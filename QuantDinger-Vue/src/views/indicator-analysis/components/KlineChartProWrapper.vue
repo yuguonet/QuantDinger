@@ -58,10 +58,10 @@ export default {
         '15m': { multiplier: 15, timespan: 'minute', text: '15m' },
         '30m': { multiplier: 30, timespan: 'minute', text: '30m' },
         '1H': { multiplier: 1, timespan: 'hour', text: '1H' },
-        '2H': { multiplier: 2, timespan: 'hour', text: '2H' },
         '4H': { multiplier: 4, timespan: 'hour', text: '4H' },
         '1D': { multiplier: 1, timespan: 'day', text: 'D' },
-        '1W': { multiplier: 1, timespan: 'week', text: 'W' }
+        '1W': { multiplier: 1, timespan: 'week', text: 'W' },
+        '1M': { multiplier: 1, timespan: 'month', text: 'M' }
       }
       return map[this.timeframe] || map['1D']
     },
@@ -194,8 +194,8 @@ export default {
           try {
             const tfMap = {
               minute: period.multiplier === 1 ? '1m' : period.multiplier === 5 ? '5m' : period.multiplier === 15 ? '15m' : '30m',
-              hour: period.multiplier === 1 ? '1H' : period.multiplier === 2 ? '2H' : '4H',
-              day: '1D', week: '1W'
+              hour: period.multiplier === 1 ? '1H' : '4H',
+              day: '1D', week: '1W', month: '1M'
             }
             const timeframe = tfMap[period.timespan] || '1D'
             const res = await request({
@@ -221,8 +221,8 @@ export default {
             try {
               const tfMap = {
                 minute: period.multiplier === 1 ? '1m' : period.multiplier === 5 ? '5m' : period.multiplier === 15 ? '15m' : '30m',
-                hour: period.multiplier === 1 ? '1H' : period.multiplier === 2 ? '2H' : '4H',
-                day: '1D', week: '1W'
+                hour: period.multiplier === 1 ? '1H' : '4H',
+                day: '1D', week: '1W', month: '1M'
               }
               const timeframe = tfMap[period.timespan] || '1D'
               const res = await request({

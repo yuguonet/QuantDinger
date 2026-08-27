@@ -178,6 +178,7 @@ import { init, registerIndicator, registerOverlay, setLocale } from 'klinecharts
 import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
 import ExchangeKlineWs from '@/utils/exchangeWs'
+import { INDICATOR_REGISTRY } from './indicatorCalculations'
 
 export default {
   name: 'KlineChart',
@@ -326,6 +327,8 @@ export default {
     const addedSignalOverlayIds = ref([])
     // 已添加的画线 overlay ID 列表（用于清理和管理）
     const addedDrawingOverlayIds = ref([])
+    // 副图关闭按钮（key=paneId, value=DOM element）
+    const paneCloseButtons = new Map()
     // 当前激活的画线工具
     const activeDrawingTool = ref(null)
 
@@ -758,6 +761,68 @@ export default {
       if (indicatorEditorTargetId.value === (indicator.instanceId || indicator.id)) {
         closeIndicatorEditor()
       }
+    }
+
+    /**
+     * 给副图 pane 左上角添加关闭按钮。
+     * klinecharts v9 的 getDom(paneId, 'root') 返回 pane 的根容器。
+     */
+    const addPaneCloseButton = (paneId, indicatorId, instanceId) => {
+      if (!chartRef.value || !paneId) return
+      // 清理旧按钮（如有）
+      removePaneCloseButton(paneId)
+      try {
+        const paneContainer = chartRef.value.getDom(paneId, 'root')
+        if (!paneContainer) return
+        paneContainer.style.position = 'relative'
+        const btn = document.createElement('div')
+        btn.className = 'pane-close-btn'
+        btn.innerHTML = '×'
+        btn.title = proxy.$t('indicatorIde.editor.deleteIndicator') || '移除指标'
+        // 内联样式（动态创建的元素无法命中 scoped CSS）
+        Object.assign(btn.style, {
+          position: 'absolute',
+          top: '2px',
+          left: '2px',
+          width: '16px',
+          height: '16px',
+          lineHeight: '14px',
+          textAlign: 'center',
+          fontSize: '13px',
+          fontWeight: 'bold',
+          color: '#999',
+          backgroundColor: 'rgba(255,255,255,0.75)',
+          borderRadius: '3px',
+          cursor: 'pointer',
+          zIndex: '10',
+          userSelect: 'none',
+          opacity: '0.6',
+          transition: 'opacity 0.15s, color 0.15s'
+        })
+        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; btn.style.color = '#f5222d' })
+        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.6'; btn.style.color = '#999' })
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation()
+          removeIndicatorInstance({ id: indicatorId, instanceId: instanceId || indicatorId })
+        })
+        paneContainer.appendChild(btn)
+        paneCloseButtons.set(paneId, btn)
+      } catch (e) { /* ignore */ }
+    }
+
+    const removePaneCloseButton = (paneId) => {
+      const btn = paneCloseButtons.get(paneId)
+      if (btn) {
+        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* ignore */ }
+        paneCloseButtons.delete(paneId)
+      }
+    }
+
+    const removeAllPaneCloseButtons = () => {
+      paneCloseButtons.forEach((btn, paneId) => {
+        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* ignore */ }
+      })
+      paneCloseButtons.clear()
     }
 
     const toggleIndicatorVisibility = (indicator) => {
@@ -2258,16 +2323,7 @@ registerOverlay({
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
               // 先移除旧 VOL pane，避免重复创建
-              try {
-                if (volPaneId.value != null) {
-                  chartRef.value.removeIndicator(volPaneId.value, 'VOL')
-                  volPaneId.value = null
-                }
-              } catch (_) {}
-              try {
-                volPaneId.value = chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
-              } catch (_) {}
-
+              // VOL 现在作为可选内置指标，通过 updateIndicators 管理
               // 延迟更新指标
               setTimeout(() => {
                 if (chartRef.value) {
@@ -3137,12 +3193,7 @@ registerOverlay({
               }
             }
 
-            // 创建成交量指标（默认显示）
-            try {
-              volPaneId.value = chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
-            } catch (e) {
-            }
-
+            // VOL 现在作为可选内置指标，通过 updateIndicators 管理
             // 延迟更新指标，确保K线先渲染
             nextTick(() => {
               updateIndicators()
@@ -3404,6 +3455,8 @@ registerOverlay({
         }
       } catch (e) {
       }
+      // 清理副图关闭按钮
+      removeAllPaneCloseButtons()
 
       // 转换数据格式（KLineChart 需要内部格式用于计算）
       const internalData = convertToInternalFormat(klineData.value)
@@ -3632,6 +3685,7 @@ registerOverlay({
                           )
                           if (indicatorId) {
                             addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                           }
                         }
                       }
@@ -3852,6 +3906,7 @@ registerOverlay({
                           )
                           if (indicatorId) {
                             addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                           }
                         }
                       }
@@ -3963,6 +4018,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -3985,6 +4041,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4048,6 +4105,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4079,6 +4137,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4111,6 +4170,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4142,6 +4202,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4173,6 +4234,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4200,6 +4262,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4233,6 +4296,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4262,6 +4326,7 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
@@ -4304,10 +4369,75 @@ registerOverlay({
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
                   addedIndicatorIds.value.push({ paneId: indicatorId, name: customIndicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
                 }
               }
             } catch (err) {
             }
+          } else if (indicator.id === 'vol') {
+            // VOL - 使用 klinecharts 内置 VOL 指标
+            try {
+              const indicatorId = chartRef.value.createIndicator('VOL', false, { height: 100, dragEnabled: true })
+              if (indicatorId) {
+                addedIndicatorIds.value.push({ paneId: indicatorId, name: 'VOL' })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
+              }
+            } catch (err) {}
+          } else if (INDICATOR_REGISTRY[indicator.id]) {
+            // 通用指标注册（来自 indicatorCalculations.js 注册表）
+            const def = INDICATOR_REGISTRY[indicator.id]
+            const params = { ...def.defaultParams, ...(indicator.params || {}) }
+            const paramKeys = Object.keys(def.defaultParams)
+            const paramValues = paramKeys.map(k => params[k])
+            const customIndicatorName = buildUniqueIndicatorName(`${indicator.id.toUpperCase()}_${paramValues.join('_')}`)
+            try {
+              const registered = registerCustomIndicator({
+                name: customIndicatorName,
+                shortName: customIndicatorName,
+                calcParams: paramValues,
+                figures: def.figures.map(f => {
+                  if (f.type === 'line') { return buildLineFigure(f.key, f.title, color, lineWidth) }
+                  if (f.type === 'bar') {
+                    return {
+                      key: f.key, title: f.title, type: 'bar', baseValue: 0,
+                      styles: (data, ind, defaultStyles) => {
+                        const prevVal = data.prev?.indicatorData?.[f.key] ?? 0
+                        const curVal = data.current?.indicatorData?.[f.key] ?? 0
+                        const bars = defaultStyles.bars || []
+                        const barStyle = bars[0] || {}
+                        return curVal >= prevVal
+                          ? { color: barStyle.upColor || '#f5222d', style: 'fill' }
+                          : { color: barStyle.downColor || '#52c41a', style: 'fill' }
+                      }
+                    }
+                  }
+                  if (f.type === 'circle') { return { key: f.key, title: f.title, type: 'circle' } }
+                  return buildLineFigure(f.key, f.title, color, lineWidth)
+                }),
+                calc: (kLineDataList, ind) => {
+                  const p = {}
+                  paramKeys.forEach((k, idx) => { p[k] = ind.calcParams[idx] })
+                  const raw = def.calc(kLineDataList, p)
+                  // 标准化输出：数组 of 对象
+                  if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'object' && raw[0] !== null && !Array.isArray(raw[0])) {
+                    return raw
+                  }
+                  // 如果返回的是简单数值数组，包装成对象
+                  const figKey = def.figures[0].key
+                  return raw.map(v => ({ [figKey]: v }))
+                },
+                precision: pricePrecision.value,
+                series: 'normal'
+              })
+              if (registered) {
+                const isMainPane = def.figures.some(f => f.overlay) || indicator.id === 'zigzag' || indicator.id === 'pivot_hi' || indicator.id === 'pivot_lo' || indicator.id.startsWith('pivot_')
+                const paneId = chartRef.value.createIndicator(customIndicatorName, !isMainPane, isMainPane ? undefined : { height: 100, dragEnabled: true })
+                if (paneId) {
+                  addedIndicatorIds.value.push({ paneId, name: customIndicatorName })
+                  if (!isMainPane) addPaneCloseButton(paneId, indicator.id, indicator.instanceId)
+                }
+              }
+            } catch (err) {}
           } else {
             // 尝试直接用 indicator.id 创建（假设是内置指标名）
             try {
@@ -4315,9 +4445,9 @@ registerOverlay({
               const indicatorId = chartRef.value.createIndicator(indicatorName, false, { height: 100, dragEnabled: true })
               if (indicatorId) {
                 addedIndicatorIds.value.push({ paneId: indicatorId, name: indicatorName })
+                addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
               }
-            } catch (err) {
-            }
+            } catch (err) {}
           }
           // ... 其他指标 ...
         } catch (e) {

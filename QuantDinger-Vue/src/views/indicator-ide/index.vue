@@ -1026,16 +1026,16 @@ const TF_MAX_DAYS = {
   '15m': 365,
   '30m': 365,
   '1H': 730,
-  '2H': 1460,
   '4H': 1460,
   '1D': 3650,
-  '1W': 7300
+  '1W': 7300,
+  '1M': 36500
 }
 
 /** A 股 / 港股交易半天，4H 无意义，用 2H（上午/下午各一根） */
-const ASIAN_STOCK_TF = ['1m', '5m', '15m', '1H', '2H', '1D', '1W']
+const ASIAN_STOCK_TF = ['1m', '5m', '15m', '1H', '1D', '1W', '1M']
 /** 美股 / 加密 / 外汇 / 期货连续交易，4H 更合适 */
-const GLOBAL_MARKET_TF = ['1m', '5m', '15m', '1H', '4H', '1D', '1W']
+const GLOBAL_MARKET_TF = ['1m', '5m', '15m', '1H', '4H', '1D', '1W', '1M']
 
 const DATE_PRESETS = [
   { key: '1m', label: '1M', days: 30 },
@@ -1121,32 +1121,108 @@ export default {
       yAxisMode: 'price',
       /** 内置技术指标列表（分主图/副图） */
       builtinIndicators: [
-        // 主图指标
-        { id: 'sma', name: '移动平均线', shortName: 'MA', group: 'main' },
-        { id: 'ema', name: '指数平滑移动平均线', shortName: 'EMA', group: 'main' },
-        { id: 'bb', name: '布林线', shortName: 'BOLL', group: 'main' },
-        { id: 'sar', name: '停损点转向指标', shortName: 'SAR', group: 'main' },
+        // ═══════════════════════════════════════════
+        // 主图指标 (Overlay)
+        // ═══════════════════════════════════════════
+        // ── 移动平均类 ──
+        { id: 'sma', name: '简单移动平均线', shortName: 'MA', group: 'main' },
         { id: 'sma2', name: '简单移动平均', shortName: 'SMA', group: 'main' },
+        { id: 'ema', name: '指数平滑移动平均线', shortName: 'EMA', group: 'main' },
+        { id: 'wma', name: '加权移动平均线', shortName: 'WMA', group: 'main' },
+        { id: 'dema', name: '双重指数移动平均线', shortName: 'DEMA', group: 'main' },
+        { id: 'tema', name: '三重指数移动平均线', shortName: 'TEMA', group: 'main' },
+        { id: 'hma', name: '赫尔移动平均线', shortName: 'HMA', group: 'main' },
+        { id: 'kama', name: '考夫曼自适应移动平均线', shortName: 'KAMA', group: 'main' },
+        { id: 'alma', name: 'Arnaud Legoux 移动平均线', shortName: 'ALMA', group: 'main' },
+        { id: 'vwma', name: '成交量加权移动平均线', shortName: 'VWMA', group: 'main' },
         { id: 'bbi', name: '多空指数', shortName: 'BBI', group: 'main' },
-        // 副图指标
+        // ── 通道/包络类 ──
+        { id: 'bb', name: '布林线', shortName: 'BOLL', group: 'main' },
+        { id: 'kc', name: '肯特纳通道', shortName: 'KC', group: 'main' },
+        { id: 'dc', name: '唐奇安通道', shortName: 'DC', group: 'main' },
+        { id: 'env', name: '包络线', shortName: 'ENV', group: 'main' },
+        // ── 趋势跟踪/止损类 ──
+        { id: 'sar', name: '停损点转向指标', shortName: 'SAR', group: 'main' },
+        { id: 'supertrend', name: '超级趋势', shortName: 'ST', group: 'main' },
+        { id: 'vstop', name: '波动止损通道', shortName: 'VSTOP', group: 'main' },
+        // ── 综合系统类 ──
+        { id: 'ichimoku', name: '一目均衡表', shortName: 'IKH', group: 'main' },
+        // ── 结构分析类 ──
+        { id: 'zigzag', name: '之字转向', shortName: 'ZZ', group: 'main' },
+        { id: 'fractal', name: '分形', shortName: 'FR', group: 'main' },
+        { id: 'pivot_hi', name: '摆动高点', shortName: 'PH', group: 'main' },
+        { id: 'pivot_lo', name: '摆动低点', shortName: 'PL', group: 'main' },
+        // ── 枢轴点系列 ──
+        { id: 'pivot_classic', name: '经典枢轴点', shortName: 'PP', group: 'main' },
+        { id: 'pivot_fibonacci', name: '斐波那契枢轴', shortName: 'FIBPP', group: 'main' },
+        { id: 'pivot_woodie', name: '伍迪枢轴点', shortName: 'WDPP', group: 'main' },
+        { id: 'pivot_camarilla', name: '卡玛利拉枢轴', shortName: 'CAMPP', group: 'main' },
+        { id: 'pivot_demark', name: 'DeMark枢轴', shortName: 'DMPP', group: 'main' },
+        // ── 其他 ──
+        { id: 'heikinashi', name: '平均K线', shortName: 'HA', group: 'main' },
+
+        // ═══════════════════════════════════════════
+        // 副图指标 (Sub)
+        // ═══════════════════════════════════════════
+        { id: 'vol', name: '成交量', shortName: 'VOL', group: 'sub' },
+        // ── MACD系列 ──
         { id: 'macd', name: '指数平滑异同平均', shortName: 'MACD', group: 'sub' },
+        { id: 'ppo', name: '百分比价格震荡器', shortName: 'PPO', group: 'sub' },
+        // ── 超买超卖类 ──
         { id: 'rsi', name: '相对强弱指标', shortName: 'RSI', group: 'sub' },
+        { id: 'stochrsi', name: '随机RSI', shortName: 'StochRSI', group: 'sub' },
         { id: 'kdj', name: '随机指标', shortName: 'KDJ', group: 'sub' },
         { id: 'cci', name: '商品通道指数', shortName: 'CCI', group: 'sub' },
         { id: 'williams', name: '威廉指标', shortName: 'WR', group: 'sub' },
-        { id: 'atr', name: '平均真实波幅', shortName: 'ATR', group: 'sub' },
+        { id: 'cmo', name: '钱德动量摆动指标', shortName: 'CMO', group: 'sub' },
+        // ── 动量类 ──
+        { id: 'mom', name: '动量', shortName: 'MOM', group: 'sub' },
+        { id: 'roc', name: '变动率', shortName: 'ROC', group: 'sub' },
+        { id: 'tsi', name: '真实强弱指数', shortName: 'TSI', group: 'sub' },
+        { id: 'bop', name: '力量平衡', shortName: 'BOP', group: 'sub' },
+        { id: 'rmi', name: '相对动量指数', shortName: 'RMI', group: 'sub' },
+        { id: 'kst', name: '确认指标', shortName: 'KST', group: 'sub' },
+        { id: 'uo', name: '终极震荡器', shortName: 'UO', group: 'sub' },
+        { id: 'coppock', name: '估波曲线', shortName: 'COPP', group: 'sub' },
+        // ── Bill Williams 系列 ──
+        { id: 'ao', name: '动量震荡器', shortName: 'AO', group: 'sub' },
+        { id: 'ac', name: '加速震荡器', shortName: 'AC', group: 'sub' },
+        { id: 'alligator', name: '鳄鱼指标', shortName: 'JAW', group: 'sub' },
+        // ── Ehlers 系列 ──
+        { id: 'fisher', name: '费舍尔变换', shortName: 'FISH', group: 'sub' },
+        { id: 'e_stoch', name: 'Ehlers随机', shortName: 'ESTOCH', group: 'sub' },
+        { id: 'e_roc', name: 'Ehlers变动率', shortName: 'EROC', group: 'sub' },
+        // ── 趋势/方向类 ──
         { id: 'adx', name: '平均趋向指数', shortName: 'ADX', group: 'sub' },
-        { id: 'mfi', name: '资金流量指标', shortName: 'MFI', group: 'sub' },
-        { id: 'obv', name: '能量潮', shortName: 'OBV', group: 'sub' },
-        { id: 'adosc', name: '积累派发振荡器', shortName: 'ADOSC', group: 'sub' },
-        { id: 'ad', name: '积累派发线', shortName: 'AD', group: 'sub' },
         { id: 'dmi', name: '趋向指标', shortName: 'DMI', group: 'sub' },
+        { id: 'aroon', name: '阿隆指标', shortName: 'AROON', group: 'sub' },
+        { id: 'aroonosc', name: '阿隆震荡器', shortName: 'AROONOSC', group: 'sub' },
+        { id: 'vi', name: '涡旋指标', shortName: 'VI', group: 'sub' },
+        // ── 波动率类 ──
+        { id: 'atr', name: '平均真实波幅', shortName: 'ATR', group: 'sub' },
+        { id: 'bbwidth', name: '布林带宽', shortName: 'BBW', group: 'sub' },
+        { id: 'bbpct', name: '布林%B', shortName: '%B', group: 'sub' },
+        { id: 'massidx', name: '梅斯线', shortName: 'MI', group: 'sub' },
+        // ── 成交量类 ──
+        { id: 'obv', name: '能量潮', shortName: 'OBV', group: 'sub' },
+        { id: 'ad', name: '积累派发线', shortName: 'AD', group: 'sub' },
+        { id: 'adosc', name: '积累派发振荡器', shortName: 'ADOSC', group: 'sub' },
+        { id: 'mfi', name: '资金流量指标', shortName: 'MFI', group: 'sub' },
+        { id: 'vr', name: '成交量比率', shortName: 'VR', group: 'sub' },
+        { id: 'vwap', name: '成交量加权均价', shortName: 'VWAP', group: 'sub' },
+        { id: 'cmf', name: '蔡金资金流', shortName: 'CMF', group: 'sub' },
+        { id: 'fi', name: '力量指数', shortName: 'FI', group: 'sub' },
+        { id: 'kvo', name: '克林格成交量摆动', shortName: 'KVO', group: 'sub' },
+        { id: 'pvo', name: '百分比成交量震荡器', shortName: 'PVO', group: 'sub' },
+        { id: 'nvi', name: '负量指标', shortName: 'NVI', group: 'sub' },
+        { id: 'pvi', name: '正量指标', shortName: 'PVI', group: 'sub' },
+        // ── 震荡/杂项类 ──
         { id: 'trix', name: '三重指数平滑', shortName: 'TRIX', group: 'sub' },
         { id: 'dpo', name: '去趋势价格', shortName: 'DPO', group: 'sub' },
         { id: 'psy', name: '心理线', shortName: 'PSY', group: 'sub' },
-        { id: 'vr', name: '成交量比率', shortName: 'VR', group: 'sub' },
         { id: 'emv', name: '简易波动', shortName: 'EMV', group: 'sub' },
-        { id: 'vwap', name: '成交量加权均价', shortName: 'VWAP', group: 'sub' }
+        { id: 'chandelier', name: '吊灯止损', shortName: 'CDR', group: 'sub' },
+        { id: 'elder_ray', name: '艾达透视指标', shortName: 'ER', group: 'sub' }
       ],
 
       // AI generation
