@@ -1,30 +1,204 @@
 #!/usr/bin/env python3
 """
-底部震荡 + 弱转强 策略 - 独立回测
+多箱体底部买入 策略 - 独立回测
 
-═══════════════════════════════════════════════════════════════════
-  弱转强形态
-═══════════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════════════════
+                          策略核心思路
+═══════════════════════════════════════════════════════════════════════════════
 
-  底部震荡期          弱转强信号           大行情启动
-  ┌─────────┐      ┌─────────────┐      ┌──────────────┐
-  │ 反复洗盘 │  →   │ 放量上涨     │  →   │  持续上涨     │
-  │ 量能萎缩 │      │ 缩量回调     │      │              │
-  │ 买卖平衡 │      │ 缩量上涨     │      │              │
-  └─────────┘      └─────────────┘      └──────────────┘
+  在历史走势中识别多个箱体整理区间，当多个箱体下沿汇聚形成强支撑，
+  且价格回踩到支撑区域附近出现反弹信号时买入。
 
-  ① 底部震荡: 前20日箱体整理，量能逐步萎缩
-  ② 平衡确认: 连续缩量，不再创新低
-  ③ 弱转强: 放量上涨→缩量回调→缩量上涨
-  ④ 买入: 弱转强确认日次日开盘买
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ 价格                                                              │
+  │         ┌──────┐          ┌──────┐                                │
+  │         │箱体1 │          │箱体3 │                                │
+  │   ┌─────┤      │   ┌──────┤      │                                │
+  │   │箱体0 │      │   │箱体2 │      │  ← 多个箱体下沿汇聚           │
+  │   │     │      │   │     │      │    形成强支撑位                  │
+  │───┴─────┴──────┴───┴─────┴──────┴────────── 支撑线 ───────────    │
+  │                              ↑                                    │
+  │                         价格回踩到支撑                             │
+  │                         + 反弹确认 → 买入                         │
+  └─────────────────────────────────────────────────────────────────────┘
 
-═══════════════════════════════════════════════════════════════════
-  使用方法
-═══════════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════════════════
+                          入场条件
+═══════════════════════════════════════════════════════════════════════════════
 
+  ① 历史箱体识别
+     - 回顾过去 box_days×4 天的K线
+     - 滑动窗口(box_days天)识别整理区间
+     - 箱体振幅在 [box_min_range, box_max_range]% 之间
+     - 箱体内至少70%的K线在区间范围内
+
+  ② 支撑位确认
+     - 多个箱体(≥min_box_count)的下沿接近(±support_tolerance%)
+     - 贪心聚类算法: 下沿差距在容差范围内的箱体归为同一支撑
+
+  ③ 趋势过滤 (三均线共振)
+     - MA10 斜率 > min_ma10_slope (%/天) 且斜率递增(加速)
+     - MA20 斜率 > 0 且斜率递增(加速)
+     - 确保处于上升趋势中的回调，而非下跌趋势
+
+  ④ 底部买入区域
+     - 当日低点触及支撑位 ±buy_zone_pct% 区域
+     - 不能跌破支撑位太多(超过buy_zone_pct%)
+
+  ⑤ 反弹确认 (至少满足一个)
+     - 收阳线: 收盘价 > 开盘价
+     - 量缩: 当日成交量 < 近5日均量×0.8 (卖压衰竭)
+     - 长下影线: 下影线 > 实体×1.5 (探底回升)
+
+  ⑥ 板块过滤
+     - 创业板/科创板: 流通市值 < 30亿
+     - 主板: 无额外限制
+
+  ⑦ 买入日过滤 (信号次日)
+     - 涨跌幅: -3% ~ +3% (不追涨不抄底暴跌)
+     - 跳空: 开盘价 vs 前收盘 -0.5% ~ +0.5% (平开)
+     - 振幅: < 3% (低波动, 确认横盘)
+     - 买入价: 收盘价
+
+═══════════════════════════════════════════════════════════════════════════════
+                          出场规则
+═══════════════════════════════════════════════════════════════════════════════
+
+  ① 止盈: 盈利达到 take_profit% (默认15%) 时止盈
+  ② 止损: 从买入后最高价回撤 stop_loss% (默认12%, 主板自适应20%)
+  ③ 跟踪止损: 盈利达到 trailing_activate% 后激活，
+              从峰值回撤 trailing_pct% 出场
+  ④ 持仓上限: max_hold 天 (默认10) 到期收盘价出场
+
+  优先级: 止盈 > 止损 > 跟踪止损 > 持仓上限
+
+═══════════════════════════════════════════════════════════════════════════════
+                          信号质量评分
+═══════════════════════════════════════════════════════════════════════════════
+
+  每日最多选取 top_per_day (默认2) 个最优信号，评分规则:
+    - 箱体数量: 每个箱体 +100 分 (箱体越多支撑越强)
+    - 收阳线: +10 分
+    - 量缩: +5 分
+
+═══════════════════════════════════════════════════════════════════════════════
+                          统计维度
+═══════════════════════════════════════════════════════════════════════════════
+
+  回测完成后按以下维度分段统计:
+    - 板块 (沪主板/深主板/创业板/科创板)
+    - 策略路径 (箱体数)
+    - 出场原因 (止盈/止损/跟踪止损/持仓到期)
+    - 突破幅度 / 洗盘天数 / 放量倍数
+    - MA5斜率 / MA5加速度 / MA10斜率
+    - 流通市值 / 换手率
+    - 买入日特征 (高开低开/涨跌幅/量比/振幅/下影线)
+    - 大赢家 vs 低质量 效应量分析
+
+═══════════════════════════════════════════════════════════════════════════════
+                          使用方法
+═══════════════════════════════════════════════════════════════════════════════
+
+  # 默认回测 (内置股票列表, 300天数据)
   python test_box_breakout.py
-  python test_box_breakout.py --box-days 20 --vol-expand 1.3
-  python test_box_breakout.py --max-hold 30 --stop-loss 8
+
+  # 指定股票
+  python test_box_breakout.py --codes 002010,300750,601318
+
+  # DB模式 (全市场)
+  python test_box_breakout.py --source db
+
+  # 调整箱体参数
+  python test_box_breakout.py --box-days 25 --box-max-range 12 --box-min-range 5
+
+  # 调整支撑参数
+  python test_box_breakout.py --min-box-count 3 --support-tolerance 2.0 --buy-zone-pct 1.5
+
+  # 调整趋势过滤
+  python test_box_breakout.py --min-ma10-slope 0.5
+
+  # 调整出场参数
+  python test_box_breakout.py --stop-loss 8 --trailing-pct 3 --take-profit 20 --max-hold 15
+
+  # 禁用板块自适应 (主板也用默认止损)
+  python test_box_breakout.py --no-board-adaptive --stop-loss 12
+
+  # 打印全部交易明细
+  python test_box_breakout.py --all-trades
+
+  # 今日信号 + 持仓卖出建议 (收盘后运行)
+  python test_box_breakout.py --today
+  python test_box_breakout.py --today --today-date 2026-08-27
+
+═══════════════════════════════════════════════════════════════════════════════
+                          实盘工作流
+═══════════════════════════════════════════════════════════════════════════════
+
+  每日收盘后 (15:00+):
+    python test_box_breakout.py --today
+
+  输出内容:
+    1. 今日信号 — 信号日=今天的股票，按质量评分排序
+       - 箱体数、确认类型、支撑/阻力位、量比、MA5斜率
+       - 买入建议: 明日收盘价买入，给出不同跳空档位参考价
+
+    2. 持仓分析 — 最近20天入场的持仓
+       - 亏损持仓: 关注止损线
+       - 盈利持仓: 关注止盈/跟踪止损
+       - 观望持仓: 收益在-3%~+5%之间
+
+═══════════════════════════════════════════════════════════════════════════════
+                          全部参数
+═══════════════════════════════════════════════════════════════════════════════
+
+  数据源:
+    --codes         逗号分隔的股票代码 (默认: 内置列表)
+    --days          加载K线天数 (默认300)
+    --source        manual(默认) / db (全市场)
+
+  箱体参数:
+    --box-days          箱体整理窗口天数 (默认20)
+    --box-max-range     箱体最大振幅% (默认15.0)
+    --box-min-range     箱体最小振幅% (默认0.0, 建议设8)
+    --box-min-bars      箱体内最少K线数 (默认10)
+
+  支撑参数:
+    --min-box-count     最少箱体数 (默认2, 越多支撑越强)
+    --support-tolerance 支撑位聚类容差% (默认3.0)
+    --buy-zone-pct      买入区域范围% (默认2.0)
+
+  趋势过滤:
+    --min-ma10-slope    MA10斜率下限%/天 (默认0.3)
+
+  突破参数:
+    --vol-expand-min    突破放量下限 (默认1.5)
+    --vol-expand-max    突破放量上限 (默认3.0)
+
+  出场参数:
+    --stop-loss         止损% (默认12.0, 主板自适应20%)
+    --trailing-pct      跟踪止损回撤% (默认5.0)
+    --trailing-activate 跟踪止损激活门槛% (默认5.0)
+    --take-profit       止盈% (默认15.0)
+    --max-hold          最大持仓天数 (默认10)
+
+  其他:
+    --board-adaptive    板块自适应参数 (默认开启)
+    --no-board-adaptive 禁用板块自适应
+    --top-per-day       每天最多选前N个信号 (默认2)
+    --top               显示TOP N交易 (默认10)
+    --all-trades        打印全部交易明细
+    --today             显示今日信号 + 持仓卖出建议
+    --today-date        指定日期(YYYY-MM-DD), 配合--today使用
+    --pullback-confirm  启用突破后回踩确认模式 (默认关闭)
+    --pullback-days     回踩确认天数 (默认3)
+
+═══════════════════════════════════════════════════════════════════════════════
+                          数据来源
+═══════════════════════════════════════════════════════════════════════════════
+
+  manual模式: kline_cache.fetch_kline() → 腾讯API + 本地JSON缓存
+  db模式:     MarketKlineWriter → mootdx写入的kline_1D表 (需.env配置)
+  换手率/市值: stock_basic_info表 (需.env配置)
 """
 from __future__ import annotations
 import json, time, argparse, os, sys
@@ -50,7 +224,7 @@ def _load_env():
         pass
 
 # ================================================================
-# 斜率工具函数
+# 斜率 + 换手率 工具函数
 # ================================================================
 def calc_ma_slope(closes, idx, ma_period=5, slope_days=3):
     """MA斜率: 线性回归角度 (% / 天)"""
@@ -83,25 +257,18 @@ def _load_circ():
         from app.utils.basicinfo_db import get_stock_basic_db
         db = get_stock_basic_db(); pool = db._get_pool()
         with pool.cursor() as cur:
-            cur.execute("SELECT symbol, circ_shares, total_shares FROM stock_basic_info WHERE status='active' AND circ_shares > 0")
-            _circ_cache = {row[0]: {'circ_shares': float(row[1]), 'total_shares': float(row[2]) if row[2] else 0} for row in cur.fetchall()}
+            cur.execute("SELECT symbol, circ_shares FROM stock_basic_info WHERE status='active' AND circ_shares > 0")
+            _circ_cache = {row[0]: float(row[1]) for row in cur.fetchall()}
     except: _circ_cache = {}
     return _circ_cache
 
 def get_turnover(code, volume):
-    circ = _load_circ().get(code, {})
-    circ_shares = circ.get('circ_shares', 0) if isinstance(circ, dict) else 0
-    return volume / circ_shares * 100 if circ_shares > 0 else 0
+    circ = _load_circ().get(code, 0)
+    return volume / circ * 100 if circ > 0 else 0
 
 def get_circ_mcap(code, price):
-    circ = _load_circ().get(code, {})
-    circ_shares = circ.get('circ_shares', 0) if isinstance(circ, dict) else 0
-    return circ_shares * price / 1e8 if circ_shares > 0 else 0
-
-def get_total_mcap(code, price):
-    circ = _load_circ().get(code, {})
-    total_shares = circ.get('total_shares', 0) if isinstance(circ, dict) else 0
-    return total_shares * price / 1e8 if total_shares > 0 else 0
+    circ = _load_circ().get(code, 0)
+    return circ * price / 1e8 if circ > 0 else 0
 
 # ================================================================
 # DB 数据加载
@@ -167,9 +334,7 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
                  trailing_pct=5.0, max_hold_days=15,
                  take_profit_pct=15.0, trailing_activate_pct=5.0):
     """
-    回测出场规则:
-      峰值回撤12%出场
-      持仓上限出场
+    简化回测: 买入后跟踪峰值，从峰值回撤 peak_drop_pct% 出场，最多持有 max_hold_days 天。
     """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
@@ -191,17 +356,18 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
         if b['high'] > peak:
             peak = b['high']
 
-        # 峰值回撤12%出场
-        drop_pct = (peak - b['low']) / peak * 100
-        if drop_pct >= 12:
-            exit_p = peak * 0.88  # 峰值-12%
-            if b['open'] < exit_p:
+        # 从峰值回撤 peak_drop_pct% 出场
+        drop_from_peak = (peak - b['low']) / peak * 100
+        if drop_from_peak >= stop_loss_pct:
+            drop_price = peak * (1 - stop_loss_pct / 100)
+            if b['open'] < drop_price:
                 exit_p = b['open']
+            else:
+                exit_p = drop_price
             exit_d = d
-            exit_reason = "peak_drop_12"
+            exit_reason = "peak_drop"
             break
 
-        # 持仓上限
         if max_hold_days > 0 and d >= max_hold_days:
             exit_p = b['close']
             exit_d = d
@@ -221,203 +387,271 @@ def run_backtest(bars, entry_idx, entry_price, stop_loss_pct=5.0,
     }
 
 # ================================================================
-# 底部震荡 + 弱转强 策略
+# 多箱体底部买入 策略
 # ================================================================
-def strategy_bottom_reversal(bars, code,
-                              box_days=20, box_max_range=15.0, box_min_range=0.0,
-                              vol_expand=1.3, vol_shrink_ratio=0.8,
-                              min_ma10_slope=0.3, min_ma60_slope=-0.3, max_ma60_slope=0.3,
-                              max_ma_dispersion=5.0, max_chg_20d=12.0,
-                              stop_loss_pct=12.0, trailing_pct=5.0,
-                              trailing_activate_pct=5.0, take_profit_pct=15.0,
-                              max_hold_days=30, top_per_day=2):
+def _find_boxes(bars, start, end, box_days, box_max_range, box_min_range):
+    """在 bars[start:end] 范围内滑动查找所有箱体"""
+    boxes = []
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    closes = [b["close"] for b in bars]
+
+    i = start
+    while i + box_days <= end:
+        box_high = max(highs[i:i + box_days])
+        box_low = min(lows[i:i + box_days])
+        if box_low <= 0:
+            i += 1
+            continue
+
+        box_range_pct = (box_high - box_low) / box_low * 100
+        if box_min_range <= box_range_pct <= box_max_range:
+            # 额外检查: 箱体内K线大部分在区间内(至少80%)
+            in_range = sum(1 for j in range(i, i + box_days)
+                          if box_low * 0.99 <= lows[j] and highs[j] <= box_high * 1.01)
+            if in_range >= box_days * 0.7:
+                boxes.append({
+                    "start": i,
+                    "end": i + box_days - 1,
+                    "high": box_high,
+                    "low": box_low,
+                    "range_pct": box_range_pct,
+                })
+                i += box_days  # 跳过已识别区间
+            else:
+                i += 1
+        else:
+            i += 1
+
+    return boxes
+
+
+def strategy_peak_breakout(bars, code,
+                           box_days=25, box_max_range=15.0, box_min_range=0.0, box_min_bars=10,
+                           vol_expand_min=1.5, vol_expand_max=3.0,
+                           stop_loss_pct=12.0, trailing_pct=5.0,
+                           trailing_activate_pct=5.0, take_profit_pct=15.0,
+                           max_hold_days=10, top_per_day=2,
+                           require_ma60=False, require_ma20_up=False,
+                           min_rsi=0, max_rsi=100,
+                           min_macd_hist=0.0, max_macd_hist=100.0,
+                           pullback_confirm=False, pullback_days=3,
+                           pullback_max_pct=3.0,
+                           # 新增: 多箱体底部买入参数
+                           min_box_count=2, support_tolerance=3.0, buy_zone_pct=2.0,
+                           min_ma10_slope=0.3):
     """
-    底部震荡 + 弱转强 入场策略
+    多箱体底部买入 策略
 
     入场条件:
-      ① 底部震荡: 前20日箱体整理，振幅<15%
-      ② 平衡确认: 前20日涨幅<12%，底部区域
-      ③ 弱转强信号:
-         - D-2: 放量上涨 (量>1.3x均量，收阳)
-         - D-1: 缩量回调 (量<D-2的80%，收阴)
-         - D0: 缩量上涨 (量<D-2的80%，收阳，价格>D-1)
-      ④ MA趋势: MA10斜率>0.3%且递增，MA60走平(-0.3%~0.3%)
-      ⑤ 三线粘合: (MA10-MA60)/MA60<=5%
-      ⑥ 买入: 弱转强确认日次日开盘买
+      ① 历史箱体: 过去N天内识别出多个整理区间
+      ② 支撑确认: 多个箱体下沿接近(±tolerance%)
+      ③ 底部买入: 当前价格触及第2/3个箱体底部区域(buy_zone_pct%内)
+      ④ 反弹确认: 触底后收阳线或量能萎缩(卖压衰竭)
+      ⑤ 买入: 确认后次日开盘买
     """
-    if len(bars) < 80:
+    if len(bars) < box_days * 3 + 30:
         return []
 
     closes = [b["close"] for b in bars]
     highs = [b["high"] for b in bars]
     lows = [b["low"] for b in bars]
-    volumes = [b["volume"] for b in bars]
     opens = [b["open"] for b in bars]
+    volumes = [b["volume"] for b in bars]
 
     candidates = []
 
-    for i in range(30, len(bars) - 1):
-        # ── ① 弱转强信号检测 ──
-        # D-2: 放量上涨
-        avg_vol_before = sum(volumes[max(0,i-7):i-2]) / min(7, i-2) if i > 7 else volumes[i-2]
-        d2_vol_expand = volumes[i-2] > avg_vol_before * vol_expand
-        d2_bullish = closes[i-2] > opens[i-2]
+    # 从足够远的位置开始，确保有历史箱体
+    scan_start = box_days * 2 + 10
 
-        if not (d2_vol_expand and d2_bullish):
+    for i in range(scan_start, len(bars)):
+        # ── ① 识别历史箱体 ──
+        # 回顾过去 box_days*4 的范围找箱体
+        lookback = box_days * 4
+        hist_start = max(0, i - lookback)
+        # 只看 i 之前的区间
+        boxes = _find_boxes(bars, hist_start, i, box_days, box_max_range, box_min_range)
+
+        if len(boxes) < min_box_count:
             continue
 
-        # D-1: 缩量回调
-        d1_vol_shrink = volumes[i-1] < volumes[i-2] * vol_shrink_ratio
-        d1_bearish = closes[i-1] < closes[i-2]
+        # ── ② 找支撑位: 多个箱体下沿接近 ──
+        # 按下沿排序，找聚类
+        sorted_boxes = sorted(boxes, key=lambda b: b["low"])
 
-        if not (d1_vol_shrink and d1_bearish):
+        # 贪心聚类: 在 tolerance 范围内的箱体归为同一支撑
+        support_clusters = []
+        current_cluster = [sorted_boxes[0]]
+
+        for j in range(1, len(sorted_boxes)):
+            ref_low = current_cluster[0]["low"]
+            diff_pct = abs(sorted_boxes[j]["low"] - ref_low) / ref_low * 100
+            if diff_pct <= support_tolerance:
+                current_cluster.append(sorted_boxes[j])
+            else:
+                if len(current_cluster) >= min_box_count:
+                    support_clusters.append(current_cluster)
+                current_cluster = [sorted_boxes[j]]
+        if len(current_cluster) >= min_box_count:
+            support_clusters.append(current_cluster)
+
+        if not support_clusters:
             continue
 
-        # D0: 上涨，量在0.8-1.2倍D-1量之间
-        d0_vol_ratio = volumes[i] / volumes[i-1] if volumes[i-1] > 0 else 1.0
-        d0_bullish = closes[i] > opens[i]
-        d0_recover = closes[i] > closes[i-1]
+        # ── 趋势过滤: MA10/MA20 斜率递增 ──
+        ma10_now = sum(closes[i-9:i+1]) / 10 if i >= 9 else closes[i]
+        ma10_prev = sum(closes[i-10:i]) / 10 if i >= 10 else ma10_now
+        ma10_slope_now = (ma10_now - ma10_prev) / ma10_prev * 100 if ma10_prev > 0 else 0
 
-        if not (d0_bullish and d0_recover and 0.8 <= d0_vol_ratio <= 1.2):
-            continue
+        ma20 = sum(closes[i-19:i+1]) / 20 if i >= 19 else closes[i]
+        ma20_prev = sum(closes[i-20:i]) / 20 if i >= 20 else ma20
+        ma20_slope_now = (ma20 - ma20_prev) / ma20_prev * 100 if ma20_prev > 0 else 0
 
-        # ── ② 底部确认: 前20日涨幅<阈值 且 前20日振幅<阈值 ──
-        chg_20d = (closes[i] / closes[i-20] - 1) * 100 if i >= 20 else 0
-        if chg_20d > max_chg_20d:
-            continue
-
-        # 前20日振幅检查
-        high_20d = max(highs[max(0,i-19):i+1])
-        low_20d = min(lows[max(0,i-19):i+1])
-        box_range_20d = (high_20d - low_20d) / low_20d * 100 if low_20d > 0 else 0
-        if box_range_20d > box_max_range:
-            continue
-
-        # ── 换手率过滤 ──
-        circ_data = _load_circ().get(code, {})
-        circ_shares = circ_data.get('circ_shares', 0) if isinstance(circ_data, dict) else 0
-        total_shares = circ_data.get('total_shares', 0) if isinstance(circ_data, dict) else 0
-        if circ_shares > 0:
-            turnover = volumes[i] / circ_shares * 100
-            if turnover < 2.5 or turnover > 6:  # 换手率2.5~6%最佳区间
-                continue
-        else:
-            turnover = 0
-
-        # ── ③ MA趋势检查 ──
-        ma10_now = sum(closes[i-9:i+1]) / 10
-        ma10_prev = sum(closes[i-10:i]) / 10
-        ma10_slope = (ma10_now - ma10_prev) / ma10_prev * 100 if ma10_prev > 0 else 0
-
-        # MA10前一段斜率
+        # 前一段斜率
         ma10_prev2 = sum(closes[i-11:i-1]) / 10 if i >= 11 else ma10_prev
         ma10_slope_prev = (ma10_prev - ma10_prev2) / ma10_prev2 * 100 if ma10_prev2 > 0 else 0
-
-        if ma10_slope < min_ma10_slope:
-            continue
-
-        # MA20斜率
-        ma20_now = sum(closes[i-19:i+1]) / 20 if i >= 19 else closes[i]
-        ma20_prev = sum(closes[i-20:i]) / 20 if i >= 20 else ma20_now
-        ma20_slope = (ma20_now - ma20_prev) / ma20_prev * 100 if ma20_prev > 0 else 0
 
         ma20_prev2 = sum(closes[i-21:i-1]) / 20 if i >= 21 else ma20_prev
         ma20_slope_prev = (ma20_prev - ma20_prev2) / ma20_prev2 * 100 if ma20_prev2 > 0 else 0
 
-        if ma20_slope <= 0 or ma20_slope <= ma20_slope_prev:
+        # 要求: MA10斜率 >= 0.3 且 递增, MA20斜率 > 0 且递增
+        if ma10_slope_now < min_ma10_slope or ma10_slope_now <= ma10_slope_prev:
+            continue
+        if ma20_slope_now <= 0 or ma20_slope_now <= ma20_slope_prev:
             continue
 
-        # MA60斜率
-        ma60_now = sum(closes[i-59:i+1]) / 60 if i >= 59 else closes[i]
-        ma60_prev = sum(closes[i-60:i]) / 60 if i >= 60 else ma60_now
-        ma60_slope = (ma60_now - ma60_prev) / ma60_prev * 100 if ma60_prev > 0 else 0
+        ma60 = sum(closes[i-59:i+1]) / 60 if i >= 59 else closes[i]
 
-        if ma60_slope < min_ma60_slope or ma60_slope > max_ma60_slope:
-            continue
+        # ── ③ 检查当前价格是否在支撑区域底部 ──
+        best_signal = None
 
-        # 三线离散度 (已屏蔽)
-        ma_dispersion = (ma10_now - ma60_now) / ma60_now * 100 if ma60_now > 0 else 0
+        for cluster in support_clusters:
+            # 支撑位 = 集群中箱体下沿的平均值
+            support_level = sum(b["low"] for b in cluster) / len(cluster)
+            # 箱体上沿 = 集群中箱体上沿的平均值
+            resistance_level = sum(b["high"] for b in cluster) / len(cluster)
 
-        # ── ④ 记录指标 ──
-        if i >= 15:
-            gains = [max(closes[j] - closes[j-1], 0) for j in range(i-13, i+1)]
-            loss_list = [max(closes[j-1] - closes[j], 0) for j in range(i-13, i+1)]
-            avg_g = sum(gains) / 14
-            avg_l = sum(loss_list) / 14
-            rsi = 100 - 100 / (1 + avg_g / avg_l) if avg_l > 0 else 100
-        else:
-            rsi = 50
+            # 买入区域: 价格在支撑位附近 (±buy_zone_pct%)
+            buy_zone_high = support_level * (1 + buy_zone_pct / 100)
+            buy_zone_low = support_level * (1 - buy_zone_pct / 100)
 
-        ma5_slope = calc_ma_slope(closes, i, 5, 3)
-        ma5_accel = calc_ma_slope_accel(closes, i, 5, 3)
-        circ_mcap = get_circ_mcap(code, closes[i])
-        total_mcap = get_total_mcap(code, closes[i])
-        # turnover already calculated above
+            # 检查当日低点是否触及买入区域
+            if lows[i] > buy_zone_high:
+                continue
+            # 不能破支撑太多
+            if lows[i] < buy_zone_low:
+                continue
 
-        # D-2/D-1/D0 量价数据
-        d2_volume = volumes[i-2]
-        d1_volume = volumes[i-1]
-        d0_volume = volumes[i]
-        d2_chg = (closes[i-2] / closes[i-3] - 1) * 100 if i >= 3 else 0
-        d1_chg = (closes[i-1] / closes[i-2] - 1) * 100
-        d0_chg = (closes[i] / closes[i-1] - 1) * 100
-        vol_ratio_d0_d2 = volumes[i] / volumes[i-2] if volumes[i-2] > 0 else 1.0
+            # ── ④ 反弹确认 ──
+            # 条件A: 收阳线（收盘>开盘）
+            is_bullish = closes[i] > bars[i]["open"]
+            # 条件B: 量能萎缩（卖压衰竭）- 当日量 < 近5日均量
+            avg_vol_5 = sum(volumes[max(0,i-4):i]) / min(5, i) if i > 0 else volumes[i]
+            vol_shrink = volumes[i] < avg_vol_5 * 0.8
+            # 条件C: 下影线长（探底回升）
+            body = abs(closes[i] - bars[i]["open"])
+            lower_shadow = min(closes[i], bars[i]["open"]) - lows[i]
+            long_lower_shadow = lower_shadow > body * 1.5 if body > 0 else lower_shadow > 0
 
-        # 前20日量价数据
-        low_20d = min(lows[max(0,i-19):i+1])
-        high_20d = max(highs[max(0,i-19):i+1])
-        avg_vol_20 = sum(volumes[max(0,i-19):i+1]) / min(20, i+1)
-        d2_vol_expand = volumes[i-2] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+            # 至少满足一个确认条件
+            if not (is_bullish or vol_shrink or long_lower_shadow):
+                continue
 
-        # 箱体振幅
-        box_high = high_20d
-        box_low = low_20d
-        box_range = (box_high - box_low) / box_low * 100 if box_low > 0 else 0
+            # 记录信号质量
+            confirm_type = "bullish" if is_bullish else ("vol_shrink" if vol_shrink else "long_shadow")
 
-        # ── ⑤ 买入: 次日开盘 ──
-        entry_idx = i + 1
-        if entry_idx >= len(bars):
-            continue
-        entry_price = bars[entry_idx]["open"]
-        if entry_price <= 0:
-            continue
+            ma60 = sum(closes[i-59:i+1]) / 60 if i >= 59 else closes[i]
+            ma20 = sum(closes[i-19:i+1]) / 20
+            if i >= 15:
+                gains = [max(closes[j] - closes[j-1], 0) for j in range(i-13, i+1)]
+                loss_list = [max(closes[j-1] - closes[j], 0) for j in range(i-13, i+1)]
+                avg_g = sum(gains) / 14
+                avg_l = sum(loss_list) / 14
+                rsi = 100 - 100 / (1 + avg_g / avg_l) if avg_l > 0 else 100
+            else:
+                rsi = 50
 
-        candidates.append({
-            "idx": i,
-            "signal_date": bars[i]["time"],
-            "entry_price": entry_price,
-            "entry_idx": entry_idx,
-            "entry_date": bars[entry_idx]["time"],
-            "d2_date": bars[i-2]["time"],
-            "d1_date": bars[i-1]["time"],
-            "d0_date": bars[i]["time"],
-            "d2_volume": d2_volume,
-            "d1_volume": d1_volume,
-            "d0_volume": d0_volume,
-            "d2_chg": round(d2_chg, 2),
-            "d1_chg": round(d1_chg, 2),
-            "d0_chg": round(d0_chg, 2),
-            "vol_ratio_d0_d2": round(vol_ratio_d0_d2, 2),
-            "chg_20d": round(chg_20d, 2),
-            "low_20d": round(low_20d, 3),
-            "high_20d": round(high_20d, 3),
-            "avg_vol_20": avg_vol_20,
-            "d2_vol_expand": round(d2_vol_expand, 2),
-            "box_range": round(box_range, 2),
-            "ma5_slope": round(ma5_slope, 3),
-            "ma10_slope": round(ma10_slope, 3),
-            "ma5_accel": round(ma5_accel, 3),
-            "turnover": round(turnover, 2),
-            "circ_mcap": round(circ_mcap, 1),
-            "total_mcap": round(total_mcap, 1),
-            "circ_shares": circ_shares,
-            "total_shares": total_shares,
-            "ma60": round(ma60_now, 3),
-            "ma60_slope": round(ma60_slope, 3),
-            "ma_dispersion": round(ma_dispersion, 2),
-            "rsi": round(rsi, 1),
-            "close_vs_ma60": round((closes[i] / ma60_now - 1) * 100, 2) if ma60_now > 0 else 0,
-        })
+            ma5_slope = calc_ma_slope(closes, i, 5, 3)
+            ma10_slope = calc_ma_slope(closes, i, 10, 3)
+            ma5_accel = calc_ma_slope_accel(closes, i, 5, 3)
+            circ_mcap = get_circ_mcap(code, closes[i])
+            turnover = get_turnover(code, volumes[i])
+
+            vol_ratio = volumes[i] / avg_vol_5 if avg_vol_5 > 0 else 1.0
+
+            # 箱体振幅
+            box_range_pct = (resistance_level - support_level) / support_level * 100 if support_level > 0 else 0
+
+            # 板块过滤
+            board = get_board_name(code)
+            if board in ('创业板', '科创板'):
+                # 创科板: 流通市值<30亿
+                if circ_mcap > 0 and circ_mcap >= 30:
+                    continue
+            # 主板无额外过滤
+
+            signal = {
+                "idx": i, "signal_date": bars[i]["time"],
+                "support_level": round(support_level, 3),
+                "resistance_level": round(resistance_level, 3),
+                "box_count": len(cluster),
+                "box_range_pct": round(box_range_pct, 2),
+                "confirm_type": confirm_type,
+                "vol_ratio": round(vol_ratio, 2),
+                "ma5_slope": round(ma5_slope, 3),
+                "ma10_slope": round(ma10_slope, 3),
+                "ma5_accel": round(ma5_accel, 3),
+                "turnover": round(turnover, 2),
+                "circ_mcap": round(circ_mcap, 1),
+                "ma60": round(ma60, 3),
+                "rsi": round(rsi, 1),
+                "close_vs_ma60": round((closes[i] / ma60 - 1) * 100, 2) if ma60 > 0 else 0,
+            }
+
+            # 选择最优信号: 箱体数多 > 收阳线 > 量缩
+            score = len(cluster) * 100 + (10 if is_bullish else 0) + (5 if vol_shrink else 0)
+            if best_signal is None or score > best_signal.get("_score", 0):
+                signal["_score"] = score
+                best_signal = signal
+
+        if best_signal:
+            entry_idx = i + 1
+            if entry_idx >= len(bars):
+                continue
+            
+            # 买入日特征分析
+            buy_day_open = bars[entry_idx]["open"]
+            buy_day_close = closes[entry_idx]
+            buy_day_chg = (buy_day_close / buy_day_open - 1) * 100 if buy_day_open > 0 else 0
+            
+            # 买入日量比(vs前5日均量)
+            avg_vol_5 = sum(volumes[max(0,entry_idx-5):entry_idx]) / min(5, entry_idx) if entry_idx > 0 else volumes[entry_idx]
+            buy_vol_ratio = volumes[entry_idx] / avg_vol_5 if avg_vol_5 > 0 else 1.0
+            
+            # 过滤条件:
+            # 1. 买入日涨跌幅 -3%~+3%
+            if buy_day_chg < -3 or buy_day_chg > 3:
+                continue
+            # 2. 平开: 开盘价vs前收盘 -0.5%~+0.5%
+            prev_close = closes[entry_idx-1] if entry_idx > 0 else buy_day_open
+            gap_pct = (buy_day_open / prev_close - 1) * 100 if prev_close > 0 else 0
+            if gap_pct < -0.5 or gap_pct > 0.5:
+                continue
+            # 3. 低振幅: 当日振幅<3%
+            buy_day_range = (bars[entry_idx]["high"] - bars[entry_idx]["low"]) / buy_day_open * 100 if buy_day_open > 0 else 0
+            if buy_day_range >= 3:
+                continue
+            
+            entry_price = buy_day_close  # 收盘价买入
+            if entry_price <= 0:
+                continue
+
+            best_signal["entry_price"] = entry_price
+            best_signal["entry_idx"] = entry_idx
+            best_signal["entry_date"] = bars[entry_idx]["time"]
+            best_signal["buy_day_chg"] = round(buy_day_chg, 2)
+            best_signal["buy_vol_ratio"] = round(buy_vol_ratio, 2)
+            candidates.append(best_signal)
 
     daily_candidates = defaultdict(list)
     for c in candidates:
@@ -425,7 +659,7 @@ def strategy_bottom_reversal(bars, code,
 
     filtered = []
     for date, cands in daily_candidates.items():
-        cands.sort(key=lambda c: (-c["ma10_slope"], c["chg_20d"]))
+        cands.sort(key=lambda c: (-c.get("box_count", 0), c.get("_score", 0)))
         filtered.extend(cands[:top_per_day])
 
     trades = []
@@ -438,36 +672,36 @@ def strategy_bottom_reversal(bars, code,
 
         trades.append({
             "code": code, "board": get_board_name(code),
-            "path": "bottom_reversal",
-            "path_label": "底部弱转强",
+            "path": "multi_box_bottom",
+            "confirm_type": c["confirm_type"],
+            "box_count": c["box_count"],
+            "path_label": f"{c['box_count']}箱体底部买入",
             "signal_date": c["signal_date"], "signal_close": closes[c["idx"]],
-            # 弱转强三日数据
-            "d2_date": c["d2_date"], "d1_date": c["d1_date"], "d0_date": c["d0_date"],
-            "d2_volume": c["d2_volume"], "d1_volume": c["d1_volume"], "d0_volume": c["d0_volume"],
-            "d2_chg": c["d2_chg"], "d1_chg": c["d1_chg"], "d0_chg": c["d0_chg"],
-            "vol_ratio_d0_d2": c["vol_ratio_d0_d2"],
-            # 前20日数据
-            "chg_20d": c["chg_20d"],
-            "low_20d": c["low_20d"], "high_20d": c["high_20d"],
-            "avg_vol_20": c["avg_vol_20"], "d2_vol_expand": c["d2_vol_expand"],
-            "box_high": c["high_20d"], "box_low": c["low_20d"], "box_range_pct": c["box_range"],
-            # MA指标
+            "box_high": c["resistance_level"], "box_low": c["support_level"],
+            "box_range_pct": round((c["resistance_level"] - c["support_level"]) / c["support_level"] * 100, 2),
+            "box_days": box_days,
+            "breakout_close": closes[c["idx"]],
+            "vol_ratio_vs_pullback": c["vol_ratio"],
             "ma5_slope": c.get("ma5_slope", 0),
             "ma10_slope": c.get("ma10_slope", 0),
             "ma5_accel": c.get("ma5_accel", 0),
-            "ma60": c["ma60"], "ma60_slope": c.get("ma60_slope", 0), "ma_dispersion": c.get("ma_dispersion", 0),
-            "rsi": c.get("rsi", 0),
-            "close_vs_ma60": c["close_vs_ma60"],
-            # 市值和换手率
             "turnover": c.get("turnover", 0),
             "circ_mcap": c.get("circ_mcap", 0),
-            "total_mcap": c.get("total_mcap", 0),
-            "circ_shares": c.get("circ_shares", 0),
-            "total_shares": c.get("total_shares", 0),
-            # 入场和出场
+            "ma60": c["ma60"], "rsi": c.get("rsi", 0),
+            "macd_hist": 0,
+            "close_vs_ma60": c["close_vs_ma60"],
             "entry_date": c["entry_date"],
             "entry_price": round(c["entry_price"], 3),
-            "buy_mode": "weak_to_strong_next_open",
+            "buy_mode": "buy_day_close",
+            "buy_day_chg": c.get("buy_day_chg", 0),
+            "buy_vol_ratio": c.get("buy_vol_ratio", 0),
+            "neckline_high": c["resistance_level"], "neckline_gain_pct": round((c["resistance_level"] - c["support_level"]) / c["support_level"] * 100, 2),
+            "first_trough_low": c["support_level"], "second_trough_low": c["support_level"],
+            "peak_high": c["resistance_level"], "peak_gain_pct": round((c["resistance_level"] - c["support_level"]) / c["support_level"] * 100, 2),
+            "pullback_low": c["support_level"], "pullback_pct": 0,
+            "breakout_pct": 0,
+            "accel_gain": 0, "accel_days": 0, "pullback_days": 0,
+            "wave1_days": 0, "wave2_days": 0, "wave3_days": 0, "wave_total_days": 0,
             **result,
         })
 
@@ -545,8 +779,210 @@ TEST_CODES = [
     "002736","002739","002745","002756","002761","002791","002797",
     "002812","002821","002831","002841","002850","002867","002916",
     "002920","002926","002938","002945","002966","002984","003816",
-    # ── 创业板/科创板已移除，仅保留主板 ──
+    # ── 创业板 (300/301) ── 少量活跃股
+    "300003","300009","300012","300014","300015","300017","300024",
+    "300027","300033","300037","300042","300044","300058","300059",
+    "300070","300072","300073","300078","300088","300098","300115",
+    "300118","300122","300124","300130","300133","300136","300140",
+    "300142","300144","300146","300152","300166","300168","300170",
+    "300171","300176","300182","300188","300197","300207","300212",
+    "300223","300226","300233","300236","300244","300251","300253",
+    "300257","300271","300274","300284","300285","300296","300308",
+    "300315","300316","300323","300324","300327","300347","300357",
+    "300363","300373","300376","300383","300390","300394","300395",
+    "300398","300408","300413","300418","300433","300438","300442",
+    "300450","300454","300457","300459","300474","300482","300487",
+    "300496","300498","300502","300529","300558","300568","300595",
+    "300601","300618","300628","300630","300661","300676","300699",
+    "300724","300750","300760","300763","300769","300773","300782",
+    "300832","300841","300861","300866","300888","300896","301269",
 ]
+
+# ================================================================
+# --today 模式: 今日信号 + 持仓建议
+# ================================================================
+def calc_buy_tiers(signal_price, board):
+    """基于信号价计算多档买入建议价
+
+    箱体底部买入策略, 次日收盘价买入。
+    给出不同开盘跳空下的参考买入价。
+    主板: -2% ~ +2% (策略要求平开)
+    创/科板: -3% ~ +2%
+    """
+    if board in ('创业板', '科创板'):
+        gaps = [-3, -2, -1, 0, 1, 2]
+    else:
+        gaps = [-2, -1, -0.5, 0, 0.5, 1, 2]
+    tiers = []
+    for g in gaps:
+        price = round(signal_price * (1 + g / 100), 2)
+        tiers.append((g, price))
+    return tiers
+
+
+def calc_signal_score(t):
+    """计算信号质量评分 (0~100)
+
+    基于信号日已知数据:
+    - 箱体数量: 每个 +20 分 (2箱=40, 3箱=60, 4箱=80)
+    - 确认类型: 收阳线=20, 量缩=10, 长下影线=5
+    - 量比: <1=10, <0.8=15 (卖压衰竭)
+    - MA5斜率: >0.3=10, >0.5=15
+    """
+    score = 0
+    box_count = t.get('box_count', 0)
+    score += min(box_count * 20, 80)
+    confirm = t.get('confirm_type', '')
+    if confirm == 'bullish':
+        score += 20
+    elif confirm == 'vol_shrink':
+        score += 10
+    elif confirm == 'long_shadow':
+        score += 5
+    vol_ratio = t.get('vol_ratio', 1.0)
+    if vol_ratio < 0.8:
+        score += 15
+    elif vol_ratio < 1.0:
+        score += 10
+    ma5_slope = t.get('ma5_slope', 0)
+    if ma5_slope > 0.5:
+        score += 15
+    elif ma5_slope > 0.3:
+        score += 10
+    return score
+
+
+def signal_quality_label(score):
+    """信号质量标签"""
+    if score >= 80: return '极强'
+    if score >= 60: return '强'
+    if score >= 40: return '中'
+    return '弱'
+
+
+def print_today_signals(all_trades, today_str):
+    """今日信号 + 持仓卖出建议
+
+    信号日=今天 → 次日收盘价买入
+    持仓: 入场日<=今天 且 入场日>=20天前
+    """
+    from datetime import datetime, timedelta
+
+    today_signals = [t for t in all_trades if t.get('signal_date') == today_str]
+
+    print(f"\n{'=' * 80}")
+    print(f"{today_str} 今日信号 (信号日, 次日收盘价买入)")
+    print(f"{'=' * 80}")
+
+    if not today_signals:
+        print(f"  今日无信号")
+    else:
+        print(f"  共 {len(today_signals)} 只股票出现信号")
+        today_signals.sort(key=lambda x: -calc_signal_score(x))
+
+        print(f"\n  多箱体底部买入 ({len(today_signals)}只):")
+        print(f"  {'代码':>8} {'板块':>6} {'质量':>6} {'评分':>4} {'箱体':>4} {'确认':>8} "
+              f"{'信号价':>8} {'支撑':>8} {'阻力':>8} {'量比':>6} {'MA5斜':>6} {'流通值':>8}")
+        print(f"  {'-' * 95}")
+        for t in today_signals:
+            code, board = t['code'], t['board']
+            score = calc_signal_score(t)
+            label = signal_quality_label(score)
+            signal_price = t.get('signal_close', t.get('entry_price', 0))
+            tiers = calc_buy_tiers(signal_price, board)
+            tier_str = ' / '.join([f"{g:+.1f}%->{p:.2f}" for g, p in tiers])
+
+            print(f"  {code:>8} {board:>6} {label:>6} {score:>3}  "
+                  f"{t.get('box_count',0):>4}箱 {t.get('confirm_type',''):<8} "
+                  f"{signal_price:>7.2f} {t.get('box_low',0):>7.2f} {t.get('box_high',0):>7.2f} "
+                  f"{t.get('vol_ratio',0):>5.2f}x {t.get('ma5_slope',0):>5.3f} "
+                  f"{t.get('circ_mcap',0):>6.1f}亿")
+            print(f"  {'':>10} 买入建议(明日收盘): {tier_str}")
+
+        print(f"\n  箱体详情:")
+        for t in today_signals:
+            print(f"    {t['code']}({t['board']}) "
+                  f"支撑{t.get('box_low',0):.2f} 阻力{t.get('box_high',0):.2f} "
+                  f"振幅{t.get('box_range_pct',0):.1f}% "
+                  f"RSI={t.get('rsi',0):.1f} MA60={t.get('ma60',0):.2f} "
+                  f"距MA60={t.get('close_vs_ma60',0):+.1f}%")
+
+    # 持仓卖出建议
+    today_dt = datetime.strptime(today_str, '%Y-%m-%d')
+    recent_cutoff = (today_dt - timedelta(days=20)).strftime('%Y-%m-%d')
+    recent_entries = [t for t in all_trades
+                      if t.get('entry_date', '') <= today_str
+                      and t.get('entry_date', '') >= recent_cutoff]
+
+    if recent_entries:
+        for t in recent_entries:
+            entry_dt = datetime.strptime(t['entry_date'], '%Y-%m-%d')
+            t['_hold_days'] = (today_dt - entry_dt).days
+
+        exited = [t for t in recent_entries
+                  if t.get('exit_day', 0) > 0 and t['_hold_days'] >= t.get('exit_day', 999)]
+        holding = [t for t in recent_entries if t not in exited]
+
+        print(f"\n{'=' * 80}")
+        print(f"持仓分析 (最近20天入场)")
+        print(f"{'=' * 80}")
+        print(f"  总计: {len(recent_entries)}只 | 已出场: {len(exited)}只 | 持有中: {len(holding)}只")
+
+        if holding:
+            holding.sort(key=lambda x: x.get('return_pct', 0))
+
+            losers = [t for t in holding if t.get('return_pct', 0) < -3]
+            winners = [t for t in holding if t.get('return_pct', 0) >= 5]
+            watch = [t for t in holding if -3 <= t.get('return_pct', 0) < 5]
+
+            if losers:
+                print(f"\n  亏损持仓 - 关注止损 ({len(losers)}只):")
+                print(f"  {'代码':>8} {'板块':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'收益':>8} {'峰值':>8} {'回撤':>8}")
+                print(f"  {'-' * 80}")
+                for t in sorted(losers, key=lambda x: x.get('return_pct', 0)):
+                    ret = t.get('return_pct', 0)
+                    peak = t.get('peak_return_pct', 0)
+                    drawdown = peak - ret if peak > 0 else 0
+                    print(f"  {t['code']:>8} {t['board']:>6} {t['entry_date']:>12} "
+                          f"{t['entry_price']:>7.2f} {t['_hold_days']:>5}天 "
+                          f"{ret:>+7.2f}% {peak:>+7.2f}% {drawdown:>7.1f}%")
+
+            if winners:
+                print(f"\n  盈利持仓 - 关注止盈 ({len(winners)}只):")
+                print(f"  {'代码':>8} {'板块':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'收益':>8} {'峰值':>8} {'出场规则'}")
+                print(f"  {'-' * 85}")
+                for t in sorted(winners, key=lambda x: -x.get('return_pct', 0)):
+                    ret = t.get('return_pct', 0)
+                    peak = t.get('peak_return_pct', 0)
+                    if peak >= 15:
+                        rule = '已到止盈线'
+                    elif peak >= 5:
+                        rule = f'跟踪止损(峰值{peak:.1f}%回撤5%%)'
+                    else:
+                        rule = '止损12%'
+                    print(f"  {t['code']:>8} {t['board']:>6} {t['entry_date']:>12} "
+                          f"{t['entry_price']:>7.2f} {t['_hold_days']:>5}天 "
+                          f"{ret:>+7.2f}% {peak:>+7.2f}% {rule}")
+
+            if watch:
+                print(f"\n  观望持仓 ({len(watch)}只):")
+                print(f"  {'代码':>8} {'板块':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'收益':>8} {'峰值':>8}")
+                print(f"  {'-' * 70}")
+                for t in watch:
+                    ret = t.get('return_pct', 0)
+                    peak = t.get('peak_return_pct', 0)
+                    print(f"  {t['code']:>8} {t['board']:>6} {t['entry_date']:>12} "
+                          f"{t['entry_price']:>7.2f} {t['_hold_days']:>5}天 "
+                          f"{ret:>+7.2f}% {peak:>+7.2f}%")
+
+            print(f"\n  出场规则提醒:")
+            print(f"    止盈: 盈利>=15% 后从峰值回撤即出场")
+            print(f"    止损: 从峰值回撤12% (主板20%)")
+            print(f"    跟踪止损: 盈利>5%后激活, 从峰值回撤5%出场")
+            print(f"    持仓上限: 10天")
+
+    return today_signals
+
 
 # ================================================================
 # 统计输出
@@ -574,17 +1010,17 @@ def print_stats(trades, label):
 # 主流程
 # ================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="底部震荡 + 弱转强 策略 独立回测")
+    parser = argparse.ArgumentParser(description="多箱体底部买入 策略 独立回测")
     parser.add_argument("--codes", default="", help="逗号分隔的股票代码")
     parser.add_argument("--days", type=int, default=300, help="加载K线天数 (默认300)")
     parser.add_argument("--source", choices=["manual", "db"], default="manual",
                         help="数据源: manual(默认), db")
 
-    # 弱转强参数
-    parser.add_argument("--vol-expand", type=float, default=1.3,
-                        help="D-2放量倍数 (默认1.3)")
-    parser.add_argument("--vol-shrink-ratio", type=float, default=0.8,
-                        help="D0/D1缩量比例 (默认0.8)")
+    # 突破参数
+    parser.add_argument("--vol-expand-min", type=float, default=1.5,
+                        help="突破放量下限 (默认1.5)")
+    parser.add_argument("--vol-expand-max", type=float, default=3.0,
+                        help="突破放量上限 (默认3.0)")
 
     # 箱体参数
     parser.add_argument("--box-days", type=int, default=20,
@@ -592,37 +1028,47 @@ if __name__ == "__main__":
     parser.add_argument("--box-max-range", type=float, default=15.0,
                         help="箱体最大振幅%% (默认15.0)")
     parser.add_argument("--box-min-range", type=float, default=0.0,
-                        help="箱体最小振幅%% (默认0)")
+                        help="箱体最小振幅%% (默认0, 建议8)")
+    parser.add_argument("--box-min-bars", type=int, default=10,
+                        help="箱体内最少K线数 (默认10)")
 
-    # MA参数
+    # 过滤参数
+    parser.add_argument("--pullback-confirm", action="store_true", default=False,
+                        help="启用突破后回踩确认模式 (默认关闭)")
+    parser.add_argument("--pullback-days", type=int, default=3,
+                        help="回踩确认天数 (默认3)")
+
+    # 多箱体底部买入参数
+    parser.add_argument("--min-box-count", type=int, default=2,
+                        help="最少箱体数 (默认2)")
+    parser.add_argument("--support-tolerance", type=float, default=3.0,
+                        help="支撑位聚类容差%% (默认3.0)")
+    parser.add_argument("--buy-zone-pct", type=float, default=2.0,
+                        help="买入区域范围%% (默认2.0)")
     parser.add_argument("--min-ma10-slope", type=float, default=0.3,
-                        help="MA10斜率下限%%/天 (默认0.3)")
-    parser.add_argument("--min-ma60-slope", type=float, default=-0.3,
-                        help="MA60斜率下限%% (默认-0.3)")
-    parser.add_argument("--max-ma60-slope", type=float, default=0.3,
-                        help="MA60斜率上限%% (默认0.3)")
-    parser.add_argument("--max-ma-dispersion", type=float, default=5.0,
-                        help="三线离散度上限%% (默认5.0)")
-    parser.add_argument("--max-chg20d", type=float, default=12.0,
-                        help="20日涨幅上限%% (默认12.0)")
+                        help="MA10斜率下限%%/天 (默认0.3, 快斜率)")
 
     # 出场参数
     parser.add_argument("--stop-loss", type=float, default=12.0,
-                        help="跟踪止损回撤%% (默认12.0)")
+                        help="止损%% (默认12.0, 主板自适应20%%)")
     parser.add_argument("--trailing-pct", type=float, default=5.0,
                         help="跟踪止损回撤%% (默认5.0)")
     parser.add_argument("--trailing-activate", type=float, default=5.0,
                         help="跟踪止损激活门槛%% (默认5.0)")
     parser.add_argument("--take-profit", type=float, default=15.0,
                         help="止盈%% (默认15.0)")
-    parser.add_argument("--max-hold", type=int, default=30,
-                        help="最大持仓天数 (默认30)")
+    parser.add_argument("--max-hold", type=int, default=10,
+                        help="最大持仓天数 (默认10)")
     parser.add_argument("--board-adaptive", action="store_true", default=True,
                         help="板块自适应参数 (默认开启)")
     parser.add_argument("--no-board-adaptive", action="store_false", dest="board_adaptive",
                         help="禁用板块自适应")
 
     # 其他
+    parser.add_argument("--today", action="store_true",
+                        help="显示今日信号+持仓卖出建议")
+    parser.add_argument("--today-date", type=str, default="",
+                        help="指定日期(YYYY-MM-DD), 配合--today使用, 默认为当天")
     parser.add_argument("--top-per-day", type=int, default=2,
                         help="每天最多选前N个 (默认2)")
     parser.add_argument("--top", type=int, default=10, help="显示TOP N (默认10)")
@@ -638,28 +1084,29 @@ if __name__ == "__main__":
         print(f"   全市场: {len(codes)} 只股票")
 
     print(f"{'=' * 80}")
-    print(f"底部震荡 + 弱转强 策略 独立回测")
+    print(f"多箱体底部买入 策略 独立回测")
     print(f"{'=' * 80}")
     print(f"入场条件:")
-    print(f"  ① 弱转强信号: D-2放量上涨(>{args.vol_expand}x) → D-1缩量回调(<0.8x) → D0上涨(0.8-1.2x D0/D-1)")
-    print(f"  ② 底部确认: 前20日涨幅<{args.max_chg20d}%, 前20日振幅<{args.box_max_range}%")
-    print(f"  ③ MA10加速: 斜率>={args.min_ma10_slope}%")
-    print(f"  ④ MA20加速: 斜率>0且递增")
-    print(f"  ⑤ MA60走平: {args.min_ma60_slope}%~{args.max_ma60_slope}%")
-    print(f"  ⑥ 换手率: 2.5%~6%")
+    print(f"  ① 历史箱体: 过去{args.box_days*4}天内识别多个整理区间")
+    print(f"  ② 箱体参数: {args.box_days}日窗口, 振幅{args.box_min_range}%~{args.box_max_range}%, 至少70%K线在区间内")
+    print(f"  ③ 支撑确认: ≥{args.min_box_count}个箱体下沿接近(±{args.support_tolerance}%)，贪心聚类")
+    print(f"  ④ 趋势过滤: MA10斜率>{args.min_ma10_slope}%/天且递增, MA20斜率>0且递增")
+    print(f"  ⑤ 底部买入: 价格触及支撑位±{args.buy_zone_pct}%区域")
+    print(f"  ⑥ 反弹确认: 收阳线/量缩(<5日均量×0.8)/长下影线(>实体×1.5)，至少满足一个")
+    print(f"  ⑦ 板块过滤: 创/科板流通市值<30亿")
+    print(f"  ⑧ 买入日: 涨跌幅-3%~+3%, 跳空-0.5%~+0.5%, 振幅<3%, 收盘价买入")
     print(f"出场条件:")
-    print(f"  ① 峰值回撤12%出场")
-    print(f"  ② 持仓上限: {args.max_hold}天")
+    print(f"  ① 止盈: {args.take_profit}%")
+    print(f"  ② 止损: 从峰值回撤{args.stop_loss}% (主板自适应20%)")
+    print(f"  ③ 跟踪止损: 盈利>{args.trailing_activate}%后激活, 从峰值回撤{args.trailing_pct}%")
+    print(f"  ④ 持仓上限: {args.max_hold}天")
+    print(f"信号筛选: 每天最多{args.top_per_day}个 (按箱体数>收阳>量缩排序)")
     print(f"股票: {len(codes)}只\n")
 
     all_trades = []
     success = 0
 
     for i, code in enumerate(codes):
-        # 屏蔽创业板/科创板
-        if code.startswith('300') or code.startswith('301') or code.startswith('688'):
-            continue
-
         bars = fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days)
         if not bars:
             continue
@@ -667,28 +1114,30 @@ if __name__ == "__main__":
         # 板块自适应参数
         board = get_board_name(code)
         if args.board_adaptive and board in ('沪主板', '深主板'):
-            _stop_loss = 8.0
+            _stop_loss = 20.0  # 主板放宽到20%
         else:
             _stop_loss = args.stop_loss
 
-        trades = strategy_bottom_reversal(
+        trades = strategy_peak_breakout(
             bars, code,
             box_days=args.box_days,
             box_max_range=args.box_max_range,
             box_min_range=args.box_min_range,
-            vol_expand=args.vol_expand,
-            vol_shrink_ratio=args.vol_shrink_ratio,
-            min_ma10_slope=args.min_ma10_slope,
-            min_ma60_slope=args.min_ma60_slope,
-            max_ma60_slope=args.max_ma60_slope,
-            max_ma_dispersion=args.max_ma_dispersion,
-            max_chg_20d=args.max_chg20d,
+            box_min_bars=args.box_min_bars,
+            vol_expand_min=args.vol_expand_min,
+            vol_expand_max=args.vol_expand_max,
             stop_loss_pct=_stop_loss,
             trailing_pct=args.trailing_pct,
             trailing_activate_pct=args.trailing_activate,
             take_profit_pct=args.take_profit,
             max_hold_days=args.max_hold,
             top_per_day=args.top_per_day,
+            pullback_confirm=args.pullback_confirm,
+            pullback_days=args.pullback_days,
+            min_box_count=args.min_box_count,
+            support_tolerance=args.support_tolerance,
+            buy_zone_pct=args.buy_zone_pct,
+            min_ma10_slope=args.min_ma10_slope,
         )
 
         all_trades.extend(trades)
@@ -713,6 +1162,13 @@ if __name__ == "__main__":
             if seg:
                 print_stats(seg, board)
 
+        # 按策略路径统计
+        print(f"\n--- 策略路径统计 ---")
+        for path_label in sorted(set(t.get('path_label', t.get('path', '')) for t in all_trades)):
+            seg = [t for t in all_trades if t.get('path_label', t.get('path', '')) == path_label]
+            if seg:
+                print_stats(seg, path_label)
+
         # 按出场原因统计
         print(f"\n--- 出场原因统计 ---")
         from collections import Counter
@@ -720,19 +1176,38 @@ if __name__ == "__main__":
             seg = [t for t in all_trades if t['exit_reason'] == reason]
             print_stats(seg, reason)
 
-        # 按20日涨幅分段
-        print(f"\n--- 20日涨幅分段 ---")
-        for lo, hi in [(-99, 0), (0, 5), (5, 10), (10, 15)]:
-            seg = [t for t in all_trades if lo <= t['chg_20d'] < hi]
+        # 按突破幅度分段
+        print(f"\n--- 突破幅度分段 ---")
+        for lo, hi in [(0, 1), (1, 3), (3, 5), (5, 100)]:
+            seg = [t for t in all_trades if lo <= t['breakout_pct'] < hi]
             if seg:
-                print_stats(seg, f"20日涨幅[{lo},{hi})%")
+                print_stats(seg, f"突破[{lo},{hi})%")
+
+        # 按洗盘天数分段
+        print(f"\n--- 洗盘天数分段 ---")
+        for lo, hi in [(3, 8), (8, 12), (12, 20), (20, 100)]:
+            seg = [t for t in all_trades if lo <= t['pullback_days'] < hi]
+            if seg:
+                print_stats(seg, f"洗盘[{lo},{hi})天")
 
         # 按放量倍数分段
-        print(f"\n--- D0/D-2量比 ---")
-        for lo, hi in [(0, 0.5), (0.5, 0.8), (0.8, 1.0), (1.0, 1.5), (1.5, 2.0)]:
-            seg = [t for t in all_trades if lo <= t['vol_ratio_d0_d2'] < hi]
+        print(f"\n--- 放量倍数分段(相对洗盘期间) ---")
+        for lo, hi in [(1.0, 1.3), (1.3, 1.5), (1.5, 2.0), (2.0, 3.0)]:
+            seg = [t for t in all_trades if lo <= t['vol_ratio_vs_pullback'] < hi]
             if seg:
-                print_stats(seg, f"量比[{lo},{hi})")
+                print_stats(seg, f"放量[{lo},{hi})x")
+
+        # MA5斜率
+        print(f"\n--- MA5斜率 ---")
+        for lo,hi,label in [(-99,0,'负'),(0,0.3,'缓'),(0.3,0.6,'中'),(0.6,99,'快')]:
+            ts=[t for t in all_trades if lo<=t.get('ma5_slope',0)<hi]
+            if ts: print_stats(ts, label)
+
+        # MA5加速度
+        print(f"\n--- MA5加速度 ---")
+        for lo,hi,label in [(-99,-0.1,'减速'),(-0.1,0.1,'平稳'),(0.1,0.3,'加速'),(0.3,99,'强加速')]:
+            ts=[t for t in all_trades if lo<=t.get('ma5_accel',0)<hi]
+            if ts: print_stats(ts, label)
 
         # MA10斜率
         print(f"\n--- MA10斜率 ---")
@@ -740,51 +1215,178 @@ if __name__ == "__main__":
             ts=[t for t in all_trades if lo<=t.get('ma10_slope',0)<hi]
             if ts: print_stats(ts, label)
 
-        # MA60斜率
-        print(f"\n--- MA60斜率 ---")
-        for lo,hi,label in [(-99,-0.3,'弱下'),(-0.3,0,'走平'),(0,0.3,'弱上'),(0.3,99,'强上')]:
-            ts=[t for t in all_trades if lo<=t.get('ma60_slope',0)<hi]
-            if ts: print_stats(ts, label)
-
-        # 三线离散度
-        print(f"\n--- 三线离散度 ---")
-        for lo,hi,label in [(-99,0,'MA10<MA60'),(0,2,'粘合'),(2,5,'轻微'),(5,10,'中等')]:
-            ts=[t for t in all_trades if lo<=t.get('ma_dispersion',0)<hi]
+        # 流通市值
+        print(f"\n--- 流通市值 ---")
+        for lo,hi,label in [(0,50,'<50亿'),(50,100,'50~100亿'),(100,500,'100~500亿'),(500,2000,'500~2000亿')]:
+            ts=[t for t in all_trades if lo<=t.get('circ_mcap',0)<hi]
             if ts: print_stats(ts, label)
 
         # 换手率
         print(f"\n--- 换手率 ---")
-        for lo,hi in [(2.5,3),(3,4),(4,5),(5,6)]:
+        for lo,hi in [(0,2),(2,5),(5,10),(10,20),(20,100)]:
             ts=[t for t in all_trades if lo<=t.get('turnover',0)<hi]
             if ts: print_stats(ts, f"[{lo},{hi})%")
 
-        # 流通市值
-        print(f"\n--- 流通市值 ---")
-        for lo,hi,label in [(0,30,'<30亿'),(30,100,'30~100亿'),(100,500,'100~500亿'),(500,9999,">500亿")]:
-            ts=[t for t in all_trades if lo<=t.get('circ_mcap',0)<hi]
-            if ts: print_stats(ts, label)
-
-        # 总市值
-        print(f"\n--- 总市值 ---")
-        for lo,hi,label in [(0,50,'<50亿'),(50,200,'50~200亿'),(200,1000,'200~1000亿'),(1000,9999,">1000亿")]:
-            ts=[t for t in all_trades if lo<=t.get('total_mcap',0)<hi]
-            if ts: print_stats(ts, label)
+        # 买入日分析
+        print(f"\n{'='*60}")
+        print(f"买入日特征分析")
+        print(f"{'='*60}")
+        
+        buy_day_results = []
+        for t in all_trades:
+            code = t['code']
+            entry_date = t['entry_date']
+            signal_date = t['signal_date']
+            
+            bars = fetch_kline(code, args.days)
+            if not bars or len(bars) < 60:
+                continue
+            
+            sig_idx = None
+            entry_idx = None
+            for i, b in enumerate(bars):
+                if b['time'] == signal_date:
+                    sig_idx = i
+                if b['time'] == entry_date:
+                    entry_idx = i
+            
+            if sig_idx is None or entry_idx is None or entry_idx < 1:
+                continue
+            
+            closes = [b['close'] for b in bars]
+            opens = [b['open'] for b in bars]
+            highs = [b['high'] for b in bars]
+            lows = [b['low'] for b in bars]
+            volumes = [b['volume'] for b in bars]
+            
+            sig_close = closes[sig_idx]
+            sig_vol = volumes[sig_idx]
+            
+            buy_open = opens[entry_idx]
+            buy_close = closes[entry_idx]
+            buy_high = highs[entry_idx]
+            buy_low = lows[entry_idx]
+            buy_vol = volumes[entry_idx]
+            
+            gap_pct = (buy_open / sig_close - 1) * 100
+            buy_chg = (buy_close / buy_open - 1) * 100
+            buy_vol_ratio = buy_vol / sig_vol if sig_vol > 0 else 1.0
+            avg_vol_5 = sum(volumes[max(0,entry_idx-5):entry_idx]) / min(5, entry_idx) if entry_idx > 0 else buy_vol
+            buy_vol_ratio_5 = buy_vol / avg_vol_5 if avg_vol_5 > 0 else 1.0
+            buy_range = (buy_high - buy_low) / buy_open * 100 if buy_open > 0 else 0
+            buy_lower_shadow = min(buy_close, buy_open) - buy_low
+            buy_body = abs(buy_close - buy_open)
+            buy_has_lower_shadow = buy_lower_shadow > buy_body * 0.5 if buy_body > 0 else buy_lower_shadow > 0
+            
+            buy_day_results.append({
+                **t,
+                'gap_pct': round(gap_pct, 2),
+                'buy_chg': round(buy_chg, 2),
+                'buy_vol_ratio': round(buy_vol_ratio, 2),
+                'buy_vol_ratio_5': round(buy_vol_ratio_5, 2),
+                'buy_range': round(buy_range, 2),
+                'buy_has_lower_shadow': buy_has_lower_shadow,
+            })
+        
+        if buy_day_results:
+            big_buy = [t for t in buy_day_results if t.get('peak_return_pct',0) >= 20]
+            bad_buy = [t for t in buy_day_results if t.get('peak_return_pct',0) < 5]
+            
+            # 高开/低开
+            print(f"\n--- 高开/低开分析 ---")
+            for label, cond in [('高开(>0.5%)', lambda t: t['gap_pct'] > 0.5),
+                                 ('平开(-0.5~0.5%)', lambda t: -0.5 <= t['gap_pct'] <= 0.5),
+                                 ('低开(<-0.5%)', lambda t: t['gap_pct'] < -0.5)]:
+                seg = [t for t in buy_day_results if cond(t)]
+                if seg:
+                    print_stats(seg, label)
+            
+            # 开口大小
+            print(f"\n--- 开口大小分段 ---")
+            for lo,hi in [(-99,-2),(-2,-1),(-1,0),(0,1),(1,2),(2,99)]:
+                seg = [t for t in buy_day_results if lo<=t['gap_pct']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日涨跌
+            print(f"\n--- 买入日涨跌幅 ---")
+            for lo,hi in [(-99,-3),(-3,-1),(-1,0),(0,1),(1,3),(3,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_chg']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日量比(vs信号日)
+            print(f"\n--- 买入日量比(vs信号日) ---")
+            for lo,hi in [(0,0.5),(0.5,0.8),(0.8,1.0),(1.0,1.5),(1.5,2.0),(2.0,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_vol_ratio']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})")
+            
+            # 买入日量比(vs前5日均量)
+            print(f"\n--- 买入日量比(vs前5日均量) ---")
+            for lo,hi in [(0,0.5),(0.5,0.8),(0.8,1.0),(1.0,1.5),(1.5,2.0),(2.0,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_vol_ratio_5']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})")
+            
+            # 买入日振幅
+            print(f"\n--- 买入日振幅 ---")
+            for lo,hi in [(0,2),(2,3),(3,5),(5,8),(8,99)]:
+                seg = [t for t in buy_day_results if lo<=t['buy_range']<hi]
+                if seg:
+                    print_stats(seg, f"[{lo},{hi})%")
+            
+            # 买入日下影线
+            print(f"\n--- 买入日下影线 ---")
+            for label, cond in [('有下影线', lambda t: t['buy_has_lower_shadow']),
+                                 ('无下影线', lambda t: not t['buy_has_lower_shadow'])]:
+                seg = [t for t in buy_day_results if cond(t)]
+                if seg:
+                    print_stats(seg, label)
+            
+            # 大赢家特征
+            if big_buy and bad_buy:
+                print(f"\n--- 大赢家 vs 低质量 效应量 ---")
+                for field in ['gap_pct', 'buy_chg', 'buy_vol_ratio', 'buy_vol_ratio_5', 'buy_range']:
+                    b_vals = [t.get(field, 0) for t in big_buy]
+                    d_vals = [t.get(field, 0) for t in bad_buy]
+                    if b_vals and d_vals:
+                        import numpy as np
+                        b_arr = np.array(b_vals)
+                        d_arr = np.array(d_vals)
+                        diff = abs(b_arr.mean() - d_arr.mean())
+                        pooled_std = np.sqrt((b_arr.std()**2 + d_arr.std()**2) / 2)
+                        effect = diff / pooled_std if pooled_std > 0 else 0
+                        effect_level = '***强' if effect > 0.8 else '**中' if effect > 0.5 else '*弱' if effect > 0.2 else '无'
+                        print(f"  {field}: 大赢家{b_arr.mean():.2f} 低质量{d_arr.mean():.2f} 效应量{effect:.3f} {effect_level}")
 
         # TOP N
         n = min(args.top, len(all_trades))
         print(f"\n--- TOP {n} 最佳交易 ---")
         for t in sorted(all_trades, key=lambda x: -x['return_pct'])[:n]:
             print(f"  {t['code']}({t['board']}) {t['signal_date']} "
-                  f"买{t['entry_price']:>7.2f} "
-                  f"收益{t['return_pct']:+.2f}% 均峰{t['peak_return_pct']:+.2f}% "
-                  f"持仓{t['exit_day']}天 {t['exit_reason']}")
+                  f"第一底{t['first_trough_low']} 颈线{t['neckline_high']} "
+                  f"第二底{t['second_trough_low']} "
+                  f"→ {t['entry_date']}买{t['entry_price']:>7.2f} "
+                  f"收益{t['return_pct']:+.2f}% 持仓{t['exit_day']}天")
 
         print(f"\n--- TOP {n} 最差交易 ---")
         for t in sorted(all_trades, key=lambda x: x['return_pct'])[:n]:
             print(f"  {t['code']}({t['board']}) {t['signal_date']} "
-                  f"买{t['entry_price']:>7.2f} "
-                  f"收益{t['return_pct']:+.2f}% 均峰{t['peak_return_pct']:+.2f}% "
-                  f"持仓{t['exit_day']}天 {t['exit_reason']}")
+                  f"第一底{t['first_trough_low']} 颈线{t['neckline_high']} "
+                  f"第二底{t['second_trough_low']} "
+                  f"→ {t['entry_date']}买{t['entry_price']:>7.2f} "
+                  f"收益{t['return_pct']:+.2f}% 持仓{t['exit_day']}天")
+
+    # --today 模式: 今日信号 + 持仓建议
+    if args.today:
+        today_str = args.today_date or time.strftime("%Y-%m-%d")
+        today_trades = print_today_signals(all_trades, today_str)
+        if today_trades:
+            out_today = f"today_signals_{today_str}.json"
+            with open(out_today, 'w', encoding='utf-8') as f:
+                json.dump(today_trades, f, ensure_ascii=False, indent=2)
+            print(f"\n  {out_today} ({len(today_trades)}笔)")
 
     # 保存JSON
     if all_trades:

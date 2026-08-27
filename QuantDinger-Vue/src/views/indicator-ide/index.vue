@@ -47,6 +47,7 @@
                 allow-clear
                 show-search
                 option-filter-prop="children"
+                :getPopupContainer="popupContainer"
                 @change="onIndicatorChange"
               >
                 <a-select-option
@@ -64,6 +65,7 @@
               trigger="click"
               placement="bottomRight"
               overlay-class-name="settings-popover"
+              :getPopupContainer="popupContainer"
             >
               <template slot="content">
                 <div class="settings-popover-body">
@@ -126,6 +128,7 @@
                 trigger="click"
                 placement="bottomLeft"
                 overlay-class-name="indicator-checkbox-popover"
+                :getPopupContainer="popupContainer"
               >
                 <template slot="content">
                   <div class="indicator-pro-popover">
@@ -873,6 +876,7 @@
       :confirmLoading="addingStock"
       width="560px"
       :wrap-class-name="isDarkTheme ? 'ide-modal-wrap ide-modal-wrap--dark' : 'ide-modal-wrap'"
+      :getPopupContainer="popupContainer"
     >
       <a-tabs v-model="addMarketTab" size="small" class="ide-add-market-tabs" @change="onAddMarketTabChange">
         <a-tab-pane
@@ -933,6 +937,7 @@
       :okText="publishIndicator && publishIndicator.publish_to_community ? $t('dashboard.indicator.publish.update') : $t('dashboard.indicator.publish.confirm')"
       :cancelText="$t('dashboard.indicator.editor.cancel')"
       :wrap-class-name="isDarkTheme ? 'ide-modal-wrap ide-modal-wrap--dark' : 'ide-modal-wrap'"
+      :getPopupContainer="popupContainer"
       @ok="handleConfirmPublish"
       @cancel="showPublishModal = false; publishIndicator = null"
     >
@@ -979,6 +984,7 @@
       :okText="$t('indicatorIde.saveAsConfirm')"
       :cancelText="$t('dashboard.indicator.editor.cancel')"
       :wrap-class-name="isDarkTheme ? 'ide-modal-wrap ide-modal-wrap--dark' : 'ide-modal-wrap'"
+      :getPopupContainer="popupContainer"
       @ok="confirmSaveAsIndicator"
       @cancel="showSaveAsModal = false"
     >
@@ -1258,6 +1264,15 @@ export default {
     },
     tfMaxDays () {
       return TF_MAX_DAYS[this.timeframe] || 3650
+    },
+    /** 弹窗容器：全屏时挂载到全屏元素内 */
+    popupContainer () {
+      return (trigger) => {
+        if (document.fullscreenElement || document.webkitFullscreenElement) {
+          return this.$el
+        }
+        return trigger.parentNode || document.body
+      }
     },
     /** 主图指标（过滤后） */
     filteredMainIndicators () {

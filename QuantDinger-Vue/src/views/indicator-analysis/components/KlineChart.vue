@@ -2272,12 +2272,6 @@ registerOverlay({
               setTimeout(() => {
                 if (chartRef.value) {
                   updateIndicators()
-                  // 滚动到最新K线，Y轴自动适配可见区域极值
-                  try {
-                    if (typeof chartRef.value.scrollToRealTime === 'function') {
-                      chartRef.value.scrollToRealTime()
-                    }
-                  } catch (_) {}
                 }
               }, 100)
             }
@@ -3322,20 +3316,27 @@ registerOverlay({
     }
 
     // --- 注册自定义指标辅助函数 ---
-    const registerCustomIndicator = (name, calcFunc, figures, calcParams = [], precision = -1, shouldOverlay = false) => {
-      if (precision < 0) precision = pricePrecision.value
-      try {
-        // KLineChart v9 使用 series: 'price' 来标识主图指标
-        const indicatorConfig = {
-          name,
-          shortName: name, // 添加 shortName
+    const registerCustomIndicator = (nameOrObj, calcFunc, figures, calcParams = [], precision = -1, shouldOverlay = false) => {
+      let indicatorConfig
+      if (typeof nameOrObj === 'object' && nameOrObj !== null) {
+        // 对象参数形式（支持 draw 等高级配置）
+        indicatorConfig = { ...nameOrObj }
+        if (!indicatorConfig.precision) indicatorConfig.precision = pricePrecision.value
+        if (!indicatorConfig.series) indicatorConfig.series = 'normal'
+      } else {
+        // 传统参数形式
+        if (precision < 0) precision = pricePrecision.value
+        indicatorConfig = {
+          name: nameOrObj,
+          shortName: nameOrObj,
           calc: calcFunc,
           figures,
           calcParams,
           precision,
           series: shouldOverlay ? 'price' : 'normal'
         }
-
+      }
+      try {
         registerIndicator(indicatorConfig)
         // console.log(`成功注册指标: ${name}, series: ${indicatorConfig.series}`)
         return true
@@ -3889,15 +3890,6 @@ registerOverlay({
               style: 'solid'
             })
           })
-          const buildBarFigure = (key, title, figureColor = color) => ({
-            key,
-            title,
-            type: 'bar',
-            color: figureColor,
-            styles: () => ({
-              color: figureColor
-            })
-          })
 
           // 根据指标类型创建 KLineChart 指标
           if (indicator.id === 'sma' || indicator.id === 'ema') {
@@ -3927,26 +3919,48 @@ registerOverlay({
             const signal = indicator.params?.signal || 9
             const customIndicatorName = buildUniqueIndicatorName(`MACD_${fast}_${slow}_${signal}`)
             try {
-              const registered = registerCustomIndicator(
-                customIndicatorName,
-                (kLineDataList, indicator) => {
-                  const fast = indicator.calcParams[0] || 12
-                  const slow = indicator.calcParams[1] || 26
-                  const signal = indicator.calcParams[2] || 9
-                  const macdValues = calculateMACD(kLineDataList, fast, slow, signal)
+              const registered = registerCustomIndicator({
+                name: customIndicatorName,
+                shortName: customIndicatorName,
+                calcParams: [fast, slow, signal],
+                figures: [
+                  buildLineFigure('macd', `MACD(${fast},${slow})`, color, lineWidth),
+                  buildLineFigure('signal', `SIGNAL(${signal})`, '#fa8c16', lineWidth),
+                  { key: 'histogram', title: 'HIST', type: 'bar' }
+                ],
+                calc: (kLineDataList, indicator) => {
+                  const f = indicator.calcParams[0] || 12
+                  const s = indicator.calcParams[1] || 26
+                  const sig = indicator.calcParams[2] || 9
+                  const macdValues = calculateMACD(kLineDataList, f, s, sig)
                   return macdValues.macd.map((value, i) => ({
                     macd: value,
                     signal: macdValues.signal[i],
                     histogram: macdValues.histogram[i]
                   }))
                 },
-                [
-                  buildLineFigure('macd', `MACD(${fast},${slow})`, color, lineWidth),
-                  buildLineFigure('signal', `SIGNAL(${signal})`, '#fa8c16', lineWidth),
-                  buildBarFigure('histogram', 'HIST', '#722ed1')
-                ],
-                [fast, slow, signal]
-              )
+                draw: ({ ctx, indicator, visibleRange, bounding, barSpace }) => {
+                  const isDark = props.theme === 'dark'
+                  const posColor = isDark ? '#0ecb81' : '#52c41a'
+                  const negColor = isDark ? '#ef5350' : '#f5222d'
+                  const halfBar = barSpace.halfBar
+                  const calcData = indicator.result || []
+                  const yAxis = indicator.yAxis
+                  if (!yAxis || !yAxis.convertToPixel) return false
+                  const zeroY = yAxis.convertToPixel(0)
+                  for (let i = visibleRange.from; i < visibleRange.to; i++) {
+                    const data = calcData[i]
+                    if (!data || data.histogram == null) continue
+                    const v = data.histogram
+                    const x = (i - visibleRange.from) * (barSpace.bar + barSpace.gapBar) + halfBar + bounding.left
+                    const barY = yAxis.convertToPixel(v)
+                    const color = v >= 0 ? posColor : negColor
+                    ctx.fillStyle = color
+                    ctx.fillRect(x - halfBar + 1, Math.min(barY, zeroY), barSpace.bar - 2, Math.abs(barY - zeroY))
+                  }
+                  return true // 返回 true 覆盖默认绘制
+                }
+              })
               if (registered) {
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
                 if (indicatorId) {
@@ -4516,7 +4530,22 @@ registerOverlay({
       }, 80)
     }
 
-    watch(() => props.symbol, debouncedLoad)
+    /** 切换股票时自动适配：加载完成后滚动到最新并适配Y轴，仅执行一次 */
+    watch(() => props.symbol, (newVal, oldVal) => {
+      if (newVal && newVal !== oldVal) {
+        debouncedLoad()
+        // 延迟执行一次自动适配
+        setTimeout(() => {
+          if (chartRef.value) {
+            try {
+              if (typeof chartRef.value.scrollToRealTime === 'function') {
+                chartRef.value.scrollToRealTime()
+              }
+            } catch (_) {}
+          }
+        }, 600)
+      }
+    })
     watch(() => props.theme, (newTheme) => {
       chartTheme.value = newTheme
       if (chartRef.value) {
