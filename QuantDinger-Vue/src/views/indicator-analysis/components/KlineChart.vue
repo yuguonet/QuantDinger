@@ -3926,7 +3926,26 @@ registerOverlay({
                 figures: [
                   buildLineFigure('macd', `MACD(${fast},${slow})`, color, lineWidth),
                   buildLineFigure('signal', `SIGNAL(${signal})`, '#fa8c16', lineWidth),
-                  { key: 'histogram', title: 'HIST', type: 'bar' }
+                  {
+                    key: 'histogram',
+                    title: 'HIST',
+                    type: 'bar',
+                    baseValue: 0,
+                    styles: (data, indicator, defaultStyles) => {
+                      const prev = data.prev
+                      const current = data.current
+                      const prevHist = prev?.indicatorData?.histogram ?? 0
+                      const currentHist = current?.indicatorData?.histogram ?? 0
+                      const isDark = props.theme === 'dark'
+                      const bars = defaultStyles.bars || []
+                      const barStyle = bars[0] || {}
+                      if (currentHist >= prevHist) {
+                        return { color: barStyle.upColor || (isDark ? '#ef5350' : '#f5222d'), style: 'fill' }
+                      } else {
+                        return { color: barStyle.downColor || (isDark ? '#0ecb81' : '#52c41a'), style: 'fill' }
+                      }
+                    }
+                  }
                 ],
                 calc: (kLineDataList, indicator) => {
                   const f = indicator.calcParams[0] || 12
@@ -3938,27 +3957,6 @@ registerOverlay({
                     signal: macdValues.signal[i],
                     histogram: macdValues.histogram[i]
                   }))
-                },
-                draw: ({ ctx, indicator, visibleRange, bounding, barSpace }) => {
-                  const isDark = props.theme === 'dark'
-                  const posColor = isDark ? '#0ecb81' : '#52c41a'
-                  const negColor = isDark ? '#ef5350' : '#f5222d'
-                  const halfBar = barSpace.halfBar
-                  const calcData = indicator.result || []
-                  const yAxis = indicator.yAxis
-                  if (!yAxis || !yAxis.convertToPixel) return false
-                  const zeroY = yAxis.convertToPixel(0)
-                  for (let i = visibleRange.from; i < visibleRange.to; i++) {
-                    const data = calcData[i]
-                    if (!data || data.histogram == null) continue
-                    const v = data.histogram
-                    const x = (i - visibleRange.from) * (barSpace.bar + barSpace.gapBar) + halfBar + bounding.left
-                    const barY = yAxis.convertToPixel(v)
-                    const color = v >= 0 ? posColor : negColor
-                    ctx.fillStyle = color
-                    ctx.fillRect(x - halfBar + 1, Math.min(barY, zeroY), barSpace.bar - 2, Math.abs(barY - zeroY))
-                  }
-                  return true // 返回 true 覆盖默认绘制
                 }
               })
               if (registered) {
