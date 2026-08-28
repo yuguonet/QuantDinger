@@ -1017,31 +1017,42 @@ export function calcPPO (klineData, fast = 12, slow = 26, signal = 9) {
  * - type: 'line' | 'macd' | 'band' | 'multi' | 'bar'
  */
 export const INDICATOR_REGISTRY = {
-  // ── 移动平均类 (主图) ──
-  wma: { calc: (d, p) => calcWMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'wma', title: 'WMA', type: 'line' }], type: 'line' },
-  dema: { calc: (d, p) => calcDEMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'dema', title: 'DEMA', type: 'line' }], type: 'line' },
-  tema: { calc: (d, p) => calcTEMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'tema', title: 'TEMA', type: 'line' }], type: 'line' },
-  hma: { calc: (d, p) => calcHMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'hma', title: 'HMA', type: 'line' }], type: 'line' },
-  kama: { calc: (d, p) => calcKAMA(d, p.length), defaultParams: { length: 10 }, figures: [{ key: 'kama', title: 'KAMA', type: 'line' }], type: 'line' },
-  alma: { calc: (d, p) => calcALMA(d, p.length), defaultParams: { length: 9 }, figures: [{ key: 'alma', title: 'ALMA', type: 'line' }], type: 'line' },
-  vwma: { calc: (d, p) => calcVWMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'vwma', title: 'VWMA', type: 'line' }], type: 'line' },
+  // ── 移动平均类 (主图 overlay) ──
+  wma: { calc: (d, p) => calcWMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'wma', title: 'WMA', type: 'line', overlay: true }], type: 'line' },
+  dema: { calc: (d, p) => calcDEMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'dema', title: 'DEMA', type: 'line', overlay: true }], type: 'line' },
+  tema: { calc: (d, p) => calcTEMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'tema', title: 'TEMA', type: 'line', overlay: true }], type: 'line' },
+  hma: { calc: (d, p) => calcHMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'hma', title: 'HMA', type: 'line', overlay: true }], type: 'line' },
+  kama: { calc: (d, p) => calcKAMA(d, p.length), defaultParams: { length: 10 }, figures: [{ key: 'kama', title: 'KAMA', type: 'line', overlay: true }], type: 'line' },
+  alma: { calc: (d, p) => calcALMA(d, p.length), defaultParams: { length: 9 }, figures: [{ key: 'alma', title: 'ALMA', type: 'line', overlay: true }], type: 'line' },
+  vwma: { calc: (d, p) => calcVWMA(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'vwma', title: 'VWMA', type: 'line', overlay: true }], type: 'line' },
 
-  // ── 通道/包络类 (主图) ──
-  kc: { calc: (d, p) => calcKC(d, p.length, p.mult), defaultParams: { length: 20, mult: 1.5 }, figures: [{ key: 'upper', title: 'Upper', type: 'line' }, { key: 'middle', title: 'Middle', type: 'line' }, { key: 'lower', title: 'Lower', type: 'line' }], type: 'band' },
-  dc: { calc: (d, p) => calcDC(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'upper', title: 'Upper', type: 'line' }, { key: 'middle', title: 'Middle', type: 'line' }, { key: 'lower', title: 'Lower', type: 'line' }], type: 'band' },
-  env: { calc: (d, p) => calcENV(d, p.length, p.pct), defaultParams: { length: 20, pct: 2.5 }, figures: [{ key: 'upper', title: 'Upper', type: 'line' }, { key: 'middle', title: 'Middle', type: 'line' }, { key: 'lower', title: 'Lower', type: 'line' }], type: 'band' },
+  // ── 通道/包络类 (主图 overlay) ──
+  kc: { calc: (d, p) => calcKC(d, p.length, p.mult), defaultParams: { length: 20, mult: 1.5 }, figures: [{ key: 'upper', title: 'Upper', type: 'line', overlay: true }, { key: 'middle', title: 'Middle', type: 'line', overlay: true }, { key: 'lower', title: 'Lower', type: 'line', overlay: true }], type: 'band' },
+  dc: { calc: (d, p) => calcDC(d, p.length), defaultParams: { length: 20 }, figures: [{ key: 'upper', title: 'Upper', type: 'line', overlay: true }, { key: 'middle', title: 'Middle', type: 'line', overlay: true }, { key: 'lower', title: 'Lower', type: 'line', overlay: true }], type: 'band' },
+  env: { calc: (d, p) => calcENV(d, p.length, p.pct), defaultParams: { length: 20, pct: 2.5 }, figures: [{ key: 'upper', title: 'Upper', type: 'line', overlay: true }, { key: 'middle', title: 'Middle', type: 'line', overlay: true }, { key: 'lower', title: 'Lower', type: 'line', overlay: true }], type: 'band' },
 
-  // ── 趋势/止损类 (主图) ──
-  supertrend: { calc: (d, p) => calcSuperTrend(d, p.length, p.mult), defaultParams: { length: 10, mult: 3 }, figures: [{ key: 'st', title: 'ST', type: 'line' }], type: 'line' },
-  vstop: { calc: (d, p) => calcVStop(d, p.length, p.mult), defaultParams: { length: 20, mult: 2 }, figures: [{ key: 'vstop', title: 'VSTOP', type: 'line' }], type: 'line' },
+  // ── 趋势/止损类 (主图 overlay) ──
+  supertrend: { calc: (d, p) => calcSuperTrend(d, p.length, p.mult), defaultParams: { length: 10, mult: 3 }, figures: [{ key: 'st', title: 'ST', type: 'line', overlay: true }], type: 'line' },
+  vstop: { calc: (d, p) => calcVStop(d, p.length, p.mult), defaultParams: { length: 20, mult: 2 }, figures: [{ key: 'vstop', title: 'VSTOP', type: 'line', overlay: true }], type: 'line' },
 
-  // ── Ichimoku (主图) ──
-  ichimoku: { calc: (d, p) => calcIchimoku(d, p.tenkan, p.kijun, p.senkou), defaultParams: { tenkan: 9, kijun: 26, senkou: 52 }, figures: [{ key: 'tenkan', title: 'Tenkan', type: 'line' }, { key: 'kijun', title: 'Kijun', type: 'line' }, { key: 'senkouA', title: 'SenkouA', type: 'line' }, { key: 'senkouB', title: 'SenkouB', type: 'line' }], type: 'multi' },
+  // ── Ichimoku (主图 overlay) ──
+  ichimoku: { calc: (d, p) => calcIchimoku(d, p.tenkan, p.kijun, p.senkou), defaultParams: { tenkan: 9, kijun: 26, senkou: 52 }, figures: [{ key: 'tenkan', title: 'Tenkan', type: 'line', overlay: true }, { key: 'kijun', title: 'Kijun', type: 'line', overlay: true }, { key: 'senkouA', title: 'SenkouA', type: 'line', overlay: true }, { key: 'senkouB', title: 'SenkouB', type: 'line', overlay: true }], type: 'multi' },
 
-  // ── 结构分析类 (主图) ──
-  zigzag: { calc: (d, p) => calcZigZag(d, p.dev), defaultParams: { dev: 5 }, figures: [{ key: 'zz', title: 'ZZ', type: 'line' }], type: 'line' },
-  pivot_hi: { calc: (d, p) => calcPivotHi(d, p.left, p.right), defaultParams: { left: 5, right: 5 }, figures: [{ key: 'ph', title: 'PH', type: 'circle' }], type: 'line' },
-  pivot_lo: { calc: (d, p) => calcPivotLo(d, p.left, p.right), defaultParams: { left: 5, right: 5 }, figures: [{ key: 'pl', title: 'PL', type: 'circle' }], type: 'line' },
+  // ── 结构分析类 (主图 overlay) ──
+  zigzag: { calc: (d, p) => calcZigZag(d, p.dev), defaultParams: { dev: 5 }, figures: [{ key: 'zz', title: 'ZZ', type: 'line', overlay: true }], type: 'line' },
+  fractal: {
+    calc: (d, p) => {
+      const hi = calcPivotHi(d, p.left, p.right)
+      const lo = calcPivotLo(d, p.left, p.right)
+      return hi.map((h, i) => ({ hi: h, lo: lo[i] }))
+    },
+    defaultParams: { left: 2, right: 2 },
+    figures: [
+      { key: 'hi', title: 'HH', type: 'circle', overlay: true },
+      { key: 'lo', title: 'LL', type: 'circle', overlay: true }
+    ],
+    type: 'multi'
+  },
 
   // ── 动量类 (副图) ──
   mom: { calc: (d, p) => calcMOM(d, p.length), defaultParams: { length: 10 }, figures: [{ key: 'mom', title: 'MOM', type: 'line' }], type: 'line' },
@@ -1059,6 +1070,7 @@ export const INDICATOR_REGISTRY = {
   // ── Ehlers 系列 (副图) ──
   fisher: { calc: (d, p) => calcFisher(d, p.length), defaultParams: { length: 10 }, figures: [{ key: 'fisher', title: 'Fisher', type: 'line' }, { key: 'signal', title: 'Signal', type: 'line' }], type: 'multi' },
   e_stoch: { calc: (d, p) => calcEhlersStoch(d, p.length), defaultParams: { length: 10 }, figures: [{ key: 'estoch', title: 'ESTOCH', type: 'line' }], type: 'line' },
+  e_roc: { calc: (d, p) => { const c = d.map(k => k.close); return c.map((v, i) => i < p.length ? null : (v - c[i - p.length]) / c[i - p.length] * 100) }, defaultParams: { length: 10 }, figures: [{ key: 'eroc', title: 'EROC', type: 'line' }], type: 'line' },
 
   // ── 趋势/方向类 (副图) ──
   aroon: { calc: (d, p) => calcAroon(d, p.length), defaultParams: { length: 25 }, figures: [{ key: 'up', title: 'Up', type: 'line' }, { key: 'down', title: 'Down', type: 'line' }], type: 'multi' },
@@ -1091,5 +1103,67 @@ export const INDICATOR_REGISTRY = {
   elder_ray: { calc: (d, p) => calcElderRay(d, p.length), defaultParams: { length: 13 }, figures: [{ key: 'bullPower', title: 'Bull', type: 'line' }, { key: 'bearPower', title: 'Bear', type: 'line' }], type: 'multi' },
 
   // ── 枢轴点系列 (主图) ──
-  pivot_classic: { calc: (d) => calcPivotClassic(d), defaultParams: {}, figures: [{ key: 'pp', title: 'PP', type: 'line' }, { key: 'r1', title: 'R1', type: 'line' }, { key: 'r2', title: 'R2', type: 'line' }, { key: 's1', title: 'S1', type: 'line' }, { key: 's2', title: 'S2', type: 'line' }], type: 'multi' }
+  pivot_classic: { calc: (d) => calcPivotClassic(d), defaultParams: {}, figures: [{ key: 'pp', title: 'PP', type: 'line', overlay: true }, { key: 'r1', title: 'R1', type: 'line', overlay: true }, { key: 'r2', title: 'R2', type: 'line', overlay: true }, { key: 's1', title: 'S1', type: 'line', overlay: true }, { key: 's2', title: 'S2', type: 'line', overlay: true }], type: 'multi' },
+  pivot_fibonacci: {
+    calc: (d) => d.map((item, i) => {
+      if (i === 0) return { pp: null, r1: null, r2: null, r3: null, s1: null, s2: null, s3: null }
+      const prev = d[i - 1]
+      const pp = (prev.high + prev.low + prev.close) / 3
+      const range = prev.high - prev.low
+      return { pp, r1: pp + 0.382 * range, r2: pp + 0.618 * range, r3: pp + range, s1: pp - 0.382 * range, s2: pp - 0.618 * range, s3: pp - range }
+    }),
+    defaultParams: {},
+    figures: ['pp', 'r1', 'r2', 'r3', 's1', 's2', 's3'].map(k => ({ key: k, title: k.toUpperCase(), type: 'line', overlay: true })),
+    type: 'multi'
+  },
+  pivot_woodie: {
+    calc: (d) => d.map((item, i) => {
+      if (i === 0) return { pp: null, r1: null, r2: null, s1: null, s2: null }
+      const prev = d[i - 1]
+      const pp = (prev.high + prev.low + 2 * prev.close) / 4
+      return { pp, r1: 2 * pp - prev.low, r2: pp + (prev.high - prev.low), s1: 2 * pp - prev.high, s2: pp - (prev.high - prev.low) }
+    }),
+    defaultParams: {},
+    figures: ['pp', 'r1', 'r2', 's1', 's2'].map(k => ({ key: k, title: k.toUpperCase(), type: 'line', overlay: true })),
+    type: 'multi'
+  },
+  pivot_camarilla: {
+    calc: (d) => d.map((item, i) => {
+      if (i === 0) return { r1: null, r2: null, r3: null, r4: null, s1: null, s2: null, s3: null, s4: null }
+      const prev = d[i - 1]
+      const range = prev.high - prev.low
+      return { r1: prev.close + range * 1.1 / 12, r2: prev.close + range * 1.1 / 6, r3: prev.close + range * 1.1 / 4, r4: prev.close + range * 1.1 / 2, s1: prev.close - range * 1.1 / 12, s2: prev.close - range * 1.1 / 6, s3: prev.close - range * 1.1 / 4, s4: prev.close - range * 1.1 / 2 }
+    }),
+    defaultParams: {},
+    figures: ['r1', 'r2', 'r3', 'r4', 's1', 's2', 's3', 's4'].map(k => ({ key: k, title: k.toUpperCase(), type: 'line', overlay: true })),
+    type: 'multi'
+  },
+  pivot_demark: {
+    calc: (d) => d.map((item, i) => {
+      if (i === 0) return { pp: null, r1: null, s1: null }
+      const prev = d[i - 1]
+      let x
+      if (prev.close < prev.open) x = prev.high + 2 * prev.low + prev.close
+      else if (prev.close > prev.open) x = 2 * prev.high + prev.low + prev.close
+      else x = prev.high + prev.low + 2 * prev.close
+      const pp = x / 4
+      return { pp, r1: x / 2 - prev.low, s1: x / 2 - prev.high }
+    }),
+    defaultParams: {},
+    figures: ['pp', 'r1', 's1'].map(k => ({ key: k, title: k.toUpperCase(), type: 'line', overlay: true })),
+    type: 'multi'
+  },
+  heikinashi: {
+    calc: (d) => d.map((item, i) => {
+      const haClose = (item.open + item.high + item.low + item.close) / 4
+      const haOpen = i === 0 ? (item.open + item.close) / 2 : (d[i - 1].open + d[i - 1].close) / 2
+      return { haOpen, haClose }
+    }),
+    defaultParams: {},
+    figures: [
+      { key: 'haOpen', title: 'HA Open', type: 'line', overlay: true },
+      { key: 'haClose', title: 'HA Close', type: 'line', overlay: true }
+    ],
+    type: 'multi'
+  }
 }

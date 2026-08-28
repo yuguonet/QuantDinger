@@ -174,7 +174,7 @@
 
 <script>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, shallowRef, getCurrentInstance } from 'vue'
-import { init, registerIndicator, registerOverlay, setLocale } from 'klinecharts'
+import { init, registerIndicator, registerOverlay } from 'klinecharts'
 import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
 import ExchangeKlineWs from '@/utils/exchangeWs'
@@ -2965,7 +2965,6 @@ registerOverlay({
         }
 
         // 设置中文语言
-        try { setLocale('zh-CN') } catch (_) {}
 
         // 尝试使用配置选项初始化
         try {
@@ -3938,34 +3937,48 @@ registerOverlay({
             key,
             title,
             type: 'line',
-            color: figureColor,
             styles: () => ({
               color: figureColor,
               size: width,
               style: 'solid'
             })
           })
-
+          const buildCircleFigure = (key, title, figureColor = color) => ({
+            key,
+            title,
+            type: 'circle',
+            styles: () => ({
+              style: 'fill',
+              color: figureColor
+            })
+          })
+          const buildFigure = (key, title, figureColor = color, width = lineWidth, figType = 'line') => {
+            if (figType === 'circle') return buildCircleFigure(key, title, figureColor)
+            return buildLineFigure(key, title, figureColor, width)
+          }
           // 根据指标类型创建 KLineChart 指标
-          if (indicator.id === 'sma' || indicator.id === 'ema') {
-            const maType = indicator.id === 'sma' ? 'SMA' : 'EMA'
-            const period = indicator.params?.length || indicator.params?.period || 20
+          if (indicator.id === 'sma' || indicator.id === 'sma2' || indicator.id === 'ema') {
+            const maType = (indicator.id === 'ema') ? 'EMA' : 'SMA'
             const figureKey = maType.toLowerCase()
-            const calcPeriod = period
+            // 默认显示 5,10,20,60 四条线；用户指定了单个 period 则只显示那一条
+            const singlePeriod = indicator.params?.length || indicator.params?.period
+            const periods = singlePeriod ? [singlePeriod] : [5, 10, 20, 60]
 
             try {
-              addMainPaneOverlayEntry({
-                signature: buildUniqueIndicatorName(`${maType}_${period}`),
-                figures: [buildLineFigure(`${figureKey}_${indicatorInstanceKey}`, `${maType}(${period})`, color, lineWidth)],
-                calc: (kLineDataList) => {
-                  const p = calcPeriod
-                  // calculateSMA/EMA 需要传入包含 close 属性的对象数组，而不是数字数组
-                  const values = maType === 'SMA'
-                    ? calculateSMA(kLineDataList, p)
-                    : calculateEMA(kLineDataList, p)
-                  return values.map(v => ({ [`${figureKey}_${indicatorInstanceKey}`]: v }))
-                }
-              })
+              for (const p of periods) {
+                const calcPeriod = p
+                const lineColor = getIndicatorColor(periods.indexOf(p))
+                addMainPaneOverlayEntry({
+                  signature: buildUniqueIndicatorName(`${maType}_${p}`),
+                  figures: [buildLineFigure(`${figureKey}_${p}_${indicatorInstanceKey}`, `${maType}(${p})`, lineColor, lineWidth)],
+                  calc: (kLineDataList) => {
+                    const values = maType === 'SMA'
+                      ? calculateSMA(kLineDataList, calcPeriod)
+                      : calculateEMA(kLineDataList, calcPeriod)
+                    return values.map(v => ({ [`${figureKey}_${calcPeriod}_${indicatorInstanceKey}`]: v }))
+                  }
+                })
+              }
             } catch (err) {
             }
           } else if (indicator.id === 'macd') {
@@ -4430,11 +4443,37 @@ registerOverlay({
                 series: 'normal'
               })
               if (registered) {
-                const isMainPane = def.figures.some(f => f.overlay) || indicator.id === 'zigzag' || indicator.id === 'pivot_hi' || indicator.id === 'pivot_lo' || indicator.id.startsWith('pivot_')
-                const paneId = chartRef.value.createIndicator(customIndicatorName, !isMainPane, isMainPane ? undefined : { height: 100, dragEnabled: true })
-                if (paneId) {
-                  addedIndicatorIds.value.push({ paneId, name: customIndicatorName })
-                  if (!isMainPane) addPaneCloseButton(paneId, indicator.id, indicator.instanceId)
+                const isMainPane = def.figures.some(f => f.overlay)
+                if (isMainPane) {
+                  // 主图指标：叠加到蜡烛图上（和 MA 一样）
+                  const ik = indicatorInstanceKey
+                  addMainPaneOverlayEntry({
+                    signature: buildUniqueIndicatorName(`${indicator.id.toUpperCase()}_${paramValues.join('_')}`),
+                    figures: def.figures.map(f => {
+                      return buildFigure(`${f.key}_${ik}`, f.title, color, lineWidth, f.type || 'line')
+                    }),
+                    calc: (kLineDataList) => {
+                      const p = {}
+                      paramKeys.forEach((k, idx) => { p[k] = paramValues[idx] })
+                      const raw = def.calc(kLineDataList, p)
+                      if (Array.isArray(raw) && raw.length > 0 && typeof raw[0] === 'object' && raw[0] !== null && !Array.isArray(raw[0])) {
+                        return raw.map(item => {
+                          const mapped = {}
+                          def.figures.forEach(f => { mapped[`${f.key}_${ik}`] = item[f.key] })
+                          return mapped
+                        })
+                      }
+                      const figKey = def.figures[0].key
+                      return raw.map(v => ({ [`${figKey}_${ik}`]: v }))
+                    }
+                  })
+                } else {
+                  // 副图指标：创建独立 pane
+                  const paneId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
+                  if (paneId) {
+                    addedIndicatorIds.value.push({ paneId, name: customIndicatorName })
+                    addPaneCloseButton(paneId, indicator.id, indicator.instanceId)
+                  }
                 }
               }
             } catch (err) {}

@@ -1149,9 +1149,7 @@ export default {
         { id: 'ichimoku', name: '一目均衡表', shortName: 'IKH', group: 'main' },
         // ── 结构分析类 ──
         { id: 'zigzag', name: '之字转向', shortName: 'ZZ', group: 'main' },
-        { id: 'fractal', name: '分形', shortName: 'FR', group: 'main' },
-        { id: 'pivot_hi', name: '摆动高点', shortName: 'PH', group: 'main' },
-        { id: 'pivot_lo', name: '摆动低点', shortName: 'PL', group: 'main' },
+        { id: 'fractal', name: '分形(高低点)', shortName: 'FR', group: 'main' },
         // ── 枢轴点系列 ──
         { id: 'pivot_classic', name: '经典枢轴点', shortName: 'PP', group: 'main' },
         { id: 'pivot_fibonacci', name: '斐波那契枢轴', shortName: 'FIBPP', group: 'main' },
