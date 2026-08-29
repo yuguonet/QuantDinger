@@ -164,10 +164,11 @@ export const asyncRouterMap = [
         component: () => import('@/views/settings'),
         meta: { title: 'menu.settings', keepAlive: false, icon: 'setting', permission: ['admin'] }
       },
-      // 定时任务（admin only）
+      // 定时任务（admin only，已从侧栏隐藏）
       {
         path: '/cron-jobs',
         name: 'CronJobs',
+        hidden: true,
         component: () => import('@/views/cron-jobs'),
         meta: { title: 'menu.dashboard.cronJobs', keepAlive: true, icon: 'clock-circle', permission: ['admin'] }
       }

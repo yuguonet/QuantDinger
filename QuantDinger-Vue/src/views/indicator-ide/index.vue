@@ -92,6 +92,15 @@
                       <a-radio-button value="percent">比例(%)</a-radio-button>
                     </a-radio-group>
                   </div>
+                  <div class="settings-group">
+                    <div class="settings-group-title">筹码分布</div>
+                    <a-switch
+                      :checked="showChip"
+                      checked-children="显示"
+                      un-checked-children="隐藏"
+                      @change="toggleChip"
+                    />
+                  </div>
                 </div>
               </template>
               <a-button class="ide-toolbar-icon-btn" size="small">
@@ -194,6 +203,7 @@
               :userId="userId"
               :realtime-enabled="klineRealtimeEnabled"
               :showIndicatorBar="false"
+              :showChip="showChip"
               @indicator-toggle="handleIndicatorToggle"
             />
           </div>
@@ -1119,6 +1129,7 @@ export default {
       chartColorScheme: 'cn',
       drawingBarVisible: false,
       yAxisMode: 'price',
+      showChip: true,
       /** 内置技术指标列表（分主图/副图） */
       builtinIndicators: [
         // ═══════════════════════════════════════════
@@ -3375,6 +3386,9 @@ export default {
       if (chart && chart.setDrawingBarVisible) {
         chart.setDrawingBarVisible(checked)
       }
+    },
+    toggleChip (checked) {
+      this.showChip = checked
     },
     onYAxisModeChange (e) {
       const mode = e.target ? e.target.value : e

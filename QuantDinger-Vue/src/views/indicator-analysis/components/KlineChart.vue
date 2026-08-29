@@ -72,7 +72,7 @@
             </a-tooltip>
           </div>
         </div>
-        <div class="kline-chart-with-pct">
+        <div class="kline-chart-with-pct" :class="{ 'kline-chart-with-pct--chip': showChip }">
           <div
             ref="pctAxisRef"
             class="pct-axis-overlay"
@@ -82,6 +82,17 @@
             id="kline-chart-container"
             class="kline-chart-container"
           ></div>
+          <!-- 筹码分布覆盖层 -->
+          <div v-if="showChip" ref="chipOverlayRef" class="chip-overlay" :class="{ 'chip-overlay--dark': chartTheme === 'dark' }">
+            <div class="chip-overlay__header">
+              <span class="chip-overlay__title">筹码分布</span>
+              <span class="chip-overlay__avg" v-if="chipDataForTemplate">AVG: {{ chipDataForTemplate.avgCost ? chipDataForTemplate.avgCost.toFixed(2) : '--' }}</span>
+            </div>
+            <canvas
+              ref="chipCanvasRef"
+              class="chip-overlay__canvas"
+            ></canvas>
+          </div>
         </div>
         <canvas
           ref="wmCanvasRef"
@@ -215,6 +226,11 @@ export default {
     showIndicatorBar: {
       type: Boolean,
       default: true
+    },
+    /** 是否显示筹码分布叠加层（置于主图右侧，Y轴右边） */
+    showChip: {
+      type: Boolean,
+      default: true
     }
   },
   emits: ['retry', 'price-change', 'load', 'indicator-toggle'],
@@ -239,6 +255,9 @@ export default {
 
     const wmCanvasRef = ref(null)
     const pctAxisRef = ref(null)
+    const chipCanvasRef = ref(null)
+    const chipOverlayRef = ref(null)
+    let _chipPaneObserver = null
     let _wmTimer = null
     let _wmObserver = null
     let _chipData = null // { prices, density, avg_cost, current_price }
@@ -321,6 +340,9 @@ export default {
         updateIndicators()
       }
     }
+
+    // 筹码分布数据（暴露给模板显示 AVG）
+    const chipDataForTemplate = ref(null)
 
     // 已添加的指标 ID 列表（用于清理）
     const addedIndicatorIds = ref([])
@@ -4756,6 +4778,17 @@ registerOverlay({
       }
     })
 
+    watch(() => props.showChip, () => {
+      // 筹码开关切换后，图表宽度/布局变化，需重绘并让芯片重新对齐
+      nextTick(() => {
+        if (chartRef.value && typeof chartRef.value.resize === 'function') {
+          chartRef.value.resize()
+        }
+        renderPctAxis()
+        renderChip()
+      })
+    })
+
     onMounted(async () => {
       // 优先使用 props.theme（从 Vuex store 获取），确保与系统主题同步
       // 使用 nextTick 确保 props 已经正确传递
@@ -4883,10 +4916,10 @@ registerOverlay({
       const range = chart.getVisibleRange()
       if (!range) { el.innerHTML = ''; return }
 
-      // range.from/to 是百分比 (0-100)，转为数据索引
+      // klinecharts v9.8.0 的 getVisibleRange() 返回的是数据索引（整数），不是百分比
       const dataLen = data.length
-      const fromIdx = Math.max(0, Math.floor(range.from / 100 * dataLen))
-      const toIdx = Math.min(dataLen - 1, Math.ceil(range.to / 100 * dataLen))
+      const fromIdx = Math.max(0, range.from)
+      const toIdx = Math.min(dataLen - 1, range.to)
       if (fromIdx >= toIdx) { el.innerHTML = ''; return }
 
       // 计算可见区间的最高价和最低价
@@ -4928,7 +4961,7 @@ registerOverlay({
     /** 用前端 K 线数据直接计算筹码分布（不依赖后端 API） */
     const fetchChipData = () => {
       const data = klineData.value
-      if (!data || data.length < 10) { _chipData = null; _destroyChipCanvas(); return }
+      if (!data || data.length < 10) { _chipData = null; return }
 
       // 取最近 120 根 K 线
       const lookback = Math.min(data.length, 120)
@@ -4941,7 +4974,7 @@ registerOverlay({
         if (b.low < priceMin) priceMin = b.low
         if (b.high > priceMax) priceMax = b.high
       }
-      if (priceMax <= priceMin) { _chipData = null; _destroyChipCanvas(); return }
+      if (priceMax <= priceMin) { _chipData = null; return }
 
       const bucketWidth = Math.max((priceMax - priceMin) / numBuckets, 0.0001)
       const buckets = Math.ceil((priceMax - priceMin) / bucketWidth) + 1
@@ -4975,7 +5008,7 @@ registerOverlay({
 
       let maxD = 0
       for (let i = 0; i < buckets; i++) { if (chipDensity[i] > maxD) maxD = chipDensity[i] }
-      if (maxD <= 0) { _chipData = null; _destroyChipCanvas(); return }
+      if (maxD <= 0) { _chipData = null; return }
 
       const prices = []
       const density = []
@@ -4992,31 +5025,12 @@ registerOverlay({
       const avgCost = costSum / totalChips
 
       _chipData = { prices, density, avgCost, currentPrice }
-      _ensureChipCanvas()
+      chipDataForTemplate.value = { avgCost }
       renderChip()
     }
 
-    let _chipCanvasEl = null
-
-    const _ensureChipCanvas = () => {
-      if (_chipCanvasEl && document.body.contains(_chipCanvasEl)) return
-      // 放在 .chart-wrapper（klinecharts 容器的父级），不受 klinecharts DOM 管控
-      const wrapper = document.querySelector('.chart-wrapper')
-      if (!wrapper) return
-      const cvs = document.createElement('canvas')
-      cvs.style.cssText = 'position:absolute;right:0;top:0;z-index:50;pointer-events:none;'
-      wrapper.appendChild(cvs)
-      _chipCanvasEl = cvs
-    }
-
-    const _destroyChipCanvas = () => {
-      if (_chipCanvasEl && _chipCanvasEl.parentElement) {
-        try { _chipCanvasEl.parentElement.removeChild(_chipCanvasEl) } catch (_) {}
-      }
-      _chipCanvasEl = null
-    }
-
     const renderChip = () => {
+      _syncChipPaneObserver()
       if (_chipRafId != null) return
       _chipRafId = requestAnimationFrame(() => {
         _chipRafId = null
@@ -5024,16 +5038,61 @@ registerOverlay({
       })
     }
 
+    // 监听主图 pane 的尺寸变化（副图新增/删除/拖拽改高都会改变主图高度），
+    // 触发筹码覆盖层自动重新定位与重绘，保证始终与蜡烛图区域对齐。
+    const _syncChipPaneObserver = () => {
+      const chart = chartRef.value
+      if (!chart) return
+      let paneEl = null
+      try { paneEl = chart.getDom('candle_pane', 'root') } catch (_) {}
+      if (!paneEl) return
+      if (_chipPaneObserver) {
+        try { _chipPaneObserver.unobserve(paneEl); _chipPaneObserver.disconnect() } catch (_) {}
+        _chipPaneObserver = null
+      }
+      if (typeof ResizeObserver === 'undefined') return
+      _chipPaneObserver = new ResizeObserver(() => {
+        renderChip()
+      })
+      _chipPaneObserver.observe(paneEl)
+    }
+
     const _doRenderChip = () => {
-      const canvas = _chipCanvasEl
+      const canvas = chipCanvasRef.value
+      const overlay = chipOverlayRef.value
       const chart = chartRef.value
       if (!canvas || !chart) return
 
+      // 获取主图 pane 的高度，确保筹码图与主图Y轴对齐
       const container = document.getElementById('kline-chart-container')
       if (!container) return
+      const containerH = container.clientHeight
 
-      const w = container.clientWidth
-      const h = container.clientHeight
+      // 通过主图 pane 的真实包围盒定位筹码覆盖层，使其严格与蜡烛图区域重合
+      // （不占用副图区域；副图 add/remove/拖拽改高度时由 ResizeObserver 重新测量）
+      let overlayTop = 0
+      let paneH = containerH
+      try {
+        const containerRect = container.getBoundingClientRect()
+        const mainPane = chart.getDom('candle_pane', 'root')
+        if (mainPane && mainPane.clientHeight > 0) {
+          const paneRect = mainPane.getBoundingClientRect()
+          overlayTop = Math.max(0, paneRect.top - containerRect.top)
+          paneH = paneRect.height
+        }
+      } catch (_) {}
+
+      // 覆盖层紧跟主图：top/height 与主图重合，不计入副图
+      if (overlay) {
+        overlay.style.top = overlayTop + 'px'
+        overlay.style.height = paneH + 'px'
+      }
+
+      // 筹码图使用完整主图高度绘制，使价格刻度与蜡烛图完全对应
+      const h = paneH
+
+      // 使用 canvas 自身的宽度，高度使用主图高度
+      const w = canvas.clientWidth || 140
       if (w <= 0 || h <= 0) return
 
       const dpr = window.devicePixelRatio || 1
@@ -5051,14 +5110,15 @@ registerOverlay({
 
       const { prices, density, avgCost, currentPrice } = _chipData
 
-      // 获取可见价格范围
+      // 获取可见价格范围（与 K 线图对齐）
       const data = klineData.value
       if (!data || data.length === 0) return
       const range = chart.getVisibleRange()
       if (!range) return
       const dataLen = data.length
-      const fromIdx = Math.max(0, Math.floor(range.from / 100 * dataLen))
-      const toIdx = Math.min(dataLen - 1, Math.ceil(range.to / 100 * dataLen))
+      // klinecharts v9.8.0 的 getVisibleRange() 返回的是数据索引（整数），不是百分比
+      const fromIdx = Math.max(0, range.from)
+      const toIdx = Math.min(dataLen - 1, range.to)
       if (fromIdx >= toIdx) return
 
       let visHigh = -Infinity
@@ -5069,18 +5129,32 @@ registerOverlay({
       }
       if (visHigh <= visLow) return
 
-      // 筹码图显示区域：图表右侧 15% 宽度
-      const chipWidth = Math.min(w * 0.15, 120)
-      const chipLeft = w - chipWidth - 5
-      const maxBarWidth = chipWidth - 4
+      // 筹码图显示区域：占满整个副图宽度
+      const padding = 4
+      const maxBarWidth = w - padding * 2
 
       // 颜色
       const isDark = chartTheme.value === 'dark'
-      const profitColor = isDark ? 'rgba(239,83,80,0.55)' : 'rgba(245,34,45,0.45)'
-      const lossColor = isDark ? 'rgba(14,203,129,0.55)' : 'rgba(82,196,26,0.45)'
+      const profitColor = isDark ? 'rgba(239,83,80,0.6)' : 'rgba(245,34,45,0.5)'
+      const lossColor = isDark ? 'rgba(14,203,129,0.6)' : 'rgba(82,196,26,0.5)'
       const avgCostColor = isDark ? '#faad14' : '#fa8c16'
+      const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'
+
+      // 画网格线（价格刻度）
+      ctx.strokeStyle = gridColor
+      ctx.lineWidth = 0.5
+      const priceStep = (visHigh - visLow) / 5
+      for (let i = 0; i <= 5; i++) {
+        const price = visLow + priceStep * i
+        const y = h - ((price - visLow) / (visHigh - visLow)) * h
+        ctx.beginPath()
+        ctx.moveTo(0, y)
+        ctx.lineTo(w, y)
+        ctx.stroke()
+      }
 
       // 画筹码条
+      const barHeight = Math.max(2, h / prices.length)
       for (let i = 0; i < prices.length; i++) {
         const price = prices[i]
         const d = density[i]
@@ -5091,24 +5165,39 @@ registerOverlay({
         const color = price <= currentPrice ? profitColor : lossColor
 
         ctx.fillStyle = color
-        ctx.fillRect(chipLeft, y - 1, barWidth, 2)
+        ctx.fillRect(padding, y - barHeight / 2, barWidth, barHeight)
       }
 
       // 平均成本线
       if (avgCost >= visLow && avgCost <= visHigh) {
         const avgY = h - ((avgCost - visLow) / (visHigh - visLow)) * h
         ctx.strokeStyle = avgCostColor
-        ctx.lineWidth = 1
-        ctx.setLineDash([3, 2])
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([4, 3])
         ctx.beginPath()
-        ctx.moveTo(chipLeft, avgY)
-        ctx.lineTo(chipLeft + maxBarWidth, avgY)
+        ctx.moveTo(0, avgY)
+        ctx.lineTo(w, avgY)
         ctx.stroke()
         ctx.setLineDash([])
 
+        // AVG 标签
         ctx.fillStyle = avgCostColor
-        ctx.font = '10px sans-serif'
-        ctx.fillText(`AVG ${avgCost}`, chipLeft + 2, avgY - 3)
+        ctx.font = 'bold 10px sans-serif'
+        ctx.textAlign = 'left'
+        ctx.fillText(`AVG ${avgCost.toFixed(2)}`, padding, avgY - 4)
+      }
+
+      // 当前价格线
+      if (currentPrice >= visLow && currentPrice <= visHigh) {
+        const curY = h - ((currentPrice - visLow) / (visHigh - visLow)) * h
+        ctx.strokeStyle = isDark ? '#1890ff' : '#1890ff'
+        ctx.lineWidth = 1
+        ctx.setLineDash([2, 2])
+        ctx.beginPath()
+        ctx.moveTo(0, curY)
+        ctx.lineTo(w, curY)
+        ctx.stroke()
+        ctx.setLineDash([])
       }
     }
 
@@ -5155,8 +5244,8 @@ registerOverlay({
       }
       if (_bdCleanup) { _bdCleanup(); _bdCleanup = null }
       if (_chipRafId != null) { cancelAnimationFrame(_chipRafId); _chipRafId = null }
+      if (_chipPaneObserver) { _chipPaneObserver.disconnect(); _chipPaneObserver = null }
       _chipData = null
-      _destroyChipCanvas()
       if (_pctAxisRafId.value != null) { cancelAnimationFrame(_pctAxisRafId.value); _pctAxisRafId.value = null }
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
@@ -5178,6 +5267,9 @@ registerOverlay({
       themeConfig,
       wmCanvasRef,
       pctAxisRef,
+      chipCanvasRef,
+      chipOverlayRef,
+      chipDataForTemplate,
       getIndicatorColor,
       handleRetry,
       loadingPython,
@@ -5682,6 +5774,72 @@ registerOverlay({
   overflow: hidden;
 }
 
+/* 筹码显示时，为右侧筹码窗口预留 140px，使蜡烛图及其Y轴保持在筹码窗口左侧 */
+.kline-chart-with-pct--chip {
+  padding-right: 140px;
+}
+
+/* 筹码分布覆盖层（绝对定位在K线图右侧、Y轴右边） */
+.chip-overlay {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 140px;
+  height: 100%;
+  background: rgba(250, 250, 250, 0.92);
+  border-left: 1px solid #e8e8e8;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.chip-overlay--dark {
+  background: rgba(26, 26, 26, 0.92);
+  border-left-color: #303030;
+}
+
+/* 标题栏绝对定位悬浮在 canvas 之上，不占用布局高度，
+   保证 canvas 高度 = 主图高度，筹码价格刻度与蜡烛图完全对齐 */
+.chip-overlay__header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px;
+  font-size: 10px;
+  color: #888;
+  border-bottom: 1px solid #e8e8e8;
+  z-index: 1;
+}
+
+.chip-overlay--dark .chip-overlay__header {
+  color: #999;
+  border-bottom-color: #303030;
+}
+
+.chip-overlay__title {
+  font-weight: 500;
+}
+
+.chip-overlay__avg {
+  font-size: 9px;
+  color: #fa8c16;
+  font-weight: 500;
+}
+
+.chip-overlay--dark .chip-overlay__avg {
+  color: #faad14;
+}
+
+.chip-overlay__canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .pct-axis-overlay {
   position: absolute;
   left: 0;
@@ -5691,6 +5849,7 @@ registerOverlay({
   z-index: 5;
   pointer-events: none;
   overflow: hidden;
+  display: none; /* 隐藏百分比刻度，避免与右侧筹码图冲突 */
 }
 
 .pct-tick {

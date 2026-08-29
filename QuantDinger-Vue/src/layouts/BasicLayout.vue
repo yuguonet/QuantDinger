@@ -747,28 +747,23 @@ export default {
     /* 浅色/暗黑 footer 配色见 src/qd-layout-dark-override.less（在 main.js 中于 global.less 之后加载） */
 
     .menu-footer-content {
-      padding: 12px 16px;
+      padding: 8px 16px;
       font-size: 11px;
       color: inherit;
       max-height: none;
       overflow: visible;
 
-      /* 隐藏滚动条但保持滚动功能 */
-      scrollbar-width: thin;
-      scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+      /* 完全隐藏滚动条 */
+      scrollbar-width: none;
+      -ms-overflow-style: none;
       &::-webkit-scrollbar {
-        width: 4px;
-      }
-      &::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      &::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.2);
-        border-radius: 2px;
+        display: none;
+        width: 0;
+        height: 0;
       }
 
       .footer-section {
-        margin-bottom: 12px;
+        margin-bottom: 6px;
         text-align: center;
 
         &:last-child {
@@ -776,9 +771,9 @@ export default {
         }
 
         .section-title {
-          font-size: 11px;
+          font-size: 10px;
           font-weight: 500;
-          margin-bottom: 6px;
+          margin-bottom: 3px;
           opacity: 0.8;
           color: inherit;
         }
@@ -860,15 +855,15 @@ export default {
         }
 
         &.copyright {
-          margin-top: 12px;
-          padding-top: 12px;
+          margin-top: 6px;
+          padding-top: 6px;
           border-top: 1px solid #2a2a2a;
           opacity: 0.6;
           font-size: 10px;
         }
 
         &.version {
-          margin-top: 4px;
+          margin-top: 2px;
           font-size: 9px;
           opacity: 0.4;
           text-align: center;
@@ -910,17 +905,7 @@ export default {
 .basic-layout-wrapper {
   .ant-layout-sider-children {
     padding-bottom: calc(var(--menu-footer-height, 220px) + 12px);
-    overflow-y: auto;
-    overflow-x: hidden;
-    -webkit-overflow-scrolling: touch;
-    /* 隐藏滚动条但保持可滚动 */
-    scrollbar-width: none;
-    -ms-overflow-style: none;
-    &::-webkit-scrollbar {
-      display: none;
-      width: 0;
-      height: 0;
-    }
+    overflow: hidden;
   }
 
   /* 强制侧栏和菜单区域可滚动，避免被 footer 遮挡 */
@@ -945,13 +930,18 @@ export default {
       overflow-y: auto !important;
       overflow-x: hidden;
       -webkit-overflow-scrolling: touch;
-      /* 隐藏菜单区域滚动条 */
-      scrollbar-width: none;
-      -ms-overflow-style: none;
+    }
+
+    /* 覆盖侧栏内所有可滚动元素的滚动条 */
+    *,
+    *::before,
+    *::after {
+      scrollbar-width: none !important;
+      -ms-overflow-style: none !important;
       &::-webkit-scrollbar {
-        display: none;
-        width: 0;
-        height: 0;
+        display: none !important;
+        width: 0 !important;
+        height: 0 !important;
       }
     }
   }
@@ -1049,21 +1039,13 @@ export default {
       padding-bottom: var(--footer-height, 280px) !important;
       /* 确保滚动流畅 */
       -webkit-overflow-scrolling: touch;
-      /* 隐藏滚动条但保持滚动功能 */
-      scrollbar-width: thin;
-      scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+      /* 完全隐藏滚动条 */
+      scrollbar-width: none;
+      -ms-overflow-style: none;
       &::-webkit-scrollbar {
-        width: 4px;
-      }
-      &::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      &::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.2);
-        border-radius: 2px;
-        &:hover {
-          background: rgba(255, 255, 255, 0.3);
-        }
+        display: none;
+        width: 0;
+        height: 0;
       }
       /* 确保菜单内容区域有足够的高度 */
       min-height: 0;
