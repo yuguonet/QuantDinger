@@ -121,3 +121,40 @@ def get_price():
             'data': None
         }), 500
 
+
+@kline_bp.route('/chip_distribution', methods=['GET'])
+def get_chip_distribution():
+    """筹码分布数据（前端筹码分布图用）。
+
+    参数:
+        market: 市场类型
+        symbol: 股票代码
+        lookback_days: 回看天数（默认 120）
+    """
+    try:
+        market = request.args.get('market', 'CNStock')
+        symbol = request.args.get('symbol', '')
+        lookback_days = int(request.args.get('lookback_days', 120))
+
+        if not symbol:
+            return jsonify({'code': 0, 'msg': 'Missing symbol', 'data': None}), 400
+
+        # 只对 A 股有效
+        if market not in ('CNStock', 'HKStock'):
+            return jsonify({'code': 1, 'msg': 'Chip distribution only for CN/HK stocks', 'data': None})
+
+        from app.services.chip_service import calc_chip_for_chart
+
+        klines = kline_service.get_kline(market=market, symbol=symbol, timeframe='1D', limit=lookback_days + 30)
+        if not klines:
+            return jsonify({'code': 0, 'msg': 'No kline data', 'data': None})
+
+        result = calc_chip_for_chart(klines, lookback_days=lookback_days)
+        if not result:
+            return jsonify({'code': 0, 'msg': 'Chip calculation failed', 'data': None})
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': result})
+    except Exception as e:
+        logger.error(f'chip_distribution error: {e}')
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+

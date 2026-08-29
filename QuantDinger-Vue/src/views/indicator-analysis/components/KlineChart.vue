@@ -241,6 +241,8 @@ export default {
     const pctAxisRef = ref(null)
     let _wmTimer = null
     let _wmObserver = null
+    let _chipData = null // { prices, density, avg_cost, current_price }
+    let _chipRafId = null
 
     // 实时更新设置
     const realtimeTimer = ref(null)
@@ -2330,6 +2332,8 @@ registerOverlay({
                   updateIndicators()
                 }
               }, 100)
+              // K 线加载完成后计算筹码分布
+              fetchChipData()
             }
           }
 
@@ -2790,7 +2794,7 @@ registerOverlay({
 
         // 如果价格超出当前可见范围，刷新百分比轴
         if (bar.high > lastBar.high || bar.low < lastBar.low) {
-          renderPctAxis()
+          renderPctAxis(); renderChip()
         }
 
         // 合并到 rAF 再刷新图表（如果 WS tick 1秒来多次，只刷最后一次）
@@ -2815,7 +2819,7 @@ registerOverlay({
         }
         // 新K线产生时立即刷新指标
         maybeUpdateIndicators(true)
-        renderPctAxis()
+        renderPctAxis(); renderChip()
       }
     }
 
@@ -3159,7 +3163,7 @@ registerOverlay({
 
               // 更新上一次的可见范围
               lastVisibleFrom = data.from
-              renderPctAxis()
+              renderPctAxis(); renderChip()
             }
           })
         }
@@ -3196,7 +3200,7 @@ registerOverlay({
             // 延迟更新指标，确保K线先渲染
             nextTick(() => {
               updateIndicators()
-              renderPctAxis()
+              renderPctAxis(); renderChip()
             })
           }
         }
@@ -3212,7 +3216,7 @@ registerOverlay({
         setTimeout(() => {
           if (chartRef.value) {
             chartRef.value.resize()
-            renderPctAxis()
+            renderPctAxis(); renderChip()
           }
         }, 100)
       } else {
@@ -4693,7 +4697,7 @@ registerOverlay({
     const debouncedLoad = () => {
       clearTimeout(_loadDebounceTimer)
       _loadDebounceTimer = setTimeout(() => {
-        if (props.symbol) loadKlineData()
+        if (props.symbol) { loadKlineData().then(() => fetchChipData()) }
       }, 80)
     }
 
@@ -4701,6 +4705,7 @@ registerOverlay({
     watch(() => props.symbol, (newVal, oldVal) => {
       if (newVal && newVal !== oldVal) {
         debouncedLoad()
+        setTimeout(() => fetchChipData(), 1500)
         // 延迟执行一次自动适配
         setTimeout(() => {
           if (chartRef.value) {
@@ -4722,7 +4727,7 @@ registerOverlay({
       nextTick(() => _ensureWmLayer())
     })
 
-    watch(() => props.market, debouncedLoad)
+    watch(() => props.market, () => { debouncedLoad(); fetchChipData() })
     watch(() => props.timeframe, debouncedLoad)
 
     watch(() => props.activeIndicators, (newVal, oldVal) => {
@@ -4790,7 +4795,7 @@ registerOverlay({
               }
             }
             _ensureWmLayer()
-            renderPctAxis()
+            renderPctAxis(); renderChip()
           })
         })
         chartResizeObserver.observe(el)
@@ -4917,6 +4922,196 @@ registerOverlay({
       }).join('')
     }
 
+    // ═══════════════════════════════════════════
+    // 筹码分布图
+    // ═══════════════════════════════════════════
+    /** 用前端 K 线数据直接计算筹码分布（不依赖后端 API） */
+    const fetchChipData = () => {
+      const data = klineData.value
+      if (!data || data.length < 10) { _chipData = null; _destroyChipCanvas(); return }
+
+      // 取最近 120 根 K 线
+      const lookback = Math.min(data.length, 120)
+      const bars = data.slice(-lookback)
+      const numBuckets = 60
+
+      // 价格区间
+      let priceMin = Infinity, priceMax = -Infinity
+      for (const b of bars) {
+        if (b.low < priceMin) priceMin = b.low
+        if (b.high > priceMax) priceMax = b.high
+      }
+      if (priceMax <= priceMin) { _chipData = null; _destroyChipCanvas(); return }
+
+      const bucketWidth = Math.max((priceMax - priceMin) / numBuckets, 0.0001)
+      const buckets = Math.ceil((priceMax - priceMin) / bucketWidth) + 1
+      const chipDensity = new Float64Array(buckets)
+      const n = bars.length
+
+      for (let i = 0; i < n; i++) {
+        const lo = bars[i].low, hi = bars[i].high, cl = bars[i].close, vol = bars[i].volume || 0
+        if (hi <= lo || vol <= 0) continue
+        const decay = Math.pow(0.98, n - 1 - i)
+        const leftHalf = Math.max(cl - lo, 0.0001)
+        const rightHalf = Math.max(hi - cl, 0.0001)
+        const steps = Math.max(Math.floor((hi - lo) / bucketWidth) + 1, 8)
+        let totalW = 0
+        const weights = []
+        for (let j = 0; j <= steps; j++) {
+          const p = lo + (hi - lo) * j / steps
+          const dist = p <= cl ? (cl - p) / leftHalf : (p - cl) / rightHalf
+          const w = Math.max(1 - dist, 0)
+          weights.push({ p, w })
+          totalW += w
+        }
+        if (totalW <= 0) continue
+        for (const { p, w } of weights) {
+          let idx = Math.floor((p - priceMin) / bucketWidth)
+          if (idx < 0) idx = 0
+          if (idx >= buckets) idx = buckets - 1
+          chipDensity[idx] += vol * decay * w / totalW
+        }
+      }
+
+      let maxD = 0
+      for (let i = 0; i < buckets; i++) { if (chipDensity[i] > maxD) maxD = chipDensity[i] }
+      if (maxD <= 0) { _chipData = null; _destroyChipCanvas(); return }
+
+      const prices = []
+      const density = []
+      for (let i = 0; i < buckets; i++) {
+        prices.push(priceMin + i * bucketWidth)
+        density.push(chipDensity[i] / maxD)
+      }
+
+      const currentPrice = bars[n - 1].close
+      let totalChips = 0
+      for (let i = 0; i < buckets; i++) totalChips += chipDensity[i]
+      let costSum = 0
+      for (let i = 0; i < buckets; i++) costSum += prices[i] * chipDensity[i]
+      const avgCost = costSum / totalChips
+
+      _chipData = { prices, density, avgCost, currentPrice }
+      _ensureChipCanvas()
+      renderChip()
+    }
+
+    let _chipCanvasEl = null
+
+    const _ensureChipCanvas = () => {
+      if (_chipCanvasEl && document.body.contains(_chipCanvasEl)) return
+      // 放在 .chart-wrapper（klinecharts 容器的父级），不受 klinecharts DOM 管控
+      const wrapper = document.querySelector('.chart-wrapper')
+      if (!wrapper) return
+      const cvs = document.createElement('canvas')
+      cvs.style.cssText = 'position:absolute;right:0;top:0;z-index:50;pointer-events:none;'
+      wrapper.appendChild(cvs)
+      _chipCanvasEl = cvs
+    }
+
+    const _destroyChipCanvas = () => {
+      if (_chipCanvasEl && _chipCanvasEl.parentElement) {
+        try { _chipCanvasEl.parentElement.removeChild(_chipCanvasEl) } catch (_) {}
+      }
+      _chipCanvasEl = null
+    }
+
+    const renderChip = () => {
+      if (_chipRafId != null) return
+      _chipRafId = requestAnimationFrame(() => {
+        _chipRafId = null
+        _doRenderChip()
+      })
+    }
+
+    const _doRenderChip = () => {
+      const canvas = _chipCanvasEl
+      const chart = chartRef.value
+      if (!canvas || !chart) return
+
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+
+      const w = container.clientWidth
+      const h = container.clientHeight
+      if (w <= 0 || h <= 0) return
+
+      const dpr = window.devicePixelRatio || 1
+      canvas.width = w * dpr
+      canvas.height = h * dpr
+      canvas.style.width = w + 'px'
+      canvas.style.height = h + 'px'
+
+      const ctx = canvas.getContext('2d')
+      ctx.scale(dpr, dpr)
+      ctx.clearRect(0, 0, w, h)
+
+      if (!_chipData || !_chipData.prices || !_chipData.density) return
+      if (!_chipData.prices.length) return
+
+      const { prices, density, avgCost, currentPrice } = _chipData
+
+      // 获取可见价格范围
+      const data = klineData.value
+      if (!data || data.length === 0) return
+      const range = chart.getVisibleRange()
+      if (!range) return
+      const dataLen = data.length
+      const fromIdx = Math.max(0, Math.floor(range.from / 100 * dataLen))
+      const toIdx = Math.min(dataLen - 1, Math.ceil(range.to / 100 * dataLen))
+      if (fromIdx >= toIdx) return
+
+      let visHigh = -Infinity
+      let visLow = Infinity
+      for (let i = fromIdx; i <= toIdx; i++) {
+        if (data[i].high > visHigh) visHigh = data[i].high
+        if (data[i].low < visLow) visLow = data[i].low
+      }
+      if (visHigh <= visLow) return
+
+      // 筹码图显示区域：图表右侧 15% 宽度
+      const chipWidth = Math.min(w * 0.15, 120)
+      const chipLeft = w - chipWidth - 5
+      const maxBarWidth = chipWidth - 4
+
+      // 颜色
+      const isDark = chartTheme.value === 'dark'
+      const profitColor = isDark ? 'rgba(239,83,80,0.55)' : 'rgba(245,34,45,0.45)'
+      const lossColor = isDark ? 'rgba(14,203,129,0.55)' : 'rgba(82,196,26,0.45)'
+      const avgCostColor = isDark ? '#faad14' : '#fa8c16'
+
+      // 画筹码条
+      for (let i = 0; i < prices.length; i++) {
+        const price = prices[i]
+        const d = density[i]
+        if (price < visLow || price > visHigh || d <= 0) continue
+
+        const y = h - ((price - visLow) / (visHigh - visLow)) * h
+        const barWidth = d * maxBarWidth
+        const color = price <= currentPrice ? profitColor : lossColor
+
+        ctx.fillStyle = color
+        ctx.fillRect(chipLeft, y - 1, barWidth, 2)
+      }
+
+      // 平均成本线
+      if (avgCost >= visLow && avgCost <= visHigh) {
+        const avgY = h - ((avgCost - visLow) / (visHigh - visLow)) * h
+        ctx.strokeStyle = avgCostColor
+        ctx.lineWidth = 1
+        ctx.setLineDash([3, 2])
+        ctx.beginPath()
+        ctx.moveTo(chipLeft, avgY)
+        ctx.lineTo(chipLeft + maxBarWidth, avgY)
+        ctx.stroke()
+        ctx.setLineDash([])
+
+        ctx.fillStyle = avgCostColor
+        ctx.font = '10px sans-serif'
+        ctx.fillText(`AVG ${avgCost}`, chipLeft + 2, avgY - 3)
+      }
+    }
+
     const _ensureWmLayer = () => {
       const cvs = wmCanvasRef.value
       if (!cvs) return
@@ -4959,6 +5154,9 @@ registerOverlay({
         chartResizeObserver = null
       }
       if (_bdCleanup) { _bdCleanup(); _bdCleanup = null }
+      if (_chipRafId != null) { cancelAnimationFrame(_chipRafId); _chipRafId = null }
+      _chipData = null
+      _destroyChipCanvas()
       if (_pctAxisRafId.value != null) { cancelAnimationFrame(_pctAxisRafId.value); _pctAxisRafId.value = null }
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
@@ -4998,6 +5196,8 @@ registerOverlay({
       updateChartTheme,
       updateIndicators,
       renderPctAxis,
+      renderChip,
+      fetchChipData,
       executePythonStrategy,
       parsePythonStrategy,
       indicatorButtons,
