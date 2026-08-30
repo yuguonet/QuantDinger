@@ -152,6 +152,18 @@ def _refresh_backfill_15m():
     run_15m()
 
 
+def _refresh_realtime_snapshot():
+    """盘中: 全市场实时行情快照原始数据采集"""
+    from app.market_cn.realtime_snapshot import collect_realtime_snapshot
+    collect_realtime_snapshot()
+
+
+def _refresh_backfill_1m():
+    """盘后: 回填当日 1m K 线"""
+    from app.data_sources.backfill_db import run_1m
+    run_1m()
+
+
 def _refresh_backfill_1d() -> dict:
     """覆写 1D，返回 {status, written, skipped}。"""
     from app.data_sources.backfill_db import run_1d
@@ -181,6 +193,9 @@ def _post_market_batch():
 
     # 15m 最先跑
     _refresh_backfill_15m()
+
+    # 1m K线回填 (mootdx, 每标的240条)
+    _refresh_backfill_1m()
 
     _refresh_daily()
     _refresh_post_market()
@@ -258,6 +273,7 @@ def _dragon_interval():
 # 任务列表
 TASKS = [
     # 盘中周期任务
+    Task("realtime_snapshot", _refresh_realtime_snapshot, interval=60, trading_only=True),
     Task("dragon_pools", _refresh_dragon_pools, interval=300, trading_only=True),
     Task("fast",         _refresh_fast,         interval=300, trading_only=True),
     Task("slow",         _refresh_slow,         interval=1800, trading_only=True),

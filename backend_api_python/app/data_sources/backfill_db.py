@@ -6,15 +6,16 @@ backfill_db.py — A 股 K 线盘后覆写（mootdx 直连）
 ═══════════════════════════════════════════════════════════════
 
 核心职责:
-  1. 交易日 15:05 后覆写当日 15m bar（每标的 16 条）
-  2. 交易日 17:00 后覆写当日 1D bar（每标的 1 条）
-  3. 首次运行时做历史回填
+  1. 交易日 15:05 后覆写当日 1m bar（每标的 240 条）
+  2. 交易日 15:05 后覆写当日 15m bar（每标的 16 条）
+  3. 交易日 17:00 后覆写当日 1D bar（每标的 1 条）
+  4. 首次运行时做历史回填
 
 设计原则:
   1. mootdx 直连，不走 coordinator
   2. 盘后全量覆写：先拉取 → 有数据才 DELETE → INSERT
   3. 无 cn_last_update，无修复循环
-  4. 对外接口: run_1d() / run_15m()（调度由 scheduler.py 管理）
+  4. 对外接口: run_1d() / run_15m() / run_1m()（调度由 scheduler.py 管理）
 
 数据说明:
   - mootdx bars() 返回的是不复权原始数据，与 kline 表存储方式一致
@@ -45,6 +46,7 @@ _executor = ThreadPoolExecutor(max_workers=1)
 _TDX_FREQ = {
     "1D": 4,    # 日线
     "15m": 1,   # 15分钟
+    "1m": 7,    # 1分钟 (pytdx frequency=7)
 }
 
 
@@ -402,6 +404,20 @@ def run_15m(symbols: Optional[List[str]] = None) -> str:
     """覆写 15m，返回 "ok" / "error"。"""
     result = sync_tf("15m", symbols)
     return result["status"]
+
+
+def run_1m(symbols: Optional[List[str]] = None) -> dict:
+    """覆写 1m，返回 {status, written, skipped}。
+
+    盘后调用，从 mootdx 拉取当日 1m K 线覆写到 kline_1m_YYYY 表。
+    每标的 240 条 (4小时 × 60分钟)。
+    """
+    result = sync_tf("1m", symbols)
+    return {
+        "status": result["status"],
+        "written": result["written"],
+        "skipped": result["written"] == 0 and result["status"] == "ok",
+    }
 
 
 
