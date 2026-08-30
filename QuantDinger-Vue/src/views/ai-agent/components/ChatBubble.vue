@@ -653,7 +653,6 @@ export default defineComponent({
 
     .score-circle {
       width: 64px;
-      height: 64px;
       border-radius: 50%;
       display: flex;
       flex-direction: column;

@@ -4107,7 +4107,6 @@ export default {
   // 移动端适配
   @media (max-width: 768px) {
     min-height: auto;
-    margin: -24px;
 
     .assistant-guide-bar {
       flex-direction: column;

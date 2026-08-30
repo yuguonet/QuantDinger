@@ -2062,7 +2062,7 @@ export default {
 @media (max-width: 992px) {
   .ai-analysis-container {
     height: auto;
-    min-height: calc(100vh - 64px);
+    min-height: calc(100vh - 48px);
     overflow-y: auto;
     overflow-x: hidden;
     width: 100%;

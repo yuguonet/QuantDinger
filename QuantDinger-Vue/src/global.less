@@ -302,3 +302,26 @@ body.realdark {
     }
   }
 }
+
+// =========================================================
+// 内容区域铺满子窗口：移除 pro-layout 的 24px 外边距，
+// 让 ant-pro-grid-content 区域等宽铺满整个窗口。
+// =========================================================
+.ant-pro-basicLayout-content {
+  margin: 0 !important;
+  .ant-pro-page-header-wrap {
+    margin: 0 !important;
+  }
+}
+
+.ant-pro-page-header-wrap-children-content {
+  margin: 0 !important;
+}
+
+.ant-pro-grid-content {
+  width: 100% !important;
+  &.wide {
+    max-width: none !important;
+    margin: 0 !important;
+  }
+}

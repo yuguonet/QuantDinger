@@ -1600,17 +1600,14 @@ export default {
 .metaverse-container {
   position: relative;
   width: 100%;
-  height: calc(100vh - 64px);
-  max-height: calc(100vh - 64px);
+  height: calc(100vh - 48px);
+  max-height: calc(100vh - 48px);
   // background-color: @bg-dark;
   color: @text-main;
   overflow: hidden;
   font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
   display: flex;
   flex-direction: column;
-  /* 尝试修复可能的父容器 padding 问题 */
-  margin: -24px;
-  width: calc(100% + 48px);
 }
 
 /* Background Effects */
@@ -3273,9 +3270,7 @@ export default {
     height: auto;
     overflow-y: auto;
     overflow-x: hidden;
-    margin: -12px;
-    width: calc(100% + 24px);
-    min-height: calc(100vh - 64px);
+    min-height: calc(100vh - 48px);
   }
 
   .main-console {

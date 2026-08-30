@@ -4034,7 +4034,7 @@ export default {
 .indicator-ide {
   display: flex;
   flex-direction: column;
-  min-height: calc(100vh - 64px);
+  min-height: calc(100vh - 48px);
   height: auto;
   padding: 0;
   background: #fff;
@@ -4356,8 +4356,8 @@ export default {
 .ide-left {
   min-width: 180px;
   max-width: 50%;
-  height: calc(100vh - 64px - 56px);
-  max-height: calc(100vh - 64px - 56px);
+  height: calc(100vh - 48px - 56px);
+  max-height: calc(100vh - 48px - 56px);
   display: flex;
   flex-direction: column;
   border-right: none;
@@ -4860,7 +4860,7 @@ export default {
 }
 
 // ===== Right Panel =====
-.ide-right { flex: 1; display: flex; flex-direction: column; overflow: visible; min-width: 0; height: calc(100vh - 64px - 56px); max-height: calc(100vh - 64px - 56px); }
+.ide-right { flex: 1; display: flex; flex-direction: column; overflow: visible; min-width: 0; height: calc(100vh - 48px - 56px); max-height: calc(100vh - 48px - 56px); }
 
 // ===== Chart Area with Tabs =====
 .ide-chart-area {

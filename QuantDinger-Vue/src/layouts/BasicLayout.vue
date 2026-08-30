@@ -187,6 +187,9 @@ export default {
         fixSiderbar: defaultSettings.fixSiderbar,
         colorWeak: defaultSettings.colorWeak,
 
+        siderWidth: 200,
+        collapsedWidth: 50,
+
         hideHintAlert: false,
         hideCopyButton: false
       },
@@ -615,7 +618,7 @@ export default {
   justify-content: flex-start;
   width: 100%;
   height: 100%;
-  padding: 0 16px;
+  padding: 0 8px;
   box-sizing: border-box;
 
   .sidebar-logo {
@@ -700,7 +703,7 @@ export default {
     bottom: 0;
     left: 0;
     z-index: 100;
-    width: 256px; /* 统一固定宽度 256px */
+    width: 200px; /* 统一固定宽度 200px */
     background: #111111;
     border-top: 1px solid #1c1c1c;
     /* 与菜单栏抽屉动画同步：使用相同的过渡时间和缓动函数 */
@@ -709,13 +712,13 @@ export default {
                 width 0.3s cubic-bezier(0.78, 0.14, 0.15, 0.86),
                 max-width 0.3s cubic-bezier(0.78, 0.14, 0.15, 0.86),
                 opacity 0.3s cubic-bezier(0.78, 0.14, 0.15, 0.86);
-    max-width: 256px;
+    max-width: 200px;
     display: block; /* 默认显示 */
     opacity: 1;
 
     &.collapsed {
-      width: 80px; /* 折叠时菜单宽度 */
-      max-width: 80px;
+      width: 50px; /* 折叠时菜单宽度 */
+      max-width: 50px;
     }
 
     /* 手机端：当菜单在 drawer 中时，需要更高的 z-index */
@@ -896,7 +899,7 @@ export default {
   ::v-deep .ant-pro-layout {
     &.ant-pro-sider-collapsed ~ .custom-menu-footer,
     .ant-pro-sider-collapsed ~ .custom-menu-footer {
-      width: 80px;
+      width: 50px;
     }
   }
 }
@@ -904,28 +907,26 @@ export default {
 /* 侧栏菜单滚动 & 为自定义 footer 预留空间 */
 .basic-layout-wrapper {
   .ant-layout-sider-children {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     padding-bottom: calc(var(--menu-footer-height, 220px) + 12px);
     overflow: hidden;
   }
 
   /* 强制侧栏和菜单区域可滚动，避免被 footer 遮挡 */
-  .ant-pro-sider {
+  .ant-pro-sider-menu-sider {
     height: 100vh;
     display: flex;
     flex-direction: column;
-
-    .ant-layout-sider-children {
-      flex: 1 1 auto;
-      min-height: 0;
-      display: flex;
-      flex-direction: column;
-    }
 
     .ant-pro-sider-menu,
     .ant-menu-root,
     .ant-menu {
       flex: 1 1 auto;
       min-height: 0;
+      height: auto;
       max-height: calc(100vh - var(--menu-footer-height, 220px) - 24px);
       overflow-y: auto !important;
       overflow-x: hidden;

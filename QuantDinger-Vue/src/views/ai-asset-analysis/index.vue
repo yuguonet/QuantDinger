@@ -159,7 +159,7 @@ export default {
 
 <style lang="less" scoped>
 .ai-asset-analysis-page {
-  padding: 20px;
+  padding: 1px;
   min-height: calc(100vh - 120px);
   background: #f0f2f5;
   width: 100%;
@@ -229,7 +229,7 @@ export default {
         text-align: center;
 
         .polymarket-placeholder {
-          .placeholder-icon { font-size: 64px; color: #6366f1; margin-bottom: 24px; }
+          .placeholder-icon { font-size: 32px; color: #6366f1; margin-bottom: 24px; }
           h3 { font-size: 20px; font-weight: 700; margin-bottom: 12px; color: rgba(0, 0, 0, 0.85); }
           p  { font-size: 14px; color: rgba(0, 0, 0, 0.55); margin-bottom: 24px; }
         }
