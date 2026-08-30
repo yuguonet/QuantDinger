@@ -208,6 +208,47 @@ def _bulk_upsert(records: List[Dict], year: int) -> int:
 
 
 # ================================================================
+# 交易时间判断
+# ================================================================
+
+def _is_auction_time(now: datetime) -> bool:
+    """9:26 集合竞价阶段, 采集一次"""
+    t = now.hour * 100 + now.minute
+    return t == 926
+
+
+def _is_trading_collect_time(now: datetime) -> bool:
+    """盘中可采集时段: 9:30~11:31, 13:00~15:01"""
+    t = now.hour * 100 + now.minute
+    return (930 <= t <= 1131) or (1300 <= t <= 1501)
+
+
+# ================================================================
+# 数据清理: 删除超过5天的快照数据
+# ================================================================
+
+def _cleanup_old_snapshots(year: int, keep_days: int = 5):
+    """删除 realtime_quote_snapshot_YYYY 中超过 keep_days 天的数据"""
+    from app.utils.db_market import get_market_db_manager
+    mgr = get_market_db_manager()
+    pool = mgr._get_pool("CNStock")
+    table = f"{_TABLE_PREFIX}_{year}"
+    cutoff = datetime.now(TZ_CN) - timedelta(days=keep_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d 00:00:00")
+    try:
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(f'DELETE FROM "{table}" WHERE time < %s', (cutoff_str,))
+            deleted = cur.rowcount
+            conn.commit()
+            cur.close()
+            if deleted > 0:
+                logger.info("[realtime_snapshot] 清理 %d 条过期数据 (< %s)", deleted, cutoff_str)
+    except Exception as e:
+        logger.warning("[realtime_snapshot] 清理过期数据失败: %s", e)
+
+
+# ================================================================
 # 主入口 — scheduler 调用
 # ================================================================
 
@@ -215,13 +256,29 @@ def collect_realtime_snapshot() -> Dict:
     """
     全市场实时行情快照采集。
 
-    流程: 拉代码 → coordinator 批量拉取 → 原始数据 UPSERT 写入
+    流程: 交易时间检查 → 拉代码 → coordinator 批量拉取 → 原始数据 UPSERT 写入 → 清理过期数据
+
+    交易时间:
+      9:29       → 采集一次(集合竞价快照)
+      9:30~11:31 → 正常采集
+      13:00~15:01 → 正常采集
+      其他时段   → 跳过
 
     Returns:
-        {"status": "ok"|"error", "stocks": int, "written": int,
+        {"status": "ok"|"skip"|"error", "stocks": int, "written": int,
          "failed": int, "elapsed": float}
     """
     t0 = time.time()
+    now = datetime.now(TZ_CN)
+
+    # ── 0. 交易时间检查 ──
+    if now.weekday() >= 5:
+        return {"status": "skip", "stocks": 0, "written": 0,
+                "failed": 0, "elapsed": 0, "reason": "周末"}
+
+    if not (_is_trading_collect_time(now) or _is_auction_time(now)):
+        return {"status": "skip", "stocks": 0, "written": 0,
+                "failed": 0, "elapsed": 0, "reason": "非交易时段"}
 
     # ── 1. 获取全市场代码 ──
     try:
@@ -240,16 +297,15 @@ def collect_realtime_snapshot() -> Dict:
     from app.data_sources.coordinator import get_coordinator
     coord = get_coordinator()
     quotes = coord.coordinate_batch_quotes(
-        symbols=codes, market="CNStock", timeout=45,
+        symbols=codes, market="CNStock", timeout=60,
     )
 
     if not quotes:
-        logger.warning("[realtime_snapshot] 拉取 0 条行情")
+        logger.warning("[realtime_snapshot] 拉取 0 条行情 (全市场 %d 只)", len(codes))
         return {"status": "error", "stocks": len(codes), "written": 0,
                 "failed": len(codes), "elapsed": time.time() - t0}
 
     # ── 3. 提取原始快照 ──
-    now = datetime.now(TZ_CN)
     ts_str = now.strftime("%Y-%m-%d %H:%M:00")
     year = now.year
     records = _extract_snapshot_records(quotes, ts_str)
@@ -259,16 +315,32 @@ def collect_realtime_snapshot() -> Dict:
     written = _bulk_upsert(records, year)
 
     elapsed = time.time() - t0
-    failed = len(codes) - len(quotes)
+    fetched = len(quotes)
+    total = len(codes)
+    failed = total - fetched
+    success_rate = fetched / total * 100 if total > 0 else 0
+
+    # 找出缺失的股票 (采样前20个)
+    quote_symbols = {q.get("symbol", "") for q in quotes}
+    missing = [c for c in codes if c not in quote_symbols]
+    missing_sample = missing[:20]
 
     logger.info(
-        "[realtime_snapshot] 完成: %d/%d 只, %d 条写入, %d 失败, %.2fs",
-        len(quotes), len(codes), written, failed, elapsed,
+        "[realtime_snapshot] 完成: %d/%d 只 (%.1f%%), %d 条写入, %d 缺失, %.2fs",
+        fetched, total, success_rate, written, failed, elapsed,
     )
+    if failed > 0:
+        logger.info(
+            "[realtime_snapshot] 缺失采样 (%d只): %s",
+            len(missing_sample), ", ".join(missing_sample),
+        )
+
+    # ── 5. 清理超过5天的过期数据 ──
+    _cleanup_old_snapshots(year, keep_days=5)
 
     return {
-        "status": "ok" if len(quotes) / len(codes) > 0.8 else "error",
-        "stocks": len(codes),
+        "status": "ok" if success_rate > 80 else "error",
+        "stocks": total,
         "written": written,
         "failed": failed,
         "elapsed": round(elapsed, 2),

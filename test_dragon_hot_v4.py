@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """龙虎榜游资D0策略 v4 — 纯VWAP时间入场
 
-在 v2 基础上新增15分钟K线分析，D0盘中买入（不等D1开盘）。
+在 v2 基础上新增1分钟K线分析，D0盘中买入（不等D1开盘）。
 v4 默认去掉一切盘中形态，只凭VWAP状态 + 入场时间段决策:
-  全天逐15m bar扫描，第一根"VWAP健康"即入场(allow_early，10:00结束点即可判定)。
+  全天逐1m bar扫描，第一根"VWAP健康"即入场(allow_early，10:00结束点即可判定)。
   实证: 9:30~10:00冲板封板概率大，第一时间买入价格最优。
   实测(2026-01~08): 120天 237笔 58.2%胜率 总+1163.9% | 20天 59笔 55.9% 总+317.4%
 
@@ -14,7 +14,7 @@ VWAP日内均线状态(弱转强关键):
                / oscillation(反复上下穿越>=2次) / weak_slope / weak_below
   --skip-su: 强排除 strong_up 状态的实验开关，实测延迟买入更贵(120d仅+1086)，默认关。
 
-无15m数据/全天VWAP均不健康 → 降级D1开盘入场(高开幅度<=--max-gap)
+无1m数据/全天VWAP均不健康 → 降级D1开盘入场(高开幅度<=--max-gap)
 
 --pattern: 切回 v3 统一信号形态(早盘强势/回踩企稳/冲板动能)+VWAP过滤，仅作对照。
 
@@ -23,7 +23,7 @@ VWAP日内均线状态(弱转强关键):
 
 数据源:
   日线: kline_1D_YYYY (前复权)
-  15分钟: kline_15m_YYYY (表名按年分, bar时间为区间结束点, 首根09:45)
+  1分钟: kline_1m_YYYY (表名按年分, bar时间为区间结束点, 首根09:31)
 
 用法:
   python test_dragon_hot_v4.py --days 20 --hold-days 7
@@ -134,14 +134,14 @@ def fetch_kline_db(code: str, days: int = 300) -> List[Dict]:
         return []
 
 
-def fetch_kline_15m(code: str, start_date: str, end_date: str) -> List[Dict]:
-    """从 kline_15m_YYYY 表加载15分钟K线
+def fetch_kline_1m(code: str, start_date: str, end_date: str) -> List[Dict]:
+    """从 kline_1m_YYYY 表加载1分钟K线
 
-    表名按年分: kline_15m_2025, kline_15m_2026, ...
+    表名按年分: kline_1m_2025, kline_1m_2026, ...
     跨年时合并多张表。
 
     Returns:
-        按时间升序的15m bar列表, 每条: {time, open, high, low, close, volume}
+        按时间升序的1m bar列表, 每条: {time, open, high, low, close, volume}
     """
     pool = _get_cnstock_pool()
     # 计算涉及的年份
@@ -149,12 +149,12 @@ def fetch_kline_15m(code: str, start_date: str, end_date: str) -> List[Dict]:
         y_start = int(start_date[:4])
         y_end = int(end_date[:4])
     except (ValueError, IndexError):
-        print(f"  [15m] {code} 日期解析失败: {start_date}~{end_date}", file=sys.stderr)
+        print(f"  [1m] {code} 日期解析失败: {start_date}~{end_date}", file=sys.stderr)
         return []
 
     all_bars = []
     for year in range(y_start, y_end + 1):
-        table = f"kline_15m_{year}"
+        table = f"kline_1m_{year}"
         try:
             with pool.connection() as conn:
                 cur = conn.cursor()
@@ -168,7 +168,7 @@ def fetch_kline_15m(code: str, start_date: str, end_date: str) -> List[Dict]:
                 rows = cur.fetchall()
                 cur.close()
                 if rows:
-                    print(f"  [15m] {code} {table}: {len(rows)}条", file=sys.stderr)
+                    print(f"  [1m] {code} {table}: {len(rows)}条", file=sys.stderr)
                 for r in rows:
                     t = r[0]
                     all_bars.append({
@@ -180,13 +180,85 @@ def fetch_kline_15m(code: str, start_date: str, end_date: str) -> List[Dict]:
                         "volume": float(r[5]),
                     })
         except Exception as e:
-            print(f"  [15m] {code} {table} 查询失败: {e}", file=sys.stderr)
+            print(f"  [1m] {code} {table} 查询失败: {e}", file=sys.stderr)
             continue
 
     if not all_bars:
-        print(f"  [15m] {code} {start_date}~{end_date} 无数据", file=sys.stderr)
+        print(f"  [1m] {code} {start_date}~{end_date} 无数据", file=sys.stderr)
     all_bars.sort(key=lambda b: b["time"])
     return all_bars
+
+
+def fetch_realtime_snapshot(code: str, date: str) -> List[Dict]:
+    """从 realtime_quote_snapshot_YYYY 表加载实时快照并转为1m bar格式
+
+    snapshot表字段: symbol, time, "last", open, high, low, "previousClose", volume
+    其中 open/high/low 是日内累计值，volume 是累计成交量（股）。
+    需要转换为增量1m bar: open=上一根last, high/low=区间极点, volume=增量。
+    """
+    pool = _get_cnstock_pool()
+    table = f"realtime_quote_snapshot_{date[:4]}"
+    try:
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f'SELECT time, "last", open, high, low, "previousClose", volume '
+                f'FROM "{table}" '
+                f'WHERE symbol = %s AND time >= %s AND time <= %s '
+                f'ORDER BY time',
+                (code, date + " 09:00:00", date + " 16:00:00")
+            )
+            rows = cur.fetchall()
+            cur.close()
+    except Exception as e:
+        print(f"  [snapshot] {code} {table} 查询失败: {e}", file=sys.stderr)
+        return []
+
+    if not rows:
+        return []
+
+    # 转为增量1m bar
+    bars = []
+    prev_last = None
+    prev_cum_vol = 0
+    for r in rows:
+        t = r[0]
+        last = float(r[1]) if r[1] else 0
+        day_open = float(r[2]) if r[2] else 0
+        day_high = float(r[3]) if r[3] else 0
+        day_low = float(r[4]) if r[4] else 0
+        prev_close = float(r[5]) if r[5] else 0
+        cum_vol = float(r[6]) if r[6] else 0
+
+        if last <= 0:
+            continue
+
+        time_str = t.strftime("%Y-%m-%d %H:%M:%S") if isinstance(t, datetime) else str(t)
+
+        # 增量volume
+        vol_delta = cum_vol - prev_cum_vol if prev_cum_vol > 0 else 0
+
+        # 用snapshot的day open/high/low作为bar的OHLC
+        # 但更精确的做法: 用last作为close，day high/low作为bar的high/low
+        bar = {
+            "time": time_str,
+            "open": prev_last if prev_last else last,
+            "high": day_high if day_high > 0 else last,
+            "low": day_low if day_low > 0 else last,
+            "close": last,
+            "volume": vol_delta if vol_delta > 0 else cum_vol,
+            "prev_close": prev_close,
+        }
+        bars.append(bar)
+        prev_last = last
+        prev_cum_vol = cum_vol
+
+    # 补充prev_close到第一根bar
+    if bars and bars[0].get('prev_close', 0) <= 0:
+        # 从day_open推算（第一根bar的open通常是前一日收盘价）
+        pass
+
+    return bars
 
 
 def get_board_type(code: str) -> str:
@@ -326,20 +398,20 @@ def analyze_tech(bars: List[Dict], idx: int) -> Dict:
 
 
 # ================================================================
-# 15分钟入场信号检测
+# 1分钟入场信号检测
 # ================================================================
 
-def _split_15m_by_date(bars_15m: List[Dict]) -> Dict[str, List[Dict]]:
-    """将15m bar按日期分组"""
+def _split_1m_by_date(bars_1m: List[Dict]) -> Dict[str, List[Dict]]:
+    """将1m bar按日期分组"""
     by_date = defaultdict(list)
-    for b in bars_15m:
+    for b in bars_1m:
         date_str = b["time"][:10]
         by_date[date_str].append(b)
     return dict(by_date)
 
 
 def analyze_vwap_strength(
-    bars_15m_day: List[Dict],
+    bars_1m_day: List[Dict],
     bar_idx: int,
     buy_price: float,
     prev_close: float,
@@ -350,10 +422,10 @@ def analyze_vwap_strength(
 
     args:
         allow_early=False: 允许早盘不足3根bar时也计算(用2根bar估算斜率)。
-        用于纯VWAP入场模式, 数据最早bar为09:45结束点,
-        用户视角"9:30算一根", 故第1根可算bar对应10:00结束点。
+        用于纯VWAP入场模式, 数据最早bar为09:31结束点,
+        用户视角"9:30算一根", 故第1根可算bar对应09:31结束点。
 
-    强信号(保留15m入场):
+    强信号(保留1m入场):
       strong_up      强势沿VWAP: 近3根close全>VWAP 且 VWAP斜率>0.1(价格站上VWAP并拉动VWAP向上)
       strong_reclaim 回踩快速收复: 当前bar low刺破VWAP(1-2根内), close收回>VWAP, VWAP持平或向上
       strong_pierce  弱转强刺破: 前根close在VWAP下方, 当前close向上刺破站上VWAP,
@@ -371,13 +443,13 @@ def analyze_vwap_strength(
       hold_above     价格在VWAP上方但无强势特征(未拉动均线, 无回踩无刺破)
     """
     if allow_early:
-        if bar_idx < 1 or bar_idx >= len(bars_15m_day):
+        if bar_idx < 1 or bar_idx >= len(bars_1m_day):
             return None
-    elif bar_idx < 2 or bar_idx >= len(bars_15m_day):
+    elif bar_idx < 2 or bar_idx >= len(bars_1m_day):
         return None
 
     # 计算到当前bar为止的累积VWAP
-    bars_so_far = bars_15m_day[:bar_idx + 1]
+    bars_so_far = bars_1m_day[:bar_idx + 1]
     total_pv = 0.0
     total_vol = 0.0
     vwap_series = []
@@ -399,8 +471,8 @@ def analyze_vwap_strength(
     else:
         vwap_slope = 0.0
 
-    bar = bars_15m_day[bar_idx]
-    prev_bar = bars_15m_day[bar_idx - 1] if bar_idx > 0 else None
+    bar = bars_1m_day[bar_idx]
+    prev_bar = bars_1m_day[bar_idx - 1] if bar_idx > 0 else None
     price = bar['close']
     low = bar['low']
 
@@ -413,16 +485,16 @@ def analyze_vwap_strength(
     crosses = 0
     if len(vwap_series) >= 3:
         for i in range(-3, 0):
-            b = bars_15m_day[bar_idx + i]
+            b = bars_1m_day[bar_idx + i]
             prev_v = vwap_series[bar_idx + i]
-            if (b['close'] > prev_v) != (bars_15m_day[bar_idx + i + 1]['close'] > vwap_series[bar_idx + i + 1]):
+            if (b['close'] > prev_v) != (bars_1m_day[bar_idx + i + 1]['close'] > vwap_series[bar_idx + i + 1]):
                 crosses += 1
 
     # 近3根close是否全部在VWAP上方
     recent_above_vwap = True
     if len(vwap_series) >= 3:
         for i in range(-3, 0):
-            if bars_15m_day[bar_idx + i]['close'] < vwap_series[bar_idx + i]:
+            if bars_1m_day[bar_idx + i]['close'] < vwap_series[bar_idx + i]:
                 recent_above_vwap = False
                 break
     else:
@@ -478,6 +550,18 @@ def analyze_vwap_strength(
 
     pass_states = {"strong_up", "strong_reclaim", "strong_pierce", "hold_above"}
 
+    # ---- 过滤优化 ----
+    # VWAP距离>2%: 胜率从76%骤降到52%, 降级hold_above
+    if dist_vwap > 2.0:
+        pass_states -= {"hold_above"}
+        if dist_vwap > 3.0:
+            pass_states = set()
+
+    # 斜率陷阱区1.2~1.7%: 胜率仅40%, 全部拒绝
+    if 1.2 <= vwap_slope < 1.7:
+        pass_states = set()
+        reasons.append(f"斜率陷阱区({vwap_slope:.1f}%)")
+
     return {
         "state": state,
         "pass": state in pass_states,
@@ -491,25 +575,25 @@ def analyze_vwap_strength(
 
 
 def detect_signal(
-    bars_15m_day: List[Dict],
+    bars_1m_day: List[Dict],
     prev_close: float,
     board_type: str,
     vol_ratio: Optional[float] = None,
 ) -> Optional[Dict]:
-    """统一15m盘中信号检测（v4 合并 A/B/C，不再区分入场模式）
+    """统一1m盘中信号检测（v4 合并 A/B/C，不再区分入场模式）
 
-    在当日15m扫描中按以下优先级取最早命中的盘中形态:
-      1) 早盘强势: 开盘前2根15m bar全阳 + 累计涨幅>3% + 第2根量>第1根×1.2
+    在当日1m扫描中按以下优先级取最早命中的盘中形态:
+      1) 早盘强势: 开盘前15根1m bar全阳 + 累计涨幅>3% + 第15根量>第1根×1.2
       2) 回踩企稳: 曾触及涨停(high>=涨停价×0.998) + 回踩<=5% + 量不放大
-                   + 收盘站上当日VWAP + D0量比<1.3 + 日内涨幅<=11% + 时间<14:30
+                   + 收盘站上当日VWAP + D0量比<1.3 + 日内涨幅<=11% + 时间<14:45
       3) 冲板动能: bar涨5~12% + high距涨停<=5% + 突破前bar高点
                    + 量不极度萎缩 + 时间<11:30
 
     Returns:
         {bar_idx, bar_time, buy_price, intraday_pct, signal_type, reason, ...}
     """
-    n = len(bars_15m_day)
-    if n < 2 or prev_close <= 0:
+    n = len(bars_1m_day)
+    if n < 15 or prev_close <= 0:
         return None
 
     limit_price = get_limit_price(prev_close, board_type)
@@ -518,41 +602,45 @@ def detect_signal(
     vwap_series = []
     total_pv = 0.0
     total_vol = 0.0
-    for b in bars_15m_day:
+    for b in bars_1m_day:
         typical = (b["high"] + b["low"] + b["close"]) / 3
         total_pv += typical * b["volume"]
         total_vol += b["volume"]
         vwap_series.append(total_pv / total_vol if total_vol > 0 else 0)
 
-    # --- 1) 早盘强势（bar 1） ---
-    b0, b1 = bars_15m_day[0], bars_15m_day[1]
-    if (b0["time"][11:16] <= "10:15"
-            and b0["close"] > b0["open"] and b1["close"] > b1["open"]):
-        intraday_pct = (b1["close"] / prev_close - 1) * 100
-        if intraday_pct > 3.0 and (b0["volume"] <= 0 or b1["volume"] > b0["volume"] * 1.2):
-            return {
-                "bar_idx": 1,
-                "bar_time": b1["time"],
-                "buy_price": b1["close"],
-                "intraday_pct": round(intraday_pct, 2),
-                "signal_type": "盘中信号",
-                "reason": "早盘强势",
-            }
+    # --- 1) 早盘强势（前15根1m bar，覆盖09:30~09:45） ---
+    # 检查前15根bar是否全部阳线
+    first_15_idx = min(14, n - 1)
+    if bars_1m_day[0]["time"][11:16] <= "09:45":
+        all_bullish = all(bars_1m_day[i]["close"] > bars_1m_day[i]["open"] for i in range(first_15_idx + 1))
+        if all_bullish:
+            b_first = bars_1m_day[0]
+            b_last = bars_1m_day[first_15_idx]
+            intraday_pct = (b_last["close"] / prev_close - 1) * 100
+            if intraday_pct > 3.0 and (b_first["volume"] <= 0 or b_last["volume"] > b_first["volume"] * 1.2):
+                return {
+                    "bar_idx": first_15_idx,
+                    "bar_time": b_last["time"],
+                    "buy_price": b_last["close"],
+                    "intraday_pct": round(intraday_pct, 2),
+                    "signal_type": "盘中信号",
+                    "reason": "早盘强势",
+                }
 
     # --- 2) 回踩企稳（首次触及涨停后） ---
     first_touch_idx = None
-    for i, bar in enumerate(bars_15m_day):
+    for i, bar in enumerate(bars_1m_day):
         if bar["high"] >= limit_price * 0.998:
             first_touch_idx = i
             break
 
     if first_touch_idx is not None:
         for i in range(first_touch_idx + 1, n):
-            bar = bars_15m_day[i]
-            if bar["time"][11:16] >= "14:30":
+            bar = bars_1m_day[i]
+            if bar["time"][11:16] >= "14:45":
                 break
             pullback_pct = (limit_price - bar["low"]) / limit_price * 100
-            prev_bar = bars_15m_day[i - 1]
+            prev_bar = bars_1m_day[i - 1]
 
             # 回撤不超过5%
             if pullback_pct > 5.0:
@@ -584,12 +672,12 @@ def detect_signal(
 
     # --- 3) 冲板动能 ---
     for i in range(1, n):
-        bar = bars_15m_day[i]
+        bar = bars_1m_day[i]
         if bar["time"][11:16] >= "11:30":
             break
         intraday_pct = (bar["close"] / prev_close - 1) * 100
         high_dist = (limit_price - bar["high"]) / limit_price * 100
-        prev_bar = bars_15m_day[i - 1]
+        prev_bar = bars_1m_day[i - 1]
 
         # 涨幅 5~12%（太低没动能，太高追涨被套）
         if intraday_pct < 5.0 or intraday_pct > 12.0:
@@ -804,7 +892,7 @@ def strategy_v4(
             by_code[code].append(row)
 
     trades = []
-    _15m_cache: Dict[str, List[Dict]] = {}  # code -> 15m bars
+    _1m_cache: Dict[str, List[Dict]] = {}  # code -> 1m bars
 
     for code, rows in by_code.items():
         rows.sort(key=lambda x: x.get('trade_date', ''))
@@ -846,16 +934,16 @@ def strategy_v4(
         prev_close = bars[d0_idx - 1]['close'] if d0_idx > 0 else 0
 
         # === 统一D0盘中入场 ===
-        # 加载15m数据
-        if code not in _15m_cache:
+        # 加载1m数据
+        if code not in _1m_cache:
             d0_dt = datetime.strptime(d0_date, "%Y-%m-%d")
-            start_15m = (d0_dt - timedelta(days=2)).strftime("%Y-%m-%d")
-            end_15m = (d0_dt + timedelta(days=2)).strftime("%Y-%m-%d")
-            _15m_cache[code] = fetch_kline_15m(code, start_15m, end_15m)
+            start_1m = (d0_dt - timedelta(days=2)).strftime("%Y-%m-%d")
+            end_1m = (d0_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+            _1m_cache[code] = fetch_kline_1m(code, start_1m, end_1m)
 
-        bars_15m_all = _15m_cache.get(code, [])
-        if not bars_15m_all:
-            # 15m数据不可用，降级到D1
+        bars_1m_all = _1m_cache.get(code, [])
+        if not bars_1m_all:
+            # 1m数据不可用，降级到D1
             entry = get_d1_entry(bars, d0_idx, max_gap)
             if entry is None:
                 continue
@@ -880,23 +968,23 @@ def strategy_v4(
             })
             continue
 
-        # 按日期分组15m bar
-        bars_15m_by_date = _split_15m_by_date(bars_15m_all)
-        bars_15m_day = bars_15m_by_date.get(d0_date, [])
+        # 按日期分组1m bar
+        bars_1m_by_date = _split_1m_by_date(bars_1m_all)
+        bars_1m_day = bars_1m_by_date.get(d0_date, [])
 
-        if not bars_15m_day:
-            print(f"  [信号] {code} {d0_date} 无15m bar (15m_by_date keys: {list(bars_15m_by_date.keys())[:3]})", file=sys.stderr)
+        if not bars_1m_day:
+            print(f"  [信号] {code} {d0_date} 无1m bar (1m_by_date keys: {list(bars_1m_by_date.keys())[:3]})", file=sys.stderr)
             continue
 
-        print(f"  [信号] {code} {d0_date} 15m有{len(bars_15m_day)}根bar, 检测盘中信号...", file=sys.stderr)
+        print(f"  [信号] {code} {d0_date} 1m有{len(bars_1m_day)}根bar, 检测盘中信号...", file=sys.stderr)
 
         # 统一信号检测
         if vwap_time:
             # 纯VWAP入场: 全天逐bar, 第一根可接受状态即入场
             signal = None
-            for idx in range(1, len(bars_15m_day)):
-                bar = bars_15m_day[idx]
-                vw = analyze_vwap_strength(bars_15m_day, idx, bar["close"],
+            for idx in range(1, len(bars_1m_day)):
+                bar = bars_1m_day[idx]
+                vw = analyze_vwap_strength(bars_1m_day, idx, bar["close"],
                                            prev_close, board_type, allow_early=True)
                 if vw is None:
                     continue
@@ -912,13 +1000,13 @@ def strategy_v4(
                     }
                     break
         else:
-            signal = detect_signal(bars_15m_day, prev_close, board_type,
+            signal = detect_signal(bars_1m_day, prev_close, board_type,
                                    vol_ratio=d0_features.get('vol_ratio'))
 
         if signal is None:
-            if bars_15m_day:
-                print(f"  [信号] {code} {d0_date} 15m有{len(bars_15m_day)}根bar但盘中信号未触发", file=sys.stderr)
-            # 没有15m信号，降级到D1
+            if bars_1m_day:
+                print(f"  [信号] {code} {d0_date} 1m有{len(bars_1m_day)}根bar但盘中信号未触发", file=sys.stderr)
+            # 没有1m信号，降级到D1
             entry = get_d1_entry(bars, d0_idx, max_gap)
             if entry is None:
                 continue
@@ -947,7 +1035,7 @@ def strategy_v4(
         vwap_check = signal.get('_vwap')
         if vwap_check is None:
             vwap_check = analyze_vwap_strength(
-                bars_15m_day, signal['bar_idx'], signal['buy_price'], prev_close, board_type)
+                bars_1m_day, signal['bar_idx'], signal['buy_price'], prev_close, board_type)
         if vwap_debug and vwap_check is not None and VWAP_DEBUG is not None:
             hr = run_backtest(bars, d0_idx, signal['buy_price'],
                               hold_days, stop_loss, trailing_stop, take_profit)
@@ -1029,6 +1117,181 @@ def strategy_v4(
     return trades
 
 
+def run_realtime_scan(args):
+    """盘中实时扫描模式: 从realtime_quote_snapshot读取今日数据, 扫描龙虎榜D0标的入场信号"""
+    from datetime import timezone, timedelta as td
+    tz_cn = timezone(td(hours=8))
+    today = datetime.now(tz_cn).strftime("%Y-%m-%d")
+    now_time = datetime.now(tz_cn).strftime("%H:%M:%S")
+
+    print(f"\n{'=' * 80}")
+    print(f"📡 盘中实时扫描模式 | {today} {now_time}")
+    print(f"{'=' * 80}")
+
+    # 1. 加载龙虎榜数据, 筛选今日D0标的
+    print(f"\n📊 加载龙虎榜数据...")
+    dragon_data = fetch_dragon_tiger_from_db(limit=50000)
+    print(f"  龙虎榜: {len(dragon_data)}条")
+
+    if not dragon_data:
+        print("\n❌ 无龙虎榜数据")
+        return
+
+    # 筛选今日龙虎榜标的
+    today_dragons = [r for r in dragon_data if r.get('trade_date', '') == today]
+    if not today_dragons:
+        # 也看最近的龙虎榜日期
+        all_dates = sorted(set(r.get('trade_date', '') for r in dragon_data), reverse=True)
+        print(f"\n  今日({today})无龙虎榜数据")
+        print(f"  最近龙虎榜日期: {all_dates[:5]}")
+        if all_dates:
+            print(f"\n  使用最近日期 {all_dates[0]} 的龙虎榜数据...")
+            today = all_dates[0]
+            today_dragons = [r for r in dragon_data if r.get('trade_date', '') == today]
+        if not today_dragons:
+            print("\n❌ 无可用龙虎榜数据")
+            return
+
+    # 按code聚合
+    by_code: Dict[str, List[Dict]] = defaultdict(list)
+    for r in today_dragons:
+        code = r.get('stock_code', '')
+        if code:
+            by_code[code].append(r)
+
+    print(f"  龙虎榜标的: {len(by_code)}只")
+
+    # 2. 对每只标的进行实时扫描
+    kline_cache = {}
+    signals = []
+    no_data = []
+    no_signal = []
+
+    for code, rows in by_code.items():
+        rows.sort(key=lambda x: x.get('trade_date', ''))
+        d0_row = rows[0]
+        d0_date = d0_row.get('trade_date', '')
+        board_type = get_board_type(code)
+        net_amount = float(d0_row.get('net_amount', 0) or 0)
+
+        # 加载日线检查D0条件
+        if code not in kline_cache:
+            bars = fetch_kline_db(code, 300)
+            if bars:
+                kline_cache[code] = bars
+        bars = kline_cache.get(code)
+        if not bars:
+            continue
+
+        d0_idx = None
+        for j, b in enumerate(bars):
+            if b['time'] == d0_date:
+                d0_idx = j
+                break
+        if d0_idx is None:
+            continue
+
+        d0_features = check_d0_conditions(bars, d0_idx, net_amount, board_type, args.min_net)
+        if d0_features is None:
+            continue
+
+        tech = analyze_tech(bars, d0_idx)
+        prev_close = bars[d0_idx - 1]['close'] if d0_idx > 0 else 0
+
+        # 加载实时快照数据
+        snapshot_bars = fetch_realtime_snapshot(code, d0_date)
+        if not snapshot_bars:
+            no_data.append(code)
+            continue
+
+        # 获取prev_close (优先用snapshot里的, 否则用日线)
+        if snapshot_bars and snapshot_bars[0].get('prev_close', 0) > 0:
+            prev_close = snapshot_bars[0]['prev_close']
+
+        # 运行VWAP分析
+        signal = None
+        for idx in range(1, len(snapshot_bars)):
+            bar = snapshot_bars[idx]
+            vw = analyze_vwap_strength(snapshot_bars, idx, bar["close"],
+                                       prev_close, board_type, allow_early=True)
+            if vw is None:
+                continue
+            if vw["pass"]:
+                signal = {
+                    "bar_idx": idx,
+                    "bar_time": bar["time"],
+                    "buy_price": bar["close"],
+                    "intraday_pct": round((bar["close"] / prev_close - 1) * 100, 2),
+                    "signal_type": "盘中信号",
+                    "reason": "VWAP:" + vw["state"],
+                    "_vwap": vw,
+                }
+                break
+
+        if signal is None:
+            no_signal.append({
+                'code': code,
+                'name': d0_row.get('stock_name', ''),
+                'bars': len(snapshot_bars),
+                'last_price': snapshot_bars[-1]['close'] if snapshot_bars else 0,
+                'intraday_pct': round((snapshot_bars[-1]['close'] / prev_close - 1) * 100, 2)
+                                   if snapshot_bars and prev_close > 0 else 0,
+            })
+            continue
+
+        vwap_info = signal.get('_vwap', {})
+        signals.append({
+            'code': code,
+            'name': d0_row.get('stock_name', ''),
+            'board': get_board_name(code),
+            'signal': signal,
+            'vwap_info': vwap_info,
+            'd0_features': d0_features,
+            'tech': tech,
+            'prev_close': prev_close,
+            'bars_count': len(snapshot_bars),
+            'last_price': snapshot_bars[-1]['close'] if snapshot_bars else 0,
+        })
+
+    # 3. 输出结果
+    print(f"\n{'=' * 80}")
+    print(f"📡 实时扫描结果 | {today}")
+    print(f"{'=' * 80}")
+
+    if signals:
+        print(f"\n✅ 入场信号: {len(signals)}只")
+        print(f"{'=' * 80}")
+        for s in signals:
+            sig = s['signal']
+            vw = s['vwap_info']
+            d0f = s['d0_features']
+            buy_p = sig['buy_price']
+            last_p = s.get('last_price', buy_p)
+            vwap_val = vw.get('vwap', 0)
+            max_buy = round(vwap_val * 1.02, 2) if vwap_val > 0 else buy_p
+            print(f"\n  🔔 {s['code']} {s['name']} ({s['board']})")
+            print(f"     建议买入价: {buy_p:.2f} @ {sig['bar_time'][11:16]}  (现价{last_p:.2f} | 上限{max_buy:.2f})")
+            print(f"     信号: {sig['reason']}")
+            print(f"     日涨: {sig['intraday_pct']:+.1f}% | 前收: {s['prev_close']:.2f}")
+            print(f"     VWAP: {vw.get('vwap', 0):.3f} | 距离: {vw.get('dist_vwap', 0):+.1f}% | 斜率: {vw.get('vwap_slope', 0):+.3f}%")
+            print(f"     D0涨停: {d0f.get('d0_change', 0):.0f}% | 净买入: {d0f.get('net_wan', 0):.0f}万 | 量比: {d0f.get('vol_ratio', 0):.1f}x")
+    else:
+        print(f"\n❌ 无入场信号")
+
+    if no_signal:
+        print(f"\n⏳ 等待信号: {len(no_signal)}只")
+        for ns in no_signal:
+            print(f"  ⏳ {ns['code']} {ns['name']} | {ns['bars_count']}根bar | "
+                  f"价格{ns['last_price']:.2f} | 日涨{ns['intraday_pct']:+.1f}%")
+
+    if no_data:
+        print(f"\n⚠️ 无实时数据: {len(no_data)}只 ({', '.join(no_data[:10])}{'...' if len(no_data) > 10 else ''})")
+
+    print(f"\n{'=' * 80}")
+    print(f"扫描完成 | 信号{len(signals)} | 等待{len(no_signal)} | 无数据{len(no_data)}")
+    print(f"{'=' * 80}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="龙虎榜游资D0策略 v4 — 纯VWAP时间入场(默认)")
     parser.add_argument("--days", type=int, default=20, help="D0搜索窗口(交易日)")
@@ -1046,6 +1309,8 @@ def main():
     parser.add_argument("--all-trades", action="store_true", help="输出交易明细")
     parser.add_argument("--detail", action="store_true", help="输出详细匹配信息")
     parser.add_argument("--export", type=str, default="", help="导出JSON文件路径")
+    parser.add_argument("--today", action="store_true",
+                        help="盘中实时扫描模式: 从realtime_quote_snapshot读取今日数据, 扫描龙虎榜D0标的入场信号")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -1053,6 +1318,10 @@ def main():
     print("D0: 涨停 + 突破前高 + 净买入>5000万 + 量比<2x")
     print(f"止损{args.stop_loss}% | 追踪{args.trailing_stop}% | 止盈{args.take_profit}% | 持仓{args.hold_days}天")
     print("=" * 80)
+
+    if args.today:
+        run_realtime_scan(args)
+        return
 
     # 加载数据
     print(f"\n📊 加载龙虎榜数据 (窗口={args.days}天)...")
