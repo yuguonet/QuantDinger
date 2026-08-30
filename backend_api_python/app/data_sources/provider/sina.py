@@ -122,7 +122,7 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
         return {
-            "name": name, "open": open_p, "prev_close": prev_close,
+            "name": name, "open": open_p, "previousClose": prev_close,
             "last": last, "high": high, "low": low,
             "volume": volume, "amount": amount,
         }
@@ -342,7 +342,7 @@ class SinaDataSource:
         if not quote:
             return None
         last = quote["last"]
-        prev = quote["prev_close"]
+        prev = quote["previousClose"]
         chg = round(last - prev, 4) if prev else 0.0
         vol = quote.get("volume", 0)
         time_str = ""

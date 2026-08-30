@@ -12,6 +12,7 @@
 #      - 停复牌检测（vol=0 且 OHLC 相同）
 #      - volume > 0（非停牌 bar）
 #      - 15m: 每天 16 bar 检查
+#      - 1m: 每天 ~240 bar 检查（±1 容差）
 #   4. 无错误 → 先删旧数据再写入
 #      有错误 → 写 log + 记录进重传文件
 #   5. 循环直到全部完成
@@ -25,6 +26,7 @@
 # 用法:
 # python fix/source_sync.py -T 1D                    # 1D: 默认 2021-01-04 起
 # python fix/source_sync.py -T 15m                   # 15m: 默认 2024-01-02 起
+# python fix/source_sync.py -T 1m                    # 1m: 默认 2025-01-02 起
 # python fix/source_sync.py -T 1D --start-date 2023-01-01  # 指定起始日期
 # python fix/source_sync.py -T 1D --end-date 2026-05-17    # 指定截止日期
 # python fix/source_sync.py -T 1D --resume           # 断点续传
@@ -108,6 +110,26 @@ _BAR_TIMES_15M = [
     (14, 30), (14, 45), (15, 0),
 ]
 _BAR_SET_15M: Set[Tuple[int, int]] = set(_BAR_TIMES_15M)
+
+# 1m 每日 bar 数（不含 9:30 集合竞价）
+#   主板(沪深): 9:31~11:30(120) + 13:01~15:00(120) = 240
+#   创业板/科创板: 9:31~11:30(120) + 13:01~14:57(117) + 15:00(1) = 240
+#   实际数据源可能有微小差异，用范围校验
+_BAR_COUNT_1M: Dict[str, int] = {
+    "main_sh": 240, "main_sz": 240,
+    "gem": 240, "star": 240,
+    "bj": 240,
+    "unknown": 240,
+}
+
+
+def _get_expected_bar_count(timeframe: str, code: str) -> int:
+    """获取每日期望 bar 数（intraday 通用）"""
+    if timeframe == "15m":
+        return 16
+    if timeframe == "1m":
+        return _BAR_COUNT_1M.get(_detect_board(code), 240)
+    return 0
 
 # 交易日历
 _TRADING_DAYS_SORTED: List[str] = []
@@ -220,7 +242,7 @@ def _bars_to_records(bars: List[Dict[str, Any]], timeframe: str) -> List[Dict[st
         dt = _parse_bar_time(bar)
         if dt is None:
             continue
-        if timeframe == "15m":
+        if timeframe in ("15m", "1m"):
             total_min = dt.hour * 60 + dt.minute
             if total_min == 570:  # 9:30 丢弃（集合竞价）
                 continue
@@ -400,21 +422,28 @@ def validate_stock(
         day_records = date_records[d]
         is_suspend = d in suspension_dates
 
-        # ── 15m: 检查每天 bar 数，16 根则重新分配标准时间 ──
+        # ── intraday: 检查每天 bar 数 ──
         skip_bar_check = False
-        if timeframe == "15m" and not is_suspend and _is_trading_day(d):
-            if len(day_records) == 16:
-                # 按时间排序，重新分配 16 根标准 bar 时间
-                day_records.sort(key=lambda r: r["time"])
-                for rec, (h, m) in zip(day_records, _BAR_TIMES_15M):
-                    old_dt = rec["time"]
-                    rec["time"] = old_dt.replace(hour=h, minute=m, second=0, microsecond=0)
-            else:
-                # bar 数不是 16 根，跳过逐 bar 校验
-                result.add_warning(f"15m bar数异常: {d} count={len(day_records)} (期望16)")
+        if timeframe in ("15m", "1m"):
+            # 停牌日 / 非交易日: 跳过校验（数据源可能返回占位 bar）
+            if is_suspend or not _is_trading_day(d):
                 skip_bar_check = True
+            else:
+                expected = _get_expected_bar_count(timeframe, code)
+                actual = len(day_records)
+                if actual == expected:
+                    # 15m: 重新分配标准 bar 时间
+                    if timeframe == "15m":
+                        day_records.sort(key=lambda r: r["time"])
+                        for rec, (h, m) in zip(day_records, _BAR_TIMES_15M):
+                            old_dt = rec["time"]
+                            rec["time"] = old_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+                elif timeframe == "15m" or actual not in (expected - 1, expected + 1):
+                    # 15m 严格匹配; 1m 允许 ±1 容差
+                    result.add_warning(f"{timeframe} bar数异常: {d} count={actual} (期望{expected})")
+                    skip_bar_check = True
 
-        # ── 停牌日跳过逐 bar 校验 ──
+        # ── 停牌日跳过逐 bar 校验（1D 也需要） ──
         if is_suspend:
             skip_bar_check = True
 
@@ -532,7 +561,7 @@ def write_stock_data(
     effective_years = [y for y in years if y in data_years]
 
     # 同一事务: 先删旧数据，再写新数据（保证原子性）
-    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
+    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m", "1m") for y in range(2000, 2035)}
 
     try:
         with pool.connection() as conn:
@@ -606,7 +635,7 @@ def write_batch_data(
     start_year = int(start_date[:4])
     end_year = int(end_date[:4])
     years = list(range(start_year, end_year + 1))
-    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m") for y in range(2000, 2035)}
+    _VALID_TABLES = {f"kline_{tf}_{y}" for tf in ("1D", "15m", "1m") for y in range(2000, 2035)}
 
     # ── 预构建全部 db_records，按 (code, year) 分组 ──
     # 只保留 start_date ~ end_date 范围内的记录（与 DELETE 范围一致）
@@ -1134,6 +1163,11 @@ def process_batch(
                     records = [r for r in records
                                if not (isinstance(r.get("time"), datetime)
                                        and r["time"].strftime("%Y-%m-%d") == today_str)]
+        # intraday: 丢弃非交易日数据（数据源可能返回周末/节假日占位 bar）
+        if records and timeframe in ("15m", "1m"):
+            records = [r for r in records
+                       if isinstance(r.get("time"), datetime)
+                       and _is_trading_day(r["time"].strftime("%Y-%m-%d"))]
         if not records:
             stats["no_data"] += 1
             to_retry[code] = ["转换后无有效记录"]
@@ -1237,8 +1271,8 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("-T", "--type",
-        choices=["1D", "15m"], default="1D",
-        help="数据类型: 1D(日线) / 15m(15分钟线)")
+        choices=["1D", "15m", "1m"], default="1D",
+        help="数据类型: 1D(日线) / 15m(15分钟线) / 1m(1分钟线)")
     parser.add_argument("--market", default="CNStock", help="市场（默认 CNStock）")
     parser.add_argument("--batch-size", type=int, default=100,
         help="每批处理股票数（默认 100）")
@@ -1288,6 +1322,7 @@ def main():
     _DEFAULT_START = {
         "1D": "2021-01-04",
         "15m": "2024-01-02",
+        "1m": "2025-01-02",
     }
 
     if args.start_date:

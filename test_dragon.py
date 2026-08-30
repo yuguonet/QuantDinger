@@ -566,7 +566,8 @@ def strategy_v1(bars, code,
                 ret_20d_min=30.0,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                 obv_filter=True,
-                d_1_vol_max=1.5):
+                d_1_vol_max=1.5,
+                today_mode=False):
     """V1策略 v3 - 强趋势回踩买入 (追击连板)
 
     核心逻辑 (数据驱动, 241个全市场样本验证):
@@ -643,32 +644,42 @@ def strategy_v1(bars, code,
                     continue  # D-1放量, 可能是出货
 
         # === 入场 ===
-        if i + 1 >= len(bars): continue
-        d1 = bars[i + 1]
-        d1_change = (d1['close'] / d0['close'] - 1) * 100
-
-        # D1开盘涨幅 (next_open模式下有实际意义)
-        d1_gap = (d1['open'] / d0['close'] - 1) * 100
-
-        if buy_mode == "signal_close":
+        # today_mode: 只检查D0四因子, 跳过D1入场条件
+        if today_mode:
             entry_price = d0['close']
             entry_idx = i
             entry_date = d0['time']
-        elif buy_mode == "next_open":
-            entry_price = d1['open']
-            entry_idx = i + 1
-            entry_date = d1['time']
-            min_d1_gap = -3.0 if board_type == "main" else -5.0
-            if d1_gap < min_d1_gap: continue
-            if d1_change < 0: continue
-            # 创/科板高开追涨风险大: d1_gap>=5%时亏损率73%, 且日内回落概率高
-            # 限制创/科板D1开盘涨幅上限, 避免追高开被套
-            if board_type == "gem_star" and d1_gap >= 5.0: continue
+            d1_change = 0
+            d1_gap = 0
+            d1_limit_up_val = False
         else:
-            continue
+            if i + 1 >= len(bars): continue
+            d1 = bars[i + 1]
+            d1_change = (d1['close'] / d0['close'] - 1) * 100
+            d1_gap = (d1['open'] / d0['close'] - 1) * 100
+
+            if buy_mode == "signal_close":
+                entry_price = d0['close']
+                entry_idx = i
+                entry_date = d0['time']
+            elif buy_mode == "next_open":
+                entry_price = d1['open']
+                entry_idx = i + 1
+                entry_date = d1['time']
+                min_d1_gap = -3.0 if board_type == "main" else -5.0
+                if d1_gap < min_d1_gap: continue
+                if d1_change < 0: continue
+                if board_type == "gem_star" and d1_gap >= 5.0: continue
+                # 主板高开3%~5%不入场 (v4数据驱动):
+                # 高开3-5%但日内冲高回落(intraday<0)是主要亏损来源
+                # 300天全市场回测: 主板高开3-5%胜率仅47% vs 低开100%/高开0-3% 74%
+                if board_type == "main" and 3.0 <= d1_gap < 5.0: continue
+            else:
+                continue
         if entry_price <= 0: continue
 
-        d1_limit_up_val = is_limit_up(d1['close'], d0['close'], board_type)
+        if not today_mode:
+            d1_limit_up_val = is_limit_up(d1['close'], d0['close'], board_type)
         bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change, d1_gap=d1_gap)
         if not bt: continue
 
@@ -995,6 +1006,8 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
             print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} 回调{t['pullback_days']}天 "
                   f"信号{t['signal_date']} {t['signal_chg']:+.1f}% 量比{t['entry_vol_r']:.2f}x")
             print(f"{'':>10} 信号价{signal_price:.2f} 买入建议: {tier_str}")
+        print(f"  {'─' * 85}")
+        print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
     # V1信号
     if v1_today:
@@ -1012,6 +1025,10 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
             tier_str = ' / '.join([f"{g:+.0f}%→{p:.2f}" for g, p in tiers])
             print(f"  {code:>8} {board:>6} {label:>6} {score:>3}  {d0_close:>7.2f} "
                   f"{t['d_1_change']:>+7.1f}% {t['ret_20d']:>+7.1f}%  {tier_str}")
+        # V1 D1入场条件
+        print(f"  {'─' * 85}")
+        print(f"  📋 D1入场条件: 开盘跌幅<3% 且 收盘涨>D0收盘价")
+        print(f"     (高开>=5%不入场, 追高风险大)")
 
     # 断板信号
     if bb_today:
@@ -1019,6 +1036,8 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
         for t in sorted(bb_today, key=lambda x: x.get('streak_len', 0), reverse=True):
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
                   f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{t['entry_price']:.2f}")
+        print(f"  {'─' * 85}")
+        print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
     # ===== 持仓卖出建议 (7天内买入的持仓) =====
     from datetime import datetime, timedelta
@@ -1090,12 +1109,14 @@ def main():
     args = parser.parse_args()
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else TEST_CODES
 
-    # DB模式: 从数据库加载全市场代码
-    use_db = args.source == "db"
-    if use_db:
+    # 指定codes时自动使用DB模式
+    use_db = args.source == "db" or len(codes) > 0
+    if args.source == "db":
         print("📊 DB模式: 从数据库加载全市场股票...")
         codes = get_all_codes_db()
         print(f"   全市场: {len(codes)} 只股票")
+    elif codes:
+        print(f"📊 指定股票: {codes}，自动从DB加载数据...")
 
     run_dc = args.strategy in ("all", "dragon")
     run_v1 = args.strategy in ("all", "v1")
@@ -1190,6 +1211,7 @@ def main():
                              d_1_pullback_min=args.d1_pullback_min,
                              d_1_pullback_max=args.d1_pullback_max,
                              obv_filter=not args.no_obv_filter,
+                             today_mode=args.today,
                              d_1_vol_max=args.d1_vol_max)
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")

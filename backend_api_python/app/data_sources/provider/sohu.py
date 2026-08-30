@@ -374,9 +374,9 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
         "open": _float(pa2[3]),
         "high": _float(pa2[5]),
         "low": _float(pa2[7]),
-        "prev_close": _float(pa2[1]),
+        "previousClose": _float(pa2[1]),
         "change": _float(pa1[3]),
-        "change_pct": _float(pa1[4]),
+        "changePercent": _float(pa1[4]),
         "volume": round(float(pa2[8]) * 100, 2) if _float(pa2[8]) else 0,  # 总手→股
         "amount": _float(pa2[12]),  # 总金额(万)
         "turnover_rate": _float(pa2[6]),
@@ -473,7 +473,7 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
                 parsed[orig_code] = {
                     "last": last,
                     "name": arr[1],
-                    "change_pct": _float(arr[3]),
+                    "changePercent": _float(arr[3]),
                     "change": _float(arr[4]),
                     "volume": round(float(arr[5]) * 100, 2) if _float(arr[5]) else 0,
                     "amount": _float(arr[7]),
@@ -481,7 +481,7 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
                     "high": _float(arr[10]),
                     "low": _float(arr[11]),
                     "PE": _float(arr[12]),
-                    "prev_close": _float(arr[13]),
+                    "previousClose": _float(arr[13]),
                     "open": _float(arr[14]),
                     "time": arr[17] if len(arr) > 17 else None,
                     "symbol": re.sub(r"\D", "", biz_code),
@@ -619,7 +619,7 @@ class SohuDataSource:
         """获取单只股票实时行情快照。
 
         通过 hq.stock.sohu.com/{market}/{code_last3}/{biz_code}-1.html 心跳接口。
-        返回: code, name, last, open, high, low, prev_close, change, change_pct,
+        返回: code, name, last, open, high, low, previousClose, change, changePercent,
               volume(股), amount(万), turnover_rate, PE, amplitude, limit_up/down, time
         """
         return _fetch_sohu_ticker(code, timeout=timeout)
@@ -628,7 +628,7 @@ class SohuDataSource:
         """批量获取实时行情快照。
 
         通过 hqm.stock.sohu.com/getqjson 批量接口（一次请求支持多只）。
-        返回: {biz_code: {code, name, last, open, high, low, prev_close, change, change_pct,
+        返回: {biz_code: {code, name, last, open, high, low, previousClose, change, changePercent,
                          volume(股), amount(万), turnover_rate, PE, time}}
         """
         return _fetch_sohu_batch_quotes(codes, timeout=timeout)
