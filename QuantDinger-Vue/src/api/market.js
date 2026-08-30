@@ -5,6 +5,8 @@ const marketApi = {
   GetWatchlist: '/api/market/watchlist/get',
   AddWatchlist: '/api/market/watchlist/add',
   RemoveWatchlist: '/api/market/watchlist/remove',
+  RenameWatchlistGroup: '/api/market/watchlist/rename-group',
+  RemoveWatchlistGroup: '/api/market/watchlist/remove-group',
   GetWatchlistPrices: '/api/market/watchlist/prices',
   // Analysis
   MultiAnalysis: '/api/analysis/multiAnalysis',
@@ -57,6 +59,32 @@ export function addWatchlist (parameter) {
 export function removeWatchlist (parameter) {
   return request({
     url: marketApi.RemoveWatchlist,
+    method: 'post',
+    data: parameter
+  })
+}
+
+/**
+ * 重命名自选股分组
+ * @param parameter { userid: number, old_name: string, new_name: string }
+ * @returns {*}
+ */
+export function renameWatchlistGroup (parameter) {
+  return request({
+    url: marketApi.RenameWatchlistGroup,
+    method: 'post',
+    data: parameter
+  })
+}
+
+/**
+ * 删除自选股分组（同时删除组内全部股票）
+ * @param parameter { userid: number, group_name: string }
+ * @returns {*}
+ */
+export function removeWatchlistGroup (parameter) {
+  return request({
+    url: marketApi.RemoveWatchlistGroup,
     method: 'post',
     data: parameter
   })

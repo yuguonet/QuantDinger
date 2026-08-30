@@ -427,12 +427,14 @@ CREATE TABLE IF NOT EXISTS qd_watchlist (
     market VARCHAR(50) NOT NULL,
     symbol VARCHAR(50) NOT NULL,
     name VARCHAR(100) DEFAULT '',
+    group_name VARCHAR(50) NOT NULL DEFAULT '默认自选',
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(user_id, market, symbol)
 );
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON qd_watchlist(user_id);
+CREATE INDEX IF NOT EXISTS idx_qdwl_group ON qd_watchlist(user_id, group_name);
 
 -- =============================================================================
 -- 11. Analysis Tasks

@@ -1,7 +1,39 @@
 <template>
   <div class="watchlist-panel" :class="{ 'theme-dark': isDarkTheme }">
     <div class="panel-header">
-      <span class="panel-title"><a-icon type="star" theme="filled" /> {{ $t('dashboard.analysis.watchlist.title') }}</span>
+      <a-dropdown :trigger="['click']" placement="bottomLeft" :visible="groupDropdownVisible" @visibleChange="onGroupDropdownVisibleChange">
+        <span class="panel-title wl-group-switcher">
+          <a-icon type="star" theme="filled" />
+          <span class="wl-group-name">{{ groupLabel(currentGroup) }}</span>
+          <a-icon type="down" class="wl-group-caret" />
+        </span>
+        <a-menu slot="overlay" class="wl-group-menu" @click="onGroupMenuClick">
+          <template v-for="g in watchlistGroups">
+            <a-menu-item :key="`switch:${g.name}`" :class="{ 'wl-group-current': g.name === currentGroup }">
+              <div class="wl-group-item">
+                <span class="wl-group-item-name">{{ groupLabel(g.name) }}</span>
+                <span class="wl-group-item-count">{{ g.count }}</span>
+                <a-icon v-if="g.name === currentGroup" type="check" class="wl-group-item-check" />
+                <span v-if="g.name !== defaultGroupName" class="wl-group-item-ops" @click.stop>
+                  <a-tooltip :title="$t('dashboard.analysis.watchlist.group.rename')">
+                    <a-icon type="edit" class="wl-group-op" @click="openRenameGroup(g.name)" />
+                  </a-tooltip>
+                  <a-popconfirm
+                    :title="$t('dashboard.analysis.watchlist.group.deleteConfirm', { count: g.count })"
+                    :okText="$t('common.confirm')"
+                    :cancelText="$t('common.cancel')"
+                    @confirm="removeGroup(g.name)"
+                  >
+                    <a-tooltip :title="$t('dashboard.analysis.watchlist.group.delete')">
+                      <a-icon type="delete" class="wl-group-op" />
+                    </a-tooltip>
+                  </a-popconfirm>
+                </span>
+              </div>
+            </a-menu-item>
+          </template>
+        </a-menu>
+      </a-dropdown>
       <span class="panel-header-actions">
         <a-tooltip :title="$t('aiAssetAnalysis.tasks.manage')">
           <a-badge :count="monitors.length" :offset="[-2, 2]" :number-style="{ fontSize: '9px', minWidth: '14px', height: '14px', lineHeight: '14px', padding: '0 3px' }">
@@ -11,7 +43,7 @@
         <a-tooltip :title="$t('aiAssetAnalysis.batch.schedule')">
           <a-icon type="schedule" class="panel-header-icon" @click="toggleBatchMode" />
         </a-tooltip>
-        <a-icon type="plus" class="panel-header-icon" @click="showAddStockModal = true" />
+        <a-icon type="plus" class="panel-header-icon" @click="openAddStockModal" />
       </span>
     </div>
 
@@ -28,7 +60,7 @@
 
     <div class="watchlist-list">
       <div
-        v-for="stock in (watchlist || [])"
+        v-for="stock in visibleWatchlist"
         :key="`wl-${stock.market}-${stock.symbol}`"
         class="wl-card"
         :class="{ active: selectedKey === `${stock.market}:${stock.symbol}` }"
@@ -83,10 +115,10 @@
           <span class="wl-hover-btn danger" @click.stop="removeFromWatchlist(stock)"><a-icon type="delete" /></span>
         </div>
       </div>
-      <div v-if="!watchlist || watchlist.length === 0" class="watchlist-empty">
+      <div v-if="!watchlist || visibleWatchlist.length === 0" class="watchlist-empty">
         <div class="we-icon"><a-icon type="star" /></div>
         <p>{{ $t('dashboard.analysis.empty.noWatchlist') }}</p>
-        <a-button type="primary" size="small" icon="plus" @click="showAddStockModal = true">
+        <a-button type="primary" size="small" icon="plus" @click="openAddStockModal">
           {{ $t('dashboard.analysis.watchlist.add') }}
         </a-button>
       </div>
@@ -181,7 +213,37 @@
             </template>
           </a-alert>
         </div>
+        <div class="group-fields-section">
+          <div class="group-field">
+            <span class="group-field-label">{{ $t('dashboard.analysis.watchlist.group.join') }}</span>
+            <div class="group-field-control">
+              <a-select
+                v-model="addTargetGroup"
+                mode="combobox"
+                style="width: 100%;"
+                :placeholder="$t('dashboard.analysis.watchlist.group.newNamePlaceholder')"
+                allow-clear
+              >
+                <a-select-option v-for="g in watchlistGroups" :key="g.name" :value="g.name">{{ groupLabel(g.name) }}</a-select-option>
+              </a-select>
+            </div>
+          </div>
+        </div>
       </div>
+    </a-modal>
+
+    <!-- 分组重命名弹窗 -->
+    <a-modal
+      :title="$t('dashboard.analysis.watchlist.group.renameModalTitle')"
+      :visible="showRenameGroupModal"
+      :confirmLoading="renamingGroup"
+      @ok="submitRenameGroup"
+      @cancel="showRenameGroupModal = false"
+      :wrapClassName="isDarkTheme ? 'qd-dark-modal' : ''"
+      :okText="$t('common.confirm')"
+      :cancelText="$t('common.cancel')"
+    >
+      <a-input v-model="renameTargetGroup" :max-length="50" @pressEnter="submitRenameGroup" />
     </a-modal>
 
     <!-- 持仓弹窗 -->
@@ -356,8 +418,10 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
+import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
+
+const DEFAULT_GROUP_NAME = '默认自选'
 
 export default {
   name: 'WatchlistPanel',
@@ -375,6 +439,14 @@ export default {
       loadingUserInfo: false,
       userId: 1,
       watchlist: [],
+      currentGroup: DEFAULT_GROUP_NAME,
+      defaultGroupName: DEFAULT_GROUP_NAME,
+      groupDropdownVisible: false,
+      showRenameGroupModal: false,
+      renameTargetGroup: '',
+      renameOldGroup: '',
+      renamingGroup: false,
+      addTargetGroup: '',
       loadingWatchlist: false,
       showAddStockModal: false,
       addingStock: false,
@@ -444,10 +516,26 @@ export default {
       return Object.values(this.positionSummaryMap).reduce((s, v) => s + (v.monitorCount || 0), 0)
     },
     batchSelectedAll () {
-      return this.watchlist && this.watchlist.length > 0 && this.batchSelectedKeys.length === this.watchlist.length
+      return this.visibleWatchlist.length > 0 && this.batchSelectedKeys.length === this.visibleWatchlist.length
     },
     batchIndeterminate () {
-      return this.batchSelectedKeys.length > 0 && this.batchSelectedKeys.length < (this.watchlist || []).length
+      return this.batchSelectedKeys.length > 0 && this.batchSelectedKeys.length < this.visibleWatchlist.length
+    },
+    watchlistGroups () {
+      const map = {}
+      const wl = this.watchlist || []
+      wl.forEach(s => {
+        const name = s.group_name || DEFAULT_GROUP_NAME
+        if (!map[name]) map[name] = { name, count: 0 }
+        map[name].count += 1
+      })
+      const groups = Object.values(map)
+      groups.sort((a, b) => (a.name === DEFAULT_GROUP_NAME ? -1 : b.name === DEFAULT_GROUP_NAME ? 1 : 0))
+      return groups
+    },
+    visibleWatchlist () {
+      const wl = this.watchlist || []
+      return wl.filter(s => (s.group_name || DEFAULT_GROUP_NAME) === this.currentGroup)
     }
   },
   created () {
@@ -466,6 +554,11 @@ export default {
   watch: {
     value (val) {
       this.selectedKey = val || ''
+    },
+    watchlist () {
+      const names = new Set((this.watchlist || []).map(s => s.group_name || DEFAULT_GROUP_NAME))
+      if (!names.has(this.currentGroup)) this.currentGroup = DEFAULT_GROUP_NAME
+      this.batchSelectedKeys = this.batchSelectedKeys.filter(k => this.visibleWatchlist.some(s => `${s.market}:${s.symbol}` === k))
     }
   },
   methods: {
@@ -631,7 +724,7 @@ export default {
       if (!this.batchMode) this.batchSelectedKeys = []
     },
     onBatchSelectAll (e) {
-      if (e.target.checked) { this.batchSelectedKeys = (this.watchlist || []).map(s => `${s.market}:${s.symbol}`) } else { this.batchSelectedKeys = [] }
+      if (e.target.checked) { this.batchSelectedKeys = this.visibleWatchlist.map(s => `${s.market}:${s.symbol}`) } else { this.batchSelectedKeys = [] }
     },
     onBatchItemToggle (stock, e) {
       const key = `${stock.market}:${stock.symbol}`
@@ -651,7 +744,7 @@ export default {
       let created = 0
       for (const key of keys) {
         const [market, symbol] = key.split(':')
-        const stock = (this.watchlist || []).find(s => s.market === market && s.symbol === symbol)
+        const stock = this.visibleWatchlist.find(s => s.market === market && s.symbol === symbol)
         if (!stock) continue
         const positionIds = (this.positions || []).filter(p => `${p.market}:${p.symbol}` === key).map(p => Number(p.id)).filter(Boolean)
         try {
@@ -832,9 +925,11 @@ export default {
         if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
         market = this.selectedMarketTab; symbol = this.symbolSearchKeyword.trim().toUpperCase(); name = ''
       } else { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol')); return }
+      const group = (this.addTargetGroup || '').trim() || this.currentGroup || DEFAULT_GROUP_NAME
+      if (group.length > 50) { this.$message.warning(this.$t('dashboard.analysis.watchlist.group.nameTooLong')); return }
       this.addingStock = true
       try {
-        const res = await addWatchlist({ userid: this.userId, market, symbol, name })
+        const res = await addWatchlist({ userid: this.userId, market, symbol, name, group_name: group })
         if (res && res.code === 1) {
           this.$message.success(this.$t('dashboard.analysis.message.addStockSuccess'))
           this.handleCloseAddStockModal()
@@ -849,6 +944,7 @@ export default {
     },
     handleCloseAddStockModal () {
       this.showAddStockModal = false; this.selectedSymbolForAdd = null; this.symbolSearchKeyword = ''; this.symbolSearchResults = []; this.hasSearched = false
+      this.addTargetGroup = ''
       this.selectedMarketTab = this.marketTypes.length > 0 ? this.marketTypes[0].value : ''
     },
     handleMarketTabChange (activeKey) {
@@ -909,6 +1005,69 @@ export default {
           this.$emit('refresh')
         } else { this.$message.error(res?.msg || this.$t('dashboard.analysis.message.removeStockFailed')) }
       } catch (error) { this.$message.error(this.$t('dashboard.analysis.message.removeStockFailed')) }
+    },
+    openAddStockModal () {
+      this.addTargetGroup = this.currentGroup
+      this.showAddStockModal = true
+    },
+    groupLabel (name) {
+      if (!name || name === DEFAULT_GROUP_NAME) return this.$t('dashboard.analysis.watchlist.group.default')
+      return name
+    },
+    onGroupDropdownVisibleChange (visible) {
+      this.groupDropdownVisible = visible
+    },
+    onGroupMenuClick ({ key }) {
+      if (typeof key === 'string' && key.startsWith('switch:')) this.switchGroup(key.slice(7))
+    },
+    switchGroup (name) {
+      if (name !== this.currentGroup) this.currentGroup = name
+      this.batchSelectedKeys = this.batchSelectedKeys.filter(k => this.visibleWatchlist.some(s => `${s.market}:${s.symbol}` === k))
+      this.groupDropdownVisible = false
+    },
+    openRenameGroup (name) {
+      this.renameOldGroup = name
+      this.renameTargetGroup = name
+      this.groupDropdownVisible = false
+      this.showRenameGroupModal = true
+    },
+    async submitRenameGroup () {
+      const newName = (this.renameTargetGroup || '').trim()
+      if (!newName) { this.$message.warning(this.$t('dashboard.analysis.watchlist.group.nameRequired')); return }
+      if (newName.length > 50) { this.$message.warning(this.$t('dashboard.analysis.watchlist.group.nameTooLong')); return }
+      if (newName === this.renameOldGroup) { this.showRenameGroupModal = false; return }
+      if (this.watchlistGroups.some(g => g.name === newName)) { this.$message.warning(this.$t('dashboard.analysis.watchlist.group.nameExists')); return }
+      this.renamingGroup = true
+      try {
+        const res = await renameWatchlistGroup({ userid: this.userId, old_name: this.renameOldGroup, new_name: newName })
+        if (res && res.code === 1) {
+          this.$message.success(this.$t('dashboard.analysis.watchlist.group.renamed'))
+          this.showRenameGroupModal = false
+          if (this.currentGroup === this.renameOldGroup) this.currentGroup = newName
+          await this.loadWatchlist()
+        } else {
+          const msg = res && res.msg
+          this.$message.error(msg || this.$t('dashboard.analysis.watchlist.group.renameFailed'))
+          if (msg) this.showRenameGroupModal = false
+        }
+      } catch (error) {
+        this.$message.error(error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.watchlist.group.renameFailed'))
+      } finally { this.renamingGroup = false }
+    },
+    async removeGroup (name) {
+      this.groupDropdownVisible = false
+      try {
+        const res = await removeWatchlistGroup({ userid: this.userId, group_name: name })
+        if (res && res.code === 1) {
+          this.$message.success(this.$t('dashboard.analysis.watchlist.group.deleted'))
+          if (this.currentGroup === name) this.currentGroup = DEFAULT_GROUP_NAME
+          await this.loadWatchlist()
+        } else {
+          this.$message.error(res?.msg || this.$t('dashboard.analysis.watchlist.group.deleteFailed'))
+        }
+      } catch (error) {
+        this.$message.error(error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.watchlist.group.deleteFailed'))
+      }
     },
     async loadMarketTypes () {
       try {
@@ -1067,5 +1226,45 @@ export default {
   .search-results-section, .hot-symbols-section { margin-bottom: 24px; .section-title { font-size: 14px; font-weight: 600; color: #262626; margin-bottom: 12px; display: flex; align-items: center; } }
   .symbol-list { max-height: 200px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 4px; .symbol-list-item { cursor: pointer; padding: 8px 12px; transition: background-color 0.3s; &:hover { background-color: #f5f5f5; } .symbol-item-content { display: flex; align-items: center; gap: 8px; .symbol-code { font-weight: 600; color: #262626; min-width: 80px; } .symbol-name { color: #595959; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } } } }
   .selected-symbol-section { margin-top: 16px; .selected-symbol-info { display: flex; align-items: center; } }
+}
+
+.wl-group-switcher {
+  cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  transition: color 0.2s;
+  &:hover { color: var(--primary-color, #1890ff); }
+  .wl-group-caret { font-size: 10px; transform: scale(0.85); }
+}
+.wl-group-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.group-fields-section { margin-top: 16px; }
+.group-field { display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  .group-field-label { flex-shrink: 0; width: 84px; font-size: 13px; color: #595959; }
+  .group-field-control { flex: 1; min-width: 0; }
+}
+
+</style>
+
+<style lang="less">
+.wl-group-menu {
+  min-width: 200px;
+  max-height: 320px;
+  overflow-y: auto;
+  .ant-dropdown-menu-item { padding: 0; line-height: 1.4; }
+  .wl-group-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; min-height: 34px;
+    .wl-group-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+    .wl-group-item-count { flex-shrink: 0; min-width: 18px; text-align: center; font-size: 11px; color: #8c8c8c; background: #f0f2f5; border-radius: 9px; padding: 0 5px; line-height: 18px; }
+    .wl-group-item-check { flex-shrink: 0; color: var(--primary-color, #1890ff); }
+    .wl-group-item-ops { display: none; flex-shrink: 0; gap: 6px; align-items: center; }
+    .wl-group-op { font-size: 14px; color: #8c8c8c; cursor: pointer; transition: color 0.15s;
+      &:hover { color: #ff4d4f; } }
+  }
+  .ant-dropdown-menu-item:hover .wl-group-item-ops { display: inline-flex; }
+  .wl-group-current { background: color-mix(in srgb, var(--primary-color, #1890ff) 8%, transparent); }
+}
+body.dark .wl-group-menu, body.realdark .wl-group-menu {
+  background: #1a1a1c; border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+  .ant-dropdown-menu-item { color: #ccc; &:hover { background: #26262a; } }
+  .wl-group-item-count { background: #2a2a2c; color: #888; }
 }
 </style>

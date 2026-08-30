@@ -51,6 +51,17 @@ def _now_ts() -> int:
 def _normalize_symbol(symbol: str) -> str:
     return (symbol or '').strip().upper()
 
+DEFAULT_GROUP_NAME = '默认自选'
+
+def _valid_group_name(name) -> tuple:
+    """Return (normalized_name_or_None, error_msg). None name + '' msg means ok."""
+    norm = (name or '').strip()
+    if not norm:
+        return None, '分组名称不能为空'
+    if len(norm) > 50:
+        return None, '分组名称不能超过50个字符'
+    return norm, ''
+
 def _ensure_watchlist_table():
     # Table is created by db schema init; this is only a sanity hook.
     return True
@@ -271,7 +282,7 @@ def get_watchlist():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT id, market, symbol, name FROM qd_watchlist WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, market, symbol, name, group_name FROM qd_watchlist WHERE user_id = ? ORDER BY id DESC",
                 (user_id,)
             )
             rows = cur.fetchall() or []
@@ -314,6 +325,9 @@ def add_watchlist():
         market = (data.get('market') or '').strip()
         symbol = _normalize_symbol(data.get('symbol'))
         name_in = (data.get('name') or '').strip()
+        group_in, group_err = _valid_group_name(data.get('group_name') or DEFAULT_GROUP_NAME)
+        if group_err:
+            return jsonify({'code': 0, 'msg': group_err, 'data': None}), 400
         if not market or not symbol:
             return jsonify({'code': 0, 'msg': 'Missing market or symbol', 'data': None}), 400
 
@@ -347,13 +361,14 @@ def add_watchlist():
             # Insert or update (PostgreSQL UPSERT)
             cur.execute(
                 """
-                INSERT INTO qd_watchlist (user_id, market, symbol, name, created_at, updated_at) 
-                VALUES (?, ?, ?, ?, NOW(), NOW())
+                INSERT INTO qd_watchlist (user_id, market, symbol, name, group_name, created_at, updated_at) 
+                VALUES (?, ?, ?, ?, ?, NOW(), NOW())
                 ON CONFLICT(user_id, market, symbol) DO UPDATE SET
                     name = excluded.name,
+                    group_name = excluded.group_name,
                     updated_at = NOW()
                 """,
-                (user_id, market, symbol, name)
+                (user_id, market, symbol, name, group_in)
             )
             db.commit()
             cur.close()
@@ -394,6 +409,79 @@ def remove_watchlist():
         return jsonify({'code': 1, 'msg': 'success', 'data': None})
     except Exception as e:
         logger.error(f"remove_watchlist failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@market_bp.route('/watchlist/rename-group', methods=['POST'])
+@login_required
+def rename_watchlist_group():
+    """Rename a watchlist group (updates group_name on all its stocks)."""
+    try:
+        user_id = g.user_id
+        data = request.get_json() or {}
+        old_name = (data.get('old_name') or '').strip()
+        new_name, name_err = _valid_group_name(data.get('new_name'))
+        if not old_name:
+            return jsonify({'code': 0, 'msg': '缺少分组名称', 'data': None}), 400
+        if old_name == DEFAULT_GROUP_NAME:
+            return jsonify({'code': 0, 'msg': '默认分组不可重命名', 'data': None}), 400
+        if name_err:
+            return jsonify({'code': 0, 'msg': name_err, 'data': None}), 400
+        if new_name == DEFAULT_GROUP_NAME:
+            return jsonify({'code': 0, 'msg': '该名称为保留名称', 'data': None}), 400
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT 1 FROM qd_watchlist WHERE user_id = ? AND group_name = ? AND group_name <> ? LIMIT 1",
+                (user_id, new_name, old_name)
+            )
+            if cur.fetchone():
+                return jsonify({'code': 0, 'msg': '分组名称已存在', 'data': None}), 400
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "UPDATE qd_watchlist SET group_name = ?, updated_at = NOW() WHERE user_id = ? AND group_name = ?",
+                (new_name, user_id, old_name)
+            )
+            updated = cur.rowcount or 0
+            db.commit()
+            cur.close()
+        if updated == 0:
+            return jsonify({'code': 0, 'msg': '分组不存在', 'data': None}), 200
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'updated': updated}})
+    except Exception as e:
+        logger.error(f"rename_watchlist_group failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@market_bp.route('/watchlist/remove-group', methods=['POST'])
+@login_required
+def remove_watchlist_group():
+    """Delete a watchlist group — removes all stocks inside it."""
+    try:
+        user_id = g.user_id
+        data = request.get_json() or {}
+        group_name = (data.get('group_name') or '').strip()
+        if not group_name:
+            return jsonify({'code': 0, 'msg': '缺少分组名称', 'data': None}), 400
+        if group_name == DEFAULT_GROUP_NAME:
+            return jsonify({'code': 0, 'msg': '默认分组不可删除', 'data': None}), 400
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "DELETE FROM qd_watchlist WHERE user_id = ? AND group_name = ?",
+                (user_id, group_name)
+            )
+            deleted = cur.rowcount or 0
+            db.commit()
+            cur.close()
+        if deleted == 0:
+            return jsonify({'code': 0, 'msg': '分组不存在', 'data': None}), 200
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'deleted': deleted}})
+    except Exception as e:
+        logger.error(f"remove_watchlist_group failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
