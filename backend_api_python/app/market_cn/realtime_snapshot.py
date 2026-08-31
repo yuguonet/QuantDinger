@@ -11,14 +11,14 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
     → collect_realtime_snapshot()          ← 本文件
       → basicinfo_db.market_all_codes()    ← 股票列表
       → coordinator.coordinate_batch_quotes() ← 多源并发拉取
-      → UPSERT 到 realtime_quote_snapshot_YYYY
+      → UPSERT 到 realtime_snapshot_YYYY
 
   scheduler.py (post_market_batch)
     → backfill_db.run_1m()                 ← 盘后精确1m K线
 
 核心职责:
   1. 盘中每分钟拉取全市场实时行情快照 (原始数据)
-  2. 存入独立表 realtime_quote_snapshot_YYYY (按年分表)
+  2. 存入独立表 realtime_snapshot_YYYY (按年分表)
   3. 供盘中 VWAP/换手率等指标直接读取，不经过 1m K 线中转
 
 设计原则:
@@ -27,7 +27,7 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
   3. 独立表，不与 kline 表混用
   4. 表自动创建 (CREATE TABLE IF NOT EXISTS)，无需手动建表
 
-表结构 (realtime_quote_snapshot_YYYY):
+表结构 (realtime_snapshot_YYYY):
   核心字段 — 与 coordinator 返回的行情 dict 字段一一对应:
     symbol, time, "last", open, high, low, "previousClose", volume
   扩展字段 — extras JSONB，各源返回的额外数据 (amount/change/changePercent 等)，
@@ -53,8 +53,8 @@ logger = get_logger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# 表名前缀 — 按年分表: realtime_quote_snapshot_YYYY
-_TABLE_PREFIX = "realtime_quote_snapshot"
+# 表名前缀 — 按年分表: realtime_snapshot_YYYY
+_TABLE_PREFIX = "realtime_snapshot"
 
 
 # ================================================================
@@ -73,11 +73,14 @@ def _ensure_snapshot_table(year: int):
                 CREATE TABLE IF NOT EXISTS "{table}" (
                     symbol           VARCHAR(16) NOT NULL,
                     time             TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                    name             VARCHAR(64),
                     "last"           DOUBLE PRECISION,
                     open             DOUBLE PRECISION,
                     high             DOUBLE PRECISION,
                     low              DOUBLE PRECISION,
                     "previousClose" DOUBLE PRECISION,
+                    change           DOUBLE PRECISION,
+                    "changePercent"  DOUBLE PRECISION,
                     volume           DOUBLE PRECISION,
                     extras           JSONB,
                     PRIMARY KEY (symbol, time)
@@ -103,14 +106,15 @@ def _load_all_codes() -> List[str]:
 
 # 核心字段集合 — 在这些范围内的 key 存独立列，其余打入 extras JSONB
 # 注意: "close" 和 "price" 是部分源对 "last" 的别名，归入核心字段避免重复存
-_CORE_KEYS = {"symbol", "last", "open", "high", "low", "previousClose", "prev_close", "volume", "close", "price"}
+_CORE_KEYS = {"symbol", "last", "open", "high", "low", "previousClose", "prev_close", "volume", "close", "price", "name", "change", "changePercent", "time"}
 
 
-def _extract_snapshot_records(quotes: List[Dict], ts_str: str) -> List[Dict]:
+def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str) -> List[Dict]:
     """
     coordinator 返回的行情 dict → 快照记录列表。
 
     核心字段存独立列，其余字段打包到 extras JSONB (有就存，没有忽略)。
+    time 字段优先使用数据源返回的 time，若无则使用 fallback_ts。
     """
     records = []
     for q in quotes:
@@ -122,12 +126,15 @@ def _extract_snapshot_records(quotes: List[Dict], ts_str: str) -> List[Dict]:
         # 核心字段
         rec = {
             "symbol": sym,
-            "time": ts_str,
+            "time": q.get("time") or fallback_ts,
+            "name": q.get("name") or "",
             "last": last,
             "open": q.get("open") or 0,
             "high": q.get("high") or 0,
             "low": q.get("low") or 0,
             "previousClose": q.get("previousClose") or q.get("prev_close") or 0,
+            "change": q.get("change") or 0,
+            "changePercent": q.get("changePercent") or 0,
             "volume": q.get("volume") or 0,
         }
 
@@ -146,7 +153,7 @@ def _extract_snapshot_records(quotes: List[Dict], ts_str: str) -> List[Dict]:
 
 def _bulk_upsert(records: List[Dict], year: int) -> int:
     """
-    批量 UPSERT 快照到 realtime_quote_snapshot_YYYY。
+    批量 UPSERT 快照到 realtime_snapshot_YYYY。
 
     ON CONFLICT (symbol, time) DO UPDATE — 幂等，同一 symbol+time 覆盖更新。
     按 symbol 分组写入，单个 symbol 失败不影响其他。
@@ -177,21 +184,26 @@ def _bulk_upsert(records: List[Dict], year: int) -> int:
         for sym, recs in by_symbol.items():
             values = [
                 (r["symbol"], _ensure_datetime(r["time"]),
-                 r["last"], r["open"], r["high"], r["low"],
-                 r["previousClose"], r["volume"],
+                 r["name"], r["last"], r["open"], r["high"], r["low"],
+                 r["previousClose"], r["change"], r["changePercent"],
+                 r["volume"],
                  _json.dumps(r["extras"]) if r.get("extras") else None)
                 for r in recs
             ]
             sql = f"""
                 INSERT INTO "{table}"
-                    (symbol, time, "last", open, high, low, "previousClose", volume, extras)
+                    (symbol, time, name, "last", open, high, low,
+                     "previousClose", change, "changePercent", volume, extras)
                 VALUES %s
                 ON CONFLICT (symbol, time) DO UPDATE SET
+                    name            = EXCLUDED.name,
                     "last"          = EXCLUDED."last",
                     open            = EXCLUDED.open,
                     high            = EXCLUDED.high,
                     low             = EXCLUDED.low,
                     "previousClose" = EXCLUDED."previousClose",
+                    change          = EXCLUDED.change,
+                    "changePercent"  = EXCLUDED."changePercent",
                     volume          = EXCLUDED.volume,
                     extras          = EXCLUDED.extras
             """
@@ -228,7 +240,7 @@ def _is_trading_collect_time(now: datetime) -> bool:
 # ================================================================
 
 def _cleanup_old_snapshots(year: int, keep_days: int = 5):
-    """删除 realtime_quote_snapshot_YYYY 中超过 keep_days 天的数据"""
+    """删除 realtime_snapshot_YYYY 中超过 keep_days 天的数据"""
     from app.utils.db_market import get_market_db_manager
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")

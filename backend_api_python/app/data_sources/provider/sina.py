@@ -72,12 +72,9 @@ _sina_kline_referers = _RefererPool([
     "https://money.finance.sina.com.cn/",
 ])
 
-# 新浪行情接口 Referer 池
+# 新浪行情接口 Referer 池 (2026-08: hq.sinajs.cn/stock.finance 收紧校验, 仅finance可用)
 _sina_quote_referers = _RefererPool([
     "https://finance.sina.com.cn/",
-    "https://hq.sinajs.cn/",
-    "https://stock.finance.sina.com.cn/",
-    "https://money.finance.sina.com.cn/",
 ])
 
 
@@ -122,7 +119,7 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
         return {
-            "name": name, "open": open_p, "previousClose": prev_close,
+            "name": name, "open": open_p, "prev_close": prev_close,
             "last": last, "high": high, "low": low,
             "volume": volume, "amount": amount,
         }
@@ -342,7 +339,7 @@ class SinaDataSource:
         if not quote:
             return None
         last = quote["last"]
-        prev = quote["previousClose"]
+        prev = quote["prev_close"]
         chg = round(last - prev, 4) if prev else 0.0
         vol = quote.get("volume", 0)
         time_str = ""

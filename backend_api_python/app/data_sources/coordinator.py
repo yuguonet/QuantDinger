@@ -986,25 +986,13 @@ class Coordinator:
 
             return batch if batch else None
 
-        def _return_to_retry(sym: str, source_name: str, is_invalid: bool = False):
+        def _return_to_retry(sym: str, source_name: str):
             """
             将单个 symbol 放回重试池，标记源失败。
 
-            Args:
-                is_invalid: True = 源返回了明确的错误代码（空dict等），
-                            不放重试池，直接记彻底失败。
+            源返回空/无效结果时视为该源失败，由其他源换源重试；
+            超过 1/2 活源都试过才判定彻底失败。
             """
-            # 明确的错误代码 → 不重试，直接彻底失败
-            if is_invalid:
-                with permanent_fail_set_lock:
-                    permanent_fail.add(sym)
-                with permanent_fail_lock:
-                    permanent_fail_count[0] += 1
-                with done_lock:
-                    done_count[0] += 1
-                _check_done()
-                return
-
             # 正常失败流程：加锁 → 标记 → 检查是否超过1/2活源试过
             with source_fails_lock:
                 source_fails[source_name].add(sym)
@@ -1095,17 +1083,6 @@ class Coordinator:
                         source_stats[source_name]["fail"] += 1
                     for sym in batch:
                         _return_to_retry(sym, source_name)
-                    return False
-
-                # 空 dict → 源返回明确的错误代码（不是"没数据"，是"这些代码无效"）
-                # 不放重试池，直接记彻底失败
-                if isinstance(task_result, dict) and len(task_result) == 0:
-                    cfg = get_source_config(source_name)
-                    cfg.record(False, elapsed)
-                    with stats_lock:
-                        source_stats[source_name]["fail"] += 1
-                    for sym in batch:
-                        _return_to_retry(sym, source_name, is_invalid=True)
                     return False
 
                 # 有返回数据 → 逐 symbol 处理
@@ -1467,26 +1444,12 @@ class Coordinator:
                     retry_pool.append(item)
                 return found
 
-        def _return_to_retry(sym: str, source_name: str, is_invalid: bool = False):
+        def _return_to_retry(sym: str, source_name: str):
             """
             将 symbol 放入重试池（失败/超时后归还）。
 
             记录到该源的失败表。检查是否超过1/2活源试过此 symbol → 是则彻底失败。
-
-            Args:
-                is_invalid: True = 源返回了明确的错误代码，不放重试池，直接彻底失败。
             """
-            # 明确的错误代码 → 不重试，直接彻底失败
-            if is_invalid:
-                with permanent_fail_set_lock:
-                    permanent_fail.add(sym)
-                with permanent_fail_lock:
-                    permanent_fail_count[0] += 1
-                with done_lock:
-                    done_count[0] += 1
-                _check_done()
-                return
-
             # 正常失败流程：加锁 → 标记 → 检查是否超过1/2活源试过
             with source_fails_lock:
                 source_fails[source_name].add(sym)
