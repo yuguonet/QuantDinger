@@ -578,7 +578,13 @@ export default {
     }
 
     const activePresetIndicators = computed(() => {
-      return (props.activeIndicators || []).filter(item => item && item.id && item.id !== 'selected-python-indicator' && item.type !== 'python')
+      // 分时模式下隐藏外置 Python 指标，保留内置指标
+      return (props.activeIndicators || []).filter(item => {
+        if (!item || !item.id) return false
+        if (item.id === 'selected-python-indicator') return false
+        if (isMinuteLine.value && item.type === 'python') return false
+        return true
+      })
     })
 
     const indicatorEditorVisible = ref(false)
@@ -2128,6 +2134,137 @@ registerOverlay({
       }
     })
 
+    // ========== 注册 VWAP 内置指标（分时图专用） ==========
+    // 统计分时图中累计的 VWAP 值，黄色线条叠加在主图上
+    registerIndicator({
+      name: 'VWAP',
+      shortName: 'VWAP',
+      figures: [{ key: 'vwap', title: 'VWAP', type: 'line', color: '#ffeb3b' }],
+      calc: (kLineDataList) => {
+        let cumVol = 0
+        let cumTPV = 0
+        return kLineDataList.map(k => {
+          const tp = (k.high + k.low + k.close) / 3
+          const vol = k.volume || 0
+          cumVol += vol
+          cumTPV += tp * vol
+          return { vwap: cumVol > 0 ? cumTPV / cumVol : k.close }
+        })
+      },
+      series: 'price',
+      precision: 2
+    })
+
+    // --- 分时图交互控制相关变量 ---
+    /** 分时图模式下禁用滚轮/拖拽的事件处理器引用，用于恢复时移除 */
+    let _minuteWheelHandler = null
+    let _minuteTouchStartHandler = null
+    let _minuteTouchMoveHandler = null
+    let _minuteMouseDownHandler = null
+    /** 分时图模式下锁定的可见范围 */
+    let _minuteLockedRange = null
+    /** 分时图模式下的 onVisibleRangeChange 回调引用，用于恢复时移除 */
+    let _minuteRangeChangeCallback = null
+    /** 分时图模式下添加的 VWAP 指标 paneId */
+    let _vwapPaneId = null
+
+    /** 分时图模式：禁用图表区域的滚轮、触摸和拖拽交互，并锁死可见范围 */
+    const disableMinuteInteractions = () => {
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+
+      // 禁用滚轮（zoom + scroll）
+      if (_minuteWheelHandler) {
+        container.removeEventListener('wheel', _minuteWheelHandler)
+      }
+      _minuteWheelHandler = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+      container.addEventListener('wheel', _minuteWheelHandler, { passive: false })
+
+      // 禁用鼠标拖拽
+      if (_minuteMouseDownHandler) {
+        container.removeEventListener('mousedown', _minuteMouseDownHandler)
+      }
+      _minuteMouseDownHandler = (e) => {
+        if (e.button === 0) {
+          e.preventDefault()
+        }
+      }
+      container.addEventListener('mousedown', _minuteMouseDownHandler)
+
+      // 禁用触摸板缩放（pinch zoom）
+      let lastTouchDist = 0
+      _minuteTouchStartHandler = (e) => {
+        if (e.touches.length >= 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX
+          const dy = e.touches[0].clientY - e.touches[1].clientY
+          lastTouchDist = Math.sqrt(dx * dx + dy * dy)
+        }
+      }
+      _minuteTouchMoveHandler = (e) => {
+        if (e.touches.length >= 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX
+          const dy = e.touches[0].clientY - e.touches[1].clientY
+          const dist = Math.sqrt(dx * dx + dy * dy)
+          if (Math.abs(dist - lastTouchDist) > 10) {
+            e.preventDefault()
+            e.stopPropagation()
+          }
+          lastTouchDist = dist
+        } else if (e.touches.length === 1) {
+          // 单指滑动也阻止（防止拖拽）
+          e.preventDefault()
+          e.stopPropagation()
+        }
+      }
+      container.addEventListener('touchstart', _minuteTouchStartHandler, { passive: true })
+      container.addEventListener('touchmove', _minuteTouchMoveHandler, { passive: false })
+
+      // 通过 klinecharts 回调锁死可见范围：任何范围变化都立即回弹
+      if (chartRef.value && typeof chartRef.value.subscribeAction === 'function') {
+        _minuteRangeChangeCallback = (data) => {
+          if (_minuteLockedRange && chartRef.value) {
+            const current = chartRef.value.getVisibleRange()
+            if (current && (current.from !== _minuteLockedRange.from || current.to !== _minuteLockedRange.to)) {
+              try {
+                chartRef.value.setVisibleRange(_minuteLockedRange.from, _minuteLockedRange.to)
+              } catch (_) {}
+            }
+          }
+        }
+        chartRef.value.subscribeAction('onVisibleRangeChange', _minuteRangeChangeCallback)
+      }
+    }
+
+    /** 分时图模式：恢复图表区域的滚轮和触摸交互 */
+    const enableMinuteInteractions = () => {
+      const container = document.getElementById('kline-chart-container')
+      if (container) {
+        if (_minuteWheelHandler) {
+          container.removeEventListener('wheel', _minuteWheelHandler)
+          _minuteWheelHandler = null
+        }
+        if (_minuteMouseDownHandler) {
+          container.removeEventListener('mousedown', _minuteMouseDownHandler)
+          _minuteMouseDownHandler = null
+        }
+        if (_minuteTouchStartHandler) {
+          container.removeEventListener('touchstart', _minuteTouchStartHandler)
+          _minuteTouchStartHandler = null
+        }
+        if (_minuteTouchMoveHandler) {
+          container.removeEventListener('touchmove', _minuteTouchMoveHandler)
+          _minuteTouchMoveHandler = null
+        }
+      }
+      // 清除范围锁定
+      _minuteLockedRange = null
+      // 注意：subscribeAction 的回调无法单独移除，但 _minuteLockedRange 为 null 后回调自动失效
+      _minuteRangeChangeCallback = null
+    }
+
     // --- 数据加载相关函数 ---
     // 格式化数据为 KLineChart 格式（timestamp 需要是毫秒）
     const formatKlineData = (data) => {
@@ -2270,38 +2407,6 @@ registerOverlay({
     /** 是否为分时图模式 */
     const isMinuteLine = computed(() => props.timeframe === '分时')
 
-    /** 禁用滚轮事件处理器引用 */
-    let _wheelHandler = null
-
-    /** 禁用图表容器的滚轮事件 */
-    const disableChartWheel = () => {
-      const container = document.getElementById('kline-chart-container')
-      if (!container) return
-
-      // 移除旧的处理器
-      if (_wheelHandler) {
-        container.removeEventListener('wheel', _wheelHandler)
-      }
-
-      // 添加新的处理器，阻止滚轮事件
-      _wheelHandler = (e) => {
-        e.preventDefault()
-        e.stopPropagation()
-      }
-      container.addEventListener('wheel', _wheelHandler, { passive: false })
-    }
-
-    /** 启用图表容器的滚轮事件 */
-    const enableChartWheel = () => {
-      const container = document.getElementById('kline-chart-container')
-      if (!container) return
-
-      if (_wheelHandler) {
-        container.removeEventListener('wheel', _wheelHandler)
-        _wheelHandler = null
-      }
-    }
-
     /**
      * 分时图数据处理：
      * 1. 使用1m数据
@@ -2388,10 +2493,12 @@ registerOverlay({
       if (!chartRef.value) return
 
       try {
-        // 禁用滚轮缩放和拖动
-        disableChartWheel()
+        // 1. 禁用滚轮和触摸交互
+        disableMinuteInteractions()
 
-        // 设置面积图样式：蓝色线条，无填充
+        // 2. 设置面积图样式：使用 close 值画面积线（蓝色），K 线柱体全部透明
+        //    注意：klinecharts 的 area.value 不支持自定义字段名，
+        //    因此面积线使用 close 价格，VWAP 通过独立内置指标叠加显示
         chartRef.value.setStyles({
           candle: {
             type: 'area',
@@ -2399,7 +2506,7 @@ registerOverlay({
               lineColor: '#1890ff',
               lineSize: 2,
               style: 'stroke',
-              value: 'vwap'
+              backgroundColor: 'rgba(24, 144, 255, 0.08)'
             },
             bar: {
               upColor: 'transparent',
@@ -2423,20 +2530,69 @@ registerOverlay({
             tooltip: {
               showRule: 'always',
               showType: 'standard',
-              labels: ['时间', 'VWAP', '成交量'],
+              labels: ['时间', '价格', 'VWAP', '成交量'],
               values: (kLineData) => {
                 const d = new Date(kLineData.timestamp)
                 const p = pricePrecision.value
                 const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
                 return [
                   timeStr,
+                  (kLineData.close || 0).toFixed(p),
                   kLineData.vwap ? kLineData.vwap.toFixed(p) : '--',
                   (kLineData.volume || 0).toFixed(0)
                 ]
               }
             }
+          },
+          // 禁用滚动条视觉
+          scroll: {
+            horizontal: { bar: { style: 'none' } },
+            vertical: { bar: { style: 'none' } }
           }
         })
+
+        // 3. 禁用图表内部的滚轮缩放和拖拽滚动（通过 klinecharts 样式配置）
+        try {
+          chartRef.value.setStyles({
+            scroll: {
+              zoom: { enable: false },
+              horizontal: { enable: false, bar: { style: 'none' } },
+              vertical: { enable: false, bar: { style: 'none' } }
+            }
+          })
+        } catch (_) { /* 部分版本不支持此配置，降级依赖事件拦截 */ }
+
+        // 4. 添加 VWAP 内置指标到主图
+        try {
+          // 先清理旧的 VWAP
+          if (_vwapPaneId) {
+            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) {}
+            _vwapPaneId = null
+          }
+          const paneId = chartRef.value.createIndicator('VWAP', false, { id: 'candle_pane' })
+          if (paneId) {
+            _vwapPaneId = paneId
+            // 注意：不加入 addedIndicatorIds，避免被 updateIndicators 清除
+          }
+        } catch (vwapErr) {
+          console.warn('添加 VWAP 指标失败:', vwapErr)
+        }
+
+        // 5. 锁死可见范围：显示全部数据，禁止拖拽后回弹
+        try {
+          if (typeof chartRef.value.getDataCount === 'function') {
+            const count = chartRef.value.getDataCount()
+            if (count > 0) {
+              _minuteLockedRange = { from: 0, to: count - 1 }
+              chartRef.value.setVisibleRange(0, count - 1)
+            }
+          } else if (typeof chartRef.value.getVisibleRange === 'function') {
+            const range = chartRef.value.getVisibleRange()
+            if (range) {
+              _minuteLockedRange = { from: range.from, to: range.to }
+            }
+          }
+        } catch (_) {}
       } catch (e) {
         console.warn('设置分时图样式失败:', e)
       }
@@ -2447,13 +2603,82 @@ registerOverlay({
       if (!chartRef.value) return
 
       try {
-        // 启用滚轮缩放
-        enableChartWheel()
+        // 1. 移除分时图添加的 VWAP 指标
+        if (_vwapPaneId) {
+          try {
+            chartRef.value.removeIndicator(_vwapPaneId, 'VWAP')
+          } catch (_) {}
+          _vwapPaneId = null
+        }
 
-        // 恢复蜡烛图样式
+        // 2. 恢复滚轮和触摸交互
+        enableMinuteInteractions()
+
+        // 3. 恢复蜡烛图样式和滚动配置
+        //    必须显式清除 area 配置并恢复 bar 颜色，
+        //    因为 klinecharts 的 setStyles 是深度合并，不会自动重置旧字段
+        const isDark = chartTheme.value === 'dark'
         chartRef.value.setStyles({
           candle: {
-            type: 'candle_solid'
+            type: 'candle_solid',
+            // 清除分时图的 area 配置
+            area: {
+              lineColor: 'transparent',
+              lineSize: 0,
+              style: 'stroke',
+              backgroundColor: 'transparent'
+            },
+            // 恢复 K 线柱体颜色
+            bar: {
+              upColor: isDark ? '#ef5350' : '#f5222d',
+              downColor: isDark ? '#0ecb81' : '#52c41a',
+              noChangeColor: isDark ? '#888' : '#999',
+              upBorderColor: isDark ? '#ef5350' : '#f5222d',
+              downBorderColor: isDark ? '#0ecb81' : '#52c41a',
+              noChangeBorderColor: isDark ? '#888' : '#999',
+              upWickColor: isDark ? '#ef5350' : '#f5222d',
+              downWickColor: isDark ? '#0ecb81' : '#52c41a',
+              noChangeWickColor: isDark ? '#888' : '#999'
+            },
+            // 恢复价格标记
+            priceMark: {
+              show: true,
+              last: {
+                show: true,
+                color: isDark ? '#d1d4dc' : '#333',
+                lineStyle: 'dashed'
+              }
+            },
+            // 恢复默认 tooltip
+            tooltip: {
+              showRule: 'always',
+              showType: 'standard',
+              labels: [
+                proxy.$t('dashboard.indicator.tooltip.time'),
+                proxy.$t('dashboard.indicator.tooltip.open'),
+                proxy.$t('dashboard.indicator.tooltip.high'),
+                proxy.$t('dashboard.indicator.tooltip.low'),
+                proxy.$t('dashboard.indicator.tooltip.close'),
+                proxy.$t('dashboard.indicator.tooltip.volume')
+              ],
+              values: (kLineData) => {
+                const d = new Date(kLineData.timestamp)
+                const p = pricePrecision.value
+                return [
+                  `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`,
+                  kLineData.open.toFixed(p),
+                  kLineData.high.toFixed(p),
+                  kLineData.low.toFixed(p),
+                  kLineData.close.toFixed(p),
+                  kLineData.volume.toFixed(0)
+                ]
+              }
+            }
+          },
+          scroll: {
+            zoom: { enable: true },
+            horizontal: { enable: true, bar: { style: 'normal' } },
+            vertical: { enable: true, bar: { style: 'normal' } }
           }
         })
       } catch (e) {
@@ -2577,8 +2802,8 @@ registerOverlay({
             startRealtime()
           }
 
-          // 如果初始数据明显不足（如美股小时线），自动补充加载历史
-          if (formattedData.length < 200 && hasMoreHistory.value) {
+          // 如果初始数据明显不足（如美股小时线），自动补充加载历史（分时模式跳过）
+          if (!isMinuteLine.value && formattedData.length < 200 && hasMoreHistory.value) {
             setTimeout(() => {
               if (klineData.value.length > 0 && klineData.value.length < 200 && hasMoreHistory.value) {
                 loadMoreHistoryDataForScroll(klineData.value[0].timestamp)
@@ -2605,6 +2830,11 @@ registerOverlay({
     // 加载更多历史数据（用于滚动加载，保持滚动位置）
     const loadMoreHistoryDataForScroll = async (timestamp) => {
       if (!props.symbol || !klineData.value || klineData.value.length === 0) {
+        return
+      }
+
+      // 分时模式下不加载历史数据（只需当日数据）
+      if (isMinuteLine.value) {
         return
       }
 
@@ -2644,7 +2874,7 @@ registerOverlay({
           params: {
             market: props.market,
             symbol: props.symbol,
-            timeframe: props.timeframe,
+            timeframe: isMinuteLine.value ? '1m' : props.timeframe,
             limit: 1000,
             before_time: beforeTime // 获取此时间之前的数据
           }
@@ -2756,6 +2986,11 @@ registerOverlay({
         return
       }
 
+      // 分时模式下不加载历史数据
+      if (isMinuteLine.value) {
+        return
+      }
+
       if (loadingHistory.value || !hasMoreHistory.value) {
         return
       }
@@ -2772,7 +3007,7 @@ registerOverlay({
           params: {
             market: props.market,
             symbol: props.symbol,
-            timeframe: props.timeframe,
+            timeframe: isMinuteLine.value ? '1m' : props.timeframe,
             limit: 1000,
             before_time: earliestTime // 获取此时间之前的数据
           }
@@ -2839,7 +3074,7 @@ registerOverlay({
           params: {
             market: props.market,
             symbol: props.symbol,
-            timeframe: props.timeframe,
+            timeframe: isMinuteLine.value ? '1m' : props.timeframe,
             limit: 5 // 只获取最新5根
           }
         })
@@ -2912,8 +3147,20 @@ registerOverlay({
                 })
               })
 
-              if (uniqueNewData.length > 0) {
-                klineData.value = [...existingData, ...uniqueNewData]
+              // 分时模式：只保留当日数据，避免 VWAP 基于多日数据计算
+              let dataToAppend = uniqueNewData
+              if (isMinuteLine.value && uniqueNewData.length > 0) {
+                const now = new Date()
+                const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+                dataToAppend = uniqueNewData.filter(item => {
+                  const d = new Date(item.timestamp)
+                  const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+                  return dateStr === todayStr
+                })
+              }
+
+              if (dataToAppend.length > 0) {
+                klineData.value = [...existingData, ...dataToAppend]
                 // 如果数据超过限制，保留最新的数据
                 if (klineData.value.length > 500) {
                   klineData.value = klineData.value.slice(-500)
@@ -3723,6 +3970,8 @@ registerOverlay({
           }
           // 处理 Python 指标
           if (indicator.type === 'python') {
+            // 分时模式下跳过外置 Python 指标
+            if (isMinuteLine.value) continue
             if (!indicator.code) continue
 
             try {
@@ -5463,6 +5712,8 @@ registerOverlay({
       if (_pctAxisRafId.value != null) { cancelAnimationFrame(_pctAxisRafId.value); _pctAxisRafId.value = null }
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
+      // 清理分时图交互禁用事件处理器
+      enableMinuteInteractions()
       if (chartRef.value) {
         chartRef.value.destroy()
         chartRef.value = null
