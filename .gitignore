@@ -49,6 +49,7 @@ venv/
 .venv/
 env/
 docs/
+tmp/
 # ========================
 # Node (if any remain)
 # ========================
@@ -99,3 +100,4 @@ backend_api_python/app/data/
 # 工具链学习闭环数据（需要提交）
 !backend_api_python/app/agent/router/tool_chains.json
 !backend_api_python/app/agent/router/tool_chain_failures.json
+AGENTS.md

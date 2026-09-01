@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""龙虎榜游资D0策略 v4 — 纯VWAP时间入场
+"""龙虎榜游资D0策略 v5 — 去掉涨停+净买入，保留突破前高+量比
 
 基于龙虎榜数据筛选D0标的，通过1分钟K线VWAP状态分析实现盘中精准入场。
 默认模式(纯VWAP时间入场): 全天逐1m bar扫描，第一根"VWAP健康"即入场。
 对照模式(--pattern): 使用旧统一信号形态(早盘强势/回踩企稳/冲板动能)+VWAP过滤。
-
-实测(2026-01~08): 120天 237笔 58.2%胜率 总+1163.9% | 20天 59笔 55.9% 总+317.4%
 
 ===========================
 入场规则
 ===========================
 
 一、D0候选门槛 (check_d0_conditions)
-  必须同时满足:
-    1) 涨停: D0日收盘价涨幅 >= 9.8%(主板) / 19.8%(创业板/科创板)
-    2) 净买入: 龙虎榜净买入额 >= min_net_wan (默认3000万)
-    3) 量比: D0成交量 / 前5日平均成交量 < 2.0 (排除异常放量)
+  v5: 去掉涨停、净买入、量比条件，只保留:
+    1) D-1突破前高: D-1收盘价 > D-1之前5日最高价
 
   d0_mode 变体 (--d0-mode):
     none          默认: 不设前高条件，只满足上述3条即可
@@ -47,10 +43,10 @@
 三、纯VWAP时间入场 (默认模式, vwap_time=True)
   全天逐1m bar扫描，连续confirm根"VWAP健康"bar即入场。
   入场附加约束:
-    - max_entry_pct (默认8%): 当日涨幅上限，>8%入场胜率仅56.7%
-    - max_dist_vwap (默认2%): 价格距VWAP上限，2~3%胜率仅48.0%
-    - confirm (默认1): 连续N根健康bar才入场(单根刺破不做数)
-  实证: 9:30~10:00冲板封板概率大，第一时间买入价格最优。
+    - max_entry_pct (默认8%): 当日涨幅上限
+    - max_dist_vwap (默认2%): 价格距VWAP上限
+    - confirm (默认1): 连续N根健康bar才入场
+    - 拉升效率: (D0累积涨跌幅/D0累积量) / (D-1同时间涨跌幅/D-1累积量) > 1.2
 
   --skip-su: 强排除 strong_up 状态的实验开关，实测延迟买入更贵(120d仅+1086)，默认关。
 
@@ -63,19 +59,17 @@
                  + 量不极度萎缩 + 时间<11:30
   盘中信号经VWAP状态过滤后入场。
 
-五、D1降级入场
-  触发条件: 无1分钟数据 / 全天VWAP均不健康 / 盘中信号被VWAP过滤
-  规则: D1开盘买入，要求高开(>0%)且高开幅度 <= max_gap (默认5%)
 
 ===========================
 出场规则
 ===========================
-  止损:       -12% (跌破买入价12%即止损)
-  追踪止损:   -10% (从持仓期间最高价回撤10%即止损)
-  止盈:       +25% (达到买入价125%即止盈)
-  持仓上限:   10天 (到期按收盘价出场)
+  D0未涨停: D1开盘出场（快速止损）
+  止损:       -12%
+  追踪止损:   -10%
+  止盈:       +25%
+  持仓上限:   10天
 
-  出场优先级: 止盈 > 追踪止损 > 止损 > 持仓到期
+  出场优先级: D0未涨停 > 止盈 > 追踪止损 > 止损 > 持仓到期
 
 ===========================
 数据源
@@ -89,28 +83,28 @@
 用法
 ===========================
   # 基础回测 (20天窗口, 持有7天)
-  python test_dragon_hot_v4.py --days 20 --hold-days 7
+  python test_dragon_hot_v5.py --days 20 --hold-days 7
 
   # 长周期回测 + 详细输出
-  python test_dragon_hot_v4.py --days 120 --debug-vwap --all-trades
+  python test_dragon_hot_v5.py --days 120 --debug-vwap --all-trades
 
   # 对照: 旧统一信号形态
-  python test_dragon_hot_v4.py --days 120 --pattern
+  python test_dragon_hot_v5.py --days 120 --pattern
 
   # 对照: 排除strong_up状态
-  python test_dragon_hot_v4.py --days 120 --skip-su
+  python test_dragon_hot_v5.py --days 120 --skip-su
 
   # 连续确认扫描 (N={1,2,3,5,8,10}对比)
-  python test_dragon_hot_v4.py --days 120 --confirm-sweep
+  python test_dragon_hot_v5.py --days 120 --confirm-sweep
 
   # 盘中实时扫描模式 (读取今日实时快照)
-  python test_dragon_hot_v4.py --today
+  python test_dragon_hot_v5.py --today
 
   # 自定义出场参数
-  python test_dragon_hot_v4.py --days 20 --stop-loss -10 --trailing-stop -8 --take-profit 20
+  python test_dragon_hot_v5.py --days 20 --stop-loss -10 --trailing-stop -8 --take-profit 20
 
   # 导出结果到指定文件
-  python test_dragon_hot_v4.py --days 120 --export result.json
+  python test_dragon_hot_v5.py --days 120 --export result.json
 
 ===========================
 关键命令行参数
@@ -122,7 +116,7 @@
   --take-profit N   止盈百分比 (默认25, <=0不设止盈)
   --min-net N       最小龙虎榜净买入额，万元 (默认3000)
   --d0-mode MODE    D0门槛变体: none|breakout|below10|ma10_pullback
-  --max-gap N       D1降级入场最大高开幅度% (默认5)
+  --max-gap N       D1入场最大高开幅度% (默认5, 仅用于show_detail对比)
   --confirm N       连续N根VWAP健康bar才入场 (默认1)
   --max-entry-pct N 入场时当日涨幅上限% (默认8, 0=禁用)
   --max-dist-vwap N 入场时距VWAP上限% (默认2, 0=禁用)
@@ -402,29 +396,26 @@ def check_d0_conditions(
     net_amount: float,
     board_type: str,
     min_net_wan: float = 3000,
-    d0_mode: str = "none",
+    d0_mode: str = "breakout",
 ) -> Optional[Dict]:
     """检查D0是否满足门槛条件
 
+    v5: 去掉涨停和净买入条件，只保留突破前高 + 量比。
+
     d0_mode 可选:
-      none          默认: 去掉前高条件(只留涨停+净买+量比)
-      breakout      收盘突破前5日最高价
-      below10       低位涨停: 收盘价×1.1 < 前5日最高价(仍距前高>10%)
-      ma10_pullback D0盘中回踩10日线不破后涨停(low触及MA10±2%且未有效跌破)
+      breakout      默认: 收盘突破前5日最高价
     """
     if d0_idx < 5 or d0_idx >= len(bars):
         return None
 
     d0 = bars[d0_idx]
-    prev_close = bars[d0_idx - 1]['close']
+    prev_close = bars[d0_idx - 1]['close']  # D-1收盘价
 
-    if not is_limit_up(d0['close'], prev_close, board_type):
-        return None
-
-    pre5_bars = bars[max(0, d0_idx - 5):d0_idx]
+    # D-1突破前高: D-1收盘价 > D-1之前5日最高价
+    pre5_bars = bars[max(0, d0_idx - 6):d0_idx - 1]
     pre5_high = max(b['high'] for b in pre5_bars) if pre5_bars else 0
     if d0_mode == "breakout":
-        if d0['close'] <= pre5_high:
+        if prev_close <= pre5_high:
             return None
     elif d0_mode == "none":
         pass
@@ -440,16 +431,12 @@ def check_d0_conditions(
     else:
         raise ValueError(f"unknown d0_mode: {d0_mode}")
 
-    net_wan = net_amount / 10000
-    if net_wan < min_net_wan:
-        return None
-
+    d1_bar = bars[d0_idx - 1]  # D-1
     pre5_vols = [b['volume'] for b in pre5_bars if b['volume'] > 0]
     avg_pre_vol = sum(pre5_vols) / len(pre5_vols) if pre5_vols else 1
-    vol_ratio = d0['volume'] / avg_pre_vol if avg_pre_vol > 0 else 999
-    if vol_ratio >= 2.0:
-        return None
+    vol_ratio = d1_bar['volume'] / avg_pre_vol if avg_pre_vol > 0 else 999
 
+    net_wan = net_amount / 10000  # 仅记录，不做门槛检查
     change_pct = (d0['close'] / prev_close - 1) * 100 if prev_close > 0 else 0
     return {
         "d0_change": round(change_pct, 2),
@@ -977,7 +964,7 @@ def print_stats(stats: Dict, label: str):
 # 核心策略
 # ================================================================
 
-def strategy_v4(
+def strategy_v5(
     dragon_data: List[Dict],
     kline_cache: Dict[str, List[Dict]],
     window_days: int = 20,
@@ -1090,29 +1077,7 @@ def strategy_v4(
 
         bars_1m_all = _1m_cache.get(code, [])
         if not bars_1m_all:
-            # 1m数据不可用，降级到D1
-            entry = get_d1_entry(bars, d0_idx, max_gap)
-            if entry is None:
-                continue
-            result = run_backtest(bars, entry['buy_idx'], entry['buy_price'],
-                                  hold_days, stop_loss, trailing_stop, take_profit)
-            if not result:
-                continue
-            trades.append({
-                'code': code,
-                'name': d0_row.get('stock_name', ''),
-                'board': get_board_name(code),
-                'signal_date': d0_date,
-                'score': tech.get('tech_score', 50),
-                'd0_features': d0_features,
-                'tech': tech,
-                'entry_type': 'D1降级',
-                'entry_price': round(entry['buy_price'], 3),
-                'entry_time': entry['buy_time'],
-                'd1_gap': entry['d1_gap'],
-                'fallback': True,
-                **result,
-            })
+            continue
             continue
 
         # 按日期分组1m bar
@@ -1122,6 +1087,10 @@ def strategy_v4(
         if not bars_1m_day:
             print(f"  [信号] {code} {d0_date} 无1m bar (1m_by_date keys: {list(bars_1m_by_date.keys())[:3]})", file=sys.stderr)
             continue
+
+        # D-1的1m数据 (用于动量对比)
+        d1_date_in_bars = bars[d0_idx - 1]['time'] if d0_idx > 0 else ''
+        bars_1m_prev = bars_1m_by_date.get(d1_date_in_bars, []) if d1_date_in_bars else []
 
         print(f"  [信号] {code} {d0_date} 1m有{len(bars_1m_day)}根bar, 检测盘中信号...", file=sys.stderr)
 
@@ -1145,7 +1114,30 @@ def strategy_v4(
                     ipct = (bar["close"] / prev_close - 1) * 100
                     pct_ok = max_entry_pct <= 0 or ipct <= max_entry_pct
                     dist_ok = max_dist_vwap <= 0 or vw["dist_vwap"] < max_dist_vwap
-                    if pct_ok and dist_ok:
+                    # 累积成交量对比: D0当前时间累积量 / D-1同时间累积量 > 1.2
+                    mom_ok = True
+                    if bars_1m_prev:
+                        cur_time = bar['time'][11:16]  # HH:MM
+                        # D0累积涨跌幅和累积成交量
+                        d0_cum_vol = sum(bars_1m_day[j]['volume'] for j in range(idx + 1))
+                        d0_open = bars_1m_day[0]['open']
+                        d0_chg = (bar['close'] - d0_open) / d0_open if d0_open > 0 else 0
+                        # D-1累积涨跌幅和累积成交量
+                        d1_cum_vol = 0
+                        d1_chg = 0
+                        d1_open = bars_1m_prev[0]['open'] if bars_1m_prev else 0
+                        for pb in bars_1m_prev:
+                            d1_cum_vol += pb['volume']
+                            if pb['time'][11:16] >= cur_time:
+                                d1_chg = (pb['close'] - d1_open) / d1_open if d1_open > 0 else 0
+                                break
+                        # 效率 = 涨跌幅 / 累积量, 比值 > 1.2 说明D0拉升效率更高
+                        if d0_cum_vol > 0 and d1_cum_vol > 0 and d1_chg > 0:
+                            d0_eff = d0_chg / d0_cum_vol
+                            d1_eff = d1_chg / d1_cum_vol
+                            if d1_eff > 0 and d0_eff / d1_eff < 1.2:
+                                mom_ok = False
+                    if pct_ok and dist_ok and mom_ok:
                         signal = {
                             "bar_idx": idx,
                             "bar_time": bar["time"],
@@ -1180,29 +1172,6 @@ def strategy_v4(
         if signal is None:
             if bars_1m_day:
                 print(f"  [信号] {code} {d0_date} 1m有{len(bars_1m_day)}根bar但盘中信号未触发", file=sys.stderr)
-            # 没有1m信号，降级到D1
-            entry = get_d1_entry(bars, d0_idx, max_gap)
-            if entry is None:
-                continue
-            result = run_backtest(bars, entry['buy_idx'], entry['buy_price'],
-                                  hold_days, stop_loss, trailing_stop, take_profit)
-            if not result:
-                continue
-            trades.append({
-                'code': code,
-                'name': d0_row.get('stock_name', ''),
-                'board': get_board_name(code),
-                'signal_date': d0_date,
-                'score': tech.get('tech_score', 50),
-                'd0_features': d0_features,
-                'tech': tech,
-                'entry_type': 'D1降级',
-                'entry_price': round(entry['buy_price'], 3),
-                'entry_time': entry['buy_time'],
-                'd1_gap': entry['d1_gap'],
-                'fallback': True,
-                **result,
-            })
             continue
 
         # === VWAP日内均线过滤 ===
@@ -1226,30 +1195,6 @@ def strategy_v4(
             if show_detail:
                 print(f"    {code} {d0_date} {signal['signal_type']}({signal.get('reason', '')}) "
                       f"VWAP[{vwap_check['state']}]: {', '.join(vwap_check['reasons'])}")
-            # VWAP不健康，降级到D1
-            entry = get_d1_entry(bars, d0_idx, max_gap)
-            if entry is None:
-                continue
-            result = run_backtest(bars, entry['buy_idx'], entry['buy_price'],
-                                  hold_days, stop_loss, trailing_stop, take_profit)
-            if not result:
-                continue
-            trades.append({
-                'code': code,
-                'name': d0_row.get('stock_name', ''),
-                'board': get_board_name(code),
-                'signal_date': d0_date,
-                'score': tech.get('tech_score', 50),
-                'd0_features': d0_features,
-                'tech': tech,
-                'entry_type': 'D1降级',
-                'entry_price': round(entry['buy_price'], 3),
-                'entry_time': entry['buy_time'],
-                'd1_gap': entry['d1_gap'],
-                'fallback': True,
-                'vwap_filtered': True,
-                **result,
-            })
             continue
 
         # 有盘中信号且VWAP健康 → 用信号价格作为买入价
@@ -1269,6 +1214,43 @@ def strategy_v4(
                 entry_min = None
         vol_ratio_1m = round(entry_bar['volume'] / first_vol, 2) if (entry_bar is not None and first_vol > 0) else None
         d0_close_ret = round((d0_last_bar['close'] / buy_price - 1) * 100, 2) if buy_price > 0 else None
+
+        # D0未涨停 → D1开盘出场
+        d0_close_price = bars[d0_idx]['close']
+        d0_prev_close = bars[d0_idx - 1]['close'] if d0_idx > 0 else 0
+        d0_is_limit_up = is_limit_up(d0_close_price, d0_prev_close, board_type)
+        if not d0_is_limit_up:
+            d1_idx = d0_idx + 1
+            if d1_idx < len(bars):
+                d1_open = bars[d1_idx]['open']
+                return_pct = (d1_open / buy_price - 1) * 100
+                trades.append({
+                    'code': code,
+                    'name': d0_row.get('stock_name', ''),
+                    'board': get_board_name(code),
+                    'signal_date': d0_date,
+                    'score': tech.get('tech_score', 50),
+                    'd0_features': d0_features,
+                    'tech': tech,
+                    'entry_type': signal['signal_type'],
+                    'entry_price': round(buy_price, 3),
+                    'entry_time': signal_time,
+                    'intraday_pct': signal['intraday_pct'],
+                    'entry_min': entry_min,
+                    'vol_ratio_1m': vol_ratio_1m,
+                    'd0_close_ret': d0_close_ret,
+                    'vwap_info': vwap_check,
+                    'signal_detail': {k: v for k, v in signal.items()
+                                      if k not in ('bar_idx', 'buy_price', 'bar_time', '_vwap')},
+                    'exit_price': round(d1_open, 3),
+                    'exit_day': 1,
+                    'exit_reason': 'D0未涨停',
+                    'return_pct': round(return_pct, 2),
+                    'peak_return_pct': round(return_pct, 2),
+                    'drawdown': 0,
+                    'daily_returns': [round(return_pct, 2)],
+                })
+            continue
 
         result = run_backtest(bars, d0_idx, buy_price,
                               hold_days, stop_loss, trailing_stop, take_profit)
@@ -1397,9 +1379,20 @@ def run_realtime_scan(args):
             no_data.append(code)
             continue
 
-        # 获取prev_close (优先用snapshot里的, 否则用日线)
+        # 获取prev_close和D-1的1m数据 (用于拉升效率对比)
         if snapshot_bars and snapshot_bars[0].get('prev_close', 0) > 0:
             prev_close = snapshot_bars[0]['prev_close']
+
+        # 加载D-1的1m数据
+        bars_1m_prev = []
+        if d0_idx > 0:
+            d1_date_in_bars = bars[d0_idx - 1]['time']
+            d1_dt = datetime.strptime(d1_date_in_bars, "%Y-%m-%d")
+            start_1m = (d1_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            end_1m = (d1_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+            all_1m = fetch_kline_1m(code, start_1m, end_1m)
+            bars_1m_by_date = _split_1m_by_date(all_1m)
+            bars_1m_prev = bars_1m_by_date.get(d1_date_in_bars, [])
 
         # 运行VWAP分析: 记录最早触发点 + 当前(最新)bar状态
         trigger = None
@@ -1425,7 +1418,27 @@ def run_realtime_scan(args):
             ipct = (bar["close"] / prev_close - 1) * 100 if prev_close > 0 else 0
             pct_ok = args.max_entry_pct <= 0 or ipct <= args.max_entry_pct
             dist_ok = args.max_dist_vwap <= 0 or last_vw["dist_vwap"] < args.max_dist_vwap
-            if pct_ok and dist_ok:
+            # 拉升效率对比
+            eff_ok = True
+            if bars_1m_prev:
+                cur_time = bar['time'][11:16]
+                d0_open = snapshot_bars[0]['open']
+                d0_cum_vol = sum(b['volume'] for b in snapshot_bars[:last_i + 1])
+                d0_chg = (bar['close'] - d0_open) / d0_open if d0_open > 0 else 0
+                d1_cum_vol = 0
+                d1_chg = 0
+                d1_open = bars_1m_prev[0]['open'] if bars_1m_prev else 0
+                for pb in bars_1m_prev:
+                    d1_cum_vol += pb['volume']
+                    if pb['time'][11:16] >= cur_time:
+                        d1_chg = (pb['close'] - d1_open) / d1_open if d1_open > 0 else 0
+                        break
+                if d0_cum_vol > 0 and d1_cum_vol > 0 and d0_chg > 0 and d1_chg > 0:
+                    d0_eff = d0_chg / d0_cum_vol
+                    d1_eff = d1_chg / d1_cum_vol
+                    if d1_eff > 0 and d0_eff / d1_eff < 1.2:
+                        eff_ok = False
+            if pct_ok and dist_ok and eff_ok:
                 signal = {
                     "bar_idx": last_i,
                     "bar_time": bar["time"],
@@ -1519,7 +1532,7 @@ def run_realtime_scan(args):
             print(f"     信号: {sig['reason']}")
             print(f"     日涨: {sig['intraday_pct']:+.1f}% | 前收: {s['prev_close']:.2f}")
             print(f"     VWAP: {vw.get('vwap', 0):.3f} | 距离: {vw.get('dist_vwap', 0):+.1f}% | 斜率: {vw.get('vwap_slope', 0):+.3f}%")
-            print(f"     D0涨停: {d0f.get('d0_change', 0):.0f}% | 净买入: {d0f.get('net_wan', 0):.0f}万 | 量比: {d0f.get('vol_ratio', 0):.1f}x")
+            print(f"     D-1突破: {d0f.get('breakout_pct', 0):.1f}% | 量比: {d0f.get('vol_ratio', 0):.1f}x")
     else:
         print(f"\n❌ 无入场信号")
 
@@ -1550,14 +1563,14 @@ def run_realtime_scan(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="龙虎榜游资D0策略 v4 — 纯VWAP时间入场(默认)")
+    parser = argparse.ArgumentParser(description="龙虎榜游资D0策略 v5(默认)")
     parser.add_argument("--days", type=int, default=20, help="D0搜索窗口(交易日)")
     parser.add_argument("--hold-days", type=int, default=10, help="持仓天数")
     parser.add_argument("--stop-loss", type=float, default=-12.0, help="止损%%")
     parser.add_argument("--trailing-stop", type=float, default=-10.0, help="追踪止损%%")
     parser.add_argument("--take-profit", type=float, default=25.0, help="止盈%%")
     parser.add_argument("--min-net", type=float, default=3000, help="最小净买入额(万)")
-    parser.add_argument("--d0-mode", type=str, default="none",
+    parser.add_argument("--d0-mode", type=str, default="breakout",
                         choices=["breakout", "none", "below10", "ma10_pullback"],
                         help="D0候选门槛变体: none(默认, 去前高)/breakout(突破前高)/below10(收盘×1.1<前高)/ma10_pullback(回踩10日线)")
     parser.add_argument("--max-gap", type=float, default=5.0, help="最大D1高开幅度%%(超过则放弃)")
@@ -1582,10 +1595,10 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("龙虎榜游资D0策略 v4 — 纯VWAP时间入场")
+    print("龙虎榜游资D0策略 v5")
     mode_tag = {"breakout": " + 突破前高", "none": " (去掉前高)",
                 "below10": " + 收盘×1.1<前高", "ma10_pullback": " + 回踩10日线不破"}.get(args.d0_mode, "")
-    print(f"D0: 涨停 + 净买入>{args.min_net:.0f}万 + 量比<2x{mode_tag}")
+    print(f"D0: D-1突破前高{mode_tag}")
     print(f"止损{args.stop_loss}% | 追踪{args.trailing_stop}% | 止盈{args.take_profit}% | 持仓{args.hold_days}天")
     print("=" * 80)
 
@@ -1613,7 +1626,7 @@ def main():
         sweep_rows = []
         for c in [1, 2, 3, 5, 8, 10]:
             t0 = time.time()
-            tr = strategy_v4(
+            tr = strategy_v5(
                 dragon_data, kline_cache,
                 window_days=args.days, min_net_wan=args.min_net,
                 hold_days=args.hold_days, stop_loss=args.stop_loss,
@@ -1654,7 +1667,7 @@ def main():
 
     print(f"\n🔄 运行策略 (窗口={args.days}天)...")
     t0 = time.time()
-    trades = strategy_v4(
+    trades = strategy_v5(
         dragon_data, kline_cache,
         window_days=args.days, min_net_wan=args.min_net,
         hold_days=args.hold_days, stop_loss=args.stop_loss,
@@ -1676,7 +1689,7 @@ def main():
     print(f"{'=' * 80}")
 
     stats = calc_stats(trades)
-    print_stats(stats, "v4纯VWAP时间入场" if not args.pattern else "v4统一信号[旧]")
+    print_stats(stats, "v5纯VWAP时间入场" if not args.pattern else "v5统一信号[旧]")
 
     if trades:
         total_ret = sum(t['return_pct'] for t in trades)
@@ -1744,14 +1757,14 @@ def main():
             elif 'd1_gap' in t:
                 entry_info += f" gap{t['d1_gap']:+.1f}%"
             print(f"  {emoji} {t['code']:>8} {t['board']:>6} "
-                  f"{t['signal_date']} D0涨{d0f.get('d0_change', 0):.0f}% "
+                  f"{t['signal_date']} D-1突{d0f.get('breakout_pct', 0):.0f}% "
                   f"-> {entry_info} "
                   f"-> {t['exit_reason'][:6]} 持{t['exit_day']}天 "
                   f"收益{t['return_pct']:>+6.2f}%")
 
     # 导出
     if trades:
-        outfile = args.export or "test_dragon_hot_v4_result.json"
+        outfile = args.export or "test_dragon_hot_v5_result.json"
         export = [{k: v for k, v in t.items() if k != 'daily_returns'} for t in trades]
         with open(outfile, "w", encoding="utf-8") as f:
             json.dump(export, f, ensure_ascii=False, indent=2)

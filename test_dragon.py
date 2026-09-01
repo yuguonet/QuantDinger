@@ -549,6 +549,75 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
     return trades
 
+def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=11,
+                            max_last_chg=3.0, today_str=None):
+    """龙回头 今日(D0)入场信号: 只检查D0是否满足信号日, 不依赖D+1数据
+
+    独立于策略回测, 仅用于 --today 报告。今日=D0(数据最后一根K线或today_str),
+    往前找 涨停 → 回调 → 末期缩量小阴 结构, 且 D0 为信号日满足条件 → 次日D1开盘买入。
+
+    返回空list或单元素list, 元素含 lu_date/pullback_days/signal_date/signal_chg/entry_vol_r。
+    """
+    result = []
+    n = len(bars)
+    if n < 3:
+        return result
+    if today_str:
+        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        if not idxs:
+            return result
+        i = idxs[-1]
+    else:
+        i = n - 1  # 最后一天视为今日(D0)
+    if i < 2:
+        return result
+    board_type = get_board_type(code)
+
+    d0 = bars[i]
+    prev_c = bars[i - 1]['close']
+    if prev_c <= 0:
+        return result
+    # D0为信号日: 末期小阴 -max_last_chg% < 涨跌 < -0.5% (缩量下跌, 抛压枯竭)
+    last_chg = (d0['close'] / prev_c - 1) * 100
+    if not (-max_last_chg < last_chg < -0.5):
+        return result
+    # 信号日量比: D0量 / D-1量 (0.5~0.8x 缩量)
+    prev_vol = bars[i - 1]['volume']
+    entry_vol_r = d0['volume'] / prev_vol if prev_vol > 0 else 0
+    if entry_vol_r < 0.5 or entry_vol_r >= 0.8:
+        return result
+
+    # 往前找涨停日, 使其回调期结束于今日 (pullback_end == i)
+    for lu_idx in find_limit_ups(bars[:i], board_type):
+        lu_close = bars[lu_idx]['close']
+        pullback_end = None
+        for j in range(lu_idx + 1, min(lu_idx + 20, i + 1)):
+            if bars[j]['close'] < lu_close:
+                pullback_end = j
+            elif j >= lu_idx + min_pullback_days:
+                break
+            else:
+                break
+        if pullback_end is None or pullback_end != i:
+            continue
+        pullback_days = pullback_end - lu_idx
+        if pullback_days < min_pullback_days or pullback_days > max_pullback_days:
+            continue
+        result.append({
+            'code': code, 'board': get_board_name(code),
+            'path': 'dragon_callback', 'path_label': '龙回头',
+            'lu_date': bars[lu_idx]['time'],
+            'pullback_days': pullback_days,
+            'signal_date': bars[pullback_end]['time'],
+            'signal_chg': round(last_chg, 2),
+            'signal_vol_r': round(entry_vol_r, 2),
+            'signal_price': round(d0['close'], 3),
+            'entry_vol_r': round(entry_vol_r, 2),
+            'buy_mode': 'next_open',
+        })
+        break  # 只取一个信号
+    return result
+
 # ================================================================
 # V1 默认参数 (v2 - 只保留核心四因子)
 # ================================================================
@@ -565,9 +634,8 @@ def strategy_v1(bars, code,
                 buy_mode="next_open",
                 ret_20d_min=30.0,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                obv_filter=True,
-                d_1_vol_max=1.5,
-                today_mode=False):
+                 obv_filter=True,
+                 d_1_vol_max=1.5):
     """V1策略 v3 - 强趋势回踩买入 (追击连板)
 
     核心逻辑 (数据驱动, 241个全市场样本验证):
@@ -644,42 +712,32 @@ def strategy_v1(bars, code,
                     continue  # D-1放量, 可能是出货
 
         # === 入场 ===
-        # today_mode: 只检查D0四因子, 跳过D1入场条件
-        if today_mode:
+        if i + 1 >= len(bars): continue
+        d1 = bars[i + 1]
+        d1_change = (d1['close'] / d0['close'] - 1) * 100
+        d1_gap = (d1['open'] / d0['close'] - 1) * 100
+
+        if buy_mode == "signal_close":
             entry_price = d0['close']
             entry_idx = i
             entry_date = d0['time']
-            d1_change = 0
-            d1_gap = 0
-            d1_limit_up_val = False
+        elif buy_mode == "next_open":
+            entry_price = d1['open']
+            entry_idx = i + 1
+            entry_date = d1['time']
+            min_d1_gap = -3.0 if board_type == "main" else -5.0
+            if d1_gap < min_d1_gap: continue
+            if d1_change < 0: continue
+            if board_type == "gem_star" and d1_gap >= 5.0: continue
+            # 主板高开3%~5%不入场 (v4数据驱动):
+            # 高开3-5%但日内冲高回落(intraday<0)是主要亏损来源
+            # 300天全市场回测: 主板高开3-5%胜率仅47% vs 低开100%/高开0-3% 74%
+            if board_type == "main" and 3.0 <= d1_gap < 5.0: continue
         else:
-            if i + 1 >= len(bars): continue
-            d1 = bars[i + 1]
-            d1_change = (d1['close'] / d0['close'] - 1) * 100
-            d1_gap = (d1['open'] / d0['close'] - 1) * 100
-
-            if buy_mode == "signal_close":
-                entry_price = d0['close']
-                entry_idx = i
-                entry_date = d0['time']
-            elif buy_mode == "next_open":
-                entry_price = d1['open']
-                entry_idx = i + 1
-                entry_date = d1['time']
-                min_d1_gap = -3.0 if board_type == "main" else -5.0
-                if d1_gap < min_d1_gap: continue
-                if d1_change < 0: continue
-                if board_type == "gem_star" and d1_gap >= 5.0: continue
-                # 主板高开3%~5%不入场 (v4数据驱动):
-                # 高开3-5%但日内冲高回落(intraday<0)是主要亏损来源
-                # 300天全市场回测: 主板高开3-5%胜率仅47% vs 低开100%/高开0-3% 74%
-                if board_type == "main" and 3.0 <= d1_gap < 5.0: continue
-            else:
-                continue
+            continue
         if entry_price <= 0: continue
 
-        if not today_mode:
-            d1_limit_up_val = is_limit_up(d1['close'], d0['close'], board_type)
+        d1_limit_up_val = is_limit_up(d1['close'], d0['close'], board_type)
         bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, is_v1=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change, d1_gap=d1_gap)
         if not bt: continue
 
@@ -698,6 +756,82 @@ def strategy_v1(bars, code,
             **bt,
         })
 
+    return result
+
+def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
+                        d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
+                        obv_filter=True, d_1_vol_max=1.5, today_str=None):
+    """V1 今日(D0)入场信号: 只检查D0四因子, 不依赖D1数据
+
+    独立于策略回测, 仅用于 --today 报告中的「今日入场」段。
+    满足D0四因子 → 下一个交易日开盘买入, D1入场规则(D1开收盘/回踩)开盘后由人工筛选。
+
+    today_str: 指定今日日期(与--today-date一致), 为空则用最后一天。
+    返回空list或单元素list, 元素含 d0_date/d0_close/ret_20d/d_1_change。
+    """
+    result = []
+    n = len(bars)
+    if n < 26:
+        return result
+    if today_str:
+        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        if not idxs:
+            return result
+        i = idxs[-1]
+    else:
+        i = n - 1  # 最后一天视为今日(D0)
+    if i < 2:
+        return result
+    board_type = get_board_type(code)
+    threshold = 0.098 if board_type == "main" else 0.198
+    d0 = bars[i]
+    d_1 = bars[i-1]
+    d_2 = bars[i-2]
+    if d_2['close'] <= 0 or d_1['close'] <= 0:
+        return result
+    if (d0['close'] / d_1['close'] - 1) < threshold * 0.98:
+        return result
+
+    # === 因子1: 强趋势 20日涨>ret_20d_min% ===
+    if i < 20 or bars[i-20]['close'] <= 0:
+        return result
+    ret_20d = (d0['close'] / bars[i-20]['close'] - 1) * 100
+    if ret_20d < ret_20d_min:
+        return result
+
+    # === 因子2: D-1回调 d_1_pullback_min~d_1_pullback_max% ===
+    d_1_change = (d_1['close'] / d_2['close'] - 1) * 100
+    if d_1_change < d_1_pullback_min or d_1_change >= d_1_pullback_max:
+        return result
+
+    # === 因子3: OBV 5日趋势上升 ===
+    if obv_filter:
+        obv = 0; obv_list = []
+        for j in range(max(0, i-20), i+1):
+            if j > 0:
+                if bars[j]['close'] > bars[j-1]['close']:
+                    obv += bars[j]['volume']
+                elif bars[j]['close'] < bars[j-1]['close']:
+                    obv -= bars[j]['volume']
+            obv_list.append(obv)
+        if len(obv_list) >= 5 and obv_list[-1] - obv_list[-5] <= 0:
+            return result
+
+    # === 因子4: D-1非放量 < d_1_vol_max x 5日均量 ===
+    if i >= 6:
+        vol_ma5_d1 = sum(bars[j]['volume'] for j in range(i-6, i-1)) / 5
+        if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
+            return result
+
+    result.append({
+        'code': code, 'board': get_board_name(code),
+        'path': 'v1', 'path_label': 'V1',
+        'd0_date': d0['time'],
+        'd0_close': round(d0['close'], 3),
+        'ret_20d': round(ret_20d, 2),
+        'd_1_change': round(d_1_change, 2),
+        'buy_mode': 'next_open',
+    })
     return result
 
 # ================================================================
@@ -756,17 +890,85 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
 
+def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params):
+    """给定连板区间[streak_start,streak_end], 计算断板期并执行回测的5a-5e确认。
+
+    与 strategy_break_buy 中"买点之前"的判定完全一致(同一段代码), 供回测和
+    break_today 今日检测共用, 保证 --today 与回测逻辑严格对齐。
+    返回信号dict(含 break_date/break_days/break_chg/break_gap/break_vol_r)或 None。
+    """
+    bt = get_board_type(code)
+    streak_len = streak_end - streak_start + 1
+    if streak_len < min_streak:
+        return None
+
+    # 断板期: 涨停日后连续非涨停的天数
+    break_idx = streak_end + 1
+    if break_idx >= len(bars):
+        return None
+    limit_bar = bars[streak_end]
+    limit_open = float(limit_bar['open'])
+    limit_close = float(limit_bar['close'])
+    limit_vol = float(limit_bar['volume'])
+    break_days = 0
+    for j in range(break_idx, min(break_idx + max_break_gap + 1, len(bars))):
+        if is_limit_up(bars[j]['close'], bars[j - 1]['close'], bt):
+            break  # 遇到新涨停, 断板期结束
+        break_days += 1
+
+    if break_days == 0:
+        # 涨停后直接又是涨停 → 连板加速, 不是断板
+        return None
+
+    # 5. 断板期各项检查 (与 strategy_break_buy 完全一致)
+    break_bars = bars[break_idx:break_idx + break_days]
+    first_break = break_bars[0]
+
+    # 5a. 断板期低点不能跌破涨停日开盘价 (支撑有效)
+    break_low = min(float(b['low']) for b in break_bars)
+    if break_low < limit_open:
+        return None
+
+    # 5b. 断板期缩量检查 (vs 涨停日量)
+    break_vol_avg = sum(float(b['volume']) for b in break_bars) / len(break_bars)
+    break_vol_r = break_vol_avg / limit_vol if limit_vol > 0 else 0
+    if break_vol_r < params['vol_min'] or break_vol_r >= params['vol_max']:
+        return None
+
+    # 5c. 第一个断板日涨跌过滤: vs 涨停日收盘, 允许 -5% ~ +8%
+    first_break_chg = (first_break['close'] / limit_close - 1) * 100
+    if first_break_chg < -5 or first_break_chg >= 8:
+        return None
+
+    # 5d. 第一个断板日开盘过滤: 高开不超过 5%, 低开不超过 3%
+    first_break_gap = (first_break['open'] / limit_close - 1) * 100
+    if first_break_gap < -3 or first_break_gap >= 5:
+        return None
+
+    # 5e. 回撤检查
+    break_drawdown = (break_low / limit_close - 1) * 100
+    if break_drawdown < params['drawdown_max']:
+        return None
+
+    return {
+        'break_idx': break_idx, 'break_days': break_days,
+        'break_date': bars[break_idx]['time'],
+        'streak_len': streak_len, 'streak_start': bars[streak_start]['time'], 'streak_end': bars[streak_end]['time'],
+        'break_chg': round(first_break_chg, 2),
+        'break_gap': round(first_break_gap, 2),
+        'break_vol_r': round(break_vol_r, 2),
+    }
+
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_params=None):
     """断板买入: 连板≥2 → 断板 → 次日开盘买入 (带止盈+峰值逃顶)
 
     买入时机: 断板日收盘确认信号 → 次日开盘买入 (实盘可行)
     """
     bt = get_board_type(code)
-    threshold = 0.098 if bt == "main" else 0.198
     params = dict(BOARD_PARAMS[bt])
     if override_params: params.update(override_params)
-    stop_loss, trailing_stop, take_profit = params["stop_loss"], params["trailing_stop"], params["take_profit"]
-    hold_days, vol_min, vol_max, drawdown_max = params["hold_days"], params["vol_min"], params["vol_max"], params["drawdown_max"]
+    stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
+    hold_days = params["hold_days"]
     trades, used = [], set()
 
     # ===== 连板后断板 =====
@@ -784,58 +986,17 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         # 3. 找连板结束位置
         streak_start = i; streak_end = i
         while streak_end < len(bars) - 1 and is_limit_up(bars[streak_end+1]['close'], bars[streak_end]['close'], bt): streak_end += 1
-        streak_len = streak_end - streak_start + 1
-        if streak_len < min_streak: i = streak_end + 1; continue
 
-        # 4. 找断板期: 涨停日后连续非涨停的天数
-        break_idx = streak_end + 1
-        if break_idx >= len(bars): i = streak_end + 1; continue
-        limit_bar = bars[streak_end]
-        limit_open = float(limit_bar['open'])
-        limit_close = float(limit_bar['close'])
-        limit_vol = float(limit_bar['volume'])
-        break_days = 0
-        for j in range(break_idx, min(break_idx + max_break_gap + 1, len(bars))):
-            if is_limit_up(bars[j]['close'], bars[j-1]['close'], bt):
-                break  # 遇到新涨停, 断板期结束
-            break_days += 1
-
-        if break_days == 0:
-            # 涨停后直接又是涨停 → 连板加速, 不是断板
+        # 4-5. 断板期确认 (与 _break_signal_at 共享同一逻辑)
+        sig = _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params)
+        if not sig:
             i = streak_end + 1; continue
 
-        # 5. 断板期各项检查
-        break_bars = bars[break_idx:break_idx + break_days]
-        first_break = break_bars[0]
-
-        # 5a. 断板期低点不能跌破涨停日开盘价 (支撑有效)
-        break_low = min(float(b['low']) for b in break_bars)
-        if break_low < limit_open:
-            i = streak_end + 1; continue
-
-        # 5b. 断板期缩量检查 (vs 涨停日量)
-        break_vol_avg = sum(float(b['volume']) for b in break_bars) / len(break_bars)
-        break_vol_r = break_vol_avg / limit_vol if limit_vol > 0 else 0
-        if break_vol_r < vol_min or break_vol_r >= vol_max:
-            i = streak_end + 1; continue
-
-        # 5c. 第一个断板日涨跌过滤: vs 涨停日收盘, 允许 -5% ~ +8%
-        first_break_chg = (first_break['close'] / limit_close - 1) * 100
-        if first_break_chg < -5 or first_break_chg >= 8:
-            i = streak_end + 1; continue
-
-        # 5d. 第一个断板日开盘过滤: 高开不超过 5%, 低开不超过 3%
-        first_break_gap = (first_break['open'] / limit_close - 1) * 100
-        if first_break_gap < -3 or first_break_gap >= 5:
-            i = streak_end + 1; continue
-
-        # 5e. 回撤检查
-        break_drawdown = (break_low / limit_close - 1) * 100
-        if break_drawdown < drawdown_max:
-            i = streak_end + 1; continue
+        break_days = sig['break_days']
+        break_idx = sig['break_idx']
 
         # 6. 去重
-        key = (bars[streak_start]['time'], bars[break_idx]['time'])
+        key = (sig['streak_start'], sig['break_date'])
         if key in used: i = streak_end + 1; continue
         used.add(key)
 
@@ -852,12 +1013,12 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         trades.append({
             'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
             'mode': 'streak_break',
-            'streak_len': streak_len, 'streak_start': bars[streak_start]['time'], 'streak_end': bars[streak_end]['time'],
-            'break_date': bars[break_idx]['time'],
+            'streak_len': sig['streak_len'], 'streak_start': sig['streak_start'], 'streak_end': sig['streak_end'],
+            'break_date': sig['break_date'],
             'break_days': break_days,
-            'break_chg': round(first_break_chg, 2),
-            'break_gap': round(first_break_gap, 2),
-            'break_vol_r': round(break_vol_r, 2),
+            'break_chg': sig['break_chg'],
+            'break_gap': sig['break_gap'],
+            'break_vol_r': sig['break_vol_r'],
             'entry_date': bars[entry_idx]['time'], 'entry_price': round(entry_price, 3), 'buy_mode': 'next_open',
             'd1_change': round((bars[entry_idx]['close'] / bars[entry_idx]['open'] - 1) * 100, 2) if bars[entry_idx]['open'] > 0 else 0,
             'd1_gap': round((bars[entry_idx]['open'] / bars[entry_idx - 1]['close'] - 1) * 100, 2) if entry_idx > 0 and bars[entry_idx - 1]['close'] > 0 else 0,
@@ -867,6 +1028,70 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         i = streak_end + 1
 
     return trades
+
+def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=None):
+    """断板 今日(D0)信号: 判断今日是否为断板期的确认日, 与回测买点前规则完全一致
+
+    原则: --today 时"买入当日(次日D1开盘)由人工判别", 今日(D0)及以前规则与回测
+    strategy_break_buy 的"买点之前"完全一致。断板策略的确认点在断板期最后一天收盘
+    (buy_mode=next_open, 买入=次日), 因此今日(D0) = 断板期的最后一天, 而非首断板日。
+    断板期指标(5a低点/5b平均量比/5c首日涨跌/5d首日gap/5e回撤)复用 _break_signal_at,
+    与回测逐条一致, 绝不引入未来数据。
+
+    返回空list或单元素list。
+    """
+    result = []
+    n = len(bars)
+    if n < 3:
+        return result
+    if today_str:
+        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        if not idxs:
+            return result
+        i = idxs[-1]
+    else:
+        i = n - 1
+    if i < 2:
+        return result
+    bt = get_board_type(code)
+    params = BOARD_PARAMS.get(bt, BOARD_PARAMS['main'])
+
+    # 寻找所有连板结构, 要求断板期最后一天 == 今日(i)
+    for lu_idx in find_limit_ups(bars[:i], bt):
+        # 连板第一板确认 (lu_idx 前一日非涨停)
+        is_first = True
+        for k in range(1, min(11, lu_idx + 1)):
+            if lu_idx - k - 1 >= 0 and is_limit_up(bars[lu_idx - k]['close'], bars[lu_idx - k - 1]['close'], bt):
+                is_first = False; break
+        if not is_first:
+            continue
+        # 连板结束位置
+        streak_start = lu_idx; streak_end = lu_idx
+        while streak_end < i - 1 and is_limit_up(bars[streak_end + 1]['close'], bars[streak_end]['close'], bt):
+            streak_end += 1
+        # 断板期必须且只能在今日结束: break_idx > streak_end 且 break_days 全落在 <=i,
+        # 断板期最后一天(break_idx+break_days-1) == i 才意味着今日收盘可确认、明日买入。
+        sig = _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params)
+        if not sig:
+            continue
+        if sig['break_idx'] + sig['break_days'] - 1 != i:
+            continue
+        result.append({
+            'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
+            'mode': 'streak_break',
+            'streak_len': sig['streak_len'],
+            'streak_start': sig['streak_start'],
+            'streak_end': sig['streak_end'],
+            'break_date': sig['break_date'],
+            'signal_date': bars[i]['time'],
+            'break_days': sig['break_days'],
+            'break_chg': sig['break_chg'],
+            'break_gap': sig['break_gap'],
+            'break_vol_r': sig['break_vol_r'],
+            'entry_price': None, 'buy_mode': 'next_open',
+        })
+        break  # 只取一个信号
+    return result
 
 # ================================================================
 # 测试列表 (去蓝筹)
@@ -969,20 +1194,152 @@ def calc_buy_tiers(d0_close, board_type):
     return tiers
 
 
-def print_today_signals(all_trades, today_str, buy_mode="next_open"):
-    """D0收盘后运行, 显示今日信号 + 次日买入建议
+def buy_suggestion_text(d0_close, board_type):
+    """D1开盘买入建议(文字描述, 供人工筛选)
 
-    所有策略按信号日筛选 (信号日=今天):
-    - 龙回头: signal_date = D0缩量小阴日
-    - V1:     d0_date = D0涨停日
-    - 断板:   break_date = 断板确认日
+    主板: D1开盘涨幅>=-3%且收盘>=0; 高开+3%~+5%不入场
+    创/科板: D1开盘涨幅>=-5%且<+5%且收盘>=0
+    """
+    if board_type == 'gem_star':
+        lo_p = d0_close * 0.95
+        hi_p = d0_close * 1.05
+        return (f"开盘 -5%~+5% 可买(约{lo_p:.2f}~{hi_p:.2f}), 收盘需收红(>=0%)")
+    lo_p = d0_close * 0.97
+    hi_p = d0_close * 1.03
+    return (f"开盘 -3%~+3% 可买(约{lo_p:.2f}~{hi_p:.2f}), 高开3%以上不入场, 收盘需收红(>=0%)")
 
-    买入时机: 次日D1开盘
+
+def _find_bar_idx(bars, date_str):
+    """在bars中定位指定交易日索引, 找不到返回None"""
+    for j, b in enumerate(bars):
+        if b['time'] == date_str:
+            return j
+    return None
+
+
+def _db_last_bar_date(bars_by_code):
+    """today_str 默认值: 数据库K线最后一根日期 (各股票K线最后交易日一致)
+
+    优先取第一个非空股票bars的最后一根K线日期; 空则返回None(调用方回退系统日期)。
+    """
+    for bars in (bars_by_code or {}).values():
+        if bars:
+            return bars[-1]['time']
+    return None
+
+
+def simulate_holding_to_today(bars, t, today_idx, board_type):
+    """从入场日到today重跑该策略出场规则, 判定截至today的持仓状态
+
+    独立于回测: 只用 入场日 ~ today 之间的K线, 不读取未来数据。
+    按各策略(龙回头/断板/V1)各自的出场规则(止损/追踪/逃顶/持仓上限)判定。
+
+    返回 dict:
+      status     : 'open' | 'closed' | 'not_yet'
+                    not_yet = 入场日 > today (尚未买入)
+                    closed  = today之前已触发平仓
+                    open    = 截至today仍持仓
+      exit_reason/exit_date: 仅在closed时
+      today_action: None | reason_str  (open时, today收盘触发应明日处理)
+      hold_days : 截至today的持仓交易日数 (open时)
+      curr_ret  : 截至today收盘的浮动收益% (open时)
+    """
+    path = t['path']
+    entry_idx = _find_bar_idx(bars, t['entry_date'])
+    if entry_idx is None:
+        return None
+    if entry_idx > today_idx:
+        return {'status': 'not_yet'}
+
+    entry_price = t['entry_price']
+    if entry_price <= 0:
+        return None
+
+    # 各策略出场参数 (与回测 run_backtest / run_backtest_breakbuy 保持一致)
+    if path == 'v1':
+        hold_days, stop, trail, is_v1 = 7, -10.0, -5.0, True
+        peak_enabled, peak_ret, upper_pct = False, 7, 30
+    elif path == 'dragon_callback':
+        hold_days, stop, trail, is_v1 = 7, -5.0, -5.0, False
+        peak_enabled, peak_ret, upper_pct = True, 7, 30
+    elif path == 'break_buy':
+        p = BOARD_PARAMS['gem_star' if board_type == 'gem_star' else 'main']
+        hold_days, stop, trail = p['hold_days'], p['stop_loss'], p['trailing_stop']
+        is_v1 = False
+        peak_enabled, peak_ret, upper_pct = True, 10, 40
+    else:
+        return None
+
+    peak = entry_price
+    if entry_idx < len(bars) and bars[entry_idx]['high'] > peak:
+        peak = bars[entry_idx]['high']
+
+    for d in range(1, hold_days + 1):
+        idx = entry_idx + d - 1
+        if idx >= len(bars):
+            break
+        if idx > today_idx:
+            # 还没走到today, 前方未触发 → today仍持仓
+            break
+        b = bars[idx]
+        if b['high'] > peak:
+            peak = b['high']
+
+        triggered = None  # 今日(today收盘)触发的出场, 应明日执行
+
+        if is_v1 and d == 2:
+            intraday = t.get('intraday', 0)
+            if intraday < 3:
+                # 明日开盘清仓
+                if idx == today_idx:
+                    return {'status': 'open', 'today_action': 'D1日内动量<3%, 明日开盘清仓',
+                            'hold_days': d, 'curr_ret': (b['close'] / entry_price - 1) * 100}
+                return {'status': 'closed', 'exit_reason': 'D1日内动量<3% 明日开盘清仓', 'exit_date': b['time']}
+        if peak_enabled:
+            ret = (b['close'] / entry_price - 1) * 100
+            if ret > peak_ret:
+                bar_range = b['high'] - b['low']
+                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                if upper > upper_pct and b['close'] < b['high'] * 0.98:
+                    triggered = triggered or f'峰值逃顶 收盘卖出'
+        if d > 1 and b['low'] <= peak * (1 + trail / 100):
+            triggered = triggered or f'追踪止损{trail}%'
+        if b['low'] <= entry_price * (1 + stop / 100):
+            triggered = triggered or f'止损{stop}%'
+
+        if idx == today_idx and triggered:
+            # today收盘已触发出场规则 → 明日开盘清仓
+            return {'status': 'open', 'today_action': triggered,
+                    'hold_days': d, 'curr_ret': (b['close'] / entry_price - 1) * 100}
+        if triggered:
+            # 历史某日触发 → 已平仓, 不入持仓
+            return {'status': 'closed', 'exit_reason': triggered, 'exit_date': b['time']}
+
+    # 走完到today仍无触发 → 仍持仓; 若已到期(hold_days)且today>=到期日 → 兜底到期
+    if today_idx >= entry_idx + hold_days - 1:
+        return {'status': 'open', 'today_action': f'到达持仓上限{hold_days}天, 明日收盘卖出',
+                'hold_days': hold_days, 'curr_ret': (bars[today_idx]['close'] / entry_price - 1) * 100}
+    hold_days_cnt = today_idx - entry_idx + 1
+    return {'status': 'open', 'today_action': None,
+            'hold_days': hold_days_cnt, 'curr_ret': (bars[today_idx]['close'] / entry_price - 1) * 100}
+
+
+def print_today_signals(all_trades, today_str, buy_mode="next_open", v1_today_signals=None, dragon_today_signals=None, break_today_signals=None, bars_by_code=None):
+    """D0收盘后运行, 显示今日 入场/持仓/出场 + 次日买入建议
+
+    回测独立: all_trades 为正常回测结果(回测逻辑不变)
+    - 龙回头: 今日信号由 dragon_today_signals 独立计算(D0不依赖D1, 兼容DB最后K线日期)
+    - V1:     今日入场信号由 v1_today_signals 独立计算(D0四因子, 不依赖D1)
+    - 断板:   今日信号由 break_today_signals 独立计算(今日为断板日, 不依赖未来)
+
+    入场信号各自按次日志交易日D1开盘买入, D1入场规则开盘后人工筛选。
     """
     # 按信号日筛选 (信号日=今天, 买入日=明天)
     dc_today = [t for t in all_trades if t['path'] == 'dragon_callback' and t.get('signal_date') == today_str]
-    v1_today = [t for t in all_trades if t['path'] == 'v1' and t.get('d0_date') == today_str]
+    dc_today += list(dragon_today_signals) if dragon_today_signals else []
+    v1_today = list(v1_today_signals) if v1_today_signals else []
     bb_today = [t for t in all_trades if t['path'] == 'break_buy' and t.get('break_date') == today_str]
+    bb_today += list(break_today_signals) if break_today_signals else []
     today_trades = dc_today + v1_today + bb_today
 
     print(f"\n{'=' * 80}")
@@ -1000,83 +1357,92 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open"):
         print(f"\n  🐉 龙回头 ({len(dc_today)}只) - 缩量小阴确认, 次日D1开盘买:")
         for t in sorted(dc_today, key=lambda x: x.get('entry_vol_r', 0), reverse=True):
             bt = get_board_type(t['code'])
-            signal_price = t.get('signal_price', t['entry_price'])
-            tiers = calc_buy_tiers(signal_price, bt)
-            tier_str = ' / '.join([f"{g:+.0f}%→{p:.2f}" for g, p in tiers])
+            signal_price = t.get('signal_price') or t.get('entry_price')
+            text = buy_suggestion_text(signal_price, bt)
             print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} 回调{t['pullback_days']}天 "
                   f"信号{t['signal_date']} {t['signal_chg']:+.1f}% 量比{t['entry_vol_r']:.2f}x")
-            print(f"{'':>10} 信号价{signal_price:.2f} 买入建议: {tier_str}")
+            print(f"{'':>10} 信号价{signal_price:.2f} 买入建议: {text}")
         print(f"  {'─' * 85}")
         print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
     # V1信号
     if v1_today:
         print(f"\n  🔥 V1 ({len(v1_today)}只) - D0涨停确认, 次日D1开盘买:")
-        print(f"  {'代码':>8} {'板块':>6} {'动量':>6} {'评分':>4} {'D0收':>8} {'D-1回调':>8} {'20日涨':>8} {'买入建议'}")
+        print(f"  {'代码':>8} {'板块':>6} {'动量':>6} {'评分':>4} {'D0收':>8} {'D-1回调':>8} {'20日涨':>8}")
         print(f"  {'-' * 85}")
         for t in sorted(v1_today, key=lambda x: calc_momentum_score(x), reverse=True):
             code, board = t['code'], t['board']
             bt = get_board_type(code)
-            d1_gap = t.get('d1_gap', 0)
-            d0_close = t['entry_price'] / (1 + d1_gap / 100) if d1_gap != 0 else t['entry_price']
+            d0_close = t.get('d0_close', t.get('entry_price', 0))
             score = calc_momentum_score(t)
             label = momentum_label(score)
-            tiers = calc_buy_tiers(d0_close, bt)
-            tier_str = ' / '.join([f"{g:+.0f}%→{p:.2f}" for g, p in tiers])
+            text = buy_suggestion_text(d0_close, bt)
             print(f"  {code:>8} {board:>6} {label:>6} {score:>3}  {d0_close:>7.2f} "
-                  f"{t['d_1_change']:>+7.1f}% {t['ret_20d']:>+7.1f}%  {tier_str}")
+                  f"{t['d_1_change']:>+7.1f}% {t['ret_20d']:>+7.1f}%")
+            print(f"{'':>10} 买入建议: {text}")
         # V1 D1入场条件
         print(f"  {'─' * 85}")
-        print(f"  📋 D1入场条件: 开盘跌幅<3% 且 收盘涨>D0收盘价")
-        print(f"     (高开>=5%不入场, 追高风险大)")
+        print(f"  📋 D1入场条件(开盘后人工筛选):")
+        print(f"     主板: D1开盘涨幅>=-3% 且 收盘涨幅>=0; 高开3%~5%不入场")
+        print(f"     创/科板: D1开盘涨幅>=-5% 且 <5% 且 收盘涨幅>=0")
 
     # 断板信号
     if bb_today:
         print(f"\n  💥 断板 ({len(bb_today)}只) - 连板后断板确认, 次日开盘买:")
         for t in sorted(bb_today, key=lambda x: x.get('streak_len', 0), reverse=True):
+            ep = t.get('entry_price')
+            ep_txt = f"{ep:.2f}" if ep else "次日开盘"
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
-                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{t['entry_price']:.2f}")
+                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{ep_txt}")
         print(f"  {'─' * 85}")
         print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
-    # ===== 持仓卖出建议 (7天内买入的持仓) =====
-    from datetime import datetime, timedelta
-    today_dt = datetime.strptime(today_str, '%Y-%m-%d')
-    recent_entries = [t for t in all_trades
-                      if t['entry_date'] <= today_str
-                      and t['entry_date'] >= (today_dt - timedelta(days=20)).strftime('%Y-%m-%d')]
+    # ===== 持仓分析 (截至today仍持仓, 按各策略出场规则重算) =====
+    if bars_by_code and all_trades:
+        open_pos = []
+        for t in all_trades:
+            bars = bars_by_code.get(t['code'])
+            if not bars:
+                continue
+            ti = _find_bar_idx(bars, today_str)
+            if ti is None:
+                continue
+            st = simulate_holding_to_today(bars, t, ti, t.get('board', get_board_type(t['code'])))
+            if st and st['status'] == 'open':
+                st['trade'] = t
+                open_pos.append(st)
 
-    if recent_entries:
-        # 计算当前收益(用today_date的收盘价)
-        # 这里简化: 用d1_change和intraday估算
-        sell = [t for t in recent_entries if t.get('intraday', 0) < 3]
-        hold = [t for t in recent_entries if t.get('intraday', 0) >= 3]
+        sell = [s for s in open_pos if s.get('today_action')]
+        hold = [s for s in open_pos if not s.get('today_action')]
 
         print(f"\n{'=' * 80}")
-        print(f"📊 持仓分析 (7天内买入, 次日开盘执行)")
+        print(f"📊 持仓分析 (截至 {today_str} 仍持仓 {len(open_pos)}只, 按各策略出场规则重算)")
         print(f"{'=' * 80}")
-        print(f"  持仓: {len(recent_entries)}只 | 卖出: {len(sell)}只 | 持有: {len(hold)}只")
+        print(f"  持仓: {len(open_pos)}只 | 🔴明日清仓: {len(sell)}只 | 🟢继续持有: {len(hold)}只")
 
         if sell:
-            print(f"\n  🔴 明日开盘清仓 ({len(sell)}只) - 日内动量<3%:")
-            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
-            print(f"  {'-' * 75}")
-            for t in sorted(sell, key=lambda x: x.get('intraday', 0)):
+            print(f"\n  🔴 明日开盘清仓 ({len(sell)}只):")
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'现价':>8} {'浮动':>7}  原因")
+            print(f"  {'-' * 100}")
+            for s in sorted(sell, key=lambda x: x['curr_ret']):
+                t = s['trade']
                 pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', }.get(t['path'], t['path'])
-                hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
+                cur = bars_by_code[t['code']][_find_bar_idx(bars_by_code[t['code']], today_str)]['close']
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
-                      f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
+                      f"{t['entry_price']:>7.2f} {s['hold_days']:>5}天 {cur:>8.2f} {s['curr_ret']:>+6.1f}%  {s['today_action']}")
 
         if hold:
-            print(f"\n  🟢 继续持有 ({len(hold)}只) - 日内动量>=3%:")
-            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'D1收':>7} {'日内':>7}")
+            print(f"\n  🟢 继续持有 ({len(hold)}只):")
+            print(f"  {'代码':>8} {'板块':>6} {'策略':>6} {'买入日':>12} {'买入价':>8} {'持仓天':>6} {'现价':>8} {'浮动':>7}")
             print(f"  {'-' * 75}")
-            for t in sorted(hold, key=lambda x: -x.get('intraday', 0)):
+            for s in sorted(hold, key=lambda x: -x['curr_ret']):
+                t = s['trade']
                 pl = {'dragon_callback': '龙回头', 'v1': 'V1', 'break_buy': '断板', }.get(t['path'], t['path'])
-                hold_days = (today_dt - datetime.strptime(t['entry_date'], '%Y-%m-%d')).days if t.get('entry_date') else 0
+                cur = bars_by_code[t['code']][_find_bar_idx(bars_by_code[t['code']], today_str)]['close']
                 print(f"  {t['code']:>8} {t['board']:>6} {pl:>6} {t['entry_date']:>12} "
-                      f"{t['entry_price']:>7.2f} {hold_days:>5}天 {t.get('d1_change',0):>+6.1f}% {t.get('intraday',0):>+6.1f}%")
-            print(f"\n    出场规则: 追踪止损-5% / 持仓上限7天")
+                      f"{t['entry_price']:>7.2f} {s['hold_days']:>5}天 {cur:>8.2f} {s['curr_ret']:>+6.1f}%")
+        if not open_pos:
+            print(f"\n  (截至{today_str} 无仍在持仓的策略仓位)")
 
     return today_trades
 
@@ -1137,6 +1503,10 @@ def main():
     print(f"股票: {len(codes)}只\n")
 
     dc_trades, v1_trades, bb_trades = [], [], []
+    v1_today_signals = []
+    dragon_today_signals = []
+    break_today_signals = []
+    bars_by_code = {}
     success = 0
 
     # 加载stock_basic_info (换手率 + 板块效应)
@@ -1189,6 +1559,8 @@ def main():
         bars = all_bars.get(code) if all_bars else (fetch_kline_db(code, args.days) if use_db else fetch_kline(code, args.days))
         if not bars:
             continue
+        if args.today:
+            bars_by_code[code] = bars
 
         parts = []
 
@@ -1199,6 +1571,13 @@ def main():
                                            max_last_chg=args.max_last_chg,
                                            buy_mode=args.buy_mode)
             dc_trades.extend(dc)
+            if args.today:
+                dragon_today_signals.extend(dragon_today_d0_signals(
+                    bars, code,
+                    min_pullback_days=args.pullback,
+                    max_pullback_days=args.max_pullback,
+                    max_last_chg=args.max_last_chg,
+                    today_str=args.today_date or None))
             parts.append(f"龙回头{len(dc)}")
         if run_v1:
             # 如果预加载了K线, 直接用; 否则单独加载
@@ -1211,13 +1590,24 @@ def main():
                              d_1_pullback_min=args.d1_pullback_min,
                              d_1_pullback_max=args.d1_pullback_max,
                              obv_filter=not args.no_obv_filter,
-                             today_mode=args.today,
                              d_1_vol_max=args.d1_vol_max)
             v1_trades.extend(v1)
+            if args.today:
+                v1_today_signals.extend(v1_today_d0_signals(
+                    code_bars, code,
+                    ret_20d_min=args.ret_20d_min,
+                    d_1_pullback_min=args.d1_pullback_min,
+                    d_1_pullback_max=args.d1_pullback_max,
+                    obv_filter=not args.no_obv_filter,
+                    d_1_vol_max=args.d1_vol_max,
+                    today_str=args.today_date or None))
             parts.append(f"V1{len(v1)}")
         if run_bb:
             bb = strategy_break_buy(bars, code)
             bb_trades.extend(bb)
+            if args.today:
+                break_today_signals.extend(break_today_d0_signals(
+                    bars, code, today_str=args.today_date or None))
             parts.append(f"断板{len(bb)}")
 
         has_signal = (run_dc and len(dc) > 0) or (run_v1 and len(v1) > 0) or (run_bb and len(bb) > 0)
@@ -1291,9 +1681,9 @@ def main():
 
     # ===== 今日买点统计 =====
     if args.today:
-        today_str = args.today_date or time.strftime("%Y-%m-%d")
+        today_str = args.today_date or _db_last_bar_date(bars_by_code) or time.strftime("%Y-%m-%d")
         all_for_today = dc_trades + v1_trades + bb_trades
-        today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode)
+        today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode, v1_today_signals=v1_today_signals, dragon_today_signals=dragon_today_signals, break_today_signals=break_today_signals, bars_by_code=bars_by_code)
         if today_trades:
             with open(f"today_signals_{today_str}.json", "w", encoding="utf-8") as f:
                 json.dump(today_trades, f, ensure_ascii=False, indent=2)
