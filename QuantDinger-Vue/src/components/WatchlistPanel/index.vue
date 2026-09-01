@@ -178,29 +178,24 @@
             </a-list-item>
           </a-list>
         </div>
-        <div class="hot-symbols-section">
-          <div class="section-title">
-            <a-icon type="fire" style="color: #ff4d4f; margin-right: 4px;" />
-            {{ $t('dashboard.analysis.modal.addStock.hotSymbols') }}
-          </div>
-          <a-spin :spinning="loadingHotSymbols">
-            <a-list v-if="hotSymbols.length > 0" :data-source="hotSymbols" size="small" class="symbol-list">
-              <a-list-item slot="renderItem" slot-scope="item" class="symbol-list-item" @click="selectSymbol(item)">
-                <a-list-item-meta>
-                  <template slot="title">
-                    <div class="symbol-item-content">
-                      <span class="symbol-code">{{ item.symbol }}</span>
-                      <span class="symbol-name">{{ item.name }}</span>
-                      <a-tag v-if="item.exchange" size="small" color="orange" style="margin-left: 8px;">{{ item.exchange }}</a-tag>
-                    </div>
-                  </template>
-                </a-list-item-meta>
-              </a-list-item>
-            </a-list>
-            <a-empty v-else :description="$t('dashboard.analysis.modal.addStock.noHotSymbols')" :image="false" />
-          </a-spin>
+
+        <div v-if="selectedSymbolsForAdd.length > 0" class="selected-symbol-section">
+          <a-alert :message="$t('dashboard.analysis.modal.addStock.selectedSymbol') + ' (' + selectedSymbolsForAdd.length + ')'" type="info" show-icon closable @close="selectedSymbolsForAdd = []">
+            <template slot="description">
+              <div class="selected-symbols-batch">
+                <div v-for="(s, idx) in selectedSymbolsForAdd" :key="idx" class="selected-symbol-item">
+                  <a-tag :color="getMarketColor(s.market)" size="small">
+                    {{ $t(`dashboard.analysis.market.${s.market}`) }}
+                  </a-tag>
+                  <strong>{{ s.symbol }}</strong>
+                  <span v-if="s.name" style="color: #999; margin-left: 4px;">{{ s.name }}</span>
+                  <a-icon type="close-circle" class="remove-symbol-btn" @click="removeSelectedSymbol(idx)" />
+                </div>
+              </div>
+            </template>
+          </a-alert>
         </div>
-        <div v-if="selectedSymbolForAdd" class="selected-symbol-section">
+        <div v-else-if="selectedSymbolForAdd" class="selected-symbol-section">
           <a-alert :message="$t('dashboard.analysis.modal.addStock.selectedSymbol')" type="info" show-icon closable @close="selectedSymbolForAdd = null">
             <template slot="description">
               <div class="selected-symbol-info">
@@ -219,7 +214,6 @@
             <div class="group-field-control">
               <a-select
                 v-model="addTargetGroup"
-                mode="combobox"
                 style="width: 100%;"
                 :placeholder="$t('dashboard.analysis.watchlist.group.newNamePlaceholder')"
                 allow-clear
@@ -459,6 +453,7 @@ export default {
       hotSymbols: [],
       loadingHotSymbols: false,
       selectedSymbolForAdd: null,
+      selectedSymbolsForAdd: [],
       searchTimer: null,
       hasSearched: false,
       positions: [],
@@ -917,33 +912,65 @@ export default {
       if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
     },
     async handleAddStock () {
-      let market = ''; let symbol = ''; let name = ''
-      if (this.selectedSymbolForAdd) {
-        // User picked from search results
-        market = this.selectedSymbolForAdd.market; symbol = this.selectedSymbolForAdd.symbol.toUpperCase(); name = this.selectedSymbolForAdd.name || ''
+      // Determine which symbols to add
+      const symbolsToAdd = []
+      if (this.selectedSymbolsForAdd.length > 0) {
+        // Batch mode: use selected symbols from search results
+        for (const s of this.selectedSymbolsForAdd) {
+          symbolsToAdd.push({ market: s.market, symbol: s.symbol.toUpperCase(), name: s.name || '' })
+        }
+      } else if (this.selectedSymbolForAdd) {
+        // Single mode: picked from search results
+        symbolsToAdd.push({ market: this.selectedSymbolForAdd.market, symbol: this.selectedSymbolForAdd.symbol.toUpperCase(), name: this.selectedSymbolForAdd.name || '' })
       } else if (this.symbolSearchKeyword && this.symbolSearchKeyword.trim()) {
         if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
-        market = this.selectedMarketTab; symbol = this.symbolSearchKeyword.trim().toUpperCase(); name = ''
+        // Comma-separated raw input without search results
+        const parts = this.symbolSearchKeyword.split(/[，,]/).map(s => s.trim().toUpperCase()).filter(Boolean)
+        for (const sym of parts) {
+          symbolsToAdd.push({ market: this.selectedMarketTab, symbol: sym, name: '' })
+        }
       } else { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol')); return }
       const group = (this.addTargetGroup || '').trim() || this.currentGroup || DEFAULT_GROUP_NAME
       if (group.length > 50) { this.$message.warning(this.$t('dashboard.analysis.watchlist.group.nameTooLong')); return }
+      if (symbolsToAdd.length === 0) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol')); return }
       this.addingStock = true
       try {
-        const res = await addWatchlist({ userid: this.userId, market, symbol, name, group_name: group })
-        if (res && res.code === 1) {
-          this.$message.success(this.$t('dashboard.analysis.message.addStockSuccess'))
+        let successCount = 0
+        const failedSymbols = []
+        for (const { market, symbol, name } of symbolsToAdd) {
+          try {
+            const res = await addWatchlist({ userid: this.userId, market, symbol, name, group_name: group })
+            if (res && res.code === 1) {
+              successCount++
+            } else if (res && res.data && res.data.candidates) {
+              // Single match — auto pick first candidate
+              const c = res.data.candidates[0]
+              const res2 = await addWatchlist({ userid: this.userId, market: c.market || market, symbol: c.symbol, name: c.name || c.symbol, group_name: group })
+              if (res2 && res2.code === 1) successCount++
+              else failedSymbols.push(symbol)
+            } else {
+              failedSymbols.push(symbol)
+            }
+          } catch (e) {
+            failedSymbols.push(symbol)
+          }
+        }
+        if (successCount > 0) {
+          const msg = symbolsToAdd.length === 1
+            ? this.$t('dashboard.analysis.message.addStockSuccess')
+            : `${this.$t('dashboard.analysis.message.addStockSuccess')} (${successCount}/${symbolsToAdd.length})`
+          this.$message.success(msg)
           this.handleCloseAddStockModal()
           await this.loadWatchlist()
           this.$emit('refresh')
-        } else if (res && res.data && res.data.candidates) {
-          // Backend returned multiple matches — show as search results for user to pick
-          this.symbolSearchResults = res.data.candidates.map(c => ({ market: c.market || market, symbol: c.symbol, name: c.name || c.symbol }))
-          this.$message.info(res.msg || this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol'))
-        } else { this.$message.error(res?.msg || this.$t('dashboard.analysis.message.addStockFailed')) }
+        }
+        if (failedSymbols.length > 0) {
+          this.$message.warning(this.$t('dashboard.analysis.message.addStockFailed') + ': ' + failedSymbols.join(', '))
+        }
       } catch (error) { this.$message.error(error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.message.addStockFailed')) } finally { this.addingStock = false }
     },
     handleCloseAddStockModal () {
-      this.showAddStockModal = false; this.selectedSymbolForAdd = null; this.symbolSearchKeyword = ''; this.symbolSearchResults = []; this.hasSearched = false
+      this.showAddStockModal = false; this.selectedSymbolForAdd = null; this.selectedSymbolsForAdd = []; this.symbolSearchKeyword = ''; this.symbolSearchResults = []; this.hasSearched = false
       this.addTargetGroup = ''
       this.selectedMarketTab = this.marketTypes.length > 0 ? this.marketTypes[0].value : ''
     },
@@ -954,7 +981,14 @@ export default {
     handleSymbolSearchInput (e) {
       const keyword = e.target.value; this.symbolSearchKeyword = keyword
       if (this.searchTimer) clearTimeout(this.searchTimer)
-      if (!keyword || keyword.trim() === '') { this.symbolSearchResults = []; this.hasSearched = false; this.selectedSymbolForAdd = null; return }
+      if (!keyword || keyword.trim() === '') { this.symbolSearchResults = []; this.hasSearched = false; this.selectedSymbolForAdd = null; this.selectedSymbolsForAdd = []; return }
+      // Check if comma-separated (batch input)
+      const parts = keyword.split(/[，,]/).map(s => s.trim()).filter(Boolean)
+      if (parts.length >= 2) {
+        // Batch mode: search each symbol
+        this.searchTimer = setTimeout(() => { this.searchBatchSymbols(parts) }, 500)
+        return
+      }
       if (keyword.trim().length < 2) { this.symbolSearchResults = []; this.hasSearched = false; return }
       this.searchTimer = setTimeout(() => { this.searchSymbolsInModal(keyword) }, 500)
     },
@@ -962,7 +996,38 @@ export default {
       if (!keyword || !keyword.trim()) return
       if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
       if (this.symbolSearchResults.length > 0) return
+      // Check if comma-separated (batch input)
+      const parts = keyword.split(/[，,]/).map(s => s.trim()).filter(Boolean)
+      if (parts.length >= 2) {
+        this.searchBatchSymbols(parts)
+        return
+      }
       if (this.hasSearched && this.symbolSearchResults.length === 0) { this.handleDirectAdd() } else { this.searchSymbolsInModal(keyword) }
+    },
+    async searchBatchSymbols (symbols) {
+      if (!this.selectedMarketTab) { this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket')); return }
+      this.searchingSymbols = true; this.hasSearched = true
+      const results = []
+      try {
+        for (const sym of symbols) {
+          if (sym.length < 1) continue
+          try {
+            const res = await searchSymbols({ market: this.selectedMarketTab, keyword: sym, limit: 5 })
+            if (res && res.code === 1 && res.data && res.data.length > 0) {
+              // Pick best match (first result)
+              results.push(res.data[0])
+            } else {
+              // No match, add as raw input
+              results.push({ market: this.selectedMarketTab, symbol: sym.toUpperCase(), name: '' })
+            }
+          } catch (e) {
+            results.push({ market: this.selectedMarketTab, symbol: sym.toUpperCase(), name: '' })
+          }
+        }
+        this.symbolSearchResults = results
+        // Auto-select all for batch add
+        this.selectedSymbolsForAdd = [...results]
+      } catch (error) { this.symbolSearchResults = [] } finally { this.searchingSymbols = false }
     },
     async searchSymbolsInModal (keyword) {
       if (!keyword || keyword.trim().length < 2) { this.symbolSearchResults = []; this.hasSearched = false; return }
@@ -982,7 +1047,16 @@ export default {
       this.selectedSymbolForAdd = { market: this.selectedMarketTab, symbol: this.symbolSearchKeyword.trim().toUpperCase(), name: '' }
     },
     selectSymbol (symbol) {
-      this.selectedSymbolForAdd = { market: symbol.market, symbol: symbol.symbol, name: symbol.name || symbol.symbol }
+      // Toggle selection in batch mode (click once to select, click again to deselect)
+      const idx = this.selectedSymbolsForAdd.findIndex(s => s.symbol === symbol.symbol && s.market === symbol.market)
+      if (idx >= 0) {
+        this.selectedSymbolsForAdd.splice(idx, 1)
+      } else {
+        this.selectedSymbolsForAdd.push(symbol)
+      }
+    },
+    removeSelectedSymbol (idx) {
+      this.selectedSymbolsForAdd.splice(idx, 1)
     },
     async loadHotSymbols (market) {
       if (!market) market = this.selectedMarketTab || (this.marketTypes.length > 0 ? this.marketTypes[0].value : '')
@@ -1226,6 +1300,7 @@ export default {
   .search-results-section, .hot-symbols-section { margin-bottom: 24px; .section-title { font-size: 14px; font-weight: 600; color: #262626; margin-bottom: 12px; display: flex; align-items: center; } }
   .symbol-list { max-height: 200px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 4px; .symbol-list-item { cursor: pointer; padding: 8px 12px; transition: background-color 0.3s; &:hover { background-color: #f5f5f5; } .symbol-item-content { display: flex; align-items: center; gap: 8px; .symbol-code { font-weight: 600; color: #262626; min-width: 80px; } .symbol-name { color: #595959; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } } } }
   .selected-symbol-section { margin-top: 16px; .selected-symbol-info { display: flex; align-items: center; } }
+  .selected-symbols-batch { max-height: 120px; overflow-y: auto; .selected-symbol-item { display: flex; align-items: center; padding: 4px 0; border-bottom: 1px solid #f0f0f0; &:last-child { border-bottom: none; } .remove-symbol-btn { margin-left: auto; color: #999; cursor: pointer; &:hover { color: #ff4d4f; } } } }
 }
 
 .wl-group-switcher {

@@ -1194,19 +1194,29 @@ def calc_buy_tiers(d0_close, board_type):
     return tiers
 
 
-def buy_suggestion_text(d0_close, board_type):
-    """D1开盘买入建议(文字描述, 供人工筛选)
+def buy_suggestion_text(d0_close, board_type, path='dragon_callback'):
+    """D1开盘买入建议(文字描述, 供人工筛选, 按策略区分)
 
-    主板: D1开盘涨幅>=-3%且收盘>=0; 高开+3%~+5%不入场
-    创/科板: D1开盘涨幅>=-5%且<+5%且收盘>=0
+    dragon_callback: D1开盘买入, 无方向过滤
+    break_buy:       D1开盘买入, 无方向过滤
+    v1:              D1开盘买入, 主板高开3%~5%不入场, 创/科板高开>=5%不入场; 收盘需收红
     """
+    if path == 'v1':
+        if board_type == 'gem_star':
+            lo_p = d0_close * 0.95
+            hi_p = d0_close * 1.05
+            return (f"开盘 -5%~+5% 可买(约{lo_p:.2f}~{hi_p:.2f}), 收盘需收红(>=0%)")
+        lo_p = d0_close * 0.97
+        hi_p = d0_close * 1.03
+        return (f"开盘 -3%~+3% 可买(约{lo_p:.2f}~{hi_p:.2f}), 高开3%以上不入场, 收盘需收红(>=0%)")
+    # 龙回头 / 断板: D1开盘买入, 无方向过滤
     if board_type == 'gem_star':
         lo_p = d0_close * 0.95
         hi_p = d0_close * 1.05
-        return (f"开盘 -5%~+5% 可买(约{lo_p:.2f}~{hi_p:.2f}), 收盘需收红(>=0%)")
+        return (f"开盘 -5%~+5% 可买(约{lo_p:.2f}~{hi_p:.2f})")
     lo_p = d0_close * 0.97
     hi_p = d0_close * 1.03
-    return (f"开盘 -3%~+3% 可买(约{lo_p:.2f}~{hi_p:.2f}), 高开3%以上不入场, 收盘需收红(>=0%)")
+    return (f"开盘 -3%~+3% 可买(约{lo_p:.2f}~{hi_p:.2f}), 高开3%以上不入场")
 
 
 def _find_bar_idx(bars, date_str):
@@ -1358,7 +1368,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open", v1_today_si
         for t in sorted(dc_today, key=lambda x: x.get('entry_vol_r', 0), reverse=True):
             bt = get_board_type(t['code'])
             signal_price = t.get('signal_price') or t.get('entry_price')
-            text = buy_suggestion_text(signal_price, bt)
+            text = buy_suggestion_text(signal_price, bt, path='dragon_callback')
             print(f"    {t['code']:<8} {t['board']:<6} 涨停{t['lu_date']} 回调{t['pullback_days']}天 "
                   f"信号{t['signal_date']} {t['signal_chg']:+.1f}% 量比{t['entry_vol_r']:.2f}x")
             print(f"{'':>10} 信号价{signal_price:.2f} 买入建议: {text}")
@@ -1376,7 +1386,7 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open", v1_today_si
             d0_close = t.get('d0_close', t.get('entry_price', 0))
             score = calc_momentum_score(t)
             label = momentum_label(score)
-            text = buy_suggestion_text(d0_close, bt)
+            text = buy_suggestion_text(d0_close, bt, path='v1')
             print(f"  {code:>8} {board:>6} {label:>6} {score:>3}  {d0_close:>7.2f} "
                   f"{t['d_1_change']:>+7.1f}% {t['ret_20d']:>+7.1f}%")
             print(f"{'':>10} 买入建议: {text}")
@@ -1583,7 +1593,7 @@ def main():
             # 如果预加载了K线, 直接用; 否则单独加载
             code_bars = all_bars.get(code) if all_bars else bars
             v1 = strategy_v1(code_bars, code, buy_mode=args.buy_mode,
-                             hold_days=args.v1_hold_days if hasattr(args, 'v1_hold_days') else 20,
+                             hold_days=7,
                              stop_loss=args.v1_stop_loss,
                              trailing_stop=args.v1_trailing_stop,
                              ret_20d_min=args.ret_20d_min,
