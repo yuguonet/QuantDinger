@@ -1043,7 +1043,7 @@ const TF_MAX_DAYS = {
 }
 
 /** A 股 / 港股交易半天，4H 无意义，用 2H（上午/下午各一根） */
-const ASIAN_STOCK_TF = ['1m', '5m', '15m', '1H', '1D', '1W', '1M']
+const ASIAN_STOCK_TF = ['分时', '1m', '5m', '15m', '1H', '1D', '1W', '1M']
 /** 美股 / 加密 / 外汇 / 期货连续交易，4H 更合适 */
 const GLOBAL_MARKET_TF = ['1m', '5m', '15m', '1H', '4H', '1D', '1W', '1M']
 

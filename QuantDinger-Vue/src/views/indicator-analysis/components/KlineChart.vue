@@ -2267,6 +2267,200 @@ registerOverlay({
       }
     }
 
+    /** 是否为分时图模式 */
+    const isMinuteLine = computed(() => props.timeframe === '分时')
+
+    /** 禁用滚轮事件处理器引用 */
+    let _wheelHandler = null
+
+    /** 禁用图表容器的滚轮事件 */
+    const disableChartWheel = () => {
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+
+      // 移除旧的处理器
+      if (_wheelHandler) {
+        container.removeEventListener('wheel', _wheelHandler)
+      }
+
+      // 添加新的处理器，阻止滚轮事件
+      _wheelHandler = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+      container.addEventListener('wheel', _wheelHandler, { passive: false })
+    }
+
+    /** 启用图表容器的滚轮事件 */
+    const enableChartWheel = () => {
+      const container = document.getElementById('kline-chart-container')
+      if (!container) return
+
+      if (_wheelHandler) {
+        container.removeEventListener('wheel', _wheelHandler)
+        _wheelHandler = null
+      }
+    }
+
+    /**
+     * 分时图数据处理：
+     * 1. 使用1m数据
+     * 2. 只保留当天从9:30开始的数据
+     * 3. 计算VWAP
+     */
+    const processMinuteLineData = (rawData) => {
+      if (!rawData || rawData.length === 0) return []
+
+      // 获取今天的日期（使用本地时间）
+      const now = new Date()
+      const year = now.getFullYear()
+      const month = String(now.getMonth() + 1).padStart(2, '0')
+      const day = String(now.getDate()).padStart(2, '0')
+      const todayStr = `${year}-${month}-${day}`
+
+      // 过滤只保留今天的数据，并且时间 >= 9:30
+      const todayData = rawData.filter(item => {
+        const d = new Date(item.timestamp)
+        const itemYear = d.getFullYear()
+        const itemMonth = String(d.getMonth() + 1).padStart(2, '0')
+        const itemDay = String(d.getDate()).padStart(2, '0')
+        const dateStr = `${itemYear}-${itemMonth}-${itemDay}`
+        const hours = d.getHours()
+        const minutes = d.getMinutes()
+        const timeNum = hours * 100 + minutes
+
+        // 只保留今天 9:30 之后的数据
+        return dateStr === todayStr && timeNum >= 930
+      })
+
+      if (todayData.length === 0) {
+        // 如果没有今天的数据，返回最近一天的数据
+        const lastItem = rawData[rawData.length - 1]
+        if (lastItem) {
+          const lastDate = new Date(lastItem.timestamp)
+          const lastDateStr = `${lastDate.getFullYear()}-${String(lastDate.getMonth() + 1).padStart(2, '0')}-${String(lastDate.getDate()).padStart(2, '0')}`
+          const fallbackData = rawData.filter(item => {
+            const d = new Date(item.timestamp)
+            const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+            return dateStr === lastDateStr
+          })
+          if (fallbackData.length > 0) {
+            // 计算VWAP
+            let cumulativeVolume = 0
+            let cumulativeTPV = 0
+            return fallbackData.map(item => {
+              const typicalPrice = (item.high + item.low + item.close) / 3
+              const volume = item.volume || 0
+              cumulativeVolume += volume
+              cumulativeTPV += typicalPrice * volume
+              const vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : item.close
+              return { ...item, vwap }
+            })
+          }
+        }
+        return []
+      }
+
+      // 计算VWAP (Volume Weighted Average Price)
+      let cumulativeVolume = 0
+      let cumulativeTPV = 0
+
+      const result = todayData.map((item, index) => {
+        const typicalPrice = (item.high + item.low + item.close) / 3
+        const volume = item.volume || 0
+
+        cumulativeVolume += volume
+        cumulativeTPV += typicalPrice * volume
+
+        const vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : item.close
+
+        return {
+          ...item,
+          vwap: vwap
+        }
+      })
+
+      return result
+    }
+
+    /** 设置图表为分时图模式 */
+    const applyMinuteLineChartStyle = () => {
+      if (!chartRef.value) return
+
+      try {
+        // 禁用滚轮缩放和拖动
+        disableChartWheel()
+
+        // 设置面积图样式：蓝色线条，无填充
+        chartRef.value.setStyles({
+          candle: {
+            type: 'area',
+            area: {
+              lineColor: '#1890ff',
+              lineSize: 2,
+              style: 'stroke',
+              value: 'vwap'
+            },
+            bar: {
+              upColor: 'transparent',
+              downColor: 'transparent',
+              noChangeColor: 'transparent',
+              upBorderColor: 'transparent',
+              downBorderColor: 'transparent',
+              noChangeBorderColor: 'transparent',
+              upWickColor: 'transparent',
+              downWickColor: 'transparent',
+              noChangeWickColor: 'transparent'
+            },
+            priceMark: {
+              show: true,
+              last: {
+                show: true,
+                color: '#1890ff',
+                lineStyle: 'dashed'
+              }
+            },
+            tooltip: {
+              showRule: 'always',
+              showType: 'standard',
+              labels: ['时间', 'VWAP', '成交量'],
+              values: (kLineData) => {
+                const d = new Date(kLineData.timestamp)
+                const p = pricePrecision.value
+                const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+                return [
+                  timeStr,
+                  kLineData.vwap ? kLineData.vwap.toFixed(p) : '--',
+                  (kLineData.volume || 0).toFixed(0)
+                ]
+              }
+            }
+          }
+        })
+      } catch (e) {
+        console.warn('设置分时图样式失败:', e)
+      }
+    }
+
+    /** 恢复普通K线图样式 */
+    const restoreNormalChartStyle = () => {
+      if (!chartRef.value) return
+
+      try {
+        // 启用滚轮缩放
+        enableChartWheel()
+
+        // 恢复蜡烛图样式
+        chartRef.value.setStyles({
+          candle: {
+            type: 'candle_solid'
+          }
+        })
+      } catch (e) {
+        console.warn('恢复K线图样式失败:', e)
+      }
+    }
+
     const loadKlineData = async (silent = false) => {
       if (!props.symbol) return
       if (loading.value && !silent) return
@@ -2277,6 +2471,9 @@ registerOverlay({
       loading.value = true
       error.value = null
 
+      // 分时图模式：使用1m数据
+      const loadTimeframe = isMinuteLine.value ? '1m' : props.timeframe
+
       try {
         let formattedData = []
         try {
@@ -2286,7 +2483,7 @@ registerOverlay({
             params: {
               market: props.market,
               symbol: props.symbol,
-              timeframe: props.timeframe,
+              timeframe: loadTimeframe,
               limit: 1000
             }
           })
@@ -2310,13 +2507,23 @@ registerOverlay({
           throw new Error('未获取到K线数据')
         }
 
-        klineData.value = formattedData
+        // 分时图模式：处理数据
+        if (isMinuteLine.value) {
+          const minuteData = processMinuteLineData(formattedData)
+          if (minuteData.length === 0) {
+            throw new Error('今日暂无分时数据')
+          }
+          klineData.value = minuteData
+        } else {
+          klineData.value = formattedData
+        }
+
         hasMoreHistory.value = true
 
         // 根据数据自动推算价格精度并设置到图表
-        pricePrecision.value = calcPricePrecision(formattedData)
+        pricePrecision.value = calcPricePrecision(klineData.value)
 
-        const internalData = convertToInternalFormat(formattedData)
+        const internalData = convertToInternalFormat(klineData.value)
         updatePricePanel(internalData, { force: true })
 
         nextTick(() => {
@@ -2343,6 +2550,13 @@ registerOverlay({
                 chartRef.value.applyNewData(validData)
               } catch (e) {
                 chartRef.value.applyNewData(validData)
+              }
+
+              // 分时图模式：应用面积图样式
+              if (isMinuteLine.value) {
+                applyMinuteLineChartStyle()
+              } else {
+                restoreNormalChartStyle()
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
@@ -5265,6 +5479,7 @@ registerOverlay({
       chartRef,
       chartTheme,
       themeConfig,
+      isMinuteLine,
       wmCanvasRef,
       pctAxisRef,
       chipCanvasRef,
