@@ -121,20 +121,57 @@ def fetch_daily_kline(code: str, days: int = 120) -> List[Dict]:
         return []
 
 def fetch_15m_kline(code: str, start_date: str, end_date: str) -> List[Dict]:
-    """15分钟K线 (前复权), 指定日期范围"""
+    """15分钟K线 (前复权), 从 1m DB 读取后聚合到 15m。"""
     from app.data_sources.provider.adjustment import unadj_to_qfq
     try:
         writer = _get_writer()
-        data = writer.query("CNStock", code, "15m",
+        data = writer.query("CNStock", code, "1m",
                             start_time=start_date, end_time=end_date, limit=0)
         if not data:
             return []
         bars = [{"time": str(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
                  "low": float(r["low"]), "close": float(r["close"]), "volume": float(r["volume"])}
                 for r in data]
+        # 1m → 15m 聚合
+        bars = _aggregate_1m_to_15m(bars)
         return unadj_to_qfq(bars, code)
     except Exception:
         return []
+
+
+def _aggregate_1m_to_15m(bars: List[Dict]) -> List[Dict]:
+    """将 1m bar 按日期分组，每 15 根聚合为 1 根 15m bar。"""
+    if not bars:
+        return bars
+    result = []
+    cur_date = None
+    group = []
+    for bar in bars:
+        d = bar["time"][:10] if isinstance(bar["time"], str) else str(bar["time"])[:10]
+        if d != cur_date:
+            if group:
+                result.append(_merge_group_15m(group))
+            cur_date = d
+            group = [bar]
+        else:
+            group.append(bar)
+        if len(group) == 15:
+            result.append(_merge_group_15m(group))
+            group = []
+    if group:
+        result.append(_merge_group_15m(group))
+    return result
+
+
+def _merge_group_15m(group: List[Dict]) -> Dict:
+    return {
+        "time": group[0]["time"],
+        "open": group[0]["open"],
+        "high": max(b["high"] for b in group),
+        "low": min(b["low"] for b in group),
+        "close": group[-1]["close"],
+        "volume": round(sum(b["volume"] for b in group), 2),
+    }
 
 # ================================================================
 # 技术指标 (移植自 dragon_d0_alert.py / realtime_monitor.py V2)

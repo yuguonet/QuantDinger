@@ -482,9 +482,9 @@ class MarketDBManager:
         pool = self._get_pool(market)
 
         with pool.cursor() as cur:
-            # 15m 分区表：5 年（source_sync 从 2024-01-01 起）
-            for year in range(current_year - 4, current_year + 1):
-                self._ensure_kline_table(cur, "15m", year)
+            # 1m 分区表：2 年（mootdx 仅存 ~4-5 个月，建 2 年留冗余）
+            for year in range(current_year - 1, current_year + 1):
+                self._ensure_kline_table(cur, "1m", year)
 
             # 1D 分区表：5 年（日线数据需要 5 年）
             for year in range(current_year - 4, current_year + 1):

@@ -187,14 +187,11 @@ import threading as _threading
 post_market_done = _threading.Event()
 
 def _post_market_batch():
-    """盘后日级串行: 15m → 日档 → 龙虎榜/北向/资金流 → 1D → 板块统计，重试至数据到位后退出。"""
+    """盘后日级串行: 1m → 日档 → 龙虎榜/北向/资金流 → 1D → 板块统计，重试至数据到位后退出。"""
     from app.utils.trading_calendar import last_finish_trading_day
     target = last_finish_trading_day()
 
-    # 15m 最先跑
-    _refresh_backfill_15m()
-
-    # 1m K线回填 (mootdx, 每标的240条)
+    # 1m K线回填 (mootdx, 每标的240条) — 替代原 15m，精度更高
     _refresh_backfill_1m()
 
     _refresh_daily()

@@ -238,7 +238,7 @@ def _merge_bars_group(group: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ================================================================
 
 class CNStockDataSource(BaseDataSource):
-    """A股数据源: 1D/1W 走 DB + TTL, 15m/30m/1h/2h/4h 盘后走 DB, 其余走远端。"""
+    """A股数据源: 1D/1W 走 DB + TTL, 1m 盘后走 DB 直读, 5m/15m/30m/1h/2h/4h 盘后从 1m DB 按需聚合, 其余走远端。"""
 
     name = "CNStock/multi-source"
 
@@ -351,8 +351,8 @@ class CNStockDataSource(BaseDataSource):
 
         分流逻辑：
           1D / 1W → 走 DB + TTL 混合流程（有本地缓存，响应快）
-          15m/30m/1h/2h/4h → 盘后走 DB（15m 直读，其余由 15m 聚合），盘中走远端
-          1m / 5m → 直接走远端（粒度太细，DB 无意义）
+          1m → 盘后走 DB 直读，盘中走远端
+          5m/15m/30m/1h/2h/4h → 盘后从 1m DB 按需聚合，盘中走远端
         """
         tf = normalize_chart_timeframe(timeframe)
         limit = max(int(limit or 300), 1)
@@ -362,10 +362,10 @@ class CNStockDataSource(BaseDataSource):
         if tf == "1W":
             return self._get_kline_weekly(symbol, limit)
 
-        # 15m/30m/1h/2h/4h — 盘后走 DB，盘中走远端
-        if tf in ("15m", "30m", "1h", "2h", "4h"):
+        # 1m/5m/15m/30m/1h/2h/4h — 盘后走 DB（1m 直读 / 其余从 1m 聚合），盘中走远端
+        if tf in ("1m", "5m", "15m", "30m", "1h", "2h", "4h"):
             if not _is_in_trading_hours():
-                result = self._get_kline_15m_based(symbol, tf, limit)
+                result = self._get_kline_intraday(symbol, tf, limit)
                 if result:
                     return self.filter_and_limit(
                         result, limit=limit,
@@ -373,7 +373,7 @@ class CNStockDataSource(BaseDataSource):
                         truncate=(after_time is None),
                     )
 
-        # 1m/5m 或 DB 未命中 → 走远端
+        # DB 未命中 → 走远端
         return self._get_kline_remote(symbol, tf, limit, before_time, after_time)
 
     # ================================================================
@@ -523,102 +523,69 @@ class CNStockDataSource(BaseDataSource):
         return out
 
     # ================================================================
-    # 15m DB + 聚合（盘后 15m/30m/1h/2h/4h）
+    # 盘后分钟级 K 线（1m/5m/15m/30m/1h/2h/4h）
     #
-    # 盘后（非交易时段）15m 线从 DB 读取（由 source_sync.py 写入），
-    # 30m/1h/2h/4h 由 15m 线聚合而来。
-    # 盘中仍走远端（DB 数据不是实时的）。
+    # 数据来源优先级：
+    #   1. DB 1m 数据充足 → 直读（1m）或按需聚合（5m/15m/30m/1h/2h/4h）
+    #   2. DB 1m 数据不足（超 4-5 个月）→ 单股从远端获取（coordinator）
+    #   3. 远端失败 → 返回空
+    #
+    # 聚合规则：
+    #   1m  → 直读
+    #   5m  → 每 5 根 1m 聚合
+    #   15m → 每 15 根 1m 聚合
+    #   30m → 每 30 根 1m 聚合
+    #   1h  → 每 60 根 1m 聚合
+    #   2h  → 每 120 根 1m 聚合
+    #   4h  → 每 240 根 1m 聚合
     # ================================================================
 
-    # 目标周期对应的 15m bar 数
-    _TF_BAR_COUNT = {"15m": 1, "30m": 2, "1h": 4, "2h": 8, "4h": 16}
+    # 目标周期对应的 1m bar 数
+    _TF_1M_BAR_COUNT = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "2h": 120,
+        "4h": 240,
+    }
 
-    def _get_kline_15m_based(
+    def _get_kline_intraday(
         self, symbol: str, tf: str, limit: int,
     ) -> List[Dict[str, Any]]:
-        """盘后: 15m 走 DB，30m/1h/2h/4h 由 15m 聚合。"""
-        # 1. 校验 DB 15m 数据是否足够新
-        if not self._check_15m_fresh(symbol):
-            return []
+        """盘后: 1m 走 DB 直读，其余从 1m DB 按需聚合。
 
-        # 2. 计算需要读多少 15m bar
-        bar_count = self._TF_BAR_COUNT.get(tf, 1)
-        # 聚合需要 limit 组 × 每组 bar_count 根，多留 1 天余量
-        need_bars = limit * bar_count + 16
-
-        # 3. 从 DB 读 15m bar
-        raw_bars = self._read_db_15m(symbol, need_bars)
-        if not raw_bars:
-            return []
-
-        # 4. 15m 直接返回；其余聚合
-        if tf == "15m":
-            return raw_bars[-limit:]
-        return self._aggregate_from_15m(raw_bars, bar_count)[-limit:]
-
-    def _check_15m_fresh(self, symbol: str) -> bool:
-        """检查 DB 中 15m 线最后一条的时间是否足够新。
-
-        盘中走远端，盘前/盘后且 DB 最新才走 DB:
-          - 盘中（交易日 9:15~15:01）→ False
-          - 盘后（交易日 15:01 后）→ 最后 bar 必须是今日 15:00
-          - 盘前（交易日 9:15 前）→ 最后 bar 必须是前一交易日 15:00
-          - 非交易日全天 → 最后 bar 必须是最近交易日 15:00
+        DB 1m 数据只有 4-5 个月，超出范围的请求：
+          - 单股：从远端获取（通过 coordinator）
+          - 大批量：缩减到 DB 范围内
         """
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        t = now.time()
+        # 1m 直读
+        if tf == "1m":
+            return self._read_db_1m(symbol, limit)
 
-        # 盘中 → 不走 DB
-        if _is_in_trading_hours():
-            return False
+        # 5m/15m/30m/1h/2h/4h → 从 1m 聚合
+        bar_count = self._TF_1M_BAR_COUNT.get(tf, 15)
+        # 计算需要多少 1m bar：limit 组 × 每组 bar_count 根，多留 1 天余量（240 根）
+        need_bars = limit * bar_count + 240
 
-        # 取 DB 最后一条 15m bar
+        # 读取 1m bar
+        raw_bars = self._read_db_1m(symbol, need_bars)
+
+        if raw_bars:
+            return self._aggregate_from_1m(raw_bars, bar_count)[-limit:]
+
+        # DB 无数据 → 单股从远端获取
+        return self._fetch_intraday_remote(symbol, tf, limit)
+
+    def _read_db_1m(self, symbol: str, limit: int) -> List[Dict[str, Any]]:
+        """从 DB 读取 1m K 线，按时间升序返回（最多 limit 条）。"""
         db_symbol = strip_market_prefix(symbol) if symbol else symbol
         try:
             from app.utils.db_market import get_market_kline_writer
             writer = get_market_kline_writer()
             rows = writer.query(
-                "CNStock", db_symbol, "15m",
-                start_time=None, end_time=None, limit=1,
-            )
-        except Exception:
-            return False
-
-        if not rows:
-            return False
-
-        last_dt = rows[-1].get("time")
-        if not isinstance(last_dt, datetime):
-            return False
-
-        last_date_str = last_dt.strftime("%Y-%m-%d")
-        last_hm = last_dt.hour * 60 + last_dt.minute
-
-        # 最后一条必须是 15:00 收盘 bar
-        if last_hm < 15 * 60:
-            return False
-
-        # 判断最后 bar 的日期是否匹配
-        if is_trading_day(today_str):
-            if t > dtime(15, 1):
-                # 盘后 → 必须是今日
-                return last_date_str == today_str
-            else:
-                # 盘前 → 必须是前一交易日
-                return last_date_str == prev_trading_day(today_str)
-        else:
-            # 非交易日 → 必须是最近交易日
-            return last_date_str == prev_trading_day(today_str)
-
-    def _read_db_15m(self, symbol: str, limit: int) -> List[Dict[str, Any]]:
-        """从 DB 读取 15m K 线，按时间升序返回（最多 limit 条）。"""
-        db_symbol = strip_market_prefix(symbol) if symbol else symbol
-        try:
-            from app.utils.db_market import get_market_kline_writer
-            writer = get_market_kline_writer()
-            rows = writer.query(
-                "CNStock", db_symbol, "15m",
+                "CNStock", db_symbol, "1m",
                 start_time=None, end_time=None, limit=limit,
             )
         except Exception:
@@ -643,14 +610,32 @@ class CNStockDataSource(BaseDataSource):
             })
         return bars
 
+    def _fetch_intraday_remote(
+        self, symbol: str, tf: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        """单股从远端获取分钟级 K 线（DB 无数据时的 fallback）。"""
+        coord_result = get_coordinator().coordinate_kline(
+            symbol=symbol,
+            timeframe=tf,
+            limit=limit,
+            market="CNStock",
+            timeout=20,
+        )
+        bars = coord_result.get("bars", []) if coord_result else []
+        if bars:
+            bars = unadj_to_qfq(bars, symbol)
+        return bars
+
     @staticmethod
-    def _aggregate_from_15m(
+    def _aggregate_from_1m(
         bars: List[Dict[str, Any]], bar_count: int,
     ) -> List[Dict[str, Any]]:
-        """将 15m bar 按日期和固定数量聚合为更大周期。
+        """将 1m bar 按日期和固定数量聚合为更大周期。
 
-        bar_count: 每组 15m bar 数（30m=2, 1h=4, 2h=8, 4h=16）
         按日期分组后，每 bar_count 根合并为一根。
+        注意: 1m 有 ±1 根/天容差，按日期分组比按数量分组更稳（规避缺 bar 偏移）。
+
+        bar_count: 每组 1m bar 数（5m=5, 15m=15, 30m=30, 1h=60, 2h=120, 4h=240）
         """
         if not bars or bar_count <= 1:
             return bars
