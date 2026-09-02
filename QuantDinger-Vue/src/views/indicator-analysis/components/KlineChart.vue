@@ -74,11 +74,6 @@
         </div>
         <div class="kline-chart-with-pct" :class="{ 'kline-chart-with-pct--chip': showChip }">
           <div
-            ref="pctAxisRef"
-            class="pct-axis-overlay"
-            :class="{ 'pct-axis-overlay--dark': chartTheme === 'dark' }"
-          ></div>
-          <div
             id="kline-chart-container"
             class="kline-chart-container"
           ></div>
@@ -256,7 +251,6 @@ export default {
     let _resizeRafId = null
 
     const wmCanvasRef = ref(null)
-    const pctAxisRef = ref(null)
     const chipCanvasRef = ref(null)
     const chipOverlayRef = ref(null)
     let _chipPaneObserver = null
@@ -2726,6 +2720,30 @@ registerOverlay({
     }
 
     /**
+     * 把主图 Y 轴恢复为自动计算刻度。
+     * klinecharts 一旦手动缩放过 Y 轴，autoCalcTickFlag 永久为 false，
+     * 换股/换周期后新数据会被塞进旧的手动范围，无法最大化填充窗口；
+     * 官方交互是双击右轴复位，这里走内部实例等价复位（版本锁定 9.8.x，带降级保护）。
+     */
+    const resetYAxisToAuto = () => {
+      const chart = chartRef.value
+      if (!chart) return
+      try {
+        const pane = chart._candlePane
+        const axis = pane && typeof pane.getAxisComponent === 'function' ? pane.getAxisComponent() : null
+        if (axis && typeof axis.setAutoCalcTickFlag === 'function' && axis.getAutoCalcTickFlag() === false) {
+          axis.setAutoCalcTickFlag(true)
+          if (typeof chart.adjustPaneViewport === 'function') {
+            chart.adjustPaneViewport(false, true, true, true)
+          }
+        }
+      } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
+    }
+
+    /** 换股后下一次数据加载：视口回归默认（barSpace 复位），保证数据最大化填充窗口 */
+    let _resetViewportOnNextLoad = false
+
+    /**
      * 分时图数据处理：
      * 1. 使用1m数据
      * 2. 只保留当天从9:30开始的数据
@@ -3081,6 +3099,16 @@ registerOverlay({
                 chartRef.value.applyNewData(validData)
               }
 
+              // Y 轴复位为自动贴合：手动缩放状态不清除会让新数据卡在旧范围里
+              resetYAxisToAuto()
+              // 换股场景：X 视口回归默认缩放（滚动到最新由外部 600ms 兼容逻辑负责）
+              if (_resetViewportOnNextLoad) {
+                _resetViewportOnNextLoad = false
+                if (!isMinuteLine.value && typeof chartRef.value.setBarSpace === 'function') {
+                  try { chartRef.value.setBarSpace(8) } catch (_) { /* 预期内 */ }
+                }
+              }
+
               // 分时图模式：应用面积图样式
               if (isMinuteLine.value) {
                 applyMinuteLineChartStyle()
@@ -3245,7 +3273,6 @@ registerOverlay({
                 // 计算新的可见范围索引
                 // 原来看的是索引 from 到 to 的数据，现在这些数据的索引变成了 from + newDataCount 到 to + newDataCount
                 const newFrom = savedVisibleRange.from + newDataCount
-                const newTo = savedVisibleRange.to + newDataCount
 
                 // P1-4: 用 nextTick 替代「赌 50ms 渲染完成」——渲染完成即执行，不再依赖固定延时
                 const _scrollSymbol = props.symbol
@@ -3254,12 +3281,8 @@ registerOverlay({
                   if (props.symbol !== _scrollSymbol) return
                   if (!chartRef.value) return
                   try {
-                    // 尝试使用 scrollToDataIndex 方法（如果存在）
                     if (typeof chartRef.value.scrollToDataIndex === 'function') {
                       chartRef.value.scrollToDataIndex(newFrom)
-                    } else if (typeof chartRef.value.setVisibleRange === 'function') {
-                      // 使用 setVisibleRange 设置可见范围（参数是数据索引）
-                      chartRef.value.setVisibleRange(newFrom, newTo)
                     }
                   } catch (e) {
                     // P1-3: 恢复滚动位置属增强逻辑，失败不影响主流程，但需留痕
@@ -3294,82 +3317,6 @@ registerOverlay({
         await loadingHistoryPromise
       } catch (err) {
         // 错误已经在内部的 catch 中处理，这里只是确保 Promise 完成
-      }
-    }
-
-    // 加载更多历史数据（保留原有函数，用于其他场景）
-    const loadMoreHistoryData = async () => {
-      if (!props.symbol || !klineData.value || klineData.value.length === 0) {
-        return
-      }
-
-      // 分时模式下不加载历史数据
-      if (isMinuteLine.value) {
-        return
-      }
-
-      if (loadingHistory.value || !hasMoreHistory.value) {
-        return
-      }
-
-      loadingHistory.value = true
-
-      try {
-        // 获取当前最早的数据时间（转换为秒级用于 API）
-        const earliestTimestamp = klineData.value[0].timestamp
-        const earliestTime = Math.floor(earliestTimestamp / 1000) // 转换为秒级
-        const response = await request({
-          url: '/api/indicator/kline',
-          method: 'get',
-          params: {
-            market: props.market,
-            symbol: props.symbol,
-            timeframe: isMinuteLine.value ? '1m' : props.timeframe,
-            limit: 1000,
-            before_time: earliestTime // 获取此时间之前的数据
-          }
-        })
-
-        if (response.code === 1 && response.data && Array.isArray(response.data)) {
-          const newData = formatKlineData(response.data)
-
-          if (newData.length === 0) {
-            // 没有更多数据了
-            hasMoreHistory.value = false
-            loadingHistory.value = false
-            return
-          }
-
-          // 确保新数据的时间早于现有最早数据
-          const filteredNewData = newData.filter(item => item.timestamp < earliestTimestamp)
-
-          if (filteredNewData.length === 0) {
-            // 没有更早的数据了
-            hasMoreHistory.value = false
-            loadingHistory.value = false
-            return
-          }
-
-          // 将新数据插入到现有数据的前面
-          klineData.value = [...filteredNewData, ...klineData.value]
-
-          // 更新图表
-          nextTick(() => {
-            if (chartRef.value) {
-              chartRef.value.applyNewData(klineData.value)
-              updateIndicators()
-            }
-          })
-        } else {
-          // API返回错误，但不一定表示没有更多数据，可能是网络问题
-          // 不设置 hasMoreHistory = false，允许用户重试
-        }
-      } catch (err) {
-        // 加载失败可能是网络问题，不应该立即认为没有更多数据
-        // 只有在明确知道没有更早数据时才设置 hasMoreHistory = false
-        // 这里不设置，允许用户重试
-      } finally {
-        loadingHistory.value = false
       }
     }
 
@@ -3606,9 +3553,9 @@ registerOverlay({
         // 直接用最后两根算价格，避免 convertToInternalFormat 遍历全部 500 根
         updatePricePanelFromLastBars(arr)
 
-        // 如果价格超出当前可见范围，刷新百分比轴
+        // 如果价格超出当前可见范围，刷新筹码覆盖层
         if (bar.high > lastBar.high || bar.low < lastBar.low) {
-          renderPctAxis(); renderChip()
+          renderChip()
         }
 
         // 合并到 rAF 再刷新图表（如果 WS tick 1秒来多次，只刷最后一次）
@@ -3633,7 +3580,7 @@ registerOverlay({
         }
         // 新K线产生时立即刷新指标
         maybeUpdateIndicators(true)
-        renderPctAxis(); renderChip()
+        renderChip()
       }
     }
 
@@ -3948,26 +3895,11 @@ registerOverlay({
               // 如果正在加载历史数据，且用户尝试继续向左滚动，阻止滚动
               if (loadingHistory.value && data.from <= 0) {
                 // 尝试将可见范围保持在第一个数据点之后，防止继续向左
-                try {
-                  if (chartRef.value && typeof chartRef.value.setVisibleRange === 'function') {
-                    const dataLength = klineData.value.length
-                    if (dataLength > 0) {
-                      // 获取当前可见范围
-                      const currentRange = chartRef.value.getVisibleRange()
-                      if (currentRange) {
-                        // 计算可见的数据条数
-                        const visibleCount = Math.ceil((currentRange.to - currentRange.from) * dataLength / 100)
-                        // 设置新的可见范围，从第一个数据点开始（索引0对应0%，但我们要稍微向右一点）
-                        // 使用百分比：第一个数据点大约是 0%，我们设置为 0.1% 来防止继续向左
-                        const minFrom = 0.1
-                        const newTo = Math.min(100, minFrom + (visibleCount / dataLength * 100))
-                        chartRef.value.setVisibleRange(minFrom, newTo)
-                      }
-                    }
+                  try {
+                    // 换股/重载后 Y 轴已复位为自动，无需再干预可见范围
+                  } catch (e) {
                   }
-                } catch (e) {
-                }
-                return
+                  return
               }
 
               // 当滚动到最左侧（索引接近0或小于等于5）时触发加载
@@ -3988,15 +3920,10 @@ registerOverlay({
 
               // 更新上一次的可见范围
               lastVisibleFrom = data.from
-              renderPctAxis(); renderChip()
+              renderChip()
             }
           })
         }
-
-        // ── 拖拽到边界后变缩放 ──
-        // 当 hasMoreHistory=false 且用户继续往左拖，或拖到数据最右端时，
-        // 把拖拽平移量转为 setVisibleRange 缩放（缩窄可见K线数量，等效于放大）
-        _attachBoundaryDragZoom()
 
         // 如果有数据，应用数据
         if (klineData.value && klineData.value.length > 0) {
@@ -4025,7 +3952,7 @@ registerOverlay({
             // 延迟更新指标，确保K线先渲染
             nextTick(() => {
               updateIndicators()
-              renderPctAxis(); renderChip()
+              renderChip()
             })
           }
         }
@@ -4046,7 +3973,7 @@ registerOverlay({
           if (chartRef.value) {
             try {
               chartRef.value.resize()
-              renderPctAxis(); renderChip()
+              renderChip()
               // 分时模式：绘图区宽度变化后重新铺满（X 轴保持覆盖整个交易时段）
               if (isMinuteLine.value) fitMinuteLineView()
             } catch (e) {
@@ -5371,161 +5298,6 @@ registerOverlay({
       }
     }
 
-    // ── 边界拖拽变缩放：核心逻辑 ──
-    const _applyBoundaryDragZoom = (deltaX) => {
-      const chart = chartRef.value
-      if (!chart) return
-      const range = chart.getVisibleRange()
-      if (!range) return
-      // klinecharts v9 getVisibleRange 返回的是百分比 (0-100)
-      const fromPct = range.from
-      const toPct = range.to
-      const dataLen = klineData.value.length
-      if (dataLen <= 1) return
-
-      // 把像素拖拽量转换为 K 线根数
-      const container = document.getElementById('kline-chart-container')
-      if (!container) return
-      const containerWidth = container.clientWidth || 1
-      const visibleBars = Math.max(1, Math.round((toPct - fromPct) / 100 * dataLen))
-      const barSpacing = containerWidth / visibleBars
-      const deltaBars = Math.round(-deltaX / barSpacing)
-
-      if (deltaBars === 0) return
-
-      // 从拖拽起始的可见范围开始计算（避免累积误差）
-      const baseFromPct = _bdDragStartFromPct
-      const baseToPct = _bdDragStartToPct
-
-      let newFromPct = baseFromPct
-      let newToPct = baseToPct
-
-      // 往左拖（deltaX > 0, deltaBars > 0）→ 到左边界了 → 右边界左移（缩窄）
-      // 往右拖（deltaX < 0, deltaBars < 0）→ 到右边界了 → 左边界右移（缩窄）
-      if (deltaBars > 0) {
-        newToPct = Math.max(baseFromPct + 1, baseToPct - deltaBars / dataLen * 100)
-      } else {
-        newFromPct = Math.min(baseToPct - 1, baseFromPct - deltaBars / dataLen * 100)
-      }
-
-      // 最小可见 5 根 K 线
-      const minPct = 5 / dataLen * 100
-      if ((newToPct - newFromPct) < minPct) return
-
-      newFromPct = Math.max(0, newFromPct)
-      newToPct = Math.min(100, newToPct)
-      if (newToPct <= newFromPct) return
-
-      // 转为数据索引（klinecharts v9 setVisibleRange 接受 { from, to } 数据索引）
-      const fromIdx = Math.max(0, Math.round(newFromPct / 100 * dataLen))
-      const toIdx = Math.min(dataLen - 1, Math.round(newToPct / 100 * dataLen))
-      if (toIdx <= fromIdx) return
-
-      try {
-        if (typeof chart.setVisibleRange === 'function') {
-          chart.setVisibleRange({ from: fromIdx, to: toIdx })
-        }
-      } catch (e) {
-        // 静默失败
-      }
-    }
-
-    let _bdDragging = false
-    let _bdStartX = null
-    let _bdStartFromPct = 0
-    let _bdStartToPct = 0
-    // 拖拽起始时的可见范围百分比（用于缩放计算）
-    let _bdDragStartFromPct = 0
-    let _bdDragStartToPct = 0
-
-    const _attachBoundaryDragZoom = () => {
-      const container = document.getElementById('kline-chart-container')
-      if (!container) return
-
-      const onMouseDown = (e) => {
-        // 只处理左键拖拽
-        if (e.button !== 0) return
-        const chart = chartRef.value
-        if (!chart) return
-
-        _bdDragging = false
-        _bdStartX = e.clientX
-
-        // 记录当前可见范围
-        try {
-          const range = chart.getVisibleRange()
-          if (range) {
-            _bdStartFromPct = range.from
-            _bdStartToPct = range.to
-            _bdDragStartFromPct = range.from
-            _bdDragStartToPct = range.to
-          }
-        } catch (_) { /* 预期内：拖拽起始状态读取失败，忽略本次手势 */ }
-      }
-
-      const onMouseMove = (e) => {
-        // 分时模式锁定视图，边界拖拽缩放不参与
-        if (isMinuteLine.value) return
-        if (_bdStartX === null && !_bdDragging) return
-        const chart = chartRef.value
-        if (!chart) return
-
-        const deltaX = e.clientX - _bdStartX
-        if (Math.abs(deltaX) < 3) return
-
-        // 判断当前是否在边界
-        try {
-          const range = chart.getVisibleRange()
-          if (!range) return
-          const dataLen = klineData.value.length
-          if (dataLen <= 0) return
-
-          // from ≈ 0 表示已到左边界（数据最左侧）
-          const atLeftBoundary = range.from <= 0.5
-          // to ≈ 100 表示已到右边界（数据最右侧）
-          const atRightBoundary = range.to >= 99.5
-
-          // 是否在可拖拽方向的边界上
-          // 往左拖（deltaX > 0）且到左边界 → 且没有更多历史 → 转缩放
-          // 往右拖（deltaX < 0）且到右边界 → 转缩放
-          const atBoundary = (deltaX > 0 && atLeftBoundary && !hasMoreHistory.value) ||
-                             (deltaX < 0 && atRightBoundary)
-
-          if (atBoundary) {
-            // 进入边界缩放模式
-            if (!_bdDragging) {
-              _bdDragging = true
-              // 记录拖拽起始的可见范围（用于计算缩放量）
-              _bdDragStartFromPct = _bdStartFromPct
-              _bdDragStartToPct = _bdStartToPct
-            }
-            _applyBoundaryDragZoom(deltaX)
-          } else if (_bdDragging) {
-            // 离开边界（比如数据加载完成了），退出缩放模式
-            _bdDragging = false
-          }
-        } catch (_) { /* 预期内：拖拽结束状态复位失败，忽略 */ }
-      }
-
-      const onMouseUp = () => {
-        _bdDragging = false
-        _bdStartX = null
-      }
-
-      container.addEventListener('mousedown', onMouseDown, { passive: true })
-      window.addEventListener('mousemove', onMouseMove, { passive: true })
-      window.addEventListener('mouseup', onMouseUp, { passive: true })
-
-      // 保存引用用于清理
-      _bdCleanup = () => {
-        container.removeEventListener('mousedown', onMouseDown)
-        window.removeEventListener('mousemove', onMouseMove)
-        window.removeEventListener('mouseup', onMouseUp)
-      }
-    }
-
-    let _bdCleanup = null
-
     const handleRetry = () => {
       loadKlineData()
     }
@@ -5544,8 +5316,9 @@ registerOverlay({
     /** 切换股票时自动适配：加载完成后滚动到最新并适配Y轴，仅执行一次 */
     watch(() => props.symbol, (newVal, oldVal) => {
       if (newVal && newVal !== oldVal) {
-        // 标的变化后旧现场无意义，全部作废
+        // 标的变化后旧现场无意义，全部作废；视口回归默认让新数据最大化填充窗口
         _tfSceneMap = {}
+        _resetViewportOnNextLoad = true
         debouncedLoad()
         // P1-1: 原先此处 1500ms 后再拉一次筹码，与 loadKlineData() 内部调用重复（一次切换请求 3 次），已移除
         // P0-2: 捕获切换后的目标 symbol，供下方自动适配回调比对
@@ -5620,7 +5393,6 @@ registerOverlay({
         if (chartRef.value && typeof chartRef.value.resize === 'function') {
           chartRef.value.resize()
         }
-        renderPctAxis()
         renderChip()
       })
     })
@@ -5666,7 +5438,7 @@ registerOverlay({
               }
             }
             _ensureWmLayer()
-            renderPctAxis(); renderChip()
+            renderChip()
           })
         })
         chartResizeObserver.observe(el)
@@ -5722,75 +5494,6 @@ registerOverlay({
       }
       ctx.restore()
       ctx.restore()
-    }
-
-    // ── 百分比 Y 轴（左侧叠加层）──
-    // 在 K 线图左侧叠加一个半透明的百分比刻度，价格仍在右侧显示
-    const _pctAxisRafId = ref(null)
-
-    const renderPctAxis = () => {
-      if (_pctAxisRafId.value != null) return // 节流：同一帧内只渲染一次
-      _pctAxisRafId.value = requestAnimationFrame(() => {
-        _pctAxisRafId.value = null
-        _doRenderPctAxis()
-      })
-    }
-
-    const _doRenderPctAxis = () => {
-      const el = pctAxisRef.value
-      const chart = chartRef.value
-      if (!el || !chart) return
-
-      const container = document.getElementById('kline-chart-container')
-      if (!container) return
-      const containerW = container.clientWidth
-      const containerH = container.clientHeight
-      if (containerW <= 0 || containerH <= 0) return
-
-      // 获取可见 K 线的价格范围
-      const data = klineData.value
-      if (!data || data.length === 0) { el.innerHTML = ''; return }
-
-      const range = chart.getVisibleRange()
-      if (!range) { el.innerHTML = ''; return }
-
-      // klinecharts v9.8.0 的 getVisibleRange() 返回的是数据索引（整数），不是百分比
-      const dataLen = data.length
-      const fromIdx = Math.max(0, range.from)
-      const toIdx = Math.min(dataLen - 1, range.to)
-      if (fromIdx >= toIdx) { el.innerHTML = ''; return }
-
-      // 计算可见区间的最高价和最低价
-      let visHigh = -Infinity
-      let visLow = Infinity
-      for (let i = fromIdx; i <= toIdx; i++) {
-        const bar = data[i]
-        if (bar.high > visHigh) visHigh = bar.high
-        if (bar.low < visLow) visLow = bar.low
-      }
-      if (visHigh <= visLow) { el.innerHTML = ''; return }
-
-      // 参考价：可见区间的最低价（所有百分比相对它计算）
-      const refPrice = visLow
-      const priceRange = visHigh - visLow
-
-      // 计算刻度数量（和右侧 klinecharts 的 Y 轴刻度对齐）
-      // klinecharts 默认大约 6-8 个刻度
-      const tickCount = 7
-      const labels = []
-      for (let i = 0; i <= tickCount; i++) {
-        const ratio = i / tickCount
-        const price = visLow + priceRange * ratio
-        const pct = ((price - refPrice) / refPrice) * 100
-        const y = containerH * (1 - ratio) // 从底部到顶部
-        labels.push({ y, pct })
-      }
-
-      // 渲染
-      el.innerHTML = labels.map(l => {
-        const sign = l.pct >= 0 ? '+' : ''
-        return `<div class="pct-tick" style="top:${l.y}px">${sign}${l.pct.toFixed(2)}%</div>`
-      }).join('')
     }
 
     // ═══════════════════════════════════════════
@@ -5967,6 +5670,16 @@ registerOverlay({
       }
       if (visHigh <= visLow) return
 
+      // 价格 → 主图像素 Y：走 klinecharts 的 Y 轴换算，
+      // 天然对齐右轴（含上下留白、百分比/价格模式、缩放状态），不再用自算线性映射
+      const priceToY = (price) => {
+        try {
+          const c = chart.convertToPixel([{ value: price }], { paneId: 'candle_pane' })
+          const coord = Array.isArray(c) ? c[0] : c
+          return coord && coord.y != null && isFinite(coord.y) ? coord.y : null
+        } catch (_) { return null }
+      }
+
       // 筹码图显示区域：占满整个副图宽度
       const padding = 4
       const maxBarWidth = w - padding * 2
@@ -5984,7 +5697,8 @@ registerOverlay({
       const priceStep = (visHigh - visLow) / 5
       for (let i = 0; i <= 5; i++) {
         const price = visLow + priceStep * i
-        const y = h - ((price - visLow) / (visHigh - visLow)) * h
+        const y = priceToY(price)
+        if (y == null) continue
         ctx.beginPath()
         ctx.moveTo(0, y)
         ctx.lineTo(w, y)
@@ -5996,9 +5710,10 @@ registerOverlay({
       for (let i = 0; i < prices.length; i++) {
         const price = prices[i]
         const d = density[i]
-        if (price < visLow || price > visHigh || d <= 0) continue
+        if (d <= 0) continue
 
-        const y = h - ((price - visLow) / (visHigh - visLow)) * h
+        const y = priceToY(price)
+        if (y == null || y < -barHeight || y > h + barHeight) continue
         const barWidth = d * maxBarWidth
         const color = price <= currentPrice ? profitColor : lossColor
 
@@ -6007,35 +5722,39 @@ registerOverlay({
       }
 
       // 平均成本线
-      if (avgCost >= visLow && avgCost <= visHigh) {
-        const avgY = h - ((avgCost - visLow) / (visHigh - visLow)) * h
-        ctx.strokeStyle = avgCostColor
-        ctx.lineWidth = 1.5
-        ctx.setLineDash([4, 3])
-        ctx.beginPath()
-        ctx.moveTo(0, avgY)
-        ctx.lineTo(w, avgY)
-        ctx.stroke()
-        ctx.setLineDash([])
+      {
+        const avgY = priceToY(avgCost)
+        if (avgY != null && avgY >= 0 && avgY <= h) {
+          ctx.strokeStyle = avgCostColor
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([4, 3])
+          ctx.beginPath()
+          ctx.moveTo(0, avgY)
+          ctx.lineTo(w, avgY)
+          ctx.stroke()
+          ctx.setLineDash([])
 
-        // AVG 标签
-        ctx.fillStyle = avgCostColor
-        ctx.font = 'bold 10px sans-serif'
-        ctx.textAlign = 'left'
-        ctx.fillText(`AVG ${avgCost.toFixed(2)}`, padding, avgY - 4)
+          // AVG 标签
+          ctx.fillStyle = avgCostColor
+          ctx.font = 'bold 10px sans-serif'
+          ctx.textAlign = 'left'
+          ctx.fillText(`AVG ${avgCost.toFixed(2)}`, padding, avgY - 4)
+        }
       }
 
       // 当前价格线
-      if (currentPrice >= visLow && currentPrice <= visHigh) {
-        const curY = h - ((currentPrice - visLow) / (visHigh - visLow)) * h
-        ctx.strokeStyle = isDark ? '#1890ff' : '#1890ff'
-        ctx.lineWidth = 1
-        ctx.setLineDash([2, 2])
-        ctx.beginPath()
-        ctx.moveTo(0, curY)
-        ctx.lineTo(w, curY)
-        ctx.stroke()
-        ctx.setLineDash([])
+      {
+        const curY = priceToY(currentPrice)
+        if (curY != null && curY >= 0 && curY <= h) {
+          ctx.strokeStyle = isDark ? '#1890ff' : '#1890ff'
+          ctx.lineWidth = 1
+          ctx.setLineDash([2, 2])
+          ctx.beginPath()
+          ctx.moveTo(0, curY)
+          ctx.lineTo(w, curY)
+          ctx.stroke()
+          ctx.setLineDash([])
+        }
       }
     }
 
@@ -6093,11 +5812,9 @@ registerOverlay({
         chartResizeObserver.disconnect()
         chartResizeObserver = null
       }
-      if (_bdCleanup) { _bdCleanup(); _bdCleanup = null }
       if (_chipRafId != null) { cancelAnimationFrame(_chipRafId); _chipRafId = null }
       if (_chipPaneObserver) { _chipPaneObserver.disconnect(); _chipPaneObserver = null }
       _chipData = null
-      if (_pctAxisRafId.value != null) { cancelAnimationFrame(_pctAxisRafId.value); _pctAxisRafId.value = null }
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
       // 清理分时图交互禁用事件处理器
@@ -6120,7 +5837,6 @@ registerOverlay({
       themeConfig,
       isMinuteLine,
       wmCanvasRef,
-      pctAxisRef,
       chipCanvasRef,
       chipOverlayRef,
       chipDataForTemplate,
@@ -6133,7 +5849,6 @@ registerOverlay({
       updatePricePanel,
       isSameTimeframe,
       loadKlineData,
-      loadMoreHistoryData,
       updateKlineRealtime,
       startRealtime,
       stopRealtime,
@@ -6141,7 +5856,6 @@ registerOverlay({
       handleResize,
       updateChartTheme,
       updateIndicators,
-      renderPctAxis,
       renderChip,
       fetchChipData,
       executePythonStrategy,
@@ -6698,36 +6412,6 @@ registerOverlay({
   width: 100%;
   height: 100%;
   display: block;
-}
-
-.pct-axis-overlay {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 58px;
-  height: 100%;
-  z-index: 5;
-  pointer-events: none;
-  overflow: hidden;
-  display: none; /* 隐藏百分比刻度，避免与右侧筹码图冲突 */
-}
-
-.pct-tick {
-  position: absolute;
-  left: 4px;
-  transform: translateY(-50%);
-  font-size: 10px;
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  color: rgba(100, 116, 139, 0.7);
-  white-space: nowrap;
-  line-height: 1;
-  text-shadow: 0 0 3px #fff, 0 0 6px #fff;
-}
-
-.pct-axis-overlay--dark .pct-tick {
-  color: rgba(148, 163, 184, 0.6);
-  text-shadow: 0 0 3px #141414, 0 0 6px #141414;
 }
 
 .chart-overlay {
