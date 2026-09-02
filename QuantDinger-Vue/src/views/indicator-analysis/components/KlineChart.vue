@@ -252,6 +252,8 @@ export default {
     /** 父容器高度变化（如指标 IDE 拖拽分割条）不会触发 window.resize，需 ResizeObserver 调 chart.resize */
     let chartResizeObserver = null
     let chartResizeRafId = null
+    /** handleResize 的 rAF 句柄（P1-4：替代固定 100ms 延时做防抖，与项目内其他 resize 一致） */
+    let _resizeRafId = null
 
     const wmCanvasRef = ref(null)
     const pctAxisRef = ref(null)
@@ -262,6 +264,23 @@ export default {
     let _wmObserver = null
     let _chipData = null // { prices, density, avg_cost, current_price }
     let _chipRafId = null
+
+    /** 组件是否已卸载：用于阻断延迟回调在卸载后继续操作/重建图表（P0-1 修复） */
+    let _isUnmounted = false
+    /** 统一收纳所有 setTimeout，供 onBeforeUnmount 一次性清理（P0-1 修复） */
+    const _timers = new Set()
+    /** 统一收纳等待容器尺寸的 ResizeObserver，供 onBeforeUnmount 一次性断开（冗余修复） */
+    const _observers = new Set()
+    /** 受管 setTimeout：回调执行后自动移出集合；组件卸载时统一清除，
+     *  避免卸载后回调仍操作已销毁的 chartRef，或在已卸载组件上重建图表（孤儿实例） */
+    const safeTimeout = (fn, delay) => {
+      const id = setTimeout(() => {
+        _timers.delete(id)
+        fn()
+      }, delay)
+      _timers.add(id)
+      return id
+    }
 
     // 实时更新设置
     const realtimeTimer = ref(null)
@@ -829,28 +848,37 @@ export default {
           opacity: '0.6',
           transition: 'opacity 0.15s, color 0.15s'
         })
-        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; btn.style.color = '#f5222d' })
-        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.6'; btn.style.color = '#999' })
+        // 冗余修复：用 AbortController 统一解绑 3 个监听（原先无 remove，只能等元素移除后被动回收）
+        const ac = new AbortController()
+        const opts = { signal: ac.signal }
+        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; btn.style.color = '#f5222d' }, opts)
+        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.6'; btn.style.color = '#999' }, opts)
         btn.addEventListener('click', (e) => {
           e.stopPropagation()
           removeIndicatorInstance({ id: indicatorId, instanceId: instanceId || indicatorId })
-        })
+        }, opts)
         paneContainer.appendChild(btn)
-        paneCloseButtons.set(paneId, btn)
-      } catch (e) { /* ignore */ }
+        // 同时保存按钮与其 controller，移除时一并 abort 解绑
+        paneCloseButtons.set(paneId, { el: btn, ac })
+      } catch (e) { /* 预期内失败：pane 容器可能已被销毁 */ }
     }
 
     const removePaneCloseButton = (paneId) => {
-      const btn = paneCloseButtons.get(paneId)
-      if (btn) {
-        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* ignore */ }
+      const item = paneCloseButtons.get(paneId)
+      if (item) {
+        // 冗余修复：先显式解绑监听，再移除 DOM
+        item.ac.abort()
+        const btn = item.el
+        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* 预期内：节点可能已不存在 */ }
         paneCloseButtons.delete(paneId)
       }
     }
 
     const removeAllPaneCloseButtons = () => {
-      paneCloseButtons.forEach((btn, paneId) => {
-        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* ignore */ }
+      paneCloseButtons.forEach((item) => {
+        item.ac.abort()
+        const btn = item.el
+        try { btn.parentNode && btn.parentNode.removeChild(btn) } catch (e) { /* 预期内：节点可能已不存在 */ }
       })
       paneCloseButtons.clear()
     }
@@ -1098,24 +1126,45 @@ export default {
     }
 
     // ========== Python 执行引擎 ==========
+    /**
+     * 等待 Pyodide 就绪（P1-5 修复）
+     * 原实现为 while + 500ms sleep 轮询空转（最多 30 次 = 15 秒），每 500ms 才检查一次状态，
+     * 加载完成时最多要空等 500ms，且整条调用链被阻塞、无法取消。
+     * 改为事件驱动：就绪/失败信号一到即刻返回，只在超时候底时依赖定时器。
+     */
+    const waitForPyodide = (timeoutMs = 15000) => {
+      // 已就绪 → 立即返回，不进入等待
+      if (pythonReady.value && pyodide.value) return Promise.resolve(true)
+      // 已明确失败、或根本没在加载 → 无需等待（保持原逻辑：直接进入失败分支）
+      if (pyodideLoadFailed.value || !loadingPython.value) return Promise.resolve(false)
+      return new Promise((resolve) => {
+        let settled = false
+        const finish = (ok) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          stopWatch()
+          resolve(ok)
+        }
+        // 事件驱动：就绪信号到达即结束；加载失败或中止同样立即结束，不再空转
+        const stopWatch = watch(
+          () => [pythonReady.value, !!pyodide.value, pyodideLoadFailed.value, loadingPython.value],
+          ([ready, py, failed, loading]) => {
+            if (ready && py) finish(true)
+            else if (failed || !loading) finish(false)
+          }
+        )
+        const timer = safeTimeout(() => finish(false), timeoutMs)
+      })
+    }
+
     const executePythonStrategy = async (userCode, klineData, params = {}, indicatorInfo = {}) => {
       if (!pythonReady.value || !pyodide.value) {
-        // 如果正在加载，等待一段时间后重试
-        if (loadingPython.value) {
-          // 等待最多 15 秒（30次 * 500ms）
-          let waitCount = 0
-          while (loadingPython.value && waitCount < 30) {
-            await new Promise(resolve => setTimeout(resolve, 500))
-            waitCount++
-            // 如果加载完成，退出循环
-            if (pythonReady.value && pyodide.value) {
-              break
-            }
-          }
-        }
+        // P1-5: 事件驱动等待（替代 while + 500ms 轮询空转），最多 15 秒
+        const ready = await waitForPyodide(15000)
 
         // 如果仍然未就绪，检查是否加载失败
-        if (!pythonReady.value || !pyodide.value) {
+        if (!ready) {
           // 如果不在加载中，说明加载失败或超时
           if (!loadingPython.value) {
             pyodideLoadFailed.value = true
@@ -2167,9 +2216,83 @@ registerOverlay({
     let _minuteRangeChangeCallback = null
     /** 分时图模式下添加的 VWAP 指标 paneId */
     let _vwapPaneId = null
+    /** 铺满视图计算中的重入保护（铺满过程会连续触发多次可见范围事件） */
+    let _minuteFitting = false
+
+    /**
+     * 分时图模式：把全部数据铺满绘图区，X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00）。
+     * 通过可见范围自校准绘图区宽度：plotWidth ≈ (to - from + 1) × barSpace，
+     * 据此换算出铺满全部数据所需的 barSpace，再滚动到最左侧。
+     * 注意：setBarSpace / scrollToDataIndex 依赖滚动能力，必须在 setScrollEnabled(false) 之前执行。
+     */
+    const fitMinuteLineView = () => {
+      const chart = chartRef.value
+      if (!chart || _minuteFitting) return
+      _minuteFitting = true
+      try {
+        const dataList = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
+        const count = dataList.length
+        if (!count) return
+        // 铺满与滚动需要滚动能力，先临时恢复（finally 中统一关闭）
+        if (typeof chart.setScrollEnabled === 'function') chart.setScrollEnabled(true)
+        // 策略：先把最后一根贴到绘图区右缘（diff=0 基准），
+        // 若 from > 0 说明 barSpace 偏大放不下全部柱子，按可见比例迭代收缩。
+        // klinecharts 的 to 会被钳到 count，因此收敛信号是 from ≤ 0。
+        for (let i = 0; i < 5; i++) {
+          if (typeof chart.scrollToDataIndex === 'function') chart.scrollToDataIndex(count - 1, 0)
+          const range = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
+          if (!range) break
+          if (range.from <= 0) break
+          const barSpace = typeof chart.getBarSpace === 'function' ? chart.getBarSpace() : 0
+          if (!(barSpace > 0) || typeof chart.setBarSpace !== 'function') break
+          chart.setBarSpace(barSpace * (count - range.from) / count)
+        }
+        if (typeof chart.scrollToDataIndex === 'function') chart.scrollToDataIndex(count - 1, 0)
+        _minuteLockedRange = { from: 0, to: count - 1 }
+      } catch (_) {
+        // 预期内：图表未就绪时无法铺满，静默降级
+      } finally {
+        _minuteFitting = false
+        const chart2 = chartRef.value
+        if (chart2 && typeof chart2.setScrollEnabled === 'function') {
+          try { chart2.setScrollEnabled(false) } catch (_) { /* 预期内：版本不支持时依赖事件拦截 */ }
+        }
+      }
+    }
+
+    /**
+     * 分时图模式：锁定主图 Y 轴手势（拖拽/滚轮缩放右轴），保持自动跟随数据。
+     * klinecharts 的 Y 轴手动缩放由 pane 级 axisOptions.scrollZoomEnabled 控制，
+     * 与 setZoomEnabled（X 向缩放）是两套开关。
+     */
+    const lockMinutePaneAxes = () => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.setPaneOptions !== 'function') return
+      try {
+        chart.setPaneOptions({ id: 'candle_pane', axisOptions: { scrollZoomEnabled: false } })
+      } catch (_) { /* 预期内：版本不支持时忽略 */ }
+    }
+
+    /** 恢复主图 Y 轴手势（退出分时时调用） */
+    const unlockMinutePaneAxes = () => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.setPaneOptions !== 'function') return
+      try {
+        chart.setPaneOptions({ id: 'candle_pane', axisOptions: { scrollZoomEnabled: true } })
+      } catch (_) { /* 预期内 */ }
+    }
 
     /** 分时图模式：禁用图表区域的滚轮、触摸和拖拽交互，并锁死可见范围 */
     const disableMinuteInteractions = () => {
+      // klinecharts v9 原生开关：禁拖拽滚动 + 禁缩放（滚轮/触摸捏合）
+      const chart = chartRef.value
+      if (chart) {
+        try {
+          if (typeof chart.setScrollEnabled === 'function') chart.setScrollEnabled(false)
+          if (typeof chart.setZoomEnabled === 'function') chart.setZoomEnabled(false)
+        } catch (_) { /* 预期内：版本不支持时依赖下方事件拦截 */ }
+      }
+
       const container = document.getElementById('kline-chart-container')
       if (!container) return
 
@@ -2222,15 +2345,13 @@ registerOverlay({
       container.addEventListener('touchstart', _minuteTouchStartHandler, { passive: true })
       container.addEventListener('touchmove', _minuteTouchMoveHandler, { passive: false })
 
-      // 通过 klinecharts 回调锁死可见范围：任何范围变化都立即回弹
+      // 兜底锁死可见范围：任何范围变化（applyNewData / resize 等）都立即重新铺满
       if (chartRef.value && typeof chartRef.value.subscribeAction === 'function') {
-        _minuteRangeChangeCallback = (data) => {
-          if (_minuteLockedRange && chartRef.value) {
+        _minuteRangeChangeCallback = () => {
+          if (_minuteLockedRange && !_minuteFitting && chartRef.value && isMinuteLine.value) {
             const current = chartRef.value.getVisibleRange()
-            if (current && (current.from !== _minuteLockedRange.from || current.to !== _minuteLockedRange.to)) {
-              try {
-                chartRef.value.setVisibleRange(_minuteLockedRange.from, _minuteLockedRange.to)
-              } catch (_) {}
+            if (current && (Math.round(current.from) !== _minuteLockedRange.from || Math.round(current.to) !== _minuteLockedRange.to)) {
+              fitMinuteLineView()
             }
           }
         }
@@ -2240,6 +2361,21 @@ registerOverlay({
 
     /** 分时图模式：恢复图表区域的滚轮和触摸交互 */
     const enableMinuteInteractions = () => {
+      // 恢复 klinecharts v9 原生滚动与缩放能力
+      const chart = chartRef.value
+      if (chart) {
+        try {
+          if (typeof chart.setScrollEnabled === 'function') chart.setScrollEnabled(true)
+          if (typeof chart.setZoomEnabled === 'function') chart.setZoomEnabled(true)
+        } catch (_) { /* 预期内：图表可能已销毁 */ }
+      }
+      // 移除范围反弹回调（v9 支持按引用取消订阅）
+      if (chart && _minuteRangeChangeCallback && typeof chart.unsubscribeAction === 'function') {
+        try { chart.unsubscribeAction('onVisibleRangeChange', _minuteRangeChangeCallback) } catch (_) { /* 预期内 */ }
+      }
+      _minuteRangeChangeCallback = null
+      _minuteLockedRange = null
+
       const container = document.getElementById('kline-chart-container')
       if (container) {
         if (_minuteWheelHandler) {
@@ -2259,10 +2395,6 @@ registerOverlay({
           _minuteTouchMoveHandler = null
         }
       }
-      // 清除范围锁定
-      _minuteLockedRange = null
-      // 注意：subscribeAction 的回调无法单独移除，但 _minuteLockedRange 为 null 后回调自动失效
-      _minuteRangeChangeCallback = null
     }
 
     // --- 数据加载相关函数 ---
@@ -2304,7 +2436,10 @@ registerOverlay({
       } catch (e) {
         try {
           chartRef.value.applyNewData(klineData.value)
-        } catch (_) {}
+        } catch (_) {
+          // P1-3: applyNewData 失败会导致图表空白，必须留痕
+          console.warn('[KlineChart] applyNewData 失败，图表可能无法渲染:', _)
+        }
       }
     }
 
@@ -2407,6 +2542,189 @@ registerOverlay({
     /** 是否为分时图模式 */
     const isMinuteLine = computed(() => props.timeframe === '分时')
 
+    // --- 分时线交易时段定义（X 轴固定覆盖整个交易时段）---
+    /** 各市场分时时段（小时分钟用 hour*100+minute 表示）；缺省按 A 股处理 */
+    const MINUTE_LINE_SESSIONS = {
+      cnstock: { start: 930, morningEnd: 1130, afternoonStart: 1300, end: 1500 },
+      hkstock: { start: 930, morningEnd: 1200, afternoonStart: 1300, end: 1600 }
+    }
+
+    const getMinuteLineSession = () => {
+      const m = String(props.market || '').toLowerCase()
+      return MINUTE_LINE_SESSIONS[m] || MINUTE_LINE_SESSIONS.cnstock
+    }
+
+    const minuteDateStr = (ts) => {
+      const d = new Date(ts)
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    }
+
+    /** 为分时真实柱计算累计 VWAP（与 VWAP 内置指标同口径） */
+    const attachMinuteVWAP = (bars) => {
+      let cumulativeVolume = 0
+      let cumulativeTPV = 0
+      bars.forEach(b => {
+        const typicalPrice = (b.high + b.low + b.close) / 3
+        const volume = b.volume || 0
+        cumulativeVolume += volume
+        cumulativeTPV += typicalPrice * volume
+        b.vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : b.close
+      })
+      return bars
+    }
+
+    /**
+     * 分时数据补齐：从最后一根真实柱向后按分钟补齐到当日收盘。
+     * 补齐柱使用前收盘平线 + 零成交量（实时分钟到达后会被逐根替换），
+     * 使 X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00），午休时段自动跳过。
+     * 后端 1m 柱时间戳为结束时间（首柱 09:31，上午末柱 11:30，下午 13:01 - 15:00）。
+     */
+    const padMinuteLineData = (bars) => {
+      if (!bars || bars.length === 0) return bars
+      const session = getMinuteLineSession()
+      const toNum = (d) => d.getHours() * 100 + d.getMinutes()
+      const lastReal = bars[bars.length - 1]
+      const lastNum = toNum(new Date(lastReal.timestamp))
+      // 最后一根未开盘或已在收盘后 → 无法向后补齐，保持原样
+      if (lastNum < session.start || lastNum > session.end) return bars
+
+      const padBars = []
+      let cur = new Date(lastReal.timestamp)
+      for (let guard = 0; guard < 600; guard++) {
+        cur = new Date(cur.getTime() + 60000)
+        const n = toNum(cur)
+        if (n > session.morningEnd && n < session.afternoonStart) {
+          // 跳过午休：对齐到下午开盘分钟，下一轮 +1 分钟得到第一根下午补齐柱
+          cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), Math.floor(session.afternoonStart / 100), session.afternoonStart % 100, 0, 0)
+          continue
+        }
+        if (n > session.end) break
+        // 未来时段占位柱：字段全部 null → klinecharts 对 null 柱不绘制（面积线/蜡烛），
+        // X 轴仍覆盖整个交易时段，价格线自然停在最新真实柱；y 轴极值计算会跳过 null
+        padBars.push({
+          timestamp: cur.getTime(),
+          open: null,
+          high: null,
+          low: null,
+          close: null,
+          volume: 0,
+          vwap: null,
+          __pad: true
+        })
+      }
+      if (padBars.length === 0) return bars
+      return [...bars, ...padBars]
+    }
+
+    /**
+     * 分时模式实时合并：真实柱按时间戳精确替换/追加（剔除旧补齐柱），
+     * 重算 VWAP 并重新补齐到收盘。
+     * 不能走通用时间段合并：补齐柱的时间戳在当前时刻之后，
+     * 通用逻辑会把实时数据判为“更早数据”而直接丢弃。
+     */
+    const mergeMinuteLineRealtime = (newData) => {
+      if (!newData || newData.length === 0) return
+      const todayStr = minuteDateStr(Date.now())
+      const incoming = newData.filter(b => b && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
+      const existingReal = (klineData.value || []).filter(b => !b.__pad && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
+      if (incoming.length === 0 && existingReal.length === 0) return
+
+      const realMap = new Map()
+      existingReal.forEach(b => realMap.set(b.timestamp, b))
+      incoming.forEach(b => realMap.set(b.timestamp, { ...b }))
+      const realBars = attachMinuteVWAP(Array.from(realMap.values()).sort((a, b) => a.timestamp - b.timestamp))
+      const padded = padMinuteLineData(realBars)
+      if (!padded || padded.length === 0) return
+
+      const prev = klineData.value || []
+      // 与上一帧完全一致则直接跳过（避免无意义的重绘）
+      const sameAsPrev = prev.length === padded.length &&
+        prev.every((b, i) => b && b.timestamp === padded[i].timestamp && klineBarSnapshotKey(b) === klineBarSnapshotKey(padded[i]))
+      if (sameAsPrev) return
+
+      klineData.value = padded
+      updatePricePanel(convertToInternalFormat(realBars), { force: true })
+
+      const structureChanged = prev.length !== padded.length ||
+        prev.some((b, i) => !b || b.timestamp !== padded[i].timestamp)
+      if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
+        // 时间轴变化（跨日 / 首次构建）：全量刷新
+        if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
+          try {
+            chartRef.value.applyNewData(padded)
+            maybeUpdateIndicators(true)
+          } catch (_) { /* 预期内：图表未就绪时等待下一轮全量加载 */ }
+        }
+      } else {
+        // 时间轴未变：只替换内容有变化的真实柱（补齐柱全为 null 常量，无需重绘）
+        if (chartRef.value && typeof chartRef.value.updateData === 'function') {
+          for (let i = 0; i < realBars.length; i++) {
+            const p = padded[i]
+            const q = prev[i]
+            if (!q || q.timestamp !== p.timestamp || klineBarSnapshotKey(q) !== klineBarSnapshotKey(p)) {
+              flushRealtimeChartBar({
+                timestamp: p.timestamp,
+                open: p.open,
+                high: p.high,
+                low: p.low,
+                close: p.close,
+                volume: p.volume != null ? p.volume : 0
+              })
+            }
+          }
+        }
+      }
+    }
+
+    /**
+     * 周期切换的图表现场保存 / 恢复 ---
+     * 每个周期的图表现场：barSpace + 右缘可见柱索引（二者完全决定视图位置）。
+     * klinecharts 的可见范围 to = round(diff + count + 0.5)（右侧空位时鍴到 count），
+     * 因此恢复时先归零到右缘基准，再按公式反解 diff 精确滚动。
+     */
+    let _tfSceneMap = {}
+
+    /** 读取当前图表现场（分时为锁定视图，不保存） */
+    const captureChartScene = () => {
+      const chart = chartRef.value
+      if (!chart || isMinuteLine.value) return null
+      if (typeof chart.getVisibleRange !== 'function') return null
+      try {
+        const range = chart.getVisibleRange()
+        let barSpace = typeof chart.getBarSpace === 'function' ? chart.getBarSpace() : 0
+        if (barSpace && typeof barSpace === 'object') barSpace = barSpace.bar
+        const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
+        if (!range || !(barSpace > 0) || !list.length) return null
+        return {
+          barSpace,
+          savedTo: range.to,
+          savedCount: list.length
+        }
+      } catch (_) {
+        return null
+      }
+    }
+
+    /** 恢复指定周期的图表现场；无现场时保持默认视图（最新居右） */
+    const restoreChartScene = (tf) => {
+      const chart = chartRef.value
+      const scene = tf ? _tfSceneMap[tf] : null
+      if (!chart || !scene || !(scene.barSpace > 0) || scene.savedTo == null) return
+      try {
+        const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
+        const count = list.length
+        if (!count) return
+        if (typeof chart.setBarSpace === 'function') chart.setBarSpace(scene.barSpace)
+        if (typeof chart.scrollToDataIndex !== 'function' || typeof chart.scrollByDistance !== 'function') return
+        // 先把最后一根贴右缘（diff=0 基准），再按保存的 to 反解 diff 精确滚动
+        chart.scrollToDataIndex(count - 1, 0)
+        const savedTo = Math.min(Math.max(scene.savedTo, 1), count)
+        const targetDiff = savedTo - count - 0.5
+        const distance = -targetDiff * scene.barSpace
+        if (distance) chart.scrollByDistance(distance, 0)
+      } catch (_) { /* 预期内：数据尚未就绪时放弃本次恢复 */ }
+    }
+
     /**
      * 分时图数据处理：
      * 1. 使用1m数据
@@ -2453,14 +2771,14 @@ registerOverlay({
             // 计算VWAP
             let cumulativeVolume = 0
             let cumulativeTPV = 0
-            return fallbackData.map(item => {
+            return padMinuteLineData(fallbackData.map(item => {
               const typicalPrice = (item.high + item.low + item.close) / 3
               const volume = item.volume || 0
               cumulativeVolume += volume
               cumulativeTPV += typicalPrice * volume
               const vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : item.close
               return { ...item, vwap }
-            })
+            }))
           }
         }
         return []
@@ -2485,7 +2803,8 @@ registerOverlay({
         }
       })
 
-      return result
+      // 补齐到整个交易时段收盘（X 轴固定 9:30 - 15:00 的关键）
+      return padMinuteLineData(result)
     }
 
     /** 设置图表为分时图模式 */
@@ -2493,10 +2812,7 @@ registerOverlay({
       if (!chartRef.value) return
 
       try {
-        // 1. 禁用滚轮和触摸交互
-        disableMinuteInteractions()
-
-        // 2. 设置面积图样式：使用 close 值画面积线（蓝色），K 线柱体全部透明
+        // 1. 设置面积图样式：使用 close 值画面积线（蓝色），K 线柱体全部透明
         //    注意：klinecharts 的 area.value 不支持自定义字段名，
         //    因此面积线使用 close 价格，VWAP 通过独立内置指标叠加显示
         chartRef.value.setStyles({
@@ -2521,10 +2837,10 @@ registerOverlay({
             },
             priceMark: {
               show: true,
+              // 分时最后一根是 null 占位柱，last 价标记会渲染成底部 0.00 伪影 → 关闭；
+              // 当前价格由常驻 tooltip 呈现
               last: {
-                show: true,
-                color: '#1890ff',
-                lineStyle: 'dashed'
+                show: false
               }
             },
             tooltip: {
@@ -2535,10 +2851,11 @@ registerOverlay({
                 const d = new Date(kLineData.timestamp)
                 const p = pricePrecision.value
                 const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+                const isPad = kLineData.__pad === true || kLineData.close == null
                 return [
                   timeStr,
-                  (kLineData.close || 0).toFixed(p),
-                  kLineData.vwap ? kLineData.vwap.toFixed(p) : '--',
+                  isPad ? '--' : (kLineData.close || 0).toFixed(p),
+                  kLineData.vwap != null ? kLineData.vwap.toFixed(p) : '--',
                   (kLineData.volume || 0).toFixed(0)
                 ]
               }
@@ -2551,22 +2868,11 @@ registerOverlay({
           }
         })
 
-        // 3. 禁用图表内部的滚轮缩放和拖拽滚动（通过 klinecharts 样式配置）
-        try {
-          chartRef.value.setStyles({
-            scroll: {
-              zoom: { enable: false },
-              horizontal: { enable: false, bar: { style: 'none' } },
-              vertical: { enable: false, bar: { style: 'none' } }
-            }
-          })
-        } catch (_) { /* 部分版本不支持此配置，降级依赖事件拦截 */ }
-
-        // 4. 添加 VWAP 内置指标到主图
+        // 2. 添加 VWAP 内置指标到主图
         try {
           // 先清理旧的 VWAP
           if (_vwapPaneId) {
-            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) {}
+            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) { /* 预期内：VWAP 指标可能尚未创建 */ }
             _vwapPaneId = null
           }
           const paneId = chartRef.value.createIndicator('VWAP', false, { id: 'candle_pane' })
@@ -2578,21 +2884,16 @@ registerOverlay({
           console.warn('添加 VWAP 指标失败:', vwapErr)
         }
 
-        // 5. 锁死可见范围：显示全部数据，禁止拖拽后回弹
-        try {
-          if (typeof chartRef.value.getDataCount === 'function') {
-            const count = chartRef.value.getDataCount()
-            if (count > 0) {
-              _minuteLockedRange = { from: 0, to: count - 1 }
-              chartRef.value.setVisibleRange(0, count - 1)
-            }
-          } else if (typeof chartRef.value.getVisibleRange === 'function') {
-            const range = chartRef.value.getVisibleRange()
-            if (range) {
-              _minuteLockedRange = { from: range.from, to: range.to }
-            }
-          }
-        } catch (_) {}
+        // 3. 铺满全部数据并锁定交互：X 轴固定覆盖整个交易时段（9:30 - 15:00）
+        //    铺满需要在滚动能力未被禁用时执行，故先 fit 再 disable
+        fitMinuteLineView()
+        disableMinuteInteractions()
+        // 锁定主图 Y 轴手势（右轴拖拽/滚轮缩放），Y 轴自动跟随数据
+        lockMinutePaneAxes()
+        // 布局/指标副图就绪后再校准一次（首次铺满时绘图区宽度可能尚未稳定）
+        safeTimeout(() => {
+          if (isMinuteLine.value) fitMinuteLineView()
+        }, 150)
       } catch (e) {
         console.warn('设置分时图样式失败:', e)
       }
@@ -2607,12 +2908,13 @@ registerOverlay({
         if (_vwapPaneId) {
           try {
             chartRef.value.removeIndicator(_vwapPaneId, 'VWAP')
-          } catch (_) {}
+          } catch (_) { /* 预期内：VWAP 指标可能已被移除 */ }
           _vwapPaneId = null
         }
 
-        // 2. 恢复滚轮和触摸交互
+        // 2. 恢复滚轮和触摸交互（含主图 Y 轴手势）
         enableMinuteInteractions()
+        unlockMinutePaneAxes()
 
         // 3. 恢复蜡烛图样式和滚动配置
         //    必须显式清除 area 配置并恢复 bar 颜色，
@@ -2675,10 +2977,10 @@ registerOverlay({
               }
             }
           },
+          // 滚动/缩放能力的恢复由 enableMinuteInteractions 通过 klinecharts API 完成
           scroll: {
-            zoom: { enable: true },
-            horizontal: { enable: true, bar: { style: 'normal' } },
-            vertical: { enable: true, bar: { style: 'normal' } }
+            horizontal: { bar: { style: 'normal' } },
+            vertical: { bar: { style: 'normal' } }
           }
         })
       } catch (e) {
@@ -2743,12 +3045,14 @@ registerOverlay({
           klineData.value = formattedData
         }
 
-        hasMoreHistory.value = true
+        // 分时模式只需当日数据，不参与历史加载
+        hasMoreHistory.value = !isMinuteLine.value
 
-        // 根据数据自动推算价格精度并设置到图表
-        pricePrecision.value = calcPricePrecision(klineData.value)
+        // 根据数据自动推算价格精度并设置到图表（补齐柱无价格，剔除后计算）
+        const realBars = klineData.value.filter(item => !item.__pad)
+        pricePrecision.value = calcPricePrecision(realBars)
 
-        const internalData = convertToInternalFormat(klineData.value)
+        const internalData = convertToInternalFormat(realBars)
         updatePricePanel(internalData, { force: true })
 
         nextTick(() => {
@@ -2782,13 +3086,18 @@ registerOverlay({
                 applyMinuteLineChartStyle()
               } else {
                 restoreNormalChartStyle()
+                // 恢复该周期上次的图表现场（分时为锁定视图，无需恢复）
+                restoreChartScene(props.timeframe)
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
               // 先移除旧 VOL pane，避免重复创建
               // VOL 现在作为可选内置指标，通过 updateIndicators 管理
-              // 延迟更新指标
-              setTimeout(() => {
+              // 延迟更新指标（P0-1 受管 timer + P0-2 symbol 一致性校验）
+              const _indSymbol = props.symbol
+              safeTimeout(() => {
+                // 已切换到其他标的 → 丢弃本次回调，防止旧标的指标写入新图表
+                if (props.symbol !== _indSymbol) return
                 if (chartRef.value) {
                   updateIndicators()
                 }
@@ -2804,7 +3113,11 @@ registerOverlay({
 
           // 如果初始数据明显不足（如美股小时线），自动补充加载历史（分时模式跳过）
           if (!isMinuteLine.value && formattedData.length < 200 && hasMoreHistory.value) {
-            setTimeout(() => {
+            // P0-2: 闭包捕获发起时的 symbol，避免切换股票后旧回调把历史数据写入新图表
+            const _histSymbol = props.symbol
+            safeTimeout(() => {
+              // 已切换到其他标的 → 丢弃本次回调（此时 klineData 已属于新标的）
+              if (props.symbol !== _histSymbol) return
               if (klineData.value.length > 0 && klineData.value.length < 200 && hasMoreHistory.value) {
                 loadMoreHistoryDataForScroll(klineData.value[0].timestamp)
               }
@@ -2934,21 +3247,25 @@ registerOverlay({
                 const newFrom = savedVisibleRange.from + newDataCount
                 const newTo = savedVisibleRange.to + newDataCount
 
-                // 使用 setTimeout 确保数据已经渲染完成
-                setTimeout(() => {
+                // P1-4: 用 nextTick 替代「赌 50ms 渲染完成」——渲染完成即执行，不再依赖固定延时
+                const _scrollSymbol = props.symbol
+                nextTick(() => {
+                  // 已切换标的 → 旧的滚动位置偏移量无意义，丢弃
+                  if (props.symbol !== _scrollSymbol) return
+                  if (!chartRef.value) return
                   try {
-                    if (chartRef.value) {
-                      // 尝试使用 scrollToDataIndex 方法（如果存在）
-                      if (typeof chartRef.value.scrollToDataIndex === 'function') {
-                        chartRef.value.scrollToDataIndex(newFrom)
-                      } else if (typeof chartRef.value.setVisibleRange === 'function') {
-                        // 使用 setVisibleRange 设置可见范围（参数是数据索引）
-                        chartRef.value.setVisibleRange(newFrom, newTo)
-                      }
+                    // 尝试使用 scrollToDataIndex 方法（如果存在）
+                    if (typeof chartRef.value.scrollToDataIndex === 'function') {
+                      chartRef.value.scrollToDataIndex(newFrom)
+                    } else if (typeof chartRef.value.setVisibleRange === 'function') {
+                      // 使用 setVisibleRange 设置可见范围（参数是数据索引）
+                      chartRef.value.setVisibleRange(newFrom, newTo)
                     }
                   } catch (e) {
+                    // P1-3: 恢复滚动位置属增强逻辑，失败不影响主流程，但需留痕
+                    console.warn('[KlineChart] 恢复滚动位置失败:', e)
                   }
-                }, 50)
+                })
               }
 
               // 更新指标
@@ -3084,6 +3401,11 @@ registerOverlay({
           const existingData = [...klineData.value]
 
           if (newData.length > 0) {
+            // 分时模式：走专用合并（补齐柱参与通用时间段合并，会把实时数据判为“更早数据”而丢弃）
+            if (isMinuteLine.value) {
+              mergeMinuteLineRealtime(newData)
+              return
+            }
             const lastNewTime = Math.floor(newData[newData.length - 1].timestamp / 1000) // 转回秒级用于比较
             const lastExistingTime = Math.floor(existingData[existingData.length - 1].timestamp / 1000)
 
@@ -3133,7 +3455,10 @@ registerOverlay({
               } else if (chartRef.value) {
                 try {
                   chartRef.value.applyNewData(klineData.value)
-                } catch (_) {}
+                } catch (_) {
+                  // P1-3: applyNewData 失败会导致图表空白，必须留痕
+                  console.warn('[KlineChart] applyNewData 失败，图表可能无法渲染:', _)
+                }
               }
             } else if (lastNewTime > lastExistingTime) {
               // 新的时间段，追加新数据
@@ -3247,6 +3572,12 @@ registerOverlay({
       if (!wsActive.value) return
       const arr = klineData.value
       if (!arr || arr.length === 0) return
+
+      // 分时模式：WS tick 走专用合并（最后一根是补齐到收盘的柱，通用同柱/新柱判断都不成立）
+      if (isMinuteLine.value) {
+        mergeMinuteLineRealtime([bar])
+        return
+      }
 
       const lastBar = arr[arr.length - 1]
 
@@ -3418,20 +3749,28 @@ registerOverlay({
       if (!container) return
 
       if (container.clientWidth === 0 || container.clientHeight === 0) {
-        let retryCount = 0
-        const maxRetries = 10
-        const checkAndInit = () => {
-          const checkContainer = document.getElementById('kline-chart-container')
-          if (checkContainer && checkContainer.clientWidth > 0 && checkContainer.clientHeight > 0) {
-            initChart()
-          } else if (retryCount < maxRetries) {
-            retryCount++
-            setTimeout(checkAndInit, 200)
-          } else {
-            initChart()
+        // 冗余修复：用 ResizeObserver 等待容器获得尺寸，替代原先 200ms × 10 次的定时轮询
+        // （项目内 chartResizeObserver / _chipPaneObserver 已在用此机制，此处属于重复造轮子）
+        // ResizeObserver 在尺寸变化时被回调，无需空转轮询；2.5 秒兜底后放弃并断开观察
+        let settled = false
+        const finish = (shouldInit) => {
+          if (settled) return
+          settled = true
+          if (ro) {
+            ro.disconnect()
+            _observers.delete(ro)
           }
+          // P0-1: 已卸载则绝不重建图表（孤儿实例）
+          if (shouldInit && !_isUnmounted) initChart()
         }
-        setTimeout(checkAndInit, 200)
+        const ro = new ResizeObserver(() => {
+          const el = document.getElementById('kline-chart-container')
+          if (el && el.clientWidth > 0 && el.clientHeight > 0) finish(true)
+        })
+        _observers.add(ro)
+        ro.observe(container)
+        // 兜底：超时仍未获得尺寸则放弃（原轮询上限约 2 秒，此处略放宽）
+        safeTimeout(() => finish(false), 2500)
         return
       }
 
@@ -3439,7 +3778,10 @@ registerOverlay({
       if (chartRef.value) {
         try {
           chartRef.value.destroy()
-        } catch (e) {}
+        } catch (e) {
+          // P1-3: destroy 失败意味着图表实例可能泄漏，必须留痕
+          console.warn('[KlineChart] 图表销毁失败，实例可能泄漏:', e)
+        }
         chartRef.value = null
         volPaneId.value = null
       }
@@ -3591,7 +3933,7 @@ registerOverlay({
                 lastVisibleFrom = data.from
                 initialRangeProcessed = true
                 // 延迟标记图表初始化完成，确保初始化完成后再允许触发加载
-                setTimeout(() => {
+                safeTimeout(() => {
                   chartInitialized.value = true
                 }, 1000)
                 return
@@ -3696,12 +4038,23 @@ registerOverlay({
 
     const handleResize = () => {
       if (chartRef.value) {
-        setTimeout(() => {
+        // P1-4: 用 rAF 防抖替代固定 100ms 延时。同一帧内多次 resize 只执行一次，
+        // 且卸载时统一 cancel，不会对已销毁的图表调用 resize
+        if (_resizeRafId != null) cancelAnimationFrame(_resizeRafId)
+        _resizeRafId = requestAnimationFrame(() => {
+          _resizeRafId = null
           if (chartRef.value) {
-            chartRef.value.resize()
-            renderPctAxis(); renderChip()
+            try {
+              chartRef.value.resize()
+              renderPctAxis(); renderChip()
+              // 分时模式：绘图区宽度变化后重新铺满（X 轴保持覆盖整个交易时段）
+              if (isMinuteLine.value) fitMinuteLineView()
+            } catch (e) {
+              // P1-3: resize 失败需留痕，否则图表错位难以定位
+              console.warn('[KlineChart] resize 重绘失败:', e)
+            }
           }
-        }, 100)
+        })
       } else {
         const container = document.getElementById('kline-chart-container')
         if (container && container.clientWidth > 0 && container.clientHeight > 0) {
@@ -3875,7 +4228,6 @@ registerOverlay({
       }
       try {
         registerIndicator(indicatorConfig)
-        // console.log(`成功注册指标: ${name}, series: ${indicatorConfig.series}`)
         return true
       } catch (err) {
         // 如果已注册，忽略错误
@@ -4884,7 +5236,7 @@ registerOverlay({
                 addedIndicatorIds.value.push({ paneId: indicatorId, name: 'VOL' })
                 addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
               }
-            } catch (err) {}
+            } catch (err) { /* 预期内：pane 容器可能已销毁，关闭按钮添加失败 */ }
           } else if (INDICATOR_REGISTRY[indicator.id]) {
             // 通用指标注册（来自 indicatorCalculations.js 注册表）
             const def = INDICATOR_REGISTRY[indicator.id]
@@ -4965,7 +5317,7 @@ registerOverlay({
                   }
                 }
               }
-            } catch (err) {}
+            } catch (err) { /* 预期内：pane 容器可能已销毁，指标重建失败 */ }
           } else {
             // 尝试直接用 indicator.id 创建（假设是内置指标名）
             try {
@@ -4975,7 +5327,7 @@ registerOverlay({
                 addedIndicatorIds.value.push({ paneId: indicatorId, name: indicatorName })
                 addPaneCloseButton(indicatorId, indicator.id, indicator.instanceId)
               }
-            } catch (err) {}
+            } catch (err) { /* 预期内：pane 容器可能已销毁，关闭按钮添加失败 */ }
           }
           // ... 其他指标 ...
         } catch (e) {
@@ -5108,10 +5460,12 @@ registerOverlay({
             _bdDragStartFromPct = range.from
             _bdDragStartToPct = range.to
           }
-        } catch (_) {}
+        } catch (_) { /* 预期内：拖拽起始状态读取失败，忽略本次手势 */ }
       }
 
       const onMouseMove = (e) => {
+        // 分时模式锁定视图，边界拖拽缩放不参与
+        if (isMinuteLine.value) return
         if (_bdStartX === null && !_bdDragging) return
         const chart = chartRef.value
         if (!chart) return
@@ -5150,7 +5504,7 @@ registerOverlay({
             // 离开边界（比如数据加载完成了），退出缩放模式
             _bdDragging = false
           }
-        } catch (_) {}
+        } catch (_) { /* 预期内：拖拽结束状态复位失败，忽略 */ }
       }
 
       const onMouseUp = () => {
@@ -5182,23 +5536,30 @@ registerOverlay({
     const debouncedLoad = () => {
       clearTimeout(_loadDebounceTimer)
       _loadDebounceTimer = setTimeout(() => {
-        if (props.symbol) { loadKlineData().then(() => fetchChipData()) }
+        // P1-1: 筹码数据由 loadKlineData() 内部统一触发（K 线加载完成后），此处不再重复请求
+        if (props.symbol) { loadKlineData() }
       }, 80)
     }
 
     /** 切换股票时自动适配：加载完成后滚动到最新并适配Y轴，仅执行一次 */
     watch(() => props.symbol, (newVal, oldVal) => {
       if (newVal && newVal !== oldVal) {
+        // 标的变化后旧现场无意义，全部作废
+        _tfSceneMap = {}
         debouncedLoad()
-        setTimeout(() => fetchChipData(), 1500)
+        // P1-1: 原先此处 1500ms 后再拉一次筹码，与 loadKlineData() 内部调用重复（一次切换请求 3 次），已移除
+        // P0-2: 捕获切换后的目标 symbol，供下方自动适配回调比对
+        const _targetSymbol = newVal
         // 延迟执行一次自动适配
-        setTimeout(() => {
+        safeTimeout(() => {
+          // 已再次切换标的 → 丢弃本次自动适配
+          if (props.symbol !== _targetSymbol) return
           if (chartRef.value) {
             try {
               if (typeof chartRef.value.scrollToRealTime === 'function') {
                 chartRef.value.scrollToRealTime()
               }
-            } catch (_) {}
+            } catch (_) { /* 预期内：图表未就绪时无法滚动到最新，静默忽略 */ }
           }
         }, 600)
       }
@@ -5212,8 +5573,20 @@ registerOverlay({
       nextTick(() => _ensureWmLayer())
     })
 
-    watch(() => props.market, () => { debouncedLoad(); fetchChipData() })
-    watch(() => props.timeframe, debouncedLoad)
+    // P1-1: 筹码由 loadKlineData() 内部触发，market 变化走 debouncedLoad 即可，不再重复请求
+    watch(() => props.market, () => {
+      // 市场变化后交易时段/旧现场均无意义，全部作废
+      _tfSceneMap = {}
+      debouncedLoad()
+    })
+    watch(() => props.timeframe, (newTf, oldTf) => {
+      // 切走前归档旧周期的图表现场（分时为锁定视图，无现场可存）
+      if (oldTf && oldTf !== newTf) {
+        const scene = captureChartScene()
+        if (scene) _tfSceneMap[oldTf] = scene
+      }
+      debouncedLoad()
+    })
 
     watch(() => props.activeIndicators, (newVal, oldVal) => {
       // 当指标列表变化时，重新渲染图表
@@ -5268,7 +5641,9 @@ registerOverlay({
       }
 
       nextTick(() => {
-        setTimeout(() => {
+        // P0-1: 受管 timer + 卸载守卫，避免卸载后重建图表
+        safeTimeout(() => {
+          if (_isUnmounted) return
           if (!chartRef.value && props.symbol) {
             initChart()
           }
@@ -5507,10 +5882,10 @@ registerOverlay({
       const chart = chartRef.value
       if (!chart) return
       let paneEl = null
-      try { paneEl = chart.getDom('candle_pane', 'root') } catch (_) {}
+      try { paneEl = chart.getDom('candle_pane', 'root') } catch (_) { /* 预期内：candle pane 尚未渲染 */ }
       if (!paneEl) return
       if (_chipPaneObserver) {
-        try { _chipPaneObserver.unobserve(paneEl); _chipPaneObserver.disconnect() } catch (_) {}
+        try { _chipPaneObserver.unobserve(paneEl); _chipPaneObserver.disconnect() } catch (_) { /* 预期内：Observer 可能已断开 */ }
         _chipPaneObserver = null
       }
       if (typeof ResizeObserver === 'undefined') return
@@ -5543,7 +5918,7 @@ registerOverlay({
           overlayTop = Math.max(0, paneRect.top - containerRect.top)
           paneH = paneRect.height
         }
-      } catch (_) {}
+      } catch (_) { /* 预期内：pane 尺寸读取失败，回退默认值 */ }
 
       // 覆盖层紧跟主图：top/height 与主图重合，不计入副图
       if (overlay) {
@@ -5691,6 +6066,19 @@ registerOverlay({
     }
 
     onBeforeUnmount(() => {
+      // P0-1: 先标记已卸载，阻断所有延迟回调继续创建图表
+      _isUnmounted = true
+      // 清理全部受管 setTimeout
+      _timers.forEach(clearTimeout)
+      _timers.clear()
+      // 清理 debounce 加载定时器
+      if (_loadDebounceTimer) { clearTimeout(_loadDebounceTimer); _loadDebounceTimer = null }
+      // 清理等待容器尺寸的 ResizeObserver（冗余修复引入）
+      _observers.forEach(ro => ro.disconnect())
+      _observers.clear()
+      // 清理 handleResize 的 rAF（P1-4 引入）
+      if (_resizeRafId != null) { cancelAnimationFrame(_resizeRafId); _resizeRafId = null }
+
       stopRealtime()
       wsClient = null
       if (realtimeChartRafId != null) {
@@ -5786,13 +6174,19 @@ registerOverlay({
             try {
               if (typeof chartRef.value.removeOverlay === 'function') chartRef.value.removeOverlay(id)
               else if (typeof chartRef.value.removeOverlayById === 'function') chartRef.value.removeOverlayById(id)
-            } catch (_) {}
+            } catch (_) { /* 预期内：overlay 可能已被移除 */ }
           })
         }
       },
       showIndicatorSignals () {
-        // Re-trigger indicator signal rendering by re-running the indicator
-        // Caller should invoke updateActiveIndicators() or equivalent
+        // P1-2 修复：原为空实现，父组件调用后信号不显示且无任何提示。
+        // 重新应用指标以重绘买卖信号标记（与 hideIndicatorSignals 对称）
+        if (!chartRef.value) return
+        try {
+          updateIndicators()
+        } catch (e) {
+          console.warn('[KlineChart] 重绘指标信号失败:', e)
+        }
       },
       /** 切换K线配色方案: cn=红涨绿跌, intl=绿涨红跌 */
       setChartColorScheme (scheme) {

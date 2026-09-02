@@ -87,16 +87,18 @@ V1核心参数:
 │ 龙回头 策略 (--strategy dragon)                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│ 入场: 涨停 → 回调 → 末期缩量小阴                                           │
+│ 入场: 涨停 → 回调 → 末期缩量小阴 → 回调结束确认                           │
 │ ────────────────────────────────────────────────────────                     │
-│ 1. 找到涨停日(D0)                                                          │
-│ 2. 回调期: D0后连续收盘<D0收盘价, 持续3~11天                               │
-│ 3. 信号日(D0回调末期):                                                     │
+│ 1. 找到涨停日(lu_idx)                                                      │
+│ 2. 回调期: 涨停日后连续收盘<涨停收盘价, 持续3~11天                        │
+│    - 循环遇到close>=涨停收盘价时立即终止(回调中断则无信号)                 │
+│ 3. 信号日(pullback_end, 回调最后一天):                                     │
 │    - 涨跌幅在 -3% ~ -0.5% (末期小阴, 抛压枯竭)                            │
-│    - 量比(D0量/D-1量)在 0.5x ~ 0.8x (缩量)                                │
-│ 4. 买入:                                                                   │
-│    signal_close: 信号日收盘买 (回测用)                                     │
-│    next_open:    信号日后第2天开盘买 (实盘可行, 需D+1收盘确认信号)         │
+│    - 量比(信号日量/前一天量)在 0.5x ~ 0.8x (缩量)                          │
+│ 4. 回调结束确认: 信号日次日收盘价 >= 涨停收盘价                            │
+│    (若次日close仍<涨停价, 说明回调未结束, 排除该信号)                      │
+│ 5. 去重: 同一股票若存在多个涨停, pullback_end距前一信号<=4天则跳过         │
+│ 6. 买入: D+1开盘买 (D0确认→D+1执行)                                        │
 │                                                                             │
 │ 出场:                                                                       │
 │ ────────────────────────────────────────────────────────                     │
@@ -125,7 +127,7 @@ V1核心参数:
 │    - 首个断板日涨跌在 -5% ~ +8%                                            │
 │    - 首个断板日开盘跳空在 -3% ~ +5%                                        │
 │    - 回撤 >= -10%                                                          │
-│ 4. 买入: 断板期结束后次日开盘价                                            │
+│ 4. 买入: 断板期最后一天确认→D+1开盘买                                      │
 │                                                                             │
 │ 出场:                                                                       │
 │ ────────────────────────────────────────────────────────                     │
@@ -184,7 +186,9 @@ def fetch_kline_db(code, days=300):
     import pandas as pd
     from datetime import datetime, timedelta
     from app.data_sources.provider.adjustment import unadj_to_qfq
-    end = datetime.now().strftime("%Y-%m-%d")
+    # DB 1D K线时间归一为当天 15:00:00, query 用 time <= end;
+    # end 取次日午夜才能包含今天 15:00 那根K线, 否则会把"今天"漏掉
+    end = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
     try:
         writer = _get_writer()
@@ -413,17 +417,18 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
         # 4 兜底: 持仓到期收盘走
         exit_p = b['close']; exit_d = d
 
-    return {
+    result = {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,
         'return_pct': round((exit_p / entry_price - 1) * 100, 2),
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
-        'd1_limit_up': d1_limit_up,
     }
+    if d1_limit_up:
+        result['d1_limit_up'] = d1_limit_up
+    return result
 
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0,
-                             buy_mode="next_open"):
+                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0):
     """
     龙回头v4 (优化版):
     D-N涨停 → 回调3-11天 → 末期缩量小阴(-3%~-0.5%)+量比0.5~0.8 → 买入
@@ -434,9 +439,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
       hold_days    = 10   (原15, 时间止损兜底)
       peak_escape : 涨>7%后上影线>30%逃顶 (原10%/40%)
 
-    buy_mode:
-      next_open    - D+1开盘买 (默认, 实盘推荐)
-      signal_close - 信号日收盘买 (回测用, 14:50盘中扫描可行)
+    入场: D+1开盘买 (D0确认→D+1执行)
     """
     board_type = get_board_type(code)
     threshold = 0.098 if board_type == "main" else 0.198
@@ -490,29 +493,21 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 skip = True; break
         if skip: continue
 
-        # D+1数据 (用于过滤)
+        # D+1数据 (next_open入场价)
         has_d1 = pullback_end + 1 < len(bars)
-        if not has_d1:
-            continue  # D1数据不存在,跳过
-        d1 = bars[pullback_end + 1]
-        d1_change = (d1['close'] / last_pb['close'] - 1) * 100
-
-        # 根据buy_mode确定入场价
-        if buy_mode == "signal_close":
-            entry_price = last_pb['close']
-            entry_idx = pullback_end
-            entry_date = last_pb['time']
-        elif buy_mode == "next_open":
-            # D0是信号日(缩量小阴), D0收盘确认信号, D1开盘买入
+        if has_d1:
+            d1 = bars[pullback_end + 1]
             entry_price = d1['open']
             entry_idx = pullback_end + 1
             entry_date = d1['time']
         else:
-            continue
-        if entry_price <= 0: continue
+            # 最后一根K线, D+1不存在 → 占位, 次日数据到来后补充
+            entry_price = 0
+            entry_idx = pullback_end + 1
+            entry_date = ''
+        if entry_price < 0: continue
 
         # 信号日量比: D0量 / D-1量 (缩量小阴, 抛压枯竭)
-        # 无论 buy_mode 是 signal_close 还是 next_open, 量比始终基于信号日(D0)
         signal_vol = last_pb['volume']
         signal_prev_vol = bars[pullback_end - 1]['volume'] if pullback_end > 0 else 0
         entry_vol_r = signal_vol / signal_prev_vol if signal_prev_vol > 0 else 0
@@ -521,11 +516,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
         used_ranges.append((lu_idx, pullback_end))
 
-        # 预计算 d1_limit_up: 基于 D1 收盘 vs D0 收盘 (信号日)
-        d1_limit_up_val = is_limit_up(d1['close'], last_pb['close'], board_type)
-
-        result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True, d1_limit_up=d1_limit_up_val, d1_change=d1_change)
-        if not result: continue
+        if entry_price > 0:
+            result = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, board_type, peak_exit=True, d1_limit_up=False, d1_change=None)
+            if not result: continue
+        else:
+            result = {'return_pct': 0, 'peak_return_pct': 0, 'exit_price': 0, 'exit_day': 0}
 
         trades.append({
             'code': code, 'board': get_board_name(code),
@@ -539,11 +534,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             'entry_vol_r': round(entry_vol_r, 2),
             'entry_date': entry_date,
             'entry_price': round(entry_price, 3),
-            'buy_mode': buy_mode,
+            'buy_mode': 'next_open',
             'signal_price': round(last_pb['close'], 3),
-            'd1_change': round(d1_change, 2),
-            'd1_gap': round((entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
-            'intraday': round(d1_change - (entry_price / last_pb['close'] - 1) * 100, 2) if last_pb['close'] > 0 else 0,
             **result,
         })
 
@@ -599,6 +591,10 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
             else:
                 break
         if pullback_end is None or pullback_end != i:
+            continue
+        # 确认回调确实在i结束: i+1(如果存在)的close不能仍低于lu_close
+        # 否则回测会在i之后继续搜索, pullback_end不落在i上
+        if i + 1 < len(bars) and bars[i + 1]['close'] < lu_close:
             continue
         pullback_days = pullback_end - lu_idx
         if pullback_days < min_pullback_days or pullback_days > max_pullback_days:
@@ -1000,8 +996,7 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         if key in used: i = streak_end + 1; continue
         used.add(key)
 
-        # 7. 买入: 断板期结束后的第一个交易日开盘价
-        #    断板期最后一天收盘才能确认"断板结束", 所以用次日开盘买入
+        # 7. 买入: 断板期结束后次日开盘价
         entry_idx = break_idx + break_days
         if entry_idx >= len(bars): i = streak_end + 1; continue
         entry_price = bars[entry_idx]['open']
@@ -1015,6 +1010,7 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
             'mode': 'streak_break',
             'streak_len': sig['streak_len'], 'streak_start': sig['streak_start'], 'streak_end': sig['streak_end'],
             'break_date': sig['break_date'],
+            'signal_date': bars[break_idx + break_days - 1]['time'],  # 断板期最后一天确认
             'break_days': break_days,
             'break_chg': sig['break_chg'],
             'break_gap': sig['break_gap'],
@@ -1228,14 +1224,66 @@ def _find_bar_idx(bars, date_str):
 
 
 def _db_last_bar_date(bars_by_code):
-    """today_str 默认值: 数据库K线最后一根日期 (各股票K线最后交易日一致)
+    """today_str 默认值: 数据库K线最后一根日期 (取全市场已加载股票的最大日期)
 
-    优先取第一个非空股票bars的最后一根K线日期; 空则返回None(调用方回退系统日期)。
+    遍历所有非空bars, 取最大的 last['time'], 不依赖代码加载顺序;
+    空则返回None(调用方回退系统日期)。
     """
+    last = None
     for bars in (bars_by_code or {}).values():
         if bars:
-            return bars[-1]['time']
-    return None
+            d = bars[-1]['time']
+            if last is None or d > last:
+                last = d
+    return last
+
+
+def _enrich_today_signals(signals, bars_by_code, existing_trades, path, signal_date_key='signal_date'):
+    """给 *_today_d0_signals 产生的信号补充 entry_price/entry_date
+
+    仅当回测未处理该信号时才补充(回测需要D+1数据, 信号日为最后一根K线时回测跳过)。
+    通过 (code, signal_date) 去重, 避免与回测结果重复。
+    """
+    existing_keys = {(t['code'], t.get('signal_date', t.get('d0_date', ''))) for t in existing_trades}
+    enriched = []
+    for t in signals:
+        code = t['code']
+        bars = bars_by_code.get(code)
+        if not bars:
+            continue
+        sd = t.get(signal_date_key) or t.get('d0_date')
+        if not sd:
+            continue
+        if (code, sd) in existing_keys:
+            continue  # 回测已处理该信号, 跳过
+            continue
+        si = _find_bar_idx(bars, sd)
+        if si is None or si + 1 >= len(bars):
+            continue  # D+1不存在, 跳过(无法确定entry)
+        d1 = bars[si + 1]
+        entry_price = d1['open']
+        if entry_price <= 0:
+            continue
+        # V1需要D+1入场过滤 (与 strategy_v1 next_open 分支一致)
+        if path == 'v1':
+            d0_close = bars[si]['close']
+            if d0_close <= 0: continue
+            d1_gap = (d1['open'] / d0_close - 1) * 100
+            d1_change = (d1['close'] / d0_close - 1) * 100
+            bt = get_board_type(code)
+            min_d1_gap = -3.0 if bt == "main" else -5.0
+            if d1_gap < min_d1_gap: continue
+            if d1_change < 0: continue
+            if bt == "gem_star" and d1_gap >= 5.0: continue
+            if bt == "main" and 3.0 <= d1_gap < 5.0: continue
+        enriched.append({
+            **t,
+            'entry_price': round(entry_price, 3),
+            'entry_date': d1['time'],
+            'return_pct': 0,
+            'peak_return_pct': 0,
+        })
+    return enriched
 
 
 def simulate_holding_to_today(bars, t, today_idx, board_type):
@@ -1255,15 +1303,14 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
       curr_ret  : 截至today收盘的浮动收益% (open时)
     """
     path = t['path']
+    entry_price = t['entry_price']
+    if entry_price <= 0:
+        return {'status': 'not_yet'}
     entry_idx = _find_bar_idx(bars, t['entry_date'])
     if entry_idx is None:
         return None
     if entry_idx > today_idx:
         return {'status': 'not_yet'}
-
-    entry_price = t['entry_price']
-    if entry_price <= 0:
-        return None
 
     # 各策略出场参数 (与回测 run_backtest / run_backtest_breakbuy 保持一致)
     if path == 'v1':
@@ -1325,16 +1372,21 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
             # 历史某日触发 → 已平仓, 不入持仓
             return {'status': 'closed', 'exit_reason': triggered, 'exit_date': b['time']}
 
-    # 走完到today仍无触发 → 仍持仓; 若已到期(hold_days)且today>=到期日 → 兜底到期
-    if today_idx >= entry_idx + hold_days - 1:
-        return {'status': 'open', 'today_action': f'到达持仓上限{hold_days}天, 明日收盘卖出',
+    # 走完到today仍无触发 → 检查是否已到期
+    expiry_idx = entry_idx + hold_days - 1  # 到期日索引
+    if today_idx > expiry_idx:
+        # today已过到期日 → 该仓位已在到期日收盘平仓, 不再持仓
+        return {'status': 'closed', 'exit_reason': f'持仓到期{hold_days}天', 'exit_date': bars[expiry_idx]['time']}
+    if today_idx == expiry_idx:
+        # today恰好是到期日 → 今日收盘卖出
+        return {'status': 'open', 'today_action': f'到达持仓上限{hold_days}天, 今日收盘卖出',
                 'hold_days': hold_days, 'curr_ret': (bars[today_idx]['close'] / entry_price - 1) * 100}
     hold_days_cnt = today_idx - entry_idx + 1
     return {'status': 'open', 'today_action': None,
             'hold_days': hold_days_cnt, 'curr_ret': (bars[today_idx]['close'] / entry_price - 1) * 100}
 
 
-def print_today_signals(all_trades, today_str, buy_mode="next_open", v1_today_signals=None, dragon_today_signals=None, break_today_signals=None, bars_by_code=None):
+def print_today_signals(all_trades, today_str, buy_mode="next_open", bars_by_code=None):
     """D0收盘后运行, 显示今日 入场/持仓/出场 + 次日买入建议
 
     回测独立: all_trades 为正常回测结果(回测逻辑不变)
@@ -1346,10 +1398,8 @@ def print_today_signals(all_trades, today_str, buy_mode="next_open", v1_today_si
     """
     # 按信号日筛选 (信号日=今天, 买入日=明天)
     dc_today = [t for t in all_trades if t['path'] == 'dragon_callback' and t.get('signal_date') == today_str]
-    dc_today += list(dragon_today_signals) if dragon_today_signals else []
-    v1_today = list(v1_today_signals) if v1_today_signals else []
-    bb_today = [t for t in all_trades if t['path'] == 'break_buy' and t.get('break_date') == today_str]
-    bb_today += list(break_today_signals) if break_today_signals else []
+    v1_today = [t for t in all_trades if t['path'] == 'v1' and t.get('d0_date') == today_str]
+    bb_today = [t for t in all_trades if t['path'] == 'break_buy' and t.get('signal_date') == today_str]
     today_trades = dc_today + v1_today + bb_today
 
     print(f"\n{'=' * 80}")
@@ -1578,8 +1628,7 @@ def main():
             dc = strategy_dragon_callback(bars, code,
                                            min_pullback_days=args.pullback,
                                            max_pullback_days=args.max_pullback,
-                                           max_last_chg=args.max_last_chg,
-                                           buy_mode=args.buy_mode)
+                                           max_last_chg=args.max_last_chg)
             dc_trades.extend(dc)
             if args.today:
                 dragon_today_signals.extend(dragon_today_d0_signals(
@@ -1626,6 +1675,15 @@ def main():
         success += 1
         if not use_db:
             time.sleep(0.15)
+
+    # ===== 将today信号补充entry信息后加入trades =====
+    if args.today:
+        if run_dc and dragon_today_signals:
+            dc_trades.extend(_enrich_today_signals(dragon_today_signals, bars_by_code, dc_trades, 'dragon_callback', 'signal_date'))
+        if run_v1 and v1_today_signals:
+            v1_trades.extend(_enrich_today_signals(v1_today_signals, bars_by_code, v1_trades, 'v1', 'd0_date'))
+        if run_bb and break_today_signals:
+            bb_trades.extend(_enrich_today_signals(break_today_signals, bars_by_code, bb_trades, 'break_buy', 'signal_date'))
 
     # ===== 独立结果 =====
     print(f"\n{'=' * 80}")
@@ -1693,7 +1751,7 @@ def main():
     if args.today:
         today_str = args.today_date or _db_last_bar_date(bars_by_code) or time.strftime("%Y-%m-%d")
         all_for_today = dc_trades + v1_trades + bb_trades
-        today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode, v1_today_signals=v1_today_signals, dragon_today_signals=dragon_today_signals, break_today_signals=break_today_signals, bars_by_code=bars_by_code)
+        today_trades = print_today_signals(all_for_today, today_str, buy_mode=args.buy_mode, bars_by_code=bars_by_code)
         if today_trades:
             with open(f"today_signals_{today_str}.json", "w", encoding="utf-8") as f:
                 json.dump(today_trades, f, ensure_ascii=False, indent=2)
