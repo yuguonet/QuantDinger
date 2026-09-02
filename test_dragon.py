@@ -736,8 +736,12 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
 # ================================================================
 
 BOARD_PARAMS = {
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15},
+    # enhance_filter: 断板增强过滤 (平衡方案) - 确认日涨跌 [confirm_chg_min, confirm_chg_max)
+    # 或 断板期均量比 >= vol_r_or_min, 满足其一即可; 置 False 可关闭 (用于 before/after 对比)
+    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
+             "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4},
+    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
+                 "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4},
 }
 
 def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
@@ -847,6 +851,19 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
     if break_drawdown < params['drawdown_max']:
         return None
 
+    # 5f. 确认日特征 + 增强过滤 (平衡方案): 确认日涨跌 0~2% 或 断板期均量比 >= 1.4, 满足其一即可
+    #     确认日 = 断板期最后一天; 特征仅用当日及以前数据, as-of 安全, 回测与 --today 共用本判定
+    confirm_bar = break_bars[-1]
+    confirm_prev = break_bars[-2] if len(break_bars) >= 2 else limit_bar
+    _c_prev_close = float(confirm_prev['close'])
+    confirm_chg = (float(confirm_bar['close']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
+    confirm_gap = (float(confirm_bar['open']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
+    if params.get('enhance_filter', True):
+        _pass_chg = params.get('confirm_chg_min', 0.0) <= confirm_chg < params.get('confirm_chg_max', 2.0)
+        _pass_vol = break_vol_r >= params.get('vol_r_or_min', 1.4)
+        if not (_pass_chg or _pass_vol):
+            return None
+
     return {
         'break_idx': break_idx, 'break_days': break_days,
         'break_date': bars[break_idx]['time'],
@@ -854,6 +871,8 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
         'break_chg': round(first_break_chg, 2),
         'break_gap': round(first_break_gap, 2),
         'break_vol_r': round(break_vol_r, 2),
+        'confirm_chg': round(confirm_chg, 2),
+        'confirm_gap': round(confirm_gap, 2),
     }
 
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_params=None):
@@ -975,6 +994,8 @@ def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=
             'break_chg': sig['break_chg'],
             'break_gap': sig['break_gap'],
             'break_vol_r': sig['break_vol_r'],
+            'confirm_chg': sig['confirm_chg'],
+            'confirm_gap': sig['confirm_gap'],
             'entry_price': None, 'buy_mode': 'next_open',
         })
         break  # 只取一个信号
@@ -1312,11 +1333,16 @@ def print_today_signals(today_stream, today_str, bars_by_code=None):
     # 断板信号
     if bb_today:
         print(f"\n  💥 断板 ({len(bb_today)}只) - 连板后断板确认, 次日开盘买:")
-        for t in sorted(bb_today, key=lambda x: x.get('streak_len', 0), reverse=True):
+        print("  [提示] 量比越高越好: 确认日量比>=1.8x 标记[量比佳], 历史表现最强; 已按量比降序排列")
+        for t in sorted(bb_today, key=lambda x: (x.get('break_vol_r', 0), x.get('streak_len', 0)), reverse=True):
             ep = t.get('entry_price')
             ep_txt = f"{ep:.2f}" if ep else "次日开盘"
+            _vr = t.get('break_vol_r', 0)
+            _vol_tag = ' [量比佳]' if _vr >= 1.8 else ''
+            _cc = t.get('confirm_chg')
+            _cc_txt = f" 确认日{_cc:+.1f}%" if _cc is not None else ''
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
-                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{t['break_vol_r']:.2f}x 预计开盘{ep_txt}")
+                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{_vr:.2f}x{_cc_txt}{_vol_tag} 预计开盘{ep_txt}")
         print(f"  {'─' * 85}")
         print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
