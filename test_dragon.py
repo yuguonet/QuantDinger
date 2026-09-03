@@ -95,10 +95,11 @@ V1核心参数:
 │ 3. 信号日(pullback_end, 回调最后一天):                                     │
 │    - 涨跌幅在 -3% ~ -0.5% (末期小阴, 抛压枯竭)                            │
 │    - 量比(信号日量/前一天量)在 0.5x ~ 0.8x (缩量)                          │
-│ 4. 回调结束确认: 信号日次日收盘价 >= 涨停收盘价                            │
-│    (若次日close仍<涨停价, 说明回调未结束, 排除该信号)                      │
+│ 4. 买入判定: 信号日(D0=回调最后一天)收盘可知条件判定, 不依赖D+1任何数据   │
+│    (旧版"回调结束确认=次日收盘>=涨停收盘"已移除: 该确认在买入时点不可知,  │
+│     属未来函数; 回调是否延续由出场规则承担)                              │
 │ 5. 去重: 同一股票若存在多个涨停, pullback_end距前一信号<=4天则跳过         │
-│ 6. 买入: D+1开盘买 (D0确认→D+1执行)                                        │
+│ 6. 买入: 信号日次日(D+1)开盘买, 无收盘确认                                │
 │                                                                             │
 │ 出场:                                                                       │
 │ ────────────────────────────────────────────────────────                     │
@@ -117,24 +118,35 @@ V1核心参数:
 │ 断板 策略 (--strategy break)                                                │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│ 入场: 连板≥2 → 断板 → 次日开盘买入                                        │
+│ 入场: 连板≥2 → 断板 → 逐日as-of确认 → 次日开盘买入                        │
 │ ────────────────────────────────────────────────────────                     │
-│ 1. 找到连板(连续涨停≥2天)                                                  │
-│ 2. 断板期: 连板后第一个非涨停日                                            │
-│ 3. 断板期检查:                                                              │
+│ 1. 找到连板(连续涨停≥2天, 前10天无涨停为首板)                              │
+│ 2. 断板期: 连板后第一个非涨停日起, 逐日判定确认点(与--today同一路径)       │
+│ 3. 断板期基础检查 (5a-5e):                                                  │
 │    - 低点 >= 涨停日开盘价 (支撑有效)                                       │
 │    - 断板期均量在 1.2x~2.0x涨停日量 (适度换手)                             │
 │    - 首个断板日涨跌在 -5% ~ +8%                                            │
 │    - 首个断板日开盘跳空在 -3% ~ +5%                                        │
 │    - 回撤 >= -10%                                                          │
-│ 4. 买入: 断板期最后一天确认→D+1开盘买                                      │
+│ 4. 增强过滤 (三通道OR, 满足其一; BOARD_PARAMS.enhance_filter 可关):        │
+│    - 通道1: 确认日涨跌 [0%, 2%)  (企稳)                                    │
+│    - 通道2: 断板期均量比 >= 1.4  (换手充分)                                │
+│    - 通道3: 连板前20日涨幅 >= 30% (前期热度, 大肉股富集)                   │
+│ 5. 均线多头排列 (确认日 MA5>MA10>MA20): 已评估, 默认关闭                  │
+│    (BOARD_PARAMS.ma_bull_filter; 120天验证胜率持平60.0%, 均收益+3.55%      │
+│    →+4.53%, 作用不大未启用; 重开只需置 True)                               │
+│ 6. 买入: 确认日次日(D+1)开盘买                                             │
+│                                                                             │
+│ 诚实口径回测 (300交易日全市场, 特征样本223笔):                              │
+│   无过滤: 223笔 58.3%/+3.36% → 三通道159笔 64.2%/+4.52% (现行)             │
+│ 大肉挖掘 (5年22万as-of样本): 热度>=30%子集 83%/+13% (结果导向)              │
 │                                                                             │
 │ 出场:                                                                       │
 │ ────────────────────────────────────────────────────────                     │
 │   止损:     -8% (主板) / -10% (创/科板)                                    │
 │   追踪止损: -6% (主板) / -8% (创/科板)                                     │
 │   峰值逃顶: 涨>10%后大上影线(>40%)收盘逃顶                                │
-│   持仓上限: 7天                                   │
+│   持仓上限: 7天                                                            │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -548,10 +560,10 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
                 break
         if pullback_end is None or pullback_end != i:
             continue
-        # 确认回调确实在i结束: i+1(如果存在)的close不能仍低于lu_close
-        # 否则回测会在i之后继续搜索, pullback_end不落在i上
-        if i + 1 < len(bars) and bars[i + 1]['close'] < lu_close:
-            continue
+        # 注意: 不检查 i+1 收盘是否仍 < lu_close (旧版"回调结束确认")。
+        # 该确认需要 T+1 收盘, 在 i 日收盘时点不可知; 若在 --today-date 回放中检查
+        # 会读入回放日之后的数据 (未来函数), 且与回测口径不一致。
+        # 回调是否真正结束不在入场时预知, 延续风险由出场规则承担 (as-of 统一口径)。
         pullback_days = pullback_end - lu_idx
         if pullback_days < min_pullback_days or pullback_days > max_pullback_days:
             continue
@@ -736,12 +748,15 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
 # ================================================================
 
 BOARD_PARAMS = {
-    # enhance_filter: 断板增强过滤 (平衡方案) - 确认日涨跌 [confirm_chg_min, confirm_chg_max)
-    # 或 断板期均量比 >= vol_r_or_min, 满足其一即可; 置 False 可关闭 (用于 before/after 对比)
+    # enhance_filter: 断板增强过滤 (三通道OR, 满足其一即可; 置 False 可整体关闭)
+    #   通道1: 确认日涨跌 [confirm_chg_min, confirm_chg_max)  (企稳)
+    #   通道2: 断板期均量比 >= vol_r_or_min                    (换手充分)
+    #   通道3: 连板前20日涨幅 >= pre20_min                     (前期热度, 大肉股富集)
+    # ma_bull_filter: 均线多头排列过滤 — 已评估: 胜率持平、均收益略增, 作用不大, 默认关闭
     "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
-             "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4},
+             "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False},
     "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
-                 "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4},
+                 "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False},
 }
 
 def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
@@ -790,6 +805,17 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-
         'return_pct': round((exit_p / entry_price - 1) * 100, 2),
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
+
+def _ma_bull_at(bars, ci):
+    """确认日均线多头排列: MA5>MA10>MA20 (ci=确认日索引); 数据不足(上市<20日)返回None"""
+    if ci + 1 < 20:
+        return None
+    c = [float(b['close']) for b in bars[ci - 19:ci + 1]]
+    ma5 = sum(c[-5:]) / 5
+    ma10 = sum(c[-10:]) / 10
+    ma20 = sum(c) / 20
+    return ma5 > ma10 > ma20
+
 
 def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params):
     """给定连板区间[streak_start,streak_end], 计算断板期并执行回测的5a-5e确认。
@@ -851,18 +877,30 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
     if break_drawdown < params['drawdown_max']:
         return None
 
-    # 5f. 确认日特征 + 增强过滤 (平衡方案): 确认日涨跌 0~2% 或 断板期均量比 >= 1.4, 满足其一即可
+    # 5f. 确认日特征 + 增强过滤 (三通道OR, 满足其一即可)
+    #     通道1: 确认日涨跌 [0,2)  通道2: 断板期均量比>=1.4  通道3: 连板前20日涨幅>=30 (热度)
     #     确认日 = 断板期最后一天; 特征仅用当日及以前数据, as-of 安全, 回测与 --today 共用本判定
     confirm_bar = break_bars[-1]
     confirm_prev = break_bars[-2] if len(break_bars) >= 2 else limit_bar
     _c_prev_close = float(confirm_prev['close'])
     confirm_chg = (float(confirm_bar['close']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
     confirm_gap = (float(confirm_bar['open']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
+    pre20_gain = None
+    if streak_start >= 20:
+        _pre_ref = float(bars[streak_start - 20]['close'])
+        if _pre_ref > 0:
+            pre20_gain = (limit_close / _pre_ref - 1) * 100
     if params.get('enhance_filter', True):
         _pass_chg = params.get('confirm_chg_min', 0.0) <= confirm_chg < params.get('confirm_chg_max', 2.0)
         _pass_vol = break_vol_r >= params.get('vol_r_or_min', 1.4)
-        if not (_pass_chg or _pass_vol):
+        _pass_hot = pre20_gain is not None and pre20_gain >= params.get('pre20_min', 30.0)
+        if not (_pass_chg or _pass_vol or _pass_hot):
             return None
+
+    # 5g. 均线多头排列 (确认日 MA5>MA10>MA20): 剔除断板期处于均线纠缠/空头的弱信号
+    ma_bull = _ma_bull_at(bars, break_idx + break_days - 1)
+    if params.get('ma_bull_filter', True) and ma_bull is False:
+        return None
 
     return {
         'break_idx': break_idx, 'break_days': break_days,
@@ -873,6 +911,8 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
         'break_vol_r': round(break_vol_r, 2),
         'confirm_chg': round(confirm_chg, 2),
         'confirm_gap': round(confirm_gap, 2),
+        'pre20_gain': round(pre20_gain, 2) if pre20_gain is not None else None,
+        'ma_bull': ma_bull,
     }
 
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_params=None):
@@ -996,6 +1036,8 @@ def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=
             'break_vol_r': sig['break_vol_r'],
             'confirm_chg': sig['confirm_chg'],
             'confirm_gap': sig['confirm_gap'],
+            'pre20_gain': sig['pre20_gain'],
+            'ma_bull': sig['ma_bull'],
             'entry_price': None, 'buy_mode': 'next_open',
         })
         break  # 只取一个信号
@@ -1333,7 +1375,7 @@ def print_today_signals(today_stream, today_str, bars_by_code=None):
     # 断板信号
     if bb_today:
         print(f"\n  💥 断板 ({len(bb_today)}只) - 连板后断板确认, 次日开盘买:")
-        print("  [提示] 量比越高越好: 确认日量比>=1.8x 标记[量比佳], 历史表现最强; 已按量比降序排列")
+        print("  [提示] 量比越高越好(>=1.8x标[量比佳]); 前期20日涨幅>=30%走热度通道(标[热度佳]); 按量比降序")
         for t in sorted(bb_today, key=lambda x: (x.get('break_vol_r', 0), x.get('streak_len', 0)), reverse=True):
             ep = t.get('entry_price')
             ep_txt = f"{ep:.2f}" if ep else "次日开盘"
@@ -1341,8 +1383,11 @@ def print_today_signals(today_stream, today_str, bars_by_code=None):
             _vol_tag = ' [量比佳]' if _vr >= 1.8 else ''
             _cc = t.get('confirm_chg')
             _cc_txt = f" 确认日{_cc:+.1f}%" if _cc is not None else ''
+            _pg = t.get('pre20_gain')
+            _pg_txt = f" 热度{_pg:.0f}%" if _pg is not None else ''
+            _hot_tag = ' [热度佳]' if (_pg is not None and _pg >= 30) else ''
             print(f"    {t['code']:<8} {t['board']:<6} {t['streak_len']}板连板 "
-                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{_vr:.2f}x{_cc_txt}{_vol_tag} 预计开盘{ep_txt}")
+                  f"断板{t['break_date']} {t['break_chg']:+.1f}% 量{_vr:.2f}x{_cc_txt}{_pg_txt}{_vol_tag}{_hot_tag} 预计开盘{ep_txt}")
         print(f"  {'─' * 85}")
         print(f"  📋 D1入场条件: 无特殊限制, D1开盘买入即可")
 
