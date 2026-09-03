@@ -226,6 +226,11 @@ export default {
     showChip: {
       type: Boolean,
       default: true
+    },
+    /** 昨日首板价（昨收），分时图 Y 轴中心与 0 轴线基准；缺省时自动回退获取 */
+    prevClose: {
+      type: Number,
+      default: null
     }
   },
   emits: ['retry', 'price-change', 'load', 'indicator-toggle'],
@@ -244,6 +249,16 @@ export default {
     // 图表实例
     const chartRef = shallowRef(null)
     const chartTheme = ref(props.theme || 'light')
+    /** 分时图 Y 轴中心 / 0 轴线基准：昨日首板价（昨收） */
+    const minutePrevClose = ref(null)
+    /** 分时昨收解析来源标记（props / 1m推导 / 今开近似 / 最新价近似），用于诊断日志去重 */
+    let _minutePcSource = ''
+    /** 分时昨收诊断日志去重键（昨收值 + 来源 + 锁定范围） */
+    let _minutePcLogKey = ''
+    /** 分时昨收缓存归属的标的（换标的才清空，同标的刷新保留，避免锁定短暂消失造成闪烁） */
+    let _minutePcSymbolKey = ''
+    /** 分时加载时保存的跨日 1m 原始数据（klineData 只保留当日，昨收推导需要跨日数据） */
+    let _minuteRawData = []
     /** 父容器高度变化（如指标 IDE 拖拽分割条）不会触发 window.resize，需 ResizeObserver 调 chart.resize */
     let chartResizeObserver = null
     let chartResizeRafId = null
@@ -2187,6 +2202,10 @@ registerOverlay({
         let cumVol = 0
         let cumTPV = 0
         return kLineDataList.map(k => {
+          // 分时补齐柱（close 为 null / __pad）不绘制 VWAP，保持与 K 线一致：未来时段不显示
+          if (k == null || k.close == null || k.__pad === true) {
+            return { vwap: null }
+          }
           const tp = (k.high + k.low + k.close) / 3
           const vol = k.volume || 0
           cumVol += vol
@@ -2197,6 +2216,12 @@ registerOverlay({
       series: 'price',
       precision: 2
     })
+
+    // ========== 分时图：0 轴线（原生指标线，与日K收盘线同机制） + Y 轴对称锚定 ==========
+    // 0 轴线不再用自定义 overlay 实现：overlay 的坐标按「创建/绘制时刻」的轴范围换算，
+    // 在锁轴/重排/实时刷新的时序竞争中容易错位甚至不渲染。
+    // 指标线与库原生画线（含日K的收盘价线）走同一条逐帧重绘管线：每次绘制都
+    // 用当前轴范围现算坐标，天然跟随锁定范围，永不脱节。
 
     // --- 分时图交互控制相关变量 ---
     /** 分时图模式下禁用滚轮/拖拽的事件处理器引用，用于恢复时移除 */
@@ -2212,6 +2237,18 @@ registerOverlay({
     let _vwapPaneId = null
     /** 铺满视图计算中的重入保护（铺满过程会连续触发多次可见范围事件） */
     let _minuteFitting = false
+    /** 分时：最近一次数据真正发生变化的时刻（用于停滞看门狗） */
+    let _minuteLastChangeTs = 0
+    /** 分时：看门狗上次全量重载的时刻（限流，避免频繁重载） */
+    let _minuteWatchdogTs = 0
+    /** 分时：整分钟强制刷新定时器，保证每一分钟的新柱在过界后立刻补上 */
+    let _minuteBoundaryTimer = null
+    /** 分时：图表全量写入的合并节流定时器 / 待写入数据 / 上次写入时刻 */
+    let _minuteApplyTimer = null
+    let _minuteApplyPending = null
+    let _minuteApplyTs = 0
+    /** 分时：图表全量写入的最小间隔（WS tick 高频到达时避免每帧 applyNewData） */
+    const MINUTE_APPLY_THROTTLE = 800
 
     /**
      * 分时图模式：把全部数据铺满绘图区，X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00）。
@@ -2568,6 +2605,98 @@ registerOverlay({
     }
 
     /**
+     * 从已加载的 1m 原始数据中推导「被展示交易日的前一交易日」收盘价。
+     * 分时加载时 limit=1000 根 1m，通常覆盖多个交易日，
+     * 因此无需额外的日线接口即可拿到昨收，可靠性最高。
+     * @param {Array} rawData 1m 原始数据
+     * @param {string} skipDayStr 需要跳过的日期（分时当前展示的那一天：今天，或回退显示的最近交易日）
+     */
+    const derivePrevCloseFromMinuteBars = (rawData, skipDayStr) => {
+      if (!Array.isArray(rawData) || rawData.length === 0) return null
+      // date -> 该日最后一根有效柱
+      const lastBarByDate = new Map()
+      for (let i = 0; i < rawData.length; i++) {
+        const b = rawData[i]
+        if (!b || !b.timestamp) continue
+        const c = Number(b.close)
+        if (!Number.isFinite(c) || c <= 0) continue
+        const d = minuteDateStr(b.timestamp)
+        if (d === skipDayStr) continue
+        const prev = lastBarByDate.get(d)
+        if (!prev || b.timestamp > prev.timestamp) lastBarByDate.set(d, b)
+      }
+      if (lastBarByDate.size === 0) return null
+      // 取日期最大的（紧邻被展示交易日的前一交易日）
+      let bestDate = null
+      lastBarByDate.forEach((_, d) => { if (!bestDate || d > bestDate) bestDate = d })
+      const bar = bestDate ? lastBarByDate.get(bestDate) : null
+      const c = bar ? Number(bar.close) : NaN
+      return Number.isFinite(c) && c > 0 ? c : null
+    }
+
+    /** 分时图：获取昨日收盘价（昨收）作为 Y 轴中心与 0 轴线基准 */
+    const fetchMinutePrevClose = async (rawData) => {
+      // 1. 父组件显式传入
+      if (props.prevClose != null && Number(props.prevClose) > 0) {
+        minutePrevClose.value = Number(props.prevClose)
+        _minutePcSource = 'props'
+        return
+      }
+      // 2. 从已加载的 1m 原始数据推导（无需额外请求，最可靠）
+      try {
+        // 「今日」可能没有数据（休市/盘前），分时会回退显示最近一个有数据的交易日。
+        // 此时 0 轴线的基准应为「被展示的那一天」的前一交易日收盘，
+        // 因此要从 klineData 最后一根真实柱反推正在展示的日期，而不是硬编码 Date.now()。
+        let displayDay = minuteDateStr(Date.now())
+        try {
+          const realBars = (klineData.value || []).filter(b => !b.__pad && b.timestamp)
+          if (realBars.length > 0) {
+            displayDay = minuteDateStr(realBars[realBars.length - 1].timestamp)
+          }
+        } catch (_) { /* 预期内 */ }
+        const fromBars = derivePrevCloseFromMinuteBars(rawData, displayDay)
+        if (fromBars != null) {
+          minutePrevClose.value = fromBars
+          _minutePcSource = '1m推导'
+          return
+        }
+      } catch (_) { /* 预期内 */ }
+      // 3. 日线接口兜底
+      try {
+        const res = await request({
+          url: '/api/indicator/kline',
+          method: 'get',
+          params: { market: props.market, symbol: props.symbol, timeframe: '1D', limit: 2 }
+        })
+        const arr = (res && res.code === 1 && Array.isArray(res.data)) ? formatKlineData(res.data) : []
+        // 先按时间升序，再取倒数第二根（上一交易日）收盘
+        const sorted = arr.slice().sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+        if (sorted.length >= 2) {
+          const c = Number(sorted[sorted.length - 2].close)
+          if (Number.isFinite(c) && c > 0) {
+            minutePrevClose.value = c
+            _minutePcSource = '日线接口'
+            return
+          }
+        }
+      } catch (_) { /* 预期内：接口缺失时回退 */ }
+      // 4. 最后回退：用当日首根真实柱的开盘价近似（开盘价缺失时用收盘价）
+      const firstReal = (klineData.value || []).find(b => !b.__pad && b.timestamp)
+      const openVal = Number(firstReal && firstReal.open)
+      const closeVal = Number(firstReal && firstReal.close)
+      const approx = (Number.isFinite(openVal) && openVal > 0)
+        ? openVal
+        : ((Number.isFinite(closeVal) && closeVal > 0) ? closeVal : null)
+      if (approx != null) {
+        minutePrevClose.value = approx
+        if (!_minutePcSource) _minutePcSource = '今开近似'
+        return
+      }
+      minutePrevClose.value = null
+      console.warn('[KlineChart] 分时：未能获取昨收，0 轴线与 Y 轴居中将被跳过（图表上无任何有效价格）')
+    }
+
+    /**
      * 分时数据补齐：从最后一根真实柱向后按分钟补齐到当日收盘。
      * 补齐柱使用前收盘平线 + 零成交量（实时分钟到达后会被逐根替换），
      * 使 X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00），午休时段自动跳过。
@@ -2611,6 +2740,38 @@ registerOverlay({
     }
 
     /**
+     * 分时：把最新分时数据整体写入图表（applyNewData + 重新铺满 + 锁定 Y 轴）。
+     * 带合并节流：WS tick 高频到达时，最多每 MINUTE_APPLY_THROTTLE ms 全量刷一次，
+     * 期间只保留最新一份数据，避免每帧都触发 applyNewData 造成卡顿。
+     */
+    const scheduleMinuteChartApply = (padded) => {
+      _minuteApplyPending = padded
+      if (_minuteApplyTimer != null) return
+      const wait = _minuteApplyTs ? Math.max(0, MINUTE_APPLY_THROTTLE - (Date.now() - _minuteApplyTs)) : 0
+      _minuteApplyTimer = safeTimeout(() => {
+        _minuteApplyTimer = null
+        const data = _minuteApplyPending
+        _minuteApplyPending = null
+        if (data && isMinuteLine.value && chartRef.value) {
+          _minuteApplyTs = Date.now()
+          try {
+            if (typeof chartRef.value.applyNewData === 'function') {
+              chartRef.value.applyNewData(data)
+              // 实时新增/替换分钟柱后重新铺满，避免 applyNewData 重置 barSpace 导致时段不再占满宽度
+              fitMinuteLineView()
+            }
+            // 【注意】这里不再调 maybeUpdateIndicators()：
+            // 1) applyNewData 内部会异步重算全部图表指标实例（VWAP/MA/VOL 均自动跟随新数据）；
+            // 2) updateIndicators 是「全删重建」，每次都会重挂 VOL 副图与主图指标，
+            //    分时下每 10s 重建一次会表现为周期性的窗口闪烁/抖动。
+            // 盘中创新高/新低会扩大波动区间 → 重新锁定 Y 轴（锚点未变则内部跳过）
+            applyMinutePrevCloseAxis()
+          } catch (_) { /* 预期内：图表未就绪时等待下一轮全量加载 */ }
+        }
+      }, wait)
+    }
+
+    /**
      * 分时模式实时合并：真实柱按时间戳精确替换/追加（剔除旧补齐柱），
      * 重算 VWAP 并重新补齐到收盘。
      * 不能走通用时间段合并：补齐柱的时间戳在当前时刻之后，
@@ -2619,7 +2780,16 @@ registerOverlay({
     const mergeMinuteLineRealtime = (newData) => {
       if (!newData || newData.length === 0) return
       const todayStr = minuteDateStr(Date.now())
-      const incoming = newData.filter(b => b && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
+      // 与 processMinuteLineData 口径一致：只接受当日「开盘之后」的柱
+      const session = getMinuteLineSession()
+      const toNumForFilter = (ts) => {
+        const d = new Date(ts)
+        return d.getHours() * 100 + d.getMinutes()
+      }
+      const incoming = newData.filter(b =>
+        b && b.timestamp &&
+        minuteDateStr(b.timestamp) === todayStr &&
+        toNumForFilter(b.timestamp) >= session.start)
       const existingReal = (klineData.value || []).filter(b => !b.__pad && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
       if (incoming.length === 0 && existingReal.length === 0) return
 
@@ -2637,11 +2807,25 @@ registerOverlay({
       if (sameAsPrev) return
 
       klineData.value = padded
+      // 数据确实发生了变化 → 记录时间戳，供停滞看门狗判断
+      _minuteLastChangeTs = Date.now()
       updatePricePanel(convertToInternalFormat(realBars), { force: true })
 
       const structureChanged = prev.length !== padded.length ||
         prev.some((b, i) => !b || b.timestamp !== padded[i].timestamp)
-      if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
+
+      if (isMinuteLine.value) {
+        // 【关键】分时模式下必须走全量 applyNewData，不能走 updateData。
+        // klinecharts 的 ChartStore.addData 对「单个对象」只会比较最后一根柱的时间戳：
+        //   timestamp >  lastDataTimestamp → push 到末尾
+        //   timestamp === lastDataTimestamp → 只替换最后一根
+        //   timestamp <  lastDataTimestamp → 直接忽略（success=false，什么都不做）
+        // 分时数据末尾是补齐到收盘的占位柱，最新真实柱永远位于数组中间，
+        // 因此 updateData 在这里是彻底的静默空操作 —— 表现为「实时数据完全不动」。
+        // 另外新一分钟到来时补齐柱减少一根、真实柱增加一根，总长度与时间轴都不变，
+        // structureChanged 也检测不到，所以分时无条件走全量刷新（内部带合并节流）。
+        scheduleMinuteChartApply(padded)
+      } else if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
         // 时间轴变化（跨日 / 首次构建）：全量刷新
         if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
           try {
@@ -2668,6 +2852,8 @@ registerOverlay({
           }
         }
       }
+      // 分时：盘中创新高/新低会扩大波动区间 → 重新锚定 Y 轴（锚点未变则内部跳过）
+      if (isMinuteLine.value) applyMinutePrevCloseAxis()
     }
 
     /**
@@ -2825,6 +3011,611 @@ registerOverlay({
       return padMinuteLineData(result)
     }
 
+    /**
+     * 分时 0 轴线指标名：一条画在昨收价上的原生指标横线（与日K收盘价线同机制），
+     * 同时兼任 Y 轴的兜底锚定（minValue / maxValue 参与 calcRange）。
+     */
+    const MINUTE_ZERO_LINE_IND = 'MINUTE_PREV_CLOSE_LINE'
+    /** 已应用的锚点区间，避免实时刷新时无谓重建 */
+    let _minuteAxisRange = null
+    /** 是否已锁定主图 Y 轴范围（退出分时时用于精确还原，避免影响其它周期） */
+    let _minuteAxisLocked = false
+    /** 分时 Y 轴上下各留的视觉余量比例（相对最大偏离） */
+    const MINUTE_AXIS_PADDING = 0.1
+    /** 涨跌幅轴「0%=昨收」重定基刻度：已安装的轴实例与库原型实现（退出分时时还原） */
+    let _minutePcTickAxis = null
+    let _minutePcOrigCreateTicks = null
+    /** 分时最新价标签是否已隐藏（涨跌幅轴下库标签基于今开，与昨收定基刻度矛盾） */
+    let _minutePriceTagHidden = false
+    /** 分时十字光标水平标签的昨收定基补丁：已补丁的视图实例与库原型实现 */
+    let _minuteCrosshairView = null
+    let _minuteCrosshairOrigGetText = null
+
+    /** 取主图 Y 轴实例（klinecharts 9.8.x 内部结构，带降级保护） */
+    const getCandleYAxis = () => {
+      const chart = chartRef.value
+      if (!chart) return null
+      try {
+        const pane = chart._candlePane
+        const axis = pane && typeof pane.getAxisComponent === 'function' ? pane.getAxisComponent() : null
+        return axis || null
+      } catch (_) {
+        return null
+      }
+    }
+
+    // ---- 涨跌幅轴刻度的「0%=昨收」重定基（A股分时惯例：中轴 0.00%，上下 ±对称）----
+    // 库的 percentage 轴 0% 基准是「首个可见柱收盘」（≈今开），昨收不在 0% 时
+    // 刻度呈 [-2%, +10%] 形态（几何上昨收已居中，但标签不以 0 为中心）。
+    // 这里在锁定的对称区间上按 rebased 值生成刻度：rebased 0 = 昨收位置，
+    // 文本 ±X.XX%，像素坐标用库自己的 _innerConvertToPixel 现算。
+    const minuteRound = (value, precision) => {
+      const p = Math.pow(10, precision)
+      return Math.round(value * p) / p
+    }
+    // 复刻库的 nice（1/2/3/4/5/6/8 × 10^n），保证刻度间隔手感与库一致
+    const minuteNice = (value) => {
+      if (!(value > 0) || !Number.isFinite(value)) return 0
+      const exponent = Math.floor(Math.log10(value))
+      const exp10 = Math.pow(10, exponent)
+      const f = value / exp10
+      let nf
+      if (f < 1.5) nf = 1
+      else if (f < 2.5) nf = 2
+      else if (f < 3.5) nf = 3
+      else if (f < 4.5) nf = 4
+      else if (f < 5.5) nf = 5
+      else if (f < 6.5) nf = 6
+      else nf = 8
+      return +(nf * exp10).toFixed(exponent < 0 ? -exponent : 0)
+    }
+    const minuteGetPrecision = (value) => {
+      const str = String(value)
+      const eIndex = str.indexOf('e')
+      if (eIndex > 0) {
+        const precision = Number(str.slice(eIndex + 1))
+        return precision < 0 ? -precision : 0
+      }
+      const dotIndex = str.indexOf('.')
+      return dotIndex < 0 ? 0 : str.length - 1 - dotIndex
+    }
+    /** 在锁定的对称区间上生成以昨收为 0% 的对称刻度（乘法重定基） */
+    const buildMinuteRebasedTicks = (axis, range, bounding) => {
+      if (!range || !(range.realRange > 0)) return []
+      const height = bounding && bounding.height > 0 ? bounding.height : 0
+      if (!(height > 0)) return []
+      // 沿用库 optimalTicks 的标签避让基准（取 xAxis.tickText.size）
+      let textHeight = 12
+      try {
+        textHeight = axis.getParent().getChart().getChartStore().getStyles().xAxis.tickText.size || 12
+      } catch (_) { /* 预期内：取不到样式时用默认值 */ }
+      const center = (Number(range.realFrom) + Number(range.realTo)) / 2 // 昨收的内部值（相对基准价的涨跌幅%）
+      // 【乘法重定基·关键】「昨收 + r%」的真实价格 = 昨收×(1+r/100)，换算到内部
+      // 百分比空间 = center + r×k，其中 k = 昨收/基准价 = 1 + center/100。
+      // 若用加法（center + r），标签值会偏离真实昨收涨跌幅达 r×缺口%，今开≠昨收时
+      // 实时线与坐标明显错位（偏离随涨幅放大）。
+      const k = 1 + center / 100
+      if (!(k > 0)) return []
+      const R = range.realRange / 2 / k // rebased（昨收 %）半区间
+      // 刻度间隔下限 0.1：保证 1 位小数的标签可分辨（需求：百分比坐标 1 位小数）
+      const interval = Math.max(minuteNice((2 * R) / 8.0), 0.1)
+      if (!(interval > 0)) return []
+      const precision = minuteGetPrecision(interval)
+      // 内部值 → 像素（优先用库实现；缺失时按库公式纯数学计算，兼容旧版本）
+      const toPx = (internal) => {
+        if (typeof axis._innerConvertToPixel === 'function') return axis._innerConvertToPixel(internal)
+        try {
+          const rg = axis.getRange()
+          const rate = (internal - rg.from) / rg.range
+          const reverse = typeof axis.isReverse === 'function' ? axis.isReverse() : false
+          return Math.round(reverse ? rate * height : (1 - rate) * height)
+        } catch (_) { return NaN }
+      }
+      const ticks = []
+      let validY = null
+      let r = minuteRound(Math.ceil(-R / interval) * interval, precision)
+      let guard = 0
+      while (r <= R + interval * 1e-6 && guard < 64) {
+        guard++
+        const y = toPx(center + r * k)
+        if (Number.isFinite(y) && y > textHeight && y < height - textHeight &&
+            (!Number.isFinite(validY) || Math.abs(validY - y) > textHeight * 2)) {
+          validY = y
+          const v = Number(r.toFixed(precision))
+          ticks.push({ text: `${v > 0 ? '+' : ''}${v.toFixed(1)}%`, coord: y, value: String(center + r * k) })
+        }
+        r = minuteRound(r + interval, precision)
+      }
+      return ticks
+    }
+    /** 文本小数位截断（保留前缀/千分位/符号，仅限制小数点后位数） */
+    const capTextDecimals = (text, maxDec) => {
+      const s = String(text)
+      const i = s.indexOf('.')
+      if (i < 0 || s.length - i - 1 <= maxDec) return s
+      return s.slice(0, i + maxDec + 1)
+    }
+    /**
+     * 给分时主图 Y 轴安装自定义刻度：
+     *  - percentage（涨跌幅轴）：昨收定基重定基刻度，1 位小数（buildMinuteRebasedTicks）
+     *  - normal（金额轴）：Y 轴刻度最多 3 位小数（图表价格精度 >3 时仅截断显示文本，
+     *    不改数据与精度本身；<3 时透传库默认刻度，与其它周期表现一致）
+     * 仅分时锁定态生效，退出分时/切普通周期时透传并最终还原。
+     */
+    const installMinuteAxisTicks = (axis) => {
+      if (!axis || typeof axis.createTicks !== 'function') return
+      if (_minutePcTickAxis === axis) return
+      try {
+        _minutePcOrigCreateTicks = axis.createTicks
+        axis.createTicks = function ({ range, bounding, defaultTicks }) {
+          try {
+            if (_minuteAxisLocked && typeof this.getType === 'function') {
+              const type = this.getType()
+              if (type === 'percentage' && range) {
+                const rebased = buildMinuteRebasedTicks(this, range, bounding)
+                if (rebased.length) return rebased
+              } else if (type === 'normal') {
+                const chartStore = this.getParent().getChart().getChartStore()
+                if (chartStore && chartStore.getPrecision().price > 3) {
+                  return defaultTicks.map(t => ({ ...t, text: capTextDecimals(t.text, 3) }))
+                }
+              }
+            }
+          } catch (_) { /* 预期内：退化到库默认刻度 */ }
+          return typeof _minutePcOrigCreateTicks === 'function'
+            ? _minutePcOrigCreateTicks.call(this, { range, bounding, defaultTicks })
+            : defaultTicks
+        }
+        _minutePcTickAxis = axis
+      } catch (_) { /* 预期内 */ }
+    }
+    /** 还原分时 Y 轴自定义刻度（退出分时/清理时调用） */
+    const restoreMinuteAxisTicks = () => {
+      if (_minutePcTickAxis) {
+        try { delete _minutePcTickAxis.createTicks } catch (_) { /* 预期内 */ }
+        try { _minutePcTickAxis.buildTicks(true) } catch (_) { /* 预期内 */ }
+        _minutePcTickAxis = null
+      }
+      _minutePcOrigCreateTicks = null
+    }
+    /**
+     * 分时最新价标签的显隐（带状态记忆，避免每次刷新重复 setStyles）。
+     * 涨跌幅轴下库标签固定显示「相对今开」的涨跌幅，与昨收定基的刻度/实时线
+     * 基准不一致（同一像素两套读数）→ 隐藏；金额轴下显示的是价格本身 → 保留。
+     */
+    const setMinutePriceTagHidden = (hidden) => {
+      if (_minutePriceTagHidden === hidden) return
+      _minutePriceTagHidden = hidden
+      try {
+        chartRef.value && chartRef.value.setStyles({ candle: { priceMark: { last: { show: !hidden } } } })
+      } catch (_) { /* 预期内 */ }
+    }
+
+    /**
+     * 安装分时十字光标水平标签的补丁：
+     *  - percentage：读数改为「昨收定基」涨跌幅，1 位小数（库默认按今开基准 → 光标
+     *    移动时百分比与昨收定基的坐标刻度不一致，即“光标百分比比例不对”）
+     *  - normal：价格读数小数位 >3 时截断为 3 位（与 Y 轴刻度规则一致）
+     * 仅分时主图生效，退出分时还原库原型实现。
+     */
+    const installMinuteCrosshairRebase = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      try {
+        const pane = chart._candlePane
+        const widget = pane && typeof pane.getYAxisWidget === 'function' ? pane.getYAxisWidget() : null
+        const view = widget && widget._crosshairHorizontalLabelView
+        if (!view || typeof view.getText !== 'function') return
+        if (_minuteCrosshairView === view) return
+        _minuteCrosshairOrigGetText = view.getText
+        view.getText = function (crosshair, chartStore, axis) {
+          try {
+            const type = axis && typeof axis.getType === 'function' ? axis.getType() : ''
+            if (type === 'percentage' && crosshair && typeof axis.convertFromPixel === 'function') {
+              const pc = minutePrevClose.value
+              if (pc != null && pc > 0) {
+                const price = axis.convertFromPixel(crosshair.y)
+                if (Number.isFinite(price) && price > 0) {
+                  // 光标处价格 → 昨收涨跌幅（昨收定基，1 位小数，与坐标刻度一致）
+                  const pct = (price - pc) / pc * 100
+                  const r = Number(pct.toFixed(1))
+                  return `${r > 0 ? '+' : ''}${r.toFixed(1)}%`
+                }
+              }
+            } else if (type === 'normal' && crosshair && chartStore &&
+                       typeof chartStore.getPrecision === 'function' &&
+                       chartStore.getPrecision().price > 3 &&
+                       typeof axis.convertFromPixel === 'function') {
+              // 价格读数最多 3 位小数（保留库的完整格式化后仅截断小数位）
+              const t = _minuteCrosshairOrigGetText.call(this, crosshair, chartStore, axis)
+              return capTextDecimals(t, 3)
+            }
+          } catch (_) { /* 预期内：退化到库默认读数 */ }
+          return typeof _minuteCrosshairOrigGetText === 'function'
+            ? _minuteCrosshairOrigGetText.call(this, crosshair, chartStore, axis)
+            : ''
+        }
+        _minuteCrosshairView = view
+      } catch (_) { /* 预期内 */ }
+    }
+    /** 还原分时十字光标水平标签的库实现（退出分时/清理时调用） */
+    const restoreMinuteCrosshairRebase = () => {
+      if (_minuteCrosshairView) {
+        try { delete _minuteCrosshairView.getText } catch (_) { /* 预期内 */ }
+        _minuteCrosshairView = null
+      }
+      _minuteCrosshairOrigGetText = null
+    }
+
+    /**
+     * 确保「0 轴线指标」已创建（不存在才创建，已存在直接返回）。
+     *
+     * 与日K收盘线同理：指标线由库的逐帧重绘管线画出来，每次绘制都用
+     * 当前轴范围现算坐标，天然跟随 Y 轴锁定范围，不存在 overlay 那种
+     * 「创建时刻坐标过期 → 错位 / 不渲染」的问题。
+     * calc 闭包在每次重算（applyNewData / 实时刷新触发）时读取最新昨收。
+     */
+    const ensureMinuteZeroLineIndicator = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      try {
+        let names = []
+        try {
+          const instances = chart.getIndicatorByPaneId('candle_pane')
+          if (instances && typeof instances.keys === 'function') names = Array.from(instances.keys())
+        } catch (_) { /* 预期内 */ }
+        if (names.includes(MINUTE_ZERO_LINE_IND)) return
+        registerIndicator({
+          name: MINUTE_ZERO_LINE_IND,
+          shortName: '',
+          series: 'price',
+          precision: 2,
+          figures: [{ key: 'zeroLine', title: '', type: 'line' }],
+          styles: {
+            lines: [{ color: '#999999', style: 'dashed', dashedValue: [4, 4], size: 1 }]
+          },
+          calc: (list) => {
+            const v = minutePrevClose.value
+            return (list || []).map(() => ({ zeroLine: (v != null && v > 0) ? v : null }))
+          }
+        })
+        // isStack 必须为 true：klinecharts 的 IndicatorStore.addInstance 在 isStack=false
+        // 时会执行 `paneInstances = []`，把该 pane 上已有的指标（VWAP 等）全部清空
+        chart.createIndicator(MINUTE_ZERO_LINE_IND, true, { id: 'candle_pane' })
+      } catch (_) { /* 预期内：指标未就绪时由自愈重试补上 */ }
+    }
+
+    /**
+     * 分时图：把主图 Y 轴范围锁定为「以昨收为中心」的对称区间。
+     *
+     * 首选方案：直接调用 YAxisImp.setRange() 锁定范围。
+     * - AxisImp.buildTicks() 只在 `_autoCalcTickFlag === true` 时才重算范围，
+     *   而 setRange() 会把它置为 false → 范围被完全固定，不再受数据/指标/重排影响。
+     * - 这样同时绕开了 klinecharts 默认的不对称 gap（top 0.2 / bottom 0.1），
+     *   该 gap 会把中心整体上移，是「看不出居中」的根因之一。
+     * - 该方式与指标实例无关，因此不会被 updateIndicators 的指标增删（尤其是
+     *   isStack=false 时 `paneInstances = []` 清空主图指标）连带清掉。
+     *
+     * 兜底方案：0 轴线指标（MINUTE_ZERO_LINE_IND）的 minValue / maxValue 会计入
+     * YAxisImp.calcRange 的范围计算（min = min(specifyMin, ...)、max = max(specifyMax, ...)，
+     * percentage 轴下库会先把这些绝对价格换算成涨跌幅再叠加 gap），
+     * 配合上下相等的 gap 也能撑出对称区间。仅在 setRange 不可用时启用。
+     *
+     * 涨跌幅轴（percentage）：锁定范围用百分比单位，以 pct(昨收) 为中心对称展开；
+     * pct 基准 = 首个可见柱收盘（与库 convertToPixel 的换算基准一致），
+     * 最大偏离按 |涨跌幅| 的绝对值取对称 → 跌0%涨10% 时范围 ±10%+余量，0 轴线恒居中。
+     */
+    /**
+     * 分时昨收的「取值即得」多级兜底解析（自愈）：
+     * fetchMinutePrevClose 是异步链路（props / 1m 推导 / 日线接口），任一环节失败
+     * 都可能让 minutePrevClose 停留在 null —— 表现为 0 轴线消失、Y 轴不居中，
+     * 且每次实时刷新 Y 轴随数据自动重算（视觉上整窗抖动）。
+     * 这里在每次应用锁定时就地解析：只要图表上有任何真实数据就一定拿得到昨收。
+     * @returns {number|null}
+     */
+    const resolveMinutePrevClose = () => {
+      if (minutePrevClose.value != null && minutePrevClose.value > 0) {
+        return minutePrevClose.value
+      }
+      // 父组件显式传入
+      if (props.prevClose != null && Number(props.prevClose) > 0) {
+        minutePrevClose.value = Number(props.prevClose)
+        _minutePcSource = 'props'
+        return minutePrevClose.value
+      }
+      const realBars = (klineData.value || []).filter(b => b && !b.__pad && b.timestamp)
+      if (realBars.length === 0) return null
+      // 【关键】klineData 的真实柱只有「正在展示的交易日」，
+      // 推导上一交易日收盘必须用加载时保存的跨日 1m 原始数据（_minuteRawData）
+      const displayDay = minuteDateStr(realBars[realBars.length - 1].timestamp)
+      const srcData = (_minuteRawData && _minuteRawData.length > 0) ? _minuteRawData : realBars
+      try {
+        const fromBars = derivePrevCloseFromMinuteBars(srcData, displayDay)
+        if (fromBars != null && fromBars > 0) {
+          minutePrevClose.value = fromBars
+          _minutePcSource = '1m推导(自愈)'
+          return fromBars
+        }
+      } catch (_) { /* 预期内 */ }
+      // 今日首柱 开/收 近似
+      const first = realBars[0]
+      const openVal = Number(first.open)
+      const closeVal = Number(first.close)
+      const approx = (Number.isFinite(openVal) && openVal > 0)
+        ? openVal
+        : ((Number.isFinite(closeVal) && closeVal > 0) ? closeVal : null)
+      if (approx != null) {
+        minutePrevClose.value = approx
+        _minutePcSource = '今开近似'
+        return approx
+      }
+      // 最后真实柱收盘
+      const lastClose = Number(realBars[realBars.length - 1].close)
+      if (Number.isFinite(lastClose) && lastClose > 0) {
+        minutePrevClose.value = lastClose
+        _minutePcSource = '最新价近似'
+        return lastClose
+      }
+      return null
+    }
+
+    const applyMinutePrevCloseAxis = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      const pc = resolveMinutePrevClose()
+      if (pc == null || !(pc > 0)) return
+      const realBars = (klineData.value || []).filter(b => b && !b.__pad)
+      if (realBars.length === 0) return
+
+      const axis = getCandleYAxis()
+      // 轴型分支：normal=价格单位；percentage=涨跌幅单位（库以「首个可见柱收盘」
+      // 为基准换算 convertToPixel/calcRange，锁定范围必须用同一基准换算成百分比，
+      // 否则只能放弃锁定 → 轴退回「按数据 min~max 铺满」，0 轴线无法居中）
+      const axisType = axis && typeof axis.getType === 'function' ? axis.getType() : 'normal'
+      const percentMode = axisType === 'percentage'
+      let baseClose = null
+      let pcPct = 0
+      if (percentMode) {
+        try {
+          const dl = chart.getDataList ? chart.getDataList() : (klineData.value || [])
+          const vr = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
+          const fd = (vr && Number.isInteger(vr.from) && dl[vr.from]) ? dl[vr.from] : dl[0]
+          const c = Number(fd && fd.close)
+          if (Number.isFinite(c) && c > 0) {
+            baseClose = c
+            // 昨收的涨跌幅（相对首个可见柱收盘，与库的百分比换算一致）
+            pcPct = (pc - baseClose) / baseClose * 100
+          }
+        } catch (_) { /* 预期内 */ }
+        // 基准缺失时放弃锁定，避免把价格值当百分比值用导致显示错乱
+        if (baseClose == null) return
+      }
+      // 涨跌幅轴下隐藏库的最新价标签（基准=今开，与昨收定基刻度矛盾）；金额轴保留
+      setMinutePriceTagHidden(percentMode)
+      // 分时 Y 轴自定义刻度（涨跌幅轴：昨收定基 1 位小数；金额轴：刻度 ≤3 位小数）
+      installMinuteAxisTicks(axis)
+      // 十字光标读数昨收定基（涨跌幅轴）+ 价格读数 ≤3 位小数
+      installMinuteCrosshairRebase()
+
+      // 取所有参与 Y 轴极值计算的价格相对昨收的最大【绝对值】偏离
+      // （涨跌不对称时按大的那一侧对称展开：跌0%涨10% → 范围 ±10%+余量）
+      let maxDev = 0
+      realBars.forEach(b => {
+        [b.close, b.high, b.low, b.vwap].forEach(v => {
+          if (v == null || !Number.isFinite(v)) return
+          const d = Math.abs(v - pc)
+          if (d > maxDev) maxDev = d
+        })
+      })
+      if (!(maxDev > 0)) maxDev = Math.abs(pc) * 0.001
+
+      // 上下各留 10% 余量，避免价格线贴边
+      const halfPrice = maxDev * (1 + MINUTE_AXIS_PADDING)
+      const fromPrice = pc - halfPrice
+      const toPrice = pc + halfPrice
+      // 锁定范围单位跟随轴型：percentage 轴用百分比单位，且以 pct(昨收) 为中心
+      // （昨收未必等于基准价，如今开≠昨收时中心点不是 0%，而是昨收的涨跌幅）
+      let from
+      let to
+      if (percentMode) {
+        const halfPct = maxDev / baseClose * 100 * (1 + MINUTE_AXIS_PADDING)
+        from = pcPct - halfPct
+        to = pcPct + halfPct
+      } else {
+        from = fromPrice
+        to = toPrice
+      }
+
+      // 锚点未变化且仍处于锁定态则跳过，避免实时刷新时反复重排
+      if (axis && _minuteAxisRange &&
+          Math.abs(_minuteAxisRange.from - from) < 1e-10 &&
+          Math.abs(_minuteAxisRange.to - to) < 1e-10 &&
+          typeof axis.getAutoCalcTickFlag === 'function' &&
+          axis.getAutoCalcTickFlag() === false) return
+
+      // 无条件输出一行诊断日志（按 昨收+来源+范围 去重），便于现场确认昨收取值与来源
+      const logKey = `${pc}|${_minutePcSource}|${axisType}|${from}|${to}`
+      if (logKey !== _minutePcLogKey) {
+        _minutePcLogKey = logKey
+        console.info(`[KlineChart] 分时0轴：昨收=${pc}（来源=${_minutePcSource || '已缓存'}） 轴=${axisType}${percentMode ? ` 基准=${baseClose}` : ''} 范围=[${from.toFixed(4)}, ${to.toFixed(4)}]`)
+      }
+
+      // ---- 0 轴线指标（原生逐帧重绘，画在昨收价上）----
+      ensureMinuteZeroLineIndicator()
+
+      // ---- 首选：直接锁定 Y 轴范围 ----
+      if (axis && typeof axis.setRange === 'function') {
+        try {
+          axis.setRange({
+            from, to,
+            range: to - from,
+            realFrom: from,
+            realTo: to,
+            realRange: to - from
+          })
+          _minuteAxisRange = { from, to }
+          _minuteAxisLocked = true
+          try { axis.buildTicks(true) } catch (_) { /* 预期内：布局时也会重建 */ }
+          if (typeof chart.adjustPaneViewport === 'function') {
+            chart.adjustPaneViewport(true, true, true, true, true)
+          }
+          return
+        } catch (e) {
+          console.warn('[KlineChart] 分时 Y 轴锁定失败，回退到指标锚定:', e)
+        }
+      }
+
+      // ---- 兜底：用 0 轴线指标本身锚定（minValue/maxValue 参与 calcRange） + 上下相等的 gap ----
+      // 注意单位必须是【绝对价格】：库的 calcRange 会按轴型自行换算
+      // （percentage 轴先把 min/max 换算成涨跌幅再叠加 gap），传百分比单位反而会错乱
+      try {
+        registerIndicator({
+          name: MINUTE_ZERO_LINE_IND,
+          shortName: '',
+          series: 'price',
+          precision: 2,
+          figures: [{ key: 'zeroLine', title: '', type: 'line' }],
+          styles: {
+            lines: [{ color: '#999999', style: 'dashed', dashedValue: [4, 4], size: 1 }]
+          },
+          minValue: fromPrice,
+          maxValue: toPrice,
+          calc: (list) => {
+            const v = minutePrevClose.value
+            return (list || []).map(() => ({ zeroLine: (v != null && v > 0) ? v : null }))
+          }
+        })
+        // 先移除旧实例，确保新锚点生效
+        try { chart.removeIndicator('candle_pane', MINUTE_ZERO_LINE_IND) } catch (_) { /* 预期内：首次尚未创建 */ }
+        // 注意：isStack 必须为 true。klinecharts 的 IndicatorStore.addInstance 在
+        // isStack=false 时会执行 `paneInstances = []`，把该 pane 上已有的指标
+        // （如分时主图的 VWAP）全部清空，导致 VWAP 线消失。
+        chart.createIndicator(MINUTE_ZERO_LINE_IND, true, { id: 'candle_pane' })
+        _minuteAxisRange = { from, to }
+        _minuteAxisLocked = true
+      } catch (e) {
+        console.warn('[KlineChart] 分时 Y 轴对称锚定失败:', e)
+      }
+
+      try {
+        // 上下 gap 相等 → 昨收恰好落在垂直中心（库默认 0.2/0.1 不对称会导致偏移）
+        chart.setPaneOptions({ id: 'candle_pane', gap: { top: 0.15, bottom: 0.15 } })
+      } catch (_) { /* 预期内 */ }
+      if (percentMode) {
+        try { axis && axis.buildTicks(true) } catch (_) { /* 预期内 */ }
+      }
+    }
+
+    /** 分时图：解除 Y 轴范围锁定并还原默认 gap（切换回普通周期时调用） */
+    const clearMinutePrevCloseAxis = () => {
+      const chart = chartRef.value
+      // 还原分时 Y 轴自定义刻度（重定基刻度仅分时涨跌幅轴使用）
+      restoreMinuteAxisTicks()
+      // 还原十字光标水平标签的库实现
+      restoreMinuteCrosshairRebase()
+      // 还原库的最新价标签
+      setMinutePriceTagHidden(false)
+      try {
+        if (chart && typeof chart.removeIndicator === 'function') {
+          // 移除 0 轴线指标；同时清理旧版锚定指标名，防止历史实例残留
+          chart.removeIndicator('candle_pane', MINUTE_ZERO_LINE_IND)
+          try { chart.removeIndicator('candle_pane', 'MINUTE_PREV_CLOSE_AXIS') } catch (_) { /* 预期内：旧版无实例 */ }
+        }
+      } catch (_) { /* 预期内 */ }
+      _minuteAxisRange = null
+      const axis = getCandleYAxis()
+      if (_minuteAxisLocked && axis) {
+        try {
+          // 还原为自动计算刻度（等价于双击右轴复位）
+          if (typeof axis.setAutoCalcTickFlag === 'function') axis.setAutoCalcTickFlag(true)
+          if (chart && typeof chart.adjustPaneViewport === 'function') {
+            chart.adjustPaneViewport(true, true, true, true, true)
+          }
+        } catch (_) { /* 预期内 */ }
+      }
+      if (_minuteAxisLocked && chart && typeof chart.setPaneOptions === 'function') {
+        try {
+          // 还原为 klinecharts 默认 gap
+          chart.setPaneOptions({ id: 'candle_pane', gap: { top: 0.2, bottom: 0.1 } })
+        } catch (_) { /* 预期内 */ }
+      }
+      _minuteAxisLocked = false
+    }
+
+    /**
+     * 分时模式：确保主图的 VWAP 与 Y 轴锚定指标仍然存在。
+     *
+     * 背景：klinecharts 的 IndicatorStore.addInstance 在 isStack=false 时会执行
+     * `paneInstances = []`，把该 pane 上已有的指标全部清空。updateIndicators 里
+     * 往 candle_pane 创建主图指标时若传了 false，就会连带清掉 VWAP 与锚定指标，
+     * 表现为「VWAP 线消失 / Y 轴不再以昨收为中心」。这里在指标刷新后补挂恢复。
+     */
+    const ensureMinuteIndicators = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      let names = []
+      try {
+        const instances = chart.getIndicatorByPaneId('candle_pane')
+        if (instances && typeof instances.keys === 'function') {
+          names = Array.from(instances.keys())
+        }
+      } catch (_) { /* 预期内 */ }
+      try {
+        if (!names.includes('VWAP')) {
+          // isStack=true 追加，避免把别人的指标清掉
+          const paneId = chart.createIndicator('VWAP', true, { id: 'candle_pane' })
+          if (paneId) _vwapPaneId = paneId
+        }
+        // 0 轴线/锚定指标被清掉时，强制重建（清掉缓存锚点，跳过「未变化」短路）
+        if (!names.includes(MINUTE_ZERO_LINE_IND)) _minuteAxisRange = null
+        applyMinutePrevCloseAxis()
+      } catch (_) { /* 预期内 */ }
+    }
+
+    /**
+     * 分时图：以昨收为中心绘制 0 轴线（原生指标线），并锁定 Y 轴为对称区间。
+     *
+     * 首次进入分时图表时容器可能尚未完成布局，此时 Y 轴高度为 0，
+     * 锁定会被后续的 resize / 铺满动作冲掉，因此这里排几次延时重试做自愈。
+     */
+    const setupMinutePrevCloseReference = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      // 取值即得：即使异步获取链路（props/1m推导/日线接口）未完成，
+      // 也会就地从已加载的真实柱解析出昨收，保证 0 轴线与居中不缺席
+      const pcReady = resolveMinutePrevClose()
+      if (pcReady == null || !(pcReady > 0)) return
+
+      const drawZeroLine = () => {
+        // 0 轴线指标（原生逐帧重绘，与日K收盘线同机制）+ 锁定 Y 轴（对称 → 昨收恰在垂直中心）
+        ensureMinuteZeroLineIndicator()
+        applyMinutePrevCloseAxis()
+      }
+
+      drawZeroLine()
+      // 布局/铺满/指标刷新都可能把 Y 轴重置，延时自愈重试
+      ;[150, 400, 1000].forEach(delay => {
+        safeTimeout(() => {
+          if (!isMinuteLine.value || !chartRef.value) return
+          if (resolveMinutePrevClose() == null) return
+          drawZeroLine()
+        }, delay)
+      })
+    }
+
+    /** 分时图：清除 0 轴线并解除 Y 轴锚定 */
+    const clearMinutePrevCloseReference = () => {
+      // 取消尚未执行的分时全量写入节流定时器，避免切走之后旧数据覆盖新周期
+      if (_minuteApplyTimer != null) {
+        clearTimeout(_minuteApplyTimer)
+        _timers.delete(_minuteApplyTimer)
+        _minuteApplyTimer = null
+        _minuteApplyPending = null
+      }
+      // 0 轴线指标在 clearMinutePrevCloseAxis 中统一移除
+      clearMinutePrevCloseAxis()
+    }
+
     /** 设置图表为分时图模式 */
     const applyMinuteLineChartStyle = () => {
       if (!chartRef.value) return
@@ -2893,7 +3684,9 @@ registerOverlay({
             try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) { /* 预期内：VWAP 指标可能尚未创建 */ }
             _vwapPaneId = null
           }
-          const paneId = chartRef.value.createIndicator('VWAP', false, { id: 'candle_pane' })
+          // isStack=true 追加。传 false 时 klinecharts 会执行 `paneInstances = []`，
+          // 把主图已有的指标（含上一轮残留的 VWAP）清空；此处已先移除旧 VWAP，用 true 更安全
+          const paneId = chartRef.value.createIndicator('VWAP', true, { id: 'candle_pane' })
           if (paneId) {
             _vwapPaneId = paneId
             // 注意：不加入 addedIndicatorIds，避免被 updateIndicators 清除
@@ -2902,15 +3695,22 @@ registerOverlay({
           console.warn('添加 VWAP 指标失败:', vwapErr)
         }
 
+        // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
+        setupMinutePrevCloseReference()
+
         // 3. 铺满全部数据并锁定交互：X 轴固定覆盖整个交易时段（9:30 - 15:00）
         //    铺满需要在滚动能力未被禁用时执行，故先 fit 再 disable
         fitMinuteLineView()
+        // 铺满会重排绘图区并重算刻度，之后必须再锁定一次 Y 轴范围
+        applyMinutePrevCloseAxis()
         disableMinuteInteractions()
         // 锁定主图 Y 轴手势（右轴拖拽/滚轮缩放），Y 轴自动跟随数据
         lockMinutePaneAxes()
         // 布局/指标副图就绪后再校准一次（首次铺满时绘图区宽度可能尚未稳定）
         safeTimeout(() => {
-          if (isMinuteLine.value) fitMinuteLineView()
+          if (!isMinuteLine.value) return
+          fitMinuteLineView()
+          applyMinutePrevCloseAxis()
         }, 150)
       } catch (e) {
         console.warn('设置分时图样式失败:', e)
@@ -2929,6 +3729,9 @@ registerOverlay({
           } catch (_) { /* 预期内：VWAP 指标可能已被移除 */ }
           _vwapPaneId = null
         }
+
+        // 1.5 清除分时 0 轴线并恢复默认 Y 轴
+        clearMinutePrevCloseReference()
 
         // 2. 恢复滚轮和触摸交互（含主图 Y 轴手势）
         enableMinuteInteractions()
@@ -3015,6 +3818,14 @@ registerOverlay({
 
       loading.value = true
       error.value = null
+      // 换标的时才清空昨收缓存；同标的的常规刷新（轮询/边界/看门狗重载）保留缓存，
+      // 避免重载到异步重取昨收之间 Y 轴短暂失去锚定，表现为每轮刷新闪烁一下
+      const _pcKey = `${props.market || ''}|${props.symbol || ''}`
+      if (_minutePcSymbolKey !== _pcKey) {
+        _minutePcSymbolKey = _pcKey
+        minutePrevClose.value = null
+        _minutePcSource = ''
+      }
 
       // 分时图模式：使用1m数据
       const loadTimeframe = isMinuteLine.value ? '1m' : props.timeframe
@@ -3059,6 +3870,11 @@ registerOverlay({
             throw new Error('今日暂无分时数据')
           }
           klineData.value = minuteData
+          // 保存跨日 1m 原始数据：昨收自愈推导需要（klineData 仅含展示当日）
+          _minuteRawData = formattedData
+          // 获取昨日收盘价（昨收），用于 Y 轴居中与 0 轴线
+          // 传入 1m 原始数据：昨收优先从中推导，避免依赖额外的日线接口
+          await fetchMinutePrevClose(formattedData)
         } else {
           klineData.value = formattedData
         }
@@ -3466,6 +4282,59 @@ registerOverlay({
     }
 
     // ── REST 轮询（非加密市场 / WS 断连临时回退） ──
+
+    /**
+     * 分时：把下一次刷新对齐到整分钟过界后 ~1.5s。
+     * 分时的最小粒度就是 1 分钟，常规 5s 轮询已经能覆盖，但对齐过界可以确保
+     * 「新一分钟的柱子」在出现后第一时间被拉取并补齐，不会滞后近一个轮询周期。
+     */
+    const scheduleMinuteBoundaryRefresh = () => {
+      if (_minuteBoundaryTimer) {
+        clearTimeout(_minuteBoundaryTimer)
+        _timers.delete(_minuteBoundaryTimer)
+        _minuteBoundaryTimer = null
+      }
+      if (!isMinuteLine.value) return
+      const now = Date.now()
+      // 距下一个整分钟的毫秒数 + 1.5s 后端聚合缓冲
+      const delay = (60 - Math.floor(now / 1000) % 60) * 1000 - (now % 1000) + 1500
+      _minuteBoundaryTimer = safeTimeout(() => {
+        _minuteBoundaryTimer = null
+        if (!isMinuteLine.value || !chartRef.value) return
+        if (!props.realtimeEnabled || !props.symbol) return
+        if (loading.value || loadingHistory.value) return
+        // 常规增量刷新
+        if (!realtimeFetchInFlight.value) updateKlineRealtime()
+        runMinuteStallWatchdog()
+        scheduleMinuteBoundaryRefresh()
+      }, Math.max(delay, 500))
+    }
+
+    /**
+     * 分时：数据停滞看门狗。
+     * 增量链路任何一环失效（接口无增量、WS 假连、补齐逻辑异常）都会表现为「图不动」，
+     * 这里在盘中发现长时间没有变化就静默全量重载一次，保证最终一定能追上。
+     */
+    const runMinuteStallWatchdog = () => {
+      try {
+        if (!isMinuteLine.value || !props.realtimeEnabled || !props.symbol) return
+        if (loading.value || loadingHistory.value) return
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+        // 只对「正在显示当日盘面」生效：休市/看历史日期时不重载，避免无谓刷新
+        const nowStr = minuteDateStr(Date.now())
+        const hasToday = (klineData.value || []).some(b => !b.__pad && minuteDateStr(b.timestamp) === nowStr)
+        if (!hasToday) return
+        const now = Date.now()
+        const since = _minuteLastChangeTs || now
+        // 超过 2.5 分钟没变化 → 静默全量重载；两次重载至少间隔 3 分钟
+        if (now - since < 150000) return
+        if (_minuteWatchdogTs && now - _minuteWatchdogTs < 180000) return
+        _minuteWatchdogTs = now
+        _minuteLastChangeTs = now
+        loadKlineData(true)
+      } catch (_) { /* 预期内：重载失败等下一轮 */ }
+    }
+
     const startRestPolling = () => {
       if (realtimeTimer.value) {
         clearInterval(realtimeTimer.value)
@@ -3481,7 +4350,8 @@ registerOverlay({
         '1W': 1800000
       }
       const base = intervalMap[props.timeframe] || 10000
-      realtimeInterval.value = Math.min(Math.max(base, 2000), 15000)
+      // 分时模式实时性要求更高，固定 5s 轮询（intervalMap 无 '分时' 键）
+      realtimeInterval.value = Math.min(Math.max(isMinuteLine.value ? 5000 : base, 2000), 15000)
 
       if (props.realtimeEnabled && props.symbol && klineData.value.length > 0) {
         realtimeTimer.value = setInterval(() => {
@@ -3490,12 +4360,23 @@ registerOverlay({
           }
         }, realtimeInterval.value)
       }
+
+      // 分时：额外挂一个整分钟对齐的强制刷新（新柱出现后 1.5s 内必定补上）
+      if (isMinuteLine.value) {
+        _minuteLastChangeTs = Date.now()
+        scheduleMinuteBoundaryRefresh()
+      }
     }
 
     const stopRestPolling = () => {
       if (realtimeTimer.value) {
         clearInterval(realtimeTimer.value)
         realtimeTimer.value = null
+      }
+      if (_minuteBoundaryTimer) {
+        clearTimeout(_minuteBoundaryTimer)
+        _timers.delete(_minuteBoundaryTimer)
+        _minuteBoundaryTimer = null
       }
     }
 
@@ -3658,7 +4539,7 @@ registerOverlay({
           if (!wsClient) {
             wsClient = new ExchangeKlineWs()
           }
-          wsClient.connect(props.symbol, props.timeframe, {
+          wsClient.connect(props.symbol, isMinuteLine.value ? '1m' : props.timeframe, {
             onTick: handleWsTick,
             onNewBar: handleWsNewBar,
             onError: handleWsError,
@@ -3673,6 +4554,13 @@ registerOverlay({
         }
       } else {
         startRestPolling()
+      }
+
+      // 分时：无论走 WS 还是 REST 轮询，都额外挂一个整分钟对齐的刷新，
+      // 保证整分钟的新柱一定会被补上（并顺带跑停滞看门狗做兜底）
+      if (gen === _realtimeGeneration && isMinuteLine.value) {
+        _minuteLastChangeTs = Date.now()
+        scheduleMinuteBoundaryRefresh()
       }
     }
 
@@ -3948,6 +4836,22 @@ registerOverlay({
               }
             }
 
+            // 分时模式：首次经 initChart 建图时也必须应用面积图样式 / 0 轴线 / Y 轴居中 /
+            // VWAP。原先只在 loadKlineData 的「图表已存在」分支里调用 applyMinuteLineChartStyle，
+            // 若首个标的在 initChart 定时器(300ms)之前就绪，图表由这里创建 → 分时样式整体缺失。
+            if (isMinuteLine.value) {
+              nextTick(() => {
+                if (chartRef.value && isMinuteLine.value) applyMinuteLineChartStyle()
+              })
+            } else {
+              nextTick(() => {
+                if (chartRef.value) {
+                  restoreNormalChartStyle()
+                  restoreChartScene(props.timeframe)
+                }
+              })
+            }
+
             // VOL 现在作为可选内置指标，通过 updateIndicators 管理
             // 延迟更新指标，确保K线先渲染
             nextTick(() => {
@@ -3975,7 +4879,11 @@ registerOverlay({
               chartRef.value.resize()
               renderChip()
               // 分时模式：绘图区宽度变化后重新铺满（X 轴保持覆盖整个交易时段）
-              if (isMinuteLine.value) fitMinuteLineView()
+              if (isMinuteLine.value) {
+                fitMinuteLineView()
+                // resize 会触发刻度重建，重排后再次锁定 Y 轴居中范围
+                applyMinutePrevCloseAxis()
+              }
             } catch (e) {
               // P1-3: resize 失败需留痕，否则图表错位难以定位
               console.warn('[KlineChart] resize 重绘失败:', e)
@@ -4435,7 +5343,7 @@ registerOverlay({
                           // 主图指标
                           const paneId = chartRef.value.createIndicator(
                             customIndicatorName,
-                            false,
+                            true, // isStack=true 追加；传 false 会清空主图已有的 VWAP / 锚定指标
                             { id: 'candle_pane' }
                           )
                           if (paneId) {
@@ -5294,6 +6202,8 @@ registerOverlay({
         }
       }
       } finally {
+        // 分时：指标刷新可能清空主图指标 → 补挂 VWAP 与 Y 轴锚定
+        try { ensureMinuteIndicators() } catch (_) { /* 预期内 */ }
         indicatorsUpdating.value = false
       }
     }
@@ -5378,6 +6288,17 @@ registerOverlay({
         }
       }
     }, { deep: true })
+
+    // 分时：昨收可能异步到位（父组件传入 / 从 1m 数据推导 / 日线接口兜底），
+    // 到位后立即补画 0 轴线并锁定 Y 轴，避免「数据先渲染、昨收后到」导致两者都缺失
+    watch(() => minutePrevClose.value, (pc) => {
+      if (!isMinuteLine.value || !chartRef.value) return
+      if (pc == null || !(pc > 0)) return
+      nextTick(() => {
+        if (!isMinuteLine.value || !chartRef.value) return
+        try { setupMinutePrevCloseReference() } catch (_) { /* 预期内 */ }
+      })
+    })
 
     watch(() => props.realtimeEnabled, (newVal) => {
       if (newVal) {
@@ -5942,6 +6863,17 @@ registerOverlay({
               type: mode === 'percent' ? 'percentage' : 'normal'
             }
           })
+          // 【关键】库的 setStyles 在指定 yAxis.type 时会执行 setAutoCalcTickFlag(true)，
+          // 解除分时的 Y 轴居中锁定 → 窗口退回「按数据 min~max 铺满」。
+          // 分时模式下必须等样式生效后立即补锁（含 0 轴线指标与居中范围）。
+          if (isMinuteLine.value) {
+            ;[60, 300].forEach(delay => {
+              safeTimeout(() => {
+                if (!isMinuteLine.value || !chartRef.value) return
+                try { applyMinutePrevCloseAxis() } catch (_) { /* 预期内 */ }
+              }, delay)
+            })
+          }
         } catch (e) { console.warn('setYAxisMode failed:', e) }
       }
     }
