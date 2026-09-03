@@ -700,7 +700,7 @@ def _add_to_watchlist(user_id: int, market: str, symbol: str, name: str = "") ->
                 cur.execute(
                     """INSERT INTO qd_watchlist (user_id, market, symbol, name)
                        VALUES (%s, %s, %s, %s)
-                       ON CONFLICT (user_id, market, symbol) DO UPDATE SET
+                       ON CONFLICT (user_id, market, symbol, group_name) DO UPDATE SET
                            name = EXCLUDED.name, updated_at = NOW()""",
                     (user_id, market, symbol, name),
                 )

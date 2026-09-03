@@ -428,9 +428,11 @@ CREATE TABLE IF NOT EXISTS qd_watchlist (
     symbol VARCHAR(50) NOT NULL,
     name VARCHAR(100) DEFAULT '',
     group_name VARCHAR(50) NOT NULL DEFAULT '默认自选',
+    strategy_state VARCHAR(20) DEFAULT NULL,
+    strategy_detail JSONB DEFAULT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(user_id, market, symbol)
+    UNIQUE(user_id, market, symbol, group_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON qd_watchlist(user_id);

@@ -38,6 +38,8 @@ def register_routes(app: Flask):
     from app.market_store.plugin_api import market_local_bp
     # cron — 定时任务管理 API
     from app.routes.cron import cron_bp
+    # 龙回头Pro — 策略信号 API (盘后扫描/盘中监控)
+    from app.market_cn.auto.dragon_api import dragon_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp, url_prefix='/api/auth')   # Auth routes
@@ -70,3 +72,4 @@ def register_routes(app: Flask):
     app.register_blueprint(stock_screener_bp, url_prefix='/api/stock-screener')
     app.register_blueprint(market_local_bp, url_prefix='/api/market-local')
     app.register_blueprint(cron_bp)
+    app.register_blueprint(dragon_bp, url_prefix='/api/market')

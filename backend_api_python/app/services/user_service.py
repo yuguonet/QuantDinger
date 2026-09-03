@@ -44,7 +44,7 @@ def _seed_default_watchlist(db, user_id: int):
             """
             INSERT INTO qd_watchlist (user_id, market, symbol, name, created_at, updated_at)
             VALUES (?, ?, ?, ?, NOW(), NOW())
-            ON CONFLICT (user_id, market, symbol) DO NOTHING
+            ON CONFLICT (user_id, market, symbol, group_name) DO NOTHING
             """,
             (user_id, market, symbol, name),
         )

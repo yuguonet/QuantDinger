@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-realtime_monitor 盘中策略回测 (V2 多维过滤版, 基于15分钟K线)
+盘中回踩企稳策略回测 (基于15分钟K线)
+
+核心思路: 不追板、不追高, 只做上升趋势中的回踩买点, 最大化单位时间收益率
 
 用法:
   python backtest_realtime_monitor.py --days 60          # 最近60个交易日
   python backtest_realtime_monitor.py --days 120 --all   # 输出每笔明细
-  python backtest_realtime_monitor.py --days 30 --category 首板新  # 只测某一类
   python backtest_realtime_monitor.py --compare          # 参数对比模式
-  python backtest_realtime_monitor.py --take-profit 8    # 止盈+8%
-  python backtest_realtime_monitor.py --tech-filter      # 启用技术分过滤 (V2)
+  python backtest_realtime_monitor.py --take-profit 5    # 止盈+5%
+  python backtest_realtime_monitor.py --tech-filter      # 启用技术分过滤
   python backtest_realtime_monitor.py --tech-filter --min-tech 70  # 技术分>=70
 
 回测逻辑:
-  1. 日线识别候选: 首板(新)/首板(旧)/昨日2连板/非昨日2连板 (排除ST, 放量)
+  1. 日线识别上升趋势回踩候选: MA多头排列 + 无近期涨停 + 量价健康
   2. 可选: 技术分过滤 (tech_score >= min_tech, 默认60)
-  3. 次日用15mK线模拟盘中信号规则
+  3. 次日用15mK线寻找回踩支撑入场点 (多因子评分)
   4. 信号触发后追踪出场 (止损 / 追踪止损 / 止盈 / 持仓上限)
 
 出场规则:
@@ -23,12 +24,12 @@ realtime_monitor 盘中策略回测 (V2 多维过滤版, 基于15分钟K线)
   止盈: 峰值达到 entry × (1 + take_profit/100) 时, 追踪止损收紧一半锁定利润
   持仓到期: 最后一根bar收盘
 
-信号规则 (V2, 与 realtime_monitor.py V2 一致):
-  前置条件 — tech_score >= 60 (启用 --tech-filter 时) + 日内动量 > -2%
-  首板(新)   — 今日动量 > 昨日动量 × 1.5 + OBV不下降
-  首板(旧)   — 突破VWAP站稳>2根bar(≈30min) + 多头排列 + RSI>50
-  昨日2连板  — 高开>0% + 收盘>VWAP + 缩量 + 多头排列
-  非昨日2连板 — 突破VWAP站稳>2根bar(≈30min) + 多头排列 + RSI>50
+入场规则 (回踩企稳, 多因子评分 ≥ 3):
+  前置条件 — 日线MA多头排列 + 无近期涨停 + RSI冷却(35-65)
+  VWAP回踩   — 价格回踩VWAP±1.5% + 缩量
+  MA回踩     — 价格回踩MA5±1.5% + 缩量
+  动量恢复   — 日内动量 -1%~+3% (回踩后企稳, 非追高)
+  反转形态   — 下影线锤子线或收盘反包前阴线
 """
 from __future__ import annotations
 import argparse, os, sys, json
@@ -174,7 +175,7 @@ def _merge_group_15m(group: List[Dict]) -> Dict:
     }
 
 # ================================================================
-# 技术指标 (移植自 dragon_d0_alert.py / realtime_monitor.py V2)
+# 技术指标
 # ================================================================
 
 def calc_rsi(closes, period=14):
@@ -244,6 +245,22 @@ def calc_ma5_angle(closes, period=5, days=3):
     return slope / recent[-1] * 100 if recent[-1] else None
 
 
+def _calc_atr_15m(bars, period=8):
+    """计算15m级别ATR (用于回踩支撑判定)"""
+    if len(bars) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(bars)):
+        tr = max(bars[i]['high'] - bars[i]['low'],
+                 abs(bars[i]['high'] - bars[i-1]['close']),
+                 abs(bars[i]['low'] - bars[i-1]['close']))
+        trs.append(tr)
+    if not trs:
+        return 0.0
+    recent = trs[-period:]
+    return sum(recent) / len(recent)
+
+
 def calc_tech_score(bars, idx):
     """综合技术评分 (0-100)"""
     if idx < 20 or idx >= len(bars):
@@ -301,7 +318,7 @@ def calc_daily_tech_details(bars, idx):
 
 
 # ================================================================
-# 候选识别 (与 realtime_monitor.py 一致)
+# 候选识别 (回踩企稳策略)
 # ================================================================
 
 def calc_vol_ratio(daily_bars: List[Dict], limit_idx: int, window: int = 5) -> float:
@@ -318,116 +335,78 @@ def has_recent_limit_up(daily_bars, before_idx, lookback, bt):
     return False
 
 def classify_candidates(daily_bars: List[Dict], code: str, tech_filter: bool = False, min_tech: int = 60) -> List[Dict]:
-    """对某只股票的日线, 找出所有符合条件的候选日并分类
+    """识别上升趋势回踩候选日
 
-    返回: [{date, source, yesterday_momentum, ...}, ...]
-    tech_filter: 启用技术分过滤 (V2)
-    min_tech: 最低技术分阈值 (默认60)
+    策略: 不追板不追高, 只做上升趋势中的回踩企稳买点
+    条件: MA多头排列 + 无近期涨停 + RSI冷却 + 量价健康 + 日线回踩迹象
+
+    返回: [{date, source, close, prev_close, ma_bull, rsi14, last_volume, ...}, ...]
     """
     bt = get_board_type(code)
-    if len(daily_bars) < 8:
+    if len(daily_bars) < 20:
         return []
 
     candidates = []
-    # 从第8天开始 (需要前5天判断是否有涨停)
-    for idx in range(7, len(daily_bars)):
+    for idx in range(20, len(daily_bars)):
         bar = daily_bars[idx]
         prev = daily_bars[idx - 1]
-        prev2 = daily_bars[idx - 2] if idx >= 2 else None
+        if prev['close'] <= 0:
+            continue
 
-        yesterday_lu = is_limit_up(bar['close'], prev['close'], bt)
-        day_before_lu = prev2 and is_limit_up(prev['close'], prev2['close'], bt)
+        # ── 条件1: 日线MA多头排列 (稳定上升趋势) ──
+        tech = calc_daily_tech_details(daily_bars, idx)
+        if not tech.get('ma_bull', False):
+            continue
 
-        # 昨日动量
-        ym = (bar['close'] - bar['open']) / prev['close'] * 100 if prev['close'] > 0 else 0
+        rsi14 = tech.get('rsi14', 50)
+        # ── 条件2: RSI不能过热(>70)或过冷(<30) ──
+        if rsi14 > 70 or rsi14 < 30:
+            continue
 
-        if yesterday_lu and not day_before_lu:
-            # 首板
-            vr = calc_vol_ratio(daily_bars, idx, 5)
-            if vr < 1.5:
-                continue
-            has_recent = has_recent_limit_up(daily_bars, idx - 1, 5, bt)
-            cat = '首板(新)' if not has_recent else '首板(旧)'
-            candidates.append({
-                'date': bar['time'], 'source': cat, 'close': bar['close'],
-                'prev_close': prev['close'], 'open': bar['open'],
-                'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
-                'last_volume': bar['volume'],
-            })
+        # ── 条件3: 无近期涨停 (避免追板) ──
+        if has_recent_limit_up(daily_bars, idx, 5, bt):
+            continue
 
-        elif yesterday_lu and day_before_lu:
-            # 连板 — 排除3连板以上: 前天之前一天不能是涨停
-            prev2 = daily_bars[idx - 3] if idx >= 3 else None
-            day_before2_lu = prev2 and is_limit_up(daily_bars[idx-2]['close'], prev2['close'], bt)
-            if day_before2_lu:
-                continue  # 3连板以上, 跳过
-            first_lu_idx = idx - 1  # 首板日
-            vr = calc_vol_ratio(daily_bars, first_lu_idx, 5)
-            if vr < 1.5:
-                continue
-            candidates.append({
-                'date': bar['time'], 'source': '昨日2连板', 'close': bar['close'],
-                'prev_close': prev['close'], 'open': bar['open'],
-                'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
-                'streak': 2, 'last_volume': bar['volume'],
-            })
+        # ── 条件4: 量价健康 ──
+        vr = calc_vol_ratio(daily_bars, idx, 5)
+        if vr < 0.3 or vr > 2.5:
+            continue
+        # 今日成交量不能极度萎缩
+        avg_vol5 = sum(daily_bars[j]['volume'] for j in range(max(0, idx-5), idx)) / 5
+        if avg_vol5 > 0 and bar['volume'] / avg_vol5 < 0.3:
+            continue
 
-        else:
-            # 非昨日2连板: 近期有恰好2连板
-            limit_indices = find_limit_up_indices(daily_bars[:idx + 1], bt)
-            if len(limit_indices) < 2:
-                continue
-            max_streak = 1
-            cur_streak = 1
-            best_start = limit_indices[0]
-            for j in range(1, len(limit_indices)):
-                if limit_indices[j] == limit_indices[j-1] + 1:
-                    cur_streak += 1
-                    if cur_streak > max_streak:
-                        max_streak = cur_streak
-                        best_start = limit_indices[j - cur_streak + 1]
-                else:
-                    cur_streak = 1
-            if max_streak != 2:
-                continue
-            # 额外校验: 确保是真正的2连板
-            if not is_limit_up(daily_bars[best_start]['close'], daily_bars[best_start-1]['close'], bt):
-                continue
-            if not is_limit_up(daily_bars[best_start+1]['close'], daily_bars[best_start]['close'], bt):
-                continue
-            # 前一天不能是涨停 (否则是3连板)
-            if best_start >= 2 and is_limit_up(daily_bars[best_start-1]['close'], daily_bars[best_start-2]['close'], bt):
-                continue
-            vr = calc_vol_ratio(daily_bars, best_start, 5)
-            if vr < 1.5:
-                continue
-            candidates.append({
-                'date': bar['time'], 'source': '非昨日2连板', 'close': bar['close'],
-                'prev_close': prev['close'], 'open': bar['open'],
-                'yesterday_momentum': round(ym, 2), 'vol_ratio': round(vr, 2),
-                'last_volume': bar['volume'],
-            })
+        # ── 条件5: 日线涨幅可控 (不追高) ──
+        daily_chg = (bar['close'] / prev['close'] - 1) * 100
+        if daily_chg > 8 or daily_chg < -8:
+            continue
 
-    # V2: 注入技术分并过滤
-    if tech_filter and candidates:
-        filtered = []
-        for c in candidates:
-            cand_idx = None
-            for i, b in enumerate(daily_bars):
-                if b['time'] == c['date']:
-                    cand_idx = i
-                    break
-            if cand_idx is not None and cand_idx >= 20:
-                tech = calc_daily_tech_details(daily_bars, cand_idx)
-                c['tech_score'] = tech.get('tech_score', 0)
-                c['ma_bull'] = tech.get('ma_bull', False)
-                c['rsi14'] = tech.get('rsi14', 0)
-                c['obv_trend'] = tech.get('obv_trend', '平')
-                if c['tech_score'] >= min_tech:
-                    filtered.append(c)
-            else:
-                c['tech_score'] = 0
-        return filtered
+        # ── 条件6: 日线回踩迹象 (不要在新高时入场) ──
+        ma5 = sum(daily_bars[j]['close'] for j in range(idx-4, idx+1)) / 5
+        # 价格在MA5附近或以下 = 回踩; 远离MA5以上 = 追高
+        pullback_depth = (ma5 - bar['close']) / ma5 * 100 if ma5 > 0 else 0
+        if pullback_depth < -3:
+            # 价格远高于MA5, 可能是追高, 等回踩
+            continue
+
+        last_volume = bar['volume']
+
+        if tech_filter and tech.get('tech_score', 0) < min_tech:
+            continue
+
+        candidates.append({
+            'date': bar['time'],
+            'source': '回踩企稳',
+            'close': bar['close'],
+            'prev_close': prev['close'],
+            'yesterday_momentum': round(daily_chg, 2),
+            'vol_ratio': round(vr, 2),
+            'last_volume': last_volume,
+            'ma_bull': True,
+            'rsi14': round(rsi14, 1),
+            'obv_trend': tech.get('obv_trend', '平'),
+            'tech_score': tech.get('tech_score', 0),
+        })
 
     return candidates
 
@@ -448,25 +427,26 @@ def calc_vwap_15m(bars_15m: List[Dict]) -> List[float]:
     return vwap
 
 # ================================================================
-# 盘中信号检测 (15m版本)
+# 盘中信号检测 (回踩企稳, 15m多因子评分)
 # ================================================================
 
 def detect_signal_15m(bars_15m: List[Dict], candidate: Dict) -> Optional[Dict]:
-    """用15mK线检测信号 (V2 多维过滤版, 时间精度15m)
+    """用15mK线检测回踩企稳信号 (多因子评分)
 
-    规则 (V2):
-      前置条件 — 日内动量 > -2%
-      首板(新)   — 今日动量 > 昨日动量 × 1.5 + OBV不下降
-      首板(旧)   — 突破VWAP站稳>2根bar(≈30min) + 多头排列 + RSI>50
-      昨日2连板  — 高开>0% + 第一根bar收盘>VWAP + 缩量 + 多头排列
-      非昨日2连板 — 突破VWAP站稳>2根bar(≈30min) + 多头排列 + RSI>50
+    入场逻辑: 上升趋势中, 股价回踩到支撑位(VWAP/MA5)附近,
+    成交量收缩、动量企稳, 出现反转迹象时入场。不追板、不追高。
+
+    评分项 (≥3分触发):
+      VWAP回踩  — 价格在VWAP附近(±1.5%)         +2分
+      MA回踩    — 价格在MA5附近(±1.5%)           +1分
+      缩量      — 当前成交量 < 5bar均值×0.6       +1分
+      动量恢复  — 日内动量在-1%~+3%区间            +1分
+      反转形态  — 锤子线或反包前阴线               +1分
     """
     if len(bars_15m) < 3:
         return None
 
-    source = candidate['source']
     prev_close = candidate['prev_close']
-    yesterday_momentum = candidate['yesterday_momentum']
     today_open = bars_15m[0]['open']
 
     if prev_close <= 0 or today_open <= 0:
@@ -475,78 +455,86 @@ def detect_signal_15m(bars_15m: List[Dict], candidate: Dict) -> Optional[Dict]:
     open_gap = (today_open / prev_close - 1) * 100
     vwap_seq = calc_vwap_15m(bars_15m)
 
+    # 15m级别ATR用于判定支撑区间宽度
+    atr = _calc_atr_15m(bars_15m, 8)
+
+    best_signal = None
+    best_score = 0
+
     for i in range(2, len(bars_15m)):
         current = bars_15m[i]
         current_price = current['close']
         vwap = vwap_seq[i]
         today_momentum = (current_price - today_open) / prev_close * 100
 
-        # V2 前置: 日内动量 < -2% 直接拒绝
-        if today_momentum < -2.0:
+        # ── 前置: 日内动量不能崩 (<-3%) ──
+        if today_momentum < -3.0:
             continue
 
-        signal = None
+        score = 0
 
-        if source == '昨日2连板':
-            # 高开>0% + 第一根bar收盘>VWAP + 缩量 + 多头排列
-            if open_gap > 0 and bars_15m[0]['close'] > vwap_seq[0]:
-                if not candidate.get('ma_bull', False):
-                    continue
-                today_vol = sum(b['volume'] for b in bars_15m[:i + 1])
-                yesterday_vol = candidate.get('last_volume', 0)
-                vol_shrink = today_vol / yesterday_vol if yesterday_vol > 0 else 1.0
-                if vol_shrink < 0.7:
-                    signal = {'type': '2连板_高开缩量', 'vol_shrink': round(vol_shrink, 2)}
+        # ── 因子1: VWAP回踩支撑 (+2分) ──
+        atr_pct = atr / current_price * 100 if current_price > 0 else 0
+        if atr_pct > 0:
+            dist_vwap = abs(current_price - vwap) / current_price * 100
+            if dist_vwap <= max(atr_pct * 0.6, 0.3):
+                score += 2
 
-        elif source == '首板(新)':
-            if yesterday_momentum > 0 and today_momentum > yesterday_momentum * 1.5:
-                # V2: OBV不下降
-                obv = candidate.get('obv_trend', '平')
-                if obv == '下降':
-                    continue
-                signal = {'type': '首板新_动量加速'}
+        # ── 因子2: MA5(15m)回踩支撑 (+1分) ──
+        if i >= 4:
+            ma5_15m = sum(bars_15m[j]['close'] for j in range(i-4, i+1)) / 5
+            dist_ma5 = abs(current_price - ma5_15m) / current_price * 100
+            if dist_ma5 <= max(atr_pct * 0.6, 0.3):
+                score += 1
 
-        else:
-            # 首板(旧) / 非昨日2连板 — 站稳VWAP超2根bar + 多头 + RSI>50
-            if not candidate.get('ma_bull', False):
-                continue
-            rsi14 = candidate.get('rsi14', 0)
-            if rsi14 and rsi14 < 50:
-                continue
-            if current_price >= vwap:
-                above_count = 0
-                for j in range(i, -1, -1):
-                    if bars_15m[j]['close'] >= vwap_seq[j]:
-                        above_count += 1
-                    else:
-                        break
-                if above_count >= 2:
-                    signal = {'type': f'{source}_站稳均线'}
+        # ── 因子3: 成交量收缩 (+1分) ──
+        if i >= 5:
+            avg_vol = sum(bars_15m[j]['volume'] for j in range(i-5, i)) / 5
+            if avg_vol > 0 and current['volume'] < avg_vol * 0.6:
+                score += 1
 
-        if signal:
-            signal.update({
+        # ── 因子4: 动量温和 (-1%~+3%) (+1分) ──
+        if -1.0 <= today_momentum <= 3.0:
+            score += 1
+
+        # ── 因子5: 反转形态 (+1分) ──
+        prev_bar = bars_15m[i - 1]
+        c, o, h, lo = current['close'], current['open'], current['high'], current['low']
+        body = abs(c - o)
+        lower_shadow = min(c, o) - lo
+
+        is_hammer = body > 0 and lower_shadow >= body * 2       # 锤子线
+        is_bounce = c > prev_bar['close'] and prev_bar['close'] < prev_bar['open']  # 反包前阴
+        if is_hammer or is_bounce:
+            score += 1
+
+        # ── 阈值: 3分触发, 取最高分信号 ──
+        if score >= 3 and score > best_score and current_price > 0:
+            best_score = score
+            best_signal = {
                 'bar_idx': i,
                 'entry_price': current_price,
                 'entry_time': current['time'],
-                'vwap': vwap,
+                'type': '回踩企稳',
+                'vwap': round(vwap, 3),
                 'open_gap': round(open_gap, 2),
                 'today_momentum': round(today_momentum, 2),
-                'yesterday_momentum': yesterday_momentum,
-            })
-            return signal
+                'yesterday_momentum': candidate.get('yesterday_momentum', 0),
+                'signal_score': score,
+            }
 
-    return None
+    return best_signal
 
 # ================================================================
 # 出场回测 (15m)
 # ================================================================
 
 def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
-                      stop_loss: float = -5.0, trailing_stop: float = -5.0,
-                      take_profit: float = 0, max_hold_bars: int = 32) -> Dict:
+                      stop_loss: float = -3.0, trailing_stop: float = -2.5,
+                      take_profit: float = 5, max_hold_bars: int = 16) -> Dict:
     """15m级别出场回测
 
-    max_hold_bars: 32根15m bar ≈ 7个交易日 (32×15min=480min=8h=1天, ×7≈7天)
+    max_hold_bars: 16根15m bar ≈ 2个交易日 (快进快出)
 
     出场规则:
       1. 止盈: 峰值达到 entry_price × (1 + take_profit/100) 时锁定
@@ -616,10 +604,10 @@ def run_exit_backtest(bars_15m: List[Dict], entry_idx: int, entry_price: float,
 # ================================================================
 
 def backtest_stock(code: str, daily_bars: List[Dict],
-                   hold_bars: int = 32, stop_loss: float = -5.0,
-                   trailing_stop: float = -5.0, take_profit: float = 0,
+                   hold_bars: int = 16, stop_loss: float = -3.0,
+                   trailing_stop: float = -2.5, take_profit: float = 5,
                    tech_filter: bool = False, min_tech: int = 60) -> List[Dict]:
-    """单股回测: 识别候选日 → 拉15m数据 → 检测信号 → 模拟出场"""
+    """单股回测: 识别回踩候选日 → 拉15m数据 → 多因子评分信号 → 模拟出场"""
     candidates = classify_candidates(daily_bars, code, tech_filter=tech_filter, min_tech=min_tech)
     if not candidates:
         return []
@@ -741,31 +729,32 @@ def print_detail(trades: List[Dict]):
 # ================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="realtime_monitor 盘中策略回测 (15m)")
+    _load_env()  # 必须在任何DB操作前加载, 否则 MarketDBManager 单例会拿到空密码
+    parser = argparse.ArgumentParser(description="盘中回踩企稳策略回测 (15m, 不追板不追高)")
     parser.add_argument("--days", type=int, default=60, help="回看交易日数 (默认60)")
     parser.add_argument("--codes", default="", help="指定股票代码, 逗号分隔")
     parser.add_argument("--category", default="all",
-                        choices=["all", "首板新", "首板旧", "昨日2连板", "非昨日2连板"],
+                        choices=["all", "回踩"],
                         help="只测某一类")
-    parser.add_argument("--hold", type=int, default=32, help="最大持仓bar数 (默认32≈7天)")
-    parser.add_argument("--stop-loss", type=float, default=-5.0, help="止损百分比 (默认-5)")
-    parser.add_argument("--trailing-stop", type=float, default=-5.0, help="追踪止损百分比 (默认-5)")
-    parser.add_argument("--take-profit", type=float, default=0, help="止盈百分比 (默认0=不禁用)")
-    parser.add_argument("--tech-filter", action="store_true", help="V2: 启用技术分过滤 (tech_score >= min-tech)")
-    parser.add_argument("--min-tech", type=int, default=60, help="V2: 最低技术分 (默认60)")
+    parser.add_argument("--hold", type=int, default=16, help="最大持仓bar数 (默认16≈2天)")
+    parser.add_argument("--stop-loss", type=float, default=-3.0, help="止损百分比 (默认-3)")
+    parser.add_argument("--trailing-stop", type=float, default=-2.5, help="追踪止损百分比 (默认-2.5)")
+    parser.add_argument("--take-profit", type=float, default=5, help="止盈百分比 (默认5)")
+    parser.add_argument("--tech-filter", action="store_true", help="启用技术分过滤 (tech_score >= min-tech)")
+    parser.add_argument("--min-tech", type=int, default=60, help="最低技术分 (默认60)")
     parser.add_argument("--compare", action="store_true", help="参数对比模式, 测试多组参数")
     parser.add_argument("--all", action="store_true", help="输出每笔明细")
     args = parser.parse_args()
 
-    cat_map = {'首板新': '首板(新)', '首板旧': '首板(旧)', '昨日2连板': '昨日2连板', '非昨日2连板': '非昨日2连板'}
+    cat_map = {'回踩': '回踩企稳'}
 
     print("=" * 70)
-    print("  📊 realtime_monitor 盘中策略回测 (V2 多维过滤版, 15m)")
+    print("  盘中回踩企稳策略回测 (15m, 不追板不追高)")
     print("=" * 70)
     if args.tech_filter:
-        print(f"  ✅ 技术分过滤: tech_score >= {args.min_tech}")
+        print(f"  技术分过滤: tech_score >= {args.min_tech}")
     else:
-        print(f"  ℹ️  技术分过滤: 未启用 (加 --tech-filter 启用 V2 过滤)")
+        print(f"  技术分过滤: 未启用 (加 --tech-filter 启用过滤)")
 
     # 获取股票列表
     if args.codes:
@@ -790,17 +779,17 @@ def main():
     # ── 参数对比模式 ──
     if args.compare:
         param_sets = [
-            {'label': '当前(无止盈)',  'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 0},
-            {'label': '止盈+8%',      'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 8.0},
-            {'label': '止盈+10%',     'stop_loss': -5.0, 'trailing_stop': -5.0, 'take_profit': 10.0},
-            {'label': '止盈+8%+追踪-3%', 'stop_loss': -5.0, 'trailing_stop': -3.0, 'take_profit': 8.0},
-            {'label': '止盈+10%+追踪-3%', 'stop_loss': -5.0, 'trailing_stop': -3.0, 'take_profit': 10.0},
-            {'label': '止损-3%+止盈+8%', 'stop_loss': -3.0, 'trailing_stop': -5.0, 'take_profit': 8.0},
+            {'label': '默认(止盈5%)',   'stop_loss': -3.0, 'trailing_stop': -2.5, 'take_profit': 5.0},
+            {'label': '保守(止盈3%)',   'stop_loss': -2.0, 'trailing_stop': -2.0, 'take_profit': 3.0},
+            {'label': '稳健(止盈5%)',   'stop_loss': -3.0, 'trailing_stop': -2.0, 'take_profit': 5.0},
+            {'label': '积极(止盈8%)',   'stop_loss': -3.0, 'trailing_stop': -2.5, 'take_profit': 8.0},
+            {'label': '宽松(止盈10%)',  'stop_loss': -4.0, 'trailing_stop': -3.0, 'take_profit': 10.0},
+            {'label': '快进快出(止盈3%)', 'stop_loss': -2.0, 'trailing_stop': -1.5, 'take_profit': 3.0},
         ]
 
         tech_str = f", 技术分>={args.min_tech}" if args.tech_filter else ""
         print(f"\n{'='*90}")
-        print(f"  📊 参数对比 ({len(daily_cache)}只股票, hold={args.hold}bar{tech_str})")
+        print(f"  参数对比 ({len(daily_cache)}只股票, hold={args.hold}bar{tech_str})")
         print(f"{'='*90}")
         print(f"  {'方案':<22} {'笔数':>6} {'胜率':>7} {'均收益':>8} {'均峰值':>8} {'盈亏比':>7} {'单位时间':>9} {'出场分布':>20}")
         print(f"  {'-'*90}")
@@ -849,7 +838,7 @@ def main():
         return
 
     # ── 单次回测模式 ──
-    cat_map = {'首板新': '首板(新)', '首板旧': '首板(旧)', '昨日2连板': '昨日2连板', '非昨日2连板': '非昨日2连板'}
+    cat_map = {'回踩': '回踩企稳'}
 
     # 回测
     all_trades = []
@@ -876,9 +865,9 @@ def main():
 
     # 按分类统计
     print(f"\n{'='*70}")
-    print(f"  📈 分类统计")
+    print(f"  策略统计")
     print(f"{'='*70}")
-    for cat in ['首板(新)', '首板(旧)', '昨日2连板', '非昨日2连板']:
+    for cat in ['回踩企稳']:
         if cat_trades[cat]:
             print_stats(cat_trades[cat], cat)
     if all_trades:
@@ -887,7 +876,7 @@ def main():
 
     # 明细
     if args.all:
-        for cat in ['首板(新)', '首板(旧)', '昨日2连板', '非昨日2连板']:
+        for cat in ['回踩企稳']:
             if cat_trades[cat]:
                 print(f"\n  ── {cat} ──")
                 print_detail(cat_trades[cat])
@@ -903,7 +892,7 @@ def main():
             'by_category': {cat: len(trades) for cat, trades in cat_trades.items()},
             'trades': all_trades,
         }, f, ensure_ascii=False, indent=2)
-    print(f"\n  💾 明细已导出: {outfile}")
+    print(f"\n  明细已导出: {outfile}")
 
 
 if __name__ == "__main__":

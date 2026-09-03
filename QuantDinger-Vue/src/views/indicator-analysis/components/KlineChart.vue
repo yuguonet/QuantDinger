@@ -234,6 +234,11 @@ export default {
       type: Boolean,
       default: true
     },
+    /** 龙回头Pro 买卖点标记 [{time, side: signal/buy/sell, price, label}]；为空时组件自动按 symbol 拉取 */
+    dragonMarkers: {
+      type: Array,
+      default: () => []
+    },
     /** 昨日首板价（昨收），分时图 Y 轴中心与 0 轴线基准；缺省时自动回退获取 */
     prevClose: {
       type: Number,
@@ -271,6 +276,87 @@ export default {
     let chartResizeRafId = null
     /** handleResize 的 rAF 句柄（P1-4：替代固定 100ms 延时做防抖，与项目内其他 resize 一致） */
     let _resizeRafId = null
+
+    // ═══════════════════════════════════════════════════════
+    // 龙回头Pro 买卖点标记 (B/S 标注在日线/分时图上)
+    // ═══════════════════════════════════════════════════════
+    const dragonMarkerSource = shallowRef([])
+
+    /** 应用标记: 清除旧 overlay → 按日期映射到 bar → simpleAnnotation 画 B/S */
+    const applyDragonMarkers = () => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.createOverlay !== 'function' || typeof chart.removeOverlay !== 'function') return
+      try { chart.removeOverlay(o => o && o.dragonTag) } catch (_) { /* 低版本不支持过滤回调则忽略 */ }
+      const list = dragonMarkerSource.value || []
+      const data = klineData.value || []
+      if (!list.length || !data.length) return
+      // 日号 → bar 索引 (同时兼容 UTC 与 UTC+8 两种时间戳约定)
+      const dayMap = new Map()
+      data.forEach((d, i) => {
+        const ts = Number(d && d.timestamp)
+        if (!Number.isFinite(ts) || ts <= 0) return
+        const k1 = Math.floor(ts / 86400000)
+        const k2 = Math.floor((ts + 8 * 3600000) / 86400000)
+        if (!dayMap.has(k1)) dayMap.set(k1, i)
+        if (!dayMap.has(k2)) dayMap.set(k2, i)
+      })
+      const colors = { buy: '#15803d', sell: '#dc2626', signal: '#d97706' }
+      const texts = { buy: 'B', sell: 'S', signal: '信' }
+      const dayNumOf = (s) => {
+        const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
+        if (!m) return null
+        return Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000
+      }
+      let applied = 0
+      list.forEach(m => {
+        const dayNum = dayNumOf(m.time)
+        if (dayNum === null) return
+        const idx = dayMap.get(dayNum)
+        if (idx === undefined) return
+        const color = colors[m.side] || '#d97706'
+        try {
+          chart.createOverlay({
+            name: 'simpleAnnotation',
+            dragonTag: true,
+            points: [{ timestamp: Number(data[idx].timestamp), value: Number(m.price) }],
+            text: texts[m.side] || '信',
+            styles: {
+              symbol: { size: 13, color: color, activeColor: color },
+              text: { size: 10, color: color, weight: 700 }
+            }
+          })
+          applied += 1
+        } catch (_) { /* 单点失败不影响其它标记 */ }
+      })
+      if (applied > 0 && console) console.log('[KlineChart] 龙回头Pro 标记 %d 个', applied)
+    }
+
+    /** 拉取龙回头Pro 标记 (props 显式传入时跳过自取) */
+    const loadDragonMarkers = async () => {
+      const hasProp = Array.isArray(props.dragonMarkers) && props.dragonMarkers.length > 0
+      if (hasProp) return
+      const sym = (props.symbol || '').trim()
+      if (!sym) { dragonMarkerSource.value = []; return }
+      try {
+        const res = await request({
+          url: '/api/market/dragon/markers',
+          method: 'get',
+          params: { symbol: sym, days: 120 }
+        })
+        const data = (res && typeof res === 'object' && res.data !== undefined) ? res.data : []
+        dragonMarkerSource.value = Array.isArray(data) ? data : []
+      } catch (_) {
+        dragonMarkerSource.value = []
+      }
+      nextTick(applyDragonMarkers)
+    }
+
+    watch(() => props.symbol, () => loadDragonMarkers(), { immediate: true })
+    watch(() => props.dragonMarkers, v => {
+      if (Array.isArray(v) && v.length) dragonMarkerSource.value = v
+    })
+    // 主图数据就绪/换代码后重挂标记 (分时实时 tick 不重挂, 标记不随分钟内变化)
+    watch(klineData, () => nextTick(applyDragonMarkers))
 
     const wmCanvasRef = ref(null)
     const chipCanvasRef = ref(null)

@@ -6,9 +6,16 @@
 功能:
   1. 盘前选股: 4类候选 (排除ST, 首板放量)
   2. 技术评分: 综合技术分 >= 60 才进入监控 (MA排列/RSI/KDJ/OBV/量比/角度)
-  3. 盘中实时: 每分钟拉取分时数据, 检测弱转强信号
+  3. 盘中实时: 每分钟从 realtime_snapshot_YYYY 快照表读取分时数据, 检测弱转强信号
   4. 信号强度: 强/中/弱 三级 (基于日内动量, 移植自 V1 策略核心胜率因子)
   5. 买入建议: 触发时输出建议买入价 + 信号类型
+
+数据来源:
+  - 批量行情: realtime_snapshot_YYYY (每分钟全市场快照, scheduler 每60s采集)
+  - 分时序列: realtime_snapshot_YYYY 当天数据重构 (每行快照 = 1分钟bar)
+  - VWAP: 优先从快照 extras.amount 累加计算, 否则回退典型价 (H+L+C)/3 加权
+  - 日K线: kline_1m_YYYY/kline_1D_YYYY (DB)
+  - 不依赖 mootdx/coordinator 网络拉取 (盘中完全走DB)
 
 用法:
   python realtime_monitor.py                    # 完整运行 (选股+监控)
@@ -669,22 +676,75 @@ def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List
 
 _batch_cache = {}  # code -> {price, open, prev_close, change_pct, ...}
 
-def fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict]:
-    """批量获取实时行情 (新浪500只/次, 1~2次HTTP搞定)
+def _snapshot_table_name() -> str:
+    """返回当前年份的快照表名 (realtime_snapshot_YYYY)"""
+    return f"realtime_snapshot_{datetime.now().year}"
 
-    返回: {code: {last, open, previousClose, changePercent, volume, amount}}
+
+def fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict]:
+    """批量获取实时行情 — 从 realtime_snapshot_YYYY 读取每只股票的最新快照。
+
+    返回: {code: {last, open, high, low, previousClose, volume, ...}}
     """
+    if not codes:
+        return {}
     try:
-        from app.data_sources.coordinator import get_coordinator
-        coord = get_coordinator()
-        quotes = coord.coordinate_tickers(symbols=codes, market="CNStock", timeout=15)
+        from app.utils.db_market import get_market_db_manager
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool("CNStock")
+        table = _snapshot_table_name()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # 用 DISTINCT ON 取每只股票今天的最新快照
+        placeholders = ", ".join(["%s"] * len(codes))
+        sql = f"""
+            SELECT DISTINCT ON (symbol)
+                symbol, "last", open, high, low, "previousClose", volume, extras, time
+            FROM "{table}"
+            WHERE symbol IN ({placeholders})
+              AND time >= %s
+            ORDER BY symbol, time DESC
+        """
+        params = list(codes) + [f"{today_str} 00:00:00"]
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
         result = {}
-        for q in quotes:
-            sym = q.get('symbol', '')
-            if sym:
-                result[sym] = q
+        for row in rows:
+            sym = row[0]
+            last = float(row[1] or 0)
+            if last <= 0:
+                continue
+
+            extras = row[7]
+            if isinstance(extras, str):
+                import json as _json
+                try:
+                    extras = _json.loads(extras)
+                except Exception:
+                    extras = {}
+
+            result[sym] = {
+                'symbol': sym,
+                'last': last,
+                'open': float(row[2] or 0),
+                'high': float(row[3] or 0),
+                'low': float(row[4] or 0),
+                'previousClose': float(row[5] or 0),
+                'volume': float(row[6] or 0),
+                'time': str(row[8]),
+            }
+            # 把 extras 中的字段也合并进去
+            if isinstance(extras, dict):
+                for k, v in extras.items():
+                    if k not in result[sym] and v is not None:
+                        result[sym][k] = v
+
         return result
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ 从快照表读取批量行情失败: {e}")
         return {}
 
 def _get_quote_price(quote: Dict) -> float:
@@ -757,50 +817,101 @@ def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
 
 
 # ================================================================
-# 分时数据 (coordinator 批量1分钟K线)
+# 分时数据 (从 realtime_snapshot_YYYY 快照表读取)
 # ================================================================
 
 def fetch_minute_klines_batch(codes: List[str], count: int = 240) -> Dict[str, List[Dict]]:
-    """批量获取1分钟K线 (coordinator 多源并发, 有限流/熔断/重试)
+    """批量获取当天分时序列 — 从 realtime_snapshot_YYYY 读取当天快照重构。
+
+    每行快照的 "last"(最新价) 作为 close, open/high/low 直接取。
+    快照表 volume 是当日累计成交量，需要转换为每分钟增量 volume。
+    extras.amount 同理是累计值，也转为增量。
 
     Args:
         codes: 股票代码列表
-        count: 每只股票取多少根K线 (默认240, 约一个交易日)
+        count: 预留参数 (兼容旧接口), 实际返回当天所有快照
 
     Returns:
-        {code: [{time, open, high, low, close, volume}, ...]}
+        {code: [{time, open, high, low, close, volume, amount}, ...]}
     """
+    if not codes:
+        return {}
     try:
-        from app.data_sources.coordinator import get_coordinator
-        coord = get_coordinator()
-        bars_list = coord.coordinate_market_kline(
-            market="CNStock", timeframe="1m", count=count,
-            symbols=codes, timeout=30,
-        )
+        from app.utils.db_market import get_market_db_manager
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool("CNStock")
+        table = _snapshot_table_name()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        placeholders = ", ".join(["%s"] * len(codes))
+        sql = f"""
+            SELECT symbol, time, "last", open, high, low, volume, extras
+            FROM "{table}"
+            WHERE symbol IN ({placeholders})
+              AND time >= %s
+            ORDER BY symbol, time ASC
+        """
+        params = list(codes) + [f"{today_str} 00:00:00"]
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        # 先按 symbol 分组收集原始数据
+        raw = {}  # symbol -> [(time, last, open, high, low, cum_vol, cum_amount), ...]
+        for row in rows:
+            sym = row[0]
+            if sym not in raw:
+                raw[sym] = []
+
+            last = float(row[2] or 0)
+            cum_vol = float(row[6] or 0)
+
+            # 从 extras 中提取累计 amount
+            cum_amount = 0.0
+            extras = row[7]
+            if isinstance(extras, str):
+                import json as _json
+                try:
+                    extras = _json.loads(extras)
+                except Exception:
+                    extras = {}
+            if isinstance(extras, dict):
+                cum_amount = float(extras.get('amount', 0) or 0)
+
+            raw[sym].append((str(row[1]), last, float(row[3] or 0),
+                             float(row[4] or 0), float(row[5] or 0),
+                             cum_vol, cum_amount))
+
+        # 转换: 累计量 → 增量
         result = {}
-        for bar in bars_list:
-            sym = bar.get('symbol', '')
-            if not sym:
-                continue
-            if sym not in result:
-                result[sym] = []
-            result[sym].append({
-                'time': str(bar.get('time', '')),
-                'open': float(bar.get('open', 0)),
-                'high': float(bar.get('high', 0)),
-                'low': float(bar.get('low', 0)),
-                'close': float(bar.get('close', 0)),
-                'volume': float(bar.get('volume', 0)),
-                'amount': float(bar.get('amount', 0)),
-            })
+        for sym, bars in raw.items():
+            ticks = []
+            prev_vol = 0.0
+            prev_amount = 0.0
+            for (t, last, o, h, l, cum_vol, cum_amount) in bars:
+                incr_vol = max(0, cum_vol - prev_vol)
+                incr_amount = max(0, cum_amount - prev_amount)
+                ticks.append({
+                    'time': t,
+                    'open': o, 'high': h, 'low': l,
+                    'close': last,
+                    'volume': incr_vol,
+                    'amount': incr_amount,
+                })
+                prev_vol = cum_vol
+                prev_amount = cum_amount
+            if ticks:
+                result[sym] = ticks
         return result
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ 从快照表读取分时序列失败: {e}")
         return {}
 
 
 def fetch_realtime_ticks(code: str) -> Optional[List[Dict]]:
-    """单股1分钟K线 (兼容旧接口, 内部走coordinator)"""
-    result = fetch_minute_klines_batch([code], count=240)
+    """单股当天分时序列 (兼容旧接口, 从快照表读取)"""
+    result = fetch_minute_klines_batch([code])
     bars = result.get(code)
     return bars if bars else None
 
@@ -859,93 +970,68 @@ def calc_intraday_vol_ratio(ticks: List[Dict], idx: int, window: int = 5) -> flo
 
 
 # ================================================================
-# VWAP 精确计算 (mootdx 直连)
+# VWAP 精确计算 (从快照表 extras.amount)
 # ================================================================
 
-def fetch_vwap_from_mootdx(codes: List[str]) -> Dict[str, float]:
-    """用 mootdx 拉取当日1分钟K线，计算精确 VWAP。
+def fetch_vwap_from_snapshot(codes: List[str]) -> Dict[str, float]:
+    """从 realtime_snapshot_YYYY 快照表计算当日 VWAP。
 
-    mootdx bars(frequency=8) 返回通达信原始数据，含 amount(成交额)。
-    VWAP = cumsum(amount) / cumsum(volume)
-
-    Returns:
-        {code: vwap_price}  — 不可用时返回空 dict
-    """
-    try:
-        from app.utils.mootdx_client import get_client
-        cli = get_client()
-        if cli is None:
-            return {}
-    except Exception:
-        return {}
-
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    result = {}
-    for code in codes:
-        try:
-            df = cli.bars(symbol=code, frequency=8, offset=800)  # 1分钟线
-            if df is None or len(df) < 5:
-                continue
-            total_amount = 0.0
-            total_vol = 0.0
-            for _, row in df.iterrows():
-                # 只取今天的数据
-                dt = str(row.get('datetime', ''))
-                if today_str not in dt:
-                    continue
-                amt = float(row.get('amount', 0) or 0)
-                vol = float(row.get('vol', 0) or row.get('volume', 0) or 0)
-                if amt > 0 and vol > 0:
-                    total_amount += amt
-                    total_vol += vol
-            if total_vol > 0:
-                result[code] = total_amount / total_vol
-        except Exception:
-            continue
-    return result
-
-
-def fetch_minutes_from_mootdx(codes: List[str]) -> Dict[str, List[Dict]]:
-    """用 mootdx 拉取当日1分钟K线，返回含 amount 的 ticks。
+    快照表的 volume 和 extras.amount 是当日累计值。
+    VWAP = 最后一行的 cumsum(amount) / 最后一行的 cumsum(volume)。
+    extras 无 amount 时该 symbol 跳过。
 
     Returns:
-        {code: [{time, open, high, low, close, volume, amount}, ...]}
+        {code: vwap_price}  — 无 amount 数据时返回空 dict
     """
+    if not codes:
+        return {}
     try:
-        from app.utils.mootdx_client import get_client
-        cli = get_client()
-        if cli is None:
-            return {}
+        from app.utils.db_market import get_market_db_manager
+        mgr = get_market_db_manager()
+        pool = mgr._get_pool("CNStock")
+        table = _snapshot_table_name()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # 用 DISTINCT ON 取每只股票今天的最后一条快照 (累计值)
+        placeholders = ", ".join(["%s"] * len(codes))
+        sql = f"""
+            SELECT DISTINCT ON (symbol)
+                symbol, volume, extras
+            FROM "{table}"
+            WHERE symbol IN ({placeholders})
+              AND time >= %s
+            ORDER BY symbol, time DESC
+        """
+        params = list(codes) + [f"{today_str} 00:00:00"]
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        result = {}
+        for row in rows:
+            sym = row[0]
+            cum_vol = float(row[1] or 0)
+            if cum_vol <= 0:
+                continue
+
+            extras = row[2]
+            if isinstance(extras, str):
+                import json as _json
+                try:
+                    extras = _json.loads(extras)
+                except Exception:
+                    extras = {}
+            cum_amount = 0.0
+            if isinstance(extras, dict):
+                cum_amount = float(extras.get('amount', 0) or 0)
+
+            if cum_amount > 0:
+                result[sym] = cum_amount / cum_vol
+
+        return result
     except Exception:
         return {}
-
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    result = {}
-    for code in codes:
-        try:
-            df = cli.bars(symbol=code, frequency=8, offset=800)
-            if df is None or len(df) < 5:
-                continue
-            ticks = []
-            for _, row in df.iterrows():
-                dt = str(row.get('datetime', ''))
-                # 只取今天的数据
-                if today_str not in dt:
-                    continue
-                ticks.append({
-                    'time': dt,
-                    'open': float(row.get('open', 0)),
-                    'high': float(row.get('high', 0)),
-                    'low': float(row.get('low', 0)),
-                    'close': float(row.get('close', 0)),
-                    'volume': float(row.get('vol', 0) or row.get('volume', 0)),
-                    'amount': float(row.get('amount', 0)),
-                })
-            if ticks:
-                result[code] = ticks
-        except Exception:
-            continue
-    return result
 
 
 # ================================================================
@@ -1148,31 +1234,26 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
             if quick_matched:
                 vwap_codes = [c['code'] for c in quick_matched]
 
-                # Step2a: mootdx 拉取精确 VWAP (含 amount)
-                mootdx_vwap = {}
-                mootdx_minutes = {}
+                # Step2: 从快照表计算精确 VWAP (extras.amount)
+                snapshot_vwap = {}
                 try:
-                    mootdx_vwap = fetch_vwap_from_mootdx(vwap_codes)
-                    mootdx_minutes = fetch_minutes_from_mootdx(vwap_codes)
+                    snapshot_vwap = fetch_vwap_from_snapshot(vwap_codes)
                 except Exception:
                     pass
 
-                # Step2b: coordinator 拉取1分钟K线 (作为 fallback)
+                # Step3: 从快照表读取当天全量分时序列
                 minute_data = fetch_minute_klines_batch(vwap_codes, count=240)
 
                 for cand in quick_matched:
                     code = cand['code']
 
-                    # 优先用 mootdx 的 ticks (含 amount，VWAP 更准)
-                    ticks = mootdx_minutes.get(code)
-                    if not ticks or len(ticks) < 5:
-                        ticks = minute_data.get(code)
+                    ticks = minute_data.get(code)
                     if not ticks or len(ticks) < 5:
                         continue
 
-                    # 如果有 mootdx 精确 VWAP，注入到 candidate 供 detect_signal 使用
-                    if code in mootdx_vwap:
-                        cand['_precise_vwap'] = mootdx_vwap[code]
+                    # 如果快照表有精确 VWAP，注入到 candidate 供 detect_signal 使用
+                    if code in snapshot_vwap:
+                        cand['_precise_vwap'] = snapshot_vwap[code]
 
                     signal = detect_signal(ticks, cand)
                     if signal is None:
@@ -1186,7 +1267,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                         'first_tick': ticks[0] if ticks else None,
                         'last_tick': ticks[-1] if ticks else None,
                         'calc_vwap': round(calc_vwap(ticks), 4),
-                        'mootdx_vwap': cand.get('_precise_vwap', 0),
+                        'snapshot_vwap': cand.get('_precise_vwap', 0),
                         'open': ticks[0]['open'] if ticks else 0,
                         'high': max(t['high'] for t in ticks) if ticks else 0,
                         'low': min(t['low'] for t in ticks) if ticks else 0,
@@ -1206,7 +1287,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                 last = _get_quote_price(q)
                 vwap_val = cand.get('_precise_vwap', 0)
                 if vwap_val <= 0:
-                    tks = mootdx_minutes.get(code) or minute_data.get(code)
+                    tks = minute_data.get(code)
                     if tks:
                         vwap_val = calc_vwap(tks)
                 _vwap_debug.append({
@@ -1214,7 +1295,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                     'source': cand.get('source', ''),
                     'price': last, 'vwap': round(vwap_val, 4),
                     'above': last >= vwap_val if vwap_val > 0 else None,
-                    'mootdx': code in mootdx_vwap,
+                    'data_source': 'snapshot',
                 })
             try:
                 _vwap_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1286,7 +1367,7 @@ def run_monitor(candidates: List[Dict], interval: int = 60, force: bool = False)
                         'vwap': sig.get('vwap', 0),
                         'above_vwap_minutes': sig.get('above_vwap_minutes', 0),
                         'calc_vwap': dbg.get('calc_vwap', 0),
-                        'mootdx_vwap': dbg.get('mootdx_vwap', 0),
+                        'snapshot_vwap': dbg.get('snapshot_vwap', 0),
                         'ticks_count': dbg.get('ticks_count', 0),
                         'day_open': dbg.get('open', 0),
                         'day_high': dbg.get('high', 0),

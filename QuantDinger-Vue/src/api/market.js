@@ -8,6 +8,8 @@ const marketApi = {
   RenameWatchlistGroup: '/api/market/watchlist/rename-group',
   RemoveWatchlistGroup: '/api/market/watchlist/remove-group',
   GetWatchlistPrices: '/api/market/watchlist/prices',
+  GetDragonToday: '/api/market/dragon/today',
+  GetDragonMarkers: '/api/market/dragon/markers',
   // Analysis
   MultiAnalysis: '/api/analysis/multiAnalysis',
   CreateAnalysisTask: '/api/analysis/createTask',
@@ -102,6 +104,28 @@ export function getWatchlistPrices (parameter) {
     params: {
       watchlist: JSON.stringify(parameter.watchlist || [])
     }
+  })
+}
+
+/**
+ * 龙回头Pro: 今日分层信号 (action=买入/持仓/卖出, watch=观察池)
+ */
+export function getDragonToday () {
+  return request({
+    url: marketApi.GetDragonToday,
+    method: 'get'
+  })
+}
+
+/**
+ * 龙回头Pro: K线图买卖点标记
+ * @param parameter { symbol: string, days: number }
+ */
+export function getDragonMarkers (parameter) {
+  return request({
+    url: marketApi.GetDragonMarkers,
+    method: 'get',
+    params: parameter
   })
 }
 

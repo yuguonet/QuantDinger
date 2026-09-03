@@ -52,6 +52,7 @@ def _normalize_symbol(symbol: str) -> str:
     return (symbol or '').strip().upper()
 
 DEFAULT_GROUP_NAME = '默认自选'
+STRATEGY_GROUP_NAME = '龙回头Pro'   # 引擎独占管理的策略组 (勿手动增删, 由 dragon_scan/monitor 对账)
 
 def _valid_group_name(name) -> tuple:
     """Return (normalized_name_or_None, error_msg). None name + '' msg means ok."""
@@ -282,13 +283,16 @@ def get_watchlist():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT id, market, symbol, name, group_name FROM qd_watchlist WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, market, symbol, name, group_name, strategy_state, strategy_detail FROM qd_watchlist WHERE user_id = ? ORDER BY id DESC",
                 (user_id,)
             )
             rows = cur.fetchall() or []
 
             # Backfill display names for legacy rows (name empty or equals symbol).
             # This keeps UI consistent without requiring users to re-add items.
+            # 注意: 每次请求最多解析 20 行 (名称解析可能落到网络源), 防止批量新增拖垮接口;
+            # 未解析的行由后续请求逐步补齐 (引擎写入的行已带名, 不会进入此路径)
+            backfill_budget = 20
             for row in rows:
                 try:
                     market = row.get('market')
@@ -298,8 +302,11 @@ def get_watchlist():
                         continue
                     if current_name and current_name != symbol:
                         continue
+                    if backfill_budget <= 0:
+                        continue
                     resolved = resolve_symbol_name(market, symbol) or seed_get_symbol_name(market, symbol)
                     if resolved and resolved != current_name:
+                        backfill_budget -= 1
                         row['name'] = resolved
                         cur.execute(
                             "UPDATE qd_watchlist SET name = ?, updated_at = NOW() WHERE user_id = ? AND market = ? AND symbol = ?",
@@ -363,7 +370,7 @@ def add_watchlist():
                 """
                 INSERT INTO qd_watchlist (user_id, market, symbol, name, group_name, created_at, updated_at) 
                 VALUES (?, ?, ?, ?, ?, NOW(), NOW())
-                ON CONFLICT(user_id, market, symbol) DO UPDATE SET
+                ON CONFLICT(user_id, market, symbol, group_name) DO UPDATE SET
                     name = excluded.name,
                     group_name = excluded.group_name,
                     updated_at = NOW()
@@ -426,6 +433,8 @@ def rename_watchlist_group():
             return jsonify({'code': 0, 'msg': '缺少分组名称', 'data': None}), 400
         if old_name == DEFAULT_GROUP_NAME:
             return jsonify({'code': 0, 'msg': '默认分组不可重命名', 'data': None}), 400
+        if old_name == STRATEGY_GROUP_NAME or new_name == STRATEGY_GROUP_NAME:
+            return jsonify({'code': 0, 'msg': '策略分组由系统自动管理, 不可重命名', 'data': None}), 400
         if name_err:
             return jsonify({'code': 0, 'msg': name_err, 'data': None}), 400
         if new_name == DEFAULT_GROUP_NAME:
@@ -468,6 +477,8 @@ def remove_watchlist_group():
             return jsonify({'code': 0, 'msg': '缺少分组名称', 'data': None}), 400
         if group_name == DEFAULT_GROUP_NAME:
             return jsonify({'code': 0, 'msg': '默认分组不可删除', 'data': None}), 400
+        if group_name == STRATEGY_GROUP_NAME:
+            return jsonify({'code': 0, 'msg': '策略分组由系统自动管理, 不可删除', 'data': None}), 400
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(

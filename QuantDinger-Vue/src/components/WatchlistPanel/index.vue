@@ -61,7 +61,7 @@
     <div class="watchlist-list">
       <div
         v-for="stock in visibleWatchlist"
-        :key="`wl-${stock.market}-${stock.symbol}`"
+        :key="`wl-${stock.group_name || ''}-${stock.market}-${stock.symbol}`"
         class="wl-card"
         :class="{ active: selectedKey === `${stock.market}:${stock.symbol}` }"
         @click="selectWatchlistItem(stock)"
@@ -94,6 +94,15 @@
               <span v-else class="wl-news-num" :class="{ 'news-negative': stock.news_score < -4 }">{{ stock.news_score }}</span>
             </div>
           </div>
+          <div class="wl-row-strategy" v-if="stock.strategy_state">
+            <a-tooltip :title="strategyDetailText(stock)">
+              <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
+            </a-tooltip>
+            <span class="wl-strategy-item" v-if="strategyEntryPrice(stock)"><span class="wl-strategy-k">买</span>{{ formatPrice(strategyEntryPrice(stock)) }}</span>
+            <span class="wl-strategy-item" v-if="strategyStopPrice(stock)"><span class="wl-strategy-k">损</span>{{ formatPrice(strategyStopPrice(stock)) }}</span>
+            <span class="wl-strategy-item" v-if="strategyScore(stock) !== null && strategyScore(stock) !== undefined"><span class="wl-strategy-k">分</span>{{ strategyScore(stock) }}</span>
+            <span class="wl-strategy-item" v-if="strategyPreConfirm(stock)"><span class="wl-strategy-pre">预{{ strategyPreConfirmText(stock) }}</span></span>
+          </div>
           <div class="wl-row-pnl" v-if="positionSummaryMap[`${stock.market}:${stock.symbol}`]">
             <span class="wl-pnl-qty">{{ formatNum(positionSummaryMap[`${stock.market}:${stock.symbol}`].quantity, 4) }} @ {{ formatPrice(positionSummaryMap[`${stock.market}:${stock.symbol}`].avgEntry || 0) }}</span>
             <span class="wl-pnl-val" :class="positionSummaryMap[`${stock.market}:${stock.symbol}`].pnl >= 0 ? 'up' : 'down'">
@@ -112,7 +121,8 @@
         <div class="wl-card-hover-actions">
           <a-tooltip :title="$t('aiAssetAnalysis.position.quickAdd')"><span class="wl-hover-btn" @click.stop="openPositionModal(stock)"><a-icon type="wallet" /></span></a-tooltip>
           <a-tooltip :title="$t('aiAssetAnalysis.monitor.quickTask')"><span class="wl-hover-btn" @click.stop="openMonitorModal(stock)"><a-icon type="clock-circle" /></span></a-tooltip>
-          <span class="wl-hover-btn danger" @click.stop="removeFromWatchlist(stock)"><a-icon type="delete" /></span>
+          <span class="wl-hover-btn danger" v-if="!stock.strategy_state" @click.stop="removeFromWatchlist(stock)"><a-icon type="delete" /></span>
+          <a-tooltip v-if="stock.strategy_state" title="龙回头Pro策略组: 由系统自动管理 (买/持/卖自动增删)"><span class="wl-hover-btn strategy-managed"><a-icon type="robot" /></span></a-tooltip>
         </div>
       </div>
       <div v-if="!watchlist || visibleWatchlist.length === 0" class="watchlist-empty">
@@ -530,7 +540,18 @@ export default {
     },
     visibleWatchlist () {
       const wl = this.watchlist || []
-      return wl.filter(s => (s.group_name || DEFAULT_GROUP_NAME) === this.currentGroup)
+      const rows = wl.filter(s => (s.group_name || DEFAULT_GROUP_NAME) === this.currentGroup)
+      const isStrategy = rows.some(s => s.strategy_state)
+      if (!isStrategy) return rows
+      const weight = { 'exit_today': 0, 'holding': 1, 'buy_today': 2, 'watch_pending': 3 }
+      return rows.slice().sort((a, b) => {
+        const wa = weight[a.strategy_state] !== undefined ? weight[a.strategy_state] : 9
+        const wb = weight[b.strategy_state] !== undefined ? weight[b.strategy_state] : 9
+        if (wa !== wb) return wa - wb
+        const sa = (a.strategy_detail && a.strategy_detail.score) || 0
+        const sb = (b.strategy_detail && b.strategy_detail.score) || 0
+        return sb - sa
+      })
     }
   },
   created () {
@@ -887,7 +908,14 @@ export default {
     async loadWatchlistPrices () {
       if (!this.watchlist || this.watchlist.length === 0) return
       try {
-        const watchlistData = this.watchlist.map(item => ({ market: item.market, symbol: item.symbol }))
+        const seen = new Set()
+        const watchlistData = []
+        this.watchlist.forEach(item => {
+          const k = `${item.market}:${item.symbol}`
+          if (seen.has(k)) return
+          seen.add(k)
+          watchlistData.push({ market: item.market, symbol: item.symbol })
+        })
         const res = await getWatchlistPrices({ watchlist: watchlistData })
         if (res && res.code === 1 && res.data) {
           const priceMap = {}; const pricesObj = {}
@@ -906,10 +934,60 @@ export default {
       } catch (error) { /* silent */ }
     },
     startWatchlistPriceRefresh () {
+      let tick = 0
       this.watchlistPriceTimer = setInterval(() => {
+        tick += 1
         if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
+        if (tick % 4 === 0) this.refreshWatchlistSilent()   // 每 2 分钟同步策略组增删 (引擎自动管理)
       }, 30000)
       if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
+    },
+    async refreshWatchlistSilent () {
+      if (!this.userId) return
+      try {
+        const res = await getWatchlist({ userid: this.userId })
+        if (res && res.code === 1 && res.data) {
+          this.watchlist = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
+          await this.loadWatchlistPrices()
+        }
+      } catch (e) { /* silent */ }
+    },
+    strategyTagClass (state) {
+      // 注意: strategy_state 存的是机器状态 (buy_today/holding/exit_today/watch_pending)
+      return { 'buy_today': 'st-buy', 'holding': 'st-hold', 'exit_today': 'st-sell', 'watch_pending': 'st-watch' }[state] || 'st-watch'
+    },
+    strategyTagText (stock) {
+      const d = stock.strategy_detail || {}
+      const base = d.state_label || stock.strategy_state || ''
+      return d.pre_confirm ? `${base}·预` : base
+    },
+    strategyEntryPrice (stock) { return (stock.strategy_detail || {}).entry_price },
+    strategyStopPrice (stock) { return (stock.strategy_detail || {}).stop_price },
+    strategyScore (stock) { const s = (stock.strategy_detail || {}).score; return (s === undefined || s === null) ? null : s },
+    strategyPreConfirm (stock) { const pc = (stock.strategy_detail || {}).pre_confirm; return pc || null },
+    strategyPreConfirmText (stock) {
+      const m = { strong: '强', ok: '中', weak: '弱' }
+      const pc = (stock.strategy_detail || {}).pre_confirm
+      return m[pc] || pc || ''
+    },
+    strategyDetailText (stock) {
+      const d = stock.strategy_detail || {}
+      const pcMap = { strong: '强', ok: '中', weak: '弱' }
+      const lines = []
+      lines.push(`状态: ${d.state_label || stock.strategy_state || ''}${d.pre_confirm ? `(预判:${pcMap[d.pre_confirm] || d.pre_confirm})` : ''}`)
+      if (d.entry_style) lines.push(`形态: ${d.entry_style}`)
+      if (d.score !== undefined && d.score !== null) lines.push(`评分: ${d.score}`)
+      if (d.turnover_anchor !== undefined && d.turnover_anchor !== null) lines.push(`换手(锚): ${d.turnover_anchor}%${d.turnover_sig !== undefined && d.turnover_sig !== null ? ` / 信${d.turnover_sig}%` : ''}`)
+      if (d.float_mcap_yi !== undefined && d.float_mcap_yi !== null) lines.push(`流通市值: ${d.float_mcap_yi}亿`)
+      if (d.ma60_slope !== undefined && d.ma60_slope !== null) lines.push(`MA60五日斜率: ${d.ma60_slope}%${d.ma_bull ? ' 多头排列' : ''}`)
+      if (d.lu_date) lines.push(`锚点日: ${d.lu_date}${d.pullback_days ? ` 回调${d.pullback_days}天` : ''}`)
+      if (d.signal_date) lines.push(`信号: ${d.signal_date} @ ${d.signal_price || ''}`)
+      if (d.entry_date) lines.push(`买入: ${d.entry_date} @ ${d.entry_price || ''}`)
+      if (d.stop_price) lines.push(`止损: ${d.stop_price}`)
+      if (d.d1_chg !== undefined && d.d1_chg !== null) lines.push(`D1确认: ${d.d1_chg > 0 ? '+' : ''}${d.d1_chg}% 量比${d.d1_vol_r || ''}`)
+      if (d.exit_reason) lines.push(`出场: ${d.exit_reason}${d.exit_date ? ` (${d.exit_date} @ ${d.exit_price || ''})` : ''}`)
+      lines.push('龙回头Pro · 系统自动管理 (买/持/卖自动增删)')
+      return lines.join('\n')
     },
     async handleAddStock () {
       // Determine which symbols to add
@@ -1267,6 +1345,16 @@ export default {
 .wl-task-badge.paused { color: #94a3b8; background: #f1f5f9; }
 .wl-task-badge:hover { opacity: 0.75; }
 .wl-task-next { font-size: 10px; color: #94a3b8; margin-left: auto; }
+.wl-row-strategy { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.wl-strategy-tag { display: inline-flex; align-items: center; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 10px; cursor: default; }
+.wl-strategy-tag.st-buy { color: #ffffff; background: #15803d; }
+.wl-strategy-tag.st-hold { color: #ffffff; background: #2563eb; }
+.wl-strategy-tag.st-sell { color: #ffffff; background: #dc2626; }
+.wl-strategy-tag.st-watch { color: #94a3b8; background: #f1f5f9; }
+.wl-strategy-item { font-size: 10px; color: #64748b; font-family: 'SF Mono', Monaco, monospace; }
+.wl-strategy-k { color: #94a3b8; margin-right: 1px; }
+.wl-strategy-pre { font-size: 10px; color: #d97706; font-weight: 600; }
+.wl-hover-btn.strategy-managed { color: #94a3b8; cursor: default; }
 
 .negative-news { background: rgba(239, 68, 68, 0.08) !important; border-color: rgba(239, 68, 68, 0.2) !important; }
 .wl-news-score { display: flex; align-items: center; justify-content: center; min-width: 24px; }
