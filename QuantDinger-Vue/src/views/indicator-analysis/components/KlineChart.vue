@@ -73,8 +73,15 @@
           </div>
         </div>
         <div class="kline-chart-with-pct" :class="{ 'kline-chart-with-pct--chip': showChip }">
+          <!-- 左侧百分比坐标轴：padding 预留 + 绝对定位覆盖层（位置在左侧）。
+               布局/观感对齐右侧金额轴：透明底、无分隔线，仅刻度短线与文字（运行时取自 yAxis 样式）；
+               0%=昨收(分时)/最新收盘(其它周期)，与右侧金额轴同范围同步 -->
+          <div v-if="pctAxisVisible" ref="pctAxisOverlayRef" class="pct-axis-overlay">
+            <canvas ref="pctAxisCanvasRef" class="pct-axis-overlay__canvas"></canvas>
+          </div>
           <div
             id="kline-chart-container"
+            ref="klineContainerRef"
             class="kline-chart-container"
           ></div>
           <!-- 筹码分布覆盖层 -->
@@ -273,6 +280,23 @@ export default {
     let _wmObserver = null
     let _chipData = null // { prices, density, avg_cost, current_price }
     let _chipRafId = null
+
+    // ---- 左侧百分比坐标轴状态 ----
+    const pctAxisOverlayRef = ref(null)
+    const pctAxisCanvasRef = ref(null)
+    const klineContainerRef = ref(null) // 主图容器模板引用（优先于全局 getElementById，避免同页异源 DOM 干扰）
+    let _pctPaneObserver = null // ResizeObserver(candle_pane root)
+    let _pctRafId = null // rAF 合并重绘
+    let _pctWrappedAxis = null // 已包装 buildTicks 的 axis 实例
+    let _pctOrigBuildTicks = null // 被包装前的 axis.buildTicks
+    let _pctRulerSig = '' // 幂等签名（范围+基准+尺寸+主题+光标）
+    let _pctCrosshairY = null // 最近一次十字光标 y（像素，相对 pane 顶）
+    let _pctSubscribed = false // 是否已订阅 onDataReady / onCrosshairChange
+    let _pctWatchdog = null // 兜底重绘定时器：即便事件订阅全部失效，也能周期性补绘左轴
+    let _pctEverPainted = false // 是否成功绘制过一次
+    let _pctFailCount = 0 // 有数据期间连续绘制失败计数
+    let _pctFailTag = '' // 最近一次失败原因
+    let _pctDiagShown = false // 一次性诊断提示是否已输出
 
     /** 组件是否已卸载：用于阻断延迟回调在卸载后继续操作/重建图表（P0-1 修复） */
     let _isUnmounted = false
@@ -2572,6 +2596,8 @@ registerOverlay({
 
     /** 是否为分时图模式 */
     const isMinuteLine = computed(() => props.timeframe === '分时')
+    /** 是否显示左侧百分比坐标轴（本轮常显，保留开关余地） */
+    const pctAxisVisible = computed(() => true)
 
     // --- 分时线交易时段定义（X 轴固定覆盖整个交易时段）---
     /** 各市场分时时段（小时分钟用 hour*100+minute 表示）；缺省按 A 股处理 */
@@ -3022,6 +3048,19 @@ registerOverlay({
     let _minuteAxisLocked = false
     /** 分时 Y 轴上下各留的视觉余量比例（相对最大偏离） */
     const MINUTE_AXIS_PADDING = 0.1
+    /**
+     * 分时极坐标的涨跌停幅度（%）：按标的代码所在板块自动识别。
+     * 沪深主板（600/601/603/605/000/001/002/003）±10%；
+     * 创业板（300/301）与科创板（688/689）±20%；北交所（8xx/4xx/920）±30%。
+     * symbol 可能带交易所前后缀（SH600000 / 600000.SH / bj430047），统一剥离。
+     */
+    const _minutePolarLimit = (market, symbol) => {
+      let code = String(symbol || '').trim()
+      code = code.replace(/^[a-zA-Z]+/, '').replace(/\..*$/, '').replace(/^\d{1,2}_/, '')
+      if (code.startsWith('300') || code.startsWith('301') || code.startsWith('688') || code.startsWith('689')) return 20
+      if (code.startsWith('920') || code.startsWith('8') || code.startsWith('4')) return 30
+      return 10
+    }
     /** 涨跌幅轴「0%=昨收」重定基刻度：已安装的轴实例与库原型实现（退出分时时还原） */
     let _minutePcTickAxis = null
     let _minutePcOrigCreateTicks = null
@@ -3030,6 +3069,8 @@ registerOverlay({
     /** 分时十字光标水平标签的昨收定基补丁：已补丁的视图实例与库原型实现 */
     let _minuteCrosshairView = null
     let _minuteCrosshairOrigGetText = null
+    /** 分时极坐标模式：开=Y 轴固定 昨收±涨跌停%（按板块识别），关=按当日最大涨跌幅自适应 */
+    let _minutePolarEnabled = false
 
     /** 取主图 Y 轴实例（klinecharts 9.8.x 内部结构，带降级保护） */
     const getCandleYAxis = () => {
@@ -3409,8 +3450,12 @@ registerOverlay({
       })
       if (!(maxDev > 0)) maxDev = Math.abs(pc) * 0.001
 
-      // 上下各留 10% 余量，避免价格线贴边
-      const halfPrice = maxDev * (1 + MINUTE_AXIS_PADDING)
+      // 分时极坐标模式：范围精确锁定为 昨收×(1∓涨跌停%)，顶部=+limit%、底部=-limit%
+      // （0 轴线居中；不叠加 padding，保证涨/跌停刻度贴边）。关闭时为自适应对称范围。
+      const polarLimit = _minutePolarEnabled ? _minutePolarLimit(props.market, props.symbol) : 0
+      const halfPrice = polarLimit > 0
+        ? pc * (polarLimit / 100)
+        : maxDev * (1 + MINUTE_AXIS_PADDING)
       const fromPrice = pc - halfPrice
       const toPrice = pc + halfPrice
       // 锁定范围单位跟随轴型：percentage 轴用百分比单位，且以 pct(昨收) 为中心
@@ -3434,10 +3479,10 @@ registerOverlay({
           axis.getAutoCalcTickFlag() === false) return
 
       // 无条件输出一行诊断日志（按 昨收+来源+范围 去重），便于现场确认昨收取值与来源
-      const logKey = `${pc}|${_minutePcSource}|${axisType}|${from}|${to}`
+      const logKey = `${pc}|${_minutePcSource}|${axisType}|${polarLimit}|${from}|${to}`
       if (logKey !== _minutePcLogKey) {
         _minutePcLogKey = logKey
-        console.info(`[KlineChart] 分时0轴：昨收=${pc}（来源=${_minutePcSource || '已缓存'}） 轴=${axisType}${percentMode ? ` 基准=${baseClose}` : ''} 范围=[${from.toFixed(4)}, ${to.toFixed(4)}]`)
+        console.info(`[KlineChart] 分时0轴：昨收=${pc}（来源=${_minutePcSource || '已缓存'}） 轴=${axisType}${polarLimit > 0 ? ` 极坐标=±${polarLimit}%` : ''} 范围=[${from.toFixed(4)}, ${to.toFixed(4)}]`)
       }
 
       // ---- 0 轴线指标（原生逐帧重绘，画在昨收价上）----
@@ -3948,6 +3993,8 @@ registerOverlay({
               }, 100)
               // K 线加载完成后计算筹码分布
               fetchChipData()
+              // 左轴百分比列：数据就绪后重建同步（换标的/换周期均可能换轴实例或改最新收盘基准）
+              _syncPctRuler()
             }
           }
 
@@ -4657,6 +4704,8 @@ registerOverlay({
         if (!chartRef.value) {
           throw new Error('图表初始化失败：无法创建图表实例')
         }
+        // 换实例后废弃左轴旧绑定（包装的 buildTicks/订阅），_syncPctRuler 会按新实例重建
+        _resetPctAxisBindings()
 
         // 调试：输出图表实例的所有方法，检查是否有画线工具栏相关的方法
         if (chartRef.value) {
@@ -4857,6 +4906,8 @@ registerOverlay({
             nextTick(() => {
               updateIndicators()
               renderChip()
+              // 左侧百分比坐标轴：图就绪后建立同步（observer/包装 buildTicks/订阅事件）
+              _syncPctRuler()
             })
           }
         }
@@ -4884,6 +4935,7 @@ registerOverlay({
                 // resize 会触发刻度重建，重排后再次锁定 Y 轴居中范围
                 applyMinutePrevCloseAxis()
               }
+              _schedulePctRulerPaint()
             } catch (e) {
               // P1-3: resize 失败需留痕，否则图表错位难以定位
               console.warn('[KlineChart] resize 重绘失败:', e)
@@ -5038,6 +5090,9 @@ registerOverlay({
           show: false
         }
       })
+
+      // 主题配色变化 → 重绘左轴百分比列（文字颜色跟随主题）
+      _schedulePctRulerPaint()
     }
 
     // --- 注册自定义指标辅助函数 ---
@@ -6679,6 +6734,339 @@ registerOverlay({
       }
     }
 
+    // ==================== 左侧百分比坐标轴（自绘，与右侧金额轴同范围同步） ====================
+    // klinecharts 每个 pane 只支持单根 Y 轴（右=金额）。左轴列由 CSS padding-left 预留，
+    // 本引擎在每个范围/数据变化后用与右轴完全相同的 convertToPixel 换算百分比刻度像素，
+    // 因此两轴天然同步。0% 基准：分时=昨收；其它周期=数据最新收盘价。
+
+    /** 左轴百分比基准：分时→昨收；其它周期→最新一根真实 bar 的收盘价 */
+    const _pctRulerBase = () => {
+      const chart = chartRef.value
+      if (!chart) return null
+      try {
+        if (isMinuteLine.value) {
+          const pc = minutePrevClose.value
+          if (pc != null && pc > 0) return pc
+        }
+        const list = typeof chart.getDataList === 'function' ? chart.getDataList() : []
+        for (let i = list.length - 1; i >= 0; i--) {
+          const b = list[i]
+          const c = b && !b.__pad ? Number(b.close) : NaN
+          if (Number.isFinite(c) && c > 0) return c
+        }
+      } catch (_) { /* 预期内 */ }
+      return null
+    }
+
+    /** 绘制失败埋点：仅在组件已有行情数据时计数；连续失败达阈值后输出一次性控制台诊断。
+     *  设计目的：左轴任何单点失效都不再"静默空白"，用户控制台可直接看到原因 */
+    const _pctFail = (tag) => {
+      if (_pctEverPainted || !(klineData.value && klineData.value.length > 0)) return undefined
+      _pctFailCount += 1
+      _pctFailTag = tag
+      if (_pctFailCount >= 8 && !_pctDiagShown) {
+        _pctDiagShown = true
+        console.info('[KlineChart] 左侧百分比轴未绘制，原因: ' + _pctFailTag + '（本提示仅出现一次）')
+      }
+      return undefined
+    }
+
+    /** rAF 合并：安排一次左轴重绘 */
+    const _schedulePctRulerPaint = () => {
+      if (_pctRafId != null) return
+      _pctRafId = requestAnimationFrame(() => {
+        _pctRafId = null
+        _pctRulerPaint()
+      })
+    }
+
+    const _pctRulerText = (r, decimals) => {
+      const v = Number(r.toFixed(decimals))
+      return `${v > 0 ? '+' : ''}${v.toFixed(decimals)}%`
+    }
+
+    /** 绘制左侧百分比坐标（幂等：范围/基准/尺寸/主题/光标未变则跳过） */
+    const _pctRulerPaint = () => {
+      const canvas = pctAxisCanvasRef.value
+      const overlay = pctAxisOverlayRef.value
+      const chart = chartRef.value
+      if (!canvas || !chart) return _pctFail('canvas/chart 引用未就绪（模板未挂载？）')
+      // 价格→像素换算：优先走轴实例（与右轴完全一致的内部换算）；
+      // 私有属性不可用时降级为公开 API convertToPixel/convertFromPixel 适配
+      let axis = null
+      try {
+        axis = chart._candlePane && typeof chart._candlePane.getAxisComponent === 'function'
+          ? chart._candlePane.getAxisComponent()
+          : null
+      } catch (_) { /* 预期内 */ }
+      let priceToY = null
+      let yToPrice = null
+      if (axis && typeof axis.convertToPixel === 'function' && typeof axis.convertFromPixel === 'function') {
+        priceToY = (v) => axis.convertToPixel(v)
+        yToPrice = (y) => axis.convertFromPixel(y)
+      } else if (typeof chart.convertToPixel === 'function' && typeof chart.convertFromPixel === 'function') {
+        priceToY = (v) => {
+          const r = chart.convertToPixel([{ dataIndex: 0, value: v }], { paneId: 'candle_pane' })
+          return r && r[0] ? r[0].y : null
+        }
+        yToPrice = (y) => {
+          const r = chart.convertFromPixel([{ y }], { paneId: 'candle_pane' })
+          return r && r[0] ? r[0].value : null
+        }
+      }
+      if (!priceToY || !yToPrice) return _pctFail('无法获取价格→像素换算（axis/公开API 均不可用）')
+      // 右轴恒为金额轴：若被其它路径切到 percentage/log，这里强制回 normal 并等下一轮重画
+      if (axis && typeof axis.getType === 'function' && axis.getType() !== 'normal') {
+        try { chart.setStyles({ yAxis: { type: 'normal' } }) } catch (_) { /* 预期内 */ }
+        _schedulePctRulerPaint()
+        return
+      }
+      const base = _pctRulerBase()
+      if (base == null || !(base > 0)) return _pctFail('无有效基准价（昨收/最新收盘）')
+
+      // 1) 定位：overlay top/height = candle pane root 相对覆盖层定位父级（.kline-chart-with-pct）的真实区域。
+      //    容器优先用模板 ref（组件内自引用，免疫同页重复 id）；pane 取不到时降级为容器整高，宁可偏、不可无
+      const container = klineContainerRef.value || document.getElementById('kline-chart-container')
+      if (!container) return _pctFail('找不到主图容器')
+      const host = (overlay && overlay.offsetParent) || container.parentElement || container
+      let overlayTop = 0
+      let paneH = 0
+      try {
+        const hostRect = host.getBoundingClientRect()
+        let mainPane = null
+        try { mainPane = chart.getDom('candle_pane', 'root') } catch (_) { /* 预期内：旧版本无此 API */ }
+        if (!mainPane) {
+          try { mainPane = chart._candlePane && chart._candlePane.getContainer ? chart._candlePane.getContainer() : null } catch (_) { /* 预期内 */ }
+        }
+        if (mainPane && mainPane.clientHeight > 0) {
+          const paneRect = mainPane.getBoundingClientRect()
+          overlayTop = Math.max(0, paneRect.top - hostRect.top)
+          paneH = paneRect.height
+        } else {
+          // 降级：拿不到主图 pane 时按容器整高绘制（可能略越过副图/时间轴，但保证轴可见）
+          overlayTop = 0
+          paneH = container.clientHeight
+        }
+      } catch (_) { /* 预期内 */ }
+      if (!(paneH > 10)) return _pctFail('主图高度不足（容器未展开？）')
+      if (overlay) {
+        // 覆盖层为绝对定位：top 对齐主图 pane 顶，高度只覆盖主图带，避免覆盖副图/时间轴区域
+        overlay.style.top = overlayTop + 'px'
+        overlay.style.height = paneH + 'px'
+      }
+      const w = canvas.clientWidth || 64
+      const h = paneH
+      if (w <= 0 || h <= 0) return
+
+      const rg = axis && typeof axis.getRange === 'function' ? axis.getRange() : null
+      let pLow = Number(rg && rg.from)
+      let pHigh = Number(rg && rg.to)
+      if (!Number.isFinite(pLow) || !Number.isFinite(pHigh) || !(pHigh > pLow)) {
+        // 降级：从数据自身 hi/lo 推算范围（极坐标锁定场景下数据极值≈锁定边界，误差可忽略）
+        try {
+          const list = chart.getDataList()
+          let lo = Infinity
+          let hi = -Infinity
+          for (const b of list) {
+            if (!b || b.__pad) continue
+            const l = Number(b.low)
+            const h = Number(b.high)
+            if (Number.isFinite(l)) lo = Math.min(lo, l)
+            if (Number.isFinite(h)) hi = Math.max(hi, h)
+          }
+          if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+            const pad = (hi - lo) * 0.05
+            pLow = lo - pad
+            pHigh = hi + pad
+          }
+        } catch (_) { /* 预期内 */ }
+      }
+      if (!Number.isFinite(pLow) || !Number.isFinite(pHigh) || !(pHigh > pLow)) return _pctFail('无法确定价格范围')
+
+      const isDark = chartTheme.value === 'dark'
+      const crosshairY = _pctCrosshairY
+      // 幂等签名：范围/基准/高度/主题/光标任一变化才重绘
+      const sig = `${pLow}|${pHigh}|${base}|${h}|${isDark}|${crosshairY == null ? 'n' : crosshairY.toFixed(1)}`
+      if (sig === _pctRulerSig) return
+      _pctRulerSig = sig
+
+      const dpr = window.devicePixelRatio || 1
+      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr)
+        canvas.height = Math.round(h * dpr)
+        canvas.style.width = w + 'px'
+        canvas.style.height = h + 'px'
+      }
+      const ctx = canvas.getContext && canvas.getContext('2d')
+      if (!ctx) return
+      ctx.save()
+      ctx.scale(dpr, dpr)
+      ctx.clearRect(0, 0, w, h)
+
+      // 2) 百分比刻度网格：span=(pHigh/base-1)-(pLow/base-1)；step=nice(span/8)，下限 0.05
+      const pctOf = (price) => (price / base - 1) * 100
+      const pMin = pctOf(pLow)
+      const pMax = pctOf(pHigh)
+      if (!(pMax > pMin)) { ctx.restore(); return }
+      let step = minuteNice((pMax - pMin) / 8.0)
+      if (!(step > 0)) step = 0.05
+      if (step < 0.05) step = 0.05
+      const decimals = step >= 1 ? 0 : (step >= 0.1 ? 1 : 2)
+      const rPrecision = Math.max(minuteGetPrecision(step), decimals)
+      // 观感对齐右侧金额轴：字号/颜色/字族/刻度线全部取自 yAxis 样式，取不到再用兜底值
+      let tickSize = 10
+      let labelColor = isDark ? '#9b9b9b' : '#6b6b6b'
+      let tickFamily = '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif'
+      let tickLen = 3
+      let tickLineColor = 'rgba(128,128,128,0.4)'
+      try {
+        const ys = chart.getStyles() && chart.getStyles().yAxis
+        if (ys && ys.tickText) {
+          tickSize = ys.tickText.size || tickSize
+          labelColor = ys.tickText.color || labelColor
+          tickFamily = ys.tickText.family || tickFamily
+        }
+        if (ys && ys.tickLine) {
+          tickLen = ys.tickLine.length != null ? ys.tickLine.length : tickLen
+          tickLineColor = ys.tickLine.color || tickLineColor
+        }
+      } catch (_) { /* 预期内：样式读取失败时用兜底值 */ }
+      const zeroColor = isDark ? '#d7d7d7' : '#262626'
+      const font = `${tickSize}px ${tickFamily}`
+
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'middle'
+      const labelX = w - 8 - tickLen
+      for (let r = Math.ceil(pMin / step) * step; r <= pMax + step * 1e-6; r = minuteRound(r + step, rPrecision)) {
+        const price = base * (1 + r / 100)
+        let y = null
+        try { y = priceToY(price) } catch (_) { /* 预期内 */ }
+        if (y == null || !Number.isFinite(y) || y < 2 || y > h - 2) continue
+        const isZero = Math.abs(r) < step * 0.5
+        // 刻度短线（镜像右轴布局：文字 | 刻度线 | 图表）
+        ctx.strokeStyle = isZero ? zeroColor : tickLineColor
+        ctx.lineWidth = isZero ? 1.5 : 1
+        ctx.beginPath()
+        ctx.moveTo(w - 3 - tickLen, y)
+        ctx.lineTo(w - 3, y)
+        ctx.stroke()
+        // 标签
+        ctx.fillStyle = isZero ? zeroColor : labelColor
+        ctx.font = isZero ? `bold ${font}` : font
+        ctx.fillText(_pctRulerText(r, decimals), labelX, y)
+      }
+
+      // 3) 十字光标处的百分比读数（与右轴价格标签对应：昨收/最新收盘基准）
+      if (crosshairY != null && crosshairY >= 0 && crosshairY <= h) {
+        let priceAt = null
+        try { priceAt = yToPrice(crosshairY) } catch (_) { /* 预期内 */ }
+        if (priceAt != null && Number.isFinite(priceAt) && priceAt > 0) {
+          const rr = Number(pctOf(priceAt).toFixed(2))
+          const txt = `${rr > 0 ? '+' : ''}${rr.toFixed(2)}%`
+          ctx.font = font
+          const tw = Math.ceil(ctx.measureText(txt).width)
+          const chipW = tw + 8
+          const chipH = 15
+          const cx = Math.max(1, w - 2 - chipW)
+          const cyy = Math.max(0, Math.min(h - chipH, crosshairY - chipH / 2))
+          ctx.fillStyle = isDark ? 'rgba(24,144,255,0.95)' : 'rgba(24,144,255,0.92)'
+          ctx.fillRect(cx, cyy, chipW, chipH)
+          ctx.fillStyle = '#fff'
+          ctx.textAlign = 'left'
+          ctx.fillText(txt, cx + 4, cyy + chipH / 2 + 0.5)
+          ctx.textAlign = 'right'
+        }
+      }
+      _pctEverPainted = true
+      _pctFailCount = 0
+      ctx.restore()
+    }
+
+    /** 建立左轴同步：ResizeObserver + 包装 buildTicks + 订阅数据/光标事件（幂等） */
+    const _syncPctRuler = () => {
+      const chart = chartRef.value
+      if (!chart || !pctAxisVisible.value) return
+      // 1) candle pane 尺寸变化（副图增删/拖拽/左右预留变化都改变主图高度或宽度）
+      let paneEl = null
+      try { paneEl = chart.getDom('candle_pane', 'root') } catch (_) { /* 预期内 */ }
+      if (paneEl && typeof ResizeObserver !== 'undefined') {
+        if (_pctPaneObserver) {
+          try { _pctPaneObserver.disconnect() } catch (_) { /* 预期内 */ }
+          _pctPaneObserver = null
+        }
+        _pctPaneObserver = new ResizeObserver(() => _schedulePctRulerPaint())
+        try {
+          _pctPaneObserver.observe(paneEl)
+          _observers.add(_pctPaneObserver)
+        } catch (_) { /* 预期内 */ }
+      }
+      // 2) 包装 axis.buildTicks：所有范围变化（Y 拖拽/双击复位/指标增删/applyNewData/锁轴）
+      //    都经 adjustPaneViewport → 每 pane buildTicks，包装后即可获得可靠的重绘时机
+      try {
+        const axis = chart._candlePane && typeof chart._candlePane.getAxisComponent === 'function'
+          ? chart._candlePane.getAxisComponent()
+          : null
+        if (axis && typeof axis.buildTicks === 'function' && _pctWrappedAxis !== axis) {
+          _pctOrigBuildTicks = axis.buildTicks
+          const origBuildTicks = axis.buildTicks
+          axis.buildTicks = function (...args) {
+            const res = origBuildTicks.apply(this, args)
+            try { _schedulePctRulerPaint() } catch (_) { /* 预期内 */ }
+            return res
+          }
+          _pctWrappedAxis = axis
+        }
+      } catch (_) { /* 预期内 */ }
+      // 3) 数据就绪（换周期/实时追加 → 最新收盘基准可能变化）与十字光标
+      if (!_pctSubscribed) {
+        _pctSubscribed = true
+        try {
+          if (typeof chart.subscribeAction === 'function') {
+            chart.subscribeAction('onDataReady', () => _schedulePctRulerPaint())
+            chart.subscribeAction('onCrosshairChange', (crosshair) => {
+              _pctCrosshairY = (crosshair && typeof crosshair.y === 'number') ? crosshair.y : null
+              _schedulePctRulerPaint()
+            })
+          }
+        } catch (_) { /* 预期内 */ }
+      }
+      // 兜底看门狗：即便 ResizeObserver/包装/订阅全部失效，也每 800ms 尝试补绘一次
+      // （rAF 合并 + 幂等签名，绘制被跳过时开销可忽略）
+      if (_pctWatchdog == null && typeof setInterval === 'function') {
+        _pctWatchdog = setInterval(() => _schedulePctRulerPaint(), 800)
+      }
+      _schedulePctRulerPaint()
+    }
+
+    /** 换图表实例（重新 init）后：废弃旧绑定，等待下一次 _syncPctRuler 重建 */
+    const _resetPctAxisBindings = () => {
+      if (_pctWrappedAxis && _pctOrigBuildTicks) {
+        try { _pctWrappedAxis.buildTicks = _pctOrigBuildTicks } catch (_) { /* 预期内 */ }
+      }
+      _pctWrappedAxis = null
+      _pctOrigBuildTicks = null
+      _pctSubscribed = false
+      _pctCrosshairY = null
+      _pctRulerSig = ''
+    }
+
+    /** 卸载清理：取消 rAF、断开 observer、还原被包装的 buildTicks */
+    const _disposePctRuler = () => {
+      if (_pctRafId != null) {
+        try { cancelAnimationFrame(_pctRafId) } catch (_) { /* 预期内 */ }
+        _pctRafId = null
+      }
+      if (_pctPaneObserver) {
+        try { _pctPaneObserver.disconnect() } catch (_) { /* 预期内 */ }
+        _pctPaneObserver = null
+      }
+      if (_pctWatchdog != null) {
+        try { clearInterval(_pctWatchdog) } catch (_) { /* 预期内 */ }
+        _pctWatchdog = null
+      }
+      _resetPctAxisBindings()
+    }
+
     const _ensureWmLayer = () => {
       const cvs = wmCanvasRef.value
       if (!cvs) return
@@ -6738,6 +7126,8 @@ registerOverlay({
       _chipData = null
       if (_wmTimer) { clearInterval(_wmTimer); _wmTimer = null }
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
+      // 清理左侧百分比坐标轴（取消 rAF/observer，并在销毁前还原被包装的 buildTicks）
+      _disposePctRuler()
       // 清理分时图交互禁用事件处理器
       enableMinuteInteractions()
       if (chartRef.value) {
@@ -6754,6 +7144,12 @@ registerOverlay({
       error,
       loadingHistory,
       chartRef,
+      // 左侧百分比轴三件套必须导出给模板：缺失时 v-if="pctAxisVisible" 取到 undefined，
+      // 轴 DOM 根本不会挂载（这正是此前"左轴始终不显示"的根因），refs 也拿不到元素
+      pctAxisVisible,
+      pctAxisOverlayRef,
+      pctAxisCanvasRef,
+      klineContainerRef,
       chartTheme,
       themeConfig,
       isMinuteLine,
@@ -6848,33 +7244,40 @@ registerOverlay({
             }
           })
         } catch (e) { console.warn('setChartColorScheme failed:', e) }
+        _schedulePctRulerPaint()
       },
       /** 显示/隐藏画线工具栏 */
       setDrawingBarVisible (visible) {
         const el = document.querySelector('.drawing-toolbar')
         if (el) el.style.display = visible ? 'flex' : 'none'
       },
-      /** 切换Y轴模式: price=金额, percent=比例 */
-      setYAxisMode (mode) {
+      /**
+       * 分时极坐标开关（设置弹窗「右侧Y轴 金额/比例」已废弃，右轴恒为金额轴）。
+       * 开：分时 Y 轴固定 昨收±涨跌停%（主板±10/创业·科创±20/北交所±30），
+       *     顶部=+limit%、底部=-limit%，0 轴线（昨收）居中；
+       * 关：按当日最大涨跌幅自适应对称锁定。
+       * 左轴百分比列与右轴金额列始终同范围同步显示。
+       */
+      setMinutePolarMode (enabled) {
+        _minutePolarEnabled = !!enabled
         if (!chartRef.value) return
+        // 右轴恒为金额轴；setStyles 指定 type 会重置自动刻度标志（解除锁定），
+        // 随后由重试补锁与下一布局自愈
         try {
-          chartRef.value.setStyles({
-            yAxis: {
-              type: mode === 'percent' ? 'percentage' : 'normal'
-            }
+          chartRef.value.setStyles({ yAxis: { type: 'normal' } })
+        } catch (_) { /* 预期内 */ }
+        if (isMinuteLine.value) {
+          ;[60, 300].forEach(delay => {
+            safeTimeout(() => {
+              if (!isMinuteLine.value || !chartRef.value) return
+              try {
+                applyMinutePrevCloseAxis()
+                _schedulePctRulerPaint()
+              } catch (_) { /* 预期内 */ }
+            }, delay)
           })
-          // 【关键】库的 setStyles 在指定 yAxis.type 时会执行 setAutoCalcTickFlag(true)，
-          // 解除分时的 Y 轴居中锁定 → 窗口退回「按数据 min~max 铺满」。
-          // 分时模式下必须等样式生效后立即补锁（含 0 轴线指标与居中范围）。
-          if (isMinuteLine.value) {
-            ;[60, 300].forEach(delay => {
-              safeTimeout(() => {
-                if (!isMinuteLine.value || !chartRef.value) return
-                try { applyMinutePrevCloseAxis() } catch (_) { /* 预期内 */ }
-              }, delay)
-            })
-          }
-        } catch (e) { console.warn('setYAxisMode failed:', e) }
+        }
+        _schedulePctRulerPaint()
       }
     }
   }
@@ -7283,6 +7686,32 @@ registerOverlay({
 /* 筹码显示时，为右侧筹码窗口预留 140px，使蜡烛图及其Y轴保持在筹码窗口左侧 */
 .kline-chart-with-pct--chip {
   padding-right: 140px;
+}
+
+/* 左侧百分比坐标轴：padding-left 预留 64px + 绝对定位覆盖层（回退方案，位置在左侧）。
+   观感对齐右侧金额轴：透明底、无分隔线，仅刻度短线与文字（样式运行时取自 yAxis 配置） */
+.kline-chart-with-pct {
+  padding-left: 64px;
+}
+
+.pct-axis-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 64px;
+  height: 100%;
+  z-index: 5;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.pct-axis-overlay__canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 /* 筹码分布覆盖层（绝对定位在K线图右侧、Y轴右边） */

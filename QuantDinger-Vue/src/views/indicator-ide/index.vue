@@ -85,12 +85,17 @@
                       @change="toggleDrawingBar"
                     />
                   </div>
-                  <div class="settings-group">
-                    <div class="settings-group-title">右侧Y轴</div>
-                    <a-radio-group v-model="yAxisMode" size="small" @change="onYAxisModeChange">
-                      <a-radio-button value="price">金额</a-radio-button>
-                      <a-radio-button value="percent">比例(%)</a-radio-button>
-                    </a-radio-group>
+                  <div class="settings-group" v-if="timeframe === '分时'">
+                    <div class="settings-group-title">分时极坐标</div>
+                    <a-switch
+                      :checked="polarCoord"
+                      checked-children="开"
+                      un-checked-children="关"
+                      @change="togglePolar"
+                    />
+                    <div class="settings-group-tip">
+                      涨跌停坐标：主板±10%，创业板/科创板±20%，北交所±30%；关闭=按当日波动自适应
+                    </div>
                   </div>
                   <div class="settings-group">
                     <div class="settings-group-title">筹码分布</div>
@@ -1128,7 +1133,8 @@ export default {
       settingsPopoverVisible: false,
       chartColorScheme: 'cn',
       drawingBarVisible: false,
-      yAxisMode: 'price',
+      /** 分时极坐标开关（原「右侧Y轴 金额/比例」改为分时专用涨跌停坐标） */
+      polarCoord: false,
       showChip: true,
       /** 内置技术指标列表（分主图/副图） */
       builtinIndicators: [
@@ -3390,11 +3396,11 @@ export default {
     toggleChip (checked) {
       this.showChip = checked
     },
-    onYAxisModeChange (e) {
-      const mode = e.target ? e.target.value : e
+    togglePolar (checked) {
+      this.polarCoord = !!checked
       const chart = this.$refs.klineChart
-      if (chart && chart.setYAxisMode) {
-        chart.setYAxisMode(mode)
+      if (chart && chart.setMinutePolarMode) {
+        chart.setMinutePolarMode(!!checked)
       }
     },
     toggleFullscreen () {
@@ -4253,6 +4259,12 @@ export default {
   color: #666;
   margin-bottom: 6px;
   font-weight: 600;
+}
+.settings-group-tip {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #999;
 }
 .ide-toolbar-group {
   display: flex;
