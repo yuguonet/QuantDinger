@@ -101,3 +101,4 @@ backend_api_python/app/data/
 !backend_api_python/app/agent/router/tool_chains.json
 !backend_api_python/app/agent/router/tool_chain_failures.json
 AGENTS.md
+.workbuddy

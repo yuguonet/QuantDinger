@@ -4427,7 +4427,7 @@ export default {
 }
 .ide-lr-resize-handle-dots {
   display: block;
-  width: 4px;
+  width: 2px;
   height: 100%;
   border-radius: 2px;
   background: #c0c0c0;

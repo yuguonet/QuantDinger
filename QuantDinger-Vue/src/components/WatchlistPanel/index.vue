@@ -86,15 +86,23 @@
                 <span class="wl-symbol" v-else>{{ stock.symbol }}</span>
                 <span class="wl-market">{{ getMarketName(stock.market) }}</span>
                 <template v-if="stock.strategy_state">
-                  <a-popover trigger="hover" placement="right">
-                    <template slot="content">
-                      <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
-                    </template>
-                    <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
-                  </a-popover>
-                  <span class="wl-strategy-mini" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
-                  <span class="wl-strategy-mini" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
-                  <span class="wl-strategy-pre" v-if="strategyPreConfirm(stock)">预{{ strategyPreConfirmText(stock) }}</span>
+                  <div class="wl-strategy-2col">
+                    <div class="wl-strategy-col-label">
+                      <a-popover trigger="hover" placement="right">
+                        <template slot="content">
+                          <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
+                        </template>
+                        <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
+                      </a-popover>
+                    </div>
+                    <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
+                      <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
+                      <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
+                      <span v-else>☆</span>
+                    </span>
+                    <span class="wl-strategy-mini wl-strategy-mini-entry" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
+                    <span class="wl-strategy-mini wl-strategy-mini-stop" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
+                  </div>
                 </template>
               </div>
               <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.symbol }}</div>
@@ -231,6 +239,7 @@
             <div class="group-field-control">
               <a-select
                 v-model="addTargetGroup"
+                mode="combobox"
                 style="width: 100%;"
                 :placeholder="$t('dashboard.analysis.watchlist.group.newNamePlaceholder')"
                 allow-clear
@@ -971,18 +980,15 @@ export default {
     },
     strategyTagText (stock) {
       const d = stock.strategy_detail || {}
-      const base = d.state_label || stock.strategy_state || ''
-      return d.pre_confirm ? `${base}·预` : base
+      const stateMap = { '买入': '买', '卖出': '卖', '持仓': '持', '买入.预': '预买', '卖出.预': '预卖', '持仓.预': '预持' }
+      const raw = d.state_label || stock.strategy_state || ''
+      const base = stateMap[raw] || raw
+      return d.pre_confirm ? `预${base}` : base
     },
     strategyEntryPrice (stock) { return (stock.strategy_detail || {}).entry_price },
     strategyStopPrice (stock) { return (stock.strategy_detail || {}).stop_price },
     strategyScore (stock) { const s = (stock.strategy_detail || {}).score; return (s === undefined || s === null) ? null : s },
     strategyPreConfirm (stock) { const pc = (stock.strategy_detail || {}).pre_confirm; return pc || null },
-    strategyPreConfirmText (stock) {
-      const m = { strong: '强', ok: '中', weak: '弱' }
-      const pc = (stock.strategy_detail || {}).pre_confirm
-      return m[pc] || pc || ''
-    },
     strategyDetailHtml (stock) {
       const d = stock.strategy_detail || {}
       const esc = s => String(s === undefined || s === null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
@@ -1236,7 +1242,7 @@ export default {
       } catch (error) { this.$message.error(this.$t('dashboard.analysis.message.removeStockFailed')) }
     },
     openAddStockModal () {
-      this.addTargetGroup = this.currentGroup
+      this.addTargetGroup = ''
       this.showAddStockModal = true
     },
     groupLabel (name) {
@@ -1393,7 +1399,7 @@ export default {
 .batch-bar .ant-btn-primary { box-shadow: 0 1px 2px color-mix(in srgb, var(--primary-color, #1890ff) 20%, transparent); &:hover { filter: brightness(1.05); } }
 .batch-bar .ant-btn:not(.ant-btn-primary) { background: #f8fafc; border-color: #e2e8f0; color: #64748b; &:hover { background: #f1f5f9; border-color: #cbd5e1; color: #475569; } }
 
-.wl-card { position: relative; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); margin-bottom: 2px; border: 1px solid transparent; }
+.wl-card { position: relative; padding: 5px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); margin-bottom: 2px; border: 1px solid transparent; }
 .wl-card:hover { background: #f5f7fa; border-color: #e8ecf1; }
 .wl-card.active { background: linear-gradient(135deg, color-mix(in srgb, var(--primary-color, #1890ff) 6%, #fff) 0%, color-mix(in srgb, var(--primary-color, #1890ff) 4%, #fff) 100%); border-color: color-mix(in srgb, var(--primary-color, #1890ff) 28%, transparent); box-shadow: 0 1px 4px color-mix(in srgb, var(--primary-color, #1890ff) 10%, transparent); }
 .wl-card-cb { position: absolute; top: 12px; left: 4px; z-index: 1; }
@@ -1430,9 +1436,37 @@ export default {
 .wl-strategy-tag.st-watch { color: #94a3b8; background: #f1f5f9; }
 .wl-strategy-item { font-size: 10px; color: #64748b; font-family: 'SF Mono', Monaco, monospace; }
 .wl-strategy-k { color: #94a3b8; margin-right: 1px; }
-.wl-strategy-pre { font-size: 10px; color: #d97706; font-weight: 600; }
-.wl-strategy-mini { font-size: 10px; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; }
-.wl-strategy-mini:first-of-type { color: #15803d; }
+.wl-strategy-2col {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  grid-template-rows: 1fr 1fr;
+  align-items: center;
+  gap: 0 3px;
+  line-height: 1.15;
+}
+.wl-strategy-col-label {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  display: flex;
+  align-items: center;
+}
+.wl-strategy-pre {
+  grid-column: 3;
+  grid-row: 1 / 3;
+  font-size: 13px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.wl-strategy-pre.wl-pre-strong { color: #f5222d; }
+.wl-strategy-pre.wl-pre-ok { color: #faad14; }
+.wl-strategy-pre.wl-pre-weak { color: #1890ff; }
+.wl-half-star { position: relative; display: inline-block; }
+.wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
+.wl-strategy-mini { font-size: 10px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 1.15; }
+.wl-strategy-mini-entry { grid-column: 1; grid-row: 1; color: #15803d; }
+.wl-strategy-mini-stop { grid-column: 1; grid-row: 2; color: #475569; }
 .wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
 .wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
 .wl-strategy-pop table.wl-dtable td { padding: 2px 8px; border-bottom: 1px solid #f1f5f9; }

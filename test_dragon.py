@@ -519,9 +519,94 @@ def find_limit_ups(bars, board_type):
             result.append(i)
     return result
 
+# ================================================================
+# 统一前置过滤 U1~U4 + 龙回头分支增强 A+B+C+E
+# 依据: tmp/妖股前置过滤分析报告.md (18564涨停事件) + tmp/龙回头入口规则分析报告.md (1628笔)
+# 关键设计: 全部条件只用信号日(D0)收盘可知数据, 无未来函数; --today 实盘报告
+# 由回测交易列表驱动, 过滤自动同步, 不需要单独改实盘判定。
+# 易错点: volume 单位是股, 换手率 = volume/circ_shares*100; 市值用信号日收盘价。
+# ================================================================
+PREFILTER_PARAMS = {
+    'turnover_min': 3.0,        # U2 换手率% 下限 (全市场验证: +0.7pp, 用户经验口径5%留给龙回头Pro)
+    'float_mv_min': 20.0,       # U3 流通市值下限(亿) (统一层20~500亿; 严格30~300会误杀600105)
+    'float_mv_max': 500.0,      # U3 流通市值上限(亿)
+    'heat_ret20_min': 10.0,     # U4 前期热度: 20日涨幅% 下限 (与prior_lu或关系)
+    'heat_prior_lu_min': 1,     # U4 前20日涨停次数下限 (或关系, 不含D0)
+    # 龙回头分支增强 (两段市场环境验证一致, 阈值敏感性平稳)
+    'dragon_resid_max': -5.0,   # A 回调充分: D0收盘/涨停收盘-1 <= -5%
+    'dragon_pre_rally_min': 10.0,  # B 主升前置: 涨停日前20日涨幅 >= 10%
+    'dragon_death_valley': (-20.0, -15.0),  # E 排除: 回调期最低收盘落在涨停收盘的(-20%,-15%]
+}
+
+def unified_prefilter(bars, i, code, code_info=None):
+    """统一前置过滤 U1~U4, 在信号日 i (D0) 收盘可知数据上判定。
+
+    code_info 为该股的 stock_basic_info 字典 (含 name/circ_shares), 不是全量映射。
+    返回 (ok, fail_reasons)。code_info 缺失时跳过 U1/U2/U3 (不误杀), U4 仍生效。
+    """
+    p = PREFILTER_PARAMS
+    fails = []
+    # U1 非ST (名称兜底; 涨停阈值已自然排除ST, 此处防漏)
+    if code_info and code_info.get('name') and 'ST' in str(code_info['name']).upper():
+        fails.append('U1_ST')
+    # U2 换手率 / U3 流通市值
+    if code_info and code_info.get('circ_shares'):
+        turnover = bars[i]['volume'] / code_info['circ_shares'] * 100
+        if turnover < p['turnover_min']:
+            fails.append(f'U2换手{turnover:.1f}')
+        float_mv = code_info['circ_shares'] * bars[i]['close'] / 1e8
+        if not (p['float_mv_min'] <= float_mv <= p['float_mv_max']):
+            fails.append(f'U3市值{float_mv:.0f}亿')
+    # U4 前期热度: 20日涨幅>=10% 或 前20日有涨停 (不含D0)
+    bt = get_board_type(code)
+    has_lu = any(is_limit_up(bars[j]['close'], bars[j-1]['close'], bt)
+                 for j in range(max(1, i - 19), i))
+    ret20 = bars[i]['close'] / bars[i - 20]['close'] - 1 if i >= 20 and bars[i - 20]['close'] > 0 else None
+    if not has_lu and (ret20 is None or ret20 * 100 < p['heat_ret20_min']):
+        fails.append('U4冷门')
+    return (not fails), fails
+
+def dragon_entry_enhance(bars, i, lu_idx):
+    """龙回头分支增强 A+B+C+E, 在信号日 i (D0) 判定; lu_idx 为锚定涨停日下标。
+
+    返回 (ok, fail_reasons)。特征口径与离线验证 (_dragon_feats.json) 完全一致。
+    """
+    p = PREFILTER_PARAMS
+    fails = []
+    lu_close = bars[lu_idx]['close']
+    if lu_close <= 0:
+        return False, ['E无锚点']
+    resid = (bars[i]['close'] / lu_close - 1) * 100
+    # A 回调充分
+    if resid > p['dragon_resid_max']:
+        fails.append(f'A残留{resid:.1f}')
+    # B 主升前置: 涨停日前20日涨幅 (数据不足视为不满足, 与离线口径一致)
+    if lu_idx >= 20 and bars[lu_idx - 20]['close'] > 0:
+        pre = (bars[lu_idx]['close'] / bars[lu_idx - 20]['close'] - 1) * 100
+        if pre < p['dragon_pre_rally_min']:
+            fails.append(f'B前置{pre:.1f}')
+    else:
+        fails.append('B前置数据不足')
+    # C 趋势环境: D0收盘 >= MA60 (数据不足视为不满足, 与离线口径一致)
+    if i >= 59:
+        ma60 = sum(b['close'] for b in bars[i - 59:i + 1]) / 60
+        if bars[i]['close'] < ma60:
+            fails.append('C_MA60下')
+    else:
+        fails.append('C_MA60数据不足')
+    # E 排除死亡谷: 回调期最低收盘不落在涨停收盘的(-20%,-15%]
+    lo, hi = p['dragon_death_valley']
+    min_close = min(b['close'] for b in bars[lu_idx + 1:i + 1])
+    depth = (min_close / lu_close - 1) * 100
+    if lo < depth <= hi:
+        fails.append(f'E死亡谷{depth:.1f}')
+    return (not fails), fails
+
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0):
+                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0,
+                             stock_info=None, use_prefilter=True, use_enhance=True,
+                             require_yin=True, require_volr=True, require_macd_red=False):
     """龙回头 (as-of 统一版): 逐日只用"当日收盘可知"的数据判定候选信号, 次日开盘买入。
 
     与 --today 报告共用同一个判定函数 dragon_today_d0_signals:
@@ -548,11 +633,16 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             min_pullback_days=min_pullback_days,
             max_pullback_days=max_pullback_days,
             max_last_chg=max_last_chg,
-            limit_ups=[j for j in lu_all if j < i])
+            limit_ups=[j for j in lu_all if j < i],
+            require_yin=require_yin, require_volr=require_volr,
+            require_macd_red=require_macd_red)
         if not sigs:
             continue
         sig = sigs[0]
+        lu_idx = _find_bar_idx(bars, sig['lu_date'])
+
         # 去重 (与原回测 used_ranges 规则一致): 区间±4天内跳过
+        # 注意去重在过滤之前, 保证禁用过滤器时行为与历史基线完全一致
         skip = False
         for (s, e) in used_ranges:
             if abs(i - s) <= 4 or abs(i - e) <= 4:
@@ -560,8 +650,20 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 break
         if skip:
             continue
-        lu_idx = _find_bar_idx(bars, sig['lu_date'])
         used_ranges.append((lu_idx, i))
+
+        # 统一前置过滤 U1~U4 + 分支增强 A+B+C+E (无未来函数)
+        # 注意: 统一层在锚定涨停日(lu_idx)评估, 而非D0信号日 —— 龙回头D0是缩量小阴日,
+        # 换手天然低, 在D0评估U2会误杀 (离线验证: @涨停日 46.2% vs @信号日 43.1%);
+        # 分支增强A+B+C+E在D0评估 (离线验证口径)。
+        if use_prefilter and lu_idx > 0:
+            ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
+            if not ok:
+                continue
+        if use_enhance and lu_idx > 0:
+            ok, fails = dragon_entry_enhance(bars, i, lu_idx)
+            if not ok:
+                continue
 
         # 入场: 次日(D+1)开盘价 —— 第i日收盘后即可确定, 无未来数据
         d1 = bars[i + 1]
@@ -595,9 +697,12 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
     return trades
 def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=11,
-                            max_last_chg=3.0, today_str=None, limit_ups=None):
+                            max_last_chg=3.0, today_str=None, limit_ups=None,
+                            require_yin=True, require_volr=True, require_macd_red=False):
     """龙回头 今日(D0)入场信号: 只检查D0是否满足信号日, 不依赖D+1数据
 
+    require_yin/require_volr 可关闭 D0 末期小阴(-3%~-0.5%)与量比(0.5~0.8x)两条件
+    (2026-09-04 实验用, 默认开启保持历史行为)。
     返回空list或单元素list, 元素含 lu_date/pullback_days/signal_date/signal_chg/entry_vol_r。
     """
     result = []
@@ -621,18 +726,26 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
         return result
     # D0为信号日: 末期小阴 -max_last_chg% < 涨跌 < -0.5% (缩量下跌, 抛压枯竭)
     last_chg = (d0['close'] / prev_c - 1) * 100
-    if not (-max_last_chg < last_chg < -0.5):
+    if require_yin and not (-max_last_chg < last_chg < -0.5):
         return result
     # 信号日量比: D0量 / D-1量 (0.5~0.8x 缩量)
     prev_vol = bars[i - 1]['volume']
     entry_vol_r = d0['volume'] / prev_vol if prev_vol > 0 else 0
-    if entry_vol_r < 0.5 or entry_vol_r >= 0.8:
+    if require_volr and (entry_vol_r < 0.5 or entry_vol_r >= 0.8):
         return result
+
+    # ═══════════════════════════════════════════════════════════════
+    # MACD 翻红过滤 (2026-09-05 判别分析唯一两段稳定规则: D0收盘MACD柱>0)
+    # ═══════════════════════════════════════════════════════════════
+    closes = [bars[j]['close'] for j in range(i + 1)]
+    if require_macd_red:
+        _, _, hist_red = calc_macd(closes)
+        if hist_red is None or len(hist_red) < 2 or hist_red[-1] <= 0:
+            return result
 
     # ═══════════════════════════════════════════════════════════════
     # 技术指标加分制 (AND逻辑: 总分必须>=阈值)
     # ═══════════════════════════════════════════════════════════════
-    closes = [bars[j]['close'] for j in range(i + 1)]
     score = 0
 
     # --- MACD (最高+4, 最低-2) ---
@@ -870,7 +983,7 @@ def strategy_v1(bars, code,
                 ret_20d_min=30.0,
                 d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                  obv_filter=True,
-                 d_1_vol_max=1.5, stock_info=None):
+                 d_1_vol_max=1.5, stock_info=None, use_prefilter=True):
     """V1 (as-of 统一版): 逐日只用当日收盘可知数据判定 D0 四因子, 次日开盘买入。
 
     与 --today 报告共用同一个判定函数 v1_today_d0_signals:
@@ -897,6 +1010,12 @@ def strategy_v1(bars, code,
         if not sigs:
             continue
         sig = sigs[0]
+
+        # 统一前置过滤 U1~U4 (信号日D0收盘可知; V1的20日涨幅>=30%已隐含U4, 实际生效U1/U2/U3)
+        if use_prefilter:
+            ok, fails = unified_prefilter(bars, i, code, stock_info)
+            if not ok:
+                continue
 
         # 入场: 次日(D+1)开盘价 + D1当日过滤 (与实盘 D1 开盘后人工筛选口径一致)
         d0 = bars[i]
@@ -940,7 +1059,7 @@ def strategy_v1(bars, code,
 
     return trades
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_params=None,
-                       stock_info=None):
+                       stock_info=None, use_prefilter=True):
     """断板买入 (as-of 统一版): 逐日判定"今日是否为断板期确认日", 次日开盘买入。
 
     与 --today 报告共用同一个判定函数 break_today_d0_signals (+ _break_signal_at 的
@@ -977,9 +1096,16 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         sig = sigs[0]
 
         # 去重 (与原回测一致): 同一连板起点+断板日只取一次
+        # 去重在过滤之前, 保证禁用过滤器时行为与历史基线完全一致
         key = (sig['streak_start'], sig['break_date'])
         if key in used: continue
         used.add(key)
+
+        # 统一前置过滤 U1~U4 (确认日D0收盘可知; 连板>=2已隐含U4, 实际生效U1/U2/U3)
+        if use_prefilter:
+            ok, fails = unified_prefilter(bars, i, code, stock_info)
+            if not ok:
+                continue
 
         # 入场: 次日(D+1)开盘价
         entry_price = bars[i + 1]['open']
@@ -1526,6 +1652,12 @@ def main():
     parser.add_argument("--d1-pullback-max", type=float, default=-3.0, help="V1: D-1回调最大%% (默认-3)")
     parser.add_argument("--no-obv-filter", action="store_true", help="V1: 禁用OBV上升过滤")
     parser.add_argument("--d1-vol-max", type=float, default=1.5, help="V1: D-1量vs5日均量上限 (默认1.5x)")
+    # 统一前置过滤开关 (U1~U4 + 龙回头A+B+C+E, 依据tmp/两份分析报告)
+    parser.add_argument("--no-ufilter", action="store_true", help="禁用统一前置过滤U1~U4 (对照用)")
+    parser.add_argument("--no-dragon-enhance", action="store_true", help="禁用龙回头分支增强A+B+C+E (对照用)")
+    parser.add_argument("--no-d0-yin", action="store_true", help="龙回头: 去掉D0末期小阴(-3%%~-0.5%%)条件 (实验)")
+    parser.add_argument("--no-d0-volr", action="store_true", help="龙回头: 去掉D0量比(0.5~0.8x)条件 (实验)")
+    parser.add_argument("--d0-macd-red", action="store_true", help="龙回头: D0要求MACD柱翻红(>0) (2026-09-05判别分析验证)")
     parser.add_argument("--today", action="store_true", help="显示买点+持仓卖出建议 (7天内买入的持仓)")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为库内最后交易日; 晚于库内最后交易日时按库内最后交易日处理")
     args = parser.parse_args()
@@ -1646,7 +1778,13 @@ def main():
             dc = strategy_dragon_callback(bars, code,
                                            min_pullback_days=args.pullback,
                                            max_pullback_days=args.max_pullback,
-                                           max_last_chg=args.max_last_chg)
+                                           max_last_chg=args.max_last_chg,
+                                           stock_info=stock_info.get(code) if stock_info else None,
+                                           use_prefilter=not args.no_ufilter,
+                                           use_enhance=not args.no_dragon_enhance,
+                                           require_yin=not args.no_d0_yin,
+                                           require_volr=not args.no_d0_volr,
+                                           require_macd_red=args.d0_macd_red)
             dc_trades.extend(dc)
             parts.append(f"龙回头{len(dc)}")
         if run_dc2:
@@ -1667,11 +1805,13 @@ def main():
                              d_1_pullback_max=args.d1_pullback_max,
                              obv_filter=not args.no_obv_filter,
                              d_1_vol_max=args.d1_vol_max,
-                             stock_info=info)
+                             stock_info=info,
+                             use_prefilter=not args.no_ufilter)
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")
         if run_bb:
-            bb = strategy_break_buy(bars, code, stock_info=stock_info.get(code) if stock_info else None)
+            bb = strategy_break_buy(bars, code, stock_info=stock_info.get(code) if stock_info else None,
+                                    use_prefilter=not args.no_ufilter)
             bb_trades.extend(bb)
             parts.append(f"断板{len(bb)}")
 
@@ -1895,12 +2035,15 @@ def main():
                   f"{t['entry_date']}买{t['entry_price']:>7.2f} 量比{t['entry_vol_r']:.2f}x "
                   f"收益{t['return_pct']:>+6.2f}% 峰值{t['peak_return_pct']:>+6.2f}%")
 
-    # 导出
+    # 导出 (文件名带策略后缀, 避免多策略连跑互相覆盖; 按文件卫生规则输出到 tmp/)
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+    os.makedirs(out_dir, exist_ok=True)
+    out_name = os.path.join(out_dir, f"test_dragon_callback_result_{args.strategy}.json")
     all_out = dc_trades + d2_trades + v1_trades + bb_trades
     if all_out:
-        with open("test_dragon_callback_result.json", "w", encoding="utf-8") as f:
+        with open(out_name, "w", encoding="utf-8") as f:
             json.dump(all_out, f, ensure_ascii=False, indent=2)
-        print(f"\n💾 test_dragon_callback_result.json ({len(all_out)}笔)")
+        print(f"\n💾 {out_name} ({len(all_out)}笔)")
 
 if __name__ == "__main__":
     main()
