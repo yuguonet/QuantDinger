@@ -110,7 +110,10 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     - 信号写 signals 表 (state=watch_pending, 待次日 D1 9:26/15:00 由 monitor 处置)
     - 组对账 (活跃集不变时无操作, 防漂移)
     """
-    from app.market_cn.auto.dragon_core import DRAGON2_PARAMS, dragon2_today_d0_signals
+    from app.market_cn.auto.dragon_core import (
+        DRAGON2_PARAMS, dragon2_today_d0_signals,
+        v1_today_d0_signals, break_today_d0_signals, find_limit_ups, get_board_type,
+    )
     from app.market_cn.auto import dragon_store
 
     dragon_store.ensure_tables()
@@ -152,8 +155,36 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
             logger.debug("[dragon_scan] %s 判定异常: %s", code, e)
             continue
         for s in sigs:
+            s["strategy"] = "dragon2"
             s["name"] = (stock_info.get(code) or {}).get("name", "")
         rows.extend(sigs)
+
+        # ── V1: D0 四因子 (涨停+强趋势+回踩+OBV+非放量) ──
+        try:
+            v1s = v1_today_d0_signals(bars, code)
+            for s in v1s:
+                s["strategy"] = "v1"
+                s["style"] = "v1"
+                s["score"] = int(min(99, max(0, s.get("ret_20d", 0) or 0)))
+                s["signal_date"] = s.get("d0_date")
+                s["signal_price"] = s.get("d0_close")
+                s["name"] = (stock_info.get(code) or {}).get("name", "")
+            rows.extend(v1s)
+        except Exception as e:
+            logger.debug("[dragon_scan] %s V1判定异常: %s", code, e)
+
+        # ── 断板: 连板≥2 → 断板期确认 (确认日=断板期最后一天) ──
+        try:
+            brks = break_today_d0_signals(bars, code)
+            for s in brks:
+                s["strategy"] = "break"
+                s["style"] = "brk"
+                s["score"] = int(s.get("confirm_chg", 0) or 0) + 10
+                s["signal_price"] = None
+                s["name"] = (stock_info.get(code) or {}).get("name", "")
+            rows.extend(brks)
+        except Exception as e:
+            logger.debug("[dragon_scan] %s 断板判定异常: %s", code, e)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
                         i + 1, len(codes), len(rows), time.time() - t0)

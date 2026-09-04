@@ -52,7 +52,7 @@ def _normalize_symbol(symbol: str) -> str:
     return (symbol or '').strip().upper()
 
 DEFAULT_GROUP_NAME = '默认自选'
-STRATEGY_GROUP_NAME = '龙回头Pro'   # 引擎独占管理的策略组 (勿手动增删, 由 dragon_scan/monitor 对账)
+STRATEGY_GROUP_NAME = '自动策略组'   # 引擎独占管理的策略组 (龙回头Pro/V1/断板 三策略共用, 勿手动增删)
 
 def _valid_group_name(name) -> tuple:
     """Return (normalized_name_or_None, error_msg). None name + '' msg means ok."""
@@ -283,7 +283,7 @@ def get_watchlist():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT id, market, symbol, name, group_name, strategy_state, strategy_detail FROM qd_watchlist WHERE user_id = ? ORDER BY id DESC",
+                "SELECT id, market, symbol, name, group_name, strategy_state, strategy_detail FROM qd_watchlist WHERE user_id = ? ORDER BY COALESCE(sort_order, 1000000) ASC, id DESC",
                 (user_id,)
             )
             rows = cur.fetchall() or []
@@ -385,6 +385,36 @@ def add_watchlist():
         logger.error(f"add_watchlist failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+@market_bp.route('/watchlist/reorder', methods=['POST'])
+@login_required
+def reorder_watchlist():
+    """保存用户拖动排序: items = [{id, sort_order}] (仅限本人行; 策略组行由引擎排序, 传了也无效)"""
+    try:
+        user_id = g.user_id
+        data = request.get_json() or {}
+        items = data.get('items') or []
+        if not isinstance(items, list) or not items:
+            return jsonify({'code': 0, 'msg': '缺少 items', 'data': None}), 400
+        with get_db_connection() as db:
+            cur = db.cursor()
+            n = 0
+            for it in items:
+                try:
+                    cur.execute(
+                        "UPDATE qd_watchlist SET sort_order = ?, updated_at = NOW() WHERE id = ? AND user_id = ?",
+                        (int(it.get('sort_order') or 0), int(it.get('id')), user_id)
+                    )
+                    n += cur.rowcount or 0
+                except Exception:
+                    continue
+            db.commit()
+            cur.close()
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'updated': n}})
+    except Exception as e:
+        logger.error(f"reorder_watchlist failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
 
 @market_bp.route('/watchlist/remove', methods=['POST'])
 @login_required

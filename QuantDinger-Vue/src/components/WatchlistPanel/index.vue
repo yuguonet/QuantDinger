@@ -63,7 +63,12 @@
         v-for="stock in visibleWatchlist"
         :key="`wl-${stock.group_name || ''}-${stock.market}-${stock.symbol}`"
         class="wl-card"
-        :class="{ active: selectedKey === `${stock.market}:${stock.symbol}` }"
+        :class="{ active: selectedKey === `${stock.market}:${stock.symbol}`, 'drag-over': dragOverKey === `${stock.market}:${stock.symbol}` }"
+        :draggable="stock.strategy_state ? 'false' : 'true'"
+        @dragstart="onDragStart(stock, $event)"
+        @dragover.prevent="onDragOver(stock, $event)"
+        @drop="onDrop(stock, $event)"
+        @dragend="onDragEnd"
         @click="selectWatchlistItem(stock)"
       >
         <a-checkbox
@@ -80,6 +85,17 @@
                 <span class="wl-symbol" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</span>
                 <span class="wl-symbol" v-else>{{ stock.symbol }}</span>
                 <span class="wl-market">{{ getMarketName(stock.market) }}</span>
+                <template v-if="stock.strategy_state">
+                  <a-popover trigger="hover" placement="right">
+                    <template slot="content">
+                      <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
+                    </template>
+                    <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
+                  </a-popover>
+                  <span class="wl-strategy-mini" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
+                  <span class="wl-strategy-mini" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
+                  <span class="wl-strategy-pre" v-if="strategyPreConfirm(stock)">预{{ strategyPreConfirmText(stock) }}</span>
+                </template>
               </div>
               <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.symbol }}</div>
             </div>
@@ -93,15 +109,6 @@
               <span v-if="stock.news_score > 4" class="wl-news-heart">♥</span>
               <span v-else class="wl-news-num" :class="{ 'news-negative': stock.news_score < -4 }">{{ stock.news_score }}</span>
             </div>
-          </div>
-          <div class="wl-row-strategy" v-if="stock.strategy_state">
-            <a-tooltip :title="strategyDetailText(stock)">
-              <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
-            </a-tooltip>
-            <span class="wl-strategy-item" v-if="strategyEntryPrice(stock)"><span class="wl-strategy-k">买</span>{{ formatPrice(strategyEntryPrice(stock)) }}</span>
-            <span class="wl-strategy-item" v-if="strategyStopPrice(stock)"><span class="wl-strategy-k">损</span>{{ formatPrice(strategyStopPrice(stock)) }}</span>
-            <span class="wl-strategy-item" v-if="strategyScore(stock) !== null && strategyScore(stock) !== undefined"><span class="wl-strategy-k">分</span>{{ strategyScore(stock) }}</span>
-            <span class="wl-strategy-item" v-if="strategyPreConfirm(stock)"><span class="wl-strategy-pre">预{{ strategyPreConfirmText(stock) }}</span></span>
           </div>
           <div class="wl-row-pnl" v-if="positionSummaryMap[`${stock.market}:${stock.symbol}`]">
             <span class="wl-pnl-qty">{{ formatNum(positionSummaryMap[`${stock.market}:${stock.symbol}`].quantity, 4) }} @ {{ formatPrice(positionSummaryMap[`${stock.market}:${stock.symbol}`].avgEntry || 0) }}</span>
@@ -422,7 +429,7 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
+import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, reorderWatchlist, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 
 const DEFAULT_GROUP_NAME = '默认自选'
@@ -439,6 +446,8 @@ export default {
     return {
       watchlistPriceTimer: null,
       watchlistPrices: {},
+      dragKey: null,
+      dragOverKey: null,
       localUserInfo: {},
       loadingUserInfo: false,
       userId: 1,
@@ -544,13 +553,17 @@ export default {
       const isStrategy = rows.some(s => s.strategy_state)
       if (!isStrategy) return rows
       const weight = { 'exit_today': 0, 'holding': 1, 'buy_today': 2, 'watch_pending': 3 }
+      const wrMap = { 'v1': 76.5, 'break': 62.7, 'dragon2': 70.4 }
       return rows.slice().sort((a, b) => {
         const wa = weight[a.strategy_state] !== undefined ? weight[a.strategy_state] : 9
         const wb = weight[b.strategy_state] !== undefined ? weight[b.strategy_state] : 9
         if (wa !== wb) return wa - wb
-        const sa = (a.strategy_detail && a.strategy_detail.score) || 0
-        const sb = (b.strategy_detail && b.strategy_detail.score) || 0
-        return sb - sa
+        const da = a.strategy_detail || {}
+        const dbb = b.strategy_detail || {}
+        const wra = wrMap[da.strategy] || 0
+        const wrb = wrMap[dbb.strategy] || 0
+        if (wra !== wrb) return wrb - wra
+        return (dbb.score || 0) - (da.score || 0)
       })
     }
   },
@@ -970,6 +983,70 @@ export default {
       const pc = (stock.strategy_detail || {}).pre_confirm
       return m[pc] || pc || ''
     },
+    strategyDetailHtml (stock) {
+      const d = stock.strategy_detail || {}
+      const esc = s => String(s === undefined || s === null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+      const row = (k, v) => (v !== undefined && v !== null && v !== '') ? `<tr><td class="k">${k}</td><td class="v">${esc(v)}</td></tr>` : ''
+      const pcMap = { strong: '强', ok: '中', weak: '弱' }
+      let html = '<table class="wl-dtable">'
+      html += row('策略', d.strategy_label)
+      html += row('历史胜率', d.winrate !== undefined && d.winrate !== null ? d.winrate + '%' : '')
+      html += row('状态', (d.state_label || stock.strategy_state || '') + (d.pre_confirm ? `(预判:${pcMap[d.pre_confirm] || d.pre_confirm})` : ''))
+      html += row('形态', d.entry_style)
+      html += row('评分', d.score)
+      if (d.lu_date) html += row('锚点日', `${d.lu_date}${d.pullback_days ? ` 回调${d.pullback_days}天` : ''}`)
+      if (d.signal_date) html += row('信号', `${d.signal_date} @ ${d.signal_price || ''}`)
+      if (d.turnover_anchor !== undefined && d.turnover_anchor !== null) html += row('换手(锚)', `${d.turnover_anchor}%${d.turnover_sig !== undefined && d.turnover_sig !== null ? ` / 信${d.turnover_sig}%` : ''}`)
+      if (d.float_mcap_yi !== undefined && d.float_mcap_yi !== null) html += row('流通市值', `${d.float_mcap_yi}亿`)
+      if (d.ma60_slope !== undefined && d.ma60_slope !== null) html += row('MA60斜率', `${d.ma60_slope}%${d.ma_bull ? ' 多头排列' : ''}`)
+      if (d.entry_date) html += row('买入', `${d.entry_date} @ ${d.entry_price || ''}`)
+      if (d.stop_price) html += row('止损', d.stop_price)
+      if (d.d1_chg !== undefined && d.d1_chg !== null) html += row('D1确认', `${d.d1_chg > 0 ? '+' : ''}${d.d1_chg}%${d.d1_vol_r !== undefined && d.d1_vol_r !== null ? ` 量比${d.d1_vol_r}` : ''}`)
+      if (d.exit_reason) html += row('出场', `${d.exit_reason}${d.exit_date ? ` (${d.exit_date} @ ${d.exit_price || ''})` : ''}`)
+      html += '</table>'
+      html += '<div class="wl-strategy-foot">自动策略组 · 系统自动管理</div>'
+      return html
+    },
+    onDragStart (stock, e) {
+      this.dragKey = `${stock.market}:${stock.symbol}`
+      try {
+        e.dataTransfer.setData('text/plain', this.dragKey)
+        e.dataTransfer.effectAllowed = 'move'
+      } catch (err) { /* 旧浏览器忽略 */ }
+    },
+    onDragOver (stock, e) {
+      const k = `${stock.market}:${stock.symbol}`
+      if (this.dragKey && k !== this.dragKey && !stock.strategy_state) this.dragOverKey = k
+    },
+    onDragEnd () {
+      this.dragKey = null
+      this.dragOverKey = null
+    },
+    async onDrop (stock, e) {
+      const fromKey = this.dragKey
+      this.dragKey = null
+      this.dragOverKey = null
+      if (!fromKey) return
+      const toKey = `${stock.market}:${stock.symbol}`
+      if (fromKey === toKey || stock.strategy_state) return
+      const list = this.visibleWatchlist.slice()
+      const fromIdx = list.findIndex(s => `${s.market}:${s.symbol}` === fromKey)
+      const toIdx = list.findIndex(s => `${s.market}:${s.symbol}` === toKey)
+      if (fromIdx < 0 || toIdx < 0) return
+      const moving = list[fromIdx]
+      if (moving.strategy_state) return
+      list.splice(fromIdx, 1)
+      list.splice(toIdx, 0, moving)
+      const orderIds = list.map(s => s.id)
+      this.watchlist = this.watchlist.slice().sort((a, b) => {
+        const ia = orderIds.indexOf(a.id)
+        const ib = orderIds.indexOf(b.id)
+        return (ia < 0 ? 99999 : ia) - (ib < 0 ? 99999 : ib)
+      })
+      try {
+        await reorderWatchlist({ items: list.map((s, i) => ({ id: s.id, sort_order: i + 1 })) })
+      } catch (err) { /* 静默: 下次同步按服务器顺序 */ }
+    },
     strategyDetailText (stock) {
       const d = stock.strategy_detail || {}
       const pcMap = { strong: '强', ok: '中', weak: '弱' }
@@ -1354,6 +1431,14 @@ export default {
 .wl-strategy-item { font-size: 10px; color: #64748b; font-family: 'SF Mono', Monaco, monospace; }
 .wl-strategy-k { color: #94a3b8; margin-right: 1px; }
 .wl-strategy-pre { font-size: 10px; color: #d97706; font-weight: 600; }
+.wl-strategy-mini { font-size: 10px; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; }
+.wl-strategy-mini:first-of-type { color: #15803d; }
+.wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
+.wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
+.wl-strategy-pop table.wl-dtable td { padding: 2px 8px; border-bottom: 1px solid #f1f5f9; }
+.wl-strategy-pop table.wl-dtable td.k { color: #94a3b8; white-space: nowrap; padding-right: 12px; }
+.wl-strategy-pop table.wl-dtable td.v { color: #0f172a; font-weight: 500; }
+.wl-strategy-pop .wl-strategy-foot { margin-top: 6px; font-size: 10px; color: #94a3b8; }
 .wl-hover-btn.strategy-managed { color: #94a3b8; cursor: default; }
 
 .negative-news { background: rgba(239, 68, 68, 0.08) !important; border-color: rgba(239, 68, 68, 0.2) !important; }

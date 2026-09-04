@@ -20,11 +20,15 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 组名与用户
-DRAGON_GROUP_NAME = "龙回头Pro"
+# 组名与用户 (固定名: 自动策略组, 三策略共用: 龙回头Pro/V1/断板)
+DRAGON_GROUP_NAME = "自动策略组"
 DRAGON_USER_ID = 1
 DRAGON_MARKET = "CNStock"
 DRAGON_STRATEGY = "dragon2"
+STRATEGIES = ("dragon2", "v1", "break")
+STRATEGY_LABELS = {"dragon2": "龙回头Pro", "v1": "V1", "break": "断板"}
+# 历史回测胜率 (300日全市场): 策略组排序用
+STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon2": 70.4}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
@@ -82,11 +86,28 @@ def ensure_tables():
                 extra         JSONB DEFAULT '{{}}',
                 created_at    TIMESTAMP DEFAULT NOW(),
                 updated_at    TIMESTAMP DEFAULT NOW(),
-                UNIQUE(trade_date, code, entry_style)
+                UNIQUE(trade_date, strategy, code, entry_style)
             )
         """)
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_qdds_state ON {_SIGNALS_TABLE}(state)")
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_qdds_date ON {_SIGNALS_TABLE}(trade_date)")
+        # 旧版唯一键 (未含 strategy) → 升级 (名称无关, 按定义判定)
+        cur.execute("""
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'qd_dragon_signals'::regclass AND contype = 'u'
+              AND pg_get_constraintdef(oid) NOT ILIKE '%strategy%'
+        """)
+        for r in cur.fetchall():
+            oldname = r["conname"] if isinstance(r, dict) else r[0]
+            cur.execute(f"ALTER TABLE {_SIGNALS_TABLE} DROP CONSTRAINT {oldname}")
+        cur.execute("""
+            SELECT 1 FROM pg_constraint WHERE conname = 'qd_dragon_signals_ukey'
+        """)
+        if not cur.fetchone():
+            cur.execute(f"""
+                ALTER TABLE {_SIGNALS_TABLE}
+                ADD CONSTRAINT qd_dragon_signals_ukey UNIQUE (trade_date, strategy, code, entry_style)
+            """)
 
         # ── 2. qd_watchlist 加列 ──
         cur.execute("""
@@ -98,6 +119,11 @@ def ensure_tables():
             cur.execute("ALTER TABLE qd_watchlist ADD COLUMN strategy_state VARCHAR(20)")
         if "strategy_detail" not in existing:
             cur.execute("ALTER TABLE qd_watchlist ADD COLUMN strategy_detail JSONB")
+        if "sort_order" not in existing:
+            cur.execute("ALTER TABLE qd_watchlist ADD COLUMN sort_order INTEGER DEFAULT 0")
+        # 组名统一为 自动策略组 (旧名 龙回头Pro 迁移)
+        cur.execute("UPDATE qd_watchlist SET group_name = %s WHERE group_name = %s",
+                    (DRAGON_GROUP_NAME, "龙回头Pro"))
 
         # ── 3. UNIQUE 约束放宽: (user_id, market, symbol) → (+ group_name) ──
         # 名称无关判定: 只要存在覆盖 4 列的 UNIQUE 约束即视为已迁移
@@ -147,7 +173,7 @@ def _row_to_dict(r):
 
 
 def upsert_scan_signals(trade_date: str, rows: list):
-    """盘后扫描结果写入 (幂等): rows = dragon2_today_d0_signals 的返回列表。
+    """盘后扫描结果写入 (幂等): rows 为各策略 (dragon2/v1/break) 的今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
@@ -165,19 +191,21 @@ def upsert_scan_signals(trade_date: str, rows: list):
             extra = {k: s.get(k) for k in
                      ("turnover_anchor", "turnover_sig", "float_mcap_yi", "ma60_slope",
                       "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
-                      "anchor_type", "anchor_vol_r", "sig_vol") if s.get(k) is not None}
+                      "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
+                      "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
+                      "pre20_gain") if s.get(k) is not None}
             cur.execute(f"""
                 INSERT INTO {_SIGNALS_TABLE}
                     (trade_date, strategy, code, name, board, entry_style, score, state,
                      signal_date, signal_price, lu_date, pullback_days, extra, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (trade_date, code, entry_style) DO UPDATE SET
+                ON CONFLICT (trade_date, strategy, code, entry_style) DO UPDATE SET
                     name = EXCLUDED.name, score = EXCLUDED.score, state = EXCLUDED.state,
                     signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
                     lu_date = EXCLUDED.lu_date, pullback_days = EXCLUDED.pullback_days,
                     extra = EXCLUDED.extra, updated_at = NOW()
             """, (
-                trade_date, DRAGON_STRATEGY, s["code"], s.get("name", ""), s.get("board", ""),
+                trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
                 s.get("style", "a"), int(s.get("score", 0)), S_WATCH_PENDING,
                 s.get("signal_date"), s.get("signal_price"),
                 s.get("lu_date"), s.get("pullback_days"),
@@ -231,13 +259,13 @@ def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, 
     cur.execute(f"UPDATE {_SIGNALS_TABLE} SET {', '.join(sets)} WHERE id = %s", vals)
 
 
-def list_signals(states=None, trade_date=None, days=20, only_active=False):
+def list_signals(states=None, trade_date=None, days=20, only_active=False, strategies=None):
     """查询信号 (signals 表)。states: 状态过滤; trade_date: 指定信号日; days: 最近N日。"""
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
         cur = db.cursor()
-        sql = f"SELECT * FROM {_SIGNALS_TABLE} WHERE strategy = %s"
-        vals = [DRAGON_STRATEGY]
+        sql = f"SELECT * FROM {_SIGNALS_TABLE} WHERE strategy = ANY(%s)"
+        vals = [list(strategies or STRATEGIES)]
         if states:
             sql += " AND state = ANY(%s)"
             vals.append(list(states))
@@ -282,31 +310,32 @@ def get_markers(code, days=60):
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(f"""
-            SELECT trade_date, code, name, entry_style, score, state,
+            SELECT trade_date, strategy, code, name, entry_style, score, state,
                    signal_date, signal_price, entry_date, entry_price,
                    exit_date, exit_price, exit_reason, confirm_date, d1_chg, d1_vol_r
             FROM {_SIGNALS_TABLE}
-            WHERE strategy = %s AND code = %s AND trade_date >= (CURRENT_DATE - %s::int)
+            WHERE strategy = ANY(%s) AND code = %s AND trade_date >= (CURRENT_DATE - %s::int)
             ORDER BY trade_date
-        """, (DRAGON_STRATEGY, code, days))
+        """, (list(STRATEGIES), code, days))
         rows = [_row_to_dict(r) for r in cur.fetchall()]
         cur.close()
 
     markers = []
     for r in rows:
+        sname = STRATEGY_LABELS.get(r.get("strategy"), r.get("strategy", ""))
         if r.get("signal_date") and r.get("signal_price"):
             markers.append({"time": r["signal_date"], "side": "signal",
                             "price": float(r["signal_price"]),
-                            "label": f"信号({r['entry_style']},score{r['score']})"})
+                            "label": f"{sname}信号({r['entry_style']},score{r['score']})"})
         if r.get("entry_date") and r.get("entry_price") and \
                 r["state"] in (S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY, S_CLOSED):
             markers.append({"time": r["entry_date"], "side": "buy",
-                            "price": float(r["entry_price"]), "label": "买入"})
+                            "price": float(r["entry_price"]), "label": f"买入·{sname}"})
         if r.get("exit_date") and r.get("exit_price") and \
                 r["state"] in (S_EXIT_TODAY, S_CLOSED):
             markers.append({"time": r["exit_date"], "side": "sell",
                             "price": float(r["exit_price"]),
-                            "label": f"卖出({r.get('exit_reason') or ''})"})
+                            "label": f"卖出·{sname}({r.get('exit_reason') or ''})"})
     return markers
 
 
@@ -315,11 +344,15 @@ def get_markers(code, days=60):
 # ================================================================
 
 def _display_detail(s):
-    """signals 行 → qd_watchlist.strategy_detail (前端 hover 明细)。v 字段用于变更检测。"""
+    """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。"""
+    strat = s.get("strategy") or "dragon2"
     return {
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
+        "strategy": strat,
+        "strategy_label": STRATEGY_LABELS.get(strat, strat),
+        "winrate": STRATEGY_WINRATE.get(strat),
         "state_label": STATE_LABELS.get(s["state"], s["state"]),
-        "entry_style": "(a)缩量企稳" if s.get("entry_style") == "a" else "(b)放量启动",
+        "entry_style": "(a)缩量企稳" if s.get("entry_style") == "a" else ("(b)放量启动" if s.get("entry_style") == "b" else (s.get("entry_style") or "")),
         "score": s.get("score"),
         "lu_date": s.get("lu_date"),
         "pullback_days": s.get("pullback_days"),
@@ -425,15 +458,15 @@ def sync_watchlist_group(active_rows):
 
 
 def cleanup_old(days=15):
-    """历史清理: signals 表保留最近约 N 个交易日 (holding 保留至自然终态)。"""
+    """历史清理: signals 表保留最近约 N 个交易日 (holding 保留至自然终态)。三策略统一清理。"""
     from app.utils.db import get_db_connection
     cutoff = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
-            f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = %s AND trade_date < %s "
+            f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = ANY(%s) AND trade_date < %s "
             "AND state = ANY(%s)",
-            (DRAGON_STRATEGY, cutoff, [S_WATCH_PENDING, S_BUY_TODAY, S_EXIT_TODAY, S_CLOSED, S_EXPIRED]),
+            (list(STRATEGIES), cutoff, [S_WATCH_PENDING, S_BUY_TODAY, S_EXIT_TODAY, S_CLOSED, S_EXPIRED]),
         )
         n = cur.rowcount
         db.commit()

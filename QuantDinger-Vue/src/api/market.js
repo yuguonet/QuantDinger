@@ -10,6 +10,7 @@ const marketApi = {
   GetWatchlistPrices: '/api/market/watchlist/prices',
   GetDragonToday: '/api/market/dragon/today',
   GetDragonMarkers: '/api/market/dragon/markers',
+  ReorderWatchlist: '/api/market/watchlist/reorder',
   // Analysis
   MultiAnalysis: '/api/analysis/multiAnalysis',
   CreateAnalysisTask: '/api/analysis/createTask',
@@ -126,6 +127,18 @@ export function getDragonMarkers (parameter) {
     url: marketApi.GetDragonMarkers,
     method: 'get',
     params: parameter
+  })
+}
+
+/**
+ * 保存自选股拖动排序
+ * @param parameter { items: [{id, sort_order}] }
+ */
+export function reorderWatchlist (parameter) {
+  return request({
+    url: marketApi.ReorderWatchlist,
+    method: 'post',
+    data: parameter
   })
 }
 
