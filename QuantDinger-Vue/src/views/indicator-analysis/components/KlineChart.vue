@@ -2302,29 +2302,19 @@ registerOverlay({
       }
     })
 
-    // ========== 注册 VWAP 内置指标（分时图专用） ==========
-    // 统计分时图中累计的 VWAP 值，黄色线条叠加在主图上
-    registerIndicator({
-      name: 'VWAP',
-      shortName: 'VWAP',
-      figures: [{ key: 'vwap', title: 'VWAP', type: 'line', color: '#ffeb3b' }],
-      calc: (kLineDataList) => {
-        let cumVol = 0
-        let cumTPV = 0
-        return kLineDataList.map(k => {
-          // 分时补齐柱（close 为 null / __pad）不绘制 VWAP，保持与 K 线一致：未来时段不显示
-          if (k == null || k.close == null || k.__pad === true) {
-            return { vwap: null }
-          }
-          const tp = (k.high + k.low + k.close) / 3
-          const vol = k.volume || 0
-          cumVol += vol
-          cumTPV += tp * vol
-          return { vwap: cumVol > 0 ? cumTPV / cumVol : k.close }
-        })
-      },
-      series: 'price',
-      precision: 2
+    // ========== 分时均价线：使用 klinecharts 9.8 官方内置 AVP（Average Price Line 均价线） ==========
+    // 内置算法：累计成交额 / 累计成交量（逐柱累加 turnover / volume），无需自研 calc。
+    // 这里仅覆盖线条样式（黄色，与旧版自研 VWAP 视觉一致）与 tooltip 文案；
+    // 数据柱的 turnover 字段由 processMinuteLineData / mergeMinuteLineRealtime 负责补充
+    // （后端未提供成交额时按「典型价×成交量」合成，与旧版口径一致）。
+    const MINUTE_AVP_OPTIONS = () => ({
+      name: 'AVP',
+      shortName: '均价',
+      figures: [{ key: 'avp', title: '均价: ', type: 'line' }],
+      // 注意：9.8.12 的指标线绘制合并逻辑会直接读取 styles.lines[i].dashedValue[0]，
+      // 覆盖对象必须带全字段（缺 dashedValue 会在 IndicatorView.drawImp 中抛 TypeError，
+      // 并中断同 pane 后续指标的绘制——0 轴线因此消失）
+      styles: { lines: [{ color: '#ffeb3b', size: 1, style: 'stroke', dashedValue: [4, 4], smooth: false }] }
     })
 
     // ========== 分时图：0 轴线（原生指标线，与日K收盘线同机制） + Y 轴对称锚定 ==========
@@ -2343,7 +2333,7 @@ registerOverlay({
     let _minuteLockedRange = null
     /** 分时图模式下的 onVisibleRangeChange 回调引用，用于恢复时移除 */
     let _minuteRangeChangeCallback = null
-    /** 分时图模式下添加的 VWAP 指标 paneId */
+    /** 分时图模式下添加的均价线指标（内置 AVP，沿用旧名 _vwapPaneId）的 paneId */
     let _vwapPaneId = null
     /** 铺满视图计算中的重入保护（铺满过程会连续触发多次可见范围事件） */
     let _minuteFitting = false
@@ -2361,9 +2351,14 @@ registerOverlay({
     const MINUTE_APPLY_THROTTLE = 800
 
     /**
-     * 分时图模式：把全部数据铺满绘图区，X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00）。
-     * 通过可见范围自校准绘图区宽度：plotWidth ≈ (to - from + 1) × barSpace，
-     * 据此换算出铺满全部数据所需的 barSpace，再滚动到最左侧。
+     * 分时图模式：把可见视口固定锁死为「整个交易时段」。
+     * 数据多长就多长（不再用 null 占位柱补齐未来时段），改为纯视口方案：
+     *   1. barSpace = 绘图区宽度 / 全时段总柱数（A股=240，港股=330，见 minuteSessionBarCount）；
+     *   2. scrollToDataIndex(count-1) 先让最后一根真实柱贴到右缘（diff=0 基准）；
+     *   3. setOffsetRightDistance((总柱数-数据数)×barSpace) 把数据锚定到最左侧（from=0），
+     *      右侧留白即为尚未走完的未来时段；X 轴刻度按库原生行为只画到最后一根真实柱；
+     *   4. finally 中 setScrollEnabled(false) 锁死视口（不再随滚动/缩放变化）。
+     * 由于 barSpace 恒定（= 宽度/总柱数），实时追加新柱时视图零抖动，只需重设右侧空位。
      * 注意：setBarSpace / scrollToDataIndex 依赖滚动能力，必须在 setScrollEnabled(false) 之前执行。
      */
     const fitMinuteLineView = () => {
@@ -2376,20 +2371,44 @@ registerOverlay({
         if (!count) return
         // 铺满与滚动需要滚动能力，先临时恢复（finally 中统一关闭）
         if (typeof chart.setScrollEnabled === 'function') chart.setScrollEnabled(true)
-        // 策略：先把最后一根贴到绘图区右缘（diff=0 基准），
-        // 若 from > 0 说明 barSpace 偏大放不下全部柱子，按可见比例迭代收缩。
-        // klinecharts 的 to 会被钳到 count，因此收敛信号是 from ≤ 0。
-        for (let i = 0; i < 5; i++) {
-          if (typeof chart.scrollToDataIndex === 'function') chart.scrollToDataIndex(count - 1, 0)
-          const range = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
-          if (!range) break
-          if (range.from <= 0) break
-          const barSpace = typeof chart.getBarSpace === 'function' ? chart.getBarSpace() : 0
-          if (!(barSpace > 0) || typeof chart.setBarSpace !== 'function') break
-          chart.setBarSpace(barSpace * (count - range.from) / count)
+        const totalBars = minuteSessionBarCount(getMinuteLineSession())
+        // 绘图区宽度：优先取主图 drawing 区精确值（不含 Y 轴，与库内部 _totalBarSpace 同源），
+        // 失败时退化为 DOM clientWidth，再失败则放弃换算（沿用当前 barSpace 只做锚定）
+        let plotWidth = 0
+        try {
+          if (typeof chart.getSize === 'function') {
+            const size = chart.getSize('candle_pane', 'main')
+            if (size && size.width > 0) plotWidth = size.width
+          }
+        } catch (_) { /* 预期内 */ }
+        if (!(plotWidth > 0)) {
+          try {
+            const dom = typeof chart.getDom === 'function' ? chart.getDom('candle_pane', 'main') : null
+            if (dom && dom.clientWidth > 0) plotWidth = dom.clientWidth
+          } catch (_) { /* 预期内 */ }
         }
+        // barSpace 合法域与库一致（MIN=1 / MAX=50），越界会被 setBarSpace 静默拒绝
+        let barSpace = plotWidth > 0 ? Math.max(1, Math.min(50, plotWidth / totalBars)) : 0
+        if (barSpace > 0 && typeof chart.setBarSpace === 'function') {
+          chart.setBarSpace(barSpace)
+        }
+        if (typeof chart.getBarSpace === 'function') {
+          // 公开 API getBarSpace() 返回数值；部分版本/内部实现返回对象 {bar,...}，两种都兼容
+          const bs = chart.getBarSpace()
+          const bsVal = typeof bs === 'number' ? bs : (bs && bs.bar)
+          if (bsVal > 0) barSpace = bsVal
+        }
+        if (!(barSpace > 0)) return
+        // 数据锚定最左侧：先让最后一根贴右缘（diff=0），再设置右侧空位 = 未走完的未来时段
         if (typeof chart.scrollToDataIndex === 'function') chart.scrollToDataIndex(count - 1, 0)
-        _minuteLockedRange = { from: 0, to: count - 1 }
+        if (typeof chart.setOffsetRightDistance === 'function') {
+          chart.setOffsetRightDistance(Math.max(0, totalBars - count) * barSpace, true)
+        }
+        // 记录锁定后的实际范围（to 被库钳到数据数），供范围反弹回调判断是否被外力扰动
+        const range = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
+        _minuteLockedRange = range
+          ? { from: Math.round(range.from), to: Math.round(range.to) }
+          : { from: 0, to: count - 1 }
       } catch (_) {
         // 预期内：图表未就绪时无法铺满，静默降级
       } finally {
@@ -2556,7 +2575,12 @@ registerOverlay({
           high: parseFloat(item.high),
           low: parseFloat(item.low),
           close: parseFloat(item.close),
-          volume: parseFloat(item.volume || 0)
+          volume: parseFloat(item.volume || 0),
+          // 成交额透传（后端若提供 turnover/amount）：内置 AVP 均价线优先用真实成交额，
+          // 缺失时由分时管线（attachMinuteTurnover）按典型价×成交量合成
+          turnover: Number.isFinite(parseFloat(item.turnover))
+            ? parseFloat(item.turnover)
+            : (Number.isFinite(parseFloat(item.amount)) ? parseFloat(item.amount) : undefined)
         }
       }).filter(item => item.timestamp && !isNaN(item.open) && !isNaN(item.high) && !isNaN(item.low) && !isNaN(item.close))
         .sort((a, b) => a.timestamp - b.timestamp)
@@ -2697,21 +2721,31 @@ registerOverlay({
       return MINUTE_LINE_SESSIONS[m] || MINUTE_LINE_SESSIONS.cnstock
     }
 
+    /**
+     * 分时全时段总柱数（X 轴固定覆盖整个交易时段所需的 bar 总数）。
+     * 后端 1m 柱时间戳为结束时间（首柱 09:31，上午末柱 11:30，下午 13:01-15:00），
+     * 因此 上午 = morningEnd - start 根、下午 = end - afternoonStart 根：
+     * A股 = 120 + 120 = 240；港股 = 150 + 180 = 330。
+     */
+    const minuteSessionBarCount = (session) => {
+      const toMin = (n) => Math.floor(n / 100) * 60 + (n % 100)
+      const morningBars = Math.max(0, toMin(session.morningEnd) - toMin(session.start))
+      const afternoonBars = Math.max(0, toMin(session.end) - toMin(session.afternoonStart))
+      return Math.max(1, morningBars + afternoonBars)
+    }
+
     const minuteDateStr = (ts) => {
       const d = new Date(ts)
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
     }
 
-    /** 为分时真实柱计算累计 VWAP（与 VWAP 内置指标同口径） */
-    const attachMinuteVWAP = (bars) => {
-      let cumulativeVolume = 0
-      let cumulativeTPV = 0
+    /** 为分时真实柱补充 turnover（成交额）：内置 AVP 均价线的必需字段。
+     *  后端 1m 数据无成交额时按「典型价×成交量」合成，与旧版自研 VWAP 口径一致 */
+    const attachMinuteTurnover = (bars) => {
       bars.forEach(b => {
+        if (b == null || Number.isFinite(b.turnover)) return
         const typicalPrice = (b.high + b.low + b.close) / 3
-        const volume = b.volume || 0
-        cumulativeVolume += volume
-        cumulativeTPV += typicalPrice * volume
-        b.vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : b.close
+        b.turnover = typicalPrice * (b.volume || 0)
       })
       return bars
     }
@@ -2809,55 +2843,12 @@ registerOverlay({
     }
 
     /**
-     * 分时数据补齐：从最后一根真实柱向后按分钟补齐到当日收盘。
-     * 补齐柱使用前收盘平线 + 零成交量（实时分钟到达后会被逐根替换），
-     * 使 X 轴固定覆盖整个交易时段（如 A 股 9:30 - 15:00），午休时段自动跳过。
-     * 后端 1m 柱时间戳为结束时间（首柱 09:31，上午末柱 11:30，下午 13:01 - 15:00）。
-     */
-    const padMinuteLineData = (bars) => {
-      if (!bars || bars.length === 0) return bars
-      const session = getMinuteLineSession()
-      const toNum = (d) => d.getHours() * 100 + d.getMinutes()
-      const lastReal = bars[bars.length - 1]
-      const lastNum = toNum(new Date(lastReal.timestamp))
-      // 最后一根未开盘或已在收盘后 → 无法向后补齐，保持原样
-      if (lastNum < session.start || lastNum > session.end) return bars
-
-      const padBars = []
-      let cur = new Date(lastReal.timestamp)
-      for (let guard = 0; guard < 600; guard++) {
-        cur = new Date(cur.getTime() + 60000)
-        const n = toNum(cur)
-        if (n > session.morningEnd && n < session.afternoonStart) {
-          // 跳过午休：对齐到下午开盘分钟，下一轮 +1 分钟得到第一根下午补齐柱
-          cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate(), Math.floor(session.afternoonStart / 100), session.afternoonStart % 100, 0, 0)
-          continue
-        }
-        if (n > session.end) break
-        // 未来时段占位柱：字段全部 null → klinecharts 对 null 柱不绘制（面积线/蜡烛），
-        // X 轴仍覆盖整个交易时段，价格线自然停在最新真实柱；y 轴极值计算会跳过 null
-        padBars.push({
-          timestamp: cur.getTime(),
-          open: null,
-          high: null,
-          low: null,
-          close: null,
-          volume: 0,
-          vwap: null,
-          __pad: true
-        })
-      }
-      if (padBars.length === 0) return bars
-      return [...bars, ...padBars]
-    }
-
-    /**
-     * 分时：把最新分时数据整体写入图表（applyNewData + 重新铺满 + 锁定 Y 轴）。
+     * 分时：把最新分时数据整体写入图表（applyNewData + 重新锁死视口 + 锁定 Y 轴）。
      * 带合并节流：WS tick 高频到达时，最多每 MINUTE_APPLY_THROTTLE ms 全量刷一次，
      * 期间只保留最新一份数据，避免每帧都触发 applyNewData 造成卡顿。
      */
-    const scheduleMinuteChartApply = (padded) => {
-      _minuteApplyPending = padded
+    const scheduleMinuteChartApply = (bars) => {
+      _minuteApplyPending = bars
       if (_minuteApplyTimer != null) return
       const wait = _minuteApplyTs ? Math.max(0, MINUTE_APPLY_THROTTLE - (Date.now() - _minuteApplyTs)) : 0
       _minuteApplyTimer = safeTimeout(() => {
@@ -2873,7 +2864,7 @@ registerOverlay({
               fitMinuteLineView()
             }
             // 【注意】这里不再调 maybeUpdateIndicators()：
-            // 1) applyNewData 内部会异步重算全部图表指标实例（VWAP/MA/VOL 均自动跟随新数据）；
+            // 1) applyNewData 内部会异步重算全部图表指标实例（AVP 均价线/MA/VOL 均自动跟随新数据）；
             // 2) updateIndicators 是「全删重建」，每次都会重挂 VOL 副图与主图指标，
             //    分时下每 10s 重建一次会表现为周期性的窗口闪烁/抖动。
             // 盘中创新高/新低会扩大波动区间 → 重新锁定 Y 轴（锚点未变则内部跳过）
@@ -2884,10 +2875,9 @@ registerOverlay({
     }
 
     /**
-     * 分时模式实时合并：真实柱按时间戳精确替换/追加（剔除旧补齐柱），
-     * 重算 VWAP 并重新补齐到收盘。
-     * 不能走通用时间段合并：补齐柱的时间戳在当前时刻之后，
-     * 通用逻辑会把实时数据判为“更早数据”而直接丢弃。
+     * 分时模式实时合并：真实柱按时间戳精确替换/追加，并补充成交额（turnover）字段。
+     * 数据多长就多长（不再补齐未来占位柱），视口由 fitMinuteLineView 统一锁死为全时段。
+     * 不能走通用时间段合并：通用逻辑按「周期边界」判重，不适配 1m 柱的时间戳口径。
      */
     const mergeMinuteLineRealtime = (newData) => {
       if (!newData || newData.length === 0) return
@@ -2908,58 +2898,44 @@ registerOverlay({
       const realMap = new Map()
       existingReal.forEach(b => realMap.set(b.timestamp, b))
       incoming.forEach(b => realMap.set(b.timestamp, { ...b }))
-      const realBars = attachMinuteVWAP(Array.from(realMap.values()).sort((a, b) => a.timestamp - b.timestamp))
-      const padded = padMinuteLineData(realBars)
-      if (!padded || padded.length === 0) return
+      const realBars = attachMinuteTurnover(Array.from(realMap.values()).sort((a, b) => a.timestamp - b.timestamp))
+      if (realBars.length === 0) return
 
       const prev = klineData.value || []
       // 与上一帧完全一致则直接跳过（避免无意义的重绘）
-      const sameAsPrev = prev.length === padded.length &&
-        prev.every((b, i) => b && b.timestamp === padded[i].timestamp && klineBarSnapshotKey(b) === klineBarSnapshotKey(padded[i]))
+      const sameAsPrev = prev.length === realBars.length &&
+        prev.every((b, i) => b && b.timestamp === realBars[i].timestamp && klineBarSnapshotKey(b) === klineBarSnapshotKey(realBars[i]))
       if (sameAsPrev) return
 
-      klineData.value = padded
+      klineData.value = realBars
       // 数据确实发生了变化 → 记录时间戳，供停滞看门狗判断
       _minuteLastChangeTs = Date.now()
       updatePricePanel(convertToInternalFormat(realBars), { force: true })
 
-      const structureChanged = prev.length !== padded.length ||
-        prev.some((b, i) => !b || b.timestamp !== padded[i].timestamp)
+      const structureChanged = prev.length !== realBars.length ||
+        prev.some((b, i) => !b || b.timestamp !== realBars[i].timestamp)
 
       if (isMinuteLine.value) {
-        // 【关键】分时模式下必须走全量 applyNewData，不能走 updateData。
-        // klinecharts 的 ChartStore.addData 对「单个对象」只会比较最后一根柱的时间戳：
-        //   timestamp >  lastDataTimestamp → push 到末尾
-        //   timestamp === lastDataTimestamp → 只替换最后一根
-        //   timestamp <  lastDataTimestamp → 直接忽略（success=false，什么都不做）
-        // 分时数据末尾是补齐到收盘的占位柱，最新真实柱永远位于数组中间，
-        // 因此 updateData 在这里是彻底的静默空操作 —— 表现为「实时数据完全不动」。
-        // 另外新一分钟到来时补齐柱减少一根、真实柱增加一根，总长度与时间轴都不变，
-        // structureChanged 也检测不到，所以分时无条件走全量刷新（内部带合并节流）。
-        scheduleMinuteChartApply(padded)
+        // 走全量 applyNewData（内部带合并节流）：视口锁死与指标重算由 fitMinuteLineView /
+        // applyMinutePrevCloseAxis 统一处理。数据末尾就是最新真实柱（已无占位柱），
+        // updateData 也可用，但全量刷新能同步重设右侧空位并保持指标/视口状态一致，更稳。
+        scheduleMinuteChartApply(realBars)
       } else if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
         // 时间轴变化（跨日 / 首次构建）：全量刷新
         if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
           try {
-            chartRef.value.applyNewData(padded)
+            chartRef.value.applyNewData(realBars)
             maybeUpdateIndicators(true)
           } catch (_) { /* 预期内：图表未就绪时等待下一轮全量加载 */ }
         }
       } else {
-        // 时间轴未变：只替换内容有变化的真实柱（补齐柱全为 null 常量，无需重绘）
+        // 时间轴未变：只替换内容有变化的柱
         if (chartRef.value && typeof chartRef.value.updateData === 'function') {
           for (let i = 0; i < realBars.length; i++) {
-            const p = padded[i]
+            const p = realBars[i]
             const q = prev[i]
             if (!q || q.timestamp !== p.timestamp || klineBarSnapshotKey(q) !== klineBarSnapshotKey(p)) {
-              flushRealtimeChartBar({
-                timestamp: p.timestamp,
-                open: p.open,
-                high: p.high,
-                low: p.low,
-                close: p.close,
-                volume: p.volume != null ? p.volume : 0
-              })
+              flushRealtimeChartBar(p)
             }
           }
         }
@@ -3045,7 +3021,8 @@ registerOverlay({
      * 分时图数据处理：
      * 1. 使用1m数据
      * 2. 只保留当天从9:30开始的数据
-     * 3. 计算VWAP
+     * 3. 补充成交额 turnover（供内置 AVP 均价线使用；数据多长就多长，不补齐未来时段，
+     *    显示区域由 fitMinuteLineView 锁死为整个交易时段）
      */
     const processMinuteLineData = (rawData) => {
       if (!rawData || rawData.length === 0) return []
@@ -3084,43 +3061,16 @@ registerOverlay({
             return dateStr === lastDateStr
           })
           if (fallbackData.length > 0) {
-            // 计算VWAP
-            let cumulativeVolume = 0
-            let cumulativeTPV = 0
-            return padMinuteLineData(fallbackData.map(item => {
-              const typicalPrice = (item.high + item.low + item.close) / 3
-              const volume = item.volume || 0
-              cumulativeVolume += volume
-              cumulativeTPV += typicalPrice * volume
-              const vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : item.close
-              return { ...item, vwap }
-            }))
+            return attachMinuteTurnover(fallbackData.map(item => ({ ...item })))
           }
         }
         return []
       }
 
-      // 计算VWAP (Volume Weighted Average Price)
-      let cumulativeVolume = 0
-      let cumulativeTPV = 0
+      // 浅拷贝（避免污染 _minuteRawData 原始数据）并补充成交额
+      const result = todayData.map(item => ({ ...item }))
 
-      const result = todayData.map((item, index) => {
-        const typicalPrice = (item.high + item.low + item.close) / 3
-        const volume = item.volume || 0
-
-        cumulativeVolume += volume
-        cumulativeTPV += typicalPrice * volume
-
-        const vwap = cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : item.close
-
-        return {
-          ...item,
-          vwap: vwap
-        }
-      })
-
-      // 补齐到整个交易时段收盘（X 轴固定 9:30 - 15:00 的关键）
-      return padMinuteLineData(result)
+      return attachMinuteTurnover(result)
     }
 
     /**
@@ -3128,6 +3078,34 @@ registerOverlay({
      * 同时兼任 Y 轴的兜底锚定（minValue / maxValue 参与 calcRange）。
      */
     const MINUTE_ZERO_LINE_IND = 'MINUTE_PREV_CLOSE_LINE'
+    /**
+     * 0 轴线的自定义绘制：横贯整个绘图区（含未来时段留白区）。
+     * 库默认的逐柱 figure 连线只覆盖「有数据的柱」，占位柱移除后数据只占左侧一段，
+     * 0 轴线会中途截断；参考线语义上应横贯全宽（与真实分时软件一致）。
+     * yAxis.convertToPixel 在 percentage 轴下自动完成 价格→涨跌幅 换算，传绝对价格即可。
+     * 返回 true 表示接管该指标的全部绘制（默认逐柱连线不再执行）。
+     */
+    const MINUTE_ZERO_LINE_DRAW = ({ ctx, bounding, yAxis, indicator }) => {
+      try {
+        const v = minutePrevClose.value
+        if (v == null || !(v > 0) || !ctx || !bounding) return true
+        const y = yAxis && typeof yAxis.convertToPixel === 'function' ? yAxis.convertToPixel(v) : null
+        if (y == null || !Number.isFinite(y)) return true
+        // 允许越界 ±2px（范围被外力改变时仍可见），完全出界则跳过
+        if (y < -2 || y > bounding.height + 2) return true
+        const lineStyle = (indicator && indicator.styles && indicator.styles.lines && indicator.styles.lines[0]) || {}
+        ctx.save()
+        ctx.strokeStyle = lineStyle.color || '#999999'
+        ctx.lineWidth = lineStyle.size || 1
+        ctx.setLineDash(lineStyle.dashedValue || [4, 4])
+        ctx.beginPath()
+        ctx.moveTo(0, Math.round(y) + 0.5)
+        ctx.lineTo(bounding.width, Math.round(y) + 0.5)
+        ctx.stroke()
+        ctx.restore()
+      } catch (_) { /* 预期内：轴未就绪时由下一帧重绘 */ }
+      return true
+    }
     /** 已应用的锚点区间，避免实时刷新时无谓重建 */
     let _minuteAxisRange = null
     /** 是否已锁定主图 Y 轴范围（退出分时时用于精确还原，避免影响其它周期） */
@@ -3404,10 +3382,11 @@ registerOverlay({
           calc: (list) => {
             const v = minutePrevClose.value
             return (list || []).map(() => ({ zeroLine: (v != null && v > 0) ? v : null }))
-          }
+          },
+          draw: MINUTE_ZERO_LINE_DRAW
         })
         // isStack 必须为 true：klinecharts 的 IndicatorStore.addInstance 在 isStack=false
-        // 时会执行 `paneInstances = []`，把该 pane 上已有的指标（VWAP 等）全部清空
+        // 时会执行 `paneInstances = []`，把该 pane 上已有的指标（均价线等）全部清空
         chart.createIndicator(MINUTE_ZERO_LINE_IND, true, { id: 'candle_pane' })
       } catch (_) { /* 预期内：指标未就绪时由自愈重试补上 */ }
     }
@@ -3526,9 +3505,11 @@ registerOverlay({
 
       // 取所有参与 Y 轴极值计算的价格相对昨收的最大【绝对值】偏离
       // （涨跌不对称时按大的那一侧对称展开：跌0%涨10% → 范围 ±10%+余量）
+      // 注：均价线（AVP）是各柱典型价的加权平均，恒在 [min(low), max(high)] 区间内，
+      // 不参与极值计算也不会越界（旧版自研 VWAP 字段 vwap 已随内置化移除）
       let maxDev = 0
       realBars.forEach(b => {
-        [b.close, b.high, b.low, b.vwap].forEach(v => {
+        [b.close, b.high, b.low].forEach(v => {
           if (v == null || !Number.isFinite(v)) return
           const d = Math.abs(v - pc)
           if (d > maxDev) maxDev = d
@@ -3614,13 +3595,14 @@ registerOverlay({
           calc: (list) => {
             const v = minutePrevClose.value
             return (list || []).map(() => ({ zeroLine: (v != null && v > 0) ? v : null }))
-          }
+          },
+          draw: MINUTE_ZERO_LINE_DRAW
         })
         // 先移除旧实例，确保新锚点生效
         try { chart.removeIndicator('candle_pane', MINUTE_ZERO_LINE_IND) } catch (_) { /* 预期内：首次尚未创建 */ }
         // 注意：isStack 必须为 true。klinecharts 的 IndicatorStore.addInstance 在
         // isStack=false 时会执行 `paneInstances = []`，把该 pane 上已有的指标
-        // （如分时主图的 VWAP）全部清空，导致 VWAP 线消失。
+        // （如分时主图的均价线）全部清空，导致均价线消失。
         chart.createIndicator(MINUTE_ZERO_LINE_IND, true, { id: 'candle_pane' })
         _minuteAxisRange = { from, to }
         _minuteAxisLocked = true
@@ -3674,12 +3656,12 @@ registerOverlay({
     }
 
     /**
-     * 分时模式：确保主图的 VWAP 与 Y 轴锚定指标仍然存在。
+     * 分时模式：确保主图的均价线（AVP）与 Y 轴锚定指标仍然存在。
      *
      * 背景：klinecharts 的 IndicatorStore.addInstance 在 isStack=false 时会执行
      * `paneInstances = []`，把该 pane 上已有的指标全部清空。updateIndicators 里
-     * 往 candle_pane 创建主图指标时若传了 false，就会连带清掉 VWAP 与锚定指标，
-     * 表现为「VWAP 线消失 / Y 轴不再以昨收为中心」。这里在指标刷新后补挂恢复。
+     * 往 candle_pane 创建主图指标时若传了 false，就会连带清掉 AVP 与锚定指标，
+     * 表现为「均价线消失 / Y 轴不再以昨收为中心」。这里在指标刷新后补挂恢复。
      */
     const ensureMinuteIndicators = () => {
       const chart = chartRef.value
@@ -3692,9 +3674,9 @@ registerOverlay({
         }
       } catch (_) { /* 预期内 */ }
       try {
-        if (!names.includes('VWAP')) {
+        if (!names.includes('AVP')) {
           // isStack=true 追加，避免把别人的指标清掉
-          const paneId = chart.createIndicator('VWAP', true, { id: 'candle_pane' })
+          const paneId = chart.createIndicator(MINUTE_AVP_OPTIONS(), true, { id: 'candle_pane' })
           if (paneId) _vwapPaneId = paneId
         }
         // 0 轴线/锚定指标被清掉时，强制重建（清掉缓存锚点，跳过「未变化」短路）
@@ -3754,7 +3736,7 @@ registerOverlay({
       try {
         // 1. 设置面积图样式：使用 close 值画面积线（蓝色），K 线柱体全部透明
         //    注意：klinecharts 的 area.value 不支持自定义字段名，
-        //    因此面积线使用 close 价格，VWAP 通过独立内置指标叠加显示
+        //    因此面积线使用 close 价格，均价线通过内置 AVP 指标叠加显示
         chartRef.value.setStyles({
           candle: {
             type: 'area',
@@ -3777,8 +3759,7 @@ registerOverlay({
             },
             priceMark: {
               show: true,
-              // 分时最后一根是 null 占位柱，last 价标记会渲染成底部 0.00 伪影 → 关闭；
-              // 当前价格由常驻 tooltip 呈现
+              // 最新价标记保持关闭：当前价格由常驻 tooltip 呈现，避免与 0 轴线/左轴刻度视觉冲突
               last: {
                 show: false
               }
@@ -3786,17 +3767,19 @@ registerOverlay({
             tooltip: {
               showRule: 'always',
               showType: 'standard',
-              labels: ['时间', '价格', 'VWAP', '成交量'],
-              values: (kLineData) => {
-                const d = new Date(kLineData.timestamp)
+              // klinecharts 9.8 的 candle.tooltip 自定义行已改为 custom（旧 labels/values 不再被消费）；
+              // 均价一行由主图上的内置 AVP 指标自动附带（figures.title = '均价: '）
+              custom: (data) => {
+                const cur = data && data.current ? data.current : {}
+                const d = new Date(cur.timestamp)
                 const p = pricePrecision.value
                 const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-                const isPad = kLineData.__pad === true || kLineData.close == null
+                const close = Number(cur.close)
+                const valid = cur.close != null && Number.isFinite(close)
                 return [
-                  timeStr,
-                  isPad ? '--' : (kLineData.close || 0).toFixed(p),
-                  kLineData.vwap != null ? kLineData.vwap.toFixed(p) : '--',
-                  (kLineData.volume || 0).toFixed(0)
+                  { title: '时间', value: timeStr },
+                  { title: '价格', value: valid ? close.toFixed(p) : '--' },
+                  { title: '成交量', value: String(cur.volume || 0) }
                 ]
               }
             }
@@ -3805,25 +3788,33 @@ registerOverlay({
           scroll: {
             horizontal: { bar: { style: 'none' } },
             vertical: { bar: { style: 'none' } }
+          },
+          // 分时下隐藏指标 tooltip 的 name 行：库会先画 shortName（"均价"）再画
+          // figures.title（"均价: 34.13"），两行叠加显示成「均价: 均价: 34.13」；
+          // 关闭 name 行后只剩黄色单行「均价: 34.13」，与真实分时软件一致。
+          // （恢复日K时在 restoreNormalChartStyle 中显式还原为 true）
+          indicator: {
+            tooltip: { showName: false }
           }
         })
 
-        // 2. 添加 VWAP 内置指标到主图
+        // 2. 添加内置均价线指标 AVP（klinecharts 9.8 官方自带，替代旧版自研 VWAP）
         try {
-          // 先清理旧的 VWAP
           if (_vwapPaneId) {
-            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) { /* 预期内：VWAP 指标可能尚未创建 */ }
+            // 旧版自研 VWAP 残留兼容清理 + 上一轮 AVP 清理（名字不存在时为静默 no-op）
+            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) { /* 预期内 */ }
+            try { chartRef.value.removeIndicator(_vwapPaneId, 'AVP') } catch (_) { /* 预期内：AVP 可能尚未创建 */ }
             _vwapPaneId = null
           }
           // isStack=true 追加。传 false 时 klinecharts 会执行 `paneInstances = []`，
-          // 把主图已有的指标（含上一轮残留的 VWAP）清空；此处已先移除旧 VWAP，用 true 更安全
-          const paneId = chartRef.value.createIndicator('VWAP', true, { id: 'candle_pane' })
+          // 把主图已有的指标（0 轴线等）清空；此处已先移除旧 AVP，用 true 更安全
+          const paneId = chartRef.value.createIndicator(MINUTE_AVP_OPTIONS(), true, { id: 'candle_pane' })
           if (paneId) {
             _vwapPaneId = paneId
             // 注意：不加入 addedIndicatorIds，避免被 updateIndicators 清除
           }
         } catch (vwapErr) {
-          console.warn('添加 VWAP 指标失败:', vwapErr)
+          console.warn('添加均价线指标(AVP)失败:', vwapErr)
         }
 
         // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
@@ -3853,11 +3844,14 @@ registerOverlay({
       if (!chartRef.value) return
 
       try {
-        // 1. 移除分时图添加的 VWAP 指标
+        // 1. 移除分时图添加的均价线指标（内置 AVP；VWAP 为旧版自研指标的兼容清理）
         if (_vwapPaneId) {
           try {
+            chartRef.value.removeIndicator(_vwapPaneId, 'AVP')
+          } catch (_) { /* 预期内：指标可能已被移除 */ }
+          try {
             chartRef.value.removeIndicator(_vwapPaneId, 'VWAP')
-          } catch (_) { /* 预期内：VWAP 指标可能已被移除 */ }
+          } catch (_) { /* 预期内 */ }
           _vwapPaneId = null
         }
 
@@ -3933,6 +3927,10 @@ registerOverlay({
           scroll: {
             horizontal: { bar: { style: 'normal' } },
             vertical: { bar: { style: 'normal' } }
+          },
+          // 还原分时模式关闭的指标 tooltip name 行（MA/BOLL 等指标名行恢复显示）
+          indicator: {
+            tooltip: { showName: true }
           }
         })
       } catch (e) {
@@ -4013,7 +4011,7 @@ registerOverlay({
         // 分时模式只需当日数据，不参与历史加载
         hasMoreHistory.value = !isMinuteLine.value
 
-        // 根据数据自动推算价格精度并设置到图表（补齐柱无价格，剔除后计算）
+        // 根据数据自动推算价格精度并设置到图表
         const realBars = klineData.value.filter(item => !item.__pad)
         pricePrecision.value = calcPricePrecision(realBars)
 
@@ -4297,7 +4295,7 @@ registerOverlay({
           const existingData = [...klineData.value]
 
           if (newData.length > 0) {
-            // 分时模式：走专用合并（补齐柱参与通用时间段合并，会把实时数据判为“更早数据”而丢弃）
+            // 分时模式：走专用合并（通用逻辑按周期边界判重，不适配 1m 柱口径）
             if (isMinuteLine.value) {
               mergeMinuteLineRealtime(newData)
               return
@@ -4368,7 +4366,7 @@ registerOverlay({
                 })
               })
 
-              // 分时模式：只保留当日数据，避免 VWAP 基于多日数据计算
+              // 分时模式：只保留当日数据，避免均价线（AVP）基于多日数据计算
               let dataToAppend = uniqueNewData
               if (isMinuteLine.value && uniqueNewData.length > 0) {
                 const now = new Date()
@@ -4419,7 +4417,7 @@ registerOverlay({
     /**
      * 分时：把下一次刷新对齐到整分钟过界后 ~1.5s。
      * 分时的最小粒度就是 1 分钟，常规 5s 轮询已经能覆盖，但对齐过界可以确保
-     * 「新一分钟的柱子」在出现后第一时间被拉取并补齐，不会滞后近一个轮询周期。
+     * 「新一分钟的柱子」在出现后第一时间被拉取，不会滞后近一个轮询周期。
      */
     const scheduleMinuteBoundaryRefresh = () => {
       if (_minuteBoundaryTimer) {
@@ -4445,7 +4443,7 @@ registerOverlay({
 
     /**
      * 分时：数据停滞看门狗。
-     * 增量链路任何一环失效（接口无增量、WS 假连、补齐逻辑异常）都会表现为「图不动」，
+     * 增量链路任何一环失效（接口无增量、WS 假连）都会表现为「图不动」，
      * 这里在盘中发现长时间没有变化就静默全量重载一次，保证最终一定能追上。
      */
     const runMinuteStallWatchdog = () => {
@@ -4534,7 +4532,7 @@ registerOverlay({
       const arr = klineData.value
       if (!arr || arr.length === 0) return
 
-      // 分时模式：WS tick 走专用合并（最后一根是补齐到收盘的柱，通用同柱/新柱判断都不成立）
+      // 分时模式：WS tick 走专用合并（通用同柱/新柱判断不适配 1m 柱口径）
       if (isMinuteLine.value) {
         mergeMinuteLineRealtime([bar])
         return
@@ -4972,7 +4970,7 @@ registerOverlay({
             }
 
             // 分时模式：首次经 initChart 建图时也必须应用面积图样式 / 0 轴线 / Y 轴居中 /
-            // VWAP。原先只在 loadKlineData 的「图表已存在」分支里调用 applyMinuteLineChartStyle，
+            // 均价线。原先只在 loadKlineData 的「图表已存在」分支里调用 applyMinuteLineChartStyle，
             // 若首个标的在 initChart 定时器(300ms)之前就绪，图表由这里创建 → 分时样式整体缺失。
             if (isMinuteLine.value) {
               nextTick(() => {
@@ -5484,7 +5482,7 @@ registerOverlay({
                           // 主图指标
                           const paneId = chartRef.value.createIndicator(
                             customIndicatorName,
-                            true, // isStack=true 追加；传 false 会清空主图已有的 VWAP / 锚定指标
+                            true, // isStack=true 追加；传 false 会清空主图已有的均价线 / 锚定指标
                             { id: 'candle_pane' }
                           )
                           if (paneId) {
@@ -6343,7 +6341,7 @@ registerOverlay({
         }
       }
       } finally {
-        // 分时：指标刷新可能清空主图指标 → 补挂 VWAP 与 Y 轴锚定
+        // 分时：指标刷新可能清空主图指标 → 补挂均价线与 Y 轴锚定
         try { ensureMinuteIndicators() } catch (_) { /* 预期内 */ }
         indicatorsUpdating.value = false
       }
