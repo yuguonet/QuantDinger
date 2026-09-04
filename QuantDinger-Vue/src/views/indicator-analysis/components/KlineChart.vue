@@ -173,7 +173,7 @@
           <a-input-number
             v-model="indicatorEditorForm._styleLineWidth"
             :min="1"
-            :max="6"
+            :max="3"
             :step="1"
             :precision="0"
             style="width: 100%"
@@ -654,7 +654,7 @@ export default {
     }
 
     const normalizeIndicatorStyle = (style = {}, fallbackColor = '') => {
-      const lineWidth = Math.max(1, Math.min(6, parseInt(style.lineWidth, 10) || 2))
+      const lineWidth = Math.max(1, Math.min(3, parseInt(style.lineWidth, 10) || 1))
       return {
         color: String(style.color || fallbackColor || '').trim() || fallbackColor || '#1890ff',
         lineWidth
