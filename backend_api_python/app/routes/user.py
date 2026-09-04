@@ -838,7 +838,7 @@ def save_chart_template():
                 'params': params,
                 'style': {
                     'color': str(style.get('color') or '').strip(),
-                    'lineWidth': int(style.get('lineWidth') or 2)
+                    'lineWidth': int(style.get('lineWidth') or 1)
                 }
             })
 
