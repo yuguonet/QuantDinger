@@ -321,7 +321,7 @@ def run_monitor():
     stats = {"pending": len(pending), "buy": len(buy_rows),
              "holding": len(hold_rows), "exit": len(exit_rows)}
 
-    # ── 1. 开盘窗口: 各策略 gap 过滤 → buy_today / expired; 隔日 pending 过期 ──
+    # ── 1. 开盘窗口: 各策略 gap 过滤 → 质量排名 → 每日名额 → buy_today / expired; 隔日 pending 过期 ──
     if in_window(W_OPEN_LO, W_OPEN_HI, hm) and pending:
         target = _last_trade_day()
         cand = [r for r in pending if str(r.get("trade_date"))[:10] == target]
@@ -330,7 +330,9 @@ def run_monitor():
             ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"})
         if cand:
             snaps = latest_snapshot([r["code"] for r in cand])
-            n_buy = n_exp = 0
+            from collections import defaultdict as _dd
+            qualified = _dd(list)      # strategy → [(quality_key, row, open_px, gap)]
+            n_exp = 0
             for r in cand:
                 code = r["code"]
                 snap = snaps.get(code)
@@ -344,17 +346,38 @@ def run_monitor():
                     continue
                 gap = (open_px / prev_close - 1) * 100
                 strat = r.get("strategy", "dragon2")
-                if _gap_buyable(code, strat, r.get("entry_style", "a"), gap):
-                    ds.set_state(r["id"], ds.S_BUY_TODAY,
-                                 detail={"entry_gap": round(gap, 2)},
-                                 entry_date=today, entry_price=round(open_px, 3))
-                    ds.update_stop_price(r["id"], _entry_stop(code, open_px, strat))
-                    n_buy += 1
-                else:
+                if not _gap_buyable(code, strat, r.get("entry_style", "a"), gap):
                     ds.set_state(r["id"], ds.S_EXPIRED,
                                  detail={"gap": round(gap, 2),
                                          "reason": f"{ds.STRATEGY_LABELS.get(strat, strat)}开盘gap超出可买区间"})
                     n_exp += 1
+                    continue
+                # 质量排序键 (越 besar 越优先)
+                extra = r.get("extra") or {}
+                if strat == "dragon2":
+                    qkey = (r.get("score", 0), extra.get("turnover_anchor") or 0,
+                            1 if (gap <= -1.5 or gap >= 3.0) else 0)
+                elif strat == "v1":
+                    qkey = (extra.get("ret_20d") or 0,)
+                else:
+                    qkey = (extra.get("confirm_chg") or 0,)
+                qualified[strat].append((qkey, gap, r, open_px))
+            # 各策略按名额买入, 超出名额 → expired (质量排名末位淘汰)
+            n_buy = 0
+            for strat, lst in qualified.items():
+                lst.sort(key=lambda x: x[0], reverse=True)
+                limit = ds.DAILY_LIMIT_PER_STRATEGY.get(strat, 5)
+                for i, (qkey, gap, r, open_px) in enumerate(lst):
+                    if i < limit:
+                        ds.set_state(r["id"], ds.S_BUY_TODAY,
+                                     detail={"entry_gap": round(gap, 2), "rank": i + 1},
+                                     entry_date=today, entry_price=round(open_px, 3))
+                        ds.update_stop_price(r["id"], _entry_stop(r["code"], open_px, strat))
+                        n_buy += 1
+                    else:
+                        ds.set_state(r["id"], ds.S_EXPIRED,
+                                     detail={"reason": f"当日名额已满(质量排名第{i+1})"})
+                        n_exp += 1
             stats["open_buy"] = n_buy
             stats["open_expired"] = n_exp
 

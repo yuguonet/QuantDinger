@@ -354,11 +354,16 @@ def dragon2_today_d0_signals(bars, code, stock_info=None, today_str=None, params
             if dd < dd_max:
                 continue
             score = 0
-            # --- 特征1 换手率 ---
+            # --- 特征1 换手率 (双口径: 流通股本 / 总股本) ---
             turn_anchor = turn_sig = None
+            total_sh = float(info.get('total_shares') or 0)
+            turn_anchor_t = turn_sig_t = None
             if circ > 0:
                 turn_anchor = anchor_vol / circ * 100
                 turn_sig = d0['volume'] / circ * 100
+                if total_sh > 0:
+                    turn_anchor_t = anchor_vol / total_sh * 100
+                    turn_sig_t = d0['volume'] / total_sh * 100
                 if turn_anchor < p['turnover_hard']:
                     continue        # 锚点换手不足 → 不活跃, 剔除
                 if turn_anchor >= p['turnover_hot']:
@@ -450,6 +455,8 @@ def dragon2_today_d0_signals(bars, code, stock_info=None, today_str=None, params
                 'buy_mode': 'next_open',
                 'score': score,
                 'turnover_anchor': round(turn_anchor, 2) if turn_anchor is not None else None,
+                'turnover_anchor_total': round(turn_anchor_t, 2) if turn_anchor_t is not None else None,
+                'turnover_sig_total': round(turn_sig_t, 2) if turn_sig_t is not None else None,
                 'turnover_sig': round(turn_sig, 2) if turn_sig is not None else None,
                 'float_mcap_yi': round(mcap_yi, 1) if mcap_yi is not None else None,
                 'ma60_slope': round(ma60_slope, 2) if ma60_slope is not None else None,
@@ -748,7 +755,8 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
 
 def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
                         d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                        obv_filter=True, d_1_vol_max=1.5, today_str=None):
+                        obv_filter=True, d_1_vol_max=1.5, today_str=None,
+                        stock_info=None):
     """V1 今日(D0)入场信号: 只检查D0四因子, 不依赖D1数据
 
     独立于策略回测, 仅用于 --today 报告中的「今日入场」段。
@@ -811,6 +819,8 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
         if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
             return result
 
+    circ = float((stock_info or {}).get('circ_shares') or 0)
+    total = float((stock_info or {}).get('total_shares') or 0)
     result.append({
         'code': code, 'board': get_board_name(code),
         'path': 'v1', 'path_label': 'V1',
@@ -818,6 +828,8 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
         'd0_close': round(d0['close'], 3),
         'ret_20d': round(ret_20d, 2),
         'd_1_change': round(d_1_change, 2),
+        'turnover_anchor': round(d0['volume'] / circ * 100, 2) if circ > 0 else None,
+        'turnover_anchor_total': round(d0['volume'] / total * 100, 2) if total > 0 else None,
         'buy_mode': 'next_open',
     })
     return result
@@ -827,7 +839,8 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
 # ================================================================
 
 
-def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=None, limit_ups=None):
+def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=None,
+                           limit_ups=None, stock_info=None):
     """断板 今日(D0)信号: 判断今日是否为断板期的确认日, 与回测买点前规则完全一致
 
     原则: --today 时"买入当日(次日D1开盘)由人工判别", 今日(D0)及以前规则与回测
@@ -874,6 +887,12 @@ def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=
             continue
         if sig['break_idx'] + sig['break_days'] - 1 != i:
             continue
+        circ = float((stock_info or {}).get('circ_shares') or 0)
+        total = float((stock_info or {}).get('total_shares') or 0)
+        turnover_anchor = round(float(bars[streak_end]['volume']) / circ * 100, 2) if circ > 0 else None
+        turnover_confirm = round(float(bars[i]['volume']) / circ * 100, 2) if circ > 0 else None
+        turnover_anchor_t = round(float(bars[streak_end]['volume']) / total * 100, 2) if total > 0 else None
+        turnover_confirm_t = round(float(bars[i]['volume']) / total * 100, 2) if total > 0 else None
         result.append({
             'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
             'mode': 'streak_break',
@@ -890,6 +909,10 @@ def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=
             'confirm_gap': sig['confirm_gap'],
             'pre20_gain': sig['pre20_gain'],
             'ma_bull': sig['ma_bull'],
+            'turnover_anchor': turnover_anchor,
+            'turnover_sig': turnover_confirm,
+            'turnover_anchor_total': turnover_anchor_t,
+            'turnover_sig_total': turnover_confirm_t,
             'entry_price': None, 'buy_mode': 'next_open',
         })
         break  # 只取一个信号

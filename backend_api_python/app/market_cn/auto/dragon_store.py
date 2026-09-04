@@ -1,4 +1,4 @@
-"""dragon_store.py — 龙回头Pro 存储层
+"""dragon_store.py - 龙回头Pro 存储层
 
 职责:
   1. qd_dragon_signals 事实表 (状态机全量+历史) 的建表与 CRUD
@@ -38,8 +38,10 @@ S_EXIT_TODAY = "exit_today"          # 触发出场 (label 卖出·红; 次日�
 S_CLOSED = "closed"                  # 已平仓 (组内删行, 留历史)
 S_EXPIRED = "expired"                # 失效: 弱确认/开盘gap放弃 (组内删行, 留历史)
 
-# 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色“观察中”置底展示, 09-04 用户要求提前可见)
+# 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察中"置底展示, 09-04 用户要求提前可见)
 ACTIVE_GROUP_STATES = (S_WATCH_PENDING, S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY)
+# 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰)
+DAILY_LIMIT_PER_STRATEGY = {"dragon2": 5, "v1": 5, "break": 5}
 # label 文案 (前端映射兜底, 前端也有映射)
 STATE_LABELS = {S_WATCH_PENDING: "观察中", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
                 S_EXIT_TODAY: "卖出", S_CLOSED: "已平仓", S_EXPIRED: "已失效"}
@@ -112,7 +114,7 @@ def ensure_tables():
         # ── 2. qd_watchlist 加列 ──
         cur.execute("""
             SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'qd_watchlist' AND column_name IN ('strategy_state', 'strategy_detail')
+            WHERE table_name = 'qd_watchlist'
         """)
         existing = {r["column_name"] if isinstance(r, dict) else r[0] for r in cur.fetchall()}
         if "strategy_state" not in existing:
@@ -189,7 +191,8 @@ def upsert_scan_signals(trade_date: str, rows: list):
         n = 0
         for s in rows:
             extra = {k: s.get(k) for k in
-                     ("turnover_anchor", "turnover_sig", "float_mcap_yi", "ma60_slope",
+                     ("turnover_anchor", "turnover_sig", "turnover_anchor_total", "turnover_sig_total",
+                      "float_mcap_yi", "ma60_slope",
                       "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
                       "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
                       "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
@@ -367,6 +370,7 @@ def _display_detail(s):
         "pre_confirm": (s.get("extra") or {}).get("pre_confirm"),
         "turnover_anchor": _f((s.get("extra") or {}).get("turnover_anchor")),
         "turnover_sig": _f((s.get("extra") or {}).get("turnover_sig")),
+        "turnover_anchor_total": _f((s.get("extra") or {}).get("turnover_anchor_total")),
         "float_mcap_yi": _f((s.get("extra") or {}).get("float_mcap_yi")),
         "ma60_slope": _f((s.get("extra") or {}).get("ma60_slope")),
         "ma_bull": (s.get("extra") or {}).get("ma_bull"),

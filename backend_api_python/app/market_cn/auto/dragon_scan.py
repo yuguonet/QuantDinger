@@ -70,12 +70,13 @@ def fetch_stock_info_db():
     pool = db._get_pool()
     with pool.cursor() as cur:   # 注意: 该 pool 返回元组行 (与 test_dragon 原实现一致)
         cur.execute(
-            "SELECT symbol, name, circ_shares FROM stock_basic_info WHERE status='active'"
+            "SELECT symbol, name, circ_shares, total_shares FROM stock_basic_info WHERE status='active'"
         )
         rows = cur.fetchall()
     out = {}
     for row in rows:
-        out[row[0]] = {"name": row[1] or "", "circ_shares": float(row[2] or 0)}
+        out[row[0]] = {"name": row[1] or "", "circ_shares": float(row[2] or 0),
+                       "total_shares": float(row[3] or 0)}
     return out
 
 
