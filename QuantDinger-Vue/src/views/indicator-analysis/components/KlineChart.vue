@@ -2304,7 +2304,7 @@ registerOverlay({
 
     // ========== 分时均价线：使用 klinecharts 9.8 官方内置 AVP（Average Price Line 均价线） ==========
     // 内置算法：累计成交额 / 累计成交量（逐柱累加 turnover / volume），无需自研 calc。
-    // 这里仅覆盖线条样式（黄色，与旧版自研 VWAP 视觉一致）与 tooltip 文案；
+    // 这里仅覆盖线条样式（金黄，浅色底上比原 #ffeb3b 更醒目）与 tooltip 文案；
     // 数据柱的 turnover 字段由 processMinuteLineData / mergeMinuteLineRealtime 负责补充
     // （后端未提供成交额时按「典型价×成交量」合成，与旧版口径一致）。
     const MINUTE_AVP_OPTIONS = () => ({
@@ -2314,7 +2314,7 @@ registerOverlay({
       // 注意：9.8.12 的指标线绘制合并逻辑会直接读取 styles.lines[i].dashedValue[0]，
       // 覆盖对象必须带全字段（缺 dashedValue 会在 IndicatorView.drawImp 中抛 TypeError，
       // 并中断同 pane 后续指标的绘制——0 轴线因此消失）
-      styles: { lines: [{ color: '#ffeb3b', size: 1, style: 'stroke', dashedValue: [4, 4], smooth: false }] }
+      styles: { lines: [{ color: '#f0b90b', size: 1, style: 'stroke', dashedValue: [4, 4], smooth: false }] }
     })
 
     // ========== 分时图：0 轴线（原生指标线，与日K收盘线同机制） + Y 轴对称锚定 ==========
@@ -2333,8 +2333,8 @@ registerOverlay({
     let _minuteLockedRange = null
     /** 分时图模式下的 onVisibleRangeChange 回调引用，用于恢复时移除 */
     let _minuteRangeChangeCallback = null
-    /** 分时图模式下添加的均价线指标（内置 AVP，沿用旧名 _vwapPaneId）的 paneId */
-    let _vwapPaneId = null
+    /** 分时图模式下添加的均价线指标（内置 AVP）的 paneId */
+    let _avpPaneId = null
     /** 铺满视图计算中的重入保护（铺满过程会连续触发多次可见范围事件） */
     let _minuteFitting = false
     /** 分时：最近一次数据真正发生变化的时刻（用于停滞看门狗） */
@@ -2740,7 +2740,7 @@ registerOverlay({
     }
 
     /** 为分时真实柱补充 turnover（成交额）：内置 AVP 均价线的必需字段。
-     *  后端 1m 数据无成交额时按「典型价×成交量」合成，与旧版自研 VWAP 口径一致 */
+     *  后端 1m 数据无成交额时按「典型价×成交量」合成 */
     const attachMinuteTurnover = (bars) => {
       bars.forEach(b => {
         if (b == null || Number.isFinite(b.turnover)) return
@@ -2795,7 +2795,7 @@ registerOverlay({
         // 因此要从 klineData 最后一根真实柱反推正在展示的日期，而不是硬编码 Date.now()。
         let displayDay = minuteDateStr(Date.now())
         try {
-          const realBars = (klineData.value || []).filter(b => !b.__pad && b.timestamp)
+          const realBars = (klineData.value || []).filter(b => b && b.timestamp)
           if (realBars.length > 0) {
             displayDay = minuteDateStr(realBars[realBars.length - 1].timestamp)
           }
@@ -2827,7 +2827,7 @@ registerOverlay({
         }
       } catch (_) { /* 预期内：接口缺失时回退 */ }
       // 4. 最后回退：用当日首根真实柱的开盘价近似（开盘价缺失时用收盘价）
-      const firstReal = (klineData.value || []).find(b => !b.__pad && b.timestamp)
+      const firstReal = (klineData.value || []).find(b => b && b.timestamp)
       const openVal = Number(firstReal && firstReal.open)
       const closeVal = Number(firstReal && firstReal.close)
       const approx = (Number.isFinite(openVal) && openVal > 0)
@@ -2892,7 +2892,7 @@ registerOverlay({
         b && b.timestamp &&
         minuteDateStr(b.timestamp) === todayStr &&
         toNumForFilter(b.timestamp) >= session.start)
-      const existingReal = (klineData.value || []).filter(b => !b.__pad && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
+      const existingReal = (klineData.value || []).filter(b => b && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
       if (incoming.length === 0 && existingReal.length === 0) return
 
       const realMap = new Map()
@@ -3429,7 +3429,7 @@ registerOverlay({
         _minutePcSource = 'props'
         return minutePrevClose.value
       }
-      const realBars = (klineData.value || []).filter(b => b && !b.__pad && b.timestamp)
+      const realBars = (klineData.value || []).filter(b => b && b.timestamp)
       if (realBars.length === 0) return null
       // 【关键】klineData 的真实柱只有「正在展示的交易日」，
       // 推导上一交易日收盘必须用加载时保存的跨日 1m 原始数据（_minuteRawData）
@@ -3470,7 +3470,7 @@ registerOverlay({
       if (!chart || !isMinuteLine.value) return
       const pc = resolveMinutePrevClose()
       if (pc == null || !(pc > 0)) return
-      const realBars = (klineData.value || []).filter(b => b && !b.__pad)
+      const realBars = (klineData.value || []).filter(b => b && b.timestamp)
       if (realBars.length === 0) return
 
       const axis = getCandleYAxis()
@@ -3506,7 +3506,7 @@ registerOverlay({
       // 取所有参与 Y 轴极值计算的价格相对昨收的最大【绝对值】偏离
       // （涨跌不对称时按大的那一侧对称展开：跌0%涨10% → 范围 ±10%+余量）
       // 注：均价线（AVP）是各柱典型价的加权平均，恒在 [min(low), max(high)] 区间内，
-      // 不参与极值计算也不会越界（旧版自研 VWAP 字段 vwap 已随内置化移除）
+      // 不参与极值计算也不会越界（均价线取值恒在当日最低/最高之间）
       let maxDev = 0
       realBars.forEach(b => {
         [b.close, b.high, b.low].forEach(v => {
@@ -3677,7 +3677,7 @@ registerOverlay({
         if (!names.includes('AVP')) {
           // isStack=true 追加，避免把别人的指标清掉
           const paneId = chart.createIndicator(MINUTE_AVP_OPTIONS(), true, { id: 'candle_pane' })
-          if (paneId) _vwapPaneId = paneId
+          if (paneId) _avpPaneId = paneId
         }
         // 0 轴线/锚定指标被清掉时，强制重建（清掉缓存锚点，跳过「未变化」短路）
         if (!names.includes(MINUTE_ZERO_LINE_IND)) _minuteAxisRange = null
@@ -3798,23 +3798,22 @@ registerOverlay({
           }
         })
 
-        // 2. 添加内置均价线指标 AVP（klinecharts 9.8 官方自带，替代旧版自研 VWAP）
+        // 2. 添加内置均价线指标 AVP（klinecharts 9.8 官方自带）
         try {
-          if (_vwapPaneId) {
-            // 旧版自研 VWAP 残留兼容清理 + 上一轮 AVP 清理（名字不存在时为静默 no-op）
-            try { chartRef.value.removeIndicator(_vwapPaneId, 'VWAP') } catch (_) { /* 预期内 */ }
-            try { chartRef.value.removeIndicator(_vwapPaneId, 'AVP') } catch (_) { /* 预期内：AVP 可能尚未创建 */ }
-            _vwapPaneId = null
+          if (_avpPaneId) {
+            // 重进分时先移除上一轮 AVP，避免重复叠加（指标不存在时为静默 no-op）
+            try { chartRef.value.removeIndicator(_avpPaneId, 'AVP') } catch (_) { /* 预期内：尚未创建 */ }
+            _avpPaneId = null
           }
           // isStack=true 追加。传 false 时 klinecharts 会执行 `paneInstances = []`，
           // 把主图已有的指标（0 轴线等）清空；此处已先移除旧 AVP，用 true 更安全
           const paneId = chartRef.value.createIndicator(MINUTE_AVP_OPTIONS(), true, { id: 'candle_pane' })
           if (paneId) {
-            _vwapPaneId = paneId
+            _avpPaneId = paneId
             // 注意：不加入 addedIndicatorIds，避免被 updateIndicators 清除
           }
-        } catch (vwapErr) {
-          console.warn('添加均价线指标(AVP)失败:', vwapErr)
+        } catch (avpErr) {
+          console.warn('添加均价线指标(AVP)失败:', avpErr)
         }
 
         // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
@@ -3844,15 +3843,12 @@ registerOverlay({
       if (!chartRef.value) return
 
       try {
-        // 1. 移除分时图添加的均价线指标（内置 AVP；VWAP 为旧版自研指标的兼容清理）
-        if (_vwapPaneId) {
+        // 1. 移除分时图添加的均价线指标（内置 AVP）
+        if (_avpPaneId) {
           try {
-            chartRef.value.removeIndicator(_vwapPaneId, 'AVP')
+            chartRef.value.removeIndicator(_avpPaneId, 'AVP')
           } catch (_) { /* 预期内：指标可能已被移除 */ }
-          try {
-            chartRef.value.removeIndicator(_vwapPaneId, 'VWAP')
-          } catch (_) { /* 预期内 */ }
-          _vwapPaneId = null
+          _avpPaneId = null
         }
 
         // 1.5 清除分时 0 轴线并恢复默认 Y 轴
@@ -3897,30 +3893,12 @@ registerOverlay({
                 lineStyle: 'dashed'
               }
             },
-            // 恢复默认 tooltip
+            // 恢复日K tooltip：9.8 起 candle.tooltip.labels/values 已不再被消费（死配置），
+            // 这里只需把分时的 custom 回调清掉——setStyles 是深度合并，不清会残留分时的三行
             tooltip: {
               showRule: 'always',
               showType: 'standard',
-              labels: [
-                proxy.$t('dashboard.indicator.tooltip.time'),
-                proxy.$t('dashboard.indicator.tooltip.open'),
-                proxy.$t('dashboard.indicator.tooltip.high'),
-                proxy.$t('dashboard.indicator.tooltip.low'),
-                proxy.$t('dashboard.indicator.tooltip.close'),
-                proxy.$t('dashboard.indicator.tooltip.volume')
-              ],
-              values: (kLineData) => {
-                const d = new Date(kLineData.timestamp)
-                const p = pricePrecision.value
-                return [
-                  `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`,
-                  kLineData.open.toFixed(p),
-                  kLineData.high.toFixed(p),
-                  kLineData.low.toFixed(p),
-                  kLineData.close.toFixed(p),
-                  kLineData.volume.toFixed(0)
-                ]
-              }
+              custom: null
             }
           },
           // 滚动/缩放能力的恢复由 enableMinuteInteractions 通过 klinecharts API 完成
@@ -4012,7 +3990,7 @@ registerOverlay({
         hasMoreHistory.value = !isMinuteLine.value
 
         // 根据数据自动推算价格精度并设置到图表
-        const realBars = klineData.value.filter(item => !item.__pad)
+        const realBars = klineData.value.filter(item => item && item.timestamp)
         pricePrecision.value = calcPricePrecision(realBars)
 
         const internalData = convertToInternalFormat(realBars)
@@ -4453,7 +4431,7 @@ registerOverlay({
         if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
         // 只对「正在显示当日盘面」生效：休市/看历史日期时不重载，避免无谓刷新
         const nowStr = minuteDateStr(Date.now())
-        const hasToday = (klineData.value || []).some(b => !b.__pad && minuteDateStr(b.timestamp) === nowStr)
+        const hasToday = (klineData.value || []).some(b => b && b.timestamp && minuteDateStr(b.timestamp) === nowStr)
         if (!hasToday) return
         const now = Date.now()
         const since = _minuteLastChangeTs || now
@@ -5068,27 +5046,7 @@ registerOverlay({
           },
           tooltip: {
             showRule: 'always',
-            showType: 'standard',
-            labels: [
-              proxy.$t('dashboard.indicator.tooltip.time'),
-              proxy.$t('dashboard.indicator.tooltip.open'),
-              proxy.$t('dashboard.indicator.tooltip.high'),
-              proxy.$t('dashboard.indicator.tooltip.low'),
-              proxy.$t('dashboard.indicator.tooltip.close'),
-              proxy.$t('dashboard.indicator.tooltip.volume')
-            ],
-            values: (kLineData) => {
-              const d = new Date(kLineData.timestamp)
-              const p = pricePrecision.value
-              return [
-                `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`,
-                kLineData.open.toFixed(p),
-                kLineData.high.toFixed(p),
-                kLineData.low.toFixed(p),
-                kLineData.close.toFixed(p),
-                kLineData.volume.toFixed(0)
-              ]
-            }
+            showType: 'standard'
           },
           bar: {
             upColor: isDark ? '#ef5350' : '#f5222d',
@@ -6835,7 +6793,7 @@ registerOverlay({
         const list = typeof chart.getDataList === 'function' ? chart.getDataList() : []
         for (let i = list.length - 1; i >= 0; i--) {
           const b = list[i]
-          const c = b && !b.__pad ? Number(b.close) : NaN
+          const c = b ? Number(b.close) : NaN
           if (Number.isFinite(c) && c > 0) return c
         }
       } catch (_) { /* 预期内 */ }
@@ -6952,7 +6910,7 @@ registerOverlay({
           let lo = Infinity
           let hi = -Infinity
           for (const b of list) {
-            if (!b || b.__pad) continue
+            if (!b) continue
             const l = Number(b.low)
             const h = Number(b.high)
             if (Number.isFinite(l)) lo = Math.min(lo, l)
