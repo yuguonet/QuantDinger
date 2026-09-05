@@ -57,8 +57,29 @@ def _fetch_remote(code, count=300):
     except:
         return []
 
+def _fetch_sina(code, count=500):
+    """Sina K线API (备用源)"""
+    c = code.strip().replace(".", "").replace("SH", "").replace("SZ", "")
+    if c.startswith(("6", "5")): sym = f"sh{c}"
+    elif c.startswith(("0", "3", "2")): sym = f"sz{c}"
+    elif c.startswith("68"): sym = f"sh{c}"
+    else: return []
+    try:
+        resp = _SESSION.get(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+            params={"symbol": sym, "scale": "240", "ma": "no", "datalen": str(count)},
+            timeout=10,
+        )
+        rows = json.loads(resp.text)
+        bars = [{"time": r["day"][:10], "open": float(r["open"]), "high": float(r["high"]),
+                 "low": float(r["low"]), "close": float(r["close"]), "volume": float(r["volume"])} for r in rows]
+        bars.sort(key=lambda x: x["time"])
+        return bars
+    except:
+        return []
+
 def fetch_kline(code, count=300):
-    """获取K线: 优先本地缓存, 没有则远程下载"""
+    """获取K线: 本地缓存 → 腾讯API → SinaAPI"""
     cache = _load_cache()
     code_clean = code.strip().replace(".", "").replace("SH", "").replace("SZ", "")
     
@@ -68,8 +89,11 @@ def fetch_kline(code, count=300):
             return bars[-count:]
         return bars
     
-    # 缓存没有, 远程下载
+    # 缓存没有, 腾讯API
     bars = _fetch_remote(code_clean, count)
+    # 腾讯没拿到, 走Sina
+    if not bars:
+        bars = _fetch_sina(code_clean, count)
     if bars:
         cache[code_clean] = bars
     return bars

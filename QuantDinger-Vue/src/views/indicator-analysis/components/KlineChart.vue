@@ -1072,7 +1072,9 @@ export default {
           dataZoomFiller: 'rgba(41, 98, 255, 0.15)',
           dataZoomHandle: '#13c2c2',
           dataZoomText: 'transparent',
-          dataZoomBg: '#252525'
+          dataZoomBg: '#252525',
+          separatorColor: '#2f2f2f',
+          separatorActive: 'rgba(88, 166, 255, 0.06)'
         }
       } else {
         return {
@@ -1092,7 +1094,9 @@ export default {
           dataZoomFiller: 'rgba(24, 144, 255, 0.15)',
           dataZoomHandle: '#1890ff',
           dataZoomText: '#999',
-          dataZoomBg: '#f0f2f5'
+          dataZoomBg: '#f0f2f5',
+          separatorColor: '#f0f0f0',
+          separatorActive: 'rgba(24, 144, 255, 0.05)'
         }
       }
     })
@@ -5031,6 +5035,12 @@ registerOverlay({
           vertical: {
             show: false
           }
+        },
+        separator: {
+          size: 1,
+          color: theme.separatorColor,
+          fill: false,
+          activeBackgroundColor: theme.separatorActive
         },
         candle: {
           priceMark: {

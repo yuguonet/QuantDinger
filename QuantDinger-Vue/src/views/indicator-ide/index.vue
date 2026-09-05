@@ -4,11 +4,13 @@
     <div class="ide-main">
       <!-- Left panel: 自选股 -->
       <div class="ide-left" :style="{ width: leftPanelWidthPct + '%' }">
-        <watchlist-panel
-          v-model="selectedWatchlistKey"
-          @select="onWatchlistPanelSelect"
-          style="width: 100%; flex: 1; max-height: none; border: none; box-shadow: none; border-radius: 0; align-self: stretch;"
-        />
+        <div class="ide-left-inner">
+          <watchlist-panel
+            v-model="selectedWatchlistKey"
+            @select="onWatchlistPanelSelect"
+            style="width: 100%; flex: 1; max-height: none; align-self: stretch;"
+          />
+        </div>
       </div>
 
       <!-- 左右调整手柄 -->
@@ -4389,18 +4391,32 @@ export default {
   top: 0;
   align-self: flex-start;
 }
+.ide-left-inner {
+  flex: 1;
+  min-height: 0;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+  // 与「价值分析」统一：保留圆角卡片外框（border/radius/shadow 取组件默认样式）
+  ::v-deep .watchlist-panel {
+    width: 100% !important;
+    flex: 1 !important;
+    max-height: none !important;
+    align-self: stretch !important;
+  }
+}
 // ===== Left-Right Resize Handle =====
 .ide-lr-resize-handle {
-  flex: 0 0 6px;
+  flex: 0 0 3px;
   align-self: stretch;
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 12px;
+  padding-top: 1px;
   cursor: col-resize;
   background: transparent;
-  border-left: 1px solid #e8e8e8;
-  border-right: 1px solid #e8e8e8;
+  border-left: 1px solid #f0f0f0;
+  border-right: 1px solid #f0f0f0;
   transition: background 0.15s, border-color 0.15s;
   flex-shrink: 0;
   position: relative;
@@ -4414,23 +4430,23 @@ export default {
     z-index: 1;
   }
   &:hover {
-    background: rgba(24, 144, 255, 0.12);
-    border-left-color: rgba(24, 144, 255, 0.35);
-    border-right-color: rgba(24, 144, 255, 0.35);
-    .ide-lr-resize-handle-dots { background: #1890ff; }
+    background: rgba(24, 144, 255, 0.07);
+    border-left-color: rgba(24, 144, 255, 0.2);
+    border-right-color: rgba(24, 144, 255, 0.2);
+    .ide-lr-resize-handle-dots { background: rgba(24, 144, 255, 0.55); }
   }
   &:active {
-    background: rgba(24, 144, 255, 0.2);
-    border-left-color: rgba(24, 144, 255, 0.5);
-    border-right-color: rgba(24, 144, 255, 0.5);
+    background: rgba(24, 144, 255, 0.1);
+    border-left-color: rgba(24, 144, 255, 0.28);
+    border-right-color: rgba(24, 144, 255, 0.28);
   }
 }
 .ide-lr-resize-handle-dots {
   display: block;
-  width: 2px;
+  width: 1px;
   height: 100%;
-  border-radius: 2px;
-  background: #c0c0c0;
+  border-radius: 1px;
+  background: #e0e0e0;
   flex-shrink: 0;
 }
 
@@ -5872,19 +5888,19 @@ export default {
   }
   .ide-left { background: #181818; border-right-color: #303030; }
   .ide-lr-resize-handle {
-    border-left-color: #303030;
-    border-right-color: #303030;
+    border-left-color: #363636;
+    border-right-color: #363636;
     &:hover {
-      background: rgba(88, 166, 255, 0.12);
-      border-left-color: rgba(88, 166, 255, 0.35);
-      border-right-color: rgba(88, 166, 255, 0.35);
+      background: rgba(88, 166, 255, 0.07);
+      border-left-color: rgba(88, 166, 255, 0.2);
+      border-right-color: rgba(88, 166, 255, 0.2);
     }
     &:active {
-      background: rgba(88, 166, 255, 0.2);
+      background: rgba(88, 166, 255, 0.1);
     }
   }
-  .ide-lr-resize-handle-dots { background: #555; }
-  .ide-lr-resize-handle:hover .ide-lr-resize-handle-dots { background: #58a6ff; }
+  .ide-lr-resize-handle-dots { background: #4a4a4a; }
+  .ide-lr-resize-handle:hover .ide-lr-resize-handle-dots { background: rgba(88, 166, 255, 0.55); }
   .ide-chart-area { border-bottom-color: #303030; }
   .ide-chart-tabs {
     background: linear-gradient(180deg, #1f1f1f 0%, #1a1a1a 100%);
