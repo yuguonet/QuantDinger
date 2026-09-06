@@ -86,24 +86,31 @@ V1核心参数:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 龙回头 策略 (--strategy dragon)                                             │
+│ 全市场300日回测: 109笔 71.6%胜率 均+1.72% 均峰值+6.16% 盈亏比0.80           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│ 入场: 涨停 → 回调 → 回调结束确认 → 次日开盘买入                          │
+│ 入场: 涨停 → 回调 → 拐点确认 → 信号质量过滤 → 次日开盘买入                │
 │ ────────────────────────────────────────────────────────                     │
-│ 1. 找到涨停日(lu_idx)                                                      │
+│ 1. 找龙: 滑动窗口[4,5,7,10,15,20]天内涨停占比>=70%                         │
 │ 2. 回调期: 涨停日后连续收盘<涨停收盘价, 持续3~11天                        │
-│    - 循环遇到close>=涨停收盘价时立即终止(回调中断则无信号)                 │
-│ 3. 信号日(pullback_end, 回调最后一天): 回调天数满足3~11天即可              │
-│ 4. 买入判定: 信号日(D0=回调最后一天)收盘可知条件判定, 不依赖D+1任何数据   │
-│    (旧版"回调结束确认=次日收盘>=涨停收盘"已移除: 该确认在买入时点不可知,  │
-│     属未来函数; 回调是否延续由出场规则承担)                              │
-│ 5. 去重: 同一股票若存在多个涨停, pullback_end距前一信号<=4天则跳过         │
-│ 6. 买入: 信号日次日(D+1)开盘买, 无收盘确认                                │
+│ 3. 信号日(D0): 回调最后一天, 次日收盘>=涨停收盘(回调结束确认)              │
+│ 4. gap过滤: 信号日距涨停日 [3,30)天                                       │
+│ 5. 拐点过滤 (或关系, 满足任一即可):                                        │
+│    - D0收盘在MA20的[-10%,-5%)区间 (均线支撑)                               │
+│    - 回调深度<=-30% (深跌释放卖压)                                         │
+│    - 回调期阴线比例<50% (买盘承接)                                         │
+│ 6. 信号质量排除:                                                           │
+│    - 阴线比例>=70% → 剔除 (卖压未尽, 胜率26%)                              │
+│    - RSI(6)<30 → 剔除 (超卖≠反弹, 胜率17%)                                │
+│    - D0距MA20<-10% → 剔除 (深度破位, 胜率17%)                              │
+│ 7. D+1开盘过滤: 高开>2%不入场, 低开<-3%不入场                             │
+│ 8. 去重: 同一股票信号±4天内跳过                                           │
+│ 9. 买入: 信号日次日(D+1)开盘买                                            │
 │                                                                             │
-│ 出场:                                                                       │
+│ 出场: 分段追踪止损                                                         │
 │ ────────────────────────────────────────────────────────                     │
-│   止损:     -5%                                                             │
-│   追踪止损: -5% (从峰值回撤)                                               │
+│   止损:     -8%                                                             │
+│   追踪止损: 分段 — 盈利<3%时-8% (给空间), 盈利>=3%时-3% (锁利润)           │
 │   峰值逃顶: 涨>7%后大上影线(>30%)收盘逃顶                                  │
 │   持仓上限: 7个交易日                                                      │
 │                                                                             │
@@ -501,6 +508,71 @@ def get_board_name(code):
     return "未知"
 
 # ================================================================
+# 龙回头专用出场回测 (分段追踪止损)
+# ================================================================
+def _run_dragon_backtest(bars, entry_idx, entry_price, hold_days=7,
+                         stop_loss=-8.0, board_type="main"):
+    """龙回头出场模拟: 分段追踪止损
+
+    盈利<3%时: 追踪止损-8% (给予空间)
+    盈利>=3%时: 追踪止损-3% (锁住利润)
+    峰值逃顶: 涨>7%后大上影线(>30%)收盘逃顶
+    """
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    n = len(bars)
+    peak = entry_price
+    exit_p, exit_d, exit_reason = entry_price, 0, ''
+
+    for d in range(1, hold_days + 1):
+        idx = entry_idx + d - 1
+        if idx >= n:
+            break
+        b = bars[idx]
+        if b['high'] > peak:
+            peak = b['high']
+
+        # 1. 峰值逃顶
+        ret = (b['close'] / entry_price - 1) * 100
+        if ret > 7:
+            rng = b['high'] - b['low']
+            upper = (b['high'] - max(b['open'], b['close'])) / rng * 100 if rng > 0 else 0
+            if upper > 30 and b['close'] < b['high'] * 0.98:
+                exit_p, exit_d, exit_reason = b['close'], d, '峰值逃顶'
+                break
+
+        # 2. 分段追踪止损
+        if d > 1:
+            peak_ret = (peak / entry_price - 1) * 100
+            if peak_ret >= 3:
+                trail = -3.0
+            else:
+                trail = -8.0
+            if b['low'] <= peak * (1 + trail / 100):
+                exit_p = peak * (1 + trail / 100)
+                exit_d = d
+                exit_reason = f'追踪止损{trail}%'
+                break
+
+        # 3. 固定止损
+        if b['low'] <= entry_price * (1 + stop_loss / 100):
+            exit_p = entry_price * (1 + stop_loss / 100)
+            exit_d = d
+            exit_reason = f'止损{stop_loss}%'
+            break
+
+        exit_p, exit_d = b['close'], d
+
+    if exit_reason == '':
+        exit_reason = '持仓到期'
+    return {
+        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'exit_reason': exit_reason,
+        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
+        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
+    }
+
+# ================================================================
 # 核心逻辑
 # ================================================================
 
@@ -609,7 +681,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
 
     框架: U1~U4 → 前面出过>=3连板(一字比<0.25) → 排除断板继续
           → 峰值日起[10,30)天回调 → bbw>=30 → 信号日
-    出场规则: stop-5/trail-5/峰值逃顶/持仓7天
+    出场规则: stop-8/分段追踪(盈<3%→-8%,盈>=3%→-3%)/峰值逃顶/持仓7天
     """
     board_type = get_board_type(code)
     n = len(bars)
@@ -668,8 +740,8 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             if d1_gap < -3.0:
                 continue
 
-        result = run_backtest(bars, i + 1, entry_price, hold_days, stop_loss, trailing_stop,
-                              board_type, peak_exit=True, d1_limit_up=False, d1_change=None)
+        result = _run_dragon_backtest(bars, i + 1, entry_price, hold_days, stop_loss,
+                                      board_type)
         if not result:
             continue
 
@@ -849,6 +921,17 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
         cond_depth = pullback_depth <= -30.0
         cond_yin = yin_ratio < 0.5
         if not (cond_ma20 or cond_depth or cond_yin):
+            continue
+
+        # ── 信号质量排除 (回测验证: 128笔基线46.9%→排除后约52%+) ──
+        # 阴线比例>=70%: 回调期全是阴线=卖压未尽, 胜率仅26.3%
+        if yin_ratio >= 0.7:
+            continue
+        # RSI<30: 超卖≠反弹, 胜率仅16.7%
+        if rsi_val is not None and rsi_val < 30:
+            continue
+        # D0距MA20超-10%: 深度破位, 胜率仅16.7%
+        if d0_vs_ma20 is not None and d0_vs_ma20 < -10.0:
             continue
 
         result.append({
@@ -1417,14 +1500,17 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
     if path == 'v1':
         hold_days, stop, trail, is_v1 = 7, -10.0, -5.0, True
         peak_enabled, peak_ret, upper_pct = False, 7, 30
+        tiered_trail = False
     elif path == 'dragon_callback':
-        hold_days, stop, trail, is_v1 = 7, -5.0, -5.0, False
+        hold_days, stop, trail, is_v1 = 7, -8.0, -8.0, False
         peak_enabled, peak_ret, upper_pct = True, 7, 30
+        tiered_trail = True  # 分段追踪: 盈>=3%→-3%, 否→-8%
     elif path == 'break_buy':
         p = BOARD_PARAMS['gem_star' if board_type == 'gem_star' else 'main']
         hold_days, stop, trail = p['hold_days'], p['stop_loss'], p['trailing_stop']
         is_v1 = False
         peak_enabled, peak_ret, upper_pct = True, 10, 40
+        tiered_trail = False
     else:
         return None
 
@@ -1460,8 +1546,14 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
                 upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
                 if upper > upper_pct and b['close'] < b['high'] * 0.98:
                     triggered = triggered or f'峰值逃顶 收盘卖出'
-        if d > 1 and b['low'] <= peak * (1 + trail / 100):
-            triggered = triggered or f'追踪止损{trail}%'
+        if d > 1:
+            if tiered_trail:
+                peak_ret_pct = (peak / entry_price - 1) * 100
+                cur_trail = -3.0 if peak_ret_pct >= 3 else -8.0
+            else:
+                cur_trail = trail
+            if b['low'] <= peak * (1 + cur_trail / 100):
+                triggered = triggered or f'追踪止损{cur_trail}%'
         if b['low'] <= entry_price * (1 + stop / 100):
             triggered = triggered or f'止损{stop}%'
 
