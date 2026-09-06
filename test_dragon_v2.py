@@ -88,12 +88,14 @@ V1核心参数:
 │ 龙回头 策略 (--strategy dragon)                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│ 入场: 涨停 → 回调 → 回调结束确认 → 次日开盘买入                          │
+│ 入场: 涨停 → 回调 → 末期缩量小阴 → 回调结束确认                           │
 │ ────────────────────────────────────────────────────────                     │
 │ 1. 找到涨停日(lu_idx)                                                      │
 │ 2. 回调期: 涨停日后连续收盘<涨停收盘价, 持续3~11天                        │
 │    - 循环遇到close>=涨停收盘价时立即终止(回调中断则无信号)                 │
-│ 3. 信号日(pullback_end, 回调最后一天): 回调天数满足3~11天即可              │
+│ 3. 信号日(pullback_end, 回调最后一天):                                     │
+│    - 涨跌幅在 -3% ~ -0.5% (末期小阴, 抛压枯竭)                            │
+│    - 量比(信号日量/前一天量)在 0.5x ~ 0.8x (缩量)                          │
 │ 4. 买入判定: 信号日(D0=回调最后一天)收盘可知条件判定, 不依赖D+1任何数据   │
 │    (旧版"回调结束确认=次日收盘>=涨停收盘"已移除: 该确认在买入时点不可知,  │
 │     属未来函数; 回调是否延续由出场规则承担)                              │
@@ -536,6 +538,33 @@ PREFILTER_PARAMS = {
     'dragon_death_valley': (-20.0, -15.0),  # E 排除: 回调期最低收盘落在涨停收盘的(-20%,-15%]
 }
 
+# 龙回头v2参数 (2026-09-06 多因子验证)
+DRAGON_V2_PARAMS = {
+    # 信号条件 (D0弱转强日)
+    'v2_d0_chg_min': 5.0,          # D0涨幅 >= 5%
+    'v2_d0_vol_r_min': 1.5,        # D0量比 >= 1.5x (放量)
+    'v2_d0_upper_shadow_max': 0.5, # D0上影线 < 0.5% (封住不回落)
+    'v2_d0_body_ratio_min': 80.0,  # D0实体占比 >= 80% (封得死)
+    'v2_d0_new_high': True,        # D0创新高 (超过涨停日高点)
+    # 回调条件
+    'v2_pullback_min': 1,           # 回调 >= 1天
+    'v2_pullback_max': 5,           # 回调 <= 5天
+    'v2_pb_vol_ratio_max': 0.8,     # 回调期量比 < 0.8 (缩量洗盘)
+    # 连板条件
+    'v2_consec_lu_min': 1,          # 含涨停日至少1板 (不强制要求连板)
+    'v2_consec_yizi_max': 0,        # 一字板 = 0 (无一字板)
+    # 均线条件
+    'v2_ma10_ma20_gap_max': 8.0,    # MA10-MA20距离 < 8% (均线粘合)
+    'v2_ma10_slope_max': 5.0,       # MA10斜率(5日) < 5% (不追涨)
+    # 前期热度
+    'v2_pre20_gain_min': 10.0,      # 涨停前20日涨幅 >= 10%
+    # 出场规则
+    'v2_stop_loss': -5.0,           # 止损 -5%
+    'v2_trailing_stop': -5.0,       # 追踪止盈 -5% (从峰值回撤)
+    'v2_max_hold': 20,              # 最长持有20天
+    'v2_no_d1_sell': True,          # 去掉D1收阴卖规则
+}
+
 def unified_prefilter(bars, i, code, code_info=None):
     """统一前置过滤 U1~U4, 在信号日 i (D0) 收盘可知数据上判定。
 
@@ -602,14 +631,18 @@ def dragon_entry_enhance(bars, i, lu_idx):
 
 def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=11,
                              max_last_chg=3.0,
-                             hold_days=10, stop_loss=-8.0, trailing_stop=-8.0,
-                             stock_info=None, use_prefilter=True,
-                             ):
+                             hold_days=7, stop_loss=-5.0, trailing_stop=-5.0,
+                             stock_info=None, use_prefilter=True, use_enhance=True,
+                             require_yin=True, require_volr=True, require_macd_red=False):
     """龙回头 (as-of 统一版): 逐日只用"当日收盘可知"的数据判定候选信号, 次日开盘买入。
 
-    框架: U1~U4 → 前面出过>=3连板(一字比<0.25) → 排除断板继续
-          → 峰值日起[10,30)天回调 → bbw>=30 → 信号日
-    出场规则: stop-5/trail-5/峰值逃顶/持仓7天
+    与 --today 报告共用同一个判定函数 dragon_today_d0_signals:
+      D-N涨停 → 连续回调3-11天(每日收盘<涨停收盘) → 当日末期缩量小阴(-3%~-0.5%)+量比0.5~0.8
+    → D+1开盘买入, 出场规则(stop-5/trail-5/峰值逃顶/持仓7天)照常模拟。
+
+    时间线严格性: 第i日的判定只使用 bars[:i+1], 不包含 D+1 及以后任何数据;
+    回调期是否"结束"不在入场时预知, 延续风险由出场规则承担 (与实盘每日报告完全一致)。
+    去重与原回测一致: 新信号与上一个已采纳信号的区间±4天内跳过。
     """
     board_type = get_board_type(code)
     n = len(bars)
@@ -627,8 +660,9 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             min_pullback_days=min_pullback_days,
             max_pullback_days=max_pullback_days,
             max_last_chg=max_last_chg,
-            limit_ups=[j for j in lu_all if j < i])
-
+            limit_ups=[j for j in lu_all if j < i],
+            require_yin=require_yin, require_volr=require_volr,
+            require_macd_red=require_macd_red)
         if not sigs:
             continue
         sig = sigs[0]
@@ -645,9 +679,16 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             continue
         used_ranges.append((lu_idx, i))
 
-        # U1~U4 预过滤 (无未来函数)
+        # 统一前置过滤 U1~U4 + 分支增强 A+B+C+E (无未来函数)
+        # 注意: 统一层在锚定涨停日(lu_idx)评估, 而非D0信号日 —— 龙回头D0是缩量小阴日,
+        # 换手天然低, 在D0评估U2会误杀 (离线验证: @涨停日 46.2% vs @信号日 43.1%);
+        # 分支增强A+B+C+E在D0评估 (离线验证口径)。
         if use_prefilter and lu_idx > 0:
             ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
+            if not ok:
+                continue
+        if use_enhance and lu_idx > 0:
+            ok, fails = dragon_entry_enhance(bars, i, lu_idx)
             if not ok:
                 continue
 
@@ -684,10 +725,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
     return trades
 def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=11,
                             max_last_chg=3.0, today_str=None, limit_ups=None,
-                            use_tech_score=True,
-                            ):
-    """龙回头 今日(D0)入场信号: 只检查D0是否满足信号日(回调天数3~11天), 不依赖D+1数据。
+                            require_yin=True, require_volr=True, require_macd_red=False):
+    """龙回头 今日(D0)入场信号: 只检查D0是否满足信号日, 不依赖D+1数据
 
+    require_yin/require_volr 可关闭 D0 末期小阴(-3%~-0.5%)与量比(0.5~0.8x)两条件
+    (2026-09-04 实验用, 默认开启保持历史行为)。
     返回空list或单元素list, 元素含 lu_date/pullback_days/signal_date/signal_chg/entry_vol_r。
     """
     result = []
@@ -709,163 +751,119 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
     prev_c = bars[i - 1]['close']
     if prev_c <= 0:
         return result
-    # D0为信号日: 计算涨跌幅和量比 (保留用于输出, 不再作为过滤条件)
+    # D0为信号日: 末期小阴 -max_last_chg% < 涨跌 < -0.5% (缩量下跌, 抛压枯竭)
     last_chg = (d0['close'] / prev_c - 1) * 100
+    if require_yin and not (-max_last_chg < last_chg < -0.5):
+        return result
+    # 信号日量比: D0量 / D-1量 (0.5~0.8x 缩量)
     prev_vol = bars[i - 1]['volume']
     entry_vol_r = d0['volume'] / prev_vol if prev_vol > 0 else 0
+    if require_volr and (entry_vol_r < 0.5 or entry_vol_r >= 0.8):
+        return result
 
+    # ═══════════════════════════════════════════════════════════════
+    # MACD 翻红过滤 (2026-09-05 判别分析唯一两段稳定规则: D0收盘MACD柱>0)
+    # ═══════════════════════════════════════════════════════════════
     closes = [bars[j]['close'] for j in range(i + 1)]
+    if require_macd_red:
+        _, _, hist_red = calc_macd(closes)
+        if hist_red is None or len(hist_red) < 2 or hist_red[-1] <= 0:
+            return result
 
     # ═══════════════════════════════════════════════════════════════
     # 技术指标加分制 (AND逻辑: 总分必须>=阈值)
     # ═══════════════════════════════════════════════════════════════
     score = 0
-    rsi_val = roc = psy = None
-    if use_tech_score:
-        # --- MACD (最高+4, 最低-2) ---
-        dif, dea, hist = calc_macd(closes)
-        if hist is not None and len(hist) >= 2:
-            if is_macd_golden_cross(dif, dea, lookback=5):
-                score += 3   # 金叉: 强烈看多
-            elif is_macd_hist_turning_positive(hist, lookback=5):
-                score += 2   # 绿翻红: 趋势转多
-            elif is_macd_hist_shrinking_negative(hist, lookback=5):
-                score += 1   # 绿柱缩短: 空头衰竭
-            # DIF在零轴附近
-            n_h = len(hist)
-            if n_h >= 2 and abs(dif[n_h-1]) < abs(dea[n_h-1]) * 0.5:
-                score += 1   # 零轴附近: 趋势不强但也没崩
-            # 死叉扣分
-            if dif[n_h-1] < dea[n_h-1] and dif[n_h-2] >= dea[n_h-2]:
-                score -= 2   # 死叉: 趋势转空
 
-        # --- RSI(6) (最高+2, 最低-2) ---
-        rsi_val = rsi(closes, period=6)
-        if rsi_val is not None:
-            if rsi_val < 30:
-                score += 2   # 超卖: 反弹概率大
-            elif rsi_val < 40:
-                score += 1   # 偏低: 有空间
-            elif rsi_val < 50:
-                score += 0   # 中性
-            elif rsi_val < 60:
-                score -= 1   # 偏高: 空间有限
-            else:
-                score -= 2   # 超买: 回调风险
+    # --- MACD (最高+4, 最低-2) ---
+    dif, dea, hist = calc_macd(closes)
+    if hist is not None and len(hist) >= 2:
+        if is_macd_golden_cross(dif, dea, lookback=5):
+            score += 3   # 金叉: 强烈看多
+        elif is_macd_hist_turning_positive(hist, lookback=5):
+            score += 2   # 绿翻红: 趋势转多
+        elif is_macd_hist_shrinking_negative(hist, lookback=5):
+            score += 1   # 绿柱缩短: 空头衰竭
+        # DIF在零轴附近
+        n_h = len(hist)
+        if n_h >= 2 and abs(dif[n_h-1]) < abs(dea[n_h-1]) * 0.5:
+            score += 1   # 零轴附近: 趋势不强但也没崩
+        # 死叉扣分
+        if dif[n_h-1] < dea[n_h-1] and dif[n_h-2] >= dea[n_h-2]:
+            score -= 2   # 死叉: 趋势转空
 
-        # --- ROC(5) 动量 (最高+2, 最低-2) ---
-        roc = calc_roc(closes, period=5)
-        if roc is not None:
-            if -10 <= roc < 0:
-                score += 1   # 温和回调: 正常
-            elif -15 <= roc < -10:
-                score += 0   # 较深回调: 观望
-            elif roc < -15:
-                score -= 1   # 深度回调: 风险
-            elif 0 <= roc < 5:
-                score += 1   # 企稳回升: 好信号
-            elif roc >= 5:
-                score -= 1   # 已经涨了: 追高风险
+    # --- RSI(6) (最高+2, 最低-2) ---
+    rsi_val = rsi(closes, period=6)
+    if rsi_val is not None:
+        if rsi_val < 30:
+            score += 2   # 超卖: 反弹概率大
+        elif rsi_val < 40:
+            score += 1   # 偏低: 有空间
+        elif rsi_val < 50:
+            score += 0   # 中性
+        elif rsi_val < 60:
+            score -= 1   # 偏高: 空间有限
+        else:
+            score -= 2   # 超买: 回调风险
 
-        # --- PSY(10) 心理线 (最高+2, 最低-1) ---
-        psy = calc_psy(closes, period=10)
-        if psy is not None:
-            if psy < 30:
-                score += 2   # 极度悲观: 反弹概率大
-            elif psy < 40:
-                score += 1   # 偏悲观: 回调充分
-            elif psy < 50:
-                score += 0   # 中性
-            else:
-                score -= 1   # 偏乐观: 回调不充分
+    # --- ROC(5) 动量 (最高+2, 最低-2) ---
+    roc = calc_roc(closes, period=5)
+    if roc is not None:
+        if -10 <= roc < 0:
+            score += 1   # 温和回调: 正常
+        elif -15 <= roc < -10:
+            score += 0   # 较深回调: 观望
+        elif roc < -15:
+            score -= 1   # 深度回调: 风险
+        elif 0 <= roc < 5:
+            score += 1   # 企稳回升: 好信号
+        elif roc >= 5:
+            score -= 1   # 已经涨了: 追高风险
 
-        # --- 总分阈值 ---
-        MIN_SCORE = 0  # 暂时关闭技术评分门槛 (实验)
-        if score < MIN_SCORE:
-            return result
+    # --- PSY(10) 心理线 (最高+2, 最低-1) ---
+    psy = calc_psy(closes, period=10)
+    if psy is not None:
+        if psy < 30:
+            score += 2   # 极度悲观: 反弹概率大
+        elif psy < 40:
+            score += 1   # 偏悲观: 回调充分
+        elif psy < 50:
+            score += 0   # 中性
+        else:
+            score -= 1   # 偏乐观: 回调不充分
 
-    # ═══════════════════════════════════════════════════════════════
-    # 龙回头方案2:
-    #   找龙: 滑动窗口涨停占比>=70% + gap[3,30)
-    #   拐点: MA20[-10%,-5%) 或 深度<=-30% 或 阴线比例<50% (或关系)
-    #   → D1开盘买
-    # ═══════════════════════════════════════════════════════════════
-    DRAGON_RATIO = 0.7
-    DRAGON_WINDOWS = [4, 5, 7, 10, 15, 20]
-    GAP_MIN = 3
-    GAP_MAX = 30
+    # --- 总分阈值 ---
+    MIN_SCORE = 0  # 暂时关闭技术评分门槛 (实验)
+    if score < MIN_SCORE:
+        return result
 
+    # 往前找涨停日
     for lu_idx in (limit_ups if limit_ups is not None else find_limit_ups(bars[:i], board_type)):
         lu_close = bars[lu_idx]['close']
-        if lu_close <= 0:
+        pullback_end = None
+        for j in range(lu_idx + 1, min(lu_idx + 20, i + 1)):
+            if bars[j]['close'] < lu_close:
+                pullback_end = j
+            elif j >= lu_idx + min_pullback_days:
+                break
+            else:
+                break
+        if pullback_end is None or pullback_end != i:
             continue
-
-        # 当前日(i)必须是回调的最后一天
-        if bars[i]['close'] >= lu_close:
-            continue
-        if i + 1 < len(bars) and bars[i + 1]['close'] < lu_close:
-            continue
-
-        pullback_days = i - lu_idx
+        pullback_days = pullback_end - lu_idx
         if pullback_days < min_pullback_days or pullback_days > max_pullback_days:
             continue
-
-        # ── Step1: 找龙 — 滑动窗口内涨停占比>=70% ──
-        dragon_found = False
-        for window in DRAGON_WINDOWS:
-            start = max(1, lu_idx - window)
-            total_days = lu_idx - start
-            if total_days < 3:
-                continue
-            lu_count = sum(1 for k in range(start, lu_idx)
-                           if k > 0 and is_limit_up(bars[k]['close'], bars[k-1]['close'], board_type))
-            if lu_count / total_days >= DRAGON_RATIO:
-                dragon_found = True
-                break
-        if not dragon_found:
-            continue
-
-        # ── Step2: gap[3,30) ──
-        gap_from_peak = i - lu_idx
-        if gap_from_peak < GAP_MIN or gap_from_peak > GAP_MAX:
-            continue
-
-        # ── 计算回调期特征 ──
-        if i >= 19:
-            ma20 = sum(bars[j]['close'] for j in range(i - 19, i + 1)) / 20
-            d0_vs_ma20 = (d0['close'] / ma20 - 1) * 100 if ma20 > 0 else None
-        else:
-            d0_vs_ma20 = None
-
-        min_low = min(bars[j]['low'] for j in range(lu_idx + 1, i + 1))
-        pullback_depth = (min_low / lu_close - 1) * 100
-
-        pb_yin = sum(1 for j in range(lu_idx + 1, i + 1) if bars[j]['close'] < bars[j]['open'])
-        pb_total = i - lu_idx
-        yin_ratio = pb_yin / pb_total if pb_total > 0 else 1.0
-
-        # ── 拐点过滤 (或关系, 满足任一即可) ──
-        cond_ma20 = d0_vs_ma20 is not None and -10.0 <= d0_vs_ma20 < -5.0
-        cond_depth = pullback_depth <= -30.0
-        cond_yin = yin_ratio < 0.5
-        if not (cond_ma20 or cond_depth or cond_yin):
-            continue
-
         result.append({
             'code': code, 'board': get_board_name(code),
             'path': 'dragon_callback', 'path_label': '龙回头',
             'lu_date': bars[lu_idx]['time'],
             'pullback_days': pullback_days,
-            'signal_date': bars[i]['time'],
+            'signal_date': bars[pullback_end]['time'],
             'signal_chg': round(last_chg, 2),
             'signal_vol_r': round(entry_vol_r, 2),
             'signal_price': round(d0['close'], 3),
             'entry_vol_r': round(entry_vol_r, 2),
             'buy_mode': 'next_open',
-            'gap_from_peak': gap_from_peak,
-            'd0_vs_ma20': round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
-            'pullback_depth': round(pullback_depth, 2),
-            'yin_ratio': round(yin_ratio, 2),
             'tech_score': score,
             'tech_rsi': round(rsi_val, 1) if rsi_val else None,
             'tech_roc': round(roc, 1) if roc else None,
@@ -873,6 +871,228 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
         })
         break
     return result
+
+
+# ================================================================
+# 龙回头 v2 (2026-09-06 多因子验证)
+# ================================================================
+def dragon_v2_signals(bars, code, p=None, limit_ups=None):
+    """龙回头v2信号: 弱转强日确认 + 多因子过滤
+
+    信号条件:
+      涨停(非一字) → 回调1~5天(缩量) → D0弱转强日(涨>=5%+量比>=1.5+上影<0.5+实体>=80%+创新高)
+      + 连板>=1(无一字板) + 涨停前20日涨幅>=10% + MA10-MA20距离<8% + MA10斜率<5%
+    出场:
+      止损-5% + 追踪止盈-5% + 最长20天 + 无D1收阴卖
+    """
+    if p is None:
+        p = DRAGON_V2_PARAMS
+    board_type = get_board_type(code)
+    th = 0.098 if board_type == 'main' else 0.198
+    n = len(bars)
+    if n < 60:
+        return []
+    result = []
+
+    for i in range(20, n - 2):
+        # ── 阶段1: 找涨停板 (排除一字板) ──
+        prev_c = bars[i - 1]['close']
+        if prev_c <= 0:
+            continue
+        ret = (bars[i]['close'] / prev_c) - 1
+        if ret < th * 0.98:
+            continue
+        if _is_yizi(bars[i]):
+            continue
+        lu_idx = i
+        lu_close = bars[i]['close']
+
+        # ── 连板检查 ──
+        consec_lu = 1
+        consec_yizi = 0
+        jj = lu_idx - 1
+        while jj >= 0 and jj > lu_idx - 20:
+            if bars[jj]['close'] > 0 and bars[jj - 1]['close'] > 0:
+                if (bars[jj]['close'] / bars[jj - 1]['close'] - 1) >= th * 0.98:
+                    consec_lu += 1
+                    if _is_yizi(bars[jj]):
+                        consec_yizi += 1
+                    jj -= 1
+                    continue
+            break
+        if consec_lu < p['v2_consec_lu_min']:
+            continue
+        if consec_yizi > p['v2_consec_yizi_max']:
+            continue
+
+        # ── 前期热度: 涨停前20日涨幅 ──
+        if lu_idx >= 20 and bars[lu_idx - 20]['close'] > 0:
+            pre20_gain = (lu_close / bars[lu_idx - 20]['close'] - 1) * 100
+            if pre20_gain < p['v2_pre20_gain_min']:
+                continue
+        else:
+            continue
+
+        # ── 阶段2: 回调期 ──
+        pullback_days = 0
+        for j in range(lu_idx + 1, min(lu_idx + 6, n)):
+            if bars[j]['close'] < lu_close:
+                pullback_days += 1
+            else:
+                break
+        if pullback_days < p['v2_pullback_min'] or pullback_days > p['v2_pullback_max']:
+            continue
+
+        # 回调期量比
+        pb_start = lu_idx + 1
+        pb_end = lu_idx + pullback_days
+        if pb_end < n:
+            pb_vols = [bars[j]['volume'] for j in range(pb_start, min(pb_end + 1, n))]
+            lu_vol = bars[lu_idx]['volume']
+            pb_avg_vol = sum(pb_vols) / len(pb_vols) if pb_vols else lu_vol
+            pb_vol_ratio = pb_avg_vol / lu_vol if lu_vol > 0 else 1
+            if pb_vol_ratio > p['v2_pb_vol_ratio_max']:
+                continue
+        else:
+            continue
+
+        # ── 阶段3: D0弱转强日确认 ──
+        d0_idx = None
+        for j in range(pb_end + 1, min(pb_end + 11, n)):
+            d0 = bars[j]
+            d0_prev = bars[j - 1]
+            if d0_prev['close'] <= 0:
+                continue
+            d0_chg = (d0['close'] / d0_prev['close'] - 1) * 100
+            d0_vol_r = d0['volume'] / d0_prev['volume'] if d0_prev['volume'] > 0 else 0
+            d0_range = d0['high'] - d0['low']
+            d0_upper = (d0['high'] - max(d0['open'], d0['close'])) / d0_range * 100 if d0_range > 0 else 0
+            d0_amplitude = d0_range / d0['low'] * 100 if d0['low'] > 0 else 0
+            d0_body = abs(d0['close'] - d0['open'])
+            d0_body_ratio = d0_body / d0_range * 100 if d0_range > 0 else 0
+
+            if d0_chg < p['v2_d0_chg_min']:
+                continue
+            if d0_vol_r < p['v2_d0_vol_r_min']:
+                continue
+            if d0_upper >= p['v2_d0_upper_shadow_max']:
+                continue
+            if d0_amplitude < 0.2:
+                continue
+            if d0_body_ratio < p['v2_d0_body_ratio_min']:
+                continue
+            if p['v2_d0_new_high'] and d0['high'] < bars[lu_idx]['high']:
+                continue
+            d0_idx = j
+            break
+        if d0_idx is None:
+            continue
+
+        # ── 均线过滤 ──
+        closes_d0 = [bars[j]['close'] for j in range(d0_idx + 1)]
+        if len(closes_d0) < 20:
+            continue
+        ma10_arr = _sma_list(closes_d0, 10)
+        ma20_arr = _sma_list(closes_d0, 20)
+        if not ma10_arr or not ma20_arr or not ma10_arr[-1] or not ma20_arr[-1]:
+            continue
+        ma10_ma20_gap = abs(ma10_arr[-1] - ma20_arr[-1]) / ma20_arr[-1] * 100
+        if ma10_ma20_gap > p['v2_ma10_ma20_gap_max']:
+            continue
+        if len(ma10_arr) < 5 or not ma10_arr[-5] or ma10_arr[-5] <= 0:
+            continue
+        ma10_slope = (ma10_arr[-1] / ma10_arr[-5] - 1) * 100
+        if ma10_slope > p['v2_ma10_slope_max']:
+            continue
+
+        # ── D+1买入 ──
+        d1_idx = d0_idx + 1
+        if d1_idx >= n:
+            continue
+        entry_price = bars[d1_idx]['open']
+        if entry_price <= 0:
+            continue
+
+        result.append({
+            'code': code, 'board': get_board_name(code),
+            'path': 'dragon_v2', 'path_label': '龙回头v2',
+            'lu_date': bars[lu_idx]['time'],
+            'consec_lu': consec_lu, 'consec_yizi': consec_yizi,
+            'pre20_gain': round(pre20_gain, 1),
+            'pullback_days': pullback_days,
+            'pb_vol_ratio': round(pb_vol_ratio, 2),
+            'd0_date': bars[d0_idx]['time'],
+            'd0_chg': round(d0_chg, 2),
+            'd0_vol_r': round(d0_vol_r, 2),
+            'd0_body_ratio': round(d0_body_ratio, 1),
+            'd0_new_high': True,
+            'ma10_ma20_gap': round(ma10_ma20_gap, 2),
+            'ma10_slope': round(ma10_slope, 2),
+            'signal_date': bars[d0_idx]['time'],
+            'signal_chg': round(d0_chg, 2),
+            'signal_vol_r': round(d0_vol_r, 2),
+            'signal_price': round(bars[d0_idx]['close'], 3),
+            'entry_price': round(entry_price, 3),
+            'entry_date': bars[d1_idx]['time'],
+            'buy_mode': 'next_open',
+        })
+    return result
+
+
+def _sma_list(closes, period):
+    """简单移动平均 (返回list, 与 _sma_at 口径一致)"""
+    if len(closes) < period:
+        return [None] * len(closes)
+    result = [None] * (period - 1)
+    for i in range(period - 1, len(closes)):
+        result.append(sum(closes[i - period + 1:i + 1]) / period)
+    return result
+
+
+def _is_yizi(b):
+    """一字板判定"""
+    return b['open'] == b['high'] == b['low'] == b['close']
+
+
+def run_backtest_v2(bars, entry_idx, entry_price, p=None):
+    """龙回头v2出场: 止损-5% + 追踪止盈-5% + 最长20天 + 无D1收阴卖"""
+    if p is None:
+        p = DRAGON_V2_PARAMS
+    n = len(bars)
+    if entry_price <= 0 or entry_idx >= n:
+        return None
+    peak = entry_price
+    exit_p = entry_price
+    exit_d = 0
+    for d in range(p['v2_max_hold']):
+        idx = entry_idx + d
+        if idx >= n:
+            break
+        bar = bars[idx]
+        if bar['high'] > peak:
+            peak = bar['high']
+        # D1不卖 (v2_no_d1_sell=True)
+        if d == 0 and p.get('v2_no_d1_sell', True):
+            exit_p = bar['close']
+            exit_d = d + 1
+            continue
+        # 止损
+        if bar['low'] <= entry_price * (1 + p['v2_stop_loss'] / 100):
+            exit_p = entry_price * (1 + p['v2_stop_loss'] / 100)
+            exit_d = d + 1
+            break
+        # 追踪止盈
+        if bar['low'] <= peak * (1 + p['v2_trailing_stop'] / 100):
+            exit_p = peak * (1 + p['v2_trailing_stop'] / 100)
+            exit_d = d + 1
+            break
+        exit_p = bar['close']
+        exit_d = d + 1
+    return {
+        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
+        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
+    }
 
 
 # ================================================================
@@ -1527,7 +1747,7 @@ def print_today_signals(today_stream, today_str, bars_by_code=None):
 
     # 龙回头信号
     if dc_today:
-        print(f"\n  🐉 龙回头 ({len(dc_today)}只) - 回调到位确认, 次日D1开盘买:")
+        print(f"\n  🐉 龙回头 ({len(dc_today)}只) - 缩量小阴确认, 次日D1开盘买:")
         for t in sorted(dc_today, key=lambda x: x.get('entry_vol_r', 0), reverse=True):
             bt = get_board_type(t['code'])
             signal_price = t.get('signal_price') or t.get('entry_price')
@@ -1714,7 +1934,10 @@ def main():
     # 统一前置过滤开关 (U1~U4 + 龙回头A+B+C+E, 依据tmp/两份分析报告)
     parser.add_argument("--no-ufilter", action="store_true", help="禁用统一前置过滤U1~U4 (对照用)")
     parser.add_argument("--no-dragon-enhance", action="store_true", help="禁用龙回头分支增强A+B+C+E (对照用)")
-
+    parser.add_argument("--no-d0-yin", action="store_true", help="龙回头: 去掉D0末期小阴(-3%%~-0.5%%)条件 (实验)")
+    parser.add_argument("--no-d0-volr", action="store_true", help="龙回头: 去掉D0量比(0.5~0.8x)条件 (实验)")
+    parser.add_argument("--d0-macd-red", action="store_true", help="龙回头: D0要求MACD柱翻红(>0) (2026-09-05判别分析验证)")
+    parser.add_argument("--dragon-v2", action="store_true", help="龙回头v2: 弱转强日确认+多因子过滤 (2026-09-06)")
     parser.add_argument("--today", action="store_true", help="显示买点+持仓卖出建议 (7天内买入的持仓)")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为库内最后交易日; 晚于库内最后交易日时按库内最后交易日处理")
     args = parser.parse_args()
@@ -1731,6 +1954,7 @@ def main():
 
     run_dc = args.strategy in ("all", "dragon")
     run_dc2 = args.strategy in ("all", "dragon2")
+    run_dv2 = args.dragon_v2
     run_v1 = args.strategy in ("all", "v1")
     run_bb = args.strategy in ("all", "break")
 
@@ -1767,12 +1991,13 @@ def main():
     
     if run_dc: labels.append(f"龙回头(回调{args.pullback}-{args.max_pullback}天)")
     if run_dc2: labels.append(f"龙回头Pro(评分>={d2_params['min_score']})")
+    if run_dv2: labels.append("龙回头v2(弱转强+多因子)")
     if run_v1: labels.append("V1")
     if run_bb: labels.append(f"断板(连板≥2)")
     print(f"运行: {' + '.join(labels)}")
     print(f"股票: {len(codes)}只\n")
 
-    dc_trades, d2_trades, v1_trades, bb_trades = [], [], [], []
+    dc_trades, d2_trades, dv2_trades, v1_trades, bb_trades = [], [], [], [], []
     bars_by_code = {}
     success = 0
 
@@ -1838,7 +2063,10 @@ def main():
                                            max_last_chg=args.max_last_chg,
                                            stock_info=stock_info.get(code) if stock_info else None,
                                            use_prefilter=not args.no_ufilter,
-)
+                                           use_enhance=not args.no_dragon_enhance,
+                                           require_yin=not args.no_d0_yin,
+                                           require_volr=not args.no_d0_volr,
+                                           require_macd_red=args.d0_macd_red)
             dc_trades.extend(dc)
             parts.append(f"龙回头{len(dc)}")
         if run_dc2:
@@ -1846,6 +2074,16 @@ def main():
             d2 = strategy_dragon2(bars, code, stock_info=info, params=d2_params)
             d2_trades.extend(d2)
             parts.append(f"龙回头Pro{len(d2)}")
+        if run_dv2:
+            dv2_sigs = dragon_v2_signals(bars, code)
+            for sig in dv2_sigs:
+                entry_idx = next((j for j, b in enumerate(bars) if b['time'] == sig['entry_date']), None)
+                if entry_idx is None:
+                    continue
+                r = run_backtest_v2(bars, entry_idx, sig['entry_price'])
+                if r:
+                    dv2_trades.append({**sig, **r})
+            parts.append(f"龙回头v2{len(dv2_sigs)}")
         if run_v1:
             # 如果预加载了K线, 直接用; 否则单独加载
             code_bars = all_bars.get(code) if all_bars else bars
@@ -1952,6 +2190,38 @@ def main():
                     print(f"    {t['code']} {t['entry_style']} 涨停{t['lu_date']} 回调{t['pullback_days']}天 score{t['score']} "
                           f"→ {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
 
+    if run_dv2:
+        print(f"\n📊 龙回头v2:")
+        print_stats(dv2_trades, "龙回头v2")
+        if dv2_trades:
+            print(f"\n  连板数分布:")
+            for n in sorted(set(t['consec_lu'] for t in dv2_trades)):
+                seg = [t for t in dv2_trades if t['consec_lu'] == n]
+                print_stats(seg, f"    {n}板")
+            print(f"\n  回调天数分布:")
+            for d in sorted(set(t['pullback_days'] for t in dv2_trades)):
+                seg = [t for t in dv2_trades if t['pullback_days'] == d]
+                print_stats(seg, f"    回调{d}天")
+            print(f"\n  回调期量比分布:")
+            for lo, hi, label in [(0, 0.3, '<0.3'), (0.3, 0.5, '0.3-0.5'), (0.5, 0.8, '0.5-0.8')]:
+                seg = [t for t in dv2_trades if lo <= t['pb_vol_ratio'] < hi]
+                if seg:
+                    print_stats(seg, f"    {label}")
+            print(f"\n  MA10-MA20距离分布:")
+            for lo, hi, label in [(0, 2, '<2%'), (2, 5, '2-5%'), (5, 8, '5-8%')]:
+                seg = [t for t in dv2_trades if lo <= t['ma10_ma20_gap'] < hi]
+                if seg:
+                    print_stats(seg, f"    {label}")
+            print(f"\n  🏆 龙回头v2 TOP5:")
+            for t in sorted(dv2_trades, key=lambda x: -x['peak_return_pct'])[:5]:
+                print(f"    {t['code']} {t['consec_lu']}板 涨停{t['lu_date']} 回调{t['pullback_days']}天 量比{t['pb_vol_ratio']} "
+                      f"D0+{t['d0_chg']}% gap{t['ma10_ma20_gap']}% → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
+            if len(dv2_trades) > 5:
+                print(f"\n  💀 龙回头v2 BOTTOM5:")
+                for t in sorted(dv2_trades, key=lambda x: x['return_pct'])[:5]:
+                    print(f"    {t['code']} {t['consec_lu']}板 涨停{t['lu_date']} 回调{t['pullback_days']}天 量比{t['pb_vol_ratio']} "
+                          f"D0+{t['d0_chg']}% gap{t['ma10_ma20_gap']}% → {t['entry_date']}买 收益{t['return_pct']:+.1f}% 峰值{t['peak_return_pct']:+.1f}%")
+
     if run_v1:
         print(f"\n📊 V1:")
         print_stats(v1_trades, "V1")
@@ -2003,7 +2273,7 @@ def main():
                 print_stats(seg, f"  阶段{phase} {label}")
 
     # ===== 混合结果 =====
-    all_trades = dc_trades + d2_trades + v1_trades + bb_trades
+    all_trades = dc_trades + d2_trades + dv2_trades + v1_trades + bb_trades
     if len(all_trades) > max(len(dc_trades), len(d2_trades), len(v1_trades), len(bb_trades)):
         print(f"\n{'=' * 80}")
         print(f"📊 三策略合并:")
@@ -2093,7 +2363,7 @@ def main():
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
     os.makedirs(out_dir, exist_ok=True)
     out_name = os.path.join(out_dir, f"test_dragon_callback_result_{args.strategy}.json")
-    all_out = dc_trades + d2_trades + v1_trades + bb_trades
+    all_out = dc_trades + d2_trades + dv2_trades + v1_trades + bb_trades
     if all_out:
         with open(out_name, "w", encoding="utf-8") as f:
             json.dump(all_out, f, ensure_ascii=False, indent=2)

@@ -25,10 +25,10 @@ DRAGON_GROUP_NAME = "自动策略组"
 DRAGON_USER_ID = 1
 DRAGON_MARKET = "CNStock"
 DRAGON_STRATEGY = "dragon2"
-STRATEGIES = ("dragon2", "v1", "break")
-STRATEGY_LABELS = {"dragon2": "龙回头Pro", "v1": "V1", "break": "断板"}
-# 历史回测胜率 (300日全市场): 策略组排序用
-STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon2": 70.4}
+STRATEGIES = ("dragon2", "v1", "break", "relay3")
+STRATEGY_LABELS = {"dragon2": "龙回头Pro", "v1": "V1", "break": "断板", "relay3": "3板接力"}
+# 历史回测胜率 (300日全市场): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
+STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon2": 70.4, "relay3": 53.4}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
@@ -40,8 +40,8 @@ S_EXPIRED = "expired"                # 失效: 弱确认/开盘gap放弃 (组内
 
 # 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察中"置底展示, 09-04 用户要求提前可见)
 ACTIVE_GROUP_STATES = (S_WATCH_PENDING, S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY)
-# 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰)
-DAILY_LIMIT_PER_STRATEGY = {"dragon2": 5, "v1": 5, "break": 5}
+# 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰; relay3 信号稀少 n≈0.7/日, 名额2)
+DAILY_LIMIT_PER_STRATEGY = {"dragon2": 5, "v1": 5, "break": 5, "relay3": 2}
 # label 文案 (前端映射兜底, 前端也有映射)
 STATE_LABELS = {S_WATCH_PENDING: "观察中", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
                 S_EXIT_TODAY: "卖出", S_CLOSED: "已平仓", S_EXPIRED: "已失效"}
@@ -196,7 +196,7 @@ def upsert_scan_signals(trade_date: str, rows: list):
                       "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
                       "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
                       "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
-                      "pre20_gain") if s.get(k) is not None}
+                      "pre20_gain", "board_height", "lu_vol_ratio", "rsi") if s.get(k) is not None}
             cur.execute(f"""
                 INSERT INTO {_SIGNALS_TABLE}
                     (trade_date, strategy, code, name, board, entry_style, score, state,
@@ -374,6 +374,9 @@ def _display_detail(s):
         "float_mcap_yi": _f((s.get("extra") or {}).get("float_mcap_yi")),
         "ma60_slope": _f((s.get("extra") or {}).get("ma60_slope")),
         "ma_bull": (s.get("extra") or {}).get("ma_bull"),
+        "board_height": (s.get("extra") or {}).get("board_height"),
+        "lu_vol_ratio": _f((s.get("extra") or {}).get("lu_vol_ratio")),
+        "rsi": _f((s.get("extra") or {}).get("rsi")),
         "exit_reason": s.get("exit_reason") or "",
         "exit_date": s.get("exit_date"),
         "exit_price": _f(s.get("exit_price")),

@@ -115,7 +115,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         DRAGON2_PARAMS, dragon2_today_d0_signals,
         v1_today_d0_signals, break_today_d0_signals, find_limit_ups, get_board_type,
     )
-    from app.market_cn.auto import dragon_store
+    from app.market_cn.auto import dragon_store, relay3
 
     dragon_store.ensure_tables()
     target = _target_date()
@@ -186,6 +186,15 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
             rows.extend(brks)
         except Exception as e:
             logger.debug("[dragon_scan] %s 断板判定异常: %s", code, e)
+
+        # ── 3板接力: 昨日恰3连板 + MA多头 (2026-09-06 回测新增) ──
+        try:
+            r3s = relay3.relay3_today_d0_signals(bars, code)
+            for s in r3s:
+                s["name"] = (stock_info.get(code) or {}).get("name", "")
+            rows.extend(r3s)
+        except Exception as e:
+            logger.debug("[dragon_scan] %s 3板接力判定异常: %s", code, e)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
                         i + 1, len(codes), len(rows), time.time() - t0)

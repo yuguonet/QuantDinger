@@ -136,6 +136,9 @@ def latest_snapshot(codes):
 def _entry_stop(code, entry_price, strategy):
     from app.market_cn.auto.dragon_core import DRAGON2_PARAMS, get_board_type
     gem = get_board_type(code) == "gem_star"
+    if strategy == "relay3":
+        from app.market_cn.auto.relay3 import PARAMS as R3P
+        return round(entry_price * (1 + R3P["stop_pct"] / 100), 3)
     if strategy == "v1":
         stop = -10.0
     elif strategy == "break":
@@ -148,6 +151,9 @@ def _entry_stop(code, entry_price, strategy):
 def _gap_buyable(code, strategy, style, gap):
     """开盘 gap 是否可买 (与各策略回测的 D1 过滤一致)。"""
     from app.market_cn.auto.dragon_core import DRAGON2_PARAMS, get_board_type
+    if strategy == "relay3":
+        from app.market_cn.auto.relay3 import gap_buyable as r3_gap
+        return r3_gap(gap)
     if strategy == "break":
         return True
     if strategy == "v1":
@@ -246,6 +252,11 @@ def _eval_exit_day_close(row):
     peak = max(float(b["high"]) for b in entry_seg)
     last_bar = bars[-1]
     prev_bar = bars[-2] if len(bars) >= 2 else last_bar
+
+    # relay3: 收盘重放分支 (D1: 未封板→尾盘卖; 封板→持有到到期/追踪)
+    if strategy == "relay3":
+        from app.market_cn.auto.relay3 import PARAMS as R3P, eval_exit_day_close as r3_close
+        return r3_close(bars, idx, entry_price, code, row.get("entry_date"))
 
     if strategy == "dragon2":
         p = DRAGON2_PARAMS
@@ -381,11 +392,14 @@ def run_monitor():
             stats["open_buy"] = n_buy
             stats["open_expired"] = n_exp
 
-    # ── 2. 盘中硬止损保护 (buy_today/holding) ──
+    # ── 2. 盘中硬止损保护 (buy_today/holding) + relay3 炸板即卖 ──
     if "09:35" <= hm < "15:00":
         guard_rows = buy_rows + hold_rows
         if guard_rows:
             snaps = latest_snapshot([r["code"] for r in guard_rows])
+            # relay3 需要当日全天快照序列判定封板/炸板
+            relay3_codes = [r["code"] for r in guard_rows if r.get("strategy") == "relay3"]
+            relay3_series = fetch_day_snapshots(relay3_codes) if relay3_codes else {}
             for r in guard_rows:
                 if r.get("exit_reason"):
                     continue
@@ -398,6 +412,18 @@ def run_monitor():
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason="盘中止损",
                                  detail={"marked": today, "stop_price": stop_px})
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
+                    continue
+                # relay3 S4: 当日曾触涨停后炸板 → 立即卖
+                if r.get("strategy") == "relay3":
+                    from app.market_cn.auto.relay3 import eval_exit_live
+                    entry = float(r.get("entry_price") or 0)
+                    series = relay3_series.get(r["code"]) or []
+                    reason, price = eval_exit_live(r, series, entry)
+                    if reason and price:
+                        ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=reason,
+                                     exit_price=round(float(price), 3),
+                                     detail={"marked": today, "intraday": True})
+                        stats["relay3_break_sell"] = stats.get("relay3_break_sell", 0) + 1
 
     # ── 3. 14:30 预确认 (dragon2/v1 的今日买入行) ──
     if in_window(W_PRECONF_LO, W_PRECONF_HI, hm):
@@ -434,8 +460,30 @@ def run_monitor():
                 rows_ = series.get(r["code"])
                 if not rows_:
                     continue
-                level, chg, vr = evaluate_confirm(r, rows_)
                 strat = r.get("strategy", "dragon2")
+                # relay3 无确认步骤: D1 封板守住 → holding (炸板/未封板已在盘中/重放转卖出)
+                if strat == "relay3":
+                    if r.get("exit_reason"):
+                        continue
+                    last_px = float(rows_[-1].get("last") or 0)
+                    entry = float(r.get("entry_price") or 0)
+                    from app.market_cn.auto.dragon_core import get_board_type
+                    th = 0.198 if get_board_type(r["code"]) == "gem_star" else 0.098
+                    limit_price = round(entry * (1 + th), 2)
+                    sealed = any(float(x.get("high") or 0) >= limit_price - 0.001 for x in rows_)
+                    if sealed and last_px >= limit_price * 0.995:
+                        ds.set_state(r["id"], ds.S_HOLDING, confirm_date=today,
+                                     d1_chg=round((last_px / entry - 1) * 100, 2),
+                                     detail={"confirm": "sealed_hold"})
+                    # 未封板且未触发出场: 兑底转 exit_today (尾盘卖漏网)
+                    else:
+                        ds.set_state(r["id"], ds.S_EXIT_TODAY, confirm_date=today,
+                                     d1_chg=round((last_px / entry - 1) * 100, 2),
+                                     exit_reason="S4未封板尾盘卖",
+                                     exit_price=round(last_px, 3),
+                                     detail={"marked": today})
+                    continue
+                level, chg, vr = evaluate_confirm(r, rows_)
                 if level == "weak":
                     reason = ("D1日内动量<3%,D2开盘清仓" if strat == "v1"
                               else "D1弱确认,D2开盘清仓")
