@@ -159,13 +159,13 @@ def _refresh_realtime_snapshot():
 
 
 def _dragon_strategy_scan():
-    """盘后: 龙回头Pro 全市场扫描 (1D 就绪后判定, 写 qd_dragon_signals)"""
+    """盘后: 龙回头/V1/断板/3板接力 全市场扫描 (1D 就绪后判定, 写 qd_dragon_signals)"""
     from app.market_cn.auto.dragon_scan import run_scan
     run_scan()
 
 
 def _dragon_strategy_monitor():
-    """盘中: 龙回头Pro 状态机 (开盘gap判定/预确认/收盘确认/出场检测/组对账)"""
+    """盘中: 自动策略组状态机 (开盘gap判定/预确认/收盘确认/出场检测/组对账)"""
     from app.market_cn.auto.dragon_monitor import run_monitor_safe
     run_monitor_safe()
 
@@ -290,7 +290,7 @@ TASKS = [
     Task("morning_batch",     _morning_batch,     interval=86400, trading_only=False, once_per_day=True, trigger_hour=6,  trigger_minute=0),
     Task("post_market_batch", _post_market_batch, interval=86400, trading_only=False, once_per_day=True, trigger_hour=15, trigger_minute=30),
     Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
-    # 龙回头Pro 自动化: 盘后扫描(1D就绪后) + 盘中状态机(60s)
+    # 自动策略组: 盘后扫描(1D就绪后) + 盘中状态机(60s), 龙回头Pro已于2026-09-06下线
     Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=16, trigger_minute=30),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
 ]

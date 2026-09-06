@@ -122,7 +122,7 @@ def relay3_today_d0_signals(bars, code) -> list:
     """判定 target 日收盘后是否产生 3板接力信号。
 
     bars: 截至当日(含)的日K list[dict] (dragon_scan.fetch_kline_db 输出)。
-    返回 list[dict], 字段与 dragon2_today_d0_signals 对齐 + strategy=relay3。
+    返回 list[dict], 字段与 dragon_cb_today_d0_signals 对齐 + strategy=relay3。
     """
     if not bars or len(bars) < 67:
         return []

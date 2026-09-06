@@ -1,15 +1,17 @@
-"""dragon_store.py - 龙回头Pro 存储层
+"""dragon_store.py - 自动策略组存储层
 
 职责:
   1. qd_dragon_signals 事实表 (状态机全量+历史) 的建表与 CRUD
   2. qd_watchlist 迁移 (strategy_state/strategy_detail 列 + UNIQUE 约束放宽)
-  3. sync_watchlist_group(): 活跃信号 → qd_watchlist '龙回头Pro' 组的全量对账
+  3. sync_watchlist_group(): 活跃信号 → qd_watchlist '自动策略组' 的全量对账
      (引擎独占读写删, 失效票删行, 历史留在 signals 表)
 
 设计要点:
   - signals 表是唯一事实源; qd_watchlist 策略组行只是活跃信号的"投影"
   - 全部幂等: 重复执行不产生脏数据
   - 单用户部署: 写 user_id=1 (DRAGON_USER_ID), 所有用户可见同一策略组
+  - 2026-09-06: 龙回头Pro(dragon2) 下线, strategy 改为 dragon_callback(方案2);
+    ensure_tables 会清理 dragon2 历史残留行
 """
 from __future__ import annotations
 
@@ -20,15 +22,16 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 组名与用户 (固定名: 自动策略组, 三策略共用: 龙回头Pro/V1/断板)
+# 组名与用户 (固定名: 自动策略组, 三策略共用: 龙回头/V1/断板)
 DRAGON_GROUP_NAME = "自动策略组"
 DRAGON_USER_ID = 1
 DRAGON_MARKET = "CNStock"
-DRAGON_STRATEGY = "dragon2"
-STRATEGIES = ("dragon2", "v1", "break", "relay3")
-STRATEGY_LABELS = {"dragon2": "龙回头Pro", "v1": "V1", "break": "断板", "relay3": "3板接力"}
-# 历史回测胜率 (300日全市场): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
-STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon2": 70.4, "relay3": 53.4}
+DRAGON_STRATEGY = "dragon_callback"
+STRATEGIES = ("dragon_callback", "v1", "break", "relay3")
+STRATEGY_LABELS = {"dragon_callback": "龙回头", "v1": "V1", "break": "断板", "relay3": "3板接力"}
+# 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
+# dragon_callback = 方案2 全市场验证 (2026-09-06, 龙回头优化分析_20260906/)
+STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 51.3, "relay3": 53.4}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
@@ -41,7 +44,7 @@ S_EXPIRED = "expired"                # 失效: 弱确认/开盘gap放弃 (组内
 # 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察中"置底展示, 09-04 用户要求提前可见)
 ACTIVE_GROUP_STATES = (S_WATCH_PENDING, S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY)
 # 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰; relay3 信号稀少 n≈0.7/日, 名额2)
-DAILY_LIMIT_PER_STRATEGY = {"dragon2": 5, "v1": 5, "break": 5, "relay3": 2}
+DAILY_LIMIT_PER_STRATEGY = {"dragon_callback": 5, "v1": 5, "break": 5, "relay3": 2}
 # label 文案 (前端映射兜底, 前端也有映射)
 STATE_LABELS = {S_WATCH_PENDING: "观察中", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
                 S_EXIT_TODAY: "卖出", S_CLOSED: "已平仓", S_EXPIRED: "已失效"}
@@ -152,6 +155,11 @@ def ensure_tables():
                 if not cur.fetchone():
                     raise
                 logger.info("[dragon_store] UNIQUE 约束已存在(重名跳过): %s", e)
+
+        # ── 4. 龙回头Pro(dragon2) 残留清理 (2026-09-06 下线):
+        #     事实行删除后, 组内投影由 sync_watchlist_group 对账自动删除 ──
+        cur.execute(f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = 'dragon2'")
+
         db.commit()
         cur.close()
     logger.info("[dragon_store] ensure_tables 完成")
@@ -175,7 +183,7 @@ def _row_to_dict(r):
 
 
 def upsert_scan_signals(trade_date: str, rows: list):
-    """盘后扫描结果写入 (幂等): rows 为各策略 (dragon2/v1/break) 的今日信号列表, 行内带 strategy 键。
+    """盘后扫描结果写入 (幂等): rows 为各策略 (dragon_callback/v1/break/relay3) 的今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
@@ -348,14 +356,18 @@ def get_markers(code, days=60):
 
 def _display_detail(s):
     """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。"""
-    strat = s.get("strategy") or "dragon2"
+    strat = s.get("strategy") or DRAGON_STRATEGY
+    _es = s.get("entry_style") or ""
+    # entry_style 的 (a)/(b) 文案是旧龙回头Pro概念; 龙回头方案2固定填 'a', 无含义
+    _es_txt = "" if strat == "dragon_callback" else (
+        "(a)缩量企稳" if _es == "a" else ("(b)放量启动" if _es == "b" else _es))
     return {
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
         "strategy": strat,
         "strategy_label": STRATEGY_LABELS.get(strat, strat),
         "winrate": STRATEGY_WINRATE.get(strat),
         "state_label": STATE_LABELS.get(s["state"], s["state"]),
-        "entry_style": "(a)缩量企稳" if s.get("entry_style") == "a" else ("(b)放量启动" if s.get("entry_style") == "b" else (s.get("entry_style") or "")),
+        "entry_style": _es_txt,
         "score": s.get("score"),
         "lu_date": s.get("lu_date"),
         "pullback_days": s.get("pullback_days"),
@@ -391,7 +403,7 @@ def _f(v):
 
 
 def sync_watchlist_group(active_rows):
-    """活跃信号 → qd_watchlist '龙回头Pro' 组全量对账 (引擎独占读写删)。
+    """活跃信号 → qd_watchlist '自动策略组' 全量对账 (引擎独占读写删)。
 
     active_rows: signals 行列表 (state ∈ ACTIVE_GROUP_STATES)。
     每轮调用: 缺失→INSERT / 状态变→UPDATE / 多余→DELETE。幂等。

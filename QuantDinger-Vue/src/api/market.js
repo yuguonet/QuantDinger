@@ -109,7 +109,7 @@ export function getWatchlistPrices (parameter) {
 }
 
 /**
- * 龙回头Pro: 今日分层信号 (action=买入/持仓/卖出, watch=观察池)
+ * 自动策略组: 今日分层信号 (action=买入/持仓/卖出, watch=观察池)
  */
 export function getDragonToday () {
   return request({
@@ -119,7 +119,7 @@ export function getDragonToday () {
 }
 
 /**
- * 龙回头Pro: K线图买卖点标记
+ * 自动策略组: K线图买卖点标记
  * @param parameter { symbol: string, days: number }
  */
 export function getDragonMarkers (parameter) {

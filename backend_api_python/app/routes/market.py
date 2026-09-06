@@ -52,7 +52,7 @@ def _normalize_symbol(symbol: str) -> str:
     return (symbol or '').strip().upper()
 
 DEFAULT_GROUP_NAME = '默认自选'
-STRATEGY_GROUP_NAME = '自动策略组'   # 引擎独占管理的策略组 (龙回头Pro/V1/断板 三策略共用, 勿手动增删)
+STRATEGY_GROUP_NAME = '自动策略组'   # 引擎独占管理的策略组 (龙回头/V1/断板/3板接力 共用, 勿手动增删)
 
 def _valid_group_name(name) -> tuple:
     """Return (normalized_name_or_None, error_msg). None name + '' msg means ok."""

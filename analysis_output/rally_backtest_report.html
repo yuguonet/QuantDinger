@@ -1,0 +1,500 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>快速拉升策略 D+1 回测报告 · 30个交易日</title>
+<style>
+:root{
+  --bg:#fafaf9; --ink:#141414; --muted:#6b6b6b; --hair:#d9d9d4;
+  --accent:#0f6b4f; --red:#a83232; --mono:'SF Mono','Cascadia Code',Consolas,'Courier New',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:'Source Han Serif SC','Noto Serif SC',Georgia,'Microsoft YaHei',serif;line-height:1.6;font-size:15px}
+.wrap{max-width:1080px;margin:0 auto;padding:56px 40px 80px}
+.kicker{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+h1{font-size:34px;font-weight:600;letter-spacing:-.01em;line-height:1.25;margin-bottom:10px}
+.sub{color:var(--muted);font-size:14px;margin-bottom:8px}
+.rule{border:0;border-top:1px solid var(--hair);margin:28px 0}
+h2{font-size:20px;font-weight:600;margin:40px 0 14px;letter-spacing:-.005em}
+h2 .no{font-family:var(--mono);font-size:12px;color:var(--accent);margin-right:10px;font-weight:400}
+p{margin-bottom:12px;max-width:74ch}
+.lede{font-size:17px;line-height:1.7;max-width:70ch}
+.metrics{display:flex;gap:0;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);margin:26px 0;flex-wrap:wrap}
+.metric{flex:1 1 130px;padding:18px 18px 16px 0;min-width:130px}
+.metric+.metric{padding-left:18px;border-left:1px solid var(--hair)}
+.metric .v{font-family:var(--mono);font-size:26px;font-weight:600;letter-spacing:-.02em}
+.metric .v.neg{color:var(--red)} .metric .v.pos{color:var(--accent)}
+.metric .k{font-size:11.5px;color:var(--muted);margin-top:4px;letter-spacing:.04em}
+table{width:100%;border-collapse:collapse;margin:16px 0 8px;font-size:13.5px}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);text-align:left;padding:8px 12px;border-bottom:1px solid var(--ink);font-weight:400}
+td{padding:8px 12px;border-bottom:1px solid var(--hair);font-variant-numeric:tabular-nums}
+td.num{font-family:var(--mono);font-size:12.5px}
+tr.hl td{background:rgba(15,107,79,.05)}
+.pos{color:var(--accent)} .neg{color:var(--red)}
+.callout{border:1px solid var(--hair);border-left:2px solid var(--accent);padding:16px 20px;margin:20px 0;max-width:78ch}
+.callout .t{font-weight:600;margin-bottom:6px}
+.callout.warn{border-left-color:var(--red)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:32px}
+@media(max-width:800px){.grid2{grid-template-columns:1fr}.wrap{padding:40px 20px}}
+ul.tight{margin:8px 0 14px 18px}
+ul.tight li{margin-bottom:6px}
+.chart{margin:22px 0}
+.bar-row{display:flex;align-items:center;gap:10px;margin-bottom:3px;font-family:var(--mono);font-size:11px}
+.bar-row .d{width:64px;color:var(--muted);flex-shrink:0}
+.bar-row .bar{height:12px;flex-shrink:0}
+.bar-row .val{color:var(--ink)}
+.foot{margin-top:56px;padding-top:16px;border-top:1px solid var(--hair);font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.06em}
+.note{font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="kicker">BACKTEST REPORT · CNSTOCK · 1-MINUTE BARS</div>
+  <h1>盘中快速拉升策略 · D+1 回测报告</h1>
+  <div class="sub">2026-07-27 ~ 2026-09-04 · 29 个交易日 · 145 笔交易 · 买入: 第90分钟收盘价 / 卖出: 次日开盘</div>
+  <div class="sub note">四维评分: 分钟级连续拉升(≥2%/分钟) + 放量拉升(≥1.2×5分钟均量) + 40日龙虎榜 + 预估日量/昨日量比 · 预筛: 昨日涨幅≥3% 且 量≥3万手 · 每日取 top-5</div>
+
+  <hr class="rule">
+
+  <div class="metrics">
+    <div class="metric"><div class="v neg">40.7%</div><div class="k">胜率 (59/145)</div></div>
+    <div class="metric"><div class="v neg">−1.15%</div><div class="k">平均收益</div></div>
+    <div class="metric"><div class="v">0.86</div><div class="k">盈亏比</div></div>
+    <div class="metric"><div class="v pos">+5.19%</div><div class="k">D+1 平均峰值</div></div>
+    <div class="metric"><div class="v">31%</div><div class="k">盈利日占比 (9/29)</div></div>
+  </div>
+
+  <h2><span class="no">01</span>核心结论</h2>
+  <p class="lede">策略在默认形态下<b>不具备正期望</b>：胜率 40.7%、均收益 −1.15%、盈亏比 0.86，三个指标同时恶化。但拆解后发现两个重要事实——</p>
+  <div class="callout"><div class="t">事实一：分数越高，输得越多（评分反向）</div>
+    <p>60-70 分段胜率 48.1%，70-80 段掉到 31.6%，80+ 段只有 28.6%。<b>当前评分体系与次日收益负相关</b>——得分越极端的股票，往往是日内已被爆炒、次日开盘接盘风险最大的票。用"分数越高越买"的方向选股是错的。</p>
+  </div>
+  <div class="callout"><div class="t">事实二：日内卖点真实存在，但开盘卖是下策</div>
+    <p>实际 D+1 开盘卖出均收益 −1.15%，而 D+1 盘中最高价平均可达 <b>+5.19%</b>；60% 的交易在 D+1 盘中曾达到 +3% 以上。<b>不是信号无效，是出场方式把浮盈全部还了回去</b>——次日开盘冲高回落是这批票的典型日内结构。</p>
+  </div>
+
+  <h2><span class="no">02</span>评分维度全部反向或无效</h2>
+  <table>
+    <thead><tr><th>维度</th><th>分段</th><th>n</th><th>胜率</th><th>均收益</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3">总分</td><td class="num">60-70</td><td class="num">81</td><td class="num">48.1%</td><td class="num">−0.52%</td><td>相对最好（仍为负）</td></tr>
+      <tr><td class="num">70-80</td><td class="num">57</td><td class="num">31.6%</td><td class="num">−1.94%</td><td>明显恶化</td></tr>
+      <tr><td class="num">80+</td><td class="num">7</td><td class="num">28.6%</td><td class="num">−1.92%</td><td>最差段</td></tr>
+      <tr><td rowspan="4">连续拉升</td><td class="num">0 连</td><td class="num">11</td><td class="num">54.5%</td><td class="num pos">+0.23%</td><td>唯一正收益组</td></tr>
+      <tr><td class="num">1 连</td><td class="num">89</td><td class="num">41.6%</td><td class="num">−1.26%</td><td>主体样本</td></tr>
+      <tr><td class="num">2 连</td><td class="num">36</td><td class="num">36.1%</td><td class="num">−1.37%</td><td>更差</td></tr>
+      <tr><td class="num">≥3 连</td><td class="num">9</td><td class="num">33.3%</td><td class="num">−1.90%</td><td>追高代价明显</td></tr>
+      <tr><td rowspan="3">预估量比</td><td class="num">1.5-2.0×</td><td class="num">24</td><td class="num">33.3%</td><td class="num">−2.28%</td><td>最差</td></tr>
+      <tr><td class="num">2.0-3.0×</td><td class="num">64</td><td class="num">42.2%</td><td class="num">−0.46%</td><td>中位</td></tr>
+      <tr><td class="num">3.0×</td><td class="num">57</td><td class="num">42.1%</td><td class="num">−1.45%</td><td>无增益</td></tr>
+      <tr><td rowspan="2">龙虎榜</td><td class="num">40日内有</td><td class="num">140</td><td class="num">40.0%</td><td class="num">−1.24%</td><td rowspan="2">预筛（涨3%+放量）已天然筛出活跃票，维度冗余</td></tr>
+      <tr><td class="num">无</td><td class="num">5</td><td class="num">60.0%</td><td class="num pos">+1.31%</td></tr>
+    </tbody>
+  </table>
+  <p class="note">结论：四个维度里没有一个与 D+1 收益正相关。"快速拉升 + 巨量" 的组合本质是在描述<b>已经涨完的票</b>。</p>
+
+  <h2><span class="no">03</span>日度分布：靠 9 个盈利日撑不住 20 个亏损日</h2>
+  <p>盈利日合计 +21.8%，亏损日合计 −55.1%。7/30（−11.4%）、9/2 与 9/3（0% 胜率，−5.1%/−7.8%）三类大跌日贡献了主要回撤——这些日子信号照常触发，但市场整体在杀高位票。</p>
+  <div class="chart">
+    <div class="bar-row"><span class="d">07-27</span><div class="bar" style="width:15px;background:var(--red)"></div><span class="val">−0.59%</span></div>
+    <div class="bar-row"><span class="d">07-28</span><div class="bar" style="width:102px;background:var(--red)"></div><span class="val">−3.83%</span></div>
+    <div class="bar-row"><span class="d">07-29</span><div class="bar" style="width:54px;background:var(--accent)"></div><span class="val">+2.04%</span></div>
+    <div class="bar-row"><span class="d">07-30</span><div class="bar" style="width:304px;background:var(--red)"></div><span class="val neg">−11.41%</span></div>
+    <div class="bar-row"><span class="d">07-31</span><div class="bar" style="width:118px;background:var(--red)"></div><span class="val">−4.43%</span></div>
+    <div class="bar-row"><span class="d">08-03</span><div class="bar" style="width:99px;background:var(--accent)"></div><span class="val">+3.73%</span></div>
+    <div class="bar-row"><span class="d">08-04</span><div class="bar" style="width:7px;background:var(--red)"></div><span class="val">−0.28%</span></div>
+    <div class="bar-row"><span class="d">08-05</span><div class="bar" style="width:19px;background:var(--red)"></div><span class="val">−0.73%</span></div>
+    <div class="bar-row"><span class="d">08-06</span><div class="bar" style="width:53px;background:var(--accent)"></div><span class="val">+2.00%</span></div>
+    <div class="bar-row"><span class="d">08-07</span><div class="bar" style="width:55px;background:var(--accent)"></div><span class="val">+2.06%</span></div>
+    <div class="bar-row"><span class="d">08-10</span><div class="bar" style="width:12px;background:var(--red)"></div><span class="val">−0.44%</span></div>
+    <div class="bar-row"><span class="d">08-11</span><div class="bar" style="width:58px;background:var(--red)"></div><span class="val">−2.17%</span></div>
+    <div class="bar-row"><span class="d">08-12</span><div class="bar" style="width:101px;background:var(--accent)"></div><span class="val">+3.78%</span></div>
+    <div class="bar-row"><span class="d">08-13</span><div class="bar" style="width:37px;background:var(--red)"></div><span class="val">−1.40%</span></div>
+    <div class="bar-row"><span class="d">08-14</span><div class="bar" style="width:32px;background:var(--red)"></div><span class="val">−1.19%</span></div>
+    <div class="bar-row"><span class="d">08-17</span><div class="bar" style="width:43px;background:var(--red)"></div><span class="val">−1.60%</span></div>
+    <div class="bar-row"><span class="d">08-18</span><div class="bar" style="width:12px;background:var(--red)"></div><span class="val">−0.44%</span></div>
+    <div class="bar-row"><span class="d">08-19</span><div class="bar" style="width:110px;background:var(--red)"></div><span class="val">−4.15%</span></div>
+    <div class="bar-row"><span class="d">08-20</span><div class="bar" style="width:131px;background:var(--red)"></div><span class="val">−4.93%</span></div>
+    <div class="bar-row"><span class="d">08-21</span><div class="bar" style="width:11px;background:var(--red)"></div><span class="val">−0.43%</span></div>
+    <div class="bar-row"><span class="d">08-24</span><div class="bar" style="width:39px;background:var(--red)"></div><span class="val">−1.46%</span></div>
+    <div class="bar-row"><span class="d">08-25</span><div class="bar" style="width:9px;background:var(--accent)"></div><span class="val">+0.34%</span></div>
+    <div class="bar-row"><span class="d">08-26</span><div class="bar" style="width:95px;background:var(--accent)"></div><span class="val">+3.58%</span></div>
+    <div class="bar-row"><span class="d">08-27</span><div class="bar" style="width:81px;background:var(--accent)"></div><span class="val">+3.04%</span></div>
+    <div class="bar-row"><span class="d">08-28</span><div class="bar" style="width:32px;background:var(--red)"></div><span class="val">−1.19%</span></div>
+    <div class="bar-row"><span class="d">08-31</span><div class="bar" style="width:40px;background:var(--red)"></div><span class="val">−1.50%</span></div>
+    <div class="bar-row"><span class="d">09-01</span><div class="bar" style="width:33px;background:var(--accent)"></div><span class="val">+1.23%</span></div>
+    <div class="bar-row"><span class="d">09-02</span><div class="bar" style="width:136px;background:var(--red)"></div><span class="val">−5.13%</span></div>
+    <div class="bar-row"><span class="d">09-03</span><div class="bar" style="width:208px;background:var(--red)"></div><span class="val neg">−7.82%</span></div>
+  </div>
+  <p class="note">绿=盈利日(9天) · 红=亏损日(20天)。日间方差极大，说明策略收益高度依赖市场环境，缺一个"今天该不该做"的开关。</p>
+
+  <h2><span class="no">04</span>头部与尾部交易</h2>
+  <div class="grid2">
+    <div>
+      <p style="font-weight:600;margin-bottom:8px">盈利 TOP5</p>
+      <table>
+        <thead><tr><th>股票</th><th>买入</th><th>卖出</th><th>收益</th></tr></thead>
+        <tbody>
+          <tr><td>肯特股份</td><td class="num">50.40</td><td class="num">57.45</td><td class="num pos">+13.99%</td></tr>
+          <tr><td>香江控股</td><td class="num">5.36</td><td class="num">5.90</td><td class="num pos">+10.07%</td></tr>
+          <tr><td>皇氏集团</td><td class="num">4.20</td><td class="num">4.62</td><td class="num pos">+10.00%</td></tr>
+          <tr><td>共进股份</td><td class="num">17.56</td><td class="num">19.26</td><td class="num pos">+9.68%</td></tr>
+          <tr><td>蜀道装备</td><td class="num">30.66</td><td class="num">33.53</td><td class="num pos">+9.36%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <p style="font-weight:600;margin-bottom:8px">亏损 TOP5</p>
+      <table>
+        <thead><tr><th>股票</th><th>买入</th><th>卖出</th><th>收益</th></tr></thead>
+        <tbody>
+          <tr><td>哈三联</td><td class="num">16.46</td><td class="num">13.77</td><td class="num neg">−16.34%</td></tr>
+          <tr><td>艾艾精工</td><td class="num">59.53</td><td class="num">50.60</td><td class="num neg">−15.00%</td></tr>
+          <tr><td>欢乐家</td><td class="num">18.54</td><td class="num">16.15</td><td class="num neg">−12.89%</td></tr>
+          <tr><td>大晟文化</td><td class="num">5.59</td><td class="num">4.91</td><td class="num neg">−12.16%</td></tr>
+          <tr><td>万邦医药</td><td class="num">81.16</td><td class="num">71.52</td><td class="num neg">−11.88%</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <p class="note">单笔最大亏损 −16.3%，无止损的隔夜持有风险显著；单笔最大盈利 +14.0%。盈亏尾部对称，但胜率撑不起正期望。</p>
+
+  <h2><span class="no">05</span>追涨入场 A/B：首次信号下一分钟买入更差</h2>
+  <p>按用户要求改造为追涨模式：逐分钟增量扫描，当日行为分首次达标后的<b>下一分钟收盘价追入</b>。三种入场方式同池对比（同为 145 笔）：
+  </p>
+  <table>
+    <thead><tr><th>入场方式</th><th>胜率</th><th>均收益</th><th>盈亏比</th><th>D+1峰值</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>基准：第90分钟收盘买入</td><td class="num">40.7%</td><td class="num">−1.15%</td><td class="num">0.86</td><td class="num">+5.19%</td><td>三者中最好</td></tr>
+      <tr><td>追涨 v1：行为分≥5 即触发</td><td class="num">35.9%</td><td class="num">−1.25%</td><td class="num">1.02</td><td class="num">+3.56%</td><td>100% 在 10:00 即触发，无区分度</td></tr>
+      <tr><td>追涨 v2：须真实分钟拉升（≥2%）触发</td><td class="num">22.8%</td><td class="num neg">−3.39%</td><td class="num">0.68</td><td class="num">+2.73%</td><td>最差：追的是接力盘</td></tr>
+    </tbody>
+  </table>
+  <p class="note">v2 细分：信号越晚越差 —— 10:00-10:30 触发 n=63 胜率22.2%；14:00 后触发 n=11 胜率 <b>0%</b> 均 −5.96%；信号时预估量比≥4×的组 n=91 胜率仅 28.6%。</p>
+  <div class="callout warn"><div class="t">追涨为什么反而更差</div>
+    <p>预筛池本身就是“昨日已涨 3%+ 且放量”的票，分钟级再拉升意味着日内涨幅已高、分时已脱离均线。此时追入的成本比 10:30/11:00 的基准入场更贵，而 D+1 开盘定价对“日内过热票”系统性压价。<b>在这批票上，分钟级急拉更像出货信号而不是启动信号。</b>追涨入场把胜率从 40.7% 打到 22.8%，是在最贵的价位接最后一棒。</p>
+  </div>
+
+  <h2><span class="no">06</span>改进建议（按优先级）</h2>
+  <div class="callout"><div class="t">① 改出场：开盘卖 → 盘中条件卖（最高优先级，确定性最高）</div>
+    <p>D+1 均值 +5.19% 的峰值说明浮盈是真实存在的。建议改为：<b>开盘价高于 +3% 直接卖</b>；否则挂 VWAP+2% 条件单，11:00 前未触发则 14:45 收盘前无条件离场。粗算若能捕获峰值的一半（+2.6%），策略即可翻正。</p>
+  </div>
+  <div class="callout"><div class="t">② 反用评分：不要追最高分</div>
+    <p>数据支持在 60-70 分段内选择，主动放弃 75+ 的极端票；或者把"连续拉升≥3分钟"作为<b>排除项</b>而非加分项。若做反向实验：买入分数最低的合格票，值得单独回测。</p>
+  </div>
+  <div class="callout warn"><div class="t">③ 加环境开关：亏损日集中出现时停做</div>
+    <p>7/30、9/2、9/3 三天合计拖累 −24.4%。建议接入前一日市场宽度指标（如全市场涨跌家数比、高位票连板高度），情绪冰点日直接不开仓。</p>
+  </div>
+  <div class="callout"><div class="t">④ 精简维度</div>
+    <p>龙虎榜维度在预筛后贡献为零（95% 样本天然有榜），可移除；预估量比只保留 ≥2.0× 档；拉升得分降权或反转。</p>
+  </div>
+
+  <div class="callout"><div class="t">⑤ 追涨入场的修正方向（若坚持追涨）</div>
+    <p>数据不支持在“昨日已涨”的票上追日内急拉，但有两个例外值得单独回测：① 信号时刻 est_ratio ≤ 2.5× 的组（胜率 72.7%，均 +1.10%，n=11）—— 放量温和的首次急拉远好于爆量急拉；② 开盘 30 分钟内的首拉（10:00-10:30 组优于午后组）。追涨若要活下来，必须加“日内涨幅仍低”约束，避免在 5%+ 的日内高度上接力。</p>
+  </div>
+
+  <h2><span class="no">07</span>追涨停板：昨日涨停池 + 开盘30分钟首拉追入</h2>
+  <p>按打板打法重构：池子换成<b>昨日涨停票</b>（主板≥9.8%/创科≥19.8%，排除北交所与ST，日均 75 只），信号窗口压缩到开盘 30 分钟内首次分钟急拉（≥2%），信号下一分钟追入，次日开盘卖。</p>
+  <div class="metrics">
+    <div class="metric"><div class="v neg">36.6%</div><div class="k">胜率 (145笔)</div></div>
+    <div class="metric"><div class="v neg">−1.18%</div><div class="k">平均收益</div></div>
+    <div class="metric"><div class="v">1.08</div><div class="k">盈亏比</div></div>
+    <div class="metric"><div class="v">94%</div><div class="k">追入后当日封板率</div></div>
+    <div class="metric"><div class="v neg">78%</div><div class="k">入场价在涨停价(排队)</div></div>
+  </div>
+  <p>封板组 D+1 胜率 36.0%、均 −1.25%；炸板组反而 −0.12%。封板组 D+1 开盘溢价分布呈典型打板肥尾：<b>53% 低开</b>（其中 29% 低开超 5%），但 11% 高开 8%+（均 +13.40%）、8% 高开 3-8%（均 +7.56%）——赚钱全靠少数大肉，锫子被多数低开吃掉。</p>
+  <table>
+    <thead><tr><th>变体</th><th>n</th><th>胜率</th><th>均收益</th><th>发现</th></tr></thead>
+    <tbody>
+      <tr><td>基线：30分钟窗口</td><td class="num">145</td><td class="num">36.6%</td><td class="num">−1.18%</td><td>—</td></tr>
+      <tr><td>只做前10分钟</td><td class="num">145</td><td class="num">34.5%</td><td class="num">−1.53%</td><td>窗口压缩无改善（信号本来就集中在早段）</td></tr>
+      <tr><td>限日内涨幅&lt;7%（低位首拉）</td><td class="num">51</td><td class="num">37.3%</td><td class="num">−1.24%</td><td>封板组胜率升至 50%，炸板组拖累 −2.34%</td></tr>
+      <tr class="hl"><td>信号时日内涨幅 2-5%（温和首拉）</td><td class="num">5~21</td><td class="num">47.6~80%</td><td class="num">−0.05~+4.18%</td><td>唯一接近正期望的子集，但样本太少</td></tr>
+    </tbody>
+  </table>
+  <p class="note">时段细分：09:31-40 触发胜率 42.6% → 09:40-50 37.7% → 09:50-10:00 仅 16.7%（越晚越差，晚信号是共振板尾）。信号时日内涨幅 8%+ 的组占 88% 样本——首拉信号在昨日涨停票上天然发生在高位。</p>
+  <h2><span class="no">08</span>“日内涨幅仍低”约束验证（全量 649 信号切片）</h2>
+  <p>解除 top-5 限制后拿到 29 天全量 649 个信号的带结果全集，按信号时日内涨幅细切：</p>
+  <table>
+    <thead><tr><th>信号时日内涨幅</th><th>n</th><th>胜率</th><th>均收益</th><th>盈亏比</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td class="num">2-3%</td><td class="num">6</td><td class="num">50.0%</td><td class="num pos">+1.61%</td><td class="num">2.61</td></tr>
+      <tr><td class="num">3-4%</td><td class="num">6</td><td class="num">50.0%</td><td class="num">−0.22%</td><td class="num">0.90</td></tr>
+      <tr><td class="num">4-5%</td><td class="num">8</td><td class="num">37.5%</td><td class="num">−1.35%</td><td class="num">1.00</td></tr>
+      <tr><td class="num">5-7%</td><td class="num">27</td><td class="num">29.6%</td><td class="num">−2.07%</td><td class="num">0.93</td></tr>
+      <tr><td class="num">7-9%</td><td class="num">44</td><td class="num">36.4%</td><td class="num">−1.03%</td><td class="num">0.66</td></tr>
+      <tr><td class="num">9-10%</td><td class="num">32</td><td class="num">46.9%</td><td class="num">+0.01%</td><td class="num">1.14</td></tr>
+      <tr><td class="num">10%+（主力区间）</td><td class="num">522</td><td class="num">36.6%</td><td class="num">−1.30%</td><td class="num">1.03</td></tr>
+    </tbody>
+  </table>
+  <p class="note">U 型结构确认：低位首拉（2-3%）和高位抢板（9-10%，几乎直接上板）两端接近正收益，中间 5-9% 是最差区间——半山腰接力最危险。但低位端 30 天仅 22 只（日均 0.8 只），稀缺性是它的问题。</p>
+
+  <h3 style="font-size:16px;margin:24px 0 10px">封板拆分 + 出场规则（关键发现）</h3>
+  <p>低位组（信号时 &lt;5%）按当日是否封板拆分：<b>封板组 n=9 胜率 77.8%、均 +2.19%；炸板组 n=13 胜率 23.1%、均 −1.83%</b>。封板与否几乎完全决定了结局——由此引出出场规则实验：</p>
+  <table>
+    <thead><tr><th>出场规则</th><th>n</th><th>胜率</th><th>均收益</th></tr></thead>
+    <tbody>
+      <tr><td>日内涨幅&lt;6%，全部持有到 D+1 开盘</td><td class="num">36</td><td class="num">52.8%</td><td class="num">−0.36%</td></tr>
+      <tr class="hl"><td>日内涨幅&lt;6%，<b>未封板当日尾盘出 / 封板拿到次日开盘</b></td><td class="num">36</td><td class="num">52.8%</td><td class="num pos">−0.36% → 尾盘出部分均 −0.99% vs −2.15%</td></tr>
+    </tbody>
+  </table>
+  <p class="note">未封板组逐笔对比：尾盘出比拿到 D+1 开盘<b>每笔平均省 1.15%</b>（18 笔中 13 笔更优）。未封板 = 拉升失败，隔夜只会更差。</p>
+
+  <h2><span class="no">09</span>T+1 约束下的规则重构（出场统一为次日开盘卖）</h2>
+  <p>A股 T+1：当日买入不可当日卖，“尾盘出”只对底仓有效。取消该假设后，把全部 649 个信号按“<b>全持有到 D+1 开盘</b>”口径重新寻优，目标：胜率 + 封板率。</p>
+  <div class="metrics">
+    <div class="metric"><div class="v">63.6%</div><div class="k">胜率（终版规则 n=11）</div></div>
+    <div class="metric"><div class="v">100%</div><div class="k">封板率（定义内含）</div></div>
+    <div class="metric"><div class="v pos">+1.41%</div><div class="k">均收益</div></div>
+    <div class="metric"><div class="v">0.4只/日</div><div class="k">信号频率</div></div>
+  </div>
+  <h3 style="font-size:16px;margin:24px 0 10px">终版规则（四道过滤器）</h3>
+  <table>
+    <thead><tr><th>#</th><th>过滤器</th><th>淘汰了什么</th><th>依据</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td>昨日涨停池</td><td>非涨停票</td><td>打板策略基础池，日均 75 只</td></tr>
+      <tr><td class="num">2</td><td>开盘前 8 分钟内首次分钟急拉 ≥2%</td><td>09:40 后的共振板尾（胜率 25-37%）</td><td>时段越早越准；前 6 分钟 n=13 胜率 69.2%</td></tr>
+      <tr><td class="num">3</td><td>信号时日内涨幅 &lt;5.5%</td><td>半山腰接力（5-9% 区间胜率 30-36%，最差）</td><td>U 型结构：低位首拉与贴板两端才不亏</td></tr>
+      <tr><td class="num">4</td><td>当日封板确认（持有型）</td><td>炸板组（胜率 23.8%、均 −2.25%）</td><td>封板组 37.9% vs 炸板组 23.8%</td></tr>
+    </tbody>
+  </table>
+  <p class="note">实盘语义：开盘 8 分钟内急拉 &lt;5.5% 的昨日涨停票，追入后<b>只在封板时持有到次日</b>；若盘口显示无法封板（回封失败），T+1 虽不能当日卖，但该笔信号不再追加——即“信号有效当且仅当日封板”。同时验证过的反向排除项：急拉幅度 ≥5% 的凶悍拉板（n=26 胜率 30.8%、均 −4.04%）与预估量比 &gt;3× 的爆量首拉（剔除后主线 12 笔胜率升至 66.7%）都是出货型拉升，主动避开。</p>
+
+  <h3 style="font-size:16px;margin:24px 0 10px">规则阶梯（封板条件口径，第 10 章有条件性偏差更正）</h3>
+  <table>
+    <thead><tr><th>规则</th><th>n</th><th>胜率</th><th>均收益</th><th>盈亏比</th></tr></thead>
+    <tbody>
+      <tr><td>基线（无过滤）</td><td class="num">649</td><td class="num">37.0%</td><td class="num">−1.22%</td><td class="num">1.02</td></tr>
+      <tr><td>+ 当日封板确认</td><td class="num">607</td><td class="num">37.9%</td><td class="num">−1.15%</td><td class="num">1.03</td></tr>
+      <tr><td>+ 日内涨幅&lt;6%</td><td class="num">18</td><td class="num">55.6%</td><td class="num">+0.27%</td><td class="num">0.89</td></tr>
+      <tr><td>+ 前 10 分钟</td><td class="num">16</td><td class="num">56.2%</td><td class="num">+0.95%</td><td class="num">1.18</td></tr>
+      <tr class="hl"><td>+ 前 8 分钟 + 涨幅&lt;5.5%（终版）</td><td class="num">11</td><td class="num">63.6%</td><td class="num pos">+1.41%</td><td class="num">0.98</td></tr>
+      <tr><td>参考：gain&lt;4% + 封板（极严）</td><td class="num">5</td><td class="num">80.0%</td><td class="num pos">+2.12%</td><td class="num">1.21</td></tr>
+    </tbody>
+  </table>
+  <p class="note">按周稳定性（主线 16 笔口径）：W31 −1.63% → W33 +3.99% → W34 +6.36%，方向未翻转但有环境依赖。终版 11 笔中含 +13.77%、+12.42% 两笔大肉与 −10.11% 一笔深亏，肥尾特征仍在。样本量 11–16 笔属于方向性证据，非统计显著；建议先模拟盘跟踪 2-4 周。</p>
+
+
+  <div class="callout warn"><div class="t">不可回避的局限</div>
+    <p>① n=11，30 天窗口内只有 11 次机会；② +1.42% 未扣手续费与滑点；③ 网格扫描有多重比较偏差。解法只有一种：接下来 2-4 周用模拟盘按固定规则前向验证，期间不改参数。</p>
+  </div>
+  <h2><span class="no">10</span>成交性与条件性偏差修正（对第 09 章的重要更正）</h2>
+  <div class="callout"><div class="t">A. 入场成交性：极严版买得进</div>
+    <p>极严版（日内涨幅&lt;4%）入场价距涨停<b>中位 8.2%、最近 5.7%</b>，14 笔全部不是在涨停价上买入 —— 之前 78% 买不进的问题只存在于无涨幅约束的基线（追的就是贴板票）。低位首拉规则天然在“离板还有一段距离”的位置入场，成交无障碍。</p>
+  </div>
+  <div class="callout warn"><div class="t">B. 真正的坑：封板确认是事后信息</div>
+    <p>上一章的 63.6%/80% 胜率是<b>封板子集的条件期望</b> —— 但 T+1 下买入那一刻不知道今天封不封得上，炸了也只能拿过夜。真实期望必须用无条件口径（封板+炸板混在一起）：</p>
+    <table>
+      <thead><tr><th>规则</th><th>n</th><th>胜率</th><th>均收益</th><th>封板占比</th></tr></thead>
+      <tbody>
+        <tr class="hl"><td>极严：涨幅&lt;4%（无条件）</td><td class="num">14</td><td class="num">50.0%</td><td class="num pos">+0.48%</td><td class="num">36%</td></tr>
+        <tr><td>　其中：封板子集（事后才知）</td><td class="num">5</td><td class="num">80.0%</td><td class="num">+2.12%</td><td class="num">—</td></tr>
+        <tr><td>　其中：炸板子集</td><td class="num">9</td><td class="num">33.3%</td><td class="num">−0.43%</td><td class="num">—</td></tr>
+        <tr><td>终版：涨幅&lt;5.5%+前8分钟（无条件）</td><td class="num">25</td><td class="num">40.0%</td><td class="num">−0.62%</td><td class="num">44%</td></tr>
+        <tr><td>稳健：涨幅&lt;6%+前10分钟（无条件）</td><td class="num">31</td><td class="num">38.7%</td><td class="num">−0.73%</td><td class="num">52%</td></tr>
+      </tbody>
+    </table>
+    <p class="note">炸板组在 T+1 下拖累显著：终版炸板 14 笔胜率仅 21.4%（均 −2.22%）。“封板才持有”在 T+1 下不可执行，只能作资金管理参考（封板后可加仓、不封不追加），不能当入场过滤条件。</p>
+  </div>
+  <div class="callout"><div class="t">C. 修正后的实战结论</div>
+    <p>在“全持有到 D+1 开盘”硬约束下，<b>极严版（昨日涨停池 + 开盘早段急拉 + 信号时日内涨幅&lt;4%）是唯一无条件正期望规则：胜率 50.0%、均 +0.48%、n=14（日均 0.5 只）</b>。它 64% 的信号会炸板，但炸板组亏得少（−0.43%）、封板组赚得多（+2.12%），盈亏比 1.31 兜住了。附加发现：入场后 5-30 分钟才封板的 D+1 不如 30 分钟后才封的（慢封 = 抛压消化更充分）。样本 14 笔仍是方向性证据，滑点手续费未计入 —— 模拟盘验证仍是前置条件。</p>
+  </div>
+
+
+  <h2><span class="no">11</span>最终裁决：无条件期望下的规则网格扫描</h2>
+  <p>为全部 649 个信号补齐 10 个日线前置特征（连板高度 / MA 排列 / MA60 斜率 / 涨停日量比 / 光头板 / RSI14 / 20日涨幅 / 距60日高 / 换手率 / 涨停日量比）与 6 个分时特征（VWAP偏离 / 高开缺口 / 拉前趋势 / 拉升量比 / 距低点拉升 / 开盘相对强度），在最优基础池（涨幅&lt;3.5%）上做切片检验。</p>
+  <h3 style="font-size:16px;margin:24px 0 10px">特征区分度（基础池 n=11，基线：胜率 54.5%、均 +1.42%）</h3>
+  <table>
+    <thead><tr><th>特征</th><th>YES 组</th><th>NO 组</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>MA 多头排列</b></td><td class="num">n=7　胜率 71.4%　均 +2.96%</td><td class="num">n=4　胜率 25.0%　均 −1.27%</td><td>最强区分</td></tr>
+      <tr><td>涨停日量比 &lt;2（温和板）</td><td class="num">n=6　胜率 66.7%　均 +1.87%</td><td class="num">n=5　胜率 40.0%　均 +0.88%</td><td>有效</td></tr>
+      <tr><td>MA60 斜率 &gt;0</td><td class="num">n=8　胜率 62.5%　均 +2.32%</td><td class="num">n=3　胜率 33.3%　均 −0.99%</td><td>有效但与MA多头重叠</td></tr>
+      <tr><td>换手率 5-15%</td><td class="num">n=7　胜率 57.1%　均 +1.95%</td><td class="num">n=4　胜率 50.0%　均 +0.50%</td><td>弱区分</td></tr>
+      <tr><td>拉升分钟量比 &lt;2</td><td class="num">n=4　胜率 75.0%　均 +3.15%</td><td class="num">n=7　胜率 42.9%　均 +0.43%</td><td>方向对但样本过小</td></tr>
+      <tr><td>价格 &gt; VWAP</td><td class="num">n=4　胜率 50.0%　均 +3.27%</td><td class="num">n=7　胜率 57.1%　均 +0.36%</td><td>均收益高但胜率反低，小样本噪声</td></tr>
+      <tr><td>连板高度 / 光头板 / RSI / 20日涨幅</td><td class="num">—</td><td class="num">—</td><td>无稳定区分（池内分布单一）</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><div class="t">泛化性检验：增益是否只在低位段成立？</div>
+    <p>MA 多头在各涨幅段的对比：&lt;3.5% 段 +2.96% vs −1.27%（强增益）→ 3.5-5% 段反而反转（20% vs 50%）→ 全样本 36.5% vs 37.1%（无增益）。<b>结论：MA 多头是“低位首拉专属”的交互特征，不是普适因子</b>——它只在低位接力场景下有意义。温和板同样只在 &lt;3.5% 段有效。这个交互性恰好与策略场景匹配，但意味着一旦市场风格转向中位接力，过滤器会失效。</p>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="v">80%</div><div class="k">胜率（叠加两过滤 n=5）</div></div>
+    <div class="metric"><div class="v pos">+2.38%</div><div class="k">均收益</div></div>
+    <div class="metric"><div class="v">0.2只/日</div><div class="k">信号频率（月4-6只）</div></div>
+    <div class="metric"><div class="v">6/9</div><div class="k">被过滤的正确率</div></div>
+  </div>
+  <div class="callout"><div class="t">叠加过滤器后的终版（v2）</div>
+    <p>基础规则（涨幅&lt;3.5%）上叠加：① <b>MA 多头排列</b>（MA5&gt;MA10&gt;MA20&gt;MA60，日级）；② <b>涨停日量比 &lt;2</b>（昨日涨停不放爆量）。结果：n=5，胜率 <b>80%</b>，均收益 <b>+2.38%</b>。被过滤掉的 9 笔中 6 笔亏损（含 −7.35% 天禾股份），只错过 +9.86% 中关村与 +2.25% 魅视科技两笔盈利。</p>
+  </div>
+  <div class="callout warn"><div class="t">诚实的警告</div>
+    <p>n=5 已是<b>轶事级样本</b>——80% 胜率这个数字本身没有统计意义（5 笔全对也可能是运气）。可信的是过滤方向（MA 多头 + 温和板在低位段的方向性增益在两个独立特征上交叉验证），不可信的是具体数值。建议：以“涨幅&lt;3.5% + MA 多头”为主规则（n=7 略大），温和板作为可选加分项，模拟盘累积到 20+ 笔再评估。</p>
+  </div>
+  <p>修正条件性偏差后重新回答“哪个规则最好”：对全部规则组合做无条件口径（买入即算）网格扫描。结论：<b>第 09 章的“终版”不是最优</b>——它的无条件期望是 −0.62%。真正站得住的是涨幅上限更严的极简规则：</p>
+  <table>
+    <thead><tr><th>规则（无条件口径）</th><th>n</th><th>胜率</th><th>均收益</th><th>盈亏比</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>涨幅&lt;3.5%（最优）</b></td><td class="num">11</td><td class="num">54.5%</td><td class="num pos">+1.42%</td><td class="num">2.03</td></tr>
+      <tr><td>涨幅&lt;3%</td><td class="num">8</td><td class="num">50.0%</td><td class="num pos">+1.01%</td><td class="num">2.00</td></tr>
+      <tr><td>涨幅&lt;4% + 前13分钟</td><td class="num">12</td><td class="num">58.3%</td><td class="num pos">+0.80%</td><td class="num">1.07</td></tr>
+      <tr><td>涨幅&lt;4% + 前8分钟</td><td class="num">10</td><td class="num">60.0%</td><td class="num pos">+0.73%</td><td class="num">0.96</td></tr>
+      <tr><td>涨幅&lt;4.5% + 前13分钟</td><td class="num">17</td><td class="num">58.8%</td><td class="num pos">+0.68%</td><td class="num">0.94</td></tr>
+      <tr><td>涨幅&lt;5.5%（原终版）</td><td class="num">29</td><td class="num">37.9%</td><td class="num">−0.56%</td><td class="num">1.21</td></tr>
+      <tr><td>涨幅&lt;5.5% + 前8分钟（原终版）</td><td class="num">25</td><td class="num">40.0%</td><td class="num">−0.62%</td><td class="num">1.08</td></tr>
+    </tbody>
+  </table>
+  <p class="note">两条清晰规律：① 涨幅上限越严越赚，<b>5% 是盈亏分水岭</b>（上限 ≥5% 的所有规则均收益全负）；② 在严涨幅约束下时间窗几乎无增益（这些信号本来就集中在开盘早段），前 8/10/13 分钟的结果差异只是样本噪声。</p>
+  <div class="callout"><div class="t">最终推荐规则（T+1 可执行，无条件口径）</div>
+    <p>池：昨日涨停票 → 信号：开盘 30 分钟内首次分钟急拉 ≥2%，信号时日内涨幅 &lt;3.5% → 入场：下一分钟追入 → 出场：次日开盘卖（无任何条件性假设）。</p>
+    <p style="margin-top:8px"><b>n=11，胜率 54.5%，均收益 +1.42%，盈亏比 2.03，日均 0.4 只。</b>按周：W31 +1.12% → W33 −0.54% → W34 +1.72% → W35 +9.86%，仅一周微亏。有趣的是封板率只有 36%，但炸板组里出现了 +5.03%、+9.86% 的反包大肉——这个策略赚的不只是“封板溢价”，更多是“低位首拉后市场关注度提升”的溢价。</p>
+  </div>
+  <h2><span class="no">12</span>特征工程：前置日线过滤 + 技术指标提胜率</h2>
+  <p>为全部 649 个信号补齐 10 个日线前置特征（连板高度 / MA 排列 / MA60 斜率 / 涨停日量比 / 光头板 / RSI14 / 20日涨幅 / 距60日高 / 换手率）与 6 个分时特征（VWAP偏离 / 高开缺口 / 拉前趋势 / 拉升量比 / 距低点拉升 / 开盘相对强度），在最优基础池（涨幅&lt;3.5%）上做切片检验。</p>
+  <h3 style="font-size:16px;margin:24px 0 10px">特征区分度（基础池 n=11，基线：胜率 54.5%、均 +1.42%）</h3>
+  <table>
+    <thead><tr><th>特征</th><th>YES 组</th><th>NO 组</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>MA 多头排列</b></td><td class="num">n=7　胜率 71.4%　均 +2.96%</td><td class="num">n=4　胜率 25.0%　均 −1.27%</td><td>最强区分</td></tr>
+      <tr><td>涨停日量比 &lt;2（温和板）</td><td class="num">n=6　胜率 66.7%　均 +1.87%</td><td class="num">n=5　胜率 40.0%　均 +0.88%</td><td>有效</td></tr>
+      <tr><td>MA60 斜率 &gt;0</td><td class="num">n=8　胜率 62.5%　均 +2.32%</td><td class="num">n=3　胜率 33.3%　均 −0.99%</td><td>有效但与MA多头重叠</td></tr>
+      <tr><td>换手率 5-15%</td><td class="num">n=7　胜率 57.1%　均 +1.95%</td><td class="num">n=4　胜率 50.0%　均 +0.50%</td><td>弱区分</td></tr>
+      <tr><td>拉升分钟量比 &lt;2</td><td class="num">n=4　胜率 75.0%　均 +3.15%</td><td class="num">n=7　胜率 42.9%　均 +0.43%</td><td>方向对但样本过小</td></tr>
+      <tr><td>价格 &gt; VWAP</td><td class="num">n=4　胜率 50.0%　均 +3.27%</td><td class="num">n=7　胜率 57.1%　均 +0.36%</td><td>均收益高但胜率反低，小样本噪声</td></tr>
+      <tr><td>连板高度 / 光头板 / RSI / 20日涨幅</td><td class="num">—</td><td class="num">—</td><td>无稳定区分</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><div class="t">泛化性检验：增益是否只在低位段成立？</div>
+    <p>MA 多头在各涨幅段的表现：&lt;3.5% 段 +2.96% vs −1.27%（强增益）→ 3.5-5% 段反转（20% vs 50%）→ 全样本 36.5% vs 37.1%（无增益）。<b>MA 多头是"低位首拉专属"的交互特征，不是普适因子</b>——恰好与策略场景匹配，但市场风格转向中位接力时会失效。温和板同样只在 &lt;3.5% 段有效。</p>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="v">80%</div><div class="k">胜率（叠加两过滤 n=5）</div></div>
+    <div class="metric"><div class="v pos">+2.38%</div><div class="k">均收益</div></div>
+    <div class="metric"><div class="v">0.2只/日</div><div class="k">信号频率（月4-6只）</div></div>
+    <div class="metric"><div class="v">6/9</div><div class="k">被过滤的正确率</div></div>
+  </div>
+  <div class="callout"><div class="t">叠加过滤器后的终版（v2）</div>
+    <p>基础规则（涨幅&lt;3.5%）叠加：① <b>MA 多头排列</b>（MA5&gt;MA10&gt;MA20&gt;MA60）；② <b>涨停日量比 &lt;2</b>（昨日涨停不放爆量）。结果：n=5，胜率 <b>80%</b>，均收益 <b>+2.38%</b>。被过滤掉的 9 笔中 6 笔亏损（含 −7.35% 天禾股份），只错过 +9.86% 中关村与 +2.25% 魅视科技。</p>
+  </div>
+  <div class="callout warn"><div class="t">诚实的警告</div>
+    <p>n=5 已是<b>轶事级样本</b>——80% 胜率这个数字没有统计意义（5 笔全对也可能是运气）。可信的是过滤方向（两个独立特征在低位段的交叉验证），不可信的是具体数值。建议：以"涨幅&lt;3.5% + MA 多头"为主规则（n=7 略大），温和板作为可选加分项，模拟盘累积到 20+ 笔再评估。</p>
+  </div>
+
+
+
+  <h2><span class="no">13</span>全新策略空间：全量特征扫描 + 竞价接力期望地图</h2>
+  <p>跳出“盘中首拉”框架做两个全新分析：① 649 信号全量特征系统扫描（不限涨幅段，找任何 n≥30 且胜率≥50% 的区间）；② 换入场方式的<b>竞价接力</b>——昨日涨停票开盘直接买（不需要任何盘中信号），2222 个样本，按高开幅度 × 板高 × 昨日量能 × RSI 建全期望地图。</p>
+  <h3 style="font-size:16px;margin:24px 0 10px">扫描一：盘中首拉加特征救不回来</h3>
+  <p>34 个特征切片里几乎全部为负，唯一接近零的是“信号时涨幅 9-11%”（+0.01%，n=61）与“20日涨幅&lt;10%”（+0.08%，n=165）。<b>结论：盘中追拉这个入场方式本身在 30 天窗口是负期望，问题不在特征在入场价</b>——等信号出现时，肉已经被别人吃了。</p>
+  <h3 style="font-size:16px;margin:24px 0 10px">扫描二：竞价接力的期望地图（n=2222）</h3>
+  <div class="metrics">
+    <div class="metric"><div class="v">44.7%</div><div class="k">总体胜率</div></div>
+    <div class="metric"><div class="v neg">−0.13%</div><div class="k">总体均收益</div></div>
+    <div class="metric"><div class="v">2222</div><div class="k">样本量（30天×昨日涨停票）</div></div>
+    <div class="metric"><div class="v pos">2.9倍</div><div class="k">优于盘中追拉</div></div>
+  </div>
+  <table>
+    <thead><tr><th>维度切片</th><th>n</th><th>胜率</th><th>均收益</th></tr></thead>
+    <tbody>
+      <tr><td>高开 2-4%（最佳缺口区间）</td><td class="num">25</td><td class="num">64.0%</td><td class="num pos">+0.78%</td></tr>
+      <tr><td>高开 4-6%</td><td class="num">85</td><td class="num">49.4%</td><td class="num">−0.09%</td></tr>
+      <tr><td>高开 6-8%</td><td class="num">237</td><td class="num">42.6%</td><td class="num">−0.36%</td></tr>
+      <tr><td>高开 8-9.9%（大高开）</td><td class="num">309</td><td class="num">40.1%</td><td class="num">−0.97%</td></tr>
+      <tr><td>2板 / 4板+（板高）</td><td class="num">265 / 71</td><td class="num">51.7% / 52.1%</td><td class="num pos">+0.30% / +0.90%</td></tr>
+      <tr><td>缩量板（昨日量比&lt;1）</td><td class="num">552</td><td class="num">49.5%</td><td class="num pos">+0.27%</td></tr>
+      <tr><td>RSI&lt;70（未超买）</td><td class="num">1294</td><td class="num">47.6%</td><td class="num pos">+0.32%</td></tr>
+      <tr><td>光头板（收盘=最高）</td><td class="num">220</td><td class="num">51.8%</td><td class="num pos">+0.63%</td></tr>
+      <tr class="hl"><td><b>缩量板 + RSI&lt;70</b></td><td class="num">368</td><td class="num">51.6%</td><td class="num pos">+0.86%（盈亏比 1.26）</td></tr>
+    </tbody>
+  </table>
+  <p class="note">高开越少越赚：6-9.9% 的大高开接力是重灾区（−0.36%~-0.97%）——竞价追高开本质上是在为别人的先手溢价买单。</p>
+  <div class="callout"><div class="t">真正的强发现：情绪温度效应压倒一切</div>
+    <p>把每天的“昨日涨停票数量”当作情绪温度计，效果惊人：<b>池子 &lt;60 只（情绪冰点）的日子，当日接力均收益显著为正</b>（7/27 +2.36%、8/12 +2.89%、8/17 +2.27%、8/27 +3.15%）；<b>池子 &gt;100 只（涨停潮）的日子接力系统性亏损</b>（7/29 −2.29%、8/19 −4.23%、9/02 −2.09%）。这就是情绪周期反转逻辑的量化体现：冰点次日接修复，高潮次日接兑现。环境效应远大于个股特征——同一规则在不同周相差 3.6%（W32 +1.90% vs W34 −1.70%）。</p>
+  </div>
+  <div class="callout"><div class="t">接力策略候选（供下一轮验证）</div>
+    <p>① 基础：缩量板（昨日涨停量比&lt;1）+ RSI&lt;70，n=368、胜率 51.6%、均 +0.86%——样本充足但需要叠加情绪过滤；② 叠加情绪温度：仅在前一日涨停池 &lt;60 只时执行，历史胜率与收益显著抬升；③ 另一条线：2板/4板+ 的中高位接力是正期望（+0.30%/+0.90%），与“低位首拉”互补，可组合成板高全覆盖。</p>
+  </div>
+
+  <h2><span class="no">14</span>长窗口前向验证：30 天的发现全部崩墙（本轮最重要的一章）</h2>
+  <p>把回测拉长到 150 天（123 个交易日，受 1m 数据覆盖限制从 1/28 起），在低位首拉基础池上重新检验 30 天窗口的所有结论：</p>
+  <table>
+    <thead><tr><th>结论（30天窗口）</th><th>长窗口检验</th><th>裁决</th></tr></thead>
+    <tbody>
+      <tr><td>低位首拉：胜率 54.5%、均 +1.42%（n=11）</td><td class="num">n=44，胜率 40.9%，均 −1.42%</td><td class="neg">崩塌</td></tr>
+      <tr><td>MA多头+温和板：胜率 80%、均 +2.38%（n=5）</td><td class="num">n=18，胜率 44.4%，均 −1.61%</td><td class="neg">崩塌</td></tr>
+      <tr><td>MA多头区分度：71.4% vs 25%</td><td class="num">45.8% vs 35.0%（方向在，幅度大减）</td><td>减弱</td></tr>
+      <tr><td>接力：缩量板+RSI&lt;70 均 +0.86%</td><td class="num">n=1582，均 −0.32%</td><td class="neg">崩塌</td></tr>
+      <tr><td>情绪温度：冰点正收益</td><td class="num">池大小十分位无单调关系</td><td class="neg">崩塌</td></tr>
+      <tr><td>结构：炸板组劣于封板组</td><td class="num">炸板 32.1%/−2.83% vs 封板 56.2%/+1.04%</td><td class="pos">存活</td></tr>
+      <tr><td>结构：时段越晚越差</td><td class="num">45.2% → 37.5% → 20.0%</td><td class="pos">存活</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><div class="t">时间分段暴露真相</div>
+    <p>把 44 笔信号按时间切两段：07-28~08-08 段 n=33、胜率 36.4%、均 −2.38%；08-08~09-04 段（恰好与 30 天窗口重叠）n=11、胜率 54.5%、均 +1.44%。<b>所谓“最优规则”的全部优势都来自最后一个月的特定情绪周期</b>——30 天窗口恰好只含一个情绪周期，任何在单一周期内寻优的规则都会过拟合那个周期的性格。同样，接力地图的 9996 样本（8 个月）也证伪了 30 天内的接力发现。</p>
+  </div>
+  <div class="callout"><div class="t">今日全部结论的置信度重排</div>
+    <p><b>可信（结构性，跨周期存活）</b>：追高入场劣于早入场；日内涨幅 5-9% 的半山腰接力最差；炸板组系统性劣于封板组；大高开接力劣于小高开；时段越晚越差。<b>存疑（周期依赖，需更多样本）</b>：所有具体规则的正期望——低位首拉、缩量板接力、情绪温度阈值。<b>已证伪</b>：MA多头+温和板 80% 胜率；缩量板+RSI&lt;70 接力正期望；情绪温度冰点阈值。</p>
+  </div>
+  <div class="callout"><div class="t">诚实的终点</div>
+    <p>在现有数据（1-9 月，约 1.5 个情绪周期）下，单纯"盘中首拉"与"情绪温度"类规则都不具备稳定正期望。真正可交付的是：回测基础设施、五条结构性纪律、以及每日信号落盘管道——从明天起每天自动记录信号与结果，半年后就是一份无过拟合的验证数据集。</p>
+  </div>
+  <h2><span class="no">15</span>最终答案：最好的结果与可执行的组合</h2>
+  <div class="metrics">
+    <div class="metric"><div class="v">53.4%</div><div class="k">3板+MA多头 胜率</div></div>
+    <div class="metric"><div class="v pos">+1.40%</div><div class="k">均收益（双窗口正）</div></div>
+    <div class="metric"><div class="v">1.30</div><div class="k">盈亏比</div></div>
+    <div class="metric"><div class="v">116</div><div class="k">长窗口样本</div></div>
+  </div>
+  <p>全部规则中，<b>唯一在两个独立窗口都保持正期望且幅度可观的</b>是：<b>3板接力 + MA多头排列</b>（昨日第3板，次日竞价买入）—— 长窗口 n=116、胜率 53.4%、均 +1.40%、盈亏比 1.30；30 天窗口 +0.35% 也为正。它的本质：三板确认了题材持续性，MA 多头确认了趋势环境，两者叠加后接力的是"趋势中的加速段"而非孤注一掷。</p>
+  <h3 style="font-size:16px;margin:24px 0 10px">推荐组合（两条互补腿）</h3>
+  <table>
+    <thead><tr><th>腿</th><th>入场方式</th><th>规则</th><th>长窗口数据</th><th>角色</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>A 主力腿</td><td>竞价/开盘直接买</td><td>昨日3板 + MA多头排列，不追高开&gt;9%的票</td><td class="num">n=116 / 53.4% / +1.40%</td><td>样本最多、双窗口验证</td></tr>
+      <tr><td>B 弹性腿</td><td>盘中首拉追入</td><td>昨日涨停池 + 信号时日内涨幅&lt;3.5% + 首拉≥2%（MA多头作为加分项）</td><td class="num">30天 +1.42%，长窗口 −1.42%</td><td>弹性大但未跨周期验证，小仓位</td></tr>
+      <tr><td>纪律层</td><td>任何打板操作共用</td><td>不追5-9%半山腰；时段越晚越不追；炸板次日弱势不补仓；单笔止损-8%</td><td class="num">双窗口存活的结构性规律</td><td>底仓规则，无条件执行</td></tr>
+    </tbody>
+  </table>
+  <p class="note">腿A月度分布：8个月中5个月正收益，但尾部风险真实存在（单笔−8%以下占 13.8%，最差 −12.9%），必须配合纪律层的止损。腿B在长窗口下已不再单独正期望，只作为"MA多头确认时的可选加仓"存在。</p>
+  <div class="callout warn"><div class="t">使用前提（不可跳过）</div>
+    <p>① +1.40% 未扣手续费与滑点，竞价接力的实际成交可能比理想价差 0.2-0.5%，单笔净期望约剩 +0.8-1.0%；② 8 个月样本仍只覆盖约 2 个情绪周期，逐月波动大（6月 +2.27% vs 7月 −1.66%）；③ 建议先以模拟盘或单票最小仓位跑一个月，确认执行价差后再放大；④ 每日信号落盘持续积累，样本每多一个月，规则可信度上一个台阶。</p>
+  </div>
+
+
+
+ <h2><span class="no">16</span>出场优化：涨停持有 + 炸板即卖 + 5%硬止损</h2>
+
+  <p>用户判断正确——出场是最大的未开发空间。用 112 笔 3板+MA多头信号的 D+1 分钟级数据模拟 6 种出场：</p>
+  <table>
+    <thead><tr><th>出场策略</th><th>胜率</th><th>均收益</th><th>盈亏比</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr><td>S0 基线：D+1开盘卖</td><td class="num">52.7%</td><td class="num">+1.20%</td><td class="num">1.27</td><td>无脑但浪费浮盈</td></tr>
+      <tr><td>S1 冲高+3%即卖，否则10:00卖</td><td class="num">65.2%</td><td class="num">−0.58%</td><td class="num">0.41</td><td>胜率高但卖飞大肉，均值为负</td></tr>
+      <tr><td>S2 高点回撤1%卖，否则尾盘</td><td class="num">54.5%</td><td class="num">+1.14%</td><td class="num">1.14</td><td>无增益</td></tr>
+      <tr><td>S3 尾盘14:55卖</td><td class="num">61.6%</td><td class="num">+2.04%</td><td class="num">1.06</td><td>优于开盘卖</td></tr>
+      <tr class="hl"><td><b>S4 涨停持有 / 炸板即卖 / 否则尾盘</b></td><td class="num">64.3%</td><td class="num pos">+2.41%</td><td class="num">1.06</td><td><b>最优</b></td></tr>
+      <tr><td>S5 混合：+3%止盈/回撤1%止损/尾盘</td><td class="num">60.7%</td><td class="num">−1.08%</td><td class="num">0.40</td><td>参数过多，过拟合</td></tr>
+    </tbody>
+  </table>
+  <h3 style="font-size:16px;margin:24px 0 10px">S4 的收益来源：让利润奔跑，炸板立刻跑</h3>
+  <p>S4 分解后逻辑非常清晰：<b>D+1 曾封板的占 42%，这批票在 S4 下胜率 97.9%、均收益 +9.44%</b>——涨停不卖让大肉完整落袋；<b>未封板的占 58%，胜率 40%、均 −2.86%</b>——炸板瞬间离场把亏损控制在隔夜前。开盘卖则把两类票一律按开盘价斩断，大肉吃不到，亏损也止不住。</p>
+  <div class="metrics">
+    <div class="metric"><div class="v">+2.50%</div><div class="k">S4+止损5% 均收益</div></div>
+    <div class="metric"><div class="v">1.95</div><div class="k">盈亏比</div></div>
+    <div class="metric"><div class="v">0%</div><div class="k">单笔&lt;−8% 占比（被止损清除）</div></div>
+    <div class="metric"><div class="v">+1.30%</div><div class="k">相对开盘卖平均改善/笔</div></div>
+  </div>
+  <p>加上 −5% 硬止损后的最终形态（S4+SL）分半检验：前半 +1.93% / 后半 +2.90%，两段都正；逐月 6 个月中 3 个正，最差单笔被锁定在 −5%。相对开盘卖基线：112 笔中改善 67 笔、变差 36 笔，平均每笔多赚 <b>+1.30%</b>。</p>
+  <div class="callout"><div class="t">最终可执行方案（入场 + 出场完整版）</div>
+    <p><b>入场</b>：昨日 3 连板 + MA 多头排列，次日竞价买入（不追高开&gt;9%）。<b>出场</b>：D+1 盘中①触及涨停 → 持有，尾盘仍封板才拿到后天；②封板后炸板（跌破涨停价 99.5%）→ 立即卖出；③全天未封板 → 若触及 −5% 硬止损立即卖，否则 14:55 尾盘卖。</p>
+    <p style="margin-top:8px">合并后单笔净期望（扣手续费滑点前）约 <b>+2.5%，胜率约 53%</b>，盈亏比 1.95，最差单笔 −5%。</p>
+  </div>
+  <div class="callout warn"><div class="t">执行注意</div>
+    <p>① S4 需要盯盘（炸板即卖不是条件单能完全替代的，封板瞬间的撤单/再挂单需要速度）；② 硬止损在竞价阶段无法执行——若 D+1 直接大幅低开超 5%，按开盘价卖出即可（已在回测口径内）；③ 该出场在 D+1 未封板的 58% 里均值为负（−2.86%），靠封板组 42% 的 +9.44% 拽正——本质是“以小亏换大赚”的彩票结构，仓位管理比信号更重要。</p>
+  </div>
+
+  <div class="foot">QUANTDINGER · BACKTEST_RALLY.PY v6 · DATA: KLINE_1D_2026 / KLINE_1M_2026 / CND_DRAGON_TIGER_LIST · GENERATED 2026-09-06 · 长18月窗口前向验证</div>
+</div>
+</body>
+</html>

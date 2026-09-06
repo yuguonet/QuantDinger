@@ -137,7 +137,7 @@
           <a-tooltip :title="$t('aiAssetAnalysis.position.quickAdd')"><span class="wl-hover-btn" @click.stop="openPositionModal(stock)"><a-icon type="wallet" /></span></a-tooltip>
           <a-tooltip :title="$t('aiAssetAnalysis.monitor.quickTask')"><span class="wl-hover-btn" @click.stop="openMonitorModal(stock)"><a-icon type="clock-circle" /></span></a-tooltip>
           <span class="wl-hover-btn danger" v-if="!stock.strategy_state" @click.stop="removeFromWatchlist(stock)"><a-icon type="delete" /></span>
-          <a-tooltip v-if="stock.strategy_state" title="龙回头Pro策略组: 由系统自动管理 (买/持/卖自动增删)"><span class="wl-hover-btn strategy-managed"><a-icon type="robot" /></span></a-tooltip>
+          <a-tooltip v-if="stock.strategy_state" title="自动策略组: 由系统自动管理 (买/持/卖自动增删)"><span class="wl-hover-btn strategy-managed"><a-icon type="robot" /></span></a-tooltip>
         </div>
       </div>
       <div v-if="!watchlist || visibleWatchlist.length === 0" class="watchlist-empty">
@@ -562,7 +562,7 @@ export default {
       const isStrategy = rows.some(s => s.strategy_state)
       if (!isStrategy) return rows
       const weight = { 'exit_today': 0, 'holding': 1, 'buy_today': 2, 'watch_pending': 3 }
-      const wrMap = { 'v1': 76.5, 'break': 62.7, 'dragon2': 70.4 }
+      const wrMap = { 'v1': 76.5, 'break': 62.7, 'dragon_callback': 51.3 }
       return rows.slice().sort((a, b) => {
         const wa = weight[a.strategy_state] !== undefined ? weight[a.strategy_state] : 9
         const wb = weight[b.strategy_state] !== undefined ? weight[b.strategy_state] : 9
@@ -1069,7 +1069,7 @@ export default {
       if (d.stop_price) lines.push(`止损: ${d.stop_price}`)
       if (d.d1_chg !== undefined && d.d1_chg !== null) lines.push(`D1确认: ${d.d1_chg > 0 ? '+' : ''}${d.d1_chg}% 量比${d.d1_vol_r || ''}`)
       if (d.exit_reason) lines.push(`出场: ${d.exit_reason}${d.exit_date ? ` (${d.exit_date} @ ${d.exit_price || ''})` : ''}`)
-      lines.push('龙回头Pro · 系统自动管理 (买/持/卖自动增删)')
+      lines.push('自动策略组 · 系统自动管理 (买/持/卖自动增删)')
       return lines.join('\n')
     },
     async handleAddStock () {

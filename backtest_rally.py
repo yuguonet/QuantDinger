@@ -118,7 +118,8 @@ def load_st_codes() -> set:
 # ================================================================
 def get_trading_days(days: int) -> List[str]:
     end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=days * 2 + 15)).strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
+    start = max(start, "2026-01-01")  # 分表从2026起
     try:
         sub = _union_daily(start, end, "symbol, time, volume")
         rows = _q(f"SELECT DISTINCT time::date FROM {sub} u WHERE u.symbol='000001' AND u.volume > 0 AND u.time::date <= %s ORDER BY 1",
@@ -195,6 +196,57 @@ def limit_price_of(code: str, prev_close: float) -> float:
         return 0.0
     pct = 1.2 if code.startswith('30') or code.startswith('68') else 1.1
     return round(prev_close * pct, 2)
+
+def load_daily_feats(codes: List[str], prev_date: str) -> Dict[str, Dict]:
+    """批量计算日线前置特征: board_h / ma_bull / lu_vol_ratio / rsi (截至 prev_date)"""
+    if not codes:
+        return {}
+    start_buf = (datetime.strptime(prev_date, "%Y-%m-%d") - timedelta(days=130)).strftime("%Y-%m-%d")
+    next_of_prev = (datetime.strptime(prev_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    sub = _union_daily(start_buf, next_of_prev, "symbol, time, close, volume")
+    placeholders = ", ".join(["%s"] * len(codes))
+    sql = f"SELECT symbol, time, close, volume FROM {sub} u WHERE u.symbol IN ({placeholders}) ORDER BY symbol, time"
+    try:
+        rows = _q(sql, [start_buf, next_of_prev] + list(codes))
+    except Exception:
+        return {}
+    bars = defaultdict(list)
+    for r in rows:
+        bars[r[0]].append((str(r[1])[:10], float(r[2]), float(r[3])))
+    feats = {}
+    for code, bl in bars.items():
+        idxs = [i for i, b in enumerate(bl) if b[0] <= prev_date]
+        if len(idxs) < 30:
+            continue
+        k = idxs[-1]
+        closes = [b[1] for b in bl[:k+1]]
+        vols = [b[2] for b in bl[:k+1]]
+        th = 0.198 if code.startswith('30') or code.startswith('68') else 0.098
+        # 连板高度
+        h = 0
+        j = len(closes) - 1
+        while j >= 1 and (closes[j]/closes[j-1]-1) >= th*0.98:
+            h += 1
+            j -= 1
+        # MA多头
+        def ma(n):
+            return sum(closes[-n:])/n if len(closes) >= n else None
+        m5, m10, m20, m60 = ma(5), ma(10), ma(20), ma(60)
+        ma_bull = 1 if (m5 and m10 and m20 and m60 and m5 > m10 > m20 > m60) else 0
+        # 涨停日量比
+        avg5 = sum(vols[-6:-1])/5 if len(vols) >= 6 else 0
+        lvr = round(vols[-1]/avg5, 2) if avg5 > 0 else None
+        # RSI
+        rsi = None
+        if len(closes) >= 15:
+            gains, losses = [], []
+            for q in range(len(closes)-15, len(closes)):
+                dd = closes[q]-closes[q-1]
+                gains.append(max(dd, 0)); losses.append(max(-dd, 0))
+            ag, al = sum(gains)/14, sum(losses)/14
+            rsi = round(100-100/(1+ag/al), 1) if al > 0 else 100.0
+        feats[code] = {'board_h': h, 'ma_bull': ma_bull, 'lu_vol_ratio': lvr, 'rsi': rsi}
+    return feats
 
 # ================================================================
 # 批量 1m K线
@@ -427,7 +479,9 @@ def run_backtest(top_n: int = 5, min_score: float = 5.0, days: int = 30,
                  no_lhb: bool = False, chg_min: float = 3.0, vol_min_wan: float = 3.0,
                  pool: str = 'limit_up', signal_after_min: int = 0,
                  signal_before_min: int = 30, chg_1m: float = 2.0,
-                 max_intraday_gain: float = 0.0, output: str = None) -> Dict:
+                 max_intraday_gain: float = 0.0, output: str = None,
+                 require_ma_bull: bool = False, mild_lu: bool = False,
+                 store_feats: bool = False) -> Dict:
     vol_min_shares = vol_min_wan * 10000 * 100
 
     trading_days = get_trading_days(days)
@@ -478,6 +532,11 @@ def run_backtest(top_n: int = 5, min_score: float = 5.0, days: int = 30,
         screened = [c for c in screened if c not in st_set]
         total_screened += len(screened)
 
+        # ---- 日线前置特征 (可选) ----
+        daily_feats = {}
+        if require_ma_bull or mild_lu or store_feats:
+            daily_feats = load_daily_feats(screened, prev_date)
+
         # 涨停价表
         limit_price_map = {c: limit_price_of(c, prev_close_map.get(c, 0)) for c in screened}
 
@@ -487,6 +546,11 @@ def run_backtest(top_n: int = 5, min_score: float = 5.0, days: int = 30,
         # ---- 首拉信号 + 追入 ----
         candidates = []
         for code in screened:
+            df = daily_feats.get(code, {})
+            if require_ma_bull and df.get('ma_bull') != 1:
+                continue
+            if mild_lu and (df.get('lu_vol_ratio') is None or df.get('lu_vol_ratio') >= 2):
+                continue
             bars = daily_1m.get(code)
             if not bars or len(bars) < 3:
                 continue
@@ -516,6 +580,8 @@ def run_backtest(top_n: int = 5, min_score: float = 5.0, days: int = 30,
                 'limit_price': limit_price,
                 'entry_at_limit': (limit_price > 0 and entry_bar['close'] >= limit_price - 0.001),
                 'sealed_today': (limit_price > 0 and day_high >= limit_price - 0.001),
+                'board_h': df.get('board_h'), 'ma_bull': df.get('ma_bull'),
+                'lu_vol_ratio': df.get('lu_vol_ratio'), 'rsi': df.get('rsi'),
             })
             candidates.append(snap)
 
@@ -675,6 +741,9 @@ def main():
     parser.add_argument("--signal-before-min", type=int, default=30, help="信号最晚分钟 (默认30=10:00前)")
     parser.add_argument("--chg-1m", type=float, default=2.0, help="首拉阈值: 分钟涨幅%%")
     parser.add_argument("--max-intraday-gain", type=float, default=0.0, help="信号时日内涨幅上限%% (0=不限)")
+    parser.add_argument("--require-ma-bull", action="store_true", help="要求MA多头排列")
+    parser.add_argument("--mild-lu", action="store_true", help="要求涨停日量比<2 (温和板)")
+    parser.add_argument("--store-feats", action="store_true", help="在交易记录中存储日线特征")
     parser.add_argument("--top-n", type=int, default=5, help="每日选N只")
     parser.add_argument("--min-score", type=float, default=5.0, help="行为分门槛")
     parser.add_argument("--chg-min", type=float, default=3.0, help="[rally池] 昨日涨幅下限%%")
@@ -697,6 +766,9 @@ def main():
         signal_before_min=args.signal_before_min,
         chg_1m=args.chg_1m,
         max_intraday_gain=args.max_intraday_gain,
+        require_ma_bull=args.require_ma_bull,
+        mild_lu=args.mild_lu,
+        store_feats=args.store_feats,
         output=output_file,
     )
 

@@ -1,11 +1,14 @@
-"""dragon_scan.py — 龙回头Pro 盘后全市场扫描
+"""dragon_scan.py — 龙回头/盘后全市场扫描
 
 触发: scheduler Task "dragon_scan" (once_per_day, 16:30, 在 post_market_batch 1D 回填之后)
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
-  2. 全市场逐股跑 dragon2 判定 (与回测同一份 dragon_core)
-  3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 确认)
+  2. 全市场逐股跑四策略判定 (与回测同一份 dragon_core):
+     dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
+  3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
+
+注: 龙回头Pro(dragon2, 八因子评分版)已于 2026-09-06 下线 (信号太多无法人工复核)。
 
 手动运行:
   python -m app.market_cn.auto.dragon_scan --run [--days 320]
@@ -112,7 +115,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     - 组对账 (活跃集不变时无操作, 防漂移)
     """
     from app.market_cn.auto.dragon_core import (
-        DRAGON2_PARAMS, dragon2_today_d0_signals,
+        DRAGON_CB_PARAMS, dragon_cb_today_d0_signals, unified_prefilter,
         v1_today_d0_signals, break_today_d0_signals, find_limit_ups, get_board_type,
     )
     from app.market_cn.auto import dragon_store, relay3
@@ -138,12 +141,12 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         logger.warning("[dragon_scan] stock_basic_info 加载失败(%s), 换手/市值过滤降级", e)
         stock_info = {}
 
-    params = dict(DRAGON2_PARAMS)   # 自动化固定形态: 判定仅到 D0, 入场模式由 monitor 状态机执行
+    params = dict(DRAGON_CB_PARAMS)  # 龙回头"方案2"参数 (自动化固定形态: 判定仅到 D0, 次日开盘买)
     rows = []
     t0 = time.time()
     for i, code in enumerate(codes):
         bars = fetch_kline_db(code, days)
-        if not bars or len(bars) < 67:
+        if not bars or len(bars) < 30:
             continue
         # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
         if bars[-1]["time"] > target:
@@ -151,18 +154,31 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         if not bars:
             continue
         try:
-            sigs = dragon2_today_d0_signals(bars, code, stock_info=stock_info.get(code), params=params)
+            sigs = dragon_cb_today_d0_signals(bars, code, params=params)
         except Exception as e:
             logger.debug("[dragon_scan] %s 判定异常: %s", code, e)
             continue
+        # U1~U4 统一预过滤: 锚定涨停日评估 (与回测 strategy_dragon_callback 同口径;
+        # 易错点: 不能用缩量信号日评估换手率, 会误杀)
+        kept = []
         for s in sigs:
-            s["strategy"] = "dragon2"
+            lu_idx = next((j for j, b in enumerate(bars) if b["time"] == s.get("lu_date")), None)
+            if lu_idx is None:
+                continue
+            ok, _fails = unified_prefilter(bars, lu_idx, code, stock_info.get(code))
+            if ok:
+                kept.append(s)
+        for s in kept:
+            s["strategy"] = "dragon_callback"
             s["name"] = (stock_info.get(code) or {}).get("name", "")
-        rows.extend(sigs)
+        rows.extend(kept)
 
         # ── V1: D0 四因子 (涨停+强趋势+回踩+OBV+非放量) ──
         try:
             v1s = v1_today_d0_signals(bars, code)
+            # U1~U4 统一预过滤: V1 的 D0 即涨停日, 锚定信号日(末根bar)评估 (与回测同口径)
+            v1s = [s for s in v1s
+                   if unified_prefilter(bars, len(bars) - 1, code, stock_info.get(code))[0]]
             for s in v1s:
                 s["strategy"] = "v1"
                 s["style"] = "v1"
@@ -177,6 +193,9 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         # ── 断板: 连板≥2 → 断板期确认 (确认日=断板期最后一天) ──
         try:
             brks = break_today_d0_signals(bars, code)
+            # U1~U4 统一预过滤: 锚定确认日(末根bar)评估 (与回测同口径; 连板≥2已隐含U4)
+            brks = [s for s in brks
+                    if unified_prefilter(bars, len(bars) - 1, code, stock_info.get(code))[0]]
             for s in brks:
                 s["strategy"] = "break"
                 s["style"] = "brk"
@@ -209,7 +228,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="龙回头Pro 盘后扫描 (手动)")
+    parser = argparse.ArgumentParser(description="龙回头/V1/断板/3板接力 盘后扫描 (手动)")
     parser.add_argument("--run", action="store_true", help="执行扫描")
     parser.add_argument("--days", type=int, default=320, help="向前取N个交易日")
     parser.add_argument("--no-wait", action="store_true", help="不等待数据就绪")

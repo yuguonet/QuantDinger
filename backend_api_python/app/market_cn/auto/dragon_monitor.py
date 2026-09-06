@@ -1,17 +1,18 @@
 """dragon_monitor.py — 自动策略组盘中状态机 (60s tick, scheduler 调度)
 
-覆盖三策略: dragon2(龙回头Pro) / v1 / break(断板) —— d1open 线上模式。
+覆盖三策略: dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)。
+注: 龙回头Pro(dragon2, 确认制)已于 2026-09-06 下线 (信号太多无法人工复核)。
 
 各策略入场 (09:25~09:35 开盘窗口, 用 9:26 集合竞价快照):
-  dragon2: gap ∈ (a)-3~+2 / (b)-3.5~+5.5
+  dragon_callback: gap ∈ (-3%, +2%] (高开>2%不追, 低开<-3%不接; 与回测 D1 过滤一致)
   v1:      主板 gap>=-3 且 非[3,5)高开区间; 创科板 -5<=gap<5
   break:   无开盘过滤 (断板确认日本身已过 5a~5f 检查)
 各策略确认 (15:01+, 当日快照收盘):
-  dragon2: 强(涨>=3%且量>=1.5x)/中/弱(收阴或无力) → 持仓/卖出
+  dragon_callback: 无确认步骤 → 买入日收盘直接转持仓
   v1:      日内动量 = D1涨幅-D1开盘涨幅 < 3% 或 收阴 → 卖出(D2开盘清仓); 否则持仓
   break:   无确认步骤 → 买入次日直接持仓
 各策略出场 (14:58 收盘重放 + 盘中硬止损):
-  dragon2: 止损-5/-7, 追踪-5/-7(涨停日豁免), 连板>=2断板尾盘卖, 巨量出货, 峰值逃顶, 到期7/10
+  dragon_callback: 止损-8%, 分段追踪(峰值收益>=3%→-3%, 否则-8%), 峰值逃顶(涨>7%上影>30%), 到期7天
   v1:      止损-10, 追踪-5, 到期7 (D1弱确认已在15:00转卖出)
   break:   止损-8/-10(收盘价), 追踪-6/-8(收盘价,盈利时), 峰值逃顶(涨>10%上影>40%), 到期20/15
 卖出执行: 次日开盘按开盘价记账 closed 并出组 (建议人工尾盘/次日开盘执行)。
@@ -134,7 +135,7 @@ def latest_snapshot(codes):
 # ================================================================
 
 def _entry_stop(code, entry_price, strategy):
-    from app.market_cn.auto.dragon_core import DRAGON2_PARAMS, get_board_type
+    from app.market_cn.auto.dragon_core import DRAGON_CB_PARAMS, get_board_type
     gem = get_board_type(code) == "gem_star"
     if strategy == "relay3":
         from app.market_cn.auto.relay3 import PARAMS as R3P
@@ -143,14 +144,16 @@ def _entry_stop(code, entry_price, strategy):
         stop = -10.0
     elif strategy == "break":
         stop = -10.0 if gem else -8.0
+    elif strategy == "dragon_callback":
+        stop = DRAGON_CB_PARAMS["stop_loss"]   # -8%, 板块不分档 (与回测一致)
     else:
-        stop = DRAGON2_PARAMS["stop_gem"] if gem else DRAGON2_PARAMS["stop_main"]
+        stop = -8.0
     return round(entry_price * (1 + stop / 100), 3)
 
 
 def _gap_buyable(code, strategy, style, gap):
     """开盘 gap 是否可买 (与各策略回测的 D1 过滤一致)。"""
-    from app.market_cn.auto.dragon_core import DRAGON2_PARAMS, get_board_type
+    from app.market_cn.auto.dragon_core import DRAGON_CB_PARAMS, get_board_type
     if strategy == "relay3":
         from app.market_cn.auto.relay3 import gap_buyable as r3_gap
         return r3_gap(gap)
@@ -160,14 +163,13 @@ def _gap_buyable(code, strategy, style, gap):
         if get_board_type(code) == "gem_star":
             return -5.0 <= gap < 5.0
         return gap >= -3.0 and not (3.0 <= gap < 5.0)
-    # dragon2
-    g_lo, g_hi = (DRAGON2_PARAMS["entry_gap_a"] if style == "a" else DRAGON2_PARAMS["entry_gap_b"])
-    return g_lo <= gap <= g_hi
+    # dragon_callback: gap ∈ [d1_gap_lo, d1_gap_hi] = (-3%, +2%]
+    return DRAGON_CB_PARAMS["d1_gap_lo"] <= gap <= DRAGON_CB_PARAMS["d1_gap_hi"]
 
 
 def evaluate_confirm(row, series_rows):
-    """15:00 正式确认: dragon2 用量价, v1 用日内动量, break 无确认。"""
-    strat = row.get("strategy", "dragon2")
+    """15:00 正式确认: dragon_callback 无确认步骤, v1 用日内动量, break 无确认。"""
+    strat = row.get("strategy", "dragon_callback")
     if not series_rows:
         return None, None, None
     last_r = series_rows[-1]
@@ -175,26 +177,17 @@ def evaluate_confirm(row, series_rows):
     if prev_close <= 0:
         return None, None, None
     d1_chg = (float(last_r["last"] or 0) / prev_close - 1) * 100
+    if strat == "dragon_callback":
+        # 方案2无确认步骤: 买入日收盘直接持仓 (出场由收盘重放判定)
+        return "ok", round(d1_chg, 2), None
     if strat == "v1":
         extra = row.get("extra") or {}
         entry_gap = float(extra.get("entry_gap") or 0)
         intraday = d1_chg - entry_gap
         level = "weak" if (d1_chg < 0 or intraday < 3.0) else "ok"
         return level, round(d1_chg, 2), round(intraday, 2)
-    # dragon2
-    from app.market_cn.auto.dragon_core import DRAGON2_PARAMS
-    p = DRAGON2_PARAMS
-    sig_vol = float((row.get("extra") or {}).get("sig_vol") or 0)
-    day_vol = float(last_r["volume"] or 0)
-    d1_vol_r = day_vol / sig_vol if sig_vol > 0 else None
-    vr = d1_vol_r if d1_vol_r is not None else 9.9
-    if d1_chg >= p["d1_strong_chg"] and vr >= p["d1_strong_vol"]:
-        level = "strong"
-    elif d1_chg < 0 or (d1_chg < p["d1_weak_chg"] and vr < p["d1_weak_vol"]):
-        level = "weak"
-    else:
-        level = "ok"
-    return level, round(d1_chg, 2), round(d1_vol_r, 2) if d1_vol_r is not None else None
+    # break: 无确认
+    return "ok", round(d1_chg, 2), None
 
 
 # ================================================================
@@ -233,10 +226,10 @@ def _bars_with_synth(code, entry_date):
 def _eval_exit_day_close(row):
     """收盘窗口出场判定 (按策略)。返回 (reason, exit_price) 当今日触发; 否则 (None, None)。"""
     from app.market_cn.auto.dragon_core import (
-        DRAGON2_PARAMS, BOARD_PARAMS, run_backtest_dragon2, get_board_type,
+        BOARD_PARAMS, run_backtest_dragon_callback, get_board_type,
     )
     code = row["code"]
-    strategy = row.get("strategy", "dragon2")
+    strategy = row.get("strategy", "dragon_callback")
     board = get_board_type(code)
     is_gem = board == "gem_star"
     entry_price = float(row.get("entry_price") or 0)
@@ -258,27 +251,10 @@ def _eval_exit_day_close(row):
         from app.market_cn.auto.relay3 import PARAMS as R3P, eval_exit_day_close as r3_close
         return r3_close(bars, idx, entry_price, code, row.get("entry_date"))
 
-    if strategy == "dragon2":
-        p = DRAGON2_PARAMS
-        stop = p["stop_gem"] if is_gem else p["stop_main"]
-        trail = p["trail_gem"] if is_gem else p["trail_main"]
-        extra = row.get("extra") or {}
-        strong = bool(extra.get("confirm_strong"))
-        hold = max(p["hold_days"], p["hold_strong"]) if strong else p["hold_days"]
-        if held >= hold:
-            return f"持仓到期{hold}天", last_bar["close"]
-        if last_bar["low"] <= entry_price * (1 + stop / 100):
-            return f"止损{stop}%", entry_price * (1 + stop / 100)
-        sig_vol = float((row.get("extra") or {}).get("sig_vol") or 0)
-        r = run_backtest_dragon2(
-            bars, idx, entry_price, board,
-            sig_close=bars[idx - 1]["close"] if idx > 0 else entry_price,
-            sig_vol=sig_vol, entry_style=row.get("entry_style", "a"), params=p,
-            entry_mode="confirm",
-            pre_d1_chg=row.get("d1_chg"), pre_d1_vol_r=row.get("d1_vol_r"),
-            pre_d1_confirm="strong" if extra.get("confirm_strong") else "ok",
-            stop_at_idx=today_idx,
-        )
+    if strategy == "dragon_callback":
+        # 出场重放: 复用回测出场模拟 run_backtest_dragon_callback
+        # (止损-8 / 分段追踪-8/-3 / 峰值逃顶 / 到期7天; stop_at_idx=今日截断)
+        r = run_backtest_dragon_callback(bars, idx, entry_price, board, stop_at_idx=today_idx)
         if r and not r.get("open"):
             exit_idx = idx + r["exit_day"] - 1
             if exit_idx == today_idx and r.get("exit_reason"):
@@ -356,7 +332,7 @@ def run_monitor():
                 if prev_close <= 0:
                     continue
                 gap = (open_px / prev_close - 1) * 100
-                strat = r.get("strategy", "dragon2")
+                strat = r.get("strategy", "dragon_callback")
                 if not _gap_buyable(code, strat, r.get("entry_style", "a"), gap):
                     ds.set_state(r["id"], ds.S_EXPIRED,
                                  detail={"gap": round(gap, 2),
@@ -365,9 +341,9 @@ def run_monitor():
                     continue
                 # 质量排序键 (越 besar 越优先)
                 extra = r.get("extra") or {}
-                if strat == "dragon2":
-                    qkey = (r.get("score", 0), extra.get("turnover_anchor") or 0,
-                            1 if (gap <= -1.5 or gap >= 3.0) else 0)
+                if strat == "dragon_callback":
+                    # 方案2 质量排序: tech_score(参考) -> 涨停日换手率; 技术分无判别力, 主要按换手热度
+                    qkey = (extra.get("tech_score") or 0, extra.get("turnover_anchor") or 0)
                 elif strat == "v1":
                     qkey = (extra.get("ret_20d") or 0,)
                 else:
@@ -425,7 +401,7 @@ def run_monitor():
                                      detail={"marked": today, "intraday": True})
                         stats["relay3_break_sell"] = stats.get("relay3_break_sell", 0) + 1
 
-    # ── 3. 14:30 预确认 (dragon2/v1 的今日买入行) ──
+    # ── 3. 14:30 预确认 (v1 的今日买入行; dragon_callback/break 无确认步骤) ──
     if in_window(W_PRECONF_LO, W_PRECONF_HI, hm):
         today_buys = [r for r in buy_rows if str(r.get("entry_date"))[:10] == today]
         if today_buys:
@@ -460,7 +436,7 @@ def run_monitor():
                 rows_ = series.get(r["code"])
                 if not rows_:
                     continue
-                strat = r.get("strategy", "dragon2")
+                strat = r.get("strategy", "dragon_callback")
                 # relay3 无确认步骤: D1 封板守住 → holding (炸板/未封板已在盘中/重放转卖出)
                 if strat == "relay3":
                     if r.get("exit_reason"):
