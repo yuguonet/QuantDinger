@@ -48,271 +48,45 @@ from app.market_cn.auto.common.filters import (  # noqa: F401
 #   - 止损-5%太紧截断收益 → 放宽到-8%; 分段追踪止损锁利润
 
 # ================================================================
-DRAGON_CB_PARAMS = dict(
-    # --- 找龙: 滑动窗口涨停占比 ---
-    dragon_ratio=0.7,               # 窗口内涨停占比阈值
-    dragon_windows=[4, 5, 7, 10, 15, 20],  # 候选窗口(天), 任一窗口达标即为"龙"
-    # --- 回调窗口 ---
-    gap_min=5, gap_max=6,           # 信号日距涨停日天数区间 [5,6]
-    # --- 拐点过滤 (或关系, 满足任一即可) ---
-    ma20_lo=-10.0, ma20_hi=-5.0,    # 拐点1: D0收盘/MA20-1 ∈ [-10%,-5%) (均线支撑)
-    depth_max=-30.0,                # 拐点2: 回调期最低价/涨停收盘-1 <= -30% (深跌释放)
-    yin_ratio_max=0.5,              # 拐点3: 回调期阴线比例<50% (买盘承接)
-    # --- 信号质量排除 (全部为"或关系"通过后的兜底剔除) ---
-    yin_ratio_exclude=0.6,          # 阴线比例>=60% 剔除 (卖压未尽, 持仓到期概率高)
-    rsi6_exclude_lt=30.0,           # RSI(6)<30 剔除 (超卖≠反弹, 胜率仅~17%)
-    d0_ma20_exclude_lt=-8.0,        # D0距MA20<-8% 剔除 (深度破位)
-    # --- 入场 ---
-    d1_gap_lo=-3.0, d1_gap_hi=2.0,  # D1开盘gap可买区间: 高开>2%不追(追高亏损率高), 低开<-3%不接(破位风险)
-    # --- 出场 (run_backtest_dragon_callback) ---
-    hold_days=7,                    # 持仓上限(交易日)
-    stop_loss=-8.0,                 # 固定止损
-    trail_lo=-8.0,                  # 分段追踪: 盈利<3%时-8% (给空间)
-    trail_hi=-3.0,                  #           盈利>=3%时-3% (锁利润)
-    trail_switch_pct=3.0,           # 分段切换阈值(峰值收益%)
-    peak_exit_ret=7.0,              # 峰值逃顶: 涨>7%后
-    peak_exit_upper=30.0,           #           上影线>30% 且收盘<高点98% → 收盘逃顶
+# Phase 2 facade: 龙回头实现已迁 strategies/dragon_callback.py (DragonCallbackStrategy)。
+# 参数/判定/出场模拟全部转发, 对外 API (含 test_dragon.py import) 不变。
+from app.market_cn.auto.strategies.dragon_callback import (  # noqa: F401  E402
+    DRAGON_CB_PARAMS,
 )
 
 
 def dragon_cb_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=11,
                                max_last_chg=3.0, today_str=None, limit_ups=None,
                                use_tech_score=True, params=None):
-    """龙回头 今日(D0)入场信号 ("方案2"): 只检查D0是否满足信号日, 不依赖D+1数据。
+    """龙回头 今日(D0)入场信号 — Phase 2 facade: 实现已迁 strategies/dragon_callback.py。
 
     参数 min_pullback_days/max_pullback_days/max_last_chg 为旧版兼容保留, 已不参与判定。
     params: 可选, 覆盖 DRAGON_CB_PARAMS 中的键 (dragon_scan 用)。
-    返回空list或单元素list, 元素含 lu_date/gap_from_peak/d0_vs_ma20/pullback_depth/
-    yin_ratio/tech_score 等 (均只用<=D0收盘可知数据)。
     """
-    result = []
-    p = {**DRAGON_CB_PARAMS, **(params or {})}
-    n = len(bars)
-    if n < 3:
-        return result
+    from app.market_cn.auto.strategies.dragon_callback import (
+        DragonCallbackStrategy, _signal_to_legacy_dict,
+    )
+    as_of = None
     if today_str:
-        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        idxs = [j for j, b in enumerate(bars) if b["time"] == today_str]
         if not idxs:
-            return result
-        i = idxs[-1]
-    else:
-        i = n - 1  # 最后一天视为今日(D0)
-    if i < 2:
-        return result
-    board_type = get_board_type(code)
-
-    d0 = bars[i]
-    prev_c = bars[i - 1]['close']
-    if prev_c <= 0:
-        return result
-    # D0涨跌幅和量比 (保留用于输出, 不作为过滤条件)
-    last_chg = (d0['close'] / prev_c - 1) * 100
-    prev_vol = bars[i - 1]['volume']
-    entry_vol_r = d0['volume'] / prev_vol if prev_vol > 0 else 0
-
-    closes = [bars[j]['close'] for j in range(i + 1)]
-
-    # ── tech_score 加分制 (仅参考输出; RSI 值供质量排除使用) ──
-    score = 0
-    rsi_val = roc = psy = None
-    if use_tech_score:
-        # MACD (最高+4, 最低-2)
-        dif, dea, hist = calc_macd(closes)
-        if hist is not None and len(hist) >= 2:
-            if is_macd_golden_cross(dif, dea, lookback=5):
-                score += 3   # 金叉: 强烈看多
-            elif is_macd_hist_turning_positive(hist, lookback=5):
-                score += 2   # 绿翻红: 趋势转多
-            elif is_macd_hist_shrinking_negative(hist, lookback=5):
-                score += 1   # 绿柱缩短: 空头衰竭
-            n_h = len(hist)
-            if n_h >= 2 and abs(dif[n_h-1]) < abs(dea[n_h-1]) * 0.5:
-                score += 1   # 零轴附近
-            if dif[n_h-1] < dea[n_h-1] and dif[n_h-2] >= dea[n_h-2]:
-                score -= 2   # 死叉: 趋势转空
-        # RSI(6)
-        rsi_val = rsi(closes, period=6)
-        if rsi_val is not None:
-            if rsi_val < 30:
-                score += 2
-            elif rsi_val < 40:
-                score += 1
-            elif rsi_val < 60:
-                score -= 1
-            else:
-                score -= 2
-        # ROC(5)
-        roc = calc_roc(closes, period=5)
-        if roc is not None:
-            if -10 <= roc < 0 or 0 <= roc < 5:
-                score += 1
-            elif roc < -15 or roc >= 5:
-                score -= 1
-        # PSY(10)
-        psy = calc_psy(closes, period=10)
-        if psy is not None:
-            if psy < 30:
-                score += 2
-            elif psy < 40:
-                score += 1
-            elif psy >= 50:
-                score -= 1
-        # 评分门槛已关闭 (实验结论: tech_score 无判别力, 仅输出参考)
-
-    # ── 方案2 主判定 ──
-    for lu_idx in (limit_ups if limit_ups is not None else find_limit_ups(bars[:i], board_type)):
-        lu_close = bars[lu_idx]['close']
-        if lu_close <= 0:
-            continue
-
-        # 当前日(i)收盘必须仍低于涨停收盘 (仍在回调中)
-        if bars[i]['close'] >= lu_close:
-            continue
-
-        pullback_days = i - lu_idx
-
-        # ── Step1: 找龙 — 滑动窗口内涨停占比>=70% ──
-        dragon_found = False
-        for window in p['dragon_windows']:
-            start = max(1, lu_idx - window)
-            total_days = lu_idx - start
-            if total_days < 3:
-                continue
-            lu_count = sum(1 for k in range(start, lu_idx)
-                           if k > 0 and is_limit_up(bars[k]['close'], bars[k-1]['close'], board_type))
-            if lu_count / total_days >= p['dragon_ratio']:
-                dragon_found = True
-                break
-        if not dragon_found:
-            continue
-
-        # ── Step2: gap [gap_min, gap_max] ──
-        gap_from_peak = i - lu_idx
-        if gap_from_peak < p['gap_min'] or gap_from_peak > p['gap_max']:
-            continue
-
-        # ── 回调期特征 ──
-        if i >= 19:
-            ma20 = sum(bars[j]['close'] for j in range(i - 19, i + 1)) / 20
-            d0_vs_ma20 = (d0['close'] / ma20 - 1) * 100 if ma20 > 0 else None
-        else:
-            d0_vs_ma20 = None
-
-        min_low = min(bars[j]['low'] for j in range(lu_idx + 1, i + 1))
-        pullback_depth = (min_low / lu_close - 1) * 100
-
-        pb_yin = sum(1 for j in range(lu_idx + 1, i + 1) if bars[j]['close'] < bars[j]['open'])
-        pb_total = i - lu_idx
-        yin_ratio = pb_yin / pb_total if pb_total > 0 else 1.0
-
-        # ── 拐点过滤 (或关系, 满足任一即可) ──
-        cond_ma20 = d0_vs_ma20 is not None and p['ma20_lo'] <= d0_vs_ma20 < p['ma20_hi']
-        cond_depth = pullback_depth <= p['depth_max']
-        cond_yin = yin_ratio < p['yin_ratio_max']
-        if not (cond_ma20 or cond_depth or cond_yin):
-            continue
-
-        # ── 信号质量排除 ──
-        if yin_ratio >= p['yin_ratio_exclude']:
-            continue  # 阴线比例>=60%: 卖压未尽, 持仓到期概率高
-        if rsi_val is not None and rsi_val < p['rsi6_exclude_lt']:
-            continue  # RSI<30: 超卖≠反弹, 胜率仅~17%
-        if d0_vs_ma20 is not None and d0_vs_ma20 < p['d0_ma20_exclude_lt']:
-            continue  # D0距MA20超-8%: 深度破位, 持仓到期概率高
-
-        result.append({
-            'code': code, 'board': get_board_name(code),
-            'path': 'dragon_callback', 'path_label': '龙回头',
-            'lu_date': bars[lu_idx]['time'],
-            'pullback_days': pullback_days,
-            'signal_date': bars[i]['time'],
-            'signal_chg': round(last_chg, 2),
-            'signal_vol_r': round(entry_vol_r, 2),
-            'signal_price': round(d0['close'], 3),
-            'entry_vol_r': round(entry_vol_r, 2),
-            'buy_mode': 'next_open',
-            'gap_from_peak': gap_from_peak,
-            'd0_vs_ma20': round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
-            'pullback_depth': round(pullback_depth, 2),
-            'yin_ratio': round(yin_ratio, 2),
-            'tech_score': score,
-            'tech_rsi': round(rsi_val, 1) if rsi_val else None,
-            'tech_roc': round(roc, 1) if roc else None,
-            'tech_psy': round(psy, 1) if psy else None,
-        })
-        break
-    return result
+            return []
+        as_of = idxs[-1]
+    overrides = dict(params or {})
+    sigs = DragonCallbackStrategy().scan_signals(
+        bars, code, as_of=as_of, limit_ups=limit_ups,
+        use_tech_score=use_tech_score, **overrides)
+    return [_signal_to_legacy_dict(s, code) for s in sigs]
 
 
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
                                  stop_loss=None, board_type="main", stop_at_idx=None):
-    """龙回头出场模拟: 分段追踪止损 (as-of安全, 供回测与盘中持仓重放共用)
-
-    出场判定顺序 (每日):
-      1) 峰值逃顶: 涨>7%后大上影线(>30%)且收盘<高点98% → 收盘逃顶
-      2) 分段追踪止损: 峰值收益>=3% → -3% (锁利润); 否则 -8% (给空间)
-      3) 固定止损: -8%
-      4) 兜底: 持仓到期收盘卖 / stop_at_idx 截断返回 open=True
-    stop_at_idx: 只模拟到该bar索引(盘中重放用); 未触发出场 → open=True
-    """
-    p = DRAGON_CB_PARAMS
-    hold_days = p['hold_days'] if hold_days is None else hold_days
-    stop_loss = p['stop_loss'] if stop_loss is None else stop_loss
-    if entry_price <= 0 or entry_idx >= len(bars):
-        return None
-    n = len(bars)
-    peak = entry_price
-    exit_p, exit_d, exit_reason = entry_price, 0, ''
-    capped = False
-
-    for d in range(1, hold_days + 1):
-        idx = entry_idx + d - 1
-        if idx >= n:
-            break
-        if stop_at_idx is not None and idx > stop_at_idx:
-            capped = True
-            break
-        b = bars[idx]
-        if b['high'] > peak:
-            peak = b['high']
-
-        # 1. 峰值逃顶
-        ret = (b['close'] / entry_price - 1) * 100
-        if ret > p['peak_exit_ret']:
-            rng = b['high'] - b['low']
-            upper = (b['high'] - max(b['open'], b['close'])) / rng * 100 if rng > 0 else 0
-            if upper > p['peak_exit_upper'] and b['close'] < b['high'] * 0.98:
-                exit_p, exit_d, exit_reason = b['close'], d, '峰值逃顶'
-                break
-
-        # 2. 分段追踪止损
-        if d > 1:
-            peak_ret = (peak / entry_price - 1) * 100
-            trail = p['trail_hi'] if peak_ret >= p['trail_switch_pct'] else p['trail_lo']
-            if b['low'] <= peak * (1 + trail / 100):
-                exit_p = peak * (1 + trail / 100)
-                exit_d = d
-                exit_reason = f'追踪止损{trail}%'
-                break
-
-        # 3. 固定止损
-        if b['low'] <= entry_price * (1 + stop_loss / 100):
-            exit_p = entry_price * (1 + stop_loss / 100)
-            exit_d = d
-            exit_reason = f'止损{stop_loss}%'
-            break
-
-        exit_p, exit_d = b['close'], d
-
-    if exit_reason == '' and not capped:
-        exit_reason = '持仓到期'
-    return {
-        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
-        'exit_reason': exit_reason,
-        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
-        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
-        'open': bool(capped),
-    }
+    """龙回头出场模拟 — Phase 2 facade: 实现已迁 strategies/dragon_callback.py。"""
+    from app.market_cn.auto.strategies.dragon_callback import (
+        run_backtest_dragon_callback as _impl,
+    )
+    return _impl(bars, entry_idx, entry_price, hold_days=hold_days, stop_loss=stop_loss,
+                 board_type=board_type, stop_at_idx=stop_at_idx)
 
 
 # ================================================================
