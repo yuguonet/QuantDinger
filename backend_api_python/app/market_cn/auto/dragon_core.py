@@ -471,114 +471,10 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-
     }
 
 
-def _ma_bull_at(bars, ci):
-    """确认日均线多头排列: MA5>MA10>MA20 (ci=确认日索引); 数据不足(上市<20日)返回None"""
-    if ci + 1 < 20:
-        return None
-    c = [float(b['close']) for b in bars[ci - 19:ci + 1]]
-    ma5 = sum(c[-5:]) / 5
-    ma10 = sum(c[-10:]) / 10
-    ma20 = sum(c) / 20
-    return ma5 > ma10 > ma20
-
-
 def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params):
-    """给定连板区间[streak_start,streak_end], 计算断板期并执行回测的5a-5e确认。
-
-    与 strategy_break_buy 中"买点之前"的判定完全一致(同一段代码), 供回测和
-    break_today 今日检测共用, 保证 --today 与回测逻辑严格对齐。
-    返回信号dict(含 break_date/break_days/break_chg/break_gap/break_vol_r)或 None。
-    """
-    bt = get_board_type(code)
-    streak_len = streak_end - streak_start + 1
-    if streak_len < min_streak:
-        return None
-
-    # 断板期: 涨停日后连续非涨停的天数
-    break_idx = streak_end + 1
-    if break_idx >= len(bars):
-        return None
-    limit_bar = bars[streak_end]
-    limit_open = float(limit_bar['open'])
-    limit_close = float(limit_bar['close'])
-    limit_vol = float(limit_bar['volume'])
-    break_days = 0
-    for j in range(break_idx, min(break_idx + max_break_gap + 1, len(bars))):
-        if is_limit_up(bars[j]['close'], bars[j - 1]['close'], bt):
-            break  # 遇到新涨停, 断板期结束
-        break_days += 1
-
-    if break_days == 0:
-        # 涨停后直接又是涨停 → 连板加速, 不是断板
-        return None
-
-    # 5. 断板期各项检查 (与 strategy_break_buy 完全一致)
-    break_bars = bars[break_idx:break_idx + break_days]
-    first_break = break_bars[0]
-
-    # 5a. 断板期低点不能跌破涨停日开盘价 (支撑有效)
-    break_low = min(float(b['low']) for b in break_bars)
-    if break_low < limit_open:
-        return None
-
-    # 5b. 断板期缩量检查 (vs 涨停日量)
-    break_vol_avg = sum(float(b['volume']) for b in break_bars) / len(break_bars)
-    break_vol_r = break_vol_avg / limit_vol if limit_vol > 0 else 0
-    if break_vol_r < params['vol_min'] or break_vol_r >= params['vol_max']:
-        return None
-
-    # 5c. 第一个断板日涨跌过滤: vs 涨停日收盘, 允许 first_break_chg_min ~ +8%
-    first_break_chg = (first_break['close'] / limit_close - 1) * 100
-    if first_break_chg < params.get('first_break_chg_min', -5) or first_break_chg >= 8:
-        return None
-
-    # 5d. 第一个断板日开盘过滤: 高开不超过 5%, 低开不低于 first_break_gap_min
-    first_break_gap = (first_break['open'] / limit_close - 1) * 100
-    if first_break_gap < params.get('first_break_gap_min', -3) or first_break_gap >= 5:
-        return None
-
-    # 5e. 回撤检查
-    break_drawdown = (break_low / limit_close - 1) * 100
-    if break_drawdown < params['drawdown_max']:
-        return None
-
-    # 5f. 确认日特征 + 增强过滤 (三通道OR, 满足其一即可)
-    #     通道1: 确认日涨跌 [0,2)  通道2: 断板期均量比>=1.4  通道3: 连板前20日涨幅>=30 (热度)
-    #     确认日 = 断板期最后一天; 特征仅用当日及以前数据, as-of 安全, 回测与 --today 共用本判定
-    confirm_bar = break_bars[-1]
-    confirm_prev = break_bars[-2] if len(break_bars) >= 2 else limit_bar
-    _c_prev_close = float(confirm_prev['close'])
-    confirm_chg = (float(confirm_bar['close']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
-    confirm_gap = (float(confirm_bar['open']) / _c_prev_close - 1) * 100 if _c_prev_close > 0 else 0.0
-    pre20_gain = None
-    if streak_start >= 20:
-        _pre_ref = float(bars[streak_start - 20]['close'])
-        if _pre_ref > 0:
-            pre20_gain = (limit_close / _pre_ref - 1) * 100
-    if params.get('enhance_filter', True):
-        _pass_chg = params.get('confirm_chg_min', 0.0) <= confirm_chg < params.get('confirm_chg_max', 2.0)
-        _pass_vol = break_vol_r >= params.get('vol_r_or_min', 1.4)
-        _pass_hot = pre20_gain is not None and pre20_gain >= params.get('pre20_min', 30.0)
-        if not (_pass_chg or _pass_vol or _pass_hot):
-            return None
-
-    # 5g. 均线多头排列 (确认日 MA5>MA10>MA20): 剔除断板期处于均线纠缠/空头的弱信号
-    ma_bull = _ma_bull_at(bars, break_idx + break_days - 1)
-    if params.get('ma_bull_filter', True) and ma_bull is False:
-        return None
-
-    return {
-        'break_idx': break_idx, 'break_days': break_days,
-        'break_date': bars[break_idx]['time'],
-        'streak_len': streak_len, 'streak_start': bars[streak_start]['time'], 'streak_end': bars[streak_end]['time'],
-        'break_chg': round(first_break_chg, 2),
-        'break_gap': round(first_break_gap, 2),
-        'break_vol_r': round(break_vol_r, 2),
-        'confirm_chg': round(confirm_chg, 2),
-        'confirm_gap': round(confirm_gap, 2),
-        'pre20_gain': round(pre20_gain, 2) if pre20_gain is not None else None,
-        'ma_bull': ma_bull,
-    }
+    """断板期计算+5a~5g确认 — Phase 2 facade: 实现已迁 strategies/break_buy.py。"""
+    from app.market_cn.auto.strategies.break_buy import _break_signal_at as _impl
+    return _impl(bars, code, streak_start, streak_end, min_streak, max_break_gap, params)
 
 
 def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
@@ -613,79 +509,20 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
 
 def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=None,
                            limit_ups=None, stock_info=None):
-    """断板 今日(D0)信号: 判断今日是否为断板期的确认日, 与回测买点前规则完全一致
+    """断板 今日(D0)信号 — Phase 2 facade: 实现已迁 strategies/break_buy.py (BreakStrategy)。
 
     原则: --today 时"买入当日(次日D1开盘)由人工判别", 今日(D0)及以前规则与回测
-    strategy_break_buy 的"买点之前"完全一致。断板策略的确认点在断板期最后一天收盘
-    (buy_mode=next_open, 买入=次日), 因此今日(D0) = 断板期的最后一天, 而非首断板日。
-    断板期指标(5a低点/5b平均量比/5c首日涨跌/5d首日gap/5e回撤)复用 _break_signal_at,
-    与回测逐条一致, 绝不引入未来数据。
-
-    返回空list或单元素list。
+    strategy_break_buy 的"买点之前"完全一致。确认点在断板期最后一天收盘。
+    today_str: 指定今日日期, 为空则用最后一天。返回空list或单元素list。
     """
-    result = []
-    n = len(bars)
-    if n < 3:
-        return result
+    from app.market_cn.auto.strategies.break_buy import BreakStrategy, _signal_to_legacy_dict
+    as_of = None
     if today_str:
-        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        idxs = [j for j, b in enumerate(bars) if b["time"] == today_str]
         if not idxs:
-            return result
-        i = idxs[-1]
-    else:
-        i = n - 1
-    if i < 2:
-        return result
-    bt = get_board_type(code)
-    params = BOARD_PARAMS.get(bt, BOARD_PARAMS['main'])
-
-    # 寻找所有连板结构, 要求断板期最后一天 == 今日(i)
-    for lu_idx in (limit_ups if limit_ups is not None else find_limit_ups(bars[:i], bt)):
-        # 连板第一板确认 (lu_idx 前一日非涨停)
-        is_first = True
-        for k in range(1, min(11, lu_idx + 1)):
-            if lu_idx - k - 1 >= 0 and is_limit_up(bars[lu_idx - k]['close'], bars[lu_idx - k - 1]['close'], bt):
-                is_first = False; break
-        if not is_first:
-            continue
-        # 连板结束位置
-        streak_start = lu_idx; streak_end = lu_idx
-        while streak_end < i - 1 and is_limit_up(bars[streak_end + 1]['close'], bars[streak_end]['close'], bt):
-            streak_end += 1
-        # 断板期必须且只能在今日结束: break_idx > streak_end 且 break_days 全落在 <=i,
-        # 断板期最后一天(break_idx+break_days-1) == i 才意味着今日收盘可确认、明日买入。
-        sig = _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params)
-        if not sig:
-            continue
-        if sig['break_idx'] + sig['break_days'] - 1 != i:
-            continue
-        circ = float((stock_info or {}).get('circ_shares') or 0)
-        total = float((stock_info or {}).get('total_shares') or 0)
-        turnover_anchor = round(float(bars[streak_end]['volume']) / circ * 100, 2) if circ > 0 else None
-        turnover_confirm = round(float(bars[i]['volume']) / circ * 100, 2) if circ > 0 else None
-        turnover_anchor_t = round(float(bars[streak_end]['volume']) / total * 100, 2) if total > 0 else None
-        turnover_confirm_t = round(float(bars[i]['volume']) / total * 100, 2) if total > 0 else None
-        result.append({
-            'code': code, 'board': get_board_name(code), 'path': 'break_buy', 'path_label': '断板',
-            'mode': 'streak_break',
-            'streak_len': sig['streak_len'],
-            'streak_start': sig['streak_start'],
-            'streak_end': sig['streak_end'],
-            'break_date': sig['break_date'],
-            'signal_date': bars[i]['time'],
-            'break_days': sig['break_days'],
-            'break_chg': sig['break_chg'],
-            'break_gap': sig['break_gap'],
-            'break_vol_r': sig['break_vol_r'],
-            'confirm_chg': sig['confirm_chg'],
-            'confirm_gap': sig['confirm_gap'],
-            'pre20_gain': sig['pre20_gain'],
-            'ma_bull': sig['ma_bull'],
-            'turnover_anchor': turnover_anchor,
-            'turnover_sig': turnover_confirm,
-            'turnover_anchor_total': turnover_anchor_t,
-            'turnover_sig_total': turnover_confirm_t,
-            'entry_price': None, 'buy_mode': 'next_open',
-        })
-        break  # 只取一个信号
-    return result
+            return []
+        as_of = idxs[-1]
+    sigs = BreakStrategy().scan_signals(
+        bars, code, as_of=as_of, limit_ups=limit_ups,
+        min_streak=min_streak, max_break_gap=max_break_gap, stock_info=stock_info)
+    return [_signal_to_legacy_dict(s, code) for s in sigs]
