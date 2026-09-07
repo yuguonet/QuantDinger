@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta
 
 from app.utils.logger import get_logger
 
@@ -36,54 +35,11 @@ _BACKEND_ROOT_DEFAULT = None  # 由 app 包上下文提供
 
 
 # ================================================================
-# 数据加载 (与 test_dragon.fetch_kline_db 同口径: DB 1D + 前复权)
+# 数据加载 (已迁 data/kline.py, 此处 re-export 保持外部 import 路径不变)
 # ================================================================
-
-def fetch_kline_db(code, days=300):
-    """从 DB 加载日K (前复权), 返回 list[dict] (time/open/high/low/close/volume)。"""
-    from datetime import datetime as _dt
-    end = (_dt.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    start = (_dt.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
-    try:
-        from app.utils.db_market import get_market_kline_writer
-        from app.data_sources.provider.adjustment import unadj_to_qfq
-        writer = get_market_kline_writer()
-        data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
-        if not data:
-            return []
-        return unadj_to_qfq([{
-            "time": str(r["time"])[:10],
-            "open": float(r["open"]),
-            "high": float(r["high"]),
-            "low": float(r["low"]),
-            "close": float(r["close"]),
-            "volume": float(r["volume"]),
-        } for r in data], code)
-    except Exception as e:
-        logger.debug("[dragon_scan] kline %s 加载失败: %s", code, e)
-        return []
-
-
-def fetch_stock_info_db():
-    """全量 stock_basic_info: {symbol: {name, circ_shares, ...}} (换手率/市值/ST过滤用)。"""
-    from app.utils.basicinfo_db import get_stock_basic_db
-    db = get_stock_basic_db()
-    pool = db._get_pool()
-    with pool.cursor() as cur:   # 注意: 该 pool 返回元组行 (与 test_dragon 原实现一致)
-        cur.execute(
-            "SELECT symbol, name, circ_shares, total_shares FROM stock_basic_info WHERE status='active'"
-        )
-        rows = cur.fetchall()
-    out = {}
-    for row in rows:
-        out[row[0]] = {"name": row[1] or "", "circ_shares": float(row[2] or 0),
-                       "total_shares": float(row[3] or 0)}
-    return out
-
-
-def all_codes():
-    from app.utils.basicinfo_db import get_stock_basic_db
-    return get_stock_basic_db().market_all_codes(status="active")
+from app.market_cn.auto.data.kline import (  # noqa: E402,F401
+    fetch_kline_db, fetch_stock_info_db, all_codes,
+)
 
 
 # ================================================================

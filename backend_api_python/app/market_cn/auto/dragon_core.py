@@ -15,6 +15,7 @@
   - app/market_cn/auto/dragon_monitor.py : 盘中状态机 (60s)
 
 本模块保持零 IO / 零 print, 只做纯判定。
+2026-09-07 Phase 1: 指标/市场函数/统一预过滤已提取至 common/ (本模块 re-export, 对外 API 不变)。
 修改任何规则后必须重跑回测对数 (方案2基线见 龙回头优化分析_20260906/ 分析日志)。
 
 易错点:
@@ -23,165 +24,16 @@
 """
 from __future__ import annotations
 
-def get_board_type(code):
-    c = str(code)[:3]
-    return "gem_star" if c.startswith("30") or c.startswith("68") else "main"
-
-def get_board_name(code):
-    c = str(code)[:3]
-    if c.startswith("68"): return "科创板"
-    elif c.startswith("30"): return "创业板"
-    elif c.startswith("6"): return "沪主板"
-    elif c.startswith(("0", "2")): return "深主板"
-    return "未知"
-
-def is_limit_up(close, prev_close, board_type):
-    threshold = 0.098 if board_type == "main" else 0.198
-    if prev_close <= 0: return False
-    return (close / prev_close - 1) >= threshold * 0.98
-
-def find_limit_ups(bars, board_type):
-    """找到所有涨停日索引。"""
-    result = []
-    for i in range(1, len(bars)):
-        if is_limit_up(bars[i]['close'], bars[i-1]['close'], board_type):
-            result.append(i)
-    return result
-
-
-# ================================================================
-# 技术指标辅助 (与 test_dragon.py 同名函数逐字一致; 仅 tech_score 参考
-# 输出与 RSI 质量排除使用, 不做评分门槛)
-# ================================================================
-
-def ema(values, period):
-    """计算EMA (指数移动平均)"""
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = sum(values[:period]) / period  # 初始值用SMA
-    for v in values[period:]:
-        e = v * k + e * (1 - k)
-    return e
-
-def rsi(closes, period=14):
-    """计算RSI (相对强弱指数)"""
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    # 初始SMA
-    avg_g = sum(gains[:period]) / period
-    avg_l = sum(losses[:period]) / period
-    # EMA平滑
-    for i in range(period, len(gains)):
-        avg_g = (avg_g * (period - 1) + gains[i]) / period
-        avg_l = (avg_l * (period - 1) + losses[i]) / period
-    if avg_l == 0:
-        return 100.0
-    rs = avg_g / avg_l
-    return 100 - 100 / (1 + rs)
-
-def calc_macd(closes, fast=12, slow=26, signal=9):
-    """计算MACD, 返回 (dif, dea, macd_hist) 三个序列
-
-    MACD柱 = 2*(DIF-DEA), DIF=EMA(fast)-EMA(slow), DEA=EMA(DIF,signal)
-    """
-    n = len(closes)
-    if n < slow + signal:
-        return None, None, None
-    # 计算EMA序列
-    ema_fast = [0.0] * n
-    ema_slow = [0.0] * n
-    k_f = 2 / (fast + 1)
-    k_s = 2 / (slow + 1)
-    ema_fast[0] = closes[0]
-    ema_slow[0] = closes[0]
-    for i in range(1, n):
-        ema_fast[i] = closes[i] * k_f + ema_fast[i-1] * (1 - k_f)
-        ema_slow[i] = closes[i] * k_s + ema_slow[i-1] * (1 - k_s)
-    # DIF序列
-    dif = [ema_fast[i] - ema_slow[i] for i in range(n)]
-    # DEA = EMA(DIF, signal)
-    dea = [0.0] * n
-    k_sig = 2 / (signal + 1)
-    dea[0] = dif[0]
-    for i in range(1, n):
-        dea[i] = dif[i] * k_sig + dea[i-1] * (1 - k_sig)
-    # MACD柱 = 2*(DIF-DEA)
-    hist = [2 * (dif[i] - dea[i]) for i in range(n)]
-    return dif, dea, hist
-
-def calc_bollinger_bw(closes, period=20, num_std=2):
-    """计算布林带宽百分比 = (upper-lower)/middle*100, 仅返回带宽值"""
-    if len(closes) < period:
-        return None
-    window = closes[-period:]
-    mid = sum(window) / period
-    if mid <= 0:
-        return None
-    var = sum((x - mid) ** 2 for x in window) / period
-    std = var ** 0.5
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    return (upper - lower) / mid * 100
-
-def calc_roc(closes, period=10):
-    """计算变动率 ROC = (close[i]-close[i-period])/close[i-period]*100"""
-    if len(closes) < period + 1:
-        return None
-    ref = closes[-1 - period]
-    if ref <= 0:
-        return None
-    return (closes[-1] - ref) / ref * 100
-
-def calc_psy(closes, period=12):
-    """计算心理线 PSY = 过去period天中上涨天数/period*100"""
-    if len(closes) < period + 1:
-        return None
-    up_days = 0
-    for i in range(-period, 0):
-        if closes[i] > closes[i-1]:
-            up_days += 1
-    return up_days / period * 100
-
-def is_macd_golden_cross(dif, dea, lookback=3):
-    """判断MACD是否在最近lookback根K线内发生金叉 (DIF上穿DEA)"""
-    if dif is None or dea is None or len(dif) < lookback + 1:
-        return False
-    n = len(dif)
-    if dif[n-1] < dea[n-1]:
-        return False  # 当前DIF在DEA下方
-    for i in range(max(0, n - lookback - 1), n - 1):
-        if dif[i] < dea[i]:
-            return True
-    return False
-
-def is_macd_hist_turning_positive(hist, lookback=3):
-    """判断MACD柱是否在最近lookback根内由负转正 (绿柱缩短→红柱)"""
-    if hist is None or len(hist) < lookback + 1:
-        return False
-    n = len(hist)
-    if hist[n-1] <= 0:
-        return False  # 当前柱还是负的
-    for i in range(max(0, n - lookback - 1), n - 1):
-        if hist[i] < 0:
-            return True
-    return False
-
-def is_macd_hist_shrinking_negative(hist, lookback=5):
-    """判断MACD绿柱是否在缩短 (负柱绝对值在减小)"""
-    if hist is None or len(hist) < lookback:
-        return False
-    n = len(hist)
-    recent = hist[n - lookback:]
-    if any(h >= 0 for h in recent):
-        return False
-    abs_vals = [abs(h) for h in recent]
-    return abs_vals[-1] < abs_vals[-2] < abs_vals[-3] if len(abs_vals) >= 3 else abs_vals[-1] < abs_vals[-2]
+from app.market_cn.auto.common.market import (  # noqa: F401  (re-export, 对外API不变)
+    get_board_type, get_board_name, is_limit_up, find_limit_ups,
+)
+from app.market_cn.auto.common.indicators import (  # noqa: F401
+    ema, rsi, calc_macd, calc_bollinger_bw, calc_roc, calc_psy,
+    is_macd_golden_cross, is_macd_hist_turning_positive, is_macd_hist_shrinking_negative,
+)
+from app.market_cn.auto.common.filters import (  # noqa: F401
+    PREFILTER_PARAMS, unified_prefilter,
+)
 
 
 # ================================================================
@@ -470,43 +322,6 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
 # 易错点: 龙回头/断板的 U2/U3 必须锚定涨停日评估, 不能用缩量信号日
 #         (D0是缩量小阴日, 换手天然低, @D0评估会误杀)。
 # ================================================================
-PREFILTER_PARAMS = {
-    'turnover_min': 3.0,        # U2 换手率% 下限 (全市场验证: +0.7pp; 用户经验口径5%更严, 会误杀低换手大盘样本)
-    'float_mv_min': 20.0,       # U3 流通市值下限(亿) (统一层20~500亿; 严格30~300会误杀600105)
-    'float_mv_max': 500.0,      # U3 流通市值上限(亿)
-    'heat_ret20_min': 10.0,     # U4 前期热度: 20日涨幅% 下限 (与prior_lu或关系)
-    'heat_prior_lu_min': 1,     # U4 前20日涨停次数下限 (或关系, 不含D0)
-}
-
-def unified_prefilter(bars, i, code, code_info=None):
-    """统一前置过滤 U1~U4, 在判定日 i 收盘可知数据上判定。
-
-    code_info 为该股的 stock_basic_info 字典 (含 name/circ_shares), 不是全量映射。
-    返回 (ok, fail_reasons)。code_info 缺失时跳过 U1/U2/U3 (不误杀), U4 仍生效。
-    """
-    p = PREFILTER_PARAMS
-    fails = []
-    # U1 非ST (名称兜底; 涨停阈值已自然排除ST, 此处防漏)
-    if code_info and code_info.get('name') and 'ST' in str(code_info['name']).upper():
-        fails.append('U1_ST')
-    # U2 换手率 / U3 流通市值
-    if code_info and code_info.get('circ_shares'):
-        turnover = bars[i]['volume'] / code_info['circ_shares'] * 100
-        if turnover < p['turnover_min']:
-            fails.append(f'U2换手{turnover:.1f}')
-        float_mv = code_info['circ_shares'] * bars[i]['close'] / 1e8
-        if not (p['float_mv_min'] <= float_mv <= p['float_mv_max']):
-            fails.append(f'U3市值{float_mv:.0f}亿')
-    # U4 前期热度: 20日涨幅>=10% 或 前20日有涨停 (不含D0)
-    bt = get_board_type(code)
-    has_lu = any(is_limit_up(bars[j]['close'], bars[j-1]['close'], bt)
-                 for j in range(max(1, i - 19), i))
-    ret20 = bars[i]['close'] / bars[i - 20]['close'] - 1 if i >= 20 and bars[i - 20]['close'] > 0 else None
-    if not has_lu and (ret20 is None or ret20 * 100 < p['heat_ret20_min']):
-        fails.append('U4冷门')
-    return (not fails), fails
-
-
 # ================================================================
 # V1 / 断板 判定与出场 (2026-09-04 提取, 与 test_dragon.py 共用)
 # ================================================================
