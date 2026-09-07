@@ -2,9 +2,38 @@
   "version": 1,
   "_comment": "自动策略配置 (当前唯一配置域)。enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。",
   "strategies": {
-    "dragon_callback": {"enabled": true, "daily_limit": 5},
-    "v1": {"enabled": true, "daily_limit": 5},
-    "break": {"enabled": true, "daily_limit": 5},
-    "relay3": {"enabled": true, "daily_limit": 2}
+    "dragon_callback": {
+      "enabled": true,
+      "daily_limit": 5
+    },
+    "v1": {
+      "enabled": true,
+      "daily_limit": 5
+    },
+    "break": {
+      "enabled": true,
+      "daily_limit": 5
+    },
+    "relay3": {
+      "enabled": true,
+      "daily_limit": 2
+    },
+    "knife_catch": {
+      "enabled": true,
+      "daily_limit": 0,
+      "params": {
+        "gain_max": -8.0,
+        "amp_min": 12.0,
+        "pos_max": 0.1,
+        "tail_min": 0.5,
+        "vw_max": 0.2,
+        "mkt_gate": -1.0,
+        "vol_max": 1.5,
+        "pre5_max": -15.0,
+        "streak_min": 2,
+        "stop_pct": -5.0,
+        "hold_days": 1
+      }
+    }
   }
 }

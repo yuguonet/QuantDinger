@@ -170,6 +170,12 @@ def _dragon_strategy_monitor():
     run_monitor_safe()
 
 
+def _dragon_strategy_knife_scan():
+    """盘中尾盘: 反向接刀 14:56 窗口扫描 (14:30 触发预热, 14:56 判定, 不过早占用资源)"""
+    from app.market_cn.auto.dragon_scan import run_scan_knife
+    run_scan_knife()
+
+
 def _refresh_backfill_1m():
     """盘后: 回填当日 1m K 线"""
     from app.data_sources.backfill_db import run_1m
@@ -292,6 +298,7 @@ TASKS = [
     Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
     # 自动策略组: 盘后扫描(1D就绪后) + 盘中状态机(60s), 龙回头Pro已于2026-09-06下线
     Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=16, trigger_minute=30),
+    Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_day=True, trigger_hour=14, trigger_minute=30),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
 ]
 

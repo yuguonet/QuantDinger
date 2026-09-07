@@ -286,6 +286,13 @@ def run_monitor():
             for r in guard_rows:
                 if r.get("exit_reason"):
                     continue
+                s_obj = _strategy_of(r)
+                if s_obj is None:
+                    continue
+                # T+1 保护: 尾盘入场策略 (knife_catch 14:56买) 当日不可卖, 跳过当日止损/出场
+                if getattr(s_obj, "entry_at_close", False) and \
+                        str(r.get("entry_date") or "")[:10] == today:
+                    continue
                 snap = snaps.get(r["code"])
                 if not snap:
                     continue
@@ -296,12 +303,10 @@ def run_monitor():
                                  detail={"marked": today, "stop_price": stop_px})
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
                     continue
-                # 策略 live 出场 (relay3 S4 炸板即卖; 其它策略 live → hold)
-                s_obj = _strategy_of(r)
-                if s_obj is None:
-                    continue
+                # 策略 live 出场 (relay3 S4 炸板即卖 / knife_catch D1开盘卖; 其它策略 live → hold)
                 dec = s_obj.exit_decision(r, snap={"mode": "live",
-                                                   "series": series_all.get(r["code"]) or []})
+                                                   "series": series_all.get(r["code"]) or [],
+                                                   "today": today})
                 if dec.action == "exit" and dec.price:
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=dec.reason,
                                  exit_price=round(float(dec.price), 3),
@@ -362,12 +367,23 @@ def run_monitor():
                                  d1_chg=dec.d1_chg, d1_vol_r=dec.d1_vol_r,
                                  detail=dec.detail or {})
 
-    # ── 6. exit_today 隔日开盘执行 (补记账) → closed ──
+    # ── 6. exit_today 执行平账 → closed ──
+    #    默认: 隔日开盘执行 (补记账, exit_price 覆写为实际开盘价);
+    #    exit_exec_same_day 策略 (knife_catch D1当日卖): 当日 14:55 后平账, 保留标记时价格
     if hm >= "09:30":
         for r in exit_rows:
             if r.get("exit_date"):
                 continue
             marked = (r.get("extra") or {}).get("marked") or str(r.get("updated_at"))[:10]
+            s_obj = _strategy_of(r)
+            same_day = s_obj is not None and getattr(s_obj, "exit_exec_same_day", False)
+            if same_day:
+                if marked >= today and hm < "14:55":
+                    continue      # 当日执行的行, 等到尾盘再平账
+                keep_px = float(r.get("exit_price") or 0)
+                ds.set_state(r["id"], ds.S_CLOSED, exit_date=today,
+                             exit_price=round(keep_px, 3) if keep_px > 0 else None)
+                continue
             if marked >= today:
                 continue
             snaps = latest_snapshot([r["code"]])

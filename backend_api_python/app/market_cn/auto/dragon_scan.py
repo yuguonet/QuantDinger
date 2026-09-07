@@ -136,13 +136,16 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
                 continue
             # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
             kept = []
-            for s in sigs:
-                idx = _anchor_idx(bars, s, strat)
-                if idx is None:
-                    continue
-                ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
-                if ok:
-                    kept.append(s)
+            if not getattr(strat, "use_unified_prefilter", True):
+                kept = list(sigs)
+            else:
+                for s in sigs:
+                    idx = _anchor_idx(bars, s, strat)
+                    if idx is None:
+                        continue
+                    ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
+                    if ok:
+                        kept.append(s)
             rows.extend(dragon_store.signal_row(key, s, name) for s in kept)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
@@ -167,15 +170,130 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     return {"status": "ok", "target": target, "codes": len(codes), "signals": result.get("written", 0)}
 
 
+def run_scan_knife(max_wait_sec=2400, wait_data=True):
+    """盘中窗口扫描 (kind=intraday_window 策略, 当前仅 knife_catch)。
+
+    调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
+    流程: 14:30 启动 → 等待到 14:56 (用户要求不过早占用资源, 窗口内仅预热) →
+      1. 全市场最新快照 (realtime_snapshot 表, 60s 采集) → 市场门控 mkt_gain
+      2. 策略 intraday_shortlist 便宜预筛 (gain/amp/pos, 免拉全市场序列)
+      3. 候选股补拉当日快照序列+日线 → scan_signals 完整判定 (tail/vw/质量过滤)
+      4. 落库 state=buy_today (signal_state), entry_date/price=14:56 快照, 止损价
+    幂等: upsert ON CONFLICT, 重跑不重复。手动: python -m ...dragon_scan --knife [--no-wait]
+    """
+    from app.market_cn.auto import dragon_store
+    from app.market_cn.auto import strategies as strat_reg
+
+    strat_reg.autodiscover()
+    active = {k: s for k, s in strat_reg.all_strategies().items()
+              if strat_reg.is_enabled(k) and s.scan_spec.kind == "intraday_window"}
+    if not active:
+        return {"status": "no_intraday_strategy"}
+
+    dragon_store.ensure_tables()
+    from app.market_cn.auto.dragon_monitor import (
+        latest_snapshot, fetch_day_snapshots, _today,
+    )
+
+    # 等待到判定时刻 14:56 (14:30 触发后仅预热等待; --no-wait 手动立即跑)
+    if wait_data:
+        deadline = time.time() + max_wait_sec
+        while _now_hm_str() < "14:56":
+            if time.time() > deadline:
+                logger.warning("[knife_scan] 等待超时, 放弃本次")
+                return {"status": "timeout"}
+            time.sleep(30)
+
+    today = _today()
+    all_codes_list = all_codes()
+    snaps = latest_snapshot(all_codes_list)
+    if not snaps:
+        logger.warning("[knife_scan] 无快照数据, 放弃")
+        return {"status": "no_snapshot"}
+
+    # 市场门控: 全市场均涨幅 (as-of 最新快照)
+    gains = []
+    for s in snaps.values():
+        try:
+            last, pc = float(s.get("last") or 0), float(s.get("previousClose") or 0)
+        except (TypeError, ValueError):
+            continue
+        if last > 0 and pc > 0:
+            gains.append((last / pc - 1) * 100)
+    mkt_gain = sum(gains) / len(gains) if gains else 0.0
+
+    # ST / 北交所 通用排除 (knife 回测口径)
+    try:
+        stock_info = fetch_stock_info_db()
+    except Exception:
+        stock_info = {}
+
+    def _st_ok(code):
+        nm = (stock_info.get(code) or {}).get("name", "") or ""
+        return "ST" not in nm.upper()
+
+    rows = []
+    t0 = time.time()
+    for key, strat in active.items():
+        params = strat_reg.params_override(key)
+        shortlist = strat.intraday_shortlist(snaps, mkt_gain, **params)
+        logger.info("[knife_scan] %s 便宜预筛: %d/%d (mkt=%.2f%%)",
+                    key, len(shortlist), len(snaps), mkt_gain)
+        for code, snap in shortlist.items():
+            if not _st_ok(code):
+                continue
+            name = (stock_info.get(code) or {}).get("name", "")
+            bars = fetch_kline_db(code, days=60)
+            series = fetch_day_snapshots([code]).get(code) or []
+            try:
+                sigs = strat.scan_signals(bars, code, ctx={
+                    "latest": snap, "series": series, "mkt_gain": mkt_gain,
+                }, **params)
+            except Exception as e:
+                logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)
+                continue
+            for s in sigs:
+                row = dragon_store.signal_row(key, s, name)
+                row["state"] = getattr(strat, "signal_state", "watch_pending")
+                if row["state"] == "buy_today":
+                    row["entry_date"] = today
+                    row["entry_price"] = float(s.price or 0) or None
+                    row["stop_price"] = strat.initial_stop(code, float(s.price or 0))
+                rows.append(row)
+        # daily_limit (config.json; 0=不截断 — 用户裁定: 全拿优于Top3截断)
+        grp = [r for r in rows if r["strategy"] == key]
+        cap = strat_reg.daily_limit(key)
+        if cap and len(grp) > cap:
+            logger.info("[knife_scan] %s 信号 %d 笔超限额, 截断至 %d", key, len(grp), cap)
+            rows = [r for r in rows if r["strategy"] != key] + \
+                sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
+
+    result = dragon_store.upsert_scan_signals(today, rows)
+    dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
+    logger.info("[knife_scan] 完成: 快照 %d, 信号 %d 笔 (%.0fs)",
+                len(snaps), result.get("written", 0), time.time() - t0)
+    return {"status": "ok", "target": today, "signals": result.get("written", 0),
+            "mkt_gain": round(mkt_gain, 3)}
+
+
+def _now_hm_str():
+    from app.market_cn.auto.dragon_monitor import _now_hm
+    return _now_hm()
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="盘后全市场扫描 (注册表分发, 手动)")
     parser.add_argument("--run", action="store_true", help="执行扫描")
     parser.add_argument("--days", type=int, default=320, help="向前取N个交易日")
     parser.add_argument("--no-wait", action="store_true", help="不等待数据就绪")
+    parser.add_argument("--knife", action="store_true", help="执行盘中接刀扫描 (手动)")
     args = parser.parse_args()
     if args.run:
         summary = run_scan(days=args.days, wait_data=not args.no_wait)
+        print(summary)
+    elif args.knife:
+        summary = run_scan_knife(wait_data=not args.no_wait)
         print(summary)
     else:
         parser.print_help()

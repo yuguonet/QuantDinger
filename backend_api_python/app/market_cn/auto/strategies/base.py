@@ -89,6 +89,11 @@ class StrategyBase:
       prefilter_anchor  U1~U4 锚定日: 'signal'=信号日(末根bar) | 'limit_up'=最近涨停日
       scan_spec         调度契约 (默认盘后一次)
       default_params    策略参数默认值 (config.json strategies.<key>.params 可覆盖)
+      use_unified_prefilter  扫描层是否做 U1~U4 统一预过滤 (默认 True; 回测未含 U1~U4 的策略设 False)
+      signal_state      扫描落库初始状态 (默认 watch_pending; 盘中即买策略设 buy_today)
+      entry_at_close    入场在尾盘/收盘 (T+1 当日不可卖, monitor 止损守卫跳过当日; 默认 False)
+      exit_exec_same_day     出场当日执行并当日平账 (默认 False=次日开盘执行)
+      intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
     """
 
     key: str = ""
@@ -97,6 +102,10 @@ class StrategyBase:
     entry_style: str = "a"             # qd_dragon_signals.entry_style (同策略多形态时区分)
     scan_spec: ScanSpec = field(default_factory=ScanSpec)
     default_params: dict = field(default_factory=dict)
+    use_unified_prefilter: bool = True
+    signal_state: str = "watch_pending"
+    entry_at_close: bool = False
+    exit_exec_same_day: bool = False
 
     # ---- 信号判定 (回测即信号: 实盘 as_of=None 只判末根bar; 回测 as_of=k 判第k根) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):

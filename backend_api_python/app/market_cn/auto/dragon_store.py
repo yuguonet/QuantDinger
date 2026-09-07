@@ -200,6 +200,9 @@ SIGNAL_EXTRA_KEYS = (
     "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
     "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
     "pre20_gain", "board_height", "lu_vol_ratio", "rsi",
+    # knife_catch (反向接刀, 2026-09-08)
+    "gain", "amplitude", "pos_range", "tail_ret", "vw_frac",
+    "vol_ratio", "down_streak", "pre5_gain", "lu_recent", "mkt_gain",
 )
 
 
@@ -239,10 +242,12 @@ def _strategy_meta(key):
 
 
 def upsert_scan_signals(trade_date: str, rows: list):
-    """盘后扫描结果写入 (幂等): rows 为各策略 (dragon_callback/v1/break/relay3) 的今日信号列表, 行内带 strategy 键。
+    """扫描结果写入 (幂等): rows 为各策略今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
+    行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
+    (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
     """
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
@@ -255,11 +260,14 @@ def upsert_scan_signals(trade_date: str, rows: list):
         n = 0
         for s in rows:
             extra = {k: s.get(k) for k in SIGNAL_EXTRA_KEYS if s.get(k) is not None}
+            state = s.get("state") or S_WATCH_PENDING
             cur.execute(f"""
                 INSERT INTO {_SIGNALS_TABLE}
                     (trade_date, strategy, code, name, board, entry_style, score, state,
-                     signal_date, signal_price, lu_date, pullback_days, extra, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                     signal_date, signal_price, lu_date, pullback_days, extra,
+                     entry_date, entry_price, stop_price, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, NOW())
                 ON CONFLICT (trade_date, strategy, code, entry_style) DO UPDATE SET
                     name = EXCLUDED.name, score = EXCLUDED.score, state = EXCLUDED.state,
                     signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
@@ -267,10 +275,11 @@ def upsert_scan_signals(trade_date: str, rows: list):
                     extra = EXCLUDED.extra, updated_at = NOW()
             """, (
                 trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
-                s.get("style", "a"), int(s.get("score", 0)), S_WATCH_PENDING,
+                s.get("style", "a"), int(s.get("score", 0)), state,
                 s.get("signal_date"), s.get("signal_price"),
                 s.get("lu_date"), s.get("pullback_days"),
                 json.dumps(extra, ensure_ascii=False, default=str),
+                s.get("entry_date"), s.get("entry_price"), s.get("stop_price"),
             ))
             n += 1
         db.commit()
