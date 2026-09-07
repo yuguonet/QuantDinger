@@ -7313,6 +7313,7 @@ registerOverlay({
       error,
       loadingHistory,
       chartRef,
+      markerTip,
       // 左侧百分比轴三件套必须导出给模板：缺失时 v-if="pctAxisVisible" 取到 undefined，
       // 轴 DOM 根本不会挂载（这正是此前"左轴始终不显示"的根因），refs 也拿不到元素
       pctAxisVisible,
