@@ -515,10 +515,10 @@ BOARD_PARAMS = {
     # ma_bull_filter: 均线多头排列过滤 — 已评估: 胜率持平、均收益略增, 作用不大, 默认关闭
     "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
              "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
-             "first_break_gap_min": 0},
+             "first_break_gap_min": -3, "first_break_chg_min": 1.0},
     "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
                  "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
-                 "first_break_gap_min": 0},
+                 "first_break_gap_min": -3, "first_break_chg_min": 1.0},
 }
 
 
@@ -708,9 +708,9 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
     if break_vol_r < params['vol_min'] or break_vol_r >= params['vol_max']:
         return None
 
-    # 5c. 第一个断板日涨跌过滤: vs 涨停日收盘, 允许 -5% ~ +8%
+    # 5c. 第一个断板日涨跌过滤: vs 涨停日收盘, 允许 first_break_chg_min ~ +8%
     first_break_chg = (first_break['close'] / limit_close - 1) * 100
-    if first_break_chg < -5 or first_break_chg >= 8:
+    if first_break_chg < params.get('first_break_chg_min', -5) or first_break_chg >= 8:
         return None
 
     # 5d. 第一个断板日开盘过滤: 高开不超过 5%, 低开不低于 first_break_gap_min
