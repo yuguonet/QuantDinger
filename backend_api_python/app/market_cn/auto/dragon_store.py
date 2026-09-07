@@ -10,8 +10,6 @@
   - signals 表是唯一事实源; qd_watchlist 策略组行只是活跃信号的"投影"
   - 全部幂等: 重复执行不产生脏数据
   - 单用户部署: 写 user_id=1 (DRAGON_USER_ID), 所有用户可见同一策略组
-  - 2026-09-06: 龙回头Pro(dragon2) 下线, strategy 改为 dragon_callback(方案2);
-    ensure_tables 会清理 dragon2 历史残留行
 """
 from __future__ import annotations
 
@@ -126,7 +124,7 @@ def ensure_tables():
             cur.execute("ALTER TABLE qd_watchlist ADD COLUMN strategy_detail JSONB")
         if "sort_order" not in existing:
             cur.execute("ALTER TABLE qd_watchlist ADD COLUMN sort_order INTEGER DEFAULT 0")
-        # 组名统一为 自动策略组 (旧名 龙回头Pro 迁移)
+        # 组名统一为 自动策略组 (旧名迁移)
         cur.execute("UPDATE qd_watchlist SET group_name = %s WHERE group_name = %s",
                     (DRAGON_GROUP_NAME, "龙回头Pro"))
 
@@ -156,8 +154,7 @@ def ensure_tables():
                     raise
                 logger.info("[dragon_store] UNIQUE 约束已存在(重名跳过): %s", e)
 
-        # ── 4. 龙回头Pro(dragon2) 残留清理 (2026-09-06 下线):
-        #     事实行删除后, 组内投影由 sync_watchlist_group 对账自动删除 ──
+        # ── 4. 历史残留清理 ──
         cur.execute(f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = 'dragon2'")
 
         db.commit()
@@ -358,7 +355,7 @@ def _display_detail(s):
     """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。"""
     strat = s.get("strategy") or DRAGON_STRATEGY
     _es = s.get("entry_style") or ""
-    # entry_style 的 (a)/(b) 文案是旧龙回头Pro概念; 龙回头方案2固定填 'a', 无含义
+    # entry_style 文案: dragon_callback 固定填 'a' 无含义
     _es_txt = "" if strat == "dragon_callback" else (
         "(a)缩量企稳" if _es == "a" else ("(b)放量启动" if _es == "b" else _es))
     return {

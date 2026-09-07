@@ -3,12 +3,10 @@
 触发: scheduler Task "dragon_scan" (once_per_day, 16:30, 在 post_market_batch 1D 回填之后)
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
-  2. 全市场逐股跑四策略判定 (与回测同一份 dragon_core):
-     dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
+  2. 全市场逐股跑策略判定 (与回测同一份 dragon_core):
+     dragon_callback(龙回头·方案2) / v1 / break(断板)
   3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
-
-注: 龙回头Pro(dragon2, 八因子评分版)已于 2026-09-06 下线 (信号太多无法人工复核)。
 
 手动运行:
   python -m app.market_cn.auto.dragon_scan --run [--days 320]
