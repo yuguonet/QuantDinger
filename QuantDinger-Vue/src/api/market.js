@@ -10,6 +10,7 @@ const marketApi = {
   GetWatchlistPrices: '/api/market/watchlist/prices',
   GetDragonToday: '/api/market/dragon/today',
   GetDragonMarkers: '/api/market/dragon/markers',
+  GetDragonStrategies: '/api/market/dragon/strategies',
   ReorderWatchlist: '/api/market/watchlist/reorder',
   // Analysis
   MultiAnalysis: '/api/analysis/multiAnalysis',
@@ -114,6 +115,16 @@ export function getWatchlistPrices (parameter) {
 export function getDragonToday () {
   return request({
     url: marketApi.GetDragonToday,
+    method: 'get'
+  })
+}
+
+/**
+ * 自动策略组: 策略元数据 (key/name/enabled/daily_limit/winrate)
+ */
+export function getDragonStrategies () {
+  return request({
+    url: marketApi.GetDragonStrategies,
     method: 'get'
   })
 }

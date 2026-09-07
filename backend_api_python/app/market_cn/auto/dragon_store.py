@@ -27,6 +27,19 @@ DRAGON_MARKET = "CNStock"
 DRAGON_STRATEGY = "dragon_callback"
 STRATEGIES = ("dragon_callback", "v1", "break", "relay3")
 STRATEGY_LABELS = {"dragon_callback": "龙回头", "v1": "V1", "break": "断板", "relay3": "3板接力"}
+
+
+def strategy_labels():
+    """策略中文名: 注册表 name 优先, STRATEGY_LABELS 静态兜底 (历史行可能含已删策略键)。"""
+    labels = dict(STRATEGY_LABELS)
+    try:
+        from app.market_cn.auto import strategies as _reg
+        for key, s in _reg.all_strategies().items():
+            if getattr(s, "name", ""):
+                labels[key] = s.name
+    except Exception:
+        pass
+    return labels
 # 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
 # dragon_callback = 方案2 全市场验证 (2026-09-06, 龙回头优化分析_20260906/)
 STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 51.3, "relay3": 53.4}
@@ -369,8 +382,9 @@ def get_markers(code, days=60):
         cur.close()
 
     markers = []
+    _labels = strategy_labels()
     for r in rows:
-        sname = STRATEGY_LABELS.get(r.get("strategy"), r.get("strategy", ""))
+        sname = _labels.get(r.get("strategy"), r.get("strategy", ""))
         if r.get("signal_date") and r.get("signal_price"):
             markers.append({"time": r["signal_date"], "side": "signal",
                             "price": float(r["signal_price"]),
@@ -401,7 +415,7 @@ def _display_detail(s):
     return {
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
         "strategy": strat,
-        "strategy_label": STRATEGY_LABELS.get(strat, strat),
+        "strategy_label": strategy_labels().get(strat, strat),
         "winrate": STRATEGY_WINRATE.get(strat),
         "state_label": STATE_LABELS.get(s["state"], s["state"]),
         "entry_style": _es_txt,

@@ -59,3 +59,24 @@ def dragon_markers():
         return jsonify({'code': 1, 'msg': 'success', 'data': ds.get_markers(symbol, days)})
     except Exception as e:
         return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
+
+
+@dragon_bp.route('/dragon/strategies', methods=['GET'])
+@login_required
+def dragon_strategies():
+    """自动策略元数据 (前端 wrMap 去硬编码): [{key, name, enabled, daily_limit, winrate}]"""
+    try:
+        from app.market_cn.auto import strategies as strat_reg
+        strat_reg.autodiscover()
+        items = []
+        for key, s in sorted(strat_reg.all_strategies().items()):
+            items.append({
+                'key': key,
+                'name': getattr(s, 'name', key),
+                'enabled': strat_reg.is_enabled(key),
+                'daily_limit': strat_reg.daily_limit(key),
+                'winrate': ds.STRATEGY_WINRATE.get(key),
+            })
+        return jsonify({'code': 1, 'msg': 'success', 'data': items})
+    except Exception as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500

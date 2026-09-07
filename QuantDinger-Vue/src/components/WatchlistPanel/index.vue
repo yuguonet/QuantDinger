@@ -438,7 +438,7 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, reorderWatchlist, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
+import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, reorderWatchlist, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 
 const DEFAULT_GROUP_NAME = '默认自选'
@@ -454,6 +454,7 @@ export default {
   data () {
     return {
       watchlistPriceTimer: null,
+      strategyWinrates: {},
       watchlistPrices: {},
       dragKey: null,
       dragOverKey: null,
@@ -562,7 +563,7 @@ export default {
       const isStrategy = rows.some(s => s.strategy_state)
       if (!isStrategy) return rows
       const weight = { 'exit_today': 0, 'holding': 1, 'buy_today': 2, 'watch_pending': 3 }
-      const wrMap = { 'v1': 76.5, 'break': 62.7, 'dragon_callback': 51.3 }
+      const wrMap = this.strategyWinrates || {}
       return rows.slice().sort((a, b) => {
         const wa = weight[a.strategy_state] !== undefined ? weight[a.strategy_state] : 9
         const wb = weight[b.strategy_state] !== undefined ? weight[b.strategy_state] : 9
@@ -582,6 +583,7 @@ export default {
     this.loadMarketTypes()
     this.loadWatchlist()
     this.loadPositionData()
+    this.loadStrategyMeta()
   },
   mounted () {
     this.startWatchlistPriceRefresh()
@@ -915,6 +917,16 @@ export default {
           this.loadWatchlist()
         }
       } catch (error) { /* silent */ } finally { this.loadingUserInfo = false }
+    },
+    async loadStrategyMeta () {
+      try {
+        const res = await getDragonStrategies()
+        if (res && res.code === 1 && Array.isArray(res.data)) {
+          const map = {}
+          res.data.forEach(s => { map[s.key] = s.winrate || 0 })
+          this.strategyWinrates = map
+        }
+      } catch (error) { /* silent: 兜底空map, 排序退化为按score */ }
     },
     async loadWatchlist () {
       if (!this.userId) return
