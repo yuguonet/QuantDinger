@@ -548,7 +548,13 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 continue
 
         # 入场: 次日(D+1)开盘价 —— 第i日收盘后即可确定, 无未来数据
+        # D1 入场 gap 过滤: 与系统 auto/strategies/dragon_callback.py entry_decision 一致
+        # (d1_gap_lo <= gap <= d1_gap_hi = [-3%, +2%]), 高开2%以上不追/低开3%以下不接
+        d0 = bars[i]
         d1 = bars[i + 1]
+        d1_gap = (d1['open'] / d0['close'] - 1) * 100 if d0['close'] > 0 else 0
+        if not (-3.0 <= d1_gap <= 2.0):
+            continue
         entry_price = d1['open']
         if entry_price <= 0:
             continue
@@ -563,6 +569,7 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
             'entry_date': d1['time'],
             'entry_price': round(entry_price, 3),
             'buy_mode': 'next_open',
+            'd1_gap': round(d1_gap, 2),
             **result,
         })
 
@@ -982,14 +989,6 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
 
         triggered = None  # 今日(today收盘)触发的出场, 应明日执行
 
-        if is_v1 and d == 2:
-            intraday = t.get('intraday', 0)
-            if intraday < 3:
-                # 明日开盘清仓
-                if idx == today_idx:
-                    return {'status': 'open', 'today_action': 'D1日内动量<3%, 明日开盘清仓',
-                            'hold_days': d, 'curr_ret': (b['close'] / entry_price - 1) * 100}
-                return {'status': 'closed', 'exit_reason': 'D1日内动量<3% 明日开盘清仓', 'exit_date': b['time']}
         if peak_enabled:
             ret = (b['close'] / entry_price - 1) * 100
             if ret > peak_ret:
@@ -1007,6 +1006,20 @@ def simulate_holding_to_today(bars, t, today_idx, board_type):
                 triggered = triggered or f'追踪止损{cur_trail}%'
         if b['low'] <= entry_price * (1 + stop / 100):
             triggered = triggered or f'止损{stop}%'
+
+        # V1 D1弱动量: D1收盘即可判定 → D2开盘清仓 (与回测 run_backtest 语义一致:
+        # 判定数据是D1的日内动量, 执行点是D2开盘价; 故必须在d==1判定, 不能拖到d==2)
+        # 放在止损检查之后: D1盘中先看是否触发止损, 未触发才走弱动量规则
+        if is_v1 and d == 1 and not triggered:
+            intraday = t.get('intraday', 0)
+            if intraday < 3:
+                if idx == today_idx:
+                    return {'status': 'open', 'today_action': 'D1日内动量<3%, 明日开盘清仓',
+                            'hold_days': d, 'curr_ret': (b['close'] / entry_price - 1) * 100}
+                exit_idx = entry_idx + 1  # D2开盘已清仓
+                exit_date = bars[exit_idx]['time'] if exit_idx < len(bars) else b['time']
+                return {'status': 'closed', 'exit_reason': 'D1日内动量<3% D2开盘清仓',
+                        'exit_date': exit_date}
 
         if idx == today_idx and triggered:
             # today收盘已触发出场规则 → 明日开盘清仓
