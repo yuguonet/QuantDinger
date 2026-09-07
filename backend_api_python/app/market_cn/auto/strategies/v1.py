@@ -70,6 +70,7 @@ class V1Strategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # D0 即涨停日, U1~U4 锚定信号日评估
+    entry_style = "v1"
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(PARAMS)
 

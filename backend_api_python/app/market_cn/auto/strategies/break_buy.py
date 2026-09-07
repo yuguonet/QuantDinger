@@ -199,6 +199,7 @@ class BreakStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # 锚定确认日(末根bar); 连板≥2已隐含U4
+    entry_style = "brk"
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DEFAULT_PARAMS)
 

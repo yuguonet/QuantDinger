@@ -179,6 +179,52 @@ def _row_to_dict(r):
     return d
 
 
+# extra 落库白名单 (Signal.extra ∩ 白名单 → qd_dragon_signals.extra JSON)
+SIGNAL_EXTRA_KEYS = (
+    "turnover_anchor", "turnover_sig", "turnover_anchor_total", "turnover_sig_total",
+    "float_mcap_yi", "ma60_slope",
+    "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
+    "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
+    "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
+    "pre20_gain", "board_height", "lu_vol_ratio", "rsi",
+)
+
+
+def signal_row(strategy_key, sig, name=""):
+    """Signal → qd_dragon_signals 行 dict (扫描器通用转换, 替代各策略手写补字段)。
+
+    口径与旧 dragon_scan 后处理逐字段等价:
+      entry_style = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
+      score       = sig.score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
+      signal_price= sig.price (0 → None; break 不定价)
+      lu_date/pullback_days 来自 extra; extra 仅白名单键落库 (None 剔除)
+    """
+    ex = sig.extra or {}
+    from app.market_cn.auto.common.market import get_board_name
+    row = {
+        "strategy": strategy_key,
+        "code": sig.code,
+        "name": name,
+        "board": ex.get("board") or get_board_name(sig.code),
+        "style": getattr(_strategy_meta(strategy_key), "entry_style", "a"),
+        "score": int(sig.score or 0),
+        "signal_date": sig.time,
+        "signal_price": float(sig.price) if sig.price else None,
+        "lu_date": ex.get("lu_date"),
+        "pullback_days": ex.get("pullback_days"),
+    }
+    row.update({k: ex[k] for k in SIGNAL_EXTRA_KEYS if ex.get(k) is not None})
+    return row
+
+
+def _strategy_meta(key):
+    try:
+        from app.market_cn.auto import strategies as _reg
+        return _reg.get_strategy(key)
+    except Exception:
+        return None
+
+
 def upsert_scan_signals(trade_date: str, rows: list):
     """盘后扫描结果写入 (幂等): rows 为各策略 (dragon_callback/v1/break/relay3) 的今日信号列表, 行内带 strategy 键。
 
@@ -195,13 +241,7 @@ def upsert_scan_signals(trade_date: str, rows: list):
         purged = cur.rowcount
         n = 0
         for s in rows:
-            extra = {k: s.get(k) for k in
-                     ("turnover_anchor", "turnover_sig", "turnover_anchor_total", "turnover_sig_total",
-                      "float_mcap_yi", "ma60_slope",
-                      "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
-                      "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
-                      "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
-                      "pre20_gain", "board_height", "lu_vol_ratio", "rsi") if s.get(k) is not None}
+            extra = {k: s.get(k) for k in SIGNAL_EXTRA_KEYS if s.get(k) is not None}
             cur.execute(f"""
                 INSERT INTO {_SIGNALS_TABLE}
                     (trade_date, strategy, code, name, board, entry_style, score, state,

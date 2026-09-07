@@ -84,6 +84,7 @@ class StrategyBase:
     key: str = ""
     name: str = ""
     prefilter_anchor: str = "signal"
+    entry_style: str = "a"             # qd_dragon_signals.entry_style (同策略多形态时区分)
     scan_spec: ScanSpec = field(default_factory=ScanSpec)
     default_params: dict = field(default_factory=dict)
 

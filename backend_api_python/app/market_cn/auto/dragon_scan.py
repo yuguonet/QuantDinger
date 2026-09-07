@@ -62,17 +62,22 @@ def _data_ready(target: str) -> bool:
 # ================================================================
 
 def run_scan(days=320, wait_data=True, max_wait_sec=3600):
-    """盘后全市场扫描。返回摘要 dict。
+    """盘后全市场扫描 (Phase 3: 注册表分发, 策略增删不改本函数)。返回摘要 dict。
 
     - trade_date = last_finish_trading_day()
-    - 信号写 signals 表 (state=watch_pending, 待次日 D1 9:26/15:00 由 monitor 处置)
+    - 遍历注册表中 enabled 且 kind=daily_close 的策略, 统一: 判定 → U1~U4 预过滤
+      (锚点=策略 prefilter_anchor) → daily_limit 截断(score降序) → 标准化行落库
     - 组对账 (活跃集不变时无操作, 防漂移)
     """
-    from app.market_cn.auto.dragon_core import (
-        DRAGON_CB_PARAMS, dragon_cb_today_d0_signals, unified_prefilter,
-        v1_today_d0_signals, break_today_d0_signals, find_limit_ups, get_board_type,
-    )
-    from app.market_cn.auto import dragon_store, relay3
+    from app.market_cn.auto import dragon_store
+    from app.market_cn.auto import strategies as strat_reg
+    from app.market_cn.auto.common.filters import unified_prefilter
+    from app.market_cn.auto.common.market import is_limit_up, get_board_type
+
+    strat_reg.autodiscover()
+    active = {k: s for k, s in strat_reg.all_strategies().items()
+              if strat_reg.is_enabled(k) and s.scan_spec.kind == "daily_close"}
+    logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
     dragon_store.ensure_tables()
     target = _target_date()
@@ -95,7 +100,22 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         logger.warning("[dragon_scan] stock_basic_info 加载失败(%s), 换手/市值过滤降级", e)
         stock_info = {}
 
-    params = dict(DRAGON_CB_PARAMS)  # 龙回头"方案2"参数 (自动化固定形态: 判定仅到 D0, 次日开盘买)
+    def _anchor_idx(bars, sig, strat):
+        """U1~U4 锚定日索引: 'signal'=末根bar; 'limit_up'=信号 extra lu_date, 兜底最近涨停日。"""
+        n = len(bars)
+        if strat.prefilter_anchor == "limit_up":
+            lu_date = (sig.extra or {}).get("lu_date")
+            if lu_date:
+                j = next((j for j, b in enumerate(bars) if b["time"] == lu_date), None)
+                if j is not None:
+                    return j
+            board_type = get_board_type(sig.code)
+            for j in range(n - 1, 0, -1):
+                if is_limit_up(bars[j]["close"], bars[j - 1]["close"], board_type):
+                    return j
+            return None
+        return n - 1
+
     rows = []
     t0 = time.time()
     for i, code in enumerate(codes):
@@ -107,70 +127,37 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
             bars = [b for b in bars if b["time"] <= target]
         if not bars:
             continue
-        try:
-            sigs = dragon_cb_today_d0_signals(bars, code, params=params)
-        except Exception as e:
-            logger.debug("[dragon_scan] %s 判定异常: %s", code, e)
-            continue
-        # U1~U4 统一预过滤: 锚定涨停日评估 (与回测 strategy_dragon_callback 同口径;
-        # 易错点: 不能用缩量信号日评估换手率, 会误杀)
-        kept = []
-        for s in sigs:
-            lu_idx = next((j for j, b in enumerate(bars) if b["time"] == s.get("lu_date")), None)
-            if lu_idx is None:
+        name = (stock_info.get(code) or {}).get("name", "")
+        for key, strat in active.items():
+            try:
+                sigs = strat.scan_signals(bars, code, **strat_reg.params_override(key))
+            except Exception as e:
+                logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
                 continue
-            ok, _fails = unified_prefilter(bars, lu_idx, code, stock_info.get(code))
-            if ok:
-                kept.append(s)
-        for s in kept:
-            s["strategy"] = "dragon_callback"
-            s["name"] = (stock_info.get(code) or {}).get("name", "")
-        rows.extend(kept)
-
-        # ── V1: D0 四因子 (涨停+强趋势+回踩+OBV+非放量) ──
-        try:
-            v1s = v1_today_d0_signals(bars, code)
-            # U1~U4 统一预过滤: V1 的 D0 即涨停日, 锚定信号日(末根bar)评估 (与回测同口径)
-            v1s = [s for s in v1s
-                   if unified_prefilter(bars, len(bars) - 1, code, stock_info.get(code))[0]]
-            for s in v1s:
-                s["strategy"] = "v1"
-                s["style"] = "v1"
-                s["score"] = int(min(99, max(0, s.get("ret_20d", 0) or 0)))
-                s["signal_date"] = s.get("d0_date")
-                s["signal_price"] = s.get("d0_close")
-                s["name"] = (stock_info.get(code) or {}).get("name", "")
-            rows.extend(v1s)
-        except Exception as e:
-            logger.debug("[dragon_scan] %s V1判定异常: %s", code, e)
-
-        # ── 断板: 连板≥2 → 断板期确认 (确认日=断板期最后一天) ──
-        try:
-            brks = break_today_d0_signals(bars, code)
-            # U1~U4 统一预过滤: 锚定确认日(末根bar)评估 (与回测同口径; 连板≥2已隐含U4)
-            brks = [s for s in brks
-                    if unified_prefilter(bars, len(bars) - 1, code, stock_info.get(code))[0]]
-            for s in brks:
-                s["strategy"] = "break"
-                s["style"] = "brk"
-                s["score"] = int(s.get("confirm_chg", 0) or 0) + 10
-                s["signal_price"] = None
-                s["name"] = (stock_info.get(code) or {}).get("name", "")
-            rows.extend(brks)
-        except Exception as e:
-            logger.debug("[dragon_scan] %s 断板判定异常: %s", code, e)
-
-        # ── 3板接力: 昨日恰3连板 + MA多头 (2026-09-06 回测新增) ──
-        try:
-            r3s = relay3.relay3_today_d0_signals(bars, code)
-            for s in r3s:
-                s["name"] = (stock_info.get(code) or {}).get("name", "")
-            rows.extend(r3s)
-        except Exception as e:
-            logger.debug("[dragon_scan] %s 3板接力判定异常: %s", code, e)
+            # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
+            kept = []
+            for s in sigs:
+                idx = _anchor_idx(bars, s, strat)
+                if idx is None:
+                    continue
+                ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
+                if ok:
+                    kept.append(s)
+            rows.extend(dragon_store.signal_row(key, s, name) for s in kept)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
                         i + 1, len(codes), len(rows), time.time() - t0)
+
+    # 每日信号入库上限 (per-strategy 全市场口径, config.json daily_limit; score 降序截断)
+    capped = []
+    for key in active:
+        grp = [r for r in rows if r["strategy"] == key]
+        cap = strat_reg.daily_limit(key)
+        if cap and len(grp) > cap:
+            logger.info("[dragon_scan] %s 信号 %d 笔超限额, 截断至 %d (score降序)", key, len(grp), cap)
+            grp = sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
+        capped.extend(grp)
+    rows = capped
 
     result = dragon_store.upsert_scan_signals(target, rows)
     dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
@@ -182,7 +169,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="龙回头/V1/断板/3板接力 盘后扫描 (手动)")
+    parser = argparse.ArgumentParser(description="盘后全市场扫描 (注册表分发, 手动)")
     parser.add_argument("--run", action="store_true", help="执行扫描")
     parser.add_argument("--days", type=int, default=320, help="向前取N个交易日")
     parser.add_argument("--no-wait", action="store_true", help="不等待数据就绪")

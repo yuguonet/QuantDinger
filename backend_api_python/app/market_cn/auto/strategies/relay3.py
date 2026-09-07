@@ -215,7 +215,8 @@ def _signal_to_legacy_dict(sig: Signal) -> dict:
 class Relay3Strategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
-    prefilter_anchor = "signal"        # relay3 不参与 U1~U4 统一层 (3板+MA多头自成池子)
+    prefilter_anchor = "limit_up"      # U1~U4 锚定最近涨停日 (3板日; Phase 3 顺手修复旧扫描漏过滤)
+    entry_style = "r3"
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(PARAMS)
 

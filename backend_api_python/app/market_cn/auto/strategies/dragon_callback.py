@@ -296,7 +296,7 @@ class DragonCallbackStrategy(StrategyBase):
             result.append(Signal(
                 code=code,
                 time=bars[i]["time"],
-                score=50,
+                score=0,   # 历史口径: 方案2无评分体系, 库内 score 恒0 (与旧 dragon_scan 后处理一致)
                 price=round(d0["close"], 3),
                 label="龙回头",
                 extra={
