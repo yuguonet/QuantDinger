@@ -44,7 +44,8 @@ DRAGON_CB_PARAMS = dict(
     rsi6_exclude_lt=30.0,
     d0_ma20_exclude_lt=-8.0,
     # --- 入场 ---
-    d1_gap_lo=-3.0, d1_gap_hi=2.0,
+    # (2026-09-07 用户裁定: 移除 D1 gap 范围过滤 [-3,+2] — 信号本身已筛选,
+    #  高开/低开由用户自行判断, 展示更多股票; 300日回测无过滤 114笔/74.6%/+3.28% 两段均正)
     # --- 出场 ---
     hold_days=7,
     stop_loss=-8.0,
@@ -323,10 +324,9 @@ class DragonCallbackStrategy(StrategyBase):
 
     # ---- D1 竞价处置 ----
     def entry_decision(self, row, snap=None, **params):
-        """D1 开盘 gap ∈ [d1_gap_lo, d1_gap_hi] = (-3%, +2%]。
+        """D1 开盘一律可买 (2026-09-07 移除 gap∈[-3,+2] 范围过滤)。
 
-        高开>2%不追(追高亏损率高), 低开<-3%不接(破位风险)。"""
-        p = self.merged_params(params or None)
+        gap 仅记录在 reason 供用户参考, 高开/低开由用户自行取舍。"""
         if not snap:
             return EntryDecision(False, "无竞价快照")
         open_px = float(snap.get("open") or snap.get("last") or 0)
@@ -336,9 +336,8 @@ class DragonCallbackStrategy(StrategyBase):
         if prev_close <= 0:
             return EntryDecision(False, "昨收缺失")
         gap = (open_px / prev_close - 1) * 100
-        if p["d1_gap_lo"] <= gap <= p["d1_gap_hi"]:
-            return EntryDecision(True, f"gap={gap:.2f}% 可买")
-        return EntryDecision(False, f"gap={gap:.2f}% 越界({p['d1_gap_lo']},{p['d1_gap_hi']}]")
+        tag = "高开" if gap > 2 else ("低开" if gap < -3 else "")
+        return EntryDecision(True, f"gap={gap:.2f}% 可买{tag}")
 
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):

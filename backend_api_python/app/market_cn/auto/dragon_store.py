@@ -41,8 +41,8 @@ def strategy_labels():
         pass
     return labels
 # 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
-# dragon_callback = 方案2 全市场验证 (2026-09-06, 龙回头优化分析_20260906/)
-STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 51.3, "relay3": 53.4}
+# dragon_callback = 方案2 (2026-09-07, test_dragon 300日回测, 无D1 gap过滤新口径: 114笔/74.6%/+3.28%)
+STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 74.6, "relay3": 53.4}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)

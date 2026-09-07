@@ -82,7 +82,7 @@ V1核心参数:
 │ 待优化 (需补充D0盘中数据, 当前K线仅OHLCV):                                 │
 │   - D0涨停时间: 10:00前封板 vs 14:00封板, 强度完全不同                     │
 │   - D0封单量/成交量比: 封单越大越强                                         │
-│   - D0是否一字板: 一字板=极强, 但实盘买不进 (已由D1 gap过滤自然排除)        │
+│   - D0是否一字板: 一字板=极强, 但实盘买不进 (gap过滤已移除, 回测对极高开偏乐观)│
 │   - D0动量强度可决定D1追涨幅度上限                                         │
 │   - ✅ 纯单板过热过滤已解决 (MACD柱+布林带宽, 见因子5)                     │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -253,7 +253,7 @@ DRAGON_CB_PARAMS = dict(
     rsi6_exclude_lt=30.0,
     d0_ma20_exclude_lt=-8.0,
     # --- 入场 ---
-    d1_gap_lo=-3.0, d1_gap_hi=2.0,
+    # (2026-09-07 用户裁定: 移除 D1 gap 范围过滤 [-3,+2], 与系统 entry_decision 同步)
     # --- 出场 ---
     hold_days=7,
     stop_loss=-8.0,
@@ -1302,13 +1302,11 @@ def strategy_dragon_callback(bars, code, min_pullback_days=3, max_pullback_days=
                 continue
 
         # 入场: 次日(D+1)开盘价 —— 第i日收盘后即可确定, 无未来数据
-        # D1 入场 gap 过滤: 与系统 auto/strategies/dragon_callback.py entry_decision 一致
-        # (d1_gap_lo <= gap <= d1_gap_hi = [-3%, +2%]), 高开2%以上不追/低开3%以下不接
+        # D1 gap 范围过滤已移除 (2026-09-07 用户裁定, 对齐系统 entry_decision):
+        # 信号本身已筛选, 高开/低开由用户自行判断; d1_gap 仅记录供观察
         d0 = bars[i]
         d1 = bars[i + 1]
         d1_gap = (d1['open'] / d0['close'] - 1) * 100 if d0['close'] > 0 else 0
-        if not (-3.0 <= d1_gap <= 2.0):
-            continue
         entry_price = d1['open']
         if entry_price <= 0:
             continue
