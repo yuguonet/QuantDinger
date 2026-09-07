@@ -95,6 +95,17 @@
               class="chip-overlay__canvas"
             ></canvas>
           </div>
+          <!-- 买卖点标记悬停详情: fixed 定位跟随触发点, 不受容器 overflow 裁剪 -->
+          <div
+            v-if="markerTip.visible"
+            class="bs-marker-tip"
+            :class="{ 'bs-marker-tip--dark': chartTheme === 'dark' }"
+            :style="{ left: markerTip.x + 'px', top: markerTip.y + 'px' }"
+          >
+            <div class="bs-marker-tip__head" :style="{ color: markerTip.color }">{{ markerTip.title }}</div>
+            <div class="bs-marker-tip__row"><span>价格</span><b>{{ markerTip.price }}</b></div>
+            <div class="bs-marker-tip__row"><span>日期</span><b>{{ markerTip.time }}</b></div>
+          </div>
         </div>
         <canvas
           ref="wmCanvasRef"
@@ -234,8 +245,8 @@ export default {
       type: Boolean,
       default: true
     },
-    /** 龙回头Pro 买卖点标记 [{time, side: signal/buy/sell, price, label}]；为空时组件自动按 symbol 拉取 */
-    dragonMarkers: {
+    /** 通用买卖点标记 [{time, side: signal/buy/sell, price, label}]；为空时组件自动按 symbol 拉取 */
+    tradeMarkers: {
       type: Array,
       default: () => []
     },
@@ -278,18 +289,87 @@ export default {
     let _resizeRafId = null
 
     // ═══════════════════════════════════════════════════════
-    // 龙回头Pro 买卖点标记 (B/S 标注在日线/分时图上)
+    // 通用 B/S 买卖点标记 (日线/分时图 overlay)
+    // 数据源: 策略信号系统标记接口, 覆盖全部策略; 本组件只负责
+    // 通用展示, 不感知具体策略语义。
+    // 视觉: 自定义 tradeMarker overlay = 实心圆点 + 竖直虚线 + 箭头 + 文字,
+    // 颜色与蜡烛图红绿配色方案实时同步 (cn=买红卖绿 / intl=买绿卖红),
+    // 悬停(或点击)显示完整 label 详情 (策略名/价格/日期)。
+    // 注: 内置 simpleAnnotation 的图形全部 ignoreEvent, 无法悬停, 故自注册。
     // ═══════════════════════════════════════════════════════
-    const dragonMarkerSource = shallowRef([])
+    const tradeMarkerSource = shallowRef([])
+    /** 买卖点 overlay 分组 id (重挂前按组整体清除) */
+    const TRADE_MARKER_GROUP = 'tradeMarkers'
+    /** 当前蜡烛图配色方案: cn=红涨绿跌, intl=绿涨红跌 (由 setChartColorScheme 维护) */
+    const chartColorScheme = ref('cn')
+    /** 标记悬停详情状态 (template 中 .bs-marker-tip) */
+    const markerTip = reactive({ visible: false, x: 0, y: 0, title: '', price: '', time: '', color: '' })
 
-    /** 应用标记: 清除旧 overlay → 按日期映射到 bar → simpleAnnotation 画 B/S */
-    const applyDragonMarkers = () => {
+    /** 标记侧颜色: 与蜡烛图涨跌色同步 (取值与 setChartColorScheme/initChart 的 bar 颜色一致) */
+    const _markerSideColors = () => {
+      const isDark = props.theme === 'dark'
+      const intl = chartColorScheme.value === 'intl'
+      const up = intl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d')
+      const down = intl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
+      return { buy: up, sell: down, signal: '#d97706' }
+    }
+
+    /** 悬停/点击显示标记详情 (fixed 定位, 视口内夹紧防溢出) */
+    const _showMarkerTip = (m, title, color, e) => {
+      markerTip.visible = true
+      markerTip.title = title
+      markerTip.price = Number.isFinite(Number(m.price)) ? Number(m.price).toFixed(2) : '--'
+      markerTip.time = m.time || ''
+      markerTip.color = color
+      let x = e && Number.isFinite(e.pageX) ? e.pageX - window.pageXOffset : 0
+      let y = e && Number.isFinite(e.pageY) ? e.pageY - window.pageYOffset : 0
+      if (x + 220 > window.innerWidth) x = Math.max(0, x - 232)
+      if (y + 110 > window.innerHeight) y = Math.max(0, y - 120)
+      markerTip.x = x + 14
+      markerTip.y = y - 8
+    }
+
+    /** 注册自定义标记 overlay: 圆点+竖直虚线+箭头+文字, 图形不忽略事件以便悬停 */
+    registerOverlay({
+      name: 'tradeMarker',
+      totalStep: 2,
+      styles: { line: { style: 'dashed' } },
+      createPointFigures ({ overlay, coordinates }) {
+        const ext = overlay.extendData || {}
+        const color = ext.color || '#d97706'
+        const x = coordinates[0].x
+        const y = coordinates[0].y
+        const lineEndY = y - 46
+        const arrowTipY = lineEndY - 6
+        return [
+          { type: 'circle', attrs: { x, y, r: 3 }, styles: { style: 'stroke_fill', color, borderColor: color, borderSize: 1 } },
+          { type: 'line', attrs: { coordinates: [{ x, y }, { x, y: lineEndY }] }, styles: { style: 'dashed', color, size: 1 } },
+          { type: 'polygon', attrs: { coordinates: [{ x, y: arrowTipY }, { x: x - 4, y: lineEndY }, { x: x + 4, y: lineEndY }] }, styles: { style: 'fill', color, borderColor: color, borderSize: 1 } },
+          { type: 'text', attrs: { x, y: arrowTipY - 2, text: ext.text || '', align: 'center', baseline: 'bottom' }, styles: { color, size: 10, weight: 700 } }
+        ]
+      }
+    })
+
+    /** 应用标记: 清除旧 overlay → 按日期映射到 bar → tradeMarker 画虚线标记
+     * 幂等签名: 以"配色方案+主题+标记源+数据首末时间戳+数量"为签名, 未变化时整体跳过 —
+     * 实时 tick 只更新最后一根价格, 时间戳跨度不变; 不做此检查时每个 tick 都会
+     * 重挂全部 overlay 并重建 O(n) dayMap (性能浪费 + 日志刷屏)。 */
+    let _tradeAppliedSig = ''
+    const applyTradeMarkers = () => {
       const chart = chartRef.value
       if (!chart || typeof chart.createOverlay !== 'function' || typeof chart.removeOverlay !== 'function') return
-      try { chart.removeOverlay(o => o && o.dragonTag) } catch (_) { /* 低版本不支持过滤回调则忽略 */ }
-      const list = dragonMarkerSource.value || []
+      const list = tradeMarkerSource.value || []
       const data = klineData.value || []
-      if (!list.length || !data.length) return
+      const colors = _markerSideColors()
+      const _first = data.length ? Number(data[0].timestamp) : 0
+      const _last = data.length ? Number(data[data.length - 1].timestamp) : 0
+      const sig = `${chartColorScheme.value}|${props.theme}|${list.length}|${_first}|${_last}|${list.length ? (list[0].time || '') + '|' + (list[list.length - 1].time || '') : ''}`
+      if (sig === _tradeAppliedSig) return
+      // v9 removeOverlay 仅支持 {id/groupId/name} 对象, 不支持过滤回调 —
+      // 回调写法会静默失效导致旧标记堆积, 故统一用 groupId 分组删除
+      try { chart.removeOverlay({ groupId: TRADE_MARKER_GROUP }) } catch (_) { /* 预期内: 无标记可删 */ }
+      markerTip.visible = false
+      if (!list.length || !data.length) { _tradeAppliedSig = sig; return }
       // 日号 → bar 索引 (同时兼容 UTC 与 UTC+8 两种时间戳约定)
       const dayMap = new Map()
       data.forEach((d, i) => {
@@ -300,8 +380,8 @@ export default {
         if (!dayMap.has(k1)) dayMap.set(k1, i)
         if (!dayMap.has(k2)) dayMap.set(k2, i)
       })
-      const colors = { buy: '#15803d', sell: '#dc2626', signal: '#d97706' }
-      const texts = { buy: 'B', sell: 'S', signal: '信' }
+      const texts = { buy: '买', sell: '卖', signal: '信' }
+      const sideNames = { buy: '买入', sell: '卖出', signal: '信号' }
       const dayNumOf = (s) => {
         const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/)
         if (!m) return null
@@ -313,30 +393,31 @@ export default {
         if (dayNum === null) return
         const idx = dayMap.get(dayNum)
         if (idx === undefined) return
-        const color = colors[m.side] || '#d97706'
+        const color = colors[m.side] || colors.signal
         try {
           chart.createOverlay({
-            name: 'simpleAnnotation',
-            dragonTag: true,
+            name: 'tradeMarker',
+            groupId: TRADE_MARKER_GROUP,
+            tradeTag: true,
             points: [{ timestamp: Number(data[idx].timestamp), value: Number(m.price) }],
-            text: texts[m.side] || '信',
-            styles: {
-              symbol: { size: 13, color: color, activeColor: color },
-              text: { size: 10, color: color, weight: 700 }
-            }
+            extendData: { text: texts[m.side] || '信', color },
+            onMouseEnter: e => _showMarkerTip(m, m.label || sideNames[m.side] || '信号', color, e),
+            onClick: e => _showMarkerTip(m, m.label || sideNames[m.side] || '信号', color, e),
+            onMouseLeave: () => { markerTip.visible = false }
           })
           applied += 1
         } catch (_) { /* 单点失败不影响其它标记 */ }
       })
-      if (applied > 0 && console) console.log('[KlineChart] 龙回头Pro 标记 %d 个', applied)
+      _tradeAppliedSig = sig
+      if (applied > 0) console.log('[KlineChart] 买卖点标记 %d 个', applied)
     }
 
-    /** 拉取龙回头Pro 标记 (props 显式传入时跳过自取) */
-    const loadDragonMarkers = async () => {
-      const hasProp = Array.isArray(props.dragonMarkers) && props.dragonMarkers.length > 0
+    /** 拉取买卖点标记 (props 显式传入时跳过自取) */
+    const loadTradeMarkers = async () => {
+      const hasProp = Array.isArray(props.tradeMarkers) && props.tradeMarkers.length > 0
       if (hasProp) return
       const sym = (props.symbol || '').trim()
-      if (!sym) { dragonMarkerSource.value = []; return }
+      if (!sym) { tradeMarkerSource.value = []; return }
       try {
         const res = await request({
           url: '/api/market/dragon/markers',
@@ -344,19 +425,27 @@ export default {
           params: { symbol: sym, days: 120 }
         })
         const data = (res && typeof res === 'object' && res.data !== undefined) ? res.data : []
-        dragonMarkerSource.value = Array.isArray(data) ? data : []
+        tradeMarkerSource.value = Array.isArray(data) ? data : []
       } catch (_) {
-        dragonMarkerSource.value = []
+        tradeMarkerSource.value = []
       }
-      nextTick(applyDragonMarkers)
+      nextTick(applyTradeMarkers)
     }
 
-    watch(() => props.symbol, () => loadDragonMarkers(), { immediate: true })
-    watch(() => props.dragonMarkers, v => {
-      if (Array.isArray(v) && v.length) dragonMarkerSource.value = v
+    watch(() => props.symbol, () => loadTradeMarkers(), { immediate: true })
+    watch(() => props.tradeMarkers, v => {
+      if (Array.isArray(v) && v.length) {
+        tradeMarkerSource.value = v
+        // 原实现只赋值不应用: 数据已加载且不再变化时, 父组件后传的标记永远不会显示
+        nextTick(applyTradeMarkers)
+      }
     })
-    // 主图数据就绪/换代码后重挂标记 (分时实时 tick 不重挂, 标记不随分钟内变化)
-    watch(klineData, () => nextTick(applyDragonMarkers))
+    // 主图数据就绪/换代码后重挂标记 (applyTradeMarkers 内部有幂等签名:
+    // 只有"新K线追加/裁剪/换代码"才真正重挂, 实时 tick 中只变价格的更新被跳过)
+    watch(klineData, () => nextTick(applyTradeMarkers))
+    // 蜡烛图配色方案/主题切换后重挂标记 (签名含方案+主题, 颜色随红绿柱同步)
+    watch(chartColorScheme, () => nextTick(applyTradeMarkers))
+    watch(() => props.theme, () => nextTick(applyTradeMarkers))
 
     const wmCanvasRef = ref(null)
     const chipCanvasRef = ref(null)
@@ -4711,12 +4800,26 @@ registerOverlay({
           // P0-1: 已卸载则绝不重建图表（孤儿实例）
           if (shouldInit && !_isUnmounted) initChart()
         }
-        const ro = new ResizeObserver(() => {
-          const el = document.getElementById('kline-chart-container')
-          if (el && el.clientWidth > 0 && el.clientHeight > 0) finish(true)
-        })
-        _observers.add(ro)
-        ro.observe(container)
+        let ro = null
+        try {
+          ro = new ResizeObserver(() => {
+            const el = document.getElementById('kline-chart-container')
+            if (el && el.clientWidth > 0 && el.clientHeight > 0) finish(true)
+          })
+          _observers.add(ro)
+          ro.observe(container)
+        } catch (_) {
+          // 兼容性兜底: 老浏览器无 ResizeObserver (会直接抛异常中断 initChart),
+          // 退化为有限次 250ms 尺寸轮询 (与历史实现口径一致, 上限 ~2.5s)
+          let _tries = 0
+          const _poll = () => {
+            if (settled || _isUnmounted) return
+            const el = document.getElementById('kline-chart-container')
+            if (el && el.clientWidth > 0 && el.clientHeight > 0) { finish(true); return }
+            if (++_tries <= 10) safeTimeout(_poll, 250)
+          }
+          safeTimeout(_poll, 250)
+        }
         // 兜底：超时仍未获得尺寸则放弃（原轮询上限约 2 秒，此处略放宽）
         safeTimeout(() => finish(false), 2500)
         return
@@ -4732,6 +4835,9 @@ registerOverlay({
         }
         chartRef.value = null
         volPaneId.value = null
+        // 新实例上旧 overlay 已随销毁丢失: 复位标记幂等签名, 稍后初始化完成后重挂
+        _tradeAppliedSig = ''
+        markerTip.visible = false
       }
 
       try {
@@ -4772,6 +4878,8 @@ registerOverlay({
         }
         // 换实例后废弃左轴旧绑定（包装的 buildTicks/订阅），_syncPctRuler 会按新实例重建
         _resetPctAxisBindings()
+        // 换实例后买卖点标记已丢失: 复位签名后重挂 (数据未就绪时由 klineData watch 兜底)
+        nextTick(applyTradeMarkers)
 
         // 调试：输出图表实例的所有方法，检查是否有画线工具栏相关的方法
         if (chartRef.value) {
@@ -7119,6 +7227,9 @@ registerOverlay({
       _resetPctAxisBindings()
     }
 
+    /** 水印幂等签名: 尺寸/DPR/主题/文本均未变化时只重申样式、不重绘 —
+     * 否则 _wmTimer 的 3s 兜底会永远整幅重画 (canvas 强制重分配 + 全屏平铺 fillText)。 */
+    let _wmPaintSig = ''
     const _ensureWmLayer = () => {
       const cvs = wmCanvasRef.value
       if (!cvs) return
@@ -7127,6 +7238,12 @@ registerOverlay({
       cvs.style.opacity = '1'
       cvs.style.visibility = 'visible'
       cvs.style.pointerEvents = 'none'
+      const _wmParent = cvs.parentElement
+      if (!_wmParent) return
+      const _wmDpr = window.devicePixelRatio || 1
+      const _wmSig = `${_wmParent.clientWidth}|${_wmParent.clientHeight}|${_wmDpr}|${chartTheme.value}|${_wmText}|${_wmSub}`
+      if (_wmSig === _wmPaintSig) return
+      _wmPaintSig = _wmSig
       _paintWmCanvas()
     }
 
@@ -7273,6 +7390,8 @@ registerOverlay({
       },
       /** 切换K线配色方案: cn=红涨绿跌, intl=绿涨红跌 */
       setChartColorScheme (scheme) {
+        // 记录当前方案: 买卖点标记颜色与红绿柱同步读取此值
+        chartColorScheme.value = scheme === 'intl' ? 'intl' : 'cn'
         if (!chartRef.value) return
         const isIntl = scheme === 'intl'
         const isDark = props.theme === 'dark'
@@ -7744,6 +7863,44 @@ registerOverlay({
    观感对齐右侧金额轴：透明底、无分隔线，仅刻度短线与文字（样式运行时取自 yAxis 配置） */
 .kline-chart-with-pct {
   padding-left: 64px;
+}
+
+/* 买卖点标记悬停详情: fixed 定位跟随触发点; pointer-events:none 避免遮挡图表鼠标事件 */
+.bs-marker-tip {
+  position: fixed;
+  z-index: 1200;
+  min-width: 140px;
+  max-width: 260px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  font-size: 12px;
+  color: #333;
+  pointer-events: none;
+}
+
+.bs-marker-tip--dark {
+  background: #1f1f1f;
+  border-color: #333;
+  color: #d9d9d9;
+}
+
+.bs-marker-tip__head {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.bs-marker-tip__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  line-height: 18px;
+}
+
+.bs-marker-tip__row span {
+  opacity: 0.6;
 }
 
 .pct-axis-overlay {

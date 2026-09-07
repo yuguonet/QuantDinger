@@ -1657,11 +1657,23 @@ export default {
       try { this.experimentAbortController.abort() } catch (_) {}
       this.experimentAbortController = null
     }
+    if (this._eqResizeRafId != null) {
+      cancelAnimationFrame(this._eqResizeRafId)
+      this._eqResizeRafId = null
+    }
     window.removeEventListener('resize', this._onResize)
   },
   beforeDestroy () {
     document.removeEventListener('fullscreenchange', this._onFullscreenChange)
     document.removeEventListener('webkitfullscreenchange', this._onFullscreenChange)
+    if (this._eqResizeRafId != null) {
+      cancelAnimationFrame(this._eqResizeRafId)
+      this._eqResizeRafId = null
+    }
+    if (this._aiEditorRafId != null) {
+      cancelAnimationFrame(this._aiEditorRafId)
+      this._aiEditorRafId = null
+    }
     if (this._persistIdeUiTimer) {
       clearTimeout(this._persistIdeUiTimer)
       this._persistIdeUiTimer = null
@@ -3220,9 +3232,16 @@ export default {
                 generatedCode += json.content
                 const cleanedCode = this.cleanMarkdownCodeBlocks(generatedCode)
                 if (this.cmInstance) {
-                  this.cmInstance.setValue(cleanedCode)
-                  this.cmInstance.setCursor({ line: this.cmInstance.lineCount() - 1, ch: 0 })
-                  this.cmInstance.refresh()
+                  // rAF 合并高频 SSE chunk: setValue + 全量重高亮 + refresh 的成本随代码
+                  // 长度增长, 逐 chunk 回写会造成输入卡顿; 每帧至多回写一次即可
+                  if (this._aiEditorRafId != null) cancelAnimationFrame(this._aiEditorRafId)
+                  this._aiEditorRafId = requestAnimationFrame(() => {
+                    this._aiEditorRafId = null
+                    if (!this.cmInstance) return
+                    this.cmInstance.setValue(cleanedCode)
+                    this.cmInstance.setCursor({ line: this.cmInstance.lineCount() - 1, ch: 0 })
+                    this.cmInstance.refresh()
+                  })
                 }
               }
             } catch (err) {
@@ -3231,6 +3250,11 @@ export default {
               }
             }
           }
+        }
+        // 流结束: 取消挂起的 rAF 回写, 直接写入最终完整代码
+        if (this._aiEditorRafId != null) {
+          cancelAnimationFrame(this._aiEditorRafId)
+          this._aiEditorRafId = null
         }
         if (this.cmInstance && generatedCode) {
           const cleanedCode = this.cleanMarkdownCodeBlocks(generatedCode)
@@ -3658,8 +3682,9 @@ export default {
       if (!r || !r.equityCurve || !r.equityCurve.length) return
       const dom = this.$refs.eqChart
       if (!dom) return
-      if (this.eqChartInstance) this.eqChartInstance.dispose()
-      this.eqChartInstance = echarts.init(dom)
+      // 复用实例: 原实现每次渲染都 dispose+init (canvas 重建/事件重绑, 纯浪费);
+      // 配合下方 setOption(option, true) 全量覆盖, 行为与重建等价
+      if (!this.eqChartInstance) this.eqChartInstance = echarts.init(dom)
       const dk = this.isDarkTheme
       const data = r.equityCurve
       const isPositive = data.length > 1 && (data[data.length - 1].value || 0) >= (data[0].value || 0)
@@ -3701,8 +3726,18 @@ export default {
             ])
           }
         }]
-      })
-      this._onResize = () => { if (this.eqChartInstance) this.eqChartInstance.resize() }
+      }, true)
+      // resize 处理器只创建一次并用 rAF 节流: 原实现每次渲染都新建匿名监听器重新挂到
+      // window 上, 旧监听器因引用被替换永远无法 remove (泄漏 + N 次回测后 resize 触发 N 遍)
+      if (!this._onResize) {
+        this._onResize = () => {
+          if (this._eqResizeRafId != null) return
+          this._eqResizeRafId = requestAnimationFrame(() => {
+            this._eqResizeRafId = null
+            if (this.eqChartInstance) this.eqChartInstance.resize()
+          })
+        }
+      }
       window.addEventListener('resize', this._onResize)
     },
 
