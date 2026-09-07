@@ -585,101 +585,26 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
                         d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
                         obv_filter=True, d_1_vol_max=1.5, today_str=None,
                         stock_info=None):
-    """V1 今日(D0)入场信号: 只检查D0四因子, 不依赖D1数据
-
-    独立于策略回测, 仅用于 --today 报告中的「今日入场」段。
-    满足D0四因子 → 下一个交易日开盘买入, D1入场规则(D1开收盘/回踩)开盘后由人工筛选。
+    """V1 今日(D0)入场信号 — Phase 2 facade: 实现已迁 strategies/v1.py (V1Strategy)。
 
     today_str: 指定今日日期(与--today-date一致), 为空则用最后一天。
     返回空list或单元素list, 元素含 d0_date/d0_close/ret_20d/d_1_change。
     """
-    result = []
-    n = len(bars)
-    if n < 26:
-        return result
+    from app.market_cn.auto.strategies.v1 import V1Strategy, _signal_to_legacy_dict
+    params = dict(ret_20d_min=ret_20d_min,
+                  d_1_pullback_min=d_1_pullback_min,
+                  d_1_pullback_max=d_1_pullback_max,
+                  obv_filter=obv_filter,
+                  d_1_vol_max=d_1_vol_max,
+                  stock_info=stock_info)
+    as_of = None
     if today_str:
-        idxs = [j for j, b in enumerate(bars) if b['time'] == today_str]
+        idxs = [j for j, b in enumerate(bars) if b["time"] == today_str]
         if not idxs:
-            return result
-        i = idxs[-1]
-    else:
-        i = n - 1  # 最后一天视为今日(D0)
-    if i < 2:
-        return result
-    board_type = get_board_type(code)
-    threshold = 0.098 if board_type == "main" else 0.198
-    d0 = bars[i]
-    d_1 = bars[i-1]
-    d_2 = bars[i-2]
-    if d_2['close'] <= 0 or d_1['close'] <= 0:
-        return result
-    if (d0['close'] / d_1['close'] - 1) < threshold * 0.98:
-        return result
-
-    # === 因子1: 强趋势 20日涨>ret_20d_min% ===
-    if i < 20 or bars[i-20]['close'] <= 0:
-        return result
-    ret_20d = (d0['close'] / bars[i-20]['close'] - 1) * 100
-    if ret_20d < ret_20d_min:
-        return result
-
-    # === 因子2: D-1回调 d_1_pullback_min~d_1_pullback_max% ===
-    d_1_change = (d_1['close'] / d_2['close'] - 1) * 100
-    if d_1_change < d_1_pullback_min or d_1_change >= d_1_pullback_max:
-        return result
-
-    # === 因子3: OBV 5日趋势上升 ===
-    if obv_filter:
-        obv = 0; obv_list = []
-        for j in range(max(0, i-20), i+1):
-            if j > 0:
-                if bars[j]['close'] > bars[j-1]['close']:
-                    obv += bars[j]['volume']
-                elif bars[j]['close'] < bars[j-1]['close']:
-                    obv -= bars[j]['volume']
-            obv_list.append(obv)
-        if len(obv_list) >= 5 and obv_list[-1] - obv_list[-5] <= 0:
-            return result
-
-    # === 因子4: D-1非放量 < d_1_vol_max x 5日均量 ===
-    if i >= 6:
-        vol_ma5_d1 = sum(bars[j]['volume'] for j in range(i-6, i-1)) / 5
-        if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
-            return result
-
-    # === 因子5: 纯单板过热过滤 (仅当前10天无涨停时生效) ===
-    # 纯单板(前10天无涨停)信号胜率偏低(67.4% vs 有近涨停79.8%),
-    # 通过MACD柱<2+布林带宽<45%剔除过热信号, 可将纯单板胜率提升至76.2%。
-    # 有近涨停的信号不受影响。
-    has_recent_lu = False
-    for j in range(max(1, i - 10), i):
-        if j >= 1 and is_limit_up(bars[j]['close'], bars[j-1]['close'], board_type):
-            has_recent_lu = True
-            break
-    if not has_recent_lu:
-        closes = [bars[j]['close'] for j in range(i + 1)]
-        _, _, hist = calc_macd(closes)
-        macd_h = hist[-1] if hist else None
-        boll_bw = calc_bollinger_bw(closes)
-        if macd_h is not None and macd_h >= 2:
-            return result
-        if boll_bw is not None and boll_bw >= 45:
-            return result
-
-    circ = float((stock_info or {}).get('circ_shares') or 0)
-    total = float((stock_info or {}).get('total_shares') or 0)
-    result.append({
-        'code': code, 'board': get_board_name(code),
-        'path': 'v1', 'path_label': 'V1',
-        'd0_date': d0['time'],
-        'd0_close': round(d0['close'], 3),
-        'ret_20d': round(ret_20d, 2),
-        'd_1_change': round(d_1_change, 2),
-        'turnover_anchor': round(d0['volume'] / circ * 100, 2) if circ > 0 else None,
-        'turnover_anchor_total': round(d0['volume'] / total * 100, 2) if total > 0 else None,
-        'buy_mode': 'next_open',
-    })
-    return result
+            return []
+        as_of = idxs[-1]  # 与旧实现 idxs[-1] 一致
+    sigs = V1Strategy().scan_signals(bars, code, as_of=as_of, **params)
+    return [_signal_to_legacy_dict(s, code) for s in sigs]
 
 # ================================================================
 # 断板买入策略
