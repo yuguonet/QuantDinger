@@ -342,8 +342,29 @@ class DragonCallbackStrategy(StrategyBase):
 
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):
-        """dragon_callback 无确认步骤: 买入日收盘直接持仓 (出场由收盘重放判定)。"""
-        return ConfirmDecision(True, "dragon_callback无确认步骤")
+        """无确认步骤: 买入日收盘直接持仓 (出场由收盘重放判定)。
+
+        snap={"series":[...当日快照序列]}; d1_chg 按 signal_price 基准 (旧 evaluate_confirm 口径)。
+        返回 None = 无法判定 (快照缺失), monitor 不做状态转移。
+        """
+        series = (snap or {}).get("series") if isinstance(snap, dict) else None
+        if not series:
+            return None
+        prev_close = float(row.get("signal_price") or 0)
+        if prev_close <= 0:
+            return None
+        d1_chg = (float(series[-1]["last"] or 0) / prev_close - 1) * 100
+        return ConfirmDecision(True, "ok", d1_chg=round(d1_chg, 2),
+                               detail={"confirm": "ok", "confirm_strong": False})
+
+    def quality_key(self, row):
+        """方案2 质量排序: tech_score(参考) -> 涨停日换手率 (技术分无判别力, 主要按换手热度)。"""
+        extra = row.get("extra") or {}
+        return (extra.get("tech_score") or 0, extra.get("turnover_anchor") or 0)
+
+    def initial_stop(self, code, entry_price):
+        """-8%, 板块不分档 (与回测一致)。"""
+        return round(entry_price * (1 + DRAGON_CB_PARAMS["stop_loss"] / 100), 3)
 
     # ---- 出场判定 ----
     def exit_decision(self, row, snap=None, **params):

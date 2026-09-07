@@ -279,8 +279,35 @@ class Relay3Strategy(StrategyBase):
 
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):
-        """relay3 无确认步骤: D1 封板守住 → holding (炸板/未封板已在盘中/重放转卖出)。"""
-        return ConfirmDecision(confirmed=True, reason="relay3无确认步骤")
+        """D1 收盘确认: 封板守住 → holding; 未封板 → 尾盘卖兜底 (S4)。
+
+        snap={"series":[...当日快照序列]}; d1_chg 按 entry_price 基准 (涨停价推算口径)。
+        返回 None = 无法判定, monitor 不转移。
+        """
+        series = (snap or {}).get("series") if isinstance(snap, dict) else None
+        if not series:
+            return None
+        entry = float(row.get("entry_price") or 0)
+        if entry <= 0:
+            return None
+        th = 0.198 if get_board_type(row.get("code", "")) == "gem_star" else 0.098
+        limit_price = round(entry * (1 + th), 2)
+        sealed = any(float(x.get("high") or 0) >= limit_price - 0.001 for x in series)
+        last_px = float(series[-1].get("last") or 0)
+        d1_chg = round((last_px / entry - 1) * 100, 2) if last_px > 0 else None
+        if sealed and last_px >= limit_price * 0.995:
+            return ConfirmDecision(True, "sealed_hold", d1_chg=d1_chg,
+                                   detail={"confirm": "sealed_hold"})
+        return ConfirmDecision(False, "S4未封板尾盘卖", d1_chg=d1_chg,
+                               exit_price=round(last_px, 3) if last_px > 0 else None)
+
+    def quality_key(self, row):
+        """3板接力无额外质量分 (旧 else 分支 confirm_chg 口径 → 恒 0, 保持原排序行为)。"""
+        return super().quality_key(row)
+
+    def initial_stop(self, code, entry_price):
+        """盘中硬止损 -5% (stop_pct)。"""
+        return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
 
     # ---- 出场判定 ----
     def exit_decision(self, row, snap=None, **params):

@@ -275,8 +275,25 @@ class BreakStrategy(StrategyBase):
 
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):
-        """break 无确认步骤 (确认已在 D0 断板期判定完成)。"""
-        return ConfirmDecision(True, "break无确认步骤")
+        """无确认步骤 (确认已在 D0 断板期判定完成): 买入次日直接持仓。
+
+        d1_chg 按 signal_price 基准 (旧 evaluate_confirm else 分支口径)。
+        返回 None = 无法判定, monitor 不转移。
+        """
+        series = (snap or {}).get("series") if isinstance(snap, dict) else None
+        if not series:
+            return None
+        prev_close = float(row.get("signal_price") or 0)
+        if prev_close <= 0:
+            return None
+        d1_chg = (float(series[-1]["last"] or 0) / prev_close - 1) * 100
+        return ConfirmDecision(True, "ok", d1_chg=round(d1_chg, 2),
+                               detail={"confirm": "ok", "confirm_strong": False})
+
+    def initial_stop(self, code, entry_price):
+        """创科板 -10% / 主板 -8% (与旧 _entry_stop 分档一致)。"""
+        gem = get_board_type(code) == "gem_star"
+        return round(entry_price * (1 + (-10.0 if gem else -8.0) / 100), 3)
 
     # ---- 出场判定 ----
     def exit_decision(self, row, snap=None, **params):

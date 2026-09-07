@@ -195,19 +195,36 @@ class V1Strategy(StrategyBase):
 
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):
-        """v1 日内动量确认: d1_chg<0 或 日内动量(entry_gap 后)<3% → weak (不确认)。"""
-        if not snap or not snap.get("series"):
-            return ConfirmDecision(False, "无收盘快照")
-        last_r = snap["series"][-1]
+        """v1 日内动量确认: d1_chg<0 或 日内动量(entry_gap 后)<3% → weak (不确认)。
+
+        snap={"series":[...当日快照序列]}; d1_chg 按 signal_price 基准, d1_vol_r=日内动量
+        (旧 evaluate_confirm 口径)。返回 None = 无法判定, monitor 不转移。
+        """
+        series = (snap or {}).get("series") if isinstance(snap, dict) else None
+        if not series:
+            return None
+        last_r = series[-1]
         prev_close = float(row.get("signal_price") or 0)
         if prev_close <= 0:
-            return ConfirmDecision(False, "signal_price缺失")
+            return None
         d1_chg = (float(last_r["last"] or 0) / prev_close - 1) * 100
         entry_gap = float((row.get("extra") or {}).get("entry_gap") or 0)
         intraday = d1_chg - entry_gap
         if d1_chg < 0 or intraday < 3.0:
-            return ConfirmDecision(False, f"weak(d1_chg={d1_chg:.2f}%,intraday={intraday:.2f}%)")
-        return ConfirmDecision(True, f"ok(d1_chg={d1_chg:.2f}%)")
+            return ConfirmDecision(False, "D1日内动量<3%,D2开盘清仓",
+                                   d1_chg=round(d1_chg, 2), detail={"confirm": "weak"})
+        return ConfirmDecision(True, "ok", d1_chg=round(d1_chg, 2),
+                               d1_vol_r=round(intraday, 2),
+                               detail={"confirm": "ok", "confirm_strong": False})
+
+    def quality_key(self, row):
+        """V1 质量排序: 20日涨幅越大越优先。"""
+        extra = row.get("extra") or {}
+        return (extra.get("ret_20d") or 0,)
+
+    def initial_stop(self, code, entry_price):
+        """-10% (板块不分档)。"""
+        return round(entry_price * (1 - 10.0 / 100), 3)
 
     # ---- 出场判定 ----
     def exit_decision(self, row, snap=None, **params):

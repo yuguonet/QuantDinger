@@ -54,9 +54,19 @@ class EntryDecision:
 
 @dataclass
 class ConfirmDecision:
-    """收盘确认判定 (monitor 15:00): watch_pending → buy_today / expired"""
+    """收盘确认判定 (monitor 15:00): watch_pending → holding / exit_today
+
+    confirmed=False 且 reason 非空 → monitor 转 exit_today (exit_reason=reason);
+    策略可返回 None 表示"无法判定"(快照缺失等), monitor 不做状态转移。
+    d1_chg/d1_vol_r/detail 由策略按自身口径填写 (落库字段, 基准各策略不同:
+    多数用 signal_price, relay3 用 entry_price)。
+    """
     confirmed: bool
     reason: str = ""
+    d1_chg: float = None
+    d1_vol_r: float = None
+    detail: dict = None
+    exit_price: float = None   # confirmed=False 时可带参考卖出价 (relay3 未封板尾盘卖=最新价)
 
 
 @dataclass
@@ -112,3 +122,13 @@ class StrategyBase:
         if override:
             p.update(override)
         return p
+
+    # ---- 框架钩子 (monitor 通用流程用; 默认实现 = 旧 else 分支语义) ----
+    def quality_key(self, row):
+        """开盘窗口质量排序键 (越大越优先)。默认 confirm_chg (break/relay3 旧口径)。"""
+        extra = row.get("extra") or {}
+        return (extra.get("confirm_chg") or 0,)
+
+    def initial_stop(self, code, entry_price):
+        """入场止损价 (update_stop_price 落库)。默认 -8% (板块不分档)。"""
+        return round(entry_price * (1 - 8.0 / 100), 3)
