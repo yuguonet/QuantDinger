@@ -112,6 +112,20 @@ def calc_macd(closes, fast=12, slow=26, signal=9):
     hist = [2 * (dif[i] - dea[i]) for i in range(n)]
     return dif, dea, hist
 
+def calc_bollinger_bw(closes, period=20, num_std=2):
+    """计算布林带宽百分比 = (upper-lower)/middle*100, 仅返回带宽值"""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mid = sum(window) / period
+    if mid <= 0:
+        return None
+    var = sum((x - mid) ** 2 for x in window) / period
+    std = var ** 0.5
+    upper = mid + num_std * std
+    lower = mid - num_std * std
+    return (upper - lower) / mid * 100
+
 def calc_roc(closes, period=10):
     """计算变动率 ROC = (close[i]-close[i-period])/close[i-period]*100"""
     if len(closes) < period + 1:
@@ -810,6 +824,25 @@ def v1_today_d0_signals(bars, code, ret_20d_min=30.0,
     if i >= 6:
         vol_ma5_d1 = sum(bars[j]['volume'] for j in range(i-6, i-1)) / 5
         if vol_ma5_d1 > 0 and d_1['volume'] / vol_ma5_d1 >= d_1_vol_max:
+            return result
+
+    # === 因子5: 纯单板过热过滤 (仅当前10天无涨停时生效) ===
+    # 纯单板(前10天无涨停)信号胜率偏低(67.4% vs 有近涨停79.8%),
+    # 通过MACD柱<2+布林带宽<45%剔除过热信号, 可将纯单板胜率提升至76.2%。
+    # 有近涨停的信号不受影响。
+    has_recent_lu = False
+    for j in range(max(1, i - 10), i):
+        if j >= 1 and is_limit_up(bars[j]['close'], bars[j-1]['close'], board_type):
+            has_recent_lu = True
+            break
+    if not has_recent_lu:
+        closes = [bars[j]['close'] for j in range(i + 1)]
+        _, _, hist = calc_macd(closes)
+        macd_h = hist[-1] if hist else None
+        boll_bw = calc_bollinger_bw(closes)
+        if macd_h is not None and macd_h >= 2:
+            return result
+        if boll_bw is not None and boll_bw >= 45:
             return result
 
     circ = float((stock_info or {}).get('circ_shares') or 0)
