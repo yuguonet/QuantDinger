@@ -1,6 +1,6 @@
 """dragon_monitor.py — 自动策略组盘中状态机 (60s tick, scheduler 调度)
 
-覆盖三策略: dragon_callback(龙回头·方案2) / v1 / break(断板)。
+覆盖三策略: dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)。
 
 各策略入场 (09:25~09:35 开盘窗口, 用 9:26 集合竞价快照):
   dragon_callback: gap ∈ (-3%, +2%] (高开>2%不追, 低开<-3%不接; 与回测 D1 过滤一致)

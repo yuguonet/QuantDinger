@@ -4,7 +4,7 @@
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
   2. 全市场逐股跑策略判定 (与回测同一份 dragon_core):
-     dragon_callback(龙回头·方案2) / v1 / break(断板)
+     dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
   3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
 
