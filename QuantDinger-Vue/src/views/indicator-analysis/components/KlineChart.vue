@@ -203,6 +203,7 @@ import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
 import ExchangeKlineWs from '@/utils/exchangeWs'
 import { INDICATOR_REGISTRY } from './indicatorCalculations'
+import { readPrefs, writePrefs } from '@/utils/uiPrefs'
 
 export default {
   name: 'KlineChart',
@@ -3045,6 +3046,15 @@ registerOverlay({
      */
     let _tfSceneMap = {}
 
+    // 会话恢复: 从 uiPrefs 读取上次持久化的周期现场。
+    // 现场按周期记 (barSpace+右缘to), 不区分股票/不区分市场 —— 换股后照常恢复该周期视野
+    try {
+      const _savedScenes = readPrefs('kline-scene')
+      if (_savedScenes && _savedScenes.scenes && typeof _savedScenes.scenes === 'object') {
+        _tfSceneMap = { ..._savedScenes.scenes }
+      }
+    } catch (_) { /* 损坏数据静默忽略 */ }
+
     /** 读取当前图表现场（分时为锁定视图，不保存） */
     const captureChartScene = () => {
       const chart = chartRef.value
@@ -3086,6 +3096,26 @@ registerOverlay({
       } catch (_) { /* 预期内：数据尚未就绪时放弃本次恢复 */ }
     }
 
+    /** 周期现场写 uiPrefs (kline-scene 模块): 刷新/重开浏览器后可恢复各周期的跨度与起止 */
+    const persistTfScenes = () => {
+      try { writePrefs('kline-scene', { scenes: _tfSceneMap }) } catch (_) { /* 配额满静默丢弃 */ }
+    }
+
+    /** 视口变化后延迟归档当前周期现场 (用户缩放/拖动K线后未切周期就刷新, 也能恢复现场) */
+    let _sceneCaptureTimer = null
+    const scheduleSceneCapture = () => {
+      if (isMinuteLine.value) return // 分时为锁定视图, 无现场
+      if (_sceneCaptureTimer) clearTimeout(_sceneCaptureTimer)
+      _sceneCaptureTimer = setTimeout(() => {
+        _sceneCaptureTimer = null
+        const scene = captureChartScene()
+        if (scene) {
+          _tfSceneMap[props.timeframe] = scene
+          persistTfScenes()
+        }
+      }, 500)
+    }
+
     /**
      * 把主图 Y 轴恢复为自动计算刻度。
      * klinecharts 一旦手动缩放过 Y 轴，autoCalcTickFlag 永久为 false，
@@ -3106,9 +3136,6 @@ registerOverlay({
         }
       } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
     }
-
-    /** 换股后下一次数据加载：视口回归默认（barSpace 复位），保证数据最大化填充窗口 */
-    let _resetViewportOnNextLoad = false
 
     /**
      * 分时图数据处理：
@@ -4117,13 +4144,6 @@ registerOverlay({
 
               // Y 轴复位为自动贴合：手动缩放状态不清除会让新数据卡在旧范围里
               resetYAxisToAuto()
-              // 换股场景：X 视口回归默认缩放（滚动到最新由外部 600ms 兼容逻辑负责）
-              if (_resetViewportOnNextLoad) {
-                _resetViewportOnNextLoad = false
-                if (!isMinuteLine.value && typeof chartRef.value.setBarSpace === 'function') {
-                  try { chartRef.value.setBarSpace(8) } catch (_) { /* 预期内 */ }
-                }
-              }
 
               // 分时图模式：应用面积图样式
               if (isMinuteLine.value) {
@@ -5032,6 +5052,8 @@ registerOverlay({
               // 更新上一次的可见范围
               lastVisibleFrom = data.from
               renderChip()
+              // 视口变化后延迟归档当前周期现场 (缩放/拖动的跨度起止 → uiPrefs 持久化)
+              scheduleSceneCapture()
             }
           })
         }
@@ -6438,28 +6460,11 @@ registerOverlay({
       }, 80)
     }
 
-    /** 切换股票时自动适配：加载完成后滚动到最新并适配Y轴，仅执行一次 */
     watch(() => props.symbol, (newVal, oldVal) => {
       if (newVal && newVal !== oldVal) {
-        // 标的变化后旧现场无意义，全部作废；视口回归默认让新数据最大化填充窗口
-        _tfSceneMap = {}
-        _resetViewportOnNextLoad = true
+        // 周期现场不区分股票: 换股不清空现场/不复位X视口/不强制滚最新 (旧版行为已移除),
+        // loadKlineData 完成后统一由 restoreChartScene 恢复该周期视野; Y轴贴合由 resetYAxisToAuto 负责
         debouncedLoad()
-        // P1-1: 原先此处 1500ms 后再拉一次筹码，与 loadKlineData() 内部调用重复（一次切换请求 3 次），已移除
-        // P0-2: 捕获切换后的目标 symbol，供下方自动适配回调比对
-        const _targetSymbol = newVal
-        // 延迟执行一次自动适配
-        safeTimeout(() => {
-          // 已再次切换标的 → 丢弃本次自动适配
-          if (props.symbol !== _targetSymbol) return
-          if (chartRef.value) {
-            try {
-              if (typeof chartRef.value.scrollToRealTime === 'function') {
-                chartRef.value.scrollToRealTime()
-              }
-            } catch (_) { /* 预期内：图表未就绪时无法滚动到最新，静默忽略 */ }
-          }
-        }, 600)
       }
     })
     watch(() => props.theme, (newTheme) => {
@@ -6473,15 +6478,19 @@ registerOverlay({
 
     // P1-1: 筹码由 loadKlineData() 内部触发，market 变化走 debouncedLoad 即可，不再重复请求
     watch(() => props.market, () => {
-      // 市场变化后交易时段/旧现场均无意义，全部作废
+      // 市场变化后交易时段/旧现场均无意义，全部作废（内存+持久化同步清）
       _tfSceneMap = {}
+      persistTfScenes()
       debouncedLoad()
     })
     watch(() => props.timeframe, (newTf, oldTf) => {
-      // 切走前归档旧周期的图表现场（分时为锁定视图，无现场可存）
+      // 切走前归档旧周期的图表现场（分时为锁定视图，无现场可存）并同步持久化
       if (oldTf && oldTf !== newTf) {
         const scene = captureChartScene()
-        if (scene) _tfSceneMap[oldTf] = scene
+        if (scene) {
+          _tfSceneMap[oldTf] = scene
+          persistTfScenes()
+        }
       }
       debouncedLoad()
     })
@@ -7270,6 +7279,10 @@ registerOverlay({
       _timers.clear()
       // 清理 debounce 加载定时器
       if (_loadDebounceTimer) { clearTimeout(_loadDebounceTimer); _loadDebounceTimer = null }
+      // 清理周期现场归档定时器 (卸载前把未flush的现场立即落盘)
+      if (_sceneCaptureTimer) { clearTimeout(_sceneCaptureTimer); _sceneCaptureTimer = null }
+      const _lastScene = captureChartScene()
+      if (_lastScene) { _tfSceneMap[props.timeframe] = _lastScene; persistTfScenes() }
       // 清理等待容器尺寸的 ResizeObserver（冗余修复引入）
       _observers.forEach(ro => ro.disconnect())
       _observers.clear()
