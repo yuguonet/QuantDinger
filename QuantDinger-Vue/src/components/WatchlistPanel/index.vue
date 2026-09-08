@@ -1442,8 +1442,8 @@ export default {
 .wl-card-body { transition: padding-left 0.2s; }
 .wl-card-body.with-cb { padding-left: 24px; }
 /* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列5新闻分 | 列4价格/涨跌 */
-/* 列1~3按内容宽靠左排, 新闻分列吃剩余空间, 价格/涨跌恒贴最右; 各列统一 16px 行高 × 2行 = 32px, 跨列行严格对齐 */
-.wl-row-main { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto; align-items: center; gap: 0 2px; min-width: 220px; }
+/* 列2/列3定宽 → 跨卡片严格对齐; 新闻分列吃剩余空间, 价格/涨跌恒贴最右; 各列统一 16px 行高 × 2行 = 32px */
+.wl-row-main { display: grid; grid-template-columns: auto 52px 22px minmax(0, 1fr) auto; align-items: center; gap: 0 2px; min-width: 220px; }
 .wl-col-name { min-width: 0; }
 .wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; line-height: 16px; }
 .wl-name { font-size: 13px; color: #94a3b8; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1501,7 +1501,7 @@ export default {
 .wl-strategy-pre.wl-pre-weak { color: #1890ff; }
 .wl-half-star { position: relative; display: inline-block; }
 .wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
-/* 买/损切片列 */
+/* 买/损切片列: 定宽左对齐, 买/损两行首字纵向对齐 */
 .wl-col-strategy { display: flex; flex-direction: column; align-items: flex-start; }
 .wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'serif', Monaco, monospace; white-space: nowrap; line-height: 16px; }
 .wl-strategy-mini-entry { color: #15803d; }
