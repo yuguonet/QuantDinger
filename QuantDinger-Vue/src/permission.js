@@ -38,8 +38,14 @@ function lastVisitedRoute () {
   return saved
 }
 
+// 应用本次会话的首次导航标记: "恢复上次栏目"只允许发生在打开应用时,
+// 否则从菜单切到默认页(/ai-asset-analysis)会被误判为空白入口而弹回上一页(死循环)
+let _bootNavDone = false
+
 router.beforeEach((to, from, next) => {
   NProgress.start() // start progress bar
+  const isBootNav = !_bootNavDone
+  _bootNavDone = true
   to.meta && typeof to.meta.title !== 'undefined' && setDocumentTitle(`${i18nRender(to.meta.title)} - ${domTitle}`)
 
   // Check whether we have a token (local-only auth).
@@ -72,7 +78,7 @@ router.beforeEach((to, from, next) => {
               })
               // 请求带有 redirect 重定向时，登录自动重定向到该地址
               let redirect = decodeURIComponent(from.query.redirect || to.path)
-              if (!from.query.redirect && isBareEntry(to.path)) {
+              if (isBootNav && !from.query.redirect && isBareEntry(to.path)) {
                 // 首次进入空白入口: 恢复上次停留栏目 (动态路由尚未注册, 跳过resolve校验)
                 const saved = lastVisitedRoute()
                 if (saved && saved !== to.path) redirect = saved
@@ -125,9 +131,10 @@ router.beforeEach((to, from, next) => {
             next()
           })
         } else {
-          // 空白入口 + 有上次停留栏目记录 → 跳转过去 (此时动态路由已注册, 可校验存在性)
+          // 仅应用首次导航时恢复上次停留栏目 (此时动态路由已注册, 可校验存在性)。
+          // SPA 日常切到默认页不属于空白入口, 否则会把用户弹回上一页造成"页面宕机"
           const saved = lastVisitedRoute()
-          if (isBareEntry(to.path) && saved && saved !== to.path && saved !== to.fullPath &&
+          if (isBootNav && isBareEntry(to.path) && saved && saved !== to.path && saved !== to.fullPath &&
               router.resolve(saved).matched.length) {
             next({ path: saved, replace: true })
           } else {

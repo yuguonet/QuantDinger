@@ -1734,9 +1734,6 @@ export default {
         if (Array.isArray(s.activeIndicators)) {
           this.activeIndicators = this.normalizePersistedChartIndicators(s.activeIndicators)
         }
-        if (s.timeframe && Object.prototype.hasOwnProperty.call(TF_MAX_DAYS, s.timeframe)) {
-          this.timeframe = s.timeframe
-        }
         if (s.market && s.symbol) {
           this.market = String(s.market)
           this.symbol = String(s.symbol)
@@ -1749,7 +1746,15 @@ export default {
             this.selectedWatchlistKey = s.selectedWatchlistKey
           }
         }
-        if (s.selectedIndicatorId != null && s.selectedIndicatorId !== '') {
+        // timeframe: 按恢复后市场的可选项校验 (分时仅A股/港股合法, 不在TF_MAX_DAYS,
+        // 旧版用TF_MAX_DAYS校验会把'分时'误拒回退到1D)
+        if (s.timeframe && this.timeframeOptions.indexOf(s.timeframe) !== -1) {
+          this.timeframe = s.timeframe
+        }
+        if (s.selectedIndicatorId === null) {
+          // 显式记录"用户未选外置指标" (旧缓存无此键, 走自动选择)
+          this._noIndicatorRestored = true
+        } else if (s.selectedIndicatorId != null && s.selectedIndicatorId !== '') {
           const id = Number(s.selectedIndicatorId)
           if (!isNaN(id) && this.indicators.some(i => Number(i.id) === id)) {
             this.selectedIndicatorId = id
@@ -1779,7 +1784,8 @@ export default {
           market: this.market,
           symbol: this.symbol,
           timeframe: this.timeframe,
-          selectedIndicatorId: this.selectedIndicatorId,
+          // 显式null=用户未选外置指标 (undefined会被JSON.stringify丢键, 恢复时误触发自动选择)
+          selectedIndicatorId: this.selectedIndicatorId == null ? null : this.selectedIndicatorId,
           selectedWatchlistKey: this.selectedWatchlistKey,
           activeIndicators: this.serializeChartIndicators(),
           // 图表显示偏好 (红涨绿跌/画线工具栏/筹码分布/分时极坐标)
@@ -1835,6 +1841,8 @@ export default {
     },
 
     autoSelectFirstIndicator () {
+      // 恢复的快照里显式记录了"未选外置指标" → 尊重用户状态, 不自动挂第一个指标
+      if (this._noIndicatorRestored) return
       if (this.indicators.length > 0 && !this.selectedIndicatorId) {
         this.selectedIndicatorId = this.indicators[0].id
         this.onIndicatorChange(this.indicators[0].id)
