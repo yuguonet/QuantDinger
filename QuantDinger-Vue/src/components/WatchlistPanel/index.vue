@@ -94,13 +94,13 @@
                         </template>
                         <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">
                           <span class="wl-vchar" v-for="(ch, ci) in strategyTagChars(stock)" :key="ci">{{ ch }}</span>
+                          <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
+                            <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
+                            <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
+                            <span v-else>☆</span>
+                          </span>
                         </span>
                       </a-popover>
-                      <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
-                        <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
-                        <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
-                        <span v-else>☆</span>
-                      </span>
                     </div>
                     <span class="wl-strategy-mini wl-strategy-mini-entry" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
                     <span class="wl-strategy-mini wl-strategy-mini-stop" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
@@ -1468,6 +1468,7 @@ export default {
 .wl-task-next { font-size: 10px; color: #94a3b8; margin-left: auto; }
 .wl-row-strategy { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .wl-strategy-tag {
+  position: relative;
   display: inline-flex;
   flex-direction: column;
   align-items: center;
@@ -1492,23 +1493,24 @@ export default {
   gap: 0 4px;
   line-height: 1.15;
 }
-/* 预持*竖直排列: tag逐字竖排 + 星标垫底, 窄列与左侧买/损切片并排 */
+/* 预买竖直排列: tag逐字竖排(每字一行, 与买/损两行切片对齐), 不再撑高卡片 */
 .wl-strategy-vtag {
   grid-column: 2;
   grid-row: 1 / 3;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1px;
+  justify-content: center;
   line-height: 1.05;
 }
 .wl-vchar { display: block; }
+/* 星标: 悬于tag右上角的小角标, 不占竖排行数 (否则第三行会把卡片撑高、代码被挤下去) */
 .wl-strategy-pre {
-  font-size: 11px;
+  position: absolute;
+  top: -4px;
+  right: -5px;
+  font-size: 9px;
   font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   line-height: 1;
 }
 .wl-strategy-pre.wl-pre-strong { color: #f5222d; }
