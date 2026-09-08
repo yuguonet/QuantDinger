@@ -87,19 +87,21 @@
                 <span class="wl-market">{{ getMarketName(stock.market) }}</span>
                 <template v-if="stock.strategy_state">
                   <div class="wl-strategy-2col">
-                    <div class="wl-strategy-col-label">
+                    <div class="wl-strategy-vtag">
                       <a-popover trigger="hover" placement="right">
                         <template slot="content">
                           <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
                         </template>
-                        <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">{{ strategyTagText(stock) }}</span>
+                        <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">
+                          <span class="wl-vchar" v-for="(ch, ci) in strategyTagChars(stock)" :key="ci">{{ ch }}</span>
+                        </span>
                       </a-popover>
+                      <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
+                        <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
+                        <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
+                        <span v-else>☆</span>
+                      </span>
                     </div>
-                    <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
-                      <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
-                      <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
-                      <span v-else>☆</span>
-                    </span>
                     <span class="wl-strategy-mini wl-strategy-mini-entry" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
                     <span class="wl-strategy-mini wl-strategy-mini-stop" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
                   </div>
@@ -1010,6 +1012,10 @@ export default {
       const base = stateMap[raw] || raw
       return d.pre_confirm ? `预${base}` : base
     },
+    // 竖排切片: tag 文本按字符拆开 (预/持/买/卖等, 每字一行)
+    strategyTagChars (stock) {
+      return String(this.strategyTagText(stock) || '').split('')
+    },
     strategyEntryPrice (stock) { return (stock.strategy_detail || {}).entry_price },
     strategyStopPrice (stock) { return (stock.strategy_detail || {}).stop_price },
     strategyScore (stock) { const s = (stock.strategy_detail || {}).score; return (s === undefined || s === null) ? null : s },
@@ -1461,7 +1467,17 @@ export default {
 .wl-task-badge:hover { opacity: 0.75; }
 .wl-task-next { font-size: 10px; color: #94a3b8; margin-left: auto; }
 .wl-row-strategy { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-.wl-strategy-tag { display: inline-flex; align-items: center; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 10px; cursor: default; }
+.wl-strategy-tag {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 3px;
+  border-radius: 4px;
+  cursor: default;
+  line-height: 1.1;
+}
 .wl-strategy-tag.st-buy { color: #ffffff; background: #15803d; }
 .wl-strategy-tag.st-hold { color: #ffffff; background: #2563eb; }
 .wl-strategy-tag.st-sell { color: #ffffff; background: #dc2626; }
@@ -1470,25 +1486,29 @@ export default {
 .wl-strategy-k { color: #94a3b8; margin-right: 1px; }
 .wl-strategy-2col {
   display: inline-grid;
-  grid-template-columns: auto auto auto;
+  grid-template-columns: auto auto;
   grid-template-rows: 1fr 1fr;
   align-items: center;
-  gap: 0 3px;
+  gap: 0 4px;
   line-height: 1.15;
 }
-.wl-strategy-col-label {
+/* 预持*竖直排列: tag逐字竖排 + 星标垫底, 窄列与左侧买/损切片并排 */
+.wl-strategy-vtag {
   grid-column: 2;
   grid-row: 1 / 3;
   display: flex;
+  flex-direction: column;
   align-items: center;
+  gap: 1px;
+  line-height: 1.05;
 }
+.wl-vchar { display: block; }
 .wl-strategy-pre {
-  grid-column: 3;
-  grid-row: 1 / 3;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 700;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   line-height: 1;
 }
 .wl-strategy-pre.wl-pre-strong { color: #f5222d; }
@@ -1496,7 +1516,7 @@ export default {
 .wl-strategy-pre.wl-pre-weak { color: #1890ff; }
 .wl-half-star { position: relative; display: inline-block; }
 .wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
-.wl-strategy-mini { font-size: 10px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 1.15; }
+.wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 1.05; }
 .wl-strategy-mini-entry { grid-column: 1; grid-row: 1; color: #15803d; }
 .wl-strategy-mini-stop { grid-column: 1; grid-row: 2; color: #475569; }
 .wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
