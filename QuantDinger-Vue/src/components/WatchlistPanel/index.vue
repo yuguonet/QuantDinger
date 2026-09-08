@@ -80,36 +80,34 @@
         />
         <div class="wl-card-body" :class="{ 'with-cb': batchMode }">
           <div class="wl-row-main" :class="{ 'negative-news': stock.news_score !== undefined && stock.news_score < -4 }">
-            <div class="wl-info-left">
+            <div class="wl-col-name">
               <div class="wl-symbol-line">
                 <span class="wl-symbol" v-if="stock.name && stock.name !== stock.symbol">{{ stock.name }}</span>
                 <span class="wl-symbol" v-else>{{ stock.symbol }}</span>
                 <span class="wl-market">{{ getMarketName(stock.market) }}</span>
-                <template v-if="stock.strategy_state">
-                  <div class="wl-strategy-2col">
-                    <div class="wl-strategy-vtag">
-                      <a-popover trigger="hover" placement="right">
-                        <template slot="content">
-                          <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
-                        </template>
-                        <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">
-                          <span class="wl-vchar" v-for="(ch, ci) in strategyTagChars(stock)" :key="ci">{{ ch }}</span>
-                          <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
-                            <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
-                            <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
-                            <span v-else>☆</span>
-                          </span>
-                        </span>
-                      </a-popover>
-                    </div>
-                    <span class="wl-strategy-mini wl-strategy-mini-entry" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
-                    <span class="wl-strategy-mini wl-strategy-mini-stop" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
-                  </div>
-                </template>
               </div>
               <div class="wl-name" v-if="stock.name && stock.name !== stock.symbol">{{ stock.symbol }}</div>
             </div>
-            <div class="wl-info-right" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
+            <div class="wl-col-strategy" v-if="stock.strategy_state">
+              <span class="wl-strategy-mini wl-strategy-mini-entry" v-if="strategyEntryPrice(stock) !== null && strategyEntryPrice(stock) !== undefined">买{{ formatPrice(strategyEntryPrice(stock)) }}</span>
+              <span class="wl-strategy-mini wl-strategy-mini-stop" v-if="strategyStopPrice(stock)">损{{ formatPrice(strategyStopPrice(stock)) }}</span>
+            </div>
+            <div class="wl-col-tag" v-if="stock.strategy_state">
+              <a-popover trigger="hover" placement="right">
+                <template slot="content">
+                  <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
+                </template>
+                <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">
+                  <span class="wl-vchar" v-for="(ch, ci) in strategyTagChars(stock)" :key="ci">{{ ch }}</span>
+                  <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
+                    <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
+                    <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
+                    <span v-else>☆</span>
+                  </span>
+                </span>
+              </a-popover>
+            </div>
+            <div class="wl-col-quote" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
               <span class="wl-price">{{ formatPrice(watchlistPrices[`${stock.market}:${stock.symbol}`].price) }}</span>
               <span class="wl-change" :class="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? 'up' : 'down'">
                 {{ (watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '+' : '' }}{{ formatNum(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change) }}%
@@ -1443,18 +1441,20 @@ export default {
 .wl-card-cb { position: absolute; top: 12px; left: 4px; z-index: 1; }
 .wl-card-body { transition: padding-left 0.2s; }
 .wl-card-body.with-cb { padding-left: 24px; }
-.wl-row-main { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px; }
-.wl-info-left { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
-.wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; }
-.wl-name { font-size: 12px; color: #94a3b8; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-.wl-info-right { display: flex; flex-direction: column; align-items: flex-end; white-space: nowrap; }
+/* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列4价格/涨跌 | 列5新闻分 */
+/* 各列统一 16px 行高 × 2行 = 32px, 保证跨列行严格对齐 */
+.wl-row-main { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; align-items: center; gap: 0 6px; }
+.wl-col-name { min-width: 0; }
+.wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; line-height: 16px; }
+.wl-name { font-size: 12px; color: #94a3b8; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-symbol { font-size: 12px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-market { font-size: 9px; color: #94a3b8; letter-spacing: 0.3px; padding: 1px 4px; background: #f1f5f9; border-radius: 3px; flex-shrink: 0; }
 
-.wl-price { font-size: 11px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; }
-.wl-change { font-size: 12px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 1px 5px; border-radius: 4px; margin-left: 4px; }
+.wl-price { font-size: 11px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; line-height: 16px; }
+.wl-change { font-size: 12px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 0 5px; border-radius: 4px; line-height: 16px; }
 .wl-change.up { color: #ef4444; background: rgba(239,68,68,0.08); }
 .wl-change.down { color: #10b981; background: rgba(16,185,129,0.06); }
+.wl-col-quote { display: flex; flex-direction: column; align-items: flex-end; white-space: nowrap; }
 .wl-row-pnl { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-family: 'SF Mono', Monaco, monospace; }
 .wl-pnl-qty { font-size: 10px; color: #94a3b8; }
 .wl-pnl-val { font-size: 10px; font-weight: 600; margin-left: auto; }
@@ -1474,10 +1474,9 @@ export default {
   align-items: center;
   font-size: 10px;
   font-weight: 700;
-  padding: 1px 3px;
+  padding: 0 3px;
   border-radius: 4px;
   cursor: default;
-  line-height: 1.1;
 }
 .wl-strategy-tag.st-buy { color: #ffffff; background: #15803d; }
 .wl-strategy-tag.st-hold { color: #ffffff; background: #2563eb; }
@@ -1485,26 +1484,10 @@ export default {
 .wl-strategy-tag.st-watch { color: #94a3b8; background: #f1f5f9; }
 .wl-strategy-item { font-size: 10px; color: #64748b; font-family: 'SF Mono', Monaco, monospace; }
 .wl-strategy-k { color: #94a3b8; margin-right: 1px; }
-.wl-strategy-2col {
-  display: inline-grid;
-  grid-template-columns: auto auto;
-  grid-template-rows: 1fr 1fr;
-  align-items: center;
-  gap: 0 4px;
-  line-height: 1.15;
-}
-/* 预买竖直排列: tag逐字竖排(每字一行, 与买/损两行切片对齐), 不再撑高卡片 */
-.wl-strategy-vtag {
-  grid-column: 2;
-  grid-row: 1 / 3;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  line-height: 1.05;
-}
-.wl-vchar { display: block; }
-/* 星标: 悬于tag右上角的小角标, 不占竖排行数 (否则第三行会把卡片撑高、代码被挤下去) */
+/* 策略标签列: 逐字竖排, 每字行高16px → 与买/损、名称/代码两行切片严格对齐 */
+.wl-col-tag { display: flex; align-items: center; justify-content: center; }
+.wl-vchar { display: block; line-height: 16px; }
+/* 星标: 悬于tag右上角的小角标, 不占竖排行数 */
 .wl-strategy-pre {
   position: absolute;
   top: -4px;
@@ -1518,9 +1501,11 @@ export default {
 .wl-strategy-pre.wl-pre-weak { color: #1890ff; }
 .wl-half-star { position: relative; display: inline-block; }
 .wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
-.wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 1.05; }
-.wl-strategy-mini-entry { grid-column: 1; grid-row: 1; color: #15803d; }
-.wl-strategy-mini-stop { grid-column: 1; grid-row: 2; color: #475569; }
+/* 买/损切片列 */
+.wl-col-strategy { display: flex; flex-direction: column; align-items: flex-start; }
+.wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 16px; }
+.wl-strategy-mini-entry { color: #15803d; }
+.wl-strategy-mini-stop { color: #475569; }
 .wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
 .wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
 .wl-strategy-pop table.wl-dtable td { padding: 2px 8px; border-bottom: 1px solid #f1f5f9; }
