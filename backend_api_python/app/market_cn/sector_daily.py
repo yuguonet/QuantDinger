@@ -161,7 +161,7 @@ def load_kline_for_date(target_date: str, symbols: List[str] = None, pool=None) 
         db_symbol = strip_market_prefix(sym)
         try:
             rows = writer.query("CNStock", db_symbol, "1D",
-                                start_time=prev_date, end_time=target_date, limit=5)
+                                start_time=prev_date, end_time=target_date + ' 23:59:59', limit=5)  # end 纯日期解析为当日00:00, 会切掉当日15:00 bar (2026-08-27停更根因)
         except Exception:
             continue
         if not rows or len(rows) < 2:
