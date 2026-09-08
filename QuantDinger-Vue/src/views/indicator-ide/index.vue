@@ -1766,6 +1766,10 @@ export default {
         if (typeof s.drawingBarVisible === 'boolean') this.drawingBarVisible = s.drawingBarVisible
         if (typeof s.showChip === 'boolean') this.showChip = s.showChip
         if (typeof s.polarCoord === 'boolean') this.polarCoord = s.polarCoord
+        // 左侧面板宽度恢复 (与拖拽范围 10~50 一致才采用)
+        if (typeof s.leftPanelPct === 'number' && isFinite(s.leftPanelPct)) {
+          this.leftPanelWidthPct = Math.max(10, Math.min(50, s.leftPanelPct))
+        }
       } catch (_) { /* ignore corrupt cache */ }
     },
 
@@ -1792,7 +1796,9 @@ export default {
           chartColorScheme: this.chartColorScheme,
           drawingBarVisible: this.drawingBarVisible,
           showChip: this.showChip,
-          polarCoord: this.polarCoord
+          polarCoord: this.polarCoord,
+          // 左侧自选股面板宽度 (百分比, 拖拽手柄调整)
+          leftPanelPct: this.leftPanelWidthPct
         }
         storage.set(ideUiCacheStorageKey(this.userId), JSON.stringify(payload))
       } catch (_) { /* ignore quota */ }
@@ -3536,6 +3542,8 @@ export default {
         document.removeEventListener('mouseup', onUp)
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
+        // 拖拽结束持久化左侧面板宽度
+        this.schedulePersistIdeUiState()
       }
       document.body.style.cursor = 'col-resize'
       document.body.style.userSelect = 'none'

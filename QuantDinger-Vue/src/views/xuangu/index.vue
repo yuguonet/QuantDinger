@@ -344,6 +344,7 @@ import WatchlistPanel from '@/components/WatchlistPanel'
 import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
 import { getUserInfo } from '@/api/login'
 import { axios as request } from '@/utils/request'
+import { prefValue, setPrefValue } from '@/utils/uiPrefs'
 
 Vue.config.productionTip = false
 Vue.use(ElementUI)
@@ -623,6 +624,8 @@ export default {
         document.removeEventListener('mouseup', onUp)
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
+        // 拖拽结束持久化面板宽度
+        try { setPrefValue('layout', 'xuanguWatchlistPct', this.watchlistPanelWidth) } catch (_) { /* ignore */ }
       }
       document.body.style.cursor = 'col-resize'
       document.body.style.userSelect = 'none'
@@ -1460,6 +1463,11 @@ export default {
   },
   created () {
     this.loadUserInfo()
+    // 恢复上次的自选股面板宽度 (拖拽范围 10~40 内才采用)
+    const savedPct = prefValue('layout', 'xuanguWatchlistPct', null)
+    if (typeof savedPct === 'number' && isFinite(savedPct)) {
+      this.watchlistPanelWidth = Math.max(10, Math.min(40, savedPct))
+    }
   },
   mounted () {
     this.aiQuery = ''
