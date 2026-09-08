@@ -3055,6 +3055,9 @@ registerOverlay({
       }
     } catch (_) { /* 损坏数据静默忽略 */ }
 
+    /** 换股后下一次数据加载: 右缘滚到最新K线 (保留缩放跨度, 现场随后自动归档为最新视图) */
+    let _goLatestOnNextLoad = false
+
     /** 读取当前图表现场（分时为锁定视图，不保存） */
     const captureChartScene = () => {
       const chart = chartRef.value
@@ -4150,8 +4153,16 @@ registerOverlay({
                 applyMinuteLineChartStyle()
               } else {
                 restoreNormalChartStyle()
-                // 恢复该周期上次的图表现场（分时为锁定视图，无需恢复）
-                restoreChartScene(props.timeframe)
+                // 换股后的本次加载: 右缘滚到最新K线(保留缩放跨度), 现场由视口监听自动归档为最新视图;
+                // 其余场景(切周期/页面刷新): 恢复该周期上次的图表现场
+                if (_goLatestOnNextLoad) {
+                  _goLatestOnNextLoad = false
+                  if (typeof chartRef.value.scrollToRealTime === 'function') {
+                    try { chartRef.value.scrollToRealTime() } catch (_) { /* 预期内 */ }
+                  }
+                } else {
+                  restoreChartScene(props.timeframe)
+                }
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
@@ -5092,7 +5103,15 @@ registerOverlay({
               nextTick(() => {
                 if (chartRef.value) {
                   restoreNormalChartStyle()
-                  restoreChartScene(props.timeframe)
+                  // 与上方「图表已存在」分支同规则: 换股滚最新(保留缩放), 其余恢复现场
+                  if (_goLatestOnNextLoad) {
+                    _goLatestOnNextLoad = false
+                    if (typeof chartRef.value.scrollToRealTime === 'function') {
+                      try { chartRef.value.scrollToRealTime() } catch (_) { /* 预期内 */ }
+                    }
+                  } else {
+                    restoreChartScene(props.timeframe)
+                  }
                 }
               })
             }
@@ -6462,8 +6481,9 @@ registerOverlay({
 
     watch(() => props.symbol, (newVal, oldVal) => {
       if (newVal && newVal !== oldVal) {
-        // 周期现场不区分股票: 换股不清空现场/不复位X视口/不强制滚最新 (旧版行为已移除),
-        // loadKlineData 完成后统一由 restoreChartScene 恢复该周期视野; Y轴贴合由 resetYAxisToAuto 负责
+        // 换股: 右缘定位到最新K线(保留缩放跨度, 不复位barSpace), 现场由视口监听自动归档为最新视图;
+        // 加载完成后 loadKlineData 内按 _goLatestOnNextLoad 分支处理; Y轴贴合由 resetYAxisToAuto 负责
+        _goLatestOnNextLoad = true
         debouncedLoad()
       }
     })
