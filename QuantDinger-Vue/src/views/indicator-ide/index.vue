@@ -1756,6 +1756,11 @@ export default {
             this.onIndicatorChange(id)
           }
         }
+        // 图表显示偏好恢复 (chart 就绪后在 ensureChartReady 中应用到 klinecharts)
+        if (s.chartColorScheme === 'cn' || s.chartColorScheme === 'intl') this.chartColorScheme = s.chartColorScheme
+        if (typeof s.drawingBarVisible === 'boolean') this.drawingBarVisible = s.drawingBarVisible
+        if (typeof s.showChip === 'boolean') this.showChip = s.showChip
+        if (typeof s.polarCoord === 'boolean') this.polarCoord = s.polarCoord
       } catch (_) { /* ignore corrupt cache */ }
     },
 
@@ -1776,7 +1781,12 @@ export default {
           timeframe: this.timeframe,
           selectedIndicatorId: this.selectedIndicatorId,
           selectedWatchlistKey: this.selectedWatchlistKey,
-          activeIndicators: this.serializeChartIndicators()
+          activeIndicators: this.serializeChartIndicators(),
+          // 图表显示偏好 (红涨绿跌/画线工具栏/筹码分布/分时极坐标)
+          chartColorScheme: this.chartColorScheme,
+          drawingBarVisible: this.drawingBarVisible,
+          showChip: this.showChip,
+          polarCoord: this.polarCoord
         }
         storage.set(ideUiCacheStorageKey(this.userId), JSON.stringify(payload))
       } catch (_) { /* ignore quota */ }
@@ -1837,6 +1847,16 @@ export default {
           if (!chart || !this.symbol) return
           if (!chart.chartRef && typeof chart.initChart === 'function') {
             chart.initChart()
+          }
+          // 每次图表就绪都同步显示偏好 (覆盖initChart默认值; 兼容re-init后样式丢失)
+          if (typeof chart.setChartColorScheme === 'function') {
+            chart.setChartColorScheme(this.chartColorScheme)
+          }
+          if (this.drawingBarVisible && typeof chart.setDrawingBarVisible === 'function') {
+            chart.setDrawingBarVisible(true)
+          }
+          if (this.polarCoord && typeof chart.setMinutePolarMode === 'function') {
+            chart.setMinutePolarMode(true)
           }
           // 不再在此调用 loadKlineData，由 KlineChart 内部 watcher(debounce) 统一处理
           if (this.selectedIndicatorId) {
@@ -3436,6 +3456,7 @@ export default {
       if (chart && chart.setChartColorScheme) {
         chart.setChartColorScheme(scheme)
       }
+      this.schedulePersistIdeUiState()
     },
     toggleDrawingBar (checked) {
       this.drawingBarVisible = checked
@@ -3443,9 +3464,11 @@ export default {
       if (chart && chart.setDrawingBarVisible) {
         chart.setDrawingBarVisible(checked)
       }
+      this.schedulePersistIdeUiState()
     },
     toggleChip (checked) {
       this.showChip = checked
+      this.schedulePersistIdeUiState()
     },
     togglePolar (checked) {
       this.polarCoord = !!checked
@@ -3453,6 +3476,7 @@ export default {
       if (chart && chart.setMinutePolarMode) {
         chart.setMinutePolarMode(!!checked)
       }
+      this.schedulePersistIdeUiState()
     },
     toggleFullscreen () {
       const el = this.$el

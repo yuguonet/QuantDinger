@@ -440,6 +440,7 @@ import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
 import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, reorderWatchlist, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
+import { prefValue, setPrefValue } from '@/utils/uiPrefs'
 
 const DEFAULT_GROUP_NAME = '默认自选'
 
@@ -597,7 +598,12 @@ export default {
     },
     watchlist () {
       const names = new Set((this.watchlist || []).map(s => s.group_name || DEFAULT_GROUP_NAME))
-      if (!names.has(this.currentGroup)) this.currentGroup = DEFAULT_GROUP_NAME
+      if (!names.has(this.currentGroup)) {
+        // 当前组失效(被删/被引擎改) → 先尝试恢复上次记住的组, 无效再回默认组
+        const saved = prefValue('watchlist', 'group', '')
+        if (saved && names.has(saved)) this.currentGroup = saved
+        else this.currentGroup = DEFAULT_GROUP_NAME
+      }
       this.batchSelectedKeys = this.batchSelectedKeys.filter(k => this.visibleWatchlist.some(s => `${s.market}:${s.symbol}` === k))
     }
   },
@@ -935,6 +941,13 @@ export default {
         const res = await getWatchlist({ userid: this.userId })
         if (res && res.code === 1 && res.data) {
           this.watchlist = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
+          // 首次加载: 恢复上次记住的自选组 (仅一次, 不干扰用户后续手动切换)
+          if (!this._groupPrefRestored) {
+            this._groupPrefRestored = true
+            const names = new Set(this.watchlist.map(s => s.group_name || DEFAULT_GROUP_NAME))
+            const saved = prefValue('watchlist', 'group', '')
+            if (saved && names.has(saved)) this.currentGroup = saved
+          }
           await this.loadWatchlistPrices()
         }
       } catch (error) { /* silent */ } finally { this.loadingWatchlist = false }
@@ -1269,6 +1282,7 @@ export default {
     },
     switchGroup (name) {
       if (name !== this.currentGroup) this.currentGroup = name
+      setPrefValue('watchlist', 'group', this.currentGroup) // 记住所选自选组 (刷新/重开不回默认)
       this.batchSelectedKeys = this.batchSelectedKeys.filter(k => this.visibleWatchlist.some(s => `${s.market}:${s.symbol}` === k))
       this.groupDropdownVisible = false
     },
@@ -1290,7 +1304,10 @@ export default {
         if (res && res.code === 1) {
           this.$message.success(this.$t('dashboard.analysis.watchlist.group.renamed'))
           this.showRenameGroupModal = false
-          if (this.currentGroup === this.renameOldGroup) this.currentGroup = newName
+          if (this.currentGroup === this.renameOldGroup) {
+            this.currentGroup = newName
+            setPrefValue('watchlist', 'group', newName) // 同步记忆中的组名
+          }
           await this.loadWatchlist()
         } else {
           const msg = res && res.msg
@@ -1307,7 +1324,10 @@ export default {
         const res = await removeWatchlistGroup({ userid: this.userId, group_name: name })
         if (res && res.code === 1) {
           this.$message.success(this.$t('dashboard.analysis.watchlist.group.deleted'))
-          if (this.currentGroup === name) this.currentGroup = DEFAULT_GROUP_NAME
+          if (this.currentGroup === name) {
+            this.currentGroup = DEFAULT_GROUP_NAME
+            setPrefValue('watchlist', 'group', DEFAULT_GROUP_NAME) // 记忆同步回默认组
+          }
           await this.loadWatchlist()
         } else {
           this.$message.error(res?.msg || this.$t('dashboard.analysis.watchlist.group.deleteFailed'))

@@ -12,6 +12,7 @@ import {
 import {
   ACCESS_TOKEN
 } from '@/store/mutation-types'
+import { prefValue, setPrefValue } from '@/utils/uiPrefs'
 import {
   i18nRender
 } from '@/locales'
@@ -23,6 +24,19 @@ NProgress.configure({
 const allowList = ['login'] // no redirect allowList
 const loginRoutePath = '/user/login'
 const defaultRoutePath = '/ai-asset-analysis'
+
+/** 是否"空白入口"路径: 打开应用直接落在根路径或默认页 (此时应恢复上次停留栏目) */
+function isBareEntry (path) {
+  return path === '/' || path === defaultRoutePath
+}
+
+/** 上次停留栏目 (无效/未记录/登录页 → null) */
+function lastVisitedRoute () {
+  const saved = prefValue('nav', 'last', '')
+  if (!saved || typeof saved !== 'string') return null
+  if (saved === '/' || saved === loginRoutePath) return null
+  return saved
+}
 
 router.beforeEach((to, from, next) => {
   NProgress.start() // start progress bar
@@ -38,9 +52,9 @@ router.beforeEach((to, from, next) => {
 
   if (token) {
     // 有 token，允许访问所有页面
-    // 如果访问登录页，跳转到默认页面
+    // 如果访问登录页，跳转到上次停留栏目(如有)或默认页面 —— 有效token下完全跳过登录确认
     if (to.path === loginRoutePath) {
-      next({ path: defaultRoutePath })
+      next({ path: lastVisitedRoute() || defaultRoutePath })
       NProgress.done()
     } else {
       // 检查用户信息是否已加载
@@ -57,7 +71,12 @@ router.beforeEach((to, from, next) => {
                 router.addRoute(r)
               })
               // 请求带有 redirect 重定向时，登录自动重定向到该地址
-              const redirect = decodeURIComponent(from.query.redirect || to.path)
+              let redirect = decodeURIComponent(from.query.redirect || to.path)
+              if (!from.query.redirect && isBareEntry(to.path)) {
+                // 首次进入空白入口: 恢复上次停留栏目 (动态路由尚未注册, 跳过resolve校验)
+                const saved = lastVisitedRoute()
+                if (saved && saved !== to.path) redirect = saved
+              }
               if (to.path === redirect) {
                 // hack方法 确保addRoutes已完成 ,set the replace: true so the navigation will not leave a history record
                 next({ ...to, replace: true })
@@ -106,7 +125,14 @@ router.beforeEach((to, from, next) => {
             next()
           })
         } else {
-          next()
+          // 空白入口 + 有上次停留栏目记录 → 跳转过去 (此时动态路由已注册, 可校验存在性)
+          const saved = lastVisitedRoute()
+          if (isBareEntry(to.path) && saved && saved !== to.path && saved !== to.fullPath &&
+              router.resolve(saved).matched.length) {
+            next({ path: saved, replace: true })
+          } else {
+            next()
+          }
         }
       }
     }
@@ -123,6 +149,10 @@ router.beforeEach((to, from, next) => {
   }
 })
 
-router.afterEach(() => {
+router.afterEach((to) => {
+  // 记录最后停留栏目 (仅登录态; 供下次打开应用时恢复)
+  if (storage.get(ACCESS_TOKEN) && to.path && to.path !== loginRoutePath) {
+    setPrefValue('nav', 'last', to.fullPath)
+  }
   NProgress.done() // finish progress bar
 })

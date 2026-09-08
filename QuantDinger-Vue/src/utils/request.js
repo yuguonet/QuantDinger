@@ -1,5 +1,6 @@
 import axios from 'axios'
-// import store from '@/store'
+// 注意: 此文件不可 import '@/store' (会形成 request→store→user→api→request 循环依赖),
+// 登录态续期直接操作 storage, 见 renewAuthTtl()
 import storage from 'store'
 import notification from 'ant-design-vue/es/notification'
 import { VueAxios } from './axios'
@@ -12,6 +13,25 @@ const LOCALE_KEY = 'lang'
 
 // Prevent multiple concurrent 401 redirects
 let isRedirectingToLogin = false
+
+// 登录态滑动续期: 活跃使用期间刷新本地TTL, 只要后端token仍有效就不再出现登录确认页。
+// 30分钟节流, 避免每次请求都写 localStorage
+let _lastAuthRenew = 0
+function renewAuthTtl () {
+  const now = Date.now()
+  if (now - _lastAuthRenew < 30 * 60 * 1000) return
+  const token = getToken()
+  if (!token) return
+  _lastAuthRenew = now
+  const expiresAt = now + 7 * 24 * 60 * 60 * 1000
+  try {
+    storage.set(ACCESS_TOKEN, token, expiresAt)
+    const info = storage.get(USER_INFO)
+    if (info) storage.set(USER_INFO, info, expiresAt)
+    const roles = storage.get(USER_ROLES)
+    if (roles && roles.length) storage.set(USER_ROLES, roles, expiresAt)
+  } catch (e) { /* ignore */ }
+}
 
 /**
  * 获取 token，处理 token 可能是字符串或对象的情况
@@ -178,6 +198,9 @@ request.interceptors.request.use(config => {
 
 // response interceptor
 request.interceptors.response.use((response) => {
+  // 活跃使用时滑动续期登录态 (30分钟节流)
+  try { renewAuthTtl() } catch (e) { /* ignore */ }
+
   // 从响应中提取 PHPSESSID 并保存
   // 由于浏览器安全限制，无法直接读取 set-cookie 头，需要通过 document.cookie 获取
   try {
