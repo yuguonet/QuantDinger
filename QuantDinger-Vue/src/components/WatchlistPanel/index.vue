@@ -107,15 +107,15 @@
                 </span>
               </a-popover>
             </div>
+            <div class="wl-news-score" v-if="stock.news_score !== undefined">
+              <span v-if="stock.news_score > 4" class="wl-news-heart">♥</span>
+              <span v-else class="wl-news-num" :class="{ 'news-negative': stock.news_score < -4 }">{{ stock.news_score }}</span>
+            </div>
             <div class="wl-col-quote" v-if="watchlistPrices[`${stock.market}:${stock.symbol}`]">
               <span class="wl-price">{{ formatPrice(watchlistPrices[`${stock.market}:${stock.symbol}`].price) }}</span>
               <span class="wl-change" :class="(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? 'up' : 'down'">
                 {{ (watchlistPrices[`${stock.market}:${stock.symbol}`]?.change || 0) >= 0 ? '+' : '' }}{{ formatNum(watchlistPrices[`${stock.market}:${stock.symbol}`]?.change) }}%
               </span>
-            </div>
-            <div class="wl-news-score" v-if="stock.news_score !== undefined">
-              <span v-if="stock.news_score > 4" class="wl-news-heart">♥</span>
-              <span v-else class="wl-news-num" :class="{ 'news-negative': stock.news_score < -4 }">{{ stock.news_score }}</span>
             </div>
           </div>
           <div class="wl-row-pnl" v-if="positionSummaryMap[`${stock.market}:${stock.symbol}`]">
@@ -1392,7 +1392,7 @@ export default {
   }
 
   .watchlist-list {
-    flex: 1; overflow-y: auto; padding: 6px 8px;
+    flex: 1; overflow-y: auto; padding: 4px 4px;
     &::-webkit-scrollbar { width: 3px; }
     &::-webkit-scrollbar-thumb { background: #d4d8dd; border-radius: 2px; }
     .watchlist-empty { text-align: center; padding: 24px 12px; color: #94a3b8; .anticon { font-size: 32px; margin-bottom: 8px; display: block; } p { font-size: 12px; margin-bottom: 12px; } }
@@ -1441,16 +1441,16 @@ export default {
 .wl-card-cb { position: absolute; top: 12px; left: 4px; z-index: 1; }
 .wl-card-body { transition: padding-left 0.2s; }
 .wl-card-body.with-cb { padding-left: 24px; }
-/* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列4价格/涨跌 | 列5新闻分 */
-/* 各列统一 16px 行高 × 2行 = 32px, 保证跨列行严格对齐 */
-.wl-row-main { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto auto; align-items: center; gap: 0 6px; }
+/* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列5新闻分 | 列4价格/涨跌 */
+/* 列1~3按内容宽靠左排, 新闻分列吃剩余空间, 价格/涨跌恒贴最右; 各列统一 16px 行高 × 2行 = 32px, 跨列行严格对齐 */
+.wl-row-main { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto; align-items: center; gap: 0 2px; min-width: 220px; }
 .wl-col-name { min-width: 0; }
 .wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; line-height: 16px; }
-.wl-name { font-size: 12px; color: #94a3b8; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wl-name { font-size: 13px; color: #94a3b8; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-symbol { font-size: 12px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-market { font-size: 9px; color: #94a3b8; letter-spacing: 0.3px; padding: 1px 4px; background: #f1f5f9; border-radius: 3px; flex-shrink: 0; }
 
-.wl-price { font-size: 11px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; line-height: 16px; }
+.wl-price { font-size: 11px; font-weight: 600; color: #0f172a; font-family: 'SF Mono', Monaco, monospace; line-height: 16px; width:65px; text-align: right; }
 .wl-change { font-size: 12px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 0 5px; border-radius: 4px; line-height: 16px; }
 .wl-change.up { color: #ef4444; background: rgba(239,68,68,0.08); }
 .wl-change.down { color: #10b981; background: rgba(16,185,129,0.06); }
@@ -1503,7 +1503,7 @@ export default {
 .wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
 /* 买/损切片列 */
 .wl-col-strategy { display: flex; flex-direction: column; align-items: flex-start; }
-.wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'SF Mono', Monaco, monospace; white-space: nowrap; line-height: 16px; }
+.wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'serif', Monaco, monospace; white-space: nowrap; line-height: 16px; }
 .wl-strategy-mini-entry { color: #15803d; }
 .wl-strategy-mini-stop { color: #475569; }
 .wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
