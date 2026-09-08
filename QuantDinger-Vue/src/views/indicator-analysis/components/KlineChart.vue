@@ -5297,7 +5297,9 @@ registerOverlay({
     }
 
     // --- 注册自定义指标辅助函数 ---
-    const registerCustomIndicator = (nameOrObj, calcFunc, figures, calcParams = [], precision = -1, shouldOverlay = false) => {
+    // 传统参数形式第7参 shortName: 图例显示名(可读), 内部唯一名仍由 nameOrObj 承担 —— 两者分离,
+    // 否则图例会显示 QD_MAIN_OVERLAY_SMA_5_xxx 这类内部签名串
+    const registerCustomIndicator = (nameOrObj, calcFunc, figures, calcParams = [], precision = -1, shouldOverlay = false, shortName = '') => {
       let indicatorConfig
       if (typeof nameOrObj === 'object' && nameOrObj !== null) {
         // 对象参数形式（支持 draw 等高级配置）
@@ -5309,7 +5311,7 @@ registerOverlay({
         if (precision < 0) precision = pricePrecision.value
         indicatorConfig = {
           name: nameOrObj,
-          shortName: nameOrObj,
+          shortName: shortName || nameOrObj,
           calc: calcFunc,
           figures,
           calcParams,
@@ -5392,9 +5394,28 @@ registerOverlay({
       const mainPaneOverlayFigures = []
       const mainPaneOverlayCalcEntries = []
       const mainPaneOverlaySignatureParts = []
-      const addMainPaneOverlayEntry = ({ signature, figures, calc }) => {
+      const mainPaneOverlayLabels = []
+      // 合并指标的图例显示名: 同类指标按 参数集合 分组, 如 SMA(5) SMA(10) → "SMA(5,10)"
+      const buildMainOverlayShortName = (labels) => {
+        const groups = new Map()
+        labels.forEach(l => {
+          const m = /^([A-Za-z0-9]+)\(([^)]*)\)$/.exec(l)
+          if (m) {
+            if (!groups.has(m[1])) groups.set(m[1], new Set())
+            m[2].split(',').forEach(a => groups.get(m[1]).add(a))
+          } else if (!groups.has(l)) {
+            groups.set(l, new Set())
+          }
+        })
+        if (groups.size === 0) return 'MAIN'
+        return Array.from(groups.entries()).map(([k, args]) => args.size ? `${k}(${Array.from(args).join(',')})` : k).join(' ')
+      }
+      const addMainPaneOverlayEntry = ({ signature, figures, calc, label }) => {
         if (signature) {
           mainPaneOverlaySignatureParts.push(String(signature))
+        }
+        if (label) {
+          mainPaneOverlayLabels.push(String(label))
         }
         if (Array.isArray(figures) && figures.length) {
           mainPaneOverlayFigures.push(...figures)
@@ -5902,6 +5923,7 @@ registerOverlay({
                 const lineColor = getIndicatorColor(periods.indexOf(p))
                 addMainPaneOverlayEntry({
                   signature: buildUniqueIndicatorName(`${maType}_${p}`),
+                  label: `${maType}(${p})`,
                   figures: [buildLineFigure(`${figureKey}_${p}_${indicatorInstanceKey}`, `${maType}(${p})`, lineColor, lineWidth)],
                   calc: (kLineDataList) => {
                     const values = maType === 'SMA'
@@ -5921,7 +5943,7 @@ registerOverlay({
             try {
               const registered = registerCustomIndicator({
                 name: customIndicatorName,
-                shortName: customIndicatorName,
+                shortName: `MACD(${fast},${slow},${signal})`,
                 calcParams: [fast, slow, signal],
                 figures: [
                   buildLineFigure('macd', `MACD(${fast},${slow})`, color, lineWidth),
@@ -5980,7 +6002,7 @@ registerOverlay({
                   return rsiValues.map(value => ({ rsi: value }))
                 },
                 [buildLineFigure('rsi', `RSI(${length})`, color, lineWidth)],
-                [length]
+                [length], -1, false, `RSI(${length})`
               )
               if (registered) {
                 const indicatorId = chartRef.value.createIndicator(customIndicatorName, false, { height: 100, dragEnabled: true })
@@ -5999,6 +6021,7 @@ registerOverlay({
             try {
               addMainPaneOverlayEntry({
                 signature: buildUniqueIndicatorName(`BOLL_${length}_${mult}`),
+                label: `BOLL(${length},${mult})`,
                 figures: [
                   buildLineFigure(`upper_${indicatorInstanceKey}`, `上轨(${length},${mult})`, color, lineWidth),
                   buildLineFigure(`middle_${indicatorInstanceKey}`, `中轨(${length})`, '#8c8c8c', lineWidth),
@@ -6172,7 +6195,7 @@ registerOverlay({
                   return result.adx.map(value => ({ adx: value }))
                 },
                 [buildLineFigure('adx', `ADX(${length})`, color, lineWidth)],
-                [length]
+                [length], -1, false, `ADX(${length})`
               )
 
               if (registered) {
@@ -6307,7 +6330,7 @@ registerOverlay({
                   buildLineFigure('d', `D(${dPeriod})`, '#4ECDC4', lineWidth),
                   buildLineFigure('j', 'J', '#95E1D3', lineWidth)
                 ],
-                [period, kPeriod, dPeriod]
+                [period, kPeriod, dPeriod], -1, false, `KDJ(${period},${kPeriod},${dPeriod})`
               )
 
               if (registered) {
@@ -6338,7 +6361,7 @@ registerOverlay({
             try {
               const registered = registerCustomIndicator({
                 name: customIndicatorName,
-                shortName: customIndicatorName,
+                shortName: `${indicator.id.toUpperCase()}(${paramValues.join(',')})`,
                 calcParams: paramValues,
                 figures: def.figures.map(f => {
                   if (f.type === 'line') { return buildLineFigure(f.key, f.title, color, lineWidth) }
@@ -6444,7 +6467,8 @@ registerOverlay({
             mainPaneOverlayFigures,
             [],
             -1,
-            true
+            true,
+            buildMainOverlayShortName(mainPaneOverlayLabels)
           )
           if (registered) {
             const paneId = chartRef.value.createIndicator(combinedName, true, { id: 'candle_pane' })
