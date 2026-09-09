@@ -439,3 +439,91 @@ class DragonCallbackStrategy(StrategyBase):
             if exit_idx == today_idx and r.get("exit_reason"):
                 return ExitDecision("exit", reason=r["exit_reason"], price=float(r["exit_price"]))
         return ExitDecision("hold")
+
+    # ---- 回测钩子 (2026-09-10 自 backtest.backtest_dragon_stock 逐字搬入, 对数零差异) ----
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+        """单股龙回头全历史回测, 返回 trades 列表 (字段与基线 JSON 对齐)。
+
+        编排 (枚举/去重±4/预过滤锚点/预筛) 是策略规则故归位本插件; 出场引擎
+        run_backtest_dragon_callback lazy import (流水线设施, 留 backtest.py)。
+        """
+        from app.market_cn.auto.common.filters import unified_prefilter
+        board_type = get_board_type(code)
+        n = len(bars)
+        if n < 5:
+            return []
+        lu_all = find_limit_ups(bars, board_type)
+        # 廉价预筛参数: 与 scan_signals 实际用的默认参数同源 (回测不走 config 覆盖,
+        # 与旧 facade 调用路径一致); 取 self.default_params 而非 merged_params。
+        gap_min = self.default_params["gap_min"]
+        gap_max = self.default_params["gap_max"]
+        trades = []
+        used_ranges = []
+
+        for i in range(2, n - 1):
+            # 廉价预筛 (数学必要条件超集, 非加规则 — 行为零差异): scan_signals 必过
+            # Step2 — 存在涨停日 lu: gap∈[gap_min,gap_max] 且 D0收盘仍低于涨停收盘;
+            # 不满足则该日不可能出信号, 跳过昂贵的逐日全量判定 (closes 复制 +
+            # MACD/RSI/ROC/PSY, 426s→48s 的根因修复)。若回测覆盖 gap 参数须同步此处。
+            d0c = bars[i]["close"]
+            if not any(gap_min <= i - j <= gap_max and d0c < bars[j]["close"]
+                       for j in lu_all):
+                continue
+
+            # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
+            sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
+                bars[:i + 1], code, limit_ups=[j for j in lu_all if j < i])]
+
+            if not sigs:
+                continue
+            sig = sigs[0]
+            lu_idx = _find_bar_idx(bars, sig["lu_date"])
+
+            # 去重 (±4天内跳过); 注意去重在过滤之前 (对数基线行为)
+            skip = False
+            for (s, e) in used_ranges:
+                if abs(i - s) <= 4 or abs(i - e) <= 4:
+                    skip = True
+                    break
+            if skip:
+                continue
+            used_ranges.append((lu_idx, i))
+
+            # U1~U4 预过滤 (锚定涨停日, 无未来函数)
+            if use_prefilter and lu_idx > 0:
+                ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
+                if not ok:
+                    continue
+
+            # 入场: 次日(D+1)开盘价
+            d0 = bars[i]
+            d1 = bars[i + 1]
+            d1_gap = (d1["open"] / d0["close"] - 1) * 100 if d0["close"] > 0 else 0
+            entry_price = d1["open"]
+            if entry_price <= 0:
+                continue
+
+            result = run_backtest_dragon_callback(
+                bars, i + 1, entry_price, hold_days=7, stop_loss=-8.0,
+                board_type=board_type)
+            if not result:
+                continue
+
+            trades.append({
+                **sig,
+                "entry_date": d1["time"],
+                "entry_price": round(entry_price, 3),
+                "buy_mode": "next_open",
+                "d1_gap": round(d1_gap, 2),
+                **result,
+            })
+
+        return trades
+
+
+def _find_bar_idx(bars, date_str):
+    """日期串 → bars 索引; 未找到返回 None (回测钩子用, 原 backtest 内联助手)。"""
+    for i, b in enumerate(bars):
+        if b["time"] == date_str:
+            return i
+    return None

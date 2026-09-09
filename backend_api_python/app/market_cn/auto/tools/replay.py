@@ -3,7 +3,7 @@
 
 用途: 规则调试入口——给定股票代码+策略, 重放全历史信号与逐笔出场,
      打印逐笔明细 (判定特征+出场原因), 供 AI/人工分析落选与胜率归因。
-     与回测流水线同一份判定/引擎 (backtest.backtest_*_stock), 保证所见即所得。
+     与回测流水线同一 backtest_stock 钩子 (注册表分发), 保证所见即所得。
 
 用法:
   python -m app.market_cn.auto.tools.replay --strategy dragon --code 000859
@@ -18,7 +18,8 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(description="单股单策略重放调试")
-    parser.add_argument("--strategy", required=True, choices=["dragon", "v1", "break"])
+    parser.add_argument("--strategy", required=True,
+                        help="任意已注册策略 key (dragon/v1/break/...)")
     parser.add_argument("--code", required=True)
     parser.add_argument("--days", type=int, default=300)
     parser.add_argument("--json", action="store_true", help="输出原始 JSON (供 AI 统计)")
@@ -33,8 +34,7 @@ def main():
     except Exception:
         pass
 
-    from app.market_cn.auto.backtest import (
-        backtest_break_stock, backtest_dragon_stock, backtest_v1_stock)
+    from app.market_cn.auto import strategies as strat_reg
     from app.market_cn.auto.data.hub import daily, stock_info
 
     try:
@@ -48,9 +48,14 @@ def main():
     print(f"{args.code} {args.strategy} | {len(bars)} 根 "
           f"({bars[0]['time']} ~ {bars[-1]['time']})")
 
-    fn = {"dragon": backtest_dragon_stock, "v1": backtest_v1_stock,
-          "break": backtest_break_stock}[args.strategy]
-    trades = fn(bars, args.code, stock_info=stock_info)
+    # 经注册表分发 (与回测流水线同一 backtest_stock 钩子, 所见即所得)
+    strat_reg.autodiscover()
+    key = {"dragon": "dragon_callback"}.get(args.strategy, args.strategy)  # 旧CLI名别名
+    strat = strat_reg.get_strategy(key)
+    if strat is None:
+        print(f"策略 {key} 未注册 (可用: {sorted(strat_reg.all_strategies())})")
+        return
+    trades = strat.backtest_stock(bars, args.code, stock_info=stock_info) or []
 
     if args.json:
         print(json.dumps(trades, ensure_ascii=False, indent=1))

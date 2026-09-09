@@ -253,3 +253,76 @@ class V1Strategy(StrategyBase):
         if held >= hold:
             return ExitDecision("exit", reason=f"持仓到期{hold}天", price=float(last_bar["close"]))
         return ExitDecision("hold")
+
+    # ---- 回测钩子 (2026-09-10 自 backtest.backtest_v1_stock 逐字搬入, 对数零差异) ----
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+        """单股 V1 全历史回测 (D0四因子判定, 次日开盘买, D1入场过滤)。
+
+        D1 过滤 (gap/change/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
+        出场引擎 run_backtest lazy import (流水线设施, 留 backtest.py)。
+        """
+        from app.market_cn.auto.backtest import run_backtest
+        from app.market_cn.auto.common.filters import unified_prefilter
+        board_type = get_board_type(code)
+        n = len(bars)
+        if n < 30:
+            return []
+        trades = []
+
+        for i in range(25, n - 1):
+            # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
+            sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
+                bars[:i + 1], code,
+                ret_20d_min=30.0, d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
+                obv_filter=True, d_1_vol_max=1.5, stock_info=stock_info)]
+            if not sigs:
+                continue
+            sig = sigs[0]
+
+            # U1~U4 (信号日D0收盘可知; 20日涨幅>=30%已隐含U4)
+            if use_prefilter:
+                ok, fails = unified_prefilter(bars, i, code, stock_info)
+                if not ok:
+                    continue
+
+            # 入场: 次日开盘价 + D1当日过滤
+            d0 = bars[i]
+            d1 = bars[i + 1]
+            entry_price = d1["open"]
+            if entry_price <= 0:
+                continue
+            entry_idx = i + 1
+            entry_date = d1["time"]
+            d1_change = (d1["close"] / d0["close"] - 1) * 100
+            d1_gap = (d1["open"] / d0["close"] - 1) * 100
+            min_d1_gap = -3.0 if board_type == "main" else -5.0
+            if d1_gap < min_d1_gap:
+                continue
+            if d1_change < 0:
+                continue
+            if board_type == "gem_star" and d1_gap >= 5.0:
+                continue
+            # 主板高开3%~5%不入场 (v4数据驱动)
+            if board_type == "main" and 3.0 <= d1_gap < 5.0:
+                continue
+
+            d1_limit_up_val = is_limit_up(d1["close"], d0["close"], board_type)
+            bt = run_backtest(bars, entry_idx, entry_price, 7, -10.0,
+                              -5.0, board_type, is_v1=True,
+                              d1_limit_up=d1_limit_up_val, d1_change=d1_change,
+                              d1_gap=d1_gap)
+            if not bt:
+                continue
+
+            trades.append({
+                **sig,
+                "entry_date": entry_date,
+                "entry_price": round(entry_price, 3),
+                "buy_mode": "next_open",
+                "d1_change": round(d1_change, 2),
+                "d1_gap": round(d1_gap, 2),
+                "intraday": round(d1_change - d1_gap, 2),
+                **bt,
+            })
+
+        return trades

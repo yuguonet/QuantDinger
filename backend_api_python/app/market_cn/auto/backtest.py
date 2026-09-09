@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
-"""auto/backtest.py — 框架内全市场回测流水线 (B 阶段, 2026-09-09)
+"""auto/backtest.py — 框架内全市场回测流水线 (B 阶段, 2026-09-09; 09-10 分发插件化)
 
-用途: 把 test_dragon.py 的"全市场回测流水线"收进框架 —— 判定/引擎/过滤全部
-     import 系统侧权威实现 (strategies 插件 + core facade), 本文件只做**薄枚举编排**:
-     逐日切片 → 当日D0判定 → 去重(±4) → U1~U4预过滤 → D1开盘买 → 出场引擎 → trades。
+用途: 把 test_dragon.py 的"全市场回测流水线"收进框架。本文件只做**薄编排**:
+     全市场循环 → hub.daily 取数 → 策略钩子 backtest_stock → trades → 标准统计。
+     策略枚举判定经注册表分发 (strategies 插件的 backtest_stock 钩子, 2026-09-10 起),
+     **新建策略零改动本文件** — 插件内实现 backtest_stock 即自动进入流水线。
 
 设计点:
   - 与实盘同一份 scan_signals (as_of 切片语义), 对数 PASS 后 test_dragon 双同步约定作废;
-  - 枚举层无规则: 所有阈值/规则都在插件 PARAMS 与判定函数内, 本文件不出现魔法数;
-  - 数据走 hub.daily (与 test_dragon.fetch_kline_db 逐字等价: 窗口取数+qfq, 已验证);
-  - 去重时机在预过滤之前 (与 test_dragon 完全一致, 保证禁用过滤时行为同基线)。
+  - 编排层无规则: 去重/预过滤锚点/D1过滤/预筛都在各插件 backtest_stock 内,
+    出场引擎 (run_backtest / run_backtest_breakbuy) 与 BOARD_PARAMS 是流水线设施留此,
+    插件 lazy import 调用 (避免顶层环: backtest 顶层会 import 插件常量);
+  - 数据走 hub.daily (与 test_dragon.fetch_kline_db 逐字等价: 窗口取数+qfq, 已验证)。
 
 易错点:
-  - 枚举终点 n-1: 最后一根无 D+1, 不能做 D0 (与 test_dragon range(2, n-1) 一致);
-  - limit_ups 预计算全序列, 逐日传 [j for j in lu_all if j < i] (as_of 内不重算);
+  - 枚举终点 n-1: 最后一根无 D+1, 不能做 D0 (约定在插件循环内);
+  - 未实现 backtest_stock 的策略 (盘中窗口类 tail/knife) run_all 直接报错提示;
   - run 输出 trades 含 tech_score 等字段, 与 tmp/ 基线 JSON 字段对齐供逐笔对数。
 """
 from __future__ import annotations
 
-import sys
 import time
-from collections import defaultdict
 
-from app.market_cn.auto.common.filters import unified_prefilter
-from app.market_cn.auto.common.market import find_limit_ups, get_board_type, is_limit_up
 from app.market_cn.auto.common.exec_cn import (
     fill_blocked_by_limit_dn,
     fill_on_gap,
     is_one_word_limit_dn,
     limit_dn_price as _limit_dn_price,
 )
-from app.market_cn.auto.core import (
-    break_today_d0_signals,
-    dragon_cb_today_d0_signals,
-    run_backtest_dragon_callback,
-    v1_today_d0_signals,
-)
 
 # ================================================================
-# 出场引擎 (2026-09-10 自 dragon_core.py 迁入 —— 出场模拟属回测流水线, 不属判定核心)
+# 出场引擎 (2026-09-10 自 core.py 迁入 —— 出场模拟属回测流水线, 不属判定核心)
 # 迁移为逐字搬运, 行为零差异; 350笔回归基线验证见 tmp/。
 # ================================================================
-
-# 跌停价原语收编至 common/exec_cn.py (C 阶段); 别名保持引擎内部调用点不变
 
 BOARD_PARAMS = {
     # enhance_filter: 断板增强过滤 (三通道OR, 满足其一即可; 置 False 可整体关闭)
@@ -290,262 +280,35 @@ def is_st_stock(code):
     return False
 
 
-def _find_bar_idx(bars, date_str):
-    for i, b in enumerate(bars):
-        if b["time"] == date_str:
-            return i
-    return None
-
-
 # ================================================================
-# 龙回头: 全历史枚举 + 逐笔回测 (编排移植自 test_dragon.strategy_dragon_callback,
-# 判定/引擎改调系统侧; 逐字等价由全市场对数 tmp/test_dragon_callback_result_all.json 验证)
-# ================================================================
-
-DRAGON_CB_DEFAULTS = dict(hold_days=7, stop_loss=-8.0)
-
-
-def backtest_dragon_stock(bars, code, hold_days=7, stop_loss=-8.0,
-                          stock_info=None, use_prefilter=True):
-    """单股龙回头全历史回测, 返回 trades 列表 (字段与基线 JSON 对齐)。"""
-    board_type = get_board_type(code)
-    n = len(bars)
-    if n < 5:
-        return []
-    lu_all = find_limit_ups(bars, board_type)
-    trades = []
-    used_ranges = []
-
-    for i in range(2, n - 1):
-        # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义)
-        sigs = dragon_cb_today_d0_signals(
-            bars[:i + 1], code,
-            limit_ups=[j for j in lu_all if j < i])
-
-        if not sigs:
-            continue
-        sig = sigs[0]
-        lu_idx = _find_bar_idx(bars, sig["lu_date"])
-
-        # 去重 (±4天内跳过); 注意去重在过滤之前 (对数基线行为)
-        skip = False
-        for (s, e) in used_ranges:
-            if abs(i - s) <= 4 or abs(i - e) <= 4:
-                skip = True
-                break
-        if skip:
-            continue
-        used_ranges.append((lu_idx, i))
-
-        # U1~U4 预过滤 (锚定涨停日, 无未来函数)
-        if use_prefilter and lu_idx > 0:
-            ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
-            if not ok:
-                continue
-
-        # 入场: 次日(D+1)开盘价
-        d0 = bars[i]
-        d1 = bars[i + 1]
-        d1_gap = (d1["open"] / d0["close"] - 1) * 100 if d0["close"] > 0 else 0
-        entry_price = d1["open"]
-        if entry_price <= 0:
-            continue
-
-        result = run_backtest_dragon_callback(
-            bars, i + 1, entry_price, hold_days=hold_days, stop_loss=stop_loss,
-            board_type=board_type)
-        if not result:
-            continue
-
-        trades.append({
-            **sig,
-            "entry_date": d1["time"],
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "next_open",
-            "d1_gap": round(d1_gap, 2),
-            **result,
-        })
-
-    return trades
-
-
-# ================================================================
-# V1: 全历史枚举 + 逐笔回测 (编排移植自 test_dragon.strategy_v1)
-# ================================================================
-
-V1_DEFAULTS = dict(hold_days=7, stop_loss=-10.0, trailing_stop=-5.0,
-                   ret_20d_min=30.0, d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                   obv_filter=True, d_1_vol_max=1.5)
-
-
-def backtest_v1_stock(bars, code, hold_days=7, stop_loss=-10.0, trailing_stop=-5.0,
-                      ret_20d_min=30.0, d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                      obv_filter=True, d_1_vol_max=1.5,
-                      stock_info=None, use_prefilter=True):
-    """单股 V1 全历史回测 (D0四因子判定, 次日开盘买, D1入场过滤)。"""
-    board_type = get_board_type(code)
-    n = len(bars)
-    if n < 30:
-        return []
-    trades = []
-
-    for i in range(25, n - 1):
-        sigs = v1_today_d0_signals(
-            bars[:i + 1], code,
-            ret_20d_min=ret_20d_min,
-            d_1_pullback_min=d_1_pullback_min,
-            d_1_pullback_max=d_1_pullback_max,
-            obv_filter=obv_filter,
-            d_1_vol_max=d_1_vol_max,
-            stock_info=stock_info)
-        if not sigs:
-            continue
-        sig = sigs[0]
-
-        # U1~U4 (信号日D0收盘可知; 20日涨幅>=30%已隐含U4)
-        if use_prefilter:
-            ok, fails = unified_prefilter(bars, i, code, stock_info)
-            if not ok:
-                continue
-
-        # 入场: 次日开盘价 + D1当日过滤
-        d0 = bars[i]
-        d1 = bars[i + 1]
-        entry_price = d1["open"]
-        if entry_price <= 0:
-            continue
-        entry_idx = i + 1
-        entry_date = d1["time"]
-        d1_change = (d1["close"] / d0["close"] - 1) * 100
-        d1_gap = (d1["open"] / d0["close"] - 1) * 100
-        min_d1_gap = -3.0 if board_type == "main" else -5.0
-        if d1_gap < min_d1_gap:
-            continue
-        if d1_change < 0:
-            continue
-        if board_type == "gem_star" and d1_gap >= 5.0:
-            continue
-        # 主板高开3%~5%不入场 (v4数据驱动)
-        if board_type == "main" and 3.0 <= d1_gap < 5.0:
-            continue
-
-        d1_limit_up_val = is_limit_up(d1["close"], d0["close"], board_type)
-        bt = run_backtest(bars, entry_idx, entry_price, hold_days, stop_loss,
-                          trailing_stop, board_type, is_v1=True,
-                          d1_limit_up=d1_limit_up_val, d1_change=d1_change,
-                          d1_gap=d1_gap)
-        if not bt:
-            continue
-
-        trades.append({
-            **sig,
-            "entry_date": entry_date,
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "next_open",
-            "d1_change": round(d1_change, 2),
-            "d1_gap": round(d1_gap, 2),
-            "intraday": round(d1_change - d1_gap, 2),
-            **bt,
-        })
-
-    return trades
-
-
-# ================================================================
-# 断板: 全历史枚举 + 逐笔回测 (编排移植自 test_dragon.strategy_break_buy)
-# ================================================================
-
-def backtest_break_stock(bars, code, min_streak=2, max_break_gap=5, override_params=None,
-                         stock_info=None, use_prefilter=True):
-    """单股断板全历史回测 (断板期确认日判定, 次日开盘买)。"""
-    bt_type = get_board_type(code)
-    params = dict(BOARD_PARAMS[bt_type])
-    if override_params:
-        params.update(override_params)
-    stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
-    hold_days = params["hold_days"]
-    n = len(bars)
-    if n < 6:
-        return []
-    lu_all = find_limit_ups(bars, bt_type)
-    lu_set = set(lu_all)
-    trades = []
-    used = set()
-
-    for i in range(4, n - 1):
-        # 确认日必为非涨停日 (断板期最后一天)
-        if is_limit_up(bars[i]["close"], bars[i - 1]["close"], bt_type):
-            continue
-        # 廉价预过滤: 断板期结束于i → 必存在距i不超过max_break_gap的涨停日
-        if not any(j in lu_set for j in range(max(1, i - max_break_gap), i)):
-            continue
-        sigs = break_today_d0_signals(
-            bars[:i + 1], code,
-            min_streak=min_streak, max_break_gap=max_break_gap,
-            limit_ups=[j for j in lu_all if j < i],
-            stock_info=stock_info)
-        if not sigs:
-            continue
-        sig = sigs[0]
-
-        # 去重: 同一连板起点+断板日只取一次 (去重在过滤之前, 对数基线行为)
-        key = (sig["streak_start"], sig["break_date"])
-        if key in used:
-            continue
-        used.add(key)
-
-        # U1~U4 (确认日D0收盘可知; 连板>=2已隐含U4)
-        if use_prefilter:
-            ok, fails = unified_prefilter(bars, i, code, stock_info)
-            if not ok:
-                continue
-
-        # 入场: 次日(D+1)开盘价
-        entry_price = bars[i + 1]["open"]
-        if entry_price <= 0:
-            continue
-        result = run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
-                                       stop_loss, trailing_stop, bt_type)
-        if not result:
-            continue
-
-        prev_close = bars[i]["close"]
-        trades.append({
-            **sig,
-            "signal_date": bars[i]["time"],
-            "entry_date": bars[i + 1]["time"],
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "next_open",
-            "d1_change": round((bars[i + 1]["close"] / bars[i + 1]["open"] - 1) * 100, 2)
-            if bars[i + 1]["open"] > 0 else 0,
-            "d1_gap": round((bars[i + 1]["open"] / prev_close - 1) * 100, 2)
-            if prev_close > 0 else 0,
-            "intraday": round((bars[i + 1]["close"] - bars[i + 1]["open"]) / prev_close * 100, 2)
-            if prev_close > 0 else 0,
-            **result,
-        })
-
-    return trades
-
-
-# ================================================================
-# 全市场流水线
+# 全市场流水线 (编排层: 经注册表分发, 无策略名分支)
 # ================================================================
 
 def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
             use_prefilter=True, progress_every=500):
-    """全市场回测。strategy: dragon (v1/break 待扩)。
+    """全市场回测 (策略经注册表分发)。
 
+    strategy: 任意已注册且实现 backtest_stock 钩子的策略 key。
     返回 {"trades": [...], "stats": {...}}; trades 直接可 json.dump 与基线对数。
     """
+    from app.market_cn.auto import strategies as strat_reg
     from app.market_cn.auto.data.hub import all_codes, daily
-    from app.market_cn.auto.data.hub import stock_info as _stock_info
+    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
+    from app.market_cn.auto.strategies.base import StrategyBase
+
+    strat_reg.autodiscover()
+    strat = strat_reg.get_strategy(strategy)
+    if strat is None:
+        raise ValueError(f"strategy={strategy} 未注册 (可用: {sorted(strat_reg.all_strategies())})")
+    if type(strat).backtest_stock is StrategyBase.backtest_stock:
+        raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock "
+                         f"(盘中窗口策略走各自验证脚本)")
 
     if codes is None:
         codes = all_codes()
     if stock_info is None:
         try:
-            stock_info = _stock_info()  # U1~U3 依赖 (缺失则跳过, 会放行)
+            stock_info = _hub_stock_info()  # U1~U3 依赖 (缺失则跳过, 会放行)
         except Exception:
             stock_info = {}
     t0 = time.time()
@@ -557,20 +320,10 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         bars = daily(code, days)
         if not bars:
             continue
-        if strategy == "dragon":
-            trades.extend(backtest_dragon_stock(
-                bars, code, stock_info=stock_info.get(code) if stock_info else None,
-                use_prefilter=use_prefilter))
-        elif strategy == "v1":
-            trades.extend(backtest_v1_stock(
-                bars, code, stock_info=stock_info.get(code) if stock_info else None,
-                use_prefilter=use_prefilter))
-        elif strategy == "break":
-            trades.extend(backtest_break_stock(
-                bars, code, stock_info=stock_info.get(code) if stock_info else None,
-                use_prefilter=use_prefilter))
-        else:
-            raise ValueError(f"strategy={strategy} 未实现")
+        trades.extend(strat.backtest_stock(
+            bars, code,
+            stock_info=stock_info.get(code) if stock_info else None,
+            use_prefilter=use_prefilter) or [])
         n_ok += 1
         if progress_every and k % progress_every == 0:
             print(f"[{k}/{len(codes)}] trades={len(trades)} "
@@ -635,8 +388,9 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="框架内全市场回测流水线")
-    parser.add_argument("--strategy", default="dragon", choices=["dragon", "v1", "break"])
+    parser = argparse.ArgumentParser(description="框架内全市场回测流水线 (策略经注册表分发)")
+    parser.add_argument("--strategy", default="dragon",
+                        help="任意已注册策略 key (dragon/v1/break/...)")
     parser.add_argument("--days", type=int, default=300)
     parser.add_argument("--codes", default="", help="逗号分隔, 空则全市场")
     parser.add_argument("--out", default="", help="结果JSON输出路径 (对数用)")

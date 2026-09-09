@@ -130,6 +130,20 @@ class StrategyBase:
         """snap=None: 盘中实时模式; snap=日K重放模式 (回测/盘后复盘复用同一路径)。"""
         raise NotImplementedError
 
+    # ---- 回测钩子 (2026-09-10 插件化: 新策略实现本钩子即入回测流水线, backtest.py 零改动) ----
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+        """单股全历史日线枚举回测 → trades 列表; 默认 None = 无日线枚举回测。
+
+        契约:
+          - 与实盘同一份 scan_signals (as_of 切片语义), 出场引擎 lazy import backtest.py
+            (插件先加载也不成环: backtest.py 顶层只 import 插件常量, 引擎调用发生在运行期);
+          - trades 字段与基线 JSON 对齐 (entry_date/entry_price/return_pct/exit_day/...);
+          - 枚举内的去重/预过滤锚点/D1过滤属策略规则, 写在插件内, 编排层 (backtest.run_all)
+            只做全市场循环与统计。
+        盘中窗口策略 (tail/knife) 不实现, 走各自验证脚本。
+        """
+        return None
+
     # ---- 便捷 ----
     def merged_params(self, override=None):
         """default_params ← config.json params 覆盖 的合并结果。"""

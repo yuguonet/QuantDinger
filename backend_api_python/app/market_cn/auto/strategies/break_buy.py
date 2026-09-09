@@ -20,7 +20,9 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.market import get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.common.market import (
+    find_limit_ups, get_board_name, get_board_type, is_limit_up,
+)
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -328,6 +330,84 @@ class BreakStrategy(StrategyBase):
         if held >= hold:
             return ExitDecision("exit", reason=f"持仓到期{hold}天", price=float(last_bar["close"]))
         return ExitDecision("hold")
+
+    # ---- 回测钩子 (2026-09-10 自 backtest.backtest_break_stock 逐字搬入, 对数零差异) ----
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+        """单股断板全历史回测 (断板期确认日判定, 次日开盘买)。
+
+        出场参数取本插件 BOARD_PARAMS (与 backtest.BOARD_PARAMS 同值同源);
+        出场引擎 run_backtest_breakbuy lazy import (流水线设施, 留 backtest.py)。
+        """
+        from app.market_cn.auto.backtest import run_backtest_breakbuy
+        from app.market_cn.auto.common.filters import unified_prefilter
+        min_streak, max_break_gap = 2, 5   # 旧 backtest_break_stock 默认值 (run_all 从不覆盖)
+        bt_type = get_board_type(code)
+        params = dict(BOARD_PARAMS[bt_type])
+        stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
+        hold_days = params["hold_days"]
+        n = len(bars)
+        if n < 6:
+            return []
+        lu_all = find_limit_ups(bars, bt_type)
+        lu_set = set(lu_all)
+        trades = []
+        used = set()
+
+        for i in range(4, n - 1):
+            # 确认日必为非涨停日 (断板期最后一天)
+            if is_limit_up(bars[i]["close"], bars[i - 1]["close"], bt_type):
+                continue
+            # 廉价预过滤: 断板期结束于i → 必存在距i不超过max_break_gap的涨停日
+            if not any(j in lu_set for j in range(max(1, i - max_break_gap), i)):
+                continue
+            # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
+            sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
+                bars[:i + 1], code,
+                min_streak=min_streak, max_break_gap=max_break_gap,
+                limit_ups=[j for j in lu_all if j < i],
+                stock_info=stock_info)]
+            if not sigs:
+                continue
+            sig = sigs[0]
+
+            # 去重: 同一连板起点+断板日只取一次 (去重在过滤之前, 对数基线行为)
+            key = (sig["streak_start"], sig["break_date"])
+            if key in used:
+                continue
+            used.add(key)
+
+            # U1~U4 (确认日D0收盘可知; 连板>=2已隐含U4)
+            if use_prefilter:
+                ok, fails = unified_prefilter(bars, i, code, stock_info)
+                if not ok:
+                    continue
+
+            # 入场: 次日(D+1)开盘价
+            entry_price = bars[i + 1]["open"]
+            if entry_price <= 0:
+                continue
+            result = run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
+                                           stop_loss, trailing_stop, bt_type)
+            if not result:
+                continue
+
+            prev_close = bars[i]["close"]
+            trades.append({
+                **sig,
+                "signal_date": bars[i]["time"],
+                "entry_date": bars[i + 1]["time"],
+                "entry_price": round(entry_price, 3),
+                "buy_mode": "next_open",
+                "d1_change": round((bars[i + 1]["close"] / bars[i + 1]["open"] - 1) * 100, 2)
+                if bars[i + 1]["open"] > 0 else 0,
+                "d1_gap": round((bars[i + 1]["open"] / prev_close - 1) * 100, 2)
+                if prev_close > 0 else 0,
+                "intraday": round((bars[i + 1]["close"] - bars[i + 1]["open"]) / prev_close * 100, 2)
+                if prev_close > 0 else 0,
+                **result,
+            })
+
+        return trades
 
 
 def _find_limit_ups(bars, bt):
