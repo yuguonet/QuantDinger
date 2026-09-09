@@ -25,7 +25,20 @@ V2 尾盘买入策略 — 全市场回测 & 今日信号扫描
     单笔胜率=80.7%  均收=+2.74%  累计=+60.17%
     夏普=8.117  回撤=-3.40%  日胜率=72.4%
 
-  卖出规则: D+1 开盘价 (open-to-open)
+  卖出规则: D+1 开盘价 (open-to-open), 唯一可执行的最优出场
+    ⚠ 已否决的出场实验 (2026-09-09, 勿再试):
+    - D1收盘/D2开盘/D2收盘全卖: 胜率均收盈亏比全面劣化 (81.5/79.6/74.1% vs 87.0%)
+    - "规则A: D1收盘封板→持D2开盘卖": 时序前视 (封板D1收盘才知道, 未封板分支却
+      用D1开盘价出场); 时序诚实版 -2.59% vs 基线+1.97% (未封板票扛D1全天
+      +1.84%→-3.36%); 一字开盘才持有的变体也略差 (-0.08pt)
+    - 本质: 超卖隔夜反弹的钱在 D0尾盘→D1开盘 竞价缺口, D1开盘不走就要扛全天回落;
+      封板票D2开盘+11.52%的红利无法用"全持有"结构捕捉 (94%的票不封板)
+    - "两级决策: gap≥3%持有(封板→D2开盘/未封→D1收盘), <3%开盘卖": 90天309笔
+      +0.60% vs 基线+1.97%; 高开组封板率12.2%(vs全体5.2%)但88%未封板票日内
+      +5.48%→-0.87%, 封板红利填不平; 阈值2~6%单调劣于基线, 最优阈值=∞=全卖
+    - "盘中监控(9:38动量/10:00 VWAP检查点, 失败即卖)": 两级+监控+1.55%/全监控
+      +0.69% vs 基线+1.97% — 检查点触发前提是价格已跌, 卖价必然≤开盘价,
+      监控本质是"等弱者跌了再卖", 而非"识别强者"
 
   ⚠ 易错点 (2026-09-09修复):
     - 回测日循环从 k=1 开始 (只需 days[k-1] 前收盘)。勿照抄 limitnext 的
@@ -467,8 +480,16 @@ def backtest_stock(code: str, start_date: str, end_date: str,
         if not check_v2_signal(feat, daily_feat, board_type):
             continue
 
-        # D+1 开盘价卖出
+        # D+1 开盘价卖出 (open-to-open)
+        # ⚠ 2026-09-09 曾实验"规则A: D1收盘封板→持到D2开盘卖", 被用户指出时序前视:
+        #   封板与否D1收盘才知道, 未封板分支却用D1开盘价出场 = 不可执行。
+        #   时序诚实版(未封板→D1收盘卖)90天309笔实测 -2.59% vs 基线+1.97% (未封板票
+        #   扛D1全天 +1.84%→-3.36%), 一字开盘变体也劣于基线 → 撤销, 维持D1开盘全卖。
+        #   d1_sealed 字段保留仅作信息记录, 不参与出场。
         next_open = float(next_day[0]['open'])
+        exit_date_use = next_date
+        d1_sealed = (feat['buy_price'] > 0
+                     and float(next_day[-1]['close']) >= feat['buy_price'] * (1 + limit_pct) * 0.998)
         if next_open <= 0:
             continue
 
@@ -479,9 +500,11 @@ def backtest_stock(code: str, start_date: str, end_date: str,
             'board': get_board_name(code),
             'signal_date': date,
             'entry_price': round(feat['buy_price'], 3),
-            'exit_date': next_date,
+            'exit_date': exit_date_use,
             'exit_price': round(next_open, 3),
             'return_pct': round(ret, 2),
+            'd1_sealed': d1_sealed,
+            'exit_rule': 'd1_open',
             # 因子明细
             'day_gain': feat['day_gain'],
             'tail_ret': feat['tail_ret'],
@@ -641,6 +664,8 @@ def main():
     parser.add_argument("--no-filter-st", action="store_true")
     parser.add_argument("--start-date", type=str, default="",
                         help="回测起始日期 (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default="",
+                        help="回测截止日期 (默认今天; 固定窗口复现时用)")
     parser.add_argument("--today", action="store_true",
                         help="仅扫描今日符合V2入场条件的股票 (不回测)")
     parser.add_argument("--all-trades", action="store_true", help="输出每笔交易明细")
@@ -751,7 +776,7 @@ def main():
     # ================================================================
     # 回测模式
     # ================================================================
-    end_date = datetime.now().strftime("%Y-%m-%d")
+    end_date = args.end_date or datetime.now().strftime("%Y-%m-%d")
     if args.start_date:
         start_date = args.start_date
     else:
