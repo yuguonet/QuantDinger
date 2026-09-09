@@ -232,10 +232,10 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         rows = []
         for key, strat in cycle_strats.items():
             params = strat_reg.params_override(key)
-            shortlist = strat.intraday_shortlist(snaps, m, **params)
+            shortlist = strat.intraday_shortlist(snaps, mkt, **params)
             logger.info("[knife_scan] %s 便宜预筛: %d/%d%s (mkt=%.2f%%)",
                         key, len(shortlist), len(snaps),
-                        " [预览]" if preview_cycle else "", m)
+                        " [预览]" if preview_cycle else "", mkt)
             for code, snap in shortlist.items():
                 if not _st_ok(code):
                     continue
@@ -244,7 +244,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                 series = fetch_day_snapshots([code]).get(code) or []
                 try:
                     sigs = strat.scan_signals(bars, code, ctx={
-                        "latest": snap, "series": series, "mkt_gain": m,
+                        "latest": snap, "series": series, "mkt_gain": mkt,
                     }, **params)
                 except Exception as e:
                     logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)

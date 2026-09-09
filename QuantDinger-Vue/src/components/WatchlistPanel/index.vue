@@ -1440,10 +1440,12 @@ export default {
 .wl-card-cb { position: absolute; top: 12px; left: 4px; z-index: 1; }
 .wl-card-body { transition: padding-left 0.2s; }
 .wl-card-body.with-cb { padding-left: 24px; }
-/* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列5新闻分 | 列4价格/涨跌 */
+/* 行主体: 先切列后分行 —— 列1名称/代码 | 列2买/损 | 列3策略标签竖排 | 列4新闻分 | 列5价格/涨跌 */
 /* 列2/列3定宽 → 跨卡片严格对齐; 新闻分列吃剩余空间, 价格/涨跌恒贴最右; 各列统一 16px 行高 × 2行 = 32px */
+/* 各列显式锁定轨道(grid-column): v-if 缺列(如无策略组)时轨道空置占位, 后续列不前移错位 ——
+   保证无策略行也是「成员最左、价格最右」的两端分布 */
 .wl-row-main { display: grid; grid-template-columns: auto 52px 22px minmax(0, 1fr) auto; align-items: center; gap: 0 2px; min-width: 220px; }
-.wl-col-name { min-width: 0; }
+.wl-col-name { grid-column: 1; min-width: 0; }
 .wl-symbol-line { display: flex; align-items: baseline; gap: 5px; overflow: hidden; line-height: 16px; }
 .wl-name { font-size: 13px; color: #94a3b8; line-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wl-symbol { font-size: 12px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1453,7 +1455,7 @@ export default {
 .wl-change { font-size: 12px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; padding: 0 5px; border-radius: 4px; line-height: 16px; }
 .wl-change.up { color: #ef4444; background: rgba(239,68,68,0.08); }
 .wl-change.down { color: #10b981; background: rgba(16,185,129,0.06); }
-.wl-col-quote { display: flex; flex-direction: column; align-items: flex-end; white-space: nowrap; }
+.wl-col-quote { grid-column: 5; display: flex; flex-direction: column; align-items: flex-end; white-space: nowrap; }
 .wl-row-pnl { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-family: 'SF Mono', Monaco, monospace; }
 .wl-pnl-qty { font-size: 10px; color: #94a3b8; }
 .wl-pnl-val { font-size: 10px; font-weight: 600; margin-left: auto; }
@@ -1484,7 +1486,7 @@ export default {
 .wl-strategy-item { font-size: 10px; color: #64748b; font-family: 'SF Mono', Monaco, monospace; }
 .wl-strategy-k { color: #94a3b8; margin-right: 1px; }
 /* 策略标签列: 逐字竖排, 每字行高16px → 与买/损、名称/代码两行切片严格对齐 */
-.wl-col-tag { display: flex; align-items: center; justify-content: center; }
+.wl-col-tag { grid-column: 3; display: flex; align-items: center; justify-content: center; }
 .wl-vchar { display: block; line-height: 16px; }
 /* 星标: 悬于tag右上角的小角标, 不占竖排行数 */
 .wl-strategy-pre {
@@ -1501,7 +1503,7 @@ export default {
 .wl-half-star { position: relative; display: inline-block; }
 .wl-half-star-fill { position: absolute; left: 0; top: 0; width: 50%; overflow: hidden; color: inherit; }
 /* 买/损切片列: 定宽左对齐, 买/损两行首字纵向对齐 */
-.wl-col-strategy { display: flex; flex-direction: column; align-items: flex-start; }
+.wl-col-strategy { grid-column: 2; display: flex; flex-direction: column; align-items: flex-start; }
 .wl-strategy-mini { font-size: 12px; font-weight: 600; color: #475569; font-family: 'serif', Monaco, monospace; white-space: nowrap; line-height: 16px; }
 .wl-strategy-mini-entry { color: #15803d; }
 .wl-strategy-mini-stop { color: #475569; }
@@ -1514,7 +1516,7 @@ export default {
 .wl-hover-btn.strategy-managed { color: #94a3b8; cursor: default; }
 
 .negative-news { background: rgba(239, 68, 68, 0.08) !important; border-color: rgba(239, 68, 68, 0.2) !important; }
-.wl-news-score { display: flex; align-items: center; justify-content: center; min-width: 24px; }
+.wl-news-score { grid-column: 4; display: flex; align-items: center; justify-content: center; min-width: 24px; }
 .wl-news-heart { color: #ef4444; font-size: 14px; }
 .wl-news-num { font-size: 11px; font-weight: 600; font-family: 'SF Mono', Monaco, monospace; color: #64748b; }
 .wl-news-num.news-negative { color: #10b981; }
