@@ -3057,11 +3057,22 @@ registerOverlay({
 
     /** 换股后下一次数据加载: 右缘滚到最新K线 (保留缩放跨度, 现场随后自动归档为最新视图) */
     let _goLatestOnNextLoad = false
+    // 上一轮已应用的图表渲染模式（'minute' | 'normal' | null）。
+    // 切股/静默刷新时同模式跳过样式重设：applyMinuteLineChartStyle 的面积样式/AVP 重建/
+    // 交互锁定与 restoreNormalChartStyle 的样式恢复都与数据无关，实例内已生效，无需重走；
+    // 仅渲染模式切换（分时↔蜡烛）或图表实例销毁重建后才走完整样式流程。
+    let _lastRenderedMode = null
 
-    /** 读取当前图表现场（分时为锁定视图，不保存） */
-    const captureChartScene = () => {
+    /** 读取当前图表现场（分时为锁定视图，不保存）。
+     * forceTf: 归档「即将离开的周期」时由 watch(timeframe) 传入旧周期名 —— 此时 props 已更新，
+     * isMinuteLine 读到的是新周期值，必须按 oldTf 判断。
+     * 另用 _lastRenderedMode 校验图表实际渲染状态：周期刚切换但新数据未就绪时图上仍是
+     * 旧模式数据（如分时视口 0~239），此刻捕获会把分时范围写进蜡烛周期槽位 ——
+     * 表现为切回蜡烛后恢复出「数据线结束位置在视口中间」的错误现场。 */
+    const captureChartScene = (forceTf) => {
       const chart = chartRef.value
-      if (!chart || isMinuteLine.value) return null
+      const sceneTf = forceTf || props.timeframe
+      if (!chart || sceneTf === '分时' || _lastRenderedMode === 'minute') return null
       if (typeof chart.getVisibleRange !== 'function') return null
       try {
         const range = chart.getVisibleRange()
@@ -3099,6 +3110,31 @@ registerOverlay({
       } catch (_) { /* 预期内：数据尚未就绪时放弃本次恢复 */ }
     }
 
+    /** 程序化视口定位(切股滚最新/恢复现场/换数据)的抑制窗口:
+     *  这些视口变化不是用户意图, 不归档现场 —— 否则切股会把该周期用户拖拽保存的
+     *  现场覆盖成"最新视图", 破坏「每周期独立记住窗口位置」 */
+    let _sceneSuppressUntil = 0
+    const suppressSceneCapture = () => {
+      if (_sceneCaptureTimer) { clearTimeout(_sceneCaptureTimer); _sceneCaptureTimer = null }
+      _sceneSuppressUntil = Date.now() + 400
+    }
+
+    /** 换股定位: 最新K线右缘留 2bar 呼吸位(保留缩放跨度)。
+     *  scrollToRealTime 先贴右缘(diff=0 基准), 再向右露 2 根 bar 宽 ——
+     *  方向与 restoreChartScene 的反解一致: distance = -diff * barSpace */
+    const goLatestWithBreath = () => {
+      const chart = chartRef.value
+      if (!chart) return
+      try {
+        if (typeof chart.scrollToRealTime === 'function') chart.scrollToRealTime()
+        const bs = typeof chart.getBarSpace === 'function' ? chart.getBarSpace() : 0
+        const bar = bs && typeof bs === 'object' ? bs.bar : bs
+        if (bar > 0 && typeof chart.scrollByDistance === 'function') {
+          chart.scrollByDistance(-2 * bar, 0)
+        }
+      } catch (_) { /* 预期内 */ }
+    }
+
     /** 周期现场写 uiPrefs (kline-scene 模块): 刷新/重开浏览器后可恢复各周期的跨度与起止 */
     const persistTfScenes = () => {
       try { writePrefs('kline-scene', { scenes: _tfSceneMap }) } catch (_) { /* 配额满静默丢弃 */ }
@@ -3109,8 +3145,14 @@ registerOverlay({
     const scheduleSceneCapture = () => {
       if (isMinuteLine.value) return // 分时为锁定视图, 无现场
       if (_sceneCaptureTimer) clearTimeout(_sceneCaptureTimer)
+      // 记录发起归档时的周期: 若回调期间已切走(如 蜡烛→分时→蜡烛), 旧现场已由
+      // watch(timeframe) 按旧周期归档, 本定时器内容过时必须丢弃 —— 否则会把切换
+      // 窗口内图上残留的旧模式视口(如分时范围)写进新周期槽位
+      const tfAtSchedule = props.timeframe
       _sceneCaptureTimer = setTimeout(() => {
         _sceneCaptureTimer = null
+        if (props.timeframe !== tfAtSchedule) return
+        if (Date.now() < _sceneSuppressUntil) return // 程序化定位的余波, 非用户拖拽
         const scene = captureChartScene()
         if (scene) {
           _tfSceneMap[props.timeframe] = scene
@@ -4138,6 +4180,8 @@ registerOverlay({
             )
 
             if (validData.length > 0 && chartRef.value) {
+              // 换数据引发的视口变化(含后续程序化定位)不归档现场, 保护用户拖拽存档
+              suppressSceneCapture()
               // 使用 applyNewData 初始化
               try {
                 chartRef.value.applyNewData(validData)
@@ -4150,16 +4194,27 @@ registerOverlay({
 
               // 分时图模式：应用面积图样式
               if (isMinuteLine.value) {
-                applyMinuteLineChartStyle()
+                if (_lastRenderedMode === 'minute') {
+                  // 同为分时（换股/静默刷新）：面积样式、AVP 均价线、交互锁定与实例同在，
+                  // 跳过整套样式重设；仅重铺 X 轴时段 + 按新标的昨收重建 0 轴线与 Y 轴
+                  // （极坐标/自适应范围、150/400/1000ms 自愈重试均由 setup 内部处理）
+                  fitMinuteLineView()
+                  setupMinutePrevCloseReference()
+                } else {
+                  applyMinuteLineChartStyle()
+                }
+                _lastRenderedMode = 'minute'
               } else {
-                restoreNormalChartStyle()
-                // 换股后的本次加载: 右缘滚到最新K线(保留缩放跨度), 现场由视口监听自动归档为最新视图;
+                if (_lastRenderedMode !== 'normal') {
+                  restoreNormalChartStyle()
+                }
+                _lastRenderedMode = 'normal'
+                // 换股后的本次加载: 最新K线停在距右缘 2bar 处(保留缩放跨度);
+                // 程序化定位不归档现场 —— 该周期用户拖拽保存的窗口位置保持不变
                 // 其余场景(切周期/页面刷新): 恢复该周期上次的图表现场
                 if (_goLatestOnNextLoad) {
                   _goLatestOnNextLoad = false
-                  if (typeof chartRef.value.scrollToRealTime === 'function') {
-                    try { chartRef.value.scrollToRealTime() } catch (_) { /* 预期内 */ }
-                  }
+                  goLatestWithBreath()
                 } else {
                   restoreChartScene(props.timeframe)
                 }
@@ -4866,6 +4921,8 @@ registerOverlay({
         }
         chartRef.value = null
         volPaneId.value = null
+        // 新实例无旧样式状态: 渲染模式标记复位, 确保后续加载走完整样式应用
+        _lastRenderedMode = null
         // 新实例上旧 overlay 已随销毁丢失: 复位标记幂等签名, 稍后初始化完成后重挂
         _tradeAppliedSig = ''
         markerTip.visible = false
@@ -5081,6 +5138,8 @@ registerOverlay({
           )
 
           if (validData.length > 0) {
+            // 首建换数据的视口变化不归档现场(保护持久化恢复的现场)
+            suppressSceneCapture()
             // 使用 applyNewData 初始化
             try {
               chartRef.value.applyNewData(validData)
@@ -5097,18 +5156,20 @@ registerOverlay({
             // 若首个标的在 initChart 定时器(300ms)之前就绪，图表由这里创建 → 分时样式整体缺失。
             if (isMinuteLine.value) {
               nextTick(() => {
-                if (chartRef.value && isMinuteLine.value) applyMinuteLineChartStyle()
+                if (chartRef.value && isMinuteLine.value) {
+                  applyMinuteLineChartStyle()
+                  _lastRenderedMode = 'minute'
+                }
               })
             } else {
               nextTick(() => {
                 if (chartRef.value) {
                   restoreNormalChartStyle()
-                  // 与上方「图表已存在」分支同规则: 换股滚最新(保留缩放), 其余恢复现场
+                  _lastRenderedMode = 'normal'
+                  // 与上方「图表已存在」分支同规则: 换股最新K线留 2bar 呼吸位, 其余恢复现场
                   if (_goLatestOnNextLoad) {
                     _goLatestOnNextLoad = false
-                    if (typeof chartRef.value.scrollToRealTime === 'function') {
-                      try { chartRef.value.scrollToRealTime() } catch (_) { /* 预期内 */ }
-                    }
+                    goLatestWithBreath()
                   } else {
                     restoreChartScene(props.timeframe)
                   }
@@ -6530,7 +6591,10 @@ registerOverlay({
     watch(() => props.timeframe, (newTf, oldTf) => {
       // 切走前归档旧周期的图表现场（分时为锁定视图，无现场可存）并同步持久化
       if (oldTf && oldTf !== newTf) {
-        const scene = captureChartScene()
+        // 传 oldTf: props.timeframe 已更新, 按「离开的周期」归档 ——
+        // 蜡烛→分时: 图上仍是蜡烛数据(_lastRenderedMode='normal'), 蜡烛现场照常保存;
+        // 分时→蜡烛: oldTf='分时' → 返回 null, 不产生分时现场写入任何槽位
+        const scene = captureChartScene(oldTf)
         if (scene) {
           _tfSceneMap[oldTf] = scene
           persistTfScenes()

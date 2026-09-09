@@ -454,7 +454,7 @@ export default {
   },
   data () {
     return {
-      watchlistPriceTimer: null,
+      watchlistSyncTimer: null,
       strategyWinrates: {},
       watchlistPrices: {},
       dragKey: null,
@@ -590,7 +590,7 @@ export default {
     this.startWatchlistPriceRefresh()
   },
   beforeDestroy () {
-    if (this.watchlistPriceTimer) clearInterval(this.watchlistPriceTimer)
+    if (this.watchlistSyncTimer) clearInterval(this.watchlistSyncTimer)
   },
   watch: {
     value (val) {
@@ -981,12 +981,11 @@ export default {
       } catch (error) { /* silent */ }
     },
     startWatchlistPriceRefresh () {
-      let tick = 0
-      this.watchlistPriceTimer = setInterval(() => {
-        tick += 1
-        if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
-        if (tick % 4 === 0) this.refreshWatchlistSilent()   // 每 2 分钟同步策略组增删 (引擎自动管理)
-      }, 30000)
+      // 统一 15s 单定时器串行: 成员/策略组同步(读库, 无压力)完成后刷一次价格(压力点) ——
+      // 行情接口每周期恰好 1 次, 避免双定时器同相位并发双击同一行情接口
+      this.watchlistSyncTimer = setInterval(() => {
+        this.refreshWatchlistSilent()   // 内部: 拉成员(读库) → 更新列表 → 刷价格
+      }, 15000)
       if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
     },
     async refreshWatchlistSilent () {
