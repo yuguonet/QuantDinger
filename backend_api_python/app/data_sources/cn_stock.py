@@ -121,11 +121,23 @@ class _SnapshotCache:
                     self._quotes.pop(k, None)
                     self._ts.pop(k, None)
 
-    def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """从 TTL 内存中查找指定 symbol（pure 和原始 key 都尝试）。"""
+    def get(self, symbol: str, max_age: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """从 TTL 内存中查找指定 symbol（pure 和原始 key 都尝试）。
+
+        max_age: 秒。指定时仅当缓存写入时间距今 <= max_age 才返回（盘中单股行情
+        的实时性要求；None 表示不限 —— 非盘中读收盘价的场景用）。
+        返回缓存对象的浅拷贝：调用方（get_tickers/get_ticker）会改写返回值的
+        symbol 字段，直接返回引用会沿双 key 别名污染缓存原始对象。"""
         pure = strip_market_prefix(symbol) if symbol else symbol
         with self._lock:
-            return self._quotes.get(pure) or self._quotes.get(symbol)
+            q = self._quotes.get(pure) or self._quotes.get(symbol)
+            if q is None:
+                return None
+            if max_age is not None:
+                ts = self._ts.get(pure) or self._ts.get(symbol) or 0
+                if _time.time() - ts > max_age:
+                    return None
+            return dict(q)
 
 
 # 进程级单例，全局共享同一份 TTL 缓存
@@ -209,6 +221,10 @@ def _bar_from_ticker(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     price = float(price)
     today_str = datetime.now().strftime("%Y-%m-%d")
+    # 非交易日没有"今日bar"语义: 周末/节假日的 ticker 是上一交易日收盘价,
+    # 若转成"今日15:00"的bar, 慢路径追加后会产生一根假日线
+    if not is_trading_day(today_str):
+        return None
     bar_ts = int(datetime.strptime(today_str, "%Y-%m-%d").replace(hour=15).timestamp())
 
     return {
@@ -310,7 +326,10 @@ class CNStockDataSource(BaseDataSource):
             return {"last": 0, "symbol": ""}
 
         # ── 先查 TTL ──
-        cached = _snapshot_cache.get(sym)
+        # 盘中要求实时性: 仅接受 10s 内的新鲜缓存, 过期视为未命中走拉取;
+        # 非盘中价格已定格(收盘价), 任意旧缓存直接可用
+        _in_trading = _is_in_trading_hours()
+        cached = _snapshot_cache.get(sym, max_age=10 if _in_trading else None)
         if cached:
             cached["symbol"] = sym
             return cached
@@ -560,9 +579,26 @@ class CNStockDataSource(BaseDataSource):
           - 单股：从远端获取（通过 coordinator）
           - 大批量：缩减到 DB 范围内
         """
+        # ── 盘后当日数据新鲜度守卫(并入主查询, 不额外多查一次) ──
+        # 交易日 15:01 后若 DB 最新 bar 不是今日 → 当日 1m 尚未回填(约 15:30 ETL 完成),
+        # 直读/聚合都会把昨日数据当"最新"返回 → 视为 DB 过期, 返回空/直接走远端
+        # (盘后远端含当日完整分钟线; 盘前/非交易日不触发, DB 的"昨日"数据即最新)。
+        now = datetime.now()
+        _fresh_required = (
+            is_trading_day(now.strftime("%Y-%m-%d")) and now.time() > dtime(15, 1)
+        )
+
+        def _db_stale(bars: List[Dict[str, Any]]) -> bool:
+            if not _fresh_required or not bars:
+                return False
+            lt = bars[-1].get("time")
+            ld = datetime.fromtimestamp(lt).date() if isinstance(lt, (int, float)) else lt.date()
+            return ld != now.date()
+
         # 1m 直读
         if tf == "1m":
-            return self._read_db_1m(symbol, limit)
+            raw = self._read_db_1m(symbol, limit)
+            return [] if _db_stale(raw) else raw
 
         # 5m/15m/30m/1h/2h/4h → 从 1m 聚合
         bar_count = self._TF_1M_BAR_COUNT.get(tf, 15)
@@ -573,6 +609,9 @@ class CNStockDataSource(BaseDataSource):
         raw_bars = self._read_db_1m(symbol, need_bars)
 
         if raw_bars:
+            if _db_stale(raw_bars):
+                # DB 缺当日数据 → 不返回滞后聚合, 直接单股走远端(含当日)
+                return self._fetch_intraday_remote(symbol, tf, limit)
             return self._aggregate_from_1m(raw_bars, bar_count)[-limit:]
 
         # DB 无数据 → 单股从远端获取

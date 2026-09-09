@@ -41,9 +41,11 @@ def strategy_labels():
         pass
     return labels
 # 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
-# dragon_callback = 方案2 (2026-09-07, test_dragon 300日回测, 无D1 gap过滤新口径: 114笔/74.6%/+3.28%)
+# 2026-09-09 出场引擎现实化 (T+1/跳空按开盘/跌停顺延, dragon_core + test_dragon 两处同步):
+#   dragon_callback = 方案2: 116笔/50.9%/+0.21% (旧74.6为乐观引擎常数, 已废弃)
+#   v1 = 139笔/72.7%/+3.51%; break = 94笔/71.3%/+4.31% (旧76.5/62.7亦为乐观口径)
 # tail_oversold = 尾盘超卖超短 (2026-09-10, test_v2_tail_buy 3个月全市场 275笔/80.7%/+2.74%)
-STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 74.6, "relay3": 53.4,
+STRATEGY_WINRATE = {"v1": 72.7, "break": 71.3, "dragon_callback": 50.9, "relay3": 53.4,
                     "tail_oversold": 80.7}
 
 # 状态机 (signals.state)
