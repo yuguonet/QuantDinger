@@ -171,15 +171,19 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True):
-    """盘中窗口扫描 (kind=intraday_window 策略, 当前仅 knife_catch)。
+    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / v2tail)。
 
     调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
-    流程: 14:30 启动 → 等待到 14:56 (用户要求不过早占用资源, 窗口内仅预热) →
-      1. 全市场最新快照 (realtime_snapshot 表, 60s 采集) → 市场门控 mkt_gain
-      2. 策略 intraday_shortlist 便宜预筛 (gain/amp/pos, 免拉全市场序列)
-      3. 候选股补拉当日快照序列+日线 → scan_signals 完整判定 (tail/vw/质量过滤)
-      4. 落库 state=buy_today (signal_state), entry_date/price=14:56 快照, 止损价
-    幂等: upsert ON CONFLICT, 重跑不重复。手动: python -m ...dragon_scan --knife [--no-wait]
+    流程:
+      1. 等待到滚动起点 (有 rolling_preview 策略=v2tail 时 14:50, 否则 14:56 保持旧行为)
+      2. 滚动预览 (14:50~14:55): 每分钟一轮 preview 策略的完整判定
+         (幂等 upsert + 本轮落选 buy_today 清理), 前端自选组实时刷新, 用户提前准备
+      3. 14:56 终审: 等待 14:56 快照落地 (采集 60s 一拍, 上限 45s) → 全部策略一轮
+      单轮: 全市场最新快照 → 策略 intraday_shortlist 必要条件预筛 →
+            候选股补拉当日快照序列+日线 → scan_signals 完整判定 →
+            落库 state=buy_today, entry_date/price=快照价, 止损价
+    幂等: upsert ON CONFLICT (trade_date, strategy, code, entry_style)。
+    手动: python -m ...dragon_scan --knife [--no-wait]
     """
     from app.market_cn.auto import dragon_store
     from app.market_cn.auto import strategies as strat_reg
@@ -195,32 +199,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         latest_snapshot, fetch_day_snapshots, _today,
     )
 
-    # 等待到判定时刻 14:56 (14:30 触发后仅预热等待; --no-wait 手动立即跑)
-    if wait_data:
-        deadline = time.time() + max_wait_sec
-        while _now_hm_str() < "14:56":
-            if time.time() > deadline:
-                logger.warning("[knife_scan] 等待超时, 放弃本次")
-                return {"status": "timeout"}
-            time.sleep(30)
-
-    today = _today()
-    all_codes_list = all_codes()
-    snaps = latest_snapshot(all_codes_list)
-    if not snaps:
-        logger.warning("[knife_scan] 无快照数据, 放弃")
-        return {"status": "no_snapshot"}
-
-    # 市场门控: 全市场均涨幅 (as-of 最新快照)
-    gains = []
-    for s in snaps.values():
-        try:
-            last, pc = float(s.get("last") or 0), float(s.get("previousClose") or 0)
-        except (TypeError, ValueError):
-            continue
-        if last > 0 and pc > 0:
-            gains.append((last / pc - 1) * 100)
-    mkt_gain = sum(gains) / len(gains) if gains else 0.0
+    # 滚动预览策略 (14:50 起每分钟重判; 无则等待起点=14:56, 与旧行为一致)
+    preview = {k: s for k, s in active.items() if getattr(s, "rolling_preview", False)}
+    start_hm = min((s.scan_spec.windows[0] for s in preview.values()), default="14:56")
 
     # ST / 北交所 通用排除 (knife 回测口径)
     try:
@@ -232,48 +213,112 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         nm = (stock_info.get(code) or {}).get("name", "") or ""
         return "ST" not in nm.upper()
 
-    rows = []
-    t0 = time.time()
-    for key, strat in active.items():
-        params = strat_reg.params_override(key)
-        shortlist = strat.intraday_shortlist(snaps, mkt_gain, **params)
-        logger.info("[knife_scan] %s 便宜预筛: %d/%d (mkt=%.2f%%)",
-                    key, len(shortlist), len(snaps), mkt_gain)
-        for code, snap in shortlist.items():
-            if not _st_ok(code):
-                continue
-            name = (stock_info.get(code) or {}).get("name", "")
-            bars = fetch_kline_db(code, days=60)
-            series = fetch_day_snapshots([code]).get(code) or []
+    def _mkt_gain(snaps):
+        """市场均涨幅 (as-of 最新快照; v2tail 仅记录不门控, knife 用作门控)。"""
+        gains = []
+        for s in snaps.values():
             try:
-                sigs = strat.scan_signals(bars, code, ctx={
-                    "latest": snap, "series": series, "mkt_gain": mkt_gain,
-                }, **params)
-            except Exception as e:
-                logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)
+                last, pc = float(s.get("last") or 0), float(s.get("previousClose") or 0)
+            except (TypeError, ValueError):
                 continue
-            for s in sigs:
-                row = dragon_store.signal_row(key, s, name)
-                row["state"] = getattr(strat, "signal_state", "watch_pending")
-                if row["state"] == "buy_today":
-                    row["entry_date"] = today
-                    row["entry_price"] = float(s.price or 0) or None
-                    row["stop_price"] = strat.initial_stop(code, float(s.price or 0))
-                rows.append(row)
-        # daily_limit (config.json; 0=不截断 — 用户裁定: 全拿优于Top3截断)
-        grp = [r for r in rows if r["strategy"] == key]
-        cap = strat_reg.daily_limit(key)
-        if cap and len(grp) > cap:
-            logger.info("[knife_scan] %s 信号 %d 笔超限额, 截断至 %d", key, len(grp), cap)
-            rows = [r for r in rows if r["strategy"] != key] + \
-                sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
+            if last > 0 and pc > 0:
+                gains.append((last / pc - 1) * 100)
+        return sum(gains) / len(gains) if gains else 0.0
 
-    result = dragon_store.upsert_scan_signals(today, rows)
-    dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
+    def _scan_cycle(cycle_strats, snaps, preview_cycle=False):
+        """一轮完整判定+落库。preview_cycle=True 时清该批策略本轮落选的 buy_today 行。"""
+        today = _today()
+        mkt = _mkt_gain(snaps)
+        rows = []
+        for key, strat in cycle_strats.items():
+            params = strat_reg.params_override(key)
+            shortlist = strat.intraday_shortlist(snaps, m, **params)
+            logger.info("[knife_scan] %s 便宜预筛: %d/%d%s (mkt=%.2f%%)",
+                        key, len(shortlist), len(snaps),
+                        " [预览]" if preview_cycle else "", m)
+            for code, snap in shortlist.items():
+                if not _st_ok(code):
+                    continue
+                name = (stock_info.get(code) or {}).get("name", "")
+                bars = fetch_kline_db(code, days=60)
+                series = fetch_day_snapshots([code]).get(code) or []
+                try:
+                    sigs = strat.scan_signals(bars, code, ctx={
+                        "latest": snap, "series": series, "mkt_gain": m,
+                    }, **params)
+                except Exception as e:
+                    logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)
+                    continue
+                for s in sigs:
+                    row = dragon_store.signal_row(key, s, name)
+                    row["state"] = getattr(strat, "signal_state", "watch_pending")
+                    if row["state"] == "buy_today":
+                        row["entry_date"] = today
+                        row["entry_price"] = float(s.price or 0) or None
+                        row["stop_price"] = strat.initial_stop(code, float(s.price or 0))
+                    rows.append(row)
+            # daily_limit (config.json; 0=不截断 — 用户裁定: 全拿优于Top3截断)
+            grp = [r for r in rows if r["strategy"] == key]
+            cap = strat_reg.daily_limit(key)
+            if cap and len(grp) > cap:
+                logger.info("[knife_scan] %s 信号 %d 笔超限额, 截断至 %d", key, len(grp), cap)
+                rows = [r for r in rows if r["strategy"] != key] + \
+                    sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
+        # 滚动重判: 清掉本批策略上一轮命中本轮落选的 buy_today 行 (防残留误导);
+        # 仅清 buy_today 态, 不碰 15:01 确认后已转移的 holding/exit 等状态
+        result = dragon_store.upsert_scan_signals(
+            today, rows, purge_buy_today=tuple(cycle_strats.keys()))
+        dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
+        return result
+
+    # 等待到滚动起点 (14:30 触发后预热等待; --no-wait 手动立即跑)
+    if wait_data:
+        deadline = time.time() + max_wait_sec
+        while _now_hm_str() < start_hm:
+            if time.time() > deadline:
+                logger.warning("[knife_scan] 等待超时, 放弃本次")
+                return {"status": "timeout"}
+            time.sleep(30)
+
+    today = _today()
+    all_codes_list = all_codes()
+
+    # ── 滚动预览: 14:50~14:55 每分钟一轮 (仅 preview 策略), 用户提前准备 ──
+    if wait_data and preview:
+        while _now_hm_str() < "14:56":
+            snaps = latest_snapshot(all_codes_list)
+            if snaps:
+                try:
+                    r = _scan_cycle(preview, snaps, preview_cycle=True)
+                    logger.info("[knife_scan] 预览轮完成: %s 信号 %d 笔",
+                                ",".join(preview), r.get("written", 0))
+                except Exception as e:
+                    logger.warning("[knife_scan] 预览轮异常(下一轮重试): %s", e)
+            # 对齐到下一整分钟
+            time.sleep(max(5, 60 - time.time() % 60))
+
+    # ── 终审: 14:56 后等待新鲜快照落地 (采集 60s 一拍, 一般 <=15s, 上限 45s) ──
+    snaps = latest_snapshot(all_codes_list)
+    if wait_data and preview and snaps:
+        fresh_cut = f"{today} 14:56"
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            latest_ts = max((str(s.get("time") or "") for s in snaps.values()), default="")
+            if latest_ts >= fresh_cut:
+                break
+            time.sleep(5)
+            snaps = latest_snapshot(all_codes_list)
+    if not snaps:
+        logger.warning("[knife_scan] 无快照数据, 放弃")
+        return {"status": "no_snapshot"}
+
+    t0 = time.time()
+    result = _scan_cycle(active, snaps)
+
     logger.info("[knife_scan] 完成: 快照 %d, 信号 %d 笔 (%.0fs)",
                 len(snaps), result.get("written", 0), time.time() - t0)
     return {"status": "ok", "target": today, "signals": result.get("written", 0),
-            "mkt_gain": round(mkt_gain, 3)}
+            "mkt_gain": round(_mkt_gain(snaps), 3)}
 
 
 def _now_hm_str():

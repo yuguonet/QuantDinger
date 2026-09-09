@@ -171,7 +171,9 @@ def _dragon_strategy_monitor():
 
 
 def _dragon_strategy_knife_scan():
-    """盘中尾盘: 反向接刀 14:56 窗口扫描 (14:30 触发预热, 14:56 判定, 不过早占用资源)"""
+    """盘中尾盘: 窗口策略扫描 (14:30 触发预热)。
+    knife_catch: 14:56 终审; v2tail: 14:50 起每分钟滚动预览 + 14:56 终审
+    (v2tail=V2尾盘超卖, 用户要求提前看到渐近结果准备买入)"""
     from app.market_cn.auto.dragon_scan import run_scan_knife
     run_scan_knife()
 

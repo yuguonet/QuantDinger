@@ -42,7 +42,9 @@ def strategy_labels():
     return labels
 # 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
 # dragon_callback = 方案2 (2026-09-07, test_dragon 300日回测, 无D1 gap过滤新口径: 114笔/74.6%/+3.28%)
-STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 74.6, "relay3": 53.4}
+# v2tail = V2尾盘超卖 (2026-09-10, test_v2_tail_buy 3个月全市场 275笔/80.7%/+2.74%)
+STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 74.6, "relay3": 53.4,
+                    "v2tail": 80.7}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
@@ -241,13 +243,16 @@ def _strategy_meta(key):
         return None
 
 
-def upsert_scan_signals(trade_date: str, rows: list):
+def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()):
     """扫描结果写入 (幂等): rows 为各策略今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
     行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
     (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
+    purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
+      (v2tail 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
+       股票须删行, 否则残留误导用户; 仅清 buy_today 态, 不碰已转移的 holding 等)。
     """
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
@@ -257,6 +262,13 @@ def upsert_scan_signals(trade_date: str, rows: list):
             (trade_date, S_WATCH_PENDING),
         )
         purged = cur.rowcount
+        if purge_buy_today:
+            cur.execute(
+                f"DELETE FROM {_SIGNALS_TABLE} "
+                f"WHERE trade_date = %s AND state = %s AND strategy = ANY(%s)",
+                (trade_date, S_BUY_TODAY, list(purge_buy_today)),
+            )
+            purged += cur.rowcount
         n = 0
         for s in rows:
             extra = {k: s.get(k) for k in SIGNAL_EXTRA_KEYS if s.get(k) is not None}

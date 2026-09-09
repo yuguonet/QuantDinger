@@ -94,6 +94,8 @@ class StrategyBase:
       entry_at_close    入场在尾盘/收盘 (T+1 当日不可卖, monitor 止损守卫跳过当日; 默认 False)
       exit_exec_same_day     出场当日执行并当日平账 (默认 False=次日开盘执行)
       intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
+      rolling_preview        True=窗口起点起每分钟滚动预览 (run_scan_knife 循环调用, 每轮
+                             清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
     """
 
     key: str = ""
@@ -106,6 +108,7 @@ class StrategyBase:
     signal_state: str = "watch_pending"
     entry_at_close: bool = False
     exit_exec_same_day: bool = False
+    rolling_preview: bool = False
 
     # ---- 信号判定 (回测即信号: 实盘 as_of=None 只判末根bar; 回测 as_of=k 判第k根) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):

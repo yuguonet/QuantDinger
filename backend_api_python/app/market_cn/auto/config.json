@@ -34,6 +34,20 @@
         "stop_pct": -5.0,
         "hold_days": 1
       }
+    },
+    "v2tail": {
+      "enabled": true,
+      "daily_limit": 0,
+      "params": {
+        "score_min": 8.0,
+        "pre5_max": -10.0,
+        "amp_min": 10.0,
+        "tail_lo": -2.8,
+        "tail_hi": -0.5,
+        "min_hhmm": "14:50",
+        "stop_pct": -8.0,
+        "hold_days": 1
+      }
     }
   }
 }
