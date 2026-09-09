@@ -1,15 +1,15 @@
-"""dragon_scan.py — 龙回头/盘后全市场扫描
+"""scan.py (原 dragon_scan.py) — 自动策略组盘后全市场扫描
 
 触发: scheduler Task "dragon_scan" (once_per_day, 16:30, 在 post_market_batch 1D 回填之后)
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
-  2. 全市场逐股跑策略判定 (与回测同一份 dragon_core):
+  2. 全市场逐股跑策略判定 (与回测同一份判定, core facade):
      dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
   3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
 
 手动运行:
-  python -m app.market_cn.auto.dragon_scan --run [--days 320]
+  python -m app.market_cn.auto.scan --run [--days 320]
 """
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ _BACKEND_ROOT_DEFAULT = None  # 由 app 包上下文提供
 
 
 # ================================================================
-# 数据加载 (已迁 data/kline.py, 此处 re-export 保持外部 import 路径不变)
+# 数据加载 (已迁 data/, 此处 import 保持调用点名字不变)
+# 2026-09-10: stock_info 改走 hub (fetch_stock_info_db 已归位 data/hub.py)
 # ================================================================
-from app.market_cn.auto.data.kline import (  # noqa: E402,F401
-    fetch_kline_db, fetch_stock_info_db, all_codes,
-)
+from app.market_cn.auto.data.hub import all_codes, stock_info as _stock_info  # noqa: E402,F401
+from app.market_cn.auto.data.kline import fetch_kline_db  # noqa: E402,F401
 
 
 # ================================================================
@@ -69,7 +69,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
       (锚点=策略 prefilter_anchor) → daily_limit 截断(score降序) → 标准化行落库
     - 组对账 (活跃集不变时无操作, 防漂移)
     """
-    from app.market_cn.auto import dragon_store
+    from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
     from app.market_cn.auto.common.filters import unified_prefilter
     from app.market_cn.auto.common.market import is_limit_up, get_board_type
@@ -79,7 +79,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
               if strat_reg.is_enabled(k) and s.scan_spec.kind == "daily_close"}
     logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
-    dragon_store.ensure_tables()
+    store.ensure_tables()
     target = _target_date()
 
     # 数据就绪等待 (仿 post_market_batch)
@@ -95,7 +95,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
     codes = all_codes()
     try:
-        stock_info = fetch_stock_info_db()
+        stock_info = _stock_info()
     except Exception as e:
         logger.warning("[dragon_scan] stock_basic_info 加载失败(%s), 换手/市值过滤降级", e)
         stock_info = {}
@@ -146,7 +146,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
                     ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
                     if ok:
                         kept.append(s)
-            rows.extend(dragon_store.signal_row(key, s, name) for s in kept)
+            rows.extend(store.signal_row(key, s, name) for s in kept)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
                         i + 1, len(codes), len(rows), time.time() - t0)
@@ -162,9 +162,9 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         capped.extend(grp)
     rows = capped
 
-    result = dragon_store.upsert_scan_signals(target, rows)
-    dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
-    dragon_store.cleanup_old(days=15)
+    result = store.upsert_scan_signals(target, rows)
+    store.sync_watchlist_group(store.get_active_signals())
+    store.cleanup_old(days=15)
     logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs)",
                 len(codes), result.get("written", 0), time.time() - t0)
     return {"status": "ok", "target": target, "codes": len(codes), "signals": result.get("written", 0)}
@@ -183,9 +183,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
             候选股补拉当日快照序列+日线 → scan_signals 完整判定 →
             落库 state=buy_today, entry_date/price=快照价, 止损价
     幂等: upsert ON CONFLICT (trade_date, strategy, code, entry_style)。
-    手动: python -m ...dragon_scan --knife [--no-wait]
+    手动: python -m ...scan --knife [--no-wait]
     """
-    from app.market_cn.auto import dragon_store
+    from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
 
     strat_reg.autodiscover()
@@ -194,8 +194,8 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     if not active:
         return {"status": "no_intraday_strategy"}
 
-    dragon_store.ensure_tables()
-    from app.market_cn.auto.dragon_monitor import (
+    store.ensure_tables()
+    from app.market_cn.auto.monitor import (
         latest_snapshot, fetch_day_snapshots, _today,
     )
 
@@ -205,7 +205,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
 
     # ST / 北交所 通用排除 (knife 回测口径)
     try:
-        stock_info = fetch_stock_info_db()
+        stock_info = _stock_info()
     except Exception:
         stock_info = {}
 
@@ -250,7 +250,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                     logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)
                     continue
                 for s in sigs:
-                    row = dragon_store.signal_row(key, s, name)
+                    row = store.signal_row(key, s, name)
                     row["state"] = getattr(strat, "signal_state", "watch_pending")
                     if row["state"] == "buy_today":
                         row["entry_date"] = today
@@ -266,9 +266,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                     sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
         # 滚动重判: 清掉本批策略上一轮命中本轮落选的 buy_today 行 (防残留误导);
         # 仅清 buy_today 态, 不碰 15:01 确认后已转移的 holding/exit 等状态
-        result = dragon_store.upsert_scan_signals(
+        result = store.upsert_scan_signals(
             today, rows, purge_buy_today=tuple(cycle_strats.keys()))
-        dragon_store.sync_watchlist_group(dragon_store.get_active_signals())
+        store.sync_watchlist_group(store.get_active_signals())
         return result
 
     # 等待到滚动起点 (14:30 触发后预热等待; --no-wait 手动立即跑)
@@ -322,7 +322,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
 
 
 def _now_hm_str():
-    from app.market_cn.auto.dragon_monitor import _now_hm
+    from app.market_cn.auto.monitor import _now_hm
     return _now_hm()
 
 

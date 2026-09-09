@@ -1,4 +1,4 @@
-"""dragon_api.py — 自动策略组信号 API (蓝图, 挂载于 /api/market)
+"""api.py (原 dragon_api.py) — 自动策略组信号 API (蓝图, 挂载于 /api/market)
 
 覆盖策略: dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from app.utils.auth import login_required
-from app.market_cn.auto import dragon_store as ds
+from app.market_cn.auto import store as ds
 
 dragon_bp = Blueprint('dragon', __name__)
 

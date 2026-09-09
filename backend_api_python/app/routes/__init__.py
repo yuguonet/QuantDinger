@@ -39,7 +39,7 @@ def register_routes(app: Flask):
     # cron — 定时任务管理 API
     from app.routes.cron import cron_bp
     # 自动策略组 — 策略信号 API (盘后扫描/盘中监控)
-    from app.market_cn.auto.dragon_api import dragon_bp
+    from app.market_cn.auto.api import dragon_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp, url_prefix='/api/auth')   # Auth routes

@@ -275,9 +275,23 @@ def minute_live(code, series=None):
 # ================================================================
 
 def stock_info():
-    """全量股票基础信息 {symbol: {name, circ_shares, ...}} (转 data/kline.py)。"""
-    from app.market_cn.auto.data.kline import fetch_stock_info_db
-    return fetch_stock_info_db()
+    """全量 stock_basic_info: {symbol: {name, circ_shares, ...}} (换手率/市值/ST过滤用)。
+
+    2026-09-10 自 data/kline.py 归位 (该函数本就不属 K线通道, 且曾被调用点绕过 hub 直连)。
+    """
+    from app.utils.basicinfo_db import get_stock_basic_db
+    db = get_stock_basic_db()
+    pool = db._get_pool()
+    with pool.cursor() as cur:   # 注意: 该 pool 返回元组行 (与 test_dragon 原实现一致)
+        cur.execute(
+            "SELECT symbol, name, circ_shares, total_shares FROM stock_basic_info WHERE status='active'"
+        )
+        rows = cur.fetchall()
+    out = {}
+    for row in rows:
+        out[row[0]] = {"name": row[1] or "", "circ_shares": float(row[2] or 0),
+                       "total_shares": float(row[3] or 0)}
+    return out
 
 
 def all_codes():

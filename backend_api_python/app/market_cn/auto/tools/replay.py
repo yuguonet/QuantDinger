@@ -35,11 +35,10 @@ def main():
 
     from app.market_cn.auto.backtest import (
         backtest_break_stock, backtest_dragon_stock, backtest_v1_stock)
-    from app.market_cn.auto.data.hub import daily
-    from app.market_cn.auto.data.kline import fetch_stock_info_db
+    from app.market_cn.auto.data.hub import daily, stock_info
 
     try:
-        stock_info = fetch_stock_info_db().get(args.code)
+        stock_info = stock_info().get(args.code)
     except Exception:
         stock_info = None
     bars = daily(args.code, args.days)

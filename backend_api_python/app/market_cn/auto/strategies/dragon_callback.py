@@ -1,6 +1,6 @@
 """strategies/dragon_callback.py — 龙回头策略 ("方案2", StrategyBase 插件实现, Phase 2 迁移)
 
-实现已迁移至本文件; dragon_core.dragon_cb_today_d0_signals / run_backtest_dragon_callback /
+实现已迁移至本文件; core.dragon_cb_today_d0_signals / run_backtest_dragon_callback /
 DRAGON_CB_PARAMS 为 facade 转发 (test_dragon.py / dragon_scan / dragon_monitor 共用)。
 
 规则框架 (2026-09-06 与 test_dragon.py 同步, 依据 龙回头优化分析_20260906/):
@@ -59,7 +59,7 @@ DRAGON_CB_PARAMS = dict(
 
 
 # ================================================================
-# 出场模拟 (原 dragon_core.run_backtest_dragon_callback, 原样移植)
+# 出场模拟 (原 core.run_backtest_dragon_callback, 原样移植)
 # 2026-09-09 现实化修正 (tmp/_dragon_intraday_exit.py E1 口径):
 #   ① T+1: 买入当日(d=1)不可卖出 — 仅更新峰值/估值, 全部出场判定从 d=2 起;
 #   ② 跳空穿越: 触发日开盘价低于触发价 → 按开盘价成交 (跳空低开只能按开盘卖);

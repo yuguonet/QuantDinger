@@ -1,6 +1,6 @@
 """strategies/v1.py — V1 追板策略 (StrategyBase 插件实现, Phase 2 迁移)
 
-实现已迁移至本文件; dragon_core.v1_today_d0_signals 为 facade 转发到这里。
+实现已迁移至本文件; core.v1_today_d0_signals 为 facade 转发到这里。
 
 入场 (D0 盘后扫描 → D1 竞价):
   D0 四因子: 涨停(0.98x阈值) + 20日涨>30% + D-1回调[-10%,-3%) + OBV 5日上升 + D-1非放量(<1.5x 5日均量)

@@ -23,9 +23,8 @@ def main():
     except Exception:
         pass
 
-    from app.market_cn.auto import dragon_store, strategies as strat_reg
-    from app.market_cn.auto.data.hub import all_codes, market_snapshot
-    from app.market_cn.auto.data.kline import fetch_stock_info_db
+    from app.market_cn.auto import store, strategies as strat_reg
+    from app.market_cn.auto.data.hub import all_codes, market_snapshot, stock_info
 
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()
@@ -40,7 +39,7 @@ def main():
     snaps = market_snapshot(codes)
     t2 = time.time()
 
-    # 市场均涨幅 (与 dragon_scan._mkt_gain 同口径)
+    # 市场均涨幅 (与 scan._mkt_gain 同口径)
     gains = []
     for s in snaps.values():
         try:
@@ -61,7 +60,7 @@ def main():
     # 候选补数据 + 完整判定 (扫描的核心成本)
     n_judged = 0
     try:
-        stock_info = fetch_stock_info_db()
+        stock_info = stock_info()
     except Exception:
         stock_info = {}
     for key, strat in active.items():

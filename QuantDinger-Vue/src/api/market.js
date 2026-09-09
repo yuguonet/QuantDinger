@@ -8,6 +8,7 @@ const marketApi = {
   RenameWatchlistGroup: '/api/market/watchlist/rename-group',
   RemoveWatchlistGroup: '/api/market/watchlist/remove-group',
   GetWatchlistPrices: '/api/market/watchlist/prices',
+  GetTradingStatus: '/api/market/watchlist/trading-status',
   GetDragonToday: '/api/market/dragon/today',
   GetDragonMarkers: '/api/market/dragon/markers',
   GetDragonStrategies: '/api/market/dragon/strategies',
@@ -112,6 +113,17 @@ export function getWatchlistPrices (parameter) {
 /**
  * 自动策略组: 今日分层信号 (action=买入/持仓/卖出, watch=观察池)
  */
+/**
+ * 交易日历状态: 前端自选行情轮询开关依据 (节假日/收盘后不轮询)
+ * @returns {*}
+ */
+export function getTradingStatus () {
+  return request({
+    url: marketApi.GetTradingStatus,
+    method: 'get'
+  })
+}
+
 export function getDragonToday () {
   return request({
     url: marketApi.GetDragonToday,

@@ -35,9 +35,9 @@ def main():
     except Exception:
         pass
 
-    from app.market_cn.auto import dragon_store, strategies as strat_reg
-    from app.market_cn.auto.data.hub import all_codes, day_series, daily, market_snapshot
-    from app.market_cn.auto.data.kline import fetch_stock_info_db
+    from app.market_cn.auto import store, strategies as strat_reg
+    from app.market_cn.auto.data.hub import (
+        all_codes, day_series, daily, market_snapshot, stock_info)
 
     strat_reg.autodiscover()
     strat = strat_reg.get_strategy(args.strategy)
@@ -65,7 +65,7 @@ def main():
     print(f"验证集: 预筛通过 {len(shortlist)} + 抽样 {len(sample)} = {len(check)} 只")
 
     try:
-        stock_info = fetch_stock_info_db()
+        stock_info = stock_info()
     except Exception:
         stock_info = {}
 

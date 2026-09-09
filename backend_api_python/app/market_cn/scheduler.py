@@ -160,13 +160,13 @@ def _refresh_realtime_snapshot():
 
 def _dragon_strategy_scan():
     """盘后: 龙回头/V1/断板/3板接力 全市场扫描 (1D 就绪后判定, 写 qd_dragon_signals)"""
-    from app.market_cn.auto.dragon_scan import run_scan
+    from app.market_cn.auto.scan import run_scan
     run_scan()
 
 
 def _dragon_strategy_monitor():
     """盘中: 自动策略组状态机 (开盘gap判定/预确认/收盘确认/出场检测/组对账)"""
-    from app.market_cn.auto.dragon_monitor import run_monitor_safe
+    from app.market_cn.auto.monitor import run_monitor_safe
     run_monitor_safe()
 
 
@@ -174,7 +174,7 @@ def _dragon_strategy_knife_scan():
     """盘中尾盘: 窗口策略扫描 (14:30 触发预热)。
     knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审
     (tail_oversold=尾盘超卖超短, 用户要求提前看到渐近结果准备买入)"""
-    from app.market_cn.auto.dragon_scan import run_scan_knife
+    from app.market_cn.auto.scan import run_scan_knife
     run_scan_knife()
 
 

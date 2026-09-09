@@ -1,4 +1,4 @@
-"""dragon_monitor.py — 自动策略组盘中状态机 (60s tick, scheduler 调度)
+"""monitor.py (原 dragon_monitor.py) — 自动策略组盘中状态机 (60s tick, scheduler 调度)
 
 Phase 3: 策略判定全部经 strategies 注册表分发, 本文件不含策略名分支:
   开盘窗口: entry_decision (gap 过滤) + quality_key (排名) + daily_limit (名额)
@@ -31,7 +31,7 @@ try:
 except Exception:
     pass
 
-from app.market_cn.auto import dragon_store as ds
+from app.market_cn.auto import store as ds
 from app.market_cn.auto import strategies as strat_reg
 
 W_OPEN_LO, W_OPEN_HI = "09:25", "09:35"

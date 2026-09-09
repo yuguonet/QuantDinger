@@ -1,4 +1,4 @@
-"""dragon_store.py - 自动策略组存储层
+"""store.py (原 dragon_store.py) - 自动策略组存储层
 
 职责:
   1. qd_dragon_signals 事实表 (状态机全量+历史) 的建表与 CRUD
@@ -10,6 +10,8 @@
   - signals 表是唯一事实源; qd_watchlist 策略组行只是活跃信号的"投影"
   - 全部幂等: 重复执行不产生脏数据
   - 单用户部署: 写 user_id=1 (DRAGON_USER_ID), 所有用户可见同一策略组
+  - 策略元数据 (key/标签/胜率/名额/状态机) 2026-09-10 拆至 registry.py,
+    本模块 re-export 全部名字, `from app.market_cn.auto import store as ds; ds.S_HOLDING` 等旧用法不变。
 """
 from __future__ import annotations
 
@@ -20,49 +22,26 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 组名与用户 (固定名: 自动策略组, 三策略共用: 龙回头/V1/断板)
-DRAGON_GROUP_NAME = "自动策略组"
-DRAGON_USER_ID = 1
-DRAGON_MARKET = "CNStock"
-DRAGON_STRATEGY = "dragon_callback"
-STRATEGIES = ("dragon_callback", "v1", "break", "relay3")
-STRATEGY_LABELS = {"dragon_callback": "龙回头", "v1": "V1", "break": "断板", "relay3": "3板接力"}
-
-
-def strategy_labels():
-    """策略中文名: 注册表 name 优先, STRATEGY_LABELS 静态兜底 (历史行可能含已删策略键)。"""
-    labels = dict(STRATEGY_LABELS)
-    try:
-        from app.market_cn.auto import strategies as _reg
-        for key, s in _reg.all_strategies().items():
-            if getattr(s, "name", ""):
-                labels[key] = s.name
-    except Exception:
-        pass
-    return labels
-# 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
-# 2026-09-09 出场引擎现实化 (T+1/跳空按开盘/跌停顺延, dragon_core + test_dragon 两处同步):
-#   dragon_callback = 方案2: 116笔/50.9%/+0.21% (旧74.6为乐观引擎常数, 已废弃)
-#   v1 = 139笔/72.7%/+3.51%; break = 94笔/71.3%/+4.31% (旧76.5/62.7亦为乐观口径)
-# tail_oversold = 尾盘超卖超短 (2026-09-10, test_v2_tail_buy 3个月全市场 275笔/80.7%/+2.74%)
-STRATEGY_WINRATE = {"v1": 72.7, "break": 71.3, "dragon_callback": 50.9, "relay3": 53.4,
-                    "tail_oversold": 80.7}
-
-# 状态机 (signals.state)
-S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
-S_BUY_TODAY = "buy_today"            # D1 9:26 gap判定通过, 今日开盘买入 (label 买入·深绿)
-S_HOLDING = "holding"                # 已买入持有中 (15:00强/中确认后; label 持仓·蓝)
-S_EXIT_TODAY = "exit_today"          # 触发出场 (label 卖出·红; 次日开盘执行)
-S_CLOSED = "closed"                  # 已平仓 (组内删行, 留历史)
-S_EXPIRED = "expired"                # 失效: 弱确认/开盘gap放弃 (组内删行, 留历史)
-
-# 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察"置底展示, 09-04 用户要求提前可见)
-ACTIVE_GROUP_STATES = (S_WATCH_PENDING, S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY)
-# 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰; relay3 信号稀少 n≈0.7/日, 名额2)
-DAILY_LIMIT_PER_STRATEGY = {"dragon_callback": 5, "v1": 5, "break": 5, "relay3": 2}
-# label 文案 (前端映射兜底, 前端也有映射)
-STATE_LABELS = {S_WATCH_PENDING: "观察", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
-                S_EXIT_TODAY: "卖出", S_CLOSED: "已平仓", S_EXPIRED: "已失效"}
+# ---- 策略注册表 (元数据单一事实源在 registry.py, 此处 re-export) ----
+from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 不变)
+    ACTIVE_GROUP_STATES,
+    DAILY_LIMIT_PER_STRATEGY,
+    DRAGON_GROUP_NAME,
+    DRAGON_MARKET,
+    DRAGON_STRATEGY,
+    DRAGON_USER_ID,
+    S_BUY_TODAY,
+    S_CLOSED,
+    S_EXPIRED,
+    S_EXIT_TODAY,
+    S_HOLDING,
+    S_WATCH_PENDING,
+    STATE_LABELS,
+    STRATEGIES,
+    STRATEGY_LABELS,
+    STRATEGY_WINRATE,
+    strategy_labels,
+)
 
 _SIGNALS_TABLE = "qd_dragon_signals"
 _WATCHLIST_TABLE = "qd_watchlist"

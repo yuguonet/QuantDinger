@@ -1,6 +1,6 @@
 """strategies/break_buy.py — 断板接力策略 (StrategyBase 插件实现, Phase 2 迁移)
 
-实现已迁移至本文件; dragon_core.break_today_d0_signals / _break_signal_at 为 facade 转发。
+实现已迁移至本文件; core.break_today_d0_signals / _break_signal_at 为 facade 转发。
 
 入场 (D0 盘后扫描 → D1 竞价):
   连板≥2 → 断板期(≤max_break_gap天) → 确认日=断板期最后一天 → D1 开盘买入
@@ -29,7 +29,7 @@ from app.market_cn.auto.strategies.base import (
 STRATEGY_KEY = "break"
 STRATEGY_LABEL = "断板"
 
-# 板块参数 (与 dragon_core.BOARD_PARAMS 同源; config.json params 可覆盖其键)
+# 板块参数 (与 backtest.BOARD_PARAMS 同源, 2026-09-10 起权威副本在 backtest.py; config.json params 可覆盖其键)
 BOARD_PARAMS = {
     "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20,
              "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
@@ -47,7 +47,7 @@ DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5)
 
 
 # ================================================================
-# 断板期判定 (原 dragon_core._break_signal_at, 原样移植)
+# 断板期判定 (原 core._break_signal_at, 原样移植)
 # ================================================================
 
 def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, params):

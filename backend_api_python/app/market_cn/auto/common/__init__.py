@@ -8,7 +8,7 @@
 关键设计点:
   - 本目录函数只依赖入参, 禁止 import DB/HTTP/策略模块 (唯一允许 IO 的是 auto/data/);
   - 与 test_dragon.py 同名函数逐字一致 —— 改这里必须同步 test_dragon.py 并重跑对数;
-  - dragon_core.py 对这些名字做 re-export (facade), 外部 import 路径不变。
+  - core.py (原dragon_core.py) 对这些名字做 re-export (facade), 外部 import 路径不变。
 
 易错点:
   - 不要把策略私有逻辑 (如 DRAGON_CB_PARAMS) 挪进来, 那是策略文件的事;
