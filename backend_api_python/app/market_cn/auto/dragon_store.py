@@ -52,12 +52,12 @@ S_EXIT_TODAY = "exit_today"          # 触发出场 (label 卖出·红; 次日�
 S_CLOSED = "closed"                  # 已平仓 (组内删行, 留历史)
 S_EXPIRED = "expired"                # 失效: 弱确认/开盘gap放弃 (组内删行, 留历史)
 
-# 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察中"置底展示, 09-04 用户要求提前可见)
+# 同步进 qd_watchlist 策略组的状态 (观察票入组: 灰色"观察"置底展示, 09-04 用户要求提前可见)
 ACTIVE_GROUP_STATES = (S_WATCH_PENDING, S_BUY_TODAY, S_HOLDING, S_EXIT_TODAY)
 # 每策略每日买入名额 (09-04 用户要求: 每策略每天≈5笔, 质量排名末位淘汰; relay3 信号稀少 n≈0.7/日, 名额2)
 DAILY_LIMIT_PER_STRATEGY = {"dragon_callback": 5, "v1": 5, "break": 5, "relay3": 2}
 # label 文案 (前端映射兜底, 前端也有映射)
-STATE_LABELS = {S_WATCH_PENDING: "观察中", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
+STATE_LABELS = {S_WATCH_PENDING: "观察", S_BUY_TODAY: "买入", S_HOLDING: "持仓",
                 S_EXIT_TODAY: "卖出", S_CLOSED: "已平仓", S_EXPIRED: "已失效"}
 
 _SIGNALS_TABLE = "qd_dragon_signals"
