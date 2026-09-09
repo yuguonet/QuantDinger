@@ -43,6 +43,15 @@ DRAGON_CB_PARAMS = dict(
     yin_ratio_exclude=0.6,
     rsi6_exclude_lt=30.0,
     d0_ma20_exclude_lt=-8.0,
+    # --- 龙强度门槛 (2026-09-10 特征判别: 600交易日334笔, 前/后两段稳定性+阈值敏感性通过;
+    #     亏损源画像 = streak<=2伪龙 61笔27.9%/-2.4% + 前期热度不足 + 回落过深) ---
+    min_streak=3,        # 锚定涨停日连板高度>=3 ("龙"的最低成色)
+    lu_gain20_min=60.0,  # 涨停日20日涨幅>=60% (前期热度; >=100更好但样本锐减)
+    rsi6_min=45.0,       # D0 RSI6>=45 (强势回调; 与 rsi6_exclude_lt=30 叠加后实际下界=45)
+    # 三条件合计实测 (09-10): 600d 334→167笔 胜率48.8→51.5% 均收-0.13→+1.09 均峰7.68→9.0
+    #   盈亏比1.00→1.39 (两段同向); 300d 117→50笔 50.4→62.0% 均收+0.07→+2.63。
+    #   注意: 实跑优于/异于"离线过滤投影"属预期 —— 规则作用在涨停日候选上, 会重锚定
+    #   (break@首个通过条件的 lu), 而非简单删旧笔; 回归口径以实跑为准。
     # --- 入场 ---
     # (2026-09-07 用户裁定: 移除 D1 gap 范围过滤 [-3,+2] — 信号本身已筛选,
     #  高开/低开由用户自行判断, 展示更多股票; 旧引擎口径 114笔/74.6% 已废弃 —
@@ -189,7 +198,7 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
 _LEGACY_FIELDS = (
     "code", "board", "path", "path_label", "lu_date", "pullback_days", "signal_date",
     "signal_chg", "signal_vol_r", "signal_price", "entry_vol_r", "buy_mode",
-    "gap_from_peak", "d0_vs_ma20", "pullback_depth", "yin_ratio",
+    "gap_from_peak", "streak_h", "lu_gain20", "d0_vs_ma20", "pullback_depth", "yin_ratio",
     "tech_score", "tech_rsi", "tech_roc", "tech_psy",
 )
 
@@ -318,6 +327,27 @@ class DragonCallbackStrategy(StrategyBase):
             if gap_from_peak < p["gap_min"] or gap_from_peak > p["gap_max"]:
                 continue
 
+            # ── 龙强度门槛 (2026-09-10 三条件; 全部只用<=D0收盘数据, as-of 安全) ──
+            # ① 连板高度: 锚定涨停日往前数连续涨停天数 (含涨停日本身)
+            streak_h = 1
+            _j = lu_idx
+            while _j > 0 and is_limit_up(bars[_j]["close"], bars[_j - 1]["close"], board_type):
+                streak_h += 1
+                _j -= 1
+            if streak_h < p["min_streak"]:
+                continue
+            # ② 前期热度: 涨停日20日涨幅 (不足20根K线=热度无法证实, 与离线分析同口径剔除)
+            if lu_idx >= 20:
+                _base = bars[lu_idx - 20]["close"]
+                lu_gain20 = (lu_close / _base - 1) * 100 if _base > 0 else None
+            else:
+                lu_gain20 = None
+            if lu_gain20 is None or lu_gain20 < p["lu_gain20_min"]:
+                continue
+            # ③ 强势回调: D0 RSI6 下界 (use_tech_score=False 时 rsi 未计算, 放行不误杀)
+            if rsi_val is not None and rsi_val < p["rsi6_min"]:
+                continue
+
             # ── 回调期特征 ──
             if i >= 19:
                 ma20 = sum(bars[j]["close"] for j in range(i - 19, i + 1)) / 20
@@ -363,6 +393,8 @@ class DragonCallbackStrategy(StrategyBase):
                     "entry_vol_r": round(entry_vol_r, 2),
                     "buy_mode": "next_open",
                     "gap_from_peak": gap_from_peak,
+                    "streak_h": streak_h,
+                    "lu_gain20": round(lu_gain20, 1) if lu_gain20 is not None else None,
                     "d0_vs_ma20": round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
                     "pullback_depth": round(pullback_depth, 2),
                     "yin_ratio": round(yin_ratio, 2),

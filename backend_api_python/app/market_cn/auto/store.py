@@ -183,6 +183,8 @@ SIGNAL_EXTRA_KEYS = (
     "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
     "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
     "pre20_gain", "board_height", "lu_vol_ratio", "rsi",
+    # dragon 龙强度门槛 (2026-09-10): 锚定涨停日连板高度 / 涨停日20日涨幅
+    "streak_h", "lu_gain20",
     # knife_catch (反向接刀, 2026-09-08)
     "gain", "amplitude", "pos_range", "tail_ret", "vw_frac",
     "vol_ratio", "down_streak", "pre5_gain", "lu_recent", "mkt_gain",
