@@ -42,9 +42,9 @@ def strategy_labels():
     return labels
 # 历史回测胜率 (全市场验证): 策略组排序用; relay3 = 3板+MA多头 长窗口回测 (2026-09-06)
 # dragon_callback = 方案2 (2026-09-07, test_dragon 300日回测, 无D1 gap过滤新口径: 114笔/74.6%/+3.28%)
-# v2tail = V2尾盘超卖 (2026-09-10, test_v2_tail_buy 3个月全市场 275笔/80.7%/+2.74%)
+# tail_oversold = 尾盘超卖超短 (2026-09-10, test_v2_tail_buy 3个月全市场 275笔/80.7%/+2.74%)
 STRATEGY_WINRATE = {"v1": 76.5, "break": 62.7, "dragon_callback": 74.6, "relay3": 53.4,
-                    "v2tail": 80.7}
+                    "tail_oversold": 80.7}
 
 # 状态机 (signals.state)
 S_WATCH_PENDING = "watch_pending"    # D0信号成立, 待D1确认 (默认不入组)
@@ -251,7 +251,7 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
     行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
     (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
     purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
-      (v2tail 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
+      (tail_oversold 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
        股票须删行, 否则残留误导用户; 仅清 buy_today 态, 不碰已转移的 holding 等)。
     """
     from app.utils.db import get_db_connection

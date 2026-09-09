@@ -171,11 +171,11 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True):
-    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / v2tail)。
+    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / tail_oversold)。
 
     调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
     流程:
-      1. 等待到滚动起点 (有 rolling_preview 策略=v2tail 时 14:50, 否则 14:56 保持旧行为)
+      1. 等待到滚动起点 (有 rolling_preview 策略=tail_oversold 时 14:50, 否则 14:56 保持旧行为)
       2. 滚动预览 (14:50~14:55): 每分钟一轮 preview 策略的完整判定
          (幂等 upsert + 本轮落选 buy_today 清理), 前端自选组实时刷新, 用户提前准备
       3. 14:56 终审: 等待 14:56 快照落地 (采集 60s 一拍, 上限 45s) → 全部策略一轮
@@ -214,7 +214,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         return "ST" not in nm.upper()
 
     def _mkt_gain(snaps):
-        """市场均涨幅 (as-of 最新快照; v2tail 仅记录不门控, knife 用作门控)。"""
+        """市场均涨幅 (as-of 最新快照; tail_oversold 仅记录不门控, knife 用作门控)。"""
         gains = []
         for s in snaps.values():
             try:

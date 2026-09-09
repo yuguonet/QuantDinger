@@ -35,7 +35,7 @@
         "hold_days": 1
       }
     },
-    "v2tail": {
+    "tail_oversold": {
       "enabled": true,
       "daily_limit": 0,
       "params": {

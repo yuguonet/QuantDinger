@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""strategies/v2tail.py — V2 尾盘超卖买入 (StrategyBase 插件, 14:56 尾盘买 → D1 开盘卖)
+"""strategies/tail_oversold.py — 尾盘超卖超短策略 (StrategyBase 插件, 14:56 尾盘买 → D1 开盘卖)
 
 核心逻辑: 超卖反弹 — 当日深跌 + 尾盘适度回落 + 贴近日内低位 + 近5日深度超卖
           + 振幅大(弹性足) → 次日开盘高概率反弹 → D0 14:56~14:57 买入 → D1 开盘卖出
@@ -51,8 +51,8 @@ from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
 
-STRATEGY_KEY = "v2tail"
-STRATEGY_LABEL = "尾盘超卖"
+STRATEGY_KEY = "tail_oversold"
+STRATEGY_LABEL = "尾盘超卖超短"
 
 PARAMS = {
     "score_min": 8.0,          # V2 评分下限 (归一化后)
@@ -140,7 +140,7 @@ def _tail_ret_v2(series_rows):
 
 
 @register
-class V2TailStrategy(StrategyBase):
+class TailOversoldStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
@@ -265,7 +265,7 @@ class V2TailStrategy(StrategyBase):
 
     # ---- 三决策 (与 knife_catch 同生命周期: 14:56 已买 → 隔夜 → D1 开盘卖) ----
     def entry_decision(self, row, snap=None, **params):
-        return EntryDecision(True, "v2tail 尾盘已入场, 无开盘步骤")
+        return EntryDecision(True, "尾盘超卖超短 已入场, 无开盘步骤")
 
     def confirm_decision(self, row, snap=None, **params):
         """D0 收盘确认: 隔夜持有到 D1 开盘卖。"""
