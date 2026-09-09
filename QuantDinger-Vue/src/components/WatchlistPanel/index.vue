@@ -980,23 +980,46 @@ export default {
         }
       } catch (error) { /* silent */ }
     },
+    _inTradingWindow () {
+      // 本地时间近似交易窗口(工作日 9:15~15:05): 盘后/周末价格不轮询 ——
+      // 收盘后价格不变, 后端本来就落 TTL 缓存, 轮询只是空转请求+刷日志
+      const now = new Date()
+      const day = now.getDay()
+      if (day === 0 || day === 6) return false
+      const mins = now.getHours() * 60 + now.getMinutes()
+      return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 5
+    },
+    async _watchlistTick () {
+      // 每 15s: 成员/策略组同步(读库, 无压力) → 价格仅 交易窗口内 或 列表有变更 时刷新
+      const changed = await this.refreshWatchlistSilent()
+      if (this.watchlist && this.watchlist.length > 0 && (this._inTradingWindow() || changed)) {
+        await this.loadWatchlistPrices()
+      }
+    },
     startWatchlistPriceRefresh () {
-      // 统一 15s 单定时器串行: 成员/策略组同步(读库, 无压力)完成后刷一次价格(压力点) ——
-      // 行情接口每周期恰好 1 次, 避免双定时器同相位并发双击同一行情接口
-      this.watchlistSyncTimer = setInterval(() => {
-        this.refreshWatchlistSilent()   // 内部: 拉成员(读库) → 更新列表 → 刷价格
-      }, 15000)
+      // 统一 15s 单定时器: 成员同步(读库) + 交易时段内的价格轮询;
+      // 盘后不轮询价格(仅进页面首刷 + 列表变更补刷一次新成员的收盘价)
+      this.watchlistSyncTimer = setInterval(() => { this._watchlistTick() }, 15000)
       if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
     },
     async refreshWatchlistSilent () {
-      if (!this.userId) return
+      // 读库同步自选列表, 返回是否发生变更。
+      // 无变更时不动列表: 保留现有价格(避免每15s清零重拉导致价格闪烁), 也省一次行情请求;
+      // 有变更(增删/换组/策略状态机推进)才替换列表, 价格由调用方按需补刷。
+      if (!this.userId) return false
       try {
         const res = await getWatchlist({ userid: this.userId })
         if (res && res.code === 1 && res.data) {
-          this.watchlist = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
-          await this.loadWatchlistPrices()
+          const next = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
+          const sig = (arr) => JSON.stringify(arr.map(s => [
+            s.symbol, s.market, s.group_name, s.strategy_state, s.strategy_detail || null,
+          ]))
+          if (sig(this.watchlist || []) === sig(next)) return false
+          this.watchlist = next
+          return true
         }
       } catch (e) { /* silent */ }
+      return false
     },
     strategyTagClass (state) {
       // 注意: strategy_state 存的是机器状态 (buy_today/holding/exit_today/watch_pending)

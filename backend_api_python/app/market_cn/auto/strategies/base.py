@@ -96,6 +96,8 @@ class StrategyBase:
       intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
       rolling_preview        True=窗口起点起每分钟滚动预览 (run_scan_knife 循环调用, 每轮
                              清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
+      data_needs             数据需求声明 (D1, §3.4): ('daily','minute_live','quote','lhb',...);
+                             框架/hub 按声明加载, 未被任何策略声明的通道零加载 (拔插), 默认 ('daily',)
     """
 
     key: str = ""
@@ -109,6 +111,7 @@ class StrategyBase:
     entry_at_close: bool = False
     exit_exec_same_day: bool = False
     rolling_preview: bool = False
+    data_needs: tuple = ("daily",)     # 数据需求声明 (hub 注入; 当前声明制 Phase 1: 仅元数据)
 
     # ---- 信号判定 (回测即信号: 实盘 as_of=None 只判末根bar; 回测 as_of=k 判第k根) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):

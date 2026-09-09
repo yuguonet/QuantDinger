@@ -69,10 +69,13 @@ DRAGON_CB_PARAMS = dict(
 #         追踪线成交, 此处保留"收盘逃顶优先"的原设计语义 (已知理想化)。
 # ================================================================
 
-def _limit_dn_price(prev_close, board_type):
-    """跌停价: main 10% / 其余(创业板科创板) 20%; 相对容差 0.2% 吸收 qfq 复权微差。"""
-    pct = 0.10 if board_type == "main" else 0.20
-    return prev_close * (1 - pct)
+# 跌停价原语收编至 common/exec_cn.py (C 阶段); 别名保持调用点不变
+from app.market_cn.auto.common.exec_cn import (
+    fill_blocked_by_limit_dn,
+    fill_on_gap,
+    is_one_word_limit_dn,
+    limit_dn_price as _limit_dn_price,
+)
 
 
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
@@ -116,7 +119,7 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
             break
 
         # 一字跌停: 全天无成交可能, 持仓顺延 (不更新估值标记)
-        if dn is not None and b["low"] == b["high"] and abs(b["low"] - dn) <= dn * 0.002:
+        if is_one_word_limit_dn(b, dn):
             last_unfilled = True
             continue
         last_unfilled = False
@@ -140,9 +143,9 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
             trig = max(trig_t, trig_s)
             if b["low"] <= trig:
                 # 跳空穿越: 开盘已低于触发价 → 只能按开盘价成交
-                fill = b["open"] if b["open"] < trig else trig
+                fill = fill_on_gap(b["open"], trig)
                 reason = f"追踪止损{trail}%" if trig_t >= trig_s else f"止损{stop_loss}%"
-                if dn is not None and fill <= dn * 1.002:
+                if fill_blocked_by_limit_dn(fill, dn):
                     pending_dn = True   # 成交价触及跌停 → 卖不出
                     continue
                 exit_p, exit_d, exit_reason = fill, d, reason

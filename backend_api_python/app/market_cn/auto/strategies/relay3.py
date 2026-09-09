@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.market_cn.auto.common.indicators import ma as _ma  # D2: 收编内联, 逐字等价
 from app.market_cn.auto.common.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
@@ -55,10 +56,7 @@ SIGNAL_EXTRA_KEYS = ("board_height", "ma_bull", "lu_vol_ratio", "rsi", "gap_hint
 # 特征计算 (纯函数, 无 IO)
 # ================================================================
 
-def _ma(closes, n):
-    if len(closes) < n:
-        return None
-    return sum(closes[-n:]) / n
+# _ma 已收编至 common/indicators.ma (D2, 逐字等价), import 处以 _ma 别名引用。
 
 
 def ma_bull_arrangement(bars) -> bool:

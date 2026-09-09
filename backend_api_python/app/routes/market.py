@@ -636,7 +636,7 @@ def get_watchlist_prices():
                         })
         
         success_count = sum(1 for r in results if r.get('price', 0) > 0)
-        logger.info(f"Watchlist prices (batch): {success_count}/{len(results)} successful")
+        logger.debug(f"Watchlist prices (batch): {success_count}/{len(results)} successful")
         
         return jsonify({
             'code': 1,

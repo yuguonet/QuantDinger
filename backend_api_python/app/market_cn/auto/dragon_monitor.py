@@ -70,11 +70,6 @@ def _snapshot_pool():
     return get_market_db_manager()._get_pool("CNStock")
 
 
-def _rows(cur):
-    cols = [d[0] for d in cur.description] if cur.description else []
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-
 def _snapshot_table():
     return f"realtime_snapshot_{datetime.now().year}"
 
@@ -95,31 +90,15 @@ def snapshot_day_done() -> bool:
 
 
 def fetch_day_snapshots(codes):
-    if not codes:
-        return {}
-    try:
-        pool = _snapshot_pool()
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT symbol, time, open, high, low, \"last\", \"previousClose\", volume "
-                    f"FROM \"{_snapshot_table()}\" "
-                    f"WHERE symbol = ANY(%s) AND time >= %s ORDER BY symbol, time",
-                    (list(codes), f"{_today()} 09:00:00"),
-                )
-                rows = _rows(cur)
-    except Exception as e:
-        logger.warning("[dragon_monitor] 快照读取失败: %s", e)
-        return {}
-    out = {}
-    for r in rows:
-        out.setdefault(r["symbol"], []).append(r)
-    return out
+    """当日快照序列 {code: [rows]} —— D1 起委托 data/hub (唯一实现, 口径逐字一致)。"""
+    from app.market_cn.auto.data.hub import day_series
+    return day_series(codes)
 
 
 def latest_snapshot(codes):
-    series = fetch_day_snapshots(codes)
-    return {code: rows[-1] for code, rows in series.items() if rows}
+    """最新一拍 {code: row} —— D1 起委托 data/hub。"""
+    from app.market_cn.auto.data.hub import market_snapshot
+    return market_snapshot(codes)
 
 
 # ================================================================
@@ -159,24 +138,14 @@ def evaluate_confirm(row, series_rows):
 # ================================================================
 
 def _bars_with_synth(code, entry_date):
-    """1D bars + 当日合成bar; 返回 (bars, entry_idx) 或 (None, None)。"""
-    from app.market_cn.auto.dragon_scan import fetch_kline_db
-    bars = fetch_kline_db(code, 200)
+    """1D bars + 当日合成bar; 返回 (bars, entry_idx) 或 (None, None)。
+
+    D1: 合成口径已上收 data/hub.daily_live (逐字一致), 此处仅保留 entry_idx 定位。
+    """
+    from app.market_cn.auto.data.hub import daily_live
+    bars = daily_live(code, days=200)
     if not bars:
         return None, None
-    series = fetch_day_snapshots([code]).get(code)
-    if not series:
-        return None, None
-    today = _today()
-    if bars[-1]["time"] < today:
-        day_open = series[0]["open"]
-        day_high = max(float(r["high"] or day_open) for r in series)
-        day_low = min(float(r["low"] or day_open) for r in series)
-        last_r = series[-1]
-        bars.append({"time": today, "open": float(day_open),
-                     "high": float(day_high), "low": float(day_low),
-                     "close": float(last_r["last"] or day_open),
-                     "volume": float(last_r["volume"] or 0)})
     idx = None
     for i, b in enumerate(bars):
         if b["time"] == entry_date:

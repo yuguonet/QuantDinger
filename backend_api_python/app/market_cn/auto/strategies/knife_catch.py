@@ -146,6 +146,7 @@ class KnifeCatchStrategy(StrategyBase):
     entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
+    data_needs = ("daily", "snapshot", "minute_live")
 
     # ---- 盘中便宜预筛 (仅用最新快照, 免拉全市场序列/日线; 阈值唯一来源在本策略) ----
     def intraday_shortlist(self, snaps, mkt_gain, **params):

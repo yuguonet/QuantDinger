@@ -6,9 +6,45 @@
   - ema/rsi 返回单值或 None (长度不足); calc_macd 返回 (dif, dea, hist) 三序列或 (None,None,None);
   - MACD柱 = 2*(DIF-DEA) (国内行情软件口径, 与普通教科书的 DIF-DEA 不同, 勿"修正");
   - 形态族 (golden_cross/turning_positive/shrinking_negative) 只做布尔判定。
+  - ma/kdj (2026-09-09 D2 新增, 非 test_dragon 对数成员): ma 与 relay3._ma 逐字等价;
+    kdj 采用国内行情软件口径 (RSV 9日, K/D 三分之一平滑, 首个有效值前 K=D=50, J=3K-2D)。
 易错点: 全部函数只读入参序列尾部, 无未来函数问题; 但回测切片语义由调用方 (as_of) 保证。
 """
 from __future__ import annotations
+
+
+def ma(closes, n):
+    """简单均线 SMA 末值。与 strategies/relay3._ma 逐字等价 (D2 收编自该处)。"""
+    if len(closes) < n:
+        return None
+    return sum(closes[-n:]) / n
+
+
+def kdj(highs, lows, closes, period=9):
+    """KDJ 随机指标, 国内行情软件口径, 返回 (k, d, j) 三序列或 (None, None, None)。
+
+    口径: RSV[i]=(C-Ln)/(Hn-Ln)*100 (n=period 窗口含当日);
+          K=(2*K'+RSV)/3, D=(2*D'+K)/3, 首个有效 bar 前初始 K=D=50;
+          J=3K-2D。前 period-1 根输出 50/50/50 占位 (与国内软件"未走满不画线"不同,
+          调用方若只要末值请取 [-1]; 形态判定请自行跳过占位段)。
+    易错点: Hn==Ln (连续一字板) 时 RSV 取 50 (中性), 避免除零。
+    """
+    n = len(closes)
+    if n < period or len(highs) != n or len(lows) != n:
+        return None, None, None
+    k_s, d_s, j_s = [], [], []
+    k_prev = d_prev = 50.0
+    for i in range(n):
+        if i < period - 1:
+            k_s.append(50.0); d_s.append(50.0); j_s.append(50.0)
+            continue
+        hn = max(highs[i - period + 1:i + 1])
+        ln = min(lows[i - period + 1:i + 1])
+        rsv = 50.0 if hn <= ln else (closes[i] - ln) / (hn - ln) * 100
+        k_prev = (2 * k_prev + rsv) / 3
+        d_prev = (2 * d_prev + k_prev) / 3
+        k_s.append(k_prev); d_s.append(d_prev); j_s.append(3 * k_prev - 2 * d_prev)
+    return k_s, d_s, j_s
 
 
 def ema(values, period):

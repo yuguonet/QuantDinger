@@ -115,10 +115,13 @@ BOARD_PARAMS = {
 }
 
 
-def _limit_dn_price(prev_close, board_type):
-    """跌停价: main 10% / 其余(创业板科创板) 20%; 判定用相对容差 0.2% 吸收 qfq 复权微差
-    (与 strategies/dragon_callback.py 同款, test_dragon.py 逐字同步)。"""
-    return prev_close * ((1 - 0.10) if board_type == "main" else (1 - 0.20))
+# 跌停价原语收编至 common/exec_cn.py (C 阶段); 别名保持引擎内部调用点不变
+from app.market_cn.auto.common.exec_cn import (
+    fill_blocked_by_limit_dn,
+    fill_on_gap,
+    is_one_word_limit_dn,
+    limit_dn_price as _limit_dn_price,
+)
 
 
 def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
@@ -190,7 +193,7 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
             v1_momentum_exit = intraday < 3
 
         # 一字跌停: 全天无成交可能 (D2开盘清仓同样无法成交 → 顺延次日开盘)
-        if dn is not None and b['low'] == b['high'] and abs(b['low'] - dn) <= dn * 0.002:
+        if is_one_word_limit_dn(b, dn):
             pending_dn = v1_momentum_exit
             last_unfilled = True
             continue
@@ -218,8 +221,8 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
             trig_s = entry_price * (1 + stop_loss / 100)
             trig = max(trig_t, trig_s)
             if b['low'] <= trig:
-                fill = b['open'] if b['open'] < trig else trig
-                if dn is not None and fill <= dn * 1.002:
+                fill = fill_on_gap(b['open'], trig)
+                if fill_blocked_by_limit_dn(fill, dn):
                     pending_dn = True   # 成交价触及跌停 → 卖不出
                     continue
                 exit_p, exit_d = fill, d
@@ -290,7 +293,7 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-
             break
 
         # 一字跌停: 全天无成交可能, 持仓顺延
-        if dn is not None and b['low'] == b['high'] and abs(b['low'] - dn) <= dn * 0.002:
+        if is_one_word_limit_dn(b, dn):
             last_unfilled = True
             continue
         last_unfilled = False

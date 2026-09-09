@@ -61,6 +61,7 @@ V1核心参数:
 │   日内动量 >= 3% → 继续持有, 按以下规则出场:                                │
 │     - 追踪止损: 从峰值回撤 -5%                                              │
 │     - 持仓上限: 7个交易日                                                  │
+│   现实约束 (2026-09-09): T+1当日不可卖 / 跳空按开盘成交 / 跌停顺延次日开盘  │
 │                                                                             │
 │ 数据验证:                                                                    │
 │   日内>=3% 持有组: 97笔, 99.0%胜率, 均+8.75%, 仅1笔亏-0.81%                │
@@ -115,6 +116,9 @@ V1核心参数:
 │   追踪止损: 分段 — 盈利<3%时-8% (给空间), 盈利>=3%时-3% (锁利润)           │
 │   峰值逃顶: 涨>7%后大上影线(>30%)收盘逃顶                                  │
 │   持仓上限: 7个交易日                                                      │
+│   现实约束 (2026-09-09 修正, tmp/_dragon_intraday_exit.py E1 实验口径):     │
+│     - T+1: 买入当日不可卖出; 跳空穿越按开盘成交; 跌停顺延次日开盘           │
+│   实测影响: 旧引擎+3.51%/75.7% → 修正后约+0.1%/51% (37笔样本, 理想化水分)   │
 │                                                                             │
 │ 参数:                                                                       │
 │   --pullback N          最少回调天数 (默认3)                               │
@@ -154,6 +158,7 @@ V1核心参数:
 │   止损:     -8% (主板) / -10% (创/科板)                                    │
 │   追踪止损: -6% (主板) / -8% (创/科板)                                     │
 │   峰值逃顶: 涨>10%后大上影线(>40%)收盘逃顶                                │
+│   现实约束 (2026-09-09): T+1 / 成交价=收盘价(原按触发价不可实现) / 跌停顺延 │
 │   持仓上限: 7天                                                            │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -440,11 +445,24 @@ def dragon_today_d0_signals(bars, code, min_pullback_days=3, max_pullback_days=1
     return result
 
 
+def _limit_dn_price(prev_close, board_type):
+    """跌停价: main 10% / 其余(创业板科创板) 20%; 不做分四舍五入 (与系统侧一致,
+    判定用相对容差 0.2% 吸收 qfq 复权微差 — 与 exchange 精确到分的口径差 < 容差)"""
+    return prev_close * ((1 - 0.10) if board_type == "main" else (1 - 0.20))
+
+
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
                                  stop_loss=None, board_type="main", stop_at_idx=None, **params):
     """龙回头出场模拟: 分段追踪止损 (as-of安全)。
 
-    出场判定顺序 (每日): 1)峰值逃顶 2)分段追踪(d>1) 3)固定止损 4)到期/stop_at_idx截断。
+    出场判定顺序 (每日, d>=2): 1)峰值逃顶 2)分段追踪+固定止损(合并, 先触发者成交)
+    3)到期/stop_at_idx截断。
+    现实约束 (2026-09-09 修正, tmp/_dragon_intraday_exit.py E1 口径, 与系统侧
+    strategies/dragon_callback.py 逐字同步):
+      ① T+1: 买入当日(d=1)不可卖出 — 仅更新峰值/估值, 全部出场判定从 d=2 起;
+      ② 跳空穿越: 触发日开盘价低于触发价 → 按开盘价成交;
+      ③ 跌停无法卖出: 一字跌停整日跳过; 成交价触及跌停 → 顺延次日开盘强平。
+      同日追踪线/止损线双触发取 max; 峰值逃顶保留收盘优先原语义 (已知理想化)。
     stop_at_idx: 只模拟到该bar索引; 未触发出场 → open=True。
     """
     p = {**DRAGON_CB_PARAMS, **(params or {})}
@@ -456,6 +474,8 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
     peak = entry_price
     exit_p, exit_d, exit_reason = entry_price, 0, ""
     capped = False
+    pending_dn = False        # 触发成交价触及跌停 → 次日开盘强平
+    last_unfilled = False     # 最后一日为一字跌停(整日无法卖出) → 到期顺延
 
     for d in range(1, hold_days + 1):
         idx = entry_idx + d - 1
@@ -467,37 +487,68 @@ def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
         b = bars[idx]
         if b["high"] > peak:
             peak = b["high"]
+        prev_close = bars[idx - 1]["close"] if idx > 0 else 0
+        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
 
-        # 1. 峰值逃顶
-        ret = (b["close"] / entry_price - 1) * 100
-        if ret > p["peak_exit_ret"]:
-            rng = b["high"] - b["low"]
-            upper = (b["high"] - max(b["open"], b["close"])) / rng * 100 if rng > 0 else 0
-            if upper > p["peak_exit_upper"] and b["close"] < b["high"] * 0.98:
-                exit_p, exit_d, exit_reason = b["close"], d, "峰值逃顶"
-                break
+        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
+        if pending_dn:
+            exit_p, exit_d, exit_reason = b["open"], d, "跌停顺延开盘"
+            break
 
-        # 2. 分段追踪止损
+        # 一字跌停: 全天无成交可能, 持仓顺延 (不更新估值标记)
+        if dn is not None and b["low"] == b["high"] and abs(b["low"] - dn) <= dn * 0.002:
+            last_unfilled = True
+            continue
+        last_unfilled = False
+
+        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
         if d > 1:
+            # 1. 峰值逃顶 (收盘判定收盘卖)
+            ret = (b["close"] / entry_price - 1) * 100
+            if ret > p["peak_exit_ret"]:
+                rng = b["high"] - b["low"]
+                upper = (b["high"] - max(b["open"], b["close"])) / rng * 100 if rng > 0 else 0
+                if upper > p["peak_exit_upper"] and b["close"] < b["high"] * 0.98:
+                    exit_p, exit_d, exit_reason = b["close"], d, "峰值逃顶"
+                    break
+
+            # 2/3. 分段追踪 + 固定止损 (合并: 价格连续, 先穿过更高触发线)
             peak_ret = (peak / entry_price - 1) * 100
             trail = p["trail_hi"] if peak_ret >= p["trail_switch_pct"] else p["trail_lo"]
-            if b["low"] <= peak * (1 + trail / 100):
-                exit_p = peak * (1 + trail / 100)
-                exit_d = d
-                exit_reason = f"追踪止损{trail}%"
+            trig_t = peak * (1 + trail / 100)
+            trig_s = entry_price * (1 + stop_loss / 100)
+            trig = max(trig_t, trig_s)
+            if b["low"] <= trig:
+                # 跳空穿越: 开盘已低于触发价 → 只能按开盘价成交
+                fill = b["open"] if b["open"] < trig else trig
+                reason = f"追踪止损{trail}%" if trig_t >= trig_s else f"止损{stop_loss}%"
+                if dn is not None and fill <= dn * 1.002:
+                    pending_dn = True   # 成交价触及跌停 → 卖不出
+                    continue
+                exit_p, exit_d, exit_reason = fill, d, reason
                 break
-
-        # 3. 固定止损
-        if b["low"] <= entry_price * (1 + stop_loss / 100):
-            exit_p = entry_price * (1 + stop_loss / 100)
-            exit_d = d
-            exit_reason = f"止损{stop_loss}%"
-            break
 
         exit_p, exit_d = b["close"], d
 
     if exit_reason == "" and not capped:
-        exit_reason = "持仓到期"
+        # 末日落入无法卖出状态 (一字跌停 / 触发成交触及跌停) → 顺延至下一可交易日
+        # 开盘强平; 连续一字跌停逐日跳过。注意 nxt 必须指向"未成交日的下一日":
+        # exit_d 是最后标记估值日(1-based), 未成交日 = exit_d+1, 顺延日 = exit_d+2。
+        nxt = entry_idx + exit_d + 1
+        while (last_unfilled or pending_dn) and nxt < n \
+                and (stop_at_idx is None or nxt <= stop_at_idx):
+            nb = bars[nxt]
+            pc = bars[nxt - 1]["close"]
+            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
+            if dn2 is not None and nb["low"] == nb["high"] \
+                    and abs(nb["low"] - dn2) <= dn2 * 0.002:
+                last_unfilled, pending_dn = True, False   # 顺延日仍一字跌停, 再顺延
+                nxt += 1
+                continue
+            exit_p, exit_d, exit_reason = nb["open"], nxt - entry_idx + 1, "跌停顺延开盘"
+            break
+        if exit_reason == "":
+            exit_reason = "持仓到期"
     return {
         "exit_price": round(exit_p, 3), "exit_day": exit_d,
         "exit_reason": exit_reason,
@@ -829,12 +880,22 @@ def break_today_d0_signals(bars, code, min_streak=2, max_break_gap=5, today_str=
 # ---------------- V1/断板 出场引擎 (快照: auto/dragon_core.py) ----------------
 
 def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
+    """V1/通用出场模拟 (现实化 2026-09-09, 与 run_backtest_dragon_callback 同口径):
+
+    现实约束: ① T+1 — 买入当日(d=1)不可卖出, 全部出场判定从 d=2 起 (仅更新峰值/估值);
+    ② 跳空穿越 — 触发日开盘低于触发价按开盘价成交;
+    ③ 跌停无法卖出 — 一字跌停整日跳过 (V1 的 D2 开盘清仓若遇一字跌停顺延次日开盘),
+    触发成交触及跌停顺延次日开盘; 到期日一字跌停顺延次日开盘强平。
+    V1 日内动量规则 (D1收盘判定→D2开盘执行) 本就满足 T+1, 判定逻辑未改动。
+    """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     limit_threshold = 0.098 if board_type == "main" else 0.198
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
+    pending_dn = False        # 触发成交触及跌停 / 清仓日一字跌停 → 次日开盘强平
+    last_unfilled = False     # 末日一字跌停 → 到期顺延
 
     # 如果外部未传入 d1_limit_up, 则在回测内计算 (兼容旧调用)
     if d1_limit_up is None:
@@ -856,10 +917,18 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
         if idx >= len(bars): break
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
+        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
+        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
+
+        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
+        if pending_dn:
+            exit_p, exit_d = b['open'], d
+            break
 
         # V1出场 (v3): D1日内动量<3% → D2开盘清仓
         # 日内动量 = D1收盘涨幅 - D1开盘涨幅 (盘中买卖力量指标)
         # 注: 判定数据是D1的, 执行点是D2开盘价 — 勿把判定拖到d==3
+        v1_momentum_exit = False
         if is_v1 and d == 2:
             if d1_change is not None and d1_gap is not None:
                 intraday = d1_change - d1_gap
@@ -868,29 +937,61 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
                 d1_bar = bars[entry_idx]
                 d0_close = bars[entry_idx - 1]['close'] if entry_idx > 0 else entry_price
                 intraday = (d1_bar['close'] - d1_bar['open']) / d0_close * 100 if d0_close > 0 else 0
-            d1_weak = intraday < 3
-            if d1_weak:
-                # D2开盘直接清仓, 不等止损位
-                exit_p = b['open']; exit_d = d; break
+            v1_momentum_exit = intraday < 3
 
-        # 1 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
-        if peak_exit:
-            ret = (b['close'] / entry_price - 1) * 100
-            if ret > 7:
-                bar_range = b['high'] - b['low']
-                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-                if upper > 30 and b['close'] < b['high'] * 0.98:
-                    exit_p = b['close']; exit_d = d; break
+        # 一字跌停: 全天无成交可能 (D2开盘清仓同样无法成交 → 顺延次日开盘)
+        if dn is not None and b['low'] == b['high'] and abs(b['low'] - dn) <= dn * 0.002:
+            pending_dn = v1_momentum_exit
+            last_unfilled = True
+            continue
+        last_unfilled = False
 
-        # 2 追踪止损
-        if d > 1 and b['low'] <= peak * (1 + trailing_stop / 100):
-            exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
-        # 3 止损
-        if b['low'] <= entry_price * (1 + stop_loss / 100):
-            exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+        if v1_momentum_exit:
+            # D2开盘直接清仓, 不等止损位
+            exit_p, exit_d = b['open'], d
+            break
+
+        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
+        if d > 1:
+            # 1 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
+            if peak_exit:
+                ret = (b['close'] / entry_price - 1) * 100
+                if ret > 7:
+                    bar_range = b['high'] - b['low']
+                    upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                    if upper > 30 and b['close'] < b['high'] * 0.98:
+                        exit_p, exit_d = b['close'], d
+                        break
+
+            # 2/3 追踪+止损 (合并: 价格连续先穿过更高触发线; 跳空按开盘; 触跌停顺延)
+            trig_t = peak * (1 + trailing_stop / 100)
+            trig_s = entry_price * (1 + stop_loss / 100)
+            trig = max(trig_t, trig_s)
+            if b['low'] <= trig:
+                fill = b['open'] if b['open'] < trig else trig
+                if dn is not None and fill <= dn * 1.002:
+                    pending_dn = True   # 成交价触及跌停 → 卖不出
+                    continue
+                exit_p, exit_d = fill, d
+                break
 
         # 4 兜底: 持仓到期收盘走
         exit_p = b['close']; exit_d = d
+
+    # 末日落入无法卖出状态 (一字跌停/触发触跌停) → 顺延下一可交易日开盘强平
+    # (连续一字逐日跳过; nxt 指向未成交日的下一日)
+    if last_unfilled or pending_dn:
+        nxt = entry_idx + exit_d + 1
+        while nxt < len(bars):
+            nb = bars[nxt]
+            pc = bars[nxt - 1]['close']
+            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
+            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
+                last_unfilled, pending_dn = True, False
+                nxt += 1
+                continue
+            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
+            break
 
     result = {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,
@@ -904,12 +1005,19 @@ def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tra
 
 def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
                           trailing_stop=-6.0, board_type="main"):
-    """断板专用回测: 追踪止损 + 峰值逃顶信号 (收盘价口径, 与v1的low触及口径不同)。"""
+    """断板专用回测: 追踪止损 + 峰值逃顶信号 (收盘价口径, 与v1的low触及口径不同)。
+
+    现实化 (2026-09-09): ① T+1 — 买入当日(d=1)不可卖出;
+    ② 成交价=收盘价 — 原引擎收盘判定却按触发价成交 (触发价高于判定收盘, 不可实现);
+    ③ 跌停 — 一字跌停整日跳过; 收盘触及跌停卖不出 → 顺延次日开盘; 到期顺延。
+    """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
+    pending_dn = False        # 收盘触跌停卖不出 → 次日开盘强平
+    last_unfilled = False     # 末日一字跌停 → 到期顺延
 
     # next_open模式: entry_idx=D1, 循环d=1应指向D1
     if entry_idx < len(bars):
@@ -922,26 +1030,64 @@ def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-
         if idx >= len(bars): break
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
+        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
+        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
+
+        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
+        if pending_dn:
+            exit_p, exit_d = b['open'], d
+            break
+
+        # 一字跌停: 全天无成交可能, 持仓顺延
+        if dn is not None and b['low'] == b['high'] and abs(b['low'] - dn) <= dn * 0.002:
+            last_unfilled = True
+            continue
+        last_unfilled = False
 
         ret = (b['close'] / entry_price - 1) * 100
         ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
 
-        # 止损
-        if ret <= stop_loss:
-            exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
+        if d > 1:
+            # 止损 (收盘判定 → 收盘价成交)
+            if ret <= stop_loss:
+                if dn is not None and b['close'] <= dn * 1.002:
+                    pending_dn = True   # 收盘封死跌停 → 卖不出
+                    continue
+                exit_p, exit_d = b['close'], d
+                break
 
-        # 追踪止损 (盈利时)
-        if ret_from_high <= trailing_stop and ret > 0:
-            exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
+            # 追踪止损 (盈利时, 收盘判定 → 收盘价成交)
+            if ret_from_high <= trailing_stop and ret > 0:
+                if dn is not None and b['close'] <= dn * 1.002:
+                    pending_dn = True
+                    continue
+                exit_p, exit_d = b['close'], d
+                break
 
-        # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶
-        if ret > 10:
-            bar_range = b['high'] - b['low']
-            upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-            if upper > 40 and b['close'] < b['high'] * 0.98:
-                exit_p = b['close']; exit_d = d; break
+            # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶 (收盘>+10%不可能贴跌停)
+            if ret > 10:
+                bar_range = b['high'] - b['low']
+                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                if upper > 40 and b['close'] < b['high'] * 0.98:
+                    exit_p, exit_d = b['close'], d
+                    break
 
         exit_p = b['close']; exit_d = d
+
+    # 末日落入无法卖出状态 → 顺延下一可交易日开盘强平 (连续一字逐日跳过)
+    if last_unfilled or pending_dn:
+        nxt = entry_idx + exit_d + 1
+        while nxt < len(bars):
+            nb = bars[nxt]
+            pc = bars[nxt - 1]['close']
+            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
+            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
+                last_unfilled, pending_dn = True, False
+                nxt += 1
+                continue
+            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
+            break
 
     return {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,

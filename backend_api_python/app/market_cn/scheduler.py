@@ -287,6 +287,37 @@ def _dragon_interval():
     return 60 if _is_dragon_fast_window() else 300
 
 
+# ── 盘中窗口策略组触发时刻: 以 auto/sched.py 分段声明为唯一事实源 ──
+# (config.json schedule 段 → 各策略 first 的最早者; 接线 2026-09-09 用户批准)
+_knife_trigger_cache = {"date": "", "hm": "14:30"}
+
+
+def _knife_trigger_hm():
+    """knife_scan 触发时刻 "HH:MM"。按天缓存 (all_schedules 会 autodiscover, 勿每 10s 调)。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _knife_trigger_cache["date"] != today:
+        hm = "14:30"
+        try:
+            from app.market_cn.auto.sched import all_schedules
+            firsts = [ts[0] for ts in all_schedules().values() if ts]
+            if firsts:
+                hm = min(firsts)
+        except Exception as e:
+            logger.warning("[scheduler] 读取 sched 时刻表失败, knife_scan 用默认 14:30: %s", e)
+        _knife_trigger_cache.update(date=today, hm=hm)
+        logger.info("[scheduler] knife_scan 触发时刻 (sched 事实源): %s", hm)
+    return _knife_trigger_cache["hm"]
+
+
+def _task_trigger_hm(task):
+    """任务的日级触发时刻 "HH:MM"; 无定时触发返回 None。"""
+    if task.name == "knife_scan":
+        return _knife_trigger_hm()
+    if task.trigger_hour >= 0:
+        return f"{task.trigger_hour:02d}:{task.trigger_minute:02d}"
+    return None
+
+
 # 任务列表
 TASKS = [
     # 盘中周期任务
@@ -300,6 +331,8 @@ TASKS = [
     Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
     # 自动策略组: 盘后扫描(1D就绪后) + 盘中状态机(60s), 龙回头Pro已于2026-09-06下线
     Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=16, trigger_minute=30),
+    # knife_scan 触发时刻由 auto/sched.py 分段声明决定 (config.json schedule 段为事实源,
+    # 见 _knife_trigger_hm; Task 上的 trigger_* 仅作 sched 不可用时的兜底)
     Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_day=True, trigger_hour=14, trigger_minute=30),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
 ]
@@ -349,13 +382,12 @@ def _scheduler_loop():
     # 跳过 post_market_batch（会唤醒 EvalWorker，与 mq-worker 产生导入竞争）
     from app.utils.trading_calendar import is_trading_day
     for task in TASKS:
-        if not task.once_per_day or task.trigger_hour < 0:
+        trig = _task_trigger_hm(task) if task.once_per_day else None
+        if not trig:
             continue
         if task.name == "post_market_batch":
             continue
-        if now_dt.hour < task.trigger_hour or (
-            now_dt.hour == task.trigger_hour and now_dt.minute < task.trigger_minute
-        ):
+        if now_dt.strftime("%H:%M") < trig:
             continue
         if not is_trading_day(today):
             continue
@@ -378,11 +410,10 @@ def _scheduler_loop():
             if task.once_per_day and task.daily_done == today:
                 continue
 
-            # 日级定时任务：未到触发时刻 → 跳过
-            if task.once_per_day and task.trigger_hour >= 0:
-                if now_dt.hour < task.trigger_hour or (
-                    now_dt.hour == task.trigger_hour and now_dt.minute < task.trigger_minute
-                ):
+            # 日级定时任务：未到触发时刻 → 跳过 (knife_scan 时刻来自 sched 事实源)
+            if task.once_per_day:
+                trig = _task_trigger_hm(task)
+                if trig and now_dt.strftime("%H:%M") < trig:
                     continue
                 # 非交易日跳过
                 from app.utils.trading_calendar import is_trading_day
