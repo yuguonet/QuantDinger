@@ -11,6 +11,11 @@
       "enabled": true,
       "daily_limit": 5
     },
+    "dragon_v2": {
+      "label": "龙回头V2",
+      "enabled": true,
+      "daily_limit": 5
+    },
     "v1": {
       "label": "V1",
       "enabled": true,
