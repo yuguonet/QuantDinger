@@ -1,28 +1,33 @@
 {
   "version": 1,
-  "_comment": "自动策略配置 (当前唯一配置域)。enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。",
+  "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。",
   "schedule": {
     "knife_catch": {"windows": ["14:30", "15:00"], "interval_sec": 60},
     "tail_oversold": {"windows": ["14:50", "15:00"], "interval_sec": 60}
   },
   "strategies": {
     "dragon_callback": {
+      "label": "龙回头",
       "enabled": true,
       "daily_limit": 5
     },
     "v1": {
+      "label": "V1",
       "enabled": true,
       "daily_limit": 5
     },
     "break": {
+      "label": "断板",
       "enabled": true,
       "daily_limit": 5
     },
     "relay3": {
+      "label": "3板接力",
       "enabled": true,
       "daily_limit": 2
     },
     "knife_catch": {
+      "label": "反向接刀",
       "enabled": true,
       "daily_limit": 0,
       "params": {
@@ -40,6 +45,7 @@
       }
     },
     "tail_oversold": {
+      "label": "尾盘超卖超短",
       "enabled": true,
       "daily_limit": 0,
       "params": {

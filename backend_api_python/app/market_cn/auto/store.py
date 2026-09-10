@@ -25,7 +25,6 @@ logger = get_logger(__name__)
 # ---- 策略注册表 (元数据单一事实源在 registry.py, 此处 re-export) ----
 from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 不变)
     ACTIVE_GROUP_STATES,
-    DAILY_LIMIT_PER_STRATEGY,
     DRAGON_GROUP_NAME,
     DRAGON_MARKET,
     DRAGON_STRATEGY,
@@ -37,9 +36,8 @@ from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 
     S_HOLDING,
     S_WATCH_PENDING,
     STATE_LABELS,
-    STRATEGIES,
-    STRATEGY_LABELS,
     STRATEGY_WINRATE,
+    strategy_keys,
     strategy_labels,
 )
 
@@ -330,7 +328,7 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False, strat
     with get_db_connection() as db:
         cur = db.cursor()
         sql = f"SELECT * FROM {_SIGNALS_TABLE} WHERE strategy = ANY(%s)"
-        vals = [list(strategies or STRATEGIES)]
+        vals = [list(strategies or strategy_keys())]
         if states:
             sql += " AND state = ANY(%s)"
             vals.append(list(states))
@@ -381,7 +379,7 @@ def get_markers(code, days=60):
             FROM {_SIGNALS_TABLE}
             WHERE strategy = ANY(%s) AND code = %s AND trade_date >= (CURRENT_DATE - %s::int)
             ORDER BY trade_date
-        """, (list(STRATEGIES), code, days))
+        """, (list(strategy_keys()), code, days))
         rows = [_row_to_dict(r) for r in cur.fetchall()]
         cur.close()
 
@@ -413,8 +411,8 @@ def _display_detail(s):
     """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。"""
     strat = s.get("strategy") or DRAGON_STRATEGY
     _es = s.get("entry_style") or ""
-    # entry_style 文案: dragon_callback 固定填 'a' 无含义
-    _es_txt = "" if strat == "dragon_callback" else (
+    # entry_style 文案: dragon (DRAGON_STRATEGY) 固定填 'a' 无含义; a/b=历史上 v1 行的形态文案
+    _es_txt = "" if strat == DRAGON_STRATEGY else (
         "(a)缩量企稳" if _es == "a" else ("(b)放量启动" if _es == "b" else _es))
     return {
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
@@ -540,7 +538,7 @@ def cleanup_old(days=15):
         cur.execute(
             f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = ANY(%s) AND trade_date < %s "
             "AND state = ANY(%s)",
-            (list(STRATEGIES), cutoff, [S_WATCH_PENDING, S_BUY_TODAY, S_EXIT_TODAY, S_CLOSED, S_EXPIRED]),
+            (list(strategy_keys()), cutoff, [S_WATCH_PENDING, S_BUY_TODAY, S_EXIT_TODAY, S_CLOSED, S_EXPIRED]),
         )
         n = cur.rowcount
         db.commit()

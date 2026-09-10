@@ -115,7 +115,7 @@ def _entry_stop(code, entry_price, strategy):
 
 def _strategy_of(row):
     """取持仓行对应策略实例 (未知策略返回 None, 调用方跳过并告警)。"""
-    return strat_reg.get_strategy(row.get("strategy", "dragon_callback"))
+    return strat_reg.get_strategy(row.get("strategy") or ds.DRAGON_STRATEGY)
 
 
 def evaluate_confirm(row, series_rows):
@@ -213,7 +213,7 @@ def run_monitor():
                 if prev_close <= 0:
                     continue
                 gap = (open_px / prev_close - 1) * 100
-                strat = r.get("strategy", "dragon_callback")
+                strat = r.get("strategy") or ds.DRAGON_STRATEGY
                 s_obj = strat_reg.get_strategy(strat)
                 if s_obj is None:
                     logger.warning("[dragon_monitor] 未知策略 %s (row %s), 跳过", strat, r.get("id"))
@@ -221,7 +221,7 @@ def run_monitor():
                 if not s_obj.entry_decision(r, snap).buyable:
                     ds.set_state(r["id"], ds.S_EXPIRED,
                                  detail={"gap": round(gap, 2),
-                                         "reason": f"{ds.STRATEGY_LABELS.get(strat, strat)}开盘gap超出可买区间"})
+                                         "reason": f"{ds.strategy_labels().get(strat, strat)}开盘gap超出可买区间"})
                     n_exp += 1
                     continue
                 # 质量排序键 (越大越优先, 策略自定义)
