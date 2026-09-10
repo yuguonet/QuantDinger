@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 
@@ -31,6 +32,28 @@ def is_st_stock(code):
 # ================================================================
 # 全市场流水线 (编排层: 经注册表分发, 无策略名分支)
 # ================================================================
+
+def _run_meta(strat, days, start_date, end_date):
+    """回测元信息 (2026-09-10 P2-2): 实验溯源用 — git 版本 + 实际生效参数 + 窗口。
+
+    git_sha 取不到 (非 git 环境/无 git) 时为 "unknown", 绝不因溯源失败影响回测本身。
+    """
+    import subprocess
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            timeout=3, stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        sha = "unknown"
+    try:
+        params = strat.merged_params(None)
+    except Exception:
+        params = {}
+    return {"git_sha": sha, "strategy": strat.key, "days": days,
+            "start_date": start_date, "end_date": end_date,
+            "effective_params": params}
+
 
 def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
             use_prefilter=True, progress_every=500, start_date=None, end_date=None,
@@ -52,9 +75,11 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         raise ValueError(f"strategy={strategy} 未注册 (可用: {sorted(strat_reg.all_strategies())})")
 
     if strat.scan_spec.kind == "intraday_window":
-        return run_all_intraday(strat, days=days, codes=codes,
-                                start_date=start_date, end_date=end_date,
-                                probe=probe)
+        res = run_all_intraday(strat, days=days, codes=codes,
+                               start_date=start_date, end_date=end_date,
+                               probe=probe)
+        res["meta"] = _run_meta(strat, days, start_date, end_date)
+        return res
 
     if type(strat).backtest_stock is StrategyBase.backtest_stock:
         raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock")
@@ -87,7 +112,8 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
             print(f"[{k}/{len(codes)}] trades={len(trades)} "
                   f"({time.time() - t0:.0f}s)", flush=True)
     return {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
-            "elapsed": round(time.time() - t0, 1)}
+            "elapsed": round(time.time() - t0, 1),
+            "meta": _run_meta(strat, days, start_date, end_date)}
 
 
 # ================================================================
@@ -327,4 +353,8 @@ if __name__ == "__main__":
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(res["trades"], f, ensure_ascii=False)
-        print("已写出:", args.out)
+        # meta sidecar (P2-2): git 版本+生效参数+窗口, 溯源用; --out 本体保持纯 trades 列表
+        # (不破坏既有对账脚本对纯列表的假设)
+        with open(args.out + ".meta.json", "w", encoding="utf-8") as f:
+            json.dump(res.get("meta", {}), f, ensure_ascii=False, indent=2)
+        print("已写出:", args.out, "| meta:", args.out + ".meta.json")

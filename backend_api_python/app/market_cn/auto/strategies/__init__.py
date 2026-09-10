@@ -67,12 +67,21 @@ def autodiscover():
 # ================================================================
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 _config_cache = None
+_config_mtime = None
 
 
 def load_config(refresh=False):
-    """读取 config.json → {"strategies": {...}}; 缺失/损坏返回空配置 (全开+默认限额)。"""
-    global _config_cache
-    if _config_cache is not None and not refresh:
+    """读取 config.json → {"strategies": {...}}; 缺失/损坏返回空配置 (全开+默认限额)。
+
+    2026-09-10 (P1-1): mtime 变化自动重读, 策略启停/限额/参数改 config.json 不再需要重启后端。
+    一致性约定: 调用方应每轮扫描开头取一次配置, 不在单轮扫描中途换配置。
+    """
+    global _config_cache, _config_mtime
+    try:
+        mt = os.path.getmtime(_CONFIG_PATH)
+    except OSError:
+        mt = None
+    if _config_cache is not None and not refresh and mt == _config_mtime:
         return _config_cache
     try:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -85,6 +94,7 @@ def load_config(refresh=False):
         logger.error("[strategies] config.json 解析失败, 按全默认兜底: %s", e)
         cfg = {}
     _config_cache = cfg if isinstance(cfg.get("strategies"), dict) else {"strategies": {}}
+    _config_mtime = mt
     return _config_cache
 
 
