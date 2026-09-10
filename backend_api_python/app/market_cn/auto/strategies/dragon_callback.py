@@ -57,12 +57,18 @@ DRAGON_CB_PARAMS = dict(
     #  高开/低开由用户自行判断, 展示更多股票; 旧引擎口径 114笔/74.6% 已废弃 —
     #  2026-09-09 出场引擎现实化(T+1/跳空/跌停)后 116笔/50.9%/+0.21%)
     # --- 出场 ---
+    # (2026-09-10 晚 C2 采纳, 用户批准: 出场参数扫描 tmp/龙回头出场参数扫描报告.md —
+    #  固定 50 笔入场真引擎重放, 自校验 50/50 逐笔一致; trail_lo -8→-3 (原-8与stop_loss
+    #  重合=前段形同虚设) + peak_exit_ret 7→4; 两段同向 (seg1/seg2 均不退化), C6≡C2 非孤点;
+    #  +2.63→+2.97/笔 盈亏比1.37→1.58, 改善全来自盈亏比; hold_days/stop_loss 扫描无效故不动。
+    #  ⚠️ 实盘执行口径依赖: trail_lo=-3 盘中触发更频繁, "收盘逃顶 vs 追踪线优先"差异被放大
+    #  (回测对照 +2.97 vs +2.29), 实盘须人工尾盘盯盘并逐笔记 execution_mode)
     hold_days=7,
     stop_loss=-8.0,
-    trail_lo=-8.0,
+    trail_lo=-3.0,
     trail_hi=-3.0,
     trail_switch_pct=3.0,
-    peak_exit_ret=7.0,
+    peak_exit_ret=4.0,
     peak_exit_upper=30.0,
 )
 

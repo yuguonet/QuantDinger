@@ -3,8 +3,8 @@
 
 用途: 把"分段声明 (首次时间→周期→截止)"变成唯一调度事实源。
      策略 ScanSpec (strategies/base.py) 提供默认声明; config.json 的 schedule 段
-     按 per-strategy 覆盖。外部 market_cn/scheduler.py 读取本模块即可驱动
-     (接线改动属外部文件, 须用户批准后实施——见设计文档 S 阶段)。
+     按 per-strategy 覆盖。外部 market_cn/scheduler.py 读取本模块驱动
+     (接线已完成 2026-09-09 用户批准; run_scan_knife 滚动起点同源读取本模块)。
 
 设计点:
   - expand_times 生成**确切时刻表** (相位锚定 first, 到点触发而非 60s interval 轮询碰点),

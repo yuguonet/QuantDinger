@@ -201,7 +201,17 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
 
     # 滚动预览策略 (14:50 起每分钟重判; 无则等待起点=14:56, 与旧行为一致)
     preview = {k: s for k, s in active.items() if getattr(s, "rolling_preview", False)}
-    start_hm = min((s.scan_spec.windows[0] for s in preview.values()), default="14:56")
+    # 起点与 scheduler 触发同源: config.json schedule 段覆盖优先 (resolve_schedule),
+    # ScanSpec 默认兜底 — 否则改 config 窗口后两处事实源分叉
+    from app.market_cn.auto.sched import resolve_schedule
+    starts = []
+    for k in preview:
+        decl = resolve_schedule(k)
+        if decl and decl.get("windows"):
+            starts.append(decl["windows"][0])
+        else:
+            starts.append(active[k].scan_spec.windows[0])
+    start_hm = min(starts, default="14:56")
 
     # ST / 北交所 通用排除 (knife 回测口径)
     try:
