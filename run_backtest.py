@@ -10,15 +10,17 @@
   python run_backtest.py                          # 默认: dragon, 300交易日, 全市场 (~50s)
   python run_backtest.py --strategy v1            # V1 (全市场 ~40s)
   python run_backtest.py --strategy break --days 120
-  python run_backtest.py --strategy all           # 三策略连跑 (~2分钟)
+  python run_backtest.py --strategy all           # 全部可回测策略连跑 (~2分钟)
+  python run_backtest.py --strategy tail_oversold --days 120   # 盘中策略 (时间线引擎, 1m覆盖内)
   python run_backtest.py --codes 000859,002081    # 指定股票秒级调试
   python run_backtest.py --out tmp/my.json        # 逐笔明细落盘 (对数用)
   python run_backtest.py --top 10                 # 报告附 Top/Bottom 各10笔明细 (默认5)
   python run_backtest.py --list                   # 查看策略说明
 
 参数:
-  --strategy   dragon|v1|break|all (默认 dragon)
-  --days N     回看 N 个交易日 (默认 300; 数据按 N*1.5 自然日取数)
+  --strategy   任意已注册策略 key, 或 all (默认 dragon)
+  --days N     回看窗口 (默认 300; 盘中策略受 1m 数据覆盖限制, 实际回测到覆盖起点)
+  --start-date / --end-date   显式窗口 (盘中策略精确复现用)
   --codes      逗号分隔股票代码, 空则全市场
   --out PATH   逐笔交易 JSON 落盘路径 (不给则不落盘, 只打印报告)
   --top N      报告尾部展示盈亏两端各 N 笔 (默认 5, 0 关闭)
@@ -33,6 +35,7 @@
 
 易错点:
   - dragon 全市场 ~50s (2026-09-10 起带必要条件预筛, 原 7 分钟); v1/break 各 ~40s;
+  - 盘中策略 (tail/knife) 首次回测需逐日构建快照帧 (~15s/交易日, 一次性, 落盘缓存);
   - 需 backend_api_python/.env 的 DB 连接; DB 未起会静默返回 0 笔 (data 层吞错);
   - 输出 trades 字段与基线 JSON 对齐 (entry_date/entry_price/return_pct/exit_day...),
     可直接喂 _compare_hub_vs_baseline.py 对数。
@@ -68,14 +71,15 @@ STRATEGY_INFO = {
 
 
 def _load_registry():
-    """读策略注册表 (autodiscover), 返回 {key: (实例, 有无回测钩子)}。"""
+    """读策略注册表 (autodiscover), 返回 {key: (实例, 可回测)}。"""
     from app.market_cn.auto import strategies as strat_reg
     from app.market_cn.auto.strategies.base import StrategyBase
     strat_reg.autodiscover()
     out = {}
     for key, s in strat_reg.all_strategies().items():
         has_hook = type(s).backtest_stock is not StrategyBase.backtest_stock
-        out[key] = (s, has_hook)
+        is_intraday = getattr(getattr(s, "scan_spec", None), "kind", "") == "intraday_window"
+        out[key] = (s, has_hook or is_intraday)   # 可回测 = 日线钩子 或 盘中时间线引擎
     return out
 
 
@@ -127,40 +131,51 @@ def main():
     ap.add_argument("--strategy", default="dragon",
                     help="任意已注册策略 key, 或 all (全部带回测钩子的策略)")
     ap.add_argument("--days", type=int, default=300)
+    ap.add_argument("--start-date", default="", help="窗口起点 (盘中策略精确复现)")
+    ap.add_argument("--end-date", default="", help="窗口终点 (默认今天)")
     ap.add_argument("--codes", default="", help="逗号分隔, 空则全市场")
     ap.add_argument("--out", default="", help="逐笔明细JSON输出路径 (对数用)")
     ap.add_argument("--top", type=int, default=5, help="报告展示盈亏两端各N笔 (0关闭)")
+    ap.add_argument("--probe", default="",
+                    help="开启调试探针并存档 (值=tag; 数据落 tmp/probes/, 供 AI 离线分析)")
     ap.add_argument("--list", action="store_true", help="打印可用策略后退出")
     args = ap.parse_args()
 
     reg = _load_registry()
     if args.list:
-        print("可用策略 (--strategy; ✓=有日线回测钩子, ✗=盘中窗口策略无日线回测):")
+        print("可用策略 (--strategy; ✓=日线枚举回测, ◉=盘中时间线引擎):")
         for key in sorted(reg):
-            s, has_hook = reg[key]
+            s, runnable = reg[key]
             label = getattr(s, "name", key)
             kind = getattr(getattr(s, "scan_spec", None), "kind", "")
-            print(f"  {'✓' if has_hook else '✗'} {key:<16} {label:<8} {kind}")
+            mark = "✓" if kind == "daily_close" else ("◉" if runnable else "✗")
+            print(f"  {mark} {key:<16} {label:<8} {kind}")
         return
 
     args.strategy = ALIAS.get(args.strategy, args.strategy)
     if args.strategy == "all":
-        strategies = sorted(k for k, (_, hook) in reg.items() if hook)
+        strategies = sorted(k for k, (_, runnable) in reg.items() if runnable)
     else:
         if args.strategy not in reg:
             print(f"策略 {args.strategy} 未注册 (可用: {', '.join(sorted(reg))}; 详情 --list)")
             return
         if not reg[args.strategy][1]:
-            print(f"策略 {args.strategy} 无日线枚举回测钩子 (盘中窗口策略走各自验证脚本)")
+            print(f"策略 {args.strategy} 暂无回测路径 (未实现 backtest_stock 且非盘中窗口策略)")
             return
         strategies = [args.strategy]
 
     from app.market_cn.auto.backtest import run_all
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None
+    probe = None
+    if args.probe:
+        from app.market_cn.auto.probe import Probe
+        probe = Probe(strategies[0] if len(strategies) == 1 else "multi", tag=args.probe)
 
     t0 = time.time()
     for st in strategies:
-        res = run_all(strategy=st, days=args.days, codes=codes)
+        res = run_all(strategy=st, days=args.days, codes=codes,
+                      start_date=args.start_date or None,
+                      end_date=args.end_date or None, probe=probe)
         _print_report(st, res, args.top, strat_inst=reg[st][0])
         if args.out:
             out = args.out if len(strategies) == 1 else args.out.replace(
@@ -169,6 +184,8 @@ def main():
             with open(out, "w", encoding="utf-8") as f:
                 json.dump(res["trades"], f, ensure_ascii=False)
             print(f"逐笔明细已写出: {out} ({len(res['trades'])}笔)")
+    if probe is not None:
+        probe.close()
     print(f"\n总耗时 {time.time() - t0:.0f}s")
 
 

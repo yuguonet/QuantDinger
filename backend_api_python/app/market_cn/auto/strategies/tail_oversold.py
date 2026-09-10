@@ -110,8 +110,11 @@ class TailOversoldStrategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
     entry_style = "v2t"
-    scan_spec = ScanSpec(kind="intraday_window", windows=("14:50", "15:00"), interval_sec=60)
+    scan_spec = ScanSpec(kind="intraday_window", windows=("14:50", "15:00"), interval_sec=60,
+                         entry_at="14:56")   # 终审语义: 仅 14:56 成交, 窗口内其余触发=预览
     default_params = dict(PARAMS)
+    # 探针 day-stage 归属 (越靠后=离信号越近)
+    PROBE_STAGE_RANK = {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5}
     # 契约: 回测未含 U1~U4 / 14:56 尾盘入场 (T+1) / D1 开盘卖当日平账 / 滚动预览
     use_unified_prefilter = False
     entry_at_close = True
@@ -151,8 +154,10 @@ class TailOversoldStrategy(StrategyBase):
             out[code] = snap
         return out
 
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
-        """盘中判定 (滚动预览 14:50 起 / 终审 14:56+)。必须 ctx={"latest","series"}。"""
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
+        """盘中判定 (滚动预览 14:50 起 / 终审 14:56+)。必须 ctx={"latest","series"}。
+
+        probe: 调试探针 (None=零开销) — 门级 TRACE 打点, 存档供 AI 离线分析。"""
         p = self.merged_params(params or None)
         ctx = ctx or {}
         snap, series = ctx.get("latest"), ctx.get("series") or []
@@ -164,9 +169,18 @@ class TailOversoldStrategy(StrategyBase):
         pc = float(snap.get("previousClose") or 0)
         if last <= 0 or pc <= 0 or high <= 0 or low <= 0 or high <= low:
             return []
+        _tr = None
+        if probe is not None:
+            def _tr(stage, **kw):
+                probe.trace(stage, code=code, d0_date=str(snap.get("time") or "")[:10],
+                            **kw)
         if _hhmm(snap.get("time") or "") < p["min_hhmm"]:    # 预览窗口起点前不出信号
+            if _tr:
+                _tr("window", hhmm=_hhmm(snap.get("time") or ""))
             return []
         if last >= round(pc * (1 + _limit_pct(code)), 2) * 0.998:   # 封板买不进
+            if _tr:
+                _tr("limit", last=round(last, 3))
             return []
 
         nf = _norm_factor(code)
@@ -175,9 +189,13 @@ class TailOversoldStrategy(StrategyBase):
         pos_range = (last - low) / (high - low)
         tail_ret, _tail_avg = _tail_ret_v2(series)
         if tail_ret is None:
+            if _tr:
+                _tr("data", reason="tail_ret")
             return []
         closes = [float(b["close"]) for b in (bars or [])]
         if len(closes) < 6 or closes[-5] <= 0:              # bars[-1]=昨日, 分母=D-5收盘
+            if _tr:
+                _tr("data", reason="bars_short")
             return []
         pre5_gain = (last / closes[-5] - 1) * 100
         # V2 精掐五条件 (全部归一化)
@@ -185,7 +203,13 @@ class TailOversoldStrategy(StrategyBase):
         if score < p["score_min"] or pre5_gain * nf > p["pre5_max"] \
                 or amplitude * nf < p["amp_min"] \
                 or not (p["tail_lo"] <= tail_ret * nf <= p["tail_hi"]):
+            if _tr:
+                _tr("v2", score=round(score, 2), pre5_gain=round(pre5_gain, 2),
+                    amplitude=round(amplitude, 2), tail_ret=round(tail_ret, 2),
+                    pos_range=round(pos_range, 3))
             return []
+        if _tr:
+            _tr("signal", score=round(score, 2))
         return [Signal(
             code=code,
             time=str(snap.get("time") or "")[:10],

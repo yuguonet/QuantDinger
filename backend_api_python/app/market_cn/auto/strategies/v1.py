@@ -73,10 +73,17 @@ class V1Strategy(StrategyBase):
     entry_style = "v1"
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(PARAMS)
+    # 探针 day-stage 归属 (越靠后=离信号越近)
+    PROBE_STAGE_RANK = {"lu": 1, "ret20": 2, "pullback": 3, "obv": 4, "vol": 5,
+                        "overheat": 6, "prefilter": 7, "d1_gap": 8, "d1_chg": 8,
+                        "d1_band": 8, "engine_skip": 9, "signal": 10}
 
     # ---- 信号判定 ----
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
-        """D0 四因子 → Signal (至多1笔)。as_of=k: 只用 bars[:k+1], 末根为 D0。"""
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
+        """D0 四因子 → Signal (至多1笔)。as_of=k: 只用 bars[:k+1], 末根为 D0。
+
+        probe: 调试探针 (probe.Probe / DayTrace shim), None=零开销 —
+        各过滤门 TRACE 式打点, 存档供 AI 离线分析, 与判定行为无关。"""
         p = self.merged_params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
@@ -94,7 +101,18 @@ class V1Strategy(StrategyBase):
         d_2 = bars[i - 2]
         if d_2["close"] <= 0 or d_1["close"] <= 0:
             return result
+        # 探针 shim (TRACE 宏语义): probe=None 时零开销
+        if probe is not None:
+            _pd = str(d0["time"])[:10]
+
+            def _tr(stage, **kw):
+                probe.trace(stage, code=code, d0_date=_pd, **kw)
+        else:
+            _tr = None
+
         if (d0["close"] / d_1["close"] - 1) < threshold * 0.98:
+            if _tr:
+                _tr("lu", d0_pct_chg=round((d0["close"] / d_1["close"] - 1) * 100, 2))
             return result
 
         # === 因子1: 强趋势 20日涨>ret_20d_min% ===
@@ -102,11 +120,15 @@ class V1Strategy(StrategyBase):
             return result
         ret_20d = (d0["close"] / bars[i - 20]["close"] - 1) * 100
         if ret_20d < p["ret_20d_min"]:
+            if _tr:
+                _tr("ret20", ret_20d=round(ret_20d, 2))
             return result
 
         # === 因子2: D-1回调 [d_1_pullback_min, d_1_pullback_max) ===
         d_1_change = (d_1["close"] / d_2["close"] - 1) * 100
         if d_1_change < p["d_1_pullback_min"] or d_1_change >= p["d_1_pullback_max"]:
+            if _tr:
+                _tr("pullback", d_1_change=round(d_1_change, 2))
             return result
 
         # === 因子3: OBV 5日趋势上升 ===
@@ -121,12 +143,16 @@ class V1Strategy(StrategyBase):
                         obv -= bars[j]["volume"]
                 obv_list.append(obv)
             if len(obv_list) >= 5 and obv_list[-1] - obv_list[-5] <= 0:
+                if _tr:
+                    _tr("obv")
                 return result
 
         # === 因子4: D-1非放量 < d_1_vol_max x 5日均量 ===
         if i >= 6:
             vol_ma5_d1 = sum(bars[j]["volume"] for j in range(i - 6, i - 1)) / 5
             if vol_ma5_d1 > 0 and d_1["volume"] / vol_ma5_d1 >= p["d_1_vol_max"]:
+                if _tr:
+                    _tr("vol", vol_r=round(d_1["volume"] / vol_ma5_d1, 2))
                 return result
 
         # === 因子5: 纯单板过热过滤 (仅当前10天无涨停时生效) ===
@@ -141,13 +167,19 @@ class V1Strategy(StrategyBase):
             macd_h = hist[-1] if hist else None
             boll_bw = calc_bollinger_bw(closes)
             if macd_h is not None and macd_h >= 2:
+                if _tr:
+                    _tr("overheat", reason="macd_hist", macd_h=round(macd_h, 2))
                 return result
             if boll_bw is not None and boll_bw >= 45:
+                if _tr:
+                    _tr("overheat", reason="boll_bw", boll_bw=round(boll_bw, 2))
                 return result
 
         circ = float((params.get("stock_info") or {}).get("circ_shares") or 0)
         total = float((params.get("stock_info") or {}).get("total_shares") or 0)
         d0_close = round(d0["close"], 3)
+        if _tr:
+            _tr("signal", ret_20d=round(ret_20d, 2), d_1_change=round(d_1_change, 2))
         result.append(Signal(
             code=code,
             time=d0["time"],
@@ -255,14 +287,15 @@ class V1Strategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_v1_stock 逐字搬入, 对数零差异) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                      probe=None):
         """单股 V1 全历史回测 (D0四因子判定, 次日开盘买, D1入场过滤)。
 
         D1 过滤 (gap/change/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
-        出场引擎 run_backtest lazy import (流水线设施, 留 backtest.py)。
+        出场模拟 _run_backtest 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
         """
-        from app.market_cn.auto.backtest import run_backtest
         from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.probe import DayTrace
         board_type = get_board_type(code)
         n = len(bars)
         if n < 30:
@@ -270,12 +303,17 @@ class V1Strategy(StrategyBase):
         trades = []
 
         for i in range(25, n - 1):
+            # debug 模式: day_tr 聚合该日判定门落点 (probe=None 零开销)
+            day_tr = DayTrace() if probe is not None else None
             # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
             sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
                 bars[:i + 1], code,
                 ret_20d_min=30.0, d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                obv_filter=True, d_1_vol_max=1.5, stock_info=stock_info)]
+                obv_filter=True, d_1_vol_max=1.5, stock_info=stock_info,
+                probe=day_tr)]
             if not sigs:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info)
                 continue
             sig = sigs[0]
 
@@ -283,6 +321,9 @@ class V1Strategy(StrategyBase):
             if use_prefilter:
                 ok, fails = unified_prefilter(bars, i, code, stock_info)
                 if not ok:
+                    if probe is not None:
+                        self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                        stage="prefilter", sig=sig, u_fails=fails)
                     continue
 
             # 入场: 次日开盘价 + D1当日过滤
@@ -297,23 +338,48 @@ class V1Strategy(StrategyBase):
             d1_gap = (d1["open"] / d0["close"] - 1) * 100
             min_d1_gap = -3.0 if board_type == "main" else -5.0
             if d1_gap < min_d1_gap:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="d1_gap", sig=sig,
+                                    extra={"d1_gap": round(d1_gap, 2)})
                 continue
             if d1_change < 0:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="d1_chg", sig=sig,
+                                    extra={"d1_change": round(d1_change, 2)})
                 continue
             if board_type == "gem_star" and d1_gap >= 5.0:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="d1_band", sig=sig,
+                                    extra={"d1_gap": round(d1_gap, 2), "board": "gem_star"})
                 continue
             # 主板高开3%~5%不入场 (v4数据驱动)
             if board_type == "main" and 3.0 <= d1_gap < 5.0:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="d1_band", sig=sig,
+                                    extra={"d1_gap": round(d1_gap, 2), "board": "main"})
                 continue
 
             d1_limit_up_val = is_limit_up(d1["close"], d0["close"], board_type)
-            bt = run_backtest(bars, entry_idx, entry_price, 7, -10.0,
+            bt = _run_backtest(bars, entry_idx, entry_price, 7, -10.0,
                               -5.0, board_type, is_v1=True,
                               d1_limit_up=d1_limit_up_val, d1_change=d1_change,
                               d1_gap=d1_gap)
             if not bt:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="engine_skip", sig=sig)
                 continue
 
+            if probe is not None:
+                self._probe_day(
+                    probe, day_tr, bars, i, code, stock_info, stage="signal",
+                    sig=sig, extra={"engine": {k: bt.get(k) for k in
+                                               ("return_pct", "peak_return_pct",
+                                                "exit_reason", "exit_day")}})
             trades.append({
                 **sig,
                 "entry_date": entry_date,
@@ -326,3 +392,147 @@ class V1Strategy(StrategyBase):
             })
 
         return trades
+
+
+# ================================================================
+# 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
+# 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
+# ================================================================
+from app.market_cn.auto.common.exec_cn import (
+    fill_blocked_by_limit_dn,
+    fill_on_gap,
+    is_one_word_limit_dn,
+    limit_dn_price as _limit_dn_price,
+)
+
+
+def _run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
+    """V1/通用出场模拟 (现实化 2026-09-09, 与 test_dragon.py 逐字同步):
+
+    现实约束: ① T+1 — 买入当日(d=1)不可卖出, 全部出场判定从 d=2 起 (仅更新峰值/估值);
+    ② 跳空穿越 — 触发日开盘低于触发价按开盘价成交;
+    ③ 跌停无法卖出 — 一字跌停整日跳过 (V1 的 D2 开盘清仓若遇一字跌停顺延次日开盘),
+    触发成交触及跌停顺延次日开盘; 到期日一字跌停顺延次日开盘强平。
+    V1 日内动量规则 (D1收盘判定→D2开盘执行) 本就满足 T+1, 判定逻辑未改动。
+    """
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    limit_threshold = 0.098 if board_type == "main" else 0.198
+    peak = entry_price
+    exit_p = entry_price
+    exit_d = 0
+    pending_dn = False        # 触发成交触及跌停 / 清仓日一字跌停 → 次日开盘强平
+    last_unfilled = False     # 末日一字跌停 → 到期顺延
+
+    # 如果外部未传入 d1_limit_up, 则在回测内计算 (兼容旧调用)
+    # 注意: next_open 模式下 entry_idx=pullback_end+1, d=1 访问的是 D2
+    # 因此推荐由调用方预计算并传入
+    if d1_limit_up is None:
+        d1_limit_up = False
+        if entry_idx + 1 < len(bars):
+            d1_bar = bars[entry_idx + 1]
+            d1_ret = (d1_bar['close'] / entry_price - 1)
+            if d1_ret >= limit_threshold * 0.98:
+                d1_limit_up = True
+
+    # next_open模式: entry_idx=D1(D+1开盘买入)
+    # 循环d=1应指向D1(第一个持仓日), d=2指向D2, 以此类推
+    # 先用D1的high更新peak
+    if entry_idx < len(bars):
+        d1_init = bars[entry_idx]
+        if d1_init['high'] > peak:
+            peak = d1_init['high']
+
+    for d in range(1, hold_days + 1):
+        idx = entry_idx + d - 1  # d=1 → entry_idx(D1), d=2 → entry_idx+1(D2)
+        if idx >= len(bars): break
+        b = bars[idx]
+        if b['high'] > peak: peak = b['high']
+        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
+        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
+
+        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
+        if pending_dn:
+            exit_p, exit_d = b['open'], d
+            break
+
+        # V1出场 (v3): D1日内动量<3% → D2开盘清仓
+        # 日内动量 = D1收盘涨幅 - D1开盘涨幅 (盘中买卖力量指标)
+        #   <0: 盘中出货, D2大概率续跌, 100%捕获D2跌>3%的信号
+        #   >=0: 盘中有买盘承接, 继续持有
+        # 注: -10%止损已移除, 日内动量规则在D2开盘即清仓, 不需要等止损位
+        v1_momentum_exit = False
+        if is_v1 and d == 2:
+            # 日内动量 = D1收盘涨幅 - D1开盘涨幅 = (D1 close - D1 open) / D0 close
+            # d1_change 和 d1_gap 由调用方传入, 也可从bars计算
+            if d1_change is not None and d1_gap is not None:
+                intraday = d1_change - d1_gap
+            else:
+                # fallback: 从bars计算
+                d1_bar = bars[entry_idx]
+                d0_close = bars[entry_idx - 1]['close'] if entry_idx > 0 else entry_price
+                intraday = (d1_bar['close'] - d1_bar['open']) / d0_close * 100 if d0_close > 0 else 0
+            v1_momentum_exit = intraday < 3
+
+        # 一字跌停: 全天无成交可能 (D2开盘清仓同样无法成交 → 顺延次日开盘)
+        if is_one_word_limit_dn(b, dn):
+            pending_dn = v1_momentum_exit
+            last_unfilled = True
+            continue
+        last_unfilled = False
+
+        if v1_momentum_exit:
+            # D2开盘直接清仓, 不等止损位
+            exit_p, exit_d = b['open'], d
+            break
+
+        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
+        if d > 1:
+            # 1 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
+            if peak_exit:
+                ret = (b['close'] / entry_price - 1) * 100
+                if ret > 7:
+                    bar_range = b['high'] - b['low']
+                    upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                    if upper > 30 and b['close'] < b['high'] * 0.98:
+                        exit_p, exit_d = b['close'], d
+                        break
+
+            # 2/3 追踪+止损 (合并: 价格连续先穿过更高触发线; 跳空按开盘; 触跌停顺延)
+            trig_t = peak * (1 + trailing_stop / 100)
+            trig_s = entry_price * (1 + stop_loss / 100)
+            trig = max(trig_t, trig_s)
+            if b['low'] <= trig:
+                fill = fill_on_gap(b['open'], trig)
+                if fill_blocked_by_limit_dn(fill, dn):
+                    pending_dn = True   # 成交价触及跌停 → 卖不出
+                    continue
+                exit_p, exit_d = fill, d
+                break
+
+        # 4 兜底: 持仓到期收盘走
+        exit_p = b['close']; exit_d = d
+
+    # 末日落入无法卖出状态 (一字跌停/触发触跌停) → 顺延下一可交易日开盘强平
+    # (连续一字逐日跳过; nxt 指向未成交日的下一日)
+    if last_unfilled or pending_dn:
+        nxt = entry_idx + exit_d + 1
+        while nxt < len(bars):
+            nb = bars[nxt]
+            pc = bars[nxt - 1]['close']
+            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
+            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
+                last_unfilled, pending_dn = True, False
+                nxt += 1
+                continue
+            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
+            break
+
+    result = {
+        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
+        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
+    }
+    if d1_limit_up:
+        result['d1_limit_up'] = d1_limit_up
+    return result

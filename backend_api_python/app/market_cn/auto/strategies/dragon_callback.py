@@ -85,6 +85,8 @@ from app.market_cn.auto.common.exec_cn import (
     is_one_word_limit_dn,
     limit_dn_price as _limit_dn_price,
 )
+from app.market_cn.auto.probe import DayTrace as _DayTrace, \
+    sample_feats as _dragon_sample_feats   # 探针框架件 (无环; 特征/标签上收共用)
 
 
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
@@ -222,14 +224,20 @@ class DragonCallbackStrategy(StrategyBase):
     prefilter_anchor = "limit_up"     # U1~U4 锚定涨停日 (D0 缩量小阴日评估会误杀)
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DRAGON_CB_PARAMS)
+    # 探针 day-stage 归属 (越靠后=离信号越近; 引擎/回测钩子经 getattr 读取)
+    PROBE_STAGE_RANK = {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4, "rsi": 5,
+                        "turn": 6, "quality": 7, "dedup": 8, "prefilter": 9,
+                        "engine_skip": 9, "signal": 10}
 
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
-                     use_tech_score=True, **params):
+                     use_tech_score=True, probe=None, **params):
         """龙回头 D0 信号 ("方案2") → Signal (至多1笔)。
 
         as_of=k: 只用 bars[:k+1] 判定; limit_ups: 预计算涨停索引 (回测优化, None 则现算)。
-        params 覆盖 DRAGON_CB_PARAMS 键 (dragon_scan 传 params=dict)。
+        **params 覆盖 DRAGON_CB_PARAMS 键 (dragon_scan 传 params=dict)。
+        probe: 调试探针 (probe.Probe / 同签名 shim), None=零开销 — TRACE 式记录
+        每候选各判定步落点 (debug 形态, 数据存档供 AI 分析, 与判定行为无关)。
         """
         p = self.merged_params(params or None)
         if as_of is not None:
@@ -306,6 +314,31 @@ class DragonCallbackStrategy(StrategyBase):
                 continue
 
             pullback_days = i - lu_idx
+            gap_from_peak = pullback_days   # 同一值 (Step2 与探针记录共用旧字段名)
+
+            # ── 龙强度度量 (①连板高度 ②前期热度; 全部只用<=D0收盘数据, as-of 安全) ──
+            # 置于 Step1 之前: 各判定门与探针 trace 共用 (纯计算, 判定行为不变)
+            streak_h = 1
+            _j = lu_idx
+            while _j > 0 and is_limit_up(bars[_j]["close"], bars[_j - 1]["close"], board_type):
+                streak_h += 1
+                _j -= 1
+            if lu_idx >= 20:
+                _base = bars[lu_idx - 20]["close"]
+                lu_gain20 = (lu_close / _base - 1) * 100 if _base > 0 else None
+            else:
+                lu_gain20 = None
+
+            # 探针 shim (TRACE 宏语义): probe=None 时 _tr=None, 判定内零开销
+            if probe is not None:
+                def _tr(stage, **kw):
+                    probe.trace(stage, code=code, d0_date=str(bars[i]["time"])[:10],
+                                lu_date=str(bars[lu_idx]["time"])[:10],
+                                gap_from_peak=gap_from_peak, streak_h=streak_h,
+                                lu_gain20=round(lu_gain20, 1) if lu_gain20 is not None else None,
+                                **kw)
+            else:
+                _tr = None
 
             # ── Step1: 找龙 — 滑动窗口内涨停占比>=70% ──
             dragon_found = False
@@ -320,32 +353,29 @@ class DragonCallbackStrategy(StrategyBase):
                     dragon_found = True
                     break
             if not dragon_found:
+                if _tr:
+                    _tr("dragon")
                 continue
 
             # ── Step2: gap [gap_min, gap_max] ──
-            gap_from_peak = i - lu_idx
             if gap_from_peak < p["gap_min"] or gap_from_peak > p["gap_max"]:
+                if _tr:
+                    _tr("gap")
                 continue
 
-            # ── 龙强度门槛 (2026-09-10 三条件; 全部只用<=D0收盘数据, as-of 安全) ──
-            # ① 连板高度: 锚定涨停日往前数连续涨停天数 (含涨停日本身)
-            streak_h = 1
-            _j = lu_idx
-            while _j > 0 and is_limit_up(bars[_j]["close"], bars[_j - 1]["close"], board_type):
-                streak_h += 1
-                _j -= 1
+            # ── 龙强度门槛 (2026-09-10 三条件) ──
             if streak_h < p["min_streak"]:
+                if _tr:
+                    _tr("streak")
                 continue
-            # ② 前期热度: 涨停日20日涨幅 (不足20根K线=热度无法证实, 与离线分析同口径剔除)
-            if lu_idx >= 20:
-                _base = bars[lu_idx - 20]["close"]
-                lu_gain20 = (lu_close / _base - 1) * 100 if _base > 0 else None
-            else:
-                lu_gain20 = None
             if lu_gain20 is None or lu_gain20 < p["lu_gain20_min"]:
+                if _tr:
+                    _tr("lu_gain20")
                 continue
             # ③ 强势回调: D0 RSI6 下界 (use_tech_score=False 时 rsi 未计算, 放行不误杀)
             if rsi_val is not None and rsi_val < p["rsi6_min"]:
+                if _tr:
+                    _tr("rsi")
                 continue
 
             # ── 回调期特征 ──
@@ -367,16 +397,28 @@ class DragonCallbackStrategy(StrategyBase):
             cond_depth = pullback_depth <= p["depth_max"]
             cond_yin = yin_ratio < p["yin_ratio_max"]
             if not (cond_ma20 or cond_depth or cond_yin):
+                if _tr:
+                    _tr("turn", d0_vs_ma20=round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
+                        pullback_depth=round(pullback_depth, 2),
+                        yin_ratio=round(yin_ratio, 2))
                 continue
 
             # ── 信号质量排除 ──
             if yin_ratio >= p["yin_ratio_exclude"]:
+                if _tr:
+                    _tr("quality", reason="yin_ratio", yin_ratio=round(yin_ratio, 2))
                 continue
             if rsi_val is not None and rsi_val < p["rsi6_exclude_lt"]:
+                if _tr:
+                    _tr("quality", reason="rsi6_lt", rsi6=round(rsi_val, 1))
                 continue
             if d0_vs_ma20 is not None and d0_vs_ma20 < p["d0_ma20_exclude_lt"]:
+                if _tr:
+                    _tr("quality", reason="d0_ma20_lt", d0_vs_ma20=round(d0_vs_ma20, 2))
                 continue
 
+            if _tr:
+                _tr("signal")
             result.append(Signal(
                 code=code,
                 time=bars[i]["time"],
@@ -473,11 +515,14 @@ class DragonCallbackStrategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_dragon_stock 逐字搬入, 对数零差异) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                       probe=None):
         """单股龙回头全历史回测, 返回 trades 列表 (字段与基线 JSON 对齐)。
 
-        编排 (枚举/去重±4/预过滤锚点/预筛) 是策略规则故归位本插件; 出场引擎
-        run_backtest_dragon_callback lazy import (流水线设施, 留 backtest.py)。
+        编排 (枚举/去重±4/预过滤锚点/预筛) 是策略规则故归位本插件; 出场模拟
+        run_backtest_dragon_callback 在本文件 (策略专用出场规则)。
+        probe: 调试探针 (None=零开销) — 每个到达完整判定的决策日产出一行
+        sample (特征+标签+当日最深判定阶段), 廉价预筛跳过的日不采样 (纯噪声)。
         """
         from app.market_cn.auto.common.filters import unified_prefilter
         board_type = get_board_type(code)
@@ -503,10 +548,21 @@ class DragonCallbackStrategy(StrategyBase):
                 continue
 
             # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
+            # debug 模式: day_tr 聚合该日全部候选的判定步落点 (_DayTrace, probe=None 零开销)
+            day_tr = _DayTrace() if probe is not None else None
             sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
-                bars[:i + 1], code, limit_ups=[j for j in lu_all if j < i])]
+                bars[:i + 1], code, limit_ups=[j for j in lu_all if j < i],
+                probe=day_tr)]
 
             if not sigs:
+                if probe is not None:
+                    stage = max((t["stage"] for t in day_tr.items),
+                                key=lambda s: self.PROBE_STAGE_RANK.get(s, 0),
+                                default="no_candidate")
+                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
+                                 stage=stage, rule_trace=day_tr.items,
+                                 **_dragon_sample_feats(bars, i, code,
+                                                        stock_info=stock_info))
                 continue
             sig = sigs[0]
             lu_idx = _find_bar_idx(bars, sig["lu_date"])
@@ -518,6 +574,11 @@ class DragonCallbackStrategy(StrategyBase):
                     skip = True
                     break
             if skip:
+                if probe is not None:
+                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
+                                 stage="dedup", rule_trace=day_tr.items, sig=sig,
+                                 **_dragon_sample_feats(bars, i, code,
+                                                        stock_info=stock_info))
                 continue
             used_ranges.append((lu_idx, i))
 
@@ -525,6 +586,12 @@ class DragonCallbackStrategy(StrategyBase):
             if use_prefilter and lu_idx > 0:
                 ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
                 if not ok:
+                    if probe is not None:
+                        probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
+                                     stage="prefilter", rule_trace=day_tr.items,
+                                     sig=sig, u_fails=list(fails),
+                                     **_dragon_sample_feats(bars, i, code,
+                                                            stock_info=stock_info))
                     continue
 
             # 入场: 次日(D+1)开盘价
@@ -539,7 +606,21 @@ class DragonCallbackStrategy(StrategyBase):
                 bars, i + 1, entry_price, hold_days=7, stop_loss=-8.0,
                 board_type=board_type)
             if not result:
+                if probe is not None:
+                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
+                                 stage="engine_skip", rule_trace=day_tr.items,
+                                 sig=sig, **_dragon_sample_feats(bars, i, code,
+                                                                 stock_info=stock_info))
                 continue
+
+            if probe is not None:
+                probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
+                             stage="signal", rule_trace=day_tr.items, sig=sig,
+                             engine={k: result.get(k) for k in
+                                     ("return_pct", "peak_return_pct",
+                                      "exit_reason", "exit_day")},
+                             **_dragon_sample_feats(bars, i, code,
+                                                    stock_info=stock_info))
 
             trades.append({
                 **sig,

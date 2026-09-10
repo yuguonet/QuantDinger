@@ -140,6 +140,10 @@ class KnifeCatchStrategy(StrategyBase):
     entry_style = "kc"
     scan_spec = ScanSpec(kind="intraday_window", windows=("14:30", "15:00"), interval_sec=60)
     default_params = dict(PARAMS)
+    # 探针 day-stage 归属 (越靠后=离信号越近)
+    PROBE_STAGE_RANK = {"window": 1, "mkt": 2, "feat": 3, "data": 4, "tail_vw": 5,
+                        "daily": 6, "vol": 7, "streak": 8, "pre5": 8,
+                        "lu_recent": 9, "signal": 10}
     # 框架契约扩展 (base.py 文档): 回测未含 U1~U4, 不做统一预过滤;
     # 14:56 入场当日不可卖 (T+1); 出场当日执行并当日平账
     use_unified_prefilter = False
@@ -175,8 +179,10 @@ class KnifeCatchStrategy(StrategyBase):
             out[code] = snap
         return out
 
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
-        """14:56 盘中判定。必须 ctx={"latest","series","mkt_gain"}; 无盘中数据返回空。"""
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
+        """14:56 盘中判定。必须 ctx={"latest","series","mkt_gain"}; 无盘中数据返回空。
+
+        probe: 调试探针 (None=零开销) — 门级 TRACE 打点, 存档供 AI 离线分析。"""
         p = self.merged_params(params or None)
         ctx = ctx or {}
         snap = ctx.get("latest")
@@ -191,39 +197,63 @@ class KnifeCatchStrategy(StrategyBase):
         last_time = str(snap.get("time") or "")
         if last <= 0 or pc <= 0 or high <= low:
             return []
+        _tr = None
+        if probe is not None:
+            def _tr(stage, **kw):
+                probe.trace(stage, code=code, d0_date=last_time[:10], **kw)
         # 窗口保护: 14:56 之后才出信号 (用户要求 14:30 启动仅为预热, 判定不变)
         if _hhmm(last_time) < "14:56":
+            if _tr:
+                _tr("window", hhmm=_hhmm(last_time))
             return []
         # 市场门控 (分钟回测核心条件之一)
         if mkt_gain is None or mkt_gain > p["mkt_gate"]:
+            if _tr:
+                _tr("mkt", mkt_gain=round(mkt_gain, 2) if mkt_gain is not None else None)
             return []
 
         gain = (last / pc - 1) * 100
         amp = (high - low) / pc * 100
         pos = (last - low) / (high - low)
         if gain > p["gain_max"] or amp < p["amp_min"] or pos > p["pos_max"]:
+            if _tr:
+                _tr("feat", gain=round(gain, 2), amp=round(amp, 2), pos=round(pos, 3))
             return []
 
         tail = _tail_ret(series, last, last_time, minutes=20)
         vw = _vw_frac(series)
         if tail is None or vw is None:
+            if _tr:
+                _tr("data", reason="tail_or_vw")
             return []
         if tail < p["tail_min"] or vw > p["vw_max"]:
+            if _tr:
+                _tr("tail_vw", tail=round(tail, 2), vw=round(vw, 3))
             return []
 
         df = _daily_feats(bars or [], code)
         if df is None:
+            if _tr:
+                _tr("daily", reason="bars_short")
             return []
         vol_ratio = (float(snap.get("volume") or 0) / df["vol5"]) if df["vol5"] > 0 else 99.0
         if vol_ratio > p["vol_max"]:
+            if _tr:
+                _tr("vol", vol_ratio=round(vol_ratio, 3))
             return []
         # down_streak 含当日 (当日必跌): live口径 = 1 + 昨日往前连跌
         streak = 1 + df["down_streak"]
         if streak < p["streak_min"]:
+            if _tr:
+                _tr("streak", streak=streak)
             return []
         if df["pre5"] > p["pre5_max"]:
+            if _tr:
+                _tr("pre5", pre5=round(df["pre5"], 2))
             return []
         if df["lu_recent"] > 0:
+            if _tr:
+                _tr("lu_recent", lu_recent=df["lu_recent"])
             return []
 
         # 评分: 仅作展示排序 (不截断, 全部展示); 连跌深+前期弱+量能适中优先
@@ -241,6 +271,8 @@ class KnifeCatchStrategy(StrategyBase):
         score = min(90, score)
 
         trade_date = str(last_time)[:10]
+        if _tr:
+            _tr("signal", streak=streak, gain=round(gain, 2), tail=round(tail, 2))
         return [Signal(
             code=code,
             time=trade_date,

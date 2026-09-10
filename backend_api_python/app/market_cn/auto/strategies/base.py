@@ -28,6 +28,8 @@ class ScanSpec:
     windows: tuple = ()                # intraday_window 生效: ("09:30","10:00") 等窗口端点
     interval_sec: int = 60             # intraday_window 生效: 窗口内轮询间隔
     data: str = "daily"                # daily=喂日K | minute=喂分钟K (1m 通道 Phase 3+ 接)
+    entry_at: str = ""                 # intraday_window 生效: 成交触发时刻 ("14:56"=终审语义,
+                                       #   窗口内其它触发仅预览不成交; 空=每个触发点均可成交)
 
 
 # ================================================================
@@ -131,7 +133,8 @@ class StrategyBase:
         raise NotImplementedError
 
     # ---- 回测钩子 (2026-09-10 插件化: 新策略实现本钩子即入回测流水线, backtest.py 零改动) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                      probe=None):
         """单股全历史日线枚举回测 → trades 列表; 默认 None = 无日线枚举回测。
 
         契约:
@@ -143,6 +146,29 @@ class StrategyBase:
         盘中窗口策略 (tail/knife) 不实现, 走各自验证脚本。
         """
         return None
+
+    # ---- 探针 sample 组装 (debug 模式专用; probe=None 路径不会走到) ----
+    def _probe_day(self, probe, day_tr, bars, i, code, stock_info,
+                   stage=None, sig=None, u_fails=None, extra=None):
+        """按决策日产出一行 sample (特征/标签共用 sample_feats, 通用组装件)。
+
+        stage=None 时取 day_tr 中 PROBE_STAGE_RANK 最深的判定步做 day 级归属。
+        """
+        from app.market_cn.auto.probe import sample_feats
+        if stage is None:
+            rank = getattr(self, "PROBE_STAGE_RANK", {})
+            stage = max((t["stage"] for t in day_tr.items),
+                        key=lambda s: rank.get(s, 0), default="no_gate")
+        rec = {"code": code, "d0_date": str(bars[i]["time"])[:10], "stage": stage,
+               "rule_trace": day_tr.items if day_tr is not None else [],
+               **sample_feats(bars, i, code, stock_info)}
+        if sig is not None:
+            rec["sig"] = sig
+        if u_fails is not None:
+            rec["u_fails"] = list(u_fails)
+        if extra:
+            rec.update(extra)
+        probe.sample(**rec)
 
     # ---- 便捷 ----
     def merged_params(self, override=None):

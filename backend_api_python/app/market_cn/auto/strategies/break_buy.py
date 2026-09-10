@@ -31,7 +31,7 @@ from app.market_cn.auto.strategies.base import (
 STRATEGY_KEY = "break"
 STRATEGY_LABEL = "断板"
 
-# 板块参数 (与 backtest.BOARD_PARAMS 同源, 2026-09-10 起权威副本在 backtest.py; config.json params 可覆盖其键)
+# 板块参数 (策略专用出场参数, 唯一定义在本文件; backtest.py 旧份已删, 2026-09-10 晚下沉; config.json params 可覆盖其键)
 BOARD_PARAMS = {
     "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20,
              "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
@@ -204,12 +204,18 @@ class BreakStrategy(StrategyBase):
     entry_style = "brk"
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DEFAULT_PARAMS)
+    # 探针 day-stage 归属 (越靠后=离信号越近; 细门在 _break_signal_at 内不单列)
+    PROBE_STAGE_RANK = {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,
+                        "engine_skip": 5, "signal": 6}
 
     # ---- 信号判定 ----
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None, **params):
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
+                     probe=None, **params):
         """今日是否为断板期确认日 → Signal (至多1笔)。as_of=k: 只用 bars[:k+1]。
 
-        limit_ups: 预计算的涨停日索引列表 (回测/扫描复用, None 则现算 bars[:as_of])。"""
+        limit_ups: 预计算的涨停日索引列表 (回测/扫描复用, None 则现算 bars[:as_of])。
+        probe: 调试探针 (None=零开销) — 门级 TRACE 打点 (粗粒度: 细门在
+        _break_signal_at 内, 日级归属够用), 存档供 AI 离线分析。"""
         p = self.merged_params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
@@ -242,8 +248,16 @@ class BreakStrategy(StrategyBase):
                 streak_end += 1
             sig = _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break_gap, board_params)
             if not sig:
+                if probe is not None:
+                    probe.trace("confirm", code=code, d0_date=str(bars[i]["time"])[:10],
+                                streak_start=str(bars[streak_start]["time"])[:10],
+                                streak_end=str(bars[streak_end]["time"])[:10],
+                                streak_len=streak_end - streak_start + 1)
                 continue
             if sig["break_idx"] + sig["break_days"] - 1 != i:
+                if probe is not None:
+                    probe.trace("align", code=code, d0_date=str(bars[i]["time"])[:10],
+                                break_days=sig.get("break_days"))
                 continue
             circ = float((params.get("stock_info") or {}).get("circ_shares") or 0)
             total = float((params.get("stock_info") or {}).get("total_shares") or 0)
@@ -332,14 +346,15 @@ class BreakStrategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_break_stock 逐字搬入, 对数零差异) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True):
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                      probe=None):
         """单股断板全历史回测 (断板期确认日判定, 次日开盘买)。
 
-        出场参数取本插件 BOARD_PARAMS (与 backtest.BOARD_PARAMS 同值同源);
-        出场引擎 run_backtest_breakbuy lazy import (流水线设施, 留 backtest.py)。
+        出场参数取本插件 BOARD_PARAMS (单一定义, backtest.py 旧份已删);
+        出场模拟 _run_backtest_breakbuy 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
         """
-        from app.market_cn.auto.backtest import run_backtest_breakbuy
         from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.probe import DayTrace
         min_streak, max_break_gap = 2, 5   # 旧 backtest_break_stock 默认值 (run_all 从不覆盖)
         bt_type = get_board_type(code)
         params = dict(BOARD_PARAMS[bt_type])
@@ -360,19 +375,26 @@ class BreakStrategy(StrategyBase):
             # 廉价预过滤: 断板期结束于i → 必存在距i不超过max_break_gap的涨停日
             if not any(j in lu_set for j in range(max(1, i - max_break_gap), i)):
                 continue
+            # debug 模式: day_tr 聚合该日判定门落点 (probe=None 零开销)
+            day_tr = DayTrace() if probe is not None else None
             # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
             sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
                 bars[:i + 1], code,
                 min_streak=min_streak, max_break_gap=max_break_gap,
                 limit_ups=[j for j in lu_all if j < i],
-                stock_info=stock_info)]
+                stock_info=stock_info, probe=day_tr)]
             if not sigs:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info)
                 continue
             sig = sigs[0]
 
             # 去重: 同一连板起点+断板日只取一次 (去重在过滤之前, 对数基线行为)
             key = (sig["streak_start"], sig["break_date"])
             if key in used:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="dedup", sig=sig)
                 continue
             used.add(key)
 
@@ -380,17 +402,29 @@ class BreakStrategy(StrategyBase):
             if use_prefilter:
                 ok, fails = unified_prefilter(bars, i, code, stock_info)
                 if not ok:
+                    if probe is not None:
+                        self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                        stage="prefilter", sig=sig, u_fails=fails)
                     continue
 
             # 入场: 次日(D+1)开盘价
             entry_price = bars[i + 1]["open"]
             if entry_price <= 0:
                 continue
-            result = run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
+            result = _run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
                                            stop_loss, trailing_stop, bt_type)
             if not result:
+                if probe is not None:
+                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
+                                    stage="engine_skip", sig=sig)
                 continue
 
+            if probe is not None:
+                self._probe_day(
+                    probe, day_tr, bars, i, code, stock_info, stage="signal",
+                    sig=sig, extra={"engine": {k: result.get(k) for k in
+                                               ("return_pct", "peak_return_pct",
+                                                "exit_reason", "exit_day")}})
             prev_close = bars[i]["close"]
             trades.append({
                 **sig,
@@ -414,3 +448,109 @@ def _find_limit_ups(bars, bt):
     """涨停日索引 (is_limit_up vs 前收; 第0根无前收跳过)。与 common find_limit_ups 同语义。"""
     from app.market_cn.auto.common.market import find_limit_ups
     return find_limit_ups(bars, bt)
+
+
+# ================================================================
+# 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
+# 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
+# ================================================================
+from app.market_cn.auto.common.exec_cn import (
+    fill_blocked_by_limit_dn,
+    fill_on_gap,
+    is_one_word_limit_dn,
+    limit_dn_price as _limit_dn_price,
+)
+
+
+def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
+                          trailing_stop=-6.0, board_type="main"):
+    """断板专用回测: 追踪止损 + 峰值逃顶信号 (收盘价口径, 与v1的low触及口径不同)。
+
+    现实化 (2026-09-09, 与 test_dragon.py 逐字同步):
+    ① T+1 — 买入当日(d=1)不可卖出;
+    ② 成交价=收盘价 — 原引擎收盘判定却按触发价成交 (触发价高于判定收盘, 不可实现);
+    ③ 跌停 — 一字跌停整日跳过; 收盘触及跌停卖不出 → 顺延次日开盘; 到期顺延。
+    """
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    peak = entry_price
+    exit_p = entry_price
+    exit_d = 0
+    pending_dn = False        # 收盘触跌停卖不出 → 次日开盘强平
+    last_unfilled = False     # 末日一字跌停 → 到期顺延
+
+    # next_open模式: entry_idx=D1, 循环d=1应指向D1
+    if entry_idx < len(bars):
+        d1_init = bars[entry_idx]
+        if d1_init['high'] > peak:
+            peak = d1_init['high']
+
+    for d in range(1, hold_days + 1):
+        idx = entry_idx + d - 1  # d=1 → entry_idx(D1)
+        if idx >= len(bars): break
+        b = bars[idx]
+        if b['high'] > peak: peak = b['high']
+        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
+        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
+
+        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
+        if pending_dn:
+            exit_p, exit_d = b['open'], d
+            break
+
+        # 一字跌停: 全天无成交可能, 持仓顺延
+        if is_one_word_limit_dn(b, dn):
+            last_unfilled = True
+            continue
+        last_unfilled = False
+
+        ret = (b['close'] / entry_price - 1) * 100
+        ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
+
+        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
+        if d > 1:
+            # 止损 (收盘判定 → 收盘价成交)
+            if ret <= stop_loss:
+                if dn is not None and b['close'] <= dn * 1.002:
+                    pending_dn = True   # 收盘封死跌停 → 卖不出
+                    continue
+                exit_p, exit_d = b['close'], d
+                break
+
+            # 追踪止损 (盈利时, 收盘判定 → 收盘价成交)
+            if ret_from_high <= trailing_stop and ret > 0:
+                if dn is not None and b['close'] <= dn * 1.002:
+                    pending_dn = True
+                    continue
+                exit_p, exit_d = b['close'], d
+                break
+
+            # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶 (收盘>+10%不可能贴跌停)
+            if ret > 10:
+                bar_range = b['high'] - b['low']
+                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                if upper > 40 and b['close'] < b['high'] * 0.98:
+                    exit_p, exit_d = b['close'], d
+                    break
+
+        exit_p = b['close']; exit_d = d
+
+    # 末日落入无法卖出状态 → 顺延下一可交易日开盘强平 (连续一字逐日跳过)
+    if last_unfilled or pending_dn:
+        nxt = entry_idx + exit_d + 1
+        while nxt < len(bars):
+            nb = bars[nxt]
+            pc = bars[nxt - 1]['close']
+            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
+            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
+                last_unfilled, pending_dn = True, False
+                nxt += 1
+                continue
+            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
+            break
+
+    return {
+        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
+        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
+    }

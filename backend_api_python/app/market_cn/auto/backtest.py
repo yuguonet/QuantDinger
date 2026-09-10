@@ -8,9 +8,9 @@
 
 设计点:
   - 与实盘同一份 scan_signals (as_of 切片语义), 对数 PASS 后 test_dragon 双同步约定作废;
-  - 编排层无规则: 去重/预过滤锚点/D1过滤/预筛都在各插件 backtest_stock 内,
-    出场引擎 (run_backtest / run_backtest_breakbuy) 与 BOARD_PARAMS 是流水线设施留此,
-    插件 lazy import 调用 (避免顶层环: backtest 顶层会 import 插件常量);
+  - 编排层无规则: 去重/预过滤锚点/D1过滤/预筛/出场模拟都在各插件 backtest_stock 内
+    (2026-09-10 晚裁定: 出场模拟是策略专用规则, 归各策略文件; backtest.py 只留
+    通用引擎 — 枚举分发/统计/时间线引擎, 见 run_all_intraday);
   - 数据走 hub.daily (与 test_dragon.fetch_kline_db 逐字等价: 窗口取数+qfq, 已验证)。
 
 易错点:
@@ -21,258 +21,6 @@
 from __future__ import annotations
 
 import time
-
-from app.market_cn.auto.common.exec_cn import (
-    fill_blocked_by_limit_dn,
-    fill_on_gap,
-    is_one_word_limit_dn,
-    limit_dn_price as _limit_dn_price,
-)
-
-# ================================================================
-# 出场引擎 (2026-09-10 自 core.py 迁入 —— 出场模拟属回测流水线, 不属判定核心)
-# 迁移为逐字搬运, 行为零差异; 350笔回归基线验证见 tmp/。
-# ================================================================
-
-BOARD_PARAMS = {
-    # enhance_filter: 断板增强过滤 (三通道OR, 满足其一即可; 置 False 可整体关闭)
-    #   通道1: 确认日涨跌 [confirm_chg_min, confirm_chg_max)  (企稳)
-    #   通道2: 断板期均量比 >= vol_r_or_min                    (换手充分)
-    #   通道3: 连板前20日涨幅 >= pre20_min                     (前期热度, 大肉股富集)
-    # ma_bull_filter: 均线多头排列过滤 — 已评估: 胜率持平、均收益略增, 作用不大, 默认关闭
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
-             "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
-             "first_break_gap_min": 0, "first_break_chg_min": 0.0},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
-                 "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0, "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
-                 "first_break_gap_min": 0, "first_break_chg_min": 0.0},
-}
-
-
-def run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None):
-    """V1/通用出场模拟 (现实化 2026-09-09, 与 test_dragon.py 逐字同步):
-
-    现实约束: ① T+1 — 买入当日(d=1)不可卖出, 全部出场判定从 d=2 起 (仅更新峰值/估值);
-    ② 跳空穿越 — 触发日开盘低于触发价按开盘价成交;
-    ③ 跌停无法卖出 — 一字跌停整日跳过 (V1 的 D2 开盘清仓若遇一字跌停顺延次日开盘),
-    触发成交触及跌停顺延次日开盘; 到期日一字跌停顺延次日开盘强平。
-    V1 日内动量规则 (D1收盘判定→D2开盘执行) 本就满足 T+1, 判定逻辑未改动。
-    """
-    if entry_price <= 0 or entry_idx >= len(bars):
-        return None
-    limit_threshold = 0.098 if board_type == "main" else 0.198
-    peak = entry_price
-    exit_p = entry_price
-    exit_d = 0
-    pending_dn = False        # 触发成交触及跌停 / 清仓日一字跌停 → 次日开盘强平
-    last_unfilled = False     # 末日一字跌停 → 到期顺延
-
-    # 如果外部未传入 d1_limit_up, 则在回测内计算 (兼容旧调用)
-    # 注意: next_open 模式下 entry_idx=pullback_end+1, d=1 访问的是 D2
-    # 因此推荐由调用方预计算并传入
-    if d1_limit_up is None:
-        d1_limit_up = False
-        if entry_idx + 1 < len(bars):
-            d1_bar = bars[entry_idx + 1]
-            d1_ret = (d1_bar['close'] / entry_price - 1)
-            if d1_ret >= limit_threshold * 0.98:
-                d1_limit_up = True
-
-    # next_open模式: entry_idx=D1(D+1开盘买入)
-    # 循环d=1应指向D1(第一个持仓日), d=2指向D2, 以此类推
-    # 先用D1的high更新peak
-    if entry_idx < len(bars):
-        d1_init = bars[entry_idx]
-        if d1_init['high'] > peak:
-            peak = d1_init['high']
-
-    for d in range(1, hold_days + 1):
-        idx = entry_idx + d - 1  # d=1 → entry_idx(D1), d=2 → entry_idx+1(D2)
-        if idx >= len(bars): break
-        b = bars[idx]
-        if b['high'] > peak: peak = b['high']
-        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
-        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
-
-        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
-        if pending_dn:
-            exit_p, exit_d = b['open'], d
-            break
-
-        # V1出场 (v3): D1日内动量<3% → D2开盘清仓
-        # 日内动量 = D1收盘涨幅 - D1开盘涨幅 (盘中买卖力量指标)
-        #   <0: 盘中出货, D2大概率续跌, 100%捕获D2跌>3%的信号
-        #   >=0: 盘中有买盘承接, 继续持有
-        # 注: -10%止损已移除, 日内动量规则在D2开盘即清仓, 不需要等止损位
-        v1_momentum_exit = False
-        if is_v1 and d == 2:
-            # 日内动量 = D1收盘涨幅 - D1开盘涨幅 = (D1 close - D1 open) / D0 close
-            # d1_change 和 d1_gap 由调用方传入, 也可从bars计算
-            if d1_change is not None and d1_gap is not None:
-                intraday = d1_change - d1_gap
-            else:
-                # fallback: 从bars计算
-                d1_bar = bars[entry_idx]
-                d0_close = bars[entry_idx - 1]['close'] if entry_idx > 0 else entry_price
-                intraday = (d1_bar['close'] - d1_bar['open']) / d0_close * 100 if d0_close > 0 else 0
-            v1_momentum_exit = intraday < 3
-
-        # 一字跌停: 全天无成交可能 (D2开盘清仓同样无法成交 → 顺延次日开盘)
-        if is_one_word_limit_dn(b, dn):
-            pending_dn = v1_momentum_exit
-            last_unfilled = True
-            continue
-        last_unfilled = False
-
-        if v1_momentum_exit:
-            # D2开盘直接清仓, 不等止损位
-            exit_p, exit_d = b['open'], d
-            break
-
-        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
-        if d > 1:
-            # 1 峰值逃顶(优先): 涨>7%后大上影线(>30%)→收盘逃顶
-            if peak_exit:
-                ret = (b['close'] / entry_price - 1) * 100
-                if ret > 7:
-                    bar_range = b['high'] - b['low']
-                    upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-                    if upper > 30 and b['close'] < b['high'] * 0.98:
-                        exit_p, exit_d = b['close'], d
-                        break
-
-            # 2/3 追踪+止损 (合并: 价格连续先穿过更高触发线; 跳空按开盘; 触跌停顺延)
-            trig_t = peak * (1 + trailing_stop / 100)
-            trig_s = entry_price * (1 + stop_loss / 100)
-            trig = max(trig_t, trig_s)
-            if b['low'] <= trig:
-                fill = fill_on_gap(b['open'], trig)
-                if fill_blocked_by_limit_dn(fill, dn):
-                    pending_dn = True   # 成交价触及跌停 → 卖不出
-                    continue
-                exit_p, exit_d = fill, d
-                break
-
-        # 4 兜底: 持仓到期收盘走
-        exit_p = b['close']; exit_d = d
-
-    # 末日落入无法卖出状态 (一字跌停/触发触跌停) → 顺延下一可交易日开盘强平
-    # (连续一字逐日跳过; nxt 指向未成交日的下一日)
-    if last_unfilled or pending_dn:
-        nxt = entry_idx + exit_d + 1
-        while nxt < len(bars):
-            nb = bars[nxt]
-            pc = bars[nxt - 1]['close']
-            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
-            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
-                last_unfilled, pending_dn = True, False
-                nxt += 1
-                continue
-            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
-            break
-
-    result = {
-        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
-        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
-        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
-    }
-    if d1_limit_up:
-        result['d1_limit_up'] = d1_limit_up
-    return result
-
-
-def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
-                          trailing_stop=-6.0, board_type="main"):
-    """断板专用回测: 追踪止损 + 峰值逃顶信号 (收盘价口径, 与v1的low触及口径不同)。
-
-    现实化 (2026-09-09, 与 test_dragon.py 逐字同步):
-    ① T+1 — 买入当日(d=1)不可卖出;
-    ② 成交价=收盘价 — 原引擎收盘判定却按触发价成交 (触发价高于判定收盘, 不可实现);
-    ③ 跌停 — 一字跌停整日跳过; 收盘触及跌停卖不出 → 顺延次日开盘; 到期顺延。
-    """
-    if entry_price <= 0 or entry_idx >= len(bars):
-        return None
-    peak = entry_price
-    exit_p = entry_price
-    exit_d = 0
-    pending_dn = False        # 收盘触跌停卖不出 → 次日开盘强平
-    last_unfilled = False     # 末日一字跌停 → 到期顺延
-
-    # next_open模式: entry_idx=D1, 循环d=1应指向D1
-    if entry_idx < len(bars):
-        d1_init = bars[entry_idx]
-        if d1_init['high'] > peak:
-            peak = d1_init['high']
-
-    for d in range(1, hold_days + 1):
-        idx = entry_idx + d - 1  # d=1 → entry_idx(D1)
-        if idx >= len(bars): break
-        b = bars[idx]
-        if b['high'] > peak: peak = b['high']
-        prev_close = bars[idx - 1]['close'] if idx > 0 else 0
-        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
-
-        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
-        if pending_dn:
-            exit_p, exit_d = b['open'], d
-            break
-
-        # 一字跌停: 全天无成交可能, 持仓顺延
-        if is_one_word_limit_dn(b, dn):
-            last_unfilled = True
-            continue
-        last_unfilled = False
-
-        ret = (b['close'] / entry_price - 1) * 100
-        ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
-
-        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
-        if d > 1:
-            # 止损 (收盘判定 → 收盘价成交)
-            if ret <= stop_loss:
-                if dn is not None and b['close'] <= dn * 1.002:
-                    pending_dn = True   # 收盘封死跌停 → 卖不出
-                    continue
-                exit_p, exit_d = b['close'], d
-                break
-
-            # 追踪止损 (盈利时, 收盘判定 → 收盘价成交)
-            if ret_from_high <= trailing_stop and ret > 0:
-                if dn is not None and b['close'] <= dn * 1.002:
-                    pending_dn = True
-                    continue
-                exit_p, exit_d = b['close'], d
-                break
-
-            # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶 (收盘>+10%不可能贴跌停)
-            if ret > 10:
-                bar_range = b['high'] - b['low']
-                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-                if upper > 40 and b['close'] < b['high'] * 0.98:
-                    exit_p, exit_d = b['close'], d
-                    break
-
-        exit_p = b['close']; exit_d = d
-
-    # 末日落入无法卖出状态 → 顺延下一可交易日开盘强平 (连续一字逐日跳过)
-    if last_unfilled or pending_dn:
-        nxt = entry_idx + exit_d + 1
-        while nxt < len(bars):
-            nb = bars[nxt]
-            pc = bars[nxt - 1]['close']
-            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
-            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
-                last_unfilled, pending_dn = True, False
-                nxt += 1
-                continue
-            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
-            break
-
-    return {
-        'exit_price': round(exit_p, 3), 'exit_day': exit_d,
-        'return_pct': round((exit_p / entry_price - 1) * 100, 2),
-        'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
-    }
 
 
 def is_st_stock(code):
@@ -285,24 +33,34 @@ def is_st_stock(code):
 # ================================================================
 
 def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
-            use_prefilter=True, progress_every=500):
-    """全市场回测 (策略经注册表分发)。
+            use_prefilter=True, progress_every=500, start_date=None, end_date=None,
+            probe=None):
+    """全市场回测 (策略经注册表分发, 按 scan_spec.kind 选路径)。
 
-    strategy: 任意已注册且实现 backtest_stock 钩子的策略 key。
+    strategy: 任意已注册策略 key。
+      - daily_close 类 (dragon/v1/break): 日线枚举快路径 (backtest_stock 钩子)。
+      - intraday_window 类 (tail/knife): 时间线引擎 (1m 快照帧重建, 与实盘同判定路径)。
+    probe: 调试探针 (probe.Probe, None=关闭)。回测只负责验证, 探针数据存档供 AI 分析。
     返回 {"trades": [...], "stats": {...}}; trades 直接可 json.dump 与基线对数。
     """
     from app.market_cn.auto import strategies as strat_reg
-    from app.market_cn.auto.data.hub import all_codes, daily
-    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
     from app.market_cn.auto.strategies.base import StrategyBase
 
     strat_reg.autodiscover()
     strat = strat_reg.get_strategy(strategy)
     if strat is None:
         raise ValueError(f"strategy={strategy} 未注册 (可用: {sorted(strat_reg.all_strategies())})")
+
+    if strat.scan_spec.kind == "intraday_window":
+        return run_all_intraday(strat, days=days, codes=codes,
+                                start_date=start_date, end_date=end_date,
+                                probe=probe)
+
     if type(strat).backtest_stock is StrategyBase.backtest_stock:
-        raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock "
-                         f"(盘中窗口策略走各自验证脚本)")
+        raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock")
+
+    from app.market_cn.auto.data.hub import all_codes, daily
+    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
 
     if codes is None:
         codes = all_codes()
@@ -323,13 +81,167 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         trades.extend(strat.backtest_stock(
             bars, code,
             stock_info=stock_info.get(code) if stock_info else None,
-            use_prefilter=use_prefilter) or [])
+            use_prefilter=use_prefilter, probe=probe) or [])
         n_ok += 1
         if progress_every and k % progress_every == 0:
             print(f"[{k}/{len(codes)}] trades={len(trades)} "
                   f"({time.time() - t0:.0f}s)", flush=True)
     return {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
             "elapsed": round(time.time() - t0, 1)}
+
+
+# ================================================================
+# 时间线引擎 (intraday_window 类: 1m 快照帧重建, 与实盘同判定路径)
+# ================================================================
+
+def _exec_trigger_mis(spec):
+    """ScanSpec → 成交触发槽位列表 (entry_at 终审语义: 只回该时刻)。"""
+    from app.market_cn.auto.data.frames import hhmm_to_pos
+    if spec.entry_at:
+        mi = hhmm_to_pos(spec.entry_at)
+        return [mi] if mi >= 0 else []
+    from app.market_cn.auto.sched import expand_times
+    mis = []
+    for t in expand_times(spec.windows, spec.interval_sec):
+        mi = hhmm_to_pos(t)
+        if mi >= 0 and mi not in mis:
+            mis.append(mi)
+    return sorted(mis)
+
+
+def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None,
+                     progress_every=1, probe=None):
+    """intraday_window 策略全市场回测 (时间线引擎)。
+
+    数据通道混用: 1m 快照帧 (盘中判定+入场价) + 日线 (策略上下文 as-of D-1 / 次日开盘出场),
+    快照通道由 kline_1m 重建 (终审口径, 与 realtime_snapshot 有分钟级微差属已知边界)。
+    触发语义 "bar 开盘触发": 信息截至 p-1 收盘 + bar[p].open 已出现, 入场即 bar[p].open。
+    出场: 次交易日日线开盘价 (与 tail/knife 基线 "D1 开盘卖" 一致)。
+    probe: 调试探针 (None=零开销)。sample 由引擎按 (股,日) 聚合产出 — 每日每股只留
+    最晚触发槽位的评估记录 (数据外壳: stage/rule_trace 来自策略门打点 + ctx 摘要 +
+    以触发价为入场基准的 d1 开盘/收盘标签); shortlist 之外的廉价预筛拒绝不采样。
+    """
+    from app.market_cn.auto.data import frames as fr
+    from app.market_cn.auto.data.hub import daily
+    from app.market_cn.auto.probe import DayTrace as _SlotTrace
+
+    t0 = time.time()
+    all_dates = fr.trading_dates(days_back=days, end=end_date)
+    dates = all_dates
+    first_1m = fr.first_1m_date()
+    if first_1m:
+        dates = [d for d in dates if d >= first_1m]     # 1m 覆盖之前的天直接跳过 (空帧浪费)
+    if start_date:
+        dates = [d for d in dates if d >= str(start_date)[:10]]
+    if not dates:
+        return {"trades": [], "stats": _summary([]), "codes_ok": 0, "elapsed": 0}
+    # 首日 prev_date: 取覆盖起点前一交易日 (2026-09-10 修复: 原首日 prev_date=date →
+    # as_of 含当日日线, 单日复现/窗口首日成未来函数, knife 单日 87笔 vs 窗口同日 52笔口径)
+    _i0 = all_dates.index(dates[0]) if dates[0] in all_dates else -1
+    _first_prev = all_dates[_i0 - 1] if _i0 > 0 else None
+    code_set = set(codes) if codes else None
+    mis = _exec_trigger_mis(strat.scan_spec)
+    if not mis:
+        raise ValueError(f"{strat.key}: scan_spec 无有效成交触发时刻 "
+                         f"(entry_at={strat.scan_spec.entry_at!r} windows={strat.scan_spec.windows})")
+
+    pc_map = fr.prev_closes(dates[0])                   # {code: 前一1m日收盘(qfq)}
+    # ST 过滤与实盘 scan 同口径 (name 含 'ST' 排除, 含 *ST)
+    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
+    try:
+        _si = _hub_stock_info()
+    except Exception:
+        _si = {}
+
+    def _st_ok(code):
+        nm = (_si.get(code) or {}).get("name", "") or ""
+        return "ST" not in nm.upper()
+
+    trades, seen = [], set()
+    dbg = {} if probe is not None else None   # debug: code -> 当日最晚槽位评估记录 (日终统一落盘)
+    for di, date in enumerate(dates):
+        frame = fr.build_frame(date)
+        if len(frame) == 0:
+            continue
+        prev_date = dates[di - 1] if di > 0 else _first_prev
+        if prev_date is None:       # 覆盖起点前再无交易日 → 无日线上下文, 该日无法判定
+            continue
+        n_sig_day = 0
+        for mi in mis:
+            snaps = frame.snaps_at(mi, pc_map, codes=code_set)
+            mkt = frame.mkt_gain(mi, pc_map)
+            short = strat.intraday_shortlist(snaps, mkt) or {}
+            for code, snap in short.items():
+                if (code, date) in seen or not _st_ok(code):
+                    continue                            # 每股每日首信号成交; ST 与实盘同排除
+                bars = daily(code, 300, as_of=prev_date)  # 截至D-1 (插件契约: bars[-1]=昨日)
+                slot_tr = _SlotTrace() if probe is not None else None
+                sigs = strat.scan_signals(
+                    bars, code,
+                    ctx={"latest": snap, "series": frame.series(code, mi),
+                         "mkt_gain": mkt}, probe=slot_tr) or []
+                if probe is not None:
+                    rank = getattr(strat, "PROBE_STAGE_RANK", {})
+                    stage = max((t["stage"] for t in slot_tr.items),
+                                key=lambda s: rank.get(s, 0), default="no_gate")
+                    dbg[code] = {"code": code, "d0_date": date,
+                                 "trigger": frames_hhmm(mi), "stage": stage,
+                                 "rule_trace": slot_tr.items,
+                                 "ctx": {"mkt_gain": round(mkt, 2) if mkt is not None else None,
+                                         "last": round(float(snap.get("last") or 0), 3)},
+                                 "entry0": float(snap.get("last") or 0)}
+                if not sigs:
+                    continue
+                s = sigs[0]
+                seen.add((code, date))
+                entry_price = float(snap["last"])
+                if entry_price <= 0:
+                    continue
+                # 出场: 次交易日日线开盘 (D1 开盘卖)
+                full = daily(code, 300)
+                nxt = next((b for b in full if str(b["time"])[:10] > date), None)
+                if nxt is None or float(nxt["open"]) <= 0:
+                    continue
+                exit_price = float(nxt["open"])
+                trades.append({
+                    "code": code, "signal_date": date, "entry_date": date,
+                    "entry_price": round(entry_price, 3), "buy_mode": "intraday_trigger",
+                    "trigger": strat.scan_spec.entry_at or frames_hhmm(mi),
+                    "exit_date": str(nxt["time"])[:10], "exit_price": round(exit_price, 3),
+                    "exit_day": 1, "exit_reason": "d1_open",
+                    "return_pct": round((exit_price / entry_price - 1) * 100, 2),
+                    **(s.extra or {}),
+                })
+                n_sig_day += 1
+        # debug 样本日终落盘: 以触发价为入场基准, D+1 开盘/收盘为标签 (视野不足不硬凑)
+        if dbg:
+            for code, rec in dbg.items():
+                entry0 = rec.pop("entry0", 0)
+                labels = {}
+                if entry0 > 0:
+                    labels["entry_trigger"] = round(entry0, 3)
+                    full_d = daily(code, 300)
+                    nxt = next((b for b in full_d if str(b["time"])[:10] > date), None)
+                    if nxt is not None and float(nxt["open"]) > 0:
+                        labels["ret_d1o"] = round((float(nxt["open"]) / entry0 - 1) * 100, 2)
+                        labels["ret_d1c"] = round((float(nxt["close"]) / entry0 - 1) * 100, 2)
+                probe.sample(labels=labels, **rec)
+            dbg.clear()
+        # pc_map 结转 (当日 1m 最后一根 close)
+        for code in frame.codes:
+            lc = frame.last_close(code)
+            if lc > 0:
+                pc_map[code] = lc
+        if progress_every and (di + 1) % progress_every == 0:
+            print(f"[{di + 1}/{len(dates)}] {date} shortlist后信号={n_sig_day} "
+                  f"累计={len(trades)} ({time.time() - t0:.0f}s)", flush=True)
+    return {"trades": trades, "stats": _summary(trades), "codes_ok": len(dates),
+            "elapsed": round(time.time() - t0, 1)}
+
+
+def frames_hhmm(mi):
+    from app.market_cn.auto.data.frames import MI_HHMM
+    return MI_HHMM[mi] if 0 <= mi < len(MI_HHMM) else ""
 
 
 def _summary(trades):
@@ -393,11 +305,23 @@ if __name__ == "__main__":
                         help="任意已注册策略 key (dragon/v1/break/...)")
     parser.add_argument("--days", type=int, default=300)
     parser.add_argument("--codes", default="", help="逗号分隔, 空则全市场")
+    parser.add_argument("--start-date", default="", help="窗口起点 (盘中策略精确复现用)")
+    parser.add_argument("--end-date", default="", help="窗口终点 (默认今天)")
     parser.add_argument("--out", default="", help="结果JSON输出路径 (对数用)")
+    parser.add_argument("--probe", default="",
+                        help="开启调试探针并存档 (值=tag; 数据落 tmp/probes/, 供 AI 离线分析)")
     args = parser.parse_args()
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None
-    res = run_all(strategy=args.strategy, days=args.days, codes=codes)
+    probe = None
+    if args.probe:
+        from app.market_cn.auto.probe import Probe
+        probe = Probe(args.strategy, tag=args.probe)
+    res = run_all(strategy=args.strategy, days=args.days, codes=codes,
+                  start_date=args.start_date or None, end_date=args.end_date or None,
+                  probe=probe)
+    if probe is not None:
+        probe.close()
     print("统计:", res["stats"], "| codes_ok:", res["codes_ok"],
           "| 耗时:", res["elapsed"], "s")
     if args.out:
