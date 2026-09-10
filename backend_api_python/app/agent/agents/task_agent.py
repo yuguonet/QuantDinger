@@ -156,6 +156,16 @@ class _LLMAdapter:
     ):
         from smolagents import ChatMessage as SmolChatMessage
 
+        # 非标 role 转换（与 smolagents 官方 get_clean_message_list 的
+        # tool_role_conversions 完全一致）：CodeAgent memory 里的 ActionStep 会产出
+        # role="tool-call"/"tool-response"，OpenAI 协议只认 user/assistant/system/tool，
+        # 直接透传会被远端网关拒 500（本地 llama.cpp 宽容解析所以不报错——
+        # 这就是"本地正常、远端 500"的根因，2026-09-10 实证定位）。
+        _ROLE_CONVERSIONS = {
+            "tool-call": "assistant",
+            "tool-response": "user",
+        }
+
         chat_messages = []
         for m in messages:
             if isinstance(m, dict):
@@ -163,18 +173,56 @@ class _LLMAdapter:
             else:
                 role = getattr(m, "role", "user")
                 content = getattr(m, "content", "")
+            # role 归一化：smolagents 的 role 是 MessageRole 枚举（str 子类），但 str() 产出
+            # "MessageRole.TOOL_CALL" 而非 "tool-call"——必须先取 .value 再查表，
+            # 否则转换永远 miss，非标 role 原样透传（2026-09-10 二次定位）。
+            if not isinstance(role, str):
+                role = getattr(role, "value", str(role))
+            role = _ROLE_CONVERSIONS.get(role, role)
             chat_messages.append(ChatMessage(role=role, content=content))
+
+        # 5xx/连接错误退避重试（有界循环，不递归）：
+        # 旧实现 except 内递归调用 self.generate()，网关持续 5xx 时每次重试失败
+        # 都会再次进入同一 except → 无限递归（2026-09-10 22:09 日志实证）。
+        # 现改为固定次数的退避循环：SDK 内置重试（max_retries，默认 1）负责秒级抖动，
+        # 本循环负责"网关重启中"的分钟级窗口，总尝试 = (LLM_MAX_RETRIES+1) × LLM_RETRY_ROUNDS。
+        import time as _time
+        import os as _os
+
+        def _is_retriable(err: Exception) -> bool:
+            t = str(err).lower()
+            return ("500" in t or "502" in t or "503" in t or "429" in t
+                    or "connection" in t or "timeout" in t)
 
         try:
             client = self._get_sync_client()
             formatted_messages = [m.to_dict() for m in chat_messages]
-            response = client.chat.completions.create(
-                model=self._llm.model,
-                messages=formatted_messages,
-                temperature=self._llm.temperature,
-                max_tokens=self._llm.max_tokens,
-                top_p=self._llm.top_p,
-            )
+            response = None
+            for attempt in range(int(_os.getenv("LLM_RETRY_ROUNDS", "3"))):
+                try:
+                    response = client.chat.completions.create(
+                        model=self._llm.model,
+                        messages=formatted_messages,
+                        temperature=self._llm.temperature,
+                        max_tokens=self._llm.max_tokens,
+                        top_p=self._llm.top_p,
+                    )
+                    break  # 成功即退出重试循环
+                except KeyboardInterrupt:
+                    raise
+                except Exception as retry_err:
+                    rounds_left = int(_os.getenv("LLM_RETRY_ROUNDS", "3")) - attempt - 1
+                    if rounds_left <= 0 or not _is_retriable(retry_err):
+                        raise
+                    # 指数退避：2s → 4s → 8s（封顶 15s）
+                    delay = min(2.0 * (2 ** attempt), 15.0)
+                    logger.warning(
+                        "[TaskAgent] LLM 网关抖动（%s），%.0fs 后第 %d 次重试（剩 %d 轮）",
+                        str(retry_err)[:120], delay, attempt + 1, rounds_left,
+                    )
+                    _time.sleep(delay)
+            if response is None:
+                raise RuntimeError("LLM 调用失败：重试轮次耗尽且无响应")
             choice = response.choices[0]
             content = choice.message.content or ""
             finish_reason = choice.finish_reason or "stop"
@@ -207,24 +255,7 @@ class _LLMAdapter:
             logger.warning("[LLMAdapter] LLM 调用被中断")
             raise
         except Exception as e:
-            # 远端网关 5xx / 连接抖动兜底重试：SDK max_retries 用尽后仍抛出时，
-            # 等待一小段再试一次（覆盖"网关重启中"的秒级窗口）。本地 llama 失败
-            # 多为终态错误，同样适用（多等一次代价小）。
-            error_text = str(e)
-            retriable = "500" in error_text or "502" in error_text or "503" in error_text or "connection" in error_text.lower()
-            if retriable:
-                import time as _time
-                delay = 2.0
-                logger.warning("[TaskAgent] LLM 网关抖动（%s），%.0fs 后重试一次", error_text[:120], delay)
-                _time.sleep(delay)
-                try:
-                    return self.generate(messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e2:
-                    logger.error("[TaskAgent] LLM 重试仍失败: %s", e2)
-                    raise
-            logger.error("[TaskAgent] LLM 调用失败: %s", e)
+            logger.error("[TaskAgent] LLM 调用失败（重试已耗尽）: %s", e)
             raise
 
         if resp.finish_reason == "error":

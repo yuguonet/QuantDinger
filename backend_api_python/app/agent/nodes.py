@@ -674,11 +674,11 @@ def make_execute_node(ctx: NodeContext):
         agent_instance = ctx.agent
         if not agent_instance:
             logger.error("[Execute] ctx.agent 未设置")
-            return {"result_raw": "[错误] agent 未初始化", "hit_max_steps": True}
+            return {"result_raw": "[run_error] agent 未初始化", "hit_max_steps": True, "_run_error": "agent not initialized"}
 
         task = state.get("task", "")
         if not task:
-            return {"result_raw": "[错误] 无任务描述", "hit_max_steps": False}
+            return {"result_raw": "[run_error] 无任务描述", "hit_max_steps": False, "_run_error": "empty task"}
 
         step_budget = state.get("step_budget", 10)
         planning_interval = state.get("planning_interval", 6)
@@ -764,12 +764,14 @@ def make_execute_node(ctx: NodeContext):
         try:
             result = agent.run(full_task)
             if _interrupted:
-                result = "[中断] 用户中断"
+                result = "[run_error] 用户中断"
+                run_error = RuntimeError("user interrupted")
                 logger.warning("[Execute] 被用户中断")
             result = str(result) if result else ""
         except KeyboardInterrupt:
             logger.warning("[Execute] 被用户中断")
-            result = "[中断] 用户中断"
+            result = "[run_error] 用户中断"
+            run_error = RuntimeError("user interrupted (KeyboardInterrupt)")
         except Exception as e:
             logger.error("[Execute] 执行异常: %s", e)
             # 机器可读错误标记：finalize_node 据此判定本次 run 失败，
@@ -876,7 +878,13 @@ def make_finalize_node(ctx: NodeContext):
         # 不作为"成功分析"进入 qd_traces 提取/回测统计——否则一次网关故障会造出一条
         # direction="neutral"、confidence=0.5 的伪决策记录参与权重训练（root_id=1737 事故）。
         # 直接回答（chat）路径无 result_raw，不算失败。
-        run_failed = bool(state.get("_run_error")) and bool(state.get("result_raw"))
+        # 双通道判定：_run_error 显式标记 + 错误前缀兜底（防未来新分支漏标）。
+        _RUN_ERROR_PREFIXES = ("[run_error]", "[错误]", "[max_steps 耗尽]")
+        result_text = state.get("result_raw", "") or ""
+        run_failed = (
+            (bool(state.get("_run_error")) and bool(result_text))
+            or (result_text.startswith(_RUN_ERROR_PREFIXES) and not direct_answer)
+        )
         failed_tools = state.get("_failed_tools", [])
         agent_plan = state.get("_agent_plan", "")
         selected_skill = state.get("selected_skill", "")
@@ -903,7 +911,7 @@ def make_finalize_node(ctx: NodeContext):
 
         # ── 5. 结果格式化（仅 task 模式 + 有工具产出时）──
         needs_task = state.get("needs_task", True)
-        has_tool_output = bool(state.get("result_raw"))  # execute_node 产出过结果
+        has_tool_output = bool(state.get("result_raw")) and not run_failed  # 错误结果不需要 LLM 格式化
         if needs_task and has_tool_output and not selected_skill:
             try:
                 from formatters.base import get_formatter
