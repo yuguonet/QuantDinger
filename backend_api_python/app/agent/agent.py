@@ -308,11 +308,10 @@ def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> 
             resp = loop.run_until_complete(coro)
         return resp.content or ""
     finally:
-        # 关闭 LLM 底层 httpx 客户端，避免 "Event loop is closed" 警告
-        try:
-            loop.run_until_complete(agent.llm.close())
-        except Exception:
-            pass
+        # 不再 close 共享 LLM 客户端（审计 P0-3）：全局唯一 OpenAILLM 的 AsyncOpenAI
+        # 客户端绑定创建它的 event loop，任务级 close/复用会造成跨 loop 竞态与并发误杀。
+        # 连接池随进程存活，进程退出由 OS 回收；v1.3 记录的 "Event loop is closed"
+        # 其根源正是跨 loop 复用 + 任务级 close 的组合，close 只会加重而非解决。
         loop.close()
 
 

@@ -119,6 +119,30 @@ def _get_actual_return(
 # 评估执行
 # ═══════════════════════════════════════════════════════════════
 
+def _bump_eval_failure(root_id: int):
+    """累计单条记录的评估失败次数（写 qd_traces.error，'eval_failed:N' 前缀）。
+
+    毒丸治理配套（审计 P0-1 断点C）：取不到行情的记录（退市/停牌/代码错误）此前
+    会被静默跳过并永久占用评估队列。失败次数 >= 5 时由 store 侧置 unverifiable。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE qd_traces
+                SET error = 'eval_failed:' || (
+                    COALESCE(
+                        (regexp_match(COALESCE(error, ''), '^eval_failed:(\\d+)'))[1]::int, 0
+                    ) + 1
+                )
+                WHERE id = %s AND parent_id IS NULL AND exit_date IS NULL
+            """, (root_id,))
+            conn.commit()
+    except Exception as e:
+        logger.debug("[Evaluator] 失败计数写入失败 root_id=%s: %s", root_id, e)
+
+
 def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     """评估所有待验证的决策记录。
 
@@ -147,6 +171,10 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             hold_days = _get_hold_days(timeframe)
             actual = _get_actual_return(stock_code, exec_date, hold_days, market)
             if not actual:
+                # 失败计数累计到 error 列（'eval_failed:N' 前缀），供
+                # store.query_pending_verify 在 >=5 次后将记录置 unverifiable 出队。
+                # 不写 exit_date（未来 K 线补齐后仍可回补验证）。
+                _bump_eval_failure(root_id)
                 continue
 
             # 方向映射
@@ -185,9 +213,10 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             # 写入 skill 子节点验证结果
             store.update_skill_verify(root_id, actual_dir)
 
-            # 更新编排路径缓存
-            store.update_path_cache(root_id)
-
+            # 注：原此处调用 store.update_path_cache(root_id)，但 chain/store.py 中
+            # 并不存在该函数（疑似旧版遗留接口），导致每条评估在收尾时抛 AttributeError，
+            # evaluated 恒为 0、自动权重更新永不触发（审计 P0-1 断点A）。已移除，
+            # 待真正实现编排路径缓存时再回加。
             stats["evaluated"] += 1
             stats["details"].append({
                 "root_id": root_id, "stock": stock_code,

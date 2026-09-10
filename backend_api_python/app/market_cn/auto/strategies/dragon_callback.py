@@ -92,7 +92,161 @@ from app.market_cn.auto.common.exec_cn import (
     limit_dn_price as _limit_dn_price,
 )
 from app.market_cn.auto.probe import DayTrace as _DayTrace, \
-    sample_feats as _dragon_sample_feats   # 探针框架件 (无环; 特征/标签上收共用)
+    sample_feats as _probe_sample_feats   # 探针框架件 (无环; 只提供通用特征/标签)
+
+
+# ================================================================
+# 调试通道 (2026-09-10 用户裁定: 调龙回头只改本文件, 框架层 probe.py 零改动)
+# ----------------------------------------------------------------
+# 规则:
+#   - 仅 debug 模式 (probe 非 None) 才计算并写入 sample.labels; 判定与实盘路径
+#     绝不读取本段任何内容 (改这里不影响任何一笔交易)。
+#   - 改口径只改本段; **归档键名保持稳定** (离线脚本/存档按键名读取)。
+# 标签三组:
+#   1) 固定持有 N 日       ret_d{N}c / peak{N} / mae{N} / peak_day
+#   2) 峰值回撤出场(多档)  ret_tr{t} / peak_tr{t} / mae_tr{t} / day_tr{t} /
+#                          rsn_tr{t} / cap_tr{t}
+#   3) 波次视角            wave_amp (整波涨幅) / entry_lag (入场推后天数)
+# ================================================================
+DEBUG_HOLD_DAYS = 7            # 固定持有交易日数
+DEBUG_TRAILS = (4, 6, 8, 12)   # 峰值回撤阈值序列 (一次回测扫多档 = 阈值敏感性前置)
+DEBUG_MAX_HOLD = 10            # 无波次窗口时的最大持有交易日
+DEBUG_WAVE_DAYS = 20           # 波次窗口长度 (自"第一条规则通过日"起)
+
+
+def _fixed_hold_labels(bars, i, entry, days=DEBUG_HOLD_DAYS):
+    """固定持有 days 日标签: 第 days 日收盘无条件卖出 (排除出场引擎差异)。
+
+    用途: 规则归因 — 用**同一条**出场规则衡量各入场规则的贡献。
+    口径: 入场=D+1 开盘; peak/mae 取持有段(含入场日)极值相对入场价%;
+    视野不足 (i+days 越界) → ret 记 None (=censored), peak/mae 仍记。
+    """
+    n = len(bars)
+    out = {}
+    if not entry or entry <= 0 or i + 1 >= n:
+        return out
+    last = min(i + days, n - 1)
+    highs = [float(bars[k]["high"]) for k in range(i + 1, last + 1)]
+    lows = [float(bars[k]["low"]) for k in range(i + 1, last + 1)]
+    if highs:
+        out[f"peak{days}"] = round((max(highs) / entry - 1) * 100, 2)
+        out["peak_day"] = int(highs.index(max(highs)) + 1)     # 第几个持有日见顶(1-based)
+        out[f"mae{days}"] = round((min(lows) / entry - 1) * 100, 2)
+    if i + days < n:                       # 完整视野才给出场收益 (否则 censored)
+        out[f"ret_d{days}c"] = round((float(bars[i + days]["close"]) / entry - 1) * 100, 2)
+    return out
+
+
+def _trail_exit_labels(bars, i, entry, trail_pct, max_days=DEBUG_MAX_HOLD,
+                       wave_start=None, wave_days=DEBUG_WAVE_DAYS):
+    """峰值回撤出场标签 (路径依赖, 衡量"这笔行情给出多少可捕获空间")。
+
+    为什么需要它: 固定持有 N 日衡量的是"第 N 日收盘的随机点位", 与入场质量关系弱
+    (好行情可能因第 N 日恰好回调而记亏)。峰值回撤出场是**可操作**的固定规则 (追踪
+    止盈): 涨越高、回撤触发越晚 → 捕获越多; 低峰值票在 peak≈entry 处就被小幅回撤
+    扫出 → 天然滤掉"没肉"的票, 一路阴跌则跌满阈值出局 (自带止损)。
+
+    口径: 入场=D+1 开盘 (entry); 从 D+1 起逐日 peak=max(peak, high_k),
+      当 close_k <= peak*(1-trail_pct/100) → 当日收盘出场 (rsn=trail);
+      始终未触发 → 窗口终点收盘出场 (rsn=expire)。
+
+    wave_start (波次窗口口径, 2026-09-10 用户裁定): "第一条规则(找龙)"通过日的 bar
+      索引; 给定时窗口终点 = wave_start + wave_days - 1 (默认 20 交易日), 而非
+      i + max_days — 原点固定在行情起点, 让龙头股 (常见 50%+ 涨幅) 有充分时间展开;
+      **峰值仍从入场日 i+1 起追踪** (入场前涨幅买不到, 不能算进可捕获空间)。
+      推论: 买入日被推后越久 → 剩余窗口越短、入场价越高 → 可捕获空间越小 → 自然淘汰;
+      入场日已超出窗口终点 → rsn=late, ret 记 None。
+    """
+    n = len(bars)
+    sf = f"{trail_pct:g}"
+    out = {}
+    if not entry or entry <= 0 or i + 1 >= n:
+        return out
+    wnd_end = (int(wave_start) + int(wave_days) - 1) if wave_start is not None \
+        else i + max_days
+    if i + 1 > wnd_end:                 # 入场日已超出波次窗口 (信号推后太多) → 淘汰
+        out[f"rsn_tr{sf}"] = "late"
+        return out
+    last = min(wnd_end, n - 1)
+    complete = wnd_end <= n - 1         # 窗口完整可见才给出场收益 (否则 censored)
+    k = trail_pct / 100.0
+    peak = mae_px = 0.0
+    exit_day = exit_px = None
+    reason = None
+    for j in range(i + 1, last + 1):
+        h = float(bars[j]["high"] or 0)
+        lo = float(bars[j]["low"] or 0)
+        c = float(bars[j]["close"] or 0)
+        if h > 0:
+            peak = h if peak == 0 else max(peak, h)
+        if lo > 0:
+            mae_px = lo if mae_px == 0 else min(mae_px, lo)
+        if peak > 0 and c > 0 and c <= peak * (1.0 - k):
+            exit_day, exit_px, reason = j - i, c, "trail"
+            break
+    if exit_day is None and complete:
+        exit_day = last - i
+        exit_px = float(bars[last]["close"] or 0)
+        reason = "expire"
+    if peak > 0:
+        out[f"peak_tr{sf}"] = round((peak / entry - 1) * 100, 2)
+    if mae_px > 0:
+        out[f"mae_tr{sf}"] = round((mae_px / entry - 1) * 100, 2)
+    if exit_day is not None and exit_px > 0:
+        ret = round((exit_px / entry - 1) * 100, 2)
+        out[f"ret_tr{sf}"] = ret
+        out[f"day_tr{sf}"] = int(exit_day)
+        out[f"rsn_tr{sf}"] = reason
+        if peak > 0:
+            pk = (peak / entry - 1) * 100
+            out[f"cap_tr{sf}"] = round(ret / pk, 2) if pk > 0.5 else None
+    return out
+
+
+def _wave_labels(bars, i, wave_start, wave_days=DEBUG_WAVE_DAYS):
+    """波次视角标签: 整波涨幅 (行情起点收盘 → 窗口内最高) + 入场推后天数。
+
+    用途: 区分"票本身没肉"与"买晚了 / 出场没兑现" — wave_amp 大但 peak_tr 小 =
+    行情有肉却没吃到 (出场问题或入场过晚)。
+    """
+    out = {}
+    n = len(bars)
+    if wave_start is None:
+        return out
+    ws = int(wave_start)
+    if not 0 <= ws < n:
+        return out
+    wend = min(ws + int(wave_days) - 1, n - 1)
+    base = float(bars[ws]["close"] or 0)
+    wmax = max((float(bars[k]["high"] or 0) for k in range(ws, wend + 1)), default=0)
+    if base > 0 and wmax > 0:
+        out["wave_amp"] = round((wmax / base - 1) * 100, 2)
+    out["entry_lag"] = int(i) - ws      # 入场决策日相对波次起点的推后天数
+    return out
+
+
+def _dragon_debug_labels(bars, i, entry, wave_start=None):
+    """本策略调试标签全集 (固定持有 + 多档峰值回撤 + 波次视角)。"""
+    out = {}
+    if not entry or entry <= 0:
+        return out
+    if DEBUG_HOLD_DAYS:
+        out.update(_fixed_hold_labels(bars, i, entry, days=DEBUG_HOLD_DAYS))
+    for t in DEBUG_TRAILS:
+        out.update(_trail_exit_labels(bars, i, entry, trail_pct=t,
+                                      wave_start=wave_start))
+    out.update(_wave_labels(bars, i, wave_start))
+    return out
+
+
+def _dragon_sample_feats(bars, i, code, stock_info=None, wave_start=None):
+    """框架通用特征/标签 + 本策略调试标签 (仅 probe 调用; 判定路径不读)。"""
+    base = _probe_sample_feats(bars, i, code, stock_info=stock_info)
+    labels = base.get("labels") or {}
+    if labels.get("entry_d1o"):
+        labels.update(_dragon_debug_labels(bars, i, labels["entry_d1o"], wave_start))
+    base["labels"] = labels
+    return base
 
 
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
@@ -542,6 +696,10 @@ class DragonCallbackStrategy(StrategyBase):
         gap_max = self.default_params["gap_max"]
         trades = []
         used_ranges = []
+        # 波次起点 (波次窗口口径, 2026-09-10 用户裁定): 最近一次"第一条规则(找龙)未通过"
+        # 的次日 = 本波行情起点; 供探针标签用 (判定路径不读)。廉价预筛跳过日与
+        # stage=dragon/no_candidate 都算"找龙未通过" → 波次断点。
+        wave_start = 0
 
         for i in range(2, n - 1):
             # 廉价预筛 (数学必要条件超集, 非加规则 — 行为零差异): scan_signals 必过
@@ -551,6 +709,7 @@ class DragonCallbackStrategy(StrategyBase):
             d0c = bars[i]["close"]
             if not any(gap_min <= i - j <= gap_max and d0c < bars[j]["close"]
                        for j in lu_all):
+                wave_start = i + 1      # 该日不可能出信号 (找龙未通过) → 波次断点
                 continue
 
             # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
@@ -568,7 +727,9 @@ class DragonCallbackStrategy(StrategyBase):
                     probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
                                  stage=stage, rule_trace=day_tr.items,
                                  **_dragon_sample_feats(bars, i, code,
-                                                        stock_info=stock_info))
+                                                        stock_info=stock_info, wave_start=wave_start))
+                    if stage in ("dragon", "no_candidate"):
+                        wave_start = i + 1      # 找龙未通过 → 波次断点
                 continue
             sig = sigs[0]
             lu_idx = _find_bar_idx(bars, sig["lu_date"])
@@ -584,7 +745,7 @@ class DragonCallbackStrategy(StrategyBase):
                     probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
                                  stage="dedup", rule_trace=day_tr.items, sig=sig,
                                  **_dragon_sample_feats(bars, i, code,
-                                                        stock_info=stock_info))
+                                                        stock_info=stock_info, wave_start=wave_start))
                 continue
             used_ranges.append((lu_idx, i))
 
@@ -597,7 +758,7 @@ class DragonCallbackStrategy(StrategyBase):
                                      stage="prefilter", rule_trace=day_tr.items,
                                      sig=sig, u_fails=list(fails),
                                      **_dragon_sample_feats(bars, i, code,
-                                                            stock_info=stock_info))
+                                                            stock_info=stock_info, wave_start=wave_start))
                     continue
 
             # 入场: 次日(D+1)开盘价
@@ -616,7 +777,7 @@ class DragonCallbackStrategy(StrategyBase):
                     probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
                                  stage="engine_skip", rule_trace=day_tr.items,
                                  sig=sig, **_dragon_sample_feats(bars, i, code,
-                                                                 stock_info=stock_info))
+                                                                 stock_info=stock_info, wave_start=wave_start))
                 continue
 
             if probe is not None:
@@ -626,7 +787,7 @@ class DragonCallbackStrategy(StrategyBase):
                                      ("return_pct", "peak_return_pct",
                                       "exit_reason", "exit_day")},
                              **_dragon_sample_feats(bars, i, code,
-                                                    stock_info=stock_info))
+                                                    stock_info=stock_info, wave_start=wave_start))
 
             trades.append({
                 **sig,

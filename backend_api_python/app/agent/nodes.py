@@ -15,7 +15,9 @@ nodes.py — Graph 节点定义
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, TypedDict
@@ -84,6 +86,11 @@ class AgentState(TypedDict, total=False):
 #  Context — 非序列化运行时对象（不进 checkpoint）
 # ═══════════════════════════════════════════════════════════════
 
+# 进程级 ToolProvider 缓存：tools/ 目录运行期不变，扫描一次全程复用（含全局 set_default）。
+# 注：单进程假设——多 worker 模式（GUNICORN_WORKERS>1）下各进程各自扫描，互不共享。
+_SHARED_TOOL_PROVIDER = None
+
+
 class NodeContext:
     """节点共享的运行时对象。
 
@@ -121,25 +128,29 @@ class NodeContext:
         self.collectors: Dict[str, Any] = {}
 
     def init_tools(self):
-        """初始化 ToolProvider（扫描 tools/ 目录）+ LLM 适配器。"""
+        """初始化 ToolProvider（扫描 tools/ 目录）+ LLM 适配器。
+
+        扫描结果进程内缓存：tools/ 目录内容在运行期不变，每次请求重扫纯属浪费
+        （且扫描会 import 全部工具模块，冷路径可达数秒）。进程首扫后直接复用。
+        """
         from tools.base import ToolProvider
         from agents.task_agent import _LLMAdapter
         from pathlib import Path
 
-        tools_dir = Path(__file__).resolve().parent / "tools"
-        provider = ToolProvider()
-        # 扫描 tools/ 根目录（通用工具）
-        provider.scan_directory(tools_dir, domain="common", package_prefix="tools")
-        # 扫描 tools/ 子目录（领域工具）
-        provider.scan_subdirectories(tools_dir, package_prefix="tools")
+        global _SHARED_TOOL_PROVIDER
+        if _SHARED_TOOL_PROVIDER is None:
+            tools_dir = Path(__file__).resolve().parent / "tools"
+            provider = ToolProvider()
+            # 扫描 tools/ 根目录（通用工具）
+            provider.scan_directory(tools_dir, domain="common", package_prefix="tools")
+            # 扫描 tools/ 子目录（领域工具）
+            provider.scan_subdirectories(tools_dir, package_prefix="tools")
+            _SHARED_TOOL_PROVIDER = provider
+            ToolProvider.set_default(provider)  # 全局默认 provider 只在首扫时设置一次
+            logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
 
-        self.tool_provider = provider
+        self.tool_provider = _SHARED_TOOL_PROVIDER
         self.model = _LLMAdapter(self.llm)
-
-        # 设置全局默认 provider，供工具内部调用
-        ToolProvider.set_default(provider)
-
-        logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -185,10 +196,12 @@ def _record_tool_calls_to_trace(trace, agent):
 
             tool_name = ""
             tool_args = {}
-            if hasattr(step, 'tool_calls') and step.tool_calls:
+            if getattr(step, 'tool_calls', None):
+                # smolagents 的 ToolCall 是 dataclass(name, arguments)，没有 .function 属性；
+                # 旧代码 fallback 到 tc.function.get('name') 会读出空字符串（审计 P2）。
                 tc = step.tool_calls[0]
-                tool_name = getattr(tc, 'name', '') or getattr(tc, 'function', {}).get('name', '')
-                raw_args = getattr(tc, 'arguments', None) or getattr(tc, 'function', {}).get('arguments', {})
+                tool_name = getattr(tc, 'name', '') or ""
+                raw_args = getattr(tc, 'arguments', None)
                 if isinstance(raw_args, str):
                     try:
                         tool_args = json.loads(raw_args)
@@ -196,7 +209,7 @@ def _record_tool_calls_to_trace(trace, agent):
                         tool_args = {}
                 elif isinstance(raw_args, dict):
                     tool_args = raw_args
-            elif hasattr(step, 'tool_name') and step.tool_name:
+            elif getattr(step, 'tool_name', None):
                 tool_name = step.tool_name
                 raw_args = getattr(step, 'tool_arguments', None) or {}
                 if isinstance(raw_args, dict):
@@ -205,6 +218,8 @@ def _record_tool_calls_to_trace(trace, agent):
             if not tool_name:
                 continue
 
+            # 在 _truncate_observations（保留近 2 步，其余截到 200 字符）破坏前提取完整观察；
+            # 旧实现在 finalize 时才读，trace 里只剩二手截断文本（审计文档漂移）。
             observations = str(getattr(step, 'observations', '') or '')
             elapsed_ms = 0.0
             if hasattr(step, 'start_time') and hasattr(step, 'end_time'):
@@ -260,31 +275,55 @@ def _record_tool_calls_to_trace(trace, agent):
         logger.debug("[Execute] trace.add_tool_call 提取失败: %s", e)
 
 
+# 工具失败标记：工具返回 dict 带 error 键时由 _extract_failed_tools 识别。
+# 旧版依赖 observations 中 "'_failed_tool': 'xxx'" 标记，但全后端无任何代码生产该
+# 标记（无生产者的消费者），失败工具检测恒空（审计 P1-4）。现以 error 键为准，
+# _failed_tool 正则保留兼容历史数据。
+_FAILED_TOOL_KEYS = ("error", "err_msg", "error_msg", "_failed_tool")
+
+
 def _extract_failed_tools(agent, tool_provider=None) -> list:
     """从 agent memory 中提取失败工具。
 
-    工具返回含 error 的 dict 时，observations 中会标记失败。
-    这里从 observations 中提取失败工具名。
+    判定通道：
+      1. smolagents ToolCall 的目标工具名 + observations 含 'error' 关键结构；
+      2. observations 中工具返回 dict 的 error 类键值（error/err_msg/...）；
+      3. 历史 _failed_tool 标记（兼容）。
     """
     failed = []
     seen = set()
+
+    def _add(name, obs):
+        if not name or name in seen:
+            return
+        seen.add(name)
+        desc = ""
+        if tool_provider:
+            func = tool_provider.get(name)
+            if func:
+                desc = (inspect.getdoc(func) or "").split("\n")[0][:60]
+        failed.append((name, desc))
+
     try:
         from smolagents.memory import ActionStep
         for step in getattr(agent.memory, 'steps', []):
             if not isinstance(step, ActionStep):
                 continue
             obs = str(getattr(step, 'observations', '') or '')
-            # 从 observation 中提取 _failed_tool 字段值
-            for m in re.finditer(r"'_failed_tool'\s*:\s*'(\w+)'", obs):
-                name = m.group(1)
-                if name and name not in seen:
-                    seen.add(name)
-                    desc = ""
-                    if tool_provider:
-                        func = tool_provider.get(name)
-                        if func:
-                            desc = (inspect.getdoc(func) or "").split("\n")[0][:60]
-                    failed.append((name, desc))
+            if not obs:
+                continue
+
+            # 通道 2/3：error 键值 或 _failed_tool 标记（值即工具名）
+            for m in re.finditer(r"'(?:error|err_msg|error_msg|_failed_tool)'\s*:\s*'([^']+)'", obs):
+                val = m.group(1)
+                # 值像工具名（标识符）→ 直接视为失败工具名；否则尝试从工具调用记录反查
+                if re.fullmatch(r'[a-zA-Z_]\w{2,40}', val):
+                    _add(val, obs)
+
+            # 通道 1：本步有工具调用且 observation 报错 → 记录该工具
+            if re.search(r"'error'\s*:", obs) or 'Error' in obs:
+                for tc in getattr(step, 'tool_calls', None) or []:
+                    _add(getattr(tc, 'name', '') or '', obs)
     except Exception:
         pass
     return failed
@@ -314,14 +353,22 @@ def make_chat_node(ctx: NodeContext):
         if use_rag and ctx.retriever:
             try:
                 docs = await ctx.retriever.retrieve(user_input)
-                # 过滤低相关度文档（避免噪音污染任务）
-                RAG_SCORE_THRESHOLD = 0.7
-                docs = [d for d in docs if d.get("score", 0) >= RAG_SCORE_THRESHOLD]
+                # 过滤低相关度文档（避免噪音污染任务）。
+                # 分数尺度按来源分流：启用 Reranker 时输出 rerank_score∈[0,1] 用绝对阈值；
+                # 未启用时输出 RRF 融合分（weight/(rrf_k+rank)，上限≈0.016），绝对阈值不可用，
+                # 改为只保留 RRF 排名前 N 条（top_k 已由检索器按排名截断，这里防御性二次截断）。
+                # 背景：旧实现统一用 0.7 阈值，RRF 尺度下过滤掉全部文档，RAG 静默失效（审计 P0-2）。
+                rerank_used = any(d.get("rerank_score") is not None for d in docs)
+                if rerank_used:
+                    RAG_SCORE_THRESHOLD = 0.7
+                    docs = [d for d in docs if (d.get("rerank_score") or 0) >= RAG_SCORE_THRESHOLD]
+                else:
+                    docs = docs[: max(1, int(os.getenv("RAG_TOP_K", "5")))]
                 if docs:
                     from rag.retriever import Retriever
                     context = Retriever.format_context(docs)
                     sources = [{"content": d["content"][:200], "score": d.get("score", 0)} for d in docs]
-                    logger.info("[Chat] RAG 检索到 %d 条文档（相关度>=%.2f）, %d 字符", len(docs), RAG_SCORE_THRESHOLD, len(context))
+                    logger.info("[Chat] RAG 检索到 %d 条文档（rerank=%s）, %d 字符", len(docs), rerank_used, len(context))
             except Exception as e:
                 logger.warning("[Chat] RAG 检索失败: %s", e)
 
@@ -398,6 +445,8 @@ def make_chat_node(ctx: NodeContext):
             if "chat" in intent and "task" not in intent:
                 needs_task = False
                 logger.info("[Chat] 意图分类: chat（直接回答）")
+                if trace:
+                    trace.set_intent(verb="chat")
             else:
                 needs_task = True
                 # 提取 task_type
@@ -409,6 +458,8 @@ def make_chat_node(ctx: NodeContext):
                 if not task_type:
                     task_type = "general"
                 logger.info("[Chat] 意图分类: task, 子类型=%s", task_type)
+                if trace:
+                    trace.set_intent(verb=task_type or "general")
         except Exception as e:
             logger.warning("[Chat] 意图分类失败，默认走任务流程: %s", e)
             needs_task = True
@@ -421,6 +472,8 @@ def make_chat_node(ctx: NodeContext):
                 cron_result = TaskAgent._try_intercept_cron(user_input, session_id)
                 if cron_result is not None:
                     logger.info("[Chat] Cron 意图拦截成功: %s", cron_result.content[:80])
+                    if trace:
+                        trace.set_intent(verb="cron")
                     return {
                         "needs_task": False,
                         "task_type": "cron",
@@ -549,11 +602,12 @@ def make_plan_node(ctx: NodeContext):
         if history_text:
             history_context_str = f"【历史对话】\n{history_text}"
 
-        # 传递给 _plan() 的 agent 实例
-        ctx.agent._plan_entity_info = entity_info_str
-        ctx.agent._plan_task_type_info = task_type_str
-        ctx.agent._plan_rag_context = rag_context_str
-        ctx.agent._plan_history_context = history_context_str
+        # plan 上下文挂本次请求的 ctx（并发安全）：
+        # 旧实现写在共享 TaskAgent 单例的实例属性上，多 worker 并发时会话间互相覆盖（审计 P1-7）。
+        ctx._plan_entity_info = entity_info_str
+        ctx._plan_task_type_info = task_type_str
+        ctx._plan_rag_context = rag_context_str
+        ctx._plan_history_context = history_context_str
 
         # 组装 plan 输入（保留拼接版本作为 task 的基础）
         plan_parts = [effective_input]
@@ -572,7 +626,7 @@ def make_plan_node(ctx: NodeContext):
         plan_input = "\n\n".join(plan_parts)
 
         # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
-        plan = await ctx.agent._plan(plan_input, ctx.llm, trace)
+        plan = await ctx.agent._plan(plan_input, ctx.llm, trace, plan_ctx=ctx)
 
         # ── 渐进式加载：plan 选中技能后，加载 SKILL.md body + 工具 ──
         selected_skill = plan.get("selected_skill")
@@ -696,6 +750,7 @@ def make_execute_node(ctx: NodeContext):
         import signal as _signal
         import threading as _threading
         hit_max_steps = False
+        run_error = None
         _interrupted = False
         _is_main_thread = _threading.current_thread() is _threading.main_thread()
 
@@ -716,20 +771,47 @@ def make_execute_node(ctx: NodeContext):
             logger.warning("[Execute] 被用户中断")
             result = "[中断] 用户中断"
         except Exception as e:
-            error_str = str(e).lower()
-            if "max_steps" in error_str or "maximum" in error_str:
-                logger.info("[Execute] max_steps 耗尽，需复盘")
-                hit_max_steps = True
-                result = f"[max_steps 耗尽] {e}"
-            else:
-                logger.error("[Execute] 执行异常: %s", e)
-                result = f"[错误] {e}"
+            logger.error("[Execute] 执行异常: %s", e)
+            # 机器可读错误标记：finalize_node 据此判定本次 run 失败，
+            # trace 不再作为"成功分析"落库（否则污染 score/direction 统计，见 root_id=1737 事故）。
+            result = f"[run_error] {e}"
+            run_error = e
         finally:
             if _is_main_thread:
                 _signal.signal(_signal.SIGINT, old_handler)
 
+        # smolagents>=1.27 到达 max_steps 不再抛异常：_handle_max_steps_reached()
+        # 会强制生成 final answer 正常返回，仅在 memory 最后一步标记 AgentMaxStepsError。
+        # 旧实现靠捕获异常字符串 "max_steps"/"maximum" 判定，在该版本下永不触发，
+        # 复盘循环（hit_max_steps → plan 重规划）因此成为死代码（审计 P1-1）。
+        try:
+            from smolagents.utils import AgentMaxStepsError
+            last_err = getattr(getattr(agent, "memory", None), "steps", [None])[-1]
+            last_err = getattr(last_err, "error", None)
+            if isinstance(last_err, AgentMaxStepsError):
+                logger.info("[Execute] max_steps 耗尽（memory 标记），需复盘")
+                hit_max_steps = True
+                result = f"[max_steps 耗尽] 已执行 {getattr(agent, 'step_number', '?')} 步，交由复盘循环继续"
+        except ImportError:
+            # 旧版 smolagents 仍走异常路径
+            if run_error is not None:
+                error_str = str(run_error).lower()
+                if "max_steps" in error_str or "maximum" in error_str:
+                    logger.info("[Execute] max_steps 耗尽（异常捕获），需复盘")
+                    hit_max_steps = True
+                    result = f"[max_steps 耗尽] {run_error}"
+
         react_elapsed = round(time.time() - react_start, 2)
         logger.info("[Execute] 完成，耗时 %.1fs，hit_max_steps=%s", react_elapsed, hit_max_steps)
+
+        # ── 收尾：关闭 _LLMAdapter 的同步 OpenAI 客户端（防 httpx 连接泄漏）──
+        # 注意只关 adapter 层客户端；底层共享 LLM 实例的生命周期由调用方管理，这里不动。
+        try:
+            model_adapter = getattr(agent, "model", None)
+            if model_adapter is not None and hasattr(model_adapter, "close"):
+                model_adapter.close()
+        except Exception as e:
+            logger.debug("[Execute] 关闭 LLM adapter 客户端失败: %s", e)
 
         # ── trace: 从 agent memory 提取工具调用 ──
         if trace:
@@ -766,6 +848,7 @@ def make_execute_node(ctx: NodeContext):
             "_code_agent": agent,  # 保留实例，下轮复用
             "_failed_tools": failed_tools,  # 失败工具列表，由 finalize_node 追加到输出
             "_agent_plan": agent_plan,  # smolagents 最终规划
+            "_run_error": repr(run_error) if run_error else "",  # 执行异常标记（含 LLM 5xx），finalize 据此判定 run 失败
         }
 
     return execute_node
@@ -786,6 +869,14 @@ def make_finalize_node(ctx: NodeContext):
         session_id = state.get("session_id", "default")
         direct_answer = state.get("direct_answer", "")
         result_raw = state.get("result_raw", "") or direct_answer or "[错误] 无执行结果"
+        # 缓存格式化前的原始 CodeAgent 输出：trace 结构化字段提取必须用原始结果，
+        # 否则 LLM 格式化版式一变，score/direction 的 regex 提取随之失效（审计 P1-3）。
+        raw_agent_output = state.get("result_raw", "") or direct_answer or ""
+        # run 失败判定（P1-3 配套）：执行异常（含 LLM 网关 5xx）的 run 只留错误痕迹，
+        # 不作为"成功分析"进入 qd_traces 提取/回测统计——否则一次网关故障会造出一条
+        # direction="neutral"、confidence=0.5 的伪决策记录参与权重训练（root_id=1737 事故）。
+        # 直接回答（chat）路径无 result_raw，不算失败。
+        run_failed = bool(state.get("_run_error")) and bool(state.get("result_raw"))
         failed_tools = state.get("_failed_tools", [])
         agent_plan = state.get("_agent_plan", "")
         selected_skill = state.get("selected_skill", "")
@@ -835,8 +926,8 @@ def make_finalize_node(ctx: NodeContext):
         if trace:
             try:
                 root_id = trace.finish(
-                    final_answer=state.get("result_raw", ""),  # 用原始结果提取结构化字段
-                    status="success",
+                    final_answer=raw_agent_output if not run_failed else None,  # 失败 run 不做决策提取
+                    status="error" if run_failed else "success",
                     response={"content": result_raw},
                 )
                 if root_id:

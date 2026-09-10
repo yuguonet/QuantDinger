@@ -94,6 +94,19 @@ class _LLMAdapter:
         self.model_id = getattr(llm, "model", "unknown")
         self._sync_client = None
 
+    def close(self):
+        """关闭同步 OpenAI 客户端，释放 httpx 连接池。
+
+        每次构建 CodeAgent 都会新建 _LLMAdapter（随之新建同步客户端），
+        不关闭会在长运行进程中持续泄漏连接（审计 P2）。在 execute_node 收尾调用。
+        """
+        if self._sync_client is not None:
+            try:
+                self._sync_client.close()
+            except Exception:
+                pass
+            self._sync_client = None
+
     def _get_sync_client(self):
         """惰性创建同步 OpenAI client（复用 _llm 的连接配置）。"""
         if self._sync_client is not None:
@@ -102,10 +115,17 @@ class _LLMAdapter:
             from openai import OpenAI
         except ImportError:
             raise ImportError("openai 未安装，请运行: pip install openai")
+        # 远端网关（如 g2claw）偶发 5xx 时 SDK 内置重试只有 1 次，快速抖动期不够用；
+        # 本地 llama 稳定无需多试。允许用 LLM_MAX_RETRIES 按部署环境调整。
+        import os as _os
+        try:
+            max_retries = int(_os.getenv("LLM_MAX_RETRIES", str(self._llm.max_retries)))
+        except ValueError:
+            max_retries = self._llm.max_retries
         client_kwargs = {
             "api_key": self._llm.api_key,
             "timeout": self._llm.timeout,
-            "max_retries": self._llm.max_retries,
+            "max_retries": max_retries,
         }
         base_url = getattr(self._llm, "base_url", None)
         if base_url:
@@ -187,6 +207,23 @@ class _LLMAdapter:
             logger.warning("[LLMAdapter] LLM 调用被中断")
             raise
         except Exception as e:
+            # 远端网关 5xx / 连接抖动兜底重试：SDK max_retries 用尽后仍抛出时，
+            # 等待一小段再试一次（覆盖"网关重启中"的秒级窗口）。本地 llama 失败
+            # 多为终态错误，同样适用（多等一次代价小）。
+            error_text = str(e)
+            retriable = "500" in error_text or "502" in error_text or "503" in error_text or "connection" in error_text.lower()
+            if retriable:
+                import time as _time
+                delay = 2.0
+                logger.warning("[TaskAgent] LLM 网关抖动（%s），%.0fs 后重试一次", error_text[:120], delay)
+                _time.sleep(delay)
+                try:
+                    return self.generate(messages, stop_sequences, response_format, tools_to_call_from, **kwargs)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e2:
+                    logger.error("[TaskAgent] LLM 重试仍失败: %s", e2)
+                    raise
             logger.error("[TaskAgent] LLM 调用失败: %s", e)
             raise
 
@@ -520,7 +557,14 @@ class TaskAgent(AgentBase):
         user_input: str,
         llm: LLMBase,
         trace: AgentTraceRecorder,
+        plan_ctx=None,
     ) -> dict:
+        """plan_ctx: 本次请求的 NodeContext。
+
+        plan 阶段的实体/RAG/历史上下文由 plan_node 写在 ctx 上（每请求独立，并发安全）。
+        兼容旧调用方：plan_ctx=None 时回退读实例属性（单线程 CLI 场景）。
+        """
+        src = plan_ctx if plan_ctx is not None else self
         """Plan 节点：选择技能、划分执行阶段。
 
         设计决策：
@@ -580,11 +624,11 @@ class TaskAgent(AgentBase):
         prompt = template.format(
             skills_text=skills_text,
             user_input=user_input,
-            entity_info=getattr(self, '_plan_entity_info', '') or '',
-            task_type_info=getattr(self, '_plan_task_type_info', '') or '',
-            rag_context=getattr(self, '_plan_rag_context', '') or '',
-            history_context=getattr(self, '_plan_history_context', '') or '',
-            completed_phases_text=getattr(self, '_completed_phases_text', '') or '',
+            entity_info=getattr(src, '_plan_entity_info', '') or '',
+            task_type_info=getattr(src, '_plan_task_type_info', '') or '',
+            rag_context=getattr(src, '_plan_rag_context', '') or '',
+            history_context=getattr(src, '_plan_history_context', '') or '',
+            completed_phases_text=getattr(src, '_completed_phases_text', '') or '',
         ) + tools_hint
 
         messages = [
@@ -613,7 +657,14 @@ class TaskAgent(AgentBase):
         plan = safe_parse_json(text, default={})
 
         task = plan.get("task", "") or plan.get("expanded_query", "") or user_input
-        step_budget = plan.get("step_budget", 10) or 10
+        # step_budget 钳制：LLM 输出不可信，范围 [1,20] + int 强转。
+        # 旧实现仅 `or 10` 兜底：字符串 "10" 在 smolagents 步数比较时会炸；
+        # 无上限时 LLM 可自定 50 步，AGENT_MAX_STEPS 环境变量形同虚设（审计 P1-6）。
+        try:
+            step_budget = int(plan.get("step_budget") or 10)
+        except (TypeError, ValueError):
+            step_budget = 10
+        step_budget = max(1, min(20, step_budget))
         planning_interval = max(step_budget // 2 + 1, 6)
 
         # 从 plan 结果中提取选中的技能名

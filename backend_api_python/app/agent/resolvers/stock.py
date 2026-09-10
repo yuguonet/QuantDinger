@@ -66,6 +66,14 @@ class StockResolver(EntityResolver):
             from tools.finance.data_tools import resolve_stock
         except ImportError:
             return None
+        # akshare 等数据源为同步 HTTP，在 async chat_node 中直接调用会阻塞事件循环
+        #（同一 worker 的其他会话全部卡住，审计 P2）。包一层线程隔离。
+        resolve_sync = resolve_stock
+
+        def _resolve_async(keyword: str, limit: int = 1):
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                return _pool.submit(resolve_sync, keyword, "CNStock", limit).result(timeout=10)
 
         entities = []
 
@@ -75,7 +83,7 @@ class StockResolver(EntityResolver):
             # 查询代码对应的名称
             name = ""
             try:
-                info = resolve_stock(code, limit=1)
+                info = _resolve_async(code, limit=1)
                 if isinstance(info, dict) and info.get('name'):
                     name = info['name']
                 elif isinstance(info, dict) and info.get('data'):
@@ -96,7 +104,7 @@ class StockResolver(EntityResolver):
                 if name in [e['code'] for e in entities]:
                     continue
                 try:
-                    result = resolve_stock(name, limit=1)
+                    result = _resolve_async(name, limit=1)
                     if isinstance(result, dict) and not result.get('error'):
                         if result.get('code'):
                             entities.append({"code": result['code'], "name": result.get('name', ''), "type": "stock"})

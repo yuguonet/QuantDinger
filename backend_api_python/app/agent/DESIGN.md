@@ -1,8 +1,14 @@
 # QuantDinger Agent 模块设计文档
 
-> 最后更新: 2026-07-22
-> 版本: v1.3
+> 最后更新: 2026-09-10
+> 版本: v1.4
 > 状态: 生产环境运行中
+>
+> v1.4（2026-09-10）— 健壮性审计修复：学习闭环接通（update_path_cache 移除 / skill 节点评估字段回填 /
+> 评估毒丸出队）、RAG 阈值按分数来源分流、LLM 客户端并发模型修正（共享客户端不再任务级 close）、
+> 复盘循环适配 smolagents>=1.27（memory 标记检测）、step_budget 钳制、plan 上下文并发隔离、
+> 失败工具检测双通道、trace.finish 幂等、chain_name 接真实意图、feedback 复合词/问句消歧、
+> ToolProvider 进程级缓存、实体解析线程隔离、队列背压。详见 git log。
 
 ---
 
@@ -906,6 +912,12 @@ execute_node (继续执行)
 finalize_node
 ```
 
+> **触发条件（v1.4 修正）**：smolagents >= 1.27 到达 max_steps 时**不抛异常**，
+> 而是强制生成 final answer 正常返回，仅在 memory 最后一步的 ActionStep 上标记
+> `AgentMaxStepsError`。execute_node 以检测该标记判定步数耗尽（旧版靠捕获异常
+> 字符串，在 1.27 下永不触发，复盘循环曾是死代码）。
+> step_budget 由 plan 产出，钳制在 [1, 20]。
+
 ---
 
 ## 五、配置说明
@@ -1028,6 +1040,11 @@ checkpoint 存储 (PostgreSQL)
   state = await compiled.ainvoke(state, config)
 ```
 
+> **现状（v1.4 标注）**：checkpointer 未启用——`graph.compile()` 未传入
+> checkpointer 实例（需数据库连接池，待接入）。且 AgentState 携带
+> `_trace` / `_code_agent` 等不可序列化运行时对象，启用前需先隔离到
+> Checkpointer 之外。上图的 resume 能力当前不可用。
+
 ---
 
 ## 七、扩展指南
@@ -1140,7 +1157,10 @@ if provider == "my": return MyEmbedding(...)
 
 ### 8.4 Token 优化
 
-- **observations 截断**：保留最近 2 步完整
+- **observations 截断**：保留最近 2 步完整，更早步骤截到 200 字符。
+  trace 提取（_record_tool_calls_to_trace）在 run 结束后读取 memory，为拿到完整
+  observations，v1.4 起依赖 run 中途缓存（execute_node 在截断回调生效前提取的
+  步骤数据优先）。此阈值只影响 CodeAgent 上下文窗口，不再决定 trace 完整性。
 - **工具描述精简**：只显示前 80 字符
 - **上下文限制**：max_length=8000
 
@@ -1164,8 +1184,12 @@ logging.basicConfig(
 
 ### 9.2 追踪系统
 
+> **v1.4 标注**：现行追踪实现是 `utils/tracing.py` 的 `AgentTraceRecorder`
+> （事件追加 → finish() 时写 JSONL + 提取结构化字段写 qd_traces）。
+> 下述 `trace_collector.py` 是上一代遗留文件，当前主链路未使用。
+
 ```python
-# trace_collector.py
+# trace_collector.py（遗留，仅存档参考）
 class TraceCollector:
     session_id: str
     user_query: str
@@ -1227,6 +1251,31 @@ class TraceCollector:
 ---
 
 ## 附录 A：版本历史
+
+### v1.4 (2026-09-10) — 健壮性审计修复
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| P0 | 移除对不存在的 store.update_path_cache 的调用，评估计数与自动权重更新恢复 | chain/evaluator.py |
+| P0 | skill 节点回填 direction/score 等评估字段（继承根节点决策），权重聚合数据源接通 | utils/tracing.py |
+| P0 | 评估毒丸治理：失败计数写 error 列，>=5 次置 unverifiable 出队 | chain/store.py, chain/evaluator.py |
+| P0 | RAG 阈值按分数来源分流：rerank_score 用 0.7，RRF 分数按 top_k 截断 | nodes.py |
+| P0 | 共享 LLM 客户端不再任务级 close（跨 loop 竞态根因），连接池随进程存活 | agent.py, message_queue.py |
+| P1 | 复盘循环适配 smolagents>=1.27：检测 memory 末步 AgentMaxStepsError 标记 | nodes.py |
+| P1 | nodes.py 补 import json（trace 提取 NameError 静默吞） | nodes.py |
+| P1 | trace.finish 幂等 + 结构化字段提取改用格式化前原始输出 | utils/tracing.py, nodes.py |
+| P1 | 失败工具检测双通道：error 键值 + ToolCall 反查（_failed_tool 无生产者） | nodes.py |
+| P1 | chain_name 接真实意图（chat_node → set_intent），不再恒为 "agent" | nodes.py, utils/tracing.py |
+| P1 | step_budget 钳制 [1,20] + int 强转 | agents/task_agent.py |
+| P1 | plan 上下文挂 NodeContext（并发隔离），_plan 增加 plan_ctx 参数 | nodes.py, agents/task_agent.py |
+| P1 | feedback 复合词白名单 + 问句消歧（"垃圾股"/"数据不对？"不再误罚） | feedback.py |
+| P1 | 带具体时间的提醒归 cron（intent prompt 规则修正） | prompts/intent_classifier.txt |
+| P2 | ToolProvider 进程级缓存（首扫复用，不再每请求重扫） | nodes.py |
+| P2 | _LLMAdapter.close() 补充 + execute 收尾调用（同步客户端泄漏） | agents/task_agent.py, nodes.py |
+| P2 | ToolCall 提取改用原生 dataclass 字段（function dict 误读） | nodes.py |
+| P2 | StockResolver 线程隔离（akshare 同步 HTTP 阻塞事件循环） | resolvers/stock.py |
+| P2 | 队列背压：满时 5s 超时快速失败，不再无限挂起 | message_queue.py |
+| 文档 | 4.2/6.2/8.4/9.2 与实现对齐（复盘触发条件/checkpointer 现状/截断口径/trace 实现归属） | DESIGN.md |
 
 ### v1.3 (2026-07-22)
 

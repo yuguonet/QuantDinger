@@ -60,12 +60,16 @@ def submit(
         init_workers()
 
     future: Future = Future()
-    _task_queue.put({
-        "message": message,
-        "session_id": session_id,
-        "timeout": timeout,
-        "future": future,
-    })
+    try:
+        # 队列满时快速失败而不是无限挂起调用线程（SSE 请求会被拖死，审计 P2）
+        _task_queue.put({
+            "message": message,
+            "session_id": session_id,
+            "timeout": timeout,
+            "future": future,
+        }, timeout=5)
+    except queue.Full:
+        raise RuntimeError("Agent 消息队列已满（256），请稍后重试")
     return future
 
 
@@ -90,11 +94,9 @@ def _worker_loop():
                 resp = loop.run_until_complete(asyncio.wait_for(coro, timeout=task["timeout"]))
                 future.set_result(resp.content or "")
             finally:
-                # 关闭 LLM 底层 httpx 客户端，避免 "Event loop is closed" 警告
-                try:
-                    loop.run_until_complete(agent.llm.close())
-                except Exception:
-                    pass
+                # 不 close 共享 LLM 客户端（审计 P0-3）：客户端绑定 event loop 且全局共享，
+                # 任务级 close 会误杀并发 worker 的在途请求，且下一个任务在新 loop 上复用
+                # 已关闭的客户端会随机报 "Event loop is closed"。连接池随进程存活。
                 loop.close()
         except Exception as e:
             logger.error("[MQ] Worker 异常: %s", e, exc_info=True)

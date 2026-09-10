@@ -197,6 +197,12 @@ class AgentTraceRecorder:
         self._skill_name: str = ""
         self._tool_calls: List[Dict[str, Any]] = []  # [{name, args, result, elapsed_ms, error}]
 
+        # finish 幂等状态
+        self._finished: bool = False
+        self._finished_root_id: Optional[int] = None
+        # 原始 CodeAgent 输出缓存（LLM 格式化前），供结构化字段提取
+        self._raw_agent_output: str = ""
+
         if self.enabled:
             self.record(
                 "run_start",
@@ -233,6 +239,20 @@ class AgentTraceRecorder:
         """标记当前执行的技能。"""
         self._skill_name = skill_name
 
+    def set_intent(self, domain: str = "", verb: str = "", noun: str = ""):
+        """记录意图三元组，供 chain_name（feedback 按链匹配、按链统计）使用。
+
+        旧版三元组无数据源，根节点 name 恒为 "agent"，按链聚合全部失效（审计 P1-5）。
+        当前 chat_node 的意图分类只产出 task_type（≈verb 位），domain/noun 暂无
+        独立来源，先接已有的，缺省位落 unknown。
+        """
+        if domain:
+            self.domain = domain
+        if verb:
+            self.intent_verb = verb
+        if noun:
+            self.intent_noun = noun
+
     def add_tool_call(self, tool_name: str, arguments: dict = None,
                       result: Any = None, elapsed_ms: float = 0,
                       error: str = ""):
@@ -247,8 +267,13 @@ class AgentTraceRecorder:
 
     # ── 结束 + 双写 ──────────────────────────────────────────
 
-    def finish(self, final_answer: str = "", status: str = "success",
+    def finish(self, final_answer: Optional[str] = None, status: str = "success",
                response: Optional[dict] = None) -> Optional[int]:
+        """结束追踪：写 JSONL + 写 qd_traces。
+
+        final_answer: CodeAgent 原始输出（execute_node 在格式化前经 state 传入），
+        用于提取 score/direction/action 等结构化字段；None 时回退 response.content。
+        """
         """结束追踪：写 JSONL + 写 qd_traces。
 
         Args:
@@ -259,6 +284,13 @@ class AgentTraceRecorder:
         Returns:
             qd_traces root_id，失败返回 None
         """
+        # 幂等保护：finalize_node 与 _chat_plan_graph 会对同一次 run 各调一次 finish，
+        # 重复执行会双写 JSONL + 双写 qd_traces（审计 P1-3）。第二次调用直接返回首写结果。
+        if self._finished:
+            return self._finished_root_id
+        self._finished = True
+        self._finished_root_id = None
+
         self.record("run_end", {"status": status, "response": response or {}})
 
         # 写 JSONL
@@ -266,18 +298,30 @@ class AgentTraceRecorder:
         if self.enabled:
             self._write_jsonl()
 
-        # 写 qd_traces
+        # 写 qd_traces。结构化字段提取源：优先 CodeAgent 原始输出（execute_node 在
+        # LLM 格式化之前传入 finish），没有时回退 response.content —— 不再用格式化
+        # 后的文本做 regex 提取，避免 LLM 版式变化污染 score/direction（审计 P1-3）。
         if final_answer and status == "success":
-            root_id = self._write_qd_traces(final_answer)
+            self._finished_root_id = self._write_qd_traces(final_answer)
 
-        return root_id
+        return self._finished_root_id
 
     def fail(self, error: Exception):
+        """异常路径收口：与 finish() 走同一条链路（幂等 + 双写一致）。
+
+        旧实现只写 JSONL、不写 qd_traces——调用方（_chat_plan_graph except 分支）
+        与 finalize_node 的 finish() 是二选一执行，谁后执行谁决定落库形态。
+        现在 run_error 事件照记，然后统一走 finish(status="error")：
+        qd_traces 会留一条带错误信息的根节点（供排查），但不参与回测统计。
+        """
         self.record("run_error", {
             "error_type": type(error).__name__,
             "error": str(error),
         })
-        self._write_jsonl()
+        self.finish(
+            status="error",
+            response={"error": str(error)[:500]},
+        )
 
     # ── JSONL 输出 ────────────────────────────────────────────
 
@@ -320,7 +364,9 @@ class AgentTraceRecorder:
                         break
 
             # 构建根节点
-            chain_name = f"{self.domain}+{self.intent_verb}+{self.intent_noun}" if self.intent_verb else "agent"
+            # chain_name 用真实 intent 三元组；缺省段填 unknown 而非统一 "agent"，
+            # 否则按 chain 聚合/匹配（负面反馈、统计）全部失效（审计 P1-5）。
+            chain_name = f"{self.domain or 'unknown'}+{self.intent_verb or 'unknown'}+{self.intent_noun or 'unknown'}"
             root = EvalNode(
                 layer=Layer.CHAIN.value,
                 name=chain_name,
@@ -338,11 +384,22 @@ class AgentTraceRecorder:
                 elapsed_ms=_now_ms() - self.started_at_ms,
             )
 
-            # skill 子节点
+            # skill 子节点。
+            # direction/score 等评估字段必须回填：evaluator 的权重聚合按
+            # layer='skill' AND correct IS NOT NULL 扫描，而 update_skill_verify
+            # 对 direction 为空的行直接跳过 → skill 行 correct 永远 NULL，
+            # qd_agent_weights 永远不会被更新（审计 P0-1 断点B）。
+            # 无独立技能报告时继承根节点决策（同源、可解释），与根节点自证等价。
             if self._skill_name:
                 skill_node = EvalNode(
                     layer=Layer.SKILL.value,
                     name=self._skill_name,
+                    direction=root.direction,
+                    score=root.score,
+                    action=root.action,
+                    signal=root.signal,
+                    confidence=root.confidence,
+                    timeframe=root.timeframe,
                     tools_called=[tc["name"] for tc in self._tool_calls],
                 )
                 # skill 下的 tool 子节点

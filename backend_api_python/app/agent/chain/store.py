@@ -16,6 +16,7 @@ root_id 字段冗余存储根节点 id，方便快速查整棵树。
 from __future__ import annotations
 
 import json
+import re
 from log import logger
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
@@ -303,14 +304,31 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
 
     cutoff = date.today() - timedelta(days=days_old)
 
+    # 毒丸治理（审计 P0-1 断点C）：
+    # 退市/长期停牌股取不到 K 线，evaluator 跳过且不写 exit_date，这些记录每天重新
+    # 入选且按 exec_date ASC 永远排队头；LIMIT 槽位被占满后新记录饿死。
+    # error 列复用现有字段累计评估失败（'eval_failed:N' 前缀，由 evaluator 写入），
+    # 连续失败 >= 5 次置 status='unverifiable' 出队，不新增表结构。
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
+            cur.execute("""
+                UPDATE qd_traces SET status = 'unverifiable'
+                WHERE parent_id IS NULL
+                  AND exit_date IS NULL
+                  AND status = 'ok'
+                  AND exec_date <= %s
+                  AND error ~ '^eval_failed:'
+                  AND (regexp_match(error, '^eval_failed:(\\d+)'))[1]::int >= 5
+            """, (cutoff,))
+            conn.commit()
+
             cur.execute("""
                 SELECT id, exec_date, stock_code, stock_name, name, action, timeframe
                 FROM qd_traces
                 WHERE parent_id IS NULL
                   AND exit_date IS NULL
+                  AND status = 'ok'
                   AND exec_date <= %s
                 ORDER BY exec_date ASC
                 LIMIT %s
