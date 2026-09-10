@@ -179,6 +179,27 @@ class KnifeCatchStrategy(StrategyBase):
             out[code] = snap
         return out
 
+    def day_prefilter(self, frame, pc_map):
+        """日级必要条件超集 (B 档回测提速; 阈值与 intraday_shortlist 同源)。
+
+        只用 frame.day_extremes() 通用统计推导 shortlist 的必要条件:
+          - 板块排除 8/4/92 (shortlist 同口径);
+          - pc>0 (shortlist 拒 pc<=0);
+          - 日高>日低 (日内全平 → 任意前缀 high<=low 必拒);
+          - 日低 <= pc*(1+gain_max) (槽位 last=bar 开盘 ≥ 日低, 深跌槽位存在的必要条件);
+          - 日振幅 >= amp_min (前缀振幅 ≤ 日振幅, 前缀达标必须日振幅先达标)。
+        pos 上限是槽位特征无法日级化 → 留给 shortlist (超集方向安全)。
+        """
+        import numpy as np
+        p = self.merged_params()
+        _dopen, dhigh, dlow = frame.day_extremes()
+        pcs = np.asarray([pc_map.get(c) or 0 for c in frame.codes], dtype=float)
+        ok = (pcs > 0) & (dhigh > dlow) \
+            & (dlow <= pcs * (1.0 + p["gain_max"] / 100.0)) \
+            & ((dhigh - dlow) / np.where(pcs > 0, pcs, 1.0) * 100.0 >= p["amp_min"])
+        return [c for c, k in zip(frame.codes, ok)
+                if k and not c.startswith(("8", "4", "92"))]
+
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
         """14:56 盘中判定。必须 ctx={"latest","series","mkt_gain"}; 无盘中数据返回空。
 

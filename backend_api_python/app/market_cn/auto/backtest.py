@@ -183,6 +183,19 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
         nm = (_si.get(code) or {}).get("name", "") or ""
         return "ST" not in nm.upper()
 
+    # 日线 per-run memo (2026-09-10 提速): 同股跨槽位重复判定曾反复打库
+    # (实测 knife 151 天 37440 次幸存→37440 次 daily() 查询 ≈ 250s)。单次运行内
+    # fetch_kline_db 返回恒定 → memo 全量 bars + as_of 本地切片, 语义等价。
+    _daily_memo = {}
+
+    def _daily_asof(code, prev_date):
+        bars = _daily_memo.get(code)
+        if bars is None:
+            bars = _daily_memo.setdefault(code, daily(code, 300))
+        if prev_date:
+            return [b for b in bars if str(b["time"])[:10] <= str(prev_date)[:10]]
+        return bars
+
     trades, seen = [], set()
     dbg = {} if probe is not None else None   # debug: code -> 当日最晚槽位评估记录 (日终统一落盘)
     for di, date in enumerate(dates):
@@ -192,15 +205,30 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
         prev_date = dates[di - 1] if di > 0 else _first_prev
         if prev_date is None:       # 覆盖起点前再无交易日 → 无日线上下文, 该日无法判定
             continue
+        # 日级必要条件超集预筛 (策略钩子, 默认 None=不预筛): 平静日整日跳过,
+        # 免建 31 槽 × 全市场快照 (B 档提速; 钩子契约见 StrategyBase.day_prefilter)
+        day_sel = strat.day_prefilter(frame, pc_map)
+        if day_sel is not None:
+            day_sel = set(day_sel)
+            if code_set is not None:
+                day_sel &= code_set
+            if not day_sel:
+                if progress_every and (di + 1) % progress_every == 0:
+                    print(f"[{di + 1}/{len(dates)}] {date} 日级预筛=0 跳过 "
+                          f"累计={len(trades)} ({time.time() - t0:.0f}s)", flush=True)
+                pc_map = _rollover_pc(frame, pc_map)
+                continue
+        else:
+            day_sel = code_set
         n_sig_day = 0
         for mi in mis:
-            snaps = frame.snaps_at(mi, pc_map, codes=code_set)
+            snaps = frame.snaps_at(mi, pc_map, codes=day_sel)
             mkt = frame.mkt_gain(mi, pc_map)
             short = strat.intraday_shortlist(snaps, mkt) or {}
             for code, snap in short.items():
                 if (code, date) in seen or not _st_ok(code):
                     continue                            # 每股每日首信号成交; ST 与实盘同排除
-                bars = daily(code, 300, as_of=prev_date)  # 截至D-1 (插件契约: bars[-1]=昨日)
+                bars = _daily_asof(code, prev_date)   # 截至D-1 (插件契约: bars[-1]=昨日)
                 slot_tr = _SlotTrace() if probe is not None else None
                 sigs = strat.scan_signals(
                     bars, code,
@@ -224,7 +252,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 if entry_price <= 0:
                     continue
                 # 出场: 次交易日日线开盘 (D1 开盘卖)
-                full = daily(code, 300)
+                full = _daily_asof(code, None)
                 nxt = next((b for b in full if str(b["time"])[:10] > date), None)
                 if nxt is None or float(nxt["open"]) <= 0:
                     continue
@@ -246,7 +274,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 labels = {}
                 if entry0 > 0:
                     labels["entry_trigger"] = round(entry0, 3)
-                    full_d = daily(code, 300)
+                    full_d = _daily_asof(code, None)
                     nxt = next((b for b in full_d if str(b["time"])[:10] > date), None)
                     if nxt is not None and float(nxt["open"]) > 0:
                         labels["ret_d1o"] = round((float(nxt["open"]) / entry0 - 1) * 100, 2)
@@ -254,10 +282,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 probe.sample(labels=labels, **rec)
             dbg.clear()
         # pc_map 结转 (当日 1m 最后一根 close)
-        for code in frame.codes:
-            lc = frame.last_close(code)
-            if lc > 0:
-                pc_map[code] = lc
+        pc_map = _rollover_pc(frame, pc_map)
         if progress_every and (di + 1) % progress_every == 0:
             print(f"[{di + 1}/{len(dates)}] {date} shortlist后信号={n_sig_day} "
                   f"累计={len(trades)} ({time.time() - t0:.0f}s)", flush=True)
@@ -268,6 +293,15 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
 def frames_hhmm(mi):
     from app.market_cn.auto.data.frames import MI_HHMM
     return MI_HHMM[mi] if 0 <= mi < len(MI_HHMM) else ""
+
+
+def _rollover_pc(frame, pc_map):
+    """pc_map 结转: 当日 1m 最后一根 close (跳过的日级预筛日也必须结转, 否则次日 pc 断链)。"""
+    for code in frame.codes:
+        lc = frame.last_close(code)
+        if lc > 0:
+            pc_map[code] = lc
+    return pc_map
 
 
 def _summary(trades):

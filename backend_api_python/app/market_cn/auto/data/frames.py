@@ -33,10 +33,14 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 缓存目录: backend_api_python/data/market_cn_cache/frames
+# (易错: 相对 __file__ 需回退 4 级 auto/data → market_cn → app → backend_api_python;
+#  原 3 级曾把 1.3G 缓存写进 app/data 源码树, 2026-09-10 修正并迁移)
 CACHE_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "data", "market_cn_cache", "frames"))
+    os.path.dirname(__file__), "..", "..", "..", "..", "data", "market_cn_cache", "frames"))
 CACHE_BUDGET_GB = 2.0
 CACHE_VER = "v2"        # 帧结构版本 (v1=跨股 cumsum 量纲污染, 已弃用; 旧文件由淘汰机制自然清理)
+                        # v2 结构增强 (A1): 新增 hcum/lcum 键 — 保持 v2 号避免已建 151 帧
+                        # 全部作废重建; 读侧对缺键旧文件加载期补算并原子升级, 语义不变
 
 # 位置(=分钟槽) → HH:MM, 与基线 _mi_to_hhmm 一致: 0↔09:31, 119↔11:30, 120↔13:01, 235↔14:56
 MI_HHMM = []
@@ -59,20 +63,48 @@ class MinuteFrame:
     __slots__ = ("date", "codes", "code_idx", "offsets", "counts",
                  "o", "h", "l", "c", "vcum", "hcum", "lcum")
 
-    def __init__(self, date, codes, offsets, counts, o, h, l, c, vcum):
+    def __init__(self, date, codes, offsets, counts, o, h, l, c, vcum,
+                 hcum=None, lcum=None):
         self.date = date
         self.codes = codes                      # list[str], 升序
         self.code_idx = {c: i for i, c in enumerate(codes)}
         self.offsets, self.counts = offsets, counts
         self.o, self.h, self.l, self.c, self.vcum = o, h, l, c, vcum
         # 分段累计极值 (截至各位置(含)之前 → 用 exclusive cummax)
-        self.hcum = np.empty_like(h)
-        self.lcum = np.empty_like(l)
-        for i in range(len(codes)):
-            s, e = offsets[i], offsets[i] + counts[i]
+        # hcum/lcum 已入缓存 (A1 提速): 缓存缺键 (旧文件) 时加载期补算并原子升级
+        if hcum is None or lcum is None:
+            hcum, lcum = self._seg_cummax(h, l, offsets, counts)
+        self.hcum, self.lcum = hcum, lcum
+
+    @staticmethod
+    def _seg_cummax(h, l, offsets, counts):
+        hcum = np.empty_like(h)
+        lcum = np.empty_like(l)
+        for i in range(len(offsets)):
+            s, e = int(offsets[i]), int(offsets[i]) + int(counts[i])
             if e > s:
-                self.hcum[s:e] = np.maximum.accumulate(h[s:e])
-                self.lcum[s:e] = np.minimum.accumulate(l[s:e])
+                hcum[s:e] = np.maximum.accumulate(h[s:e])
+                lcum[s:e] = np.minimum.accumulate(l[s:e])
+        return hcum, lcum
+
+    def day_extremes(self):
+        """每股当日 (首开, 日高, 日低) — reduceat 向量化 (通用窗口统计, 供策略日级预筛)。
+
+        返回三个与 self.codes 对齐的 float64 数组; 分段保证非空 (构建期跳过无 bar 股)。
+        """
+        if (self.counts == 0).any():            # 防御: 空段会让 reduceat 错位
+            dhigh = np.empty(len(self.codes))
+            dlow = np.empty(len(self.codes))
+            for i in range(len(self.codes)):
+                s, n = int(self.offsets[i]), int(self.counts[i])
+                if n > 0:
+                    dhigh[i] = self.h[s:s + n].max()
+                    dlow[i] = self.l[s:s + n].min()
+            return self.o[self.offsets], dhigh, dlow
+        starts = self.offsets
+        return (self.o[starts],
+                np.maximum.reduceat(self.h, starts),
+                np.minimum.reduceat(self.l, starts))
 
     def __len__(self):
         return len(self.codes)
@@ -102,17 +134,33 @@ class MinuteFrame:
                 "volume": float(self.vcum[s + pos])}
 
     def snaps_at(self, pos, pc_map, codes=None):
-        """触发位置 pos 的全市场快照 {code: snap} (只含有 bar 的股票; dict 即建即用)。"""
+        """触发位置 pos 的全市场快照 {code: snap} (只含有 bar 的股票)。
+
+        向量化 (A2 提速, 语义与逐股 snap() 逐字段一致): 同槽位所有股票的 time 串相同
+        (外提一次); 价格/极值/累计量用 fancy indexing 一次取齐再建 dict。
+        """
+        idxs = [i for i, c in enumerate(self.codes)
+                if int(self.counts[i]) > pos and (codes is None or c in codes)]
+        if not idxs:
+            return {}
+        ia = np.asarray(idxs, dtype=np.int64)
+        s = self.offsets[ia] + pos
+        lasts = self.o[s].tolist()
+        if pos > 0:
+            highs = self.hcum[s - 1].tolist()   # 截至 p-1 收盘的累计极值 (exclusive)
+            lows = self.lcum[s - 1].tolist()
+        else:
+            highs = lows = lasts                # 日初无累计极值 (退化, 预筛会拒)
+        vols = self.vcum[s].tolist()
+        t = f"{self.date} {MI_HHMM[pos]}:00"
         out = {}
-        for i, code in enumerate(self.codes):
-            if codes is not None and code not in codes:
-                continue
-            n = int(self.counts[i])
-            if pos >= n:
-                continue
-            snap = self.snap(code, pos, pc_map.get(code))
-            if snap is not None:
-                out[code] = snap
+        for k, i in enumerate(idxs):
+            code = self.codes[i]
+            pc = pc_map.get(code)
+            out[code] = {"time": t, "open": lasts[k], "high": highs[k],
+                         "low": lows[k], "last": lasts[k],
+                         "previousClose": float(pc) if pc else 0,
+                         "volume": vols[k]}
         return out
 
     def series(self, code, upto_pos):
@@ -129,19 +177,17 @@ class MinuteFrame:
                 for j in range(off, e)]
 
     def mkt_gain(self, pos, pc_map):
-        """全市场均涨幅% (与 scan._mkt_gain 同口径: mean(last/pc-1); 无样本返回 0.0)。"""
-        gains, idxs = [], []
-        for i, code in enumerate(self.codes):
-            if int(self.counts[i]) > pos:
-                pc = pc_map.get(code)
-                if pc and pc > 0:
-                    idxs.append(int(self.offsets[i]) + pos)
-                    gains.append(pc)
-        if not gains:
+        """全市场均涨幅% (与 scan._mkt_gain 同口径: mean(last/pc-1); 无样本返回 0.0)。
+
+        向量化 (A2 提速, 口径不变): 有 bar 且 pc>0 的股票, last>0 过滤后取均值。
+        """
+        valid = self.counts > pos
+        if not valid.any():
             return 0.0
-        lasts = self.o[idxs]
-        pcs = np.asarray(gains, dtype=float)
-        ok = lasts > 0
+        idxs = np.nonzero(valid)[0]
+        pcs = np.asarray([pc_map.get(self.codes[i]) or 0 for i in idxs], dtype=float)
+        lasts = self.o[self.offsets[idxs] + pos]
+        ok = (pcs > 0) & (lasts > 0)
         if not ok.any():
             return 0.0
         return float(np.mean((lasts[ok] / pcs[ok] - 1.0) * 100.0))
@@ -284,10 +330,15 @@ def build_frame(date, codes=None):
 def _save_cache(frame):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        np.savez_compressed(
-            _cache_path(frame.date), codes=np.asarray(frame.codes),
-            offsets=frame.offsets, counts=frame.counts,
-            o=frame.o, h=frame.h, l=frame.l, c=frame.c, vcum=frame.vcum)
+        path = _cache_path(frame.date)
+        tmp = path + ".tmp"                 # 原子写: 先落 tmp 再 replace (防半文件/并发覆盖)
+        with open(tmp, "wb") as f:
+            np.savez_compressed(
+                f, codes=np.asarray(frame.codes),
+                offsets=frame.offsets, counts=frame.counts,
+                o=frame.o, h=frame.h, l=frame.l, c=frame.c, vcum=frame.vcum,
+                hcum=frame.hcum, lcum=frame.lcum)
+        os.replace(tmp, path)
         _evict_cache()
     except OSError as e:
         logger.debug("[frames] 缓存写盘失败 (%s): %s", frame.date, e)
@@ -299,10 +350,16 @@ def _load_cache(date):
         return None
     try:
         with np.load(path, allow_pickle=False) as z:
-            return MinuteFrame(
+            hcum = z["hcum"] if "hcum" in z.files else None     # 旧 v2 文件无此键
+            lcum = z["lcum"] if "lcum" in z.files else None
+            frame = MinuteFrame(
                 date, [str(x) for x in z["codes"].tolist()],
                 z["offsets"], z["counts"],
-                z["o"], z["h"], z["l"], z["c"], z["vcum"])
+                z["o"], z["h"], z["l"], z["c"], z["vcum"],
+                hcum=hcum, lcum=lcum)
+        if hcum is None:                    # 加载期升级 (补算的 hcum/lcum 回写, 下次免算)
+            _save_cache(frame)
+        return frame
     except Exception as e:
         logger.warning("[frames] 缓存加载失败 (%s): %s", date, e)
         return None

@@ -147,6 +147,20 @@ class StrategyBase:
         """
         return None
 
+    def day_prefilter(self, frame, pc_map):
+        """日级必要条件超集预筛 (intraday_window 回测提速, 2026-09-10; 默认 None=不预筛)。
+
+        契约 (dragon 预筛同款方法论: 预筛必须是数学必要条件超集):
+          - 入参 frame (MinuteFrame, 含 day_extremes() 通用窗口统计) + pc_map;
+          - 返回 None = 不预筛 (全市场照旧); 返回 code 集合 = 引擎只在该子集内
+            建快照/跑 shortlist/判定; 返回空集合 = 整日跳过;
+          - **宁可多留不可误杀**: 被排除的 code 必须在所有触发槽位都不可能通过
+            intraday_shortlist; 判定只能用 frame 通用统计 (日高/日低/首开), 不得
+            引入 slot 级信息 (槽位快照此刻尚未构建);
+          - 与实盘无交互 (实盘全市场快照本就现成, 无需此钩子), 回测专用。
+        """
+        return None
+
     # ---- 探针 sample 组装 (debug 模式专用; probe=None 路径不会走到) ----
     def _probe_day(self, probe, day_tr, bars, i, code, stock_info,
                    stage=None, sig=None, u_fails=None, extra=None):
