@@ -117,3 +117,14 @@ def params_override(key):
     """参数覆盖 dict (无则空 dict, 由 StrategyBase.merged_params 合并)。"""
     v = _strategy_cfg(key).get("params")
     return v if isinstance(v, dict) else {}
+
+
+def live_probe_enabled():
+    """实盘扫描探针开关 (M1 实盘采集, 2026-09-11; 默认 True=未写即开启)。
+
+    config.json 顶层 "live_probe": false 可关 (与 strategies 平级, 非 per-strategy)。
+    开启时 run_scan 每策略产一份 sample 存档 (tmp/probes/<key>_live_<ts>.jsonl),
+    只记判定步落点非空的 (code,day) — 特征完整、标签 censored (D+1 数据当时不存在,
+    离线按 kline 回填; 与回测探针同 schema, sample_build 可直接消费)。
+    """
+    return bool(load_config().get("live_probe", True))

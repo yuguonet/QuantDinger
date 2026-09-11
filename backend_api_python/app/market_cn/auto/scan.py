@@ -79,6 +79,20 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
               if strat_reg.is_enabled(k) and s.scan_spec.kind == "daily_close"}
     logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
+    # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定同步过 DayTrace shim 产 sample。
+    # 只记判定步落点非空的 (code,day) (纯噪声不采, 同 probe.py 约定); 标签 censored
+    # (D+1 bar 当时不存在, 离线回填)。relay3 暂不支持 (scan_signals 无 probe 形参,
+    # **params 静默吞掉 → 无 trace 无采样, 判定行为不受影响)。
+    live_probes = None
+    if strat_reg.live_probe_enabled():
+        import inspect
+        from app.market_cn.auto.probe import DayTrace as _DayTrace, Probe as _Probe
+        live_probes = {k: _Probe(k, tag="live") for k in active}
+        # probe 形参显式支持才传 (relay3 scan_signals 无 probe 形参 — **params 会静默吞掉,
+        # 探针对象混进 params 有隐患; 未支持策略不传, 判定行为零变化)
+        _probe_ok = {k: "probe" in inspect.signature(s.scan_signals).parameters
+                     for k, s in active.items()}
+
     store.ensure_tables()
     target = _target_date()
 
@@ -118,38 +132,62 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
     rows = []
     t0 = time.time()
-    for i, code in enumerate(codes):
-        bars = fetch_kline_db(code, days)
-        if not bars or len(bars) < 30:
-            continue
-        # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
-        if bars[-1]["time"] > target:
-            bars = [b for b in bars if b["time"] <= target]
-        if not bars:
-            continue
-        name = (stock_info.get(code) or {}).get("name", "")
-        for key, strat in active.items():
-            try:
-                sigs = strat.scan_signals(bars, code, **strat_reg.params_override(key))
-            except Exception as e:
-                logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
+    try:
+        for i, code in enumerate(codes):
+            bars = fetch_kline_db(code, days)
+            if not bars or len(bars) < 30:
                 continue
-            # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
-            kept = []
-            if not getattr(strat, "use_unified_prefilter", True):
-                kept = list(sigs)
-            else:
-                for s in sigs:
-                    idx = _anchor_idx(bars, s, strat)
-                    if idx is None:
-                        continue
-                    ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
-                    if ok:
-                        kept.append(s)
-            rows.extend(store.signal_row(key, s, name) for s in kept)
-        if (i + 1) % 500 == 0:
-            logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
-                        i + 1, len(codes), len(rows), time.time() - t0)
+            # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
+            if bars[-1]["time"] > target:
+                bars = [b for b in bars if b["time"] <= target]
+            if not bars:
+                continue
+            name = (stock_info.get(code) or {}).get("name", "")
+            for key, strat in active.items():
+                day_tr = _DayTrace() if (live_probes is not None and _probe_ok.get(key)) else None
+                try:
+                    _kw = {"probe": day_tr} if day_tr is not None else {}
+                    sigs = strat.scan_signals(bars, code, **_kw,
+                                              **strat_reg.params_override(key))
+                except Exception as e:
+                    logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
+                    continue
+                # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
+                kept = []
+                last_u_fails = None
+                if not getattr(strat, "use_unified_prefilter", True):
+                    kept = list(sigs)
+                else:
+                    for s in sigs:
+                        idx = _anchor_idx(bars, s, strat)
+                        if idx is None:
+                            continue
+                        ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
+                        if ok:
+                            kept.append(s)
+                        else:
+                            last_u_fails = _fails
+                # M1 采样: 判定步有落点才记 (stage 口径镜像回测 — U1~U4 拒=prefilter,
+                # 全过=signal, 其余取当日最深判定步); sig 传 dict (Signal dataclass 落盘可读)
+                if live_probes is not None and _probe_ok.get(key) and (day_tr.items or sigs):
+                    if sigs and not kept:
+                        stage, u_fails = "prefilter", last_u_fails
+                    elif kept:
+                        stage, u_fails = "signal", None
+                    else:
+                        stage, u_fails = None, None
+                    from dataclasses import asdict as _asdict
+                    strat._probe_day(
+                        live_probes[key], day_tr, bars, len(bars) - 1, code,
+                        stock_info.get(code), stage=stage, u_fails=u_fails,
+                        sig=_asdict(kept[0] if kept else sigs[0]) if sigs else None)
+                rows.extend(store.signal_row(key, s, name) for s in kept)
+            if (i + 1) % 500 == 0:
+                logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
+                            i + 1, len(codes), len(rows), time.time() - t0)
+    finally:
+        for _pr in (live_probes or {}).values():
+            _pr.close()
 
     # 每日信号入库上限 (per-strategy 全市场口径, config.json daily_limit; score 降序截断)
     capped = []

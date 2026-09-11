@@ -183,7 +183,11 @@ def build(probe_paths, indexes, keep_win=False, dup_mode="dedup", out_path=None)
             feat = {k: v for k, v in (d.get("features") or {}).items() if keep_win or k != "win"}
             r = {
                 "strategy": strat, "code": d.get("code"), "d0_date": d0,
-                "stage": d.get("stage"), "kind": kinds.get(strat),
+                "stage": d.get("stage"),
+                # 行类型恒 sample; scan_spec 类别单列 spec_kind
+                # (2026-09-11 撞名教训: 曾把 kind 覆盖成 scan_spec.kind, 下游按
+                #  kind=="sample" 过滤全空 — 重建库才修复)
+                "kind": "sample", "spec_kind": kinds.get(strat),
                 "features": {**feat, **env},
                 "labels": d.get("labels") or {},
                 "rule_trace": d.get("rule_trace"),
