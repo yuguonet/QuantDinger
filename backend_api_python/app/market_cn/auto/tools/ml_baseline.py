@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--top", type=float, nargs="*", default=[0.1, 0.2],
                     help="top 分位评估档 (默认 0.1 0.2)")
     ap.add_argument("--out", default=None, help="报告输出路径 (默认 tmp/ml_baseline_<tag>.md)")
+    ap.add_argument("--strategy", nargs="*", default=None,
+                    help="只用指定策略样本训练/评估 (默认全部; v1/lu 占 92% 会淹没 dragon 系, 归因时用)")
     args = ap.parse_args()
 
     path = args.sample
@@ -97,7 +99,7 @@ def main():
         row = np.empty(len(feat_names), dtype=np.float32)
         for j, name in enumerate(feat_names[:-2]):
             x = feat.get(name)
-            row[j] = np.nan if isinstance(x, (str, bool)) or x is None else x
+            row[j] = np.nan if isinstance(x, (str, bool)) or x is None or abs(x) > 1e15 else x
         s, st, sp = d.get("strategy") or "?", d.get("stage") or "?", d.get("split") or "?"
         for key, val in (("strategy", s), ("stage", st), ("split", sp)):
             if val not in books[key]:
@@ -119,6 +121,13 @@ def main():
     stage_a = np.asarray(stgs)
     split_a = np.asarray(spls)
     xs.clear()
+    # --strategy 过滤 (归因: 全库训练时 v1/lu 样本占绝对多数, 会淹没小策略信号)
+    if args.strategy:
+        keep_keys = [books["strategy"][s] for s in args.strategy if s in books["strategy"]]
+        keep = np.isin(strat_a, keep_keys)
+        X, y = X[keep], y[keep]
+        strat_a, stage_a, split_a = strat_a[keep], stage_a[keep], split_a[keep]
+        print(f"strategy filter {args.strategy}: kept {int(keep.sum())} rows")
     inv_strategy = {v: k for k, v in books["strategy"].items()}
     inv_stage = {v: k for k, v in books["stage"].items()}
     inv_split = {v: k for k, v in books["split"].items()}
@@ -140,7 +149,8 @@ def main():
     t1 = time.time()
     model.fit(X[m_train], (y[m_train] > 0).astype(int),
               eval_set=[(X[m_valid], (y[m_valid] > 0).astype(int))],
-              eval_metric="auc", callbacks=[lgb.early_stopping(50, verbose=False)])
+              eval_metric="auc", feature_name=feat_names,
+              callbacks=[lgb.early_stopping(50, verbose=False)])
     print(f"trained in {time.time() - t1:.0f}s, best_iter={model.best_iteration_}")
 
     lines = ["# M4 GBDT 基线报告", "",
@@ -215,7 +225,7 @@ def main():
               + ", split=" + json.dumps(inv_split, ensure_ascii=False)
               + ", stage=" + json.dumps(inv_stage, ensure_ascii=False), ""]
 
-    out = args.out or os.path.join(_ML_DIR, "..", "..", "..", "..", "tmp",
+    out = args.out or os.path.join(_ML_DIR, "..", "..", "..", "tmp",
                                    f"ml_baseline_{time.strftime('%m%d_%H%M')}.md")
     out = os.path.normpath(out)
     os.makedirs(os.path.dirname(out), exist_ok=True)

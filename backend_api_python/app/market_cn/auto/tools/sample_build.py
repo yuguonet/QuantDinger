@@ -122,6 +122,10 @@ def build(probe_paths, indexes, keep_win=False, dup_mode="dedup", out_path=None)
     del seen   # pass1 键集用完即释放, pass2 用独立 emitted 集合 (避免双持 300 万级键集)
 
     # 策略判定时点类别 (注册表 scan_spec.kind, 不硬编码策略名)
+    # 易错点: _REGISTRY 在 autodiscover() 前为空, get_strategy 返回 None 会
+    # 全部静默落进 except 兜底 (首建即踩: 四策略全成了 intraday_window)
+    from app.market_cn.auto.strategies import autodiscover, get_strategy
+    autodiscover()
     kinds = {}
     for s in strategies:
         try:

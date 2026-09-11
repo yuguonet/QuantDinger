@@ -73,7 +73,9 @@ def sample_feats(bars, i, code, stock_info=None):
                  round(float(b["volume"] or 0) / 100, 1)]
                 for b in bars[max(0, i - 29):i + 1]],
         "d0_pct_chg": round((float(d0["close"]) / prev_c - 1) * 100, 2) if prev_c > 0 else None,
-        "vol_r": round(vol0 / vol_prev, 2) if vol_prev > 0 else None,
+        # 易错点: kline DB 偶发 volume 脏值 (如 5.88e-39, float32 下溢级), >0 防护挡不住,
+        # 除出来 1e46 级垃圾特征 (2026-09-11 实证 45 行); 成交量单位=手, <1 手视为无效记 None
+        "vol_r": round(vol0 / vol_prev, 2) if vol_prev >= 1 else None,
         "turnover_d0": round(vol0 / circ * 100, 2) if circ > 0 else None,
         "circ_mv_yi": round(float(d0["close"]) * circ / 1e8, 2) if circ > 0 else None,
         "rsi6": _rsi(closes, period=6),
