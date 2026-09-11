@@ -345,7 +345,7 @@ export default {
       _streamActive = true
       const toolEvents = reactive([]) // reactive 包装：push/字段变更都能被模板响应（原闭包数组 Vue 检测不到）
       _pendingToolEvents = toolEvents
-      pushMessage('assistant', '', { streaming: true, toolEvents })
+      pushMessage('assistant', '', { streaming: true, toolEvents, progressSteps: [], stepContents: [] })
 
       // 注册模块级回调（通过 _currentCallbacks 代理，组件卸载也不中断）
       const makeCb = (name) => (...args) => _currentCallbacks[name]?.(...args)
@@ -413,13 +413,14 @@ export default {
           }
         },
         onToolStart: (ev) => {
-          toolEvents.push({ ...ev, status: 'loading', streamOutput: '' })
+          toolEvents.push({ ...ev, status: 'loading', streamOutput: '', recovery: ev.recovery || '' })
           connected.value = true
         },
         onToolDone: (ev) => {
           const item = toolEvents.find((t) => t.tool === ev.tool && t.status === 'loading')
           if (item) {
             item.status = ev.success === false ? 'error' : 'done'
+            if (ev.recovery) item.recovery = ev.recovery
           }
         },
         onDone: (ev) => {

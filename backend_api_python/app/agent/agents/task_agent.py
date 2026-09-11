@@ -1295,9 +1295,21 @@ class TaskAgent(AgentBase):
 
             # 逐节点流式执行（2026-09-11 SSE 改造）：每个节点完成时经 event_cb 播报
             # 节点生命周期，执行节点产出 step/tool 事件由 _build_code_agent 的钩子上报。
+            # node_start 播报：astream 仅按"节点完成"粒度回调，故入口节点先行播报、
+            # 后续节点在上一节点完成且路由确定时播报（路由函数与图内共用、纯函数）。
             # event_cb 为 None 时行为与原 ainvoke 等价（只是换用 astream 驱动）。
             result = {}
             _node_cn = {"chat": "意图解析", "plan": "任务规划", "execute": "工具执行", "finalize": "结果整理"}
+            _node_next = {"chat": route_after_chat, "plan": route_after_plan, "execute": route_after_execute}
+
+            def _emit_node_start(_n):
+                if event_cb is not None and _n in _node_cn:
+                    try:
+                        event_cb({"kind": "node_start", "node": _n, "label": _node_cn.get(_n, _n)})
+                    except Exception:
+                        pass
+
+            _emit_node_start("chat")
             async for _evt in compiled.astream(initial_state):
                 result = _evt.get("state", result)
                 _node = _evt.get("node")
@@ -1320,6 +1332,9 @@ class TaskAgent(AgentBase):
                         if _plan:
                             event_cb({"kind": "progress",
                                       "message": "规划完成：" + str(_plan)[:200]})
+                    _router = _node_next.get(_node)
+                    if _router is not None:
+                        _emit_node_start(_router(result))
                 except Exception:
                     pass  # 事件通道故障不阻断主流程
 

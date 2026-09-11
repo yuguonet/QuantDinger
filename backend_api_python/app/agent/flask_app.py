@@ -28,6 +28,53 @@ logger = logging.getLogger(__name__)
 agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 
+def _translate_agent_event(ev: dict) -> list:
+    """agent 语义事件 -> 前端 wire 协议帧（按 type 分发）。
+
+    前端 agent.js 的分发契约：node_start / node_done / progress /
+    step_content / tool_start / tool_done / done / error。
+    agent 侧以 kind 标记语义，在此翻译——保持前端契约不变。
+    （2026-09-12 修复：原实现直接包 {"type":"event"}，与前端分发不匹配，
+    过程事件被静默丢弃。）
+    """
+    kind = ev.get("kind")
+    if kind == "action_step":
+        # smolagents 步骤完成 -> 工具卡片（start+done 一对）
+        n = ev.get("step_number")
+        n = n if n is not None else "?"
+        tools = ev.get("tools") or []
+        tool_id = "step_%s" % n
+        if tools:
+            disp = "步骤 %s · %s" % (n, "、".join(str(t) for t in tools[:3]))
+        else:
+            disp = "分析步骤 %s" % n
+        info = ""
+        for _ln in str(ev.get("code_action") or "").splitlines():
+            _ln = _ln.strip()
+            if _ln and not _ln.startswith("#") and not _ln.startswith("```"):
+                info = _ln[:60]
+                break
+        frames = [{"type": "tool_start", "tool": tool_id,
+                   "display_name": disp, "info": info}]
+        done_ev = {"type": "tool_done", "tool": tool_id,
+                   "success": not ev.get("error")}
+        if ev.get("error"):
+            done_ev["recovery"] = str(ev.get("error"))[:160]
+        frames.append(done_ev)
+        return frames
+    if kind in ("node_start", "node_done"):
+        return [{"type": kind, "node": ev.get("node"), "label": ev.get("label")}]
+    if kind == "node_error":
+        label = ev.get("label") or ev.get("node") or "节点"
+        return [{"type": "progress", "message": "⚠ %s 执行异常，正在恢复" % label}]
+    if kind == "step_content":
+        return [{"type": "step_content", "content": ev.get("content")}]
+    if kind == "progress":
+        return [{"type": "progress", "message": ev.get("message")}]
+    # 未知事件原样透传（向前兼容）
+    return [{"type": "event", **ev}]
+
+
 def _sse_stream(message: str, session_id: str, timeout: int = 300):
     """SSE 生成器（2026-09-11 重写）：过程事件真流式。
 
@@ -45,7 +92,8 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
     def _event_cb(ev: dict):
         """agent 线程 -> SSE 通道的唯一入口。绝不抛异常、绝不阻塞。"""
         try:
-            ev_queue.put({"type": "event", **ev}, timeout=1)
+            for _frame in _translate_agent_event(ev):
+                ev_queue.put(_frame, timeout=1)
         except Exception:
             pass  # 流式通道故障不影响主任务
 
