@@ -149,6 +149,13 @@ class NodeContext:
             provider.scan_directory(tools_dir, domain="common", package_prefix="tools")
             # 扫描 tools/ 子目录（领域工具）
             provider.scan_subdirectories(tools_dir, package_prefix="tools")
+            # 能力发现层（A 阶段 2026-09-12）: admission.json 准入的只读函数 -> domain="quant"
+            try:
+                from capabilities import register_capabilities
+                _cap_n = register_capabilities(provider)
+                logger.info("[Context] 能力层注册: %d 个函数 (domain=quant)", _cap_n)
+            except Exception as e:
+                logger.warning("[Context] 能力层注册失败（不阻断启动）: %s", e)
             _SHARED_TOOL_PROVIDER = provider
             ToolProvider.set_default(provider)  # 全局默认 provider 只在首扫时设置一次
             logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
@@ -425,7 +432,9 @@ def make_chat_node(ctx: NodeContext):
             # 从文件加载意图分类器 prompt
             intent_system = ""
             try:
-                import os
+                # 易错点（2026-09-12 修复）: 不可在函数内 `import os`——会让整个 chat_node 的
+                # os 变量成为局部变量, 上方 RAG 段（os.getenv）先于本行执行会抛 UnboundLocalError,
+                # RAG 检索静默失败。模块顶部已有 import os, 此处直接复用。
                 intent_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "intent_classifier.txt")
                 with open(intent_prompt_path, encoding="utf-8") as f:
                     intent_system = f.read()
