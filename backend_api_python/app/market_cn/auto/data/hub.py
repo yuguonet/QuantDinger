@@ -414,6 +414,43 @@ def index_daily(code="000001", days=800, as_of=None, force=False):
     return bars
 
 
+def index_minute(code="000300", days=800, as_of=None):
+    """指数 5m K线 (list[dict] time/open/high/low/close/volume/up_count/down_count,
+    time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_5m
+    (scripts/sync_index_minute.py 盘后落库, 2026-09-11 起; 无磁盘缓存 — DB 即存储)。
+
+    code 用 6 位指数码 ("000300"=沪深300, "399006"=创业板指), 存储符号按
+    399*→.SZ / 其余→.SH 映射 (与 sync_index_daily.INDICES 同键)。
+    up/down_count = 当根 bar 涨/跌家数 (市场宽度)。
+    as_of: 只返回该交易日(含)以前 —— 与 daily()/index_daily() 同语义;
+    **必须先过滤后尾切** (先 [-days:] 再过滤会把历史 as_of 的全部未来根裁掉,
+    2026-09-11 hub.index_daily 同型 bug 的教训)。
+    """
+    sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
+    from app.utils.db_market import get_market_db_manager
+    mgr = get_market_db_manager()
+    mgr.ensure_market_db("CNStock")
+    pool = mgr._get_pool("CNStock")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if as_of:
+                cur.execute(
+                    f'SELECT time, open, high, low, close, volume, up_count, down_count '
+                    f'FROM "kline_index_5m" WHERE symbol = %s AND time::date <= %s '
+                    f'ORDER BY time ASC',
+                    (sym, str(as_of)[:10]))
+            else:
+                cur.execute(
+                    f'SELECT time, open, high, low, close, volume, up_count, down_count '
+                    f'FROM "kline_index_5m" WHERE symbol = %s ORDER BY time ASC',
+                    (sym,))
+            rows = cur.fetchall()
+    bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"), "open": r[1], "high": r[2],
+             "low": r[3], "close": r[4], "volume": r[5],
+             "up_count": r[6], "down_count": r[7]} for r in rows]
+    return bars[-days:] if days and len(bars) > days else bars
+
+
 # ================================================================
 # daily_live 收盘对账 (微差持续监控; 调度接入在 S 阶段, 先提供函数+CLI)
 # ================================================================

@@ -184,6 +184,27 @@ def _refresh_backfill_1m():
     run_1m()
 
 
+def _sync_index_minute():
+    """盘后: 指数 5m K线同步 → kline_index_5m (指数分钟不可回补, 只能向前攒;
+    幂等 upsert, 800 根窗口断采一周可补回)。
+    scripts/ 目录脚本, 用 importlib 按路径载入 (scripts/ 不在 app 包内)。"""
+    import importlib.util
+    import os as _os
+    _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.abspath(__file__))))), "scripts", "sync_index_minute.py")
+    if not _os.path.isfile(_p):
+        logger.warning("[index_minute] 未找到 scripts/sync_index_minute.py, 跳过")
+        return
+    try:
+        _spec = importlib.util.spec_from_file_location("sync_index_minute", _p)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        r = _mod.sync()
+        logger.info("[index_minute] 指数 5m 同步: %s", r)
+    except Exception as e:
+        logger.error("[index_minute] 执行失败: %s", e)
+
+
 def _refresh_backfill_1d() -> dict:
     """覆写 1D，返回 {status, written, skipped}。"""
     from app.data_sources.backfill_db import run_1d
@@ -213,6 +234,9 @@ def _post_market_batch():
 
     # 1m K线回填 (mootdx, 每标的240条) — 替代原 15m，精度更高
     _refresh_backfill_1m()
+
+    # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
+    _sync_index_minute()
 
     _refresh_daily()
     _refresh_post_market()
