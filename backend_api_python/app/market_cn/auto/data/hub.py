@@ -12,7 +12,9 @@
   - 盘中唯一通道: realtime_snapshot_YYYY (60s/拍, 保留 5 工作日, 可能丢拍) ——
     quote/market_snapshot/day_series/minute_live/daily_live 合成段全部来自它;
   - minute_live 输出按 mi 标准化并丢弃无效槽位 (缺口容忍), 调用方按槽位数自判数据是否足够;
-  - lhb: 只读引用 market_cn/dragon_tiger_store (名单型事件数据, 不 OHLVC 化)。
+  - lhb: 只读引用 market_cn/dragon_tiger_store (名单型事件数据, 不 OHLVC 化);
+  - index_daily: 指数日线 (M3 环境特征通道, 09-11), 只读引用 market_cn/index.py
+    降级链, hub 侧加磁盘缓存 —— L2 盘后补数语义: 缓存新鲜零外网, 过期才刷新。
 
 关键设计点:
   - as_of 全线贯通: daily/minute_1m 只返回 as_of 当日及以前 —— 数据层兜底防未来函数,
@@ -31,6 +33,8 @@
 """
 from __future__ import annotations
 
+import json as _json
+import os as _os
 import time as _time
 
 from app.utils.logger import get_logger
@@ -40,7 +44,7 @@ logger = get_logger(__name__)
 __all__ = [
     "daily", "daily_live", "minute_1m", "minute_live",
     "quote", "market_snapshot", "day_series",
-    "stock_info", "all_codes", "lhb",
+    "stock_info", "all_codes", "lhb", "index_daily",
     "reconcile_daily_live",
 ]
 
@@ -308,6 +312,102 @@ def lhb(stock_code=None, trade_date="", days=30):
     except Exception as e:
         logger.warning("[hub] 龙虎榜读取失败: %s", e)
         return []
+
+
+# ================================================================
+# 指数日线 (M3 环境特征通道, 2026-09-11)
+# ================================================================
+
+# 易错: 相对 __file__ 需回退 4 级 auto/data → market_cn → app → backend_api_python
+# (与 frames.CACHE_DIR 同款路径推导, 缓存放 data/market_cn_cache 不进源码树)
+INDEX_CACHE_DIR = _os.path.normpath(_os.path.join(
+    _os.path.dirname(__file__), "..", "..", "..", "..",
+    "data", "market_cn_cache", "index"))
+
+_INDEX_FETCH_CAP = 800   # mootdx TDX 协议单次上限 (index.py 同款约束)
+
+
+def _index_cache_path(code):
+    return _os.path.join(INDEX_CACHE_DIR, f"{code}_1d.json")
+
+
+def _index_norm_bars(raw):
+    """index.py 返回行 → 规范 bar dict (date 升序, 数值化, 缺 date 丢弃)。"""
+    out = []
+    for r in raw or []:
+        d = str(r.get("date", ""))[:10]
+        if len(d) != 10:
+            continue
+        try:
+            bar = {"date": d}
+            for f in ("open", "high", "low", "close", "volume", "amount"):
+                v = r.get(f)
+                bar[f] = float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        out.append(bar)
+    out.sort(key=lambda b: b["date"])
+    return out
+
+
+def _index_load_cache(code):
+    try:
+        with open(_index_cache_path(code), "r", encoding="utf-8") as f:
+            payload = _json.load(f)
+        return payload.get("bars") or []
+    except (OSError, ValueError):
+        return []
+
+
+def _index_save_cache(code, bars):
+    try:
+        _os.makedirs(INDEX_CACHE_DIR, exist_ok=True)
+        tmp = _index_cache_path(code) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump({"code": code, "fetched_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "bars": bars}, f, ensure_ascii=False)
+        _os.replace(tmp, _index_cache_path(code))    # 原子落盘
+    except OSError as e:
+        logger.warning("[hub] 指数缓存写盘失败 (%s): %s", code, e)
+
+
+def index_daily(code="000001", days=800, as_of=None, force=False):
+    """指数日线 (list[dict] date/open/high/low/close/volume/amount, date 升序)。
+
+    code 默认 "000001"=上证指数 (index.py 约定, 非个股); 沪深300 用 "000300"。
+    缓存策略 (L2 盘后补数语义): 磁盘缓存 {code}_1d.json, 末根 date < 今日 视为过期
+    → force/缺失/过期才触远端降级链 (mootdx→tencent→sina→baostock), 命中缓存零外网;
+    远端失败但有旧缓存时回退旧缓存 (告警, 不空手)。
+    as_of: 只返回该交易日(含)以前 —— 与 daily() 同语义, 离线重放防未来函数。
+    注意: 远端只保证最近 ~800 根 (TDX 上限), 更长窗口不可用。
+    """
+    from datetime import datetime
+    cached = _index_load_cache(code)
+    fetch_days = min(max(days, 400), _INDEX_FETCH_CAP)
+    stale = (not cached) or cached[-1]["date"] < datetime.now().strftime("%Y-%m-%d")
+    if force or stale or len(cached) < days:
+        try:
+            from app.market_cn.index import get_index_daily_kline
+            fresh = _index_norm_bars(get_index_daily_kline(code, fetch_days, force=True))
+        except Exception as e:
+            fresh = []
+            logger.warning("[hub] 指数日线远端失败 (%s): %s", code, e)
+        if fresh:
+            if cached and cached[0]["date"] < fresh[0]["date"]:
+                merged = {b["date"]: b for b in cached}      # 远端窗口覆盖不到的旧根保留
+                merged.update({b["date"]: b for b in fresh})
+                fresh = [merged[d] for d in sorted(merged)]
+            _index_save_cache(code, fresh)
+            cached = fresh
+        elif not cached:
+            return []                                        # 无缓存且远端失败
+        else:
+            logger.warning("[hub] 指数日线远端失败, 回退旧缓存 (%s, 末根 %s)",
+                           code, cached[-1]["date"])
+    bars = cached[-days:] if days and len(cached) > days else cached
+    if as_of:
+        bars = [b for b in bars if b["date"] <= str(as_of)[:10]]
+    return bars
 
 
 # ================================================================
