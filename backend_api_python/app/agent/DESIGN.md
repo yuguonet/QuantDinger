@@ -995,6 +995,21 @@ E:\llama.cpp\llama-server.exe ^
 
 ---
 
+### 5.3 单进程假设（重要）
+
+agent 子系统以下状态为**进程内单例**，多 gunicorn worker 会直接失效：
+
+| 组件 | 状态 | 多 worker 时的症状 |
+|------|------|--------------------|
+| feedback 会话→root 映射 | 模块级 dict | 负面反馈找不到对应 trace，惩罚失效 |
+| ToolProvider | 类单例 set_default | 各 worker 重复扫描，全局覆盖互踩 |
+| trace（utils/tracing.py） | 模块级状态 | 跨进程 trace 断裂，chain 统计失真 |
+| message_queue | 进程内 Queue + worker 线程 | 消息分属不同进程队列，SSE 订阅收不到其它进程的结果 |
+
+部署约束：保持 `GUNICORN_WORKERS=1`（gunicorn_config.py 头部注释已同步），
+并发吞吐用 `GUNICORN_THREADS`（gthread）扩展。
+扩 worker 前置条件：上述四项完成进程安全改造（共享存储或 sticky 路由）。
+
 ## 六、数据流
 
 ### 6.1 请求数据流

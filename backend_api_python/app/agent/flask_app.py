@@ -29,12 +29,52 @@ agent_v2_bp = Blueprint("agent_v2", __name__, url_prefix="/api/agent-v2")
 
 
 def _sse_stream(message: str, session_id: str, timeout: int = 300):
-    """SSE 生成器：通过统一消息队列执行 agent，推送结果。"""
+    """SSE 生成器（2026-09-11 重写）：过程事件真流式。
+
+    机制：event_cb 把 agent 过程事件（节点生命周期/工具步骤）入队；
+    本生成器 0.3s 粒度排空队列 yield 给前端，15s 无事件发心跳注释行保活
+    （防 nginx/代理空闲断连）。future 完成后补排残余事件，最后发 done
+    （content=AgentResponse.content，与前端 onDone 契约一致）。
+    前端 agent.js 已实现 node/tool/step/progress 全部回调，事件契约不变。
+    """
+    import queue as _queue
     from message_queue import submit
 
+    ev_queue: _queue.Queue = _queue.Queue()
+
+    def _event_cb(ev: dict):
+        """agent 线程 -> SSE 通道的唯一入口。绝不抛异常、绝不阻塞。"""
+        try:
+            ev_queue.put({"type": "event", **ev}, timeout=1)
+        except Exception:
+            pass  # 流式通道故障不影响主任务
+
+    future = submit(message, session_id=session_id, timeout=timeout, event_cb=_event_cb)
+
+    ticks = 0
+    while True:
+        try:
+            ev = ev_queue.get(timeout=0.3)
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            continue
+        except _queue.Empty:
+            pass
+        if future.done():
+            # 排空残余事件再收尾（事件与 done 可能乱序到达队列）
+            while True:
+                try:
+                    ev = ev_queue.get_nowait()
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                except _queue.Empty:
+                    break
+            break
+        ticks += 1
+        if ticks >= 50:  # 0.3s * 50 = 15s 心跳
+            yield ": ping\n\n"
+            ticks = 0
+
     try:
-        future = submit(message, session_id=session_id, timeout=timeout)
-        result = future.result(timeout=timeout)
+        result = future.result(timeout=1)
         yield f"data: {json.dumps({'type': 'done', 'content': result, 'session_id': session_id}, ensure_ascii=False)}\n\n"
     except Exception as exc:
         logger.error("Agent 异常: %s", exc, exc_info=True)
@@ -86,6 +126,26 @@ def list_skills():
         return jsonify({"error": str(e)}), 500
 
 
+def _resolve_user_ns() -> str:
+    """多用户上下文命名空间（2026-09-11）。
+
+    JWT 有效 -> "user:<id>"；否则回退 "anon:<ip>"。
+    session_id 最终形如 "user:3:session_xxx"，memory/事件总线/trace 全链路按此 key
+    隔离 —— 上下文在后端按用户隔离，前端仅缓存显示层。
+    """
+    try:
+        from app.utils.auth import verify_token
+        auth = (request.headers.get("Authorization") or request.headers.get("token") or "").strip()
+        token = auth[7:] if auth.lower().startswith("bearer ") else auth
+        if token:
+            payload = verify_token(token)
+            if payload and payload.get("user_id") is not None:
+                return f"user:{payload['user_id']}"
+    except Exception:
+        pass
+    return f"anon:{request.remote_addr or 'unknown'}"
+
+
 @agent_v2_bp.route("/chat", methods=["POST"])
 def chat():
     """普通对话（SSE）。TaskAgent 内部决定是否调用工具。"""
@@ -93,6 +153,8 @@ def chat():
         data = request.get_json() or {}
         message = data.get("message", "").strip()
         session_id = data.get("session_id") or str(uuid.uuid4())
+        # 多用户隔离（2026-09-11）：按 JWT user_id 加命名空间前缀
+        session_id = f"{_resolve_user_ns()}:{session_id}"
         if not message:
             return jsonify({"error": "message 不能为空"}), 400
 
@@ -112,6 +174,8 @@ def task():
         data = request.get_json() or {}
         message = data.get("message", "").strip()
         session_id = data.get("session_id") or str(uuid.uuid4())
+        # 多用户隔离（2026-09-11）：按 JWT user_id 加命名空间前缀
+        session_id = f"{_resolve_user_ns()}:{session_id}"
         if not message:
             return jsonify({"error": "message 不能为空"}), 400
 

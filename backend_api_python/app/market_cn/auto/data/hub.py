@@ -404,9 +404,13 @@ def index_daily(code="000001", days=800, as_of=None, force=False):
         else:
             logger.warning("[hub] 指数日线远端失败, 回退旧缓存 (%s, 末根 %s)",
                            code, cached[-1]["date"])
-    bars = cached[-days:] if days and len(cached) > days else cached
+    # as_of 必须先于尾部切片 (2026-09-11 修): 先 [-days:] 再过滤会把历史 as_of
+    # 之前的全部"未来"根裁掉 → 恒空 (break_v2 回测 env 门失效根因)。
+    # 正确语义 = "该交易日(含)以前" 的最后 days 根。
+    bars = cached
     if as_of:
         bars = [b for b in bars if b["date"] <= str(as_of)[:10]]
+    bars = bars[-days:] if days and len(bars) > days else bars
     return bars
 
 

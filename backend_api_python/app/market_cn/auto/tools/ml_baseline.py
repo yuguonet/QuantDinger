@@ -86,12 +86,21 @@ def main():
     print(f"sample library: {path}")
 
     # ---- 流式装载 ----
+    # 易错点: 过滤必须在装载循环内做——装载后再 X[keep] 会全量驻留+复制双持,
+    # 内存峰值超沙箱上限被杀 (2026-09-11 实证, v1 子集两连死);
+    # 循环内 continue 则非目标策略行零驻留
     t0 = time.time()
     xs, ys, strs, stgs, spls = [], [], [], [], []
     feat_names = None
     books = {"strategy": {}, "stage": {}, "split": {}}
     n = 0
+    n_skip = 0
+    want = set(args.strategy) if args.strategy else None
     for d in _iter_samples(path):
+        s = d.get("strategy") or "?"
+        if want is not None and s not in want:
+            n_skip += 1
+            continue
         if feat_names is None:
             feat_names = [k for k in sorted(d["features"]) if k != "win"]
             feat_names += ["strategy_code", "board_type_code"]
@@ -121,17 +130,11 @@ def main():
     stage_a = np.asarray(stgs)
     split_a = np.asarray(spls)
     xs.clear()
-    # --strategy 过滤 (归因: 全库训练时 v1/lu 样本占绝对多数, 会淹没小策略信号)
-    if args.strategy:
-        keep_keys = [books["strategy"][s] for s in args.strategy if s in books["strategy"]]
-        keep = np.isin(strat_a, keep_keys)
-        X, y = X[keep], y[keep]
-        strat_a, stage_a, split_a = strat_a[keep], stage_a[keep], split_a[keep]
-        print(f"strategy filter {args.strategy}: kept {int(keep.sum())} rows")
     inv_strategy = {v: k for k, v in books["strategy"].items()}
     inv_stage = {v: k for k, v in books["stage"].items()}
     inv_split = {v: k for k, v in books["split"].items()}
     print(f"loaded: {n} rows x {X.shape[1]} feats ({time.time() - t0:.0f}s), "
+          f"skipped={n_skip}, "
           f"strategies={ {inv_strategy[v]: int((strat_a == v).sum()) for v in set(strat_a)} }")
 
     # ---- 训练/评估 ----

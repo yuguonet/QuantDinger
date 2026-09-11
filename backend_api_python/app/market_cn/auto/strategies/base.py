@@ -106,6 +106,9 @@ class StrategyBase:
     name: str = ""
     prefilter_anchor: str = "signal"
     entry_style: str = "a"             # qd_dragon_signals.entry_style (同策略多形态时区分)
+    family: str = ""                   # 版本链 family 根 (空=自身 key; 如 break_v2→"break",
+                                       #  扫描展示归一按 (code,family,style) 去重; config 可覆盖)
+    family_version: int = 1            # 链内版本号 (同族重叠取最高版本, 加高版本自动识别)
     scan_spec: ScanSpec = field(default_factory=ScanSpec)
     default_params: dict = field(default_factory=dict)
     use_unified_prefilter: bool = True

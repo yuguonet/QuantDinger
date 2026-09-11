@@ -189,7 +189,7 @@
 </template>
 
 <script>
-import { ref, computed, nextTick, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, watch, reactive } from 'vue'
 import { message } from 'ant-design-vue'
 // icons: using <a-icon type="xxx" /> (ant-design-vue 1.x pattern)
 
@@ -343,7 +343,7 @@ export default {
     async function sendStream (text) {
       streaming.value = true
       _streamActive = true
-      const toolEvents = []
+      const toolEvents = reactive([]) // reactive 包装：push/字段变更都能被模板响应（原闭包数组 Vue 检测不到）
       _pendingToolEvents = toolEvents
       pushMessage('assistant', '', { streaming: true, toolEvents })
 
@@ -372,12 +372,28 @@ export default {
       // 绑定实际回调
       _currentCallbacks = {
         onNodeStart: (ev) => {
-          // planner 节点开始时显示思考状态
-          if (ev.node === 'planner') {
-            updateLastMessage('🤔 分析中...')
+          // 节点生命周期进入进度列表（2026-09-11 SSE 过程事件）
+          const last = messages.value[messages.value.length - 1]
+          if (last) {
+            if (!last.progressSteps) last.progressSteps = []
+            const labels = { chat: '解析意图', plan: '规划任务', execute: '执行工具', finalize: '整理结果' }
+            const label = labels[ev.node] || (ev.node || '处理中')
+            last.progressSteps.push('▶ ' + label + '…')
+            nextTick(() => scrollToBottom())
           }
         },
-        onNodeDone: () => {},
+        onNodeDone: (ev) => {
+          // 节点完成：对应进度行打勾（与 onNodeStart 的 ▶ 行一一对应）
+          const last = messages.value[messages.value.length - 1]
+          if (last && last.progressSteps && last.progressSteps.length) {
+            const labels = { chat: '解析意图', plan: '规划任务', execute: '执行工具', finalize: '整理结果' }
+            const label = labels[ev.node] || ev.node || '完成'
+            const idx = last.progressSteps.findIndex((s) => typeof s === 'string' && s.indexOf('▶ ') === 0 && s.indexOf(label) > 0)
+            if (idx >= 0) last.progressSteps.splice(idx, 1, '✓ ' + label)
+            else last.progressSteps.push('✓ ' + label)
+            nextTick(() => scrollToBottom())
+          }
+        },
         onProgress: (ev) => {
           // 工具规划进度
           const last = messages.value[messages.value.length - 1]

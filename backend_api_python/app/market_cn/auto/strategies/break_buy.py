@@ -7,6 +7,7 @@
   断板期检查 5a~5f: 低点不破涨停日开盘 / 缩量1.2~2.0x / 首断日涨跌+gap 区间 /
   回撤不破限 / 确认日增强过滤(三通道OR: 企稳[0,2) | 均量比≥1.4 | 前20日涨幅≥30)
   竞价: 无 gap 过滤 (恒可买, gap 判定交给 D1 数据)
+  换手率门 (2026-09-11): 确认日换手 < turnover_min (config params, None=关) → 剔除
   U1~U4: prefilter_anchor='signal' (锚定确认日=末根bar; 连板≥2已隐含U4)
 
 出场 (收盘价判定, monitor break 分支 / run_backtest_breakbuy 语义):
@@ -45,7 +46,14 @@ BOARD_PARAMS = {
                  "first_break_gap_min": 0, "first_break_chg_min": 0.0},
 }
 
-DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5)
+DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5,
+                      # 确认日换手率前置门 (2026-09-11 ML归因反哺, 数学必要条件):
+                      # turnover_sig(=D0成交量/流通股本*100, 与样本库 turnover_d0 同口径)
+                      # < turnover_min 的候选直接剔除。None=关 (默认, 保持历史行为);
+                      # config.json strategies.break.params.turnover_min 开启 (实测 21.7:
+                      # align级 Δ+1.76 两段稳 / 日级七档全平坦 / signal级 60.4%/+3.42,
+                      # 见 tmp/break_confirm_归因报告.md)。circ 缺失 fail-open 不拦。
+                      turnover_min=None)
 
 
 # ================================================================
@@ -259,7 +267,17 @@ class BreakStrategy(StrategyBase):
                     probe.trace("align", code=code, d0_date=str(bars[i]["time"])[:10],
                                 break_days=sig.get("break_days"))
                 continue
+            # 换手率前置门 (ML归因反哺, 数学必要条件; turnover_min=None 时零开销直通)
             circ = float((params.get("stock_info") or {}).get("circ_shares") or 0)
+            _tmin = p.get("turnover_min")
+            if _tmin and circ > 0:
+                _to_sig = float(bars[i]["volume"]) / circ * 100
+                if _to_sig < _tmin:
+                    if probe is not None:
+                        probe.trace("prefilter", code=code, gate="turnover_min",
+                                    d0_date=str(bars[i]["time"])[:10],
+                                    turnover_sig=round(_to_sig, 2), turnover_min=_tmin)
+                    continue
             total = float((params.get("stock_info") or {}).get("total_shares") or 0)
             extra = dict(sig)
             extra.update({
@@ -356,6 +374,13 @@ class BreakStrategy(StrategyBase):
         from app.market_cn.auto.common.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
         min_streak, max_break_gap = 2, 5   # 旧 backtest_break_stock 默认值 (run_all 从不覆盖)
+        # 换手率门从 config 透传 (2026-09-11): backtest 唯一受 config params 影响的键,
+        # 其余枚举参数仍走代码默认 — turnover_min=None (config 未写) 时行为与历史零差异
+        from app.market_cn.auto import strategies as _strat_reg
+        try:
+            _turnover_min = _strat_reg.params_override(self.key).get("turnover_min")
+        except Exception:
+            _turnover_min = None
         bt_type = get_board_type(code)
         params = dict(BOARD_PARAMS[bt_type])
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
@@ -381,6 +406,7 @@ class BreakStrategy(StrategyBase):
             sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
                 bars[:i + 1], code,
                 min_streak=min_streak, max_break_gap=max_break_gap,
+                turnover_min=_turnover_min,
                 limit_ups=[j for j in lu_all if j < i],
                 stock_info=stock_info, probe=day_tr)]
             if not sigs:

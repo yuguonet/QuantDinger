@@ -3,8 +3,20 @@
   "live_probe": true,
   "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。live_probe=实盘扫描探针总开关 (M1 实盘采集, 2026-09-11; 默认 true, false 关闭 — 每日盘后扫描按策略产 sample 存档到 tmp/probes/。注意: 探针只记特征/判定轨迹, 标签 censored 由离线回填)。",
   "schedule": {
-    "knife_catch": {"windows": ["14:30", "15:00"], "interval_sec": 60},
-    "tail_oversold": {"windows": ["14:50", "15:00"], "interval_sec": 60}
+    "knife_catch": {
+      "windows": [
+        "14:30",
+        "15:00"
+      ],
+      "interval_sec": 60
+    },
+    "tail_oversold": {
+      "windows": [
+        "14:50",
+        "15:00"
+      ],
+      "interval_sec": 60
+    }
   },
   "strategies": {
     "dragon_callback": {
@@ -64,6 +76,11 @@
         "stop_pct": -8.0,
         "hold_days": 1
       }
+    },
+    "break_v2": {
+      "label": "断板V2",
+      "enabled": true,
+      "daily_limit": 5
     }
   }
 }

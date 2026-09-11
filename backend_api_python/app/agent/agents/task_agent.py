@@ -752,7 +752,7 @@ class TaskAgent(AgentBase):
         except Exception:
             pass
 
-        return await self._chat_plan_graph(user_input, session_id, use_rag)
+        return await self._chat_plan_graph(user_input, session_id, use_rag, event_cb=getattr(self, "_current_event_cb", None))
 
     # ── 定时任务拦截 ──────────────────────────────────────
 
@@ -946,6 +946,7 @@ class TaskAgent(AgentBase):
         planning_interval: int | None = None,
         phase_id: int = 0,
         domain: str = "",
+        step_event_cb=None,
     ):
         """构建 smolagents CodeAgent 实例。
 
@@ -987,15 +988,76 @@ class TaskAgent(AgentBase):
 
         # executor
         executor = LocalPythonExecutor(
+            # 生成代码可 import 的模块白名单（最小授权，2026-09-11 收紧，审计 P2）：
+            # - os/sys/pathlib/importlib 移除：web_search 等工具返回的不可信文本可注入指令，
+            #   让生成代码读文件/环境变量/任意模块。实证依据：agent_runs.jsonl 全量 1.4MB
+            #   轨迹零命中 import os/sys/importlib/pathlib；生成代码的约定范式是"调用注入的
+            #   工具函数"而非直接 I/O。skills 内部 import 发生在宿主进程，不受本表约束。
+            # - stat 保留：A 股工具链生成代码常用 st.* 判别文件属性（若后续零使用可再收）。
+            # - 收紧后若出现 "is not authorized" 类执行错误：先核对轨迹确认真实需求，
+            #   按最小需要加回，禁止整表回滚。
             additional_authorized_imports=[
                 "json", "datetime", "math", "re", "collections", "itertools",
                 "concurrent.futures", "queue", "time", "unicodedata", "stat",
-                "statistics", "random", "os", "sys", "pathlib", "importlib",
+                "statistics", "random",
                 "skills", "skills.*",
             ],
             additional_functions={"final_answer": _final_answer},
         )
         executor.custom_tools = tool_functions
+
+        # 过程事件钩子（2026-09-11 SSE 改造）：smolagents 在每个 step 结束时调用
+        # callback(memory_step, agent=self)。把 ActionStep 的代码动作/工具产出转成
+        # 轻量事件 dict 交给 cb（SSE 层入队）。cb 必须绝不抛异常、不阻塞执行——
+        # 钩子内部捕获一切异常，cb 异常也吞掉（流式通道故障不能影响主任务）。
+        def _make_step_event_hook(cb):
+            if cb is None:
+                return None
+
+            def _hook(memory_step, agent):
+                try:
+                    if type(memory_step).__name__ != "ActionStep":
+                        return
+                    ev = {
+                        "kind": "action_step",
+                        "step_number": getattr(memory_step, "step_number", None),
+                        "is_final": bool(getattr(memory_step, "is_final_answer", False)),
+                    }
+                    code_action = getattr(memory_step, "code_action", None)
+                    if code_action:
+                        ev["code_action"] = str(code_action)[:600]
+                    obs = getattr(memory_step, "observations", None)
+                    if obs:
+                        ev["observations"] = str(obs)[:1200]
+                    err = getattr(memory_step, "error", None)
+                    if err:
+                        ev["error"] = str(err)[:300]
+                    # 从 CodeAgent 的工具调用日志提取工具名（若有）
+                    tools = []
+                    tc = getattr(memory_step, "tool_calls", None)
+                    if tc:
+                        try:
+                            for t in tc:
+                                name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else None)
+                                if name:
+                                    tools.append(str(name))
+                        except Exception:
+                            pass
+                    if tools:
+                        ev["tools"] = tools
+                    if ev.get("code_action") or ev.get("observations") or ev.get("error") or tools:
+                        try:
+                            cb(ev)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            return _hook
+
+        _evt_hook = _make_step_event_hook(step_event_cb)
+        # 注意：_truncate_observations 定义在本函数后段（SmolCodeAgent 构造前），
+        # 此处不能引用——回调列表在构造参数处内联组装。
         logger.info("[TaskAgent] executor 已注入 %d 个工具函数", len(tool_functions))
 
         # ── 必选工具：注册为 smolagents Tool，放入 tools=[] ──
@@ -1071,7 +1133,7 @@ class TaskAgent(AgentBase):
             max_steps=self.max_tool_rounds,
             executor=executor,
             planning_interval=planning_interval,
-            step_callbacks=[_truncate_observations],
+            step_callbacks=([_truncate_observations] + ([_evt_hook] if _evt_hook is not None else [])),
             instructions=(
                 "【数据补充策略】\n"
                 "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
@@ -1154,6 +1216,7 @@ class TaskAgent(AgentBase):
         user_input: str,
         session_id: str,
         use_rag: bool,
+        event_cb=None,
     ) -> AgentResponse:
         """主对话流程：基于 StateGraph 的编排。
 
@@ -1164,6 +1227,7 @@ class TaskAgent(AgentBase):
           - 流式输出（astream）
         """
         from graph import StateGraph, END
+        END_SENTINEL = END  # astream 结束事件 node==END，事件回调跳过它
         from nodes import (
             AgentState, NodeContext,
             make_chat_node, make_plan_node,
@@ -1192,6 +1256,7 @@ class TaskAgent(AgentBase):
                 max_tool_rounds=self.max_tool_rounds,
                 entity_resolver=StockResolver(),
             )
+            ctx.event_cb = event_cb  # SSE 过程事件回调（None=非流式路径零开销）
             ctx.agent = self  # 传递 TaskAgent 实例，供节点调用 _build_code_agent 等方法
 
             # 构建图
@@ -1228,7 +1293,35 @@ class TaskAgent(AgentBase):
                 "_trace": trace,
             }
 
-            result = await compiled.ainvoke(initial_state)
+            # 逐节点流式执行（2026-09-11 SSE 改造）：每个节点完成时经 event_cb 播报
+            # 节点生命周期，执行节点产出 step/tool 事件由 _build_code_agent 的钩子上报。
+            # event_cb 为 None 时行为与原 ainvoke 等价（只是换用 astream 驱动）。
+            result = {}
+            _node_cn = {"chat": "意图解析", "plan": "任务规划", "execute": "工具执行", "finalize": "结果整理"}
+            async for _evt in compiled.astream(initial_state):
+                result = _evt.get("state", result)
+                _node = _evt.get("node")
+                if event_cb is None or _node == END_SENTINEL:
+                    continue
+                try:
+                    if _evt.get("error"):
+                        event_cb({"kind": "node_error", "node": _node,
+                                  "error": str(_evt.get("error"))[:300]})
+                        continue
+                    event_cb({"kind": "node_done", "node": _node,
+                              "label": _node_cn.get(_node, _node)})
+                    if _node == "execute":
+                        _obs = str(result.get("result_raw", "") or "")
+                        if _obs:
+                            event_cb({"kind": "step_content",
+                                      "content": _obs[:1500], "stream": True})
+                    elif _node == "plan":
+                        _plan = result.get("_agent_plan", "")
+                        if _plan:
+                            event_cb({"kind": "progress",
+                                      "message": "规划完成：" + str(_plan)[:200]})
+                except Exception:
+                    pass  # 事件通道故障不阻断主流程
 
             final_output = result.get("final_output", {})
             response = AgentResponse(

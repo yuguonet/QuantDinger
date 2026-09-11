@@ -43,6 +43,46 @@ from app.market_cn.auto.data.kline import fetch_kline_db  # noqa: E402,F401
 
 
 # ================================================================
+# 展示归一 (2026-09-11): 同族版本链去重, 高版本优先
+# 背景: break_v2 ⊆ break 严格子集, 并行扫描同 (code, style) 双版本重复落库,
+# 前端列表/自选组出现重复行。落库前按 (code, family, style) 归一, family 内
+# 取 family_version 最高版本; 跨族 (dragon vs break) 与无重叠低版本信号照常
+# 落库, v1 实盘台账只在真正重叠处被高版本替代。
+# 版本身份声明 (2026-09-11 改版): 策略类属性 family/family_version 声明默认
+# (break_v2: family="break", family_version=2), config.json
+# strategies.<key>.family/family_version 可覆盖 — 加 break_v3 只需在插件里
+# 声明 family="break", family_version=3, 扫描器零改动 (版本号自动识别)。
+# ================================================================
+
+
+def _family_maps():
+    """全注册表 {key: (family, version)} (每轮现取; config mtime 缓存兜底)。"""
+    from app.market_cn.auto import strategies as strat_reg
+    return {k: (strat_reg.family_of(k), strat_reg.family_version(k))
+            for k in strat_reg.all_strategies()}
+
+
+def _dedupe_family(rows):
+    """同族版本链去重: 同 (code, family, style) 取 family_version 最高者。"""
+    if not rows:
+        return rows
+    fmap = _family_maps()
+    best = {}
+    for r in rows:
+        fam, ver = fmap.get(r["strategy"], (r["strategy"], 1))
+        k = (r["code"], fam, r.get("style"))
+        cur = best.get(k)
+        if cur is None or ver > cur[0]:
+            best[k] = (ver, r)
+    out = []
+    for r in rows:
+        fam, _ver = fmap.get(r["strategy"], (r["strategy"], 1))
+        if best[(r["code"], fam, r.get("style"))][1] is r:
+            out.append(r)
+    return out
+
+
+# ================================================================
 # 数据就绪检测
 # ================================================================
 
@@ -188,6 +228,14 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     finally:
         for _pr in (live_probes or {}).values():
             _pr.close()
+
+    # 展示归一: 同族版本链重叠 → 高版本优先 (在 daily_limit 截断之前,
+    # 避免低版本限额名额浪费在会被高版本替代的行上)
+    _n_raw = len(rows)
+    rows = _dedupe_family(rows)
+    if len(rows) != _n_raw:
+        logger.info("[dragon_scan] 展示归一: 同族重叠去重 %d → %d (高版本优先)",
+                    _n_raw, len(rows))
 
     # 每日信号入库上限 (per-strategy 全市场口径, config.json daily_limit; score 降序截断)
     capped = []

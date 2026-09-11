@@ -278,8 +278,24 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
     expected_return = win_rate * avg_win - (1 - win_rate) * avg_loss
     return_per_day = expected_return / avg_hold
 
-    # 映射到权重（0.5~2.0）
-    weight = max(0.5, min(2.0, 1.0 + return_per_day * 20))
+    # 映射到权重（0.5~2.0），带样本量置信度（2026-09-11，审计 P2）：
+    # 旧实现 1 + rpd*20 的问题：+0.67%/日 -> 1.013（区分度≈0）；
+    # -1%/日 与 -0.025%/日 同触 0.5 地板（噪声主导）。两步修正：
+    # 1) 胜率先取 Wilson 下界（95% 置信），小样本高胜率不再直接顶格——
+    #    n=5 全对时 win_rate=1.0 但下界仅 0.566；
+    # 2) 用样本量缩放因子把权重拉向中性 1.0：n<15 信号不足，n>=30 全额生效。
+    #    收益维度（expected_return）保持原始值进入线性段——它才是单位时间收益的分子。
+    z = 1.96
+    denom = 1 + z * z / total
+    center = (win_rate + z * z / (2 * total)) / denom
+    margin = z * math.sqrt(win_rate * (1 - win_rate) / total + z * z / (4 * total * total))
+    win_rate_lb = max(0.0, center - margin)
+
+    sample_scale = min(1.0, max(0.0, (total - 15) / 15.0))
+    expected_adj = (win_rate_lb * avg_win - (1 - win_rate_lb) * avg_loss) / avg_hold
+    weight_raw = 1.0 + expected_adj * 20
+    weight = 1.0 + (weight_raw - 1.0) * sample_scale
+    weight = max(0.5, min(2.0, weight))
 
     return {
         "weight": round(weight, 3),

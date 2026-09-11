@@ -121,6 +121,10 @@ class NodeContext:
         self.tool_provider = None
         self.model = None
 
+        # 过程事件回调（2026-09-11 SSE 改造）：节点/工具/步骤事件经此上报，
+        # 由 SSE 层注入。None = 零开销（CLI/定时任务等非流式路径不受影响）。
+        self.event_cb = None
+
         # TaskAgent 实例（用于调用 _build_code_agent 等方法）
         self.agent = None
 
@@ -172,6 +176,16 @@ def _set_llm_timeout(agent, timeout_seconds: int):
                 client.timeout = timeout_seconds
                 logger.debug("[Execute] 已设置 OpenAI 客户端 timeout=%ds", timeout_seconds)
                 return
+        # 同步客户端分支（2026-09-11，审计 P2）：CodeAgent 实际走 _LLMAdapter 的独立
+        # 同步 OpenAI 客户端（_get_sync_client），上面的 AsyncOpenAI 分支对它无效——
+        # 不设则执行期 LLM 调用沿用工厂默认超时，180s 上限形同虚设。
+        # 与 generate() 同款阈值判定，客户端未初始化时不主动建连接。
+        if llm_adapter and getattr(llm_adapter, '_sync_client', None) is not None:
+            try:
+                llm_adapter._sync_client.timeout = timeout_seconds
+                logger.debug("[Execute] 已设置同步 OpenAI 客户端 timeout=%ds", timeout_seconds)
+            except Exception as e2:
+                logger.debug("[Execute] 设置同步客户端超时失败: %s", e2)
         # 兜底：改 model 属性
         if llm_adapter and hasattr(llm_adapter, 'timeout'):
             llm_adapter.timeout = timeout_seconds
@@ -685,11 +699,11 @@ def make_execute_node(ctx: NodeContext):
         trace = state.get("_trace")
 
         # 构建上下文
+        # 实体不在此重复注入（2026-09-11 去冗余，审计 P2）：resolver 的 effective_input
+        # 已含实体 → plan task 基于 effective_input 生成 → 【任务】段已带实体；原始关键词
+        # 由下方【用户原始输入】段保底。旧实现同一标的信息最多出现 3 次，纯 token 浪费。
+        # state.entity_code 仍保留给 trace/finalize 写 qd_traces 使用，勿删字段。
         task_parts = []
-        if state.get("entity_code"):
-            entity_label = state.get("entity_type", "实体")
-            entity_info = f"【{entity_label}】{state.get('entity_name', '')}({state['entity_code']})" if state.get('entity_name') else f"【{entity_label}】{state['entity_code']}"
-            task_parts.append(entity_info)
         if state.get("context"):
             task_parts.append(f"【参考资料】\n{state['context']}")
 
@@ -727,6 +741,7 @@ def make_execute_node(ctx: NodeContext):
                 planning_interval=effective_interval,
                 phase_id=0,
                 domain=selected_domain,
+                step_event_cb=getattr(ctx, "event_cb", None),
             )
             logger.info("[Execute] 新建 CodeAgent 实例")
         else:

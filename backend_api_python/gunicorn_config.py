@@ -17,7 +17,11 @@ bind = f"{os.getenv('PYTHON_API_HOST', '0.0.0.0')}:{os.getenv('PYTHON_API_PORT',
 
 # Default: 1 worker + 4 threads — same concurrency model as Flask dev server
 # but with better stability and connection handling.
-# Increase GUNICORN_WORKERS for multi-core throughput.
+# !! 单进程假设（2026-09-11 写入，与 app/agent/DESIGN.md 对应）：
+# agent 子系统的以下状态均为进程内单例，多 worker 会直接失效——
+#   feedback 会话->root 映射 / ToolProvider 单例 / trace 模块级状态 / message_queue 队列与 worker 线程。
+# 扩 worker 前必须先完成这四处的进程安全改造，否则请保持 GUNICORN_WORKERS=1，
+# 并发吞吐用 GUNICORN_THREADS（gthread）扩展。
 workers = int(os.getenv("GUNICORN_WORKERS", 1))
 threads = int(os.getenv("GUNICORN_THREADS", 4))
 

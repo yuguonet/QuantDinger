@@ -119,6 +119,25 @@ def params_override(key):
     return v if isinstance(v, dict) else {}
 
 
+def family_of(key):
+    """版本链 family 根 (2026-09-11 展示归一): 策略类 family 属性声明默认,
+    config strategies.<key>.family 可覆盖 (与 enabled/params 同优先级惯例);
+    空/缺省 = 自身 key (自成一族, 不参与跨策略去重)。"""
+    v = _strategy_cfg(key).get("family")
+    if v:
+        return str(v)
+    return getattr(get_strategy(key), "family", "") or key
+
+
+def family_version(key):
+    """链内版本号: 类属性 family_version 声明默认, config 覆盖; 缺省 1。
+    同 (code, family, style) 重叠时扫描器取 version 最高者。"""
+    v = _strategy_cfg(key).get("family_version")
+    if v is not None:
+        return int(v)
+    return int(getattr(get_strategy(key), "family_version", 1) or 1)
+
+
 def live_probe_enabled():
     """实盘扫描探针开关 (M1 实盘采集, 2026-09-11; 默认 True=未写即开启)。
 
