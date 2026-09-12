@@ -194,8 +194,8 @@ def mcp_search_tools(query: str) -> str:
     return f"找到 {len(matches)} 个匹配工具:\n" + "\n".join(matches[:20])
 
 
-def main():
-    """启动 MCP server。"""
+def serve():
+    """启动 MCP server（进程入口，仅供 __main__ 调用——不注册为 agent 工具）。"""
     import argparse
 
     parser = argparse.ArgumentParser(description="QuantDinger MCP Tool Server")
@@ -218,4 +218,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    serve()

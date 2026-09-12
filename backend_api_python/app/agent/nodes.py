@@ -66,6 +66,17 @@ class AgentState(TypedDict, total=False):
     step_budget: int      # CodeAgent 本轮步数预算
     planning_interval: int
 
+    # ── phase 契约（B 阶段 2026-09-12）──
+    phases: list          # 外部 planner 产出的阶段契约（[]=单段执行旧路径）
+    phase_index: int      # 阶段游标（当前执行第几个，0 起）
+    phase_retry: int      # 当前阶段已重试次数
+    phase_replan_count: int  # 因阶段失败触发的重设计次数（route 上限 2）
+    phase_results: list   # 阶段结果记录 [{id,name,status,note,elapsed,preview}]
+    completed_phases_text: str  # 阶段摘要累积（正向通道，注入下一阶段任务书）
+    phase_last_note: str  # 最近一次验收失败说明（重试任务书引用）
+    _phase_agents: Any    # 各阶段 CodeAgent 实例（dict，非序列化）
+    _phase_abort: bool    # 中断标记：跳过重试直接收尾
+
     # ── execute_node 输出 ──
     result_raw: str       # CodeAgent 执行结果
     hit_max_steps: bool   # True=max_steps 耗尽，需复盘
@@ -176,6 +187,12 @@ def _set_llm_timeout(agent, timeout_seconds: int):
     try:
         # smolagents _LLMAdapter → 内部 _llm (OpenAILLM) → _client (AsyncOpenAI)
         llm_adapter = getattr(agent, 'model', None)
+        if llm_adapter is not None:
+            # 记录期望超时（2026-09-12）：同步客户端惰性创建/重建时补挂
+            try:
+                llm_adapter._desired_timeout = timeout_seconds
+            except Exception:
+                pass
         if llm_adapter and hasattr(llm_adapter, '_llm'):
             inner_llm = llm_adapter._llm
             client = getattr(inner_llm, '_client', None)
@@ -317,6 +334,10 @@ def _extract_failed_tools(agent, tool_provider=None) -> list:
     def _add(name, obs):
         if not name or name in seen:
             return
+        # 伪工具名过滤（2026-09-12）：smolagents 为代码执行步骤记录 python_interpreter
+        # 等伪工具名，任务尾"数据完整性"误报来源于此（CLI 实测）。
+        if name in ("python_interpreter", "final_answer"):
+            return
         seen.add(name)
         desc = ""
         if tool_provider:
@@ -384,6 +405,15 @@ def make_chat_node(ctx: NodeContext):
                     RAG_SCORE_THRESHOLD = 0.7
                     docs = [d for d in docs if (d.get("rerank_score") or 0) >= RAG_SCORE_THRESHOLD]
                 else:
+                    # RRF ????????2026-09-12 ???????? 0.01 ???
+                    # ??????????RRF ????weight/(60+rank)??????0.016?
+                    # 0.005 ? ?? rank>40 ???????????????
+                    _rrf_min = float(os.getenv("RAG_RRF_MIN_SCORE", "0.005"))
+                    _before = len(docs)
+                    docs = [d for d in docs if (d.get("score") or 0) >= _rrf_min]
+                    if len(docs) < _before:
+                        logger.info("[Chat] RAG RRF ????: %d ? %d ? (min=%.4f)",
+                                    _before, len(docs), _rrf_min)
                     docs = docs[: max(1, int(os.getenv("RAG_TOP_K", "5")))]
                 if docs:
                     from rag.retriever import Retriever
@@ -412,6 +442,21 @@ def make_chat_node(ctx: NodeContext):
                     entity_code = entity.entity_code
                     entity_name = entity.entity_name
                     entity_type = entity.entity_type
+                    # 时间语义异常打回（2026-09-12 用户裁定）：如周六问"今天行情"，
+                    # 不静默标注——直接询问用户意图（最近收盘日 vs 下一交易日规划）。
+                    # 用户在追问中明确日期后，新消息重新解析自然走常规流程。
+                    if entity_type == "time_clarify":
+                        _q = ""
+                        for _e in entity.entities or []:
+                            if isinstance(_e, dict) and _e.get("type") == "time_clarify":
+                                _q = str(_e.get("question", ""))
+                                break
+                        logger.info("[Chat] 时间语义打回澄清: %s", (_q or "")[:80])
+                        return {
+                            "needs_task": False,
+                            "task_type": "query",
+                            "direct_answer": _q or "您提到的时间不是交易日，请明确想查询的日期。",
+                        }
                     # 直接用 resolver 生成的 effective_input（含实体注入+扩写）
                     if entity.effective_input:
                         effective_input = entity.effective_input
@@ -631,6 +676,8 @@ def make_plan_node(ctx: NodeContext):
         ctx._plan_task_type_info = task_type_str
         ctx._plan_rag_context = rag_context_str
         ctx._plan_history_context = history_context_str
+        # 已完成阶段摘要（phase 模式复盘时非空；_plan 模板 {completed_phases_text} 读取）
+        ctx._completed_phases_text = state.get("completed_phases_text", "") or ""
 
         # 组装 plan 输入（保留拼接版本作为 task 的基础）
         plan_parts = [effective_input]
@@ -675,6 +722,14 @@ def make_plan_node(ctx: NodeContext):
                 "tool_count": len(skill_tools),
             })
 
+        # phase 契约透传（B 阶段）：游标归零重走新序列；completed_phases_text / phase_results
+        # 保留累积（复盘时已完成阶段的摘要仍然注入任务书）；_phase_agents 重置——
+        # 重设计后契约已更换，旧 per-phase 记忆作废（重试走 execute 自身，不经过本节点）。
+        phases = plan.get("phases") or []
+        if phases:
+            logger.info("[Plan] phase 契约: %d 个阶段: %s", len(phases),
+                        ", ".join(f"#{p['id']}{p['name']}" for p in phases))
+
         return {
             "task": plan["task"],
             "selected_skill": selected_skill or "",
@@ -684,16 +739,419 @@ def make_plan_node(ctx: NodeContext):
             "step_budget": plan["step_budget"],
             "planning_interval": plan.get("planning_interval", 6),
             "replan_count": replan_count + (1 if prev_hit else 0),
+            "phases": phases,
+            "phase_index": 0,
+            "phase_retry": 0,
+            "_phase_agents": {},
         }
 
     return plan_node
+
+
+# agent.run 墙钟上限（秒；2026-09-12 卡死事故防线）：
+# 非主线程执行时，超时按执行失败上报并隔离卡死线程（Python 无法强杀线程）。
+AGENT_RUN_WALL_TIMEOUT = int(os.getenv("AGENT_RUN_WALL_TIMEOUT", "600"))
+
+
+def _run_agent_with_guard(agent, full_task: str):
+    """带 SIGINT 守卫 / 墙钟守卫执行 agent.run。返回 (result_str, run_error, interrupted)。
+
+    主线程场景临时接管 SIGINT（Ctrl+C 不炸进程，标记中断后由调用方收尾）。
+    非主线程（消息队列 worker / gunicorn 请求线程）无法接管信号——除 SIGINT 外，
+    还需防"底层调用/调试器挂起导致线程永久阻塞拖死整条流水线"（2026-09-12 事故：
+    后台线程未捕获异常被调试器 do_wait_suspend 挂起 → smolagents 代码执行
+    ThreadPoolExecutor.shutdown(wait=True) 永久 join → SSE 无限等待、无错无超时）。
+    对策：放入守护线程执行 + 限时等待，超时按失败上报（验收/on_fail 策略接管），
+    卡死线程被隔离丢弃。
+    设计点：单段执行（旧路径）与 phase 单阶段执行共用本函数，避免两处行为漂移。
+    """
+    import signal as _signal
+    import threading as _threading
+    _interrupted = False
+    _is_main_thread = _threading.current_thread() is _threading.main_thread()
+
+    def _sigint_handler(signum, frame):
+        nonlocal _interrupted
+        _interrupted = True
+        logger.warning("[Execute] 收到 SIGINT，正在停止...")
+
+    if not _is_main_thread:
+        # ── 非主线程：墙钟守卫（守护线程 + 限时等待）──
+        _holder = {}
+
+        def _guarded_run():
+            try:
+                _holder["result"] = agent.run(full_task)
+            except BaseException as _e:  # noqa: BLE001 - 一切异常带回主线程判定
+                _holder["error"] = _e
+
+        _gt = _threading.Thread(target=_guarded_run, daemon=True, name="agent-run-guard")
+        _gt.start()
+        _gt.join(AGENT_RUN_WALL_TIMEOUT)
+        if _gt.is_alive():
+            logger.error("[Execute] agent.run 超过 %ds 未返回，判定卡死并放弃等待（线程被隔离）",
+                         AGENT_RUN_WALL_TIMEOUT)
+            return (f"[run_error] agent 执行超时（超过 {AGENT_RUN_WALL_TIMEOUT}s 无响应）",
+                    TimeoutError(f"agent run wall timeout >{AGENT_RUN_WALL_TIMEOUT}s"), False)
+        if "error" in _holder:
+            err = _holder["error"]
+            if isinstance(err, KeyboardInterrupt):
+                logger.warning("[Execute] 被用户中断")
+                return "[run_error] 用户中断", RuntimeError("user interrupted (KeyboardInterrupt)"), False
+            logger.error("[Execute] 执行异常: %s", err)
+            # 机器可读错误标记：finalize_node 据此判定本次 run 失败，
+            # trace 不再作为"成功分析"落库（否则污染 score/direction 统计，见 root_id=1737 事故）。
+            return f"[run_error] {err}", err, False
+        result = _holder.get("result")
+        return (str(result) if result else ""), None, False
+
+    old_handler = _signal.signal(_signal.SIGINT, _sigint_handler)
+    run_error = None
+    try:
+        result = agent.run(full_task)
+        if _interrupted:
+            result = "[run_error] 用户中断"
+            run_error = RuntimeError("user interrupted")
+            logger.warning("[Execute] 被用户中断")
+        result = str(result) if result else ""
+    except KeyboardInterrupt:
+        logger.warning("[Execute] 被用户中断")
+        result = "[run_error] 用户中断"
+        run_error = RuntimeError("user interrupted (KeyboardInterrupt)")
+    except Exception as e:
+        logger.error("[Execute] 执行异常: %s", e)
+        # 机器可读错误标记：finalize_node 据此判定本次 run 失败，
+        # trace 不再作为"成功分析"落库（否则污染 score/direction 统计，见 root_id=1737 事故）。
+        result = f"[run_error] {e}"
+        run_error = e
+    finally:
+        if old_handler is not None:
+            _signal.signal(_signal.SIGINT, old_handler)
+    return result, run_error, _interrupted
+
+
+async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_error) -> tuple:
+    """轮询通道：外部 planner 的阶段验收判定（B 阶段）。
+
+    - 执行异常 → 直接 fail（不让 LLM 判）
+    - 结果为空 → fail
+    - 无 acceptance 条目 → pass（无标准即放行）
+    - 有标准 → 轻量 LLM 逐条核对，输出 JSON {{passed, note}}
+    - 判定通道不可用（LLM 错误/解析失败）→ fail-open 放行（宁松勿卡：判定故障不阻断主链路）
+    """
+    text = str(result or "")
+    if run_error is not None:
+        return False, f"执行异常: {str(run_error)[:200]}"
+    if not text.strip():
+        return False, "结果为空"
+    acc = phase.get("acceptance") or []
+    if not acc:
+        return True, ""
+    try:
+        from utils.json_parser import safe_parse_json
+        criteria = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(acc))
+        prompt = (
+            f"【阶段目标】{phase.get('goal', '')}\n"
+            f"【验收标准】\n{criteria}\n"
+            f"【阶段结果】\n{text[:4000]}\n\n"
+            "请逐条核对阶段结果是否满足验收标准。只输出 JSON："
+            '{"passed": true/false, "note": "未通过时说明缺失项（≤100字），通过时留空"}'
+        )
+        resp = await ctx.llm.generate(messages=[
+            ChatMessage(role="system", content="你是严格的阶段验收员。只输出 JSON。"),
+            ChatMessage(role="user", content=prompt),
+        ])
+        obj = safe_parse_json((resp.content or "").strip(), default={})
+        passed = bool(obj.get("passed", True))
+        note = str(obj.get("note") or "")[:300]
+        return passed, note
+    except Exception as e:
+        logger.warning("[Execute] 验收判定失败（放行）: %s", e)
+        return True, f"验收判定不可用: {e}"[:200]
+
+
+def _phase_summary(phase: dict, result) -> str:
+    """反向通道：阶段结果摘要（截断上限 2000 字符）。
+
+    大结果由执行器落盘 tmp/ 只回报路径（任务书中的数据纪律），此处再做一层截断兜底。
+    """
+    text = str(result or "").strip()
+    limit = 2000
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…(截断，共 {len(text)} 字符)"
+
+
+def _select_phase_skill_tools(all_tools: list, phase_tools: list) -> list:
+    """按阶段契约收窄技能工具（2026-09-12 阶段清单升级）。
+
+    - phase_tools 非空：只保留被点名的技能工具；read_skill_* 文档类工具始终保留
+      （渐进式文档访问不设门槛，成本低且利于收敛）；
+    - phase_tools 为空：保持全量（回退语义，兼容未列工具的旧契约）。
+    """
+    if not all_tools:
+        return []
+    names = set(phase_tools or [])
+    if not names:
+        return list(all_tools)
+    out = []
+    for t in all_tools:
+        n = getattr(t, "name", "")
+        if n.startswith("read_skill_") or n in names:
+            out.append(t)
+    return out
+
+
+def _detect_max_steps(agent) -> bool:
+    """smolagents>=1.27 到达 max_steps 不抛异常，仅在 memory 末步标记错误。"""
+    try:
+        from smolagents.utils import AgentMaxStepsError
+        steps = getattr(getattr(agent, "memory", None), "steps", []) or []
+        last = steps[-1] if steps else None
+        return isinstance(getattr(last, "error", None), AgentMaxStepsError)
+    except Exception:
+        return False
+
+
+def _extract_clean_phase_result(agent, result: str, limit: int = 4000) -> str:
+    """步数耗尽时，优先取最后一段"干净的执行输出"（打印内容）作为阶段结果。
+
+    原因（run3 实测）：强制 final answer 常是半成品——<code> 包裹的工具调用 JSON，
+    原样下传会污染下一阶段任务书。跳过含执行错误标记的观察，取最后一段干净输出。
+    """
+    bad_marks = ("Code execution failed", "InterpreterError", "Traceback",
+                 "is not among", "is not allowed", "KeyError")
+    try:
+        from smolagents.memory import ActionStep
+        for step in reversed(getattr(agent.memory, "steps", []) or []):
+            if not isinstance(step, ActionStep):
+                continue
+            obs = str(getattr(step, "observations", "") or "").strip()
+            if not obs or any(k in obs for k in bad_marks):
+                continue
+            return obs[:limit]
+    except Exception:
+        pass
+    return result
+
+
+async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
+    """执行单个 phase（B 阶段 2026-09-12 单阶段执行器）。
+
+    正向通道：任务书 = 用户原始需求 + 已完成阶段摘要 + phase.goal/deliverable/acceptance。
+    反向通道：阶段摘要 ≤2000 字符累积进 completed_phases_text。
+    轮询通道：_check_phase_acceptance 验收，失败由 route_after_execute 按 on_fail 处置。
+    每 phase 独立 CodeAgent（_phase_agents 缓存；重试同 phase 复用实例 = 记忆衔接；
+    adapter.close() 只关同步客户端，复用时会惰性重建，安全）。
+    """
+    agent_instance = ctx.agent
+    if not agent_instance:
+        logger.error("[Execute] ctx.agent 未设置")
+        return {"result_raw": "[run_error] agent 未初始化", "phase_index": len(phases),
+                "_phase_abort": True}
+    trace = state.get("_trace")
+    idx = int(state.get("phase_index", 0) or 0)
+    if idx >= len(phases):
+        return {"result_raw": state.get("result_raw", "")}
+    phase = phases[idx]
+    phase_id = int(phase.get("id", idx + 1))
+    retry = int(state.get("phase_retry", 0) or 0)
+
+    # ── 正向通道：组装阶段任务书 ──
+    # 暂存区 scope（2026-09-12）：一次 run 内稳定，跨阶段读写同一区
+    run_scope = "run_" + re.sub(r"[^A-Za-z0-9]", "",
+                                str(state.get("_start_time", ""))[-8:]) or "run_default"
+    task_parts = []
+    task_parts.append(f"【暂存区 scope】{run_scope}")
+    original_input = state.get("user_input", "")
+    if original_input:
+        task_parts.append(f"【用户原始需求】{original_input[:800]}")
+    done_text = state.get("completed_phases_text", "") or ""
+    if done_text:
+        task_parts.append(f"【已完成阶段结果】\n{done_text[-3000:]}")
+    task_parts.append(f"【当前阶段 {phase_id}/{len(phases)}：{phase.get('name', '')}】\n{phase.get('goal', '')}")
+    deliverable = phase.get("deliverable")
+    if deliverable:
+        if not isinstance(deliverable, str):
+            deliverable = json.dumps(deliverable, ensure_ascii=False)
+        task_parts.append(f"【交付物要求】{deliverable}")
+    phase_tools = phase.get("tools") or []
+    if phase_tools:
+        # 带签名（2026-09-12 E2E 实证：只给名字会诱发参数猜测——build_keyword_from_filters
+        # (industry=)、bb_screener_scan(keyword=) 连环 TypeError 烧步数）
+        def _tool_sig(_n):
+            try:
+                _fn = ctx.tool_provider.get(_n) if ctx.tool_provider else None
+                if _fn is not None:
+                    _ps = [p.name for p in inspect.signature(_fn).parameters.values()
+                           if not p.name.startswith("_")]
+                    return "%s(%s)" % (_n, ", ".join(_ps))
+            except Exception:
+                pass
+            return _n
+        task_parts.append("【本阶段可用工具（仅限；括号内为参数名）】" +
+                          ", ".join(_tool_sig(n) for n in phase_tools))
+    # 技能工具按阶段收窄（2026-09-12 阶段清单升级）：点到名才注入（read_skill_* 常驻）
+    _skill_tools = _select_phase_skill_tools(list(state.get("skill_tools", [])), phase_tools)
+    if _skill_tools:
+        # 带参数签名（2026-09-12）：执行器曾因不见签名连环猜错参数（CLI 实测
+        # pre_screen(strategy=) / deep_analyze(candidates=) 连环 TypeError 烧步数）
+        _skill_sigs = []
+        for _st in _skill_tools:
+            _ps = list((getattr(_st, "inputs", None) or {}).keys())
+            _skill_sigs.append(f"{getattr(_st, 'name', '?')}({', '.join(_ps)})")
+        task_parts.append("【技能工具（可直接调用；括号内为参数名）】" + "；".join(_skill_sigs))
+    acceptance = phase.get("acceptance") or []
+    if acceptance:
+        task_parts.append("【验收标准】\n" + "\n".join(f"- {a}" for a in acceptance))
+    if retry:
+        task_parts.append(f"【重试提示】上一轮未通过验收：{state.get('phase_last_note', '')}；"
+                          "本轮聚焦补齐缺失项，不要重复已完成的工作。")
+    task_parts.append("【数据纪律】多标的同类数据一次拉全：支持批量的工具用逗号分隔 codes 一次调用，"
+                      "或在单个代码块内循环完成（只打印提炼后的关键字段）；禁止逐只分步取数。"
+                      "跨阶段重数据用暂存区工具 stage_write(scope, name, content) / "
+                      "stage_read(scope, name)（本阶段 scope 见上）。"
+                      "沙箱内只存在【本阶段可用工具】清单所列函数——不存在 create_file/read_file 等任何"
+                      "文件工具，调用必然失败；代码类任务的交付物=完整代码文本（直接在最终答复中给出）。")
+    full_task = "\n\n".join(task_parts)
+
+    # ── 每 phase 独立 CodeAgent（重试复用实例）──
+    agents = dict(state.get("_phase_agents") or {})
+    agent = agents.get(str(phase_id))
+    if agent is None:
+        selected_skill = state.get("selected_skill", "")
+        effective_interval = None if selected_skill else state.get("planning_interval", 6)
+        agent = agent_instance._build_code_agent(
+            model=ctx.model,
+            provider=ctx.tool_provider,
+            skill_tools=list(_skill_tools),
+            planning_interval=effective_interval,
+            phase_id=phase_id,
+            domain=state.get("selected_domain", ""),
+            tools=(phase.get("tools") or None),
+            step_event_cb=getattr(ctx, "event_cb", None),
+        )
+        agents[str(phase_id)] = agent
+        logger.info("[Execute] phase #%d 新建 CodeAgent（白名单 %d 个工具）",
+                    phase_id, len(phase.get("tools") or []))
+    else:
+        logger.info("[Execute] phase #%d 复用 CodeAgent（重试）", phase_id)
+
+    agent.max_steps = int(state.get("step_budget", 10) or 10)
+    _set_llm_timeout(agent, 180)
+
+    logger.info("[Execute] phase #%d/%d '%s' 开始，step_budget=%d",
+                phase_id, len(phases), phase.get("name", ""), agent.max_steps)
+    if trace:
+        trace.record("phase_start", {
+            "phase_id": phase_id, "name": phase.get("name", ""),
+            "retry": retry, "tools": phase.get("tools") or [],
+        })
+    react_start = time.time()
+    result, run_error, interrupted = _run_agent_with_guard(agent, full_task)
+    react_elapsed = round(time.time() - react_start, 2)
+    logger.info("[Execute] phase #%d 完成，耗时 %.1fs", phase_id, react_elapsed)
+
+    # 步数耗尽的强制答案常是半成品（run3 实测：脏代码污染下阶段任务书）
+    # → 改取最后一段干净执行输出作为阶段结果（验收与交接都用它）
+    if _detect_max_steps(agent) and not interrupted:
+        _clean = _extract_clean_phase_result(agent, str(result))
+        if _clean and _clean != str(result):
+            logger.info("[Execute] phase #%d 步数耗尽，改用最后干净输出（%d 字符）",
+                        phase_id, len(_clean))
+            result = _clean
+
+    # 收尾：关闭 adapter 同步客户端（防 httpx 连接泄漏；复用实例时惰性重建）
+    try:
+        model_adapter = getattr(agent, "model", None)
+        if model_adapter is not None and hasattr(model_adapter, "close"):
+            model_adapter.close()
+    except Exception as e:
+        logger.debug("[Execute] 关闭 LLM adapter 客户端失败: %s", e)
+
+    if trace:
+        _record_tool_calls_to_trace(trace, agent)
+    failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
+
+    # ── 轮询通道：验收判定 ──
+    if interrupted:
+        passed, note = False, "用户中断"
+    else:
+        passed, note = await _check_phase_acceptance(ctx, phase, result, run_error)
+
+    logger.info("[Execute] phase #%d 验收: %s %s", phase_id,
+                "通过" if passed else "未通过", note[:120])
+
+    summary = _phase_summary(phase, result)
+    # 暂存区引用回填：结果中提到 stage_write 的文件 → 在摘要尾部列出（供下阶段 stage_read）
+    try:
+        if "stage_write" in str(result):
+            import re as _re
+            _hits = sorted(set(_re.findall(r"([\w.\-]+\.(?:json|md|txt))", str(result)[:6000])))
+            if _hits:
+                summary += f"\n（暂存区文件: {', '.join(_hits[:8])}——下阶段可用 stage_read(scope, name) 读取）"
+    except Exception:
+        pass
+    entry = {
+        "id": phase_id, "name": phase.get("name", ""),
+        "status": "pass" if passed else "fail",
+        "note": note[:300], "elapsed": react_elapsed,
+        "preview": str(result)[:300],
+    }
+    results = list(state.get("phase_results") or []) + [entry]
+    line = f"[阶段{phase_id} {phase.get('name', '')}] {'✓通过' if passed else '✗未通过'}：{summary}"
+    done_new = (done_text + "\n\n" + line).strip() if done_text else line
+
+    if passed:
+        new_idx, new_retry = idx + 1, 0
+        replan_count = int(state.get("phase_replan_count", 0) or 0)
+    else:
+        new_idx, new_retry = idx, retry + 1
+        replan_count = int(state.get("phase_replan_count", 0) or 0)
+        if phase.get("on_fail", "retry") == "replan":
+            replan_count += 1
+
+    if trace:
+        trace.record("phase_done", {
+            "phase_id": phase_id, "name": phase.get("name", ""),
+            "status": entry["status"], "retries": retry,
+            "on_fail": phase.get("on_fail", "retry"),
+            "acceptance_note": note[:500], "elapsed_seconds": react_elapsed,
+            "tools_whitelist": phase.get("tools") or [],
+            "result_preview": str(result)[:200],
+        })
+
+    return {
+        "result_raw": str(result),
+        "hit_max_steps": False,
+        "phase_index": new_idx,
+        "phase_retry": new_retry,
+        "phase_replan_count": replan_count,
+        "phase_results": results,
+        "completed_phases_text": done_new,
+        "phase_last_note": "" if passed else (note[:500] or "未通过验收"),
+        "_phase_agents": agents,
+        "_phase_abort": bool(interrupted),
+        "_failed_tools": failed_tools,
+        "_agent_plan": "",
+        "_run_error": repr(run_error) if run_error else "",
+    }
 
 
 def make_execute_node(ctx: NodeContext):
     """创建 execute_node（闭包捕获 ctx）。"""
 
     async def execute_node(state: dict) -> dict:
-        """执行：单次 CodeAgent 跑完任务，planning_interval 内部进度检查。"""
+        """执行：单次 CodeAgent 跑完任务，planning_interval 内部进度检查。
+
+        phase 模式（B 阶段 2026-09-12）：state.phases 非空时本节点降为"单阶段执行器"——
+        每次执行一个 phase（任务书 = goal + deliverable + acceptance + 已完成摘要），
+        验收后由 route_after_execute 循环推进；全部完成才进 finalize。
+        """
+        phases = state.get("phases") or []
+        if phases:
+            return await _run_phase_step(ctx, state, phases)
+
         agent_instance = ctx.agent
         if not agent_instance:
             logger.error("[Execute] ctx.agent 未设置")
@@ -771,40 +1229,8 @@ def make_execute_node(ctx: NodeContext):
         logger.info("[Execute] 开始执行，step_budget=%d, timeout=180s", step_budget)
         react_start = time.time()
 
-        import signal as _signal
-        import threading as _threading
         hit_max_steps = False
-        run_error = None
-        _interrupted = False
-        _is_main_thread = _threading.current_thread() is _threading.main_thread()
-
-        def _sigint_handler(signum, frame):
-            nonlocal _interrupted
-            _interrupted = True
-            logger.warning("[Execute] 收到 SIGINT，正在停止...")
-
-        if _is_main_thread:
-            old_handler = _signal.signal(_signal.SIGINT, _sigint_handler)
-        try:
-            result = agent.run(full_task)
-            if _interrupted:
-                result = "[run_error] 用户中断"
-                run_error = RuntimeError("user interrupted")
-                logger.warning("[Execute] 被用户中断")
-            result = str(result) if result else ""
-        except KeyboardInterrupt:
-            logger.warning("[Execute] 被用户中断")
-            result = "[run_error] 用户中断"
-            run_error = RuntimeError("user interrupted (KeyboardInterrupt)")
-        except Exception as e:
-            logger.error("[Execute] 执行异常: %s", e)
-            # 机器可读错误标记：finalize_node 据此判定本次 run 失败，
-            # trace 不再作为"成功分析"落库（否则污染 score/direction 统计，见 root_id=1737 事故）。
-            result = f"[run_error] {e}"
-            run_error = e
-        finally:
-            if _is_main_thread:
-                _signal.signal(_signal.SIGINT, old_handler)
+        result, run_error, _interrupted = _run_agent_with_guard(agent, full_task)
 
         # smolagents>=1.27 到达 max_steps 不再抛异常：_handle_max_steps_reached()
         # 会强制生成 final answer 正常返回，仅在 memory 最后一步标记 AgentMaxStepsError。
@@ -1000,8 +1426,35 @@ def route_after_plan(state: dict) -> str:
 
 
 def route_after_execute(state: dict) -> str:
-    """execute_node 之后的路由。"""
+    """execute_node 之后的路由。
+
+    phase 模式（B 阶段）：游标 / 验收状态驱动循环——
+      还有下一阶段 → execute（循环）；全部完成 → finalize；
+      失败按 phase.on_fail：retry（重试同阶段，上限 max_retries）/ replan（回 plan
+      重设计，上限 2 次）/ abort（直接收尾）。中断 → 直接收尾。
+    旧路径（无 phases）：保持 max_steps 复盘逻辑不变。
+    """
     MAX_REPLAN = 2
+
+    phases = state.get("phases") or []
+    if phases:
+        if state.get("_phase_abort"):
+            return "finalize"
+        idx = int(state.get("phase_index", 0) or 0)
+        if idx >= len(phases):
+            return "finalize"    # 全部阶段完成
+        results = state.get("phase_results") or []
+        last = results[-1] if results else None
+        if last is None or last.get("status") == "pass":
+            return "execute"     # 开始/推进到下一阶段
+        # 当前阶段失败（游标未推进）
+        current = phases[min(idx, len(phases) - 1)]
+        on_fail = current.get("on_fail", "retry")
+        if on_fail == "retry" and int(state.get("phase_retry", 0) or 0) <= int(current.get("max_retries", 1)):
+            return "execute"     # 重试同阶段
+        if on_fail == "replan" and int(state.get("phase_replan_count", 0) or 0) <= MAX_REPLAN:
+            return "plan"        # 回外部 planner 重设计
+        return "finalize"        # abort / 重试耗尽 / 重设计耗尽
 
     if not state.get("hit_max_steps", False):
         return "finalize"        # CodeAgent 完成或正常结束

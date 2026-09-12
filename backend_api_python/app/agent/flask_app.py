@@ -99,6 +99,13 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
 
     future = submit(message, session_id=session_id, timeout=timeout, event_cb=_event_cb)
 
+    # 硬超时（2026-09-12 卡死事故防线）：worker 可能被卡死（调试器挂起/底层调用永久阻塞），
+    # future 永不 done → 原实现无限心跳、前端永久转圈。到点必须发终帧收尾。
+    import os as _os
+    import time as _time
+    _t0 = _time.monotonic()
+    _hard_limit = timeout + float(_os.getenv("SSE_HARD_TIMEOUT_EXTRA", "600"))
+
     ticks = 0
     while True:
         try:
@@ -116,6 +123,11 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
                 except _queue.Empty:
                     break
             break
+        if _time.monotonic() - _t0 > _hard_limit:
+            logger.error("[SSE] 硬超时触发: session=%s 已等待 %.0fs 仍未完成，判定 worker 卡死",
+                         session_id, _time.monotonic() - _t0)
+            yield f"data: {json.dumps({'type': 'error', 'message': '处理超时：任务长时间无响应，已停止等待。请重试；若连续出现请重启后端服务。'}, ensure_ascii=False)}\n\n"
+            return
         ticks += 1
         if ticks >= 50:  # 0.3s * 50 = 15s 心跳
             yield ": ping\n\n"
@@ -126,7 +138,13 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
         yield f"data: {json.dumps({'type': 'done', 'content': result, 'session_id': session_id}, ensure_ascii=False)}\n\n"
     except Exception as exc:
         logger.error("Agent 异常: %s", exc, exc_info=True)
-        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+        # 超时文案（2026-09-12）：asyncio.wait_for 抛出的 TimeoutError 其 str 为空，
+        # 前端只能拿到空错误；这里给出可读说明（阶段模式长任务被服务端等待上限截断）
+        if isinstance(exc, TimeoutError):
+            _err_msg = "处理超时：任务耗时超过服务端等待上限（%ss），请重试；长任务建议缩小范围" % timeout
+        else:
+            _err_msg = str(exc) or "服务端处理异常"
+        yield f"data: {json.dumps({'type': 'error', 'message': _err_msg}, ensure_ascii=False)}\n\n"
 
 
 # ── 路由 ──────────────────────────────────────────────────────
@@ -228,7 +246,8 @@ def task():
             return jsonify({"error": "message 不能为空"}), 400
 
         return Response(
-            _sse_stream(message, session_id, timeout=300),
+            # 阶段模式实测（2026-09-12）：完整多阶段管线 7~10 分钟，300s 常在收尾前截断
+        _sse_stream(message, session_id, timeout=600),
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

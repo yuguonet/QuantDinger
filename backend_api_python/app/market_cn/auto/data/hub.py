@@ -14,7 +14,10 @@
   - minute_live 输出按 mi 标准化并丢弃无效槽位 (缺口容忍), 调用方按槽位数自判数据是否足够;
   - lhb: 只读引用 market_cn/dragon_tiger_store (名单型事件数据, 不 OHLVC 化);
   - index_daily: 指数日线 (M3 环境特征通道, 09-11), 只读引用 market_cn/index.py
-    降级链, hub 侧加磁盘缓存 —— L2 盘后补数语义: 缓存新鲜零外网, 过期才刷新。
+    降级链, hub 侧加磁盘缓存 —— L2 盘后补数语义: 缓存新鲜零外网, 过期才刷新;
+  - index_minute / index_fflow: 指数 5m K线 (09-12 新浪口径, 含涨跌家数宽度列) 与
+    大盘资金流 (09-12, 主力/超大单/大单/中单/小单 净额当日累计), 读独立表
+    kline_index_5m / kline_index_fflow, scripts/sync_index_* 落库, 无磁盘缓存;
 
 关键设计点:
   - as_of 全线贯通: daily/minute_1m 只返回 as_of 当日及以前 —— 数据层兜底防未来函数,
@@ -45,6 +48,7 @@ __all__ = [
     "daily", "daily_live", "minute_1m", "minute_live",
     "quote", "market_snapshot", "day_series",
     "stock_info", "all_codes", "lhb", "index_daily",
+    "index_minute", "index_fflow",
     "reconcile_daily_live",
 ]
 
@@ -305,7 +309,15 @@ def all_codes():
 
 
 def lhb(stock_code=None, trade_date="", days=30):
-    """龙虎榜事件 (名单型数据, 不 OHLVC 化)。只读引用 market_cn/dragon_tiger_store。"""
+    """龙虎榜事件 (名单型数据, 不 OHLVC 化)。只读引用 market_cn/dragon_tiger_store。
+
+    🔴 发布时效纪律 (决策不可违): LHB(D) 当日 17:30 才发布 → 任何 D 日判定
+    (16:30 盘后扫描 / 盘中窗口) 只允许消费 trade_date ≤ D-1 的事件, 本接口
+    不代为裁剪 —— 调用方必须显式传 ≤D-1 的 trade_date/days 窗口。
+    (auto/ 盘后扫描 16:30 触发, 同日调用返回空 vs 17:30 后重跑返回当日榜,
+    两种行为即隐性未来函数; 2026-09-12 偏差审计 A2 固化。)
+    若策略真消费本通道, 须 data_needs 声明加 "lhb"。
+    """
     try:
         from app.market_cn.dragon_tiger_store import query_dragon_tiger
         return query_dragon_tiger(trade_date=trade_date, stock_code=stock_code, days=days)
@@ -448,6 +460,44 @@ def index_minute(code="000300", days=800, as_of=None):
     bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"), "open": r[1], "high": r[2],
              "low": r[3], "close": r[4], "volume": r[5],
              "up_count": r[6], "down_count": r[7]} for r in rows]
+    return bars[-days:] if days and len(bars) > days else bars
+
+
+def index_fflow(code="000300", days=800, as_of=None):
+    """指数大盘资金流 (list[dict] time/main_net/small_net/mid_net/big_net/super_net,
+    time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_fflow
+    (scripts/sync_index_fflow.py 落库, 2026-09-12 起; 无磁盘缓存 — DB 即存储)。
+
+    code 用 6 位指数码 ("000300"=沪深300), 存储符号映射与 index_minute 同规则。
+    净额单位=元, **当日累计值语义** (EM fflow 口径, 15:00 累计=日级值):
+    用时差分得每分钟增量, 5m 增量 = 5 根 1m 差分聚合; 主力 = 超大单+大单;
+    四类净额之和恒为 0 (互为对手盘)。盘中数据滞后 ~15 分钟 (delay host 轮询)。
+    time 为 bar 起始时刻 (09:31 起) —— 与 index_minute 的 bar 结束时刻 (09:35 起)
+    对齐差 1 根, 跨表对齐特征时注意。
+    as_of: 只返回该交易日(含)以前 —— **必须先过滤后尾切** (同 index_minute 教训)。
+    """
+    sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
+    from app.utils.db_market import get_market_db_manager
+    mgr = get_market_db_manager()
+    mgr.ensure_market_db("CNStock")
+    pool = mgr._get_pool("CNStock")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if as_of:
+                cur.execute(
+                    'SELECT time, main_net, small_net, mid_net, big_net, super_net '
+                    'FROM "kline_index_fflow" WHERE symbol = %s AND time::date <= %s '
+                    'ORDER BY time ASC',
+                    (sym, str(as_of)[:10]))
+            else:
+                cur.execute(
+                    'SELECT time, main_net, small_net, mid_net, big_net, super_net '
+                    'FROM "kline_index_fflow" WHERE symbol = %s ORDER BY time ASC',
+                    (sym,))
+            rows = cur.fetchall()
+    bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"),
+             "main_net": r[1], "small_net": r[2], "mid_net": r[3],
+             "big_net": r[4], "super_net": r[5]} for r in rows]
     return bars[-days:] if days and len(bars) > days else bars
 
 

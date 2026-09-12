@@ -205,6 +205,26 @@ def _sync_index_minute():
         logger.error("[index_minute] 执行失败: %s", e)
 
 
+def _sync_index_fflow():
+    """盘后: 指数大盘资金流同步 → kline_index_fflow (EM 1分钟累计, 当日240根/指数;
+    只能向前攒不可回补)。scripts/ 目录脚本, 用 importlib 按路径载入。"""
+    import importlib.util
+    import os as _os
+    _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.abspath(__file__))))), "scripts", "sync_index_fflow.py")
+    if not _os.path.isfile(_p):
+        logger.warning("[index_fflow] 未找到 scripts/sync_index_fflow.py, 跳过")
+        return
+    try:
+        _spec = importlib.util.spec_from_file_location("sync_index_fflow", _p)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        r = _mod.sync()
+        logger.info("[index_fflow] 指数资金流同步: %s", r)
+    except Exception as e:
+        logger.error("[index_fflow] 执行失败: %s", e)
+
+
 def _refresh_backfill_1d() -> dict:
     """覆写 1D，返回 {status, written, skipped}。"""
     from app.data_sources.backfill_db import run_1d
@@ -237,6 +257,9 @@ def _post_market_batch():
 
     # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
     _sync_index_minute()
+
+    # 指数大盘资金流同步 (kline_index_fflow, EM 1分钟累计, 只能向前攒)
+    _sync_index_fflow()
 
     _refresh_daily()
     _refresh_post_market()
@@ -349,6 +372,9 @@ TASKS = [
     Task("dragon_pools", _refresh_dragon_pools, interval=300, trading_only=True),
     Task("fast",         _refresh_fast,         interval=300, trading_only=True),
     Task("slow",         _refresh_slow,         interval=1800, trading_only=True),
+    # 盘中资金流轮询 (kline_index_fflow, 每5分钟全日重写幂等; EM delay host 滞后
+    # ~15分钟, 实时主站封锁自动回退, 解封后延迟降为秒级; 盘后 batch 终校准)
+    Task("fflow_intraday", _sync_index_fflow, interval=300, trading_only=True),
     # 日级任务 (定时触发，一天一次)
     Task("morning_batch",     _morning_batch,     interval=86400, trading_only=False, once_per_day=True, trigger_hour=6,  trigger_minute=0),
     Task("post_market_batch", _post_market_batch, interval=86400, trading_only=False, once_per_day=True, trigger_hour=15, trigger_minute=30),

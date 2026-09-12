@@ -50,7 +50,8 @@ class {cls}(StrategyBase):
     prefilter_anchor = "signal"          # signal=D0信号日 | limit_up=锚定涨停日
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DEFAULT_PARAMS)
-    data_needs = ("daily",)              # 可选: daily/snapshot/minute_1m/minute_live/lhb
+    data_needs = ("daily",)              # 可选: daily/snapshot/minute_1m/minute_live/lhb/
+                                         #       index_daily/index_minute/index_fflow (09-12 补录)
 
     # ---- D0 判定 (盘后扫描) ----
 

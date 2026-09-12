@@ -47,11 +47,12 @@ DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5,
                       # V2 前置门 (2026-09-11 trail 引擎口径归因 + 引擎级 A/B 终审):
                       # turnover_max=确认日换手上界 (低换手好, 池级全桶单调+五档平坦;
                       # 信号级子集语义 600d 65.1%/+4.52, 300d 72.7%/+6.22 vs v1
-                      # 63.0%/+3.28 / 71.6%/+4.41, 两段全正; 8/12 双档全优=平坦)。
+                      # 63.0%/+3.28 / 71.6%/+4.41, 两段全正; 8/12 双档全优=平坦;
+                      # 终版上线取 turnover_max=12 (默认即此值, 与验收证据一致)。
                       # env_ret20_max=None 默认关 — 池级深弱 alpha 未迁移到信号级
                       # (B-only 7 笔 42.9%/-0.01), 接口保留待实盘样本攒厚复核。
                       # None=该条件关闭; 条件不可知 (circ/指数缺失) 不否决 (fail-open)。
-                      turnover_max=14.0, env_ret20_max=None, env_index="000300",
+                      turnover_max=12.0, env_ret20_max=None, env_index="000300",
                       turnover_min=None)
 
 
@@ -124,6 +125,7 @@ class BreakV2Strategy(StrategyBase):
     entry_style = "brk"                # 出场引擎与 V1 同分支 (monitor break 语义)
     family = "break"                   # 版本链: break_v2 ⊆ break, 展示归一优先于 V1
     family_version = 2
+    data_needs = ("daily", "index_daily")   # §3.4 声明制: env_ret20 门消费 hub.index_daily (审计: 2026-09-12 偏差 A1)
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DEFAULT_PARAMS)
     PROBE_STAGE_RANK = {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,

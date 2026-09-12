@@ -331,10 +331,18 @@ class ToolProvider:
         """注册模块中所有公开函数。"""
         self._register_module_functions(module, domain)
 
+    # CLI/进程入口名黑名单（2026-09-12 事故修复）：这类函数是"进程入口"而非
+    # 可组合工具——mcp_bridge.main()（阻塞式启动 stdio server）曾因被注册为工具，
+    # 被规划器调用后挂死整个进程。任何模块的同名入口一律不注册。
+    _ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "app"})
+
     def _register_module_functions(self, module, domain: str):
         """扫描模块公开函数并注册。"""
         for attr_name in dir(module):
             if attr_name.startswith("_"):
+                continue
+            if attr_name in self._ENTRY_NAME_DENY:
+                logger.debug("[ToolProvider] 跳过入口函数 %s（CLI/server 入口不注册）", attr_name)
                 continue
             obj = getattr(module, attr_name)
             if not callable(obj) or not inspect.isfunction(obj):

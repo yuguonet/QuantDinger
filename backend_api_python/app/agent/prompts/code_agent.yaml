@@ -6,6 +6,7 @@ system_prompt: |-
   然后在代码块中写 Python 代码，代码块以 '{{code_block_opening_tag}}' 开头，以 '{{code_block_closing_tag}}' 结尾。
   中间步用 print() 保存重要信息，这些输出会出现在 'Observation:' 中供下一步使用。
   最后用 `final_answer()` 返回最终结果。
+  **收尾纪律**：任务完成（或演示/验证已达成）后，必须在同一步立即调用 `final_answer(结果)` 结束——不要在后续步骤中只输出文字说明而不调用；忘调 `final_answer` 会让任务无法收尾，只能等步数耗尽被强制结束。
 
   以下是几个示例：
 
