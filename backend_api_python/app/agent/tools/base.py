@@ -259,6 +259,9 @@ def func_to_openai_schema(func: Callable) -> Dict[str, Any]:
 # 跳过的文件（框架文件，非工具）
 _SKIP_FILES = {
     "__init__", "base", "em_utils", "pagination",
+    # 基础设施模块（非工具，2026-09-12）：防内部函数泄漏进工具注册表
+    # （resilient_parse 的 apply/resilient_parse_code_blobs 曾被误注册）
+    "resilient_parse", "guided_executor", "breaker", "staging_tools",
 }
 
 # 必选工具（通过 smolagents tools=[] 注入，provider 不扫描）

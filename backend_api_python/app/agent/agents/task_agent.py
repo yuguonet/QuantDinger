@@ -73,6 +73,33 @@ PLAN_MAX_PHASES = 5          # 单次 plan 的阶段数上限（超出截断）
 PLAN_PHASE_MAX_RETRIES = 1   # 单阶段默认重试上限（phase.max_retries 可覆盖，钳制 [0,3]）
 
 
+def _sandbox_help(obj=None):
+    """沙箱版 help：只返回文档文本，不进交互模式（防 stdin 阻塞）。"""
+    try:
+        import pydoc
+        if obj is None:
+            return "（沙箱不提供交互式帮助；传入对象可查看其文档，如 help(str)）"
+        return pydoc.render_doc(obj)[:3000]
+    except Exception as e:
+        return f"help 不可用: {e}"
+
+
+# 沙箱安全内置补全（2026-09-12）：smolagents BASE_PYTHON_TOOLS 仅 52 个名字，模型
+# 常用内置（repr/format/hash/hex/oct/bin/help…）全部缺失 → 每次调用触发
+# "Forbidden function evaluation" → 被误报为"[幻觉调用拦截]"（run6/run7 实证：
+# repr/help 连环拦截烧步数）。以下均为无 I/O、无动态求值的纯内置，统一放行；
+# 有害内置（open/eval/exec/compile/input/globals/locals/__import__ 等）继续拦截。
+_SANDBOX_EXTRA_BUILTINS = {
+    "repr": repr, "format": format, "hash": hash, "id": id,
+    "hex": hex, "oct": oct, "bin": bin, "ascii": ascii,
+    "bytes": bytes, "bytearray": bytearray, "frozenset": frozenset,
+    "slice": slice, "memoryview": memoryview, "dir": dir,
+    "help": _sandbox_help, "object": object, "super": super,
+    "property": property, "classmethod": classmethod, "staticmethod": staticmethod,
+    "delattr": delattr,
+}
+
+
 def _load_plan_template() -> str:
     global _PLAN_TEMPLATE
     if _PLAN_TEMPLATE is None:
@@ -286,11 +313,14 @@ class _LLMAdapter:
             response = None
             for attempt in range(int(_os.getenv("LLM_RETRY_ROUNDS", "3"))):
                 try:
+                    # Output budget: CodeAgent full-file generation exceeds the
+                    # 2048 default -> truncated mid-string. Env-tunable.
+                    _exec_max_tokens = int(_os.getenv("CODE_AGENT_MAX_TOKENS", "4096"))
                     response = client.chat.completions.create(
                         model=self._llm.model,
                         messages=formatted_messages,
                         temperature=self._llm.temperature,
-                        max_tokens=self._llm.max_tokens,
+                        max_tokens=max(self._llm.max_tokens or 0, _exec_max_tokens),
                         top_p=self._llm.top_p,
                     )
                     break  # 成功即退出重试循环
@@ -1215,6 +1245,14 @@ class TaskAgent(AgentBase):
             sname = getattr(st, "name", "unknown")
             tool_functions[sname] = st
 
+        # 暂存区工具常驻（2026-09-12）：任务书数据纪律要求跨阶段重数据用
+        # stage_write/stage_read/stage_list，但 phase 白名单模式会漏注入 → 模型按
+        # 说明调用即触发 Forbidden（误报"幻觉调用"）。三个工具与技能工具同级常驻。
+        _prov_fns = provider.get_functions() if provider else {}
+        for _stn in ("stage_write", "stage_read", "stage_list"):
+            if _stn in _prov_fns:
+                tool_functions.setdefault(_stn, _prov_fns[_stn])
+
         # final_answer
         def _final_answer(answer=None, **kwargs):
             return answer if answer is not None else kwargs
@@ -1241,10 +1279,8 @@ class TaskAgent(AgentBase):
             ],
             additional_functions={
             "final_answer": _final_answer,
-            # ?????????2026-09-12??smolagents ??????? repr?
-            # ??? repr(x) ? Forbidden??repr ??????/??????
-            # ?????????????run6 ?????
-            "repr": repr,
+            # 内置补全（2026-09-12）：见 _SANDBOX_EXTRA_BUILTINS（repr/format/hash…）
+            **_SANDBOX_EXTRA_BUILTINS,
         },
         )
         executor.custom_tools = tool_functions
@@ -1341,12 +1377,14 @@ class TaskAgent(AgentBase):
                 # （E2E 实证：列出白名单外工具 → 执行器反复试探"搜到但调不动"）
                 if tools is not None:
                     if not tools:
-                        return "本阶段无数据工具（仅计算能力与 search_tools 查询）。"
+                        return ("本阶段无数据工具（暂存区 stage_write/stage_read/stage_list "
+                                "与 search_tools 仍可用）。")
                     lines = [f"本阶段可用工具 ({len(tools)})："]
                     for _n in tools:
                         _fn = provider.get(_n)
                         _desc = (getattr(_fn, "__doc__", "") or "").strip().split("\n")[0][:100]
                         lines.append(f"  - {_n} — {_desc}" if _desc else f"  - {_n}")
+                    lines.append("（另：stage_write/stage_read/stage_list 暂存区工具常驻可用）")
                     return "\n".join(lines)
                 if not domain:
                     # 空 domain 在 provider 语义里=仅通用工具（E2E 实证误导）；默认列全部
@@ -1387,17 +1425,32 @@ class TaskAgent(AgentBase):
         smol_tools = [_SearchToolsTool(), _ListToolsTool(), _FormatResultTool(), _WebSearchTool()]
         smol_tools += list(skill_tools or [])
 
-        # 阶段内 observations 截断（保留最近 2 步完整，防止 token 爆炸）
+        # 阶段内局部记忆（保留最近 2 步完整，更早步骤压缩，防止重试/长阶段 token 爆炸）
         keep_recent = 2
+
+        def _truncate_field(step: ActionStep, field: str, cap: int = 200) -> None:
+            val = getattr(step, field, None)
+            if val is None:
+                return
+            if isinstance(val, str):
+                if len(val) > cap:
+                    setattr(step, field, val[:cap] + "...(truncated)")
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str) \
+                            and len(item["text"]) > cap:
+                        item["text"] = item["text"][:cap] + "...(truncated)"
 
         def _truncate_observations(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
             for step in agent.memory.steps:
-                if isinstance(step, ActionStep) and step.step_number is not None:
-                    if step.step_number <= memory_step.step_number - keep_recent:
-                        if step.observations and len(str(step.observations)) > 200:
-                            step.observations = str(step.observations)[:200] + "...(truncated)"
-                        if hasattr(step, 'observations_images') and step.observations_images:
-                            step.observations_images = None
+                if not isinstance(step, ActionStep) or step.step_number is None:
+                    continue
+                if step.step_number <= memory_step.step_number - keep_recent:
+                    _truncate_field(step, "observations")
+                    _truncate_field(step, "model_output")
+                    _truncate_field(step, "code_action")
+                    if hasattr(step, 'observations_images') and step.observations_images:
+                        step.observations_images = None
 
         agent = SmolCodeAgent(
             tools=smol_tools,
@@ -1425,7 +1478,8 @@ class TaskAgent(AgentBase):
             planning = custom_templates.get("planning", {})
             if isinstance(planning, dict) and provider:
                 if tools:
-                    allowed_names = set(str(t) for t in tools)
+                    # 暂存区工具常驻（2026-09-12）：与 executor 注入保持一致
+                    allowed_names = set(str(t) for t in tools) | {"stage_write", "stage_read", "stage_list"}
                 elif domain:
                     allowed_names = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
                 else:

@@ -847,6 +847,8 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
     acc = phase.get("acceptance") or []
     if not acc:
         return True, ""
+    import asyncio
+    _accept_timeout = float(os.getenv("PHASE_ACCEPT_TIMEOUT", "60"))
     try:
         from utils.json_parser import safe_parse_json
         criteria = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(acc))
@@ -857,14 +859,19 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
             "请逐条核对阶段结果是否满足验收标准。只输出 JSON："
             '{"passed": true/false, "note": "未通过时说明缺失项（≤100字），通过时留空"}'
         )
-        resp = await ctx.llm.generate(messages=[
+        # 验收判定自带上限（2026-09-12）：无独立超时时，一次慢判定会烧掉整个
+        # 任务预算，阶段结果连同主链路一起被 wait_for 取消（TimeoutError 事故实测）。
+        resp = await asyncio.wait_for(ctx.llm.generate(messages=[
             ChatMessage(role="system", content="你是严格的阶段验收员。只输出 JSON。"),
             ChatMessage(role="user", content=prompt),
-        ])
+        ]), timeout=_accept_timeout)
         obj = safe_parse_json((resp.content or "").strip(), default={})
         passed = bool(obj.get("passed", True))
         note = str(obj.get("note") or "")[:300]
         return passed, note
+    except asyncio.TimeoutError:
+        logger.warning("[Execute] 验收判定超时 %.0fs（放行）", _accept_timeout)
+        return True, f"验收判定超时（{_accept_timeout:.0f}s）"[:200]
     except Exception as e:
         logger.warning("[Execute] 验收判定失败（放行）: %s", e)
         return True, f"验收判定不可用: {e}"[:200]
@@ -911,6 +918,44 @@ def _detect_max_steps(agent) -> bool:
         return isinstance(getattr(last, "error", None), AgentMaxStepsError)
     except Exception:
         return False
+
+
+def _has_final_answer(agent) -> bool:
+    """引擎级 final_answer 检测：任一 ActionStep 置位 is_final_answer 即视为正常收尾。
+
+    模型偶发忘调 final_answer 时，smolagents 只会走 _handle_max_steps_reached() 强制生成
+    末步（该步仅有 error=AgentMaxStepsError，无 is_final_answer 标记）——通过扫描标记
+    即可在引擎层判定"未正常收尾"，不再依赖 error 类型/版本行为。
+    """
+    try:
+        from smolagents.memory import ActionStep
+        steps = getattr(getattr(agent, "memory", None), "steps", []) or []
+        return any(getattr(s, "is_final_answer", False) for s in steps
+                   if isinstance(s, ActionStep))
+    except Exception:
+        return True
+
+
+def _auto_stage_phase_result(scope: str, phase: dict, result, min_chars: int = 2000) -> str:
+    """框架侧自动落盘阶段完整结果（强制机制，2026-09-12）。
+
+    摘要通道 ≤2000 字符会丢明细，且跨阶段重数据原依赖模型自觉 stage_write——
+    本函数在框架层代做：阶段结果超过 min_chars 即自动写入暂存区并返回文件名，
+    下阶段任务书据此提示可 stage_read 读取完整数据。落盘失败不影响主流程。
+    """
+    text = str(result or "")
+    if len(text) <= min_chars:
+        return ""
+    try:
+        from tools.staging import stage_write
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_",
+                      f"phase_{phase.get('id', '')}_{phase.get('name', '')}")[:76]
+        name = f"{base}.md"
+        stage_write(scope, name, text)
+        return name
+    except Exception as e:
+        logger.debug("[Execute] 阶段结果自动落盘失败: %s", e)
+        return ""
 
 
 def _extract_clean_phase_result(agent, result: str, limit: int = 4000) -> str:
@@ -1054,10 +1099,11 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
 
     # 步数耗尽的强制答案常是半成品（run3 实测：脏代码污染下阶段任务书）
     # → 改取最后一段干净执行输出作为阶段结果（验收与交接都用它）
-    if _detect_max_steps(agent) and not interrupted:
+    # 引擎级兜底：未置位 final_answer 标记同样按"未正常收尾"处理（模型偶发忘调）
+    if not interrupted and (_detect_max_steps(agent) or not _has_final_answer(agent)):
         _clean = _extract_clean_phase_result(agent, str(result))
         if _clean and _clean != str(result):
-            logger.info("[Execute] phase #%d 步数耗尽，改用最后干净输出（%d 字符）",
+            logger.info("[Execute] phase #%d 未正常收尾，改用最后干净输出（%d 字符）",
                         phase_id, len(_clean))
             result = _clean
 
@@ -1092,6 +1138,11 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                 summary += f"\n（暂存区文件: {', '.join(_hits[:8])}——下阶段可用 stage_read(scope, name) 读取）"
     except Exception:
         pass
+    # 强制机制：摘要截断前的重数据由框架自动落盘，不依赖模型自觉 stage_write
+    _staged = _auto_stage_phase_result(run_scope, phase, result)
+    if _staged:
+        summary += (f"\n（阶段完整结果已自动存入暂存区 {_staged}，"
+                    f"下阶段可用 stage_read('{run_scope}', '{_staged}') 直接读取）")
     entry = {
         "id": phase_id, "name": phase.get("name", ""),
         "status": "pass" if passed else "fail",
@@ -1130,7 +1181,8 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         "phase_results": results,
         "completed_phases_text": done_new,
         "phase_last_note": "" if passed else (note[:500] or "未通过验收"),
-        "_phase_agents": agents,
+        "_phase_agents": {k: v for k, v in agents.items()
+                          if k.isdigit() and int(k) >= new_idx},
         "_phase_abort": bool(interrupted),
         "_failed_tools": failed_tools,
         "_agent_plan": "",

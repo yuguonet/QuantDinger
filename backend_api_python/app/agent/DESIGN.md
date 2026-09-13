@@ -107,7 +107,12 @@ backend_api_python/app/agent/
 │
 ├── agents/               # Agent 实现
 │   ├── base.py           # AgentBase 基类
-│   └── task_agent.py     # TaskAgent — 核心任务执行器
+│   └── task_agent.py     # TaskAgent — 核心任务执行器（双规划器阶段契约/_plan/_build_code_agent）
+│
+├── capabilities/         # 能力发现层（v2.0 新增，域=quant 数据能力）
+│   ├── scanner.py        # 扫描器（显式包 → 公开函数 → 写操作前缀硬排除）
+│   ├── loader.py         # 准入加载（admission.json → 护栏包装 → 注册 domain="quant"）
+│   └── admission.json    # 人工过目准入清单（19 项激活 / 2 暂缓留档）
 │
 ├── chain/                # 可追责链（EvalNode 树）
 │   ├── schema.py         # EvalNode 数据结构
@@ -135,12 +140,17 @@ backend_api_python/app/agent/
 │   ├── postgres_memory.py # PostgreSQL 实现
 │   └── redis_memory.py   # Redis 实现
 │
-├── tools/                # 工具集（78 个公开函数）
-│   ├── base.py           # Tool 基类 + ToolProvider 统一注册表
+├── tools/                # 工具集（78 个公开函数 + v2.0 加固件）
+│   ├── base.py           # Tool 基类 + ToolProvider 统一注册表（含 CLI 入口名注册黑名单）
 │   ├── format_utils.py   # 格式化工具（必选）
 │   ├── web_search_tools.py # 联网搜索（四引擎降级）
 │   ├── pagination.py     # 分页工具
-│   ├── mcp_bridge.py     # MCP 桥接
+│   ├── mcp_bridge.py     # MCP 桥接（serve() 入口不注册为工具）
+│   ├── resilient_parse.py # 代码提取加固层 v4（健全性校验/伪标签防线/散落抢救）
+│   ├── guided_executor.py # GuidedPythonExecutor（幻觉调用纠正，错误带可用清单）
+│   ├── breaker.py        # ToolCircuitBreaker（工具失败熔断：连续失败2次短路）
+│   ├── staging.py        # 阶段中转数据暂存区（stage_write/read/list，白名单+2MB上限）
+│   ├── staging_tools.py  # 暂存区工具注册出口
 │   └── finance/          # 金融领域工具（27 个模块）
 │       ├── analysis_tools.py    # 技术分析（1613行，最大）
 │       ├── data_tools.py        # 数据查询
@@ -183,6 +193,11 @@ backend_api_python/app/agent/
 │       ├── run.py        # 技能函数
 │       └── stock_report.py # 评估报告
 │
+├── resolvers/            # 实体解析器（chat_node 组合调用）
+│   ├── base.py           # EntityResolver/ResolveResult 协议
+│   ├── stock.py          # 股票实体（RAG 辅助，线程隔离）
+│   └── time.py           # 时间实体 v2（domain=finance|general，交易日历标定，语义异常打回澄清）
+│
 ├── formatters/           # 结果格式化
 │   ├── base.py           # BaseFormatter 基类 + 注册表
 │   ├── default.py        # 通用兜底（纯 LLM 自适应）
@@ -198,6 +213,8 @@ backend_api_python/app/agent/
     ├── md_format.py      # Markdown 格式化
     ├── tracing.py        # 追踪记录
     ├── prompt_loader.py  # 提示词加载
+    ├── prescan.py        # 预扫（技能AST签名/工具签名清单 → 规划提示，v2.0）
+    ├── trading_calendar.py # 交易日历（TimeResolver 依赖）
     └── logger.py         # 日志工具
 ```
 
@@ -273,6 +290,12 @@ class AgentState(TypedDict):
 ```
 
 ### 3.2 节点实现 (`nodes.py`)
+
+> **v2.0 阶段契约**：chat/plan/execute/finalize 之外的核心机制——execute 为单 phase
+> 执行器（`_run_phase_step`），route_after_execute 按 on_fail 分级驱动循环；阶段工具
+> 白名单收窄（`_select_phase_skill_tools`）；验收判定（`_check_phase_acceptance`）；
+> 步数耗尽取干净输出（`_extract_clean_phase_result`）。设计详见
+> `docs/AGENT_ACCOUNTABLE.md` §14。
 
 #### 四节点职责
 
@@ -1250,6 +1273,13 @@ class TraceCollector:
 | ~~CodeAgent planning prompt 工具注入失败~~ | ✅ 已修复 | 通过 {{tool_list}} 注入 |
 | ~~LLM 客户端泄漏 (Event loop is closed)~~ | ✅ v1.3 修复 | LLMBase.close() + 资源清理 |
 | ~~agent.py 连接泄漏~~ | ✅ v1.3 修复 | _load_analysis_memory_docs() 加 finally |
+| ~~CodeAgent 输出截断（max_tokens 2048）~~ | ✅ v2.0 修复 | CODE_AGENT_MAX_TOKENS=4096 + finish_reason=length 检测 |
+| ~~幻觉工具调用循环（create_file 等）~~ | ✅ v2.0 修复 | GuidedPythonExecutor 纠正 + 任务书边界明示 |
+| ~~坏工具反复重试不收敛~~ | ✅ v2.0 修复 | ToolCircuitBreaker（连续失败2次短路） |
+| ~~RAG 低相关度文档进上下文（RRF 长尾）~~ | ✅ v2.0 修复 | RAG_RRF_MIN_SCORE=0.005 长尾过滤 |
+| 阶段重试大上下文 | ⚠️ 已知 | 重试复用 CodeAgent 记忆累积（实测 137k input tokens）；局部记忆待做 |
+| 阶段间重数据依赖模型自觉调用暂存区 | ⚠️ 已知 | stage_* 工具已注入+纪律行提示，强制机制待做 |
+| 模型偶发忘调 final_answer | ⚠️ 已知 | code_agent.yaml 收尾纪律已加；引擎级检测待做 |
 | llama.cpp router mode 不支持 embedding | ⚠️ 已知 | 需要两个实例 |
 | PgVectorStore 性能瓶颈 | 📋 待优化 | 需引入 pgvector 扩展 |
 
@@ -1266,6 +1296,33 @@ class TraceCollector:
 ---
 
 ## 附录 A：版本历史
+
+### v2.0 (2026-09-11 ~ 09-12) — 双规划器阶段契约 + 能力发现层 + 稳定性防线
+
+> 完整设计说明见 `docs/AGENT_ACCOUNTABLE.md` §14；过程日志见 `.workbuddy/memory/2026-09-12.designer.md`。
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| ✨ 架构 | 双规划器阶段契约：外部 planner 产 phases[]（goal/tools/deliverable/acceptance/on_fail），execute 降为单 phase 执行器，route_after_execute 条件边循环；PLAN_MAX_PHASES=5 | agents/task_agent.py, nodes.py, prompts/plan_system.txt |
+| ✨ 架构 | 能力发现层：capabilities 包（scanner/loader/admission）+ planner 能力视图；19 项数据函数注册 domain="quant" | capabilities/*, agents/task_agent.py, nodes.py |
+| ✨ 稳定 | SSE 事件格式修复（翻译层 + node_start 补发 + 前端预声明）——半流式可见 | flask_app.py, agents/task_agent.py, nodes.py |
+| 🐛 修复 | RAG 静默失效：chat_node 局部 import os 作用域污染（UnboundLocalError） | nodes.py |
+| ✨ 稳定 | 提取层加固 v4：健全性校验/伪标签防线/散落代码抢救/围栏救援；合法输出零干预 | tools/resilient_parse.py |
+| ✨ 稳定 | 幻觉调用纠正：GuidedPythonExecutor（Forbidden 错误 → 可用清单+二选一指引） | tools/guided_executor.py |
+| ✨ 稳定 | 工具失败熔断：ToolCircuitBreaker（连续失败2次短路，元工具豁免，实例隔离） | tools/breaker.py |
+| ✨ 稳定 | 三道守卫：AGENT_RUN_WALL_TIMEOUT（非主线程墙钟）/ SSE_HARD_TIMEOUT_EXTRA（硬上限+可读超时文案）/ LLM 惰性客户端超时补挂 | nodes.py, flask_app.py, agents/task_agent.py |
+| 🐛 修复 | 复用 Agent 重试时 LLM 180s 超时丢失（close 后惰性重建未补挂） | agents/task_agent.py, nodes.py |
+| 🐛 修复 | main() 进程入口被注册为工具（mcp.run 挂死进程）→ CLI 入口名注册黑名单 + main→serve | tools/base.py, tools/mcp_bridge.py |
+| ✨ 功能 | 暂存区：stage_write/read/list（跨阶段重数据，scope/文件名白名单+2MB 上限） | tools/staging.py, tools/staging_tools.py, nodes.py |
+| ✨ 功能 | 取数批量化：27 个 codes 工具 [支持批量] 标注 + 任务书/规划规则 | utils/prescan.py, nodes.py, prompts/plan_system.txt |
+| ✨ 功能 | 预扫：技能 AST 签名解析 + 工具签名清单注入规划提示（替代裸名列表） | utils/prescan.py, agents/task_agent.py |
+| ✨ 功能 | 技能阶段清单：SKILL.md 可选 `## stages` 段 → planner 按阶段映射切片；market_screener 样板 | agents/task_agent.py, skills/market_screener/SKILL.md |
+| ✨ 功能 | TimeResolver：时间实体解析（domain=finance 交易日口径 / general 自然日；周六"今天行情"打回澄清） | resolvers/time.py, agents/task_agent.py, nodes.py |
+| 🐛 修复 | RAG RRF 长尾过滤：RAG_RRF_MIN_SCORE=0.005（低相关文档不再进上下文） | nodes.py |
+| 🐛 修复 | _LLMAdapter._desired_timeout 惰性补挂（复用 Agent 重试时 180s 超时丢失） | agents/task_agent.py |
+| 🐛 修复 | ToolProvider CLI 入口名黑名单（main/serve 等不注册） | tools/base.py |
+| 🐛 修复 | 响应元数据 phase_types 适配契约格式；代码类任务边界规则（禁止规划「写文件→运行文件」） | agents/task_agent.py, prompts/plan_system.txt, nodes.py |
+| 📄 文档 | docs/AGENT_ACCOUNTABLE.md v5.0（§十四）；本文件 v2.0 | docs/, DESIGN.md |
 
 ### v1.4 (2026-09-10) — 健壮性审计修复
 
