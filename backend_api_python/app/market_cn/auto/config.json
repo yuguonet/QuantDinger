@@ -79,7 +79,7 @@
     },
     "break_v2": {
       "label": "断板V2",
-      "enabled": false,
+      "enabled": true,
       "daily_limit": 5
     }
   }
