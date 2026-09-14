@@ -1124,13 +1124,22 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
         codes: 多股用逗号分隔
         periods: 均线周期列表，默认 [5,10,20,60,120,250]
     """
-    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    # codes 可能是 "a,b,c" 字符串，也可能被 LLM 直接传成列表；统一归一
+    if isinstance(codes, (list, tuple, set)):
+        code_list = [str(c).strip() for c in codes if str(c).strip()][:20]
+    else:
+        code_list = [c.strip() for c in str(codes).split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
     def _one(stock_code: str) -> Dict[str, Any]:
         try:
-            period_list = sorted(set(int(p.strip()) for p in periods.split(",") if p.strip().isdigit()))
+            # periods 描述写着"均线周期列表"，LLM 可能直接传 [5,10,20] 列表，故兼容 str/list
+            if isinstance(periods, (list, tuple, set)):
+                _pitems = [str(p) for p in periods]
+            else:
+                _pitems = str(periods).split(",")
+            period_list = sorted(set(int(p.strip()) for p in _pitems if str(p).strip().isdigit()))
             if not period_list:
                 return {"error": "无效的周期参数"}
 

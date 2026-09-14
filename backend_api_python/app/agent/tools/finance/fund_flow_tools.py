@@ -85,11 +85,7 @@ def get_market_fund_flow() -> dict:
     except Exception as e:
         logger.warning("get_market_fund_flow failed: %s", e)
         return {"error": str(e)}
-def get_northbound_flow() -> dict:
-    """北向资金：返回沪股通/深股通当日实时净买入金额。"""
-    from app.market_cn.index import get_northbound_realtime as _get
-    try:
-        return _get()
-    except Exception as e:
-        logger.warning("get_northbound_flow failed: %s", e)
-        return {"error": str(e)}
+# 2026-09-14 移除 `get_northbound_flow`：上游（同花顺 hexin 实时接口）已不可用，
+# 调用恒返回 {"error": ...}。留在工具面只会诱导模型反复试探、白烧步数与 token。
+# 底层 `app.market_cn.index.get_northbound_realtime` 仍被 fear_greed_index 与
+# cards/overview 依赖，故只摘除 agent 工具层的暴露，不动底层实现。

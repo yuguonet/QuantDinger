@@ -115,6 +115,10 @@ def _worker_loop():
                 # 任务级 close 会误杀并发 worker 的在途请求，且下一个任务在新 loop 上复用
                 # 已关闭的客户端会随机报 "Event loop is closed"。连接池随进程存活。
                 loop.close()
-        except Exception as e:
-            logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
-            future.set_exception(e)
+        except (Exception, asyncio.CancelledError) as e:
+            if isinstance(e, asyncio.CancelledError):
+                logger.warning("[MQ] Worker 任务超时被取消（放行）")
+                future.set_result("")
+            else:
+                logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
+                future.set_exception(e)

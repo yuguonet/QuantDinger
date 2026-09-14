@@ -262,6 +262,12 @@ _SKIP_FILES = {
     # 基础设施模块（非工具，2026-09-12）：防内部函数泄漏进工具注册表
     # （resilient_parse 的 apply/resilient_parse_code_blobs 曾被误注册）
     "resilient_parse", "guided_executor", "breaker", "staging_tools",
+    # mcp_bridge：独立 MCP server（供外部客户端连接），其 list_tools/list_categories/
+    # mcp_search_tools 是 @mcp.tool() 装饰的 MCP 工具，仅供子进程 serve() 注册。
+    # 若被本进程 ToolProvider 扫描，会把这些"同名但 _tool_catalog 为空（仅 serve() 时填充）"
+    # 的函数注册进沙箱、以"缺必填参数 category"的破损签名覆盖正经的 _ListToolsTool，
+    # 导致 Agent 调 list_tools() 报 "分类 'general' 不存在。可用分类: "（2026-09-14 实测）。
+    "mcp_bridge",
 }
 
 # 必选工具（通过 smolagents tools=[] 注入，provider 不扫描）
@@ -292,6 +298,8 @@ class ToolProvider:
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
         self._domains: Dict[str, str] = {}       # name → domain
+        # 可被 selected_domain 选中的域，只由 tools/<子目录> 推导（见 scan_subdirectories）
+        self._selectable_domains: set = set()
         self._schema_cache: Optional[List[dict]] = None
 
     # ── 扫描注册 ──────────────────────────────────────────────
@@ -317,10 +325,16 @@ class ToolProvider:
             self._register_module_functions(mod, domain)
 
     def scan_subdirectories(self, tools_dir: Path, package_prefix: str = "tools"):
-        """扫描子目录，子目录名即 domain。"""
+        """扫描子目录，子目录名即 domain（同时登记为"可选域"）。
+
+        可选域只来自目录：手动注册的来源层（如 capabilities）虽带 domain 标记，
+        但不进 _selectable_domains，因此不会出现在 planner 的可用域清单里——
+        "工具集域"与"工具来源层"不再混淆（2026-09-13，见 get_domains）。
+        """
         for sub in sorted(tools_dir.iterdir()):
             if not sub.is_dir() or sub.name.startswith("_") or sub.name == "__pycache__":
                 continue
+            self._selectable_domains.add(sub.name)
             self.scan_directory(sub, domain=sub.name,
                                 package_prefix=f"{package_prefix}.{sub.name}")
 
@@ -438,6 +452,15 @@ class ToolProvider:
         if not domain:
             return sorted(self._tools.keys())
         return sorted(n for n, d in self._domains.items() if d == domain)
+
+    def get_domains(self) -> List[str]:
+        """可选工具域（由 tools/<子目录> 推导，不含 common）。
+
+        与 _domains 的区别：_domains 记录每个工具的归属（含手动注册的来源层，
+        如 capabilities 的 CAPABILITY_DOMAIN），本方法只返回 planner 能用
+        selected_domain 选择的"工具集域"——两者语义不再混淆（2026-09-13）。
+        """
+        return sorted(d for d in self._selectable_domains if d != "common")
 
     # ── LLM 面向接口 ────────────────────────────────────────
 

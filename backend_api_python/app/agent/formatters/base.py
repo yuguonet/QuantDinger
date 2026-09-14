@@ -4,9 +4,14 @@ formatters/base.py — 格式化基类 + 注册表
 
 设计模式：和 resolvers/ 一样的注册表模式。
   - BaseFormatter：抽象基类，定义 format() 接口
-  - _REGISTRY：全局注册表，key=entity_type, value=formatter_class
+  - _REGISTRY：全局注册表，key=领域名或实体类型, value=formatter_class
   - register_formatter()：装饰器，注册 formatter
-  - get_formatter()：根据 entity_type 查找 formatter，找不到返回 default
+  - get_formatter()：按 domain → entity_type 查找 formatter，找不到返回 default
+
+key 语义（2026-09-13 修复）：注册方用的是【领域名】（如 register_formatter("finance")），
+而调用方曾只传 entity_type（"stock"）——key 语义不一致使 finance formatter 永不命中。
+现查找顺序为 domain（领域级标准输出，多领域可复用同一模板）→ entity_type
+（领域内某实体单独定制）→ default，既可扩展又向后兼容。
 """
 
 from __future__ import annotations
@@ -39,20 +44,33 @@ def register_formatter(entity_type: str):
     return decorator
 
 
-def get_formatter(entity_type: str) -> "BaseFormatter":
-    """根据 entity_type 查找 formatter。
+def get_formatter(entity_type: str = "", domain: str = "") -> "BaseFormatter":
+    """查找 formatter：domain（优先）→ entity_type → default。
 
-    优先精确匹配，找不到返回 default formatter。
+    Args:
+        entity_type: 实体类型（stock/commodity/crypto/...）
+        domain: 工具域（selected_domain，如 finance）。领域级标准输出按此命中，
+            多领域复用同一套输出规范；entity_type 供"领域内单实体定制"扩展。
+
+    Returns:
+        formatter 实例（永不返回 None：无匹配时为 DefaultFormatter）。
     """
-    if entity_type in _REGISTRY:
-        cls = _REGISTRY[entity_type]
-        logger.debug("[Formatter] 匹配: entity_type=%s → %s", entity_type, cls.__name__)
-        return cls()
+    for key, kind in ((domain, "domain"), (entity_type, "entity_type")):
+        if key and key in _REGISTRY:
+            cls = _REGISTRY[key]
+            logger.debug("[Formatter] 匹配: %s=%s → %s", kind, key, cls.__name__)
+            return cls()
 
     # 兜底：default
     from .default import DefaultFormatter
-    logger.debug("[Formatter] 兜底: entity_type=%s → DefaultFormatter", entity_type)
+    logger.debug("[Formatter] 兜底: domain=%s entity_type=%s → DefaultFormatter",
+                 domain, entity_type)
     return DefaultFormatter()
+
+
+def list_formatters() -> Dict[str, str]:
+    """已注册 formatter 的快照（key → 类名），供启动自检/排查"注册断链"。"""
+    return {k: v.__name__ for k, v in _REGISTRY.items()}
 
 
 # ═══════════════════════════════════════════════════════════════

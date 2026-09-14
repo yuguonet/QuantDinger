@@ -321,6 +321,16 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
                   AND error ~ '^eval_failed:'
                   AND (regexp_match(error, '^eval_failed:(\\d+)'))[1]::int >= 5
             """, (cutoff,))
+            # 2026-09-14：stock_code 为空的记录**永不可验证**（K 线恒拒绝"codes 不能
+            # 为空"），属永久毒丸——不等 5 次失败计数，直接出队。实测盘后验证对 125+
+            # 条空 code 记录逐条刷"K线返回错误: codes 不能为空"却从不计入统计。
+            cur.execute("""
+                UPDATE qd_traces SET status = 'unverifiable'
+                WHERE parent_id IS NULL
+                  AND exit_date IS NULL
+                  AND status = 'ok'
+                  AND COALESCE(stock_code, '') = ''
+            """)
             conn.commit()
 
             cur.execute("""
@@ -329,6 +339,7 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
                 WHERE parent_id IS NULL
                   AND exit_date IS NULL
                   AND status = 'ok'
+                  AND COALESCE(stock_code, '') <> ''
                   AND exec_date <= %s
                 ORDER BY exec_date ASC
                 LIMIT %s

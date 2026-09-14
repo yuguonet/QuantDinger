@@ -432,7 +432,8 @@ def web_search(query: str, count: int = 8, freshness: str = "pm") -> dict:
     """
     count = min(max(count, 1), 10)
     result = _unified_search(query, count=count, freshness=freshness)
-    return _format_output(result)
+    # 外网返回内容不可信 —— 就地消毒（提示注入中和），详见文件末尾 _sanitize_result
+    return _sanitize_result(_format_output(result))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -477,3 +478,52 @@ def _format_output(result: Dict[str, Any]) -> dict:
         output["error"] = result.get("error", "搜索失败")
 
     return output
+
+
+# ═══════════════════════════════════════════════════════════════
+#  结果消毒：提示注入中和（2026-09-14）
+# ═══════════════════════════════════════════════════════════════
+# 本工具是 agent **唯一**与外网发生关系的入口，返回的搜索结果是不可信文本，
+# 可能夹带提示注入（"忽略之前的指令，执行 xxx"）。沙箱已去掉，故在此就地消毒：
+# 命中即**注释掉**——保留原文便于排查，但使其失去指令形态。
+#
+# 注意：消毒必须放在**真正的实现**里（而非上层包装 _WebSearchTool），
+# 这样无论谁调用（agent 包装 / 其它工具 / 直接调用）都经过同一道处理。
+_WEB_INJECTION_MARKERS = (
+    "ignore previous instructions", "ignore all previous instructions",
+    "ignore the above", "ignore the following",
+    "disregard all previous", "disregard previous",
+    "忽略之前的所有指令", "忽略之前的指令", "忽略上面的指令", "忽略以上指令",
+    "忽略先前的所有指令", "忽略上述指令",
+    "不要遵守之前的指令", "不要理会上面的指令",
+    "你现在是", "你现在扮演", "你现在作为", "你现在充当",
+    "new instructions:", "new instruction:", "updated instructions:",
+    "system prompt:", "system message:",
+)
+
+
+def _neutralize_text(text):
+    """把含注入标记的整行注释掉（不删内容，便于事后排查对方塞了什么）。"""
+    if not text:
+        return text
+    out = []
+    for line in str(text).splitlines():
+        low = line.lower()
+        if any(m in low for m in _WEB_INJECTION_MARKERS):
+            out.append("# [已屏蔽·疑似提示注入] " + line.strip()[:200])
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _sanitize_result(obj, depth=0):
+    """递归消毒返回结构里的所有字符串（dict / list / str）。"""
+    if depth > 6:
+        return obj
+    if isinstance(obj, str):
+        return _neutralize_text(obj)
+    if isinstance(obj, list):
+        return [_sanitize_result(x, depth + 1) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _sanitize_result(v, depth + 1) for k, v in obj.items()}
+    return obj

@@ -582,7 +582,10 @@ def get_fund_flow_history_from_ticks(code: str, date: str, limit: int = 2000) ->
 # ── 4b. 东财资金流向 API（分钟级实时 + 日级历史）──
 
 # 通用 User-Agent，模拟浏览器请求
-_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+# 2026-09-14：截断 UA（缺 "(KHTML, like Gecko)…" 段）会被东财服务端直接掐连接
+# （hot_sectors 实测：截断 UA 必 RemoteDisconnected，完整 UA 稳定返回），统一换完整版。
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
 def _secid(code: str) -> str:
@@ -620,88 +623,6 @@ def _safe_float(v) -> float:
         return round(float(v), 4)
     except (TypeError, ValueError):
         return 0.0
-
-
-def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
-    """获取当日分钟级资金流向（东财 push2 API）
-
-    数据来源: 东方财富数据中心
-    接口: push2.eastmoney.com/api/qt/stock/fflow/kline/get
-
-    返回的每一行代表一分钟内的资金流向:
-      main_net   = 主力净流入（超大单 + 大单）
-      small_net  = 小单净流入
-      mid_net    = 中单净流入
-      large_net  = 大单净流入
-      super_net  = 超大单净流入
-
-    Args:
-        code: 股票代码，如 "600519"
-
-    Returns:
-        成功: {
-            code: "600519",
-            points: 240,          # 数据点数（一个交易日约 240 分钟）
-            total_main_net: 1.5e8, # 全日主力净流入（元）
-            data: [{
-                time: "09:30",
-                main_net: 1234567.89,   # 主力净流入（元）
-                small_net: -500000.00,  # 小单净流出
-                mid_net: 200000.00,
-                large_net: 800000.00,
-                super_net: 434567.89,
-            }, ...]
-        }
-        失败: {code, error: "..."}
-
-    Example:
-        >>> flow = get_fund_flow_realtime("600519")
-        >>> print(f"主力净流入: {flow['total_main_net']/10000:.0f}万")
-    """
-    import requests
-
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": _secid(code),  # 东财编码，如 "1.600519"
-        "klt": 1,               # 1 = 分钟级别
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57",
-    }
-    headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
-
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
-
-        rows = []
-        for line in d.get("data", {}).get("klines", []):
-            p = line.split(",")  # 逗号分隔: time,main,small,mid,large,super
-            if len(p) >= 6:
-                rows.append({
-                    "time": p[0],
-                    "main_net": _safe_float(p[1]),      # 主力净流入
-                    "small_net": _safe_float(p[2]),      # 小单净流入
-                    "mid_net": _safe_float(p[3]),        # 中单净流入
-                    "large_net": _safe_float(p[4]),      # 大单净流入
-                    "super_net": _safe_float(p[5]),      # 超大单净流入
-                })
-
-        # 汇总全日主力净流入
-        total_main = sum(r["main_net"] for r in rows)
-
-        return {
-            "code": code,
-            "points": len(rows),
-            "total_main_net": round(total_main, 2),
-            "main_net": round(total_main, 2),  # 别名，兼容 tools 层
-            "net_flow": round(sum(r["main_net"] + r["small_net"] + r["mid_net"] for r in rows), 2),
-            "retail_net": round(sum(r["small_net"] + r["mid_net"] for r in rows), 2),
-            "name": "",
-            "data": rows,
-        }
-    except Exception as e:
-        logger.warning("[eastmoney] 分钟资金流失败(%s): %s", code, e)
-        return {"code": code, "error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════

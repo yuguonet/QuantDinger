@@ -19,7 +19,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+# 2026-09-14：截断 UA（缺 "(KHTML, like Gecko)…" 段）会被东财服务端直接掐连接
+# （hot_sectors 实测：截断 UA 必 RemoteDisconnected，完整 UA 稳定返回），统一换完整版。
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 _SOURCE_URL = "https://www.stockapi.com.cn/v1/base/emotionalCycle"
 _CACHE_FILE = os.path.join(os.getcwd(), "data", "market_cn_cache", "emotion.json")
 _MAX_DAYS = 30

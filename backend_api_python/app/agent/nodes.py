@@ -27,6 +27,14 @@ from utils.tracing import AgentTraceRecorder
 
 logger = logging.getLogger(__name__)
 
+# F3 门控（2026-09-14）：代码/通用意图的语汇。命中即**不**做"RAG 历史标的 → 实体"的
+# 辅助注入——那条通道的本意是补全"它/这只票"这类省略指代，对代码任务是纯噪声。
+# 实证：「写一个跑马灯的代码并运行」被注入"西安银行(600928)"，迫使模型把股票分析
+# 塞进跑马灯任务。新增领域只需在此补语汇。
+_CODE_INTENT_RE = re.compile(
+    r"代码|程序|脚本|函数|算法|排序|递归|写一段|写一个|跑马灯|示例|demo|python|运行",
+    re.IGNORECASE)
+
 
 # ═══════════════════════════════════════════════════════════════
 #  格式化函数
@@ -65,6 +73,7 @@ class AgentState(TypedDict, total=False):
     skill_tools: list     # 选中技能的工具列表（_SkillResourceTool + _SkillFuncTool）
     step_budget: int      # CodeAgent 本轮步数预算
     planning_interval: int
+    plan_tools: list      # 顶层附加点名的工具（单段路径与 domain 基调取并集；有 phases 时恒为 []）
 
     # ── phase 契约（B 阶段 2026-09-12）──
     phases: list          # 外部 planner 产出的阶段契约（[]=单段执行旧路径）
@@ -160,11 +169,19 @@ class NodeContext:
             provider.scan_directory(tools_dir, domain="common", package_prefix="tools")
             # 扫描 tools/ 子目录（领域工具）
             provider.scan_subdirectories(tools_dir, package_prefix="tools")
-            # 能力发现层（A 阶段 2026-09-12）: admission.json 准入的只读函数 -> domain="quant"
+            # 能力发现层（A 阶段 2026-09-12）: admission.json 准入的只读函数 -> 来源层标记
+            # 2026-09-14：能力层**默认屏蔽**，CAPABILITIES_ENABLED=1 才注册。
+            # 理由（用户决策）：19 项准入全部**无审核留痕**（admission.json 没有
+            # reviewed_by/at），来源还是一份并不存在的"扫描报告"；而这层带来的
+            # 取数函数让工具面变大 → 模型更容易试探、上下文膨胀更快、沙箱冲突更多。
+            # 补齐审核留痕并评估收益后，再决定是否重新打开。
             try:
-                from capabilities import register_capabilities
-                _cap_n = register_capabilities(provider)
-                logger.info("[Context] 能力层注册: %d 个函数 (domain=quant)", _cap_n)
+                if os.getenv("CAPABILITIES_ENABLED", "0") == "1":
+                    from capabilities import register_capabilities
+                    _cap_n = register_capabilities(provider)
+                    logger.info("[Context] 能力层注册: %d 个函数（来源层标记，非可选工具域）", _cap_n)
+                else:
+                    logger.info("[Context] 能力层已屏蔽（CAPABILITIES_ENABLED != 1），跳过注册")
             except Exception as e:
                 logger.warning("[Context] 能力层注册失败（不阻断启动）: %s", e)
             _SHARED_TOOL_PROVIDER = provider
@@ -371,6 +388,54 @@ def _extract_failed_tools(agent, tool_provider=None) -> list:
     return failed
 
 
+# 数据/工具层不可用的正向证据关键词（验收失败归因，区分"环境导致"vs"agent 可控"）
+_TOOL_DATA_KW = (
+    "接口未返回", "未返回", "数据缺失", "无数据", "获取失败", "调用失败", "拉取失败",
+    "超时", "timeout", "time out", "api error", "http 5", "502", "503", "504",
+    "无法获取", "未能获取", "暂无", "暂不可用", "服务异常", "rate limit", "限流",
+    "返回空", "空值", "缺失", "不可用", "unavailable", "failed to fetch", "网络",
+)
+
+
+def _tool_data_evidence(result_text: str, failed_tools: list, run_error) -> bool:
+    """验收失败的"环境归因"正向证据。
+
+    仅当本阶段**确有**工具/数据层失败时，才允许把验收失败归因为 tool_data_fault；
+    否则即便验收判官声称"工具/数据导致"，也回退为 agent_fault，避免模型手软放过
+    本应重试的环节（验收的意义不能被绕过）。
+    """
+    if run_error:
+        return True
+    if failed_tools:
+        return True
+    low = (result_text or "").lower()
+    return any(k in low for k in _TOOL_DATA_KW)
+
+
+def _decide_phase_transition(passed, reason, on_fail, retry, max_retries, replan_count):
+    """阶段验收后的推进决策（由 execute_node 调用；抽为独立函数便于回归测试）。
+
+    返回 (kind, new_retry, do_replan, soft_pass)：
+      kind="advance" → 游标 +1（通过 / 软通过 / 重试·重设计额度耗尽容忍失败推进）
+      kind="retry"   → 游标不变，new_retry=retry+1（同阶段重试）
+      kind="replan"  → 游标不变，do_replan=True（回外部 planner 重设计）
+      soft_pass=True 仅当"未通过但缺失归因于工具/数据不可用"，此时仍 advance 但
+      保留已产出工作、不重试、不放弃。
+    """
+    # 软通过：验收通过，或仅因工具/数据不可用（非 agent 可控）而部分缺失 →
+    # 保留已产出的有效工作（如 80 分），直接推进管道。不重试（同一不可用工具必再
+    # 失败）、不放弃（已产出部分有价值）。
+    if passed or reason == "tool_data_fault":
+        return "advance", 0, False, (not passed)
+    # 仅 agent 可控失败才按 on_fail 重试 / 重设计
+    if on_fail == "retry" and retry < max_retries:
+        return "retry", retry + 1, False, False
+    if on_fail == "replan" and replan_count < MAX_REPLAN:
+        return "replan", retry, True, False
+    # 重试 / 重设计额度耗尽：容忍单阶段失败，推进管道，让后续阶段继续产出
+    return "advance", 0, False, False
+
+
 def make_chat_node(ctx: NodeContext):
     """创建 chat_node（闭包捕获 ctx）。
 
@@ -429,8 +494,15 @@ def make_chat_node(ctx: NodeContext):
         entity_type = ""
         effective_input = user_input
         # RAG 辅助：用户消息无明确代码时，从 context 中提取最近分析的标的
+        #
+        # F3 门控（2026-09-14 修复）：**代码/通用意图不得被历史标的污染**。
+        # 实证：问「写一个跑马灯的代码并运行」，RAG 捞到历史分析记录里的 600928，
+        # 于是给纯代码任务注入"西安银行(600928)，周期 T+3，深度：标准"——模型把股票
+        # 分析塞进跑马灯，5 步才收尾（原本 1~2 步），单步最长 150s。
+        # 该通道本意是"用户说'它'/'这只票'时补上标的"，对代码任务是纯粹噪声。
         resolve_input = user_input
-        if context and not re.search(r'(?<!\d)\d{6}(?!\d)', user_input):
+        if context and not re.search(r'(?<!\d)\d{6}(?!\d)', user_input) \
+                and not _CODE_INTENT_RE.search(user_input):
             code_match = re.search(r'(?:代码|code|symbol)[：:]*\s*(\d{6})', context, re.IGNORECASE)
             if code_match:
                 resolve_input = f"{user_input} {code_match.group(1)}"
@@ -442,20 +514,24 @@ def make_chat_node(ctx: NodeContext):
                     entity_code = entity.entity_code
                     entity_name = entity.entity_name
                     entity_type = entity.entity_type
-                    # 时间语义异常打回（2026-09-12 用户裁定）：如周六问"今天行情"，
-                    # 不静默标注——直接询问用户意图（最近收盘日 vs 下一交易日规划）。
-                    # 用户在追问中明确日期后，新消息重新解析自然走常规流程。
-                    if entity_type == "time_clarify":
-                        _q = ""
+                    # 澄清契约（2026-09-13 通用，域无关）：解析器无法准确判断时
+                    # 必须填 clarify_question 而不是猜默认值；这里直接把问题反问
+                    # 用户且**不进入执行**，用户答复作为新消息重新解析，拿到准确
+                    # 信息后才执行。任何 *_clarify（time / entity / 未来领域）都走
+                    # 本通道，新增领域无需改本文件。
+                    _q = str(getattr(entity, "clarify_question", "") or "")
+                    if not _q and entity_type.endswith("_clarify"):
+                        # 向后兼容：仍支持仅通过 entities 标记传递的旧写法
                         for _e in entity.entities or []:
-                            if isinstance(_e, dict) and _e.get("type") == "time_clarify":
+                            if isinstance(_e, dict) and str(_e.get("type", "")).endswith("_clarify"):
                                 _q = str(_e.get("question", ""))
                                 break
-                        logger.info("[Chat] 时间语义打回澄清: %s", (_q or "")[:80])
+                    if _q:
+                        logger.info("[Chat] 澄清反问(%s): %s", entity_type or "clarify", _q[:80])
                         return {
                             "needs_task": False,
                             "task_type": "query",
-                            "direct_answer": _q or "您提到的时间不是交易日，请明确想查询的日期。",
+                            "direct_answer": _q,
                         }
                     # 直接用 resolver 生成的 effective_input（含实体注入+扩写）
                     if entity.effective_input:
@@ -465,8 +541,15 @@ def make_chat_node(ctx: NodeContext):
                         entity_desc = f"{entity_name}({entity_code})" if entity_name else entity_code
                         effective_input = f"{user_input} 【实体】{entity_desc} [{entity_type}]"
                     logger.info("[Chat] 实体解析: %s → %s %s (%s)", user_input, entity_code, entity_name, entity_type)
+                    if effective_input != user_input:
+                        # 2026-09-14：让"时间/实体到底注入成什么样"在日志里直接可见。
+                        # 只打印原始输入时，排查者会误判解析器没生效（实测即如此）。
+                        logger.info("[Chat] 指令扩写: %s", effective_input)
             except Exception as e:
-                logger.debug("[Chat] 实体解析跳过: %s", e)
+                # 提升为 warning（2026-09-13）：此处原先 debug，把"注入对象不满足
+                # EntityResolver 契约"这类接线错误整体吞掉了——实体解析与澄清反问
+                # 因此静默失效很久。解析失败是真实降级，必须可见。
+                logger.warning("[Chat] 实体解析失败（已跳过，不影响主流程）: %s", e)
 
         # ── 4. 意图分类：统一 LLM 分类 ──
         needs_task = True
@@ -740,6 +823,7 @@ def make_plan_node(ctx: NodeContext):
             "planning_interval": plan.get("planning_interval", 6),
             "replan_count": replan_count + (1 if prev_hit else 0),
             "phases": phases,
+            "plan_tools": plan.get("plan_tools") or [],
             "phase_index": 0,
             "phase_retry": 0,
             "_phase_agents": {},
@@ -833,20 +917,34 @@ def _run_agent_with_guard(agent, full_task: str):
 async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_error) -> tuple:
     """轮询通道：外部 planner 的阶段验收判定（B 阶段）。
 
-    - 执行异常 → 直接 fail（不让 LLM 判）
-    - 结果为空 → fail
+    返回四元组 (passed, note, reason, score)：
+      - passed: 是否达到验收标准
+      - note: 未通过时缺失项说明（通过时留空）
+      - reason: 失败归因 ——
+          "pass"            验收通过
+          "agent_fault"     缺失项属于 agent 可控（分析错误/交付物不完整/可修正错误）→ 应重试
+          "tool_data_fault" 缺失项因工具不可用/外部接口未返回/数据缺失/网络超时等
+                           **agent 无法自行解决**的环境因素 → 不应重试，应软通过保留已产出工作
+      - score: 判官给的阶段完成度评分（0-100，供 telemetry；fail-open 时为 None）
+
+    设计要点（用户定调 2026-09-14）：验收是好的，但当结果已大部分达标（如 80 分）、
+    缺失的 20 分**纯因工具/数据不可用**时，系统不应无谓重试（同一工具必再失败）也不应
+    放弃已产出的有效工作。故验收必须区分"环境导致"与"agent 可控"，由调用方据此决定
+    重试 or 软通过。本函数只负责判定与归因，路由决策在 _run_phase_step / _decide_phase_transition。
+
+    - 执行异常 / 结果为空 → 直接 fail（无有效产出，保持原重试行为）
     - 无 acceptance 条目 → pass（无标准即放行）
-    - 有标准 → 轻量 LLM 逐条核对，输出 JSON {{passed, note}}
+    - 有标准 → 轻量 LLM 逐条核对，输出 JSON {passed, score, reason, note}
     - 判定通道不可用（LLM 错误/解析失败）→ fail-open 放行（宁松勿卡：判定故障不阻断主链路）
     """
     text = str(result or "")
     if run_error is not None:
-        return False, f"执行异常: {str(run_error)[:200]}"
+        return False, f"执行异常: {str(run_error)[:200]}", "agent_fault", None
     if not text.strip():
-        return False, "结果为空"
+        return False, "结果为空", "agent_fault", None
     acc = phase.get("acceptance") or []
     if not acc:
-        return True, ""
+        return True, "", "pass", None
     import asyncio
     _accept_timeout = float(os.getenv("PHASE_ACCEPT_TIMEOUT", "60"))
     try:
@@ -856,37 +954,63 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
             f"【阶段目标】{phase.get('goal', '')}\n"
             f"【验收标准】\n{criteria}\n"
             f"【阶段结果】\n{text[:4000]}\n\n"
-            "请逐条核对阶段结果是否满足验收标准。只输出 JSON："
-            '{"passed": true/false, "note": "未通过时说明缺失项（≤100字），通过时留空"}'
+            "请逐条核对阶段结果是否满足验收标准。只输出 JSON：\n"
+            '{"passed": true/false, "score": 0-100, '
+            '"reason": "pass 或 agent_fault 或 tool_data_fault", '
+            '"note": "未通过时说明缺失项与原因（≤100字），通过时留空"}\n'
+            "reason 取值规则：passed 为 true 时填 pass；为 false 时——"
+            "若缺失项是由于工具不可用 / 外部接口未返回 / 数据缺失 / 网络超时等"
+            "**agent 无法自行解决**的环境因素，填 tool_data_fault；"
+            "若缺失项属于分析错误、交付物不完整、agent 本可修正的错误，填 agent_fault。"
         )
         # 验收判定自带上限（2026-09-12）：无独立超时时，一次慢判定会烧掉整个
         # 任务预算，阶段结果连同主链路一起被 wait_for 取消（TimeoutError 事故实测）。
-        resp = await asyncio.wait_for(ctx.llm.generate(messages=[
-            ChatMessage(role="system", content="你是严格的阶段验收员。只输出 JSON。"),
-            ChatMessage(role="user", content=prompt),
-        ]), timeout=_accept_timeout)
+        # 2026-09-13 修复：Python 3.11+ 的 wait_for 超时会级联取消整个协程树，
+        # 必须捕获 CancelledError 并恢复到稳定状态。
+        try:
+            resp = await asyncio.wait_for(ctx.llm.generate(messages=[
+                ChatMessage(role="system", content="你是严格的阶段验收员。只输出 JSON，并为失败归因于 agent_fault 或 tool_data_fault。"),
+                ChatMessage(role="user", content=prompt),
+            ]), timeout=_accept_timeout)
+        except asyncio.CancelledError:
+            # CancelledError 可能是 timeout 触发，也可能是外层取消
+            # 优先按 timeout 处理（放行），避免级联崩溃
+            logger.warning("[Execute] 验收判定被取消（可能是超时），放行通过")
+            return True, "验收判定被取消（放行）"[:200], "pass", None
         obj = safe_parse_json((resp.content or "").strip(), default={})
         passed = bool(obj.get("passed", True))
         note = str(obj.get("note") or "")[:300]
-        return passed, note
+        try:
+            score = int(obj.get("score")) if obj.get("score") is not None else None
+        except Exception:
+            score = None
+        reason = str(obj.get("reason") or ("pass" if passed else "agent_fault"))
+        if reason not in ("pass", "agent_fault", "tool_data_fault"):
+            reason = "pass" if passed else "agent_fault"
+        return passed, note, reason, score
     except asyncio.TimeoutError:
         logger.warning("[Execute] 验收判定超时 %.0fs（放行）", _accept_timeout)
-        return True, f"验收判定超时（{_accept_timeout:.0f}s）"[:200]
+        return True, f"验收判定超时（{_accept_timeout:.0f}s）"[:200], "pass", None
+    except asyncio.CancelledError:
+        # 兜底：确保 CancelledError 不外泄
+        logger.warning("[Execute] 验收判定 CancelledError 兜底（放行）")
+        return True, "验收判定取消（兜底放行）"[:200], "pass", None
     except Exception as e:
         logger.warning("[Execute] 验收判定失败（放行）: %s", e)
-        return True, f"验收判定不可用: {e}"[:200]
+        return True, f"验收判定不可用: {e}"[:200], "pass", None
 
 
 def _phase_summary(phase: dict, result) -> str:
-    """反向通道：阶段结果摘要（截断上限 2000 字符）。
+    """反向通道：阶段结果摘要（截断 300 字符，仅入 state 记录与 trace）。
 
-    大结果由执行器落盘 tmp/ 只回报路径（任务书中的数据纪律），此处再做一层截断兜底。
+    2026-09-14 三轮演进后定稿（用户定调：阶段交接**零内联**）——下阶段任务书
+    不再引用本摘要（改用 phase_results 清单 + stage_read 指引），因此这里不需要
+    任何提炼/截断花活：短截断仅供 state 记录与日志，不再进模型上下文。
     """
     text = str(result or "").strip()
-    limit = 2000
-    if len(text) <= limit:
+    if len(text) <= 300:
         return text
-    return f"{text[:limit]}…(截断，共 {len(text)} 字符)"
+    return f"{text[:300]}…(共 {len(text)} 字符)"
 
 
 def _select_phase_skill_tools(all_tools: list, phase_tools: list) -> list:
@@ -936,25 +1060,31 @@ def _has_final_answer(agent) -> bool:
         return True
 
 
-def _auto_stage_phase_result(scope: str, phase: dict, result, min_chars: int = 2000) -> str:
+def _auto_stage_phase_result(scope: str, phase: dict, result, min_chars: int = 800) -> str:
     """框架侧自动落盘阶段完整结果（强制机制，2026-09-12）。
 
-    摘要通道 ≤2000 字符会丢明细，且跨阶段重数据原依赖模型自觉 stage_write——
+    摘要通道会丢明细，且跨阶段重数据原依赖模型自觉 stage_write——
     本函数在框架层代做：阶段结果超过 min_chars 即自动写入暂存区并返回文件名，
     下阶段任务书据此提示可 stage_read 读取完整数据。落盘失败不影响主流程。
+    2026-09-14：min_chars 2000 → 800，与 `_phase_summary` 的截断上限对齐——
+    凡被摘要截掉的全文，必然已在暂存区（内联摘要 ⊆ 暂存区全文）。
     """
     text = str(result or "")
     if len(text) <= min_chars:
         return ""
     try:
-        from tools.staging import stage_write
+        # 2026-09-13 修正：infra 拆分后 staging 已迁至 infra/（见 DESIGN v2.0 架构行），
+        # 此处遗留 `from tools.staging import ...` → ImportError 被下面的 except 静默吞掉，
+        # 本函数（"框架代做落盘"的强制机制）实际从未执行过，且无任何告警。
+        from infra.staging import stage_write
         base = re.sub(r"[^A-Za-z0-9_.-]", "_",
                       f"phase_{phase.get('id', '')}_{phase.get('name', '')}")[:76]
         name = f"{base}.md"
         stage_write(scope, name, text)
         return name
     except Exception as e:
-        logger.debug("[Execute] 阶段结果自动落盘失败: %s", e)
+        # 接线错误必须可见（同 v2.2 对 L8 的处置）：降级可以，静默不行。
+        logger.warning("[Execute] 阶段结果自动落盘失败: %s", e)
         return ""
 
 
@@ -1008,12 +1138,32 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                                 str(state.get("_start_time", ""))[-8:]) or "run_default"
     task_parts = []
     task_parts.append(f"【暂存区 scope】{run_scope}")
-    original_input = state.get("user_input", "")
+    # 2026-09-14：用 effective_input（resolver 已把时间/实体事实**内联**进原文），
+    # 而不是裸 user_input。只用原始消息时，阶段任务书开头的"用户原始需求"没有日期，
+    # 与下方 goal 里的标定日期不一致，模型可能以无日期的那份为准；日志上看也像
+    # "时间解析没生效"（实测即被这样误读）。effective_input 是原文的严格扩写，
+    # 保底作用不减反增。
+    original_input = state.get("effective_input") or state.get("user_input", "")
     if original_input:
         task_parts.append(f"【用户原始需求】{original_input[:800]}")
-    done_text = state.get("completed_phases_text", "") or ""
-    if done_text:
-        task_parts.append(f"【已完成阶段结果】\n{done_text[-3000:]}")
+    # 2026-09-14（用户定调）：已完成阶段**不内联任何内容**，只给一行式清单 +
+    # 暂存区取用方式。此前把上一阶段交付物（原文截断/行筛选摘要）拼进任务书，
+    # 内联进后续每阶段每一步 ⇒ 平方级 token 膨胀。stage_* 是常驻工具，各阶段
+    # 都可用；模型需要明细时自己 stage_read（用户接受这一次调用）。
+    prev_results = list(state.get("phase_results") or [])
+    if prev_results:
+        lines = []
+        for r in prev_results:
+            fields = (r.get("deliverable") or "")[:120]
+            staged = r.get("staged") or ""
+            if staged:
+                detail = f"交付物含[{fields}]；完整结果: stage_read('{run_scope}', '{staged}')"
+            else:
+                detail = f"交付物含[{fields}]；结果较短未落盘"
+            lines.append(f"- 阶段{r.get('id')} {r.get('name', '')}："
+                         f"{'✓通过' if r.get('status') == 'pass' else '✗未通过'}，{detail}")
+        task_parts.append("【已完成阶段（本清单不含内容；需要明细时用 stage_read 自取）】\n"
+                          + "\n".join(lines))
     task_parts.append(f"【当前阶段 {phase_id}/{len(phases)}：{phase.get('name', '')}】\n{phase.get('goal', '')}")
     deliverable = phase.get("deliverable")
     if deliverable:
@@ -1055,7 +1205,8 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     task_parts.append("【数据纪律】多标的同类数据一次拉全：支持批量的工具用逗号分隔 codes 一次调用，"
                       "或在单个代码块内循环完成（只打印提炼后的关键字段）；禁止逐只分步取数。"
                       "跨阶段重数据用暂存区工具 stage_write(scope, name, content) / "
-                      "stage_read(scope, name)（本阶段 scope 见上）。"
+                      "stage_read(scope, name)（本阶段 scope 见上）：content 传**原对象**（dict/list）"
+                      "即可，stage_read 直接返回该对象、无需 json.loads；纯文本（.md）照旧传字符串。"
                       "沙箱内只存在【本阶段可用工具】清单所列函数——不存在 create_file/read_file 等任何"
                       "文件工具，调用必然失败；代码类任务的交付物=完整代码文本（直接在最终答复中给出）。")
     full_task = "\n\n".join(task_parts)
@@ -1063,9 +1214,17 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     # ── 每 phase 独立 CodeAgent（重试复用实例）──
     agents = dict(state.get("_phase_agents") or {})
     agent = agents.get(str(phase_id))
+    # 阶段级预算（2026-09-13 契约补全）：优先取契约 phases[].step_budget，缺失回退全局。
+    # 旧实现所有阶段共用全局 step_budget → "取数 3 步 / 分析 8 步"这类差异无法表达（审计 G3）。
+    phase_budget = int(phase.get("step_budget") or 0) or int(state.get("step_budget", 10) or 10)
+    # 内部 planner 开关（2026-09-13）：由外部 planner 在契约里显式声明 internal_plan。
+    # 旧实现按 selected_skill 判断——技能层清空后该判据恒真，内部 planner 全程常开，
+    # 与"简单指令关闭内部 planner"的设计意图正好相反（审计 G2）。未声明时按预算判复杂度。
+    _need_internal = phase.get("internal_plan")
+    if _need_internal is None:
+        _need_internal = phase_budget >= 8
     if agent is None:
-        selected_skill = state.get("selected_skill", "")
-        effective_interval = None if selected_skill else state.get("planning_interval", 6)
+        effective_interval = max(2, min(phase_budget // 2, 6)) if _need_internal else None
         agent = agent_instance._build_code_agent(
             model=ctx.model,
             provider=ctx.tool_provider,
@@ -1075,22 +1234,28 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             domain=state.get("selected_domain", ""),
             tools=(phase.get("tools") or None),
             step_event_cb=getattr(ctx, "event_cb", None),
+            run_scope=run_scope,
         )
         agents[str(phase_id)] = agent
-        logger.info("[Execute] phase #%d 新建 CodeAgent（白名单 %d 个工具）",
-                    phase_id, len(phase.get("tools") or []))
+        logger.info("[Execute] phase #%d 新建 CodeAgent（白名单 %d 个工具，内部规划 %s）",
+                    phase_id, len(phase.get("tools") or []),
+                    "on" if effective_interval else "off")
     else:
         logger.info("[Execute] phase #%d 复用 CodeAgent（重试）", phase_id)
 
-    agent.max_steps = int(state.get("step_budget", 10) or 10)
+    agent.max_steps = phase_budget
     _set_llm_timeout(agent, 180)
 
-    logger.info("[Execute] phase #%d/%d '%s' 开始，step_budget=%d",
-                phase_id, len(phases), phase.get("name", ""), agent.max_steps)
+    logger.info("[Execute] phase #%d/%d '%s' 开始，step_budget=%d，内部规划=%s",
+                phase_id, len(phases), phase.get("name", ""), agent.max_steps,
+                "on" if _need_internal else "off")
     if trace:
         trace.record("phase_start", {
             "phase_id": phase_id, "name": phase.get("name", ""),
             "retry": retry, "tools": phase.get("tools") or [],
+            # 规划分工决策留痕（2026-09-13）：事后可对账"该阶段有没有开内部 planner、
+            # 预算多少"，否则 G2 那类判据失效的问题无法从 trace 里发现。
+            "step_budget": agent.max_steps, "internal_plan": bool(_need_internal),
         })
     react_start = time.time()
     result, run_error, interrupted = _run_agent_with_guard(agent, full_task)
@@ -1115,18 +1280,60 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     except Exception as e:
         logger.debug("[Execute] 关闭 LLM adapter 客户端失败: %s", e)
 
+    # 收尾：清理 CodeAgent.executor/python_executor（2026-09-13：smolagents
+    # LocalPythonExecutor 内部 ThreadPoolExecutor(max_workers=1) 的工作线程在超时时
+    # 不被杀，只抛 TimeoutError 给主线程，导致进程不退出。显式清空引用触发资源回收。）
+    try:
+        for _attr in ("executor", "python_executor"):
+            _exec = getattr(agent, _attr, None)
+            if _exec is None:
+                continue
+            if hasattr(_exec, "custom_tools"):
+                _exec.custom_tools.clear()
+            if hasattr(_exec, "state") and isinstance(_exec.state, dict):
+                for _k in list(_exec.state.keys()):
+                    if not _k.startswith("__"):
+                        _exec.state.pop(_k, None)
+            if hasattr(_exec, "cleanup"):
+                _exec.cleanup()
+            elif hasattr(_exec, "shutdown"):
+                _exec.shutdown(wait=False)
+            logger.debug("[Execute] phase #%d %s 已清理", phase_id, _attr)
+    except Exception as e:
+        logger.debug("[Execute] 清理 executor 失败: %s", e)
+
     if trace:
         _record_tool_calls_to_trace(trace, agent)
     failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
 
     # ── 轮询通道：验收判定 ──
     if interrupted:
-        passed, note = False, "用户中断"
+        passed, note, reason, score = False, "用户中断", "agent_fault", None
     else:
-        passed, note = await _check_phase_acceptance(ctx, phase, result, run_error)
+        passed, note, reason, score = await _check_phase_acceptance(ctx, phase, result, run_error)
+        # 护栏（防误判/手软）：判官称"工具/数据导致"但本阶段无任何工具/数据层失败的
+        # 实锤证据时，回退为 agent_fault，保住验收意义——不因而放过该重试的环节。
+        if not passed and reason == "tool_data_fault" \
+                and not _tool_data_evidence(str(result), failed_tools, run_error):
+            reason = "agent_fault"
 
-    logger.info("[Execute] phase #%d 验收: %s %s", phase_id,
-                "通过" if passed else "未通过", note[:120])
+    logger.info("[Execute] phase #%d 验收: %s（归因 %s，评分 %s） %s", phase_id,
+                "通过" if passed else "未通过", reason, score, note[:120])
+
+    # 推进决策：验收通过 或"工具/数据不可用导致部分缺失(软通过)"→ 推进管道；
+    # 仅 agent 可控失败才按 on_fail 重试/重设计。决策抽为可测函数（见 _decide_phase_transition）。
+    _kind, new_retry, do_replan, soft_pass = _decide_phase_transition(
+        passed, reason,
+        phase.get("on_fail", "retry"),
+        retry,
+        int(phase.get("max_retries", 1) or 1),
+        int(state.get("phase_replan_count", 0) or 0),
+    )
+    new_idx = idx + 1 if _kind == "advance" else idx
+    replan_count = int(state.get("phase_replan_count", 0) or 0)
+    if _kind == "replan":
+        replan_count = replan_count + 1
+    effective_pass = passed or reason == "tool_data_fault"
 
     summary = _phase_summary(phase, result)
     # 暂存区引用回填：结果中提到 stage_write 的文件 → 在摘要尾部列出（供下阶段 stage_read）
@@ -1145,27 +1352,32 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                     f"下阶段可用 stage_read('{run_scope}', '{_staged}') 直接读取）")
     entry = {
         "id": phase_id, "name": phase.get("name", ""),
-        "status": "pass" if passed else "fail",
+        "status": "pass" if effective_pass else "fail",
+        "partial": soft_pass,
+        "reason": reason,
+        "score": score,
         "note": note[:300], "elapsed": react_elapsed,
         "preview": str(result)[:300],
+        # 2026-09-14：供下阶段任务书生成"已完成阶段清单"——只给文件名与字段说明，
+        # 不内联内容（用户定调）。deliverable = planner 写的交付物描述（字段说明）。
+        "staged": _staged,
+        "deliverable": str(phase.get("deliverable", ""))[:200],
     }
     results = list(state.get("phase_results") or []) + [entry]
     line = f"[阶段{phase_id} {phase.get('name', '')}] {'✓通过' if passed else '✗未通过'}：{summary}"
+    # 2026-09-14 回归修复：任务书组装处不再读 completed_phases_text（零内联改造时
+    # 误删了 done_text 定义），但 state 累积本身保留——复盘/重规划通道可能消费。
+    done_text = str(state.get("completed_phases_text", "") or "")
     done_new = (done_text + "\n\n" + line).strip() if done_text else line
 
-    if passed:
-        new_idx, new_retry = idx + 1, 0
-        replan_count = int(state.get("phase_replan_count", 0) or 0)
-    else:
-        new_idx, new_retry = idx, retry + 1
-        replan_count = int(state.get("phase_replan_count", 0) or 0)
-        if phase.get("on_fail", "retry") == "replan":
-            replan_count += 1
+    # 注：new_idx / new_retry / replan_count / do_replan / soft_pass / effective_pass
+    # 已在上方"推进决策"段据 _decide_phase_transition 计算，此处不再重复。
 
     if trace:
         trace.record("phase_done", {
             "phase_id": phase_id, "name": phase.get("name", ""),
             "status": entry["status"], "retries": retry,
+            "accept_reason": reason, "accept_score": score, "partial": soft_pass,
             "on_fail": phase.get("on_fail", "retry"),
             "acceptance_note": note[:500], "elapsed_seconds": react_elapsed,
             "tools_whitelist": phase.get("tools") or [],
@@ -1184,6 +1396,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         "_phase_agents": {k: v for k, v in agents.items()
                           if k.isdigit() and int(k) >= new_idx},
         "_phase_abort": bool(interrupted),
+        "_phase_replan_request": do_replan,
         "_failed_tools": failed_tools,
         "_agent_plan": "",
         "_run_error": repr(run_error) if run_error else "",
@@ -1238,21 +1451,58 @@ def make_execute_node(ctx: NodeContext):
                         selected_skill, len(skill_body), len(skill_tools))
 
         # 注入原始用户输入（Planner 可能重新描述任务，丢失关键词如“深度”“明天”）
-        original_input = state.get("user_input", "")
+        # 2026-09-14：改用 effective_input（原文的严格扩写，已内联时间/实体事实）。
+        # 注释所述"Planner 可能重新描述任务、丢失关键词"的保底作用完全保留，
+        # 且不会给出无日期的版本（与阶段模式任务书口径一致）。
+        original_input = state.get("effective_input") or state.get("user_input", "")
         if original_input and original_input != task:
             task_parts.append(f"【用户原始输入】{original_input}")
 
         task_parts.append(f"【任务】\n{task}")
+
+        # 附加点名工具（2026-09-13）：给"名字 + 参数签名"而不是裸名字。与阶段任务书同规则
+        # （2026-09-12 E2E 实证：只给名字会诱发参数猜测，连环 TypeError 烧步数）——两条
+        # 执行路径若在此处不一致，行为就会漂移。这里是单段任务接触 capabilities 的唯一入口。
+        plan_tools = list(state.get("plan_tools") or [])
+        if plan_tools:
+            _pt_sigs = []
+            for _n in plan_tools:
+                _ft = ctx.tool_provider.get(_n) if ctx.tool_provider else None
+                _sig = _n
+                if _ft is not None:
+                    try:
+                        _ps = [p.name for p in inspect.signature(_ft).parameters.values()
+                               if not p.name.startswith("_")]
+                        _sig = "%s(%s)" % (_n, ", ".join(_ps))
+                    except Exception:
+                        pass
+                _pt_sigs.append(_sig)
+            task_parts.append("【附加点名工具（可直接调用；括号内为参数名）】" + ", ".join(_pt_sigs))
+            logger.info("[Execute] 附加点名工具 %d 个: %s", len(_pt_sigs), plan_tools[:12])
+
         full_task = "\n\n".join(task_parts)
 
-        # 复用已有 CodeAgent 实例（跨轮 memory 自然衔接）
+        # 复用已有 CodeAgent 实例（跨轮 memory 自然衔接）——但实例是与"工具契约"
+        # （域 + 附加点名）绑定的：复盘重规划若改变了二者，复用旧实例会导致沙箱里
+        # 根本没有新点名的工具，而任务书却明写着"可直接调用"→ 模型照说明调用即
+        # Forbidden，被误报成"幻觉调用"（与 stage_write 漏注入是同一类坑）。
+        # 契约变了就重建：牺牲一次跨轮 memory，换取工具面与任务书一致。
+        _contract = (selected_domain, tuple(plan_tools))
         agent = state.get("_code_agent")
+        if agent is not None and getattr(agent, "_tool_contract", None) != _contract:
+            logger.info("[Execute] 工具契约变化 %s → %s，重建 CodeAgent 实例",
+                        getattr(agent, "_tool_contract", None), _contract)
+            agent = None
         if agent is None:
 
-            # 技能模式下关闭 smolagents 内部 planning（外部 plan 已规划）
-            # 非技能模式保持原样
-            effective_interval = None if selected_skill else planning_interval
+            # 内部 planner 开关（2026-09-13）：单段路径无阶段契约，按预算判复杂度——
+            # 预算小视为"简单指令"，直接关闭 smolagents 内部 planner（外部 plan 已定范围）。
+            # 旧实现按 selected_skill 判断，技能层清空后判据恒真、内部 planner 恒开（审计 G2）。
+            effective_interval = planning_interval if step_budget >= 8 else None
 
+            # 本次 run 的暂存区 scope（与 _run_phase_step 同规则派生）
+            run_scope = "run_" + re.sub(r"[^A-Za-z0-9]", "",
+                                        str(state.get("_start_time", ""))[-8:]) or "run_default"
             agent = agent_instance._build_code_agent(
                 model=ctx.model,
                 provider=ctx.tool_provider,
@@ -1261,8 +1511,11 @@ def make_execute_node(ctx: NodeContext):
                 phase_id=0,
                 domain=selected_domain,
                 step_event_cb=getattr(ctx, "event_cb", None),
+                run_scope=run_scope,
+                extra_tools=plan_tools or None,
             )
-            logger.info("[Execute] 新建 CodeAgent 实例")
+            agent._tool_contract = _contract
+            logger.info("[Execute] 新建 CodeAgent 实例（工具契约 %s）", _contract)
         else:
             logger.info("[Execute] 复用 CodeAgent 实例，memory 自然衔接")
 
@@ -1411,6 +1664,18 @@ def make_finalize_node(ctx: NodeContext):
             missing = "\n".join(lines)
             result_raw = f"{result_raw}\n\n【数据完整性】以下工具未获取到数据:\n{missing}"
 
+        # ── 4b. 阶段部分达标说明（工具/数据不可用，未无谓重试/放弃）──
+        _phase_results = state.get("phase_results") or []
+        _partial = [p for p in _phase_results if p.get("partial")]
+        if _partial:
+            _p_lines = []
+            for _p in _partial:
+                _sc = _p.get("score")
+                _sc_txt = f"（评分 {_sc}/100）" if isinstance(_sc, int) else ""
+                _p_lines.append(f"- 阶段{_p.get('id')} {_p.get('name', '')}{_sc_txt}：{str(_p.get('note', ''))[:200]}")
+            result_raw = (result_raw + "\n\n【阶段部分达标】以下阶段因工具/数据不可用仅部分完成，"
+                          "已保留已产出结果并继续（未无谓重试/放弃）：\n" + "\n".join(_p_lines))
+
         # ── 5. 结果格式化（仅 task 模式 + 有工具产出时）──
         needs_task = state.get("needs_task", True)
         has_tool_output = bool(state.get("result_raw")) and not run_failed  # 错误结果不需要 LLM 格式化
@@ -1418,7 +1683,11 @@ def make_finalize_node(ctx: NodeContext):
             try:
                 from formatters.base import get_formatter
                 entity_type = state.get("entity_type", "")
-                formatter = get_formatter(entity_type)
+                # domain 优先匹配（领域级标准输出，多领域共用模板），
+                # entity_type 为次级键（领域内单实体定制）。2026-09-13 修复：
+                # 此前只传 entity_type="stock"，而注册方用领域名 "finance" → 永不命中。
+                formatter = get_formatter(entity_type,
+                                          domain=state.get("selected_domain", ""))
                 fmt_context = {
                     "entity_type": entity_type,
                     "entity_code": state.get("entity_code", ""),
@@ -1450,6 +1719,15 @@ def make_finalize_node(ctx: NodeContext):
         start_time = state.get("_start_time", 0)
         elapsed = round(time.time() - start_time, 2) if start_time else 0
 
+        # 任务收尾：清空本次 run 的暂存区（内存对象区 + 字符串区），防长流程内存泄漏
+        try:
+            from infra.staging import stage_clear
+            _scope = "run_" + re.sub(r"[^A-Za-z0-9]", "",
+                                     str(state.get("_start_time", ""))[-8:]) or "run_default"
+            stage_clear(_scope)
+        except Exception as e:
+            logger.debug("[Finalize] 清空暂存区失败: %s", e)
+
         return {
             "result_raw": result_raw,
             "elapsed": elapsed,
@@ -1477,36 +1755,34 @@ def route_after_plan(state: dict) -> str:
     return "finalize"
 
 
+MAX_REPLAN = 2
+
+
 def route_after_execute(state: dict) -> str:
     """execute_node 之后的路由。
 
-    phase 模式（B 阶段）：游标 / 验收状态驱动循环——
-      还有下一阶段 → execute（循环）；全部完成 → finalize；
-      失败按 phase.on_fail：retry（重试同阶段，上限 max_retries）/ replan（回 plan
-      重设计，上限 2 次）/ abort（直接收尾）。中断 → 直接收尾。
+    phase 模式（B 阶段）：state.phases 非空时，是否重试同阶段 / 推进下一阶段 /
+    回 plan 重设计，已由 execute_node 内部根据 (passed / retry 额度 / on_fail)
+    判定好，本函数只做收口——
+      - 中断 → finalize
+      - 收到重设计请求(_phase_replan_request) → plan
+      - 游标越过末尾(phase_index >= len(phases)) → finalize（全部阶段完成）
+      - 否则 → execute（跑 phases[phase_index]）
+    关键修正：单阶段验收失败且重试/重设计额度耗尽时，execute_node 选择"推进下一
+    阶段"而非 abort——否则任一阶段验收不可达就会吞掉后续所有阶段的产出，整个多
+    阶段管道在第一个阶段就死掉（实测"明天买什么股?" 卡在阶段1 直接 finalize）。
     旧路径（无 phases）：保持 max_steps 复盘逻辑不变。
     """
-    MAX_REPLAN = 2
-
     phases = state.get("phases") or []
     if phases:
         if state.get("_phase_abort"):
             return "finalize"
+        if state.get("_phase_replan_request"):
+            return "plan"
         idx = int(state.get("phase_index", 0) or 0)
         if idx >= len(phases):
             return "finalize"    # 全部阶段完成
-        results = state.get("phase_results") or []
-        last = results[-1] if results else None
-        if last is None or last.get("status") == "pass":
-            return "execute"     # 开始/推进到下一阶段
-        # 当前阶段失败（游标未推进）
-        current = phases[min(idx, len(phases) - 1)]
-        on_fail = current.get("on_fail", "retry")
-        if on_fail == "retry" and int(state.get("phase_retry", 0) or 0) <= int(current.get("max_retries", 1)):
-            return "execute"     # 重试同阶段
-        if on_fail == "replan" and int(state.get("phase_replan_count", 0) or 0) <= MAX_REPLAN:
-            return "plan"        # 回外部 planner 重设计
-        return "finalize"        # abort / 重试耗尽 / 重设计耗尽
+        return "execute"         # 执行 phases[idx]（重试/推进由节点内部判定）
 
     if not state.get("hit_max_steps", False):
         return "finalize"        # CodeAgent 完成或正常结束

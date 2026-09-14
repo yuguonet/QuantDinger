@@ -58,13 +58,36 @@ async def _run_chat(message: str, session_id: str = "cli"):
 
     print(f"\n📎 Session: {session_id}")
     print(f"💬 Message: {message}")
-    print(f"🔧 模式: task | 技能: {len(_import_agent()[2])} 个")
+    print(f"[wrench] 模式: task | 技能: {len(_import_agent()[2])} 个")
     print("-" * 50)
 
-    future = submit(message, session_id=session_id, timeout=300)
-    content = future.result(timeout=300)
+    # 2026-09-14：原先 300s 是硬编码，多阶段任务跑到一半就被掐断
+    # （实测 phase #1 单阶段就 188s，4 阶段必然超时，日志里只看到 TimeoutError，
+    #   极易被误判成 agent 崩溃）。改为可配置，默认不变。
+    _timeout = int(os.getenv("CLI_RUN_TIMEOUT", "300"))
+    future = submit(message, session_id=session_id, timeout=_timeout)
+    content = future.result(timeout=_timeout)
     print(f"\n{content}")
     return content
+
+
+def _flush_and_exit(code: int = 0) -> None:
+    """确保输出落盘后直接结束进程。
+
+    2026-09-14：任务跑完（结果已打印、决策树与 qd_traces 已落库）后进程却挂住不退出。
+    原因不在 agent：数据源层有**模块级长生命周期线程池**
+    （`app/data_sources/coordinator.py` 的 `_timeout_pool` / `_mkline_timeout_pool`），
+    而 `concurrent.futures` 自身注册的 atexit 钩子会 **join** 这些 worker——只要有一个
+    worker 卡在无超时的网络请求上，进程就永远退不出去（后台 agent 线程都已是 daemon，
+    不是它们的锅）。
+    CLI 是一次性进程，跑完即退是正确语义，故显式 flush 后直接结束。
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -98,14 +121,14 @@ def _print_info():
 
 def _list_tools():
     """列出所有工具。"""
-    print("\n🔧 工具通过 list_tools/search_tools 动态发现。")
+    print("\n[wrench] 工具通过 list_tools/search_tools 动态发现。")
 
 
 def _list_skills():
     """列出所有技能。"""
     _, _, skills, _, _ = _import_agent()
 
-    print(f"\n🎯 可用技能 ({len(skills)} 个):\n")
+    print(f"\n[skills] 可用技能 ({len(skills)} 个):\n")
     for info in skills.list_skills():
         print(f"  {info['name']:30s} {info['description'][:60]}")
 
@@ -150,6 +173,8 @@ def main():
         from message_queue import init_workers
         init_workers(4)
         asyncio.run(_run_chat(args.message, session_id))
+        # 单次消息模式：跑完即退（见 _flush_and_exit 说明——否则会被数据源线程池拖住）
+        _flush_and_exit(0)
     else:
         # 交互模式（单个事件循环，避免 PostgresMemory 连接池随循环销毁重建）
         import signal
@@ -201,11 +226,21 @@ def main():
                     _ctrl_c_count = 0
                     signal.signal(signal.SIGINT, signal.default_int_handler)
 
-            # 退出时关闭 LLM 客户端，释放连接
+            # 退出时关闭 LLM 客户端，释放连接。
+            # 退出路径吞掉关闭期异常（含 KeyboardInterrupt / CancelledError / httpx 在
+            # 事件循环收尾期的关闭噪音）—— 进程即将退出，连接池关不关无所谓，
+            # 否则会打印一条无害但吓人的 traceback（实测 Windows + Ctrl+C 退出时
+            # `await llm.close()` 被 KeyboardInterrupt 打断）。
             if llm and hasattr(llm, 'close'):
-                await llm.close()
+                try:
+                    await llm.close()
+                except (Exception, KeyboardInterrupt, asyncio.CancelledError):
+                    pass
 
-        asyncio.run(_interactive_loop())
+        try:
+            asyncio.run(_interactive_loop())
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass  # 退出期信号，忽略
 
 
 if __name__ == "__main__":

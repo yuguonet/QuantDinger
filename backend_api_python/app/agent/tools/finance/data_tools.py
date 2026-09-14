@@ -25,10 +25,20 @@ def get_market_indices() -> dict:
         return {"error": str(e)}
 
 def get_market_overview() -> dict:
-    """市场概览：返回全市场涨跌家数、涨停跌停数、北向资金净买入、市场情绪指数、主力资金流向。"""
+    """市场概览：返回市场情绪指数、主力资金流向、指数涨跌概况。
+
+    2026-09-14 移除北向资金字段（与 get_northbound_flow 摘除同因）：上游同花顺
+    hexin 实时接口数据源残缺（实测 sgt 仅 13% 完整度，接口自判"北向数据不完整"）
+    ——北向实时披露已停，属数据源性死亡而非临时故障。留在聚合里，每次调用都要
+    白等一个必死请求，还诱导模型每轮写"北向资金：未明确返回"。日级历史
+    （get_northbound_daily）不受影响。
+
+    注意字段语义：up_count/down_count 是**两大指数（上证/深成）的涨跌抽样**，
+    不是全市场涨跌家数——全市场维度请用 get_market_indices 自行汇总。
+    """
     result = {}
 
-    # 指数行情 → 涨跌家数
+    # 指数行情 → 涨跌概况（仅两大指数抽样，非全市场）
     try:
         from app.market_cn.index import get_index_realtime
         indices = get_index_realtime(["000001", "399001"])
@@ -36,14 +46,6 @@ def get_market_overview() -> dict:
         down = sum(1 for i in (indices or []) if i.get("change_percent", 0) < 0)
         result["up_count"] = up
         result["down_count"] = down
-    except Exception:
-        pass
-
-    # 北向资金
-    try:
-        from app.market_cn.index import get_northbound_realtime
-        nb = get_northbound_realtime()
-        result["north_net_flow"] = round(nb.get("total_latest_yi", 0), 2)
     except Exception:
         pass
 

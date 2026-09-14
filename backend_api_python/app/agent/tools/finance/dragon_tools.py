@@ -10,6 +10,7 @@ import json
 from app.agent.log import logger
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _batch_execute, _to_md
+
 def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> dict:
     """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
 
@@ -52,6 +53,7 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> dict:
         return {"error": "codes 不能为空", "retriable": False}
 
     return _batch_execute(_one, code_list)
+
 def get_hot_rank(top_n: int = 30) -> dict:
     """人气榜：返回当日市场关注度最高的股票排名及热度分数。
 

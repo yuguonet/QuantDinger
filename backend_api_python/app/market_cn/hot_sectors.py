@@ -15,38 +15,24 @@ import logging
 import requests
 import pandas as pd
 from datetime import datetime
-from functools import wraps
 import time
 import json
 
 logger = logging.getLogger(__name__)
 
+# 2026-09-14：UA 必须是**完整**的 Chrome UA——截断版（缺 "(KHTML, like Gecko)…" 段）
+# 会被 push2.eastmoney.com 直接掐断连接（RemoteDisconnected，连状态码都不给）。
+# 实测对照：同 URL 同参数，截断 UA 必失败、完整 UA 稳定返回。
+# 与 eastmoney_search._em_get 的 UA 保持一致。
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Referer": "https://data.eastmoney.com/",
 }
 
 # ═══════════════════════════════════════════════════
 #  工具函数
 # ═══════════════════════════════════════════════════
-
-def _retry(max_retries=2, delay=1):
-    """重试装饰器"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            last_err = None
-            for i in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_err = e
-                    if i < max_retries:
-                        time.sleep(delay)
-            raise last_err
-        return wrapper
-    return decorator
-
 
 def _safe_num(val, default=0):
     """安全转数值：处理 '-', None, '' 等东方财富特殊值"""
@@ -85,13 +71,83 @@ _INDUSTRY_FIELDS = (
 )
 
 
-@_retry(max_retries=2, delay=1)
+# ═══ push2 熔断 + sina 兜底（2026-09-14 反爬封禁事件）═══
+# push2.eastmoney.com 会对连续请求的 IP 掐连接（RemoteDisconnected，无状态码；
+# 数字前缀镜像 host 一并封禁，分钟级以上）。`_retry` 连打 3 次反而加重限频
+# ⇒ 失败即熔断：10 分钟内入口直接走 sina 兜底，不再碰 push2。
+_push2_blocked_until = 0.0
+_PUSH2_BLOCK_SECONDS = 600
+
+
+def _mark_push2_blocked():
+    global _push2_blocked_until
+    _push2_blocked_until = time.time() + _PUSH2_BLOCK_SECONDS
+    logger.warning("[hot_sectors] push2 触发熔断，%d 分钟内直接走 sina 兜底",
+                   _PUSH2_BLOCK_SECONDS // 60)
+
+
+def _board_list_sina(board_type: str, limit: int) -> list:
+    """sina 兜底：复用 index.get_sector_fund_flow（已验证稳定的资金流通道）。
+
+    sina 只有行业资金流、无概念板块行情 ⇒ concept/area 返回空，由调用方降级
+    （空列表好过异常）。字段对齐 `_fetch_board_list` 的形状，sina 没有的字段填
+    默认值，并多给 main_net（主力净流入，对板块筛选同样有用）。
+    """
+    if board_type != "industry":
+        return []
+    try:
+        from app.market_cn.index import get_sector_fund_flow  # 延迟 import 防循环依赖
+        rows = get_sector_fund_flow("今日")
+    except Exception as e:
+        logger.warning("[hot_sectors] sina 兜底也失败: %s", e)
+        return []
+    out = []
+    for r in (rows or [])[:limit]:
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "name": _safe_str(r.get("name")),
+            "code": _safe_str(r.get("code")),
+            "change_pct": _safe_num(r.get("change_pct")),
+            "price": 0,
+            "volume": 0,
+            "amount": 0,
+            "turnover": _safe_num(r.get("turnover")),
+            "up_count": 0,
+            "down_count": 0,
+            "lead_stock": _safe_str(r.get("lead_stock")),
+            "lead_stock_code": "",
+            "lead_stock_pct": _safe_num(r.get("lead_pct")),
+            "limit_up_count": 0,
+            "total_mv": 0,
+            "pe_ratio": 0,
+            "main_net": _safe_num(r.get("main_net")),
+        })
+    return out
+
+
 def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
-    """获取板块行情排名
+    """板块排名入口：push2 优先；熔断期内 / 失败时自动降级 sina。
 
     board_type: industry | concept | area
     sort_by: f3=涨跌幅, f6=成交额, f8=换手率, f20=总市值
     """
+    if time.time() < _push2_blocked_until:
+        return _board_list_sina(board_type, limit)
+    try:
+        return _fetch_board_list_push2(board_type, sort_by, sort_dir, limit)
+    except Exception as e:
+        _mark_push2_blocked()
+        fallback = _board_list_sina(board_type, limit)
+        if fallback:
+            logger.warning("[hot_sectors] push2 失败(%s)，已降级 sina（%d 行）",
+                           type(e).__name__, len(fallback))
+            return fallback
+        raise
+
+
+def _fetch_board_list_push2(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
+    """push2 clist 原实现（2026-09-14 起去掉 _retry——熔断承担节流）。"""
     config = _BOARD_TYPES.get(board_type, _BOARD_TYPES["industry"])
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
@@ -113,6 +169,7 @@ def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limi
         raise
     except requests.exceptions.ConnectionError as e:
         logger.error("东方财富 API 连接失败: %s", e)
+        _mark_push2_blocked()   # RemoteDisconnected = 反爬封禁信号，立即熔断
         raise
 
     # 检查 HTTP 状态码
@@ -161,9 +218,16 @@ def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limi
     return results
 
 
-@_retry(max_retries=2, delay=1)
 def _fetch_sector_stocks(board_code, limit=10):
-    """获取板块内个股行情（领涨股详情）"""
+    """获取板块内个股行情（领涨股详情）
+
+    与 _fetch_board_list_push2 一致采用"失败即熔断"策略：push2 对连续请求会掐连接
+    （RemoteDisconnected，无状态码），连打 retry 反而加重限频。故**不重试**，
+    ConnectionError 立即触发熔断，后续 10 分钟内入口直接降级为空（个股明细无 sina 等价
+    通道，由调用方降级处理）——这正是 2026-09-14 板块列表接口已落地的行为，此处对齐。
+    """
+    if time.time() < _push2_blocked_until:
+        return []   # 熔断期内不碰 push2（个股明细无 sina 等价通道，由调用方降级）
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
         "pn": 1,
@@ -177,7 +241,13 @@ def _fetch_sector_stocks(board_code, limit=10):
         "fields": "f2,f3,f4,f5,f6,f8,f12,f14,f15,f16,f17,f18,f62,f100,f115",
     }
 
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    except requests.exceptions.ConnectionError as e:
+        # RemoteDisconnected / Connection aborted = 反爬封禁信号 → 触发熔断，
+        # 10 分钟内后续板块直接走降级，不再连打 push2 加重限频
+        _mark_push2_blocked()
+        raise
     if resp.status_code != 200:
         raise ConnectionError(f"东方财富板块个股 API 返回 {resp.status_code}")
 

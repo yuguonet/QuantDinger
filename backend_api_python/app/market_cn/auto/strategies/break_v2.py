@@ -278,7 +278,8 @@ class BreakV2Strategy(StrategyBase):
                       probe=None):
         from app.market_cn.auto.common.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
-        min_streak, max_break_gap = 2, 5
+        _p0 = self.merged_params()   # 2026-09-13 接线: 原硬编码 2,5 压过实例覆写 (同 break_buy)
+        min_streak, max_break_gap = _p0["min_streak"], _p0["max_break_gap"]
         # V2 门参数 (2026-09-11): config 覆盖 > 代码默认。**门在回测侧应用于
         # "v1 会选定的候选"** (dedup/used 登记之后) — 扫描内门会造成 dedup 泄漏:
         # 首确认日被门否决后 used 未登记, 同一连板段次日重新入场 (实证 11 笔

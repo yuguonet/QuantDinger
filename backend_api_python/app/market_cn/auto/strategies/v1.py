@@ -296,6 +296,10 @@ class V1Strategy(StrategyBase):
         """
         from app.market_cn.auto.common.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
+        # 参数接线 (2026-09-13 修): 原入场五参数/D1过滤/出场均硬编码字面量 (kwargs
+        # 压过实例覆写) → param_scan 网格无效。统一改从 merged_params(None) 取:
+        # 默认=PARAMS 同值 (行为零差异), 实例 default_params 覆写即生效。
+        _p = self.merged_params(None)
         board_type = get_board_type(code)
         n = len(bars)
         if n < 30:
@@ -308,8 +312,9 @@ class V1Strategy(StrategyBase):
             # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
             sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
                 bars[:i + 1], code,
-                ret_20d_min=30.0, d_1_pullback_min=-10.0, d_1_pullback_max=-3.0,
-                obv_filter=True, d_1_vol_max=1.5, stock_info=stock_info,
+                ret_20d_min=_p["ret_20d_min"], d_1_pullback_min=_p["d_1_pullback_min"],
+                d_1_pullback_max=_p["d_1_pullback_max"], obv_filter=_p["obv_filter"],
+                d_1_vol_max=_p["d_1_vol_max"], stock_info=stock_info,
                 probe=day_tr)]
             if not sigs:
                 if probe is not None:
@@ -336,7 +341,7 @@ class V1Strategy(StrategyBase):
             entry_date = d1["time"]
             d1_change = (d1["close"] / d0["close"] - 1) * 100
             d1_gap = (d1["open"] / d0["close"] - 1) * 100
-            min_d1_gap = -3.0 if board_type == "main" else -5.0
+            min_d1_gap = _p["min_gap_main"] if board_type == "main" else _p["min_gap_gem"]
             if d1_gap < min_d1_gap:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
@@ -349,14 +354,14 @@ class V1Strategy(StrategyBase):
                                     stage="d1_chg", sig=sig,
                                     extra={"d1_change": round(d1_change, 2)})
                 continue
-            if board_type == "gem_star" and d1_gap >= 5.0:
+            if board_type == "gem_star" and d1_gap >= _p["gem_gap_max"]:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
                                     stage="d1_band", sig=sig,
                                     extra={"d1_gap": round(d1_gap, 2), "board": "gem_star"})
                 continue
             # 主板高开3%~5%不入场 (v4数据驱动)
-            if board_type == "main" and 3.0 <= d1_gap < 5.0:
+            if board_type == "main" and _p["main_gap_band_lo"] <= d1_gap < _p["main_gap_band_hi"]:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
                                     stage="d1_band", sig=sig,
@@ -364,8 +369,8 @@ class V1Strategy(StrategyBase):
                 continue
 
             d1_limit_up_val = is_limit_up(d1["close"], d0["close"], board_type)
-            bt = _run_backtest(bars, entry_idx, entry_price, 7, -10.0,
-                              -5.0, board_type, is_v1=True,
+            bt = _run_backtest(bars, entry_idx, entry_price, _p["hold"], _p["stop"],
+                              _p["trail"], board_type, is_v1=True,
                               d1_limit_up=d1_limit_up_val, d1_change=d1_change,
                               d1_gap=d1_gap)
             if not bt:

@@ -2,7 +2,15 @@
 """capabilities/loader.py — 准入能力加载 / 护栏包装 / 注册（A 阶段, 2026-09-12）
 
 职责: 读 admission.json（人工过目固化的准入清单）-> 导入函数 -> 护栏包装 ->
-      注册进 ToolProvider（domain="quant"）。
+      注册进 ToolProvider（来源层标记 domain=CAPABILITY_DOMAIN）。
+
+来源层 vs 工具域（2026-09-13 修正）:
+  本模块注册的是"数据能力层"——底层取数函数，按需点名注入，**不是** planner 用
+  selected_domain 选择的工具集域。此前用 domain="quant" 注册，与真实域
+  tools/finance（domain="finance"）并列且互斥（_build_code_agent 只加载
+  common+单域），planner 无法判断该选哪个，选任一都丢掉另一半工具。
+  现统一打 CAPABILITY_DOMAIN 标记，并从可选域清单（ToolProvider.get_domains）中
+  天然排除；能力的唯一注入途径是 stage 级 tools 白名单。
 
 三层闸门之二在本层落地:
   - 写入硬复核: 名称命中写操作前缀的条目拒绝注册（即便被误写进配置）;
@@ -31,13 +39,18 @@ logger = logging.getLogger(__name__)
 
 _ADMISSION_PATH = Path(__file__).resolve().parent / "admission.json"
 
-# 写操作前缀（与 scanner.WRITE_PREFIXES 保持一致；注册时二次复核）
-_WRITE_PREFIXES = (
-    "set_", "update_", "delete_", "remove_", "insert_", "upsert_", "create_",
-    "drop_", "clear_", "reset_", "save_", "write_", "run_", "start_", "stop_",
-    "trigger_", "schedule_", "sync_", "cleanup_", "ensure_", "reconcile_",
-    "emit_", "commit_", "apply_", "patch_", "migrate_", "purge_",
-)
+# 写操作前缀（注册时二次复核）——单一事实源在 scanner.WRITE_PREFIXES。
+# 2026-09-13 去重：原先此处复制了一份相同元组，靠注释"与 scanner 保持一致"手工同步；
+# 一旦漂移，扫描器标 excluded 的函数可能在注册层被放行（或反之），且无告警。
+from .scanner import WRITE_PREFIXES as _WRITE_PREFIXES  # noqa: E402
+
+
+# 来源层标记（不是可选域）：capabilities 是"数据能力层"，不是 planner 用
+# selected_domain 能选的工具集域。它只用于两处：planner 提示里"数据能力"分段的
+# 过滤（task_agent），以及可选域清单（ToolProvider.get_domains）的天然排除。
+# 2026-09-13：原为 domain="quant"，与真实域 tools/finance（domain="finance"）
+# 并列且互斥，是"把工具来源当领域"的典型误用。
+CAPABILITY_DOMAIN = "capability"
 
 
 def _is_hard_denied(name: str) -> bool:
@@ -122,8 +135,13 @@ def _wrap_guards(fn, timeout_s, max_chars, tool_name):
     return wrapper
 
 
-def register_capabilities(provider, admission_path=None) -> int:
-    """把准入清单中的函数注册进 provider（domain='quant'）。返回注册数。"""
+def register_capabilities(provider, admission_path=None,
+                          domain: str = CAPABILITY_DOMAIN) -> int:
+    """把准入清单中的函数注册进 provider（来源层标记，见 CAPABILITY_DOMAIN）。
+
+    Returns:
+        实际注册数（admission.json 缺失/损坏时为 0，不抛错）。
+    """
     entries = load_admitted(admission_path)
     if not entries:
         return 0
@@ -145,7 +163,7 @@ def register_capabilities(provider, admission_path=None) -> int:
             failures.append(f"{mod_path}:{name}(导入失败:{e})")
             continue
         provider.register(
-            name, _wrap_guards(fn, timeout_s, max_chars, name), domain="quant"
+            name, _wrap_guards(fn, timeout_s, max_chars, name), domain=domain
         )
         registered += 1
     if failures:

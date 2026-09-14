@@ -67,14 +67,30 @@ def _get_actual_return(
         {"pnl_pct": float, "hold_days": int, "direction": str} 或 None
     """
     try:
-        from app.agent.tools.finance.data_tools import agent_get_kline
+        from app.data_sources.cn_stock import CNStockDataSource
+        from datetime import datetime as _dt
 
-        klines = agent_get_kline(stock_code, timeframe="1D", days=hold_days + 10)
+        # 直接走底层数据源 cn_stock（agent_get_kline 工具即其封装 + 归一）。
+        # 不再 import 工具包装层，避免破坏拔插式单一真相源。
+        raw = CNStockDataSource().get_kline(stock_code, "1D", max(hold_days + 10, 1))
 
-        # 校验返回类型：dict 表示错误，需要 list 才能遍历
-        if isinstance(klines, dict):
-            logger.warning("[Evaluator] %s K线返回错误: %s", stock_code, klines.get("error", klines))
-            return None
+        def _ts_to_date(ts):
+            try:
+                return _dt.fromtimestamp(int(ts)).strftime("%m-%d")
+            except Exception:
+                return str(ts)
+
+        # 规整成 evaluator 下游依赖的 {t,o,h,l,c,v} 形态（与 agent_get_kline 一致）
+        klines = [{
+            "t": (k.get("date") or _ts_to_date(k.get("time", 0)))[:10],
+            "o": round(k.get("open", 0), 2),
+            "h": round(k.get("high", 0), 2),
+            "l": round(k.get("low", 0), 2),
+            "c": round(k.get("close", 0), 2),
+            "v": k.get("volume", 0),
+        } for k in (raw or []) if isinstance(k, dict)]
+
+        # 校验：需要可遍历的列表
         if not isinstance(klines, list) or len(klines) < 2:
             return None
 
@@ -166,6 +182,10 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
         stock_code = item["stock_code"]
         action = item["action"]
         timeframe = item.get("timeframe", "")
+        if not (stock_code or "").strip():
+            # 防御纵深：SQL 已滤空 code，这里兜底（永不可验证，计数让其出队）
+            _bump_eval_failure(root_id)
+            continue
 
         try:
             hold_days = _get_hold_days(timeframe)

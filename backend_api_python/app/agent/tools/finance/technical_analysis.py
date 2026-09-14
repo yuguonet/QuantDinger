@@ -10,13 +10,19 @@ from __future__ import annotations
 from app.agent.log import logger
 from typing import Any, Dict, List
 def _call_tools(stock_code: str) -> Dict[str, Any]:
-    """调用 analysis_tools.py 中的分析工具 + basicinfo，返回结果字典。"""
+    """调用 analysis_tools 中的分析算法（同包内规范实现，非工具包装层）+ basicinfo，返回结果字典。
+
+    说明：analyze_trend 等是 tools/finance 包内的规范实现本身（其底层 _fetch_ohlcv/_calc_* 在
+    _analysis_utils），这里同包复用属正常库调用、二者都会被扫描注册，不构成"外部层偷用工具包装层"。
+    唯一被替换为底层调用的是实时行情：get_realtime_quote 工具即 _get_ds().get_tickers 的封装，
+    已改为直接走数据源，不再 import 工具包装层。
+    """
     from app.utils.basicinfo_db import get_stock_basic_db
     from app.agent.tools.finance.analysis_tools import (
         analyze_trend, get_indicator_snapshot, get_volume_analysis,
         analyze_pattern, get_chip_distribution,
     )
-    from app.agent.tools.finance.data_tools import get_realtime_quote
+    from app.agent.tools.finance._analysis_utils import _get_ds
 
     results = {}
     for name, fn in [
@@ -25,12 +31,23 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
         ("get_volume_analysis", lambda: get_volume_analysis(stock_code)),
         ("analyze_pattern", lambda: analyze_pattern(stock_code)),
         ("get_chip_distribution", lambda: get_chip_distribution(stock_code)),
-        ("realtime_quote", lambda: get_realtime_quote(stock_code)),
     ]:
         try:
             results[name] = fn()
         except Exception as e:
             results[name] = {"error": str(e)}
+
+    # 实时行情：直接走底层数据源（get_realtime_quote 工具即此封装），避免 import 工具包装层
+    try:
+        ds = _get_ds("CNStock")
+        tickers = ds.get_tickers([stock_code]) or []
+        ticker_map = {t.get("symbol"): t for t in tickers}
+        t = ticker_map.get(stock_code) or (tickers[0] if tickers else None)
+        results["realtime_quote"] = (
+            {"stock_code": stock_code, "market": "CNStock", **t} if t else {}
+        )
+    except Exception as e:
+        results["realtime_quote"] = {"error": str(e)}
 
     try:
         stock_db = get_stock_basic_db()

@@ -108,10 +108,14 @@ backend_api_python/app/agent/
 ├── agents/               # Agent 实现
 │   ├── base.py           # AgentBase 基类
 │   └── task_agent.py     # TaskAgent — 核心任务执行器（双规划器阶段契约/_plan/_build_code_agent）
-│
-├── capabilities/         # 能力发现层（v2.0 新增，域=quant 数据能力）
+├── infra/                # 框架内部机制（非插件，标准 import）
+│   ├── breaker.py        # ToolCircuitBreaker（工具失败熔断：连续失败2次短路）
+│   ├── guided_executor.py # GuidedPythonExecutor（幻觉调用纠正，错误带可用清单）
+│   ├── resilient_parse.py # 代码提取加固层 v4（健全性校验/伪标签防线/散落抢救）
+│   └── staging.py        # 阶段中转数据暂存区（stage_write/read/list，白名单+2MB上限）
+├── capabilities/         # 能力发现层（v2.0 新增；来源层，不占用 planner 可选工具域）
 │   ├── scanner.py        # 扫描器（显式包 → 公开函数 → 写操作前缀硬排除）
-│   ├── loader.py         # 准入加载（admission.json → 护栏包装 → 注册 domain="quant"）
+│   ├── loader.py         # 准入加载（admission.json → 护栏包装 → 注册为来源层 CAPABILITY_DOMAIN）
 │   └── admission.json    # 人工过目准入清单（19 项激活 / 2 暂缓留档）
 │
 ├── chain/                # 可追责链（EvalNode 树）
@@ -140,19 +144,14 @@ backend_api_python/app/agent/
 │   ├── postgres_memory.py # PostgreSQL 实现
 │   └── redis_memory.py   # Redis 实现
 │
-├── tools/                # 工具集（78 个公开函数 + v2.0 加固件）
-│   ├── base.py           # Tool 基类 + ToolProvider 统一注册表（含 CLI 入口名注册黑名单）
+├── tools/                # 业务工具集（通过 ToolProvider 统一注册）
+│   ├── base.py           # Tool 基类 + ToolProvider 统一注册表
 │   ├── format_utils.py   # 格式化工具（必选）
 │   ├── web_search_tools.py # 联网搜索（四引擎降级）
 │   ├── pagination.py     # 分页工具
 │   ├── mcp_bridge.py     # MCP 桥接（serve() 入口不注册为工具）
-│   ├── resilient_parse.py # 代码提取加固层 v4（健全性校验/伪标签防线/散落抢救）
-│   ├── guided_executor.py # GuidedPythonExecutor（幻觉调用纠正，错误带可用清单）
-│   ├── breaker.py        # ToolCircuitBreaker（工具失败熔断：连续失败2次短路）
-│   ├── staging.py        # 阶段中转数据暂存区（stage_write/read/list，白名单+2MB上限）
-│   ├── staging_tools.py  # 暂存区工具注册出口
 │   └── finance/          # 金融领域工具（27 个模块）
-│       ├── analysis_tools.py    # 技术分析（1613行，最大）
+│       ├── analysis_tools.py    # 技术分析（1613行，最大））
 │       ├── data_tools.py        # 数据查询
 │       ├── indicator_tools.py   # 指标计算
 │       ├── indicator_analysis.py # 指标分析
@@ -194,9 +193,10 @@ backend_api_python/app/agent/
 │       └── stock_report.py # 评估报告
 │
 ├── resolvers/            # 实体解析器（chat_node 组合调用）
-│   ├── base.py           # EntityResolver/ResolveResult 协议
-│   ├── stock.py          # 股票实体（RAG 辅助，线程隔离）
-│   └── time.py           # 时间实体 v2（domain=finance|general，交易日历标定，语义异常打回澄清）
+│   ├── base.py           # EntityResolver/ResolveResult 协议 + 澄清契约（clarify_question / needs_clarify）
+│   ├── composite.py      # CompositeResolver：按序组合子解析器，澄清优先短路 + 上下文累积（2026-09-13）
+│   ├── stock.py          # 股票实体（RAG 辅助，线程隔离；多候选歧义 → 反问消歧，不静默取首个）
+│   └── time.py           # 时间实体 v3（领域按 显式/实体/语汇 三级登记表倒推；交易日历标定；语义异常与窗口不明 → 反问）
 │
 ├── formatters/           # 结果格式化
 │   ├── base.py           # BaseFormatter 基类 + 注册表
@@ -296,6 +296,11 @@ class AgentState(TypedDict):
 > 白名单收窄（`_select_phase_skill_tools`）；验收判定（`_check_phase_acceptance`）；
 > 步数耗尽取干净输出（`_extract_clean_phase_result`）。设计详见
 > `docs/AGENT_ACCOUNTABLE.md` §14。
+>
+> **v2.1 规划分工**：双 planner 的职责边界由契约字段显式表达——外部 planner 定
+> 「范围 / 分段 / 工具白名单 / 每阶段步数（`step_budget`）/ 是否启用内部规划
+> （`internal_plan`）」，内部 planner 只在阶段内细化步骤、不得扩范围。简单阶段
+> （取数/汇总）由外部 planner 直接关掉内部 planner，省一次 LLM 与上下文。
 
 #### 四节点职责
 
@@ -333,6 +338,10 @@ task + context + selected_domain + skill_tools
   │     ├─→ ToolProvider 按 domain 过滤工具 → executor.custom_tools
   │     ├─→ 技能工具注入 → executor.custom_tools
   │     ├─→ 4 个必选工具 → smolagents tools=[]（system prompt 可见）
+  │     │     ※ 2026-09-14 更正：本项目下 tools= 的工具描述**不会**进入 system prompt
+  │     │       （system_prompt 被 prompts/code_agent.yaml 整体覆盖，模板内无 tools
+  │     │       渲染块）；实际作用仅"沙箱内可调用 + 以 BaseTool 形态调用"。
+  │     │       清单现为 5 个（+ final_answer）。详见 §3.3 工具架构的更正说明。
   │     │     ├─ list_tools() — 列出工具
   │     │     ├─ search_tools() — 搜索工具
   │     │     ├─ format_result() — 格式化
@@ -365,6 +374,33 @@ task + context + selected_domain + skill_tools
 | YAML {{tool_list}} | 全量工具 schema（按 domain 过滤） | planning/replan 选工具 |
 
 必选工具：list_tools、search_tools、format_result、web_search
+
+> **2026-09-14 更正 —— 上表第 1 行"system prompt 自动描述，LLM 天然可见"不成立。**
+> `smolagents tools=[]` 里的工具**不会**出现在 system prompt 中：
+> smolagents 的默认模板才有 `{% for tool in tools %}{{ tool.to_code_prompt() }}` 渲染块
+> （`.venv/.../smolagents/prompts/code_agent.yaml:132-137`），而本项目用
+> `prompts/code_agent.yaml` **整体覆盖**了 `system_prompt`
+> （`task_agent.py` 里 `agent.prompt_templates.update(custom_templates)`），
+> 该模板内**没有**这个渲染块（实测 2026-09-14：用该模板 + 桩 tool 渲染，结果不含工具描述）。
+>
+> 因此三层的真实可见性通道是：
+> - **LLM 可见**：`YAML {{tool_list}}`（provider schema，注入 planning 段）+ `prompts/code_agent.yaml` 正文与示例；
+> - **仅沙箱可调用**：`executor.custom_tools`（裸函数）与 `smolagents tools=[]`（BaseTool 形态）。
+>   二者差别只在调用形态：`BaseTool.__call__` 会把"单个 dict 且键名匹配 inputs"的入参自动展开成
+>   kwargs（smolagents `tools.py:231-246`），避免"模型打包参数传 dict"直接 TypeError 烧步数。
+>
+> 清单现为 **5 个**（+ `final_answer`；其 `forward` 抛 `FinalAnswerException`）。
+> 若确实要让工具描述进入系统提示，必须改 `system_prompt` 模板——属行为变更，需先评审。
+>
+> **沙箱内"能用哪些工具"的真相（2026-09-14，L14）**：业务工具走 `executor.custom_tools`
+> （`task_agent.py` 的 `executor.custom_tools = tool_functions`），**不在** `static_tools` 里
+> ——后者由 smolagents `send_tools` 填充，只有 agent tools + `BASE_PYTHON_TOOLS` +
+> `additional_functions`（`local_python_executor.py:1763-1765`）。**混淆二者会让"可用工具
+> 清单"退化成 Python 内置名列表**，见 §10.1 的 L14。
+
+> **⚠️ 改 `_build_code_agent` 前必读 §3.13。**本函数里的 step callback 链
+> （`_truncate_observations` / `_clarify_empty_output` / `_enforce_final_answer`）决定任务
+> **能否正常收尾**，是事故高发区——症状是"步数被烧光"，根因却在别处。
 
 #### CodeAgent 构建
 
@@ -400,7 +436,7 @@ def _build_code_agent(self, model, provider, skill_tools, domain, ...):
 #### LLM 工作流
 
 ```python
-result = search_tools("资金")                    # 发现（必选工具，system prompt 可见）
+result = search_tools("资金")                    # 发现（必选工具；2026-09-14 更正：不进 system prompt）
 result = get_fund_flow(codes="600519")           # 直接调用（在 custom_tools 中）
 final_answer(result)                              # 输出（系统自动格式化）
 ```
@@ -569,6 +605,10 @@ class ToolProvider:
 #### 工具发现与调用
 
 必选工具（4 个）通过 smolagents tools=[] 注入 system prompt：
+
+> 2026-09-14 更正：上一句"注入 system prompt"不成立——`tools=[]` 的工具描述**不会**进入
+> system prompt（`system_prompt` 被 `prompts/code_agent.yaml` 整体覆盖，模板内无 tools 渲染块），
+> 它们只保证"沙箱内可调用"。清单现为 5 个（+ `final_answer`）。详见 §3.3 工具架构的更正说明。
 - `list_tools()` — 列出可用工具
 - `search_tools()` — 按关键词搜索
 - `format_result()` — 格式化输出
@@ -665,9 +705,11 @@ worker 线程 (4个)
 
 采用和 `resolvers/` 相同的注册表模式：
 - `BaseFormatter`：抽象基类，定义 `format()` 接口
-- `_REGISTRY`：全局注册表，key=entity_type, value=formatter_class
+- `_REGISTRY`：全局注册表，key=**领域名或实体类型**, value=formatter_class
 - `@register_formatter()`：装饰器，注册 formatter
-- `get_formatter()`：根据 entity_type 查找 formatter，找不到返回 default
+- `get_formatter(entity_type, domain)`：查找顺序 **domain（领域级标准输出，多领域复用）→ entity_type（领域内单实体定制）→ default**
+- `formatters/__init__.py` 用 pkgutil **自动发现**同目录模块 → 新增领域只需放 `formatters/<domain>.py` 并注册
+- `list_formatters()`：注册快照，供启动自检（专门用来发现"注册了但没接线"这类静默断链）
 
 #### 格式化流程
 
@@ -831,6 +873,125 @@ planning:
 managed_agent:            # 子 agent 模板
 final_answer:             # 最终回答模板
 ```
+
+### 3.13 收尾与退出机制（`final_answer`）—— 事故高发区
+
+> 本节由 2026-09-14 的 CLI 实测事故沉淀（编号 L13）。**凡遇"任务跑不完 / 步数被烧光 / 到点还在重写代码"，
+> 先读本节再动手。**
+> 这类 bug 反复以不同形态出现，且**症状（步数耗尽）与根因相距很远**——根因通常是模型不知道该往哪交，
+> 或误判"上一步什么都没产出"。已连续出现多个变体，故单独立节。
+
+#### 框架事实（已核对 smolagents 源码，勿凭印象改）
+
+| 事实 | 位置 |
+|---|---|
+| **唯一正常出口 = 模型主动调 `final_answer`** | `agents.py:545` `while not returned_final_answer and step_number <= max_steps`；`returned_final_answer` 仅在 `ActionOutput.is_final_answer` 为真时置位（`agents.py:582-592`） |
+| **框架对"忘调 final_answer"零补救** —— 不提醒、不自动收尾 | — |
+| 步数耗尽后 `_handle_max_steps_reached` **再额外调一次 LLM** 出终答（多花一次调用） | `agents.py:606-607` / `625-637` / `810-853` |
+| `agent.interrupt()` 只是循环头 `raise AgentError` ⇒ **打断 run 且拿不到终答**，不能当收尾开关用 | `agents.py:546-547` / `754-756` |
+| **唯一干净的"注入提示"位置 = `ActionStep.observations`** —— 它会被渲染成下一步的 `Observation:` 消息 | `memory.py:126-137`；`agents.py:768-769` 遍历所有 steps |
+| **callbacks 里读到的 `is_final_answer` 是准的**：`_finalize_step` → callbacks 发生在 `action_step.is_final_answer = True` **之后** | `agents.py:592` → `601` |
+
+社区量化参考：只靠 prompt 建议"完成后回答" ≈ **30%** 不收敛；把 Finish 做成**显式 Action** ≈ **100%**。
+官方无配置开关可解（GitHub issue #1231 至今 Open / 零回复）。
+
+#### 三层防御（A 机制层 / B 契约层 / C 护栏层）
+
+三层都实现在 `agents/task_agent.py::_build_code_agent`，顺序固定：
+
+```python
+step_callbacks = (
+    [_truncate_observations, _clarify_empty_output, _enforce_final_answer]
+    + ([_evt_hook] if _evt_hook is not None else [])
+)
+```
+
+| 层 | 治什么 | 实现 |
+|---|---|---|
+| **A 机制层** | 代码只 `print` 无 `return` ⇒ `code_output.output is None` ⇒ observation 出现 `Last output from code snippet: None` ⇒ 模型读成"上一步什么都没产出" ⇒ 从头重写整份代码 ⇒ 探索型死循环（实测：0 次 final_answer，4 步 token 单调膨胀 in 3884→7943 / out 7768→15888） | `_clarify_empty_output`：把该 `None` 补成明确语义（"仅表示本步代码没有 return 值；print 输出已完整列在上方 Execution logs"）。判定用 `rfind` 取最后一个 marker，非 `None` 或非 ActionStep 一律不动 |
+| **B 契约层** | 任务书把交付物表述成"直接在答复中以代码块给出"——"答复"不是可执行落点，模型于是只 print 不交 | `prompts/code_agent.yaml`：正文加「交付物铁律」（源码 / 报告 / 结果 / 日志 ＝ `final_answer` 的参数）+ 规则第 9 条 + 代码交付示例；`prompts/plan_system.txt`：代码类任务改为"task 里必须要求执行者用 `final_answer(源码文本 + 运行输出)` 一次性交回" |
+| **C 护栏层** | A、B 都没拦住时的兜底：把"跑满 N 步后被强制收尾"压成主动退出 | `_enforce_final_answer`：检测到**原地重写**或**倒数第二步仍未收尾**时，在该步 observations 末尾注入收尾指令 |
+
+**C 的两条硬约束（都踩过坑，勿改回去）：**
+
+1. **注入必须在倒数第二步**：`observations` 要到下一步才渲染成 `Observation:` 消息，
+   在最后一步注入等于没人看得到。判据 `agent.max_steps - memory_step.step_number <= 1`。
+2. **上一步含错误痕迹时不判定为重复**：`[import 拦截]` / `Traceback` / `Error:` / `Exception:`
+   ⇒ 那是**失败重试**，重写是必要的；此时劝"别重写"会直接阻断纠错。
+   （真实事故：Step1 因 `import io` 撞沙箱白名单整块中断，Step2 几乎是同一份代码、只换了捕获方式
+   ——不设此门控就会被误判成原地重写。）
+
+另外，**判据是"代码重复"而不是"没调 final_answer"**：后者会把正常多步任务
+（取数 → 计算 → 交付）的中间步骤全部误判成"该收尾"，属于矫枉过正。
+重复判定：最近 `keep_recent`(=2) 步的 `code_action`，去整行注释 + 去全部空白后
+`SequenceMatcher(autojunk=False).ratio() >= 0.9`。
+
+#### 排查清单
+
+1. 日志看 `hit_max_steps` —— True ＝ 三层都没生效（退化为强制收尾）。
+2. 看每步 `In / Out tokens` 是否**单调递增**：单调膨胀 ＝ 模型在重写整份代码 ＝ A 或 C 失效。
+3. 看 observation 末行是否出现 `Last output from code snippet: None` 且**后面没有**补充说明 ＝ A 失效。
+4. 看 observations 末尾是否出现 `[系统]` 注入 ＝ C 已介入；若反复出现，说明 A/B 没拦住。
+
+#### 回归测试
+
+`tests/test_wiring.py`：
+- `test_empty_output_observation_is_clarified`（A：回调在位 + 真的改写）
+- `test_prompt_maps_deliverable_to_final_answer`（B：提示措辞未被改回）
+- `test_stalled_rewrite_gets_forced_to_final_answer`（C：重写必注入 / 正常推进不注入 / 倒数第二步保底注入 / 已收尾不介入 / **失败重试不误伤**）
+
+CI 只跑 `compileall`、不跑测试 ⇒ 改完 agent 必须本地跑
+`python -m pytest tests/test_wiring.py -v`。
+
+### 3.14 时间解析与事实锚定（`resolvers/time.py`）
+
+> 时间事实错 = 结论全错（取错区间的数据，或模型自己编日期）。本节记录该链路的关键决策，
+> 改动前必读。相关事故：L2（domain 从未传入 ⇒ 交易日常识链整体不执行）、
+> F2（时间事实可被模型改写并被复盘继承）。
+
+#### 领域三级倒推（chat 先于 plan、拿不到 `selected_domain`）
+
+显式 `domain` > 实体类型（`_ENTITY_DOMAIN`）> 输入语汇（`_WORD_DOMAIN`，复用 `_MARKET_WORDS`）
+> `general`。是否走**交易日口径**查 `TRADING_CALENDAR_DOMAINS` 登记表（不是 `== "finance"` 硬编码）。
+
+> **⚠️ `_MARKET_WORDS` 的覆盖率＝口径正确性。**漏一个词就让金融问题掉进 `general` 按自然日算：
+> 实测「前天涨幅榜」因"涨幅"未收录 → 算出 2026-09-12（自然日），而交易日口径应为 2026-09-10。
+> 2026-09-14 已补 `涨幅 / 跌幅 / 振幅 / 换手 / 成交 / 量比 / 市盈率 / 市值 / 封板 / 炸板 / 打板` 等
+> （均为纯行情语汇，不误伤闲聊）。**新增行情语汇时同步此表。**
+
+#### 内联标注是主交付（2026-09-14）
+
+日期**就地钉在原文的时间词上**，而不是挂在消息尾部：
+
+| 原文 | 解析后 |
+|---|---|
+| 今日涨停概率最大的股票 | `今日(2026-09-14)`涨停概率最大的股票 |
+| 昨日涨停的股票 | `昨日(2026-09-11)`涨停的股票（交易日口径：周一说"昨日"＝上周五，不是自然日的 09-13） |
+| 前天涨幅榜 | `前天(2026-09-10)`涨幅榜 |
+
+**为什么必须内联**：改之前输出是
+`今日涨停概率最大的股票 【时间】今天=2026-09-14；最近已收盘交易日=2026-09-11（以交易日历为准…）`
+——信息虽在，但挂在**尾部**，LLM 生成时把它当背景忽略、照旧自己编日期
+（实测结论里出现模型臆造的"上周五评分"）。钉在原文的时间词上才绕不过去。
+
+- 可内联的类型见 `_INLINE_KINDS`（能解析出**单一日期**的词）；区间型（最近 / 本周 / 近 N 个交易日）
+  不内联——它们不是一个日子，内联成 `最近(2026-09-07~2026-09-11)` 会误导，仍走尾部说明。
+- **金融域常驻锚点**：即便原文没提时间也补 `最近已收盘交易日=…`（"金融领域统一加时间解析"的要求）；
+  原文已内联"今天"时不再重复输出 `今天=…`。
+- 非金融输入不注入时间（实测「帮我写个冒泡排序」→ 返回 `None`）。
+
+> **⚠️ 内联必须贯穿到 execute（2026-09-14 修复）**：`plan_node` 用 `effective_input`
+> （`nodes.py:606`），但 `_run_phase_step`（阶段模式）与单段 execute 曾直接取裸
+> `state["user_input"]` ⇒ 阶段任务书开头的「用户原始需求」**没有日期**，与下方 goal 里
+> planner 写的标定日期不一致，且日志上看起来像"时间解析没生效"（实测即被这样误读）。
+> 现统一改为 `state.get("effective_input") or user_input`。
+> **凡是"注入原始输入做保底"的段落（防止 planner 丢关键词），都该用 `effective_input`**
+> ——它是原文的严格扩写，保底作用不减反增，不会给出无日期的版本。
+
+#### 澄清契约（域无关）
+
+无法准确判断就**反问**而不是猜：非交易日说"今天行情"、"最近/近期"无窗口 → 返回
+`clarify_question`，`chat_node` 见非空即反问用户且**不进入执行**。
 
 ---
 
@@ -1176,6 +1337,9 @@ if provider == "my": return MyEmbedding(...)
 ### 8.1 工具发现优化
 
 - **3 层可见性**：必选工具占 prompt token，领域工具不占，schema 仅 planning 可见
+  - 2026-09-14 更正：前半句不成立——`tools=[]` 的工具描述不会进入 system prompt（原因见 §3.3 更正说明），
+    所以"必选工具占 prompt token / 领域工具不占"这个差异**在当前实现下并不存在**；
+    实际对 LLM 可见的只有 planning 段注入的 provider schema 与 `prompts/code_agent.yaml` 正文。
 - **零启动开销**：无子进程启动（已移除 MCP），工具直接在 executor 命名空间
 - **domain 过滤**：plan 选域后只加载域+通用工具，减少 executor 噪音
 - **直接调用**：无需 router，LLM 直接调工具函数
@@ -1279,7 +1443,11 @@ class TraceCollector:
 | ~~RAG 低相关度文档进上下文（RRF 长尾）~~ | ✅ v2.0 修复 | RAG_RRF_MIN_SCORE=0.005 长尾过滤 |
 | 阶段重试大上下文 | ⚠️ 已知 | 重试复用 CodeAgent 记忆累积（实测 137k input tokens）；局部记忆待做 |
 | 阶段间重数据依赖模型自觉调用暂存区 | ⚠️ 已知 | stage_* 工具已注入+纪律行提示，强制机制待做 |
-| 模型偶发忘调 final_answer | ⚠️ 已知 | code_agent.yaml 收尾纪律已加；引擎级检测待做 |
+| ~~模型偶发忘调 final_answer~~ | ✅ 已修（L13） | 三层防御：A 改 observation 的 None 歧义 / B 交付物钉死到 `final_answer` 参数 / C 原地重写或倒数第二步注入收尾指令（**详见 §3.13**）；实测由「4 步跑满 + 强制收尾」降到 1~2 步正常退出 |
+| 沙箱白名单缺 io | ⚠️ 已知 | 模型写“捕获 print 输出”的代码时很自然地 `import io`（StringIO）⇒ 撞墙后整块代码中断、白烧一步（2026-09-14 实测）。扩大白名单属安全边界变更（io 能 open 文件），待评估，见 §10.3 |
+| ~~拦截提示的"可用工具清单"无效~~ | ✅ 已修（L14） | 旧版只从 `static_tools` 取名（业务工具实际在 `custom_tools`），还与 `dir(builtins)` 混排后截断 `[:30]` ⇒ 清单恒为 ArithmeticError / Ellipsis / False…，真实工具一个不显示。实测误拦真实工具 `technical_analysis`，模型只能按提示放弃工具、改用纯 Python 硬算。改为从 custom_tools + static_tools 取、剔除内置与 BASE_PYTHON_TOOLS（详见 §3.3 更正块） |
+| ~~工具注入到包装之前→沙箱内调不到~~ | ✅ 已修（L16） | `tool_functions` 被 `_wrap_stage_guard`/breaker 重新绑定后再注入 executor ⇒ 沙箱持旧（空）表：任务书与 `list_tools()` 都列得出，调用却被误报"幻觉调用"。注入点已移到包装之后，日志加"沙箱实持 N 个"（详见 §3.3 工具架构警示） |
+| 能力层准入缺人工审核留痕 | ⚠️ 已知 | admission.json 有 19 项 `admitted: true`，但 L4 修复时是"按扫描报告语义复原"的**批量导入**，无逐项审核留痕；无法区分"审核通过"与"默认准入"。建议加 `reviewed_by/at` 并在 loader 校验 |
 | llama.cpp router mode 不支持 embedding | ⚠️ 已知 | 需要两个实例 |
 | PgVectorStore 性能瓶颈 | 📋 待优化 | 需引入 pgvector 扩展 |
 
@@ -1293,9 +1461,116 @@ class TraceCollector:
 | 中文分词优化 | 低 | jieba 分词 + 停用词过滤 |
 | Embedding 分块 | 低 | 长文本自动切分 |
 
+### 10.3 设计稿指引与本轮新增待办（2026-09-14，来源：CodeBuddy agent 会话）
+
+- **P2/P3 设计稿（未实施，待评审）**：`docs/AGENT_EXEC_MODE_DESIGN.md` —— 执行层形态（code 执行 vs 结构化 tool-calls）开关化 + 决策点收敛（外部 planner +1 次显式复盘）+ 工具面治理 + 事实权威层 + A/B 指标口径。评审通过后再进 §附录 A 的版本历史。
+- **接线回归网**：`tests/test_wiring.py`（**21 项**，2026-09-14 更新：原 15 项 + L12 两项 + L13 三项 + L14 一项）。CI 只跑 compileall → 改 agent 后本地跑 `python -m pytest tests/test_wiring.py -v`；全量 `pytest tests/` 有与本网无关的既有失败，判断回归要看**增量**而非总数。
+- **本轮新增待办**（证据见上表 v2.4「本轮新发现」）：
+  | 待办 | 优先级 | 说明 |
+  |--------|--------|------|
+  | F1 阶段显式 `[]` 工具被当成"未声明" | 高 | 白名单静默退回域基调（实测 phase#2 = 62 工具），与任务书"仅限清单所列"矛盾 |
+  | F1b 能力层不可达的留痕盲区 | 中 | v2.3 的 info 只覆盖"无阶段"，"有阶段但未点名能力"同样不可达却无声 |
+  | F2 时间事实可被模型改写并被复盘继承 | 高 | 权威口径与模型自由文本同权，最终答案无校验。**2026-09-14 部分缓解**：时间事实改为**内联钉死**在原文时间词上（`今日(2026-09-14)`，见 §3.14），模型无法再当背景忽略；但**最终答案仍无校验**，生成环节仍可能改写 |
+  | 死开关 `AGENT_TYPE` / `CODE_EXECUTION_TIMEOUT` | 低 | 仅 `env.example` 声明、代码零读取点（家族第 12/13 处） |
+  | 环境漂移：`requirements` 要 `smolagents>=1.27` 实装 1.26.0 | 中 | `nodes.py:934/1385` 的判定逻辑照 1.27 写；A/B 前须对齐 |
+  | qd_traces 列漂移 | 中 | `store.py` 写 `plan` 列但 DDL 无；`model/total_tokens/session_id/user_query` 有列无写入 |
+  | ~~L12 沙箱 import 边界两处手工维护 + 撞墙后无纠正~~ | ✅ 已修 | 2026-09-14：`SANDBOX_AUTHORIZED_IMPORTS` 单一来源（executor + instructions 同源渲染）、`GuidedPythonExecutor` v3 覆盖 import 类错误并按次数提示、`plan_system.txt` 补沙箱能力边界；`tests/test_wiring.py` 新增 L12 两项 |
+  | F3 实体污染无意图门控 | 高 | `nodes.py:432-438`：用户话里无 6 位数字就从 RAG 上下文捞股票代码 → 纯代码任务被强制"包含西安银行(600928)"（2026-09-14 CLI 实测）；方案：(a) 实体解析挪到意图分类后 (b) 代码/通用意图跳过 RAG 辅助注入 |
+  | F6 沙箱错误不纳入熔断 | 中 | `ToolCircuitBreaker` 只管工具调用；沙箱 `InterpreterError`（如 import 越界）不经它 → 同一失败模式重复发生（实测 Step2 `sys` / Step4 `argparse` 两次），归 S4 守卫层 |
+  | ~~L13 收尾 / 退出通道三层缺失~~ | ✅ 已修 | 2026-09-14：A `_clarify_empty_output` + B 交付物钉到 `final_answer` 参数 + C `_enforce_final_answer`（含「注入必须在倒数第二步」「上一步有错＝失败重试、不判重复」两条硬约束）。**已写入 §3.13 收尾与退出机制（事故高发区）**；回归网 +3 项（共 20 项） |
+  | 沙箱白名单缺 io | 中 | 2026-09-14 实测：`import io`（StringIO 捕获输出）撞墙 ⇒ 整块代码中断、白烧一步。与安全边界相关（io 可 open 文件），需单独评估：放行 or 在拦截提示里给出等价替代写法 |
+  | ~~L14 拦截提示的"可用工具清单"无效~~ | ✅ 已修 | 2026-09-14：清单改为从 `custom_tools + static_tools` 取、剔除内置与 BASE_PYTHON_TOOLS，`GuidedPythonExecutor` v4；回归网 +1 项（共 21 项）。**架构事实已写进 §3.3**（业务工具在 custom_tools，不在 static_tools） |
+  | 工具不在当前阶段沙箱内（domain / phase 白名单） | ⚠️ 已知 | 与 L14 相邻但不同层：L14 是"清单显示不出来"，本项是"真的没注入"——planner 未在 `phase.tools` 点名或 domain 不匹配（F1 类）。修 L14 后可从日志清单直接判断是否属此类 |
+  | 诊断记录 | — | `docs/AGENT_EXEC_MODE_DESIGN.md` 附录 D：CLI 复现「写跑马灯」的完整失败链路、代价量化（两次白打整份源码 ≈2.9 万 output tokens）与改动清单 |
+
 ---
 
 ## 附录 A：版本历史
+
+### v2.1 (2026-09-13) — 规划分工显式化：阶段级预算 + 内部 planner 契约开关
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| 🐛 修复 | **内部 planner 判据失效**：`effective_interval = None if selected_skill else ...` 依赖技能存在；技能层清空后判据恒真 → 内部 planner 全程常开，与"简单指令关闭内部 planner"的设计意图相反。改为读阶段契约 `internal_plan`（缺失时按阶段预算判复杂度兜底） | nodes.py |
+| ✨ 契约 | phases[] 增 `step_budget`（钳制 1~12，0=未指定）/ `internal_plan`（bool/None）：外部 planner 显式声明每阶段步数上限与是否开启执行器内部规划 | agents/task_agent.py (_normalize_phases), prompts/plan_system.txt |
+| 🐛 修复 | **契约断裂**：plan_system 早已承诺"多阶段按每阶段 3~7 步分别给"，但契约里无该字段，执行侧所有阶段共用全局 step_budget。现 per-phase 预算真正生效 | nodes.py, agents/task_agent.py |
+| ✨ 稳定 | 内部 planner 注入范围边界与收敛纪律（initial_plan / update_plan_post_messages）：不得扩范围、不得规划后续阶段、剩余步数少时优先收口 | prompts/code_agent.yaml |
+| 📝 文档 | plan_system 示例去技能化（market_screener/stock_evaluation 已不存在 → selected_skill=null）＋域名说明修正（原写"finance、technical"，其中 technical 不存在；**实测真实域为 common / finance / quant**——finance=tools/finance 47 个工具，quant=capabilities 19 个能力） | prompts/plan_system.txt |
+| ✨ 审计 | phase_start trace 增 step_budget / internal_plan：规划分工决策可事后对账 | nodes.py |
+
+#### v2.1 附带审计：能力发现层（capabilities）断链清单（2026-09-13）
+
+> 本节为**审计记录**。L1~L8 已于 2026-09-13 全部修复（见下方 v2.2），L9/L10 见 v2.3（L9 = 同一病灶的第三层：点名通道；L10 = 架构拆分遗留 import）、L11 见 v2.4（2026-09-14 由 `tests/test_wiring.py` 查出并修复）；修复前的断链状态与证据原样保留。
+
+| # | 问题 | 证据 | 状态 |
+|---|------|------|------|
+| L1 | **`quant` 与 `finance` 是两个互斥的"金融域"**：域由目录名推导（`finance` = tools/finance，实测 47 个工具），而能力层硬编码 `domain="quant"`（19 个）。`_build_code_agent` 只加载 `common + 单个域` → planner 看到"可用工具域：finance, quant"却无法判断该选哪个，选任一都丢掉另一半 | nodes.py:160-162、capabilities/loader.py:148、agents/task_agent.py:930-934/1331-1335 | ✅ 已修（v2.2） |
+| L2 | **`TimeResolver` 的 domain 从未传入**：调用点 `TimeResolver()`（无参）→ 恒为 `"general"` → `finance = self.domain == "finance"` 恒假 → 交易日常识链整体不执行（`finish` 恒为自然日、非交易日打回澄清永不触发、`今天=…；最近已收盘交易日=…` 标注永不输出）。DESIGN §14.5 所声称的"domain=finance 交易日口径 / 周六打回澄清"从未生效 | agents/task_agent.py:1741、resolvers/time.py:141-159 | ✅ 已修（v2.2） |
+| L3 | **`FinanceFormatter` 双层断链**：① `formatters/__init__.py:21` 的 `from . import finance` 被注释掉 → `_REGISTRY` 恒空，`get_formatter()` 恒返回 `DefaultFormatter`；② 更深一层：注册 key 是领域名（`"finance"`）而查询只传 `entity_type`（`"stock"`）→ **即便恢复 import 也命中不了**。领域格式化分发形同虚设（且 `not selected_skill` 恒真 ⇒ 每次 finalize 都多一次 LLM 汇总调用） | formatters/__init__.py:21、formatters/base.py:47-55、nodes.py:1470-1484 | ✅ 已修（v2.2） |
+| L4 | `admission.json` 中文不可逆损坏：实测 3779 字节 / 100 个字面 `0x3F` / 0 个非 ASCII 字节（写入时编码丢失，**不是**读取编码问题）→ 该文件定位是"人工过目唯一事实源"，说明文字全部不可读 | capabilities/admission.json | ✅ 已复原 |
+| L5 | `_cap_text = prescan_tools(limit=0, …)` 计算后从未被使用，但每次 plan 都白跑一遍全量工具签名扫描 | agents/task_agent.py:950 | ✅ 已删 |
+| L6 | `WRITE_PREFIXES` 在 scanner / loader 各存一份，靠注释"保持一致"手工同步 → 必然漂移且无告警 | capabilities/scanner.py:57、capabilities/loader.py:35 | ✅ 已去重 |
+| L7 | planner 工具清单被 `prescan_tools(limit=60)` 按**字母序**截断（生产约 78 个工具 ⇒ 约 18 个对 planner 不可见，写不进 `phase.tools`）；而能力视图段**不截断**（19 个全列）→ 诱导 planner 优先选低阶 capabilities 而非语义化 finance 工具 | agents/task_agent.py:939/950、tools/base.py:373-378 | ✅ 已改相关性裁剪（v2.2） |
+| L8 | **实体解析与澄清反问在线上从未执行**：`NodeContext` 的契约是 `EntityResolver`（nodes.py 调 `.resolve()`），但 task_agent 注入的是**裸函数** `_combined_resolver` → 调用处 `AttributeError` 被 `except Exception: logger.debug` 吞掉。后果：标的解析、交易日口径、非交易日/歧义澄清**全部静默失效**——与 L2 是同一病灶的两层（即便 L2 的 resolver 逻辑修对了，也永远跑不到） | agents/task_agent.py:1811、nodes.py:440/472 | ✅ 已修（v2.2，`CompositeResolver` + 异常升级 warning） |
+| L9 | **能力层唯一注入途径挂在"编排结构"上**：L1 修复后能力刻意不属于任何可选域，其唯一点名通道是 `phases[].tools`；而 phases 是**编排契约**（单段任务本就不拆阶段）⇒ 没有阶段就没有点名通道，**能力层对单段任务永久不可达**，planner 提示里却完整展示 19 个能力。plan_system 自己写着"无 phases 的单段任务用不了能力"（把缺陷写进了规则），且 6 个制导示例里 5 个是不带 phases 的单段 + 另一条规则称"简单任务 1 个阶段即可" → **示例、规则、实现三者互斥** | agents/task_agent.py `_build_code_agent`（whitelist/domain/common 三支均不含能力）、capabilities/loader.py:12-13（自述"唯一注入途径是 stage 级 tools 白名单"）、prompts/plan_system.txt | ✅ 已修（v2.3，与阶段解耦的"附加点名"通道） |
+| L10 | **框架级自动落盘从未执行**：`_auto_stage_phase_result` 仍 `from tools.staging import stage_write`，但 staging 在 v2.0 架构拆分中已迁至 `infra/staging.py` → ImportError 被 `except Exception: logger.debug` 静默吞掉。v2.0 承诺的"重数据由框架自动落盘、不依赖模型自觉"（阶段结果防截断的强制机制）**一次都没生效过** | nodes.py `_auto_stage_phase_result`（`except` 处原为 debug） | ✅ 已修（v2.3，改 `infra.staging` + 异常升级 warning） |
+
+| L11 | **暂存区三件套在沙箱内从未存在**（2026-09-14 由 `tests/test_wiring.py` 查出，同族第 11 处）：`_build_code_agent` 的常驻注入写成"provider 里若已注册则补注入"，而 v2.0 把 staging 从 `tools/` 迁到 `infra/` 后它不再被目录扫描注册（`tools/base.py::_SKIP_FILES` 里仍留着迁移前的旧名 `staging_tools`）⇒ 该条件恒假。于是任务书"暂存区工具常驻可用"、`_ListToolsTool` 说明、`_wrap_stage_guard` 自动落盘后的"用 `stage_read(scope, name)` 读取"——全都在让模型调用一个**沙箱里不存在的函数**（Forbidden，且会被误判为"幻觉调用"） | agents/task_agent.py `_build_code_agent`（实测：真实 provider 81 个工具中不含 stage_*） | ✅ 已修（v2.4，直连 `infra.staging` 常驻） |
+
+> 实测数据（本机裸环境，`common` 域因缺 pandas/requests 未计入）：finance=47、capabilities=19、common≈12 ⇒ 工具总数≈78，与既有记录一致。
+> `capabilities/__init__.py` 自称"通用机制（不局限金融域）"，但 `scanner.SCAN_TARGETS` 硬编码 `app.market_cn.auto.*` → 壳通用、里硬编码（`SCAN_TARGETS` 待后续按需扩展；`domain="quant"` 已随 L1 修复）。
+
+### v2.2 (2026-09-13) — 能力层审计修复：域模型数据化 + 领域格式化/时间口径接线 + 相关性裁剪
+
+> 起因：用户指出 §14.2 能力发现层"是巨大的 bug、并没有模块化"。核实成立，根因是
+> **把"工具来源(provenance)"当成了"领域(domain)"**。附带约束：领域不止 finance，
+> 未来会有很多领域 → 一律按"可扩展登记/推导"处理，不做硬编码。
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| 🐛 修复 | **L1 域模型数据化**：能力层不再占用可选域（原 `domain="quant"` → 来源层标记 `CAPABILITY_DOMAIN`）。`ToolProvider` 新增 `_selectable_domains`（在 `scan_subdirectories` 按目录登记）与 `get_domains()`；planner 的"可用工具域"清单与 `selected_domain` 校验都改用它 → **域随目录自动增减，新增领域无需改代码** | capabilities/loader.py, tools/base.py, agents/task_agent.py |
+| 🐛 修复 | **L2 时间口径接线**：`TimeResolver` 增 `domain` / `entity_type` 参数。chat 阶段先于 plan、拿不到 `selected_domain`；由 `CompositeResolver` 先跑实体解析，再按 `_ENTITY_DOMAIN` / `_WORD_DOMAIN` 三级倒推领域（见下方两条）；交易日口径判定由 `self.domain == "finance"` 改为查 `TRADING_CALENDAR_DOMAINS` 登记表 | resolvers/time.py, agents/task_agent.py |
+| 🐛 修复 | **L3 领域格式化接线（双层）**：① `formatters/__init__.py` 把被注释掉的 `from . import finance` 改为 **pkgutil 自动发现**——新增 `formatters/<domain>.py` 即自动注册；② 新增 `get_formatter(entity_type, domain)`，查找顺序 **domain（领域级标准输出，多领域复用）→ entity_type（领域内单实体定制）→ default**，finalize 侧传 `state["selected_domain"]`；另增 `list_formatters()` 供启动自检 | formatters/*, nodes.py |
+| 🐛 修复 | **L7 相关性裁剪**：`prescan_tools(limit, query)` 超上限时按与本次需求的相关度排序再截断（ASCII 词 + 中文 2-gram 打分；命中工具名权重 6 > 命中描述权重 2；零分并列按名称稳定排序；无任何相关信号时退化为字母序以避免随机丢弃），被裁数量如实写入清单末尾。上限改为 env 可配 `PLAN_TOOL_LIST_LIMIT`（默认 60） | utils/prescan.py, agents/task_agent.py |
+| 🐛 修复 | **L8 实体解析/澄清接线**：`entity_resolver` 注入的裸函数 `_combined_resolver` 不满足 `EntityResolver` 契约（nodes.py 调 `.resolve()`）→ `AttributeError` 被 `except: logger.debug` 吞掉 ⇒ **实体解析与澄清反问线上从未执行**。改为注入 `CompositeResolver`（新增 `resolvers/composite.py`），并把该处异常由 debug 升级为 warning（接线错误必须可见） | resolvers/composite.py, agents/task_agent.py, nodes.py |
+| ✨ 功能 | **通用澄清契约**（用户裁定："无法准确判断就应该反问，拿到准确信息才执行"）：`ResolveResult` 增 `clarify_question` + `needs_clarify`；`chat_node` 改为**域无关**检测（字段优先，兼容 `*_clarify` 标记）——任何领域/解析器都能反问，新增领域无需改 nodes.py | resolvers/base.py, nodes.py, resolvers/time.py |
+| ✨ 功能 | **标的歧义反问**：`StockResolver` 原以 `limit=1` 调 `resolve_stock`（DB 至多回 1 条 ⇒ 歧义在结构上不可见，"静默取首个候选"，选错标的最致命）→ 改取多候选，无法用**精确同名收敛**时反问用户确认（列出候选与代码） | resolvers/stock.py |
+| ✨ 功能 | **窗口不明反问**：`TimeResolver` 原把"最近/近期"静默当"近 5 个交易日"（自己都标注"可按需调整"）→ 改为反问（交易日常见 5/10/20/60 个交易日；自然日 7/30/90 天），带窗口的说法不触发 | resolvers/time.py |
+| ✨ 功能 | **领域三级倒推**（chat 先于 plan、拿不到 `selected_domain`）：显式 `domain` > 实体类型（`_ENTITY_DOMAIN`）> 输入语汇（`_WORD_DOMAIN`，复用 `_MARKET_WORDS`）——纯"最近的行情怎么样"无实体也能落到 finance，否则会问出自然日错口径 | resolvers/time.py |
+| 📝 文档 | prompt 域与能力说明改写：删去虚构域 `quant`，示例全部改 `"finance"`；能力段契约改为"只能由阶段 tools 白名单点名注入" | prompts/plan_system.txt |
+| ✅ 验证 | 临时脚本全绿后删除：`tmp/_verify_wiring.py`（formatter 自动注册/domain 命中、`get_formatter("stock")` 不误命中、L7 排序/退化、`get_domains()` 排除来源层、周六"今天行情"打回澄清）；`tmp/_verify_clarify.py` **25 项全过**（澄清契约、标的歧义/精确同名收敛/6 位代码、窗口不明/带窗口不触发、三级领域倒推、**注入对象满足 `EntityResolver` 契约**、组合器澄清优先短路与多标的合并） | — |
+
+### v2.3 (2026-09-13) — 点名通道与编排结构解耦：单段任务可达能力层（L9）+ 遗留接线（L10）
+
+> 起因：核验"能力只认 `phases[].tools` 一个点名通道"这条设计时发现——**把"工具可见性"耦合到了"编排结构"**。
+> phases 回答"怎么分步、怎么验收"，点名回答"这一轮允许看到哪些函数"，两者正交；而单段任务（不拆阶段）因此
+> 在所有分支上都拿不到能力层。修法是把点名通道独立出来，而不是给 LLM 再补一句提示。
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| 🐛 修复 | **L9 单段附加点名通道**：plan 契约新增**顶层 `tools`**，语义 = **附加点名**（在 `selected_domain` 基调〔域+通用〕之上做**并集**，不挤掉域工具）；`phases[].tools` 仍是**独占白名单**、语义不变，两者同时出现时以 phases 为准（避免静默放宽每个阶段的工具面）。新增 `_normalize_plan_tools`（保序去重 / 容错逗号串 / 落空名字告警）；`_build_code_agent` 增 `extra_tools` 参数（`tools` 非空时不生效） | agents/task_agent.py, nodes.py |
+| 🐛 修复 | **prompt 三处互斥**：删去"无 phases 的单段任务用不了能力"（缺陷被写成规则），改为按有无 phases 二分点名通道；示例补单段点名用法；"简单任务 1 个阶段即可"与示例（单段）矛盾 → 统一为"单段省略 phases"。另修正能力段头注（原写"仅当本阶段 tools 白名单"，未提单段通道） | prompts/plan_system.txt, agents/task_agent.py |
+| 🐛 修复 | **L10 自动落盘接线**：`from tools.staging` → `from infra.staging`（v2.0 架构拆分遗留），异常由 debug 升级为 warning。此前 ImportError 被静默吞掉 ⇒ 阶段结果自动落盘从未执行 | nodes.py |
+| 🐛 修复 | **工具契约陈旧实例**：单段路径复用 `state["_code_agent"]` 时未校验工具契约（域+点名单）→ 复盘重规划若改变二者，沙箱里没有新点名的工具而任务书却写着"可直接调用"，模型照做即 Forbidden（会被误判为幻觉调用）。改为契约不一致即重建实例 | nodes.py |
+| ✨ 稳定 | 单段任务书补【附加点名工具（括号内为参数名）】：与阶段任务书同规则（2026-09-12 实证：只给名字会诱发参数猜测、连环 TypeError 烧步数），避免两条执行路径行为漂移 | nodes.py |
+| ✨ 审计 | 能力可达性可对账：无阶段且未点名能力时记 info（"能力层不可达"）；`plan_result` trace 增 `plan_tools` / `capabilities_named`（点名生效 vs 落空各自留痕） | agents/task_agent.py |
+| 📝 文档 | 能力视图构造抽 `_capability_names()` 复用（原两处各写一遍来源层过滤）；`_plan` docstring 补 `phases`/`plan_tools` 返回说明 | agents/task_agent.py |
+| ⚠️ 待同步 | `docs/AGENT_ACCOUNTABLE.md` §14.2/§14.4 仍为 v2.2 前的表述（"注册 domain=quant"、"规划器据此把能力函数编排进 phases[]"）——该文件属共享区域（协作约定只增不删），本次未改，标记待同步 | docs/AGENT_ACCOUNTABLE.md |
+| ✅ 验证 | 临时脚本全绿后删除：`tmp/_verify_plan_tools.py` **30 项全过**（规格化 7 项含逗号串/幻觉名；**真实构建 CodeAgent 断言注入工具集** 5 项：并集不挤掉域工具、落空不入沙箱、无域+点名可达、`tools` 非空时 extra 不生效、无点名时与旧版一致；能力名过滤 2 项；模板可 format + 契约/规则/示例一致性 6 项；状态字段 1 项；`infra.staging` 导入 2 项；接线审计 7 项） | — |
+
+### v2.4 (2026-09-14) — 接线回归网（P0）+ L11 暂存区常驻 + 真实链路 E2E（P1）
+
+> 起因：v2.3 的验证脚本按惯例"跑完即删"。但 L1~L10 全是同一类问题——**声明了、没接上、静默失效**，
+> 靠一次性脚本发现 ⇒ 同类断链反复复发。本轮把那些断言固化进测试套件（P0），并在建设过程中
+> 又查出同族第 11 处（L11）；随后用真实链路 E2E 验证 v2.3 的能力点名通道（P1）。
+
+| 类别 | 改动 | 文件 |
+|------|------|------|
+| ✅ 新增 | **接线契约回归测试**（15 项）：能力层来源层过滤（L1）、`_normalize_plan_tools`/`_normalize_phases` 契约（L9）、**真实构建 CodeAgent 断言沙箱工具面**（附加点名并集 / 白名单独占 / 无域可达 / 无点名回退）、formatter 目录自动发现与 key 语义（L3）、`EntityResolver` 契约＋澄清优先短路＋故障降级（L8）、`TimeResolver` 三级领域倒推（L2）、阶段结果自动落盘读写闭环（L10）、暂存区常驻（L11）、真实 provider 全链不变式。此后 agent 接线改动可一条命令回归：`python -m pytest tests/test_wiring.py -v`（CI 只跑 compileall，不跑测试；本文件用合成 provider + 桩 model + 桩交易日历，不依赖外部服务与 LLM） | tests/test_wiring.py |
+| 🐛 修复 | **L11 暂存区三件套在沙箱内从未存在**（见审计表 L11）：常驻注入改为直连 `infra.staging` 本体（框架工具 ≠ 插件工具，不依赖 provider 扫描结果） | agents/task_agent.py |
+| 🔁 可复测 | 新增 E2E 驱动 `tmp/_e2e_capability_naming.py`：不经 message_queue（本机 Redis 未起），直接 `agent.run_agent` 走同一个图，可反复手动运行；顺带证明"跳过投递不影响图逻辑" | tmp/ |
+| ✅ 验证 | ① `pytest tests/test_wiring.py` **15 项全过**；`pytest tests/` 与改动前同为 29 failed / 44 errors（既有失败，与本改动无关）。② 真实 provider 实测：81 工具 / finance=59 / capability=19 / common=3，`stage_*` **不在 provider 内**（L11 证据）。③ **E2E（真实 LLM，138s）**：`顶层 tools 附加点名 4 个: [list_signals, get_active_signals, strategy_labels, resolve_stock]` → `[Execute] 附加点名工具 4 个` → `加载 65 个工具（通用+finance+附加点名4）` → `附加点名生效 4 个`，任务书出现 `【附加点名工具（可直接调用；括号内为参数名）】`，模型**实际在沙箱里调用了 `list_signals(...)`**（v2.3 前单段任务不可达能力层）；无 `附加点名落空`；复盘重规划走阶段路径，`phase 白名单：加载 3 个工具` + `新建 CodeAgent（工具契约 ('finance', (...))）` 生效；`qd_traces` 写入 root_id=1940 children=14 | — |
+| ⚠️ 本轮新发现（未改） | **F1 阶段"显式 0 工具"被当成"未声明工具"**：planner 明确写 `#2汇总清单[0工具]`，`_build_code_agent` 视空列表为"无白名单"⇒ 回退域基调，实测 phase #2 拿到 **62 个工具**，而同一份任务书写着"沙箱内只存在【本阶段可用工具】清单所列函数——不存在其他任何函数"（语义自相矛盾；白名单"独占"设计被静默放宽）。**F1b 审计留痕盲区**：v2.3 的"能力层不可达"info 只覆盖"无阶段"，此处"有阶段但阶段未点名能力"同样不可达却无任何留痕。**F2 事实无权威层**：解析器给出 `今天=2026-09-14（当前交易日）`（正确，周一），执行段模型自造"周日非交易日"，复盘又把该错误事实**继承进第二轮 plan text**（`2026-09-14,当前为周日非交易日`）——harness 对"模型改写时间事实"无校验。**F3 执行形态代价**：单段 7 步耗尽预算（`hit_max_steps=True`），中途因把返回 dict 当 list 切片报 `InterpreterError` 烧步数——印证 ①"在给 smolagents 打补丁"的收益点（见 P2 实验） | agents/task_agent.py, nodes.py |
 
 ### v2.0 (2026-09-11 ~ 09-12) — 双规划器阶段契约 + 能力发现层 + 稳定性防线
 
@@ -1307,13 +1582,13 @@ class TraceCollector:
 | ✨ 架构 | 能力发现层：capabilities 包（scanner/loader/admission）+ planner 能力视图；19 项数据函数注册 domain="quant" | capabilities/*, agents/task_agent.py, nodes.py |
 | ✨ 稳定 | SSE 事件格式修复（翻译层 + node_start 补发 + 前端预声明）——半流式可见 | flask_app.py, agents/task_agent.py, nodes.py |
 | 🐛 修复 | RAG 静默失效：chat_node 局部 import os 作用域污染（UnboundLocalError） | nodes.py |
-| ✨ 稳定 | 提取层加固 v4：健全性校验/伪标签防线/散落代码抢救/围栏救援；合法输出零干预 | tools/resilient_parse.py |
-| ✨ 稳定 | 幻觉调用纠正：GuidedPythonExecutor（Forbidden 错误 → 可用清单+二选一指引） | tools/guided_executor.py |
-| ✨ 稳定 | 工具失败熔断：ToolCircuitBreaker（连续失败2次短路，元工具豁免，实例隔离） | tools/breaker.py |
+| ✨ 稳定 | 提取层加固 v4：健全性校验/伪标签防线/散落代码抢救/围栏救援；合法输出零干预 | infra/resilient_parse.py |
+| ✨ 稳定 | 幻觉调用纠正：GuidedPythonExecutor（Forbidden 错误 → 可用清单+二选一指引） | infra/guided_executor.py |
+| ✨ 稳定 | 工具失败熔断：ToolCircuitBreaker（连续失败2次短路，元工具豁免，实例隔离） | infra/breaker.py |
 | ✨ 稳定 | 三道守卫：AGENT_RUN_WALL_TIMEOUT（非主线程墙钟）/ SSE_HARD_TIMEOUT_EXTRA（硬上限+可读超时文案）/ LLM 惰性客户端超时补挂 | nodes.py, flask_app.py, agents/task_agent.py |
 | 🐛 修复 | 复用 Agent 重试时 LLM 180s 超时丢失（close 后惰性重建未补挂） | agents/task_agent.py, nodes.py |
 | 🐛 修复 | main() 进程入口被注册为工具（mcp.run 挂死进程）→ CLI 入口名注册黑名单 + main→serve | tools/base.py, tools/mcp_bridge.py |
-| ✨ 功能 | 暂存区：stage_write/read/list（跨阶段重数据，scope/文件名白名单+2MB 上限） | tools/staging.py, tools/staging_tools.py, nodes.py |
+| ✨ 功能 | 暂存区：stage_write/read/list（跨阶段重数据，scope/文件名白名单+2MB 上限） | infra/staging.py, nodes.py |
 | ✨ 功能 | 取数批量化：27 个 codes 工具 [支持批量] 标注 + 任务书/规划规则 | utils/prescan.py, nodes.py, prompts/plan_system.txt |
 | ✨ 功能 | 预扫：技能 AST 签名解析 + 工具签名清单注入规划提示（替代裸名列表） | utils/prescan.py, agents/task_agent.py |
 | ✨ 功能 | 技能阶段清单：SKILL.md 可选 `## stages` 段 → planner 按阶段映射切片；market_screener 样板 | agents/task_agent.py, skills/market_screener/SKILL.md |
@@ -1322,7 +1597,7 @@ class TraceCollector:
 | 🐛 修复 | _LLMAdapter._desired_timeout 惰性补挂（复用 Agent 重试时 180s 超时丢失） | agents/task_agent.py |
 | 🐛 修复 | ToolProvider CLI 入口名黑名单（main/serve 等不注册） | tools/base.py |
 | 🐛 修复 | 响应元数据 phase_types 适配契约格式；代码类任务边界规则（禁止规划「写文件→运行文件」） | agents/task_agent.py, prompts/plan_system.txt, nodes.py |
-| 📄 文档 | docs/AGENT_ACCOUNTABLE.md v5.0（§十四）；本文件 v2.0 | docs/, DESIGN.md |
+| ✨ 架构 | 框架内部机制（infra/）：breaker/guided_executor/resilient_parse/staging 移出 tools/，标准 import，消除动态加载 | infra/*, agents/task_agent.py, tools/base.py |
 
 ### v1.4 (2026-09-10) — 健壮性审计修复
 

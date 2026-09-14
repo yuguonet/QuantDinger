@@ -373,14 +373,21 @@ class BreakStrategy(StrategyBase):
         """
         from app.market_cn.auto.common.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
-        min_streak, max_break_gap = 2, 5   # 旧 backtest_break_stock 默认值 (run_all 从不覆盖)
-        # 换手率门从 config 透传 (2026-09-11): backtest 唯一受 config params 影响的键,
-        # 其余枚举参数仍走代码默认 — turnover_min=None (config 未写) 时行为与历史零差异
+        # 入场枚举参数接线 (2026-09-13 修): 原硬编码 2,5 且经 kwargs 传 scan_signals,
+        # kwargs 优先级压过实例覆写 → param_scan 网格全然无效 (实证: 全组合 n=94
+        # 同数字)。改从 merged_params(None) 取: 默认=代码默认值 (行为零差异), 实例
+        # default_params 覆写 (param_scan 唯一调参入口) 即生效。
+        _p = self.merged_params(None)
+        min_streak, max_break_gap = _p["min_streak"], _p["max_break_gap"]
+        # 换手率门 (2026-09-11 config 透传): 实例覆写优先, 未覆写时回落 config —
+        # 覆写后 config 不再参与 (实例覆写=回测权威)
         from app.market_cn.auto import strategies as _strat_reg
-        try:
-            _turnover_min = _strat_reg.params_override(self.key).get("turnover_min")
-        except Exception:
-            _turnover_min = None
+        _turnover_min = _p.get("turnover_min")
+        if "default_params" not in self.__dict__ and _turnover_min is None:
+            try:
+                _turnover_min = _strat_reg.params_override(self.key).get("turnover_min")
+            except Exception:
+                pass
         bt_type = get_board_type(code)
         params = dict(BOARD_PARAMS[bt_type])
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]

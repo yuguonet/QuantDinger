@@ -1505,14 +1505,15 @@ def _sector_flow_ths(indicator: str = "今日") -> Optional[List[Dict[str, Any]]
         return None
 
 
-def _sector_flow_eastmoney(indicator: str = "今日") -> Optional[List[Dict[str, Any]]]:
-    """数据源5(兜底): 东方财富 push2 行业板块资金流向排名。
+def _sector_flow_eastmoney(indicator: str = "今日", board_type: str = "industry") -> Optional[List[Dict[str, Any]]]:
+    """数据源5(兜底): 东方财富 push2 板块资金流向排名（行业/概念）。
 
     接口: push2.eastmoney.com/api/qt/clist/get
-    行业板块 fid=f62(主力净流入) 降序
+    fid=f62(主力净流入) 降序；fs=m:90+t:2 行业 / m:90+t:3 概念
 
     Args:
         indicator: "今日"/"3日"/"5日"/"10日"（东财支持多周期）
+        board_type: "industry"(默认) / "concept"
 
     Returns:
         成功: [{name, code, change_pct, main_net, main_pct,
@@ -1523,9 +1524,10 @@ def _sector_flow_eastmoney(indicator: str = "今日") -> Optional[List[Dict[str,
     import urllib.request
 
     fields = "f12,f14,f3,f62,f184,f66,f69,f72,f75,f204,f205"
+    fs = "m:90+t:3" if board_type == "concept" else "m:90+t:2"
     url = (
         "https://push2.eastmoney.com/api/qt/clist/get"
-        f"?fid=f62&po=1&pz=100&pn=1&np=1&fs=m:90+t:2"
+        f"?fid=f62&po=1&pz=100&pn=1&np=1&fs={fs}"
         f"&fields={fields}"
     )
     headers = {
@@ -1567,22 +1569,28 @@ def _sector_flow_eastmoney(indicator: str = "今日") -> Optional[List[Dict[str,
             })
 
         if rows:
-            logger.info("[eastmoney] 行业资金流(兜底): %d 个板块", len(rows))
+            logger.info("[eastmoney] %s资金流(兜底): %d 个板块",
+                        "概念" if board_type == "concept" else "行业", len(rows))
         return rows or None
     except Exception as e:
         logger.warning("[eastmoney] 行业资金流失败: %s", e)
         return None
 
 
-def get_sector_fund_flow(indicator: str = "今日", force: bool = False) -> List[Dict[str, Any]]:
-    """获取行业板块资金流向排名。
+def get_sector_fund_flow(indicator: str = "今日", force: bool = False,
+                         board_type: str = "industry") -> List[Dict[str, Any]]:
+    """获取板块资金流向排名（行业 / 概念）。
 
-    多源降级: 新浪 → 东财(兜底)
+    多源降级: 新浪 → 东财(兜底)；概念板块仅东财一个源。
 
-    注意: 新浪仅支持当日数据；"3日"/"5日"/"10日"需走东财兜底。
+    注意: 新浪/同花顺仅支持当日**行业**数据；"3日"/"5日"/"10日"与概念板块走东财兜底。
 
     Args:
         indicator: 统计周期，可选 "今日"(默认) / "3日" / "5日" / "10日"
+        board_type: "industry"(默认) / "concept"。
+            2026-09-14 补上——此前 fund_flow_tools.get_concept_fund_flow 传
+            board_type="concept" 触发 TypeError，概念资金流工具自上线起即坏
+            （工具熔断器因此把它拉黑）。
 
     Returns:
         成功: [{
@@ -1604,11 +1612,20 @@ def get_sector_fund_flow(indicator: str = "今日", force: bool = False) -> List
         >>> for s in sectors[:5]:
         ...     print(f"{s['name']}: 主力 {s['main_net']/1e8:.2f} 亿")
     """
-    if not force and _rt_sector_flow is not None:  # 内存缓存
+    if not force and board_type == "industry" and _rt_sector_flow is not None:  # 内存缓存（仅行业）
         return _rt_sector_flow
     if indicator not in ("今日", "3日", "5日", "10日"):
         logger.warning("不支持的统计周期: %s，使用'今日'", indicator)
         indicator = "今日"
+
+    # 2026-09-14：概念板块（board_type="concept"）只有东财一个源
+    # （sina/ths 均无概念资金流），直接走兜底。
+    if board_type == "concept":
+        data = _sector_flow_eastmoney(indicator, board_type="concept")
+        if data:
+            return data
+        logger.error("概念板块资金流获取失败（东财 push2 是唯一概念源）")
+        return []
 
     # 新浪仅支持当日，非"今日"时跳过新浪直接走同花顺/东财
     if indicator == "今日":

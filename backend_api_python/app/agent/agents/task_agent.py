@@ -27,30 +27,50 @@ import logging
 import os
 import re
 import time
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional
 
 import yaml
-
-
 
 from agents.base import AgentBase, AgentResponse
 from llm.base import ChatMessage, LLMBase
 from memory.base import MemoryBase
 from utils.prescan import prescan_skill_funcs, prescan_tools  # 预扫（2026-09-12 Q4）
-from tools.breaker import ToolCircuitBreaker  # 工具失败熔断（2026-09-12）
-from tools.guided_executor import GuidedPythonExecutor  # 幻觉调用纠正（2026-09-12）
-from tools.resilient_parse import apply as _apply_resilient_parse  # 代码提取加固（2026-09-12）
-_apply_resilient_parse()
 from rag.retriever import Retriever
 from smolagents import Tool as SmolToolBase
+from smolagents.local_python_executor import FinalAnswerException
 from utils.json_parser import safe_parse_json
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
+
+# ═══════════════════════════════════════════════════════════════
+#  框架内部模块（infra/）——标准 import，非插件
+# ═══════════════════════════════════════════════════════════════
+from infra.resilient_parse import apply as _apply_resilient_parse, resilient_parse_code_blobs
+from infra.breaker import ToolCircuitBreaker
+from infra.guided_executor import DANGEROUS_IMPORTS, GuidedPythonExecutor
+from infra.staging import stage_write, stage_read, stage_list, stage_get_obj, stage_put_obj
 
 # 使用 app.agent logger（与 log.py 配置一致，确保日志写入文件）
 try:
     from log import logger
 except ImportError:
     logger = logging.getLogger(__name__)
+
+# 熔断器单例（跨 agent 实例共享）
+try:
+    _global_breaker = ToolCircuitBreaker(threshold=2)
+except Exception as e:
+    logger.warning("[TaskAgent] ToolCircuitBreaker 实例化失败: %s（熔断降级）", e)
+    _global_breaker = None
+
+# 定时任务模块
+from cron.cron_tools import create_cron_job
+
+# Resilient parse 初始化（模块加载时应用一次）
+try:
+    _apply_resilient_parse()
+except Exception as e:
+    logger.warning("[TaskAgent] resilient_parse.apply() 失败: %s（功能降级）", e)
 
 
 
@@ -71,6 +91,15 @@ _CODE_AGENT_YAML_PATH = os.path.join(
 # （route_after_execute 条件边形成循环，全部完成才进 finalize）。
 PLAN_MAX_PHASES = 5          # 单次 plan 的阶段数上限（超出截断）
 PLAN_PHASE_MAX_RETRIES = 1   # 单阶段默认重试上限（phase.max_retries 可覆盖，钳制 [0,3]）
+PLAN_PHASE_MAX_STEPS = 12    # 单阶段内部步数上限（phase.step_budget 钳制上界，2026-09-13）
+
+# planner 工具清单条数上限（2026-09-13 审计 L7）。原先固定 60 且按字母序截断：
+# 工具总数接近/超过该值时被砍掉的是"字母序靠后"的工具，与需求无关，会整批丢掉
+# 核心工具（且能力段不截断 → 误导 planner 优先选低阶能力）。现改为按与本次需求的
+# 相关度排序后截断，并把被裁掉的数量如实告知 planner。
+_PLAN_TOOL_LIST_LIMIT_ENV = os.getenv("PLAN_TOOL_LIST_LIMIT", "").strip()
+PLAN_TOOL_LIST_LIMIT = (int(_PLAN_TOOL_LIST_LIMIT_ENV)
+                        if _PLAN_TOOL_LIST_LIMIT_ENV.isdigit() else 60)
 
 
 def _sandbox_help(obj=None):
@@ -99,6 +128,104 @@ _SANDBOX_EXTRA_BUILTINS = {
     "delattr": delattr,
 }
 
+# ── 沙箱 import 边界（2026-09-14 决策）──────────────────────────────────────
+# 已**直接去掉 import 白名单**：executor 传 additional_authorized_imports=["*"]，
+# 所有 import 放行（os/shutil/socket/sqlite3 等均可）。
+# 破坏性操作不再靠沙箱提前堵死，改由 GuidedPythonExecutor._scan_dangerous()
+# 在执行前扫描 DANGEROUS_IMPORTS 并交用户确认。
+# 原 SANDBOX_AUTHORIZED_IMPORTS / SANDBOX_KNOWN_UNAVAILABLE 两个常量已删除（死代码）。
+
+
+def _sandbox_instructions() -> str:
+    """渲染执行环境说明段。
+
+    2026-09-14 决策：已去掉 import 白名单（executor 传 additional_authorized_imports=["*"]），
+    故本段**不再列举白/黑名单**（那段每步重发是上下文膨胀来源，实测多轮后 4 万 token）。
+    仅保留实测有效的防坑提示：① 沙箱只演示、完整源码在最终答复一次性给出；
+    ② break/continue 不能放进 try/except（本沙箱用异常实现循环控制）。
+    """
+    return (
+        # 2026-09-14：沙箱已去掉（import 全放行），不再列白/黑名单——那段每步重发，
+        # 是上下文膨胀的来源之一。仅保留实测有效的防坑提示。
+        "【执行环境】Python 标准库与已安装的第三方库均可 import（无白名单限制）。\n"
+        "沙箱内只做演示：有限次循环 + print 输出要点；完整源码在最终答复里一次性给出，"
+        "不要在沙箱内重复打印整份源码。\n"
+        "2026-09-14 实测：`break`/`continue` **不能放在 `try/except Exception` 里面**——"
+        "本沙箱用异常实现循环控制（BreakException 继承 Exception），会被你的 except 捕获 "
+        "⇒ 循环无法终止、同一逻辑反复执行。需要中途退出时，把 break 放在 try 块之外，"
+        "或改用函数返回值/标志位控制。\n"
+    )
+
+
+# 引擎级重数据自动落盘（2026-09-12）：provider 工具返回超过阈值时自动写入本次 run
+# 暂存区，观测只留"已落盘说明+预览"，完整数据由模型在沙箱内经 stage_read 读取再做计算
+# （阶段间可依赖，观测受控 → 上下文不膨胀）。阈值可经 TOOL_OUTPUT_STAGE_CHARS 调整。
+# 2026-09-14：默认 1500 过低——金融工具（指数/板块/资金流）动辄数千字符，几乎每次都
+# 触发落盘，逼模型多走一步 stage_read，还容易踩"返回类型变了"的坑。提到 6000
+# （与 CODE_MAX_PRINT_CHARS 同量级），只对真正的大结果落盘。仍可用环境变量调回。
+_TOOL_OUTPUT_STAGE_CHARS = int(os.getenv("TOOL_OUTPUT_STAGE_CHARS", "6000"))
+_auto_stage_seq = [0]
+
+
+def _wrap_stage_guard(fn, tool_name, scope):
+    """工具返回过大 → 自动 stage_write 落盘，返回占位 dict（F3 引擎级数据纪律）。
+
+    仅包 provider 工具函数（阶段白名单/领域/通用 + 能力）；暂存区三件套与技能工具
+    Tool 实例不受影响（stage_read 的大返回不必二次落盘）。scope 为空时不启作用。
+    """
+    if not scope:
+        return fn
+    import json as _json
+    _stage_write = stage_write  # 标准 import（infra.staging）
+    _stage_put_obj = stage_put_obj  # 活对象入库（跳过 str→json.loads 往返）
+
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        try:
+            # 仅用于量长度/预览；不再是存储内容（避免 str→json.loads 往返的解析坑）
+            if isinstance(result, (dict, list)):
+                text = _json.dumps(result, ensure_ascii=False, default=str)
+            else:
+                text = str(result)
+        except Exception:
+            return result
+        if len(text) <= _TOOL_OUTPUT_STAGE_CHARS:
+            return result
+        _auto_stage_seq[0] += 1
+        fname = ("auto-" + re.sub(r"[^A-Za-z0-9.-]", "-", str(tool_name))[:50]
+                 + "-%d.obj" % _auto_stage_seq[0])
+        try:
+            if _stage_put_obj is None:
+                return {"note": "[暂存区不可用] %s 结果 %d 字符超出阈值(%d)" % (
+                    tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS),
+                    "preview": text[:1200]}
+            ok = _stage_put_obj(scope, fname, result)
+        except Exception as e:
+            return {"note": "[%s] 结果过大且暂存失败: %s" % (tool_name, e),
+                    "preview": text[:1200]}
+        if ok:
+            # 2026-09-14（修订）：结果以**活对象**入库（stage_put_obj），跳过 str→json.loads。
+            # 取回用 stage_get_obj(scope, fname) 直接拿回原对象，无需解析——
+            # 根除此前连撞 TypeError(unhashable)/IndexError/AttributeError 的绕路。
+            return {
+                "staged": True,
+                "file": fname,
+                "scope": scope,
+                "chars": len(text),
+                "python_type": type(result).__name__,
+                "note": ("[%s] 结果 %d 字符超出阈值(%d)，已存入内存对象区（非字符串）。"
+                         "取回方式：obj = stage_get_obj('%s', '%s') —— 它**直接返回活对象**，"
+                         "无需 json.loads，可直接当 %s 用（如 obj.items()/索引）。"
+                         "不要用 stage_read（那是字符串路径）；也不要 print 整个对象。"
+                         % (tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS,
+                            scope, fname, type(result).__name__)),
+                "preview": text[:800],
+            }
+        return {"note": "[暂存区不可用] %s 结果 %d 字符超出阈值(%d)" % (
+            tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS), "preview": text[:1200]}
+
+    return wrapper
+
 
 def _load_plan_template() -> str:
     global _PLAN_TEMPLATE
@@ -126,6 +253,8 @@ def _normalize_phases(raw, available_names: set) -> list:
       - id 重排为 1..n；总数为 PLAN_MAX_PHASES 截断
       - tools 只保留 provider 中真实存在的名字（LLM 幻觉名丢弃并记入 tools_dropped）
       - on_fail ∈ {retry,replan,abort}（默认 retry）；max_retries 钳制 [0,3]
+      - step_budget 钳制 [0,PLAN_PHASE_MAX_STEPS]，0 = 未指定（执行侧回退全局 step_budget）
+      - internal_plan ∈ {True,False,None}；None = 未指定（执行侧按阶段预算判复杂度兜底）
       - goal 为空的条目跳过；非 list / 全空 → 返回 []（调用方回退单段执行旧路径）
     易错点：
       - 纯函数（不 import provider），名称集合由调用方传入，便于单测
@@ -168,6 +297,19 @@ def _normalize_phases(raw, available_names: set) -> list:
             acc = [acc]
         if not isinstance(acc, list):
             acc = [str(acc)]
+        # 阶段级步数预算（2026-09-13 契约补全）：plan_system 早已承诺"多阶段按每阶段 3~7 步
+        # 分别给"，但契约里一直没这个字段，执行侧只能用全局 step_budget → 阶段间预算无法
+        # 区分（审计 G3）。0 = 未指定，执行侧回退全局；上界比顶层（20）更紧，阶段粒度更细。
+        try:
+            pbudget = int(p.get("step_budget") or 0)
+        except (TypeError, ValueError):
+            pbudget = 0
+        pbudget = max(0, min(PLAN_PHASE_MAX_STEPS, pbudget))
+        # 内部 planner 开关（2026-09-13）：由外部 planner 显式声明本阶段是否需要执行器
+        # 内部细化规划。旧实现用 selected_skill 判断（技能层清空后恒真 → 内部 planner 常开），
+        # 职责错位（审计 G2）。None = 未声明，执行侧按阶段预算判复杂度兜底。
+        _ip = p.get("internal_plan", None)
+        internal_plan = bool(_ip) if isinstance(_ip, (bool, int)) else None
         out.append({
             "id": len(out) + 1,
             "name": (str(p.get("name") or "").strip() or f"阶段{len(out) + 1}")[:40],
@@ -175,11 +317,72 @@ def _normalize_phases(raw, available_names: set) -> list:
             "tools": tools,
             "tools_dropped": dropped,
             "deliverable": p.get("deliverable") or "",
+            "step_budget": pbudget,
+            "internal_plan": internal_plan,
             "acceptance": [str(a)[:300] for a in acc][:8],
             "on_fail": on_fail,
             "max_retries": mr,
         })
     return out
+
+
+def _normalize_plan_tools(raw, available_names: set) -> tuple:
+    """把 _plan 输出的**顶层** tools 规格化为"附加点名"名单（2026-09-13）。
+
+    为什么需要这条通道（能力层断链根因）：
+      capabilities 层（CAPABILITY_DOMAIN）刻意不属于任何可选域，其唯一注入途径曾是
+      `phases[].tools` —— 而 phases 是编排契约，简单任务本来就不拆阶段，于是"没有阶段
+      就没有点名通道"，能力层对这些任务永久不可见（prompt 里已如实写明"无 phases 的
+      单段任务用不了能力"）。把"工具可见性"耦合到"编排结构"上是设计错位：
+      本函数为单段任务补一条与阶段解耦的点名通道。
+
+    与 phases[].tools 的语义差异（关键，勿混用）：
+      - phases[].tools = **独占白名单**：只注入点名的工具（阶段内工具面刻意收窄）；
+      - 顶层 tools     = **附加点名**：在 selected_domain 的基调（域+通用）之上做并集，
+                        不会挤掉域工具。典型用途：点名取数能力（all_codes/daily/
+                        list_signals…），也可点名其他域的单个工具。
+    两者同时出现时以 phases 为准（单段通道不生效），避免静默放宽每个阶段的工具面。
+
+    Returns:
+        (tools, dropped)：tools 去重且只保留 available_names 内的名字；
+        dropped 为不存在的名字（调用方负责告警——点名落空必须可见，否则重演
+        "planner 以为能用 / 执行时 Forbidden"的静默断链）。
+    """
+    if isinstance(raw, str):
+        # LLM 偶尔把数组写成逗号串（"daily,all_codes"），按逗号拆开以免整串落空
+        raw = [x for x in raw.split(",")]
+    if not isinstance(raw, list):
+        return [], []
+    tools, dropped = [], []
+    for t in raw:
+        t = str(t).strip()
+        if not t:
+            continue
+        if t in available_names:
+            if t not in tools:
+                tools.append(t)
+        else:
+            dropped.append(t)
+    return tools, dropped
+
+
+def _capability_names(provider) -> list:
+    """列出 provider 中数据能力层（CAPABILITY_DOMAIN）的工具名（2026-09-13）。
+
+    能力视图注入（_plan 的 planner 提示）与"能力是否可达"的观测信号共用本函数，
+    避免两处各写一遍来源层过滤而漂移（来源层标记的单一事实源见 capabilities/loader）。
+    """
+    if not provider:
+        return []
+    try:
+        from capabilities.loader import CAPABILITY_DOMAIN
+    except Exception:
+        return []
+    try:
+        return sorted(n for n in provider.get_tool_names()
+                      if provider.get_domain(n) == CAPABILITY_DOMAIN)
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -800,6 +1003,8 @@ class TaskAgent(AgentBase):
               "selected_domain": str,
               "step_budget": int,
               "planning_interval": int,
+              "phases": list,       # [] = 单段执行旧路径
+              "plan_tools": list,   # 顶层附加点名单（有 phases 时恒为 []，见 _normalize_plan_tools）
             }
         """
         # 构建技能描述（含权重 + SKILL.md 执行流程）
@@ -834,29 +1039,31 @@ class TaskAgent(AgentBase):
         # 注入可用域和工具名列表，让规划器知道 CodeAgent 能调什么
         tools_hint = ""
         if self._tool_provider:
-            # 可用域列表（子目录名）
-            domains = sorted(set(
-                d for d in self._tool_provider._domains.values() if d != "common"
-            ))
+            # 可用域 = 由 tools/<子目录> 推导的可选域（2026-09-13）。
+            # 不再从 _domains 反推：那会把能力层等"来源层标记"也算成可选域，
+            # 出现"finance / quant 两个都像金融域、选任一都丢掉另一半工具"的问题。
+            domains = self._tool_provider.get_domains()
             if domains:
                 tools_hint += f"\n\n可用工具域：{', '.join(domains)}"
                 tools_hint += "\n（domain 为空时仅加载通用工具，指定域时加载域+通用工具）"
             # 上限 30→60（2026-09-12 B 阶段）：phase.tools 白名单要求 planner 看到足量
             # 工具名——截断会让清单外的真实工具被误判为不存在；名称短，token 开销可控。
             # 预扫（2026-09-12 Q4）：签名清单替代裸名列表——planner 直接写对参数
-            _sig_text = prescan_tools(self._tool_provider, limit=60)
+            _sig_text = prescan_tools(
+                self._tool_provider,
+                limit=PLAN_TOOL_LIST_LIMIT,
+                query=user_input,
+            )
             if _sig_text:
                 tools_hint += "\n\n可用工具（CodeAgent 可直接调用，含参数签名）：\n" + _sig_text
             # 能力视图（2026-09-12 Q5）：准入数据能力单独成段——能力清单是外部 planner
-            # 做细致分析的原料；段内排序稳定，planner 可直接把能力名写进 phases[].tools
+            # 做细致分析的原料；段内排序稳定，planner 可直接点名（通道见 _normalize_plan_tools）。
+            # 2026-09-13：改按来源层标记过滤（此前是虚构域 "quant"，与 tools/finance
+            # 并列互斥，见 capabilities/loader.CAPABILITY_DOMAIN）；同时删除原先
+            # 计算后从未使用的 _cap_text = prescan_tools(...)（每次 plan 白扫一遍全量工具）。
             try:
-                _cap_names = sorted(
-                    n for n in self._tool_provider.get_tool_names()
-                    if self._tool_provider.get_domain(n) == "quant"
-                )
+                _cap_names = _capability_names(self._tool_provider)
                 if _cap_names:
-                    _cap_text = prescan_tools(self._tool_provider, limit=0, per_item=140)
-                    # prescan_tools 不支持按域过滤——手动组装 quant 段
                     _cap_lines = []
                     for _n in _cap_names:
                         _fn = self._tool_provider.get(_n)
@@ -870,7 +1077,9 @@ class TaskAgent(AgentBase):
                             _sig = _n + "(…)"
                         _doc = (inspect.getdoc(_fn) or "").strip().split("\n")[0][:100]
                         _cap_lines.append("  %s — %s" % (_sig, _doc))
-                    tools_hint += ("\n\n数据能力（domain=quant，准入数据接口，可直接调用）：\n"
+                    tools_hint += ("\n\n数据能力（底层取数函数，不属于任何工具域；必须点名才注入，"
+                                   "未点名调用即失败。点名通道：有 phases → 写进该阶段 tools；"
+                                   "无 phases（单段任务）→ 写进顶层 tools）：\n"
                                    + "\n".join(_cap_lines))
             except Exception as _e:
                 logger.debug("[Plan] 能力视图注入跳过: %s", _e)
@@ -921,7 +1130,10 @@ class TaskAgent(AgentBase):
         except (TypeError, ValueError):
             step_budget = 10
         step_budget = max(1, min(20, step_budget))
-        planning_interval = max(step_budget // 2 + 1, 6)
+        # 内部规划步距（2026-09-12 Q7+B 后修正）：旧公式 max(budget//2+1,6) 在预算 4~6
+        # 时 interval=6 > 预算 → 内部 planner 全程不触发（"没细化"）。改为与预算匹配：
+        # 预算小则 interval 小（2 保底），预算大时最多 6 步一复盘（多轮影响可用更小值压测）。
+        planning_interval = max(2, min(step_budget // 2, 6))
 
         # 从 plan 结果中提取选中的技能名
         selected_skill = plan.get("selected_skill") or plan.get("skill") or None
@@ -935,11 +1147,9 @@ class TaskAgent(AgentBase):
         selected_domain = ""
         if not selected_skill:  # 技能模式不加载域工具
             selected_domain = plan.get("selected_domain") or plan.get("domain") or ""
-            # 校验域是否真实存在
+            # 校验域是否真实存在（可选域由 tools/<子目录> 推导，来源层标记不算域）
             if selected_domain and self._tool_provider:
-                available_domains = set(
-                    d for d in self._tool_provider._domains.values() if d != "common"
-                )
+                available_domains = set(self._tool_provider.get_domains())
                 if selected_domain not in available_domains:
                     logger.warning("[TaskAgent] plan 选择了不存在的域 '%s'，忽略", selected_domain)
                     selected_domain = ""
@@ -967,6 +1177,32 @@ class TaskAgent(AgentBase):
                 logger.warning("[TaskAgent] phase 白名单丢弃不存在的工具名 %d 个: %s",
                                dropped_total, [t for p in phases for t in p["tools_dropped"]][:10])
 
+        # 单段附加点名（2026-09-13，修"能力层断链"）：phases[].tools 只在有阶段时存在，
+        # 而无阶段任务原本没有任何点名通道 → capabilities（刻意不属于任何可选域）永远
+        # 注入不到，planner 提示里却展示着能力清单。顶层 tools 补上这条与阶段解耦的通道，
+        # 语义为"在 selected_domain 基调之上做并集"（不是白名单，见 _normalize_plan_tools）。
+        # 与 phases 同时出现时以 phases 为准：不把顶层名单静默并进每个阶段（会放宽阶段工具面）。
+        raw_plan_tools = plan.get("tools")
+        plan_tools, _pt_dropped = _normalize_plan_tools(raw_plan_tools, available_names)
+        if _pt_dropped:
+            logger.warning("[TaskAgent] 顶层 tools 丢弃不存在的工具名 %d 个: %s",
+                           len(_pt_dropped), _pt_dropped[:10])
+        if plan_tools and phases:
+            logger.info("[TaskAgent] 顶层 tools(%d 个) 因存在 phases 契约而不生效（按阶段白名单执行）",
+                        len(plan_tools))
+            plan_tools = []
+        elif plan_tools:
+            logger.info("[TaskAgent] 顶层 tools 附加点名 %d 个: %s",
+                        len(plan_tools), plan_tools[:12])
+
+        # 能力可达性观测（2026-09-13）：能力不属于任何可选域，只有被点名才注入。
+        # 既无 phases 又无顶层 tools 的 run 必然用不到能力层——如实记录，避免
+        # "提示里展示了能力、执行时无从调用"再次成为静默断链（本项目高发问题）。
+        _cap_set = set(_capability_names(self._tool_provider))
+        _cap_named = sorted((set(plan_tools) | {t for p in phases for t in p["tools"]}) & _cap_set)
+        if _cap_set and not _cap_named:
+            logger.info("[TaskAgent] 本次未点名数据能力（%d 个可用）→ 能力层不可达", len(_cap_set))
+
         logger.info("[TaskAgent] plan: task=%s..., skill=%s, domain=%s, step_budget=%d",
                      task[:80], selected_skill, selected_domain or "(通用)", step_budget)
         trace.record("plan_result", {
@@ -976,6 +1212,8 @@ class TaskAgent(AgentBase):
             "selected_domain": selected_domain,
             "step_budget": step_budget,
             "planning_interval": planning_interval,
+            "plan_tools": plan_tools,
+            "capabilities_named": _cap_named,
         })
         if phases:
             # 契约全文入 trace（供晋升闭环聚合与 T+N 对账）
@@ -988,6 +1226,7 @@ class TaskAgent(AgentBase):
             "step_budget": step_budget,
             "planning_interval": planning_interval,
             "phases": phases,
+            "plan_tools": plan_tools,
         }
 
 
@@ -1152,7 +1391,7 @@ class TaskAgent(AgentBase):
 
         # ── 创建定时任务 ──────────────────────────────────
         try:
-            from cron.cron_tools import create_cron_job
+            # create_cron_job 已通过标准 import（cron.cron_tools）
 
             # 提取任务名（取前20字）
             name = content[:20]
@@ -1200,6 +1439,8 @@ class TaskAgent(AgentBase):
         domain: str = "",
         tools: list | None = None,
         step_event_cb=None,
+        run_scope: str | None = None,
+        extra_tools: list | None = None,
     ):
         """构建 smolagents CodeAgent 实例。
 
@@ -1209,60 +1450,102 @@ class TaskAgent(AgentBase):
         domain: 领域名，用于过滤工具。
         tools: phase 工具白名单（2026-09-12 B 阶段）。非空→只注入白名单内的 provider 工具；
             空或 None→回退 domain 逻辑（调用方传 domain="" 时回退为仅通用工具）。
+        run_scope: 本次 run 的暂存区 scope（2026-09-12 F3）——非 None 时，provider
+            工具返回超过阈值会自动 stage_write 落盘，观测只留占位 + 预览。
+        extra_tools: 单段路径的**附加点名**（2026-09-13，修能力层断链）。与上面三支的
+            "基调"是并集而非替代——phases[].tools 才是独占白名单；tools 非空时本参数不生效。
+            用途：无阶段的单段任务点名取数能力（capabilities 不属于任何可选域，不点名注入不到）。
 
         工具架构：
           - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]
           - 领域工具 + 通用工具 → executor.custom_tools（通过 ToolProvider 注入）
           - 技能工具 → executor.custom_tools
           - phase 白名单（tools 非空）→ 只注入白名单内的 provider 工具
+          - 附加点名（extra_tools，仅 tools 为空时）→ 并进 domain/common 基调
           - 全量工具 schema → planning YAML {{tool_list}}（供 smolagents 内部 planning 选工具）
+
+        注入沙箱必须在 tool_functions **最终确定之后**（2026-09-14，L16）：
+        `_wrap_stage_guard` 与 breaker 包装都会**重新绑定**这个名字（是重新赋值，不是
+        原地改）。若在绑定前把旧 dict 交给 `executor.custom_tools`，executor 持有的就是
+        旧表 ⇒ 任务书写着这些工具、`list_tools()` 也列得出、日志也打印"已注入 N 个"，
+        **但沙箱里一个都调不到**，调用即被误报成"幻觉调用"。日志现同时打印
+        "沙箱实持 M 个"——N 与 M 不一致即注入错位。
+        更进一步（2026-09-14 二次复发后）：光修时机不够，还要修**路径**——业务工具走
+        `custom_tools` 是 smolagents 的**次路径**（主要为代码里 def 出来的函数服务），
+        官方主路径是 `send_tools → static_tools`，`evaluate_call` 也先查 static_tools。
+        现 `GuidedPythonExecutor` 在每次 `__call__` 前把 custom_tools 并入 static_tools，
+        **不再依赖任何注入时序**。凡"工具能否调到"的问题，一律以官方主路径为准。
         """
         from smolagents import CodeAgent as SmolCodeAgent
         from smolagents.local_python_executor import LocalPythonExecutor
         from smolagents.memory import ActionStep
 
-        # ── 工具函数：phase 白名单 / domain 过滤 + 技能工具 ──
+        # ── 工具函数：phase 白名单 / domain 过滤 + 附加点名 + 技能工具 ──
         # phase 白名单（2026-09-12 B 阶段，审计自 qd_traces）：tools 非空时只注入白名单工具，
         # 补救通道 = smol_tools 的 search_tools/list_tools（只读探查，不产生调用能力）。
+        # 附加点名（2026-09-13）：只在非白名单模式（单段路径）生效，与基调做并集，
+        # 不改变"domain 决定基调"的既有语义（见 extra_tools 说明）。
+        _extra = {str(t) for t in (extra_tools or [])} if not tools else set()
         if tools:
             allowed = set(str(t) for t in tools)
             tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
             logger.info("[TaskAgent] phase 白名单：加载 %d 个工具 %s", len(tool_functions),
                         sorted(tool_functions)[:12])
         elif domain:
-            # 指定域：域工具 + 通用工具
-            allowed = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
+            # 指定域：域工具 + 通用工具（+ 附加点名）
+            allowed = set(provider.list_by_domain("common") + provider.list_by_domain(domain)) | _extra
             tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
-            logger.info("[TaskAgent] domain='%s'，加载 %d 个工具（通用+%s）", domain, len(tool_functions), domain)
+            logger.info("[TaskAgent] domain='%s'，加载 %d 个工具（通用+%s%s）", domain, len(tool_functions),
+                        domain, f"+附加点名{len(_extra)}" if _extra else "")
         else:
-            # 无域：仅通用工具
-            allowed = set(provider.list_by_domain("common"))
+            # 无域：仅通用工具（+ 附加点名）
+            allowed = set(provider.list_by_domain("common")) | _extra
             tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
-            logger.info("[TaskAgent] 无域，加载 %d 个通用工具", len(tool_functions))
+            logger.info("[TaskAgent] 无域，加载 %d 个通用工具%s", len(tool_functions),
+                        f"（含附加点名 {len(_extra)}）" if _extra else "")
+
+        # 附加点名落空告警（2026-09-13）：点名了 provider 里不存在的名字 → 静默丢弃会让
+        # "planner 以为能用 / 执行时 Forbidden"的静默断链重演。命中与落空都如实入日志。
+        if _extra:
+            _hit = sorted(n for n in _extra if n in tool_functions)
+            _miss = sorted(n for n in _extra if n not in tool_functions)
+            if _hit:
+                logger.info("[TaskAgent] 附加点名生效 %d 个: %s", len(_hit), _hit[:12])
+            if _miss:
+                logger.warning("[TaskAgent] 附加点名落空 %d 个（provider 中不存在）: %s",
+                               len(_miss), _miss[:12])
 
         # 技能工具（私有，不和 tools/ 通用）
         for st in skill_tools:
             sname = getattr(st, "name", "unknown")
             tool_functions[sname] = st
 
-        # 暂存区工具常驻（2026-09-12）：任务书数据纪律要求跨阶段重数据用
-        # stage_write/stage_read/stage_list，但 phase 白名单模式会漏注入 → 模型按
-        # 说明调用即触发 Forbidden（误报"幻觉调用"）。三个工具与技能工具同级常驻。
-        _prov_fns = provider.get_functions() if provider else {}
-        for _stn in ("stage_write", "stage_read", "stage_list"):
-            if _stn in _prov_fns:
-                tool_functions.setdefault(_stn, _prov_fns[_stn])
+        # 暂存区工具常驻（2026-09-12 设计；2026-09-14 修接线）：任务书数据纪律要求
+        # 跨阶段重数据用 stage_write/stage_read/stage_list，但 phase 白名单模式会漏注入
+        # → 模型按说明调用即触发 Forbidden（误报"幻觉调用"）。三个工具与技能工具同级常驻。
+        #
+        # 原实现是"provider 里若已注册则补注入"，而 v2.0 把 staging 从 tools/ 迁到
+        # infra/ 后它不再被目录扫描注册（_SKIP_FILES 里仍留着迁移前的旧名
+        # "staging_tools"）→ 该条件恒假：三件套在沙箱里从未存在过，而引擎自动落盘
+        # （下方 _wrap_stage_guard）返回的却正是"用 stage_read(scope, name) 读取"、
+        # 任务书也写着"暂存区工具常驻可用"——又一次"声明了、没接上、静默"。
+        # 常驻就直连函数本体，不依赖 provider 的扫描结果（框架工具 ≠ 插件工具）。
+        for _stn, _fn in (("stage_write", stage_write), ("stage_read", stage_read),
+                          ("stage_list", stage_list), ("stage_get_obj", stage_get_obj)):
+            tool_functions.setdefault(_stn, _fn)
 
-        # final_answer
+        # final_answer：必须抛 FinalAnswerException，smolagents 据此判定 is_final_answer=True
         def _final_answer(answer=None, **kwargs):
-            return answer if answer is not None else kwargs
+            result = answer if answer is not None else kwargs
+            raise FinalAnswerException(result)
 
         # executor
         # 幻觉调用纠正（2026-09-12）：执行器错误信息带可用工具清单与修复指令
         # （Forbidden function evaluation → [幻觉调用拦截]+可用清单+二选一处理指引）
         # allowed 名单延迟解析：__call__ 出错时从 static_tools 动态收集（构造期
         # smol_tools 尚未定义——run5 教训）
-        executor = GuidedPythonExecutor(
+        executor_cls = GuidedPythonExecutor or LocalPythonExecutor
+        executor = executor_cls(
             # 生成代码可 import 的模块白名单（最小授权，2026-09-11 收紧，审计 P2）：
             # - os/sys/pathlib/importlib 移除：web_search 等工具返回的不可信文本可注入指令，
             #   让生成代码读文件/环境变量/任意模块。实证依据：agent_runs.jsonl 全量 1.4MB
@@ -1271,20 +1554,25 @@ class TaskAgent(AgentBase):
             # - stat 保留：A 股工具链生成代码常用 st.* 判别文件属性（若后续零使用可再收）。
             # - 收紧后若出现 "is not authorized" 类执行错误：先核对轨迹确认真实需求，
             #   按最小需要加回，禁止整表回滚。
-            additional_authorized_imports=[
-                "json", "datetime", "math", "re", "collections", "itertools",
-                "concurrent.futures", "queue", "time", "unicodedata", "stat",
-                "statistics", "random",
-                "skills", "skills.*",
-            ],
+            # 2026-09-14 改为"能力开放 + 用户确认"：破坏性模块**也**放进白名单，
+            # 否则 smolagents 的 AST 检查会先拒绝，根本走不到确认环节；真正的把关在
+            # GuidedPythonExecutor._scan_dangerous + _approve（执行前先征求用户同意，
+            # 非交互环境且无回调时一律拒绝）。
+            # 2026-09-14 用户决策：**直接去掉沙箱**，能力全开；审批层待功能完善后再加。
+            # smolagents 的 check_import_authorized 支持 "*" 通配符
+            # （local_python_executor.py:375），传 "*" 即放行所有 import，不再有白名单约束。
+            # 风险已向用户说明（web_search 提示注入 / LLM 误操作），用户明确接受。
+            additional_authorized_imports=["*"],
             additional_functions={
             "final_answer": _final_answer,
             # 内置补全（2026-09-12）：见 _SANDBOX_EXTRA_BUILTINS（repr/format/hash…）
             **_SANDBOX_EXTRA_BUILTINS,
         },
+            # 打印上限收紧（2026-09-12 F4）：smolagents 默认 50k 字符/步——生成代码
+            # 打印全量表/整段序列会把上下文撑爆。降到 6000（CODE_MAX_PRINT_CHARS 可调），
+            # 配合 F3 自动落盘：大数据进暂存区，打印只留要点。
+            max_print_outputs_length=int(os.getenv("CODE_MAX_PRINT_CHARS", "6000")),
         )
-        executor.custom_tools = tool_functions
-
         # 过程事件钩子（2026-09-11 SSE 改造）：smolagents 在每个 step 结束时调用
         # callback(memory_step, agent=self)。把 ActionStep 的代码动作/工具产出转成
         # 轻量事件 dict 交给 cb（SSE 层入队）。cb 必须绝不抛异常、不阻塞执行——
@@ -1337,21 +1625,89 @@ class TaskAgent(AgentBase):
         _evt_hook = _make_step_event_hook(step_event_cb)
         # 注意：_truncate_observations 定义在本函数后段（SmolCodeAgent 构造前），
         # 此处不能引用——回调列表在构造参数处内联组装。
-        # 工具失败熔断（2026-09-12）：坏工具/坏数据源连续失败 ≥2 次 → 短路，
-        # 防止执行器反复重试同一坑烧爆步数（run3/run4 实证：资金流接口宕机时
-        # 每轮 5~10 步耗在注定失败的调用上）。断路器按 agent 实例隔离，
-        # 阶段重试复用同一实例 → 熔断状态延续。
+        # 工具失败熔断（2026-09-12 + 2026-09-13 动态加载）：
+        # 坏工具/坏数据源连续失败 ≥2 次 → 短路，防止执行器反复重试同一坑烧爆步数。
+        # 熔断包装：跳过熔断包装，工具正常调用。
         if not hasattr(self, "_tool_breaker"):
-            self._tool_breaker = ToolCircuitBreaker(threshold=2)
-        tool_functions = {
-            name: self._tool_breaker.wrap(name, fn)
-            for name, fn in tool_functions.items()
-        }
+            self._tool_breaker = _global_breaker
+        # 引擎级重数据落盘（F3）：provider 工具函数按返回大小自动入暂存区。
+        # 跳过暂存区三件套（自身返回小 / stage_read 大返回无需二次落盘）；技能工具是
+        # Tool 实例而非纯函数，json.dumps 探测无意义，一并跳过（文档读取内容受控）。
+        _staged_names = ("stage_write", "stage_read", "stage_list")
+        for _n in list(tool_functions.keys()):
+            if _n in _staged_names or not inspect.isfunction(tool_functions[_n]):
+                continue
+            tool_functions[_n] = _wrap_stage_guard(tool_functions[_n], _n, run_scope)
+        if hasattr(self, "_tool_breaker"):
+            tool_functions = {
+                name: self._tool_breaker.wrap(name, fn)
+                for name, fn in tool_functions.items()
+            }
 
-        logger.info("[TaskAgent] executor 已注入 %d 个工具函数", len(tool_functions))
+        # ── 注入沙箱（必须在 tool_functions **最终确定之后**）──
+        # 上方 `_wrap_stage_guard` 与 breaker 包装都可能**重新绑定** tool_functions
+        # （1629 行是重新赋值而非原地改），若在绑定前把旧 dict 交给 executor，executor
+        # 持有的就是那张旧表 ⇒ 任务书写着这些工具、`list_tools()` 也列得出、日志也打印
+        # "已注入 N 个"，但沙箱里一个都调不到，调用即被误报成"幻觉调用"
+        # （2026-09-14 L16 事故：phase 白名单 6 个工具 + 暂存区三件套全部调不动，
+        #   模型只能按提示改用纯 Python 硬算）。旧注入点在 executor 创建处，已移到这里。
+        # 登记权威工具表：executor 会在**每次执行前**重装它们。
+        # 阶段重试（复用 CodeAgent）会清空 custom_tools / state，只注入一次必然复发
+        # （详见 GuidedPythonExecutor.install_tools 的实证说明）。
+        try:
+            executor.install_tools(tool_functions)
+        except Exception as e:
+            logger.warning("[TaskAgent] install_tools 不可用（回退直接赋值）: %s", e)
+            executor.custom_tools = tool_functions
+
+        # 双保险：再用官方 `send_variables` 把同一批工具注入沙箱**全局 state**。
+        # `evaluate_call` 的查找顺序是 state → static_tools → custom_tools
+        # （local_python_executor.py:847-855），state 优先级最高，且**不会被
+        # send_tools 重置**（send_tools 只动 static_tools）。custom_tools 这条次路径
+        # 已经让"工具调不到"复发了三次，state 是官方且更靠前的一档。
+        try:
+            executor.send_variables(tool_functions)
+        except Exception as e:
+            logger.warning("[TaskAgent] 工具注入 state 失败（退化为仅 custom_tools）: %s", e)
+
+        # 日志同时打印沙箱**实际持有**的数量——只打印 len(tool_functions) 会在上述
+        # 错位时给出误导数字（这是本次事故排查被带偏的直接原因）。
+        logger.info("[TaskAgent] executor 已注入 %d 个工具函数（沙箱实持 custom=%d state=%d）",
+                    len(tool_functions),
+                    len(getattr(executor, "custom_tools", {}) or {}),
+                    len(getattr(executor, "state", {}) or {}))
 
         # ── 必选工具：注册为 smolagents Tool，放入 tools=[] ──
-        # smolagents 自动在 system prompt 中描述这些工具，LLM 天然知道可以用
+        # 注意：tools= 在本项目下**不会**"随 system prompt 下发工具描述"（原因与
+        # 更正说明见下方 smol_tools 定义处）。它只决定"沙箱内可调用 + 以 BaseTool
+        # 形态被调用"。LLM 认识这些工具名的通道是 prompts/code_agent.yaml 的正文/
+        # 示例与 planning 段注入的 provider schema。
+
+        class FinalAnswerTool(SmolToolBase):
+            """把"调用 final_answer 即终止任务"这条契约以 Tool 形态表达一次。
+
+            注意：它**不负责**让 LLM 知道 final_answer 的存在（本项目下 tools= 的
+            描述不会进 system prompt，见下方 smol_tools 处的更正说明）；LLM 的认知
+            来自 prompts/code_agent.yaml 正文与示例。
+
+            forward 抛 FinalAnswerException（由 evaluate_python_code 捕获并设置
+            is_final_answer=True），而非真正返回。这样 smolagents 才知道任务结束了。
+            """
+            skip_forward_signature_validation = True
+            name = "final_answer"
+            description = (
+                "结束任务并返回最终答案。调用后任务立即结束——"
+                "只在你确定已有足够信息来回答用户时才调用。"
+            )
+            output_type = "string"
+            inputs = {
+                "answer": {"type": "string", "description": "最终答案内容"},
+            }
+
+            def forward(self, answer: str = "", **kwargs):
+                # 抛异常而非返回值——smolagents 据此判定 is_final_answer
+                raise FinalAnswerException(answer)
+
         class _SearchToolsTool(SmolToolBase):
             skip_forward_signature_validation = True
             name = "search_tools"
@@ -1363,6 +1719,24 @@ class TaskAgent(AgentBase):
             }
             def forward(self, query: str = "", domain: str = "", **kwargs):
                 return provider.search_tools(query, domain)
+
+        def _sig(fn) -> str:
+            """工具的完整签名（含默认值）。
+
+            2026-09-14 实证：模型为确认 `get_market_indices` 有没有参数，写了
+            `import inspect; inspect.signature(get_market_indices)`，撞 import 白名单、
+            白烧一步。签名在**宿主侧**算好随 list_tools 给出，模型就不必去探——
+            比把 inspect 放进沙箱白名单更安全，也更省一步。
+            """
+            try:
+                # eval_str=True：把 `from __future__ import annotations` 造成的字符串化
+                # 注解（code: 'str' = ''）解析回可读形式（code: str = ''）。
+                try:
+                    return str(inspect.signature(fn, eval_str=True))
+                except Exception:
+                    return str(inspect.signature(fn))
+            except Exception:
+                return "(...)"
 
         class _ListToolsTool(SmolToolBase):
             skip_forward_signature_validation = True
@@ -1383,7 +1757,8 @@ class TaskAgent(AgentBase):
                     for _n in tools:
                         _fn = provider.get(_n)
                         _desc = (getattr(_fn, "__doc__", "") or "").strip().split("\n")[0][:100]
-                        lines.append(f"  - {_n} — {_desc}" if _desc else f"  - {_n}")
+                        lines.append(f"  - {_n}{_sig(_fn)} — {_desc}" if _desc
+                                     else f"  - {_n}{_sig(_fn)}")
                     lines.append("（另：stage_write/stage_read/stage_list 暂存区工具常驻可用）")
                     return "\n".join(lines)
                 if not domain:
@@ -1402,8 +1777,11 @@ class TaskAgent(AgentBase):
                 "max_items": {"type": "integer", "description": "最多显示的项数", "nullable": True},
             }
             def forward(self, result=None, max_depth: int = 3, max_items: int = 20, **kwargs):
-                from tools.format_utils import format_result
-                return format_result(result, max_depth, max_items)
+                # 通过 provider 获取（业务工具，非 infra）
+                fmt_fn = provider.get("format_result") if provider else None
+                if fmt_fn is None:
+                    return str(result)[:2000]  # 降级：直接转字符串
+                return fmt_fn(result, max_depth, max_items)
 
         class _WebSearchTool(SmolToolBase):
             skip_forward_signature_validation = True
@@ -1416,13 +1794,50 @@ class TaskAgent(AgentBase):
                 "freshness": {"type": "string", "description": "时效性过滤", "nullable": True},
             }
             def forward(self, query: str = "", count: int = 8, freshness: str = "", **kwargs):
-                from tools.web_search_tools import web_search
-                return web_search(query, count, freshness)
+                # 通过 provider 获取（业务工具，非 infra）
+                web_fn = provider.get("web_search") if provider else None
+                if web_fn is None:
+                    return {"error": "web_search 工具不可用"}
+                # 消毒在**真正的实现**里做（tools/web_search_tools.py 的 _sanitize_result），
+                # 不在本包装层——否则两处都消毒会叠加成双重注释前缀。
+                return web_fn(query, count, freshness)
 
-        # 技能工具并入 smol_tools（2026-09-12）：custom_tools 不进入模型可见提示，
-        # 执行器对技能函数只能"猜参数"（CLI 实测连环 TypeError 烧步数）。
-        # 放入 tools= 后，名称/签名/说明随系统提示下发（与 search_tools 等并列）。
-        smol_tools = [_SearchToolsTool(), _ListToolsTool(), _FormatResultTool(), _WebSearchTool()]
+        # ── tools= 在本项目的真实作用（2026-09-14 更正误判）────────────────────
+        # smolagents 里 tools= 有两个作用，本项目只吃到 ①：
+        # ①【生效｜沙箱可调用】run 启动时随 send_tools 注入执行器
+        #    （smolagents agents.py:492）⇒ 沙箱内可调用，且以 BaseTool 形态被调用：
+        #    BaseTool.__call__ 会把"单个 dict 且键名匹配 inputs"的入参自动展开成
+        #    kwargs（smolagents tools.py:231-246）⇒ 这正是技能工具从 custom_tools
+        #    挪进 tools= 的真实收益（模型把参数打包成 dict 传参时不再直接
+        #    TypeError 烧步数）。技能工具并入 smol_tools（2026-09-12）保留。
+        # ②【不生效｜随提示下发描述】smolagents 默认模板里有
+        #    `{% for tool in tools %}{{ tool.to_code_prompt() }}` 渲染块
+        #    （.venv/.../smolagents/prompts/code_agent.yaml:132-137）；而本项目用
+        #    prompts/code_agent.yaml **整体覆盖**了 system_prompt（见本函数下文
+        #    agent.prompt_templates.update(custom_templates)），该模板里**没有**
+        #    这个渲染块 ⇒ 放进 smol_tools 的工具描述不会进入 LLM 提示
+        #    （2026-09-14 实测：用该模板 + 桩 tool 渲染，结果不含工具描述）。
+        # ③【因此】LLM 能认识 search_tools / final_answer / 技能工具的名字，通道是
+        #    prompts/code_agent.yaml 正文与示例 + planning 段注入的 provider schema
+        #    （`{{tool_list}}` 只出现在 planning.*，且填的是 provider 工具，不含
+        #    smol_tools）。**不要再假设"加进 smol_tools 模型就能看见"**；若确实想让
+        #    工具描述进系统提示，必须改 system_prompt 模板——那是行为变更，需先评审。
+        #
+        # ── final_answer 接线（必要条件只有两条，均已满足，不要重复"再改一次"）──
+        #   a. 执行器侧：additional_functions["final_answer"] = _final_answer，且
+        #      _final_answer **抛** FinalAnswerException（定义见本函数上文）。
+        #   b. 提示侧：prompts/code_agent.yaml 正文与示例已硬编码 `final_answer(...)`
+        #      的用法与"最后用它返回"的纪律。
+        # 下方的 FinalAnswerTool 在 CodeAgent 下**不是**必需条件（历史注释"不加就不
+        # 结束"属误判）：它的 forward 抛同一个异常，作用是把该契约同时表达为 Tool
+        # 形态，使 ToolCallingAgent 形态下也能正确终止。保留即可。
+        smol_tools = [
+            _SearchToolsTool(),
+            _ListToolsTool(),
+            _FormatResultTool(),
+            _WebSearchTool(),
+            FinalAnswerTool(),
+        ]
         smol_tools += list(skill_tools or [])
 
         # 阶段内局部记忆（保留最近 2 步完整，更早步骤压缩，防止重试/长阶段 token 爆炸）
@@ -1452,15 +1867,116 @@ class TaskAgent(AgentBase):
                     if hasattr(step, 'observations_images') and step.observations_images:
                         step.observations_images = None
 
+        # 观察层「空输出」歧义修正（2026-09-14 CLI 实测查出的不收尾头号诱因）：
+        # 本步代码只 print() 无 return 时，smolagents 把 observation 末行写成
+        # `Last output from code snippet:` + `None`（agents.py:1752-1754 对
+        # code_output.output 做 str(None)）。该 None 的真实语义只是「本步代码没有
+        # return 值」，但模型会读成「上一步什么都没产出」→ 从头重写整份代码 →
+        # 探索型死循环把步数烧光（实测「写跑马灯」：Step1 已跑出完整结果，仍重写
+        # 3 次、全程 0 次 final_answer，token 单调膨胀 in 3884→7943 / out 7768→15888）。
+        # 修法：只把该行补成语义明确的说明，不动任何行为契约——print 的日志本就在
+        # 上方 Execution logs 中完整列出，模型可直接引用。
+        def _clarify_empty_output(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
+            obs = getattr(memory_step, "observations", None)
+            if not isinstance(obs, str):
+                return  # PlanningStep / 异常路径不含该行，跳过
+            marker = "Last output from code snippet:"
+            idx = obs.rfind(marker)
+            if idx == -1:
+                return
+            if obs[idx + len(marker):].strip() != "None":
+                return
+            memory_step.observations = (
+                obs[:idx + len(marker)]
+                + "\nNone ← 本行仅表示「本步代码没有 return 值」，不代表本步没有产出："
+                  "print() 的输出已完整列在上方 Execution logs 中，可直接引用。"
+            )
+
+        # ── C 护栏层·确定性收尾（2026-09-14）──
+        # A（`_clarify_empty_output`）治"把 None 误判成没产出"，B（交付物铁律）治
+        # "不知道交付物该放哪个参数"。C 是两者都没拦住时的兜底：把"跑满 N 步 →
+        # `_handle_max_steps_reached` 再额外调一次 LLM 强制收尾"压成"主动退出"。
+        #
+        # 判据为什么是「代码重复」而不是「没调 final_answer」：后者会把正常的多步任务
+        # （取数 → 计算 → 交付）的中间步骤全部误判成"该收尾"，属于矫枉过正。
+        # **原地重写同一份代码**才是真正的死循环信号——模型已经算出来了，却以为没算出来。
+        #
+        # 注入时机必须在**倒数第二步**：observations 要到下一步才会被渲染成
+        # `Observation:` 消息（memory.py:126-137 / agents.py:768-769），在最后一步注入
+        # 等于没人看得到。
+        #
+        # 时序前提（已核对 smolagents 源码，勿凭印象改）：`_finalize_step` → callbacks
+        # 发生在 `action_step.is_final_answer = True` **之后**（agents.py:592 → 601），
+        # 所以这里读到的 is_final_answer 是准确的。
+        def _enforce_final_answer(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
+            if getattr(memory_step, "is_final_answer", False):
+                return  # 本步已正常退出，无事可做
+            obs = getattr(memory_step, "observations", None)
+            code = getattr(memory_step, "code_action", None)
+            if not isinstance(obs, str) or not obs:
+                return
+            if not isinstance(code, str) or not code.strip():
+                return
+
+            def _norm(src: str) -> str:
+                # 去整行注释与全部空白：模型"重写"往往只改注释/缩进/换行，语义完全相同
+                body = "".join(ln.split("#", 1)[0] for ln in src.splitlines())
+                return "".join(body.split())
+
+            # 只和最近 keep_recent 步比（更早的 code_action 已被 _truncate_observations
+            # 截断，比较无意义，也正好省掉无谓开销）
+            cur = _norm(code)
+            dup_step: Optional[int] = None
+            if cur and len(cur) <= 20000:
+                lo = memory_step.step_number - keep_recent
+                for prev in agent.memory.steps:
+                    if not isinstance(prev, ActionStep) or prev.step_number is None:
+                        continue
+                    if not (lo <= prev.step_number < memory_step.step_number):
+                        continue
+                    # 上一步若是「失败重试」（报错 → 改写），重写是**必要的**：此时劝它
+                    # "别重写"会直接阻断纠错——这是 C 最容易犯的错。用错误痕迹做门控排除。
+                    # （2026-09-14 CLI 实测「写跑马灯」：Step1 因 `import io` 撞沙箱白名单
+                    #   而整块中断，Step2 几乎是同一份代码、只换了捕获方式 → 若误判成
+                    #   "原地重写"，就会劝它放弃修复。）
+                    prev_obs = getattr(prev, "observations", "") or ""
+                    if ("[import 拦截]" in prev_obs or "Traceback" in prev_obs
+                            or "Error:" in prev_obs or "Exception:" in prev_obs):
+                        continue
+                    prev_code = getattr(prev, "code_action", None)
+                    p = _norm(prev_code) if isinstance(prev_code, str) else ""
+                    if p and SequenceMatcher(None, cur, p, autojunk=False).ratio() >= 0.9:
+                        dup_step = prev.step_number
+                        break
+
+            if dup_step is not None:
+                hint = (
+                    f"\n[系统] 本步代码与第 {dup_step} 步几乎完全相同——你在原地重写，"
+                    "并没有产生新信息。若任务已达成，**不要再重写代码**，直接把握有的"
+                    "源码/结果/日志交给 `final_answer(...)` 收尾即可。"
+                )
+            elif agent.max_steps - memory_step.step_number <= 1:
+                hint = (
+                    "\n[系统] 只剩最后一步了。请立即用 `final_answer(...)` 送出交付物"
+                    "（源码 / 结果 / 日志拼成字符串），不要再开始新的探索或重写。"
+                )
+            else:
+                return  # 无重复迹象、且步数还有余量 → 不干预（避免误伤正常推进的任务）
+            memory_step.observations = obs + hint
+
         agent = SmolCodeAgent(
             tools=smol_tools,
             model=model,
             max_steps=self.max_tool_rounds,
             executor=executor,
             planning_interval=planning_interval,
-            step_callbacks=([_truncate_observations] + ([_evt_hook] if _evt_hook is not None else [])),
+            step_callbacks=(
+                [_truncate_observations, _clarify_empty_output, _enforce_final_answer]
+                + ([_evt_hook] if _evt_hook is not None else [])
+            ),
             instructions=(
-                "【数据补充策略】\n"
+                _sandbox_instructions()
+                + "\n【数据补充策略】\n"
                 "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
                 "- web_search 搜索关键词示例：'{股票名称} {股票代码} 最新消息 分析'\n"
                 "- 将 web_search 结果作为参考信息，结合已有数据分析\n"
@@ -1479,17 +1995,25 @@ class TaskAgent(AgentBase):
             if isinstance(planning, dict) and provider:
                 if tools:
                     # 暂存区工具常驻（2026-09-12）：与 executor 注入保持一致
-                    allowed_names = set(str(t) for t in tools) | {"stage_write", "stage_read", "stage_list"}
+                    allowed_names = set(str(t) for t in tools) | {"stage_write", "stage_read", "stage_list", "stage_get_obj"}
                 elif domain:
                     allowed_names = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
                 else:
                     allowed_names = set(provider.list_by_domain("common"))
                 tools_text = provider.get_schemas_text(names_filter=allowed_names)
+                # 日志口径修正（2026-09-14）：原打印 len(provider)（全量 81），
+                # 与"注入了几条 schema"无关——排查时极易误判成"全量 schema 进 prompt"。
+                # 这里按 get_schemas_text 的同一过滤条件（base.py:409）数实际条数。
+                _injected_n = sum(
+                    1 for s in provider.get_schemas()
+                    if s.get("function", {}).get("name", "") in allowed_names
+                )
                 for key in ("initial_plan", "update_plan_pre_messages", "update_plan_post_messages"):
                     val = planning.get(key, "")
                     if isinstance(val, str) and "{{tool_list}}" in val:
                         planning[key] = val.replace("{{tool_list}}", tools_text)
-                        logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具 schema", key, len(provider))
+                        logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具 schema"
+                                    "（provider 共 %d）", key, _injected_n, len(provider))
 
             agent.prompt_templates.update(custom_templates)
             logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
@@ -1573,40 +2097,24 @@ class TaskAgent(AgentBase):
 
         try:
             # 创建运行时上下文
-            # 实体解析组合器（2026-09-12）：StockResolver（实体扩写）+ TimeResolver
-            # （时间标定，交易日历口径）串联——各产出 effective_input 增量，依次追加。
+            # 实体解析改用 CompositeResolver（2026-09-13 接线修复）：NodeContext 的
+            # 契约是 EntityResolver（nodes.py 调 .resolve()），此前注入的却是裸函数
+            # _combined_resolver → 调用处 AttributeError 被 chat_node 的
+            # `except Exception: logger.debug` 吞掉 ⇒ chat 阶段的实体解析与澄清反问
+            # 在线上**从未执行**过（与 L2/L3 同源的"声明了没接线"）。组合逻辑现收敛到
+            # resolvers/composite.CompositeResolver，注入即满足契约。
+            #
+            # 顺序即语义：先标的、后时间。时间解析必须拿到"标的反推的领域"
+            # （chat 先于 plan、拿不到 selected_domain），故用工厂按前序 ctx 惰性创建。
+            from resolvers.composite import CompositeResolver
             from resolvers.stock import StockResolver
             from resolvers.time import TimeResolver
 
-            def _combined_resolver(user_input: str):
-                results = []
-                for _resolver in (StockResolver(), TimeResolver()):
-                    try:
-                        results.append(_resolver.resolve(user_input))
-                    except Exception:
-                        continue
-                if not results:
-                    return None
-                primary = next((r for r in results if r and r.effective_input), None)
-                if primary is None:
-                    return None
-                extras = []
-                for r in results:
-                    if r is primary or not r:
-                        continue
-                    if r.effective_input and r.effective_input != user_input:
-                        extras.append(r.effective_input[len(user_input):].lstrip("，, "))
-                merged = primary.effective_input
-                for extra in extras:
-                    merged = f"{merged}；{extra}"
-                from resolvers.base import ResolveResult
-                return ResolveResult(
-                    entities=sum((r.entities for r in results if r), []),
-                    entity_code=primary.entity_code,
-                    entity_name=primary.entity_name,
-                    entity_type=primary.entity_type,
-                    effective_input=merged,
-                )
+            def _time_resolver(ctx):
+                """由前序识别出的实体类型倒推领域（resolvers/time._ENTITY_DOMAIN），
+                否则交易日口径与非交易日澄清整链不生效。"""
+                _types = ctx.get("entity_types") or []
+                return TimeResolver(entity_type=_types[0] if _types else "")
 
             ctx = NodeContext(
                 llm=self.llm,
@@ -1616,7 +2124,7 @@ class TaskAgent(AgentBase):
                 system_prompt=self.system_prompt,
                 memory_window_size=self.memory_window_size,
                 max_tool_rounds=self.max_tool_rounds,
-                entity_resolver=_combined_resolver,
+                entity_resolver=CompositeResolver([StockResolver(), _time_resolver]),
             )
             ctx.event_cb = event_cb  # SSE 过程事件回调（None=非流式路径零开销）
             ctx.agent = self  # 传递 TaskAgent 实例，供节点调用 _build_code_agent 等方法

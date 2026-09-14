@@ -23,6 +23,20 @@ from llm.base import ChatMessage, LLMResponse
 
 logger = logging.getLogger(__name__)
 
+# 意图动词 → 兜底归类（2026-09-14）。
+# domain/noun 当前无独立来源，set_intent 只接 verb，缺省位恒落 unknown，
+# 导致链名退化成 unknown+verb+unknown：既无法按链聚合/回测，又让 unknown+screen+unknown
+# 这类空链（无 stock_code）污染决策树。这里按 verb 兜底归类到已知域，使 stock 任务
+# 可被正确归类（finance 域，参与回测统计）；归类失败的（chat/general/cron 等）仍落 unknown。
+_VERB_CLASSIFY = {
+    "screen":   {"domain": "finance", "noun": "stock"},
+    "analysis": {"domain": "finance", "noun": "stock"},
+    "compare":  {"domain": "finance", "noun": "stock"},
+    "query":    {"domain": "finance", "noun": "stock"},
+    "code":     {"domain": "finance", "noun": "strategy"},
+    "explain":  {"domain": "finance", "noun": "indicator"},
+}
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -366,7 +380,24 @@ class AgentTraceRecorder:
             # 构建根节点
             # chain_name 用真实 intent 三元组；缺省段填 unknown 而非统一 "agent"，
             # 否则按 chain 聚合/匹配（负面反馈、统计）全部失效（审计 P1-5）。
+            # 归类优先（2026-09-14）：domain/noun 无独立来源、恒落 unknown，导致
+            # unknown+screen+unknown 等空链既无法按链聚合/回测，又污染决策树。按 verb
+            # 兜底归类（选股/分析等 stock 任务归入 finance 域），使其可被正确归类。
+            if not self.domain:
+                _cls = _VERB_CLASSIFY.get(self.intent_verb)
+                if _cls:
+                    self.domain = _cls.get("domain", "")
+                    if not self.intent_noun:
+                        self.intent_noun = _cls.get("noun", "")
             chain_name = f"{self.domain or 'unknown'}+{self.intent_verb or 'unknown'}+{self.intent_noun or 'unknown'}"
+
+            # 跳过大势/筛选类无标的空链：无 stock_code 且链仍含 unknown（无法归类）→
+            # 不参与决策树/回测统计，避免 unknown+screen+unknown 这类毒丸数据入库。
+            # 注：空 code 记录本就无法逐股回测，store.query_pending_verify 已将其判为
+            # 永久毒丸——此处写入前直接拦截更干净（归类成功则仍写入，符合"归类回测"诉求）。
+            if not stock_code and "unknown" in chain_name:
+                logger.info("[Trace] 跳过写入决策树: 链不可归类且无标的 chain=%s (不参与回测)", chain_name)
+                return None
             root = EvalNode(
                 layer=Layer.CHAIN.value,
                 name=chain_name,

@@ -57,9 +57,15 @@ class ToolCircuitBreaker:
 
         def _call(*args, **kwargs):
             if self.is_open(name):
-                return (f"[熔断] 工具 {name} 已连续失败 {self.threshold} 次（数据源可能不可用），"
-                        f"本次调用被拦截。请勿再调用该工具；改用其它工具、基于已有数据继续，"
-                        f"或在答复中说明该数据暂不可获取。")
+                # 2026-09-14：改为**抛异常**而非返回字符串。实测模型把返回的熔断提示
+                # 当成了"调用成功"（拿到 str 打印后继续换参数轰炸，6 个 indicator
+                # 全试一遍）；异常语义（本次调用失败）才能让模型正确分支、不再重试。
+                # 异常会被 executor 包装捕获 → 记失败（熔断保持打开）→ 以 error 返回。
+                raise RuntimeError(
+                    f"[熔断] 工具 {name} 已连续失败 {self.threshold} 次（数据源可能不可用），"
+                    f"本次调用被拦截。请勿再调用该工具；改用其它工具、基于已有数据继续，"
+                    f"或在答复中说明该数据暂不可获取。"
+                )
             try:
                 result = fn(*args, **kwargs)
             except Exception as e:

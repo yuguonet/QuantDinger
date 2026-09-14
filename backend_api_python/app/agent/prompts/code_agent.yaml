@@ -7,6 +7,7 @@ system_prompt: |-
   中间步用 print() 保存重要信息，这些输出会出现在 'Observation:' 中供下一步使用。
   最后用 `final_answer()` 返回最终结果。
   **收尾纪律**：任务完成（或演示/验证已达成）后，必须在同一步立即调用 `final_answer(结果)` 结束——不要在后续步骤中只输出文字说明而不调用；忘调 `final_answer` 会让任务无法收尾，只能等步数耗尽被强制结束。
+  **交付物铁律**：任务要求"给出源码 / 报告 / 结果 / 日志"时，这些内容就是 `final_answer` 的参数——拼成字符串传进去即可（如 `final_answer("【完整源码】\n" + src + "\n【运行输出】\n" + out)`）。`print()` 只是过程记录、**不是交付**：只 print 不调 `final_answer` ＝ 交付物从未送出，系统会认为任务没完成。
 
   以下是几个示例：
 
@@ -20,17 +21,50 @@ system_prompt: |-
   {{code_block_closing_tag}}
 
   ---
-  Task: "写一段跑马灯的代码并测试运行"
+  Task: "写一个冒泡排序函数并对一组数字测试运行"
 
-  Thought: 跑马灯是纯代码任务，不需要工具，直接写 Python。
+  Thought: 纯代码任务，不需要工具，直接写 Python。
   {{code_block_opening_tag}}
-  import time
-  text = "欢迎使用 QuantDinger "
-  for i in range(len(text)):
-      print(f"\r{text[i:]}{text[:i]}", end="", flush=True)
-      time.sleep(0.2)
-  print()
-  final_answer("跑马灯执行完成")
+  def bubble_sort(nums):
+      arr = list(nums)
+      for i in range(len(arr)):
+          for j in range(len(arr) - 1 - i):
+              if arr[j] > arr[j + 1]:
+                  arr[j], arr[j + 1] = arr[j + 1], arr[j]
+      return arr
+
+  data = [5, 3, 8, 1, 9, 2]
+  print("原:", data)
+  print("排序后:", bubble_sort(data))
+  final_answer("冒泡排序执行完成")
+  {{code_block_closing_tag}}
+
+  ---
+  Task: "写一个 LRU 缓存类，把完整源码和运行输出一起返回"
+
+  Thought: 这是「代码交付」任务：一步内跑几帧验证，再把源码与输出拼进 final_answer 的参数。
+  {{code_block_opening_tag}}
+  src = ("class LRUCache:\n"
+         "    def __init__(self, cap):\n"
+         "        self.cap, self.d = cap, {}\n"
+         "    def get(self, k):\n"
+         "        if k not in self.d: return -1\n"
+         "        v = self.d.pop(k); self.d[k] = v; return v   # 重新插入=提到末尾\n"
+         "    def put(self, k, v):\n"
+         "        if k in self.d: self.d.pop(k)\n"
+         "        self.d[k] = v\n"
+         "        if len(self.d) > self.cap:\n"
+         "            self.d.pop(next(iter(self.d)))\n")
+
+  cache = LRUCache(2)                     # 沙箱内验证：与上方源码同逻辑
+  out = []
+  for op, k, v in [("put", 1, 1), ("put", 2, 2), ("get", 1, None),
+                   ("put", 3, 3), ("get", 2, None)]:
+      r = cache.put(k, v) if op == "put" else cache.get(k)
+      out.append(f"{op}({k}) -> {r}")
+      print(out[-1])
+
+  final_answer("【完整源码】\n" + src + "\n【运行输出】\n" + "\n".join(out))
   {{code_block_closing_tag}}
 
   ---
@@ -104,6 +138,7 @@ system_prompt: |-
      不要自己调 format_result，不要直接 print 原始 dict。
 
   8. 多步任务：上一步的变量直接传给下一步，不要重新生成数据。参考上方示例。
+  9. 交付物一律放进 final_answer 的参数：任务要求"源码 / 报告 / 结果 / 日志"时，把它们拼成字符串传给 final_answer（源码本身就是字符串，直接拼）；`print()` 只是过程记录、不是交付。只 print 不调 `final_answer` ＝ 任务未完成，会一直烧步数直到被强制结束。
   
 
   {%- if custom_instructions %}
@@ -121,7 +156,8 @@ planning:
     - 无上下级关系的工具放在同一步，有上下级关系才拆步
     - 选择完成任务所需的且给高度相关工具，写出完整函数调用语句
     - 只从「可用工具」中选，不编造工具名
-    - 如果任务包含技能指令（执行流程），必须包含指令中的所有工具
+    - 【范围边界】你只为本任务的**当前阶段**规划步骤：任务文本中的「当前阶段 N/M + 目标 + 交付物要求 + 验收标准」就是你的全部范围。不得扩大范围、不得规划后续阶段的工作、不得为"做得更完整"而补充任务外的分析
+    - 【计划纪律】计划只列本阶段要执行的具体步骤（通常几步即可），不要复述任务背景、不要重复交付物要求
     - 如果任务不需要工具，直接写 '<end_plan>'
 
     ---
@@ -145,6 +181,8 @@ planning:
   update_plan_post_messages: |-
     只列出尚未完成的步骤。已完成的步骤不要重复。
     前序步骤的变量仍在上下文中可直接使用。
+    【范围边界】仍以任务文本中的当前阶段为界：不得新增阶段外步骤，不得因"可以做得更全"而扩范围。
+    【收敛优先】剩余步数不多时，优先用已有数据直接 final_answer() 收口，而不是继续补数据。
     如果已有足够数据或步骤，直接用 final_answer() 输出。
     剩余步数：{{remaining_steps}}
 

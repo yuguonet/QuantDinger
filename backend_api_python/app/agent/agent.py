@@ -317,7 +317,11 @@ def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> 
 
 # ---------- 盘后回溯评估 Worker ----------
 try:
-    from chain.evaluator import start_eval_worker
+    # 2026-09-14：统一用全路径——此前 `chain.evaluator` 与 `app.agent.chain.evaluator`
+    # 是**两个模块实例**（sys.path 双路径导入的又一坑，同 L10 的 tools.staging/infra.staging），
+    # 各自的 `_eval_thread` 互不可见 ⇒ `is_alive()` 防重入失效 ⇒ 同进程双 worker、
+    # 日志双份、每次盘后评估跑两遍。
+    from app.agent.chain.evaluator import start_eval_worker
     start_eval_worker()
     logger.info("盘后回溯评估 worker 已启动")
 except Exception as e:

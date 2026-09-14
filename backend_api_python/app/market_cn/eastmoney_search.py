@@ -31,6 +31,49 @@ def _gen_id(length: int = 32) -> str:
     return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
 
 
+def _pick(s: Dict[str, Any], name: str) -> Any:
+    """字段取值，容忍东财的动态键名后缀。
+
+    2026-09-14：同一字段会以 `PEAK_PRICE<140>`（字段 ID 后缀）或
+    `PETTM{2026-09-14}`（日期后缀）的形式出现，后缀随请求变化——固定键名
+    `s.get(name)` 会**静默取空**，下游拿到一堆 0 值（实测现象：高低价/成交量/
+    市值全为 0，被报告"无法使用"）。接口本身仍活着（HTTP 200 + code=100 +
+    dataList 正常返回），故不换接口，改解析层为「精确 → 前缀」两级匹配。
+
+    顺带修正的键名变化（实测 2026-09-14）：
+      HIGH_PRICE → PEAK_PRICE；LOW_PRICE → BOTTOM_PRICE；
+      成交量 TRADE_VOLUME → VOLUME；PB_NEW_MRQ → PB。
+    """
+    if name in s:
+        return s[name]
+    for suffix in ("<", "{"):
+        for k, v in s.items():
+            if isinstance(k, str) and k.startswith(name + suffix):
+                return v
+    return None
+
+
+def _to_num(v: Any) -> float:
+    """把东财的「460.85万 / 191.43亿」格式转成数值；纯数值原样，解析不动返回 0.0。
+
+    2026-09-14：新版返回的成交量 VOLUME 是格式化字符串（"460.85万"），
+    `_safe_float` 吃不下 ⇒ volume 恒为 0。
+    """
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str):
+        return 0.0
+    t = v.strip()
+    try:
+        if t.endswith("亿"):
+            return float(t[:-1]) * 1e8
+        if t.endswith("万"):
+            return float(t[:-1]) * 1e4
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
 def search_stocks(
     keyword: str,
     page_size: int = 200,
@@ -131,24 +174,24 @@ def search_stocks(
         if not isinstance(s, dict):
             continue
         stocks.append({
-            "code": str(s.get("SECURITY_CODE", "")),
-            "name": str(s.get("SECURITY_SHORT_NAME", "")),
-            "industry": str(s.get("INDUSTRY", "")),
-            "concept": str(s.get("CONCEPT", "")),
-            "new_price": _safe_float(s.get("NEWEST_PRICE")),
-            "change_rate": _safe_float(s.get("CHG")),
-            "high_price": _safe_float(s.get("HIGH_PRICE")),
-            "low_price": _safe_float(s.get("LOW_PRICE")),
-            "pre_close_price": _safe_float(s.get("PRE_CLOSE_PRICE")),
-            "volume": _safe_float(s.get("TRADE_VOLUME")),
-            "deal_amount": s.get("TRADING_VOLUMES") or s.get("TRADE_AMOUNT"),
-            "volume_ratio": s.get("QRR"),
-            "turnoverrate": _safe_float(s.get("TURNOVER_RATE")),
-            "amplitude": _safe_float(s.get("AMPLITUDE")),
-            "pe9": s.get("PE_DYNAMIC") or s.get("PE9"),
-            "pbnewmrq": s.get("PB_NEW_MRQ"),
-            "total_market_cap": s.get("TOEAL_MARKET_VALUE") or s.get("TOTAL_MARKET_CAP"),
-            "free_cap": s.get("FREE_CAP"),
+            "code": str(_pick(s, "SECURITY_CODE") or ""),
+            "name": str(_pick(s, "SECURITY_SHORT_NAME") or ""),
+            "industry": str(_pick(s, "INDUSTRY") or ""),
+            "concept": str(_pick(s, "CONCEPT") or ""),
+            "new_price": _safe_float(_pick(s, "NEWEST_PRICE")),
+            "change_rate": _safe_float(_pick(s, "CHG")),
+            "high_price": _safe_float(_pick(s, "PEAK_PRICE")),
+            "low_price": _safe_float(_pick(s, "BOTTOM_PRICE")),
+            "pre_close_price": _safe_float(_pick(s, "PRE_CLOSE_PRICE")),
+            "volume": _to_num(_pick(s, "VOLUME")),
+            "deal_amount": _pick(s, "TRADING_VOLUMES") or _pick(s, "TRADE_AMOUNT"),
+            "volume_ratio": _pick(s, "QRR"),
+            "turnoverrate": _safe_float(_pick(s, "TURNOVER_RATE")),
+            "amplitude": _safe_float(_pick(s, "AMPLITUDE")),
+            "pe9": _pick(s, "PE_DYNAMIC") or _pick(s, "PE9"),
+            "pbnewmrq": _pick(s, "PB_NEW_MRQ") or _pick(s, "PB"),
+            "total_market_cap": _pick(s, "TOEAL_MARKET_VALUE") or _pick(s, "TOTAL_MARKET_CAP"),
+            "free_cap": _pick(s, "FREE_CAP"),
         })
 
     return {

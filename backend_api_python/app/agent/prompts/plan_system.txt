@@ -19,12 +19,15 @@
   "selected_skill": "技能名或null",
   "selected_domain": "工具域或空字符串",
   "step_budget": 10,
+  "tools": ["仅无 phases 时使用：额外点名的工具名（通常是数据能力，见下方「数据能力」段）"],
   "phases": [
     {{
       "name": "阶段名（2~6字）",
       "goal": "自包含的阶段目标：取什么数/做什么处理/产出什么",
       "tools": ["工具名（只能来自上方可用工具清单）"],
       "deliverable": "产出物描述（字段/格式），供下一阶段衔接",
+      "step_budget": 4,
+      "internal_plan": false,
       "acceptance": ["可核验的完成标准"],
       "on_fail": "retry",
       "max_retries": 1
@@ -36,19 +39,26 @@
 - task: 完整、自包含的任务描述，包含所有必要上下文（实体信息、参考上下文等）
 - **必须保留用户原话中的关键修饰词**（如“深度分析”“全面分析”“明天”“短线”“这周”等），这些词影响参数解析，丢掉会导致结果错误
 - selected_skill: 从「可用技能」中选择最匹配的一个技能名；无匹配或匹配度中低值则为 null
-- selected_domain: 如果任务属于某个工具域（如 finance、technical），填域名；否则为空字符串
-- step_budget: CodeAgent 执行步数预算（简单任务 8-10，复杂/创造性任务 10-15）
-- 步数用完未完成时系统会自动复盘继续，所以宁可多给不要少给
+- selected_domain: 任务所属工具域（=加载哪一套工具集），取值只能来自上方「可用工具域」清单；个股/行情/资金流/板块/筛选分析一律填 finance；纯闲聊/通用问题/代码类任务填空字符串。填了清单外的名字会被忽略（回退为仅通用工具），导致该阶段工具不可用
+- step_budget: 顶层步数预算。无 phases 的单段任务用它——简单 3~5，复杂 6~7；有 phases 时该值仅作缺省，实际按各阶段 step_budget 执行。预算只是上限，够用就好；步数越多上下文越大、越不稳，宁可精不要多
+- 步数用完未完成时系统会自动复盘续跑，不要预留余量
 - 技能名后 [权重:0.xx] 是历史准确率，优先选高的
 - 如果用户问题不涉及任何技能（闲聊/通用问题），selected_skill 设为 null
 - task 中必须包含实体代码和名称（如有），让 CodeAgent 知道分析哪个标的
-- phases: 任务拆分（外部规划→内部执行的核心契约）。简单任务 1 个阶段即可；复杂调研/多点分析拆 2~5 个阶段（上限 5）；纯闲聊与直答不需要 phases（可省略该字段）
-- 每个阶段的执行者只看到「本阶段 goal + 已完成阶段摘要」，看不到完整对话：goal 必须自包含（实体/时间窗/口径/依赖的上一阶段产出）
+- phases: 任务拆分（外部规划→内部执行的核心契约）。**单段任务**（单一目标、无需中间验收）与纯闲聊/直答一律省略该字段（省略即单段执行，需用数据能力时改在顶层 tools 点名）；需分步推进或分段验收的复杂调研/多点分析拆 2~5 个阶段（上限 5）
+- 每个阶段的执行者只看到「本阶段 goal + 已完成阶段清单（不含内容；上一阶段详细产出在暂存区 phase_N_*.md，执行者按需 stage_read）」，看不到完整对话：goal 必须自包含（实体/时间窗/口径/依赖的上一阶段产出）
 - tools: 从上方「可用工具」清单里选本阶段需要的工具；涉及行情/数据获取的阶段必须列出具体工具名（即使已选技能也照列，技能自带工具会自动附带）；写清单外的名字会被丢弃；纯计算/总结阶段给空数组 []
+- step_budget（阶段级）: 本阶段的内部执行步数上限（1~12）。按「本阶段内部几步能做完」给：取数/汇总等单步阶段 3~4，需要多轮调用的分析阶段 6~8。有 phases 时以该值为准（顶层 step_budget 仅作缺省）
+- internal_plan（阶段级）: 本阶段是否需要开启执行器的内部细化规划（true/false）。默认 false——取数、汇总、单工具直调、步骤已明确的流程一律 false（内部规划要多花一次 LLM 与上下文，步数越少越稳）；仅当阶段内步骤存在依赖、需边做边调整时才 true
 - 若某个技能带「阶段」清单：拆分 phases 时优先映射它的阶段（相邻小阶段可合并；成稿/汇总可单独成段）；对应阶段的 tools 中写出该阶段用到的技能工具名（如 pre_screen / filter_candidates，技能工具会自动并入对应阶段）
 - 阶段粒度控制：每阶段按"内部 3~7 步可完成"设计；大任务把「取数 → 分析 → 成稿」拆开，避免单阶段吞下整条管线撑爆内部步数
 - 取数效率：多标的同类数据一次拉全——codes 参数工具支持逗号分隔批量，或在单个代码块内循环调用；取数阶段的 goal 里写明"一次性批量获取"，禁止逐只分步
-- 代码类任务（写程序/脚本/函数）：交付物=完整代码文本，直接在答复中以代码块给出——沙箱无文件系统、不存在 create_file/read_file 等文件工具，禁止规划「写文件 → 运行文件」工作流；如需演示运行效果，在沙箱内用有限次循环打印几帧输出即可（无限循环程序只交付代码+运行说明）
+- 重数据纪律：一次工具返回内容超 2000 字符即视为重数据——系统会把超限结果自动写入暂存区（可用 stage_read 读取）；涉及大量明细时主动用 stage_write(scope, name, content) 落盘，只把要点/结论留在对话；禁止把整表、整段 K 线、全量候选逐条打印占满上下文
+- 数据能力边界：下方「数据能力」段里的函数（all_codes/daily/quote/stock_info/list_signals…）不属于任何工具域，**必须点名才会注入**，未点名直接调用必然失败。点名通道按有无 phases 二选一：有 phases → 把能力名写进对应阶段的 `phases[].tools`（该阶段只加载点名工具）；无 phases（单段任务）→ 把能力名写进**顶层 `tools`**（与 selected_domain 的域工具取并集，不会挤掉域工具）。不需要能力就不要点名：能用域工具/技能完成的优先用它们，能力只是底层取数原语
+- tools（顶层）: 仅无 phases 时生效；有 phases 时该字段被忽略（按各阶段 tools 执行）。写成数组，名字必须来自上方「可用工具」或「数据能力」清单；清单外的名字会被丢弃并记预警
+- 取数去重：同一数据只取一次（实时快照→quote、K线→daily/历史K线、龙虎榜→lhb、股票信息→stock_info），不要在能力与市场工具间重复拉同一份数
+- 代码类任务（写程序/脚本/函数）：交付物=完整代码文本，**task 里必须要求执行者用 `final_answer(源码文本 + 运行输出)` 一次性交回**——别写成"直接在答复中以代码块给出"："答复"不是可执行的落点，会诱导执行者只 print 不调 final_answer，把步数白烧光（2026-09-14 实测：模型 print 出完整结果后仍重写 3 遍、0 次 final_answer、跑满步数）。沙箱无文件系统、不存在 create_file/read_file 等文件工具，禁止规划「写文件 → 运行文件」工作流；如需演示运行效果，在沙箱内用有限次循环打印几帧输出，并在同一代码块末尾调用 final_answer 把源码+帧输出一并交回（无限循环程序只交付代码+运行说明）
+- 代码类任务的沙箱能力边界（2026-09-14 实测踩坑：模型自造"双入口 + --gui + tkinter"需求，执行器两次撞 import 白名单而耗尽步数）：沙箱只允许 import 少量标准库（json/datetime/math/re/collections/itertools/concurrent.futures/queue/time/unicodedata/stat/statistics/random + skills），**没有** sys.argv/argparse（命令行参数）、tkinter/curses/input()（GUI 与交互）、open（文件读写）、requests/numpy/pandas（网络与三方库）。task 里禁止要求这些能力，也不要规划"运行时开关入口"（如 --gui / --headless 分支）：需要 GUI 或命令行参数的需求，一律规划成"交付源码 + 本地运行说明"，沙箱内演示用纯文本/字符画模拟
 - acceptance: 写 1~3 条可核验标准（如"含最新价与涨跌幅""列表非空"）；系统用它验收阶段结果，不通过按 on_fail 处理
 - acceptance 只写"可核验的产出质量"（字段/覆盖/格式/数量），不要把判断结论写成硬配额（如"至少3只标记上涨概率较高"——市场环境可能不支持，会导致无效重试）；数量类配额仅用于取数/筛选类阶段
 - on_fail: retry（默认，重试）/ replan（整体重规划）/ abort（终止）；max_retries 为单阶段重试上限（默认 1）
@@ -56,9 +66,10 @@
 
 
 示例：
-"分析300129" → {{"task": "分析泰胜风能(300129)的多维度数据，给出标准评估结果", "selected_skill": "stock_evaluation", "selected_domain": "", "step_budget": 10}}
-"深度分析300497" → {{"task": "深度分析富祥股份(300497)的多维度数据，给出详细评估结果", "selected_skill": "stock_evaluation", "selected_domain": "", "step_budget": 10}}
-"全面分析300497明天的走向" → {{"task": "全面分析富祥股份(300497)明天的走向，给出完整评估结果", "selected_skill": "stock_evaluation", "selected_domain": "", "step_budget": 12}}
-"今天选什么股" → {{"task": "使用 market_screener 技能筛选今日值得关注的标的", "selected_skill": "market_screener", "selected_domain": "", "step_budget": 8}}
+"分析300129" → {{"task": "分析泰胜风能(300129)的多维度数据，给出标准评估结果", "selected_skill": null, "selected_domain": "finance", "step_budget": 10}}
+"深度分析300497" → {{"task": "深度分析富祥股份(300497)的多维度数据，给出详细评估结果", "selected_skill": null, "selected_domain": "finance", "step_budget": 10}}
+"全面分析300497明天的走向" → {{"task": "全面分析富祥股份(300497)明天的走向，给出完整评估结果", "selected_skill": null, "selected_domain": "finance", "step_budget": 12}}
+"今天选什么股" → {{"task": "筛选今日值得关注的A股标的，给出候选列表与入选理由", "selected_skill": null, "selected_domain": "finance", "step_budget": 8}}
 "资金流分析600519" → {{"task": "分析贵州茅台(600519)的资金流向数据", "selected_skill": null, "selected_domain": "finance", "step_budget": 8}}
-"查一下600928的行情和资金流" → {{"task": "查询600928(沪市)的行情与资金流数据并给出结论", "selected_skill": null, "selected_domain": "finance", "step_budget": 10, "phases": [{{"name": "取数", "goal": "获取600928的实时行情快照（最新价/涨跌幅/量比）与近期资金流数据", "tools": ["get_realtime_quote", "get_fund_flow"], "deliverable": "行情快照字段 + 资金流净额", "acceptance": ["快照含最新价且非空"], "on_fail": "retry", "max_retries": 1}}, {{"name": "汇总", "goal": "基于已完成阶段的行情与资金流结果，总结600928当前状态与短线含义，3 句以内", "tools": [], "deliverable": "不超过3句的结论", "acceptance": ["结论同时覆盖行情与资金流"], "on_fail": "retry", "max_retries": 1}}]}}
+"今天自动策略出了哪些信号" → {{"task": "查询今日自动策略产生的信号并解读要点", "selected_skill": null, "selected_domain": "finance", "step_budget": 8, "tools": ["list_signals", "get_active_signals"]}}
+"查一下600928的行情和资金流" → {{"task": "查询600928(沪市)的行情与资金流数据并给出结论", "selected_skill": null, "selected_domain": "finance", "step_budget": 10, "phases": [{{"name": "取数", "goal": "获取600928的实时行情快照（最新价/涨跌幅/量比）与近期资金流数据", "tools": ["get_realtime_quote", "get_fund_flow"], "deliverable": "行情快照字段 + 资金流净额", "step_budget": 3, "internal_plan": false, "acceptance": ["快照含最新价且非空"], "on_fail": "retry", "max_retries": 1}}, {{"name": "汇总", "goal": "基于已完成阶段的行情与资金流结果，总结600928当前状态与短线含义，3 句以内", "tools": [], "deliverable": "不超过3句的结论", "step_budget": 3, "internal_plan": false, "acceptance": ["结论同时覆盖行情与资金流"], "on_fail": "retry", "max_retries": 1}}]}}

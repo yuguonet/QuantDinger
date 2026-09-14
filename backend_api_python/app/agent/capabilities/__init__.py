@@ -2,7 +2,8 @@
 """capabilities/__init__.py — agent 能力发现层（A 阶段, 2026-09-12）
 
 通用机制（不局限金融域）: 显式指定包 -> 扫描公开函数 -> 分类 -> 人工准入 ->
-注册为 agent 工具（domain="quant"）。auto/ 为第一个接入域。
+注册为 agent 工具（来源层标记 CAPABILITY_DOMAIN；只由阶段 tools 白名单点名注入，
+不占用 planner 的可选工具域）。auto/ 为第一个接入包。
 
 模块分工:
   scanner.py — 能力扫描器（产出报告到 tmp/，绝不写准入配置）

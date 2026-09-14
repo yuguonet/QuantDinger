@@ -51,6 +51,24 @@ SCAN_TARGETS = [
     "app.market_cn.auto.data.hub",     # auto 唯一数据出口: 日线/分钟/快照/指数/龙虎榜…
     "app.market_cn.auto.store",        # 信号事实表查询与状态机（只读子集）
     "app.market_cn.auto.registry",     # 策略注册表元数据（key/label）
+    # ── 2026-09-14 扩展：market_cn 根目录的数据/接口模块（用户指出此前漏扫）──
+    # 15 个模块已逐一验证 import 无副作用（无 DB/网络连接，scanner 依赖 import 盘点）；
+    # scheduler.py 有意排除（后台调度器，不属于 agent 能力面）。
+    "app.market_cn.china_market",
+    "app.market_cn.data_bridge",
+    "app.market_cn.dragon_limit",
+    "app.market_cn.dragon_tiger_store",
+    "app.market_cn.eastmoney_search",
+    "app.market_cn.emotion",
+    "app.market_cn.fear_greed_index",
+    "app.market_cn.finance",
+    "app.market_cn.hot_sectors",
+    "app.market_cn.index_daily",
+    "app.market_cn.index",
+    "app.market_cn.realtime_snapshot",
+    "app.market_cn.sector_daily",
+    "app.market_cn.sector_history",
+    "app.market_cn.tape",
 ]
 
 # 写操作前缀（硬性排除：扫描标 excluded，loader 注册时二次复核）
