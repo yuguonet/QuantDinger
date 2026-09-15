@@ -983,6 +983,15 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
         return False, "结果为空", "agent_fault", None
     acc = phase.get("acceptance") or []
     if not acc:
+        # 2026-09-15：planner 不再预写验收（轻量契约），此通道改为**引擎默认验收**：
+        # ① 正常收尾（is_final_answer=True）+ 结果非空 → pass（无标准即放行的原语义）；
+        # ② 结果非空但异常收尾（步数耗尽强制答案）→ agent_fault（半成品应重试）；
+        # ③ 引擎校准所需的引擎事实（_has_final_answer/工具已调/失败实锤）与沙箱实况
+        #    摘要由调用方注入（_run_phase_step），保证闭环④归因/校准继续生效。
+        if run_error is not None:
+            return False, f"执行异常: {str(run_error)[:200]}", "agent_fault", None
+        if not text.strip():
+            return False, "结果为空", "agent_fault", None
         return True, "", "pass", None
     import asyncio
     _accept_timeout = float(os.getenv("PHASE_ACCEPT_TIMEOUT", "60"))

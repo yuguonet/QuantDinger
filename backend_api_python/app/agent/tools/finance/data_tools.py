@@ -6,6 +6,7 @@ Wraps DataSourceFactory into OpenAI-function-callable tools.
 from __future__ import annotations
 
 import json
+import os
 from app.agent.log import logger
 from typing import Any, Dict, List, Optional
 
@@ -292,17 +293,27 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
                 logger.debug("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
             return {}
 
+        # 2026-09-15 条件触发：basicinfo 已覆盖（有价格且估值非占位）→ 跳过 HTTP；
+        # cn_stock_info 兜底实测 ~16s，故超时放宽 STOCK_INFO_HTTP_TIMEOUT(默认 20s)。
+        _needs_http = (
+            not db_result
+            or not db_result.get("last_price")
+            or float(db_result.get("pe_ratio") or 0) == 0
+        )
+        _http_timeout = int(os.getenv("STOCK_INFO_HTTP_TIMEOUT", "20"))
+
         http_result: Dict[str, Any] = {}
-        _pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = _pool.submit(_http_fetch)
-            http_result = future.result(timeout=5)
-        except FuturesTimeout:
-            logger.info("get_stock_info(%s) HTTP 5s 超时，使用 basicinfo_db", stock_code)
-        except Exception as e:
-            logger.debug("get_stock_info(%s) HTTP fetch error: %s", stock_code, e)
-        finally:
-            _pool.shutdown(wait=False)
+        if _needs_http:
+            _pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = _pool.submit(_http_fetch)
+                http_result = future.result(timeout=_http_timeout)
+            except FuturesTimeout:
+                logger.info("get_stock_info(%s) HTTP %ds 超时，使用 basicinfo_db", stock_code, _http_timeout)
+            except Exception as e:
+                logger.debug("get_stock_info(%s) HTTP fetch error: %s", stock_code, e)
+            finally:
+                _pool.shutdown(wait=False)
 
         # ── 3) 合并：basicinfo_db 为底，HTTP 补充新字段 ──
         result = {**db_result, **{k: v for k, v in http_result.items() if v is not None}}
@@ -821,4 +832,3 @@ def get_capital_summary(codes: str) -> dict:
         return {"summary": summary}
 
     return _batch_execute(_one, code_list)
-
