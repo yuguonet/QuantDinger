@@ -1,55 +1,34 @@
 # -*- coding: utf-8 -*-
-"""阶段中转数据暂存区（2026-09-12）。
+"""跨阶段会话级变量存储（2026-09-15 两级统一后的唯一用途）。
 
-背景：执行沙箱不支持 import os / 直接写文件，跨阶段重数据只能靠 ≤2000 字摘要，
-明细在阶段间丢失（实测：深入分析阶段的全量结果无法完整传给成稿阶段）。
-本模块提供受控暂存区：按 run（scope）分区，phase 间中转大块数据。
+背景：沙箱是单进程内的多次 executor 实例（每个阶段/批次新建），Python 变量无法靠
+smolagents 原生 state 跨实例存活。本模块在进程内用 `_OBJ`（scope -> {name: 原对象}）
+承接被促升的会话级变量，供新建 executor 时投影回其 state，实现跨阶段续承。
 
-安全边界：
-  - 目录限定 <项目>/tmp/agent_staging/<scope>/（scope 由任务书下发并做白名单清洗）
-  - name 任意描述性字符串（中文亦可，仅限长度）；scope 限 ASCII 白名单；内容 ≤ 2MB（仅字符串路径）
-  - 无任意路径访问；scope/name 非法直接拒绝
-易错点：
-  - scope 必须在一次 run 内保持稳定（chat_node 用 session_id+start_time 派生），
-    否则跨阶段读不到
+机制（与 GuidedPythonExecutor._promote_model_vars、task_agent 投影段配合）：
+  · 写入：阶段结果注册 / 模型变量促升时调 stage_put_obj，存**原对象**（跳过序列化往返）
+  · 读出：新建 executor 前用 stage_scope_vars(scope) 取出全部变量，send_variables 装回 state
+  · 清理：一次 run 结束由 finalize 调 stage_clear(scope)，防长跑内存增长
+
+为什么不像早期版本那样暴露 stage_write / stage_read 这类读写 API：
+  两级已统一为"executor.state 里的 Python 变量"——模型用赋值即续承，无需读写调用，
+  也不丢 Python 类型；早期的字符串/文件读写暂存 API 已被变量形态取代并彻底移除。
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
-import time
-from pathlib import Path
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# <项目>/tmp/agent_staging/（tools/staging.py → parents[3] = backend_api_python）
-_ROOT = Path(__file__).resolve().parents[3] / "tmp" / "agent_staging"
-
-# 注：文件名白名单已废弃（全局变量区用任意字符串键；仅磁盘模式经 _disk_name 做 sanitize）
+# scope 限 ASCII 白名单（须在单次 run 内保持稳定，由 nodes 用 start_time 派生）
 _SCOPE_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
-_MAX_CHARS = 2 * 1024 * 1024  # 2MB
 
-# ═══════════════════════════════════════════════════════════════
-#  存储后端：内存（默认） / 磁盘（STAGING_BACKEND=disk）
-# ═══════════════════════════════════════════════════════════════
-# 2026-09-14：用户指出——落盘的代价是**磁盘 I/O，不是 token**（模型可在同一代码块内
-# 完成"调用工具 → 读回 → 处理"，不额外消耗 LLM 轮次）。既然如此，默认后端改为内存：
-# 零 I/O、更快，且 run 结束随 scope 淘汰自动清空，不留垃圾文件。
-#
-# 前提：单进程。gunicorn_config.py 默认 GUNICORN_WORKERS=1 + gthread，
-# 且注释已声明"agent 子系统多处为进程内单例，扩 worker 前须先做进程安全改造"。
-# 多线程故需加锁；需要跨进程/持久化时用 STAGING_BACKEND=disk（行为与旧版一致）。
-_MEM: dict = {}                       # scope -> {name: content}
-_MEM_LOCK = threading.Lock()
-_MEM_MAX_SCOPES = int(os.getenv("STAGING_MAX_SCOPES", "50"))
-
-# ── 活对象区（2026-09-14）：自动暂存/F3 用，存**原对象**而非字符串 ──
-# 与 _MEM（stage_write 字符串路径）分离、互不干扰。agent 经 stage_get_obj 直接拿回
-# 活对象，跳过 str(repr)→json.loads 往返（此前连撞 TypeError/IndexError/AttributeError 的根）。
+# ── 活对象区（跨阶段变量存储） ──
+# 存**原对象**而非字符串：跳 str(repr)→json.loads 往返，避免连撞 TypeError/IndexError。
 # 内存常驻，靠 stage_clear(scope)（run 结束）、单 scope 上限、全局总上限三重防泄漏。
 _OBJ: dict = {}                       # scope -> {name: obj}
 _OBJ_LOCK = threading.Lock()
@@ -71,25 +50,8 @@ def _evict_obj_locked() -> None:
         _OBJ.pop(next(iter(_OBJ)), None)
 
 
-def _use_memory() -> bool:
-    return os.getenv("STAGING_BACKEND", "memory").lower() != "disk"
-
-
-def _evict_locked() -> None:
-    """淘汰最旧的 scope（dict 保序），避免长跑进程内存无限增长。"""
-    while len(_MEM) > _MEM_MAX_SCOPES:
-        _MEM.pop(next(iter(_MEM)), None)
-
-
-def _dir(scope: str) -> Path:
-    if not _SCOPE_RE.fullmatch(scope or ""):
-        raise ValueError(f"scope 非法: {scope!r}")
-    return _ROOT / scope
-
-
 def _safe_name(name: str) -> str:
-    """内存键（_MEM/_OBJ 的 dict 键）：任意字符串均可，仅做非空+长度限制。
-    文件名白名单 [A-Za-z0-9_.-] 是落盘时代的残留——全局变量区本就不需要它。"""
+    """dict 键：任意字符串均可，仅做非空 + 长度限制（全局变量区本就不需要文件名白名单）。"""
     s = name if isinstance(name, str) else str(name)
     if not s:
         raise ValueError("name 不能为空")
@@ -98,112 +60,9 @@ def _safe_name(name: str) -> str:
     return s
 
 
-# 磁盘文件名（仅 STAGING_BACKEND=disk 用）：把文件系统不安全字符统一替换，保证 write/read 往返一致
-_FS_UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
-
-def _disk_name(name: str) -> str:
-    s = name if isinstance(name, str) else str(name)
-    s = _FS_UNSAFE.sub("_", s).strip(". ").replace("..", "_")
-    if not s:
-        s = "unnamed"
-    if len(s) > 120:
-        s = s[:120]
-    return s
-
-
-def stage_write(scope: str, name: str, content) -> dict:
-    """写入阶段中转数据（全局变量模式：非字符串内容直接存活对象，stage_read 直接取回、无需解析）。
-
-    name 任意描述性字符串（中文亦可），仅限长度；字符串内容走文本路径（≤2MB）。
-    """
-    d = _dir(scope)                       # scope 校验（ASCII 白名单）
-    mem_key = _safe_name(name)           # 现已放宽：任意字符串
-    try:
-        # 活对象：直接存内存，不受 2MB 文本限制（全局变量区，靠 caps 防泄漏）
-        if not isinstance(content, str):
-            try:
-                with _OBJ_LOCK:
-                    _OBJ.setdefault(scope, {})[mem_key] = content
-                    _evict_obj_locked()
-            except Exception:
-                pass
-            logger.info("[staging] write obj %s/%s", scope, mem_key)
-            return {"ok": True, "name": mem_key, "chars": len(str(content))}
-        # 字符串：走文本路径（内存/磁盘），受 2MB 限制
-        text = content or ""
-        if len(text) > _MAX_CHARS:
-            return {"ok": False, "error": f"内容超限（{len(text)} > {_MAX_CHARS} 字符），请先提炼"}
-        if _use_memory():
-            with _MEM_LOCK:
-                _MEM.setdefault(scope, {})[mem_key] = text
-                _evict_locked()
-        else:
-            fname = _disk_name(name)
-            d.mkdir(parents=True, exist_ok=True)
-            (d / fname).write_text(text, encoding="utf-8")
-        logger.info("[staging] write %s/%s (%d chars)", scope, mem_key, len(text))
-        return {"ok": True, "name": mem_key, "chars": len(text)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
-
-
-def stage_read(scope: str, name: str):
-    """读取阶段中转数据（全局变量模式：命中活对象直接返回原对象；否则返回文本，>60000 截断）。"""
-    try:
-        mem_key = _safe_name(name)
-        # 优先返回活对象（全局变量区）；不在则回退下方字符串路径
-        with _OBJ_LOCK:
-            _od = _OBJ.get(scope)
-            _obj = _od.get(mem_key) if _od is not None else None
-        if _obj is not None:
-            return _obj
-        d = _dir(scope)
-        if _use_memory():
-            text = _MEM.get(scope, {}).get(mem_key)
-            if text is None:
-                avail = sorted(_MEM.get(scope, {}))
-                return json.dumps({"ok": False, "error": f"数据不存在: {name}", "可用": avail},
-                                  ensure_ascii=False)
-        else:
-            f = d / _disk_name(name)
-            if not f.is_file():
-                avail = [x.name for x in d.glob("*") if x.is_file()] if d.is_dir() else []
-                return json.dumps({"ok": False, "error": f"数据不存在: {name}", "可用": avail},
-                                  ensure_ascii=False)
-            text = f.read_text(encoding="utf-8", errors="replace")
-        if len(text) > 60000:
-            text = text[:60000] + f"\n…(截断，共 {len(text)} 字符)"
-        return text
-    except Exception as e:
-        return json.dumps({"ok": False, "error": str(e)[:200]}, ensure_ascii=False)
-
-
-def stage_list(scope: str) -> list:
-    """列出暂存区现有文件（name/chars/mtime）。"""
-    try:
-        d = _dir(scope)
-        if _use_memory():
-            return [{"name": n, "chars": len(c), "mtime": "-"}
-                    for n, c in sorted(_MEM.get(scope, {}).items())]
-        if not d.is_dir():
-            return []
-        out = []
-        for x in sorted(d.glob("*")):
-            if x.is_file():
-                out.append({"name": x.name, "chars": x.stat().st_size,
-                            "mtime": time.strftime("%H:%M:%S", time.localtime(x.stat().st_mtime))})
-        return out
-    except Exception as e:
-        return [{"error": str(e)[:200]}]
-
-
-# ═══════════════════════════════════════════════════════════════
-#  活对象存取（2026-09-14）：自动暂存用，存原对象、取回即对象
-# ═══════════════════════════════════════════════════════════════
 def stage_put_obj(scope: str, name: str, obj) -> bool:
-    """存**活对象**（自动暂存/F3 用）：跳过 str(repr)→json.loads 往返，agent 经
-    stage_get_obj 直接拿回原对象。与 stage_write(字符串) 分离，互不干扰。
-    内存常驻，依赖 stage_clear(scope) 或上限淘汰防泄漏。"""
+    """存**活对象**（跨阶段变量续承用）：跳过序列化往返，下阶段经 stage_get_obj / 投影直接拿回原对象。
+    返回是否成功；依赖 stage_clear(scope) 或上限淘汰防泄漏。"""
     if not _SCOPE_RE.fullmatch(scope or ""):
         return False
     fname = _safe_name(name)
@@ -218,7 +77,7 @@ def stage_put_obj(scope: str, name: str, obj) -> bool:
 
 def stage_get_obj(scope: str, name: str):
     """取回 stage_put_obj 存入的活对象（非字符串，无需 json.loads）。
-    返回对象本身；不存在/非法时返回 {"ok": False, "error": ...} 便于 agent 判错恢复。"""
+    返回对象本身；不存在/非法时返回 {"ok": False, "error": ...} 便于判错恢复。"""
     try:
         if not _SCOPE_RE.fullmatch(scope or ""):
             return {"ok": False, "error": f"scope 非法: {scope!r}"}
@@ -235,8 +94,19 @@ def stage_get_obj(scope: str, name: str):
     return obj
 
 
+def stage_scope_vars(scope: str) -> dict:
+    """返回某 scope 的全部会话级变量（**浅拷贝**），用于把它投影进新建 executor 的 state。
+    `_OBJ` 承担**会话级**那份（跨阶段存活）；本函数只是把它读出来的入口。"""
+    if not scope or not _SCOPE_RE.fullmatch(scope):
+        return {}
+    try:
+        with _OBJ_LOCK:
+            return dict(_OBJ.get(scope) or {})
+    except Exception:
+        return {}
+
+
 def stage_clear(scope: str) -> None:
-    """清空某 scope 的暂存（字符串区 _MEM + 活对象区 _OBJ），用于一次 run 结束防泄漏。"""
-    with _MEM_LOCK, _OBJ_LOCK:
-        _MEM.pop(scope, None)
+    """清空某 scope 的会话级变量存储，用于一次 run 结束防泄漏。"""
+    with _OBJ_LOCK:
         _OBJ.pop(scope, None)

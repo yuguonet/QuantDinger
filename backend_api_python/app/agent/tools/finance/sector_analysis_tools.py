@@ -28,6 +28,16 @@ def _to_int(val, default=0) -> int:
         return int(float(val))
     except (ValueError, TypeError):
         return default
+
+# 2026-09-15：东财 UA 必须是**完整**的 Chrome UA。截断版（缺 "(KHTML, like Gecko)…"）
+# 会被 push2.eastmoney.com 直接掐断连接（RemoteDisconnected，连状态码都不给）——
+# 与 market_cn/hot_sectors.py:23-26 的实测结论一致。本文件此前两处都在用截断版，
+# 这正是日志里 `Remote end closed connection without response` 的根因。
+_EM_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Referer": "https://data.eastmoney.com/",
+}
 def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, Any]]:
     """从东方财富直接获取热门板块排名（带 BK 代码）。"""
     fs_filter = _BOARD_TYPE_MAP.get(board_type)
@@ -36,10 +46,7 @@ def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, An
     try:
         import requests
         url = "https://push2.eastmoney.com/api/qt/clist/get"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://data.eastmoney.com/",
-        }
+        headers = _EM_HEADERS
         params = {
             "pn": 1, "pz": limit, "po": 1, "np": 1, "fltt": 2, "invt": 2,
             "fid": "f3", "fs": fs_filter,
@@ -67,42 +74,92 @@ def _fetch_em_hot_sectors(board_type: str, limit: int = 15) -> List[Dict[str, An
     except Exception as e:
         logger.warning("_fetch_em_hot_sectors(%s) 失败: %s", board_type, e)
         return []
+def _merge_em_rows(rows: List[Dict[str, Any]], em_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """用东财结果按**板块名**富化主源行：补 BK 代码与涨停家数。
+
+    新浪主源缺这两项（代码是新浪自有编码、`limit_up_count` 恒为 0），而下游
+    `get_sector_detail(board_code)` 需要 BK 代码 ⇒ 东财成功时按名对齐补上；
+    东财失败则原样返回——**不再**让主结果变成空数组。
+    """
+    if not em_rows:
+        return rows
+    by_name = {str(r.get("name") or "").strip(): r for r in em_rows if isinstance(r, dict)}
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row = dict(row)
+        e = by_name.get(str(row.get("name") or "").strip())
+        if e:
+            if e.get("code"):
+                row["code"] = e["code"]                 # 换成 BK 代码，下游可直接用
+            if _to_int(e.get("limit_up_count")):
+                row["limit_up_count"] = _to_int(e.get("limit_up_count"))
+            if e.get("leading_stock"):
+                row["leading_stock"] = e["leading_stock"]
+        # 新浪字段名是 lead_stock，对外统一成 leading_stock
+        row["leading_stock"] = row.get("leading_stock") or row.get("lead_stock", "")
+        out.append(row)
+    return out
+
+
 def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
     """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股。
 
-    数据源为东方财富，返回的 code 字段为可直接使用的 BK 板块代码。
+    2026-09-15 主源改为**新浪**（经 market_cn.china_market，其内部已是"新浪优先、
+    东财兜底"）。东财退为**富化源**，只负责补 BK 板块代码与涨停家数。
+
+    改动原因（事故）：此前 industry/concept **只**取自东财。东财被反爬掐断后
+    （`RemoteDisconnected`；且本文件当时用的是必被掐断的截断 UA）两个列表直接变
+    空数组，而同一时刻新浪的数据是好的 ⇒ 数据丢了却静默、无人察觉。
+    现在东财挂掉不影响主结果。
 
     Args:
         industry_limit: 行业板块数量，默认15
         concept_limit: 概念板块数量，默认15
     """
     try:
-        industry = _fetch_em_hot_sectors("industry", industry_limit)
-        concept = _fetch_em_hot_sectors("concept", concept_limit)
-
         from app.market_cn.china_market import get_hot_sectors as _get
-        result = _get(industry_limit=industry_limit, concept_limit=concept_limit)
-        analysis = (result.get("data") or {}).get("analysis") if isinstance(result, dict) else None
 
-        _r = {
-            "timestamp": result.get("data", {}).get("timestamp", ""),
-            "industry": [{
-                "code": s.get("code", ""),
-                "name": s.get("name", ""),
-                "change_pct": s.get("change_pct", 0),
-                "limit_up_count": s.get("limit_up_count", 0),
-                "leading_stock": s.get("leading_stock", ""),
-            } for s in industry],
-            "concept": [{
-                "code": s.get("code", ""),
-                "name": s.get("name", ""),
-                "change_pct": s.get("change_pct", 0),
-                "limit_up_count": s.get("limit_up_count", 0),
-                "leading_stock": s.get("leading_stock", ""),
-            } for s in concept],
-            "analysis": analysis or {},
+        result = _get(industry_limit=industry_limit, concept_limit=concept_limit)
+        data = (result or {}).get("data") or {}
+
+        # ① 主源：新浪优先的行业标准链路
+        industry = list(data.get("industry") or [])
+        concept = list(data.get("concept") or [])
+
+        # ② 东财富化（失败不影响主源）
+        em_limit = max(int(industry_limit or 0), int(concept_limit or 0)) or 15
+        em = {bt: _fetch_em_hot_sectors(bt, em_limit) for bt in ("industry", "concept")}
+        industry = _merge_em_rows(industry, em.get("industry") or [])
+        concept = _merge_em_rows(concept, em.get("concept") or [])
+
+        # ③ 主源也空（新浪与东财兜底同时失败）时，东财才降级为唯一来源
+        if not industry:
+            industry = em.get("industry") or []
+        if not concept:
+            concept = em.get("concept") or []
+
+        def _slim(rows, limit):
+            out = []
+            for s in rows[:limit]:
+                if not isinstance(s, dict):
+                    continue
+                out.append({
+                    "code": s.get("code", ""),
+                    "name": s.get("name", ""),
+                    "change_pct": s.get("change_pct", 0),
+                    "limit_up_count": _to_int(s.get("limit_up_count")),
+                    "leading_stock": s.get("leading_stock") or s.get("lead_stock", ""),
+                })
+            return out
+
+        return {
+            "timestamp": data.get("timestamp", ""),
+            "industry": _slim(industry, industry_limit),
+            "concept": _slim(concept, concept_limit),
+            "analysis": data.get("analysis") or {},
         }
-        return _r
     except Exception as e:
         logger.warning("get_hot_sectors failed: %s", e)
         return {"error": str(e)}
@@ -207,10 +264,7 @@ def _build_board_name_cache() -> Dict[str, Dict[str, str]]:
     try:
         import requests
         url = "https://push2.eastmoney.com/api/qt/clist/get"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://data.eastmoney.com/",
-        }
+        headers = _EM_HEADERS
         for board_type, fs_filter in _BOARD_TYPE_MAP.items():
             params = {
                 "pn": 1, "pz": 500, "po": 1, "np": 1, "fltt": 2, "invt": 2,

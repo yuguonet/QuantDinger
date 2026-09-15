@@ -149,6 +149,9 @@ class GuidedPythonExecutor(LocalPythonExecutor):
         self._authoritative_tools: dict = {}
         # 同一错误签名的出现次数（2026-09-14）：让"重复撞同一面墙"在错误信息里显式化。
         self._err_counts: dict[str, int] = {}
+        # 2026-09-15 两级统一：非空时，**每次执行后**把模型命名变量促升到该 scope 的
+        # 会话级存储（跨阶段续承）。由 task_agent 在拿到 run_scope 后设置。
+        self.session_vars_scope: str | None = None
 
     def _tool_names(self) -> list:
         """真实可用的**工具名**（业务工具 + agent 工具），不含 Python 内置。
@@ -203,7 +206,8 @@ class GuidedPythonExecutor(LocalPythonExecutor):
             return (
                 f"[属性访问] 无法访问属性 `{dm.group(1)}`。\n"
                 f"替代写法：查看类型用 print(type(x))；查看内容用 print(str(x)[:500])。\n"
-                f"若数据来自 stage_read：它返回 JSON 文本，需先 data = json.loads(raw)。"
+                f"若数据来自变量（工具返回值）：非字符串内容返回的是**活对象**，直接当 dict/list 用"
+                f"（无需 json.loads）；只有文本类内容才是字符串。"
             )
         im = _IMPORT_RE.search(err_text)
         if im:
@@ -328,15 +332,53 @@ class GuidedPythonExecutor(LocalPythonExecutor):
         except Exception:
             return False
 
+    # ── 两级统一的促升（2026-09-15）────────────────────────────────────────
+    # 两级共用同一个投递方式（executor.state 里的 Python 变量），差别只在**能否越过
+    # 快照边界**：本方法负责把"模型自己命名"的变量写进会话级存储，由它跨阶段存活。
+    #
+    # 排除三类，否则会把下一阶段的命名空间搞脏：
+    #   ① 解释器内部项（__name__ / _print_outputs）；
+    #   ② 注入进 state 的工具与函数本体（callable）——它们每阶段都会重装；
+    #   ③ 2 级自动变量 `_r_*`：工具原始载荷量大且属本阶段过程数据，不该跨阶段堆积。
+    #      模型若确实要留到下阶段，只需 `quotes = _r_quotes_1` 起自己的名字。
+    _NON_VAR_STATE_KEYS = frozenset({"__name__", "_print_outputs"})
+
+    def _promote_model_vars(self) -> int:
+        """把本次执行后 state 中的模型命名变量促升到会话级。返回促升个数。"""
+        scope = getattr(self, "session_vars_scope", None)
+        if not scope:
+            return 0
+        try:
+            from infra.staging import stage_put_obj as _put
+        except Exception:
+            return 0
+        promoted = 0
+        for name in list(self.state.keys()):
+            if name in self._NON_VAR_STATE_KEYS or name.startswith("_r_"):
+                continue
+            try:
+                value = self.state[name]
+            except Exception:
+                continue
+            if callable(value):          # 工具/函数本体不是数据变量
+                continue
+            try:
+                if _put(scope, name, value):
+                    promoted += 1
+            except Exception:
+                continue
+        return promoted
+
     def __call__(self, code_action: str):
         # 注：`_scan_dangerous` + `_approve`（先征求用户确认再执行）已实现但**暂不接线**。
         # 2026-09-14 试接入时破坏了 15 项既有测试——危险模块一旦进白名单，smolagents 不再报
         # "import 不允许"，改由本层拦截；而 pytest/服务是非交互环境，无人可问只能拒绝，
         # 导致错误语义全变。确认机制须作为**独立一层**（在 agent 执行前、带默认策略与
         # 测试替身）重新设计，不能塞进执行器。保持硬拦（错误语义稳定）直到那时。
+        # 只在**执行成功**后促升：失败的代码块不产出可信变量。
         try:
             self._reinstall_tools()
-            return super().__call__(code_action)
+            out = super().__call__(code_action)
         except Exception as e:
             text = str(e)
             # 需要改写的三类：幻觉工具调用 / 属性误用 / import 越界（v3 新增）。
@@ -345,3 +387,9 @@ class GuidedPythonExecutor(LocalPythonExecutor):
                     or "dunder attribute" in text or _IMPORT_RE.search(text)):
                 raise InterpreterError(self._rewrite(text)) from None
             raise
+        try:
+            self._promote_model_vars()
+        except Exception as _pe:
+            # 促升失败不得影响主流程，但必须留痕——本项目多次栽在"静默吞掉"。
+            logger.warning("[GuidedPythonExecutor] 会话级变量促升失败: %s", _pe)
+        return out

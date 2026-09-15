@@ -21,9 +21,8 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 元工具不参与熔断（模型的自救通道必须始终可用）
-_META_TOOLS = {"search_tools", "list_tools", "format_result", "web_search",
-               "final_answer", "stage_write", "stage_read", "stage_list"}
+# 跨阶段变量续承由框架内部存储自动投影，元工具不参与熔断（模型自救通道必须始终可用）
+_META_TOOLS = {"search_tools", "list_tools", "format_result", "web_search", "final_answer"}
 
 
 class ToolCircuitBreaker:

@@ -48,7 +48,7 @@ from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 from infra.resilient_parse import apply as _apply_resilient_parse, resilient_parse_code_blobs
 from infra.breaker import ToolCircuitBreaker
 from infra.guided_executor import DANGEROUS_IMPORTS, GuidedPythonExecutor
-from infra.staging import stage_write, stage_read, stage_list, stage_get_obj, stage_put_obj
+from infra.staging import stage_scope_vars
 
 # 使用 app.agent logger（与 log.py 配置一致，确保日志写入文件）
 try:
@@ -86,12 +86,15 @@ _CODE_AGENT_YAML_PATH = os.path.join(
     os.path.dirname(__file__), "..", "prompts", "code_agent.yaml"
 )
 
-# Phase 契约常量（2026-09-12 B 阶段接线）：
-# 外部 planner 产出 phases[] 契约，execute_node 降为单 phase 轮询执行
-# （route_after_execute 条件边形成循环，全部完成才进 finalize）。
+# Phase 契约常量（2026-09-12 B 阶段接线；2026-09-15 批次化改造）：
+# 外部 planner 产出 phases[] 契约，execute_node 按"批次"轮询执行——
+# 连续非边界 phase 合并为一批，一次 CodeAgent 跑完（省去逐阶段重新初始化的 token/时间）；
+# barrier 阶段独占一批；replan 阶段发重规划信号。route_after_execute 条件边形成循环，
+# 全部阶段完成才进 finalize。
 PLAN_MAX_PHASES = 5          # 单次 plan 的阶段数上限（超出截断）
 PLAN_PHASE_MAX_RETRIES = 1   # 单阶段默认重试上限（phase.max_retries 可覆盖，钳制 [0,3]）
 PLAN_PHASE_MAX_STEPS = 12    # 单阶段内部步数上限（phase.step_budget 钳制上界，2026-09-13）
+PLAN_BATCH_MAX_STEPS = 30     # 批次级步数上限（合并批次预算之和的封顶，2026-09-15 批次化）
 
 # planner 工具清单条数上限（2026-09-13 审计 L7）。原先固定 60 且按字母序截断：
 # 工具总数接近/超过该值时被砍掉的是"字母序靠后"的工具，与需求无关，会整批丢掉
@@ -150,6 +153,11 @@ def _sandbox_instructions() -> str:
         "【执行环境】Python 标准库与已安装的第三方库均可 import（无白名单限制）。\n"
         "沙箱内只做演示：有限次循环 + print 输出要点；完整源码在最终答复里一次性给出，"
         "不要在沙箱内重复打印整份源码。\n"
+        "【工具返回值】工具**直接返回数据本身**：赋给变量即可复用（如 quotes = get_daily(...)），"
+        "该变量在本阶段后续步骤始终可用，并会自动续承到下一阶段（跨阶段无需任何读写调用）。"
+        "结果另有一份兜底登记在 `_r_<工具名>`（如 _r_get_daily），没赋值时也能按名取回。"
+        "**不要把裸调用 tool() 放在代码最后一行**——那样返回值会整份进观测、撑爆上下文；"
+        "要查看就打印提炼后的关键字段。\n"
         "2026-09-14 实测：`break`/`continue` **不能放在 `try/except Exception` 里面**——"
         "本沙箱用异常实现循环控制（BreakException 继承 Exception），会被你的 except 捕获 "
         "⇒ 循环无法终止、同一逻辑反复执行。需要中途退出时，把 break 放在 try 块之外，"
@@ -157,72 +165,70 @@ def _sandbox_instructions() -> str:
     )
 
 
-# 引擎级重数据自动落盘（2026-09-12）：provider 工具返回超过阈值时自动写入本次 run
-# 暂存区，观测只留"已落盘说明+预览"，完整数据由模型在沙箱内经 stage_read 读取再做计算
-# （阶段间可依赖，观测受控 → 上下文不膨胀）。阈值可经 TOOL_OUTPUT_STAGE_CHARS 调整。
-# 2026-09-14：默认 1500 过低——金融工具（指数/板块/资金流）动辄数千字符，几乎每次都
-# 触发落盘，逼模型多走一步 stage_read，还容易踩"返回类型变了"的坑。提到 6000
-# （与 CODE_MAX_PRINT_CHARS 同量级），只对真正的大结果落盘。仍可用环境变量调回。
-_TOOL_OUTPUT_STAGE_CHARS = int(os.getenv("TOOL_OUTPUT_STAGE_CHARS", "6000"))
-_auto_stage_seq = [0]
+# ── 两级全局变量：**统一实现**（2026-09-15 用户定调）────────────────────────
+# 两级共用**同一个投递方式**——`executor.state` 里的 Python 变量：
+#   2 级（本阶段内跨 step）= smolagents 原生 executor.state。
+#      LocalPythonExecutor.__call__ 每次传的都是同一个 self.state（1747-1752 行），
+#      故 step N 赋的变量 step N+1 仍在；executor 随阶段重建而消亡，无需清理。
+#   1 级（跨 phase / 整个 run）= 同样是 state 变量，只是**是否被促升**的区别：
+#      · 促升：`GuidedPythonExecutor._promote_model_vars()` 每步执行后把模型命名的
+#        变量写入 `infra/staging.py` 的会话级存储（退化为框架内部实现，非模型 API）；
+#      · 投影：新建 executor 时（本文件下方）把该 scope 的变量装回 state。
+#
+# 统一后模型无需任何读写调用，只需记住一条：
+#   工具**直接返回数据本身** —— 想在本阶段后续步骤复用就赋值给自己的变量
+#   （`quotes = get_daily(...)`），该变量即跨阶段续承；工具结果另有一份兜底登记在
+#   `_r_<工具名>`（模型没赋值时也能按名取回）。
+#
+# 为什么要把 per-step 数据从 1 级桶里挪出来（旧实现 _wrap_stage_guard 写 run 作用域 _OBJ）：
+#   ① 与刻意交接的数据抢 _OBJ_MAX_PER_SCOPE=200 的 FIFO 名额，长跑会挤掉跨阶段数据；
+#   ② 该作用域会被 auto-*.obj 噪声淹没，违背"点名即可引用"；
+#   ③ 需要 json.loads / 取回调用，多一步且易踩类型坑。
+#
+# 实现"抄作业"：照 smolagents 自带的重结果范式（agents.py:1398-1399 存进 state、
+# 观测只留 `Stored 'x' in memory.`），并**对所有结果统一生效**——不分大小，
+# 避免模型去写 `if 'staged' in r` 之类的分支。
+def _tool_result_var(tool_name: str) -> str:
+    """工具结果变量的**确定性**名字：`_r_<工具名>`。
 
-
-def _wrap_stage_guard(fn, tool_name, scope):
-    """工具返回过大 → 自动 stage_write 落盘，返回占位 dict（F3 引擎级数据纪律）。
-
-    仅包 provider 工具函数（阶段白名单/领域/通用 + 能力）；暂存区三件套与技能工具
-    Tool 实例不受影响（stage_read 的大返回不必二次落盘）。scope 为空时不启作用。
+    2026-09-15 实测事故：早先用带序号的名字（`_r_xxx_1`），模型**事前无法知道名字**
+    ⇒ 只能先调一次拿到名字、下一步才能引用，硬生生把"取数 + 取回"拆成两个 step
+    （Step1 发现名字、Step2 才用得上）。名字可由工具名推导后，同一代码块内就能
+    `get_xxx(...)` 紧接着 `data = _r_get_xxx`，合并回一步。
+    同名重复调用会覆盖上一个结果——需要留旧值就自己赋值给别的名字。
     """
-    if not scope:
+    base = re.sub(r"\W", "_", str(tool_name or ""))[:60]
+    vname = "_r_%s" % base
+    return vname if vname.isidentifier() else "_r_result"
+
+
+def _wrap_stage_guard(fn, tool_name, executor=None):
+    """把工具结果**顺带**登记进 executor.state（`_r_<工具名>`），并**原样返回数据本身**。
+
+    2026-09-15 第二次修订：上一版返回"变量名提示字符串"，于是 `x = tool()` 拿到的是
+    **通知**而不是数据 ⇒ 模型被迫多走一步去取回（实测 Step1 发现名字、Step2 才用）。
+    改回原样返回后：
+      · `x = tool()` 一步拿到真数据；且赋值不产生 code output ⇒ **不会进观测**；
+      · 结果同时登记进 `_r_<工具名>`，模型万一没赋值，仍能按确定性名字取回。
+
+    唯一回归风险：把**裸调用** `tool()` 写在代码块最后一行时，返回值会整份进观测
+    （`_truncate_observations` 只截断 `keep_recent` 之前的旧步骤，当前步不截）。
+    已用提示词约束该写法（见 _sandbox_instructions）。
+
+    executor 为 None 时退化为原样返回（不登记）。
+    """
+    if executor is None:
         return fn
-    import json as _json
-    _stage_write = stage_write  # 标准 import（infra.staging）
-    _stage_put_obj = stage_put_obj  # 活对象入库（跳过 str→json.loads 往返）
+    vname = _tool_result_var(tool_name)
 
     def wrapper(*args, **kwargs):
         result = fn(*args, **kwargs)
         try:
-            # 仅用于量长度/预览；不再是存储内容（避免 str→json.loads 往返的解析坑）
-            if isinstance(result, (dict, list)):
-                text = _json.dumps(result, ensure_ascii=False, default=str)
-            else:
-                text = str(result)
-        except Exception:
-            return result
-        if len(text) <= _TOOL_OUTPUT_STAGE_CHARS:
-            return result
-        _auto_stage_seq[0] += 1
-        fname = ("auto-" + re.sub(r"[^A-Za-z0-9.-]", "-", str(tool_name))[:50]
-                 + "-%d.obj" % _auto_stage_seq[0])
-        try:
-            if _stage_put_obj is None:
-                return {"note": "[暂存区不可用] %s 结果 %d 字符超出阈值(%d)" % (
-                    tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS),
-                    "preview": text[:1200]}
-            ok = _stage_put_obj(scope, fname, result)
+            executor.state[vname] = result
         except Exception as e:
-            return {"note": "[%s] 结果过大且暂存失败: %s" % (tool_name, e),
-                    "preview": text[:1200]}
-        if ok:
-            # 2026-09-14（修订）：结果以**活对象**入库（stage_put_obj），跳过 str→json.loads。
-            # 取回用 stage_get_obj(scope, fname) 直接拿回原对象，无需解析——
-            # 根除此前连撞 TypeError(unhashable)/IndexError/AttributeError 的绕路。
-            return {
-                "staged": True,
-                "file": fname,
-                "scope": scope,
-                "chars": len(text),
-                "python_type": type(result).__name__,
-                "note": ("[%s] 结果 %d 字符超出阈值(%d)，已存入内存对象区（非字符串）。"
-                         "取回方式：obj = stage_get_obj('%s', '%s') —— 它**直接返回活对象**，"
-                         "无需 json.loads，可直接当 %s 用（如 obj.items()/索引）。"
-                         "不要用 stage_read（那是字符串路径）；也不要 print 整个对象。"
-                         % (tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS,
-                            scope, fname, type(result).__name__)),
-                "preview": text[:800],
-            }
-        return {"note": "[暂存区不可用] %s 结果 %d 字符超出阈值(%d)" % (
-            tool_name, len(text), _TOOL_OUTPUT_STAGE_CHARS), "preview": text[:1200]}
+            logger.warning("[stage-guard] %s 结果登记进 state 失败（不影响返回值）: %s",
+                           tool_name, e)
+        return result
 
     return wrapper
 
@@ -310,6 +316,13 @@ def _normalize_phases(raw, available_names: set) -> list:
         # 职责错位（审计 G2）。None = 未声明，执行侧按阶段预算判复杂度兜底。
         _ip = p.get("internal_plan", None)
         internal_plan = bool(_ip) if isinstance(_ip, (bool, int)) else None
+        # 批次边界（2026-09-15 批次化）：barrier = 目标已知但依赖上游运行结果 → 独占一批；
+        # replan = 目标本身未知（需看结果才能定）→ 触发重规划。二者默认 False（普通顺序阶段，
+        # 与后续非边界阶段合并成批）。契约层只负责规格化，切片决策在 _run_phase_step。
+        _bar = p.get("barrier", False)
+        barrier = bool(_bar) if isinstance(_bar, (bool, int)) else False
+        _rp = p.get("replan", False)
+        replan = bool(_rp) if isinstance(_rp, (bool, int)) else False
         out.append({
             "id": len(out) + 1,
             "name": (str(p.get("name") or "").strip() or f"阶段{len(out) + 1}")[:40],
@@ -319,6 +332,8 @@ def _normalize_phases(raw, available_names: set) -> list:
             "deliverable": p.get("deliverable") or "",
             "step_budget": pbudget,
             "internal_plan": internal_plan,
+            "barrier": barrier,
+            "replan": replan,
             "acceptance": [str(a)[:300] for a in acc][:8],
             "on_fail": on_fail,
             "max_retries": mr,
@@ -1450,8 +1465,10 @@ class TaskAgent(AgentBase):
         domain: 领域名，用于过滤工具。
         tools: phase 工具白名单（2026-09-12 B 阶段）。非空→只注入白名单内的 provider 工具；
             空或 None→回退 domain 逻辑（调用方传 domain="" 时回退为仅通用工具）。
-        run_scope: 本次 run 的暂存区 scope（2026-09-12 F3）——非 None 时，provider
-            工具返回超过阈值会自动 stage_write 落盘，观测只留占位 + 预览。
+        run_scope: 本次 run 的暂存区 scope（2026-09-12 F3）。**1 级（跨阶段）通道**
+            由 nodes 侧驱动（任务书告知 scope、_auto_stage_phase_result 写阶段结果），
+            本形参自 2026-09-15 起在本方法体内不再被消费（工具结果改走 2 级
+            executor.state），保留仅为调用侧兼容。
         extra_tools: 单段路径的**附加点名**（2026-09-13，修能力层断链）。与上面三支的
             "基调"是并集而非替代——phases[].tools 才是独占白名单；tools 非空时本参数不生效。
             用途：无阶段的单段任务点名取数能力（capabilities 不属于任何可选域，不点名注入不到）。
@@ -1485,10 +1502,26 @@ class TaskAgent(AgentBase):
         # 补救通道 = smol_tools 的 search_tools/list_tools（只读探查，不产生调用能力）。
         # 附加点名（2026-09-13）：只在非白名单模式（单段路径）生效，与基调做并集，
         # 不改变"domain 决定基调"的既有语义（见 extra_tools 说明）。
-        _extra = {str(t) for t in (extra_tools or [])} if not tools else set()
+        # 工具名归一化（防御性）：剥掉 planner 可能带上的 "()" / 空白，
+        # 与 nodes.py 收集 union_tools 同一规则，避免白名单名字和 provider 注册名
+        # 差一个括号就被静默丢弃
+        def _norm_tool_name(_t):
+            s = str(_t).strip()
+            if s.endswith("()"):
+                s = s[:-2].strip()
+            return s
+
+        _extra = {_norm_tool_name(t) for t in (extra_tools or [])} if not tools else set()
         if tools:
-            allowed = set(str(t) for t in tools)
-            tool_functions = {n: f for n, f in provider.get_functions().items() if n in allowed}
+            allowed = {_norm_tool_name(t) for t in tools}
+            _prov_fns = provider.get_functions()
+            tool_functions = {n: f for n, f in _prov_fns.items() if n in allowed}
+            # 落空告警（2026-09-15）：白名单名字在 provider 找不到 → 静默丢弃会让
+            # “planner 以为能用 / 执行时 Forbidden”的断链重演；命中与落空都如实入日志
+            _miss = sorted(allowed - set(_prov_fns))
+            if _miss:
+                logger.warning("[TaskAgent] phase 白名单 %d 个名字 provider 中不存在（已忽略）：%s",
+                               len(_miss), _miss[:12])
             logger.info("[TaskAgent] phase 白名单：加载 %d 个工具 %s", len(tool_functions),
                         sorted(tool_functions)[:12])
         elif domain:
@@ -1520,19 +1553,14 @@ class TaskAgent(AgentBase):
             sname = getattr(st, "name", "unknown")
             tool_functions[sname] = st
 
-        # 暂存区工具常驻（2026-09-12 设计；2026-09-14 修接线）：任务书数据纪律要求
-        # 跨阶段重数据用 stage_write/stage_read/stage_list，但 phase 白名单模式会漏注入
-        # → 模型按说明调用即触发 Forbidden（误报"幻觉调用"）。三个工具与技能工具同级常驻。
-        #
-        # 原实现是"provider 里若已注册则补注入"，而 v2.0 把 staging 从 tools/ 迁到
-        # infra/ 后它不再被目录扫描注册（_SKIP_FILES 里仍留着迁移前的旧名
-        # "staging_tools"）→ 该条件恒假：三件套在沙箱里从未存在过，而引擎自动落盘
-        # （下方 _wrap_stage_guard）返回的却正是"用 stage_read(scope, name) 读取"、
-        # 任务书也写着"暂存区工具常驻可用"——又一次"声明了、没接上、静默"。
-        # 常驻就直连函数本体，不依赖 provider 的扫描结果（框架工具 ≠ 插件工具）。
-        for _stn, _fn in (("stage_write", stage_write), ("stage_read", stage_read),
-                          ("stage_list", stage_list), ("stage_get_obj", stage_get_obj)):
-            tool_functions.setdefault(_stn, _fn)
+        # ── 2026-09-15：两级统一为同一个投递方式（executor.state 里的 Python 变量）──
+        # 两级统一为同一个投递方式：executor.state 里的 **Python 变量**。
+        #   2 级 = 工具结果与本阶段内变量（含自动生成的 `_r_*`）；
+        #   1 级 = 模型起过名、被促升后跨阶段续承的变量。
+        # 跨阶段续承不再靠任何读写调用，而靠两个框架动作：
+        #   ① `GuidedPythonExecutor._promote_model_vars()` —— 每步执行后促升到会话级；
+        #   ② 下方投影 —— 新建 executor 时把会话级变量装回 state。
+        # 存储层 `infra/staging.py` 仅作框架内部实现（会话级变量存储），不进模型工具面。
 
         # final_answer：必须抛 FinalAnswerException，smolagents 据此判定 is_final_answer=True
         def _final_answer(answer=None, **kwargs):
@@ -1630,14 +1658,14 @@ class TaskAgent(AgentBase):
         # 熔断包装：跳过熔断包装，工具正常调用。
         if not hasattr(self, "_tool_breaker"):
             self._tool_breaker = _global_breaker
-        # 引擎级重数据落盘（F3）：provider 工具函数按返回大小自动入暂存区。
-        # 跳过暂存区三件套（自身返回小 / stage_read 大返回无需二次落盘）；技能工具是
-        # Tool 实例而非纯函数，json.dumps 探测无意义，一并跳过（文档读取内容受控）。
-        _staged_names = ("stage_write", "stage_read", "stage_list")
+        # 2 级全局变量（2026-09-15）：provider 工具函数的结果统一存进 executor.state
+        # （smolagents 原生，寿命=本阶段），返回变量名提示；不再按返回大小判定，
+        # 也不再进 1 级 run 作用域全局区（那条通道仅供跨阶段交接）。
+        # 技能工具是 Tool 实例而非纯函数，跳过包装（文档读取内容受控）。
         for _n in list(tool_functions.keys()):
-            if _n in _staged_names or not inspect.isfunction(tool_functions[_n]):
+            if not inspect.isfunction(tool_functions[_n]):
                 continue
-            tool_functions[_n] = _wrap_stage_guard(tool_functions[_n], _n, run_scope)
+            tool_functions[_n] = _wrap_stage_guard(tool_functions[_n], _n, executor)
         if hasattr(self, "_tool_breaker"):
             tool_functions = {
                 name: self._tool_breaker.wrap(name, fn)
@@ -1676,6 +1704,22 @@ class TaskAgent(AgentBase):
                     len(tool_functions),
                     len(getattr(executor, "custom_tools", {}) or {}),
                     len(getattr(executor, "state", {}) or {}))
+
+        # ── 会话级变量投影（2026-09-15 两级统一的核心一步）──
+        # 新建 executor = 全新命名空间，上一阶段的变量**不在作用域里**；这里把该
+        # run_scope 下已促升的变量投影回 state，模型下一阶段就能**直接用同名变量**。
+        # 安全性：smolagents run() 开始时只做 send_variables（= state.update，**合并**
+        # 而非替换），不会清掉此处注入的内容（agents.py:490-491 实证）。
+        try:
+            if run_scope:
+                executor.session_vars_scope = run_scope
+                prev = stage_scope_vars(run_scope)
+                if prev:
+                    executor.send_variables(prev)
+                    logger.info("[TaskAgent] 已续承会话级变量 %d 个：%s",
+                                len(prev), ", ".join(sorted(prev)[:20]))
+        except Exception as e:
+            logger.warning("[TaskAgent] 会话级变量投影失败（本阶段无续承）: %s", e)
 
         # ── 必选工具：注册为 smolagents Tool，放入 tools=[] ──
         # 注意：tools= 在本项目下**不会**"随 system prompt 下发工具描述"（原因与
@@ -1751,15 +1795,13 @@ class TaskAgent(AgentBase):
                 # （E2E 实证：列出白名单外工具 → 执行器反复试探"搜到但调不动"）
                 if tools is not None:
                     if not tools:
-                        return ("本阶段无数据工具（暂存区 stage_write/stage_read/stage_list "
-                                "与 search_tools 仍可用）。")
+                        return "本阶段无数据工具（search_tools 仍可用）。"
                     lines = [f"本阶段可用工具 ({len(tools)})："]
                     for _n in tools:
                         _fn = provider.get(_n)
                         _desc = (getattr(_fn, "__doc__", "") or "").strip().split("\n")[0][:100]
                         lines.append(f"  - {_n}{_sig(_fn)} — {_desc}" if _desc
                                      else f"  - {_n}{_sig(_fn)}")
-                    lines.append("（另：stage_write/stage_read/stage_list 暂存区工具常驻可用）")
                     return "\n".join(lines)
                 if not domain:
                     # 空 domain 在 provider 语义里=仅通用工具（E2E 实证误导）；默认列全部
@@ -1994,8 +2036,8 @@ class TaskAgent(AgentBase):
             planning = custom_templates.get("planning", {})
             if isinstance(planning, dict) and provider:
                 if tools:
-                    # 暂存区工具常驻（2026-09-12）：与 executor 注入保持一致
-                    allowed_names = set(str(t) for t in tools) | {"stage_write", "stage_read", "stage_list", "stage_get_obj"}
+                    # 2026-09-15：stage_* 已不是工具；planning 可选范围就是本阶段白名单本身
+                    allowed_names = set(str(t) for t in tools)
                 elif domain:
                     allowed_names = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
                 else:

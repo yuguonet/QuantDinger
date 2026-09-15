@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -81,28 +82,53 @@ class Retriever:
 
     @staticmethod
     def format_context(docs: list[dict], max_length: int = 8000) -> str:
-        """
-        将检索结果格式化为上下文文本
+        """将检索结果格式化为上下文文本（**只保留有效相关度的文档**）。
 
-        :param docs: 检索结果列表
-        :param max_length: 上下文最大长度
-        :return: 格式化的上下文文本
+        Args:
+            docs: 检索结果列表
+            max_length: 上下文最大长度（按字符软截断）
+
+        相关性过滤（用户诉求：低相关度不应作为参考资料）：
+        不同召回源的分数量纲不统一——Reranker 输出 [0,1]、RRF 融合分上限≈0.016、
+        Postgres ts_rank 是另一套小数。因此**不用绝对阈值**（否则会清空纯 RRF 召回，
+        即审计 P0-2 的回归），改用**相对阈值**：以本批最高相关性为基准，
+        `score < best * RAG_REF_MIN_RATIO` 视为无关噪音剔除。
+        另设**绝对地板** `RAG_REF_ABS_FLOOR`，但**仅当本批最高分 > 0.1** 时才启用——
+        最高分 ≤0.1 说明是 RRF 尺度（其最高分本就 ≤0.016），此时禁用绝对地板以免误伤。
+        哪怕整批都弱，也会保留相关性最高的那一条作兜底，避免参考资料整段变空。
         """
         if not docs:
             return ""
 
+        _ratio = float(os.getenv("RAG_REF_MIN_RATIO", "0.3"))
+        _abs_floor = float(os.getenv("RAG_REF_ABS_FLOOR", "0.1"))
+        _ratio = _ratio if 0 < _ratio < 1 else 0.3
+
+        # 本批最高相关性（score 缺失/非数视为 0），作相对阈值基准。
+        best = max((float(d.get("score", 0) or 0) for d in docs), default=0.0)
+        rel_floor = best * _ratio
+        # 仅在高分尺度（非 RRF）启用绝对地板，保护纯 RRF 召回不被清空。
+        abs_floor = _abs_floor if best > 0.1 else 0.0
+
         parts = []
         total_len = 0
-        for i, doc in enumerate(docs):
+        kept = 0
+        for doc in docs:
             content = doc.get("content", "")
-            score = doc.get("score", 0)
+            score = float(doc.get("score", 0) or 0)
             source = doc.get("metadata", {}).get("source", "unknown")
 
-            part = f"[参考{i + 1}] (相关度: {score:.2f}, 来源: {source})\n{content}"
+            # 过滤：弱于**相对阈值或绝对地板任一**即视为噪音；相关性最高的一条始终保留作兜底。
+            is_best = (score >= best - 1e-9)
+            if (score < rel_floor or score < abs_floor) and not is_best:
+                continue
+
+            part = f"[参考{kept + 1}] (相关度: {score:.2f}, 来源: {source})\n{content}"
             if total_len + len(part) > max_length:
                 break
             parts.append(part)
             total_len += len(part)
+            kept += 1
 
         return "\n\n---\n\n".join(parts)
 
