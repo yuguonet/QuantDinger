@@ -6,8 +6,7 @@ Evaluator — 回溯评估引擎（重写版）。
 
 核心流程（每日盘后自动运行）：
   evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_traces
-  update_skill_weights()  → 按单位时间收益率聚合 Skill 权重 + 自动同步 registry
-  update_factor_weights() → 按单位时间收益率聚合因子权重（带时间衰减）+ 清理过期因子
+  update_weights()        → 统一更新 skill + factor 权重（原 update_skill_weights / update_factor_weights 已合并）
   auto_evaluate()         → 自动闭环
 
 核心指标：单位时间期望收益率（不是胜率）
@@ -94,13 +93,19 @@ def _get_actual_return(
         if not isinstance(klines, list) or len(klines) < 2:
             return None
 
-        from_str = from_date.strftime("%Y-%m-%d")
         base_idx = None
         for i, k in enumerate(klines):
             if not isinstance(k, dict):
                 continue
-            k_date = k.get("t", "")[:10]
-            if k_date >= from_str:
+            raw_date = str(k.get("t", ""))[:10]
+            try:
+                normalized = raw_date.replace("/", "-")
+                if len(normalized) == 8 and normalized.isdigit():
+                    normalized = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:8]}"
+                k_date = date.fromisoformat(normalized)
+            except (ValueError, TypeError):
+                continue
+            if k_date >= from_date:
                 base_idx = i
                 break
 
@@ -497,12 +502,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
     logger.info("[Evaluator] 权重更新: 同步 %d, skill %d, factor %d, 清理 %d",
                 stats["synced"], stats["skill_updated"], stats["factor_updated"], stats["factor_cleaned"])
     return stats
-def update_skill_weights(days: int = 90) -> Dict[str, Any]:
-    """兼容旧接口。"""
-    return update_weights(days)
-def update_factor_weights(days: int = 90) -> Dict[str, Any]:
-    """兼容旧接口。"""
-    return update_weights(days)
+
 # ═══════════════════════════════════════════════════════════════
 # 评估报告
 # ═══════════════════════════════════════════════════════════════

@@ -231,7 +231,7 @@ def _set_llm_timeout(agent, timeout_seconds: int):
         if llm_adapter and hasattr(llm_adapter, 'timeout'):
             llm_adapter.timeout = timeout_seconds
     except Exception as e:
-        logger.debug("[Execute] 设置超时失败: %s", e)
+        logger.warning("[Execute] 设置超时失败（LLM 调用可能沿用默认超时）: %s", e)
 
 
 def _record_tool_calls_to_trace(trace, agent):
@@ -335,6 +335,31 @@ def _record_tool_calls_to_trace(trace, agent):
 # 标记（无生产者的消费者），失败工具检测恒空（审计 P1-4）。现以 error 键为准，
 # _failed_tool 正则保留兼容历史数据。
 _FAILED_TOOL_KEYS = ("error", "err_msg", "error_msg", "_failed_tool")
+
+
+def _extract_token_usage(agent) -> dict:
+    """从 agent.memory.steps 提取 token 统计（smolagents 原生方式）。
+
+    smolagents 的 RunResult.token_usage 就是这么算的（agents.py:509-519）：
+    遍历所有 ActionStep + PlanningStep，累加 input_tokens / output_tokens。
+    返回 {"input": int, "output": int, "total": int} 或空 dict。
+    """
+    total_in, total_out = 0, 0
+    try:
+        from smolagents.memory import ActionStep, PlanningStep
+        for step in getattr(agent.memory, "steps", []) or []:
+            if not isinstance(step, (ActionStep, PlanningStep)):
+                continue
+            usage = getattr(step, "token_usage", None)
+            if usage is None:
+                continue
+            total_in += getattr(usage, "input_tokens", 0) or 0
+            total_out += getattr(usage, "output_tokens", 0) or 0
+    except Exception:
+        return {}
+    if total_in == 0 and total_out == 0:
+        return {}
+    return {"input": total_in, "output": total_out, "total": total_in + total_out}
 
 
 def _extract_failed_tools(agent, tool_provider=None) -> list:
@@ -470,14 +495,14 @@ def make_chat_node(ctx: NodeContext):
                     RAG_SCORE_THRESHOLD = 0.7
                     docs = [d for d in docs if (d.get("rerank_score") or 0) >= RAG_SCORE_THRESHOLD]
                 else:
-                    # RRF ????????2026-09-12 ???????? 0.01 ???
-                    # ??????????RRF ????weight/(60+rank)??????0.016?
-                    # 0.005 ? ?? rank>40 ???????????????
+                    # RRF 长尾过滤(2026-09-12 修复)：阈值 0.005 是经验值
+                    # 说明：RRF 的分数尺度是 weight/(60+rank)，单源上限约 0.016
+                    # 0.005 约等于 rank>40 的分数，低于此值视为长尾噪声
                     _rrf_min = float(os.getenv("RAG_RRF_MIN_SCORE", "0.005"))
                     _before = len(docs)
                     docs = [d for d in docs if (d.get("score") or 0) >= _rrf_min]
                     if len(docs) < _before:
-                        logger.info("[Chat] RAG RRF ????: %d ? %d ? (min=%.4f)",
+                        logger.info("[Chat] RAG RRF 长尾过滤：%d → %d 条 (min=%.4f)",
                                     _before, len(docs), _rrf_min)
                     docs = docs[: max(1, int(os.getenv("RAG_TOP_K", "5")))]
                 if docs:
@@ -722,7 +747,7 @@ def make_plan_node(ctx: NodeContext):
                         history_lines.append(f"{role}: {msg.content[:300]}")
                     history_text = "\n".join(history_lines)
             except Exception as e:
-                logger.debug("[Plan] 加载历史对话失败: %s", e)
+                logger.warning("[Plan] 加载历史对话失败（不影响主流程）: %s", e)
 
         # 意图类型映射
         _TASK_TYPE_DESC = {
@@ -1112,7 +1137,7 @@ def _extract_clean_phase_result(agent, result: str, limit: int = 4000) -> str:
             return obs[:limit]
     except Exception:
         pass
-    return result
+    return result[:limit]
 
 
 async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
@@ -1382,6 +1407,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
 
         if trace:
             _record_tool_calls_to_trace(trace, agent)
+            _tok = _extract_token_usage(agent)
+            if _tok:
+                trace.record("token_usage", _tok)
         failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
 
         # ── 批次内逐 phase 验收 ──
@@ -1684,9 +1712,12 @@ def make_execute_node(ctx: NodeContext):
         except Exception as e:
             logger.debug("[Execute] 关闭 LLM adapter 客户端失败: %s", e)
 
-        # ── trace: 从 agent memory 提取工具调用 ──
+        # ── trace: 从 agent memory 提取工具调用 + token 统计 ──
         if trace:
             _record_tool_calls_to_trace(trace, agent)
+            _tok = _extract_token_usage(agent)
+            if _tok:
+                trace.record("token_usage", _tok)
 
         # 从 agent memory 提取失败的工具调用（不追加到 result，由 finalize_node 处理）
         failed_tools = _extract_failed_tools(agent, ctx.tool_provider)

@@ -1679,24 +1679,17 @@ class TaskAgent(AgentBase):
         # "已注入 N 个"，但沙箱里一个都调不到，调用即被误报成"幻觉调用"
         # （2026-09-14 L16 事故：phase 白名单 6 个工具 + 暂存区三件套全部调不动，
         #   模型只能按提示改用纯 Python 硬算）。旧注入点在 executor 创建处，已移到这里。
-        # 登记权威工具表：executor 会在**每次执行前**重装它们。
-        # 阶段重试（复用 CodeAgent）会清空 custom_tools / state，只注入一次必然复发
-        # （详见 GuidedPythonExecutor.install_tools 的实证说明）。
+        # 统一注入：install_tools 内部同步 custom_tools / state / static_tools 三处。
+        # 阶段重试（复用 CodeAgent）会清空 custom_tools / state，只注入一次必然复发。
         try:
             executor.install_tools(tool_functions)
         except Exception as e:
             logger.warning("[TaskAgent] install_tools 不可用（回退直接赋值）: %s", e)
             executor.custom_tools = tool_functions
-
-        # 双保险：再用官方 `send_variables` 把同一批工具注入沙箱**全局 state**。
-        # `evaluate_call` 的查找顺序是 state → static_tools → custom_tools
-        # （local_python_executor.py:847-855），state 优先级最高，且**不会被
-        # send_tools 重置**（send_tools 只动 static_tools）。custom_tools 这条次路径
-        # 已经让"工具调不到"复发了三次，state 是官方且更靠前的一档。
-        try:
-            executor.send_variables(tool_functions)
-        except Exception as e:
-            logger.warning("[TaskAgent] 工具注入 state 失败（退化为仅 custom_tools）: %s", e)
+            try:
+                executor.send_variables(tool_functions)
+            except Exception:
+                pass
 
         # 日志同时打印沙箱**实际持有**的数量——只打印 len(tool_functions) 会在上述
         # 错位时给出误导数字（这是本次事故排查被带偏的直接原因）。
@@ -2006,6 +1999,18 @@ class TaskAgent(AgentBase):
                 return  # 无重复迹象、且步数还有余量 → 不干预（避免误伤正常推进的任务）
             memory_step.observations = obs + hint
 
+        def _check_final_answer(answer, memory, agent):
+            """验证 final_answer 不为空且非半成品。"""
+            if answer is None:
+                return False
+            text = str(answer).strip()
+            if not text:
+                return False
+            # 半成品检测：仍含裸 <code> 标签且无 final_answer 调用痕迹
+            if "<code>" in text and "final_answer" not in text:
+                return False
+            return True
+
         agent = SmolCodeAgent(
             tools=smol_tools,
             model=model,
@@ -2016,6 +2021,7 @@ class TaskAgent(AgentBase):
                 [_truncate_observations, _clarify_empty_output, _enforce_final_answer]
                 + ([_evt_hook] if _evt_hook is not None else [])
             ),
+            final_answer_checks=[_check_final_answer],
             instructions=(
                 _sandbox_instructions()
                 + "\n【数据补充策略】\n"

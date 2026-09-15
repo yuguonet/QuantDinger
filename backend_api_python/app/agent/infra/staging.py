@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 
 from app.utils.logger import get_logger
 
@@ -36,6 +37,10 @@ _MISSING = object()                   # stage_get_obj 未命中哨兵
 _OBJ_MAX_PER_SCOPE = int(os.getenv("STAGING_OBJ_MAX_PER_SCOPE", "200"))
 _OBJ_MAX_TOTAL = int(os.getenv("STAGING_OBJ_MAX_TOTAL", "1000"))
 
+# ── TTL 过期清理（防中途退出泄漏） ──
+_SCOPE_TS: dict = {}                  # scope -> last_write_timestamp
+_SCOPE_TTL = int(os.getenv("STAGING_SCOPE_TTL", "3600"))  # 默认 1 小时
+
 
 def _obj_total_locked() -> int:
     return sum(len(d) for d in _OBJ.values())
@@ -48,6 +53,17 @@ def _evict_obj_locked() -> None:
             d.pop(next(iter(d)), None)
     while _obj_total_locked() > _OBJ_MAX_TOTAL and _OBJ:
         _OBJ.pop(next(iter(_OBJ)), None)
+
+
+def _expire_stale_scopes() -> None:
+    """清理超过 TTL 未写入的 scope（防中途退出泄漏）。"""
+    now = time.time()
+    expired = [s for s, ts in _SCOPE_TS.items() if now - ts > _SCOPE_TTL]
+    for s in expired:
+        _OBJ.pop(s, None)
+        _SCOPE_TS.pop(s, None)
+    if expired:
+        logger.info("[Staging] 过期清理 %d 个 scope", len(expired))
 
 
 def _safe_name(name: str) -> str:
@@ -69,6 +85,8 @@ def stage_put_obj(scope: str, name: str, obj) -> bool:
     try:
         with _OBJ_LOCK:
             _OBJ.setdefault(scope, {})[fname] = obj
+            _SCOPE_TS[scope] = time.time()
+            _expire_stale_scopes()
             _evict_obj_locked()
         return True
     except Exception:
@@ -110,3 +128,4 @@ def stage_clear(scope: str) -> None:
     """清空某 scope 的会话级变量存储，用于一次 run 结束防泄漏。"""
     with _OBJ_LOCK:
         _OBJ.pop(scope, None)
+        _SCOPE_TS.pop(scope, None)

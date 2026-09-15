@@ -278,37 +278,21 @@ class GuidedPythonExecutor(LocalPythonExecutor):
         executor 自己持有权威副本，**每次执行前无条件重装**。
         """
         self._authoritative_tools = dict(tools or {})
-        self._reinstall_tools()
+        self._ensure_tools_available()
 
-    def _reinstall_tools(self) -> None:
-        """把权威工具表装回 custom_tools / state / static_tools 三处。"""
+    def _ensure_tools_available(self) -> None:
+        """确保权威工具表在 custom_tools / state / static_tools 三处可用。
+
+        合并原 _reinstall_tools（权威表恢复）和 _sync_tools_into_static（custom→static 同步）。
+        每次 __call__ 前调用一次，不再依赖任何注入时序。
+        """
         tools = getattr(self, "_authoritative_tools", None) or {}
-        if not tools:
-            return
-        self.custom_tools.update(tools)
-        # state 在 evaluate_call 的查找顺序里优先级最高（state → static_tools →
-        # custom_tools），且不会被 send_tools 重置，是三处里最可靠的一处。
-        self.state.update(tools)
+        if tools:
+            self.custom_tools.update(tools)
+            self.state.update(tools)
         static_tools = getattr(self, "static_tools", None)
         if isinstance(static_tools, dict):
-            static_tools.update(tools)
-
-    def _sync_tools_into_static(self) -> None:
-        """把 custom_tools 并入 static_tools（2026-09-14，L16 根治）。
-
-        为什么需要这一步：业务工具走 `executor.custom_tools`，但那是 smolagents 的
-        **次路径**（主要为代码里 `def` 出来的函数服务）；官方主路径是
-        `send_tools → static_tools`，`evaluate_call` 的查找顺序也是
-        state → **static_tools** → custom_tools（local_python_executor.py:847-855）。
-
-        依赖次路径的代价已经付了两次：先是注入时机错位（L16），这次是同样的症状在不同
-        phase 复发。执行前无条件同步一次，则**不再依赖任何注入时序**——只要
-        `custom_tools` 里有的，这一刻起 static_tools 里也有。
-        """
-        static_tools = getattr(self, "static_tools", None)
-        if not isinstance(static_tools, dict):
-            return   # send_tools 尚未调用（此时 super().__call__ 本就会失败），不越俎代庖
-        static_tools.update(self.custom_tools or {})
+            static_tools.update(self.custom_tools or {})
 
     def _approve(self, hits: list, code: str) -> bool:
         """破坏性操作是否获准。
@@ -377,7 +361,7 @@ class GuidedPythonExecutor(LocalPythonExecutor):
         # 测试替身）重新设计，不能塞进执行器。保持硬拦（错误语义稳定）直到那时。
         # 只在**执行成功**后促升：失败的代码块不产出可信变量。
         try:
-            self._reinstall_tools()
+            self._ensure_tools_available()
             out = super().__call__(code_action)
         except Exception as e:
             text = str(e)
