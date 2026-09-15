@@ -82,6 +82,11 @@ class LLMBase(ABC):
         self.temperature = kwargs.get("temperature", 0.7)
         self.max_tokens = kwargs.get("max_tokens", 2048)
         self.top_p = kwargs.get("top_p", 0.95)
+        # 可复现采样（2026-09-15）：seed 透传给 OpenAI 兼容 API；None=不传（默认随机）。
+        # 注意：MoE 模型 / 网关负载均衡 / 实时数据使复现非严格，但同 seed 同输入可消除
+        # 采样路径抖动（planner 路由/工具组合/措辞的结构性漂移）。
+        _seed = kwargs.get("seed")
+        self.seed = int(_seed) if _seed not in (None, "") else None
         self.timeout = kwargs.get("timeout", 180)
         self.max_retries = kwargs.get("max_retries", 1)
 

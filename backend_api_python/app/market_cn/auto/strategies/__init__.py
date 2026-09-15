@@ -103,8 +103,14 @@ def _strategy_cfg(key):
 
 
 def is_enabled(key):
-    """策略开关 (默认 True: 未写配置 = 开启, 与现状行为一致)。"""
-    return bool(_strategy_cfg(key).get("enabled", True))
+    """策略开关 (默认 False: 未显式写 config 段 = 不进实盘)。
+
+    2026-09-15 事故修复: 旧缺省 True 导致无 config 段的磁盘插件 (如
+    triple_resonance) 被 autodiscover 捡回实盘扫描。系统成员以 config
+    strategies 段显式声明为准 — 想让新策略实盘必须在 config.json 写段
+    (enabled=true); 仅回测/离线用途的策略不写段即自动隔离。
+    """
+    return bool(_strategy_cfg(key).get("enabled", False))
 
 
 def daily_limit(key, default=5):

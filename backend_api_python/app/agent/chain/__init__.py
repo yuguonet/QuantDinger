@@ -21,7 +21,7 @@ from chain.schema import (
 from chain.store import (
     save_tree, load_tree, query_roots, query_pending_verify,
     update_verify_results, update_skill_verify,
-    get_skill_weights, get_factor_weights, get_eval_stats,
+    get_skill_weights, get_factor_weights, get_tool_weights, get_eval_stats,
     query_cached_tools, query_low_weight_tools,
 )
 
@@ -33,5 +33,5 @@ __all__ = [
     "save_tree", "load_tree", "query_roots", "query_pending_verify",
     "update_verify_results", "update_skill_verify",
     "get_skill_weights", "get_factor_weights",
-    "get_eval_stats", "query_cached_tools", "query_low_weight_tools",
+    "get_eval_stats", "get_tool_weights", "query_cached_tools", "query_low_weight_tools",
 ]

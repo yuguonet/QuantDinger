@@ -26,7 +26,7 @@
     },
     "dragon_v2": {
       "label": "龙回头V2",
-      "enabled": true,
+      "enabled": false,
       "daily_limit": 5
     },
     "v1": {
@@ -79,8 +79,13 @@
     },
     "break_v2": {
       "label": "断板V2",
-      "enabled": true,
+      "enabled": false,
       "daily_limit": 5
+    },
+    "triple_resonance": {
+      "label": "三金叉共振",
+      "enabled": false,
+      "daily_limit": 0
     }
   }
 }

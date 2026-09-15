@@ -64,7 +64,7 @@ async def _run_chat(message: str, session_id: str = "cli"):
     # 2026-09-14：原先 300s 是硬编码，多阶段任务跑到一半就被掐断
     # （实测 phase #1 单阶段就 188s，4 阶段必然超时，日志里只看到 TimeoutError，
     #   极易被误判成 agent 崩溃）。改为可配置，默认不变。
-    _timeout = int(os.getenv("CLI_RUN_TIMEOUT", "300"))
+    _timeout = int(os.getenv("CLI_RUN_TIMEOUT", "900"))  # 2026-09-15：300→900（用户定调，多阶段任务完整跑完）
     future = submit(message, session_id=session_id, timeout=_timeout)
     content = future.result(timeout=_timeout)
     print(f"\n{content}")

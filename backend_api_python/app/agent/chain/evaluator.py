@@ -331,17 +331,21 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
         "sample_count": total,
     }
 def update_weights(days: int = 90) -> Dict[str, Any]:
-    """更新 qd_agent_weights 表（统一 skill + factor）。
+    """更新 qd_agent_weights 表（统一 skill + factor + tool 三层，同表分层）。
 
-    一次扫描 qd_traces WHERE layer='skill'，同时产出：
+    一次扫描 qd_traces，同时产出：
       1. skill 层权重（按单位时间收益率）
       2. factor 层权重（带时间衰减的准确率）
+      3. tool 层权重（按工具参与链路的 correct 率，含失败样本）
 
-    自动同步 registry：新 Skill → INSERT 工厂默认值。
+    自动同步 registry（双向）：
+      - 新 Skill/新工具 → INSERT 工厂默认值（权重 1.0，sample_count=0）；
+      - 已删除的 Skill/工具 → DELETE 对应行（不再人工介入）。
     """
     from app.utils.db import get_db_connection
 
-    stats = {"synced": 0, "skill_updated": 0, "factor_updated": 0, "factor_cleaned": 0}
+    stats = {"synced": 0, "skill_updated": 0, "factor_updated": 0, "factor_cleaned": 0,
+             "tool_updated": 0, "tool_synced": 0, "tool_cleaned": 0, "skill_cleaned": 0}
     since = date.today() - timedelta(days=days)
     today = date.today()
 
@@ -363,10 +367,46 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                     cur.execute("""
                         INSERT INTO qd_agent_weights (layer, name, skill_name, weight, sample_count)
                         VALUES ('skill', %s, NULL, %s, 0)
-                        ON CONFLICT (layer, name, skill_name) DO NOTHING
+                        ON CONFLICT (layer, name, COALESCE(skill_name, '')) DO NOTHING
                     """, (name, default_w))
                     stats["synced"] += 1
                     logger.info("[Evaluator] 新 Skill 注册: %s (weight=%.2f)", name, default_w)
+
+            # ①b 同步 skills：已删除的 Skill → DELETE 权重行（不再人工介入）
+            live_skills = {s["name"] for s in adapter.list_skills()}
+            dead_skills = existing_skills - live_skills
+            for name in sorted(dead_skills):
+                cur.execute("DELETE FROM qd_agent_weights WHERE layer = 'skill' AND name = %s", (name,))
+                stats["skill_cleaned"] += 1
+                logger.info("[Evaluator] 已删除 Skill，权重行清理: %s", name)
+
+            # ①c 同步 tools：新工具 → INSERT 默认；已删除工具 → DELETE（与 skill 同一张表，layer='tool'）
+            # 注意 tool_provider 在 execute 阶段才惰性初始化；这里独立扫描工具目录（与 ToolProvider 同规则）。
+            live_tools: set = set()
+            try:
+                from pathlib import Path as _Path
+                from tools.base import ToolProvider as _TP
+                _tp = _TP()
+                _tools_dir = _Path(__file__).resolve().parent.parent / "tools"
+                _tp.scan_directory(_tools_dir, domain="common", package_prefix="tools")
+                _tp.scan_subdirectories(_tools_dir, package_prefix="tools")
+                live_tools = set(_tp.get_tool_names())
+            except Exception as e:
+                logger.warning("[Evaluator] 工具目录扫描失败，跳过 tool 层同步: %s", e)
+            if live_tools:
+                cur.execute("SELECT name FROM qd_agent_weights WHERE layer = 'tool'")
+                existing_tools = {row["name"] for row in cur.fetchall()}
+                for name in sorted(live_tools - existing_tools):
+                    cur.execute("""
+                        INSERT INTO qd_agent_weights (layer, name, skill_name, weight, sample_count)
+                        VALUES ('tool', %s, NULL, 1.0, 0)
+                        ON CONFLICT (layer, name, COALESCE(skill_name, '')) DO NOTHING
+                    """, (name,))
+                    stats["tool_synced"] += 1
+                for name in sorted(existing_tools - live_tools):
+                    cur.execute("DELETE FROM qd_agent_weights WHERE layer = 'tool' AND name = %s", (name,))
+                    stats["tool_cleaned"] += 1
+                    logger.info("[Evaluator] 已删除工具，权重行清理: %s", name)
 
             # ② 一次扫描 qd_traces，同时聚合 skill 和 factor 数据
             cur.execute("""
@@ -436,7 +476,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                          avg_pnl_pct, avg_hold_days, return_per_day,
                          sample_count, last_updated)
                     VALUES ('skill', %s, NULL, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (layer, name, skill_name)
+                    ON CONFLICT (layer, name, COALESCE(skill_name, ''))
                     DO UPDATE SET
                         weight = EXCLUDED.weight,
                         win_rate = EXCLUDED.win_rate,
@@ -468,7 +508,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                         (layer, name, skill_name, weight, win_rate,
                          sample_count, decay_half_life, last_updated)
                     VALUES ('factor', %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (layer, name, skill_name)
+                    ON CONFLICT (layer, name, COALESCE(skill_name, ''))
                     DO UPDATE SET
                         weight = EXCLUDED.weight,
                         win_rate = EXCLUDED.win_rate,
@@ -494,13 +534,46 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 """, params)
                 stats["factor_cleaned"] = cur.rowcount
 
+            # ⑥ tool 层权重（同表 layer='tool'）：按工具参与链路的 correct 率统计。
+            # 样本含失败链路（工具坏了也是权重信号）；sample_count < 最小样本时不动（防误判）。
+            cur.execute("""
+                SELECT child.name AS tool_name,
+                       COUNT(*) AS n,
+                       AVG(CASE WHEN root.correct THEN 1.0 ELSE 0.0 END) AS win_rate
+                FROM qd_traces child
+                JOIN qd_traces root ON child.root_id = root.id
+                WHERE child.layer = 'tool'
+                  AND root.layer = 'chain'
+                  AND root.correct IS NOT NULL
+                  AND root.exec_date >= %s
+                GROUP BY child.name
+            """, (since,))
+            for row in cur.fetchall():
+                tname, n, wr = row["tool_name"], int(row["n"]), float(row["win_rate"])
+                # 权重：0.5~2.0 夹紧（与 factor 层同幅度）；低样本不改权重
+                weight = 1.0 if n < 10 else round(max(0.5, min(2.0, 1.0 + (wr - 0.5) * 2.0)), 4)
+                cur.execute("""
+                    INSERT INTO qd_agent_weights
+                        (layer, name, skill_name, weight, win_rate, sample_count, last_updated)
+                    VALUES ('tool', %s, NULL, %s, %s, %s, NOW())
+                    ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                    DO UPDATE SET
+                        weight = EXCLUDED.weight,
+                        win_rate = EXCLUDED.win_rate,
+                        sample_count = EXCLUDED.sample_count,
+                        last_updated = NOW()
+                """, (tname, weight, wr, n))
+                stats["tool_updated"] += 1
+
             conn.commit()
 
     except Exception as e:
         logger.error("[Evaluator] 更新权重失败: %s", e)
 
-    logger.info("[Evaluator] 权重更新: 同步 %d, skill %d, factor %d, 清理 %d",
-                stats["synced"], stats["skill_updated"], stats["factor_updated"], stats["factor_cleaned"])
+    logger.info("[Evaluator] 权重更新: skill 同步%d/更新%d/清理%d, tool 同步%d/更新%d/清理%d, factor %d/清理 %d",
+                stats["synced"], stats["skill_updated"], stats["skill_cleaned"],
+                stats["tool_synced"], stats["tool_updated"], stats["tool_cleaned"],
+                stats["factor_updated"], stats["factor_cleaned"])
     return stats
 
 # ═══════════════════════════════════════════════════════════════

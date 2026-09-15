@@ -16,6 +16,10 @@ def get_fund_flow(codes: str = "") -> dict:
 
     Args:
         codes: 股票代码，如 "000001" 或 "000001,600519"
+
+    Returns:
+        {"count": N, "data": {代码: {主力净流入, 散户净流入, 趋势, ...}}} ——
+        dict，个股明细在二级键 data 下按代码索引；某股失败时其值为 {"error": ...}
     """
     if not codes or not codes.strip():
         return {"error": "codes 不能为空", "retriable": False}

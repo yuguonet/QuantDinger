@@ -59,6 +59,9 @@ def get_hot_rank(top_n: int = 30) -> dict:
 
     Args:
         top_n: 返回前N名，默认30，最大100
+
+    Returns:
+        {"count": N, "stocks": [{code, name, rank, hot_score, ...}]} —— dict，stocks 是二级键下的列表
     """
     from app.market_cn.dragon_limit import get_hot_rank as _get
     top_n = min(max(int(top_n or 30), 1), 100)
@@ -69,8 +72,13 @@ def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: i
 
     Args:
         date: 交易日期 YYYY-MM-DD，默认今天
-        pool_type: zt=涨停池, dt=跌停池, broken=炸板池, all=全部
+        pool_type: zt=涨停池, dt=跌停池, broken=炸板池, all=全部（其它值会被忽略，只返回 {date}）
         min_continuous_days: 仅 zt 有效，最少连板天数，0=全部
+
+    Returns:
+        {"date": "YYYY-MM-DD", "zt": {"count": N, "stocks": [{code, name, ...}]}}
+        —— dict 结构， stocks 列表在二级键下（zt/dt/broken），不要对返回值直接切片/迭代；
+        无效 pool_type 或无数据时对应键缺失，取值前用 .get() 并判空。
     """
     from datetime import datetime
     from app.market_cn.dragon_limit import (

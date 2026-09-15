@@ -106,6 +106,9 @@ class OpenAILLM(LLMBase):
                 "max_tokens": tokens,
                 "top_p": self.top_p,
             }
+            # seed 透传（2026-09-15）：同 seed 同输入可消除采样路径抖动；None=不传。
+            if getattr(self, "seed", None) is not None:
+                call_kwargs["seed"] = self.seed
             if tools:
                 call_kwargs["tools"] = [
                     {"type": "function", "function": t} for t in tools

@@ -247,7 +247,7 @@ def task():
 
         return Response(
             # 阶段模式实测（2026-09-12）：完整多阶段管线 7~10 分钟，300s 常在收尾前截断
-        _sse_stream(message, session_id, timeout=600),
+        _sse_stream(message, session_id, timeout=900),  # 2026-09-15：600→900 与 CLI/wall 对齐
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

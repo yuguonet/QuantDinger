@@ -189,13 +189,19 @@ def func_to_openai_schema(func: Callable) -> Dict[str, Any]:
     sig = inspect.signature(func)
     doc = inspect.getdoc(func) or ""
 
-    # 解析描述（排除 Args 段落）
+    # 解析描述（排除 Args 段落；Returns 段是模型需要的返回结构契约，保留在描述里）
+    # 2026-09-15 修复：旧解析器把空行后仍当 args、把 'Returns:' 行当参数行跳过 →
+    # 工具返回结构永远进不了 schema，模型只能猜返回形态（实测对 dict 切片烧步数）。
     desc_lines = []
     in_args = False
     for line in doc.strip().split("\n") if doc else []:
         stripped = line.strip()
-        if stripped.lower().rstrip(":") in ("args", "parameters", "参数"):
+        header = stripped.lower().rstrip(":")
+        if header in ("args", "parameters", "参数"):
             in_args = True
+            continue
+        if header in ("returns", "return", "返回"):
+            in_args = False          # Returns 段退出 args；内容并入描述（返回结构契约）
             continue
         if in_args:
             if stripped and not line[0].isspace() and ":" not in stripped:

@@ -29,6 +29,11 @@ def get_hot_stocks_with_reason(date: str = "") -> dict:
 
     Args:
         date: 日期 YYYY-MM-DD，默认今天
+
+    Returns:
+        {"date": str, "total": int, "stocks": [{code, name, change_pct, reason, ...}],
+         "hot_tags": [(题材, 次数), ...]} —— dict，股票列表在二级键 stocks 下，
+        不要对返回值直接切片/迭代；接口异常时返回 {"error": ...}
     """
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")

@@ -196,6 +196,18 @@ def run_monitor():
         stale = [r for r in pending if str(r.get("trade_date"))[:10] < target]
         for r in stale:
             ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"})
+        # 禁用策略的存量 pending 直接过期 (09-15 事故修复: 停扫只断新信号,
+        # 已入库的 pending 行此前仍会在开盘窗口被买入)
+        disabled = []
+        for r in list(cand):
+            strat = r.get("strategy") or ds.DRAGON_STRATEGY
+            if not strat_reg.is_enabled(strat):
+                ds.set_state(r["id"], ds.S_EXPIRED,
+                             detail={"reason": f"策略已禁用({strat}), 信号作废"})
+                cand.remove(r)
+                disabled.append(r.get("code"))
+        if disabled:
+            logger.warning("[dragon_monitor] 禁用策略存量信号作废: %s", disabled)
         if cand:
             snaps = latest_snapshot([r["code"] for r in cand])
             from collections import defaultdict as _dd

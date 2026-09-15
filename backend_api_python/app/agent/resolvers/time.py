@@ -64,6 +64,7 @@ _PATTERNS = [
     (re.compile(r"(\d+)\s*天前"), "days_ago"),
     (re.compile(r"(\d+)\s*天[之]?后"), "days_after"),
     (re.compile(r"([上本下])个?(?:星期|周)([一二三四五六日天])"), "weekday_rel"),
+    (re.compile(r"(现在|当前|此刻)"), "now"),
     (re.compile(r"(今天|今日|当天)"), "today"),
     (re.compile(r"(前天)"), "dbd2"),
     (re.compile(r"(前一日|前一天)"), "prev_day"),
@@ -78,16 +79,13 @@ _PATTERNS = [
     (re.compile(r"(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?)"), "explicit_date"),
 ]
 
-# 可"就地内联"的时间类型：能解析出**单一日期**的词（今日/昨日/明天/3天前/上周五…）。
-# 区间型（最近/本周/近N个交易日/上月…）不在此集合——它们不是一个日子，内联成
-# `最近(2026-09-07~2026-09-11)` 会误导，仍走尾部说明。
-# 2026-09-14：内联是主交付，见 `_resolve_one` 与 `resolve` 注释。
-_INLINE_KINDS = frozenset({
-    "today", "yesterday", "prev_day", "dbd2", "tomorrow", "after_tomorrow",
-    "prev_trade_day", "weekday_abs", "weekday_rel", "days_ago", "days_after",
-    "explicit_date",
-})
-
+# 区间型词干：内联插入点 = 数字捕获组末尾 + 词干（保证不拆散「近5个交易日」这类词组）
+_RANGE_STEMS = {
+    "recent_trade_days": "个交易日",
+    "recent_days": "天",
+    "days_ago": "天前",
+    "days_after": "天后",
+}
 
 def _cal():
     from app.utils import trading_calendar
@@ -108,7 +106,6 @@ def _next_weekday_after(base: str, wd: int) -> str:
     dt = datetime.strptime(base, "%Y-%m-%d")
     delta = (wd - dt.weekday()) % 7 or 7
     return (dt + timedelta(days=delta)).strftime("%Y-%m-%d")
-
 
 class TimeResolver(EntityResolver):
     """时间实体解析器（域特化 + 语义异常打回）。"""
@@ -239,8 +236,7 @@ class TimeResolver(EntityResolver):
             logger.info("[TimeResolver] 时间窗不明反问: %s", _q[:80])
             return self._clarify(user_input, _q)
 
-        edits: list = []      # (start, end, date) —— 就地内联标注
-        lines: list = []      # 尾部说明（区间型 + 交易日锚点）
+        edits: list = []      # (start, end, inline_text) —— 就地内联标注
         seen = set()
         for pattern, kind in _PATTERNS:
             m = pattern.search(user_input)
@@ -254,156 +250,141 @@ class TimeResolver(EntityResolver):
                 continue
             if not out:
                 continue
-            date, desc = out
-            if date and kind in _INLINE_KINDS:
-                edits.append((m.start(), m.end(), date))
-            else:
-                lines.append(desc)
+            inline = out                      # 2026-09-15：统一返回内联文本
+            if inline:
+                # 内联点钉在**时间词本身**的末尾：
+                #   单日期型（今天/昨天/现在…）捕获组即整词 → m.end(1)；
+                #   区间型捕获组是数字（近5…），须补上词干（个交易日/天/周/月）→ m.end(1)+词干长；
+                #   二者都不含正则可选尾缀（如「的行情」）——否则日期被插到谓语后面拆散句意。
+                _stem = _RANGE_STEMS.get(kind, "")
+                _word_end = m.end(1) + (len(_stem) if _stem else 0) if m.groups() else m.end()
+                edits.append((m.start(), _word_end, inline))
 
-        # 就地内联：把日期钉在**原文的时间词上**。从后往前改，避免索引偏移。
+        # 就地内联（2026-09-15 用户定格式）：日期钉在**原文的时间词上**，
+        # 形如 昨天(2026-09-14) / 现在(2026-09-15 13:50:00) / 近5个交易日(2026-09-08~2026-09-14)。
+        # 不再追加任何尾部说明块——【时间】尾巴喧宾夺主，且盘中把 agent 引向昨日数据。
         annotated = user_input
-        for start, end, date in sorted(edits, key=lambda x: x[0], reverse=True):
+        for start, end, inline in sorted(edits, key=lambda x: x[0], reverse=True):
             if 0 <= start < end <= len(annotated):
-                annotated = f"{annotated[:end]}({date}){annotated[end:]}"
+                annotated = f"{annotated[:end]}({inline}){annotated[end:]}"
 
-        if finance:
-            # 交易日锚点常驻（金融域"统一加时间解析"）：原文已内联"今天"时不再重复它
-            anchor = f"最近已收盘交易日={finish}" if "today" in seen \
-                else f"今天={today}；最近已收盘交易日={finish}"
-            lines.insert(0, anchor)
+        if finance and "today" not in seen and "now" not in seen:
+            # 金融域常驻锚点（用户定格式 2026-09-15）：原文无任何时间词时补一个
+            # `今天(日期)`，简洁不喧宾夺主。仅非交易日时附注最近已收盘交易日——
+            # 盘中注入"最近已收盘=昨天"会误导 agent 弃实时取昨日（用户实测"无所适从"）。
+            try:
+                _is_td = _cal().is_trading_day(today)
+            except Exception:
+                _is_td = False
+            if _is_td:
+                annotated = f"{annotated} 今天({today})"
+            else:
+                annotated = f"{annotated} 今天({today}，非交易日；最近已收盘交易日={finish})"
 
-        if not lines and annotated == user_input:
+        if annotated == user_input:
             return None
 
-        if not lines:
-            expanded = annotated       # 已内联且无补充（general 域常见）
-        else:
-            tail = "（以交易日历为准，请在规划与取数时使用上述标定日期）" if finance \
-                else "（自然日口径）"
-            expanded = f"{annotated} 【时间】{'；'.join(lines)}{tail}"
+        expanded = annotated
         return ResolveResult(entities=[], entity_code="", entity_name="",
                              entity_type="time", effective_input=expanded)
 
     def _resolve_one(self, kind: str, m: re.Match, today: str, finish: str,
-                     finance: bool) -> Optional[tuple]:
-        """返回 `(date, desc)`：
+                     finance: bool) -> Optional[str]:
+        """返回**内联标注文本**（2026-09-15 用户定格式）。
 
-        - `date`：解析出的**单一日期**（YYYY-MM-DD），供"就地内联标注"用；
-          区间型（最近 / 本周 / 近 N 个交易日…）返回 None——它们不是一个日子，
-          内联成 `最近(2026-09-07~2026-09-11)` 会误导，仍走尾部说明。
-        - `desc`：人读说明，供尾部 `【时间】` 段用。
-
-        2026-09-14 起**内联是主交付**（见 `_INLINE_KINDS`）：时间事实必须钉在原文
-        的时间词上（`今日(2026-09-14)`）。只挂在消息尾部时，LLM 会把它当背景忽略、
-        照旧自己编日期——实测结论里出现模型臆造的"上周五评分"，就是这么来的。
+        格式契约：内联文本拼在原文时间词后面，形如——
+          昨天 → `昨天(2026-09-14)`；前天 → `前天(2026-09-12)`
+          现在 → `现在(2026-09-15 13:50:00)`（带时分秒）
+          今天 → `今天(2026-09-15)`；交易日历史词注明上一交易日口径
+          区间 → `近5个交易日(2026-09-08~2026-09-14)`
+        解析失败返回 None（不标注）。旧版只内联单日期、区间走尾部【时间】块；
+        尾部块喧宾夺主且盘中误导，已按用户裁定整体废除。
         """
         cal = _cal()
         g = m.group(1) if m.groups() else ""
         dt_today = datetime.strptime(today, "%Y-%m-%d")
 
+        if kind == "now":
+            ts = (self._now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+            return ts
+
         if kind == "yesterday" or kind == "prev_day":
-            word = "昨天" if kind == "yesterday" else "前一天"
             if finance:
                 d = _shift_trade(today, 1)
-                return d, f"{word}={d}（上一交易日）"
-            d = (dt_today - timedelta(days=1)).strftime("%Y-%m-%d")
-            return d, f"{word}={d}"
+                return d
+            return (dt_today - timedelta(days=1)).strftime("%Y-%m-%d")
 
         if kind == "dbd2":
             if finance:
-                d = _shift_trade(today, 2)
-                return d, f"前天={d}（前两个交易日）"
-            d = (dt_today - timedelta(days=2)).strftime("%Y-%m-%d")
-            return d, f"前天={d}"
+                return _shift_trade(today, 2)
+            return (dt_today - timedelta(days=2)).strftime("%Y-%m-%d")
 
         if kind == "tomorrow":
             if finance:
-                d = _shift_trade(today, 1, future=True)
-                return d, f"明天={d}（下一交易日）"
-            d = (dt_today + timedelta(days=1)).strftime("%Y-%m-%d")
-            return d, f"明天={d}"
+                return _shift_trade(today, 1, future=True)
+            return (dt_today + timedelta(days=1)).strftime("%Y-%m-%d")
 
         if kind == "after_tomorrow":
             if finance:
-                d = _shift_trade(today, 2, future=True)
-                return d, f"后天={d}（下两个交易日）"
-            d = (dt_today + timedelta(days=2)).strftime("%Y-%m-%d")
-            return d, f"后天={d}"
+                return _shift_trade(today, 2, future=True)
+            return (dt_today + timedelta(days=2)).strftime("%Y-%m-%d")
 
         if kind == "today":
-            if finance:
-                if cal.is_trading_day(today):
-                    return today, f"今天={today}（当前交易日）"
-                return today, f"今天={today}（非交易日），最近已收盘交易日={finish}"
-            return today, f"今天={today}"
+            if finance and not cal.is_trading_day(today):
+                return f"{today}，非交易日；最近已收盘交易日={finish}"
+            return today
 
         if kind == "prev_trade_day":
-            return finish, f"上一交易日={finish}"
+            return finish
 
-        # ── 区间型：date 一律 None（不内联），只给尾部说明 ──
+        # ── 区间型：内联为 起~止（2026-09-15 起同样内联）──
         if kind == "recent":
             if finance:
                 d5 = _shift_trade(finish, 4)
-                return None, f"最近=默认近 5 个交易日 {d5}~{finish}（右端为最近已收盘交易日，可按需调整）"
+                return f"{d5}~{finish}，近5个交易日"
             d7 = (dt_today - timedelta(days=7)).strftime("%Y-%m-%d")
-            return None, f"最近=约 {d7}~{today}"
+            return f"{d7}~{today}，近7天"
 
         if kind == "recent_trade_days":
             n = max(1, min(60, int(g)))
             if finance:
                 d_start = _shift_trade(finish, n - 1)
-                return None, f"近{n}个交易日={d_start}~{finish}"
+                return f"{d_start}~{finish}"
             d_start = (dt_today - timedelta(days=max(1, round(n * 7 / 5)) - 1)).strftime("%Y-%m-%d")
-            return None, f"近{n}个交易日≈{d_start}~{today}（按自然日估算）"
+            return f"{d_start}~{today}，按自然日估算"
 
         if kind == "recent_days":
             n = max(1, min(90, int(g)))
             d_start = (dt_today - timedelta(days=n - 1)).strftime("%Y-%m-%d")
-            if finance:
-                return None, f"近{n}天（自然日）={d_start}~{today}；交易日口径≈{_shift_trade(today, max(1, round(n * 7 / 5)) - 1)}~{today}"
-            return None, f"近{n}天（自然日）={d_start}~{today}"
+            return f"{d_start}~{today}"
 
         # ── 单一日期型 ──
         if kind == "days_ago":
             n = max(1, int(g))
             if finance:
-                d = _shift_trade(today, n)
-                return d, f"{n}天前={d}（{n} 个交易日前）"
-            d = (dt_today - timedelta(days=n)).strftime("%Y-%m-%d")
-            return d, f"{n}天前={d}"
+                return _shift_trade(today, n)
+            return (dt_today - timedelta(days=n)).strftime("%Y-%m-%d")
 
         if kind == "days_after":
             n = max(1, int(g))
             if finance:
-                d = _shift_trade(today, n, future=True)
-                return d, f"{n}天后={d}（{n} 个交易日后）"
-            d = (dt_today + timedelta(days=n)).strftime("%Y-%m-%d")
-            return d, f"{n}天后={d}"
+                return _shift_trade(today, n, future=True)
+            return (dt_today + timedelta(days=n)).strftime("%Y-%m-%d")
 
         if kind == "weekday_rel":
             rel, wd_char = m.group(1), m.group(2)
             wd = _WEEKDAY_CN.get(wd_char, 0)
             if rel == "上":
                 last_mon = dt_today - timedelta(days=dt_today.weekday() + 7)
-                d = _next_weekday_after((last_mon - timedelta(days=1)).strftime("%Y-%m-%d"), wd)
-                return d, f"上周{wd_char}={d}"
+                return _next_weekday_after((last_mon - timedelta(days=1)).strftime("%Y-%m-%d"), wd)
             if rel == "下":
                 next_mon = dt_today - timedelta(days=dt_today.weekday()) + timedelta(days=7)
-                d = _next_weekday_after((next_mon - timedelta(days=1)).strftime("%Y-%m-%d"), wd)
-                if finance:
-                    tag = "（交易日）" if cal.is_trading_day(d) else "（非交易日）"
-                    return d, f"下周{wd_char}={d}{tag}"
-                return d, f"下周{wd_char}={d}"
-            d = (dt_today + timedelta(days=(wd - dt_today.weekday()) % 7)).strftime("%Y-%m-%d")
-            return d, f"本周{wd_char}={d}"
+                return _next_weekday_after((next_mon - timedelta(days=1)).strftime("%Y-%m-%d"), wd)
+            return (dt_today + timedelta(days=(wd - dt_today.weekday()) % 7)).strftime("%Y-%m-%d")
 
         if kind == "weekday_abs":
             wd = _WEEKDAY_CN.get(g, 0)
-            d = _next_weekday_after(today, wd)
-            if finance:
-                tag = "交易日" if cal.is_trading_day(d) else "非交易日"
-                return d, f"星期{g}={d}（未来最近一个，{tag}）"
-            return d, f"星期{g}={d}（未来最近一个）"
+            return _next_weekday_after(today, wd)
 
         if kind == "week_rel":
             s = g
@@ -418,8 +399,8 @@ class TimeResolver(EntityResolver):
                 ws = monday.strftime("%Y-%m-%d")
                 we = (monday + timedelta(days=6)).strftime("%Y-%m-%d")
             if finance:
-                return None, f"{s}={ws}~{we}（交易日 {cal.trade_date_range(ws, we)}）"
-            return None, f"{s}={ws}~{we}"
+                return f"{ws}~{we}（交易日 {cal.trade_date_range(ws, we)}）"
+            return f"{ws}~{we}"
 
         if kind == "month_rel":
             s = g
@@ -434,7 +415,7 @@ class TimeResolver(EntityResolver):
                 end = ((nm + timedelta(days=32)).replace(day=1) - timedelta(days=1)).strftime("%Y-%m-%d")
             else:
                 end = today
-            return None, f"{s}={first.strftime('%Y-%m-%d')}~{end}"
+            return f"{first.strftime('%Y-%m-%d')}~{end}"
 
         if kind == "explicit_date":
             s = re.sub(r"[年月]", "-", g).replace("日", "").replace("/", "-")
@@ -442,8 +423,6 @@ class TimeResolver(EntityResolver):
                 datetime.strptime(s, "%Y-%m-%d")
             except ValueError:
                 return None
-            if finance:
-                tag = "交易日" if cal.is_trading_day(s) else "非交易日"
-                return s, f"{g}={s}（{tag}）"
-            return s, f"{g}={s}"
+            # 用户已写明确日期 → 原样即契约，不再重复内联同一日期
+            return None if s in user_input else s
         return None

@@ -534,13 +534,17 @@ class _LLMAdapter:
                     # Output budget: CodeAgent full-file generation exceeds the
                     # 2048 default -> truncated mid-string. Env-tunable.
                     _exec_max_tokens = int(_os.getenv("CODE_AGENT_MAX_TOKENS", "4096"))
-                    response = client.chat.completions.create(
-                        model=self._llm.model,
-                        messages=formatted_messages,
-                        temperature=self._llm.temperature,
-                        max_tokens=max(self._llm.max_tokens or 0, _exec_max_tokens),
-                        top_p=self._llm.top_p,
-                    )
+                    _call_kwargs = {
+                        "model": self._llm.model,
+                        "messages": formatted_messages,
+                        "temperature": self._llm.temperature,
+                        "max_tokens": max(self._llm.max_tokens or 0, _exec_max_tokens),
+                        "top_p": self._llm.top_p,
+                    }
+                    # seed 透传（2026-09-15）：同 seed 同输入消除采样抖动；None=不传。
+                    if getattr(self._llm, "seed", None) is not None:
+                        _call_kwargs["seed"] = self._llm.seed
+                    response = client.chat.completions.create(**_call_kwargs)
                     break  # 成功即退出重试循环
                 except KeyboardInterrupt:
                     raise
@@ -1099,6 +1103,45 @@ class TaskAgent(AgentBase):
             except Exception as _e:
                 logger.debug("[Plan] 能力视图注入跳过: %s", _e)
 
+        # ── 编排缓存激活（2026-09-15，闭环④）：历史成功链路作为**参考**注入 plan 提示 ──
+        # 设计要点（与旧 v5.0 缓存的本质区别）：不跳过 LLM 硬缓存（同一意图在不同市况下
+        # 合理的工具组合不同），而是把「同 domain+意图+标的 的历史已验证工具链 + 胜率」
+        # 作为参考注入，让 planner 在真 schema 地基上参考历史经验 —— 结合 2026-09-15
+        # 的 seed 复现，输出既稳又可解释。查询失败/未命中 → 静默跳过（fail-open）。
+        cached_chain_text = ""
+        try:
+            from chain.store import query_cached_tools
+            _iv = getattr(plan_ctx, "intent_verb", "") if plan_ctx is not None else ""
+            _in = getattr(plan_ctx, "intent_noun", "") if plan_ctx is not None else ""
+            if not _iv:
+                # 回退：从 task_type / 用户输入语汇粗粒度对齐（chain_name 需 domain+verb+noun）
+                _iv = (getattr(plan_ctx, "task_type", "") if plan_ctx is not None else "") or "general"
+            _dom = ""
+            if self._tool_provider:
+                _dom = "finance"  # 唯一可选域；与 _infer_domain 的主路径一致
+            _hit = query_cached_tools(_dom, _iv, _in or "stock")
+            if _hit:
+                cached_chain_text = (
+                    "\n\n【历史成功链路（仅供参考）】同意图已验证的工具序列："
+                    + ", ".join(_hit)
+                    + "\n（可参考其取数/分析顺序；是否沿用由你根据本任务决定，非强制）"
+                )
+                trace.record("plan_cache_hit", {"tools": _hit, "domain": _dom, "verb": _iv, "noun": _in})
+        except Exception as _e:
+            logger.debug("[Plan] 编排缓存查询跳过: %s", _e)
+
+        # ── 工具权重提示（2026-09-15）：低权重工具（历史链路胜率差）提醒 planner 谨慎点名 ──
+        # 与 skill 权重同源同表（qd_agent_weights.layer='tool'），由 evaluator 盘后自动更新。
+        try:
+            from chain.store import get_tool_weights
+            _tw = get_tool_weights()
+            _low_tools = sorted(n for n, w in _tw.items() if w < 0.7)
+            if _low_tools:
+                tools_hint += ("\n\n【工具权重提示】以下工具近期参与链路胜率偏低（<0.7），"
+                               "点名前请确认确有必要：" + ", ".join(_low_tools[:12]))
+        except Exception as _e:
+            logger.debug("[Plan] 工具权重提示跳过: %s", _e)
+
         template = _load_plan_template()
         # completed_phases_text: 已完成阶段的摘要（用于多轮规划），首次调用为空
         prompt = template.format(
@@ -1109,7 +1152,7 @@ class TaskAgent(AgentBase):
             rag_context=getattr(src, '_plan_rag_context', '') or '',
             history_context=getattr(src, '_plan_history_context', '') or '',
             completed_phases_text=getattr(src, '_completed_phases_text', '') or '',
-        ) + tools_hint
+        ) + tools_hint + cached_chain_text
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -1600,6 +1643,10 @@ class TaskAgent(AgentBase):
             # 打印全量表/整段序列会把上下文撑爆。降到 6000（CODE_MAX_PRINT_CHARS 可调），
             # 配合 F3 自动落盘：大数据进暂存区，打印只留要点。
             max_print_outputs_length=int(os.getenv("CODE_MAX_PRINT_CHARS", "6000")),
+            # 单步代码执行超时（2026-09-15）：smolagents 默认 30s，多标的批量取数
+            # （几十只 × 串行 HTTP）必超。改为 env 可调，默认 120s；与外层
+            # AGENT_RUN_WALL_TIMEOUT / wait_for 超时保持大于关系，保证外层先降级。
+            timeout_seconds=int(os.getenv("CODE_EXEC_TIMEOUT", "120")),
         )
         # 过程事件钩子（2026-09-11 SSE 改造）：smolagents 在每个 step 结束时调用
         # callback(memory_step, agent=self)。把 ActionStep 的代码动作/工具产出转成
@@ -1875,7 +1922,14 @@ class TaskAgent(AgentBase):
         ]
         smol_tools += list(skill_tools or [])
 
-        # 阶段内局部记忆（保留最近 2 步完整，更早步骤压缩，防止重试/长阶段 token 爆炸）
+        # 阶段内局部记忆（2026-09-15 激进压缩，用户定调）：
+        #   - 保留最近 2 步完整（当前决策需要）；
+        #   - 更早步骤：observations 截到 400 字符（旧 200 太狠会丢成败信号），
+        #     code_action/model_output 截到 200 —— 大头是 print 的全量工具返回值；
+        #   - 真正的数据靠 executor.state 变量续承，不靠重放 observations。
+        # smolagents 1.26 生命周期事实：write_memory_to_messages 每步全量重放
+        # （无官方截断开关），社区方案 = step_callbacks 里原地改写 memory ——
+        # 本函数即该方案（每步 finalize 后触发，截断对下一步的 prompt 生效）。
         keep_recent = 2
 
         def _truncate_field(step: ActionStep, field: str, cap: int = 200) -> None:
@@ -1884,7 +1938,9 @@ class TaskAgent(AgentBase):
                 return
             if isinstance(val, str):
                 if len(val) > cap:
-                    setattr(step, field, val[:cap] + "...(truncated)")
+                    # 保留首尾：头部含结构信息，尾部含 "Last output" 行（收尾语义）
+                    tail_keep = min(80, cap // 4)
+                    setattr(step, field, val[:cap - tail_keep] + "\n...[truncated, full data kept in variables]...\n" + val[-tail_keep:])
             elif isinstance(val, list):
                 for item in val:
                     if isinstance(item, dict) and isinstance(item.get("text"), str) \
@@ -1896,9 +1952,11 @@ class TaskAgent(AgentBase):
                 if not isinstance(step, ActionStep) or step.step_number is None:
                     continue
                 if step.step_number <= memory_step.step_number - keep_recent:
-                    _truncate_field(step, "observations")
-                    _truncate_field(step, "model_output")
-                    _truncate_field(step, "code_action")
+                    # observations 是 token 大头（print 的工具全量返回都在这），截到 400；
+                    # model_output/code_action 截到 200（早期步骤的思维链和代码已无用）。
+                    _truncate_field(step, "observations", cap=400)
+                    _truncate_field(step, "model_output", cap=200)
+                    _truncate_field(step, "code_action", cap=200)
                     if hasattr(step, 'observations_images') and step.observations_images:
                         step.observations_images = None
 

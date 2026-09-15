@@ -588,11 +588,26 @@ def get_skill_weights() -> Dict[str, float]:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'skill'")
-            for name, weight in cur.fetchall():
-                weights[name] = weight
+            for row in cur.fetchall():
+                weights[row["name"]] = row["weight"]
     except Exception as e:
         logger.warning("[Store] 获取 Skill 权重失败: %s", e)
     return weights
+def get_tool_weights() -> Dict[str, float]:
+    """从 qd_agent_weights 获取工具权重（layer='tool'，2026-09-15 与 skill/factor 同表）。"""
+    from app.utils.db import get_db_connection
+    weights = {}
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'tool'")
+            for row in cur.fetchall():
+                weights[row["name"]] = row["weight"]
+    except Exception as e:
+        logger.warning("[Store] 获取工具权重失败: %s", e)
+    return weights
+
+
 def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     """从 qd_agent_weights 获取因子权重。"""
     from app.utils.db import get_db_connection

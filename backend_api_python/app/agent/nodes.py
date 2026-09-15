@@ -286,6 +286,11 @@ def _record_tool_calls_to_trace(trace, agent):
                 m = re.search(r"'error'\s*:\s*'([^']*)'", observations)
                 if m:
                     error = m.group(1)[:200]
+            # 2026-09-15：ActionStep.error 是 smolagents 官方错误通道（该步执行异常原文，
+            # 如 InterpreterError），比 observations 关键字匹配精确。有实锤时覆盖推断值。
+            _step_err = getattr(step, "error", None)
+            if _step_err is not None:
+                error = str(_step_err)[:200]
 
             # ── 提取推理链（model_output / code_action / token_usage）──
             model_output = (getattr(step, 'model_output', '') or '')[:1000]
@@ -298,6 +303,14 @@ def _record_tool_calls_to_trace(trace, agent):
                     'output': getattr(raw_usage, 'output_tokens', 0),
                     'total': getattr(raw_usage, 'total_tokens', 0),
                 }
+
+            # 2026-09-15：CodeAgent 无结构化 tool_calls —— 工具名从 code_action 行提取：
+            # `x = tool_name(...)` / `tool_name(...)`。用于闭环④/②的工具层成败对账。
+            if not tool_name and code_action:
+                m = re.search(r"(?:^|\n)\s*(?:\w+\s*=\s*)?([a-z][a-z0-9_]{2,40})\s*\(", code_action)
+                if m and m.group(1) not in ("print", "len", "str", "int", "float", "list", "dict", "range"):
+                    tool_name = m.group(1)
+                    tool_args = {"_source": "code_action"}
 
             trace.add_tool_call(
                 tool_name=tool_name,
@@ -859,7 +872,7 @@ def make_plan_node(ctx: NodeContext):
 
 # agent.run 墙钟上限（秒；2026-09-12 卡死事故防线）：
 # 非主线程执行时，超时按执行失败上报并隔离卡死线程（Python 无法强杀线程）。
-AGENT_RUN_WALL_TIMEOUT = int(os.getenv("AGENT_RUN_WALL_TIMEOUT", "600"))
+AGENT_RUN_WALL_TIMEOUT = int(os.getenv("AGENT_RUN_WALL_TIMEOUT", "900"))  # 2026-09-15：600→900，与外层 CLI/API 超时对齐
 
 
 def _run_agent_with_guard(agent, full_task: str):
@@ -939,7 +952,8 @@ def _run_agent_with_guard(agent, full_task: str):
     return result, run_error, _interrupted
 
 
-async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_error) -> tuple:
+async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_error,
+                                  sandbox_digest: str = "") -> tuple:
     """轮询通道：外部 planner 的阶段验收判定（B 阶段）。
 
     返回四元组 (passed, note, reason, score)：
@@ -975,10 +989,15 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
     try:
         from utils.json_parser import safe_parse_json
         criteria = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(acc))
+        # 2026-09-15：沙箱实况摘要（executor.state 变量值 + 工具调用清单）注入判官 ——
+        # smolagents 把全部中间数据存在 executor.state（实测：变量原值/_print_outputs/
+        # _operations_count），从「只看 final_answer 文本」升级为「看沙箱实况」，
+        # 可精确区分：内部 planner 规划错误（goal 要的字段工具根本不返回）/
+        # 工具错误（返回 error）／agent 偷懒没调（state 里连变量都没有）。
+        _sandbox_block = f"\n【沙箱实况（executor.state 实际数据）】\n{sandbox_digest}\n" if sandbox_digest else ""
         prompt = (
             f"【阶段目标】{phase.get('goal', '')}\n"
-            f"【验收标准】\n{criteria}\n"
-            f"【阶段结果】\n{text[:4000]}\n\n"
+            f"【验收标准】\n{criteria}\n{sandbox_block}【阶段结果】\n{text[:4000]}\n\n"
             "请逐条核对阶段结果是否满足验收标准。只输出 JSON：\n"
             '{"passed": true/false, "score": 0-100, '
             '"reason": "pass 或 agent_fault 或 tool_data_fault", '
@@ -1067,6 +1086,78 @@ def _detect_max_steps(agent) -> bool:
         return isinstance(getattr(last, "error", None), AgentMaxStepsError)
     except Exception:
         return False
+
+
+def _sandbox_state_digest(agent, whitelist=None, max_vars: int = 15) -> str:
+    """从 executor.state 提取沙箱实况摘要（供验收判官注入）。
+
+    smolagents 1.26 数据生命周期：全部中间数据都在 executor.state ——
+      变量名 → 工具返回原值（数据是否为空/N/A 一眼可辨）；
+      _print_outputs → agent 打印过的内容；
+      _operations_count → 计算量（agent 是否真干活）。
+    摘要形态：每变量一行 `名 = 值预览`，值超过 120 字符截断；返回 None/空容器的
+    变量标 ⚠。这是区分「规划错误 / 工具错误 / agent 偷懒」的关键证据。
+    """
+    try:
+        ex = agent
+        if not hasattr(ex, "state"):
+            ex = getattr(agent, "python_executor", None) or getattr(agent, "executor", None)
+        state = getattr(ex, "state", None)
+        if not isinstance(state, dict):
+            return ""
+        wl = set(whitelist or [])
+        lines = []
+        called_hint = []
+        for k, v in state.items():
+            if k.startswith("_"):
+                continue
+            vs = str(v).replace("\n", " ")
+            if len(vs) > 120:
+                vs = vs[:120] + "…"
+            empty = v is None or (isinstance(v, (list, dict, str, tuple)) and len(v) == 0)
+            lines.append(f"  {k} = {vs}" + ("  ⚠空/None" if empty else ""))
+            if wl and k not in wl:
+                pass
+        ops = state.get("_operations_count") or {}
+        n_ops = ops.get("counter", "?") if isinstance(ops, dict) else "?"
+        prints = str(state.get("_print_outputs", "") or "").replace("\n", " ")[:200]
+        head = f"变量数={len(lines)}, 计算操作数={n_ops}, 打印输出预览: {prints or '(无)'}"
+        return "\n".join([head] + lines[:max_vars])
+    except Exception as e:
+        logger.debug("[Execute] 沙箱实况摘要提取失败: %s", e)
+        return ""
+
+
+def _extract_called_tools(agent, whitelist=None) -> set:
+    """从 agent memory 的 code_action 提取实际被调用的工具名（CodeAgent 无结构化 tool_calls）。
+
+    smolagents 1.26 生命周期事实：CodeAgent 的每步动作是 code_action（Python 源码文本），
+    工具调用形如 `x = tool_name(...)` 或裸 `tool_name(...)`。本函数扫描全部 ActionStep
+    的 code_action，抓出与白名单交集的调用名 —— 用于验收归因校准（区分「偷懒没调」
+    vs「调了但数据没给」）与工具权重对账。
+    """
+    called = set()
+    try:
+        from smolagents.memory import ActionStep
+        _BUILTIN = {"print", "len", "str", "int", "float", "list", "dict", "range",
+                    "json", "sorted", "set", "sum", "min", "max", "abs", "round"}
+        wl = set(whitelist or [])
+        for step in getattr(getattr(agent, "memory", None), "steps", []) or []:
+            if not isinstance(step, ActionStep):
+                continue
+            code = getattr(step, "code_action", None) or ""
+            if not code:
+                continue
+            for m in re.finditer(r"(?:^|\n)\s*(?:\w+\s*=\s*)?([a-z][a-z0-9_]{2,40})\s*\(", code):
+                name = m.group(1)
+                if name in _BUILTIN or name.startswith("_"):
+                    continue
+                if wl and name not in wl:
+                    continue
+                called.add(name)
+    except Exception as e:
+        logger.debug("[Execute] 提取已调用工具失败: %s", e)
+    return called
 
 
 def _has_final_answer(agent) -> bool:
@@ -1210,9 +1301,10 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                                 str(state.get("_start_time", ""))[-8:]) or "run_default"
     task_parts = []
     # 2026-09-14：用 effective_input（resolver 已把时间/实体事实内联进原文），而非裸 user_input。
+    # 2026-09-15：任务书改用标准 Markdown 分节（## 标题 + 列表），替代【】密集墙。
     original_input = state.get("effective_input") or state.get("user_input", "")
     if original_input:
-        task_parts.append(f"【用户原始需求】{original_input[:800]}")
+        task_parts.append(f"## 用户原始需求\n\n{original_input[:800]}")
     # 2026-09-14（用户定调）：已完成阶段不内联任何内容，只给一行式清单。
     prev_results = list(state.get("phase_results") or [])
     try:
@@ -1229,24 +1321,26 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             lines.append(f"- 阶段{r.get('id')} {r.get('name', '')}："
                          f"{'✓通过' if r.get('status') == 'pass' else '✗未通过'}，"
                          f"交付物含[{fields}]")
-        task_parts.append("【已完成阶段（本清单不含内容）】\n" + "\n".join(lines))
+        task_parts.append("## 已完成阶段（本清单不含内容）\n\n"
+                          + "\n".join(lines))
     if inherited:
-        task_parts.append("【已续承的上阶段变量（直接在代码里用变量名引用）】"
+        task_parts.append("## 已续承的上阶段变量\n\n"
+                          "直接在代码里用变量名引用："
                           + ", ".join(inherited[:20]))
     # 批次内逐 phase 编号列出 goal/deliverable/acceptance
     for k, ph in enumerate(batch):
         pid = int(ph.get("id", idx + k + 1))
-        sec = [f"【阶段 {pid}/{len(phases)}（本批次第 {k + 1}/{len(batch)} 个）："
-               f"{ph.get('name', '')}】", ph.get("goal", "")]
+        sec = [f"## 阶段 {pid}/{len(phases)}（本批次第 {k + 1}/{len(batch)} 个）：{ph.get('name', '')}",
+               ph.get("goal", "")]
         deliverable = ph.get("deliverable")
         if deliverable:
             if not isinstance(deliverable, str):
                 deliverable = json.dumps(deliverable, ensure_ascii=False)
-            sec.append(f"【交付物要求】{deliverable}")
+            sec.append(f"**交付物**：{deliverable}")
         acceptance = ph.get("acceptance") or []
         if acceptance:
-            sec.append("【验收标准】\n" + "\n".join(f"- {a}" for a in acceptance))
-        task_parts.append("\n".join(sec))
+            sec.append("**验收标准**：\n" + "\n".join(f"- {a}" for a in acceptance))
+        task_parts.append("\n\n".join(sec))
     # 工具白名单：批次内并集；任一 phase 未列工具（回退域默认）→ 整批不收窄
     union_tools = []
     any_default = False
@@ -1275,8 +1369,8 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             except Exception:
                 pass
             return _n
-        task_parts.append("【本批次可用工具（仅限；括号内为参数名）】" +
-                          ", ".join(_tool_sig(n) for n in union_tools))
+        task_parts.append("## 本批次可用工具（仅限这些；括号内为参数名）\n\n"
+                          + ", ".join(_tool_sig(n) for n in union_tools))
         # 限定白名单模式：沙箱只暴露清单所列函数（防止模型臆造 create_file 等不存在的函数）
         tool_scope_clause = ""
     else:
@@ -1292,20 +1386,18 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         for _st in _skill_tools:
             _ps = list((getattr(_st, "inputs", None) or {}).keys())
             _skill_sigs.append(f"{getattr(_st, 'name', '?')}({', '.join(_ps)})")
-        task_parts.append("【技能工具（可直接调用；括号内为参数名）】" + "；".join(_skill_sigs))
+        task_parts.append("## 技能工具（可直接调用；括号内为参数名）\n\n"
+                          + "；".join(_skill_sigs))
     retry = int(state.get("phase_retry", 0) or 0)
     if retry:
-        task_parts.append(f"【重试提示】上一轮未通过验收：{state.get('phase_last_note', '')}；"
+        task_parts.append(f"## 重试提示\n\n上一轮未通过验收：{state.get('phase_last_note', '')}。"
                           "本轮聚焦补齐缺失项，不要重复已完成的工作。")
-    task_parts.append("【数据纪律】多标的同类数据一次拉全：支持批量的工具用逗号分隔 codes 一次调用，"
-                      "或在单个代码块内循环完成（只打印提炼后的关键字段）；禁止逐只分步取数。"
-                      "跨阶段交接**不要**调用读写工具："
-                      "工具返回值形如 Stored '变量名' in memory，用该变量直接引用原数据；"
-                      "想留到下一阶段就自己起个名字赋值（如 quotes = _r_quotes_1），"
-                      "它会自动续承，下一阶段直接用同名变量引用。"
-                      "沙箱内只存在【本批次可用工具】清单所列函数——" + tool_scope_clause + "不存在 create_file/read_file 等任何"
-                      "文件工具，调用必然失败；代码类任务的交付物=完整代码文本（直接在最终答复中给出）。"
-                      "本批次含多个顺序阶段，请在**同一个代码块**里依次完成，最后用 final_answer 一次性交回。")
+    # 执行纪律（压缩版）：每条都对应一次踩坑；模型侧细节由 _sandbox_instructions 与
+    # code_agent.yaml 承担（变量续承语义/批量取数/收尾纪律），任务书不重复展开。
+    task_parts.append("## 执行纪律\n\n"
+                      f"- 工具直接返回数据本身：赋给变量即可复用，并自动续承到下一阶段。{tool_scope_clause}\n"
+                      "- 多标的同类数据一次拉全（逗号分隔 codes 或单代码块内循环），禁止逐只分步取数；"
+                      "只打印提炼后的关键字段\n")
     full_task = "\n\n".join(task_parts)
 
     # ── 3. 批次级预算 / 内部规划 ──
@@ -1317,7 +1409,19 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     if any(x is True for x in _ip_list):
         _need_internal = True
     elif any(x is None for x in _ip_list):
-        _need_internal = sum_budget >= 8
+        # 2026-09-15 通用化判定（用户定调：激进偏开，1/3 特征即开）：
+        # 多工具批次直接写代码的实测痛点：模型在 20+ 工具面上自选路径，
+        # 步数膨胀且参数易错；内部 planner 一次预规划（tool_list 已注入 schema）
+        # 基本一次写对全流程代码。三个通用特征（不依赖领域），任一命中即开：
+        #   ① 工具面宽（≥7）—— 自由度高、组合爆炸；
+        #   ② 批次内多阶段（≥2）—— 顺序依赖，预规划能定准数据流；
+        #   ③ 预算非小（≥6）—— 付得起一次规划步。
+        # 显式声明优先：internal_plan=True 强制开 / False 强制关，全 None 时按特征判定。
+        _need_internal = (
+            len(union_tools) >= 7
+            or len(batch) >= 2
+            or sum_budget >= 6
+        )
     else:
         _need_internal = False
 
@@ -1415,15 +1519,41 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         # ── 批次内逐 phase 验收 ──
         first_fail = None
         _records = []
+        # 引擎事实（2026-09-15，smolagents 生命周期信号）：
+        #   ① _has_final_answer —— CodeAgent 正常调了 final_answer 收尾；
+        #   ② 白名单工具是否真的被调用过（code_action 行提取）—— 区分「偷懒没调」vs「调了但数据没给」；
+        #   ③ failed_tools 实锤 —— 数据源/接口错误。
+        # 三者共同决定：判官的 agent_fault 是否可信（见 _check_phase_acceptance 调用处的降级）。
+        _final_ok = _has_final_answer(agent)
+        _called_tools = _extract_called_tools(agent, union_tools)
         for ph in batch:
             if interrupted:
                 passed, note, reason, score = False, "用户中断", "agent_fault", None
             else:
-                passed, note, reason, score = await _check_phase_acceptance(ctx, ph, result, run_error)
+                passed, note, reason, score = await _check_phase_acceptance(
+                    ctx, ph, result, run_error,
+                    sandbox_digest=_sandbox_state_digest(agent, union_tools))
                 # 护栏（防误判/手软）：判官称"工具/数据导致"但无实锤证据时回退 agent_fault
                 if not passed and reason == "tool_data_fault" \
                         and not _tool_data_evidence(str(result), failed_tools, run_error):
                     reason = "agent_fault"
+                    passed = False
+                # 引擎事实降级（防无效重跑，2026-09-15）：判官称 agent_fault 但
+                #   ① 执行器正常收尾（is_final_answer=True）
+                #   ② 白名单工具确实被调用过（agent 没偷懒）
+                #   ③ 无工具硬错误实锤（failed_tools 为空）
+                # → 缺失只能来自数据源未返回有效内容（环境因素），改判 tool_data_fault
+                #   软通过推进，finalize 如实告知用户"数据暂不可用"，不再整批重跑。
+                # 实证（fb861d61）：phase1/2 均正常收尾、工具已调、数据源全 N/A，
+                # 判官仍打 agent_fault → 整批重跑 → 数据源依旧 N/A → 白烧两轮。
+                if not passed and reason == "agent_fault" \
+                        and _final_ok and _called_tools and not failed_tools:
+                    logger.info(
+                        "[Execute] 阶段 %s 判官归因 agent_fault，但引擎事实为：正常收尾 + 工具已调(%s) + 无失败实锤 "
+                        "→ 降级 tool_data_fault 软通过（防无效重跑）",
+                        ph.get("id"), len(_called_tools))
+                    reason = "tool_data_fault"
+                    note = (note + "；工具已调用且正常收尾，数据源未返回有效内容（引擎校准）")[:300]
                     passed = False
             effective_pass = passed or reason == "tool_data_fault"
             _records.append({

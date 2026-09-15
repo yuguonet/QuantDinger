@@ -108,6 +108,11 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
 
     Args:
         codes: 多股用逗号分隔
+
+    Returns:
+        单代码 → {stock_code, last, changePercent, volume, name, ...}（扁平行情 dict）；
+        多代码 → {"count": N, "data": {代码: 行情dict}}——**单/多代码返回结构不同**，
+        多代码时股票字典在二级键 data 下；失败时含 error 键
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -702,58 +707,56 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
 
     summary: Dict[str, Any] = {}
 
-    try:
-        url = f"https://quotes.sina.cn/cn/go.php/vFD_FinancialGuideLine/stockid/{symbol}/ctrl/zcfzb/displaytype/4.phtml"
-        headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
-        r = requests.get(url, headers=headers, timeout=15)
-        r.encoding = "gbk"
+    # 2026-09-15：旧视图 vFD_FinancialGuideLine 已被新浪下线（返回 {"__ERROR":0,"__ERRORMSG":"Invalid view go"}），
+    # 改用 money.finance.sina.com.cn 新版三表视图（vFD_BalanceSheet / vFD_ProfitStatement）。
+    # 新表结构：最大表为数据表，列0=项目名，列1+=报告期（第0行为日期行）。
+    import requests
+    _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
+    code_num = _strip_prefix(code)
 
-        import pandas as pd
-        from io import StringIO
-        dfs = pd.read_html(StringIO(r.text))
-        if dfs:
-            df = dfs[0]
-            cols = df.columns.tolist()
-            latest_col = cols[1] if len(cols) > 1 else None
-            if latest_col:
-                for _, row in df.iterrows():
-                    item_name = str(row.iloc[0]) if len(row) > 0 else ""
-                    val = row[latest_col] if pd.notna(row[latest_col]) else None
-                    if val is None:
-                        continue
-                    # 只保留关键指标
-                    if "总资产" in item_name and "负债" not in item_name:
-                        summary["total_assets"] = val
-                    elif "总负债" in item_name:
-                        summary["total_liabilities"] = val
-                    elif "股东权益合计" in item_name or "归属.*股东.*权益" in item_name:
-                        summary["equity"] = val
-                    elif "货币资金" in item_name:
-                        summary["cash"] = val
+    import pandas as pd
+    from io import StringIO
+
+    def _fetch_sina_table(path: str):
+        try:
+            r = requests.get(f"https://money.finance.sina.com.cn/corp/go.php/{path}/stockid/{code_num}/ctrl/part/displaytype/4.phtml",
+                             headers=headers, timeout=15)
+            r.encoding = "gbk"
+            dfs = pd.read_html(StringIO(r.text))
+            # 数据表 = 行数最多的那张（导航页表格都是 2~5 行的小表）
+            return max(dfs, key=lambda d: d.shape[0]) if dfs else None
+        except Exception as e:
+            logger.warning("_get_financial_statements(%s) %s 抓取失败: %s", code, path, e)
+            return None
+
+    def _latest_value(df, keywords, exclude=None):
+        """取最新报告期（列1）中匹配关键词的值。"""
+        if df is None or df.shape[1] < 2:
+            return None
+        exclude = exclude or []
+        for _, row in df.iterrows():
+            item_name = str(row.iloc[0])
+            if any(k in item_name for k in keywords) and not any(x in item_name for x in exclude):
+                val = row.iloc[1]
+                return val if pd.notna(val) else None
+        return None
+
+    # 资产负债表
+    try:
+        df_bs = _fetch_sina_table('vFD_BalanceSheet')
+        summary["total_assets"] = _latest_value(df_bs, ["资产总计", "总资产"])
+        summary["total_liabilities"] = _latest_value(df_bs, ["负债合计", "总负债"])
+        summary["equity"] = _latest_value(df_bs, ["股东权益合计", "所有者权益合计", "归属母公司"])
+        summary["cash"] = _latest_value(df_bs, ["货币资金"])
     except Exception as e:
         logger.warning("_get_financial_statements(%s) 资产负债表失败: %s", code, e)
 
-    # 利润表：从财务指标接口取关键增速
+    # 利润表
     try:
-        url2 = f"https://quotes.sina.cn/cn/go.php/vFD_FinancialGuideLine/stockid/{symbol}/ctrl/lrb/displaytype/4.phtml"
-        headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
-        r2 = requests.get(url2, headers=headers, timeout=15)
-        r2.encoding = "gbk"
-        dfs2 = pd.read_html(StringIO(r2.text))
-        if dfs2:
-            df2 = dfs2[0]
-            cols2 = df2.columns.tolist()
-            latest_col2 = cols2[1] if len(cols2) > 1 else None
-            if latest_col2:
-                for _, row in df2.iterrows():
-                    item_name = str(row.iloc[0]) if len(row) > 0 else ""
-                    val = row[latest_col2] if pd.notna(row[latest_col2]) else None
-                    if val is None:
-                        continue
-                    if "营业总收入" in item_name or "营业收入" in item_name:
-                        summary["revenue"] = val
-                    elif "净利润" in item_name and "扣非" not in item_name:
-                        summary["net_profit"] = val
+        df_is = _fetch_sina_table('vFD_ProfitStatement')
+        summary["revenue"] = _latest_value(df_is, ["营业总收入", "营业收入"])
+        summary["net_profit"] = _latest_value(df_is, ["净利润"], exclude=["扣非"])
     except Exception as e:
         logger.warning("_get_financial_statements(%s) 利润表失败: %s", code, e)
 
