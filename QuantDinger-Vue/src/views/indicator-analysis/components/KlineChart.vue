@@ -3277,6 +3277,12 @@ registerOverlay({
     let _minuteAxisLocked = false
     /** 分时 Y 轴上下各留的视觉余量比例（相对最大偏离） */
     const MINUTE_AXIS_PADDING = 0.1
+    /** 分时 Y 轴范围量化档位数（抗抖动）：实时波动区间被量化到 1/N 的离散档位，
+     *  偏离跨过档位边界才扩展一次，避免每 tick 因新高低重排整窗造成抖动 */
+    const MINUTE_AXIS_QUANTIZE_STEPS = 10
+    /** 分时 Y 轴范围「单调锚点」：日内只增不减的量化偏离，换标的时清零。
+     *  盘中极值只可能扩大，配合量化后 from/to 频繁刷新时恒定 → 命中「未变化」短路 */
+    let _minuteAxisAnchorDev = 0
     /**
      * 分时极坐标的涨跌停幅度（%）：按标的代码所在板块自动识别。
      * 沪深主板（600/601/603/605/000/001/002/003）±10%；
@@ -3338,6 +3344,18 @@ registerOverlay({
       else if (f < 6.5) nf = 6
       else nf = 8
       return +(nf * exp10).toFixed(exponent < 0 ? -exponent : 0)
+    }
+    /**
+     * 把实时波动偏离量化到离散档位（抗抖动核心）。
+     * 步长 = nice(maxDev / N)，向上取整 → 量化后范围恒 ≥ 真实偏离，永不截断可见数据；
+     * 同时把「每次 tick 的连续变化」收敛成「每跨 N 分之一档位才变化一次」的离散跳变，
+     * 使锁定范围在频繁刷新中保持稳定，命中 applyMinutePrevCloseAxis 的「未变化」短路。
+     */
+    const quantizeMinuteDev = (dev) => {
+      if (!(dev > 0) || !Number.isFinite(dev)) return dev
+      const step = minuteNice(dev / MINUTE_AXIS_QUANTIZE_STEPS)
+      if (!(step > 0)) return dev
+      return Math.ceil(dev / step) * step
     }
     const minuteGetPrecision = (value) => {
       const str = String(value)
@@ -3682,12 +3700,20 @@ registerOverlay({
       })
       if (!(maxDev > 0)) maxDev = Math.abs(pc) * 0.001
 
+      // 【抗抖动】实时波动区间量化为离散档位，且日内单调只增：
+      // 盘中每次刷新都按 live min/max 重算范围，任何新高低都会改变 maxDev → setRange
+      // 重排整窗造成抖动。量化到 ~1/N 档位 + 单调锚定后，整窗只在偏离跨越档位边界时
+      // 才扩展一次，频繁刷新时 from/to 恒定 → 命中「未变化」短路，不再 rebuild。
+      const qDev = quantizeMinuteDev(maxDev)
+      if (qDev > _minuteAxisAnchorDev) _minuteAxisAnchorDev = qDev
+      const effDev = _minuteAxisAnchorDev
+
       // 分时极坐标模式：范围精确锁定为 昨收×(1∓涨跌停%)，顶部=+limit%、底部=-limit%
       // （0 轴线居中；不叠加 padding，保证涨/跌停刻度贴边）。关闭时为自适应对称范围。
       const polarLimit = _minutePolarEnabled ? _minutePolarLimit(props.market, props.symbol) : 0
       const halfPrice = polarLimit > 0
         ? pc * (polarLimit / 100)
-        : maxDev * (1 + MINUTE_AXIS_PADDING)
+        : effDev * (1 + MINUTE_AXIS_PADDING)
       const fromPrice = pc - halfPrice
       const toPrice = pc + halfPrice
       // 锁定范围单位跟随轴型：percentage 轴用百分比单位，且以 pct(昨收) 为中心
@@ -3695,7 +3721,7 @@ registerOverlay({
       let from
       let to
       if (percentMode) {
-        const halfPct = maxDev / baseClose * 100 * (1 + MINUTE_AXIS_PADDING)
+        const halfPct = effDev / baseClose * 100 * (1 + MINUTE_AXIS_PADDING)
         from = pcPct - halfPct
         to = pcPct + halfPct
       } else {
@@ -3801,6 +3827,8 @@ registerOverlay({
         }
       } catch (_) { /* 预期内 */ }
       _minuteAxisRange = null
+      // 退出分时：清零 Y 轴单调锚点，下次进入分时重新从当日波动推导
+      _minuteAxisAnchorDev = 0
       const axis = getCandleYAxis()
       if (_minuteAxisLocked && axis) {
         try {
@@ -4097,6 +4125,8 @@ registerOverlay({
         _minutePcSymbolKey = _pcKey
         minutePrevClose.value = null
         _minutePcSource = ''
+        // 换标的：Y 轴范围单调锚点清零，避免沿用上一标的的波动区间
+        _minuteAxisAnchorDev = 0
       }
 
       // 分时图模式：使用1m数据

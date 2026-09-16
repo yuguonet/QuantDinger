@@ -190,7 +190,7 @@ def search_stocks(
             "amplitude": _safe_float(_pick(s, "AMPLITUDE")),
             "pe9": _pick(s, "PE_DYNAMIC") or _pick(s, "PE9"),
             "pbnewmrq": _pick(s, "PB_NEW_MRQ") or _pick(s, "PB"),
-            "total_market_cap": _pick(s, "TOEAL_MARKET_VALUE") or _pick(s, "TOTAL_MARKET_CAP"),
+            "total_market_cap": _pick(s, "TOAL_MARKET_VALUE") or _pick(s, "TOTAL_MARKET_CAP"),
             "free_cap": _pick(s, "FREE_CAP"),
         })
 

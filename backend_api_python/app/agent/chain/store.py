@@ -531,6 +531,30 @@ def mark_root_wrong(root_id: int):
             logger.info("[Store] 标记 trace root_id=%d correct=False", root_id)
     except Exception as e:
         logger.error("[Store] 标记 trace 失败 root_id=%d: %s", root_id, e)
+def mark_root_good(root_id: int):
+    """正面奖励（2026-09-15）：用户认可上一轮编排。
+    correct=TRUE 固化 + calibration 上调至上限 1.05 + human_reviewed=TRUE
+    （跳过 T+N 自动校准，防止把用户认可的链路改判）→ 下轮 update_weights
+    的 win_rate/编排缓存立即受益。"""
+    from app.utils.db import get_db_connection
+
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE qd_traces SET
+                    correct = TRUE,
+                    calibration = 1.05,
+                    human_reviewed = TRUE,
+                    human_verdict = 'positive_feedback'
+                WHERE id = %s AND parent_id IS NULL
+            """, (root_id,))
+            conn.commit()
+            logger.info("[Store] 正面认可 root_id=%d correct=TRUE calibration=1.05", root_id)
+    except Exception as e:
+        logger.error("[Store] 正面奖励失败 root_id=%d: %s", root_id, e)
+
+
 def delete_tree(root_id: int):
     """重度惩罚：删除整棵 trace 树。"""
     from app.utils.db import get_db_connection

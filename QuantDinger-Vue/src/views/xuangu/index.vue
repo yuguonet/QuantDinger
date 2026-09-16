@@ -477,68 +477,50 @@ export default {
     },
 
     async performEastMoneySearch (kw) {
-      const API_URL = 'https://np-tjxg-b.eastmoney.com/api/smart-tag/stock/v3/pw/search-code'
+      // 经后端代理 /api/shichang/search 调用东财（避免浏览器直连第三方域名的 CORS 拦截）
       this.searchLoading = true
       try {
-        const body = {
-          needAmbiguousSuggest: true, pageSize: 200, pageNo: 1,
-          fingerprint: this._genId(32), matchWord: '', shareToGuba: false,
-          timestamp: String(Date.now()),
-          requestId: this._genId(32) + String(Date.now()),
-          removedConditionIdList: [], ownSelectAll: false, needCorrect: true,
-          client: 'WEB', product: '', needShowStockNum: false,
-          biz: 'web_ai_select_stocks', xcId: '', gids: [], dxInfoNew: [],
-          keyWordNew: kw,
-          customDataNew: JSON.stringify([{ type: 'text', value: kw, extra: '' }])
-        }
-        const resp = await fetch(API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
+        const res = await request.get('/api/shichang/search', {
+          params: { keyword: kw, page_size: 200 }
         })
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
-        const data = await resp.json()
-
-        if (String(data.code) !== '100') {
-          this.$message.error(data.msg || '搜索失败')
+        if (res.code !== 1) {
+          this.$message.error(res.msg || '搜索失败')
           this.tableData = []
           this.totalItems = 0
           return
         }
-
-        const res = data.data && data.data.result
-        const stocks = (res && res.dataList) || []
-        this.totalItems = (res && res.total) || stocks.length
-
+        const stocks = res.stocks || []
+        this.totalItems = res.total || stocks.length
+        // 后端 search_stocks 已标准化字段（code/name/new_price/change_rate/
+        // total_market_cap…），与表格列定义一致，直接消费，无需前端二次映射
         this.tableData = stocks.map(s => ({
-          code: s.SECURITY_CODE || '',
-          name: s.SECURITY_SHORT_NAME || '',
-          industry: s.INDUSTRY || '',
-          concept: s.CONCEPT || '',
-          new_price: this._safeParseFloat(s.NEWEST_PRICE),
-          change_rate: this._safeParseFloat(s.CHG),
-          high_price: this._safeParseFloat(s.HIGH_PRICE),
-          low_price: this._safeParseFloat(s.LOW_PRICE),
-          pre_close_price: this._safeParseFloat(s.PRE_CLOSE_PRICE),
-          volume: this._safeParseFloat(s.TRADE_VOLUME),
-          deal_amount: s.TRADING_VOLUMES || s.TRADE_AMOUNT || null,
-          volume_ratio: s.QRR || null,
-          turnoverrate: this._safeParseFloat(s.TURNOVER_RATE),
-          amplitude: this._safeParseFloat(s.AMPLITUDE),
-          pe9: s.PE_DYNAMIC || s.PE9 || null,
-          pbnewmrq: s.PB_NEW_MRQ || null,
-          total_market_cap: s.TOEAL_MARKET_VALUE || s.TOTAL_MARKET_CAP || null,
-          free_cap: s.FREE_CAP || null
+          code: s.code || '',
+          name: s.name || '',
+          industry: s.industry || '',
+          concept: s.concept || '',
+          new_price: s.new_price != null ? Number(s.new_price) : null,
+          change_rate: s.change_rate != null ? Number(s.change_rate) : null,
+          high_price: s.high_price != null ? Number(s.high_price) : null,
+          low_price: s.low_price != null ? Number(s.low_price) : null,
+          pre_close_price: s.pre_close_price != null ? Number(s.pre_close_price) : null,
+          volume: s.volume != null ? Number(s.volume) : null,
+          deal_amount: s.deal_amount != null ? s.deal_amount : null,
+          volume_ratio: s.volume_ratio != null ? Number(s.volume_ratio) : null,
+          turnoverrate: s.turnoverrate != null ? Number(s.turnoverrate) : null,
+          amplitude: s.amplitude != null ? Number(s.amplitude) : null,
+          pe9: s.pe9 != null ? s.pe9 : null,
+          pbnewmrq: s.pbnewmrq != null ? s.pbnewmrq : null,
+          total_market_cap: s.total_market_cap != null ? s.total_market_cap : null,
+          free_cap: s.free_cap != null ? s.free_cap : null
         }))
-
         if (this.tableData.length === 0) {
           this.$message.info('未找到匹配的股票')
         }
       } catch (err) {
-        if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
-          this.$message.error('搜索失败：网络请求被阻止（可能是CORS限制），请检查网络或使用代理')
+        if (err && err.response && err.response.status === 401) {
+          this.$message.error('搜索失败：登录态失效，请重新登录')
         } else {
-          this.$message.error('搜索失败: ' + err.message)
+          this.$message.error('搜索失败: ' + (err && err.message ? err.message : '未知错误'))
         }
         this.tableData = []
         this.totalItems = 0

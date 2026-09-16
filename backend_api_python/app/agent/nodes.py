@@ -497,7 +497,9 @@ def make_chat_node(ctx: NodeContext):
         docs = []
         if use_rag and ctx.retriever:
             try:
-                docs = await ctx.retriever.retrieve(user_input)
+                docs = await ctx.retriever.retrieve(
+                    user_input,
+                    intent="code" if _CODE_INTENT_RE.search(user_input) else "")
                 # 过滤低相关度文档（避免噪音污染任务）。
                 # 分数尺度按来源分流：启用 Reranker 时输出 rerank_score∈[0,1] 用绝对阈值；
                 # 未启用时输出 RRF 融合分（weight/(rrf_k+rank)，上限≈0.016），绝对阈值不可用，
@@ -622,7 +624,9 @@ def make_chat_node(ctx: NodeContext):
                     "只回复一个类型词，不要解释"
                 )
             if context:
-                intent_system += f"\n\n【参考上下文】\n{context[:1000]}\n如果上下文中提到过具体标的或分析，优先判断为 task。"
+                # 2026-09-16：去掉「上下文提到标的→优先 task」偏置——RAG 历史与用户
+                # 真实意图无关（跑马灯任务曾因此差点被拉成金融 task）。上下文仅作参考。
+                intent_system += f"\n\n【参考上下文（仅供理解背景，不改变意图判断）】\n{context[:600]}"
             if entity_code:
                 intent_system += f"\n\n【已识别实体】{entity_name}({entity_code}) [{entity_type}]\n该实体已解析完成，用户消息必然需要工具，优先判断为 task。"
             intent_messages = [
@@ -1406,7 +1410,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     task_parts.append("## 执行纪律\n\n"
                       f"- 工具直接返回数据本身：赋给变量即可复用，并自动续承到下一阶段。{tool_scope_clause}\n"
                       "- 多标的同类数据一次拉全（逗号分隔 codes 或单代码块内循环），禁止逐只分步取数；"
-                      "只打印提炼后的关键字段\n")
+                      "只打印提炼后的关键字段\n"
+                      "- 分析文本在下一段写：你写下的每个数字，都必须能在之前的 Observation 里找到\n"
+                      "- 全部取数完成后用 final_answer 一次收尾")
     full_task = "\n\n".join(task_parts)
 
     # ── 3. 批次级预算 / 内部规划 ──

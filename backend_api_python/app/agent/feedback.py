@@ -197,3 +197,45 @@ def check_negative_feedback(user_input: str, session_id: str = "default") -> Non
 
         logger.warning("[Feedback] 检测失败: %s", e)
 
+
+
+# ── 正面反馈（2026-09-15）：用户认可上一轮编排 → 奖励链路 ──
+# 与负面闭环对称：正面认可固化 correct=True + human_reviewed（跳过 T+N 自动校准），
+# 使 win_rate 提前计入下轮 update_weights 的 skill/tool 权重，并提高编排缓存命中率。
+_POSITIVE = [
+    '很好', '非常好', '不错', '准确', '到位', '有用', '有帮助', '厉害', '完美',
+    '专业', '靠谱', '满意', '赞', '好分析', '分析得很好', '分析不错', '就是这样',
+    '答对了', '说得好', 'nice', 'good', 'great', 'perfect', 'thx', '感谢',
+]
+
+# 复合词防误伤：含正面词但实际在提问/贬损的形态
+_POSITIVE_COMPOUND_SKIP = ['怎么样', '怎么办', '呢', '吗', '还行吧', '也就', '一般']
+
+
+def detect_positive_feedback(message: str) -> bool:
+    """检测正面认可（无问句、无转折、命中正面词表）。"""
+    msg = message.strip()
+    if not msg or len(msg) > 40:          # 长消息大概率是新任务而非认可
+        return False
+    if any(ch in msg for ch in _QUESTION_MARKS):
+        return False
+    if any(w in msg for w in _POSITIVE_COMPOUND_SKIP):
+        return False
+    msg = _strip_compounds(msg)
+    return any(w in msg for w in _POSITIVE)
+
+
+def check_positive_feedback(user_input: str, session_id: str = 'default') -> None:
+    """检测正面认可并奖励上一轮编排（与 check_negative_feedback 对称）。"""
+    if not detect_positive_feedback(user_input):
+        return
+    root_id = _session_last_root.get(session_id)
+    if not root_id:
+        logger.debug('[Feedback] session=%s 无历史 trace，正面认可跳过', session_id)
+        return
+    try:
+        from chain import store as chain_store
+        chain_store.mark_root_good(root_id)
+        logger.info('[Feedback] 正面认可 → root_id=%d 已奖励（correct 固化 + 权重受益）', root_id)
+    except Exception as e:
+        logger.warning('[Feedback] 正面认可处理失败（不影响主流程）: %s', e)

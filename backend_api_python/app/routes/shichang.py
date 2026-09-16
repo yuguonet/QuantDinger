@@ -79,6 +79,29 @@ def strong():
         return _make_resp({})
 
 
+@shichang_bp.route('/search')
+def search():
+    """智能选股搜索 — 薄壳，逻辑下沉到 eastmoney_search.search_stocks。
+
+    前端选股页（xuangu）调用，返回标准化股票列表（字段名已对齐前端表格）。
+    查询参数: keyword(str, 必填), page_size(int, 默认200, 最大200)
+    """
+    try:
+        from app.market_cn.eastmoney_search import search_stocks
+        keyword = request.args.get('keyword', '').strip()
+        try:
+            page_size = int(request.args.get('page_size', 200))
+        except (TypeError, ValueError):
+            page_size = 200
+        if not keyword:
+            return _make_resp({"code": 0, "msg": "keyword 不能为空", "stocks": [], "total": 0})
+        result = search_stocks(keyword=keyword, page_size=page_size, page_no=1)
+        return _make_resp(result)
+    except Exception as e:
+        logger.error("search 失败: %s", e)
+        return _make_resp({"code": 0, "msg": "搜索失败: " + str(e), "stocks": [], "total": 0})
+
+
 @shichang_bp.route('/')
 def market_data():
     """兼容旧接口 — 聚合所有卡片数据"""
