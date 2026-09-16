@@ -24,6 +24,37 @@ def _safe_float(v, default=0.0):
 
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
+
+def _resolve_data_date(requested: str) -> tuple[str, str]:
+    """把请求日期解析为真实数据日期（2026-09-16 盘前事故修复）。
+
+    数据源（10jqka 等）对未收盘日期的请求返回**最近收盘日**的数据但响应不含真实日期，
+    旧代码把请求日期当数据日期返回 → 模型把昨日收盘数据当成今日实时（盘前'今日涨停'幻觉）。
+    规则：请求日期是交易日且已过 15:00 → 原样；否则回落到最近已收盘交易日。
+    返回 (data_date, market_state)：market_state ∈ {closed_today, intraday, pre_open, non_trading_day}
+    """
+    import os as _os
+    from datetime import datetime as _dt
+    try:
+        from app.utils.trading_calendar import is_trading_day
+    except Exception:
+        is_trading_day = lambda d: _dt.strptime(d, '%Y-%m-%d').weekday() < 5
+
+    today = _dt.now().strftime('%Y-%m-%d')
+    if requested != today:
+        # 历史日期：数据即该日（不再校验盘面状态）
+        return requested, ('trading_day' if is_trading_day(requested) else 'non_trading_day')
+    # 请求的就是今天
+    if not is_trading_day(today):
+        return requested, 'non_trading_day'
+    now = _dt.now()
+    if now.hour >= 15:
+        return today, 'closed_today'
+    if 9 <= now.hour < 15:
+        return today, 'intraday'
+    return today, 'pre_open'  # 开盘前（<9:00）：当日数据未产生，数据源会给最近收盘日
+
+
 def get_hot_stocks_with_reason(date: str = "") -> dict:
     """当日强势股：同花顺数据源，返回涨幅居前个股及其涨停/强势的题材归因。
 
@@ -37,6 +68,9 @@ def get_hot_stocks_with_reason(date: str = "") -> dict:
     """
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
+    # 盘前/非交易日：请求日期无当日数据，数据源会返回最近收盘日数据但响应不带真实日期
+    # → 必须把返回值的 date 标成真实数据日期，否则模型把昨日数据当今日实时（2026-09-16 盘前事故）
+    data_date, market_state = _resolve_data_date(date)
 
     url = (
         f"http://zx.10jqka.com.cn/event/api/getharden/"
@@ -83,7 +117,9 @@ def get_hot_stocks_with_reason(date: str = "") -> dict:
             })
 
         _r = {
-            "date": date,
+            "date": data_date,          # 真实数据日期（≠请求日期，盘前/非交易日时回落）
+            "market_state": market_state,
+            "requested_date": date,
             "total": len(stocks),
             "stocks": compact_stocks,
             "hot_tags": hot_tags,

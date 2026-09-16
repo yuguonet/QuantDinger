@@ -60,11 +60,17 @@ class Retriever:
         self.score_threshold = score_threshold
         self.embedding = embedding
 
+    # 非金融意图集合（2026-09-16 下沉自 nodes：意图×语料域不匹配的判断属于 RAG 层——
+    # 它拥有语料域知识；node 只传意图信号，不替 RAG 做过滤决策）。
+    # 命中即跳过检索（省一次向量查询），返回空列表由调用方按「无参考资料」处理。
+    NON_FINANCE_INTENTS = frozenset({"code", "general", "explain"})
+
     async def retrieve(
         self,
         query: str,
         top_k: Optional[int] = None,
         filter: Optional[dict] = None,
+        intent: str = "",
     ) -> list[dict]:
         """
         执行检索
@@ -72,8 +78,13 @@ class Retriever:
         :param query: 查询文本
         :param top_k: 返回数量
         :param filter: 元数据过滤条件
+        :param intent: 用户意图分类（task 子类型，如 code/screen/analysis）。
+            非金融意图（code/general/explain）与本库语料域不匹配 → 直接返回 []。
         :return: 文档列表 [{"content": ..., "metadata": ..., "score": ...}]
         """
+        if intent and intent in self.NON_FINANCE_INTENTS:
+            logger.info("[Retriever] 意图=%s 与本库语料域不匹配，跳过检索", intent)
+            return []
         k = top_k or self.top_k
         docs = await self.vector_store.similarity_search(query=query, k=k, filter=filter)
         if self.score_threshold is not None:
@@ -88,47 +99,41 @@ class Retriever:
             docs: 检索结果列表
             max_length: 上下文最大长度（按字符软截断）
 
-        相关性过滤（用户诉求：低相关度不应作为参考资料）：
-        不同召回源的分数量纲不统一——Reranker 输出 [0,1]、RRF 融合分上限≈0.016、
-        Postgres ts_rank 是另一套小数。因此**不用绝对阈值**（否则会清空纯 RRF 召回，
-        即审计 P0-2 的回归），改用**相对阈值**：以本批最高相关性为基准，
-        `score < best * RAG_REF_MIN_RATIO` 视为无关噪音剔除。
-        另设**绝对地板** `RAG_REF_ABS_FLOOR`，但**仅当本批最高分 > 0.1** 时才启用——
-        最高分 ≤0.1 说明是 RRF 尺度（其最高分本就 ≤0.016），此时禁用绝对地板以免误伤。
-        哪怕整批都弱，也会保留相关性最高的那一条作兜底，避免参考资料整段变空。
+        相关性过滤（2026-09-16 用户硬规则：**相关度 <0.3 一律拦截，严禁进入下一轮**）：
+        绝对阈值 RAG_REF_ABS_FLOOR（默认 0.3）对所有召回源统一生效——
+        Reranker 输出 [0,1] 直接可比；RRF 融合分（上限约 0.016）全数低于 0.3，
+        视为「未证明相关」整体拦截（RRF 分数只反映排名不反映相关性，
+        记忆库里没有相关内容时它照样返回 topN——实测「跑马灯」捞到西安银行 SELL）。
+        整批被拦 → 返回空串，下游以「无参考资料」处理，不让弱相关内容污染任务。
+        如需恢复历史记忆召回，请先接入 Reranker 精排（rerank_score >= 0.3 的文档可通过）。
         """
         if not docs:
             return ""
 
-        _ratio = float(os.getenv("RAG_REF_MIN_RATIO", "0.3"))
-        _abs_floor = float(os.getenv("RAG_REF_ABS_FLOOR", "0.1"))
-        _ratio = _ratio if 0 < _ratio < 1 else 0.3
-
-        # 本批最高相关性（score 缺失/非数视为 0），作相对阈值基准。
-        best = max((float(d.get("score", 0) or 0) for d in docs), default=0.0)
-        rel_floor = best * _ratio
-        # 仅在高分尺度（非 RRF）启用绝对地板，保护纯 RRF 召回不被清空。
-        abs_floor = _abs_floor if best > 0.1 else 0.0
+        # 2026-09-16 硬规则：score < 0.3 一律拦截（含原「best 兜底」例外也取消——
+        # 整批弱相关时留一条兜底仍会污染任务，用户明确要求严禁进入）。
+        _abs_floor = float(os.getenv("RAG_REF_ABS_FLOOR", "0.3"))
 
         parts = []
         total_len = 0
         kept = 0
+        dropped = 0
         for doc in docs:
             content = doc.get("content", "")
             score = float(doc.get("score", 0) or 0)
             source = doc.get("metadata", {}).get("source", "unknown")
-
-            # 过滤：弱于**相对阈值或绝对地板任一**即视为噪音；相关性最高的一条始终保留作兜底。
-            is_best = (score >= best - 1e-9)
-            if (score < rel_floor or score < abs_floor) and not is_best:
+            if score < _abs_floor:
+                dropped += 1
                 continue
-
             part = f"[参考{kept + 1}] (相关度: {score:.2f}, 来源: {source})\n{content}"
             if total_len + len(part) > max_length:
                 break
             parts.append(part)
             total_len += len(part)
             kept += 1
+        if dropped:
+            logger.info("[Retriever] 相关性硬拦截：%d → %d 条 (floor=%.2f)",
+                        dropped + kept, kept, _abs_floor)
 
         return "\n\n---\n\n".join(parts)
 

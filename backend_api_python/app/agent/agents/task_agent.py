@@ -2058,7 +2058,13 @@ class TaskAgent(AgentBase):
             memory_step.observations = obs + hint
 
         def _check_final_answer(answer, memory, agent):
-            """验证 final_answer 不为空且非半成品。"""
+            """验证 final_answer 不为空且非半成品 + 数字溯源（2026-09-16）。
+
+            数字溯源：报告中的数值必须能在之前的 Observation（工具返回）里找到——
+            这是「结果必须来自工具输出」的引擎级保证，不依赖提示词遵守。
+            保守触发：孤立数值 >= 4 个且 <=30% 可溯源时才拒收（少量数值可能是
+            推理衍生值如百分比/评分，全部强拦会误伤）；拒收后 smolagents 要求模型重写。
+            """
             if answer is None:
                 return False
             text = str(answer).strip()
@@ -2067,6 +2073,27 @@ class TaskAgent(AgentBase):
             # 半成品检测：仍含裸 <code> 标签且无 final_answer 调用痕迹
             if "<code>" in text and "final_answer" not in text:
                 return False
+            # 数字溯源（工具输出 grounding）
+            try:
+                import re as _re
+                observations = []
+                for step in getattr(getattr(agent, "memory", None), "steps", []) or []:
+                    obs = getattr(step, "observations", None)
+                    if obs:
+                        observations.append(str(obs))
+                obs_corpus = "\n".join(observations)
+                if obs_corpus:
+                    nums = _re.findall(r"\d+(?:\.\d+)?", text)
+                    nums = [n for n in nums if len(n.lstrip("0.")) >= 2]  # 忽略 0/1/2 这类噪音
+                    if len(nums) >= 4:
+                        grounded = sum(1 for n in nums if n in obs_corpus)
+                        if grounded / len(nums) < 0.3:
+                            logger.warning(
+                                "[FinalAnswer] 数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源，拒收要求重写",
+                                len(nums), grounded)
+                            return False
+            except Exception as e:
+                logger.debug("[FinalAnswer] 数字溯源检查跳过: %s", e)
             return True
 
         agent = SmolCodeAgent(
@@ -2090,13 +2117,33 @@ class TaskAgent(AgentBase):
             ),
         )
 
+        # 2026-09-16：与实际执行环境对齐——executor 已是全放行（"*"），
+        # 但 CodeAgent 默认 authorized_imports 会让 system_prompt 规则 9 渲染出
+        # 受限模块清单（提示词与现实不符）。构造后直接设属性并重渲染 system_prompt，
+        # 规则 9 变为 "You can import from any package you want."。
+        try:
+            agent.authorized_imports = ["*"]
+            agent.prompt_templates["system_prompt"] = _load_code_agent_yaml()["system_prompt"]
+            agent.memory.system_prompt = None  # 触发 initialize_system_prompt 惰性重渲染
+        except Exception as _ae:
+            logger.debug("[TaskAgent] authorized_imports 对齐跳过: %s", _ae)
+
         # 覆盖 smolagents 默认 prompt_templates，使用自定义 YAML 模板
         try:
             custom_templates = _load_code_agent_yaml()
             import copy
             custom_templates = copy.deepcopy(custom_templates)
 
-            # 替换 {{tool_list}} 占位符：注入 domain 相关工具 schema，供 smolagents 内部 planning 选工具
+            # planning 段注入（2026-09-16 jinja 折衷说明）：
+            #   smolagents._generate_planning_step 用 populate_template(..., variables={task, tools,
+            #   managed_agents}) 渲染 initial_plan，变量集**写死**；26 个业务工具注册在 provider 侧、
+            #   不在 self.tools（smolagents Tool 实例），所以官方 {% for tool in tools.values() %}
+            #   循环对我们**只能看到 5 个内部工具**（_SearchToolsTool 等），业务 schema 一个都进不去。
+            #   想让业务工具进 planning prompt，必须把它们的 schema 文本预渲染进模板。
+            #   现状（字符串 .replace 占位符）与官方 jinja 完全等价——planning 其余占位符（task/
+            #   managed_agents）由 smolagents 后续渲染。唯一代价是 planning 段不是"全文 jinja"，
+            #   形式上稍欠纯，但避免重写 75 行 _generate_planning_step + 每次升级 diff 维护。
+            #   system_prompt 段已完全贴官方 jinja（占位符 8 个全在 populate_template 变量集里）。
             planning = custom_templates.get("planning", {})
             if isinstance(planning, dict) and provider:
                 if tools:
@@ -2118,8 +2165,14 @@ class TaskAgent(AgentBase):
                     val = planning.get(key, "")
                     if isinstance(val, str) and "{{tool_list}}" in val:
                         planning[key] = val.replace("{{tool_list}}", tools_text)
+                        # len() 容错（2026-09-16）：provider 无 __len__ 时（测试桩/部分实现）
+                        # 注入本身已成功，不该因日志取长度失败而整体回退到默认模板。
+                        try:
+                            _total = len(provider)
+                        except TypeError:
+                            _total = _injected_n
                         logger.info("[TaskAgent] YAML planning['%s'] 已注入 %d 个工具 schema"
-                                    "（provider 共 %d）", key, _injected_n, len(provider))
+                                    "（provider 共 %d）", key, _injected_n, _total)
 
             agent.prompt_templates.update(custom_templates)
             logger.info("[TaskAgent] 已加载自定义 prompt_templates (YAML)")
