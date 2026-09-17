@@ -343,7 +343,8 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                         "latest": snap, "series": series, "mkt_gain": mkt,
                     }, **params)
                 except Exception as e:
-                    logger.debug("[knife_scan] %s %s 判定异常: %s", code, key, e)
+                    logger.warning("[knife_scan] %s %s 判定异常(已跳过该股): %s",
+                                   code, key, e)
                     continue
                 for s in sigs:
                     row = store.signal_row(key, s, name)

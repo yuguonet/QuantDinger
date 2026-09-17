@@ -59,8 +59,15 @@ def _import_agent():
 #  核心：统一 Agent 对话（组件从 agent.py 导入）
 # ═══════════════════════════════════════════════════════════════
 
-async def _run_chat(message: str, session_id: str = "cli"):
-    """统一对话入口：通过消息队列执行，和 Flask/Cron 同一条链路。"""
+import concurrent.futures as concurrent_futures_timeout
+
+
+async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = None):
+    """统一对话入口：通过消息队列执行，和 Flask/Cron 同一条链路。
+
+    _future_sink: 可选列表，调用方传入后本次任务的 Future 会被 append 进去，
+    供 SIGINT handler / KeyboardInterrupt 分支置取消位（Ctrl+C 协作中止）。
+    """
     from message_queue import submit
 
     print(f"\n[会话] Session: {session_id}")
@@ -73,7 +80,42 @@ async def _run_chat(message: str, session_id: str = "cli"):
     #   极易被误判成 agent 崩溃）。改为可配置，默认不变。
     _timeout = int(os.getenv("CLI_RUN_TIMEOUT", "900"))  # 2026-09-15：300→900（用户定调，多阶段任务完整跑完）
     future = submit(message, session_id=session_id, timeout=_timeout)
-    content = future.result(timeout=_timeout)
+    if _future_sink is not None:
+        _future_sink.append(future)
+
+    # 2026-09-17 三修：future.result(900) 是一次 900s 的长等待——Windows 上
+    # SIGINT handler 执行完返回后 wait 继续等、不抛 KeyboardInterrupt，
+    # KeyboardInterrupt 分支永远不执行（用户体感"Ctrl+C 无效"）。
+    # 改为 0.5s 分片轮询：每个分片醒来查一次停止位；停止位由 SIGINT handler /
+    # KeyboardInterrupt 分支置上（message_queue.request_stop）——
+    # worker 的中断探针在工具/步边界中止 agent.run，这里随即收尾。
+    from message_queue import request_stop as _req_stop, _is_stop_requested
+
+    _stop_asked = False
+    deadline = time.time() + _timeout
+    content = None
+    while True:
+        try:
+            content = future.result(timeout=0.5)
+            break  # 正常完成
+        except concurrent_futures_timeout.TimeoutError:
+            pass
+        except KeyboardInterrupt:
+            _stop_asked = True
+        if _stop_asked or _is_stop_requested(str(session_id)):
+            if not _stop_asked:
+                pass
+            print("\n⚠ 已请求停止，等 worker 在当前工具/步边界停下…（再按 Ctrl+C 强制退出）")
+            # 等 worker 收尾（探针中止 run → worker set_result('') → result 返回）
+            try:
+                content = future.result(timeout=30)
+            except BaseException:
+                content = "[run_error] 用户中断"
+            break
+        if time.time() > deadline:
+            future.cancel()
+            content = f"[run_error] 超过 {_timeout}s 未完成"
+            break
     print(f"\n{content}")
     return content
 
@@ -189,15 +231,24 @@ def main():
         init_workers(4)
 
         _ctrl_c_count = 0
+        _active_future = []  # 当前在跑的任务 Future（_run_chat 注册，_force_exit 取消）
 
         def _force_exit(signum, frame):
-            """第二次 Ctrl+C 强制退出"""
+            """第一次：置协作取消位；第二次：立即强退。
+
+            2026-09-17 修复：旧实现计数被交互循环 finally 清零，强退通道永不可达。
+            """
             nonlocal _ctrl_c_count
             _ctrl_c_count += 1
             if _ctrl_c_count >= 2:
                 print("\n 强制退出!")
                 os._exit(0)
-            print("\n⚠ 再按一次 Ctrl+C 强制退出")
+            try:
+                from message_queue import request_stop
+                request_stop(session_id)
+            except Exception:
+                pass
+            print("\n⚠ 已请求停止；再按一次 Ctrl+C 强制退出")
 
         print(f"\n[机器人] QuantDinger Agent CLI")
         print(f"[会话] Session: {session_id}")
@@ -216,21 +267,23 @@ def main():
 
                 if not message:
                     continue
+                _active_future.clear()
                 if message == "/quit":
                     print(" 再见!")
                     break
 
                 try:
                     signal.signal(signal.SIGINT, _force_exit)
-                    await _run_chat(message, session_id)
+                    await _run_chat(message, session_id, _future_sink=_active_future)
                 except KeyboardInterrupt:
-                    print("\n⚠ 已中断")
+                    # 2026-09-17 Ctrl+C 修复：置取消位让 worker 协作中止；
+                    # 连续第二次 Ctrl+C 由 _force_exit 直接 os._exit（计数不再被清零）
+                    print("\n⚠ 已请求中断（再按一次 Ctrl+C 强制退出）")
                 except Exception as e:
                     print(f"\n 异常: {e}")
                     import traceback
                     traceback.print_exc()
                 finally:
-                    _ctrl_c_count = 0
                     signal.signal(signal.SIGINT, signal.default_int_handler)
 
             # 退出时关闭 LLM 客户端，释放连接。

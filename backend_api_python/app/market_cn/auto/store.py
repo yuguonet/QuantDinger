@@ -186,6 +186,8 @@ SIGNAL_EXTRA_KEYS = (
     # knife_catch (反向接刀, 2026-09-08)
     "gain", "amplitude", "pos_range", "tail_ret", "vw_frac",
     "vol_ratio", "down_streak", "pre5_gain", "lu_recent", "mkt_gain",
+    # g56 56%规则G+ (2026-09-17): 横截面门值落库 (审计/复盘/quality_key 排序依赖)
+    "rhist_chg", "boll_pctb", "dif0", "rmed", "score_r",
 )
 
 

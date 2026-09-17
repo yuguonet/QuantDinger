@@ -27,6 +27,36 @@ _task_queue: queue.Queue = queue.Queue(maxsize=256)
 _workers_started = False
 _worker_count = 0
 
+# ── 跨终端立即停止（2026-09-17）──
+# 停止指令注册表：session_id → stop 标记。CLI Ctrl+C / Web / API 统一走 request_stop()，
+# worker 侧的 step callback 与工具守卫每次检查——命中即中止当前 run。
+_stop_flags: set = set()
+_stop_lock = threading.Lock()
+
+
+def request_stop(session_id: str) -> None:
+    """请求停止指定会话当前正在执行的任务（幂等，线程安全）。
+
+    任何终端都可以调用：CLI Ctrl+C / Flask 端点 / Cron。停止位在任务开始时清除、
+    任务结束后保留至下次 start——worker 侧见 _is_stop_requested。
+    """
+    if not session_id:
+        return
+    with _stop_lock:
+        _stop_flags.add(str(session_id))
+    logger.warning("[MQ] 已请求停止会话 %s 的当前任务", session_id)
+
+
+def clear_stop(session_id: str) -> None:
+    """清除停止位（任务真正开始执行时调用，防止残留位误杀新任务）。"""
+    with _stop_lock:
+        _stop_flags.discard(str(session_id))
+
+
+def _is_stop_requested(session_id: str) -> bool:
+    with _stop_lock:
+        return str(session_id) in _stop_flags
+
 
 def init_workers(n: int = 4):
     """启动 worker 线程池（幂等，只启动一次）。"""
@@ -88,6 +118,7 @@ def _worker_loop():
         future: Future = task["future"]
         if future.cancelled():
             continue
+        clear_stop(str(task["session_id"]))  # 新任务开始，清掉该会话残留停止位
 
         try:
             loop = asyncio.new_event_loop()
@@ -99,14 +130,52 @@ def _worker_loop():
                 # 超时取消时 finally 同样执行，不会泄漏。
                 _prev_cb = getattr(agent, "_current_event_cb", None)
 
+                # 协作取消（2026-09-17 Ctrl+C 修复）：worker 线程收不到 SIGINT，
+                # 主线程只能置 future 取消位；agent.run 的 step callback 是天然检查点——
+                # 每个 step 边界看一眼 future.cancelled()，命中即中止 run，
+                # 不再让已"中断"的任务继续烧 token（smolagents 每步都会调 callbacks）。
+                class _UserInterruptError(RuntimeError):
+                    pass
+
+                def _cancel_check(_step_data):
+                    # 触发源：会话停止位（任意终端 request_stop；CLI Ctrl+C 也归一到此）。
+                    # 不再查 future.cancelled()——Future.cancel 对运行中任务返回 False
+                    # 且不置位（concurrent.futures 语义），查它是坏开关。
+                    if _is_stop_requested(str(task["session_id"])):
+                        raise _UserInterruptError("user interrupted")
+
                 async def _run_with_events():
                     _cb = task.get("event_cb")
                     if _cb is not None:
                         agent._current_event_cb = _cb
+                    _prev_cbs = getattr(agent, "_user_step_callbacks", None)
+                    agent._user_step_callbacks = list(_prev_cbs or []) + [_cancel_check]
+
+                    # 立即停止（2026-09-17）：工具级中断探针（task_agent._INTERRUPT_CHECKS）
+                    # 三个触发源：future 取消位（CLI Ctrl+C）/ 会话停止位（任意终端
+                    # request_stop）/ smolagents interrupt_switch（TaskAgent 转发 interrupt()）。
+                    # 工具守卫每次工具调用进入前执行探针 → step 内即停，不等步边界。
+                    from agents import task_agent as _ta_mod
+
+                    def _interrupt_probe():
+                        # 只查停止位 + interrupt_switch（见 _cancel_check 注释：
+                        # future.cancelled() 对运行中任务恒 False，是坏开关）
+                        if _is_stop_requested(str(task["session_id"])):
+                            raise _UserInterruptError("user interrupted")
+                        _ca = getattr(agent, "_active_code_agent", None)
+                        if _ca is not None and getattr(_ca, "interrupt_switch", False):
+                            raise _UserInterruptError("user interrupted")
+
+                    _prev_checks = list(_ta_mod._INTERRUPT_CHECKS)
+                    _ta_mod._INTERRUPT_CHECKS.append(_interrupt_probe)
                     try:
                         return await agent.chat(task["message"], session_id=task["session_id"])
+                    except _UserInterruptError:
+                        raise
                     finally:
                         agent._current_event_cb = _prev_cb
+                        agent._user_step_callbacks = _prev_cbs
+                        _ta_mod._INTERRUPT_CHECKS[:] = _prev_checks
 
                 resp = loop.run_until_complete(asyncio.wait_for(_run_with_events(), timeout=task["timeout"]))
                 future.set_result(resp.content or "")
@@ -119,6 +188,14 @@ def _worker_loop():
             if isinstance(e, asyncio.CancelledError):
                 logger.warning("[MQ] Worker 任务超时被取消（放行）")
                 future.set_result("")
+            elif type(e).__name__ == "_UserInterruptError":
+                # 用户停止（CLI Ctrl+C / Web request_stop）：安静收尾。
+                # set_result('') 让仍阻塞在 result() 的调用方立刻解除（不抛给无人等的场景）。
+                logger.warning("[MQ] Worker 任务被用户停止，已中止 agent.run")
+                try:
+                    future.set_result("")
+                except Exception:
+                    pass
             else:
                 logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
                 future.set_exception(e)

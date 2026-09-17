@@ -246,6 +246,11 @@ def _wrap_stage_guard(fn, tool_name, executor=None):
     vname = _tool_result_var(tool_name)
 
     def wrapper(*args, **kwargs):
+        # 立即停止（2026-09-17）：工具调用是 step 内最密集的可中断点——
+        # 每次**进入**工具前查一次中断回调，命中即中止（比等 step 边界快一个数量级：
+        # 一个 step 可含多次工具调用 + 最长 120s 沙箱代码）。
+        for _check in _INTERRUPT_CHECKS:
+            _check()
         result = fn(*args, **kwargs)
         try:
             executor.state[vname] = result
@@ -272,6 +277,15 @@ def _load_code_agent_yaml() -> dict:
             _CODE_AGENT_YAML = yaml.safe_load(f)
     return _CODE_AGENT_YAML
 
+
+# ── 立即停止（2026-09-17）──
+# 中断检查回调注册表：每次工具调用进入前逐个调用，抛异常即中止当前 run。
+# 由 message_queue worker 在执行任务期间注册（future 取消位 / session 停止位 /
+# smolagents interrupt_switch），任务结束后恢复原状。与步边界检查互补：
+#   - 工具调用边界：本注册表（step 内最密集检查点）
+#   - 步边界：smolagents interrupt_switch + step_callbacks（既有）
+#   - 沙箱内长代码：无法安全强杀线程，CODE_EXEC_TIMEOUT 兜底
+_INTERRUPT_CHECKS: list = []
 
 _VALID_ON_FAIL = {"retry", "replan", "abort"}
 
@@ -2154,6 +2168,10 @@ class TaskAgent(AgentBase):
             planning_interval=planning_interval,
             step_callbacks=(
                 [_truncate_observations, _clarify_empty_output, _enforce_final_answer]
+                # 协作取消（2026-09-17 Ctrl+C 修复）：message_queue worker 在主线程
+                # 收到 Ctrl+C 后置 future 取消位，这里每步开头检查 _user_step_callbacks，
+                # 命中即抛错中止 run——worker 线程收不到 SIGINT，这是唯一可停点。
+                + list(getattr(self, "_user_step_callbacks", None) or [])
                 + ([_evt_hook] if _evt_hook is not None else [])
             ),
             final_answer_checks=[_check_final_answer],
@@ -2166,6 +2184,11 @@ class TaskAgent(AgentBase):
                 "- web_search 结果用于补充新闻面、政策面、市场情绪等实时信息"
             ),
         )
+
+        # 立即停止（2026-09-17）：当前在跑的 CodeAgent 挂实例槽——
+        # 外部（message_queue 探针 / Web stop 端点）可调 agent.interrupt()，
+        # smolagents 原生 interrupt_switch 在下一个步边界抛 AgentError 中止。
+        self._active_code_agent = agent
 
         # 2026-09-16：与实际执行环境对齐——executor 已是全放行（"*"），
         # 但 CodeAgent 默认 authorized_imports 会让 system_prompt 规则 9 渲染出

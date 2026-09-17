@@ -192,6 +192,28 @@ def _g1_mask(f, board):
     return m
 
 
+def _g56_gate(f, pool, board, k, date_k):
+    """五重共振门判定 (给定预计算特征 f@k / 池统计 pool / 板块 board / 信号日索引 k)。
+
+    返回 (bool_pass, st): st=该日横截面统计 (None=池缺失)。scan_signals 与
+    backtest_stock 共用此单一判定事实源 — 修复 backtest 逐日重算 _g1_arrays 的 O(n^2)
+    坑 (原 backtest 每历史日调 scan_signals 重算全序列指标); 改规则务必同步此处。
+    """
+    if not _g1_mask(f, board)[k] or not f["rhist_chg"][k] > R56[board]:
+        return False, None
+    st = pool.get(board, {}).get(date_k)
+    if st is None:
+        return False, None                          # 池统计缺失 (聚合失败/暖机/空池)
+    if board == "main":
+        if not (st["rmed"] > MAIN_RMED_MIN and f["pctb"][k] <= MAIN_PCTB_MAX):
+            return False, None
+    else:
+        if not (st["score_r"] is not None and st["score_r"] > GEM_SCORE_MIN
+                and f["dif0"][k] <= 0):
+            return False, None
+    return True, st
+
+
 # ================================================================
 # 横截面 regime 门: 惰性聚合缓存 (单票回调架构下的池级统计量解法)
 # ================================================================
@@ -315,18 +337,9 @@ class G56Strategy(StrategyBase):
         date_k = str(bars[k]["time"])[:10]
         board = get_board_type(code)
         f = _g1_arrays(bars)
-        if not _g1_mask(f, board)[k] or not f["rhist_chg"][k] > R56[board]:
-            return []                              # G1池 & 56%门
-        st = _ensure_pool_daily(pool_target).get(board, {}).get(date_k)
-        if st is None:
-            return []                              # 池统计缺失 (聚合失败/暖机/空池) → 不产信号
-        if board == "main":
-            if not (st["rmed"] > MAIN_RMED_MIN and f["pctb"][k] <= MAIN_PCTB_MAX):
-                return []
-        else:
-            if not (st["score_r"] is not None and st["score_r"] > GEM_SCORE_MIN
-                    and f["dif0"][k] <= 0):
-                return []
+        ok, st = _g56_gate(f, _ensure_pool_daily(pool_target), board, k, date_k)
+        if not ok:
+            return []                              # G1池 & 56%门 & 横截面 regime 门
         rhc = float(f["rhist_chg"][k])
         return [Signal(
             code=code,
@@ -416,7 +429,7 @@ class G56Strategy(StrategyBase):
                                 price=round(float(b["close"]), 3))
         return ExitDecision("hold")
 
-    # ---- 回测钩子 (信号判定走 scan_signals 统一路径; 出场 _exit_no_trail 无追踪 2026-09-17) ----
+    # ---- 回测钩子 (信号判定走 _g56_gate 统一路径, 指标一次预计算; 出场 _exit_no_trail 无追踪 2026-09-17) ----
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=False,
                        probe=None):
         if code.startswith(("8", "4", "92")) or len(bars) < 68:
@@ -426,12 +439,20 @@ class G56Strategy(StrategyBase):
         n = len(bars)
         o = np.array([float(b["open"]) for b in bars])
         c = np.array([float(b["close"]) for b in bars])
+        # 修复① O(n^2): 全序列指标一次 O(n) 预计算, 不再逐日 scan_signals 重算 _g1_arrays
+        f = _g1_arrays(bars)
+        # 横截面 regime 池: 锚=快照末日, 一次聚合后按 target 跨股/逐日缓存复用
+        pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
         trades = []
+        last_exit_idx = -1   # 修复② 持仓窗口去重: 上一笔未退出前不重复入场
+                            # (同共振段连续成信号时锁仓至退出日, 防 000070 连日重复建仓)
         for s in range(68, n - 9):             # 末9日留引擎缓冲 (同研究)
-            if o[s] <= 0:
+            if o[s] <= 0 or s <= last_exit_idx:
                 continue
-            sigs = self.scan_signals(bars, code, as_of=s - 1)   # 判 D-1=s-1
-            if not sigs:
+            k = s - 1                          # 信号日 D-1
+            date_k = str(bars[k]["time"])[:10]
+            ok, st = _g56_gate(f, pool, board, k, date_k)
+            if not ok:
                 continue
             gap = o[s] / c[s - 1] - 1
             if gap >= lim:
@@ -439,12 +460,12 @@ class G56Strategy(StrategyBase):
             r = _exit_no_trail(bars, s, float(o[s]))
             if not r:
                 continue
-            ex = sigs[0].extra or {}
+            rhc = float(f["rhist_chg"][k])
             trades.append({
                 "code": code,
                 "board": board,
                 "strategy": STRATEGY_KEY,
-                "signal_date": str(bars[s - 1]["time"])[:10],
+                "signal_date": date_k,
                 "entry_date": str(bars[s]["time"])[:10],
                 "entry_price": round(float(o[s]), 3),
                 "entry_gap": round(gap * 100, 2),
@@ -454,10 +475,11 @@ class G56Strategy(StrategyBase):
                 "exit_day": r["exit_day"],
                 "return_pct": r["return_pct"],
                 "peak_return_pct": r["peak_return_pct"],
-                "rhist_chg": ex.get("rhist_chg"),
-                "boll_pctb": ex.get("boll_pctb"),
-                "rmed": ex.get("rmed"),
-                "score_r": ex.get("score_r"),
+                "rhist_chg": round(rhc, 3),
+                "boll_pctb": round(float(f["pctb"][k]), 2),
+                "rmed": round(st["rmed"], 3),
+                "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
                 "buy_mode": "next_open",
             })
+            last_exit_idx = s + r["exit_day"] - 1   # 锁仓至退出日 (含), 期间不重复入场
         return trades
