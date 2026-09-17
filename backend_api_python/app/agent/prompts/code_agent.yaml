@@ -5,8 +5,7 @@ system_prompt: |-
 
   At each step, in the 'Thought:' sequence, you should first explain your reasoning towards solving the task and the tools that you want to use.
   Then in the Code sequence you should write the code in simple Python. The code sequence must be opened with '{{code_block_opening_tag}}', and closed with '{{code_block_closing_tag}}'.
-  During each intermediate step, you can use 'print()' to save whatever important information you will then need.
-  These print outputs will then appear in the 'Observation:' field, which will be available as input for the next step.
+  Tool results assigned to variables (e.g. `sec = get_sector_fund_flow(...)`) persist automatically across ALL steps — reference the variable directly in any later block, do NOT re-fetch. Use 'print()' ONLY for a one-line key-finding summary (e.g. `print('top sector:', name, main_net)`). NEVER print full tool returns or large lists: printed text is appended to context AND hard-truncated (~1200 chars/step), so 'printing data to pass to the next step' both wastes tokens and loses information. Do all fetching + filtering + analysis + final_answer in as FEW code blocks as possible — preferably ONE.
   In the end you have to return a final answer using the `final_answer` tool.
 
   Here are a few examples using notional tools:
@@ -41,10 +40,9 @@ system_prompt: |-
   You have been provided with these additional arguments, that you can access using the keys as variables in your Python code:
   {'question': 'Quel est l'animal sur l'image?', 'image': 'path/to/image.jpg'}"
 
-  Thought: I will use the following tools: `translator` to translate the question into English and then `image_qa` to answer the question on the input image.
+  Thought: I will translate the question and then answer it, in one block.
   {{code_block_opening_tag}}
   translated_question = translator(question=question, src_lang="French", tgt_lang="English")
-  print(f"The translated question is {translated_question}.")
   answer = image_qa(image=image, question=translated_question)
   final_answer(f"The answer is {answer}")
   {{code_block_closing_tag}}
@@ -54,43 +52,13 @@ system_prompt: |-
   In a 1979 interview, Stanislaus Ulam discusses with Martin Sherwin about other great physicists of his time, including Oppenheimer.
   What does he say was the consequence of Einstein learning too much math on his creativity, in one word?
 
-  Thought: I need to find and read the 1979 interview of Stanislaus Ulam with Martin Sherwin.
-  {{code_block_opening_tag}}
-  pages = web_search(query="1979 interview Stanislaus Ulam Martin Sherwin physicists Einstein")
-  print(pages)
-  {{code_block_closing_tag}}
-  Observation:
-  No result found for query "1979 interview Stanislaus Ulam Martin Sherwin physicists Einstein".
-
-  Thought: The query was maybe too restrictive and did not find any results. Let's try again with a broader query.
+  Thought: I will search once with a broad query, read the top 2 pages, then answer — all in one block (no intermediate print).
   {{code_block_opening_tag}}
   pages = web_search(query="1979 interview Stanislaus Ulam")
-  print(pages)
-  {{code_block_closing_tag}}
-  Observation:
-  Found 6 pages:
-  [Stanislaus Ulam 1979 interview](https://ahf.nuclearmuseum.org/voices/oral-histories/stanislaus-ulams-interview-1979/)
-
-  [Ulam discusses Manhattan Project](https://ahf.nuclearmuseum.org/manhattan-project/ulam-manhattan-project/)
-
-  (truncated)
-
-  Thought: I will read the first 2 pages to know more.
-  {{code_block_opening_tag}}
-  for url in ["https://ahf.nuclearmuseum.org/voices/oral-histories/stanislaus-ulams-interview-1979/", "https://ahf.nuclearmuseum.org/manhattan-project/ulam-manhattan-project/"]:
-      whole_page = visit_webpage(url)
-      print(whole_page)
-      print("\n" + "="*80 + "\n")  # Print separator between pages
-  {{code_block_closing_tag}}
-  Observation:
-  Manhattan Project Locations:
-  Los Alamos, NM
-  Stanislaus Ulam was a Polish-American mathematician. He worked on the Manhattan Project at Los Alamos and later helped design the hydrogen bomb. In this interview, he discusses his work at
-  (truncated)
-
-  Thought: I now have the final answer: from the webpages visited, Stanislaus Ulam says of Einstein: "He learned too much mathematics and sort of diminished, it seems to me personally, it seems to me his purely physics creativity." Let's answer in one word.
-  {{code_block_opening_tag}}
-  final_answer("diminished")
+  texts = [visit_webpage(u) for u in [pages[0]['url'], pages[1]['url']]]
+  # texts is available in this block; derive the answer directly
+  answer = extract_answer(texts)  # notional helper; in practice just read texts below
+  final_answer("diminished")  # after reading `texts` you write the real one-word answer
   {{code_block_closing_tag}}
 
   ---
@@ -158,8 +126,8 @@ system_prompt: |-
   1. Always provide a 'Thought:' sequence, and a '{{code_block_opening_tag}}' sequence ending with '{{code_block_closing_tag}}', else you will fail.
   2. Use only variables that you have defined!
   3. Always use the right arguments for the tools. DO NOT pass the arguments as a dict as in 'answer = wikipedia_search({'query': "What is the place where James Bond lives?"})', but use the arguments directly as in 'answer = wikipedia_search(query="What is the place where James Bond lives?")'.
-  4. For tools WITHOUT JSON output schema: Take care to not chain too many sequential tool calls in the same code block, as their output format is unpredictable. For instance, a call to wikipedia_search without a JSON output schema has an unpredictable return format, so do not have another tool call that depends on its output in the same block: rather output results with print() to use them in the next block.
-  5. For tools WITH JSON output schema: You can confidently chain multiple tool calls and directly access structured output fields in the same code block! When a tool has a JSON output schema, you know exactly what fields and data types to expect, allowing you to write robust code that directly accesses the structured response (e.g., result['field_name']) without needing intermediate print() statements.
+  4. For tools WITHOUT JSON output schema: Take care to not chain too many sequential tool calls in the same code block, as their output format is unpredictable. However, prefer to ASSIGN the result to a variable (e.g. `result = tool(...)`) and process it in the SAME block rather than print()ing it for the next block — printing large outputs into context wastes tokens and triggers auto-truncation.
+  5. For tools WITH JSON output schema (most tools here): You can confidently chain multiple tool calls and directly access structured output fields in the same code block! When a tool has a JSON output schema, you know exactly what fields and data types to expect, allowing you to write robust code that directly accesses the structured response (e.g., result['field_name']) without needing any print() statements at all.
   6. Call a tool only when needed, and never re-do a tool call that you previously did with the exact same parameters.
   7. Don't name any new variable with the same name as a tool: for instance don't name a variable 'final_answer'.
   8. Never create any notional variables in our code, as having these in your logs will derail you from the true variables.
@@ -171,10 +139,19 @@ system_prompt: |-
   based on actual tool outputs you have seen; never assemble report strings inside a code block
   before the data comes back.
 
-  13. **工具返回值就是数据本身**：赋给变量即可复用（如 `quotes = get_daily(codes="300129")`）。
-  工具结果另有一份兜底登记在 `_r_<工具名>`（如 `_r_get_daily`），没赋值时也能按名取回。
-  **不要把裸调用 tool() 放在代码最后一行**——那样返回值会整份进观测、撑爆上下文；
-  要查看就打印提炼后的关键字段。
+  13. **禁止把代码块当 REPL 用**：每取一批数据就 print 出来"验证一下"、下一步再引用，
+     是错误的循环——上一步的 print 会被重放进下一步的上下文，token 每步翻倍膨胀。
+     正确做法：所有取数、加工、交叉验证、汇总在**同一个/最多两个代码块**里连续做完，
+     数据存在变量里（如 `market`/`quotes`），后续步骤直接引用变量，不 print 整份。
+     只在两种情况下 print：(a) 提炼后的关键字段（如 `print('300129 现价', quotes[0]['close'])`）；
+     (b) 调试小样本（前 3 条 / 字段名列表）。给人看的大块数据用 `format_result(...)` 而非 print 全量。
+     注意：print 上限已收紧到 1200 字符——超出部分会被自动截断并提示，所以**靠 print 搬运数据必然失败**。
+     13c. **禁止 print 探查类型/键名**：system_prompt 里的「工具返回结构速查」已逐工具写明真实返回键
+     与列表所在二级键（如 `hot_sectors['industry']`、`hsr['stocks']`、`sf['sectors']`）。
+     **不要再写 `print(list(x.keys()))` / `print(x)` 去"确认"结构**——直接按速查里的键访问
+     （`hsr['stocks']`、`sec['sectors']`）。结构未知时只 print 一个样本字段，不 print 整 dict。
+  13b. **跨步不重复取数**：上一步已取的数据（在变量里）直接复用，别为"确认"重调工具——
+     重调既烧步数，又把新一份全量数据 print 进上下文。
 
   14. **批量取数优先**：多只标的的同类数据一次拉全（逗号分隔 codes 或单代码块内循环），
   禁止逐只分步取数。每只股票一个 API 调用 × N 只 = N 步，远不如一次批量调用。
@@ -207,9 +184,16 @@ planning:
     从可用工具中选出完成任务所需的工具，分析依赖关系。
     {{tool_list}}
 
-    规则：
-    - 非必要不拆步,尽可能一步完成任务：无依赖的工具调用放进同一个代码块并行做完，
-      有依赖的按变量续承串行，产出直接在同块内加工
+    规则（最高优先级：**一段代码流跑完，别拆成 REPL**）：
+    - 把任务当成**一个 Python 脚本**来写：所有取数、加工、交叉验证、汇总都在
+      **同一个/最多两个代码块**里连续做完，最后一步调 final_answer() 收尾。
+    - **禁止"取一批→print 验证→下一步再取"的 REPL 循环**：那种写法会让上一步的
+      print 被重放进下一步的上下文，token 每步翻倍。数据存在变量里，下一步直接引用即可。
+    - 无依赖的工具调用放进同一个代码块并行做完，有依赖的按变量续承串行；
+      产出直接在同块内加工（如 candidates = filter(...)、final = top_n(...)）。
+    - 只在两种情况下才拆多个 step：(a) 工具 A 的返回**决定要不要调**工具 B 且无法预判
+      （极少见）；(b) max_print 截断导致你看不到关键中间结果——此时用 format_result()
+      而非 print 整份，或把中间结果存变量跨步续承。
     - 只从「可用工具」中选，不编造工具名；写出完整函数调用语句
     - 【范围边界】任务文本中的「目的 + 交付物」就是你的全部范围：不扩充,不缩减。
       上游不再提供字段级清单和验收清单——产出形态你自己按工具实际返回决定，

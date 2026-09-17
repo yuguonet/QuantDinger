@@ -141,15 +141,20 @@ _SANDBOX_EXTRA_BUILTINS = {
 # 原 SANDBOX_AUTHORIZED_IMPORTS / SANDBOX_KNOWN_UNAVAILABLE 两个常量已删除（死代码）。
 
 
-def _sandbox_instructions() -> str:
+def _sandbox_instructions(tools: Any = None) -> str:
     """渲染执行环境说明段。
 
     2026-09-14 决策：已去掉 import 白名单（executor 传 additional_authorized_imports=["*"]），
     故本段**不再列举白/黑名单**（那段每步重发是上下文膨胀来源，实测多轮后 4 万 token）。
     仅保留实测有效的防坑提示：① 沙箱只演示、完整源码在最终答复一次性给出；
     ② break/continue 不能放进 try/except（本沙箱用异常实现循环控制）。
+
+    2026-09-17 修复（根因）：模型对业务工具的真实返回形态（dict 顶层键、list 在哪个
+    二级键、单/多参数返回结构差异）一无所知，只能靠 print 探查类型 → REPL 式多步、
+    200K token 烧在类型试探。故在此把本阶段点名工具的【返回结构速查】拼进 system_prompt，
+    模型每一步都看得到，无需再探查。来源：tools/returns_contract.TOOL_RETURN_CONTRACTS。
     """
-    return (
+    base = (
         # 2026-09-14：沙箱已去掉（import 全放行），不再列白/黑名单——那段每步重发，
         # 是上下文膨胀的来源之一。仅保留实测有效的防坑提示。
         "【执行环境】Python 标准库与已安装的第三方库均可 import（无白名单限制）。\n"
@@ -165,6 +170,23 @@ def _sandbox_instructions() -> str:
         "⇒ 循环无法终止、同一逻辑反复执行。需要中途退出时，把 break 放在 try 块之外，"
         "或改用函数返回值/标志位控制。\n"
     )
+    # 2026-09-17：返回结构速查（仅本阶段点名工具）。这是压住 REPL 式类型探查的关键。
+    contract_block = ""
+    try:
+        from app.agent.tools.returns_contract import build_return_contract_block
+        names: set = set()
+        if tools:
+            if isinstance(tools, (list, tuple, set)):
+                names = set(str(t) for t in tools)
+            elif isinstance(tools, dict):
+                names = set(str(t) for t in tools.keys())
+        if names:
+            contract_block = build_return_contract_block(names)
+    except Exception as _ce:
+        logger.debug("[TaskAgent] 返回结构速查拼装跳过: %s", _ce)
+    if contract_block:
+        return base + "\n" + contract_block + "\n"
+    return base
 
 
 # ── 两级全局变量：**统一实现**（2026-09-15 用户定调）────────────────────────
@@ -1658,10 +1680,13 @@ class TaskAgent(AgentBase):
             # 内置补全（2026-09-12）：见 _SANDBOX_EXTRA_BUILTINS（repr/format/hash…）
             **_SANDBOX_EXTRA_BUILTINS,
         },
-            # 打印上限收紧（2026-09-12 F4）：smolagents 默认 50k 字符/步——生成代码
-            # 打印全量表/整段序列会把上下文撑爆。降到 6000（CODE_MAX_PRINT_CHARS 可调），
-            # 配合 F3 自动落盘：大数据进暂存区，打印只留要点。
-            max_print_outputs_length=int(os.getenv("CODE_MAX_PRINT_CHARS", "6000")),
+            # 打印上限收紧（2026-09-12 F4 → 2026-09-17 再砍）：smolagents 默认 50k 字符/步。
+            # 6000 仍被模型滥用——它把每个 step 当 REPL：取一批数据 print 验证→下一步再用，
+            # 导致上一步 print 被重放进下一步 context，token 每步累加 ~8K（实测 4.7K→34K/6步）。
+            # 砍到 1200：当前步 print 超阈值自动替成占位（smolagents 原生 truncate），逼模型
+            # 把数据留在变量里、用 final_answer 一次性汇总，而非分步 print 验证。
+            # 业务数据（列表/表形）本就该用 format_result/变量续承，不需要全量 print 进上下文。
+            max_print_outputs_length=int(os.getenv("CODE_MAX_PRINT_CHARS", "1200")),
             # 单步代码执行超时（2026-09-15）：smolagents 默认 30s，多标的批量取数
             # （几十只 × 串行 HTTP）必超。改为 env 可调，默认 120s；与外层
             # AGENT_RUN_WALL_TIMEOUT / wait_for 超时保持大于关系，保证外层先降级。
@@ -1941,15 +1966,16 @@ class TaskAgent(AgentBase):
         ]
         smol_tools += list(skill_tools or [])
 
-        # 阶段内局部记忆（2026-09-15 激进压缩，用户定调）：
-        #   - 保留最近 2 步完整（当前决策需要）；
-        #   - 更早步骤：observations 截到 400 字符（旧 200 太狠会丢成败信号），
-        #     code_action/model_output 截到 200 —— 大头是 print 的全量工具返回值；
-        #   - 真正的数据靠 executor.state 变量续承，不靠重放 observations。
+        # 阶段内局部记忆（2026-09-15 激进压缩，用户定调；2026-09-17 收紧 keep_recent）：
+        #   - 2026-09-17 keep_recent=1 仍线性膨胀：当前步生成 input 时上一步尚未
+        #     finalize，obs 仍是全量 → 每步涨 ~上一步全量 obs。故进一步降到 0：
+        #     历史步全部截到 400/200，当前步 obs 在其 finalize 后才被后续步看到
+        #     （此时已是下一轮，本步已成历史被截）。数据变量在 executor.state
+        #     跨步保留（见 _wrap_stage_guard），截断 observations 不丢数据。
         # smolagents 1.26 生命周期事实：write_memory_to_messages 每步全量重放
         # （无官方截断开关），社区方案 = step_callbacks 里原地改写 memory ——
         # 本函数即该方案（每步 finalize 后触发，截断对下一步的 prompt 生效）。
-        keep_recent = 2
+        keep_recent = 0
 
         def _truncate_field(step: ActionStep, field: str, cap: int = 200) -> None:
             val = getattr(step, field, None)
@@ -2127,7 +2153,7 @@ class TaskAgent(AgentBase):
             ),
             final_answer_checks=[_check_final_answer],
             instructions=(
-                _sandbox_instructions()
+                _sandbox_instructions(tools)
                 + "\n【数据补充策略】\n"
                 "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
                 "- web_search 搜索关键词示例：'{股票名称} {股票代码} 最新消息 分析'\n"
