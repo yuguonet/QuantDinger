@@ -86,6 +86,11 @@
       "label": "三金叉共振",
       "enabled": false,
       "daily_limit": 0
+    },
+    "g56": {
+      "label": "五重共振",
+      "enabled": true,
+      "daily_limit": 30
     }
   }
 }
