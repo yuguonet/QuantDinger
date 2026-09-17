@@ -186,6 +186,12 @@ class EvalNode:
     analysis: str = ""                 # 分析文字（内容主体）
     plan: str = ""                     # smolagents 最终规划
 
+    # 运行元数据（run 级，只写根节点；设计文档 §8.3：这四列此前有 DDL 无写入）
+    session_id: str = ""
+    user_query: str = ""
+    model: str = ""
+    total_tokens: Optional[int] = None
+
     # 正向: 调用信息
     input_params: Dict[str, Any] = field(default_factory=dict)
     tools_called: List[str] = field(default_factory=list)
@@ -313,6 +319,9 @@ class EvalNode:
             "timeframe": self.timeframe,
             "factors": [f.to_dict() for f in self.factors],
             "output_data": self.output_data, "analysis": self.analysis,
+            "plan": self.plan, "session_id": self.session_id,
+            "user_query": self.user_query, "model": self.model,
+            "total_tokens": self.total_tokens,
             "input_params": self.input_params,
             "tools_called": self.tools_called,
             "missing_data": self.missing_data, "data_source": self.data_source,
@@ -360,6 +369,11 @@ class EvalNode:
             confidence=d.get("confidence"), timeframe=d.get("timeframe", ""),
             factors=[FactorItem.from_dict(f) for f in d.get("factors", [])],
             output_data=d.get("output_data", {}), analysis=d.get("analysis", ""),
+            plan=d.get("plan", ""),
+            session_id=d.get("session_id", ""),
+            user_query=d.get("user_query", ""),
+            model=d.get("model", ""),
+            total_tokens=d.get("total_tokens"),
             input_params=d.get("input_params", {}),
             tools_called=d.get("tools_called", []),
             missing_data=d.get("missing_data", []),

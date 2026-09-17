@@ -171,7 +171,32 @@ system_prompt: |-
   based on actual tool outputs you have seen; never assemble report strings inside a code block
   before the data comes back.
 
-    {%- if custom_instructions %}
+  13. **工具返回值就是数据本身**：赋给变量即可复用（如 `quotes = get_daily(codes="300129")`）。
+  工具结果另有一份兜底登记在 `_r_<工具名>`（如 `_r_get_daily`），没赋值时也能按名取回。
+  **不要把裸调用 tool() 放在代码最后一行**——那样返回值会整份进观测、撑爆上下文；
+  要查看就打印提炼后的关键字段。
+
+  14. **批量取数优先**：多只标的的同类数据一次拉全（逗号分隔 codes 或单代码块内循环），
+  禁止逐只分步取数。每只股票一个 API 调用 × N 只 = N 步，远不如一次批量调用。
+
+  15. **分析文本在下一段写**：你写下的每个数字，都必须能在之前的 Observation 里找到。
+  不要在代码块里组装报告字符串（数据还没回来就是编造）。先取数，再用 final_answer 给出分析。
+
+  16. **收尾纪律**：全部取数完成后用 final_answer 一次收尾。final_answer 的内容是你的最终交付物，
+  调用后任务立即结束——确保所有需要的数据都已取到、所有分析都已完成再调用。
+
+  17. **沙箱限制**：
+  - 可以 import 任何已安装的模块（无白名单限制）
+  - break/continue **不能放在 try/except Exception 里面**——沙箱用异常实现循环控制，
+    会被你的 except 捕获导致循环无法终止。需要中途退出时把 break 放在 try 块之外，
+    或改用函数返回值/标志位控制
+  - 沙箱无文件写入工具，不要尝试写文件
+  - 沙箱只做演示，完整源码在 final_answer 里一次性给出
+
+  18. **跨阶段变量续承**：上一阶段你赋过名的变量（如 `df = get_daily(...)` 里的 `df`），
+  在本阶段**自动可用**，无需任何读写调用。直接用变量名引用即可。
+
+  {%- if custom_instructions %}
   {{custom_instructions}}
   {%- endif %}
 
@@ -190,6 +215,8 @@ planning:
       上游不再提供字段级清单和验收清单——产出形态你自己按工具实际返回决定，
       把任务要的信息要素完整覆盖即达标
     - 计划只列要执行的具体步骤，不复述任务背景
+    - 多只标的的同类数据一次拉全（逗号分隔 codes 或循环），禁止逐只分步取数
+    - 每个数字都必须有数据来源（工具返回值），不要编造
     - 如果任务不需要工具，直接写 '<end_plan>'
 
     ---
@@ -206,6 +233,7 @@ planning:
   update_plan_post_messages: |-
     【范围边界】仍以任务文本中的目的与交付物为界，不得新增阶段外步骤。
     【收敛优先】剩余步数不多时，优先用已有数据直接 final_answer() 收口。
+    【数据校验】写分析前先检查：你引用的每个数字是否真的出现在之前的 Observation 里？
     剩余步数：{{remaining_steps}}
 
     写完后写 '<end_plan>' 标签并停止。

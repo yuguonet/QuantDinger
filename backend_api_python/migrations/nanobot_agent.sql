@@ -57,6 +57,7 @@ CREATE TABLE qd_traces (
     calibration     REAL DEFAULT 1.0,
 
     -- 元数据
+    plan            TEXT,               -- smolagents 最终规划
     session_id      VARCHAR(100),
     user_query      TEXT,
     model           VARCHAR(100),

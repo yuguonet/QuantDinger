@@ -62,6 +62,7 @@ CREATE TABLE qd_traces (
     human_verdict   VARCHAR(50),                     -- negative_feedback 等
 
     -- 元数据
+    plan            TEXT,               -- smolagents 最终规划
     session_id      VARCHAR(100),
     user_query      TEXT,
     model           VARCHAR(100),

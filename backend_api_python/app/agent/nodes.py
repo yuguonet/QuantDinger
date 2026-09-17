@@ -148,7 +148,9 @@ class NodeContext:
         # TaskAgent 实例（用于调用 _build_code_agent 等方法）
         self.agent = None
 
-        # TraceCollector（session 级）
+        # AgentTraceRecorder（session 级；实现在 utils/tracing.py）。
+        # 顶层的 trace_collector.py 是上一代遗留（全项目零引用，主链路不在它）——
+        # 2026-09-17 曾删除，同日按用户决定原样恢复保留备查，勿再擅自删除。
         self.collectors: Dict[str, Any] = {}
 
     def init_tools(self):
@@ -1091,13 +1093,25 @@ def _select_phase_skill_tools(all_tools: list, phase_tools: list) -> list:
 
 
 def _detect_max_steps(agent) -> bool:
-    """smolagents>=1.27 到达 max_steps 不抛异常，仅在 memory 末步标记错误。"""
+    """smolagents 到达 max_steps 不抛异常，仅在 memory 末步 ActionStep 标记 AgentMaxStepsError。
+
+    已核对 1.26 源码（agents.py:625-637）：`_handle_max_steps_reached` 把带错的 ActionStep
+    append 为 memory.steps 末步（FinalAnswerStep 只 yield、不入 memory）⇒ 1.26/1.27 行为一致。
+    except 不再静默：本判据失效 = hit_max_steps 永假 = 复盘循环整体变死代码
+    （v1.4 曾因此死过一轮）——"判据不可用"必须可见（接线错误必须可见，同 L8/L10 处置）。
+    """
     try:
         from smolagents.utils import AgentMaxStepsError
+    except Exception as e:
+        logger.warning("[Execute] 步数耗尽判据失效：无法导入 AgentMaxStepsError"
+                       "（smolagents 版本漂移？）→ hit_max_steps 恒 False，复盘循环不会触发: %s", e)
+        return False
+    try:
         steps = getattr(getattr(agent, "memory", None), "steps", []) or []
         last = steps[-1] if steps else None
         return isinstance(getattr(last, "error", None), AgentMaxStepsError)
-    except Exception:
+    except Exception as e:
+        logger.warning("[Execute] 步数耗尽检测读取 memory 失败 → 视为未耗尽: %s", e)
         return False
 
 
@@ -1354,23 +1368,30 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         if acceptance:
             sec.append("**验收标准**：\n" + "\n".join(f"- {a}" for a in acceptance))
         task_parts.append("\n\n".join(sec))
-    # 工具白名单：批次内并集；任一 phase 未列工具（回退域默认）→ 整批不收窄
+    # 工具白名单：批次内并集。三态（2026-09-17，设计文档 §8.2）：
+    #   · 任一 phase 未声明 tools（tools_declared=False）→ 整批不收窄（回退域基调）
+    #   · 全部声明且并集非空 → 严格白名单
+    #   · 全部声明但并集为空（显式 0 工具）→ 整批不注入数据工具，只留元工具 + 技能工具
     union_tools = []
     any_default = False
     for ph in batch:
         t = ph.get("tools") or []
-        if not t:
+        if not ph.get("tools_declared", False):
             any_default = True
-        else:
-            for n in t:
-                # 归一化：planner 常把工具写成调用形态（如 get_market_overview()），
-                # 剥掉括号/空白再进白名单，避免“差一个字符就被静默丢弃”的断链
-                n = str(n).strip()
-                if n.endswith("()"):
-                    n = n[:-2].strip()
-                if n and n not in union_tools:
-                    union_tools.append(n)
-    if not any_default and union_tools:
+        for n in t:
+            # 归一化：planner 常把工具写成调用形态（如 get_market_overview()），
+            # 剥掉括号/空白再进白名单，避免“差一个字符就被静默丢弃”的断链
+            n = str(n).strip()
+            if n.endswith("()"):
+                n = n[:-2].strip()
+            if n and n not in union_tools:
+                union_tools.append(n)
+    if any_default:
+        # 未限定白名单：回退域默认（本域+通用工具全部可调用）。切勿把"无清单"误解成"无工具"，
+        # 否则模型会以为自己什么函数都没有而拒绝取数。
+        tool_scope_clause = ("（更正：本批次未设工具白名单，上句“仅清单所列函数”不适用——"
+                            "实际本域全部已挂载工具均可调用，函数名见函数调用 schema）")
+    elif union_tools:
         # 带签名（2026-09-12 E2E 实证：只给名字会诱发参数猜测，连环 TypeError 烧步数）
         def _tool_sig(_n):
             try:
@@ -1387,10 +1408,14 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         # 限定白名单模式：沙箱只暴露清单所列函数（防止模型臆造 create_file 等不存在的函数）
         tool_scope_clause = ""
     else:
-        # 未限定白名单：回退域默认（本域+通用工具全部可调用）。切勿把"无清单"误解成"无工具"，
-        # 否则模型会以为自己什么函数都没有而拒绝取数。
-        tool_scope_clause = ("（更正：本批次未设工具白名单，上句“仅清单所列函数”不适用——"
-                            "实际本域全部已挂载工具均可调用，函数名见函数调用 schema）")
+        # 显式声明 0 工具（§8.2）：本阶段经规划声明不使用任何数据工具，沙箱内只有
+        # 元工具（list_tools / search_tools / format_result / web_search / final_answer）
+        # 与技能工具。必须明说——否则模型会照"域工具全可用"的默认预期去调不存在的取数函数。
+        task_parts.append("## 本批次无数据工具\n\n"
+                          "本阶段经规划显式声明不使用任何数据工具：请直接基于"
+                          "【已续承的上阶段变量】与上下文完成，不要尝试调用取数函数（调用必然失败）。")
+        tool_scope_clause = ("（本阶段显式声明 0 个数据工具：不提供任何取数函数，"
+                            "请直接基于已续承变量/上下文完成）")
     # 技能工具按阶段收窄（2026-09-12 阶段清单升级）：点到名才注入（read_skill_* 常驻）
     _skill_tools = _select_phase_skill_tools(
         list(state.get("skill_tools", [])), union_tools if not any_default else [])
@@ -1790,6 +1815,17 @@ def make_execute_node(ctx: NodeContext):
             # 本次 run 的暂存区 scope（与 _run_phase_step 同规则派生）
             run_scope = "run_" + re.sub(r"[^A-Za-z0-9]", "",
                                         str(state.get("_start_time", ""))[-8:]) or "run_default"
+            # 单段路径白名单化（2026-09-17 契约）：外部 planner 必须点名工具，
+            # smolagents 沙箱不含全量（省 token + 不许执行器猜）。
+            # - plan_tools 非空 → 白名单 = plan_tools ∪ common（通用函数保底在场；
+            #   元工具 list_tools/search_tools/final_answer 等由 smol_tools 独立注入）
+            # - plan_tools 为空 → 维持 domain+common 基调（planner 没点名时不制造裸沙箱）
+            _tools_param = None
+            if plan_tools:
+                _common = set(ctx.tool_provider.list_by_domain("common")) if ctx.tool_provider else set()
+                _tools_param = sorted({_norm_tool_name_safe(t) for t in plan_tools} | _common)
+                logger.info("[Execute] 单段白名单注入 %d 个工具（planner 点名 %d + 通用 %d）: %s",
+                            len(_tools_param), len(plan_tools), len(_common), _tools_param[:12])
             agent = agent_instance._build_code_agent(
                 model=ctx.model,
                 provider=ctx.tool_provider,
@@ -1797,9 +1833,9 @@ def make_execute_node(ctx: NodeContext):
                 planning_interval=effective_interval,
                 phase_id=0,
                 domain=selected_domain,
+                tools=_tools_param,
                 step_event_cb=getattr(ctx, "event_cb", None),
                 run_scope=run_scope,
-                extra_tools=plan_tools or None,
             )
             agent._tool_contract = _contract
             logger.info("[Execute] 新建 CodeAgent 实例（工具契约 %s）", _contract)
@@ -1993,6 +2029,11 @@ def make_finalize_node(ctx: NodeContext):
         # ── 6. trace.finish() 写 JSONL + qd_traces ──
         trace = state.get("_trace")
         if trace:
+            # §8.3：run 级元数据在收尾补齐。model 没有事件源，只能显式设置；
+            # plan 通常由 execute_done 事件带入，这里用 state 的最终值兜底。
+            trace.set_model(getattr(getattr(ctx, "llm", None), "model", "") or "")
+            if agent_plan:
+                trace.set_plan(agent_plan)
             try:
                 root_id = trace.finish(
                     final_answer=raw_agent_output if not run_failed else None,  # 失败 run 不做决策提取
@@ -2050,6 +2091,14 @@ MAX_REPLAN = 2
 # 批次级步数上限（2026-09-15 批次化）：合并连续 phase 的 step_budget 之和封顶，
 # 防止单 CodeAgent 步数过多导致不稳。
 PLAN_BATCH_MAX_STEPS = 30
+
+
+def _norm_tool_name_safe(t: str) -> str:
+    """剥掉 planner 点名可能带上的 "()" / 空白（与 task_agent._norm_tool_name 同规则）。"""
+    s = str(t).strip()
+    if s.endswith("()"):
+        s = s[:-2].strip()
+    return s
 
 
 def route_after_execute(state: dict) -> str:

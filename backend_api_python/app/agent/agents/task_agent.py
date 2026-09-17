@@ -94,7 +94,9 @@ _CODE_AGENT_YAML_PATH = os.path.join(
 PLAN_MAX_PHASES = 5          # 单次 plan 的阶段数上限（超出截断）
 PLAN_PHASE_MAX_RETRIES = 1   # 单阶段默认重试上限（phase.max_retries 可覆盖，钳制 [0,3]）
 PLAN_PHASE_MAX_STEPS = 12    # 单阶段内部步数上限（phase.step_budget 钳制上界，2026-09-13）
-PLAN_BATCH_MAX_STEPS = 30     # 批次级步数上限（合并批次预算之和的封顶，2026-09-15 批次化）
+# 注：PLAN_BATCH_MAX_STEPS（批次级步数上限）的唯一来源在 nodes.py——它是执行侧"批次合并"
+# 的常量，不属于 planner 契约。曾在此双份定义（本处为死定义），改一处漏一处即静默漂移
+# （与审计 L6 同型），2026-09-17 删除，勿再加回。
 
 # planner 工具清单条数上限（2026-09-13 审计 L7）。原先固定 60 且按字母序截断：
 # 工具总数接近/超过该值时被砍掉的是"字母序靠后"的工具，与需求无关，会整批丢掉
@@ -264,8 +266,10 @@ def _normalize_phases(raw, available_names: set) -> list:
       - goal 为空的条目跳过；非 list / 全空 → 返回 []（调用方回退单段执行旧路径）
     易错点：
       - 纯函数（不 import provider），名称集合由调用方传入，便于单测
-      - 每个 phase 输出必带 tools 键（可能为空 list）：执行侧语义为
-        "非空 = 严格白名单；空/None = 回退 domain 逻辑"
+      - 每个 phase 输出必带 tools 键（可能为空 list）+ tools_declared 声明位：执行侧
+        按三态处理 —— tools 非空 = 严格白名单；tools 空且 tools_declared=True = 显式
+        "本阶段不用数据工具"（只留元工具 + 技能工具）；tools_declared=False = 未声明，
+        回退 domain 逻辑
     """
     if not isinstance(raw, list):
         return []
@@ -277,6 +281,11 @@ def _normalize_phases(raw, available_names: set) -> list:
         if not goal:
             continue
         tools_raw = p.get("tools")
+        # 2026-09-17（设计文档 §8.2）：区分"未声明"与"显式空"。二者此前都归一成 tools: []，
+        # 执行侧无从分辨 ⇒ planner 明确写 "tools": []（本阶段不用数据工具）时，会被静默
+        # 放大成整域几十个工具。声明位只认 list/str 形态；其余类型（dict/int）视为未声明、
+        # 回退域基调（安全侧：避免"声明了却一个工具都没有"的反向事故）。
+        tools_declared = isinstance(tools_raw, (list, str))
         if isinstance(tools_raw, str):
             tools_raw = [tools_raw]
         tools, dropped = [], []
@@ -328,6 +337,7 @@ def _normalize_phases(raw, available_names: set) -> list:
             "name": (str(p.get("name") or "").strip() or f"阶段{len(out) + 1}")[:40],
             "goal": goal[:800],
             "tools": tools,
+            "tools_declared": tools_declared,
             "tools_dropped": dropped,
             "deliverable": p.get("deliverable") or "",
             "step_budget": pbudget,
@@ -1506,8 +1516,11 @@ class TaskAgent(AgentBase):
         planning_interval: None=不 replan，3~5=每 N 步 replan。
         phase_id: 阶段ID（trace 与日志标记）。
         domain: 领域名，用于过滤工具。
-        tools: phase 工具白名单（2026-09-12 B 阶段）。非空→只注入白名单内的 provider 工具；
-            空或 None→回退 domain 逻辑（调用方传 domain="" 时回退为仅通用工具）。
+        tools: phase 工具白名单（2026-09-12 B 阶段）。三态（2026-09-17，设计文档 §8.2）：
+            非空 list → 只注入白名单内的 provider 工具；
+            空 list `[]`（planner 显式声明本阶段不用数据工具）→ 不注入任何 provider
+            工具，沙箱内只剩元工具 + 技能工具；
+            None（未声明）→ 回退 domain 逻辑（domain="" 时仅通用工具）。
         run_scope: 本次 run 的暂存区 scope（2026-09-12 F3）。**1 级（跨阶段）通道**
             由 nodes 侧驱动（任务书告知 scope、_auto_stage_phase_result 写阶段结果），
             本形参自 2026-09-15 起在本方法体内不再被消费（工具结果改走 2 级
@@ -1554,8 +1567,8 @@ class TaskAgent(AgentBase):
                 s = s[:-2].strip()
             return s
 
-        _extra = {_norm_tool_name(t) for t in (extra_tools or [])} if not tools else set()
-        if tools:
+        _extra = {_norm_tool_name(t) for t in (extra_tools or [])} if tools is None else set()
+        if tools is not None:
             allowed = {_norm_tool_name(t) for t in tools}
             _prov_fns = provider.get_functions()
             tool_functions = {n: f for n, f in _prov_fns.items() if n in allowed}
@@ -1565,8 +1578,14 @@ class TaskAgent(AgentBase):
             if _miss:
                 logger.warning("[TaskAgent] phase 白名单 %d 个名字 provider 中不存在（已忽略）：%s",
                                len(_miss), _miss[:12])
-            logger.info("[TaskAgent] phase 白名单：加载 %d 个工具 %s", len(tool_functions),
-                        sorted(tool_functions)[:12])
+            if allowed:
+                logger.info("[TaskAgent] phase 白名单：加载 %d 个工具 %s", len(tool_functions),
+                            sorted(tool_functions)[:12])
+            else:
+                # 显式声明 0 工具（§8.2）：不注入任何 provider 工具，沙箱内只剩
+                # 元工具（list_tools / search_tools / format_result / web_search / final_answer）
+                # 与技能工具——本阶段靠已续承变量与上下文完成。
+                logger.info("[TaskAgent] phase 显式声明 0 工具：仅元工具 + 技能工具可用")
         elif domain:
             # 指定域：域工具 + 通用工具（+ 附加点名）
             allowed = set(provider.list_by_domain("common") + provider.list_by_domain(domain)) | _extra

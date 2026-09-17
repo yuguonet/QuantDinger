@@ -26,6 +26,50 @@ _PROSE_RE = re.compile(
 )
 
 
+_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
+_PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
+
+
+def _translate_invoke_xml(text: str) -> str | None:
+    """把 <invoke name="tool">…</invoke> XML 工具调用语法转成 Python 调用。
+
+    模型偶尔用 XML 工具调用语法（而非 <code> 块内的 Python）表达工具调用，
+    例如 Step1 实测：`<execute><invoke name="get_market_overview"></invoke></execute>`。
+    本函数做 best-effort 转译，让一次格式漂移不至于直接烧掉整步：
+      - `<invoke name="get_market_overview"></invoke>` → `get_market_overview()`
+      - `<invoke name="foo"><parameter name="a">1</parameter><parameter name="b">'x'</parameter></invoke>`
+        → `foo(a=1, b='x')`
+    多个 invoke 串行拼接为多行调用。转译结果必须 ast 可解析，否则返回 None
+    （交给后续救援链 / 结构化错误）。
+    """
+    invokes = _INVOKE_RE.findall(text)
+    if not invokes:
+        return None
+    lines: list[str] = []
+    for name, body in invokes:
+        params = _PARAM_RE.findall(body)
+        if params:
+            args = []
+            for pname, pval in params:
+                pval = pval.strip()
+                # 尝试解析为 Python 字面量（数字/bool/None/列表/字典），失败则按字符串 repr 包裹
+                try:
+                    ast.literal_eval(pval)
+                    arg = f"{pname}={pval}"
+                except (ValueError, SyntaxError):
+                    arg = f"{pname}={pval!r}"
+                args.append(arg)
+            lines.append(f"{name}({', '.join(args)})")
+        else:
+            lines.append(f"{name}()")
+    code = "\n".join(lines)
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return None
+    return code
+
+
 def _rescue_loose_code(text: str) -> str | None:
     """无标签抢救：跳过散文行，提取最长【可解析】的 Python 区段。"""
     lines = text.split("\n")
@@ -80,6 +124,9 @@ def resilient_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> s
             ast.parse(code)
         except SyntaxError:
             code = None
+    if code is None:
+        # XML 工具调用语法兜底（如 `<invoke name="tool">…</invoke>`）：转译为 Python 调用
+        code = _translate_invoke_xml(text)
     if code is None:
         code = _rescue_loose_code(text)
 

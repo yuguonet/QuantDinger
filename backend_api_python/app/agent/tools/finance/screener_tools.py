@@ -139,7 +139,10 @@ def search_stocks(
             return _r
         elif source == "eastmoney":
             return {"error": raw.get("msg", "东财选股搜索失败"), "retriable": True}
-        # auto 模式下东财失败，继续 fallback
+        # auto 模式下东财失败：本工具当前仅有 eastmoney 一个后端，无第二个数据源可 fallback；
+        # 返回 retriable=True 让 breaker 不立即熔断、模型可换其他工具继续，而非把合法的
+        # 'auto' 默认值误报成"未知数据源"（旧实现会掉进下方 return 把 auto 当非法值）。
+        return {"error": raw.get("msg", "东财选股搜索失败（auto 模式）"), "retriable": True}
 
     return {"error": f"未知数据源: {source}", "retriable": False}
 

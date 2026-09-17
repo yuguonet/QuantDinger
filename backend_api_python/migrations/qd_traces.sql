@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS qd_traces (
     calibration     REAL DEFAULT 1.0,
 
     -- 元数据
+    plan            TEXT,               -- smolagents 最终规划
     session_id      VARCHAR(100),
     user_query      TEXT,
     model           VARCHAR(100),
@@ -79,3 +80,8 @@ CREATE INDEX IF NOT EXISTS idx_traces_layer ON qd_traces(layer);
 CREATE INDEX IF NOT EXISTS idx_traces_stock ON qd_traces(stock_code, exec_date);
 CREATE INDEX IF NOT EXISTS idx_traces_skill ON qd_traces(name, exec_date) WHERE layer = 'skill';
 CREATE INDEX IF NOT EXISTS idx_traces_pending ON qd_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
+
+-- 存量库补列（设计文档 §8.3）：chain/store.py 的 INSERT/UPDATE 都会写 plan，
+-- 缺列会让整条 INSERT 报错 ⇒ qd_traces 一条都写不进去（声明了却静默断链）。
+-- CREATE TABLE IF NOT EXISTS 不会改动已存在的表，故此处单独幂等补列。
+ALTER TABLE qd_traces ADD COLUMN IF NOT EXISTS plan text;

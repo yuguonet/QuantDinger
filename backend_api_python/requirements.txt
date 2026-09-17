@@ -39,7 +39,9 @@ pyarrow>=14.0.0
 pydantic>=2.0.0
 PyYAML>=6.0
 # smolagents — ReAct agent framework (OpenAI-compatible)
-smolagents[openai]>=1.27.0
+# 代码按 1.26 生命周期写并实测（max_steps 末步标记 AgentMaxStepsError，见 nodes._detect_max_steps）；
+# 曾声明 >=1.27 而实装 1.26.0（环境漂移）。升 1.27 前先复核该行为与 executor.state 生命周期。
+smolagents[openai]>=1.26.0
 # smolagents built-in tool dependencies
 ddgs>=7.0.0
 markdownify>=0.14.0

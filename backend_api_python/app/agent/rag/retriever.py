@@ -428,12 +428,26 @@ class MultiRouteRetriever:
         self.reranker = reranker
         self.rerank_top_k = rerank_top_k  # RRF 后送入 reranker 的数量
 
+    # 非金融意图集合：与 Retriever.NON_FINANCE_INTENTS 同一清单（意图×语料域
+    # 不匹配的判断属于 RAG 层；MultiRouteRetriever 作为组合器同步下沉，2026-09-17）。
+    NON_FINANCE_INTENTS = Retriever.NON_FINANCE_INTENTS
+
     async def retrieve(
         self,
         query: str,
         top_k: Optional[int] = None,
         filter: Optional[dict] = None,
+        intent: str = "",
     ) -> list[dict]:
+        """执行多路检索 + RRF 融合 + 可选精排。
+
+        :param intent: 用户意图分类（task 子类型，如 code/general/explain）。
+            命中 NON_FINANCE_INTENTS → 与本库语料域不匹配，直接返回 []（不发起
+            任何路线的检索调用），与 Retriever.retrieve 的门控语义一致。
+        """
+        if intent and intent in self.NON_FINANCE_INTENTS:
+            logger.info("[MultiRouteRetriever] 意图=%s 与本库语料域不匹配，跳过检索", intent)
+            return []
         # 1. 多路召回
         queries = [query, *[q for q in self.query_variants if q and q != query]]
         tasks = []

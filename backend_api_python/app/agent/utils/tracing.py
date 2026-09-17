@@ -217,6 +217,13 @@ class AgentTraceRecorder:
         # 原始 CodeAgent 输出缓存（LLM 格式化前），供结构化字段提取
         self._raw_agent_output: str = ""
 
+        # run 级运行元数据（2026-09-17，设计文档 §8.3）：qd_traces 的
+        # session_id / user_query / model / total_tokens / plan 五列此前要么缺 DDL、
+        # 要么有 DDL 无写入，这里负责采集，finish() 时随根节点落库。
+        self._model: str = ""
+        self._total_tokens: int = 0
+        self._plan: str = ""
+
         if self.enabled:
             self.record(
                 "run_start",
@@ -233,11 +240,25 @@ class AgentTraceRecorder:
     def record(self, event_type: str, payload: Optional[dict] = None):
         if not self.enabled:
             return
+        payload = payload or {}
+        # 顺路汇总 run 级元数据（§8.3）：这些信息散落在事件里，此前无人采集落库。
+        # 多批次执行会记多次 token_usage（每批一次），累加才是整轮真实消耗。
+        if event_type == "token_usage":
+            try:
+                self._total_tokens += int(payload.get("total") or 0)
+            except (TypeError, ValueError):
+                pass
+        _plan = payload.get("agent_plan")
+        if isinstance(_plan, str) and _plan:
+            self._plan = _plan
+        _model = payload.get("model")
+        if isinstance(_model, str) and _model and not self._model:
+            self._model = _model
         self.events.append({
             "type": event_type,
             "timestamp_ms": _now_ms(),
             "elapsed_ms": _now_ms() - self.started_at_ms,
-            "payload": _truncate(payload or {}),
+            "payload": _truncate(payload),
         })
 
     # ── 上下文设置（由 nodes 调用）────────────────────────────
@@ -266,6 +287,20 @@ class AgentTraceRecorder:
             self.intent_verb = verb
         if noun:
             self.intent_noun = noun
+
+    def set_model(self, model: str):
+        """记录本次 run 使用的模型名（§8.3）。
+
+        model 没有事件源（没有任何节点把模型名写进 trace 事件），只能由调用方在
+        收尾处显式设置——finalize 的 ctx.llm.model 即是。
+        """
+        if model:
+            self._model = str(model)
+
+    def set_plan(self, plan: str):
+        """记录 smolagents 最终规划（§8.3）。事件里已带 agent_plan 时可不必调用。"""
+        if plan and not self._plan:
+            self._plan = str(plan)
 
     def add_tool_call(self, tool_name: str, arguments: dict = None,
                       result: Any = None, elapsed_ms: float = 0,
@@ -406,6 +441,14 @@ class AgentTraceRecorder:
                 stock_name=stock_name,
                 input_params={"user_query": self.user_input},
                 analysis=final_answer[:2000],
+                # §8.3：run 级元数据落库。此前这五列要么有 DDL 无写入（恒空），
+                # 要么（plan）压根没有 DDL —— 而 store.py 的 INSERT 一直在写 plan，
+                # 缺列会让整条 INSERT 报错 ⇒ qd_traces 一条都写不进去。
+                plan=self._plan,
+                session_id=self.session_id,
+                user_query=self.user_input,
+                model=self._model,
+                total_tokens=self._total_tokens or None,
                 score=_extract_score(final_answer),
                 direction=_extract_direction(final_answer),
                 action=_extract_action(final_answer),

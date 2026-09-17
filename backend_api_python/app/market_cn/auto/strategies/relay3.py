@@ -188,6 +188,82 @@ def eval_exit_day_close(bars, entry_idx: int, entry_price: float, code: str, d1_
 
 
 # ================================================================
+# 回测出场引擎 (日线近似 S4: 无1m快照, 用 high/close 判定触板/封板)
+# ================================================================
+
+def run_backtest_relay3(bars, entry_idx, entry_price, code, params):
+    """relay3 日线回测出场模拟 → dict 或 None。
+
+    出场口径 (与 eval_exit_day_close/eval_exit_live 同语义, 日线近似):
+      - D1 未触涨停 (high < limit) → S4 尾盘卖 (按 D1 close);
+      - D1 触板但未封板 (high>=limit 且 close < limit*0.995) → 炸板卖出 (按 D1 close,
+        保守近似: 实盘炸板瞬间价通常高于收盘价);
+      - D1 封板守住 → 持有 D2+: 追踪止损-8% (自D1以来最高点) / 到期 hold_days_max 天。
+    返回 dict 含 exit_price/exit_day/exit_reason/return_pct/peak_return_pct/open;
+    开放持仓 (数据不足) 返回 {"open": True, "exit_day": N}。
+    """
+    th = 0.198 if get_board_type(code) == "gem_star" else 0.098
+    limit_price = round(entry_price * (1 + th), 2)
+    seal_th = limit_price * params["break_sell_ratio"]
+    n = len(bars)
+    if entry_idx >= n:
+        return None
+    d1 = bars[entry_idx]
+    d1_high = float(d1["high"])
+    d1_close = float(d1["close"])
+    d1_touched = d1_high >= limit_price - 0.001
+    d1_sealed = d1_touched and d1_close >= seal_th
+
+    if not d1_touched:
+        return {
+            "exit_price": round(d1_close, 3), "exit_day": 1,
+            "exit_reason": "S4未封板尾盘卖",
+            "return_pct": round((d1_close / entry_price - 1) * 100, 2),
+            "peak_return_pct": round((d1_high / entry_price - 1) * 100, 2),
+            "open": False,
+        }
+    if not d1_sealed:
+        return {
+            "exit_price": round(d1_close, 3), "exit_day": 1,
+            "exit_reason": "炸板卖出(S4)",
+            "return_pct": round((d1_close / entry_price - 1) * 100, 2),
+            "peak_return_pct": round((d1_high / entry_price - 1) * 100, 2),
+            "open": False,
+        }
+    # 封板延续: D2+ 追踪止损 / 到期
+    peak_high = d1_high
+    max_days = params["hold_days_max"]
+    for day in range(2, max_days + 1):
+        idx = entry_idx + day - 1  # day=2 → D2 bar
+        if idx >= n:
+            return {"open": True, "exit_day": day}
+        bar = bars[idx]
+        hi, cl = float(bar["high"]), float(bar["close"])
+        peak_high = max(peak_high, hi)
+        ret_from_high = (cl / peak_high - 1) * 100
+        if ret_from_high <= params["trail_after_limit"]:
+            return {
+                "exit_price": round(cl, 3), "exit_day": day,
+                "exit_reason": f"追踪止损{params['trail_after_limit']}%",
+                "return_pct": round((cl / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((peak_high / entry_price - 1) * 100, 2),
+                "open": False,
+            }
+    # 到期
+    last_idx = entry_idx + max_days - 1
+    if last_idx >= n:
+        return {"open": True, "exit_day": max_days}
+    last_close = float(bars[last_idx]["close"])
+    return {
+        "exit_price": round(last_close, 3), "exit_day": max_days,
+        "exit_reason": f"到期{max_days}天",
+        "return_pct": round((last_close / entry_price - 1) * 100, 2),
+        "peak_return_pct": round((peak_high / entry_price - 1) * 100, 2),
+        "open": False,
+    }
+
+
+# ================================================================
 # StrategyBase 插件实现
 # ================================================================
 
@@ -327,3 +403,62 @@ class Relay3Strategy(StrategyBase):
         if reason:
             return ExitDecision("exit", reason=reason, price=float(price or 0))
         return ExitDecision("hold")
+
+    # ---- 回测钩子 (日线近似 S4, 2026-09-16 新增) ----
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                       probe=None):
+        """单股 relay3 全历史日线回测 → trades 列表。
+
+        枚举: i=D0 (恰为board_height连板收盘日) → scan_signals → D1开盘gap过滤
+        → run_backtest_relay3 出场模拟。U1~U4 锚定 D0 涨停日。
+        注意: 日线近似 S4 炸板按收盘价卖出, 实盘炸板瞬间价通常更高 → 回测偏保守。
+        """
+        from app.market_cn.auto.common.filters import unified_prefilter
+        p = self.merged_params(None)
+        n = len(bars)
+        if n < 5:
+            return []
+        trades = []
+        for i in range(1, n - 1):  # i=D0, i+1=D1(入场日)
+            sigs = self.scan_signals(bars[:i + 1], code)
+            if not sigs:
+                continue
+            sig = sigs[0]
+            # U1~U4 预过滤 (锚定 D0 涨停日)
+            if use_prefilter:
+                ok, _fails = unified_prefilter(bars, i, code, stock_info)
+                if not ok:
+                    continue
+            # D1 开盘 gap 过滤
+            entry_price = float(bars[i + 1]["open"])
+            if entry_price <= 0:
+                continue
+            prev_close = float(bars[i]["close"])
+            if prev_close <= 0:
+                continue
+            gap = (entry_price / prev_close - 1) * 100
+            if not (p["gap_min"] <= gap <= p["gap_max"]):
+                continue
+            # 出场模拟
+            result = run_backtest_relay3(bars, i + 1, entry_price, code, p)
+            if not result or result.get("open"):
+                continue  # 跳过开放持仓 (数据不足, 回测只统计已平仓)
+            ex = sig.extra or {}
+            trades.append({
+                "code": code,
+                "board": get_board_type(code),
+                "path": self.key,
+                "path_label": self.name,
+                "signal_date": bars[i]["time"],
+                "entry_date": bars[i + 1]["time"],
+                "entry_price": round(entry_price, 3),
+                "buy_mode": "next_open",
+                "d1_gap": round(gap, 2),
+                "lu_date": ex.get("lu_date"),
+                "board_height": ex.get("board_height"),
+                "ma_bull": ex.get("ma_bull"),
+                "lu_vol_ratio": ex.get("lu_vol_ratio"),
+                "rsi": ex.get("rsi"),
+                **result,
+            })
+        return trades
