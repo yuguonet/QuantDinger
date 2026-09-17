@@ -32,11 +32,11 @@ thread.join(timeout=60)
 
 elapsed = time.time() - t0
 if thread.is_alive():
-    print(f"[check_exit] ❌ 60s 后线程仍在运行，进程不退")
+    print(f"[check_exit]  60s 后线程仍在运行，进程不退")
     # 列出所有活着线程
     for st in threading.enumerate():
         print(f"  存活线程: {st.name} daemon={st.daemon}")
     sys.exit(1)
 else:
-    print(f"[check_exit] ✅ 线程正常退出，耗时 {elapsed:.1f}s")
+    print(f"[check_exit]  线程正常退出，耗时 {elapsed:.1f}s")
     sys.exit(0)

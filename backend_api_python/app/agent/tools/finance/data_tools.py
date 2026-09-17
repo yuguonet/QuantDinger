@@ -150,7 +150,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
 def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
     """K线数据：返回OHLCV，支持 A 股。
 
-    ⚠️ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
+    ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
 
     Args:
         codes: 多股用逗号分隔

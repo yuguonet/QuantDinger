@@ -583,13 +583,13 @@ def _detect_resonance(
 
     if oversold_count >= 3:
         bullish_scores.append(("超卖", 12))
-        signals.append("🔥 RSI+KDJ+BOLL 三重超卖共振")
+        signals.append(" RSI+KDJ+BOLL 三重超卖共振")
     elif oversold_count >= 2:
         bullish_scores.append(("超卖", 6))
         signals.append("RSI+KDJ 双重超卖")
     elif overbought_count >= 3:
         bearish_scores.append(("超买", 12))
-        signals.append("⚠️ RSI+KDJ+BOLL 三重超买共振")
+        signals.append("⚠ RSI+KDJ+BOLL 三重超买共振")
     elif overbought_count >= 2:
         bearish_scores.append(("超买", 6))
         signals.append("RSI+KDJ 双重超买")
@@ -597,10 +597,10 @@ def _detect_resonance(
     # ── 维度 4: 背离共振（MACD + RSI）──
     if macd_div == "bullish_div" and rsi_div == "bullish_div":
         bullish_scores.append(("背离", 10))
-        signals.append("🔥 MACD+RSI 双底背离共振")
+        signals.append(" MACD+RSI 双底背离共振")
     elif macd_div == "bearish_div" and rsi_div == "bearish_div":
         bearish_scores.append(("背离", 10))
-        signals.append("⚠️ MACD+RSI 双顶背离共振")
+        signals.append("⚠ MACD+RSI 双顶背离共振")
     elif macd_div == "bullish_div":
         bullish_scores.append(("背离", 4))
         signals.append("MACD底背离")
@@ -672,10 +672,10 @@ def _detect_resonance(
     resonance_type = "无"
     resonance_detail = ""
     if bull_dims >= 3:
-        resonance_type = f"🔥 {bull_dims}重看多共振"
+        resonance_type = f" {bull_dims}重看多共振"
         resonance_detail = "+".join(n for n, _ in bullish_scores)
     elif bear_dims >= 3:
-        resonance_type = f"⚠️ {bear_dims}重看空共振"
+        resonance_type = f"⚠ {bear_dims}重看空共振"
         resonance_detail = "+".join(n for n, _ in bearish_scores)
     elif bull_dims >= 2:
         resonance_type = "双重看多共振"

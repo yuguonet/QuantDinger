@@ -1346,7 +1346,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         for r in prev_results:
             fields = (r.get("deliverable") or "")[:120]
             lines.append(f"- 阶段{r.get('id')} {r.get('name', '')}："
-                         f"{'✓通过' if r.get('status') == 'pass' else '✗未通过'}，"
+                         f"{'通过' if r.get('status') == 'pass' else '未通过'}，"
                          f"交付物含[{fields}]")
         task_parts.append("## 已完成阶段（本清单不含内容）\n\n"
                           + "\n".join(lines))
@@ -1614,9 +1614,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                 if r["id"] == int(batch[-1].get("id", 0)):
                     r["staged"] = _staged
             _done = (done_text + "\n\n" + "\n".join(
-                f"[阶段{r['id']} {r['name']}] {'✓通过' if r['status'] == 'pass' else '✗未通过'}"
+                f"[阶段{r['id']} {r['name']}] {'通过' if r['status'] == 'pass' else '未通过'}"
                 for r in _records)).strip() if done_text else "\n".join(
-                f"[阶段{r['id']} {r['name']}] {'✓通过' if r['status'] == 'pass' else '✗未通过'}"
+                f"[阶段{r['id']} {r['name']}] {'通过' if r['status'] == 'pass' else '未通过'}"
                 for r in _records)
             return {
                 "result_raw": str(result), "hit_max_steps": False,
@@ -1653,9 +1653,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             replan_count = replan_count + 1
             logger.info("[Execute] 批次 [%d-%d] 验收未过，触发 replan", first_id, last_id)
             _done = (done_text + "\n\n" + "\n".join(
-                f"[阶段{r['id']} {r['name']}] {'✓通过' if r['status'] == 'pass' else '✗未通过'}"
+                f"[阶段{r['id']} {r['name']}] {'通过' if r['status'] == 'pass' else '未通过'}"
                 for r in _records)).strip() if done_text else "\n".join(
-                f"[阶段{r['id']} {r['name']}] {'✓通过' if r['status'] == 'pass' else '✗未通过'}"
+                f"[阶段{r['id']} {r['name']}] {'通过' if r['status'] == 'pass' else '未通过'}"
                 for r in _records)
             return {
                 "result_raw": str(result), "hit_max_steps": False,
@@ -1678,7 +1678,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     for r in records:
         if r["id"] == int(batch[-1].get("id", 0)):
             r["staged"] = _staged
-    done_lines = [f"[阶段{r['id']} {r['name']}] {'✓通过' if r['status'] == 'pass' else '✗未通过'}"
+    done_lines = [f"[阶段{r['id']} {r['name']}] {'通过' if r['status'] == 'pass' else '未通过'}"
                   f"{('：' + r['note'][:160]) if r['note'] else ''}" for r in records]
     done_new = (done_text + "\n\n" + "\n".join(done_lines)).strip() if done_text \
         else "\n".join(done_lines)
@@ -1866,7 +1866,8 @@ def make_execute_node(ctx: NodeContext):
         # 复盘循环（hit_max_steps → plan 重规划）因此成为死代码（审计 P1-1）。
         try:
             from smolagents.utils import AgentMaxStepsError
-            last_err = getattr(getattr(agent, "memory", None), "steps", [None])[-1]
+            _mem_steps = getattr(getattr(agent, "memory", None), "steps", None) or []
+            last_err = _mem_steps[-1] if _mem_steps else None
             last_err = getattr(last_err, "error", None)
             if isinstance(last_err, AgentMaxStepsError):
                 logger.info("[Execute] max_steps 耗尽（memory 标记），需复盘")

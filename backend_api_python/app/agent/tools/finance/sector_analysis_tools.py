@@ -128,17 +128,16 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
         industry = list(data.get("industry") or [])
         concept = list(data.get("concept") or [])
 
-        # ② 东财富化（失败不影响主源）
-        em_limit = max(int(industry_limit or 0), int(concept_limit or 0)) or 15
-        em = {bt: _fetch_em_hot_sectors(bt, em_limit) for bt in ("industry", "concept")}
-        industry = _merge_em_rows(industry, em.get("industry") or [])
-        concept = _merge_em_rows(concept, em.get("concept") or [])
-
-        # ③ 主源也空（新浪与东财兜底同时失败）时，东财才降级为唯一来源
-        if not industry:
-            industry = em.get("industry") or []
-        if not concept:
-            concept = em.get("concept") or []
+        # ② 东财兜底：仅当新浪某板块列表为空时才降级调用东财。
+        #    —— 主源健康时完全不碰东财，避免 push2 反爬熔断（RemoteDisconnected）。
+        #    —— 新浪有数据时不富化 BK 代码（下游 get_sector_stocks 走 board_name 缓存解析）。
+        if not industry or not concept:
+            em_limit = max(int(industry_limit or 0), int(concept_limit or 0)) or 15
+            em = {bt: _fetch_em_hot_sectors(bt, em_limit) for bt in ("industry", "concept")}
+            if not industry:
+                industry = em.get("industry") or []
+            if not concept:
+                concept = em.get("concept") or []
 
         def _slim(rows, limit):
             out = []

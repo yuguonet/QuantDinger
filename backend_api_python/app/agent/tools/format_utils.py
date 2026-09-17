@@ -22,7 +22,7 @@ def format_result(result: Any, max_depth: int = 3, max_items: int = 20) -> str:
         'name: 茅台\nprice: 1800.0'
 
         >>> format_result({"error": "数据不足"})
-        '❌ 数据不足'
+        ' 数据不足'
 
         >>> format_result([1, 2, 3])
         '1\n2\n3'
@@ -85,7 +85,7 @@ def _format_dict(d: dict, depth: int, max_depth: int, max_items: int) -> str:
 
     # 检查是否有 error 字段
     if "error" in d:
-        return f"❌ {d['error']}"
+        return f" {d['error']}"
 
     lines = []
     count = 0

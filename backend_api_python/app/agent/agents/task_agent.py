@@ -1220,10 +1220,16 @@ class TaskAgent(AgentBase):
         except (TypeError, ValueError):
             step_budget = 10
         step_budget = max(1, min(20, step_budget))
-        # 内部规划步距（2026-09-12 Q7+B 后修正）：旧公式 max(budget//2+1,6) 在预算 4~6
-        # 时 interval=6 > 预算 → 内部 planner 全程不触发（"没细化"）。改为与预算匹配：
-        # 预算小则 interval 小（2 保底），预算大时最多 6 步一复盘（多轮影响可用更小值压测）。
-        planning_interval = max(2, min(step_budget // 2, 6))
+        # 内部规划步距（2026-09-12 Q7+B 后修正）：旧公式 max(budget//2+1,6) 在预算小则
+        # interval 小（2 保底），预算大时最多 6 步一复盘。
+        # 2026-09-17 修正（根治 R1 串行 REPL）：step_budget<=4 表示 planner 已判定
+        # “一段代码流跑完即可”，此时**关闭**内部重规划（interval=None）——否则每 2 步
+        # 强制 replan 会把模型推回“拆步取数→验证”的 REPL 循环。大预算（多阶段/真要
+        # 分阶段）仍保留每 N 步复盘（interval 3~6）。
+        if step_budget <= 4:
+            planning_interval = None
+        else:
+            planning_interval = max(3, min(step_budget // 2, 6))
 
         # 从 plan 结果中提取选中的技能名
         selected_skill = plan.get("selected_skill") or plan.get("skill") or None
@@ -1502,10 +1508,10 @@ class TaskAgent(AgentBase):
             one_shot = result.get("one_shot", False)
 
             if one_shot:
-                reply = f"✅ 已创建一次性任务 #{job_id}，将在 {next_run} 执行：{content}"
+                reply = f" 已创建一次性任务 #{job_id}，将在 {next_run} 执行：{content}"
             else:
                 cron = result.get("cron_expr", "")
-                reply = f"✅ 已创建定时任务 #{job_id}（{cron}），下次执行：{next_run}\n执行内容：{content}"
+                reply = f" 已创建定时任务 #{job_id}（{cron}），下次执行：{next_run}\n执行内容：{content}"
 
             return AgentResponse(
                 content=reply,
@@ -1680,12 +1686,11 @@ class TaskAgent(AgentBase):
             # 内置补全（2026-09-12）：见 _SANDBOX_EXTRA_BUILTINS（repr/format/hash…）
             **_SANDBOX_EXTRA_BUILTINS,
         },
-            # 打印上限收紧（2026-09-12 F4 → 2026-09-17 再砍）：smolagents 默认 50k 字符/步。
-            # 6000 仍被模型滥用——它把每个 step 当 REPL：取一批数据 print 验证→下一步再用，
-            # 导致上一步 print 被重放进下一步 context，token 每步累加 ~8K（实测 4.7K→34K/6步）。
-            # 砍到 1200：当前步 print 超阈值自动替成占位（smolagents 原生 truncate），逼模型
-            # 把数据留在变量里、用 final_answer 一次性汇总，而非分步 print 验证。
-            # 业务数据（列表/表形）本就该用 format_result/变量续承，不需要全量 print 进上下文。
+            # 打印上限（2026-09-17 收紧）：smolagents 默认 50k 字符/步。
+            # 砍到 1200：当前步 print 超阈值自动替成占位（smolagents 原生 truncate），
+            # 逼模型把数据留在变量里、用 final_answer 一次性汇总，而非分步 print 验证。
+            # 注意：真正根治靠 prompt 让模型「一步写完」（详见 code_agent.yaml 规则 13），
+            # 一步写完时 print 本就多余、自然消失；这里只是兜底防爆。
             max_print_outputs_length=int(os.getenv("CODE_MAX_PRINT_CHARS", "1200")),
             # 单步代码执行超时（2026-09-15）：smolagents 默认 30s，多标的批量取数
             # （几十只 × 串行 HTTP）必超。改为 env 可调，默认 120s；与外层

@@ -70,7 +70,8 @@ TOOL_RETURN_CONTRACTS: dict[str, str] = {
     # ── 热点/涨停/龙虎 ──
     "get_hot_stocks_with_reason": (
         "dict: {date, market_state, total, stocks:[{code,name,change_pct,reason}], hot_tags:[(题材,次数)]}。"
-        "候选在 hsr['stocks']（list）；market_state 可能为 closed_today；change_pct 盘前可能为 0。"
+        "候选在 hsr['stocks']（list）；每只字段是 code/name（不是 stock_code/stock_name！）；"
+        "market_state 可能为 closed_today；change_pct 盘前可能为 0。"
     ),
     "get_limit_pool": (
         "dict: {date, zt:{count,stocks:[...]}, dt:{...}, broken:{...}}（按 pool_type）。"

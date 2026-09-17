@@ -250,15 +250,15 @@ def _execute_prompt_job(job: Dict[str, Any]):
         _publish(_make_event("job_success", job_id, job_name,
                              mode="prompt",
                              content_preview=(content or "")[:500]))
-        logger.info("[CronWorker] ✅ 完成: %s", job_name)
+        logger.info("[CronWorker]  完成: %s", job_name)
 
         # 打印结果到终端
         now = datetime.now(TZ_CN).strftime("%H:%M")
-        print(f"\n🔔 [{now}] {content}\nYou> ", end="", flush=True)
+        print(f"\n [{now}] {content}\nYou> ", end="", flush=True)
     except Exception as e:
         _update_job_status(job_id, success=False, error=str(e))
         _publish(_make_event("job_error", job_id, job_name, mode="prompt", error=str(e)))
-        logger.error("[CronWorker] ❌ 失败: %s — %s", job_name, e, exc_info=True)
+        logger.error("[CronWorker]  失败: %s — %s", job_name, e, exc_info=True)
     finally:
         if not job.get("one_shot"):
             _reschedule_job(job_id)
@@ -278,11 +278,11 @@ def _execute_function_job(job: Dict[str, Any]):
         _update_job_status(job_id, success=True)
         _publish(_make_event("job_success", job_id, job_name,
                              mode="function", result_preview=result_preview))
-        logger.info("[CronWorker] ✅ function 任务完成: %s → %s", job_name, result_preview)
+        logger.info("[CronWorker]  function 任务完成: %s → %s", job_name, result_preview)
     except Exception as e:
         _update_job_status(job_id, success=False, error=str(e))
         _publish(_make_event("job_error", job_id, job_name, mode="function", error=str(e)))
-        logger.error("[CronWorker] ❌ function 任务异常: %s — %s", job_name, e, exc_info=True)
+        logger.error("[CronWorker]  function 任务异常: %s — %s", job_name, e, exc_info=True)
     finally:
         if job.get("one_shot"):
             _delete_one_shot(job_id, job_name)
@@ -357,7 +357,7 @@ def _delete_one_shot(job_id: int, job_name: str):
             cur = conn.cursor()
             cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s", (job_id,))
             conn.commit()
-        logger.info("[CronWorker] 🗑️ 一次性任务 %d (%s) 已删除", job_id, job_name)
+        logger.info("[CronWorker]  一次性任务 %d (%s) 已删除", job_id, job_name)
     except Exception as e:
         logger.error("[CronWorker] 删除一次性任务 %d 失败: %s", job_id, e)
 

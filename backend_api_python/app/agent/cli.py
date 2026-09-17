@@ -27,6 +27,13 @@ import os
 import sys
 import time
 
+# gbk 控制台编码保护（与 run.py 一致）：模型输出可能含 emoji/特殊符号，
+# 若 stdout 为 gbk 控制台会因无法编码崩溃。统一重配置为 utf-8 + replace。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ── 路径设置（直接运行 cli.py 时需要，-m 方式由 __init__.py 处理）──
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _agent_dir = os.path.abspath(os.path.dirname(__file__))
@@ -56,8 +63,8 @@ async def _run_chat(message: str, session_id: str = "cli"):
     """统一对话入口：通过消息队列执行，和 Flask/Cron 同一条链路。"""
     from message_queue import submit
 
-    print(f"\n📎 Session: {session_id}")
-    print(f"💬 Message: {message}")
+    print(f"\n[会话] Session: {session_id}")
+    print(f"[对话] Message: {message}")
     print(f"[wrench] 模式: task | 技能: {len(_import_agent()[2])} 个")
     print("-" * 50)
 
@@ -166,7 +173,7 @@ def main():
             LLMService_cls, _, _ = _load_llm_service()
             svc = LLMService_cls()
             if not svc.get_api_key():
-                print(f"⚠️  警告: {svc.provider.value} API Key 未配置")
+                print(f"⚠  警告: {svc.provider.value} API Key 未配置")
         except Exception:
             pass
 
@@ -188,13 +195,13 @@ def main():
             nonlocal _ctrl_c_count
             _ctrl_c_count += 1
             if _ctrl_c_count >= 2:
-                print("\n👋 强制退出!")
+                print("\n 强制退出!")
                 os._exit(0)
-            print("\n⚠️ 再按一次 Ctrl+C 强制退出")
+            print("\n⚠ 再按一次 Ctrl+C 强制退出")
 
-        print(f"\n🤖 QuantDinger Agent CLI")
-        print(f"📎 Session: {session_id}")
-        print(f"💡 /quit 退出，Ctrl+C 中断当前任务\n")
+        print(f"\n[机器人] QuantDinger Agent CLI")
+        print(f"[会话] Session: {session_id}")
+        print(f"[提示] /quit 退出，Ctrl+C 中断当前任务\n")
 
         async def _interactive_loop():
             nonlocal _ctrl_c_count
@@ -204,22 +211,22 @@ def main():
                     _ctrl_c_count = 0  # 每轮重置
                     message = input("You> ").strip()
                 except (EOFError, KeyboardInterrupt):
-                    print("\n👋 再见!")
+                    print("\n 再见!")
                     break
 
                 if not message:
                     continue
                 if message == "/quit":
-                    print("👋 再见!")
+                    print(" 再见!")
                     break
 
                 try:
                     signal.signal(signal.SIGINT, _force_exit)
                     await _run_chat(message, session_id)
                 except KeyboardInterrupt:
-                    print("\n⚠️ 已中断")
+                    print("\n⚠ 已中断")
                 except Exception as e:
-                    print(f"\n❌ 异常: {e}")
+                    print(f"\n 异常: {e}")
                     import traceback
                     traceback.print_exc()
                 finally:
