@@ -1,6 +1,7 @@
 """scan.py (原 dragon_scan.py) — 自动策略组盘后全市场扫描
 
-触发: scheduler Task "dragon_scan" (once_per_day, 16:30, 在 post_market_batch 1D 回填之后)
+触发: scheduler Task "dragon_scan" (once_per_day, 17:25, 在 post_market_batch 1D 回填
+      与龙虎榜落库 dragon_hot_daily(17:00+重试) 之后; 2026-09-18 由 16:30 重排)
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
   2. 全市场逐股跑策略判定 (与回测同一份判定, core facade):

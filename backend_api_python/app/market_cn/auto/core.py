@@ -11,7 +11,7 @@
 使用方:
   - test_dragon.py (--strategy dragon)   : 回测 (dragon_cb_today_d0_signals /
                                            run_backtest_dragon_callback / unified_prefilter)
-  - app/market_cn/auto/scan.py      : 盘后全市场扫描 (16:30)
+  - app/market_cn/auto/scan.py      : 盘后全市场扫描 (17:25, 2026-09-18 由 16:30 重排)
   - app/market_cn/auto/monitor.py    : 盘中状态机 (60s)
 
 本模块保持零 IO / 零 print, 只做纯判定。

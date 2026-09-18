@@ -179,20 +179,34 @@ def _refresh_sector_daily():
 
 
 def _save_dragon_hot_daily():
-    """龙虎榜 & 热榜持久化 — 每天 18:00 调用，写入 PostgreSQL。"""
+    """龙虎榜 & 热榜持久化 — 每天 17:00 调用 (LHB(D) 交易所 ~17:00-17:30 发布)。
+
+    当日榜未发布(total=0)时 10min 间隔重试(最多 3 次尝试), 必须先于
+    dragon_scan(17:25) 完成落库 —— 2026-09-18 调度重排: 榜先落库、扫描后跑,
+    杜绝"策略消费 LHB 时当日榜缺失"的时序错位 (hub.lhb 时效纪律配套)。
+    """
     from app.market_cn.dragon_tiger_store import save_daily
-    try:
-        result = save_daily()
-        dt = result.get("dragon_tiger", {})
-        hr = result.get("hot_rank", {})
-        logger.info(
-            "[dragon_hot_daily] 完成: 龙虎榜 %d/%d, 热榜 %d/%d, 状态=%s",
-            dt.get("written", 0), dt.get("total", 0),
-            hr.get("written", 0), hr.get("total", 0),
-            result.get("status", "unknown"),
-        )
-    except Exception as e:
-        logger.error("[dragon_hot_daily] 执行失败: %s", e)
+    from app.utils.trading_calendar import is_trading_day
+    today = datetime.now().strftime("%Y-%m-%d")
+    for attempt in range(1, 4):
+        try:
+            result = save_daily()
+            dt = result.get("dragon_tiger", {})
+            hr = result.get("hot_rank", {})
+            logger.info(
+                "[dragon_hot_daily] 完成: 龙虎榜 %d/%d, 热榜 %d/%d, 状态=%s",
+                dt.get("written", 0), dt.get("total", 0),
+                hr.get("written", 0), hr.get("total", 0),
+                result.get("status", "unknown"),
+            )
+            # 拿到当日榜 / 非交易日 / 已到最后一次尝试 → 结束; 否则等 10min 重试
+            if dt.get("total", 0) > 0 or not is_trading_day(today) or attempt >= 3:
+                return
+            logger.warning("[dragon_hot_daily] 当日龙虎榜尚未发布(attempt %d), 10min 后重试", attempt)
+            _time.sleep(600)
+        except Exception as e:
+            logger.error("[dragon_hot_daily] 执行失败: %s", e)
+            return
 
 
 def _refresh_daily():
@@ -437,9 +451,11 @@ TASKS = [
     # 日级任务 (定时触发，一天一次)
     Task("morning_batch",     _morning_batch,     interval=86400, trading_only=False, once_per_day=True, trigger_hour=6,  trigger_minute=0),
     Task("post_market_batch", _post_market_batch, interval=86400, trading_only=False, once_per_day=True, trigger_hour=15, trigger_minute=30),
-    Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
+    # 龙虎榜落库 17:00 (LHB ~17:00-17:30 发布, 未发布自动重试), 先于 dragon_scan(17:25)
+    Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=0),
     # 自动策略组: 盘后扫描(1D就绪后) + 盘中状态机(60s), 龙回头Pro已于2026-09-06下线
-    Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=16, trigger_minute=30),
+    # 2026-09-18 时序重排: 16:30→17:25, 晚于龙虎榜落库(17:00+重试), 杜绝 LHB 时序错位
+    Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=25),
     # knife_scan 触发时刻由 auto/sched.py 分段声明决定 (config.json schedule 段为事实源,
     # 见 _knife_trigger_hm; Task 上的 trigger_* 仅作 sched 不可用时的兜底)
     Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_day=True, trigger_hour=14, trigger_minute=30),
