@@ -75,7 +75,7 @@ def dragon_strategies():
                 'name': getattr(s, 'name', key),
                 'enabled': strat_reg.is_enabled(key),
                 'daily_limit': strat_reg.daily_limit(key),
-                'winrate': ds.STRATEGY_WINRATE.get(key),
+                'winrate': ds.strategy_winrate(key),
             })
         return jsonify({'code': 1, 'msg': 'success', 'data': items})
     except Exception as e:

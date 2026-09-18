@@ -47,7 +47,7 @@ from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 # ═══════════════════════════════════════════════════════════════
 from infra.resilient_parse import apply as _apply_resilient_parse, resilient_parse_code_blobs
 from infra.breaker import ToolCircuitBreaker
-from infra.guided_executor import DANGEROUS_IMPORTS, GuidedPythonExecutor
+from infra.guided_executor import GuidedPythonExecutor
 from infra.staging import stage_scope_vars
 
 # 使用 app.agent logger（与 log.py 配置一致，确保日志写入文件）
@@ -136,8 +136,8 @@ _SANDBOX_EXTRA_BUILTINS = {
 # ── 沙箱 import 边界（2026-09-14 决策）──────────────────────────────────────
 # 已**直接去掉 import 白名单**：executor 传 additional_authorized_imports=["*"]，
 # 所有 import 放行（os/shutil/socket/sqlite3 等均可）。
-# 破坏性操作不再靠沙箱提前堵死，改由 GuidedPythonExecutor._scan_dangerous()
-# 在执行前扫描 DANGEROUS_IMPORTS 并交用户确认。
+# 破坏性操作**不做拦截**（2026-09-18）：原 GuidedPythonExecutor 的 _scan_dangerous()
+# + _approve() 审批层从未接线，已连同 DANGEROUS_IMPORTS 删除。
 # 原 SANDBOX_AUTHORIZED_IMPORTS / SANDBOX_KNOWN_UNAVAILABLE 两个常量已删除（死代码）。
 
 
@@ -1593,7 +1593,7 @@ class TaskAgent(AgentBase):
         """
         from smolagents import CodeAgent as SmolCodeAgent
         from smolagents.local_python_executor import LocalPythonExecutor
-        from smolagents.memory import ActionStep
+        from smolagents.memory import ActionStep, PlanningStep
 
         # ── 工具函数：phase 白名单 / domain 过滤 + 附加点名 + 技能工具 ──
         # phase 白名单（2026-09-12 B 阶段，审计自 qd_traces）：tools 非空时只注入白名单工具，
@@ -1678,22 +1678,12 @@ class TaskAgent(AgentBase):
         # smol_tools 尚未定义——run5 教训）
         executor_cls = GuidedPythonExecutor or LocalPythonExecutor
         executor = executor_cls(
-            # 生成代码可 import 的模块白名单（最小授权，2026-09-11 收紧，审计 P2）：
-            # - os/sys/pathlib/importlib 移除：web_search 等工具返回的不可信文本可注入指令，
-            #   让生成代码读文件/环境变量/任意模块。实证依据：agent_runs.jsonl 全量 1.4MB
-            #   轨迹零命中 import os/sys/importlib/pathlib；生成代码的约定范式是"调用注入的
-            #   工具函数"而非直接 I/O。skills 内部 import 发生在宿主进程，不受本表约束。
-            # - stat 保留：A 股工具链生成代码常用 st.* 判别文件属性（若后续零使用可再收）。
-            # - 收紧后若出现 "is not authorized" 类执行错误：先核对轨迹确认真实需求，
-            #   按最小需要加回，禁止整表回滚。
-            # 2026-09-14 改为"能力开放 + 用户确认"：破坏性模块**也**放进白名单，
-            # 否则 smolagents 的 AST 检查会先拒绝，根本走不到确认环节；真正的把关在
-            # GuidedPythonExecutor._scan_dangerous + _approve（执行前先征求用户同意，
-            # 非交互环境且无回调时一律拒绝）。
-            # 2026-09-14 用户决策：**直接去掉沙箱**，能力全开；审批层待功能完善后再加。
+            # 2026-09-14 用户决策：**直接去掉沙箱**，能力全开。
             # smolagents 的 check_import_authorized 支持 "*" 通配符
             # （local_python_executor.py:375），传 "*" 即放行所有 import，不再有白名单约束。
             # 风险已向用户说明（web_search 提示注入 / LLM 误操作），用户明确接受。
+            # （2026-09-18：删除此处原 8 行「最小授权白名单」设计说明——它描述的是
+            #   已删除的 SANDBOX_AUTHORIZED_IMPORTS，与"能力全开"的现状自相矛盾。）
             additional_authorized_imports=["*"],
             additional_functions={
             "final_answer": _final_answer,
@@ -1871,9 +1861,9 @@ class TaskAgent(AgentBase):
             """工具的完整签名（含默认值）。
 
             2026-09-14 实证：模型为确认 `get_market_indices` 有没有参数，写了
-            `import inspect; inspect.signature(get_market_indices)`，撞 import 白名单、
-            白烧一步。签名在**宿主侧**算好随 list_tools 给出，模型就不必去探——
-            比把 inspect 放进沙箱白名单更安全，也更省一步。
+            `import inspect; inspect.signature(...)`，白烧一步（当时 import 受白名单
+            限制，现已全放行，但"探签名"本身仍是无谓的一步）。签名在**宿主侧**
+            算好随 list_tools 给出，模型就不必去探——比让它自己 import inspect 更省一步。
             """
             try:
                 # eval_str=True：把 `from __future__ import annotations` 造成的字符串化
@@ -1995,6 +1985,8 @@ class TaskAgent(AgentBase):
         # （无官方截断开关），社区方案 = step_callbacks 里原地改写 memory ——
         # 本函数即该方案（每步 finalize 后触发，截断对下一步的 prompt 生效）。
         keep_recent = 0
+        keep_recent_mo = 1  # model_output 保留近 1 步 code 块（模型需看上一步代码续写），更早截断
+        _CODE_BLOCK_RE = re.compile(r"<code>(.*?)</code>", re.S)
 
         def _truncate_field(step: ActionStep, field: str, cap: int = 200) -> None:
             val = getattr(step, field, None)
@@ -2011,18 +2003,62 @@ class TaskAgent(AgentBase):
                             and len(item["text"]) > cap:
                         item["text"] = item["text"][:cap] + "...(truncated)"
 
+        def _truncate_tool_call_args(step: ActionStep, cap: int = 300) -> None:
+            # tool_calls 在 to_messages 里渲染为 str([tc.dict()])，arguments 中的大代码/
+            # 参数字符串随步数累积重放（实测每步 8-12k 字符，是 O(n²) 主引擎之一）。
+            # 只截展示用 arguments，不影响执行——执行读的是沙箱 state 里的代码与变量。
+            for tc in (getattr(step, "tool_calls", None) or []):
+                args = getattr(tc, "arguments", None)
+                if isinstance(args, dict):
+                    for k, v in list(args.items()):
+                        if isinstance(v, str) and len(v) > cap:
+                            args[k] = v[:cap] + "...[truncated]"
+                elif isinstance(args, str) and len(args) > cap:
+                    try:
+                        tc.arguments = args[:cap] + "...[truncated]"
+                    except Exception:
+                        pass
+
+        def _truncate_model_output(step: ActionStep, cap: int = 400) -> None:
+            # model_output = Thought(思维链，往往几千字符) + <code>块。模型下一步续写真正
+            # 需要的只是 code（变量在沙箱 state），思维链可丢。截断策略：保留 <code> 块完整
+            # + 120 字符头部摘要；无 code 块时退回首尾截断。
+            mo = getattr(step, "model_output", None)
+            if not isinstance(mo, str) or len(mo) <= cap:
+                return
+            m = _CODE_BLOCK_RE.search(mo)
+            if m and len(m.group(0)) <= max(cap, 2500):
+                step.model_output = mo[:120].rstrip() + "\n...[thought truncated]...\n" + m.group(0)
+            else:
+                tail_keep = min(80, cap // 4)
+                step.model_output = (mo[:cap - tail_keep] + "\n...[truncated]...\n"
+                                     + mo[-tail_keep:])
+
         def _truncate_observations(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
-            for step in agent.memory.steps:
+            # 三类累积重放大头（2026-09-18 cli 实测定量）：
+            #   observations —— _wrap_stage_guard 后通常已是 0，维持全截兜底（裸调用洞）；
+            #   tool_calls.arguments —— 实测每步 8-12k 字符，截展示串（执行不受影响）；
+            #   model_output —— 模型思维链+完整代码，每步 2-11k 字符累积；保留近
+            #     keep_recent_mo 步原文（模型需看上一步代码续写，全截实测令输出暴涨），
+            #     更早截到 400。变量在 executor.state 跨步保留，截断不丢数据。
+            for step in list(agent.memory.steps) + [memory_step]:
+                if isinstance(step, PlanningStep):
+                    # PlanningStep 重放渲染完整 plan（实测 ~9k 字符，planning 后 ASSISTANT
+                    # 角色跳变的主因），压到 400 保留首尾。
+                    _truncate_field(step, "plan", cap=400)
+                    continue
                 if not isinstance(step, ActionStep) or step.step_number is None:
                     continue
-                if step.step_number <= memory_step.step_number - keep_recent:
-                    # observations 是 token 大头（print 的工具全量返回都在这），截到 400；
-                    # model_output/code_action 截到 200（早期步骤的思维链和代码已无用）。
+                if step is memory_step or step.step_number <= memory_step.step_number - keep_recent:
                     _truncate_field(step, "observations", cap=400)
-                    _truncate_field(step, "model_output", cap=200)
-                    _truncate_field(step, "code_action", cap=200)
-                    if hasattr(step, 'observations_images') and step.observations_images:
-                        step.observations_images = None
+                if step is not memory_step and step.step_number <= memory_step.step_number - keep_recent_mo:
+                    _truncate_model_output(step, cap=400)
+                _truncate_tool_call_args(step, cap=300)
+                # error 字段（完整 traceback）渲染为 TOOL_RESPONSE，实测某步出错后
+                # TOOL_RESPONSE 跳变 ~6k 字符，压到 400。
+                _truncate_field(step, "error", cap=400)
+                if hasattr(step, 'observations_images') and step.observations_images:
+                    step.observations_images = None
 
         # 观察层「空输出」歧义修正（2026-09-14 CLI 实测查出的不收尾头号诱因）：
         # 本步代码只 print() 无 return 时，smolagents 把 observation 末行写成
@@ -2093,11 +2129,12 @@ class TaskAgent(AgentBase):
                         continue
                     # 上一步若是「失败重试」（报错 → 改写），重写是**必要的**：此时劝它
                     # "别重写"会直接阻断纠错——这是 C 最容易犯的错。用错误痕迹做门控排除。
-                    # （2026-09-14 CLI 实测「写跑马灯」：Step1 因 `import io` 撞沙箱白名单
-                    #   而整块中断，Step2 几乎是同一份代码、只换了捕获方式 → 若误判成
-                    #   "原地重写"，就会劝它放弃修复。）
+                    # （2026-09-14 CLI 实测「写跑马灯」：Step1 整块中断，Step2 几乎是同一份
+                    #   代码、只换了捕获方式 → 若误判成"原地重写"，就会劝它放弃修复。）
                     prev_obs = getattr(prev, "observations", "") or ""
-                    if ("[import 拦截]" in prev_obs or "Traceback" in prev_obs
+                    # 2026-09-18：移除 "[import 拦截]" 匹配——该标记出自 GuidedPythonExecutor
+                    # 的 import 越界改写分支，分支已随沙箱删除而移除（永不命中）。
+                    if ("Traceback" in prev_obs
                             or "Error:" in prev_obs or "Exception:" in prev_obs):
                         continue
                     prev_code = getattr(prev, "code_action", None)
@@ -2199,7 +2236,11 @@ class TaskAgent(AgentBase):
             agent.prompt_templates["system_prompt"] = _load_code_agent_yaml()["system_prompt"]
             agent.memory.system_prompt = None  # 触发 initialize_system_prompt 惰性重渲染
         except Exception as _ae:
-            logger.debug("[TaskAgent] authorized_imports 对齐跳过: %s", _ae)
+            # 2026-09-18：对齐失败会让规则 9 回退渲染成 smolagents 默认的**受限模块清单**，
+            # 模型被教成"只能 import 这些"——与全放行的现实相反、且原 debug 级别无人可见。
+            # 判据失效必须可见（同 nodes.py _detect_max_steps 的 warning 化处置）。
+            logger.warning("[TaskAgent] authorized_imports 对齐失败，system_prompt 规则 9 "
+                           "可能渲染出受限 import 清单（与全放行不符）: %s", _ae)
 
         # 覆盖 smolagents 默认 prompt_templates，使用自定义 YAML 模板
         try:

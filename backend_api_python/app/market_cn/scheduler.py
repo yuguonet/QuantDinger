@@ -23,6 +23,65 @@ _EMOTION_MIN_INTERVAL = 1800
 
 
 # ═══════════════════════════════════════════════════════════
+#  跨重启"今日已完成"标记 (2026-09-18 事故修复①)
+#  问题: once_per_day 任务的 daily_done 是内存标记, backend 重启后丢失,
+#        启动补跑会重复触发 dragon_scan 等 → 并发 DELETE+INSERT 死锁丢信号。
+#  解决: 完成标记持久化到 DB (qd_scheduler_done), 重启后跳过已完成的今日任务。
+# ═══════════════════════════════════════════════════════════
+
+def _ensure_sched_done_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS qd_scheduler_done (
+            task_name   VARCHAR(40) NOT NULL,
+            trade_date  DATE NOT NULL,
+            done_at     TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (task_name, trade_date)
+        )
+    """)
+
+
+def scheduler_task_done(task_name: str, trade_date: str) -> bool:
+    """DB 持久化标记: 该任务今日是否已完成 (跨重启生效)。读取失败→保守返回 False(允许补跑)。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            _ensure_sched_done_table(cur)
+            cur.execute(
+                "SELECT 1 FROM qd_scheduler_done WHERE task_name = %s AND trade_date = %s",
+                (task_name, trade_date),
+            )
+            ok = bool(cur.fetchone())
+            cur.close()
+        return ok
+    except Exception as e:
+        logger.warning("[scheduler] 读取完成标记失败(保守补跑): %s", e)
+        return False
+
+
+def mark_scheduler_task_done(task_name: str, trade_date: str):
+    """标记今日任务已完成 (幂等)。写入失败→忽略(下次补跑兜底), 不抛。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            _ensure_sched_done_table(cur)
+            cur.execute(
+                "INSERT INTO qd_scheduler_done (task_name, trade_date) VALUES (%s, %s) "
+                "ON CONFLICT (task_name, trade_date) DO NOTHING",
+                (task_name, trade_date),
+            )
+            cur.execute(
+                "DELETE FROM qd_scheduler_done WHERE trade_date < (CURRENT_DATE - 60)"
+            )
+            db.commit()
+            cur.close()
+        logger.info("[scheduler] 标记完成: %s @ %s", task_name, trade_date)
+    except Exception as e:
+        logger.warning("[scheduler] 标记完成失败(忽略): %s", e)
+
+
+# ═══════════════════════════════════════════════════════════
 #  时段判断
 # ═══════════════════════════════════════════════════════════
 
@@ -404,6 +463,9 @@ def _worker(task: Task):
     """执行单个任务，完成后退出。"""
     try:
         task.fn()
+        # 跨重启守卫: 成功完成才标记, 失败不标记→当日仍可被补跑重试
+        if task.once_per_day:
+            mark_scheduler_task_done(task.name, datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
         logger.error("[%s] 执行失败: %s", task.name, e)
     finally:
@@ -441,6 +503,11 @@ def _scheduler_loop():
             continue
         if not is_trading_day(today):
             continue
+        # 跨重启守卫: 今日已完成则跳过启动补跑 (防重复扫描→并发死锁丢信号)
+        if scheduler_task_done(task.name, today):
+            task.daily_done = today
+            logger.info("[scheduler] 跳过启动补跑(今日已完成): %s", task.name)
+            continue
         logger.info("[scheduler] 启动补跑: %s (今日 %02d:%02d 已过)",
                      task.name, task.trigger_hour, task.trigger_minute)
         _launch(task)
@@ -458,6 +525,10 @@ def _scheduler_loop():
 
             # 一天一次 + 今天已跑 → 跳过
             if task.once_per_day and task.daily_done == today:
+                continue
+            # 跨重启守卫 (防御): 内存标记丢失但 DB 已记录完成 → 跳过
+            if task.once_per_day and scheduler_task_done(task.name, today):
+                task.daily_done = today
                 continue
 
             # 日级定时任务：未到触发时刻 → 跳过 (knife_scan 时刻来自 sched 事实源)

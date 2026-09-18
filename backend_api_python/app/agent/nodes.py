@@ -1242,6 +1242,10 @@ def _extract_clean_phase_result(agent, result: str, limit: int = 4000) -> str:
     原因（run3 实测）：强制 final answer 常是半成品——<code> 包裹的工具调用 JSON，
     原样下传会污染下一阶段任务书。跳过含执行错误标记的观察，取最后一段干净输出。
     """
+    # 2026-09-18 注：保留 "is not allowed" —— 它虽也匹配已消失的 smolagents import
+    # 越界报错（"Import of X is not allowed"，沙箱全放行后不再产生），但**仍会命中**
+    # "Invoking a builtin function ... is not allowed"（模型调用了未登记为工具的 builtin，
+    # local_python_executor.py:908）。只删 import 语义会误伤这条仍在生效的判定。
     bad_marks = ("Code execution failed", "InterpreterError", "Traceback",
                  "is not among", "is not allowed", "KeyError")
     try:

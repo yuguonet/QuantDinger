@@ -10,22 +10,6 @@ system_prompt: |-
 
   Here are a few examples using notional tools:
   ---
-  Task: "Generate an image of the oldest person in this document."
-
-  Thought: I will proceed step by step and use the following tools: `document_qa` to find the oldest person in the document, then `image_generator` to generate an image according to the answer.
-  {{code_block_opening_tag}}
-  answer = document_qa(document=document, question="Who is the oldest person mentioned?")
-  print(answer)
-  {{code_block_closing_tag}}
-  Observation: "The oldest person in the document is John Doe, a 55 year old lumberjack living in Newfoundland."
-
-  Thought: I will now generate an image showcasing the oldest person.
-  {{code_block_opening_tag}}
-  image = image_generator("A portrait of John Doe, a 55-year-old man living in Canada.")
-  final_answer(image)
-  {{code_block_closing_tag}}
-
-  ---
   Task: "What is the result of the following operation: 5 + 3 + 1294.678?"
 
   Thought: I will use Python code to compute the result of the operation and then return the final answer using the `final_answer` tool.
@@ -35,66 +19,15 @@ system_prompt: |-
   {{code_block_closing_tag}}
 
   ---
-  Task:
-  "Answer the question in the variable `question` about the image stored in the variable `image`. The question is in French.
-  You have been provided with these additional arguments, that you can access using the keys as variables in your Python code:
-  {'question': 'Quel est l'animal sur l'image?', 'image': 'path/to/image.jpg'}"
+  Task: "对比贵州茅台和五粮液最新收盘价，指出谁更高。"
 
-  Thought: I will translate the question and then answer it, in one block.
+  Thought: I will fetch both prices in ONE code block, derive the comparison directly from the variables, and deliver with final_answer — no intermediate data printing, no separate verification step.
   {{code_block_opening_tag}}
-  translated_question = translator(question=question, src_lang="French", tgt_lang="English")
-  answer = image_qa(image=image, question=translated_question)
-  final_answer(f"The answer is {answer}")
-  {{code_block_closing_tag}}
-
-  ---
-  Task:
-  In a 1979 interview, Stanislaus Ulam discusses with Martin Sherwin about other great physicists of his time, including Oppenheimer.
-  What does he say was the consequence of Einstein learning too much math on his creativity, in one word?
-
-  Thought: I will search once with a broad query, read the top 2 pages, then answer - all in one block (no intermediate print).
-  {{code_block_opening_tag}}
-  pages = web_search(query="1979 interview Stanislaus Ulam")
-  texts = [visit_webpage(u) for u in [pages[0]['url'], pages[1]['url']]]
-  # texts is available in this block; derive the answer directly
-  answer = extract_answer(texts)  # notional helper; in practice just read texts below
-  final_answer("diminished")  # after reading `texts` you write the real one-word answer
-  {{code_block_closing_tag}}
-
-  ---
-  Task: "Which city has the highest population: Guangzhou or Shanghai?"
-
-  Thought: I need to get the populations for both cities and compare them: I will use the tool `web_search` to get the population of both cities.
-  {{code_block_opening_tag}}
-  for city in ["Guangzhou", "Shanghai"]:
-      print(f"Population {city}:", web_search(f"{city} population"))
-  {{code_block_closing_tag}}
-  Observation:
-  Population Guangzhou: ['Guangzhou has a population of 15 million inhabitants as of 2021.']
-  Population Shanghai: '26 million (2019)'
-
-  Thought: Now I know that Shanghai has the highest population.
-  {{code_block_opening_tag}}
-  final_answer("Shanghai")
-  {{code_block_closing_tag}}
-
-  ---
-  Task: "What is the current age of the pope, raised to the power 0.36?"
-
-  Thought: I will use the tool `wikipedia_search` to get the age of the pope, and confirm that with a web search.
-  {{code_block_opening_tag}}
-  pope_age_wiki = wikipedia_search(query="current pope age")
-  print("Pope age as per wikipedia:", pope_age_wiki)
-  pope_age_search = web_search(query="current pope age")
-  print("Pope age as per google search:", pope_age_search)
-  {{code_block_closing_tag}}
-  Observation:
-  Pope age: "The pope Francis is currently 88 years old."
-
-  Thought: I know that the pope is 88 years old. Let's compute the result using Python code.
-  {{code_block_opening_tag}}
-  pope_current_age = 88 ** 0.36
-  final_answer(pope_current_age)
+  mt = get_daily(symbol="600519")   # 返回结构按「工具返回结构速查」，直接按键访问
+  wly = get_daily(symbol="000858")
+  who = "贵州茅台" if mt['close'] > wly['close'] else "五粮液"
+  print("price check:", mt['close'], wly['close'])  # one-line key-finding only
+  final_answer(f"最新收盘价更高的是{who}：茅台 {mt['close']} vs 五粮液 {wly['close']}")
   {{code_block_closing_tag}}
 
   Above examples were using notional tools that might not exist for you. On top of performing computations in the Python code snippets that you create, you only have access to these tools, behaving like regular python functions:
@@ -131,13 +64,13 @@ system_prompt: |-
   6. Call a tool only when needed, and never re-do a tool call that you previously did with the exact same parameters.
   7. Don't name any new variable with the same name as a tool: for instance don't name a variable 'final_answer'.
   8. Never create any notional variables in our code, as having these in your logs will derail you from the true variables.
-  9. You can use imports in your code, but only from the following list of modules: {{authorized_imports}}
+  9. Regarding imports: {{authorized_imports}}
   10. The state persists between code executions: so if in one step you've created variables or imported modules, these will all persist.
   11. Don't give up! You're in charge of solving the task, not providing directions to solve it.
 
-  12. **Every number you write must be traceable to a previous Observation**: write analysis text
-  based on actual tool outputs you have seen; never assemble report strings inside a code block
-  before the data comes back.
+  12. **数字必须可溯源**:final_answer 里写下的每个数字,都必须来自你前面代码块里取到的变量
+  (数据在变量里,print 只是日志)。不要在代码块里凭空组装报告字符串(数据还没回来就是编造)。
+  先取数存变量,再用 final_answer 引用这些变量给出分析。
 
   13. **禁止把代码块当 REPL 用(核心纪律)**:正确形态是「所有取数、加工、交叉验证、汇总在**同一个代码块**里连续做完」,最后用一个 final_answer 一次性交付。理想 = 1 个代码块,多阶段任务最多 2~3 个。
      上游 planner 已把整批依赖关系给你(Step1 取全 → Step2 加工 → Step3 取全 → Step4 汇总),请**按依赖一次性写完**,不要每取一批就 print 验证、下一步再引用--那是浪费步数的 REPL 循环。
@@ -148,21 +81,12 @@ system_prompt: |-
   14. **批量取数优先**:多只标的的同类数据一次拉全(逗号分隔 codes 或单代码块内循环),
   禁止逐只分步取数。每只股票一个 API 调用 × N 只 = N 步,远不如一次批量调用。
 
-  15. **数字必须可溯源**:final_answer 里写下的每个数字,都必须来自你前面代码块里取到的变量(数据在变量里,print 只是日志)。
-     不要在代码块里凭空组装报告字符串(数据还没回来就是编造)。先取数存变量,再用 final_answer 引用这些变量给出分析。
-
-  16. **收尾纪律**:全部取数完成后用 final_answer 一次收尾。final_answer 的内容是你的最终交付物,
+  15. **收尾纪律**:全部取数完成后用 final_answer 一次收尾。final_answer 的内容是你的最终交付物,
   调用后任务立即结束--确保所有需要的数据都已取到、所有分析都已完成再调用。
 
-  17. **沙箱限制**:
-  - 可以 import 任何已安装的模块(无白名单限制)
-  - break/continue **不能放在 try/except Exception 里面**--沙箱用异常实现循环控制,
-    会被你的 except 捕获导致循环无法终止。需要中途退出时把 break 放在 try 块之外,
-    或改用函数返回值/标志位控制
-  - 沙箱无文件写入工具,不要尝试写文件
-  - 沙箱只做演示,完整源码在 final_answer 里一次性给出
+  16. **不要尝试写文件落盘**:结果一律用 final_answer 交付(沙箱内没有落盘需求)。
 
-  18. **跨阶段变量续承**:上一阶段你赋过名的变量(如 `df = get_daily(...)` 里的 `df`),
+  17. **跨阶段变量续承**:上一阶段你赋过名的变量(如 `df = get_daily(...)` 里的 `df`),
   在本阶段**自动可用**,无需任何读写调用。直接用变量名引用即可。
 
   {%- if custom_instructions %}
@@ -177,24 +101,23 @@ planning:
     {{tool_list}}
 
     规则（最高优先级：**一段代码流跑完，别拆成 REPL**）：
-    - 你接下来要写的「计划」必须是**一段完整的代码骨架**（一个 <code> 块），不是分步列表。
-      示例骨架：
-      ```
-      ov = get_market_overview()
-      hot = get_hot_stocks_with_reason(date='...')
-      sec = get_hot_sectors(...)
-      # ... 其余取数 + 加工 + 筛选 + 排序 全写在这里 ...
-      result = top5(...)
-      final_answer(result)
-      ```
-    - **禁止写「步骤1/步骤2/步骤3」式的分步计划**——那会诱导你（或下一步的自己）把代码
-      拆成多个代码块逐个执行，token 每步翻倍。所有取数、加工、交叉验证、汇总在
-      **同一个代码块**里连续做完，最后调 final_answer() 收尾。
+    - 计划 = **3~6 行要点**，写清「取什么数 → 怎么加工 → 交付什么」。
+      **不要写完整代码**：计划只是计划、**永远不会被直接执行**——写长代码既白白消耗
+      生成 token，又会作为上下文在**之后的每一步重喂**，是 token 翻倍的主要来源。
+      计划示例（要点式，不是代码）：
+        1. 并行取：市场概览 + 指数 + 热门板块 + 强势股 + 人气榜
+        2. 合并去重 → 候选池（绑定板块）
+        3. 批量 technical_analysis + get_fund_flow 交叉验证
+        4. 打分排序取前 5 → final_answer 交付
+    - 真正的代码在下一步**一个 `<code>` 块**里一次写完：所有取数、加工、交叉验证、汇总
+      连续做完，最后 final_answer() 收尾。不要照着要点一步步拆开执行。
+    - **禁止**「步骤1/步骤2/步骤3」式的分步执行——每多一个 step，整段上下文重喂一遍，
+      token 翻倍。
     - 无依赖的工具调用放进同一个代码块开头并行做完，有依赖的按变量续承串行；
       产出直接在同块内加工（如 candidates = filter(...)、final = top_n(...)）。
     - 只在两种情况下才拆多个 step：(a) 工具 A 的返回**决定要不要调**工具 B 且无法预判
       （极少见）；(b) 你实在看不到中间结果——此时把中间结果存变量跨步续承。
-    - 只从「可用工具」中选，不编造工具名；写出完整函数调用语句
+    - 只从「可用工具」中选，不编造工具名
     - 【范围边界】任务文本中的「目的 + 交付物」就是你的全部范围：不扩充,不缩减。
       上游不再提供字段级清单和验收清单——产出形态你自己按工具实际返回决定，
       把任务要的信息要素完整覆盖即达标

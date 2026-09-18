@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta
 
 from app.utils.logger import get_logger
@@ -35,8 +36,8 @@ from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 
     S_EXIT_TODAY,
     S_HOLDING,
     S_WATCH_PENDING,
-    STATE_LABELS,
-    STRATEGY_WINRATE,
+    state_label,
+    strategy_winrate,
     strategy_keys,
     strategy_labels,
 )
@@ -173,24 +174,6 @@ def _row_to_dict(r):
     return d
 
 
-# extra 落库白名单 (Signal.extra ∩ 白名单 → qd_dragon_signals.extra JSON)
-SIGNAL_EXTRA_KEYS = (
-    "turnover_anchor", "turnover_sig", "turnover_anchor_total", "turnover_sig_total",
-    "float_mcap_yi", "ma60_slope",
-    "ma_bull", "support_ma", "support_anchor_open", "pullback_drawdown",
-    "anchor_type", "anchor_vol_r", "sig_vol", "ret_20d", "d_1_change",
-    "streak_len", "break_chg", "break_gap", "break_vol_r", "confirm_chg",
-    "pre20_gain", "board_height", "lu_vol_ratio", "rsi",
-    # dragon 龙强度门槛 (2026-09-10): 锚定涨停日连板高度 / 涨停日20日涨幅
-    "streak_h", "lu_gain20",
-    # knife_catch (反向接刀, 2026-09-08)
-    "gain", "amplitude", "pos_range", "tail_ret", "vw_frac",
-    "vol_ratio", "down_streak", "pre5_gain", "lu_recent", "mkt_gain",
-    # g56 56%规则G+ (2026-09-17): 横截面门值落库 (审计/复盘/quality_key 排序依赖)
-    "rhist_chg", "boll_pctb", "dif0", "rmed", "score_r",
-)
-
-
 def signal_row(strategy_key, sig, name=""):
     """Signal → qd_dragon_signals 行 dict (扫描器通用转换, 替代各策略手写补字段)。
 
@@ -198,7 +181,8 @@ def signal_row(strategy_key, sig, name=""):
       entry_style = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
       score       = sig.score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
       signal_price= sig.price (0 → None; break 不定价)
-      lu_date/pullback_days 来自 extra; extra 仅白名单键落库 (None 剔除)
+      lu_date/pullback_days 来自 extra; extra 整包落库 (策略自保证 clean, None 剔除,
+      顶层已映射键 board/lu_date/pullback_days 不重复进子字典) → qd_dragon_signals.extra JSON
     """
     ex = sig.extra or {}
     from app.market_cn.auto.common.market import get_board_name
@@ -214,7 +198,11 @@ def signal_row(strategy_key, sig, name=""):
         "lu_date": ex.get("lu_date"),
         "pullback_days": ex.get("pullback_days"),
     }
-    row.update({k: ex[k] for k in SIGNAL_EXTRA_KEYS if ex.get(k) is not None})
+    # 方案A (2026-09-18): 拔插式 —— 不再有全局白名单, Signal.extra 整包落库。
+    # 约定: 策略仅把应落库的字段放进 extra (不塞内部调试量)。
+    _top = {"board", "lu_date", "pullback_days"}   # 已在上面映射为顶层列, 不重复
+    row["extra"] = {k: v for k, v in ex.items()
+                    if v is not None and k not in _top}
     return row
 
 
@@ -226,7 +214,7 @@ def _strategy_meta(key):
         return None
 
 
-def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()):
+def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = (), max_retries: int = 5):
     """扫描结果写入 (幂等): rows 为各策略今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
@@ -236,50 +224,72 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
     purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
       (tail_oversold 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
        股票须删行, 否则残留误导用户; 仅清 buy_today 态, 不碰已转移的 holding 等)。
+
+    瞬态冲突重试 (2026-09-18 事故修复②): 并发 DELETE+INSERT (调度重启补跑触发
+    deadlock_detected / 序列化失败) 会整事务回滚丢信号 — 此处捕获 40P01/40001 后
+    退避重试, 保证最终写入 (操作幂等, 重试安全)。
     """
     from app.utils.db import get_db_connection
-    with get_db_connection() as db:
-        cur = db.cursor()
-        cur.execute(
-            f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s AND state = %s",
-            (trade_date, S_WATCH_PENDING),
-        )
-        purged = cur.rowcount
-        if purge_buy_today:
-            cur.execute(
-                f"DELETE FROM {_SIGNALS_TABLE} "
-                f"WHERE trade_date = %s AND state = %s AND strategy = ANY(%s)",
-                (trade_date, S_BUY_TODAY, list(purge_buy_today)),
-            )
-            purged += cur.rowcount
-        n = 0
-        for s in rows:
-            extra = {k: s.get(k) for k in SIGNAL_EXTRA_KEYS if s.get(k) is not None}
-            state = s.get("state") or S_WATCH_PENDING
-            cur.execute(f"""
-                INSERT INTO {_SIGNALS_TABLE}
-                    (trade_date, strategy, code, name, board, entry_style, score, state,
-                     signal_date, signal_price, lu_date, pullback_days, extra,
-                     entry_date, entry_price, stop_price, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, NOW())
-                ON CONFLICT (trade_date, strategy, code, entry_style) DO UPDATE SET
-                    name = EXCLUDED.name, score = EXCLUDED.score, state = EXCLUDED.state,
-                    signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
-                    lu_date = EXCLUDED.lu_date, pullback_days = EXCLUDED.pullback_days,
-                    extra = EXCLUDED.extra, updated_at = NOW()
-            """, (
-                trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
-                s.get("style", "a"), int(s.get("score", 0)), state,
-                s.get("signal_date"), s.get("signal_price"),
-                s.get("lu_date"), s.get("pullback_days"),
-                json.dumps(extra, ensure_ascii=False, default=str),
-                s.get("entry_date"), s.get("entry_price"), s.get("stop_price"),
-            ))
-            n += 1
-        db.commit()
-        cur.close()
-    return {"written": n, "purged": purged}
+    last_err = None
+    for _attempt in range(1, max_retries + 1):
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s AND state = %s",
+                    (trade_date, S_WATCH_PENDING),
+                )
+                purged = cur.rowcount
+                if purge_buy_today:
+                    cur.execute(
+                        f"DELETE FROM {_SIGNALS_TABLE} "
+                        f"WHERE trade_date = %s AND state = %s AND strategy = ANY(%s)",
+                        (trade_date, S_BUY_TODAY, list(purge_buy_today)),
+                    )
+                    purged += cur.rowcount
+                n = 0
+                for s in rows:
+                    # 方案A (2026-09-18): extra 已由 signal_row 整包构造, 直接取 (剔除 None)
+                    extra = {k: v for k, v in (s.get("extra") or {}).items()
+                             if v is not None}
+                    state = s.get("state") or S_WATCH_PENDING
+                    cur.execute(f"""
+                        INSERT INTO {_SIGNALS_TABLE}
+                            (trade_date, strategy, code, name, board, entry_style, score, state,
+                             signal_date, signal_price, lu_date, pullback_days, extra,
+                             entry_date, entry_price, stop_price, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, NOW())
+                        ON CONFLICT (trade_date, strategy, code, entry_style) DO UPDATE SET
+                            name = EXCLUDED.name, score = EXCLUDED.score, state = EXCLUDED.state,
+                            signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
+                            lu_date = EXCLUDED.lu_date, pullback_days = EXCLUDED.pullback_days,
+                            extra = EXCLUDED.extra, updated_at = NOW()
+                    """, (
+                        trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
+                        s.get("style", "a"), int(s.get("score", 0)), state,
+                        s.get("signal_date"), s.get("signal_price"),
+                        s.get("lu_date"), s.get("pullback_days"),
+                        json.dumps(extra, ensure_ascii=False, default=str),
+                        s.get("entry_date"), s.get("entry_price"), s.get("stop_price"),
+                    ))
+                    n += 1
+                db.commit()
+                cur.close()
+            return {"written": n, "purged": purged}
+        except Exception as _e:
+            _pg = getattr(_e, "pgcode", None)
+            _transient = _pg in ("40P01", "40001")
+            last_err = _e
+            if _transient and _attempt < max_retries:
+                logger.warning(
+                    "[upsert_scan_signals] 瞬态冲突(pgcode=%s) 第%d/%d次重试 trade_date=%s: %s",
+                    _pg, _attempt, max_retries, trade_date, _e)
+                time.sleep(0.2 * _attempt)
+                continue
+            logger.error("[upsert_scan_signals] 失败(attempt %d): %s", _attempt, _e)
+            raise
+    raise last_err
 
 
 def set_state(sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol_r=None,
@@ -420,8 +430,8 @@ def _display_detail(s):
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
         "strategy": strat,
         "strategy_label": strategy_labels().get(strat, strat),
-        "winrate": STRATEGY_WINRATE.get(strat),
-        "state_label": STATE_LABELS.get(s["state"], s["state"]),
+        "winrate": strategy_winrate(strat),
+        "state_label": state_label(s["state"]),
         "entry_style": _es_txt,
         "score": s.get("score"),
         "lu_date": s.get("lu_date"),

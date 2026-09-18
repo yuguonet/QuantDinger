@@ -48,9 +48,6 @@ PARAMS = {
     "trail_after_limit": -8.0,  # 封板延续期的追踪止损 (自D1高点) %
 }
 
-# 用于 dragon_store 注册 (extra 落库白名单)
-SIGNAL_EXTRA_KEYS = ("board_height", "ma_bull", "lu_vol_ratio", "rsi", "gap_hint")
-
 
 # ================================================================
 # 特征计算 (纯函数, 无 IO)

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "live_probe": true,
-  "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。live_probe=实盘扫描探针总开关 (M1 实盘采集, 2026-09-11; 默认 true, false 关闭 — 每日盘后扫描按策略产 sample 存档到 tmp/probes/。注意: 探针只记特征/判定轨迹, 标签 censored 由离线回填)。2026-09-13 用户裁定撤回 V2 代实验: dragon_v2/break_v2 enabled=false 留档 (停扫描, 历史行仍可查), 系统回到 V1 策略集; 策略文件与回测证据原地保留。",
+  "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。live_probe=实盘扫描探针总开关 (M1 实盘采集, 2026-09-11; 默认 true, false 关闭 — 每日盘后扫描按策略产 sample 存档到 tmp/probes/。注意: 探针只记特征/判定轨迹, 标签 censored 由离线回填)。2026-09-13 用户裁定撤回 V2 代实验: dragon_v2/break_v2 enabled=false 留档 (停扫描, 历史行仍可查), 系统回到 V1 策略集; 策略文件与回测证据原地保留。winrate=历史回测胜率 (前端排序/展示用, 非实盘承诺, 可选缺省 null); state_labels=信号状态中文显示文案 (前端映射兜底, 可选缺省回退到状态原串)。",
   "schedule": {
     "knife_catch": {
       "windows": [
@@ -22,7 +22,8 @@
     "dragon_callback": {
       "label": "龙回头",
       "enabled": true,
-      "daily_limit": 5
+      "daily_limit": 5,
+      "winrate": 62.0
     },
     "dragon_v2": {
       "label": "龙回头V2",
@@ -32,17 +33,20 @@
     "v1": {
       "label": "V1",
       "enabled": true,
-      "daily_limit": 5
+      "daily_limit": 5,
+      "winrate": 72.7
     },
     "break": {
       "label": "断板",
       "enabled": true,
-      "daily_limit": 5
+      "daily_limit": 5,
+      "winrate": 71.3
     },
     "relay3": {
       "label": "3板接力",
       "enabled": true,
-      "daily_limit": 2
+      "daily_limit": 2,
+      "winrate": 53.4
     },
     "knife_catch": {
       "label": "反向接刀",
@@ -60,7 +64,8 @@
         "streak_min": 2,
         "stop_pct": -5.0,
         "hold_days": 1
-      }
+      },
+      "winrate": 97.2
     },
     "tail_oversold": {
       "label": "尾盘超卖超短",
@@ -75,7 +80,8 @@
         "min_hhmm": "14:50",
         "stop_pct": -8.0,
         "hold_days": 1
-      }
+      },
+      "winrate": 80.7
     },
     "break_v2": {
       "label": "断板V2",
@@ -92,5 +98,13 @@
       "enabled": true,
       "daily_limit": 30
     }
+  },
+  "state_labels": {
+    "watch_pending": "观察",
+    "buy_today": "买入",
+    "holding": "持仓",
+    "exit_today": "卖出",
+    "closed": "已平仓",
+    "expired": "已失效"
   }
 }
