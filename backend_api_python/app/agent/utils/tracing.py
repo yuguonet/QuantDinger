@@ -4,7 +4,7 @@ Agent 运行轨迹记录 + 结构化存储。
 统一采集：事件追加到 JSONL，finish() 时从事件流提取结构化字段写入 qd_traces。
 一套采集，一路输出（qd_traces），JSONL 作为附属日志。
 
-AGENT_TRACE_ENABLED=false   关闭
+AGENT_JSONL_ENABLED=false    只关本地 JSONL（agent_runs.jsonl），保留 qd_traces 落库与事件采集
 AGENT_TRACE_FILE=traces/agent_runs.jsonl
 AGENT_TRACE_MAX_CHARS=12000
 """
@@ -42,18 +42,23 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _trace_enabled() -> bool:
-    return os.getenv("AGENT_TRACE_ENABLED", "true").lower() not in (
-        "0", "false", "no", "off",
-    )
-
-
 def _max_chars() -> int:
     raw = os.getenv("AGENT_TRACE_MAX_CHARS", "12000")
     try:
         return max(100, int(raw))
     except ValueError:
         return 12000
+
+
+def _jsonl_enabled() -> bool:
+    """独立控制本地 JSONL 附属日志（agent_runs.jsonl）开关。
+
+    默认开启。设为 false 时只跳过 JSONL 文件写入，事件采集与 qd_traces
+    结构化落库不受影响——用于在保留回测闭环的前提下关掉本地磁盘日志。
+    """
+    return os.getenv("AGENT_JSONL_ENABLED", "true").lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def _truncate(value: Any, limit: Optional[int] = None) -> Any:
@@ -193,7 +198,6 @@ class AgentTraceRecorder:
         user_input: str,
         metadata: Optional[dict] = None,
     ):
-        self.enabled = _trace_enabled()
         self.trace_id = str(uuid.uuid4())
         self.agent_type = agent_type
         self.session_id = session_id
@@ -224,22 +228,19 @@ class AgentTraceRecorder:
         self._total_tokens: int = 0
         self._plan: str = ""
 
-        if self.enabled:
-            self.record(
-                "run_start",
-                {
-                    "agent_type": agent_type,
-                    "session_id": session_id,
-                    "user_input": user_input,
-                    "metadata": self.metadata,
-                },
-            )
+        self.record(
+            "run_start",
+            {
+                "agent_type": agent_type,
+                "session_id": session_id,
+                "user_input": user_input,
+                "metadata": self.metadata,
+            },
+        )
 
     # ── 事件追加 ──────────────────────────────────────────────
 
     def record(self, event_type: str, payload: Optional[dict] = None):
-        if not self.enabled:
-            return
         payload = payload or {}
         # 顺路汇总 run 级元数据（§8.3）：这些信息散落在事件里，此前无人采集落库。
         # 多批次执行会记多次 token_usage（每批一次），累加才是整轮真实消耗。
@@ -342,9 +343,9 @@ class AgentTraceRecorder:
 
         self.record("run_end", {"status": status, "response": response or {}})
 
-        # 写 JSONL
+        # 写 JSONL（受独立开关 AGENT_JSONL_ENABLED 控制；qd_traces 落库不受影响）
         root_id = None
-        if self.enabled:
+        if _jsonl_enabled():
             self._write_jsonl()
 
         # 写 qd_traces。结构化字段提取源：优先 CodeAgent 原始输出（execute_node 在
@@ -418,12 +419,14 @@ class AgentTraceRecorder:
             # 归类优先（2026-09-14）：domain/noun 无独立来源、恒落 unknown，导致
             # unknown+screen+unknown 等空链既无法按链聚合/回测，又污染决策树。按 verb
             # 兜底归类（选股/分析等 stock 任务归入 finance 域），使其可被正确归类。
-            if not self.domain:
-                _cls = _VERB_CLASSIFY.get(self.intent_verb)
-                if _cls:
-                    self.domain = _cls.get("domain", "")
-                    if not self.intent_noun:
-                        self.intent_noun = _cls.get("noun", "")
+            # 2026-09-19（重设计 V1）：domain/noun 兜底解耦——domain 可由 plan_node
+            # 补写（set_intent(domain=...)），noun 缺失时无论 domain 来源如何都按
+            # verb 归类补齐；否则 domain 有值会抑制 noun 兜底，链名残留 unknown 段。
+            _cls = _VERB_CLASSIFY.get(self.intent_verb)
+            if not self.domain and _cls:
+                self.domain = _cls.get("domain", "")
+            if not self.intent_noun and _cls:
+                self.intent_noun = _cls.get("noun", "")
             chain_name = f"{self.domain or 'unknown'}+{self.intent_verb or 'unknown'}+{self.intent_noun or 'unknown'}"
 
             # 跳过大势/筛选类无标的空链：无 stock_code 且链仍含 unknown（无法归类）→

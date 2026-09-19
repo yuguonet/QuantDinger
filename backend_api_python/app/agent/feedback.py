@@ -167,6 +167,8 @@ def check_negative_feedback(user_input: str, session_id: str = "default") -> Non
 
 
 
+            # [AUDIT-MASK:C3|2026-09-19] 双口径取舍：按 stock 计数时同链换标的惩罚记忆清零；
+            # 按 chain 计数时跨标的连坐。已知取舍，待确认统一口径。
             if stock_code:
 
                 count = chain_store.get_penalty_count(stock_code)

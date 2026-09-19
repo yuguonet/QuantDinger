@@ -105,6 +105,12 @@ PLAN_PHASE_MAX_STEPS = 12    # 单阶段内部步数上限（phase.step_budget �
 _PLAN_TOOL_LIST_LIMIT_ENV = os.getenv("PLAN_TOOL_LIST_LIMIT", "").strip()
 PLAN_TOOL_LIST_LIMIT = (int(_PLAN_TOOL_LIST_LIMIT_ENV)
                         if _PLAN_TOOL_LIST_LIMIT_ENV.isdigit() else 60)
+# plan 提示"数据能力"段的条数上限（2026-09-18）：能力层扩至 70 项后全量注入会让
+# plan 输入膨胀 ~10k 字符；按 user_input 相关度排序截断（复用 prescan.rank_tool_names，
+# 补 L7 遗留的"能力段不截断"缺口），被裁数量如实告知 planner。
+_CAP_PLAN_LIST_LIMIT_ENV = os.getenv("CAP_PLAN_LIST_LIMIT", "").strip()
+CAP_PLAN_LIST_LIMIT = (int(_CAP_PLAN_LIST_LIMIT_ENV)
+                       if _CAP_PLAN_LIST_LIMIT_ENV.isdigit() else 30)
 
 
 def _sandbox_help(obj=None):
@@ -910,12 +916,17 @@ def _load_skill_functions(skill_name: str, skill_adapter=None) -> list:
     """加载 skill 的 run.py 中的公开函数，包装为 CodeAgent 工具。
 
     约定：skill 目录名使用下划线（如 stock_evaluation），不用连字符。
+    注意：导入失败必须留痕（2026-09-19）——旧实现静默 `return []`，
+    导致 skill 工具全部不注入沙箱、模型调用被幻觉拦截却无人知晓
+    （market_screener/common.py 的过时 import 曾因此长期失效）。
     """
     import importlib
     module_name = skill_name.replace("-", "_")
     try:
         mod = importlib.import_module(f"skills.{module_name}.run")
-    except Exception:
+    except Exception as e:
+        logger.warning("[TaskAgent] 加载技能函数失败 skill=%s module=skills.%s.run: %s",
+                       skill_name, module_name, e)
         return []
 
     tools = []
@@ -929,8 +940,8 @@ def _load_skill_functions(skill_name: str, skill_adapter=None) -> list:
             continue
         try:
             tools.append(_SkillFuncTool(func, f"skills.{module_name}.run"))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[TaskAgent] 包装技能函数失败 %s.%s: %s", module_name, attr_name, e)
     return tools
 
 
@@ -944,7 +955,8 @@ def _list_skill_func_names(skill_name: str) -> set:
     module_name = skill_name.replace("-", "_")
     try:
         mod = importlib.import_module(f"skills.{module_name}.run")
-    except Exception:
+    except Exception as e:
+        logger.warning("[TaskAgent] 列出技能函数名失败 skill=%s: %s", skill_name, e)
         return set()
     out = set()
     for attr_name in dir(mod):
@@ -1126,8 +1138,15 @@ class TaskAgent(AgentBase):
             # 2026-09-13：改按来源层标记过滤（此前是虚构域 "quant"，与 tools/finance
             # 并列互斥，见 capabilities/loader.CAPABILITY_DOMAIN）；同时删除原先
             # 计算后从未使用的 _cap_text = prescan_tools(...)（每次 plan 白扫一遍全量工具）。
+            # 2026-09-18：能力层扩至 70 项后按 user_input 相关度裁剪（补 L7 遗留的
+            # "能力段不截断"缺口）——全量注入会让 plan 输入膨胀 ~10k 字符；被裁数量
+            # 如实告知 planner（与 prescan 裁剪原则一致：不静默丢弃）。
             try:
-                _cap_names = _capability_names(self._tool_provider)
+                from utils.prescan import rank_tool_names
+                from capabilities.loader import CAPABILITY_DOMAIN as _CAP_DOMAIN
+                _cap_names, _cap_hidden = rank_tool_names(
+                    self._tool_provider, user_input,
+                    limit=CAP_PLAN_LIST_LIMIT, domain=_CAP_DOMAIN)
                 if _cap_names:
                     _cap_lines = []
                     for _n in _cap_names:
@@ -1146,6 +1165,9 @@ class TaskAgent(AgentBase):
                                    "未点名调用即失败。点名通道：有 phases → 写进该阶段 tools；"
                                    "无 phases（单段任务）→ 写进顶层 tools）：\n"
                                    + "\n".join(_cap_lines))
+                    if _cap_hidden > 0:
+                        tools_hint += (f"\n  …另有 {_cap_hidden} 项数据能力与本次需求相关度较低"
+                                       f"未列出；如清单里没有你需要的取数通道，可点名 list_tools 查询。")
             except Exception as _e:
                 logger.debug("[Plan] 能力视图注入跳过: %s", _e)
 
@@ -1157,15 +1179,17 @@ class TaskAgent(AgentBase):
         cached_chain_text = ""
         try:
             from chain.store import query_cached_tools
-            _iv = getattr(plan_ctx, "intent_verb", "") if plan_ctx is not None else ""
-            _in = getattr(plan_ctx, "intent_noun", "") if plan_ctx is not None else ""
-            if not _iv:
-                # 回退：从 task_type / 用户输入语汇粗粒度对齐（chain_name 需 domain+verb+noun）
-                _iv = (getattr(plan_ctx, "task_type", "") if plan_ctx is not None else "") or "general"
+            # 2026-09-18 断链④修复：旧实现用 getattr(plan_ctx, "intent_verb")——NodeContext
+            # 无此属性 → 恒空 → chain_name 永远对不上。现改取 plan_node 挂载的
+            # _plan_task_type/_plan_entity_type（chat 意图分类的真实产出，见 nodes.py）。
+            # 键格式与 qd_traces.name（domain+verb+noun）对齐，verb=noun=task_type 时
+            # 语义即"同意图查询"。
+            _iv = (getattr(plan_ctx, "_plan_task_type", "") if plan_ctx is not None else "") or "general"
+            _in = (getattr(plan_ctx, "_plan_entity_type", "") if plan_ctx is not None else "") or "stock"
             _dom = ""
             if self._tool_provider:
                 _dom = "finance"  # 唯一可选域；与 _infer_domain 的主路径一致
-            _hit = query_cached_tools(_dom, _iv, _in or "stock")
+            _hit = query_cached_tools(_dom, _iv, _in)
             if _hit:
                 cached_chain_text = (
                     "\n\n【历史成功链路（仅供参考）】同意图已验证的工具序列："
@@ -1181,6 +1205,7 @@ class TaskAgent(AgentBase):
         try:
             from chain.store import get_tool_weights
             _tw = get_tool_weights()
+            # [AUDIT-MASK:B3/E1|2026-09-19] 阈值 0.7 硬编码；与 skill_brewer.py 组装逻辑重复（统一清理抽 helper）
             _low_tools = sorted(n for n, w in _tw.items() if w < 0.7)
             if _low_tools:
                 tools_hint += ("\n\n【工具权重提示】以下工具近期参与链路胜率偏低（<0.7），"
@@ -1346,10 +1371,12 @@ class TaskAgent(AgentBase):
         session_id: str = "default",
         use_rag: bool = True,
     ) -> AgentResponse:
-        # 负面反馈检测
+        # 反馈检测（负面对照 + 正面认可，2026-09-18 补接线：check_positive_feedback
+        # 此前定义了但零调用——正面认可本应固化 correct=True 并让权重/编排缓存受益）
         try:
-            from feedback import check_negative_feedback
+            from feedback import check_negative_feedback, check_positive_feedback
             check_negative_feedback(user_input, session_id=session_id)
+            check_positive_feedback(user_input, session_id=session_id)
         except Exception:
             pass
 
@@ -2177,6 +2204,13 @@ class TaskAgent(AgentBase):
             # 数字溯源（工具输出 grounding）
             try:
                 import re as _re
+
+                def _to_float(s):
+                    try:
+                        return float(s)
+                    except Exception:
+                        return None
+
                 observations = []
                 for step in getattr(getattr(agent, "memory", None), "steps", []) or []:
                     obs = getattr(step, "observations", None)
@@ -2188,11 +2222,26 @@ class TaskAgent(AgentBase):
                     nums = [n for n in nums if len(n.lstrip("0.")) >= 2]  # 忽略 0/1/2 这类噪音
                     if len(nums) >= 4:
                         grounded = sum(1 for n in nums if n in obs_corpus)
+                        # ① 总量级保守阈值：整体可溯源比例过低即拒收
                         if grounded / len(nums) < 0.3:
                             logger.warning(
                                 "[FinalAnswer] 数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源，拒收要求重写",
                                 len(nums), grounded)
                             return False
+                        # ② 价格/金额/百分比类（含小数点且 >=1）几乎只可能来自工具数据：
+                        #   模型若凭空在 final_answer 里写死这类数字（而非引用前面取到的变量 /
+                        #   打印过的取值），就会大面积无法溯源 → 判定为编造并拒收重写。
+                        #   30% 全局阈值会被计划文本/早期打印里的偶然整数、常见百分比「漏过」，
+                        #   故对小数类数值单独加严（2026-09-19 修复 tmp/1.txt 选股报告幻觉）。
+                        decimal_nums = [n for n in nums if "." in n and (_to_float(n) or 0) >= 1.0]
+                        if len(decimal_nums) >= 4:
+                            dec_grounded = sum(1 for n in decimal_nums if n in obs_corpus)
+                            if dec_grounded / len(decimal_nums) < 0.5:
+                                logger.warning(
+                                    "[FinalAnswer] 数字溯源失败（价格/金额类）：%d 个小数数值仅 %d 个可溯源，"
+                                    "疑似凭空编造，拒收要求重写",
+                                    len(decimal_nums), dec_grounded)
+                                return False
             except Exception as e:
                 logger.debug("[FinalAnswer] 数字溯源检查跳过: %s", e)
             return True

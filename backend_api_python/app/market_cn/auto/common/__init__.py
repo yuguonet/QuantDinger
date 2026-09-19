@@ -7,8 +7,8 @@
 
 关键设计点:
   - 本目录函数只依赖入参, 禁止 import DB/HTTP/策略模块 (唯一允许 IO 的是 auto/data/);
-  - 与 test_dragon.py 同名函数逐字一致 —— 改这里必须同步 test_dragon.py 并重跑对数;
-  - core.py (原dragon_core.py) 对这些名字做 re-export (facade), 外部 import 路径不变。
+  - 2026-09-18 裁定: 与 test_dragon.py 彻底脱钩 (其已是独立快照实现, 互不共享代码);
+    本目录是策略判定的唯一事实源, 改规则只需重跑 auto/backtest.py 对数验证。
 
 易错点:
   - 不要把策略私有逻辑 (如 DRAGON_CB_PARAMS) 挪进来, 那是策略文件的事;

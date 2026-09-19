@@ -19,7 +19,12 @@ import re
 import smolagents.agents as _sm_agents
 from smolagents.utils import parse_code_blobs as _orig_parse
 
-_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL)
+# v6（2026-09-19）：兼容模型输出的不同代码块语言标签。
+# 实测 glm 系模型用 ````python，部分国产模型（如 XingChenAGI）用 ````code / ````text
+# 标记代码块。原生 smolagents fallback 仅认 `python|py`，故 ````code 块会被彻底漏掉
+# （解析失败 → AgentParsingError）。此处追加 code/text/txt/plaintext 等通用代码标签，
+# 让两类写法都能被提取；非 Python 内容由后续 ast 健全性校验兜底。
+_CODE_FENCE_RE = re.compile(r"```(?:python|py|code|text|txt|plaintext)?\s*\n(.*?)```", re.DOTALL)
 
 _PROSE_RE = re.compile(
     r"^(?:[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]|(?:好的|例如|注意|现在|太好了|以上|这是|思路))"
@@ -100,35 +105,40 @@ def _looks_like_final_answer(text: str) -> bool:
     return "final_answer" in low or ("最终" in text and "答复" in text)
 
 
+def _usable(code: str | None) -> str | None:
+    """候选代码可用性校验：必须非空白且 ast 可解析。
+
+    2026-09-19（v6）：旧实现只校验 ast，而 ast.parse("") 对空模块**合法**，
+    导致「多个空 <code> 块 join 成空白串」被当成有效代码返回 → 沙箱执行空代码（Out: None）
+    → agent 静默空转到超时（XingChenAGI 实测每步输出约 30 个空 `<code></code>`）。
+    空/纯空白一律判为不可用，进入救援链或最终报错，让"模型没写代码"尽早暴露。
+    """
+    if not code or not code.strip():
+        return None
+    try:
+        ast.parse(code)
+    except (SyntaxError, ValueError):
+        return None
+    return code
+
+
 def resilient_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
-    """加固版 parse_code_blobs（签名兼容；v5：健全性校验 + 伪标签防线）。"""
+    """加固版 parse_code_blobs（签名兼容；v6：非空校验 + 标签兼容 + 伪标签防线）。"""
     code = None
     try:
         code = _orig_parse(text, code_block_tags)
     except Exception:
         pass
-
-    # 健全性校验（v5）：提取"成功"≠可用——伪标签匹配出的散文不是代码
-    if code is not None:
-        try:
-            ast.parse(code)
-        except SyntaxError:
-            code = None  # 进入救援链
+    code = _usable(code)  # 空/伪标签散文不是代码
 
     if code is None:
         m = _CODE_FENCE_RE.findall(text)
-        if m:
-            code = "\n\n".join(x.strip() for x in m)
-    if code is not None:
-        try:
-            ast.parse(code)
-        except SyntaxError:
-            code = None
+        code = _usable("\n\n".join(x.strip() for x in m)) if m else None
     if code is None:
         # XML 工具调用语法兜底（如 `<invoke name="tool">…</invoke>`）：转译为 Python 调用
-        code = _translate_invoke_xml(text)
+        code = _usable(_translate_invoke_xml(text))
     if code is None:
-        code = _rescue_loose_code(text)
+        code = _usable(_rescue_loose_code(text))
 
     if code is None:
         if _looks_like_final_answer(text):
@@ -147,8 +157,6 @@ def resilient_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> s
             "代码内不要插入解释性文字；若代码含三引号请改用 # 注释。"
         )
 
-    # 最终校验（双保险）
-    ast.parse(code)
     return code
 
 

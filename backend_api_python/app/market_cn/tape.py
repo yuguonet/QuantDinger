@@ -952,6 +952,80 @@ def get_realtime_snapshot(code: str) -> Dict[str, Any]:
     }
 
 
+def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
+    """获取当日分钟级资金流向。
+
+    数据源优先级（2026-09-19 用户定调）：
+      1. **本地 realtime_snapshot 派生**（量价方向近似，零外网）—— 主源；
+      2. 东财 push2 远程 —— 兜底（本地无数据 / 非交易时段外的指数等无快照标的）。
+
+    返回结构两源一致：
+        {code, points, total_main_net,
+         data: [{time, main_net, small_net, mid_net, large_net, super_net}]}
+    ⚠ 本地源为**量价近似**（返回带 approx=True），非真实主力/散户分类，
+       口径见 market_cn/fund_flow_local.py。
+    """
+    # 1) 本地快照派生（外网零依赖）
+    try:
+        from app.market_cn.fund_flow_local import get_fund_flow_from_snapshot
+        local = get_fund_flow_from_snapshot(code)
+        if local.get("data"):
+            return local
+    except Exception as e:
+        logger.warning("[fund_flow] 本地快照派生失败(%s): %s", code, e)
+
+    # 2) 东财远程兜底
+    return _fund_flow_eastmoney(code)
+
+
+def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
+    """当日分钟级资金流（东财 push2 远程，兜底路径）。
+
+    Args:
+        code: 股票代码，如 "600519"
+
+    Returns:
+        {
+            code, points, total_main_net,
+            data: [{time, main_net, small_net, mid_net, large_net, super_net}, ...]
+        }
+        主力=超大单+大单, 单位: 元
+    """
+    import requests
+    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+    params = {
+        "secid": _secid(code), "klt": 1,
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+    }
+    headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json()
+        rows = []
+        for line in d.get("data", {}).get("klines", []):
+            p = line.split(",")
+            if len(p) >= 6:
+                rows.append({
+                    "time": p[0],
+                    "main_net": _safe_float(p[1]),      # 主力净流入
+                    "small_net": _safe_float(p[2]),      # 小单净流入
+                    "mid_net": _safe_float(p[3]),        # 中单净流入
+                    "large_net": _safe_float(p[4]),      # 大单净流入
+                    "super_net": _safe_float(p[5]),      # 超大单净流入
+                })
+        total_main = sum(r["main_net"] for r in rows)
+        return {
+            "code": code,
+            "points": len(rows),
+            "total_main_net": round(total_main, 2),
+            "data": rows,
+        }
+    except Exception as e:
+        logger.warning("[eastmoney] 分钟资金流失败(%s): %s", code, e)
+        return {"code": code, "error": str(e)}
+
+
 def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
     """获取近 N 日日级资金流向（东财 push2his API）
 

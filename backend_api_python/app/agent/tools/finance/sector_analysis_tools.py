@@ -187,26 +187,6 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dic
     except Exception as e:
         logger.warning("get_sector_history_data failed: %s", e)
         return {"error": str(e)}
-def get_sector_prediction() -> dict:
-    """板块预测：基于资金流+情绪+技术面，预测今日可能走强的板块。"""
-    try:
-        from app.market_cn.china_market import get_sector_prediction as _get
-        return _get()
-    except Exception as e:
-        logger.warning("get_sector_prediction failed: %s", e)
-        return {"error": str(e)}
-def get_sector_cycle(board_type: str = "industry") -> dict:
-    """板块周期：返回板块6个月内的周期位置（高位/低位/上升/下降）。
-
-    Args:
-        board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
-    """
-    try:
-        from app.market_cn.china_market import get_sector_cycle as _get
-        return _get(board_type=board_type)
-    except Exception as e:
-        logger.warning("get_sector_cycle failed: %s", e)
-        return {"error": str(e)}
 def get_stock_sector_info(codes: str) -> dict:
     """从本地数据库查询股票所属行业和概念。
 

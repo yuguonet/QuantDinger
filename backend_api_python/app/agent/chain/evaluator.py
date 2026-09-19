@@ -267,6 +267,18 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
         except Exception as e:
             logger.warning("[Evaluator] 自动更新权重失败: %s", e)
 
+
+    # 迭代旁支调度（重设计 §2.6，2026-09-19）：权重打分完成后，把低于阈值的 auto_ 技能
+    # 交给修订器。护栏/队列在 skill_brewer 侧；本处只一行调度（模块边界 §11.1）。
+    try:
+        from chain.skill_brewer import maybe_revise
+        from chain.store import get_skill_weights as _gsw
+        _rev_results = maybe_revise(_gsw())
+        if any(r.get("status") == "revised" for r in _rev_results):
+            stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
+    except Exception as _re:
+        logger.warning("[Evaluator] 技能修订调度跳过: %s", _re)
+
     return stats
 # ═══════════════════════════════════════════════════════════════
 # Skill 权重更新（按单位时间收益率）
@@ -749,6 +761,18 @@ def start_eval_worker():
                 _worker_health["total_failures"] += 1
                 _worker_health["last_error"] = str(e)
                 logger.warning("[EvalWorker] 盘后验证失败: %s", e)
+
+            # 技能酿造挂钩（2026-09-19 升级为触发策略 v2，重设计 §2.5）：
+            # 每日调用一次 brew_skills(trigger="auto")，节拍由信号分内部决定
+            # （信号就绪立即酿 / 7 日兜底 / 冷却），状态落 qd_agent_weights
+            # （layer='brew_state'），重启不丢。worker 不再管理日期。
+            try:
+                from chain.skill_brewer import brew_skills, refresh_skill_adapter
+                _brewed = brew_skills(trigger="auto")
+                if any(r.get("status") == "brewed" for r in _brewed):
+                    refresh_skill_adapter()
+            except Exception as e:
+                logger.warning("[EvalWorker] 技能酿造跳过: %s", e)
 
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()

@@ -1,3 +1,4 @@
+# [AUDIT-MASK:D1|2026-09-19] DEPRECATED：全后端零引用（上一代追踪器；现役 = utils/tracing.py AgentTraceRecorder）。清理阶段删除。
 # -*- coding: utf-8 -*-
 """
 TraceCollector — Agent 执行追踪器。

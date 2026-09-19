@@ -147,12 +147,13 @@ def register_capabilities(provider, admission_path=None,
         return 0
     registered = 0
     failures = []
+    conflicts = []
     for mod_path, name, timeout_s, max_chars in entries:
         if _is_hard_denied(name):
             failures.append(f"{mod_path}:{name}(写操作前缀,拒绝)")
             continue
         if name in provider:
-            failures.append(f"{mod_path}:{name}(名称冲突)")
+            conflicts.append(f"{mod_path}:{name}")
             continue
         try:
             mod = importlib.import_module(mod_path)
@@ -166,6 +167,12 @@ def register_capabilities(provider, admission_path=None,
             name, _wrap_guards(fn, timeout_s, max_chars, name), domain=domain
         )
         registered += 1
+    # 日志分级（2026-09-18）：同名让位 = 预期内的替补待命（既有包装工具优先生效，
+    # admission 有意保留这些条目，删除包装后自动补位）→ INFO，避免每次启动都拉
+    # WARNING 造成警报疲劳；failures（写拒绝/导入失败）= 真问题 → 保持 WARNING。
+    if conflicts:
+        logger.info("[capabilities] %d 项同名让位（既有包装工具优先生效，能力函数待命，"
+                    "删除包装后自动补位）: %s", len(conflicts), "；".join(conflicts))
     if failures:
         logger.warning("[capabilities] %d 项未注册: %s", len(failures), "；".join(failures))
     return registered

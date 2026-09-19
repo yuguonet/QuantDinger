@@ -172,13 +172,16 @@ class NodeContext:
             # 扫描 tools/ 子目录（领域工具）
             provider.scan_subdirectories(tools_dir, package_prefix="tools")
             # 能力发现层（A 阶段 2026-09-12）: admission.json 准入的只读函数 -> 来源层标记
-            # 2026-09-14：能力层**默认屏蔽**，CAPABILITIES_ENABLED=1 才注册。
-            # 理由（用户决策）：19 项准入全部**无审核留痕**（admission.json 没有
-            # reviewed_by/at），来源还是一份并不存在的"扫描报告"；而这层带来的
-            # 取数函数让工具面变大 → 模型更容易试探、上下文膨胀更快、沙箱冲突更多。
-            # 补齐审核留痕并评估收益后，再决定是否重新打开。
+            # 2026-09-14 曾默认屏蔽。2026-09-18 默认开启（CAPABILITIES_ENABLED=0 可显式关）。
+            # 开启依据（原屏蔽理由逐条消除）：
+            # ① 审核留痕已补齐：admission.json 22 项逐个 reviewed_by/at + review_note
+            #    （AI 逐函数审读源码确认只读/无副作用），20 项准入；
+            # ② 来源为真实扫描报告 tmp/capability_scan_20260914_0714.json（仓库存在）；
+            # ③ 沙箱已全删（原"工具面大→沙箱冲突多"的理由消失）；
+            # ④ 注入走 planner 点名白名单、非全量下发，工具面不膨胀
+            #    （2026-09-18 e2e 实测：单段任务仅注入 6 工具，能力点名→沙箱调用全链路通）。
             try:
-                if os.getenv("CAPABILITIES_ENABLED", "0") == "1":
+                if os.getenv("CAPABILITIES_ENABLED", "1") == "1":
                     from capabilities import register_capabilities
                     _cap_n = register_capabilities(provider)
                     logger.info("[Context] 能力层注册: %d 个函数（来源层标记，非可选工具域）", _cap_n)
@@ -283,6 +286,8 @@ def _record_tool_calls_to_trace(trace, agent):
                 if step.start_time and step.end_time:
                     elapsed_ms = (step.end_time - step.start_time) * 1000
 
+            # [AUDIT-MASK:A2|2026-09-19] 失败判定双份之一：与本文件 _extract_failed_tools 口径漂移
+            # （本处无伪工具名过滤；对端有过滤但缺 ActionStep.error 通道）。统一后删除其一。
             error = ""
             if "_failed_tool" in observations or "error" in observations.lower():
                 m = re.search(r"'error'\s*:\s*'([^']*)'", observations)
@@ -822,6 +827,13 @@ def make_plan_node(ctx: NodeContext):
             plan_parts.append(replan_context)
         plan_input = "\n\n".join(plan_parts)
 
+        # 编排缓存查询键（2026-09-18 小接线）：_plan 内部的 query_cached_tools 此前用
+        # getattr(plan_ctx, "intent_verb") 取键——NodeContext 根本没有该属性 → 恒空 →
+        # chain_name 永远对不上（断链④）。此处把 chat 意图分类产出的两元组挂到 ctx，
+        # 与既有 _plan_entity_info 挂载模式一致；task_agent 侧改从这些属性直取。
+        ctx._plan_task_type = task_type or "general"
+        ctx._plan_entity_type = entity_type or "stock"
+
         # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
         plan = await ctx.agent._plan(plan_input, ctx.llm, trace, plan_ctx=ctx)
 
@@ -848,6 +860,15 @@ def make_plan_node(ctx: NodeContext):
                 "body_chars": len(skill_body),
                 "tool_count": len(skill_tools),
             })
+
+        # intent 三元组补源（2026-09-19，重设计 V1）：chat 阶段只有 verb（task_type），
+        # domain 空置 → 根节点 name 含 unknown → 酿造候选过滤（position('unknown')=0）
+        # 把链排除 → 闭环④断粮。此处 selected_domain 已确定，补写 domain；
+        # noun 仍由 tracing 内 _VERB_CLASSIFY 依 verb 推导（如 query→stock）。
+        # set_intent 只在非空时覆盖（tracing.py），重复调用安全。
+        _sd = (plan.get("selected_domain") or "").strip()
+        if trace:
+            trace.set_intent(domain=_sd)
 
         # phase 契约透传（B 阶段）：游标归零重走新序列；completed_phases_text / phase_results
         # 保留累积（复盘时已完成阶段的摘要仍然注入任务书）；_phase_agents 重置——

@@ -287,8 +287,19 @@ def technical_analysis(codes: str) -> dict:
         codes: 股票代码（6位数字），如 "600519"
 
     Returns:
-        dict: 标准化分析报告，包含 score(0-100)、direction(bullish/bearish/neutral)、
-              confidence(high/medium/low)、signal(信号摘要)、factors(因子明细)、analysis(分析文字)
+        dict: 标准化分析报告，键包括:
+              score(0-100)、direction(bullish/bearish/neutral)、confidence(high/medium/low)、
+              signal(信号摘要)、analysis(分析文字)、stock_code，
+              以及透传原始数据 latest_close/boll/ma20/ma60/bias_ma20/rsi。
+              ⚠️ factors 是【列表】，不是字典！每个元素是 {"name","value","score"} 三键字典，
+                 因子名在 name 字段里（取值如 "趋势"/"指标"/"量价"/"形态"/"筹码"/"流通盘"），
+                 没有 "MA"/"MACD"/"RSI"/"KDJ" 这种顶层键。
+              正确取用法:
+                  factors = r["factors"]                        # list
+                  by_name = {f["name"]: f["value"] for f in factors}
+                  # by_name.get("指标") -> "MACD:中性 RSI:72"
+                  # by_name.get("趋势") -> "强烈看空"
+              切勿写成 r["factors"].get("MA", "N/A")（list 无 .get，会报 InterpreterError）。
     """
     tool_results = _call_tools(codes)
     return _algo_analyze(codes, tool_results)

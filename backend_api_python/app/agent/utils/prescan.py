@@ -158,7 +158,8 @@ def _relevance(name: str, doc: str, terms: set) -> int:
     return score
 
 
-def rank_tool_names(provider, query: str, limit: int = 0) -> tuple:
+def rank_tool_names(provider, query: str, limit: int = 0,
+                    domain: str | None = None) -> tuple:
     """按相关度排序工具名，返回 (names, hidden_count)。
 
     limit<=0 或工具数不超上限 → 不裁剪（只按名称稳定排序）。
@@ -167,8 +168,13 @@ def rank_tool_names(provider, query: str, limit: int = 0) -> tuple:
     Args:
         query: 相关性依据（用户消息 / 任务描述 / 实体信息），中文可用。
         limit: 最多返回多少个。
+        domain: 只统计该来源域的工具（2026-09-18 新增）。能力层（CAPABILITY_DOMAIN）
+            从 20 项扩至 70 项后，plan 提示的能力段必须按相关度裁剪，否则全量注入
+            会让 plan 输入膨胀 ~10k 字符——补 L7 审计遗留的"能力段不截断"缺口。
     """
     names = provider.get_tool_names()
+    if domain:
+        names = [n for n in names if provider.get_domain(n) == domain]
     if limit <= 0 or len(names) <= limit:
         return names, 0
     terms = _terms(query)

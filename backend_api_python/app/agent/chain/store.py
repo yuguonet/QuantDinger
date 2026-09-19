@@ -341,6 +341,7 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
                   AND status = 'ok'
                   AND COALESCE(stock_code, '') <> ''
                   AND exec_date <= %s
+                  AND NOT COALESCE(human_reviewed, FALSE)  -- [AUDIT-MASK:C2→fix 2026-09-19] 人工判定优先，自动验证不覆盖
                 ORDER BY exec_date ASC
                 LIMIT %s
             """, (cutoff, limit))
@@ -361,6 +362,8 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
 # 回溯验证写入
 # ═══════════════════════════════════════════════════════════════
 
+# [AUDIT-MASK:C1|2026-09-19] 与下方 update_skill_verify 为配对写回（root 层/skill 层），
+# 结构相似属分层设计，勿合并。
 def update_verify_results(
     root_id: int,
     exit_date: date = None,
@@ -513,7 +516,11 @@ def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
         logger.error("[Store] 查询最近根节点失败 chain=%s: %s", chain_name, e)
         return None
 def mark_root_wrong(root_id: int):
-    """轻度惩罚：标记根节点 correct=False + calibration 重校准。"""
+    """轻度惩罚：标记根节点 correct=False + calibration 重校准。
+
+    [AUDIT-MASK:C2|2026-09-19 → fix 2026-09-19] 时序冲突已修：query_pending_verify
+    现排除 human_reviewed=TRUE 的行，本函数写入的人工判定不会被自动验证覆盖。
+    """
     from app.utils.db import get_db_connection
 
     try:
@@ -654,6 +661,9 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     except Exception as e:
         logger.warning("[Store] 获取因子权重失败: %s", e)
     return weights
+# [AUDIT-MASK:B1|2026-09-19] 第④闭环双轨之一：本函数（工具序列参考注入）与 skill_brewer
+# （酿造）同源同目的，质量门口径不一致（此处 win_rate>=0.7/MIN_SAMPLES=1；酿造 证伪<=0.3）。
+# 等混合触发（重设计稿 §2.5）与迭代旁支稳定后二选一；建议保留酿造，本通道降级 debug 开关。
 def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None) -> Optional[List[str]]:
     """查询 qd_traces 中已验证的工具序列（编排路径缓存）。
 
@@ -677,7 +687,10 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
 
     def _query(cur, extra_where: str, params: tuple) -> Optional[list]:
         """聚合查询：按 tools_called 分组，取最优链路。"""
-        MIN_SAMPLES = 3         # 最小样本数
+        # 2026-09-18：3 → 1（用户方案"第一次顺利完成后下一次直接用"）。
+        # 工具序列天然分散（同一意图不同 run 组合不同），3 样本门槛意味着永远等不到；
+        # 参考注入 fail-open 且非强制，1 样本即可注入；回测证伪由 correct 门兜底。
+        MIN_SAMPLES = 1         # 最小样本数
         MIN_WIN_RATE = 0.7      # 最小胜率
         
         cur.execute(f"""
@@ -701,7 +714,11 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
               )
             GROUP BY t.tools_called
             HAVING COUNT(*) >= %s
-               AND AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) >= %s
+               AND (AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) >= %s
+                    -- 未校准（correct 全 NULL，如 query/chat 类无方向预测的任务）视为
+                    -- 中性可用——只要没有一条被回测证伪（correct=FALSE）即可入选。
+                    -- 旧实现把全 NULL 的链一律拒之门外，query 类编排缓存因此永不命中。
+                    OR NOT BOOL_OR(t.correct IS FALSE))
             ORDER BY COALESCE(AVG(t.pnl_pct), 0) / COALESCE(NULLIF(AVG(NULLIF(t.hold_days, 0)), 0), 1) DESC
             LIMIT 1
         """, (chain_name, MAX_STEPS) + params + (MIN_SAMPLES, MIN_WIN_RATE))
@@ -731,6 +748,200 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
     except Exception as e:
         logger.warning("[Store] 查询缓存工具链失败 %s: %s", chain_name, e)
         return None
+
+def get_brew_states() -> list:
+    """读取全部酿造状态（重设计 §2.5；layer='brew_state' 行）。
+
+    返回 [{chain_name, last_brew_date(date), fail_streak(int)}]。
+    weight 列复用为 fail_streak 存储（整数语义，无需新表）。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT name, last_updated, weight
+                FROM qd_agent_weights
+                WHERE layer = 'brew_state'
+            """)
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "chain_name": r["name"],
+                    "last_brew_date": r["last_updated"].date() if r["last_updated"] else None,
+                    "fail_streak": int(r["weight"] or 0),
+                })
+            cur.close()
+            return rows
+    except Exception as e:
+        logger.warning("[Store] 酿造状态读取失败: %s", e)
+        return []
+
+
+def set_brew_state(chain_name: str, last_brew_date=None, fail_streak: int = 0) -> None:
+    """写/更新一条酿造状态（幂等 upsert）。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO qd_agent_weights
+                    (layer, name, skill_name, weight, sample_count, last_updated)
+                VALUES ('brew_state', %s, NULL, %s, 0, %s)
+                ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                DO UPDATE SET
+                    weight = EXCLUDED.weight,
+                    last_updated = EXCLUDED.last_updated
+            """, (chain_name, fail_streak, last_brew_date))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.error("[Store] 酿造状态写入失败 chain=%s: %s", chain_name, e)
+
+
+# ── 酿造触发阈值（重设计 §2.5；单一事实源，消费方：skill_brewer）──
+BREW_MIN_SIGNAL = 3.0        # 信号分下限 ≈ 3 次验证正确
+BREW_WIN_RATE_FLOOR = 0.7    # 正确率闸门
+BREW_CONFIDENCE_CAP = 10     # 置信缩放分母（verified 达此值后不再增益）
+
+
+def query_brew_ready(min_signal: float = BREW_MIN_SIGNAL, limit: int = 5) -> list:
+    """信号就绪的酿造候选（重设计 §2.5 触发策略 v2，2026-09-19）。
+
+    与 query_brew_candidates 的区别：本函数按**合成信号分**排序与过滤——
+      signal = verified_correct × win_rate × min(1, verified/BREW_CONFIDENCE_CAP)
+    - verified_correct 只数 correct=TRUE（NULL 不计，与 §7.18.6 语义一致）；
+    - win_rate < BREW_WIN_RATE_FLOOR 的链直接拒绝（坏编排不固化）；
+    - 置信缩放防"一夜爆量"（同市况样本不泛化）。
+    不含 unknown 链、要求可回测标的（与 query_brew_candidates 同口径）。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT t.name AS chain_name,
+                       COUNT(*) AS runs,
+                       COUNT(*) FILTER (WHERE t.correct IS FALSE) AS falsified,
+                       COUNT(*) FILTER (WHERE t.correct) AS verified_correct,
+                       COUNT(*) FILTER (WHERE t.correct IS NOT NULL) AS verified_total,
+                       MAX(t.exec_date) AS last_date,
+                       MIN(t.id) AS sample_root_id
+                FROM qd_traces t
+                WHERE t.layer = 'chain' AND t.status = 'ok'
+                  AND t.stock_code IS NOT NULL AND t.stock_code <> ''
+                  AND position('unknown' in t.name) = 0
+                GROUP BY t.name
+                HAVING COUNT(*) FILTER (WHERE t.correct) >= 1
+                   AND (COUNT(*) FILTER (WHERE t.correct))::float
+                       / GREATEST(COUNT(*) FILTER (WHERE t.correct IS NOT NULL), 1)
+                       >= %s
+                ORDER BY runs DESC
+                LIMIT %s
+            """, (BREW_WIN_RATE_FLOOR, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.close()
+            out = []
+            for r in rows:
+                wr = (r["verified_correct"] / r["verified_total"]) if r["verified_total"] else 0.0
+                confidence = min(1.0, r["verified_correct"] / BREW_CONFIDENCE_CAP)
+                r["win_rate"] = round(wr, 4)
+                r["signal"] = round(r["verified_correct"] * wr * confidence, 3)
+                if r["signal"] >= min_signal:
+                    out.append(r)
+            out.sort(key=lambda x: -x["signal"])
+            return out[:limit]
+    except Exception as e:
+        logger.warning("[Store] 信号候选查询失败: %s", e)
+        return []
+
+
+def query_brew_candidates(min_runs: int = 5, max_falsified_ratio: float = 0.3,
+                          min_days_span: int = 0, limit: int = 5) -> list:
+    """技能酿造候选（2026-09-18，用户方案：高频且验证效果好的节点树 → 酿成 Skill）。
+
+    按 chain_name 聚合 qd_traces 根节点，筛选：
+      - runs >= min_runs（高频：问得多的链才值得固化）；
+      - 被回测证伪（correct=FALSE）占比 <= max_falsified_ratio（效果好：未被证伪/证伪少）；
+      - 跨天数 >= min_days_span（0 = 不要求；用户提的"7 天周期"由调用方按 last_date 控制）。
+    返回候选列表（含代表 run 的 root_id，供酿造器拉节点树明细），按 runs 降序。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT t.name AS chain_name,
+                       COUNT(*) AS runs,
+                       COUNT(*) FILTER (WHERE t.correct IS FALSE) AS falsified,
+                       COUNT(*) FILTER (WHERE t.correct) AS verified_correct,
+                       COUNT(DISTINCT t.exec_date) AS days_span,
+                       MAX(t.exec_date) AS last_date,
+                       MIN(t.id) AS sample_root_id
+                FROM qd_traces t
+                WHERE t.layer = 'chain' AND t.status = 'ok'
+                  AND t.stock_code IS NOT NULL AND t.stock_code <> ''
+                  AND position('unknown' in t.name) = 0   -- 不可归类链无酿造价值（LIKE 通配符会撞 psycopg2 占位符解析）
+                GROUP BY t.name
+                HAVING COUNT(*) >= %s
+                   AND (COUNT(*) FILTER (WHERE t.correct IS FALSE))::float
+                       / GREATEST(COUNT(*) FILTER (WHERE t.correct IS NOT NULL), 1)
+                       <= %s
+                   AND COUNT(DISTINCT t.exec_date) >= %s
+                ORDER BY runs DESC
+                LIMIT %s
+            """, (min_runs, max_falsified_ratio, min_days_span, limit))
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("[Store] 酿造候选查询失败: %s", e)
+        return []
+
+def get_run_tree_digest(root_id: int, max_children: int = 12) -> Optional[dict]:
+    """取一条 run 的节点树摘要（酿造原料）：task/plan + 各步骤的执行日志摘要。
+
+    注意 tools_called 里记的是 python_interpreter 占位（CodeAgent 形态），真实步骤
+    线索在 output_summary 的 Execution logs 里——原样交给 LLM 编译，由它从日志推断
+    每步做了什么、用了什么工具。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT name, user_query, plan, tools_called FROM qd_traces WHERE id = %s
+            """, (root_id,))
+            root = cur.fetchone()
+            if not root:
+                cur.close()
+                return None
+            cur.execute("""
+                SELECT name, status, output_summary FROM qd_traces
+                WHERE root_id = %s AND layer <> 'chain' ORDER BY id LIMIT %s
+            """, (root_id, max_children))
+            steps = []
+            for r in cur.fetchall():
+                os_ = r["output_summary"]
+                if isinstance(os_, dict):
+                    txt = str(os_.get("result") or os_)[:400]
+                else:
+                    txt = str(os_)[:400]
+                steps.append({"step": r["name"], "status": r["status"], "log": txt})
+            cur.close()
+            return {
+                "chain_name": root["name"],
+                "user_query": root["user_query"] or "",
+                "plan": (root["plan"] or "")[:1500],
+                "tools_called": root["tools_called"] or [],
+                "steps": steps,
+            }
+    except Exception as e:
+        logger.warning("[Store] 节点树摘要查询失败 root=%s: %s", root_id, e)
+        return None
+
+# [AUDIT-MASK:B2|2026-09-19] 死代码实锤：仅定义+chain/__init__ 导出，全 backend 零生产调用方
+# （现役通道 = get_tool_weights + 调用方 <0.7 过滤）。统一清理阶段连同导出项删除。
 def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) -> set:
     """聚合 qd_traces，返回低权重工具集合。
 
@@ -817,3 +1028,96 @@ def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
         logger.warning("[Store] 获取评估统计失败: %s", e)
 
     return result
+
+
+def get_delta_digest(chain_name: str, since_date=None, max_children: int = 20) -> Optional[dict]:
+    """增量轨迹摘要（迭代修订原料，重设计 §2.6）。
+
+    取该链自 since_date 以来（含 correct 两态）的 run 树摘要：
+      - correct=TRUE 的 run → 供修订器提炼步骤/参数改进；
+      - correct=FALSE 的 run → 供修订器把坑写进「注意事项」。
+    since_date=None 时取全部（与首酿原料同源）。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            extra = "AND t.exec_date >= %s" if since_date else ""
+            params = [chain_name] + ([since_date] if since_date else []) + [max_children]
+            cur.execute(f"""
+                SELECT t.id, t.user_query, t.plan, t.correct, t.exec_date,
+                       t.output_summary
+                FROM qd_traces t
+                WHERE t.layer = 'chain' AND t.name = %s AND t.status = 'ok'
+                  AND t.stock_code IS NOT NULL AND t.stock_code <> ''
+                  {extra}
+                ORDER BY t.exec_date DESC
+                LIMIT %s
+            """, params)
+            runs = []
+            for r in cur.fetchall():
+                os_ = r["output_summary"]
+                txt = str(os_.get("result") or os_)[:400] if isinstance(os_, dict) else str(os_)[:400]
+                runs.append({
+                    "root_id": r["id"],
+                    "user_query": r["user_query"] or "",
+                    "plan": (r["plan"] or "")[:1200],
+                    "correct": r["correct"],
+                    "exec_date": str(r["exec_date"]),
+                    "summary": txt,
+                })
+            cur.close()
+            return {
+                "chain_name": chain_name,
+                "runs": runs,
+                "n_correct": sum(1 for x in runs if x["correct"] is True),
+                "n_falsified": sum(1 for x in runs if x["correct"] is False),
+            }
+    except Exception as e:
+        logger.warning("[Store] 增量轨迹摘要失败 chain=%s: %s", chain_name, e)
+        return None
+
+
+def get_skill_revision(chain_name: str) -> dict:
+    """读取技能修订状态（version/revision 计数；重设计 §2.6 护栏 5 用）。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT weight, sample_count FROM qd_agent_weights
+                WHERE layer = 'brew_state' AND name = %s
+            """, (chain_name,))
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return {"revision": 0, "low_streak": 0}
+            # weight 列在 brew_state 行语义：整数部分=fail_streak 由 set_brew_state 维护；
+            # revision 存 sample_count（复用列，避免加字段）
+            return {"revision": int(row["sample_count"] or 0), "low_streak": int(row["weight"] or 0)}
+    except Exception as e:
+        logger.warning("[Store] 修订状态读取失败 chain=%s: %s", chain_name, e)
+        return {"revision": 0, "low_streak": 0}
+
+
+def set_skill_revision(chain_name: str, revision: int, low_streak: int) -> None:
+    """更新技能修订计数（revision 存 sample_count 列，low_streak 存 weight 列的负值语义见调用方）。"""
+    from app.utils.db import get_db_connection
+    from datetime import date as _d
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO qd_agent_weights
+                    (layer, name, skill_name, weight, sample_count, last_updated)
+                VALUES ('brew_state', %s, NULL, %s, %s, %s)
+                ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                DO UPDATE SET
+                    weight = EXCLUDED.weight,
+                    sample_count = EXCLUDED.sample_count,
+                    last_updated = EXCLUDED.last_updated
+            """, (chain_name, low_streak, revision, _d.today()))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.error("[Store] 修订状态写入失败 chain=%s: %s", chain_name, e)

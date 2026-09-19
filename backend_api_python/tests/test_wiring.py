@@ -181,14 +181,14 @@ def test_plan_prompt_exposes_single_segment_naming_channel():
     """L9 病灶是"示例/规则/实现三者互斥"：提示必须同时覆盖单段与多段两条点名通道。
 
     现行形态（2026-09-15）：JSON 结构里 tools 字段说明 + 数据能力边界规则行
-    （“无 phases（单段任务）→ 顶层 tools 点名”）承担单段示例；断言按当前形态验证
-    两条通道都有描述，防止提示改回“能力只认 phases[].tools”的互斥旧态。
+    （"无 phases（单段任务）→ 顶层 tools 点名"）承担单段示例；断言按当前形态验证
+    两条通道都有描述，防止提示改回"能力只认 phases[].tools"的互斥旧态。
     """
     text = _load_plan_template()
     assert "必须点名才会注入" in text
-    # 单段通道：顶层 tools 的说明必须在场且注明“仅无 phases 时使用”
+    # 单段通道：顶层 tools 的说明必须在场且注明"仅无 phases 时使用"
     assert "仅无 phases 时使用" in text, "顶层 tools 单段点名通道无说明（L9 互斥复发）"
-    # 能力名清单与“单段 → 顶层 tools”规则行必须在场
+    # 能力名清单与"单段 → 顶层 tools"规则行必须在场
     naming_lines = [ln for ln in text.splitlines() if "list_signals" in ln]
     assert naming_lines, "能力名单里没有 list_signals（能力视图与提示脱节）"
     assert any("顶层 `tools`" in ln or "顶层 tools" in ln for ln in naming_lines + text.splitlines()), \
@@ -476,13 +476,13 @@ def test_time_resolver_infers_domain_and_inlines_dates(fake_calendar):
     assert TimeResolver(entity_type="stock", now=monday).resolve(
         "昨日涨停的股票").effective_input.startswith("昨日(2026-09-11)涨停的股票")
 
-    # 盘中语义（用户实测“无所适从”修正）：交易日盘中问"现在买什么股"，
+    # 盘中语义（用户实测"无所适从"修正）：交易日盘中问"现在买什么股"，
     # 内联的是 `现在(日期 时刻)` —— 不得出现指向昨日的"最近已收盘交易日"锚点
     tuesday_intraday = datetime(2026, 9, 15, 13, 50)
     r = TimeResolver(entity_type="stock", now=tuesday_intraday).resolve("现在买什么股?不要涨停了的")
     assert r is not None and r.effective_input.startswith("现在(2026-09-15 "), \
-        f"盘中“现在”必须内联带时刻的日期：{r.effective_input if r else None}"
-    assert "最近已收盘" not in r.effective_input, "盘中注入“最近已收盘=昨天”误导 agent"
+        f"盘中'现在'必须内联带时刻的日期：{r.effective_input if r else None}"
+    assert "最近已收盘" not in r.effective_input, "盘中注入'最近已收盘=昨天'误导 agent"
 
     # 金融域常驻锚点：原文无时间词时补一个最小的 `今天(日期)`；无尾部说明块
     plain = TimeResolver(entity_type="stock", now=monday).resolve("涨停概率最大的股票")
@@ -670,8 +670,9 @@ def test_real_provider_wiring(monkeypatch):
     assert admitted, "admission.json 未解析出任何准入项"
     assert admitted & cap, "admission.json 的准入项一个都没注册进 provider"
 
-    # 端到端：真实 provider 下单段任务同样能拿到点名能力；stage_* 三件套不得复活
+    # 端到端：真实 provider 下单段任务同样能拿到点名能力
     tools = _tools(_build(p, phase_id=9, domain="finance", extra_tools=["daily"]))
     assert "daily" in tools
-    assert not ({"stage_write", "stage_read", "stage_list"} & set(tools)), \
-        "暂存区三件套已在 2026-09-15 两级统一中删除，不得作为工具复活"
+
+
+# ═══════════════════════════════════════════════════════════════

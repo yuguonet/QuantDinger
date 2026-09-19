@@ -125,15 +125,8 @@ class StrategyBase:
         raise NotImplementedError
 
     # ---- 三决策 (入参 row = qd_dragon_signals 持仓行 dict; snap = 当日快照可选) ----
-    def entry_decision(self, row, snap=None, **params) -> EntryDecision:
-        raise NotImplementedError
-
-    def confirm_decision(self, row, snap=None, **params) -> ConfirmDecision:
-        raise NotImplementedError
-
-    def exit_decision(self, row, snap=None, **params) -> ExitDecision:
-        """snap=None: 盘中实时模式; snap=日K重放模式 (回测/盘后复盘复用同一路径)。"""
-        raise NotImplementedError
+    # 2026-09-18 P1: entry/confirm/exit 均有智能默认实现 (见类尾), 按需覆盖;
+    # 仅 scan_signals 保持抽象必填。
 
     # ---- 回测钩子 (2026-09-10 插件化: 新策略实现本钩子即入回测流水线, backtest.py 零改动) ----
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
@@ -202,5 +195,174 @@ class StrategyBase:
         return (extra.get("confirm_chg") or 0,)
 
     def initial_stop(self, code, entry_price):
-        """入场止损价 (update_stop_price 落库)。默认 -8% (板块不分档)。"""
-        return round(entry_price * (1 - 8.0 / 100), 3)
+        """入场止损价 (update_stop_price 落库)。默认取 params.stop (-8%, 板块不分档)。"""
+        stop = self.merged_params(None).get("stop", -8.0)
+        return round(entry_price * (1 + float(stop) / 100), 3)
+
+    # ================================================================
+    # 智能默认 (2026-09-18 P1): 新策略最小面 = key/name + scan_signals + 出场参数。
+    # 以下全部可覆盖; 存量策略均已 override, 默认实现对其零影响。
+    # 默认消费的 params 键 (config.json params 可覆盖):
+    #   stop=-8.0 出场止损% / trail=-4.0 追踪止损%(自入场日峰值, held>1) / hold=7 到期天
+    #   min_gap_main=-8.0 max_gap_main=11.0 主板竞价 gap 带上/下限 (回测 D1 口径)
+    #   min_gap_gem=-10.0 max_gap_gem=20.5 创业板/科创板 gap 带
+    # ================================================================
+    def entry_decision(self, row, snap=None, **params):
+        """通用默认: D1 竞价 gap 带判定 (gap=(open/prev_close-1)*100)。
+
+        prev_close 取快照 previousClose 兜底 signal_price; 板块分主/创带。
+        策略有特殊竞价规则时覆盖 (如 v1 的主板高开 3~5% 回避带——可用参数复现)。
+        """
+        from app.market_cn.auto.common.market import get_board_type
+        p = self.merged_params(params or None)
+        if not snap:
+            return EntryDecision(False, "无竞价快照")
+        open_px = float(snap.get("open") or snap.get("last") or 0)
+        if open_px <= 0:
+            return EntryDecision(False, "开盘价缺失")
+        prev_close = float(snap.get("previousClose") or row.get("signal_price") or 0)
+        if prev_close <= 0:
+            return EntryDecision(False, "昨收缺失")
+        gap = (open_px / prev_close - 1) * 100
+        if get_board_type(row.get("code", "")) == "gem_star":
+            ok = p.get("min_gap_gem", -10.0) <= gap < p.get("max_gap_gem", 20.5)
+        else:
+            ok = (p.get("min_gap_main", -8.0) <= gap
+                  and gap < p.get("max_gap_main", 11.0))
+        if ok:
+            return EntryDecision(True, f"gap={gap:.2f}% 可买")
+        return EntryDecision(False, f"gap={gap:.2f}% 越界")
+
+    def confirm_decision(self, row, snap=None, **params):
+        """通用默认: D1 收盘确认通过 (d1_chg 按 signal_price 基准)。
+
+        策略有特殊确认规则时覆盖 (如 v1 日内动量 / relay3 封板确认)。
+        返回 None = 无法判定 (无快照), monitor 不转移。
+        """
+        series = (snap or {}).get("series") if isinstance(snap, dict) else None
+        if not series:
+            return None
+        last = float((series[-1] or {}).get("last") or 0)
+        base = float(row.get("signal_price") or 0)
+        d1_chg = (last / base - 1) * 100 if last > 0 and base > 0 else None
+        return ConfirmDecision(True, "ok",
+                               d1_chg=round(d1_chg, 2) if d1_chg is not None else None)
+
+    def exit_decision(self, row, snap=None, **params):
+        """通用默认: 收盘重放出场引擎 (止损 stop% / 追踪 trail% / 到期 hold 天)。
+
+        v1.exit_decision 的逐字通用化 (2026-09-18): snap={"mode":"day_close",
+        "bars":[...], "entry_idx":int}; live 盘中模式返回 hold (硬止损兜底在 monitor)。
+        策略有特殊出场 (如龙回头分段追踪 / relay3 尾盘未封板卖) 时覆盖。
+        """
+        p = self.merged_params(params or None)
+        stop = p.get("stop", -8.0)
+        trail = p.get("trail", -4.0)
+        hold = p.get("hold", 7)
+        if not isinstance(snap, dict) or snap.get("mode") != "day_close":
+            return ExitDecision("hold")
+        bars = snap.get("bars")
+        entry_idx = snap.get("entry_idx")
+        entry_price = float(row.get("entry_price") or 0)
+        if bars is None or entry_idx is None or entry_price <= 0:
+            return ExitDecision("hold")
+        today_idx = len(bars) - 1
+        held = today_idx - entry_idx + 1
+        peak = max(float(b["high"]) for b in bars[entry_idx:today_idx + 1])
+        last_bar = bars[-1]
+        if last_bar["low"] <= entry_price * (1 + stop / 100):
+            return ExitDecision("exit", reason=f"止损{stop}%",
+                                price=entry_price * (1 + stop / 100))
+        if held > 1 and last_bar["low"] <= peak * (1 + trail / 100):
+            return ExitDecision("exit", reason=f"追踪止损{trail}%",
+                                price=peak * (1 + trail / 100))
+        if held >= hold:
+            return ExitDecision("exit", reason=f"持仓到期{hold}天",
+                                price=float(last_bar["close"]))
+        return ExitDecision("hold")
+
+    # ================================================================
+    # 通用回测引擎 (2026-09-18 P2): 新策略零回测代码的默认 backtest_stock。
+    # 路径: as_of 枚举 → scan_signals → U1~U4 → D1 开盘买(gap带) →
+    #       exit_decision 收盘重放出场 (与实盘同一出场路径)。
+    # 口径说明:
+    #   - 出场填价=决策价 (收盘重放口径), 与 v1 回测专用引擎的"次日开盘"口径不同
+    #     —— 新策略无基线对数负担, 以实盘同路径为准;
+    #   - D1 gap 带用 params (min_gap_*/max_gap_*) — 若策略覆盖 entry_decision
+    #     改了竞价规则, 须同步 params 或自写 backtest_stock (引擎会告警);
+    #   - 持仓期内新信号跳过 (平仓次一日起可再入场);
+    #   - intraday_window 策略不适用 (返回 None, 走 run_all_intraday 时间线引擎)。
+    # ================================================================
+    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
+                       probe=None):
+        if self.scan_spec.kind != "daily_close":
+            return None
+        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.common.market import get_board_type
+        p = self.merged_params(None)
+        n = len(bars)
+        if n < 30:
+            return []
+        trades = []
+        last_exit_idx = -1
+        for i in range(25, n - 1):
+            if i <= last_exit_idx:          # 持仓去重
+                continue
+            sigs = self.scan_signals(bars[:i + 1], code, stock_info=stock_info)
+            if not sigs:
+                continue
+            sig = sigs[0]
+            if use_prefilter and self.use_unified_prefilter:
+                ok, _fails = unified_prefilter(bars, i, code, stock_info)
+                if not ok:
+                    continue
+            d0, d1 = bars[i], bars[i + 1]
+            entry_price = float(d1["open"] or 0)
+            if entry_price <= 0:
+                continue
+            entry_idx = i + 1
+            d1_gap = (entry_price / float(d0["close"]) - 1) * 100
+            d1_change = (float(d1["close"]) / float(d0["close"]) - 1) * 100
+            if get_board_type(code) == "gem_star":
+                if not (p.get("min_gap_gem", -10.0) <= d1_gap
+                        < p.get("max_gap_gem", 20.5)):
+                    continue
+            else:
+                if not (p.get("min_gap_main", -8.0) <= d1_gap
+                        < p.get("max_gap_main", 11.0)):
+                    continue
+            # 出场: exit_decision 收盘重放 (与实盘同一出场路径)
+            row0 = {"code": code, "entry_price": entry_price,
+                    "signal_price": float(d0["close"]), "extra": {}}
+            exit_idx = exit_price = None
+            exit_reason = ""
+            for j in range(entry_idx, n):
+                snap = {"mode": "day_close", "bars": bars[:j + 1],
+                        "entry_idx": entry_idx}
+                d = self.exit_decision(row0, snap=snap)
+                if d is not None and getattr(d, "action", "") == "exit":
+                    exit_idx = j
+                    exit_price = float(d.price or 0)
+                    exit_reason = d.reason
+                    break
+            if exit_idx is None:             # 数据结束未触发 → 末日收盘平仓
+                exit_idx, exit_price, exit_reason = n - 1, float(bars[n - 1]["close"]), "数据结束平仓"
+            if exit_price <= 0:
+                continue
+            last_exit_idx = exit_idx
+            peak = max(float(b["high"]) for b in bars[entry_idx:exit_idx + 1])
+            trades.append({
+                "code": code, "strategy": self.key, "path": self.key,
+                "d0_date": str(d0["time"])[:10], "d0_close": float(d0["close"]),
+                "score": int(sig.score), "label": sig.label,
+                "entry_date": str(d1["time"])[:10],
+                "entry_price": round(entry_price, 3), "buy_mode": "next_open",
+                "d1_change": round(d1_change, 2), "d1_gap": round(d1_gap, 2),
+                "exit_date": str(bars[exit_idx]["time"])[:10],
+                "exit_price": round(exit_price, 3),
+                "exit_day": exit_idx - entry_idx + 1,
+                "exit_reason": exit_reason,
+                "return_pct": round((exit_price / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
+            })
+        return trades
