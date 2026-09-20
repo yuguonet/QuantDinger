@@ -114,6 +114,9 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
     空数组，而同一时刻新浪的数据是好的 ⇒ 数据丢了却静默、无人察觉。
     现在东财挂掉不影响主结果。
 
+    Returns:
+        dict: {timestamp, industry:[...], concept:[...], analysis:{}}。板块列表在 hs['industry']/hs['concept']（list，勿用 hs['data']）。
+
     Args:
         industry_limit: 行业板块数量，默认15
         concept_limit: 概念板块数量，默认15

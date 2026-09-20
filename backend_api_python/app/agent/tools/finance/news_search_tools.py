@@ -104,6 +104,9 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
 def search_stock_intel(codes: str, name: str = "") -> dict:
     """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
+    Returns:
+        dict: {label, composite_score, direction, veto, count(新闻条数), news(list)}；多代码→{count(代码数), data:{代码:上述}}；error=失败。
+
     Args:
         codes: 多股用逗号分隔
         name: 股票名称，如 "贵州茅台"
@@ -144,6 +147,9 @@ def search_policy_intel(market: str = "CNStock") -> dict:
     return _build_result(items, f"政策:{market}")
 def search_comprehensive_intel(codes: str, name: str = "") -> dict:
     """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
+
+    Returns:
+        dict: {label, composite_score, direction, veto, count(新闻条数), news(list)}（个股新闻+政策缓存按标题去重合并）；多代码→{count(代码数), data:{代码:上述}}；error=失败。
 
     Args:
         codes: 多股用逗号分隔

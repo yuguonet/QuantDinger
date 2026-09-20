@@ -706,6 +706,9 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
 
     包含多指标共振检测、背离检测、均线收敛度、乖离率极值等高级信号。
 
+    Returns:
+        dict: {trend_score(0-100), trend, strength, all_signals(list), macd/rsi/kdj/boll 各为 dict}；多代码→{count, data:{代码:上述}}；error=失败。
+
     Args:
         codes: 多股用逗号分隔
     """
@@ -1542,6 +1545,9 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
 from app.agent.tools.finance.chip_distribution import get_chip_distribution  # noqa: F401
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
+
+    Returns:
+        dict: {stock_code, latest_close, ma5~ma120(视数据长度可能缺失), macd/rsi/boll/kdj 各为 dict, volume_ratio}；多代码→{count, data:{代码:上述}}；error=失败。
 
     Args:
         codes: 多股用逗号分隔

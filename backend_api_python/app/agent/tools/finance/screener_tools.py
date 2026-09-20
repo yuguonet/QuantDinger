@@ -460,7 +460,12 @@ def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
 
     return "; ".join(parts)
 def get_screener_presets() -> dict:
-    """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。"""
+    """选股条件列表：返回所有可用筛选条件的分类、字段名、示例值。
+
+    Returns:
+        dict: {categories, markets, tips}。categories 是嵌套 dict（分类→groups→条件名
+        列表），markets 为 list，无 error 键。
+    """
     return {
         "categories": {
             "基本面": {

@@ -265,9 +265,10 @@ def func_to_openai_schema(func: Callable) -> Dict[str, Any]:
 # 跳过的文件（框架文件，非工具）
 _SKIP_FILES = {
     "__init__", "base", "em_utils", "pagination",
-    # 基础设施模块（非工具，2026-09-12）：防内部函数泄漏进工具注册表
-    # （resilient_parse 的 apply/resilient_parse_code_blobs 曾被误注册）
-    "resilient_parse", "guided_executor", "breaker", "staging_tools",
+    # 基础设施模块（非工具，2026-09-12 曾在此名单防内部函数泄漏）。
+    # S9（2026-09-19）：resilient_parse / guided_executor / breaker / staging_tools 已迁至
+    # app/agent/infra/（不再位于 tools/ 扫描目录），此名单项已成死条目，一并删除；
+    # 若将来有框架模块回迁 tools/，按需补回。
     # mcp_bridge：独立 MCP server（供外部客户端连接），其 list_tools/list_categories/
     # mcp_search_tools 是 @mcp.tool() 装饰的 MCP 工具，仅供子进程 serve() 注册。
     # 若被本进程 ToolProvider 扫描，会把这些"同名但 _tool_catalog 为空（仅 serve() 时填充）"

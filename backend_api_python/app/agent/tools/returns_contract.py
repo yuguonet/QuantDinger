@@ -1,127 +1,204 @@
 # -*- coding: utf-8 -*-
 """
-返回结构契约速查表（Return-shape contracts）— 执行期提示词注入源。
+返回结构契约（Return-shape contracts）— 执行期提示词注入源（2026-09-20 改版）。
 
-背景（2026-09-17 根因修复）：
-  agent 的自定义提示词模板 prompts/code_agent.yaml 整体覆盖了 smolagents 默认模板，
-  默认模板里负责把工具签名/返回结构渲染进 system_prompt 的 {% for tool in tools %}
-  {{ tool.to_code_prompt() }} 块被我们删掉了（业务工具注册在 ToolProvider，不在
-  smolagents.tools，官方循环对我们只能看到 5 个内部工具）。planning 段的 {{tool_list}}
-  也只渲染 name(params) — desc[:80]，**不含返回结构**。
+作用：
+  把「每个工具的**真实返回结构**」拼进 CodeAgent 的 system_prompt，让模型取数后
+  直接按键访问，而不是「取数 → print → 看类型 → 下一步再引用」的 REPL 式试探
+  （6~11 步把 200K token 烧在类型探查上）。
 
-  后果：模型在 CodeAgent 沙箱里对每个业务工具的真实返回形态（dict 顶层键、list 在哪个
-  二级键、单/多代码返回结构差异）一无所知，只能靠"取数据→print→看类型→下一步再引用"
-  的 REPL 式试探，6~11 步把 200K token 烧在类型探查上。这是"变严重了"的真正根因。
+  唯一真源 = **工具函数自己的 docstring 里的 `Returns:` 段**（Google 风格）。
+  本模块只做**自动抽取**，不再维护任何平行契约表。
 
-修复：把所有沙箱业务工具的【真实返回结构】集中登记在此，由 task_agent._sandbox_instructions
-在构造执行 agent 时，针对本阶段点名的工具，把对应契约拼进 system_prompt（模型每一步都看得到）。
-这样模型无需再 print 探查类型，可直接 `hot_sectors['industry']`、`hsr['stocks']` 一步取全。
+为什么改版（2026-09-20 根因）：
+  旧版把契约集中登记在本文件的 `TOOL_RETURN_CONTRACTS` 大字典里（19 项）。
+  实测注册工具 120 个 ⇒ 契约覆盖率 16%，101 个盲区；且**平行表会腐烂**——
+  改工具返回结构时几乎没人记得回来改这张表，表里写的和代码里做的必然漂移。
+  用户裁定：契约应当写在**工具描述**里、由程序自动匹配，未声明的走标准兜底。
 
-契约写法规范（保持精炼，每行一个工具）：
-  - 说明返回值是 dict 还是 list；
-  - 指明**数据列表所在键**（最重要：stocks / sectors / data / concepts 等二级键）；
-  - 标注单/多参数返回结构不一致的高危工具（如 get_realtime_quote）；
-  - 标注取值前需 .get() 判空的键；
-  - 不超过 ~120 字符/工具，避免把 token 压力从执行转移到提示词。
+与 OpenAI / MCP 标准的关系（查证结论，勿再走弯路）：
+  · OpenAI Function Calling 的 tool 定义**没有返回结构字段**，只有
+    `name` / `description` / `parameters`(JSON Schema) / `strict`；Structured Outputs
+    约束的是**模型输出**，不是工具返回。⇒「把返回类型加进工具描述」正是官方口径内
+    唯一可用的位置，本项目的 `tools/base.func_to_openai_schema` 已把 `Returns:` 段内容
+    并入 schema 的 `description`（见该函数注释，2026-09-15 修复）。
+  · 描述工具返回结构的既有标准是 MCP 的 `outputSchema`(JSON Schema) + `structuredContent`；
+    本项目 `tools/mcp_bridge.py` 若将来要暴露工具给 MCP 客户端，可直接把同一个
+    `Returns:` 段映射成 `outputSchema` 描述，无需另写一份。
+
+易错点（改本文件前先读）：
+  1. 抽取依赖 `inspect.getdoc()` 的**去缩进**结果：段头在 0 列、段体有缩进。
+     故「段结束」判据 = **第一个 0 列非空行**（下一个段头，或段后的整段散文）。
+     不要改成「遇到空行就结束」——段内空行是允许的；也不要只认「像段头的行」——
+     本项目很多 docstring 在摘要后紧跟 0 列长注释，只认段头会把那段注释吞进契约
+     （2026-09-20 实测：4 条契约被污染并触发 200 字符截断）。
+  2. `Returns:` 段内容会被**折叠成单行**再拼进提示词（一工具一行，控 token）。
+     段落里不要写需要保留换行的结构化内容。
+  3. 未声明 `Returns:` 的工具**不是错误**：走 `_STANDARD_HANDLING` 标准兜底，
+     不要为凑覆盖率编造返回结构（编造比没有更坏——模型会照错的键去访问）。
+  4. 本模块只读 docstring，**不执行**任何工具，不在导入期做重活（导入期只编译正则）。
+  5. 本模块内**所有函数一律下划线开头**：`tools/` 目录下的公开函数会被
+     `ToolProvider._register_module_functions` 自动注册成**模型可调工具**。本模块是
+     提示词构建器、不是工具，公开命名会让 `get_return_contract` 这类内部函数出现在
+     模型工具表里（实测确实被注册过）。
+
+工具 docstring 写法约定（新增/修改工具时遵守）：
+  · `Returns:` 段放在**摘要段之后、长注释与 `Args:` 之前**。理由有三：
+    ① 摘要后紧接返回结构，读代码的人第一眼就看到"这东西吐什么"；
+    ② `func_to_openai_schema` 的 description 上限 1024 字符，放段尾会被长注释挤掉；
+    ③ 排在 `Args:` 之前，`_parse_docstring_params` 不会把返回结构里的 `键: 说明`
+       误当参数描述。
+  · 内容格式：`类型: {顶层键, ...}。数据列表在 xx['二级键']（list）。`
+    单/多参数返回结构不同的工具必须显式标注（如 get_realtime_quote）。
+  · 长度控制在 ~120 字符内：这段每步都会重发，token 压力会从执行转移到提示词。
+  · 成本实测（2026-09-20，`tmp/qclaw/audit_returns_contract_0920.py`）：典型阶段白名单
+    8 工具 → 速查段 ~1.5K 字符；finance 全域 56 工具 → ~6.0K 字符（受 `max_declared=40`
+    与单条 200 字符双重封顶）。**域模式此前完全不渲染**，这是本次新增的成本项，
+    后续调 `max_declared` / `_MAX_CONTRACT_CHARS` 请以该脚本实测为准。
 """
 from __future__ import annotations
 
-TOOL_RETURN_CONTRACTS: dict[str, str] = {
-    # ── 大盘/指数 ──
-    "get_market_overview": (
-        "dict: {up_count, down_count(两大指数抽样涨跌家数), emotion(0-100情绪), "
-        "main_net_yi(主力净流亿元), main_pct}。直接 ov['emotion'] / ov['main_net_yi']。"
-    ),
-    "get_market_fund_flow": (
-        "dict(全市场实时净流) 或 {error}。结构随底层接口，取前先 isinstance 判 error。"
-    ),
-    "get_hot_sectors": (
-        "dict: {timestamp, industry:[{code,name,change_pct,limit_up_count,leading_stock}], "
-        "concept:[同上], analysis:{}}。板块列表是 hs['industry']/['concept']（list），"
-        "勿用 .get('data')；取名字 hs['industry'][0]['name']。"
-    ),
-    "get_industry_ranking": (
-        "dict: {top:[{name,change_pct,leading_stock,...}], total}。行业列表在 top['top']（list）。"
-    ),
-    "get_sector_fund_flow": (
-        "dict: {indicator, count, sectors:[{name,change_pct,main_net,lead_stock,...}]}。"
-        "行业资金列表在 sf['sectors']（list）。"
-    ),
-    "get_concept_fund_flow": (
-        "dict: {indicator, count, concepts:[{name,change_pct,main_net,lead_stock,...}]}。"
-        "概念资金列表在 cf['concepts']（list，不是 'sectors'）。"
-    ),
-    "get_sector_prediction": (
-        "dict：预测走强板块（结构随底层，含板块名/强度）。取前先判 error；无统一键名，先 print(keys) 一次。"
-    ),
-    # ── 个股行情/资金 ──
-    "get_realtime_quote": (
-        "⚠单/多代码结构不同：单代码→扁平行情 dict{stock_code,last,changePercent,...}；"
-        "多代码→{count, data:{代码:行情dict}}，个股在 q['data'][code]。codes 必填非空。"
-    ),
-    "get_fund_flow": (
-        "dict: {count, data:{代码:{主力净流入,散户净流入,趋势,...}}}。个股明细在 ff['data'][code]；"
-        "某股失败其值为 {error}。codes 必填非空。"
-    ),
-    "get_capital_summary": (
-        "多代码→{count, data:{代码:{summary:{margin,block_trade,holders,dividend,financials,overall_signal}}}}；"
-        "overall_signal∈{中长线偏多/偏空/中性}。codes 必填。"
-    ),
-    # ── 热点/涨停/龙虎 ──
-    "get_hot_stocks_with_reason": (
-        "dict: {date, market_state, total, stocks:[{code,name,change_pct,reason}], hot_tags:[(题材,次数)]}。"
-        "候选在 hsr['stocks']（list）；每只字段是 code/name（不是 stock_code/stock_name！）；"
-        "market_state 可能为 closed_today；change_pct 盘前可能为 0。"
-    ),
-    "get_limit_pool": (
-        "dict: {date, zt:{count,stocks:[...]}, dt:{...}, broken:{...}}（按 pool_type）。"
-        "涨停股在 lp['zt']['stocks']（list）；无效类型或缺数据时对应键缺失，用 .get() 判空。"
-    ),
-    "get_dragon_tiger": (
-        "codes 空→{date,count,stocks:[...]}（全市场）；codes 非空→{stock_code,count,records:[...]}。"
-        "全市场列表在 dt['stocks']，个股记录在 dt['records']。"
-    ),
-    "get_hot_rank": (
-        "dict: {count, stocks:[{code,name,rank,hot_score,...}]}。人气股在 hr['stocks']（list）。"
-    ),
-    # ── 选股/概念/情报 ──
-    "search_stocks": (
-        "dict: {source, keyword, total, count, stocks:[{code,name,industry,price,pe,pb,...}]}。"
-        "结果在 ss['stocks'][i]['code']；query 与 filters 至少传一个，都空返回 error（勿传空 filters 当全部）。"
-    ),
-    "get_stock_concept_blocks": (
-        "多代码→{count, data:{代码:{stock_code,total,boards:[{name,code,change_pct,lead_stock}],concept_tags:[...]}}}。"
-        "概念在 cb['data'][code]['boards']。"
-    ),
-    "search_stock_intel": (
-        "单代码→{items:[{title,time,summary,url,...}], summary}；多代码→{count, data:{代码:上述}}。"
-        "新闻在 si['items']（单）或 si['data'][code]['items']（多）。"
-    ),
-    "resolve_stock": (
-        "单只→{code,name,market}；多只→{count, data:[{code,name,market}]}。失败→{error}。"
-    ),
-    "technical_analysis": (
-        "dict: {score(0-100), direction(bullish/bearish/neutral), confidence, signal, factors, analysis}。"
-        "综合评分在 ta['score']，方向 ta['direction']；单股深度分析用，codes 为单只代码。"
-    ),
-}
+import inspect
+import re
+from typing import Any, Callable, Iterable, Mapping
+
+# 段头识别：Google 风格 + 中文变体。`Returns:` / `返回:` / `Yields:` 均视作返回结构段。
+_RETURNS_HEADERS = frozenset({"returns", "return", "yields", "yield", "返回"})
+# 0 列且形如 `Xxx: 内容` 的行 → 段头（段体有缩进，不会命中）
+_SECTION_LINE_RE = re.compile(
+    r"^([A-Za-z\u4e00-\u9fff][A-Za-z0-9 _\-]{0,24})\s*[:：]\s*(.*)$")
 
 
-def get_return_contract(name: str) -> str | None:
-    """返回某个工具的真实返回结构契约；未登记返回 None。"""
-    return TOOL_RETURN_CONTRACTS.get(name)
+# 未声明返回结构的工具的标准处理口径（用户 2026-09-20 裁定："没描述的按标准处理"）。
+# 目标不是禁止探查，而是把探查**限制成一次**并强制在同块内完成取值。
+_STANDARD_HANDLING = (
+    "未声明返回结构：调用后先 `isinstance(x, dict)` 判形，"
+    "`list(x.keys())` **一次**确认键名（不要反复 print 试探），"
+    "再在**同一代码块内**完成取值；列表通常在某个二级键下，勿对顶层 dict 直接切片。"
+)
+
+# 单工具契约的字符上限。超长（多为带字段注释的多行结构）会被截断——这是**故意的**：
+# 本段每步重发，全量注册表按原样渲染要 8.7K 字符（≈4.4K token/步），会把"执行省下的
+# token"原样搬到提示词里。超长结构的完整内容模型可随时用
+# `print(tool_name.__doc__)` 就地读取（真 CPython 下这是一次普通调用，成本远低于每步重发）。
+_MAX_CONTRACT_CHARS = 200
+_TRUNCATED_HINT = " …（完整结构见 `print(<工具名>.__doc__)`）"
 
 
-def build_return_contract_block(names: set[str]) -> str:
-    """为本阶段点名的工具拼出返回结构速查段（仅含已登记的）。"""
-    lines = [name for name in sorted(names) if name in TOOL_RETURN_CONTRACTS]
-    if not lines:
+
+def _resolve_doc_target(tool: Any) -> Callable | None:
+    """把「函数 / smolagents Tool 实例 / 类」统一解析到**承载 docstring 的可调用对象**。
+
+    smolagents 的 `Tool` 实例把 docstring 写在 `forward()` 上（类本身通常只有说明），
+    故实例优先取 `forward`；取不到再退回实例/类自身。
+    """
+    if tool is None:
+        return None
+    forward = getattr(tool, "forward", None)
+    if callable(forward) and getattr(forward, "__doc__", None):
+        return forward
+    if callable(tool):
+        return tool
+    return None
+
+
+def _extract_returns_section(tool: Any) -> str | None:
+    """从工具 docstring 抽 `Returns:` 段，折叠成单行（超长按 `_MAX_CONTRACT_CHARS` 截断）。"""
+    target = _resolve_doc_target(tool)
+    if target is None:
+        return None
+    try:
+        doc = inspect.getdoc(target) or ""
+    except Exception:
+        return None
+    if not doc:
+        return None
+
+    body: list[str] = []
+    in_returns = False
+    for line in doc.split("\n"):
+        if in_returns:
+            if not line.strip():
+                continue                           # 段内空行：跳过，不结束段
+            if not line[0].isspace():
+                break                              # **0 列非空行 = 段结束**
+            body.append(line.strip())
+            continue
+        # 找段头：只认 0 列（`getdoc` 去缩进后，段头在 0 列、段体有缩进）
+        if line[:1].isspace() or not line.strip():
+            continue
+        m = _SECTION_LINE_RE.match(line)
+        if not m:
+            continue
+        if m.group(1).strip().lower() in _RETURNS_HEADERS:
+            in_returns = True
+            inline = m.group(2).strip()            # 支持 `Returns: dict: {...}` 同行写法
+            if inline:
+                body.append(inline)
+    if not body:
+        return None
+    text = " ".join(body)
+    if len(text) > _MAX_CONTRACT_CHARS:
+        text = text[:_MAX_CONTRACT_CHARS].rstrip() + _TRUNCATED_HINT
+    return text
+
+
+def _get_return_contract(tool: Any) -> str | None:
+    """取单个工具的返回结构契约（自动抽取）；未声明返回 None。
+
+    Args:
+        tool: 工具函数对象 / smolagents Tool 实例；传**工具名**（str）无法解析 docstring，
+            恒返回 None —— 按名字取请改用 `_build_return_contract_block` 并传函数表。
+    """
+    if isinstance(tool, str):
+        return None
+    return _extract_returns_section(tool)
+
+
+def _build_return_contract_block(tools: Mapping[str, Any] | Iterable[str],
+                                 max_declared: int = 40) -> str:
+    """拼出「工具返回结构速查」段（供 task_agent 注入 CodeAgent system_prompt）。
+
+    Args:
+        tools: **本阶段实际注入的工具表** `{name: 函数/Tool实例}`（首选，能读到 docstring）；
+            也兼容只给名字的可迭代对象（此时全部落到标准兜底，仅用于兼容旧调用）。
+        max_declared: 已声明契约的工具数上限（防某阶段工具极多时提示词膨胀）。
+
+    Returns:
+        提示词段落；本阶段无工具时返回 ""。
+    """
+    if not tools:
         return ""
-    out = [
-        "【工具返回结构速查 — 取数后直接按键访问，勿再逐个 print 探查类型】",
-    ]
-    for name in lines:
-        out.append(f"- {name}() -> {TOOL_RETURN_CONTRACTS[name]}")
+    if isinstance(tools, Mapping):
+        items = [(str(k), v) for k, v in tools.items()]
+    else:
+        items = [(str(k), None) for k in tools]
+
+    declared: list[tuple[str, str]] = []
+    undeclared: list[str] = []
+    for name, fn in items:
+        contract = _extract_returns_section(fn)
+        if contract:
+            declared.append((name, contract))
+        else:
+            undeclared.append(name)
+
+    if not declared and not undeclared:
+        return ""
+    declared.sort(key=lambda kv: kv[0])
+    undeclared.sort()
+
+    out = ["【工具返回结构速查 — 取数后直接按键访问，勿再逐个 print 探查类型】"]
+    if declared:
+        for name, contract in declared[:max_declared]:
+            out.append(f"- {name}() -> {contract}")
+        if len(declared) > max_declared:
+            rest = ", ".join(n for n, _ in declared[max_declared:])
+            out.append(f"- （其余已声明工具：{rest}）")
+    if undeclared:
+        out.append("【未声明返回结构的工具 — 按标准处理】")
+        out.append(f"- {', '.join(undeclared)}")
+        out.append(f"  {_STANDARD_HANDLING}")
     out.append(
         "（凡返回含 error 键或 market_state='closed_today' 的工具，先判空/判 error 再使用；"
         "列表型结果一律通过上面标注的二级键访问，不要对顶层 dict 直接切片/迭代）"

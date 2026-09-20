@@ -38,6 +38,9 @@ def get_fund_flow(codes: str = "") -> dict:
 def get_sector_fund_flow(indicator: str = "今日") -> dict:
     """行业资金流向：返回各行业板块主力资金净流入排名。
 
+    Returns:
+        dict: {indicator, count, sectors:[{name,change_pct,main_net,...}]}。行业列表在 sf['sectors']（list）；异常含 error。
+
     Args:
         indicator: 时间维度，可选 "今日" "5日" "10日"
     """
@@ -51,6 +54,9 @@ def get_sector_fund_flow(indicator: str = "今日") -> dict:
 def get_concept_fund_flow(indicator: str = "今日") -> dict:
     """概念资金流向：返回各概念板块主力资金净流入排名。
 
+    Returns:
+        dict: {indicator, count, concepts:[{name,change_pct,main_net,...}]}。概念列表在 cf['concepts']（list，非 'sectors'）。
+
     Args:
         indicator: 时间维度，可选 "今日" "5日" "10日"
     """
@@ -63,6 +69,9 @@ def get_concept_fund_flow(indicator: str = "今日") -> dict:
         return {"error": str(e)}
 def get_fund_flow_daily(codes: str, days: int = 120) -> dict:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
+
+    Returns:
+        dict: 单股→{code,total_days,recent_20d_main_net,data:[...]}；多股→{count,data:{代码:{同左}}}。日线列表在 data（list）；失败 {code,error}。
 
     Args:
         codes: 多股用逗号分隔
@@ -82,7 +91,11 @@ def get_fund_flow_daily(codes: str, days: int = 120) -> dict:
 
     return _batch_execute(_one, code_list)
 def get_market_fund_flow() -> dict:
-    """大盘资金流向：返回全市场主力/散户实时净流入金额。"""
+    """大盘资金流向：返回全市场主力/散户实时净流入金额。
+
+    Returns:
+        dict: {source,timestamp,main_net,main_pct,in_net,out_net,data}。main_net 元；data 明细 list；sectors_count/points 或缺；异常含 error。
+    """
     from app.market_cn.index import get_market_fund_flow_realtime as _get
     try:
         return _get()

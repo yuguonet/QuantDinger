@@ -5,7 +5,7 @@
 smolagents 原生 state 跨实例存活。本模块在进程内用 `_OBJ`（scope -> {name: 原对象}）
 承接被促升的会话级变量，供新建 executor 时投影回其 state，实现跨阶段续承。
 
-机制（与 GuidedPythonExecutor._promote_model_vars、task_agent 投影段配合）：
+机制（与 GuidedCPythonExecutor._promote_model_vars、task_agent 投影段配合）：
   · 写入：阶段结果注册 / 模型变量促升时调 stage_put_obj，存**原对象**（跳过序列化往返）
   · 读出：新建 executor 前用 stage_scope_vars(scope) 取出全部变量，send_variables 装回 state
   · 清理：一次 run 结束由 finalize 调 stage_clear(scope)，防长跑内存增长

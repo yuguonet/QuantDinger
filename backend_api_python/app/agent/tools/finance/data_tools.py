@@ -16,7 +16,12 @@ from app.agent.utils.md_format import _batch_execute, _to_md
 # ── 指数行情 / 市场概览 ──────────────────────────────────────
 
 def get_market_indices() -> dict:
-    """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。"""
+    """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。
+
+    Returns:
+        {"count": N, "indices": [{code, name, price, change_percent, ...}]} —— dict，
+        指数列表在二级键 indices（list）；失败 → {"error": ...}
+    """
     from app.market_cn.index import get_index_realtime as _get
     try:
         data = _get()
@@ -36,6 +41,10 @@ def get_market_overview() -> dict:
 
     注意字段语义：up_count/down_count 是**两大指数（上证/深成）的涨跌抽样**，
     不是全市场涨跌家数——全市场维度请用 get_market_indices 自行汇总。
+
+    Returns:
+        dict: {up_count, down_count(两大指数抽样涨跌家数), emotion(0-100情绪),
+        main_net_yi(主力净流亿元), main_pct}。单源失败则该键缺失，无 error 键
     """
     result = {}
 
@@ -152,6 +161,10 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[s
 
     ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
 
+    Returns:
+        单代码 → [{t,o,h,l,c,v}, ...]（顶层直接是 list）；多代码 →
+        {"count": N, "data": {代码: [K线dict]}}；失败 → {"error": ...}
+
     Args:
         codes: 多股用逗号分隔
         timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认1D
@@ -227,6 +240,10 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
     默认返回核心字段：名称、行业、价格、PE/PB、市值、ROE、EPS、股本等。
     数据量小，Agent 直接评估更靠谱，不出评分。
     如需完整财务数据（利润表/资产负债表/现金流/股东/杜邦），设置 detail=true。
+
+    Returns:
+        单代码 → 扁平 dict（核心字段 name/price/pe_ratio/mcap_yi 等，detail=true 时50+字段）；
+        多代码 → {"count": N, "data": {代码: dict}}；失败 → {"error": ...}
 
     Args:
         codes: 多股用逗号分隔
@@ -468,6 +485,10 @@ def _tencent_quote_raw(codes: list) -> dict:
 def get_order_book(codes: str) -> dict:
     """五档盘口：返回买卖各5档价格和挂单量、涨跌幅、换手率、PE、市值等。
 
+    Returns:
+        单代码 → {code, name, price, change_percent, bid, ask}，五档在 bid/ask；
+        多代码 → {"count": N, "data": {代码: dict}}；失败 → {"error"}
+
     Args:
         codes: 多股用逗号分隔
     """
@@ -533,6 +554,10 @@ def get_index_etf_quote(codes: str) -> dict:
 
 def batch_valuation_compare(codes: str) -> dict:
     """估值对比：返回多只股票的PE/PB/市值/营收并排对比表。
+
+    Returns:
+        {"total": N, "stocks": [{code, name, price, pe_ttm, pb, mcap_yi, ...}]，
+        "pe_sorted": [按PE升序的 code]}；失败 → {"error": ...}
 
     Args:
         codes: 逗号分隔的股票代码，如 "600519,000858,688017"
@@ -778,6 +803,10 @@ def get_capital_summary(codes: str) -> dict:
 
     一次调用聚合融资融券、大宗交易、股东户数、分红送转、财报三表五大维度数据，
     并生成结构化摘要供中长线持仓决策参考。
+
+    Returns:
+        单代码 → {"summary": {margin, block_trade, holders, dividend, financials,
+        overall_signal(中长线偏多/偏空/中性)}}；多代码 → {"count": N, "data": {代码: 同上}}
 
     Args:
         codes: 多股用逗号分隔

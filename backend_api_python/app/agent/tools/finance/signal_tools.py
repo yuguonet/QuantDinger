@@ -135,6 +135,9 @@ def get_hot_stocks_with_reason(date: str = "") -> dict:
 def get_stock_concept_blocks(codes: str) -> dict:
     """个股概念归属：返回股票所属的行业板块和概念板块列表。
 
+    Returns:
+        dict: 单股→{stock_code,total,boards:[{name,code,change_pct,lead_stock}]}；多股→{count,data:{代码:同左}}。板块列表在 boards；失败含 error。
+
     Args:
         codes: 多股用逗号分隔
     """
@@ -246,6 +249,9 @@ def get_industry_ranking(top_n: int = 20) -> dict:
     """行业涨跌幅排名：返回当日各行业板块涨跌幅、领涨股、成交额排名。
 
     数据源：market_cn.hot_sectors（东财 + 新浪双源）
+
+    Returns:
+        dict: {top:[{name,code,change_pct,lead_stock,limit_up_count,...}], total}。行业列表在 r['top']（list）；异常含 error。
 
     Args:
         top_n: 返回前N个行业，默认20

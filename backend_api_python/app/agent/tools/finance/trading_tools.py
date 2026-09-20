@@ -27,7 +27,9 @@ except ImportError as _e:
 def list_strategies(user_id: int = 1) -> dict:
     """策略列表：返回用户所有策略的ID、名称、类型、运行状态、市场。
 
-    返回策略 ID、名称、类型、状态、交易对、时间框架等信息。
+    Returns:
+        dict: {strategies, count, error}。策略列表在 result['strategies']（list），
+        每项含 id/name/status；依赖缺失或异常时 strategies 为空且含 error。
 
     Args:
         user_id: 用户 ID，默认 1
@@ -60,7 +62,9 @@ def list_strategies(user_id: int = 1) -> dict:
 def get_strategy_detail(strategy_id: int, user_id: int = 1) -> dict:
     """策略详情：返回指定策略的参数配置、持仓、触发条件。
 
-    包含策略类型、交易配置、指标配置、运行状态等。
+    Returns:
+        dict: {success, strategy, error}。策略字段在 result['strategy']（dict，已剔除
+        密钥），失败时 success=False 且只有 error。
 
     Args:
         strategy_id: 策略 ID
@@ -172,6 +176,10 @@ def get_strategy_trades(
     limit: int = 20,
 ) -> dict:
     """策略交易记录：返回指定策略最近的买入/卖出记录。
+
+    Returns:
+        dict: {trades, count, error}。交易记录在 result['trades']（list），每项含
+        type/price/amount/profit；查询异常时 trades 为空且含 error。
 
     Args:
         strategy_id: 策略 ID

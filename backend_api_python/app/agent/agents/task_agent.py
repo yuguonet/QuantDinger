@@ -47,7 +47,7 @@ from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 # ═══════════════════════════════════════════════════════════════
 from infra.resilient_parse import apply as _apply_resilient_parse, resilient_parse_code_blobs
 from infra.breaker import ToolCircuitBreaker
-from infra.guided_executor import GuidedPythonExecutor
+from infra.guided_executor import GuidedCPythonExecutor
 from infra.staging import stage_scope_vars
 
 # 使用 app.agent logger（与 log.py 配置一致，确保日志写入文件）
@@ -113,81 +113,57 @@ CAP_PLAN_LIST_LIMIT = (int(_CAP_PLAN_LIST_LIMIT_ENV)
                        if _CAP_PLAN_LIST_LIMIT_ENV.isdigit() else 30)
 
 
-def _sandbox_help(obj=None):
-    """沙箱版 help：只返回文档文本，不进交互模式（防 stdin 阻塞）。"""
-    try:
-        import pydoc
-        if obj is None:
-            return "（沙箱不提供交互式帮助；传入对象可查看其文档，如 help(str)）"
-        return pydoc.render_doc(obj)[:3000]
-    except Exception as e:
-        return f"help 不可用: {e}"
+# 沙箱安全内置补全（2026-09-12）已随执行器更换整段删除（2026-09-20）：
+# 原 `_SANDBOX_EXTRA_BUILTINS`（repr/format/hash/dir/super…21 个）是为补 smolagents
+# BASE_PYTHON_TOOLS 只有 52 个内置而加的。真 CPython 执行器下这些内置**本就存在**，
+# 补全表与 `_sandbox_help` 一并作废（help 的防 stdin 阻塞覆盖已内移到执行器）。
 
-
-# 沙箱安全内置补全（2026-09-12）：smolagents BASE_PYTHON_TOOLS 仅 52 个名字，模型
-# 常用内置（repr/format/hash/hex/oct/bin/help…）全部缺失 → 每次调用触发
-# "Forbidden function evaluation" → 被误报为"[幻觉调用拦截]"（run6/run7 实证：
-# repr/help 连环拦截烧步数）。以下均为无 I/O、无动态求值的纯内置，统一放行；
-# 有害内置（open/eval/exec/compile/input/globals/locals/__import__ 等）继续拦截。
-_SANDBOX_EXTRA_BUILTINS = {
-    "repr": repr, "format": format, "hash": hash, "id": id,
-    "hex": hex, "oct": oct, "bin": bin, "ascii": ascii,
-    "bytes": bytes, "bytearray": bytearray, "frozenset": frozenset,
-    "slice": slice, "memoryview": memoryview, "dir": dir,
-    "help": _sandbox_help, "object": object, "super": super,
-    "property": property, "classmethod": classmethod, "staticmethod": staticmethod,
-    "delattr": delattr,
-}
-
-# ── 沙箱 import 边界（2026-09-14 决策）──────────────────────────────────────
-# 已**直接去掉 import 白名单**：executor 传 additional_authorized_imports=["*"]，
-# 所有 import 放行（os/shutil/socket/sqlite3 等均可）。
-# 破坏性操作**不做拦截**（2026-09-18）：原 GuidedPythonExecutor 的 _scan_dangerous()
-# + _approve() 审批层从未接线，已连同 DANGEROUS_IMPORTS 删除。
-# 原 SANDBOX_AUTHORIZED_IMPORTS / SANDBOX_KNOWN_UNAVAILABLE 两个常量已删除（死代码）。
+# ── 执行环境：真 CPython（2026-09-20 路线 C）────────────────────────────────
+# 原 smolagents `LocalPythonExecutor` 是自实现的 AST 解释器，与 CPython 语义系统性偏差
+# （vararg/kwonly/posonly 绑参错、仅 52 个内置、dunder 默认禁、错误行号指到调用点）。
+# 其"安全职能"已全部作废：import 白名单 2026-09-14 删除，破坏性操作审批 2026-09-18 删除
+# ⇒ 只剩误伤。现改用 `infra/guided_executor.GuidedCPythonExecutor`（真 exec，官方
+# `executor=` 扩展点），全量真内置按 CPython 语义可用。
+# 真隔离需求请走官方 `executor_type="e2b"/"docker"/"modal"/"blaxel"`，不要再自建解释器。
 
 
 def _sandbox_instructions(tools: Any = None) -> str:
     """渲染执行环境说明段。
 
-    2026-09-14 决策：已去掉 import 白名单（executor 传 additional_authorized_imports=["*"]），
-    故本段**不再列举白/黑名单**（那段每步重发是上下文膨胀来源，实测多轮后 4 万 token）。
-    仅保留实测有效的防坑提示：① 沙箱只演示、完整源码在最终答复一次性给出；
-    ② break/continue 不能放进 try/except（本沙箱用异常实现循环控制）。
+    2026-09-14 决策：已去掉 import 白名单，故本段**不再列举白/黑名单**
+    （那段每步重发是上下文膨胀来源，实测多轮后 4 万 token）。
+    2026-09-20：执行器换成真 CPython 后，原"break/continue 不能放进 try/except"
+    提示已删除——那是旧解释器用 BreakException 实现循环控制的产物，CPython 下**是错的**
+    （教错比不教更糟）。
 
     2026-09-17 修复（根因）：模型对业务工具的真实返回形态（dict 顶层键、list 在哪个
     二级键、单/多参数返回结构差异）一无所知，只能靠 print 探查类型 → REPL 式多步、
-    200K token 烧在类型试探。故在此把本阶段点名工具的【返回结构速查】拼进 system_prompt，
-    模型每一步都看得到，无需再探查。来源：tools/returns_contract.TOOL_RETURN_CONTRACTS。
+    200K token 烧在类型试探。故在此把本阶段工具的【返回结构速查】拼进 system_prompt，
+    模型每一步都看得到，无需再探查。
+    2026-09-20 改版：契约真源改为**工具 docstring 的 `Returns:` 段**，由
+    tools/returns_contract.py 自动抽取（旧的集中式平行表已删——120 个注册工具只有 19 个
+    登记，且表与代码必然漂移）。因此本函数现在应当收到**本阶段实际注入的工具表**
+    （`{name: 函数/Tool实例}`，即 `tool_functions`），而不是 planner 声明的名字列表：
+    只有拿到函数对象才读得到 docstring。未声明 `Returns:` 的工具走标准兜底口径。
     """
     base = (
-        # 2026-09-14：沙箱已去掉（import 全放行），不再列白/黑名单——那段每步重发，
-        # 是上下文膨胀的来源之一。仅保留实测有效的防坑提示。
-        "【执行环境】Python 标准库与已安装的第三方库均可 import（无白名单限制）。\n"
+        "【执行环境】真 CPython：Python 标准库与已安装的第三方库均可 import（无白名单限制），"
+        "内置函数（print/len/dir/type/eval/…）与语言语义（含 break/continue、异常、闭包、装饰器）"
+        "与本地 Python 完全一致。\n"
         "沙箱内只做演示：有限次循环 + print 输出要点；完整源码在最终答复里一次性给出，"
         "不要在沙箱内重复打印整份源码。\n"
-        "【工具返回值】工具**直接返回数据本身**：赋给变量即可复用（如 quotes = get_daily(...)），"
+        "【工具返回值】工具**直接返回数据本身**：赋给变量即可复用（如 k = agent_get_kline(...)），"
         "该变量在本阶段后续步骤始终可用，并会自动续承到下一阶段（跨阶段无需任何读写调用）。"
-        "结果另有一份兜底登记在 `_r_<工具名>`（如 _r_get_daily），没赋值时也能按名取回。"
+        "结果另有一份兜底登记在 `_r_<工具名>`（如 _r_agent_get_kline），没赋值时也能按名取回。"
         "**不要把裸调用 tool() 放在代码最后一行**——那样返回值会整份进观测、撑爆上下文；"
         "要查看就打印提炼后的关键字段。\n"
-        "2026-09-14 实测：`break`/`continue` **不能放在 `try/except Exception` 里面**——"
-        "本沙箱用异常实现循环控制（BreakException 继承 Exception），会被你的 except 捕获 "
-        "⇒ 循环无法终止、同一逻辑反复执行。需要中途退出时，把 break 放在 try 块之外，"
-        "或改用函数返回值/标志位控制。\n"
     )
-    # 2026-09-17：返回结构速查（仅本阶段点名工具）。这是压住 REPL 式类型探查的关键。
+    # 2026-09-17：返回结构速查（本阶段实际注入的工具）。这是压住 REPL 式类型探查的关键。
     contract_block = ""
     try:
-        from app.agent.tools.returns_contract import build_return_contract_block
-        names: set = set()
+        from app.agent.tools.returns_contract import _build_return_contract_block
         if tools:
-            if isinstance(tools, (list, tuple, set)):
-                names = set(str(t) for t in tools)
-            elif isinstance(tools, dict):
-                names = set(str(t) for t in tools.keys())
-        if names:
-            contract_block = build_return_contract_block(names)
+            contract_block = _build_return_contract_block(tools)
     except Exception as _ce:
         logger.debug("[TaskAgent] 返回结构速查拼装跳过: %s", _ce)
     if contract_block:
@@ -197,17 +173,17 @@ def _sandbox_instructions(tools: Any = None) -> str:
 
 # ── 两级全局变量：**统一实现**（2026-09-15 用户定调）────────────────────────
 # 两级共用**同一个投递方式**——`executor.state` 里的 Python 变量：
-#   2 级（本阶段内跨 step）= smolagents 原生 executor.state。
-#      LocalPythonExecutor.__call__ 每次传的都是同一个 self.state（1747-1752 行），
+#   2 级（本阶段内跨 step）= 执行器原生 state。
+#      `GuidedCPythonExecutor.__call__` 每次的 globals 就是同一个 self.state，
 #      故 step N 赋的变量 step N+1 仍在；executor 随阶段重建而消亡，无需清理。
 #   1 级（跨 phase / 整个 run）= 同样是 state 变量，只是**是否被促升**的区别：
-#      · 促升：`GuidedPythonExecutor._promote_model_vars()` 每步执行后把模型命名的
+#      · 促升：`GuidedCPythonExecutor._promote_model_vars()` 每步执行后把模型命名的
 #        变量写入 `infra/staging.py` 的会话级存储（退化为框架内部实现，非模型 API）；
 #      · 投影：新建 executor 时（本文件下方）把该 scope 的变量装回 state。
 #
 # 统一后模型无需任何读写调用，只需记住一条：
 #   工具**直接返回数据本身** —— 想在本阶段后续步骤复用就赋值给自己的变量
-#   （`quotes = get_daily(...)`），该变量即跨阶段续承；工具结果另有一份兜底登记在
+#   （`k = agent_get_kline(...)`），该变量即跨阶段续承；工具结果另有一份兜底登记在
 #   `_r_<工具名>`（模型没赋值时也能按名取回）。
 #
 # 为什么要把 per-step 数据从 1 级桶里挪出来（旧实现 _wrap_stage_guard 写 run 作用域 _OBJ）：
@@ -431,6 +407,30 @@ def _normalize_plan_tools(raw, available_names: set) -> tuple:
         else:
             dropped.append(t)
     return tools, dropped
+
+
+def _salvage_tools_from_text(text: str, available_names: set) -> list:
+    """从 planner 的 task 正文回收其点名的真实工具名（2026-09-20，退化兜底）。
+
+    为什么需要（实证 ts=1789835139377，模型 deepseek-ai/DeepSeek-V4-Flash）：
+      结构化字段（selected_domain / tools / phases）是规划器的"点名通道"，但模型退化时
+      可能只吐 `task` 一个字段，把工具名写进正文菜单却不填机器可读的 tools → 执行层看到
+      的是"任务书承诺了工具、沙箱里没有"，调用即 Forbidden，被误报成"幻觉调用" → 空转
+      至 max steps。设计红线「planner 必须点名工具」在模型退化时缺兜底：点名只认结构化
+      字段，不认 planner 自己写进 task 的菜单。
+
+    保守性：只恢复 **provider 真实注册** 的名字（available_names 内），幻觉名不回收，
+    因此不会引入不可调用的名字；纯推理任务的正文不含数据工具名（如跑马灯 code 任务），
+    扫描为空 → 行为不变。词边界扫描避免 `get_fund_flow` 命中 `get_fund_flow_daily`。
+    """
+    if not text or not available_names:
+        return []
+    import re as _re
+    hits = []
+    for _n in sorted(available_names):
+        if _re.search(r"(?<![A-Za-z0-9_])" + _re.escape(_n) + r"(?![A-Za-z0-9_])", text):
+            hits.append(_n)
+    return hits
 
 
 def _capability_names(provider) -> list:
@@ -1204,9 +1204,9 @@ class TaskAgent(AgentBase):
         # 与 skill 权重同源同表（qd_agent_weights.layer='tool'），由 evaluator 盘后自动更新。
         try:
             from chain.store import get_tool_weights
+            from chain.skill_brewer import LOW_WEIGHT_THRESHOLD  # S5：阈值单一事实源
             _tw = get_tool_weights()
-            # [AUDIT-MASK:B3/E1|2026-09-19] 阈值 0.7 硬编码；与 skill_brewer.py 组装逻辑重复（统一清理抽 helper）
-            _low_tools = sorted(n for n, w in _tw.items() if w < 0.7)
+            _low_tools = sorted(n for n, w in _tw.items() if w < LOW_WEIGHT_THRESHOLD)
             if _low_tools:
                 tools_hint += ("\n\n【工具权重提示】以下工具近期参与链路胜率偏低（<0.7），"
                                "点名前请确认确有必要：" + ", ".join(_low_tools[:12]))
@@ -1242,13 +1242,14 @@ class TaskAgent(AgentBase):
             **llm_response_to_dict(response),
         })
 
-        text = (response.content or "").strip()
-        if "```" in text:
-            m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
-            if m:
-                text = m.group(1).strip()
-
-        plan = safe_parse_json(text, default={})
+        # 2026-09-20 修复（解析截断，与"模型退化"同症状的第二种根因）：调用侧不再做
+        # "首个 ``` 块"的非贪婪剥离。实测 plan_response 的 task 值内部自带 ```json 菜单块
+        # （raw 含 4 个围栏），非贪婪 `(.*?)` 会截到内层围栏处（1458 → 257 字符、无闭合
+        # 大括号）→ 解析失败 → plan={} → 域/工具/阶段三通道全空，与 planner 真退化
+        # （只吐 task 字段）的表象完全一致，极易误判成模型问题。
+        # 现保留原文交给 safe_parse_json（内部按括号平衡取顶层对象，跳过字符串内的围栏）。
+        plan_raw = (response.content or "").strip()
+        plan = safe_parse_json(plan_raw, default={})
 
         task = plan.get("task", "") or plan.get("expanded_query", "") or user_input
         # step_budget 钳制：LLM 输出不可信，范围 [1,20] + int 强转。
@@ -1318,6 +1319,41 @@ class TaskAgent(AgentBase):
         # 语义为"在 selected_domain 基调之上做并集"（不是白名单，见 _normalize_plan_tools）。
         # 与 phases 同时出现时以 phases 为准：不把顶层名单静默并进每个阶段（会放宽阶段工具面）。
         raw_plan_tools = plan.get("tools")
+        # ── planner 退化兜底（2026-09-20）：三通道全空时的工具面救援 ──
+        # 仅当 selected_domain / phases / tools 三个结构化通道**全空**时才触发，从 planner
+        # 的**原始输出**按 provider 真实注册名回收它自己写过的工具名（见 _salvage_tools_from_text）。
+        # 命中即并进附加点名通道，避免"planner 任务书写了 11 个工具、沙箱只有 2 个通用工具"
+        # 的裸沙箱（该形态下执行器按任务书调用全部被判幻觉，是 09-19 故障的直接机制）。
+        # 扫描对象是 plan_raw（LLM 原文）而非 task：解析失败时 task 会退化为 plan_input
+        # （用户输入+实体+意图），正文菜单只剩在原文里——扫 task 在本兜底的目标场景下必然落空
+        # （2026-09-20 实测：第 1 轮 plan_tools=[] 即此因）。
+        if not raw_plan_tools and not phases and not selected_domain:
+            try:
+                _salvaged = _salvage_tools_from_text(plan_raw, available_names)
+                if _salvaged:
+                    raw_plan_tools = _salvaged
+                    logger.warning(
+                        "[TaskAgent] planner 未产出结构化工具字段（域/阶段/tools 全空），"
+                        "从 planner 原文回收点名工具 %d 个: %s", len(_salvaged), _salvaged[:12])
+                    trace.record("plan_tools_salvaged", {"tools": _salvaged})
+            except Exception as _e:
+                logger.debug("[TaskAgent] planner 原文工具名回收跳过: %s", _e)
+
+        # 域通道兜底（2026-09-20，与 tools 回收互斥的第二道网）：task 正文里一个 provider
+        # 工具名都没提及（纯菜单蒸发）但意图是股票类任务（screen/analysis/compare/query）
+        # 时，回退到唯一可选域 finance —— 这是历史上 460+ 次 run 的主路径（planner 正常时
+        # 恒填 dom='finance'）。断言：域选择失效属退化，绝不能降成"只用 2 个通用工具"的
+        # 裸沙箱。刻意不含 code/explain（跑马灯等纯推理任务不该拉金融工具，否则白烧 token）。
+        if not raw_plan_tools and not phases and not selected_domain and not selected_skill:
+            _fb_verb = (getattr(src, "_plan_task_type", "") or "").strip().lower()
+            if _fb_verb in {"screen", "analysis", "compare", "query"} and available_names:
+                _avail_domains = set(self._tool_provider.get_domains()) if self._tool_provider else set()
+                if "finance" in _avail_domains:
+                    selected_domain = "finance"
+                    logger.warning(
+                        "[TaskAgent] planner 域字段缺失（task_type=%s）→ 兜底回退 domain='finance'"
+                        "（避免裸沙箱；若为误判请从 task 文本核对实体）", _fb_verb)
+                    trace.record("plan_domain_fallback", {"domain": "finance", "reason": _fb_verb})
         plan_tools, _pt_dropped = _normalize_plan_tools(raw_plan_tools, available_names)
         if _pt_dropped:
             logger.warning("[TaskAgent] 顶层 tools 丢弃不存在的工具名 %d 个: %s",
@@ -1600,26 +1636,22 @@ class TaskAgent(AgentBase):
 
         工具架构：
           - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]
-          - 领域工具 + 通用工具 → executor.custom_tools（通过 ToolProvider 注入）
-          - 技能工具 → executor.custom_tools
+          - 领域工具 + 通用工具 → executor 权威工具表（通过 ToolProvider 注入）
+          - 技能工具 → 同上（Tool 实例，真 exec 下按对象直接可调用）
           - phase 白名单（tools 非空）→ 只注入白名单内的 provider 工具
           - 附加点名（extra_tools，仅 tools 为空时）→ 并进 domain/common 基调
           - 全量工具 schema → planning YAML {{tool_list}}（供 smolagents 内部 planning 选工具）
 
-        注入沙箱必须在 tool_functions **最终确定之后**（2026-09-14，L16）：
+        注入必须在 tool_functions **最终确定之后**（2026-09-14，L16）：
         `_wrap_stage_guard` 与 breaker 包装都会**重新绑定**这个名字（是重新赋值，不是
-        原地改）。若在绑定前把旧 dict 交给 `executor.custom_tools`，executor 持有的就是
-        旧表 ⇒ 任务书写着这些工具、`list_tools()` 也列得出、日志也打印"已注入 N 个"，
-        **但沙箱里一个都调不到**，调用即被误报成"幻觉调用"。日志现同时打印
-        "沙箱实持 M 个"——N 与 M 不一致即注入错位。
-        更进一步（2026-09-14 二次复发后）：光修时机不够，还要修**路径**——业务工具走
-        `custom_tools` 是 smolagents 的**次路径**（主要为代码里 def 出来的函数服务），
-        官方主路径是 `send_tools → static_tools`，`evaluate_call` 也先查 static_tools。
-        现 `GuidedPythonExecutor` 在每次 `__call__` 前把 custom_tools 并入 static_tools，
-        **不再依赖任何注入时序**。凡"工具能否调到"的问题，一律以官方主路径为准。
+        原地改）。若在绑定前把旧 dict 交给 executor，executor 持有的就是旧表
+        ⇒ 任务书写着这些工具、`list_tools()` 也列得出、日志也打印"已注入 N 个"，
+        **但执行时一个都调不到**，调用即被误报成"幻觉调用"。日志现同时打印
+        "实持 M 个"——N 与 M 不一致即注入错位。
+        2026-09-20：执行器换真 CPython 后，"工具放哪个 dict 才生效"这类路径问题**整体消失**
+        ——`install_tools()` 登记权威表，`__call__` 前无条件装进命名空间，不依赖注入时序。
         """
         from smolagents import CodeAgent as SmolCodeAgent
-        from smolagents.local_python_executor import LocalPythonExecutor
         from smolagents.memory import ActionStep, PlanningStep
 
         # ── 工具函数：phase 白名单 / domain 过滤 + 附加点名 + 技能工具 ──
@@ -1689,7 +1721,7 @@ class TaskAgent(AgentBase):
         #   2 级 = 工具结果与本阶段内变量（含自动生成的 `_r_*`）；
         #   1 级 = 模型起过名、被促升后跨阶段续承的变量。
         # 跨阶段续承不再靠任何读写调用，而靠两个框架动作：
-        #   ① `GuidedPythonExecutor._promote_model_vars()` —— 每步执行后促升到会话级；
+        #   ① `GuidedCPythonExecutor._promote_model_vars()` —— 每步执行后促升到会话级；
         #   ② 下方投影 —— 新建 executor 时把会话级变量装回 state。
         # 存储层 `infra/staging.py` 仅作框架内部实现（会话级变量存储），不进模型工具面。
 
@@ -1698,24 +1730,13 @@ class TaskAgent(AgentBase):
             result = answer if answer is not None else kwargs
             raise FinalAnswerException(result)
 
-        # executor
-        # 幻觉调用纠正（2026-09-12）：执行器错误信息带可用工具清单与修复指令
-        # （Forbidden function evaluation → [幻觉调用拦截]+可用清单+二选一处理指引）
-        # allowed 名单延迟解析：__call__ 出错时从 static_tools 动态收集（构造期
-        # smol_tools 尚未定义——run5 教训）
-        executor_cls = GuidedPythonExecutor or LocalPythonExecutor
-        executor = executor_cls(
-            # 2026-09-14 用户决策：**直接去掉沙箱**，能力全开。
-            # smolagents 的 check_import_authorized 支持 "*" 通配符
-            # （local_python_executor.py:375），传 "*" 即放行所有 import，不再有白名单约束。
-            # 风险已向用户说明（web_search 提示注入 / LLM 误操作），用户明确接受。
-            # （2026-09-18：删除此处原 8 行「最小授权白名单」设计说明——它描述的是
-            #   已删除的 SANDBOX_AUTHORIZED_IMPORTS，与"能力全开"的现状自相矛盾。）
-            additional_authorized_imports=["*"],
+        # executor（2026-09-20 换真 CPython，官方 `executor=` 扩展点）
+        # 幻觉调用纠正：执行器把 NameError/AttributeError 改写成"可用工具清单 + 处理指引"。
+        # 工具名单延迟解析：__call__ 出错时从权威表/agent 工具动态收集（构造期 smol_tools
+        # 尚未定义——run5 教训）。
+        executor = GuidedCPythonExecutor(
             additional_functions={
             "final_answer": _final_answer,
-            # 内置补全（2026-09-12）：见 _SANDBOX_EXTRA_BUILTINS（repr/format/hash…）
-            **_SANDBOX_EXTRA_BUILTINS,
         },
             # 打印上限（2026-09-17 收紧）：smolagents 默认 50k 字符/步。
             # 砍到 1200：当前步 print 超阈值自动替成占位（smolagents 原生 truncate），
@@ -1789,6 +1810,12 @@ class TaskAgent(AgentBase):
         # （smolagents 原生，寿命=本阶段），返回变量名提示；不再按返回大小判定，
         # 也不再进 1 级 run 作用域全局区（那条通道仅供跨阶段交接）。
         # 技能工具是 Tool 实例而非纯函数，跳过包装（文档读取内容受控）。
+        #
+        # 【契约渲染必须在包装之前】(2026-09-20)：返回结构速查读的是工具**自身 docstring
+        # 的 `Returns:` 段**，而下方两种包装（_wrap_stage_guard / breaker）返回的都是
+        # 新闭包，**不保留 docstring** ⇒ 包装后再渲染会全部落进"未声明"兜底。故在此处
+        # （tool_functions 仍是 provider 原始函数 + 技能 Tool 实例）先渲染好整段文本。
+        _env_instructions = _sandbox_instructions(tool_functions)
         for _n in list(tool_functions.keys()):
             if not inspect.isfunction(tool_functions[_n]):
                 continue
@@ -1799,28 +1826,19 @@ class TaskAgent(AgentBase):
                 for name, fn in tool_functions.items()
             }
 
-        # ── 注入沙箱（必须在 tool_functions **最终确定之后**）──
-        # 上方 `_wrap_stage_guard` 与 breaker 包装都可能**重新绑定** tool_functions
-        # （1629 行是重新赋值而非原地改），若在绑定前把旧 dict 交给 executor，executor
-        # 持有的就是那张旧表 ⇒ 任务书写着这些工具、`list_tools()` 也列得出、日志也打印
-        # "已注入 N 个"，但沙箱里一个都调不到，调用即被误报成"幻觉调用"
+        # ── 注入工具（必须在 tool_functions **最终确定之后**）──
+        # 上方 `_wrap_stage_guard` 与 breaker 包装都可能**重新绑定** tool_functions，
+        # 若在绑定前把旧 dict 交给 executor，executor 持有的就是那张旧表 ⇒ 任务书写着
+        # 这些工具、`list_tools()` 也列得出、日志也打印"已注入 N 个"，但执行时一个都调不到
         # （2026-09-14 L16 事故：phase 白名单 6 个工具 + 暂存区三件套全部调不动，
         #   模型只能按提示改用纯 Python 硬算）。旧注入点在 executor 创建处，已移到这里。
-        # 统一注入：install_tools 内部同步 custom_tools / state / static_tools 三处。
-        # 阶段重试（复用 CodeAgent）会清空 custom_tools / state，只注入一次必然复发。
-        try:
-            executor.install_tools(tool_functions)
-        except Exception as e:
-            logger.warning("[TaskAgent] install_tools 不可用（回退直接赋值）: %s", e)
-            executor.custom_tools = tool_functions
-            try:
-                executor.send_variables(tool_functions)
-            except Exception:
-                pass
+        # install_tools 登记权威表，executor 每次 __call__ 前无条件重装——阶段重试
+        # （复用 CodeAgent）清空命名空间也不会复发。
+        executor.install_tools(tool_functions)
 
-        # 日志同时打印沙箱**实际持有**的数量——只打印 len(tool_functions) 会在上述
+        # 日志同时打印 executor **实际持有**的数量——只打印 len(tool_functions) 会在上述
         # 错位时给出误导数字（这是本次事故排查被带偏的直接原因）。
-        logger.info("[TaskAgent] executor 已注入 %d 个工具函数（沙箱实持 custom=%d state=%d）",
+        logger.info("[TaskAgent] executor 已注入 %d 个工具函数（实持 custom=%d state=%d）",
                     len(tool_functions),
                     len(getattr(executor, "custom_tools", {}) or {}),
                     len(getattr(executor, "state", {}) or {}))
@@ -2159,8 +2177,8 @@ class TaskAgent(AgentBase):
                     # （2026-09-14 CLI 实测「写跑马灯」：Step1 整块中断，Step2 几乎是同一份
                     #   代码、只换了捕获方式 → 若误判成"原地重写"，就会劝它放弃修复。）
                     prev_obs = getattr(prev, "observations", "") or ""
-                    # 2026-09-18：移除 "[import 拦截]" 匹配——该标记出自 GuidedPythonExecutor
-                    # 的 import 越界改写分支，分支已随沙箱删除而移除（永不命中）。
+                    # 2026-09-18：移除 "[import 拦截]" 匹配——该标记出自执行器的 import
+                    # 越界改写分支，分支已随沙箱删除而移除（永不命中）。
                     if ("Traceback" in prev_obs
                             or "Error:" in prev_obs or "Exception:" in prev_obs):
                         continue
@@ -2262,7 +2280,7 @@ class TaskAgent(AgentBase):
             ),
             final_answer_checks=[_check_final_answer],
             instructions=(
-                _sandbox_instructions(tools)
+                _env_instructions
                 + "\n【数据补充策略】\n"
                 "- 当关键工具返回 error 或数据为空时，使用 web_search 搜索最新信息补充\n"
                 "- web_search 搜索关键词示例：'{股票名称} {股票代码} 最新消息 分析'\n"

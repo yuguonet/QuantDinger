@@ -1142,9 +1142,13 @@ def _sandbox_state_digest(agent, whitelist=None, max_vars: int = 15) -> str:
     smolagents 1.26 数据生命周期：全部中间数据都在 executor.state ——
       变量名 → 工具返回原值（数据是否为空/N/A 一眼可辨）；
       _print_outputs → agent 打印过的内容；
-      _operations_count → 计算量（agent 是否真干活）。
+      _qd_stats → 代码块执行次数（agent 是否真干活）。
     摘要形态：每变量一行 `名 = 值预览`，值超过 120 字符截断；返回 None/空容器的
     变量标 ⚠。这是区分「规划错误 / 工具错误 / agent 偷懒」的关键证据。
+
+    注：`_qd_stats` 由 GuidedCPythonExecutor 写入（2026-09-20 换真 CPython 后，
+    旧自实现解释器的 `_operations_count` 随解释器一起消失，改记"代码块数"这一
+    同样诚实、且不依赖解释器内部的指标）。
     """
     try:
         ex = agent
@@ -1166,10 +1170,10 @@ def _sandbox_state_digest(agent, whitelist=None, max_vars: int = 15) -> str:
             lines.append(f"  {k} = {vs}" + ("  ⚠空/None" if empty else ""))
             if wl and k not in wl:
                 pass
-        ops = state.get("_operations_count") or {}
-        n_ops = ops.get("counter", "?") if isinstance(ops, dict) else "?"
+        stats = state.get("_qd_stats") or {}
+        n_blocks = stats.get("code_blocks", "?") if isinstance(stats, dict) else "?"
         prints = str(state.get("_print_outputs", "") or "").replace("\n", " ")[:200]
-        head = f"变量数={len(lines)}, 计算操作数={n_ops}, 打印输出预览: {prints or '(无)'}"
+        head = f"变量数={len(lines)}, 代码块数={n_blocks}, 打印输出预览: {prints or '(无)'}"
         return "\n".join([head] + lines[:max_vars])
     except Exception as e:
         logger.debug("[Execute] 沙箱实况摘要提取失败: %s", e)

@@ -260,24 +260,14 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
     logger.info("[Evaluator] 评估完成: %d 条已评估, %d 条失败",
                 stats["evaluated"], stats["errors"])
 
-    # 评估后自动更新权重
+    # 评估后自动更新权重（链式门控 · 第 1 级：evaluated>0 才进入下一步）。
+    # 末级 maybe_revise 已移入 update_weights() 末尾，按 "updated>0" 再门控一次
+    # （重设计 §2.6 / 模块边界 §11.1，2026-09-19 调整）。
     if stats["evaluated"] > 0:
         try:
             update_weights()
         except Exception as e:
             logger.warning("[Evaluator] 自动更新权重失败: %s", e)
-
-
-    # 迭代旁支调度（重设计 §2.6，2026-09-19）：权重打分完成后，把低于阈值的 auto_ 技能
-    # 交给修订器。护栏/队列在 skill_brewer 侧；本处只一行调度（模块边界 §11.1）。
-    try:
-        from chain.skill_brewer import maybe_revise
-        from chain.store import get_skill_weights as _gsw
-        _rev_results = maybe_revise(_gsw())
-        if any(r.get("status") == "revised" for r in _rev_results):
-            stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
-    except Exception as _re:
-        logger.warning("[Evaluator] 技能修订调度跳过: %s", _re)
 
     return stats
 # ═══════════════════════════════════════════════════════════════
@@ -586,6 +576,20 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 stats["synced"], stats["skill_updated"], stats["skill_cleaned"],
                 stats["tool_synced"], stats["tool_updated"], stats["tool_cleaned"],
                 stats["factor_updated"], stats["factor_cleaned"])
+    # 迭代旁支调度（重设计 §2.6，2026-09-19）：链式门控 · 第 2 级——仅当权重确有更新
+    # （skill/factor/tool 任一 *_updated>0）才把低于阈值的 auto_ 技能交给修订器。
+    # 护栏/队列全在 skill_brewer 侧；本处只一行调度（模块边界 §11.1）。
+    _updated = stats["skill_updated"] + stats["factor_updated"] + stats["tool_updated"]
+    if _updated > 0:
+        try:
+            from chain.skill_brewer import maybe_revise
+            from chain.store import get_skill_weights as _gsw
+            _rev_results = maybe_revise(_gsw())
+            if any(r.get("status") == "revised" for r in _rev_results):
+                stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
+        except Exception as _re:
+            logger.warning("[Evaluator] 技能修订调度跳过: %s", _re)
+
     return stats
 
 # ═══════════════════════════════════════════════════════════════

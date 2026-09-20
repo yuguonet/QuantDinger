@@ -43,10 +43,15 @@ def safe_parse_json(text: str, default: Any = None) -> Any:
         try:
             return json.loads(code_block_match.group(1))
         except json.JSONDecodeError:
-            text = code_block_match.group(1)
+            # 2026-09-20：不再用截断块覆盖 text。非贪婪 `(.*?)` 在"字符串内部自带围栏"
+            # 的场合（如 planner 的 task 值里写了 ```json 菜单块）会截断到内层围栏处，
+            # 覆盖后原文丢失，Step 3 的边界提取与 Step 5 的括号平衡都无从下手
+            # （实测 1458 字符原文被截成 257 字符 → 整段 plan 解析失败 → plan={}）。
+            pass
 
     # Step 3: 定位 JSON 边界
     start = text.find("{")
+    obj_start = start          # Step 5 括号平衡的起点（start 可能被下方数组分支改写）
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         # 尝试数组
@@ -64,6 +69,14 @@ def safe_parse_json(text: str, default: Any = None) -> Any:
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 边界提取后仍解析失败: {e}")
             logger.debug(f"提取内容: {json_str[:200]}...")
+
+    # Step 5: 括号平衡兜底（2026-09-20）。"首个 { 到末个 }"在两种常见形态下会失败：
+    # ① JSON 之后还有正文且含右括号（rfind 越过对象边界）；② 字符串值内含围栏/括号。
+    # 括号平衡按 in_string/escape 状态计数，能精确取出顶层对象，且复用本文件既有实现。
+    if obj_start != -1:
+        balanced = _extract_json_from_offset(text, obj_start)
+        if balanced is not None:
+            return balanced
 
     logger.error(f"JSON 解析彻底失败，原文前200字符: {text[:200]}")
     return default

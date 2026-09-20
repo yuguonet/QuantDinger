@@ -6,6 +6,7 @@ Agent 运行轨迹记录 + 结构化存储。
 
 AGENT_JSONL_ENABLED=false    只关本地 JSONL（agent_runs.jsonl），保留 qd_traces 落库与事件采集
 AGENT_TRACE_FILE=traces/agent_runs.jsonl
+                            相对路径锚定到本包目录（app/agent/），不随进程 CWD 漂移
 AGENT_TRACE_MAX_CHARS=12000
 """
 
@@ -48,6 +49,23 @@ def _max_chars() -> int:
         return max(100, int(raw))
     except ValueError:
         return 12000
+
+
+# JSONL 落盘锚点：AGENT_TRACE_FILE 为相对路径时按**本包目录**（app/agent/）解析，
+# 而不是按进程 CWD。旧实现直接用 `Path(env)`，同一份配置会因启动位置不同写到两个文件：
+#   CLI（cwd=backend_api_python/）              → backend_api_python/traces/agent_runs.jsonl
+#   Flask（cwd=backend_api_python/app/agent）   → app/agent/traces/agent_runs.jsonl
+# 排查时很容易读到另一个文件里的陈旧 run（2026-09-20 实际踩坑：E2E 新 run 写在
+# backend_api_python/traces/，核对脚本却读 app/agent/traces/ 的 6 小时前旧 run）。
+_AGENT_DIR = Path(__file__).resolve().parent.parent  # utils/ → agent/
+_DEFAULT_TRACE_FILE = "traces/agent_runs.jsonl"
+
+
+def _trace_file_path() -> Path:
+    """解析 AGENT_TRACE_FILE：绝对路径原样使用，相对路径锚定 app/agent/。"""
+    raw = (os.getenv("AGENT_TRACE_FILE") or "").strip() or _DEFAULT_TRACE_FILE
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else (_AGENT_DIR / p)
 
 
 def _jsonl_enabled() -> bool:
@@ -376,7 +394,7 @@ class AgentTraceRecorder:
     # ── JSONL 输出 ────────────────────────────────────────────
 
     def _write_jsonl(self):
-        trace_file = Path(os.getenv("AGENT_TRACE_FILE", "traces/agent_runs.jsonl"))
+        trace_file = _trace_file_path()
         trace_file.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "trace_id": self.trace_id,

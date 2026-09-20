@@ -107,6 +107,13 @@ def _skill_dir_exists_for(chain_name: str) -> Optional[str]:
     return None
 
 
+# ── brew 触发 v2 常量（重设计 §2.5，2026-09-19；S6：字面量 → 命名常量）──
+# 姊妹常量在 chain/store.py 顶部：BREW_MIN_SIGNAL / BREW_WIN_RATE_FLOOR /
+# BREW_CONFIDENCE_CAP（信号通道门槛）。批 4 计划统一迁至 chain/constants.py。
+BREW_FAIL_COOLDOWN = 3      # 连续失败达到该值 → 冷却跳过（通道 3）
+BREW_FALLBACK_DAYS = 7      # 距上次尝试达到该天数 → 兜底重试（通道 2）
+
+
 def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> list:
     """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto_*/SKILL.md。
 
@@ -141,7 +148,7 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
         for c in ready:
             name = c["chain_name"]
             s = states.get(name, {})
-            if s.get("fail_streak", 0) >= 3:
+            if s.get("fail_streak", 0) >= BREW_FAIL_COOLDOWN:
                 logger.info("[Brewer] %s 冷却中（连续失败 %d），跳过", name, s["fail_streak"])
                 continue
             if name not in seen:
@@ -153,10 +160,10 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             if name in seen:
                 continue
             s = states.get(name, {})
-            if s.get("fail_streak", 0) >= 3:
+            if s.get("fail_streak", 0) >= BREW_FAIL_COOLDOWN:
                 continue
             last = s.get("last_brew_date")
-            if last and (_today - last).days < 7:
+            if last and (_today - last).days < BREW_FALLBACK_DAYS:
                 continue
             c["_channel"] = "fallback"
             candidates.append(c)
@@ -198,10 +205,10 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             signatures = prescan_tools(provider, limit=40, query="")
         from chain.store import get_tool_weights as _gtw
         weights = _gtw()
-        # [AUDIT-MASK:B3/E1|2026-09-19] 阈值 0.7 与 task_agent.py plan 提示处硬编码重复；
-        # 「工具差」三源口径不同（熔断=连续失败/权重=回测胜率/此处=低胜率名单）。
-        # 统一清理阶段抽公共 helper + 阈值常量化。
-        low = sorted(n for n, w in weights.items() if w < 0.7)
+        # S5（2026-09-19）：阈值改用模块常量 LOW_WEIGHT_THRESHOLD（单一事实源），
+        # 与 task_agent.py plan 提示处同源。「工具差」三源口径不同
+        # （熔断=连续失败/权重=回测胜率/此处=低胜率名单）。
+        low = sorted(n for n, w in weights.items() if w < LOW_WEIGHT_THRESHOLD)
         low_tools = ", ".join(low[:15]) if low else "（暂无低权重工具）"
     except Exception as e:
         logger.warning("[Brewer] 工具质量上下文获取失败（继续酿造）: %s", e)

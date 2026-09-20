@@ -299,6 +299,9 @@ def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any
     算法：按日K线的 high/low 区间分配成交量到价格档位，
     用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
 
+    Returns:
+        dict: {avg_cost, current_price, profit_ratio, concentration_90, support_prices/resistance_prices/chip_peaks 均为 list}；多代码→{count, data:{代码:上述}}；error=失败。
+
     Args:
         codes: 多股用逗号分隔（也兼容 search_stock 返回的 dict）
         lookback_days: 回看天数，默认120天

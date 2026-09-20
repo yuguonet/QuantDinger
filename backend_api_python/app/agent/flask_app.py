@@ -7,6 +7,7 @@ Flask 壳 — 共用 agent.py 全局组件。
   POST /api/agent-v2/task          — 带工具调用的任务
   GET  /api/agent-v2/tools         — 列出可用工具
   GET  /api/agent-v2/skills        — 列出可用技能
+  POST /api/agent-v2/stop          — 请求停止指定会话的当前任务
   GET  /api/agent-v2/health        — 健康检查
   GET  /api/agent-v2/info          — 配置信息
 
@@ -251,6 +252,28 @@ def task():
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@agent_v2_bp.route("/stop", methods=["POST"])
+def stop():
+    """请求停止指定会话当前正在执行的任务（S8，2026-09-19）。
+
+    与 CLI Ctrl+C / Cron 共用 `message_queue.request_stop()`——跨终端立即停止。
+    session_id 需与 chat/task 入队时一致（带用户命名空间前缀，如 "user:3:session_xxx"）。
+    为兼容前端是否携带前缀两种情形，原样与补前缀两个键都投递（request_stop 幂等，
+    残留位对不存在会话无副作用）。
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        session_id = (data.get("session_id") or "").strip()
+        if not session_id:
+            return jsonify({"error": "session_id 不能为空"}), 400
+        from message_queue import request_stop
+        request_stop(session_id)                              # 原样（前端已带命名空间）
+        request_stop(f"{_resolve_user_ns()}:{session_id}")    # 补前缀（与 chat/task 对齐）
+        return jsonify({"ok": True, "session_id": session_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
