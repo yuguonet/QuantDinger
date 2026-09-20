@@ -48,7 +48,7 @@ _bootstrap_path()
 
 # ── 显式扫描范围（第一域: auto/ 数据与信号接口层）──
 SCAN_TARGETS = [
-    "app.market_cn.auto.data.hub",     # auto 唯一数据出口: 日线/分钟/快照/指数/龙虎榜…
+    "app.market_cn.auto.core.data.hub",     # auto 唯一数据出口: 日线/分钟/快照/指数/龙虎榜…
     "app.market_cn.auto.store",        # 信号事实表查询与状态机（只读子集）
     "app.market_cn.auto.registry",     # 策略注册表元数据（key/label）
     # ── 2026-09-14 扩展：market_cn 根目录的数据/接口模块（用户指出此前漏扫）──

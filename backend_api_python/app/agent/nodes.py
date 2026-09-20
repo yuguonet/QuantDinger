@@ -193,6 +193,17 @@ class NodeContext:
             ToolProvider.set_default(provider)  # 全局默认 provider 只在首扫时设置一次
             logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
 
+            # ── 返回结构采样（方案 D 写侧，2026-09-20）───────────────────
+            # 守护线程后台对只读工具真实调采样一次，固化返回结构缓存；
+            # `start_background_sampling` 立即返回（不阻塞启动），采样未就绪期间
+            # 读取侧（task_agent._sandbox_instructions）自动回退 docstring 契约（零回归）。
+            # 进程级一次；由本 `if _SHARED_TOOL_PROVIDER is None` 分支保证，函数内亦幂等。
+            try:
+                from tools.returns_sampler import _start_background_sampling
+                _start_background_sampling(provider)
+            except Exception as _rse:
+                logger.warning("[Context] 返回结构采样启动失败（不阻断启动）: %s", _rse)
+
         self.tool_provider = _SHARED_TOOL_PROVIDER
         self.model = _LLMAdapter(self.llm)
 
