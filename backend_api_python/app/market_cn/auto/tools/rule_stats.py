@@ -348,7 +348,7 @@ def main():
                 print(f"[warn] 存档无 {k} 标签 (口径不符; 请用 --trail 匹配或去掉 --probe-file 重跑)",
                       file=sys.stderr)
     else:
-        from app.market_cn.auto.backtest import run_all
+        from app.market_cn.auto.core.backtest import run_all
         from app.market_cn.auto.probe import Probe
         # 标签由策略文件内的 DEBUG_* 常量生成 (框架不注入口径 — 2026-09-10 裁定);
         # 这里只校验所选档位确实会被生成, 避免"分析了一个存档里没有的键"。

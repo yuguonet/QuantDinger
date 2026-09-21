@@ -60,7 +60,7 @@ DEFAULT_WINDOWS = (600, 300)
 
 def _feat_env_ret20(code, d0, trade, index_code="000300"):
     try:
-        from app.market_cn.auto.data.hub import index_daily
+        from app.market_cn.auto.core.data.hub import index_daily
         bars = index_daily(index_code, days=60, as_of=d0) or []
         c = [float(b["close"]) for b in bars]
         if len(c) >= 21 and c[-21] > 0:
@@ -72,7 +72,7 @@ def _feat_env_ret20(code, d0, trade, index_code="000300"):
 
 def _feat_ev20(code, d0, trade, index_code="000300"):
     try:
-        from app.market_cn.auto.data.hub import lhb
+        from app.market_cn.auto.core.data.hub import lhb
         evs = lhb(code, days=40, as_of=d0) or []     # D-1 及以前的上榜事件
         # 取截至 D-1 前 20 交易日内次数 (用事件日期 <= d0 且落在窗口)
         cnt = 0
@@ -90,7 +90,7 @@ def _feat_ev20(code, d0, trade, index_code="000300"):
 
 def _feat_on_d1(code, d0, trade, index_code="000300"):
     try:
-        from app.market_cn.auto.data.hub import lhb
+        from app.market_cn.auto.core.data.hub import lhb
         evs = lhb(code, days=5, as_of=d0) or []
         for e in evs:
             ed = str(e.get("trade_date") or e.get("date") or "")[:10]
@@ -111,7 +111,7 @@ def _feat_turnover_d0(code, d0, trade, index_code="000300"):
             pass
     # 回退: daily 成交量 / 流通股本
     try:
-        from app.market_cn.auto.data.hub import daily, stock_info
+        from app.market_cn.auto.core.data.hub import daily, stock_info
         bars = daily(code, 30, as_of=d0) or []
         info = (stock_info() or {}).get(code) or {}
         circ = float(info.get("circ_shares") or 0)
@@ -123,7 +123,7 @@ def _feat_turnover_d0(code, d0, trade, index_code="000300"):
 
 
 def _fflow_bars(index_code, as_of):
-    from app.market_cn.auto.data.hub import index_fflow
+    from app.market_cn.auto.core.data.hub import index_fflow
     return index_fflow(index_code, days=10, as_of=as_of) or []
 
 
@@ -306,7 +306,7 @@ def load_trades(args):
     if args.trades:
         return json.load(open(args.trades, encoding="utf-8"))
     if args.strategy:
-        from app.market_cn.auto.backtest import run_all
+        from app.market_cn.auto.core.backtest import run_all
         res = run_all(strategy=args.strategy, days=args.days or 600)
         trades = res["trades"]
         if args.out:

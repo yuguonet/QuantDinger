@@ -27,7 +27,7 @@ HEADER = '''#!/usr/bin/env python3
   confirm: D1 收盘确认通过 (d1_chg 按 signal_price 基准)
   exit   : 止损 stop% / 追踪 trail%(自入场日峰值, held>1) / 到期 hold 天
 回测钩子: backtest_stock 默认 = as_of 枚举 + U1~U4 + D1 开盘买 + exit 重放
-  (python -m app.market_cn.auto.backtest --strategy {key} --days 60 直接可跑)。
+  (python -m app.market_cn.auto.core.backtest --strategy {key} --days 60 直接可跑)。
 需要特殊规则时覆盖对应方法 (参考 v1.py / dragon_callback.py / tail_oversold.py)。
 
 规则编写纪律: 判定只用 as_of(含)以前数据 (无未来函数); 阈值全进 default_params
@@ -128,7 +128,7 @@ CHECKLIST = '''
   2) config.json strategies 加段 (未写段 = 不进实盘, 安全):
      "{key}": {{"enabled": false, "daily_limit": 5, "params": {{}}, "winrate": null}}
   3) 导入自检: python -c "from app.market_cn.auto import strategies as s; s.autodiscover(); print(s.get_strategy('{key}'))"
-  4) 回测冒烟: python -m app.market_cn.auto.backtest --strategy {key} --days 60
+  4) 回测冒烟: python -m app.market_cn.auto.core.backtest --strategy {key} --days 60
   5) 参数网格: tools/param_scan.py --strategy {key} --days 300   (两段稳定性)
   6) 规则审计: tools/rule_audit.py --strategy {key} --days 300   (逐门判别力)
   7) 池切复验: tools/pool_check.py --strategy {key}              (kept>universe 才 MIGRATE)

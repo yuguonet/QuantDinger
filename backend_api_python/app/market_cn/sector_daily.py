@@ -458,7 +458,11 @@ def _flush_batch(cur, batch):
 # ============================================================
 
 def get_trading_dates(start_date: str, end_date: str) -> List[str]:
-    """获取有数据的交易日列表（基于交易日历）"""
+    """获取有数据的交易日列表（基于交易日历）
+
+    Returns:
+        list[str]: 交易日字符串列表（"YYYY-MM-DD"，升序）。
+    """
     from app.utils.trading_calendar import trade_date_range
     return trade_date_range(start_date, end_date)
 

@@ -277,8 +277,34 @@ _SKIP_FILES = {
     "mcp_bridge",
 }
 
-# 必选工具（通过 smolagents tools=[] 注入，provider 不扫描）
+# 元工具模块（通过 smolagents tools=[] 注入，provider **注册表**不扫描）。
+#
+# 【易错点·2026-09-21】"不扫描"的后果是这两个模块的函数**不在注册表里**：
+#   provider.get("web_search") / provider.get("format_result") 恒为 None。
+# 消费方（task_agent.py 的 _WebSearchTool / _FormatResultTool）**只能**用
+# provider.get_meta(name) —— 它查的是 _load_meta_tools 装出来的元工具表。
+# 2026-09-21 事故正是消费方误用了 get()：web_search 直接返回
+# {"error": "web_search 工具不可用"}、format_result 静默降级成 str(result)[:2000]。
 _MUST_HAVE = {"format_utils", "web_search_tools"}
+
+# CLI/进程入口名黑名单（2026-09-12 事故修复）：这类函数是"进程入口"而非可组合工具
+# ——mcp_bridge.main()（阻塞式启动 stdio server）曾因被注册为工具，被规划器调用后
+# 挂死整个进程。任何模块的同名入口一律不注册（元工具表同判据）。
+_ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "app"})
+
+
+def _is_tool_function(obj, module) -> bool:
+    """模块里哪些公开函数算"工具函数"——注册表与元工具表**共用同一判据**。
+
+    单独抽成函数是为了两处判据不漂移：_register_module_functions（注册表）
+    与 _load_meta_tools（元工具表）。
+    """
+    if not inspect.isfunction(obj) or not inspect.getdoc(obj):
+        return False
+    if getattr(obj, "__module__", "") != module.__name__:
+        return False
+    name = getattr(obj, "__name__", "")
+    return not (name.startswith("_") or name in _ENTRY_NAME_DENY)
 
 
 class ToolProvider:
@@ -305,6 +331,9 @@ class ToolProvider:
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
         self._domains: Dict[str, str] = {}       # name → domain
+        # 元工具（_MUST_HAVE 模块的公开函数）：**不进注册表**、不进 planner schema，
+        # 仅供 task_agent 的包装层按工具名取实现。见 _load_meta_tools 的说明。
+        self._meta_tools: Dict[str, Callable] = {}
         # 可被 selected_domain 选中的域，只由 tools/<子目录> 推导（见 scan_subdirectories）
         self._selectable_domains: set = set()
         self._schema_cache: Optional[List[dict]] = None
@@ -312,14 +341,22 @@ class ToolProvider:
     # ── 扫描注册 ──────────────────────────────────────────────
 
     def scan_directory(self, tools_dir: Path, domain: str = "common",
-                       package_prefix: str = "tools"):
+                       package_prefix: str = "tools", load_meta: bool = True):
         """扫描目录下所有 .py，自动注册公开函数。
+
+        `_MUST_HAVE` 里的模块**不进注册表**（下方 continue 跳过），但它们的公开函数
+        会被装进独立的元工具表 —— 两件事同源，故都在本方法内完成，避免新增调用点
+        被遗漏（元工具表漏装配 ⇒ 联网搜索/格式化整体不可用，2026-09-21 事故）。
 
         Args:
             tools_dir: 目录路径
             domain: 领域名（默认 common）
             package_prefix: 导入包前缀
+            load_meta: 是否顺带装配元工具表。子目录扫描传 False —— 元工具模块只在
+                tools/ 顶层，对每个子目录都找一遍会刷出一堆"模块缺失"假告警。
         """
+        if load_meta:
+            self._load_meta_tools(tools_dir, package_prefix)
         for py_file in sorted(tools_dir.glob("*.py")):
             module_name = py_file.stem
             if module_name.startswith("_") or module_name in _SKIP_FILES or module_name in _MUST_HAVE:
@@ -330,6 +367,33 @@ class ToolProvider:
                 logger.debug("[ToolProvider] 跳过模块 %s", module_name, exc_info=True)
                 continue
             self._register_module_functions(mod, domain)
+
+    # ── 元工具表（_MUST_HAVE）──────────────────────────────────
+    #
+    # 【为什么与注册表分开·2026-09-21】元工具（web_search / format_result）必须
+    # **每个阶段都在场**，包括 planner 显式声明 0 工具的阶段 —— 而 phase 白名单分支
+    # （task_agent.py）只认白名单、不与 common 域求并集，注册进注册表反而会被丢掉。
+    # 故它们走 `tools=[]`（smolagents）通道；本表只做"工具名 → 实现"的绑定。
+    #
+    # 【易错点】消费方**只能**用 get_meta()，不能用 get()：get() 查的是注册表，
+    # 这两个模块被 scan_directory 跳过 ⇒ 恒为 None。2026-09-21 事故即由此而来。
+    # 好处是模块改名/迁移只改本文件的 _MUST_HAVE，不波及消费方（消费方只认工具名）。
+    def _load_meta_tools(self, tools_dir: Path, package_prefix: str) -> None:
+        for module_name in sorted(_MUST_HAVE):
+            py_file = tools_dir / f"{module_name}.py"
+            if not py_file.exists():
+                logger.warning("[ToolProvider] 元工具模块缺失：%s", py_file)
+                continue
+            try:
+                mod = importlib.import_module(f"{package_prefix}.{module_name}")
+            except Exception:
+                logger.error("[ToolProvider] 元工具模块导入失败：%s（该元工具不可用）",
+                             module_name, exc_info=True)
+                continue
+            for attr_name in dir(mod):
+                obj = getattr(mod, attr_name)
+                if _is_tool_function(obj, mod):
+                    self._meta_tools[attr_name] = obj
 
     def scan_subdirectories(self, tools_dir: Path, package_prefix: str = "tools"):
         """扫描子目录，子目录名即 domain（同时登记为"可选域"）。
@@ -343,7 +407,8 @@ class ToolProvider:
                 continue
             self._selectable_domains.add(sub.name)
             self.scan_directory(sub, domain=sub.name,
-                                package_prefix=f"{package_prefix}.{sub.name}")
+                                package_prefix=f"{package_prefix}.{sub.name}",
+                                load_meta=False)  # 元工具只在 tools/ 顶层装配
 
     def register(self, name: str, func: Callable, domain: str = "common"):
         """手动注册单个函数。"""
@@ -355,25 +420,14 @@ class ToolProvider:
         """注册模块中所有公开函数。"""
         self._register_module_functions(module, domain)
 
-    # CLI/进程入口名黑名单（2026-09-12 事故修复）：这类函数是"进程入口"而非
-    # 可组合工具——mcp_bridge.main()（阻塞式启动 stdio server）曾因被注册为工具，
-    # 被规划器调用后挂死整个进程。任何模块的同名入口一律不注册。
-    _ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "app"})
-
     def _register_module_functions(self, module, domain: str):
-        """扫描模块公开函数并注册。"""
+        """扫描模块公开函数并注册（判据见模块级 _is_tool_function）。"""
         for attr_name in dir(module):
-            if attr_name.startswith("_"):
-                continue
-            if attr_name in self._ENTRY_NAME_DENY:
+            if attr_name in _ENTRY_NAME_DENY:
                 logger.debug("[ToolProvider] 跳过入口函数 %s（CLI/server 入口不注册）", attr_name)
                 continue
             obj = getattr(module, attr_name)
-            if not callable(obj) or not inspect.isfunction(obj):
-                continue
-            if getattr(obj, "__module__", "") != module.__name__:
-                continue
-            if not inspect.getdoc(obj):
+            if not _is_tool_function(obj, module):
                 continue
             self._tools[attr_name] = obj
             self._domains[attr_name] = domain
@@ -384,6 +438,14 @@ class ToolProvider:
     def get_functions(self) -> Dict[str, Callable]:
         """executor 用：name → callable。"""
         return dict(self._tools)
+
+    def get_meta(self, name: str) -> Optional[Callable]:
+        """取元工具实现（`_MUST_HAVE` 模块的公开函数）；未装配返回 None。
+
+        注意：与 get() 查的是**两张不同的表**——元工具只在 get_meta() 里，
+        注册表工具只在 get() 里，互相取不到（2026-09-21 事故根因）。
+        """
+        return self._meta_tools.get(name)
 
     def get_schemas(self) -> List[dict]:
         """planning 用：OpenAI Function Calling schema 列表（带缓存）。"""

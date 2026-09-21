@@ -25,8 +25,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from app.market_cn.auto.common.indicators import ma as _ma  # D2: 收编内联, 逐字等价
-from app.market_cn.auto.common.market import get_board_type, is_limit_up
+from app.market_cn.auto.core.indicators import ma as _ma  # D2: 收编内联, 逐字等价
+from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -410,7 +410,7 @@ class Relay3Strategy(StrategyBase):
         → run_backtest_relay3 出场模拟。U1~U4 锚定 D0 涨停日。
         注意: 日线近似 S4 炸板按收盘价卖出, 实盘炸板瞬间价通常更高 → 回测偏保守。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         p = self.merged_params(None)
         n = len(bars)
         if n < 5:

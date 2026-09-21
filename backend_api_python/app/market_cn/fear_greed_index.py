@@ -155,7 +155,11 @@ _CALC = [
 
 
 def fear_greed_index():
-    """计算综合贪恐指数，返回结构化结果（5分钟缓存）"""
+    """计算综合贪恐指数，返回结构化结果（5分钟缓存）
+
+    Returns:
+        dict: {timestamp, composite_score, label, indicators: [{name, score, detail}]}。
+    """
     global _fg_cache, _fg_cache_ts
     now = time.time()
     if _fg_cache is not None and (now - _fg_cache_ts) < _FG_TTL:

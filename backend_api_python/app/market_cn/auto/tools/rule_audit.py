@@ -362,7 +362,7 @@ def main():
         raw = _load_rows(args.probe_file)
         print(f"复用探针存档: {args.probe_file} → {len(raw)} 行 sample")
     else:
-        from app.market_cn.auto.backtest import run_all
+        from app.market_cn.auto.core.backtest import run_all
         from app.market_cn.auto.probe import Probe
         codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None
         t0 = time.time()

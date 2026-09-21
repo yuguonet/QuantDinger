@@ -39,6 +39,7 @@ from __future__ import annotations
 import json as _json
 import os as _os
 import time as _time
+from datetime import datetime, timezone
 
 from app.utils.logger import get_logger
 
@@ -101,18 +102,30 @@ def _fetch_snapshots_by_date(codes, date=None):
 
 
 def day_series(codes, date=None):
-    """当日(或指定日)快照序列 {code: [raw rows]} —— 收编 dragon_monitor.fetch_day_snapshots。"""
+    """当日(或指定日)快照序列 {code: [raw rows]} —— 收编 dragon_monitor.fetch_day_snapshots。
+
+    Returns:
+        dict: {code: [原始快照行, ...]}；每行含 time/last/open/high/low/volume 等键。
+    """
     return _fetch_snapshots_by_date(codes, date)
 
 
 def market_snapshot(codes, date=None):
-    """全市场(或给定 codes)最新一拍 {code: row} —— 收编 dragon_monitor.latest_snapshot。"""
+    """全市场(或给定 codes)最新一拍 {code: row} —— 收编 dragon_monitor.latest_snapshot。
+
+    Returns:
+        dict: {code: 最新一拍快照 row}；无数据的 code 不出现。
+    """
     series = _fetch_snapshots_by_date(codes, date)
     return {code: rows[-1] for code, rows in series.items() if rows}
 
 
 def quote(code, snaps=None):
-    """单股最新一拍实时行情 (无K线语义)。snaps 可注入已拉取的快照池避免重复查询。"""
+    """单股最新一拍实时行情 (无K线语义)。snaps 可注入已拉取的快照池避免重复查询。
+
+    Returns:
+        dict | None: 单股最新一拍快照 dict；无数据返回 None。
+    """
     if snaps is not None:
         return snaps.get(code)
     return market_snapshot([code]).get(code)
@@ -124,13 +137,101 @@ def quote(code, snaps=None):
 
 def daily(code, days=300, as_of=None):
     """历史日线 (qfq, list[dict] time/open/high/low/close/volume)。
-    as_of: 只返回该交易日(含)以前 —— 数据层兜底防未来函数。"""
-    from app.market_cn.auto.data.kline import fetch_kline_db
+    as_of: 只返回该交易日(含)以前 —— 数据层兜底防未来函数。
+
+    Returns:
+        list[dict]: [{time, open, high, low, close, volume}]（qfq，time 升序）；无数据 []。
+    """
+    from app.market_cn.auto.core.data.kline import fetch_kline_db
     bars = fetch_kline_db(code, days)
     if as_of:
         bars = [b for b in bars if str(b["time"])[:10] <= str(as_of)[:10]]
     return bars
 
+# ================================================================
+# 批量取数原语 (归位自 app/utils/db_market.py:query_batch, 09-21)
+#   越界整改: 原批量 ANY 逻辑放在共享后端 db_market, 放大爆炸半径;
+#   hub 本就直连同一 kline 表 pool + 同形态 ANY, 故迁回 auto 内 (唯一数据出口)。
+# ================================================================
+
+def _ensure_dt(value):
+    """时间规整 (与 db_market._ensure_datetime 同口径): datetime/时间戳/ISO串 -> naive datetime。"""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip(), fmt)
+            except ValueError:
+                continue
+    raise ValueError("无法解析时间: %r" % (value,))
+
+
+def _query_batch_raw(market, symbols, timeframe, start_time=None, end_time=None):
+    """批量取多品种 K 线原始行 -> {symbol: [(time,o,h,l,c,v), ...]}。
+
+    归位自 db_market.query_batch (09-21 越界整改): 与 writer.query 行内容/排序口径
+    完全一致 (同窗口/同分区/同列/同 as-of 语义), 差别: SQL 用 symbol = ANY(...)
+    一次取一批 (消除逐票 O(N) 往返瓶颈, 全市场 days=300 取数 ~2.4x), 返回**原始
+    tuple** 由调用方一次性装配 (百万级行省去 dict->bars 双重构造)。
+
+    行序: (time, open, high, low, close, volume), 每票 time 升序 (跨年表按年升序追加)。
+    未命中 symbol 不出现于返回 dict。
+    """
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        return {}
+    from app.utils.db_market import get_market_db_manager
+    mgr = get_market_db_manager()
+    if not mgr.market_db_exists(market):
+        return {}
+
+    start_dt = _ensure_dt(start_time) if start_time is not None else None
+    end_dt = _ensure_dt(end_time) if end_time is not None else None
+
+    years = set()
+    if start_dt and end_dt:
+        for y in range(start_dt.year, end_dt.year + 1):
+            years.add(y)
+    elif start_dt:
+        years.add(start_dt.year)
+    elif end_dt:
+        years.add(end_dt.year)
+    if not years:
+        years = {datetime.now().year}
+
+    out = {}
+    pool = mgr._get_pool(market)
+    with pool.cursor() as cur:
+        for year in sorted(years):
+            table = "kline_%s_%d" % (timeframe, year)
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = %s",
+                (table,),
+            )
+            if cur.fetchone() is None:
+                continue
+            conditions, params = ["symbol = ANY(%s)"], [symbols]
+            if start_dt is not None:
+                conditions.append("time >= %s")
+                params.append(start_dt)
+            if end_dt is not None:
+                conditions.append("time <= %s")
+                params.append(end_dt)
+            cur.execute(
+                f'SELECT symbol, time, open, high, low, close, volume '
+                f'FROM "{table}" '
+                f'WHERE {" AND ".join(conditions)} '
+                f'ORDER BY symbol, time',
+                params,
+            )
+            for row in cur.fetchall():
+                out.setdefault(row[0], []).append(row[1:])
+    return out
 
 def _synth_bar_from_series(series, date):
     """快照序列 → 当日合成 bar (逐字收编 _bars_with_synth 合成段口径)。"""
@@ -144,14 +245,28 @@ def _synth_bar_from_series(series, date):
             "volume": float(last_r["volume"] or 0)}
 
 
+def synth_bar(series, date):
+    """当日快照序列 → 当日合成 1D bar (对外入口; 口径唯一来源 = _synth_bar_from_series)。
+
+    盘中策略构造 D0 bar 用 —— 与 monitor 出场重放/日线合成同源, 避免各策略自己
+    拼一份导致口径漂移。series 为空返回 None。
+    """
+    if not series:
+        return None
+    return _synth_bar_from_series(series, date)
+
+
 def daily_live(code, days=200, series=None):
     """实时日线 = 历史日线 + 今日合成 bar (若 1D 尚未回填今日)。
+
+    Returns:
+        list[dict]: 同 daily 结构；bars 为空或无快照序列时返回 None。
 
     series 可注入已拉取的快照序列 (monitor/scan 已有) 避免重复查询。
     返回 bars | None: bars 为空或无快照序列 → None (与 monitor._bars_with_synth 语义一致,
     entry_idx 定位仍由调用方完成)。
     """
-    from app.market_cn.auto.data.kline import fetch_kline_db
+    from app.market_cn.auto.core.data.kline import fetch_kline_db
     bars = fetch_kline_db(code, days)
     if not bars:
         return None
@@ -172,6 +287,9 @@ def daily_live(code, days=200, series=None):
 
 def minute_1m(code, start=None, end=None, as_of=None, limit=100000):
     """1m K线 (list[dict], time='YYYY-MM-DD HH:MM' 字符串)。
+
+    Returns:
+        list[dict]: [{time, open, high, low, close, volume}]（time="YYYY-MM-DD HH:MM"，升序）。
 
     易错点消化: start==end 单日区间可能整表返回空 → 内部自动把起点扩一天再按日期过滤。
     as_of: 只保留该交易日(含)以前。
@@ -234,12 +352,21 @@ def _trading_minute_index(ts: str) -> int:
         return -1
 
 
-def prep_minutes(rows, volume_cumulative=False):
+def prep_minutes(rows, volume_cumulative=False, *, report_gaps=False):
     """原始行 → 标准分钟序列。rows: [{time, open, high, low, close, volume}]
 
     volume_cumulative=True 表示 volume 是当日累计量 (snapshot), 先差分。
     输出按 mi 升序去重 (保留每分钟最后一根); 无效槽位 (c<=0) 丢弃 —— 缺口容忍,
     调用方按返回槽位数自判数据是否足够 (如 tail_ret 要求 mi 199~219 至少 15 槽)。
+
+    report_gaps=True → 返回 (bars, gaps): gaps = [(mi_start, mi_end, n_missing), ...]
+      为**交易时段内部**缺失的连续槽位区间 (首末之间的丢拍); 默认 False 返回形态不变。
+      ⚠️ 只报内部缺口 (不报首前 / 末后) —— 后者多为"当日尚未采集到此刻"或停牌收尾,
+      非丢拍。停牌整日缺席 → bars 为空 (调用方据此标 suspend, 非异常)。
+      ⚠️ 午休 11:30(mi119) → 13:01(mi120) 相邻, 不会被误判为缺口。
+
+    ⚠️ 集合竞价拍 (9:26) 仅作展示层预留 (用户裁定 2026-09-21): 不参与盘中成交判定
+      与回测 —— 它被开盘首拍在 mi=0 覆盖 (价格侧安全), 故引擎天然不消费竞价拍。
     """
     tmp = {}
     for r in rows:
@@ -266,11 +393,22 @@ def prep_minutes(rows, volume_cumulative=False):
             cv += b["v"]
             b["cv"] = cv
     out = [b for b in out if b["c"] > 0]
-    return out
+    if not report_gaps:
+        return out
+    gaps = []
+    mis = [b["mi"] for b in out]
+    for a, c in zip(mis, mis[1:]):
+        if c != a + 1:                      # 非相邻 → 丢拍 (午休 119→120 相邻, 不入此)
+            gaps.append((a + 1, c - 1, c - a - 1))
+    return out, gaps
 
 
 def minute_live(code, series=None):
-    """盘中实时1m = 当日快照序列差分密集化 (标准化槽位序列)。"""
+    """盘中实时1m = 当日快照序列差分密集化 (标准化槽位序列)。
+
+    Returns:
+        list[dict]: [{mi, ts, o, h, l, c, v, cv}] 标准化分钟槽位序列（mi 升序）。
+    """
     if series is None:
         from datetime import datetime
         series = _fetch_snapshots_by_date([code]).get(
@@ -284,6 +422,9 @@ def minute_live(code, series=None):
 
 def stock_info():
     """全量 stock_basic_info: {symbol: {name, circ_shares, ...}} (换手率/市值/ST过滤用)。
+
+    Returns:
+        dict: {symbol: {name, circ_shares, total_shares}}（全量活跃股基础信息）。
 
     2026-09-10 自 data/kline.py 归位 (该函数本就不属 K线通道, 且曾被调用点绕过 hub 直连)。
     """
@@ -303,13 +444,20 @@ def stock_info():
 
 
 def all_codes():
-    """全市场活跃代码表 (转 data/kline.py)。"""
-    from app.market_cn.auto.data.kline import all_codes
+    """全市场活跃代码表 (转 data/kline.py)。
+
+    Returns:
+        list[str]: 全市场活跃股票代码列表。
+    """
+    from app.market_cn.auto.core.data.kline import all_codes
     return all_codes()
 
 
 def lhb(stock_code=None, trade_date="", days=30):
     """龙虎榜事件 (名单型数据, 不 OHLVC 化)。只读引用 market_cn/dragon_tiger_store。
+
+    Returns:
+        list[dict]: 龙虎榜事件行（含 stock_code/stock_name/trade_date/net_amount 等）；无数据 []。
 
     🔴 发布时效纪律 (决策不可违): LHB(D) 交易所 ~17:00-17:30 才发布 → 任何 D 日
     判定 (盘后扫描 / 盘中窗口) 只允许消费 trade_date ≤ D-1 的事件, 本接口
@@ -331,11 +479,10 @@ def lhb(stock_code=None, trade_date="", days=30):
 # 指数日线 (M3 环境特征通道, 2026-09-11)
 # ================================================================
 
-# 易错: 相对 __file__ 需回退 4 级 auto/data → market_cn → app → backend_api_python
-# (与 frames.CACHE_DIR 同款路径推导, 缓存放 data/market_cn_cache 不进源码树)
-INDEX_CACHE_DIR = _os.path.normpath(_os.path.join(
-    _os.path.dirname(__file__), "..", "..", "..", "..",
-    "data", "market_cn_cache", "index"))
+# 路径锚点走 core/_paths.PROJECT_ROOT (与 frames.CACHE_DIR 同源), 缓存放
+# backend_api_python/data/market_cn_cache/index —— 不进源码树, 不依赖自身层级
+from app.market_cn.auto.core._paths import CACHE_ROOT as _CACHE_ROOT
+INDEX_CACHE_DIR = _os.path.join(_CACHE_ROOT, "index")
 
 _INDEX_FETCH_CAP = 800   # mootdx TDX 协议单次上限 (index.py 同款约束)
 
@@ -387,6 +534,9 @@ def _index_save_cache(code, bars):
 def index_daily(code="000001", days=800, as_of=None, force=False):
     """指数日线 (list[dict] date/open/high/low/close/volume/amount, date 升序)。
 
+    Returns:
+        list[dict]: [{date, open, high, low, close, volume, amount}]（date 升序）。
+
     code 默认 "000001"=上证指数 (index.py 约定, 非个股); 沪深300 用 "000300"。
     缓存策略 (L2 盘后补数语义): 磁盘缓存 {code}_1d.json, 末根 date < 今日 视为过期
     → force/缺失/过期才触远端降级链 (mootdx→tencent→sina→baostock), 命中缓存零外网;
@@ -432,6 +582,9 @@ def index_minute(code="000300", days=800, as_of=None):
     time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_5m
     (scripts/sync_index_minute.py 盘后落库, 2026-09-11 起; 无磁盘缓存 — DB 即存储)。
 
+    Returns:
+        list[dict]: [{time, open, high, low, close, volume, up_count, down_count}]（time 升序）。
+
     code 用 6 位指数码 ("000300"=沪深300, "399006"=创业板指), 存储符号按
     399*→.SZ / 其余→.SH 映射 (与 sync_index_daily.INDICES 同键)。
     up/down_count = 当根 bar 涨/跌家数 (市场宽度)。
@@ -468,6 +621,9 @@ def index_fflow(code="000300", days=800, as_of=None):
     """指数大盘资金流 (list[dict] time/main_net/small_net/mid_net/big_net/super_net,
     time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_fflow
     (scripts/sync_index_fflow.py 落库, 2026-09-12 起; 无磁盘缓存 — DB 即存储)。
+
+    Returns:
+        list[dict]: [{time, main_net, small_net, mid_net, big_net, super_net}]（time 升序，单位元）。
 
     code 用 6 位指数码 ("000300"=沪深300), 存储符号映射与 index_minute 同规则。
     净额单位=元, **当日累计值语义** (EM fflow 口径, 15:00 累计=日级值):
@@ -518,7 +674,7 @@ def reconcile_daily_live(target=None, codes=None, sample=50):
     """
     import random
     from datetime import datetime
-    from app.market_cn.auto.data.kline import fetch_kline_db
+    from app.market_cn.auto.core.data.kline import fetch_kline_db
     if target is None:
         try:
             from app.utils.trading_calendar import last_finish_trading_day

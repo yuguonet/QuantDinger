@@ -36,7 +36,7 @@ def main():
         pass
 
     from app.market_cn.auto import store, strategies as strat_reg
-    from app.market_cn.auto.data.hub import (
+    from app.market_cn.auto.core.data.hub import (
         all_codes, day_series, daily, market_snapshot, stock_info)
 
     strat_reg.autodiscover()

@@ -11,7 +11,7 @@
   2. 契约符合性 (全策略): key/name/scan_spec/default_params 齐备;
      scan_signals 无 ctx 调用返回 list[Signal] (盘中策略此时应返回 [])。
   3. A股约束 (AST 扫描策略文件): 禁硬编码涨跌停常数 (如 *0.1 /*0.9) —
-     涨跌停判定必须引用 common/exec_cn 原语。
+     涨跌停判定必须引用 core/exec 原语。
   4. 零 IO (AST): 策略文件禁 import DB/HTTP/子进程 — 数据一律由框架注入 bars/ctx。
 
 易错点:
@@ -47,7 +47,7 @@ from app.market_cn.auto.strategies.base import ScanSpec, Signal
 # 零 IO 黑名单: 策略文件禁 import (模块顶层与函数内 lazy import 都算)
 BANNED_IMPORTS = {"psycopg2", "sqlite3", "mysql", "pymysql", "requests", "urllib",
                   "http", "socket", "subprocess", "app.utils.db", "app.utils.db_market"}
-# 禁手涨跌停常数: Mult/Div 中的可疑因子 (涨跌停判定必须走 exec_cn 原语)
+# 禁手涨跌停常数: Mult/Div 中的可疑因子 (涨跌停判定必须走 core/exec 原语)
 BANNED_LIMIT_FACTORS = {0.1, 0.2, 1.1, 1.2}
 
 
@@ -124,7 +124,7 @@ def check_ast(path):
             elif isinstance(node.op, ast.Div) and isinstance(node.right, ast.Constant):
                 v = node.right.value
             if v in BANNED_LIMIT_FACTORS:
-                errs.append(f"L{node.lineno} 疑似硬编码涨跌停常数 ({v}) — 应引用 exec_cn 原语")
+                errs.append(f"L{node.lineno} 疑似硬编码涨跌停常数 ({v}) — 应引用 core/exec 原语")
     return errs
 
 
@@ -148,7 +148,7 @@ def run(codes=None, only=None, asof=True):
         n_fail += bool(errs)
 
     if asof:
-        from app.market_cn.auto.data.hub import daily
+        from app.market_cn.auto.core.data.hub import daily
         codes = codes or ["000017", "600397"]
         for key, strat in sorted(strats.items()):
             if strat.scan_spec.kind != "daily_close":

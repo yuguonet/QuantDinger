@@ -11,7 +11,7 @@
 流程: 14:30 预热 → 14:50 起每分钟滚动预览 (用户提前准备) → 14:56 终审 (等新鲜快照 ≤45s)
 → 15:01 确认持有 → D1 开盘卖。快速判定=两级管线: shortlist 用最新快照必要条件预筛
 (score>=8 数学蕴含 day_gain*nf<=-5; 盘中 low 只会更低 → 预览口径是终审超集), 幸存股
-(约10~50只) 才拉序列+日线完整判定。规则改动验证: `python -m app.market_cn.auto.backtest`
+(约10~50只) 才拉序列+日线完整判定。规则改动验证: `python -m app.market_cn.auto.core.backtest`
 框架对数 (test_dragon/test_v2 双同步约定已于 09-09 B 阶段对数 PASS 后作废)。
 
 易错点: 快照 open/high/low=当日累计值非分钟bar; bars[-1]=昨日 (1D 盘中未回填);
@@ -41,7 +41,7 @@ PARAMS = {
 _SHORTLIST_SLACK_PCT = 0.15   # 预筛容差(百分点): 吸收原始价/复权价微差, 放宽保超集
 
 # 分钟序列标准化已上收 data/hub.py (prep_minutes, D1), 别名引用保持原名
-from app.market_cn.auto.data.hub import prep_minutes as _prep_minutes  # noqa: E402
+from app.market_cn.auto.core.data.hub import prep_minutes as _prep_minutes  # noqa: E402
 
 
 def _hhmm(s):

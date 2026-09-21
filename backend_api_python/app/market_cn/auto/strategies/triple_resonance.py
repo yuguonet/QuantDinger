@@ -49,8 +49,8 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.indicators import calc_macd
-from app.market_cn.auto.common.market import get_board_type
+from app.market_cn.auto.core.indicators import calc_macd
+from app.market_cn.auto.core.market import get_board_type
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -452,7 +452,7 @@ class TripleResonanceStrategy(StrategyBase):
         (stage=声明序第一个 False 门 + extra.gates 门向量) — 门级拦截归因的数据源;
         非 probe 模式: 主路径短路版, 判定/性能与改造前逐字等价。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         # 参数接线 (2026-09-13 纪律): 一律 merged_params(None), 禁硬编码 kwargs
         p = self.merged_params(None)
         n = len(bars)

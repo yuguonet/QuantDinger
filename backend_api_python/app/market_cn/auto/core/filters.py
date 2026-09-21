@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.market import get_board_type, is_limit_up
+from app.market_cn.auto.core.market import get_board_type, is_limit_up
 
 PREFILTER_PARAMS = {
     'turnover_min': 3.0,        # U2 换手率% 下限 (全市场验证: +0.7pp; 用户经验口径5%更严, 会误杀低换手大盘样本)
@@ -23,10 +23,11 @@ PREFILTER_PARAMS = {
 }
 
 
-def unified_prefilter(bars, i, code, code_info=None):
+def unified_prefilter(bars, i, code, code_info=None, market=None):
     """统一前置过滤 U1~U4, 在判定日 i 收盘可知数据上判定。
 
     code_info 为该股的 stock_basic_info 字典 (含 name/circ_shares), 不是全量映射。
+    market   为 MarketSpec (可选; None = 进程默认市场 A) —— U4 的涨停判定口径来源。
     返回 (ok, fail_reasons)。code_info 缺失时跳过 U1/U2/U3 (不误杀), U4 仍生效。
     """
     p = PREFILTER_PARAMS
@@ -43,8 +44,8 @@ def unified_prefilter(bars, i, code, code_info=None):
         if not (p['float_mv_min'] <= float_mv <= p['float_mv_max']):
             fails.append(f'U3市值{float_mv:.0f}亿')
     # U4 前期热度: 20日涨幅>=10% 或 前20日有涨停 (不含D0)
-    bt = get_board_type(code)
-    has_lu = any(is_limit_up(bars[j]['close'], bars[j-1]['close'], bt)
+    bt = get_board_type(code, market)
+    has_lu = any(is_limit_up(bars[j]['close'], bars[j-1]['close'], bt, market)
                  for j in range(max(1, i - 19), i))
     ret20 = bars[i]['close'] / bars[i - 20]['close'] - 1 if i >= 20 and bars[i - 20]['close'] > 0 else None
     if not has_lu and (ret20 is None or ret20 * 100 < p['heat_ret20_min']):

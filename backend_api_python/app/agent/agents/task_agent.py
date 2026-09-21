@@ -159,22 +159,11 @@ def _sandbox_instructions(tools: Any = None) -> str:
         "要查看就打印提炼后的关键字段。\n"
     )
     # 2026-09-17：返回结构速查（本阶段实际注入的工具）。这是压住 REPL 式类型探查的关键。
-    # 2026-09-20 方案 D：契约渲染改为「采样优先、docstring 兜底」——
-    #   tools/returns_sampler.py 启动时对只读工具真实调采样，得结构存缓存；
-    #   此处按本阶段工具名取采样结构（sampled=），命中的用采样、未命中的回退 docstring。
-    #   采样器不可用 / 缓存未就绪时 sampled 为空 → 纯 docstring 模式，零回归。
     contract_block = ""
     try:
         from app.agent.tools.returns_contract import _build_return_contract_block
         if tools:
-            sampled = None
-            try:
-                from app.agent.tools.returns_sampler import _get_sampled_structures
-                _names = tools.keys() if hasattr(tools, "keys") else list(tools)
-                sampled = _get_sampled_structures(list(_names)) or None
-            except Exception as _se:
-                logger.debug("[TaskAgent] 采样契约取用跳过: %s", _se)
-            contract_block = _build_return_contract_block(tools, sampled=sampled)
+            contract_block = _build_return_contract_block(tools)
     except Exception as _ce:
         logger.debug("[TaskAgent] 返回结构速查拼装跳过: %s", _ce)
     if contract_block:
@@ -1957,6 +1946,23 @@ class TaskAgent(AgentBase):
                     domain = "all"
                 return provider.list_tools(domain)
 
+        def _meta_fn(name: str):
+            """取元工具实现（web_search / format_result 等，供 tools=[] 通道的包装层用）。
+
+            【易错点·2026-09-21】元工具走 `tools=[]` 通道，**不在 provider 注册表里**
+            （base.py 的 `_MUST_HAVE` 让 scan_directory 跳过它们）⇒ 只能用
+            provider.get_meta()。误用 provider.get() 会恒为 None —— 表现为
+            web_search 整体不可用、format_result 静默退化成 str(result)[:2000]。
+
+            缺装配时**响亮报错**、不静默降级：静默降级正是这个 bug 难发现的原因。
+            这里只认**工具名**、不认模块名，模块改名/迁移只需改 base.py 的 _MUST_HAVE。
+            """
+            fn = provider.get_meta(name) if provider else None
+            if fn is None:
+                raise RuntimeError(
+                    f"元工具 {name} 未装配（见 tools/base.py 的 _MUST_HAVE 与 _load_meta_tools）")
+            return fn
+
         class _FormatResultTool(SmolToolBase):
             skip_forward_signature_validation = True
             name = "format_result"
@@ -1968,11 +1974,7 @@ class TaskAgent(AgentBase):
                 "max_items": {"type": "integer", "description": "最多显示的项数", "nullable": True},
             }
             def forward(self, result=None, max_depth: int = 3, max_items: int = 20, **kwargs):
-                # 通过 provider 获取（业务工具，非 infra）
-                fmt_fn = provider.get("format_result") if provider else None
-                if fmt_fn is None:
-                    return str(result)[:2000]  # 降级：直接转字符串
-                return fmt_fn(result, max_depth, max_items)
+                return _meta_fn("format_result")(result, max_depth, max_items)
 
         class _WebSearchTool(SmolToolBase):
             skip_forward_signature_validation = True
@@ -1985,13 +1987,9 @@ class TaskAgent(AgentBase):
                 "freshness": {"type": "string", "description": "时效性过滤", "nullable": True},
             }
             def forward(self, query: str = "", count: int = 8, freshness: str = "", **kwargs):
-                # 通过 provider 获取（业务工具，非 infra）
-                web_fn = provider.get("web_search") if provider else None
-                if web_fn is None:
-                    return {"error": "web_search 工具不可用"}
                 # 消毒在**真正的实现**里做（tools/web_search_tools.py 的 _sanitize_result），
                 # 不在本包装层——否则两处都消毒会叠加成双重注释前缀。
-                return web_fn(query, count, freshness)
+                return _meta_fn("web_search")(query, count, freshness)
 
         # ── tools= 在本项目的真实作用（2026-09-14 更正误判）────────────────────
         # smolagents 里 tools= 有两个作用，本项目只吃到 ①：
@@ -2205,17 +2203,6 @@ class TaskAgent(AgentBase):
                     "并没有产生新信息。若任务已达成，**不要再重写代码**，直接把握有的"
                     "源码/结果/日志交给 `final_answer(...)` 收尾即可。"
                 )
-            # 2026-09-20：拒收感知（与 _check_final_answer 逃生阀配套）。仅靠"代码相似度"
-            # 挡不住「每次换一种组装方式重写同一份报告」——实测 4 连拒全部逃过相似度门
-            # → 900s 死循环。这里直接读溯源门的连续拒收计数：上一份 final_answer 刚被
-            # 拒过，就明确告诉模型"数字没问题，是你组装方式触发了溯源门"，并给出出路。
-            elif int(getattr(agent, "_final_answer_rejects", 0)) >= 1:
-                hint = (
-                    "\n[系统] 你上一次的 `final_answer` 因**数字溯源**被拒（与工具返回对不上），"
-                    "不是数据缺失。不要再换一种方式重新组装同一份报告：请把交付物收敛为"
-                    "**精简平文**，只保留你确实从工具返回值里拿到的关键字段，其余推断性/衍生"
-                    "数字一律删去或改为定性描述，然后立刻 `final_answer(...)` 收尾。"
-                )
             elif agent.max_steps - memory_step.step_number <= 1:
                 hint = (
                     "\n[系统] 只剩最后一步了。请立即用 `final_answer(...)` 送出交付物"
@@ -2241,37 +2228,6 @@ class TaskAgent(AgentBase):
             # 半成品检测：仍含裸 <code> 标签且无 final_answer 调用痕迹
             if "<code>" in text and "final_answer" not in text:
                 return False
-            # 逃生阀（2026-09-20，修复 tmp/1.txt 900s 死循环）：
-            # 溯源门可能因「证据被截断/从未 print」而对**正确**报告反复拒收，
-            # smolagents 每次拒收都要求模型重写，形成无上限重写循环（实测 4 连拒
-            # 后 900s 硬超时）。故对同一 CodeAgent 实例上的连续拒收计数：
-            #   被拒 >= 2 次 → 第 3 次不再拒收，告警放行并标 ungrounded（可追溯）。
-            # 上限 2 兼顾两头：仍给模型 2 次重写机会（真幻觉大多能改对），
-            # 又不让坏结构/坏组装把整单拖到超时。计数器挂在 agent 上，随批次 CodeAgent 重建而归零。
-            MAX_REJECT_BEFORE_ESCAPE = 2
-
-            def _reject(reason: str) -> bool:
-                """记录一次拒收；未达上限返回 False（继续拒收），达上限告警放行返回 True。"""
-                rejects = int(getattr(agent, "_final_answer_rejects", 0)) + 1
-                try:
-                    agent._final_answer_rejects = rejects
-                except Exception:
-                    pass
-                if rejects > MAX_REJECT_BEFORE_ESCAPE:
-                    try:
-                        agent._final_answer_ungrounded = True
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "[FinalAnswer] 逃生阀触发：同一交付物已连续被拒 %d 次，放行并标记 ungrounded"
-                        "（最后一次原因：%s）。请人工复核数字来源。",
-                        rejects - 1, reason)
-                    return True
-                logger.warning(
-                    "[FinalAnswer] %s，第 %d 次拒收（最多重写 %d 次后放行）",
-                    reason, rejects, MAX_REJECT_BEFORE_ESCAPE)
-                return False
-
             # 数字溯源（工具输出 grounding）
             try:
                 import re as _re
@@ -2295,9 +2251,10 @@ class TaskAgent(AgentBase):
                         grounded = sum(1 for n in nums if n in obs_corpus)
                         # ① 总量级保守阈值：整体可溯源比例过低即拒收
                         if grounded / len(nums) < 0.3:
-                            return _reject(
-                                "数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源"
-                                % (len(nums), grounded))
+                            logger.warning(
+                                "[FinalAnswer] 数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源，拒收要求重写",
+                                len(nums), grounded)
+                            return False
                         # ② 价格/金额/百分比类（含小数点且 >=1）几乎只可能来自工具数据：
                         #   模型若凭空在 final_answer 里写死这类数字（而非引用前面取到的变量 /
                         #   打印过的取值），就会大面积无法溯源 → 判定为编造并拒收重写。
@@ -2307,9 +2264,11 @@ class TaskAgent(AgentBase):
                         if len(decimal_nums) >= 4:
                             dec_grounded = sum(1 for n in decimal_nums if n in obs_corpus)
                             if dec_grounded / len(decimal_nums) < 0.5:
-                                return _reject(
-                                    "数字溯源失败（价格/金额类）：%d 个小数数值仅 %d 个可溯源，疑似凭空编造"
-                                    % (len(decimal_nums), dec_grounded))
+                                logger.warning(
+                                    "[FinalAnswer] 数字溯源失败（价格/金额类）：%d 个小数数值仅 %d 个可溯源，"
+                                    "疑似凭空编造，拒收要求重写",
+                                    len(decimal_nums), dec_grounded)
+                                return False
             except Exception as e:
                 logger.debug("[FinalAnswer] 数字溯源检查跳过: %s", e)
             return True

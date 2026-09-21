@@ -1,0 +1,45 @@
+# ================================================================
+# 3板接力 (relay3) — IDE 门表单文件 (M4)
+# 与 strategies/relay3.py (backtest_stock) 逐笔等价 (见 tmp/_relay3_equivalence.py)
+# ================================================================
+meta:
+  name: 3板接力
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  enumeration: day             # 逐日候选 → D0 信号 → 次日开盘入场
+  day_flow: relay3             # day 流程口径 (信号展示字段集 board_height/ma_bull/lu_vol_ratio/rsi)
+  day_start: 66                # 镜像 relay3.scan_signals 的 len(bars[:i+1])>=67 下界
+  day_min_n: 5                 # 镜像 relay3.backtest_stock 的 n<5 早返回
+
+entry:
+  mode: open                   # D1 开盘买入 (next_open)
+  price: open                  # 成交价基准 = D1 开盘价
+  gap_min: gap_min             # 值可引用 params 名 → 保留网格可扫 (-2.0)
+  gap_max: gap_max             # 9.0 (排除一字板)
+
+exit:
+  mode: relay3_s4              # 日线近似 S4 出场 (D1 未/未封板尾盘卖; 封板延续→追踪/到期)
+  hold_days_max: 3             # 封板延续后最长持有天数
+  trail_after_limit: -8.0      # 封板延续期追踪止损 % (自 D1 以来最高点)
+  break_sell_ratio: 0.995      # 炸板判定: last < 涨停价*0.995
+
+params:                        # 与 strategies/relay3.py PARAMS 默认同值 (逐笔等价基线)
+  board_height: 3
+  ma_bull: true
+  gap_min: -2.0
+  gap_max: 9.0
+  daily_limit: 2
+  stop_pct: -5.0
+  break_sell_ratio: 0.995
+  hold_days_max: 3
+  trail_after_limit: -8.0
+
+# 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门 / audit=只记录
+# 注: "左=实算(函数), 右=参数" 的写法 (如 board_height() == board_height) 让阈值仍可被网格扫描。
+gates:
+  - {id: g_exch, name: 非北交所, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "not is_bse()"}                         # 镜像 relay3 池子排除 8/4/92 开头代码
+  - {id: g_board, name: 恰3连板, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "board_height() == board_height"}       # 镜像 relay3 的 board_height 硬门槛
+  - {id: g_ma, name: MA多头排列, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "ma_bull() or not ma_bull"}             # 左=实算 MA5>MA10>MA20>MA60, 右=params.ma_bull 开关

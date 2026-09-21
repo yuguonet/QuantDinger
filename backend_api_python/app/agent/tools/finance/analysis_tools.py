@@ -1121,11 +1121,15 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
-    """均线指标：返回指定周期(5/10/20/60/120/250)的MA值、斜率和趋势方向。
+    """均线指标：返回多个周期均线的 MA 值、斜率和趋势方向。
+
+    Returns:
+        dict: {stock_code, latest_close, ma{p}, ma{p}_slope, ma{p}_trend(上行/下行/走平)}，
+        每个周期一组键（如 ma5/ma5_slope/ma5_trend）；多代码→{count, data:{代码:上述}}；失败→{error}。
 
     Args:
         codes: 多股用逗号分隔
-        periods: 均线周期列表，默认 [5,10,20,60,120,250]
+        periods: 均线周期，字符串或列表，默认 "5,10,20,60,120"（可传 "5,10,20" 或 [5,10,20]）
     """
     # codes 可能是 "a,b,c" 字符串，也可能被 LLM 直接传成列表；统一归一
     if isinstance(codes, (list, tuple, set)):
@@ -1178,7 +1182,12 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 def get_volume_analysis(codes: str) -> Dict[str, Any]:
-    """量能分析：返回量比、换手率、近5日成交量趋势（放量/缩量/平量）。
+    """量能分析：返回量比、近5/20日均量与量能趋势（放量/缩量/平量）、量价关系。
+
+    Returns:
+        dict: {stock_code, latest_volume, avg_volume_5d, avg_volume_20d, volume_ratio,
+        volume_status, volume_trend, vol_price_relation, is_intraday}；
+        多代码→{count, data:{代码:上述}}；失败→{error}。
 
     Args:
         codes: 多股用逗号分隔
@@ -1333,6 +1342,11 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
     return {"count": len(results), "data": results}
 def analyze_pattern(codes: str) -> Dict[str, Any]:
     """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
+
+    Returns:
+        dict: {stock_code, latest_candle(open/high/low/close), body_size,
+        upper_shadow, lower_shadow, patterns(list[str]), pattern_count}；
+        多代码→{count, data:{代码:上述}}；失败→{error}。
 
     Args:
         codes: 多股用逗号分隔
@@ -1794,7 +1808,12 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
 def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
     """图表形态识别：头肩顶/底、双顶/双底、三角形、旗形、楔形、矩形、杯柄等经典形态。
 
-    基于枢轴点（局部极值）检测，分析多K线构成的结构性形态。
+    基于枢轴点（局部极值）检测，分析多K线构成的结构性形态；一次调用完成取数与判定。
+
+    Returns:
+        dict: {stock_code, latest_close, patterns(list[str]), pattern_count,
+        pattern_score(0-100), direction(看多/看空/中性), signals(list)}；
+        多代码→{count, data:{代码:上述}}；失败→{error}。
 
     Args:
         codes: 多股用逗号分隔
@@ -2038,6 +2057,11 @@ def get_obv_analysis(codes: str) -> Dict[str, Any]:
 
     OBV 是累计成交量指标，价格上涨日加上成交量，价格下跌日减去成交量。
     用于验证趋势是否得到量能支撑。
+
+    Returns:
+        dict: {stock_code, latest_close, obv, obv_prev, obv_slope, obv_trend(上升/下降),
+        obv_vs_ma, divergence, signals(list), volume_ratio, price_change_pct, vol_price_assessment}；
+        多代码→{count, data:{代码:上述}}；失败→{error}。
 
     Args:
         codes: 多股用逗号分隔

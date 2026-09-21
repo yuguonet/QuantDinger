@@ -26,6 +26,8 @@
   W14 F3 代码意图门控：_CODE_INTENT_RE 在位且误伤可控
   W15 阶段路由：失败推进而非 abort / 中断收尾 / replan 回环
   W16 真实 provider 生产链路：扫描 → 注册 → 能力层默认屏蔽（集成冒烟）
+  W17 业务工具返回结构契约：可注入工具 100% 带 `Returns:` 且可抽出（2026-09-21 补全）
+  W18 返回结构契约单一真源：契约块为纯 docstring，采样缓存已退役（2026-09-21）
 
 设计取舍：
   - 合成 provider 决定论验证契约；W16 单独走生产扫描路径。
@@ -237,23 +239,24 @@ def test_whitelist_tool_names_are_normalized(provider):
 # ═══════════════════════════════════════════════════════════════
 
 def test_install_tools_syncs_all_three_paths(provider):
-    """install_tools 必须把权威表同步到 custom_tools / state，并在 send_tools
-    （run 启动会调，重设 static_tools）之后仍能经 _ensure_tools_available 并入。
+    """install_tools 必须把权威表同步到 custom_tools / state，且在 send_tools
+    （run 启动会调，重设 static_tools）之后仍能经 _refresh_namespace 并入。
 
-    2026-09-15 合并后（_reinstall_tools + _sync_tools_into_static →
-    _ensure_tools_available），调用方只调一次 install_tools——
-    static_tools 由 smolagents send_tools 在 run() 时才创建，构造期为 None 是正常的；
-    因此断言分两段：①构造后 custom_tools/state 即同步；②send_tools 模拟 run 启动后，
-    static_tools 也要被补上。
+    2026-09-20 真 exec 执行器重写后语义变更：业务工具进 `_authoritative_tools`
+    （每次 __call__ 前无条件重装进 state/custom_tools），**不再**被并入 static_tools。
+    static_tools 只保留 send_tools 传入的 agent 工具 + BASE_PYTHON_TOOLS 兜底，
+    仅作排查用途。故断言改为：send_tools 重设后，业务工具仍留在权威表且可调用。
     """
     agent = _build(provider, phase_id=5, domain="finance", tools=["finance_tool"])
     ex = agent.python_executor
     assert "finance_tool" in ex.custom_tools
     assert "finance_tool" in ex.state
-    ex.send_tools({})          # 模拟 run 启动：static_tools 被重设（仅含 BASE_PYTHON_TOOLS 等）
-    out = ex("finance_tool(code='600519')")   # __call__ 前置 _ensure_tools_available 触发并入
-    assert "finance_tool" in (ex.static_tools or {}), \
-        "send_tools 重设后 static_tools 未被 _ensure_tools_available 并入"
+    assert "finance_tool" in ex._authoritative_tools, \
+        "install_tools 应登记权威工具表（重试后重装依赖它）"
+    ex.send_tools({})          # 模拟 run 启动：static_tools 被重设
+    out = ex("finance_tool(code='600519')")   # __call__ 前置 _refresh_namespace 重装权威表
+    assert "finance_tool" in ex.custom_tools and "finance_tool" in ex.state, \
+        "send_tools 重设后权威工具未重装回 state/custom_tools"
     assert "600519" in (out.logs or str(out) or "") or out.output is not None
 
 
@@ -282,6 +285,41 @@ def test_custom_tools_callable_after_send_tools(provider):
     out = ex("print(finance_tool(code='600519'))")
     assert "600519" in (out.logs or ""), \
         "业务工具调不到：send_tools 重设 static_tools 后丢失（L16 复发）"
+
+
+def test_executor_error_reports_true_failing_statement(provider):
+    """2026-09-21 回归：执行器报错行必须指向**真正抛错的语句**，而非最后一条。
+
+    旧实现 _run 固定用 body[-1] 截源码片段，导致「前面语句抛错、报错行指向末行」
+    （实测 round(dict) 被报成 globals().update(...)）。修复后应归因到真凶行。
+    """
+    agent = _build(provider, phase_id=17, domain="finance")
+    ex = agent.python_executor
+    err = None
+    try:
+        ex("v = {'a': 1}\nprint(round(v, 1))\nglobals().update({'z': 1})")
+    except Exception as e:  # InterpreterError
+        err = str(e)
+    assert err is not None, "应抛 InterpreterError"
+    assert "print(round(v, 1))" in err, f"报错行未指向真凶语句：{err}"
+    assert "globals().update" not in err, f"报错行被误归因到末行：{err}"
+
+
+def test_skill_func_loader_skips_markdown_only_skill(provider, caplog):
+    """2026-09-21 回归：纯 SKILL.md 技能（无 run.py）不得打 WARNING（旧实现每跑刷噪音）。
+
+    如 auto_finance-analysis-stock：目录只有 SKILL.md，按 skills.<name>.run 导入必 ImportError。
+    正确行为：静默返回空集/空列表（debug 留痕），不打 WARNING；有 run.py 的技能仍能加载。
+    """
+    from agents.task_agent import _load_skill_functions, _list_skill_func_names
+    with caplog.at_level("WARNING"):
+        names = _list_skill_func_names("auto_finance-analysis-stock")
+        funcs = _load_skill_functions("auto_finance-analysis-stock")
+    assert names == set() and funcs == [], "纯 SKILL.md 技能应返回空集/空列表"
+    bad = [r for r in caplog.records if r.levelno >= 30 and "技能函数" in r.getMessage()]
+    assert not bad, f"纯 SKILL.md 技能不应刷 WARNING：{[r.getMessage() for r in bad]}"
+    # 有 run.py 的技能仍可加载
+    assert len(_load_skill_functions("market_screener")) > 0
 
 
 def test_list_tools_gives_full_signature(provider):
@@ -564,8 +602,13 @@ def test_sandbox_instructions_match_open_sandbox(provider):
     assert "_r_" in text, "工具结果兜底登记的取回说明（_r_<工具名>）不应缺失"
 
     agent = _build(provider, phase_id=16, domain="finance")
-    assert "*" in set(agent.python_executor.authorized_imports), \
-        "executor 未全开 import（沙箱作废决策被回退）"
+    # 2026-09-20 真 exec 执行器重写后：不再有 authorized_imports 概念（import 全放行）。
+    # 断言执行器确无 import 限制：①无 authorized_imports 属性；②内置命名空间带 __import__。
+    ex = agent.python_executor
+    assert not hasattr(ex, "authorized_imports"), \
+        "真 exec 执行器不应再有 authorized_imports 白名单"
+    assert "__import__" in ex._builtins_ns, \
+        "内置命名空间缺 __import__ → import 被隐性限制（沙箱作废决策被回退）"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -673,6 +716,125 @@ def test_real_provider_wiring(monkeypatch):
     # 端到端：真实 provider 下单段任务同样能拿到点名能力
     tools = _tools(_build(p, phase_id=9, domain="finance", extra_tools=["daily"]))
     assert "daily" in tools
+
+
+# ═══════════════════════════════════════════════════════════════
+#  W17：工具返回结构契约覆盖率（2026-09-21 补全 return 形状）
+# ═══════════════════════════════════════════════════════════════
+#
+# 已文档化事故：tools 目录 56 个业务工具里 20 个 docstring 缺 `Returns:` 段
+# （§7.12 REPL 陷阱 / §7.13 返回结构契约缺失）。执行期 `returns_contract.py`
+# 只认 docstring 的 `Returns:` 段，缺段 ⇒ 模型看不到返回结构 ⇒ 只能
+# 「取数 → print → 看类型 → 下一步再引用」逐键试探，把 token 烧在类型探查上。
+#
+# 本组断言把「可注入沙箱的业务工具必须逐一声明返回结构」固化为回归网：
+#   W17a 扫描后可注入业务域（finance）工具 100% 带 `Returns:`；
+#   W17b 每个 `Returns:` 都能被 `_extract_returns_section` 抽出非空契约；
+#   W17c 契约并入 `func_to_openai_schema` 描述后不超 1024 上限、不污染参数表。
+# （能力层 capability 域的历史函数不在沙箱注入面，不纳入硬断言。）
+
+def test_selectable_tools_all_declare_return_shape(provider):
+    """W17a：可注入业务域工具必须逐一带 `Returns:`（缺段即回归）。"""
+    import inspect
+    from tools.base import ToolProvider
+
+    real = ToolProvider()
+    real.scan_directory(_AGENT_DIR / "tools", domain="common", package_prefix="tools")
+    real.scan_subdirectories(_AGENT_DIR / "tools", package_prefix="tools")
+    funcs = real.get_functions()
+
+    selectable: list = []
+    for d in real.get_domains():
+        selectable += list(real.list_by_domain(d))
+    assert selectable, "可注入业务域为空 —— 扫描链路断裂"
+    missing = [n for n in sorted(set(selectable))
+               if "Returns:" not in (inspect.getdoc(funcs[n]) or "")]
+    assert not missing, (
+        "以下工具缺 `Returns:` 段（模型看不到返回结构 → 逐键试探烧 token）："
+        + ", ".join(missing)
+    )
+
+
+def test_return_shape_contract_extractable_and_schema_clean(provider):
+    """W17b/W17c：`Returns:` 可抽出非空契约；并入 schema 描述后不越界、不污染参数。"""
+    from tools.base import ToolProvider, func_to_openai_schema
+    from tools.returns_contract import _extract_returns_section
+
+    real = ToolProvider()
+    real.scan_directory(_AGENT_DIR / "tools", domain="common", package_prefix="tools")
+    real.scan_subdirectories(_AGENT_DIR / "tools", package_prefix="tools")
+    funcs = real.get_functions()
+
+    selectable: list = []
+    for d in real.get_domains():
+        selectable += list(real.list_by_domain(d))
+
+    for n in sorted(set(selectable)):
+        f = funcs[n]
+        contract = _extract_returns_section(f)
+        assert contract, f"{n} 的 `Returns:` 段抽不出契约"
+        schema = func_to_openai_schema(f)
+        fn = schema["function"]
+        assert len(fn.get("description", "")) <= 1024, f"{n} 描述超 1024 字符上限"
+        props = list(fn.get("parameters", {}).get("properties", {}).keys())
+        polluted = [k for k in props if ("Returns" in k or "{" in k or "," in k)]
+        assert not polluted, f"{n} 参数表被返回结构污染：{polluted}"
+
+
+# ── W18：返回结构契约单一真源（2026-09-21 退役采样缓存）────────────
+#
+# 已文档化事故："采样优先、docstring 兜底"两层真源下，运行期坏结构（如
+# `{error,retriable}`）会被当真实结构注入 → 反而引新幻觉（2026-09-20 质量门）。
+# docstring 补齐 56/56 后，契约真源收束为**单一** = 工具 docstring 的 `Returns:`。
+# 本组断言锁死：(a) 契约块不含采样专属文案（旧头部含"结构取自真实调采样"）；
+#              (b) `_build_return_contract_block` 不再接受 `sampled=` 参数。
+
+def test_return_contract_block_is_single_source_docstring():
+    """W18：契约块为纯 docstring 单一真源，采样缓存已退役。"""
+    import inspect
+    from tools.returns_contract import _build_return_contract_block
+
+    sig = inspect.signature(_build_return_contract_block)
+    assert "sampled" not in sig.parameters, \
+        "契约块仍接受 sampled= 参数 —— 采样缓存未彻底退役（双真源会再次引入坏结构）"
+
+    blk = _build_return_contract_block(["__nonexistent_tool__"])
+    assert "真实调采样" not in blk, "契约块头部仍宣称采样来源"
+    assert "FAKE" not in blk
+
+
+# ── W19：能力层返回结构契约覆盖率（2026-09-21 补齐 42 个）──────────
+#
+# 能力层（capability，来源层，非可选域）由 admission.json 准入、仅在 planner 点名时
+# 装进沙箱。它同样走 `returns_contract.py` 的单源抽取，此前 62 个函数里 42 个
+# docstring 缺 `Returns:`（物理在 app/market_cn/**）——点名进沙箱即结构盲区。
+# 本组：注册的能力层函数必须 100% 可抽出非空契约；且能力层不得混入可选域。
+
+def test_capability_layer_tools_all_declare_return_shape(monkeypatch):
+    """W19：能力层注册函数必须逐一带可抽出的 `Returns:`；能力层不进可选域。"""
+    monkeypatch.setenv("CAPABILITIES_ENABLED", "1")
+    from nodes import NodeContext
+    from tools.returns_contract import _extract_returns_section
+
+    ctx = NodeContext(llm=None)
+    ctx.init_tools()
+    p = ctx.tool_provider
+    funcs = p.get_functions()
+
+    caps = sorted(set(p.list_by_domain(CAPABILITY_DOMAIN)))
+    assert caps, "能力层一个函数也没注册 —— 扫描/准入链路断裂"
+    assert CAPABILITY_DOMAIN not in p.get_domains(), "能力层泄漏成了可选域"
+
+    missing = [n for n in caps if not _extract_returns_section(funcs[n])]
+    assert not missing, (
+        "以下能力层函数缺可抽出的 `Returns:` 段（点名进沙箱即结构盲区）："
+        + ", ".join(missing)
+    )
+
+    for n in caps:
+        f = funcs[n]
+        contract = _extract_returns_section(f)
+        assert contract and contract.strip(), f"{n} 的 Returns: 段为空"
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1,0 +1,43 @@
+# ================================================================
+# 龙回头策略 (反转日收盘买入) — IDE 门表单文件 (M1 原型)
+# 与 strategies/dragon_callback.py 逐笔等价 (见 tmp/_m1_equivalence.py)
+# ================================================================
+meta:
+  name: 龙回头
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  # 结构说明：本策略"涨停 → 回调 → 反转"的循环依赖 (遍历 lu_idx) 属于引擎级编排，
+  # 不写进门表。门表只表达"给定 (决策日 i, 涨停日 lu_idx) 是否放行"的条件；
+  # 引擎按 lu_idx 升序遍历、首个通过即出信号 (与 python 版 scan_signals 同语义)。
+
+entry:
+  mode: close                  # open | close | intraday | auction
+  at: "14:56"                  # 收盘模式终审时刻
+  price: close                 # 成交价基准 = 决策日(D0)收盘价
+
+exit:
+  mode: combo                  # hold | trail | stop | signal | combo
+  stop: -5.0                   # 硬止损 %
+  trail: -5.0                  # 单一追踪止损 % (自入场后峰值回撤)
+  max_hold: 15                 # 到期天数
+  peak_exit_ret: 7.0           # 峰值逃顶: 收盘涨幅阈值 %
+  peak_exit_upper: 30.0        # 峰值逃顶: 上影线占比阈值 %
+
+params:                        # 可调参数 (网格扫描 / 敏感性分析直接读这里)
+  min_pullback_days: 3
+  max_pullback_days: 11
+  max_last_chg: 3.0            # 末期小阴上界: -max_last_chg < chg(-1) < -0.5
+  min_vol_ratio: 0.5           # 末期小阴量比下界 (含)
+  max_vol_ratio: 0.8           # 末期小阴量比上界 (不含)
+
+# 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门 / audit=只记录
+# needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)
+gates:
+  - {id: g1, name: 末期缩量小阴, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "chg(-1) > -max_last_chg and chg(-1) < -0.5 and vol_ratio(-1) >= min_vol_ratio and vol_ratio(-1) < max_vol_ratio"}
+  - {id: g2, name: 回调天数, role: required, needs_d0: 0, enabled: 1,
+     expr: "pullback_days() >= min_pullback_days and pullback_days() <= max_pullback_days"}
+  - {id: g3, name: 连续回调, role: required, needs_d0: 0, enabled: 1,
+     expr: "monotonic_down()"}
+  - {id: g4, name: 反转确认, role: required, needs_d0: 1, enabled: 1,
+     expr: "close() >= lu_close()"}

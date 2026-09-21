@@ -58,8 +58,8 @@ def sample_feats(bars, i, code, stock_info=None):
     只能离线分析, 绝不能回流判定/实盘路径); 视野不足记 None (=censored)。
     易错点: stock_info 是单票 info dict (run_all 已按股取好, 非全量映射)。
     """
-    from app.market_cn.auto.common.indicators import rsi as _rsi
-    from app.market_cn.auto.common.market import get_board_type
+    from app.market_cn.auto.core.indicators import rsi as _rsi
+    from app.market_cn.auto.core.market import get_board_type
     d0 = bars[i]
     closes = [float(b["close"]) for b in bars[:i + 1]]
     prev_c = closes[-2] if len(closes) >= 2 else 0

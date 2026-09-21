@@ -1,0 +1,62 @@
+# ================================================================
+# V1 追板策略 (D0四因子 → 次日开盘买入) — IDE 门表单文件 (M2)
+# 与 strategies/v1.py (backtest_stock) 逐笔等价 (见 tmp/_v1_equivalence.py)
+# ================================================================
+meta:
+  name: V1
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  enumeration: day             # 枚举方式: 逐日候选 → D0 信号 → 次日开盘入场 (区别于 dragon 的 lu_idx 遍历)
+  day_flow: v1                 # day 流程口径 (信号展示字段集); relay3 用 relay3
+  day_start: 25                # 逐日起点 (镜像 v1.backtest_stock 的 range(25, n-1))
+  day_min_n: 30                # 低于此长度直接返回空 (镜像 v1 的 n<30 早返回)
+  # 说明: 本策略无 lu_idx 依赖 (信号在 D0 当日判定), 引擎逐日枚举决策日 i,
+  # 门表一次性求所有门; 入场/出场由 entry_modes / exit_modes 按本文件 entry/exit 块选择。
+
+entry:
+  mode: open                  # v1 次日开盘买入 (next_open)
+  price: open                 # 成交价基准 = D1 开盘价
+  gap_min: {main: min_gap_main, gem_star: min_gap_gem}   # 值可引用 params 名 → 保留网格可扫
+  gap_max: {gem_star: gem_gap_max}
+  require_d1_close_up: true   # 镜像 v1 的 d1_change<0 → 淘汰
+  gap_exclude_band: {main: [main_gap_band_lo, main_gap_band_hi]}   # 主板高开 3~5% 不入场
+
+exit:
+  mode: v1_combo              # 复用 v1 专属出场引擎 (stop/trail/max_hold + V1 动量 D2 清仓)
+  stop: -10.0                 # 固定止损 % (与 PARAMS 同值; 峰值≥入场时被 -5% 追踪线支配, 实际不触发)
+  trail: -5.0                 # 追踪止损 % (自入场后峰值回撤)
+  max_hold: 7                 # 到期天数
+
+params:                        # 与 strategies/v1.py PARAMS 默认同值 (逐笔等价基线)
+  ret_20d_min: 30.0
+  d_1_pullback_min: -10.0
+  d_1_pullback_max: -3.0
+  obv_filter: true
+  d_1_vol_max: 1.5
+  hold: 7
+  stop: -10.0
+  trail: -5.0
+  min_gap_main: -3.0
+  min_gap_gem: -5.0
+  gem_gap_max: 5.0
+  main_gap_band_lo: 3.0
+  main_gap_band_hi: 5.0
+
+# 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门 / audit=只记录
+# needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)
+# v1 无 lu_idx 依赖 → 全部为 qualify (决策日一次性求值); required 列仅保留 schema 兼容
+gates:
+  - {id: g_priced, name: 数据有效, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "close(-1) > 0 and close(-2) > 0"}      # 镜像 v1 顶部 d_1/d_2 close<=0 早返回
+  - {id: g_lu, name: D0近似涨停, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "is_approx_limit_up()"}                 # 镜像 v1 因子1 (0.98x 板块阈值近似)
+  - {id: g_ret20, name: 20日涨幅, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "ret_n(20) >= ret_20d_min"}             # 镜像 v1 因子2 (i<20 或 close<=0 → ret_n 返 -1e9 拦截)
+  - {id: g_pullback, name: D-1回调, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "chg(-1) >= d_1_pullback_min and chg(-1) < d_1_pullback_max"}  # 因子3 [-10%,-3%)
+  - {id: g_obv, name: OBV上升, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "obv_rising(5) or not obv_filter"}      # 因子4 (obv_filter=False → 该门恒放行)
+  - {id: g_vol, name: D-1非放量, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "d1_vol_ratio(5) < d_1_vol_max"}        # 因子5 (<1.5x 前5日均量)
+  - {id: g_overheat, name: 过热过滤, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "not no_lu_last(10) or (macd_hist_lt(2) and boll_bw_ok(45))"}  # 因子6 (仅前10日无涨停时生效)

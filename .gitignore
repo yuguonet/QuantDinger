@@ -32,7 +32,6 @@ backend_api_python/.env
 .DS_Store
 Thumbs.db
 *.iml
-
 # ========================
 # Python
 # ========================
@@ -50,6 +49,7 @@ venv/
 env/
 docs/
 tmp/
+.codebuddy/
 # ========================
 # Node (if any remain)
 # ========================
@@ -74,7 +74,6 @@ backend_api_python/data/memory/
 # i18n tooling
 # ========================
 scripts/.i18n-cache/
-QuantDinger-Vue-src/src/locales/lang/*.bak
 
 # ========================
 # Docker
@@ -97,8 +96,10 @@ backend_api_python/app/utils/calendar/
 backend_api_python/app/data/
 *del/
 *.json
-# 工具链学习闭环数据（需要提交）
-!backend_api_python/app/agent/router/tool_chains.json
-!backend_api_python/app/agent/router/tool_chain_failures.json
+*.bak
 AGENTS.md
 .workbuddy
+.trae/documents/
+想法.txt
+backend_api_python/app/agent/memory/
+

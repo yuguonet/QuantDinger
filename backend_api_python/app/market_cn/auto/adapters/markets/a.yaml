@@ -1,0 +1,59 @@
+# ================================================================
+# 市场适配: A 股 (基线市场, 唯一已接数据源)
+# ----------------------------------------------------------------
+# 本文件是 A 股市场规则的**唯一事实源**。此前这些数值写死在
+#   app/market_cn/auto/common/market.py  (0.098 / 0.198 / *0.98 / 前缀分板)
+#   app/market_cn/auto/common/exec_cn.py (0.10 / 0.20 / 0.002 容差)
+# 里 —— 接港股/美股必然要改 core。现全部外置到此处, core 只按字段取值。
+#
+# ⚠️ 数值逐字搬自旧实现, 改动前先读 docs/自动策略IDE架构设计.md §9.1/§9.3。
+# ================================================================
+key: A
+name: A股
+
+# --- 交易限制 / 结算 (架构 §9.0: 两者必须分离) ---
+intraday_t0: false          # 当日新开仓不可当日平 (T+1 是交易限制, 不是交割慢)
+settlement_days: 1          # 交割 T+1
+settlement_basis: calendar
+
+# --- 方向 / 做空 ---
+direction: long_only        # 不可做空
+short_rule: none
+
+# --- 价格边界 (涨跌停) ---
+# up_pct  = 名义涨停幅度; up_tol = 判别容差系数 (原实现 `threshold * 0.98`)
+# dn_pct  = 名义跌停幅度; dn_tol = 跌停判定相对容差 (原 LIMIT_DN_TOL=0.002)
+band_kind: pct
+bands:
+  main:     {up_pct: 0.098, up_tol: 0.98, dn_pct: 0.10, dn_tol: 0.002}   # 沪深主板 10%
+  gem_star: {up_pct: 0.198, up_tol: 0.98, dn_pct: 0.20, dn_tol: 0.002}   # 创业板/科创板 20%
+# 板块未命中时取 gem_star 档 —— **刻意**复现旧实现 `else: 0.198` 的分支语义,
+# 使行为逐位等价 (旧代码只判 board_type=="main", 其余一律按 20% 档)。
+band_default: gem_star
+
+# --- 交易单位 / 币种 ---
+lot_size: 100               # 1 手 = 100 股
+tick_size: 0.01
+currency: CNY
+tz: CST
+fee_model: commission+stamp  # 佣金 + 印花税
+
+# --- 分板规则 (有序: 先匹配先生效; 与旧 get_board_type 完全一致) ---
+board_rules:
+  - ["30", gem_star]
+  - ["68", gem_star]
+board_default: main
+
+# --- 板块中文名 (有序; 与旧 get_board_name 的 if/elif 次序一致 —— 68 必须在 6 之前) ---
+board_names:
+  - ["68", 科创板]
+  - ["30", 创业板]
+  - ["6",  沪主板]
+  - ["0",  深主板]
+  - ["2",  深主板]
+board_name_default: 未知
+
+# --- 数据源 ---
+source: a_share_daily
+runnable: true
+note: 基线市场; 涨跌停/分板数值逐字搬自旧 common/market.py + common/exec_cn.py

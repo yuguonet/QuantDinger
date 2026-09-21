@@ -123,7 +123,7 @@ def _daily_feats(bars, code):
     pre5 = (closes[-1] / closes[-5] - 1) * 100 if closes[-5] > 0 else 0
     vol5 = sum(float(b["volume"]) for b in bars[-5:]) / 5
     lu_recent = 0
-    from app.market_cn.auto.common.market import get_board_type, is_limit_up
+    from app.market_cn.auto.core.market import get_board_type, is_limit_up
     bt = get_board_type(code)
     for d in range(len(bars) - 1, max(len(bars) - 6, 0), -1):
         cl, pc = closes[d], closes[d - 1]

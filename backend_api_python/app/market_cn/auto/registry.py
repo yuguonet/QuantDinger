@@ -46,6 +46,9 @@ _STRATEGIES_FALLBACK = ("dragon_callback", "v1", "break", "relay3", "knife_catch
 def strategy_keys():
     """全量策略 key (store 查询/清理范围的单一事实源): config.json ∪ autodiscover 并集。
 
+    Returns:
+        tuple[str, ...]: 全量策略 key（去重保序）。
+
     快速拔插: 新增策略=丢文件进 strategies/ (+ config.json 写开关/限额), 本文件零改动;
     config keys 显式声明系统成员 (enabled=false 停扫描但历史行仍可查);
     autodiscover 兜底防新增漏登记 config。两边都挂时用 _STRATEGIES_FALLBACK。
@@ -68,7 +71,11 @@ def strategy_keys():
 
 
 def strategy_labels():
-    """策略显示名: config.json label > 策略插件 name 属性 (调用方 .get(key, key) 原样回退)。"""
+    """策略显示名: config.json label > 策略插件 name 属性 (调用方 .get(key, key) 原样回退)。
+
+    Returns:
+        dict: {策略key: 显示名}；缺失时调用方回退用 key。
+    """
     out = {}
     try:
         from app.market_cn.auto import strategies as _reg

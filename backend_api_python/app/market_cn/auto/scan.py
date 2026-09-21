@@ -39,8 +39,8 @@ _BACKEND_ROOT_DEFAULT = None  # 由 app 包上下文提供
 # 数据加载 (已迁 data/, 此处 import 保持调用点名字不变)
 # 2026-09-10: stock_info 改走 hub (fetch_stock_info_db 已归位 data/hub.py)
 # ================================================================
-from app.market_cn.auto.data.hub import all_codes, stock_info as _stock_info  # noqa: E402,F401
-from app.market_cn.auto.data.kline import fetch_kline_db  # noqa: E402,F401
+from app.market_cn.auto.core.data.hub import all_codes, stock_info as _stock_info  # noqa: E402,F401
+from app.market_cn.auto.core.data.kline import fetch_kline_db  # noqa: E402,F401
 
 
 # ================================================================
@@ -98,6 +98,28 @@ def _data_ready(target: str) -> bool:
     return bool(bars) and bars[-1]["time"] >= target
 
 
+def _anchor_idx(bars, sig, strat):
+    """U1~U4 锚定日索引: 'signal'=末根bar; 'limit_up'=信号 extra lu_date, 兜底最近涨停日。
+
+    run_scan(盘后) 与 run_scan_knife(盘中窗口) 共用 —— 两处必须同源, 否则同一策略在
+    两条路径上的 U1~U4 口径会分叉 (逐笔等价性以实盘路径为基准)。
+    """
+    from app.market_cn.auto.core.market import get_board_type, is_limit_up
+    n = len(bars)
+    if strat.prefilter_anchor == "limit_up":
+        lu_date = (sig.extra or {}).get("lu_date")
+        if lu_date:
+            j = next((j for j, b in enumerate(bars) if b["time"] == lu_date), None)
+            if j is not None:
+                return j
+        board_type = get_board_type(sig.code)
+        for j in range(n - 1, 0, -1):
+            if is_limit_up(bars[j]["close"], bars[j - 1]["close"], board_type):
+                return j
+        return None
+    return n - 1
+
+
 # ================================================================
 # 主扫描
 # ================================================================
@@ -112,8 +134,8 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     """
     from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
-    from app.market_cn.auto.common.filters import unified_prefilter
-    from app.market_cn.auto.common.market import is_limit_up, get_board_type
+    from app.market_cn.auto.core.filters import unified_prefilter
+    from app.market_cn.auto.core.market import is_limit_up, get_board_type
 
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()
@@ -154,22 +176,6 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     except Exception as e:
         logger.warning("[dragon_scan] stock_basic_info 加载失败(%s), 换手/市值过滤降级", e)
         stock_info = {}
-
-    def _anchor_idx(bars, sig, strat):
-        """U1~U4 锚定日索引: 'signal'=末根bar; 'limit_up'=信号 extra lu_date, 兜底最近涨停日。"""
-        n = len(bars)
-        if strat.prefilter_anchor == "limit_up":
-            lu_date = (sig.extra or {}).get("lu_date")
-            if lu_date:
-                j = next((j for j, b in enumerate(bars) if b["time"] == lu_date), None)
-                if j is not None:
-                    return j
-            board_type = get_board_type(sig.code)
-            for j in range(n - 1, 0, -1):
-                if is_limit_up(bars[j]["close"], bars[j - 1]["close"], board_type):
-                    return j
-            return None
-        return n - 1
 
     rows = []
     t0 = time.time()
@@ -258,22 +264,24 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True):
-    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / tail_oversold)。
+    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / tail_oversold / dragon_callback)。
 
     调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
     流程:
-      1. 等待到滚动起点 (有 rolling_preview 策略=tail_oversold 时 14:50, 否则 14:56 保持旧行为)
+      1. 等待到滚动起点 (有 rolling_preview 策略时取最早者, 现为 14:50; 否则 14:56 保持旧行为)
       2. 滚动预览 (14:50~14:55): 每分钟一轮 preview 策略的完整判定
          (幂等 upsert + 本轮落选 buy_today 清理), 前端自选组实时刷新, 用户提前准备
       3. 14:56 终审: 等待 14:56 快照落地 (采集 60s 一拍, 上限 45s) → 全部策略一轮
       单轮: 全市场最新快照 → 策略 intraday_shortlist 必要条件预筛 →
             候选股补拉当日快照序列+日线 → scan_signals 完整判定 →
+            U1~U4 统一预过滤 (use_unified_prefilter=True 的策略, 锚点 prefilter_anchor) →
             落库 state=buy_today, entry_date/price=快照价, 止损价
     幂等: upsert ON CONFLICT (trade_date, strategy, code, entry_style)。
     手动: python -m ...scan --knife [--no-wait]
     """
     from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
+    from app.market_cn.auto.core.filters import unified_prefilter
 
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()
@@ -347,6 +355,19 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                     logger.warning("[knife_scan] %s %s 判定异常(已跳过该股): %s",
                                    code, key, e)
                     continue
+                # U1~U4 统一预过滤 (与盘后 run_scan 同源; 锚点由策略 prefilter_anchor 声明)。
+                # 只有声明 use_unified_prefilter=True 的策略走本段 —— knife/tail 声明 False,
+                # 行为逐字不变; 否则盘中实盘会缺 U1~U4 而与其回测口径分叉。
+                if sigs and getattr(strat, "use_unified_prefilter", True):
+                    kept = []
+                    for s in sigs:
+                        idx = _anchor_idx(bars, s, strat)
+                        if idx is None:
+                            continue
+                        ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
+                        if ok:
+                            kept.append(s)
+                    sigs = kept
                 for s in sigs:
                     row = store.signal_row(key, s, name)
                     row["state"] = getattr(strat, "signal_state", "watch_pending")

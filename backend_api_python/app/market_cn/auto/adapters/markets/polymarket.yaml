@@ -1,0 +1,43 @@
+# ================================================================
+# 市场适配: Polymarket 预测市场 (声明式, **未接数据源**)
+# ----------------------------------------------------------------
+# 架构 §9 里最"极端"的市场 —— 它的存在价值是**证明瓶颈已被消除**:
+#   · settlement_basis=event → "持有 N 日卖出"无意义, 出场需 exit.on_resolution;
+#   · price_band=bounded[0,1] → 价格是概率, 不是股价;
+#   · 执行需链上 CLOB + 钱包签名 (不能假设券商 API/法币账户)。
+# 这些都由 §9.1 的正交字段完整承载, **core 不需要加分支**。
+# ================================================================
+key: POLYMARKET
+name: Polymarket
+
+# --- 交易限制 / 结算 ---
+intraday_t0: true
+settlement_days: 0
+settlement_basis: event     # 事件结算 (UMA Optimistic Oracle 裁决); 无"持有 N 日"概念
+
+# --- 方向 / 做空 ---
+direction: long_short      # YES / NO 二元面
+short_rule: synthetic_no   # 买 NO = 看空, 非借券做空 (是另一面合约)
+
+# --- 价格边界: 概率, 恒在 $0~$1, YES + NO = $1 ---
+band_kind: bounded
+bands: {}
+band_default: null
+price_bound: [0.0, 1.0]
+
+# --- 交易单位 / 币种 ---
+lot_size: 1
+tick_size: 0.01
+currency: USDC
+tz: UTC
+fee_model: taker_by_category    # 政治/金融 $1/100股, 加密 $1.75 等
+
+board_rules: []
+board_default: default
+board_names: []
+board_name_default: Polymarket
+
+# --- 数据源 ---
+source: ""
+runnable: false
+note: 二元事件合约; 事件结算(需 exit.on_resolution); 链上 CLOB + 钱包签名 + 非托管执行

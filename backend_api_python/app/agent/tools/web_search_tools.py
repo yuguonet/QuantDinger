@@ -8,7 +8,14 @@ web_search_tools — Agent 联网搜索工具
   3. baidusearch — 直接爬百度，免费无限额
   4. SearXNG — 自建兜底，无配额限制
 
-工具函数由 ToolRegistry 自动发现，无需手动注册。
+【注册方式·易错点】本模块在 tools/base.py 的 `_MUST_HAVE` 名单里 ⇒ scan_directory
+**跳过它**、ToolProvider 里**没有** web_search ⇒ 上层包装（task_agent.py 的
+_WebSearchTool）必须**直接 import 本模块的实现**，绝不能 `provider.get("web_search")`
+（恒为 None，2026-09-21 事故）。曾误写为"由 ToolRegistry 自动发现，无需手动注册"。
+
+【freshness 词表·易错点】工具对外统一用 pd/pw/pm/py（Tavily/Bing 惯例），但各引擎
+原生词表不同（博查 oneDay/oneWeek/oneMonth/oneYear，SearXNG day/week/month/year，
+Tavily 用天数 days）——下发前必须翻译，否则引擎按非法值处理、返回一堆旧文。
 """
 from __future__ import annotations
 
@@ -25,10 +32,24 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ── 配置 ──────────────────────────────────────────────────────
+# 【易错点】以下 key 都在 **import 期**读取一次：改 .env 后必须重启进程才生效，
+# 热改 .env 不生效（排查时最容易被误判成"key 明明配了却没生效"）。
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
+_TAVILY_API_URL = "https://api.tavily.com/search"
 _BOCHA_API_KEY = os.getenv("BOCHA_AI_API_KEY", "").strip()
-_TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+# Tavily key 的项目统一命名是**复数** TAVILY_API_KEYS（逗号分隔可轮换，见
+# app/config/api_keys.py、app/services/news_search.py）。此处曾读单数
+# TAVILY_API_KEY ⇒ 与 .env 的 TAVILY_API_KEYS 不匹配 ⇒ 该引擎**永远**报"未配置"
+# 并被静默降级掉（无报错，现象是"Tavily 从来没用上"）。2026-09-21 修复。
+_TAVILY_API_KEYS = [k.strip() for k in os.getenv("TAVILY_API_KEYS", "").split(",") if k.strip()]
 _SEARXNG_URL = os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/")
+
+# freshness 词表：工具对外统一用 pd/pw/pm/py（Tavily/Bing 惯例，也是工具 docstring
+# 对模型承诺的取值）。各引擎**原生词表不同**，必须翻译后再下发，否则引擎会当成
+# 非法值处理。见 _BOCHA_FRESHNESS 处的 2026-09-21 事故说明。
+_FRESHNESS_DAYS = {"pd": 1, "pw": 7, "pm": 30, "py": 365}
+_BOCHA_FRESHNESS = {"pd": "oneDay", "pw": "oneWeek", "pm": "oneMonth", "py": "oneYear"}
+_SEARXNG_FRESHNESS = {"pd": "day", "pw": "week", "pm": "month", "py": "year"}
 
 _REQUEST_TIMEOUT = 12  # 秒
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB
@@ -114,6 +135,14 @@ def _fail(provider: str, error: str) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _bocha_search(query: str, count: int = 8, freshness: str = "") -> Dict[str, Any]:
+    """博查引擎。freshness 必须翻译成博查原生词表（见 _BOCHA_FRESHNESS）。
+
+    【2026-09-21 事故】原实现直接把工具的 pd/pw/pm/py 塞进 payload["freshness"]，
+    而博查只认 noLimit/oneDay/oneWeek/oneMonth/oneYear（或 YYYY-MM-DD 区间）。
+    实测非法值下博查返回 2018~2025 年的旧文（同一 query 不传该参数反而返回当天
+    结果）⇒ 随后被 _filter_by_date 全数剔除 ⇒ 降级到最差的 baidu，返回
+    "大家还在搜…"这类垃圾。表现是"搜索结果全是废话"，根因却是参数词表不通。
+    """
     if not _BOCHA_API_KEY:
         return _fail("bocha", "BOCHA_AI_API_KEY 未配置")
 
@@ -121,8 +150,9 @@ def _bocha_search(query: str, count: int = 8, freshness: str = "") -> Dict[str, 
                "Authorization": f"Bearer {_BOCHA_API_KEY}"}
     payload = {"query": query, "count": min(max(count, 1), 10),
                "search_lang": "zh", "summary": True}
-    if freshness:
-        payload["freshness"] = freshness
+    bocha_freshness = _BOCHA_FRESHNESS.get(freshness, "")
+    if bocha_freshness:
+        payload["freshness"] = bocha_freshness
 
     try:
         resp = requests.post(_BOCHA_API_URL, headers=headers, json=payload,
@@ -167,32 +197,47 @@ def _bocha_search(query: str, count: int = 8, freshness: str = "") -> Dict[str, 
 #  Engine 2: Tavily
 # ═══════════════════════════════════════════════════════════════
 
-def _tavily_search(query: str, count: int = 8, days: int = 7) -> Dict[str, Any]:
-    if not _TAVILY_API_KEY:
-        return _fail("tavily", "TAVILY_API_KEY 未配置")
+def _tavily_search(query: str, count: int = 8, freshness: str = "") -> Dict[str, Any]:
+    """Tavily 引擎：直连 REST，**不依赖 tavily-python 包**。
+
+    【2026-09-21 修复】原实现 `from tavily import TavilyClient`，而 requirements.txt
+    里 tavily-python 是**注释掉的**（未安装）⇒ 每次调用都 ImportError、引擎永远不可用。
+    项目内已有同款 REST 直连先例（app/services/news_search.py 的
+    TavilySearchProvider._do_search_rest），此处对齐复用该做法，免装包。
+    freshness 走服务端 `days`（旧实现把它写死成 7，pd/py 都被当成一周）。
+    """
+    if not _TAVILY_API_KEYS:
+        return _fail("tavily", "TAVILY_API_KEYS 未配置")
+
+    payload = {
+        "api_key": _TAVILY_API_KEYS[0],   # 复数 env 支持逗号分隔轮换，此处取首个
+        "query": query,
+        "search_depth": "advanced" if count > 5 else "basic",
+        "max_results": min(max(count, 1), 10),
+        "include_answer": True,
+        "topic": "general",
+    }
+    days = _FRESHNESS_DAYS.get(freshness, 0)
+    if days:
+        payload["days"] = days
 
     try:
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=_TAVILY_API_KEY)
-
-        search_depth = "advanced" if count > 5 else "basic"
-        response = client.search(
-            query=query,
-            max_results=min(count, 10),
-            search_depth=search_depth,
-            include_answer=True,
-            topic="general",
-            days=days,
-        )
+        resp = requests.post(_TAVILY_API_URL, json=payload, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code == 401:
+            return _fail("tavily", "Tavily API Key 无效")
+        if resp.status_code == 429:
+            return _fail("tavily", "Tavily 频率限制")
+        resp.raise_for_status()
+        data = resp.json()
 
         results = []
-        for item in response.get("results", []):
+        for item in data.get("results", []):
             results.append({
                 "title": _clean(item.get("title", "")),
                 "url": _clean(item.get("url", "")),
                 "snippet": _clean(item.get("content", "")),
                 "source": "",
-                "published": "",
+                "published": item.get("published_date", "") or "",
                 "score": item.get("score", 0),
             })
 
@@ -200,21 +245,16 @@ def _tavily_search(query: str, count: int = 8, days: int = 7) -> Dict[str, Any]:
             return _fail("tavily", "Tavily 搜索无结果")
 
         r = _ok(results, "tavily")
-        answer = response.get("answer", "")
+        answer = data.get("answer", "")
         if answer:
             r["summary"] = _clean(answer)[:1500]
         return r
 
-    except ImportError:
-        return _fail("tavily", "tavily-python 未安装")
+    except requests.exceptions.Timeout:
+        return _fail("tavily", "Tavily 超时")
     except Exception as e:
-        err_msg = str(e)
-        if "401" in err_msg or "invalid" in err_msg.lower():
-            return _fail("tavily", "Tavily API Key 无效")
-        if "429" in err_msg or "rate" in err_msg.lower():
-            return _fail("tavily", "Tavily 频率限制")
         logger.warning("[WebSearch] Tavily 异常: %s", e)
-        return _fail("tavily", err_msg)
+        return _fail("tavily", str(e))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -261,14 +301,18 @@ def _baidu_search(query: str, count: int = 8) -> Dict[str, Any]:
 #  Engine 4: SearXNG (自建兜底)
 # ═══════════════════════════════════════════════════════════════
 
-def _searxng_search(query: str, count: int = 8, engines: str = "",
-                    language: str = "zh") -> Dict[str, Any]:
+def _searxng_search(query: str, count: int = 8, freshness: str = "",
+                    engines: str = "", language: str = "zh") -> Dict[str, Any]:
     if not _SEARXNG_URL:
         return _fail("searxng", "SEARXNG_BASE_URL 未配置")
 
     params = {"q": query, "format": "json", "language": language, "pageno": 1}
     if engines:
         params["engines"] = engines
+    # SearXNG 原生词表是 day/week/month/year（与工具的 pd/pw/pm/py 不同，需翻译）
+    time_range = _SEARXNG_FRESHNESS.get(freshness, "")
+    if time_range:
+        params["time_range"] = time_range
 
     try:
         resp = requests.get(f"{_SEARXNG_URL}/search", params=params,
@@ -305,9 +349,9 @@ def _searxng_search(query: str, count: int = 8, engines: str = "",
 
 _ENGINES = [
     ("bocha",    lambda q, c, f: _bocha_search(q, c, f)),
-    ("tavily",   lambda q, c, f: _tavily_search(q, c)),
+    ("tavily",   lambda q, c, f: _tavily_search(q, c, f)),
     ("baidu",    lambda q, c, f: _baidu_search(q, c)),
-    ("searxng",  lambda q, c, f: _searxng_search(q, c)),
+    ("searxng",  lambda q, c, f: _searxng_search(q, c, f)),
 ]
 
 
@@ -381,7 +425,6 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
 
     # freshness → max_age_days 映射（后置过滤用）
     # "" = 不过滤（知识型查询），有值时按值过滤
-    _FRESHNESS_DAYS = {"pd": 1, "pw": 7, "pm": 30, "py": 365}
     max_age_days = _FRESHNESS_DAYS.get(freshness, 0)  # 0 = 不过滤
 
     errors = []
@@ -401,8 +444,11 @@ def _unified_search(query: str, count: int = 8, freshness: str = "",
             if result["results"]:  # 过滤后仍有结果
                 _cache_set(cache_key, result)
                 return result
-            # 过滤后无结果，尝试下一个引擎
+            # 过滤后无结果，尝试下一个引擎。
+            # 必须记入 errors：否则"全部引擎都被时效过滤掉"时 errors 为空，最终
+            # 报出 `所有引擎均失败: `（后面什么都没有）——排查时完全误导。
             logger.info("[WebSearch] %s 日期过滤后无结果，尝试下一个引擎", name)
+            errors.append(f"{name}: {before_filter} 条结果全部超过时效({freshness})被过滤")
             continue
         errors.append(f"{name}: {result.get('error', '?')}")
         logger.info("[WebSearch] %s 失败 → 下一个", name)

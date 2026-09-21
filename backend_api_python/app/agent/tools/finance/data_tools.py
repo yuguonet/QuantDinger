@@ -156,36 +156,52 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         return results[code_list[0]]
     return {"count": len(results), "data": results}
 
-def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
-    """K线数据：返回OHLCV，支持 A 股。
+def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
+    """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
 
     ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
 
     Returns:
-        单代码 → [{t,o,h,l,c,v}, ...]（顶层直接是 list）；多代码 →
-        {"count": N, "data": {代码: [K线dict]}}；失败 → {"error": ...}
+        {"count": N, "data": {代码: [{"t","o","h","l","c","v"}, ...]}}；
+        失败 → {"error": "...", "retriable": bool}（error 键恒参与，成功时为 None）
+        注意：无论单代码还是多代码，data 都是"代码 → K线列表"的映射，取单只用 data[codes]。
 
     Args:
-        codes: 多股用逗号分隔
-        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认1D
-        days: 天数，默认30，最大250
+        codes: 股票代码，字符串（如 "603466"）或代码列表均可，多股逗号分隔
+        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
+        days: 天数，默认 30，最大 250
     """
-    code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    # codes 容错：模型可能传 list / list[tuple] / 数字 / 带前后缀串
+    if isinstance(codes, (list, tuple)):
+        _parts = []
+        for c in codes:
+            if isinstance(c, (list, tuple)) and c:
+                c = c[0]
+            _parts.append(str(c))
+        codes = ",".join(_parts)
+    else:
+        codes = str(codes)
+
+    code_list = [_strip_prefix(c.strip()) for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
     valid_timeframes = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"}
     if timeframe not in valid_timeframes:
-        return {"error": f"无效周期: {timeframe}，可选: {','.join(sorted(valid_timeframes))}"}
-    _days = min(max(days, 1), 250)
+        return {"error": f"无效周期: {timeframe}，可选: {','.join(sorted(valid_timeframes))}", "retriable": False}
+    _days = min(max(int(days), 1), 250)
 
-    ds = _get_ds("CNStock")
+    # 直连 CNStockDataSource（cn_stock.py）：1D/1W 本地 DB + TTL 快路径，
+    # 盘中分钟线走远端。不再经 coordinator 二次包装。
+    from app.data_sources.cn_stock import CNStockDataSource
 
     def _fetch(stock_code: str) -> list:
         try:
+            ds = CNStockDataSource()
             return ds.get_kline(stock_code, timeframe, _days) or []
         except Exception as e:
-            logger.error("get_kline(%s, %s, %d) failed: %s", stock_code, timeframe, _days, e)
+            logger.error("agent_get_kline.get_kline(%s, %s, %d) failed: %s",
+                         stock_code, timeframe, _days, e)
             return []
 
     def _ts_to_date(ts) -> str:
@@ -195,7 +211,6 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[s
         except Exception:
             return str(ts)
 
-    # ── 完整 OHLCV ──
     results: Dict[str, Any] = {}
     for code in code_list:
         klines = _fetch(code)
@@ -207,9 +222,12 @@ def agent_get_kline(codes: str, timeframe: str = "1D", days: int = 30) -> Dict[s
             "c": round(k.get("close", 0), 2),
             "v": k.get("volume", 0),
         } for k in klines]
-    if len(code_list) == 1:
-        return results[code_list[0]]
-    return {"count": len(results), "data": results}
+
+    # 统一形态：单/多代码都是 {count, data: {code: [...]}}，error 键恒在
+    # （2026-09-21 修复：旧版单代码返回裸 list、多代码返回 dict 的二义性导致
+    #  模型拿 list 当 dict 切片 → TypeError "string indices must be integers"，
+    #  连续两次触发熔断，是 step 爆炸的主要推手之一）
+    return {"count": len(results), "data": results, "error": None}
 
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {
@@ -312,9 +330,10 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
 
         # 2026-09-15 条件触发：basicinfo 已覆盖（有价格且估值非占位）→ 跳过 HTTP；
         # cn_stock_info 兜底实测 ~16s，故超时放宽 STOCK_INFO_HTTP_TIMEOUT(默认 20s)。
+        # 2026-09-21 收紧：DB 有非零估值（回填机制已上线）即跳过 20s 大竞赛——
+        # 价格/换手等实时字段由后置腾讯 3s 补全负责，不为它们付 20s。
         _needs_http = (
             not db_result
-            or not db_result.get("last_price")
             or float(db_result.get("pe_ratio") or 0) == 0
         )
         _http_timeout = int(os.getenv("STOCK_INFO_HTTP_TIMEOUT", "20"))
@@ -381,6 +400,44 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             logger.info("get_stock_info(%s) 腾讯估值 3s 超时，跳过补全", stock_code)
         except Exception as e:
             logger.debug("get_stock_info(%s) 腾讯估值补全跳过: %s", stock_code, e)
+
+        # ── 5) 估值回填 DB（2026-09-21）：腾讯估值是实时快照，写回 stock_basic_info
+        # 让下次毫秒级命中（pe_ratio/pb_ratio 非零才覆盖，upsert 已有 CASE 保护）。
+        if (result.get("pe_ttm") or result.get("pb")) and result.get("price"):
+            try:
+                from app.utils.basicinfo_db import get_stock_basic_db
+                get_stock_basic_db().upsert_stocks([{
+                    "symbol": sym,
+                    "name": result.get("name", ""),
+                    "market_cn": result.get("market_cn") or "",
+                    "pe_ratio": float(result.get("pe_ttm") or 0),
+                    "pb_ratio": float(result.get("pb") or 0),
+                }])
+            except Exception as e:
+                logger.debug("get_stock_info(%s) 估值回填 DB 跳过: %s", stock_code, e)
+
+        # ── 6) ROE 补全（2026-09-21）：stock_basic_info 无 ROE 列、腾讯行情接口
+        # 也不带 ROE。cn_stock_info（新浪财务指标页）有，但完整拉取 ~16s 太重，
+        # 只在 ROE 缺失时按需补（8s 上限，失败不阻塞——ROE 属增强字段）。
+        if not result.get("roe"):
+            try:
+                # 2026-09-21 实测：get_cn_stock_info 全量 27s 太重；_sina_finance
+                # （新浪财务指标页）0.75s 即含 ROE/EPS/bvps，用它。
+                def _roe_fetch():
+                    from app.utils.cn_stock_info import _sina_finance
+                    fin = _sina_finance(sym) or {}
+                    return fin.get("roe")
+                _rpool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    _roe = _rpool.submit(_roe_fetch).result(timeout=4)
+                finally:
+                    _rpool.shutdown(wait=False)
+                if _roe is not None:
+                    result["roe"] = _roe
+            except FuturesTimeout:
+                logger.debug("get_stock_info(%s) ROE 补全 4s 超时", stock_code)
+            except Exception as e:
+                logger.debug("get_stock_info(%s) ROE 补全跳过: %s", stock_code, e)
 
         return result
 
@@ -514,6 +571,10 @@ def get_order_book(codes: str) -> dict:
 
 def get_index_etf_quote(codes: str) -> dict:
     """指数/ETF行情：返回价格、涨跌幅、成交量，支持上证/深证/创业板/沪深300及对应ETF。
+
+    Returns:
+        dict: {total, quotes:[{code, name, price, change_pct, change_amt, high, low,
+        amount_wan, open, last_close}]}，行情列表在 quotes；失败→{error}。
 
     Args:
         codes: 逗号分隔的代码，如 "000001,000300,399006,510050"

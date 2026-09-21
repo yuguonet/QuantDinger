@@ -70,7 +70,7 @@ def env_flow_features(index_code="000300", as_of=None, lookback=20):
     as_of: 决策日 (YYYY-MM-DD 或含时间); 只用严格早于 as_of 的日累计。
     """
     try:
-        from app.market_cn.auto.data.hub import index_fflow
+        from app.market_cn.auto.core.data.hub import index_fflow
         bars = index_fflow(index_code, days=lookback + 6, as_of=as_of) or []
     except Exception:
         return None
@@ -144,7 +144,7 @@ def _demo():
     # 验证数学经 env_flow_features (临时替换 hub)
     real = mod.index_fflow
     try:
-        import app.market_cn.auto.data.hub as hubmod
+        import app.market_cn.auto.core.data.hub as hubmod
         orig = hubmod.index_fflow
         hubmod.index_fflow = _Hub.index_fflow
         f = mod.env_flow_features("000300", as_of="2026-09-12")

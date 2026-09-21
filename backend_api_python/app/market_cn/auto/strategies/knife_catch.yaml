@@ -1,0 +1,70 @@
+# ================================================================
+# knife_catch 反向接刀 (14:56 尾盘买入 → D1 开盘卖) — IDE 门表单文件 (M4)
+# 与 strategies/knife_catch.py (scan_signals) 逐笔等价 (见 tmp/_knife_equivalence.py)
+# ----------------------------------------------------------------
+# 大盘下跌日 + 个股深跌 + 尾盘卖盘枯竭 + 全天压制 VWAP 下方 + 收盘贴低点
+# → 次日高概率反弹。四过滤叠加（宁缺勿滥质量门）。
+# 盘中通道：时间线引擎（1m 快照帧）逐槽位判定；qualify 门 = 快照级、required 门 = 需序列/日线。
+# ================================================================
+meta:
+  name: 反向接刀
+  market: A
+  version: 1
+  enumeration: intraday
+  intraday:
+    windows: ["14:30", "15:00"]   # 扫描窗口 (14:30 起预热, 14:56 后出信号)
+    interval_sec: 60              # 每分钟一槽
+
+entry:
+  mode: intraday                  # 触发槽位现价买入 (14:56 尾盘)
+  price: last
+
+exit:
+  mode: d1_open                   # 次交易日(D1)开盘卖 (T+1)
+
+params:                           # 与 strategies/knife_catch.py PARAMS 同值 (逐笔等价基线)
+  gain_max: -8.0                  # 当日涨幅上限 % (深跌)
+  amp_min: 12.0                   # 当日振幅下限 % (排除窄幅阴跌)
+  pos_max: 0.1                    # 收盘位置上限 (0=最低点)
+  tail_min: 0.5                   # 尾盘20分钟回升下限 % (卖盘枯竭)
+  vw_max: 0.2                     # 全天 VWAP 上方占比上限
+  mkt_gate: -1.0                  # 市场门控: 全市场均涨幅 <= 此值才扫描
+  vol_max: 1.5                    # 量比上限 (过度恐慌继续崩)
+  pre5_max: -15.0                 # 近5日涨幅上限 % (前期已走弱)
+  streak_min: 2                   # 连跌天数下限 (含当日)
+
+# 门表：qualify = 快照级 (只需 latest/mkt_gain) / required = 需快照序列 + 日线上下文。
+# NaN 哨兵：缺值/序列不足/日线不足 → 数值门自然失败 (与参考版早返回同效)。
+# 说明: 参考版另有 intraday_shortlist/day_prefilter 两层"便宜预筛"（必要条件超集，
+#       只影响枚举规模不影响 trades），IDE 盘中通道复用它们（见 ide/intraday.py 模块头）。
+gates:
+  - {id: kc_window, name: 尾盘窗口, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "kc_hhmm() >= '14:56'"}                  # 14:56 之后才出信号
+  - {id: kc_mkt, name: 市场门控, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "kc_mkt_gain() <= mkt_gate"}             # None → nan → 拦截 (镜像 mkt_gain is None)
+  - {id: kc_feat, name: 深跌+振幅+贴低, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('gain') <= gain_max and kc_metric('amp') >= amp_min and kc_metric('pos') <= pos_max"}
+  - {id: kc_tail_vw, name: 尾盘回升+压制VWAP, role: required, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('tail') >= tail_min and kc_metric('vw') <= vw_max"}   # None → nan → 拦截
+  - {id: kc_vol, name: 量比上限, role: required, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('vol_ratio') <= vol_max"}
+  - {id: kc_streak, name: 连跌下限, role: required, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('streak') >= streak_min"}
+  - {id: kc_pre5, name: 近5日走弱, role: required, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('pre5') <= pre5_max"}
+  - {id: kc_lu_recent, name: 近期无涨停, role: required, needs_d0: 1, enabled: 1,
+     expr: "kc_metric('lu_recent') == 0"}
+
+# 信号展示字段（门通过后求值; 与参考版 Signal.extra 逐字段一致）
+signal:
+  fields:
+    gain: {expr: "kc_metric('gain')", fmt: r2}
+    amplitude: {expr: "kc_metric('amp')", fmt: r2}
+    pos_range: {expr: "kc_metric('pos')", fmt: r3}
+    tail_ret: {expr: "kc_metric('tail')", fmt: r2}
+    vw_frac: {expr: "kc_metric('vw')", fmt: r3}
+    vol_ratio: {expr: "kc_metric('vol_ratio')", fmt: r3}
+    down_streak: {expr: "kc_metric('streak')", fmt: int}
+    pre5_gain: {expr: "kc_metric('pre5')", fmt: r2}
+    lu_recent: {expr: "kc_metric('lu_recent')", fmt: int}
+    mkt_gain: {expr: "kc_mkt_gain()", fmt: r3}

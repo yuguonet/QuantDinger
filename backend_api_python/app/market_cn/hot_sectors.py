@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 热门板块 & 概念板块实时分析
-数据源: 东方财富板块行情 API（直接 HTTP，不依赖 AKShare）
+数据源: **新浪为主**（newSinaHy / newFLJK，无反爬，稳定），东方财富 push2 作降级
+       （2026-09-21 主备翻转：push2 反爬频繁掐连接，sina 反而稳定）
 依赖: pip install requests pandas
 
 功能:
@@ -74,7 +75,8 @@ _INDUSTRY_FIELDS = (
 # ═══ push2 熔断 + sina 兜底（2026-09-14 反爬封禁事件）═══
 # push2.eastmoney.com 会对连续请求的 IP 掐连接（RemoteDisconnected，无状态码；
 # 数字前缀镜像 host 一并封禁，分钟级以上）。`_retry` 连打 3 次反而加重限频
-# ⇒ 失败即熔断：10 分钟内入口直接走 sina 兜底，不再碰 push2。
+# ⇒ 失败即熔断：10 分钟内入口不再碰 push2。
+# 2026-09-21：主备翻转——sina 升为主源，push2 降为降级源（仅在 sina 为空时尝试）。
 _push2_blocked_until = 0.0
 _PUSH2_BLOCK_SECONDS = 600
 
@@ -126,24 +128,56 @@ def _board_list_sina(board_type: str, limit: int) -> list:
     return out
 
 
+def _fetch_board_list_sina(board_type, limit):
+    """新浪板块行情主源：行业→newSinaHy，概念→newFLJK，地域无 sina 等价 → []。"""
+    try:
+        if board_type == "industry":
+            return _fetch_sina_industry_boards(limit)
+        if board_type == "concept":
+            return _fetch_sina_concept_boards(limit)
+        return []   # area 无 sina 板块行情通道
+    except Exception as e:
+        logger.warning("[hot_sectors] sina 板块行情失败(%s): %s", board_type, e)
+        return []
+
+
+def _sort_boards(rows, sort_by, sort_dir):
+    """按请求字段重排（sina 主源默认按涨跌幅降序返回，其余排序键需本地重排）。"""
+    keymap = {"f3": "change_pct", "f6": "amount", "f8": "turnover", "f20": "total_mv"}
+    key = keymap.get(sort_by, "change_pct")
+    try:
+        return sorted(rows, key=lambda x: _safe_num(x.get(key)), reverse=(sort_dir != "asc"))
+    except Exception:
+        return rows
+
+
 def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
-    """板块排名入口：push2 优先；熔断期内 / 失败时自动降级 sina。
+    """板块排名入口：**sina 主源**；sina 空时降级东财 push2；再不行回退 sina 资金流通道。
 
     board_type: industry | concept | area
     sort_by: f3=涨跌幅, f6=成交额, f8=换手率, f20=总市值
     """
-    if time.time() < _push2_blocked_until:
-        return _board_list_sina(board_type, limit)
-    try:
-        return _fetch_board_list_push2(board_type, sort_by, sort_dir, limit)
-    except Exception as e:
-        _mark_push2_blocked()
-        fallback = _board_list_sina(board_type, limit)
-        if fallback:
-            logger.warning("[hot_sectors] push2 失败(%s)，已降级 sina（%d 行）",
-                           type(e).__name__, len(fallback))
-            return fallback
-        raise
+    # ① 主源：新浪板块行情（无反爬、稳定）
+    rows = _fetch_board_list_sina(board_type, limit)
+    if rows:
+        return _sort_boards(rows, sort_by, sort_dir)
+
+    # ② 降级：东财 push2（连续请求会被反爬掐断 ⇒ 失败即熔断，10 分钟内不再尝试）
+    if time.time() >= _push2_blocked_until:
+        try:
+            rows = _fetch_board_list_push2(board_type, sort_by, sort_dir, limit)
+            if rows:
+                logger.warning("[hot_sectors] sina 主源为空，已降级东财 push2（%d 行）", len(rows))
+                return rows
+        except Exception as e:
+            _mark_push2_blocked()
+            logger.warning("[hot_sectors] push2 降级源失败(%s)", type(e).__name__)
+
+    # ③ 末级兜底：sina 资金流通道（index.get_sector_fund_flow，含 main_net）
+    fallback = _board_list_sina(board_type, limit)
+    if fallback:
+        logger.warning("[hot_sectors] 主源与 push2 均不可用，回退 sina 资金流（%d 行）", len(fallback))
+    return fallback
 
 
 def _fetch_board_list_push2(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
@@ -312,7 +346,12 @@ def _analyze_continuity(boards):
 # ═══════════════════════════════════════════════════
 
 def get_hot_industry_boards(limit=20):
-    """获取热门行业板块（按涨幅排序）"""
+    """获取热门行业板块（按涨幅排序）。数据源：**新浪为主**（newSinaHy），东财 push2 降级。
+
+    Returns:
+        list[dict]: 板块行 [{name, code, change_pct, amount, up_count, down_count, lead_stock, limit_up_count, strength, amount_yi}]。
+        注：sina 主源无 涨停家数/涨跌家数 ⇒ limit_up_count/up_count/down_count 为 0。
+    """
     logger.info("获取热门行业板块 top %d", limit)
     boards = _fetch_board_list("industry", sort_by="f3", sort_dir="desc", limit=limit)
     boards = _analyze_continuity(boards)
@@ -320,7 +359,11 @@ def get_hot_industry_boards(limit=20):
 
 
 def get_hot_concept_boards(limit=20):
-    """获取热门概念板块（按涨幅排序）"""
+    """获取热门概念板块（按涨幅排序）。数据源：**新浪为主**（newFLJK），东财 push2 降级。
+
+    Returns:
+        list[dict]: 板块行，键同 get_hot_industry_boards（sina 主源同样无涨跌家数）。
+    """
     logger.info("获取热门概念板块 top %d", limit)
     boards = _fetch_board_list("concept", sort_by="f3", sort_dir="desc", limit=limit)
     boards = _analyze_continuity(boards)
@@ -328,20 +371,26 @@ def get_hot_concept_boards(limit=20):
 
 
 def get_sector_detail(board_code, limit=10):
-    """获取板块内强势个股"""
+    """获取板块内强势个股
+
+    Returns:
+        list[dict]: 板块内个股 [{code, name, price, change_pct, amount, turnover, is_limit_up}]；失败/熔断 []。
+    """
     return _fetch_sector_stocks(board_code, limit=limit)
 
 
 def _fetch_sina_industry_boards(limit=30):
-    """新浪行业板块（备用数据源）
+    """新浪行业板块（**主数据源**）
 
     数据格式 (13字段):
-      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]change_pct,[5]change_ratio,
+      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]avg_change_amount,[5]change_pct,
       [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
 
-    注意:
-      - change_pct [4] 是小数 (0.05 = 5%)，需要 *100
-      - lead_pct [9] 已经是百分比 (10.084 = 10.08%)，不需要转换
+    注意（2026-09-21 修正）:
+      - [4] 是**平均价格变动（元）**，不是涨跌幅；涨跌幅取 [5]（%）。
+        实测 [4]/[3]*100 ≈ [5]（简单均值 vs 加权）。旧实现误用 [4]*100，
+        产出 281.6% 之类的乱值。
+      - lead_pct [9] 已经是百分比 (10.084 = 10.08%)，不需要转换。
     """
     url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
     try:
@@ -361,7 +410,7 @@ def _fetch_sina_industry_boards(limit=30):
             parts = val.split(",")
             if len(parts) < 13:
                 continue
-            change_pct = _safe_num(parts[4]) * 100  # 小数→百分比
+            change_pct = _safe_num(parts[5])  # [5]=涨跌幅(%)（[4] 是平均价格变动(元)，勿用）
             results.append({
                 "name": parts[1],
                 "code": parts[0],
@@ -382,16 +431,17 @@ def _fetch_sina_industry_boards(limit=30):
 
 
 def _fetch_sina_concept_boards(limit=30):
-    """新浪概念板块（备用数据源）
+    """新浪概念板块（**主数据源**）
 
     数据来源: https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class
     返回 gn_ 前缀的概念板块，共约 175 个。
 
     数据格式 (13字段):
-      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]change_pct,[5]change_ratio,
+      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]avg_change_amount,[5]change_pct,
       [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
 
-    注意: change_pct[4] 和 lead_pct[9] 已经是百分比，不需要乘100。
+    注意（2026-09-21 修正）: 涨跌幅取 [5]（%）。[4] 是平均价格变动(元)，不是百分比；
+    旧实现误把 [4] 当百分比，全表普遍偏小/错位。lead_pct [9] 已是百分比。
     """
     url = "https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class"
     try:
@@ -411,7 +461,7 @@ def _fetch_sina_concept_boards(limit=30):
             parts = val.split(",")
             if len(parts) < 13:
                 continue
-            change_pct = _safe_num(parts[4])  # 已是百分比
+            change_pct = _safe_num(parts[5])  # [5]=涨跌幅(%)（[4] 是平均价格变动(元)，勿用）
             results.append({
                 "name": parts[1],
                 "code": parts[0],
@@ -434,6 +484,9 @@ def _fetch_sina_concept_boards(limit=30):
 
 def get_all_hot_sectors(industry_limit=15, concept_limit=15):
     """获取全部热门板块数据（供 API 使用）
+
+    Returns:
+        dict: {timestamp, industry: [...], concept: [...], analysis: {...}}；板块行键同 get_hot_industry_boards。
 
     优先使用新浪（稳定，无反爬），东财作为兜底。
     """

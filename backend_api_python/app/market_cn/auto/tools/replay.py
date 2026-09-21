@@ -50,7 +50,7 @@ def main():
         _replay_intraday(strat, args)
         return
 
-    from app.market_cn.auto.data.hub import daily, stock_info
+    from app.market_cn.auto.core.data.hub import daily, stock_info
 
     try:
         stock_info = stock_info().get(args.code)
@@ -89,9 +89,9 @@ def _replay_intraday(strat, args):
     单股回看 --days 自然日内的历史 (或 --start-date/--end-date 显式窗口)。
     """
     from datetime import datetime, timedelta
-    from app.market_cn.auto.data import frames as fr
-    from app.market_cn.auto.data.hub import daily
-    from app.market_cn.auto.backtest import _exec_trigger_mis
+    from app.market_cn.auto.core.data import frames as fr
+    from app.market_cn.auto.core.data.hub import daily
+    from app.market_cn.auto.core.backtest import _exec_trigger_mis
 
     end = args.end_date or datetime.now().strftime("%Y-%m-%d")
     start = args.start_date or (datetime.strptime(end, "%Y-%m-%d")

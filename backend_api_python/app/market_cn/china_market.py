@@ -258,7 +258,11 @@ def _warmup():
 # ============================================================
 
 def get_fear_greed() -> dict:
-    """A股市场贪婪恐惧指数 (7维度综合)"""
+    """A股市场贪婪恐惧指数 (7维度综合)
+
+    Returns:
+        dict: {code, msg, data}；data 含 composite_score/label/indicators/time 等；无数据 data={}。
+    """
     if _rt_fear_greed is not None:           # ① 内存缓存
         return _rt_fear_greed
     try:                                      # ② 远端拉取
@@ -282,18 +286,30 @@ def get_hot_sectors(industry_limit=15, concept_limit=15) -> dict:
 
 
 def get_sector_trend(board_type="industry") -> dict:
-    """板块1个月趋势 + 6个月周期 + 预测 — 直接从 DB 计算，无缓存"""
+    """板块1个月趋势 + 6个月周期 + 预测 — 直接从 DB 计算，无缓存
+
+    Returns:
+        dict: {code, msg, data}；data 为趋势/周期/预测聚合 dict（无数据时 {}）。
+    """
     data = _fetch_sector_trend(board_type)
     return {"code": 1, "msg": "success", "data": data or {}}
 
 
 def get_sector_prediction() -> dict:
-    """今日热门板块预测 — 直接从 DB 计算，无缓存"""
+    """今日热门板块预测 — 直接从 DB 计算，无缓存
+
+    Returns:
+        dict: {code, msg, data}；data 含 {industry, concept, timestamp}。
+    """
     return _fetch_sector_prediction()
 
 
 def get_sector_cycle(board_type="industry") -> dict:
-    """板块6个月周期分析 — 直接从 DB 计算，无缓存"""
+    """板块6个月周期分析 — 直接从 DB 计算，无缓存
+
+    Returns:
+        dict: {code, msg, data}；data 含 {cycle, data_days, date_range}。
+    """
     return _fetch_sector_cycle(board_type)
 
 
@@ -311,7 +327,11 @@ def get_sector_stocks(board_code: str, limit=15) -> dict:
 
 
 def get_sector_history(board_type="industry", days=30) -> dict:
-    """板块历史排名数据 — 直接从 DB 读取，无缓存"""
+    """板块历史排名数据 — 直接从 DB 读取，无缓存
+
+    Returns:
+        dict: {code, msg, count, data}；data=[排名行, ...]。
+    """
     days = min(max(days, 1), 250)
     try:
         from .sector_history import get_sector_history as _get_history
@@ -323,13 +343,21 @@ def get_sector_history(board_type="industry", days=30) -> dict:
 
 
 def get_emotion_history(hours=None, date=None) -> dict:
-    """情绪指数历史数据 — 直接从文件读取，无缓存"""
+    """情绪指数历史数据 — 直接从文件读取，无缓存
+
+    Returns:
+        dict: {code, count, history: [...]}；history=情绪快照行列表。
+    """
     from .emotion import get_emotion_history as _get
     return _get(hours=hours)
 
 
 def get_policy() -> dict:
-    """政策新闻 — 纯读: 直接从 DB 加载，无内存缓存"""
+    """政策新闻 — 纯读: 直接从 DB 加载，无内存缓存
+
+    Returns:
+        dict: {code, msg, timestamp, data}；data 含 {news: [...], score, direction, count}。
+    """
     try:
         from app.services.news_search import get_news_cache_manager
         from app.services.news_analysis import composite_score

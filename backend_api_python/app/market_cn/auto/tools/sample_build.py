@@ -134,7 +134,7 @@ def build(probe_paths, indexes, keep_win=False, dup_mode="dedup", out_path=None)
             kinds[s] = "intraday_window"   # 注册表查不到 → 保守按盘中口径 (as-of 到 D-1, 严不松)
 
     # 指数日线 (进程内按 code 只拉一次)
-    from app.market_cn.auto.data import hub
+    from app.market_cn.auto.core.data import hub
     idx_bars = {}
     for code in indexes:
         bars = hub.index_daily(code, days=800)

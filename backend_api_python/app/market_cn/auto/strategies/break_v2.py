@@ -29,7 +29,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.market import (
+from app.market_cn.auto.core.market import (
     find_limit_ups, get_board_name, get_board_type, is_limit_up,
 )
 from app.market_cn.auto.strategies import register
@@ -73,7 +73,7 @@ def _env_ret20(index_code, d0_date):
         return _ENV_RET20_MEMO[k]
     v = None
     try:
-        from app.market_cn.auto.data.hub import index_daily
+        from app.market_cn.auto.core.data.hub import index_daily
         bars = index_daily(index_code, days=60, as_of=d0_date) or []
         c = [float(b["close"]) for b in bars]
         if len(c) >= 21 and c[-21] > 0:
@@ -276,7 +276,7 @@ class BreakV2Strategy(StrategyBase):
     # ---- 回测钩子 (与 break_buy.backtest_stock 同构; 门参数从 config 透传) ----
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
                       probe=None):
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
         _p0 = self.merged_params()   # 2026-09-13 接线: 原硬编码 2,5 压过实例覆写 (同 break_buy)
         min_streak, max_break_gap = _p0["min_streak"], _p0["max_break_gap"]
@@ -397,5 +397,5 @@ class BreakV2Strategy(StrategyBase):
 
 
 def _find_limit_ups(bars, bt):
-    from app.market_cn.auto.common.market import find_limit_ups as _fl
+    from app.market_cn.auto.core.market import find_limit_ups as _fl
     return _fl(bars, bt)

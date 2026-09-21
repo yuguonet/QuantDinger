@@ -1,0 +1,40 @@
+# ================================================================
+# 市场适配: 美股 (声明式, **未接数据源**)
+# ----------------------------------------------------------------
+# 按架构 §9.1/§9.2 建模; `runnable: false` —— 被要求运行时明确报错。
+# 账户级约束 (PDT / GFV) **刻意不入本文件**: 那是账户属性, 由执行适配器/账户配置
+# 承载, 不进市场级字段 (架构 §9.0)。
+# ================================================================
+key: US
+name: 美股
+
+# --- 交易限制 / 结算 ---
+intraday_t0: true           # 当日可无限次买卖同一只
+settlement_days: 1          # 2024-05-28 起 T+2 → T+1
+settlement_basis: calendar
+
+# --- 方向 / 做空 ---
+direction: long_short
+short_rule: RegSHO+alt_uptick   # covered short; 单日跌 >10% 后只能用 ≥ 全国最佳买价做空
+
+# --- 价格边界: 无涨跌停 (仅全市场熔断) ---
+band_kind: none
+bands: {}
+band_default: null
+
+# --- 交易单位 / 币种 ---
+lot_size: 1
+tick_size: 0.01
+currency: USD
+tz: ET
+fee_model: commission
+
+board_rules: []
+board_default: default
+board_names: []
+board_name_default: 美股
+
+# --- 数据源 ---
+source: ""
+runnable: false
+note: 交易 T+0 / 结算 T+1; 无涨跌停, 仅标普 500 跌 7%/13%/20% 全市场熔断; PDT/GFV 属账户级不入此表

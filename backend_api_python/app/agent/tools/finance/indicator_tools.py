@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional
 def list_indicators(user_id: int = 1) -> Dict[str, Any]:
     """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
+    Returns:
+        dict: {indicators:[{id, user_id, is_buy, name, description, price, createtime,
+        updatetime, ...}], count}；失败→{indicators: [], count: 0, error}。
+
     Args:
         user_id: 用户 ID，默认 1
     """
@@ -54,6 +58,9 @@ def get_indicator_params(indicator_id: int, user_id: int = 1) -> Dict[str, Any]:
     """指标参数：返回指定指标策略的可配置参数列表及默认值。
 
     解析指标代码中的 # @param 注释，返回参数名称、类型、默认值。
+
+    Returns:
+        dict: {indicator_id, indicator_name, params(list), count}；失败→{params: [], error}。
 
     Args:
         indicator_id: 指标 ID
@@ -99,6 +106,11 @@ def run_indicator_signal(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
+
+    Returns:
+        dict: {success(True/False), stock_code, indicator_id, indicator_name, current_price,
+        has_buy, has_sell, buy_price, sell_price, signal_status, plots, signals(list),
+        data_points, last5_buy/last5_sell/last5_close}；失败→{success: False, error}。
 
     Args:
         indicator_id: 指标策略 ID

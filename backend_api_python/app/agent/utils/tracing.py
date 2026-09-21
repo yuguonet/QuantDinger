@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # 导致链名退化成 unknown+verb+unknown：既无法按链聚合/回测，又让 unknown+screen+unknown
 # 这类空链（无 stock_code）污染决策树。这里按 verb 兜底归类到已知域，使 stock 任务
 # 可被正确归类（finance 域，参与回测统计）；归类失败的（chat/general/cron 等）仍落 unknown。
+# 2026-09-21 注记：本表兜底仅限**金融语境**的 verb（选股/分析/对比/金融数据查询）。
+# 非金融任务（天气/新闻/生活查询）由意图分类器标 task_type=general，
+# general 不在此表 → domain/noun 兜底 unknown → finish 防毒丸逻辑跳过入库。
+# 若意图分类器仍把非金融任务标成 query，链名会错记 finance+query+stock（污染酿造候选）。
 _VERB_CLASSIFY = {
     "screen":   {"domain": "finance", "noun": "stock"},
     "analysis": {"domain": "finance", "noun": "stock"},

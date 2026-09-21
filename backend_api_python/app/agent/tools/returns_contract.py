@@ -156,22 +156,13 @@ def _get_return_contract(tool: Any) -> str | None:
 
 
 def _build_return_contract_block(tools: Mapping[str, Any] | Iterable[str],
-                                 max_declared: int = 40,
-                                 sampled: Mapping[str, str] | None = None) -> str:
+                                 max_declared: int = 40) -> str:
     """拼出「工具返回结构速查」段（供 task_agent 注入 CodeAgent system_prompt）。
-
-    两级真源，**采样优先、docstring 兜底**（2026-09-20 方案 D 接入）：
-      · `sampled[name]`（来自 tools/returns_sampler.py 的真实调用采样）→ 首选，结构更准、
-        覆盖率更高（实测 ~91% vs docstring ~64%）；
-      · 未命中采样 → 回退工具 docstring 的 `Returns:` 段；
-      · 两者都无 → 落 `_STANDARD_HANDLING` 标准兜底。
 
     Args:
         tools: **本阶段实际注入的工具表** `{name: 函数/Tool实例}`（首选，能读到 docstring）；
             也兼容只给名字的可迭代对象（此时全部落到标准兜底，仅用于兼容旧调用）。
         max_declared: 已声明契约的工具数上限（防某阶段工具极多时提示词膨胀）。
-        sampled: `{name: 折叠后的返回结构单行}`（采样缓存命中项）。传 None = 纯 docstring 模式
-            （采样未就绪 / 采样器不可用时自动走此路，零回归）。
 
     Returns:
         提示词段落；本阶段无工具时返回 ""。
@@ -183,14 +174,10 @@ def _build_return_contract_block(tools: Mapping[str, Any] | Iterable[str],
     else:
         items = [(str(k), None) for k in tools]
 
-    sampled = sampled or {}
     declared: list[tuple[str, str]] = []
     undeclared: list[str] = []
     for name, fn in items:
-        if name in sampled:                     # ① 采样命中（最高优先）
-            declared.append((name, sampled[name]))
-            continue
-        contract = _extract_returns_section(fn)  # ② docstring 兜底
+        contract = _extract_returns_section(fn)
         if contract:
             declared.append((name, contract))
         else:
@@ -200,13 +187,8 @@ def _build_return_contract_block(tools: Mapping[str, Any] | Iterable[str],
         return ""
     declared.sort(key=lambda kv: kv[0])
     undeclared.sort()
-    _n_sampled = sum(1 for n, _ in declared if n in sampled)
 
-    head = ("【工具返回结构速查 — 取数后直接按键访问，勿再逐个 print 探查类型】"
-            if not _n_sampled else
-            "【工具返回结构速查 — 取数后直接按键访问，勿再逐个 print 探查类型】"
-            "（结构取自真实调采样；obj{} 为对象、arr[] 为列表，深层元素默认泛化）")
-    out = [head]
+    out = ["【工具返回结构速查 — 取数后直接按键访问，勿再逐个 print 探查类型】"]
     if declared:
         for name, contract in declared[:max_declared]:
             out.append(f"- {name}() -> {contract}")

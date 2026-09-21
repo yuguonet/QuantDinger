@@ -57,13 +57,17 @@ def _run_meta(strat, days, start_date, end_date):
 
 def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
             use_prefilter=True, progress_every=500, start_date=None, end_date=None,
-            probe=None):
+            probe=None, exec_engine=None):
     """全市场回测 (策略经注册表分发, 按 scan_spec.kind 选路径)。
 
     strategy: 任意已注册策略 key。
       - daily_close 类 (dragon/v1/break): 日线枚举快路径 (backtest_stock 钩子)。
       - intraday_window 类 (tail/knife): 时间线引擎 (1m 快照帧重建, 与实盘同判定路径)。
     probe: 调试探针 (probe.Probe, None=关闭)。回测只负责验证, 探针数据存档供 AI 分析。
+    exec_engine (P4, 2026-09-21): **回测成交口径** (入口参数, 不污染 scan_spec.kind):
+      - ``None`` / ``"daily"`` = 现有日线枚举 (**零行为变化**);
+      - ``"intraday"`` / ``"auto"`` = 日线初筛 + **1m 真实腿精修出场** (分段式), 逐笔标注
+        ``trade["exec_basis"] = "1m" | "daily"``; ``auto`` 额外限制入口日须在常量 ``DEFAULT_MINUTE_DAYS`` 个交易日内 (近端)。策略未实现 `intraday_replay` → 整批日线腿。
     返回 {"trades": [...], "stats": {...}}; trades 直接可 json.dump 与基线对数。
     """
     from app.market_cn.auto import strategies as strat_reg
@@ -84,8 +88,8 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
     if type(strat).backtest_stock is StrategyBase.backtest_stock:
         raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock")
 
-    from app.market_cn.auto.data.hub import all_codes, daily
-    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
+    from app.market_cn.auto.core.data.hub import all_codes, daily
+    from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
 
     if codes is None:
         codes = all_codes()
@@ -95,12 +99,22 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         except Exception:
             stock_info = {}
     t0 = time.time()
+    # 批量预取日线 (2026-09-20 提速): 逐票 hub.daily 是 N 次 DB 往返, 实测占全流程
+    # ~85% (5223 票 days=300: 逐票中位 32.2s vs 批量 13.6s = 2.4x; 全流程 38s→19s)。
+    # fetch_klines_batch 与逐票 fetch_kline_db **行内容逐字等价**(同窗口/同 qfq/同 as-of,
+    # 抽检 80/80 逐字段一致), 故此处只换取数方式, 不改判定语义。
+    # 批量未覆盖 (空/异常) 的票回落 hub.daily —— 单票失败不拖垮全市场循环, 与逐票行为一致。
+    try:
+        from app.market_cn.auto.core.data.kline import fetch_klines_batch
+        _bars_batch = fetch_klines_batch(codes, days=days)
+    except Exception:                                         # noqa: BLE001
+        _bars_batch = {}                                     # 批量失败 → 全部回落逐票
     trades = []
     n_ok = 0
     for k, code in enumerate(codes, 1):
         if is_st_stock(code):
             continue
-        bars = daily(code, days)
+        bars = _bars_batch.get(code) or daily(code, days)
         if not bars:
             continue
         trades.extend(strat.backtest_stock(
@@ -111,9 +125,134 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         if progress_every and k % progress_every == 0:
             print(f"[{k}/{len(codes)}] trades={len(trades)} "
                   f"({time.time() - t0:.0f}s)", flush=True)
-    return {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
-            "elapsed": round(time.time() - t0, 1),
-            "meta": _run_meta(strat, days, start_date, end_date)}
+    out = {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
+           "elapsed": round(time.time() - t0, 1),
+           "meta": _run_meta(strat, days, start_date, end_date)}
+    _eng = str(exec_engine or "daily").lower()
+    if _eng in ("intraday", "auto") and trades:
+        out["exec_engine"] = _eng
+        out["exec_basis_counts"] = _refine_intraday(
+            strat, trades, _bars_batch, daily, days=days,
+            start_date=start_date, end_date=end_date, engine=_eng)
+    return out
+
+
+def _refine_intraday(strat, trades, bars_batch, daily_fn, *, days, start_date,
+                     end_date, engine="auto"):
+    """P4: 对日线枚举候选, **按候选窗口最小必要取 1m** 精修出场 (分段式)。
+
+    纪律 (与设计文档 §4.3 / §3 原则 8 一致):
+      - **逐笔只选一档** (``exec_basis`` = "1m" | "daily"): 持仓窗口内 1m 完整 → 走 1m 腿;
+        否则**整笔**保留日线腿 —— 禁止半段 1m / 半段日线 (口径混合会污染阈值结论);
+      - ``auto``: 入口日早于"最近 ``DEFAULT_MINUTE_DAYS`` 个交易日"起点 → 固定日线腿
+        (即"近端 1m + 远端 1D"的分界, 常量单点定义);
+      - 取数按**每票候选窗口的并集**一次取 (`window_minutes`), 绝不为几笔交易拉整窗 1m。
+
+    返回 ``{"1m": n, "daily": n}`` (逐笔口径计数, 供报告标注)。
+    """
+    from app.market_cn.auto.core.data.frames import trading_dates
+    from app.market_cn.auto.core.features.minute_composite import (
+        DEFAULT_MINUTE_DAYS, window_minutes)
+    from app.market_cn.auto.core.features.quality import grade_minute_window
+    from app.market_cn.auto.strategies.base import StrategyBase as _SB
+
+    counts = {"1m": 0, "daily": 0}
+    if type(strat).intraday_replay is _SB.intraday_replay:
+        for t in trades:                       # 策略未实现 1m 重放 → 整批日线腿 (显式标注)
+            t["exec_basis"] = "daily"
+        counts["daily"] = len(trades)
+        return counts
+
+    all_dates = trading_dates(days_back=days, end=end_date)
+    if start_date:
+        all_dates = [d for d in all_dates if d >= str(start_date)[:10]]
+    boundary = None
+    if all_dates and engine == "auto":
+        boundary = all_dates[-int(DEFAULT_MINUTE_DAYS):][0]
+
+    by_code = {}
+    for t in trades:
+        by_code.setdefault(t["code"], []).append(t)
+
+    def _idx(bars, date_str):
+        ds = str(date_str)[:10]
+        return next((j for j, b in enumerate(bars) if str(b["time"])[:10] == ds), None)
+
+    _HOLD_FLOOR, _TAIL_BUF = 20, 10            # 持有天数下限 / 顺延缓冲 (覆盖末日顺延)
+    for code, ts in by_code.items():
+        bars = bars_batch.get(code) or daily_fn(code, days)
+        if not bars:
+            for t in ts:
+                t["exec_basis"] = "daily"
+            counts["daily"] += len(ts)
+            continue
+        # 该票候选窗口并集 → 一次取数
+        lo, hi = None, None
+        for t in ts:
+            ei = _idx(bars, t["entry_date"])
+            if ei is None:
+                continue
+            hold = max(int(t.get("exit_day") or 0), _HOLD_FLOOR) + _TAIL_BUF
+            end_i = min(ei + hold, len(bars) - 1)
+            ed = str(t["entry_date"])[:10]
+            lo = ed if lo is None or ed < lo else lo
+            hi = bars[end_i]["time"][:10] if hi is None or bars[end_i]["time"][:10] > hi \
+                else hi
+        if lo is None or (boundary is not None and lo < boundary):
+            for t in ts:
+                t["exec_basis"] = "daily"
+            counts["daily"] += len(ts)
+            continue
+        mbd = window_minutes(code, lo, hi)
+        if not mbd:
+            for t in ts:
+                t["exec_basis"] = "daily"
+            counts["daily"] += len(ts)
+            continue
+
+        for t in ts:
+            ei = _idx(bars, t["entry_date"])
+            if ei is None:
+                t["exec_basis"] = "daily"
+                counts["daily"] += 1
+                continue
+            hold = max(int(t.get("exit_day") or 0), _HOLD_FLOOR) + _TAIL_BUF
+            win = [b["time"][:10] for b in bars[ei:min(ei + hold, len(bars))]]
+            if not win or any(d not in mbd for d in win):
+                t["exec_basis"] = "daily"      # 窗口内有日缺 1m → 整笔回落 (不混合口径)
+                counts["daily"] += 1
+                continue
+            res = strat.intraday_replay(bars, ei, float(bars[ei]["open"]), code=code,
+                                        board_type=None, minute_by_date=mbd)
+            if not res:
+                t["exec_basis"] = "daily"
+                counts["daily"] += 1
+                continue
+            for k in ("exit_price", "exit_day", "return_pct", "peak_return_pct"):
+                if res.get(k) is not None:
+                    t[k] = res[k]
+            t["exec_basis"] = "1m"
+            counts["1m"] += 1
+            # P5: 1m 窗口数据完整度标注 — 只在该笔 1m 腿写入, 日线腿保持无标记
+            # (语义: 1m 腿才有"分钟数据是否完整"问题, 日线腿不评估)。
+            win_bars: list = []
+            touched_set: set = set()
+            for d in win:
+                arr = mbd.get(d) or []
+                if not arr:
+                    continue
+                base = len(win_bars)
+                win_bars.extend(arr)
+                if d == str(t.get("entry_date", ""))[:10]:
+                    touched_set.add(base)
+            if win_bars:
+                from app.market_cn.auto.core.market import get_board_type as _gbt
+                _bt = _gbt(code, strat.market_spec) if hasattr(strat, "market_spec") else "default"
+                g = grade_minute_window(win_bars, board_type=_bt,
+                                        touched=sorted(touched_set))
+                t["data_quality"] = g.get("level", "ok")
+                t["data_quality_reasons"] = g.get("reasons", [])
+    return counts
 
 
 # ================================================================
@@ -122,7 +261,7 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
 
 def _exec_trigger_mis(spec):
     """ScanSpec → 成交触发槽位列表 (entry_at 终审语义: 只回该时刻)。"""
-    from app.market_cn.auto.data.frames import hhmm_to_pos
+    from app.market_cn.auto.core.data.frames import hhmm_to_pos
     if spec.entry_at:
         mi = hhmm_to_pos(spec.entry_at)
         return [mi] if mi >= 0 else []
@@ -147,8 +286,8 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
     最晚触发槽位的评估记录 (数据外壳: stage/rule_trace 来自策略门打点 + ctx 摘要 +
     以触发价为入场基准的 d1 开盘/收盘标签); shortlist 之外的廉价预筛拒绝不采样。
     """
-    from app.market_cn.auto.data import frames as fr
-    from app.market_cn.auto.data.hub import daily
+    from app.market_cn.auto.core.data import frames as fr
+    from app.market_cn.auto.core.data.hub import daily
     from app.market_cn.auto.probe import DayTrace as _SlotTrace
 
     t0 = time.time()
@@ -173,7 +312,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
 
     pc_map = fr.prev_closes(dates[0])                   # {code: 前一1m日收盘(qfq)}
     # ST 过滤与实盘 scan 同口径 (name 含 'ST' 排除, 含 *ST)
-    from app.market_cn.auto.data.hub import stock_info as _hub_stock_info
+    from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
     try:
         _si = _hub_stock_info()
     except Exception:
@@ -234,6 +373,22 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                     bars, code,
                     ctx={"latest": snap, "series": frame.series(code, mi),
                          "mkt_gain": mkt}, probe=slot_tr) or []
+                # U1~U4 统一预过滤 (与实盘 run_scan_knife / daily 回测 backtest_stock 同源;
+                # 锚点 prefilter_anchor)。仅声明 use_unified_prefilter=True 的策略走本段
+                # (knife/tail/g56 声明 False, 行为不变), 否则盘中回测会缺 U1~U4 而与其
+                # 实盘/日线回测口径分叉 (2026-09-20 收敛: 结构分叉 P0)。
+                if sigs and getattr(strat, "use_unified_prefilter", True):
+                    from app.market_cn.auto.core.filters import unified_prefilter
+                    from app.market_cn.auto.scan import _anchor_idx
+                    kept = []
+                    for s in sigs:
+                        idx = _anchor_idx(bars, s, strat)
+                        if idx is None:
+                            continue
+                        ok, _fails = unified_prefilter(bars, idx, code, _si.get(code))
+                        if ok:
+                            kept.append(s)
+                    sigs = kept
                 if probe is not None:
                     rank = getattr(strat, "PROBE_STAGE_RANK", {})
                     stage = max((t["stage"] for t in slot_tr.items),
@@ -251,21 +406,30 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 entry_price = float(snap["last"])
                 if entry_price <= 0:
                     continue
-                # 出场: 次交易日日线开盘 (D1 开盘卖)
+                # 出场: 策略回调 (默认 = 次交易日开盘卖; 多日持有策略覆盖 intraday_exit)
                 full = _daily_asof(code, None)
-                nxt = next((b for b in full if str(b["time"])[:10] > date), None)
-                if nxt is None or float(nxt["open"]) <= 0:
+                ei = next((j for j, b in enumerate(full)
+                           if str(b["time"])[:10] == str(date)[:10]), None)
+                if ei is None:
                     continue
-                exit_price = float(nxt["open"])
-                trades.append({
+                ex = strat.intraday_exit(full, code, date, entry_price, entry_idx=ei)
+                if not ex:
+                    continue
+                # extra 先展开 → 引擎字段后覆盖 (buy_mode/exit_* 标签以引擎为准);
+                # tail/knife 的 extra 无键冲突 → 交易 dict 与基线逐字不变
+                _tr = {
+                    **(s.extra or {}),
                     "code": code, "signal_date": date, "entry_date": date,
                     "entry_price": round(entry_price, 3), "buy_mode": "intraday_trigger",
                     "trigger": strat.scan_spec.entry_at or frames_hhmm(mi),
-                    "exit_date": str(nxt["time"])[:10], "exit_price": round(exit_price, 3),
-                    "exit_day": 1, "exit_reason": "d1_open",
-                    "return_pct": round((exit_price / entry_price - 1) * 100, 2),
-                    **(s.extra or {}),
-                })
+                    "exit_date": ex.get("exit_date"), "exit_price": ex.get("exit_price"),
+                    "exit_day": ex.get("exit_day"), "exit_reason": ex.get("exit_reason"),
+                    "return_pct": ex.get("return_pct"),
+                }
+                # 峰值标签仅在策略给出时写入 (tail/knife 交易 dict 保持逐字不变, 基线可对数)
+                if ex.get("peak_return_pct") is not None:
+                    _tr["peak_return_pct"] = ex["peak_return_pct"]
+                trades.append(_tr)
                 n_sig_day += 1
         # debug 样本日终落盘: 以触发价为入场基准, D+1 开盘/收盘为标签 (视野不足不硬凑)
         if dbg:
@@ -291,7 +455,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
 
 
 def frames_hhmm(mi):
-    from app.market_cn.auto.data.frames import MI_HHMM
+    from app.market_cn.auto.core.data.frames import MI_HHMM
     return MI_HHMM[mi] if 0 <= mi < len(MI_HHMM) else ""
 
 
@@ -349,16 +513,8 @@ if __name__ == "__main__":
     import os
 
     # CLI 直跑时需自行加载 .env (服务进程已由应用加载, 重复加载无害)
-    try:
-        from dotenv import load_dotenv
-        for _p in [os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))))), ".env"),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")]:
-            if os.path.isfile(_p):
-                load_dotenv(_p, override=False)
-                break
-    except Exception:
-        pass
+    from app.market_cn.auto.core._paths import load_env_first_found
+    load_env_first_found(os.path.join(os.getcwd(), ".env"))
 
     parser = argparse.ArgumentParser(description="框架内全市场回测流水线 (策略经注册表分发)")
     parser.add_argument("--strategy", default="dragon",

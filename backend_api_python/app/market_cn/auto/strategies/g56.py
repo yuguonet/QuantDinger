@@ -56,8 +56,8 @@ import threading
 
 import numpy as np
 
-from app.market_cn.auto.common.indicators import calc_macd
-from app.market_cn.auto.common.market import get_board_type
+from app.market_cn.auto.core.indicators import calc_macd
+from app.market_cn.auto.core.market import get_board_type
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -161,7 +161,11 @@ def _g1_arrays(bars):
     l = np.array([float(b["low"]) for b in bars])
     n = len(c)
     ma5, ma10 = _sma_np(c, 5), _sma_np(c, 10)
-    dif, dea, _ = calc_macd(c)           # calc_macd 返回 list, 转数组向量化
+    # 传 list[float] 而非 ndarray: calc_macd 是纯 Python 循环, 用 ndarray 会取到
+    # np.float64 标量, 每次算术都要 numpy 标量装箱 (比 Python float 慢一个量级)。
+    # 二者同为 IEEE-754 double 运算, 结果**逐位一致** (tmp/_macd_exact_test.py: 400 组
+    # 随机序列 0 不一致; 提速 2.1×)。
+    dif, dea, _ = calc_macd(c.tolist())
     dif, dea = np.asarray(dif, float), np.asarray(dea, float)
     rma = (ma5 / ma10 - 1) * 100
     rma_chg = np.full(n, np.nan)
@@ -239,23 +243,31 @@ def _aggregate(by_date):
             for i, d in enumerate(dates)}
 
 
-def _ensure_pool_daily(pool_target):
+def _ensure_pool_daily(pool_target, bars_batch=None):
     """返回 {board: {date: {rmed, score_r}}} (key=pool_target 跨日失效; 失败不缓存)。
 
-    前视防护: 每票 hub.daily(as_of=pool_target) 截断 — 实盘扫描日=快照末日;
-    回测时 pool_target=快照末日(今日), 历史 date 的统计仅由 ≤该日 数据构成。
+    前视防护: 每票日线截断到 ≤pool_target — 实盘扫描日=快照末日; 回测时
+    pool_target=快照末日(今日), 历史 date 的统计仅由 ≤该日 数据构成。
+
+    bars_batch: 可选 `{code: bars}`。由调用方**批量预加载**(窗口/复权/截断必须与
+      `hub.daily(code, 200, as_of=pool_target)` 完全一致, 见 data.kline.fetch_klines_batch),
+      用于消除逐票 `hub.daily` 的 O(N) 往返 —— 横截面池是展示管线夜间的主要超支源。
+      缺省 None → 保持原逐票路径 (单票调用方/实盘扫描零改动)。
     """
     with _POOL_LOCK:
         if _POOL["target"] == pool_target:
             return _POOL
-        from app.market_cn.auto.data import hub
+        from app.market_cn.auto.core.data import hub
         try:
             buckets = {"main": {}, "gem_star": {}}
             codes = hub.all_codes()
             for code in codes:
                 if code.startswith(("8", "4", "92")):   # 北交所/老三板 (同研究口径)
                     continue
-                bars = hub.daily(code, 200, as_of=pool_target)
+                if bars_batch is not None:
+                    bars = bars_batch.get(code) or []
+                else:
+                    bars = hub.daily(code, 200, as_of=pool_target)
                 if len(bars) < 68:
                     continue
                 board = get_board_type(code)

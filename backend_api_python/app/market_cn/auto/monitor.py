@@ -91,13 +91,13 @@ def snapshot_day_done() -> bool:
 
 def fetch_day_snapshots(codes):
     """当日快照序列 {code: [rows]} —— D1 起委托 data/hub (唯一实现, 口径逐字一致)。"""
-    from app.market_cn.auto.data.hub import day_series
+    from app.market_cn.auto.core.data.hub import day_series
     return day_series(codes)
 
 
 def latest_snapshot(codes):
     """最新一拍 {code: row} —— D1 起委托 data/hub。"""
-    from app.market_cn.auto.data.hub import market_snapshot
+    from app.market_cn.auto.core.data.hub import market_snapshot
     return market_snapshot(codes)
 
 
@@ -142,7 +142,7 @@ def _bars_with_synth(code, entry_date):
 
     D1: 合成口径已上收 data/hub.daily_live (逐字一致), 此处仅保留 entry_idx 定位。
     """
-    from app.market_cn.auto.data.hub import daily_live
+    from app.market_cn.auto.core.data.hub import daily_live
     bars = daily_live(code, days=200)
     if not bars:
         return None, None

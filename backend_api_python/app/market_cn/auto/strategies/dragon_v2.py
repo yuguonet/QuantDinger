@@ -43,17 +43,17 @@ V2 门的数据依据 (2026-09-16, 均为 600d 全市场真实回测):
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.exec_cn import (
+from app.market_cn.auto.core.exec import (
     fill_blocked_by_limit_dn,
     fill_on_gap,
     is_one_word_limit_dn,
     limit_dn_price as _limit_dn_price,
 )
-from app.market_cn.auto.common.indicators import (
+from app.market_cn.auto.core.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )
-from app.market_cn.auto.common.market import find_limit_ups, get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.market import find_limit_ups, get_board_name, get_board_type, is_limit_up
 from app.market_cn.auto.probe import DayTrace as _DayTrace, \
     sample_feats as _probe_sample_feats   # 探针框架件 (无环; 只提供通用特征/标签)
 from app.market_cn.auto.strategies import register
@@ -255,6 +255,7 @@ def run_backtest_dragon_v2(bars, entry_idx, entry_price, hold_days=None,
             capped = True
             break
         b = bars[idx]
+        peak_prev = peak
         if b["high"] > peak:
             peak = b["high"]
         prev_close = bars[idx - 1]["close"] if idx > 0 else 0
@@ -288,8 +289,10 @@ def run_backtest_dragon_v2(bars, entry_idx, entry_price, hold_days=None,
             trig_t = peak * (1 + trail / 100)
             trig_s = entry_price * (1 + stop_loss / 100)
             trig = max(trig_t, trig_s)
+            # 开盘时已存在的止损线 (未被当日 high 抬高); 只有跌破它才按开盘价成交 (fill_on_gap 误用修正, 同源 dragon_callback)
+            trig_prev = max(peak_prev * (1 + trail / 100), trig_s)
             if b["low"] <= trig:
-                fill = fill_on_gap(b["open"], trig)   # 跳空穿越按开盘成交
+                fill = b["open"] if b["open"] <= trig_prev else trig   # 跳空穿越按开盘成交
                 reason = f"追踪止损{trail}%" if trig_t >= trig_s else f"止损{stop_loss}%"
                 if fill_blocked_by_limit_dn(fill, dn):
                     pending_dn = True
@@ -667,7 +670,7 @@ class DragonV2Strategy(StrategyBase):
         枚举/去重±4/预过滤锚点/廉价预筛均为本策略规则; 出场模拟用本文件引擎。
         probe: 每个完整判定日产一行 sample (廉价预筛跳过日不采样)。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         board_type = get_board_type(code)
         n = len(bars)
         if n < 5:

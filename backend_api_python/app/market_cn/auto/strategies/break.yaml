@@ -1,0 +1,72 @@
+# ================================================================
+# 断板接力策略 (连板→断板期确认日 → 次日开盘买入) — IDE 门表单文件 (M2/M4)
+# 与 strategies/break_buy.py (BreakStrategy.backtest_stock) 逐笔等价 (见 tmp/_break_equivalence.py)
+# ----------------------------------------------------------------
+# 结构 (连板→断板期→确认日) 收编为注册函数 bk_feat(name)（见 ide/strategy_funcs.py），
+# 5a~5g 判定全部上提为下列门表 → IDE 能逐门展示"为何放行/拦截"。
+# ================================================================
+meta:
+  name: 断板
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  enumeration: day             # 逐日候选 → D0 确认日 → 次日开盘入场
+  day_flow: break              # day 流程口径 (信号展示字段集 + 去重键 (streak_start, break_date))
+  day_start: 4                 # 逐日起点 (镜像 break_buy.backtest_stock 的 range(4, n-1))
+  day_min_n: 6                 # 低于此长度直接返回空 (镜像 break_buy 的 n<6 早返回)
+
+entry:
+  mode: open                   # 次日(D1)开盘买入 (next_open)
+  price: open                  # 成交价基准 = D1 开盘价
+  # 断板无竞价 gap 过滤 (恒可买); gap 判定交给 D1 数据 (与 break_buy.entry_decision 一致)
+
+exit:
+  mode: break_combo            # 收盘价口径 combo (止损/追踪(需 ret>0)/峰值逃顶/到期) — 分板块阈值
+  stop_loss: {main: -8.0, gem_star: -10.0}
+  trailing_stop: {main: -6.0, gem_star: -8.0}
+  hold_days: {main: 20, gem_star: 15}
+
+params:                        # 与 break_buy.BOARD_PARAMS / DEFAULT_PARAMS 同值 (逐笔等价基线)
+  min_streak: 2                # 连板下限 (DEFAULT_PARAMS)
+  max_break_gap: 5             # 断板期最长天数 (DEFAULT_PARAMS)
+  turnover_min: null           # 确认日换手率前置门; null=关 (config 未开启, 与参考默认一致)
+  enhance_filter: true         # 5f 增强过滤开关 (BOARD_PARAMS)
+  ma_bull_filter: false        # 5g 均线多头开关 (BOARD_PARAMS 实为 False → 该门恒放行)
+  # ---- 断板期判定阈值 (BOARD_PARAMS; 分板块用 {board: 值}) ----
+  vol_min: 1.2                 # 5b 断板期缩量下限 (均量比, vs 涨停日量)
+  vol_max: {main: 2.0, gem_star: 2.5}     # 5b 缩量上限 (>= 上限 拦截)
+  drawdown_max: {main: -10, gem_star: -15}  # 5e 断板期回撤下限 (vs 涨停日收盘)
+  first_break_chg_min: 0.0     # 5c 首断日涨跌下限 (vs 涨停日收盘; 上界 8% 硬编码, 勿配置化)
+  first_break_gap_min: 0.0     # 5d 首断日开盘下限 (vs 涨停日收盘; 上界 5% 硬编码, 勿配置化)
+  confirm_chg_min: 0.0         # 5f 通道1: 确认日涨跌区间 [min, max)
+  confirm_chg_max: 2.0
+  vol_r_or_min: 1.4            # 5f 通道2: 断板期均量比 >= 该值 (换手充分)
+  pre20_min: 30.0              # 5f 通道3: 连板前20日涨幅 >= 该值 (前期热度)
+  # ---- 出场阈值 (BOARD_PARAMS; 由 exit.mode=break_combo 的分板块解析读取) ----
+  stop_loss: {main: -8.0, gem_star: -10.0}
+  trailing_stop: {main: -6.0, gem_star: -8.0}
+  hold_days: {main: 20, gem_star: 15}
+
+# 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门
+# needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)
+# break 无 lu_idx 依赖 → 全部 qualify (决策日一次性求值); pk(name) 做分板块阈值解析。
+gates:
+  - {id: g_candidate, name: 断板期结构, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('is_candidate') == 1"}      # 连板/断板期/对齐/首板隔离 (结构，见 bk_struct)
+  - {id: g_streak, name: 连板数下限, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('streak_len') >= min_streak"}          # 连板 ≥ min_streak
+  - {id: g_5a, name: 断板期不破涨停日开盘, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('break_low') >= bk_feat('limit_open')"}   # 5a 支撑有效
+  - {id: g_5b, name: 断板期缩量, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('break_vol_r') >= pk('vol_min') and bk_feat('break_vol_r') < pk('vol_max')"}  # 5b
+  - {id: g_5c, name: 首断日涨跌, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('first_break_chg') >= pk('first_break_chg_min') and bk_feat('first_break_chg') < 8"}  # 5c
+  - {id: g_5d, name: 首断日开盘, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('first_break_gap') >= pk('first_break_gap_min') and bk_feat('first_break_gap') < 5"}  # 5d
+  - {id: g_5e, name: 断板期回撤, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "bk_feat('break_drawdown') >= pk('drawdown_max')"}  # 5e
+  - {id: g_5f, name: 增强过滤(三通道OR), role: qualify, needs_d0: 1, enabled: 1,
+     expr: "not enhance_filter or (bk_feat('confirm_chg') >= pk('confirm_chg_min') and bk_feat('confirm_chg') < pk('confirm_chg_max')) or bk_feat('break_vol_r') >= pk('vol_r_or_min') or bk_feat('pre20_gain') >= pk('pre20_min')"}  # 5f
+  - {id: g_5g, name: 均线多头, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "not ma_bull_filter or bk_feat('ma_bull') != 0"}  # 5g (仅 ma_bull=False 拦截; None 放行)
+  - {id: g_turnover, name: 确认日换手率门, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "not turnover_min or turnover_sig() >= turnover_min"}  # ML归因前置门 (默认关)

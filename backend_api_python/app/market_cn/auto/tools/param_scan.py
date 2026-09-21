@@ -309,7 +309,7 @@ def main():
                          f"(--max-combos 可调; 大网格建议用户终端跑)")
 
     # ---- 股票池 ----
-    from app.market_cn.auto.data.hub import all_codes
+    from app.market_cn.auto.core.data.hub import all_codes
     pool_mode = "全市场"
     codes = None
     if args.codes:
@@ -325,9 +325,9 @@ def main():
 
     # ---- 回测执行件 ----
     if kind == "intraday_window":
-        from app.market_cn.auto.backtest import run_all_intraday
+        from app.market_cn.auto.core.backtest import run_all_intraday
     else:
-        from app.market_cn.auto.backtest import run_all
+        from app.market_cn.auto.core.backtest import run_all
     start_date = args.start_date or None
     end_date = args.end_date or None
 

@@ -193,16 +193,18 @@ class NodeContext:
             ToolProvider.set_default(provider)  # 全局默认 provider 只在首扫时设置一次
             logger.info("[Context] ToolProvider 初始化完成: %d 个工具", len(provider))
 
-            # ── 返回结构采样（方案 D 写侧，2026-09-20）───────────────────
-            # 守护线程后台对只读工具真实调采样一次，固化返回结构缓存；
-            # `start_background_sampling` 立即返回（不阻塞启动），采样未就绪期间
-            # 读取侧（task_agent._sandbox_instructions）自动回退 docstring 契约（零回归）。
-            # 进程级一次；由本 `if _SHARED_TOOL_PROVIDER is None` 分支保证，函数内亦幂等。
-            try:
-                from tools.returns_sampler import _start_background_sampling
-                _start_background_sampling(provider)
-            except Exception as _rse:
-                logger.warning("[Context] 返回结构采样启动失败（不阻断启动）: %s", _rse)
+            # ── 返回结构采样（方案 D 写侧，2026-09-20）—— **2026-09-21 退役** ────
+            # 契约真源已收束为工具 docstring 的 `Returns:` 段（可注入域 56/56 已补齐），
+            # 读侧（task_agent._sandbox_instructions）不再取采样缓存 → 后台采样属纯开销
+            # （启动期真实调工具 = 网络 IO），故**不再自动启动**。
+            # `tools/returns_sampler.py` 保留作**离线结构漂移体检**：
+            #   `python -m app.agent.tools.returns_sampler`
+            # 如将来要恢复在线采样，取消下面三行注释即可（读侧需同步恢复 sampled= 取用）。
+            # try:
+            #     from tools.returns_sampler import _start_background_sampling
+            #     _start_background_sampling(provider)
+            # except Exception as _rse:
+            #     logger.warning("[Context] 返回结构采样启动失败（不阻断启动）: %s", _rse)
 
         self.tool_provider = _SHARED_TOOL_PROVIDER
         self.model = _LLMAdapter(self.llm)
@@ -632,13 +634,14 @@ def make_chat_node(ctx: NodeContext):
                     "类型说明：\n"
                     "- task: 需要工具完成任务（分析、查询、搜索、计算、对比等）\n"
                     "- chat: 不需要工具（闲聊、问候、简单知识问答、感谢等）\n"
-                    "- analysis: 分析、评估、诊断\n"
-                    "- screen: 筛选、选股、推荐、找\n"
-                    "- compare: 对比、比较、PK\n"
-                    "- query: 查询、查一下、获取数据\n"
+                    "- analysis: 分析、评估、诊断（股票/金融标的）\n"
+                    "- screen: 筛选、选股、推荐、找（金融标的）\n"
+                    "- compare: 对比、比较、PK（金融标的）\n"
+                    "- query: 查询、查一下、获取数据（金融数据：行情/资金/财报）\n"
                     "- code: 写代码、开发、编程、实现功能\n"
                     "- explain: 解释、说明、教学、教程\n"
-                    "- general: 其他需要工具的任务\n"
+                    "- general: 其他需要工具的任务（天气、新闻、生活查询等非金融任务；"
+                    "金融标的相关的查询不要用 general）\n"
                     "只回复一个类型词，不要解释"
                 )
             if context:
@@ -889,13 +892,22 @@ def make_plan_node(ctx: NodeContext):
             logger.info("[Plan] phase 契约: %d 个阶段: %s", len(phases),
                         ", ".join(f"#{p['id']}{p['name']}" for p in phases))
 
+        # 步数纪律（2026-09-21）：单 CodeAgent 阶段 ≤5 步，planner 报大值一律钳到 5。
+        # 实测 >5 步的阶段全部 hit_max_steps（262s/283s 烧穿 180s 预算）并连带
+        # token 爆炸；步数不够应拆阶段，不是加步数。
+        _sb = int(plan.get("step_budget") or 0)
+        if _sb > 5:
+            logger.warning("[Plan] step_budget=%d 超过单段上限 5，钳制到 5（任务过大请拆阶段）", _sb)
+            _sb = 5
+        _sb = max(_sb, 1)
+
         return {
             "task": plan["task"],
             "selected_skill": selected_skill or "",
             "selected_domain": plan.get("selected_domain", ""),
             "skill_body": skill_body,
             "skill_tools": skill_tools,
-            "step_budget": plan["step_budget"],
+            "step_budget": _sb,
             "planning_interval": plan.get("planning_interval", 6),
             "replan_count": replan_count + (1 if prev_hit else 0),
             "phases": phases,

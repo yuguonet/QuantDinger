@@ -1,0 +1,63 @@
+# ================================================================
+# G56 五重共振 (D-1 盘后判定 → D0 开盘买入) — IDE 门表单文件 (M4)
+# 与 strategies/g56.py (G56Strategy.backtest_stock) 逐笔等价 (见 tmp/_g56_equivalence.py)
+# ----------------------------------------------------------------
+# 五重共振 = G1 池成员(①趋势②波动③基因) + ④金叉预测(rhist_chg>板块Q5)
+#           + ⑤板块状态(横截面 regime 门: 主板 rmed>0.25 & %b<=49.87 /
+#             20cm score_r>0.65 & dif0<=0)。
+# 特征 f=_g1_arrays(bars) 与横截面池由引擎注入 ctx.ext (见 strategy_funcs.g56_*)。
+# 出场 = 无追踪纯 7d/-8% (2026-09-17 出场研究定稿)。
+# ================================================================
+meta:
+  name: G56
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  enumeration: day             # 逐日候选 → D-1 信号 → D0 开盘入场
+  day_flow: g56                # day 流程口径 (g56 特征/池 + 锁仓去重)
+  day_start: 68                # 镜像 backtest_stock 的 range(68, n-9)
+  day_end: 9                   # 终点 = n-9 (末9日留引擎缓冲, 同研究)
+  ext: g56                     # 编排层预计算上下文 (Ctx.ext): G1 特征数组 + 当日横截面池
+                               # 见 ide/present.py EXT_PROVIDERS (展示/回测/实盘同源构造)
+
+entry:
+  mode: open                   # D0 开盘买入 (next_open)
+  price: open
+  gap_max: {main: 9.8, gem_star: 19.8}   # gap >= 涨停幅度 → 一字/触板不可买 (lim=0.098/0.198)
+
+exit:
+  mode: g56_no_trail           # 无追踪纯 7d/-8% (HOLD_DAYS=7, STOP_LOSS=-8%)
+
+params:                        # 与 strategies/g56.py 冻结常量同值 (逐笔等价基线)
+  r56: {main: 0.51, gem_star: 0.66}      # ④rhist_chg 门 = 150天池内 Q5
+  atr_q5: {main: 5.07, gem_star: 6.42}   # ②ATR14% 下限 = 板块池内 Q5
+  main_rmed_min: 0.25          # 主板 regime: 池 rhist_chg 中位数 (raw)
+  main_pctb_max: 49.87         # 主板 regime: boll %b 上限
+  gem_score_min: 0.65          # 20cm regime: score_r (滚动相对热度)
+
+# 门表：一行一门。G1 池成员 (trend/atr/big20/finite/warmup) + ④ + ⑤ (分板块 regime)。
+# NaN 哨兵：缺值/暖机/池缺失 → 数值门自然失败 (与 _g1_mask 的 isfinite + m[:68]=False 同效)。
+gates:
+  - {id: g1_warmup, name: 暖机≥68日, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "g56_warmup() == 1"}                    # 镜像 _g1_mask 的 m[:68]=False
+  - {id: g1_finite, name: 特征有限, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "g56_finite() == 1"}                    # 镜像 _g1_mask 的 np.isfinite 过滤
+  - {id: g1_trend, name: ①趋势收敛, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "abs(g56_feat('rma')) <= 2.5 and g56_feat('rma_chg') > 0"}   # |MA5/MA10-1|<=2.5% & 走强
+  - {id: g1_atr, name: ②波动足够, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "g56_feat('atr') > pk('atr_q5')"}       # ATR14% > 板块池 Q5
+  - {id: g1_big20, name: ③大涨基因, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "g56_feat('big20') >= 2"}               # 前20日≥5%大涨日数 >= 2
+  - {id: r56, name: ④金叉预测, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "g56_feat('rhist_chg') > pk('r56')"}    # MACD柱加速 > 板块 Q5
+  - {id: regime_main, name: ⑤板块状态(主板), role: qualify, needs_d0: 0, enabled: 1,
+     expr: "board_is_gem() == 1 or (g56_pool_stat('rmed') > pk('main_rmed_min') and g56_feat('pctb') <= pk('main_pctb_max'))"}
+  - {id: regime_gem, name: ⑤板块状态(20cm), role: qualify, needs_d0: 0, enabled: 1,
+     expr: "board_is_main() == 1 or (g56_pool_stat('score_r') > pk('gem_score_min') and g56_feat('dif0') <= 0)"}
+
+# 信号展示字段 (门通过后求值; 与参考版 trades 逐字段一致)
+signal:
+  fields:
+    rhist_chg: {expr: "g56_feat('rhist_chg')", fmt: r3}
+    boll_pctb: {expr: "g56_feat('pctb')", fmt: r2}
+    rmed: {expr: "g56_pool_field('rmed')", fmt: r3}
+    score_r: {expr: "g56_pool_field('score_r')", fmt: r3}

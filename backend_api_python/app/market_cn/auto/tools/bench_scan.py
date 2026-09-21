@@ -24,7 +24,7 @@ def main():
         pass
 
     from app.market_cn.auto import store, strategies as strat_reg
-    from app.market_cn.auto.data.hub import all_codes, market_snapshot, stock_info
+    from app.market_cn.auto.core.data.hub import all_codes, market_snapshot, stock_info
 
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()
@@ -66,7 +66,7 @@ def main():
     for key, strat in active.items():
         params = strat_reg.params_override(key)
         for code in shortlists[key]:
-            from app.market_cn.auto.data.hub import daily, day_series
+            from app.market_cn.auto.core.data.hub import daily, day_series
             bars = daily(code, days=60)
             series = day_series([code]).get(code) or []
             try:

@@ -245,8 +245,8 @@ def _dragon_strategy_monitor():
 
 def _dragon_strategy_knife_scan():
     """盘中尾盘: 窗口策略扫描 (14:30 触发预热)。
-    knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审
-    (tail_oversold=尾盘超卖超短, 用户要求提前看到渐近结果准备买入)"""
+    knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审;
+    dragon_callback: 14:50 起每分钟滚动预览 + 14:56 终审 (收盘买入, 2026-09-19 起)"""
     from app.market_cn.auto.scan import run_scan_knife
     run_scan_knife()
 

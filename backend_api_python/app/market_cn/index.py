@@ -490,7 +490,11 @@ def _kline_baostock(code: str, days: int) -> Optional[pd.DataFrame]:
 # ══════════════════════════════════════════════════════════════
 
 def get_index_realtime(codes: Optional[List[str]] = None, force: bool = False) -> List[Dict[str, Any]]:
-    """获取指数实时行情（自动降级）"""
+    """获取指数实时行情（自动降级）
+
+    Returns:
+        list[dict]: [{code, name, price, open, high, low, last_close, change, change_percent, volume, amount}]；失败 []。
+    """
     if not force and _rt_idx_realtime is not None:  # 内存缓存
         return _rt_idx_realtime
     if codes is None:                        # ② 原有逻辑
@@ -1274,6 +1278,9 @@ def _mkt_flow_eastmoney_realtime() -> Optional[Dict[str, Any]]:
 
 def get_market_fund_flow_realtime(force: bool = False) -> Dict[str, Any]:
     """获取实时大盘资金流向（沪深两市主力资金净流入/流出）。
+
+    Returns:
+        dict: 大盘资金流快照（含 source 及主力净流入字段）；全失败 {source:"none", error}。
 
     多源降级: 新浪(行业汇总) → 东财 push2(兜底)
     内存缓存: _rt_mf_realtime，由 scheduler 定期刷新。

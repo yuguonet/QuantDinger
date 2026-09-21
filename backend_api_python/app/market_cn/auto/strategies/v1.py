@@ -18,8 +18,8 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.indicators import calc_bollinger_bw, calc_macd
-from app.market_cn.auto.common.market import get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.indicators import calc_bollinger_bw, calc_macd
+from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -294,7 +294,7 @@ class V1Strategy(StrategyBase):
         D1 过滤 (gap/change/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
         出场模拟 _run_backtest 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
         # 参数接线 (2026-09-13 修): 原入场五参数/D1过滤/出场均硬编码字面量 (kwargs
         # 压过实例覆写) → param_scan 网格无效。统一改从 merged_params(None) 取:
@@ -403,7 +403,7 @@ class V1Strategy(StrategyBase):
 # 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
 # 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
 # ================================================================
-from app.market_cn.auto.common.exec_cn import (
+from app.market_cn.auto.core.exec import (
     fill_blocked_by_limit_dn,
     fill_on_gap,
     is_one_word_limit_dn,
@@ -452,6 +452,7 @@ def _run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tr
         idx = entry_idx + d - 1  # d=1 → entry_idx(D1), d=2 → entry_idx+1(D2)
         if idx >= len(bars): break
         b = bars[idx]
+        peak_prev = peak
         if b['high'] > peak: peak = b['high']
         prev_close = bars[idx - 1]['close'] if idx > 0 else 0
         dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
@@ -507,8 +508,11 @@ def _run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, tr
             trig_t = peak * (1 + trailing_stop / 100)
             trig_s = entry_price * (1 + stop_loss / 100)
             trig = max(trig_t, trig_s)
+            # 开盘时已存在的止损线 (未被当日 high 抬高); 只有跌破它才按开盘价成交, 否则
+            # 该线在开盘后才形成, 用"峰值之前的开盘价"成交不可得 (fill_on_gap 误用修正, 同源 dragon_callback)
+            trig_prev = max(peak_prev * (1 + trailing_stop / 100), trig_s)
             if b['low'] <= trig:
-                fill = fill_on_gap(b['open'], trig)
+                fill = b['open'] if b['open'] <= trig_prev else trig
                 if fill_blocked_by_limit_dn(fill, dn):
                     pending_dn = True   # 成交价触及跌停 → 卖不出
                     continue

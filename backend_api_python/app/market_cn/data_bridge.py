@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 # ================================================================
 
 def get_macro_data() -> Dict[str, Any]:
-    """
-    A股市场数据 → 与 global_market.get_sentiment() 同格式输出
+    """A股市场数据 → 与 global_market.get_sentiment() 同格式输出
+
+    Returns:
+        dict: 键 FEAR_GREED / CN_HOT_SECTORS；各值 {name, description, price, change, changePercent[, data]}。
 
     映射关系:
       A股贪恐指数  → FEAR_GREED
@@ -76,8 +78,10 @@ def get_macro_data() -> Dict[str, Any]:
 # ================================================================
 
 def fetch_sentiment() -> Dict[str, Any]:
-    """
-    A股情绪数据 → 与 global_market.get_sentiment() 同格式输出
+    """A股情绪数据 → 与 global_market.get_sentiment() 同格式输出
+
+    Returns:
+        dict: {fear_greed: {value, classification, source}, vix: {value, level}, dxy: {value, level}}。
 
     fear_greed: A股7维度贪恐指数
     vix/dxy:    A股无对应，返回 0 占位
@@ -114,8 +118,10 @@ def fetch_sentiment() -> Dict[str, Any]:
 # ================================================================
 
 def fetch_overview() -> Dict[str, Any]:
-    """
-    A股概览数据 → 与 global_market.get_indices() 同格式输出
+    """A股概览数据 → 与 global_market.get_indices() 同格式输出
+
+    Returns:
+        dict: {indices: [{symbol, name, name_cn, price, change}], forex: [], crypto: [], commodities: []}。
 
     indices:      A股主要指数（上证/深证/创业板/沪深300）— 取最新日线收盘
     forex/crypto/commodities: A股无直接对应，返回空列表

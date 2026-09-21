@@ -1,0 +1,40 @@
+# ================================================================
+# 市场适配: 港股 (声明式, **未接数据源**)
+# ----------------------------------------------------------------
+# 按架构 §9.1/§9.2 建模, 但当前 `runnable: false` —— 真正被要求运行时
+# registry.require_runnable 会明确报错, 不会静默按 A 股口径跑。
+# 接入 = 加数据源适配器 + 把 runnable 改 true; **core 零改动**。
+# ================================================================
+key: HK
+name: 港股
+
+# --- 交易限制 / 结算 ---
+intraday_t0: true           # 当日买可当日卖, 无次数限制
+settlement_days: 2          # ⚠️ 结算 T+2 (交割比交易慢两天, 与 A 股 T+1 不同构)
+settlement_basis: calendar
+
+# --- 方向 / 做空 ---
+direction: long_short
+short_rule: designated+tick  # 仅指定可卖空名单(季度更新) + 卖空价 ≥ 当时最佳买价 + 须先借券
+
+# --- 价格边界: 无涨跌停 (但有 VCM 市调机制) ---
+band_kind: none
+bands: {}
+band_default: null
+
+# --- 交易单位 / 币种 (每手不固定, 10~1e5 股) ---
+lot_size: 0                 # 0 = 不固定 (按标的各自的每手股数)
+tick_size: 0.0              # 按价位分档, 非单一值
+currency: HKD
+tz: HKT
+fee_model: commission+stamp
+
+board_rules: []
+board_default: default
+board_names: []
+board_name_default: 港股
+
+# --- 数据源 ---
+source: ""
+runnable: false
+note: 交易 T+0 / 结算 T+2; 无涨跌停但有 VCM (恒指国指成分股 5 分钟内 ±10% → 5 分钟冷静期)

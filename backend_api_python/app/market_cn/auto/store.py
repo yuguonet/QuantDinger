@@ -185,7 +185,7 @@ def signal_row(strategy_key, sig, name=""):
       顶层已映射键 board/lu_date/pullback_days 不重复进子字典) → qd_dragon_signals.extra JSON
     """
     ex = sig.extra or {}
-    from app.market_cn.auto.common.market import get_board_name
+    from app.market_cn.auto.core.market import get_board_name
     row = {
         "strategy": strategy_key,
         "code": sig.code,
@@ -335,7 +335,11 @@ def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, 
 
 
 def list_signals(states=None, trade_date=None, days=20, only_active=False, strategies=None):
-    """查询信号 (signals 表)。states: 状态过滤; trade_date: 指定信号日; days: 最近N日。"""
+    """查询信号 (signals 表)。states: 状态过滤; trade_date: 指定信号日; days: 最近N日。
+
+    Returns:
+        list[dict]: 信号行（含 trade_date/strategy/code/name/state/score 及 entry/exit 系列字段）。
+    """
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
         cur = db.cursor()
@@ -361,17 +365,29 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False, strat
 
 
 def get_active_signals():
-    """组内活跃信号 (买入/持仓/卖出)。"""
+    """组内活跃信号 (买入/持仓/卖出)。
+
+    Returns:
+        list[dict]: 同 list_signals；仅 买入/持仓/卖出 活跃状态、最近 30 日。
+    """
     return list_signals(states=ACTIVE_GROUP_STATES, days=30)
 
 
 def get_watch_pending(trade_date=None, days=5):
-    """观察池 (watch_pending)。"""
+    """观察池 (watch_pending)。
+
+    Returns:
+        list[dict]: 同 list_signals；仅观察池(watch_pending)状态。
+    """
     return list_signals(states=(S_WATCH_PENDING,), trade_date=trade_date, days=days)
 
 
 def get_signal_by_code(code, trade_date=None):
-    """取某票当前活跃信号 (买入/持仓/卖出) 最新一条。"""
+    """取某票当前活跃信号 (买入/持仓/卖出) 最新一条。
+
+    Returns:
+        dict | None: 该股最新一条活跃信号行；无则 None。
+    """
     rows = list_signals(states=ACTIVE_GROUP_STATES, trade_date=trade_date, days=30)
     for r in rows:
         if r["code"] == code:
@@ -380,7 +396,11 @@ def get_signal_by_code(code, trade_date=None):
 
 
 def get_markers(code, days=60):
-    """买卖点标记 (K线图 overlay 用): 信号点/买点/卖点。"""
+    """买卖点标记 (K线图 overlay 用): 信号点/买点/卖点。
+
+    Returns:
+        list[dict]: [{time, side, price, label}]；side ∈ signal/buy/sell。
+    """
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
         cur = db.cursor()

@@ -33,10 +33,10 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 缓存目录: backend_api_python/data/market_cn_cache/frames
-# (易错: 相对 __file__ 需回退 4 级 auto/data → market_cn → app → backend_api_python;
+# (路径锚点走 core/_paths.PROJECT_ROOT —— 曾用"回退 N 级", 目录一挪就静默指错;
 #  原 3 级曾把 1.3G 缓存写进 app/data 源码树, 2026-09-10 修正并迁移)
-CACHE_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..", "data", "market_cn_cache", "frames"))
+from app.market_cn.auto.core._paths import CACHE_ROOT
+CACHE_DIR = os.path.join(CACHE_ROOT, "frames")
 CACHE_BUDGET_GB = 2.0
 CACHE_VER = "v2"        # 帧结构版本 (v1=跨股 cumsum 量纲污染, 已弃用; 旧文件由淘汰机制自然清理)
                         # v2 结构增强 (A1): 新增 hcum/lcum 键 — 保持 v2 号避免已建 151 帧
@@ -265,7 +265,7 @@ def build_frame(date, codes=None):
     else:
         codes = sorted(codes)
 
-    from app.market_cn.auto.data.hub import all_codes
+    from app.market_cn.auto.core.data.hub import all_codes
     universe = codes if codes is not None else all_codes()
     year = date[:4]
     table = f"kline_1m_{year}"
@@ -425,7 +425,7 @@ def prev_closes(before_date):
         except Exception as e:
             logger.debug("[frames] pc 缓存加载失败 (%s): %s", date, e)
 
-    from app.market_cn.auto.data.hub import all_codes
+    from app.market_cn.auto.core.data.hub import all_codes
     from app.utils.db_market import get_market_db_manager
     universe = all_codes()
     mgr = get_market_db_manager()

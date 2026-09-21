@@ -96,6 +96,7 @@ class StrategyBase:
       entry_at_close    入场在尾盘/收盘 (T+1 当日不可卖, monitor 止损守卫跳过当日; 默认 False)
       exit_exec_same_day     出场当日执行并当日平账 (默认 False=次日开盘执行)
       intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
+      intraday_exit          时间线引擎出场回调 (默认 = 次交易日开盘卖; 多日持有策略必须覆盖)
       rolling_preview        True=窗口起点起每分钟滚动预览 (run_scan_knife 循环调用, 每轮
                              清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
       data_needs             数据需求声明 (D1, §3.4): ('daily','minute_live','quote','lhb',...);
@@ -157,6 +158,40 @@ class StrategyBase:
         """
         return None
 
+    def intraday_exit(self, bars, code, entry_date, entry_price, entry_idx=None, **params):
+        """时间线引擎 (intraday_window 回测) 的出场回调 —— 默认 = 次交易日开盘卖。
+
+        默认实现与 tail/knife 基线口径逐字一致 (D1 开盘卖, exit_day=1); 返回 None =
+        视野不足 (该笔不计入)。**多日持有策略必须覆盖** (如龙回头 15 日追踪/止损/逃顶),
+        否则回测收益口径会与其实盘出场引擎不符 —— 这会反向污染阈值敏感性结论。
+        返回 dict(exit_date/exit_price/exit_day/exit_reason/return_pct[, peak_return_pct])。
+        """
+        nxt = next((b for b in bars if str(b["time"])[:10] > str(entry_date)[:10]), None)
+        if nxt is None or float(nxt["open"]) <= 0:
+            return None
+        exit_price = float(nxt["open"])
+        return {"exit_date": str(nxt["time"])[:10], "exit_price": round(exit_price, 3),
+                "exit_day": 1, "exit_reason": "d1_open",
+                "return_pct": round((exit_price / entry_price - 1) * 100, 2)}
+
+    def intraday_replay(self, bars, entry_idx, entry_price, *, code, board_type,
+                        minute_by_date, params=None):
+        """**1m 真实腿出场重放** (P3b/P4, 2026-09-21) —— 默认 None = 该策略暂不支持。
+
+        与 `intraday_exit` 的分工: 后者是 intraday_window 类策略的"入场后一次性出场判定";
+        本钩子服务**日线策略走 1m 通道** —— 策略把自己的**日线出场引擎**在给定分钟序列上
+        重放, 只把成交时点从收盘换成盘中 (日内先后可知 → 消除"low 触线但不知
+        先跌穿后收回 / 先冲高后跌穿"的结构性失真)。
+
+        契约:
+          - `bars` = 日线序列, `entry_idx` = 入场日索引 (与 `backtest_stock` 同一语义);
+          - `minute_by_date` = `{date: [槽位, ...]}`, 槽位含 `o/h/l/c` 或 `open/high/low/close`;
+            **调用方 (P4 引擎) 保证整笔持仓窗口覆盖一致** —— 要么整段有 1m, 要么不传;
+          - 返回 `dict(exit_price, exit_day, return_pct[, peak_return_pct, ...])` 或 None;
+          - **同一笔交易只用一档口径**, 禁止半段 1m / 半段日线 (口径混合会污染阈值结论)。
+        """
+        return None
+
     # ---- 探针 sample 组装 (debug 模式专用; probe=None 路径不会走到) ----
     def _probe_day(self, probe, day_tr, bars, i, code, stock_info,
                    stage=None, sig=None, u_fails=None, extra=None):
@@ -213,7 +248,7 @@ class StrategyBase:
         prev_close 取快照 previousClose 兜底 signal_price; 板块分主/创带。
         策略有特殊竞价规则时覆盖 (如 v1 的主板高开 3~5% 回避带——可用参数复现)。
         """
-        from app.market_cn.auto.common.market import get_board_type
+        from app.market_cn.auto.core.market import get_board_type
         p = self.merged_params(params or None)
         if not snap:
             return EntryDecision(False, "无竞价快照")
@@ -297,8 +332,8 @@ class StrategyBase:
                        probe=None):
         if self.scan_spec.kind != "daily_close":
             return None
-        from app.market_cn.auto.common.filters import unified_prefilter
-        from app.market_cn.auto.common.market import get_board_type
+        from app.market_cn.auto.core.filters import unified_prefilter
+        from app.market_cn.auto.core.market import get_board_type
         p = self.merged_params(None)
         n = len(bars)
         if n < 30:

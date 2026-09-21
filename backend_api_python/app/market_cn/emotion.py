@@ -149,7 +149,11 @@ def get_emotion_history(days: int = 1, hours: Optional[int] = None) -> Dict[str,
 
 
 def get_emotion_latest() -> Dict[str, Any]:
-    """获取当天最新一条情绪快照。"""
+    """获取当天最新一条情绪快照。
+
+    Returns:
+        dict: {code, emotion, count}；code=1 有数据(emotion=快照 dict)，code=0 暂无(emotion={})。
+    """
     if _rt_emotion_cycle is not None:        # ① 内存缓存
         return {"code": 1, "emotion": _rt_emotion_cycle, "count": 1}
     today = datetime.now().strftime("%Y-%m-%d")  # ② 原有逻辑

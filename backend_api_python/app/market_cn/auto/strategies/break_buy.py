@@ -21,7 +21,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.market import (
+from app.market_cn.auto.core.market import (
     find_limit_ups, get_board_name, get_board_type, is_limit_up,
 )
 from app.market_cn.auto.strategies import register
@@ -371,7 +371,7 @@ class BreakStrategy(StrategyBase):
         出场参数取本插件 BOARD_PARAMS (单一定义, backtest.py 旧份已删);
         出场模拟 _run_backtest_breakbuy 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
         # 入场枚举参数接线 (2026-09-13 修): 原硬编码 2,5 且经 kwargs 传 scan_signals,
         # kwargs 优先级压过实例覆写 → param_scan 网格全然无效 (实证: 全组合 n=94
@@ -389,6 +389,16 @@ class BreakStrategy(StrategyBase):
             except Exception:
                 pass
         bt_type = get_board_type(code)
+        # 出场成交时点 (2026-09-21 新增能力, 默认 "close" = 原行为逐笔不变):
+        #   "close"(收盘判定+收盘价成交) / "intraday_stop"(仅硬止损盘中) / "intraday"(两腿盘中)。
+        # 入口与 turnover_min 同源: 实例 default_params 覆写优先, 否则回落 config.json。
+        fill_mode = str(_p.get("fill_mode") or "")
+        if not fill_mode:
+            try:
+                fill_mode = str(_strat_reg.params_override(self.key).get("fill_mode") or "")
+            except Exception:
+                pass
+        fill_mode = fill_mode or "close"
         params = dict(BOARD_PARAMS[bt_type])
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
         hold_days = params["hold_days"]
@@ -445,7 +455,7 @@ class BreakStrategy(StrategyBase):
             if entry_price <= 0:
                 continue
             result = _run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
-                                           stop_loss, trailing_stop, bt_type)
+                                           stop_loss, trailing_stop, bt_type, fill_mode)
             if not result:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
@@ -476,10 +486,25 @@ class BreakStrategy(StrategyBase):
 
         return trades
 
+    # ---- 1m 真实腿出场重放 (P3b/P4, 2026-09-21) ----
+    def intraday_replay(self, bars, entry_idx, entry_price, *, code, board_type,
+                        minute_by_date, params=None):
+        """断板出场在 1m 通道上重放: 止损/追踪**逐槽位**(知日内先后), 峰值逃顶/到期仍收盘语义。
+
+        与 `backtest_stock` 共用**同一出场引擎** `_run_backtest_breakbuy` —— 只是多传
+        `minute_by_date`, 不新增第二份出场规则。出场参数取本插件 BOARD_PARAMS (单一定义)。
+        调用方 (P4 `run_all`) 负责"整笔持仓窗口覆盖一致"与口径标注 (`exec_basis`)。
+        """
+        bt = board_type or get_board_type(code)
+        bp = BOARD_PARAMS.get(bt, BOARD_PARAMS["main"])
+        return _run_backtest_breakbuy(
+            bars, entry_idx, entry_price, bp["hold_days"], bp["stop_loss"],
+            bp["trailing_stop"], bt, "close", minute_by_date)
+
 
 def _find_limit_ups(bars, bt):
     """涨停日索引 (is_limit_up vs 前收; 第0根无前收跳过)。与 common find_limit_ups 同语义。"""
-    from app.market_cn.auto.common.market import find_limit_ups
+    from app.market_cn.auto.core.market import find_limit_ups
     return find_limit_ups(bars, bt)
 
 
@@ -487,23 +512,42 @@ def _find_limit_ups(bars, bt):
 # 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
 # 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
 # ================================================================
-from app.market_cn.auto.common.exec_cn import (
-    fill_blocked_by_limit_dn,
-    fill_on_gap,
+from app.market_cn.auto.core.exec import (
+    fill_intraday,
     is_one_word_limit_dn,
     limit_dn_price as _limit_dn_price,
+    replay_sell_intraday,
 )
 
 
 def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
-                          trailing_stop=-6.0, board_type="main"):
-    """断板专用回测: 追踪止损 + 峰值逃顶信号 (收盘价口径, 与v1的low触及口径不同)。
+                          trailing_stop=-6.0, board_type="main", fill_mode="close",
+                          minute_by_date=None):
+    """断板专用回测: 追踪止损 + 峰值逃顶信号。
 
     现实化 (2026-09-09, 与 test_dragon.py 逐字同步):
     ① T+1 — 买入当日(d=1)不可卖出;
     ② 成交价=收盘价 — 原引擎收盘判定却按触发价成交 (触发价高于判定收盘, 不可实现);
     ③ 跌停 — 一字跌停整日跳过; 收盘触及跌停卖不出 → 顺延次日开盘; 到期顺延。
+
+    出场成交时点 fill_mode (2026-09-21 新增能力; **默认 "close" = 原行为逐笔不变**):
+      "close"         : 两腿均"收盘判定 + 收盘价成交"(现行口径, 默认);
+      "intraday_stop" : **仅硬止损腿**盘中触发 — 当日 low 触及止损线即按线价成交
+                        (开盘已在线下则按开盘价, 跳空不可按线成交), 成交价贴跌停
+                        (fill_blocked_by_limit_dn) → 卖不出, 顺延次日开盘强平;
+                        追踪腿仍 close。对齐实盘 monitor.py 硬止损的 tick 级语义。
+      "intraday"      : 两腿均盘中。追踪线取 **开盘时已知的 peak_prev**
+                        (不用当日 high 抬高后再回判, 避免"日内先视"伪影)。
+    盘中价一律走 `core/exec.fill_intraday` 原子原语 (内部复用 fill_on_gap /
+    fill_blocked_by_limit_dn), 与 v1 / dragon_callback / dragon_v2 同一约定 —— 不新增第二份成交语义。
+    配置入口: config.json `strategies.break.params.fill_mode` (未配置 → close)。
+
+    minute_by_date (2026-09-21 P3b, **1m 真实腿**): ``{date: [分钟槽位, ...]}`` (当日升序)。
+    给定且该日有槽位 → 止损/追踪两腿改由 `core/exec.replay_sell_intraday` **逐槽位重放**
+    (知日内先后, 消除"先跌穿后收回 / 先冲高后跌穿"歧义; 追踪线取开盘时已知峰值)。
+    峰值逃顶 / 到期仍是**收盘语义** (与 1m 无关)。``None`` → 行为与既往**逐笔不变**。
     """
+    fill_mode = str(fill_mode or "close")
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
     peak = entry_price
@@ -511,6 +555,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
     exit_d = 0
     pending_dn = False        # 收盘触跌停卖不出 → 次日开盘强平
     last_unfilled = False     # 末日一字跌停 → 到期顺延
+    stop_line = entry_price * (1 + stop_loss / 100.0)   # 硬止损线 (D1 起即存在, 盘中可用)
 
     # next_open模式: entry_idx=D1, 循环d=1应指向D1
     if entry_idx < len(bars):
@@ -522,6 +567,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
         idx = entry_idx + d - 1  # d=1 → entry_idx(D1)
         if idx >= len(bars): break
         b = bars[idx]
+        peak_prev = peak        # 开盘时已知的峰值 (当日 high 尚未计入 → 盘中追踪线可用)
         if b['high'] > peak: peak = b['high']
         prev_close = bars[idx - 1]['close'] if idx > 0 else 0
         dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
@@ -529,6 +575,12 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
         # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
         if pending_dn:
             exit_p, exit_d = b['open'], d
+            # 已成交 → 清标志。不清则尾部"末日顺延"块 (if last_unfilled or pending_dn)
+            # 会再顺延一次, 且其起点 nxt = entry_idx + exit_d + 1 还多跳一天 →
+            # 出场被整体推后 2 个交易日 (实测 300d 全市场 94 笔中 9 笔受影响)。
+            # 同类引擎 (dragon_callback/v1/dragon_v2) 用 `if exit_reason == "":` 守卫尾部块,
+            # 本引擎无 exit_reason → 以清标志达成同一守卫 (2026-09-20 修)。
+            pending_dn = False
             break
 
         # 一字跌停: 全天无成交可能, 持仓顺延
@@ -542,21 +594,57 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
 
         # T+1: 买入当日(d=1)不可卖出, 仅记录估值
         if d > 1:
-            # 止损 (收盘判定 → 收盘价成交)
-            if ret <= stop_loss:
-                if dn is not None and b['close'] <= dn * 1.002:
-                    pending_dn = True   # 收盘封死跌停 → 卖不出
-                    continue
-                exit_p, exit_d = b['close'], d
-                break
+            _mbars = ((minute_by_date or {}).get(str(b["time"])[:10])
+                      if minute_by_date else None)
+            if _mbars:
+                # P3b 1m 真实腿: 逐槽位重放止损/追踪 (知日内先后; 线用开盘时已知峰值)
+                _fill, _mi, _peak_after = replay_sell_intraday(
+                    _mbars, entry_price=entry_price, stop_line=stop_line,
+                    trail_pct=trailing_stop, require_profit=entry_price,
+                    dn=dn, peak=peak_prev)
+                if _peak_after > peak:
+                    peak = _peak_after
+                if _fill is not None:
+                    exit_p, exit_d = _fill, d
+                    break
+                # 1m 腿未触发 → **不**落回日线 close 口径的止损/追踪: 那条路用"当日 high
+                # 抬高后的峰值 + 单点 low", 会把分钟腿刚排除的**日内先视**再引回来。
+                # 收盘语义的两条腿 (峰值逃顶 / 到期) 与 1m 无关, 继续在下方判定。
+            else:
+                # 止损 — 盘中模式: 当日 low 触及线即按线价成交 (跳空按开盘; 贴跌停 → 顺延)
+                # 止损线自 D1 起就存在, 无"线在开盘后才形成"的问题 → 不需要 trig_prev 守卫。
+                if fill_mode != "close":
+                    _fill, _filled = fill_intraday(b, stop_line, side="sell", dn=dn)
+                    if _fill is not None:
+                        if _filled:
+                            exit_p, exit_d = _fill, d
+                            break
+                        pending_dn = True       # 成交价贴跌停 → 卖不出
+                        continue
 
-            # 追踪止损 (盈利时, 收盘判定 → 收盘价成交)
-            if ret_from_high <= trailing_stop and ret > 0:
-                if dn is not None and b['close'] <= dn * 1.002:
-                    pending_dn = True
-                    continue
-                exit_p, exit_d = b['close'], d
-                break
+                # 止损 (收盘判定 → 收盘价成交)
+                if ret <= stop_loss:
+                    if dn is not None and b['close'] <= dn * 1.002:
+                        pending_dn = True   # 收盘封死跌停 → 卖不出
+                        continue
+                    exit_p, exit_d = b['close'], d
+                    break
+
+                # 追踪止损 (盈利时)
+                if fill_mode == "intraday":
+                    # 盘中: 用开盘时已知的 peak_prev 线; 成交价须高于成本 (镜像 ret>0 门)
+                    line_prev = peak_prev * (1 + trailing_stop / 100.0)
+                    _fill, _filled = fill_intraday(b, line_prev, side="sell", dn=dn)
+                    if _filled and _fill > entry_price:
+                        exit_p, exit_d = _fill, d
+                        break
+                # 追踪止损 (收盘判定 → 收盘价成交)
+                elif ret_from_high <= trailing_stop and ret > 0:
+                    if dn is not None and b['close'] <= dn * 1.002:
+                        pending_dn = True
+                        continue
+                    exit_p, exit_d = b['close'], d
+                    break
 
             # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶 (收盘>+10%不可能贴跌停)
             if ret > 10:

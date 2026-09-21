@@ -1,0 +1,53 @@
+# ================================================================
+# tail_oversold 尾盘超卖超短 (14:56 尾盘买 → D1 开盘卖) — IDE 门表单文件 (M4)
+# 与 strategies/tail_oversold.py (scan_signals) 逐笔等价 (见 tmp/_tail_equivalence.py)
+# ----------------------------------------------------------------
+# 超卖反弹: 当日深跌 + 尾盘适度回落 + 贴近日内低位 + 近5日深度超卖 + 振幅大
+# → 次日开盘高概率反弹。入场五条件 (归一化 nf: 创/科板 0.5, 主板 1.0)。
+# 盘中通道: 时间线引擎 (1m 快照帧), entry_at=14:56 终审 (窗口内其余触发=预览)。
+# ================================================================
+meta:
+  name: 尾盘超卖超短
+  market: A
+  version: 1
+  enumeration: intraday
+  intraday:
+    windows: ["14:50", "15:00"]   # 滚动预览窗口 (14:50 起)
+    interval_sec: 60
+    entry_at: "14:56"             # 终审语义: 只在该时刻成交 (镜像 ScanSpec.entry_at)
+
+entry:
+  mode: intraday                  # 触发槽位现价买入 (14:56)
+  price: last
+
+exit:
+  mode: d1_open                   # 次交易日(D1)开盘卖
+
+params:                           # 与 strategies/tail_oversold.py PARAMS 同值 (逐笔等价基线)
+  score_min: 8.0                  # V2 评分下限 (归一化后)
+  pre5_max: -10.0                 # pre5_gain*nf 上限 (深度超卖)
+  amp_min: 10.0                   # amplitude*nf 下限 (弹性)
+  tail_lo: -2.8                   # tail_ret*nf 下限
+  tail_hi: -0.5                   # tail_ret*nf 上限 (跌太多=还在崩)
+  min_hhmm: "14:50"               # 快照时间下限 (滚动预览窗口起点)
+
+# 门表: qualify = 快照级 / required = 需快照序列(14:20~14:40 均价) + 日线上下文。
+# NaN 哨兵: 序列不足/日线不足 → 数值门自然失败 (与参考版早返回同效)。
+gates:
+  - {id: to_window, name: 预览窗口, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "to_hhmm() >= min_hhmm"}                 # 14:50 之前不出信号
+  - {id: to_limit, name: 未封板, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "to_limit_hit() == 0"}                   # 封板买不进
+  - {id: to_data, name: 序列+日线可用, role: required, needs_d0: 1, enabled: 1,
+     expr: "to_ok('tail_ret') == 1 and to_ok('pre5_gain') == 1"}   # tail_ret is None / bars<6 → 拦截
+  - {id: to_v2, name: V2五条件, role: required, needs_d0: 1, enabled: 1,
+     expr: "to_metric('score') >= score_min and to_metric('pre5_gain') * to_nf() <= pre5_max and to_metric('amplitude') * to_nf() >= amp_min and to_metric('tail_ret') * to_nf() >= tail_lo and to_metric('tail_ret') * to_nf() <= tail_hi"}
+
+# 信号展示字段 (门通过后求值; 与参考版 Signal.extra 逐字段一致)
+signal:
+  fields:
+    gain: {expr: "to_metric('day_gain')", fmt: r2}
+    amplitude: {expr: "to_metric('amplitude')", fmt: r2}
+    pos_range: {expr: "to_metric('pos_range')", fmt: r3}
+    tail_ret: {expr: "to_metric('tail_ret')", fmt: r2}
+    pre5_gain: {expr: "to_metric('pre5_gain')", fmt: r2}

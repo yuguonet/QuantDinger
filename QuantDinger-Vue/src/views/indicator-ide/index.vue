@@ -1155,9 +1155,9 @@ export default {
 
       activeIndicators: [],
       /** 图内指标（内部函数）按图表类型分桶：分时线(minute) / 蜡烛图(candle)，互不干扰 */
-      _indicatorBuckets: null,
+      indicatorBuckets: null,
       /** restore 期间抑制换档：避免恢复 timeframe 时把当前桶错误写入另一桶 */
-      _suppressBucketSwap: false,
+      suppressBucketSwap: false,
       /** 是否在 K 线图上运行当前指标（关闭后仅保留 K 线，不计算/绘制指标） */
       chartIndicatorRunning: true,
       indicatorPopoverVisible: false,
@@ -1731,7 +1731,7 @@ export default {
     restoreIdeUiState () {
       if (!this.userId) return
       try {
-        if (!this._indicatorBuckets) this._indicatorBuckets = { minute: [], candle: [] }
+        if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
         const raw = storage.get(ideUiCacheStorageKey(this.userId))
         if (raw == null || raw === '') return
         const s = typeof raw === 'string' ? JSON.parse(raw) : raw
@@ -1751,24 +1751,24 @@ export default {
         // timeframe: 按恢复后市场的可选项校验 (分时仅A股/港股合法, 不在TF_MAX_DAYS,
         // 旧版用TF_MAX_DAYS校验会把'分时'误拒回退到1D)
         if (s.timeframe && this.timeframeOptions.indexOf(s.timeframe) !== -1) {
-          this._suppressBucketSwap = true
+          this.suppressBucketSwap = true
           this.timeframe = s.timeframe
-          this._suppressBucketSwap = false
+          this.suppressBucketSwap = false
         }
         // —— 图内指标（内部函数）分桶恢复：分时线 / 蜡烛图 各自保存、互不干扰 ——
         {
           const restoredTf = this.timeframe
           const rMinute = Array.isArray(s.activeIndicatorsMinute) ? this.normalizePersistedChartIndicators(s.activeIndicatorsMinute) : null
           const rCandle = Array.isArray(s.activeIndicatorsCandle) ? this.normalizePersistedChartIndicators(s.activeIndicatorsCandle) : null
-          if (rMinute) this._indicatorBuckets.minute = rMinute
-          if (rCandle) this._indicatorBuckets.candle = rCandle
+          if (rMinute) this.indicatorBuckets.minute = rMinute
+          if (rCandle) this.indicatorBuckets.candle = rCandle
           // 旧缓存兼容：无分桶字段时，把旧 activeIndicators 归入「当前 timeframe 对应桶」
           if (rMinute == null && rCandle == null && Array.isArray(s.activeIndicators)) {
             const m = (restoredTf === '分时') ? 'minute' : 'candle'
-            this._indicatorBuckets[m] = this.normalizePersistedChartIndicators(s.activeIndicators)
+            this.indicatorBuckets[m] = this.normalizePersistedChartIndicators(s.activeIndicators)
           }
           const curMode = (restoredTf === '分时') ? 'minute' : 'candle'
-          this.activeIndicators = (this._indicatorBuckets[curMode] || []).map(i => ({ ...i }))
+          this.activeIndicators = (this.indicatorBuckets[curMode] || []).map(i => ({ ...i }))
         }
         if (s.selectedIndicatorId === null) {
           // 显式记录"用户未选外置指标" (旧缓存无此键, 走自动选择)
@@ -1804,9 +1804,9 @@ export default {
       if (!this.userId) return
       try {
         // 持久化前把当前图内指标写回「当前 timeframe 对应桶」，保证两桶均为最新
-        if (!this._indicatorBuckets) this._indicatorBuckets = { minute: [], candle: [] }
+        if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
         const curMode = (this.timeframe === '分时') ? 'minute' : 'candle'
-        this._indicatorBuckets[curMode] = this.normalizePersistedChartIndicators(this.activeIndicators)
+        this.indicatorBuckets[curMode] = this.normalizePersistedChartIndicators(this.activeIndicators)
         const payload = {
           market: this.market,
           symbol: this.symbol,
@@ -1815,8 +1815,8 @@ export default {
           selectedIndicatorId: this.selectedIndicatorId == null ? null : this.selectedIndicatorId,
           selectedWatchlistKey: this.selectedWatchlistKey,
           // 图内指标（内部函数）分桶持久化：分时线 / 蜡烛图 各自保存、互不干扰
-          activeIndicatorsMinute: this.normalizePersistedChartIndicators(this._indicatorBuckets.minute),
-          activeIndicatorsCandle: this.normalizePersistedChartIndicators(this._indicatorBuckets.candle),
+          activeIndicatorsMinute: this.normalizePersistedChartIndicators(this.indicatorBuckets.minute),
+          activeIndicatorsCandle: this.normalizePersistedChartIndicators(this.indicatorBuckets.candle),
           // 旧字段保留（兼容旧版/外部消费方）
           activeIndicators: this.serializeChartIndicators(),
           // 图表显示偏好 (红涨绿跌/画线工具栏/筹码分布/分时极坐标)
@@ -1856,16 +1856,16 @@ export default {
     },
     /** 切换 timeframe 时，把当前图内指标存回旧桶、载入目标桶（分时 / 蜡烛图互不干扰） */
     _swapIndicatorBucket (newTf, oldTf) {
-      if (!this._indicatorBuckets) this._indicatorBuckets = { minute: [], candle: [] }
+      if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
       const oldMode = this._indicatorMode(oldTf)
       const newMode = this._indicatorMode(newTf)
       if (oldMode === newMode) return
       // 旧桶：写回当前（旧模式的）图内指标
-      this._indicatorBuckets[oldMode] = this.normalizePersistedChartIndicators(this.activeIndicators)
+      this.indicatorBuckets[oldMode] = this.normalizePersistedChartIndicators(this.activeIndicators)
       // 新桶：载入（未初始化则为空数组）
-      const next = this._indicatorBuckets[newMode]
+      const next = this.indicatorBuckets[newMode]
       const loaded = Array.isArray(next) ? next.map(i => ({ ...i })) : []
-      this._indicatorBuckets[newMode] = Array.isArray(next) ? next : []
+      this.indicatorBuckets[newMode] = Array.isArray(next) ? next : []
       this.activeIndicators = loaded
     },
 
@@ -4148,7 +4148,7 @@ export default {
     timeframe (newVal, oldVal) {
       this.ensureChartReady()
       // 切换周期时换档：分时线 / 蜡烛图 各自的图内指标（内部函数）独立保存
-      if (!this._suppressBucketSwap && oldVal !== newVal) {
+      if (!this.suppressBucketSwap && oldVal !== newVal) {
         this._swapIndicatorBucket(newVal, oldVal)
       }
       this.schedulePersistIdeUiState()
