@@ -453,10 +453,11 @@ _V1_PARAMS = dict(
     v1_hold_days=20, v1_stop_loss=-10.0, v1_trailing_stop=-5.0,
 )
 
-# 断板默认参数
+# 断板默认参数 (v5: hold_days 20→7, 出场=止损-8% + J拐头(90) + 时间上限)
 _BREAK_PARAMS = dict(
     stop_loss=-8.0, trailing_stop=-6.0, take_profit=15.0,
-    hold_days=20, vol_min=1.2, vol_max=2.0, drawdown_max=-10,
+    hold_days=7, vol_min=1.2, vol_max=2.0, drawdown_max=-10,
+    use_sweet_exit=True, sweet_rsi=(80.0, 92.0), sweet_pctb=95.0, sweet_start_day=2,
 )
 
 # 龙回头 A 默认参数 (D3~D5, 短回调)
@@ -671,7 +672,11 @@ def strategy_4in1(bars, code,
                     result = run_backtest_breakbuy(
                         bars, entry_idx, entry_price,
                         bp['hold_days'], bp['stop_loss'],
-                        bp['trailing_stop'], bt)
+                        bp['trailing_stop'], bt,
+                        use_sweet_exit=bp.get('use_sweet_exit', True),
+                        sweet_rsi=bp.get('sweet_rsi', (80.0, 92.0)),
+                        sweet_pctb=bp.get('sweet_pctb', 95.0),
+                        sweet_start_day=bp.get('sweet_start_day', 2))
                     if result:
                         trade = {
                             'code': code, 'board': get_board_name(code),
@@ -975,62 +980,135 @@ def strategy_v1(bars, code, min_vol_ratio=1.5, max_upper_shadow=0.5,
 # 断板买入策略
 # ================================================================
 
+# v6.1 (2026-09-22): 断板出场 = 止损-8%(统一) + 甜点区(RSI6∈[80,92]且%B≥95, d≥2) + J拐头(90,须价格确认) + 7天上限
 BOARD_PARAMS = {
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15},
+    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 7, "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
+             "use_sweet_exit": True, "sweet_rsi": (80.0, 92.0), "sweet_pctb": 95.0, "sweet_start_day": 2},
+    "gem_star": {"stop_loss": -8.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 7, "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,  # stop -10→-8: 2026-09-22 研究定稿统一止损口径
+             "use_sweet_exit": True, "sweet_rsi": (80.0, 92.0), "sweet_pctb": 95.0, "sweet_start_day": 2},
 }
 
-def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=20, stop_loss=-8.0,
-                          trailing_stop=-6.0, board_type="main"):
-    """断板专用回测: 追踪止损 + 峰值逃顶信号"""
+def _kdj_j_series(bars):
+    """KDJ(9,3,3) J值序列, 通达信SVA口径 (与峰值日/出场研究脚本逐位一致)"""
+    n = len(bars)
+    highs = [b['high'] for b in bars]
+    lows = [b['low'] for b in bars]
+    closes = [b['close'] for b in bars]
+    Js = [50.0] * n
+    pk = 50.0
+    pd_ = 50.0
+    for i in range(n):
+        lo = min(lows[max(0, i - 8):i + 1])
+        hi = max(highs[max(0, i - 8):i + 1])
+        rsv = 50.0 if hi <= lo else (closes[i] - lo) / (hi - lo) * 100
+        pk = (2 * pk + rsv) / 3
+        pd_ = (2 * pd_ + pk) / 3
+        Js[i] = 3 * pk - 2 * pd_
+    return Js
+
+
+def _rsi6_series(bars):
+    """RSI6 (TDX SMA递推) 全序列; 前6根为 None"""
+    n = len(bars)
+    closes = [b['close'] for b in bars]
+    out = [None] * n
+    ag = al = 0.0
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        g, l = max(ch, 0), max(-ch, 0)
+        if i <= 6:
+            ag += g; al += l
+            if i == 6:
+                ag /= 6; al /= 6
+                out[i] = 100 - 100 / (1 + ag / al) if al > 0 else 100.0
+        else:
+            ag = (ag * 5 + g) / 6
+            al = (al * 5 + l) / 6
+            out[i] = 100 - 100 / (1 + ag / al) if al > 0 else 100.0
+    return out
+
+
+def _boll_pctb_series(bars):
+    """BOLL(20,2) %B 全序列; 前19根为 None"""
+    n = len(bars)
+    closes = [b['close'] for b in bars]
+    out = [None] * n
+    for i in range(19, n):
+        w = closes[i - 19:i + 1]
+        m = sum(w) / 20
+        sd = (sum((x - m) ** 2 for x in w) / 20) ** 0.5
+        u, l = m + 2 * sd, m - 2 * sd
+        out[i] = (closes[i] - l) / (u - l) * 100 if u > l else 50.0
+    return out
+
+
+def run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
+                          trailing_stop=None, board_type="main", j_threshold=90.0,
+                          use_sweet_exit=True, sweet_rsi=(80.0, 92.0), sweet_pctb=95.0,
+                          sweet_start_day=2):
+    """断板专用回测 v6: 硬止损 + 甜点区出场 + KDJ J拐头 + 时间上限
+
+    出场优先级 (每日收盘检查, 命中即出; 2026-09-22 出场研究定稿):
+      1. 硬止损:   收盘收益 <= stop_loss (生存规则永远第一, 按止损价记账)
+      2. 甜点区:   d >= sweet_start_day 且 RSI6∈sweet_rsi 且 %B>=sweet_pctb → 收盘出
+                   (峰值日标准画像: 动能高位未过热 + 价格贴上轨; 首日不生效, 避免切断启动段)
+      3. J拐头:    前一日 J >= j_threshold 且当日 J 回落, 且当日收盘 < 昨日收盘 → 收盘出
+                   (价格确认护栏: 指标拐头 + 价格下跌双重条件, 防加速段误杀)
+      4. 时间上限: 第 hold_days 天收盘出 (兜底)
+    已移除: 追踪止损 / 峰值逃顶 / take_profit (trailing_stop 参数仅为兼容旧调用保留, 不再生效)
+    入场不做甜点区过滤 — 该条件作为出场信号使用 (入场笔数不受影响)
+    """
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
+    Js = _kdj_j_series(bars)
+    Rs = _rsi6_series(bars)
+    Ps = _boll_pctb_series(bars)
+    s_lo, s_hi = sweet_rsi
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
-
-    # next_open模式: entry_idx=D1, 循环d=1应指向D1
-    if entry_idx < len(bars):
-        d1_init = bars[entry_idx]
-        if d1_init['high'] > peak:
-            peak = d1_init['high']
+    exit_rule = "time"
 
     for d in range(1, hold_days + 1):
-        idx = entry_idx + d - 1  # d=1 → entry_idx(D1)
+        idx = entry_idx + d - 1  # d=1 → entry_idx(入场日)
         if idx >= len(bars): break
         b = bars[idx]
         if b['high'] > peak: peak = b['high']
 
-        ret = (b['close'] / entry_price - 1) * 100
-        ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
+        # 1) 硬止损
+        if (b['close'] / entry_price - 1) * 100 <= stop_loss:
+            exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; exit_rule = "stop"; break
 
-        # 止损
-        if ret <= stop_loss:
-            exit_p = entry_price * (1 + stop_loss / 100); exit_d = d; break
+        # 2) 甜点区出场 (d>=sweet_start_day, 首日不生效)
+        if (use_sweet_exit and d >= sweet_start_day
+                and Rs[idx] is not None and Ps[idx] is not None
+                and s_lo <= Rs[idx] <= s_hi and Ps[idx] >= sweet_pctb):
+            exit_p = b['close']; exit_d = d; exit_rule = "sweet"; break
 
-        # 追踪止损 (盈利时)
-        if ret_from_high <= trailing_stop and ret > 0:
-            exit_p = peak * (1 + trailing_stop / 100); exit_d = d; break
-
-        # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶
-        if ret > 10:
-            bar_range = b['high'] - b['low']
-            upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-            if upper > 40 and b['close'] < b['high'] * 0.98:
-                exit_p = b['close']; exit_d = d; break
+        # 3) J拐头 + 价格确认: 前一日J达标且当日回落, 且当日收盘低于昨日收盘 → 收盘出
+        #    (v6.1 护栏: J从高位回落但收盘仍上涨 = 加速段特征, 不卖;
+        #     2026-09-22 护栏研究: 59笔 79.7%/+9.27% → 81.4%/+10.57%)
+        if (idx > 0 and Js[idx - 1] >= j_threshold and Js[idx] < Js[idx - 1]
+                and b['close'] < bars[idx - 1]['close']):
+            exit_p = b['close']; exit_d = d; exit_rule = "j_turn"; break
 
         exit_p = b['close']; exit_d = d
 
+    xidx = entry_idx + exit_d - 1
     return {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'exit_rule': exit_rule,
+        'exit_rsi6': round(Rs[xidx], 1) if 0 <= xidx < len(bars) and Rs[xidx] is not None else None,
+        'exit_pctb': round(Ps[xidx], 1) if 0 <= xidx < len(bars) and Ps[xidx] is not None else None,
         'return_pct': round((exit_p / entry_price - 1) * 100, 2),
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
 
 def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_params=None):
-    """断板买入: 连板≥2 → 断板 → 次日开盘买入 (带止盈+峰值逃顶)
+    """断板买入: 连板≥2 → 断板 → 次日开盘买入 (v6.1出场: 止损-8% + 甜点区(d≥2) + J拐头(90,价格确认) + 7天上限)
 
     买入时机: 断板日收盘确认信号 → 次日开盘买入 (实盘可行)
+    出场明细见 run_backtest_breakbuy; exit_rule 字段随交易记录输出 (stop/sweet/j_turn/time)
     """
     bt = get_board_type(code)
     threshold = 0.098 if bt == "main" else 0.198
@@ -1117,7 +1195,12 @@ def strategy_break_buy(bars, code, min_streak=2, max_break_gap=5, override_param
         entry_price = bars[entry_idx]['open']
         if entry_price <= 0: i = streak_end + 1; continue
 
-        result = run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, bt)
+        result = run_backtest_breakbuy(
+            bars, entry_idx, entry_price, hold_days, stop_loss, trailing_stop, bt,
+            use_sweet_exit=params.get('use_sweet_exit', True),
+            sweet_rsi=params.get('sweet_rsi', (80.0, 92.0)),
+            sweet_pctb=params.get('sweet_pctb', 95.0),
+            sweet_start_day=params.get('sweet_start_day', 2))
         if not result: i = streak_end + 1; continue
 
         trades.append({
@@ -1279,6 +1362,8 @@ def main():
     parser.add_argument("--min-sector-limits", type=int, default=2, help="V1: 同板块最少涨停数, 低于排除 (默认2, 即不是孤板)")
     parser.add_argument("--no-ema-filter", action="store_true", help="V1: 禁用EMA10>EMA20过滤")
     parser.add_argument("--no-rsi-filter", action="store_true", help="V1: 禁用RSI 30-70过滤")
+    parser.add_argument("--no-sweet-exit", action="store_true",
+                        help="断板: 关闭甜点区出场信号 (RSI6∈[80,92] 且 %B≥95, d≥2, 默认开启)")
     parser.add_argument("--today", action="store_true", help="仅统计今日出现买点的股票")
     parser.add_argument("--today-date", type=str, default="", help="指定日期(YYYY-MM-DD), 默认为 --end 日期")
     args = parser.parse_args()
@@ -1373,7 +1458,9 @@ def main():
         parts = []
         if run_4in1:
             code_bars = all_bars.get(code) if all_bars else bars
+            f4_bp = {"use_sweet_exit": not args.no_sweet_exit} if args.no_sweet_exit else None
             f4 = strategy_4in1(code_bars, code, buy_mode=args.buy_mode,
+                               break_params=f4_bp,
                                stock_info=stock_info,
                                sector_counts_by_date=sector_counts_by_date)
             f4in1_trades.extend(f4)
@@ -1409,7 +1496,8 @@ def main():
             v1_trades.extend(v1)
             parts.append(f"V1{len(v1)}")
         if run_bb:
-            bb = strategy_break_buy(bars, code)
+            bb_params = {"use_sweet_exit": not args.no_sweet_exit} if args.no_sweet_exit else None
+            bb = strategy_break_buy(bars, code, override_params=bb_params)
             bb_trades.extend(bb)
             parts.append(f"断板{len(bb)}")
 
