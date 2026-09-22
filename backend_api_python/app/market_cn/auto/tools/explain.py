@@ -112,7 +112,8 @@ def run_explain_backtest(spec, days, codes, sample_codes=0, seed=42, progress_ev
     rows: 每行 = 一个 (股, 决策日) 的门向量 + 标签 (供漏斗/rule_audit 消费)。
     trades: 门表回测实际成行的交易 (供两段稳定性/最终池)。
     """
-    from app.market_cn.auto.core.data.hub import all_codes, daily
+    from app.market_cn.auto.core.data.hub import all_codes
+    from app.market_cn.auto.core.data.kline import fetch_klines_batch
     from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
     from app.market_cn.auto.core.runtime.evaluate import run_backtest
     from app.market_cn.auto.probe import sample_feats
@@ -137,8 +138,11 @@ def run_explain_backtest(spec, days, codes, sample_codes=0, seed=42, progress_ev
     rows, trades = [], []
     t0 = time.time()
     n_ok = 0
+    # 批量取数: 一次往返取全部票日线 (与逐票 hub.daily 行内容/窗口/复权完全一致,
+    # 消除 O(N) DB 往返瓶颈; 缺失票不在 dict 中, 与 daily 返回 [] 等价)。
+    bars_by_code = fetch_klines_batch(codes, days)
     for k, code in enumerate(codes, 1):
-        bars = daily(code, days)
+        bars = bars_by_code.get(code)
         if not bars or len(bars) < 5:
             continue
         si = si_map.get(code) if si_map else None

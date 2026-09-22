@@ -1002,6 +1002,10 @@ def _run_agent_with_guard(agent, full_task: str):
     return result, run_error, _interrupted
 
 
+# 验收通道连续失败计数（缺陷清单 Bug12，2026-09-22）：连续 >=3 次 fail-open 时升 ERROR 告警
+_ACCEPT_FAIL_STREAK = 0
+
+
 async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_error,
                                   sandbox_digest: str = "") -> tuple:
     """轮询通道：外部 planner 的阶段验收判定（B 阶段）。
@@ -1090,6 +1094,7 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
         reason = str(obj.get("reason") or ("pass" if passed else "agent_fault"))
         if reason not in ("pass", "agent_fault", "tool_data_fault"):
             reason = "pass" if passed else "agent_fault"
+        globals()["_ACCEPT_FAIL_STREAK"] = 0   # 验收通道恢复，清零连续失败计数（Bug12）
         return passed, note, reason, score
     except asyncio.TimeoutError:
         logger.warning("[Execute] 验收判定超时 %.0fs（放行）", _accept_timeout)
@@ -1099,7 +1104,15 @@ async def _check_phase_acceptance(ctx: NodeContext, phase: dict, result, run_err
         logger.warning("[Execute] 验收判定 CancelledError 兜底（放行）")
         return True, "验收判定取消（兜底放行）"[:200], "pass", None
     except Exception as e:
-        logger.warning("[Execute] 验收判定失败（放行）: %s", e)
+        # 2026-09-22（缺陷清单 Bug12）：fail-open 语义保留（验收挂了不能卡死主流程），
+        # 但连续失败要足够刺眼——验收 LLM 持续不可用（key 过期/网络故障）时，
+        # 所有阶段都会静默通过，系统处于"无验收"状态而无人知晓。
+        globals()["_ACCEPT_FAIL_STREAK"] = globals().get("_ACCEPT_FAIL_STREAK", 0) + 1
+        _streak = globals()["_ACCEPT_FAIL_STREAK"]
+        if _streak >= 3:
+            logger.error("[Execute] 验收判定已连续失败 %d 次（全部放行）——验收通道疑似不可用，请检查验收 LLM 配置！", _streak)
+        else:
+            logger.warning("[Execute] 验收判定失败（放行）: %s", e)
         return True, f"验收判定不可用: {e}"[:200], "pass", None
 
 

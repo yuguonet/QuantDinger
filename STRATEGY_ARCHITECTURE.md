@@ -1,5 +1,11 @@
 # 自动策略组架构重设计
 
+> 📌 **本文档是迁移方案（as-is → to-be）。§1「现状分析」描述的是重构「前」的代码状态，重构已完成。**
+> `dragon_core.py` / `dragon_scan.py` / `dragon_monitor.py` / `dragon_store.py` / `dragon_api.py`
+> 等单体模块**均已不存在**，现为 `auto/strategies/` 插件化 + `store.py` / `scan.py` / `monitor.py` / `api.py`。
+> ⚠️ 因此 §1 中的旧文件名是**历史记录，不是死链** —— 勿据此"修正" §1 正文，否则会篡改现状分析。
+> 当前框架设计见 `docs/自动策略框架设计.md`；策略规则以各自策略文件（`strategies/*.py`）代码为准，文档不复述规则。
+
 ## 一、现状分析
 
 ### 1.1 当前文件结构

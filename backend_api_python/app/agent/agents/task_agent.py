@@ -1835,6 +1835,14 @@ class TaskAgent(AgentBase):
         # install_tools 登记权威表，executor 每次 __call__ 前无条件重装——阶段重试
         # （复用 CodeAgent）清空命名空间也不会复发。
         executor.install_tools(tool_functions)
+        # 2026-09-22：把 provider 全量工具名登记给执行器（纠正话术用）——
+        # 模型引用了"存在但未点名"的工具时（如 calculate_ma），纠正文案直接说明
+        # "该工具存在但未列入本阶段白名单"，避免模型继续猜名字烧步数。
+        try:
+            if self._tool_provider is not None:
+                executor.set_all_known_tools(self._tool_provider.get_functions().keys())
+        except Exception:
+            pass
 
         # 日志同时打印 executor **实际持有**的数量——只打印 len(tool_functions) 会在上述
         # 错位时给出误导数字（这是本次事故排查被带偏的直接原因）。
@@ -2251,10 +2259,18 @@ class TaskAgent(AgentBase):
                         grounded = sum(1 for n in nums if n in obs_corpus)
                         # ① 总量级保守阈值：整体可溯源比例过低即拒收
                         if grounded / len(nums) < 0.3:
+                            ungrounded = [n for n in nums if n not in obs_corpus][:10]
+                            guide = (
+                                f"以下数值在工具输出（Observation）中找不到，疑似编造：{ungrounded}。"
+                                "修复方法（三选一）：① 删除这些数值，只保留可溯源的数据；"
+                                "② 在数值后标注来源或'估算'，如'约12.5元（估算）'；"
+                                "③ 改为引用前面步骤的变量而非写死数字。"
+                                "重写 final_answer 时逐条核对每个数值。"
+                            )
                             logger.warning(
-                                "[FinalAnswer] 数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源，拒收要求重写",
+                                "[FinalAnswer] 数字溯源失败：%d 个数值仅 %d 个可在 Observation 中溯源，拒收要求重写（已附修复指导）",
                                 len(nums), grounded)
-                            return False
+                            raise ValueError(f"数字溯源失败（{len(nums)} 个数值仅 {grounded} 个可溯源）。{guide}")
                         # ② 价格/金额/百分比类（含小数点且 >=1）几乎只可能来自工具数据：
                         #   模型若凭空在 final_answer 里写死这类数字（而非引用前面取到的变量 /
                         #   打印过的取值），就会大面积无法溯源 → 判定为编造并拒收重写。
@@ -2264,11 +2280,18 @@ class TaskAgent(AgentBase):
                         if len(decimal_nums) >= 4:
                             dec_grounded = sum(1 for n in decimal_nums if n in obs_corpus)
                             if dec_grounded / len(decimal_nums) < 0.5:
+                                dec_un = [n for n in decimal_nums if n not in obs_corpus][:10]
+                                guide = (
+                                    f"以下价格/金额类小数在工具输出中找不到（疑似编造）：{dec_un}。"
+                                    "修复方法：① 用之前步骤从工具取到的**变量**（如 latest['c']）代替写死的数字；"
+                                    "② 无法变量化的，在数值后标注'（估算）'或'（工具未返回）'；"
+                                    "③ 删除非必要数值。注意：print 过的数值也算可溯源，重写前可 print 复核。"
+                                )
                                 logger.warning(
                                     "[FinalAnswer] 数字溯源失败（价格/金额类）：%d 个小数数值仅 %d 个可溯源，"
-                                    "疑似凭空编造，拒收要求重写",
+                                    "疑似凭空编造，拒收要求重写（已附修复指导）",
                                     len(decimal_nums), dec_grounded)
-                                return False
+                                raise ValueError(f"数字溯源失败（价格/金额类：{len(decimal_nums)} 个仅 {dec_grounded} 个可溯源）。{guide}")
             except Exception as e:
                 logger.debug("[FinalAnswer] 数字溯源检查跳过: %s", e)
             return True

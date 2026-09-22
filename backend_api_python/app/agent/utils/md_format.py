@@ -127,21 +127,26 @@ def _to_tsv(rows: List[Dict[str, Any]], columns: Optional[List[str]] = None) -> 
 
 
 def _batch_execute(fn, codes: List[str]) -> Any:
-    """多股批量执行模板。单股直接返回结果，多股返回 {count, data}。
+    """多股批量执行模板。单股/多股**统一**返回 {count, data, error}（2026-09-22）。
+
+    历史：单股曾直接返回扁平结果、多股返回 {count, data}——二义性导致模型按
+    data['代码'] 取值时单股场景 KeyError（07:22 轮 get_stock_concept_blocks 实测）。
+    现统一为与 agent_get_kline 相同的三键结构：无论单多股，取数路径一致。
 
     Args:
         fn: 单股执行函数 fn(code) -> Any
         codes: 股票代码列表
     """
-    if len(codes) == 1:
-        return fn(codes[0])
+    def _safe_one(code: str) -> Dict[str, Any]:
+        try:
+            return fn(code)
+        except Exception as e:
+            return {"error": str(e)}
+
     results: Dict[str, Any] = {}
     for code in codes:
-        try:
-            results[code] = fn(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+        results[code] = _safe_one(code)
+    return {"count": len(results), "data": results, "error": None}
 
 
 def _lookup_stock_name(stock_code: str) -> str:

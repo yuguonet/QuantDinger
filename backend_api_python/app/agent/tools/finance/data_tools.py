@@ -124,9 +124,13 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         多代码 → {"count": N, "data": {代码: 行情dict}}——**单/多代码返回结构不同**，
         多代码时股票字典在二级键 data 下；失败时含 error 键
     """
+    # 归一化：剥离市场后缀（.SZ/.SH）与市场前缀（sh/sz），与 get_tickers 的
+    # symbol 键对齐（get_tickers 返回的 symbol 是纯代码，如 "300497"）。
+    # 若不归一化，.SZ 后缀输入会查不到 → 误报"未获取到行情"（2026-09-22 修复）。
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
+    code_list = [_strip_prefix(c) for c in code_list]
 
     ds = _get_ds("CNStock")
 
@@ -182,7 +186,11 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, A
     else:
         codes = str(codes)
 
-    code_list = [_strip_prefix(c.strip()) for c in codes.split(",") if c.strip()][:20]
+    raw_codes = [c.strip() for c in codes.split(",") if c.strip()][:20]
+    # 查询用裸码（DB/远端按裸码），返回键用原始入参码（模型视角一致）——
+    # 2026-09-22 修复：入参 '600519.SH' strip 后用裸码做返回键，模型按
+    # data['600519.SH'] 取值落空，指标全缺（07:19 轮红字根因）。
+    code_list = [_strip_prefix(c) for c in raw_codes]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
@@ -212,9 +220,9 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, A
             return str(ts)
 
     results: Dict[str, Any] = {}
-    for code in code_list:
+    for raw, code in zip(raw_codes, code_list):
         klines = _fetch(code)
-        results[code] = [{
+        results[raw] = [{
             "t": k.get("date") or _ts_to_date(k.get("time", 0)),
             "o": round(k.get("open", 0), 2),
             "h": round(k.get("high", 0), 2),
@@ -465,14 +473,13 @@ def _tencent_quote_raw(codes: list) -> dict:
     prefixed = []
     for c in codes:
         c = _strip_prefix(c)
-        if c.startswith(("6", "9", "5", "000")):
-            if c.startswith("000") and not c.startswith(("002", "003")):
-                prefixed.append(f"sh{c}")
-            elif c.startswith(("6", "9", "5")):
-                prefixed.append(f"sh{c}")
-            else:
-                prefixed.append(f"sz{c}")
-        elif c.startswith("8"):
+        # 2026-09-22 修复：旧逻辑把 000/001 开头的深市主板股映射成 sh 前缀
+        # （如 000858 五粮液 → sh000858），腾讯对不存在标的返回错位字段，
+        # 解析出 price=13765/pb=0 的坏数据。市场前缀统一按 normalizer 规则：
+        # 沪市 6/9/5 开头 → sh；北交所 8/4 开头 → bj；其余（深市 0/2/3）→ sz。
+        if c.startswith(("6", "9", "5")):
+            prefixed.append(f"sh{c}")
+        elif c.startswith(("8", "4")):
             prefixed.append(f"bj{c}")
         else:
             prefixed.append(f"sz{c}")
@@ -543,8 +550,8 @@ def get_order_book(codes: str) -> dict:
     """五档盘口：返回买卖各5档价格和挂单量、涨跌幅、换手率、PE、市值等。
 
     Returns:
-        单代码 → {code, name, price, change_percent, bid, ask}，五档在 bid/ask；
-        多代码 → {"count": N, "data": {代码: dict}}；失败 → {"error"}
+        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{code, name, price, change_percent, bid, ask}，五档在 bid/ask。
 
     Args:
         codes: 多股用逗号分隔
@@ -866,8 +873,9 @@ def get_capital_summary(codes: str) -> dict:
     并生成结构化摘要供中长线持仓决策参考。
 
     Returns:
-        单代码 → {"summary": {margin, block_trade, holders, dividend, financials,
-        overall_signal(中长线偏多/偏空/中性)}}；多代码 → {"count": N, "data": {代码: 同上}}
+        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{"summary": {margin, block_trade, holders, dividend, financials,
+        overall_signal(中长线偏多/偏空/中性)}}。
 
     Args:
         codes: 多股用逗号分隔

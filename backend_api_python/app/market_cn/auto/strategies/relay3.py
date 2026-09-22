@@ -28,6 +28,8 @@ from datetime import datetime
 from app.market_cn.auto.core.indicators import ma as _ma  # D2: 收编内联, 逐字等价
 from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
+from app.market_cn.auto.core.runtime.functions import Ctx, _closes_upto
+from app.market_cn.auto.core.runtime.gate_stdlib import board_height, ma_bull
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -459,3 +461,32 @@ class Relay3Strategy(StrategyBase):
                 **result,
             })
         return trades
+
+
+# ================================================================
+# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# ================================================================
+def relay3_features(ctx: Ctx) -> dict:
+    """relay3 日线特征（逐字镜像 relay3.calc_features，截至决策日 i）。
+
+    门表用 board_height()/ma_bull() 判资格；本函数额外给出**信号展示字段**
+    （lu_vol_ratio / rsi），保证与 python 参考版 trades 逐字一致。逻辑单点维护于此。
+    """
+    i = ctx.i
+    closes = _closes_upto(ctx)
+    vols = [Ctx._f(ctx.bars[j], "volume") for j in range(i + 1)]
+    feats = {"board_height": board_height(ctx), "ma_bull": 1 if ma_bull(ctx) else 0}
+    # 涨停日量比 (昨日量 / 前5日均量)
+    if len(vols) >= 6:
+        avg5 = sum(vols[-6:-1]) / 5
+        feats["lu_vol_ratio"] = round(vols[-1] / avg5, 2) if avg5 > 0 else None
+    # RSI14 (relay3 口径: 取末尾 15 个收盘的 14 段差分)
+    if len(closes) >= 15:
+        gains, losses = [], []
+        for k in range(len(closes) - 15, len(closes)):
+            dd = closes[k] - closes[k - 1]
+            gains.append(max(dd, 0))
+            losses.append(max(-dd, 0))
+        ag, al = sum(gains) / 14, sum(losses) / 14
+        feats["rsi"] = round(100 - 100 / (1 + ag / al), 1) if al > 0 else 100.0
+    return feats

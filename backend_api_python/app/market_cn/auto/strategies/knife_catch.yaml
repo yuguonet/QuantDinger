@@ -39,32 +39,32 @@ params:                           # 与 strategies/knife_catch.py PARAMS 同值 
 #       只影响枚举规模不影响 trades），IDE 盘中通道复用它们（见 ide/intraday.py 模块头）。
 gates:
   - {id: kc_window, name: 尾盘窗口, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "kc_hhmm() >= '14:56'"}                  # 14:56 之后才出信号
+     expr: "hhmm() >= '14:56'"}                  # 14:56 之后才出信号
   - {id: kc_mkt, name: 市场门控, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "kc_mkt_gain() <= mkt_gate"}             # None → nan → 拦截 (镜像 mkt_gain is None)
+     expr: "mkt_gain() <= mkt_gate"}             # None → nan → 拦截 (镜像 mkt_gain is None)
   - {id: kc_feat, name: 深跌+振幅+贴低, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('gain') <= gain_max and kc_metric('amp') >= amp_min and kc_metric('pos') <= pos_max"}
+     expr: "feat('gain') <= gain_max and feat('amp') >= amp_min and feat('pos') <= pos_max"}
   - {id: kc_tail_vw, name: 尾盘回升+压制VWAP, role: required, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('tail') >= tail_min and kc_metric('vw') <= vw_max"}   # None → nan → 拦截
+     expr: "feat('tail') >= tail_min and feat('vw') <= vw_max"}   # None → nan → 拦截
   - {id: kc_vol, name: 量比上限, role: required, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('vol_ratio') <= vol_max"}
+     expr: "feat('vol_ratio') <= vol_max"}
   - {id: kc_streak, name: 连跌下限, role: required, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('streak') >= streak_min"}
+     expr: "feat('streak') >= streak_min"}
   - {id: kc_pre5, name: 近5日走弱, role: required, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('pre5') <= pre5_max"}
+     expr: "feat('pre5') <= pre5_max"}
   - {id: kc_lu_recent, name: 近期无涨停, role: required, needs_d0: 1, enabled: 1,
-     expr: "kc_metric('lu_recent') == 0"}
+     expr: "feat('lu_recent') == 0"}
 
 # 信号展示字段（门通过后求值; 与参考版 Signal.extra 逐字段一致）
 signal:
   fields:
-    gain: {expr: "kc_metric('gain')", fmt: r2}
-    amplitude: {expr: "kc_metric('amp')", fmt: r2}
-    pos_range: {expr: "kc_metric('pos')", fmt: r3}
-    tail_ret: {expr: "kc_metric('tail')", fmt: r2}
-    vw_frac: {expr: "kc_metric('vw')", fmt: r3}
-    vol_ratio: {expr: "kc_metric('vol_ratio')", fmt: r3}
-    down_streak: {expr: "kc_metric('streak')", fmt: int}
-    pre5_gain: {expr: "kc_metric('pre5')", fmt: r2}
-    lu_recent: {expr: "kc_metric('lu_recent')", fmt: int}
-    mkt_gain: {expr: "kc_mkt_gain()", fmt: r3}
+    gain: {expr: "feat('gain')", fmt: r2}
+    amplitude: {expr: "feat('amp')", fmt: r2}
+    pos_range: {expr: "feat('pos')", fmt: r3}
+    tail_ret: {expr: "feat('tail')", fmt: r2}
+    vw_frac: {expr: "feat('vw')", fmt: r3}
+    vol_ratio: {expr: "feat('vol_ratio')", fmt: r3}
+    down_streak: {expr: "feat('streak')", fmt: int}
+    pre5_gain: {expr: "feat('pre5')", fmt: r2}
+    lu_recent: {expr: "feat('lu_recent')", fmt: int}
+    mkt_gain: {expr: "mkt_gain()", fmt: r3}

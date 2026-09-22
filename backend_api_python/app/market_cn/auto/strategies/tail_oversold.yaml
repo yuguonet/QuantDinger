@@ -35,19 +35,19 @@ params:                           # 与 strategies/tail_oversold.py PARAMS 同�
 # NaN 哨兵: 序列不足/日线不足 → 数值门自然失败 (与参考版早返回同效)。
 gates:
   - {id: to_window, name: 预览窗口, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "to_hhmm() >= min_hhmm"}                 # 14:50 之前不出信号
+     expr: "hhmm() >= min_hhmm"}                 # 14:50 之前不出信号
   - {id: to_limit, name: 未封板, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "to_limit_hit() == 0"}                   # 封板买不进
+     expr: "limit_hit() == 0"}                   # 封板买不进
   - {id: to_data, name: 序列+日线可用, role: required, needs_d0: 1, enabled: 1,
-     expr: "to_ok('tail_ret') == 1 and to_ok('pre5_gain') == 1"}   # tail_ret is None / bars<6 → 拦截
+     expr: "ok('tail_ret') == 1 and ok('pre5_gain') == 1"}   # tail_ret is None / bars<6 → 拦截
   - {id: to_v2, name: V2五条件, role: required, needs_d0: 1, enabled: 1,
-     expr: "to_metric('score') >= score_min and to_metric('pre5_gain') * to_nf() <= pre5_max and to_metric('amplitude') * to_nf() >= amp_min and to_metric('tail_ret') * to_nf() >= tail_lo and to_metric('tail_ret') * to_nf() <= tail_hi"}
+     expr: "feat('score') >= score_min and feat('pre5_gain') * nf() <= pre5_max and feat('amplitude') * nf() >= amp_min and feat('tail_ret') * nf() >= tail_lo and feat('tail_ret') * nf() <= tail_hi"}
 
 # 信号展示字段 (门通过后求值; 与参考版 Signal.extra 逐字段一致)
 signal:
   fields:
-    gain: {expr: "to_metric('day_gain')", fmt: r2}
-    amplitude: {expr: "to_metric('amplitude')", fmt: r2}
-    pos_range: {expr: "to_metric('pos_range')", fmt: r3}
-    tail_ret: {expr: "to_metric('tail_ret')", fmt: r2}
-    pre5_gain: {expr: "to_metric('pre5_gain')", fmt: r2}
+    gain: {expr: "feat('day_gain')", fmt: r2}
+    amplitude: {expr: "feat('amplitude')", fmt: r2}
+    pos_range: {expr: "feat('pos_range')", fmt: r3}
+    tail_ret: {expr: "feat('tail_ret')", fmt: r2}
+    pre5_gain: {expr: "feat('pre5_gain')", fmt: r2}

@@ -136,7 +136,9 @@ def get_stock_concept_blocks(codes: str) -> dict:
     """个股概念归属：返回股票所属的行业板块和概念板块列表。
 
     Returns:
-        dict: 单股→{stock_code,total,boards:[{name,code,change_pct,lead_stock}]}；多股→{count,data:{代码:同左}}。板块列表在 boards；失败含 error。
+        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{stock_code, total, boards:[{name,code,change_pct,lead_stock}],
+        concept_tags:[...]}（板块列表在 boards）。
 
     Args:
         codes: 多股用逗号分隔

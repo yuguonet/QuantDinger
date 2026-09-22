@@ -106,6 +106,13 @@ class StateGraph:
         return CompiledGraph(self, checkpointer)
 
 
+
+# 2026-09-22（缺陷清单 Bug7）：框架级最大迭代防护——路由函数 bug 导致
+# execute→plan→execute 无限循环时，业务层防护（MAX_REPLAN 等）可能同样失效，
+# 这里兜底断开并标记错误，进程不会永久挂起。
+MAX_ITERATIONS = 50
+
+
 class CompiledGraph:
     """编译后的状态图，可执行。"""
 
@@ -133,7 +140,13 @@ class CompiledGraph:
                 logger.info("[Graph] 从 checkpoint 恢复: thread=%s", thread_id)
 
         current = self._graph._entry
+        _steps = 0
         while current != END:
+            _steps += 1
+            if _steps > MAX_ITERATIONS:
+                logger.error("[Graph] 迭代超过 %d 步，判定路由环，强制终止", MAX_ITERATIONS)
+                state["error"] = f"graph 迭代超限（>{MAX_ITERATIONS}）"
+                return state
             node_func = self._graph._nodes.get(current)
             if not node_func:
                 raise ValueError(f"节点 '{current}' 未注册")
@@ -181,7 +194,14 @@ class CompiledGraph:
                 state.update(saved)
 
         current = self._graph._entry
+        _steps = 0
         while current != END:
+            _steps += 1
+            if _steps > MAX_ITERATIONS:
+                logger.error("[Graph] astream 迭代超过 %d 步，判定路由环，强制终止", MAX_ITERATIONS)
+                state["error"] = f"graph 迭代超限（>{MAX_ITERATIONS}）"
+                yield {"node": current, "state": dict(state), "error": state["error"]}
+                break
             node_func = self._graph._nodes.get(current)
             if not node_func:
                 raise ValueError(f"节点 '{current}' 未注册")
@@ -219,10 +239,14 @@ class CompiledGraph:
             condition, mapping = self._graph._conditional[current]
             route = condition(state)
             if route not in mapping:
-                raise ValueError(
-                    f"节点 '{current}' 的条件路由返回 '{route}'，"
-                    f"但 mapping 中只有 {list(mapping.keys())}"
-                )
+                # 2026-09-22（缺陷清单 A10）：路由 bug 不应炸穿整图——
+                # 记 error 并终止（state 里有 error/failed 信息，调用方可降级），
+                # 比抛 ValueError 让 async for 直接死掉更可诊断。
+                logger.error("[Graph] 节点 '%s' 条件路由返回无效值 '%s'（mapping=%s），强制终止",
+                             current, route, list(mapping.keys()))
+                state["error"] = f"条件路由无效值: {route!r}"
+                state["failed_node"] = current
+                return END
             return mapping[route]
 
         # 固定边

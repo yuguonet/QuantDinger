@@ -59,6 +59,7 @@ import numpy as np
 from app.market_cn.auto.core.indicators import calc_macd
 from app.market_cn.auto.core.market import get_board_type
 from app.market_cn.auto.strategies import register
+from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -68,6 +69,10 @@ logger = get_logger(__name__)
 
 STRATEGY_KEY = "g56"
 STRATEGY_LABEL = "五重共振"   # 2026-09-17 用户命名 (原"56%规则G+"); 5重硬条件:
+# 开盘区间指引 (2026-09-22 回测结论, 仅展示/排序用, 不强制过滤信号集):
+#   次日开盘跳空 gap ∈ [-3%,+3%] 最优 (甜区 [0%,+2%], 76%~100% 胜率/+8~+10.6% 均收);
+#   回避 ≥+4% 高开 (尤其 [4%,5%] 样本全止损 -8%)。gap 在 D0 开盘才可知, 故此处为静态指引。
+SIGNAL_OPEN_RANGE_HINT = " · 开[-3%,+3%]优先·回避≥+4%高开"
 # |MA5-MA10|≤2.5% / rma_chg>0 / ATR>板块Q5 / 前20日大涨日≥2 / rhist_chg>板块Q5,
 # regime 门为横截面环境门不占位; 与祖先策略"三金叉共振"成谱系。key=g56 不变。
 
@@ -358,7 +363,7 @@ class G56Strategy(StrategyBase):
             time=bars[k]["time"],
             score=int(min(99, max(0, round(50 + rhc * GEM_SCORE_DIVISOR)))),
             price=float(bars[k]["close"]),
-            label=STRATEGY_LABEL,
+            label=STRATEGY_LABEL + SIGNAL_OPEN_RANGE_HINT,
             extra={
                 # 不写 "board" 键: store.signal_row 回退 get_board_name (中文板块名,
                 # 与全表落库口径一致); 板块类型由 code 前缀可逆推导
@@ -495,3 +500,79 @@ class G56Strategy(StrategyBase):
             })
             last_exit_idx = s + r["exit_day"] - 1   # 锁仓至退出日 (含), 期间不重复入场
         return trades
+
+
+# ================================================================
+# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# ================================================================
+_G56_KEYS = ("rma", "rma_chg", "atr", "rhist_chg", "dif0", "pctb", "rsi")
+
+
+def g56_feat(ctx: Ctx, name: str) -> float:
+    """g56 G1 特征取值（决策日 i）。缺值/暖机 → nan（数值门自然失败）。"""
+    f = ctx.ext.get("g56_feats")
+    if f is None:
+        raise RuntimeError("g56 特征未注入 ctx.ext['g56_feats']（编排层缺失）")
+    arr = f.get(name)
+    if arr is None:
+        raise KeyError(f"未知 g56 特征: {name}")
+    j = ctx.i
+    if j < 0 or j >= len(arr):
+        return float("nan")
+    return float(arr[j])
+
+
+def g56_finite(ctx: Ctx) -> int:
+    """G1 判定要求的"全部特征有限"（镜像 _g1_mask 的 np.isfinite 循环）。"""
+    import math
+    f = ctx.ext.get("g56_feats") or {}
+    j = ctx.i
+    for k in _G56_KEYS:
+        arr = f.get(k)
+        if arr is None or j < 0 or j >= len(arr) or not math.isfinite(float(arr[j])):
+            return 0
+    return 1
+
+
+def g56_warmup(ctx: Ctx) -> int:
+    """暖机下限：镜像 _g1_mask 的 m[:68]=False → 决策日索引 i 必须 >= 68。"""
+    return 1 if ctx.i >= 68 else 0
+
+
+def g56_pool_stat(ctx: Ctx, name: str) -> float:
+    """横截面 regime 池统计（决策日 date_k 的板块池值）—— 门用（缺失 → nan → 门失败）。
+
+    镜像参考版 `st = pool.get(board,{}).get(date_k); if st is None: 拦截`。
+    """
+    pool = ctx.ext.get("g56_pool") or {}
+    st = (pool.get(ctx.board_type) or {}).get(str(ctx.bars[ctx.i]["time"])[:10])
+    if st is None:
+        return float("nan")
+    v = st.get(name)
+    return float("nan") if v is None else float(v)
+
+
+def g56_pool_field(ctx: Ctx, name: str):
+    """横截面池统计原值 —— 信号展示字段用（缺失/None → None，与参考版 trades 同语义）。"""
+    pool = ctx.ext.get("g56_pool") or {}
+    st = (pool.get(ctx.board_type) or {}).get(str(ctx.bars[ctx.i]["time"])[:10])
+    if st is None:
+        return None
+    v = st.get(name)
+    return None if v is None else float(v)
+
+
+def board_is_main(ctx: Ctx) -> int:
+    """是否主板（镜像参考版 regime 门的 board == 'main' 分支）。"""
+    return 1 if ctx.board_type == "main" else 0
+
+
+def board_is_gem(ctx: Ctx) -> int:
+    """是否 20cm（创业板/科创板）。"""
+    return 1 if ctx.board_type != "main" else 0
+
+register_strategy_funcs(
+    'g56',
+    {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem},
+    d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0},
+)

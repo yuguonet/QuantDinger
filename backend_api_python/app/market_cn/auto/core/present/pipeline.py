@@ -101,14 +101,17 @@ def _const_num(node: ast.AST) -> Optional[float]:
 
 
 @functools.lru_cache(maxsize=4096)
-def reads_decision_bar(expr: str) -> bool:
+def reads_decision_bar(expr: str, key: str = None) -> bool:
     """门表达式是否**读取决策日 i**(偏移 0)的行情数据。
 
     判据:
       - 内置/注册**偏移函数**: `args[0]` 必须可常量折叠为 < 0 才安全; 无参调用
         (默认偏移 0) 或偏移值 ≥ 0 或偏移来自参数 → 判 True。
-      - **非偏移函数**: 查 functions.D0_DEPS / REGISTERED_D0; 未声明 (None) → 判 True。
+      - **非偏移函数**: 查 functions.D0_DEPS / REGISTERED_D0 / 策略命名空间 STRATEGY_GATE_D0
+        (declared_d0_for_strategy); 未声明 (None) → 判 True。
       - 字面量/参数名/纯运算: 不读行情数据。
+
+    key: 策略命名空间 (feat/warmup/finite 等跨策略同名函数各自的 D0 依赖不同, 必须按 key 查)。
 
     **保守原则**: 不能证明"不读"就返回 True。返回 False 的门才会被 T-1 夜用占位
     D0 bar 求值 —— 一旦判错就是静默丢信号, 故宁可多算一门到盘中。
@@ -126,7 +129,7 @@ def reads_decision_bar(expr: str) -> bool:
             if k is None or k >= 0:
                 return True                     # 偏移来自参数 / 读决策日
             continue
-        dep = declared_d0_dep(fname)
+        dep = declared_d0_dep(fname, key)
         if dep != 0:
             return True                         # 未声明 / 声明为 1 → 保守判读决策日
     return False
@@ -196,7 +199,7 @@ def audit_needs_d0(spec: StrategySpec) -> List[Dict[str, Any]]:
     off = decision_offset(spec)
     out: List[Dict[str, Any]] = []
     for g in spec.enabled_gates:
-        derived = 1 if (off == 0 and reads_decision_bar(g.expr)) else 0
+        derived = 1 if (off == 0 and reads_decision_bar(g.expr, spec.key)) else 0
         if derived != g.needs_d0:
             out.append({
                 "key": spec.key, "gate": g.id, "name": g.name,
@@ -760,7 +763,8 @@ def verify_split(spec: StrategySpec, bars: List[Dict[str, Any]], code: str,
 # ================================================================
 def _load_specs(keys=None) -> Dict[str, StrategySpec]:
     from app.market_cn.auto.core.runtime.evaluate import load_strategy
-    import app.market_cn.auto.core.runtime.strategy_funcs  # noqa: F401  副作用: 注册策略函数
+    from app.market_cn.auto.core.runtime.functions import ensure_gate_init
+    ensure_gate_init()  # noqa: F401  副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数
     if keys is None:
         import glob
         keys = sorted(os.path.splitext(os.path.basename(p))[0]

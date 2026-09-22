@@ -25,6 +25,7 @@ from app.market_cn.auto.core.market import (
     find_limit_ups, get_board_name, get_board_type, is_limit_up,
 )
 from app.market_cn.auto.strategies import register
+from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -675,3 +676,231 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
         'return_pct': round((exit_p / entry_price - 1) * 100, 2),
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
+
+
+# ================================================================
+# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# ================================================================
+def _bk_ma_bull_at(bars, idx: int):
+    """确认日均线多头排列 MA5>MA10>MA20（镜像 break_buy._ma_bull_at）。不足 20 日 → None。"""
+    if idx + 1 < 20:
+        return None
+    c = [Ctx._f(bars[j], "close") for j in range(idx - 19, idx + 1)]
+    m5 = sum(c[-5:]) / 5.0
+    m10 = sum(c[-10:]) / 10.0
+    m20 = sum(c) / 20.0
+    return m5 > m10 > m20
+
+
+def _bk_raw(bars, bt: str, streak_start: int, streak_end: int,
+            min_streak: int, max_break_gap: int, asof: int, market=None):
+    """断板期『原始结构』—— 镜像 break_buy._break_signal_at 的**结构部分**（不含 5a~5g 判定）。
+
+    返回 None = 结构不成立（连板不足 / 断板期为空 / 越界）。判定（缩量/涨跌/回撤/增强/
+    均线）由门表完成；本函数只产出结构量，使门表与参考版逐笔等价且逐门可解释。
+
+    asof: 决策日 i —— 参考版在 bars[:i+1] 上计算（scan_signals 切片），故断板期**只扫到 i**；
+          故本函数绝不能用完整 bars 向后扫（否则读到未来 bar，且 break_days 会偏大 → 翻转判定）。
+    """
+    streak_len = streak_end - streak_start + 1
+    if streak_len < min_streak:
+        return None
+    break_idx = streak_end + 1
+    if break_idx >= asof + 1:            # 参考版: break_idx >= len(bars[:i+1])
+        return None
+    limit_bar = bars[streak_end]
+    limit_open = Ctx._f(limit_bar, "open")
+    limit_close = Ctx._f(limit_bar, "close")
+    limit_vol = Ctx._f(limit_bar, "volume")
+    break_days = 0
+    # 切片上界 = min(break_idx+max_break_gap+1, asof+1)，与 bars[:i+1] 完全一致
+    for j in range(break_idx, min(break_idx + max_break_gap + 1, asof + 1)):
+        if is_limit_up(Ctx._f(bars[j], "close"), Ctx._f(bars[j - 1], "close"), bt, market):
+            break
+        break_days += 1
+    if break_days == 0:
+        return None
+    break_bars = bars[break_idx:break_idx + break_days]
+    first_break = break_bars[0]
+    break_low = min(Ctx._f(b, "low") for b in break_bars)
+    break_vol_avg = sum(Ctx._f(b, "volume") for b in break_bars) / len(break_bars)
+    break_vol_r = break_vol_avg / limit_vol if limit_vol > 0 else 0.0
+    first_break_chg = (Ctx._f(first_break, "close") / limit_close - 1) * 100 if limit_close > 0 else 0.0
+    first_break_gap = (Ctx._f(first_break, "open") / limit_close - 1) * 100 if limit_close > 0 else 0.0
+    break_drawdown = (break_low / limit_close - 1) * 100 if limit_close > 0 else 0.0
+    confirm_bar = break_bars[-1]
+    confirm_prev = break_bars[-2] if len(break_bars) >= 2 else limit_bar
+    c_pc = Ctx._f(confirm_prev, "close")
+    confirm_chg = (Ctx._f(confirm_bar, "close") / c_pc - 1) * 100 if c_pc > 0 else 0.0
+    confirm_gap = (Ctx._f(confirm_bar, "open") / c_pc - 1) * 100 if c_pc > 0 else 0.0
+    pre20_gain = None
+    if streak_start >= 20:
+        _ref = Ctx._f(bars[streak_start - 20], "close")
+        if _ref > 0:
+            pre20_gain = (limit_close / _ref - 1) * 100
+    ma_bull = _bk_ma_bull_at(bars, break_idx + break_days - 1)
+    return {
+        "streak_len": streak_len, "streak_start_idx": streak_start, "streak_end_idx": streak_end,
+        "break_idx": break_idx, "break_days": break_days,
+        "limit_open": limit_open, "limit_close": limit_close, "limit_vol": limit_vol,
+        "break_low": break_low, "break_vol_r": break_vol_r,
+        "first_break_chg": first_break_chg, "first_break_gap": first_break_gap,
+        "break_drawdown": break_drawdown,
+        "confirm_chg": confirm_chg, "confirm_gap": confirm_gap,
+        "pre20_gain": pre20_gain, "ma_bull": ma_bull,
+        "break_date": bars[break_idx]["time"],
+        "streak_start_date": bars[streak_start]["time"],
+        "streak_end_date": bars[streak_end]["time"],
+    }
+
+
+def _bk_compute(ctx: Ctx):
+    """决策日 i 的断板期候选结构（镜像 break_buy.scan_signals 的 lu_idx 搜索 + 对齐）。
+
+    候选唯一：streak_end = i 之前**最后一个涨停日**（若距 i 超过 max_break_gap 则断板期过长
+    → 无候选）；streak_start = 该连板首板（须 is_first：其前 10 日内无涨停）；断板期
+    = [streak_end+1, i]，长度须 ≤ max_break_gap 且恰好终止于 i。只读 ≤ i 的 bar（as-of 安全）。
+    """
+    bars = ctx.bars
+    i = ctx.i
+    n = ctx.n
+    bt = ctx.board_type
+    mk = ctx.market
+    p = ctx.params
+    if i < 2 or i >= n:
+        return None
+    min_streak = int(p.get("min_streak", 2))
+    max_break_gap = int(p.get("max_break_gap", 5))
+    # 确认日必为非涨停日（断板期最后一天）
+    if is_limit_up(Ctx._f(bars[i], "close"), Ctx._f(bars[i - 1], "close"), bt, mk):
+        return None
+    # i 之前最后一个涨停日（= streak_end）；断板期 ≤ max_break_gap，故仅需回看该窗口
+    streak_end = -1
+    j = i - 1
+    steps = 0
+    while j >= 1 and steps <= max_break_gap:
+        if is_limit_up(Ctx._f(bars[j], "close"), Ctx._f(bars[j - 1], "close"), bt, mk):
+            streak_end = j
+            break
+        j -= 1
+        steps += 1
+    if streak_end < 0:
+        return None
+    break_days = i - streak_end
+    if break_days < 1 or break_days > max_break_gap:
+        return None
+    # 连板首板（向前回看连续涨停）：仅当前一根 bar 也是涨停时才纳入（与参考版正向延伸对称）
+    streak_start = streak_end
+    while streak_start - 2 >= 0 and is_limit_up(
+            Ctx._f(bars[streak_start - 1], "close"), Ctx._f(bars[streak_start - 2], "close"), bt, mk):
+        streak_start -= 1
+    # is_first：首板前 10 日内不得有涨停（镜像 break_buy.scan_signals）
+    for k in range(1, min(11, streak_start + 1)):
+        idx = streak_start - k
+        if idx - 1 >= 0 and is_limit_up(Ctx._f(bars[idx], "close"),
+                                       Ctx._f(bars[idx - 1], "close"), bt, mk):
+            return None
+    return _bk_raw(bars, bt, streak_start, streak_end, min_streak, max_break_gap, i, mk)
+
+
+def bk_struct(ctx: Ctx):
+    """决策日 i 的断板期结构（每 Ctx 记忆化：同一天的多个门共享一次计算）。None=非确认日。"""
+    cache = ctx.__dict__.setdefault("_bk_cache", {})
+    if "s" not in cache:
+        cache["s"] = _bk_compute(ctx)
+    return cache["s"]
+
+
+# 非候选日的缺省特征（使各判定门自然失败；候选门 g_candidate 才是真正的闸）
+_BK_MISS = {
+    "streak_len": 0.0, "break_days": 0.0, "break_vol_r": 0.0,
+    "first_break_chg": -1e18, "first_break_gap": -1e18, "break_drawdown": -1e18,
+    "confirm_chg": -1e18, "confirm_gap": -1e18, "pre20_gain": -1e18,
+    "ma_bull": 0.0, "limit_open": 0.0, "break_low": 0.0, "is_candidate": 0,
+}
+
+
+def bk_feat(ctx: Ctx, name: str):
+    """断板期结构特征（供门表表达式引用）。非候选日 → 返回使各门自然失败的缺省值。
+
+    ma_bull 编码: True→1 / None(数据不足)→-1 / False→0 —— 参考版"仅 False 拦截"由门
+    表达式 `not ma_bull_filter or bk_feat('ma_bull') != 0` 表达 (None 亦放行)。
+    """
+    s = bk_struct(ctx)
+    if name == "is_candidate":
+        return 1 if s is not None else 0
+    if s is None:
+        return _BK_MISS.get(name, 0.0)
+    if name == "pre20_gain":
+        v = s["pre20_gain"]
+        return v if v is not None else -1e18
+    if name == "ma_bull":
+        v = s["ma_bull"]
+        return 1 if v is True else (-1 if v is None else 0)
+    return s.get(name, _BK_MISS.get(name, 0.0))
+
+
+def pk(ctx: Ctx, name: str):
+    """板块感知参数取值：params[name] 为 {board: 值} → 按 ctx.board_type 取；标量原样返回。
+
+    镜像 entry_modes._resolve 的 dict 语义，使同一份门表可对主板/创业板给出不同阈值
+    （break 的 vol_max/drawdown_max/stop_loss/... 分板块）。
+    """
+    v = ctx.params.get(name)
+    if isinstance(v, dict):
+        if ctx.board_type in v:
+            return v[ctx.board_type]
+        return v.get("default")
+    return v
+
+
+def turnover_sig(ctx: Ctx) -> float:
+    """确认日换手率%(= D0成交量/流通股本*100; 镜像 break_buy 的 turnover_sig 口径)。
+
+    流通股本缺失 (circ<=0) → 返回极大值 = 该门 fail-open 放行（参考版 circ<=0 时跳过该门）。
+    """
+    circ = float((ctx.stock_info or {}).get("circ_shares") or 0)
+    if circ <= 0:
+        return 1e18
+    return Ctx._f(ctx.bars[ctx.i], "volume") / circ * 100
+
+
+def break_features(ctx: Ctx, stock_info=None) -> dict:
+    """break 信号展示字段（逐字镜像 break_buy._signal_to_legacy_dict + scan_signals 的 extra）。
+
+    门表用 bk_feat 判资格；本函数额外给出**信号展示字段**（连板/断板期/换手率），
+    保证与 python 参考版 trades 逐字一致。逻辑单点维护于此。
+    """
+    s = bk_struct(ctx)
+    if s is None:
+        return {}
+    i = ctx.i
+    si = stock_info or {}
+    circ = float(si.get("circ_shares") or 0)
+    total = float(si.get("total_shares") or 0)
+    se = s["streak_end_idx"]
+    vol_se = Ctx._f(ctx.bars[se], "volume")
+    vol_i = Ctx._f(ctx.bars[i], "volume")
+    return {
+        "streak_len": s["streak_len"],
+        "streak_start": s["streak_start_date"],
+        "streak_end": s["streak_end_date"],
+        "break_date": s["break_date"],
+        "break_days": s["break_days"],
+        "break_chg": round(s["first_break_chg"], 2),
+        "break_gap": round(s["first_break_gap"], 2),
+        "break_vol_r": round(s["break_vol_r"], 2),
+        "confirm_chg": round(s["confirm_chg"], 2),
+        "confirm_gap": round(s["confirm_gap"], 2),
+        "pre20_gain": round(s["pre20_gain"], 2) if s["pre20_gain"] is not None else None,
+        "ma_bull": s["ma_bull"],
+        "turnover_anchor": round(vol_se / circ * 100, 2) if circ > 0 else None,
+        "turnover_sig": round(vol_i / circ * 100, 2) if circ > 0 else None,
+        "turnover_anchor_total": round(vol_se / total * 100, 2) if total > 0 else None,
+        "turnover_sig_total": round(vol_i / total * 100, 2) if total > 0 else None,
+    }
+
+register_strategy_funcs(
+    'break',
+    {"feat": bk_feat, "turnover_sig": turnover_sig},
+)

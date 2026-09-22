@@ -207,7 +207,7 @@ def _ctx(spec, bars, i, lu_idx, code, stock_info):
 
 def _funcs(spec, ctx):
     from app.market_cn.auto.core.runtime.functions import build_funcs
-    return build_funcs(ctx, spec.func_names)
+    return build_funcs(ctx, spec.key, spec.func_names)
 
 
 # ================================================================

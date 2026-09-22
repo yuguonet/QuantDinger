@@ -26,17 +26,38 @@ _META_TOOLS = {"search_tools", "list_tools", "format_result", "web_search", "fin
 
 
 class ToolCircuitBreaker:
-    """同一工具连续失败 N 次 → 熔断（短路返回降级指令）。"""
+    """同一工具连续失败 N 次 → 熔断（短路返回降级指令）。
+
+    2026-09-22（缺陷清单 Bug4）：加 cooldown 自动半开——熔断超过 COOLDOWN_SECONDS
+    后自动复位计数，允许下一次调用真实试探（成功→彻底恢复；再失败→重新熔断）。
+    修复"临时故障（网络抖动/数据源闪断）导致工具整个 session 锁死"的问题；
+    有意失败的工具仍会被重新熔断，防护语义不变。
+    """
+
+    COOLDOWN_SECONDS = 300  # 熔断 5 分钟后允许试探
 
     def __init__(self, threshold: int = 2):
         self.threshold = threshold
         self._fail_streak: dict = {}
         self._open: dict = {}
+        self._open_at: dict = {}   # 熔断打开时间戳（half-open 判定用）
         self._lock = threading.Lock()
 
     def is_open(self, name: str) -> bool:
         with self._lock:
-            return self._open.get(name, False)
+            if not self._open.get(name, False):
+                return False
+            # half-open：超过冷却期 → 自动复位，放行一次试探
+            import time as _time
+            opened_at = self._open_at.get(name, 0)
+            if _time.time() - opened_at >= self.COOLDOWN_SECONDS:
+                logger.info("[Breaker] 工具 %s 熔断冷却期已过（%ds），半开放行试探",
+                            name, self.COOLDOWN_SECONDS)
+                self._open[name] = False
+                self._fail_streak[name] = 0
+                self._open_at.pop(name, None)
+                return False
+            return True
 
     def record(self, name: str, ok: bool):
         with self._lock:
@@ -47,7 +68,10 @@ class ToolCircuitBreaker:
             self._fail_streak[name] = streak
             if streak >= self.threshold and not self._open.get(name):
                 self._open[name] = True
-                logger.warning("[Breaker] 工具 %s 连续失败 %d 次，熔断打开", name, streak)
+                import time as _time
+                self._open_at[name] = _time.time()
+                logger.warning("[Breaker] 工具 %s 连续失败 %d 次，熔断打开（%ds 后半开试探）",
+                               name, streak, self.COOLDOWN_SECONDS)
 
     def wrap(self, name: str, fn):
         """返回包装后的调用函数（供 executor 使用）。"""

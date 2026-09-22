@@ -71,7 +71,8 @@ def get_fund_flow_daily(codes: str, days: int = 120) -> dict:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
 
     Returns:
-        dict: 单股→{code,total_days,recent_20d_main_net,data:[...]}；多股→{count,data:{代码:{同左}}}。日线列表在 data（list）；失败 {code,error}。
+        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{code, total_days, recent_20d_main_net, data:[...]}（日线列表在 data）。
 
     Args:
         codes: 多股用逗号分隔

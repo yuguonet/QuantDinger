@@ -66,7 +66,7 @@ def _eff_rank(stage, rank_map, signal_rank):
 
 
 def _metrics(rows, key_ret="ret_d7c", key_peak="peak7", key_mae="mae7",
-             key_cap=None, key_day=None, key_rsn=None):
+             key_cap=None, key_day=None, key_rsn=None, two_seg=True):
     """一组样本的出场口径统计 (胜率/均收/盈亏比/峰值分布/均峰/均MAE + 两段胜率)。
 
     key_cap/key_day/key_rsn: 仅峰值回撤口径有 (捕获率/持有日/出场原因)。
@@ -125,6 +125,11 @@ def _metrics(rows, key_ret="ret_d7c", key_peak="peak7", key_mae="mae7",
         out["rsn"] = {k: round(v / len(rsns) * 100, 1) for k, v in
                       sorted(c.items(), key=lambda kv: -kv[1])}
     # 两段稳定性 (按 d0_date 排序取前后半; 每段胜率, 差异大=环境依赖)
+    # two_seg=False 可跳过: 该排序实测占本函数 33% 耗时, 且用户裁定(2026-09-22)
+    # 「切上下半段比胜率」意义不大, 需要时由调用方自行从明细数据判断。
+    # 默认 True = 与优化前完全一致 (explain/rule_audit/services 全部不受影响)。
+    if not two_seg:
+        return out
     pairs = sorted(zip(dates, rets))
     h = len(pairs) // 2
     if h:

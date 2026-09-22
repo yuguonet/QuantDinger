@@ -114,6 +114,10 @@ class GuidedCPythonExecutor(PythonExecutor):
         # 权威工具表（2026-09-14）：由 install_tools() 登记，每次执行前重装。
         # 阶段重试会清空 custom_tools/state（复用 CodeAgent 时实测），故不依赖注入时序。
         self._authoritative_tools: dict = {}
+        # 全局已知工具名（2026-09-22）：provider 全量名字（含本阶段未点名的）。
+        # 仅用于未定义名字纠正话术——告诉模型"该工具存在但未列入本阶段白名单"，
+        # 避免模型继续猜名字烧步数。不参与任何注入/执行判定。
+        self._all_known_tools: set = set()
         # send_tools 给的 agent 工具（final_answer / list_tools / search_tools / …）。
         # 与 state 分开存：它们每次执行都要可调用，但不该被当成"数据变量"参与促升与摘要。
         self._agent_tools: dict = {}
@@ -249,6 +253,10 @@ class GuidedCPythonExecutor(PythonExecutor):
         if self.additional_functions:
             ns.update(self.additional_functions)
 
+    def set_all_known_tools(self, names) -> None:
+        """登记 provider 全量工具名（纠正话术用，见 _all_known_tools 注释）。"""
+        self._all_known_tools = set(names or {})
+
     def _tool_names(self) -> list:
         """真实可用的**工具名**（业务工具 + agent 工具），不含 Python 内置。
 
@@ -286,14 +294,39 @@ class GuidedCPythonExecutor(PythonExecutor):
                 avail = shown + tail
             else:
                 avail = "（本阶段无数据工具，仅计算能力）"
-            return (
+            # 2026-09-22：区分「存在但未点名」与「完全未知」——前者是 planner 白名单
+            # 未覆盖（实测：技能文档/历史记忆让模型知道 calculate_ma 存在，引用即
+            # NameError），明确告知比让模型猜省 1-2 步。
+            known_hit = name in self._all_known_tools
+            head = (
                 f"[未定义名字] `{name}` 在当前命名空间里不存在。\n"
                 f"{err_text}\n"
-                f"两种可能，按序自查：\n"
-                f"  1) 拼写/大小写错误，或变量名写错（变量跨步保留，本阶段直接用名字引用即可）；\n"
-                f"  2) 该名字是想调用的工具，但不在本阶段可用清单里——"
-                f"请立即停止尝试这个名字及其变体。\n"
-                f"可用工具清单（仅限这些）：{avail}\n"
+            )
+            import re as _re2
+            _is_cjk = bool(_re2.search(r"[\u4e00-\u9fff]", name))
+            if _is_cjk:
+                head += (
+                    f"⚠ 未定义的名字 `{name}` 是**中文文本**——你很可能把报告/文档正文"
+                    f"直接当 Python 代码提交了。正确做法：把报告文本作为字符串传给交付工具，"
+                    f"例如 final_answer(\"报告正文…\")，或 final_answer(report_variable)。"
+                    f"代码块里只能有合法 Python 语句。\n"
+                )
+            elif known_hit:
+                head += (
+                    f"⚠ `{name}` 是系统里真实存在的工具，但**未被列入本阶段的白名单**"
+                    f"（planner 未点名），本阶段无法调用它。\n"
+                    f"请立即停止尝试这个名字及其变体。\n"
+                )
+            else:
+                head += (
+                    f"两种可能，按序自查：\n"
+                    f"  1) 拼写/大小写错误，或变量名写错（变量跨步保留，本阶段直接用名字引用即可）；\n"
+                    f"  2) 该名字是想调用的工具，但不在本阶段可用清单里——"
+                    f"请立即停止尝试这个名字及其变体。\n"
+                )
+            return (
+                head
+                + f"可用工具清单（仅限这些）：{avail}\n"
                 f"（Python 内置函数 print/len/dir/type/… 可直接调用，不在此列）\n"
                 f"处理方式（二选一）：\n"
                 f"  1) 用清单内工具重新实现该步骤；\n"

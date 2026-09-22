@@ -32,9 +32,12 @@ from app.market_cn.auto.core.market import (
 from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.runtime.expr import ExprError, evaluate, static_asof_check
-from app.market_cn.auto.core.runtime.functions import Ctx, OFFSET_FUNCS, build_funcs, offset_funcs
-import app.market_cn.auto.core.runtime.strategy_funcs  # 副作用: 注册 v1/relay3 专属函数 (register_function)
-from app.market_cn.auto.core.runtime.strategy_funcs import bk_struct, break_features, relay3_features
+from app.market_cn.auto.core.runtime.functions import (
+    Ctx, OFFSET_FUNCS, build_funcs, offset_funcs, ensure_gate_init,
+)
+ensure_gate_init()  # 副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数 (autodiscover)
+from app.market_cn.auto.strategies.break_buy import bk_struct, break_features
+from app.market_cn.auto.strategies.relay3 import relay3_features
 
 from app.market_cn.auto.core._paths import STRATEGY_DIR as _STRATEGY_DIR
 
@@ -184,7 +187,7 @@ def build_signal(ctx: Ctx, spec: StrategySpec) -> Dict[str, Any]:
     fields = spec.signal.get("fields") or {}
     if not fields:
         return {}
-    funcs = build_funcs(ctx, spec.func_names)
+    funcs = build_funcs(ctx, spec.key, spec.func_names)
     out: Dict[str, Any] = {}
     for name, fs in fields.items():
         if isinstance(fs, str):
@@ -206,7 +209,7 @@ def evaluate_gates(spec: StrategySpec, gates: List[Gate], ctx: Ctx) -> Tuple[boo
     只作诊断 (所有调用方要么丢弃, 要么写入 detail), 不参与任何判定。展示管线的夜间枚举
     是热点 (全市场 × 每票每个 lu ≠ 数万次), 逐门求全的年代价是其主要开销。
     """
-    funcs = build_funcs(ctx, spec.func_names)
+    funcs = build_funcs(ctx, spec.key, spec.func_names)
     for g in gates:
         try:
             if not evaluate(g.expr, spec.params, funcs):
@@ -269,7 +272,7 @@ class GateEvaluator:
         """
         gates = self.spec.prefilter_gates()
         ctx = self._ctx(bars, i, 0, params)
-        funcs = build_funcs(ctx, self.spec.func_names)
+        funcs = build_funcs(ctx, self.spec.key, self.spec.func_names)
         if self.gate_dbg is not None:
             vec = self._vector(gates, params, funcs)
             self.gate_dbg("qualify", self.code, i, 0, vec)
@@ -289,7 +292,7 @@ class GateEvaluator:
         """
         gates = self.spec.decision_gates()
         ctx = self._ctx(bars, i, lu_idx, params)
-        funcs = build_funcs(ctx, self.spec.func_names)
+        funcs = build_funcs(ctx, self.spec.key, self.spec.func_names)
         if self.gate_dbg is not None:
             vec = self._vector(gates, params, funcs)
             self.gate_dbg("decision", self.code, i, lu_idx, vec)
@@ -311,7 +314,7 @@ class GateEvaluator:
         """
         if ctx is None:
             ctx = self._ctx(bars, i, 0, params)
-        funcs = build_funcs(ctx, self.spec.func_names)
+        funcs = build_funcs(ctx, self.spec.key, self.spec.func_names)
         gates = self.spec.enabled_gates
         if self.gate_dbg is not None:
             vec = self._vector(gates, params, funcs)

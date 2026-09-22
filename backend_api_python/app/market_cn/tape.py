@@ -5,12 +5,12 @@
   1. 五档实时行情 — 买一~买五 / 卖一~卖五 + 实时快照（最新价/涨跌/成交量等）
   2. 当日分笔成交 — 逐笔成交明细（仅交易时段可用，非交易时段返回空）
   3. 历史分笔成交 — 指定日期的逐笔成交明细（可用于复盘分析）
-  4. 个股资金流向 — 当日分钟级 + 近120日日级（东财 push2 API）
+  4. 个股资金流向 — 当日分钟级 + 近120日日级
 
 数据源:
   五档行情:  mootdx(TCP) → 腾讯财经(HTTP)
   分笔数据:  mootdx(TCP) — 仅此一个源
-  资金流向:  东财 push2 API — 分钟级实时 + 日级历史
+  资金流向:  本地快照派生(主) → 新浪日级(2026-09-22 主备翻转) → 东财 push2(末级兜底,熔断)
 
 依赖: pip install mootdx
 """
@@ -955,9 +955,10 @@ def get_realtime_snapshot(code: str) -> Dict[str, Any]:
 def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
     """获取当日分钟级资金流向。
 
-    数据源优先级（2026-09-19 用户定调）：
+    数据源优先级（2026-09-22 主备翻转）：
       1. **本地 realtime_snapshot 派生**（量价方向近似，零外网）—— 主源；
-      2. 东财 push2 远程 —— 兜底（本地无数据 / 非交易时段外的指数等无快照标的）。
+      2. **新浪日级资金流**（无反爬，稳定）—— 外部主源；
+      3. 东财 push2 远程 —— 末级兜底（熔断期内自动跳过，不反复打扰反爬源）。
 
     返回结构两源一致：
         {code, points, total_main_net,
@@ -974,8 +975,82 @@ def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("[fund_flow] 本地快照派生失败(%s): %s", code, e)
 
-    # 2) 东财远程兜底
+    # 2) 新浪日级资金流（主外部源，无反爬，2026-09-22 主备翻转）
+    sina = _fund_flow_sina(code)
+    if sina:
+        return sina
+
+    # 3) 东财 push2 远程兜底（熔断期内自动跳过）
     return _fund_flow_eastmoney(code)
+
+
+# ── 个股资金流向: 新浪日级主源 + 东财 push2 兜底（2026-09-22 主备翻转）──
+# 与 hot_sectors（2026-09-21 M.8）同款原则：新浪无反爬、稳定，东财 push2 会
+# 对被连续请求的 IP 掐连接（RemoteDisconnected）。故外部源优先走新浪；
+# push2 仅在 sina 不可用且不在熔断期内才试，失败即熔断（_PUSH2_BLOCK_SECONDS
+# 内不再碰 push2）。note: sina 仅日级（ssl_qsfx_zjlrqs），无分钟级；minutes
+# 级仍由本地快照派生或 push2 补充。
+import threading as _threading
+_push2_lock = _threading.Lock()
+_push2_blocked_until = 0.0
+_PUSH2_BLOCK_SECONDS = 600
+
+
+def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
+    """当日个股资金流向（新浪日级，主源，无反爬）。
+
+    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
+    返回最新一条日级资金流。字段: netamount(主力净流入), r0_net(超大单净额),
+    turnover(成交额)。
+
+    Returns:
+        {code, points:1, total_main_net, data:[{time, main_net, small_net,
+             mid_net, large_net, super_net}]}（近似映射，小/中单为 0）
+        失败: None（不抛异常，交给下级兜底）
+    """
+    import requests
+    code_num = code.split(".")[0]
+    daima = ("sh" if code_num.startswith("6") else "sz") + code_num
+    url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+           "json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs")
+    params = {"page": 1, "num": 1, "sort": "opendate", "asc": 0, "daima": daima}
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json()
+        if not isinstance(d, list) or not d:
+            return None
+        row = d[0]
+        t = row.get("opendate", "") or ""
+        main_net = _safe_float(row.get("netamount"))
+        return {
+            "code": code,
+            "points": 1,
+            "total_main_net": round(main_net, 2),
+            "data": [{
+                "time": t,
+                "main_net": main_net,
+                "small_net": 0.0,
+                "mid_net": 0.0,
+                "large_net": _safe_float(row.get("r0_net")),
+                "super_net": 0.0,
+            }],
+        }
+    except Exception as e:
+        logger.debug("[sina] 个股资金流向失败(%s): %s", code, e)
+        return None
+
+
+def _mark_push2_blocked() -> None:
+    global _push2_blocked_until
+    with _push2_lock:
+        _push2_blocked_until = time.time() + _PUSH2_BLOCK_SECONDS
+
+
+def _push2_allowed() -> bool:
+    global _push2_blocked_until
+    with _push2_lock:
+        return time.time() >= _push2_blocked_until
 
 
 def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
@@ -991,6 +1066,10 @@ def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
         }
         主力=超大单+大单, 单位: 元
     """
+    # 熔断期内不再碰 push2（反爬 RemoteDisconnected 掐连接，2026-09-22）
+    if not _push2_allowed():
+        logger.warning("[eastmoney] 分钟资金流: push2 熔断期内，跳过东财直接走 sina")
+        return {"code": code, "error": "push2 blocked (circuit breaker)"}
     import requests
     url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
     params = {
@@ -1022,7 +1101,8 @@ def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
             "data": rows,
         }
     except Exception as e:
-        logger.warning("[eastmoney] 分钟资金流失败(%s): %s", code, e)
+        _mark_push2_blocked()
+        logger.warning("[eastmoney] 分钟资金流失败(%s): %s — 触发 push2 熔断", code, e)
         return {"code": code, "error": str(e)}
 
 

@@ -361,6 +361,16 @@ class Ctx:
         return a[j] if (n - 1) <= j < self.n else 0.0
 
 
+def _closes_upto(ctx: Ctx) -> List[float]:
+    """决策日 i 及之前全部收盘价（as-of 安全切片 [0..i]）。
+
+    供 gate_stdlib / 策略私有门函数取"完整已定日线"计算技术指标（MACD/BOLL/MA）。
+    只依赖 bars[0..i]，绝不读未来。原定义在 strategy_funcs.py，重构后迁入门表 DSL
+    标准库入口（functions），消除"堆料文件"依赖。
+    """
+    return [Ctx._f(ctx.bars[j], "close") for j in range(ctx.i + 1)]
+
+
 # ================================================================
 # 决策日依赖表 (Frame A: 函数是否读**决策日 i**(偏移 0) 的行情数据)
 # ----------------------------------------------------------------
@@ -423,8 +433,14 @@ def register_function(name: str, fn, is_offset: bool = False,
         REGISTERED_D0[name] = int(needs_d0)
 
 
-def declared_d0_dep(name: str) -> Optional[int]:
-    """内核/注册函数声明的决策日依赖；未声明 → None (调用方按 1 处理)。"""
+def declared_d0_dep(name: str, key: str = None) -> Optional[int]:
+    """内核/注册函数声明的决策日依赖；未声明 → None (调用方按 1 处理)。
+
+    若传入 key，优先查策略命名空间 STRATEGY_GATE_D0[key][name]（见 declared_d0_for_strategy）；
+    这是重构后 feat('x') 等跨策略同名函数能各自声明 D0 依赖的关键。
+    """
+    if key is not None and key in STRATEGY_GATE_D0 and name in STRATEGY_GATE_D0[key]:
+        return STRATEGY_GATE_D0[key][name]
     if name in REGISTERED_D0:
         return REGISTERED_D0[name]
     return D0_DEPS.get(name)
@@ -435,13 +451,78 @@ def offset_funcs() -> set:
     return OFFSET_FUNCS | REGISTERED_OFFSET
 
 
-def build_funcs(ctx: Ctx, names=None) -> Dict[str, Any]:
-    """把 Ctx 方法 + 已注册函数 绑定为求值器可用的函数字典。
+# ================================================================
+# 策略作用域门函数注册表（架构重构：策略私有函数 key 命名空间隔离）
+# ----------------------------------------------------------------
+# 重构前：所有策略私有门函数堆在 strategy_funcs.py，经全局 REGISTERED_FUNCS 注册，
+# 同名函数（feat/warmup/finite/pool_stat/...）跨策略互相污染。重构后：
+#   - 策略私有函数只挂在 STRATEGY_GATE_FUNCS[key]，build_funcs 先解策略私有、再回退 stdlib；
+#   - 同名策略私有函数互不可见（key 隔离），避免 g56/break/knife/tail 的 feat 互相覆盖；
+#   - 真正跨策略共享的函数留在 gate_stdlib（REGISTERED_FUNCS），由本表兜底。
+# ================================================================
+STRATEGY_GATE_FUNCS: Dict[str, Dict[str, Any]] = {}
+STRATEGY_GATE_OFFSET: Dict[str, set] = {}
+STRATEGY_GATE_D0: Dict[str, Dict[str, int]] = {}
 
-    names: 可选函数名集合 (StrategySpec.func_names) —— 只绑定**用得到**的注册函数。
-      求值热点 (全市场 × 每票每 lu, 十万级) 每次构造 ~50 项字典是显著开销, 而单条表达式
-      通常只用 2~4 个函数。names 必须是"策略全部表达式引用名"的**超集**; 传 None =
-      绑全量 (调用方不确定时的安全回退, 语义与优化前一致)。Ctx 方法 (24 项) 恒绑定。
+
+def register_strategy_funcs(key: str, names_fns: Dict[str, Any],
+                            offset: set = None, d0: Dict[str, int] = None) -> None:
+    """注册某策略的私有门函数（key 命名空间隔离）。
+
+    names_fns: {name: fn}，fn 签名 fn(ctx, ...)（非偏移）或 fn(ctx, k, ...)（偏移，k 第一位置参数）。
+    offset:    该策略内哪些 name 是偏移函数（k 为第一位置参数）。
+    d0:        {name: 0|1} 决策日依赖声明（0=只依赖 ≤i-1，1/缺省=读决策日 i）。
+    策略私有函数优先于 stdlib 被 build_funcs 解析（key 隔离，互不可见）。
+    """
+    offset = offset or set()
+    d0 = d0 or {}
+    STRATEGY_GATE_FUNCS.setdefault(key, {}).update(names_fns)
+    STRATEGY_GATE_OFFSET.setdefault(key, set()).update(offset)
+    STRATEGY_GATE_D0.setdefault(key, {}).update(d0)
+
+
+def declared_d0_for_strategy(name: str, key: str) -> Optional[int]:
+    """策略命名空间下函数的决策日依赖；未声明 → None（调用方按 1 处理）。
+
+    优先查策略私有声明，其次 stdlib 声明，最后内核 D0_DEPS。
+    """
+    if key in STRATEGY_GATE_D0 and name in STRATEGY_GATE_D0[key]:
+        return STRATEGY_GATE_D0[key][name]
+    if name in REGISTERED_D0:
+        return REGISTERED_D0[name]
+    return D0_DEPS.get(name)
+
+
+def ensure_gate_init() -> None:
+    """惰性触发策略模块发现 + stdlib 导入（YAML/展示路径不 import .py 模块）。
+
+    门表 YAML 解析路径（present.pipeline）不 import strategies 的 .py 模块，故解析前必须
+    确保各策略私有函数已注册。扫描/回测路径由 autodiscover 在开头调用，但 present 路径需
+    自行触发。幂等（autodiscover 内部幂等 + 模块导入幂等）。
+    """
+    import app.market_cn.auto.strategies as strategies_pkg  # 触发 autodiscover（注册策略私有函数）
+    strategies_pkg.autodiscover()
+    import app.market_cn.auto.core.runtime.gate_stdlib  # noqa: F401（注册 stdlib 共享函数）
+
+
+def _bind(ctx: Ctx, name: str, fn, is_offset: bool):
+    """把函数绑定到具体 ctx（offset 函数运行期拒绝 k>0）。"""
+    if is_offset:
+        return lambda k, *a, ctx=ctx, fn=fn: (ctx._check_k(k) or fn(ctx, k, *a))
+    return lambda *a, ctx=ctx, fn=fn: fn(ctx, *a)
+
+
+def build_funcs(ctx: Ctx, key: str, names=None) -> Dict[str, Any]:
+    """把 Ctx 方法 + 策略私有函数 + stdlib 共享函数 绑定为求值器可用的函数字典。
+
+    key:   策略 key（STRATEGY_GATE_FUNCS 命名空间）—— 解析顺序：策略私有 → stdlib 兜底。
+    names: 可选函数名集合 (StrategySpec.func_names) —— 只绑定**用得到**的函数（性能热点）。
+           传 None = 绑全量（安全回退，语义与优化前一致）。Ctx 方法 (24 项) 恒绑定。
+
+    解析顺序（关键）：同名函数，策略私有优先；只有策略未定义的名才回退 stdlib。这样
+    g56/break/knife/tail 各自的 feat/warmup/finite 互不可见，彻底消除全局 REGISTERED_FUNCS
+    的"同名互相覆盖"隐患。去 fail-open：查不到的策略私有名，若非 stdlib 也不可用，
+    求值器会在表达式求值时抛 NameError 而非静默通过/失败。
     """
     funcs = {
         "chg": ctx.chg,
@@ -470,12 +551,16 @@ def build_funcs(ctx: Ctx, names=None) -> Dict[str, Any]:
         "atr": ctx.atr,
         "abs": abs,             # 纯数学内建 (无 ctx, 非偏移) —— 供门表写 |x| <= t 类条件
     }
-    for name, fn in REGISTERED_FUNCS.items():
+    sfuncs = STRATEGY_GATE_FUNCS.get(key, {})
+    soffset = STRATEGY_GATE_OFFSET.get(key, set())
+    for name, fn in sfuncs.items():
         if names is not None and name not in names:
             continue
-        if name in REGISTERED_OFFSET:
-            # 偏移函数：k 为第一位置参数，运行期拒绝 k>0
-            funcs[name] = lambda k, *a, ctx=ctx, fn=fn: (ctx._check_k(k) or fn(ctx, k, *a))
-        else:
-            funcs[name] = lambda *a, ctx=ctx, fn=fn: fn(ctx, *a)
+        funcs[name] = _bind(ctx, name, fn, name in soffset)
+    for name, fn in REGISTERED_FUNCS.items():
+        if name in funcs:        # 策略私有已覆盖，跳过（key 隔离）
+            continue
+        if names is not None and name not in names:
+            continue
+        funcs[name] = _bind(ctx, name, fn, name in REGISTERED_OFFSET)
     return funcs

@@ -20,6 +20,8 @@ tail_ret 需 mi 199~219 槽位 ≥15 个; T+1 当日不可卖。
 """
 
 from app.market_cn.auto.strategies import register
+from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
+from app.market_cn.auto.core.market import get_board_type, is_limit_up, default_market
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -260,3 +262,149 @@ class TailOversoldStrategy(StrategyBase):
 
     def initial_stop(self, code, entry_price):
         return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
+
+
+# ================================================================
+# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# ================================================================
+def _to_is_gem_star(code, market=None) -> bool:
+    """是否高波动板（创业板/科创板）。
+
+    口径 = MarketSpec 的分板规则（**不是**代码前缀字面量）—— 换市场时自动跟随。
+    与旧 `str(code)[:3].startswith(("30","68"))` 对 A 股逐位等价（见 a.yaml board_rules）。
+    """
+    return get_board_type(code, market) == "gem_star"
+
+
+def to_nf(ctx: Ctx) -> float:
+    """归一化系数：高波动板 0.5，其余 1.0（镜像 tail_oversold._norm_factor）。
+
+    0.5/1.0 是**策略自己的归一化惯例**（高波动板幅度翻倍故减半），不是市场规则常量，
+    故留在策略函数里；判定用的"是否高波动板"则来自 MarketSpec。
+    """
+    return 0.5 if _to_is_gem_star(ctx.code, ctx.market) else 1.0
+
+
+def _to_limit_pct(code, market=None) -> float:
+    """该股的市场名义涨停幅度（供 tail 的涨停触板判定）—— 取自 MarketSpec。"""
+    m = market if market is not None else default_market()
+    return m.nominal_up_pct(get_board_type(code, m))
+
+
+def _to_calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf) -> float:
+    """V2 评分（逐字镜像 tail_oversold._calc_score；nan 输入 → 该分支不计分）。"""
+    score = 0.0
+    dg = day_gain * nf
+    if dg <= -8:
+        score += 4.0
+    elif dg <= -5:
+        score += 3.0
+    elif dg <= -2:
+        score += 1.2
+    elif dg <= 0:
+        score += 0.5
+    tr = tail_ret * nf
+    if tr <= -2:
+        score += 3.0
+    elif tr <= -1:
+        score += 2.5
+    elif tr <= -0.3:
+        score += 1.5
+    if pos_range <= 0.2:
+        score += 2.0
+    elif pos_range <= 0.4:
+        score += 1.0
+    if amplitude * nf >= 5 and tr <= -0.3:
+        score += 1.0
+    p5 = pre5_gain * nf
+    if p5 <= -10:
+        score += 0.3
+    elif p5 <= -5:
+        score += 0.1
+    return round(score, 2)
+
+
+def _to_tail_ret_v2(series_rows):
+    """V2 尾盘回落%（逐字镜像 tail_oversold._tail_ret_v2；槽位<15 → None）。
+
+    prep_minutes 是 data/hub 的分钟标准化通道（数据层，非策略规则）。
+    """
+    if not series_rows:
+        return None
+    from app.market_cn.auto.core.data.hub import prep_minutes
+    mins = prep_minutes(
+        [{"time": str(r.get("time") or ""), "open": r.get("open") or 0,
+          "high": r.get("high") or 0, "low": r.get("low") or 0,
+          "close": r.get("last") or 0, "volume": r.get("volume") or 0}
+         for r in series_rows], volume_cumulative=True)
+    by_mi = {b["mi"]: float(b["c"]) for b in mins if float(b["c"]) > 0}
+    tail = [by_mi[mi] for mi in range(199, 220) if mi in by_mi]
+    tail_avg = sum(tail) / len(tail) if len(tail) >= 15 else 0
+    last_px = by_mi.get(max(by_mi)) if by_mi else 0
+    if not last_px or last_px <= 0 or tail_avg <= 0:
+        return None
+    return (last_px / tail_avg - 1) * 100
+
+
+def _to_hhmm(s) -> str:
+    """'YYYY-MM-DD HH:MM:SS' → 'HH:MM'（逐字镜像 tail_oversold._hhmm）。"""
+    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+
+
+def _to_cache(ctx: Ctx) -> dict:
+    """tail 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 数据助手。"""
+    cache = ctx.__dict__.get("_to_cache")
+    if cache is not None:
+        return cache
+    snap = ctx.latest or {}
+    last = Ctx._f(snap, "last")
+    high = Ctx._f(snap, "high")
+    low = Ctx._f(snap, "low")
+    pc = Ctx._f(snap, "previousClose")
+    cache = {"hhmm": _to_hhmm(str(snap.get("time") or "")), "nf": to_nf(ctx),
+             "day_gain": float("nan"), "amplitude": float("nan"),
+             "pos_range": float("nan"), "tail_ret": float("nan"),
+             "pre5_gain": float("nan"), "score": float("nan"), "limit_hit": 0}
+    if last > 0 and pc > 0 and high > 0 and low > 0 and high > low:
+        cache["limit_hit"] = 1 if last >= round(
+            pc * (1 + _to_limit_pct(ctx.code, ctx.market)), 2) * 0.998 else 0
+        cache["day_gain"] = (last / pc - 1) * 100
+        cache["amplitude"] = (high - low) / pc * 100
+        cache["pos_range"] = (last - low) / (high - low)
+        tr = _to_tail_ret_v2(ctx.series or [])
+        cache["tail_ret"] = float("nan") if tr is None else tr
+        closes = [float(b["close"]) for b in (ctx.bars or [])]
+        if len(closes) >= 6 and closes[-5] > 0:
+            cache["pre5_gain"] = (last / closes[-5] - 1) * 100
+            cache["score"] = _to_calc_score(cache["day_gain"], cache["tail_ret"],
+                                            cache["pos_range"], cache["amplitude"],
+                                            cache["pre5_gain"], cache["nf"])
+    ctx.__dict__["_to_cache"] = cache
+    return cache
+
+
+def to_metric(ctx: Ctx, name: str) -> float:
+    """tail 特征取值（缺少/无效 → nan，数值门自然失败）。"""
+    return float(_to_cache(ctx).get(name, float("nan")))
+
+
+def to_hhmm(ctx: Ctx) -> str:
+    """触发时刻 HH:MM（'' = 时间串非法）。"""
+    return _to_cache(ctx).get("hhmm", "")
+
+
+def to_limit_hit(ctx: Ctx) -> int:
+    """是否封板买不进（1=封板，镜像参考版 last >= 涨停价*0.998）。"""
+    return int(_to_cache(ctx).get("limit_hit", 0))
+
+
+def to_ok(ctx: Ctx, name: str) -> int:
+    """该特征是否可用（1=非 nan）—— 镜像参考版 "tail_ret is None / bars 不足 → 早返回"。"""
+    v = float(_to_cache(ctx).get(name, float("nan")))
+    return 0 if v != v else 1        # nan != nan → 不可用
+
+register_strategy_funcs(
+    'tail_oversold',
+    {"feat": to_metric, "hhmm": to_hhmm, "limit_hit": to_limit_hit, "ok": to_ok, "nf": to_nf},
+    d0={"nf": 0},
+)

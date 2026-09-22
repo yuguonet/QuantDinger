@@ -149,7 +149,9 @@ def search_comprehensive_intel(codes: str, name: str = "") -> dict:
     """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
 
     Returns:
-        dict: {label, composite_score, direction, veto, count(新闻条数), news(list)}（个股新闻+政策缓存按标题去重合并）；多代码→{count(代码数), data:{代码:上述}}；error=失败。
+        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；单股结果：{label, composite_score, direction, veto,
+        count(新闻条数), news(list)}；失败 → {"error": "...", "retriable": False}
 
     Args:
         codes: 多股用逗号分隔

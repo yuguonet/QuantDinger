@@ -33,6 +33,8 @@
 from __future__ import annotations
 
 from app.market_cn.auto.strategies import register
+from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
+from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -359,3 +361,136 @@ class KnifeCatchStrategy(StrategyBase):
 
     def initial_stop(self, code, entry_price):
         return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
+
+
+# ================================================================
+# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# ================================================================
+def _kc_hhmm(s) -> str:
+    """'YYYY-MM-DD HH:MM:SS' → 'HH:MM'（镜像 knife_catch._hhmm）。"""
+    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+
+
+def _kc_tail_ret(series_rows, last_px, last_time, minutes=20):
+    """尾盘 20 分钟回升%（逐字镜像 knife_catch._tail_ret）。无法计算 → None。"""
+    if not series_rows or last_px <= 0:
+        return None
+    from datetime import datetime, timedelta
+    try:
+        t_cut = (datetime.strptime(str(last_time)[:19], "%Y-%m-%d %H:%M:%S")
+                 - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    ref = None
+    for r in series_rows:
+        ts = str(r["time"])[:19]
+        if ts <= t_cut:
+            ref = r
+        else:
+            break
+    if ref is None:
+        return None
+    ref_px = float(ref.get("last") or 0)
+    if ref_px <= 0:
+        return None
+    return (last_px / ref_px - 1) * 100
+
+
+def _kc_vw_frac(series_rows):
+    """全天 VWAP 上方占比（逐字镜像 knife_catch._vw_frac；样本<30 → None）。"""
+    if not series_rows:
+        return None
+    cum_pv = cum_v = 0.0
+    above = total = 0
+    prev_v = 0.0
+    for r in series_rows:
+        px = float(r.get("last") or 0)
+        v = float(r.get("volume") or 0)
+        if px <= 0:
+            continue
+        dv = max(0.0, v - prev_v)
+        prev_v = v
+        if cum_v > 0:
+            total += 1
+            if px > cum_pv / cum_v:
+                above += 1
+        cum_pv += px * dv
+        cum_v += dv
+    return above / total if total >= 30 else None
+
+
+def _kc_daily_feats(bars, code, market=None):
+    """日线特征（逐字镜像 knife_catch._daily_feats；bars[-1]=昨日；len<8 → None）。"""
+    if len(bars) < 8:
+        return None
+    closes = [float(b["close"]) for b in bars]
+    streak = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] < closes[i - 1]:
+            streak += 1
+        else:
+            break
+    pre5 = (closes[-1] / closes[-5] - 1) * 100 if closes[-5] > 0 else 0
+    vol5 = sum(float(b["volume"]) for b in bars[-5:]) / 5
+    lu_recent = 0
+    bt = get_board_type(code, market)
+    for d in range(len(bars) - 1, max(len(bars) - 6, 0), -1):
+        cl, pc = closes[d], closes[d - 1]
+        if pc > 0 and is_limit_up(cl, pc, bt, market):
+            lu_recent += 1
+    return {"down_streak": streak, "pre5": pre5, "vol5": vol5, "lu_recent": lu_recent}
+
+
+_KC_NAN_KEYS = ("gain", "amp", "pos", "tail", "vw", "vol_ratio", "streak",
+                "pre5", "lu_recent")
+
+
+def _kc_cache(ctx: Ctx) -> dict:
+    """knife 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 3 个数据助手。"""
+    cache = ctx.__dict__.get("_kc_cache")
+    if cache is not None:
+        return cache
+    cache = {k: float("nan") for k in _KC_NAN_KEYS}
+    snap = ctx.latest or {}
+    last = Ctx._f(snap, "last")
+    high = Ctx._f(snap, "high")
+    low = Ctx._f(snap, "low")
+    pc = Ctx._f(snap, "previousClose")
+    last_time = str(snap.get("time") or "")
+    cache["hhmm"] = _kc_hhmm(last_time)
+    if last > 0 and pc > 0 and high > low:
+        cache["gain"] = (last / pc - 1) * 100
+        cache["amp"] = (high - low) / pc * 100
+        cache["pos"] = (last - low) / (high - low)
+        tail = _kc_tail_ret(ctx.series or [], last, last_time, 20)
+        vw = _kc_vw_frac(ctx.series or [])
+        cache["tail"] = float("nan") if tail is None else tail
+        cache["vw"] = float("nan") if vw is None else vw
+        df = _kc_daily_feats(ctx.bars or [], ctx.code, ctx.market)
+        if df is not None:
+            cache["vol_ratio"] = (Ctx._f(snap, "volume") / df["vol5"]) if df["vol5"] > 0 else 99.0
+            cache["streak"] = 1 + df["down_streak"]
+            cache["pre5"] = df["pre5"]
+            cache["lu_recent"] = df["lu_recent"]
+    ctx.__dict__["_kc_cache"] = cache
+    return cache
+
+
+def kc_metric(ctx: Ctx, name: str) -> float:
+    """knife 特征取值（缺少/无效 → nan，数值门自然失败）。"""
+    return float(_kc_cache(ctx).get(name, float("nan")))
+
+
+def kc_hhmm(ctx: Ctx) -> str:
+    """触发槽位的 HH:MM（'' = 时间串非法）。"""
+    return _kc_cache(ctx).get("hhmm", "")
+
+
+def kc_mkt_gain(ctx: Ctx) -> float:
+    """全市场均涨幅%（ctx.mkt_gain；None → nan → 市场门失败，镜像参考版 mkt_gain is None）。"""
+    return float("nan") if ctx.mkt_gain is None else float(ctx.mkt_gain)
+
+register_strategy_funcs(
+    'knife_catch',
+    {"feat": kc_metric, "hhmm": kc_hhmm, "mkt_gain": kc_mkt_gain},
+)

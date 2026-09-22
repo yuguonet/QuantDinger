@@ -363,8 +363,11 @@ class ToolProvider:
                 continue
             try:
                 mod = importlib.import_module(f"{package_prefix}.{module_name}")
-            except Exception:
-                logger.debug("[ToolProvider] 跳过模块 %s", module_name, exc_info=True)
+            except Exception as _mod_err:
+                # 2026-09-22（缺陷清单 Bug2A）：debug→warning。新工具文件 import 挂了
+                # 只有 debug 能看到 = 静默消失，工具少注册无人知。warning 不影响流程。
+                logger.warning("[ToolProvider] 模块 %s 导入失败，跳过注册（%s: %s）",
+                               module_name, type(_mod_err).__name__, _mod_err)
                 continue
             self._register_module_functions(mod, domain)
 

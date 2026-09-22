@@ -56,7 +56,6 @@ def _return_hint(fn) -> str:
     return ""
 
 
-import re  # noqa: E402  （放底部避免顶部拥挤）
 
 
 def prescan_skill_funcs(module_name: str) -> list:

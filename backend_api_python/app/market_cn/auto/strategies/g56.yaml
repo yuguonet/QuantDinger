@@ -5,7 +5,7 @@
 # 五重共振 = G1 池成员(①趋势②波动③基因) + ④金叉预测(rhist_chg>板块Q5)
 #           + ⑤板块状态(横截面 regime 门: 主板 rmed>0.25 & %b<=49.87 /
 #             20cm score_r>0.65 & dif0<=0)。
-# 特征 f=_g1_arrays(bars) 与横截面池由引擎注入 ctx.ext (见 strategy_funcs.g56_*)。
+# 特征 f=_g1_arrays(bars) 与横截面池由引擎注入 ctx.ext (见 strategies/g56.py)。
 # 出场 = 无追踪纯 7d/-8% (2026-09-17 出场研究定稿)。
 # ================================================================
 meta:
@@ -38,26 +38,26 @@ params:                        # 与 strategies/g56.py 冻结常量同值 (逐�
 # NaN 哨兵：缺值/暖机/池缺失 → 数值门自然失败 (与 _g1_mask 的 isfinite + m[:68]=False 同效)。
 gates:
   - {id: g1_warmup, name: 暖机≥68日, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "g56_warmup() == 1"}                    # 镜像 _g1_mask 的 m[:68]=False
+     expr: "warmup() == 1"}                    # 镜像 _g1_mask 的 m[:68]=False
   - {id: g1_finite, name: 特征有限, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "g56_finite() == 1"}                    # 镜像 _g1_mask 的 np.isfinite 过滤
+     expr: "finite() == 1"}                    # 镜像 _g1_mask 的 np.isfinite 过滤
   - {id: g1_trend, name: ①趋势收敛, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "abs(g56_feat('rma')) <= 2.5 and g56_feat('rma_chg') > 0"}   # |MA5/MA10-1|<=2.5% & 走强
+     expr: "abs(feat('rma')) <= 2.5 and feat('rma_chg') > 0"}   # |MA5/MA10-1|<=2.5% & 走强
   - {id: g1_atr, name: ②波动足够, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "g56_feat('atr') > pk('atr_q5')"}       # ATR14% > 板块池 Q5
+     expr: "feat('atr') > pk('atr_q5')"}       # ATR14% > 板块池 Q5
   - {id: g1_big20, name: ③大涨基因, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "g56_feat('big20') >= 2"}               # 前20日≥5%大涨日数 >= 2
+     expr: "feat('big20') >= 2"}               # 前20日≥5%大涨日数 >= 2
   - {id: r56, name: ④金叉预测, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "g56_feat('rhist_chg') > pk('r56')"}    # MACD柱加速 > 板块 Q5
+     expr: "feat('rhist_chg') > pk('r56')"}    # MACD柱加速 > 板块 Q5
   - {id: regime_main, name: ⑤板块状态(主板), role: qualify, needs_d0: 0, enabled: 1,
-     expr: "board_is_gem() == 1 or (g56_pool_stat('rmed') > pk('main_rmed_min') and g56_feat('pctb') <= pk('main_pctb_max'))"}
+     expr: "board_is_gem() == 1 or (pool_stat('rmed') > pk('main_rmed_min') and feat('pctb') <= pk('main_pctb_max'))"}
   - {id: regime_gem, name: ⑤板块状态(20cm), role: qualify, needs_d0: 0, enabled: 1,
-     expr: "board_is_main() == 1 or (g56_pool_stat('score_r') > pk('gem_score_min') and g56_feat('dif0') <= 0)"}
+     expr: "board_is_main() == 1 or (pool_stat('score_r') > pk('gem_score_min') and feat('dif0') <= 0)"}
 
 # 信号展示字段 (门通过后求值; 与参考版 trades 逐字段一致)
 signal:
   fields:
-    rhist_chg: {expr: "g56_feat('rhist_chg')", fmt: r3}
-    boll_pctb: {expr: "g56_feat('pctb')", fmt: r2}
-    rmed: {expr: "g56_pool_field('rmed')", fmt: r3}
-    score_r: {expr: "g56_pool_field('score_r')", fmt: r3}
+    rhist_chg: {expr: "feat('rhist_chg')", fmt: r3}
+    boll_pctb: {expr: "feat('pctb')", fmt: r2}
+    rmed: {expr: "pool_field('rmed')", fmt: r3}
+    score_r: {expr: "pool_field('score_r')", fmt: r3}

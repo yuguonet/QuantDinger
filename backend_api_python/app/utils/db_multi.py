@@ -29,6 +29,21 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ── 兜底加载 .env（2026-09-22 修复）──────────────────────────────
+# MarketDBManager 从 DATABASE_URL 解析连接凭据（含密码）。但并非所有调用方
+# 都先加载 .env（cli/agent 入口会，但 fund_flow_local/basicinfo_db 等被动触发的
+# 市场库连接路径未必），一旦 DATABASE_URL 为空 → 密码变 '' → 连 postgres 报
+# `fe_sendauth: no password supplied`（CLI 实测）。这里兜底加载一次，override=False
+# 不覆盖已设变量。与 skill_brewer.py 的既有约定一致。
+try:
+    from dotenv import load_dotenv
+    from pathlib import Path as _Path
+    _bp = _Path(__file__).resolve().parents[2]  # backend_api_python/
+    load_dotenv(_bp / ".env", override=False)
+    load_dotenv(_Path(os.getcwd()) / ".env", override=False)
+except Exception:
+    pass  # 无 dotenv 时静默跳过，凭据由上/下逻辑保证
+
 
 # ---------------------------------------------------------------------------
 # 共享常量

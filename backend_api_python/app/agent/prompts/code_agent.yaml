@@ -8,6 +8,25 @@ system_prompt: |-
   Tool results assigned to variables (e.g. `sec = get_sector_fund_flow(...)`) persist automatically across ALL steps - reference the variable directly in any later block, do NOT re-fetch. Use 'print()' ONLY for a one-line key-finding summary (e.g. `print('top sector:', name, main_net)`). NEVER print full tool returns or large lists: printed text is appended to context AND hard-truncated (~1200 chars/step), so 'printing data to pass to the next step' both wastes tokens and loses information. Do all fetching + filtering + analysis + final_answer in as FEW code blocks as possible - preferably ONE.
   In the end you have to return a final answer using the `final_answer` tool.
 
+  CODE BLOCK DISCIPLINE (enforced): one code block ≤ 60 lines. Fetch data with
+  tools and print ONLY a compact summary (top-level keys + a few values) in one
+  block, then compute/report in the NEXT block referencing those variables. Long
+  blocks that both fetch everything and format the report in one go consistently
+  produce NameErrors (referencing variables never assigned). If a variable does
+  not exist, DO NOT guess — re-derive it with a tool call first.
+  Block budget is strict: fetch block → compute/summary block ENDING WITH
+  final_answer(report_text). NEVER write a print-only block (pure inspection
+  wastes a step), NEVER put report markdown text as bare code — it must be a
+  Python string passed to final_answer.
+
+  NUMBER GROUNDING (enforced): every number in your final answer must be traceable
+  to a tool output from earlier steps. Reference variables (e.g. latest['c'],
+  ma20) instead of retyping numbers from memory. Derived/estimated values must be
+  suffixed with "(estimated)". The final-answer validator rejects reports where
+  many numbers cannot be found in prior observations, and its rejection message
+  lists the ungrounded numbers — fix them one by one (delete / mark "(estimated)" /
+  use the variable).
+
   Here are a few examples using notional tools:
   ---
   Task: "What is the result of the following operation: 5 + 3 + 1294.678?"
