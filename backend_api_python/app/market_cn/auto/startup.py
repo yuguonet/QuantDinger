@@ -9,8 +9,16 @@
   本模块补的是「启动即对齐」, 不替代 monitor 窗口逻辑。
 
 职责:
-  1. 计算策略指纹: config.json strategies 段 (enabled / daily_limit / params)
-     + strategies/ 下规则文件 (*.py / *.yaml, 不含 __init__.py) 的内容 sha256
+  1. 计算策略指纹 —— **两段, 边界 = 语义边界**:
+       rules   (判定链)  = config.json strategies 段的 enabled/daily_limit/params
+                           + 从判定入口 (rebuild/scan/monitor/store/...) 出发做
+                             AST import 闭包得到的 .py 清单, 各取内容 sha256。
+                           变化 ⇒ 库里是旧规则算出的结果 ⇒ **必须重建**。
+       display (展示层)  = strategies/*.yaml (门表) + core/present/*.py
+                           + core/display_meta.py, 各取内容 sha256。
+                           展示链每次请求实时读 ⇒ 重启即生效, **不重建**。
+     为什么按语义边界切: 展示口径与判定契约曾混在同一文件 (base.py), 文件级 hash
+     切不开 ⇒ 改一次档位映射就白跑一次全量重建 (实证 2026-09-23 19:33)。
   2. 与上次持久化快照比对, 得出变更集
   3. 按变更类型分流补偿:
      - 策略被禁用 或 从 config 移除 → 该策略「未入场」的活跃行 → expired
@@ -34,10 +42,18 @@
   → UI 不再提示卖出 → 用户会遗忘手上还有这两只票。这是实盘资金事故, 不是脏数据。
 
 刻意不做的边界:
-  - core/ 框架代码变更不在指纹内。框架改动通常伴随整体发版, 真正的守卫是
-    market_spec_check / path_parity, 而非重启补算。
-  - strategies/__init__.py 排除在规则指纹外 (注册表机制本身属框架层)。
+  - **展示链** (core/present/、core/display_meta.py、strategies/*.yaml、tools/) 不进
+    判定指纹: UI 实时读, 重启即生效, 重建是纯浪费。详见 core/display_meta.py 头注实证。
+  - 判定闭包里**不可达**的 core 模块 (如 core/runtime/evaluate.py、expr.py —— 只被展示链
+    与 tools 引用) 自然不在指纹内; 它们的守卫是 market_spec_check / path_parity。
   - 首次运行 (无快照) 同样触发一次后台校准 —— 首次恰是库最可能与代码不一致的时刻。
+
+★ 快照 = 「这份指纹已经校准过」的凭据 (2026-09-23 修):
+  旧实现在触发 rebuild 后**立即**落盘, 而 rebuild 是后台线程 —— 从落盘到跑完有数分钟
+  窗口 (实证: 19:33:45 落盘 / 19:38:45 才完成)。窗口内进程被杀、或 worker 命中
+  rebuild.py 的 "取数为空" / "无活跃日线策略" 早退, 指纹都已推进 ⇒ 下次启动同指纹跳过
+  ⇒ **永久漏补** (最危险的失败方向: 判据的依据本身没兑现)。
+  现在指纹只在 worker **校准成功后**推进; 失败则下次启动自动重试。
 
 用法 (启动钩子 —— 由调用方在调度器起 broker 之前调用一次, 幂等):
     from app.market_cn.auto.startup import reconcile_startup
@@ -45,11 +61,13 @@
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import threading
 import time
+from datetime import datetime
 
 from app.utils.logger import get_logger
 
@@ -86,34 +104,173 @@ def _sha256_file(path):
         return "missing"
 
 
-def _iter_rule_files():
-    """规则文件清单 [(relname, abspath)] —— *.py / *.yaml, 排除 __init__.py 与 __pycache__。"""
-    d = _strategies_dir()
-    out = []
+# ── 判定链入口: 生产链 (实盘 scan / 盘中 monitor / 启动 rebuild / 查询 store) 的起点 ──
+_JUDGE_ENTRIES = (
+    "__init__.py", "api.py", "monitor.py", "probe.py", "rebuild.py",
+    "registry.py", "scan.py", "sched.py", "store.py", "strategies/base.py",
+)
+
+# ── 展示层: 显式排除在判定指纹外 (改了只需重启) ──
+#   core/present/        展示链管线 (runtime.evaluate / expr 只被它引用)
+#   core/display_meta.py 展示口径映射 (预确认档位归一, 与判定解耦)
+#   tools/               诊断脚本 (debug/explain/gate_try/...), 不参与生产链
+_JUDGE_EXCLUDE = ("core/present/", "core/display_meta.py", "tools/")
+
+_PKG = "app.market_cn.auto"
+
+
+def _auto_root():
+    """auto/ 包根目录 (本文件所在目录)。"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_excluded(rel):
+    rel = rel.replace(os.sep, "/")
+    return any(rel.startswith(x) for x in _JUDGE_EXCLUDE)
+
+
+def _mod_path(mod):
+    """`app.market_cn.auto.core.exec` → `core/exec.py`; 非本包 / 文件不存在 → None。"""
+    if mod != _PKG and not mod.startswith(_PKG + "."):
+        return None
+    rel = mod[len(_PKG):].strip(".")
+    if not rel:
+        return "__init__.py"
+    base = os.path.join(_auto_root(), *rel.split("."))
+    for cand in (base + ".py", os.path.join(base, "__init__.py")):
+        if os.path.isfile(cand):
+            return os.path.relpath(cand, _auto_root()).replace(os.sep, "/")
+    return None
+
+
+def _imports_of(path, rel):
+    """静态提取文件的 import 目标模块名 (含相对导入)。解析失败返回空集 (由闭包校验兜住)。"""
     try:
-        names = sorted(os.listdir(d))
-    except OSError:
-        return out
-    for fn in names:
-        if not (fn.endswith(".py") or fn.endswith(".yaml")):
-            continue
-        if fn == "__init__.py":
-            continue
-        p = os.path.join(d, fn)
-        if os.path.isfile(p):
-            out.append((fn, p))
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except Exception:
+        return set()
+    out = set()
+    cur_dir = os.path.dirname(rel)          # '' | 'strategies' | 'core/runtime'
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                out.add(a.name)
+        elif isinstance(n, ast.ImportFrom):
+            if n.level:                     # 相对导入: from ..base import x
+                parts = cur_dir.split("/") if cur_dir else []
+                parts = parts[:max(len(parts) - (n.level - 1), 0)]
+                base = _PKG + ("." + ".".join(parts) if parts else "")
+            else:
+                base = n.module or ""
+            if base:
+                out.add(base)
+                for a in n.names:           # from pkg import sub / from mod import name
+                    out.add(base + "." + a.name)
     return out
 
 
+def _closure_judge_files():
+    """AST 闭包: 从判定入口 + strategies/*.py 出发递归收 import。
+
+    为什么动态算而不是写死清单: 写死清单在"新增策略 / 新增 core 模块 / 挪 import"时必漏,
+    而漏 = 该重建却不重建 (最危险的失败方向)。闭包每次冷启动重算 (<0.1s), 边界跟随代码。
+
+    Returns:
+        [(relpath, abspath)]; 结果不可信时 None (由 _iter_judge_files 回退全扫)。
+    """
+    try:
+        entries = list(_JUDGE_ENTRIES)
+        sd = _strategies_dir()
+        entries += ["strategies/" + fn for fn in sorted(os.listdir(sd))
+                    if fn.endswith(".py") and fn != "__init__.py"]
+        seen, queue = set(), []
+        for e in entries:
+            e = e.replace(os.sep, "/")
+            if _is_excluded(e) or not os.path.isfile(os.path.join(_auto_root(), e)):
+                continue
+            seen.add(e)
+            queue.append(e)
+        while queue:
+            rel = queue.pop()
+            for mod in _imports_of(os.path.join(_auto_root(), rel), rel):
+                r2 = _mod_path(mod)
+                if r2 and r2 not in seen and not _is_excluded(r2):
+                    seen.add(r2)
+                    queue.append(r2)
+        # 安全校验: 关键入口缺一即视为不可信 (宁可回退全扫多跑, 不可漏跑)
+        if not {"monitor.py", "rebuild.py", "scan.py", "strategies/base.py"} <= seen:
+            return None
+        if len(seen) < 15:
+            return None
+        return [(r, os.path.join(_auto_root(), r)) for r in sorted(seen)]
+    except Exception as e:
+        logger.warning("[auto_startup] 判定链闭包分析失败: %s", e)
+        return None
+
+
+def _sweep_judge_files():
+    """兜底: 扫 auto/ 下全部 .py (排除 _JUDGE_EXCLUDE)。保守 —— 宁可多跑, 不可漏跑。"""
+    out = []
+    for dp, dn, fn in os.walk(_auto_root()):
+        dn[:] = [d for d in dn if d != "__pycache__"]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, _auto_root()).replace(os.sep, "/")
+            if _is_excluded(rel):
+                continue
+            out.append((rel, p))
+    return sorted(out)
+
+
+def _iter_judge_files():
+    """判定链文件清单 [(relpath, abspath)]: AST 闭包优先, 不可信则全扫。"""
+    got = _closure_judge_files()
+    if got:
+        return got
+    logger.warning("[auto_startup] 判定链闭包不可信 → 回退全扫 auto/ (保守)")
+    return _sweep_judge_files()
+
+
+def _iter_display_files():
+    """展示层文件清单 [(relpath, abspath)]: strategies/*.yaml + core/present/**.py
+    + core/display_meta.py。
+
+    单独成段是为了把「展示变更」与「判定变更」分开: 展示链每次请求实时读, 改了重启即可,
+    不需要重跑 rebuild。旧实现把 *.yaml 混在判定指纹里 ⇒ 只改门表也会白跑一次全量重建。
+    """
+    out = []
+    sd = _strategies_dir()
+    try:
+        for fn in sorted(os.listdir(sd)):
+            p = os.path.join(sd, fn)
+            if fn.endswith(".yaml") and os.path.isfile(p):
+                out.append(("strategies/" + fn, p))
+    except OSError:
+        pass
+    for dp, dn, fn in os.walk(os.path.join(_auto_root(), "core", "present")):
+        dn[:] = [d for d in dn if d != "__pycache__"]
+        for f in fn:
+            if f.endswith(".py"):
+                p = os.path.join(dp, f)
+                out.append((os.path.relpath(p, _auto_root()).replace(os.sep, "/"), p))
+    dm = os.path.join(_auto_root(), "core", "display_meta.py")
+    if os.path.isfile(dm):
+        out.append(("core/display_meta.py", dm))
+    return sorted(out)
+
+
 def fingerprint():
-    """计算当前策略指纹。
+    """计算当前策略指纹 (三段: strategies=配置 / rules=判定链 / display=展示层)。
 
     Returns:
         dict: {"strategies": {key: {"enabled": bool, "daily_limit": int, "params": dict}},
-               "rules": {filename: sha256_32}}
-        config / 插件目录双双异常时返回空 dict (调用方应视作「无可比对」并跳过补偿)。
+               "rules":   {relpath: sha256_32}}   ← 判定链, 变化 ⇒ 必须重建
+               "display": {relpath: sha256_32}}   ← 展示层, 变化 ⇒ 重启即可
+        config / 插件目录双双异常时 strategies 为空 (调用方应视作「无可比对」并跳过补偿)。
     """
-    fp = {"strategies": {}, "rules": {}}
+    fp = {"strategies": {}, "rules": {}, "display": {}}
     try:
         from app.market_cn.auto import strategies as strat_reg
         strat_reg.autodiscover()
@@ -131,8 +288,10 @@ def fingerprint():
         logger.warning("[auto_startup] 指纹-策略段失败: %s", e)
         fp["strategies"] = {}
 
-    for fn, p in _iter_rule_files():
-        fp["rules"][fn] = _sha256_file(p)
+    for rel, p in _iter_judge_files():
+        fp["rules"][rel] = _sha256_file(p)
+    for rel, p in _iter_display_files():
+        fp["display"][rel] = _sha256_file(p)
     return fp
 
 
@@ -178,11 +337,23 @@ def _load_snapshot():
         return None
 
 
-def _save_snapshot(fp):
-    """落盘当前指纹快照 (幂等 upsert)。"""
+def _save_snapshot(fp, calibrated_for=None):
+    """落盘指纹快照 (幂等 upsert) —— **只在校准成功后调用**。
+
+    快照的语义是「这份指纹已经校准过了」的凭据, 不是「这份指纹已经见过了」。提前落盘会把
+    失败的校准误判为已完成 ⇒ 下次启动指纹相同 ⇒ 跳过 ⇒ 永久漏补 (见模块 docstring ★)。
+
+    Args:
+        fp: 本次的指纹 (fingerprint() 的返回)
+        calibrated_for: 本次校准覆盖到的目标交易日 (YYYY-MM-DD); 仅作可观测性记录
+    """
     from app.utils.db import get_db_connection
-    payload = json.dumps({"hash": _fp_hash(fp), "detail": fp},
-                         sort_keys=True, ensure_ascii=False, default=str)
+    payload = json.dumps({
+        "hash": _fp_hash(fp),
+        "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+        "calibrated_for": calibrated_for,
+        "detail": fp,
+    }, sort_keys=True, ensure_ascii=False, default=str)
     try:
         with get_db_connection() as db:
             cur = db.cursor()
@@ -230,6 +401,10 @@ def diff(prev_detail, now_detail):
     }
     out["rules_changed"] = ((prev_detail or {}).get("rules") or {}) != \
                            ((now_detail or {}).get("rules") or {})
+    # 展示层变更 (门表 yaml / core/present / display_meta): 展示链实时读, 重启即生效,
+    # **不需要**重建 —— 单独标记只为在日志里与"必须重建"区分开。
+    out["display_changed"] = ((prev_detail or {}).get("display") or {}) != \
+                             ((now_detail or {}).get("display") or {})
     return out
 
 
@@ -307,7 +482,11 @@ def _active_rows_of_removed(keys):
 _REBUILD_WINDOW = 20
 
 
-def _rebuild_worker(why):
+class _RebuildIncomplete(Exception):
+    """重建未完成 (数据未就绪等可恢复原因) —— 用于跳过「推进指纹」那一步。"""
+
+
+def _rebuild_worker(why, fingerprint=None):
     """后台线程体: 先补扫当日 (幂等), 再跑**账本重放**并写库校准。
 
     为什么两件都做:
@@ -328,14 +507,17 @@ def _rebuild_worker(why):
     except Exception as e:
         logger.warning("[auto_startup] 补扫失败 (不影响重建): %s", e)
 
+    done, calibrated_for = False, None
     try:
         from app.market_cn.auto import rebuild as _rb
         logger.info("[auto_startup] 账本重建开始 (window=%d, %s)", _REBUILD_WINDOW, why)
         t0 = time.time()
         expected, meta = _rb.build_expected(window=_REBUILD_WINDOW)
         if meta.get("error"):
-            logger.warning("[auto_startup] 重建跳过: %s", meta["error"])
-            return
+            # ★ 早退路径: 不推进指纹 —— 否则"取数为空"这类可恢复失败会被永久记成已完成
+            logger.warning("[auto_startup] 重建跳过: %s (指纹不推进, 下次启动会重试)",
+                           meta["error"])
+            raise _RebuildIncomplete(meta["error"])
         actual = _rb.load_actual(meta.get("win_dates") or [])
         # 账本重放 (而非信号层): 只有它能把状态推到 买入/持有/卖出。
         # 信号层只产 watch_pending(观察), 且 monitor 不推进历史行 (每步锚定"今天"),
@@ -346,18 +528,38 @@ def _rebuild_worker(why):
         stat = _rb.apply_ledger_plan(plan, dry_run=False)
         logger.info("[auto_startup] 账本重建完成 (%.0fs): %s | 重放分支=%s",
                     time.time() - t0, stat, rstat)
+        done = True
+        calibrated_for = meta.get("target") or (meta.get("win_dates") or [None])[-1]
+    except _RebuildIncomplete:
+        pass
     except Exception as e:
         logger.warning("[auto_startup] 账本重建失败 (不影响启动): %s", e)
 
+    # ★ 指纹只在**校准成功后**推进 (见模块 docstring "快照 = 已校准的凭据")。
+    #   中途夭折 / 数据未就绪 都保持旧快照 ⇒ 下次启动同指纹仍会重跑, 不会永久漏补。
+    if fingerprint is not None:
+        if done:
+            _save_snapshot(fingerprint, calibrated_for=calibrated_for)
+            logger.info("[auto_startup] 校准成功 → 指纹已推进 (校准至 %s); "
+                        "下次以同指纹启动将跳过重建", calibrated_for)
+        else:
+            logger.warning("[auto_startup] 校准未完成 → 指纹**不推进**, 下次启动会重试 "
+                           "(why=%s)", why)
 
-def trigger_rebuild(why, background=True):
-    """触发「补扫 + 重建校准」。默认后台线程; background=False 时同步 (CLI/调试)。"""
+
+def trigger_rebuild(why, background=True, fingerprint=None):
+    """触发「补扫 + 重建校准」。默认后台线程; background=False 时同步 (CLI/调试)。
+
+    Args:
+        fingerprint: 本次待推进的指纹; **只在校准成功后**由 worker 落盘 (见 _save_snapshot)。
+                     None = 不推进 (仅供"只看效果不落账"的调试调用)。
+    """
     if background:
-        t = threading.Thread(target=_rebuild_worker, args=(why,), daemon=True,
+        t = threading.Thread(target=_rebuild_worker, args=(why, fingerprint), daemon=True,
                              name="auto-startup-rebuild")
         t.start()
         return {"mode": "background", "why": why}
-    _rebuild_worker(why)
+    _rebuild_worker(why, fingerprint)
     return {"mode": "sync", "why": why}
 
 
@@ -402,7 +604,8 @@ def reconcile_startup(async_=True, once=True, force=False):
     """
     global _reconciled_once
     report = {"changed": False, "diff": None, "retired": {}, "rescan": None,
-              "rebuild": None, "reasons": [], "open_rows_removed": []}
+              "rebuild": None, "snapshot_deferred": False, "reasons": [],
+              "open_rows_removed": []}
 
     if once:
         with _reconcile_lock:
@@ -428,11 +631,14 @@ def reconcile_startup(async_=True, once=True, force=False):
         # 首次运行: 落基准 + 校准一次
         # (原设计只落基准不补偿, 理由是"避免每次发版全量重扫"; 但首次恰恰是库最可能
         #  与代码不一致的时刻 —— 用户正是在反复改策略代码, 所以首次也校准, 后台跑。)
-        _save_snapshot(now_fp)
+        # ★ 指纹不在这里落盘: 交给 worker 在**校准成功后**推进 —— 否则首次校准失败
+        #   (数据未就绪等) 会留下一个"看似已校准"的基准, 后续启动全部跳过。
         report["changed"] = True
-        report["reasons"].append("首次运行: 已落指纹基准, 并触发一次后台重建校准")
+        report["reasons"].append("首次运行: 触发一次后台重建校准 (成功后落指纹基准)")
         logger.info("[auto_startup] %s", report["reasons"][-1])
-        report["rebuild"] = trigger_rebuild("首次运行校准", background=async_)
+        report["rebuild"] = trigger_rebuild("首次运行校准", background=async_,
+                                            fingerprint=now_fp)
+        report["snapshot_deferred"] = True
         return report
 
     if prev.get("hash") == _fp_hash(now_fp) and not force:
@@ -479,10 +685,22 @@ def reconcile_startup(async_=True, once=True, force=False):
         why = "; ".join(need_scan)
         # 用「补扫 + 重建校准」而非只补扫: run_scan 只判当天, 规则改了历史行不会更新,
         # UI 仍是旧信号 —— 这正是"重启后端仍显示旧信号"的根因。rebuild 覆盖窗口内全部行。
-        report["rebuild"] = trigger_rebuild(why, background=async_)
-        logger.info("[auto_startup] 检测到 %s → 已触发补扫+重建校准", why)
+        # ★ 指纹延后到校准成功后落盘 (见 _rebuild_worker): 否则 rebuild 中途夭折 / 命中
+        #   "取数为空" 早退时指纹也被推进 ⇒ 下次启动跳过 ⇒ 永久漏补。
+        report["rebuild"] = trigger_rebuild(why, background=async_, fingerprint=now_fp)
+        report["snapshot_deferred"] = True
+        logger.info("[auto_startup] 检测到 %s → 已触发补扫+重建校准 (指纹待校准成功后推进)",
+                    why)
+    else:
+        # 无重建需求 → 立即推进指纹。典型: 只改了展示层 (门表 yaml / 展示管线 / 档位映射),
+        # 展示链每次请求实时读, 重启即生效, 重建纯属浪费。
+        _save_snapshot(now_fp, calibrated_for=(prev or {}).get("calibrated_for"))
+        if d.get("display_changed"):
+            logger.info("[auto_startup] 仅展示层变更 (门表/展示管线/档位映射) → "
+                        "无需重建, 重启即生效; 指纹已推进")
+        else:
+            logger.info("[auto_startup] 无重建需求 (停用类变更已同步处理) → 指纹已推进")
 
-    _save_snapshot(now_fp)
     return report
 
 

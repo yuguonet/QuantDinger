@@ -33,7 +33,8 @@ except Exception:
 
 from app.market_cn.auto import store as ds
 from app.market_cn.auto import strategies as strat_reg
-from app.market_cn.auto.strategies.base import confirm_level_of
+# 展示档位归一 (非判定): 单独模块, 不进判定指纹 —— 见 core/display_meta.py 头注
+from app.market_cn.auto.core.display_meta import confirm_level_of
 
 W_OPEN_LO, W_OPEN_HI = "09:25", "09:35"
 W_PRECONF_LO, W_PRECONF_HI = "14:25", "14:45"
@@ -123,7 +124,8 @@ def evaluate_confirm(row, series_rows):
     """确认判定 (通用): 注册表分发 confirm_decision, snap={"series": [...]}。
 
     返回 (level, reason, chg, vr):
-      level  = 展示档位 strong/ok/weak (经 base.confirm_level_of 归一; None=无法判定)
+      level  = 展示档位 strong/ok/weak (经 core.display_meta.confirm_level_of 归一;
+               None=无法判定)
       reason = 策略原始语义串 (落 extra.pre_reason 作审计, **不当档位用**)
       chg/vr = d1_chg / d1_vol_r
     """

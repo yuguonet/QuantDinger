@@ -64,7 +64,8 @@ class ConfirmDecision:
     多数用 signal_price, relay3 用 entry_price)。
 
     reason 是**策略内部语义串**(ok / g56_hold / sealed_hold / 一整句中文), 只作审计,
-    不是展示档位 —— 档位一律经 `confirm_level_of()` 归一, 勿直取 reason 当档位。
+    不是展示档位 —— 档位一律经 `core/display_meta.confirm_level_of()` 归一, 勿直取
+    reason 当档位。
     """
     confirmed: bool
     reason: str = ""
@@ -75,35 +76,14 @@ class ConfirmDecision:
 
 
 # ================================================================
-# 预确认档位 (展示层口径, 与 ConfirmDecision.reason 解耦)
+# 预确认档位 → 已迁 core/display_meta.py (2026-09-23, 语义边界拆分)
 # ================================================================
-
-#: 档位值域 —— 前端 pcMap 只认这三个 (strong='强' / ok='中' / weak='弱')
-CONFIRM_LEVELS = ("strong", "ok", "weak")
-
-
-def confirm_level_of(dec):
-    """把 ConfirmDecision 归一为展示档位 strong/ok/weak; None = 无法判定。
-
-    真值源单一:
-      confirmed            过没过 (硬判定, 决定状态机 watch_pending → holding/exit_today)
-      detail['confirm_strong']  强度位 (True 且已确认 → strong)
-      detail['level']      策略显式覆盖扩展点 (仅当取值在 CONFIRM_LEVELS 内才生效)
-    刻意**不读 reason** —— 旧实现 `dec.reason if dec.confirmed else "weak"` 把策略内部
-    语义串当档位写进 extra.pre_confirm (g56_hold / hold_to_D1_open / sealed_hold /
-    "D1日内动量<3%,D2开盘清仓"), 前端 pcMap 查不到 → 一律渲染成未知档 ☆, 既无法与真弱
-    确认区分, 又把内部 token 漏进明细弹窗。归一后: 未确认恒 weak, 已确认恒 ok (除非策略
-    用 confirm_strong / level 显式声明强档)。
-    """
-    if dec is None:
-        return None
-    d = dec.detail if isinstance(dec.detail, dict) else {}
-    lv = d.get("level")
-    if lv in CONFIRM_LEVELS:            # 显式覆盖 (非法值静默走兜底, 不抛)
-        return lv
-    if not dec.confirmed:
-        return "weak"
-    return "strong" if d.get("confirm_strong") else "ok"
+# `CONFIRM_LEVELS` / `confirm_level_of` 曾住在本文件。它们只是"判定结果 → 展示档位"的
+# 翻译器, 不改判定; 而本文件是**判定契约** (ConfirmDecision / StrategyBase / scan_days)。
+# 启动指纹是文件级内容 hash, 切不开同一文件里混着的两类改动 ⇒ 改档位映射会白跑一次全量
+# 重建 (实证: 2026-09-23 19:33 因本文件变更触发 rebuild 300s, 产出与 17:01 逐字段相同)。
+# 移出到 core/display_meta.py —— 该模块被 startup 判定指纹显式排除。
+# 调用方: `from app.market_cn.auto.core.display_meta import confirm_level_of`
 
 
 @dataclass
