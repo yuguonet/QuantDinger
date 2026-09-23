@@ -265,7 +265,13 @@ def _load_analysis_memory_docs() -> list:
 
 retriever = _build_retriever()
 
-# 模式：固定 task
+# 模式：固定 task；执行形态：固定 CodeAgent（AGENT_TYPE 仅作声明校验，2026-09-23）
+# ——历史曾有 ToolCallingAgent 双形态设想，现架构仅支持 code（工具=Python 函数，
+# 沙箱真 CPython 执行）。AGENT_TYPE 配其它值将在启动时告警并强制按 code 运行。
+_agent_type = os.getenv("AGENT_TYPE", "code").strip().lower()
+if _agent_type != "code":
+    logging.getLogger(__name__).warning(
+        "[启动] AGENT_TYPE=%s 不受支持，本系统仅支持 CodeAgent 形态，已按 code 运行", _agent_type)
 # 工具架构：
 #   - ToolProvider 统一注册（tools/ 通用 + 子目录领域工具），一次扫描两种输出（函数 + schema）
 #   - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]

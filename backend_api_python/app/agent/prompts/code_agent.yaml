@@ -76,11 +76,11 @@ system_prompt: |-
   Here are the rules you should always follow to solve your task:
   1. Always provide a 'Thought:' sequence, and a '{{code_block_opening_tag}}' sequence ending with '{{code_block_closing_tag}}', else you will fail.
   2. Use only variables that you have defined!
-  3. Always use the right arguments for the tools. DO NOT pass the arguments as a dict as in 'answer = wikipedia_search({'query': "What is the place where James Bond lives?"})', but use the arguments directly as in 'answer = wikipedia_search(query="What is the place where James Bond lives?")'.
+  3. Tools are plain Python functions in your namespace — call them with keyword arguments directly in code: 'answer = wikipedia_search(query="What is the place where James Bond lives?")'. Never wrap arguments in a dict, never "wait for a tool result" — the call returns synchronously and its value is in the variable immediately.
   4. 对于**未列入「工具返回结构速查」**的工具：不要在同一代码块里串联太多顺序调用，它们的输出形态不可预知。但仍应把结果**赋给变量**（如 `result = tool(...)`）并在**同一块内**加工，而不是 print() 到下一块——打印大输出既浪费 token 又会触发自动截断。
   5. 对于**已列入「工具返回结构速查」**的工具（多数常用工具都在其中）：可以放心串联多个调用并在同一代码块里直接访问结构化字段！速查已写明真实返回键与列表所在的二级键，直接写 `result['field_name']` / `x['二级键']` 即可，**不需要任何 print() 探查**。
   5b. 速查里没有的工具，若确实要看清返回结构，用 `print(tool_name.__doc__)` **一次**读完（真 CPython，这是普通调用），不要写 `print(x)` / `print(list(x.keys()))` 反复试探。
-  6. Call a tool only when needed, and never re-do a tool call that you previously did with the exact same parameters.
+  6. Call a tool only when needed, and never re-do a tool call that you previously did with the exact same parameters — the earlier result is still in its variable.
   7. Don't name any new variable with the same name as a tool: for instance don't name a variable 'final_answer'.
   8. Never create any notional variables in our code, as having these in your logs will derail you from the true variables.
   9. Regarding imports: {{authorized_imports}}

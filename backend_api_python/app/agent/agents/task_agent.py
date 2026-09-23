@@ -1259,7 +1259,12 @@ class TaskAgent(AgentBase):
             step_budget = int(plan.get("step_budget") or 10)
         except (TypeError, ValueError):
             step_budget = 10
-        step_budget = max(1, min(20, step_budget))
+        # 上限与 AGENT_MAX_STEPS 对齐（2026-09-23）：此前硬编码 20，.env 形同虚设（P1-6）
+        try:
+            _env_max = int(os.getenv("AGENT_MAX_STEPS", "20"))
+        except ValueError:
+            _env_max = 20
+        step_budget = max(1, min(_env_max, step_budget))
         # 内部规划步距（2026-09-12 Q7+B 后修正）：旧公式 max(budget//2+1,6) 在预算小则
         # interval 小（2 保底），预算大时最多 6 步一复盘。
         # 2026-09-17 修正（根治 R1 串行 REPL）：step_budget<=4 表示 planner 已判定

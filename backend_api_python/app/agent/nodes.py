@@ -892,13 +892,21 @@ def make_plan_node(ctx: NodeContext):
             logger.info("[Plan] phase 契约: %d 个阶段: %s", len(phases),
                         ", ".join(f"#{p['id']}{p['name']}" for p in phases))
 
-        # 步数纪律（2026-09-21）：单 CodeAgent 阶段 ≤5 步，planner 报大值一律钳到 5。
-        # 实测 >5 步的阶段全部 hit_max_steps（262s/283s 烧穿 180s 预算）并连带
-        # token 爆炸；步数不够应拆阶段，不是加步数。
+        # 步数纪律（2026-09-21）：单 CodeAgent 阶段 ≤5 步（默认），planner 报大值一律钳制。
+        # 2026-09-23：上界改为读 AGENT_MAX_STEPS（.env 可调，默认 5）——此前 .env 的
+        # AGENT_MAX_STEPS 只在 executor 构造时当初始值、随即被 step_budget 覆盖，形同虚设；
+        # 现在它是单段硬上限的真实单一事实源（提示词引导 ≤5 与默认值一致）。
+        # 实测 >5 步的阶段全部 hit_max_steps 烧穿预算；步数不够应拆阶段，不是加步数。
+        try:
+            _max_sb = int(os.getenv("AGENT_MAX_STEPS", "5"))
+        except ValueError:
+            _max_sb = 5
+        _max_sb = max(_max_sb, 1)
         _sb = int(plan.get("step_budget") or 0)
-        if _sb > 5:
-            logger.warning("[Plan] step_budget=%d 超过单段上限 5，钳制到 5（任务过大请拆阶段）", _sb)
-            _sb = 5
+        if _sb > _max_sb:
+            logger.warning("[Plan] step_budget=%d 超过单段上限 %d（AGENT_MAX_STEPS），钳制（任务过大请拆阶段）",
+                           _sb, _max_sb)
+            _sb = _max_sb
         _sb = max(_sb, 1)
 
         return {
