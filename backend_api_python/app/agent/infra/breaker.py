@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from app.utils.logger import get_logger
 
@@ -48,9 +49,8 @@ class ToolCircuitBreaker:
             if not self._open.get(name, False):
                 return False
             # half-open：超过冷却期 → 自动复位，放行一次试探
-            import time as _time
             opened_at = self._open_at.get(name, 0)
-            if _time.time() - opened_at >= self.COOLDOWN_SECONDS:
+            if time.time() - opened_at >= self.COOLDOWN_SECONDS:
                 logger.info("[Breaker] 工具 %s 熔断冷却期已过（%ds），半开放行试探",
                             name, self.COOLDOWN_SECONDS)
                 self._open[name] = False
@@ -68,8 +68,7 @@ class ToolCircuitBreaker:
             self._fail_streak[name] = streak
             if streak >= self.threshold and not self._open.get(name):
                 self._open[name] = True
-                import time as _time
-                self._open_at[name] = _time.time()
+                self._open_at[name] = time.time()
                 logger.warning("[Breaker] 工具 %s 连续失败 %d 次，熔断打开（%ds 后半开试探）",
                                name, streak, self.COOLDOWN_SECONDS)
 

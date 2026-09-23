@@ -1461,6 +1461,10 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         def _tool_sig(_n):
             try:
                 _fn = ctx.tool_provider.get(_n) if ctx.tool_provider else None
+                if _fn is None and ctx.tool_provider is not None:
+                    # 2026-09-23（v2 清单 Bug3）：meta 工具（web_search/format_result 等）
+                    # 只在 get_meta 表里——回退查询，签名不再退化为裸名
+                    _fn = ctx.tool_provider.get_meta(_n)
                 if _fn is not None:
                     _ps = [p.name for p in inspect.signature(_fn).parameters.values()
                            if not p.name.startswith("_")]
@@ -1533,6 +1537,15 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     # ── 4. 执行（重试=整批重跑，复用 agent 实例）──
     agents = dict(state.get("_phase_agents") or {})
     agent = agents.get(str(idx))
+    # 工具契约检查（2026-09-23，v2 清单 Bug2）：与单段路径同款——复用实例的
+    # 工具面（domain+union_tools）必须与本次一致，否则用旧工具面执行新任务。
+    _contract = (state.get("selected_domain", ""), tuple(sorted(union_tools or [])))
+    if agent is not None and getattr(agent, "_tool_contract", None) != _contract:
+        logger.warning(
+            "[Execute] 批次 [%d-%d] 工具契约变化（%s → %s），重建 CodeAgent",
+            first_id, last_id, getattr(agent, "_tool_contract", None), _contract)
+        agent = None
+        agents.pop(str(idx), None)
     if agent is None:
         effective_interval = max(2, min(sum_budget // 2, 6)) if _need_internal else None
         agent = agent_instance._build_code_agent(
@@ -1547,6 +1560,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             run_scope=run_scope,
         )
         agents[str(idx)] = agent
+        agent._tool_contract = _contract
         logger.info("[Execute] 批次 [%d-%d] 新建 CodeAgent（白名单 %d 个工具，内部规划 %s）",
                     first_id, last_id, len(union_tools), "on" if effective_interval else "off")
     else:

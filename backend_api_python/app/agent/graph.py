@@ -168,7 +168,8 @@ class CompiledGraph:
                 if "on_error" in self._graph._edges:
                     current = self._graph._edges["on_error"]
                     continue
-                raise
+                # 2026-09-23（v2 清单 Bug1）：无 on_error 边时带 error 状态返回
+                return state
 
             # 持久化
             if self._checkpointer:
@@ -219,7 +220,10 @@ class CompiledGraph:
                 if "on_error" in self._graph._edges:
                     current = self._graph._edges["on_error"]
                     continue
-                raise
+                # 2026-09-23（v2 清单 Bug1）：无 on_error 边时不再 raise——
+                # 生成器内 raise 会让调用方 async for 直接终止且拿不到 error 状态；
+                # 改为终止迭代（error 已在 state 与事件里，调用方可优雅降级）。
+                break
 
             # 持久化
             if self._checkpointer:
