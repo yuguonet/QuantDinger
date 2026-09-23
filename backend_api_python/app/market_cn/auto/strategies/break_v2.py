@@ -36,9 +36,12 @@ from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
-from app.market_cn.auto.strategies.break_buy import (
-    BOARD_PARAMS, _break_signal_at, _run_backtest_breakbuy,
-)
+# break 是 Python 关键字 → 静态 import 语法错误, 走动态导入 (2026-09-23 更名)。
+from importlib import import_module as _import_module
+_break_mod = _import_module("app.market_cn.auto.strategies.break")
+BOARD_PARAMS = _break_mod.BOARD_PARAMS
+_break_signal_at = _break_mod._break_signal_at
+_run_backtest_breakbuy = _break_mod._run_backtest_breakbuy
 
 STRATEGY_KEY = "break_v2"
 STRATEGY_LABEL = "断板V2"

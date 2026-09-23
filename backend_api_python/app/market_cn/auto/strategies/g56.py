@@ -31,8 +31,20 @@
   - 特征公式与 tmp/migrate_150.py 逐字一致 (_sma_np/_rsi/_atr/_boll_np 本地移植 —
     indicators.rsi 是 Wilder EMA 口径, 与研究成果不一致, 勿替换; MACD 复用
     indicators.calc_macd 与研究同源)。
+  - 逐日/批量路径统一走 `_iter_gate_days` (2026-09-23 性能改动): f 与 mask 对同一
+    (bars, board) 恒定, 抽出为生成器后一次 O(n) 预计算 + 逐日 O(1) 查表; 原实现虽已
+    预计算 f, 仍每历史日重算整条 _g1_mask (占单次 gating 95%) ⇒ 回测全历史 **5.3x**
+    (6.69→1.26 ms/票, 全市场 244 天 35.0s→6.6s; tmp/_g56_speed.py)。等价性由
+    tmp/_g56_diff.py 证实: 20440 项逐字段 0 不一致。
 
 易错点:
+  - **全部 G1 指标因果** (实证: f_full[k] 逐位 == _g1_arrays(bars[:k+1])[k],
+    29360 点 0 不一致, tmp/_g56_cost.py P1) ⇒ 可用**未切片**全序列一次算出第 k 日
+    特征, 与"按 as_of 切片后重算"完全相同 ⇒ scan_signals 已不再真的切片。
+    ⚠️ 若将来引入非因果/双向平滑指标 (如 centered MA / 用未来值回填), 此前提失效,
+    必须回退切片, 否则会引入前视。
+  - `_g56_gate` 的 mask 参数应传预算值: 不传则内部重算整条 mask (95% 开销)。目前仅
+    单次调用的 scan_signals 路径允许省略; 一切循环/批量路径必须走 _iter_gate_days。
   - 前视防护: 聚合每票 bars 必须 as_of=pool_target 截断; 池统计按特征日(D-1)为 key,
     score_r 滚动分位不含当日 (同 tmp/regime3_150._pctl_roll)。
   - 与研究的已知口径差 (仅边缘日微差): 研究池统计来自 g1deep3 缓存 — 行级隐含
@@ -201,14 +213,20 @@ def _g1_mask(f, board):
     return m
 
 
-def _g56_gate(f, pool, board, k, date_k):
+def _g56_gate(f, pool, board, k, date_k, mask=None):
     """五重共振门判定 (给定预计算特征 f@k / 池统计 pool / 板块 board / 信号日索引 k)。
+
+    mask: 可选预计算的 `_g1_mask(f, board)` 结果。**同一 (f, board) 下 mask 恒定**,
+      逐日循环里若不传入则每次重算整条序列 —— 实测占 _g56_gate 单次耗时 **95%**
+      (0.0225 / 0.0238 ms, `tmp/_g56_hotspot.py`), 抹掉后单次降到 0.0013 ms (**18x**)。
+      逐日/批量调用方务必预算一次并传入, 见 `_iter_gate_days`。
 
     返回 (bool_pass, st): st=该日横截面统计 (None=池缺失)。scan_signals 与
     backtest_stock 共用此单一判定事实源 — 修复 backtest 逐日重算 _g1_arrays 的 O(n^2)
     坑 (原 backtest 每历史日调 scan_signals 重算全序列指标); 改规则务必同步此处。
     """
-    if not _g1_mask(f, board)[k] or not f["rhist_chg"][k] > R56[board]:
+    mk = _g1_mask(f, board) if mask is None else mask
+    if not mk[k] or not f["rhist_chg"][k] > R56[board]:
         return False, None
     st = pool.get(board, {}).get(date_k)
     if st is None:
@@ -221,6 +239,35 @@ def _g56_gate(f, pool, board, k, date_k):
                 and f["dif0"][k] <= 0):
             return False, None
     return True, st
+
+
+def _iter_gate_days(bars, board, pool, lo_k, hi_k):
+    """单票逐日列出通过五重共振门的 (k, f, st) —— 共用事实源, 一次预计算 + 逐日 O(1)。
+
+    从 backtest_stock 抽出: `f` 与 `mask` 对同一 (bars, board) 恒定, 但原实现在每个
+    历史日都重算 `_g1_mask` 整条序列 (占 _g56_gate 95%)。此处一次算完, 逐日只做标量
+    索引与标量比较 ⇒ 单次 gating 0.0238 → 0.0013 ms (18x, `tmp/_g56_hotspot.py`)。
+
+    前视安全: 所有 G1 指标**因果**(实证: 29360 点逐位比对, `f_full[k]` ==
+    `_g1_arrays(bars[:k+1])[k]`, 0 不一致, `tmp/_g56_cost.py` P1) ⇒ 可以用未切片
+    的全序列一次算出 k 日特征, 与逐日截断重算结果完全相同。
+
+    索引: lo_k..hi_k **含端点**, 越界自动裁剪; 与 `_g1_mask` 的 `m[:68]=False`
+    一致, k<68 恒不通过, 无需调用方过滤。
+    """
+    n = len(bars)
+    lo = max(0, lo_k)
+    hi = min(n - 1, hi_k)
+    if hi < lo:
+        return
+    f = _g1_arrays(bars)
+    mask = _g1_mask(f, board)
+    for k in range(lo, hi + 1):
+        if not mask[k]:
+            continue
+        ok, st = _g56_gate(f, pool, board, k, str(bars[k]["time"])[:10], mask=mask)
+        if ok:
+            yield k, f, st
 
 
 # ================================================================
@@ -295,8 +342,11 @@ def _ensure_pool_daily(pool_target, bars_batch=None):
         return _POOL
 
 
-def _exit_no_trail(bars, s, entry):
-    """无追踪出场模拟 (2026-09-17 出场研究定稿): 出场 = min(止损-8%, HOLD_DAYS 到期收盘)。
+def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None):
+    """无追踪出场模拟 (2026-09-17 出场研究定稿): 出场 = min(止损, hold_days 到期收盘)。
+
+    hold_days / stop_loss (2026-09-23): 出场阈值改由调用方注入 (源 = g56.yaml 声明);
+    传 None -> 回落模块常量 HOLD_DAYS / STOP_LOSS, 即不传参时逐笔等价不破。
 
     返回与 v1._run_backtest 同构 {'exit_day','exit_price','return_pct','peak_return_pct'}:
       - d=1 入场日 T+1 不可卖, 峰值自入场日 high 起累计 (统计口径, 不影响成交);
@@ -306,9 +356,11 @@ def _exit_no_trail(bars, s, entry):
     (主板 +1.45→+7.64 / 20cm +2.12→+10.22)。数据不足返回 None (调用方跳过该笔)。
     """
     n = len(bars)
-    stop_line = entry * (1 + STOP_LOSS / 100)
+    _hold = HOLD_DAYS if hold_days is None else int(hold_days)
+    _stop = STOP_LOSS if stop_loss is None else float(stop_loss)
+    stop_line = entry * (1 + _stop / 100)
     peak = float(bars[s]["high"])
-    for d in range(2, HOLD_DAYS + 1):
+    for d in range(2, _hold + 1):
         i = s + d - 1
         if i >= n:
             return None
@@ -318,13 +370,39 @@ def _exit_no_trail(bars, s, entry):
             return {"exit_day": d, "exit_price": round(fill, 3),
                     "return_pct": round((fill / entry - 1) * 100, 2),
                     "peak_return_pct": round((peak / entry - 1) * 100, 2)}
-    i = s + HOLD_DAYS - 1
+    i = s + _hold - 1
     if i >= n:
         return None
     px = float(bars[i]["close"])
-    return {"exit_day": HOLD_DAYS, "exit_price": round(px, 3),
+    return {"exit_day": _hold, "exit_price": round(px, 3),
             "return_pct": round((px / entry - 1) * 100, 2),
             "peak_return_pct": round((peak / entry - 1) * 100, 2)}
+
+
+def _mk_signal(code, bars, k, f, st):
+    """命中日 k → Signal (单日 scan_signals 与批量 scan_days 共用的唯一构造点)。
+
+    抽出的理由: 两处若各写一份, 字段口径迟早分叉 (score 取整/pctb 位数/score_r None
+    处理都是易错点)。改任一字段必须只改这里。
+    """
+    rhc = float(f["rhist_chg"][k])
+    return Signal(
+        code=code,
+        time=bars[k]["time"],
+        score=int(min(99, max(0, round(50 + rhc * GEM_SCORE_DIVISOR)))),
+        price=float(bars[k]["close"]),
+        label=STRATEGY_LABEL + SIGNAL_OPEN_RANGE_HINT,
+        extra={
+            # 不写 "board" 键: store.signal_row 回退 get_board_name (中文板块名,
+            # 与全表落库口径一致); 板块类型由 code 前缀可逆推导
+            "rhist_chg": round(rhc, 3),
+            "boll_pctb": round(float(f["pctb"][k]), 2),
+            "dif0": round(float(f["dif0"][k]), 3),
+            "rmed": round(st["rmed"], 3),
+            "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
+            "buy_mode": "next_open",
+        },
+    )
 
 
 # ================================================================
@@ -347,34 +425,69 @@ class G56Strategy(StrategyBase):
             return []
         if code.startswith(("8", "4", "92")):
             return []
-        pool_target = str(bars[-1]["time"])[:10]   # 聚合锚=切片前末根 (回测=快照末日)
-        if as_of is not None:
-            bars = bars[:as_of + 1]
-        k = len(bars) - 1                          # 信号日 D-1
-        date_k = str(bars[k]["time"])[:10]
+        # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
+        pool_target = str(bars[-1]["time"])[:10]
+        k = len(bars) - 1 if as_of is None else as_of
+        # 暖机/越界: 原实现对小 as_of 会因 np.convolve 广播失败而崩溃 (切片不足 20 根),
+        # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
+        if not (67 <= k < len(bars)):
+            return []
         board = get_board_type(code)
+        # 全序列一次算 f, 不再 _g1_arrays(bars[:k+1]): 指标全部因果, f_full[k] 逐位
+        # == 截断重算的第 k 个值 (实证 29360 点 0 不一致, tmp/_g56_cost.py P1)
         f = _g1_arrays(bars)
+        date_k = str(bars[k]["time"])[:10]
         ok, st = _g56_gate(f, _ensure_pool_daily(pool_target), board, k, date_k)
         if not ok:
             return []                              # G1池 & 56%门 & 横截面 regime 门
-        rhc = float(f["rhist_chg"][k])
-        return [Signal(
-            code=code,
-            time=bars[k]["time"],
-            score=int(min(99, max(0, round(50 + rhc * GEM_SCORE_DIVISOR)))),
-            price=float(bars[k]["close"]),
-            label=STRATEGY_LABEL + SIGNAL_OPEN_RANGE_HINT,
-            extra={
-                # 不写 "board" 键: store.signal_row 回退 get_board_name (中文板块名,
-                # 与全表落库口径一致); 板块类型由 code 前缀可逆推导
-                "rhist_chg": round(rhc, 3),
-                "boll_pctb": round(float(f["pctb"][k]), 2),
-                "dif0": round(float(f["dif0"][k]), 3),
-                "rmed": round(st["rmed"], 3),
-                "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
-                "buy_mode": "next_open",
-            },
-        )]
+        return [_mk_signal(code, bars, k, f, st)]
+
+    # ---- 横截面预热 (声明制; 编排层调 prewarm 一次, 不硬编码策略 key) ----
+    def prewarm(self, bars_map, hi_date):
+        """一次建好横截面池 (锚=hi_date), 供本批所有票的 scan_days 复用。
+
+        不预热的后果: `_POOL` 是单槽缓存, 若每票各自调用 `_ensure_pool_daily`, 只要
+        target 相同仍会命中 —— 但**停牌票末根早于全市场末日**会让锚跳变 ⇒ 反复重建
+        全市场池。编排层统一预热 + `scan_days` 锚取 hi_date ⇒ 全批只建一次。
+        """
+        _ensure_pool_daily(hi_date, bars_batch=bars_map)
+
+    # ---- 覆盖基类 scan_days (批量契约): 与逐日调 scan_signals 等价, 但 O(n) 而非 O(n²) ----
+    def scan_days(self, bars, code, *, lo_date=None, hi_date=None, pool=None, **params):
+        """返回该票在 [lo_date, hi_date] 内**所有**命中日的 Signal (不只末根)。
+
+        为什么必须覆盖基类的默认实现: 默认实现逐日调 scan_signals, 而单次调用就是一次
+        O(n) `_g1_arrays` ⇒ 逐日枚举 O(n²); 更致命的是 scan_signals 内部按 `bars[-1]`
+        取池锚, 逐日截断会让锚每天都变 ⇒ `_POOL` 单槽缓存**每票每天都重建全市场池**
+        (5235 票 × 114s)。本方法一次 f+mask 预计算 + 池锚固定 ⇒ 逐日 O(1)。
+
+        等价实证 (`tmp/_g56_pool_anchor.py`, 500 票分层抽样):
+          - 池锚: 一次建池(锚=末日) 的第 i 天 vs 逐日建池(锚=i) 的第 i 天 →
+            **232 个 (板,日) 点 |Δrmed|=0 |Δscore_r|=0, 阈值翻转 0**
+            (`_pctl_roll` 零前视 + EMA/ATR/RSI 因果 ⇒ 池可一次建好逐日查)
+          - 端到端: 逐日切片 scan_signals vs 本路径 → **103 个 (code,date) 命中逐位一致, 96.4x**
+
+        ⚠️ 池锚取 hi_date 而非 bars[-1]: 同一批票必须锚在同一天, 停牌票的末根早于全市场
+        末日时会让锚跳变 ⇒ 单槽缓存 thrash。调用方显式传 pool 可完全跳过这一步。
+        """
+        if not bars or len(bars) < 68:
+            return []
+        if code.startswith(("8", "4", "92")):
+            return []
+        board = get_board_type(code)
+        if board not in ("main", "gem_star"):
+            return []
+        if pool is None:
+            pool = _ensure_pool_daily(hi_date or str(bars[-1]["time"])[:10])
+        out = []
+        for k, f, st in _iter_gate_days(bars, board, pool, 0, len(bars) - 1):
+            d = str(bars[k]["time"])[:10]
+            if lo_date and d < lo_date:
+                continue
+            if hi_date and d > hi_date:
+                continue
+            out.append(_mk_signal(code, bars, k, f, st))
+        return out
 
     # ---- D0 竞价处置 (monitor ~09:25): gap≥涨停幅度 → 不可买 (同回测 gap 过滤) ----
     def entry_decision(self, row, snap=None, **params):
@@ -456,20 +569,17 @@ class G56Strategy(StrategyBase):
         n = len(bars)
         o = np.array([float(b["open"]) for b in bars])
         c = np.array([float(b["close"]) for b in bars])
-        # 修复① O(n^2): 全序列指标一次 O(n) 预计算, 不再逐日 scan_signals 重算 _g1_arrays
-        f = _g1_arrays(bars)
         # 横截面 regime 池: 锚=快照末日, 一次聚合后按 target 跨股/逐日缓存复用
         pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
         trades = []
         last_exit_idx = -1   # 修复② 持仓窗口去重: 上一笔未退出前不重复入场
                             # (同共振段连续成信号时锁仓至退出日, 防 000070 连日重复建仓)
-        for s in range(68, n - 9):             # 末9日留引擎缓冲 (同研究)
-            if o[s] <= 0 or s <= last_exit_idx:
-                continue
-            k = s - 1                          # 信号日 D-1
-            date_k = str(bars[k]["time"])[:10]
-            ok, st = _g56_gate(f, pool, board, k, date_k)
-            if not ok:
+        # 修复① O(n^2): 全序列指标一次 O(n) 预计算, 不再逐日 scan_signals 重算 _g1_arrays
+        # 修复③: 顺带消除逐日重算 _g1_mask (单次 gating 的 95%, 见 _iter_gate_days)
+        # 索引换算: 原 `for s in range(68, n - 9)` ⇒ s∈[68, n-10] ⇒ k=s-1∈[67, n-11]
+        for k, f, st in _iter_gate_days(bars, board, pool, 67, n - 11):
+            s = k + 1                          # 入场日 D0 = 信号日 D-1 的下一交易日
+            if s <= last_exit_idx or o[s] <= 0:
                 continue
             gap = o[s] / c[s - 1] - 1
             if gap >= lim:
@@ -482,7 +592,7 @@ class G56Strategy(StrategyBase):
                 "code": code,
                 "board": board,
                 "strategy": STRATEGY_KEY,
-                "signal_date": date_k,
+                "signal_date": str(bars[k]["time"])[:10],
                 "entry_date": str(bars[s]["time"])[:10],
                 "entry_price": round(float(o[s]), 3),
                 "entry_gap": round(gap * 100, 2),

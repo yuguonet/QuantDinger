@@ -33,6 +33,7 @@ except Exception:
 
 from app.market_cn.auto import store as ds
 from app.market_cn.auto import strategies as strat_reg
+from app.market_cn.auto.strategies.base import confirm_level_of
 
 W_OPEN_LO, W_OPEN_HI = "09:25", "09:35"
 W_PRECONF_LO, W_PRECONF_HI = "14:25", "14:45"
@@ -119,18 +120,20 @@ def _strategy_of(row):
 
 
 def evaluate_confirm(row, series_rows):
-    """确认判定 (通用, 兼容旧签名): 注册表分发 confirm_decision, snap={"series": [...]}。
+    """确认判定 (通用): 注册表分发 confirm_decision, snap={"series": [...]}。
 
-    返回 (level, chg, vr); level=None 表示无法判定。
+    返回 (level, reason, chg, vr):
+      level  = 展示档位 strong/ok/weak (经 base.confirm_level_of 归一; None=无法判定)
+      reason = 策略原始语义串 (落 extra.pre_reason 作审计, **不当档位用**)
+      chg/vr = d1_chg / d1_vol_r
     """
     s_obj = _strategy_of(row)
     if s_obj is None:
-        return None, None, None
+        return None, None, None, None
     dec = s_obj.confirm_decision(row, {"series": series_rows})
     if dec is None:
-        return None, None, None
-    level = dec.reason if dec.confirmed else "weak"
-    return level, dec.d1_chg, dec.d1_vol_r
+        return None, None, None, None
+    return confirm_level_of(dec), dec.reason, dec.d1_chg, dec.d1_vol_r
 
 
 # ================================================================
@@ -294,7 +297,10 @@ def run_monitor():
                                  detail={"marked": today, "intraday": True})
                     stats["live_exit"] = stats.get("live_exit", 0) + 1
 
-    # ── 3. 14:30 预确认 (v1 的今日买入行; dragon_callback/break 无确认步骤) ──
+    # ── 3. 14:25~14:45 预确认 ("当日买入行"通用, 无策略过滤; 各策略 confirm_decision 给档位) ──
+    #      pre_confirm = 归一档位 strong/ok/weak (展示用, 前端 pcMap);
+    #      pre_reason  = 策略原始语义串 (仅审计, 前端不展示 —— 防 g56_hold 之类内部 token 漏进 UI)。
+    #      该标记只在当日买入窗口有意义 —— 15:00 正式确认后由 step 7 统一清除, 勿在此清。
     if in_window(W_PRECONF_LO, W_PRECONF_HI, hm):
         today_buys = [r for r in buy_rows if str(r.get("entry_date"))[:10] == today]
         if today_buys:
@@ -305,9 +311,12 @@ def run_monitor():
                 rows_ = series.get(r["code"])
                 if not rows_:
                     continue
-                level, chg, vr = evaluate_confirm(r, rows_)
+                level, reason, chg, vr = evaluate_confirm(r, rows_)
                 if level:
-                    ds.set_state(r["id"], r["state"], detail={"pre_confirm": level, "pre_ts": hm})
+                    detail = {"pre_confirm": level, "pre_ts": hm}
+                    if reason:
+                        detail["pre_reason"] = reason
+                    ds.set_state(r["id"], r["state"], detail=detail)
 
     # ── 4. 收盘窗口: 出场重放 (holding, 注册表分发 day_close 模式) ──
     if in_window(W_CLOSESIM_LO, W_CLOSESIM_HI, hm):
@@ -376,7 +385,15 @@ def run_monitor():
                 continue
             ds.set_state(r["id"], ds.S_CLOSED, exit_date=today, exit_price=round(open_px, 3))
 
-    # ── 7. 组对账 ──
+    # ── 7. 清理过期瞬时标记: pre_confirm/pre_ts/pre_reason 只在"当日买入行"期间有意义 ──
+    #      设计口径: 14:25 加"预"角标 → **15:00 正式确认覆盖** (docs/龙回头自动化设计方案.md:92/154)。
+    #      extra 是增量合并 (只加不减), 上面各出口 —— 盘中硬止损 / live 出场 / 15:01 正式确认 /
+    #      未确认跨日 —— 都可能把标记留下 ⇒ 统一在此按 "state=buy_today 且 entry_date=今天"
+    #      保留、其余清除。幂等 (已清理的不再匹配), 亦自愈历史脏数据。
+    #      漏清的后果: 持仓行带着 pre_confirm 过夜, 显示层把它当"当前预判"渲染成"预持"。
+    ds.purge_stale_detail(("pre_confirm", "pre_ts", "pre_reason"), ds.S_BUY_TODAY, today)
+
+    # ── 8. 组对账 ──
     ds.sync_watchlist_group(ds.get_active_signals())
     return stats
 

@@ -1,0 +1,109 @@
+# ================================================================
+# 龙回头 (dragon_callback) — IDE 门表镜像
+# ----------------------------------------------------------------
+# 规则事实源 = strategies/dragon_callback.py 的"判定原语"段 (2026-09-23 抽出):
+#   本文件的每个门只是**调用**策略模块注册的私有门函数 (dragon/streak/lu_gain20/
+#   depth/yin/ma20_dev/rsi6/gap_days), 不重写任何判定逻辑 —— 改规则只改 .py 一处。
+# 引擎编排 (core/runtime/evaluate.py):
+#   enumeration=limit_up → 枚举候选日 i → 资格门 → 遍历 lu_idx 升序, 首个通过即出信号
+#   → 去重 ±4 → U1~U4 预过滤(锚定涨停日) → 入场 → exit_modes.combo 出场。
+#   与 python 版 backtest_stock 编排同构 (编排差异见下方 entry 段 TODO)。
+#
+# ⚠️ 已知口径差 (待 core 支持, 不属门表范围):
+#   生产链 = 信号日(D0) 次日开盘买入 (buy_mode="next_open", entry_idx=i+1);
+#   门表引擎 limit_up 分支当前硬编码 entry=D0 收盘价 (entry_idx=i)。
+#   ⇒ 门表与 python 的**信号集(选股+选涨停日)应逐日一致** (A 段可验),
+#     成交价/入场日逐笔等价需引擎支持 next_open 后才成立 (B 段)。
+# ================================================================
+meta:
+  name: 龙回头
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 2
+  enumeration: limit_up        # 引擎: 遍历 lu_idx 升序, 首个通过即出信号 (与 scan_signals 同)
+  # 结构说明: "涨停 → 回调 → 反转"的 lu_idx 循环属引擎编排, 不写进门表; 门表只表达
+  # "给定 (决策日 i, 涨停日 lu_idx) 是否放行"。
+
+entry:
+  mode: next_open              # 语义声明: 次日(D1)开盘买入 (引擎编排支持后生效)
+  price: d1_open
+  # TODO(core): evaluate._run_backtest_limit_up 目前固定 entry_price=bars[i].close;
+  #  支持 next_open 后本段即生效, 届时 B 段可逐笔等价。
+
+exit:
+  mode: combo                  # core/exit_modes: dragon 出场引擎 (追踪/止损/到期/峰值逃顶)
+
+params:                        # 可调参数 (网格扫描 / 敏感性分析直接读这里)
+  # --- 回调窗口 (gap = i - lu_idx, 与 .py 的 gap_min/gap_max 同义) ---
+  gap_min: 5
+  gap_max: 7
+  # 引擎廉价预筛专用: core evaluate limit_up 读这两个键, 判定 i-lu ∈ [pd_min+1, pd_max+1]
+  # (= [gap_min, gap_max]); 改 gap_min/gap_max 必须同步此处, 否则预筛与门表不一致。
+  min_pullback_days: 4
+  max_pullback_days: 6
+  # --- 找龙: 滑动窗口涨停占比 ---
+  dragon_ratio: 0.7
+  dragon_windows: [4, 5, 7, 10, 15, 20]
+  # --- 龙强度三条件 ---
+  min_streak: 3                # 涨停日连板高度 >= 3
+  lu_gain20_min: 60.0          # 涨停日 20 日涨幅 >= 60%
+  rsi6_min: 45.0               # D0 RSI6 >= 45 (强势回调)
+  # --- 拐点过滤 (三腿 OR; ma20 腿已用哨兵参数关闭 lo==hi → 区间为空, 恒 False) ---
+  ma20_lo: -10.0
+  ma20_hi: -10.0
+  depth_max: -30.0             # 深跌释放
+  yin_ratio_max: 0.5           # 阳线承接
+  # --- 信号质量 (后两道排除门已用哨兵参数关闭, 保留以便扫描/恢复) ---
+  d0_chg_min: -4.0             # D0 企稳: 跌幅必须 > -4%
+  yin_ratio_exclude: 1.01      # 1.01 = 数学关闭 (占比恒 <1.01)
+  rsi6_exclude_lt: -100.0      # 哨兵停用
+  d0_ma20_exclude_lt: -100.0   # 哨兵停用
+  # --- 出场 (exit_modes.combo → run_backtest_dragon_callback) ---
+  hold_days: 7
+  stop_loss: -8.0
+  trail_lo: -3.0
+  trail_hi: -3.0
+  trail_switch_pct: 3.0
+  peak_exit_ret: 4.0
+  peak_exit_upper: 30.0
+
+# 门表: 一行一门。role: qualify=资格门(与 lu_idx 无关) / required=判定门(依赖 lu_idx)
+# needs_d0: 该门是否需 D0 当日数据 (展示端 T-1 夜预计算依据)
+gates:
+  # ---- 资格门 (每决策日只算一次) ----
+  - {id: q1, name: D0企稳, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "chg(0) > d0_chg_min"}
+  # ---- 判定门 (逐候选涨停日) ----
+  - {id: g1, name: 仍在回调中, role: required, needs_d0: 1, enabled: 1,
+     expr: "close() < lu_close()"}
+  - {id: g2, name: 找龙(窗口涨停占比), role: required, needs_d0: 0, enabled: 1,
+     expr: "dragon()"}
+  - {id: g3, name: 回调天数gap, role: required, needs_d0: 1, enabled: 1,
+     expr: "gap_days() >= gap_min and gap_days() <= gap_max"}
+  - {id: g4, name: 连板高度, role: required, needs_d0: 0, enabled: 1,
+     expr: "streak() >= min_streak"}
+  - {id: g5, name: 前期热度20日涨幅, role: required, needs_d0: 0, enabled: 1,
+     expr: "lu_gain20() >= lu_gain20_min"}
+  - {id: g6, name: 强势回调RSI6, role: required, needs_d0: 1, enabled: 1,
+     expr: "rsi6() >= rsi6_min"}
+  - {id: g7, name: 拐点(深跌|阳线|MA20腿), role: required, needs_d0: 1, enabled: 1,
+     expr: "(ma20_dev() >= ma20_lo and ma20_dev() < ma20_hi) or depth() <= depth_max or yin() < yin_ratio_max"}
+  - {id: g8, name: 排除-回调期阴线占比, role: required, needs_d0: 1, enabled: 1,
+     expr: "yin() < yin_ratio_exclude"}
+  - {id: g9, name: 排除-RSI6过弱, role: required, needs_d0: 1, enabled: 1,
+     expr: "rsi6() >= rsi6_exclude_lt"}
+  - {id: g10, name: 排除-跌破MA20, role: required, needs_d0: 1, enabled: 1,
+     expr: "ma20_dev() >= d0_ma20_exclude_lt"}
+
+# 信号展示字段 (python 版 extra 字段镜像; 引擎支持 signal.fields 后生效)
+signal:
+  fields:
+    gap_from_peak:    {expr: "gap_days()", fmt: int}
+    streak_h:         {expr: "streak()", fmt: int}
+    lu_gain20:        {expr: "lu_gain20_val()", fmt: r1}
+    d0_vs_ma20:       {expr: "ma20_dev_val()", fmt: r2}
+    pullback_depth:   {expr: "depth()", fmt: r2}
+    yin_ratio:        {expr: "yin()", fmt: r2}
+    tech_score:       {expr: "tech_score()", fmt: int}
+    tech_rsi:         {expr: "tech_rsi()", fmt: none}
+    tech_roc:         {expr: "tech_roc()", fmt: none}
+    tech_psy:         {expr: "tech_psy()", fmt: none}

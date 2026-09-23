@@ -25,7 +25,11 @@ entry:
   gap_max: {main: 9.8, gem_star: 19.8}   # gap >= 涨停幅度 → 一字/触板不可买 (lim=0.098/0.198)
 
 exit:
-  mode: g56_no_trail           # 无追踪纯 7d/-8% (HOLD_DAYS=7, STOP_LOSS=-8%)
+  mode: g56_no_trail           # 无追踪纯 7d/-8% (2026-09-17 出场研究定稿)
+  hold_days: 7                 # 最长持有交易日 (含入场日, 出场模拟 d=1..7)
+  stop_loss: -8.0              # 硬止损 % (与 initial_stop 同值, 双保险)
+                               # 2026-09-23: 由 g56.py 模块常量提升为 yaml 声明
+                               # (出场上限 All-Portfolio 统一, 不做板块分档)
 
 params:                        # 与 strategies/g56.py 冻结常量同值 (逐笔等价基线)
   r56: {main: 0.51, gem_star: 0.66}      # ④rhist_chg 门 = 150天池内 Q5
@@ -33,6 +37,9 @@ params:                        # 与 strategies/g56.py 冻结常量同值 (逐�
   main_rmed_min: 0.25          # 主板 regime: 池 rhist_chg 中位数 (raw)
   main_pctb_max: 49.87         # 主板 regime: boll %b 上限
   gem_score_min: 0.65          # 20cm regime: score_r (滚动相对热度)
+  # ---- 出场阈值 (2026-09-23 补: 原硬编码于 g56.py 模块常量) ----
+  hold_days: 7                 # = g56.HOLD_DAYS
+  stop_loss: -8.0              # = g56.STOP_LOSS
 
 # 门表：一行一门。G1 池成员 (trend/atr/big20/finite/warmup) + ④ + ⑤ (分板块 regime)。
 # NaN 哨兵：缺值/暖机/池缺失 → 数值门自然失败 (与 _g1_mask 的 isfinite + m[:68]=False 同效)。

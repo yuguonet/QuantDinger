@@ -62,6 +62,9 @@ class ConfirmDecision:
     策略可返回 None 表示"无法判定"(快照缺失等), monitor 不做状态转移。
     d1_chg/d1_vol_r/detail 由策略按自身口径填写 (落库字段, 基准各策略不同:
     多数用 signal_price, relay3 用 entry_price)。
+
+    reason 是**策略内部语义串**(ok / g56_hold / sealed_hold / 一整句中文), 只作审计,
+    不是展示档位 —— 档位一律经 `confirm_level_of()` 归一, 勿直取 reason 当档位。
     """
     confirmed: bool
     reason: str = ""
@@ -69,6 +72,38 @@ class ConfirmDecision:
     d1_vol_r: float = None
     detail: dict = None
     exit_price: float = None   # confirmed=False 时可带参考卖出价 (relay3 未封板尾盘卖=最新价)
+
+
+# ================================================================
+# 预确认档位 (展示层口径, 与 ConfirmDecision.reason 解耦)
+# ================================================================
+
+#: 档位值域 —— 前端 pcMap 只认这三个 (strong='强' / ok='中' / weak='弱')
+CONFIRM_LEVELS = ("strong", "ok", "weak")
+
+
+def confirm_level_of(dec):
+    """把 ConfirmDecision 归一为展示档位 strong/ok/weak; None = 无法判定。
+
+    真值源单一:
+      confirmed            过没过 (硬判定, 决定状态机 watch_pending → holding/exit_today)
+      detail['confirm_strong']  强度位 (True 且已确认 → strong)
+      detail['level']      策略显式覆盖扩展点 (仅当取值在 CONFIRM_LEVELS 内才生效)
+    刻意**不读 reason** —— 旧实现 `dec.reason if dec.confirmed else "weak"` 把策略内部
+    语义串当档位写进 extra.pre_confirm (g56_hold / hold_to_D1_open / sealed_hold /
+    "D1日内动量<3%,D2开盘清仓"), 前端 pcMap 查不到 → 一律渲染成未知档 ☆, 既无法与真弱
+    确认区分, 又把内部 token 漏进明细弹窗。归一后: 未确认恒 weak, 已确认恒 ok (除非策略
+    用 confirm_strong / level 显式声明强档)。
+    """
+    if dec is None:
+        return None
+    d = dec.detail if isinstance(dec.detail, dict) else {}
+    lv = d.get("level")
+    if lv in CONFIRM_LEVELS:            # 显式覆盖 (非法值静默走兜底, 不抛)
+        return lv
+    if not dec.confirmed:
+        return "weak"
+    return "strong" if d.get("confirm_strong") else "ok"
 
 
 @dataclass
@@ -124,6 +159,32 @@ class StrategyBase:
         """返回 list[Signal]。as_of=None 与现状 *_today_d0_signals 语义一致;
         ctx 为 BacktestCtx 预计算缓存 (涨停表/指标序列), 策略优先从 ctx 取。"""
         raise NotImplementedError
+
+    # ---- 窗口内逐日信号 (重建/回测的统一批量契约) ----
+    def scan_days(self, bars, code, *, lo_date=None, hi_date=None, **params):
+        """返回 [lo_date, hi_date] 区间内**所有**命中日的 list[Signal]。
+
+        统一契约的意义: 编排层 (rebuild) 对所有策略一视同仁地调这一个方法, 不因某个
+        策略"内部贵"就给它单独开一条路径 —— 那会让编排层长出策略专属分支。
+
+        默认实现 = 逐日截断 + scan_signals (语义基准, 所有策略行为的定义)。
+        覆盖条件: 判定代价高到逐日枚举不可接受时 (全序列指标 / 横截面池), 策略可在
+        自己的模块里覆盖本方法做"一次预计算 + 逐日 O(1)", 但**必须保证与逐日调用
+        scan_signals 逐位一致** (g56 的做法与实证见 g56.scan_days)。
+
+        ⚠️ 只枚举 [lo_date, hi_date] 内的日期, 区间外的日期跳过 (不浪费判定)。
+        """
+        if not bars:
+            return []
+        out = []
+        for k in range(len(bars)):
+            d = str(bars[k]["time"])[:10]
+            if lo_date and d < lo_date:
+                continue
+            if hi_date and d > hi_date:
+                break                      # 日期升序, 可提前退出
+            out.extend(self.scan_signals(bars[:k + 1], code, **params))
+        return out
 
     # ---- 三决策 (入参 row = qd_dragon_signals 持仓行 dict; snap = 当日快照可选) ----
     # 2026-09-18 P1: entry/confirm/exit 均有智能默认实现 (见类尾), 按需覆盖;

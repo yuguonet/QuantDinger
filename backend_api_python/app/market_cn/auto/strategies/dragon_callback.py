@@ -23,6 +23,7 @@ from app.market_cn.auto.common.indicators import (
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )
 from app.market_cn.auto.common.market import find_limit_ups, get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -101,6 +102,123 @@ DRAGON_CB_PARAMS = dict(
     peak_exit_ret=4.0,
     peak_exit_upper=30.0,
 )
+
+
+# ================================================================
+# 判定原语 (2026-09-23 重构: 单实现 —— python 判定与 YAML 门表共用同一份代码)
+# ----------------------------------------------------------------
+# 背景: 门表化之前, 判定逻辑全部内联在 scan_signals 里; 若 YAML 再写一份等价表达式,
+#       就是双实现 (改一边忘另一边 = 静默漂移)。本段把每个"量"抽成 **bars 级纯函数**
+#       (无 self / 无状态 / 参数由调用方传入), scan_signals 与文件尾的门函数适配器
+#       (register_strategy_funcs) 都只调用它们 —— 规则只有一份事实源。
+# 重构纪律: 逐字搬移, 含 None 语义与边界条件一律不变 (改一行即可能改一笔交易)。
+# ================================================================
+
+
+def _lu_streak(bars, lu_idx, board_type) -> int:
+    """涨停日连板高度 (含涨停日本身, 向前连续涨停计数)。"""
+    streak_h = 1
+    j = lu_idx
+    while j > 0 and is_limit_up(bars[j]["close"], bars[j - 1]["close"], board_type):
+        streak_h += 1
+        j -= 1
+    return streak_h
+
+
+def _lu_gain20(bars, lu_idx):
+    """涨停日往前 20 日涨幅 %; lu_idx<20 或基价<=0 → None (数据不足, 判 False)。"""
+    if lu_idx < 20:
+        return None
+    lu_close = bars[lu_idx]["close"]
+    base = bars[lu_idx - 20]["close"]
+    return (lu_close / base - 1) * 100 if base > 0 else None
+
+
+def _dragon_found(bars, lu_idx, board_type, ratio, windows) -> bool:
+    """找龙: 任一滑动窗口内涨停占比 >= ratio 即成立 (窗口 start=max(1, lu-window),
+    窗口长度<3 跳过)。"""
+    for window in windows:
+        start = max(1, lu_idx - window)
+        total_days = lu_idx - start
+        if total_days < 3:
+            continue
+        lu_count = sum(1 for k in range(start, lu_idx)
+                       if k > 0 and is_limit_up(bars[k]["close"], bars[k - 1]["close"], board_type))
+        if lu_count / total_days >= ratio:
+            return True
+    return False
+
+
+def _pullback_depth(bars, lu_idx, i) -> float:
+    """回调期最深跌幅 % (区间最低 low 相对涨停收盘)。"""
+    lu_close = bars[lu_idx]["close"]
+    min_low = min(bars[j]["low"] for j in range(lu_idx + 1, i + 1))
+    return (min_low / lu_close - 1) * 100
+
+
+def _yin_ratio(bars, lu_idx, i) -> float:
+    """回调期阴线占比 (0~1); 区间为空 → 1.0。"""
+    pb_yin = sum(1 for j in range(lu_idx + 1, i + 1) if bars[j]["close"] < bars[j]["open"])
+    pb_total = i - lu_idx
+    return pb_yin / pb_total if pb_total > 0 else 1.0
+
+
+def _d0_vs_ma20(bars, i):
+    """D0 收盘相对 MA20 偏离 %; i<19 → None。"""
+    if i < 19:
+        return None
+    ma20 = sum(bars[j]["close"] for j in range(i - 19, i + 1)) / 20
+    return (bars[i]["close"] / ma20 - 1) * 100 if ma20 > 0 else None
+
+
+def _tech_block(closes, use_tech_score=True):
+    """技术面加分块 → (score, rsi_val, roc, psy)。
+
+    score/roc/psy 只进展示字段 (评分门槛已关闭, 实验结论无判别力); **rsi_val 参与判定**
+    (龙强度 ③ 与质量排除), 故 use_tech_score=False 时 rsi_val=None → 对应门放行不误杀。
+    """
+    score = 0
+    rsi_val = roc = psy = None
+    if not use_tech_score:
+        return score, rsi_val, roc, psy
+    dif, dea, hist = calc_macd(closes)
+    if hist is not None and len(hist) >= 2:
+        if is_macd_golden_cross(dif, dea, lookback=5):
+            score += 3
+        elif is_macd_hist_turning_positive(hist, lookback=5):
+            score += 2
+        elif is_macd_hist_shrinking_negative(hist, lookback=5):
+            score += 1
+        n_h = len(hist)
+        if n_h >= 2 and abs(dif[n_h - 1]) < abs(dea[n_h - 1]) * 0.5:
+            score += 1
+        if dif[n_h - 1] < dea[n_h - 1] and dif[n_h - 2] >= dea[n_h - 2]:
+            score -= 2
+    rsi_val = rsi(closes, period=6)
+    if rsi_val is not None:
+        if rsi_val < 30:
+            score += 2
+        elif rsi_val < 40:
+            score += 1
+        elif rsi_val < 60:
+            score -= 1
+        else:
+            score -= 2
+    roc = calc_roc(closes, period=5)
+    if roc is not None:
+        if -10 <= roc < 0 or 0 <= roc < 5:
+            score += 1
+        elif roc < -15 or roc >= 5:
+            score -= 1
+    psy = calc_psy(closes, period=10)
+    if psy is not None:
+        if psy < 30:
+            score += 2
+        elif psy < 40:
+            score += 1
+        elif psy >= 50:
+            score -= 1
+    return score, rsi_val, roc, psy
 
 
 # ================================================================
@@ -452,46 +570,8 @@ class DragonCallbackStrategy(StrategyBase):
         closes = [bars[j]["close"] for j in range(i + 1)]
 
         # ── tech_score 加分制 (仅参考输出; RSI 值供质量排除使用) ──
-        score = 0
-        rsi_val = roc = psy = None
-        if use_tech_score:
-            dif, dea, hist = calc_macd(closes)
-            if hist is not None and len(hist) >= 2:
-                if is_macd_golden_cross(dif, dea, lookback=5):
-                    score += 3
-                elif is_macd_hist_turning_positive(hist, lookback=5):
-                    score += 2
-                elif is_macd_hist_shrinking_negative(hist, lookback=5):
-                    score += 1
-                n_h = len(hist)
-                if n_h >= 2 and abs(dif[n_h - 1]) < abs(dea[n_h - 1]) * 0.5:
-                    score += 1
-                if dif[n_h - 1] < dea[n_h - 1] and dif[n_h - 2] >= dea[n_h - 2]:
-                    score -= 2
-            rsi_val = rsi(closes, period=6)
-            if rsi_val is not None:
-                if rsi_val < 30:
-                    score += 2
-                elif rsi_val < 40:
-                    score += 1
-                elif rsi_val < 60:
-                    score -= 1
-                else:
-                    score -= 2
-            roc = calc_roc(closes, period=5)
-            if roc is not None:
-                if -10 <= roc < 0 or 0 <= roc < 5:
-                    score += 1
-                elif roc < -15 or roc >= 5:
-                    score -= 1
-            psy = calc_psy(closes, period=10)
-            if psy is not None:
-                if psy < 30:
-                    score += 2
-                elif psy < 40:
-                    score += 1
-                elif psy >= 50:
-                    score -= 1
+        # 2026-09-23: 逐字搬入 _tech_block (与 YAML signal.fields 共用同一实现)
+        score, rsi_val, roc, psy = _tech_block(closes, use_tech_score)
 
         # ── 方案2 主判定 ──
         for lu_idx in (limit_ups if limit_ups is not None else find_limit_ups(bars[:i], board_type)):
@@ -508,16 +588,9 @@ class DragonCallbackStrategy(StrategyBase):
 
             # ── 龙强度度量 (①连板高度 ②前期热度; 全部只用<=D0收盘数据, as-of 安全) ──
             # 置于 Step1 之前: 各判定门与探针 trace 共用 (纯计算, 判定行为不变)
-            streak_h = 1
-            _j = lu_idx
-            while _j > 0 and is_limit_up(bars[_j]["close"], bars[_j - 1]["close"], board_type):
-                streak_h += 1
-                _j -= 1
-            if lu_idx >= 20:
-                _base = bars[lu_idx - 20]["close"]
-                lu_gain20 = (lu_close / _base - 1) * 100 if _base > 0 else None
-            else:
-                lu_gain20 = None
+            # 2026-09-23: 逐字搬入 _lu_streak / _lu_gain20 (与 YAML 门表共用同一实现)
+            streak_h = _lu_streak(bars, lu_idx, board_type)
+            lu_gain20 = _lu_gain20(bars, lu_idx)
 
             # 探针 shim (TRACE 宏语义): probe=None 时 _tr=None, 判定内零开销
             if probe is not None:
@@ -531,17 +604,9 @@ class DragonCallbackStrategy(StrategyBase):
                 _tr = None
 
             # ── Step1: 找龙 — 滑动窗口内涨停占比>=70% ──
-            dragon_found = False
-            for window in p["dragon_windows"]:
-                start = max(1, lu_idx - window)
-                total_days = lu_idx - start
-                if total_days < 3:
-                    continue
-                lu_count = sum(1 for k in range(start, lu_idx)
-                               if k > 0 and is_limit_up(bars[k]["close"], bars[k - 1]["close"], board_type))
-                if lu_count / total_days >= p["dragon_ratio"]:
-                    dragon_found = True
-                    break
+            # 2026-09-23: 逐字搬入 _dragon_found (与 YAML 门表共用同一实现)
+            dragon_found = _dragon_found(bars, lu_idx, board_type,
+                                         p["dragon_ratio"], p["dragon_windows"])
             if not dragon_found:
                 if _tr:
                     _tr("dragon")
@@ -569,18 +634,10 @@ class DragonCallbackStrategy(StrategyBase):
                 continue
 
             # ── 回调期特征 ──
-            if i >= 19:
-                ma20 = sum(bars[j]["close"] for j in range(i - 19, i + 1)) / 20
-                d0_vs_ma20 = (d0["close"] / ma20 - 1) * 100 if ma20 > 0 else None
-            else:
-                d0_vs_ma20 = None
-
-            min_low = min(bars[j]["low"] for j in range(lu_idx + 1, i + 1))
-            pullback_depth = (min_low / lu_close - 1) * 100
-
-            pb_yin = sum(1 for j in range(lu_idx + 1, i + 1) if bars[j]["close"] < bars[j]["open"])
-            pb_total = i - lu_idx
-            yin_ratio = pb_yin / pb_total if pb_total > 0 else 1.0
+            # 2026-09-23: 逐字搬入 _d0_vs_ma20 / _pullback_depth / _yin_ratio
+            d0_vs_ma20 = _d0_vs_ma20(bars, i)
+            pullback_depth = _pullback_depth(bars, lu_idx, i)
+            yin_ratio = _yin_ratio(bars, lu_idx, i)
 
             # ── 拐点过滤 (或关系) ──
             cond_ma20 = d0_vs_ma20 is not None and p["ma20_lo"] <= d0_vs_ma20 < p["ma20_hi"]
@@ -843,3 +900,133 @@ def _find_bar_idx(bars, date_str):
         if b["time"] == date_str:
             return i
     return None
+
+
+# ================================================================
+# YAML 门表适配器 (2026-09-23 门表化: 门表达式只调用本段函数)
+# ----------------------------------------------------------------
+# 纪律 (策略自包含): 策略私有门函数**只挂在本策略 key 命名空间**, 不进 core
+# (core 只留 Ctx 24 行情原语 + 注册机制, 见 MEMORY 自包含纪律)。本段每个函数都是
+# 上方"判定原语"的 Ctx 适配, **不含任何新逻辑** —— 门表与 python 判定共用同一份
+# 实现, 杜绝"改 python 忘改 yaml"的双实现漂移。
+#
+# None 语义 (改这里等于改交易):
+#   python 版对"数据不足"的处理分两种 ——
+#     · rsi6 / ma20_dev: 数据不足时**放行** (不误杀) → 门函数返回放行值
+#       (rsi6 → 100.0 恒过下界; ma20_dev → 0.0, 落在已关闭的 ma20 区间外);
+#     · lu_gain20: 数据不足时**判 False** (continue) → 返回 -9999.0。
+#   展示字段另用 *_val 变体透传 None (与 _LEGACY_FIELDS 逐字对齐)。
+# ================================================================
+
+
+def _ctx_closes(ctx: Ctx):
+    """决策日因果切片 closes[:i+1] (与 scan_signals 的 closes 同口径)。"""
+    return [ctx.bars[j]["close"] for j in range(ctx.i + 1)]
+
+
+def dc_gap_days(ctx: Ctx) -> int:
+    """回调天数 = i - lu_idx (python 版 gap_from_peak / pullback_days 同值)。
+
+    与内核 Ctx.pullback_days() 差 1 (内核 = (i-1)-lu_idx): 门表统一用本函数, 勿混用。
+    """
+    return ctx.i - ctx.lu_idx
+
+
+def dc_dragon(ctx: Ctx) -> bool:
+    """找龙: 任一滑动窗口内涨停占比 >= dragon_ratio。"""
+    p = ctx.params
+    return _dragon_found(ctx.bars, ctx.lu_idx, ctx.board_type,
+                         p.get("dragon_ratio", DRAGON_CB_PARAMS["dragon_ratio"]),
+                         p.get("dragon_windows", DRAGON_CB_PARAMS["dragon_windows"]))
+
+
+def dc_streak(ctx: Ctx) -> int:
+    """涨停日连板高度 (>=1)。"""
+    return _lu_streak(ctx.bars, ctx.lu_idx, ctx.board_type)
+
+
+def dc_lu_gain20(ctx: Ctx) -> float:
+    """涨停日 20 日涨幅 %; 数据不足 → -9999 (判 False, 与 python continue 同)。"""
+    v = _lu_gain20(ctx.bars, ctx.lu_idx)
+    return v if v is not None else -9999.0
+
+
+def dc_lu_gain20_val(ctx: Ctx):
+    """展示字段版 (None 透传, 对齐 _LEGACY_FIELDS.lu_gain20)。"""
+    return _lu_gain20(ctx.bars, ctx.lu_idx)
+
+
+def dc_depth(ctx: Ctx) -> float:
+    """回调期最深跌幅 % (负)。"""
+    return _pullback_depth(ctx.bars, ctx.lu_idx, ctx.i)
+
+
+def dc_yin(ctx: Ctx) -> float:
+    """回调期阴线占比 0~1。"""
+    return _yin_ratio(ctx.bars, ctx.lu_idx, ctx.i)
+
+
+def dc_ma20_dev(ctx: Ctx) -> float:
+    """D0 收盘相对 MA20 偏离 %; 数据不足 → 0.0 (放行)。"""
+    v = _d0_vs_ma20(ctx.bars, ctx.i)
+    return v if v is not None else 0.0
+
+
+def dc_ma20_dev_val(ctx: Ctx):
+    """展示字段版 (None 透传)。"""
+    return _d0_vs_ma20(ctx.bars, ctx.i)
+
+
+def dc_rsi6(ctx: Ctx) -> float:
+    """D0 RSI6 (与 scan_signals 同一 common.indicators.rsi, 非内核 Ctx.rsi —— 算法不同)。
+
+    数据不足 → 100.0 (放行, 与 python 版 rsi_val=None 时跳过该门同语义)。
+    """
+    v = rsi(_ctx_closes(ctx), period=6)
+    return v if v is not None else 100.0
+
+
+def dc_tech_score(ctx: Ctx) -> int:
+    """技术面加分 (仅展示, 不参与过滤)。"""
+    return _tech_block(_ctx_closes(ctx))[0]
+
+
+def dc_tech_rsi(ctx: Ctx):
+    v = rsi(_ctx_closes(ctx), period=6)
+    return round(v, 1) if v else None
+
+
+def dc_tech_roc(ctx: Ctx):
+    v = calc_roc(_ctx_closes(ctx), period=5)
+    return round(v, 1) if v else None
+
+
+def dc_tech_psy(ctx: Ctx):
+    v = calc_psy(_ctx_closes(ctx), period=10)
+    return round(v, 1) if v else None
+
+
+register_strategy_funcs(
+    "dragon_callback",
+    {
+        "gap_days": dc_gap_days,
+        "dragon": dc_dragon,
+        "streak": dc_streak,
+        "lu_gain20": dc_lu_gain20,
+        "lu_gain20_val": dc_lu_gain20_val,
+        "depth": dc_depth,
+        "yin": dc_yin,
+        "ma20_dev": dc_ma20_dev,
+        "ma20_dev_val": dc_ma20_dev_val,
+        "rsi6": dc_rsi6,
+        "tech_score": dc_tech_score,
+        "tech_rsi": dc_tech_rsi,
+        "tech_roc": dc_tech_roc,
+        "tech_psy": dc_tech_psy,
+    },
+    offset=set(),
+    # 决策日依赖 (展示端 T-1 夜预计算依据): 只读涨停日及之前 → 0; 读到 D0(i) → 1
+    d0={"dragon": 0, "streak": 0, "lu_gain20": 0, "lu_gain20_val": 0,
+        "gap_days": 1, "depth": 1, "yin": 1, "ma20_dev": 1, "ma20_dev_val": 1,
+        "rsi6": 1, "tech_score": 1, "tech_rsi": 1, "tech_roc": 1, "tech_psy": 1},
+)

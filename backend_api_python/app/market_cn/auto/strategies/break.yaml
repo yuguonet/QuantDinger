@@ -23,7 +23,7 @@ exit:
   mode: break_combo            # 收盘价口径 combo (止损/追踪(需 ret>0)/峰值逃顶/到期) — 分板块阈值
   stop_loss: {main: -8.0, gem_star: -10.0}
   trailing_stop: {main: -6.0, gem_star: -8.0}
-  hold_days: {main: 20, gem_star: 15}
+  hold_days: {main: 7, gem_star: 7}   # 20/15→7: 2026-09-22 出场研究定稿(时间上限先行)
 
 params:                        # 与 break_buy.BOARD_PARAMS / DEFAULT_PARAMS 同值 (逐笔等价基线)
   min_streak: 2                # 连板下限 (DEFAULT_PARAMS)
@@ -44,7 +44,7 @@ params:                        # 与 break_buy.BOARD_PARAMS / DEFAULT_PARAMS 同
   # ---- 出场阈值 (BOARD_PARAMS; 由 exit.mode=break_combo 的分板块解析读取) ----
   stop_loss: {main: -8.0, gem_star: -10.0}
   trailing_stop: {main: -6.0, gem_star: -8.0}
-  hold_days: {main: 20, gem_star: 15}
+  hold_days: {main: 7, gem_star: 7}   # 20/15→7: 2026-09-22 出场研究定稿(时间上限先行)
 
 # 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门
 # needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)

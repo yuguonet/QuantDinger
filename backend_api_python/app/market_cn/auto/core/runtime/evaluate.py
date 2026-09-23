@@ -36,7 +36,11 @@ from app.market_cn.auto.core.runtime.functions import (
     Ctx, OFFSET_FUNCS, build_funcs, offset_funcs, ensure_gate_init,
 )
 ensure_gate_init()  # 副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数 (autodiscover)
-from app.market_cn.auto.strategies.break_buy import bk_struct, break_features
+# break 是 Python 关键字 → 静态 import 语法错误, 走动态导入 (2026-09-23 更名)。
+from importlib import import_module as _import_module
+_break_mod = _import_module("app.market_cn.auto.strategies.break")
+bk_struct = _break_mod.bk_struct
+break_features = _break_mod.break_features
 from app.market_cn.auto.strategies.relay3 import relay3_features
 
 from app.market_cn.auto.core._paths import STRATEGY_DIR as _STRATEGY_DIR

@@ -51,9 +51,10 @@
     },
     "relay3": {
       "label": "3板接力",
-      "enabled": true,
+      "enabled": false,
       "daily_limit": 2,
-      "winrate": 53.4
+      "winrate": 53.4,
+      "_disabled_note": "2026-09-23 用户裁定停用: 入场逻辑缺陷(3板次日追入无法成交/期望为0), 待重构为2进3/3进4接力后重评"
     },
     "knife_catch": {
       "label": "反向接刀",

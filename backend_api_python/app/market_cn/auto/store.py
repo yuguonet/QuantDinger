@@ -36,6 +36,7 @@ from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 
     S_EXIT_TODAY,
     S_HOLDING,
     S_WATCH_PENDING,
+    enabled_keys,
     state_label,
     strategy_winrate,
     strategy_keys,
@@ -306,6 +307,33 @@ def set_state(sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol
         cur.close()
 
 
+def purge_stale_detail(keys, keep_state, keep_entry_date):
+    """清除 extra 中过期的"瞬时标记"键, 保留 state=keep_state 且 entry_date=keep_entry_date 的行。
+
+    背景: extra 的写入是增量合并 (`extra = extra || %s`, 见 _set_state), **只能加不能减**。
+    像 pre_confirm/pre_ts 这类只在"当日买入窗口"有意义的标记 —— 设计口径见
+    docs/龙回头自动化设计方案.md:92/154 (14:25 加"预"角标 → 15:00 正式确认覆盖) ——
+    超过窗口若不显式删除, 标记会永久残留: 显示层会把它当"当前预判", 持仓行被渲染成"预持"。
+
+    幂等: 时机/次数无关, 已清理过的行不再匹配; 亦可用于自愈历史脏数据。
+    返回受影响行数。
+    """
+    if not keys:
+        return 0
+    from app.utils.db import get_db_connection
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"UPDATE {_SIGNALS_TABLE} SET extra = extra - %s::text[] "
+            "WHERE jsonb_exists_any(extra, %s::text[]) "
+            "AND (state IS DISTINCT FROM %s OR entry_date IS DISTINCT FROM %s::date)",
+            (list(keys), list(keys), keep_state, keep_entry_date))
+        n = cur.rowcount
+        db.commit()
+        cur.close()
+    return n
+
+
 def update_stop_price(sig_id, stop_price):
     """补记止损价 (buy_today 时按 board 规则计算)。"""
     from app.utils.db import get_db_connection
@@ -334,8 +362,16 @@ def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, 
     cur.execute(f"UPDATE {_SIGNALS_TABLE} SET {', '.join(sets)} WHERE id = %s", vals)
 
 
-def list_signals(states=None, trade_date=None, days=20, only_active=False, strategies=None):
+def list_signals(states=None, trade_date=None, days=20, only_active=False,
+                 strategies=None, enabled_only=False):
     """查询信号 (signals 表)。states: 状态过滤; trade_date: 指定信号日; days: 最近N日。
+
+    Args:
+        enabled_only: True=只显示 enabled=true 策略的行 (展示层用)。
+            ★ 但**停用策略的已入场行 (entry_date 非空) 仍保留可见** —— 否则用户
+            会遗忘手上还有票要卖, 是实盘资金事故 (见 startup.py 模块 docstring 硬约束)。
+            即: 停用 = 不再提示新买入, 但不隐藏已有持仓/卖出提示。
+            ⚠ monitor 推进状态机**不能**带此过滤 (它要接着推进已入场行), 故默认 False。
 
     Returns:
         list[dict]: 信号行（含 trade_date/strategy/code/name/state/score 及 entry/exit 系列字段）。
@@ -357,6 +393,9 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False, strat
         if only_active:
             sql += " AND state = ANY(%s)"
             vals.append(list(ACTIVE_GROUP_STATES))
+        if enabled_only:
+            sql += " AND (strategy = ANY(%s) OR entry_date IS NOT NULL)"
+            vals.append(list(enabled_keys()))
         sql += " ORDER BY trade_date DESC, score DESC"
         cur.execute(sql, vals)
         rows = [_row_to_dict(r) for r in cur.fetchall()]
@@ -370,16 +409,19 @@ def get_active_signals():
     Returns:
         list[dict]: 同 list_signals；仅 买入/持仓/卖出 活跃状态、最近 30 日。
     """
-    return list_signals(states=ACTIVE_GROUP_STATES, days=30)
+    return list_signals(states=ACTIVE_GROUP_STATES, days=30, enabled_only=True)
 
 
 def get_watch_pending(trade_date=None, days=5):
-    """观察池 (watch_pending)。
+    """观察池 (watch_pending) —— 只含 enabled=true 策略。
+
+    观察池是"待买入候选", 停用策略不该再提名新股; 其未入场行也不显示。
 
     Returns:
         list[dict]: 同 list_signals；仅观察池(watch_pending)状态。
     """
-    return list_signals(states=(S_WATCH_PENDING,), trade_date=trade_date, days=days)
+    return list_signals(states=(S_WATCH_PENDING,), trade_date=trade_date, days=days,
+                        enabled_only=True)
 
 
 def get_signal_by_code(code, trade_date=None):
@@ -564,10 +606,20 @@ def sync_watchlist_group(active_rows):
     return {"target": len(target), "inserted": inserted, "updated": updated, "deleted": deleted}
 
 
+def cleanup_cutoff(days=15):
+    """cleanup_old 的物理删除边界 (YYYY-MM-DD)。
+
+    ⚠ 是**日历日**且带 1.6 放大系数 (交易日→日历日): days=15 ⇒ 边界为 24 个日历日前。
+    rebuild 用它区分「真漏发」(边界内该有却没有) 与「已被清理」(边界外, 补了也会被再删)。
+    单一事实源在此, 禁止各处重写公式。
+    """
+    return (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
+
+
 def cleanup_old(days=15):
     """历史清理: signals 表保留最近约 N 个交易日 (holding 保留至自然终态)。三策略统一清理。"""
     from app.utils.db import get_db_connection
-    cutoff = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
+    cutoff = cleanup_cutoff(days)
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(

@@ -1,4 +1,4 @@
-"""strategies/break_buy.py — 断板接力策略 (StrategyBase 插件实现, Phase 2 迁移)
+"""strategies/break.py — 断板接力策略 (StrategyBase 插件实现, Phase 2 迁移)
 
 实现已迁移至本文件; core.break_today_d0_signals / _break_signal_at 为 facade 转发。
 
@@ -35,12 +35,14 @@ STRATEGY_LABEL = "断板"
 
 # 板块参数 (策略专用出场参数, 唯一定义在本文件; backtest.py 旧份已删, 2026-09-10 晚下沉; config.json params 可覆盖其键)
 BOARD_PARAMS = {
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 20,
+    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 7,  # 20→7: 2026-09-22 出场研究定稿(时间上限先行)
+             "exit_mode": "sweet", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,  # E3: 甜点区出场; 核心/高板通道阈值100(让利润跑)
              "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
              "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
              "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
              "first_break_gap_min": 0, "first_break_chg_min": 0.0},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 15,
+    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 7,  # 15→7: 同上
+                 "exit_mode": "sweet", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,
                  "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
                  "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
                  "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
@@ -170,6 +172,52 @@ def _ma_bull_at(bars, idx):
     return ma5 > ma10 > ma20
 
 
+def _entry_gate(bars, i, streak_len):
+    """入场通道标签 (2026-09-22 归一四通道研究, 见 tmp/break_plan_A.json)。
+
+    全部用确认日 D0=i 收盘可知数据, 无前视。只标注不过滤 — 展示层用于
+    区分历史胜率 (核心 89% / 高板 83% / 温和 80% / 强势 53%)。
+
+    Returns: (gate:str, pctb:float|None, bd:int)
+      gate ∈ {"核心", "高板", "温和", "强势", "观察"}
+    """
+    closes = [float(b["close"]) for b in bars]
+    highs = [float(b["high"]) for b in bars]
+    lows = [float(b["low"]) for b in bars]
+    # %B (BOLL 20,2)
+    if i < 19:
+        return "观察", None, None
+    w = closes[i - 19:i + 1]
+    m = sum(w) / 20.0
+    sd = (sum((x - m) ** 2 for x in w) / 20.0) ** 0.5
+    u, l = m + 2 * sd, m - 2 * sd
+    pctb = (closes[i] - l) / (u - l) * 100 if u > l else 50.0
+    # 调整天数: D0 前最后一个涨停日 → D0
+    bt = get_board_type(bars[i].get("code", "") if isinstance(bars[i], dict) and bars[i].get("code") else "")
+    j, steps, streak_end = i - 1, 0, None
+    while j >= 1 and steps <= 5:
+        prev = float(bars[j - 1]["close"]) if j >= 1 else 0
+        cur = float(bars[j]["close"])
+        lim = 0.098 if (bt or "main") == "main" else 0.198
+        if prev > 0 and cur / prev - 1 >= lim * 0.98:
+            streak_end = j
+            break
+        j -= 1; steps += 1
+    if streak_end is None:
+        return "观察", round(pctb, 1), None
+    bd = i - streak_end
+    # 通道判定 (优先级: 核心 > 高板 > 温和 > 强势)
+    if 2 <= bd <= 3 and pctb >= 90:
+        return "核心", round(pctb, 1), bd
+    if streak_len >= 4 and (pctb >= 100 or bd >= 3):
+        return "高板", round(pctb, 1), bd
+    if bd == 1 and pctb < 80:
+        return "温和", round(pctb, 1), bd
+    if bd == 1 and pctb >= 95:
+        return "强势", round(pctb, 1), bd
+    return "观察", round(pctb, 1), bd
+
+
 def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
     """Signal → 旧 break_today_d0_signals 的 dict 形态 (facade 兼容层)。
 
@@ -196,6 +244,9 @@ def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
         "confirm_gap": ex.get("confirm_gap"),
         "pre20_gain": ex.get("pre20_gain"),
         "ma_bull": ex.get("ma_bull"),
+        "entry_gate": ex.get("entry_gate"),
+        "entry_pctb": ex.get("entry_pctb"),
+        "entry_bd": ex.get("entry_bd"),
         "turnover_anchor": ex.get("turnover_anchor"),
         "turnover_sig": ex.get("turnover_sig"),
         "turnover_anchor_total": ex.get("turnover_anchor_total"),
@@ -281,7 +332,11 @@ class BreakStrategy(StrategyBase):
                     continue
             total = float((params.get("stock_info") or {}).get("total_shares") or 0)
             extra = dict(sig)
+            _gate, _gpctb, _gbd = _entry_gate(bars, i, sig.get("streak_len") or 0)
             extra.update({
+                "entry_gate": _gate,
+                "entry_pctb": _gpctb,
+                "entry_bd": _gbd,
                 "turnover_anchor": round(float(bars[streak_end]["volume"]) / circ * 100, 2) if circ > 0 else None,
                 "turnover_sig": round(float(bars[i]["volume"]) / circ * 100, 2) if circ > 0 else None,
                 "turnover_anchor_total": round(float(bars[streak_end]["volume"]) / total * 100, 2) if total > 0 else None,
@@ -401,8 +456,14 @@ class BreakStrategy(StrategyBase):
                 pass
         fill_mode = fill_mode or "close"
         params = dict(BOARD_PARAMS[bt_type])
+        # config/default_params 覆盖链: 实例 default_params / config params 中与 BOARD_PARAMS 同键的项生效
+        _mp = self.merged_params(None)
+        params.update({k: v for k, v in _mp.items() if k in params})
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
         hold_days = params["hold_days"]
+        exit_mode = str(params.get("exit_mode") or "sweet")
+        sweet_pctb = float(params.get("sweet_pctb") or 95.0)
+        sweet_pctb_core = float(params.get("sweet_pctb_core") or 100.0)
         n = len(bars)
         if n < 6:
             return []
@@ -456,7 +517,11 @@ class BreakStrategy(StrategyBase):
             if entry_price <= 0:
                 continue
             result = _run_backtest_breakbuy(bars, i + 1, entry_price, hold_days,
-                                           stop_loss, trailing_stop, bt_type, fill_mode)
+                                           stop_loss, trailing_stop, bt_type, fill_mode,
+                                           exit_mode=exit_mode,
+                                           entry_gate=sig.get("entry_gate"),
+                                           sweet_pctb=sweet_pctb,
+                                           sweet_pctb_core=sweet_pctb_core)
             if not result:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
@@ -521,9 +586,61 @@ from app.market_cn.auto.core.exec import (
 )
 
 
+def _rsi6_series(bars):
+    """RSI6 (TDX SMA递推) 全序列; 前6根为 None (与 2026-09-22 出场研究脚本逐位一致)"""
+    n = len(bars)
+    closes = [float(b["close"]) for b in bars]
+    out = [None] * n
+    ag = al = 0.0
+    for i in range(1, n):
+        ch = closes[i] - closes[i - 1]
+        g, l = max(ch, 0.0), max(-ch, 0.0)
+        if i <= 6:
+            ag += g; al += l
+            if i == 6:
+                ag /= 6; al /= 6
+                out[i] = 100.0 if al == 0 else 100.0 - 100.0 / (1 + ag / al)
+        else:
+            ag = (ag * 5 + g) / 6
+            al = (al * 5 + l) / 6
+            out[i] = 100.0 if al == 0 else 100.0 - 100.0 / (1 + ag / al)
+    return out
+
+
+def _boll_pctb_series(bars):
+    """BOLL(20,2) %B 全序列; 前19根为 None"""
+    n = len(bars)
+    closes = [float(b["close"]) for b in bars]
+    out = [None] * n
+    for i in range(19, n):
+        w = closes[i - 19:i + 1]
+        m = sum(w) / 20.0
+        sd = (sum((x - m) ** 2 for x in w) / 20.0) ** 0.5
+        u, l = m + 2 * sd, m - 2 * sd
+        out[i] = (closes[i] - l) / (u - l) * 100 if u > l else 50.0
+    return out
+
+
+_RSI6_CACHE = {}
+_PCTB_CACHE = {}
+
+
+def _exit_series(bars):
+    """RSI6/%B 序列 (按 bars id 缓存; 同 bars 多笔交易零重复计算)"""
+    key = id(bars)
+    if key not in _RSI6_CACHE:
+        if len(_RSI6_CACHE) > 64:
+            _RSI6_CACHE.clear()
+            _PCTB_CACHE.clear()
+        _RSI6_CACHE[key] = _rsi6_series(bars)
+        _PCTB_CACHE[key] = _boll_pctb_series(bars)
+    return _RSI6_CACHE[key], _PCTB_CACHE[key]
+
+
 def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
                           trailing_stop=-6.0, board_type="main", fill_mode="close",
-                          minute_by_date=None):
+                          minute_by_date=None, exit_mode="sweet", entry_gate=None,
+                          sweet_pctb=95.0, sweet_pctb_core=100.0):
     """断板专用回测: 追踪止损 + 峰值逃顶信号。
 
     现实化 (2026-09-09, 与 test_dragon.py 逐字同步):
@@ -551,6 +668,10 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
     fill_mode = str(fill_mode or "close")
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
+    _last_rule = "time"
+    _sweet_on = (exit_mode == "sweet")
+    if _sweet_on:
+        Rs, Ps = _exit_series(bars)
     peak = entry_price
     exit_p = entry_price
     exit_d = 0
@@ -592,6 +713,14 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
 
         ret = (b['close'] / entry_price - 1) * 100
         ret_from_high = (b['close'] / peak - 1) * 100 if peak > 0 else 0
+        # 甜点区出场 (E3, 2026-09-22 消融最优): d≥2 且 RSI6∈[80,92] 且 %B≥阈值
+        # 通道差异: 核心/高板 → %B≥100 (让利润跑); 温和/强势 → %B≥95 (尽快落袋)
+        _in_sweet = False
+        if _sweet_on and d >= 2:
+            r6, pb = Rs[idx], Ps[idx]
+            if r6 is not None and pb is not None:
+                _thr = sweet_pctb_core if (entry_gate or "") in ("核心", "高板") else sweet_pctb
+                _in_sweet = 80.0 <= r6 <= 92.0 and pb >= _thr
 
         # T+1: 买入当日(d=1)不可卖出, 仅记录估值
         if d > 1:
@@ -619,6 +748,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
                     if _fill is not None:
                         if _filled:
                             exit_p, exit_d = _fill, d
+                            _last_rule = "stop"
                             break
                         pending_dn = True       # 成交价贴跌停 → 卖不出
                         continue
@@ -629,33 +759,48 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
                         pending_dn = True   # 收盘封死跌停 → 卖不出
                         continue
                     exit_p, exit_d = b['close'], d
+                    _last_rule = "stop"
                     break
 
-                # 追踪止损 (盈利时)
-                if fill_mode == "intraday":
+                # 甜点区出场 (E3): 收盘判定 → 收盘价成交
+                if _in_sweet:
+                    if dn is not None and b['close'] <= dn * 1.002:
+                        pending_dn = True
+                        continue
+                    exit_p, exit_d = b['close'], d
+                    _last_rule = "sweet"
+                    break
+
+                # 追踪止损 (盈利时) — T3 定稿 (2026-09-22): sweet 模式下保留, 作为浮亏单深跌防线
+                # legacy 模式额外支持盘中成交 (fill_mode=intraday)
+                if fill_mode == "intraday" and exit_mode != "sweet":
                     # 盘中: 用开盘时已知的 peak_prev 线; 成交价须高于成本 (镜像 ret>0 门)
                     line_prev = peak_prev * (1 + trailing_stop / 100.0)
                     _fill, _filled = fill_intraday(b, line_prev, side="sell", dn=dn)
                     if _filled and _fill > entry_price:
                         exit_p, exit_d = _fill, d
+                        _last_rule = "trail"
                         break
                 # 追踪止损 (收盘判定 → 收盘价成交)
-                elif ret_from_high <= trailing_stop and ret > 0:
+                if ret_from_high <= trailing_stop and ret > 0:
                     if dn is not None and b['close'] <= dn * 1.002:
                         pending_dn = True
                         continue
                     exit_p, exit_d = b['close'], d
+                    _last_rule = "trail"
                     break
 
-            # 峰值信号: 涨>10%后大上影线(>40%)→收盘逃顶 (收盘>+10%不可能贴跌停)
-            if ret > 10:
-                bar_range = b['high'] - b['low']
-                upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
-                if upper > 40 and b['close'] < b['high'] * 0.98:
-                    exit_p, exit_d = b['close'], d
-                    break
+                # 峰值逃顶 [仅 legacy 模式]
+                if exit_mode != "sweet" and ret > 10:
+                    bar_range = b['high'] - b['low']
+                    upper = (b['high'] - max(b['open'], b['close'])) / bar_range * 100 if bar_range > 0 else 0
+                    if upper > 40 and b['close'] < b['high'] * 0.98:
+                        exit_p, exit_d = b['close'], d
+                        _last_rule = "escape"
+                        break
 
         exit_p = b['close']; exit_d = d
+        _last_rule = "time"
 
     # 末日落入无法卖出状态 → 顺延下一可交易日开盘强平 (连续一字逐日跳过)
     if last_unfilled or pending_dn:
@@ -673,6 +818,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
 
     return {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,
+        'exit_rule': _last_rule,
         'return_pct': round((exit_p / entry_price - 1) * 100, 2),
         'peak_return_pct': round((peak / entry_price - 1) * 100, 2),
     }
@@ -682,7 +828,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
 # 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
 # ================================================================
 def _bk_ma_bull_at(bars, idx: int):
-    """确认日均线多头排列 MA5>MA10>MA20（镜像 break_buy._ma_bull_at）。不足 20 日 → None。"""
+    """确认日均线多头排列 MA5>MA10>MA20（镜像 break._ma_bull_at）。不足 20 日 → None。"""
     if idx + 1 < 20:
         return None
     c = [Ctx._f(bars[j], "close") for j in range(idx - 19, idx + 1)]
@@ -694,7 +840,7 @@ def _bk_ma_bull_at(bars, idx: int):
 
 def _bk_raw(bars, bt: str, streak_start: int, streak_end: int,
             min_streak: int, max_break_gap: int, asof: int, market=None):
-    """断板期『原始结构』—— 镜像 break_buy._break_signal_at 的**结构部分**（不含 5a~5g 判定）。
+    """断板期『原始结构』—— 镜像 break._break_signal_at 的**结构部分**（不含 5a~5g 判定）。
 
     返回 None = 结构不成立（连板不足 / 断板期为空 / 越界）。判定（缩量/涨跌/回撤/增强/
     均线）由门表完成；本函数只产出结构量，使门表与参考版逐笔等价且逐门可解释。
@@ -755,7 +901,7 @@ def _bk_raw(bars, bt: str, streak_start: int, streak_end: int,
 
 
 def _bk_compute(ctx: Ctx):
-    """决策日 i 的断板期候选结构（镜像 break_buy.scan_signals 的 lu_idx 搜索 + 对齐）。
+    """决策日 i 的断板期候选结构（镜像 break.scan_signals 的 lu_idx 搜索 + 对齐）。
 
     候选唯一：streak_end = i 之前**最后一个涨停日**（若距 i 超过 max_break_gap 则断板期过长
     → 无候选）；streak_start = 该连板首板（须 is_first：其前 10 日内无涨停）；断板期
@@ -794,7 +940,7 @@ def _bk_compute(ctx: Ctx):
     while streak_start - 2 >= 0 and is_limit_up(
             Ctx._f(bars[streak_start - 1], "close"), Ctx._f(bars[streak_start - 2], "close"), bt, mk):
         streak_start -= 1
-    # is_first：首板前 10 日内不得有涨停（镜像 break_buy.scan_signals）
+    # is_first：首板前 10 日内不得有涨停（镜像 break.scan_signals）
     for k in range(1, min(11, streak_start + 1)):
         idx = streak_start - k
         if idx - 1 >= 0 and is_limit_up(Ctx._f(bars[idx], "close"),
@@ -855,7 +1001,7 @@ def pk(ctx: Ctx, name: str):
 
 
 def turnover_sig(ctx: Ctx) -> float:
-    """确认日换手率%(= D0成交量/流通股本*100; 镜像 break_buy 的 turnover_sig 口径)。
+    """确认日换手率%(= D0成交量/流通股本*100; 镜像 break 的 turnover_sig 口径)。
 
     流通股本缺失 (circ<=0) → 返回极大值 = 该门 fail-open 放行（参考版 circ<=0 时跳过该门）。
     """
@@ -866,7 +1012,7 @@ def turnover_sig(ctx: Ctx) -> float:
 
 
 def break_features(ctx: Ctx, stock_info=None) -> dict:
-    """break 信号展示字段（逐字镜像 break_buy._signal_to_legacy_dict + scan_signals 的 extra）。
+    """break 信号展示字段（逐字镜像 break._signal_to_legacy_dict + scan_signals 的 extra）。
 
     门表用 bk_feat 判资格；本函数额外给出**信号展示字段**（连板/断板期/换手率），
     保证与 python 参考版 trades 逐字一致。逻辑单点维护于此。

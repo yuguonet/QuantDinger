@@ -24,7 +24,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from app.market_cn.auto.strategies.break_buy import _run_backtest_breakbuy
+# break 是 Python 关键字: `from ...strategies.break import X` 为 SyntaxError,
+# 故走 importlib 动态导入 (2026-09-23 由 break_buy.py 更名而来)。
+from importlib import import_module as _import_module
+_run_backtest_breakbuy = _import_module(
+    "app.market_cn.auto.strategies.break")._run_backtest_breakbuy
 from app.market_cn.auto.strategies.dragon_callback import run_backtest_dragon_callback
 from app.market_cn.auto.strategies.relay3 import run_backtest_relay3
 from app.market_cn.auto.strategies.v1 import _run_backtest as _v1_run_backtest
@@ -107,9 +111,15 @@ register_exit("break_combo", _break_combo)
 
 
 def _g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params, diag):
-    """g56：无追踪纯 7d/-8%（2026-09-17 出场研究定稿）—— 复用 g56._exit_no_trail。"""
+    """g56：无追踪纯 7d/-8%（2026-09-17 出场研究定稿）—— 复用 g56._exit_no_trail。
+
+    (2026-09-23): 出场阈值改由 params 注入 (g56.yaml 的 hold_days / stop_loss)；
+    门表未写 -> None -> 引擎回落 g56.py 模块常量，逐笔等价不破。
+    """
     from app.market_cn.auto.strategies.g56 import _exit_no_trail
-    return _exit_no_trail(bars, entry_idx, entry_price)
+    return _exit_no_trail(bars, entry_idx, entry_price,
+                          _bp(params, board_type, "hold_days"),
+                          _bp(params, board_type, "stop_loss"))
 
 
 def _d1_open(bars, entry_idx, entry_price, *, code, board_type, params, diag):

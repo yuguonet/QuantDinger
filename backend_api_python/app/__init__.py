@@ -419,6 +419,21 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.warning(f"market_cn scheduler not started: {e}")
 
+        # ── 自动策略组启动对账 ────────────────────────────────
+        # 这是「改了策略代码/开关 → 重启后端 → UI 显示被校准」的落点:
+        # 指纹 (config + strategies/*.py|*.yaml 的 sha256) 变更时, 后台跑一次
+        # 「补扫当日 + 应然集重建」把 qd_dragon_signals 校准到当前规则。
+        # 非阻塞 (daemon 线程), 任何异常只记日志, 绝不影响业务启动。
+        try:
+            _auto_dbg = _os.getenv("PYTHON_API_DEBUG", "false").lower() == "true"
+            if _auto_dbg and _os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+                logger.info("auto strategy reconcile skipped (werkzeug reloader parent)")
+            else:
+                from app.market_cn.auto.startup import reconcile_startup
+                logger.info(f"auto strategy reconcile: {reconcile_startup()}")
+        except Exception as e:
+            logger.warning(f"auto strategy reconcile not started: {e}")
+
         # ── Agent 盘后回溯评估 worker（T+N 验证 → 权重迭代）──
         # 盘后自动运行，按 timeframe 取实际行情验证决策准确性
         try:

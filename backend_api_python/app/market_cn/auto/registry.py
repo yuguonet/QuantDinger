@@ -70,6 +70,26 @@ def strategy_keys():
     return tuple(dict.fromkeys(keys))  # 去重保序
 
 
+def enabled_keys():
+    """当前 enabled=true 的策略 key (显示层过滤的单一事实源)。
+
+    与 strategy_keys() 的区别: 后者是"系统成员"全集 (含 enabled=false, 为的是历史行可查);
+    本函数是"现在还在产信号的"子集 —— 展示层用它实现「只显示 enabled=true」。
+
+    ★ 注意: 停用策略的**已入场行** (entry_date 非空) 仍必须可见, 否则用户会遗忘
+    手上还有票要卖 (实盘资金事故)。过滤条件由调用方 (store.list_signals) 组合,
+    本函数只回答"哪些 key 是启用的"。
+    """
+    try:
+        from app.market_cn.auto import strategies as _reg
+        _reg.autodiscover()
+        keys = [k for k in strategy_keys() if _reg.is_enabled(k)]
+        # 全空时回退全集: 若 config 读取异常, 宁可多显示也不要把界面清空
+        return tuple(keys) if keys else strategy_keys()
+    except Exception:
+        return strategy_keys()
+
+
 def strategy_labels():
     """策略显示名: config.json label > 策略插件 name 属性 (调用方 .get(key, key) 原样回退)。
 
