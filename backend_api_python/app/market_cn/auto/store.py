@@ -684,6 +684,28 @@ def _label_row(s) -> dict:
     }
 
 
+_CONFIRM_LEVEL_TXT = {"strong": "强", "ok": "中", "weak": "弱"}
+
+
+def _confirm_pre_text(state, d):
+    """「预判」展示文案 —— 与前端 `strategyPreLevel` 同口径（双层防御）。
+
+    返回 None 表示**不产出该行**（"没有预判"不该由数据层造一行"无"）：
+      · 行不在 buy_today：holding/exit_today 上的 pre_confirm 是增量合并残留的脏数据，
+        且与 docs/龙回头自动化设计方案.md:92「14:25 加角标 → 15:00 正式确认覆盖」口径不符
+        （前端曾因此把持仓行渲染成"预持"）。
+      · 无标记。
+    档位只认 strong/ok/weak（经 core.display_meta.confirm_level_of 归一）；
+    非三档只在老数据/回滚场景出现，退化为"已预判"，**不把策略内部 token 漏到 UI**。
+    """
+    if state != S_BUY_TODAY:
+        return None
+    pc = d.get("pre_confirm")
+    if not pc:
+        return None
+    return _CONFIRM_LEVEL_TXT.get(pc) or "已预判"
+
+
 def _label_payload(s) -> dict:
     """构造 4 段 payload：评分 + 扩展段(策略明细表) + 评分口径说明。
 
@@ -693,7 +715,7 @@ def _label_payload(s) -> dict:
     d = _display_detail(s)
     state_rows = [{"label": "状态",
                    "value": d.get("state_label") or s.get("state") or ""}]
-    pre = d.get("pre_confirm")
+    pre = _confirm_pre_text(s.get("state"), d)
     if pre:                                  # 无预判 ⇒ **不产出该行**（"无"是展示文案, 不该由数据层造）
         state_rows.append({"label": "预判", "value": pre})
     return {

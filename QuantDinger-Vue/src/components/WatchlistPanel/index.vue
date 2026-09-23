@@ -112,9 +112,9 @@
             <div class="wl-col-tag" v-if="stock.strategy_state">
               <span class="wl-strategy-tag" :class="strategyTagClass(stock.strategy_state)">
                 <span class="wl-vchar" v-for="(ch, ci) in strategyTagChars(stock)" :key="ci">{{ ch }}</span>
-                <span v-if="strategyPreConfirm(stock)" class="wl-strategy-pre" :class="'wl-pre-' + (stock.strategy_detail || {}).pre_confirm">
-                  <span v-if="(stock.strategy_detail || {}).pre_confirm === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
-                  <span v-else-if="(stock.strategy_detail || {}).pre_confirm === 'strong'">★</span>
+                <span v-if="strategyPreLevel(stock)" class="wl-strategy-pre" :class="'wl-pre-' + strategyPreLevel(stock)">
+                  <span v-if="strategyPreLevel(stock) === 'ok'" class="wl-half-star"><span class="wl-half-star-fill">★</span>★</span>
+                  <span v-else-if="strategyPreLevel(stock) === 'strong'">★</span>
                   <span v-else>☆</span>
                 </span>
               </span>
@@ -1058,7 +1058,8 @@ export default {
       const stateMap = { '买入': '买', '卖出': '卖', '持仓': '持', '买入.预': '预买', '卖出.预': '预卖', '持仓.预': '预持' }
       const raw = d.state_label || stock.strategy_state || ''
       const base = stateMap[raw] || raw
-      return d.pre_confirm ? `预${base}` : base
+      // "预" 前缀只对当日待确认的买入行生效, 判据统一走 strategyPreConfirm
+      return this.strategyPreConfirm(stock) ? `预${base}` : base
     },
     // 竖排切片: tag 文本按字符拆开 (预/持/买/卖等, 每字一行)
     strategyTagChars (stock) {
@@ -1067,7 +1068,27 @@ export default {
     strategyEntryPrice (stock) { return (stock.strategy_detail || {}).entry_price },
     strategyStopPrice (stock) { return (stock.strategy_detail || {}).stop_price },
     strategyScore (stock) { const s = (stock.strategy_detail || {}).score; return (s === undefined || s === null) ? null : s },
-    strategyPreConfirm (stock) { const pc = (stock.strategy_detail || {}).pre_confirm; return pc || null },
+    // 预判标记 (pre_confirm) 仅对「当日待确认的买入行」有效, 返回 null 表示不展示角标/"预"前缀。
+    // 背景: monitor 盘中 step3 (14:25~14:45) 给 state='buy_today' 且 entry_date=今天的行写 extra.pre_confirm;
+    //       15:01 该行转 holding 后, store._set_state 是增量合并 (extra = extra || 占位符) 不会清除该字段,
+    //       于是 holding/exit_today 行长期残留 pre_confirm —— 若前端只看"字段是否存在",
+    //       持仓行就会被渲染成"预持"(与 docs/龙回头自动化设计方案.md "15:00 正式确认覆盖" 的口径不符)。
+    strategyPreConfirm (stock) {
+      const pc = (stock.strategy_detail || {}).pre_confirm
+      if (!pc) return null
+      return stock.strategy_state === 'buy_today' ? pc : null
+    },
+    // 预判档位: 只有 strong/ok/weak 三档有展示意义。
+    // 各策略的 confirm_decision().reason 不是枚举 —— g56 恒返回 'g56_hold'(无区分力),
+    // relay3/knife 等另有 'sealed_hold'/'hold_to_D1_open' 之类内部 token。
+    // 直接渲染会把内部 token 漏到 UI, 且会误画成"弱(☆)"角标 ⇒ 非三档一律返回 null (不画角标,
+    // 明细只标"已预判")。设计图纸见 docs/龙回头自动化设计方案.md:92/154。
+    // 后端自 2026-09-23 起已在 core.display_meta.confirm_level_of 归一 (reason 另落 extra.pre_reason,
+    // 不再当档位), 此处保留为**双层防御** —— 老数据/回滚场景仍可能带非三档值。
+    strategyPreLevel (stock) {
+      const pc = this.strategyPreConfirm(stock)
+      return (pc === 'strong' || pc === 'ok' || pc === 'weak') ? pc : null
+    },
     // ── label 4 段通用渲染器（type 只有 3 种: levels / score / units(fields|table)）──
     // 明细的唯一渲染处; 内容由后端 label 统一出口发放, 前端不再各自拼装
     escHtml (s) {
