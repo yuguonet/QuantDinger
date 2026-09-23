@@ -197,7 +197,7 @@
 </template>
 
 <script>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, shallowRef, getCurrentInstance } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, nextTick, watch, shallowRef, getCurrentInstance } from 'vue'
 import { init, registerIndicator, registerOverlay } from 'klinecharts'
 import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
@@ -259,8 +259,9 @@ export default {
     /**
      * 关键位水平线（仅分时图使用）：`[{ price, side }]`，side ∈ 'support' | 'resistance'。
      *
-     * 由父组件注入（数据源归父组件，本组件只负责「怎么画」）。**超出当前 Y 轴可视范围的不画**
-     * —— 分时 Y 轴被锁定为昨收 ±当日最大偏离，筹码峰常落在范围外，画出来只会贴边/出界。
+     * 由父组件注入（数据源归父组件，本组件只负责「怎么画」）。落在当前 Y 轴可视范围内的画
+     * 贯穿线，**范围外的改画贴边指示**（上/下边缘的箭头 + 价格标记）—— 分时 Y 轴被锁定为
+     * 昨收 ±当日最大偏离，筹码峰常落在范围外，整段丢弃会被误读成"没算出来"（2026-09-24 修）。
      * 与 `tradeMarkers` 的分层一致：本组件不感知 watchlist / label 概念。
      */
     levelLines: {
@@ -292,8 +293,14 @@ export default {
     let _minutePcLogKey = ''
     /** 分时昨收缓存归属的标的（换标的才清空，同标的刷新保留，避免锁定短暂消失造成闪烁） */
     let _minutePcSymbolKey = ''
-    /** 分时加载时保存的跨日 1m 原始数据（klineData 只保留当日，昨收推导需要跨日数据） */
+    /** 分时加载时保存的跨日 1m 原始数据（klineData 只保留当日，昨收推导需要跨日数据）。
+     *  归属「市场|标的」：换标的必须作废，否则会拿上一标的的 1m 数据推导新标的的昨收 */
     let _minuteRawData = []
+    /** 分时昨收缓存归属的「被展示交易日」：跨日（含回退显示最近交易日）必须重推昨收，
+     *  否则新的分时窗口仍沿用上一交易日的昨收 ⇒ 窗口被撑到 ±几十%（用户反馈的 ±60%） */
+    let _minutePcDayKey = ''
+    /** 「跳过 Y 轴锁定」诊断日志去重键（原因|交易日|当日柱数） */
+    let _minuteSkipLogKey = ''
     /** 父容器高度变化（如指标 IDE 拖拽分割条）不会触发 window.resize，需 ResizeObserver 调 chart.resize */
     let chartResizeObserver = null
     let chartResizeRafId = null
@@ -314,16 +321,42 @@ export default {
     const TRADE_MARKER_GROUP = 'tradeMarkers'
     /** 当前蜡烛图配色方案: cn=红涨绿跌, intl=绿涨红跌 (由 setChartColorScheme 维护) */
     const chartColorScheme = ref('cn')
+    /**
+     * ★ 涨跌柱配色唯一来源。
+     * 语义: cn=红涨绿跌(默认/中国市场), intl=绿涨红跌; 深浅色各一套。
+     * 此前 `restoreNormalChartStyle` / `updateChartTheme` / `setChartColorScheme` 各写一份
+     * 且前两者写死 cn ⇒ 用户选 intl 后一切周期或切主题，蜡烛就跳回红涨，而买卖点标记
+     * (`_markerSideColors` 仍跟随 intl) 变成买绿 ⇒ 标记与蜡烛互相矛盾。
+     * 任何"应用/恢复/切主题/切方案"的路径都必须经这里取值。
+     */
+    const CANDLE_BAR_PALETTE = {
+      cn: { light: { up: '#f5222d', down: '#52c41a' }, dark: { up: '#ef5350', down: '#0ecb81' } },
+      intl: { light: { up: '#52c41a', down: '#f5222d' }, dark: { up: '#0ecb81', down: '#ef5350' } }
+    }
+    /** 归一化方案名（非法值退回 cn） */
+    const _barPaletteKey = (scheme) => (scheme === 'intl' ? 'intl' : 'cn')
+    /** 取当前方案成组柱色: 供 setStyles 直接展开（noChange 缺省与浅色中性灰一致） */
+    const candleBarColors = (scheme, isDark, noChangeColor = '#999') => {
+      const p = CANDLE_BAR_PALETTE[_barPaletteKey(scheme)][isDark ? 'dark' : 'light']
+      return {
+        upColor: p.up,
+        downColor: p.down,
+        noChangeColor,
+        upBorderColor: p.up,
+        downBorderColor: p.down,
+        noChangeBorderColor: noChangeColor,
+        upWickColor: p.up,
+        downWickColor: p.down,
+        noChangeWickColor: noChangeColor
+      }
+    }
     /** 标记悬停详情状态 (template 中 .bs-marker-tip) */
     const markerTip = reactive({ visible: false, x: 0, y: 0, title: '', price: '', time: '', color: '' })
 
-    /** 标记侧颜色: 与蜡烛图涨跌色同步 (取值与 setChartColorScheme/initChart 的 bar 颜色一致) */
+    /** 标记侧颜色: 与蜡烛图涨跌色同步 (与 setChartColorScheme/样式恢复同读 CANDLE_BAR_PALETTE) */
     const _markerSideColors = () => {
-      const isDark = props.theme === 'dark'
-      const intl = chartColorScheme.value === 'intl'
-      const up = intl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d')
-      const down = intl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
-      return { buy: up, sell: down, signal: '#d97706' }
+      const p = CANDLE_BAR_PALETTE[_barPaletteKey(chartColorScheme.value)][props.theme === 'dark' ? 'dark' : 'light']
+      return { buy: p.up, sell: p.down, signal: '#d97706' }
     }
 
     /** 悬停/点击显示标记详情 (fixed 定位, 视口内夹紧防溢出) */
@@ -590,6 +623,8 @@ export default {
     const addedSignalOverlayIds = ref([])
     // 已添加的画线 overlay ID 列表（用于清理和管理）
     const addedDrawingOverlayIds = ref([])
+    /** 批量清空画线期间抑制 onRemoved 就地 splice（防遍历中数组位移漏项） */
+    let _clearingDrawings = false
     // 副图关闭按钮（key=paneId, value=DOM element）
     const paneCloseButtons = new Map()
     // 当前激活的画线工具
@@ -911,12 +946,27 @@ export default {
           lock: false,
           extendData: {
             isDrawing: true
+          },
+          // ★ 画完最后一个点 ⇒ 登记 id 并退出绘制模式(唯一有效挂点, 见 initChart 注释)。
+          //   取点工具(priceRangeMeasure)也走这里: onDrawEnd 只在最后一个点落定后触发。
+          onDrawEnd: (e) => {
+            const id = (e && e.overlay && e.overlay.id) || overlayId
+            if (id && addedDrawingOverlayIds.value.indexOf(id) === -1) {
+              addedDrawingOverlayIds.value.push(id)
+            }
+            activeDrawingTool.value = null
+          },
+          // 覆盖物被移除(含被"清空所有画线"批量删除)时摘掉登记, 避免残留脏 id。
+          // 批量清空期间由 _clearingDrawings 抑制 —— 否则会边遍历边 splice 漏项。
+          onRemoved: (e) => {
+            if (_clearingDrawings) return
+            const id = e && e.overlay && e.overlay.id
+            const k = addedDrawingOverlayIds.value.indexOf(id)
+            if (k > -1) addedDrawingOverlayIds.value.splice(k, 1)
           }
         }
         const overlayId = chartRef.value.createOverlay(overlayConfig)
-        if (overlayId) {
-          addedDrawingOverlayIds.value.push(overlayId)
-        } else {
+        if (!overlayId) {
           console.warn(`Failed to create overlay: ${overlayName}. Make sure the overlay is registered.`)
           activeDrawingTool.value = null
         }
@@ -931,17 +981,23 @@ export default {
       if (!chartRef.value) return
 
       try {
-        // 移除所有已添加的画线覆盖物
-        addedDrawingOverlayIds.value.forEach(overlayId => {
-          try {
-            if (typeof chartRef.value.removeOverlay === 'function') {
-              chartRef.value.removeOverlay(overlayId)
-            } else if (typeof chartRef.value.removeOverlayById === 'function') {
-              chartRef.value.removeOverlayById(overlayId)
+        // 先快照: overlay 的 onRemoved 回调会就地 splice 同一数组, 直接 forEach 会漏项
+        const ids = [...addedDrawingOverlayIds.value]
+        _clearingDrawings = true
+        try {
+          ids.forEach(overlayId => {
+            try {
+              if (typeof chartRef.value.removeOverlay === 'function') {
+                chartRef.value.removeOverlay(overlayId)
+              } else if (typeof chartRef.value.removeOverlayById === 'function') {
+                chartRef.value.removeOverlayById(overlayId)
+              }
+            } catch (err) {
             }
-          } catch (err) {
-          }
-        })
+          })
+        } finally {
+          _clearingDrawings = false
+        }
         addedDrawingOverlayIds.value = []
         activeDrawingTool.value = null
 
@@ -1423,15 +1479,24 @@ export default {
         }
         // 1. 数据转换：将 JS 的 klineData / params 转换为 JSON 字符串
         // klineData 可能是内部格式（time）或 KLineChart 格式（timestamp）
+        let _pythonBadRows = 0
         const rawData = klineData.map(item => {
           // 兼容两种格式
           let timeValue = item.timestamp || item.time
+          // 坏行防护: 两个字段都缺 / 非数字(如 '2026-09-23' 字符串日期) 时，
+          // `timeValue < 1e10` 的比较为 false ⇒ 会算出 NaN 并经 JSON.stringify 变 null
+          // 静默流进 Python(time=None)，无任何告警。此处按 0 计并计数上报。
+          if (typeof timeValue === 'string') timeValue = parseInt(timeValue, 10)
+          if (!Number.isFinite(timeValue)) {
+            _pythonBadRows += 1
+            timeValue = 0
+          }
           // 如果是秒级时间戳，转换为毫秒
           if (timeValue < 1e10) {
             timeValue = timeValue * 1000
           }
           return {
-            time: Math.floor(timeValue / 1000), // Python 端使用秒级时间戳
+            time: Math.floor(timeValue / 1000) || 0, // Python 端使用秒级时间戳
             open: parseFloat(item.open) || 0,
             high: parseFloat(item.high) || 0,
             low: parseFloat(item.low) || 0,
@@ -1439,6 +1504,9 @@ export default {
             volume: parseFloat(item.volume) || 0
           }
         })
+        if (_pythonBadRows > 0) {
+          console.warn(`[KlineChart] ${_pythonBadRows} 行 K 线缺少可用时间戳，已按 0 传入 Python 指标`)
+        }
         const rawDataJson = JSON.stringify(rawData)
         const paramsJson = JSON.stringify(params || {})
 
@@ -2127,8 +2195,7 @@ json.dumps(output)
 
     // ========== 注册自定义信号 Overlay (Signal Tag) ==========
     // 这是一个能够绘制 "圆点 + 带背景色文字框" 的自定义覆盖物
-// ========== 注册自定义信号 Overlay (Signal Tag) ==========
-registerOverlay({
+    registerOverlay({
       name: 'signalTag',
       // 【关键修改1】必须改为 1。告诉图表这个图形只需要一个点就画完了。
       // 只要这里是 1，图表就不会画那个蓝色的"编辑中"手柄。
@@ -2800,10 +2867,18 @@ registerOverlay({
           return date1.getFullYear() === date2.getFullYear() &&
                  date1.getMonth() === date2.getMonth() &&
                  date1.getDate() === date2.getDate()
-        case '1W':
-          const week1 = Math.floor((date1.getTime() - new Date(date1.getFullYear(), 0, 1).getTime()) / (7 * 24 * 60 * 60 * 1000))
-          const week2 = Math.floor((date2.getTime() - new Date(date2.getFullYear(), 0, 1).getTime()) / (7 * 24 * 60 * 60 * 1000))
-          return date1.getFullYear() === date2.getFullYear() && week1 === week2
+        case '1W': {
+          // ★ 周桶键统一取「该周周一 00:00」。
+          // 原实现是 `Math.floor((t - 同年1/1) / 7天)` 且额外要求 getFullYear() 相同 ⇒
+          // 12/31 与次年 1/1 明明同一 ISO 周却被判为不同段(跨年那根周线会被重复追加或漏合并)；
+          // 且「距 1/1 的天数/7」本身也与真实周边界(周一)不齐。
+          const _mondayOf = (d) => {
+            const x = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+            x.setDate(x.getDate() - ((x.getDay() + 6) % 7)) // 周一=0 ... 周日=6
+            return x.getTime()
+          }
+          return _mondayOf(date1) === _mondayOf(date2)
+        }
         default:
           return time1 === time2
       }
@@ -3015,6 +3090,17 @@ registerOverlay({
       klineData.value = realBars
       // 数据确实发生了变化 → 记录时间戳，供停滞看门狗判断
       _minuteLastChangeTs = Date.now()
+      // 展示交易日变化（休市时回退显示上一交易日 → 今日数据到达后切到今日）：
+      // 昨收 = 「被展示交易日的上一交易日收盘」，必须重推；区间锚点同属当日，一并作废。
+      // 否则昨收会停在上一交易日的口径上（0 轴线偏心、窗口略微撑大）
+      const _rtDay = minuteDateStr(realBars[realBars.length - 1].timestamp)
+      if (_rtDay !== _minutePcDayKey) {
+        _minutePcDayKey = _rtDay
+        minutePrevClose.value = null
+        _minutePcSource = ''
+        _minuteAxisAnchorDev = 0
+        _minuteAxisKey = ''
+      }
       updatePricePanel(convertToInternalFormat(realBars), { force: true })
 
       const structureChanged = prev.length !== realBars.length ||
@@ -3300,39 +3386,61 @@ registerOverlay({
     const MINUTE_SR_DASH = [4, 4]
     /** 右端价格标签字号（与分时 tooltip 同量级，不抢戏） */
     const MINUTE_SR_FONT = '10px sans-serif'
+    /** 价格标签底色（贯穿线标签与贴边标记共用，压住下方分时线保证可读） */
+    const MINUTE_SR_LABEL_BG = 'rgba(255, 255, 255, 0.82)'
+    /** 贴边指示：每侧最多档位（与 label 每侧上限一致，避免横向挤满整条边） */
+    const MINUTE_SR_EDGE_MAX = 3
+    /** 贴边指示：距绘图区上下边缘的内边距（px） */
+    const MINUTE_SR_EDGE_PAD = 6
+    /** 贴边指示：横向最多占用绘图区宽度的比例（给右端价格标签留位，防重叠） */
+    const MINUTE_SR_EDGE_WIDTH_RATIO = 0.6
 
     /**
-     * 关键位**可见性裁剪**（纯函数，便于单测）：把「价格 → 像素 Y」交给调用方，
-     * 只保留落在 `[0, height]` 内的档位，并顺带丢弃非法价格。
+     * 关键位**可见性分类**（纯函数，便于单测）：把「价格 → 像素 Y」交给调用方。
      *
-     * 这是「超过范围的不显示」的唯一判据 —— 分时 Y 轴锁定为昨收 ± 当日最大偏离，
-     * 筹码推算出的关键位常在范围外（如现价 44 而支撑在 40 以下），
-     * 不裁剪就会贴边成一条看不出意义的线。
+     * 为什么不是"超范围就丢"（2026-09-24 修）：分时 Y 轴被锁定为「昨收 ± 当日最大偏离」
+     * （实测常见 ±1~4%），而筹码峰关键位常落在范围外 —— 全市场 30 只票实测 157 个关键位
+     * 仅 **62 个（39.5%）** 落在区间内，**最近一档也只有 56.7% 可见**；支撑在下方、离得
+     * 最远，常被整段裁光 ⇒ 用户看到的就是"支撑/压力线凭空消失"，且无法区分
+     * 「没算出来」与「在图外」。改为三分类后，图外档位走**贴边指示**（箭头 + 价格）。
+     *
+     * 三分类（y 越小价格越高）：
+     *   - visible : y ∈ [0, height]  → 画贯穿线（含右端价格标签）
+     *   - above   : y < 0            → 价格高于可视区上沿 → 贴顶边
+     *   - below   : y > height       → 价格低于可视区下沿 → 贴底边
+     * `gap` = 距边界的像素距离，above/below 按它**升序**（离边界越近越该被看到）。
      *
      * @param {Array<{price:number, side?:string}>} levels 原始关键位
      * @param {(price:number)=>number} toPixel 价格 → 像素 Y（库的轴换算，含涨跌幅轴重定基）
      * @param {number} height 绘图区高度（bounding.height）
-     * @returns {Array<{price:number, side:string, y:number}>} 可见档位（保持传入顺序）
+     * @returns {{visible:Array, above:Array, below:Array}} visible 保持传入顺序
      */
-    const pickVisibleLevels = (levels, toPixel, height) => {
-      const out = []
-      if (!Array.isArray(levels) || !levels.length) return out
-      if (typeof toPixel !== 'function' || !(height > 0)) return out
+    const classifyMinuteLevels = (levels, toPixel, height) => {
+      const visible = []
+      const above = []
+      const below = []
+      if (!Array.isArray(levels) || !levels.length) return { visible, above, below }
+      if (typeof toPixel !== 'function' || !(height > 0)) return { visible, above, below }
       for (const lv of levels) {
         const price = Number(lv && lv.price)
         if (!Number.isFinite(price) || price <= 0) continue
         let y = null
         try { y = toPixel(price) } catch (_) { y = null }
         if (y == null || !Number.isFinite(y)) continue
-        if (y < 0 || y > height) continue
-        out.push({ price, side: (lv.side === 'resistance' ? 'resistance' : 'support'), y })
+        const side = (lv.side === 'resistance' ? 'resistance' : 'support')
+        if (y < 0) above.push({ price, side, gap: -y })
+        else if (y > height) below.push({ price, side, gap: y - height })
+        else visible.push({ price, side, y })
       }
-      return out
+      above.sort((a, b) => a.gap - b.gap)
+      below.sort((a, b) => a.gap - b.gap)
+      return { visible, above, below }
     }
 
     /**
-     * 关键位线绘制：横贯全宽（与 0 轴线同理，覆盖右侧未来时段留白区），
-     * 右端贴一条价格小标签。返回 true 接管该指标的全部绘制。
+     * 关键位绘制：视野内画横贯全宽的虚线 + 右端价格标签；**视野外改为贴边指示**
+     * （上/下边缘的一个「箭头 + 价格」小标记，不画贯穿线 —— 贯穿线贴到边缘没有
+     * 读数意义，还会与 0 轴线/均价线混淆）。返回 true 接管该指标的全部绘制。
      *
      * 闭包读取 `props.levelLines` ⇒ 切股票/标签刷新后无需重新注册指标，
      * 只要触发一次重绘即可呈现新值（见 watch(() => props.levelLines)）。
@@ -3343,12 +3451,14 @@ registerOverlay({
         if (!Array.isArray(props.levelLines) || !props.levelLines.length) return true
         const axis = yAxis || (indicator && indicator.yAxis)
         if (!axis || typeof axis.convertToPixel !== 'function') return true
-        const visible = pickVisibleLevels(props.levelLines, axis.convertToPixel.bind(axis), bounding.height)
-        if (!visible.length) return true
+        const { visible, above, below } = classifyMinuteLevels(
+          props.levelLines, axis.convertToPixel.bind(axis), bounding.height)
+        if (!visible.length && !above.length && !below.length) return true
 
         ctx.save()
         ctx.font = MINUTE_SR_FONT
         ctx.textBaseline = 'middle'
+        // ---- 视野内：贯穿线 + 右端价格标签 ----
         for (const lv of visible) {
           const color = (MINUTE_SR_STYLE[lv.side] || MINUTE_SR_STYLE.support).color
           // 半像素对齐，避免 1px 线被反锯齿糊成 2px
@@ -3366,11 +3476,49 @@ registerOverlay({
           const tw = ctx.measureText(text).width
           const tx = bounding.width - tw - 3
           ctx.setLineDash([])
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.82)'
+          ctx.fillStyle = MINUTE_SR_LABEL_BG
           ctx.fillRect(tx - 2, y - 7, tw + 4, 14)
           ctx.fillStyle = color
           ctx.fillText(text, tx, y)
         }
+        // ---- 视野外：贴边指示（左端横向排布，避开右端价格标签）----
+        const drawEdgeMarks = (items, atTop) => {
+          if (!items.length) return
+          const yc = atTop
+            ? MINUTE_SR_EDGE_PAD + 7
+            : bounding.height - MINUTE_SR_EDGE_PAD - 7
+          let x = MINUTE_SR_EDGE_PAD + 5
+          for (const lv of items.slice(0, MINUTE_SR_EDGE_MAX)) {
+            const color = (MINUTE_SR_STYLE[lv.side] || MINUTE_SR_STYLE.support).color
+            ctx.font = MINUTE_SR_FONT
+            const text = lv.price.toFixed(2)
+            const tw = ctx.measureText(text).width
+            const w = tw + 12                       // 三角 5px + 间隙 + 文本
+            // 不与右端价格标签抢位：累计宽度超过绘图区 60% 就停
+            if (x - MINUTE_SR_EDGE_PAD + w > bounding.width * MINUTE_SR_EDGE_WIDTH_RATIO) break
+            ctx.setLineDash([])
+            ctx.fillStyle = MINUTE_SR_LABEL_BG
+            ctx.fillRect(x - 4, yc - 7, w, 14)
+            // 方向三角（画而非字符，避免字体缺字）：上边档位指上=价格更高
+            ctx.fillStyle = color
+            ctx.beginPath()
+            if (atTop) {
+              ctx.moveTo(x + 2, yc - 3)
+              ctx.lineTo(x - 1, yc + 2)
+              ctx.lineTo(x + 5, yc + 2)
+            } else {
+              ctx.moveTo(x + 2, yc + 3)
+              ctx.lineTo(x - 1, yc - 2)
+              ctx.lineTo(x + 5, yc - 2)
+            }
+            ctx.closePath()
+            ctx.fill()
+            ctx.fillText(text, x + 7, yc)
+            x += w + 4
+          }
+        }
+        drawEdgeMarks(above, true)
+        drawEdgeMarks(below, false)
         ctx.restore()
       } catch (_) { /* 预期内：轴未就绪时由下一帧重绘 */ }
       return true
@@ -3428,6 +3576,9 @@ registerOverlay({
     /** 分时 Y 轴范围「单调锚点」：日内只增不减的量化偏离，换标的时清零。
      *  盘中极值只可能扩大，配合量化后 from/to 频繁刷新时恒定 → 命中「未变化」短路 */
     let _minuteAxisAnchorDev = 0
+    /** 分时 Y 轴锚点归属键（市场|标的|被展示交易日）：键变即清零 —— 跨标的/跨交易日的
+     *  「当日波动区间」不可复用（复用等于把上一份数据的区间搬到新窗口） */
+    let _minuteAxisKey = ''
     /**
      * 分时极坐标的涨跌停幅度（%）：按标的代码所在板块自动识别。
      * 沪深主板（600/601/603/605/000/001/002/003）±10%；
@@ -3793,10 +3944,151 @@ registerOverlay({
       return null
     }
 
+    // ==================================================================================
+    // 分时 Y 轴区间判定（纯函数族；与 applyMinutePrevCloseAxis 的副作用分离，便于单测/回归）
+    // ==================================================================================
+    /** 分时窗口「当日柱数」下限：日线数据每个交易日在 klineData 里恰好 1 根，
+     *  用它把非分时数据挡在 Y 轴锁定之外（1D→分时的异步空档里 klineData 仍是日线柱） */
+    const MINUTE_AXIS_MIN_DAY_BARS = 2
+    /** 分时序列相邻柱间隔上限（毫秒）：1m 数据含午休跨段最长 5400s，
+     *  与日线的 86400s 有量级差 ⇒ 用它把「日线序列」识别出来 */
+    const MINUTE_INTRADAY_MAX_GAP_MS = 7200 * 1000
+    /** 单日偏离上限的容差系数：涨跌停/除权等边界情况留出余量 */
+    const MINUTE_DEV_CEILING_TOLERANCE = 1.5
+
+    /** 是否 CN 标的：market 已就绪时看市场名；未就绪时按 6 位代码形态（可带 SH/SZ/BJ 前后缀）兜底 */
+    const _isCnMarketSymbol = (market, symbol) => {
+      const m = String(market || '').trim()
+      if (m) return m === 'CNStock'
+      return /^(sh|sz|bj)?\d{6}(\.(sh|sz|bj))?$/i.test(String(symbol || '').trim())
+    }
+
+    /**
+     * 单日「相对昨收最大偏离」上限（%）：仅 CN 有涨跌停约束（主板 10 / 创业科创 20 / 北交所 30）。
+     * 非 CN 市场返回 Infinity（不设上限）。用途**仅限识别病态输入**（昨收与当日数据不自洽），
+     * 正常路径完全不受影响；无涨跌停的新股/复牌若超限，只是不锁定（退回按数据铺满，不画错误区间）。
+     */
+    const minuteDevCeilingPct = (market, symbol) => (
+      _isCnMarketSymbol(market, symbol) ? _minutePolarLimit(market, symbol) : Infinity
+    )
+
+    /** 序列是否「分时形态」：相邻柱间隔中位数 ≤ 2h（日线为 ~86400s，一眼可分） */
+    const _isIntradayBars = (list) => {
+      if (!Array.isArray(list) || list.length < 2) return false
+      const gaps = []
+      for (let i = 1; i < list.length; i++) {
+        const gap = Number(list[i].timestamp) - Number(list[i - 1].timestamp)
+        if (gap > 0) gaps.push(gap)
+      }
+      if (gaps.length === 0) return false
+      gaps.sort((a, b) => a - b)
+      const median = gaps[Math.floor(gaps.length / 2)]
+      return median > 0 && median <= MINUTE_INTRADAY_MAX_GAP_MS
+    }
+
+    /**
+     * 分时 Y 轴区间判定（纯函数，无副作用）。
+     *
+     * 唯一口径：窗口 = 昨收 ± 当日最大偏离×余量（自适应）或 昨收 ± 涨跌停%（极坐标）。
+     * 三条硬约束，都是对**病态输入**的拦截，正常路径行为逐位不变：
+     *  1. **只用被展示交易日的柱**：分时窗口 = 一个交易日，跨日柱不参与极值。
+     *  2. **当日柱数 ≥ MINUTE_AXIS_MIN_DAY_BARS**（或序列确认为分时形态）：
+     *     日线数据每天 1 根 ⇒ 1D→分时的异步空档里绝不会用日线区间去锁分时轴。
+     *     旧实现会锁上，而锚点单调只增不计减 ⇒ 一个错误区间被永久钉住（±60% 的来源）。
+     *  3. **偏离不得超过该板块涨跌停×容差**（仅 CN）：超出说明昨收与实际数据不自洽
+     *     （缓存跨日/异标的/粗兜底），标记 untrusted 交由调用方重解析昨收。
+     *
+     * 锚点单调性保留（抗抖动），但归属键（市场|标的|交易日）变化即清零，
+     * 且偏离**显著收窄（< 1/2）时重锚** —— 否则任何一次污染都再无自愈机会。
+     *
+     * @param {Array} bars klineData（分时模式下即当日的 1m 柱）
+     * @param {number} pc 昨收
+     * @param {object} opts { percentMode, baseClose, polarLimit, ceiling, key, prevKey, prevAnchorDev }
+     * @returns {object} ok=false 时带 reason（pc/empty/base/not-intraday/dev-out-of-range/range）
+     */
+    const computeMinuteAxisPlan = (bars, pc, opts) => {
+      const o = opts || {}
+      const percentMode = !!o.percentMode
+      const polarLimit = Number(o.polarLimit) > 0 ? Number(o.polarLimit) : 0
+      const baseClose = Number(o.baseClose)
+      const ceiling = Number.isFinite(o.ceiling) ? Number(o.ceiling) : Infinity
+      const key = String(o.key || '')
+      const prevAnchorDev = Number(o.prevAnchorDev) || 0
+      const anchorValid = String(o.prevKey || '') === key
+
+      if (!(pc > 0)) return { ok: false, reason: 'pc' }
+      const list = Array.isArray(bars) ? bars.filter(b => b && b.timestamp) : []
+      if (list.length === 0) return { ok: false, reason: 'empty' }
+
+      // 约束 1 + 2：当日作用域 + 当日柱数下限（日线数据每天恰好 1 根 ⇒ 在此被拦下）
+      const day = minuteDateStr(list[list.length - 1].timestamp)
+      const dayBars = list.filter(b => minuteDateStr(b.timestamp) === day)
+      const intraday = _isIntradayBars(list)
+      if (dayBars.length < MINUTE_AXIS_MIN_DAY_BARS && !(dayBars.length >= 1 && intraday)) {
+        return { ok: false, reason: 'not-intraday', day, dayBarCount: dayBars.length, key, ceiling }
+      }
+
+      // 当日最大【绝对值】偏离（均价线恒在当日 low~high 之间，不参与也不会越界）
+      let maxDev = 0
+      dayBars.forEach(b => {
+        [b.close, b.high, b.low].forEach(v => {
+          if (v == null || !Number.isFinite(v)) return
+          const d = Math.abs(v - pc)
+          if (d > maxDev) maxDev = d
+        })
+      })
+      if (!(maxDev > 0)) maxDev = Math.abs(pc) * 0.001
+      const devPct = maxDev / pc * 100
+
+      // 约束 3：单日偏离不可能超过涨跌停幅度（极坐标本就固定 ±limit，不依赖数据，无需判定）
+      if (polarLimit <= 0 && devPct > ceiling * MINUTE_DEV_CEILING_TOLERANCE) {
+        return {
+          ok: false, reason: 'dev-out-of-range', untrusted: true,
+          day, dayBarCount: dayBars.length, key, ceiling, devPct, maxDev
+        }
+      }
+
+      // 抗抖动：量化到离散档位 + 单调锚定；归属键变 ⇒ 清零；显著收窄 ⇒ 重锚（自愈）
+      const qDev = quantizeMinuteDev(maxDev)
+      let anchorDev = anchorValid ? prevAnchorDev : 0
+      const reanchored = qDev < anchorDev / 2
+      if (reanchored || qDev > anchorDev) anchorDev = qDev
+
+      const halfPrice = polarLimit > 0
+        ? pc * (polarLimit / 100)
+        : anchorDev * (1 + MINUTE_AXIS_PADDING)
+      const fromPrice = pc - halfPrice
+      const toPrice = pc + halfPrice
+
+      let from
+      let to
+      if (percentMode) {
+        if (!(baseClose > 0) || !Number.isFinite(baseClose)) {
+          return { ok: false, reason: 'base', day, dayBarCount: dayBars.length, key, ceiling }
+        }
+        // 百分比轴以「首个可见柱收盘」为换算基准（库口径），锁定时必须同基准。
+        // 注：此分支沿用既有公式（不叠加极坐标 ±limit），避免改动不可达路径的行为
+        const pcPct = (pc - baseClose) / baseClose * 100
+        const halfPct = anchorDev / baseClose * 100 * (1 + MINUTE_AXIS_PADDING)
+        from = pcPct - halfPct
+        to = pcPct + halfPct
+      } else {
+        from = fromPrice
+        to = toPrice
+      }
+      if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) {
+        return { ok: false, reason: 'range', day, dayBarCount: dayBars.length, key, ceiling }
+      }
+      return {
+        ok: true, day, dayBarCount: dayBars.length, key, ceiling,
+        maxDev, devPct, anchorDev, reanchored, halfPrice, fromPrice, toPrice, from, to
+      }
+    }
+
     const applyMinutePrevCloseAxis = () => {
       const chart = chartRef.value
       if (!chart || !isMinuteLine.value) return
-      const pc = resolveMinutePrevClose()
+      let pc = resolveMinutePrevClose()
       if (pc == null || !(pc > 0)) return
       const realBars = (klineData.value || []).filter(b => b && b.timestamp)
       if (realBars.length === 0) return
@@ -3808,18 +4100,14 @@ registerOverlay({
       const axisType = axis && typeof axis.getType === 'function' ? axis.getType() : 'normal'
       const percentMode = axisType === 'percentage'
       let baseClose = null
-      let pcPct = 0
       if (percentMode) {
         try {
           const dl = chart.getDataList ? chart.getDataList() : (klineData.value || [])
           const vr = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
           const fd = (vr && Number.isInteger(vr.from) && dl[vr.from]) ? dl[vr.from] : dl[0]
           const c = Number(fd && fd.close)
-          if (Number.isFinite(c) && c > 0) {
-            baseClose = c
-            // 昨收的涨跌幅（相对首个可见柱收盘，与库的百分比换算一致）
-            pcPct = (pc - baseClose) / baseClose * 100
-          }
+          // 只解析基准价；昨收的涨跌幅（pcPct）由 computeMinuteAxisPlan 内部同口径现算
+          if (Number.isFinite(c) && c > 0) baseClose = c
         } catch (_) { /* 预期内 */ }
         // 基准缺失时放弃锁定，避免把价格值当百分比值用导致显示错乱
         if (baseClose == null) return
@@ -3831,48 +4119,51 @@ registerOverlay({
       // 十字光标读数昨收定基（涨跌幅轴）+ 价格读数 ≤3 位小数
       installMinuteCrosshairRebase()
 
-      // 取所有参与 Y 轴极值计算的价格相对昨收的最大【绝对值】偏离
-      // （涨跌不对称时按大的那一侧对称展开：跌0%涨10% → 范围 ±10%+余量）
-      // 注：均价线（AVP）是各柱典型价的加权平均，恒在 [min(low), max(high)] 区间内，
-      // 不参与极值计算也不会越界（均价线取值恒在当日最低/最高之间）
-      let maxDev = 0
-      realBars.forEach(b => {
-        [b.close, b.high, b.low].forEach(v => {
-          if (v == null || !Number.isFinite(v)) return
-          const d = Math.abs(v - pc)
-          if (d > maxDev) maxDev = d
-        })
-      })
-      if (!(maxDev > 0)) maxDev = Math.abs(pc) * 0.001
-
-      // 【抗抖动】实时波动区间量化为离散档位，且日内单调只增：
-      // 盘中每次刷新都按 live min/max 重算范围，任何新高低都会改变 maxDev → setRange
-      // 重排整窗造成抖动。量化到 ~1/N 档位 + 单调锚定后，整窗只在偏离跨越档位边界时
-      // 才扩展一次，频繁刷新时 from/to 恒定 → 命中「未变化」短路，不再 rebuild。
-      const qDev = quantizeMinuteDev(maxDev)
-      if (qDev > _minuteAxisAnchorDev) _minuteAxisAnchorDev = qDev
-      const effDev = _minuteAxisAnchorDev
-
-      // 分时极坐标模式：范围精确锁定为 昨收×(1∓涨跌停%)，顶部=+limit%、底部=-limit%
-      // （0 轴线居中；不叠加 padding，保证涨/跌停刻度贴边）。关闭时为自适应对称范围。
+      // 区间判定全部交给纯函数（当日作用域 / 当日柱数下限 / 涨跌停上限自洽 / 锚点归属与重锚）
       const polarLimit = _minutePolarEnabled ? _minutePolarLimit(props.market, props.symbol) : 0
-      const halfPrice = polarLimit > 0
-        ? pc * (polarLimit / 100)
-        : effDev * (1 + MINUTE_AXIS_PADDING)
-      const fromPrice = pc - halfPrice
-      const toPrice = pc + halfPrice
-      // 锁定范围单位跟随轴型：percentage 轴用百分比单位，且以 pct(昨收) 为中心
-      // （昨收未必等于基准价，如今开≠昨收时中心点不是 0%，而是昨收的涨跌幅）
-      let from
-      let to
-      if (percentMode) {
-        const halfPct = effDev / baseClose * 100 * (1 + MINUTE_AXIS_PADDING)
-        from = pcPct - halfPct
-        to = pcPct + halfPct
-      } else {
-        from = fromPrice
-        to = toPrice
+      const rangeKey = `${props.market || ''}|${props.symbol || ''}|${minuteDateStr(realBars[realBars.length - 1].timestamp)}`
+      const planOpts = {
+        percentMode,
+        baseClose,
+        polarLimit,
+        ceiling: minuteDevCeilingPct(props.market, props.symbol),
+        key: rangeKey,
+        prevKey: _minuteAxisKey,
+        prevAnchorDev: _minuteAxisAnchorDev
       }
+      let plan = computeMinuteAxisPlan(realBars, pc, planOpts)
+
+      // 病态输入：昨收与当日数据不自洽（偏离超出该板块涨跌停上限）⇒ 缓存不可信，
+      // 丢弃后**就地重解析一次**（缓存可能来自上一交易日/上一标的，或落到「今开近似」粗兜底）
+      if (plan.untrusted) {
+        const badKey = `untrusted|${plan.day || ''}|${pc}|${plan.devPct.toFixed(1)}`
+        if (badKey !== _minuteSkipLogKey) {
+          _minuteSkipLogKey = badKey
+          console.warn(`[KlineChart] 分时：昨收=${pc}（来源=${_minutePcSource || '已缓存'}）与当日数据偏离 ${plan.devPct.toFixed(1)}%，超出该板块上限 ${plan.ceiling}% → 丢弃缓存重新解析`)
+        }
+        minutePrevClose.value = null
+        _minutePcSource = ''
+        _minuteAxisKey = ''
+        _minuteAxisAnchorDev = 0
+        const pcRetry = resolveMinutePrevClose()
+        if (pcRetry == null || !(pcRetry > 0)) return
+        pc = pcRetry
+        plan = computeMinuteAxisPlan(realBars, pc, { ...planOpts, prevKey: '', prevAnchorDev: 0 })
+      }
+
+      // 状态先落盘：即使本次命中「未变化」短路，归属键与锚点也必须推进（否则锚点永不过期）
+      _minuteAxisKey = plan.key || rangeKey
+      if (plan.ok) _minuteAxisAnchorDev = plan.anchorDev
+      if (!plan.ok) {
+        // 不动轴、不动锚点：数据还不是分时数据（1D→分时的异步空档）时等真正的分时数据到位
+        const skipKey = `${plan.reason}|${plan.day || ''}|${plan.dayBarCount || 0}`
+        if (skipKey !== _minuteSkipLogKey) {
+          _minuteSkipLogKey = skipKey
+          console.info(`[KlineChart] 分时：跳过 Y 轴锁定（${plan.reason}，当日 ${plan.dayBarCount || 0} 根柱 / ${plan.day || '-'}）`)
+        }
+        return
+      }
+      const { from, to, fromPrice, toPrice } = plan
 
       // 锚点未变化且仍处于锁定态则跳过，避免实时刷新时反复重排
       if (axis && _minuteAxisRange &&
@@ -3882,10 +4173,10 @@ registerOverlay({
           axis.getAutoCalcTickFlag() === false) return
 
       // 无条件输出一行诊断日志（按 昨收+来源+范围 去重），便于现场确认昨收取值与来源
-      const logKey = `${pc}|${_minutePcSource}|${axisType}|${polarLimit}|${from}|${to}`
+      const logKey = `${pc}|${_minutePcSource}|${axisType}|${polarLimit}|${from}|${to}|${plan.day}|${plan.dayBarCount}`
       if (logKey !== _minutePcLogKey) {
         _minutePcLogKey = logKey
-        console.info(`[KlineChart] 分时0轴：昨收=${pc}（来源=${_minutePcSource || '已缓存'}） 轴=${axisType}${polarLimit > 0 ? ` 极坐标=±${polarLimit}%` : ''} 范围=[${from.toFixed(4)}, ${to.toFixed(4)}]`)
+        console.info(`[KlineChart] 分时0轴：昨收=${pc}（来源=${_minutePcSource || '已缓存'}） 轴=${axisType}${polarLimit > 0 ? ` 极坐标=±${polarLimit}%` : ''} 当日=${plan.day}(${plan.dayBarCount}根) 偏离=${plan.devPct.toFixed(2)}%${plan.reanchored ? ' 已重锚' : ''} 范围=[${from.toFixed(4)}, ${to.toFixed(4)}]`)
       }
 
       // ---- 0 轴线指标（原生逐帧重绘，画在昨收价上）----
@@ -3974,8 +4265,9 @@ registerOverlay({
         }
       } catch (_) { /* 预期内 */ }
       _minuteAxisRange = null
-      // 退出分时：清零 Y 轴单调锚点，下次进入分时重新从当日波动推导
+      // 退出分时：清零 Y 轴单调锚点与归属键，下次进入分时重新从当日波动推导
       _minuteAxisAnchorDev = 0
+      _minuteAxisKey = ''
       const axis = getCandleYAxis()
       if (_minuteAxisLocked && axis) {
         try {
@@ -4219,18 +4511,8 @@ registerOverlay({
               style: 'stroke',
               backgroundColor: 'transparent'
             },
-            // 恢复 K 线柱体颜色
-            bar: {
-              upColor: isDark ? '#ef5350' : '#f5222d',
-              downColor: isDark ? '#0ecb81' : '#52c41a',
-              noChangeColor: isDark ? '#888' : '#999',
-              upBorderColor: isDark ? '#ef5350' : '#f5222d',
-              downBorderColor: isDark ? '#0ecb81' : '#52c41a',
-              noChangeBorderColor: isDark ? '#888' : '#999',
-              upWickColor: isDark ? '#ef5350' : '#f5222d',
-              downWickColor: isDark ? '#0ecb81' : '#52c41a',
-              noChangeWickColor: isDark ? '#888' : '#999'
-            },
+            // 恢复 K 线柱体颜色（★ 走单一配色来源，禁止写死方案，否则与买卖点标记色脱钩）
+            bar: candleBarColors(chartColorScheme.value, isDark, isDark ? '#888' : '#999'),
             // 恢复价格标记
             priceMark: {
               show: true,
@@ -4279,8 +4561,12 @@ registerOverlay({
         _minutePcSymbolKey = _pcKey
         minutePrevClose.value = null
         _minutePcSource = ''
-        // 换标的：Y 轴范围单调锚点清零，避免沿用上一标的的波动区间
+        _minutePcDayKey = ''
+        // 换标的：跨日 1m 原始数据（昨收推导源）+ Y 轴锚点全部作废 ——
+        // 沿用上一标的的 1m 数据会推导出错误的昨收，沿用其波动区间会撑错窗口
+        _minuteRawData = []
         _minuteAxisAnchorDev = 0
+        _minuteAxisKey = ''
       }
 
       // 分时图模式：使用1m数据
@@ -4328,6 +4614,17 @@ registerOverlay({
           klineData.value = minuteData
           // 保存跨日 1m 原始数据：昨收自愈推导需要（klineData 仅含展示当日）
           _minuteRawData = formattedData
+          // 昨收 = 「被展示交易日的上一交易日收盘」⇒ 展示日一变（跨日/回退显示最近交易日）
+          // 必须重推：沿用上一交易日的昨收会把新窗口撑到 ±几十%（用户反馈的 ±60%）
+          const _dispDay = minuteDateStr(minuteData[minuteData.length - 1].timestamp)
+          if (_dispDay !== _minutePcDayKey) {
+            _minutePcDayKey = _dispDay
+            minutePrevClose.value = null
+            _minutePcSource = ''
+            // 新交易日：区间从当日波动重新推导（旧锚点属于上一交易日的数据）
+            _minuteAxisAnchorDev = 0
+            _minuteAxisKey = ''
+          }
           // 获取昨日收盘价（昨收），用于 Y 轴居中与 0 轴线
           // 传入 1m 原始数据：昨收优先从中推导，避免依赖额外的日线接口
           await fetchMinutePrevClose(formattedData)
@@ -5050,6 +5347,24 @@ registerOverlay({
       wsActive.value = false
     }
 
+    /**
+     * ★ keep-alive 挂起 ⇄ 恢复时暂停/恢复实时通道。
+     * 本组件常驻于 keep-alive 的路由内，父组件 deactivated 只清了自己的计时器，
+     * 子组件的 `startRestPolling`(2~15s 周期) 与加密 WS 会**继续在后台跑**
+     * ⇒ 多开几个页面 = N 套后台轮询常驻(请求量/电量/后端压力)。
+     * 用 _realtimePaused 标记避免「挂载时的 activated」引起一次无谓的 WS 重连。
+     */
+    let _realtimePaused = false
+    onActivated(() => {
+      if (!_realtimePaused) return
+      _realtimePaused = false
+      startRealtime()
+    })
+    onDeactivated(() => {
+      _realtimePaused = true
+      stopRealtime()
+    })
+
     // --- 图表初始化函数 ---
     const initChart = () => {
       const container = document.getElementById('kline-chart-container')
@@ -5125,7 +5440,7 @@ registerOverlay({
         try {
           chartRef.value = init(container, {
             locale: 'zh-CN',
-            drawingBarVisible: true,
+            // 注: 不传 drawingBarVisible —— 9.8 无此选项(见下方说明), 画线栏由本组件自绘
             overlay: { visible: true }
           })
         } catch (e) {
@@ -5136,14 +5451,12 @@ registerOverlay({
           }
         }
 
-        // 如果配置选项方式不支持，尝试调用方法启用画线工具栏
-        if (chartRef.value && typeof chartRef.value.setDrawingBarVisible === 'function') {
-          chartRef.value.setDrawingBarVisible(true)
-        } else if (chartRef.value && typeof chartRef.value.setDrawingBar === 'function') {
-          chartRef.value.setDrawingBar(true)
-        } else if (chartRef.value && typeof chartRef.value.enableDrawing === 'function') {
-          chartRef.value.enableDrawing(true)
-        }
+        // klinecharts 9.8.12 无原生画线工具栏: init 的 drawingBarVisible 选项与
+        // setDrawingBarVisible / setDrawingBar / enableDrawing 方法在 9.8 的 d.ts 与
+        // dist 中均不存在(实测 d.ts/dist 0 命中) ⇒ 原「探测后调用」三个分支恒为 false,
+        // 属死代码(照抄 klinecharts-pro 的写法, 版本不匹配)。本页画线工具是自己渲染的
+        // .drawing-toolbar(见模板) + selectDrawingTool, 父组件开关走本组件导出的
+        // setDrawingBarVisible(切 DOM 可见性)。
 
         if (!chartRef.value) {
           throw new Error('图表初始化失败：无法创建图表实例')
@@ -5152,20 +5465,6 @@ registerOverlay({
         _resetPctAxisBindings()
         // 换实例后买卖点标记已丢失: 复位签名后重挂 (数据未就绪时由 klineData watch 兜底)
         nextTick(applyTradeMarkers)
-
-        // 调试：输出图表实例的所有方法，检查是否有画线工具栏相关的方法
-        if (chartRef.value) {
-          // 检查是否有内置画线工具栏的方法
-          if (typeof chartRef.value.setDrawingBarVisible === 'function') {
-            chartRef.value.setDrawingBarVisible(true)
-          }
-          if (typeof chartRef.value.setDrawingBar === 'function') {
-            chartRef.value.setDrawingBar(true)
-          }
-          if (typeof chartRef.value.enableDrawing === 'function') {
-            chartRef.value.enableDrawing(true)
-          }
-        }
 
         // 设置价格精度（在 applyNewData 之前）
         if (typeof chartRef.value.setPriceVolumePrecision === 'function') {
@@ -5176,77 +5475,13 @@ registerOverlay({
         updateChartTheme()
         nextTick(() => _ensureWmLayer())
 
-        // 监听覆盖物创建完成事件，自动退出绘制模式
-        if (chartRef.value && typeof chartRef.value.subscribeAction === 'function') {
-          // 监听覆盖物创建完成事件
-          chartRef.value.subscribeAction('onOverlayCreated', (overlay) => {
-            // 如果是通过画线工具创建的覆盖物，记录ID并退出绘制模式
-            if (activeDrawingTool.value && overlay && overlay.id) {
-              // 检查覆盖物名称是否匹配当前激活的工具
-              const toolMap = {
-                line: 'segment',
-                horizontalLine: 'horizontalStraightLine',
-                verticalLine: 'verticalStraightLine',
-                ray: 'rayLine',
-                straightLine: 'straightLine',
-                parallelStraightLine: 'parallelStraightLine',
-                priceLine: 'priceLine',
-                priceChannelLine: 'priceChannelLine',
-                fibonacciLine: 'fibonacciLine',
-                measure: 'priceRangeMeasure'
-              }
-              const expectedOverlayName = toolMap[activeDrawingTool.value]
-
-              // 测量工具需要等待第二个点完成，不能在 created 阶段就退出绘制模式
-              if (expectedOverlayName === 'priceRangeMeasure') {
-                return
-              }
-              // 如果覆盖物名称匹配，或者是通过 overrideOverlay 创建的自定义覆盖物
-              if (!overlay.name || overlay.name === expectedOverlayName) {
-                addedDrawingOverlayIds.value.push(overlay.id)
-                // 重置激活状态
-                activeDrawingTool.value = null
-                // 退出绘制模式
-                try {
-                  if (typeof chartRef.value.overrideOverlay === 'function') {
-                    chartRef.value.overrideOverlay(null)
-                  }
-                } catch (e) {
-                }
-              }
-            }
-          })
-
-          // 监听覆盖物绘制完成事件（某些版本可能使用此事件）
-          if (typeof chartRef.value.subscribeAction === 'function') {
-            try {
-              chartRef.value.subscribeAction('onOverlayComplete', (overlay) => {
-                if (activeDrawingTool.value && overlay && overlay.id) {
-                  if (activeDrawingTool.value === 'measure') {
-                    const points = overlay.points || []
-                    if (points.length < 2 || !points[0] || !points[1]) {
-                      return
-                    }
-                  }
-                  addedDrawingOverlayIds.value.push(overlay.id)
-                  activeDrawingTool.value = null
-                  // 退出绘制模式 - 不调用 overrideOverlay(null)，因为会导致错误
-                }
-              })
-            } catch (e) {
-              // 如果 onOverlayComplete 不存在，忽略错误
-            }
-          }
-
-          // 监听覆盖物移除事件
-          chartRef.value.subscribeAction('onOverlayRemoved', (overlayId) => {
-            // 从列表中移除
-            const index = addedDrawingOverlayIds.value.indexOf(overlayId)
-            if (index > -1) {
-              addedDrawingOverlayIds.value.splice(index, 1)
-            }
-          })
-        }
+        // 画线 overlay 的「创建/完成/移除」三事件曾被挂在
+        // subscribeAction('onOverlayCreated'/'onOverlayComplete'/'onOverlayRemoved') 上 ——
+        // 但 klinecharts 9.8 的 ActionType 枚举**没有任何 overlay 生命周期事件**
+        // (只有 onDataReady/onZoom/onScroll/onVisibleRangeChange/onTooltipIconClick/
+        //  onCrosshairChange/onCandleBarClick/onPaneDrag) ⇒ 这三段是**死订阅**:
+        // 既不会登记 overlay id, 也不会「画完自动退出绘制模式」(该意图从未生效)。
+        // 正确挂点 = overlay 级回调 onDrawEnd/onRemoved, 见 selectDrawingTool。
 
         // 使用 subscribeAction 监听可见范围变化，手动触发加载更多
         // 替代 setLoadMoreDataCallback，因为它在某些版本可能不触发
@@ -5373,8 +5608,11 @@ registerOverlay({
         }
 
         window.addEventListener('resize', handleResize)
-      } catch (error) {
-        error.value = proxy.$t('dashboard.indicator.error.chartInitFailed') + ': ' + (error.message || '未知错误')
+      } catch (e) {
+        // ★ 参数名必须是 e 而不是 error: `catch (error)` 会遮蔽 setup 里的 error ref，
+        //   此时 `error.value = ...` 只是给异常对象挂属性 ⇒ 模板 v-if="error" 的遮罩永不显示
+        //   （初始化失败时用户只看到空白图，零提示）。
+        error.value = proxy.$t('dashboard.indicator.error.chartInitFailed') + ': ' + (e.message || '未知错误')
       }
     }
 
@@ -5452,17 +5690,8 @@ registerOverlay({
             showRule: 'always',
             showType: 'standard'
           },
-          bar: {
-            upColor: isDark ? '#ef5350' : '#f5222d',
-            downColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeColor: theme.borderColor,
-            upBorderColor: isDark ? '#ef5350' : '#f5222d',
-            downBorderColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeBorderColor: theme.borderColor,
-            upWickColor: isDark ? '#ef5350' : '#f5222d',
-            downWickColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeWickColor: theme.borderColor
-          },
+          // ★ 主题切换也必须跟随当前配色方案（曾写死 cn ⇒ 切主题后 intl 用户蜡烛跳回红涨）
+          bar: candleBarColors(chartColorScheme.value, isDark, theme.borderColor),
           // 若使用面积图类型，关闭末端点动画可减少实时跳动观感
           area: {
             point: { animation: false, animationDuration: 0 }
@@ -5473,15 +5702,10 @@ registerOverlay({
             showRule: 'always',
             showType: 'standard'
           },
-          // indicator.bars 控制副图指标（VOL等）的柱状图颜色
+          // indicator.bars 控制副图指标（VOL等）的柱状图颜色（★ 同读单一配色来源）
           bars: [{
             style: 'fill',
-            upColor: isDark ? '#ef5350' : '#f5222d',
-            downColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeColor: theme.borderColor,
-            upBorderColor: isDark ? '#ef5350' : '#f5222d',
-            downBorderColor: isDark ? '#0ecb81' : '#52c41a',
-            noChangeBorderColor: theme.borderColor
+            ...candleBarColors(chartColorScheme.value, isDark, theme.borderColor)
           }]
         },
         xAxis: {
@@ -6203,13 +6427,14 @@ registerOverlay({
                       const current = data.current
                       const prevHist = prev?.indicatorData?.histogram ?? 0
                       const currentHist = current?.indicatorData?.histogram ?? 0
-                      const isDark = props.theme === 'dark'
                       const bars = defaultStyles.bars || []
                       const barStyle = bars[0] || {}
+                      // 兜底色同读单一配色来源（热路径: 直接查表, 不构造对象）
+                      const p = CANDLE_BAR_PALETTE[_barPaletteKey(chartColorScheme.value)][props.theme === 'dark' ? 'dark' : 'light']
                       if (currentHist >= prevHist) {
-                        return { color: barStyle.upColor || (isDark ? '#ef5350' : '#f5222d'), style: 'fill' }
+                        return { color: barStyle.upColor || p.up, style: 'fill' }
                       } else {
-                        return { color: barStyle.downColor || (isDark ? '#0ecb81' : '#52c41a'), style: 'fill' }
+                        return { color: barStyle.downColor || p.down, style: 'fill' }
                       }
                     }
                   }
@@ -6618,9 +6843,11 @@ registerOverlay({
                         const curVal = data.current?.indicatorData?.[f.key] ?? 0
                         const bars = defaultStyles.bars || []
                         const barStyle = bars[0] || {}
+                        // 兜底色同读单一配色来源（热路径: 直接查表）
+                        const p = CANDLE_BAR_PALETTE[_barPaletteKey(chartColorScheme.value)][props.theme === 'dark' ? 'dark' : 'light']
                         return curVal >= prevVal
-                          ? { color: barStyle.upColor || '#f5222d', style: 'fill' }
-                          : { color: barStyle.downColor || '#52c41a', style: 'fill' }
+                          ? { color: barStyle.upColor || p.up, style: 'fill' }
+                          : { color: barStyle.downColor || p.down, style: 'fill' }
                       }
                     }
                   }
@@ -6694,7 +6921,18 @@ registerOverlay({
       }
       if (mainPaneOverlayFigures.length > 0) {
         try {
-          const combinedName = `QD_MAIN_OVERLAY_${mainPaneOverlaySignatureParts.join('_').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 120)}`
+          // ★ 注册名必须与"这一组叠加指标"一一对应。
+          // 原实现把签名 join 后 slice(0,120): 主图叠加指标 4 个以上时尾部必被截断
+          // (每个签名含 `SMA_20_sma_<ts>_<rand>` ≈ 33 字符), 不同组合可能落到同名 ⇒
+          // registerCustomIndicator 遇 'already registered' 直接 `return true`
+          // (见其 catch 分支) ⇒ createIndicator 拿到的仍是**上一个组合**的 calc 闭包
+          // ⇒ 画出别的指标的数据。改为「短前缀 + 全签名哈希」, 长度有界且哈希覆盖全部内容。
+          const _overlaySig = mainPaneOverlaySignatureParts.join('_').replace(/[^a-zA-Z0-9_]/g, '_')
+          let _sigHash = 5381
+          for (let _hi = 0; _hi < _overlaySig.length; _hi++) {
+            _sigHash = ((_sigHash * 33) ^ _overlaySig.charCodeAt(_hi)) >>> 0
+          }
+          const combinedName = `QD_MAIN_OVERLAY_${_overlaySig.slice(0, 96)}_${_sigHash.toString(36)}`
           const registered = registerCustomIndicator(
             combinedName,
             (kLineDataList) => {
@@ -7664,6 +7902,10 @@ registerOverlay({
       stopRealtime,
       initChart,
       handleResize,
+      // ★ 父组件入口: indicator-ide 切回图表 tab / 拖分割条后会调 chart.resize()。
+      //   此前未导出 resize ⇒ 父组件 `typeof chart.resize === 'function'` 守卫恒 false，
+      //   每次调用都静默跳过（"声明了但没接线"）。转发到本组件 rAF 防抖的 handleResize。
+      resize () { handleResize() },
       updateChartTheme,
       updateIndicators,
       renderChip,
@@ -7717,24 +7959,25 @@ registerOverlay({
         // 记录当前方案: 买卖点标记颜色与红绿柱同步读取此值
         chartColorScheme.value = scheme === 'intl' ? 'intl' : 'cn'
         if (!chartRef.value) return
-        const isIntl = scheme === 'intl'
         const isDark = props.theme === 'dark'
+        // ★ 只写本方法原本写的那 6 个字段（不多写 noChange*，避免污染已有的中性色）
+        const p = CANDLE_BAR_PALETTE[_barPaletteKey(scheme)][isDark ? 'dark' : 'light']
         try {
           chartRef.value.setStyles({
             candle: {
               bar: {
-                upColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
-                downColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a'),
-                upBorderColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
-                downBorderColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a'),
-                upWickColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
-                downWickColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
+                upColor: p.up,
+                downColor: p.down,
+                upBorderColor: p.up,
+                downBorderColor: p.down,
+                upWickColor: p.up,
+                downWickColor: p.down
               }
             },
             indicator: {
               bars: [{
-                upColor: isIntl ? (isDark ? '#0ecb81' : '#52c41a') : (isDark ? '#ef5350' : '#f5222d'),
-                downColor: isIntl ? (isDark ? '#ef5350' : '#f5222d') : (isDark ? '#0ecb81' : '#52c41a')
+                upColor: p.up,
+                downColor: p.down
               }]
             }
           })

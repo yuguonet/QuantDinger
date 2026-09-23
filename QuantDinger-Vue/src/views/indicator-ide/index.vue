@@ -3191,9 +3191,16 @@ export default {
       const klineData = (typeof chartInstance.getDataList === 'function') ? chartInstance.getDataList() : []
       const klineTimestamps = klineData.map(k => k.timestamp)
 
-      // Parse a backend time string as UTC -> epoch millis.
-      // Backend emits '%Y-%m-%d %H:%M' without tz info; values are UTC.
-      const parseBackendTime = (raw) => {
+      // ── 后端时间语义（2026-09-24 对表取证）────────────────────────────────
+      // 后端 backtest.py 的 bar_time 由 df 索引生成（UTC → Asia/Shanghai → 去 tz），
+      // 即**市场本地墙钟**（如 '2026-09-23 14:56'），不是 UTC。
+      // 而 /api/kline 的 bar 时间戳是该墙钟对应的**真实时刻**
+      // （实测 kline_1D raw=1790146800 → 北京 2026-09-23 15:00；1D 按收盘 15:00 盖章）。
+      // 两者相差一个市场偏移。原实现一律按 UTC 解析（补 'Z'）＝把时间 +8h 再向下取整：
+      //   · 日线（收盘盖章）: +8h 后仍落在同一交易日内 ⇒ 巧合正确（线上无感）
+      //   · 分时（起始盖章）: 整体后移 8 小时，越过当天末根后被夹到最后一根 ⇒ 明显错位
+      // ⇒ 日线及以上**保持原语义**（行为零变化）；分时且市场偏移已知时按市场本地解析。
+      const parseBackendTime = (raw, tzSuffix) => {
         if (raw == null) return 0
         if (typeof raw === 'number') {
           return raw < 1e10 ? raw * 1000 : raw
@@ -3202,11 +3209,34 @@ export default {
         if (!s) return 0
         if (!s.includes('T')) s = s.replace(' ', 'T')
         if (!/:\d{2}$/.test(s) && /T\d{2}:\d{2}$/.test(s)) s += ':00'
-        if (!s.endsWith('Z') && !/[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z'
+        if (!s.endsWith('Z') && !/[+-]\d{2}:?\d{2}$/.test(s)) s += (tzSuffix || 'Z')
         const d = new Date(s)
         const t = d.getTime()
         return isNaN(t) ? 0 : t
       }
+
+      // 图表 bar 周期: 用最近 ≤200 根的间隔中位数判断「日线及以上」还是「分时」。
+      // 比读 props.timeframe 更可靠（分时模式 / 多周期切换下 timeframe 未必等于盖章口径）。
+      const barSpanMs = (() => {
+        const n = klineTimestamps.length
+        if (n < 3) return 0
+        const gaps = []
+        for (let i = Math.max(1, n - 200); i < n; i++) {
+          const g = klineTimestamps[i] - klineTimestamps[i - 1]
+          if (g > 0) gaps.push(g)
+        }
+        if (!gaps.length) return 0
+        gaps.sort((a, b) => a - b)
+        return gaps[gaps.length >> 1] || 0
+      })()
+      const isDailyOrLarger = barSpanMs >= 20 * 3600 * 1000
+      // 市场本地偏移（分钟）: 仅对已知市场启用分时修正 —— 其余市场沿用原语义，
+      // 避免在未取证的时区约定上改动 marker 落点。
+      const mkt = String(this.market || '').toLowerCase()
+      const mktOffsetMin = (mkt.indexOf('cn') === 0 || mkt.indexOf('hk') === 0) ? 480 : null
+      const intradayTzSuffix = (!isDailyOrLarger && mktOffsetMin != null)
+        ? '+08:00'
+        : 'Z'
 
       for (const trade of trades) {
         const ty = (trade.type || '').toLowerCase()
@@ -3215,7 +3245,7 @@ export default {
         if (!isBuy && !isSell) continue
 
         // Prefer bar_time (chart-aligned) over time (may be at finer exec TF in MTF mode)
-        let timestamp = parseBackendTime(trade.bar_time || trade.timestamp || trade.time)
+        let timestamp = parseBackendTime(trade.bar_time || trade.timestamp || trade.time, intradayTzSuffix)
 
         // Floor-snap to the K-line bar that CONTAINS this timestamp, not nearest.
         // This avoids a full-bar offset when an intra-bar trigger (SL/TP) happens
