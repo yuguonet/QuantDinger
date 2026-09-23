@@ -371,6 +371,20 @@ def _post_market_batch():
     # 板块热度每日统计（依赖 1D 日线，必须在最后执行）
     _refresh_sector_daily()
 
+    # 自选股标签 system 自算 (grade=1 兜底, 全量自选股并集) —— 放在最后:
+    # 必须等 1D 日线到位; 复用本批次的 once_per_day 守卫与跨重启完成标记, 不另起调度器。
+    # 失败不影响盘后批次结论 (标签是展示层兜底, 不参与任何策略判定)。
+    try:
+        from app.watchlist.job import run_daily as _label_run_daily
+        _stats = _label_run_daily()
+        logger.info("[label] 每日标签刷新: scope=%s written=%s skipped=%s failed=%s 接管=%s",
+                    _stats.get("scope"), _stats.get("written"), _stats.get("skipped"),
+                    _stats.get("failed"), _stats.get("takeover"))
+    except Exception:
+        logger.error("[label] 每日标签刷新失败 (不影响盘后批次)")
+        import traceback as _tb
+        logger.error(_tb.format_exc())
+
     # 通知 EvalWorker: 盘后批次完成，K线数据已就绪
     post_market_done.set()
     logger.info("[post_market] 盘后批次完成，已通知 EvalWorker")

@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-筹码分布模块。
+筹码分布模块（agent 口径展示器）。
 
-计算 + tool 包装自包含，不依赖 analysis_tools。
-算法：
+2026-09-23 合并: 本模块原与 app/services/chip_service.py 各有一份**同算法重复实现**。
+现**唯一数学内核** = `app.services.chip_service.compute_chip_core`（三角分布 + 时间衰减），
+本模块只做「取数 + agent 口径组装」（多出集中度/套牢盘/筹码峰等高层面），
+改算法一律改内核，**禁止在本文件复制判定**。
+
+算法（内核内实现）：
   1. 每条 K 线的成交量按三角分布（峰值在 close）分配至 low~high 区间
   2. 时间指数衰减加权（近期权重更高）
   3. 离散化价格桶，累积筹码量
-  4. 计算加权平均成本、90% 集中区间、获利/亏损比例
+  4. 计算加权平均成本、90%/70% 集中区间、获利/亏损比例、筹码峰
+
+依赖方向: services(基座) ← agent(上级)。本文件可 import services，反向禁止。
 """
 from __future__ import annotations
 
@@ -15,10 +21,11 @@ from typing import Any, Dict, List
 
 from app.agent.log import logger
 from app.agent.tools.finance._analysis_utils import _fetch_klines
+from app.services.chip_service import compute_chip_core
 
 
 # ═══════════════════════════════════════════════════════════════
-# 筹码计算（纯函数，只做数学）
+# 筹码展示组装（agent 口径；数学全在 compute_chip_core）
 # ═══════════════════════════════════════════════════════════════
 
 def _calc_chip_distribution(
@@ -27,7 +34,7 @@ def _calc_chip_distribution(
     lookback_days: int = 120,
     num_buckets: int = 80,
 ) -> Dict[str, Any]:
-    """计算筹码分布。
+    """计算筹码分布（agent 口径）。
 
     Args:
         klines: K 线列表，每项含 time/open/high/low/close/volume
@@ -50,99 +57,22 @@ def _calc_chip_distribution(
             "resistance_prices": [阻力位列表],
             "chip_peaks": [筹码峰(price, strength)],
             "total_volume_analyzed": 分析总成交量,
+            "analyzed_days": 分析 K 线数,
         }
+        失败返回 {"error": "<原因>"}
     """
-    if not klines:
-        return {"error": "K线数据为空"}
+    core = compute_chip_core(klines, lookback_days=lookback_days, num_buckets=num_buckets)
+    if "error" in core:
+        return {"error": core["error"]}
 
-    # lookback_days 生效：截取最近 N 条
-    if lookback_days > 0 and len(klines) > lookback_days:
-        klines = klines[-lookback_days:]
+    buckets = core["buckets"]
+    prices = core["prices"]
+    cum_ratio = core["cum_ratio"]
+    current_price = core["current_price"]
+    avg_cost = core["avg_cost_raw"]
+    profit_ratio = core["profit_ratio_raw"]
 
-    # 提取 OHLCV
-    closes = [float(k.get("close", 0)) for k in klines]
-    highs = [float(k.get("high", 0)) for k in klines]
-    lows = [float(k.get("low", 0)) for k in klines]
-    volumes = [float(k.get("volume", 0)) for k in klines]
-
-    if not closes:
-        return {"error": "K线缺少价格数据"}
-
-    current_price = closes[-1]
-
-    # 价格区间 + 桶宽度
-    price_min = min(lows)
-    price_max = max(highs)
-    if price_max <= price_min:
-        return {"error": "价格区间异常"}
-
-    # 自适应桶间距（最小 0.01）
-    bucket_width = max((price_max - price_min) / num_buckets, 0.01)
-    buckets = int((price_max - price_min) / bucket_width) + 1
-
-    # 筹码累积数组 [price_index] = total_weighted_volume
-    chip_density = [0.0] * buckets
-
-    n = len(klines)
-    for i in range(n):
-        lo, hi, cl, vol = lows[i], highs[i], closes[i], volumes[i]
-        if hi <= lo or vol <= 0:
-            continue
-
-        # 时间衰减权重：近期权重高，指数衰减
-        age = n - 1 - i  # 0=最新
-        decay = 0.98 ** age
-
-        # 三角分布：峰值在 close，两端在 low/high
-        # 左右半宽分别计算，避免 close 偏向一侧时权重失真
-        left_half = cl - lo
-        right_half = hi - cl
-        if left_half < 0.001:
-            left_half = 0.001
-        if right_half < 0.001:
-            right_half = 0.001
-
-        steps = max(int((hi - lo) / bucket_width) + 1, 10)
-        total_weight = 0.0
-        weights = []
-        for j in range(steps + 1):
-            p = lo + (hi - lo) * j / steps
-            if p <= cl:
-                dist = (cl - p) / left_half
-            else:
-                dist = (p - cl) / right_half
-            w = max(1.0 - dist, 0.0)
-            weights.append((p, w))
-            total_weight += w
-
-        if total_weight <= 0:
-            continue
-
-        # 按桶累积（clamp 索引防越界）
-        for p, w in weights:
-            idx = int((p - price_min) / bucket_width)
-            idx = max(0, min(idx, buckets - 1))
-            chip_density[idx] += (vol * decay * w / total_weight)
-
-    if max(chip_density) <= 0:
-        return {"error": "筹码计算无有效数据"}
-
-    # ── 计算总量和累积比例 ──
-    total_chips = sum(chip_density)
-
-    cum_ratio = []
-    acc = 0.0
-    for d in chip_density:
-        acc += d
-        cum_ratio.append(acc / total_chips)
-
-    # 价格序列
-    prices = [price_min + i * bucket_width for i in range(buckets)]
-
-    # ── 加权平均成本 ──
-    avg_cost = sum(prices[i] * chip_density[i] for i in range(buckets)) / total_chips
-
-    # ── 90% 集中区间（剔除两端各 5%） ──
+    # ── 90% 集中区间（剔除两端各 5%）──
     lower_idx = 0
     upper_idx = buckets - 1
     for i in range(buckets):
@@ -165,7 +95,7 @@ def _calc_chip_distribution(
     else:
         concentration_90 = "低"
 
-    # ── 70% 集中区间（剔除两端各 15%） ──
+    # ── 70% 集中区间（剔除两端各 15%）──
     c70_lower_idx = 0
     c70_upper_idx = buckets - 1
     for i in range(buckets):
@@ -188,41 +118,16 @@ def _calc_chip_distribution(
     else:
         concentration_70 = "低"
 
-    # ── 获利/亏损比例 ──
-    profit_ratio = 0.0
-    for i in range(buckets):
-        if prices[i] <= current_price:
-            profit_ratio += chip_density[i]
-    profit_ratio /= total_chips if total_chips > 0 else 1
     loss_ratio = 1.0 - profit_ratio
 
-    # ── 筹码峰检测（局部最大值） ──
-    peaks = []
-    density_sum = sum(chip_density)
-    peak_threshold = max(chip_density) * 0.15  # 降至 15%，捕获次级峰
-
-    for i in range(1, buckets - 1):
-        if (chip_density[i] > chip_density[i - 1] and
-                chip_density[i] >= chip_density[i + 1] and
-                chip_density[i] >= peak_threshold):
-            strength = chip_density[i] / density_sum if density_sum > 0 else 0
-            peaks.append({
-                "price": round(prices[i], 2),
-                "strength": round(strength, 4),
-            })
-
+    # ── 筹码峰 & 支撑/阻力位 ──
+    # 口径与合并前一致: 峰价取整到 2 位展示; 峰按**取整后强度**降序 (稳定排序 ⇒ 同强度保留价格升序)
+    peaks = [{"price": round(p["price"], 2), "strength": round(p["strength"], 4)}
+             for p in core["peaks"]]
     peaks.sort(key=lambda x: x["strength"], reverse=True)
 
-    # ── 支撑/阻力位 ──
-    sorted_peaks = sorted(peaks, key=lambda x: x["strength"], reverse=True)
-    support_prices = []
-    resistance_prices = []
-    for p in sorted_peaks:
-        if p["price"] < current_price:
-            support_prices.append(p["price"])
-        elif p["price"] > current_price:
-            resistance_prices.append(p["price"])
-
+    support_prices = [p["price"] for p in peaks if p["price"] < current_price]
+    resistance_prices = [p["price"] for p in peaks if p["price"] > current_price]
     support_prices = sorted(support_prices, reverse=True)[:3]
     resistance_prices = sorted(resistance_prices)[:3]
 
@@ -245,8 +150,8 @@ def _calc_chip_distribution(
         "support_prices": support_prices,
         "resistance_prices": resistance_prices,
         "chip_peaks": peaks[:5],
-        "total_volume_analyzed": round(total_chips, 0),
-        "analyzed_days": n,
+        "total_volume_analyzed": round(core["total_chips"], 0),
+        "analyzed_days": core["kline_count"],
     }
 
 

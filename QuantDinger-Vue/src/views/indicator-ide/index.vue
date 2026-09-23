@@ -211,6 +211,7 @@
               :realtime-enabled="klineRealtimeEnabled"
               :showIndicatorBar="false"
               :showChip="showChip"
+              :level-lines="chartLevelLines"
               @indicator-toggle="handleIndicatorToggle"
             />
           </div>
@@ -1356,6 +1357,33 @@ export default {
     },
     chartTheme () {
       return this.isDarkTheme ? 'dark' : 'light'
+    },
+    /**
+     * 分时图关键位水平线（支撑 / 压力），供图表组件叠加绘制。
+     *
+     * 数据来源刻意选**已加载的自选列表**（`this.watchlist`）—— `/watchlist/get` 已把 label
+     * 的 4 段 attach 到每一行上 ⇒ 零新增接口、零新增请求。标的不在自选里（或该行没有 label）
+     * 时返回空数组，图上就不画线，不做任何"近似兜底"（宁可没有，也不给错的价格）。
+     *
+     * 段级来源天然可信：`sections` 里的 levels 段已由后端按等级/接管/回填裁定过，
+     * 前端只做"取价格 + 标方向"，不参与任何判定。
+     */
+    chartLevelLines () {
+      const market = this.market
+      const symbol = this.symbol
+      if (!market || !symbol) return []
+      const row = (this.watchlist || []).find(r => r && r.market === market && r.symbol === symbol)
+      const sections = (row && row.sections) || []
+      const out = []
+      for (const sec of sections) {
+        if (!sec || (sec.key !== 'supports' && sec.key !== 'resistances')) continue
+        const side = sec.key === 'supports' ? 'support' : 'resistance'
+        for (const it of (sec.items || [])) {
+          const price = Number(it && it.price)
+          if (Number.isFinite(price) && price > 0) out.push({ price, side })
+        }
+      }
+      return out
     },
     chartTabOptions () {
       return [

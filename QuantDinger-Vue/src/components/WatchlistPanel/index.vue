@@ -81,9 +81,9 @@
         <div class="wl-card-body" :class="{ 'with-cb': batchMode }">
           <div class="wl-row-main" :class="{ 'negative-news': stock.news_score !== undefined && stock.news_score < -4 }">
             <div class="wl-col-name">
-              <a-popover v-if="stock.strategy_state" trigger="hover" placement="right">
+              <a-popover v-if="stock.strategy_state || (stock.sections && stock.sections.length)" trigger="hover" placement="right">
                 <template slot="content">
-                  <div class="wl-strategy-pop" v-html="strategyDetailHtml(stock)"></div>
+                  <div class="wl-strategy-pop" v-html="labelSectionsHtml(stock)"></div>
                 </template>
                 <div class="wl-name-wrap">
                   <div class="wl-symbol-line">
@@ -1068,29 +1068,93 @@ export default {
     strategyStopPrice (stock) { return (stock.strategy_detail || {}).stop_price },
     strategyScore (stock) { const s = (stock.strategy_detail || {}).score; return (s === undefined || s === null) ? null : s },
     strategyPreConfirm (stock) { const pc = (stock.strategy_detail || {}).pre_confirm; return pc || null },
-    strategyDetailHtml (stock) {
-      const d = stock.strategy_detail || {}
-      const esc = s => String(s === undefined || s === null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
-      const row = (k, v) => (v !== undefined && v !== null && v !== '') ? `<tr><td class="k">${k}</td><td class="v">${esc(v)}</td></tr>` : ''
-      const pcMap = { strong: '强', ok: '中', weak: '弱' }
-      let html = '<table class="wl-dtable">'
-      html += row('策略', d.strategy_label)
-      html += row('历史胜率', d.winrate !== undefined && d.winrate !== null ? d.winrate + '%' : '')
-      html += row('状态', (d.state_label || stock.strategy_state || '') + (d.pre_confirm ? `(预判:${pcMap[d.pre_confirm] || d.pre_confirm})` : ''))
-      html += row('形态', d.entry_style)
-      html += row('评分', d.score)
-      if (d.lu_date) html += row('锚点日', `${d.lu_date}${d.pullback_days ? ` 回调${d.pullback_days}天` : ''}`)
-      if (d.signal_date) html += row('信号', `${d.signal_date} @ ${d.signal_price || ''}`)
-      if (d.turnover_anchor !== undefined && d.turnover_anchor !== null) html += row('换手(锚)', `${d.turnover_anchor}%${d.turnover_sig !== undefined && d.turnover_sig !== null ? ` / 信${d.turnover_sig}%` : ''}`)
-      if (d.float_mcap_yi !== undefined && d.float_mcap_yi !== null) html += row('流通市值', `${d.float_mcap_yi}亿`)
-      if (d.ma60_slope !== undefined && d.ma60_slope !== null) html += row('MA60斜率', `${d.ma60_slope}%${d.ma_bull ? ' 多头排列' : ''}`)
-      if (d.entry_date) html += row('买入', `${d.entry_date} @ ${d.entry_price || ''}`)
-      if (d.stop_price) html += row('止损', d.stop_price)
-      if (d.d1_chg !== undefined && d.d1_chg !== null) html += row('D1确认', `${d.d1_chg > 0 ? '+' : ''}${d.d1_chg}%${d.d1_vol_r !== undefined && d.d1_vol_r !== null ? ` 量比${d.d1_vol_r}` : ''}`)
-      if (d.exit_reason) html += row('出场', `${d.exit_reason}${d.exit_date ? ` (${d.exit_date} @ ${d.exit_price || ''})` : ''}`)
-      html += '</table>'
-      html += '<div class="wl-strategy-foot">自动策略组 · 系统自动管理</div>'
+    // ── label 4 段通用渲染器（type 只有 3 种: levels / score / units(fields|table)）──
+    // 明细的唯一渲染处; 内容由后端 label 统一出口发放, 前端不再各自拼装
+    escHtml (s) {
+      return String(s === undefined || s === null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+    },
+    fmtNum (v, nd) { return (v === undefined || v === null) ? '' : Number(v).toFixed(nd === undefined ? 2 : nd) },
+    fmtPct (v, nd) { return (v === undefined || v === null) ? '' : (Number(v) * 100).toFixed(nd === undefined ? 1 : nd) + '%' },
+    labelSourceText (grade) { return { 0: '空白', 1: '系统算', 2: 'agent', 3: '策略' }[grade] || '' },
+    // 来源键 → 显示名（stale 的键是 source 字符串, 不是 grade）
+    labelSourceByKey (k) { return { system: '系统算', agent: 'agent', auto: '策略' }[k] || k },
+    // meta 只承载"异常与来源": 正常态（当日更新、未接管）不出现任何多余词
+    labelMetaText (stock) {
+      const parts = []
+      const src = this.labelSourceText(stock.grade)
+      if (src) parts.push(src)
+      if (stock.taken_over) parts.push('已接管')
+      const age = stock.age_days
+      if (age !== undefined && age !== null && age > 0) parts.push(`${age} 个交易日未更新`)
+      const stale = stock.stale && Object.keys(stock.stale)
+      if (stale && stale.length) parts.push(stale.map(k => `${this.labelSourceByKey(k)}已失效`).join(' '))
+      return parts.join(' · ')
+    },
+    // 关键位: 水平排列 —— 标题在左, 价格在一行内从左到右铺开(不再一档一行)
+    // 强度/距现价/来源仍放悬停: 扫读只要价格, 想追问再停一下
+    renderLevelsSection (sec) {
+      const items = sec.items || []
+      if (!items.length) return ''
+      const cells = items.map(it => {
+        const tip = [
+          (it.strength !== undefined && it.strength !== null) ? `强度 ${this.fmtPct(it.strength)}` : '',
+          (it.dist_pct !== undefined && it.dist_pct !== null) ? `距现价 ${this.fmtPct(Math.abs(it.dist_pct))}` : '',
+          it.origin ? `来源 ${it.origin === 'chip_peak' ? '筹码峰' : it.origin}` : ''
+        ].filter(Boolean).join(' · ')
+        return `<span class="wl-lv"${tip ? ` title="${this.escHtml(tip)}"` : ''}>${this.fmtNum(it.price, 2)}</span>`
+      }).join('')
+      return `<div class="wl-sec wl-sec-inline"><div class="wl-sec-t">${this.escHtml(sec.title || sec.key)}</div>` +
+        `<div class="wl-lv-row">${cells}</div></div>`
+    },
+    // 评分: 同样与标题同行; 数字放大, 满分与口径进悬停（口径漂移是风险项 ⇒ 可查但不必常驻）
+    renderScoreSection (sec) {
+      if (sec.value === undefined || sec.value === null) return ''
+      const tip = `满分 100${sec.score_version ? ` · 口径 v${sec.score_version}` : ''}`
+      return `<div class="wl-sec wl-sec-inline"><div class="wl-sec-t">${this.escHtml(sec.title || sec.key)}</div>` +
+        `<div class="wl-score-val" title="${this.escHtml(tip)}">${this.fmtNum(sec.value, 0)}` +
+        `<span class="wl-score-max">/100</span></div></div>`
+    },
+    renderUnits (units) {
+      let html = ''
+      ;(units || []).forEach(u => {
+        const rows = u.rows || []
+        if (!rows.length) return                 // 空单元不产出（后端已裁, 此处防御）
+        const title = `<div class="wl-sec-t">${this.escHtml(u.title || (u.type === 'table' ? '表格' : '字段'))}</div>`
+        if (u.type === 'fields') {
+          html += `<div class="wl-sec">${title}<table class="wl-dtable">`
+          rows.forEach(r => {
+            html += `<tr><td class="k">${this.escHtml(r.label)}</td><td class="v">${this.escHtml(r.value)}</td></tr>`
+          })
+          html += '</table></div>'
+          return
+        }
+        // table: 再兜一次"整列皆空不显示"（后端 _tidy_units 是主防线, 这里只防脏数据）
+        const cols = (u.columns || []).filter(c =>
+          rows.some(r => !/^\s*$/.test(String(r[c.key] === undefined || r[c.key] === null ? '' : r[c.key]))))
+        if (!cols.length) return
+        html += `<div class="wl-sec">${title}<table class="wl-dtable">`
+        html += '<tr>' + cols.map(c => `<td class="k">${this.escHtml(c.label)}</td>`).join('') + '</tr>'
+        rows.forEach(r => {
+          html += '<tr>' + cols.map(c => `<td class="v">${this.escHtml(r[c.key])}</td>`).join('') + '</tr>'
+        })
+        html += '</table></div>'
+      })
       return html
+    },
+    renderSections (sections) {
+      let html = ''
+      ;(sections || []).forEach(sec => {
+        if (sec.type === 'levels') html += this.renderLevelsSection(sec)
+        else if (sec.type === 'score') html += this.renderScoreSection(sec)
+        else if (sec.type === 'units') html += this.renderUnits(sec.units)
+      })
+      return html
+    },
+    labelSectionsHtml (stock) {
+      const body = this.renderSections(stock.sections)
+      if (!body) return ''                      // 没有任何段 ⇒ 弹层整体不显示(不吐孤儿 meta)
+      const meta = this.labelMetaText(stock)
+      return (meta ? `<div class="wl-sec-meta">${this.escHtml(meta)}</div>` : '') + body
     },
     onDragStart (stock, e) {
       this.dragKey = `${stock.market}:${stock.symbol}`
@@ -1131,25 +1195,6 @@ export default {
       try {
         await reorderWatchlist({ items: list.map((s, i) => ({ id: s.id, sort_order: i + 1 })) })
       } catch (err) { /* 静默: 下次同步按服务器顺序 */ }
-    },
-    strategyDetailText (stock) {
-      const d = stock.strategy_detail || {}
-      const pcMap = { strong: '强', ok: '中', weak: '弱' }
-      const lines = []
-      lines.push(`状态: ${d.state_label || stock.strategy_state || ''}${d.pre_confirm ? `(预判:${pcMap[d.pre_confirm] || d.pre_confirm})` : ''}`)
-      if (d.entry_style) lines.push(`形态: ${d.entry_style}`)
-      if (d.score !== undefined && d.score !== null) lines.push(`评分: ${d.score}`)
-      if (d.turnover_anchor !== undefined && d.turnover_anchor !== null) lines.push(`换手(锚): ${d.turnover_anchor}%${d.turnover_sig !== undefined && d.turnover_sig !== null ? ` / 信${d.turnover_sig}%` : ''}`)
-      if (d.float_mcap_yi !== undefined && d.float_mcap_yi !== null) lines.push(`流通市值: ${d.float_mcap_yi}亿`)
-      if (d.ma60_slope !== undefined && d.ma60_slope !== null) lines.push(`MA60五日斜率: ${d.ma60_slope}%${d.ma_bull ? ' 多头排列' : ''}`)
-      if (d.lu_date) lines.push(`锚点日: ${d.lu_date}${d.pullback_days ? ` 回调${d.pullback_days}天` : ''}`)
-      if (d.signal_date) lines.push(`信号: ${d.signal_date} @ ${d.signal_price || ''}`)
-      if (d.entry_date) lines.push(`买入: ${d.entry_date} @ ${d.entry_price || ''}`)
-      if (d.stop_price) lines.push(`止损: ${d.stop_price}`)
-      if (d.d1_chg !== undefined && d.d1_chg !== null) lines.push(`D1确认: ${d.d1_chg > 0 ? '+' : ''}${d.d1_chg}% 量比${d.d1_vol_r || ''}`)
-      if (d.exit_reason) lines.push(`出场: ${d.exit_reason}${d.exit_date ? ` (${d.exit_date} @ ${d.exit_price || ''})` : ''}`)
-      lines.push('自动策略组 · 系统自动管理 (买/持/卖自动增删)')
-      return lines.join('\n')
     },
     async handleAddStock () {
       // Determine which symbols to add
@@ -1560,11 +1605,6 @@ export default {
 .wl-strategy-mini-entry { color: #15803d; }
 .wl-strategy-mini-stop { color: #475569; }
 .wl-card.drag-over { border-color: #2563eb !important; background: rgba(37,99,235,0.06); }
-.wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
-.wl-strategy-pop table.wl-dtable td { padding: 2px 8px; border-bottom: 1px solid #f1f5f9; }
-.wl-strategy-pop table.wl-dtable td.k { color: #94a3b8; white-space: nowrap; padding-right: 12px; }
-.wl-strategy-pop table.wl-dtable td.v { color: #0f172a; font-weight: 500; }
-.wl-strategy-pop .wl-strategy-foot { margin-top: 6px; font-size: 10px; color: #94a3b8; }
 .wl-hover-btn.strategy-managed { color: #94a3b8; cursor: default; }
 
 .negative-news { background: rgba(239, 68, 68, 0.08) !important; border-color: rgba(239, 68, 68, 0.2) !important; }
@@ -1619,6 +1659,26 @@ export default {
 </style>
 
 <style lang="less">
+/* label 弹层内容 —— 必须放**非 scoped** 样式块：
+   ① 内容经 `v-html` 注入（不含编译期 data-v 属性）② a-popover 的 content 还 teleport 到 body。
+   两者叠加 ⇒ scoped 编译出的 `[data-v-*]` 选择器全部匹配不到，样式静默失效。
+   与下面的 .wl-group-menu 同理。若把本块移回 scoped，弹层会退化成无样式的纯文本流。 */
+.wl-strategy-pop { font-size: 12px; line-height: 1.5; color: #0f172a; }
+.wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
+.wl-strategy-pop table.wl-dtable td { padding: 2px 8px 2px 0; border-bottom: 1px solid #f1f5f9; }
+.wl-strategy-pop table.wl-dtable td.k { color: #94a3b8; white-space: nowrap; padding-right: 12px; }
+.wl-strategy-pop table.wl-dtable td.v { color: #0f172a; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wl-strategy-pop .wl-sec { margin-bottom: 6px; }
+.wl-strategy-pop .wl-sec-t { font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 2px; }
+/* 标题与内容同行（关键位/评分）: 一行读完, 不再"标题独占一行" */
+.wl-strategy-pop .wl-sec-inline { display: flex; align-items: baseline; gap: 10px; }
+.wl-strategy-pop .wl-sec-inline .wl-sec-t { margin-bottom: 0; flex: 0 0 auto; min-width: 34px; }
+/* 关键位水平排列: 价格从左到右铺开, 档数变化自动换行 */
+.wl-strategy-pop .wl-lv-row { display: flex; flex-wrap: wrap; gap: 2px 12px; min-width: 0; }
+.wl-strategy-pop .wl-lv { font-size: 12px; font-weight: 500; color: #0f172a; font-variant-numeric: tabular-nums; }
+.wl-strategy-pop .wl-score-val { font-size: 18px; font-weight: 600; color: #0f172a; line-height: 20px; }
+.wl-strategy-pop .wl-score-max { font-size: 11px; font-weight: 500; color: #94a3b8; margin-left: 2px; }
+.wl-strategy-pop .wl-sec-meta { font-size: 10px; color: #94a3b8; margin-bottom: 6px; }
 .wl-group-menu {
   min-width: 200px;
   max-height: 320px;

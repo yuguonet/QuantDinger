@@ -482,19 +482,18 @@ def get_markers(code, days=60):
 # ================================================================
 
 def _display_detail(s):
-    """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。"""
+    """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。
+
+    注意: 不渲染 entry_style —— 它只是 qd_dragon_signals 的唯一键成分与 K 线 marker 文案来源
+    (见 signals_markers), 前端 popover 已于 §9.3 缩减中删除"形态"行。
+    """
     strat = s.get("strategy") or DRAGON_STRATEGY
-    _es = s.get("entry_style") or ""
-    # entry_style 文案: dragon (DRAGON_STRATEGY) 固定填 'a' 无含义; a/b=历史上 v1 行的形态文案
-    _es_txt = "" if strat == DRAGON_STRATEGY else (
-        "(a)缩量企稳" if _es == "a" else ("(b)放量启动" if _es == "b" else _es))
     return {
         "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
         "strategy": strat,
         "strategy_label": strategy_labels().get(strat, strat),
         "winrate": strategy_winrate(strat),
         "state_label": state_label(s["state"]),
-        "entry_style": _es_txt,
         "score": s.get("score"),
         "lu_date": s.get("lu_date"),
         "pullback_days": s.get("pullback_days"),
@@ -603,7 +602,132 @@ def sync_watchlist_group(active_rows):
         cur.close()
     logger.info("[dragon_store] 组同步: 目标%d 插入%d 更新%d 删除%d",
                 len(target), inserted, updated, deleted)
-    return {"target": len(target), "inserted": inserted, "updated": updated, "deleted": deleted}
+
+    # ── 上级答案 → label 唯一写接口 submit() (grade=3, auto) ──
+    # 这是**唯一允许的跨层边** (auto → submit, 写)。label 侧零反向依赖:
+    # auto 不得回读 label 的数据作策略输入 (方案 §5.5 禁令 4)。
+    # 失败只记日志: 标签是展示层, 不得影响组对账与信号链。
+    submitted = 0
+    try:
+        submitted = _submit_labels_to_label_layer(active_rows)
+    except Exception:
+        logger.error("[dragon_store] label 提交失败 (不影响组同步)")
+        import traceback as _tb
+        logger.error(_tb.format_exc())
+
+    return {"target": len(target), "inserted": inserted, "updated": updated,
+            "deleted": deleted, "label_submitted": submitted}
+
+
+# ================================================================
+# 上级答案 → label 扩展段 (auto 侧唯一调用点)
+# ================================================================
+
+#: auto 自己的答案有效期 (交易日)。**由提交方决定** —— label 侧不加默认、不设上限 (方案 §3.3)。
+#: 2 个交易日: 信号状态每交易日刷新, 停更 2 日即认为上级链路异常, 由 system 接管。
+LABEL_TTL_TRADING_DAYS = 2
+
+#: 策略明细表列清单 (方案 §9.3.5)。**"状态"刻意不做列**: 每票只有一行, 状态已由行上
+#: 竖排 tag 承载; 列内无法表达"预判", 会与 tag 星级形成两个信息源。
+LABEL_TABLE_COLUMNS = (
+    ("strategy", "策略"),
+    ("winrate", "历史胜率"),
+    ("score", "评分"),
+    ("anchor", "锚点日"),
+    ("turnover", "换手(锚)"),
+    ("mcap", "流通市值"),
+    ("ma60", "MA60斜率"),
+    ("entry", "买入"),
+    ("stop", "止损"),
+    ("d1", "D1确认"),
+    ("exit", "出场"),
+)
+
+
+def _label_row(s) -> dict:
+    """signals 行 → 策略明细表的一行（列口径见 LABEL_TABLE_COLUMNS）。"""
+    d = _display_detail(s)
+    lu = d.get("lu_date")
+    anchor = ""
+    if lu:
+        anchor = f"{lu}{(' 回调%d天' % d['pullback_days']) if d.get('pullback_days') else ''}"
+    turnover = ""
+    if d.get("turnover_anchor") is not None:
+        turnover = f"{d['turnover_anchor']}%" + (
+            f" / 信{d['turnover_sig']}%" if d.get("turnover_sig") is not None else "")
+    ma60 = ""
+    if d.get("ma60_slope") is not None:
+        ma60 = f"{d['ma60_slope']}%" + (" 多头排列" if d.get("ma_bull") else "")
+    entry = ""
+    if d.get("entry_date"):
+        entry = f"{d['entry_date']} @ {d.get('entry_price', '')}"
+    d1 = ""
+    if d.get("d1_chg") is not None:
+        d1 = f"{'+' if d['d1_chg'] > 0 else ''}{d['d1_chg']}%" + (
+            f" 量比{d['d1_vol_r']}" if d.get("d1_vol_r") is not None else "")
+    exit_txt = ""
+    if d.get("exit_reason"):
+        exit_txt = str(d["exit_reason"]) + (
+            f" ({d['exit_date']} @ {d.get('exit_price', '')})" if d.get("exit_date") else "")
+    return {
+        "strategy": d.get("strategy_label") or d.get("strategy") or "",
+        "winrate": d.get("winrate"),
+        "score": d.get("score"),
+        "anchor": anchor,
+        "turnover": turnover,
+        "mcap": f"{d['float_mcap_yi']}亿" if d.get("float_mcap_yi") is not None else "",
+        "ma60": ma60,
+        "entry": entry,
+        "stop": d.get("stop_price"),
+        "d1": d1,
+        "exit": exit_txt,
+    }
+
+
+def _label_payload(s) -> dict:
+    """构造 4 段 payload：评分 + 扩展段(策略明细表) + 评分口径说明。
+
+    supports/resistances 留空 —— auto 的答案不含筹码关键位; 读路径有**段级回填**，
+    空段不会抹掉 system 已有的支撑位/压力位答案。
+    """
+    d = _display_detail(s)
+    state_rows = [{"label": "状态",
+                   "value": d.get("state_label") or s.get("state") or ""}]
+    pre = d.get("pre_confirm")
+    if pre:                                  # 无预判 ⇒ **不产出该行**（"无"是展示文案, 不该由数据层造）
+        state_rows.append({"label": "预判", "value": pre})
+    return {
+        "score": d.get("score"),
+        "score_version": None,          # auto 的评分口径归 auto, 本批未定义 ⇒ 不声明
+        "supports": [],
+        "resistances": [],
+        "extras": [
+            {"type": "table", "title": "策略明细",
+             "columns": [{"key": k, "label": v} for k, v in LABEL_TABLE_COLUMNS],
+             "rows": [_label_row(s)]},
+            {"type": "fields", "title": "策略状态", "rows": state_rows},
+        ],
+    }
+
+
+def _submit_labels_to_label_layer(active_rows) -> int:
+    """把活跃信号的上级答案经 label 唯一写接口落库 (grade=3)。"""
+    from app.watchlist import submit
+    n = 0
+    for s in active_rows:
+        code = s.get("code")
+        if not code:
+            continue
+        try:
+            submit("auto", DRAGON_MARKET, str(code), _label_payload(s),
+                   ttl_days=LABEL_TTL_TRADING_DAYS)
+            n += 1
+        except Exception as e:
+            logger.warning("[dragon_store] label 提交失败 %s: %s", code, e)
+    if n:
+        logger.info("[dragon_store] label 提交(auto/grade3): %d 条 (ttl=%d 交易日)",
+                    n, LABEL_TTL_TRADING_DAYS)
+    return n
 
 
 def cleanup_cutoff(days=15):

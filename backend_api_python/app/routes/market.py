@@ -316,6 +316,12 @@ def get_watchlist():
                     continue
             db.commit()
             cur.close()
+
+        # ── label 统一出口（4 段 + 等级/来源/接管/年龄）──
+        # 加法式：旧字段一个不动（strategy_state/strategy_detail 仍供冻结的呈现格式使用），
+        # 只额外挂 sections 与标注，便于前端"通用渲染器"换代与随时回退。
+        from app.watchlist import attach_labels
+        attach_labels(rows, user_id)
         return jsonify({'code': 1, 'msg': 'success', 'data': rows})
     except Exception as e:
         logger.error(f"get_watchlist failed: {str(e)}")

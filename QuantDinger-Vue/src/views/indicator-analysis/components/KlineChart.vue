@@ -255,6 +255,17 @@ export default {
     prevClose: {
       type: Number,
       default: null
+    },
+    /**
+     * 关键位水平线（仅分时图使用）：`[{ price, side }]`，side ∈ 'support' | 'resistance'。
+     *
+     * 由父组件注入（数据源归父组件，本组件只负责「怎么画」）。**超出当前 Y 轴可视范围的不画**
+     * —— 分时 Y 轴被锁定为昨收 ±当日最大偏离，筹码峰常落在范围外，画出来只会贴边/出界。
+     * 与 `tradeMarkers` 的分层一致：本组件不感知 watchlist / label 概念。
+     */
+    levelLines: {
+      type: Array,
+      default: () => []
     }
   },
   emits: ['retry', 'price-change', 'load', 'indicator-toggle'],
@@ -3271,6 +3282,140 @@ registerOverlay({
       } catch (_) { /* 预期内：轴未就绪时由下一帧重绘 */ }
       return true
     }
+    /**
+     * 分时支撑/压力位水平线指标名。与 0 轴线（MINUTE_ZERO_LINE_IND）同一机制：
+     * 指标线由库的逐帧重绘管线画出来，每次绘制都用**当前轴范围**现算坐标。
+     *
+     * 为什么不用 overlay：分时下 Y 轴被锁定（setRange + _autoCalcTickFlag=false），
+     * 数据又走 applyNewData 全量重写，overlay 在创建时刻算出的坐标随后就过期
+     * ⇒ 表现为错位或不渲染（与 0 轴线注释里记录的是同一个坑）。
+     */
+    const MINUTE_SR_LINES_IND = 'MINUTE_SR_LEVEL_LINES'
+    /** 支撑/压力配色：与 K 线涨跌色语义自洽（下方=跌向=绿、上方=涨向=红） */
+    const MINUTE_SR_STYLE = {
+      support: { color: '#52c41a' },
+      resistance: { color: '#f5222d' }
+    }
+    /** 关键位线型：虚线 + 1px，与实线价格序列区分 */
+    const MINUTE_SR_DASH = [4, 4]
+    /** 右端价格标签字号（与分时 tooltip 同量级，不抢戏） */
+    const MINUTE_SR_FONT = '10px sans-serif'
+
+    /**
+     * 关键位**可见性裁剪**（纯函数，便于单测）：把「价格 → 像素 Y」交给调用方，
+     * 只保留落在 `[0, height]` 内的档位，并顺带丢弃非法价格。
+     *
+     * 这是「超过范围的不显示」的唯一判据 —— 分时 Y 轴锁定为昨收 ± 当日最大偏离，
+     * 筹码推算出的关键位常在范围外（如现价 44 而支撑在 40 以下），
+     * 不裁剪就会贴边成一条看不出意义的线。
+     *
+     * @param {Array<{price:number, side?:string}>} levels 原始关键位
+     * @param {(price:number)=>number} toPixel 价格 → 像素 Y（库的轴换算，含涨跌幅轴重定基）
+     * @param {number} height 绘图区高度（bounding.height）
+     * @returns {Array<{price:number, side:string, y:number}>} 可见档位（保持传入顺序）
+     */
+    const pickVisibleLevels = (levels, toPixel, height) => {
+      const out = []
+      if (!Array.isArray(levels) || !levels.length) return out
+      if (typeof toPixel !== 'function' || !(height > 0)) return out
+      for (const lv of levels) {
+        const price = Number(lv && lv.price)
+        if (!Number.isFinite(price) || price <= 0) continue
+        let y = null
+        try { y = toPixel(price) } catch (_) { y = null }
+        if (y == null || !Number.isFinite(y)) continue
+        if (y < 0 || y > height) continue
+        out.push({ price, side: (lv.side === 'resistance' ? 'resistance' : 'support'), y })
+      }
+      return out
+    }
+
+    /**
+     * 关键位线绘制：横贯全宽（与 0 轴线同理，覆盖右侧未来时段留白区），
+     * 右端贴一条价格小标签。返回 true 接管该指标的全部绘制。
+     *
+     * 闭包读取 `props.levelLines` ⇒ 切股票/标签刷新后无需重新注册指标，
+     * 只要触发一次重绘即可呈现新值（见 watch(() => props.levelLines)）。
+     */
+    const MINUTE_SR_LINES_DRAW = ({ ctx, bounding, yAxis, indicator }) => {
+      try {
+        if (!ctx || !bounding || !(bounding.width > 0) || !(bounding.height > 0)) return true
+        if (!Array.isArray(props.levelLines) || !props.levelLines.length) return true
+        const axis = yAxis || (indicator && indicator.yAxis)
+        if (!axis || typeof axis.convertToPixel !== 'function') return true
+        const visible = pickVisibleLevels(props.levelLines, axis.convertToPixel.bind(axis), bounding.height)
+        if (!visible.length) return true
+
+        ctx.save()
+        ctx.font = MINUTE_SR_FONT
+        ctx.textBaseline = 'middle'
+        for (const lv of visible) {
+          const color = (MINUTE_SR_STYLE[lv.side] || MINUTE_SR_STYLE.support).color
+          // 半像素对齐，避免 1px 线被反锯齿糊成 2px
+          const y = Math.round(lv.y) + 0.5
+          ctx.strokeStyle = color
+          ctx.lineWidth = 1
+          ctx.setLineDash(MINUTE_SR_DASH)
+          ctx.beginPath()
+          ctx.moveTo(0, y)
+          ctx.lineTo(bounding.width, y)
+          ctx.stroke()
+
+          // 右端价格标签：盘中右端是未到时段的留白区，标签基本压在空处
+          const text = lv.price.toFixed(2)
+          const tw = ctx.measureText(text).width
+          const tx = bounding.width - tw - 3
+          ctx.setLineDash([])
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.82)'
+          ctx.fillRect(tx - 2, y - 7, tw + 4, 14)
+          ctx.fillStyle = color
+          ctx.fillText(text, tx, y)
+        }
+        ctx.restore()
+      } catch (_) { /* 预期内：轴未就绪时由下一帧重绘 */ }
+      return true
+    }
+
+    /**
+     * 分时：确保关键位线指标已挂上（与 0 轴线独立，不依赖昨收是否已解析出来）。
+     *
+     * @param {boolean} force 为 true 时强制重建实例（用于 levelLines 变化后触发重绘）
+     */
+    const ensureMinuteSrLinesIndicator = (force) => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      try {
+        let names = []
+        try {
+          const instances = chart.getIndicatorByPaneId('candle_pane')
+          if (instances && typeof instances.keys === 'function') names = Array.from(instances.keys())
+        } catch (_) { /* 预期内 */ }
+        const exists = names.includes(MINUTE_SR_LINES_IND)
+        if (exists && !force) return
+
+        registerIndicator({
+          name: MINUTE_SR_LINES_IND,
+          shortName: '',
+          series: 'price',
+          precision: 2,
+          figures: [{ key: 'srLevel', title: '', type: 'line' }],
+          styles: {
+            lines: [{ color: MINUTE_SR_STYLE.support.color, style: 'dashed', dashedValue: MINUTE_SR_DASH, size: 1 }]
+          },
+          // figure 恒为 null：全部绘制由 draw 接管（避免默认逐柱连线画出一条无意义的横线）
+          calc: (list) => (list || []).map(() => ({ srLevel: null })),
+          draw: MINUTE_SR_LINES_DRAW
+        })
+        // 已存在且要求强制刷新时先移除：remove + create 本身即触发一次重绘，
+        // 比调 resize() 轻（不会重排布局，也就不会扰动锁定的 Y 轴范围）
+        if (exists) {
+          try { chart.removeIndicator('candle_pane', MINUTE_SR_LINES_IND) } catch (_) { /* 预期内 */ }
+        }
+        // isStack 必须为 true：false 会执行 `paneInstances = []`，把均价线/0 轴线一起清空
+        chart.createIndicator(MINUTE_SR_LINES_IND, true, { id: 'candle_pane' })
+      } catch (_) { /* 预期内：指标未就绪时由自愈重试补上 */ }
+    }
+
     /** 已应用的锚点区间，避免实时刷新时无谓重建 */
     let _minuteAxisRange = null
     /** 是否已锁定主图 Y 轴范围（退出分时时用于精确还原，避免影响其它周期） */
@@ -3824,6 +3969,8 @@ registerOverlay({
           // 移除 0 轴线指标；同时清理旧版锚定指标名，防止历史实例残留
           chart.removeIndicator('candle_pane', MINUTE_ZERO_LINE_IND)
           try { chart.removeIndicator('candle_pane', 'MINUTE_PREV_CLOSE_AXIS') } catch (_) { /* 预期内：旧版无实例 */ }
+          // 关键位线同样只在分时存在，退出分时一并移除（否则会画到日K上）
+          chart.removeIndicator('candle_pane', MINUTE_SR_LINES_IND)
         }
       } catch (_) { /* 预期内 */ }
       _minuteAxisRange = null
@@ -3875,6 +4022,8 @@ registerOverlay({
         // 0 轴线/锚定指标被清掉时，强制重建（清掉缓存锚点，跳过「未变化」短路）
         if (!names.includes(MINUTE_ZERO_LINE_IND)) _minuteAxisRange = null
         applyMinutePrevCloseAxis()
+        // 关键位线同样会被 updateIndicators 的 isStack=false 清掉，此处补挂
+        ensureMinuteSrLinesIndicator()
       } catch (_) { /* 预期内 */ }
     }
 
@@ -4008,6 +4157,11 @@ registerOverlay({
         } catch (avpErr) {
           console.warn('添加均价线指标(AVP)失败:', avpErr)
         }
+
+        // 2.4 分时专用：关键位（支撑/压力）水平线。
+        //     刻意**早于**昨收链路：昨收解析失败时 setupMinutePrevCloseReference 会整体 return，
+        //     两者数据独立，关键位不该被昨收的可用性连坐。
+        ensureMinuteSrLinesIndicator()
 
         // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
         setupMinutePrevCloseReference()
@@ -6659,6 +6813,24 @@ registerOverlay({
       nextTick(() => {
         if (!isMinuteLine.value || !chartRef.value) return
         try { setupMinutePrevCloseReference() } catch (_) { /* 预期内 */ }
+      })
+    })
+
+    // 关键位水平线：随标的切换 / 标签刷新而变化。
+    // draw 闭包读的是 props.levelLines，本身永远是最新值；这里重建实例只是为了
+    // 让库**主动重绘一次**（否则新值要等下一次交互才显现）。
+    // 用内容签名做短路：父组件的 computed 每次求值都会产生新数组引用，
+    // 只按引用比较会导致「内容没变也重建」→ 无谓闪烁。
+    let _srLinesKey = null
+    watch(() => props.levelLines, (lines) => {
+      const arr = Array.isArray(lines) ? lines : []
+      const key = arr.map(l => `${l && l.side}|${Number(l && l.price)}`).join(',')
+      if (key === _srLinesKey) return
+      _srLinesKey = key
+      if (!isMinuteLine.value || !chartRef.value) return
+      nextTick(() => {
+        if (!isMinuteLine.value || !chartRef.value) return
+        try { ensureMinuteSrLinesIndicator(true) } catch (_) { /* 预期内 */ }
       })
     })
 
