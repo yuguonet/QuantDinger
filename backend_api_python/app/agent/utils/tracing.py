@@ -562,6 +562,11 @@ class AgentTraceRecorder:
     # ── JSONL 输出 ────────────────────────────────────────────
 
     def _write_jsonl(self):
+        try:
+            from utils.mask import mask_obj as _mask
+        except Exception:
+            _mask = lambda x: x  # noqa: E731
+
         trace_file = _trace_file_path()
         trace_file.parent.mkdir(parents=True, exist_ok=True)
         record = {
@@ -574,7 +579,7 @@ class AgentTraceRecorder:
             "events": self.events,
         }
         with trace_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(_mask(record), ensure_ascii=False) + "\n")
 
     # ── 评测侧车输出（E1 评测集取数）───────────────────────────
 

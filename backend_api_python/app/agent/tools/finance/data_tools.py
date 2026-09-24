@@ -120,9 +120,10 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         codes: 多股用逗号分隔
 
     Returns:
-        单代码 → {stock_code, last, changePercent, volume, name, ...}（扁平行情 dict）；
-        多代码 → {"count": N, "data": {代码: 行情dict}}——**单/多代码返回结构不同**，
-        多代码时股票字典在二级键 data 下；失败时含 error 键
+        统一结构（单/多代码一致，2026-09-24 起）：{"count": N, "data": {代码: 行情dict},
+        "error": None}；行情dict 字段：{stock_code, last, changePercent, volume, name,
+        high, low, open, previousClose, time} + 涨跌停价 {limit_up, limit_down}
+        （来自腾讯源增补，供涨跌停判定）；失败 → {"error": "...", "retriable": False}
     """
     # 归一化：剥离市场后缀（.SZ/.SH）与市场前缀（sh/sz），与 get_tickers 的
     # symbol 键对齐（get_tickers 返回的 symbol 是纯代码，如 "300497"）。
@@ -156,9 +157,20 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         else:
             results[code] = {"error": "未获取到行情", "stock_code": code}
 
-    if len(code_list) == 1:
-        return results[code_list[0]]
-    return {"count": len(results), "data": results}
+    # 2026-09-24：并入统一三键契约（与 _batch_execute 系一致，消除单/多二义性）；
+    # 并增补涨跌停价（get_tickers 无此字段，模型做创业板 20% 判定需要）——
+    # 一次批量腾讯调用补全，失败不阻塞主结果（limit_up 缺省 None）。
+    try:
+        raw_q = _tencent_quote_raw(code_list)
+        for code in code_list:
+            tq = raw_q.get(code) or {}
+            item = results.get(code)
+            if isinstance(item, dict) and "error" not in item:
+                item.setdefault("limit_up", tq.get("limit_up"))
+                item.setdefault("limit_down", tq.get("limit_down"))
+    except Exception as e:
+        logger.debug("get_realtime_quote 涨跌停增补跳过: %s", e)
+    return {"count": len(results), "data": results, "error": None}
 
 def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
     """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
@@ -450,7 +462,18 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         return result
 
     if len(code_list) == 1:
-        return _filter_stock_info(_one(code_list[0]), detail)
+        from tools.base import as_code_envelope
+        one = _filter_stock_info(_one(code_list[0]), detail)
+        _NUM_KEYS = ("pe_ratio", "pb_ratio", "market_cn", "mcap_yi", "float_mcap_yi",
+                     "roe", "price", "change_pct", "pe_ttm", "pe_static", "turnover_pct",
+                     "vol_ratio", "total_shares", "circ_shares")
+        for _k in _NUM_KEYS:
+            if _k in one and one[_k] is not None and not isinstance(one[_k], (int, float)):
+                try:
+                    one[_k] = float(one[_k])
+                except Exception:
+                    pass
+        return as_code_envelope(code_list[0], one)
 
     results = {}
     for code in code_list:

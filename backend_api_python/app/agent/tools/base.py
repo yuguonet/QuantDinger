@@ -20,6 +20,25 @@ from typing import Any, Callable, Dict, List, Optional, get_type_hints
 logger = logging.getLogger(__name__)
 
 
+def as_code_envelope(code: str, obj: Dict[str, Any]) -> Dict[str, Any]:
+    """统一单码工具返回信封（幻象结构治理）。
+
+    背景：`calculate_ma` 单码返回扁平 dict，多码返回 `{count, data:{code}}`；
+    模型按 `get_realtime_quote` 习惯写 `ma['data'][code]` → KeyError。
+
+    契约：**始终**带 `count`/`data{code}`；单码时顶层再镜像一份扁平键（双通道可读）。
+    error 形态（`{"error":...}`）保持原样，不包信封。
+    """
+    if not isinstance(obj, dict):
+        obj = {"value": obj}
+    if "error" in obj and not any(k not in ("error", "retriable") for k in obj):
+        return obj
+    out = {"count": 1, "data": {code: obj}}
+    for k, v in obj.items():
+        out.setdefault(k, v)
+    return out
+
+
 @dataclass
 class ToolResult:
     """工具执行结果"""

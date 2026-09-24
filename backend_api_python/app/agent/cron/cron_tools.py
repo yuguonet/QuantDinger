@@ -156,6 +156,30 @@ def create_cron_job(
     else:
         return {"error": "必须提供 cron_expr 或 at 参数"}
 
+    # F6 调度滥用防线：表达式校验 + 最短间隔 + 任务数上限
+    try:
+        from app.agent.cron import guards as _cguard
+    except Exception:
+        _cguard = None
+    if _cguard is not None and cron_expr:
+        try:
+            _exist = 0
+            try:
+                from app.utils.db import get_db_connection as _gdb
+                with _gdb() as _dc:
+                    _c = _dc.cursor()
+                    _c.execute("SELECT COUNT(*) AS n FROM qd_cron_jobs")
+                    _r = _c.fetchone()
+                    _exist = int((_r.get("n") if isinstance(_r, dict) else _r[0]) or 0)
+                    _c.close()
+            except Exception:
+                _exist = 0
+            _v = _cguard.guard_create(cron_expr=cron_expr, existing_count=_exist)
+            if not _v.get("ok"):
+                return {"error": _v.get("error") or "cron guard rejected"}
+        except Exception:
+            pass
+
     try:
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:

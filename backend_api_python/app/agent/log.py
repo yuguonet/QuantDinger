@@ -4,6 +4,7 @@ Agent Log — 兼容 app.agent.log 的轻量级桥接。
 
 工具模块中 `from app.agent.log import logger` 可正常工作。
 同时将日志写入 logs/app.log，与应用其他模块共享同一个文件。
+输出经 MASK 脱敏（常设 6）。
 """
 from __future__ import annotations
 
@@ -11,6 +12,23 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+
+
+class _MaskFilter(logging.Filter):
+    """日志脱敏：api_key/phone/id 等不进 JSONL 与 log。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from utils.mask import mask_text
+            record.msg = mask_text(str(record.msg))
+            if record.args:
+                record.args = tuple(
+                    mask_text(a) if isinstance(a, str) else a for a in record.args
+                )
+        except Exception:
+            pass
+        return True
+
 
 _level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 _log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
@@ -50,3 +68,5 @@ if _file_handler is None:
     root.addHandler(_file_handler)
 
 logger = logging.getLogger("app.agent")
+if not any(isinstance(f, _MaskFilter) for f in logger.filters):
+    logger.addFilter(_MaskFilter())

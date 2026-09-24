@@ -459,7 +459,7 @@ state 留 run_id 引用)——这是纯重构,做在 F4 前,checkpointer 后续�
 ### 阶段 0（安全止血）
 | 项 | 状态 | 备注 |
 |----|------|------|
-| 0.1 交易确认闸 | 🟡 | `trading_tools.py::requires_confirmation` 已在位；human-in-the-loop 确认+审计留痕待补 |
+| 0.1 交易确认闸 | ✅ | **2026-09-24 夜更正**（原标 🟡 为滞后）：`trading_tools.py::start_strategy` 的 `confirm` 硬闸 + `requires_confirmation` 展示态 + `[Trading][AUDIT]` 留痕均已完整（stop 刻意不加闸：kill 动作安全优先） |
 | 0.2 direct_answer 禁数字门 | ✅ | `nodes.py` `_DATA_INTENT_RE` + `direct_answer_numbers_detected` 事件 |
 | 0.3 酿造四修 | ✅ | 拆列（`set_skill_low_streak`/`reset_skill_weight`）、护栏2真落地、护栏5语义修正、删二次写 |
 | 0.4 brew/revise 并发锁 | ✅ | `chain/store.py::acquire_run_lock` + `_brew_locked` |
@@ -481,7 +481,7 @@ state 留 run_id 引用)——这是纯重构,做在 F4 前,checkpointer 后续�
 | 项 | 状态 | 备注 |
 |----|------|------|
 | B1-A 确定性（R1 工具覆盖 / R2 隐式依赖） | ✅ | `utils/plan_linter.py`：R1 `_DATA_DOMAINS` 词典（域→关键词+候选，首选工具补位）+ 2-gram 倒排索引兜底（低置信只告警）；R2 产消依赖自动补 `barrier`（WARN 不阻塞）。`task_agent._plan` 接线（lint→apply→`trace.record("plan_lint")`），失败 `logger.warning` 发声不静默。CI 门禁：`test_wiring.py` 10 项（含 C7「词典/依赖表 ⊆ provider 注册表」） |
-| B1-B LLM plan critic + Best-of-N(N=2) | ⬜ | 未开工。**前置：评测集首跑基线**（C12）——无基线量不出"同 temperature 采 3 个 plan 的质量方差"，选优规则无从校准 |
+| B1-B LLM plan critic + Best-of-N(N=2) | ✅ | **2026-09-24 夜落地**（OpenClaw agent）：`utils/plan_critic.py`（三问 critic {fatal,warnings,score} + select_best 选优 + format_defects 回炉反馈）；`_plan` N=AGENT_PLAN_BEST_OF_N（默认 2）并发采样→critic 逐候选→选优→**回炉一次**；trace 新增 plan_critic/plan_selected/plan_replan。R3（granularity_hints 粒度信号）/R4（零相关工具面裁剪，保护名单=能力/技能/清单产消）同步落地进 plan_linter。冒烟当场抓到选优 tie-break bug（parse 失败候选靠"最小工具面"胜出）已修 |
 | B2 失败记忆（run 内闭环） | ✅ | `utils/failure_memory.py`（error_type 定死词表 + 单次注入 + `drain_executor_events`）；采集点 `infra/guided_executor.py::_failure_events`；注入通道 `task_agent._failure_memory_step`（step_callback 单一通道，追加 observation 不改模型代码） |
 | B3 数据自检（validate_df + SelfCheckError） | ✅ | `utils/data_check.py`（`validate_df`/`SelfCheckError`/`drain_checks`/`CHECK_CODES`）+ 沙箱注入 `data_check` 别名（README 式，见 guided_executor L365）+ `prompts/code_agent.yaml` 规则 19；软/硬失败两级路由 |
 | B4 轻量修复代理 repair.py | ✅ | `execution/repair.py`（只修 `hallucinated_tool/wrong_column/wrong_frequency`、`REPAIR_MAX_ONCE=1`、fail-open、env `AGENT_CODE_REPAIR` 默认关）；**2026-09-24 下午补接线**：`task_agent._repair_step` 进 step_callbacks，且先于 `_failure_memory_step`（先 peek 失败事件、再由 B2 drain 清空） |
@@ -494,11 +494,11 @@ state 留 run_id 引用)——这是纯重构,做在 F4 前,checkpointer 后续�
 |----|------|------|
 | P1 correct 写保护 | ✅ | `test_qd_traces_correct_only_written_by_store`（静态白名单 `chain/store.py`） |
 | P2 0.3 schema additive | ✅ | 0.3 落于独立列/独立行，权重层行零污染 |
-| P3 chain 层权重去留 | ⬜ | G1（`update_weights` 不产 chain 权重行）仍待单独拉 TODO-1 |
+| P3 chain 层权重去留 | ✅ | **2026-09-24 夜落地**（OpenClaw agent）：补——evaluator.update_weights ⑦段产 layer='chain' 权重行（n<10 不动、0.5~2.0 夹紧、unknown 链排除）+ store.get_chain_weights() + planner 消费（_plan【链路权重提示】）；G1 缺口关闭 |
 | C1 F4 前提前置 | ✅（审计） | 已核：仅 `phase_results`/`completed_phases_text` 可序列化，数值变量不可续跑 |
 | C2 E2 corpus 口径 | ✅ | `grounding.py` 只认来源槽位（排除自造变量） |
 | C3 CI 骨架 | ✅ | `.github/workflows/basic-ci.yml` 新增 `wiring-contract-tests` job |
-| C4 名单一致不变量 | 🟡 | `_ListToolsTool` 单源视图已落地；`allowed_names` 收敛核验通过 |
+| C4 名单一致不变量 | ✅ | `_ListToolsTool` 单源视图已落地；**2026-09-24 夜收尾**（OpenClaw agent）：planning YAML 工具视图收敛为沙箱选定面（tool_functions 键集，含附加点名/技能名），§7.0 三处口径（planning/沙箱/list_tools）自此同源 |
 
 ### 下一步（建议顺序）
 
@@ -582,3 +582,34 @@ qd_traces 落库与回测统计在本环境不可用；侧车走文件通道，�
 
 **产物**：`tmp/qclaw/report_baseline_20260924b.json`（重跑）、`eval_dump_baseline_20260924b.jsonl`、
 `baseline_run_20260924b.log`、`report_baseline_20260924b_outputs/*.txt`。
+
+#### 2026-09-24 夜 · 二波收尾 + 三波落地（OpenClaw agent，增量追加）
+
+> 约束：本轮只改 `backend_api_python/app/agent/` 内；打包件 `quantdinger_tizhi_wave23_20260924.tar.gz`
+（13 文件按目录原位，含 MANIFEST）。**截至本节，阶段 0 + 先手 + 二波 + 三波全部完成**。
+
+**落地清单**（详见各表状态更新与 `app/agent/tizhi_wave23_progress_20260924.md`）：
+1. **B1-B**：`utils/plan_critic.py`（三问 critic + Best-of-N 选优 + 回炉反馈）；`_plan` N=2
+   并发采样→critic→选优→回炉一次（L0/L1 单候选不跑 critic，矩阵成本闸）；R3 粒度信号
+   （`granularity_hints` 单源）/R4 零相关工具面裁剪进 plan_linter（保护名单=能力/技能/产消）。
+2. **三波 T1**：`utils/case_memory.py`（qd_cases 延迟标签：pending 开局、T+N 经
+   `update_verify_results` 后回填、incorrect 硬排除/pending 降权/近重复去重）；
+   `tools/knowledge/search_knowledge`（历史结论库+案例库，带来源只读）；酿造**信号④**
+   接进 brew_skills 通道 3（聚类≥3 且 correct 率高）。
+3. **三波 T2**：`agents/routing_policy.py`（L0~L3 矩阵登记表 + 确定性特征打分 + 临界带±10%）；
+   难度判定**随意图分类一次带回**（零额外调用，intent 契约增量追加 Lx 档位）；升级信号
+   （单段工具超阈值/self_check_failed）→ 丢弃单段从头 plan；L0/L1 降档默认关（启用闸）。
+4. **P3/TODO-1**：chain 层权重落地（evaluator ⑦ + get_chain_weights + planner 提示），G1 关闭。
+5. **C4 收尾**：planning 视图 = 沙箱选定面（tool_functions 键集）；0.1 复核确认已完整（原 🟡 滞后）。
+
+**验证**：compileall 全绿；`test_wiring.py` **33 passed / 2 failed**——2 条均为能力层
+（`load_admitted()=0`，`capabilities/admission.json` 不在本检出），与本轮零交集；新模块离线冒烟全过
+（select_best/R3/R4/难度打分/case_memory fail-open/search_knowledge Returns 契约）。
+
+**本检出与文档的漂移（待用户手工提交，agent 禁 git）**：`capabilities/admission.json`、
+`tests/evals/`、文档所称 67 测试版 `test_wiring.py` 均在本机未入仓；缺前者的后果 = 能力层在
+干净检出整层空转（2 条 wiring 测试恒红）。
+
+**剩余（有意未动）**：远期 F1~F6（较大变动先评审后动）；C8 临界带宽/CASE_SIM_MIN(0.35 初值)
+待评测集校准；模型档位切换未接线（待评测证小模型掉点<5pp）；模型自报 need_replan 单段通道未建；
+grounding 基线 0/3 的**数据层**真问题独立立项（600176 K线 count=1 等，不在 agent 层）。

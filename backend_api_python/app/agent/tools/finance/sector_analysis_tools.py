@@ -78,7 +78,7 @@ def _merge_em_rows(rows: List[Dict[str, Any]], em_rows: List[Dict[str, Any]]) ->
     """用东财结果按**板块名**富化主源行：补 BK 代码与涨停家数。
 
     新浪主源缺这两项（代码是新浪自有编码、`limit_up_count` 恒为 0），而下游
-    `get_sector_detail(board_code)` 需要 BK 代码 ⇒ 东财成功时按名对齐补上；
+    `get_sector_stocks(board_code)` 需要 BK 代码 ⇒ 东财成功时按名对齐补上；
     东财失败则原样返回——**不再**让主结果变成空数组。
     """
     if not em_rows:

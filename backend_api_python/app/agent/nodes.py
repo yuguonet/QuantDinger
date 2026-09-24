@@ -77,6 +77,31 @@ _CODE_INTENT_RE = re.compile(
 # ═══════════════════════════════════════════════════════════════
 #  AgentState — 状态类型定义
 # ═══════════════════════════════════════════════════════════════
+
+
+def _skill_declared_tool_names(skill_name: str, skill_body: str = "") -> list:
+    """从 SKILL.md frontmatter `tools: [...]` 抽出技能声明的工具名（幻象治理）。
+
+    技能正文点名的工具若**真实存在**于 provider，必须并入本阶段白名单——
+    否则模型按文档调用会命中「未定义名字」（300497 get_chip_distribution 案例）。
+    """
+    names = []
+    src = skill_body or ""
+    if not src and skill_name:
+        try:
+            # body 可能在 state；frontmatter 也可从 adapter 读
+            src = ""
+        except Exception:
+            src = ""
+    m = re.search(r"(?m)^tools:\s*\[([^\]]*)\]", src)
+    if m:
+        for x in m.group(1).split(","):
+            x = x.strip().strip("'\"")
+            if x and x not in names:
+                names.append(x)
+    return names
+
+
 class AgentState(TypedDict, total=False):
     """Graph 状态。节点之间通过它传递数据。"""
 
@@ -1556,13 +1581,35 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             "_agent_plan": "",
             "_run_error": "",
         }
-    if p0.get("barrier"):
+    # F1 ready-set（R2 depends_on）：有依赖声明时按 ready 集合取批，否则顺序批（兼容）
+    _has_dep = any((ph or {}).get("depends_on") is not None for ph in phases)
+    if _has_dep and not p0.get("barrier") and not p0.get("replan"):
+        try:
+            from app.agent.utils.phase_graph import (
+                select_ready_batch, completed_ids as _done_ids, phase_id as _pid,
+            )
+            done = _done_ids(state.get("phase_results"))
+            ready_ids = select_ready_batch(
+                phases, done=done, max_parallel=2, prefer_from=_pid(p0, idx + 1))
+            idset = set(ready_ids)
+            batch = [ph for ph in phases if _pid(ph, 0) in idset] or [p0]
+            b = idx + len(batch)
+        except Exception as _ge:
+            logger.warning("[Execute] ready-set failed, fallback sequential: %s", _ge)
+            if p0.get("barrier"):
+                b = idx + 1
+            else:
+                b = idx
+                while b < len(phases) and not (phases[b].get("barrier") or phases[b].get("replan")):
+                    b += 1
+            batch = phases[idx:b]
+    elif p0.get("barrier"):
         b = idx + 1                         # barrier 阶段独占一批
     else:
         b = idx
         while b < len(phases) and not (phases[b].get("barrier") or phases[b].get("replan")):
             b += 1
-    batch = phases[idx:b]
+        batch = phases[idx:b]
     first_id = int(batch[0].get("id", idx + 1))
     last_id = int(batch[-1].get("id", b))
     logger.info("[Execute] 批次 [%d-%d] 共 %d 个阶段：%s", first_id, last_id, len(batch),
@@ -1633,6 +1680,14 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                 n = n[:-2].strip()
             if n and n not in union_tools:
                 union_tools.append(n)
+    # 幻象治理：技能 SKILL.md tools: 声明且真实存在的工具必须进白名单
+    try:
+        _sk_decl = set(_skill_declared_tool_names(state.get("selected_skill") or "", state.get("skill_body") or ""))
+        for _n in _sk_decl:
+            if _n and _n not in union_tools:
+                union_tools.append(_n)
+    except Exception:
+        pass
     if any_default:
         # 未限定白名单：回退域默认（本域+通用工具全部可调用）。切勿把"无清单"误解成"无工具"，
         # 否则模型会以为自己什么函数都没有而拒绝取数。
@@ -2093,7 +2148,8 @@ def make_execute_node(ctx: NodeContext):
             _tools_param = None
             if plan_tools:
                 _common = set(ctx.tool_provider.list_by_domain("common")) if ctx.tool_provider else set()
-                _tools_param = sorted({_norm_tool_name_safe(t) for t in plan_tools} | _common)
+                _skill_decl = set(_skill_declared_tool_names(state.get("selected_skill") or "", state.get("skill_body") or ""))
+                _tools_param = sorted({_norm_tool_name_safe(t) for t in plan_tools} | _common | _skill_decl)
                 logger.info("[Execute] 单段白名单注入 %d 个工具（planner 点名 %d + 通用 %d）: %s",
                             len(_tools_param), len(plan_tools), len(_common), _tools_param[:12])
             agent = agent_instance._build_code_agent(
@@ -2282,6 +2338,21 @@ def make_finalize_node(ctx: NodeContext):
         # 双通道判定：_run_error 显式标记 + 错误前缀兜底（防未来新分支漏标）。
         _RUN_ERROR_PREFIXES = ("[run_error]", "[错误]", "[max_steps 耗尽]")
         result_text = state.get("result_raw", "") or ""
+        # F4 续跑凭据：失败/中断 run 也可重启续跑（只序列化摘要，不含 agent 实例）
+        try:
+            if state.get("hit_max_steps") or state.get("_phase_abort") or state.get("_run_error"):
+                from app.agent.execution.resume import maybe_persist
+                maybe_persist(state, force=True, reason="finalize_failed")
+        except Exception as _re:
+            logger.debug("[resume] persist skipped: %s", _re)
+        # 远期自检：四闭环 + 三层追责完整性（只读审计，不改 correct）
+        try:
+            from app.agent.utils.loop_integrity import audit as _loop_audit, render as _loop_render
+            _la = _loop_audit()
+            if not _la.get("integrity"):
+                logger.warning("[loop_integrity] GAP\n%s", _loop_render(_la))
+        except Exception as _le:
+            logger.debug("[loop_integrity] audit skipped: %s", _le)
         run_failed = (
             (bool(state.get("_run_error")) and bool(result_text))
             or (result_text.startswith(_RUN_ERROR_PREFIXES) and not direct_answer)

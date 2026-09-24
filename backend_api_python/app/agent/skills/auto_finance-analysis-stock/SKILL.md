@@ -61,6 +61,13 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 5. **风险提示**：明确列出潜在利空与不确定性。
 6. **免责声明**：必须包含"数据口径：日线级别，基于公开市场数据计算，不构成投资建议"。
 
+## 返回结构统一契约（防结构幻象）
+
+- 批量/单码取数工具统一信封：`{count, data:{代码: {...}}}`；单码时顶层再镜像扁平键。
+- 访问：优先 `r["data"][code]["ma5"]`；单码也可 `r["ma5"]`。**禁止**对未判空的 `r["data"]` 直接下标。
+- `get_stock_info` 数值字段（pe_ratio/pb_ratio/market_cn/mcap_yi/roe…）尽量为 float，比较前仍建议 `float(x)`。
+- 失败：`{"error": "..."}`（无 data 信封）——先判 error 再取数。
+
 ## 注意事项
 
 - **参数类型坑**：`agent_get_kline` 与 `get_realtime_quote` 等工具的 `codes` 参数在单标的场景下**必须传字符串**（如 `'600519.SH'`）。若传入 `list` 类型，可能触发 `AttributeError: 'list' object has no attribute 'split'`。

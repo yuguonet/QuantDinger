@@ -44,6 +44,7 @@ import threading
 
 from constants import get_agent_max_steps
 from utils.json_parser import safe_parse_json
+from utils.smol_log import install_structured_logger as _install_sml_logger
 from utils.tracing import AgentTraceRecorder, llm_response_to_dict
 
 # ═══════════════════════════════════════════════════════════════
@@ -2558,6 +2559,23 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Repair] 跳过: %s", e)
 
+        def _error_step(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
+            """红字错误结构化：ActionStep.error → error/warn 事件（非仅 rich 显示）。"""
+            try:
+                from utils.smol_log import extract_step_error
+                item = extract_step_error(memory_step)
+                if item:
+                    try:
+                        _ev_cb = getattr(agent, "_qd_event_cb", None)
+                        if _ev_cb:
+                            _ev_cb({"type": "step_error", "kind": item.get("kind"),
+                                    "error_type": item.get("error_type"),
+                                    "msg": item.get("msg", "")[:300]})
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug("[smol_log] extract skipped: %s", e)
+
         def _failure_memory_step(memory_step: ActionStep, agent: SmolCodeAgent) -> None:
             """把本 step 新出现的失败类型合成【失败记忆】注入观测（不重复堆叠）。"""
             try:
@@ -2674,9 +2692,10 @@ class TaskAgent(AgentBase):
             max_steps=self.max_tool_rounds,
             executor=executor,
             planning_interval=planning_interval,
+            # 红字错误结构化：error_step 把 ActionStep.error 记成 step_error 事件
             step_callbacks=(
                 [_truncate_observations, _clarify_empty_output, _enforce_final_answer,
-                 _budget_step, _repair_step, _failure_memory_step]
+                 _budget_step, _repair_step, _failure_memory_step, _error_step]
                 # 协作取消(2026-09-17 Ctrl+C 修复):message_queue worker 在主线程
                 # 收到 Ctrl+C 后置 future 取消位,这里每步开头检查 _user_step_callbacks,
                 # 命中即抛错中止 run--worker 线程收不到 SIGINT,这是唯一可停点。
@@ -2767,6 +2786,10 @@ class TaskAgent(AgentBase):
         except Exception as e:
             logger.warning("[TaskAgent] 自定义 prompt_templates 加载失败: %s,使用默认", e)
 
+        try:
+            _install_sml_logger(agent)
+        except Exception as _sle:
+            logger.debug("[smol_log] install skipped: %s", _sle)
         return agent
 
     async def _execute_phase(

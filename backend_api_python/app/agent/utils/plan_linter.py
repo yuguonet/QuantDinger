@@ -47,7 +47,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 __all__ = [
     "DATA_DOMAIN_TOOLS", "LIST_PRODUCERS", "LIST_CONSUMERS",
     "detect_domains", "names_in_text", "build_tool_index", "index_candidates",
-    "get_tool_index", "granularity_hints", "LintReport", "lint_plan", "apply_report",
+    "list_tools", "granularity_hints", "LintReport", "lint_plan", "apply_report",
 ]
 
 # R4 裁剪后的最小工具面（低于此数不再裁——空工具面比冗余更致命）
@@ -62,19 +62,19 @@ R4_MIN_FACE = 3
 _DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("realtime_quote",
      ("实时", "现价", "最新价", "盘口", "快照", "分时", "realtime", "报价", "现在多少钱"),
-     ("get_realtime_quote", "quote", "get_realtime_snapshot", "get_order_book",
-      "minute_live", "get_realtime_turnover")),
+     ("get_realtime_quote", "quote", "get_realtime_quote", "get_order_book",
+      "minute_live", "get_realtime_quote")),
     ("kline",
      ("日线", "周线", "月线", "k线", "历史行情", "走势", "复权", "分钟线", "均线"),
-     ("agent_get_kline", "daily", "daily_live", "get_index_kline", "index_daily",
+     ("agent_get_kline", "daily", "daily_live", "agent_get_kline", "index_daily",
       "get_sector_history_data", "day_series")),
     ("fund_flow",
      ("资金流", "主力", "净流入", "净流出", "大单", "北向", "外资", "资金面", "fund_flow"),
-     ("get_fund_flow", "get_realtime_main_flow", "get_fund_flow_daily",
-      "get_market_fund_flow", "get_northbound_realtime", "get_capital_summary")),
+     ("get_fund_flow", "get_fund_flow", "get_fund_flow_daily",
+      "get_market_fund_flow", "get_market_fund_flow", "get_capital_summary")),
     ("financials",
      ("财务", "业绩", "营收", "净利润", "财报", "毛利率", "roe", "基本面", "财报数据"),
-     ("get_finance", "get_f10_all", "get_f10_content", "get_f10_categories")),
+     ("get_capital_summary", "get_stock_info", "get_stock_info", "get_stock_info")),
     ("valuation",
      ("估值", "市盈", "市净", "市值", "贵不贵", "值多少钱", "dcf", "目标价", "定价"),
      ("batch_valuation_compare", "get_stock_info")),
@@ -90,7 +90,7 @@ _DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
      ("get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason")),
     ("limit_pool",
      ("涨停", "跌停", "炸板", "连板", "封板", "打板", "首板", "接力", "晋级"),
-     ("get_limit_pool", "get_zt_pool", "get_dt_pool", "get_broken_board")),
+     ("get_limit_pool", "get_limit_pool", "get_dragon_tiger", "get_limit_pool")),
     ("screen",
      ("筛选", "选股", "选出", "找出", "挑出", "有哪些", "股票池", "排行"),
      ("search_stocks", "get_screener_presets", "build_keyword_from_filters")),
@@ -103,13 +103,13 @@ _DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("intel_news",
      ("消息面", "新闻", "公告", "研报", "舆情", "利好", "利空", "政策", "事件驱动", "传闻"),
      ("search_stock_intel", "search_sector_intel", "search_policy_intel",
-      "search_comprehensive_intel", "get_policy")),
+      "search_comprehensive_intel", "search_policy_intel")),
     ("market_overview",
      ("大盘", "指数", "市场概览", "沪深", "上证", "创业板指", "行情总览"),
-     ("get_market_overview", "get_market_indices", "market_snapshot", "get_index_realtime")),
+     ("get_market_overview", "get_market_indices", "market_snapshot", "get_market_indices")),
     ("sentiment",
      ("情绪", "恐贪", "赚钱效应", "亏钱效应", "情绪周期", "高潮", "冰点"),
-     ("get_emotion_latest", "get_emotion_history", "fear_greed_index", "get_fear_greed")),
+     ("get_market_overview", "get_market_overview", "fear_greed_index", "get_market_overview")),
     ("chip",
      ("筹码", "成本分布", "获利盘", "套牢盘", "筹码集中度"),
      ("get_chip_distribution",)),
@@ -121,10 +121,10 @@ _DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
      ("get_lockup_expiry",)),
     ("dividend",
      ("分红", "股息", "派息"),
-     ("get_dividend",)),
+     ("get_capital_summary",)),
     ("signals",
      ("信号", "买点", "卖点", "触发条件"),
-     ("list_signals", "get_signal_by_code", "get_active_signals", "strategy_keys")),
+     ("search_stock_intel", "run_indicator_signal", "list_strategies", "strategy_keys")),
 )
 
 # 域 → 候选工具（派生视图，供调用方/CI 断言使用；勿单独维护）
@@ -135,12 +135,12 @@ _PREFERRED: Dict[str, str] = {d: t[0] for d, _kw, t in _DATA_DOMAINS}
 # ── R2 依赖登记表 ──────────────────────────────────────────────────────────
 # 生产者：调用后产出"一批代码/一个股票池"（下游必须等它跑完才知道做什么）。
 LIST_PRODUCERS = frozenset({
-    "search_stocks", "get_limit_pool", "get_zt_pool", "get_dt_pool", "get_broken_board",
+    "search_stocks", "get_limit_pool", "get_limit_pool", "get_dragon_tiger", "get_limit_pool",
     "get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason",
     "get_dragon_tiger", "query_dragon_tiger", "lhb",
-    "get_hot_sectors", "get_all_hot_sectors", "get_sector_stocks",
-    "get_hot_concept_boards", "get_hot_industry_boards", "get_industry_ranking",
-    "get_active_signals", "list_signals", "all_codes", "get_watch_pending",
+    "get_hot_sectors", "get_hot_sectors", "get_sector_stocks",
+    "get_hot_sectors", "get_industry_ranking", "get_industry_ranking",
+    "list_strategies", "search_stock_intel", "all_codes", "list_strategies",
 })
 # 消费者：以"单票 / codes 清单"为单位取数或分析（输入依赖上一步的清单）。
 LIST_CONSUMERS = frozenset({
@@ -149,8 +149,8 @@ LIST_CONSUMERS = frozenset({
     "indicator_analysis", "get_obv_analysis", "get_volume_analysis",
     "get_fund_flow", "get_fund_flow_daily", "get_chip_distribution",
     "get_stock_info", "get_stock_sector_info", "get_stock_concept_blocks",
-    "search_stock_intel", "batch_valuation_compare", "get_finance", "get_f10_all",
-    "resolve_stock", "get_lockup_expiry", "get_dividend", "get_signal_by_code",
+    "search_stock_intel", "batch_valuation_compare", "get_capital_summary", "get_stock_info",
+    "resolve_stock", "get_lockup_expiry", "get_capital_summary", "run_indicator_signal",
 })
 
 
@@ -379,6 +379,13 @@ def lint_plan(
     phases = list(phases or [])
     plan_tools = list(plan_tools or [])
     rep = LintReport()
+    # R2 depends_on（远期 F1 前置）：环/自依赖/未知 id 一律致命
+    try:
+        from app.agent.utils.phase_graph import validate_depends_on
+        for _err in validate_depends_on(phases or []):
+            rep.warnings.append(f"depends_on:{_err}")
+    except Exception as _e:
+        rep.warnings.append(f'depends_on_check_failed:{_e}')
     avail = set(available_names or ())
     face = _declared_face(phases, plan_tools, base_tools)
 

@@ -452,6 +452,23 @@ class GuidedCPythonExecutor(PythonExecutor):
             return (err_text
                     + "\n[纠正提示] 该对象没有这个方法/属性。请先确认变量类型"
                       "（print(type(x))）与正确用法；如需调用工具，只能使用可用工具清单中的名称。")
+        # 2026-09-24（提智实测）：模型把工具当模块 import（from agent_get_kline import …）
+        # ——工具不是模块，已直接在命名空间，import 即错。给出定向纠正 + 失败记忆登记。
+        m_imp = (re.search(r"No module named '([\w.]+)'", err_text)
+                 or re.search(r"from ([\w.]+) import", err_text))
+        if m_imp:
+            _imp_name = m_imp.group(1).split(".")[0]
+            if _imp_name in self._all_known_tools:
+                try:
+                    from utils.failure_memory import classify_error
+                    self._failure_events.append((classify_error(err_text) or "hallucinated_tool",
+                                                 err_text[:60]))
+                except Exception:
+                    self._failure_events.append(("hallucinated_tool", err_text[:60]))
+                return (err_text
+                        + f"\n[纠正提示] `{_imp_name}` 不是模块——它是已注入命名空间的工具函数，"
+                          f"**直接调用即可**（禁止 import）：{_imp_name}(...)。"
+                          f"import 语句只用于第三方库（如 pandas）。")
         return err_text
 
     # ── 跨阶段变量促升（2026-09-15 两级统一）──────────────────────────────

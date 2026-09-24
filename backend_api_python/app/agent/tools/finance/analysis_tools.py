@@ -1124,8 +1124,9 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """均线指标：返回多个周期均线的 MA 值、斜率和趋势方向。
 
     Returns:
-        dict: {stock_code, latest_close, ma{p}, ma{p}_slope, ma{p}_trend(上行/下行/走平)}，
-        每个周期一组键（如 ma5/ma5_slope/ma5_trend）；多代码→{count, data:{代码:上述}}；失败→{error}。
+        **始终**含 `count`/`data:{代码: {...}}`；单码时顶层再镜像扁平键（双通道）。
+        每周期一组键（如 ma5/ma5_slope/ma5_trend）；访问推荐 `r["data"][code]` 或单码 `r["ma5"]`。
+        失败 → {error}。
 
     Args:
         codes: 多股用逗号分隔
@@ -1172,7 +1173,8 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
             return {"error": str(e)}
 
     if len(code_list) == 1:
-        return _one(code_list[0])
+        from tools.base import as_code_envelope
+        return as_code_envelope(code_list[0], _one(code_list[0]))
 
     results = {}
     for code in code_list:
