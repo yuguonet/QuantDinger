@@ -8,6 +8,9 @@ AGENT_JSONL_ENABLED=false    只关本地 JSONL（agent_runs.jsonl），保留 q
 AGENT_TRACE_FILE=traces/agent_runs.jsonl
                             相对路径锚定到本包目录（app/agent/），不随进程 CWD 漂移
 AGENT_TRACE_MAX_CHARS=12000
+AGENT_EVAL_DUMP=<path>       评测侧车出口（默认不设=关闭）：每次 finish() 追加一行 JSON，
+                            含 route(意图路由) / used_tools / 工具观测语料，供
+                            tests/evals/runner.py --live 判分取数
 """
 
 import json
@@ -83,6 +86,39 @@ def _jsonl_enabled() -> bool:
     )
 
 
+# ── 评测侧车出口（2026-09-24 提智 · E1 评测集取数通道）────────────────────
+# 背景：`tests/evals/runner.py --live` 此前只能从 CLI stdout 正则回收工具名，
+# 拿不到 route（意图路由）与工具观测语料 ⇒ 用例里声明的 `expect_route` 恒判失败、
+# `min_grounding_rate` 恒被跳过（"声明了没接线"的判分项，基线失真）。
+# 这三个量其实**已被本采集器收在内存里**（intent_verb / _tool_calls），只是没有出口：
+# JSONL 只写 events、qd_traces 需 DB。这里补一个机器可读侧车——
+# 设 AGENT_EVAL_DUMP 时每次 finish() 追加一行 JSON；不设则零开销、零行为变化。
+_EVAL_CORPUS_MAX = 200_000  # 观测语料总长上限（grounding 溯源用，防报告失控）
+
+
+def _eval_dump_path() -> Optional[Path]:
+    """解析 AGENT_EVAL_DUMP：未设置返回 None（关闭），相对路径锚定 app/agent/。"""
+    raw = (os.getenv("AGENT_EVAL_DUMP") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else (_AGENT_DIR / p)
+
+
+def _eval_route(intent_verb: str) -> str:
+    """把意图动词归一到图路由口径（与 nodes.route_after_chat 的 needs_task 同义）。
+
+    chat → 直答（finalize）；cron → 定时任务短路（不走 plan/execute）；
+    其余（analysis/screen/compare/query/code/explain/general/空）→ 任务链（plan）。
+    """
+    v = (intent_verb or "").strip().lower()
+    if v == "chat":
+        return "chat"
+    if v == "cron":
+        return "cron"
+    return "task"
+
+
 def _truncate(value: Any, limit: Optional[int] = None) -> Any:
     """递归裁剪过长字段，避免 trace 文件失控。"""
     limit = limit or _max_chars()
@@ -136,15 +172,37 @@ def _extract_score(answer: str) -> Optional[float]:
     return None
 
 
+# 方向/动作关键词的否定语境过滤（2026-09-24 提智阶段 0.10，审计 B4）：
+# 旧口径"关键词命中即定方向"会把「不建议买入」判成 bullish、风险提示里的「卖出」
+# 判成 bearish——标注噪声以"数据"身份进入 T+N correct 与权重/酿造原料（B4）。
+# 现只做**否定过滤**（命中词紧邻否定修饰则丢弃该命中），不做反向推断
+# （"不建议买" ≠ "建议卖"，宁可落 neutral 不猜方向）。
+_NEGATION_RE = re.compile(r"(?:不|别|切勿|勿|暂不|并非|禁|不宜|回避)[^。！？；;\n]{0,6}$")
+
+
+def _kw_first_hit(answer_lower: str, kws) -> str:
+    """返回第一个**未被否定**命中的关键词（列表顺序即优先级）；无命中返回 ""。"""
+    for kw in kws:
+        start = 0
+        while True:
+            i = answer_lower.find(kw, start)
+            if i < 0:
+                break
+            if not _NEGATION_RE.search(answer_lower[:i]):
+                return kw
+            start = i + 1
+    return ""
+
+
 def _extract_direction(answer: str) -> str:
     extracted = _extract_from_json(answer)
     d = extracted.get("direction", "")
     if d:
         return d
     answer_lower = answer.lower()
-    if any(kw in answer_lower for kw in ["买入", "buy", "看多", "bullish", "建议买"]):
+    if _kw_first_hit(answer_lower, ["买入", "buy", "看多", "bullish", "建议买"]):
         return "bullish"
-    if any(kw in answer_lower for kw in ["卖出", "sell", "看空", "bearish", "建议卖"]):
+    if _kw_first_hit(answer_lower, ["卖出", "sell", "看空", "bearish", "建议卖"]):
         return "bearish"
     return "neutral"
 
@@ -155,11 +213,11 @@ def _extract_action(answer: str) -> str:
     if a:
         return a
     answer_lower = answer.lower()
-    if any(kw in answer_lower for kw in ["买入", "buy", "建议买"]):
+    if _kw_first_hit(answer_lower, ["买入", "buy", "建议买"]):
         return "buy"
-    if any(kw in answer_lower for kw in ["卖出", "sell", "建议卖"]):
+    if _kw_first_hit(answer_lower, ["卖出", "sell", "建议卖"]):
         return "sell"
-    if any(kw in answer_lower for kw in ["跳过", "skip", "回避"]):
+    if _kw_first_hit(answer_lower, ["跳过", "skip", "回避"]):
         return "skip"
     return "hold"
 
@@ -203,6 +261,50 @@ def _extract_stock_from_answer(answer: str) -> tuple[str, str]:
 #  AgentTraceRecorder
 # ═══════════════════════════════════════════════════════════════
 
+def _repro_meta(tool_manifest=None) -> dict:
+    """run 级可复现字段（2026-09-24 提智 0.8，agent提智 #8）：
+    prompt 哈希 + 模型/温度/seed + 工具清单哈希 + 代码版本标识。
+
+    复盘一个决策至少要能回答"这单结论是哪套配置给出的"。代码版本读 .git 文件
+    （不执行 git 命令，项目红线）；拿不到就 'unknown'，不阻断。
+    """
+    import hashlib
+
+    def _sha_file(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        except Exception:
+            return "missing"
+
+    prompts = Path(__file__).resolve().parent.parent / "prompts"
+    meta = {
+        "prompt_sha": {p.name: _sha_file(p) for p in (
+            prompts / "plan_system.txt", prompts / "code_agent.yaml",
+            prompts / "intent_classifier.txt", prompts / "skill_brew.txt",
+            prompts / "skill_revise.txt")},
+        "model": os.getenv("OPENAI_MODEL", ""),
+        "temperature": os.getenv("AGENT_LLM_TEMPERATURE", ""),
+        "seed": os.getenv("AGENT_LLM_SEED", ""),
+    }
+    if tool_manifest:
+        _m = ",".join(sorted(tool_manifest)).encode("utf-8", "ignore")
+        meta["tools_sha"] = hashlib.sha256(_m).hexdigest()[:16]
+        meta["tool_count"] = len(tool_manifest)
+    # 代码版本标识：读 .git/HEAD → refs（文件读取，不执行 git 命令）
+    try:
+        _git = Path(__file__).resolve().parents[3] / ".git"
+        _head = (_git / "HEAD").read_text(encoding="utf-8").strip()
+        if _head.startswith("ref: "):
+            _ref = _git / _head[5:]
+            meta["code_version"] = (_ref.read_text(encoding="utf-8").strip()
+                                    if _ref.exists() else _head)
+        else:
+            meta["code_version"] = _head
+    except Exception:
+        meta["code_version"] = "unknown"
+    return meta
+
+
 class AgentTraceRecorder:
     """统一采集器：事件追加 + finish() 时写入 qd_traces。
 
@@ -210,7 +312,8 @@ class AgentTraceRecorder:
       1. __init__(): 创建，记录 run_start
       2. record(): 各节点追加事件（plan/execute/error 等）
       3. set_stock() / set_skill() / add_tool_call(): 设置上下文
-      4. finish(): 写 JSONL + 从 final_answer 提取结构化字段写入 qd_traces
+      4. finish(): 写 JSONL + 评测侧车（AGENT_EVAL_DUMP）+ 从 final_answer
+         提取结构化字段写入 qd_traces
     """
 
     def __init__(
@@ -250,6 +353,16 @@ class AgentTraceRecorder:
         self._total_tokens: int = 0
         self._plan: str = ""
 
+        # 0.9 计数器面板：从事件流汇总（原则 7：校验环自证在工作）。
+        try:
+            from utils.budget import empty_panel, bump
+            self._panel = empty_panel()
+            self._panel["runs"] = 1
+            self._bump = bump
+        except Exception:
+            self._panel = {}
+            self._bump = lambda p, k, n=1: p
+
         self.record(
             "run_start",
             {
@@ -283,6 +396,26 @@ class AgentTraceRecorder:
             "elapsed_ms": _now_ms() - self.started_at_ms,
             "payload": _truncate(payload),
         })
+        # 0.9 面板：把关键事件计入计数器（trace 是唯一汇总处）
+        try:
+            if event_type == "verify_done":
+                self._bump(self._panel, "verify_seen")
+                _r = str((payload or {}).get("route") or "")
+                self._bump(self._panel, {"PASS": "verify_pass",
+                             "REPAIR_ONCE": "verify_repair",
+                             "DEGRADE": "verify_degrade"}.get(_r, "verify_seen"))
+            elif event_type == "verify_skipped":
+                self._bump(self._panel, "verify_skipped")
+            elif event_type == "grounding_reject":
+                self._bump(self._panel, "grounding_rejects", int((payload or {}).get("count", 1) or 1))
+            elif event_type == "hallucination_blocked":
+                self._bump(self._panel, "hallucination_blocks", int((payload or {}).get("count", 1) or 1))
+            elif event_type == "budget_exceeded":
+                self._bump(self._panel, "budget_exceeded")
+            elif event_type == "replan":
+                self._bump(self._panel, "replans")
+        except Exception:
+            pass
 
     # ── 上下文设置（由 nodes 调用）────────────────────────────
 
@@ -296,6 +429,10 @@ class AgentTraceRecorder:
     def set_skill(self, skill_name: str):
         """标记当前执行的技能。"""
         self._skill_name = skill_name
+
+    def set_tool_manifest(self, names) -> None:
+        """登记本 run 的工具清单（0.8 可复现字段：tools_sha 来源）。"""
+        self._tool_manifest = sorted(set(names or []))
 
     def set_intent(self, domain: str = "", verb: str = "", noun: str = ""):
         """记录意图三元组，供 chain_name（feedback 按链匹配、按链统计）使用。
@@ -343,18 +480,17 @@ class AgentTraceRecorder:
                response: Optional[dict] = None) -> Optional[int]:
         """结束追踪：写 JSONL + 写 qd_traces。
 
-        final_answer: CodeAgent 原始输出（execute_node 在格式化前经 state 传入），
-        用于提取 score/direction/action 等结构化字段；None 时回退 response.content。
-        """
-        """结束追踪：写 JSONL + 写 qd_traces。
-
         Args:
-            final_answer: CodeAgent 原始输出（用于提取结构化字段）
+            final_answer: CodeAgent 原始输出（execute_node 在格式化前经 state 传入），
+                用于提取 score/direction/action 等结构化字段；None 时回退 response.content。
             status: success / error
-            response: 附加响应数据
+            response: 附加响应数据（error 时取 response["error"] 落根节点）
 
         Returns:
             qd_traces root_id，失败返回 None
+
+        注（2026-09-24 提智阶段 0.10，审计 A6）：错误 run 也落一条根节点
+        （status='failed' + error），不进回测统计（query_pending_verify 只取 status='ok'）。
         """
         # 幂等保护：finalize_node 与 _chat_plan_graph 会对同一次 run 各调一次 finish，
         # 重复执行会双写 JSONL + 双写 qd_traces（审计 P1-3）。第二次调用直接返回首写结果。
@@ -370,11 +506,39 @@ class AgentTraceRecorder:
         if _jsonl_enabled():
             self._write_jsonl()
 
+        # 评测侧车（AGENT_EVAL_DUMP 开启时）：成功/失败 run 都写，供评测判分取数
+        self._write_eval_dump()
+
+        # 0.9 周报：面板计数器同步一份到独立 panel.jsonl（供 scripts/weekly_panel.py 聚合）
+        try:
+            if getattr(self, "_panel", None):
+                import os as _os
+                _pf = _os.getenv("AGENT_PANEL_FILE", "traces/panel.jsonl")
+                _p = Path(_pf).expanduser()
+                if not _p.is_absolute():
+                    _p = _AGENT_DIR / _p
+                _p.parent.mkdir(parents=True, exist_ok=True)
+                with _p.open("a", encoding="utf-8") as _f:
+                    _f.write(json.dumps({"trace_id": self.trace_id,
+                                         "session_id": self.session_id,
+                                         "finished_at_ms": _now_ms(),
+                                         "panel": self._panel}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
         # 写 qd_traces。结构化字段提取源：优先 CodeAgent 原始输出（execute_node 在
         # LLM 格式化之前传入 finish），没有时回退 response.content —— 不再用格式化
         # 后的文本做 regex 提取，避免 LLM 版式变化污染 score/direction（审计 P1-3）。
-        if final_answer and status == "success":
-            self._finished_root_id = self._write_qd_traces(final_answer)
+        # 2026-09-24（提智阶段 0.10，审计 A6）：错误 run 也落根节点——旧实现只在
+        # `final_answer and status == "success"` 时写库，fail() docstring 承诺的
+        # "留一条带错误信息的根节点（供排查）"零兑现，排查"某天为什么没分析"DB 是空白。
+        if status == "success":
+            if final_answer:
+                self._finished_root_id = self._write_qd_traces(final_answer)
+        else:
+            err = str((response or {}).get("error") or "")
+            self._finished_root_id = self._write_qd_traces(
+                final_answer or "", status="failed", error=err)
 
         return self._finished_root_id
 
@@ -406,15 +570,64 @@ class AgentTraceRecorder:
             "session_id": self.session_id,
             "started_at_ms": self.started_at_ms,
             "finished_at_ms": _now_ms(),
+            "panel": (getattr(self, "_panel", None) or None),  # 0.9 计数器面板
             "events": self.events,
         }
         with trace_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    # ── 评测侧车输出（E1 评测集取数）───────────────────────────
+
+    def _write_eval_dump(self) -> None:
+        """把判分所需的三件套追加一行到 AGENT_EVAL_DUMP（未设置则直接返回）。
+
+        字段契约（tests/evals/runner.py 按 session_id 取最后一行）：
+          route       意图路由（chat/cron/task），对齐用例的 expect_route
+          intent_verb 意图分类原始动词（analysis/screen/... 便于排查）
+          used_tools  本次调用的工具名（去重保序，来源 _tool_calls）
+          corpus      工具观测语料拼接（grounding 溯源用，超限截断）
+        """
+        path = _eval_dump_path()
+        if path is None:
+            return
+        try:
+            names: List[str] = []
+            parts: List[str] = []
+            for tc in self._tool_calls:
+                name = tc.get("name") or ""
+                if name and name not in names:
+                    names.append(name)
+                res = tc.get("result")
+                if res:
+                    parts.append(str(res))
+            payload = {
+                "trace_id": self.trace_id,
+                "agent_type": self.agent_type,
+                "session_id": self.session_id,
+                "finished_at_ms": _now_ms(),
+                "route": _eval_route(self.intent_verb),
+                "intent_verb": self.intent_verb,
+                "intent_domain": self.domain,
+                "used_tools": names,
+                "corpus": "\n".join(parts)[:_EVAL_CORPUS_MAX],
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            # 附属出口失败不影响主链，但必须发声（不许静默降级）
+            logger.warning("[Trace] 评测侧车写入失败 %s: %s", path, e)
+
     # ── qd_traces 输出 ────────────────────────────────────────
 
-    def _write_qd_traces(self, final_answer: str) -> Optional[int]:
-        """从 final_answer + 事件流提取结构化字段，构建 EvalNode 写入 qd_traces。"""
+    def _write_qd_traces(self, final_answer: str, status: str = "ok",
+                         error: str = "") -> Optional[int]:
+        """从 final_answer + 事件流提取结构化字段，构建 EvalNode 写入 qd_traces。
+
+        status/error（2026-09-24，审计 A6）：成功 run 默认 status='ok' 走全量结构化提取；
+        错误 run 传 status='failed' + error，只写根节点留痕（决策字段留空，
+        不参与 T+N 回测与权重聚合——query_pending_verify 只取 status='ok'）。
+        """
         try:
             from chain.schema import EvalNode, Layer
 
@@ -455,7 +668,9 @@ class AgentTraceRecorder:
             # 不参与决策树/回测统计，避免 unknown+screen+unknown 这类毒丸数据入库。
             # 注：空 code 记录本就无法逐股回测，store.query_pending_verify 已将其判为
             # 永久毒丸——此处写入前直接拦截更干净（归类成功则仍写入，符合"归类回测"诉求）。
-            if not stock_code and "unknown" in chain_name:
+            # 错误 run 不走毒丸拦截：留痕本身就是目的（status='failed' 已被回测查询排除），
+            # 拦掉就回到"排查时 DB 空白"的老问题（审计 A6）。
+            if status == "ok" and not stock_code and "unknown" in chain_name:
                 logger.info("[Trace] 跳过写入决策树: 链不可归类且无标的 chain=%s (不参与回测)", chain_name)
                 return None
             root = EvalNode(
@@ -464,7 +679,8 @@ class AgentTraceRecorder:
                 exec_date=date.today(),
                 stock_code=stock_code,
                 stock_name=stock_name,
-                input_params={"user_query": self.user_input},
+                input_params={"user_query": self.user_input,
+                              "repro": _repro_meta(getattr(self, "_tool_manifest", None))},
                 analysis=final_answer[:2000],
                 # §8.3：run 级元数据落库。此前这五列要么有 DDL 无写入（恒空），
                 # 要么（plan）压根没有 DDL —— 而 store.py 的 INSERT 一直在写 plan，
@@ -474,12 +690,15 @@ class AgentTraceRecorder:
                 user_query=self.user_input,
                 model=self._model,
                 total_tokens=self._total_tokens or None,
-                score=_extract_score(final_answer),
-                direction=_extract_direction(final_answer),
-                action=_extract_action(final_answer),
-                signal=_extract_signal(final_answer),
-                confidence=_extract_confidence(final_answer),
-                timeframe=_extract_timeframe(final_answer),
+                # 成功 run 全量提取；错误 run 决策字段留空（不污染权重/酿造原料）。
+                score=_extract_score(final_answer) if status == "ok" else None,
+                direction=_extract_direction(final_answer) if status == "ok" else "",
+                action=_extract_action(final_answer) if status == "ok" else "",
+                signal=_extract_signal(final_answer) if status == "ok" else "",
+                confidence=_extract_confidence(final_answer) if status == "ok" else 0.0,
+                timeframe=_extract_timeframe(final_answer) if status == "ok" else "",
+                status=status,
+                error=error,
                 elapsed_ms=_now_ms() - self.started_at_ms,
             )
 

@@ -132,6 +132,10 @@ def search_stock_intel(codes: str, name: str = "") -> dict:
 def search_sector_intel(market: str = "CNStock") -> dict:
     """板块情报搜索：返回指定板块的相关新闻和政策动态。
 
+    Returns:
+        {label, composite_score, direction, veto, veto_article, count, news[]}；
+        news 元素 {title, link, snippet?, source, published, sentiment, sentiment_score}。
+
     Args:
         market: 板块名称或关键词
     """
@@ -139,6 +143,10 @@ def search_sector_intel(market: str = "CNStock") -> dict:
     return _build_result(items, f"板块:{market}")
 def search_policy_intel(market: str = "CNStock") -> dict:
     """政策情报搜索：返回最新财经政策、监管动态。
+
+    Returns:
+        {label, composite_score, direction, veto, veto_article, count, news[]}；
+        news 元素 {title, link, snippet?, source, published, sentiment, sentiment_score}。
 
     Args:
         market: 市场或政策关键词

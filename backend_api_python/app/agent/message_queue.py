@@ -123,12 +123,9 @@ def _worker_loop():
         try:
             loop = asyncio.new_event_loop()
             try:
-                # event_cb 经 _current_event_cb 生效（chat() 读取，避免改公开签名）。
-                # 时序关键（2026-09-11 修复）：协程创建≠执行——若在协程外设置/恢复，
-                # finally 会在 run_until_complete 真正执行协程体之前把回调恢复为 None，
-                # 过程事件全部丢失。必须在协程体内设置、finally 恢复；
-                # 超时取消时 finally 同样执行，不会泄漏。
-                _prev_cb = getattr(agent, "_current_event_cb", None)
+                # event_cb/step_checks/中断探针统一走 task_agent 会话钩子表
+                # （2026-09-24 提智 0.7 并发槽位收编：旧 _current_event_cb 全局槽 +
+                # save/restore 模式多 worker 互踩，审计 B1）。
 
                 # 协作取消（2026-09-17 Ctrl+C 修复）：worker 线程收不到 SIGINT，
                 # 主线程只能置 future 取消位；agent.run 的 step callback 是天然检查点——
@@ -145,37 +142,37 @@ def _worker_loop():
                         raise _UserInterruptError("user interrupted")
 
                 async def _run_with_events():
-                    _cb = task.get("event_cb")
-                    if _cb is not None:
-                        agent._current_event_cb = _cb
-                    _prev_cbs = getattr(agent, "_user_step_callbacks", None)
-                    agent._user_step_callbacks = list(_prev_cbs or []) + [_cancel_check]
-
-                    # 立即停止（2026-09-17）：工具级中断探针（task_agent._INTERRUPT_CHECKS）
-                    # 三个触发源：future 取消位（CLI Ctrl+C）/ 会话停止位（任意终端
-                    # request_stop）/ smolagents interrupt_switch（TaskAgent 转发 interrupt()）。
-                    # 工具守卫每次工具调用进入前执行探针 → step 内即停，不等步边界。
+                    # 2026-09-24 提智 0.7：并发槽位收编——原 _current_event_cb /
+                    # _user_step_callbacks / _INTERRUPT_CHECKS 均“赋值 + finally 恢复”，
+                    # 多 worker 并发互踩（A 收尾抹掉 B 的注册 / 陈旧探针串会话误杀，审计 B1）。
+                    # 现按 session 注册到 task_agent 会话钩子表 + 线程局部绑定当前 run。
                     from agents import task_agent as _ta_mod
+                    _sid = str(task["session_id"])
+                    _ta_mod.bind_run_session(_sid)
 
+                    # 立即停止（2026-09-17）：工具级中断探针，触发源——会话停止位
+                    # （任意终端 request_stop，CLI Ctrl+C 归一到此）/ smolagents
+                    # interrupt_switch。工具守卫每次工具调用进入前执行探针 → step 内即停。
                     def _interrupt_probe():
-                        # 只查停止位 + interrupt_switch（见 _cancel_check 注释：
-                        # future.cancelled() 对运行中任务恒 False，是坏开关）
-                        if _is_stop_requested(str(task["session_id"])):
+                        # 只查停止位 + interrupt_switch（future.cancelled() 对运行中任务恒 False）
+                        if _is_stop_requested(_sid):
                             raise _UserInterruptError("user interrupted")
-                        _ca = getattr(agent, "_active_code_agent", None)
+                        _ca = _ta_mod._hooks_now().get("active_agent")
                         if _ca is not None and getattr(_ca, "interrupt_switch", False):
                             raise _UserInterruptError("user interrupted")
 
-                    _prev_checks = list(_ta_mod._INTERRUPT_CHECKS)
-                    _ta_mod._INTERRUPT_CHECKS.append(_interrupt_probe)
+                    _ta_mod.register_run_hooks(
+                        _sid,
+                        event_cb=task.get("event_cb"),
+                        step_checks=[_cancel_check],
+                        probes=[_interrupt_probe],
+                    )
                     try:
                         return await agent.chat(task["message"], session_id=task["session_id"])
                     except _UserInterruptError:
                         raise
                     finally:
-                        agent._current_event_cb = _prev_cb
-                        agent._user_step_callbacks = _prev_cbs
-                        _ta_mod._INTERRUPT_CHECKS[:] = _prev_checks
+                        _ta_mod.unregister_run_hooks(_sid)
 
                 resp = loop.run_until_complete(asyncio.wait_for(_run_with_events(), timeout=task["timeout"]))
                 future.set_result(resp.content or "")

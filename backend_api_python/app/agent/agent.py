@@ -10,6 +10,7 @@ import os
 import logging
 from types import SimpleNamespace
 
+from constants import get_agent_max_steps
 from llm import create_llm, QDSkillAdapter
 from memory import (
     LocalMemory,
@@ -44,7 +45,7 @@ LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "2000"))
 MEMORY_BACKEND    = os.getenv("MEMORY_BACKEND", "local").lower()
 DATABASE_URL      = os.getenv("DATABASE_URL", "")
-MAX_TOOL_ROUNDS   = int(os.getenv("AGENT_MAX_STEPS", "6"))
+MAX_TOOL_ROUNDS   = get_agent_max_steps()  # 2026-09-24 统一常量源（审计 B2）：语义/默认值见 constants.py
 DEFAULT_SESSION_ID = "default"
 
 # ---------- settings 兼容对象（cli.py / flask_app.py 使用）----------

@@ -1030,20 +1030,32 @@ def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
     return result
 
 
-def get_delta_digest(chain_name: str, since_date=None, max_children: int = 20) -> Optional[dict]:
+def get_delta_digest(chain_name: str, since_date=None, since_root_id: int = None,
+                     max_children: int = 20) -> Optional[dict]:
     """增量轨迹摘要（迭代修订原料，重设计 §2.6）。
 
-    取该链自 since_date 以来（含 correct 两态）的 run 树摘要：
+    取该链自 since_date / since_root_id 以来（含 correct 两态）的 run 树摘要：
       - correct=TRUE 的 run → 供修订器提炼步骤/参数改进；
       - correct=FALSE 的 run → 供修订器把坑写进「注意事项」。
-    since_date=None 时取全部（与首酿原料同源）。
+    都不传时取全部（与首酿原料同源）。
+    since_root_id（2026-09-24，审计 A4）：修订原料按 SKILL.md 头部 `from root_id=NNN`
+    截增量——旧实现调用方解析了 since_id 却零引用，每轮把全量历史反复喂给修订器
+    （护栏 1「增量轨迹」名存实亡，重复强化/漂移）。
     """
     from app.utils.db import get_db_connection
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            extra = "AND t.exec_date >= %s" if since_date else ""
-            params = [chain_name] + ([since_date] if since_date else []) + [max_children]
+            conds = []
+            params = [chain_name]
+            if since_date:
+                conds.append("AND t.exec_date >= %s")
+                params.append(since_date)
+            if since_root_id:
+                conds.append("AND t.id > %s")
+                params.append(since_root_id)
+            extra = " ".join(conds)
+            params.append(max_children)
             cur.execute(f"""
                 SELECT t.id, t.user_query, t.plan, t.correct, t.exec_date,
                        t.output_summary
@@ -1078,30 +1090,56 @@ def get_delta_digest(chain_name: str, since_date=None, max_children: int = 20) -
         return None
 
 
-def get_skill_revision(chain_name: str) -> dict:
-    """读取技能修订状态（version/revision 计数；重设计 §2.6 护栏 5 用）。"""
+# 修订状态行前缀（2026-09-24 提智 0.3「拆行」方案，免 DDL）：修订状态独立存
+# `layer='brew_state', name='revise:<skill_name>'` 行，与酿造节拍行（name=<chain>）彻底分开。
+# 列语义单一（禁一列两用，审计 A2 的病根）：weight=low_streak、sample_count=revision、
+# last_updated=修订时刻（评价过滤用）。键用 **skill_name**（与 layer='skill' 权重行同键）。
+# 历史数据不迁移：旧实现把 revision/low_streak 塞进酿造行与 fail_streak 互踩（A2）、
+# 且每轮被 maybe_revise 归零（A3）——旧值不可信，从零重新积累。
+_REVISE_PREFIX = "revise:"
+
+
+def get_skill_revision(skill_name: str) -> dict:
+    """读取单个技能的修订状态（重设计 §2.6 护栏 5 用）。"""
+    return get_skill_revisions().get(
+        skill_name, {"revision": 0, "low_streak": 0, "revised_at": None})
+
+
+def get_skill_revisions() -> Dict[str, dict]:
+    """全部技能修订状态 → {skill_name: {revision, low_streak, revised_at}}。
+
+    revised_at = 修订时刻（date）：evaluator 用它把评价样本截到**新版本产出**的 run
+    （护栏 2「新版本重新积累」的另一半，2026-09-24）。
+    """
     from app.utils.db import get_db_connection
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT weight, sample_count FROM qd_agent_weights
-                WHERE layer = 'brew_state' AND name = %s
-            """, (chain_name,))
-            row = cur.fetchone()
+                SELECT name, weight, sample_count, last_updated
+                FROM qd_agent_weights
+                WHERE layer = 'brew_state' AND name LIKE %s
+            """, (_REVISE_PREFIX + "%",))
+            out = {}
+            for r in cur.fetchall():
+                out[r["name"][len(_REVISE_PREFIX):]] = {
+                    "revision": int(r["sample_count"] or 0),
+                    "low_streak": int(r["weight"] or 0),
+                    "revised_at": r["last_updated"].date() if r["last_updated"] else None,
+                }
             cur.close()
-            if not row:
-                return {"revision": 0, "low_streak": 0}
-            # weight 列在 brew_state 行语义：整数部分=fail_streak 由 set_brew_state 维护；
-            # revision 存 sample_count（复用列，避免加字段）
-            return {"revision": int(row["sample_count"] or 0), "low_streak": int(row["weight"] or 0)}
+            return out
     except Exception as e:
-        logger.warning("[Store] 修订状态读取失败 chain=%s: %s", chain_name, e)
-        return {"revision": 0, "low_streak": 0}
+        logger.warning("[Store] 修订状态读取失败: %s", e)
+        return {}
 
 
-def set_skill_revision(chain_name: str, revision: int, low_streak: int) -> None:
-    """更新技能修订计数（revision 存 sample_count 列，low_streak 存 weight 列的负值语义见调用方）。"""
+def set_skill_revision(skill_name: str, revision: int, low_streak: int) -> None:
+    """写修订状态（**修订事件**调用）：last_updated=修订时刻。
+
+    判定事件（只改 low_streak）请用 set_skill_low_streak——本函数会刷新 last_updated，
+    判定事件用它会让旧版本样本混进新评价（一列两用，禁）。
+    """
     from app.utils.db import get_db_connection
     from datetime import date as _d
     try:
@@ -1116,8 +1154,103 @@ def set_skill_revision(chain_name: str, revision: int, low_streak: int) -> None:
                     weight = EXCLUDED.weight,
                     sample_count = EXCLUDED.sample_count,
                     last_updated = EXCLUDED.last_updated
-            """, (chain_name, low_streak, revision, _d.today()))
+            """, (_REVISE_PREFIX + skill_name, low_streak, revision, _d.today()))
             conn.commit()
             cur.close()
     except Exception as e:
-        logger.error("[Store] 修订状态写入失败 chain=%s: %s", chain_name, e)
+        logger.error("[Store] 修订状态写入失败 skill=%s: %s", skill_name, e)
+
+
+def set_skill_low_streak(skill_name: str, low_streak: int) -> None:
+    """只更新 low_streak（**判定事件**调用）：不动 sample_count/last_updated。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO qd_agent_weights
+                    (layer, name, skill_name, weight, sample_count)
+                VALUES ('brew_state', %s, NULL, %s, 0)
+                ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                DO UPDATE SET weight = EXCLUDED.weight
+            """, (_REVISE_PREFIX + skill_name, low_streak))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.error("[Store] low_streak 写入失败 skill=%s: %s", skill_name, e)
+
+
+def reset_skill_weight(skill_name: str) -> None:
+    """护栏 2 真落地（2026-09-24，设计 §3.17）：修订完成 → 权重重置 1.0、sample_count 归零
+    （新版本重新积累）。旧实现只有注释/文档承诺、无写入点（“声明了但没接线”）。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE qd_agent_weights
+                SET weight = 1.0, sample_count = 0
+                WHERE layer = 'skill' AND name = %s
+            """, (skill_name,))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.error("[Store] 权重重置失败 skill=%s: %s", skill_name, e)
+
+
+def get_skill_weight_rows() -> Dict[str, dict]:
+    """skill 层权重行 → {name: {weight, sample_count}}（maybe_revise 判定“带最小样本”用）。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name, weight, sample_count FROM qd_agent_weights WHERE layer = 'skill'")
+            out = {r["name"]: {"weight": r["weight"], "sample_count": int(r["sample_count"] or 0)}
+                   for r in cur.fetchall()}
+            cur.close()
+            return out
+    except Exception as e:
+        logger.warning("[Store] skill 权重行读取失败: %s", e)
+        return {}
+
+
+# ── 酿造/修订并发锁（2026-09-24 提智 0.4；PG advisory lock 的免连接替代）──
+# eval worker 与手动入口（python -m ...skill_brewer）是两个进程，可能同时酿/修同一
+# SKILL.md 与状态行。租约行（layer='run_lock'）原子抢占，TTL 过期自愈（进程崩溃不留死锁）。
+def acquire_run_lock(lock_name: str, ttl_seconds: int = 1800) -> bool:
+    """抢占式租约锁：成功返回 True；他人持有且未过期返回 False。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO qd_agent_weights
+                    (layer, name, skill_name, weight, sample_count, last_updated)
+                VALUES ('run_lock', %s, NULL, 0, 0, NOW())
+                ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                DO UPDATE SET last_updated = NOW()
+                  WHERE qd_agent_weights.last_updated
+                        < NOW() - (%s || ' seconds')::interval
+                RETURNING name
+            """, (lock_name, str(int(ttl_seconds))))
+            got = cur.fetchone() is not None
+            conn.commit()
+            cur.close()
+            return got
+    except Exception as e:
+        logger.warning("[Store] 运行锁获取失败（保守放行）: %s", e)
+        return True   # 锁基础设施故障不阻断酿造（宁松勿卡，但留痕）
+
+
+def release_run_lock(lock_name: str) -> None:
+    """释放租约锁（删行；幂等）。"""
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM qd_agent_weights WHERE layer = 'run_lock' AND name = %s",
+                        (lock_name,))
+            conn.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning("[Store] 运行锁释放失败（TTL 会自愈）: %s", e)

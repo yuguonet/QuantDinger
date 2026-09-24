@@ -90,14 +90,25 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> dict:
         logger.error("get_strategy_detail failed: %s", e, exc_info=True)
         return {"success": False, "error": str(e)}
 
-def start_strategy(strategy_id: int, user_id: int = 1) -> dict:
-    """启动策略：将指定策略从停止状态切换为运行状态。
+def start_strategy(strategy_id: int, user_id: int = 1, confirm: bool = False) -> dict:
+    """启动策略：将指定策略从停止状态切换为运行状态。**真实资金动作**。
 
-    策略将按照配置的指标信号自动执行买卖操作。
+    策略将按照配置的指标信号自动执行买卖操作；订单由 PendingOrderWorker +
+    app.services.live_trading **实盘成交**（各所直连 REST，见 trading_executor.py 头注释）。
+
+    【human-in-the-loop 硬闸（2026-09-24 提智 0.1）】调用前**必须**把策略名与“将按信号
+    自动实盘买卖”告知用户、获得明确同意，再以 confirm=True 重调；未确认只返回
+    requires_confirmation（展示信息，不执行）。每次启动/停止均审计留痕。
+
+    Returns:
+        成功 → {"success": True, "strategy_id", "strategy_name", "message"}；
+        未确认 → {"success": False, "requires_confirmation": True, "strategy_id", "strategy_name"}；
+        失败 → {"success": False, "error": str}。
 
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
+        confirm: 是否已获用户明确同意（默认 False = 只展示、不执行）
     """
     if not _TRADING_DEPS_OK:
         return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}
@@ -112,6 +123,21 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> dict:
         strategy_type = svc.get_strategy_type(strategy_id)
         if strategy_type == "PromptBasedStrategy":
             return {"success": False, "error": "AI 策略暂不支持直接启动，请使用指标策略"}
+
+        # 人工确认硬闸（2026-09-24）：真实资金动作，模型不得自行拍板；审计留痕
+        if not confirm:
+            logger.warning("[Trading][AUDIT] start_strategy 未确认拒绝 user_id=%s strategy_id=%s name=%s",
+                           user_id, strategy_id, st.get("name", ""))
+            return {
+                "success": False,
+                "requires_confirmation": True,
+                "strategy_id": strategy_id,
+                "strategy_name": st.get("name", ""),
+                "message": ("启动后将按指标信号自动执行买卖并**实盘成交**（真实资金动作）。"
+                            "请先向用户说明风险并获得明确同意，再以 confirm=true 重新调用。"),
+            }
+        logger.warning("[Trading][AUDIT] start_strategy 确认执行 user_id=%s strategy_id=%s name=%s",
+                       user_id, strategy_id, st.get("name", ""))
 
         # 更新状态
         svc.update_strategy_status(strategy_id, "running", user_id=user_id)
@@ -137,6 +163,10 @@ def start_strategy(strategy_id: int, user_id: int = 1) -> dict:
 def stop_strategy(strategy_id: int, user_id: int = 1) -> dict:
     """停止策略：将指定策略从运行状态切换为停止状态。
 
+    Returns:
+        成功 → {"success": True, "strategy_id", "strategy_name", "message"}；
+        失败 → {"success": False, "error": str}。
+
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
@@ -153,6 +183,11 @@ def stop_strategy(strategy_id: int, user_id: int = 1) -> dict:
         strategy_type = svc.get_strategy_type(strategy_id)
         if strategy_type == "PromptBasedStrategy":
             return {"success": False, "error": "AI 策略暂不支持"}
+
+        # 审计留痕（2026-09-24 提智 0.1）。刻意**不加**确认闸：停止是风控/kill 动作，
+        # 加闸会拖慢离场（安全优先于对称性；对照方案 0.1 字面的安全修正）。
+        logger.warning("[Trading][AUDIT] stop_strategy 执行 user_id=%s strategy_id=%s name=%s",
+                       user_id, strategy_id, st.get("name", ""))
 
         # 停止执行器
         try:

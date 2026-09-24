@@ -191,6 +191,10 @@ def get_stock_concept_blocks(codes: str) -> dict:
 def get_lockup_expiry(codes: str, forward_days: int = 90) -> dict:
     """限售解禁日历：返回指定股票未来解禁日期、解禁数量、占总股本比例。
 
+    Returns:
+        单代码 → {stock_code, history[], upcoming[], upcoming_count}（限售解禁日历）；
+        多代码 → {"count": N, "data": {代码: 上述dict}}；失败 → {"error", "retriable"}。
+
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"
         forward_days: 向前看的天数，默认90天
@@ -271,6 +275,10 @@ def get_industry_ranking(top_n: int = 20) -> dict:
 
 def get_dragon_tiger_detail(codes: str, look_back_days: int = 30) -> dict:
     """龙虎榜详情：返回个股上榜日期、买卖席位明细、机构/游资动向。
+
+    Returns:
+        单代码 → {stock_code, records[], seats{}, institution{}}（龙虎榜明细）；
+        多代码 → {"count": N, "data": {代码: 上述dict}}；失败 → {"error", "retriable"}。
 
     Args:
         codes: 逗号分隔的股票代码，如 "002475" 或 "002475,600519"

@@ -422,6 +422,12 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                   AND r.exec_date >= %s
             """, (since,))
 
+            # 护栏 2 真实现（2026-09-24 提智 0.3）：修订过的技能只统计**新版本**产出的 run
+            # （exec_date ≥ 修订时刻）——设计 §3.17“新版本重新积累”此前只写了权重行 reset，
+            # 本轮 update_weights 又用 90 日窗全量重算，重置恒被覆盖（护栏 2 名存实亡的一半）。
+            from chain.store import get_skill_revisions as _gsrs
+            _revisions = _gsrs()
+
             skill_trades: Dict[str, List[Dict]] = {}
             factor_stats: Dict[tuple, Dict[str, float]] = {}
 
@@ -429,6 +435,11 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 skill_name = row['skill_name']
                 correct = row['correct']
                 exec_date = row['exec_date']
+
+                # 旧版本产出的 run 不进新版本评价（skill 与 factor 同口径，防偏）
+                _rev = _revisions.get(skill_name)
+                if _rev and _rev.get("revised_at") and exec_date < _rev["revised_at"]:
+                    continue
 
                 # 聚合 skill 交易数据
                 if skill_name not in skill_trades:
@@ -583,8 +594,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
     if _updated > 0:
         try:
             from chain.skill_brewer import maybe_revise
-            from chain.store import get_skill_weights as _gsw
-            _rev_results = maybe_revise(_gsw())
+            from chain.store import get_skill_weight_rows as _gswr
+            _rev_results = maybe_revise(_gswr())
             if any(r.get("status") == "revised" for r in _rev_results):
                 stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
         except Exception as _re:

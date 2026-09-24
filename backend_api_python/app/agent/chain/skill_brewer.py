@@ -25,6 +25,7 @@ qd_agent_weights layer='skill' 打分），无需键匹配与短路逻辑。
 """
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import shutil
@@ -39,6 +40,75 @@ _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "skill_brew.
 _AUTO_PREFIX = "auto_"
 _HUMAN_EDITED_MARK = "human-edited"
 _BREW_TEMPLATE: Optional[str] = None
+
+
+# ── 酿造/修订并发锁 + 版本历史（2026-09-24 提智 0.4）────────────────────
+_BREW_LOCK_NAME = "skill_brew_revise"
+_BREW_LOCK_TTL = 1800          # 租约秒数：LLM 修订可耗数分钟；崩溃留锁由 TTL 过期自愈
+BREW_BAK_KEEP = 5              # .bak 归档保留份数（护栏 3 单版本 → 轮转历史）
+
+
+def _brew_locked(locked_result):
+    """酿造/修订并发锁装饰器：eval worker 与手动入口两进程互斥（同写 SKILL.md/状态行）。"""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            from chain.store import acquire_run_lock, release_run_lock
+            if not acquire_run_lock(_BREW_LOCK_NAME, _BREW_LOCK_TTL):
+                logger.warning("[Brewer] %s 正被其他进程持有（eval worker 与手动入口并发？）→ 本次跳过",
+                               _BREW_LOCK_NAME)
+                return locked_result
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                release_run_lock(_BREW_LOCK_NAME)
+        return wrapper
+    return deco
+
+
+def _snapshot_bak(skill_path: Path) -> None:
+    """护栏 3 升级（2026-09-24）：.bak 从单版本改轮转归档（保留 BREW_BAK_KEEP 份）。
+
+    同时维护 `SKILL.md.bak`（永远=最新一份，兼容旧回滚习惯）。
+    """
+    import time as _time
+    ts = _time.strftime("%Y%m%d-%H%M%S")
+    shutil.copyfile(skill_path, skill_path.with_suffix(".md.bak"))
+    # 同秒多次修订时循环找唯一名（实现鲁棒性：归档不得互相覆盖）
+    archive, _i = skill_path.parent / f"SKILL.md.bak.{ts}", 1
+    while archive.exists():
+        _i += 1
+        archive = skill_path.parent / f"SKILL.md.bak.{ts}.{_i}"
+    shutil.copyfile(skill_path, archive)
+    olds = sorted(skill_path.parent.glob("SKILL.md.bak.*"))
+    for old in olds[:-BREW_BAK_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _load_pre_weight(skill_path: Path):
+    """从 SKILL.md 头部读修订前权重（`pre_weight=X.XX`，0.4c 回归自愈判据）。"""
+    try:
+        text = skill_path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"pre_weight=([\d.]+)", text)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def _restore_latest_bak(skill_path: Path) -> bool:
+    """修订回归自愈（0.4c）：还原最新 .bak 归档。成功 True。"""
+    archives = sorted(skill_path.parent.glob("SKILL.md.bak.*"))
+    latest = archives[-1] if archives else skill_path.with_suffix(".md.bak")
+    try:
+        shutil.copyfile(latest, skill_path)
+        logger.error("[Brewer] 已从 %s 还原 %s", latest.name, skill_path.parent.name)
+        return True
+    except Exception as e:
+        logger.error("[Brewer] .bak 还原失败: %s", e)
+        return False
 
 
 def _load_brew_template() -> str:
@@ -114,6 +184,7 @@ BREW_FAIL_COOLDOWN = 3      # 连续失败达到该值 → 冷却跳过（通道
 BREW_FALLBACK_DAYS = 7      # 距上次尝试达到该天数 → 兜底重试（通道 2）
 
 
+@_brew_locked(locked_result=[])
 def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> list:
     """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto_*/SKILL.md。
 
@@ -293,6 +364,10 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
 _REVISE_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "skill_revise.txt"
 LOW_WEIGHT_THRESHOLD = 0.7       # 与 planner 低权重告警同阈值（原 B3 硬编码收敛）
 REVISE_MAX_STREAK = 2            # 连续修订 N 轮仍差 → 转淘汰（护栏 5）
+# 判定最小样本（2026-09-24，护栏 5 语义②“带最小样本”）：修订后的新版本至少要攒到
+# 15 个已回测样本才作“仍差/回升”判定——evaluator 的 sample_scale 在 n≤15 时把权重
+# 拉向 1.0，样本不足时“权重仍低于阈值”根本观测不到，判了就是误杀。
+REVISE_JUDGE_MIN_SAMPLES = 15
 
 
 def _load_revise_template() -> str:
@@ -311,7 +386,8 @@ def _bump_version(version: str) -> str:
         return "0.2.0"
 
 
-def revise_skill(chain_name: str, skill_dir: str, llm=None) -> dict:
+@_brew_locked(locked_result={"status": "locked"})
+def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = None) -> dict:
     """修订单个 auto_ 技能（§2.6 旁支主体）。
 
     护栏（§2.6 五条）：
@@ -322,7 +398,7 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None) -> dict:
     （correct=TRUE 教改进，FALSE 供坑）；修订是 LLM 对旧文档的增量更新，
     不是从零重编译。
     """
-    from chain.store import get_delta_digest, get_skill_revision, set_skill_revision, set_brew_state
+    from chain.store import get_delta_digest, get_skill_revision, set_skill_revision, reset_skill_weight
 
     skill_path = Path(skill_dir) / "SKILL.md"
     if not skill_path.exists():
@@ -334,11 +410,16 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None) -> dict:
     m = re.search(r"from root_id=(\d+)", old_doc)
     since_id = int(m.group(1)) if m else None
 
-    digest = get_delta_digest(chain_name, since_date=None)
+    # 护栏 1 真落地（2026-09-24，审计 A4）：原料 = 旧文档 + origin root_id **之后**的增量轨迹。
+    # 旧实现算了 since_id 却零引用、每轮把全量历史反复喂给修订器（重复强化/漂移）。
+    digest = get_delta_digest(chain_name, since_root_id=since_id)
     if not digest or (digest["n_correct"] + digest["n_falsified"]) == 0:
         return {"chain_name": chain_name, "status": "no_delta"}
 
-    rev = get_skill_revision(chain_name)
+    # 修订状态按 **skill_name** 键（2026-09-24 拆行）：与 layer='skill' 权重行同键，
+    # 评价层才能按修订时刻截新版本样本（护栏 2 的另一半在 evaluator.update_weights）。
+    skill_name = Path(skill_dir).name
+    rev = get_skill_revision(skill_name)
 
     if llm is None:
         try:
@@ -396,42 +477,73 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None) -> dict:
     new_doc = re.sub(r"^(version:\s*)[\d.]+$", lambda mm: "version: " + new_version,
                      new_doc, count=1, flags=re.M)
 
-    # 护栏 3：.bak 单版本回滚
-    shutil.copyfile(skill_path, skill_path.with_suffix(".md.bak"))
+    # 护栏 3：.bak 回滚点（2026-09-24 升级为轮转归档，保留 BREW_BAK_KEEP 份）
+    _snapshot_bak(skill_path)
 
     # 修订头注释：保留溯源，追加 revision 序号
     m_rev = re.search(r"from root_id=(\d+)", old_doc)
     origin = m_rev.group(1) if m_rev else "?"
     header = (f"<!-- auto-brewed&revised {date.today().isoformat()} origin_root_id={origin} "
               f"chain={chain_name} | revision={rev['revision'] + 1} | "
+              f"pre_weight={pre_weight if pre_weight is not None else 'NA'} | "
               f"{_HUMAN_EDITED_MARK} 后请去除 auto_ 前缀接管 -->\n")
     skill_path.write_text(header + new_doc + "\n", encoding="utf-8")
 
-    # 护栏 2：权重重置（新版本重新积累评价）
-    set_brew_state(chain_name, last_brew_date=date.today(), fail_streak=0)
-    set_skill_revision(chain_name, revision=rev["revision"] + 1, low_streak=0)
+    # 护栏 2 真落地（2026-09-24，设计 §3.17）：修订完成 → 权重重置 1.0、sample_count 归零
+    # （新版本重新积累）。旧实现这里写的是 set_brew_state(fail_streak=0)——**写错了行**，
+    # skill 权重从未被重置（“声明了但没接线”）；顺带不再动酿造 fail_streak（与护栏 2 无关）。
+    # low_streak **不**清零：护栏 5 语义是“权重回升（带最小样本）才清零”
+    # （maybe_revise 判定）——旧实现恒清零导致“修了还是烂”永不淘汰。
+    reset_skill_weight(skill_name)
+    set_skill_revision(skill_name, revision=rev["revision"] + 1,
+                       low_streak=rev["low_streak"])
 
-    logger.info("[Brewer] 技能已修订: %s → v%s (revision=%d)",
-                skill_dir, new_version, rev["revision"] + 1)
+    logger.info("[Brewer] 技能已修订: %s → v%s (revision=%d, low_streak=%d)",
+                skill_dir, new_version, rev["revision"] + 1, rev["low_streak"])
     return {"chain_name": chain_name, "status": "revised",
-            "skill_dir": skill_dir, "version": new_version}
+            "skill_dir": skill_dir, "version": new_version,
+            "revision": rev["revision"] + 1}
 
 
-def maybe_revise(skill_weights: dict, skill_adapter=None, llm=None) -> list:
+def maybe_revise(skill_rows: dict, skill_adapter=None, llm=None) -> list:
     """update_weights 收口调度入口（evaluator 只调本函数，一行）。
 
-    筛选：layer='skill' 权重中 auto_ 前缀且 weight < LOW_WEIGHT_THRESHOLD；
-    护栏 4：human-edited（无 auto_ 前缀）不修；护栏 5：low_streak ≥ REVISE_MAX_STREAK 跳过。
+    入参：skill 层权重行 {name: {weight, sample_count}}（chain/store.get_skill_weight_rows）。
+
+    2026-09-24（提智 0.3，护栏 5 语义修正）：low_streak 计的是“**修订过之后权重仍低于阈值**”
+    的轮数（带最小样本 REVISE_JUDGE_MIN_SAMPLES），不再是“修订尝试失败次数”——旧偏差
+    使“修了还是烂”的无限修订永不触发淘汰，而 LLM 抖动却会伪造转淘汰。配套语义：
+      · 判定 +1 只在**再次求修**时计，且 `low_streak ≤ revision` 不变量保证一版只判一次
+        （修订尝试失败不推进 revision → 不重复计，防基础设施抖动误淘汰）；
+      · 权重回升 ≥ 阈值（带最小样本）→ 清零（自救成功，切断“连续”链）；
+      · 修订尝试失败（llm_error/bad_format/no_delta）不作数——那是基础设施抖动，不是“修完仍差”。
+    护栏 4：human-edited（无 auto_ 前缀）不修；护栏 5：low_streak ≥ REVISE_MAX_STREAK → 转淘汰。
     """
-    from chain.store import set_skill_revision as _ssr
+    from chain.store import get_skill_revisions, set_skill_low_streak as _ssl
     results = []
-    low = sorted((n, w) for n, w in skill_weights.items()
-                 if n.startswith(_AUTO_PREFIX) and w < LOW_WEIGHT_THRESHOLD)
-    if not low:
+    autos = sorted((n, r) for n, r in skill_rows.items()
+                   if n.startswith(_AUTO_PREFIX) and isinstance(r, dict)
+                   and r.get("weight") is not None)
+    if not autos:
         return results
-    for name, w in low:
-        chain_name = name[len(_AUTO_PREFIX):].replace("-", "+")
-        # 反推 chain 原名不可靠（连字符双向），改由 header 注释读真实 chain
+    revisions = get_skill_revisions()
+    for name, row in autos:
+        w = row["weight"]
+        n = int(row.get("sample_count") or 0)
+        rev = revisions.get(name) or {"revision": 0, "low_streak": 0, "revised_at": None}
+
+        # 权重回升清零（护栏 5 语义②：“权重回升至阈值上（带最小样本）才清零”）——
+        # 必须扫全部 auto_ 技能（不止低权重），否则自救成功后 low_streak 永久滞留，
+        # 数月后一次正常回撤就凑满“连续 2 轮”误淘汰。
+        if (rev["low_streak"] > 0 and rev["revision"] > 0
+                and n >= REVISE_JUDGE_MIN_SAMPLES and w >= LOW_WEIGHT_THRESHOLD):
+            _ssl(name, 0)
+            logger.info("[Brewer] %s 修订后权重回升（%.2f≥%.2f, n=%d）→ low_streak 清零（自救成功）",
+                        name, w, LOW_WEIGHT_THRESHOLD, n)
+            continue
+        if w >= LOW_WEIGHT_THRESHOLD:
+            continue
+
         skill_dir = _SKILLS_DIR / name
         if not skill_dir.exists():
             continue
@@ -440,20 +552,38 @@ def maybe_revise(skill_weights: dict, skill_adapter=None, llm=None) -> list:
         real_chain = m.group(1) if m else None
         if not real_chain:
             continue
-        from chain.store import get_skill_revision
-        rev = get_skill_revision(real_chain)
-        if rev["low_streak"] >= REVISE_MAX_STREAK:
-            logger.info("[Brewer] %s 已连续 %d 轮修订仍低权重 → 转淘汰/人工接管",
-                        name, rev["low_streak"])
-            results.append({"chain_name": real_chain, "status": "give_up",
-                            "skill_dir": name, "weight": w})
-            continue
-        r = revise_skill(real_chain, str(skill_dir), llm=llm)
+
+        if rev["revision"] > 0 and rev["low_streak"] < rev["revision"]:
+            # 已修订过又回到低权重 = “上一版修完仍差”的判定点（一版一次）；
+            # 带最小样本才作数（防样本不足期误杀）。
+            if n < REVISE_JUDGE_MIN_SAMPLES:
+                logger.info("[Brewer] %s 修订后样本不足（n=%d < %d）→ 暂缓判定与再修",
+                            name, n, REVISE_JUDGE_MIN_SAMPLES)
+                continue
+            # 修订回归自愈（2026-09-24 提智 0.4c）：修后反而更差（w < 修订前 pre_weight）
+            # → 自动还原最新 .bak + 告警（护栏 3 自动化；"M 天"窗口由最小样本门等价覆盖）。
+            _pw = _load_pre_weight(skill_dir / "SKILL.md")
+            if _pw is not None and w < _pw:
+                if _restore_latest_bak(skill_dir / "SKILL.md"):
+                    logger.error("[Brewer] %s 修订回归（%.2f < 修订前 %.2f）→ 已自动还原 .bak，请人工介入",
+                                 name, w, _pw)
+                    results.append({"chain_name": real_chain, "status": "restored",
+                                    "skill_dir": name, "weight": w, "pre_weight": _pw})
+                    continue
+            low_streak = rev["low_streak"] + 1
+            if low_streak >= REVISE_MAX_STREAK:
+                logger.info("[Brewer] %s 连续 %d 轮修订后权重仍低于 %.2f → 转淘汰/人工接管",
+                            name, low_streak, LOW_WEIGHT_THRESHOLD)
+                results.append({"chain_name": real_chain, "status": "give_up",
+                                "skill_dir": name, "weight": w})
+                continue
+            _ssl(name, low_streak)   # 判定事件：只写 low_streak，不动 revised_at
+            rev = {**rev, "low_streak": low_streak}
+        # 注：旧版此处 `chain_name = name[...].replace("-", "+")` 是算了不用的死变量（反推
+        # chain 反正不可靠，已改由 header 注释读真实 chain），一并删除。
+        r = revise_skill(real_chain, str(skill_dir), llm=llm, pre_weight=w)
         results.append(r)
-        if r["status"] == "revised":
-            _ssr(real_chain, revision=r.get("revision", 0), low_streak=0)
-        elif r["status"] in ("llm_error", "bad_format", "no_delta"):
-            _ssr(real_chain, revision=rev["revision"], low_streak=rev["low_streak"] + 1)
+        # 修订尝试失败（llm_error/bad_format/no_delta）不计入 low_streak（见函数头语义）。
     return results
 
 
@@ -475,6 +605,7 @@ if __name__ == "__main__":
     # 手动酿造入口（同步上下文）：
     #   <python> app/agent/chain/skill_brewer.py [min_runs]
     import sys
+    import os  # 2026-09-24（提智阶段 0.10，审计 A5）：下文 os.path.join 需要；缺失时手动入口启动即 NameError
     _bp = Path(__file__).resolve().parents[3]
     sys.path.insert(0, _bp)
     sys.path.insert(0, os.path.join(_bp, "app", "agent"))

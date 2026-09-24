@@ -68,6 +68,22 @@ logger = logging.getLogger(__name__)
 _NAME_ERR_RE = re.compile(r"name '([\w.]+)' is not defined")
 
 
+# ── 危险面审计与 deny-list（2026-09-24 提智 0.5，执行隔离第一步）──────────
+# 真 exec = 零安全边界（§7.20），且 .env/凭据与执行器同树。本层：
+#   ① 文件：凭据类路径 **deny**（硬拦 + 留痕）；
+#   ② 网络/进程：敏感模块 import **审计留痕不拦**（socket/subprocess/…）——
+#      拦了会误伤合法取数，留痕保证可追责（升级到真隔离见方案 F5）。
+# 登记表（禁散写）：路径/模块名单各自集中一处。
+_SENSITIVE_PATH_RE = re.compile(
+    r"(\.env\b|[/\\]\.ssh[/\\]|authorized_keys|id_rsa|id_ed25519|\.git-credentials|"
+    r"\.aws[/\\]credentials|\.kube[/\\]config|\.docker[/\\]config\.json|"
+    r"[/\\]\.?(?:pgpass|netrc)\b)", re.I)
+_AUDITED_IMPORTS = frozenset({
+    "subprocess", "socket", "ssl", "ctypes", "multiprocessing", "pty",
+    "telnetlib", "ftplib", "paramiko", "requests", "httpx", "urllib", "shutil", "psutil",
+})
+
+
 def _help_no_stdin(obj=None) -> str:
     """`help` 覆盖版：只渲染文档文本，不进交互模式（裸 `help()` 会读 stdin 阻塞进程）。"""
     try:
@@ -126,7 +142,25 @@ class GuidedCPythonExecutor(PythonExecutor):
         self.session_vars_scope: str | None = None
         # 判官摘要用的诚实计数（原解释器的 _operations_count 已随解释器一起消失）。
         self._code_blocks = 0
-        self._builtins_ns = {**vars(builtins), "help": _help_no_stdin}
+        self._danger_log: list = []  # 危险调用审计留痕（0.5；进 _qd_stats.danger_calls 可对账）
+        self._hallucination_hits: int = 0  # 0.9 面板：未定义名（疑幻觉工具/变量）命中计数
+        # B2 失败记忆（2026-09-24）：逐 step 登记 (error_type, detail)，由执行层 drain。
+        self._failure_events: list = []
+        # B3 数据自检（2026-09-24）：validate_df/SelfCheckError 作为内置可用，
+        # 让模型在代码块里对取到的数据做硬校验（异常式）。
+        try:
+            from utils.data_check import validate_df as _validate_df, SelfCheckError as _SCE
+            _dc = {"validate_df": _validate_df, "SelfCheckError": _SCE}
+        except Exception:
+            _dc = {}
+        self._builtins_ns = {
+            **vars(builtins),
+            "help": _help_no_stdin,
+            **_dc,
+            # 0.5：open 与 __import__ 换守卫版（deny-list + 审计），其余真 CPython 行为不变
+            "open": self._guarded_open(),
+            "__import__": self._guarded_import(vars(builtins)["__import__"]),
+        }
 
     # ── 官方三件套 ────────────────────────────────────────────────────────
 
@@ -158,7 +192,15 @@ class GuidedCPythonExecutor(PythonExecutor):
         container = PrintContainer()
         self.state["_print_outputs"] = container
         self._code_blocks += 1
-        self.state["_qd_stats"] = {"code_blocks": self._code_blocks}
+        # B3 数据自检统计：执行**前**先清空上一轮残留（真正的 drain 在 finally 内）
+        try:
+            from utils.data_check import drain_checks as _drain_dc
+            _drain_dc()
+        except Exception:
+            pass
+        self.state["_qd_stats"] = {"code_blocks": self._code_blocks,
+                                   "danger_calls": list(self._danger_log[-20:]),
+                                   "data_checks": []}
         self.state["__builtins__"] = {**self._builtins_ns, "print": _make_print(container)}
 
         t0 = time.time()
@@ -172,6 +214,15 @@ class GuidedCPythonExecutor(PythonExecutor):
             container.value = truncate_content(
                 str(container), max_length=self.max_print_outputs_length
             )
+            # B3 数据自检统计（执行后 drain，含出错路径）
+            try:
+                from utils.data_check import drain_checks as _drain_dc2
+                _dc2 = _drain_dc2()
+                _st = self.state.get("_qd_stats")
+                if isinstance(_st, dict):
+                    _st["data_checks"] = _dc2
+            except Exception:
+                pass
         logger.debug("[CPythonExecutor] 代码块 #%d 执行 %dms（final=%s）",
                      self._code_blocks, int((time.time() - t0) * 1000), is_final_answer)
         try:
@@ -197,10 +248,17 @@ class GuidedCPythonExecutor(PythonExecutor):
 
         def _execute():
             result = None
-            node = body[-1]
+            # 2026-09-21 修复：报错行必须指向**真正抛错的语句**，而非恒取 body[-1]。
+            # 旧实现固定用末条语句截源码片段，导致「前面语句抛错、报错行却指向末行」
+            # （实测 round(dict) 被报成 globals().update(...)）。此处用游标 cur 记录
+            # 当前正在执行的语句，异常时按 cur 归因。
+            cur = body[-1]
             try:
                 for prev in body[:-1]:
+                    cur = prev
                     exec(compile(ast.Module(body=[prev], type_ignores=[]), "<agent>", "exec"), ns)
+                node = body[-1]
+                cur = node
                 if isinstance(node, ast.Expr):
                     result = eval(compile(ast.Expression(body=node.value), "<agent>", "eval"), ns)
                 else:
@@ -214,7 +272,7 @@ class GuidedCPythonExecutor(PythonExecutor):
                 # SystemExit/GeneratorExit 等 BaseException 若外泄会穿透 CodeAgent 的
                 # `except Exception`（agents.py:1733）直到打死 worker，故在此统一转成
                 # InterpreterError——错误可见、进程存活。
-                seg = ast.get_source_segment(code_action, node) or ""
+                seg = ast.get_source_segment(code_action, cur) or ""
                 raise InterpreterError(
                     f"Code execution failed at line '{seg}' due to: {type(e).__name__}: {e}"
                 ) from None
@@ -273,6 +331,57 @@ class GuidedCPythonExecutor(PythonExecutor):
         names -= set(self.additional_functions.keys())
         return sorted(names)
 
+    # ── 危险面守卫（2026-09-24 提智 0.5）───────────────────────────────
+    def _audit_danger(self, kind: str, detail: str) -> None:
+        """危险调用留痕：logger.warning + _qd_stats.danger_calls（原则 7：可自证）。"""
+        self._danger_log.append(f"{kind}:{detail}")
+        logger.warning("[CPythonExecutor][AUDIT] 危险调用 %s: %s", kind, detail[:200])
+        # B2 失败记忆：把沙箱受限调用登记为 sandbox_unavailable
+        try:
+            from utils.failure_memory import classify_error, _SANDBOX_HINT_RE as _SH
+            _et = classify_error(f"{kind}: {detail}")
+            if _et is None and _SH.search(str(detail)):
+                _et = "sandbox_unavailable"
+            self._failure_events.append((_et or "sandbox_unavailable", f"{kind}:{str(detail)[:60]}"))
+        except Exception:
+            pass
+
+    def _guarded_open(self):
+        """open 守卫：凭据类路径 deny（PermissionError）；其余原样透传。"""
+        _real_open = open
+
+        def _open(file, *args, **kwargs):
+            path = str(file)
+            if _SENSITIVE_PATH_RE.search(path):
+                self._audit_danger("open_denied", path)
+                raise PermissionError(
+                    f"读写凭据类路径被禁止: {path}（执行环境 deny-list，2026-09-24）")
+            return _real_open(file, *args, **kwargs)
+
+        return _open
+
+    def _guarded_import(self, real_import):
+        """__import__ 守卫：敏感模块 import 审计留痕（不拦）；其余原样透传。"""
+        # 沙箱内友好别名：`from data_check import validate_df` / `import data_check`
+        # （B3，2026-09-24）。这些是本项目自有模块，不是第三方依赖。
+        _ALIAS = {
+            "data_check": "utils.data_check",
+            "failure_memory": "utils.failure_memory",
+        }
+
+        def _imp(name, *args, **kwargs):
+            root = str(name).split(".")[0]
+            if root in _ALIAS:
+                try:
+                    return real_import(_ALIAS[root], *args, **kwargs)
+                except Exception:
+                    pass
+            if root in _AUDITED_IMPORTS:
+                self._audit_danger("import", str(name))
+            return real_import(name, *args, **kwargs)
+
+        return _imp
+
     def _rewrite(self, err_text: str) -> str:
         """把 CPython 原生错误改写成"能直接照做"的纠正话术。
 
@@ -284,6 +393,8 @@ class GuidedCPythonExecutor(PythonExecutor):
         m = _NAME_ERR_RE.search(err_text)
         if m:
             name = m.group(1)
+            self._hallucination_hits += 1  # 0.9 面板计数
+            self._failure_events.append(("hallucinated_tool", f"name={name}"))  # B2 失败记忆
             tools = self._tool_names()
             logger.warning(
                 "[幻觉调用拦截] name=%s | state=%d custom_tools=%d authoritative=%d",
@@ -333,6 +444,11 @@ class GuidedCPythonExecutor(PythonExecutor):
                 f"  2) 清单内无对应能力时，直接用纯 Python 计算实现，并在最终答复中说明该能力暂缺。"
             )
         if "has no attribute" in err_text:
+            try:
+                from utils.failure_memory import classify_error
+                self._failure_events.append((classify_error(err_text) or "wrong_column", err_text[:60]))
+            except Exception:
+                self._failure_events.append(("wrong_column", err_text[:60]))
             return (err_text
                     + "\n[纠正提示] 该对象没有这个方法/属性。请先确认变量类型"
                       "（print(type(x))）与正确用法；如需调用工具，只能使用可用工具清单中的名称。")

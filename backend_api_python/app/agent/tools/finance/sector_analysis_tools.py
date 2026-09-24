@@ -168,6 +168,9 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
 def get_sector_trend_analysis(board_type: str = "industry") -> dict:
     """板块趋势：返回近1月涨跌趋势、6个月周期位置、今日预测信号。
 
+    Returns:
+        {"code": 1成功/0失败, "msg": str, "data": {趋势指标 dict}}；失败 → {"error": str}。
+
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
     """
@@ -179,6 +182,9 @@ def get_sector_trend_analysis(board_type: str = "industry") -> dict:
         return {"error": str(e)}
 def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dict:
     """板块历史排名：返回板块近N天的每日涨跌幅排名变化。
+
+    Returns:
+        {"code": 1成功/0失败, "msg": str, "count": N, "data": [每日排名行, ...]}；失败 → {"error": str}。
 
     Args:
         board_type: 板块类型，"industry"(行业) 或 "concept"(概念)
@@ -192,6 +198,10 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dic
         return {"error": str(e)}
 def get_stock_sector_info(codes: str) -> dict:
     """从本地数据库查询股票所属行业和概念。
+
+    Returns:
+        单代码 → {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?}；
+        多代码 → {"count": N, "data": {代码: 上述dict}}；失败 → {"error", "retriable"}。
 
     Args:
         codes: 多股用逗号分隔
@@ -289,6 +299,10 @@ def _resolve_board_code(name_or_code: str) -> str:
     return name_or_code
 def get_sector_stocks(board_code: str = "", board_name: str = "", limit: int = 10) -> dict:
     """获取板块内强势个股列表。
+
+    Returns:
+        list: 板块内个股列表，元素 {code, name, price, change_pct, amount, turnover, is_limit_up}；
+        无数据/解析失败 → []（**裸列表**，非 dict）。
 
     Args:
         board_code: 板块代码（如 BK0475），与 board_name 二选一

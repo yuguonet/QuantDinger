@@ -71,7 +71,7 @@ import threading
 import numpy as np
 
 from app.market_cn.auto.core.indicators import calc_macd
-from app.market_cn.auto.core.market import get_board_type
+from app.market_cn.auto.core.market import default_market, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
@@ -736,8 +736,223 @@ def board_is_gem(ctx: Ctx) -> int:
     """是否 20cm（创业板/科创板）。"""
     return 1 if ctx.board_type != "main" else 0
 
+# ================================================================
+# 「明日操作分」(v2, 2026-09-24 重标定) —— 展示用独立分, 不参与任何门/评分/截断
+# ----------------------------------------------------------------
+# 语义: 用 **T 日收盘后可知**的信息, 估算 **T+1 开盘买 → T+1 收盘卖** 的相对强弱。
+#       50 = 明日全市场平均。偏离 50 的幅度 ∝ 预期超额收益 (加权 1pp ↔ 100 分)。
+#
+# ★★ v1 为什么是错的 (必须记录, 否则会再犯) ★★
+#   v1 按 r1 = T收盘→T+1收盘 标定, 而该口径的 alpha **100% 在隔夜跳空**:
+#     偏多档 +2.155pp = 跳空 +2.409 + 盘中 -0.254。
+#   g56 信号 17:25 才产出、最早 T+1 开盘成交 ⇒ **跳空拿不到**。
+#   ⇒ v1 把「今天涨停」打成**高分(偏多)**, 与可操作口径**完全相反** —— 可操作口径下,
+#     今天涨停 ⇒ 明天开盘买是**负向**的 (首板 -0.196%/胜44.8%, 一字板 -0.641%/胜37.1%)。
+#
+# 标定 (可复跑 tmp/_nd2_final.py, 产物 tmp/nd2_final.json):
+#   样本: 全市场 2025-09-01~2026-09-22, 1,332,513 个 (票×交易日), 258 日, 5229 票
+#   目标: r1_oc = T+1收盘 / T+1开盘 - 1 ; 全市场均值 +0.095%, 上涨占比 48.4%
+#   Δ   = 各档**绝对超额** (档内 r1_oc − 同日全市场均值), 单位 pp, 相对各因子 0 点
+#   验收 (5 档按分值硬切; 全/seg1/seg2 **三段完全单调**):
+#     <=45    偏空    n=  5422  r1_oc -0.455%  胜41.7%  (seg1 -0.427 / seg2 -0.490)
+#     45~49   中性偏空 n=  6541  -0.270%       44.3%   (seg1 -0.256 / seg2 -0.281)
+#     49~50.5 中性    n=1033716 +0.072%       48.6%
+#     50.5~55 中性偏多 n=262421 +0.171%       48.0%
+#     >55     偏多    n= 24413  +0.479%       48.0%  (seg1 +0.501 / seg2 +0.454)
+#   逐日方向成立率 (防「少数极端日撑起来」): 偏空 64.2%(t=-5.69) / 中性偏空 60.9%(t=-3.59)
+#     / 中性偏多 53.9%(t=+2.95) / 偏多 65.9%(t=+5.87) —— 四档均成立。
+#   典型日排序力弱 (同日截面 IC≈-0.011) ⇒ **定位 = 事件条件期望, 不是全市场排序器**:
+#     93% 的票落在中性 (那里没有可靠的边际信息, 不制造假分辨率), 分数只在有事件时离开 50。
+# 因子 (三重筛选: 两段同向不缩水 + 逐日方向成立率 + 池化 t; 权重等权):
+#   zt   涨停状态   首板 -0.276 / 连板 -0.446 / 触板未封 +0.387
+#   seal 封板强度   一字板 -0.403 / 强封 -0.135 / 烂板 +0.121 (相对涨停加权平均)
+#   lhbz 上榜未涨停 +0.543  ← 最强 (t=+6.05, 63.2% 日成立)
+#   vr   量比       单调 -0.041 … +0.183
+#   ev20 前20日上榜次数 (含 T) 单调 0 / +0.017 / +0.167 / +0.445
+#   剔除: crash (两段反向, 逐日 48.1% t=+1.08 不成立) / zt20 (t<=1.8) / turn (98.8% 缺失)
+#         / close_pos, ma20_dist (两段反向) / 上榜且涨停 (两段反向)
+#   ⚠ 「上榜但没涨停」在 g56 出场收益口径是**最差象限**(57.5%), 在 T+1 口径是最强**正向**
+#     (+0.539pp) ⇒ 又一次印证: **跨目标口径不可迁移, 换目标必须重新标定**。
+# 纪律: 只读 —— 不改门/出场/截断; 涨跌停阈值只从 MarketSpec 取; 龙虎榜只经 dragon_tiger_store;
+#       **fail-open** —— 数据不足/除权日 ⇒ 返回 None (宁可不展示, 也不给错的数)。
+# ================================================================
+
+#: 各因子各档 Δ (pp, 相对该因子 0 点)。唯一事实源, 标定脚本原样搬运。
+ND_D = {
+    "zt": {"streak2": -0.4455, "first": -0.2759, "touch": 0.3871, "none": 0.0},
+    "seal": {"lt05": -0.4029, "0509": -0.1351, "ge09": 0.1209, "na": 0.0},
+    "lhbz": {"yes": 0.5427, "no": 0.0},
+    "vr": {"0508": -0.0321, "0810": -0.0171, "1013": 0.0191, "1316": 0.0451,
+           "1620": 0.0598, "2030": 0.1152, "ge30": 0.1826, "lt05": -0.0412},
+    "ev20": {"0": 0.0, "1-2": 0.017, "3-5": 0.1673, "6+": 0.4445},
+}
+#: 等权 (v1 已证: z 归一下「按跨度加权」不如随机; Δ 口径下等权 = 每因子同权)
+ND_W = {"zt": 0.2, "seal": 0.2, "lhbz": 0.2, "vr": 0.2, "ev20": 0.2}
+#: 分值 = 50 + ND_SCALE * Σ(W·Δ), 即加权 1pp ↔ 100 分
+ND_SCALE = 100.0
+#: 展示分档 (下界降序匹配) → 标签
+ND_BANDS = ((55.0, "偏多"), (50.5, "中性偏多"), (49.0, "中性"),
+            (45.0, "中性偏空"), (0.0, "偏空"))
+#: 除权/异常保护: |单日涨跌幅| 超过此值 ⇒ 比值失真, 不产出
+ND_EXDAY_CHG = 0.35
+#: 量比 = 当日量 / 前 ND_VOL_WIN 个交易日均量
+ND_VOL_WIN = 20
+#: ev20 回看窗口 (交易日, 含 T)
+ND_EV20_WIN = 20
+#: 连板回溯上限
+ND_STREAK_MAX = 10
+_ND_LHB_CACHE: dict = {}
+_ND_LHB_CACHE_MAX = 4096
+
+
+def _nd_bucket_zt(zt, touch, streak):
+    if zt:
+        return "streak2" if (streak or 0) >= 2 else "first"
+    return "touch" if touch else "none"
+
+
+def _nd_bucket_seal(zt, amp):
+    """封板强度: 仅涨停票有意义。非涨停 ⇒ `na` 中性档 (Δ=0, 不惩罚)。"""
+    if not zt:
+        return "na"
+    if amp is None or amp != amp:            # None / NaN
+        return "ge09"
+    if amp < 0.05:
+        return "lt05"
+    if amp < 0.09:
+        return "0509"
+    return "ge09"
+
+
+def _nd_bucket_ev20(ev20):
+    if ev20 is None or ev20 != ev20:
+        return "0"
+    ev20 = int(ev20)
+    if ev20 <= 0:
+        return "0"
+    if ev20 <= 2:
+        return "1-2"
+    return "3-5" if ev20 <= 5 else "6+"
+
+
+def _nd_bucket_vr(vr):
+    if vr is None or vr != vr:
+        return "1013"
+    for lab, lo, hi in (("lt05", 0.0, 0.5), ("0508", 0.5, 0.8), ("0810", 0.8, 1.0),
+                        ("1013", 1.0, 1.3), ("1316", 1.3, 1.6), ("1620", 1.6, 2.0),
+                        ("2030", 2.0, 3.0)):
+        if lo <= vr < hi:
+            return lab
+    return "ge30"
+
+
+def _nd_score_of(zt=False, touch=False, streak=0, amp=None, lhb=False, vr=None, ev20=None):
+    """明日操作分 0~100 (50 = 明日全市场平均)。缺特征 ⇒ 该子项取中性档。
+
+    ⚠ 与策略质量分 `_score_of` 是两个东西: 后者是 scan.py:254 的每日限额截断键,
+    本分**只作展示**, 不参与任何门/排序/截断 —— 禁止混用。
+    """
+    b = {"zt": _nd_bucket_zt(zt, touch, streak),
+         "seal": _nd_bucket_seal(zt, amp),
+         "lhbz": "yes" if (lhb and not zt) else "no",
+         "vr": _nd_bucket_vr(vr),
+         "ev20": _nd_bucket_ev20(ev20)}
+    mu = sum(ND_W[k] * ND_D[k][b[k]] for k in ND_W)
+    return round(max(0.0, min(100.0, 50.0 + ND_SCALE * mu)), 1)
+
+
+def _nd_tag_of(score):
+    for lo, tag in ND_BANDS:
+        if score >= lo:
+            return tag
+    return "偏空"
+
+
+def _nd_parts(bars, i, board, market):
+    """(zt, touch, streak, amp, vr, chg) —— 只用 bars[:i+1] (as-of 安全)。
+
+    None ⇒ 数据不足 / 除权日 (不产出)。涨停阈值**只从 MarketSpec 取**。
+    """
+    if i < ND_VOL_WIN + 1:
+        return None
+    prev = float(bars[i - 1]["close"])
+    if prev <= 0:
+        return None
+    chg = float(bars[i]["close"]) / prev - 1.0
+    if abs(chg) > ND_EXDAY_CHG:              # 除权/异常: 比值失真, 判定不可信
+        return None
+    spec = market if market is not None else default_market()
+    band = spec._band(board)
+    if band is None:
+        return None
+    lim = band[0]
+    zt = is_limit_up(float(bars[i]["close"]), prev, board, spec)
+    touch = (not zt) and (float(bars[i]["high"]) / prev - 1.0 >= lim)
+    streak, j = 0, i
+    while j >= 1 and streak < ND_STREAK_MAX:
+        pc = float(bars[j - 1]["close"])
+        if pc <= 0:
+            break
+        if float(bars[j]["close"]) / pc - 1.0 >= lim:
+            streak += 1
+            j -= 1
+        else:
+            break
+    amp = (float(bars[i]["high"]) - float(bars[i]["low"])) / prev
+    vs = [float(bars[t].get("volume") or 0) for t in range(i - ND_VOL_WIN, i)]
+    vr = None
+    if vs and sum(vs) > 0:
+        vr = float(bars[i].get("volume") or 0) / (sum(vs) / len(vs))
+    return zt, touch, streak, amp, vr, chg
+
+
+def _nd_lhb2(code, dates):
+    """(T 日是否上榜, 前 ND_EV20_WIN 个交易日上榜次数——含 T)。
+
+    该票榜史只查一次 (倒序全量) 后按票缓存, 再与 dates 求交 ⇒ 每票至多一次查询。
+    查询异常 ⇒ (False, 0): 全落中性档, **fail-open 不阻信号**。
+    """
+    c = str(code)[:6].zfill(6)
+    hist = _ND_LHB_CACHE.get(c)
+    if hist is None:
+        try:
+            from app.market_cn.dragon_tiger_store import query_dragon_tiger
+
+            rows = query_dragon_tiger(stock_code=c) or []
+            hist = {str(r.get("trade_date"))[:10] for r in rows if r.get("trade_date")}
+        except Exception as e:
+            logger.debug("[g56.nd] 龙虎榜查询失败 %s: %s", c, e)
+            hist = set()
+        if len(_ND_LHB_CACHE) >= _ND_LHB_CACHE_MAX:
+            _ND_LHB_CACHE.clear()
+        _ND_LHB_CACHE[c] = hist
+    ds = [str(d)[:10] for d in dates]
+    return (bool(ds) and ds[-1] in hist), sum(1 for d in ds if d in hist)
+
+
+def g56_nd_score(ctx: Ctx):
+    """门表私有函数: 明日操作分 0~100 (signal.fields 用; 缺数据 ⇒ None)。"""
+    p = _nd_parts(ctx.bars, ctx.i, ctx.board_type, ctx.market)
+    if p is None:
+        return None
+    zt, touch, streak, amp, vr, _chg = p
+    i = ctx.i
+    if i < ND_EV20_WIN - 1:
+        return None
+    dates = [str(ctx.bars[j]["time"])[:10] for j in range(i - ND_EV20_WIN + 1, i + 1)]
+    lhb_today, ev20 = _nd_lhb2(ctx.code, dates)
+    return _nd_score_of(zt=zt, touch=touch, streak=streak, amp=amp,
+                        lhb=lhb_today, vr=vr, ev20=ev20)
+
+
+def g56_nd_tag(ctx: Ctx):
+    """门表私有函数: 操作分档标签 (偏多/中性偏多/中性/中性偏空/偏空)。"""
+    s = g56_nd_score(ctx)
+    return None if s is None else _nd_tag_of(s)
+
+
 register_strategy_funcs(
     'g56',
-    {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem},
-    d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0},
+    {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem, "nd_score": g56_nd_score, "nd_tag": g56_nd_tag},
+    d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0, "nd_score": 0, "nd_tag": 0},
 )

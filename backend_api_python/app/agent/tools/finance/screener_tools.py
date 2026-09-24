@@ -153,6 +153,9 @@ def search_stocks(
 def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
     """条件转关键词：将 filters 字典转为自然语言查询字符串，供 search_stocks 使用。
 
+    Returns:
+        str: 由 filters 拼成的自然语言查询串（**纯字符串**，非 dict）；无有效条件时返回空串。
+
     Args:
         filters: 筛选条件字典，如 {"market": "主板", "pe_range": [0, 30]}
     """

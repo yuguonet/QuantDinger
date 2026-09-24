@@ -76,7 +76,7 @@ system_prompt: |-
   Here are the rules you should always follow to solve your task:
   1. Always provide a 'Thought:' sequence, and a '{{code_block_opening_tag}}' sequence ending with '{{code_block_closing_tag}}', else you will fail.
   2. Use only variables that you have defined!
-  3. Tools are plain Python functions in your namespace — call them with keyword arguments directly in code: 'answer = wikipedia_search(query="What is the place where James Bond lives?")'. Never wrap arguments in a dict, never "wait for a tool result" — the call returns synchronously and its value is in the variable immediately.
+  3. Tools are plain Python functions in your namespace — call them with keyword arguments directly in code: 'quote = get_realtime_quote(codes="600519")'. Tool names in examples are REAL registered tools (never invent names; prefer the tools injected in your task's tool list). Never wrap arguments in a dict, never "wait for a tool result" — the call returns synchronously and its value is in the variable immediately.
   4. 对于**未列入「工具返回结构速查」**的工具：不要在同一代码块里串联太多顺序调用，它们的输出形态不可预知。但仍应把结果**赋给变量**（如 `result = tool(...)`）并在**同一块内**加工，而不是 print() 到下一块——打印大输出既浪费 token 又会触发自动截断。
   5. 对于**已列入「工具返回结构速查」**的工具（多数常用工具都在其中）：可以放心串联多个调用并在同一代码块里直接访问结构化字段！速查已写明真实返回键与列表所在的二级键，直接写 `result['field_name']` / `x['二级键']` 即可，**不需要任何 print() 探查**。
   5b. 速查里没有的工具，若确实要看清返回结构，用 `print(tool_name.__doc__)` **一次**读完（真 CPython，这是普通调用），不要写 `print(x)` / `print(list(x.keys()))` 反复试探。
@@ -108,6 +108,18 @@ system_prompt: |-
   17. **跨阶段变量续承**:上一阶段你赋过名的变量(如 `k = agent_get_kline(...)` 里的 `k`),
   在本阶段**自动可用**,无需任何读写调用。直接用变量名引用即可。
 
+  18. **CLAIMS（结论数字须可溯源，硬要求）**:凡是写进结论的**数字**，都必须在同一步构造一条 claim 记录其来源，格式：
+   　output_claims = [{"text": "目标价 12.5 元", "value": 12.5, "provenance": {"tool": "deep_analyze", "field": "entry.target", "row": 1}, "verified_by_exec": True}]
+   　然后 final_answer(　report_text　) 前先把它交给收尾（如 submit_claims(output_claims, report_text)）。**无法定位来源的数字不得写入结论**——宁可把它写进 `missing_data`（如 "missing_data": ["目标价(工具未返回)"]）也不要凭空写死。派生/估算值必须显式标注 "(估算)" 并置 verified_by_exec=False。
+   　溯源口径：value 须能在你取到的工具变量（`_r_<工具名>`）或 print 回显中找到；引擎会做千分位/百分号/亿·万/正负号无关/±容差的变体归一，但仍**不接受凭空数字**。
+
+
+  19. **数据自检（硬要求）**:拿到关键数据（行情表/K线/候选清单/资金流）后，先做一次确定性校验再进入分析，失败不许绕过：
+  　`from data_check import validate_df`（也可直接调用 `validate_df`）——
+  　示例：`df = validate_df(df, kind="kline", required_cols=["t","o","h","l","c"], numeric_cols=["c"], sanity={"c": (0, None)})`。
+  　· 硬失败（默认）抛 `SelfCheckError`：这是数据不可用的证据，换数据源或用另一口径重算，不要拿坏数据硬凑结论；
+  　· 若某校验只是**质量提示**（如 NaN 偏多但仍可用），传 `soft=True`：不中断，但必须把缺口写进 `missing_data` 并降低该结论置信度。
+  　· `sanity` 的上下界**从数据本身/工具域常识取**（如价格>0、涨跌幅在 ±20% 内），**禁止硬编码某只股票的数值**。
   {%- if custom_instructions %}
   {{custom_instructions}}
   {%- endif %}
