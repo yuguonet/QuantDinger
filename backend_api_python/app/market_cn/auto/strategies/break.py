@@ -7,6 +7,9 @@
   断板期检查 5a~5f: 低点不破涨停日开盘 / 缩量1.2~2.0x / 首断日涨跌+gap 区间 /
   回撤不破限 / 确认日增强过滤(三通道OR: 企稳[0,2) | 均量比≥1.4 | 前20日涨幅≥30)
   竞价: 无 gap 过滤 (恒可买, gap 判定交给 D1 数据)
+评分 = 50 + 确认日涨幅% × 3, clip [0,100] —— **展示分, 非质量分**
+  (2026-09-24 由 int(confirm_chg)+10 归一化而来; 原值域 0~17 与它策略不可比。
+   实测 corr=-0.084 无判别力, 且 daily_limit=5 从不触发 ⇒ 只作展示/tie-break, 依据见 SCORE_* 处)
   换手率门 (2026-09-11): 确认日换手 < turnover_min (config params, None=关) → 剔除
   U1~U4: prefilter_anchor='signal' (锚定确认日=末根bar; 连板≥2已隐含U4)
 
@@ -57,6 +60,42 @@ DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5,
                       # align级 Δ+1.76 两段稳 / 日级七档全平坦 / signal级 60.4%/+3.42,
                       # 见 tmp/break_confirm_归因报告.md)。circ 缺失 fail-open 不拦。
                       turnover_min=None)
+
+
+# ================================================================
+# 评分口径 (2026-09-24 归一化: 旧式 `int(confirm_chg) + 10` ⇒ 值域 0~17)
+# ----------------------------------------------------------------
+# 旧式三个问题 (取证: tmp/_break_score_ic.log · _break_score_db.log):
+#   ① **值域塌缩, 跨策略不可比**: 库内 break 仅 9/10/11, 回测 109 笔 min0~max17
+#      (87% 落 10~17); 而 g56 67~99 / v1 34~66 / relay3 68~80 / tail 72~93
+#      ⇒ 在 0~100 直觉下断板永远垫底, 观感即"评分不对"。
+#   ② **int() 向零截断** ⇒ 1pp 分辨率; 通道1(企稳 confirm_chg∈[0,2)) 样本
+#      **全部塌缩到 {10,11}** (库内 4 笔中 3 笔正是 10/11); confirm_chg<-10 ⇒ score≤0。
+#   ③ **语义是入场成本而非质量**: score 就是确认日涨幅, 确认日涨得多=次日追高。
+# 归一化后 ① ② 解决 (分辨率 1pp → 0.33pp, 值域 0~100); ③ **未解决且无法用换键解决** ——
+#   实测 corr(score,ret)=-0.084 / 同日截面 IC -0.034 (confirm_chg -0.125), 无正向判别力。
+#   ⚠ 故本分**只作展示与同策略内 tie-break, 不得用于资源分配/质量判断**。
+#
+# ★★ **本分不参与每日名额截断**: `daily_limit=5` 但实测 320 天 **85 个信号日无一日超 5 笔**
+#    (109 笔/85 天, 单日最大 n=3) ⇒ `scan.py` 截断从不触发。这是 break 与 g56 的关键差异
+#    (g56 单日可达 218 笔, 换键有 ~6.7pp 收益; **break 换键零收益**, 故此处不换因子, 只做
+#    展示归一化, 保持与 confirm_chg 单调同向)。
+SCORE_BASE = 50.0        # confirm_chg = 0 对应分
+SCORE_PER_PCT = 3.0      # 确认日每 +1% 涨幅对应 +3 分 (实测 p05=-6.77 / p95=+7.36 ⇒ 值域 ≈20~74)
+
+
+def _score_of(confirm_chg):
+    """断板信号评分 0~100 (**展示分**, 口径见 SCORE_* 常量处注释)。
+
+    线性: BASE + confirm_chg * PER_PCT, clip [0,100] 后取整。与 confirm_chg 单调同向,
+    故**同策略内的相对排序与旧式一致** (归一化不改变组内次序)。
+
+    NaN/负溢出防御: 比较 `> 0` 对 NaN 为 False ⇒ 落 0, 不污染排序 (与 g56._score_of 同款)。
+    """
+    v = SCORE_BASE + confirm_chg * SCORE_PER_PCT
+    if not (v > 0):
+        return 0
+    return int(min(100, round(v)))
 
 
 # ================================================================
@@ -345,7 +384,7 @@ class BreakStrategy(StrategyBase):
             result.append(Signal(
                 code=code,
                 time=bars[i]["time"],
-                score=int(sig.get("confirm_chg", 0) or 0) + 10,   # 与 dragon_scan 后处理口径一致
+                score=_score_of(float(sig.get("confirm_chg", 0) or 0)),
                 price=0.0,                                        # 断板信号日不定价 (entry=D1开盘)
                 label="断板",
                 extra=extra,

@@ -11,6 +11,8 @@
   ④ 金叉预测 rhist_chg 板块池内前5%      MACD 柱加速变长, 金叉正在形成
   ⑤ 板块状态 板块动量为正 + 未超买        个股+板块同向, 不是个股独立异动
     (⑤ = 横截面 regime 门: 主板 rmed>0.25 & 布林%b≤49.87 / 20cm score_r>0.65 & dif0≤0)
+评分 (展示 + **实盘每日限额截断键**) = 0.5·归一(dist_ma20) + 0.5·归一(−dif0),
+  2026-09-24 由 rhist_chg 换键而来, 依据与阈值见 SCORE_* 常量处注释。
 出场 = 纯 7d/-8% 无追踪 (2026-09-17 出场研究定稿: trail 保留系数全区间单调, 紧追踪
   系统性打断启动初期动量): 持有期任一日 (d≥2, T+1) low≤入场价×0.92 → 止损卖
   (跳空穿越按开盘价成交); 否则第 7 个交易日收盘卖。
@@ -100,7 +102,32 @@ MAIN_PCTB_MAX = 49.87    # 主板 boll %b 上限 = 56%池内 P40 (g1deep3 桶边
 GEM_SCORE_MIN = 0.65     # 20cm regime 门: score_r (滚动相对热度)
 ROLL = 20                # score_r 滚动分位窗口 (交易日)
 MIN_HIST = 5             # 分位最少历史天数 (不足为 None → 20cm 不产信号)
-GEM_SCORE_DIVISOR = 30.0  # score 映射: 50 + rhist_chg*30, clip [0,99]
+# ================================================================
+# 评分口径 (2026-09-24 换键: rhist_chg → dist_ma20 / dif0 组合)
+# ----------------------------------------------------------------
+# score 有两个消费者: ① 前端「评分」展示 ② **实盘每日限额截断键**
+#   (scan.py:254 按 score 降序截断到 daily_limit)。② 是要害 —— 旧键 rhist_chg
+#   在 1594 笔样本上实盘口径仅 **65.6%**, 低于随机截断×300 的 90% 区间下沿
+#   **66.8%** (随机中位 68.4%) ⇒ 不只是"无判别力", 是系统性挑到较差的一批。
+#
+# 换键依据 (tmp/_g56_factor_ic.py · _g56_key_sim.py · _g56_key_robust.py):
+#   · 主样本 1594笔/34信号日 **同日截面** Spearman IC: dist_ma20 +0.173 (t=3.30),
+#     ret5 +0.178, pos20 +0.136, big20 +0.145 ; **rhist_chg +0.057 (t=1.00)**
+#   · 早期段 87笔 (entry_date<2026-04-20, 与主样本不重叠) 分桶 Δ:
+#     dist_ma20 +21.4pp / combo +16.8pp / **现用 score −1.6pp**
+#   · ⚠ 陷阱: atr14/amp20/big20/dif0 **全样本 IC 很强但两时段反向** ⇒ 全样本 IC
+#     会被"大日子效应"污染, 选因子必须看**同日截面 IC** (本轮踩过, 勿再犯)
+#   · 实盘口径(每日Top30) 模拟: 现用 65.6%/+6.39% → dist_ma20 70.9%/+7.09%
+#     → 本 combo 72.5%/+8.11% ; 参数 48 组网格全部落在 72.1~73.3% ⇒ 非阈值拟合
+#
+# 两段含义: dist_ma20 = 收盘相对 MA20 偏离% (位置/动量, 越大越强); −dif0 = MACD
+#   柱深度 (越负=柱在零轴下越深=越接近金叉, 与 g56「④金叉预测」维度同向)。
+#   二者均**个股级 D-1 已知**, 无需当日全市场截面 ⇒ 与池统计解耦, 单票可算。
+SCORE_DIST_LO = -10.0    # dist_ma20 归一下界 (%)
+SCORE_DIST_HI = 5.0      # dist_ma20 归一上界 (%)
+SCORE_DIF0_LO = 0.0      # −dif0 归一下界 (对应 dif0 = 0)
+SCORE_DIF0_HI = 16.0     # −dif0 归一上界 (对应 dif0 = −16)
+SCORE_W_DIST = 0.5       # dist_ma20 权重 (dif0 占 1 − w)
 
 DEFAULT_PARAMS = {}      # 阈值全部冻结为模块常量 (样本内拟合产物, 不开放 config 覆盖
                          # 以防误调 — 调参须走 tmp 研究链路重验)
@@ -171,13 +198,14 @@ def _g1_arrays(bars):
 
     特征: rma/rma_chg (MA5/MA10 收敛), atr (ATR14%), rsi (研究口径), big20
     (前20日≥5%大涨日数), rhist_chg (MACD柱日差/前收), dif0 (MACD柱/现收),
-    pctb (布林%b), dates (YYYY-MM-DD)。需要 len>=35 (calc_macd 下限), 调用方保证。
+    pctb (布林%b), ma20 (MA20, 评分用 dist_ma20 的分母), dates (YYYY-MM-DD)。
+    需要 len>=35 (calc_macd 下限), 调用方保证。
     """
     c = np.array([float(b["close"]) for b in bars])
     h = np.array([float(b["high"]) for b in bars])
     l = np.array([float(b["low"]) for b in bars])
     n = len(c)
-    ma5, ma10 = _sma_np(c, 5), _sma_np(c, 10)
+    ma5, ma10, ma20 = _sma_np(c, 5), _sma_np(c, 10), _sma_np(c, 20)
     # 传 list[float] 而非 ndarray: calc_macd 是纯 Python 循环, 用 ndarray 会取到
     # np.float64 标量, 每次算术都要 numpy 标量装箱 (比 Python float 慢一个量级)。
     # 二者同为 IEEE-754 double 运算, 结果**逐位一致** (tmp/_macd_exact_test.py: 400 组
@@ -197,7 +225,7 @@ def _g1_arrays(bars):
     cb_prev[20:] = cb[:-20]
     return {
         "rma": rma, "rma_chg": rma_chg, "atr": _atr(h, l, c),
-        "rsi": _rsi(c), "big20": cb - cb_prev,
+        "rsi": _rsi(c), "big20": cb - cb_prev, "ma20": ma20,
         "rhist_chg": rhist - rh_prev, "dif0": dif / c * 100,
         "pctb": _boll_pctb(c), "dates": [str(b["time"])[:10] for b in bars],
     }
@@ -207,7 +235,7 @@ def _g1_mask(f, board):
     """G1池成员 mask (全D-1判定, 同 g1deep3 行127-131): NaN 比较为 False 自然暖机。"""
     m = ((np.abs(f["rma"]) <= 2.5) & (f["rma_chg"] > 0)
          & (f["atr"] > ATR_Q5[board]) & (f["big20"] >= 2))
-    for key in ("rma", "rma_chg", "atr", "rhist_chg", "dif0", "pctb", "rsi"):
+    for key in ("rma", "rma_chg", "atr", "rhist_chg", "dif0", "pctb", "rsi", "ma20"):
         m &= np.isfinite(f[key])
     m[:68] = False       # 暖机下限 (同研究 s>=68 → 特征日 k>=67)
     return m
@@ -379,6 +407,22 @@ def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None):
             "peak_return_pct": round((peak / entry - 1) * 100, 2)}
 
 
+def _score_of(dist_ma20, dif0):
+    """信号评分 0~100 —— 换键后唯一构造点 (口径见 SCORE_* 常量处注释)。
+
+    = W·归一(dist_ma20) + (1−W)·归一(−dif0), 两段各 clip [0,1] 后线性加权 ×100 取整。
+
+    NaN 防御: ma20/dif0 在暖机段为 NaN, 比较 `> 0` 为 False ⇒ 落 0.0 (最低分),
+    不会污染排序。正常路径下暖机 `m[:68]=False` 已保证 k≥68, 不会走到。
+    """
+    s1 = (dist_ma20 - SCORE_DIST_LO) / (SCORE_DIST_HI - SCORE_DIST_LO)
+    s2 = ((-dif0) - SCORE_DIF0_LO) / (SCORE_DIF0_HI - SCORE_DIF0_LO)
+    s1 = 0.0 if not (s1 > 0) else (1.0 if s1 > 1 else s1)
+    s2 = 0.0 if not (s2 > 0) else (1.0 if s2 > 1 else s2)
+    v = 100 * (SCORE_W_DIST * s1 + (1 - SCORE_W_DIST) * s2)
+    return int(min(100, max(0, round(v))))
+
+
 def _mk_signal(code, bars, k, f, st):
     """命中日 k → Signal (单日 scan_signals 与批量 scan_days 共用的唯一构造点)。
 
@@ -386,10 +430,11 @@ def _mk_signal(code, bars, k, f, st):
     处理都是易错点)。改任一字段必须只改这里。
     """
     rhc = float(f["rhist_chg"][k])
+    dist = (float(bars[k]["close"]) / float(f["ma20"][k]) - 1) * 100
     return Signal(
         code=code,
         time=bars[k]["time"],
-        score=int(min(99, max(0, round(50 + rhc * GEM_SCORE_DIVISOR)))),
+        score=_score_of(dist, float(f["dif0"][k])),
         price=float(bars[k]["close"]),
         label=STRATEGY_LABEL + SIGNAL_OPEN_RANGE_HINT,
         extra={
@@ -398,6 +443,7 @@ def _mk_signal(code, bars, k, f, st):
             "rhist_chg": round(rhc, 3),
             "boll_pctb": round(float(f["pctb"][k]), 2),
             "dif0": round(float(f["dif0"][k]), 3),
+            "dist_ma20": round(dist, 2),
             "rmed": round(st["rmed"], 3),
             "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
             "buy_mode": "next_open",
