@@ -386,6 +386,13 @@ def add_watchlist():
             db.commit()
             cur.close()
 
+        # 入库后走后台队列补算 system 标签（与批量入自选同一队列，合并去重）
+        try:
+            from app.watchlist import enqueue_ensure
+            enqueue_ensure([(market, symbol)])
+        except Exception as le:
+            logger.warning(f"add_watchlist label enqueue failed {market}:{symbol}: {le}")
+
         return jsonify({'code': 1, 'msg': 'success', 'data': None})
     except Exception as e:
         logger.error(f"add_watchlist failed: {str(e)}")

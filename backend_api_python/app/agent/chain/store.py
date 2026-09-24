@@ -372,7 +372,14 @@ def update_verify_results(
     hold_days: int = None,
     correct: bool = None,
 ):
-    """写入根节点的验证结果。"""
+    """写入根节点的验证结果。
+
+    【P1 写保护】`correct`/`calibration` **只由本函数与 update_skill_verify 写入**
+    （golden test 锁定）；verify_node/claims 结论只进独立字段，不得回写此处。
+
+    2026-09-24（提智三波 T1）：写入定论后顺带回填案例库延迟标签（只读 correct，
+    只改 pending 行，fail-open）——案例记忆的 outcome 就在这里从 pending 转正/转误。
+    """
     from app.utils.db import get_db_connection
 
     try:
@@ -387,6 +394,13 @@ def update_verify_results(
             conn.commit()
     except Exception as e:
         logger.error("[Store] 写入验证结果失败 root_id=%d: %s", root_id, e)
+        return
+    # 延迟标签回填（T1）：失败不影响验证主链
+    try:
+        from utils.case_memory import backfill_by_root
+        backfill_by_root(root_id, correct, t_plus_n=pnl_pct)
+    except Exception as e:
+        logger.warning("[Store] 案例标签回填跳过 root_id=%d: %s", root_id, e)
 def update_skill_verify(root_id: int, actual_direction: str):
     """回溯时逐层验证：更新每个 skill 子节点的 correct。
 
@@ -660,6 +674,27 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
                 weights[fname] = weight
     except Exception as e:
         logger.warning("[Store] 获取因子权重失败: %s", e)
+    return weights
+
+
+def get_chain_weights() -> Dict[str, float]:
+    """从 qd_agent_weights 获取链路权重（layer='chain'，2026-09-24 提智 P3/TODO-1）。
+
+    背景（已知局限 G1 的补全）：update_weights 此前只产 skill/factor/tool 三层权重，
+    chain 层“只记账不加权”；本函数是 planner 侧的消费入口（与 get_tool_weights 同款
+    低权重提示）。写入点在 evaluator.update_weights 的⑦段（同表分层，additive）。
+    """
+    from app.utils.db import get_db_connection
+    weights: Dict[str, float] = {}
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'chain'")
+            for name, weight in cur.fetchall():
+                weights[name] = weight
+            cur.close()
+    except Exception as e:
+        logger.warning("[Store] 获取链路权重失败: %s", e)
     return weights
 # [AUDIT-MASK:B1|2026-09-19] 第④闭环双轨之一：本函数（工具序列参考注入）与 skill_brewer
 # （酿造）同源同目的，质量门口径不一致（此处 win_rate>=0.7/MIN_SAMPLES=1；酿造 证伪<=0.3）。

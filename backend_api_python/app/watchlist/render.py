@@ -153,20 +153,23 @@ def _section_has_content(sec: Dict[str, Any]) -> bool:
 
 #: 哪些**来源**的 extras 属于「过程明细」⇒ 整段不进弹层（§10.3）。
 #:
-#: system 的 extras 就是评分过程本身（技术指标 / 评分明细 / 评分口径：输入、归一、权重），
-#: 它回答的是"分数怎么来的"，不是"这只票现在什么样"。弹层是**一眼扫完**的场景，
-#: 把它塞进来自选股列表会退化成一个需要展开研读的面板。
+#: system 的 **技术指标 / 评分明细 / 评分口径** 就是评分过程本身，回答的是"分数怎么来的"。
+#: 但 **「次日预测」** 是行动信息（P涨/操作提示），不是过程 ⇒ **白名单放行**。
 #:
-#: ⚠️ 纯**显示**决策：三块数据一字不差地留在库里（agent 消费 / 审计 / §7.8 逐位回归照读原值），
-#: 只有这一屏不发放。要看过程明细请走 label 的读接口，不要靠弹层。
+#: ⚠️ 纯**显示**决策：数据一字不差地留在库里。
 _EXTRAS_HIDDEN_SOURCES = frozenset({"system"})
+
+#: system 来源下仍上屏的 extras 单元标题（行动信息，非过程明细）
+_EXTRAS_VISIBLE_TITLES = frozenset({"次日预测"})
 
 
 def _extras_units(row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """extras 段的展示口径：过程明细来源整段不产出，其余照 `_tidy_units` 瘦身。"""
+    """extras 段的展示口径：过程明细来源整段不产出（行动信息白名单放行），其余照 `_tidy_units` 瘦身。"""
+    units = list(row.get("extras") or [])
     if (row.get("source") or "") in _EXTRAS_HIDDEN_SOURCES:
-        return []
-    return _tidy_units(list(row.get("extras") or []))
+        units = [u for u in units
+                 if isinstance(u, dict) and u.get("title") in _EXTRAS_VISIBLE_TITLES]
+    return _tidy_units(units)
 
 
 def render(row: Optional[Dict[str, Any]], quote: Optional[Dict[str, Any]] = None, *,

@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -114,6 +115,13 @@ PLAN_TOOL_LIST_LIMIT = (int(_PLAN_TOOL_LIST_LIMIT_ENV)
 _CAP_PLAN_LIST_LIMIT_ENV = os.getenv("CAP_PLAN_LIST_LIMIT", "").strip()
 CAP_PLAN_LIST_LIMIT = (int(_CAP_PLAN_LIST_LIMIT_ENV)
                        if _CAP_PLAN_LIST_LIMIT_ENV.isdigit() else 30)
+
+# plan 回炉反馈前缀（B1-B，2026-09-24）：只列缺陷不给改法；“未列出的内容一字不改”
+# 约束与 verify REPAIR_ONCE 同款（防“修一处坏三处”）；回炉只许一次，写死在 _plan。
+_PLAN_REPLAN_NOTE = (
+    "\n\n【规划回炉·仅一次】上一版规划存在以下缺陷（只修复列出的问题，其余内容"
+    "**一字不改**；若缺陷要求拆合阶段，按缺陷方向重出 phases 即可）：\n"
+)
 
 
 # 沙箱安全内置补全(2026-09-12)已随执行器更换整段删除(2026-09-20):
@@ -1291,6 +1299,37 @@ class TaskAgent(AgentBase):
         except Exception as _e:
             logger.debug("[Plan] 工具权重提示跳过: %s", _e)
 
+        # ── 链路权重提示（2026-09-24 提智 P3/TODO-1）：低权重链路提醒避免沿用其工具组合 ──
+        # chain 层权重由 evaluator.update_weights ⑦段产出（同表 layer='chain'）；
+        # 本处是 planner 侧消费点（与工具权重提示同款形态，同一阈值事实源）。
+        try:
+            from chain.store import get_chain_weights
+            from chain.skill_brewer import LOW_WEIGHT_THRESHOLD  # 同 S5 阈值事实源
+            _cw = get_chain_weights()
+            _low_chains = sorted(n for n, w in _cw.items() if w < LOW_WEIGHT_THRESHOLD)
+            if _low_chains:
+                tools_hint += ("\n\n【链路权重提示】以下历史链路胜率偏低(<0.7),"
+                               "规划时避免沿用其工具组合:"
+                               + ", ".join(_low_chains[:8]))
+        except Exception as _e:
+            logger.debug("[Plan] 链路权重提示跳过: %s", _e)
+
+        # ── 案例记忆注入（2026-09-24 提智三波 T1）：top-3 相似历史案例（延迟标签加权）──
+        # 注入语义严格两类（成功=骨架候选+坑 / 失败=只给坑），由 format_case_injection
+        # 单源渲染；相似度低于阈值一条不注（宁缺毋滥）。
+        case_text = ""
+        try:
+            from utils.case_memory import retrieve_cases, format_case_injection
+            _cases = retrieve_cases(user_input, top_k=3)
+            case_text = format_case_injection(_cases)
+            if case_text:
+                trace.record("case_injected", {
+                    "cases": [c.get("case_id") for c in _cases],
+                    "scores": [c.get("score") for c in _cases],
+                })
+        except Exception as _e:
+            logger.debug("[Plan] 案例记忆注入跳过: %s", _e)
+
         template = _load_plan_template()
         # completed_phases_text: 已完成阶段的摘要(用于多轮规划),首次调用为空
         prompt = template.format(
@@ -1301,7 +1340,7 @@ class TaskAgent(AgentBase):
             rag_context=getattr(src, '_plan_rag_context', '') or '',
             history_context=getattr(src, '_plan_history_context', '') or '',
             completed_phases_text=getattr(src, '_completed_phases_text', '') or '',
-        ) + tools_hint + cached_chain_text
+        ) + tools_hint + cached_chain_text + case_text
 
         messages = [
             ChatMessage(role="system", content="你是任务规划器。只输出 JSON。"),
@@ -1313,20 +1352,135 @@ class TaskAgent(AgentBase):
             "skills_available": [s["name"] for s in self.skill_adapter.list_skills()] if self.skill_adapter else [],
         })
 
-        plan_start = time.time()
-        response = await llm.generate(messages=messages)
-        trace.record("plan_response", {
-            "elapsed_seconds": round(time.time() - plan_start, 3),
-            **llm_response_to_dict(response),
-        })
+        # ── B1-B：Best-of-N 采样 + LLM plan critic 选优 + 回炉一次（2026-09-24 提智二波）──
+        # 裁决 #5：N=AGENT_PLAN_BEST_OF_N（默认 2）起步，L0/L1 单候选（routing_policy
+        # 矩阵 best_of_n=off）；critic 只兜确定性查不了的（断点/验收不可判定/预算失配），
+        # 确定性缺陷由下方 plan_linter R1~R4 处理（原则 1）。回炉**只许一次**（原则 2，
+        # 写死此处不靠提示约束）。选优/破平规则见 utils/plan_critic.select_best。
+        from agents import routing_policy as _rp
+        from utils.plan_critic import (critic_enabled as _critic_on, critique as _critique,
+                                       select_best as _select_best, summarize_plan as _summarize,
+                                       format_defects as _format_defects)
+        from utils.plan_linter import granularity_hints as _gran_hints
 
+        _difficulty = (getattr(src, "_plan_difficulty", "") or "").strip().upper()
+        _n = _rp.planning_samples(_difficulty)
+        _use_critic = _critic_on() and (_n > 1 or _difficulty in ("L2", "L3", ""))
+
+        async def _sample(tag: str, note: str = "") -> str:
+            """采一个候选 raw（同一 prompt；回炉时附缺陷清单）。"""
+            _msgs = list(messages)
+            if note:
+                _msgs = [messages[0], ChatMessage(role="user", content=prompt + note)]
+            _t0 = time.time()
+            _resp = await llm.generate(messages=_msgs)
+            trace.record("plan_response", {
+                "candidate": tag,
+                "elapsed_seconds": round(time.time() - _t0, 3),
+                **llm_response_to_dict(_resp),
+            })
+            return (_resp.content or "").strip()
+
+        # return_exceptions=True：单个采样调用失败（网关 5xx 等）**不全灭**，幸存候选照常
+        # 选优（与"防 planner JSON 损坏"同一初衷）；全部失败才抛首异常（保持旧行为：
+        # plan 调用彻底不可用时如实报错，不静默出空 plan）。
+        _sample_results = list(await asyncio.gather(
+            *[_sample("c%d" % _i) for _i in range(_n)], return_exceptions=True))
+        _ok_samples = [("c%d" % _i, _r) for _i, _r in enumerate(_sample_results)
+                       if isinstance(_r, str)]
+        for _i, _r in enumerate(_sample_results):
+            if isinstance(_r, BaseException):
+                logger.warning("[TaskAgent] plan 采样 c%d 失败（幸存候选继续选优）: %s",
+                               _i, _r)
+        if not _ok_samples:
+            _first_err = next((_r for _r in _sample_results
+                               if isinstance(_r, BaseException)), None)
+            raise RuntimeError("plan 全部采样失败") from _first_err
+
+        def _cand(tag: str, raw: str) -> dict:
+            """raw → 候选结构（选优用；规格化/裁剪由下方线性主体统一做）。"""
+            _p = safe_parse_json(raw, default={})
+            if not isinstance(_p, dict):
+                _p = {}
+            _ph = _p.get("phases") if isinstance(_p.get("phases"), list) else []
+            _pt = _p.get("tools")
+            if isinstance(_pt, str):
+                _pt = [x for x in _pt.split(",")]
+            if not isinstance(_pt, list):
+                _pt = []
+            try:
+                _sb = int(_p.get("step_budget") or 0)
+            except (TypeError, ValueError):
+                _sb = 0
+            return {"tag": tag, "raw": raw, "plan": _p, "parsed": bool(_p),
+                    "phases": [x for x in _ph if isinstance(x, dict)],
+                    "plan_tools": [str(x) for x in _pt if str(x).strip()],
+                    "step_budget": _sb, "critic": None, "granularity": []}
+
+        candidates = [_cand(_t, _r) for _t, _r in _ok_samples]
+        _names = " ".join(sorted(self._tool_provider.get_tool_names())) \
+            if self._tool_provider else ""
+
+        if _use_critic:
+            _crits = await asyncio.gather(*[
+                _critique(llm, user_input, _summarize(c["plan"]), _names)
+                for c in candidates], return_exceptions=True)
+            for _c, _cr in zip(candidates, _crits):
+                if isinstance(_cr, BaseException):
+                    # critique 内部已 fail-open；这里是它自身异常的兑底，不许炸主链
+                    from utils.plan_critic import CritiqueResult as _CR
+                    _cr = _CR(error="critic 异常: %s" % _cr,
+                              warnings=["plan_critic 异常（已降级为确定性选优）"])
+                _c["critic"] = _cr
+        for _c in candidates:
+            if _c["critic"] is not None:
+                trace.record("plan_critic",
+                             {"candidate": _c["tag"], **_c["critic"].to_trace()})
+            # R3 粒度信号（确定性；预选期只用原始承诺的 step_budget/acceptance/barrier）
+            _c["granularity"] = _gran_hints(_c["phases"])
+
+        _idx, _reason = _select_best(candidates)
+        chosen = candidates[_idx] if 0 <= _idx < len(candidates) else candidates[0]
+
+        # 回炉一次（critic fatal 或 R3 粒度信号 → 带缺陷清单重出；只列缺陷不给改法）
+        _defects = _format_defects(chosen)
+        _need_replan = bool((chosen.get("critic") and chosen["critic"].fatal)
+                            or chosen["granularity"])
+        if _need_replan and _defects.strip():
+            logger.warning("[TaskAgent] plan 候选 %s 有缺陷，回炉一次（仅一次）：\n%s",
+                           chosen["tag"], _defects[:500])
+            try:
+                _rc = _cand("replan", await _sample("replan", _PLAN_REPLAN_NOTE + _defects))
+                if _rc["parsed"]:
+                    _rc["granularity"] = _gran_hints(_rc["phases"])
+                    if _use_critic:
+                        _rc["critic"] = await _critique(
+                            llm, user_input, _summarize(_rc["plan"]), _names)
+                        trace.record("plan_critic",
+                                     {"candidate": "replan", **_rc["critic"].to_trace()})
+                    # 回炉候选**不无条件采纳**：与原候选再走同一选优纯函数，严格更优才顶替
+                    # （防"修一处坏三处"——回炉产物比原件更烂时没有理由换）。
+                    # 并列不换（破平含粒度信号数，修掉 R3 信号即胜出）。
+                    _ri, _rr = _select_best([chosen, _rc])
+                    if _ri == 1:
+                        chosen = _rc
+                    trace.record("plan_replan", {"defects": _defects[:500],
+                                                 "adopted": _ri == 1, "reason": _rr})
+                else:
+                    trace.record("plan_replan", {"defects": _defects[:500],
+                                                 "adopted": False, "reason": "回炉产物不可解析"})
+            except Exception as _e:
+                logger.warning("[TaskAgent] plan 回炉失败（沿用原候选）: %s", _e)
+
+        plan_raw = chosen["raw"]
+        trace.record("plan_selected", {"candidate": chosen["tag"], "samples": _n,
+                                       "difficulty": _difficulty, "reason": _reason})
         # 2026-09-20 修复(解析截断,与"模型退化"同症状的第二种根因):调用侧不再做
         # "首个 ``` 块"的非贪婪剥离。实测 plan_response 的 task 值内部自带 ```json 菜单块
         # (raw 含 4 个围栏),非贪婪 `(.*?)` 会截到内层围栏处(1458 → 257 字符、无闭合
         # 大括号)→ 解析失败 → plan={} → 域/工具/阶段三通道全空,与 planner 真退化
         # (只吐 task 字段)的表象完全一致,极易误判成模型问题。
         # 现保留原文交给 safe_parse_json(内部按括号平衡取顶层对象,跳过字符串内的围栏)。
-        plan_raw = (response.content or "").strip()
         plan = safe_parse_json(plan_raw, default={})
 
         task = plan.get("task", "") or plan.get("expanded_query", "") or user_input
@@ -1461,10 +1615,16 @@ class TaskAgent(AgentBase):
             from utils.plan_linter import get_tool_index, apply_report, lint_plan
             _lint_base = (self._tool_provider.list_by_domain(selected_domain)
                           if (selected_domain and self._tool_provider) else [])
+            # R4 保护名单：技能工具 + 数据能力点名单（能力层断链教训：宁可冗余不裁）
+            _lint_protected = set(_capability_names(self._tool_provider))
+            if selected_skill:
+                _lint_protected |= set(_list_skill_func_names(selected_skill))
+                _lint_protected |= {"read_skill_resource", "read_skill_section"}
             _lint = lint_plan(task, phases, plan_tools,
                               base_tools=_lint_base,
                               available_names=available_names,
-                              index=get_tool_index(self._tool_provider))
+                              index=get_tool_index(self._tool_provider),
+                              protected_names=_lint_protected)
             if _lint.dirty:
                 apply_report(phases, plan_tools, _lint)
                 trace.record("plan_lint", _lint.to_trace())
@@ -2574,13 +2734,13 @@ class TaskAgent(AgentBase):
             #   system_prompt 段已完全贴官方 jinja(占位符 8 个全在 populate_template 变量集里)。
             planning = custom_templates.get("planning", {})
             if isinstance(planning, dict) and provider:
-                if tools:
-                    # 2026-09-15:stage_* 已不是工具;planning 可选范围就是本阶段白名单本身
-                    allowed_names = set(str(t) for t in tools)
-                elif domain:
-                    allowed_names = set(provider.list_by_domain("common") + provider.list_by_domain(domain))
-                else:
-                    allowed_names = set(provider.list_by_domain("common"))
+                # C4 收尾（2026-09-24 提智）：planning 视图 **收敛为沙箱选定面**——
+                # 直接取 tool_functions 键集（= 本阶段真注入面，含附加点名与技能工具名），
+                # 不再三条件各自推导（白名单分支漏附加点名/技能名、域分支漏 _extra ⇒
+                # §7.0 三处口径打架：planning ~60 / 沙箱 ~15 / list_tools 58）。
+                # get_schemas_text 只命中 provider 注册名，技能工具名自然被过滤
+                # （其 schema 走 smolagents Tool 对象通道）。
+                allowed_names = set(tool_functions.keys())
                 tools_text = provider.get_schemas_text(names_filter=allowed_names)
                 # 日志口径修正(2026-09-14):原打印 len(provider)(全量 81),
                 # 与"注入了几条 schema"无关--排查时极易误判成"全量 schema 进 prompt"。

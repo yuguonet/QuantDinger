@@ -227,12 +227,17 @@ def build_levels(chip_core: Optional[Dict[str, Any]], close: float) -> Tuple[Lis
 
 
 def system_label(market: str, symbol: str, klines: List[Dict[str, Any]],
-                 asof: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                 asof: Optional[str] = None, *,
+                 market_klines: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
     """system（grade=1）自算一张 label 事实（不写库；写库由 store 负责）。
 
+    **v2 口径**（SCORE_VERSION=2）：`score` = P(T+1 上涨)×100，不是历史形态健康度。
+    预测链：大盘基础分 + 个股独立分 + beta/反向 + 庄代理（`predict.predict_next_day`）。
+    v1 形态分仍写入 extras 供对照，不作主分。
+
     Returns:
-        None ⇒ **不产出**（= 空白）：市场不支持 / 数据不足 / `W_eff < 0.60`
-        dict ⇒ {trade_date, score, score_version, supports, resistances, extras, facts_asof}
+        None ⇒ **不产出**（= 空白）：市场不支持 / 数据不足 / 有效特征不足
+        dict ⇒ {trade_date, score, score_version, supports, resistances, extras, facts_asof, pred?}
     """
     if market not in model.SUPPORTED_MARKETS:
         return None                      # §7.5：非 CN/HK **明确不产出**（不是落 NULL）
@@ -249,23 +254,61 @@ def system_label(market: str, symbol: str, klines: List[Dict[str, Any]],
     if "error" in chip_core:
         chip_core = None
 
+    from app.watchlist.predict import predict_next_day
+
+    # 大盘日K：CN/HK 统一用上证作系统性风险代理；调用方可传入更贴切的指数
+    if market_klines is None and market == "CNStock":
+        from app.watchlist.predict import load_market_klines
+        market_klines = load_market_klines(120)
+
+    pred = predict_next_day(klines, market_klines or [], chip_core)
+    if pred is None:
+        return None                      # 特征不足 ⇒ 不落行
+
     fe = extract_features(klines, chip_core)
-    res = model.score_from_features(fe["feats"])
-    if res["score"] is None:
-        return None                      # W_eff < 0.60 ⇒ 不落 grade=1 行（空白）
+    res_v1 = model.score_from_features(fe["feats"])
 
     close = fe["detail"]["close"]
     supports, resistances = build_levels(chip_core, close)
 
+    extras = build_extras(fe["detail"], fe["raw_disp"], res_v1["breakdown"],
+                          res_v1["dropped"], res_v1["w_eff"])
+    # v2 主分的可解释块 + 操作读法（前缀字段进 fields，弹层可读）
+    pred_rows = [
+        {"label": "次日上涨概率", "value": f"{pred['p_up'] * 100:.1f}%"},
+        {"label": "预期日收益", "value": f"{pred['exp_ret_bp']:+.0f} bp"},
+        {"label": "大盘基础分", "value": f"{(pred['market'].get('p_up') or 0) * 100:.0f}"},
+        {"label": "大盘相关", "value": f"{pred['beta'].get('regime')}/β={pred['beta'].get('beta')}"},
+        {"label": "庄异动", "value": f"{pred['zhuang'].get('score')}" if pred['zhuang'].get('score') is not None else "-"},
+        {"label": "操作提示", "value": action_hint(pred['p_up'])},
+    ]
+    extras = [
+        {"type": "fields", "title": "次日预测", "rows": pred_rows},
+        *extras,
+    ]
+
     return {
         "trade_date": trade_date,
-        "score": res["score"],
-        "score_version": model.SCORE_VERSION,
+        "score": pred["score"],                 # = P(up)×100，主指标
+        "score_version": model.SCORE_VERSION,   # 2
         "supports": supports,
         "resistances": resistances,
-        "extras": build_extras(fe["detail"], fe["raw_disp"], res["breakdown"],
-                               res["dropped"], res["w_eff"]),
+        "extras": extras,
         "facts_asof": datetime.fromtimestamp(int(klines[-1]["time"])),
-        "w_eff": res["w_eff"],
-        "dropped": res["dropped"],
+        "pred": pred,                           # 机器可读全量（agent/回测用）
     }
+
+
+def action_hint(p_up: float) -> str:
+    """P(涨) → 操作读法（用户裁定：见分即知今天怎么操作）。"""
+    if p_up is None:
+        return "—"
+    if p_up >= 0.65:
+        return "偏多：可持/可买"
+    if p_up >= 0.55:
+        return "略偏多：持有"
+    if p_up > 0.45:
+        return "中性：观望"
+    if p_up > 0.35:
+        return "略偏空：谨慎"
+    return "偏空：宜减/回避"

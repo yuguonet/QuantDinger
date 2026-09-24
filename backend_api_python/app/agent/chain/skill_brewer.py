@@ -189,7 +189,9 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
     """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto_*/SKILL.md。
 
     触发分派（重设计 §2.5，2026-09-19）：
-      trigger="auto"   → 混合三通道：信号就绪（query_brew_ready）立即酿；
+      trigger="auto"   → 混合四通道：信号就绪（query_brew_ready）立即酿；
+                         案例聚类信号④（plan_digest 聚类 ≥3 次且 correct 率高，
+                         2026-09-24 提智 T1，前置=0.3 状态机四修已完成）；
                          兜底（brew_state 距上次尝试 ≥7 天且 runs 达标）；
                          冷却（连续失败 ≥3 → 静默）
       trigger="manual" → 原 query_brew_candidates 全量门槛（手动入口语义不变）
@@ -239,6 +241,23 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             c["_channel"] = "fallback"
             candidates.append(c)
             seen.add(name)
+        # 通道 3：案例聚类信号④（T1，2026-09-24）——案例库攒两周就能看出的高频模式，
+        # 不必等技能统计跑起来（用户方案："更早的观察窗口"）。语义对齐通道 1（信号达标
+        # 即酿，不看 last_brew_date），但同样受冷却门约束。fail-open：案例库不可用=通道缺席。
+        try:
+            from utils.case_memory import query_brew_case_signals
+            for c in query_brew_case_signals(limit=limit):
+                name = c.get("chain_name")
+                if not name or name in seen:
+                    continue
+                s = states.get(name, {})
+                if s.get("fail_streak", 0) >= BREW_FAIL_COOLDOWN:
+                    continue
+                c["_channel"] = "case"
+                candidates.append(c)
+                seen.add(name)
+        except Exception as e:
+            logger.warning("[Brewer] 案例聚类信号④查询跳过（不影响其他通道）: %s", e)
         candidates = candidates[:limit]
     else:
         candidates = query_brew_candidates(min_runs=min_runs, limit=limit)

@@ -4,7 +4,7 @@
 | 符号 | 调用方 | 说明 |
 |---|---|---|
 | `get_labels` | `routes/market.py` `/watchlist/get` | 读路径唯一入口 |
-| `write_system_facts` | `job.py`（每日盘后） | system 自算，grade=1 兜底，范围 = 自选股并集 |
+| `write_system_facts` | `job.py`（每日盘后）/ 新增自选后即时补算 | system 自算，grade=1 兜底；默认范围 = 自选股并集 |
 | `submit` | **auto / agent** | 上级唯一写入口；`source` 决定 grade，**不接受外部传 grade** |
 
 **接口即唯一写通道**：`submit` 之外没有第二条写路径 —— 等级映射、TTL 换算、
@@ -189,13 +189,19 @@ def _pick(rows: List[Dict[str, Any]]):
 # 写路径 1：system 自算（grade=1，唯一）
 # ═══════════════════════════════════════════════════════════════════
 
-def write_system_facts(asof: Optional[str] = None) -> Dict[str, Any]:
-    """system 自算并落库（**每日全量**，grade=1）。范围 = 自选股并集。
+def write_system_facts(asof: Optional[str] = None,
+                       pairs: Optional[List[tuple]] = None) -> Dict[str, Any]:
+    """system 自算并落库（grade=1）。
+
+    - 默认（`pairs=None`）：**每日全量**，范围 = 自选股并集（盘后 job）
+    - 传 `pairs=[(market, symbol), ...]`：只补算指定标的 —— 供**新增自选后即时出标签**，
+      不必干等下一次盘后 job（否则新票会空窗到次日）
 
     不产出（市场不支持 / 数据不足 / `W_eff<0.60`）⇒ 该票**不落行**（= 空白）。
     单票失败不阻断整批。
     """
     from app.watchlist.compute import KLINE_LIMIT, system_label
+    from app.watchlist.predict import load_market_klines
     from app.services.kline import KlineService
 
     asof = asof or _today()
@@ -204,12 +210,19 @@ def write_system_facts(asof: Optional[str] = None) -> Dict[str, Any]:
     failures: List[str] = []
     skipped: List[str] = []
 
-    pairs = store.list_watchlist_symbols()
+    # 大盘只拉一次，供全部个股的 beta/反向/庄-抗跌共用
+    market_klines = load_market_klines(120)
+
+    if pairs is not None:
+        pairs = [(m, s) for m, s in pairs if m and s]
+    else:
+        pairs = store.list_watchlist_symbols()
     for market, symbol in pairs:
         try:
             klines = ks.get_kline(market=market, symbol=symbol, timeframe="1D",
                                   limit=KLINE_LIMIT)
-            lab = system_label(market, symbol, klines or [], asof=asof)
+            lab = system_label(market, symbol, klines or [], asof=asof,
+                               market_klines=market_klines)
             if lab is None:
                 skipped.append(f"{market}:{symbol}")
                 continue

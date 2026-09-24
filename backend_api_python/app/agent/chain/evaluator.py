@@ -339,6 +339,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
       1. skill 层权重（按单位时间收益率）
       2. factor 层权重（带时间衰减的准确率）
       3. tool 层权重（按工具参与链路的 correct 率，含失败样本）
+      4. chain 层权重（链路 correct 率，2026-09-24 P3/TODO-1 补全三层追责）
 
     自动同步 registry（双向）：
       - 新 Skill/新工具 → INSERT 工厂默认值（权重 1.0，sample_count=0）；
@@ -347,7 +348,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
     from app.utils.db import get_db_connection
 
     stats = {"synced": 0, "skill_updated": 0, "factor_updated": 0, "factor_cleaned": 0,
-             "tool_updated": 0, "tool_synced": 0, "tool_cleaned": 0, "skill_cleaned": 0}
+             "tool_updated": 0, "tool_synced": 0, "tool_cleaned": 0, "skill_cleaned": 0,
+             "chain_updated": 0}
     since = date.today() - timedelta(days=days)
     today = date.today()
 
@@ -578,15 +580,51 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 """, (tname, weight, wr, n))
                 stats["tool_updated"] += 1
 
+            # ⑦ chain 层权重（同表 layer='chain'，2026-09-24 提智 P3/TODO-1）：
+            # 三层追责（Layer.CHAIN/SKILL/TOOL）此前只记账不加权（已知局限 G1）——
+            # 本段把链路（root 层 name=domain+verb+noun）的 correct 率折成权重，
+            # planner 侧消费点 = task_agent._plan 的【链路权重提示】（与工具权重同款）。
+            # 同步口径：只算有定论（correct IS NOT NULL）的链；含失败链路（链坏了
+            # 也是权重信号，与 tool 层同款）；低样本不改权重（防误判）。
+            # name 含 'unknown' 的不可归类链不产权重行（与酿造候选同口径排除）。
+            cur.execute("""
+                SELECT t.name AS chain_name,
+                       COUNT(*) AS n,
+                       AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) AS win_rate
+                FROM qd_traces t
+                WHERE t.layer = 'chain'
+                  AND t.correct IS NOT NULL
+                  AND t.exec_date >= %s
+                  AND position('unknown' in t.name) = 0
+                GROUP BY t.name
+            """, (since,))
+            for row in cur.fetchall():
+                cname, n, wr = row["chain_name"], int(row["n"]), float(row["win_rate"])
+                weight = 1.0 if n < 10 else round(max(0.5, min(2.0, 1.0 + (wr - 0.5) * 2.0)), 4)
+                cur.execute("""
+                    INSERT INTO qd_agent_weights
+                        (layer, name, skill_name, weight, win_rate, sample_count, last_updated)
+                    VALUES ('chain', %s, NULL, %s, %s, %s, NOW())
+                    ON CONFLICT (layer, name, COALESCE(skill_name, ''))
+                    DO UPDATE SET
+                        weight = EXCLUDED.weight,
+                        win_rate = EXCLUDED.win_rate,
+                        sample_count = EXCLUDED.sample_count,
+                        last_updated = NOW()
+                """, (cname, weight, wr, n))
+                stats["chain_updated"] = stats.get("chain_updated", 0) + 1
+
             conn.commit()
 
     except Exception as e:
         logger.error("[Evaluator] 更新权重失败: %s", e)
 
-    logger.info("[Evaluator] 权重更新: skill 同步%d/更新%d/清理%d, tool 同步%d/更新%d/清理%d, factor %d/清理 %d",
+    logger.info("[Evaluator] 权重更新: skill 同步%d/更新%d/清理%d, tool 同步%d/更新%d/清理%d, "
+                "factor %d/清理 %d, chain %d",
                 stats["synced"], stats["skill_updated"], stats["skill_cleaned"],
                 stats["tool_synced"], stats["tool_updated"], stats["tool_cleaned"],
-                stats["factor_updated"], stats["factor_cleaned"])
+                stats["factor_updated"], stats["factor_cleaned"],
+                stats.get("chain_updated", 0))
     # 迭代旁支调度（重设计 §2.6，2026-09-19）：链式门控 · 第 2 级——仅当权重确有更新
     # （skill/factor/tool 任一 *_updated>0）才把低于阈值的 auto_ 技能交给修订器。
     # 护栏/队列全在 skill_brewer 侧；本处只一行调度（模块边界 §11.1）。

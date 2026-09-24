@@ -1041,6 +1041,8 @@ export default {
           const next = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
           const sig = (arr) => JSON.stringify(arr.map(s => [
             s.symbol, s.market, s.group_name, s.strategy_state, s.strategy_detail || null,
+            // label 字段必须进 signature：否则标签补上/刷新后静默同步会误判「无变更」而永不展示
+            s.name, s.grade, s.source, s.taken_over, s.age_days, s.stale || null, s.sections || null,
           ]))
           if (sig(this.watchlist || []) === sig(next)) return false
           this.watchlist = next
@@ -1128,12 +1130,22 @@ export default {
         `<div class="wl-lv-row">${cells}</div></div>`
     },
     // 评分: 同样与标题同行; 数字放大, 满分与口径进悬停（口径漂移是风险项 ⇒ 可查但不必常驻）
+    // v2: score = P(次日上涨)×100 —— 高=今天偏多, 低=今天偏空（见分即知操作）
     renderScoreSection (sec) {
       if (sec.value === undefined || sec.value === null) return ''
-      const tip = `满分 100${sec.score_version ? ` · 口径 v${sec.score_version}` : ''}`
+      const p = Number(sec.value)
+      let hint = ''
+      if (!Number.isNaN(p)) {
+        if (p >= 65) hint = ' · 偏多'
+        else if (p >= 55) hint = ' · 略偏多'
+        else if (p > 45) hint = ' · 中性'
+        else if (p > 35) hint = ' · 略偏空'
+        else hint = ' · 偏空'
+      }
+      const tip = `次日上涨概率 ${p.toFixed(0)}%${sec.score_version ? ` · 口径 v${sec.score_version}` : ''}`
       return `<div class="wl-sec wl-sec-inline"><div class="wl-sec-t">${this.escHtml(sec.title || sec.key)}</div>` +
         `<div class="wl-score-val" title="${this.escHtml(tip)}">${this.fmtNum(sec.value, 0)}` +
-        `<span class="wl-score-max">/100</span></div></div>`
+        `<span class="wl-score-max">/100</span><span class="wl-score-max">${this.escHtml(hint)}</span></div></div>`
     },
     renderUnits (units) {
       let html = ''
@@ -1173,8 +1185,13 @@ export default {
     },
     labelSectionsHtml (stock) {
       const body = this.renderSections(stock.sections)
-      if (!body) return ''                      // 没有任何段 ⇒ 弹层整体不显示(不吐孤儿 meta)
       const meta = this.labelMetaText(stock)
+      if (!body) {
+        // 有策略态/来源标注但 4 段为空时仍给一行说明，避免弹层空白像坏掉
+        if (!stock.strategy_state && !meta) return ''
+        return (meta ? `<div class="wl-sec-meta">${this.escHtml(meta)}</div>` : '') +
+          '<div class="wl-sec-meta">暂无标签</div>'
+      }
       return (meta ? `<div class="wl-sec-meta">${this.escHtml(meta)}</div>` : '') + body
     },
     onDragStart (stock, e) {

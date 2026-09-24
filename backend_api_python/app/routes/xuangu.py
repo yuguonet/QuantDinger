@@ -310,6 +310,7 @@ def add_to_watchlist():
             cur = conn.cursor()
             added = 0
             skipped = 0
+            added_pairs = []
             for s in stocks:
                 code = (s.get("code") or s.get("symbol") or "").strip()
                 if not code:
@@ -341,11 +342,20 @@ def add_to_watchlist():
                         )
                     )
                     added += 1
+                    added_pairs.append((market, code))
                 except Exception as ie:
                     logger.warning(f"watchlist insert skipped code={code}: {ie}")
                     skipped += 1
             conn.commit()
             cur.close()
+
+        # 标签后台队列补算：HTTP 立刻返回，不在请求里同步拉 K 线
+        if added_pairs:
+            try:
+                from app.watchlist import enqueue_ensure
+                enqueue_ensure(added_pairs)
+            except Exception as le:
+                logger.warning(f"watchlist label enqueue failed: {le}")
 
         return jsonify({"code": 0, "msg": f"成功添加 {added} 只自选股", "data": {"added": added, "skipped": skipped}})
     except Exception as e:

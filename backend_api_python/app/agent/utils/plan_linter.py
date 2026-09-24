@@ -1,13 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Plan Linter（提智方案 二波 B1 · R1+R2 确定性部分，2026-09-24）——规划产物的产前检查。
+"""Plan Linter（提智方案 二波 B1 · R1~R4 确定性部分，2026-09-24）——规划产物的产前检查。
 
-职责（**只做确定性判断，不含 LLM**；LLM critic / Best-of-N 属 B1 后半段，另行开工）：
+职责（**只做确定性判断，不含 LLM**；LLM critic / Best-of-N 在 utils/plan_critic.py）：
   · **R1 工具覆盖**：从 task 正文识别"数据域需求"（行情/资金流/财务/板块/龙虎榜…），逐个断言
     「交付承诺的信息必须有对应取数工具」落在本轮**沙箱工具面**内；命中缺失 → 告警 + 留痕，
     词典高置信时补进点名通道。词典为主，2-gram 倒排索引兜底长尾。
   · **R2 隐式依赖**：下游阶段消费"上游阶段产出的代码清单/股票池"却没标 `barrier` 时，自动补
     `barrier=True`（WARN 不阻塞）。这是并行化（远期 F1）的地基——barrier 不对，"同批并行"
     会把有依赖的阶段塞进同一个 CodeAgent 会话。
+  · **R3 预算-粒度失配**（2026-09-24 B1-B 补齐）：单阶段预算顶格且验收 >3 条 → "粒度过粗"；
+    两相邻阶段各 ≤2 步且无 barrier → "建议合并"。**只出信号不机械拆合**（裁决：粒度信号
+    只回炉让 planner 重出，防 acceptance 语义脱绑），信号进 LintReport.granularity →
+    plan_critic.format_defects → 回炉一次。
+  · **R4 工具面裁剪**（2026-09-24 B1-B 补齐）：planner 声明的工具里"与任务零相关"的条目
+    （正文没提、倒排索引零命中、非清单保护名单）→ 裁掉，削减误用面、降幻觉调用概率。
+    裁剪口径是**零相关**而非原文的"裁到并集"（本契约 phases[].tools 即执行面，无独立
+    "声明 vs 引用"两层；误杀比漏杀烦人——裁决原则），保留数不低于 R4_MIN_FACE。
 
 关键设计点：
   · **单一数据表** `_DATA_DOMAINS`（域 → 关键词 + 候选工具 + 首选工具）：关键词与工具同表，
@@ -39,8 +47,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 __all__ = [
     "DATA_DOMAIN_TOOLS", "LIST_PRODUCERS", "LIST_CONSUMERS",
     "detect_domains", "names_in_text", "build_tool_index", "index_candidates",
-    "get_tool_index", "LintReport", "lint_plan", "apply_report",
+    "get_tool_index", "granularity_hints", "LintReport", "lint_plan", "apply_report",
 ]
+
+# R4 裁剪后的最小工具面（低于此数不再裁——空工具面比冗余更致命）
+R4_MIN_FACE = 3
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  数据域登记表（R1 词典：域 → 触发关键词 + 候选工具）
@@ -248,10 +259,12 @@ def index_candidates(text: str, index: Dict[str, set], available_names,
 #  Lint 报告 + 检查 + 应用
 # ═══════════════════════════════════════════════════════════════════════════
 class LintReport:
-    """检查结果（纯数据）。`coverage` 记录"哪个域缺覆盖"，`*_additions` 记录"该往哪加"。"""
+    """检查结果（纯数据）。`coverage` 记录"哪个域缺覆盖"，`*_additions` 记录"该往哪加"。
+    `granularity` = R3 粒度信号（回炉拆合提示）；`*_pruned*` = R4 工具面裁剪记录。"""
 
     __slots__ = ("coverage", "phase_tool_additions", "plan_tools_additions",
-                 "barriers_added", "index_candidates", "warnings")
+                 "barriers_added", "index_candidates", "warnings",
+                 "granularity", "tool_pruned", "plan_tools_pruned")
 
     def __init__(self) -> None:
         self.coverage: List[dict] = []                    # {domain, tool, source, auto_added}
@@ -260,11 +273,15 @@ class LintReport:
         self.barriers_added: List[int] = []               # 自动补 barrier 的 phase_id
         self.index_candidates: List[str] = []             # 低置信候选（仅告警）
         self.warnings: List[str] = []
+        self.granularity: List[str] = []                  # R3：粒度信号（回炉提示）
+        self.tool_pruned: Dict[int, List[str]] = {}       # R4：phase_id → 裁掉的工具
+        self.plan_tools_pruned: List[str] = []            # R4：顶层裁掉的工具
 
     @property
     def dirty(self) -> bool:
         return bool(self.coverage or self.barriers_added or self.warnings
-                    or self.index_candidates)
+                    or self.index_candidates or self.granularity
+                    or self.tool_pruned or self.plan_tools_pruned)
 
     def to_trace(self) -> dict:
         """trace 载荷（键名稳定，供周报/评测聚合）。"""
@@ -275,6 +292,9 @@ class LintReport:
             "barriers_added": self.barriers_added,
             "index_candidates": self.index_candidates,
             "warnings": self.warnings,
+            "granularity": self.granularity,
+            "tool_pruned": {str(k): v for k, v in self.tool_pruned.items()},
+            "plan_tools_pruned": self.plan_tools_pruned,
         }
 
 
@@ -296,6 +316,41 @@ def _declared_face(phases: Sequence[dict], plan_tools, base_tools) -> set:
     return face
 
 
+def granularity_hints(phases: Optional[Sequence[dict]]) -> List[str]:
+    """R3 预算-粒度失配信号（纯函数；phases 可为**原始承诺**或规格化结构）。
+
+    判据 A（过粗）：单阶段预算顶到 PLAN_PHASE_MAX_STEPS 上限且验收 >3 条 → 拆分。
+    判据 B（过细）：两相邻阶段各 ≤2 步且无 barrier/replan 边界 → 合并。
+    只出信号不机械拆合（裁决：回炉让 planner 重出，防 acceptance 语义脱绑）。
+    阶段标识容忍缺 id（预选期传的是原始 phases，用序号代）。
+    """
+    out: List[str] = []
+    phases = list(phases or [])
+    if not phases:
+        return out
+    _phase_cap = 12  # 与 agents/task_agent.PLAN_PHASE_MAX_STEPS 对齐（惰性取真值，防漂移）
+    try:
+        from agents.task_agent import PLAN_PHASE_MAX_STEPS as _pms
+        _phase_cap = _pms
+    except Exception:
+        pass
+    for i, p in enumerate(phases):
+        pid = p.get("id", i + 1)
+        if int(p.get("step_budget") or 0) >= _phase_cap and len(p.get("acceptance") or ()) > 3:
+            out.append("阶段 %s 粒度过粗（预算顶格 %d 步且验收 %d 条）——建议拆分"
+                       % (pid, _phase_cap, len(p.get("acceptance") or ())))
+    for i in range(1, len(phases)):
+        up, cur = phases[i - 1], phases[i]
+        if cur.get("barrier") or cur.get("replan") or up.get("replan"):
+            continue
+        ub = int(up.get("step_budget") or 0)
+        cb = int(cur.get("step_budget") or 0)
+        if 0 < ub <= 2 and 0 < cb <= 2:
+            out.append("阶段 %s/%s 各 ≤2 步且无边界——建议合并"
+                       % (up.get("id", i), cur.get("id", i + 1)))
+    return out
+
+
 def lint_plan(
     task: str,
     phases: Optional[Sequence[dict]] = None,
@@ -304,6 +359,7 @@ def lint_plan(
     base_tools: Sequence[str] = (),
     available_names: Sequence[str] = (),
     index: Optional[Dict[str, set]] = None,
+    protected_names: Sequence[str] = (),
 ) -> LintReport:
     """对规划产物做确定性检查（纯函数，不改入参）。
 
@@ -313,7 +369,9 @@ def lint_plan(
         plan_tools: 顶层附加点名单。
         base_tools: selected_domain 的域基调工具名（空 = 无域，仅通用工具面）。
         available_names: provider 注册表全部工具名（校验词典/索引候选是否真实存在）。
-        index: 工具倒排索引（None = 跳过兜底）。
+        index: 工具倒排索引（None = 跳过兜底与 R4）。
+        protected_names: R4 永不裁剪名单（技能工具/数据能力点名单——能力层断链教训：
+            能力名恰是最脆弱的点名通道，宁可冗余也不裁）。
 
     Returns:
         LintReport。
@@ -372,7 +430,49 @@ def lint_plan(
             "阶段 %s 消费上游产出的清单却未标 barrier → 自动补（WARN 不阻塞）"
             % rep.barriers_added)
 
+    # ── R3：预算-粒度失配（只出信号，回炉让 planner 重出，不机械拆合）──
+    rep.granularity = granularity_hints(phases)
+    if rep.granularity:
+        rep.warnings.append("R3 粒度信号 %d 条（仅回炉提示，不机械拆合）" % len(rep.granularity))
+
+    # ── R4：工具面裁剪（只裁"零相关"条目，保留面不低于 R4_MIN_FACE）──
+    # 相关性判定：正文逐字命中 ∣ 倒排索引 token 命中 ∣ 保护名单（清单候选/清单产消/
+    # 技能工具/能力点名）。误杀比漏杀烦人（裁决原则）——有任何相关信号就不裁。
+    if index:
+        rel = set(protected_names or ()) | LIST_PRODUCERS | LIST_CONSUMERS
+        for _tools in DATA_DOMAIN_TOOLS.values():
+            rel |= set(_tools)
+        rel |= _relevant_names(task, index, available_names)
+        if phases:
+            for p in phases:
+                if not p.get("tools_declared"):
+                    continue
+                face = list(p.get("tools") or ())
+                _prel = rel | _relevant_names(
+                    " ".join(str(p.get(k) or "") for k in ("name", "goal", "deliverable")),
+                    index, available_names)
+                pruned = [t for t in face if t not in _prel]
+                if pruned and len(face) - len(pruned) >= R4_MIN_FACE:
+                    rep.tool_pruned[p["id"]] = pruned
+        else:
+            pruned = [t for t in plan_tools if t not in rel]
+            if pruned and len(plan_tools) - len(pruned) >= R4_MIN_FACE:
+                rep.plan_tools_pruned = pruned
+        if rep.tool_pruned or rep.plan_tools_pruned:
+            rep.warnings.append(
+                "R4 工具面裁剪：零相关工具 %d 个（逐字/索引均未命中，误用面收缩）"
+                % (sum(len(v) for v in rep.tool_pruned.values())
+                   + len(rep.plan_tools_pruned)))
+
     return rep
+
+
+def _relevant_names(text: str, index: Dict[str, set], available_names) -> set:
+    """与文本相关的工具名集合：正文逐字命中 + 倒排索引 token 命中。"""
+    rel = set(names_in_text(text, available_names)) if available_names else set()
+    for tk in set(_tokens(text or "")):
+        rel |= set(index.get(tk, ()))
+    return rel
 
 
 def _add_for_domain(rep: LintReport, phases, plan_tools, dom: str, tool: str) -> bool:
@@ -398,7 +498,11 @@ def _phase_hits_domain(phase: dict, dom: str) -> bool:
 
 
 def apply_report(phases, plan_tools, report: LintReport) -> Tuple[list, list]:
-    """按报告就地落实（改的是入参对象；返回同一对引用，便于链式书写）。"""
+    """按报告就地落实（改的是入参对象；返回同一对引用，便于链式书写）。
+
+    R1/R2 落**加法**（补工具/补 barrier）；R4 落**减法**（裁零相关工具）。
+    加法先于减法：同名工具被补过就不再是“零相关”（补位源于域命中，本就不会进裁剪名单）。
+    """
     for pid, tools in (report.phase_tool_additions or {}).items():
         for p in phases or ():
             if p.get("id") != pid:
@@ -413,4 +517,12 @@ def apply_report(phases, plan_tools, report: LintReport) -> Tuple[list, list]:
     for t in (report.plan_tools_additions or ()):
         if t not in (plan_tools or []):
             plan_tools.append(t)
+    # R4：减法（只动 tools_declared=True 的阶段，与补位同一选面原则）
+    for pid, pruned in (report.tool_pruned or {}).items():
+        for p in phases or ():
+            if p.get("id") == pid and p.get("tools_declared"):
+                p["tools"] = [t for t in (p.get("tools") or []) if t not in set(pruned)]
+    if report.plan_tools_pruned:
+        _drop = set(report.plan_tools_pruned)
+        plan_tools[:] = [t for t in plan_tools if t not in _drop]
     return phases, plan_tools

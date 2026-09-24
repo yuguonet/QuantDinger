@@ -64,11 +64,32 @@ def takeover_report(asof: Optional[str] = None) -> Dict[str, Any]:
 
 
 def run_daily(asof: Optional[str] = None) -> Dict[str, Any]:
-    """每日盘后 job：system 全量刷新（grade=1）+ 接管统计。"""
+    """每日盘后 job：预测分衰减巡检（必要时自动重标上线）+ system 全量刷新 + 接管统计。
+
+    产品口径（用户裁定）：**只保当前/未来预测力**。重标后立刻全量刷当前自选分，历史分不回写。
+    """
+    cal_stats: Dict[str, Any] = {}
+    try:
+        from app.watchlist.calibrate import run_auto_calibrate
+        cal_stats = run_auto_calibrate()
+        if (cal_stats.get("recal") or {}).get("applied"):
+            logger.info("[label] 自动重标已上线 score_version=%s",
+                        cal_stats["recal"].get("score_version"))
+    except Exception as e:
+        logger.warning("[label] 自动标定巡检失败（不影响刷分）: %s", e)
+
     stats = write_system_facts(asof=asof)
     report = takeover_report(asof=stats.get("asof"))
     stats["takeover"] = {
         k: report[k] for k in ("scope", "higher_active", "higher_expired", "takeover_rate")
     }
-    logger.info("[label] 每日 job 完成: %s", stats["takeover"])
+    det = cal_stats.get("detect") or {}
+    rec = cal_stats.get("recal") or {}
+    stats["calibrate"] = {
+        "auc": det.get("auc"),
+        "should_refit": det.get("should_refit"),
+        "applied": rec.get("applied"),
+        "score_version": rec.get("score_version") or det.get("score_version"),
+    }
+    logger.info("[label] 每日 job 完成: %s cal=%s", stats["takeover"], stats["calibrate"])
     return stats

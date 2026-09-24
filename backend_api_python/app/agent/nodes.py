@@ -96,6 +96,7 @@ class AgentState(TypedDict, total=False):
     # ── chat_node 路由 ──
     needs_task: bool      # True=进 plan→execute 任务流程, False=直接回答
     task_type: str        # 任务子类型: analysis/screen/compare/query/general
+    difficulty: str       # T2 难度档位 L0~L3（chat 判定，plan/execute 只读不重算）
     direct_answer: str    # 直接回答内容（needs_task=False 时有值）
 
     # ── plan_node 输出 ──
@@ -126,6 +127,8 @@ class AgentState(TypedDict, total=False):
     _code_agent: Any      # CodeAgent 实例（跨轮复用，不序列化）
     _failed_tools: list   # 失败工具列表
     _agent_plan: str      # smolagents 最终规划
+    _upgrade_pending: bool  # T2 升级信号：丢弃单段从头 plan（plan_node 消费即清，防残留）
+    _upgrade_done: bool     # T2 升级一次性闸（触发后不再重触发）
 
     # ── verify_node 输出（E3，2026-09-24 提智先手）──
     verify_route: str       # PASS / REPAIR_ONCE / DEGRADE
@@ -701,6 +704,17 @@ def make_chat_node(ctx: NodeContext):
                 # 因此静默失效很久。解析失败是真实降级，必须可见。
                 logger.warning("[Chat] 实体解析失败（已跳过，不影响主流程）: %s", e)
 
+        # ── 3.5 难度路由（2026-09-24 提智三波 T2）：确定性特征先算，临界带随意图分类
+        # 一次带回（裁决 #4：零额外调用）。结果进 trace / state / _plan（N 的取值）三处共用，
+        # 不在下游重新算（路由抖动比误判更难查——routing_policy 头部易错点）。
+        difficulty, _diff_score, _diff_feats, _diff_border = "", 0.0, {}, False
+        _diff_src = "rule"      # 外层初始化（防 try 内赋值前异常 → UnboundLocalError，本项目经典坑）
+        try:
+            from agents.routing_policy import score_difficulty
+            difficulty, _diff_score, _diff_feats, _diff_border = score_difficulty(user_input)
+        except Exception as _e:
+            logger.debug("[Chat] 难度打分跳过: %s", _e)
+
         # ── 4. 意图分类：统一 LLM 分类 ──
         needs_task = True
         direct_answer = ""
@@ -740,12 +754,33 @@ def make_chat_node(ctx: NodeContext):
                 intent_system += f"\n\n【参考上下文（仅供理解背景，不改变意图判断）】\n{context[:600]}"
             if entity_code:
                 intent_system += f"\n\n【已识别实体】{entity_name}({entity_code}) [{entity_type}]\n该实体已解析完成，用户消息必然需要工具，优先判断为 task。"
+            # 临界带才附带难度判定（T2，零额外调用）：判据清单 + 输出契约追加 Lx 档位。
+            # 模型没给级别/给坏值 → 规则结果保留（fail-open，routing_policy.parse_level）。
+            if _diff_border:
+                try:
+                    from agents.routing_policy import difficulty_block
+                    intent_system += (
+                        "\n\n【难度判定（附带任务）】" + difficulty_block()
+                        + "\n在类型词后追加空格+难度级别（如 `analysis L2`），级别四选一。")
+                    _diff_src = "model"
+                except Exception:
+                    pass
             intent_messages = [
                 ChatMessage(role="system", content=intent_system),
                 ChatMessage(role="user", content=user_input),
             ]
             intent_resp = await ctx.llm.generate(messages=intent_messages)
             intent = (intent_resp.content or "").strip().lower()
+            # T2：意图响应里回收难度档位（L0~L3），命中则覆盖规则结果
+            try:
+                from agents.routing_policy import parse_level
+                _lv = parse_level(intent)
+                if _lv:
+                    difficulty = _lv
+                elif _diff_src == "model":
+                    _diff_src = "rule(fallback)"
+            except Exception:
+                pass
             if "chat" in intent and "task" not in intent:
                 needs_task = False
                 logger.info("[Chat] 意图分类: chat（直接回答）")
@@ -768,6 +803,13 @@ def make_chat_node(ctx: NodeContext):
             logger.warning("[Chat] 意图分类失败，默认走任务流程: %s", e)
             needs_task = True
             task_type = "general"
+
+        # T2 难度路由留痕（原则 7：路由质量可复盘——升级率指标的数据源）
+        if trace:
+            trace.record("difficulty_route", {
+                "level": difficulty, "score": _diff_score, "borderline": _diff_border,
+                "source": _diff_src, "features": _diff_feats,
+            })
 
         # ── 4.5 Cron 意图拦截：直接创建定时任务，不走 plan/execute ──
         if task_type == "cron":
@@ -851,6 +893,7 @@ def make_chat_node(ctx: NodeContext):
             "effective_input": effective_input,
             "needs_task": needs_task,
             "task_type": task_type,
+            "difficulty": difficulty,
             "direct_answer": direct_answer,
         }
 
@@ -973,6 +1016,9 @@ def make_plan_node(ctx: NodeContext):
         # 与既有 _plan_entity_info 挂载模式一致；task_agent 侧改从这些属性直取。
         ctx._plan_task_type = task_type or "general"
         ctx._plan_entity_type = entity_type or "stock"
+        # T2 难度透传（2026-09-24）：_plan 据此取 Best-of-N 的 N（不在 plan 期重算——
+        # 两次结果可能不同，路由抖动比误判更难查）
+        ctx._plan_difficulty = state.get("difficulty", "")
 
         # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
         plan = await ctx.agent._plan(plan_input, ctx.llm, trace, plan_ctx=ctx)
@@ -1048,6 +1094,9 @@ def make_plan_node(ctx: NodeContext):
             "phase_index": 0,
             "phase_retry": 0,
             "_phase_agents": {},
+            # T2 升级信号经本节点即消费（清残留）：execute 早退分支不带该字段，
+            # 不在此清零会让 route_after_execute 反复回 plan（2026-09-24 审计抓到的死循环坑）。
+            "_upgrade_pending": False,
         }
 
     return plan_node
@@ -1944,11 +1993,13 @@ def make_execute_node(ctx: NodeContext):
         agent_instance = ctx.agent
         if not agent_instance:
             logger.error("[Execute] ctx.agent 未设置")
-            return {"result_raw": "[run_error] agent 未初始化", "hit_max_steps": True, "_run_error": "agent not initialized"}
+            return {"result_raw": "[run_error] agent 未初始化", "hit_max_steps": True, "_run_error": "agent not initialized",
+                    "_upgrade_pending": False}   # 早退分支显式覆盖，防升级标记残留（回炉死循环坑）
 
         task = state.get("task", "")
         if not task:
-            return {"result_raw": "[run_error] 无任务描述", "hit_max_steps": False, "_run_error": "empty task"}
+            return {"result_raw": "[run_error] 无任务描述", "hit_max_steps": False, "_run_error": "empty task",
+                    "_upgrade_pending": False}
 
         step_budget = state.get("step_budget", 10)
         planning_interval = state.get("planning_interval", 6)
@@ -2164,6 +2215,32 @@ def make_execute_node(ctx: NodeContext):
                 "agent_plan": agent_plan[:500] if agent_plan else None,
             })
 
+        # ── T2 升级信号（2026-09-24 提智三波）：单段工具调用超阈值/数据缺口 → 丢弃单段
+        # 从头 plan。判定与阈值在 agents/routing_policy（登记表化）；只触发一次
+        # （_upgrade_done），且只对 L0/L1 单段路径生效（多阶段走 _phase_replan_request）。
+        # 模型自报 need_replan 的单段通道尚未建（留参待接，不假装生效）。
+        _upgrade_pending = False
+        if not state.get("_upgrade_done"):
+            try:
+                from agents.routing_policy import should_upgrade
+                _tc_count = len(getattr(trace, "_tool_calls", []) or [])
+                _fm_obj = getattr(agent, "_failure_memory", None)
+                # 跨域数据缺口代理信号：B3 self_check_failed 出现（validate_df 缺口）
+                _cross_gap = bool(_fm_obj and getattr(_fm_obj, "counts", {}).get("self_check_failed"))
+                _upgrade_pending = should_upgrade(
+                    state.get("difficulty", ""), _tc_count,
+                    cross_domain_gap=_cross_gap, need_replan=False)
+                if _upgrade_pending:
+                    logger.warning("[Execute] 升级信号命中（difficulty=%s tools=%d gap=%s）"
+                                   "→ 丢弃单段结果从头 plan",
+                                   state.get("difficulty", ""), _tc_count, _cross_gap)
+                    if trace:
+                        trace.record("difficulty_upgrade",
+                                     {"from": state.get("difficulty", ""),
+                                      "tool_calls": _tc_count, "cross_domain_gap": _cross_gap})
+            except Exception as _e:
+                logger.debug("[Execute] 升级信号判定跳过: %s", _e)
+
         return {
             "result_raw": result,
             "hit_max_steps": hit_max_steps,
@@ -2173,6 +2250,8 @@ def make_execute_node(ctx: NodeContext):
             "_agent_plan": agent_plan,  # smolagents 最终规划
             "_run_error": repr(run_error) if run_error else "",  # 执行异常标记（含 LLM 5xx），finalize 据此判定 run 失败
             "_budget_exceeded": _budget_exceeded,  # 0.9 成本预算超限原因（空=未超限）
+            "_upgrade_pending": _upgrade_pending,   # T2 升级信号（每次返回显式覆盖，防旧值残留）
+            "_upgrade_done": bool(state.get("_upgrade_done") or _upgrade_pending),
         }
 
     return execute_node
@@ -2269,6 +2348,7 @@ def make_finalize_node(ctx: NodeContext):
 
         # ── 6. trace.finish() 写 JSONL + qd_traces ──
         trace = state.get("_trace")
+        root_id = None   # 6b 案例落库用；finish 失败/未跑时保持 None（防 UnboundLocalError）
         if trace:
             # §8.3：run 级元数据在收尾补齐。model 没有事件源，只能显式设置；
             # plan 通常由 execute_done 事件带入，这里用 state 的最终值兜底。
@@ -2290,6 +2370,45 @@ def make_finalize_node(ctx: NodeContext):
         # 计算耗时
         start_time = state.get("_start_time", 0)
         elapsed = round(time.time() - start_time, 2) if start_time else 0
+
+        # ── 6b. 案例记忆落库（2026-09-24 提智三波 T1）────────────────────────
+        # 每个任务型 run 一条案例（含失败 run——“失败案例同样入库存档，带 fault 归因”）；
+        # outcome 以 pending 开局，T+N 定论经 chain/store.update_verify_results 回填
+        # （延迟标签，防错误自我复制）。fail-open：案例层绝不阻断收尾主链。
+        if needs_task and root_id:
+            try:
+                from utils.case_memory import record_case
+                _fm_obj = getattr(state.get("_code_agent"), "_failure_memory", None)
+                _f_modes = list((getattr(_fm_obj, "snapshot", dict)() or {}).get("types") or [])
+                if run_failed:
+                    _f_modes.append("run_failed")
+                _phs = state.get("phases") or []
+                if _phs:
+                    _digest = [{"purpose": str(p.get("goal") or "")[:80],
+                                "tools": list(p.get("tools") or []), "steps_used": None}
+                               for p in _phs if isinstance(p, dict)]
+                else:
+                    _used_tools = []
+                    for _tc in (getattr(trace, "_tool_calls", []) or []):
+                        _tn = str(_tc.get("name") or "")
+                        if _tn and _tn not in _used_tools:
+                            _used_tools.append(_tn)
+                    _digest = [{"purpose": str(state.get("task") or state.get("user_input") or "")[:80],
+                                "tools": _used_tools[:10], "steps_used": None}]
+                _steps = len(getattr(getattr(state.get("_code_agent"), "memory", None),
+                                     "steps", []) or [])
+                record_case(
+                    str(state.get("task") or state.get("user_input") or ""),
+                    root_id=root_id,
+                    level=state.get("difficulty", ""),
+                    tags=[t for t in (state.get("task_type", ""),
+                                      state.get("selected_domain", "")) if t],
+                    plan_digest=_digest,
+                    failure_modes=_f_modes,
+                    cost={"steps": _steps, "wall_clock_s": float(elapsed or 0)},
+                )
+            except Exception as e:
+                logger.warning("[Finalize] 案例落库失败（主链不受影响）: %s", e)
 
         # 任务收尾：清空本次 run 的会话级变量存储（防长跑内存增长）
         try:
@@ -2367,6 +2486,11 @@ def route_after_execute(state: dict) -> str:
         if idx >= len(phases):
             return "finalize"    # 全部阶段完成
         return "execute"         # 执行 phases[idx]（重试/推进由节点内部判定）
+
+    if state.get("_upgrade_pending"):
+        # T2 升级（2026-09-24）：单段难度升档 → 丢弃单段结果从头 plan（一次性，
+        # _upgrade_done 已置，下轮 execute 返回会把 _upgrade_pending 覆盖回 False）
+        return "plan"
 
     if not state.get("hit_max_steps", False):
         # E3（2026-09-24 提智先手）：正常完成 → 先进 verify（只对含数字结论启用；

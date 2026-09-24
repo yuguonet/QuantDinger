@@ -21,5 +21,6 @@
 from __future__ import annotations
 
 from app.watchlist.api import attach_labels, get_labels, submit, write_system_facts
+from app.watchlist.ensure_queue import enqueue_ensure
 
-__all__ = ["get_labels", "write_system_facts", "submit", "attach_labels"]
+__all__ = ["get_labels", "write_system_facts", "submit", "attach_labels", "enqueue_ensure"]
