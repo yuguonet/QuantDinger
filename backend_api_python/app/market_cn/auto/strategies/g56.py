@@ -790,9 +790,43 @@ ND_D = {
 ND_W = {"zt": 0.2, "seal": 0.2, "lhbz": 0.2, "vr": 0.2, "ev20": 0.2}
 #: 分值 = 50 + ND_SCALE * Σ(W·Δ), 即加权 1pp ↔ 100 分
 ND_SCALE = 100.0
-#: 展示分档 (下界降序匹配) → 标签
-ND_BANDS = ((55.0, "偏多"), (50.5, "中性偏多"), (49.0, "中性"),
-            (45.0, "中性偏空"), (0.0, "偏空"))
+#: 展示分档 (P(涨)×100, 下界降序匹配) → 标签 — 见 `_nd_tag_of`
+ND_BANDS = ((52.0, "偏多"), (50.0, "略偏多"), (47.0, "中性"),
+            (44.0, "略偏空"), (0.0, "偏空"))
+
+# ================================================================
+# 「明日操作分」v3 主分: P(T+1 开→收上涨) —— 与自选股同一思想, 事件分桶 logit
+# ----------------------------------------------------------------
+# 标定 (tmp/nd_pup_v1.json · 2026-09-25):
+#   样本 1,332,513 (票×日), y=1{r1_oc>0}, 基率 48.43%
+#   模型: 5 因子分桶 one-hot 逻辑回归 (参考档 logit=0)
+#   AUC 0.5063 / 五分位 win 47.4→49.1 (弱但同向) —— 日频方向本身难;
+#   事件因子真实信息在**超额期望** (辅分 ND_D, 五档 r1_oc 单调 -0.46%→+0.48%)。
+#   ⚠ lhbz:yes 对 P(涨) 略负、对超额最强正 ⇒ 概率与收益**不可互相替代**, 主/辅并存。
+# 参考档 (logit 贡献 0): zt=none, seal=na, lhbz=no, vr=1013, ev20=0
+# 本分**不参与**门/排序/截断; 重标定后更新本表与版本注释。
+# ================================================================
+
+ND_PUP_BIAS = -0.050268
+ND_PUP_W = {
+    "zt:first": -0.104292,
+    "zt:streak2": -0.182289,
+    "zt:touch": 0.045615,
+    "seal:0509": -0.044101,
+    "seal:ge09": 0.008754,
+    "seal:lt05": -0.251234,
+    "lhbz:yes": -0.027848,
+    "vr:0508": -0.011778,
+    "vr:0810": -0.004606,
+    "vr:1316": -0.005490,
+    "vr:1620": -0.022160,
+    "vr:2030": -0.049833,
+    "vr:ge30": -0.029548,
+    "vr:lt05": 0.024119,
+    "ev20:1-2": -0.041406,
+    "ev20:3-5": -0.026978,
+    "ev20:6+": 0.071617,
+}
 #: 除权/异常保护: |单日涨跌幅| 超过此值 ⇒ 比值失真, 不产出
 ND_EXDAY_CHG = 0.35
 #: 量比 = 当日量 / 前 ND_VOL_WIN 个交易日均量
@@ -846,25 +880,57 @@ def _nd_bucket_vr(vr):
     return "ge30"
 
 
+def _nd_buckets(zt=False, touch=False, streak=0, amp=None, lhb=False, vr=None, ev20=None):
+    """五因子分桶（主/辅共用，禁止两处各拼一套）。"""
+    return {
+        "zt": _nd_bucket_zt(zt, touch, streak),
+        "seal": _nd_bucket_seal(zt, amp),
+        "lhbz": "yes" if (lhb and not zt) else "no",
+        "vr": _nd_bucket_vr(vr),
+        "ev20": _nd_bucket_ev20(ev20),
+    }
+
+
 def _nd_score_of(zt=False, touch=False, streak=0, amp=None, lhb=False, vr=None, ev20=None):
-    """明日操作分 0~100 (50 = 明日全市场平均)。缺特征 ⇒ 该子项取中性档。
+    """明日操作分 = **P(T+1 开→收上涨)×100**（与自选股评分同一思想）。
 
     ⚠ 与策略质量分 `_score_of` 是两个东西: 后者是 scan.py:254 的每日限额截断键,
     本分**只作展示**, 不参与任何门/排序/截断 —— 禁止混用。
+
+    口径 v3（2026-09-25）:
+      主分 = σ(Σ 分桶 logit)×100 —— 用户裁定「上涨概率为主」
+      辅  = 事件超额期望 (原 ND_D，`_nd_exp_of`) —— 事件因子对**超额**更有效
+      实现与自选股不同: **事件分桶 logit** (zt/seal/lhbz/vr/ev20)，不是连续技术特征回归。
+    缺特征 ⇒ 该子项取参考档 (logit 0)。fail-open: 全缺 → 返回 None 由上游处理。
     """
-    b = {"zt": _nd_bucket_zt(zt, touch, streak),
-         "seal": _nd_bucket_seal(zt, amp),
-         "lhbz": "yes" if (lhb and not zt) else "no",
-         "vr": _nd_bucket_vr(vr),
-         "ev20": _nd_bucket_ev20(ev20)}
+    b = _nd_buckets(zt=zt, touch=touch, streak=streak, amp=amp, lhb=lhb, vr=vr, ev20=ev20)
+    z = ND_PUP_BIAS
+    for fac, cat in b.items():
+        z += ND_PUP_W.get(f"{fac}:{cat}", 0.0)
+    z = max(-8.0, min(8.0, z))
+    p = 1.0 / (1.0 + __import__("math").exp(-z))
+    return round(p * 100.0, 1)
+
+
+def _nd_exp_of(zt=False, touch=False, streak=0, amp=None, lhb=False, vr=None, ev20=None):
+    """辅助: 明日开→收**超额期望** (pp, 50=全市场均值的旧口径换算) — 只作辅展示。"""
+    b = _nd_buckets(zt=zt, touch=touch, streak=streak, amp=amp, lhb=lhb, vr=vr, ev20=ev20)
     mu = sum(ND_W[k] * ND_D[k][b[k]] for k in ND_W)
     return round(max(0.0, min(100.0, 50.0 + ND_SCALE * mu)), 1)
 
 
 def _nd_tag_of(score):
-    for lo, tag in ND_BANDS:
-        if score >= lo:
-            return tag
+    """P(涨)×100 → 操作读法（与自选股同一套语义；因基率≈48%，档位更贴事件分布）。"""
+    if score is None:
+        return "—"
+    if score >= 52.0:
+        return "偏多"
+    if score >= 50.0:
+        return "略偏多"
+    if score > 47.0:
+        return "中性"
+    if score > 44.0:
+        return "略偏空"
     return "偏空"
 
 
@@ -931,7 +997,7 @@ def _nd_lhb2(code, dates):
 
 
 def g56_nd_score(ctx: Ctx):
-    """门表私有函数: 明日操作分 0~100 (signal.fields 用; 缺数据 ⇒ None)。"""
+    """门表私有函数: 明日操作分 = P(T+1 涨)×100 (signal.fields 用; 缺数据 ⇒ None)。"""
     p = _nd_parts(ctx.bars, ctx.i, ctx.board_type, ctx.market)
     if p is None:
         return None
@@ -946,13 +1012,28 @@ def g56_nd_score(ctx: Ctx):
 
 
 def g56_nd_tag(ctx: Ctx):
-    """门表私有函数: 操作分档标签 (偏多/中性偏多/中性/中性偏空/偏空)。"""
+    """门表私有函数: 操作分档标签 (偏多/略偏多/中性/略偏空/偏空, 按 P(涨)×100)。"""
     s = g56_nd_score(ctx)
     return None if s is None else _nd_tag_of(s)
 
 
+def g56_nd_exp(ctx: Ctx):
+    """门表私有函数: 明日开→收**超额期望**展示辅分 (50=全市场均值; 缺数据 ⇒ None)。"""
+    p = _nd_parts(ctx.bars, ctx.i, ctx.board_type, ctx.market)
+    if p is None:
+        return None
+    zt, touch, streak, amp, vr, _chg = p
+    i = ctx.i
+    if i < ND_EV20_WIN - 1:
+        return None
+    dates = [str(ctx.bars[j]["time"])[:10] for j in range(i - ND_EV20_WIN + 1, i + 1)]
+    lhb_today, ev20 = _nd_lhb2(ctx.code, dates)
+    return _nd_exp_of(zt=zt, touch=touch, streak=streak, amp=amp,
+                      lhb=lhb_today, vr=vr, ev20=ev20)
+
+
 register_strategy_funcs(
     'g56',
-    {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem, "nd_score": g56_nd_score, "nd_tag": g56_nd_tag},
-    d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0, "nd_score": 0, "nd_tag": 0},
+    {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem, "nd_score": g56_nd_score, "nd_tag": g56_nd_tag, "nd_exp": g56_nd_exp},
+    d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0, "nd_score": 0, "nd_tag": 0, "nd_exp": 0},
 )

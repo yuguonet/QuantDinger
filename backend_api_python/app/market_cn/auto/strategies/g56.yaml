@@ -81,3 +81,4 @@ signal:
     # 数据不足/除权日 ⇒ 求值为 None (不展示)。
     nd_score: {expr: "nd_score()", fmt: r1}
     nd_tag: {expr: "nd_tag()"}
+    nd_exp: {expr: "nd_exp()", fmt: r1}
