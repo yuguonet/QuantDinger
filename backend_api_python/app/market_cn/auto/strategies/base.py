@@ -266,7 +266,17 @@ class StrategyBase:
 
     # ---- 框架钩子 (monitor 通用流程用; 默认实现 = 旧 else 分支语义) ----
     def quality_key(self, row):
-        """开盘窗口质量排序键 (越大越优先)。默认 confirm_chg (break/relay3 旧口径)。"""
+        """开盘窗口质量排序键 (越大越优先)。**消费方 = `monitor.py:245` 开盘名额**。
+
+        默认读 `extra.confirm_chg` (break/relay3 口径)。
+        ⚠ 2026-09-24 核查: **全集群只有 break(22处) 与 relay3(1处) 产出 confirm_chg**,
+          其余策略若不 override 本方法 ⇒ 恒 `(0,)` ⇒ 名额排序**退化为入库顺序**。
+          当前未 override 的: knife_catch / tail_oversold (均 intraday_window, 库内无
+          signals 行, 暂无实害); dragon_callback / dragon_v2 / g56 / v1 / relay3 已 override。
+        ⚠ 另一坑: **须与 `scan.py:254` 的入库截断键同源于 `Signal.score`**, 否则会像 g56
+          那样出现"入库用新键/开盘名额用旧键"的两套口径并存 (g56 已于 09-24 修正)。
+          新策略建议直接 `return (row.get("score") or 0,)`。
+        """
         extra = row.get("extra") or {}
         return (extra.get("confirm_chg") or 0,)
 

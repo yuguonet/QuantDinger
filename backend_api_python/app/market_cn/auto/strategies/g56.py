@@ -564,8 +564,17 @@ class G56Strategy(StrategyBase):
                                detail={"confirm": "always"})
 
     def quality_key(self, row):
-        """开盘窗口质量排序: 按信号动量 rhist_chg 降序。"""
-        return ((row.get("extra") or {}).get("rhist_chg") or 0,)
+        """开盘窗口质量排序键 —— **与入库截断键同源于 Signal.score**。
+
+        2026-09-24 修正: 旧实现用 `extra.rhist_chg`, 那正是当日换键前的**旧键**
+        (实盘口径仅 65.6%, 低于随机截断×300 的 90% 区间下沿 66.8% ⇒ 有害非无效)。
+        当日 `Signal.score` 已换成 dist_ma20/dif0 组合(见文件头), 但本方法**未同步** ⇒
+        出现「`scan.py:254` 用新键截断入库、`monitor.py:245` 用旧键分配开盘名额」的
+        **两套口径并存**。现统一回落到 `row["score"]`, 两环节完全一致。
+
+        row 是 signals 行(dict), `score` 由 `_score_of` 产出并落库; `or 0` 兜底历史空值。
+        """
+        return (row.get("score") or 0,)
 
     # ---- 出场判定 (day_close 重放 = _exit_no_trail 同式, 见文件头"易错点") ----
     def exit_decision(self, row, snap=None, **params):
