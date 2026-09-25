@@ -330,8 +330,10 @@ def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信�
     if not keys and not ids:
         return []
     from app.utils.db import get_db_connection
+    # 2026-09-25 bugfix: sql_sel 曾写 `{_t}` 却 `.format(t=...)` → KeyError '_t',
+    # retire 静默失败 (rebuild 应用时 sweep_expired 恒 0)。改 f-string 与 UPDATE 一致。
     sql_sel = (
-        "SELECT id, strategy, code, trade_date FROM {_t} "
+        f"SELECT id, strategy, code, trade_date FROM {_SIGNALS_TABLE} "
         "WHERE state = %s AND entry_date IS NULL"
     )
     rows = []
@@ -340,12 +342,12 @@ def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信�
             cur = db.cursor()
             if keys:
                 cur.execute(
-                    sql_sel.format(t=_SIGNALS_TABLE) + " AND strategy = ANY(%s)",
+                    sql_sel + " AND strategy = ANY(%s)",
                     (S_WATCH_PENDING, list(keys)))
                 rows = [dict(r) for r in cur.fetchall()]
             if ids:
                 cur.execute(
-                    sql_sel.format(t=_SIGNALS_TABLE) + " AND id = ANY(%s)",
+                    sql_sel + " AND id = ANY(%s)",
                     (S_WATCH_PENDING, list(ids)))
                 seen = {r["id"] for r in rows}
                 for r in cur.fetchall():
