@@ -1045,7 +1045,9 @@ def make_plan_node(ctx: NodeContext):
         # chain_name 永远对不上（断链④）。此处把 chat 意图分类产出的两元组挂到 ctx，
         # 与既有 _plan_entity_info 挂载模式一致；task_agent 侧改从这些属性直取。
         ctx._plan_task_type = task_type or "general"
-        ctx._plan_entity_type = entity_type or "stock"
+        # 2026-09-25：不再臆造 "stock"——未识别实体就保持空，由 verb 归类/域注册表补链名
+        from domain_registry import default_entity_type as _default_entity_type
+        ctx._plan_entity_type = entity_type or _default_entity_type()
         # T2 难度透传（2026-09-24）：_plan 据此取 Best-of-N 的 N（不在 plan 期重算——
         # 两次结果可能不同，路由抖动比误判更难查）
         ctx._plan_difficulty = state.get("difficulty", "")
@@ -1080,7 +1082,7 @@ def make_plan_node(ctx: NodeContext):
         # intent 三元组补源（2026-09-19，重设计 V1）：chat 阶段只有 verb（task_type），
         # domain 空置 → 根节点 name 含 unknown → 酿造候选过滤（position('unknown')=0）
         # 把链排除 → 闭环④断粮。此处 selected_domain 已确定，补写 domain；
-        # noun 仍由 tracing 内 _VERB_CLASSIFY 依 verb 推导（如 query→stock）。
+        # noun 仍由 domain_registry.classify_verb 依 verb 推导（如 query→stock）。
         # set_intent 只在非空时覆盖（tracing.py），重复调用安全。
         _sd = (plan.get("selected_domain") or "").strip()
         if trace:

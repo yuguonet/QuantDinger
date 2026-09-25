@@ -33,30 +33,30 @@ logger = logging.getLogger(__name__)
 # ── 领域登记表（可扩展）────────────────────────────────────────
 # 2026-09-13：原实现在 resolve() 内直接判定 `self.domain == "finance"`，领域一多就
 # 无处扩展。现改为查登记表：
-#   _ENTITY_DOMAIN           —— 实体类型 → 领域。chat 阶段先于 plan，拿不到
-#                               selected_domain，只能倒推领域。
-#   TRADING_CALENDAR_DOMAINS —— 使用【交易日】口径的领域。新增以交易日为一等
-#                               公民的领域时在此登记；未登记的领域一律自然日口径。
-#   _WORD_DOMAIN（见下）      —— 输入语汇 → 领域，用于"没有实体但语境明确"的兜底。
-_ENTITY_DOMAIN = {"stock": "finance"}
-TRADING_CALENDAR_DOMAINS = frozenset({"finance"})
+#   entity_to_domain()           —— 实体类型 → 领域。chat 阶段先于 plan，拿不到
+#                                   selected_domain，只能倒推领域。
+#   trading_calendar_domains()   —— 使用【交易日】口径的领域。新增以交易日为一等
+#                                   公民的领域时在 tools/<domain>/domain_meta.py
+#                                   设 trading_calendar=True。
+#   word_domain_hints()          —— 输入语汇 → 领域，用于"没有实体但语境明确"的兜底。
+# 2026-09-25：三表均已抽到 domain_registry / tools/<domain>/domain_meta.py，
+# 核心不再写死 finance/stock。
+from domain_registry import (
+    entity_to_domain as _entity_to_domain,
+    trading_calendar_domains as _trading_calendar_domains,
+    word_domain_hints as _word_domain_hints,
+)
 
 _WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 
-# 行情/交易语境词（出现才考虑异常打回；纯闲聊不拦）
-_MARKET_WORDS = re.compile(
-    r"行情|开盘|收盘|涨停|跌停|大盘|指数|个股|股票|资金|龙虎榜|板块|题材|"
-    r"买入|卖出|建仓|减仓|仓位|止损|止盈|K线|均线|MACD|RSI|KDJ|涨跌|做多|做空|看多|看空|"
-    # 2026-09-14 补：这些词此前落不到 finance，导致"前天涨幅榜"被判 general 域、
-    # 按自然日算出 2026-09-12（交易日口径应为 2026-09-10，差 2 天）——金融域漏判
-    # 直接给错日期，是"统一加时间解析"的缺口。均为纯行情语汇，不误伤闲聊。
-    r"涨幅|跌幅|振幅|换手|成交|量比|市盈率|市值|涨速|跌速|封板|炸板|打板"
-)
 
-# 语汇 → 领域（无实体时的兜底信号，按顺序匹配，可扩展）。
-# "最近的行情怎么样"里没有股票名，但它显然属金融域——若落到 general，澄清会问出
-# "自然日 7/30/90 天"这种错口径。新增领域在此登记（如 crypto 的 币/交易所 语汇）。
-_WORD_DOMAIN = [(_MARKET_WORDS, "finance")]
+def _has_trading_context(user_input: str) -> bool:
+    """消息是否含交易日口径领域的语境词（语义异常检测门闩）。"""
+    cal_doms = _trading_calendar_domains()
+    for _rx, _dom in _word_domain_hints():
+        if _dom in cal_doms and _rx.search(user_input):
+            return True
+    return False
 
 _PATTERNS = [
     (re.compile(r"[近这](\d+)\s*个?交易日内?(?:的)?(?:行情|走势|数据|资金|表现)?"), "recent_trade_days"),
@@ -112,7 +112,7 @@ class TimeResolver(EntityResolver):
 
     def __init__(self, domain: str = "", entity_type: str = "",
                  now: Optional[datetime] = None):
-        """domain 显式给定优先；未给定则由 entity_type 推导（见 _ENTITY_DOMAIN）。
+        """domain 显式给定优先；未给定则由 entity_type 推导（entity_to_domain）。
 
         chat 阶段（实体解析）先于 plan，拿不到 selected_domain，所以调用方通常
         只能传 entity_type；显式 domain 供已持有领域信息的调用方使用。
@@ -120,7 +120,7 @@ class TimeResolver(EntityResolver):
         # 领域优先级：显式 domain > 实体类型倒推 > resolve() 内按输入语汇倒推。
         # 此处不再直接落到 "general"——否则无法区分"显式 general"与"未知"。
         self._domain_explicit = bool(domain)
-        self.domain = domain or _ENTITY_DOMAIN.get(entity_type or "", "")
+        self.domain = domain or _entity_to_domain(entity_type or "")
         self._now = now
 
     def _today(self) -> str:
@@ -141,7 +141,7 @@ class TimeResolver(EntityResolver):
           - "今天/当日" + 今天非交易日 → 打回（用户可能是想问最近收盘日，或想在
             非交易日做盘后规划——两种意图都成立，必须问）
         """
-        if not _MARKET_WORDS.search(user_input):
+        if not _has_trading_context(user_input):
             return None
         if re.search(r"(今天|今日|当天)", user_input):
             try:
@@ -206,12 +206,12 @@ class TimeResolver(EntityResolver):
     def _infer_domain(self, user_input: str) -> str:
         """领域倒推（chat 先于 plan、拿不到 selected_domain）。
 
-        优先级：显式 domain > 实体类型倒推（_ENTITY_DOMAIN）> 输入语汇倒推
-        （_WORD_DOMAIN）> general。三者都是登记表——新增领域只加表、不改逻辑。
+        优先级：显式 domain > 实体类型倒推（entity_to_domain）> 输入语汇倒推
+        （word_domain_hints）> general。三者都是登记表——新增领域只加 domain_meta、不改逻辑。
         """
         if self._domain_explicit or self.domain:
             return self.domain
-        for _rx, _dom in _WORD_DOMAIN:
+        for _rx, _dom in _word_domain_hints():
             if _rx.search(user_input):
                 return _dom
         return "general"
@@ -219,7 +219,7 @@ class TimeResolver(EntityResolver):
     def resolve(self, user_input: str) -> Optional[ResolveResult]:
         # 领域先倒推，再查登记表判定是否走交易日口径（两者均可扩展）
         domain = self._infer_domain(user_input)
-        finance = domain in TRADING_CALENDAR_DOMAINS
+        finance = domain in _trading_calendar_domains()
         today = self._today()
         finish = self._finish(today) if finance else today
 

@@ -466,10 +466,15 @@ def _normalize_plan_tools(raw, available_names: set) -> tuple:
     return tools, dropped
 
 
-# planner 金融类意图登记表（2026-09-24，领域红线：判定用登记表、禁散写）：
-# 命中即"该给金融域工具面"的任务类型——域兜底（plan_domain_fallback）与空域退化留痕
+# planner 领域动词登记表（2026-09-24，领域红线：判定用登记表、禁散写）：
+# 命中即"该给领域工具面"的任务类型——域兜底（plan_domain_fallback）与空域退化留痕
 # （plan_domain_empty_degraded）两处消费，单一事实源（新增消费点必须引用本表）。
-_FINANCE_INTENT_TASK_TYPES = frozenset({"screen", "analysis", "compare", "query"})
+# 2026-09-25：改从 domain_registry 取并集，核心不再写死 finance。
+from domain_registry import domain_intent_verbs as _domain_intent_verbs
+
+
+def _domain_intent_types() -> frozenset:
+    return _domain_intent_verbs()
 
 
 def _salvage_tools_from_text(text: str, available_names: set) -> list:
@@ -1272,10 +1277,11 @@ class TaskAgent(AgentBase):
             # 键格式与 qd_traces.name(domain+verb+noun)对齐,verb=noun=task_type 时
             # 语义即"同意图查询"。
             _iv = (getattr(plan_ctx, "_plan_task_type", "") if plan_ctx is not None else "") or "general"
-            _in = (getattr(plan_ctx, "_plan_entity_type", "") if plan_ctx is not None else "") or "stock"
+            _in = (getattr(plan_ctx, "_plan_entity_type", "") if plan_ctx is not None else "") or ""
             _dom = ""
             if self._tool_provider:
-                _dom = "finance"  # 唯一可选域;与 _infer_domain 的主路径一致
+                from domain_registry import fallback_domain as _fallback_domain
+                _dom = _fallback_domain(self._tool_provider.get_domains())
             _hit = query_cached_tools(_dom, _iv, _in)
             if _hit:
                 cached_chain_text = (
@@ -1575,20 +1581,22 @@ class TaskAgent(AgentBase):
                 logger.debug("[TaskAgent] planner 原文工具名回收跳过: %s", _e)
 
         # 域通道兜底(2026-09-20,与 tools 回收互斥的第二道网):task 正文里一个 provider
-        # 工具名都没提及(纯菜单蒸发)但意图是股票类任务(screen/analysis/compare/query)
-        # 时,回退到唯一可选域 finance -- 这是历史上 460+ 次 run 的主路径(planner 正常时
-        # 恒填 dom='finance')。断言:域选择失效属退化,绝不能降成"只用 2 个通用工具"的
-        # 裸沙箱。刻意不含 code/explain(跑马灯等纯推理任务不该拉金融工具,否则白烧 token)。
+        # 工具名都没提及(纯菜单蒸发)但意图是领域类任务(screen/analysis/compare/query)
+        # 时,回退到注册表兜底域 -- 这是历史上 460+ 次 run 的主路径(planner 正常时
+        # 恒填 dom)。断言:域选择失效属退化,绝不能降成"只用 2 个通用工具"的
+        # 裸沙箱。刻意不含 code/explain(跑马灯等纯推理任务不该拉域工具,否则白烧 token)。
         if not raw_plan_tools and not phases and not selected_domain and not selected_skill:
             _fb_verb = (getattr(src, "_plan_task_type", "") or "").strip().lower()
-            if _fb_verb in _FINANCE_INTENT_TASK_TYPES and available_names:
+            if _fb_verb in _domain_intent_types() and available_names:
                 _avail_domains = set(self._tool_provider.get_domains()) if self._tool_provider else set()
-                if "finance" in _avail_domains:
-                    selected_domain = "finance"
+                from domain_registry import fallback_domain as _fallback_domain
+                _fb_dom = _fallback_domain(_avail_domains)
+                if _fb_dom:
+                    selected_domain = _fb_dom
                     logger.warning(
-                        "[TaskAgent] planner 域字段缺失(task_type=%s)→ 兜底回退 domain='finance'"
-                        "(避免裸沙箱;若为误判请从 task 文本核对实体)", _fb_verb)
-                    trace.record("plan_domain_fallback", {"domain": "finance", "reason": _fb_verb})
+                        "[TaskAgent] planner 域字段缺失(task_type=%s)→ 兜底回退 domain='%s'"
+                        "(避免裸沙箱;若为误判请从 task 文本核对实体)", _fb_verb, _fb_dom)
+                    trace.record("plan_domain_fallback", {"domain": _fb_dom, "reason": _fb_verb})
 
         # ── §7.19 待补加固①③（2026-09-24 落地）：空域不许静默（设计 §7.0 第 5 条）──
         # 双网救援后仍空 = planner 域字段退化残余（含"工具名救回了、域仍空"的形态）；
@@ -1597,7 +1605,7 @@ class TaskAgent(AgentBase):
             logger.warning("[TaskAgent] selected_domain 为空串（本 run 仅通用工具面）"
                            "——planner 域字段退化嫌疑（§7.19），禁止静默")
             _deg_verb = (getattr(src, "_plan_task_type", "") or "").strip().lower()
-            if _deg_verb in _FINANCE_INTENT_TASK_TYPES:
+            if _deg_verb in _domain_intent_types():
                 trace.record("plan_domain_empty_degraded",
                              {"task_type": _deg_verb, "tools": list(raw_plan_tools or [])})
         plan_tools, _pt_dropped = _normalize_plan_tools(raw_plan_tools, available_names)
@@ -2905,7 +2913,7 @@ class TaskAgent(AgentBase):
             from resolvers.time import TimeResolver
 
             def _time_resolver(ctx):
-                """由前序识别出的实体类型倒推领域(resolvers/time._ENTITY_DOMAIN),
+                """由前序识别出的实体类型倒推领域(domain_registry.entity_to_domain),
                 否则交易日口径与非交易日澄清整链不生效。"""
                 _types = ctx.get("entity_types") or []
                 return TimeResolver(entity_type=_types[0] if _types else "")

@@ -14,7 +14,7 @@
      把不确定的输入拼进任务描述会让 LLM 顺着错误假设往下做，整份结论作废。
   2. **上下文累积**：子解析器按序执行，前序结果以 ctx 交给后续子解析器。
      chat 先于 plan、拿不到 selected_domain，只能由已识别实体倒推领域
-     （见 time._ENTITY_DOMAIN）——这就是"先标的、后时间"的原因。
+     （见 domain_registry.entity_to_domain）——这就是"先标的、后时间"的原因。
 
 扩展新领域（如 crypto/futures）：把新解析器（或 `ctx -> EntityResolver` 工厂）
 加进 children 即可，调用方无需改动。

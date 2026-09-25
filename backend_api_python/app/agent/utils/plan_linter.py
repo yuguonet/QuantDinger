@@ -56,102 +56,28 @@ R4_MIN_FACE = 3
 # ═══════════════════════════════════════════════════════════════════════════
 #  数据域登记表（R1 词典：域 → 触发关键词 + 候选工具）
 # ═══════════════════════════════════════════════════════════════════════════
+# 2026-09-25：词典已抽到 tools/<domain>/domain_meta.py（DomainSpec.data_domains），
+# 本模块只做拼接与派生视图，核心不再写死金融关键词/工具名。
 # 每行 = (域, 关键词元组, 候选工具元组)。候选工具**首元素 = 首选**（补点名时用它）。
-# 工具名必须逐字来自 provider 注册表（CI 断言见 tests/test_wiring.py 的 plan_linter 段）；
-# 注册表实测口径：capability 62 + finance 56（2026-09-24 dump，见 tmp/qclaw/dump_tools_0924.py）。
-_DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
-    ("realtime_quote",
-     ("实时", "现价", "最新价", "盘口", "快照", "分时", "realtime", "报价", "现在多少钱"),
-     ("get_realtime_quote", "quote", "get_realtime_quote", "get_order_book",
-      "minute_live", "get_realtime_quote")),
-    ("kline",
-     ("日线", "周线", "月线", "k线", "历史行情", "走势", "复权", "分钟线", "均线"),
-     ("agent_get_kline", "daily", "daily_live", "agent_get_kline", "index_daily",
-      "get_sector_history_data", "day_series")),
-    ("fund_flow",
-     ("资金流", "主力", "净流入", "净流出", "大单", "北向", "外资", "资金面", "fund_flow"),
-     ("get_fund_flow", "get_fund_flow", "get_fund_flow_daily",
-      "get_market_fund_flow", "get_market_fund_flow", "get_capital_summary")),
-    ("financials",
-     ("财务", "业绩", "营收", "净利润", "财报", "毛利率", "roe", "基本面", "财报数据"),
-     ("get_capital_summary", "get_stock_info", "get_stock_info", "get_stock_info")),
-    ("valuation",
-     ("估值", "市盈", "市净", "市值", "贵不贵", "值多少钱", "dcf", "目标价", "定价"),
-     ("batch_valuation_compare", "get_stock_info")),
-    ("sector",
-     ("板块", "行业", "概念", "题材", "产业链", "板块轮动"),
-     ("get_hot_sectors", "get_sector_stocks", "get_industry_ranking",
-      "get_sector_trend_analysis", "get_sector_fund_flow", "get_stock_sector_info")),
-    ("dragon_tiger",
-     ("龙虎榜", "席位", "游资", "营业部", "机构专用"),
-     ("get_dragon_tiger", "get_dragon_tiger_detail", "lhb", "query_dragon_tiger")),
-    ("hot_rank",
-     ("人气", "热度", "关注度", "人气榜", "热榜"),
-     ("get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason")),
-    ("limit_pool",
-     ("涨停", "跌停", "炸板", "连板", "封板", "打板", "首板", "接力", "晋级"),
-     ("get_limit_pool", "get_limit_pool", "get_dragon_tiger", "get_limit_pool")),
-    ("screen",
-     ("筛选", "选股", "选出", "找出", "挑出", "有哪些", "股票池", "排行"),
-     ("search_stocks", "get_screener_presets", "build_keyword_from_filters")),
-    ("technical",
-     ("技术面", "技术分析", "指标", "macd", "kdj", "rsi", "金叉", "死叉", "形态",
-      "布林", "背驰", "背离", "量能"),
-     ("technical_analysis", "analyze_trend", "calculate_ma", "indicator_analysis",
-      "analyze_chart_patterns", "get_obv_analysis", "get_volume_analysis",
-      "list_indicators")),
-    ("intel_news",
-     ("消息面", "新闻", "公告", "研报", "舆情", "利好", "利空", "政策", "事件驱动", "传闻"),
-     ("search_stock_intel", "search_sector_intel", "search_policy_intel",
-      "search_comprehensive_intel", "search_policy_intel")),
-    ("market_overview",
-     ("大盘", "指数", "市场概览", "沪深", "上证", "创业板指", "行情总览"),
-     ("get_market_overview", "get_market_indices", "market_snapshot", "get_market_indices")),
-    ("sentiment",
-     ("情绪", "恐贪", "赚钱效应", "亏钱效应", "情绪周期", "高潮", "冰点"),
-     ("get_market_overview", "get_market_overview", "fear_greed_index", "get_market_overview")),
-    ("chip",
-     ("筹码", "成本分布", "获利盘", "套牢盘", "筹码集中度"),
-     ("get_chip_distribution",)),
-    ("backtest",
-     ("回测", "胜率", "收益率", "绩效", "策略表现", "历史表现"),
-     ("run_backtest", "get_backtest_history", "list_strategies", "get_strategy_detail")),
-    ("lockup",
-     ("解禁", "限售"),
-     ("get_lockup_expiry",)),
-    ("dividend",
-     ("分红", "股息", "派息"),
-     ("get_capital_summary",)),
-    ("signals",
-     ("信号", "买点", "卖点", "触发条件"),
-     ("search_stock_intel", "run_indicator_signal", "list_strategies", "strategy_keys")),
+# 工具名必须逐字来自 provider 注册表（CI 断言见 tests/test_wiring.py 的 plan_linter 段）。
+from domain_registry import (
+    iter_data_domains as _iter_data_domains,
+    list_consumers as _list_consumers,
+    list_producers as _list_producers,
 )
+
+_DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = _iter_data_domains()
 
 # 域 → 候选工具（派生视图，供调用方/CI 断言使用；勿单独维护）
 DATA_DOMAIN_TOOLS: Dict[str, Tuple[str, ...]] = {d: t for d, _kw, t in _DATA_DOMAINS}
 # 域 → 首选工具
 _PREFERRED: Dict[str, str] = {d: t[0] for d, _kw, t in _DATA_DOMAINS}
 
-# ── R2 依赖登记表 ──────────────────────────────────────────────────────────
+# ── R2 依赖登记表 ─────────────────────────────────────────────
 # 生产者：调用后产出"一批代码/一个股票池"（下游必须等它跑完才知道做什么）。
-LIST_PRODUCERS = frozenset({
-    "search_stocks", "get_limit_pool", "get_limit_pool", "get_dragon_tiger", "get_limit_pool",
-    "get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason",
-    "get_dragon_tiger", "query_dragon_tiger", "lhb",
-    "get_hot_sectors", "get_hot_sectors", "get_sector_stocks",
-    "get_hot_sectors", "get_industry_ranking", "get_industry_ranking",
-    "list_strategies", "search_stock_intel", "all_codes", "list_strategies",
-})
+LIST_PRODUCERS = _list_producers()
 # 消费者：以"单票 / codes 清单"为单位取数或分析（输入依赖上一步的清单）。
-LIST_CONSUMERS = frozenset({
-    "agent_get_kline", "get_realtime_quote", "quote", "technical_analysis",
-    "analyze_trend", "analyze_pattern", "analyze_chart_patterns", "calculate_ma",
-    "indicator_analysis", "get_obv_analysis", "get_volume_analysis",
-    "get_fund_flow", "get_fund_flow_daily", "get_chip_distribution",
-    "get_stock_info", "get_stock_sector_info", "get_stock_concept_blocks",
-    "search_stock_intel", "batch_valuation_compare", "get_capital_summary", "get_stock_info",
-    "resolve_stock", "get_lockup_expiry", "get_capital_summary", "run_indicator_signal",
-})
+LIST_CONSUMERS = _list_consumers()
 
 
 def detect_domains(text: str) -> List[str]:

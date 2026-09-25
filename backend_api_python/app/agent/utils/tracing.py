@@ -36,14 +36,9 @@ logger = logging.getLogger(__name__)
 # 非金融任务（天气/新闻/生活查询）由意图分类器标 task_type=general，
 # general 不在此表 → domain/noun 兜底 unknown → finish 防毒丸逻辑跳过入库。
 # 若意图分类器仍把非金融任务标成 query，链名会错记 finance+query+stock（污染酿造候选）。
-_VERB_CLASSIFY = {
-    "screen":   {"domain": "finance", "noun": "stock"},
-    "analysis": {"domain": "finance", "noun": "stock"},
-    "compare":  {"domain": "finance", "noun": "stock"},
-    "query":    {"domain": "finance", "noun": "stock"},
-    "code":     {"domain": "finance", "noun": "strategy"},
-    "explain":  {"domain": "finance", "noun": "indicator"},
-}
+# 2026-09-25：verb→(domain,noun) 已抽到 domain_registry / tools/<domain>/domain_meta.py，
+# 核心不再写死 finance/stock；新领域在 domain_meta 登记即可参与追溯归类。
+from domain_registry import classify_verb as _classify_verb
 
 
 def _now_ms() -> int:
@@ -662,7 +657,7 @@ class AgentTraceRecorder:
             # 2026-09-19（重设计 V1）：domain/noun 兜底解耦——domain 可由 plan_node
             # 补写（set_intent(domain=...)），noun 缺失时无论 domain 来源如何都按
             # verb 归类补齐；否则 domain 有值会抑制 noun 兜底，链名残留 unknown 段。
-            _cls = _VERB_CLASSIFY.get(self.intent_verb)
+            _cls = _classify_verb(self.intent_verb)
             if not self.domain and _cls:
                 self.domain = _cls.get("domain", "")
             if not self.intent_noun and _cls:
