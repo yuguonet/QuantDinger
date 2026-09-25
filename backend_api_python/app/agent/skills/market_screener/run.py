@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 from app.agent.log import logger
 from skills.market_screener._helpers import (
     select_strategy, analyze_batch, build_report, resolve_names,
+    enrich_predictive,
     filter_candidates as _filter_candidates,
 )
 from skills.market_screener.common import SkillReport, SkillResult
@@ -106,6 +107,15 @@ def deep_analyze(codes: str) -> Dict[str, Any]:
             max_candidates=15,
         )
 
+    # 2026-09-25：技术分只是初筛/解释；最终 score= P(T+1涨)×100，按预测分+情绪分桶重排
+    # market 从 pre_screen 结果透传（deep_analyze 单独调用时用当前 assess）
+    _market = {}
+    try:
+        from .intraday import assess_market_state
+        _market = assess_market_state() or {}
+    except Exception:
+        _market = {}
+    raw = enrich_predictive(raw, market=_market)
     report = build_report(raw)
 
     # 构建输出

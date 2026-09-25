@@ -6,6 +6,8 @@ market_screener/_helpers.py
 """
 
 from datetime import date, datetime, time
+
+from app.agent.log import logger
 from typing import Any, Dict, List
 
 
@@ -66,6 +68,125 @@ def analyze_batch(items: list, fn, max_candidates: int = 8) -> list:
     return results
 
 
+# ── 预测分（P(T+1涨)×100）──────────────────────────────────────
+# 2026-09-25：原 analyze_code 是手拍分档（+5/-3 累加），对次日涨跌无标定，
+# 选股排序质量低。复用 app/watchlist.predict 的已标定 T+1 预测（AUC≈0.61），
+# score 语义统一为「次日上涨概率×100」，技术形态只作解释与轻量门闩。
+
+_MKT_KLINES_CACHE = {"data": None}
+
+
+def _market_klines():
+    if _MKT_KLINES_CACHE["data"] is None:
+        try:
+            from app.watchlist.predict import load_market_klines
+            _MKT_KLINES_CACHE["data"] = load_market_klines(120) or []
+        except Exception:
+            _MKT_KLINES_CACHE["data"] = []
+    return _MKT_KLINES_CACHE["data"]
+
+
+def _norm_bars(bars: list) -> list:
+    """fetch_kline 的 time 是日期串；predict._by_day 要 int 时间戳。"""
+    from datetime import datetime as _dt
+    out = []
+    for b in bars or []:
+        if not isinstance(b, dict):
+            continue
+        x = dict(b)
+        tm = x.get("time")
+        if isinstance(tm, str):
+            try:
+                x["time"] = int(_dt.strptime(tm[:10], "%Y-%m-%d").timestamp())
+            except Exception:
+                continue
+        out.append(x)
+    return out
+
+
+def _mood_regime(market: dict) -> str:
+    """情绪分桶：strong / neutral / weak。"""
+    market = market or {}
+    mood = str(market.get("mood") or "")
+    try:
+        ms = float(market.get("mood_score", 50) or 50)
+    except Exception:
+        ms = 50.0
+    if mood in ("弱势", "偏弱") or ms < 40:
+        return "weak"
+    if mood in ("偏强",) or ms >= 70:
+        return "strong"
+    return "neutral"
+
+
+def enrich_predictive(results: list, market: dict = None) -> list:
+    """给每只候选打 P(T+1涨) 分，按情绪分桶裁剪，再按预测分降序重排。
+
+    - 有预测：score = p_up*100（情绪弱时对涨停活跃源做小幅折价）
+    - 门槛：weak ≥0.55 / neutral ≥0.50 / strong ≥0.48；无预测的垫底且不进最终推荐
+    - 条数：weak 5 / neutral 8 / strong 10
+    """
+    if not results:
+        return []
+    regime = _mood_regime(market)
+    from .common import fetch_kline
+    try:
+        from app.watchlist.predict import predict_next_day
+    except Exception as e:
+        logger.warning("[MktScreen] 预测模块不可用，退化为技术分: %s", e)
+        return list(results)
+
+    mk = _market_klines()
+    out = []
+    for r in results:
+        if not isinstance(r, dict) or not r.get("code"):
+            continue
+        item = dict(r)
+        item.setdefault("tech_score", item.get("score", 50))
+        try:
+            bars = _norm_bars(fetch_kline(item["code"], days=120))
+            pred = predict_next_day(bars, mk) if bars else None
+        except Exception as e:
+            logger.debug("[MktScreen] predict %s 失败: %s", item.get("code"), e)
+            pred = None
+        if pred and pred.get("score") is not None:
+            p_up = float(pred.get("p_up") or 0.5)
+            # 情绪弱时对涨停活跃源折价：连板/炸板题材在弱势市次日溢价差
+            src = str(item.get("source") or "")
+            if regime == "weak" and any(k in src for k in ("连板", "4IN1", "龙回头", "涨停")):
+                p_up = max(0.05, p_up * 0.92)
+                item["mood_haircut"] = 0.92
+            item["score"] = round(p_up * 100, 1)
+            item["p_up"] = round(p_up, 4)
+            item["exp_ret_bp"] = pred.get("exp_ret_bp")
+            item["direction"] = (
+                "bullish" if p_up >= 0.55 else ("bearish" if p_up <= 0.45 else "neutral")
+            )
+            item["pred"] = {
+                "beta": (pred.get("beta") or {}).get("beta"),
+                "regime": (pred.get("beta") or {}).get("regime"),
+                "zhuang": (pred.get("zhuang") or {}).get("score"),
+                "market_p_up": (pred.get("market") or {}).get("p_up"),
+                "mood_regime": regime,
+            }
+            item["has_pred"] = True
+        else:
+            item["has_pred"] = False
+        out.append(item)
+
+    thr = {"weak": 0.55, "neutral": 0.50, "strong": 0.48}[regime]
+    cap = {"weak": 5, "neutral": 8, "strong": 10}[regime]
+    kept = [x for x in out if x.get("has_pred") and (x.get("p_up") or 0) >= thr]
+    kept.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    kept = kept[:cap]
+    kept_ids = {id(x) for x in kept}
+    for x in out:
+        x["selected"] = id(x) in kept_ids
+    dropped = [x for x in out if id(x) not in kept_ids]
+    dropped.sort(key=lambda x: x.get("score") or x.get("tech_score") or 0, reverse=True)
+    return kept + dropped
+
+
 def build_report(results: list):
     """从分析结果列表构建 SkillReport。"""
     from .common import SkillReport
@@ -78,7 +199,9 @@ def build_report(results: list):
             signal="无有效分析结果",
         )
 
-    scores = [v.get("score", 50) for v in valid]
+    # 组合评分取 Top5 均值：反映「最终推荐质量」，避免被垫底候选拉平
+    _ranked = sorted(valid, key=lambda v: v.get("score") or 0, reverse=True)
+    scores = [v.get("score", 50) for v in _ranked[:5]] or [50]
     directions = [v.get("direction", "neutral") for v in valid]
     avg_score = sum(scores) / len(scores)
 
@@ -126,6 +249,7 @@ def filter_candidates(prescreen_result: Dict) -> str:
 
     mood = market.get("mood", "")
     mood_score = market.get("mood_score", 50)
+    regime = _mood_regime(market)
 
     filtered = []
     for c in candidates:
@@ -134,9 +258,22 @@ def filter_candidates(prescreen_result: Dict) -> str:
         change = abs(c.get("change_pct", 0) or 0)
         trn = c.get("turnover_pct", 0) or 0
         reason = c.get("reason", "") or ""
+        name = str(c.get("name") or "")
+        price = c.get("price") or 0
 
-        if src in ("ST股",) or trn < 2:
+        if src in ("ST股",) or "ST" in name.upper() or trn < 2:
             continue
+        # 价格带：仙股/过高价流动性与可交易性差
+        try:
+            if price and (float(price) < 2 or float(price) > 300):
+                continue
+        except Exception:
+            pass
+
+        # 情绪弱势：涨停活跃源需题材/理由支撑，否则丢弃（打板退潮）
+        if regime == "weak" and any(k in src for k in ("连板", "4IN1", "龙回头")):
+            if not reason:
+                continue
 
         if strategy == "post_market":
             # 热点题材且 reason 涉及主线
