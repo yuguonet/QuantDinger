@@ -133,6 +133,12 @@ class StrategyBase:
     exit_exec_same_day: bool = False
     rolling_preview: bool = False
     data_needs: tuple = ("daily",)     # 数据需求声明 (hub 注入; 当前声明制 Phase 1: 仅元数据)
+    # ---- 做T 腿 (可选, T14 骨架 2026-09-26) ----
+    # 只在已持仓日生效; 约束由 MarketSpec.intraday_t0 / direction 推出 (core 不特判 A股)。
+    # 声明形态: {"enabled": True, "max_legs_per_day": 2, "legs": [{"action":"sell",
+    #   "qty_pct":50, "trigger": <callable|已求值bool>, "label":"冲高减半"}, ...]}
+    # 复杂网格/依赖成交回报 → 本类方法 t_leg_intents() 逃生舱覆盖。
+    t_legs: dict = field(default_factory=dict)
 
     # ---- 信号判定 (回测即信号: 实盘 as_of=None 只判末根bar; 回测 as_of=k 判第k根) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
@@ -170,20 +176,12 @@ class StrategyBase:
     # 2026-09-18 P1: entry/confirm/exit 均有智能默认实现 (见类尾), 按需覆盖;
     # 仅 scan_signals 保持抽象必填。
 
-    # ---- 回测钩子 (2026-09-10 插件化: 新策略实现本钩子即入回测流水线, backtest.py 零改动) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
-                      probe=None):
-        """单股全历史日线枚举回测 → trades 列表; 默认 None = 无日线枚举回测。
-
-        契约:
-          - 与实盘同一份 scan_signals (as_of 切片语义), 出场引擎 lazy import backtest.py
-            (插件先加载也不成环: backtest.py 顶层只 import 插件常量, 引擎调用发生在运行期);
-          - trades 字段与基线 JSON 对齐 (entry_date/entry_price/return_pct/exit_day/...);
-          - 枚举内的去重/预过滤锚点/D1过滤属策略规则, 写在插件内, 编排层 (backtest.run_all)
-            只做全市场循环与统计。
-        盘中窗口策略 (tail/knife) 不实现, 走各自验证脚本。
-        """
-        return None
+    # ---- 回测钩子 ----
+    # backtest_stock 见文末「通用回测引擎」段 (2026-09-18 P2 起提供智能默认,
+    # 新策略零回测代码; 契约: 与实盘同一份 scan_signals, trades 字段对齐基线 JSON,
+    # 枚举内去重/预过滤/D1 过滤属策略规则; intraday_window 策略不适用)。
+    # 2026-09-26: 删除此前「默认返回 None」的死 stub —— 它被文末通用引擎定义覆盖,
+    # 误导读代码的人以为默认无回测能力。
 
     def day_prefilter(self, frame, pc_map):
         """日级必要条件超集预筛 (intraday_window 回测提速, 2026-09-10; 默认 None=不预筛)。
@@ -198,6 +196,19 @@ class StrategyBase:
           - 与实盘无交互 (实盘全市场快照本就现成, 无需此钩子), 回测专用。
         """
         return None
+
+    def t_leg_intents(self, position, ctx, *, hold_day, spec=None, already=None):
+        """做T 腿意图 (T14 骨架) — 默认走 t_legs 声明 + core.t_legs.eval_t_legs。
+
+        返回 list[TradeIntent]。覆盖本方法 = 复杂网格/依赖成交回报的逃生舱。
+        只在已持仓日由上层 (monitor/回测时间线) 调用; 本方法不写库、不成交。
+        """
+        from app.market_cn.auto.core.t_legs import TLegsConfig, eval_t_legs
+        cfg = TLegsConfig.from_dict(self.t_legs)
+        if cfg is None:
+            return []
+        return eval_t_legs(position, ctx, cfg, hold_day=hold_day,
+                           spec=spec, already=already)
 
     def intraday_exit(self, bars, code, entry_date, entry_price, entry_idx=None, **params):
         """时间线引擎 (intraday_window 回测) 的出场回调 —— 默认 = 次交易日开盘卖。

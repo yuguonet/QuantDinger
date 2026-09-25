@@ -34,6 +34,8 @@ _DATA_INTENT_RE = re.compile(
     r"(多少钱|什么价|价格|股价|现价|收盘价|开盘价|涨跌幅|涨跌|涨幅|跌幅|行情|报价|市值|"
     r"市盈率|市净率|财报|营收|净利润|资金流|主力|换手|成交量|成交额|估值|股息|分红)", re.I)
 _DIRECT_ANSWER_NUM_RE = re.compile(r"\d+(?:\.\d+)?\s*[%％元]|\d{4,}(?:\.\d+)?")
+# 科学常数/定义值白名单（光速/π/g 等）：定义类数字不拦，只拦行情财务动态数
+SCIENCE_CONST_RE = re.compile(r"(光速|声速|重力|引力常数|普朗克|阿伏|圆周率|pi|π|黄金分割|绝对零度|常数)", re.I)
 
 # ── 记忆注入按不可信数据包裹（2026-09-24 提智 0.6）──────────────────────
 # memory 是用户可控文本（间接提示注入面）：注入 prompt 时加层级声明 + 指令式内容降权丢弃。
@@ -863,7 +865,9 @@ def make_chat_node(ctx: NodeContext):
         # 直答必然编造/过时。命中即转 task 并留痕（校验环自证：forced_task 计数可观测）。
         if not needs_task and (entity_code or entity_name):
             _hit = _DATA_INTENT_RE.search(user_input or "")
-            if _hit:
+            # 科学常数/定义类（光速、π…）是静态知识，不强制走 task 取数
+            _sci = SCIENCE_CONST_RE.search(user_input or "") if _hit else None
+            if _hit and not _sci:
                 needs_task = True
                 task_type = task_type or "query"
                 logger.info("[Chat] 实体+数据意图（命中词：%s）→ 禁止 direct_answer，强制走 task",
@@ -898,7 +902,8 @@ def make_chat_node(ctx: NodeContext):
             # 数字禁令输出侧自证（原则 7）：只记账不阻断（拒收误伤成本高于漏报）；
             # 截获率长期非零再升级为硬拦截/转 task。
             _num_hit = _DIRECT_ANSWER_NUM_RE.search(direct_answer or "")
-            if _num_hit:
+            _sci_q = SCIENCE_CONST_RE.search(user_input or "")
+            if _num_hit and not _sci_q:
                 logger.warning("[Chat] direct_answer 含数字形态（禁令截获）: %s", _num_hit.group(0))
                 _tr = state.get("_trace")
                 if _tr:

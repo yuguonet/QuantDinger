@@ -4,8 +4,9 @@
       与龙虎榜落库 dragon_hot_daily(17:00+重试) 之后; 2026-09-18 由 16:30 重排)
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
-  2. 全市场逐股跑策略判定 (与回测同一份判定, core facade):
-     dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
+  2. 全市场逐股跑策略判定 (与回测同一份判定, core facade)。
+     策略清单以注册表为准 (autodiscover + config enabled 且 kind=daily_close):
+     现网 dragon_callback / v1 / break / g56 等; 盘中窗口类走 run_scan_knife
   3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
 
@@ -120,6 +121,72 @@ def _anchor_idx(bars, sig, strat):
     return n - 1
 
 
+def apply_unified_prefilter(sigs, bars, code, code_info, strat):
+    """U1~U4 应用循环 (2026-09-26 P0-4 唯一实现)。
+
+    对每条 Signal 取锚点 → unified_prefilter; use_unified_prefilter=False 的策略
+    原样放行 (knife/tail/g56 与回测口径一致)。run_scan / run_scan_knife /
+    rebuild / core.backtest 四处共用, 改过滤逻辑只改这里。
+
+    Returns:
+        (kept, last_fails): kept=通过的 Signal 列表; last_fails=最后一次失败明细
+        (供探针 stage=prefilter 归因; 无失败则 None)。
+    """
+    if not sigs:
+        return [], None
+    if not getattr(strat, "use_unified_prefilter", True):
+        return list(sigs), None
+    from app.market_cn.auto.core.filters import unified_prefilter
+    kept = []
+    last_u_fails = None
+    for s in sigs:
+        idx = _anchor_idx(bars, s, strat)
+        if idx is None:
+            continue
+        ok, fails = unified_prefilter(bars, idx, code, code_info)
+        if ok:
+            kept.append(s)
+        else:
+            last_u_fails = fails
+    return kept, last_u_fails
+
+
+def finalize_signal_rows(rows, logger=None):
+    """落库前归一 (2026-09-26 P0-4 唯一实现): 同族去重 → daily_limit 截断。
+
+    顺序铁律 (与 run_scan 既有行为一致):
+      1. _dedupe_family 先做 —— 高版本替代低版本, 避免低版本占掉限额名额;
+      2. daily_limit 按 strategy 分组, score 降序截断 (0=不截断)。
+
+    Args:
+        rows: store.signal_row 产出的 dict 列表 (须含 strategy/code/score)
+        logger: 可选, 用于记录截断日志
+
+    Returns:
+        list[dict]: 归一后的行 (新列表)
+    """
+    if not rows:
+        return []
+    rows = _dedupe_family(rows)
+    from app.market_cn.auto import strategies as strat_reg
+    capped = []
+    keys = []
+    for r in rows:
+        k = r["strategy"]
+        if k not in keys:
+            keys.append(k)
+    for key in keys:
+        grp = [r for r in rows if r["strategy"] == key]
+        cap = strat_reg.daily_limit(key)
+        if cap and len(grp) > cap:
+            if logger is not None:
+                logger.info("[postfilter] %s 信号 %d 笔超限额, 截断至 %d (score降序)",
+                            key, len(grp), cap)
+            grp = sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
+        capped.extend(grp)
+    return capped
+
+
 # ================================================================
 # 主扫描
 # ================================================================
@@ -200,20 +267,8 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
                     logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
                     continue
                 # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
-                kept = []
-                last_u_fails = None
-                if not getattr(strat, "use_unified_prefilter", True):
-                    kept = list(sigs)
-                else:
-                    for s in sigs:
-                        idx = _anchor_idx(bars, s, strat)
-                        if idx is None:
-                            continue
-                        ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
-                        if ok:
-                            kept.append(s)
-                        else:
-                            last_u_fails = _fails
+                kept, last_u_fails = apply_unified_prefilter(
+                    sigs, bars, code, stock_info.get(code), strat)
                 # M1 采样: 判定步有落点才记 (stage 口径镜像回测 — U1~U4 拒=prefilter,
                 # 全过=signal, 其余取当日最深判定步); sig 传 dict (Signal dataclass 落盘可读)
                 if live_probes is not None and _probe_ok.get(key) and (day_tr.items or sigs):
@@ -236,24 +291,11 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         for _pr in (live_probes or {}).values():
             _pr.close()
 
-    # 展示归一: 同族版本链重叠 → 高版本优先 (在 daily_limit 截断之前,
-    # 避免低版本限额名额浪费在会被高版本替代的行上)
+    # 展示归一 + 每日限额 (2026-09-26 P0-4: 唯一实现 finalize_signal_rows)
     _n_raw = len(rows)
-    rows = _dedupe_family(rows)
+    rows = finalize_signal_rows(rows, logger=logger)
     if len(rows) != _n_raw:
-        logger.info("[dragon_scan] 展示归一: 同族重叠去重 %d → %d (高版本优先)",
-                    _n_raw, len(rows))
-
-    # 每日信号入库上限 (per-strategy 全市场口径, config.json daily_limit; score 降序截断)
-    capped = []
-    for key in active:
-        grp = [r for r in rows if r["strategy"] == key]
-        cap = strat_reg.daily_limit(key)
-        if cap and len(grp) > cap:
-            logger.info("[dragon_scan] %s 信号 %d 笔超限额, 截断至 %d (score降序)", key, len(grp), cap)
-            grp = sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
-        capped.extend(grp)
-    rows = capped
+        logger.info("[dragon_scan] 同族去重+限额截断: %d → %d", _n_raw, len(rows))
 
     result = store.upsert_scan_signals(target, rows)
     store.sync_watchlist_group(store.get_active_signals())
@@ -264,7 +306,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True):
-    """盘中窗口扫描 (kind=intraday_window 策略: knife_catch / tail_oversold / dragon_callback)。
+    """盘中窗口扫描 (kind=intraday_window 策略, 由注册表动态收集: 现为 knife_catch / tail_oversold)。
 
     调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
     流程:
@@ -358,16 +400,8 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                 # U1~U4 统一预过滤 (与盘后 run_scan 同源; 锚点由策略 prefilter_anchor 声明)。
                 # 只有声明 use_unified_prefilter=True 的策略走本段 —— knife/tail 声明 False,
                 # 行为逐字不变; 否则盘中实盘会缺 U1~U4 而与其回测口径分叉。
-                if sigs and getattr(strat, "use_unified_prefilter", True):
-                    kept = []
-                    for s in sigs:
-                        idx = _anchor_idx(bars, s, strat)
-                        if idx is None:
-                            continue
-                        ok, _fails = unified_prefilter(bars, idx, code, stock_info.get(code))
-                        if ok:
-                            kept.append(s)
-                    sigs = kept
+                sigs, _u_fails = apply_unified_prefilter(
+                    sigs, bars, code, stock_info.get(code), strat)
                 for s in sigs:
                     row = store.signal_row(key, s, name)
                     row["state"] = getattr(strat, "signal_state", "watch_pending")
@@ -377,6 +411,8 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
                         row["stop_price"] = strat.initial_stop(code, float(s.price or 0))
                     rows.append(row)
             # daily_limit (config.json; 0=不截断 — 用户裁定: 全拿优于Top3截断)
+            # 2026-09-26 P0-4: 复用 finalize_signal_rows 的限额段语义 (本处只截当前策略,
+            # 不去重 — 盘中窗口无同族版本链问题, 且 finalize 会误伤其它策略行)。
             grp = [r for r in rows if r["strategy"] == key]
             cap = strat_reg.daily_limit(key)
             if cap and len(grp) > cap:

@@ -842,18 +842,14 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
         _last_rule = "time"
 
     # 末日落入无法卖出状态 → 顺延下一可交易日开盘强平 (连续一字逐日跳过)
+    # 2026-09-26 P1-7b: 骨架走 core.exit_engines.defer_force_open
     if last_unfilled or pending_dn:
-        nxt = entry_idx + exit_d + 1
-        while nxt < len(bars):
-            nb = bars[nxt]
-            pc = bars[nxt - 1]['close']
-            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
-            if dn2 is not None and nb['low'] == nb['high'] and abs(nb['low'] - dn2) <= dn2 * 0.002:
-                last_unfilled, pending_dn = True, False
-                nxt += 1
-                continue
-            exit_p, exit_d = nb['open'], nxt - entry_idx + 1
-            break
+        from app.market_cn.auto.core.exit_engines import defer_force_open
+        _def = defer_force_open(bars, entry_idx, exit_d,
+                                last_unfilled=last_unfilled, pending_dn=pending_dn,
+                                board_type=board_type)
+        if _def is not None:
+            exit_p, exit_d = _def[0], _def[1]
 
     return {
         'exit_price': round(exit_p, 3), 'exit_day': exit_d,
@@ -1089,3 +1085,21 @@ register_strategy_funcs(
     'break',
     {"feat": bk_feat, "turnover_sig": turnover_sig},
 )
+
+
+# ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
+def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag):
+    """断板 combo 出场 (止损/追踪/峰值逃顶/到期, 分板块) — 供 YAML exit.mode=break_combo。"""
+    from app.market_cn.auto.core.exit_modes import _bp
+    return _run_backtest_breakbuy(
+        bars, entry_idx, entry_price,
+        _bp(params, board_type, "hold_days"),
+        _bp(params, board_type, "stop_loss"),
+        _bp(params, board_type, "trailing_stop"),
+        board_type,
+        _bp(params, board_type, "fill_mode"),
+    )
+
+
+from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
+_register_exit("break_combo", _exit_break_combo)

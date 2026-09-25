@@ -77,6 +77,7 @@ _STATE_TABLE = "qd_auto_strategy_state"
 _SNAPSHOT_KEY = "strategy_fingerprint"
 
 # 可被「退休」的状态 —— 见模块 docstring 硬约束, 只有未入场的行
+# 2026-09-26: 唯一实现 = store.retire_unfilled (本常量仅作语义备忘, 不再被 SQL 使用)
 _RETIREABLE_STATES = ("watch_pending",)
 
 # 补扫最长等待数据就绪的时间 (后台线程, 不阻塞启动)
@@ -415,6 +416,9 @@ def diff(prev_detail, now_detail):
 def retire_unfilled(keys, reasons=None):
     """作废指定策略「未入场」的活跃行 (watch_pending 且 entry_date IS NULL)。
 
+    2026-09-26: SQL 唯一实现已收编至 ``store.retire_unfilled``; 本函数保留原签名作
+    薄包装 (startup 只关心 {key: count}, 详细行集见 store)。
+
     Args:
         keys: 策略 key 列表 (应为已被禁用或从 config 移除的 key)
         reasons: {key: 作废原因文案}
@@ -425,30 +429,13 @@ def retire_unfilled(keys, reasons=None):
     keys = [k for k in (keys or []) if k]
     if not keys:
         return {}
-    from app.utils.db import get_db_connection
-    retired = {}
-    try:
-        with get_db_connection() as db:
-            cur = db.cursor()
-            for k in keys:
-                cur.execute(
-                    "SELECT id, code, trade_date FROM qd_dragon_signals "
-                    "WHERE strategy = %s AND state = ANY(%s) AND entry_date IS NULL",
-                    (k, list(_RETIREABLE_STATES)),
-                )
-                rows = [dict(r) for r in cur.fetchall()]
-                reason = (reasons or {}).get(k) or "策略已停用, 未入场信号作废"
-                for r in rows:
-                    cur.execute(
-                        "UPDATE qd_dragon_signals SET state = %s, updated_at = NOW(), "
-                        "extra = extra || %s::jsonb WHERE id = %s",
-                        ("expired", json.dumps({"reason": reason}, ensure_ascii=False), r["id"]),
-                    )
-                retired[k] = len(rows)
-            db.commit()
-            cur.close()
-    except Exception as e:
-        logger.warning("[auto_startup] 停用策略行作废失败: %s", e)
+    from app.market_cn.auto.store import retire_unfilled as _retire
+    rows = _retire(keys=keys, reason_by_key=reasons or {})
+    retired = {k: 0 for k in keys}
+    for r in rows:
+        k = r.get("strategy")
+        if k in retired:
+            retired[k] += 1
     return retired
 
 

@@ -307,6 +307,71 @@ def set_state(sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol
         cur.close()
 
 
+def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信号作废",
+                    reason_by_key=None, dry_run=False):
+    """作废「未入场」活跃行 —— 停用策略清扫的**唯一实现** (2026-09-26 P0-3 收编)。
+
+    红线 (与 rebuild/startup 既有约定一致, 变更须用户裁定):
+      - 只碰 ``state='watch_pending' AND entry_date IS NULL`` 的行;
+      - 已入场行 (buy_today/holding/exit_today/closed) 一律不动 ——
+        停用策略的已入场行必须继续可见, 否则用户会遗忘卖出 (资金事故)。
+
+    Args:
+        keys: 按策略 key 批量清扫 (startup / rebuild plan)
+        ids:  按行 id 清扫 (rebuild apply / monitor); 写库前仍复核 state/entry_date
+        reason: 默认作废原因文案 (写入 extra.reason)
+        reason_by_key: {key: 文案} 覆盖默认 (startup 的 per-strategy 说明)
+        dry_run: True=只查不写 (rebuild plan/影子审计)
+
+    Returns:
+        list[dict]: 被作废/将被作废的行 ``{id, strategy, code, trade_date}``。
+        调用方按 strategy 分组即得 {key: count}。
+    """
+    if not keys and not ids:
+        return []
+    from app.utils.db import get_db_connection
+    sql_sel = (
+        "SELECT id, strategy, code, trade_date FROM {_t} "
+        "WHERE state = %s AND entry_date IS NULL"
+    )
+    rows = []
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            if keys:
+                cur.execute(
+                    sql_sel.format(t=_SIGNALS_TABLE) + " AND strategy = ANY(%s)",
+                    (S_WATCH_PENDING, list(keys)))
+                rows = [dict(r) for r in cur.fetchall()]
+            if ids:
+                cur.execute(
+                    sql_sel.format(t=_SIGNALS_TABLE) + " AND id = ANY(%s)",
+                    (S_WATCH_PENDING, list(ids)))
+                seen = {r["id"] for r in rows}
+                for r in cur.fetchall():
+                    d = dict(r)
+                    if d["id"] not in seen:
+                        rows.append(d)
+            if dry_run or not rows:
+                cur.close()
+                return rows
+            for r in rows:
+                why = (reason_by_key or {}).get(r.get("strategy")) or reason
+                cur.execute(
+                    f"UPDATE {_SIGNALS_TABLE} SET state = %s, updated_at = NOW(), "
+                    "extra = extra || %s::jsonb "
+                    "WHERE id = %s AND state = %s AND entry_date IS NULL",
+                    (S_EXPIRED,
+                     json.dumps({"reason": why}, ensure_ascii=False),
+                     r["id"], S_WATCH_PENDING))
+            db.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning("[store.retire_unfilled] 作废失败: %s", e)
+        return []
+    return rows
+
+
 def purge_stale_detail(keys, keep_state, keep_entry_date):
     """清除 extra 中过期的"瞬时标记"键, 保留 state=keep_state 且 entry_date=keep_entry_date 的行。
 

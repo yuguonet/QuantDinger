@@ -120,6 +120,89 @@ def _strategy_of(row):
     return strat_reg.get_strategy(row.get("strategy") or ds.DRAGON_STRATEGY)
 
 
+def _hold_day(row, today):
+    """持仓第几日 (1-based; 入场当日=1)。按日历日近似, 交易日精确版待 exec 层。"""
+    ed = str(row.get("entry_date") or "")[:10]
+    if not ed:
+        return 0
+    try:
+        from datetime import date
+        y1, m1, d1 = (int(x) for x in ed.split("-"))
+        y2, m2, d2 = (int(x) for x in str(today)[:10].split("-"))
+        return max(1, (date(y2, m2, d2) - date(y1, m1, d1)).days + 1)
+    except Exception:
+        return 2
+
+
+def _t_leg_position(row, today, spec=None):
+    """持仓行 → t_legs.eval_t_legs 的 position dict (含 sellable_qty)。
+
+    A股 T+1: 入场当日 sellable=0; 其后=仓位 (signals 表无数量列, 用 extra.position_qty
+    或默认 1.0 归一化仓位)。t0 市场 (spec.intraday_t0) 当日即可卖。
+    """
+    extra = row.get("extra") or {}
+    qty = float(extra.get("position_qty") or 1.0)
+    hold = _hold_day(row, today)
+    entry_today = str(row.get("entry_date") or "")[:10] == str(today)[:10]
+    try:
+        from app.market_cn.auto.core.market import default_market
+        sp = spec or default_market()
+        t0 = bool(getattr(sp, "intraday_t0", False))
+    except Exception:
+        t0 = False
+    sellable = qty if (t0 or not entry_today) else 0.0
+    return {"code": row.get("code"), "qty": qty, "sellable_qty": sellable,
+            "entry_price": float(row.get("entry_price") or 0), "hold_day": hold}
+
+
+def _eval_t_legs(row, s_obj, today, snap, series_rows):
+    """评估做T 腿 → list[dict] 意图 (只记不执行; 每日每行最多求值一轮)。
+
+    返回空列表表示无腿/不适用。结果写入 caller (extra.t_legs_today)。
+    幂等: extra.t_legs_today.date == today 时不重复求值 (60s tick 防刷)。
+    """
+    if s_obj is None or not getattr(s_obj, "t_legs", None) and \
+            not hasattr(s_obj, "t_leg_intents"):
+        return []
+    extra = row.get("extra") or {}
+    prev = extra.get("t_legs_today") or {}
+    if str(prev.get("date") or "")[:10] == str(today)[:10]:
+        return []   # 今日已评估
+    hold = _hold_day(row, today)
+    if hold < 1:
+        return []
+    pos = _t_leg_position(row, today)
+    if pos["sellable_qty"] <= 0 and hold <= 1:
+        return []
+    # ctx: 当日快照统计 (t_hilo 等示例约定)
+    from app.market_cn.auto.core.t_legs import t_constraints
+    stats = None
+    if snap:
+        try:
+            last = float(snap.get("last") or 0)
+            high = float(snap.get("high") or 0)
+            low = float(snap.get("low") or 0)
+            pc = float(snap.get("previousClose") or 0)
+            if last > 0 and pc > 0 and high > 0:
+                stats = {
+                    "last": last, "high": high, "low": low, "prev_close": pc,
+                    "day_gain_pct": (last / pc - 1) * 100,
+                    "pullback_from_high_pct": (last / high - 1) * 100 if high > 0 else 0.0,
+                }
+        except (TypeError, ValueError):
+            stats = None
+    ctx = {"snap": snap, "day": stats, "series": series_rows or [],
+           "sold_today_pct": float(extra.get("t_sold_today_pct") or 0)}
+    try:
+        intents = s_obj.t_leg_intents(pos, ctx, hold_day=hold) or []
+    except Exception as e:
+        logger.warning("[dragon_monitor] t_legs 求值失败 %s/%s: %s",
+                       row.get("code"), row.get("strategy"), e)
+        return []
+    out = [i.as_dict() if hasattr(i, "as_dict") else dict(i) for i in intents]
+    return out
+
+
 def evaluate_confirm(row, series_rows):
     """确认判定 (通用): 注册表分发 confirm_decision, snap={"series": [...]}。
 
@@ -203,16 +286,22 @@ def run_monitor():
             ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"})
         # 禁用策略的存量 pending 直接过期 (09-15 事故修复: 停扫只断新信号,
         # 已入库的 pending 行此前仍会在开盘窗口被买入)
-        disabled = []
+        # 2026-09-26: 批量走 store.retire_unfilled (唯一实现)。
+        disabled_codes = []
+        disabled_ids = []
+        reason_by_key = {}
         for r in list(cand):
             strat = r.get("strategy") or ds.DRAGON_STRATEGY
             if not strat_reg.is_enabled(strat):
-                ds.set_state(r["id"], ds.S_EXPIRED,
-                             detail={"reason": f"策略已禁用({strat}), 信号作废"})
+                disabled_ids.append(r["id"])
+                disabled_codes.append(r.get("code"))
+                reason_by_key[strat] = f"策略已禁用({strat}), 信号作废"
                 cand.remove(r)
-                disabled.append(r.get("code"))
-        if disabled:
-            logger.warning("[dragon_monitor] 禁用策略存量信号作废: %s", disabled)
+        if disabled_ids:
+            swept = ds.retire_unfilled(ids=disabled_ids,
+                                       reason_by_key=reason_by_key)
+            logger.warning("[dragon_monitor] 禁用策略存量信号作废: %s (n=%d)",
+                           disabled_codes, len(swept))
         if cand:
             snaps = latest_snapshot([r["code"] for r in cand])
             from collections import defaultdict as _dd
@@ -282,6 +371,20 @@ def run_monitor():
                 snap = snaps.get(r["code"])
                 if not snap:
                     continue
+                # ── 做T 腿 (T16): 已持仓日评估, 只记意图不执行; 先于 exit 判定 ──
+                if r.get("state") == ds.S_HOLDING:
+                    t_intents = _eval_t_legs(
+                        r, s_obj, today, snap,
+                        series_all.get(r["code"]) or [])
+                    if t_intents:
+                        detail = {"t_legs_today": {
+                            "date": today, "hm": hm, "intents": t_intents}}
+                        ds.set_state(r["id"], r["state"], detail=detail)
+                        stats["t_legs"] = stats.get("t_legs", 0) + len(t_intents)
+                        logger.info("[dragon_monitor] 做T意图 %s/%s n=%d: %s",
+                                    r.get("code"), r.get("strategy"),
+                                    len(t_intents),
+                                    [x.get("label") for x in t_intents])
                 px = float(snap.get("last") or 0)
                 stop_px = float(r.get("stop_price") or 0)
                 if px > 0 and stop_px > 0 and px <= stop_px:

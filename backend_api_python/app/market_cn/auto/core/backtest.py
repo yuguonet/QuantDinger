@@ -377,18 +377,10 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 # 锚点 prefilter_anchor)。仅声明 use_unified_prefilter=True 的策略走本段
                 # (knife/tail/g56 声明 False, 行为不变), 否则盘中回测会缺 U1~U4 而与其
                 # 实盘/日线回测口径分叉 (2026-09-20 收敛: 结构分叉 P0)。
-                if sigs and getattr(strat, "use_unified_prefilter", True):
-                    from app.market_cn.auto.core.filters import unified_prefilter
-                    from app.market_cn.auto.scan import _anchor_idx
-                    kept = []
-                    for s in sigs:
-                        idx = _anchor_idx(bars, s, strat)
-                        if idx is None:
-                            continue
-                        ok, _fails = unified_prefilter(bars, idx, code, _si.get(code))
-                        if ok:
-                            kept.append(s)
-                    sigs = kept
+                # 2026-09-26 P0-4: 应用循环收编至 scan.apply_unified_prefilter。
+                from app.market_cn.auto.scan import apply_unified_prefilter
+                sigs, _ = apply_unified_prefilter(
+                    sigs, bars, code, _si.get(code), strat)
                 if probe is not None:
                     rank = getattr(strat, "PROBE_STAGE_RANK", {})
                     stage = max((t["stage"] for t in slot_tr.items),

@@ -399,105 +399,29 @@ def _dragon_sample_feats(bars, i, code, stock_info=None, wave_start=None):
 
 def run_backtest_dragon_callback(bars, entry_idx, entry_price, hold_days=None,
                                  stop_loss=None, board_type="main", stop_at_idx=None, **params):
-    """龙回头出场模拟: 分段追踪止损 (as-of安全, 供回测与盘中持仓重放共用)。
+    """龙回头出场 — 2026-09-26 P1-7b: 骨架上收 core.exit_engines.run_trail_stop。
 
-    出场判定顺序 (每日, d>=2): 1)峰值逃顶 2)分段追踪+固定止损(合并, 先触发者成交)
-    3)到期/stop_at_idx截断。
-    现实约束见上方修正注释 (T+1 / 跳空按开盘 / 跌停顺延)。
-    stop_at_idx: 只模拟到该bar索引(盘中重放用); 未触发出场 → open=True。
-    跌停顺延成交价=次日开盘, 仅当次日 bar 存在且不超过 stop_at_idx (重放 as-of 安全)。
+    保留差异: 分段追踪 (trail_hi/lo + switch_pct)、峰值逃顶阈值、stop_at_idx 重放、
+    **不启用 trig_prev 守卫** (与历史 dragon 口径逐笔一致; v1 才启用)。
     """
     p = {**DRAGON_CB_PARAMS, **(params or {})}
     hold_days = p["hold_days"] if hold_days is None else hold_days
     stop_loss = p["stop_loss"] if stop_loss is None else stop_loss
     if entry_price <= 0 or entry_idx >= len(bars):
         return None
-    n = len(bars)
-    peak = entry_price
-    exit_p, exit_d, exit_reason = entry_price, 0, ""
-    capped = False
-    pending_dn = False        # 触发成交价触及跌停 → 次日开盘强平
-    last_unfilled = False     # 最后一日为一字跌停(整日无法卖出) → 到期顺延
-
-    for d in range(1, hold_days + 1):
-        idx = entry_idx + d - 1
-        if idx >= n:
-            break
-        if stop_at_idx is not None and idx > stop_at_idx:
-            capped = True
-            break
-        b = bars[idx]
-        if b["high"] > peak:
-            peak = b["high"]
-        prev_close = bars[idx - 1]["close"] if idx > 0 else 0
-        dn = _limit_dn_price(prev_close, board_type) if prev_close > 0 else None
-
-        # 跌停顺延: 前一交易日无法卖出 → 今日开盘强平
-        if pending_dn:
-            exit_p, exit_d, exit_reason = b["open"], d, "跌停顺延开盘"
-            break
-
-        # 一字跌停: 全天无成交可能, 持仓顺延 (不更新估值标记)
-        if is_one_word_limit_dn(b, dn):
-            last_unfilled = True
-            continue
-        last_unfilled = False
-
-        # T+1: 买入当日(d=1)不可卖出, 仅记录估值
-        if d > 1:
-            # 1. 峰值逃顶 (收盘判定收盘卖)
-            ret = (b["close"] / entry_price - 1) * 100
-            if ret > p["peak_exit_ret"]:
-                rng = b["high"] - b["low"]
-                upper = (b["high"] - max(b["open"], b["close"])) / rng * 100 if rng > 0 else 0
-                if upper > p["peak_exit_upper"] and b["close"] < b["high"] * 0.98:
-                    exit_p, exit_d, exit_reason = b["close"], d, "峰值逃顶"
-                    break
-
-            # 2/3. 分段追踪 + 固定止损 (合并: 价格连续, 先穿过更高触发线)
-            peak_ret = (peak / entry_price - 1) * 100
-            trail = p["trail_hi"] if peak_ret >= p["trail_switch_pct"] else p["trail_lo"]
-            trig_t = peak * (1 + trail / 100)
-            trig_s = entry_price * (1 + stop_loss / 100)
-            trig = max(trig_t, trig_s)
-            if b["low"] <= trig:
-                # 跳空穿越: 开盘已低于触发价 → 只能按开盘价成交
-                fill = fill_on_gap(b["open"], trig)
-                reason = f"追踪止损{trail}%" if trig_t >= trig_s else f"止损{stop_loss}%"
-                if fill_blocked_by_limit_dn(fill, dn):
-                    pending_dn = True   # 成交价触及跌停 → 卖不出
-                    continue
-                exit_p, exit_d, exit_reason = fill, d, reason
-                break
-
-        exit_p, exit_d = b["close"], d
-
-    if exit_reason == "" and not capped:
-        # 末日落入无法卖出状态 (一字跌停 / 触发成交触及跌停) → 顺延至下一可交易日
-        # 开盘强平; 连续一字跌停逐日跳过。注意 nxt 必须指向"未成交日的下一日":
-        # exit_d 是最后标记估值日(1-based), 未成交日 = exit_d+1, 顺延日 = exit_d+2。
-        nxt = entry_idx + exit_d + 1
-        while (last_unfilled or pending_dn) and nxt < n \
-                and (stop_at_idx is None or nxt <= stop_at_idx):
-            nb = bars[nxt]
-            pc = bars[nxt - 1]["close"]
-            dn2 = _limit_dn_price(pc, board_type) if pc > 0 else None
-            if dn2 is not None and nb["low"] == nb["high"] \
-                    and abs(nb["low"] - dn2) <= dn2 * 0.002:
-                last_unfilled, pending_dn = True, False   # 顺延日仍一字跌停, 再顺延
-                nxt += 1
-                continue
-            exit_p, exit_d, exit_reason = nb["open"], nxt - entry_idx + 1, "跌停顺延开盘"
-            break
-        if exit_reason == "":
-            exit_reason = "持仓到期"
-    return {
-        "exit_price": round(exit_p, 3), "exit_day": exit_d,
-        "exit_reason": exit_reason,
-        "return_pct": round((exit_p / entry_price - 1) * 100, 2),
-        "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
-        "open": bool(capped),
-    }
+    from app.market_cn.auto.core.exit_engines import run_trail_stop
+    result = run_trail_stop(
+        bars, entry_idx, entry_price,
+        hold_days=hold_days, stop_loss=stop_loss,
+        trails={"hi": p["trail_hi"], "lo": p["trail_lo"],
+                "switch_pct": p["trail_switch_pct"]},
+        board_type=board_type,
+        peak_exit={"ret": p["peak_exit_ret"], "upper": p["peak_exit_upper"]},
+        stop_at_idx=stop_at_idx,
+        use_trig_prev=False,   # dragon 历史口径: 用当日 peak 的 trig, 无 trig_prev 守卫
+        with_reason=True,
+    )
+    return result
 
 
 # ================================================================
@@ -1030,3 +954,13 @@ register_strategy_funcs(
         "gap_days": 1, "depth": 1, "yin": 1, "ma20_dev": 1, "ma20_dev_val": 1,
         "rsi6": 1, "tech_score": 1, "tech_rsi": 1, "tech_roc": 1, "tech_psy": 1},
 )
+
+
+# ---- exit_modes 注册 (2026-09-26 P1-9 层反转): core 不再 import 本模块 ----
+def _exit_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag):
+    """龙回头 combo 出场 (trail/stop/max_hold/peak/signal) — 供 YAML exit.mode=combo。"""
+    return run_backtest_dragon_callback(bars, entry_idx, entry_price, board_type=board_type)
+
+
+from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
+_register_exit("combo", _exit_combo)

@@ -120,7 +120,8 @@ def search_stock_intel(codes: str, name: str = "") -> dict:
         return _build_result(items, f"个股:{stock_code}")
 
     if len(code_list) == 1:
-        return _one(code_list[0])
+        from tools.base import as_code_envelope
+        return as_code_envelope(code_list[0], _one(code_list[0]))
 
     results = {}
     for code in code_list:

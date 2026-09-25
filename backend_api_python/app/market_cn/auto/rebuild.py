@@ -209,7 +209,9 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
 
     # ---- 逐日: U1~U4 → 同族去重 → daily_limit (与 run_scan 同序) ----
     # U1~U4 只对**已产出的信号**切片 (信号数远小于 5235×30), 不为每票每天切一次。
+    # 2026-09-26 P0-4: 应用循环走 scan.apply_unified_prefilter; 归一走 finalize_signal_rows。
     from app.market_cn.auto import strategies as strat_reg
+    from app.market_cn.auto.scan import apply_unified_prefilter, finalize_signal_rows
     expected = {}
     stat = defaultdict(lambda: {"raw": 0, "prefilter": 0, "kept": 0})
     for date in win:
@@ -219,26 +221,19 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
             stat[key]["raw"] += 1
             if getattr(strat, "use_unified_prefilter", True):
                 sub = bars_map[s.code][:bisect.bisect_right(idx_map[s.code], date)]
-                ai = _anchor_idx(sub, s, strat)
-                if ai is None:
-                    continue
-                ok, _ = unified_prefilter(sub, ai, s.code, stock_info.get(s.code))
-                if not ok:
+                kept, _ = apply_unified_prefilter(
+                    [s], sub, s.code, stock_info.get(s.code), strat)
+                if not kept:
                     stat[key]["prefilter"] += 1
                     continue
             name = (stock_info.get(s.code) or {}).get("name", "")
             rows.append(store.signal_row(key, s, name))
             stat[key]["kept"] += 1
-        rows = _dedupe_family(rows)
-        for key in active:
-            grp = [r for r in rows if r["strategy"] == key]
-            cap = strat_reg.daily_limit(key)
-            if cap and len(grp) > cap:
-                grp = sorted(grp, key=lambda r: r["score"], reverse=True)[:cap]
-            for r in grp:
-                # signal_row 不含 trade_date (它以 signal_date 表达); 写库需要显式 trade_date
-                r = dict(r, trade_date=date)
-                expected[(date, r["strategy"], r["code"])] = r
+        rows = finalize_signal_rows(rows, logger=logger)
+        for r in rows:
+            # signal_row 不含 trade_date (它以 signal_date 表达); 写库需要显式 trade_date
+            r = dict(r, trade_date=date)
+            expected[(date, r["strategy"], r["code"])] = r
 
     meta = {
         "days": days, "window": len(win), "win_from": lo, "win_to": hi,
@@ -343,24 +338,14 @@ def build_plan(expected, actual, meta):
 
     # ---- A. 停用策略清扫 (全表, 不依赖窗口) ----
     # 停用 = 不再提名新买入; 但已入场行保留 (由 monitor 走完生命周期)。
+    # 2026-09-26: 查询/写库统一走 store.retire_unfilled (唯一实现)。
     active_keys = set(meta.get("strategies") or [])
     all_keys = set(registry.strategy_keys())
     disabled = sorted(all_keys - set(registry.enabled_keys()))
     disabled_sweep = []
     if disabled:
-        from app.utils.db import get_db_connection
-        try:
-            with get_db_connection() as db:
-                cur = db.cursor()
-                cur.execute(
-                    "SELECT id, strategy, code, trade_date FROM qd_dragon_signals "
-                    "WHERE strategy = ANY(%s) AND state = %s AND entry_date IS NULL",
-                    (disabled, S_WATCH_PENDING),
-                )
-                disabled_sweep = [_row_plain(r) for r in cur.fetchall()]
-                cur.close()
-        except Exception as e:
-            logger.warning("[rebuild] 停用策略清扫查询失败: %s", e)
+        from app.market_cn.auto.store import retire_unfilled as _retire
+        disabled_sweep = _retire(keys=disabled, dry_run=True)
 
     # ---- B. 窗口内 missing / ghost / drift ----
     def _settled(row):
@@ -436,24 +421,18 @@ def apply_plan(plan, dry_run=True):
         })
         return stat
 
+    # ---- A. 停用策略未入场行 → expired (全表) ----
+    # 2026-09-26: 走 store.retire_unfilled 唯一实现 (复核 state/entry_date 后写)。
+    if plan["disabled_sweep"]:
+        from app.market_cn.auto.store import retire_unfilled as _retire
+        swept = _retire(ids=[r["id"] for r in plan["disabled_sweep"]])
+        stat["sweep_expired"] = len(swept)
+
     from app.utils.db import get_db_connection
     import json as _json
 
     with get_db_connection() as db:
         cur = db.cursor()
-
-        # ---- A. 停用策略未入场行 → expired (全表) ----
-        for r in plan["disabled_sweep"]:
-            cur.execute(
-                "UPDATE qd_dragon_signals SET state = %s, updated_at = NOW(), "
-                "extra = extra || %s::jsonb "
-                "WHERE id = %s AND state = %s AND entry_date IS NULL",
-                (S_EXPIRED,
-                 _json.dumps({"reason": "策略已停用, 未入场信号作废"},
-                             ensure_ascii=False),
-                 r["id"], S_WATCH_PENDING),
-            )
-            stat["sweep_expired"] += cur.rowcount
 
         # ---- B. 补写 missing → watch_pending ----
         # ON CONFLICT DO NOTHING (不是 DO UPDATE): 竞赛窗口里若已有行, 绝不覆盖其 state
@@ -692,20 +671,11 @@ def build_ledger_plan(replay, actual, meta):
             expire.append((a.get("id"), k, a.get("state"), bool(a.get("entry_date"))))
 
     # 停用策略未入场行清扫 (全表, 不依赖窗口)
+    # 2026-09-26: 查询/写库统一走 store.retire_unfilled (唯一实现)。
     disabled_sweep = []
     if disabled:
-        from app.utils.db import get_db_connection
-        try:
-            with get_db_connection() as db:
-                cur = db.cursor()
-                cur.execute(
-                    "SELECT id, strategy, code, trade_date FROM qd_dragon_signals "
-                    "WHERE strategy = ANY(%s) AND state = %s AND entry_date IS NULL",
-                    (disabled, S_WATCH_PENDING))
-                disabled_sweep = [_row_plain(r) for r in cur.fetchall()]
-                cur.close()
-        except Exception as e:
-            logger.warning("[rebuild] 停用策略清扫查询失败: %s", e)
+        from app.market_cn.auto.store import retire_unfilled as _retire
+        disabled_sweep = _retire(keys=disabled, dry_run=True)
 
     return {"upsert": upsert, "insert": insert, "expire": expire,
             "disabled_sweep": disabled_sweep, "keep_disabled": keep_disabled,
@@ -724,22 +694,19 @@ def apply_ledger_plan(plan, dry_run=True):
                      "sweep_expired": len(plan["disabled_sweep"])})
         return stat
 
+    # ---- 停用策略未入场行 → expired (全表) ----
+    # 2026-09-26: 走 store.retire_unfilled 唯一实现。
+    if plan["disabled_sweep"]:
+        from app.market_cn.auto.store import retire_unfilled as _retire
+        swept = _retire(ids=[r["id"] for r in plan["disabled_sweep"]])
+        stat["sweep_expired"] = len(swept)
+
     from app.utils.db import get_db_connection
     import json as _json
     from app.market_cn.auto.store import _row_to_dict  # noqa: F401
 
     with get_db_connection() as db:
         cur = db.cursor()
-
-        for r in plan["disabled_sweep"]:
-            cur.execute(
-                "UPDATE qd_dragon_signals SET state = %s, updated_at = NOW(), "
-                "extra = extra || %s::jsonb "
-                "WHERE id = %s AND state = %s AND entry_date IS NULL",
-                (S_EXPIRED, _json.dumps({"reason": "策略已停用, 未入场信号作废"},
-                                        ensure_ascii=False),
-                 r["id"], S_WATCH_PENDING))
-            stat["sweep_expired"] += cur.rowcount
 
         # ---- INSERT (落重放终态) ----
         for r in plan["insert"]:

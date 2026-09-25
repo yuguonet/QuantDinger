@@ -371,40 +371,15 @@ def _ensure_pool_daily(pool_target, bars_batch=None):
 
 
 def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None):
-    """无追踪出场模拟 (2026-09-17 出场研究定稿): 出场 = min(止损, hold_days 到期收盘)。
+    """无追踪出场模拟 — 2026-09-26 P1-7: 骨架已上收 core.exit_engines.run_hold_stop。
 
-    hold_days / stop_loss (2026-09-23): 出场阈值改由调用方注入 (源 = g56.yaml 声明);
-    传 None -> 回落模块常量 HOLD_DAYS / STOP_LOSS, 即不传参时逐笔等价不破。
-
-    返回与 v1._run_backtest 同构 {'exit_day','exit_price','return_pct','peak_return_pct'}:
-      - d=1 入场日 T+1 不可卖, 峰值自入场日 high 起累计 (统计口径, 不影响成交);
-      - d≥2 止损触发日 low≤止损线 按 min(open, 止损线) 成交 (跳空穿越按开盘);
-      - peak_return_pct = 截至出场日的峰值 high 收益 (统计用)。
-    依据: trail 保留系数 0.85~0.97 全区间单调 → 纯 7d/-8% 最优, 月度全向改善
-    (主板 +1.45→+7.64 / 20cm +2.12→+10.22)。数据不足返回 None (调用方跳过该笔)。
+    hold_days / stop_loss: 由调用方注入 (g56.yaml); 传 None 回落模块常量。
+    返回与 v1._run_backtest 同构 {'exit_day','exit_price','return_pct','peak_return_pct'}。
     """
-    n = len(bars)
     _hold = HOLD_DAYS if hold_days is None else int(hold_days)
     _stop = STOP_LOSS if stop_loss is None else float(stop_loss)
-    stop_line = entry * (1 + _stop / 100)
-    peak = float(bars[s]["high"])
-    for d in range(2, _hold + 1):
-        i = s + d - 1
-        if i >= n:
-            return None
-        peak = max(peak, float(bars[i]["high"]))
-        if float(bars[i]["low"]) <= stop_line:
-            fill = min(float(bars[i]["open"]), stop_line)
-            return {"exit_day": d, "exit_price": round(fill, 3),
-                    "return_pct": round((fill / entry - 1) * 100, 2),
-                    "peak_return_pct": round((peak / entry - 1) * 100, 2)}
-    i = s + _hold - 1
-    if i >= n:
-        return None
-    px = float(bars[i]["close"])
-    return {"exit_day": _hold, "exit_price": round(px, 3),
-            "return_pct": round((px / entry - 1) * 100, 2),
-            "peak_return_pct": round((peak / entry - 1) * 100, 2)}
+    from app.market_cn.auto.core.exit_engines import run_hold_stop
+    return run_hold_stop(bars, s, entry, hold_days=_hold, stop_loss=_stop)
 
 
 def _score_of(dist_ma20, dif0):
@@ -1037,3 +1012,16 @@ register_strategy_funcs(
     {"feat": g56_feat, "finite": g56_finite, "warmup": g56_warmup, "pool_stat": g56_pool_stat, "pool_field": g56_pool_field, "board_is_main": board_is_main, "board_is_gem": board_is_gem, "nd_score": g56_nd_score, "nd_tag": g56_nd_tag, "nd_exp": g56_nd_exp},
     d0={"feat": 0, "finite": 0, "warmup": 0, "pool_stat": 0, "pool_field": 0, "board_is_main": 0, "board_is_gem": 0, "nd_score": 0, "nd_tag": 0, "nd_exp": 0},
 )
+
+
+# ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
+def _exit_g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params, diag):
+    """g56 无追踪 7d/-8% 出场 — 供 YAML exit.mode=g56_no_trail。"""
+    from app.market_cn.auto.core.exit_modes import _bp
+    return _exit_no_trail(bars, entry_idx, entry_price,
+                          _bp(params, board_type, "hold_days"),
+                          _bp(params, board_type, "stop_loss"))
+
+
+from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
+_register_exit("g56_no_trail", _exit_g56_no_trail)

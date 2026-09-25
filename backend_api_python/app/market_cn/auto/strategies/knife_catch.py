@@ -110,7 +110,7 @@ def _vw_frac(series_rows):
     return above / total if total >= 30 else None
 
 
-def _daily_feats(bars, code):
+def _daily_feats(bars, code, market=None):
     """日线特征 (bars[-1]=昨日, 盘中当日 1D 未回填)。"""
     if len(bars) < 8:
         return None
@@ -126,10 +126,10 @@ def _daily_feats(bars, code):
     vol5 = sum(float(b["volume"]) for b in bars[-5:]) / 5
     lu_recent = 0
     from app.market_cn.auto.core.market import get_board_type, is_limit_up
-    bt = get_board_type(code)
+    bt = get_board_type(code, market)
     for d in range(len(bars) - 1, max(len(bars) - 6, 0), -1):
         cl, pc = closes[d], closes[d - 1]
-        if pc > 0 and is_limit_up(cl, pc, bt):
+        if pc > 0 and is_limit_up(cl, pc, bt, market):
             lu_recent += 1
     return {"down_streak": streak, "pre5": pre5, "vol5": vol5, "lu_recent": lu_recent}
 
@@ -364,81 +364,23 @@ class KnifeCatchStrategy(StrategyBase):
 
 
 # ================================================================
-# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# 门表 DSL 私有函数 (2026-09-26 P1-6: 消灭「逐字镜像」, 统一调上方实现)
 # ================================================================
+
 def _kc_hhmm(s) -> str:
-    """'YYYY-MM-DD HH:MM:SS' → 'HH:MM'（镜像 knife_catch._hhmm）。"""
-    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+    return _hhmm(s)
 
 
 def _kc_tail_ret(series_rows, last_px, last_time, minutes=20):
-    """尾盘 20 分钟回升%（逐字镜像 knife_catch._tail_ret）。无法计算 → None。"""
-    if not series_rows or last_px <= 0:
-        return None
-    from datetime import datetime, timedelta
-    try:
-        t_cut = (datetime.strptime(str(last_time)[:19], "%Y-%m-%d %H:%M:%S")
-                 - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
-    ref = None
-    for r in series_rows:
-        ts = str(r["time"])[:19]
-        if ts <= t_cut:
-            ref = r
-        else:
-            break
-    if ref is None:
-        return None
-    ref_px = float(ref.get("last") or 0)
-    if ref_px <= 0:
-        return None
-    return (last_px / ref_px - 1) * 100
+    return _tail_ret(series_rows, last_px, last_time, minutes)
 
 
 def _kc_vw_frac(series_rows):
-    """全天 VWAP 上方占比（逐字镜像 knife_catch._vw_frac；样本<30 → None）。"""
-    if not series_rows:
-        return None
-    cum_pv = cum_v = 0.0
-    above = total = 0
-    prev_v = 0.0
-    for r in series_rows:
-        px = float(r.get("last") or 0)
-        v = float(r.get("volume") or 0)
-        if px <= 0:
-            continue
-        dv = max(0.0, v - prev_v)
-        prev_v = v
-        if cum_v > 0:
-            total += 1
-            if px > cum_pv / cum_v:
-                above += 1
-        cum_pv += px * dv
-        cum_v += dv
-    return above / total if total >= 30 else None
+    return _vw_frac(series_rows)
 
 
 def _kc_daily_feats(bars, code, market=None):
-    """日线特征（逐字镜像 knife_catch._daily_feats；bars[-1]=昨日；len<8 → None）。"""
-    if len(bars) < 8:
-        return None
-    closes = [float(b["close"]) for b in bars]
-    streak = 0
-    for i in range(len(closes) - 1, 0, -1):
-        if closes[i] < closes[i - 1]:
-            streak += 1
-        else:
-            break
-    pre5 = (closes[-1] / closes[-5] - 1) * 100 if closes[-5] > 0 else 0
-    vol5 = sum(float(b["volume"]) for b in bars[-5:]) / 5
-    lu_recent = 0
-    bt = get_board_type(code, market)
-    for d in range(len(bars) - 1, max(len(bars) - 6, 0), -1):
-        cl, pc = closes[d], closes[d - 1]
-        if pc > 0 and is_limit_up(cl, pc, bt, market):
-            lu_recent += 1
-    return {"down_streak": streak, "pre5": pre5, "vol5": vol5, "lu_recent": lu_recent}
+    return _daily_feats(bars, code, market)
 
 
 _KC_NAN_KEYS = ("gain", "amp", "pos", "tail", "vw", "vol_ratio", "streak",

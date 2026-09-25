@@ -38,10 +38,18 @@ from app.market_cn.auto.core.runtime.functions import (
 ensure_gate_init()  # 副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数 (autodiscover)
 # break 是 Python 关键字 → 静态 import 语法错误, 走动态导入 (2026-09-23 更名)。
 from importlib import import_module as _import_module
-_break_mod = _import_module("app.market_cn.auto.strategies.break")
-bk_struct = _break_mod.bk_struct
-break_features = _break_mod.break_features
-from app.market_cn.auto.strategies.relay3 import relay3_features
+# 2026-09-26 P1-9: break/relay3 特征改惰性获取 (调用点再 import), 去掉 load-time 层反转。
+# 真正收编待 P1-8 day_flow 塌缩 (门表应经 register_strategy_funcs 取特征)。
+
+
+def _break_fns():
+    """惰性取 break 门表特征 (避免 core 顶层 import strategies)。"""
+    m = _import_module("app.market_cn.auto.strategies.break")
+    return m.bk_struct, m.break_features
+
+
+def _relay3_feats_fn():
+    return _import_module("app.market_cn.auto.strategies.relay3").relay3_features
 
 from app.market_cn.auto.core._paths import STRATEGY_DIR as _STRATEGY_DIR
 
@@ -584,7 +592,7 @@ def _run_backtest_day_relay3(bars, code, spec, ev, board_type, stock_info, use_p
             continue  # 参考版跳过开放持仓（数据不足, 只统计已平仓）
 
         # 信号展示字段（镜像 relay3 calc_features: board_height/ma_bull/lu_vol_ratio/rsi）
-        feats = relay3_features(Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
+        feats = _relay3_feats_fn()(Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
                                     market=spec.market_spec))
         trades.append({
             "code": code,
@@ -621,6 +629,7 @@ def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_pr
     n = len(bars)
     if n < int(spec.meta.get("day_min_n", 6)):
         return []
+    bk_struct, break_features = _break_fns()   # 惰性取 break 门表特征 (P1-9)
     _p = spec.params
     max_break_gap = int(_p.get("max_break_gap", 5))
     lu_all = find_limit_ups(bars, board_type, spec.market_spec)

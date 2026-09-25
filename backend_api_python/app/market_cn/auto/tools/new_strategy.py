@@ -66,7 +66,7 @@ class {cls}(StrategyBase):
     scan_spec = ScanSpec(kind="daily_close")
     default_params = dict(DEFAULT_PARAMS)
     data_needs = ("daily",)              # 可选: daily/minute_1m/minute_live/quote/lhb/
-                                         #       index_daily/index_minute/index_fflow
+                                         #       index_daily/index_minute/index_fflow{tlegs_block}
 
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
         """D0 判定 — TODO: 替换为真实规则。
@@ -107,7 +107,7 @@ class {cls}(StrategyBase):
     signal_state = "buy_today"        # 盘中即买策略初始状态
     entry_at_close = True             # 尾盘入场, 当日止损守卫跳过
     default_params = dict(DEFAULT_PARAMS)
-    data_needs = ("minute_live",)
+    data_needs = ("minute_live",){tlegs_block}
 
     def intraday_shortlist(self, snaps, **params):
         """便宜预筛 — 只用最新快照, 宁可多留不可误杀。返回 {{code: snap}}。"""
@@ -143,6 +143,8 @@ def main():
                         choices=["daily_close", "intraday_window"],
                         help="策略形态 (默认 daily_close 盘后扫描)")
     parser.add_argument("--out", default=None, help="输出目录 (默认 strategies/)")
+    parser.add_argument("--with-tlegs", action="store_true",
+                        help="生成做T腿声明骨架 (已持仓日高抛低吸; A股自动先卖后买)")
     args = parser.parse_args()
 
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.key):
@@ -154,6 +156,20 @@ def main():
     kind_zh = ("daily_close 盘后全市场扫描, D0 判定→D1 开盘买"
                if args.kind == "daily_close"
                else "intraday_window 盘中窗口轮询 (参考 tail_oversold.py)")
+    tlegs_block = ""
+    if args.with_tlegs:
+        tlegs_block = '''
+    # 做T 腿 (T14): 已持仓日生效; A股(intraday_t0=false)自动先卖后买、净头寸不变。
+    # trigger 为占位布尔 — 真实策略请改为受控表达式求值或覆盖 t_leg_intents()。
+    t_legs = {
+        "enabled": True,
+        "max_legs_per_day": 2,
+        "legs": [
+            {"action": "sell", "qty_pct": 50, "trigger": False, "label": "冲高减半"},
+            {"action": "buy_back", "qty_pct": 50, "trigger": False, "label": "回落接回"},
+        ],
+    }
+'''
     body = DAILY_BODY if args.kind == "daily_close" else INTRADAY_BODY
     out_dir = (os.path.abspath(args.out) if args.out else
                os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -164,8 +180,10 @@ def main():
         raise SystemExit(f"已存在: {dst}")
     with open(dst, "w", encoding="utf-8", newline="\n") as f:
         f.write((HEADER + body).format(key=args.key, label=label, cls=cls,
-                                       kind_zh=kind_zh))
+                                       kind_zh=kind_zh, tlegs_block=tlegs_block))
     print(f"已生成: {os.path.normpath(dst)}")
+    if args.with_tlegs:
+        print("已附 t_legs 骨架 — 运行期由 core.t_legs.eval_t_legs 产出 TradeIntent (不成交)")
     print(CHECKLIST.format(key=args.key))
 
 

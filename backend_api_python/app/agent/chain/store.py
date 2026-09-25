@@ -73,6 +73,11 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
     tools_pg_array = _list_to_pg_array(node.tools_called) if node.tools_called else None
     missing_pg_array = _list_to_pg_array(node.missing_data) if node.missing_data else None
 
+    # 2026-09-25: 多标的对比 stock_code='600519,000858' 超 varchar(10) → 写库炸
+    # （StringDataRightTruncation，决策树整棵丢掉）。应用侧截断 + 库列放宽双保险。
+    _code = str(node.stock_code or "")[:32]
+    _name = str(node.stock_name or "")[:64]
+
     if node.id is not None:
         # UPDATE
         cur.execute("""
@@ -90,7 +95,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             RETURNING id
         """, (
             parent_id, root_id, node.layer, node.name, node.step_order,
-            node.exec_date, node.stock_code, node.stock_name,
+            node.exec_date, _code, _name,
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
             node.plan, node.session_id, node.user_query, node.model, node.total_tokens,
@@ -127,7 +132,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             ) RETURNING id
         """, (
             parent_id, root_id, node.layer, node.name, node.step_order,
-            node.exec_date, node.stock_code, node.stock_name,
+            node.exec_date, _code, _name,
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
             node.plan, node.session_id, node.user_query, node.model, node.total_tokens,

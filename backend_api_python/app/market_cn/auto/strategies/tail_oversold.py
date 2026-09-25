@@ -50,17 +50,24 @@ def _hhmm(s):
     return str(s)[11:16] if s and len(str(s)) >= 16 else ""
 
 
-def _is_3038(code: str) -> bool:
-    return str(code)[:3].startswith(("30", "68"))
+def _is_gem_star(code: str, market=None) -> bool:
+    """是否高波动板（创业板/科创板）—— MarketSpec 分板规则, 非代码前缀字面量。"""
+    return get_board_type(code, market) == "gem_star"
 
 
-def _norm_factor(code: str) -> float:
+def _norm_factor(code: str, market=None) -> float:
     """归一化系数: 创/科板×0.5, 主板不变 (与 test_v2_tail_buy.norm_factor 一致)。"""
-    return 0.5 if _is_3038(code) else 1.0
+    return 0.5 if _is_gem_star(code, market) else 1.0
 
 
-def _limit_pct(code: str) -> float:
-    return 0.20 if _is_3038(code) else 0.10
+def _limit_pct(code: str, market=None) -> float:
+    """名义涨停幅度 (封板判定用, 与历史插件口径一致): 主板 10% / 创科 20%。
+
+    ⚠️ 不要用 MarketSpec.nominal_up_pct (0.098/0.198, 已折 up_tol) —— 那是
+    is_limit_up 的判别阈值, 不是名义涨停价幅度; 两者语义不同, 混用会改封板判定。
+    2026-09-26 P1-6: 板型判定改走 MarketSpec (等价), 数值常量保留原口径。
+    """
+    return 0.20 if _is_gem_star(code, market) else 0.10
 
 
 def _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf):
@@ -88,10 +95,11 @@ def _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf):
 def _tail_ret_v2(series_rows):
     """V2 尾盘回落 %: 14:56 现价 vs 14:20~14:40 (mi 199~219) 分钟收盘均价。
 
-    快照序列 prep_minutes 差分后按 mi 对齐; 槽位 <15 (21 槽缺口过多) 返回 (None, None)。
+    快照序列 prep_minutes 差分后按 mi 对齐; 槽位 <15 (21 槽缺口过多) 返回 None。
+    返回 float | None (2026-09-26 P1-6 统一; 旧 (value, avg) 元组形态由调用方拆).
     """
     if not series_rows:
-        return None, None
+        return None
     mins = _prep_minutes(
         [{"time": str(r.get("time") or ""), "open": r.get("open") or 0,
           "high": r.get("high") or 0, "low": r.get("low") or 0,
@@ -102,8 +110,8 @@ def _tail_ret_v2(series_rows):
     tail_avg = sum(tail) / len(tail) if len(tail) >= 15 else 0
     last_px = by_mi.get(max(by_mi)) if by_mi else 0
     if not last_px or last_px <= 0 or tail_avg <= 0:
-        return None, None
-    return (last_px / tail_avg - 1) * 100, tail_avg
+        return None
+    return (last_px / tail_avg - 1) * 100
 
 
 @register
@@ -189,7 +197,7 @@ class TailOversoldStrategy(StrategyBase):
         day_gain = (last / pc - 1) * 100                    # 快照口径: high/low=当日累计极值
         amplitude = (high - low) / pc * 100
         pos_range = (last - low) / (high - low)
-        tail_ret, _tail_avg = _tail_ret_v2(series)
+        tail_ret = _tail_ret_v2(series)
         if tail_ret is None:
             if _tr:
                 _tr("data", reason="tail_ret")
@@ -265,90 +273,32 @@ class TailOversoldStrategy(StrategyBase):
 
 
 # ================================================================
-# 以下门表 DSL 私有函数由 strategies 重构从 strategy_funcs 迁入（逐字等价）
+# 门表 DSL 私有函数 (2026-09-26 P1-6: 消灭「逐字镜像」, 统一调上方实现)
 # ================================================================
-def _to_is_gem_star(code, market=None) -> bool:
-    """是否高波动板（创业板/科创板）。
 
-    口径 = MarketSpec 的分板规则（**不是**代码前缀字面量）—— 换市场时自动跟随。
-    与旧 `str(code)[:3].startswith(("30","68"))` 对 A 股逐位等价（见 a.yaml board_rules）。
-    """
-    return get_board_type(code, market) == "gem_star"
+def _to_is_gem_star(code, market=None) -> bool:
+    return _is_gem_star(code, market)
 
 
 def to_nf(ctx: Ctx) -> float:
-    """归一化系数：高波动板 0.5，其余 1.0（镜像 tail_oversold._norm_factor）。
-
-    0.5/1.0 是**策略自己的归一化惯例**（高波动板幅度翻倍故减半），不是市场规则常量，
-    故留在策略函数里；判定用的"是否高波动板"则来自 MarketSpec。
-    """
-    return 0.5 if _to_is_gem_star(ctx.code, ctx.market) else 1.0
+    """归一化系数：高波动板 0.5，其余 1.0（= _norm_factor）。"""
+    return _norm_factor(ctx.code, ctx.market)
 
 
 def _to_limit_pct(code, market=None) -> float:
-    """该股的市场名义涨停幅度（供 tail 的涨停触板判定）—— 取自 MarketSpec。"""
-    m = market if market is not None else default_market()
-    return m.nominal_up_pct(get_board_type(code, m))
+    return _limit_pct(code, market)
 
 
 def _to_calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf) -> float:
-    """V2 评分（逐字镜像 tail_oversold._calc_score；nan 输入 → 该分支不计分）。"""
-    score = 0.0
-    dg = day_gain * nf
-    if dg <= -8:
-        score += 4.0
-    elif dg <= -5:
-        score += 3.0
-    elif dg <= -2:
-        score += 1.2
-    elif dg <= 0:
-        score += 0.5
-    tr = tail_ret * nf
-    if tr <= -2:
-        score += 3.0
-    elif tr <= -1:
-        score += 2.5
-    elif tr <= -0.3:
-        score += 1.5
-    if pos_range <= 0.2:
-        score += 2.0
-    elif pos_range <= 0.4:
-        score += 1.0
-    if amplitude * nf >= 5 and tr <= -0.3:
-        score += 1.0
-    p5 = pre5_gain * nf
-    if p5 <= -10:
-        score += 0.3
-    elif p5 <= -5:
-        score += 0.1
-    return round(score, 2)
+    return _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf)
 
 
 def _to_tail_ret_v2(series_rows):
-    """V2 尾盘回落%（逐字镜像 tail_oversold._tail_ret_v2；槽位<15 → None）。
-
-    prep_minutes 是 data/hub 的分钟标准化通道（数据层，非策略规则）。
-    """
-    if not series_rows:
-        return None
-    from app.market_cn.auto.core.data.hub import prep_minutes
-    mins = prep_minutes(
-        [{"time": str(r.get("time") or ""), "open": r.get("open") or 0,
-          "high": r.get("high") or 0, "low": r.get("low") or 0,
-          "close": r.get("last") or 0, "volume": r.get("volume") or 0}
-         for r in series_rows], volume_cumulative=True)
-    by_mi = {b["mi"]: float(b["c"]) for b in mins if float(b["c"]) > 0}
-    tail = [by_mi[mi] for mi in range(199, 220) if mi in by_mi]
-    tail_avg = sum(tail) / len(tail) if len(tail) >= 15 else 0
-    last_px = by_mi.get(max(by_mi)) if by_mi else 0
-    if not last_px or last_px <= 0 or tail_avg <= 0:
-        return None
-    return (last_px / tail_avg - 1) * 100
+    return _tail_ret_v2(series_rows)
 
 
 def _to_hhmm(s) -> str:
-    """'YYYY-MM-DD HH:MM:SS' → 'HH:MM'（逐字镜像 tail_oversold._hhmm）。"""
-    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+    return _hhmm(s)
 
 
 def _to_cache(ctx: Ctx) -> dict:

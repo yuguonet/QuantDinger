@@ -1494,7 +1494,7 @@ class TaskAgent(AgentBase):
             step_budget = 10
         # 上限与 AGENT_MAX_STEPS 对齐(2026-09-23):此前硬编码 20,.env 形同虚设(P1-6)。
         # 2026-09-24(审计 B2):读取统一到 constants.get_agent_max_steps(默认值三样 → 一样)。
-        step_budget = max(1, min(get_agent_max_steps(), step_budget))
+        step_budget = max(6, min(get_agent_max_steps(), step_budget))
         # 内部规划步距(2026-09-12 Q7+B 后修正):旧公式 max(budget//2+1,6) 在预算小则
         # interval 小(2 保底),预算大时最多 6 步一复盘。
         # 2026-09-17 修正(根治 R1 串行 REPL):step_budget<=4 表示 planner 已判定
@@ -2644,21 +2644,43 @@ class TaskAgent(AgentBase):
                 logger.debug("[Budget] 预算钩子跳过: %s", e)
 
         def _check_final_answer(answer, memory, agent):
-            """验证 final_answer 不为空且非半成品 + 数字溯源(2026-09-16)。
+            """验证 final_answer 不为空 + 数字溯源。已到 final_answer 阶段。
 
-            数字溯源:报告中的数值必须能在工具输出/变量语料(executor.state 全量)里找到--
-            这是「结果必须来自工具输出」的引擎级保证,不依赖提示词遵守。
-            保守触发:孤立数值 >= 4 个且 <=30% 可溯源时才拒收(少量数值可能是
-            推理衍生值如百分比/评分,全部强拦会误伤);拒收后 smolagents 要求模型重写。
+            2026-09-25：原「含 <code> 且无 final_answer 字样 → 拒收」会误杀
+            **代码交付报告**（正文合法含 <code>def ...</code> 展示函数），
+            且 smolagents 对 False 只报空错误（Check failed with error:）。
+            改为：纯代码块才算半成品；拒收时 raise 带原因的 ValueError。
             """
             if answer is None:
-                return False
+                raise ValueError("final_answer 为空")
             text = str(answer).strip()
             if not text:
-                return False
-            # 半成品检测:仍含裸 <code> 标签且无 final_answer 调用痕迹
-            if "<code>" in text and "final_answer" not in text:
-                return False
+                raise ValueError("final_answer 空白")
+            # 半成品：整段就是代码/标签壳，几乎无自然语言
+            stripped = re.sub(r"<code>.*?</code>", "", text, flags=re.S)
+            stripped = re.sub(r"```.*?```", "", stripped, flags=re.S).strip()
+            if text.startswith(("<code>", "```")) and len(stripped) < 20:
+                raise ValueError("final_answer 疑似未写完的代码块，缺少结论文字")
+            # 数字溯源(工具输出 grounding)
+            try:
+                from utils.grounding import collect_grounding_corpus
+                corpus = collect_grounding_corpus(getattr(executor, "state", None) or {})
+            except Exception as e:
+                logger.warning("[FinalAnswer] grounding 语料采集失败,退回 observations: %s", e)
+                corpus = "\n".join(
+                    str(getattr(step, "observations", "") or "")
+                    for step in getattr(getattr(agent, "memory", None), "steps", []) or [])
+            if corpus.strip():
+                from utils.grounding import check_grounding
+                ok, guide = check_grounding(text, corpus)
+                if not ok:
+                    try:
+                        agent._grounding_rejects = int(getattr(agent, "_grounding_rejects", 0)) + 1
+                    except Exception:
+                        pass
+                    logger.warning("[FinalAnswer] 数字溯源失败,拒收要求重写:%s", guide[:160])
+                    raise ValueError(guide)
+            return True
             # 数字溯源(工具输出 grounding)--2026-09-24 提智阶段 0.10 复活(审计 A1):
             # 旧实现把两处 raise 写在 try 内、被 except Exception→logger.debug 吞掉,
             # 本函数恒返回 True(拒收从未生效,warning 与行为脱节)。现改为:
@@ -2710,6 +2732,7 @@ class TaskAgent(AgentBase):
                 "- web_search 搜索关键词示例:'{股票名称} {股票代码} 最新消息 分析'\n"
                 "- 将 web_search 结果作为参考信息,结合已有数据分析\n"
                 "- web_search 结果用于补充新闻面、政策面、市场情绪等实时信息"
+                "- 【代码类任务】测试用例只用可比较的同类型元素（勿混 int 与 str）；final_answer 可含代码块，但开头要有结论句"
             ),
         )
 

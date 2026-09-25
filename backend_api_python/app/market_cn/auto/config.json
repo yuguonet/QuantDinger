@@ -34,8 +34,9 @@
     },
     "dragon_v2": {
       "label": "龙回头V2",
-      "enabled": true,
-      "daily_limit": 5
+      "enabled": false,
+      "daily_limit": 5,
+      "_disabled_note": "2026-09-13 用户裁定撤回 V2 实验 (同 break_v2)。2026-09-26 扫描发现 enabled 仍为 true 与注释矛盾, 现对齐注释改回 false 留档 (停扫描, 历史行仍可查)"
     },
     "v1": {
       "label": "V1",
@@ -107,6 +108,13 @@
       "daily_limit": 30,
       "winrate": 79.3,
       "_winrate_note": "2026-09-24 补 (此前缺键 ⇒ 前端历史胜率列空 + 策略组排序当 0 垫底)。口径: 官方编排 run_all(strategy=g56) 全市场回测, days=320 → 1191笔/79.3%/+8.69%; days=120 为 86.2%(915笔) 但有效信号期仅≈44交易日、2026-08权重69%, 代表性不足, 不作常规引用。非实盘承诺。"
+    },
+    "t_hilo": {
+      "label": "持仓做T·高抛低吸",
+      "enabled": false,
+      "daily_limit": 5,
+      "winrate": null,
+      "_disabled_note": "2026-09-26 T15 示例做T策略 (t_legs 骨架演示)。规则未经两段稳定性验证, 默认不进实盘。做T 腿只产 TradeIntent, 待 monitor/执行层接线。"
     }
   },
   "state_labels": {

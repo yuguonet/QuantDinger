@@ -35,6 +35,38 @@ _INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL
 _PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
 
 
+def _translate_function_xml(text: str) -> str | None:
+    """function=final_answer XML to Python call."""
+    close = "<" + "/function>"
+    pclose = "<" + "/parameter>"
+    funcs = re.findall(r"<function=([A-Za-z0-9_]+)>(.*?)" + close, text, re.S)
+    if not funcs:
+        return None
+    lines = []
+    for name, body in funcs:
+        ps = re.findall(r"<parameter[^>]*>(.*?)" + pclose, body, re.S)
+        if ps:
+            vals = []
+            for i, v in enumerate(ps):
+                v = (v or "").strip()
+                key = "answer" if (name == "final_answer" and i == 0) else "arg" + str(i)
+                try:
+                    ast.literal_eval(v)
+                    vals.append("%s=%s" % (key, v))
+                except Exception:
+                    vals.append("%s=%r" % (key, v))
+            lines.append("%s(%s)" % (name, ", ".join(vals)))
+        else:
+            raw = (body or "").strip()
+            lines.append(("%s(%r)" % (name, raw)) if raw else ("%s()" % name))
+    code = chr(10).join(lines)
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return None
+    return code
+
+
 def _translate_invoke_xml(text: str) -> str | None:
     """把 <invoke name="tool">…</invoke> XML 工具调用语法转成 Python 调用。
 
@@ -122,6 +154,58 @@ def _usable(code: str | None) -> str | None:
     return code
 
 
+
+def _translate_toolcall_json(text: str) -> str | None:
+    """OpenAI tool-call dump -> Python.
+
+    Pattern: Calling tools:[{... "name": "final_answer", "arguments": "..." ...}]
+    """
+    import re as _re
+    if "arguments" not in text:
+        return None
+    # 兼容 JSON 双引号与 Python repr 单引号（实测 smolagents dump 是 repr）
+    ms = list(_re.finditer(r"['\"]name['\"]\s*:\s*['\"]([A-Za-z0-9_]+)['\"]", text))
+    if not ms:
+        return None
+    name = ms[0].group(1)
+    j = text.find("arguments", ms[0].end())
+    if j < 0:
+        return None
+    colon = text.find(":", j)
+    if colon < 0:
+        return None
+    q1 = text.find("'", colon)
+    q2 = text.find('"', colon)
+    if q1 < 0 or (q2 >= 0 and q2 < q1):
+        q1 = q2
+    if q1 < 0:
+        return None
+    quote = text[q1]
+    k = q1 + 1
+    while k < len(text):
+        if text[k] == quote and text[k - 1] != chr(92):
+            break
+        k += 1
+    raw = text[q1 + 1:k]
+    try:
+        arg = raw.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        arg = raw
+    payload = arg.strip()
+    if payload.startswith("{"):
+        try:
+            import json as _json
+            obj = _json.loads(payload)
+            payload = str(obj.get("answer") or obj.get("text") or payload)
+        except Exception:
+            pass
+    code = name + "(" + repr(payload) + ")"
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return None
+    return code
+
 def resilient_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
     """加固版 parse_code_blobs（签名兼容；v6：非空校验 + 标签兼容 + 伪标签防线）。"""
     code = None
@@ -137,6 +221,12 @@ def resilient_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> s
     if code is None:
         # XML 工具调用语法兜底（如 `<invoke name="tool">…</invoke>`）：转译为 Python 调用
         code = _usable(_translate_invoke_xml(text))
+    if code is None:
+        code = _usable(_translate_function_xml(text))
+    if code is None:
+        code = _usable(_translate_toolcall_json(text))
+    if code is None:
+        code = _usable(_translate_function_xml(text))
     if code is None:
         code = _usable(_rescue_loose_code(text))
 
