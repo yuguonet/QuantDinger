@@ -82,25 +82,42 @@ _CODE_INTENT_RE = re.compile(
 
 
 def _skill_declared_tool_names(skill_name: str, skill_body: str = "") -> list:
-    """从 SKILL.md frontmatter `tools: [...]` 抽出技能声明的工具名（幻象治理）。
+    """取出技能声明的工具名（幻象治理白名单并集）。
 
-    技能正文点名的工具若**真实存在**于 provider，必须并入本阶段白名单——
-    否则模型按文档调用会命中「未定义名字」（300497 get_chip_distribution 案例）。
+    2026-09-25 B2：body 已被 _parse_skill_md 剥掉 frontmatter，正则抠 tools: 恒空。
+    改从 SkillInfo.tools（frontmatter 解析结果）取；正文 tools: 行仅作兼容兜底。
     """
-    names = []
-    src = skill_body or ""
-    if not src and skill_name:
+    names: list = []
+
+    def _push(x: str) -> None:
+        x = (x or "").strip().strip("'\"")
+        if x and x not in names:
+            names.append(x)
+
+    if skill_name:
+        info = None
         try:
-            # body 可能在 state；frontmatter 也可从 adapter 读
-            src = ""
+            import agent as _agent_mod
+            _ad = getattr(_agent_mod, "skills", None)
+            if _ad is None:
+                _ad = getattr(getattr(_agent_mod, "agent", None), "skill_adapter", None)
+            if _ad is not None:
+                info = _ad.get(skill_name)
         except Exception:
-            src = ""
+            info = None
+        if info is None:
+            try:
+                from llm.qd_skills import QDSkillAdapter
+                info = QDSkillAdapter().get(skill_name)
+            except Exception:
+                info = None
+        for x in (getattr(info, "tools", None) or []):
+            _push(str(x))
+    src = skill_body or ""
     m = re.search(r"(?m)^tools:\s*\[([^\]]*)\]", src)
     if m:
         for x in m.group(1).split(","):
-            x = x.strip().strip("'\"")
-            if x and x not in names:
-                names.append(x)
+            _push(x)
     return names
 
 

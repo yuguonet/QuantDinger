@@ -367,7 +367,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 name = skill_info["name"]
                 if name not in existing_skills:
                     info = adapter.get(name)
-                    default_w = info.default_weight if info and info.default_weight else 1.0
+                    # SkillInfo 无 default_weight 字段（2026-09-25 B1）：新技能默认 1.0，与下方 tool 行 INSERT 口径一致。
+                    default_w = 1.0
                     cur.execute("""
                         INSERT INTO qd_agent_weights (layer, name, skill_name, weight, sample_count)
                         VALUES ('skill', %s, NULL, %s, 0)

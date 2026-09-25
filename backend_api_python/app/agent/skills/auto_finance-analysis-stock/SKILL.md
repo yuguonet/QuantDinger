@@ -37,7 +37,7 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 - `get_chip_distribution(codes, lookback_days=120)`：获取获利比例、平均成本、90%筹码集中度。
 
 ### Step 4：拉取基本面与资金面数据
-- `get_capital_summary(codes)`：获取营收/利润增速、ROE、PE/PB估值分位、机构持仓变化。
+- `get_capital_summary(codes)`：获取融资融券、大宗交易、股东户数、分红送转、财报三表摘要（margin/block_trade/holders/dividend/financials）。**不提供** PE/PB 历史分位与机构目标价。
 - `get_fund_flow(codes)`：获取主力/散户净流入金额及近期资金趋势；如需更细粒度，可补充 `get_fund_flow_daily(codes, days=120)`。
 
 ### Step 5：多周期数据加工
@@ -49,7 +49,7 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 同时计算：
 - 量比 = 当日成交量 / 过去5日均量；
 - 均线趋势：读取 `ma5_trend`、`ma10_trend`、`ma20_trend`、`ma60_trend` 判断多空排列；
-- 估值分位：从 `get_capital_summary` 提取PE/PB历史分位数；
+- 估值水平：从 `get_stock_info` / `get_realtime_quote` 取 PE/PB 绝对值（**无历史分位，勿编造**）；
 - 资金动向：汇总主力净流入方向与持续性。
 
 ### Step 6：交叉验证与结论合成
@@ -57,7 +57,7 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 1. **多周期技术面结论**：以表格形式呈现各周期涨跌幅与一句话判断（如"缩量回调，跌势趋缓"）。
 2. **技术形态与指标**：均线状态、超买/超卖（RSI/KDJ）、MACD柱体变化、支撑/压力位（如MA120）。
 3. **资金面**：主力净流入方向、是否逆势吸筹、筹码集中度。
-4. **基本面支撑**：估值分位、机构目标价区间（若数据可用）。
+4. **基本面支撑**：财报增速/ROE/分红与融资、股东户数变化（来自 `get_capital_summary`）；估值用 PE/PB 绝对水平。
 5. **风险提示**：明确列出潜在利空与不确定性。
 6. **免责声明**：必须包含"数据口径：日线级别，基于公开市场数据计算，不构成投资建议"。
 
@@ -72,7 +72,7 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 
 - **参数类型坑**：`agent_get_kline` 与 `get_realtime_quote` 等工具的 `codes` 参数在单标的场景下**必须传字符串**（如 `'600519.SH'`）。若传入 `list` 类型，可能触发 `AttributeError: 'list' object has no attribute 'split'`。
 - **数据缺失兜底**：`get_realtime_quote` 可能返回 `{'error': '未获取到行情'}`，此时应立即以 `agent_get_kline` 或 `calculate_ma` 返回的最新收盘价 `latest_close` 作为当前价，并标注数据来源差异。
-- **字段名保护**：部分字段可能缺失（如机构目标价、筹码集中度），读取前需做空值/键值检查，避免直接抛异常。
+- **字段名保护**：部分字段可能缺失（如筹码集中度），读取前需做空值/键值检查，避免直接抛异常；机构目标价/估值分位字段不存在，不得向用户承诺。
 - **周期换算**：T+N 均按**交易日**近似计算，非自然日；若K线数据不足对应周期，需在报告中说明数据窗口限制。
-- **估值分位依赖**：PE/PB 历史分位由 `get_capital_summary` 提供，若接口未返回分位字段，不得主观编造，可改为描述绝对估值水平。
+- **估值口径**：工具层无 PE/PB 历史分位，统一描述绝对估值水平；不得主观编造分位或目标价。
 - **输出纪律**：所有结论须基于返回数据，不得引入外部未经验证的消息；最终报告须附带数据口径与免责声明。

@@ -4,6 +4,7 @@ name: auto_finance-query-stock
 version: 0.1.0
 description: 查询 A 股个股的最新实时行情与涨跌幅信息（最新价、涨跌额、涨跌幅、今开/最高/最低、昨收、成交量、换手率、量比、PE、PB、总市值等），并按指定周期（T+1/T+3/1W/1M）计算周期涨跌幅。适用于用户询问"XX股票最新行情"、"XX涨了多少"、"XX今天/这周/这个月涨跌幅度"等场景。同义表述包括：实时报价、最新价、当前股价、今日涨跌、涨幅、跌幅、行情快照。
 tags: [finance, stock, query, realtime-quote, kline, change-percent, A股]
+tools: [get_realtime_quote, agent_get_kline, get_stock_info]
 ---
 
 # A股个股实时行情与周期涨跌幅查询技能
@@ -18,7 +19,8 @@ tags: [finance, stock, query, realtime-quote, kline, change-percent, A股]
 **不适用**：
 - 港股、美股、基金、债券、加密货币等非 A 股标的（本技能工具签名仅覆盖 A 股行情接口）。
 - 需要深度技术分析（形态识别、筹码分布、资金流向、龙虎榜、估值对比等）——这些属于其他技能范畴，不在本技能覆盖范围内。
-- 需要分钟级、Tick 级或盘后逐笔数据——`get_realtime_quote` 与 `agent_get_kline` 默认输出日频/快照级数据。
+- 需要 Tick 级或盘后逐笔数据——工具层不提供 Tick/逐笔。
+- 需要分钟 K 线请改用 `agent_get_kline(timeframe='1m'|'5m'|'15m'|'30m'|'1H'|'4H')`（已支持，见下文）；本技能默认演示日频/快照口径。
 - `web_search` 在本沙箱**不可用**，不得作为数据兜底。
 
 ## 执行流程

@@ -80,12 +80,27 @@ class SkillDocument:
         return None
 
 
+def _strip_leading_comments(content: str) -> str:
+    """去掉 BOM/空白与前置 HTML 注释（酿造器溯源注释曾写在 frontmatter 前，B3）。"""
+    s = (content or "").lstrip("\ufeff \t\r\n")
+    while s.startswith("<!--"):
+        end = s.find("-->")
+        if end < 0:
+            break
+        s = s[end + 3:].lstrip(" \t\r\n")
+    return s
+
+
 def _parse_skill_md(content: str) -> tuple:
-    """解析 SKILL.md → (metadata_dict, body_str)。"""
+    """解析 SKILL.md → (metadata_dict, body_str)。
+
+    2026-09-25 B3：兼容前置 HTML 注释/BOM——否则 auto_* 技能 description/tags/tools 全空。
+    """
     meta = {}
     body = content
-    if content.startswith("---"):
-        parts = content.split("---", 2)
+    s = _strip_leading_comments(content)
+    if s.startswith("---"):
+        parts = s.split("---", 2)
         if len(parts) >= 3:
             if yaml:
                 try:
@@ -377,7 +392,21 @@ class QDSkillAdapter:
         cache_key = f"{skill_name}:{resource_path}"
         if cache_key in doc._resource_cache:
             return doc._resource_cache[cache_key]
-        full_path = doc.base_path / resource_path
+        # B4：拒绝绝对路径与 .. 穿越；目标必须落在 skill 的 references|scripts|assets 内
+        try:
+            rp = str(resource_path or "").replace("\\", "/")
+            if (not rp) or rp.startswith("/") or (len(rp) > 1 and rp[1] == ":") or ".." in rp.split("/"):
+                logger.warning("[QDSkills] Level 3 拒绝非法路径: %s", resource_path)
+                return None
+            full_path = (doc.base_path / rp).resolve()
+            base = Path(doc.base_path).resolve()
+            allowed = [base] + [base / d for d in ("references", "scripts", "assets")]
+            if not any(full_path == a or full_path.is_relative_to(a) for a in allowed):
+                logger.warning("[QDSkills] Level 3 路径越界: %s", resource_path)
+                return None
+        except Exception as e:
+            logger.warning("[QDSkills] Level 3 路径校验失败: %s (%s)", resource_path, e)
+            return None
         if not full_path.exists():
             logger.warning("[QDSkills] Level 3 资源不存在: %s", full_path)
             return None

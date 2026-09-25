@@ -172,7 +172,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         logger.debug("get_realtime_quote 涨跌停增补跳过: %s", e)
     return {"count": len(results), "data": results, "error": None}
 
-def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, Any]:
+def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qfq") -> Dict[str, Any]:
     """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
 
     ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
@@ -186,6 +186,9 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, A
         codes: 股票代码，字符串（如 "603466"）或代码列表均可，多股逗号分隔
         timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
         days: 天数，默认 30，最大 250
+        adj: 复权口径 qfq(前复权,默认)/hfq(后复权)/none(不复权)。返回 data 各 bar 含 adj 标注。
+
+    2026-09-25：补 adj——底层本就做 qfq，分析/回测口径不可比的缺口在工具层未暴露。
     """
     # codes 容错：模型可能传 list / list[tuple] / 数字 / 带前后缀串
     if isinstance(codes, (list, tuple)):
@@ -218,7 +221,25 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, A
     def _fetch(stock_code: str) -> list:
         try:
             ds = CNStockDataSource()
-            return ds.get_kline(stock_code, timeframe, _days) or []
+            bars = ds.get_kline(stock_code, timeframe, _days) or []
+            # ds.get_kline 内部已 unadj→qfq；adj 要求 hfq/none 时再换算（单一事实源 adjustment）
+            _adj = (adj or "qfq").lower()
+            if _adj in ("none", "raw", "unadj"):
+                try:
+                    from app.data_sources.provider.adjustment import reverse_fwd_adjust
+                    bars = reverse_fwd_adjust(bars, stock_code) or bars
+                except Exception as _adj_err:
+                    logger.warning("agent_get_kline adj=none 转换失败(%s): %s", stock_code, _adj_err)
+            elif _adj == "hfq":
+                try:
+                    from app.data_sources.provider.adjustment import (
+                        reverse_fwd_adjust, unadj_to_hfq,
+                    )
+                    raw = reverse_fwd_adjust(bars, stock_code) or bars
+                    bars = unadj_to_hfq(raw, stock_code) or raw
+                except Exception as _adj_err:
+                    logger.warning("agent_get_kline adj=hfq 转换失败(%s): %s", stock_code, _adj_err)
+            return bars
         except Exception as e:
             logger.error("agent_get_kline.get_kline(%s, %s, %d) failed: %s",
                          stock_code, timeframe, _days, e)
@@ -247,7 +268,7 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30) -> Dict[str, A
     # （2026-09-21 修复：旧版单代码返回裸 list、多代码返回 dict 的二义性导致
     #  模型拿 list 当 dict 切片 → TypeError "string indices must be integers"，
     #  连续两次触发熔断，是 step 爆炸的主要推手之一）
-    return {"count": len(results), "data": results, "error": None}
+    return {"count": len(results), "data": results, "adj": (adj or "qfq").lower(), "error": None}
 
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {

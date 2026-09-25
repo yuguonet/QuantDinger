@@ -88,6 +88,16 @@ def _snapshot_bak(skill_path: Path) -> None:
             pass
 
 
+def _compose_skill_doc(header: str, skmd: str) -> str:
+    """把溯源注释插到 frontmatter 之后（B3：注释在最前会导致元数据解析全空）。"""
+    s = (skmd or "").lstrip("\ufeff \t\r\n")
+    if s.startswith("---"):
+        parts = s.split("---", 2)
+        if len(parts) >= 3:
+            return "---" + parts[1] + "---\n" + header + parts[2].lstrip("\n") + "\n"
+    return header + (skmd or "") + "\n"
+
+
 def _load_pre_weight(skill_path: Path):
     """从 SKILL.md 头部读修订前权重（`pre_weight=X.XX`，0.4c 回归自愈判据）。"""
     try:
@@ -361,7 +371,8 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
         header = (f"<!-- auto-brewed {date.today().isoformat()} from root_id="
                   f"{cand['sample_root_id']} chain={chain_name} | "
                   f"{_HUMAN_EDITED_MARK} 后请去除 auto_ 前缀接管 -->\n")
-        (skill_dir / "SKILL.md").write_text(header + skmd + "\n", encoding="utf-8")
+        # B3：溯源注释放 frontmatter 之后，保证 _parse_skill_md 能读到 name/description/tools
+        (skill_dir / "SKILL.md").write_text(_compose_skill_doc(header, skmd), encoding="utf-8")
         logger.info("[Brewer] 酿成技能: %s (chain=%s)", final_name, chain_name)
         results.append({"chain_name": chain_name, "status": "brewed", "skill_dir": final_name})
         set_brew_state(chain_name, last_brew_date=_today, fail_streak=0)
@@ -506,7 +517,7 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
               f"chain={chain_name} | revision={rev['revision'] + 1} | "
               f"pre_weight={pre_weight if pre_weight is not None else 'NA'} | "
               f"{_HUMAN_EDITED_MARK} 后请去除 auto_ 前缀接管 -->\n")
-    skill_path.write_text(header + new_doc + "\n", encoding="utf-8")
+    skill_path.write_text(_compose_skill_doc(header, new_doc), encoding="utf-8")
 
     # 护栏 2 真落地（2026-09-24，设计 §3.17）：修订完成 → 权重重置 1.0、sample_count 归零
     # （新版本重新积累）。旧实现这里写的是 set_brew_state(fail_streak=0)——**写错了行**，
