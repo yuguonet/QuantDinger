@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """评分校准回填脚本（A1b，2026-09-26）。
 
 用法：
     python scripts/calibrate_scores.py [--skills technical_analysis,bull_bear_research]
 
-从 qd_traces 取 (score, direction, correct) → IsotonicRegression 拟合 →
+从 qd_agent_traces 取 (score, direction, correct) → IsotonicRegression 拟合 →
 存 qd_agent_weights(layer='calibration')。冷启动时样本不足会自动跳过并报告。
 
 幂等：每次先 DELETE 该 skill 的旧 calibration 记录再 INSERT。

@@ -6,13 +6,13 @@
 功能:
   1. 盘前选股: 4类候选 (排除ST, 首板放量)
   2. 技术评分: 综合技术分 >= 60 才进入监控 (MA排列/RSI/KDJ/OBV/量比/角度)
-  3. 盘中实时: 每分钟从 realtime_snapshot_YYYY 快照表读取分时数据, 检测弱转强信号
+  3. 盘中实时: 每分钟从 realtime_snapshot 快照表读取分时数据, 检测弱转强信号
   4. 信号强度: 强/中/弱 三级 (基于日内动量, 移植自 V1 策略核心胜率因子)
   5. 买入建议: 触发时输出建议买入价 + 信号类型
 
 数据来源:
-  - 批量行情: realtime_snapshot_YYYY (每分钟全市场快照, scheduler 每60s采集)
-  - 分时序列: realtime_snapshot_YYYY 当天数据重构 (每行快照 = 1分钟bar)
+  - 批量行情: realtime_snapshot (每分钟全市场快照, scheduler 每60s采集)
+  - 分时序列: realtime_snapshot 当天数据重构 (每行快照 = 1分钟bar)
   - VWAP: 优先从快照 extras.amount 累加计算, 否则回退典型价 (H+L+C)/3 加权
   - 日K线: kline_1m_YYYY/kline_1D_YYYY (DB)
   - 不依赖 mootdx/coordinator 网络拉取 (盘中完全走DB)
@@ -677,12 +677,12 @@ def screen_candidates(kline_days: int = 30, force_refresh: bool = False) -> List
 _batch_cache = {}  # code -> {price, open, prev_close, change_pct, ...}
 
 def _snapshot_table_name() -> str:
-    """返回当前年份的快照表名 (realtime_snapshot_YYYY)"""
+    """返回当前年份的快照表名 (realtime_snapshot)"""
     return f"realtime_snapshot_{datetime.now().year}"
 
 
 def fetch_batch_quotes(codes: List[str]) -> Dict[str, Dict]:
-    """批量获取实时行情 — 从 realtime_snapshot_YYYY 读取每只股票的最新快照。
+    """批量获取实时行情 — 从 realtime_snapshot 读取每只股票的最新快照。
 
     返回: {code: {last, open, high, low, previousClose, volume, ...}}
     """
@@ -817,11 +817,11 @@ def prefilter_by_rules(candidates: List[Dict]) -> List[Dict]:
 
 
 # ================================================================
-# 分时数据 (从 realtime_snapshot_YYYY 快照表读取)
+# 分时数据 (从 realtime_snapshot 快照表读取)
 # ================================================================
 
 def fetch_minute_klines_batch(codes: List[str], count: int = 240) -> Dict[str, List[Dict]]:
-    """批量获取当天分时序列 — 从 realtime_snapshot_YYYY 读取当天快照重构。
+    """批量获取当天分时序列 — 从 realtime_snapshot 读取当天快照重构。
 
     每行快照的 "last"(最新价) 作为 close, open/high/low 直接取。
     快照表 volume 是当日累计成交量，需要转换为每分钟增量 volume。
@@ -974,7 +974,7 @@ def calc_intraday_vol_ratio(ticks: List[Dict], idx: int, window: int = 5) -> flo
 # ================================================================
 
 def fetch_vwap_from_snapshot(codes: List[str]) -> Dict[str, float]:
-    """从 realtime_snapshot_YYYY 快照表计算当日 VWAP。
+    """从 realtime_snapshot 快照表计算当日 VWAP。
 
     快照表的 volume 和 extras.amount 是当日累计值。
     VWAP = 最后一行的 cumsum(amount) / 最后一行的 cumsum(volume)。

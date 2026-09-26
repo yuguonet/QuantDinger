@@ -1568,11 +1568,6 @@ _prepare_intent() ────────────────────�
 
 │ 10. 结果处理 + DecisionCard ← 需要增加失败处理,交给Planner想办法
 
-2026-06-17 09:47:37,004 - app.market_cn.scheduler - ERROR - [scheduler] dragon_pools 异常: can't start new thread
-2026-06-17 09:47:37,019 - app.market_cn.scheduler - ERROR - [scheduler] dragon_pools 异常: can't start new thread
-2026-06-17 09:47:37,077 - app.market_cn.scheduler - ERROR - [scheduler] dragon_pools 异常: can't start new thread
-2026-06-17 09:47:37,078 - app.market_cn.scheduler - ERROR - [scheduler] dragon_pools 异常: can't start new thread
-
 backend_api_python\app\nanobot就是一个完整的agent智能体
 backend_api_python\app\agent是一个ai智能体,使用的smolagents库做内核,agent/skills和tools已和nanbot兼容
 使用backend_api_python\app\routes\agent_blueprint.py作为出入接口对接前端
@@ -1862,13 +1857,13 @@ test_dragon.py回测数据和test_dragon.py --today参数或--today-date无法�
 出场策略建议暂时不进行调整,方便评估.
 
 这里会需要做一个大的调整
-backend_api_python\app\market_cn\scheduler.py 在盘中每分钟会将实时行情数据存到db的realtime_snapshot_YYYY中,数据长度5天的时间,
+backend_api_python\app\market_cn\scheduler.py 在盘中每分钟会将实时行情数据存到db的realtime_snapshot中,数据长度5天的时间,
 盘后下载1m线存到kline_1m_YYYY中,数据长度3-5个月
 现在为了满足test_dragon.py的需求,简化用户人工识别难度,提高自动化识别能力
 将test_dragon.py的核心复制到app/market_cn/auto/stock_dragon.py中
 日线数据和1m数据回来后,自动运行一次类似test_dragon.py --today指令,这样可以获取到所有明日清仓的,继续持有的,明日准备买入的股票信息.
 并保存,个人想法是在前端自选股列表中增加一个组显示这些股票,用户可以提前观察这些股票
-开盘后每次更新完realtime_snapshot_YYYY后运行实时监控,或者其它方式,删除掉失效的股票,只保留可以买入/持仓/当日清仓的股票.
+开盘后每次更新完realtime_snapshot后运行实时监控,或者其它方式,删除掉失效的股票,只保留可以买入/持仓/当日清仓的股票.
 需求是前端自选股策略组能明确显示持仓,买/卖标识,能在分时线图中直接标记买点/卖点是最好的结果,这一步需要修改前端,
 几个问题:
 数据和qd_watchlist共用好还是分开比较好?分开的话以数据库的方式存储好还是存成临时文件比较好,因为寿命只有1个工作日.
@@ -1884,7 +1879,7 @@ backend_api_python\app\market_cn\scheduler.py 在盘中每分钟会将实时行�
 实盘买卖根据经验有这些特点:
 日内均线(VWAP)是个重要的参考内容,也是判断弱转强的关键细节,价格一直在VWAP之上,并拉动VWAP趋势向上是强信号,偶尔跌破(按今天的时间比例0.05左右)快速站上VWAP同时VWAP持平或向上也是强信号,向上突破VWAP并持续在VWAP上方附近是典型的弱转强信号,
 唯一需要警惕的就是现价离VWAP太远但又没涨停可能会引发回调,但现价在VWAP下方太大反弹强度会相对较弱
-可以用的realtime_snapshot_YYYY计算实时成交量来预估今日成交量,这也是个重要参数,预估成交量应该是用今日预估成交量加上3-5日后面时间段的成交量的均量,用这个估计成交量可以计算动量等参数,也可以用现在的成交量和昨日同时间成交量计算实时动量
+可以用的realtime_snapshot计算实时成交量来预估今日成交量,这也是个重要参数,预估成交量应该是用今日预估成交量加上3-5日后面时间段的成交量的均量,用这个估计成交量可以计算动量等参数,也可以用现在的成交量和昨日同时间成交量计算实时动量
 实盘中持续缩量平稳上涨说明上方压力较小,持续放量下跌是真跌.
 实盘MACD绿柱和红柱与涨跌副比值也能看出日内强弱
 根据感觉,尾盘小幅度下跌和上涨比,第二天上涨的可能性更高.
@@ -1896,8 +1891,8 @@ backend_api_python\app\market_cn\scheduler.py 在盘中每分钟会将实时行�
 我觉得龙回头还会有一个鲜明的规则,MA20或MA30趋势向上,应该还会呈现一定斜率.
 
 抄袭realtime_monitor.py数据读写部分,生成一个新的盘中实时监控的脚本,
-并生成一个回测脚本验证D+1胜率和盈亏比(当前时间买,明天开盘卖),回测应该可以使用1m K线验证吧(3个月的足够多了)?不行就用realtime_snapshot_YYYY做5天内的回测
-realtime_snapshot_YYYY会在盘中实时更新,
+并生成一个回测脚本验证D+1胜率和盈亏比(当前时间买,明天开盘卖),回测应该可以使用1m K线验证吧(3个月的足够多了)?不行就用realtime_snapshot做5天内的回测
+realtime_snapshot会在盘中实时更新,
 1. 盘中出现快速拉升的股票,就是和上一分钟比涨幅越大的,<2%的不考虑,连续拉升的得分越高
 2. 判断是放量拉升还是无量上涨,只要放量拉升的.放量越大得分越高,连续分钟越多的得分越高
 3. 前40日是否在龙虎榜及次数,丢弃不在龙虎榜单中的,次数越多得分越高
@@ -1940,8 +1935,8 @@ market_cn/auto/系统写设计文档在tmp\自动策略架构评估与改进方�
 系统在market_cn/auto/中,不要外溢,只允许进行外部引用,根目录下的test_dragon.py是临时的单一化文件,将来会要删除,可以学习,不能引用,也不要进行修改
 此次改进只允许修改auto/目录下内容,外部bug先申请
 
-只有realtime_snapshot_YYYY,是盘中实时更新,每1m一次,中间可能会丢失数据,其它所有数据都是盘后更新,
-数据库数据量:realtime_snapshot_YYYY最大历史记录5工作日,1m最大100个工作日,1D数据最大5年
+只有realtime_snapshot,是盘中实时更新,每1m一次,中间可能会丢失数据,其它所有数据都是盘后更新,
+数据库数据量:realtime_snapshot最大历史记录5工作日,1m最大100个工作日,1D数据最大5年
 个别数据允许从data_sources\coordinator.py或cn_stock或其它位置获取,但这会拖垮速度和影响稳定性
 股票索引和工作日历可以从ulits/basicinfo_db.py和trading_calendar.py中获取
 实盘执行可以类似定时任务,可以在规则文件中或其它方式进行统一配置首次时间->下次时间,时间周期等
@@ -1999,3 +1994,10 @@ A股模式是T+1,只能做多,不能做空,并保留将来的可扩展性,比如
 4原来有声明,规则不应该被约束.哪种约束性大一些?
 这应该是独立的接口文件.不应该过分侵入系统,影响系统模块化.
 
+检查每个门的最好办法是检查时间段,比如最大持有时间为7天,那么在7天里出现谷值-峰值最大化,这里谷值必须在峰值前面,然后找谷值前20天后4天的规律,一级一级过滤,尽量滤掉峰谷小的,反向的,
+应该是先定入场,计算入场离峰值的差值,差值越大越好.如果入场规则定了,出场规则更简单,出场点离峰值越近越好.
+入场与峰值之间有>10%的差值操作空间都算是优质股票,剩下就看怎么制定规则过滤了.
+
+需要在自选股中加入弹出式label显示,lable内容包括但不限于,计算出支撑位,压力位,并能在klinechart中显示,如果外部无法提供这几个指标,就根据OHLCV计算,比如MA均线,筹码分布,历史峰值,BOLL带,RSI等综合评估,先给一出一个简单的方案
+
+auto系统中还缺几个重要指标,缺少止盈价,止损价,周期也应该根据策略出场规则在盘中实时调整.方便用户在盘中操作,如果计算量过大,可以只监控持仓股

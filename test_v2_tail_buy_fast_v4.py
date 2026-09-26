@@ -42,7 +42,7 @@ V2 尾盘买入策略 — 快速版 V4 (V2规则 + V3式两阶段提速, 等价�
   阶段2: 幸存股调用 V2 原版 backtest_stock (import 复用)。
 
   --today 快速扫描 (盘后 kline_1m 未回填时的盘中方案):
-    数据源: realtime_snapshot_YYYY (60s 全市场快照, 保留5天, volume 为当日累计量)
+    数据源: realtime_snapshot (60s 全市场快照, 保留5天, volume 为当日累计量)
     1. 分批 (800只/批) 一条 SQL 读全市场当日快照序列
     2. 快照口径 P1/P3 预筛 + 现价封板排除 (原始价, 同源自洽)
     3. 幸存股才拉 300 日线; 快照序列 prep_minutes(累计量差分) → 按 mi 密集化成

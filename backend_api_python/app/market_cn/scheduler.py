@@ -226,9 +226,21 @@ def _refresh_backfill_15m():
 
 
 def _refresh_realtime_snapshot():
-    """盘中: 全市场实时行情快照原始数据采集"""
+    """盘中: 全市场实时行情快照原始数据采集 + 派生资金流今日行。"""
     from app.market_cn.realtime_snapshot import collect_realtime_snapshot
     collect_realtime_snapshot()
+    # 2026-09-26: 资金流是 snapshot 的派生视图, 采集后就地刷新今日行 (幂等)。
+    # 失败不影响快照; 不另开分时任务。
+    try:
+        from app.market_cn.fund_flow_api import update_intraday_fund_flow
+        update_intraday_fund_flow()
+    except Exception as e:
+        try:
+            from app.market_cn.scheduler import logger as _lg
+        except Exception:
+            import logging
+            _lg = logging.getLogger("scheduler")
+        _lg.warning("[fund_flow] 盘中派生刷新失败(不影响 snapshot): %s", e)
 
 
 def _dragon_strategy_scan():

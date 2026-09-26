@@ -1,22 +1,22 @@
--- QuantDinger Agent 可追责架构 — 统一迁移（重建版）
+﻿-- QuantDinger Agent 可追责架构 — 统一迁移（重建版）
 -- 日期: 2026-06-17
 -- 适用: nanobot 内核 + 金融领域
 -- 旧表 qd_evaluations 保留只读，不迁移数据
 --
 -- 三张表:
---   qd_traces         — 执行追踪树（Agent 每次执行 = 一棵树）
+--   qd_agent_traces         — 执行追踪树（Agent 每次执行 = 一棵树）
 --   qd_skill_weights  — Skill 权重（按单位时间收益率迭代）
 --   qd_factor_weights — 因子权重（按因子维度聚合，带时间衰减）
 
 -- ═══════════════════════════════════════════════════════════
--- 1. qd_traces — 执行追踪表
+-- 1. qd_agent_traces — 执行追踪表
 -- ═══════════════════════════════════════════════════════════
 
-DROP TABLE IF EXISTS qd_traces CASCADE;
-CREATE TABLE qd_traces (
+DROP TABLE IF EXISTS qd_agent_traces CASCADE;
+CREATE TABLE qd_agent_traces (
     id              SERIAL PRIMARY KEY,
-    parent_id       INTEGER REFERENCES qd_traces(id),
-    root_id         INTEGER REFERENCES qd_traces(id),
+    parent_id       INTEGER REFERENCES qd_agent_traces(id),
+    root_id         INTEGER REFERENCES qd_agent_traces(id),
     layer           VARCHAR(10) NOT NULL,
     step_order      INTEGER DEFAULT 0,
 
@@ -65,12 +65,12 @@ CREATE TABLE qd_traces (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_traces_root    ON qd_traces(root_id);
-CREATE INDEX idx_traces_parent  ON qd_traces(parent_id);
-CREATE INDEX idx_traces_layer   ON qd_traces(layer);
-CREATE INDEX idx_traces_stock   ON qd_traces(stock_code, exec_date);
-CREATE INDEX idx_traces_skill   ON qd_traces(name, exec_date) WHERE layer = 'skill';
-CREATE INDEX idx_traces_pending ON qd_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
+CREATE INDEX idx_traces_root    ON qd_agent_traces(root_id);
+CREATE INDEX idx_traces_parent  ON qd_agent_traces(parent_id);
+CREATE INDEX idx_traces_layer   ON qd_agent_traces(layer);
+CREATE INDEX idx_traces_stock   ON qd_agent_traces(stock_code, exec_date);
+CREATE INDEX idx_traces_skill   ON qd_agent_traces(name, exec_date) WHERE layer = 'skill';
+CREATE INDEX idx_traces_pending ON qd_agent_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
 
 
 -- ═══════════════════════════════════════════════════════════

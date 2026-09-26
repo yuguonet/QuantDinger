@@ -23,7 +23,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # 默认表名
-DEFAULT_TABLE = "agent_messages"
+DEFAULT_TABLE = "qd_agent_messages"
 # 默认 TTL：7 天
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 

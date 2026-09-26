@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """案例记忆（提智方案 三波 T1，CBR，2026-09-24，署名：OpenClaw agent）。
 
 来源：`agent_tizhi_final_plan_20260923.md` §三 三波 T1 + 用户方案 §三 一（案例记忆）。
@@ -13,7 +13,7 @@
   · `query_brew_case_signals()`：plan_digest 聚类 ≥N 次且 correct 率高 → 酿造候选
     **信号④**（前置依赖 0.3 状态机四修，已完成）。
 
-存储裁决（§四 #6）：pgvector 表 `qd_cases`（字段用用户 schema）+ 可选 JSONL 快照。
+存储裁决（§四 #6）：pgvector 表 `qd_agent_cases`（字段用用户 schema）+ 可选 JSONL 快照。
 实现沿用 `rag/pg_vector_store.py` 同款形态（JSONB 存向量 + Python 余弦；本仓 pgvector
 扩展不可依赖），embedding 走 `rag/embeddings.py` 工厂（env EMBEDDING_*）；无 embedding
 配置时退化为 2-gram 词面相似（零外呼），检索质量降级但通道不断。
@@ -80,11 +80,11 @@ def _warn_once(key: str, msg: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  存储（qd_cases；additive schema，自动建表）
+#  存储（qd_agent_cases；additive schema，自动建表）
 # ═══════════════════════════════════════════════════════════════
 
 _DDL = """
-CREATE TABLE IF NOT EXISTS qd_cases (
+CREATE TABLE IF NOT EXISTS qd_agent_cases (
     case_id      VARCHAR(64) PRIMARY KEY,
     root_id      BIGINT,
     task_summary TEXT NOT NULL,
@@ -98,8 +98,8 @@ CREATE TABLE IF NOT EXISTS qd_cases (
     created_at   TIMESTAMP DEFAULT NOW(),
     updated_at   TIMESTAMP DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_qd_cases_root   ON qd_cases (root_id);
-CREATE INDEX IF NOT EXISTS idx_qd_cases_created ON qd_cases (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_qd_agent_cases_root   ON qd_agent_cases (root_id);
+CREATE INDEX IF NOT EXISTS idx_qd_agent_cases_created ON qd_agent_cases (created_at DESC);
 """
 
 _schema_ok = False
@@ -233,7 +233,7 @@ def record_case(task_summary: str, *, root_id: Optional[int] = None, level: str 
             cur = conn.cursor()
             _ensure_schema(cur, conn)
             cur.execute(
-                "INSERT INTO qd_cases (case_id, root_id, task_summary, level, tags,"
+                "INSERT INTO qd_agent_cases (case_id, root_id, task_summary, level, tags,"
                 " plan_digest, outcome, failure_modes, cost, embedding)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING case_id",
                 (case_id, root_id, summary, str(level or "")[:4],
@@ -269,7 +269,7 @@ def backfill_by_root(root_id: int, correct: Optional[bool],
                 return 0
             cur = conn.cursor()
             cur.execute(
-                "UPDATE qd_cases SET outcome = jsonb_set(jsonb_set(outcome,"
+                "UPDATE qd_agent_cases SET outcome = jsonb_set(jsonb_set(outcome,"
                 " '{label}', to_jsonb(%s::text)), '{t_plus_n}', to_jsonb(%s::float8)),"
                 " updated_at = NOW()"
                 " WHERE root_id = %s AND outcome->>'label' = 'pending'",
@@ -304,7 +304,7 @@ def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
             _ensure_schema(cur, conn)
             cur.execute(
                 "SELECT case_id, task_summary, plan_digest, outcome, failure_modes,"
-                " embedding, created_at FROM qd_cases"
+                " embedding, created_at FROM qd_agent_cases"
                 " ORDER BY created_at DESC LIMIT %s", (CASE_SCAN_LIMIT,))
             rows = cur.fetchall()
             cur.close()
@@ -418,7 +418,7 @@ def query_brew_case_signals(min_cluster: int = CASE_CLUSTER_MIN,
     聚类键 = plan_digest 的工具链签名（各阶段 tools 有序拼接）；门槛：
     出现 ≥ min_cluster 次、已定论 ≥ min_labeled、correct 率 ≥ min_win_rate。
     返回 [{chain_name, runs, win_rate, sample_root_id, _channel:"case"}]——
-    chain_name/sample_root_id 从 qd_traces 按 root_id 反查（酿造需要 run 树原料）。
+    chain_name/sample_root_id 从 qd_agent_traces 按 root_id 反查（酿造需要 run 树原料）。
     """
     if not case_memory_enabled():
         return []
@@ -429,7 +429,7 @@ def query_brew_case_signals(min_cluster: int = CASE_CLUSTER_MIN,
             cur = conn.cursor()
             _ensure_schema(cur, conn)
             cur.execute(
-                "SELECT root_id, plan_digest, outcome FROM qd_cases"
+                "SELECT root_id, plan_digest, outcome FROM qd_agent_cases"
                 " WHERE root_id IS NOT NULL ORDER BY created_at DESC LIMIT %s",
                 (CASE_SCAN_LIMIT,))
             rows = cur.fetchall()
@@ -455,13 +455,13 @@ def query_brew_case_signals(min_cluster: int = CASE_CLUSTER_MIN,
                     c["correct"] += 1 if label == "correct" else 0
 
             out = []
-            # chain_name / sample_root_id 需从 qd_traces 反查（酿造要 run 树原料）；
+            # chain_name / sample_root_id 需从 qd_agent_traces 反查（酿造要 run 树原料）；
             # 反查不到（root 已删）的簇不产候选——无原料的酿造候选是假信号。
             root_ids = sorted({r for c in clusters.values() for r in c["roots"]})
             name_by_root: Dict[int, str] = {}
             try:
                 cur2 = conn.cursor()
-                cur2.execute("SELECT id, name FROM qd_traces WHERE id = ANY(%s)", (root_ids,))
+                cur2.execute("SELECT id, name FROM qd_agent_traces WHERE id = ANY(%s)", (root_ids,))
                 name_by_root = {int(r[0]): str(r[1] or "") for r in cur2.fetchall()}
                 cur2.close()
             except Exception as e:

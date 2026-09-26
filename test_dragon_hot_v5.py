@@ -77,7 +77,7 @@
   龙虎榜: cnd_dragon_tiger_list (PostgreSQL)
   日线:   kline_1D_YYYY (前复权, PostgreSQL)
   1分钟:  kline_1m_YYYY (表名按年分, bar时间为区间结束点, 首根09:31)
-  实时快照: realtime_snapshot_YYYY (--today模式, 转为增量1m bar)
+  实时快照: realtime_snapshot (--today模式, 转为增量1m bar)
 
 ===========================
 用法
@@ -288,7 +288,7 @@ def fetch_kline_1m(code: str, start_date: str, end_date: str) -> List[Dict]:
 
 
 def fetch_realtime_snapshot(code: str, date: str) -> List[Dict]:
-    """从 realtime_snapshot_YYYY 表加载实时快照并转为1m bar格式
+    """从 realtime_snapshot 表加载实时快照并转为1m bar格式
 
     snapshot表字段: symbol, time, "last", open, high, low, "previousClose", volume
     其中 open/high/low 是日内累计值，volume 是累计成交量（股）。

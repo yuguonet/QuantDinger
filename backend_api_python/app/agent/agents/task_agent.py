@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 任务型 Agent - 统一多阶段
 
@@ -1291,7 +1291,7 @@ class TaskAgent(AgentBase):
             # 2026-09-18 断链4修复:旧实现用 getattr(plan_ctx, "intent_verb")--NodeContext
             # 无此属性 → 恒空 → chain_name 永远对不上。现改取 plan_node 挂载的
             # _plan_task_type/_plan_entity_type(chat 意图分类的真实产出,见 nodes.py)。
-            # 键格式与 qd_traces.name(domain+verb+noun)对齐,verb=noun=task_type 时
+            # 键格式与 qd_agent_traces.name(domain+verb+noun)对齐,verb=noun=task_type 时
             # 语义即"同意图查询"。
             _iv = (getattr(plan_ctx, "_plan_task_type", "") if plan_ctx is not None else "") or "general"
             _in = (getattr(plan_ctx, "_plan_entity_type", "") if plan_ctx is not None else "") or ""
@@ -1963,7 +1963,7 @@ class TaskAgent(AgentBase):
         from smolagents.memory import ActionStep, PlanningStep
 
         # ── 工具函数:phase 白名单 / domain 过滤 + 附加点名 + 技能工具 ──
-        # phase 白名单(2026-09-12 B 阶段,审计自 qd_traces):tools 非空时只注入白名单工具,
+        # phase 白名单(2026-09-12 B 阶段,审计自 qd_agent_traces):tools 非空时只注入白名单工具,
         # 补救通道 = smol_tools 的 search_tools/list_tools(只读探查,不产生调用能力)。
         # 附加点名(2026-09-13):只在非白名单模式(单段路径)生效,与基调做并集,
         # 不改变"domain 决定基调"的既有语义(见 extra_tools 说明)。

@@ -1,15 +1,15 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Chain — 编排/决策层。
 
 核心模块：
   schema.py    — EvalNode 三层统一数据结构 + SkillReport
-  store.py     — qd_traces 持久化 + qd_agent_path_cache + qd_agent_weights
+  store.py     — qd_agent_traces 持久化 + qd_agent_path_cache + qd_agent_weights
   chains.py    — 链路定义
   evaluator.py — 回溯评估引擎（T+N 验证 → 权重更新）
 
 已删除：
-  tool_chains.py — 编排路径缓存（读写链路断裂，改用 qd_traces）
+  tool_chains.py — 编排路径缓存（读写链路断裂，改用 qd_agent_traces）
   contract.py    — SkillReport 解析契约（Skill 直接构造 SkillReport，不再需要解析）
 """
 from chain.schema import (

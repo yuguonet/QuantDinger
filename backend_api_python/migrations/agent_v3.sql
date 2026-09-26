@@ -1,23 +1,29 @@
 -- QuantDinger Agent v3 — 完整迁移（重建版）
 -- 日期: 2026-06-18
+--
+-- [DEPRECATED 2026-09-26] 此 migration 中的 qd_skill_weights / qd_factor_weights
+--                        已被统一表 qd_agent_weights 替代，零代码引用。
+--                        新库仍会创建这两张废弃空表，不影响运行。
+--                        如需清理，执行 migrations/drop_deprecated_agent_tables.sql
+--
 -- 适用: 可追责架构 + skill_runner + tool_chains.json 链路路由
 --
--- 三张表:
---   qd_traces         — 执行追踪树（Agent 每次执行 = 一棵树）
---   qd_skill_weights  — Skill 权重（按单位时间收益率迭代）
---   qd_factor_weights — 因子权重（按因子维度聚合，带时间衰减）
+-- 表:
+--   qd_agent_traces  — 执行追踪树（Agent 每次执行 = 一棵树）【在用】
+--   qd_skill_weights — 废弃（被 qd_agent_weights 替代）
+--   qd_factor_weights— 废弃（被 qd_agent_weights 替代）
 --
--- 使用: 直接执行即可，不需要先执行 agent_v2.sql 或 qd_traces.sql
+-- 使用: 直接执行即可，不需要先执行 agent_v2.sql 或 qd_agent_traces.sql
 
 -- ═══════════════════════════════════════════════════════════
--- 1. qd_traces — 执行追踪表
+-- 1. qd_agent_traces — 执行追踪表
 -- ═══════════════════════════════════════════════════════════
 
-DROP TABLE IF EXISTS qd_traces CASCADE;
-CREATE TABLE qd_traces (
+DROP TABLE IF EXISTS qd_agent_traces CASCADE;
+CREATE TABLE qd_agent_traces (
     id              SERIAL PRIMARY KEY,
-    parent_id       INTEGER REFERENCES qd_traces(id) ON DELETE CASCADE,
-    root_id         INTEGER REFERENCES qd_traces(id) ON DELETE CASCADE,
+    parent_id       INTEGER REFERENCES qd_agent_traces(id) ON DELETE CASCADE,
+    root_id         INTEGER REFERENCES qd_agent_traces(id) ON DELETE CASCADE,
     layer           VARCHAR(10) NOT NULL,           -- 'chain' / 'skill' / 'tool'
     step_order      INTEGER DEFAULT 0,
 
@@ -71,13 +77,13 @@ CREATE TABLE qd_traces (
 );
 
 -- 索引
-CREATE INDEX idx_traces_root    ON qd_traces(root_id);
-CREATE INDEX idx_traces_parent  ON qd_traces(parent_id);
-CREATE INDEX idx_traces_layer   ON qd_traces(layer);
-CREATE INDEX idx_traces_stock   ON qd_traces(stock_code, exec_date);
-CREATE INDEX idx_traces_skill   ON qd_traces(name, exec_date) WHERE layer = 'skill';
-CREATE INDEX idx_traces_pending ON qd_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
-CREATE INDEX idx_traces_penalty ON qd_traces(stock_code) WHERE human_verdict = 'negative_feedback';
+CREATE INDEX idx_traces_root    ON qd_agent_traces(root_id);
+CREATE INDEX idx_traces_parent  ON qd_agent_traces(parent_id);
+CREATE INDEX idx_traces_layer   ON qd_agent_traces(layer);
+CREATE INDEX idx_traces_stock   ON qd_agent_traces(stock_code, exec_date);
+CREATE INDEX idx_traces_skill   ON qd_agent_traces(name, exec_date) WHERE layer = 'skill';
+CREATE INDEX idx_traces_pending ON qd_agent_traces(id) WHERE layer = 'chain' AND exit_date IS NULL;
+CREATE INDEX idx_traces_penalty ON qd_agent_traces(stock_code) WHERE human_verdict = 'negative_feedback';
 
 
 -- ═══════════════════════════════════════════════════════════

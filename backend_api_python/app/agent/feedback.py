@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 """
 
@@ -147,7 +147,7 @@ def check_negative_feedback(user_input: str, session_id: str = "default") -> Non
 
             cur.execute(
 
-                "SELECT id, stock_code, name FROM qd_traces WHERE id = %s",
+                "SELECT id, stock_code, name FROM qd_agent_traces WHERE id = %s",
 
                 (root_id,),
 

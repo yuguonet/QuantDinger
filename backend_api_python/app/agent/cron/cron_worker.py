@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Cron Worker — Agent 定时任务后台执行器（自调度模式）。
 
@@ -298,14 +298,14 @@ def _update_job_status(job_id: int, success: bool, error: str = ""):
             cur = conn.cursor()
             if success:
                 cur.execute("""
-                    UPDATE qd_cron_jobs
+                    UPDATE qd_agent_cron_jobs
                     SET last_run_at = %s, last_success_at = %s, last_error = NULL,
                         error_count = 0, total_runs = total_runs + 1, updated_at = %s
                     WHERE id = %s
                 """, (now, now, now, job_id))
             else:
                 cur.execute("""
-                    UPDATE qd_cron_jobs
+                    UPDATE qd_agent_cron_jobs
                     SET last_run_at = %s, last_error = %s,
                         error_count = error_count + 1, total_runs = total_runs + 1, updated_at = %s
                     WHERE id = %s
@@ -355,7 +355,7 @@ def _delete_one_shot(job_id: int, job_name: str):
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s", (job_id,))
+            cur.execute("DELETE FROM qd_agent_cron_jobs WHERE id = %s", (job_id,))
             conn.commit()
         logger.info("[CronWorker]  一次性任务 %d (%s) 已删除", job_id, job_name)
     except Exception as e:
@@ -369,7 +369,7 @@ def _reschedule_job(job_id: int):
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, name, cron_expr, mode, prompt, function_path, enabled, one_shot
-                FROM qd_cron_jobs WHERE id = %s
+                FROM qd_agent_cron_jobs WHERE id = %s
             """, (job_id,))
             row = cur.fetchone()
 
@@ -415,7 +415,7 @@ def _load_and_schedule_all():
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, name, cron_expr, mode, prompt, function_path, one_shot
-                FROM qd_cron_jobs WHERE enabled = TRUE
+                FROM qd_agent_cron_jobs WHERE enabled = TRUE
             """)
             rows = cur.fetchall()
 

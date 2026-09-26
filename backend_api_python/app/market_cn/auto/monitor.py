@@ -64,7 +64,7 @@ def in_window(lo, hi, hm=None):
 
 
 # ================================================================
-# 快照读取 (market DB, realtime_snapshot_YYYY)
+# 快照读取 (market DB, realtime_snapshot 单表)
 # ================================================================
 
 def _snapshot_pool():
@@ -72,8 +72,8 @@ def _snapshot_pool():
     return get_market_db_manager()._get_pool("CNStock")
 
 
-def _snapshot_table():
-    return f"realtime_snapshot_{datetime.now().year}"
+# 2026-09-26 由按年分表改为单表
+_SNAPSHOT_TABLE = "realtime_snapshot"
 
 
 def snapshot_day_done() -> bool:
@@ -81,7 +81,7 @@ def snapshot_day_done() -> bool:
         pool = _snapshot_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT MAX(time) FROM \"{_snapshot_table()}\" "
+                cur.execute(f"SELECT MAX(time) FROM \"{_SNAPSHOT_TABLE}\" "
                             "WHERE time::date = CURRENT_DATE")
                 r = cur.fetchone()
         if not r or r[0] is None:

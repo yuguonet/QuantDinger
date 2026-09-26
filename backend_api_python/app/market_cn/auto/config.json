@@ -30,7 +30,12 @@
       "label": "龙回头",
       "enabled": true,
       "daily_limit": 5,
-      "winrate": 43.5
+      "winrate": 43.5,
+      "params": {
+        "trail_lo": -2.0,
+        "trail_hi": -2.0
+      },
+      "_params_note": "2026-09-25 trail -3→-2: 300d 真注入出场后胜率持平 72.7%, 均收 5.0→5.14, 盈亏比 2.43→2.52 (不伤胜率提盈亏比)。依赖 backtest_stock/exit_decision 经 merged_params 传入 (当日修掉写死 hold=7/stop=-8 的 bug)。"
     },
     "dragon_v2": {
       "label": "龙回头V2",

@@ -413,9 +413,15 @@ def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None):
 
 
 def _score_of(dist_ma20, dif0):
-    """信号评分 0~100 —— 换键后唯一构造点 (口径见 SCORE_* 常量处注释)。
+    """**预测分** 0~100 (2026-09-26 用户定名) — 唯一构造点 (口径见 SCORE_* 常量)。
 
     = W·归一(dist_ma20) + (1−W)·归一(−dif0), 两段各 clip [0,1] 后线性加权 ×100 取整。
+
+    语义 (勿混用):
+      - 只对 **下一交易日 T+1** 负责 (T 日收盘后算出的分 → 预期 T+1);
+      - 持仓期内 **每日更新**, 形成「D0分→D1 / D5分→D6」的心里预期链;
+      - **出场后不再适用**本套评分; **出池无效** (全市场任意日 ≈ 抛硬币);
+      - 用途 = 排序 / 展示 / 次日胜率校准, **不是**入场规则门。
 
     NaN 防御: ma20/dif0 在暖机段为 NaN, 比较 `> 0` 为 False ⇒ 落 0.0 (最低分),
     不会污染排序。正常路径下暖机 `m[:68]=False` 已保证 k≥68, 不会走到。
@@ -426,6 +432,42 @@ def _score_of(dist_ma20, dif0):
     s2 = 0.0 if not (s2 > 0) else (1.0 if s2 > 1 else s2)
     v = 100 * (SCORE_W_DIST * s1 + (1 - SCORE_W_DIST) * s2)
     return int(min(100, max(0, round(v))))
+
+
+def next_day_view(score) -> dict:
+    """预测分 → **下一交易日** 心理预期 (仅 g56 池内校准; 每日收盘后调用)。
+
+    用户语义 (2026-09-26): D0 分看 D1、D5 分看 D6; 出场后停用; 是「预测分」不是持有评分。
+
+    prob_up 样本内校准 (g56 信号日 n=748, score(T)→T+1 收>前收):
+      <35≈68% | 35–49≈63% | 50–64≈79% | ≥65≈89%
+    label 为口语心里预期 (≈50 视为持平, 与用户举例对齐)。
+
+    Returns:
+        {score, label, prob_up, note}
+    """
+    try:
+        s = int(score)
+    except Exception:
+        return {"score": None, "label": "—", "prob_up": None,
+                "note": "无预测分"}
+    # label: 用户心里预期口径 (≈50=持平); prob_up: g56 信号日实测 P(T+1涨)
+    if s >= 80:
+        label, prob = "大概率涨", 0.90
+    elif s >= 65:
+        label, prob = "偏涨", 0.89
+    elif s >= 55:
+        label, prob = "持平偏涨", 0.79
+    elif s >= 45:
+        label, prob = "大概率持平", 0.63
+    else:
+        label, prob = "偏跌", 0.68
+    return {
+        "score": s,
+        "label": label,
+        "prob_up": prob,
+        "note": "预测分仅对下一交易日有效; 出场后停用; 出池无效",
+    }
 
 
 def _mk_signal(code, bars, k, f, st):

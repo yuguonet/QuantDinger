@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 cron_tools.py — Agent 定时任务工具
 
@@ -168,7 +168,7 @@ def create_cron_job(
                 from app.utils.db import get_db_connection as _gdb
                 with _gdb() as _dc:
                     _c = _dc.cursor()
-                    _c.execute("SELECT COUNT(*) AS n FROM qd_cron_jobs")
+                    _c.execute("SELECT COUNT(*) AS n FROM qd_agent_cron_jobs")
                     _r = _c.fetchone()
                     _exist = int((_r.get("n") if isinstance(_r, dict) else _r[0]) or 0)
                     _c.close()
@@ -185,7 +185,7 @@ def create_cron_job(
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO qd_cron_jobs (name, cron_expr, mode, prompt, description, one_shot)
+                INSERT INTO qd_agent_cron_jobs (name, cron_expr, mode, prompt, description, one_shot)
                 VALUES (%s, %s, 'prompt', %s, %s, %s)
                 RETURNING id
             """, (name, cron_expr, prompt, description or None, one_shot))
@@ -242,13 +242,13 @@ def list_cron_jobs(enabled_only: bool = False) -> Dict:
                 cur.execute("""
                     SELECT id, name, cron_expr, mode, prompt, one_shot, enabled,
                            last_run_at, last_error, error_count, total_runs, created_at
-                    FROM qd_cron_jobs WHERE enabled = TRUE ORDER BY id
+                    FROM qd_agent_cron_jobs WHERE enabled = TRUE ORDER BY id
                 """)
             else:
                 cur.execute("""
                     SELECT id, name, cron_expr, mode, prompt, one_shot, enabled,
                            last_run_at, last_error, error_count, total_runs, created_at
-                    FROM qd_cron_jobs ORDER BY id
+                    FROM qd_agent_cron_jobs ORDER BY id
                 """)
             rows = cur.fetchall()
 
@@ -289,7 +289,7 @@ def remove_cron_job(job_id: int) -> Dict:
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s RETURNING id, name", (job_id,))
+            cur.execute("DELETE FROM qd_agent_cron_jobs WHERE id = %s RETURNING id, name", (job_id,))
             row = cur.fetchone()
             conn.commit()
 
@@ -326,7 +326,7 @@ def toggle_cron_job(job_id: int, enabled: bool) -> Dict:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_cron_jobs SET enabled = %s, updated_at = NOW()
+                UPDATE qd_agent_cron_jobs SET enabled = %s, updated_at = NOW()
                 WHERE id = %s RETURNING id, name, enabled
             """, (enabled, job_id))
             row = cur.fetchone()

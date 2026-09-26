@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-Store — qd_traces 树形持久化层（替代旧 qd_evaluations）。
+Store — qd_agent_traces 树形持久化层（替代旧 qd_evaluations）。
 
 职责：
-  save_tree(node)   → 将整棵 EvalNode 树写入 qd_traces（含所有子节点）
-  load_tree(root_id) → 从 qd_traces 读取整棵树，重建 EvalNode 父子关系
+  save_tree(node)   → 将整棵 EvalNode 树写入 qd_agent_traces（含所有子节点）
+  load_tree(root_id) → 从 qd_agent_traces 读取整棵树，重建 EvalNode 父子关系
   query_roots(...)   → 查询根节点列表（分页/过滤）
   update_verify(...) → 回溯时写入验证结果
   get_skill_weights() → 获取 Skill 历史权重
@@ -38,7 +38,7 @@ def _list_to_pg_array(items: list) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def save_tree(root: EvalNode) -> Optional[int]:
-    """将整棵 EvalNode 树写入 qd_traces。
+    """将整棵 EvalNode 树写入 qd_agent_traces。
 
     递归写入：根节点 → skill 子节点 → tool 叶子节点。
     已有 id 的节点做 UPDATE，没有的做 INSERT。
@@ -81,7 +81,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
     if node.id is not None:
         # UPDATE
         cur.execute("""
-            UPDATE qd_traces SET
+            UPDATE qd_agent_traces SET
                 parent_id=%s, root_id=%s, layer=%s, name=%s, step_order=%s,
                 exec_date=%s, stock_code=%s, stock_name=%s,
                 score=%s, direction=%s, action=%s, signal=%s, confidence=%s,
@@ -109,7 +109,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
     else:
         # INSERT
         cur.execute("""
-            INSERT INTO qd_traces (
+            INSERT INTO qd_agent_traces (
                 parent_id, root_id, layer, name, step_order,
                 exec_date, stock_code, stock_name,
                 score, direction, action, signal, confidence,
@@ -146,7 +146,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
     node.id = node_id
     if root_id is None:
         root_id = node_id
-        cur.execute("UPDATE qd_traces SET root_id=%s WHERE id=%s", (root_id, node_id))
+        cur.execute("UPDATE qd_agent_traces SET root_id=%s WHERE id=%s", (root_id, node_id))
 
     # 递归保存子节点（传递 root_exec_date 保证子节点有 exec_date）
     for i, child in enumerate(node.children):
@@ -175,7 +175,7 @@ def load_tree(root_id: int) -> Optional[EvalNode]:
                        status, error, elapsed_ms,
                        exit_date, exit_reason, pnl_pct, hold_days,
                        correct, calibration
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE root_id = %s
                 ORDER BY step_order ASC
             """, (root_id,))
@@ -282,7 +282,7 @@ def query_roots(
             cur.execute(f"""
                 SELECT id, exec_date, stock_code, stock_name, name,
                        score, action, direction, confidence, timeframe, status, created_at
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE {where}
                 ORDER BY created_at DESC
                 LIMIT %s OFFSET %s
@@ -318,7 +318,7 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_traces SET status = 'unverifiable'
+                UPDATE qd_agent_traces SET status = 'unverifiable'
                 WHERE parent_id IS NULL
                   AND exit_date IS NULL
                   AND status = 'ok'
@@ -330,7 +330,7 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
             # 为空"），属永久毒丸——不等 5 次失败计数，直接出队。实测盘后验证对 125+
             # 条空 code 记录逐条刷"K线返回错误: codes 不能为空"却从不计入统计。
             cur.execute("""
-                UPDATE qd_traces SET status = 'unverifiable'
+                UPDATE qd_agent_traces SET status = 'unverifiable'
                 WHERE parent_id IS NULL
                   AND exit_date IS NULL
                   AND status = 'ok'
@@ -340,7 +340,7 @@ def query_pending_verify(days_old: int = 1, limit: int = 100) -> List[Dict[str, 
 
             cur.execute("""
                 SELECT id, exec_date, stock_code, stock_name, name, action, timeframe
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE parent_id IS NULL
                   AND exit_date IS NULL
                   AND status = 'ok'
@@ -391,7 +391,7 @@ def update_verify_results(
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_traces SET
+                UPDATE qd_agent_traces SET
                     exit_date = %s, exit_reason = %s,
                     pnl_pct = %s, hold_days = %s, correct = %s
                 WHERE id = %s AND parent_id IS NULL
@@ -421,7 +421,7 @@ def update_skill_verify(root_id: int, actual_direction: str):
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, direction, score
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE root_id = %s AND layer = 'skill' AND status = 'ok'
             """, (root_id,))
 
@@ -433,7 +433,7 @@ def update_skill_verify(root_id: int, actual_direction: str):
 
                 if verdict == "neutral":
                     cur.execute("""
-                        UPDATE qd_traces SET
+                        UPDATE qd_agent_traces SET
                             correct = NULL, calibration = 1.0
                         WHERE id = %s
                     """, (step_id,))
@@ -446,7 +446,7 @@ def update_skill_verify(root_id: int, actual_direction: str):
                     calibration = round(1.0 + confidence * 0.05, 4)
 
                 cur.execute("""
-                    UPDATE qd_traces SET correct = %s, calibration = %s
+                    UPDATE qd_agent_traces SET correct = %s, calibration = %s
                     WHERE id = %s
                 """, (correct, calibration, step_id))
 
@@ -478,7 +478,7 @@ def query_latest_root(stock_code: str) -> Optional[Dict[str, Any]]:
             cur.execute("""
                 SELECT id, exec_date, stock_code, stock_name, name,
                        score, action, direction, confidence, status
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE parent_id IS NULL AND stock_code = %s
                 ORDER BY created_at DESC LIMIT 1
             """, (stock_code,))
@@ -511,7 +511,7 @@ def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
             cur.execute("""
                 SELECT id, exec_date, stock_code, stock_name, name,
                        score, action, direction, confidence, status
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE parent_id IS NULL AND name = %s
                 ORDER BY created_at DESC LIMIT 1
             """, (chain_name,))
@@ -546,7 +546,7 @@ def mark_root_wrong(root_id: int):
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_traces SET
+                UPDATE qd_agent_traces SET
                     correct = FALSE,
                     calibration = 1.10,
                     human_reviewed = TRUE,
@@ -568,7 +568,7 @@ def mark_root_good(root_id: int):
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_traces SET
+                UPDATE qd_agent_traces SET
                     correct = TRUE,
                     calibration = 1.05,
                     human_reviewed = TRUE,
@@ -588,7 +588,7 @@ def delete_tree(root_id: int):
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM qd_traces WHERE root_id = %s", (root_id,))
+            cur.execute("DELETE FROM qd_agent_traces WHERE root_id = %s", (root_id,))
             deleted = cur.rowcount
             conn.commit()
             logger.info("[Store] 删除 trace 树 root_id=%d, 共 %d 条", root_id, deleted)
@@ -602,7 +602,7 @@ def get_penalty_count(stock_code: str) -> int:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT COUNT(*) as cnt FROM qd_traces
+                SELECT COUNT(*) as cnt FROM qd_agent_traces
                 WHERE parent_id IS NULL
                   AND stock_code = %s
                   AND human_verdict = 'negative_feedback'
@@ -620,7 +620,7 @@ def get_penalty_count_by_chain(chain_name: str) -> int:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT COUNT(*) as cnt FROM qd_traces
+                SELECT COUNT(*) as cnt FROM qd_agent_traces
                 WHERE parent_id IS NULL
                   AND name = %s
                   AND human_verdict = 'negative_feedback'
@@ -705,7 +705,7 @@ def get_chain_weights() -> Dict[str, float]:
 # （酿造）同源同目的，质量门口径不一致（此处 win_rate>=0.7/MIN_SAMPLES=1；酿造 证伪<=0.3）。
 # 等混合触发（重设计稿 §2.5）与迭代旁支稳定后二选一；建议保留酿造，本通道降级 debug 开关。
 def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None) -> Optional[List[str]]:
-    """查询 qd_traces 中已验证的工具序列（编排路径缓存）。
+    """查询 qd_agent_traces 中已验证的工具序列（编排路径缓存）。
 
     chain_name 格式: domain+verb+noun（如 finance+analyze+stock）。
     聚合同一工具序列的多条执行记录，取 win_rate 最高且 return_per_day 最优的。
@@ -740,7 +740,7 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
                 AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) as win_rate,
                 AVG(t.pnl_pct) as avg_pnl,
                 AVG(NULLIF(t.hold_days, 0)) as avg_hold_days
-            FROM qd_traces t
+            FROM qd_agent_traces t
             WHERE t.layer = 'chain'
               AND t.name = %s
               AND t.status = 'ok'
@@ -748,7 +748,7 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
               AND array_length(t.tools_called, 1) BETWEEN 1 AND %s
               {extra_where}
               AND NOT EXISTS (
-                  SELECT 1 FROM qd_traces child
+                  SELECT 1 FROM qd_agent_traces child
                   WHERE child.root_id = t.id
                     AND child.status = 'failed'
               )
@@ -867,7 +867,7 @@ def query_brew_ready(min_signal: float = BREW_MIN_SIGNAL, limit: int = 5) -> lis
                        COUNT(*) FILTER (WHERE t.correct IS NOT NULL) AS verified_total,
                        MAX(t.exec_date) AS last_date,
                        MIN(t.id) AS sample_root_id
-                FROM qd_traces t
+                FROM qd_agent_traces t
                 WHERE t.layer = 'chain' AND t.status = 'ok'
                   AND t.stock_code IS NOT NULL AND t.stock_code <> ''
                   AND position('unknown' in t.name) = 0
@@ -900,7 +900,7 @@ def query_brew_candidates(min_runs: int = 5, max_falsified_ratio: float = 0.3,
                           min_days_span: int = 0, limit: int = 5) -> list:
     """技能酿造候选（2026-09-18，用户方案：高频且验证效果好的节点树 → 酿成 Skill）。
 
-    按 chain_name 聚合 qd_traces 根节点，筛选：
+    按 chain_name 聚合 qd_agent_traces 根节点，筛选：
       - runs >= min_runs（高频：问得多的链才值得固化）；
       - 被回测证伪（correct=FALSE）占比 <= max_falsified_ratio（效果好：未被证伪/证伪少）；
       - 跨天数 >= min_days_span（0 = 不要求；用户提的"7 天周期"由调用方按 last_date 控制）。
@@ -918,7 +918,7 @@ def query_brew_candidates(min_runs: int = 5, max_falsified_ratio: float = 0.3,
                        COUNT(DISTINCT t.exec_date) AS days_span,
                        MAX(t.exec_date) AS last_date,
                        MIN(t.id) AS sample_root_id
-                FROM qd_traces t
+                FROM qd_agent_traces t
                 WHERE t.layer = 'chain' AND t.status = 'ok'
                   AND t.stock_code IS NOT NULL AND t.stock_code <> ''
                   AND position('unknown' in t.name) = 0   -- 不可归类链无酿造价值（LIKE 通配符会撞 psycopg2 占位符解析）
@@ -950,14 +950,14 @@ def get_run_tree_digest(root_id: int, max_children: int = 12) -> Optional[dict]:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT name, user_query, plan, tools_called FROM qd_traces WHERE id = %s
+                SELECT name, user_query, plan, tools_called FROM qd_agent_traces WHERE id = %s
             """, (root_id,))
             root = cur.fetchone()
             if not root:
                 cur.close()
                 return None
             cur.execute("""
-                SELECT name, status, output_summary FROM qd_traces
+                SELECT name, status, output_summary FROM qd_agent_traces
                 WHERE root_id = %s AND layer <> 'chain' ORDER BY id LIMIT %s
             """, (root_id, max_children))
             steps = []
@@ -983,7 +983,7 @@ def get_run_tree_digest(root_id: int, max_children: int = 12) -> Optional[dict]:
 # [AUDIT-MASK:B2|2026-09-19] 死代码实锤：仅定义+chain/__init__ 导出，全 backend 零生产调用方
 # （现役通道 = get_tool_weights + 调用方 <0.7 过滤）。统一清理阶段连同导出项删除。
 def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) -> set:
-    """聚合 qd_traces，返回低权重工具集合。
+    """聚合 qd_agent_traces，返回低权重工具集合。
 
     工具出现次数 >= min_appearances 且所在链路 win_rate < max_win_rate → 低权重。
     结果缓存 10 分钟，避免每次调用都聚合。
@@ -1004,8 +1004,8 @@ def query_low_weight_tools(min_appearances: int = 5, max_win_rate: float = 0.4) 
             cur = conn.cursor()
             cur.execute("""
                 SELECT child.name
-                FROM qd_traces child
-                JOIN qd_traces root ON child.root_id = root.id
+                FROM qd_agent_traces child
+                JOIN qd_agent_traces root ON child.root_id = root.id
                 WHERE child.layer = 'tool'
                   AND root.layer = 'chain'
                   AND root.correct IS NOT NULL
@@ -1043,7 +1043,7 @@ def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
             cur.execute(f"""
                 SELECT COUNT(*) as total,
                        COUNT(CASE WHEN correct IS NOT NULL THEN 1 END) as evaluated
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE parent_id IS NULL {chain_filter}
             """, params)
 
@@ -1055,7 +1055,7 @@ def get_eval_stats(chain_id: str = None) -> Dict[str, Any]:
             if result["evaluated_decisions"] > 0:
                 cur.execute(f"""
                     SELECT AVG(CASE WHEN correct THEN 1.0 ELSE 0.0 END) as acc
-                    FROM qd_traces
+                    FROM qd_agent_traces
                     WHERE parent_id IS NULL AND correct IS NOT NULL {chain_filter}
                 """, params)
                 acc = cur.fetchone()
@@ -1099,7 +1099,7 @@ def get_delta_digest(chain_name: str, since_date=None, since_root_id: int = None
             cur.execute(f"""
                 SELECT t.id, t.user_query, t.plan, t.correct, t.exec_date,
                        t.output_summary
-                FROM qd_traces t
+                FROM qd_agent_traces t
                 WHERE t.layer = 'chain' AND t.name = %s AND t.status = 'ok'
                   AND t.stock_code IS NOT NULL AND t.stock_code <> ''
                   {extra}

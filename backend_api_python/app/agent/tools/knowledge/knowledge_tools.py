@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """search_knowledge —— 执行期知识检索工具（提智方案 三波 T1，2026-09-24，署名：OpenClaw agent）。
 
 来源：`agent_tizhi_final_plan_20260923.md` §三 三波 T1（search_knowledge）+
@@ -8,7 +8,7 @@
 比公网 web_search 可控、带来源：
   ① 历史分析结论库 `qd_analysis_memory`（PG 全文检索，复用 rag/postgres_fts 的分词
      与查询语义——同一语义单元，不另造分词口径）；
-  ② 案例库 `qd_cases`（utils/case_memory，T+N 已定论的历史结论优先）。
+  ② 案例库 `qd_agent_cases`（utils/case_memory，T+N 已定论的历史结论优先）。
 
 关键设计点：
   · **只读语义**：查询本身只读；`PostgresFTSRetriever._ensure_schema` 首次调用会补
@@ -76,7 +76,7 @@ def _search_analysis_memory(query: str, count: int):
 
 
 def _search_case_memory(query: str, count: int):
-    """来源②：qd_cases 案例库（延迟标签已定论优先）。返回 (rows, note)。"""
+    """来源②：qd_agent_cases 案例库（延迟标签已定论优先）。返回 (rows, note)。"""
     try:
         from utils.case_memory import retrieve_cases
         cases = retrieve_cases(query, top_k=max(1, count))

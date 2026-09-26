@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Cron Jobs API — 定时任务 REST 接口。
 
@@ -42,7 +42,7 @@ def list_jobs():
     try:
         with _get_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM qd_cron_jobs ORDER BY id")
+            cur.execute("SELECT * FROM qd_agent_cron_jobs ORDER BY id")
             rows = cur.fetchall()
         jobs = [_row_to_dict(r) for r in rows]
         return jsonify({
@@ -95,7 +95,7 @@ def create_job():
         with _get_db() as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO qd_cron_jobs (name, cron_expr, mode, prompt, function_path, description)
+                INSERT INTO qd_agent_cron_jobs (name, cron_expr, mode, prompt, function_path, description)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (name, cron_expr, mode, prompt, function_path, description))
@@ -142,7 +142,7 @@ def update_job(job_id):
     try:
         with _get_db() as conn:
             cur = conn.cursor()
-            cur.execute(f"UPDATE qd_cron_jobs SET {', '.join(updates)} WHERE id = %s RETURNING id, enabled", params)
+            cur.execute(f"UPDATE qd_agent_cron_jobs SET {', '.join(updates)} WHERE id = %s RETURNING id, enabled", params)
             row = cur.fetchone()
             conn.commit()
 
@@ -173,7 +173,7 @@ def delete_job(job_id):
     try:
         with _get_db() as conn:
             cur = conn.cursor()
-            cur.execute("DELETE FROM qd_cron_jobs WHERE id = %s RETURNING id", (job_id,))
+            cur.execute("DELETE FROM qd_agent_cron_jobs WHERE id = %s RETURNING id", (job_id,))
             row = cur.fetchone()
             conn.commit()
 
@@ -201,7 +201,7 @@ def trigger_job(job_id):
     try:
         with _get_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, name, cron_expr, mode, prompt, function_path FROM qd_cron_jobs WHERE id = %s", (job_id,))
+            cur.execute("SELECT id, name, cron_expr, mode, prompt, function_path FROM qd_agent_cron_jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
 
         if not row:

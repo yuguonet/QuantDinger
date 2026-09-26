@@ -1,7 +1,7 @@
--- qd_cron_jobs — Agent 定时任务表
+﻿-- qd_agent_cron_jobs — Agent 定时任务表
 -- 由 Agent 通过 create_cron_job 工具创建，cron_worker 后台扫描执行。
 
-CREATE TABLE IF NOT EXISTS qd_cron_jobs (
+CREATE TABLE IF NOT EXISTS qd_agent_cron_jobs (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(128) NOT NULL,           -- 任务名称（Agent 可读）
     cron_expr       VARCHAR(64) NOT NULL,            -- 5 段式 cron: 分 时 日 月 周
@@ -20,10 +20,10 @@ CREATE TABLE IF NOT EXISTS qd_cron_jobs (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_cron_jobs_enabled ON qd_cron_jobs(enabled) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_enabled ON qd_agent_cron_jobs(enabled) WHERE enabled = TRUE;
 
-COMMENT ON TABLE qd_cron_jobs IS 'Agent 定时任务';
-COMMENT ON COLUMN qd_cron_jobs.cron_expr IS '5段式: 分 时 日 月 周, 如 0 18 * * 1-5';
-COMMENT ON COLUMN qd_cron_jobs.mode IS 'prompt=调agent.chat, function=直接调Python函数';
-COMMENT ON COLUMN qd_cron_jobs.function_path IS '点分路径: app.agent.chain.evaluator.auto_evaluate';
-COMMENT ON COLUMN qd_cron_jobs.one_shot IS 'TRUE=执行一次后自动删除，FALSE=按cron循环调度';
+COMMENT ON TABLE qd_agent_cron_jobs IS 'Agent 定时任务';
+COMMENT ON COLUMN qd_agent_cron_jobs.cron_expr IS '5段式: 分 时 日 月 周, 如 0 18 * * 1-5';
+COMMENT ON COLUMN qd_agent_cron_jobs.mode IS 'prompt=调agent.chat, function=直接调Python函数';
+COMMENT ON COLUMN qd_agent_cron_jobs.function_path IS '点分路径: app.agent.chain.evaluator.auto_evaluate';
+COMMENT ON COLUMN qd_agent_cron_jobs.one_shot IS 'TRUE=执行一次后自动删除，FALSE=按cron循环调度';

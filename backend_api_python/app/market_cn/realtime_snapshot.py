@@ -11,14 +11,14 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
     → collect_realtime_snapshot()          ← 本文件
       → basicinfo_db.market_all_codes()    ← 股票列表
       → coordinator.coordinate_batch_quotes() ← 多源并发拉取
-      → UPSERT 到 realtime_snapshot_YYYY
+      → UPSERT 到 realtime_snapshot 单表
 
   scheduler.py (post_market_batch)
     → backfill_db.run_1m()                 ← 盘后精确1m K线
 
 核心职责:
   1. 盘中每分钟拉取全市场实时行情快照 (原始数据)
-  2. 存入独立表 realtime_snapshot_YYYY (按年分表)
+  2. 存入独立表 realtime_snapshot (单表，不按年分表)
   3. 供盘中 VWAP/换手率等指标直接读取，不经过 1m K 线中转
 
 设计原则:
@@ -26,8 +26,9 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
   2. ON CONFLICT (symbol, time) DO UPDATE 幂等写入，重复跑不产生重复数据
   3. 独立表，不与 kline 表混用
   4. 表自动创建 (CREATE TABLE IF NOT EXISTS)，无需手动建表
+  5. 单表，保留 KEEP_DAYS 天历史（默认 8 天），过期自动清理
 
-表结构 (realtime_snapshot_YYYY):
+表结构 (realtime_snapshot):
   核心字段 — 与 coordinator 返回的行情 dict 字段一一对应:
     symbol, time, "last", open, high, low, "previousClose", volume
   扩展字段 — extras JSONB，各源返回的额外数据 (amount/change/changePercent 等)，
@@ -53,24 +54,23 @@ logger = get_logger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# 表名前缀 — 按年分表: realtime_snapshot_YYYY
-_TABLE_PREFIX = "realtime_snapshot"
+# 单表名 — 2026-09-26 由按年分表改为单表（KEEP_DAYS 清理机制已控量）
+_TABLE = "realtime_snapshot"
 
 
 # ================================================================
 # 建表
 # ================================================================
 
-def _ensure_snapshot_table(year: int):
-    """确保快照表存在 (idempotent)"""
+def _ensure_snapshot_table():
+    """确保 realtime_snapshot 单表存在 (idempotent)"""
     from app.utils.db_market import get_market_db_manager
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
-    table = f"{_TABLE_PREFIX}_{year}"
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{table}" (
+                CREATE TABLE IF NOT EXISTS "{_TABLE}" (
                     symbol           VARCHAR(16) NOT NULL,
                     time             TIMESTAMP WITHOUT TIME ZONE NOT NULL,
                     name             VARCHAR(64),
@@ -151,9 +151,9 @@ def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str) -> List[Dict
 # DB 写入 (UPSERT)
 # ================================================================
 
-def _bulk_upsert(records: List[Dict], year: int) -> int:
+def _bulk_upsert(records: List[Dict]) -> int:
     """
-    批量 UPSERT 快照到 realtime_snapshot_YYYY。
+    批量 UPSERT 快照到 realtime_snapshot (单表)。
 
     ON CONFLICT (symbol, time) DO UPDATE — 幂等，同一 symbol+time 覆盖更新。
     按 symbol 分组写入，单个 symbol 失败不影响其他。
@@ -170,7 +170,6 @@ def _bulk_upsert(records: List[Dict], year: int) -> int:
 
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
-    table = f"{_TABLE_PREFIX}_{year}"
 
     # 按 symbol 分组
     by_symbol: Dict[str, List[Dict]] = {}
@@ -191,7 +190,7 @@ def _bulk_upsert(records: List[Dict], year: int) -> int:
                 for r in recs
             ]
             sql = f"""
-                INSERT INTO "{table}"
+                INSERT INTO "{_TABLE}"
                     (symbol, time, name, "last", open, high, low,
                      "previousClose", change, "changePercent", volume, extras)
                 VALUES %s
@@ -236,21 +235,26 @@ def _is_trading_collect_time(now: datetime) -> bool:
 
 
 # ================================================================
-# 数据清理: 删除超过5天的快照数据
+# 数据清理: 删除超过 KEEP_DAYS 天的快照数据
 # ================================================================
 
-def _cleanup_old_snapshots(year: int, keep_days: int = 5):
-    """删除 realtime_snapshot_YYYY 中超过 keep_days 天的数据"""
+# 快照保留天数（2026-09-26 由 5→8）。
+# 盘中策略回看窗口、资金流近似计算、hub minute_live 当日回看均依赖此数据，
+# 保留 8 天可覆盖完整两周工作日（含一个周末）。
+KEEP_DAYS = 8
+
+
+def _cleanup_old_snapshots(keep_days: int = KEEP_DAYS):
+    """删除 realtime_snapshot 单表中超过 keep_days 天的数据（天然跨年）"""
     from app.utils.db_market import get_market_db_manager
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
-    table = f"{_TABLE_PREFIX}_{year}"
     cutoff = datetime.now(TZ_CN) - timedelta(days=keep_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d 00:00:00")
     try:
         with pool.connection() as conn:
             cur = conn.cursor()
-            cur.execute(f'DELETE FROM "{table}" WHERE time < %s', (cutoff_str,))
+            cur.execute(f'DELETE FROM "{_TABLE}" WHERE time < %s', (cutoff_str,))
             deleted = cur.rowcount
             conn.commit()
             cur.close()
@@ -319,12 +323,11 @@ def collect_realtime_snapshot() -> Dict:
 
     # ── 3. 提取原始快照 ──
     ts_str = now.strftime("%Y-%m-%d %H:%M:00")
-    year = now.year
     records = _extract_snapshot_records(quotes, ts_str)
 
     # ── 4. 建表 + UPSERT ──
-    _ensure_snapshot_table(year)
-    written = _bulk_upsert(records, year)
+    _ensure_snapshot_table()
+    written = _bulk_upsert(records)
 
     elapsed = time.time() - t0
     fetched = len(quotes)
@@ -347,8 +350,8 @@ def collect_realtime_snapshot() -> Dict:
             len(missing_sample), ", ".join(missing_sample),
         )
 
-    # ── 5. 清理超过5天的过期数据 ──
-    _cleanup_old_snapshots(year, keep_days=5)
+    # ── 5. 清理过期数据（保留 KEEP_DAYS 天） ──
+    _cleanup_old_snapshots(keep_days=KEEP_DAYS)
 
     return {
         "status": "ok" if success_rate > 80 else "error",

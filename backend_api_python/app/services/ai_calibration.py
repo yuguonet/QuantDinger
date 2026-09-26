@@ -64,7 +64,7 @@ class AICalibrationService:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS qd_ai_calibration (
+                    CREATE TABLE IF NOT EXISTS qd_agent_decision_calibration (
                         id SERIAL PRIMARY KEY,
                         market VARCHAR(50) NOT NULL,
                         buy_threshold DECIMAL(10,4) NOT NULL,
@@ -79,14 +79,14 @@ class AICalibrationService:
                 # Index for latest lookup
                 cur.execute(
                     """
-                    CREATE INDEX IF NOT EXISTS idx_ai_calibration_market_validated_at
-                    ON qd_ai_calibration(market, validated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_agent_decision_calibration_market_validated_at
+                    ON qd_agent_decision_calibration(market, validated_at DESC);
                     """
                 )
                 db.commit()
                 cur.close()
         except Exception as e:
-            logger.error(f"Failed to ensure qd_ai_calibration table: {e}", exc_info=True)
+            logger.error(f"Failed to ensure qd_agent_decision_calibration table: {e}", exc_info=True)
 
     def get_latest(self, market: str) -> Dict[str, Any]:
         """
@@ -104,7 +104,7 @@ class AICalibrationService:
                     """
                     SELECT buy_threshold, sell_threshold,
                            min_consensus_abs_override, quality_hold_threshold
-                    FROM qd_ai_calibration
+                    FROM qd_agent_decision_calibration
                     WHERE market = %s
                     ORDER BY validated_at DESC
                     LIMIT 1
@@ -277,7 +277,7 @@ class AICalibrationService:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    INSERT INTO qd_ai_calibration
+                    INSERT INTO qd_agent_decision_calibration
                       (market, buy_threshold, sell_threshold,
                        min_consensus_abs_override, quality_hold_threshold,
                        validated_at, created_at)

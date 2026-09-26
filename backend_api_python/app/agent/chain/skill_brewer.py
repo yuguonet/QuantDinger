@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """chain/skill_brewer.py — 技能酿造器（2026-09-18，用户方案）
 
-思路：高频且回测验证效果好的节点树（qd_traces），周期性由 LLM 编译成
+思路：高频且回测验证效果好的节点树（qd_agent_traces），周期性由 LLM 编译成
 SKILL.md（auto_ 前缀目录），下次同类问题 planner 优先技能调用——
 "用数据库代替 Hermes 的 Skill 固化，回测 = 给编排 Skill 打分"。
 

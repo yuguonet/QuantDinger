@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Agent CLI — 命令行入口（壳）。
@@ -123,7 +123,7 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
 def _flush_and_exit(code: int = 0) -> None:
     """确保输出落盘后直接结束进程。
 
-    2026-09-14：任务跑完（结果已打印、决策树与 qd_traces 已落库）后进程却挂住不退出。
+    2026-09-14：任务跑完（结果已打印、决策树与 qd_agent_traces 已落库）后进程却挂住不退出。
     原因不在 agent：数据源层有**模块级长生命周期线程池**
     （`app/data_sources/coordinator.py` 的 `_timeout_pool` / `_mkline_timeout_pool`），
     而 `concurrent.futures` 自身注册的 atexit 钩子会 **join** 这些 worker——只要有一个

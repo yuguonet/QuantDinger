@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 nodes.py — Graph 节点定义
 
@@ -6,7 +6,7 @@ nodes.py — Graph 节点定义
   - chat_node：RAG + 实体解析 + 意图分类 + 简单问题直接回答
   - plan_node：生成任务描述 + step_budget（复盘时带前轮结果）
   - execute_node：单 CodeAgent 执行，跨轮复用实例
-  - finalize_node：格式化汇总 + 保存 memory + trace.finish() 写入 qd_traces
+  - finalize_node：格式化汇总 + 保存 memory + trace.finish() 写入 qd_agent_traces
 
 每个节点签名为 async def node(state: dict) -> dict | None：
   - 输入：完整状态
@@ -343,7 +343,7 @@ def _set_llm_timeout(agent, timeout_seconds: int):
 # 代码执行伪工具（2026-09-24）：smolagents CodeAgent 的 step.tool_calls 恒为代码执行器
 # 自身（python_interpreter），**不是**真实工具调用。旧实现把它当工具名写进工具层，并且
 # 在 `if not tool_name and code_action` 处被它短路 ⇒ code_action 提取永不执行，
-# 工具层（qd_traces TOOL 节点）与评测集工具面回收**全程只有 python_interpreter**。
+# 工具层（qd_agent_traces TOOL 节点）与评测集工具面回收**全程只有 python_interpreter**。
 # 2026-09-24 评测集首跑基线实测：3 条用例 used_tools 均为 ["python_interpreter"]。
 _PSEUDO_CODE_TOOLS = frozenset({"python_interpreter", "final_answer"})
 
@@ -2088,7 +2088,7 @@ def make_execute_node(ctx: NodeContext):
         # 实体不在此重复注入（2026-09-11 去冗余，审计 P2）：resolver 的 effective_input
         # 已含实体 → plan task 基于 effective_input 生成 → 【任务】段已带实体；原始关键词
         # 由下方【用户原始输入】段保底。旧实现同一标的信息最多出现 3 次，纯 token 浪费。
-        # state.entity_code 仍保留给 trace/finalize 写 qd_traces 使用，勿删字段。
+        # state.entity_code 仍保留给 trace/finalize 写 qd_agent_traces 使用，勿删字段。
         task_parts = []
         if state.get("context"):
             task_parts.append(f"【参考资料】\n{state['context']}")
@@ -2347,7 +2347,7 @@ def make_finalize_node(ctx: NodeContext):
           1. memory 存原始 result_raw（复盘时 plan_node 拿到真实进度）
           2. 追加失败工具信息
           3. 格式化（仅 task 模式 + 有工具产出时，只影响最终输出给用户）
-          4. trace.finish() 写 JSONL + qd_traces（Evaluator/Feedback 用）
+          4. trace.finish() 写 JSONL + qd_agent_traces（Evaluator/Feedback 用）
         """
         session_id = state.get("session_id", "default")
         direct_answer = state.get("direct_answer", "")
@@ -2356,7 +2356,7 @@ def make_finalize_node(ctx: NodeContext):
         # 否则 LLM 格式化版式一变，score/direction 的 regex 提取随之失效（审计 P1-3）。
         raw_agent_output = state.get("result_raw", "") or direct_answer or ""
         # run 失败判定（P1-3 配套）：执行异常（含 LLM 网关 5xx）的 run 只留错误痕迹，
-        # 不作为"成功分析"进入 qd_traces 提取/回测统计——否则一次网关故障会造出一条
+        # 不作为"成功分析"进入 qd_agent_traces 提取/回测统计——否则一次网关故障会造出一条
         # direction="neutral"、confidence=0.5 的伪决策记录参与权重训练（root_id=1737 事故）。
         # 直接回答（chat）路径无 result_raw，不算失败。
         # 双通道判定：_run_error 显式标记 + 错误前缀兜底（防未来新分支漏标）。
@@ -2441,7 +2441,7 @@ def make_finalize_node(ctx: NodeContext):
             except Exception as e:
                 logger.warning("[Finalize] 格式化失败，使用原始数据: %s", e)
 
-        # ── 6. trace.finish() 写 JSONL + qd_traces ──
+        # ── 6. trace.finish() 写 JSONL + qd_agent_traces ──
         trace = state.get("_trace")
         root_id = None   # 6b 案例落库用；finish 失败/未跑时保持 None（防 UnboundLocalError）
         if trace:

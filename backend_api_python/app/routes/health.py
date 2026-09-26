@@ -1,4 +1,4 @@
-"""
+﻿"""
 健康检查路由
 """
 import json
@@ -47,7 +47,7 @@ def cron_worker_status():
 
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE enabled) as enabled FROM qd_cron_jobs")
+            cur.execute("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE enabled) as enabled FROM qd_agent_cron_jobs")
             row = cur.fetchone()
 
         return jsonify({

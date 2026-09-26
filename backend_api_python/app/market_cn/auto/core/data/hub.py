@@ -2,14 +2,14 @@
 """data/hub.py — auto/ 唯一数据出口 (统一数据层, D1 2026-09-09, 设计见 tmp/自动策略架构评估与改进方案.md §3)
 
 用途: 策略/扫描/监控/回测一律经本模块取数, 禁止直连物理源
-     (kline 1D 分区表 / kline_1m_YYYY / realtime_snapshot_YYYY)。
+     (kline 1D 分区表 / kline_1m_YYYY / realtime_snapshot)。
 接口形态说明: 设计稿画的是 DataHub 类, 落地改为模块级函数 (与 data/kline.py 现有
 风格一致, 调用点改动最小); 函数名即接口, 语义不变。
 
 数据通道与时效硬事实 (用户 09-09 说明):
   - daily:      1D 分区表, qfq, 最大 5 年 —— 盘后更新;
   - minute_1m:  kline_1m_YYYY, 不复权原始价, 最大 ~100 工作日 —— 盘后回填;
-  - 盘中唯一通道: realtime_snapshot_YYYY (60s/拍, 保留 5 工作日, 可能丢拍) ——
+  - 盘中唯一通道: realtime_snapshot (60s/拍, 保留 8 天, 可能丢拍) ——
     quote/market_snapshot/day_series/minute_live/daily_live 合成段全部来自它;
   - minute_live 输出按 mi 标准化并丢弃无效槽位 (缺口容忍), 调用方按槽位数自判数据是否足够;
   - lhb: 只读引用 market_cn/dragon_tiger_store (名单型事件数据, 不 OHLVC 化);
@@ -32,7 +32,7 @@
   - 快照 open/high/low 是当日累计值 (非分钟 bar), volume 是累计量 → minute_live 内部差分;
   - 1m 为不复权原始价, daily 为 qfq: 跨层混算的除权偏差是已知限度, 换算用
     adjustment.unadj_to_qfq 由调用方显式做, hub 不静默换算;
-  - snapshot 表按年分表 (realtime_snapshot_YYYY), 跨年对账/回看需注意。
+  - snapshot 表按年分表 (realtime_snapshot), 跨年对账/回看需注意。
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ __all__ = [
 
 
 # ================================================================
-# 内部: 快照通道 (realtime_snapshot_YYYY)
+# 内部: 快照通道 (realtime_snapshot 单表)
 # ================================================================
 
 def _snapshot_pool():
@@ -63,9 +63,8 @@ def _snapshot_pool():
     return get_market_db_manager()._get_pool("CNStock")
 
 
-def _snapshot_table(year=None):
-    from datetime import datetime
-    return f"realtime_snapshot_{year or datetime.now().year}"
+# 2026-09-26 由按年分表改为单表
+_SNAPSHOT_TABLE = "realtime_snapshot"
 
 
 def _rows(cur):
@@ -79,14 +78,13 @@ def _fetch_snapshots_by_date(codes, date=None):
         return {}
     from datetime import datetime
     d = date or datetime.now().strftime("%Y-%m-%d")
-    year = int(d[:4])
     try:
         pool = _snapshot_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f'SELECT symbol, time, open, high, low, "last", "previousClose", volume '
-                    f'FROM "{_snapshot_table(year)}" '
+                    f'FROM "{_SNAPSHOT_TABLE}" '
                     f"WHERE symbol = ANY(%s) AND time >= %s AND time < %s "
                     f"ORDER BY symbol, time",
                     (list(codes), f"{d} 09:00:00", f"{d} 16:00:00"),

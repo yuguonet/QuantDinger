@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 评分校准（方案 A1b，2026-09-26）：把工具输出的启发式 score(0-100) 映射到
-P(方向正确=hit_rate) —— 用 sklearn IsotonicRegression 拟合 qd_traces 历史 (score, correct)。
+P(方向正确=hit_rate) —— 用 sklearn IsotonicRegression 拟合 qd_agent_traces 历史 (score, correct)。
 
 单一事实源：technical_analysis / bull_bear_research 的 hit_rate 字段一律从本模块取，
 禁止各工具自己算概率（项目红线：不各写一套阈值）。
@@ -89,7 +89,7 @@ def apply(skill_name: str, score: float) -> Optional[float]:
 
 
 def fit_score_map(skill_name: str) -> Dict:
-    """从 qd_traces 取 (score, correct) 拟合 isotonic，分桶存 qd_agent_weights。
+    """从 qd_agent_traces 取 (score, correct) 拟合 isotonic，分桶存 qd_agent_weights。
 
     返回 {skill, samples, buckets, status}：
       status='ok'            成功
@@ -113,7 +113,7 @@ def fit_score_map(skill_name: str) -> Dict:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT score, correct FROM qd_traces
+                SELECT score, correct FROM qd_agent_traces
                 WHERE skill_name = %s AND score IS NOT NULL AND correct IS NOT NULL
                   AND score >= 0 AND score <= 100
             """, (skill_name,))

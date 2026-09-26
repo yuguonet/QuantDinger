@@ -1,10 +1,10 @@
-"""
+﻿"""
 Agent 运行轨迹记录 + 结构化存储。
 
-统一采集：事件追加到 JSONL，finish() 时从事件流提取结构化字段写入 qd_traces。
-一套采集，一路输出（qd_traces），JSONL 作为附属日志。
+统一采集：事件追加到 JSONL，finish() 时从事件流提取结构化字段写入 qd_agent_traces。
+一套采集，一路输出（qd_agent_traces），JSONL 作为附属日志。
 
-AGENT_JSONL_ENABLED=false    只关本地 JSONL（agent_runs.jsonl），保留 qd_traces 落库与事件采集
+AGENT_JSONL_ENABLED=false    只关本地 JSONL（agent_runs.jsonl），保留 qd_agent_traces 落库与事件采集
 AGENT_TRACE_FILE=traces/agent_runs.jsonl
                             相对路径锚定到本包目录（app/agent/），不随进程 CWD 漂移
 AGENT_TRACE_MAX_CHARS=12000
@@ -73,7 +73,7 @@ def _trace_file_path() -> Path:
 def _jsonl_enabled() -> bool:
     """独立控制本地 JSONL 附属日志（agent_runs.jsonl）开关。
 
-    默认开启。设为 false 时只跳过 JSONL 文件写入，事件采集与 qd_traces
+    默认开启。设为 false 时只跳过 JSONL 文件写入，事件采集与 qd_agent_traces
     结构化落库不受影响——用于在保留回测闭环的前提下关掉本地磁盘日志。
     """
     return os.getenv("AGENT_JSONL_ENABLED", "true").lower() not in (
@@ -86,7 +86,7 @@ def _jsonl_enabled() -> bool:
 # 拿不到 route（意图路由）与工具观测语料 ⇒ 用例里声明的 `expect_route` 恒判失败、
 # `min_grounding_rate` 恒被跳过（"声明了没接线"的判分项，基线失真）。
 # 这三个量其实**已被本采集器收在内存里**（intent_verb / _tool_calls），只是没有出口：
-# JSONL 只写 events、qd_traces 需 DB。这里补一个机器可读侧车——
+# JSONL 只写 events、qd_agent_traces 需 DB。这里补一个机器可读侧车——
 # 设 AGENT_EVAL_DUMP 时每次 finish() 追加一行 JSON；不设则零开销、零行为变化。
 _EVAL_CORPUS_MAX = 200_000  # 观测语料总长上限（grounding 溯源用，防报告失控）
 
@@ -301,14 +301,14 @@ def _repro_meta(tool_manifest=None) -> dict:
 
 
 class AgentTraceRecorder:
-    """统一采集器：事件追加 + finish() 时写入 qd_traces。
+    """统一采集器：事件追加 + finish() 时写入 qd_agent_traces。
 
     生命周期：
       1. __init__(): 创建，记录 run_start
       2. record(): 各节点追加事件（plan/execute/error 等）
       3. set_stock() / set_skill() / add_tool_call(): 设置上下文
       4. finish(): 写 JSONL + 评测侧车（AGENT_EVAL_DUMP）+ 从 final_answer
-         提取结构化字段写入 qd_traces
+         提取结构化字段写入 qd_agent_traces
     """
 
     def __init__(
@@ -341,7 +341,7 @@ class AgentTraceRecorder:
         # 原始 CodeAgent 输出缓存（LLM 格式化前），供结构化字段提取
         self._raw_agent_output: str = ""
 
-        # run 级运行元数据（2026-09-17，设计文档 §8.3）：qd_traces 的
+        # run 级运行元数据（2026-09-17，设计文档 §8.3）：qd_agent_traces 的
         # session_id / user_query / model / total_tokens / plan 五列此前要么缺 DDL、
         # 要么有 DDL 无写入，这里负责采集，finish() 时随根节点落库。
         self._model: str = ""
@@ -473,7 +473,7 @@ class AgentTraceRecorder:
 
     def finish(self, final_answer: Optional[str] = None, status: str = "success",
                response: Optional[dict] = None) -> Optional[int]:
-        """结束追踪：写 JSONL + 写 qd_traces。
+        """结束追踪：写 JSONL + 写 qd_agent_traces。
 
         Args:
             final_answer: CodeAgent 原始输出（execute_node 在格式化前经 state 传入），
@@ -482,13 +482,13 @@ class AgentTraceRecorder:
             response: 附加响应数据（error 时取 response["error"] 落根节点）
 
         Returns:
-            qd_traces root_id，失败返回 None
+            qd_agent_traces root_id，失败返回 None
 
         注（2026-09-24 提智阶段 0.10，审计 A6）：错误 run 也落一条根节点
         （status='failed' + error），不进回测统计（query_pending_verify 只取 status='ok'）。
         """
         # 幂等保护：finalize_node 与 _chat_plan_graph 会对同一次 run 各调一次 finish，
-        # 重复执行会双写 JSONL + 双写 qd_traces（审计 P1-3）。第二次调用直接返回首写结果。
+        # 重复执行会双写 JSONL + 双写 qd_agent_traces（审计 P1-3）。第二次调用直接返回首写结果。
         if self._finished:
             return self._finished_root_id
         self._finished = True
@@ -496,7 +496,7 @@ class AgentTraceRecorder:
 
         self.record("run_end", {"status": status, "response": response or {}})
 
-        # 写 JSONL（受独立开关 AGENT_JSONL_ENABLED 控制；qd_traces 落库不受影响）
+        # 写 JSONL（受独立开关 AGENT_JSONL_ENABLED 控制；qd_agent_traces 落库不受影响）
         root_id = None
         if _jsonl_enabled():
             self._write_jsonl()
@@ -521,7 +521,7 @@ class AgentTraceRecorder:
         except Exception:
             pass
 
-        # 写 qd_traces。结构化字段提取源：优先 CodeAgent 原始输出（execute_node 在
+        # 写 qd_agent_traces。结构化字段提取源：优先 CodeAgent 原始输出（execute_node 在
         # LLM 格式化之前传入 finish），没有时回退 response.content —— 不再用格式化
         # 后的文本做 regex 提取，避免 LLM 版式变化污染 score/direction（审计 P1-3）。
         # 2026-09-24（提智阶段 0.10，审计 A6）：错误 run 也落根节点——旧实现只在
@@ -529,10 +529,10 @@ class AgentTraceRecorder:
         # "留一条带错误信息的根节点（供排查）"零兑现，排查"某天为什么没分析"DB 是空白。
         if status == "success":
             if final_answer:
-                self._finished_root_id = self._write_qd_traces(final_answer)
+                self._finished_root_id = self._write_qd_agent_traces(final_answer)
         else:
             err = str((response or {}).get("error") or "")
-            self._finished_root_id = self._write_qd_traces(
+            self._finished_root_id = self._write_qd_agent_traces(
                 final_answer or "", status="failed", error=err)
 
         return self._finished_root_id
@@ -540,10 +540,10 @@ class AgentTraceRecorder:
     def fail(self, error: Exception):
         """异常路径收口：与 finish() 走同一条链路（幂等 + 双写一致）。
 
-        旧实现只写 JSONL、不写 qd_traces——调用方（_chat_plan_graph except 分支）
+        旧实现只写 JSONL、不写 qd_agent_traces——调用方（_chat_plan_graph except 分支）
         与 finalize_node 的 finish() 是二选一执行，谁后执行谁决定落库形态。
         现在 run_error 事件照记，然后统一走 finish(status="error")：
-        qd_traces 会留一条带错误信息的根节点（供排查），但不参与回测统计。
+        qd_agent_traces 会留一条带错误信息的根节点（供排查），但不参与回测统计。
         """
         self.record("run_error", {
             "error_type": type(error).__name__,
@@ -618,11 +618,11 @@ class AgentTraceRecorder:
             # 附属出口失败不影响主链，但必须发声（不许静默降级）
             logger.warning("[Trace] 评测侧车写入失败 %s: %s", path, e)
 
-    # ── qd_traces 输出 ────────────────────────────────────────
+    # ── qd_agent_traces 输出 ────────────────────────────────────────
 
-    def _write_qd_traces(self, final_answer: str, status: str = "ok",
+    def _write_qd_agent_traces(self, final_answer: str, status: str = "ok",
                          error: str = "") -> Optional[int]:
-        """从 final_answer + 事件流提取结构化字段，构建 EvalNode 写入 qd_traces。
+        """从 final_answer + 事件流提取结构化字段，构建 EvalNode 写入 qd_agent_traces。
 
         status/error（2026-09-24，审计 A6）：成功 run 默认 status='ok' 走全量结构化提取；
         错误 run 传 status='failed' + error，只写根节点留痕（决策字段留空，
@@ -684,7 +684,7 @@ class AgentTraceRecorder:
                 analysis=final_answer[:2000],
                 # §8.3：run 级元数据落库。此前这五列要么有 DDL 无写入（恒空），
                 # 要么（plan）压根没有 DDL —— 而 store.py 的 INSERT 一直在写 plan，
-                # 缺列会让整条 INSERT 报错 ⇒ qd_traces 一条都写不进去。
+                # 缺列会让整条 INSERT 报错 ⇒ qd_agent_traces 一条都写不进去。
                 plan=self._plan,
                 session_id=self.session_id,
                 user_query=self.user_input,
@@ -749,15 +749,15 @@ class AgentTraceRecorder:
 
             root.tools_called = [tc["name"] for tc in self._tool_calls]
 
-            # 写入 qd_traces
+            # 写入 qd_agent_traces
             from chain import store
             execution_id = store.save_tree(root)
             if execution_id:
                 root.id = execution_id
-                logger.info("[Trace] qd_traces 写入: root_id=%d stock=%s chain=%s children=%d",
+                logger.info("[Trace] qd_agent_traces 写入: root_id=%d stock=%s chain=%s children=%d",
                             execution_id, stock_code, chain_name, len(root.children))
             return execution_id
 
         except Exception as e:
-            logger.warning("[Trace] qd_traces 写入失败: %s", e)
+            logger.warning("[Trace] qd_agent_traces 写入失败: %s", e)
             return None

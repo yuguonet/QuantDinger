@@ -48,7 +48,7 @@ def _snapshot_table_name() -> str:
     return f"realtime_snapshot_{datetime.now().year}"
 
 def fetch_realtime_snapshot(codes: List[str]) -> Dict[str, Dict]:
-    """从 realtime_snapshot_YYYY 读取最新快照"""
+    """从 realtime_snapshot 读取最新快照"""
     if not codes:
         return {}
     try:
@@ -105,7 +105,7 @@ def fetch_realtime_snapshot(codes: List[str]) -> Dict[str, Dict]:
         return {}
 
 def fetch_intraday_series(code: str, minutes: int = 240) -> List[Dict]:
-    """从 realtime_snapshot_YYYY 读取今日分时序列"""
+    """从 realtime_snapshot 读取今日分时序列"""
     try:
         from app.utils.db_market import get_market_db_manager
         mgr = get_market_db_manager()

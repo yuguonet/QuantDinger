@@ -1,11 +1,11 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Evaluator — 回溯评估引擎（重写版）。
 
-基于 qd_traces 表 + qd_agent_weights。
+基于 qd_agent_traces 表 + qd_agent_weights。
 
 核心流程（每日盘后自动运行）：
-  evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_traces
+  evaluate_pending()      → 按 timeframe 取实际行情，写回 qd_agent_traces
   update_weights()        → 统一更新 skill + factor 权重（原 update_skill_weights / update_factor_weights 已合并）
   auto_evaluate()         → 自动闭环
 
@@ -141,7 +141,7 @@ def _get_actual_return(
 # ═══════════════════════════════════════════════════════════════
 
 def _bump_eval_failure(root_id: int):
-    """累计单条记录的评估失败次数（写 qd_traces.error，'eval_failed:N' 前缀）。
+    """累计单条记录的评估失败次数（写 qd_agent_traces.error，'eval_failed:N' 前缀）。
 
     毒丸治理配套（审计 P0-1 断点C）：取不到行情的记录（退市/停牌/代码错误）此前
     会被静默跳过并永久占用评估队列。失败次数 >= 5 时由 store 侧置 unverifiable。
@@ -151,7 +151,7 @@ def _bump_eval_failure(root_id: int):
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                UPDATE qd_traces
+                UPDATE qd_agent_traces
                 SET error = 'eval_failed:' || (
                     COALESCE(
                         (regexp_match(COALESCE(error, ''), '^eval_failed:(\\d+)'))[1]::int, 0
@@ -167,7 +167,7 @@ def _bump_eval_failure(root_id: int):
 def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     """评估所有待验证的决策记录。
 
-    查找 qd_traces 中 exit_date IS NULL 的根节点，
+    查找 qd_agent_traces 中 exit_date IS NULL 的根节点，
     按 timeframe 取实际行情，写回验证结果。
 
     Args:
@@ -335,7 +335,7 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
 def update_weights(days: int = 90) -> Dict[str, Any]:
     """更新 qd_agent_weights 表（统一 skill + factor + tool 三层，同表分层）。
 
-    一次扫描 qd_traces，同时产出：
+    一次扫描 qd_agent_traces，同时产出：
       1. skill 层权重（按单位时间收益率）
       2. factor 层权重（带时间衰减的准确率）
       3. tool 层权重（按工具参与链路的 correct 率，含失败样本）
@@ -413,12 +413,12 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                     stats["tool_cleaned"] += 1
                     logger.info("[Evaluator] 已删除工具，权重行清理: %s", name)
 
-            # ② 一次扫描 qd_traces，同时聚合 skill 和 factor 数据
+            # ② 一次扫描 qd_agent_traces，同时聚合 skill 和 factor 数据
             cur.execute("""
                 SELECT t.name as skill_name, t.factors, t.pnl_pct,
                        t.hold_days, t.correct, r.exec_date
-                FROM qd_traces t
-                JOIN qd_traces r ON r.id = t.root_id
+                FROM qd_agent_traces t
+                JOIN qd_agent_traces r ON r.id = t.root_id
                 WHERE t.layer = 'skill'
                   AND t.status = 'ok'
                   AND t.correct IS NOT NULL
@@ -556,8 +556,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 SELECT child.name AS tool_name,
                        COUNT(*) AS n,
                        AVG(CASE WHEN root.correct THEN 1.0 ELSE 0.0 END) AS win_rate
-                FROM qd_traces child
-                JOIN qd_traces root ON child.root_id = root.id
+                FROM qd_agent_traces child
+                JOIN qd_agent_traces root ON child.root_id = root.id
                 WHERE child.layer = 'tool'
                   AND root.layer = 'chain'
                   AND root.correct IS NOT NULL
@@ -592,7 +592,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 SELECT t.name AS chain_name,
                        COUNT(*) AS n,
                        AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) AS win_rate
-                FROM qd_traces t
+                FROM qd_agent_traces t
                 WHERE t.layer = 'chain'
                   AND t.correct IS NOT NULL
                   AND t.exec_date >= %s
@@ -661,7 +661,7 @@ def get_eval_report(days: int = 30) -> Dict[str, Any]:
             cur.execute("""
                 SELECT COUNT(*) as total,
                        AVG(CASE WHEN correct THEN 1.0 ELSE 0.0 END) as acc
-                FROM qd_traces
+                FROM qd_agent_traces
                 WHERE parent_id IS NULL AND correct IS NOT NULL
                   AND exec_date >= %s
             """, (since,))
@@ -678,8 +678,8 @@ def get_eval_report(days: int = 30) -> Dict[str, Any]:
                 SELECT t.name,
                        COUNT(*) as cnt,
                        AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) as acc
-                FROM qd_traces t
-                JOIN qd_traces r ON r.id = t.root_id
+                FROM qd_agent_traces t
+                JOIN qd_agent_traces r ON r.id = t.root_id
                 WHERE t.layer = 'skill' AND t.correct IS NOT NULL
                   AND r.exec_date >= %s
                 GROUP BY t.name
