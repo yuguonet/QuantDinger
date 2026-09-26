@@ -5,8 +5,9 @@ stock_basic — 股票基本面扩展参数
     turnover_rate  换手率 (volume / circ_shares * 100)
     total_shares   总股本 (股)
     circ_shares    流通股本 (股)
-    pe_ratio       市盈率 (动态)
-    pb_ratio       市净率
+
+pe_ratio / pb_ratio 已于 2026-09-26 移除（不再从 stock_basic_info 表读取，
+实时估值应从 agent/tools/finance/data_tools.py 的腾讯实时估值获取）。
 
 脚本可用函数：
     query_stock(sym=None)  查询任意股票基本面信息
@@ -55,8 +56,7 @@ def register(ctx: dict) -> dict:
             total = float(info.get('total_shares', 0) or 0)
             df['total_shares'] = total
             df['circ_shares'] = circ
-            df['pe_ratio'] = float(info.get('pe_ratio', 0) or 0)
-            df['pb_ratio'] = float(info.get('pb_ratio', 0) or 0)
+            # pe_ratio/pb_ratio 不再从 basicinfo_db 读取（2026-09-26）
             if circ > 0:
                 df['turnover_rate'] = (df['volume'] / circ * 100).round(4)
             else:

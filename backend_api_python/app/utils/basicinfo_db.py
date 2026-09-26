@@ -135,8 +135,8 @@ CREATE TABLE IF NOT EXISTS stock_basic_info (
     list_date     VARCHAR(20)  DEFAULT '',     -- 上市日期（如 "2001-08-27"），按需补充
     total_shares  DOUBLE PRECISION DEFAULT 0,  -- 总股本（股），按需补充，0 表示未知
     circ_shares   DOUBLE PRECISION DEFAULT 0,  -- 流通股本（股），按需补充
-    pe_ratio      DOUBLE PRECISION DEFAULT 0,  -- 市盈率（动态），按需补充
-    pb_ratio      DOUBLE PRECISION DEFAULT 0,  -- 市净率，按需补充
+    -- pe_ratio / pb_ratio 已于 2026-09-26 移除：实时变动的估值指标不应存静态基本信息表
+    -- 实时 PE/PB 由 agent/tools/finance/data_tools.py 的腾讯实时估值获取
     status        VARCHAR(10)  DEFAULT 'active', -- 状态：active/suspended/delisted
     updated_at    TIMESTAMP    DEFAULT NOW()    -- 最后更新时间
 )
@@ -284,7 +284,7 @@ class StockBasicDB:
         更新策略是"非空覆盖"：
           - name / market：直接覆盖（名称和交易所可能变更）
           - industry / list_date：新值非空时覆盖，否则保留旧值
-          - total_shares / circ_shares / pe_ratio / pb_ratio：新值非零时覆盖
+          - total_shares / circ_shares：新值非零时覆盖
           - status / updated_at：直接覆盖
 
         这样设计的原因：
@@ -305,8 +305,7 @@ class StockBasicDB:
 
         ── Args ──
             stocks: 股票信息列表，每条至少包含 symbol 和 name
-                    可选字段: market_cn, industry, list_date, total_shares, circ_shares,
-                              pe_ratio, pb_ratio, status
+                    可选字段: market_cn, industry, list_date, total_shares, circ_shares, status
 
         ── Returns ──
             {
@@ -347,14 +346,12 @@ class StockBasicDB:
             valid_rows.append((
                 code,                            # symbol
                 name,                            # name
-                market_cn,                          # market_cn
+                market_cn,                       # market_cn
                 item.get("industry", ""),        # industry（默认空串）
                 item.get("concepts", ""),        # concepts（默认空串，逗号分隔）
                 item.get("list_date", ""),       # list_date（默认空串）
                 float(item.get("total_shares", 0) or 0),  # total_shares（None → 0）
                 float(item.get("circ_shares", 0) or 0),   # circ_shares
-                float(item.get("pe_ratio", 0) or 0),   # pe_ratio
-                float(item.get("pb_ratio", 0) or 0),   # pb_ratio
                 item.get("status", "active"),           # status
                 now,                                    # updated_at
             ))
@@ -371,7 +368,7 @@ class StockBasicDB:
         sql = """
             INSERT INTO stock_basic_info
                 (symbol, name, market_cn, industry, concepts, list_date,
-                 total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at)
+                 total_shares, circ_shares, status, updated_at)
             VALUES %s
             ON CONFLICT (symbol) DO UPDATE SET
                 -- 名称和交易所：直接覆盖（可能变更，如 ST 摘帽/更名）
@@ -387,9 +384,6 @@ class StockBasicDB:
                 -- 数值字段：只在新值 > 0 时覆盖（0 表示"未知"，不覆盖已知值）
                 total_shares = CASE WHEN EXCLUDED.total_shares > 0 THEN EXCLUDED.total_shares ELSE stock_basic_info.total_shares END,
                 circ_shares  = CASE WHEN EXCLUDED.circ_shares  > 0 THEN EXCLUDED.circ_shares  ELSE stock_basic_info.circ_shares  END,
-                -- pe_ratio/pb_ratio 可能为负数（亏损股），所以用 != 0 判断
-                pe_ratio   = CASE WHEN EXCLUDED.pe_ratio != 0 THEN EXCLUDED.pe_ratio ELSE stock_basic_info.pe_ratio END,
-                pb_ratio   = CASE WHEN EXCLUDED.pb_ratio != 0 THEN EXCLUDED.pb_ratio ELSE stock_basic_info.pb_ratio END,
                 -- 状态和时间：直接覆盖
                 status     = EXCLUDED.status,
                 updated_at = EXCLUDED.updated_at
@@ -513,12 +507,13 @@ class StockBasicDB:
                 "list_date": str,       -- 上市日期，如 "2001-08-27"
                 "total_shares": float,  -- 总股本（股），0 表示未知
                 "circ_shares": float,   -- 流通股本（股）
-                "pe_ratio": float,      -- 市盈率（动态），可为负数
-                "pb_ratio": float,      -- 市净率，可为负数
                 "status": str,          -- 状态：active / suspended / delisted
                 "updated_at": str       -- 最后更新时间（ISO 格式），无数据返回 None
             }
             未找到返回 None
+
+            注意：pe_ratio / pb_ratio 已于 2026-09-26 移除，不再返回。
+            实时估值请用 agent/tools/finance/data_tools.py 的 get_stock_info()。
         """
         self.ensure_table()
         keyword = (code_or_name or "").strip()
@@ -530,7 +525,7 @@ class StockBasicDB:
             # 优先级1: 按 symbol 精确匹配
             cur.execute(
                 "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                "       total_shares, circ_shares, status, updated_at "
                 "FROM stock_basic_info WHERE symbol = %s",
                 (keyword,),
             )
@@ -541,7 +536,7 @@ class StockBasicDB:
             # 优先级2: 按 name 精确匹配
             cur.execute(
                 "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                "       total_shares, circ_shares, status, updated_at "
                 "FROM stock_basic_info WHERE name = %s",
                 (keyword,),
             )
@@ -585,7 +580,7 @@ class StockBasicDB:
         with pool.cursor() as cur:
             cur.execute(
                 f"SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                f"       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                f"       total_shares, circ_shares, status, updated_at "
                 f"FROM stock_basic_info {where} ORDER BY symbol",
                 params,
             )
@@ -629,7 +624,7 @@ class StockBasicDB:
                 with pool.cursor() as cur:
                     cur.execute(
                         "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                        "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                        "       total_shares, circ_shares, status, updated_at "
                         "FROM stock_basic_info "
                         "WHERE (symbol LIKE %s OR name LIKE %s) AND status = 'active' "
                         "ORDER BY symbol LIMIT %s",
@@ -821,7 +816,7 @@ class StockBasicDB:
             with pool.cursor() as cur:
                 cur.execute(
                     "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                    "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                    "       total_shares, circ_shares, status, updated_at "
                     "FROM stock_basic_info "
                     "WHERE concepts LIKE %s AND status = %s ORDER BY symbol",
                     (pattern, status),
@@ -831,7 +826,7 @@ class StockBasicDB:
             with pool.cursor() as cur:
                 cur.execute(
                     "SELECT symbol, name, market_cn, industry, concepts, list_date, "
-                    "       total_shares, circ_shares, pe_ratio, pb_ratio, status, updated_at "
+                    "       total_shares, circ_shares, status, updated_at "
                     "FROM stock_basic_info "
                     "WHERE concepts LIKE %s ORDER BY symbol",
                     (pattern,),
@@ -1256,8 +1251,8 @@ class StockBasicDB:
 
         列顺序与 SELECT 语句一致：
           0: symbol, 1: name, 2: market_cn, 3: industry, 4: concepts,
-          5: list_date,  6: total_shares,  7: circ_shares, 8: pe_ratio,
-          9: pb_ratio,   10: status,    11: updated_at
+          5: list_date,  6: total_shares,  7: circ_shares,
+          8: status,    9: updated_at
 
         注意：float(row[x] or 0) 处理 NULL → 0.0 的转换。
         """
@@ -1270,10 +1265,9 @@ class StockBasicDB:
             "list_date":  row[5],
             "total_shares":  float(row[6] or 0),
             "circ_shares":   float(row[7] or 0),
-            "pe_ratio":   float(row[8] or 0),
-            "pb_ratio":   float(row[9] or 0),
-            "status":     row[10],
-            "updated_at": row[11].isoformat() if row[11] else None,
+            # pe_ratio / pb_ratio 已移除（2026-09-26），不再从 DB 返回
+            "status":     row[8],
+            "updated_at": row[9].isoformat() if row[9] else None,
         }
 
     def close(self):

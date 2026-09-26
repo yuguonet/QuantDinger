@@ -329,7 +329,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
             if stock:
                 db_result = {"stock_code": sym}
                 for fld in ("name", "industry", "total_shares", "circ_shares",
-                            "pe_ratio", "pb_ratio", "market_cn", "list_date"):
+                            "market_cn", "list_date"):
                     val = stock.get(fld)
                     if val is not None and val != "":
                         db_result[fld] = val
@@ -369,14 +369,10 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
                 logger.debug("get_stock_info(%s) cn_stock_info failed: %s", stock_code, e)
             return {}
 
-        # 2026-09-15 条件触发：basicinfo 已覆盖（有价格且估值非占位）→ 跳过 HTTP；
-        # cn_stock_info 兜底实测 ~16s，故超时放宽 STOCK_INFO_HTTP_TIMEOUT(默认 20s)。
-        # 2026-09-21 收紧：DB 有非零估值（回填机制已上线）即跳过 20s 大竞赛——
-        # 价格/换手等实时字段由后置腾讯 3s 补全负责，不为它们付 20s。
-        _needs_http = (
-            not db_result
-            or float(db_result.get("pe_ratio") or 0) == 0
-        )
+        # 2026-09-26: DB 不再存 pe_ratio/pb_ratio，HTTP 竞赛仅用于 DB 未命中时兜底
+        # DB 命中（有 name）→ 跳过 20s 大竞赛，实时估值由腾讯 3s 补全负责
+        # DB 未命中 → 走完整 HTTP 竞赛兜底
+        _needs_http = not db_result or not db_result.get("name")
         _http_timeout = int(os.getenv("STOCK_INFO_HTTP_TIMEOUT", "20"))
 
         http_result: Dict[str, Any] = {}
@@ -442,24 +438,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         except Exception as e:
             logger.debug("get_stock_info(%s) 腾讯估值补全跳过: %s", stock_code, e)
 
-        # ── 5) 估值回填 DB（2026-09-21）：腾讯估值是实时快照，写回 stock_basic_info
-        # 让下次毫秒级命中（pe_ratio/pb_ratio 非零才覆盖，upsert 已有 CASE 保护）。
-        if (result.get("pe_ttm") or result.get("pb")) and result.get("price"):
-            try:
-                from app.utils.basicinfo_db import get_stock_basic_db
-                get_stock_basic_db().upsert_stocks([{
-                    "symbol": sym,
-                    "name": result.get("name", ""),
-                    "market_cn": result.get("market_cn") or "",
-                    "pe_ratio": float(result.get("pe_ttm") or 0),
-                    "pb_ratio": float(result.get("pb") or 0),
-                }])
-            except Exception as e:
-                logger.debug("get_stock_info(%s) 估值回填 DB 跳过: %s", stock_code, e)
-
-        # ── 6) ROE 补全（2026-09-21）：stock_basic_info 无 ROE 列、腾讯行情接口
-        # 也不带 ROE。cn_stock_info（新浪财务指标页）有，但完整拉取 ~16s 太重，
-        # 只在 ROE 缺失时按需补（8s 上限，失败不阻塞——ROE 属增强字段）。
+        # ── 5) ROE 补全（2026-09-21）──
         if not result.get("roe"):
             try:
                 # 2026-09-21 实测：get_cn_stock_info 全量 27s 太重；_sina_finance
