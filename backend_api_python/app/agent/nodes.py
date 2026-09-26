@@ -2691,6 +2691,18 @@ def make_verify_node(ctx: NodeContext):
             if len([n for n in _VERIFY_DIGIT_RE.findall(text) if "." in n]) >= 6:
                 soft.append("逻辑性:含较多小数结论但无『（估算）』标注，建议核对来源")
 
+        # ── 金融口径四查（soft，A2a 2026-09-26）──
+        # 前视/复权口径/样本量/新鲜度，缺声明只 warning 不阻断；
+        # 锚点优先用 state.as_of，其次从 corpus 推断。
+        try:
+            from utils.finance_checks import check_finance_discipline
+            anchor = str(state.get("as_of") or "")
+            ok, fw = check_finance_discipline(text, anchor=anchor, corpus=corpus)
+            if not ok:
+                soft.extend(fw)
+        except Exception as e:
+            logger.debug("[Verify] 金融口径检查跳过: %s", e)
+
         # ── 三级路由 ──
         if fatal and int(state.get("verify_retry", 0) or 0) < 1:
             route = "REPAIR_ONCE"

@@ -126,6 +126,16 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
 
     confidence = min(1.0, max(0.3, (len(bull_factors) + len(bear_factors)) / 8))
 
+    # ── A1c 校准命中率（score→P(方向正确)）──
+    # 有校准数据时 confidence 直接取 hit_rate（P(方向正确)），无则回退原因子数逻辑。
+    try:
+        from utils.calibration import apply as _cal_apply
+        hit_rate = _cal_apply("bull_bear_research", final_score)
+    except Exception:
+        hit_rate = None
+    if hit_rate is not None:
+        confidence = hit_rate
+
     signal_parts = []
     if bull_signals:
         signal_parts.append(f"多:{','.join(bull_signals[:2])}")
@@ -142,12 +152,36 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
     all_signals = (bull_signals or []) + (bear_signals or [])
     md = f"多空分析 {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if hit_rate is not None:
+        md += f" 历史命中率{hit_rate*100:.0f}%"
     if factors:
         md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
     if all_signals:
         md += "\n" + " ".join(all_signals[:3])
     md += f"\n{verdict}"
     analysis = md
+
+    # ── A3 缺数据声明 ──
+    # data 各数据源若含 "error" 键则视为缺失，统一收集到 missing_data。
+    missing_data = [k for k, v in data.items()
+                    if isinstance(v, dict) and "error" in v]
+
+    # ── A4 可证伪条件（若 X 发生则本判断失效）──
+    _trend = data.get("trend", {}) if isinstance(data.get("trend"), dict) else {}
+    _ma5 = _trend.get("ma5")
+    _ma20 = _trend.get("ma20")
+    _falsifiable = []
+    if direction == "bullish":
+        if _ma5 and _ma20:
+            _falsifiable.append(f"MA5({_ma5:.2f})跌破MA20({_ma20:.2f})")
+        _falsifiable.append(f"多空分({final_score:.0f})跌破55")
+    elif direction == "bearish":
+        if _ma5 and _ma20:
+            _falsifiable.append(f"MA5({_ma5:.2f})突破MA20({_ma20:.2f})")
+        _falsifiable.append(f"多空分({final_score:.0f})突破45")
+    else:
+        _falsifiable.append(f"多空分({final_score:.0f})突破60或跌破40")
+    falsifiable_conditions = "；".join(_falsifiable) if _falsifiable else "数据不足"
 
     _r = {
         "score": final_score,
@@ -157,6 +191,14 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         "factors": factors,
         "analysis": analysis,
         "status": "ok",
+        # A1a：权重是否来自 qd_agent_weights 校准（透传 _analyze_trend 的 calibrated）
+        "calibrated": data.get("trend", {}).get("calibrated", False) if isinstance(data.get("trend"), dict) else False,
+        # A1c：score→P(方向正确)，无校准数据时为 None
+        "hit_rate": hit_rate,
+        # A3：缺失的数据源名列表
+        "missing_data": missing_data,
+        # A4：可证伪条件
+        "falsifiable_conditions": falsifiable_conditions,
         "output_data": {
             "bull_case": {
                 "score": bull_score,
@@ -282,12 +324,30 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
                     kdj_score = 30
 
             # ── 综合评分 ──
+            # A1a 因子权重接线（2026-09-26）：五维权重优先从 qd_agent_weights 取校准值，
+            # 无数据回退启发式常量 + calibrated=false。
+            # 注意：当前 factors 输出名是"多头:xxx"/"空头:xxx"，与维度名(ma/macd/...)不匹配，
+            # 故 get_factor_weights 暂返回空 → 走回退分支。A1b 统一 factors 命名后自动生效。
+            _BB_DEFAULT_WEIGHTS = {"ma": 0.30, "macd": 0.25, "rsi": 0.20,
+                                   "boll": 0.15, "kdj": 0.10}
+            try:
+                from chain.store import get_factor_weights
+                _bb_calibrated = get_factor_weights("bull_bear_research")
+            except Exception:
+                _bb_calibrated = {}
+            if _bb_calibrated:
+                _bb_w = _bb_calibrated
+                _bb_calibrated_flag = True
+            else:
+                _bb_w = _BB_DEFAULT_WEIGHTS
+                _bb_calibrated_flag = False
+
             total_score = int(
-                ma_score * 0.30 +
-                macd_score * 0.25 +
-                rsi_score * 0.20 +
-                boll_score * 0.15 +
-                kdj_score * 0.10
+                ma_score * _bb_w.get("ma", 0.30) +
+                macd_score * _bb_w.get("macd", 0.25) +
+                rsi_score * _bb_w.get("rsi", 0.20) +
+                boll_score * _bb_w.get("boll", 0.15) +
+                kdj_score * _bb_w.get("kdj", 0.10)
             )
             total_score = max(0, min(100, total_score))
 
@@ -341,6 +401,8 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
                 "signal_score": signal_score,
                 "all_signals": all_signals,
                 "data_points": len(closes),
+                # A1a：权重是否来自 qd_agent_weights 校准
+                "calibrated": _bb_calibrated_flag,
             }
         except Exception as e:
             logger.error("_analyze_trend(%s) failed: %s", codes, e)

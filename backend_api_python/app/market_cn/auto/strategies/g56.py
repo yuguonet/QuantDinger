@@ -95,6 +95,18 @@ SIGNAL_OPEN_RANGE_HINT = " · 开[-3%,+3%]优先·回避≥+4%高开"
 # ================================================================
 HOLD_DAYS = 7          # 最长持有交易日 (含入场日, 出场模拟 d=1..7)
 STOP_LOSS = -8.0       # 硬止损 % (框架 initial_stop 默认同值, 双保险)
+# 规则门 (2026-09-25): 信号日收盘相对 MA20 下限 %。与 score **无关** ——
+# score 只做排序/展示 (随日变动); 本阈值是硬规则。300d 对照 (n=1191 基线):
+#   ma20>=-4 → n=748 / 胜率80.7%(+1.4pp) / 均收8.52(基本持平) / 盈亏比1.83
+#   背景: 近期 600613/002437/002412 反抽失败票 dist_ma20 多在 -3.4~-6.8。
+#   trail/峰值逃顶经对照 **否决** (均收 8.69→2.5, 大肉被砍; 见 tmp/g56_round1.json)。
+DIST_MA20_MIN = -4.0
+# D-1 涨停子集紧止损 (2026-09-25): 归因确认信号日涨停呈两极 (大肉/大血), 46 笔中
+# 14 笔≤-5% / 13 笔≥+10%。对该子集用 -5% 止损, 其余仍 -8%。
+# 320d 对照 (含 DIST_MA20_MIN): 深亏≤-7.5% 103→91, 胜率 80.7→80.2, 均收持平。
+# ⚠️ 不是改全体止损 (全体 -5% 胜率掉到 75%); 只收 D-1 涨停尾部。
+# 依据: docs/analysis_output/g56_涨停与龙虎榜事件归因_20260924.md §A5
+STOP_LOSS_LU = -5.0
 R56 = {"main": 0.51, "gem_star": 0.66}        # rhist_chg 门 = 150天池内Q5
 ATR_Q5 = {"main": 5.07, "gem_star": 6.42}     # G1池 ATR14% 下限 = 板块池内Q5
 MAIN_RMED_MIN = 0.25     # 主板 regime 门: 池 rhist_chg 中位数 (raw)
@@ -228,6 +240,8 @@ def _g1_arrays(bars):
         "rsi": _rsi(c), "big20": cb - cb_prev, "ma20": ma20,
         "rhist_chg": rhist - rh_prev, "dif0": dif / c * 100,
         "pctb": _boll_pctb(c), "dates": [str(b["time"])[:10] for b in bars],
+        # dist_ma20: 收盘相对 MA20 偏离% (规则门用, **不是 score**)
+        "dist_ma20": (c / ma20 - 1) * 100,
     }
 
 
@@ -265,6 +279,12 @@ def _g56_gate(f, pool, board, k, date_k, mask=None):
     else:
         if not (st["score_r"] is not None and st["score_r"] > GEM_SCORE_MIN
                 and f["dif0"][k] <= 0):
+            return False, None
+    # 规则门: 信号日不得深跌于 MA20 (2026-09-25; dist_ma20 是特征阈值, 非 score)
+    d20 = f.get("dist_ma20")
+    if d20 is not None and k < len(d20):
+        dv = float(d20[k])
+        if not (dv == dv) or dv < DIST_MA20_MIN:   # nan → 不放行
             return False, None
     return True, st
 
@@ -370,14 +390,24 @@ def _ensure_pool_daily(pool_target, bars_batch=None):
         return _POOL
 
 
-def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None):
-    """无追踪出场模拟 — 2026-09-26 P1-7: 骨架已上收 core.exit_engines.run_hold_stop。
+def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None):
+    """无追踪出场模拟 — 骨架上收 core.exit_engines.run_hold_stop。
 
     hold_days / stop_loss: 由调用方注入 (g56.yaml); 传 None 回落模块常量。
-    返回与 v1._run_backtest 同构 {'exit_day','exit_price','return_pct','peak_return_pct'}。
+    code: 可选, 用于判断信号日是否涨停 (D-1 板) —— 该子集用 STOP_LOSS_LU 紧止损,
+        降低 -8% 深亏触发 (2026-09-25)。缺 code 时行为与历史逐笔一致。
+    返回 {'exit_day','exit_price','return_pct','peak_return_pct'}。
     """
     _hold = HOLD_DAYS if hold_days is None else int(hold_days)
     _stop = STOP_LOSS if stop_loss is None else float(stop_loss)
+    if code and s >= 1:
+        try:
+            from app.market_cn.auto.core.market import get_board_type, is_limit_up
+            bt = get_board_type(code)
+            if is_limit_up(float(bars[s - 1]["close"]), float(bars[s - 2]["close"]), bt):
+                _stop = max(_stop, STOP_LOSS_LU)  # -5 大于 -8 → 更紧
+        except Exception:
+            pass
     from app.market_cn.auto.core.exit_engines import run_hold_stop
     return run_hold_stop(bars, s, entry, hold_days=_hold, stop_loss=_stop)
 
@@ -559,13 +589,26 @@ class G56Strategy(StrategyBase):
         if entry_price <= 0:
             return ExitDecision("hold")
         mode = snap.get("mode")
+        # D-1 涨停子集紧止损 (2026-09-25, STOP_LOSS_LU); 信号日 = entry_idx-1
+        stop_use = STOP_LOSS
+        try:
+            ei = snap.get("entry_idx")
+            bars_chk = snap.get("bars") or []
+            if row.get("code") and isinstance(ei, int) and 2 <= ei < len(bars_chk):
+                from app.market_cn.auto.core.market import get_board_type, is_limit_up
+                if is_limit_up(float(bars_chk[ei - 1]["close"]),
+                               float(bars_chk[ei - 2]["close"]),
+                               get_board_type(row["code"])):
+                    stop_use = max(STOP_LOSS, STOP_LOSS_LU)
+        except Exception:
+            pass
         if mode == "live":
-            # -8% 硬止损兜底 (框架 stop_price 守卫为主; 此处防其缺失)
+            # 硬止损兜底 (框架 stop_price 守卫为主; 此处防其缺失)
             series = snap.get("series") or []
             if series:
                 last = float(series[-1].get("last") or 0)
-                if 0 < last <= entry_price * (1 + STOP_LOSS / 100):
-                    return ExitDecision("exit", reason=f"硬止损{STOP_LOSS}%",
+                if 0 < last <= entry_price * (1 + stop_use / 100):
+                    return ExitDecision("exit", reason=f"硬止损{stop_use:g}%",
                                         price=last)
             return ExitDecision("hold")
         if mode != "day_close":
@@ -579,10 +622,10 @@ class G56Strategy(StrategyBase):
         if d <= 1:
             return ExitDecision("hold")        # T+1: 入场日不可卖
         b = bars[today_idx]
-        stop_line = entry_price * (1 + STOP_LOSS / 100)
+        stop_line = entry_price * (1 + stop_use / 100)
         if float(b["low"]) <= stop_line:
             fill = min(float(b["open"]), stop_line)   # 跳空穿越按开盘 (模拟同式)
-            return ExitDecision("exit", reason=f"止损{STOP_LOSS:g}%",
+            return ExitDecision("exit", reason=f"止损{stop_use:g}%",
                                 price=round(fill, 3))
         if d >= HOLD_DAYS:
             return ExitDecision("exit", reason=f"到期{HOLD_DAYS}天",
@@ -614,7 +657,7 @@ class G56Strategy(StrategyBase):
             gap = o[s] / c[s - 1] - 1
             if gap >= lim:
                 continue                        # D0 开盘不可买 (一字/触板)
-            r = _exit_no_trail(bars, s, float(o[s]))
+            r = _exit_no_trail(bars, s, float(o[s]), code=code)
             if not r:
                 continue
             rhc = float(f["rhist_chg"][k])
@@ -1020,7 +1063,8 @@ def _exit_g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params
     from app.market_cn.auto.core.exit_modes import _bp
     return _exit_no_trail(bars, entry_idx, entry_price,
                           _bp(params, board_type, "hold_days"),
-                          _bp(params, board_type, "stop_loss"))
+                          _bp(params, board_type, "stop_loss"),
+                          code=code)
 
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit

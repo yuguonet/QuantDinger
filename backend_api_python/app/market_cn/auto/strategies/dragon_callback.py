@@ -94,10 +94,13 @@ DRAGON_CB_PARAMS = dict(
     #  +2.63→+2.97/笔 盈亏比1.37→1.58, 改善全来自盈亏比; hold_days/stop_loss 扫描无效故不动。
     #  ⚠️ 实盘执行口径依赖: trail_lo=-3 盘中触发更频繁, "收盘逃顶 vs 追踪线优先"差异被放大
     #  (回测对照 +2.97 vs +2.29), 实盘须人工尾盘盯盘并逐笔记 execution_mode)
+    # 2026-09-25: trail_lo/hi -3 → -2 (用户裁定保盈亏比路线)。300d 出场真注入对照:
+    #  胜率 72.7% 持平, 均收 5.0→5.14, 盈亏比 2.43→2.52。config.json 同步; YAML 门表
+    #  params 段请保持一致 (展示/敏感性读 YAML)。
     hold_days=7,
     stop_loss=-8.0,
-    trail_lo=-3.0,
-    trail_hi=-3.0,
+    trail_lo=-2.0,
+    trail_hi=-2.0,
     trail_switch_pct=3.0,
     peak_exit_ret=4.0,
     peak_exit_upper=30.0,
@@ -683,8 +686,19 @@ class DragonCallbackStrategy(StrategyBase):
             return ExitDecision("hold")
         board = get_board_type(row.get("code", ""))
         today_idx = len(bars) - 1
-        r = run_backtest_dragon_callback(bars, entry_idx, entry_price, board_type=board,
-                                         stop_at_idx=today_idx)
+        # 2026-09-25: 出场参数同样走 merged_params (与 backtest_stock 一致, 否则实盘/回测口径分叉)
+        _ep = self.merged_params(None)
+        r = run_backtest_dragon_callback(
+            bars, entry_idx, entry_price, board_type=board,
+            stop_at_idx=today_idx,
+            hold_days=_ep.get("hold_days"),
+            stop_loss=_ep.get("stop_loss"),
+            trail_lo=_ep.get("trail_lo"),
+            trail_hi=_ep.get("trail_hi"),
+            trail_switch_pct=_ep.get("trail_switch_pct"),
+            peak_exit_ret=_ep.get("peak_exit_ret"),
+            peak_exit_upper=_ep.get("peak_exit_upper"),
+        )
         if r and not r.get("open"):
             exit_idx = entry_idx + r["exit_day"] - 1
             if exit_idx == today_idx and r.get("exit_reason"):
@@ -786,9 +800,20 @@ class DragonCallbackStrategy(StrategyBase):
             if entry_price <= 0:
                 continue
 
+            # 2026-09-25 bugfix: 原先写死 hold_days=7, stop_loss=-8.0 且不传 trail/peak,
+            # 导致 config/default_params 出场参数在回测路径**静默失效**。改为经 merged_params
+            # 注入 (config > 代码默认), 与 run_backtest_dragon_callback 的 **params 合并口径一致。
+            _ep = self.merged_params(None)
             result = run_backtest_dragon_callback(
-                bars, i + 1, entry_price, hold_days=7, stop_loss=-8.0,
-                board_type=board_type)
+                bars, i + 1, entry_price, board_type=board_type,
+                hold_days=_ep.get("hold_days"),
+                stop_loss=_ep.get("stop_loss"),
+                trail_lo=_ep.get("trail_lo"),
+                trail_hi=_ep.get("trail_hi"),
+                trail_switch_pct=_ep.get("trail_switch_pct"),
+                peak_exit_ret=_ep.get("peak_exit_ret"),
+                peak_exit_upper=_ep.get("peak_exit_upper"),
+            )
             if not result:
                 if probe is not None:
                     probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],

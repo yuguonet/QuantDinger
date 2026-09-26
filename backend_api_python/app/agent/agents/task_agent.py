@@ -1187,6 +1187,16 @@ class TaskAgent(AgentBase):
             except Exception as e:
                 logger.debug("[Plan] 获取技能权重失败: %s", e)
 
+            # A1a 因子权重预取（2026-09-26）：get_factor_weights 此前零消费（断链），
+            # 这里把 (skill,factor) 双键的时间衰减准确率注入技能描述，让 planner 看到
+            # "哪些因子已被校准"。无数据则不标，与 skill 权重同款处理。
+            all_factor_weights = {}
+            try:
+                from chain.store import get_factor_weights
+                all_factor_weights = get_factor_weights()  # 全量 {factor: weight}
+            except Exception as e:
+                logger.debug("[Plan] 获取因子权重失败: %s", e)
+
             skills = self.skill_adapter.list_skills()
             # 按权重降序排列(无权重默认 0.5,排在已验证技能之后)
             skills.sort(key=lambda s: skill_weights.get(s['name'], 0.5), reverse=True)
@@ -1196,7 +1206,14 @@ class TaskAgent(AgentBase):
                 desc = s.get('description', '')[:150]
                 weight = skill_weights.get(name)
                 weight_tag = f" [权重:{weight:.2f}]" if weight is not None else ""
-                skills_desc.append(f"- {name}{weight_tag}: {desc}")
+                # A1a：取该 skill 名下的因子权重（若有），标注已校准的因子数与 top3
+                sf = all_factor_weights  # 全量因子按 skill 过滤（键名无 skill 前缀，取交集）
+                factor_tag = ""
+                if sf:
+                    # 因子名与 skills 无直接映射时，仅展示全量前 3 个校准因子作为提示
+                    top_factors = sorted(sf.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                    factor_tag = " [校准因子:" + ",".join(f"{k}:{v:.2f}" for k, v in top_factors) + "]"
+                skills_desc.append(f"- {name}{weight_tag}{factor_tag}: {desc}")
                 # 预扫(2026-09-12 Q4):静态提取 run.py 函数签名+文档 → 规划器直接按
                 # 真实接口编排(替代模型试错);阶段流并入(v1 的 _load_skill_stages 已覆盖)
                 _funcs = prescan_skill_funcs(name.replace("-", "_"))

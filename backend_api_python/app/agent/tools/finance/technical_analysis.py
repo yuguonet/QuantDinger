@@ -218,7 +218,23 @@ def _algo_analyze(
     factors.append({"name": "流通盘", "value": f"{float_shares/10000:.0f}万股" if float_shares else "未知", "score": float_score})
 
     # ── 综合加权评分 ──
-    weights = {"趋势": 0.40, "指标": 0.25, "量价": 0.20, "形态": 0.10, "筹码": 0.05, "流通盘": 0.00}
+    # A1a 因子权重接线（2026-09-26）：优先从 qd_agent_weights 取校准权重（按 (skill,factor)
+    # 双键的时间衰减准确率），无数据则回退启发式常量并显式标 calibrated=false。
+    # 禁止静默假装修准过——缺口显式 > 硬凑数字（项目红线）。
+    _DEFAULT_WEIGHTS = {"趋势": 0.40, "指标": 0.25, "量价": 0.20,
+                        "形态": 0.10, "筹码": 0.05, "流通盘": 0.00}
+    try:
+        from chain.store import get_factor_weights
+        _calibrated = get_factor_weights("technical_analysis")
+    except Exception as _e:
+        logger.debug("[technical_analysis] 因子权重读取失败，回退常量: %s", _e)
+        _calibrated = {}
+    if _calibrated:
+        weights = _calibrated
+        calibrated = True
+    else:
+        weights = _DEFAULT_WEIGHTS
+        calibrated = False
     total_weight = 0
     weighted_score = 0
     for f in factors:
@@ -238,9 +254,26 @@ def _algo_analyze(
     else:
         direction = "neutral"
 
+    # ── A1c 校准命中率（score→P(方向正确)）──
+    # 有校准数据用 calibration.apply，无则 None（输出标 n/a）。
+    # 置信度优先用 hit_rate 区间映射（>0.6 high / 0.4-0.6 medium / <0.4 low），
+    # 无校准则回退原"有效因子数"逻辑。
+    try:
+        from utils.calibration import apply as _cal_apply
+        hit_rate = _cal_apply("technical_analysis", final_score)
+    except Exception:
+        hit_rate = None
+
     # ── 置信度 ──
     valid_count = sum(1 for f in factors if f["value"] != "数据缺失")
-    if valid_count >= 5:
+    if hit_rate is not None:
+        if hit_rate >= 0.6:
+            confidence = "high"
+        elif hit_rate >= 0.4:
+            confidence = "medium"
+        else:
+            confidence = "low"
+    elif valid_count >= 5:
         confidence = "high"
     elif valid_count >= 3:
         confidence = "medium"
@@ -253,6 +286,8 @@ def _algo_analyze(
     # ── markdown 分析 ──
     dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
     md = f"{stock_code}({stock_code}) {final_score:.0f}分 {dir_map.get(direction, direction)}"
+    if hit_rate is not None:
+        md += f" 历史命中率{hit_rate*100:.0f}%"
     if factors:
         md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
     if signals:
@@ -263,6 +298,36 @@ def _algo_analyze(
     trend_raw = tool_results.get("analyze_trend", {})
     indicator_raw = tool_results.get("get_indicator_snapshot", {})
 
+    # ── A3 缺数据声明（缺口显式 > 硬凑数字）──
+    # 复用各因子块已有的 "数据缺失" 标记，统一收集到 missing_data 供下游识别。
+    missing_data = [f["name"] for f in factors if f.get("value") == "数据缺失"]
+
+    # ── A4 可证伪条件（若 X 发生则本判断失效）──
+    # 基于实际 MA/RSI 数据生成，数据缺失时降级为 score 阈值条件。
+    ma5 = trend_raw.get("ma5") if isinstance(trend_raw, dict) else None
+    ma20 = trend_raw.get("ma20") if isinstance(trend_raw, dict) else None
+    rsi_val = None
+    if isinstance(indicator_raw, dict):
+        rsi_dict = indicator_raw.get("rsi", {})
+        if isinstance(rsi_dict, dict):
+            rsi_val = rsi_dict.get("rsi") or rsi_dict.get("value")
+    falsifiable = []
+    if direction == "bullish":
+        if ma5 and ma20:
+            falsifiable.append(f"MA5({ma5:.2f})跌破MA20({ma20:.2f})")
+        if isinstance(rsi_val, (int, float)):
+            falsifiable.append(f"RSI({rsi_val:.0f})跌破30")
+        falsifiable.append(f"综合分({final_score:.0f})跌破55")
+    elif direction == "bearish":
+        if ma5 and ma20:
+            falsifiable.append(f"MA5({ma5:.2f})突破MA20({ma20:.2f})")
+        if isinstance(rsi_val, (int, float)):
+            falsifiable.append(f"RSI({rsi_val:.0f})突破70")
+        falsifiable.append(f"综合分({final_score:.0f})突破45")
+    else:
+        falsifiable.append(f"综合分({final_score:.0f})突破60或跌破40")
+    falsifiable_conditions = "；".join(falsifiable) if falsifiable else "数据不足，无法生成可证伪条件"
+
     _r = {
         "score": final_score,
         "direction": direction,
@@ -271,6 +336,14 @@ def _algo_analyze(
         "factors": factors,
         "analysis": analysis,
         "stock_code": stock_code,
+        # A1a：权重是否来自 qd_agent_weights 校准
+        "calibrated": calibrated,
+        # A1c：score→P(方向正确)，无校准数据时为 None
+        "hit_rate": hit_rate,
+        # A3：缺失的因子名列表（空列表表示数据完整）
+        "missing_data": missing_data,
+        # A4：可证伪条件（若发生则本判断失效）
+        "falsifiable_conditions": falsifiable_conditions,
         # 原始数据透传
         "latest_close": trend_raw.get("latest_close", 0) if isinstance(trend_raw, dict) else 0,
         "boll": trend_raw.get("boll", {}) if isinstance(trend_raw, dict) else {},

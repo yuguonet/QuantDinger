@@ -143,6 +143,66 @@ def check_skill_tool_phantoms() -> Dict[str, List[str]]:
     return out
 
 
+def check_weight_getter_consumers() -> Dict[str, List[str]]:
+    """qd_agent_weights 各层 getter 必须有真实消费点（A1a 防断链看门狗）。
+
+    项目高发 bug：getter 写了+导出了，但没有任何运行时消费（如 get_factor_weights
+    此前零消费）。本检查对 skill/factor/tool/chain 四层 getter，统计除定义点(store.py)
+    和导出点(__init__.py)之外的出现次数；<=1 视为断链。
+    """
+    GETTERS = ["get_skill_weights", "get_factor_weights",
+               "get_tool_weights", "get_chain_weights"]
+    occurrences: Dict[str, List[str]] = {g: [] for g in GETTERS}
+    for p in _py_files(AGENT):
+        rel = str(p.relative_to(AGENT))
+        src = p.read_text(encoding="utf-8", errors="ignore")
+        for g in GETTERS:
+            # 排除定义文件(chain/store.py)和导出文件(chain/__init__.py)
+            if rel.endswith("chain/store.py") or rel.endswith("chain/__init__.py"):
+                continue
+            if g in src:
+                occurrences[g].append(rel)
+    zero = [g for g, files in occurrences.items() if len(files) == 0]
+    return {"zero_consumer_getters": zero, "consumer_files": occurrences}
+
+
+# A5：副作用类工具必须声明 dry_run 参数（预防性看门狗）
+# 本项目金融工具均为只读分析；若未来引入下单/写入类工具，必须支持 dry_run 才能进工具集。
+_SIDE_EFFECT_HINTS = (
+    "place_order", "submit_order", "create_order", "cancel_order",
+    "send_order", "trade", "execute_order",
+    "write_db", "insert", "update_db", "delete_",
+    "send_message", "publish", "notify",
+)
+
+
+def check_dry_contract() -> Dict[str, List[str]]:
+    """副作用类工具必须有 dry_run 参数（A5 预防性契约扫描）。
+
+    扫描 tools/ 下所有公开函数：若函数名含副作用关键词（下单/写入/发送），
+    则其签名必须包含 dry_run 参数，否则报 missing_dry_run。
+    当前项目无此类工具，结果应为空；此检查防止未来引入无 dry_run 的副作用工具。
+    """
+    import inspect
+    missing: List[str] = []
+    for p in _py_files(AGENT / "tools"):
+        rel = str(p.relative_to(AGENT))
+        src = p.read_text(encoding="utf-8", errors="ignore")
+        # 简单 AST：找 def name(...) 公开函数
+        for m in __import__("re").finditer(r"^def\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)", src, __import__("re").M):
+            fname, params = m.group(1), m.group(2)
+            if fname.startswith("_"):
+                continue
+            # get_ 前缀语义为只读查询，排除
+            if fname.startswith("get_"):
+                continue
+            if not any(h in fname for h in _SIDE_EFFECT_HINTS):
+                continue
+            if "dry_run" not in params:
+                missing.append(f"{rel}::{fname}")
+    return {"missing_dry_run": missing}
+
+
 def run_all() -> Dict:
     return {
         "env": check_env_declarations(),
@@ -150,6 +210,8 @@ def run_all() -> Dict:
         "mask": check_mask_coverage(),
         "returns": check_returns_contracts(),
         "skill_phantoms": check_skill_tool_phantoms(),
+        "weight_getter_consumers": check_weight_getter_consumers(),
+        "dry_contract": check_dry_contract(),
     }
 
 

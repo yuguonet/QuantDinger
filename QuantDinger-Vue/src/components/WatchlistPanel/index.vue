@@ -81,7 +81,7 @@
         <div class="wl-card-body" :class="{ 'with-cb': batchMode }">
           <div class="wl-row-main" :class="{ 'negative-news': stock.news_score !== undefined && stock.news_score < -4 }">
             <div class="wl-col-name">
-              <a-popover v-if="stock.strategy_state || (stock.sections && stock.sections.length)" trigger="hover" placement="right">
+              <a-popover v-if="stock.strategy_state || (stock.sections && stock.sections.length)" trigger="hover" placement="rightTop">
                 <template slot="content">
                   <div class="wl-strategy-pop" v-html="labelSectionsHtml(stock)"></div>
                 </template>
@@ -1701,7 +1701,24 @@ export default {
    ① 内容经 `v-html` 注入（不含编译期 data-v 属性）② a-popover 的 content 还 teleport 到 body。
    两者叠加 ⇒ scoped 编译出的 `[data-v-*]` 选择器全部匹配不到，样式静默失效。
    与下面的 .wl-group-menu 同理。若把本块移回 scoped，弹层会退化成无样式的纯文本流。 */
-.wl-strategy-pop { font-size: 12px; line-height: 1.5; color: #0f172a; }
+
+/* ★弹层高度必须有上限 + 内部滚动（09-26 修「最后几只票悬停时弹层探出窗口、撑出 window 滚动条」）
+   病根：内容不设高度上限 ⇒ label 段位多时弹层可高达 1200+px。a-popover 被 teleport 到 body 且以
+   `position:absolute` 用文档坐标定位，一旦弹层高于视口，dom-align 的 adjustForViewport 只能把 top 钳到 0，
+   底边必然溢出到文档滚动区 ⇒ documentElement.scrollHeight 被撑大 ⇒ **窗口出现滚动条**（实测 908 视口 /
+   1224 弹层：belowVP=316px、scrollbar=true）。反 PF：`placement="right"` 的对齐点是 ['cl','cr']，里面不含
+   t/b 字符，dom-align 的 Y 轴翻转（flip /[tb]/）对它无效 ⇒ 只能硬钳底边 ⇒ 弹层相对卡片整体上移、箭头也对不上。
+   对策两条，缺一不可：
+     ① 本样式 max-height ⇒ 弹层高度恒 < 视口，翻转/钳位才有用（这是消掉滚动条的**充分条件**）
+     ② 模板里 placement 改 rightTop（['tl','cr']）⇒ 空间不够时 dom-align 能翻到 rightBottom，
+        弹层底边正好贴住卡片、箭头落在卡上（实测同场景 belowVP=-54px、无滚动条）
+   改回 `right` 或删掉 max-height 都会让这个 bug 复现。 */
+.wl-strategy-pop {
+  font-size: 12px; line-height: 1.5; color: #0f172a;
+  max-height: 60vh; overflow-y: auto; overflow-x: hidden;
+  &::-webkit-scrollbar { width: 3px; }
+  &::-webkit-scrollbar-thumb { background: #d4d8dd; border-radius: 2px; }
+}
 .wl-strategy-pop table.wl-dtable { border-collapse: collapse; font-size: 11px; }
 .wl-strategy-pop table.wl-dtable td { padding: 2px 8px 2px 0; border-bottom: 1px solid #f1f5f9; }
 .wl-strategy-pop table.wl-dtable td.k { color: #94a3b8; white-space: nowrap; padding-right: 12px; }

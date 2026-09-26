@@ -269,8 +269,25 @@ class StrategyBase:
 
     # ---- 便捷 ----
     def merged_params(self, override=None):
-        """default_params ← config.json params 覆盖 的合并结果。"""
-        p = dict(self.default_params)
+        """default_params ← config.json params 覆盖 的合并结果。
+
+        优先级 (高→低): override 显式入参 > 实例 default_params (param_scan 网格覆写)
+                      > config.json params > 类默认 default_params。
+
+        2026-09-25 bugfix: 原实现只做 default_params+override, **从未读 config**,
+        文档却写「← config 覆盖」→ config.params 在回测/monitor 路径静默失效
+        (仅 scan 经 params_override 单独注入)。现按文档补齐; 判定「是否仍为类默认」
+        以放行 config —— param_scan 把网格写进实例 default_params 后仍保持权威。
+        """
+        cls_def = type(self).default_params or {}
+        p = dict(self.default_params or {})
+        try:
+            from app.market_cn.auto.strategies import params_override
+            for k, v in (params_override(self.key) or {}).items():
+                if (k not in p) or (p.get(k) == cls_def.get(k)):
+                    p[k] = v
+        except Exception:
+            pass
         if override:
             p.update(override)
         return p

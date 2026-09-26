@@ -60,8 +60,8 @@ params:                        # 可调参数 (网格扫描 / 敏感性分析直
   # --- 出场 (exit_modes.combo → run_backtest_dragon_callback) ---
   hold_days: 7
   stop_loss: -8.0
-  trail_lo: -3.0
-  trail_hi: -3.0
+  trail_lo: -2.0
+  trail_hi: -2.0
   trail_switch_pct: 3.0
   peak_exit_ret: 4.0
   peak_exit_upper: 30.0
