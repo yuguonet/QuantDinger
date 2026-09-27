@@ -11,20 +11,25 @@ from app.agent.log import logger
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _batch_execute, _to_md
 
-def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> dict:
+def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
+                     detail: bool = False) -> dict:
     """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
 
     codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
+    2026-09-27 工具归组化：合并原 get_dragon_tiger_detail（detail=True 展开席位明细）。
 
     Returns:
         统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
         "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{stock_code, count, records:[...]}（records 含个股龙虎榜明细；
         不传代码时 data 为日期汇总 {date, count, stocks:[...]}）。
+        detail=True 时单股结果追加 seats{buy,sell} 与 institution{}（席位与机构动向，
+        与原 get_dragon_tiger_detail 单股返回同构）。
 
     Args:
         codes: 逗号分隔的股票代码（可选，空=全市场），如 "600519" 或 "600519,000001"
         date: 查询日期 YYYY-MM-DD，默认最近交易日
         days: 回溯天数，默认30
+        detail: 是否展开席位/机构明细（仅单股模式生效；全市场模式忽略）
     """
     def _one(stock_code: str) -> dict:
         from datetime import datetime, timedelta
@@ -49,7 +54,7 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> dict:
             data = _get(_date, _date)
             return {"date": _date, "days": 1, "count": len(data), "stocks": data}
 
-    # codes 为空时走全市场逻辑（不经过批量）
+    # codes 为空时走全市场逻辑（不经过批量）；detail 仅单股模式生效
     if not codes or not codes.strip():
         return _one("")
 
@@ -57,7 +62,39 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30) -> dict:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    return _batch_execute(_one, code_list)
+    base = _batch_execute(_one, code_list)
+    if not detail:
+        return base
+
+    # detail=True：逐股追加 seats/institution（委托原 get_dragon_tiger_detail 实现，
+    # 不自算第三份；单股等价性 = 原工具单股返回的 seats/institution 子集）
+    from tools.finance.signal_tools import get_dragon_tiger_detail as _detail
+    data = base.get("data") if isinstance(base, dict) else None
+    if not isinstance(data, dict):
+        return base
+    for code in code_list:
+        row = data.get(code)
+        if not isinstance(row, dict) or "error" in row:
+            continue
+        try:
+            d = _detail(code, look_back_days=max(1, min(days, 365)))
+            # 形状容错：单股扁平 {seats,...} 或批量信封 {data:{code:{seats,...}}}
+            # （⚠️ 勿用 "error" 键猜形态——_batch_execute 恒带 error:None，会误判）
+            src = None
+            if isinstance(d, dict):
+                if "seats" in d or "institution" in d:
+                    src = d
+                elif isinstance(d.get("data"), dict) and d["data"]:
+                    src = d["data"].get(code) or next(iter(d["data"].values()))
+            if isinstance(src, dict):
+                for k in ("seats", "institution"):
+                    if k in src:
+                        row[k] = src[k]
+            else:
+                row["detail_error"] = (d.get("error") if isinstance(d, dict) else None) or "明细获取失败"
+        except Exception as e:  # 明细拉取失败不拖垮主结果，但显式标注（不静默）
+            row["detail_error"] = str(e)
+    return base
 
 def get_hot_rank(top_n: int = 30) -> dict:
     """人气榜：返回当日市场关注度最高的股票排名及热度分数。

@@ -26,6 +26,13 @@
     }
   },
   "strategies": {
+    "lead_chase": {
+      "label": "领涨追击",
+      "enabled": false,
+      "daily_limit": 20,
+      "params": {},
+      "_note": "2026-09-27 新建 (用户假设: 盘中资金流入推涨 + 上方压力小 + 预估放量 + 板块共振领涨 + 前期涨幅少/回调 → 可追)。口径见 strategies/lead_chase.py 头注。enabled=false 待 kline_1m 回测验证后用户拍板开启 (回测: -m app.market_cn.auto.core.backtest --strategy lead_chase)。出场默认 D1 开盘卖, 未定稿。"
+    },
     "dragon_callback": {
       "label": "龙回头",
       "enabled": true,
@@ -88,14 +95,15 @@
       "params": {
         "score_min": 8.0,
         "pre5_max": -10.0,
-        "amp_min": 10.0,
+        "amp_min": 8.0,
         "tail_lo": -2.8,
         "tail_hi": -0.5,
         "min_hhmm": "14:50",
         "stop_pct": -8.0,
         "hold_days": 1
       },
-      "winrate": 80.7
+      "winrate": 80.7,
+      "_params_note": "2026-09-26 amp_min 10→8: 120d n=274→306, 胜率82.8→82.7, 盈亏比2.15→2.04。14:50起滚动买入(观察窗至15:00)。"
     },
     "break_v2": {
       "label": "断板V2",

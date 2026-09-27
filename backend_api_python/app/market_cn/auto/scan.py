@@ -311,9 +311,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
     流程:
       1. 等待到滚动起点 (有 rolling_preview 策略时取最早者, 现为 14:50; 否则 14:56 保持旧行为)
-      2. 滚动预览 (14:50~14:55): 每分钟一轮 preview 策略的完整判定
+      2. 滚动判定 (14:50~14:59): 每分钟一轮; 14:50 起触发即买入 (已定价行不被冲掉)
          (幂等 upsert + 本轮落选 buy_today 清理), 前端自选组实时刷新, 用户提前准备
-      3. 14:56 终审: 等待 14:56 快照落地 (采集 60s 一拍, 上限 45s) → 全部策略一轮
+      3. 15:00 收口: 再跑一轮全量; 仅清 entry_price 为空的预览行
       单轮: 全市场最新快照 → 策略 intraday_shortlist 必要条件预筛 →
             候选股补拉当日快照序列+日线 → scan_signals 完整判定 →
             U1~U4 统一预过滤 (use_unified_prefilter=True 的策略, 锚点 prefilter_anchor) →
@@ -423,6 +423,10 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         # 仅清 buy_today 态, 不碰 15:01 确认后已转移的 holding/exit 等状态
         result = store.upsert_scan_signals(
             today, rows, purge_buy_today=tuple(cycle_strats.keys()))
+        if not preview_cycle and not rows:
+            logger.info("[knife_scan] 终审 0 笔 → purge 预览 buy_today (策略=%s); "
+                        "预览曾命中的票不会留在库里",
+                        ",".join(cycle_strats.keys()))
         store.sync_watchlist_group(store.get_active_signals())
         return result
 
@@ -438,9 +442,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     today = _today()
     all_codes_list = all_codes()
 
-    # ── 滚动预览: 14:50~14:55 每分钟一轮 (仅 preview 策略), 用户提前准备 ──
+    # ── 滚动预览: 14:50~14:59 每分钟一轮 (仅 preview 策略) — 观察窗 10 分钟 ──
     if wait_data and preview:
-        while _now_hm_str() < "14:56":
+        while _now_hm_str() < "15:00":
             snaps = latest_snapshot(all_codes_list)
             if snaps:
                 try:
@@ -452,10 +456,10 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
             # 对齐到下一整分钟
             time.sleep(max(5, 60 - time.time() % 60))
 
-    # ── 终审: 14:56 后等待新鲜快照落地 (采集 60s 一拍, 一般 <=15s, 上限 45s) ──
+    # ── 终审: 15:00 后等待新鲜快照落地 (采集 60s 一拍, 一般 <=15s, 上限 45s) ──
     snaps = latest_snapshot(all_codes_list)
     if wait_data and preview and snaps:
-        fresh_cut = f"{today} 14:56"
+        fresh_cut = f"{today} 15:00"
         deadline = time.time() + 45
         while time.time() < deadline:
             latest_ts = max((str(s.get("time") or "") for s in snaps.values()), default="")

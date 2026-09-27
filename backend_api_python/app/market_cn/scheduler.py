@@ -464,6 +464,23 @@ def _task_trigger_hm(task):
     return None
 
 
+def _save_fund_flow_daily():
+    """资金流日度落库: 把最近 7 个交易日的 1m 派生资金流补齐(幂等、自愈)。
+
+    为什么独立成任务而不并入 `_post_market_batch`:
+      ① 后者要串行回填 1m(5221 标的 x 240 条) + 日线 + 龙虎榜, 跑完时刻不定;
+         本任务放 18:00 与之解耦, 互不拖累;
+      ② days=7 的"自愈"语义与 batch 的"仅当天"不同 —— 容许补前几天,
+         任一天失败/漏跑, 只要还在窗口内下次自动补上。
+    """
+    try:
+        from app.market_cn.fund_flow_api import backfill_stock_from_1m
+        r = backfill_stock_from_1m(days=7)
+        logger.info("[fund_flow_daily] %s", r)
+    except Exception as e:
+        logger.warning("[fund_flow_daily] 失败: %s", e)
+
+
 # 任务列表
 TASKS = [
     # 盘中周期任务
@@ -486,6 +503,10 @@ TASKS = [
     # 见 _knife_trigger_hm; Task 上的 trigger_* 仅作 sched 不可用时的兜底)
     Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_day=True, trigger_hour=14, trigger_minute=30),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
+    # 资金流日度落库 (2026-09-27 用户裁定): `kline_15m` 已作废 => 1m 是唯一可用分钟源。
+    # 放 18:00 —— 晚于 post_market_batch(15:30, 内含 1m 回填), 与之解耦;
+    # days=7 自愈: 当日 1m 未到位则自动跳过, 次日补上。
+    Task("fund_flow_daily", _save_fund_flow_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
 ]
 
 

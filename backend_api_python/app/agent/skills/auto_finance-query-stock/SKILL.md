@@ -102,6 +102,6 @@ get_realtime_quote(codes="<6位代码>")
 
 5. **涨跌幅单位**：接口返回的 `changePercent` 已带百分号数值（如 `1.23` 即 `1.23%`），输出时**不要**再乘 100。
 
-6. **避免引用不在白名单的工具**：本技能仅依赖 `get_realtime_quote`、`agent_get_kline`、`get_stock_info` 三个工具；不要因贪图信息丰富度去调用 `get_order_book` / `analyze_trend` / `get_fund_flow` 等，扩展功能留给别的技能。
+6. **避免引用不在白名单的工具**：本技能仅依赖 `get_realtime_quote`、`agent_get_kline`、`get_stock_info` 三个工具；不要因贪图信息丰富度去调用 `get_order_book` / `technical_analysis` / `get_fund_flow` 等，扩展功能留给别的技能。
 
 8. **故障列表**：当前 trace 未观察到链路胜率显著偏低的工具，不强制禁用项；若后续链路中 `agent_get_kline` 持续返回 `error`，应优先尝试把 `days` 调小（如 10）再试一次，仍然失败则按"数据源不可用"降级处理。

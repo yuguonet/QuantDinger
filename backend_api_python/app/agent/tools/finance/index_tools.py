@@ -33,17 +33,55 @@ def _norm_codes(codes: Union[str, List[str], None]) -> List[str]:
     return cleaned[:12]
 
 
-def get_index_quote(codes: Union[str, List[str]] = "") -> Dict[str, Any]:
-    """指数实时行情（沪深300/上证/创业板等）。
+def get_index_quote(codes: Union[str, List[str]] = "", scope: str = "single",
+                    days: int = 60) -> Dict[str, Any]:
+    """指数/ETF 行情（统一入口，2026-09-27 工具归组化：合并五大指数快照与 ETF 行情）。
+
+    scope: indices=五大指数快照 | single=指定指数实时（默认） | etf=指数对应 ETF
+           | kline=指数日线序列
+    注：指数日 K 另有独立工具 get_index_kline（P0 定案：同名让位项保留注册），
+    与 scope=kline 同源同实现。
 
     Args:
-        codes: 指数代码，逗号分隔或列表。常用: 000001 上证, 000300 沪深300,
-               399001 深成指, 399006 创业板指, 000905 中证500。
+        codes: 指数/ETF 代码，逗号分隔或列表。常用: 000001 上证, 000300 沪深300,
+               399001 深成指, 399006 创业板指, 000905 中证500；ETF: 510050, 510300…
+        scope: indices | single | etf | kline
+        days: K 线天数（scope=kline 用），默认60
 
     Returns:
-        {count, data:{code:{code,name,price,change,change_percent,...}}}；
-        单指数时顶层镜像。失败 → {error}。
+        scope=indices → {"count", "indices": [{code,name,price,change_percent,...}]}。
+        scope=single/etf → {"count", "data": {code: {code,name,price,change_percent,...}}}，
+            单标的时顶层再镜像（双通道）；获取失败的代码其值为 {"code", "error"}。
+        scope=kline → {"count", "data": {code: [{t,o,h,l,c,v}...]}}（双键 bar，可直接
+            下标 bar['c']；无数据的代码其值为 {"error"}）。
+        失败 → {"error": "...", "retriable": bool}。
     """
+    s = (scope or "single").strip().lower()
+    if s == "indices":
+        # 惰性 import：data_tools 与本模块同域，避免模块级环形 import 风险
+        from tools.finance.data_tools import get_market_indices
+        return get_market_indices()
+    if s == "etf":
+        from tools.finance.data_tools import get_index_etf_quote
+        raw = get_index_etf_quote(
+            codes if isinstance(codes, str) else ",".join(codes))
+        if not isinstance(raw, dict) or "error" in raw:
+            return raw
+        by_code = {str(r.get("code", "")): r for r in (raw.get("quotes") or [])
+                   if isinstance(r, dict)}
+        return {"count": len(by_code), "data": by_code}
+    if s == "kline":
+        code_list = _norm_codes(codes) or ["000001"]
+        data: Dict[str, Any] = {}
+        for c in code_list[:20]:
+            r = get_index_kline(c, days)
+            bars = r.get("bars") if isinstance(r, dict) else None
+            data[c] = bars if bars else {"error": (r or {}).get("error", "无指数K线数据")}
+        return {"count": len(data), "data": data}
+    if s != "single":
+        return {"error": f"scope 无效: {scope!r}，可选 indices|single|etf|kline",
+                "retriable": False}
+    # ── scope=single：指定指数实时（原主体，零改动）──
     code_list = _norm_codes(codes)
     if not code_list:
         # 默认五大指数

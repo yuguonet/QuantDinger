@@ -242,9 +242,12 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                 )
                 purged = cur.rowcount
                 if purge_buy_today:
+                    # 2026-09-26: 只清「预览未定价」行; 已写 entry_price 的 buy_today
+                    # = 已在盘中某分钟成交 (14:50 起滚动买入), **不得**被后续轮次冲掉。
                     cur.execute(
                         f"DELETE FROM {_SIGNALS_TABLE} "
-                        f"WHERE trade_date = %s AND state = %s AND strategy = ANY(%s)",
+                        f"WHERE trade_date = %s AND state = %s AND strategy = ANY(%s) "
+                        f"AND entry_price IS NULL",
                         (trade_date, S_BUY_TODAY, list(purge_buy_today)),
                     )
                     purged += cur.rowcount

@@ -13,7 +13,40 @@ from typing import Any, Dict, List, Optional
 
 # ── Tool functions ────────────────────────────────────────────
 
-def list_indicators(user_id: int = 1) -> Dict[str, Any]:
+def list_indicators(user_id: int = 1, include_params: bool = False,
+                    indicator_id: Optional[int] = None) -> Dict[str, Any]:
+    """指标策略列表（2026-09-27 工具归组化：合并原 get_indicator_params）。
+
+    Returns:
+        dict: {indicators:[{id, user_id, is_buy, name, description, price, createtime,
+        updatetime, ...}], count}；include_params=True 时每项追加 params（解析 # @param 注释）；
+        失败→{indicators: [], count: 0, error}。
+        indicator_id 非空时返回单指标参数视图（等价原 get_indicator_params）：
+        {indicator_id, indicator_name, params(list), count}；失败→{params: [], error}。
+
+    Args:
+        user_id: 用户 ID，默认 1
+        include_params: 是否附带每项指标的可配置参数（默认 False）
+        indicator_id: 只看某个指标的参数（默认 None = 列表模式）
+    """
+    if indicator_id is not None:
+        # 委托原 get_indicator_params 实现，不自算第三份（实现保留供历史链路）
+        return get_indicator_params(indicator_id, user_id)
+
+    out = _list_indicators_impl(user_id)
+    if include_params and isinstance(out, dict) and not out.get("error"):
+        for d in out.get("indicators") or []:
+            try:
+                p = get_indicator_params(int(d.get("id")), user_id)
+                d["params"] = p.get("params", [])
+            except Exception as e:
+                d["params"] = []
+                d["params_error"] = str(e)   # 显式标注，不静默丢
+    return out
+
+
+def _list_indicators_impl(user_id: int = 1) -> Dict[str, Any]:
+    """指标策略列表（原 list_indicators 主体，2026-09-27 归组抽出）。"""
     """指标策略列表：返回用户所有指标策略的ID、名称、描述、是否已购买。
 
     Returns:
@@ -104,22 +137,40 @@ def run_indicator_signal(
     days: int = 60,
     user_id: int = 1,
     params: Optional[Dict[str, Any]] = None,
+    codes: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """执行指标策略：对单只股票运行指定指标，返回最新信号(buy/sell)、评分、指标数值。
+    """执行指标策略（2026-09-27 工具归组化：合并原 indicator_analysis 批量研判）。
 
     Returns:
-        dict: {success(True/False), stock_code, indicator_id, indicator_name, current_price,
-        has_buy, has_sell, buy_price, sell_price, signal_status, plots, signals(list),
-        data_points, last5_buy/last5_sell/last5_close}；失败→{success: False, error}。
+        单股模式 → dict: {success(True/False), stock_code, indicator_id, indicator_name,
+        current_price, has_buy, has_sell, buy_price, sell_price, signal_status, plots,
+        signals(list), data_points, last5_buy/last5_sell/last5_close}；失败→{success: False, error}。
+        批量模式（codes 非空）→ {count, data:{代码: 标准化 SkillReport dict}}，
+        单标的时顶层再镜像 report（SkillReport，双通道）；此模式下 indicator_id 忽略，
+        对用户全部指标策略综合研判（等价原 indicator_analysis）。
 
     Args:
-        indicator_id: 指标策略 ID
-        stock_code: 股票代码（如 600519, 000001, BTC/USDT）
+        indicator_id: 指标策略 ID（单股模式必填；批量模式忽略）
+        stock_code: 股票代码（如 600519, 000001, BTC/USDT）（单股模式用）
         timeframe: K 线周期，默认 1D（可选 1H, 4H, 1W）
         days: 获取 K 线天数，默认 60
         user_id: 用户 ID，默认 1
         params: 指标参数覆盖（可选）
+        codes: 批量模式的股票代码，逗号分隔（非空即进入批量研判）
     """
+    if codes and codes.strip():
+        code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
+        data: Dict[str, Any] = {}
+        for c in code_list:
+            try:
+                data[c] = indicator_analysis(c, user_id)
+            except Exception as e:
+                data[c] = {"score": 50, "direction": "neutral", "status": "error",
+                           "error": str(e)}
+        out: Dict[str, Any] = {"count": len(data), "data": data}
+        if len(code_list) == 1:
+            out["report"] = data[code_list[0]]     # 单标的顶层镜像 SkillReport（双通道）
+        return out
     import pandas as pd
     import numpy as np
     from app.utils.db import get_db_connection
@@ -302,7 +353,8 @@ def run_indicator_signal(
 # 指标策略批量分析（从 indicator_analysis.py 合并）
 # ═══════════════════════════════════════════════════════════════
 
-def indicator_analysis(codes: str, user_id: int = 1) -> dict:
+def indicator_analysis(codes: str, user_id: int = 1,
+                       context: Optional[dict] = None) -> dict:
     """指标策略批量分析：对多只股票执行用户自定义指标策略，返回每只股票的最新信号(buy/sell)和评分。
 
     Args:
@@ -318,8 +370,11 @@ def indicator_analysis(codes: str, user_id: int = 1) -> dict:
 
     Returns:
         标准化 SkillReport dict
+
+    ⚠️（2026-09-27 修复）原签名无 context 参数却引用 context ⇒ 调用即 NameError。
+    现显式接收可选 context（兼容可能的封装层注入），无 context 时以 user_id 参数为准。
     """
-    user_id = (context or {}).get("user_id", 1)
+    user_id = (context or {}).get("user_id", user_id)
 
     # ── 1. 加载用户指标 ──
     indicators = _list_user_indicators(user_id)

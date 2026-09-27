@@ -311,6 +311,73 @@ _MUST_HAVE = {"format_utils", "web_search_tools"}
 # 挂死整个进程。任何模块的同名入口一律不注册（元工具表同判据）。
 _ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "app"})
 
+# 已被聚合工具取代：实现保留（技能/内部仍可 import、能力层仍可让位判定），
+# 但不再注册为工具面。key 用全限定名 "module:func"（module = importlib 导入后的
+# __name__，如 tools.finance.fund_flow_tools），避免跨模块同名误伤。
+#
+# 【为什么只摘注册不删实现】（工具归组化方案 §4，2026-09-27）：
+#   ① 技能层直接 import 这些函数（market_screener/common.py 等），删实现会断链；
+#   ② 能力层同名让位机制依赖"包装函数存在"做语义对比（loader.py 先注册者胜出）；
+#   ③ 归组的目的是缩注入面，不是抹掉代码。
+# 【易错点】摘名后能力层会**自动补位**（loader.py:170 既定行为）。凡同名让位项
+#   （get_fund_flow_daily/get_sector_fund_flow/get_hot_sectors/get_index_kline）
+#   不得进本表——否则包装被摘、能力薄实现出静默接管，语义降级无人知（P0 定案）。
+_SUPERSEDED_BY_MERGE = frozenset({
+    # 资金流 → get_fund_flow(scope=...)（P0 保留 get_fund_flow_daily/get_sector_fund_flow）
+    "tools.finance.fund_flow_tools:get_market_fund_flow",
+    "tools.finance.fund_flow_tools:get_concept_fund_flow",
+    # 指数行情 → get_index_quote(scope=...)（P0 保留 get_index_kline）
+    "tools.finance.data_tools:get_market_indices",
+    "tools.finance.data_tools:get_index_etf_quote",
+    # 情报 → search_intel(scope=...)
+    "tools.finance.news_search_tools:search_stock_intel",
+    "tools.finance.news_search_tools:search_sector_intel",
+    "tools.finance.news_search_tools:search_policy_intel",
+    "tools.finance.news_search_tools:search_comprehensive_intel",
+    # 龙虎榜 → get_dragon_tiger(detail=...)；板块 → get_sector_board(view=...)
+    "tools.finance.signal_tools:get_dragon_tiger_detail",
+    "tools.finance.signal_tools:get_industry_ranking",
+    "tools.finance.signal_tools:get_stock_concept_blocks",
+    "tools.finance.sector_analysis_tools:get_sector_trend_analysis",
+    "tools.finance.sector_analysis_tools:get_sector_history_data",
+    # 技术分析 → technical_analysis（实现保留供技能 import）
+    "tools.finance.analysis_tools:analyze_trend",
+    "tools.finance.analysis_tools:get_indicator_snapshot",
+    "tools.finance.analysis_tools:get_volume_analysis",
+    "tools.finance.analysis_tools:get_obv_analysis",
+    "tools.finance.analysis_tools:calculate_ma",
+    # 指标策略 → list_indicators / run_indicator_signal
+    "tools.finance.indicator_tools:get_indicator_params",
+    "tools.finance.indicator_tools:indicator_analysis",
+})
+
+# 工具更名/归并的权重迁移表（旧名 → 新名）：chain/evaluator 同步权重表时，
+# 把旧名的 win_rate/sample_count 按样本量加权并入新名，再删旧行，
+# 避免 EvalNode 历史学习成果被冷启动清零（2026-09-27 工具归组化）。
+# 多旧名并入同新名时逐个迁移累加。
+TOOL_ALIAS: Dict[str, str] = {
+    "get_market_fund_flow": "get_fund_flow",
+    "get_concept_fund_flow": "get_fund_flow",
+    "get_market_indices": "get_index_quote",
+    "get_index_etf_quote": "get_index_quote",
+    "search_stock_intel": "search_intel",
+    "search_sector_intel": "search_intel",
+    "search_policy_intel": "search_intel",
+    "search_comprehensive_intel": "search_intel",
+    "get_dragon_tiger_detail": "get_dragon_tiger",
+    "get_industry_ranking": "get_sector_board",
+    "get_sector_trend_analysis": "get_sector_board",
+    "get_sector_history_data": "get_sector_board",
+    "get_stock_concept_blocks": "get_stock_sector_info",
+    "analyze_trend": "technical_analysis",
+    "get_indicator_snapshot": "technical_analysis",
+    "get_volume_analysis": "technical_analysis",
+    "get_obv_analysis": "technical_analysis",
+    "calculate_ma": "technical_analysis",
+    "get_indicator_params": "list_indicators",
+    "indicator_analysis": "run_indicator_signal",
+}
+
 
 def _is_tool_function(obj, module) -> bool:
     """模块里哪些公开函数算"工具函数"——注册表与元工具表**共用同一判据**。
@@ -443,10 +510,19 @@ class ToolProvider:
         self._register_module_functions(module, domain)
 
     def _register_module_functions(self, module, domain: str):
-        """扫描模块公开函数并注册（判据见模块级 _is_tool_function）。"""
+        """扫描模块公开函数并注册（判据见模块级 _is_tool_function）。
+
+        聚合摘除（`_SUPERSEDED_BY_MERGE`）判定**只在本处**、不在 `_is_tool_function`：
+        后者被注册表与元工具表共用（2026-09-21 判据漂移事故），塞聚合语义会污染另一处。
+        """
+        mod_name = getattr(module, "__name__", "")
         for attr_name in dir(module):
             if attr_name in _ENTRY_NAME_DENY:
                 logger.debug("[ToolProvider] 跳过入口函数 %s（CLI/server 入口不注册）", attr_name)
+                continue
+            if f"{mod_name}:{attr_name}" in _SUPERSEDED_BY_MERGE:
+                logger.debug("[ToolProvider] %s:%s 已被聚合工具取代，摘除注册（实现保留）",
+                             mod_name, attr_name)
                 continue
             obj = getattr(module, attr_name)
             if not _is_tool_function(obj, module):

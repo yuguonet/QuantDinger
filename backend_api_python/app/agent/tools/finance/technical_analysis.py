@@ -328,6 +328,27 @@ def _algo_analyze(
         falsifiable.append(f"综合分({final_score:.0f})突破60或跌破40")
     falsifiable_conditions = "；".join(falsifiable) if falsifiable else "数据不足，无法生成可证伪条件"
 
+    # ── 派生字段（中间结果直出，2026-09-27 工具归组化 §3.6）──
+    # 口径以本块为唯一真源（纯由已取回的工具结果推导，不新增数据拉取）：
+    #   ma_alignment: 均线排列，【透传】analyze_trend 的既有结论（7 档：强多头排列/
+    #     多头排列/弱势多头/强空头排列/空头排列/弱势空头/均线缠绕/震荡），缺失 → None。
+    #     ⚠️ 禁止在此自算第二份排列：2026-09-27 曾产出 4 档劣化副本 ma_arrangement，
+    #     与 analyze_trend 的 ma_alignment 语义重叠且信息量更少（2026-09-27 用户定案删除）。
+    #   vol_price_divergence: 量价背离 = 价升量缩（vol_price_relation 含"缩量上涨"）；
+    #     数据不足 → None（勿把 None 当 False，三态语义）
+    #   trend_strength_grade: 趋势因子分分级（trend_score ≥65 强 / ≤35 弱 / 其余 中）
+    volume_raw = tool_results.get("get_volume_analysis", {})
+    ma_alignment = trend_raw.get("ma_alignment") if isinstance(trend_raw, dict) else None
+    _vpr = volume_raw.get("vol_price_relation", "") if isinstance(volume_raw, dict) else ""
+    if not _vpr or "数据不足" in _vpr:
+        vol_price_divergence = None
+    else:
+        vol_price_divergence = "缩量上涨" in _vpr
+    if isinstance(trend_score, (int, float)):
+        trend_strength_grade = "强" if trend_score >= 65 else ("弱" if trend_score <= 35 else "中")
+    else:
+        trend_strength_grade = "数据不足"
+
     _r = {
         "score": final_score,
         "direction": direction,
@@ -351,6 +372,11 @@ def _algo_analyze(
         "ma60": trend_raw.get("ma60") if isinstance(trend_raw, dict) else None,
         "bias_ma20": trend_raw.get("bias_ma20") if isinstance(trend_raw, dict) else None,
         "rsi": indicator_raw.get("rsi", {}) if isinstance(indicator_raw, dict) else {},
+        # 派生字段（中间结果直出，2026-09-27）——模型不再自己算排列/背离/强度
+        # ma_alignment 为 analyze_trend 原值透传（非空即 7 档之一，见上）
+        "ma_alignment": ma_alignment,
+        "vol_price_divergence": vol_price_divergence,
+        "trend_strength_grade": trend_strength_grade,
     }
     return _r
 def technical_analysis(codes: str) -> dict:
@@ -363,7 +389,13 @@ def technical_analysis(codes: str) -> dict:
         dict: 标准化分析报告，键包括:
               score(0-100)、direction(bullish/bearish/neutral)、confidence(high/medium/low)、
               signal(信号摘要)、analysis(分析文字)、stock_code，
-              以及透传原始数据 latest_close/boll/ma20/ma60/bias_ma20/rsi。
+              以及透传原始数据 latest_close/boll/ma20/ma60/bias_ma20/rsi，
+              并含派生字段（中间结果直出，2026-09-27）：
+              ma_alignment(均线排列，透传 analyze_trend 原值：强多头排列|多头排列|弱势多头|
+              强空头排列|空头排列|弱势空头|均线缠绕/震荡；数据不足→null，勿自算第二份排列)，
+              vol_price_divergence(量价背离：价升量缩→true；无背离→false；数据不足→null，
+              三态勿当 bool 用)，trend_strength_grade(趋势强度：强|中|弱|数据不足，
+              按趋势因子分 ≥65/≤35 分级)。
               ⚠️ factors 是【列表】，不是字典！每个元素是 {"name","value","score"} 三键字典，
                  因子名在 name 字段里（取值如 "趋势"/"指标"/"量价"/"形态"/"筹码"/"流通盘"），
                  没有 "MA"/"MACD"/"RSI"/"KDJ" 这种顶层键。

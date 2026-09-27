@@ -11,15 +11,10 @@ import json
 from app.agent.log import logger
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _batch_execute, _to_md
-def get_fund_flow(codes: str = "") -> dict:
-    """个股资金流向：返回主力/散户/净流入金额、资金流向趋势。
+def _fund_flow_stock_realtime(codes: str) -> dict:
+    """个股实时资金流（原 get_fund_flow 主体，2026-09-27 归组时抽出为私有助手）。
 
-    Args:
-        codes: 股票代码，如 "000001" 或 "000001,600519"
-
-    Returns:
-        {"count": N, "data": {代码: {主力净流入, 散户净流入, 趋势, ...}}} ——
-        dict，个股明细在二级键 data 下按代码索引；某股失败时其值为 {"error": ...}
+    私有函数不注册（_ 前缀），仅供 get_fund_flow(scope="stock") 分发。
     """
     if not codes or not codes.strip():
         return {"error": "codes 不能为空", "retriable": False}
@@ -35,6 +30,92 @@ def get_fund_flow(codes: str = "") -> dict:
             results[code] = {"error": str(e)}
 
     return {"count": len(results), "data": results}
+
+
+def _fund_flow_trend(rows: List[Dict[str, Any]]) -> dict:
+    """资金趋势判定（中间结果直出）：从日频 main_net 序列算连续净流入/流出天数+方向。
+
+    口径：取末日符号为方向，向前数连续同号天数；末日为 0 或无数据 → direction=none。
+    易错点：空序列/全 0 序列要给 none 而不是 inflow（勿把无数据当净流入）。
+    """
+    if not rows:
+        return {"direction": "none", "streak_days": 0, "as_of": ""}
+    as_of = str(rows[-1].get("date", ""))
+    signs = [1 if (r.get("main_net") or 0) > 0 else (-1 if (r.get("main_net") or 0) < 0 else 0)
+             for r in rows]
+    if signs[-1] == 0:
+        return {"direction": "none", "streak_days": 0, "as_of": as_of}
+    last = signs[-1]
+    streak = 0
+    for s in reversed(signs):
+        if s != last:
+            break
+        streak += 1
+    return {"direction": "inflow" if last > 0 else "outflow",
+            "streak_days": streak, "as_of": as_of}
+
+
+def _fund_flow_boards_view(src: dict) -> dict:
+    """sectors/concepts 键统一为 boards（2026-09-27 归组契约）。
+
+    破坏点：旧键不再出现（方案 §3.1 已明写）；只改键名不改行结构。
+    """
+    if not isinstance(src, dict):
+        return src
+    out = dict(src)
+    for old in ("sectors", "concepts"):
+        if old in out:
+            out["boards"] = out.pop(old)
+    return out
+
+
+def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
+                  indicator: str = "今日") -> dict:
+    """资金流向（统一入口，2026-09-27 工具归组化）。
+
+    scope: stock=个股实时 | stock_daily=个股历史 | market=大盘实时
+           | sector=行业板块 | concept=概念板块
+    注：个股日频历史与行业资金流另有独立工具 get_fund_flow_daily / get_sector_fund_flow
+    （P0 定案：同名让位项保留注册，防能力层薄实现实静默接管），与本工具同源同实现。
+
+    Returns:
+        scope=stock → {"count": N, "data": {代码: {主力净流入, 散户净流入, 趋势, ...}}}，
+            单股失败其值为 {"error": ...}。
+        scope=stock_daily → {"count": N, "data": {代码: {code, total_days,
+            recent_20d_main_net, 资金趋势判定:{direction(inflow|outflow|none),
+            streak_days, as_of}, data:[{date, main_net, small_net, mid_net,
+            large_net, super_net}...]}}}；失败其值为 {"error": ...}。
+        scope=market → {source, timestamp, main_net, main_pct, in_net, out_net, data}。
+        scope=sector/concept → {"indicator", "count", "boards":[{name, change_pct,
+            main_net, ...}]}（**统一键名 boards**，旧工具的 sectors/concepts 键不再出现）。
+        失败 → {"error": "...", "retriable": bool}。
+        缓议字段：净流入占成交额比 —— 资金流各源均无成交额字段，不跨服务硬拉、不造假字段。
+
+    Args:
+        scope: 资金流范围，stock | stock_daily | market | sector | concept
+        codes: 股票代码，多股逗号分隔（scope=stock/stock_daily 用），如 "000001,600519"
+        days: 历史回溯天数（scope=stock_daily 用），默认120
+        indicator: 时间维度（scope=sector/concept 用），"今日"|"5日"|"10日"
+    """
+    s = (scope or "stock").strip().lower()
+    if s == "stock":
+        return _fund_flow_stock_realtime(codes)
+    if s == "stock_daily":
+        out = get_fund_flow_daily(codes, days)
+        data = out.get("data") if isinstance(out, dict) else None
+        if isinstance(data, dict):
+            for one in data.values():
+                if isinstance(one, dict) and "error" not in one:
+                    one["资金趋势判定"] = _fund_flow_trend(one.get("data") or [])
+        return out
+    if s == "market":
+        return get_market_fund_flow()
+    if s == "sector":
+        return _fund_flow_boards_view(get_sector_fund_flow(indicator))
+    if s == "concept":
+        return _fund_flow_boards_view(get_concept_fund_flow(indicator))
+    return {"error": f"scope 无效: {scope!r}，可选 stock|stock_daily|market|sector|concept",
+            "retriable": False}
 def get_sector_fund_flow(indicator: str = "今日") -> dict:
     """行业资金流向：返回各行业板块主力资金净流入排名。
 

@@ -5,7 +5,7 @@ description: 从A股全市场筛选短线标的。用户问"今天买什么股""
 tags: [market, screener, short_term, a_share]
 tools:
   - get_fund_flow
-  - get_indicator_snapshot
+  - technical_analysis
   - search_stocks
   - agent_get_kline
 ---

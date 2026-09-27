@@ -19,7 +19,10 @@ fund_flow_api.py — 通用资金流 API (2026-09-26)
 - **口径标注** (不编造):
     source = eastmoney | sina | snapshot_approx | hub_index_fflow
     approx = True 时为量价方向近似 (realtime_snapshot), 非主力/超大单分类
-- **保留天数** KEEP_DAYS 默认 30,  clamp 到 [5, 30]; sync 时删更旧的行。
+- **保留天数** `KEEP_DAYS_DEFAULT=1200`(约 3.3 年): 个股表 `qd_fund_flow_stock` 是我们
+  从本地分钟 K 线回填的研究历史库(2024-01-23 起), 按 30 天滚动裁剪会把它清空;
+  大盘/板块同值 —— 两者现有规模极小(5 / 48 行), 且远端补历史与裁剪口径保持一致更省心。
+  读口 clamp 区间 [5, `KEEP_DAYS_MAX`=1200] ⇒ 可直接 `days=700` 读长历史。
 
 用法
 ----
@@ -44,12 +47,16 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-KEEP_DAYS_DEFAULT = 30
+# 2026-09-27 30 -> 1200 (约 3.3 年): `qd_fund_flow_stock` 是本地分钟 K 线回填的
+# 研究历史库(2024-01-23 起 ~570 个交易日), 原 30 天滚动裁剪会把它整体清空。
+# 三张表统一用本值: 大盘/板块现有仅 5 / 48 行, 抬高无压力, 少一个常量少一处漏改。
+KEEP_DAYS_DEFAULT = 1200
 # 盘中派生节流: 全市场聚合 ~10s+, 勿每 60s 跑
 INTRADAY_MIN_INTERVAL_SEC = 180
 _LAST_INTRADAY_TS = 0.0
 KEEP_DAYS_MIN = 5
-KEEP_DAYS_MAX = 30
+# 读口 clamp 上限: 不抬高的话 days>30 仍会被静默截断(7 个读口共用本值)。
+KEEP_DAYS_MAX = 1200
 
 T_MARKET = "qd_fund_flow_market"
 T_STOCK = "qd_fund_flow_stock"
@@ -96,6 +103,7 @@ def ensure_fund_flow_tables() -> None:
                     large_net   DOUBLE PRECISION,
                     mid_net     DOUBLE PRECISION,
                     small_net   DOUBLE PRECISION,
+                    turnover    DOUBLE PRECISION,
                     source      TEXT,
                     approx      BOOLEAN DEFAULT FALSE,
                     updated_at  TIMESTAMPTZ DEFAULT NOW(),
@@ -444,16 +452,19 @@ def upsert_stock(rows: List[Dict[str, Any]]) -> int:
                 cur.execute(
                     f"""INSERT INTO {T_STOCK}
                         (trade_date, code, main_net, super_net, large_net,
-                         mid_net, small_net, source, approx, updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                         mid_net, small_net, turnover, source, approx, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
                         ON CONFLICT (trade_date, code) DO UPDATE SET
                           main_net=EXCLUDED.main_net, super_net=EXCLUDED.super_net,
                           large_net=EXCLUDED.large_net, mid_net=EXCLUDED.mid_net,
-                          small_net=EXCLUDED.small_net, source=EXCLUDED.source,
+                          small_net=EXCLUDED.small_net,
+                          -- ⚠ 快照来源的行不带 turnover, 直接 EXCLUDED 会把回填值刷成 NULL
+                          turnover=COALESCE(EXCLUDED.turnover, {T_STOCK}.turnover),
+                          source=EXCLUDED.source,
                           approx=EXCLUDED.approx, updated_at=NOW()""",
                     (r["trade_date"], r["code"], r.get("main_net"), r.get("super_net"),
                      r.get("large_net"), r.get("mid_net"), r.get("small_net"),
-                     r.get("source"), bool(r.get("approx"))),
+                     r.get("turnover"), r.get("source"), bool(r.get("approx"))),
                 )
                 n += 1
             _prune(cur, T_STOCK, KEEP_DAYS_DEFAULT)
@@ -461,13 +472,143 @@ def upsert_stock(rows: List[Dict[str, Any]]) -> int:
     return n
 
 
+# ================================================================
+# 2'. 日度落库: 由 kline_1m 派生 (2026-09-27 用户裁定)
+# ================================================================
+# 背景: `kline_15m` 已被判定作废(复权口径/日内高低价/覆盖三处与日线不符),
+# `kline_1m` 成为唯一可用分钟源。已有能力都做不了「全市场日度落库」:
+#   - `_flow_from_1m_day()`    全市场**汇总**, 返回单个 dict(市场级);
+#   - `_stock_from_kline1m()`  逐票派生, N 次查询, 5221 票不可行。
+# 本段补「单日全市场批量聚合 -> upsert」+ 最近 N 日缺失自愈,
+# 由 scheduler 每日调用, 长期攒出可判定的样本量(1m 现有仅 ~110 交易日)。
+MIN_SYMBOLS_PER_DAY_STORE = 3000   # 当日覆盖票数低于此值 => 源未就绪, 不落库
+
+
+def _stock_flows_from_1m_day(day: str) -> list:
+    """单日全市场 1m 派生个股资金流 -> [(code, main_net, turnover), ...]。
+
+    ★ 口径与 `_flow_from_1m_day` **完全一致**(同一 SQL 的个体化版本):
+        ref = 前一根 close (首根用 open)
+        net = Σ(volume*close) 按 close vs ref 取符号
+        amt = Σ(volume*close)
+      清洗同样剔除 688*/8*/4*/92* 与 amt >= 2000 亿。
+    ⚠ psycopg2 参数化里 LIKE 字面量的 % 必须写成 %%。
+    """
+    table = _kline_1m_year_table(int(str(day)[:4]))
+    sql = (
+        "WITH t AS ("
+        "  SELECT symbol, open, close, volume,"
+        "         lag(close) OVER (PARTITION BY symbol ORDER BY time) AS pc"
+        f"  FROM {table} WHERE time::date = %s"
+        "    AND symbol NOT LIKE '688%%' AND symbol NOT LIKE '8%%'"
+        "    AND symbol NOT LIKE '4%%' AND symbol NOT LIKE '92%%'"
+        "), s AS ("
+        # ⚠ ref 必须取 pc(前一根 close)。写成 close 会让 239/240 根 bar 落入
+        #   ELSE 0 分支 => 全天净额只由开盘首根决定(线上 _flow_from_1m_day 原有此 bug)。
+        "  SELECT symbol, CASE WHEN pc IS NOT NULL THEN pc ELSE open END AS ref,"
+        "         close, volume FROM t WHERE volume > 0 AND close > 0"
+        "), p AS ("
+        "  SELECT symbol,"
+        "         sum(CASE WHEN close > ref THEN volume * close"
+        "                  WHEN close < ref THEN -(volume * close)"
+        "                  ELSE 0 END) AS net,"
+        "         sum(volume * close) AS amt"
+        "  FROM s GROUP BY symbol"
+        ") SELECT symbol, net, amt FROM p WHERE amt > 0 AND amt < 200000000000"
+    )
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(day)[:10],))
+                return [(r[0], float(r[1]), float(r[2])) for r in cur.fetchall()]
+    except Exception as e:
+        logger.warning("[fund_flow_api] 1m 个股批量聚合失败(%s): %s", day, e)
+        return []
+
+
+def upsert_stock_day_from_1m(day: str) -> int:
+    """把某交易日全市场 1m 派生资金流落库(幂等 UPSERT)。返回写入行数。
+
+    ⚠ 不复用 `upsert_stock()`: 它是**逐行** execute(5221 票 => 5221 次往返),
+      这里走 `execute_values` 批量。字段语义保持一致(含 turnover 的 COALESCE 保护,
+      否则快照来源的行会把回填值刷成 NULL)。
+    ⚠ 不做 `_prune`: 现网 `KEEP_DAYS_DEFAULT=1200`(约 3.3 年) 远大于本段数据跨度,
+      且落库只补最近几天, 无裁剪必要 —— 少一次全表 DELETE。
+    """
+    import psycopg2.extras as _pgx
+    day = str(day)[:10]
+    rows = _stock_flows_from_1m_day(day)
+    if len(rows) < MIN_SYMBOLS_PER_DAY_STORE:
+        logger.warning("[fund_flow_api] %s 覆盖票数 %d < %d => 跳过落库(源未就绪)",
+                       day, len(rows), MIN_SYMBOLS_PER_DAY_STORE)
+        return 0
+    ensure_fund_flow_tables()
+    payload = [(day, code, net, amt, "kline_1m", True) for code, net, amt in rows]
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            _pgx.execute_values(
+                cur,
+                f"""INSERT INTO {T_STOCK}
+                    (trade_date, code, main_net, turnover, source, approx, updated_at)
+                    VALUES %s
+                    ON CONFLICT (trade_date, code) DO UPDATE SET
+                      main_net=EXCLUDED.main_net,
+                      turnover=COALESCE(EXCLUDED.turnover, {T_STOCK}.turnover),
+                      source=EXCLUDED.source, approx=EXCLUDED.approx, updated_at=NOW()""",
+                payload, page_size=2000, template="(%s,%s,%s,%s,%s,%s,NOW())")
+        conn.commit()
+    return len(payload)
+
+
+def backfill_stock_from_1m(days: int = 7) -> Dict[str, Any]:
+    """最近 N 个交易日「缺失或残缺」的 1m 资金流落库(每日调度调用, 自愈)。
+
+    判据: 该日在 1m 源里有数据, 但库里 `source='kline_1m'` 的行数 < 阈值
+          => 视为未落库/残缺(如盘中只落了一半), 重算覆盖。
+    自愈性: 任一天失败或漏跑, 只要还在最近 N 天内, 下次调度自动补上。
+    """
+    days = max(1, min(int(days), 60))
+    year = datetime.now().year
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT time::date FROM {_kline_1m_year_table(year)} "
+                    f"WHERE time::date <= %s ORDER BY 1 DESC LIMIT %s",
+                    (today, days))
+                src_days = [str(r[0])[:10] for r in cur.fetchall()]
+                have = {}
+                if src_days:
+                    cur.execute(
+                        f"SELECT trade_date, COUNT(*) FROM {T_STOCK} "
+                        f"WHERE trade_date IN %s AND coalesce(source, '') = 'kline_1m' "
+                        f"GROUP BY 1", (tuple(src_days),))
+                    have = {str(r[0])[:10]: int(r[1]) for r in cur.fetchall()}
+    except Exception as e:
+        logger.warning("[fund_flow_api] 落库候选日查询失败: %s", e)
+        return {"error": repr(e)[:160]}
+
+    todo = [d for d in src_days if have.get(d, 0) < MIN_SYMBOLS_PER_DAY_STORE]
+    written = []
+    for d in todo:
+        written.append({"day": d, "rows": upsert_stock_day_from_1m(d)})
+    logger.info("[fund_flow_api] 1m 日度落库: 候选 %d 天, 需补 %d 天, 写入 %s",
+                len(src_days), len(todo), written)
+    return {"source_days": src_days, "todo": todo, "written": written}
+
+
 def _load_stock_db(code: str, days: int) -> List[Dict[str, Any]]:
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT trade_date, main_net, super_net, large_net, mid_net, "
-                f"small_net, source, approx FROM {T_STOCK} "
-                f"WHERE code=%s ORDER BY trade_date DESC LIMIT %s",
+                f"small_net, turnover, source, approx FROM {T_STOCK} "
+                # ⚠ 2026-09-27: `kline_15m` 源已被用户判定作废（复权口径/日内高低价/覆盖
+                #   三处与日线不符），其 188 万行已改标记为 `kline_15m_void` 保留备查。
+                #   读口必须排除，否则作废数据会照旧被返回（本函数原本不按 source 过滤）。
+                f"WHERE code=%s AND coalesce(source, '') <> 'kline_15m_void' "
+                f"ORDER BY trade_date DESC LIMIT %s",
                 (code, days))
             rows = cur.fetchall()
     out = []
@@ -475,8 +616,8 @@ def _load_stock_db(code: str, days: int) -> List[Dict[str, Any]]:
         out.append({
             "trade_date": str(r[0])[:10], "code": code,
             "main_net": _f(r[1]), "super_net": _f(r[2]), "large_net": _f(r[3]),
-            "mid_net": _f(r[4]), "small_net": _f(r[5]),
-            "source": r[6], "approx": bool(r[7]),
+            "mid_net": _f(r[4]), "small_net": _f(r[5]), "turnover": _f(r[6]),
+            "source": r[7], "approx": bool(r[8]),
         })
     return list(reversed(out))
 
@@ -816,7 +957,10 @@ def _flow_from_1m_day(day: str, code: Optional[str] = None) -> Optional[Dict[str
         f"  FROM {table} WHERE {where}"
         "), s AS ("
         "  SELECT symbol,"
-        "         CASE WHEN pc IS NOT NULL THEN close ELSE open END AS ref,"
+        # ⚠ 2026-09-27 修复: 原为 `THEN close`, 与 `close > ref` 恒等价 =>
+        #   实测 240 根 bar 中 239 根落入 ELSE 0, 全天净额只由开盘首根决定。
+        #   正确的 ref 是**前一根 close**(pc), 首根才用 open。
+        "         CASE WHEN pc IS NOT NULL THEN pc ELSE open END AS ref,"
         "         close, volume"
         "  FROM t"
         "), d AS ("

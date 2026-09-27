@@ -4,7 +4,7 @@ name: auto_finance-analysis-stock
 version: 0.1.0
 description: 对单只A股标的开展T+1/T+3/1W/1M多周期技术面、资金面、基本面综合诊断，输出短期走势参考结论。适用于用户要求"分析/诊断/解读某只股票"、"看下600519怎么样"、"贵州茅台短期走势如何"、"XX标的近期该关注什么"等场景。
 tags: [finance, stock, A股, 多周期分析, 技术面, 资金面, 基本面, 综合诊断]
-tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analyze_trend, get_capital_summary, get_indicator_snapshot, get_fund_flow, get_chip_distribution]
+tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info, get_capital_summary, get_fund_flow, get_chip_distribution]
 ---
 
 # 单只A股多周期综合诊断
@@ -27,18 +27,22 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 ### Step 2：并行拉取基础行情与K线
 并行调用以下工具，**codes 参数传字符串**（单标的场景）：
 - `agent_get_kline(codes, timeframe='1D', days=30)`：获取近30个交易日OHLCV，用于计算多周期涨跌幅、阶段高低点、量比（当日成交量/5日均量）。
-- `get_realtime_quote(codes)`：获取最新价、涨跌幅、换手率、PE/PB、总市值。若返回异常，以 `agent_get_kline` 或 `calculate_ma` 的最新收盘价兜底。
-- `calculate_ma(codes, periods='5,10,20,60,120')`：获取MA值、斜率、趋势方向，用于均线多空排列判断。
+- `get_realtime_quote(codes)`：获取最新价、涨跌幅、换手率、PE/PB、总市值。若返回异常，以 `agent_get_kline` 或 `technical_analysis` 的最新收盘价兜底。
 - `get_stock_info(codes, detail=False)`：获取标的基础信息，辅助确认实体与行业归属。
 
 ### Step 3：拉取技术指标与筹码数据
-- `analyze_trend(codes)`：获取MA/MACD/BOLL/RSI/KDJ/OBV/MFI/CMF/ATR等综合趋势信号。
-- `get_indicator_snapshot(codes)`：获取MACD/RSI/BOLL/KDJ/KD最新数值及金叉/死叉/超买超卖状态。
+- `technical_analysis(codes)`：技术面综合报告，一次拿全 MA/MACD/BOLL/RSI/KDJ 等趋势信号与指标快照
+  （2026-09-27 工具归组化：已合并原 calculate_ma / analyze_trend / get_indicator_snapshot 三个工具）。
+  报告自带派生字段：`ma_alignment`（均线排列，**透传**趋势分析的原始字段、非本工具自算，
+  7 档：强多头排列/多头排列/弱势多头/强空头排列/空头排列/弱势空头/均线缠绕/震荡；数据不足→null）、`vol_price_divergence`（量价背离，
+  三态：true/false/null）、`trend_strength_grade`（强/中/弱）；均线多空排列判断直接用 `ma_alignment`，
+  不要再自行比较 MA 数值（该字段是排列的唯一真源，勿自算第二份）。
+  ⚠️ `factors` 是【列表】不是字典，取值用 `by_name = {f["name"]: f["value"] for f in factors}`。
 - `get_chip_distribution(codes, lookback_days=120)`：获取获利比例、平均成本、90%筹码集中度。
 
 ### Step 4：拉取基本面与资金面数据
 - `get_capital_summary(codes)`：获取融资融券、大宗交易、股东户数、分红送转、财报三表摘要（margin/block_trade/holders/dividend/financials）。**不提供** PE/PB 历史分位与机构目标价。
-- `get_fund_flow(codes)`：获取主力/散户净流入金额及近期资金趋势；如需更细粒度，可补充 `get_fund_flow_daily(codes, days=120)`。
+- `get_fund_flow(scope='stock', codes=codes)`：获取主力/散户净流入金额及近期资金趋势（scope 五选一：stock/stock_daily/market/sector/concept）；如需更细粒度，可补充 `get_fund_flow_daily(codes, days=120)`。
 
 ### Step 5：多周期数据加工
 基于 Step 2 的K线数据，按交易日近似推算各周期表现：
@@ -71,7 +75,7 @@ tools: [agent_get_kline, calculate_ma, get_realtime_quote, get_stock_info, analy
 ## 注意事项
 
 - **参数类型坑**：`agent_get_kline` 与 `get_realtime_quote` 等工具的 `codes` 参数在单标的场景下**必须传字符串**（如 `'600519.SH'`）。若传入 `list` 类型，可能触发 `AttributeError: 'list' object has no attribute 'split'`。
-- **数据缺失兜底**：`get_realtime_quote` 可能返回 `{'error': '未获取到行情'}`，此时应立即以 `agent_get_kline` 或 `calculate_ma` 返回的最新收盘价 `latest_close` 作为当前价，并标注数据来源差异。
+- **数据缺失兜底**：`get_realtime_quote` 可能返回 `{'error': '未获取到行情'}`，此时应立即以 `agent_get_kline` 或 `technical_analysis` 返回的最新收盘价 `latest_close` 作为当前价，并标注数据来源差异。
 - **字段名保护**：部分字段可能缺失（如筹码集中度），读取前需做空值/键值检查，避免直接抛异常；机构目标价/估值分位字段不存在，不得向用户承诺。
 - **周期换算**：T+N 均按**交易日**近似计算，非自然日；若K线数据不足对应周期，需在报告中说明数据窗口限制。
 - **估值口径**：工具层无 PE/PB 历史分位，统一描述绝对估值水平；不得主观编造分位或目标价。

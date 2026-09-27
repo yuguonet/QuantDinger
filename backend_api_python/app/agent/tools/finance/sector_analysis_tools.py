@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from app.agent.log import logger
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 from app.agent.utils.md_format import _batch_execute, _to_md
 
 def _to_float(val, default=0.0) -> float:
@@ -196,19 +196,76 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dic
     except Exception as e:
         logger.warning("get_sector_history_data failed: %s", e)
         return {"error": str(e)}
-def get_stock_sector_info(codes: str) -> dict:
-    """从本地数据库查询股票所属行业和概念。
+def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
+                     board_type: str = "industry", days: int = 30,
+                     top_n: int = 20) -> dict:
+    """板块行情统一入口（2026-09-27 工具归组化：合并排名/历史/趋势三个板块工具）。
+
+    view: ranking=行业涨跌幅排名 | history=近N日排名变化 | trend=趋势+周期位置+预测信号
+    ⚠️ 不含热门板块：热门板块一律用独立工具 get_hot_sectors（2026-09-27 定案删除
+    view=hot——它与 get_hot_sectors 同源同实现，双入口会让 planner 纠结选哪个）。
 
     Returns:
-        单代码 → {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?}；
-        多代码 → {"count": N, "data": {代码: 上述dict}}；失败 → {"error", "retriable"}。
+        view=ranking → {top:[{name,code,change_pct,lead_stock,limit_up_count,...}], total}。
+        view=history → {code(1成功/0失败), msg, count, data:[每日排名行, ...]}。
+        view=trend → {code(1成功/0失败), msg, data:{趋势指标 dict}}。
+        失败 → {"error": "..."}。
 
     Args:
-        codes: 多股用逗号分隔
+        view: 视图，ranking | history | trend（热门板块请用 get_hot_sectors）
+        board_type: 板块类型，"industry"(行业) 或 "concept"(概念)（view=history/trend 用）
+        days: 历史天数（view=history 用），默认30
+        top_n: 条数上限（view=ranking 用），默认20
+    """
+    v = (view or "ranking").strip().lower()
+    if v == "ranking":
+        from tools.finance.signal_tools import get_industry_ranking
+        return get_industry_ranking(top_n=top_n)
+    if v == "history":
+        return get_sector_history_data(board_type=board_type, days=days)
+    if v == "trend":
+        return get_sector_trend_analysis(board_type=board_type)
+    return {"error": f"view 无效: {view!r}，可选 ranking|history|trend（热门板块用 get_hot_sectors）",
+            "retriable": False}
+
+
+def get_stock_sector_info(codes: str) -> dict:
+    """从本地数据库查询股票所属行业和概念（单股/多股同一入口，逗号分隔即可）。
+
+    与 agent_get_kline / get_stock_concept_blocks 同构：多股一次调用拿全，
+    概念归属只发【一次】批量请求后按代码分发（2026-09-27 定案——逐票拉取会把本工具
+    的纯本地快查询拖成 N 次外部 HTTP，批量 100 只票即 100 次请求）。
+
+    Returns:
+        统一三键结构（单股/多股一致，⚠️ 勿按"单股扁平 dict"取数，2026-09-27 修正
+        docstring 与实际返回不符的遗留描述）：
+        {"count": N, "data": {代码: 单股dict}, "error": None}；
+        参数非法 → {"error", "retriable"}。
+        单股dict: {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?,
+        boards?: [{name,code,change_pct,lead_stock}], concept_tags?: [...]}。
+        boards/concept_tags 为概念归属富化（2026-09-27 归组：合并原 get_stock_concept_blocks，
+        行情类板块字段），源拉取失败时显式给 concept_error，不静默丢字段。
+
+    Args:
+        codes: 股票代码，多股用逗号分隔（上限 20）
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
+
+    # 概念归属富化：一次批量拉取后分发（委托原 get_stock_concept_blocks，不自算第三份）
+    concept_map: Dict[str, dict] = {}
+    concept_error_all = ""
+    try:
+        from tools.finance.signal_tools import get_stock_concept_blocks as _concept
+        cb_all = _concept(",".join(code_list))
+        if isinstance(cb_all, dict):
+            if "error" in cb_all and not cb_all.get("data"):
+                concept_error_all = str(cb_all.get("error") or "概念归属获取失败")
+            else:
+                concept_map = cb_all.get("data") or {}
+    except Exception as ce:
+        concept_error_all = str(ce)
 
     def _one(stock_code: str) -> dict:
         try:
@@ -234,6 +291,22 @@ def get_stock_sector_info(codes: str) -> dict:
                 result["market_cn"] = stock["market_cn"]
             if stock.get("list_date"):
                 result["list_date"] = stock["list_date"]
+            # 概念归属富化：取外层批量结果按代码分发（键优先用传入原码，回退 stripped 码）
+            # ⚠️ 勿用 "error" 键猜形状：_batch_execute 恒带 error:None，那是信封不是单票失败标记
+            if concept_error_all:
+                result["concept_error"] = concept_error_all
+            else:
+                one = concept_map.get(stock_code) or concept_map.get(sym)
+                if isinstance(one, dict):
+                    if "error" in one:
+                        result["concept_error"] = str(one.get("error") or "概念归属获取失败")
+                    else:
+                        if one.get("boards"):
+                            result["boards"] = one["boards"]
+                        if one.get("concept_tags"):
+                            result["concept_tags"] = one["concept_tags"]
+                else:
+                    result["concept_error"] = "概念归属获取失败"   # 显式标注，不静默丢
             return result
         except Exception as e:
             logger.warning("get_stock_sector_info(%s) failed: %s", stock_code, e)

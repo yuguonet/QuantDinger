@@ -451,6 +451,22 @@ def all_codes():
     return all_codes()
 
 
+def sector_map():
+    """行业归属: {symbol: industry} (板块共振/领涨判定用, 2026-09-27 lead_chase 需求)。
+
+    只收 industry 非空的票; 空行业票不进任何板块, 不参与共振判定 (宁缺勿假共振)。
+    概念股属多对多, 本期只用行业 (一对一) —— 概念共振待概念映射表落点确定后扩。
+    """
+    from app.utils.basicinfo_db import get_stock_basic_db
+    db = get_stock_basic_db()
+    pool = db._get_pool()
+    with pool.cursor() as cur:
+        cur.execute("SELECT symbol, industry FROM stock_basic_info "
+                    "WHERE status='active' AND industry IS NOT NULL AND industry <> ''")
+        rows = cur.fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 def lhb(stock_code=None, trade_date="", days=30):
     """龙虎榜事件 (名单型数据, 不 OHLVC 化)。只读引用 market_cn/dragon_tiger_store。
 

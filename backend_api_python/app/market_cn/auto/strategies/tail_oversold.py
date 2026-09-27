@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""tail_oversold.py — 尾盘超卖超短策略 (14:56 尾盘买 → D1 开盘卖)
+"""tail_oversold.py — 尾盘超卖超短策略 (14:50 起滚动买入 → D1 开盘卖)
 
 超卖反弹: 当日深跌 + 尾盘适度回落 + 贴近日内低位 + 近5日深度超卖 + 振幅大 → 次日开盘
-高概率反弹。D0 14:56~14:57 买入, D1 开盘卖 (出场终审结构最优)。规则来源 test_v2_tail_buy.py。
+高概率反弹。D0 14:50~15:00 任一分钟触发即买, D1 开盘卖。规则来源 test_v2_tail_buy.py。
 回测 (2026-09-09~10 终审): N=275 胜率80.7% 均收+2.74%; 50天 56笔/87.5%/+5.28%/PL3.31。
 
 入场五条件 (归一化 nf: 创/科板 0.5, 主板 1.0): ①非ST/非北交所/未封板 ②score>=8
-③pre5*nf<=-10 ④amplitude*nf>=10 ⑤tail_ret*nf ∈ [-2.8,-0.5] (14:20~14:40 均价→14:56 现价)。
+③pre5*nf<=-10 ④amplitude*nf>=10 ⑤tail_ret*nf ∈ [-2.8,-0.5] (14:20~14:40 均价→触发时现价)。
 
-流程: 14:30 预热 → 14:50 起每分钟滚动预览 (用户提前准备) → 14:56 终审 (等新鲜快照 ≤45s)
+流程: 14:30 预热 → 14:50 起每分钟滚动判定/买入 (10 分钟窗, 先到先得)
 → 15:01 确认持有 → D1 开盘卖。快速判定=两级管线: shortlist 用最新快照必要条件预筛
 (score>=8 数学蕴含 day_gain*nf<=-5; 盘中 low 只会更低 → 预览口径是终审超集), 幸存股
 (约10~50只) 才拉序列+日线完整判定。规则改动验证: `python -m app.market_cn.auto.core.backtest`
@@ -28,6 +28,72 @@ from app.market_cn.auto.strategies.base import (
 
 STRATEGY_KEY = "tail_oversold"
 STRATEGY_LABEL = "尾盘超卖超短"
+
+# 预测分高分段 (2026-09-26): 仅排序/展示, **不挡入场** (笔数保持 L0)。
+# 用途: 同时多票时优中选优; 只在策略存续期有意义。
+SCORE_HIGH_MIN = 10.0
+
+
+# ================================================================
+# 预测分 (2026-09-26 用户定标): 50=平盘 0%, 100=涨停, 0=跌停
+# ================================================================
+# 用途: 同时多票时优中选优; 只在策略存续期有意义; **不挡入场** (笔数不变)。
+# 标定链: V2 分 → 预期次日收益% (经验锚点, 保序) → 相对涨跌停幅度 → 50 为中心。
+#   score = 50 + (E[ret%] / limit_pct) * 50
+#   limit_pct: 主板 10 / 创业科创 20 (涨跌停幅度, 与板块一致)
+_V2_TO_EXP = (
+    (8.3, 0.5),    # V2 → 预期次日收益%
+    (8.8, 2.5),
+    (9.3, 2.5),
+    (9.8, 4.0),
+    (10.3, 5.5),
+)
+
+
+def _v2_to_exp_ret(v2_score: float) -> float:
+    """V2 → 预期次日收益% (单调插值)。"""
+    try:
+        s = float(v2_score)
+    except Exception:
+        return 0.0
+    pts = _V2_TO_EXP
+    if s <= pts[0][0]:
+        return pts[0][1]
+    if s >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if x0 <= s <= x1:
+            if x1 == x0:
+                return y1
+            return y0 + (y1 - y0) * (s - x0) / (x1 - x0)
+    return 0.0
+
+
+def pred_score(v2_score: float, code: str = "", limit_pct: float = None) -> int:
+    """预测分 0~100: **50=平盘, 100=涨停, 0=跌停** (按板块涨跌停幅度)。
+
+    score = 50 + (E[ret%] / limit_pct) * 50
+    limit_pct 缺省按 code 推断 (20cm 创业/科创=20, 其余=10); 也可显式传入。
+    仅持仓期内用于同日排序; 不是入场门。
+    """
+    exp = _v2_to_exp_ret(v2_score)
+    if limit_pct is None:
+        try:
+            from app.market_cn.auto.core.market import get_board_type
+            limit_pct = 20.0 if get_board_type(code) == "gem_star" else 10.0
+        except Exception:
+            limit_pct = 10.0
+    try:
+        limit_pct = float(limit_pct)
+    except Exception:
+        limit_pct = 10.0
+    if limit_pct <= 0:
+        limit_pct = 10.0
+    s = 50.0 + (exp / limit_pct) * 50.0
+    return int(round(max(0.0, min(100.0, s))))
+
 
 PARAMS = {
     "score_min": 8.0,          # V2 评分下限 (归一化后)
@@ -93,7 +159,7 @@ def _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf):
 
 
 def _tail_ret_v2(series_rows):
-    """V2 尾盘回落 %: 14:56 现价 vs 14:20~14:40 (mi 199~219) 分钟收盘均价。
+    """V2 尾盘回落 %: 触发时现价 vs 14:20~14:40 (mi 199~219) 分钟收盘均价。
 
     快照序列 prep_minutes 差分后按 mi 对齐; 槽位 <15 (21 槽缺口过多) 返回 None。
     返回 float | None (2026-09-26 P1-6 统一; 旧 (value, avg) 元组形态由调用方拆).
@@ -121,11 +187,11 @@ class TailOversoldStrategy(StrategyBase):
     prefilter_anchor = "signal"
     entry_style = "v2t"
     scan_spec = ScanSpec(kind="intraday_window", windows=("14:50", "15:00"), interval_sec=60,
-                         entry_at="14:56")   # 终审语义: 仅 14:56 成交, 窗口内其余触发=预览
+                         entry_at="14:50")   # 2026-09-26: 14:50 起即可买入 (非仅 15:00 终审)
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
     PROBE_STAGE_RANK = {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5}
-    # 契约: 回测未含 U1~U4 / 14:56 尾盘入场 (T+1) / D1 开盘卖当日平账 / 滚动预览
+    # 契约: 回测未含 U1~U4 / 14:50 起尾盘入场 (T+1) / D1 开盘卖当日平账 / 滚动预览
     use_unified_prefilter = False
     entry_at_close = True
     exit_exec_same_day = True
@@ -165,7 +231,7 @@ class TailOversoldStrategy(StrategyBase):
         return out
 
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
-        """盘中判定 (滚动预览 14:50 起 / 终审 14:56+)。必须 ctx={"latest","series"}。
+        """盘中判定 (14:50~15:00 滚动, 触发即可买)。必须 ctx={"latest","series"}。
 
         probe: 调试探针 (None=零开销) — 门级 TRACE 打点, 存档供 AI 离线分析。"""
         p = self.merged_params(params or None)
@@ -220,19 +286,24 @@ class TailOversoldStrategy(StrategyBase):
             return []
         if _tr:
             _tr("signal", score=round(score, 2))
+        # 2026-09-26 双层: L0 现网候选 / L1 预测分高分段 (score>=10)
+        #   120d amp8: L0 n=306 wr82.7 pl2.04 | L1 n=18 wr88.9 **pl6.30**
+        tier = "high" if score >= SCORE_HIGH_MIN else "base"
         return [Signal(
             code=code,
             time=str(snap.get("time") or "")[:10],
-            score=min(95, int(round(score * 9))),           # 8~10.3 分映射 72~93 展示分
+            score=pred_score(score, code),   # 50=平盘 100=涨停 0=跌停
             price=last,
             label=(f"尾盘超卖 gain={day_gain:.1f}% tail={tail_ret:+.2f}% "
-                   f"pos={pos_range:.2f} score={score:.1f}"),
+                   f"pos={pos_range:.2f} 预测分={pred_score(score, code)} v2={score:.1f} [{tier}]"),
             extra={"gain": round(day_gain, 2), "amplitude": round(amplitude, 2),
                    "pos_range": round(pos_range, 3), "tail_ret": round(tail_ret, 2),
-                   "pre5_gain": round(pre5_gain, 2)},
+                   "pre5_gain": round(pre5_gain, 2),
+                   "v2_score": round(score, 2), "pred_score": pred_score(score, code),
+                     "pred_exp_ret": round(_v2_to_exp_ret(score), 2), "tier": tier},
         )]
 
-    # ---- 三决策 (与 knife_catch 同生命周期: 14:56 已买 → 隔夜 → D1 开盘卖) ----
+    # ---- 三决策 (14:50 起买入 → 隔夜 → D1 开盘卖) ----
     def entry_decision(self, row, snap=None, **params):
         return EntryDecision(True, "尾盘超卖超短 已入场, 无开盘步骤")
 
