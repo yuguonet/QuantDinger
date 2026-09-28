@@ -190,21 +190,18 @@ def search_intel(scope: str = "stock", codes: str = "", name: str = "",
                  market: str = "CNStock") -> dict:
     """情报检索（统一入口，2026-09-27 工具归组化：合并原 4 个情报工具）。
 
-    scope: stock=个股情报 | sector=板块情报 | policy=政策情报 | all=综合（个股+政策合并）
-
-    Returns:
-        scope=stock/all → {"count": N, "data": {代码: {label, composite_score, direction,
-            veto, veto_article, count(新闻条数), news:[{title,link,snippet?,source,
-            published,sentiment,sentiment_score}]}}}；单标的时顶层再镜像单股结果（双通道）。
-        scope=sector/policy → 单对象（无 data 层）：{label, composite_score, direction,
-            veto, veto_article, count, news:[...]}。
-        失败 → {"error": "...", "retriable": False}。
-
     Args:
         scope: 检索范围，stock | sector | policy | all
         codes: 股票代码，多股逗号分隔（scope=stock/all 必填），如 "000001,600519"
         name: 股票名称，如 "贵州茅台"
         market: 板块名称/政策关键词（scope=sector/policy 用），如 "半导体"
+
+    Returns:
+        信封格式（scope 决定结构）：
+        stock/all   → {"count": N, "data": {CODE: {composite_score, direction, veto,
+                       news:[{title, link, sentiment, ...}]}}}
+        sector/policy → {"count", "label", "composite_score", "news":[...]}（单对象，无 data 层）
+        统一顶层键: "data"/"count"/"error"(失败)。迭代新闻先取 result["data"][code]["news"]。
     """
     s = (scope or "stock").strip().lower()
     if s == "stock":

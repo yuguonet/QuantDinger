@@ -10,12 +10,21 @@ from typing import Any, Dict, List
 
 
 def daily(code: str, days: int = 120, as_of: str = None) -> Dict[str, Any]:
-    """历史日线（qfq），返回统一信封 + 可直接下标的 bars。
+    """历史日线（前复权）。
+
+    Args:
+        code: 股票代码，如 "600000"。多码用逗号分隔，最多 5 个。
+        days: 最近多少天，默认 120。
+        as_of: 截止日期（YYYY-MM-DD），可选。
 
     Returns:
-        {count, data:{code:[{t,o,h,l,c,v},...]}, bars:[...]} 单码顶层镜像。
-        `bars` 按 time 升序；字段短键 t/o/h/l/c/v（兼容 time/open/... 别名）。
-        失败 → {"error": ...}
+        dict 信封格式（不是 DataFrame）。
+        单码 → {"bars": list[dict], "count": int, "data": {CODE: bars}}
+        多码 → {"data": {CODE1: list, CODE2: list}}  （无顶层 bars）
+        失败 → {"error": str, "retriable": bool}
+
+        bars 元素: {"t","o","h","l","c","v"} 短键 + {"time","open",...} 长键别名。
+        切片/迭代用 result["bars"] — 顶层 dict 不能直接切片。
     """
     try:
         from app.market_cn.auto.core.data.hub import daily as _hub_daily

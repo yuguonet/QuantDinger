@@ -73,29 +73,19 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
                   indicator: str = "今日") -> dict:
     """资金流向（统一入口，2026-09-27 工具归组化）。
 
-    scope: stock=个股实时 | stock_daily=个股历史 | market=大盘实时
-           | sector=行业板块 | concept=概念板块
-    注：个股日频历史与行业资金流另有独立工具 get_fund_flow_daily / get_sector_fund_flow
-    （P0 定案：同名让位项保留注册，防能力层薄实现实静默接管），与本工具同源同实现。
-
-    Returns:
-        scope=stock → {"count": N, "data": {代码: {主力净流入, 散户净流入, 趋势, ...}}}，
-            单股失败其值为 {"error": ...}。
-        scope=stock_daily → {"count": N, "data": {代码: {code, total_days,
-            recent_20d_main_net, 资金趋势判定:{direction(inflow|outflow|none),
-            streak_days, as_of}, data:[{date, main_net, small_net, mid_net,
-            large_net, super_net}...]}}}；失败其值为 {"error": ...}。
-        scope=market → {source, timestamp, main_net, main_pct, in_net, out_net, data}。
-        scope=sector/concept → {"indicator", "count", "boards":[{name, change_pct,
-            main_net, ...}]}（**统一键名 boards**，旧工具的 sectors/concepts 键不再出现）。
-        失败 → {"error": "...", "retriable": bool}。
-        缓议字段：净流入占成交额比 —— 资金流各源均无成交额字段，不跨服务硬拉、不造假字段。
-
     Args:
         scope: 资金流范围，stock | stock_daily | market | sector | concept
         codes: 股票代码，多股逗号分隔（scope=stock/stock_daily 用），如 "000001,600519"
         days: 历史回溯天数（scope=stock_daily 用），默认120
         indicator: 时间维度（scope=sector/concept 用），"今日"|"5日"|"10日"
+
+    Returns:
+        信封格式（scope 决定结构）：
+        stock       → {"count": N, "data": {CODE: {主力净流入, 趋势, ...}}}
+        stock_daily → {"count": N, "data": {CODE: {data:[{date, main_net, ...}]}}}
+        market      → {"source","main_net","in_net","out_net",...}
+        sector/concept → {"indicator","count","boards":[{name, main_net, ...}]}
+        统一顶层键: "data"/"count"/"error"(失败)。切片迭代先取 result["data"]。
     """
     s = (scope or "stock").strip().lower()
     if s == "stock":

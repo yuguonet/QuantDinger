@@ -10,18 +10,13 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         stock_name: 股票名称，可选
 
     Returns:
-        {
-            "score": float,          # 0-100 综合评分
-            "direction": str,        # bullish / bearish / neutral
-            "confidence": float,     # 0.0-1.0
-            "signal": str,           # 信号摘要
-            "factors": list,         # 因子明细
-            "analysis": str,         # 分析文字
-            "bull_case": dict,       # 多头论据
-            "bear_case": dict,       # 空头论据
-            "verdict": str,          # 综合判断
-            "status": "ok",
-        }
+        dict — 多空综合报告。
+        核心键: score(0-100), direction(bullish|bearish|neutral), confidence(float),
+        factors(list), analysis(str), hit_rate(float|None), missing_data(list[str]),
+        falsifiable_conditions(str), output_data(bull_case/bear_case/verdict 嵌套)。
+        factors 同 technical_analysis 格式：list[dict{"name","score","direction"}]，
+        因子名带 "多头:" / "空头:" 前缀，按 direction 字段过滤。
+        失败 → {"error": str, "retriable": bool}。
     """
         
     # ── 获取数据 ──

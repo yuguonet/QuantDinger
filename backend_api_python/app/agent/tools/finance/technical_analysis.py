@@ -386,25 +386,12 @@ def technical_analysis(codes: str) -> dict:
         codes: 股票代码（6位数字），如 "600519"
 
     Returns:
-        dict: 标准化分析报告，键包括:
-              score(0-100)、direction(bullish/bearish/neutral)、confidence(high/medium/low)、
-              signal(信号摘要)、analysis(分析文字)、stock_code，
-              以及透传原始数据 latest_close/boll/ma20/ma60/bias_ma20/rsi，
-              并含派生字段（中间结果直出，2026-09-27）：
-              ma_alignment(均线排列，透传 analyze_trend 原值：强多头排列|多头排列|弱势多头|
-              强空头排列|空头排列|弱势空头|均线缠绕/震荡；数据不足→null，勿自算第二份排列)，
-              vol_price_divergence(量价背离：价升量缩→true；无背离→false；数据不足→null，
-              三态勿当 bool 用)，trend_strength_grade(趋势强度：强|中|弱|数据不足，
-              按趋势因子分 ≥65/≤35 分级)。
-              ⚠️ factors 是【列表】，不是字典！每个元素是 {"name","value","score"} 三键字典，
-                 因子名在 name 字段里（取值如 "趋势"/"指标"/"量价"/"形态"/"筹码"/"流通盘"），
-                 没有 "MA"/"MACD"/"RSI"/"KDJ" 这种顶层键。
-              正确取用法:
-                  factors = r["factors"]                        # list
-                  by_name = {f["name"]: f["value"] for f in factors}
-                  # by_name.get("指标") -> "MACD:中性 RSI:72"
-                  # by_name.get("趋势") -> "强烈看空"
-              切勿写成 r["factors"].get("MA", "N/A")（list 无 .get，会报 InterpreterError）。
+        dict — 综合评分报告。
+        核心键: score(0-100), direction(bullish|bearish|neutral), confidence(high|medium|low),
+        factors(list[dict: {"name","value","score"}]), analysis(str), hit_rate(float|None),
+        missing_data(list[str]), falsifiable_conditions(str), ma_alignment, vol_price_divergence。
+        ⚠ factors 是 list，取值 r["factors"] 后按 f["name"] 过滤；r["factors"].get() 会报错。
+        失败 → {"error": str, "retriable": bool}。
     """
     tool_results = _call_tools(codes)
     return _algo_analyze(codes, tool_results)
