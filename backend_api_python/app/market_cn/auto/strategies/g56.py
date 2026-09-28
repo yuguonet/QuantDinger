@@ -357,6 +357,11 @@ class G56Strategy(StrategyBase):
             return []
         if code.startswith(("8", "4", "92")):
             return []
+        # 板块守卫 (2026-09-28 审计 P2): scan_days 版本有、这里缺 ⇒ 两条路径判据不等价,
+        # 且非 A 市场会让 R56[board] 直接 KeyError (而非返回空)。
+        board = get_board_type(code)
+        if board not in ("main", "gem_star"):
+            return []
         # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
         pool_target = str(bars[-1]["time"])[:10]
         k = len(bars) - 1 if as_of is None else as_of
@@ -364,7 +369,6 @@ class G56Strategy(StrategyBase):
         # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
         if not (67 <= k < len(bars)):
             return []
-        board = get_board_type(code)
         # 全序列一次算 f, 不再 _g1_arrays(bars[:k+1]): 指标全部因果, f_full[k] 逐位
         # == 截断重算的第 k 个值 (实证 29360 点 0 不一致, tmp/_g56_cost.py P1)
         f = _g1_arrays(bars)

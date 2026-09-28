@@ -104,15 +104,29 @@ def _skipped_intraday(keys=None):
 # ================================================================
 
 def _load_bars(codes, days, progress=True):
-    """一次性批量取数 (O(N) 一次, 后续全部切片复用)。返回 {code: bars}。"""
-    from app.market_cn.auto.core.data.kline import fetch_kline_db
+    """批量取数 (O(N) 一次往返, 后续全部切片复用)。返回 {code: bars}。
+
+    ⚠ 2026-09-28 审计 P2: 原实现自称"一次性批量取数"但实为逐票 `fetch_kline_db`
+    ⇒ N 次 DB 往返 (全市场约 5000 次)。改用 `fetch_klines_batch` (同一窗口/同一 qfq/
+    同一 as-of 口径, 逐行一致; 分片并发), 门槛(>=30 根)与日志语义保持不变。
+    """
+    from app.market_cn.auto.core.data.kline import fetch_klines_batch
     out = {}
     t0 = time.time()
+    batch = {}
+    try:
+        batch = fetch_klines_batch(list(codes), days) or {}
+    except Exception as e:
+        logger.warning("[rebuild] 批量取数失败, 回落逐票: %s", e)
+        from app.market_cn.auto.core.data.kline import fetch_kline_db
+        batch = {}
+        for c in codes:
+            try:
+                batch[c] = fetch_kline_db(c, days)
+            except Exception:
+                batch[c] = []
     for i, c in enumerate(codes):
-        try:
-            b = fetch_kline_db(c, days)
-        except Exception:
-            b = []
+        b = batch.get(c) or []
         if b and len(b) >= 30:
             out[c] = b
         if progress and (i + 1) % 1000 == 0:
@@ -907,11 +921,15 @@ def render(meta, d, expected, actual, top=25):
             p("  ... 其余 %d 条" % (len(items) - top))
 
     # missing 二分: 库保留窗口内的才是真漏发; 更早的是被 cleanup_old 物理删掉的 (预期)
-    # ⚠ 按**日历日**算, 不能取 win_dates[-15]: cleanup_old 是 `trade_date >= CURRENT_DATE - 15`
-    # (日历日), 而交易日比日历日稀疏 ⇒ 取交易日索引会把窗口算宽, 把已被清理的行误标成漏发。
-    from datetime import date, timedelta
+    # ⚠ 边界**必须复用 `store.cleanup_cutoff`**(单一事实源; 2026-09-28 审计 A8):
+    #   它 = 今日 - int(days*1.6) **日历日** (days=15 → 今日 - 24 日历日)。
+    #   此处原先自行重写公式 `today - DB_KEEP_DAYS`(漏 1.6) ⇒ 边界窄算 9 天,
+    #   [today-24d, today-15d) 区间内的**真漏发**会被误标成"已被清理 (预期, 非漏发)"
+    #   ⇒ 掩盖问题 (正是这个函数本该暴露的东西)。
+    #   也不能取 win_dates[-15] (交易日比日历日稀疏, 会反向把窗口算宽)。
+    from app.market_cn.auto import store as _st
     wd = meta.get("win_dates") or []
-    keep_from = str(date.today() - timedelta(days=DB_KEEP_DAYS))
+    keep_from = _st.cleanup_cutoff(DB_KEEP_DAYS)
     m_recent = [k for k in d["missing"] if k[0] >= keep_from]
     m_purged = [k for k in d["missing"] if k[0] < keep_from]
 

@@ -12,7 +12,7 @@ from app.agent.log import logger
 from typing import Any, Dict, List
 from app.agent.utils.md_format import _batch_execute, _to_md
 def _fund_flow_stock_realtime(codes: str) -> dict:
-    """个股实时资金流（原 get_fund_flow 主体，2026-09-27 归组时抽出为私有助手）。
+    """个股实时资金流 + 5日/20日累计（2026-09-28 补全多日汇总）。
 
     私有函数不注册（_ 前缀），仅供 get_fund_flow(scope="stock") 分发。
     """
@@ -20,12 +20,22 @@ def _fund_flow_stock_realtime(codes: str) -> dict:
         return {"error": "codes 不能为空", "retriable": False}
 
     codes = [c.strip() for c in codes.split(",") if c.strip()][:20]
-    from app.market_cn.tape import get_fund_flow_realtime
+    from app.market_cn.tape import get_fund_flow_realtime, get_fund_flow_daily
 
     results = {}
     for code in codes:
         try:
-            results[code] = get_fund_flow_realtime(code)
+            rt = get_fund_flow_realtime(code)
+            # 补全多日累计（daily 有就合并进 realtime 结果）
+            if isinstance(rt, dict) and "error" not in rt:
+                try:
+                    daily = get_fund_flow_daily(code, days=30)
+                    if isinstance(daily, dict) and "error" not in daily:
+                        rt["recent_5d_main_net"] = daily.get("recent_5d_main_net")
+                        rt["recent_20d_main_net"] = daily.get("recent_20d_main_net")
+                except Exception as e:
+                    logger.debug("_fund_flow_stock_realtime(%s) daily 汇总失败: %s", code, e)
+            results[code] = rt
         except Exception as e:
             results[code] = {"error": str(e)}
 

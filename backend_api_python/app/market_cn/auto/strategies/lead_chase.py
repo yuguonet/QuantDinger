@@ -100,6 +100,14 @@ PARAMS = {
     "exit_mode": "close",       # close=次日收盘 | open=次日开盘 | limit=挂单止盈
     "exit_limit_pct": 3.0,      # exit_mode=limit 时的挂单止盈 %
     "stop_pct": -6.0,           # 次日盘中硬止损 %
+    # ── ⑦ v7 日内均线规则 (2026-09-28 实证, analysis_output/领涨追击_重设计_v7) ──
+    # 只做 T+1; 09:40 口径; 推荐切点 前40%~60% (beta≈1, alpha t 最高)
+    "rule_mode": "v7_dev40",   # off=旧规则 | v7_dev40=日内均线截面
+    "dev40_hhmm": "09:40",     # 取分时均线截止时刻
+    "dev40_pctile": 40.0,      # 同日截面取前 N% (按偏离从高到低)
+    "zt20_max": 0,             # 近20日涨停次数上限 (0=不许有)
+    "fade_max": 1.0,           # 早盘冲高回撤上限 %
+    "amt_lo": 1e8,             # 成交额下限 (元, 可选流动性)
 }
 
 #: 创/科板涨跌幅缩放
@@ -149,6 +157,89 @@ def _minute_pos(hhmm: str) -> int:
     if minutes <= 900:          # 13:00~15:00
         return 119 + (minutes - 780)
     return -1
+
+
+
+
+def _vwap_dev(series, hhmm: str = "09:40") -> float:
+    """dev: 现价/分时VWAP − 1 (%, 09:31~hhmm)。v7 核心因子。
+
+    series: 快照序列 [{time, last, volume}, ...] (volume 累计, 与 day_series 一致)。
+    无数据 → nan。
+    """
+    try:
+        import math
+        cut = hhmm
+        pv = vol = 0.0
+        prev_v = 0.0
+        last_px = None
+        for r in series or []:
+            ts = str(r.get("time") or "")
+            if len(ts) >= 16:
+                hm = ts[11:16]
+            else:
+                hm = ""
+            if hm < "09:31" or hm > cut:
+                # 仍取 09:40 前最后一笔 last
+                if hm and hm <= cut:
+                    last_px = float(r.get("last") or 0) or last_px
+                continue
+            last_px = float(r.get("last") or 0) or last_px
+            v = float(r.get("volume") or 0)
+            dv = max(0.0, v - prev_v)
+            prev_v = v
+            if dv > 0 and last_px > 0:
+                pv += last_px * dv
+                vol += dv
+        if vol <= 0 or not last_px or last_px <= 0:
+            return float("nan")
+        vwap = pv / vol
+        return (last_px / vwap - 1) * 100
+    except Exception:
+        return float("nan")
+
+
+def _fade_pct(series, snap, hhmm: str = "09:40") -> float:
+    """早盘回撤 %: (09:40前最高 − 现价) / 昨收。noise: 越大越像冲高回落。"""
+    try:
+        pc = float((snap or {}).get("previousClose") or 0)
+        last = float((snap or {}).get("last") or 0)
+        if pc <= 0 or last <= 0:
+            return float("nan")
+        hi = last
+        for r in series or []:
+            hm = str(r.get("time") or "")[11:16]
+            if hm and hm <= hhmm:
+                h = float(r.get("high") or r.get("last") or 0)
+                if h > hi:
+                    hi = h
+        return (hi - last) / pc * 100
+    except Exception:
+        return float("nan")
+
+
+def _zt_count(bars, code: str, n: int = 20) -> int:
+    """近 n 日涨停次数 (窗口 = 末根 bar 及其前 n-1 根)。
+
+    调用方传的 `bars` 末根应为 **T-1 及更早** (盘中路径的 bars 到昨收为止), 故本函数
+    含末根即等价于"T-1 及更早", 无前视。
+
+    ⚠ 2026-09-28 审计 A4: 原实现把 `code` 写死 None 后**直接 `return 0`** ⇒ 死函数
+    (任何输入恒 0), 而唯一用到 zt20 的地方当时内联了同一段循环 ⇒ 同一口径两份实现。
+    现统一到本函数 (共享 `is_limit_up`), 行为与那处内联完全一致。
+    """
+    if not bars:
+        return 0
+    from app.market_cn.auto.core.market import get_board_type, is_limit_up
+    bt = get_board_type(code)
+    b = list(bars)
+    end = len(b) - 1
+    zt = 0
+    for j in range(max(1, end - n + 1), end + 1):
+        if j > 0 and is_limit_up(float(b[j]["close"]), float(b[j - 1]["close"]), bt):
+            zt += 1
+    return zt
+
 
 
 def _hist_slot_volume(code: str, end_day: str, days: int, slot: int):
@@ -236,6 +327,32 @@ class LeadChaseStrategy(StrategyBase):
             if (last / pc - 1) * 100 < p["gain_lo"] * _gain_scale(code):
                 continue
             out[code] = snap
+
+        # v7: 全市场 dev_40 截面前 N% (日内均线偏离高优先)
+        if str(p.get("rule_mode", "")).lower() == "v7_dev40" and out:
+            try:
+                from app.market_cn.auto.core.data.hub import day_series
+                date = ""
+                for s in snaps.values():
+                    date = str(s.get("time") or "")[:10]
+                    break
+                series_map = day_series(list(out.keys()), date=date) if date else {}
+            except Exception:
+                series_map = {}
+            scored = []
+            for code, snap in out.items():
+                ser = series_map.get(code) or []
+                dev = _vwap_dev(ser, p.get("dev40_hhmm", "09:40"))
+                if dev != dev:
+                    continue
+                fade = _fade_pct(ser, snap, p.get("dev40_hhmm", "09:40"))
+                if fade == fade and fade > float(p.get("fade_max", 1.0)):
+                    continue
+                scored.append((dev, code, snap, fade))
+            scored.sort(key=lambda x: -x[0])
+            pct = float(p.get("dev40_pctile", 40.0) or 40)
+            k = max(1, int(len(scored) * pct / 100)) if scored else 0
+            out = {c: s for _, c, s, _ in scored[:k]}
         return out
 
     # ── 第二段: 单票深判 (日线前置池 + 早盘噪音剔除 + 时段量比) ──
@@ -265,6 +382,66 @@ class LeadChaseStrategy(StrategyBase):
             if _tr:
                 _tr("mkt", mkt_gain=mkt_gain)
             return []
+
+
+        # ⑦ v7 日内均线规则 (2026-09-28): 只做 T+1; 09:40 口径; 无前视
+        #   dev_40 = 价/分时VWAP−1; 同日截面前 N% (推荐 40~60); zt20=0; fade<=1
+        if str(p.get("rule_mode", "")).lower() == "v7_dev40":
+            if not series:
+                return []
+            dev = _vwap_dev(series, p.get("dev40_hhmm", "09:40"))
+            if dev != dev:  # nan
+                if _tr:
+                    _tr("signal", reason="dev40_nan")
+                return []
+            fade = _fade_pct(series, snap, p.get("dev40_hhmm", "09:40"))
+            # 噪音: 早盘冲高回撤
+            try:
+                if fade == fade and fade > float(p.get("fade_max", 1.0)):
+                    if _tr:
+                        _tr("noise", fade=round(float(fade), 2))
+                    return []
+            except Exception:
+                pass
+            # 近20日涨停 (bars 末根 = T-1, 避免用今日未完行情) —— 口径统一走 _zt_count
+            try:
+                zt = _zt_count(bars, code, 20)
+                if zt > int(p.get("zt20_max", 0)):
+                    if _tr:
+                        _tr("signal", zt20=zt)
+                    return []
+            except Exception:
+                pass
+            # 流动性 (可选)
+            try:
+                amt = last * float(snap.get("volume") or 0)
+                if float(p.get("amt_lo", 0) or 0) > 0 and amt > 0 and amt < float(p["amt_lo"]):
+                    if _tr:
+                        _tr("signal", amt=amt)
+                    return []
+            except Exception:
+                pass
+            # 截面切点: 优先 ctx["dev40_cut"]; 否则只记录 dev (单票无法自证分位)
+            cut = ctx.get("dev40_cut")
+            if cut is not None:
+                try:
+                    if dev < float(cut):
+                        if _tr:
+                            _tr("signal", dev40=round(dev, 3), cut=float(cut))
+                        return []
+                except Exception:
+                    pass
+            if _tr:
+                _tr("signal", dev40=round(dev, 3), fade=round(float(fade or 0), 2))
+            return [Signal(
+                code=code,
+                time=str(snap.get("time") or "")[:10],
+                score=min(100, max(0, int(round(50 + dev * 10)))),
+                price=last,
+                label=f"领涨v7 dev40={dev:.2f}% fade={float(fade or 0):.1f}",
+                extra={"dev40": round(dev, 3), "fade": round(float(fade or 0), 2),
+                       "rule": "v7_dev40", "hhmm": hhmm},
+            )]
 
         # ④ 日线前置池 (M6: 昨天收盘就能算, 把全市场缩到几百只)
         if bool(p.get("pool_enabled", True)) and code not in self._ensure_pool(day, p):

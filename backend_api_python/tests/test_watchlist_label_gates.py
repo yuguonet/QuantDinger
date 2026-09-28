@@ -192,24 +192,49 @@ def _segment(src: str, start: str, end: str) -> str:
     return src[i:j]
 
 
-def test_level_lines_clip_out_of_range():
-    """「超出当前 Y 轴范围的关键位不画」是功能契约，判据必须保持**严格**。
+def test_level_lines_out_of_range_uses_edge_marks():
+    """关键位的「视野外」处理是功能契约：**三分类 + 贴边指示**，不得回退成硬裁剪。
 
-    分时 Y 轴被锁定为「昨收 ± 当日最大偏离」，筹码关键位常在范围外。**实测**（32 只自选、
-    162 档关键位）：39.5% 落在视野内，31/32 只票至少可见 1 档 —— 即"过滤"是常态而非边缘情况。
+    分时 Y 轴被锁定为「昨收 ± 当日最大偏离」，筹码关键位常在范围外（实测 32 只自选、
+    162 档关键位仅 39.5% 落在视野内）。09-24 之前的实现把范围外的档位直接丢掉 ⇒
+    支撑整段消失，且**无法区分「没算出来」与「在图外」**（用户看到的就是"线凭空消失"）。
+    现行契约 = `classifyMinuteLevels` 三分类：视野内画贯穿线，above/below 走**贴边指示**。
 
-    若把比较放宽成贴边显示，图右边缘会挤上几条分不清归属的线，与 label「简单明了」的取向相反。
-    要做"视野外贴边指示"应当是新增一个显式档位，而不是把这里的比较悄悄放宽。
+    ⚠️ 贴边标记必须留出「让位带」（yc 内移），取值依据是 09-28 **像素级**实测
+    （300300 分时，绘图区 845×741，方法见 tmp/_cdp_px_probe.js）：
+      - klinecharts 是多 canvas：信息行在**覆盖层** cv2_845x741（压在主图之上，
+        基线 y=10/30/50/70，从 x≈12 起排）⇒ 贴顶必被盖住；
+      - X 轴时间刻度在**独立** cv5_845x24（主图下方），主图底部 80px 内
+        getImageData 不透明像素=0 ⇒ **底部没有被任何库自绘元素压住**。
+    ⚠️ 早期注释写的「顶信息行与底时间刻度同 canvas 压住标记」是推断、且底部一半已被
+    像素取证否掉；本断言只锁「有让位带」这一行为，不锁具体的遮挡理由。
     """
     if not _KLINE_VUE.is_file():
         return
     src = _read(_KLINE_VUE)
-    seg = _segment(src, "const pickVisibleLevels = (", "\n\n    /**")
-    assert "const pickVisibleLevels" in seg
-    assert "if (y < 0 || y > height) continue" in seg, (
-        "关键位可见性判据被放宽了：必须严格剔除 y<0 / y>height，"
-        "不得改成留像素余量的贴边显示"
+
+    # ① 三分类：严格判据（visible 只在 [0, height]），且不得出现"范围外直接丢弃"
+    seg = _segment(src, "const classifyMinuteLevels = (", "\n\n    /**")
+    for need in ("const visible = []", "const above = []", "const below = []"):
+        assert need in seg, f"关键位分类缺 {need}：视野外档位不得被丢弃"
+    assert "if (y < 0) above.push" in seg and "else if (y > height) below.push" in seg, (
+        "可见性判据被放宽了：视野内仍须严格限定 y ∈ [0, height]，"
+        "不得改成留像素余量的贴边"
     )
+
+    # ② 视野外档位必须真的画出来（贴边指示），且标记内移避开库自绘的两行
+    draw = _segment(src, "const MINUTE_SR_LINES_DRAW = ({", "\n    /**")
+    for need in ("drawEdgeMarks(above, true)", "drawEdgeMarks(below, false)"):
+        assert need in draw, f"视野外档位必须走贴边指示（缺 {need}）"
+    for need in ("MINUTE_SR_EDGE_TOP_RESERVE", "MINUTE_SR_EDGE_BOTTOM_RESERVE"):
+        assert need in draw, (
+            f"贴边标记必须按让位带内移（缺 {need}）：顶部要给覆盖层信息行让位，"
+            "底部要离开最外一行，否则 10px 小字会被读作「数据丢失」（实测 300300）"
+        )
+    assert "bounding.height - reserve - 7" in draw, "底部贴边标记的 y 必须扣掉让位带"
+    # 让位带的取值依据必须写明可复测的取证方法，不许退回纯推断
+    doc = _segment(src, "/**\n     * 贴边指示的**让位带**", "const MINUTE_SR_EDGE_TOP_RESERVE")
+    assert "_cdp_px_probe.js" in doc, "让位带取值依据必须写明可复测的取证方法"
 
 
 def test_key_level_indicator_is_minute_only():

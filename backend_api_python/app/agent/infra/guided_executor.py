@@ -382,13 +382,30 @@ class GuidedCPythonExecutor(PythonExecutor):
 
         return _imp
 
+    def _collect_dict_hints(self) -> tuple:
+        """收集 state 里的 dict 变量键和 _r_* 工具返回键，供纠正提示用。"""
+        dict_hints = []
+        r_hints = []
+        for name, val in self.state.items():
+            if name.startswith("_") or callable(val):
+                continue
+            if name.startswith("_r_"):
+                if isinstance(val, dict):
+                    keys = list(val.keys())[:8]
+                    r_hints.append(f"  {name} (工具原始返回): dict 含键 {keys}")
+            elif isinstance(val, dict):
+                keys = list(val.keys())[:8]
+                dict_hints.append(f"  {name}: dict 含键 {keys}")
+        return dict_hints, r_hints
+
     def _rewrite(self, err_text: str, culprit_var: str = "") -> str:
         """把 CPython 原生错误改写成"能直接照做"的纠正话术。
 
-        保留三类（对应三种真实误用）：
+        保留四类（对应四种真实误用）：
           · 未定义名字（NameError）——多为写错工具名/变量名；
           · 属性误用（AttributeError）——多为把 list 当 dict（`.get`）用；
-          · 字典被切片（KeyError: slice）——模型把 dict 当 list/DataFrame 做 `x[-5:]`。
+          · 字典被切片（KeyError: slice）——模型把 dict 当 list/DataFrame 做 `x[-5:]`；
+          · 字典被整数索引（KeyError: <int>）——模型把 dict 当 list 做 `x[-1]`。
         其余错误原样抛出：真 exec 下行号已准确，再包一层话术只会稀释信息。
 
         Args:
@@ -396,31 +413,17 @@ class GuidedCPythonExecutor(PythonExecutor):
             culprit_var: 触发异常的变量名（由 `_run` 在 AST 层从切片表达式里提取，
                          例如 `daily_data[-5:]` 提取为 `daily_data`）。空字符串则不做定向提示。
         """
-        # ── 新止血：KeyError: slice（dict 被当 list/DataFrame 切片）────
+        # ── KeyError: slice（dict 被当 list/DataFrame 切片）────
         # 2026-09-28 线上真实报错：daily_data[-5:] → KeyError: slice(-5, None, None)
         # 根因：daily() 返回 dict{"count","data","bars"}，模型直接对 dict 切片。
         # 从 state 里找 dict 值，列出其顶层键供模型取用。
         m_slice = re.search(r"KeyError: slice\((-?\d+),\s*(-?\d+|None),\s*(-?\d+|None)\)", err_text)
         if m_slice:
             self._failure_events.append(("dict_sliced", err_text[:80]))
-            # 尝试从 state 列出 dict 变量的键
-            dict_hints = []
-            for name, val in self.state.items():
-                if name.startswith("_") or callable(val):
-                    continue
-                if isinstance(val, dict):
-                    keys = list(val.keys())[:8]
-                    dict_hints.append(f"  {name}: dict 含键 {keys}")
+            dict_hints, r_hints = self._collect_dict_hints()
             hint_block = ""
             if dict_hints:
                 hint_block = "\n当前命名空间里的 dict 变量及其顶层键：\n" + "\n".join(dict_hints)
-            # 也尝试从 _wrap_stage_guard 登记的 _r_* 工具结果找
-            r_hints = []
-            for name, val in self.state.items():
-                if not name.startswith("_r_"): continue
-                if isinstance(val, dict):
-                    keys = list(val.keys())[:8]
-                    r_hints.append(f"  {name} (工具原始返回): dict 含键 {keys}")
             if r_hints:
                 hint_block += "\n工具原始返回（dict 信封格式）：\n" + "\n".join(r_hints)
             var_hint = f"  （可能触发变量：`{culprit_var}`，它是 dict 不是 list/DataFrame）" if culprit_var else ""
@@ -431,6 +434,29 @@ class GuidedCPythonExecutor(PythonExecutor):
                 + f"  1) 如果 dict 里有 bars 键 → `{culprit_var + '[' if culprit_var else 'dict_'}['bars'][-5:]`\n"
                 + f"  2) 如果 dict 里有 data 键 → 先看 `{culprit_var + '[' if culprit_var else 'dict_'}['data']` 的结构\n"
                 + f"  3) 用 dict.values() 或转 DataFrame 后再切片\n"
+                + hint_block
+            )
+        # ── KeyError: <int>（dict 被当 list 用整数索引）────
+        # 2026-09-28 线上真实报错：kline['data'][-1] → KeyError: -1
+        # 根因：kline['data'] 是 dict{"CODE": bars}，模型当 list 做 [-1] 取末元素。
+        m_intkey = re.search(r"KeyError: (-?\d+)", err_text)
+        if m_intkey and not m_slice:  # 避免 slice 分支重复匹配
+            self._failure_events.append(("dict_int_indexed", err_text[:80]))
+            dict_hints, r_hints = self._collect_dict_hints()
+            hint_block = ""
+            if dict_hints:
+                hint_block = "\n当前命名空间里的 dict 变量及其顶层键：\n" + "\n".join(dict_hints)
+            if r_hints:
+                hint_block += "\n工具原始返回（dict 信封格式）：\n" + "\n".join(r_hints)
+            var_hint = f"  （可能触发变量：`{culprit_var}`，它是 dict 不是 list）" if culprit_var else ""
+            bad_idx = m_intkey.group(1)
+            return (
+                err_text + "\n"
+                + f"[纠正提示] 你正在用整数 `{bad_idx}` 索引 **dict**（dict 只能用键取值，不能用位置索引）。{var_hint}\n"
+                + f"正确做法：\n"
+                + f"  1) 如果要取 list 的末元素 → 先确保变量是 list：`bars = result['bars']; bars[-1]`\n"
+                + f"  2) 如果是 dict['data'] → 它是 {{CODE: bars}} 映射，用 `result['data']['600519'][-1]` 取\n"
+                + f"  3) 检查工具返回格式：dict 顶层键有 'bars'/'data'/'count'/'error' 等\n"
                 + hint_block
             )
         # ── 未定义名字（NameError）──────────────────────────────────────

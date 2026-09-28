@@ -17,11 +17,37 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def fetch_kline_db(code, days=300):
-    """从 DB 加载日K (前复权), 返回 list[dict] (time/open/high/low/close/volume)。"""
+def _window_bounds(days=300, as_of=None):
+    """取数窗口 (start, end) = [anchor - days*1.5 日历日, anchor + 1 日历日]。
+
+    anchor = as_of (给了就锚在它) 否则 now。
+    2026-09-28 审计 A1: 窗口原先**恒锚 now**, 于是 `hub.daily(code, days, as_of=历史日)`
+    的 as_of 过滤会把窗口内的根**全部**裁掉 ⇒ 静默空集 (命中 tools/pool_check、
+    strategies/lead_chase、g56.scan_signals 逐日枚举、tools/debug、tools/replay)。
+    as_of=None 时与旧版逐字节一致 ⇒ 生产链行为不变。
+
+    ⚠ 返回语义是"窗口内**全部**行", 不是"最后 days 根"。该约定被 `present/pipeline.py`
+    的「300 窗口按 window_start(200) 切片 == fetch_kline_db(code, 200)」依赖,
+    故**不可**改成尾部精确截断 (改了会让切片等价性破功)。
+    """
     from datetime import datetime as _dt
-    end = (_dt.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    start = (_dt.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    anchor = _dt.now()
+    if as_of:
+        try:
+            anchor = _dt.strptime(str(as_of)[:10], "%Y-%m-%d")
+        except ValueError:
+            anchor = _dt.now()          # as_of 形态异常时退回旧行为 (保持宽松, 不抛)
+    return ((anchor - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d"),
+            (anchor + timedelta(days=1)).strftime("%Y-%m-%d"))
+
+
+def fetch_kline_db(code, days=300, as_of=None):
+    """从 DB 加载日K (前复权), 返回 list[dict] (time/open/high/low/close/volume)。
+
+    as_of: **取数窗口锚点** (只影响窗口, 不额外过滤)。调用方给了 as_of 必须下传,
+    否则历史 as_of 会因窗口锁在"今天"而返回空 (审计 A1)。
+    """
+    start, end = _window_bounds(days, as_of)
     try:
         from app.utils.db_market import get_market_kline_writer
         from app.data_sources.provider.adjustment import unadj_to_qfq
@@ -50,7 +76,8 @@ def fetch_klines_batch(codes, days=300, as_of=None, shards=6):
     并按 `shards` 把代码**分片并发**查询 (psycopg2 在 C 层释放 GIL, 分片真并行)。
 
     未加载到 (或加载失败) 的 code 不出现在返回 dict 中 → 调用方按空处理 (与
-    fetch_kline_db 返回 [] 等价)。as_of 非空时只保留 ≤as_of 的 bar (hub.daily 语义)。
+    fetch_kline_db 返回 [] 等价)。as_of 非空时**窗口锚在 as_of** 并只保留 ≤as_of 的 bar
+    (与 `fetch_kline_db(code, days, as_of)` 逐行一致, 见 _window_bounds)。
 
     shards: 并发分片数 (<=1 = 单条 SQL)。分片只改变"哪条 SQL 取哪些代码", 合并后
     结果与单条完全一致 (各片代码互斥, 片内顺序保持)。
@@ -58,9 +85,7 @@ def fetch_klines_batch(codes, days=300, as_of=None, shards=6):
     codes = [c for c in codes if c]
     if not codes:
         return {}
-    from datetime import datetime as _dt
-    end = (_dt.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    start = (_dt.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    start, end = _window_bounds(days, as_of)
     try:
         from app.data_sources.provider.adjustment import unadj_to_qfq
         from app.market_cn.auto.core.data.hub import _query_batch_raw
@@ -103,16 +128,18 @@ def fetch_klines_batch(codes, days=300, as_of=None, shards=6):
     return out
 
 
-def window_start(days=300):
+def window_start(days=300, as_of=None):
     """加载窗口的日历下界 (fetch_kline_db / fetch_klines_batch 的 start)。
 
-    `fetch_kline_db(code, days)` 的定义就是 "time ∈ [now - days*1.5, now+1d]" ——
-    因此 **days=200 的行集 == days=300 行集中 time ≥ window_start(200) 的部分**。
-    需要更短窗口派生量 (如 g56 横截面池的 200 根) 时, 可据此从共享长窗口缓存**切片**
-    得到, 免去再加载一遍全市场 (切片与逐票同口径, 非近似)。
+    `fetch_kline_db(code, days)` 的定义就是 "time ∈ [anchor - days*1.5, anchor + 1d]"
+    (anchor=as_of 或 now), 因此 **days=200 的行集 == days=300 行集中 time ≥
+    window_start(200, 同一 anchor) 的部分**。需要更短窗口派生量 (如 g56 横截面池的
+    200 根) 时, 可据此从共享长窗口缓存**切片**得到, 免去再加载一遍全市场
+    (切片与逐票同口径, 非近似)。
+
+    传 as_of 时必须与取数方用同一个 as_of, 否则切片基准错位 (审计 A1 同源)。
     """
-    from datetime import datetime as _dt
-    return (_dt.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    return _window_bounds(days, as_of)[0]
 
 
 def fetch_stock_info_db():

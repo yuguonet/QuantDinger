@@ -121,7 +121,14 @@ def _break_signal_at(bars, code, streak_start, streak_end, min_streak, max_break
     limit_close = float(limit_bar["close"])
     limit_vol = float(limit_bar["volume"])
     break_days = 0
-    for j in range(break_idx, min(break_idx + max_break_gap + 1, len(bars))):
+    # 上界 = max_break_gap (2026-09-28 审计 A6: 原为 max_break_gap+1, 使断板期可到 6 天,
+    # 与三处同义编码不一致 —— ① break.yaml:30 注释"断板期最长天数" ② 回测预过滤
+    # `range(i-max_break_gap, i)` ③ 门表适配器 `break_days > max_break_gap → None`
+    # ④ 本文件模块 docstring"断板期(≤max_break_gap天)"。四者均 ≤5, 故生产链的 +1 是 off-by-one。
+    # 实测: 1500 只 × 320 日(绕过预过滤) break_days 分布 {1:40,2:9,3:3,4:1} ⇒ 本改为零影响。
+    # 注: 真实断板期 > 上界时循环被截断, 该候选由调用方 scan_signals 的"确认日必须
+    # 恰好落在 i"对齐检查(bars 索引等式)拒绝, 故截断不会产生错标信号。
+    for j in range(break_idx, min(break_idx + max_break_gap, len(bars))):
         if is_limit_up(bars[j]["close"], bars[j - 1]["close"], bt):
             break  # 遇到新涨停, 断板期结束
         break_days += 1
@@ -211,11 +218,16 @@ def _ma_bull_at(bars, idx):
     return ma5 > ma10 > ma20
 
 
-def _entry_gate(bars, i, streak_len):
+def _entry_gate(bars, i, streak_len, code):
     """入场通道标签 (2026-09-22 归一四通道研究, 见 tmp/break_plan_A.json)。
 
     全部用确认日 D0=i 收盘可知数据, 无前视。只标注不过滤 — 展示层用于
     区分历史胜率 (核心 89% / 高板 83% / 温和 80% / 强势 53%)。
+
+    ⚠ `code` 必传 (2026-09-28 审计 A3): 原先从 `bars[i].get("code")` 取板块, 而 bar
+    只有 time/open/high/low/close/volume ⇒ 恒取到 "" ⇒ `get_board_type("")` 回落
+    `board_default="main"` ⇒ 创业板/科创板按 9.8% 找"前一涨停日"(其真实阈值 19.8%)
+    ⇒ `bd`/`entry_gate` 错标; 而 entry_bd 经 sweet_pctb 参与回测出场阈值选择。
 
     Returns: (gate:str, pctb:float|None, bd:int)
       gate ∈ {"核心", "高板", "温和", "强势", "观察"}
@@ -232,13 +244,15 @@ def _entry_gate(bars, i, streak_len):
     u, l = m + 2 * sd, m - 2 * sd
     pctb = (closes[i] - l) / (u - l) * 100 if u > l else 50.0
     # 调整天数: D0 前最后一个涨停日 → D0
-    bt = get_board_type(bars[i].get("code", "") if isinstance(bars[i], dict) and bars[i].get("code") else "")
+    # ⚠ 板块必须来自 `code` (审计 A3): 原先读 bars[i]["code"] 恒取不到 ⇒ 恒 main。
+    # 涨停口径改用共享 `is_limit_up` (本文件其余位置同口径), 不再内联 0.098/0.198 × 0.98
+    # (内联=第二份口径; 且 0.98 容差使主板阈值变 9.6%, 与 is_limit_up/门表不一致)。
+    bt = get_board_type(code)
     j, steps, streak_end = i - 1, 0, None
     while j >= 1 and steps <= 5:
         prev = float(bars[j - 1]["close"]) if j >= 1 else 0
         cur = float(bars[j]["close"])
-        lim = 0.098 if (bt or "main") == "main" else 0.198
-        if prev > 0 and cur / prev - 1 >= lim * 0.98:
+        if is_limit_up(cur, prev, bt):
             streak_end = j
             break
         j -= 1; steps += 1
@@ -255,6 +269,18 @@ def _entry_gate(bars, i, streak_len):
     if bd == 1 and pctb >= 95:
         return "强势", round(pctb, 1), bd
     return "观察", round(pctb, 1), bd
+
+
+def break_entry_gate(bars, i, streak_len, code):
+    """入场通道标注的 IDE 侧入口 (薄封装 `_entry_gate`)。
+
+    2026-09-28: 供 `core/runtime/evaluate._run_backtest_day_break` 惰性引用 —— core 不得
+    顶层 import strategies, 故经本模块薄封装暴露。口径与参考版**同一份实现**, 保证 IDE
+    门表回测的 entry_gate/entry_pctb/entry_bd 与 .py 生产链逐笔一致。
+
+    Returns: (gate:str, pctb:float|None, bd:int|None)
+    """
+    return _entry_gate(bars, i, streak_len, code)
 
 
 def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
@@ -371,7 +397,7 @@ class BreakStrategy(StrategyBase):
                     continue
             total = float((params.get("stock_info") or {}).get("total_shares") or 0)
             extra = dict(sig)
-            _gate, _gpctb, _gbd = _entry_gate(bars, i, sig.get("streak_len") or 0)
+            _gate, _gpctb, _gbd = _entry_gate(bars, i, sig.get("streak_len") or 0, code)
             extra.update({
                 "entry_gate": _gate,
                 "entry_pctb": _gpctb,
@@ -665,8 +691,17 @@ _PCTB_CACHE = {}
 
 
 def _exit_series(bars):
-    """RSI6/%B 序列 (按 bars id 缓存; 同 bars 多笔交易零重复计算)"""
-    key = id(bars)
+    """RSI6/%B 序列 (按**内容指纹**缓存; 同 bars 多笔交易零重复计算)。
+
+    ⚠ 2026-09-28 审计 P2: 原按 `id(bars)` 作缓存键 —— list 被回收后地址可能被另一只票的
+    bars 复用 ⇒ 命中他票序列 (heisenbug; 批量路径 bars 常驻故通常不发作)。
+    改内容指纹 (长度 + 首/中/尾日期 + 尾收盘): O(1) 且与对象身份无关。
+    """
+    if not bars:
+        return [], []
+    key = (len(bars), str(bars[0].get("time")), str(bars[-1].get("time")),
+           float(bars[-1].get("close") or 0),
+           float(bars[len(bars) // 2].get("close") or 0))
     if key not in _RSI6_CACHE:
         if len(_RSI6_CACHE) > 64:
             _RSI6_CACHE.clear()
@@ -894,8 +929,10 @@ def _bk_raw(bars, bt: str, streak_start: int, streak_end: int,
     limit_close = Ctx._f(limit_bar, "close")
     limit_vol = Ctx._f(limit_bar, "volume")
     break_days = 0
-    # 切片上界 = min(break_idx+max_break_gap+1, asof+1)，与 bars[:i+1] 完全一致
-    for j in range(break_idx, min(break_idx + max_break_gap + 1, asof + 1)):
+    # 切片上界 = min(break_idx+max_break_gap, asof+1)，与参考版 bars[:i+1] 逐位一致
+    # (2026-09-28 审计 A6: 与参考版同步去掉 +1; 本函数仅由门表适配器调用, 而适配器已先
+    #  用 `break_days > max_break_gap → None` 闸过, 故此改动对门表链无行为影响)
+    for j in range(break_idx, min(break_idx + max_break_gap, asof + 1)):
         if is_limit_up(Ctx._f(bars[j], "close"), Ctx._f(bars[j - 1], "close"), bt, market):
             break
         break_days += 1
@@ -1089,8 +1126,23 @@ register_strategy_funcs(
 
 # ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
 def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag):
-    """断板 combo 出场 (止损/追踪/峰值逃顶/到期, 分板块) — 供 YAML exit.mode=break_combo。"""
+    """断板 combo 出场 (止损/追踪/峰值逃顶/甜点区/到期, 分板块) — 供 YAML exit.mode=break_combo。
+
+    ⚠ 2026-09-28 (A3 配套): 原实现漏传 `exit_mode`/`sweet_pctb`/`sweet_pctb_core`/`entry_gate`
+    ⇒ 恒走 `_run_backtest_breakbuy` 默认 (sweet_pctb=95), 而参考版对 **核心/高板** 通道取
+    `sweet_pctb_core=100` ⇒ 两链甜点区出场阈值分叉 (实测 000659: 门表 day6/4.44 vs 参考
+    day7/4.42), "逐笔等价"破功。口径单源 = 本文件 BOARD_PARAMS (yaml params 同键优先覆写)。
+    """
     from app.market_cn.auto.core.exit_modes import _bp
+    _bpar = BOARD_PARAMS.get(board_type, BOARD_PARAMS["main"])
+
+    def _pick(name, default):
+        """yaml params 覆写优先 (镜像参考版 whitelist update) → BOARD_PARAMS → default。"""
+        v = _bp(params, board_type, name)
+        if v is None:
+            v = _bpar.get(name)
+        return default if v is None else v
+
     return _run_backtest_breakbuy(
         bars, entry_idx, entry_price,
         _bp(params, board_type, "hold_days"),
@@ -1098,6 +1150,10 @@ def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params,
         _bp(params, board_type, "trailing_stop"),
         board_type,
         _bp(params, board_type, "fill_mode"),
+        exit_mode=str(_pick("exit_mode", "sweet")),
+        entry_gate=(diag or {}).get("entry_gate"),
+        sweet_pctb=float(_pick("sweet_pctb", 95.0)),
+        sweet_pctb_core=float(_pick("sweet_pctb_core", 100.0)),
     )
 
 

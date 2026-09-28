@@ -13,6 +13,7 @@ Flask 和 Cron 共用同一个队列 + worker 线程池，
 """
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -20,6 +21,41 @@ from concurrent.futures import Future
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ── F4 续跑凭据识别（2026-09-28 修 E7 读侧）────────────────
+# 已文档化事故：resume.py 落队的凭据 JSON 此前被 worker 当普通用户文本
+# 跑全新任务（finalize_failed 时 nodes.py 主动 enqueue），产出垃圾回复。
+# 修法：worker 取到消息先识别 type=agent_resume，改写成「续跑上下文
+# prompt」重新 plan——兑现 resume.py 文件头「worker 从下一 phase
+# 重新 plan-续跑」的设计语义。不做 state 级重建（_code_agent 不可序列化）。
+def _rewrite_resume_message(message: str) -> str:
+    """agent_resume 凭据 JSON → 续跑上下文 prompt；普通消息原样返回（零开销）。"""
+    s = (message or "").strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return message
+    try:
+        cred = json.loads(s)
+    except Exception:
+        return message
+    if not isinstance(cred, dict) or cred.get("type") != "agent_resume":
+        return message
+    task = str(cred.get("task") or cred.get("effective_input")
+               or cred.get("user_input") or "")
+    done_text = str(cred.get("completed_phases_text") or "").strip()
+    reason = str(cred.get("reason") or "budget_or_timeout")
+    done_n = len(cred.get("phase_results") or [])
+    parts = [
+        f"[续跑] 上一轮任务因 {reason} 中断，已完成 {done_n} 个阶段，请继续完成剩余工作。",
+        f"原任务：{task}",
+    ]
+    if done_text:
+        parts.append("已完成阶段摘要（结论可直接引用，勿重复执行）：\n" + done_text)
+    parts.append("请基于以上进度重新规划缺口部分并执行，最终给出完整结论。")
+    logger.info("[MQ] 识别 agent_resume 凭据（session=%s, 已完成 %d 阶段），改写为续跑 prompt",
+                cred.get("session_id"), done_n)
+    return "\n\n".join(parts)
+
 
 # ── 全局队列 + worker 线程池 ────────────────────────────────
 
@@ -119,6 +155,9 @@ def _worker_loop():
         if future.cancelled():
             continue
         clear_stop(str(task["session_id"]))  # 新任务开始，清掉该会话残留停止位
+        # F4 续跑凭据识别（修 E7）：agent_resume JSON → 续跑上下文 prompt，
+        # 普通消息原样透传（详见 _rewrite_resume_message 注释块）。
+        task["message"] = _rewrite_resume_message(str(task.get("message") or ""))
 
         try:
             loop = asyncio.new_event_loop()

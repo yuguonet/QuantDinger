@@ -438,26 +438,53 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         except Exception as e:
             logger.debug("get_stock_info(%s) 腾讯估值补全跳过: %s", stock_code, e)
 
-        # ── 5) ROE 补全（2026-09-21）──
-        if not result.get("roe"):
+        # ── 5) ROE / EPS / BVPS 补全 + PE/PB 本地计算 ──────────────
+        # 2026-09-21: _sina_finance 0.75s 即含 ROE/EPS/bvps
+        # 2026-09-28: EPS/BVPS 不再丢弃——用 price/eps 算 PE、price/bvps 算 PB
+        if not result.get("roe") or not result.get("eps") or not result.get("bvps"):
             try:
-                # 2026-09-21 实测：get_cn_stock_info 全量 27s 太重；_sina_finance
-                # （新浪财务指标页）0.75s 即含 ROE/EPS/bvps，用它。
-                def _roe_fetch():
+                def _fin_fetch():
                     from app.utils.cn_stock_info import _sina_finance
-                    fin = _sina_finance(sym) or {}
-                    return fin.get("roe")
+                    return _sina_finance(sym) or {}
                 _rpool = ThreadPoolExecutor(max_workers=1)
                 try:
-                    _roe = _rpool.submit(_roe_fetch).result(timeout=4)
+                    _fin = _rpool.submit(_fin_fetch).result(timeout=4)
                 finally:
                     _rpool.shutdown(wait=False)
-                if _roe is not None:
-                    result["roe"] = _roe
+                if _fin:
+                    result.setdefault("roe", _fin.get("roe"))
+                    result.setdefault("eps", _fin.get("eps"))
+                    result.setdefault("bvps", _fin.get("bvps"))
             except FuturesTimeout:
-                logger.debug("get_stock_info(%s) ROE 补全 4s 超时", stock_code)
+                logger.debug("get_stock_info(%s) 财务指标补全 4s 超时", stock_code)
             except Exception as e:
-                logger.debug("get_stock_info(%s) ROE 补全跳过: %s", stock_code, e)
+                logger.debug("get_stock_info(%s) 财务指标补全跳过: %s", stock_code, e)
+
+        # ── 5b) PE/PB 本地计算（腾讯没给时用 price÷eps/bvps 算）──
+        _px = result.get("price")
+        if _px and not result.get("pe_ttm") and result.get("eps"):
+            if result["eps"] > 0:
+                result["pe_ttm"] = round(_px / result["eps"], 2)
+        if _px and not result.get("pb") and result.get("bvps"):
+            if result["bvps"] > 0:
+                result["pb"] = round(_px / result["bvps"], 2)
+
+        # ── 5c) 换手率/总市值 fallback（腾讯没给时用 mootdx 本地算）──
+        if not result.get("turnover_pct"):
+            try:
+                from app.market_cn.tape import get_realtime_turnover
+                _tr = get_realtime_turnover(sym)
+                if isinstance(_tr, dict) and _tr.get("turnover_rate") is not None:
+                    result["turnover_pct"] = _tr["turnover_rate"]
+            except Exception as e:
+                logger.debug("get_stock_info(%s) 换手率 fallback 跳过: %s", stock_code, e)
+
+        if not result.get("mcap_yi") and _px and result.get("total_shares"):
+            # 总市值(亿) = 价格 × 总股本(股) / 1e8
+            result["mcap_yi"] = round(_px * result["total_shares"] / 1e8, 2)
+        if not result.get("float_mcap_yi") and _px and result.get("circ_shares"):
+            # 流通市值(亿) = 价格 × 流通股本(股) / 1e8
+            result["float_mcap_yi"] = round(_px * result["circ_shares"] / 1e8, 2)
 
         return result
 

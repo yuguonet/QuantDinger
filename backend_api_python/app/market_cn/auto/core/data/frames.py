@@ -366,7 +366,14 @@ def _load_cache(date):
 
 
 def trading_dates(days_back, end=None):
-    """有日线记录的交易日列表 (升序, 窗口=最近 days_back 个自然日), 供引擎遍历。"""
+    """有日线记录的交易日列表 (升序, 窗口=最近 days_back 个自然日), 供引擎遍历。
+
+    ⚠ 年份必须遍历 [start.year, end.year] **整段** (2026-09-28 审计 A2): 原写法
+    `for year in {start[:4], end[:4]}` 只查首尾两年, days_back ≳638 (跨 2 个年以上) 时
+    **中间年份整年丢失** (实测 days_back=700 → 2025 整年 0 日, 实得 225 应约 490);
+    命中 core/backtest、present/intraday、tools/present_bench、tools/replay。
+    同仓正确写法见 hub._query_batch_raw 的 `range(start.year, end.year + 1)`。
+    """
     from datetime import datetime, timedelta
     from app.utils.db_market import get_market_db_manager
     end = str(end or datetime.now().strftime("%Y-%m-%d"))[:10]
@@ -374,7 +381,7 @@ def trading_dates(days_back, end=None):
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
     out = []
-    for year in {start[:4], end[:4]}:
+    for year in range(int(start[:4]), int(end[:4]) + 1):
         try:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
@@ -389,24 +396,31 @@ def trading_dates(days_back, end=None):
 
 
 def first_1m_date():
-    """1m 数据覆盖的最早日期 (无数据返回 None); 引擎用它裁掉空帧日。"""
-    from datetime import datetime
+    """1m 数据覆盖的最早日期 (无数据返回 None); 引擎用它裁掉空帧日。
+
+    ⚠ 不能只查 (今年, 去年) (2026-09-28 审计 A2 同源): 分钟表按年分表
+    (kline_1m_YYYY), 更早年份有数据时会漏判 ⇒ 改为枚举全部 kline_1m_* 表取 MIN。
+    """
     from app.utils.db_market import get_market_db_manager
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
-    year = datetime.now().year
     best = None
-    for y in (year, year - 1):
-        try:
-            with pool.connection() as conn:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name ~ '^kline_1m_[0-9]{4}$'")
+            tables = sorted(r[0] for r in cur.fetchall())
+        for t in tables:
+            try:
                 with conn.cursor() as cur:
-                    cur.execute(f'SELECT MIN(time) FROM "kline_1m_{y}"')
+                    cur.execute(f'SELECT MIN(time) FROM "{t}"')
                     row = cur.fetchone()
-                    if row and row[0]:
-                        d = str(row[0])[:10]
-                        best = d if best is None or d < best else best
-        except Exception:
-            continue
+                if row and row[0]:
+                    d = str(row[0])[:10]
+                    best = d if best is None or d < best else best
+            except Exception:
+                continue
     return best
 
 

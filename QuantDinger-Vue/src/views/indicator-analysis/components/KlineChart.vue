@@ -3392,6 +3392,27 @@ json.dumps(output)
     const MINUTE_SR_EDGE_MAX = 3
     /** 贴边指示：距绘图区上下边缘的内边距（px） */
     const MINUTE_SR_EDGE_PAD = 6
+    /**
+     * 贴边指示的**让位带**（px）。取值依据 = 2026-09-28 像素级实测（300300 分时，窗 1600×1000，
+     * 绘图区 845×741，方法见 tmp/_cdp_px_probe.js）：
+     *
+     *   - klinecharts 的图层是**多张 canvas**：信息行画在**覆盖层** cv2_845x741（堆叠在主图之上），
+     *     X 轴时间刻度画在**独立** cv5_845x24（位于主图下方 24px），价格轴在 cv0_64x741。
+     *   - 顶部：覆盖层信息行实测基线 y=10/30/50/70（时间/价格/成交量 + 昨收/均价），全部从 x≈12
+     *     起排 ⇒ 贴到顶边画的标记会被覆盖层盖住 ⇒ 顶部必须整体下移。
+     *   - 底部：主图 canvas 底部 80px 内**没有任何库自绘文本**（getImageData 不透明像素=0），
+     *     X 轴也不在这一层 ⇒ 底部不会被压。留让位带纯粹是为了让标记离开最外一行、肉眼能扫到。
+     *
+     * 用户 09-28 报「压力位和支撑位不显示了」时数据一档没少（300300 = 3 档支撑），
+     * 只是三档全在锁定轴之外（−14%~−21%），只剩贴边标记且贴在最外一行 ⇒ 读作"丢失"。
+     *
+     * ⚠️ 早期版本把这里写成「顶部信息行与底部时间刻度同 canvas 压住标记」——那是**推断**，
+     * 已被像素取证否掉一半（底部不成立）。改这条注释前请先跑 _cdp_px_probe.js 复测。
+     */
+    const MINUTE_SR_EDGE_TOP_RESERVE = 26
+    const MINUTE_SR_EDGE_BOTTOM_RESERVE = 24
+    /** 让位带在矮窗内的上限比例（副图/极小窗口下按比例收缩，避免两侧撞在一起） */
+    const MINUTE_SR_EDGE_RESERVE_MAX_RATIO = 0.18
     /** 贴边指示：横向最多占用绘图区宽度的比例（给右端价格标签留位，防重叠） */
     const MINUTE_SR_EDGE_WIDTH_RATIO = 0.6
 
@@ -3484,9 +3505,12 @@ json.dumps(output)
         // ---- 视野外：贴边指示（左端横向排布，避开右端价格标签）----
         const drawEdgeMarks = (items, atTop) => {
           if (!items.length) return
-          const yc = atTop
-            ? MINUTE_SR_EDGE_PAD + 7
-            : bounding.height - MINUTE_SR_EDGE_PAD - 7
+          // 让位带见 MINUTE_SR_EDGE_TOP_RESERVE 注释：顶部要给覆盖层信息行让位，
+          // 底部则是为了离开最外一行（那一层本身是空的，不存在"被压住"）
+          const cap = bounding.height * MINUTE_SR_EDGE_RESERVE_MAX_RATIO
+          const reserve = Math.min(atTop ? MINUTE_SR_EDGE_TOP_RESERVE : MINUTE_SR_EDGE_BOTTOM_RESERVE, cap)
+          // 让位带已含原有的边缘内边距 ⇒ 这里不再叠加 MINUTE_SR_EDGE_PAD（它只用于横向起点）
+          const yc = atTop ? reserve + 7 : bounding.height - reserve - 7
           let x = MINUTE_SR_EDGE_PAD + 5
           for (const lv of items.slice(0, MINUTE_SR_EDGE_MAX)) {
             const color = (MINUTE_SR_STYLE[lv.side] || MINUTE_SR_STYLE.support).color

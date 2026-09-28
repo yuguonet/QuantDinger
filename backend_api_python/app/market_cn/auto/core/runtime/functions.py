@@ -174,6 +174,7 @@ class Ctx:
     # 以便 expr.static_asof_check 静态校验（只查 args[0]），不会误伤窗口/字段参数。
     def ma(self, k: int = 0, field: str = "close", n: int = 5) -> float:
         """第 i+k 日往前 n 日 (含) 的 field 简单均值。k 为第一个位置参数。"""
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         end = self.i + k
         if end < 0:
             return 0.0
@@ -184,6 +185,7 @@ class Ctx:
 
     def rsi(self, k: int = 0, n: int = 14) -> float:
         """第 i+k 日 Wilder RSI(%)。k 为第一个位置参数。"""
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         end = self.i + k
         if end < n:
             return 0.0
@@ -241,16 +243,19 @@ class Ctx:
         return cache[key]
 
     def macd_dif(self, k: int = 0, fast: int = 12, slow: int = 26, signal: int = 9) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         dif, _, _ = self._macd(fast, slow, signal)
         j = self.i + k
         return dif[j] if 0 <= j < self.n else 0.0
 
     def macd_dea(self, k: int = 0, fast: int = 12, slow: int = 26, signal: int = 9) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, dea, _ = self._macd(fast, slow, signal)
         j = self.i + k
         return dea[j] if 0 <= j < self.n else 0.0
 
     def macd_hist(self, k: int = 0, fast: int = 12, slow: int = 26, signal: int = 9) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, _, hist = self._macd(fast, slow, signal)
         j = self.i + k
         return hist[j] if 0 <= j < self.n else 0.0
@@ -278,16 +283,19 @@ class Ctx:
         return cache[key]
 
     def kdj_k(self, k: int = 0, n: int = 9, ks: int = 3, ds: int = 3) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         K, _, _ = self._kdj(n, ks, ds)
         j = self.i + k
         return K[j] if 0 <= j < self.n else 0.0
 
     def kdj_d(self, k: int = 0, n: int = 9, ks: int = 3, ds: int = 3) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, D, _ = self._kdj(n, ks, ds)
         j = self.i + k
         return D[j] if 0 <= j < self.n else 0.0
 
     def kdj_j(self, k: int = 0, n: int = 9, ks: int = 3, ds: int = 3) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, _, J = self._kdj(n, ks, ds)
         j = self.i + k
         return J[j] if 0 <= j < self.n else 0.0
@@ -316,16 +324,19 @@ class Ctx:
         return cache[key]
 
     def boll_mid(self, k: int = 0, n: int = 20, mult: float = 2.0) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         mid, _, _ = self._boll(n, mult)
         j = self.i + k
         return mid[j] if 0 <= j < self.n else 0.0
 
     def boll_upper(self, k: int = 0, n: int = 20, mult: float = 2.0) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, up, _ = self._boll(n, mult)
         j = self.i + k
         return up[j] if 0 <= j < self.n else 0.0
 
     def boll_lower(self, k: int = 0, n: int = 20, mult: float = 2.0) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         _, _, low = self._boll(n, mult)
         j = self.i + k
         return low[j] if 0 <= j < self.n else 0.0
@@ -356,6 +367,7 @@ class Ctx:
         return cache[key]
 
     def atr(self, k: int = 0, n: int = 14) -> float:
+        self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         a = self._atr(n)
         j = self.i + k
         return a[j] if (n - 1) <= j < self.n else 0.0

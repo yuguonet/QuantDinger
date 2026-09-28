@@ -209,12 +209,16 @@ def eval_t_legs(
             sold_today += qty * pct / 100.0 if qty else 0
 
         elif action in ("buy_back", "buyback", "buy"):
-            # A股: 买回须同日已有卖出 (先卖后买, 净头寸不变)
-            if c["require_sell_first"] and sold_today <= 0 and not any(
-                    x in already for x in ()):
-                # already 里若无今日 sell 记录, 依赖顺序: 声明序保证 sell 在前
-                # 若调用方未按序传 already, 仍放行但标 meta.warn — 由执行层拒绝
-                pass
+            # A股: 买回须同日已有卖出 (先卖后买, 净头寸不变)。
+            # ⚠ 2026-09-28 审计 P2: 原处有一个死守卫 ——
+            #   `if c["require_sell_first"] and sold_today <= 0 and not any(x in already for x in ()):`
+            # ① `any(... for x in ())` 恒 False ⇒ 条件恒真; ② 分支体只有 `pass`,
+            #    注释许诺的 `meta.warn` 从未实现; ③ 更要紧的是 `already` 装的是
+            #    **已执行 leg 的 label**(见 docstring line 159), 根本不携带"今日有无 sell 记录"
+            #    的信息 ⇒ 该检查按注释的写法不可能实现。
+            # 实际约束由下面的 net_zero 分支保证: `require_sell_first` 与 `net_zero`
+            # 同源 (`not intraday_t0`, 见 t_constraints), 故 A股 下无同日 sell ⇒ sold_today=0
+            # ⇒ cap<=0 ⇒ 整腿跳过 (与 docstring "违反则整腿跳过" 一致)。
             if c["net_zero"]:
                 # 净头寸: 买回量 ≤ 今日已卖量 (否则隔夜加仓)
                 cap = max(0.0, sold_today - bought_today)

@@ -137,11 +137,16 @@ def daily(code, days=300, as_of=None):
     """历史日线 (qfq, list[dict] time/open/high/low/close/volume)。
     as_of: 只返回该交易日(含)以前 —— 数据层兜底防未来函数。
 
+    ⚠ `days` 是**日历窗口** (窗口 = anchor - days*1.5 日历日), 返回窗口内**全部**行,
+    不是"最后 days 根" (该约定被 present/pipeline 的切片等价性依赖, 见 kline._window_bounds)。
+    ⚠ as_of 必须**下传给取数层**当窗口锚 (2026-09-28 审计 A1): 只在取数后做 `<= as_of`
+    过滤, 而窗口锁在 now, 会静默返回空集。
+
     Returns:
         list[dict]: [{time, open, high, low, close, volume}]（qfq，time 升序）；无数据 []。
     """
     from app.market_cn.auto.core.data.kline import fetch_kline_db
-    bars = fetch_kline_db(code, days)
+    bars = fetch_kline_db(code, days, as_of=as_of)
     if as_of:
         bars = [b for b in bars if str(b["time"])[:10] <= str(as_of)[:10]]
     return bars
@@ -591,6 +596,28 @@ def index_daily(code="000001", days=800, as_of=None, force=False):
     return bars
 
 
+def _tail_trading_days(bars, days):
+    """按**交易日**取尾部 N 日 (不是"最后 N 根 bar")。
+
+    2026-09-28 审计 A1b: index_minute/index_fflow 原先 `bars[-days:]` 把 days 当
+    **bar 行数**, 而这两张表是分钟粒度 (约 240 行/交易日) ⇒ `days=10` 只拿到 10 **分钟**。
+    调用方的语义是交易日: `tools/pool_check` 传 10、`features/env_flow` 传 lookback+6=26
+    ⇒ 二者实际拿到的窗口被压缩了 ~240 倍, env_flow 因此恒 None。
+    bars 需按 time 升序 (两函数 SQL 均 ORDER BY time ASC)。
+    """
+    if not days or days <= 0:
+        return bars
+    dates = []
+    for b in bars:
+        d = str(b["time"])[:10]
+        if not dates or dates[-1] != d:
+            dates.append(d)
+    if len(dates) <= days:
+        return bars
+    cut = dates[-days]
+    return [b for b in bars if str(b["time"])[:10] >= cut]
+
+
 def index_minute(code="000300", days=800, as_of=None):
     """指数 5m K线 (list[dict] time/open/high/low/close/volume/up_count/down_count,
     time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_5m
@@ -605,6 +632,7 @@ def index_minute(code="000300", days=800, as_of=None):
     as_of: 只返回该交易日(含)以前 —— 与 daily()/index_daily() 同语义;
     **必须先过滤后尾切** (先 [-days:] 再过滤会把历史 as_of 的全部未来根裁掉,
     2026-09-11 hub.index_daily 同型 bug 的教训)。
+    ⚠ `days` = **交易日数** (2026-09-28 审计 A1b 修正: 原为 bar 行数, 240 倍偏差)。
     """
     sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
     from app.utils.db_market import get_market_db_manager
@@ -628,7 +656,7 @@ def index_minute(code="000300", days=800, as_of=None):
     bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"), "open": r[1], "high": r[2],
              "low": r[3], "close": r[4], "volume": r[5],
              "up_count": r[6], "down_count": r[7]} for r in rows]
-    return bars[-days:] if days and len(bars) > days else bars
+    return _tail_trading_days(bars, days)
 
 
 def index_fflow(code="000300", days=800, as_of=None):
@@ -646,6 +674,7 @@ def index_fflow(code="000300", days=800, as_of=None):
     time 为 bar 起始时刻 (09:31 起) —— 与 index_minute 的 bar 结束时刻 (09:35 起)
     对齐差 1 根, 跨表对齐特征时注意。
     as_of: 只返回该交易日(含)以前 —— **必须先过滤后尾切** (同 index_minute 教训)。
+    ⚠ `days` = **交易日数** (2026-09-28 审计 A1b 修正: 原为 bar 行数, 240 倍偏差)。
     """
     sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
     from app.utils.db_market import get_market_db_manager
@@ -669,7 +698,7 @@ def index_fflow(code="000300", days=800, as_of=None):
     bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"),
              "main_net": r[1], "small_net": r[2], "mid_net": r[3],
              "big_net": r[4], "super_net": r[5]} for r in rows]
-    return bars[-days:] if days and len(bars) > days else bars
+    return _tail_trading_days(bars, days)
 
 
 # ================================================================

@@ -311,8 +311,22 @@ def run_limit_seal(bars, entry_idx, entry_price, *, board_type="main",
     if entry_idx >= len(bars) or entry_price <= 0:
         return None
     sp = _spec_or_default(spec)
-    # 名义涨停阈值 (与原 th=0.098/0.198 同); 无涨跌停市场 → 不判触板, 直接按到期逻辑
-    nominal = 0.198 if board_type == "gem_star" else 0.098
+    # 名义涨停阈值来自 MarketSpec (2026-09-28 审计 P2: 原先硬编码 0.098/0.198 —— 违反
+    # "core 零市场常量"硬规则, 接港/美股或增设新档位时会静默算错)。
+    # 档位值与原硬编码一致 (main 0.098 / 未命中回落 band_default=gem_star 0.198)。
+    nominal = sp.nominal_up_pct(board_type)
+    if not nominal or nominal <= 0:
+        # 无涨跌停市场: 不判触板/封板, 直接按到期逻辑 (docstring 许诺的语义, 原实现漏)
+        max_days0 = int(hold_days_max)
+        last_idx0 = min(entry_idx + max_days0 - 1, len(bars) - 1)
+        if last_idx0 < entry_idx:
+            return {"open": True, "exit_day": max_days0}
+        last_close0 = float(bars[last_idx0].get("close") or 0)
+        return {"exit_price": round(last_close0, 3), "exit_day": max_days0,
+                "exit_reason": f"到期{max_days0}天(无涨跌停市场)",
+                "return_pct": round((last_close0 / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((last_close0 / entry_price - 1) * 100, 2),
+                "open": False}
     limit_price = round(entry_price * (1 + nominal), 2)
     seal_th = limit_price * float(break_sell_ratio)
     n = len(bars)

@@ -21,11 +21,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.market_cn.auto.core.market import default_market
 
 # 质量等级（数值越大越差；供排序/筛选）
-LEVEL_ORDER: Dict[str, int] = {"ok": 0, "suspend": 0, "warning": 1, "error": 2}
+# ⚠ 2026-09-28 审计 P2: `suspend`(整段无数据, 无法评估) 原先与 `ok` 同置 0 —— 与
+# "数值越大越差" 矛盾, 且排序时会把"没数据"当成"没问题"。改为最差档。当前无消费者。
+LEVEL_ORDER: Dict[str, int] = {"ok": 0, "warning": 1, "error": 2, "suspend": 3}
 
 
 def detect_gap_anomaly(bars: Sequence[Dict[str, Any]], *,
-                       board_type: str = "default",
+                       board_type: str,
                        spec: Optional[Any] = None,
                        margin_pp: float = 1.0,
                        ex_div_idx: Optional[Sequence[int]] = None

@@ -138,7 +138,16 @@ class StrategyBase:
     # 声明形态: {"enabled": True, "max_legs_per_day": 2, "legs": [{"action":"sell",
     #   "qty_pct":50, "trigger": <callable|已求值bool>, "label":"冲高减半"}, ...]}
     # 复杂网格/依赖成交回报 → 本类方法 t_leg_intents() 逃生舱覆盖。
-    t_legs: dict = field(default_factory=dict)
+    #
+    # ⚠️ 2026-09-28 修根因：StrategyBase 不是 @dataclass（靠子类类属性覆盖 +
+    # 手动 __init__），不能用 dataclass.field()——field() 返回 Field 元对象挂
+    # 在类属性上，getattr 返回 truthy Field 绕过 monitor._eval_t_legs L164 的
+    # falsy 短路，走到 TLegsConfig.from_dict(Field) 调 .get() → 'Field' object
+    # has no attribute 'get'。改用普通默认值 {}：空 dict 是 falsy，L164 短路
+    # return []，永远不到 from_dict。子类要启用做T 用 t_legs = {...} 整体覆盖。
+    # 同源隐患：scan_spec/default_params 也用了 field()，活跃策略都覆盖了所以
+    # 未触发；若新增策略不覆盖会踩同样雷——后续清理建议改普通默认值。
+    t_legs: dict = {}
 
     # ---- 信号判定 (回测即信号: 实盘 as_of=None 只判末根bar; 回测 as_of=k 判第k根) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):

@@ -1171,12 +1171,14 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
                     "super_net": _safe_float(p[5]),
                 })
 
-        # 计算最近20个交易日的主力累计净流入（约一个交易月）
+        # 计算最近5个交易日和20个交易日的主力累计净流入
+        recent_5 = rows[-5:] if len(rows) >= 5 else rows
         recent_20 = rows[-20:] if len(rows) >= 20 else rows
 
         return {
             "code": code,
             "total_days": len(rows),
+            "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
             "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
             "data": rows,
         }

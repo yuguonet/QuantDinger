@@ -33,11 +33,10 @@ _MARKET_WORDS = re.compile(
 
 # plan_linter R1 数据域词典：(数据域, 触发关键词, 候选工具[0]=首选)
 # 工具名必须逐字来自 provider 注册表（tools ∪ capabilities 并集）。
-# ⚠️ 2026-09-27：此处曾写"CI 断言见 tests/test_wiring.py plan_linter 段"——该文件确实
-#    存在（35 个用例）但**里面没有任何词典断言**，属幻觉引用（引用了不存在的一段）。
-#    后果：2026-09-27 工具归组摘除 17 个旧名后本词典整行失效（intel_news 曾 0 有效候选）
-#    而无人报警，plan_linter R1 持续向 planner 推荐不存在的工具。本轮已按 TOOL_ALIAS
-#    全部迁移（失效名 0）。词典 ⊆ 注册表的 CI 断言待补，未补前勿再声称已覆盖。
+# ⚠️ 2026-09-27：工具归组摘除 17 个旧名后本词典曾整行失效（intel_news 一行
+#    0 有效候选）而无人报警——当时声称的"CI 断言"是幻觉引用。本轮已按
+#    TOOL_ALIAS 全部迁移（失效名 0），并已补上真实断言：tests/test_wiring.py
+#    W20a/W20b/W20c（词典 ⊆ 注册表 / 每域首选可用 / 摘除名不得回流）。
 _DATA_DOMAINS = (
     ("realtime_quote",
      ("实时", "现价", "最新价", "盘口", "快照", "分时", "realtime", "报价", "现在多少钱"),

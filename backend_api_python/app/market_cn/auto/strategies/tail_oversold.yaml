@@ -26,7 +26,10 @@ exit:
 params:                           # 与 strategies/tail_oversold.py PARAMS 同值 (逐笔等价基线)
   score_min: 8.0                  # V2 评分下限 (归一化后)
   pre5_max: -10.0                 # pre5_gain*nf 上限 (深度超卖)
-  amp_min: 10.0                   # amplitude*nf 下限 (弹性)
+  amp_min: 8.0                    # amplitude*nf 下限 (弹性)
+                                  # ⚠ 2026-09-28 审计 A5 修正: 本行原为 10.0, 未随
+                                  # 2026-09-26 的 .py PARAMS:101 / config.json:92 一并标定到
+                                  # 8.0 ⇒ 三处双源分叉, 破坏本文件头部"逐笔等价"承诺。
   tail_lo: -2.8                   # tail_ret*nf 下限
   tail_hi: -0.5                   # tail_ret*nf 上限 (跌太多=还在崩)
   min_hhmm: "14:50"               # 快照时间下限 (滚动预览窗口起点)

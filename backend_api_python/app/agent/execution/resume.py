@@ -8,6 +8,17 @@ checkpoint 语义「现成」不成立。裁决 = **续跑凭据重启**：
   selected_skill/domain, plan_tool_names}`（全可序列化）入队列，
   worker 从下一 phase **重新 plan-续跑**。
 
+读侧接线（2026-09-28 修 E7）：message_queue._worker_loop 取到消息后
+经 `_rewrite_resume_message` 识别 type=agent_resume 凭据，改写成
+「续跑上下文 prompt」（原任务 + 已完成阶段摘要 + 续跑指令）重新 plan。
+不做 state 级重建——凭据里没有 _code_agent，重建语义不成立。
+
+已知边界（诚实声明）：`maybe_persist` 的非 force 路径依赖
+state["_resume_needed"] 标记，当前唯一生产者是 nodes.py finalize 失败
+时的 force=True 调用；超时/预算路径未标记 _resume_needed，即凭据
+只在 finalize 失败时落队。若后续接超时路径，需在对应位置补
+`state["_resume_needed"] = True`。
+
 配套（评审 #9 / C1）：阶段产物必须**可文本化审计**——
 数值变量经 `phase_results[].deliverable_text` 落入摘要，续跑只信文本摘要。
 """
@@ -94,9 +105,6 @@ def maybe_persist(state: Dict[str, Any], *, force: bool = False,
 
 def wrapup_hint(credential: Dict[str, Any]) -> str:
     """前端话术（方案 F4：已转后台，预计 N 分钟后回传）。"""
-    n_left = 0
-    for p in credential.get("phases_digest") or []:
-        pass
     done = len(credential.get("phase_results") or [])
     total = done + max(0, len(credential.get("phases_digest") or []) - done)
     mins = max(1, (total - done) * 2)

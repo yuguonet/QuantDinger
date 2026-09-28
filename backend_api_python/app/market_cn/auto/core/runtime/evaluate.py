@@ -43,9 +43,14 @@ from importlib import import_module as _import_module
 
 
 def _break_fns():
-    """惰性取 break 门表特征 (避免 core 顶层 import strategies)。"""
+    """惰性取 break 门表特征 + 入场通道标注 (避免 core 顶层 import strategies)。
+
+    返回 (bk_struct, break_features, break_entry_gate) —— 三者均取自 strategies.break,
+    与 .py 生产链**同一份实现**。2026-09-28 起 break_entry_gate 亦供 IDE 回测产出
+    entry_gate/entry_pctb/entry_bd 展示字段, 并经 diag 决定 break_combo 甜点区阈值。
+    """
     m = _import_module("app.market_cn.auto.strategies.break")
-    return m.bk_struct, m.break_features
+    return m.bk_struct, m.break_features, m.break_entry_gate
 
 
 def _relay3_feats_fn():
@@ -512,7 +517,10 @@ def _run_backtest_day_v1(bars, code, spec, ev, board_type, stock_info, use_prefi
         # 信号附字段（与 _signal_to_legacy_dict + backtest_stock 完全一致）
         d_1 = bars[i - 1]
         d_2 = bars[i - 2]
-        ret_20d = (float(d0["close"]) / float(bars[i - 20]["close"]) - 1) * 100
+        # 20 日收益 (信号展示字段; 与 v1 参考版同式)。⚠ 2026-09-28 审计 P2: 原无零值守卫,
+        # 参照 close<=0 的脏数据会在此抛 ZeroDivisionError 打断整轮回测 (v1.py:119 有守卫)。
+        _ref20 = float(bars[i - 20]["close"])
+        ret_20d = (float(d0["close"]) / _ref20 - 1) * 100 if _ref20 > 0 else None
         d_1_change = (float(d_1["close"]) / float(d_2["close"]) - 1) * 100
         circ = float((stock_info or {}).get("circ_shares") or 0)
         total = float((stock_info or {}).get("total_shares") or 0)
@@ -523,7 +531,7 @@ def _run_backtest_day_v1(bars, code, spec, ev, board_type, stock_info, use_prefi
             "path_label": "V1",
             "d0_date": d0["time"],
             "d0_close": round(float(d0["close"]), 3),
-            "ret_20d": round(ret_20d, 2),
+            "ret_20d": round(ret_20d, 2) if ret_20d is not None else None,
             "d_1_change": round(d_1_change, 2),
             "turnover_anchor": round(float(d0["volume"]) / circ * 100, 2) if circ > 0 else None,
             "turnover_anchor_total": round(float(d0["volume"]) / total * 100, 2) if total > 0 else None,
@@ -629,7 +637,7 @@ def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_pr
     n = len(bars)
     if n < int(spec.meta.get("day_min_n", 6)):
         return []
-    bk_struct, break_features = _break_fns()   # 惰性取 break 门表特征 (P1-9)
+    bk_struct, break_features, break_entry_gate = _break_fns()   # 惰性取 break 门表特征 + 通道标注
     _p = spec.params
     max_break_gap = int(_p.get("max_break_gap", 5))
     lu_all = find_limit_ups(bars, board_type, spec.market_spec)
@@ -671,6 +679,14 @@ def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_pr
         if site is None:
             continue
 
+        # 信号展示字段（镜像 _signal_to_legacy_dict + scan_signals.extra）
+        feats = break_features(ctx, stock_info=stock_info)
+        # 入场通道标注 (2026-09-28 A3 配套): 与参考版同一 `break_entry_gate` — 板块来自 code、
+        # 涨停走共享 is_limit_up。既作展示字段, 又经 diag.entry_gate 决定甜点区阈值
+        # (核心/高板 → sweet_pctb_core=100; 其余 → sweet_pctb=95)。修复两链出场分叉。
+        _gate, _gpctb, _gbd = break_entry_gate(bars, i, feats.get("streak_len") or 0, code)
+        site["diag"]["entry_gate"] = _gate
+
         # 出场 = exit_modes（break_combo 收盘价口径）
         result = run_exit(spec.exit.get("mode", "break_combo"), bars=bars,
                           entry_idx=site["entry_idx"], entry_price=site["entry_price"],
@@ -678,8 +694,6 @@ def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_pr
         if not result:
             continue
 
-        # 信号展示字段（镜像 _signal_to_legacy_dict + scan_signals.extra）
-        feats = break_features(ctx, stock_info=stock_info)
         d1 = bars[i + 1]
         prev_close = float(bars[i]["close"])
         trades.append({
@@ -701,6 +715,9 @@ def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_pr
             "confirm_gap": feats.get("confirm_gap"),
             "pre20_gain": feats.get("pre20_gain"),
             "ma_bull": feats.get("ma_bull"),
+            "entry_gate": _gate,
+            "entry_pctb": _gpctb,
+            "entry_bd": _gbd,
             "turnover_anchor": feats.get("turnover_anchor"),
             "turnover_sig": feats.get("turnover_sig"),
             "turnover_anchor_total": feats.get("turnover_anchor_total"),
