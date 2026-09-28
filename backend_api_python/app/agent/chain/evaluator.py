@@ -84,12 +84,21 @@ def _get_actual_return(
         raw = CNStockDataSource().get_kline(stock_code, "1D", max(hold_days + 10, 1))
 
         def _ts_to_date(ts):
+            # ★ 必须带年份（%Y-%m-%d）。cn_stock 的 1D 行只有 time（无 date 字段），
+            #   此前回退成 "%m-%d" → 下游 date.fromisoformat("09-28") 恒 ValueError
+            #   → base_idx 永远 None → 本函数恒返回 None → 每条待验证记录都记一次
+            #   失败，5 次后被 query_pending_verify 的毒丸机制置 'unverifiable' 永久
+            #   出队。实测库里 874 条 root 已是 unverifiable、root 的 pnl_pct 与
+            #   skill/tool 层的 correct **一条都没写进去**、qd_agent_weights 只有
+            #   tool 层 58 行且 sample_count 全 0 —— 整条 T+N 闭环就是死在这里。
             try:
-                return _dt.fromtimestamp(int(ts)).strftime("%m-%d")
+                return _dt.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
             except Exception:
                 return str(ts)
 
-        # 规整成 evaluator 下游依赖的 {t,o,h,l,c,v} 形态（与 agent_get_kline 一致）
+        # 规整成 evaluator 下游依赖的 {t,o,h,l,c,v} 形态。
+        # 注：键名与 agent_get_kline 一致，但 t **必须**是完整日期——工具侧 "%m-%d"
+        # 只用于给模型展示，本函数的 t 要被 date.fromisoformat 回解析。
         klines = [{
             "t": (k.get("date") or _ts_to_date(k.get("time", 0)))[:10],
             "o": round(k.get("open", 0), 2),
@@ -587,6 +596,10 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                         return_per_day = EXCLUDED.return_per_day,
                         sample_count = EXCLUDED.sample_count,
                         last_updated = NOW()
+                    -- qd_agent_weights 无 id 列：必须自带 RETURNING，否则游标兼容层
+                    -- （app.utils.db_postgres.PostgresCursor.execute 对"简单 INSERT…VALUES"
+                    --   自动追加 RETURNING id）会让本语句变 UndefinedColumn、整段回滚
+                    RETURNING name
                 """, (
                     skill_name, result["weight"], result["win_rate"],
                     result["avg_pnl_pct"], result["avg_hold_days"],
@@ -617,6 +630,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                         sample_count = EXCLUDED.sample_count,
                         decay_half_life = EXCLUDED.decay_half_life,
                         last_updated = NOW()
+                    -- 同 skill 层：无 id 列，必须自带 RETURNING 抑制兼容层自动追加
+                    RETURNING name
                 """, (fname, skill_name, weight, accuracy,
                       int(s["raw_total"]), s["half_life"]))
                 stats["factor_updated"] += 1
@@ -664,6 +679,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                         win_rate = EXCLUDED.win_rate,
                         sample_count = EXCLUDED.sample_count,
                         last_updated = NOW()
+                    -- 同 skill 层：无 id 列，必须自带 RETURNING 抑制兼容层自动追加
+                    RETURNING name
                 """, (tname, weight, wr, n))
                 stats["tool_updated"] += 1
 
@@ -698,6 +715,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                         win_rate = EXCLUDED.win_rate,
                         sample_count = EXCLUDED.sample_count,
                         last_updated = NOW()
+                    -- 同 skill 层：无 id 列，必须自带 RETURNING 抑制兼容层自动追加
+                    RETURNING name
                 """, (cname, weight, wr, n))
                 stats["chain_updated"] = stats.get("chain_updated", 0) + 1
 

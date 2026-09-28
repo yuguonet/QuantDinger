@@ -12,6 +12,10 @@ expr.static_asof_check 加载期静态校验 + 运行时偏移强制，双重杜
 **额外**算一遍全门布尔向量并回调 `gate_dbg(phase, code, i, lu_idx, {gate_id: bool})`；
 `gate_dbg=None`（生产默认）时走原短路主路径，**零额外开销、判定语义完全不变**。供
 `tools/explain.py` 采集门漏斗（门表路径此前无采集通道，`failed` 只留首个失败门）。
+
+分层 (2026-09-28): 本文件曾是「门表求值 + 5 份策略专属回测编排」的混合体 (840 行,
+其中 415 行 = v1/relay3/break/g56/limit_up 的逐字镜像编排, 占 49%)。编排已**纯搬运**
+回 strategies/<key>.py 并经 core/runtime/flows 自注册; 本文件只留门表加载/求值 + 分派。
 """
 
 from __future__ import annotations
@@ -33,29 +37,41 @@ from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.runtime.expr import ExprError, evaluate, static_asof_check
 from app.market_cn.auto.core.runtime.functions import (
-    Ctx, OFFSET_FUNCS, build_funcs, offset_funcs, ensure_gate_init,
+    AsOfViolation, Ctx, OFFSET_FUNCS, build_funcs, offset_funcs, ensure_gate_init,
 )
+from app.market_cn.auto.core.runtime.flows import UnknownFlow, available_flows, get_flow
 ensure_gate_init()  # 副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数 (autodiscover)
-# break 是 Python 关键字 → 静态 import 语法错误, 走动态导入 (2026-09-23 更名)。
-from importlib import import_module as _import_module
-# 2026-09-26 P1-9: break/relay3 特征改惰性获取 (调用点再 import), 去掉 load-time 层反转。
-# 真正收编待 P1-8 day_flow 塌缩 (门表应经 register_strategy_funcs 取特征)。
+
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# 门求值异常去重告警 (A8): (gate_id, 异常类名) → 出现次数。回测逐 bar 循环里
+# 同一门反复炸同一异常, 首次 WARNING、后续 DEBUG, 兼顾暴露与日志量。
+_GATE_ERR_SEEN: Dict[Tuple[str, str], int] = {}
 
 
-def _break_fns():
-    """惰性取 break 门表特征 + 入场通道标注 (避免 core 顶层 import strategies)。
+def _gate_error(gate_id, e) -> None:
+    """门求值异常 → 记日志, 调用方视作该门未过 (模块契约)。
 
-    返回 (bk_struct, break_features, break_entry_gate) —— 三者均取自 strategies.break,
-    与 .py 生产链**同一份实现**。2026-09-28 起 break_entry_gate 亦供 IDE 回测产出
-    entry_gate/entry_pctb/entry_bd 展示字段, 并经 diag 决定 break_combo 甜点区阈值。
+    A8 (2026-09-28): 原实现只捕 ExprError —— AsOfViolation (参数化正偏移的
+    运行期 _check_k 兜底)、TypeError (注册偏移函数缺参)、KeyError /
+    ZeroDivisionError (策略私有门函数内部异常) 全部未捕获, 直接炸掉整轮回测 /
+    夜间预计算 (pipeline.py 无外层 try)。一条脏表达式/脏数据最多损失一个门,
+    不再打断整策略全市场回测。AsOfViolation 是真未来函数信号, 恒 WARNING 暴露。
     """
-    m = _import_module("app.market_cn.auto.strategies.break")
-    return m.bk_struct, m.break_features, m.break_entry_gate
-
-
-def _relay3_feats_fn():
-    return _import_module("app.market_cn.auto.strategies.relay3").relay3_features
-
+    key = (str(gate_id), type(e).__name__)
+    _GATE_ERR_SEEN[key] = _GATE_ERR_SEEN.get(key, 0) + 1
+    n = _GATE_ERR_SEEN[key]
+    if isinstance(e, AsOfViolation):
+        logger.warning("[gate:%s] 未来函数违规(运行期 as-of 正偏移), 门按未过处理: %s", gate_id, e)
+    elif n == 1:
+        logger.warning("[gate:%s] 求值异常(首次), 门按未过处理: %s: %s",
+                       gate_id, type(e).__name__, e)
+    else:
+        logger.debug("[gate:%s] 求值异常(第%d次): %s: %s", gate_id, n, type(e).__name__, e)
+# 2026-09-28 分层改造: core 不再惰性 import strategies.* 取特征 (**层反转**), 也不再内嵌
+# 任何策略专属编排 —— 编排由 strategies/<key>.py 经 core/runtime/flows 自注册 (见下)。
 from app.market_cn.auto.core._paths import STRATEGY_DIR as _STRATEGY_DIR
 
 
@@ -231,7 +247,8 @@ def evaluate_gates(spec: StrategySpec, gates: List[Gate], ctx: Ctx) -> Tuple[boo
         try:
             if not evaluate(g.expr, spec.params, funcs):
                 return False, [g.id]
-        except ExprError:
+        except Exception as e:      # A8: 求值异常一律视作该门未过 (原只捕 ExprError)
+            _gate_error(g.id, e)
             return False, [g.id]
     return True, []
 
@@ -263,7 +280,8 @@ class GateEvaluator:
         for g in gates:
             try:
                 out[g.id] = bool(evaluate(g.expr, params, funcs))
-            except ExprError:
+            except Exception as e:  # A8: 求值异常一律视作该门未过 (原只捕 ExprError)
+                _gate_error(g.id, e)
                 out[g.id] = False
         return out
 
@@ -298,7 +316,8 @@ class GateEvaluator:
             try:
                 if not evaluate(g.expr, params, funcs):
                     return False, [g.id]
-            except ExprError:
+            except Exception as e:  # A8: 求值异常一律视作该门未过 (原只捕 ExprError)
+                _gate_error(g.id, e)
                 return False, [g.id]
         return True, []
 
@@ -318,7 +337,8 @@ class GateEvaluator:
             try:
                 if not evaluate(g.expr, params, funcs):
                     return False, [g.id]
-            except ExprError:
+            except Exception as e:  # A8: 求值异常一律视作该门未过 (原只捕 ExprError)
+                _gate_error(g.id, e)
                 return False, [g.id]
         return True, []
 
@@ -341,7 +361,8 @@ class GateEvaluator:
             try:
                 if not evaluate(g.expr, params, funcs):
                     return False, [g.id]
-            except ExprError:
+            except Exception as e:  # A8: 求值异常一律视作该门未过 (原只捕 ExprError)
+                _gate_error(g.id, e)
                 return False, [g.id]
         return True, []
 
@@ -353,454 +374,49 @@ def run_backtest(bars: List[Dict[str, Any]], code: str, spec: StrategySpec,
                  stock_info: Optional[Dict[str, Any]] = None,
                  use_prefilter: bool = True,
                  gate_dbg: Optional[Any] = None) -> List[Dict[str, Any]]:
-    """门表策略全历史回测入口；按 spec.meta["enumeration"] 分派枚举方式。
+    """门表策略全历史回测入口 —— **只做分派**, 编排实现在各 strategies/<key>.py。
 
-    - "limit_up"（默认，dragon_callback）：枚举候选日 → 遍历 lu_idx → 收盘买入。
-    - "day"（v1 / relay3 / break）：逐日候选 → D0 信号 → 次日开盘入场。
+    - "limit_up"（dragon_callback）：枚举候选日 → 遍历 lu_idx → 收盘买入。
+    - "day"（v1 / relay3 / break / g56）：逐日候选 → D0 信号 → 次日开盘入场。
+
+    分派 = 查 core/runtime/flows 注册表 (策略模块自注册), **未登记即抛 UnknownFlow**
+    (2026-09-28 分层改造)。改造前这里是闭集 `if flow == ...` + `return ..._v1(...)` 兜底:
+    yaml 里 day_flow 拼错会**静默**按 V1 口径算收益 —— 门是 g56 的门、编排是 v1 的编排,
+    回测数字看着像真的, 实盘选股全错。现在宁可炸, 绝不静默。
+
     入场/出场由 entry_modes / exit_modes 按 YAML 选择 → 逐笔等价于对应 python 参考版。
     gate_dbg: M6 诊断回调 (None=零开销); 非 None 时每次门求值回调全门向量, 供 explain 采集。
     """
     board_type = get_board_type(code, spec.market_spec)
-    n = len(bars)
     ev = GateEvaluator(spec, board_type, code=code, stock_info=stock_info, gate_dbg=gate_dbg)
     enumeration = str(spec.meta.get("enumeration", "limit_up")).lower()
+    if enumeration == "intraday":
+        # 盘中策略走时间线引擎 (scan.py / 分钟快照帧), run_backtest 的日线编排不适用。
+        # 改造前此处会**静默**落 limit_up 编排 (等于拿龙回头的枚举跑接刀/超卖) —— 显式拒绝。
+        raise UnknownFlow(
+            f"策略 {spec.key} 的 enumeration=intraday, 不经 run_backtest "
+            f"(盘中策略走时间线引擎: scan.py / 分钟快照帧)")
+    flow = ""
     if enumeration == "day":
-        flow = str(spec.meta.get("day_flow", "v1")).lower()
-        if flow == "relay3":
-            return _run_backtest_day_relay3(bars, code, spec, ev, board_type, stock_info, use_prefilter)
-        if flow == "break":
-            return _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_prefilter)
-        if flow == "g56":
-            return _run_backtest_day_g56(bars, code, spec, ev, board_type, stock_info, use_prefilter)
-        return _run_backtest_day_v1(bars, code, spec, ev, board_type, stock_info, use_prefilter)
-    return _run_backtest_limit_up(bars, code, spec, ev, board_type, stock_info, use_prefilter)
+        flow = str(spec.meta.get("day_flow", "")).lower()
+        if not flow:
+            raise UnknownFlow(
+                f"策略 {spec.key} 的 meta.enumeration=day 但未声明 day_flow; 请显式写 "
+                f"day_flow: <{', '.join(available_flows()) or '...'}>")
+    runner = get_flow(enumeration, flow)
+    return runner(bars, code, spec, ev, board_type, stock_info, use_prefilter)
 
 
 # ================================================================
-# 枚举方式 A：limit_up（dragon_callback，反转日收盘买入）
-# 逐字镜像 dragon_callback.backtest_stock（见 M1 验收）
+# 编排下沉声明 (2026-09-28 分层改造)
+# ----------------------------------------------------------------
+# 本文件曾内嵌 5 份策略专属回测编排 (415 行 / 840 行 = 49%)。现已**纯搬运**回各自
+# 策略模块 (签名与语义逐字不变), core 只保留门表加载/求值 + 通用分派:
+#   strategies/v1.py               register_day_flow("v1", ...)
+#   strategies/relay3.py           register_day_flow("relay3", ...)
+#   strategies/break.py            register_day_flow("break", ...)
+#   strategies/g56.py              register_day_flow("g56", ...)
+#   strategies/dragon_callback.py  register_enum_flow("limit_up", ...)
+# 新增策略 = 写 strategies/<key>.py + yaml 声明 day_flow, core 零改动。
+# 逐笔等价回归见 analysis_output/auto架构分层_20260928.md
 # ================================================================
-def _run_backtest_limit_up(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版龙回头全历史回测，返回 trades 列表（与 dragon_callback.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 backtest_stock：枚举候选日 → 廉价预筛 → 资格门 → 遍历 lu_idx 取首个通过
-    → 去重±4 → unified_prefilter → 入场=entry_modes(close) → 出场=exit_modes(exit.mode)。
-    """
-    n = len(bars)
-    if n < 5:
-        return []
-    lu_all = find_limit_ups(bars, board_type, spec.market_spec)
-    pd_min = int(spec.params["min_pullback_days"])
-    pd_max = int(spec.params["max_pullback_days"])
-    params = spec.params
-    trades: List[Dict[str, Any]] = []
-    used_ranges: List[Tuple[int, int]] = []
-
-    for i in range(2, n - 1):
-        # 廉价预筛（数学必要条件超集；与 backtest_stock 同源）
-        if not any(pd_min + 1 <= i - j <= pd_max + 1 for j in lu_all):
-            continue
-        # 资格门（与 lu_idx 无关）
-        ok, _ = ev.evaluate_prefilter(bars, i, params)
-        if not ok:
-            continue
-        # 遍历 lu_idx（升序；首个通过即出信号 —— 与 scan_signals 同语义）
-        lu_cands = [j for j in lu_all if j < i]
-        chosen = None
-        for lu_idx in lu_cands:
-            ok, _ = ev.evaluate_decision(bars, i, lu_idx, params)
-            if ok:
-                chosen = lu_idx
-                break
-        if chosen is None:
-            continue
-        lu_idx = chosen
-        # 去重（±4 天内跳过）
-        skip = False
-        for (s, e) in used_ranges:
-            if abs(i - s) <= 4 or abs(i - e) <= 4:
-                skip = True
-                break
-        if skip:
-            continue
-        used_ranges.append((lu_idx, i))
-        # U1~U4 预过滤（锚定涨停日）
-        if use_prefilter and lu_idx > 0:
-            ok, _ = unified_prefilter(bars, lu_idx, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-        # 入场 = D0(反转日)收盘价
-        d0 = bars[i]
-        d1 = bars[i + 1]
-        entry_price = float(d0["close"] or 0)
-        if entry_price <= 0:
-            continue
-        result = run_exit(spec.exit.get("mode", "combo"), bars=bars, entry_idx=i,
-                          entry_price=entry_price, code=code, board_type=board_type,
-                          params=spec.params, diag={})
-        if not result:
-            continue
-        # 信号附带字段（与 _signal_to_legacy_dict + scan_signals.extra 完全一致）
-        d_prev = bars[i - 1]
-        d_prev2 = bars[i - 2]
-        prev_chg = (float(d_prev["close"]) / float(d_prev2["close"]) - 1) * 100 \
-            if float(d_prev2.get("close") or 0) > 0 else 0.0
-        prev_vol = float(d_prev["volume"]) / float(d_prev2["volume"]) \
-            if float(d_prev2.get("volume") or 0) > 0 else 0.0
-        sig = {
-            "code": code,
-            "board": get_board_name(code, spec.market_spec),
-            "path": spec.key,
-            "path_label": spec.meta.get("name", spec.key),
-            "lu_date": bars[lu_idx]["time"],
-            "pullback_days": (i - 1) - lu_idx,
-            "signal_date": d0["time"],
-            "signal_chg": round(prev_chg, 2),
-            "signal_vol_r": round(prev_vol, 2),
-            "signal_price": round(entry_price, 3),
-            "entry_vol_r": round(prev_vol, 2),
-            "buy_mode": "signal_close",
-        }
-        trades.append({
-            **sig,
-            "entry_date": d0["time"],
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "signal_close",
-            "d1_gap": round((float(d1["open"]) / entry_price - 1) * 100, 2),
-            "d1_change": round((float(d1["close"]) / entry_price - 1) * 100, 2),
-            **result,
-        })
-    return trades
-
-
-# ================================================================
-# 枚举方式 B：day（逐日候选 → D0 信号 → 次日开盘入场）
-#   day_flow=v1     : 镜像 v1.backtest_stock（见 tmp/_v1_equivalence.py 验收）
-#   day_flow=relay3 : 镜像 relay3.backtest_stock（见 tmp/_relay3_equivalence.py 验收）
-# ================================================================
-def _run_backtest_day_v1(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 V1 全历史回测，返回 trades 列表（与 v1.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 v1.backtest_stock：逐日候选判定（门表求值）→ U1~U4 锚定 D0 →
-    入场=entry_modes(open + gap 过滤) → 出场=exit_modes(v1_combo，含 V1 动量 D2 清仓)。
-    v1 原版无去重 ±4（本路径不施加）；起点/最小长度由 meta.day_start / day_min_n 声明。
-    """
-    n = len(bars)
-    if n < int(spec.meta.get("day_min_n", 30)):
-        return []
-    _p = spec.params
-    trades: List[Dict[str, Any]] = []
-
-    for i in range(int(spec.meta.get("day_start", 25)), n - 1):
-        # D0 逐日判定（门表一次性求所有门，与 scan_signals 同一逻辑）
-        ok, _ = ev.evaluate_all(bars, i, _p)
-        if not ok:
-            continue
-
-        # U1~U4（信号日 D0 锚定，v1 prefilter_anchor='signal'）
-        if use_prefilter:
-            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-
-        # 入场 = entry_modes（open + gap 过滤；阈值来自 YAML entry 块，可引用 params 名）
-        d0 = bars[i]
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-        entry_idx = site["entry_idx"]
-        entry_price = site["entry_price"]
-        entry_date = site["entry_date"]
-        d1_gap = site["diag"]["d1_gap"]
-        d1_change = site["diag"]["d1_change"]
-
-        # 信号附字段（与 _signal_to_legacy_dict + backtest_stock 完全一致）
-        d_1 = bars[i - 1]
-        d_2 = bars[i - 2]
-        # 20 日收益 (信号展示字段; 与 v1 参考版同式)。⚠ 2026-09-28 审计 P2: 原无零值守卫,
-        # 参照 close<=0 的脏数据会在此抛 ZeroDivisionError 打断整轮回测 (v1.py:119 有守卫)。
-        _ref20 = float(bars[i - 20]["close"])
-        ret_20d = (float(d0["close"]) / _ref20 - 1) * 100 if _ref20 > 0 else None
-        d_1_change = (float(d_1["close"]) / float(d_2["close"]) - 1) * 100
-        circ = float((stock_info or {}).get("circ_shares") or 0)
-        total = float((stock_info or {}).get("total_shares") or 0)
-        sig = {
-            "code": code,
-            "board": get_board_name(code, spec.market_spec),
-            "path": "v1",
-            "path_label": "V1",
-            "d0_date": d0["time"],
-            "d0_close": round(float(d0["close"]), 3),
-            "ret_20d": round(ret_20d, 2) if ret_20d is not None else None,
-            "d_1_change": round(d_1_change, 2),
-            "turnover_anchor": round(float(d0["volume"]) / circ * 100, 2) if circ > 0 else None,
-            "turnover_anchor_total": round(float(d0["volume"]) / total * 100, 2) if total > 0 else None,
-            "buy_mode": "next_open",
-        }
-
-        # 出场 = exit_modes（v1_combo；成交语义见 core/exec.py，只此一份）
-        d1 = bars[i + 1]
-        diag = dict(site["diag"])
-        diag["d1_limit_up"] = is_limit_up(float(d1["close"]), float(d0["close"]),
-                                        board_type, spec.market_spec)
-        bt = run_exit(spec.exit.get("mode", "v1_combo"), bars=bars, entry_idx=entry_idx,
-                      entry_price=entry_price, code=code, board_type=board_type,
-                      params=_p, diag=diag)
-        if not bt:
-            continue
-
-        trades.append({
-            **sig,
-            "entry_date": entry_date,
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "next_open",
-            "d1_change": round(d1_change, 2),
-            "d1_gap": round(d1_gap, 2),
-            "intraday": round(d1_change - d1_gap, 2),
-            **bt,
-        })
-    return trades
-
-
-def _run_backtest_day_relay3(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 relay3(3板接力) 全历史回测，返回 trades 列表（与 relay3.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 relay3.backtest_stock：逐日 D0 判定（门表: 非北交所 + 恰3连板 + MA多头）
-    → U1~U4 锚定 D0 涨停日 → 入场=entry_modes(open, gap -2~9%) → 出场=exit_modes(relay3_s4)。
-    参考版 scan_signals 要求 len(bars[:i+1])>=67 → meta.day_start=66 精确复现该下界。
-    """
-    n = len(bars)
-    if n < int(spec.meta.get("day_min_n", 5)):
-        return []
-    _p = spec.params
-    trades: List[Dict[str, Any]] = []
-
-    for i in range(int(spec.meta.get("day_start", 66)), n - 1):
-        # D0 逐日判定（门表一次性求所有门，与 relay3.scan_signals 同一逻辑）
-        ok, _ = ev.evaluate_all(bars, i, _p)
-        if not ok:
-            continue
-
-        # U1~U4（锚定 D0 涨停日；relay3 prefilter_anchor='limit_up'）
-        if use_prefilter:
-            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-
-        # 入场 = entry_modes（open + gap 过滤）
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-
-        # 出场 = exit_modes（relay3_s4 日线近似；成交语义见 core/exec.py）
-        result = run_exit(spec.exit.get("mode", "relay3_s4"), bars=bars,
-                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
-                          code=code, board_type=board_type, params=_p, diag=site["diag"])
-        if not result or result.get("open"):
-            continue  # 参考版跳过开放持仓（数据不足, 只统计已平仓）
-
-        # 信号展示字段（镜像 relay3 calc_features: board_height/ma_bull/lu_vol_ratio/rsi）
-        feats = _relay3_feats_fn()(Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
-                                    market=spec.market_spec))
-        trades.append({
-            "code": code,
-            "board": get_board_type(code, spec.market_spec),
-            "path": spec.key,
-            "path_label": spec.meta.get("name", spec.key),
-            "signal_date": bars[i]["time"],
-            "entry_date": site["entry_date"],
-            "entry_price": round(site["entry_price"], 3),
-            "buy_mode": "next_open",
-            "d1_gap": round(site["diag"]["d1_gap"], 2),
-            "lu_date": bars[i]["time"],
-            "board_height": feats.get("board_height"),
-            "ma_bull": feats.get("ma_bull"),
-            "lu_vol_ratio": feats.get("lu_vol_ratio"),
-            "rsi": feats.get("rsi"),
-            **result,
-        })
-    return trades
-
-
-# ================================================================
-# 枚举方式 B / day_flow=break（断板接力，D0 确认日 → 次日开盘入场）
-# 逐字镜像 break_buy.BreakStrategy.backtest_stock（见 tmp/_break_equivalence.py 验收）
-# ================================================================
-def _run_backtest_day_break(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 break(断板接力) 全历史回测，返回 trades 列表（与 break_buy.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 backtest_stock：确认日必为非涨停 → 廉价预筛(窗口内有涨停) → 门表求值
-    → 去重 (streak_start, break_date)（**在 U1~U4 之前**，与参考版同序）→ U1~U4 锚定 D0
-    → 入场=entry_modes(open, 无 gap 过滤) → 出场=exit_modes(break_combo)。
-    起点 i=4 / 最小长度 6 由 meta.day_start / day_min_n 声明。
-    """
-    n = len(bars)
-    if n < int(spec.meta.get("day_min_n", 6)):
-        return []
-    bk_struct, break_features, break_entry_gate = _break_fns()   # 惰性取 break 门表特征 + 通道标注
-    _p = spec.params
-    max_break_gap = int(_p.get("max_break_gap", 5))
-    lu_all = find_limit_ups(bars, board_type, spec.market_spec)
-    lu_set = set(lu_all)
-    trades: List[Dict[str, Any]] = []
-    used = set()
-
-    for i in range(int(spec.meta.get("day_start", 4)), n - 1):
-        # 确认日必为非涨停日（断板期最后一天）
-        if is_limit_up(float(bars[i]["close"]), float(bars[i - 1]["close"]),
-                       board_type, spec.market_spec):
-            continue
-        # 廉价预过滤：断板期结束于 i → 必存在距 i 不超过 max_break_gap 的涨停日
-        if not any(j in lu_set for j in range(max(1, i - max_break_gap), i)):
-            continue
-        # 逐日候选判定（门表一次性求所有门；Ctx 复用给 bk_struct，命中记忆化）
-        ctx = Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type,
-                  code=code, stock_info=stock_info, market=spec.market_spec)
-        ok, _ = ev.evaluate_all(bars, i, _p, ctx=ctx)
-        if not ok:
-            continue
-        s = bk_struct(ctx)
-        if not s:
-            continue
-        # 去重: 同一连板起点+断板日只取一次（在 U1~U4 之前，与参考版同序）
-        key = (s["streak_start_date"], s["break_date"])
-        if key in used:
-            continue
-        used.add(key)
-
-        # U1~U4（锚定确认日 D0；信号日 prefilter_anchor='signal'）
-        if use_prefilter:
-            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-
-        # 入场 = entry_modes（open，break 无 gap 过滤）
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-
-        # 信号展示字段（镜像 _signal_to_legacy_dict + scan_signals.extra）
-        feats = break_features(ctx, stock_info=stock_info)
-        # 入场通道标注 (2026-09-28 A3 配套): 与参考版同一 `break_entry_gate` — 板块来自 code、
-        # 涨停走共享 is_limit_up。既作展示字段, 又经 diag.entry_gate 决定甜点区阈值
-        # (核心/高板 → sweet_pctb_core=100; 其余 → sweet_pctb=95)。修复两链出场分叉。
-        _gate, _gpctb, _gbd = break_entry_gate(bars, i, feats.get("streak_len") or 0, code)
-        site["diag"]["entry_gate"] = _gate
-
-        # 出场 = exit_modes（break_combo 收盘价口径）
-        result = run_exit(spec.exit.get("mode", "break_combo"), bars=bars,
-                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
-                          code=code, board_type=board_type, params=_p, diag=site["diag"])
-        if not result:
-            continue
-
-        d1 = bars[i + 1]
-        prev_close = float(bars[i]["close"])
-        trades.append({
-            "code": code,
-            "board": get_board_name(code, spec.market_spec),
-            "path": "break_buy",
-            "path_label": spec.meta.get("name", spec.key),
-            "mode": "streak_break",
-            "streak_len": feats.get("streak_len"),
-            "streak_start": feats.get("streak_start"),
-            "streak_end": feats.get("streak_end"),
-            "break_date": feats.get("break_date"),
-            "signal_date": bars[i]["time"],
-            "break_days": feats.get("break_days"),
-            "break_chg": feats.get("break_chg"),
-            "break_gap": feats.get("break_gap"),
-            "break_vol_r": feats.get("break_vol_r"),
-            "confirm_chg": feats.get("confirm_chg"),
-            "confirm_gap": feats.get("confirm_gap"),
-            "pre20_gain": feats.get("pre20_gain"),
-            "ma_bull": feats.get("ma_bull"),
-            "entry_gate": _gate,
-            "entry_pctb": _gpctb,
-            "entry_bd": _gbd,
-            "turnover_anchor": feats.get("turnover_anchor"),
-            "turnover_sig": feats.get("turnover_sig"),
-            "turnover_anchor_total": feats.get("turnover_anchor_total"),
-            "turnover_sig_total": feats.get("turnover_sig_total"),
-            "entry_price": round(float(site["entry_price"]), 3),
-            "buy_mode": "next_open",
-            "entry_date": site["entry_date"],
-            "d1_change": round((float(d1["close"]) / float(d1["open"]) - 1) * 100, 2)
-            if float(d1["open"]) > 0 else 0,
-            "d1_gap": round((float(d1["open"]) / prev_close - 1) * 100, 2)
-            if prev_close > 0 else 0,
-            "intraday": round((float(d1["close"]) - float(d1["open"])) / prev_close * 100, 2)
-            if prev_close > 0 else 0,
-            **result,
-        })
-    return trades
-
-
-# ================================================================
-# 枚举方式 B / day_flow=g56（五重共振，D-1 信号 → D0 开盘入场 + 锁仓去重）
-# 逐字镜像 g56.G56Strategy.backtest_stock（见 tmp/_g56_equivalence.py 验收）
-# ================================================================
-def _run_backtest_day_g56(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 g56(五重共振) 全历史回测，返回 trades 列表（与 g56.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 backtest_stock：北交所/长度早返回 → 特征 O(n) 一次预计算 → 横截面池聚合
-    → 逐日 s（信号日 k=s-1）→ 锁仓去重（s <= last_exit_idx 跳过，**在门表之前**）→ 门表求值
-    → 入场=entry_modes(open + gap_max 分板块) → 出场=exit_modes(g56_no_trail 无追踪 7d/-8%)
-    → 锁仓至退出日。g56 无 U1~U4（use_unified_prefilter=False）。
-    起点/终点由 meta.day_start(68) / day_end(9) 声明（镜像 range(68, n-9)）。
-    """
-    from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
-
-    if str(code).startswith(("8", "4", "92")) or len(bars) < 68:
-        return []
-    _p = spec.params
-    n = len(bars)
-    # 特征一次预计算（镜像修复① O(n^2)→O(n)）；池按 pool_target 跨股缓存复用
-    ext = {"g56_feats": _g1_arrays(bars),
-           "g56_pool": _ensure_pool_daily(str(bars[-1]["time"])[:10])}
-    trades: List[Dict[str, Any]] = []
-    last_exit_idx = -1
-
-    for s in range(int(spec.meta.get("day_start", 68)), n - int(spec.meta.get("day_end", 9))):
-        if float(bars[s].get("open") or 0) <= 0 or s <= last_exit_idx:
-            continue                        # 锁仓去重（镜像修复②：未退出前不重复入场）
-        i = s - 1                           # 信号日 D-1
-        ctx = Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
-                  stock_info=stock_info, ext=ext, market=spec.market_spec)
-        ok, _ = ev.evaluate_all(bars, i, _p, ctx=ctx)
-        if not ok:
-            continue
-
-        # 入场 = entry_modes（open + gap_max；gap >= 涨停幅度 → 一字/触板不可买）
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-
-        # 出场 = exit_modes（g56_no_trail，无追踪 7d/-8%）
-        result = run_exit(spec.exit.get("mode", "g56_no_trail"), bars=bars,
-                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
-                          code=code, board_type=board_type, params=_p, diag=site["diag"])
-        if not result:
-            continue
-
-        sig = build_signal(ctx, spec)
-        ed = s + int(result["exit_day"]) - 1
-        trades.append({
-            "code": code,
-            "board": board_type,
-            "strategy": spec.key,
-            "signal_date": str(bars[i]["time"])[:10],
-            "entry_date": str(bars[s]["time"])[:10],
-            "entry_price": round(float(bars[s]["open"]), 3),
-            "entry_gap": round(float(site["diag"]["d1_gap"]), 2),
-            "exit_date": str(bars[ed]["time"])[:10]
-            if 0 < int(result["exit_day"]) and ed < n else None,
-            "exit_price": result["exit_price"],
-            "exit_day": result["exit_day"],
-            "return_pct": result["return_pct"],
-            "peak_return_pct": result["peak_return_pct"],
-            **sig,
-            "buy_mode": "next_open",
-        })
-        last_exit_idx = ed
-    return trades

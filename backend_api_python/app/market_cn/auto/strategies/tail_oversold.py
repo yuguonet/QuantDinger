@@ -108,6 +108,26 @@ PARAMS = {
 }
 _SHORTLIST_SLACK_PCT = 0.15   # 预筛容差(百分点): 吸收原始价/复权价微差, 放宽保超集
 
+# 评分除 day_gain 外其余四维的上限合计 (tail 3.0 + pos 2.0 + amp&tail 1.0 + pre5 0.3),
+# 与 _calc_score 分支表一一对应 —— 改评分表必须同步改这里。
+_SHORTLIST_OTHER_MAX = 6.3
+
+
+def _shortlist_dg_max(score_min):
+    """预筛 day_gain*nf 上界, 由 score_min 反推 (2026-09-28 修 A5, 替代硬编码 -5)。
+
+    反推: 信号可达 score_min ⇒ day_gain 档位分 >= score_min - _SHORTLIST_OTHER_MAX
+    ⇒ 取满足的最宽档界 (dg>该界时评分上限 < score_min, 必被判定拒绝, 预筛丢弃不漏)。
+    score_min=8 → 界=-5 (与旧硬编码一致); score_min<=6.3 → None (dg 不构成必要条件)。
+    """
+    need = float(score_min) - _SHORTLIST_OTHER_MAX
+    if need <= 0:
+        return None
+    for bound, pts in ((0.0, 0.5), (-2.0, 1.2), (-5.0, 3.0), (-8.0, 4.0)):
+        if need <= pts:
+            return bound
+    return -8.0    # score_min 超评分理论上限: 按最严档 (判定侧自然全拒)
+
 # 分钟序列标准化已上收 data/hub.py (prep_minutes, D1), 别名引用保持原名
 from app.market_cn.auto.core.data.hub import prep_minutes as _prep_minutes  # noqa: E402
 
@@ -204,7 +224,15 @@ class TailOversoldStrategy(StrategyBase):
 
         snaps: {code: latest_snapshot_row} → 通过必要条件的 {code: snap}。
         无市场门控 (V2 规则不含大盘条件, mkt_gain 仅记录不拦截)。
+
+        预筛与判定同源 (2026-09-28 修 A5): 两道界都从 params 推导, 不硬编码标定值 ——
+        原实现 amp 界硬编码 10, 判定 2026-09-26 已标定改 8.0 (p["amp_min"]), 导致
+        8≤amp*nf<9.85 的合法信号被预筛静默丢弃: 实盘 14:50 滚动扫描 (走本预筛)
+        系统性漏信号, 与回测口径分叉。契约仍是"必要条件超集, 宁多勿漏"。
         """
+        p = self.merged_params(params or None)
+        dg_max = _shortlist_dg_max(float(p["score_min"]))
+        amp_floor = float(p["amp_min"]) - _SHORTLIST_SLACK_PCT
         out = {}
         for code, snap in snaps.items():
             if code.startswith(("8", "4", "92")):       # 北交所排除 (v2 回测口径)
@@ -219,11 +247,12 @@ class TailOversoldStrategy(StrategyBase):
             if last <= 0 or pc <= 0 or high <= 0 or low <= 0 or high <= low:
                 continue
             nf = _norm_factor(code)
-            # P1: score>=8 ⇒ day_gain*nf<=-5; P2: amp*nf>=10 (盘中只会更差 → 超集);
+            # P1: score>=score_min ⇒ day_gain*nf<=dg_max (由评分表反推, 见 _shortlist_dg_max);
+            # P2: amp*nf>=amp_min (盘中只会更差 → 超集);
             # P3: 封板排除 (现价口径, 买不进)
-            if (low / pc - 1) * 100 * nf > -5 + _SHORTLIST_SLACK_PCT:
+            if dg_max is not None and (low / pc - 1) * 100 * nf > dg_max + _SHORTLIST_SLACK_PCT:
                 continue
-            if (high - low) / pc * 100 * nf < 10 - _SHORTLIST_SLACK_PCT:
+            if (high - low) / pc * 100 * nf < amp_floor:
                 continue
             if last >= round(pc * (1 + _limit_pct(code)), 2) * 0.998:
                 continue

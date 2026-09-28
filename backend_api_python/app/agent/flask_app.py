@@ -95,8 +95,9 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
         try:
             for _frame in _translate_agent_event(ev):
                 ev_queue.put(_frame, timeout=1)
-        except Exception:
-            pass  # 流式通道故障不影响主任务
+        except Exception as _e:
+            # 流式通道故障不影响主任务；留 debug 日志便于排查（原 pass 零可观测）
+            logger.debug("[SSE] event_cb 投递失败: %s", _e)
 
     future = submit(message, session_id=session_id, timeout=timeout, event_cb=_event_cb)
 

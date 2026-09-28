@@ -10,6 +10,12 @@ Phase 3: 策略判定全部经 strategies 注册表分发, 本文件不含策略
 
 与回测的已知差异: 回测"尾盘卖"按当日收盘成交; 自动化在 14:58 提示、
 未执行者次日开盘记账。盘中追踪止损不做分钟级模拟 (日线粒度)。
+
+易错点 (2026-09-28 修 A3): run_monitor 每 tick 开头批量取行快照 (buy_rows/hold_rows),
+step2/3/4/5 共用同一份 —— step2 与 step3 (14:25~14:45)、step4 (14:58~15:00) 时间窗重叠。
+对快照行的所有 set_state 必须带条件守卫 (expect_state=快照态 / only_unexited),
+否则 step2 刚做出的出场会被旧快照回滚或被确认结果覆盖, 出场价/原因丢失后
+该行永不回归出场态。出场标记 (exit_reason) 一经写入即资金事实, 任何写入不得覆盖。
 """
 from __future__ import annotations
 
@@ -278,12 +284,17 @@ def run_monitor():
              "holding": len(hold_rows), "exit": len(exit_rows)}
 
     # ── 1. 开盘窗口: 各策略 gap 过滤 → 质量排名 → 每日名额 → buy_today / expired; 隔日 pending 过期 ──
+    #      A3 收尾 (2026-09-28): 本步 4 处写入全部带 expect_state=watch_pending ——
+    #      cand/stale 均取自本 tick 的 pending 快照, 守卫不拦正常路径, 只挡「行已被并发
+    #      买入/推进后仍按过期快照写」。无守卫时并发会把已入场行作废 (遗忘持仓) 或覆盖
+    #      entry_price (收益统计失真), 亦会突破 daily_limit 名额。
     if in_window(W_OPEN_LO, W_OPEN_HI, hm) and pending:
         target = _last_trade_day()
         cand = [r for r in pending if str(r.get("trade_date"))[:10] == target]
         stale = [r for r in pending if str(r.get("trade_date"))[:10] < target]
         for r in stale:
-            ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"})
+            ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"},
+                         expect_state=ds.S_WATCH_PENDING)
         # 禁用策略的存量 pending 直接过期 (09-15 事故修复: 停扫只断新信号,
         # 已入库的 pending 行此前仍会在开盘窗口被买入)
         # 2026-09-26: 批量走 store.retire_unfilled (唯一实现)。
@@ -327,7 +338,8 @@ def run_monitor():
                 if not s_obj.entry_decision(r, snap).buyable:
                     ds.set_state(r["id"], ds.S_EXPIRED,
                                  detail={"gap": round(gap, 2),
-                                         "reason": f"{ds.strategy_labels().get(strat, strat)}开盘gap超出可买区间"})
+                                         "reason": f"{ds.strategy_labels().get(strat, strat)}开盘gap超出可买区间"},
+                                 expect_state=ds.S_WATCH_PENDING)
                     n_exp += 1
                     continue
                 # 质量排序键 (越大越优先, 策略自定义)
@@ -341,12 +353,14 @@ def run_monitor():
                     if i < limit:
                         ds.set_state(r["id"], ds.S_BUY_TODAY,
                                      detail={"entry_gap": round(gap, 2), "rank": i + 1},
-                                     entry_date=today, entry_price=round(open_px, 3))
+                                     entry_date=today, entry_price=round(open_px, 3),
+                                     expect_state=ds.S_WATCH_PENDING)
                         ds.update_stop_price(r["id"], _entry_stop(r["code"], open_px, strat))
                         n_buy += 1
                     else:
                         ds.set_state(r["id"], ds.S_EXPIRED,
-                                     detail={"reason": f"当日名额已满(质量排名第{i+1})"})
+                                     detail={"reason": f"当日名额已满(质量排名第{i+1})"},
+                                     expect_state=ds.S_WATCH_PENDING)
                         n_exp += 1
             stats["open_buy"] = n_buy
             stats["open_expired"] = n_exp
@@ -379,7 +393,10 @@ def run_monitor():
                     if t_intents:
                         detail = {"t_legs_today": {
                             "date": today, "hm": hm, "intents": t_intents}}
-                        ds.set_state(r["id"], r["state"], detail=detail)
+                        # A3 同类隐患: 只在行仍是 holding 时记意图 (条件写入,
+                        # 与并发出场转移竞争时意图不落到已出场行上)。
+                        ds.set_state(r["id"], ds.S_HOLDING, detail=detail,
+                                     expect_state=ds.S_HOLDING, only_unexited=True)
                         stats["t_legs"] = stats.get("t_legs", 0) + len(t_intents)
                         logger.info("[dragon_monitor] 做T意图 %s/%s n=%d: %s",
                                     r.get("code"), r.get("strategy"),
@@ -389,9 +406,11 @@ def run_monitor():
                 stop_px = float(r.get("stop_price") or 0)
                 if px > 0 and stop_px > 0 and px <= stop_px:
                     # 2026-09-26 bugfix: 补 exit_price (原缺失 → 平账无出场价, 收益统计空)
+                    # A3: only_unexited —— 出场标记不可被并发写入覆盖。
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason="盘中止损",
                                  exit_price=round(px, 3),
-                                 detail={"marked": today, "stop_price": stop_px})
+                                 detail={"marked": today, "stop_price": stop_px},
+                                 only_unexited=True)
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
                     continue
                 # 策略 live 出场 (relay3 S4 炸板即卖 / knife_catch D1开盘卖; 其它策略 live → hold)
@@ -401,7 +420,8 @@ def run_monitor():
                 if dec.action == "exit" and dec.price:
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=dec.reason,
                                  exit_price=round(float(dec.price), 3),
-                                 detail={"marked": today, "intraday": True})
+                                 detail={"marked": today, "intraday": True},
+                                 only_unexited=True)
                     stats["live_exit"] = stats.get("live_exit", 0) + 1
 
     # ── 3. 14:25~14:45 预确认 ("当日买入行"通用, 无策略过滤; 各策略 confirm_decision 给档位) ──
@@ -413,6 +433,12 @@ def run_monitor():
         if today_buys:
             series = fetch_day_snapshots([r["code"] for r in today_buys])
             for r in today_buys:
+                # A3 (2026-09-28): buy_rows 是 tick 开头快照 —— 同一 tick 的 step2
+                # 可能刚把该行打出 exit_today。已有出场标记的行跳过预确认;
+                # 写入用条件守卫 (state 仍=buy_today 且无出场标记), 不把旧 r["state"]
+                # 当写入值, 防止 step2 刚做的止损/出场被本步回滚。
+                if r.get("exit_reason"):
+                    continue
                 if (r.get("extra") or {}).get("pre_confirm"):
                     continue
                 rows_ = series.get(r["code"])
@@ -423,7 +449,8 @@ def run_monitor():
                     detail = {"pre_confirm": level, "pre_ts": hm}
                     if reason:
                         detail["pre_reason"] = reason
-                    ds.set_state(r["id"], r["state"], detail=detail)
+                    ds.set_state(r["id"], ds.S_BUY_TODAY, detail=detail,
+                                 expect_state=ds.S_BUY_TODAY, only_unexited=True)
 
     # ── 4. 收盘窗口: 出场重放 (holding, 注册表分发 day_close 模式) ──
     if in_window(W_CLOSESIM_LO, W_CLOSESIM_HI, hm):
@@ -432,9 +459,13 @@ def run_monitor():
                 continue
             dec = _eval_exit_day_close(r)
             if dec is not None and dec.action == "exit":
+                # A3 (2026-09-28): hold_rows 是 tick 开头快照 —— step2 (窗口重叠
+                # 14:58~15:00) 可能刚给该行做过 live 出场/盘中止损。条件写入:
+                # 仅当行仍是 holding 且无出场标记才落, 收盘重放不得覆盖已有出场价/原因。
                 ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=dec.reason,
                              exit_price=round(float(dec.price), 3) if dec.price else None,
-                             detail={"marked": today})
+                             detail={"marked": today},
+                             expect_state=ds.S_HOLDING, only_unexited=True)
 
     # ── 5. 正式确认 15:01+ (当日 buy_today → holding / exit_today, 注册表分发) ──
     if hm >= W_CONFIRM_LO:
@@ -455,16 +486,23 @@ def run_monitor():
                 if dec is None:
                     continue
                 if not dec.confirmed:
+                    # A3: 确认写入带条件守卫 (行仍=buy_today 且无出场标记) ——
+                    # 与 step2/step4 的出场写入竞争时, 出场标记不被确认结果覆盖。
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, confirm_date=today,
                                  d1_chg=dec.d1_chg, exit_reason=dec.reason,
                                  exit_price=round(float(dec.exit_price), 3) if dec.exit_price else None,
-                                 detail={"marked": today, **(dec.detail or {})})
+                                 detail={"marked": today, **(dec.detail or {})},
+                                 expect_state=ds.S_BUY_TODAY, only_unexited=True)
                 else:
                     ds.set_state(r["id"], ds.S_HOLDING, confirm_date=today,
                                  d1_chg=dec.d1_chg, d1_vol_r=dec.d1_vol_r,
-                                 detail=dec.detail or {})
+                                 detail=dec.detail or {},
+                                 expect_state=ds.S_BUY_TODAY, only_unexited=True)
 
     # ── 6. exit_today 执行平账 → closed ──
+    #      A3 收尾 (2026-09-28): 2 处平账写入带 expect_state=exit_today —— 行集取自本 tick
+    #      的 exit_rows 快照; 幂等原靠 `if r.get("exit_date"): continue` (快照层), 但拦不住
+    #      「快照后行已被并发推进到其它终态」的情形 (会被写回 closed, 状态机倒退)。
     #    默认: 隔日开盘执行 (补记账, exit_price 覆写为实际开盘价);
     #    exit_exec_same_day 策略 (knife_catch D1当日卖): 当日 14:55 后平账, 保留标记时价格
     if hm >= "09:30":
@@ -479,7 +517,8 @@ def run_monitor():
                     continue      # 当日执行的行, 等到尾盘再平账
                 keep_px = float(r.get("exit_price") or 0)
                 ds.set_state(r["id"], ds.S_CLOSED, exit_date=today,
-                             exit_price=round(keep_px, 3) if keep_px > 0 else None)
+                             exit_price=round(keep_px, 3) if keep_px > 0 else None,
+                             expect_state=ds.S_EXIT_TODAY)
                 continue
             if marked >= today:
                 continue
@@ -490,7 +529,8 @@ def run_monitor():
             open_px = float(snap.get("open") or snap.get("last") or 0)
             if open_px <= 0:
                 continue
-            ds.set_state(r["id"], ds.S_CLOSED, exit_date=today, exit_price=round(open_px, 3))
+            ds.set_state(r["id"], ds.S_CLOSED, exit_date=today, exit_price=round(open_px, 3),
+                         expect_state=ds.S_EXIT_TODAY)
 
     # ── 7. 清理过期瞬时标记: pre_confirm/pre_ts/pre_reason 只在"当日买入行"期间有意义 ──
     #      设计口径: 14:25 加"预"角标 → **15:00 正式确认覆盖** (docs/龙回头自动化设计方案.md:92/154)。

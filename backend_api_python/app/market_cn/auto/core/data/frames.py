@@ -276,22 +276,30 @@ def build_frame(date, codes=None):
 
     per_code = {}                            # code -> list[(mi,o,h,l,c,v)]
     CHUNK = 800
+    partial = False                          # A11: 任一分块最终失败 → 本帧残缺, 不落缓存
     for s in range(0, len(universe), CHUNK):
         chunk = universe[s:s + CHUNK]
-        try:
-            with pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f'SELECT symbol, time, open, high, low, close, volume '
-                        f'FROM "{table}" WHERE symbol = ANY(%s) '
-                        f'AND time >= %s AND time < %s ORDER BY symbol, time',
-                        (chunk, f"{date} 09:00:00", f"{date} 15:01:00"))
-                    cols = [d[0] for d in cur.description]
-                    for row in cur.fetchall():
-                        r = dict(zip(cols, row))
-                        per_code.setdefault(str(r["symbol"]), []).append(r)
-        except Exception as e:
-            logger.warning("[frames] %s 分块查询失败: %s", date[:10], e)
+        for attempt in (1, 2):               # 单次重试: 吸收瞬时 DB 抖动 (只此一次, 非循环兜底)
+            try:
+                with pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f'SELECT symbol, time, open, high, low, close, volume '
+                            f'FROM "{table}" WHERE symbol = ANY(%s) '
+                            f'AND time >= %s AND time < %s ORDER BY symbol, time',
+                            (chunk, f"{date} 09:00:00", f"{date} 15:01:00"))
+                        cols = [d[0] for d in cur.description]
+                        for row in cur.fetchall():
+                            r = dict(zip(cols, row))
+                            per_code.setdefault(str(r["symbol"]), []).append(r)
+                break
+            except Exception as e:
+                if attempt == 1:
+                    logger.warning("[frames] %s 分块查询失败(重试一次): %s", date[:10], e)
+                else:
+                    partial = True
+                    logger.warning("[frames] %s 分块查询重试仍失败(该块≤%d票缺失, 本帧不落缓存): %s",
+                                   date[:10], CHUNK, e)
 
     # 分段展平 (qfq → float 数组)
     sym_list, o_l, h_l, l_l, c_l, v_l, off_l, cnt_l = [], [], [], [], [], [], [], []
@@ -322,8 +330,8 @@ def build_frame(date, codes=None):
         np.asarray(o_l, dtype=np.float64), np.asarray(h_l, dtype=np.float64),
         np.asarray(l_l, dtype=np.float64), np.asarray(c_l, dtype=np.float64),
         _seg_cumsum(v_l, off_l, cnt_l))
-    if codes is None:
-        _save_cache(frame)          # 子集查询不落缓存 (防污染全量缓存)
+    if codes is None and not partial:
+        _save_cache(frame)          # A11: 残缺帧(partial)不落缓存, 否则脏缓存永不失效
     return frame
 
 
@@ -428,6 +436,12 @@ def prev_closes(before_date):
     """每股在 before_date 之前最近一根 1m close (qfq) → {code: price} (pc_map 种子)。
 
     全量查询较慢 (~分钟级) → 结果按 before_date 落盘缓存 (data/market_cn_cache/frames)。
+
+    易错点 (A10, 2026-09-28): 分钟表按年分表, 最近一根 1m close 可能落在**上一年**表
+    (每年 1 月最初交易日回看 / 跨年长期停牌复牌) —— 只查 before_date 当年表会整体漏,
+    previousClose=0 → 涨幅判定/除零全错。必须 UNION 相邻两年表后 DISTINCT ON 取最近
+    (同 hub._query_batch_raw 跨年写法; before_date 在 Y 年则 time<Y-01-01 只可能落
+    Y-1/Y 两表, 不需要 Y+1)。分块失败或全空**不落缓存** (A11: 脏缓存永不失效)。
     """
     date = str(before_date)[:10]
     path = os.path.join(CACHE_DIR, f"pc_{date}.npz")
@@ -444,27 +458,41 @@ def prev_closes(before_date):
     universe = all_codes()
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
+    year = int(date[:4])
+    with pool.connection() as conn:          # 只 UNION 实际存在的表 (最早年份无上一年表)
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_name ~ '^kline_1m_[0-9]{4}$'")
+            existing = {str(r[0]) for r in cur.fetchall()}
+    years = [y for y in (year - 1, year) if f"kline_1m_{y}" in existing]
     out = {}
-    year = str(before_date)[:4]
+    ok = bool(years)                         # A11: 任一分块失败 / 无可用表 → 不落缓存
     CHUNK = 800
     for s in range(0, len(universe), CHUNK):
         chunk = universe[s:s + CHUNK]
+        union = " UNION ALL ".join(
+            f'(SELECT symbol, time, close FROM "kline_1m_{y}" '
+            f'WHERE symbol = ANY(%s) AND time < %s)' for y in years)
         try:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
+                    # 占位符按子查询交错: (symbol, time) × N年
+                    params = tuple(v for _ in years
+                                   for v in (chunk, f"{before_date} 09:00:00"))
                     cur.execute(
                         f'SELECT DISTINCT ON (symbol) symbol, close '
-                        f'FROM "kline_1m_{year}" WHERE symbol = ANY(%s) '
-                        f'AND time < %s ORDER BY symbol, time DESC',
-                        (chunk, f"{before_date} 09:00:00"))
+                        f'FROM ({union}) t ORDER BY symbol, time DESC',
+                        params)
                     for sym, close in cur.fetchall():
                         out[str(sym)] = float(close or 0)
         except Exception as e:
+            ok = False
             logger.warning("[frames] pc 种子查询失败 (%s): %s", before_date, e)
-    try:                                    # 落盘缓存 (下次秒级)
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        np.savez_compressed(path, codes=np.asarray(list(out)),
-                            vals=np.asarray([out[c] for c in out]))
-    except OSError as e:
-        logger.debug("[frames] pc 缓存写盘失败: %s", e)
+    if ok and out:                           # A11: 失败/查空不落缓存 (下次重新取数)
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            np.savez_compressed(path, codes=np.asarray(list(out)),
+                                vals=np.asarray([out[c] for c in out]))
+        except OSError as e:
+            logger.debug("[frames] pc 缓存写盘失败: %s", e)
     return out

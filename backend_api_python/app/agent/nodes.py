@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 nodes.py — Graph 节点定义
 
@@ -96,21 +96,16 @@ def _skill_declared_tool_names(skill_name: str, skill_body: str = "") -> list:
 
     if skill_name:
         info = None
+        # 直接从 QDSkillAdapter 取（唯一事实源）。旧实现先尝试 `import agent` 取全局
+        # skills 实例，失败再回退到 QDSkillAdapter——两层取的是同一个东西，且
+        # `import agent as _agent_mod` 在 app.agent 包内语义模糊（可能指向 agent.py
+        # 模块而非包），重构时易断。QDSkillAdapter 是轻量适配器（只读 SKILL.md），
+        # 每次实例化无副作用，直接用即可。
         try:
-            import agent as _agent_mod
-            _ad = getattr(_agent_mod, "skills", None)
-            if _ad is None:
-                _ad = getattr(getattr(_agent_mod, "agent", None), "skill_adapter", None)
-            if _ad is not None:
-                info = _ad.get(skill_name)
+            from llm.qd_skills import QDSkillAdapter
+            info = QDSkillAdapter().get(skill_name)
         except Exception:
             info = None
-        if info is None:
-            try:
-                from llm.qd_skills import QDSkillAdapter
-                info = QDSkillAdapter().get(skill_name)
-            except Exception:
-                info = None
         for x in (getattr(info, "tools", None) or []):
             _push(str(x))
     src = skill_body or ""

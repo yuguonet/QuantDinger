@@ -56,6 +56,67 @@ M7 量比不是固定值, 会随时间变化 ⇒ 早盘量能应跟**最近几�
   若要保留该方向, 只能改口径 —— 尾盘(已知拉升)选股 + 次日开盘买, 而这条已被
   g56(17:25 dragon_scan 选当日涨停 -> 次日开盘入)覆盖, 无需另立门户。
   本文件保留完整实现与全部实证记录, 供后续接入封单/逐笔等更细粒度数据后重评。
+
+━━ 2026-09-28 追加: v7 —— 上面的"结构性不成立"**被推翻一半** ━━
+
+v6 的死结是**样本**: 它用事后定义的"当日盘中拉升涨停"事件集。换成**全市场无偏样本 +
+09:40 固定入场 + T+1 收盘出场**后, 日内均线类因子成立。完整过程见
+`analysis_output/领涨追击_重设计_v7_20260928.md`。
+
+[v7-0] 为什么必须 09:40 入场而不能更早
+  dev_40 = 09:40价 / (09:31~09:40 分时VWAP) − 1, 用到直到 09:40 的量价。
+  ⇒ **09:40 之前成交即前视**。延伸到更晚虽不再前视, 但信息已被定价:
+    alpha 09:40 +25.8bp/日(t=2.63) → 09:45 +16.7(1.75) → 09:50 +17.1(1.77)
+         → 09:55 +16.5(1.72) → 10:00 +13.6(1.41)
+  ⇒ 成交时点固定 **09:40 单点** (ScanSpec windows=("09:40","09:40"))。
+
+[v7-A] 规则 (全市场无偏, 09:40 已知, 无前视)
+  dev_40 同日截面排名前 N%  AND  近20日涨停次数=0  AND  早盘回撤<=1%
+  入场 09:40, 出场 D+1 收盘。三个输入在 09:40 时点全部可得。
+
+[v7-B] 切点定 60% (不是报告里的 40%)
+  按 dev_40 切前10%/20%/40%/60% 都显著, 但**把成交时点往后挪**时衰减速度不同:
+    前40%: 09:45 t=1.75 → 10:00 t=1.41 (掉出显著)
+    前60%: 09:45 t=2.47 → 10:00 t=1.93 (仍显著)
+  ⇒ 60% 抗时点漂移最强, beta 0.891 (前40% 0.993, 前10% 1.259 偏高)。
+  ⇒ dev40_pctile = 60.0
+
+[v7-C] 大盘门定为 mkt_gate = -0.3 (全市场等权均涨幅, 与 scan._mkt_gain 同口径)
+   无门   +39.6bp  日胜率63.2  t=3.10  跌日27
+   -0.5%  +50.0bp  日胜率67.4  t=2.61  跌日17
+   -0.3%  +53.6bp  日胜率66.7  t=2.54  跌日14   ← 取
+    0.0%  +45.9bp  日胜率67.7  t=2.18  跌日12
+  ⇒ 门控后**日超额几乎不变(22~24bp)**, 但绝对收益改善 = 纯粹避损, 值得做。
+
+[v7-D] 诚实预期 (不要拿 54.3% 当承诺)
+  54.3% 是 09:40 单点的峰值。同一套规则只改成成交时点: 09:45 52.5% / 10:00 51.5% /
+  09:35(公平口径) 50.8% ⇒ **可执行区间取 51.5%~52.5%**, 54.3% 只能当上限引用。
+  且所有报数是**毛口径**, 扣双边 20bp 后收益减 20bp、逐笔胜率降 2~3pp。
+
+[v7-E] daily_limit = 30
+  候选池(Top60% & zt20=0 & fade<=1% & 大盘门)后按 dev_40 排序:
+    Top10 +128.4bp(t=1.84) | Top20 +92.6(t=1.20) | Top30 +88.9(t=1.28) | Top50 +76.0(t=1.00)
+  TopK 越小单笔收益越高但天数越少、显著性越差; Top20~30 接近顶值且样本最多。
+
+[v7-F] ★ 流动性门槛必须关 (amt_lo = 0)
+  v7 报告 §4.4 的"成交额>=1亿更好(+68.2bp)"是**事后口径**: close*volume 要收盘才知道。
+  09:40 可用的任何代理都失效 (验证段 68 日, 同一套规则):
+    当日全天额>=1亿 [事后不可用]  +46.3bp  t=2.88
+    早盘09:40累计额>=2000万       +24.2bp  t=0.98
+    昨日全天额>=1亿               +25.3bp  t=1.19
+    前5日均额>=1亿                +25.5bp  t=1.24
+  ⇒ 真实判别力来自**当日**资金关注度, 盘中不可得。早盘累计额还会把样本推向"开盘爆量"
+    的消息票。⇒ v7 一律不加流动性门槛。
+
+[v7-G] v7 模式不套用旧规则的 gain_lo(当日涨幅>=2%) 预筛
+  v7 样本是**全市场无偏**(含下跌票)。加当日涨幅预筛会把样本退化成"已经涨过的票",
+  与验证口径不符 (且结构上接近 v6 被判伪的那条路)。实测其单笔收益更高(+60.3bp),
+  但样本只剩 11%、t 降到 1.62 ⇒ 不作为默认口径。
+
+⚠ 仍未启用 (enabled=false): ① 验证段仅 68 个交易日, 建议再攒 3~6 个月;
+  ② 纯多头无择时, 下跌日即使加门控仍可能绝对亏损; ③ **执行通道未就绪** ——
+  现有 auto/scan.py::run_scan_knife 是下午滚动设计 (终端 15:00 快照 + 每轮 purge),
+  早盘单点策略即便 enabled=true 也不会出信号, 需先解决编排 (见 2026-09-28 日志)。
 """
 from __future__ import annotations
 
@@ -69,8 +130,10 @@ STRATEGY_LABEL = "领涨追击"
 
 PARAMS = {
     # ── ① 入场时间窗 (M4/M5: 只做早盘, 9:30~10:00) ──
-    "min_hhmm": "09:35",        # 早于此时噪音未散 (9:30~9:40 冲高回落最多)
-    "max_hhmm": "10:00",        # M5: 早盘涨停优于下午
+    "min_hhmm": "09:35",        # 旧规则窗口下界 (rule_mode!=v7_dev40 时使用)
+    "max_hhmm": "10:00",        # 旧规则窗口上界 (M5: 早盘涨停优于下午)
+    "win_lo": "09:40",          # ★ v7 成交时刻下界 (见 [v7-0]: 早于此即前视)
+    "win_hi": "09:40",          # ★ v7 成交时刻上界 (晚于此 alpha 单调衰减)
     "noise_spike_pct": 3.0,     # 早盘冲高阈值 % (相对前收)
     "noise_fade_pct": 3.0,      # 从早盘高点回落超过该值 ⇒ 判定为冲高回落噪音, 剔除
     "noise_window_hhmm": "09:40",   # 早盘噪音观察截止时点
@@ -92,10 +155,10 @@ PARAMS = {
     "pool_pos20_lo": 40.0,      # 收盘处于20日区间的位置 % 下限
     "pool_ret60_hi": 100.0,     # 前60日涨幅 % 上限 (防过热)
     # ── ⑤ 大盘 / 流动性 ──
-    "mkt_gate": 0.0,            # 大盘当日涨幅下限 %
+    "mkt_gate": -0.3,           # 大盘当日均涨幅下限 % (见 [v7-C]: -0.5~-0.3 为稳健区间)
     "cap_lo": 20e8,             # 流通市值下限(元); 数据缺失 fail-open
     # ── 门控 / 生命周期 ──
-    "daily_limit": 10,
+    "daily_limit": 30,          # 见 [v7-E]: Top20~30 接近顶值且样本最多
     # ── ⑥ 出场 (M2/M4: T+1, 默认次日收盘卖) ──
     "exit_mode": "close",       # close=次日收盘 | open=次日开盘 | limit=挂单止盈
     "exit_limit_pct": 3.0,      # exit_mode=limit 时的挂单止盈 %
@@ -103,11 +166,12 @@ PARAMS = {
     # ── ⑦ v7 日内均线规则 (2026-09-28 实证, analysis_output/领涨追击_重设计_v7) ──
     # 只做 T+1; 09:40 口径; 推荐切点 前40%~60% (beta≈1, alpha t 最高)
     "rule_mode": "v7_dev40",   # off=旧规则 | v7_dev40=日内均线截面
-    "dev40_hhmm": "09:40",     # 取分时均线截止时刻
-    "dev40_pctile": 40.0,      # 同日截面取前 N% (按偏离从高到低)
+    "dev40_hhmm": "09:40",     # 取分时均线截止时刻 (VWAP 窗口 09:31~09:40)
+    "dev40_pctile": 60.0,      # ★ 同日截面取前 N% —— 定 60 的依据见 [v7-B] (抗时点漂移)
     "zt20_max": 0,             # 近20日涨停次数上限 (0=不许有)
-    "fade_max": 1.0,           # 早盘冲高回撤上限 %
-    "amt_lo": 1e8,             # 成交额下限 (元, 可选流动性)
+    "fade_max": 1.0,           # 早盘冲高回撤上限 % ((早盘高-现价)/昨收)
+    "amt_lo": 0,               # ★ 必须保持 0 —— 依据见 [v7-F] (全天额是事后变量)
+    "gain_lo_v7": False,       # ★ v7 是否套用当日涨幅>=gain_lo 预筛 (默认否, 见 [v7-G])
 }
 
 #: 创/科板涨跌幅缩放
@@ -173,19 +237,23 @@ def _vwap_dev(series, hhmm: str = "09:40") -> float:
         pv = vol = 0.0
         prev_v = 0.0
         last_px = None
+        # ★ 2026-09-28 修: 旧实现在 `hm < "09:31"` 分支里仍把该 bar 的 last 当现价
+        #   ⇒ 缺 09:40 bar 时会静默用 09:30 的价格。改为: 窗口外只更新"量基线",
+        #   不碰 last_px; 且窗口起点基线必须是 09:30 收盘累计量 (volume 是当日累计值,
+        #   若从 0 起算会把 09:30 的量按 09:31 的价计入 VWAP)。
         for r in series or []:
             ts = str(r.get("time") or "")
-            if len(ts) >= 16:
-                hm = ts[11:16]
-            else:
-                hm = ""
-            if hm < "09:31" or hm > cut:
-                # 仍取 09:40 前最后一笔 last
-                if hm and hm <= cut:
-                    last_px = float(r.get("last") or 0) or last_px
+            hm = ts[11:16] if len(ts) >= 16 else ""
+            if not hm:
                 continue
-            last_px = float(r.get("last") or 0) or last_px
             v = float(r.get("volume") or 0)
+            if hm < "09:31":
+                if v > 0:
+                    prev_v = v                  # 仅作窗口起点基线
+                continue
+            if hm > cut:
+                break
+            last_px = float(r.get("last") or 0) or last_px
             dv = max(0.0, v - prev_v)
             prev_v = v
             if dv > 0 and last_px > 0:
@@ -288,7 +356,8 @@ class LeadChaseStrategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
     entry_style = "lc"
-    scan_spec = ScanSpec(kind="intraday_window", windows=("09:35", "10:00"), interval_sec=60)
+    # ★ 单点窗口: dev_40 含到 09:40 的量价, 早成交=前视; 晚成交 alpha 衰减 (见 [v7-0])
+    scan_spec = ScanSpec(kind="intraday_window", windows=("09:40", "09:40"), interval_sec=60)
     default_params = dict(PARAMS)
     PROBE_STAGE_RANK = {"window": 1, "mkt": 2, "pool": 3, "noise": 4,
                         "volume": 5, "board": 6, "signal": 7}
@@ -308,8 +377,14 @@ class LeadChaseStrategy(StrategyBase):
         for snap in snaps.values():
             hhmm = _hhmm(snap.get("time") or "")
             break
-        if not (p["min_hhmm"] <= hhmm <= p["max_hhmm"]):
+        # 窗口: v7 用单点 win_lo~win_hi; 旧规则沿用 min_hhmm~max_hhmm
+        _v7 = str(p.get("rule_mode", "")).lower() == "v7_dev40"
+        lo, hi = (str(p.get("win_lo", "09:40")), str(p.get("win_hi", "09:40"))) \
+            if _v7 else (p["min_hhmm"], p["max_hhmm"])
+        if not (lo <= hhmm <= hi):
             return {}
+        # [v7-G] v7 是全市场无偏样本, 不能用当日涨幅先把下跌票筛掉
+        _skip_gain = _v7 and not bool(p.get("gain_lo_v7", False))
         out = {}
         for code, snap in snaps.items():
             if code.startswith(("8", "4", "92")):            # 北交所排除
@@ -324,7 +399,7 @@ class LeadChaseStrategy(StrategyBase):
             # 已封死 ⇒ 买不进
             if last >= round(pc * (1 + _limit_pct(code)), 2) * _AT_LIMIT:
                 continue
-            if (last / pc - 1) * 100 < p["gain_lo"] * _gain_scale(code):
+            if not _skip_gain and (last / pc - 1) * 100 < p["gain_lo"] * _gain_scale(code):
                 continue
             out[code] = snap
 
@@ -403,22 +478,27 @@ class LeadChaseStrategy(StrategyBase):
                     return []
             except Exception:
                 pass
-            # 近20日涨停 (bars 末根 = T-1, 避免用今日未完行情) —— 口径统一走 _zt_count
+            # 近20日涨停 —— 口径统一走 _zt_count。
+            # ★ 守卫: _zt_count 统计末根及其前 19 根, 若盘中路径把当日半成品日线一并给了
+            #   bars, 末根就是今天 ⇒ zt20 会含今日涨停 (既前视又与实证口径不符)。
+            #   实证 zt20 窗口是 T-1 及更早, 故此处显式剔掉当日 bar。
             try:
-                zt = _zt_count(bars, code, 20)
+                b20 = bars
+                if b20 and str(b20[-1].get("time") or "")[:10] == day:
+                    b20 = b20[:-1]
+                zt = _zt_count(b20, code, 20)
                 if zt > int(p.get("zt20_max", 0)):
                     if _tr:
                         _tr("signal", zt20=zt)
                     return []
             except Exception:
                 pass
-            # 流动性 (可选)
+            # ★ 流动性: 一律不过滤。见 [v7-F] —— 实证的"全天成交额>=1亿"是事后变量,
+            #   09:40 拿不到; 早盘累计额/昨日额/前5日均额等事前代理实测都把日 alpha
+            #   t 从 2.54 打到 0.7~1.2 (不显著)。amt_lo 仅保留参数位。
             try:
-                amt = last * float(snap.get("volume") or 0)
-                if float(p.get("amt_lo", 0) or 0) > 0 and amt > 0 and amt < float(p["amt_lo"]):
-                    if _tr:
-                        _tr("signal", amt=amt)
-                    return []
+                if _tr:
+                    _tr("signal", amt40=round(last * float(snap.get("volume") or 0), 0))
             except Exception:
                 pass
             # 截面切点: 优先 ctx["dev40_cut"]; 否则只记录 dev (单票无法自证分位)

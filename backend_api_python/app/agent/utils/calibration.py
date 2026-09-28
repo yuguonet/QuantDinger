@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+﻿﻿# -*- coding: utf-8 -*-
 """
 评分校准（方案 A1b，2026-09-26）：把工具输出的启发式 score(0-100) 映射到
 P(方向正确=hit_rate) —— 用 sklearn IsotonicRegression 拟合 qd_agent_traces 历史 (score, correct)。
@@ -54,7 +54,13 @@ def get(skill_name: str) -> Optional[Dict[int, float]]:
                 SELECT skill_name, weight, sample_count FROM qd_agent_weights
                 WHERE layer = %s AND name = %s AND sample_count >= 1
             """, (_CALIBRATION_LAYER, skill_name))
-            for score_str, hit_rate, cnt in cur.fetchall():
+            # 行是 RealDictRow（app.utils.db 游标 = RealDictCursor），按列名取。
+            # 曾按位置解包拿到列名字符串 → int(float("skill_name")) 恒 ValueError →
+            # continue → mapping 恒空 → 校准分永远返回 None（静默降级，无日志）。
+            for _crow in cur.fetchall():
+                score_str = _crow["skill_name"]
+                hit_rate = _crow["weight"]
+                cnt = _crow["sample_count"]
                 try:
                     score = int(float(score_str))
                 except (ValueError, TypeError):

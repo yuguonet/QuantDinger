@@ -164,9 +164,11 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
         if h > peak:
             peak = h
 
+    data_exhausted = False
     for d in range(1, hold_days + 1):
         idx = entry_idx + d - 1
         if idx >= n:
+            data_exhausted = True
             break
         if stop_at_idx is not None and idx > stop_at_idx:
             capped = True
@@ -180,6 +182,10 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
 
         if pending_dn:
             exit_p, exit_d, _exit_reason = float(b.get("open") or 0), d, "跌停顺延开盘"
+            # A7 (2026-09-28): 此分支已实际成交 —— 必须清 pending_dn/last_unfilled,
+            # 否则尾块 (last_unfilled or pending_dn) 视为仍未成交再顺延一次,
+            # 出场推后 2 个交易日 (break.py 自研引擎同病灶, 其 :774 注释早有记载)。
+            pending_dn = last_unfilled = False
             break
 
         # 策略专属早退 (V1 动量等) — 不在本引擎解释语义
@@ -232,9 +238,12 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                 _exit_reason = (f"追踪止损{trail_pct}%" if trig_t >= trig_s else f"止损{stop_loss}%")
                 break
 
-        exit_p = float(b.get("close") or 0)
-        exit_d = d
-        _exit_reason = "持仓到期"
+            # A7a (2026-09-28): 到期收盘出场同样受 min_d 守卫 —— 原来在 `if d >= min_d`
+            # 之外, d<min_d 也会按当日收盘卖 (hold_days=1 即入场当日卖出),
+            # 违反 spec.intraday_t0 语义 (A股 T+1: 最早 d=2 可卖)。
+            exit_p = float(b.get("close") or 0)
+            exit_d = d
+            _exit_reason = "持仓到期"
 
     if (last_unfilled or pending_dn) and not capped:
         nxt = entry_idx + exit_d + 1
@@ -246,7 +255,18 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                 nxt += 1
                 continue
             exit_p, exit_d, _exit_reason = float(nb.get("open") or 0), nxt - entry_idx + 1, "跌停顺延开盘"
+            # A7: 尾块顺延成交后同样清标志, 供下方最终校验识别"已实际出场"。
+            last_unfilled, pending_dn = False, False
             break
+
+    # A7b (2026-09-28): 统一"视野不足 → None"语义 (模块头契约 + run_hold_stop 的
+    # `if i>=n: return None`)。视野尽头未实际成交的三种情形 —— 数据尽头假到期
+    # (data_exhausted)、末段连续一字跌停无处可卖 (标志仍置位)、hold_days<min_d
+    # 整个视野不可卖 (_exit_reason 为空) —— 一律返回 None 由调用方跳过该笔,
+    # 不再把数据尽头当正常到期计入统计 (胜率/均收被污染且与 g56 口径不可比)。
+    # capped 是调用方主动截断重放 (stop_at_idx), 保留原 open=True 语义不受影响。
+    if not capped and (data_exhausted or _exit_reason == "" or last_unfilled or pending_dn):
+        return None
 
     result = {
         "exit_price": round(exit_p, 3), "exit_day": exit_d,

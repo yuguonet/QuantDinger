@@ -215,31 +215,48 @@ def _strategy_meta(key):
         return None
 
 
-def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = (), max_retries: int = 5):
+def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = (), max_retries: int = 5,
+                        strategies: tuple = ()):
     """扫描结果写入 (幂等): rows 为各策略今日信号列表, 行内带 strategy 键。
 
-    扫描是 watch_pending 状态的权威来源: 先清空该 trade_date 的旧 watch_pending
+    扫描是 watch_pending 状态的权威来源: 先清该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
     行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
     (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
     purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
       (tail_oversold 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
        股票须删行, 否则残留误导用户; 仅清 buy_today 态, 不碰已转移的 holding 等)。
+    strategies: 本批扫描的策略范围 (修 M12)。前置 DELETE 只清这些策略的
+      watch_pending——不带范围时会把同 trade_date 其它策略的盘后信号整批删掉
+      且不补回 (盘后扫描先写、之后任何 _scan_cycle 预览轮都会丢信号)。空 tuple
+      时从 rows 推断; rows 也为空 → DELETE 0 行 (安全方向: 宁多留不误删)。
+
+    ⚠️ 2026-09-28 修 A1 (资金事故红线): ON CONFLICT 的 state/extra 加 CASE 守卫
+    ——monitor 已推进的行 (entry_date 非空: buy_today/holding/exit) 不得被补扫
+    的新信号行回滚 state 或冲掉 extra (t_legs_today/pre_confirm 等运行时字段)。
+    D+1 白天重启后端自动补扫 (_target_date=上一交易日) 最易触发: 行被回滚
+    watch_pending 后过窗无人推进 → 次日 stale 扫成 expired「隔日未处理」→
+    已买入持仓不再提示卖出。
 
     瞬态冲突重试 (2026-09-18 事故修复②): 并发 DELETE+INSERT (调度重启补跑触发
     deadlock_detected / 序列化失败) 会整事务回滚丢信号 — 此处捕获 40P01/40001 后
     退避重试, 保证最终写入 (操作幂等, 重试安全)。
     """
     from app.utils.db import get_db_connection
+    # M12: DELETE 策略范围 (显式传入优先, 否则从 rows 推断; 都空 → 删 0 行)
+    scope = sorted({str(s) for s in strategies if s}) or \
+        sorted({str(r.get("strategy") or DRAGON_STRATEGY) for r in rows})
     last_err = None
     for _attempt in range(1, max_retries + 1):
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute(
-                    f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s AND state = %s",
-                    (trade_date, S_WATCH_PENDING),
-                )
+                if scope:
+                    cur.execute(
+                        f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s AND state = %s "
+                        f"AND strategy = ANY(%s)",
+                        (trade_date, S_WATCH_PENDING, scope),
+                    )
                 purged = cur.rowcount
                 if purge_buy_today:
                     # 2026-09-26: 只清「预览未定价」行; 已写 entry_price 的 buy_today
@@ -265,10 +282,22 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, NOW())
                         ON CONFLICT (trade_date, strategy, code, entry_style) DO UPDATE SET
-                            name = EXCLUDED.name, score = EXCLUDED.score, state = EXCLUDED.state,
+                            name = EXCLUDED.name, score = EXCLUDED.score,
                             signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
                             lu_date = EXCLUDED.lu_date, pullback_days = EXCLUDED.pullback_days,
-                            extra = EXCLUDED.extra, updated_at = NOW()
+                            updated_at = NOW(),
+                            -- A1 守卫 (2026-09-28): 已推进行 (entry_date 非空) 保留原
+                            -- state 与 extra——补扫新信号行不得回滚生命周期状态,
+                            -- 不得冲掉 monitor 运行时字段 (t_legs_today/pre_confirm/marked)。
+                            -- ⚠ 2026-09-28 核验修正: DO UPDATE 里引用"已存在的行"必须用
+                            -- **真表名** (此处 = {_SIGNALS_TABLE}, 由 f-string 展开)。写死短
+                            -- 表名前缀会让 Pg 报 missing FROM-clause entry ⇒
+                            -- upsert_scan_signals 整条路径抛 UndefinedTable, 全策略信号无法
+                            -- 落库 (比修前的覆盖更严重)。表名单一事实源 = 同名常量。
+                            state = CASE WHEN {_SIGNALS_TABLE}.entry_date IS NOT NULL
+                                         THEN {_SIGNALS_TABLE}.state ELSE EXCLUDED.state END,
+                            extra = CASE WHEN {_SIGNALS_TABLE}.entry_date IS NOT NULL
+                                         THEN {_SIGNALS_TABLE}.extra ELSE EXCLUDED.extra END
                     """, (
                         trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
                         s.get("style", "a"), int(s.get("score", 0)), state,
@@ -297,17 +326,30 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
 
 
 def set_state(sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol_r=None,
-              entry_date=None, entry_price=None, exit_reason=None, exit_date=None, exit_price=None):
-    """状态转移 (单条)。"""
+              entry_date=None, entry_price=None, exit_reason=None, exit_date=None, exit_price=None,
+              expect_state=None, only_unexited=False):
+    """状态转移 (单条)。返回受影响行数 —— 0 = 守卫拦截, 写入未发生。
+
+    条件写入守卫 (2026-09-28 修 A3, 见 _set_state):
+      expect_state: 旧快照写入方必传 (调用行的快照态), 行已被并发推进则拦截;
+      only_unexited: 出场类标记写入必传, 防覆盖已有出场价/出场原因 (资金事实)。
+    被拦截时记 WARNING —— 该日志出现即说明存在基于过期快照的写入竞争, 应排查调用方。
+    """
     from app.utils.db import get_db_connection
     with get_db_connection() as db:
         cur = db.cursor()
-        _set_state(cur, sig_id, state, detail=detail, confirm_date=confirm_date,
-                   d1_chg=d1_chg, d1_vol_r=d1_vol_r, entry_date=entry_date,
-                   entry_price=entry_price, exit_reason=exit_reason,
-                   exit_date=exit_date, exit_price=exit_price)
+        n = _set_state(cur, sig_id, state, detail=detail, confirm_date=confirm_date,
+                       d1_chg=d1_chg, d1_vol_r=d1_vol_r, entry_date=entry_date,
+                       entry_price=entry_price, exit_reason=exit_reason,
+                       exit_date=exit_date, exit_price=exit_price,
+                       expect_state=expect_state, only_unexited=only_unexited)
         db.commit()
         cur.close()
+    if n == 0 and (expect_state is not None or only_unexited):
+        logger.warning("[store.set_state] 写入被守卫拦截: id=%s 拟写=%s expect_state=%s "
+                       "only_unexited=%s (行已被并发推进, 旧快照写入已丢弃)",
+                       sig_id, state, expect_state, only_unexited)
+    return n
 
 
 def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信号作废",
@@ -416,7 +458,19 @@ def update_stop_price(sig_id, stop_price):
 
 
 def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol_r=None,
-               entry_date=None, entry_price=None, exit_reason=None, exit_date=None, exit_price=None):
+               entry_date=None, entry_price=None, exit_reason=None, exit_date=None, exit_price=None,
+               expect_state=None, only_unexited=False):
+    """构建并执行状态 UPDATE, 返回受影响行数。
+
+    A3 条件写入守卫 (2026-09-28):
+      - expect_state: WHERE 附加 `AND state = %s` —— 调用方持有的快照态与库内当前态
+        一致才写。monitor 的 run_monitor 每 tick 开头批量取行快照, step2/3/4 共用同一份;
+        step2 盘中可把 buy_today/holding 打成 exit_today, 若 step3/4 仍按快照无条件回写,
+        会把同 tick 刚做出的出场回滚 (出场价/原因丢失后该行永不回归出场态)。
+      - only_unexited: WHERE 附加 `AND COALESCE(exit_reason,'')=''` —— 出场标记
+        (盘中止损/live 出场/收盘重放) 一经写入即资金事实, 后续写入不得覆盖。
+    无守卫的调用 (调度路径的状态推进, 先按 id 查后写) 不受影响; 返回 0 供调用方感知拦截。
+    """
     sets = ["state = %s", "updated_at = NOW()"]
     vals = [state]
     for col, v in (("confirm_date", confirm_date), ("d1_chg", d1_chg), ("d1_vol_r", d1_vol_r),
@@ -428,8 +482,15 @@ def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, 
     if detail is not None:
         sets.append("extra = extra || %s")
         vals.append(json.dumps(detail, ensure_ascii=False, default=str))
+    conds = ["id = %s"]
     vals.append(sig_id)
-    cur.execute(f"UPDATE {_SIGNALS_TABLE} SET {', '.join(sets)} WHERE id = %s", vals)
+    if expect_state is not None:
+        conds.append("state = %s")
+        vals.append(expect_state)
+    if only_unexited:
+        conds.append("COALESCE(exit_reason, '') = ''")
+    cur.execute(f"UPDATE {_SIGNALS_TABLE} SET {', '.join(sets)} WHERE {' AND '.join(conds)}", vals)
+    return cur.rowcount
 
 
 def list_signals(states=None, trade_date=None, days=20, only_active=False,

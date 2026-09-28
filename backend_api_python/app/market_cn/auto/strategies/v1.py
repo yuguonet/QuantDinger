@@ -472,3 +472,105 @@ def _exit_v1_combo(bars, entry_idx, entry_price, *, code, board_type, params, di
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
 _register_exit("v1_combo", _exit_v1_combo)
+
+
+# ================================================================
+# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# ----------------------------------------------------------------
+# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
+# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
+# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
+# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
+#    analysis_output/auto架构分层_20260928.md
+# ================================================================
+
+from typing import Any, Dict, List
+from app.market_cn.auto.core.entry_modes import resolve_entry
+from app.market_cn.auto.core.exit_modes import run_exit
+from app.market_cn.auto.core.filters import unified_prefilter
+from app.market_cn.auto.core.runtime.flows import register_day_flow
+
+def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilter):
+    """门表版 V1 全历史回测，返回 trades 列表（与 v1.backtest_stock 逐笔等价）。
+
+    编排逐字镜像 v1.backtest_stock：逐日候选判定（门表求值）→ U1~U4 锚定 D0 →
+    入场=entry_modes(open + gap 过滤) → 出场=exit_modes(v1_combo，含 V1 动量 D2 清仓)。
+    v1 原版无去重 ±4（本路径不施加）；起点/最小长度由 meta.day_start / day_min_n 声明。
+    """
+    n = len(bars)
+    if n < int(spec.meta.get("day_min_n", 30)):
+        return []
+    _p = spec.params
+    trades: List[Dict[str, Any]] = []
+
+    for i in range(int(spec.meta.get("day_start", 25)), n - 1):
+        # D0 逐日判定（门表一次性求所有门，与 scan_signals 同一逻辑）
+        ok, _ = ev.evaluate_all(bars, i, _p)
+        if not ok:
+            continue
+
+        # U1~U4（信号日 D0 锚定，v1 prefilter_anchor='signal'）
+        if use_prefilter:
+            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
+            if not ok:
+                continue
+
+        # 入场 = entry_modes（open + gap 过滤；阈值来自 YAML entry 块，可引用 params 名）
+        d0 = bars[i]
+        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
+        if site is None:
+            continue
+        entry_idx = site["entry_idx"]
+        entry_price = site["entry_price"]
+        entry_date = site["entry_date"]
+        d1_gap = site["diag"]["d1_gap"]
+        d1_change = site["diag"]["d1_change"]
+
+        # 信号附字段（与 _signal_to_legacy_dict + backtest_stock 完全一致）
+        d_1 = bars[i - 1]
+        d_2 = bars[i - 2]
+        # 20 日收益 (信号展示字段; 与 v1 参考版同式)。⚠ 2026-09-28 审计 P2: 原无零值守卫,
+        # 参照 close<=0 的脏数据会在此抛 ZeroDivisionError 打断整轮回测 (v1.py:119 有守卫)。
+        _ref20 = float(bars[i - 20]["close"])
+        ret_20d = (float(d0["close"]) / _ref20 - 1) * 100 if _ref20 > 0 else None
+        d_1_change = (float(d_1["close"]) / float(d_2["close"]) - 1) * 100
+        circ = float((stock_info or {}).get("circ_shares") or 0)
+        total = float((stock_info or {}).get("total_shares") or 0)
+        sig = {
+            "code": code,
+            "board": get_board_name(code, spec.market_spec),
+            "path": "v1",
+            "path_label": "V1",
+            "d0_date": d0["time"],
+            "d0_close": round(float(d0["close"]), 3),
+            "ret_20d": round(ret_20d, 2) if ret_20d is not None else None,
+            "d_1_change": round(d_1_change, 2),
+            "turnover_anchor": round(float(d0["volume"]) / circ * 100, 2) if circ > 0 else None,
+            "turnover_anchor_total": round(float(d0["volume"]) / total * 100, 2) if total > 0 else None,
+            "buy_mode": "next_open",
+        }
+
+        # 出场 = exit_modes（v1_combo；成交语义见 core/exec.py，只此一份）
+        d1 = bars[i + 1]
+        diag = dict(site["diag"])
+        diag["d1_limit_up"] = is_limit_up(float(d1["close"]), float(d0["close"]),
+                                        board_type, spec.market_spec)
+        bt = run_exit(spec.exit.get("mode", "v1_combo"), bars=bars, entry_idx=entry_idx,
+                      entry_price=entry_price, code=code, board_type=board_type,
+                      params=_p, diag=diag)
+        if not bt:
+            continue
+
+        trades.append({
+            **sig,
+            "entry_date": entry_date,
+            "entry_price": round(entry_price, 3),
+            "buy_mode": "next_open",
+            "d1_change": round(d1_change, 2),
+            "d1_gap": round(d1_gap, 2),
+            "intraday": round(d1_change - d1_gap, 2),
+            **bt,
+        })
+    return trades
+
+register_day_flow("v1", _backtest_day_flow)

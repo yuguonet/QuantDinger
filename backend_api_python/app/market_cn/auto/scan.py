@@ -297,7 +297,9 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     if len(rows) != _n_raw:
         logger.info("[dragon_scan] 同族去重+限额截断: %d → %d", _n_raw, len(rows))
 
-    result = store.upsert_scan_signals(target, rows)
+    # M12: 显式声明本批策略范围 —— 前置 DELETE 只清这些策略的 watch_pending,
+    # 不依赖 rows 推断 (0 信号时也要把本轮落选的旧 watch_pending 清掉)。
+    result = store.upsert_scan_signals(target, rows, strategies=tuple(active))
     store.sync_watchlist_group(store.get_active_signals())
     store.cleanup_old(days=15)
     logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs)",
@@ -422,7 +424,8 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
         # 滚动重判: 清掉本批策略上一轮命中本轮落选的 buy_today 行 (防残留误导);
         # 仅清 buy_today 态, 不碰 15:01 确认后已转移的 holding/exit 等状态
         result = store.upsert_scan_signals(
-            today, rows, purge_buy_today=tuple(cycle_strats.keys()))
+            today, rows, purge_buy_today=tuple(cycle_strats.keys()),
+            strategies=tuple(cycle_strats.keys()))
         if not preview_cycle and not rows:
             logger.info("[knife_scan] 终审 0 笔 → purge 预览 buy_today (策略=%s); "
                         "预览曾命中的票不会留在库里",

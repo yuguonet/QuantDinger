@@ -86,8 +86,13 @@ def market_keys() -> List[str]:
 
 
 def load_market(key: str, refresh: bool = False) -> MarketSpec:
-    """加载（并缓存）一个市场。未知 key → KeyError（fail-fast，不猜）。"""
-    k = str(key or "A").strip() or "A"
+    """加载（并缓存）一个市场。未知 key → KeyError（fail-fast，不猜）。
+
+    ⚠️ 2026-09-28 修 X0：key 归一为小写——market_keys() 返回磁盘文件名
+    （小写），调用方历史上传 "A"（如 L113 import 注入、冻结插件硬编码），
+    Windows 大小写不敏感侥幸能跑，Linux import 即 KeyError 炸穿门表引擎。
+    """
+    k = (str(key or "a").strip().lower()) or "a"
     if not refresh and k in _CACHE:
         return _CACHE[k]
     path = os.path.join(MARKETS_DIR, f"{k}.yaml")

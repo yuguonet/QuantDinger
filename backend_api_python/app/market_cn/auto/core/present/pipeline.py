@@ -162,7 +162,10 @@ def plan_gates_cached(key: str, offset: int, gates_sig: tuple) -> Tuple[Tuple[st
     """缓存友好版门分组 (只依赖 (key, offset, 门签名)) —— 纯函数, 可跨调用复用。"""
     night, day = [], []
     for gid, expr in gates_sig:
-        (night if not reads_decision_bar(expr) else day).append(gid)
+        # M14 (2026-09-28): 必须传 key —— functions.declared_d0_dep 只在传 key 时查
+        # STRATEGY_GATE_D0[key] (策略命名空间 D0 声明); 漏传则声明失效, 划分口径与
+        # audit_needs_d0 (带 spec.key) 分叉。
+        (night if not reads_decision_bar(expr, key) else day).append(gid)
     return tuple(night), tuple(day)
 
 
@@ -255,10 +258,19 @@ def _g56_pool_batch(pool_target: Optional[str],
     同口径 (同窗口/同复权/同截断), 否则横截面统计漂移 → 门判定不再等价 (逐笔等价前提)。
 
     取数优先级:
-      ① 从**共享 BarsCache 切片** (days=300 缓存按 window_start(200) 切) —— 因为
-         `fetch_kline_db(code,200)` 的定义就是 300 窗口的下界切片, 二者逐行一致,
-         却省掉池的第二次全市场加载 (展示管线夜间的主要超支源);
-      ② 缓存不覆盖 (未预热/口径不足) → 独立批量加载一次。
+      ① 从**共享 BarsCache 切片** (days=300 缓存按 window_start(200, pool_target) 切) ——
+         因为 `fetch_kline_db(code,200,as_of=T)` 的定义就是同锚 300 窗口的下界切片,
+         二者逐行一致, 却省掉池的第二次全市场加载 (展示管线夜间的主要超支源);
+      ② 缓存窗口不覆盖切片 (未预热 / asof 过旧或过新) → 独立批量加载一次。
+
+    易错点 (A9, 2026-09-28): 切片锚与覆盖判据**必须用 pool_target**, 不能锚 now ——
+    原实现 lo=window_start(200) 锚在 now, pool_target 为历史日 (verify_split / 逐日
+    replay) 时窗口错位截短 → 池统计漂移 → g56 regime 门静默全 False (零信号)。
+    切片等价的前提是缓存窗口 [window_start(cache.days, asof), asof] 完整包含
+    [window_start(200, pool_target), pool_target]: 右缘 = asof >= pool_target,
+    左缘 = window_start(cache.days, asof) <= window_start(200, pool_target)
+    (即 asof 距 pool_target 不超过 (cache.days-200)*1.5 自然日, 勿写死数值, 用
+    window_start 比较保持口径同源)。未覆盖或切片意外全空都走 ② 权威取数。
     """
     if not pool_target:
         return None
@@ -268,10 +280,13 @@ def _g56_pool_batch(pool_target: Optional[str],
         all_codes as _all_codes, fetch_klines_batch, window_start,
     )
     codes = [c for c in _all_codes() if not c.startswith(("8", "4", "92"))]
+    lo = window_start(_G56_POOL_DAYS, pool_target)      # A9: 锚=pool_target (原错锚 now)
     bars = None
-    if cache is not None and (not cache.asof or cache.asof >= pool_target):
+    # 右缘: cache.asof 为 None 表示无截断 (行集到今天, pool_target 恒 <= 今天) → 视为过
+    # 左缘: 缓存窗口下界须不晚于切片下界, 否则切片左端截短 (历史 replay 时必不覆盖)
+    if cache is not None and (not cache.asof or cache.asof >= pool_target) \
+            and window_start(cache.days, cache.asof) <= lo:
         cache.warm(codes)                     # 保证全市场在共享缓存内 (池口径完整)
-        lo = window_start(_G56_POOL_DAYS)
         bars = {}
         for c in codes:
             bs = cache.get(c)
@@ -280,7 +295,7 @@ def _g56_pool_batch(pool_target: Optional[str],
             sl = [b for b in bs if lo <= b["time"] <= pool_target]
             if sl:
                 bars[c] = sl
-    if bars is None:
+    if not bars:   # None(未走切片) 或 {}(切片意外全空) 都走权威取数, 不信任残缺结果
         bars = fetch_klines_batch(codes, days=_G56_POOL_DAYS, as_of=pool_target)
     _G56_POOL_BARS["date"], _G56_POOL_BARS["bars"] = pool_target, bars
     return bars
@@ -290,7 +305,7 @@ def _g56_pool_batch(pool_target: Optional[str],
 def _ext_g56(spec: StrategySpec, code: str, bars: List[Dict[str, Any]],
              asof_date: Optional[str],
              cache: Optional["BarsCache"] = None) -> Dict[str, Any]:
-    """g56: 每股 G1 特征数组 + 当日横截面池 (逐字镜像 _run_backtest_day_g56 的 ext)。
+    """g56: 每股 G1 特征数组 + 当日横截面池 (逐字镜像 strategies/g56.py 的 day_flow 编排 ext)。
 
     硬要求 len(bars) >= 35 (g56._g1_arrays 依赖 calc_macd, 短序列返 None) —— 已由
     `required_min_len("g56")` 在管线侧保证; 语义上的暖机要求 (>=68) 由 g1_warmup 门
@@ -367,7 +382,11 @@ class BarsCache:
             bars = self._loader(code, self.days)
         else:
             from app.market_cn.auto.core.data.kline import fetch_kline_db
-            bars = fetch_kline_db(code, self.days)
+            # M15 (2026-09-28): 必须与 warm() 同锚 (as_of=self.asof)。原实现锚=now,
+            # asof 为历史日期时 "warm 过的票"([asof-450d, asof]) 与 "惰性补载的票"
+            # ([now-450d, now] 再截 asof) 历史长度不同 → MA/MACD/最小根数门槛、
+            # _g56_pool_batch 切片等价性全受影响 (kline._window_bounds A1 同款坑)。
+            bars = fetch_kline_db(code, self.days, as_of=self.asof)
         if not bars:
             return []
         if self.asof:
@@ -736,8 +755,11 @@ def verify_split(spec: StrategySpec, bars: List[Dict[str, Any]], code: str,
     split_lu: Optional[int] = None
     split_failed: List[str] = []
     for lu in night_pass:                      # 升序 → 首个日门通过者
+        # M18 (2026-09-28): day 门在全量**真实** bars 上求值, ext 必须同源 (_ext 由
+        # 真实 bars / 调用方预传构建); 原实现传 n_ext (夜侧占位 D0 bar 构建), 对声明
+        # meta.ext 且 offset=0 的策略, 日侧特征来自占位 → 自检产假 ok/假 bad。
         ctx = Ctx(bars, i, lu, spec.params, board_type=bt, code=code,
-                  stock_info=stock_info, ext=n_ext, market=spec.market_spec)
+                  stock_info=stock_info, ext=_ext, market=spec.market_spec)
         ok, failed = evaluate_gates(spec, plan.day, ctx)
         if ok:
             split_lu = lu

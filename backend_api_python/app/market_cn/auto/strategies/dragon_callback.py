@@ -5,7 +5,8 @@ DRAGON_CB_PARAMS 为 facade 转发 (test_dragon.py / dragon_scan / dragon_monito
 
 规则框架 (2026-09-06 与 test_dragon.py 同步; 2026-09-16 消融调参, 依据 tmp/dragon_ablation.py):
   找龙(滑动窗口涨停占比>=70%) → 回调 gap[5,7] → 拐点OR(深跌释放 | 阳线承接;
-  MA20支撑腿已参数关闭) → 龙强度(连板>=3 | 20日涨幅>=60 | RSI6>=45)
+  MA20支撑腿已参数关闭) → 龙强度(连板>=2 | 20日涨幅>=60 | RSI6>=45; 连板度量
+  2026-09-28 A6 修复为真实口径, 修复前 ms=3 实际=真实>=2)
   → 信号质量(D0跌幅>-4%企稳; 阴线/RSI6<30/距MA20<-8 三排除门已参数关闭)
   → U1~U4(@涨停日) → D1开盘买 (gap 范围过滤 09-07 移除)
   出场: 分段追踪(-8/-3) + 固定止损-8 + 峰值逃顶 + 到期7天
@@ -76,7 +77,10 @@ DRAGON_CB_PARAMS = dict(
     #     老市场段(2024-06~2025-02)23.5%/-16.3pp, 近市场段也仅44.4% — 300d 结论是
     #     强市场环境偏差。用户裁定回退3。注意: 本策略 600d 前段(2024下半年)各变体均
     #     负收益, 属策略级环境失效而非参数问题。 ---
-    min_streak=3,        # 锚定涨停日连板高度>=3 ("龙"的最低成色)
+    # A6 (2026-09-28): _lu_streak off-by-one 修复后度量回归真实连板高度, 3→2 保持
+    # 实际行为不变 (旧 buggy ms=3 恰好等价真实>=2, 600d 逐笔等价 167/167 实证)。
+    # 注意: 下方 09-10/09-16 历史结论均在 buggy 度量上得出, 其"streak<=2伪龙"实为真实<=1板。
+    min_streak=2,        # 锚定涨停日真实连板高度>=2 ("龙"的最低成色; 修复前 ms=3 的实际效果)
     lu_gain20_min=60.0,  # 涨停日20日涨幅>=60% (前期热度; >=100更好但样本锐减)
     rsi6_min=45.0,       # D0 RSI6>=45 (强势回调; rsi6_exclude_lt 已停用, 下界即此值)
     # 三条件合计实测 (09-10): 600d 334→167笔 胜率48.8→51.5% 均收-0.13→+1.09 均峰7.68→9.0
@@ -119,9 +123,17 @@ DRAGON_CB_PARAMS = dict(
 
 
 def _lu_streak(bars, lu_idx, board_type) -> int:
-    """涨停日连板高度 (含涨停日本身, 向前连续涨停计数)。"""
+    """涨停日连板高度 (含涨停日本身, 向前连续涨停计数): L板返回L。
+
+    易错点 (A6, 2026-09-28 修复): 初值 1 已计涨停日本身, 循环必须从 j=lu_idx-1 起步 ——
+    原实现 j=lu_idx 起步, 首轮 is_limit_up(bars[lu_idx], bars[lu_idx-1]) 恒真再 +1,
+    返回值恒 = 真实+1 (1板报2), 展示字段/落库/前端跟着虚高, min_streak 语义错位一档
+    (历史 min_streak=3 实际只拦真实1板)。600d 验证: 修复+ms=2 与旧行为逐笔等价
+    167/167, 真实分桶: 1板 35.9%/+0.02 (垃圾桶), 2板 50%/+1.25, 3板 52.9%/+2.58
+    (tmp/verify_a6_streak.py)。
+    """
     streak_h = 1
-    j = lu_idx
+    j = lu_idx - 1
     while j > 0 and is_limit_up(bars[j]["close"], bars[j - 1]["close"], board_type):
         streak_h += 1
         j -= 1
@@ -989,3 +1001,126 @@ def _exit_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag)
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
 _register_exit("combo", _exit_combo)
+
+
+# ================================================================
+# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# ----------------------------------------------------------------
+# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
+# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
+# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
+# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
+#    analysis_output/auto架构分层_20260928.md
+# ================================================================
+
+# ⚠ 本模块顶层用的是 **common.market** 的 find_limit_ups/get_board_name
+#    (生产链口径); 该编排必须与 core/runtime/evaluate.py 原实现同源 →
+#    显式取 **core.market** 并别名导入。两套同名实现不可混用。
+from typing import Any, Dict, List, Tuple
+
+from app.market_cn.auto.core.exit_modes import run_exit
+from app.market_cn.auto.core.filters import unified_prefilter
+from app.market_cn.auto.core.market import find_limit_ups as _core_find_limit_ups
+from app.market_cn.auto.core.market import get_board_name as _core_get_board_name
+from app.market_cn.auto.core.runtime.flows import register_enum_flow
+
+def _backtest_limit_up(bars, code, spec, ev, board_type, stock_info, use_prefilter):
+    """门表版龙回头全历史回测，返回 trades 列表（与 dragon_callback.backtest_stock 逐笔等价）。
+
+    编排逐字镜像 backtest_stock：枚举候选日 → 廉价预筛 → 资格门 → 遍历 lu_idx 取首个通过
+    → 去重±4 → unified_prefilter → 入场=entry_modes(close) → 出场=exit_modes(exit.mode)。
+    """
+    n = len(bars)
+    if n < 5:
+        return []
+    lu_all = _core_find_limit_ups(bars, board_type, spec.market_spec)
+    pd_min = int(spec.params["min_pullback_days"])
+    pd_max = int(spec.params["max_pullback_days"])
+    params = spec.params
+    trades: List[Dict[str, Any]] = []
+    used_ranges: List[Tuple[int, int]] = []
+
+    for i in range(2, n - 1):
+        # 廉价预筛（数学必要条件超集；与 backtest_stock 同源）
+        if not any(pd_min + 1 <= i - j <= pd_max + 1 for j in lu_all):
+            continue
+        # 资格门（与 lu_idx 无关）
+        ok, _ = ev.evaluate_prefilter(bars, i, params)
+        if not ok:
+            continue
+        # 遍历 lu_idx（升序；首个通过即出信号 —— 与 scan_signals 同语义）
+        lu_cands = [j for j in lu_all if j < i]
+        chosen = None
+        for lu_idx in lu_cands:
+            ok, _ = ev.evaluate_decision(bars, i, lu_idx, params)
+            if ok:
+                chosen = lu_idx
+                break
+        if chosen is None:
+            continue
+        lu_idx = chosen
+        # 去重（±4 天内跳过）
+        skip = False
+        for (s, e) in used_ranges:
+            if abs(i - s) <= 4 or abs(i - e) <= 4:
+                skip = True
+                break
+        if skip:
+            continue
+        used_ranges.append((lu_idx, i))
+        # U1~U4 预过滤（锚定涨停日）
+        if use_prefilter and lu_idx > 0:
+            ok, _ = unified_prefilter(bars, lu_idx, code, stock_info, spec.market_spec)
+            if not ok:
+                continue
+        # 入场 = D0(反转日)收盘价
+        d0 = bars[i]
+        d1 = bars[i + 1]
+        entry_price = float(d0["close"] or 0)
+        if entry_price <= 0:
+            continue
+        result = run_exit(spec.exit.get("mode", "combo"), bars=bars, entry_idx=i,
+                          entry_price=entry_price, code=code, board_type=board_type,
+                          params=spec.params, diag={})
+        if not result:
+            continue
+        # 信号附带字段（与 _signal_to_legacy_dict + scan_signals.extra 完全一致）
+        d_prev = bars[i - 1]
+        d_prev2 = bars[i - 2]
+        prev_chg = (float(d_prev["close"]) / float(d_prev2["close"]) - 1) * 100 \
+            if float(d_prev2.get("close") or 0) > 0 else 0.0
+        prev_vol = float(d_prev["volume"]) / float(d_prev2["volume"]) \
+            if float(d_prev2.get("volume") or 0) > 0 else 0.0
+        sig = {
+            "code": code,
+            "board": _core_get_board_name(code, spec.market_spec),
+            "path": spec.key,
+            "path_label": spec.meta.get("name", spec.key),
+            "lu_date": bars[lu_idx]["time"],
+            "pullback_days": (i - 1) - lu_idx,
+            "signal_date": d0["time"],
+            "signal_chg": round(prev_chg, 2),
+            "signal_vol_r": round(prev_vol, 2),
+            "signal_price": round(entry_price, 3),
+            "entry_vol_r": round(prev_vol, 2),
+            "buy_mode": "signal_close",
+        }
+        trades.append({
+            **sig,
+            "entry_date": d0["time"],
+            "entry_price": round(entry_price, 3),
+            "buy_mode": "signal_close",
+            "d1_gap": round((float(d1["open"]) / entry_price - 1) * 100, 2),
+            "d1_change": round((float(d1["close"]) / entry_price - 1) * 100, 2),
+            **result,
+        })
+    return trades
+
+
+# ================================================================
+# 枚举方式 B：day（逐日候选 → D0 信号 → 次日开盘入场）
+#   day_flow=v1     : 镜像 v1.backtest_stock（见 tmp/_v1_equivalence.py 验收）
+#   day_flow=relay3 : 镜像 relay3.backtest_stock（见 tmp/_relay3_equivalence.py 验收）
+# ================================================================
+
+register_enum_flow("limit_up", _backtest_limit_up)

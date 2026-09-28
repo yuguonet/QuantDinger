@@ -108,7 +108,11 @@ class Tool(ABC):
     # 子类必须定义这三个属性
     name: str = ""
     description: str = ""
-    parameters: dict = field(default_factory=dict) if False else {}
+    # ★ 必须用 field(default_factory=dict)，不能写 {}——类属性 {} 是可变对象，
+    #   所有未覆盖 parameters 的子类会共享同一个 dict 实例（一个子类修改会污染其他）。
+    #   旧写法 `field(default_factory=dict) if False else {}` 是错的：if False 分支
+    #   永远不执行，实际值就是 {}，等于没修。
+    parameters: dict = field(default_factory=dict)
 
     @abstractmethod
     async def execute(self, **kwargs) -> ToolResult:

@@ -957,3 +957,89 @@ def _exit_g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
 _register_exit("g56_no_trail", _exit_g56_no_trail)
+
+
+# ================================================================
+# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# ----------------------------------------------------------------
+# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
+# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
+# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
+# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
+#    analysis_output/auto架构分层_20260928.md
+# ================================================================
+
+from typing import Any, Dict, List
+from app.market_cn.auto.core.entry_modes import resolve_entry
+from app.market_cn.auto.core.exit_modes import run_exit
+from app.market_cn.auto.core.runtime.flows import register_day_flow
+
+def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilter):
+    """门表版 g56(五重共振) 全历史回测，返回 trades 列表（与 g56.backtest_stock 逐笔等价）。
+
+    编排逐字镜像 backtest_stock：北交所/长度早返回 → 特征 O(n) 一次预计算 → 横截面池聚合
+    → 逐日 s（信号日 k=s-1）→ 锁仓去重（s <= last_exit_idx 跳过，**在门表之前**）→ 门表求值
+    → 入场=entry_modes(open + gap_max 分板块) → 出场=exit_modes(g56_no_trail 无追踪 7d/-8%)
+    → 锁仓至退出日。g56 无 U1~U4（use_unified_prefilter=False）。
+    起点/终点由 meta.day_start(68) / day_end(9) 声明（镜像 range(68, n-9)）。
+    """
+    from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
+    # build_signal 属 core.runtime.evaluate; 此处**必须**函数体内 import —— 顶层 import 会
+    # 在 evaluate 半初始化 (ensure_gate_init → autodiscover → 本模块) 时取不到该名字而成环。
+    from app.market_cn.auto.core.runtime.evaluate import build_signal
+
+    if str(code).startswith(("8", "4", "92")) or len(bars) < 68:
+        return []
+    _p = spec.params
+    n = len(bars)
+    # 特征一次预计算（镜像修复① O(n^2)→O(n)）；池按 pool_target 跨股缓存复用
+    ext = {"g56_feats": _g1_arrays(bars),
+           "g56_pool": _ensure_pool_daily(str(bars[-1]["time"])[:10])}
+    trades: List[Dict[str, Any]] = []
+    last_exit_idx = -1
+
+    for s in range(int(spec.meta.get("day_start", 68)), n - int(spec.meta.get("day_end", 9))):
+        if float(bars[s].get("open") or 0) <= 0 or s <= last_exit_idx:
+            continue                        # 锁仓去重（镜像修复②：未退出前不重复入场）
+        i = s - 1                           # 信号日 D-1
+        ctx = Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
+                  stock_info=stock_info, ext=ext, market=spec.market_spec)
+        ok, _ = ev.evaluate_all(bars, i, _p, ctx=ctx)
+        if not ok:
+            continue
+
+        # 入场 = entry_modes（open + gap_max；gap >= 涨停幅度 → 一字/触板不可买）
+        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
+        if site is None:
+            continue
+
+        # 出场 = exit_modes（g56_no_trail，无追踪 7d/-8%）
+        result = run_exit(spec.exit.get("mode", "g56_no_trail"), bars=bars,
+                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
+                          code=code, board_type=board_type, params=_p, diag=site["diag"])
+        if not result:
+            continue
+
+        sig = build_signal(ctx, spec)
+        ed = s + int(result["exit_day"]) - 1
+        trades.append({
+            "code": code,
+            "board": board_type,
+            "strategy": spec.key,
+            "signal_date": str(bars[i]["time"])[:10],
+            "entry_date": str(bars[s]["time"])[:10],
+            "entry_price": round(float(bars[s]["open"]), 3),
+            "entry_gap": round(float(site["diag"]["d1_gap"]), 2),
+            "exit_date": str(bars[ed]["time"])[:10]
+            if 0 < int(result["exit_day"]) and ed < n else None,
+            "exit_price": result["exit_price"],
+            "exit_day": result["exit_day"],
+            "return_pct": result["return_pct"],
+            "peak_return_pct": result["peak_return_pct"],
+            **sig,
+            "buy_mode": "next_open",
+        })
+        last_exit_idx = ed
+    return trades
+
+register_day_flow("g56", _backtest_day_flow)

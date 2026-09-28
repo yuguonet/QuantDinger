@@ -203,15 +203,44 @@ def load_tree(root_id: int) -> Optional[EvalNode]:
         logger.error("[Store] 读取决策树 root_id=%d 失败: %s", root_id, e)
         return None
 def _row_to_node(row) -> EvalNode:
-    """将数据库行转为 EvalNode。"""
-    (id_, parent_id, root_id, layer, name, step_order,
-     exec_date, stock_code, stock_name,
-     score, direction, action, signal, confidence,
-     timeframe, factors_json, output_json, analysis,
-     input_json, tools_json, missing_json, data_source,
-     status, error, elapsed_ms,
-     exit_date, exit_reason, pnl_pct, hold_days,
-     correct, calibration) = row
+    """将数据库行转为 EvalNode。
+
+    ★ 行是 RealDictRow（app.utils.db 游标固定 RealDictCursor），**必须按列名取**。
+      位置解包 `(a, b) = row` 迭代 dict 的键，拿到的是列名字符串而非值
+      （与 case_memory/evaluator 的 row['k'] 口径一致）。此前用位置解包导致
+      load_tree 完全失效（id_='id' 等），但 load_tree 暂无调用方故长期未暴露。
+    """
+    id_ = row["id"]
+    parent_id = row["parent_id"]
+    root_id = row["root_id"]
+    layer = row["layer"]
+    name = row["name"]
+    step_order = row["step_order"]
+    exec_date = row["exec_date"]
+    stock_code = row["stock_code"]
+    stock_name = row["stock_name"]
+    score = row["score"]
+    direction = row["direction"]
+    action = row["action"]
+    signal = row["signal"]
+    confidence = row["confidence"]
+    timeframe = row["timeframe"]
+    factors_json = row["factors"]
+    output_json = row["output_summary"]
+    analysis = row["analysis"]
+    input_json = row["input_params"]
+    tools_json = row["tools_called"]
+    missing_json = row["missing_data"]
+    data_source = row["data_source"]
+    status = row["status"]
+    error = row["error"]
+    elapsed_ms = row["elapsed_ms"]
+    exit_date = row["exit_date"]
+    exit_reason = row["exit_reason"]
+    pnl_pct = row["pnl_pct"]
+    hold_days = row["hold_days"]
+    correct = row["correct"]
+    calibration = row["calibration"]
 
     def _parse_json(val, default=None):
         if val is None:
@@ -425,7 +454,14 @@ def update_skill_verify(root_id: int, actual_direction: str):
                 WHERE root_id = %s AND layer = 'skill' AND status = 'ok'
             """, (root_id,))
 
-            for step_id, direction, score in cur.fetchall():
+            # ★ 行是 RealDictRow（app.utils.db 游标 = RealDictCursor），按列名取。
+            #   曾写成 `for step_id, direction, score in cur.fetchall()` ——解包出来是
+            #   列名字符串，UPDATE ... WHERE id = 'id' 直接报类型错 → 整个 except 吞掉，
+            #   结果 skill 层 correct **一条都没写进去**（实测 237 行 correct 全 NULL）。
+            for _srow in cur.fetchall():
+                step_id = _srow["id"]
+                direction = _srow["direction"]
+                score = _srow["score"]
                 if not direction:
                     continue
 
@@ -675,8 +711,9 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
                     SELECT name, weight FROM qd_agent_weights
                     WHERE layer = 'factor' AND sample_count >= 5
                 """)
-            for fname, weight in cur.fetchall():
-                weights[fname] = weight
+            # 行是 RealDictRow，按键取（按位置解包会拿到列名字符串）
+            for _wrow in cur.fetchall():
+                weights[_wrow["name"]] = _wrow["weight"]
     except Exception as e:
         logger.warning("[Store] 获取因子权重失败: %s", e)
     return weights
@@ -695,8 +732,9 @@ def get_chain_weights() -> Dict[str, float]:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'chain'")
-            for name, weight in cur.fetchall():
-                weights[name] = weight
+            # 行是 RealDictRow，按键取（按位置解包会拿到列名字符串）
+            for _crow in cur.fetchall():
+                weights[_crow["name"]] = _crow["weight"]
             cur.close()
     except Exception as e:
         logger.warning("[Store] 获取链路权重失败: %s", e)

@@ -668,10 +668,17 @@ def build_ledger_plan(replay, actual, meta):
     disabled = sorted(set(registry.strategy_keys()) - set(registry.enabled_keys()))
 
     upsert, insert, expire, keep_disabled, vanish_settled = [], [], [], [], []
+    keep_actual = []   # A2 守卫 (2026-09-28): 重放无权改写的已推进真实行
     for k, r in replay.items():
         a = actual.get(k)
         if a is None:
             insert.append(r)
+        elif a.get("entry_date") and not r.get("entry_date"):
+            # A2: actual 已真实入场 (monitor 盘中按实时数据买入) 而重放行是
+            # 占位「待次日确认(末根)」或被日线口径拒绝 (无 entry 字段) ——
+            # 重放视野不足, 无权抹掉真实入场。跳过不写, 保留 actual。
+            # ("完全以重放为准" 不应覆盖 "重放视野之外的真实入场")
+            keep_actual.append(k)
         else:
             upsert.append((a.get("id"), k, r))
             if a.get("entry_date") and r.get("state") != a.get("state"):
@@ -681,8 +688,12 @@ def build_ledger_plan(replay, actual, meta):
             continue
         if k[1] not in active_keys:
             keep_disabled.append((k, a.get("state")))
+        elif a.get("entry_date"):
+            # A2: 已推进/已平仓行不做 expire —— 重放集外 ≠ 未入场
+            # (窗口末日 hi 的信号 D+1 上午刚买入、日线未回填时必落此分支)。
+            keep_actual.append(k)
         else:
-            expire.append((a.get("id"), k, a.get("state"), bool(a.get("entry_date"))))
+            expire.append((a.get("id"), k, a.get("state"), False))
 
     # 停用策略未入场行清扫 (全表, 不依赖窗口)
     # 2026-09-26: 查询/写库统一走 store.retire_unfilled (唯一实现)。
@@ -694,6 +705,7 @@ def build_ledger_plan(replay, actual, meta):
     return {"upsert": upsert, "insert": insert, "expire": expire,
             "disabled_sweep": disabled_sweep, "keep_disabled": keep_disabled,
             "vanish_settled": vanish_settled, "disabled": disabled,
+            "keep_actual": keep_actual,
             "n_replay": len(replay), "n_actual": len(actual)}
 
 
@@ -701,7 +713,8 @@ def apply_ledger_plan(plan, dry_run=True):
     """执行账本写库计划。only 索引 0/1/2 (id,key,row) 形态见 build_ledger_plan。"""
     from app.market_cn.auto.store import S_EXPIRED, S_WATCH_PENDING
     stat = {"upserted": 0, "inserted": 0, "expired": 0, "sweep_expired": 0,
-            "insert_skipped": 0, "dry_run": bool(dry_run)}
+            "insert_skipped": 0, "kept_actual": len(plan.get("keep_actual") or []),
+            "dry_run": bool(dry_run)}
     if dry_run:
         stat.update({"upserted": len(plan["upsert"]), "inserted": len(plan["insert"]),
                      "expired": len(plan["expire"]),

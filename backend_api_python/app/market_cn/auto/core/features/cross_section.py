@@ -178,7 +178,7 @@ def _ensure_pool_daily(pool_target, bars_batch=None):
     """
     with _POOL_LOCK:
         if _POOL["target"] == pool_target:
-            return _POOL
+            return dict(_POOL)               # M19 同款: 命中路径也不交出共享引用
         from app.market_cn.auto.core.data import hub
         try:
             buckets = {"main": {}, "gem_star": {}}
@@ -208,4 +208,7 @@ def _ensure_pool_daily(pool_target, bars_batch=None):
         logger.info("[g56] 池聚合完成 target=%s 主板%d日/20cm%d日",
                     pool_target, len(main_map), len(gem_map))
         _POOL.update({"target": pool_target, "main": main_map, "gem_star": gem_map})
-        return _POOL
+        # M19 (2026-09-28): 返回**新** dict, 不返回共享 _POOL —— 原实现把共享单槽缓存
+        # 直接交出, 下一个 pool_target _POOL.update 原地改写时, 调用方手里的旧引用
+        # (上一决策日的池统计) 被静默换成新日数据 → 跨日重放中先前日期的门判定漂移。
+        return {"target": pool_target, "main": main_map, "gem_star": gem_map}

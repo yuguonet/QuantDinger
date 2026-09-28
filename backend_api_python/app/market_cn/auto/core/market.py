@@ -152,16 +152,23 @@ def set_default_market(spec: MarketSpec) -> None:
 
 
 def default_market() -> MarketSpec:
-    """当前默认市场。未注入时惰性加载 A（保证冻结插件的裸调用不崩）。"""
+    """当前默认市场。未注入时惰性加载 A（保证冻结插件的裸调用不崩）。
+
+    ⚠️ 2026-09-28 修 X0：加载失败**抛错**而非回退空 MarketSpec()——空 spec
+    会让 is_limit_up 恒 False / limit_dn_price 恒 0 / get_board_type 恒
+    "default"，全部涨停判定静默失效（与 registry「fail-fast 不静默降级」
+    承诺矛盾）。正常进程 import 时即注入成功，不会走到抛错分支。
+    """
     global _DEFAULT, _LAZY_TRIED
     if _DEFAULT is None and not _LAZY_TRIED:
         _LAZY_TRIED = True
-        try:
-            from app.market_cn.auto.adapters.markets.registry import load_market
-            _DEFAULT = load_market("A")
-        except Exception:
-            _DEFAULT = None
-    return _DEFAULT if _DEFAULT is not None else MarketSpec()
+        from app.market_cn.auto.adapters.markets.registry import load_market
+        _DEFAULT = load_market("A")
+    if _DEFAULT is None:
+        raise RuntimeError(
+            "默认市场 A 未加载（import 注入与惰性加载均失败），"
+            "拒绝按空市场口径运行（涨停/跌停/板块判定会全部静默失效）。")
+    return _DEFAULT
 
 
 # ================================================================

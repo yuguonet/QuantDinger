@@ -324,7 +324,17 @@ def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
 
     scored: List[dict] = []
     for row in rows:
-        (case_id, summary, digest, outcome, fmode, emb_json, created_at) = row
+        # ★ 行是 RealDictRow（app.utils.db 的游标固定用 RealDictCursor）——**必须按
+        #   列名取**。按位置解包拿到的是列名字符串（"plan_digest" 之类），json.loads
+        #   会抛 "Expecting value: line 1 column 1 (char 0)"，本函数静默返回空 →
+        #   案例召回整条链断掉却只在日志里留一行。与 store/evaluator 的 row['k'] 一致。
+        case_id = row["case_id"]
+        summary = row["task_summary"]
+        digest = row["plan_digest"]
+        outcome = row["outcome"]
+        fmode = row["failure_modes"]
+        emb_json = row["embedding"]
+        created_at = row["created_at"]
         outcome = outcome if isinstance(outcome, dict) else json.loads(outcome or "{}")
         label = str((outcome or {}).get("label") or "pending")
         if label == "incorrect":
@@ -437,7 +447,11 @@ def query_brew_case_signals(min_cluster: int = CASE_CLUSTER_MIN,
                 return []
 
             clusters: Dict[str, dict] = {}
-            for root_id, digest, outcome in rows:
+            for row in rows:
+                # 同 retrieve_cases：行是 RealDictRow，按键取（按位置解包会拿到列名字符串）
+                root_id = row["root_id"]
+                digest = row["plan_digest"]
+                outcome = row["outcome"]
                 digest = digest if isinstance(digest, list) else json.loads(digest or "[]")
                 outcome = outcome if isinstance(outcome, dict) else json.loads(outcome or "{}")
                 sig = "→".join(
@@ -462,13 +476,18 @@ def query_brew_case_signals(min_cluster: int = CASE_CLUSTER_MIN,
             try:
                 cur2 = conn.cursor()
                 cur2.execute("SELECT id, name FROM qd_agent_traces WHERE id = ANY(%s)", (root_ids,))
-                name_by_root = {int(r[0]): str(r[1] or "") for r in cur2.fetchall()}
+                # RealDictRow 不支持整数下标（r[0] 会 KeyError），同样按键取
+                name_by_root = {int(r["id"]): str(r["name"] or "") for r in cur2.fetchall()}
                 cur2.close()
             except Exception as e:
                 _warn_once("signal4_lookup", "案例聚类 chain_name 反查失败：%s" % e)
                 return []
             for sig, c in clusters.items():
                 if c["runs"] < min_cluster or c["labeled"] < min_labeled:
+                    continue
+                # labeled=0 时胜率无定义（min_labeled 被调成 0 才会到这里）——
+                # 不除零，也不把 0/0 当 1.0 放进来（那会凭空产候选）
+                if c["labeled"] <= 0:
                     continue
                 wr = c["correct"] / float(c["labeled"])
                 if wr < min_win_rate:
