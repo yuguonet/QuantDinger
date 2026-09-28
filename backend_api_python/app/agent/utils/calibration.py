@@ -1,4 +1,4 @@
-﻿﻿# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 评分校准（方案 A1b，2026-09-26）：把工具输出的启发式 score(0-100) 映射到
 P(方向正确=hit_rate) —— 用 sklearn IsotonicRegression 拟合 qd_agent_traces 历史 (score, correct)。
