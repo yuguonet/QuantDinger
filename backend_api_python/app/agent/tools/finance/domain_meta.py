@@ -32,58 +32,59 @@ _MARKET_WORDS = re.compile(
 )
 
 # plan_linter R1 数据域词典：(数据域, 触发关键词, 候选工具[0]=首选)
-# 工具名必须逐字来自 provider 注册表（CI 断言见 tests/test_wiring.py plan_linter 段）
+# 工具名必须逐字来自 provider 注册表（tools ∪ capabilities 并集）。
+# ⚠️ 2026-09-27：此处曾写"CI 断言见 tests/test_wiring.py plan_linter 段"——该文件确实
+#    存在（35 个用例）但**里面没有任何词典断言**，属幻觉引用（引用了不存在的一段）。
+#    后果：2026-09-27 工具归组摘除 17 个旧名后本词典整行失效（intel_news 曾 0 有效候选）
+#    而无人报警，plan_linter R1 持续向 planner 推荐不存在的工具。本轮已按 TOOL_ALIAS
+#    全部迁移（失效名 0）。词典 ⊆ 注册表的 CI 断言待补，未补前勿再声称已覆盖。
 _DATA_DOMAINS = (
     ("realtime_quote",
      ("实时", "现价", "最新价", "盘口", "快照", "分时", "realtime", "报价", "现在多少钱"),
-     ("get_realtime_quote", "quote", "get_realtime_quote", "get_order_book",
-      "minute_live", "get_realtime_quote")),
+          ("get_realtime_quote", "quote", "get_order_book", "minute_live")),
     ("kline",
      ("日线", "周线", "月线", "k线", "历史行情", "走势", "复权", "分钟线", "均线"),
-     ("agent_get_kline", "daily", "daily_live", "agent_get_kline", "index_daily",
-      "get_sector_history_data", "day_series")),
+          ("agent_get_kline", "daily", "daily_live", "index_daily", "get_sector_board",
+      "day_series")),
     ("fund_flow",
      ("资金流", "主力", "净流入", "净流出", "大单", "北向", "外资", "资金面", "fund_flow"),
-     ("get_fund_flow", "get_fund_flow", "get_fund_flow_daily",
-      "get_market_fund_flow", "get_market_fund_flow", "get_capital_summary")),
+          ("get_fund_flow", "get_fund_flow_daily", "get_capital_summary")),
     ("financials",
      ("财务", "业绩", "营收", "净利润", "财报", "毛利率", "roe", "基本面", "财报数据"),
-     ("get_capital_summary", "get_stock_info", "get_stock_info", "get_stock_info")),
+          ("get_capital_summary", "get_stock_info")),
     ("valuation",
      ("估值", "市盈", "市净", "市值", "贵不贵", "值多少钱", "dcf", "目标价", "定价"),
      ("batch_valuation_compare", "get_stock_info")),
     ("sector",
      ("板块", "行业", "概念", "题材", "产业链", "板块转动"),
-     ("get_hot_sectors", "get_sector_stocks", "get_industry_ranking",
-      "get_sector_trend_analysis", "get_sector_fund_flow", "get_stock_sector_info")),
+          ("get_hot_sectors", "get_sector_stocks", "get_sector_board",
+      "get_sector_fund_flow", "get_stock_sector_info")),
     ("dragon_tiger",
      ("龙虎榜", "席位", "游资", "营业部", "机构专用"),
-     ("get_dragon_tiger", "get_dragon_tiger_detail", "lhb", "query_dragon_tiger")),
+          ("get_dragon_tiger", "lhb", "query_dragon_tiger")),
     ("hot_rank",
      ("人气", "热度", "关注度", "人气榜", "热搜"),
      ("get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason")),
     ("limit_pool",
      ("涨停", "跌停", "炸板", "连板", "封板", "打板", "首板", "接力", "晋级"),
-     ("get_limit_pool", "get_limit_pool", "get_dragon_tiger", "get_limit_pool")),
+          ("get_limit_pool", "get_dragon_tiger")),
     ("screen",
      ("筛选", "选股", "选出", "找出", "挑出", "有哪些", "股票池", "排行"),
      ("search_stocks", "get_screener_presets", "build_keyword_from_filters")),
     ("technical",
      ("技术面", "技术分析", "指标", "macd", "kdj", "rsi", "金叉", "死叉", "形态",
       "布林", "背驰", "背离", "量能"),
-     ("technical_analysis", "analyze_trend", "calculate_ma", "indicator_analysis",
-      "analyze_chart_patterns", "get_obv_analysis", "get_volume_analysis",
+          ("technical_analysis", "run_indicator_signal", "analyze_chart_patterns",
       "list_indicators")),
     ("intel_news",
      ("消息面", "新闻", "公告", "研报", "舆情", "利好", "利空", "政策", "事件驱动", "传闻"),
-     ("search_stock_intel", "search_sector_intel", "search_policy_intel",
-      "search_comprehensive_intel", "search_policy_intel")),
+          ("search_intel",)),
     ("market_overview",
      ("大盘", "指数", "市场概览", "沪深", "上证", "创业板指", "行情总览"),
-     ("get_market_overview", "get_market_indices", "market_snapshot", "get_market_indices")),
+          ("get_market_overview", "get_index_quote", "market_snapshot")),
     ("sentiment",
      ("情绪", "恐慌", "赚钱效应", "亏钱效应", "情绪周期", "高潮", "冰点"),
-     ("get_market_overview", "get_market_overview", "fear_greed_index", "get_market_overview")),
+          ("get_market_overview", "fear_greed_index")),
     ("chip",
      ("筹码", "成本分布", "获利盘", "套牢盘", "筹码集中度"),
      ("get_chip_distribution",)),
@@ -98,7 +99,7 @@ _DATA_DOMAINS = (
      ("get_capital_summary",)),
     ("signals",
      ("信号", "买点", "卖点", "触发条件"),
-     ("search_stock_intel", "run_indicator_signal", "list_strategies", "strategy_keys")),
+     ("search_intel", "run_indicator_signal", "list_strategies", "strategy_keys")),
 )
 
 # R2 依赖登记
@@ -106,17 +107,15 @@ _LIST_PRODUCERS = frozenset({
     "search_stocks", "get_limit_pool", "get_dragon_tiger",
     "get_hot_rank", "query_hot_rank", "get_hot_stocks_with_reason",
     "query_dragon_tiger", "lhb",
-    "get_hot_sectors", "get_sector_stocks", "get_industry_ranking",
-    "list_strategies", "search_stock_intel", "all_codes",
+    "get_hot_sectors", "get_sector_stocks", "get_sector_board",
+    "list_strategies", "search_intel", "all_codes",
 })
 _LIST_CONSUMERS = frozenset({
     "agent_get_kline", "get_realtime_quote", "quote", "technical_analysis",
-    "analyze_trend", "analyze_pattern", "analyze_chart_patterns", "calculate_ma",
-    "indicator_analysis", "get_obv_analysis", "get_volume_analysis",
-    "get_fund_flow", "get_fund_flow_daily", "get_chip_distribution",
-    "get_stock_info", "get_stock_sector_info", "get_stock_concept_blocks",
-    "search_stock_intel", "batch_valuation_compare", "get_capital_summary",
-    "resolve_stock", "get_lockup_expiry", "run_indicator_signal",
+    "analyze_pattern", "analyze_chart_patterns", "run_indicator_signal", "get_fund_flow",
+    "get_fund_flow_daily", "get_chip_distribution", "get_stock_info", "get_stock_sector_info",
+    "search_intel", "batch_valuation_compare", "get_capital_summary", "resolve_stock",
+    "get_lockup_expiry",
 })
 
 SPEC = DomainSpec(

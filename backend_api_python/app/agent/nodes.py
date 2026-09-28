@@ -1622,6 +1622,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             logger.warning("[Execute] ready-set failed, fallback sequential: %s", _ge)
             if p0.get("barrier"):
                 b = idx + 1
+                # 2026-09-27 修 E3：原分支只算 b 未赋 batch → 下面 batch[0] 抛
+                # UnboundLocalError（回退路径同样踩雷，与 elif 分支是同一个 bug）
+                batch = [p0]
             else:
                 b = idx
                 while b < len(phases) and not (phases[b].get("barrier") or phases[b].get("replan")):
@@ -1629,6 +1632,11 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             batch = phases[idx:b]
     elif p0.get("barrier"):
         b = idx + 1                         # barrier 阶段独占一批
+        # 2026-09-27 修 E3：barrier 分支必须显式给 batch，否则下面 batch[0] 抛
+        # UnboundLocalError → execute 节点异常 → graph 无 on_error 边 → 全管道终止。
+        # 触发面不小：plan_linter R2 会自动补 barrier=True（plan_linter.py），
+        # 等于"修复动作主动踩雷"。
+        batch = [p0]
     else:
         b = idx
         while b < len(phases) and not (phases[b].get("barrier") or phases[b].get("replan")):
@@ -1807,19 +1815,26 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             first_id, last_id, getattr(agent, "_tool_contract", None), _contract)
         agent = None
         agents.pop(str(idx), None)
-    if agent is None:
-        effective_interval = max(2, min(sum_budget // 2, 6)) if _need_internal else None
-        agent = agent_instance._build_code_agent(
+    effective_interval = max(2, min(sum_budget // 2, 6)) if _need_internal else None
+
+    def _build_fresh_agent(phase_tag: str):
+        """构建**全新** CodeAgent（2026-09-27 抽出：主跑与 F2 双跑共用同一份构建参数，
+        否则两处各写一套工具面/预算/作用域，改一处漏一处即静默漂移）。
+        """
+        return agent_instance._build_code_agent(
             model=ctx.model,
             provider=ctx.tool_provider,
             skill_tools=list(_skill_tools),
             planning_interval=effective_interval,
-            phase_id=f"{first_id}-{last_id}",
+            phase_id=phase_tag,
             domain=state.get("selected_domain", ""),
             tools=(union_tools if not any_default else None),
             step_event_cb=getattr(ctx, "event_cb", None),
             run_scope=run_scope,
         )
+
+    if agent is None:
+        agent = _build_fresh_agent(f"{first_id}-{last_id}")
         agents[str(idx)] = agent
         agent._tool_contract = _contract
         logger.info("[Execute] 批次 [%d-%d] 新建 CodeAgent（白名单 %d 个工具，内部规划 %s）",
@@ -1846,6 +1861,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
     done_text = str(state.get("completed_phases_text", "") or "")
     records = []
     failed_tools = []
+    _dual_verdict = None      # F2 双跑仲裁结论（2026-09-27 接线）；无则 None
 
     # ── 5. 重试循环：整批重跑 ──
     while True:
@@ -1895,6 +1911,76 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             if _tok:
                 trace.record("token_usage", _tok)
         failed_tools = _extract_failed_tools(agent, ctx.tool_provider)
+
+        # ── 5b. F2 双跑交叉验证（2026-09-27 接线，实现见 execution/dual_run.py）──
+        # 触发：phase 显式标 dual_run/sensitive，或任务文本命中买卖/金额/仓位等敏感词。
+        # 做法：用**全新** CodeAgent 再跑同一份任务书（必须新实例——复用会看到主跑遗留
+        # 的沙箱变量，那就不是独立双跑）。成本翻倍，故只在敏感任务触发且 fail-open：
+        # 任何异常都不阻断主流程。
+        # 比对口径：**只比数值与方向**（arbitrate_text），措辞/格式差异不算分歧——
+        # 否则 _walk_diff 会把标点换行全报成 diff（模块 docstring 警告的格式假阳性）。
+        try:
+            from execution.dual_run import arbitrate_text, should_dual_run
+
+            _task_text = str(state.get("task") or state.get("effective_input")
+                             or state.get("user_input") or "")
+            if should_dual_run(phase=p0, task=_task_text):
+                logger.info("[Execute] 批次 [%d-%d] 敏感任务 → 启动双跑交叉验证",
+                            first_id, last_id)
+                _dual_agent = _build_fresh_agent(f"dual-{first_id}-{last_id}")
+                _dual_agent.max_steps = sum_budget
+                _set_llm_timeout(_dual_agent, 180)
+                try:
+                    _r2, _e2, _i2 = _run_agent_with_guard(_dual_agent, full_task)
+                    if not _i2 and (_detect_max_steps(_dual_agent)
+                                    or not _has_final_answer(_dual_agent)):
+                        _c2 = _extract_clean_phase_result(_dual_agent, str(_r2))
+                        if _c2 and _c2 != str(_r2):
+                            _r2 = _c2
+                    _dual_verdict = arbitrate_text(str(result), str(_r2))
+                finally:
+                    # 双跑 agent 是一次性的，用完即清（防 httpx/executor 泄漏）
+                    try:
+                        _m2 = getattr(_dual_agent, "model", None)
+                        if _m2 is not None and hasattr(_m2, "close"):
+                            _m2.close()
+                        for _attr in ("executor", "python_executor"):
+                            _ex = getattr(_dual_agent, _attr, None)
+                            if _ex is None:
+                                continue
+                            if hasattr(_ex, "custom_tools"):
+                                _ex.custom_tools.clear()
+                            if hasattr(_ex, "cleanup"):
+                                _ex.cleanup()
+                            elif hasattr(_ex, "shutdown"):
+                                _ex.shutdown(wait=False)
+                    except Exception as _ce:
+                        logger.debug("[Execute] 双跑 agent 清理失败: %s", _ce)
+
+                logger.warning("[Execute] 双跑结论 [%d-%d]: %s / confidence=%s / both=%s — %s",
+                               first_id, last_id, _dual_verdict.get("verdict"),
+                               _dual_verdict.get("confidence"), _dual_verdict.get("both"),
+                               _dual_verdict.get("note", ""))
+                if trace:
+                    trace.record("dual_run", {
+                        "batch": f"{first_id}-{last_id}",
+                        "verdict": _dual_verdict.get("verdict"),
+                        "confidence": _dual_verdict.get("confidence"),
+                        "both": _dual_verdict.get("both"),
+                        "note": _dual_verdict.get("note"),
+                        "diffs": (_dual_verdict.get("diffs") or [])[:10],
+                    })
+                # 方向相反 → **两口径并列**进最终答案（F2 仲裁表：不硬选）。
+                # 只在 both=True 时追加，避免给正常答案平白加噪声。
+                if _dual_verdict.get("both"):
+                    _cap = 1200
+                    result = (str(result)
+                              + "\n\n---\n**⚠️ 双跑方向相反（未硬选，两口径并列）**\n"
+                              + "口径A：" + str(_dual_verdict.get("text_a", ""))[:_cap]
+                              + "\n\n口径B：" + str(_dual_verdict.get("text_b", ""))[:_cap])
+        except Exception as _de:
+            logger.warning("[Execute] 双跑交叉验证失败（fail-open，不影响主流程）: %s", _de)
+            _dual_verdict = None
 
         # ── 批次内逐 phase 验收 ──
         first_fail = None
@@ -2052,6 +2138,8 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
         "_failed_tools": failed_tools,
         "_agent_plan": "",
         "_run_error": repr(run_error) if run_error else "",
+        # F2 双跑仲裁结论（2026-09-27 接线）：无双跑时为 None，下游/前端可消费
+        "_dual_run": _dual_verdict,
     }
 
 

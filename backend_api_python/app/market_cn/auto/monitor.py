@@ -388,7 +388,9 @@ def run_monitor():
                 px = float(snap.get("last") or 0)
                 stop_px = float(r.get("stop_price") or 0)
                 if px > 0 and stop_px > 0 and px <= stop_px:
+                    # 2026-09-26 bugfix: 补 exit_price (原缺失 → 平账无出场价, 收益统计空)
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason="盘中止损",
+                                 exit_price=round(px, 3),
                                  detail={"marked": today, "stop_price": stop_px})
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
                     continue

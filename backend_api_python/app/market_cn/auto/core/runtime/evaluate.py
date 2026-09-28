@@ -732,7 +732,7 @@ def _run_backtest_day_g56(bars, code, spec, ev, board_type, stock_info, use_pref
     → 锁仓至退出日。g56 无 U1~U4（use_unified_prefilter=False）。
     起点/终点由 meta.day_start(68) / day_end(9) 声明（镜像 range(68, n-9)）。
     """
-    from app.market_cn.auto.strategies.g56 import _ensure_pool_daily, _g1_arrays
+    from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
 
     if str(code).startswith(("8", "4", "92")) or len(bars) < 68:
         return []

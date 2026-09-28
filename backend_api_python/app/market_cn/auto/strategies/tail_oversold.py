@@ -98,7 +98,7 @@ def pred_score(v2_score: float, code: str = "", limit_pct: float = None) -> int:
 PARAMS = {
     "score_min": 8.0,          # V2 评分下限 (归一化后)
     "pre5_max": -10.0,         # pre5_gain*nf 上限 (深度超卖)
-    "amp_min": 10.0,           # amplitude*nf 下限 (弹性)
+    "amp_min": 8.0,            # amplitude*nf 下限 (2026-09-26 120d 标定: 8.0 n=306 胜率82.7% 盈亏比2.04; 原10.0 n=274 胜率82.8% 盈亏比2.15, 差异不大但覆盖更全; 与 config.json 对齐)
     "tail_lo": -2.8,           # tail_ret*nf 下限
     "tail_hi": -0.5,           # tail_ret*nf 上限 (跌太多=还在崩)
     "min_hhmm": "14:50",       # 快照时间下限 (= 滚动预览窗口起点, 早于此不出信号)

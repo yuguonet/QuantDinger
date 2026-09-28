@@ -838,3 +838,94 @@ def test_capability_layer_tools_all_declare_return_shape(monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  W20：domain_meta 词典 ⊆ 注册表（2026-09-27 补）
+# ═══════════════════════════════════════════════════════════════
+#
+# 已文档化事故：2026-09-27 工具归组（_SUPERSEDED_BY_MERGE）摘除 17 个旧名，
+# 但 tools/finance/domain_meta.py 的数据域词典与 R2 依赖登记仍整行是旧名
+# （intel_news 一行 5 个候选全部失效）。plan_linter R1/R2 据此向 planner
+# 推荐/认可不存在的工具 → 幻觉工具名烧步数。
+# 更根本的失效：domain_meta.py 与 plan_linter.py 此前都写着「CI 断言见
+# tests/test_wiring.py 的 plan_linter 段」—— 本文件当时**没有**这段断言，
+# 是幻觉引用（引用了不存在的一段），所以摘名后无人报警。本组把它补上。
+
+def _live_registry(monkeypatch) -> set:
+    """生产扫描路径下全部可点名工具名（tools ∪ capabilities）。"""
+    monkeypatch.setenv("CAPABILITIES_ENABLED", "1")
+    from tools.base import ToolProvider
+    from capabilities import register_capabilities
+
+    p = ToolProvider()
+    p.scan_directory(_AGENT_DIR / "tools", domain="common", package_prefix="tools")
+    p.scan_subdirectories(_AGENT_DIR / "tools", package_prefix="tools")
+    register_capabilities(p)
+    return set(p.get_functions())
+
+
+def test_domain_meta_names_are_all_registered(monkeypatch):
+    """W20a：词典与 R2 依赖登记的每个工具名都必须在注册表内（否则即活断链）。"""
+    import tools.finance.domain_meta  # noqa: F401  （触发 DomainSpec 注册）
+    from domain_registry import iter_data_domains, list_consumers, list_producers
+
+    registry = _live_registry(monkeypatch)
+    assert registry, "注册表为空 —— 扫描链路断裂"
+
+    bad = []
+    for dom, _kw, cands in iter_data_domains():
+        for n in cands:
+            if n not in registry:
+                bad.append(f"{dom}:{n}")
+    for n in sorted(list_producers()):
+        if n not in registry:
+            bad.append(f"producer:{n}")
+    for n in sorted(list_consumers()):
+        if n not in registry:
+            bad.append(f"consumer:{n}")
+
+    assert not bad, (
+        "domain_meta 含未注册工具名（摘名后未同步 → plan_linter 会推荐幻觉工具）："
+        + ", ".join(bad)
+    )
+
+
+def test_every_data_domain_has_usable_preferred_tool(monkeypatch):
+    """W20b：每个数据域至少 1 个有效候选，且**首项（首选）本身可用**。
+
+    plan_linter 的 `_PREFERRED = {d: t[0]}` 直接取候选首项；首项失效会让
+    "补点名"补出一个不存在的工具，比整行失效更隐蔽。
+    """
+    import tools.finance.domain_meta  # noqa: F401
+    from domain_registry import iter_data_domains
+
+    registry = _live_registry(monkeypatch)
+    rows = list(iter_data_domains())
+    assert rows, "数据域词典为空 —— domain_meta 未注册"
+
+    for dom, _kw, cands in rows:
+        alive = [c for c in cands if c in registry]
+        assert alive, f"数据域 {dom} 无任何有效候选 —— 该域需求会被静默漏掉"
+        assert cands[0] in registry, (
+            f"数据域 {dom} 的首选工具 {cands[0]!r} 未注册（_PREFERRED=t[0] 会指空）"
+        )
+
+
+def test_superseded_names_are_absent_from_domain_meta(monkeypatch):
+    """W20c：已被归组摘除的旧名不得出现在词典里（迁移看 TOOL_ALIAS，不是手改）。"""
+    import tools.finance.domain_meta  # noqa: F401
+    from domain_registry import iter_data_domains
+    from tools.base import TOOL_ALIAS, _SUPERSEDED_BY_MERGE
+
+    assert _SUPERSEDED_BY_MERGE, "摘除名单为空 —— 归组机制可能被移除"
+
+    dead = {n for _m, n in (x.split(":", 1) for x in _SUPERSEDED_BY_MERGE)}
+    used = set()
+    for _dom, _kw, cands in iter_data_domains():
+        used.update(cands)
+    leftovers = sorted(used & dead)
+    assert not leftovers, (
+        "词典仍在用已摘除的旧名（应迁移到 TOOL_ALIAS 目标）："
+        + ", ".join(f"{n}→{TOOL_ALIAS.get(n, '?')}" for n in leftovers)
+    )
+
+
+# ═══════════════════════════════════════════════════════════════

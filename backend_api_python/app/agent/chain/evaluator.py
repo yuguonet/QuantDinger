@@ -44,6 +44,16 @@ _DEFAULT_HOLD_DAYS = 3  # timeframe 缺失时的默认值
 def _get_hold_days(timeframe: str) -> int:
     """timeframe → 验证用持有天数。"""
     return _TIMEFRAME_DAYS.get(timeframe, _DEFAULT_HOLD_DAYS)
+
+
+def _maturity_days(hold_days: int) -> int:
+    """持有交易日数 → 可以定论所需的**自然日**下界（视界门，2026-09-27 修 E2）。
+
+    hold_days 按交易日计（_TIMEFRAME_DAYS），而 exec_date / CURRENT_DATE 是自然日
+    口径，两者必须换算：A 股一年约 244 交易日 / 365 自然日 ≈ 1.496，取 1.5；
+    +2 天用于覆盖周末与节假日（周五做的 T+1 决策，要到下周一才有第 1 根 K 线）。
+    """
+    return int(hold_days * 1.5) + 2
 # ═══════════════════════════════════════════════════════════════
 # 实际行情获取
 # ═══════════════════════════════════════════════════════════════
@@ -175,9 +185,13 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
         market: 市场类型
 
     Returns:
-        {"evaluated": int, "errors": int, "details": list}
+        {"evaluated": int, "errors": int, "details": list,
+         "not_mature": int, "truncated": int}
+        not_mature = 持有期未走完而跳过；truncated = 数据缺口导致窗口被截断而跳过。
     """
-    stats = {"evaluated": 0, "errors": 0, "details": []}
+    stats = {"evaluated": 0, "errors": 0, "details": [],
+             "not_mature": 0, "truncated": 0}
+    today = date.today()
 
     pending = store.query_pending_verify(days_old=days_old, limit=100)
 
@@ -194,12 +208,35 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
 
         try:
             hold_days = _get_hold_days(timeframe)
+
+            # ── 视界门 ①：持有期未走完不得定论（2026-09-27 修 E2）──
+            # 旧行为：query_pending_verify 统一 days_old=1（只够 T+1），而
+            # _get_actual_return 里 exit_idx = min(base_idx+hold_days, len-1) 会把窗口
+            # 静默截断到"现有最后一根 K 线"，于是 T+5/1M/3M/1Y 在次日就被 1 天的窗口
+            # 定了论；exit_date 一写入该记录即永久出队（WHERE exit_date IS NULL），
+            # 之后永不再验 → 权重/酿造信号/win_rate 全被错误标签污染。
+            # hold_days 是**交易日**数，换算自然日下界（1 交易日 ≈ 1.5 自然日，
+            # +2 覆盖周末/节假日）。未到视界只跳过，**不计失败**——否则连跳 5 次
+            # 会被 query_pending_verify 误判 unverifiable 永久出队。
+            if exec_date + timedelta(days=_maturity_days(hold_days)) > today:
+                stats["not_mature"] += 1
+                continue
+
             actual = _get_actual_return(stock_code, exec_date, hold_days, market)
             if not actual:
                 # 失败计数累计到 error 列（'eval_failed:N' 前缀），供
                 # store.query_pending_verify 在 >=5 次后将记录置 unverifiable 出队。
                 # 不写 exit_date（未来 K 线补齐后仍可回补验证）。
                 _bump_eval_failure(root_id)
+                continue
+
+            # ── 视界门 ②：窗口被截断不得定论（2026-09-27 修 E2）──
+            # 时间已到但 K 线仍不足（长期停牌/退市/数据缺口）时，_get_actual_return
+            # 依旧会用"最后一根"交卷。实际持有根数 < 应有根数即判定被截断：不写
+            # exit_date（留待数据补齐后回补），计入失败次数走毒丸治理（连续 5 次出队）。
+            if int(actual.get("hold_days") or 0) < hold_days:
+                _bump_eval_failure(root_id)
+                stats["truncated"] += 1
                 continue
 
             # 方向映射
@@ -288,8 +325,14 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
         return {"weight": 1.0, "win_rate": 0, "avg_pnl_pct": 0,
                 "avg_hold_days": 1, "return_per_day": 0, "sample_count": 0}
 
-    correct_trades = [t for t in trades if t.get("correct") is True]
-    wrong_trades = [t for t in trades if t.get("correct") is False]
+    # 防御纵深（2026-09-27 修 E1）：pnl_pct 缺失的行一律不入统计。
+    # 旧实现直接 sum(t["pnl_pct"])，遇 None 抛 TypeError 并炸穿整个权重主链
+    # （根因是取错行，已改为取根行；此处防止历史 NULL 行再次炸链）。
+    def _has_pnl(t: Dict) -> bool:
+        return isinstance(t.get("pnl_pct"), (int, float))
+
+    correct_trades = [t for t in trades if t.get("correct") is True and _has_pnl(t)]
+    wrong_trades = [t for t in trades if t.get("correct") is False and _has_pnl(t)]
     total = len(correct_trades) + len(wrong_trades)
 
     if total == 0:
@@ -299,7 +342,9 @@ def _calc_skill_weight_from_trades(trades: List[Dict]) -> Dict[str, float]:
     win_rate = len(correct_trades) / total
     avg_win = (sum(t["pnl_pct"] for t in correct_trades) / len(correct_trades)) if correct_trades else 0
     avg_loss = abs(sum(t["pnl_pct"] for t in wrong_trades) / len(wrong_trades)) if wrong_trades else 0
-    avg_hold = sum(t.get("hold_days", 3) for t in trades) / len(trades)
+    # `t.get("hold_days", 3)` 对"键存在但值为 None"仍返回 None → sum 同样会炸，
+    # 故用 `or 3` 兜底（与 pnl 同一道防线）。
+    avg_hold = sum((t.get("hold_days") or 3) for t in trades) / len(trades)
     avg_hold = max(avg_hold, 1)
 
     expected_return = win_rate * avg_win - (1 - win_rate) * avg_loss
@@ -448,14 +493,21 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                     logger.info("[Evaluator] 已删除工具，权重行清理: %s", name)
 
             # ② 一次扫描 qd_agent_traces，同时聚合 skill 和 factor 数据
+            # ⚠️ pnl_pct / hold_days 必须取**根节点** r（2026-09-27 修 E1）：
+            # store.update_verify_results 的 UPDATE 带 `AND parent_id IS NULL`，只写根行；
+            # skill 行的 pnl_pct 恒为 NULL。旧实现取 t.pnl_pct → _calc_weight 里
+            # sum(None) 抛 TypeError → 被外层 except 吞掉 → commit 永远到不了，
+            # skill/factor/tool/chain 四层权重全部冻结。correct 仍是 skill 行口径
+            # （update_skill_verify 写子节点），保持 t.correct。
             cur.execute("""
-                SELECT t.name as skill_name, t.factors, t.pnl_pct,
-                       t.hold_days, t.correct, r.exec_date
+                SELECT t.name as skill_name, t.factors, r.pnl_pct,
+                       r.hold_days, t.correct, r.exec_date
                 FROM qd_agent_traces t
                 JOIN qd_agent_traces r ON r.id = t.root_id
                 WHERE t.layer = 'skill'
                   AND t.status = 'ok'
                   AND t.correct IS NOT NULL
+                  AND r.pnl_pct IS NOT NULL
                   AND r.exec_date >= %s
             """, (since,))
 

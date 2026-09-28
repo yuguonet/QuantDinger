@@ -59,7 +59,10 @@ R4_MIN_FACE = 3
 # 2026-09-25：词典已抽到 tools/<domain>/domain_meta.py（DomainSpec.data_domains），
 # 本模块只做拼接与派生视图，核心不再写死金融关键词/工具名。
 # 每行 = (域, 关键词元组, 候选工具元组)。候选工具**首元素 = 首选**（补点名时用它）。
-# 工具名必须逐字来自 provider 注册表（CI 断言见 tests/test_wiring.py 的 plan_linter 段）。
+# 工具名必须逐字来自 provider 注册表（tools ∪ capabilities 并集）。
+# ⚠️ 2026-09-27：原注释声称"CI 断言见 tests/test_wiring.py 的 plan_linter 段"——该文件
+#    存在但其中**没有**这一段断言（幻觉引用）。归组摘名后词典失效因此无人报警，
+#    已按 TOOL_ALIAS 迁移；断言本身待补，未补前勿再声称已覆盖。
 from domain_registry import (
     iter_data_domains as _iter_data_domains,
     list_consumers as _list_consumers,

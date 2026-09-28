@@ -42,10 +42,10 @@ DRAGON_STRATEGY = "dragon_callback"
 # 兜底 (config 与 autodiscover 双双异常时使用, 与磁盘插件保持一致)
 # 2026-09-26: 补 g56/break_v2/dragon_v2/triple_resonance; 去掉已归档的
 # dragon_callback_legacy (见 strategies/_archive/)。改名/增删策略时同步此表。
+# 2026-09-27: break_v2/dragon_v2/triple_resonance/t_hilo 归档 _archive/, 同步删 fallback
 _STRATEGIES_FALLBACK = (
-    "dragon_callback", "dragon_v2", "v1", "break", "break_v2",
-    "relay3", "knife_catch", "tail_oversold", "triple_resonance", "g56",
-    "t_hilo",
+    "dragon_callback", "v1", "break",
+    "relay3", "knife_catch", "tail_oversold", "g56", "lead_chase",
 )
 
 

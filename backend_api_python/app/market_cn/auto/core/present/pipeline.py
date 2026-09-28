@@ -296,7 +296,7 @@ def _ext_g56(spec: StrategySpec, code: str, bars: List[Dict[str, Any]],
     `required_min_len("g56")` 在管线侧保证; 语义上的暖机要求 (>=68) 由 g1_warmup 门
     用 NaN 哨兵自然过滤。
     """
-    from app.market_cn.auto.strategies.g56 import _ensure_pool_daily, _g1_arrays
+    from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
     d = asof_date or (str(bars[-1]["time"])[:10] if bars else None)
     return {"g56_feats": _g1_arrays(bars),
             "g56_pool": _ensure_pool_daily(d, bars_batch=_g56_pool_batch(d, cache))}

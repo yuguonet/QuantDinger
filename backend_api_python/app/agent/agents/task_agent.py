@@ -99,6 +99,13 @@ _CODE_AGENT_YAML_PATH = os.path.join(
 PLAN_MAX_PHASES = 5          # 单次 plan 的阶段数上限(超出截断)
 PLAN_PHASE_MAX_RETRIES = 1   # 单阶段默认重试上限(phase.max_retries 可覆盖,钳制 [0,3])
 PLAN_PHASE_MAX_STEPS = 12    # 单阶段内部步数上限(phase.step_budget 钳制上界,2026-09-13)
+
+# 「代码原地重写 → 劝模型收尾」检测的回看步数(2026-09-27 修 E4)。
+# ⚠️ 语义是"回看几步",与 observation 截断强度 keep_recent 是两件事:
+#   后者为省 token 可降到 0,前者为 0 会让检测区间 [step, step) 恒空 → 防线失效。
+#   3 步:1 步太敏感(失败重试改写属正常纠错),5 步以上对长任务迟钝。
+_DUP_LOOKBACK_STEPS = 3
+
 # 注:PLAN_BATCH_MAX_STEPS(批次级步数上限)的唯一来源在 nodes.py--它是执行侧"批次合并"
 # 的常量,不属于 planner 契约。曾在此双份定义(本处为死定义),改一处漏一处即静默漂移
 # (与审计 L6 同型),2026-09-17 删除,勿再加回。
@@ -2364,6 +2371,12 @@ class TaskAgent(AgentBase):
         # 本函数即该方案(每步 finalize 后触发,截断对下一步的 prompt 生效)。
         keep_recent = 0
         keep_recent_mo = 1  # model_output 保留近 1 步 code 块(模型需看上一步代码续写),更早截断
+        # ⚠️ 重复检测回看步数**不得复用 keep_recent**(2026-09-27 修 E4):
+        #   keep_recent=0 是"observation 截断强度"(省 token),而检测窗口 [step-N, step)
+        #   需要的是"回看几步"(语义)。两者混用 → N=0 → 区间 [step, step) 恒空 →
+        #   "连续几步在重写同一份代码 → 劝收尾"这条防线永不触发,步数烧穿无人管。
+        #   截断与检测是两件事,各自独立常量。
+        dup_lookback = _DUP_LOOKBACK_STEPS
         _CODE_BLOCK_RE = re.compile(r"<code>(.*?)</code>", re.S)
 
         def _truncate_field(step: ActionStep, field: str, cap: int = 200) -> None:
@@ -2494,12 +2507,13 @@ class TaskAgent(AgentBase):
                 body = "".join(ln.split("#", 1)[0] for ln in src.splitlines())
                 return "".join(body.split())
 
-            # 只和最近 keep_recent 步比(更早的 code_action 已被 _truncate_observations
-            # 截断,比较无意义,也正好省掉无谓开销)
+            # 只和最近 dup_lookback 步比(2026-09-27 修 E4:原用 keep_recent=0 导致
+            # 检测区间恒空)。更早的 code_action 已被 _truncate_observations 归一化
+            # 截断,比较无意义,也正好省掉无谓开销。
             cur = _norm(code)
             dup_step: Optional[int] = None
             if cur and len(cur) <= 20000:
-                lo = memory_step.step_number - keep_recent
+                lo = memory_step.step_number - dup_lookback
                 for prev in agent.memory.steps:
                     if not isinstance(prev, ActionStep) or prev.step_number is None:
                         continue

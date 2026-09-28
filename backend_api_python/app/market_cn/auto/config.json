@@ -31,7 +31,7 @@
       "enabled": false,
       "daily_limit": 20,
       "params": {},
-      "_note": "2026-09-27 新建 (用户假设: 盘中资金流入推涨 + 上方压力小 + 预估放量 + 板块共振领涨 + 前期涨幅少/回调 → 可追)。口径见 strategies/lead_chase.py 头注。enabled=false 待 kline_1m 回测验证后用户拍板开启 (回测: -m app.market_cn.auto.core.backtest --strategy lead_chase)。出场默认 D1 开盘卖, 未定稿。"
+      "_note": "2026-09-28 终审: **结构性不成立, 保持 enabled=false**。全市场无偏样本(567,648 行/136日/5,219票) + 前68日选参后68日验证。① 09:40 买入的收益 100% 在当日拉升段(+356bp), 次日段仅 -3.2bp(t=-1.21) —— 之前 v5 的 +3.13% 是事后定义事件集的前视偏差。② A股 T+1 禁止当日卖出, 当日浮盈不可兑现, 必须过夜, 而过夜段 -5.4bp 且拉升股回吐最强。③ 样本外 corr(in_bp,out_bp)=-0.31 挑得越狠越差; 按 t 选的最优组 OOS +6.1bp vs 基线 +6.8bp = 零超额。④ 日度回归 alpha=-27.9bp/日(t=-1.36), beta=1.21(t=11.75), 上涨日超额 -11.5bp/下跌日 -49.3bp。⑤ 公平安慰剂 z=-0.58; 双边成本 20bp 即转负。保留两条稳健**负向**结论供它用: 早盘冲高回落>3% -> -52.2bp(t=-17.17); zt20>=1(近期涨停过) -> -17.0bp(t=-9.78)。完整记录见 analysis_output/领涨追击_重设计_v6_20260928.md。该方向若重启, 应并入 g56(尾盘选涨停+次日开盘买), 无需另立门户。"
     },
     "dragon_callback": {
       "label": "龙回头",
@@ -43,12 +43,6 @@
         "trail_hi": -2.0
       },
       "_params_note": "2026-09-25 trail -3→-2: 300d 真注入出场后胜率持平 72.7%, 均收 5.0→5.14, 盈亏比 2.43→2.52 (不伤胜率提盈亏比)。依赖 backtest_stock/exit_decision 经 merged_params 传入 (当日修掉写死 hold=7/stop=-8 的 bug)。"
-    },
-    "dragon_v2": {
-      "label": "龙回头V2",
-      "enabled": false,
-      "daily_limit": 5,
-      "_disabled_note": "2026-09-13 用户裁定撤回 V2 实验 (同 break_v2)。2026-09-26 扫描发现 enabled 仍为 true 与注释矛盾, 现对齐注释改回 false 留档 (停扫描, 历史行仍可查)"
     },
     "v1": {
       "label": "V1",
@@ -105,29 +99,16 @@
       "winrate": 80.7,
       "_params_note": "2026-09-26 amp_min 10→8: 120d n=274→306, 胜率82.8→82.7, 盈亏比2.15→2.04。14:50起滚动买入(观察窗至15:00)。"
     },
-    "break_v2": {
-      "label": "断板V2",
-      "enabled": false,
-      "daily_limit": 5
-    },
-    "triple_resonance": {
-      "label": "三金叉共振",
-      "enabled": false,
-      "daily_limit": 0
-    },
     "g56": {
       "label": "五重共振",
       "enabled": true,
       "daily_limit": 30,
+      "params": {
+        "dist_ma20_min": -4.0
+      },
       "winrate": 79.3,
-      "_winrate_note": "2026-09-24 补 (此前缺键 ⇒ 前端历史胜率列空 + 策略组排序当 0 垫底)。口径: 官方编排 run_all(strategy=g56) 全市场回测, days=320 → 1191笔/79.3%/+8.69%; days=120 为 86.2%(915笔) 但有效信号期仅≈44交易日、2026-08权重69%, 代表性不足, 不作常规引用。非实盘承诺。"
-    },
-    "t_hilo": {
-      "label": "持仓做T·高抛低吸",
-      "enabled": false,
-      "daily_limit": 5,
-      "winrate": null,
-      "_disabled_note": "2026-09-26 T15 示例做T策略 (t_legs 骨架演示)。规则未经两段稳定性验证, 默认不进实盘。做T 腿只产 TradeIntent, 待 monitor/执行层接线。"
+      "_winrate_note": "2026-09-24 补 (此前缺键 ⇒ 前端历史胜率列空 + 策略组排序当 0 垫底)。口径: 官方编排 run_all(strategy=g56) 全市场回测, days=320 → 1191笔/79.3%/+8.69%; days=120 为 86.2%(915笔) 但有效信号期仅≈44交易日、2026-08权重69%, 代表性不足, 不作常规引用。非实盘承诺。",
+      "_params_note": "2026-09-26 迁入 dist_ma20_min=-4.0 (原硬编码 DIST_MA20_MIN; 300d 对照 n=748 胜率80.7% 均收基本持平)。其他 score/board 阈值仍冻结为模块常量, 不开放 config 覆盖以防误调。"
     }
   },
   "state_labels": {
