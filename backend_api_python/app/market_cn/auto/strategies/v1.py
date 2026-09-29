@@ -71,7 +71,7 @@ class V1Strategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # D0 即涨停日, U1~U4 锚定信号日评估
     entry_style = "v1"
-    scan_spec = ScanSpec(kind="daily_close")
+    scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
     PROBE_STAGE_RANK = {"lu": 1, "ret20": 2, "pullback": 3, "obv": 4, "vol": 5,

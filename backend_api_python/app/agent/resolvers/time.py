@@ -244,7 +244,7 @@ class TimeResolver(EntityResolver):
                 continue
             seen.add(kind)
             try:
-                out = self._resolve_one(kind, m, today, finish, finance)
+                out = self._resolve_one(kind, m, today, finish, finance, user_input)
             except Exception as e:
                 logger.debug("[TimeResolver] %s 解析失败: %s", kind, e)
                 continue
@@ -289,7 +289,7 @@ class TimeResolver(EntityResolver):
                              entity_type="time", effective_input=expanded)
 
     def _resolve_one(self, kind: str, m: re.Match, today: str, finish: str,
-                     finance: bool) -> Optional[str]:
+                     finance: bool, user_input: str = "") -> Optional[str]:
         """返回**内联标注文本**（2026-09-15 用户定格式）。
 
         格式契约：内联文本拼在原文时间词后面，形如——
@@ -423,6 +423,9 @@ class TimeResolver(EntityResolver):
                 datetime.strptime(s, "%Y-%m-%d")
             except ValueError:
                 return None
-            # 用户已写明确日期 → 原样即契约，不再重复内联同一日期
+            # 用户已写明确日期 → 原样即契约，不再重复内联同一日期。
+            # user_input 必须由调用方传入（此前此处引用的裸名 user_input
+            # 不在本函数作用域内 → NameError，被 resolve() 的 except 吞成
+            # debug 日志 → 显式日期永远走不到这一行）。
             return None if s in user_input else s
         return None

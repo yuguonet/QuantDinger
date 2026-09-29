@@ -347,7 +347,7 @@ class G56Strategy(StrategyBase):
     name = STRATEGY_LABEL
     entry_style = "g56"
     family = "g56"                     # 自成一族, 不与 triple_resonance 链去重
-    scan_spec = ScanSpec(kind="daily_close")
+    scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(DEFAULT_PARAMS)
     use_unified_prefilter = False      # 与 tmp 回测口径一致 (无 U1~U4)
 

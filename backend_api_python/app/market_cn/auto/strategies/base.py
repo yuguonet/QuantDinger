@@ -30,6 +30,13 @@ class ScanSpec:
     data: str = "daily"                # daily=喂日K | minute=喂分钟K (1m 通道 Phase 3+ 接)
     entry_at: str = ""                 # intraday_window 生效: 成交触发时刻 ("14:56"=终审语义,
                                        #   窗口内其它触发仅预览不成交; 空=每个触发点均可成交)
+    # ---- 盘后触发声明 (2026-09-29; scheduler 不再硬编码 17:25) ----
+    # after_events: 数据就绪事件依赖 (auto/events.py KNOWN_EVENTS), 全齐才允许触发。
+    #   空 = daily_close 默认 ("daily_1d",); 加 lhb 表示必须等龙虎榜落库。
+    after_events: tuple = ()
+    # fire_at: "HH:MM" 不早于该时刻 (排序/避让用); 空 = 事件齐即可跑。
+    #   过 auto/sched.DAILY_FALLBACK_FIRE 后事件未齐也放行 (见 daily_fire_ready)。
+    fire_at: str = ""
 
 
 # ================================================================

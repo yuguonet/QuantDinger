@@ -328,7 +328,7 @@ class BreakStrategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # 锚定确认日(末根bar); 连板≥2已隐含U4
     entry_style = "brk"
-    scan_spec = ScanSpec(kind="daily_close")
+    scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(DEFAULT_PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近; 细门在 _break_signal_at 内不单列)
     PROBE_STAGE_RANK = {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,

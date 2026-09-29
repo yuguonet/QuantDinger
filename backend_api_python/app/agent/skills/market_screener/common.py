@@ -99,6 +99,13 @@ _SRC_SHORT = {
     "盘后筛选": "筛选", "条件搜索": "搜索", "4IN1(近期涨停)": "4IN1",
 }
 
+_DIR_CN = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
+
+
+def _dir_cn(d: str) -> str:
+    """英文方向 → 中文（给 LLM 与终端用户看的文案统一用中文）。"""
+    return _DIR_CN.get(str(d or ""), str(d or "-"))
+
 
 def _fmt(v, dec=2):
     if v is None:
@@ -121,6 +128,15 @@ class SkillResult(dict):
         # 错误
         if self.get("error"):
             return f"ERR: {self['error']}"
+
+        # profile_candidates() 格式（证据卡）—— 必须排在 prescreen 之前：
+        # profile bundle 自身也带 market 键，判序反了会被 _prescreen_md 吃掉（2026-09-29 实测）
+        if "profiles" in self:
+            return self._profile_md()
+
+        # inspect_stock() 格式（单票深挖）
+        if "tech" in self and "risks" in self:
+            return self._inspect_md()
 
         # pre_screen() 格式
         if "candidates" in self or "market" in self:
@@ -179,6 +195,142 @@ class SkillResult(dict):
                 )
             parts.append("\n".join(rows))
 
+        return "\n".join(parts)
+
+    def _inspect_md(self):
+        """单票深挖结果渲染（inspect_stock）：按「结论 → 证据 → 缺口」顺序。"""
+        parts = []
+
+        def _n(v, suffix=""):
+            """None → '-'，数值保持原样（避免渲染出 None 字面量误导 LLM）。"""
+            return "-" if v is None else f"{v}{suffix}"
+
+        tech = self.get("tech") or {}
+        name = self.get("name") or ""
+        parts.append(f"**{self.get('code','')} {name}** [{self.get('strategy','')}]")
+
+        pred = self.get("prediction") or {}
+        if pred.get("ok"):
+            parts.append(f"P(T+1涨)={pred.get('p_up')}  建议方向:{_dir_cn(pred.get('suggest_dir'))}  "
+                         f"预期收益:{_n(pred.get('exp_ret_bp'), 'bp')}")
+        else:
+            parts.append(f"P(T+1涨)=缺失（{pred.get('reason','未知')}）")
+
+        q = self.get("quote") or {}
+        if any(v is not None for v in q.values()):
+            parts.append(f"报价: 价{_n(q.get('price'))} 涨{_n(q.get('change_pct'), '%')} "
+                         f"换手{_n(q.get('turnover_pct'), '%')} 额{_n(q.get('amount'))}")
+
+        if tech:
+            ma_txt = ""
+            if tech.get("ma20"):
+                ma_txt = (f"MA5/10/20={tech.get('ma5')}/{tech.get('ma10')}/{tech.get('ma20')} "
+                          f"距MA20 {tech.get('dist_ma20_pct')}%"
+                          f"{'(多头排列)' if tech.get('ma_bull_stack') else ''}")
+            parts.append("技术: " + " | ".join(x for x in [
+                f"收{tech.get('close')} 涨{tech.get('change_pct')}%",
+                f"振幅{tech.get('amplitude_pct')}% 收盘位{tech.get('close_pos_in_day')}%",
+                ma_txt,
+                f"RSI{tech.get('rsi14')} 量比{tech.get('vol_ratio')}",
+                f"20日位置{tech.get('pos_in_20d_pct')}%"
+                f"{'(20日新高)' if tech.get('is_20d_high') else ''}",
+                f"5日{tech.get('ret_5d_pct')}% 20日{tech.get('ret_20d_pct')}%",
+                f"连板{tech.get('zt_streak')}/前{tech.get('prev_zt_streak')}",
+                "当日涨停" if tech.get("limit_up") else "",
+            ] if x))
+
+        flow = self.get("flow") or {}
+        if flow.get("ok"):
+            parts.append(f"资金: 主力净额{flow.get('main_net_wan')}万 "
+                         f"占成交{flow.get('net_pct_of_amount')}%")
+        elif flow:
+            parts.append(f"资金: 缺失（{flow.get('reason')}）")
+
+        th = self.get("theme") or {}
+        if any(th.values()):
+            boards = ",".join(th.get("boards") or []) or "-"
+            tags = ",".join(th.get("concept_tags") or []) or "-"
+            parts.append(f"题材: 行业{th.get('industry') or '-'} | 板块{boards} | 概念{tags}")
+
+        zt = self.get("zt_history") or []
+        if zt:
+            parts.append("涨停史: " + " ".join(
+                f"{z.get('date')}({z.get('continuous_days')}板)" for z in zt[:6]))
+
+        if self.get("fund_hist"):
+            parts.append(f"近10日主力资金明细已附(fund_hist)")
+        if self.get("dragon"):
+            parts.append(f"龙虎榜席位已附(dragon, detail=True)")
+        if self.get("boards"):
+            parts.append(f"板块排名已附(boards, top30)")
+
+        risks = self.get("risks") or []
+        parts.append("风险: " + ("；".join(risks) if risks else "无客观风险标记"))
+
+        missing = self.get("missing") or []
+        if missing:
+            parts.append("数据缺口: " + "；".join(str(m) for m in missing[:6]))
+        return "\n".join(parts)
+
+    def _profile_md(self):
+        """候选证据卡渲染（profile_candidates）：一行一票，列=决策要用的事实。"""
+        parts = []
+        strategy = self.get("strategy", "")
+        market = self.get("market", {}) or {}
+        if market:
+            parts.append(
+                f"{strategy} M:{market.get('mood','')}({market.get('mood_score','')}) "
+                f"ZT:{market.get('zt_count',0)} DT:{market.get('dt_count',0)} "
+                f"炸{market.get('broken_rate',0)}% F{_fmt(market.get('fund_flow',0)/1e8,1)}e"
+            )
+        themes = self.get("themes") or []
+        if themes:
+            parts.append("主线题材: " + ",".join(themes))
+
+        hints = self.get("hints") or {}
+        if hints:
+            parts.append(
+                f"参考门槛(非硬约束): p_up≥{hints.get('p_up_floor_suggest')} "
+                f"建议≤{hints.get('max_picks_suggest')}只 情绪桶:{self.get('mood_regime','')}"
+            )
+
+        profiles = self.get("profiles") or []
+        if not profiles:
+            parts.append("无候选画像")
+        else:
+            rows = ["CODE   NAME     SRC      CHG%   TRN%   额万      P↑     位置%   DISP%  RSI   量比  连板  主线命中/障碍"]
+            rows.append("------ -------- -------- ------ ------ -------- ------- ------ ------ ----- ----- ---- -------------")
+            for p in profiles:
+                t = p.get("tech") or {}
+                th = p.get("theme") or {}
+                hard = ",".join(p.get("hard") or []) or "-"
+                warn = p.get("warnings") or []
+                warn_s = (" | 软提示:" + ",".join(warn)) if warn else ""
+                hit = ("√" + ",".join(th.get("tags") or [])) if th.get("hit") else "-"
+                rows.append(
+                    f"{p.get('code',''):6} {str(p.get('name',''))[:7]:8} {str(p.get('source',''))[:7]:8} "
+                    f"{_fmt_pct(p.get('change_pct')):>6} {_fmt_pct(p.get('turnover_pct')):>6} "
+                    f"{_fmt(p.get('amount_wan'),0):>8} "
+                    f"{str(p.get('p_up') if p.get('p_up') is not None else '-'):>7} "
+                    f"{_fmt(t.get('pos_in_20d_pct'),1):>6} {_fmt(t.get('dist_ma20_pct'),1):>6} "
+                    f"{_fmt(t.get('rsi14'),0):>5} {_fmt(t.get('vol_ratio'),1):>5} "
+                    f"{t.get('zt_streak','-')!s:>4}  {hit} | 硬:{hard}{warn_s}"
+                )
+            rows.append("(P↑=P(次日涨)；列仅为事实排序参考，取舍由你决定；missing 见每行末尾)")
+            parts.append("\n".join(rows))
+            miss_rows = [(p.get("code"), p.get("missing")) for p in profiles if p.get("missing")]
+            if miss_rows:
+                parts.append("数据缺口: " + "；".join(
+                    f"{c}:{','.join(str(x) for x in m[:2])}" for c, m in miss_rows[:8]))
+
+        trimmed = self.get("trimmed") or 0
+        if trimmed:
+            parts.append(f"注: 因 limit 被裁掉 {trimmed} 只（pool={self.get('pool_size')}）")
+        if self.get("missing"):
+            parts.append("全局缺口: " + "；".join(str(m) for m in self["missing"][:4]))
+        if self.get("errors"):
+            parts.append("错误: " + "；".join(
+                f"{e.get('code')}:{e.get('error')}" for e in self["errors"][:4]))
         return "\n".join(parts)
 
     def _deep_analyze_md(self):

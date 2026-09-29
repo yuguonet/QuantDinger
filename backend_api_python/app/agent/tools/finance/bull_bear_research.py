@@ -1,6 +1,19 @@
 # -*- coding: utf-8 -*-
 """多空研究员 — 同时构建多头和空头论据，综合判断方向。"""
 from typing import Any, Dict, List
+
+# 2026-09-28 修复：本模块的 4 个内部分析函数（_analyze_trend/_get_volume_analysis/
+# _analyze_pattern/_get_indicator_snapshot）由 analysis_tools.py 内联而来，但内联时
+# **漏带了被内联代码所依赖的辅助函数**（_safe_round / _fetch_ohlcv / _calc_macd /
+# _calc_rsi / _calc_boll / _calc_kdj / logger / get_realtime_quote），导致这些函数
+# 一旦被调用即 NameError（被内层 except 吞掉后只返回 {"error": ...}，静默退化）。
+# 按项目"复用优于重定义"约定改为导入单一实现，不在此复制第三份。
+from app.agent.log import logger
+from app.agent.tools.finance._analysis_utils import _fetch_ohlcv, _safe_round
+from app.agent.tools.finance.analysis_tools import (
+    _calc_boll, _calc_kdj, _calc_macd, _calc_rsi,
+)
+from app.agent.tools.finance.data_tools import get_realtime_quote
 from app.agent.tools.finance.news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。

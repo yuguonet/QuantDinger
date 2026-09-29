@@ -1,7 +1,8 @@
 """scan.py (原 dragon_scan.py) — 自动策略组盘后全市场扫描
 
-触发: scheduler Task "dragon_scan" (once_per_day, 17:25, 在 post_market_batch 1D 回填
-      与龙虎榜落库 dragon_hot_daily(17:00+重试) 之后; 2026-09-18 由 16:30 重排)
+触发: scheduler Task "daily_scan" (事件驱动分发, 2026-09-29 取代 17:25 硬编码)。
+      各策略 ScanSpec.after_events/fire_at 声明依赖 (auto/sched.py::daily_fire_ready),
+      数据任务 mark_event 后就绪即跑 keys 子集; 事件齐/过 DAILY_FALLBACK_FIRE 放行。
 职责:
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
   2. 全市场逐股跑策略判定 (与回测同一份判定, core facade)。
@@ -12,6 +13,7 @@
 
 手动运行:
   python -m app.market_cn.auto.scan --run [--days 320]
+  python -m app.market_cn.auto.scan --run --keys g56,v1
 """
 from __future__ import annotations
 
@@ -151,19 +153,19 @@ def apply_unified_prefilter(sigs, bars, code, code_info, strat):
     return kept, last_u_fails
 
 
-def finalize_signal_rows(rows, logger=None):
-    """落库前归一 (2026-09-26 P0-4 唯一实现): 同族去重 → daily_limit 截断。
+def finalize_signal_rows(rows, logger=None, env_mode=None):
+    """落库前归一: 同族去重 → (策略层环境门) → daily_limit 截断。
 
-    顺序铁律 (与 run_scan 既有行为一致):
-      1. _dedupe_family 先做 —— 高版本替代低版本, 避免低版本占掉限额名额;
-      2. daily_limit 按 strategy 分组, score 降序截断 (0=不截断)。
+    2026-09-28: 环境门**不挡主干** — 只作用于 market_env="trend" 的策略;
+    counter/off 策略在弱市照常出信号 (反市场策略弱市可能更优)。
 
     Args:
-        rows: store.signal_row 产出的 dict 列表 (须含 strategy/code/score)
-        logger: 可选, 用于记录截断日志
+        rows: store.signal_row 产出的 dict 列表
+        logger: 可选
+        env_mode: 大盘环境档 full|reduce|halt (由 run_scan 传入)
 
     Returns:
-        list[dict]: 归一后的行 (新列表)
+        list[dict]
     """
     if not rows:
         return []
@@ -177,7 +179,28 @@ def finalize_signal_rows(rows, logger=None):
             keys.append(k)
     for key in keys:
         grp = [r for r in rows if r["strategy"] == key]
+        # 策略层环境门 (仅 trend 策略)
+        mode_str = env_mode or "full"
+        try:
+            me = strat_reg.market_env_of(key) or "off"
+        except Exception:
+            me = "off"
+        if me == "trend" and mode_str == "halt":
+            if logger is not None:
+                logger.info("[postfilter] %s trend×env=halt → 丢弃 %d 笔",
+                            key, len(grp))
+            continue
         cap = strat_reg.daily_limit(key)
+        if me == "trend" and mode_str == "reduce":
+            try:
+                from app.market_cn.auto.core.market_env import apply_env_to_limit
+                cap2 = apply_env_to_limit(cap, "reduce")
+                if logger is not None and cap2 != cap:
+                    logger.info("[postfilter] %s trend×reduce: limit %s → %s",
+                                key, cap, cap2)
+                cap = cap2
+            except Exception:
+                pass
         if cap and len(grp) > cap:
             if logger is not None:
                 logger.info("[postfilter] %s 信号 %d 笔超限额, 截断至 %d (score降序)",
@@ -191,12 +214,14 @@ def finalize_signal_rows(rows, logger=None):
 # 主扫描
 # ================================================================
 
-def run_scan(days=320, wait_data=True, max_wait_sec=3600):
+def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None):
     """盘后全市场扫描 (Phase 3: 注册表分发, 策略增删不改本函数)。返回摘要 dict。
 
     - trade_date = last_finish_trading_day()
-    - 遍历注册表中 enabled 且 kind=daily_close 的策略, 统一: 判定 → U1~U4 预过滤
-      (锚点=策略 prefilter_anchor) → daily_limit 截断(score降序) → 标准化行落库
+    - 遍历注册表中 enabled 且 kind=daily_close 的策略 (keys 非空则只跑该子集,
+      事件驱动分发用: 不同策略 after_events 就绪时刻不同, 分批触发), 统一:
+      判定 → U1~U4 预过滤 (锚点=策略 prefilter_anchor) → daily_limit 截断(score降序)
+      → 标准化行落库
     - 组对账 (活跃集不变时无操作, 防漂移)
     """
     from app.market_cn.auto import store
@@ -205,8 +230,13 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
     from app.market_cn.auto.core.market import is_limit_up, get_board_type
 
     strat_reg.autodiscover()
+    want = set(keys) if keys else None
     active = {k: s for k, s in strat_reg.all_strategies().items()
-              if strat_reg.is_enabled(k) and s.scan_spec.kind == "daily_close"}
+              if strat_reg.is_enabled(k) and s.scan_spec.kind == "daily_close"
+              and (want is None or k in want)}
+    if want is not None and not active:
+        logger.info("[dragon_scan] keys=%s 无启用 daily_close 策略, 跳过", sorted(want))
+        return {"status": "no_active_strategy", "keys": sorted(want), "target": _target_date()}
     logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
     # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定同步过 DayTrace shim 产 sample。
@@ -291,26 +321,65 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600):
         for _pr in (live_probes or {}).values():
             _pr.close()
 
-    # 展示归一 + 每日限额 (2026-09-26 P0-4: 唯一实现 finalize_signal_rows)
+    # 2026-09-28 A: 大盘资金流环境门 —— **先于限额截断** (reduce 砍名额)
+    env_info = {}
+    try:
+        from app.market_cn.auto.core.market_env import market_flow_gate
+        env_info = market_flow_gate(as_of=target)
+        logger.info("[dragon_scan] 环境门 mode=%s | %s",
+                    env_info.get("mode"), env_info.get("reason"))
+    except Exception as e:
+        logger.warning("[dragon_scan] 环境门失败(忽略): %s", e)
+
+    # 展示归一 + 每日限额 (env=reduce → 名额减半)
     _n_raw = len(rows)
-    rows = finalize_signal_rows(rows, logger=logger)
+    rows = finalize_signal_rows(rows, logger=logger,
+                                env_mode=env_info.get("mode"))
     if len(rows) != _n_raw:
         logger.info("[dragon_scan] 同族去重+限额截断: %d → %d", _n_raw, len(rows))
 
-    # M12: 显式声明本批策略范围 —— 前置 DELETE 只清这些策略的 watch_pending,
-    # 不依赖 rows 推断 (0 信号时也要把本轮落选的旧 watch_pending 清掉)。
+    # M12: 显式声明本批策略范围 —— 前置 DELETE 只清这些策略的 watch_pending
+    # 2026-09-28 B: 个股 LHB/资金流 —— **纸面记录**, 不改落库
+    if rows:
+        try:
+            from app.market_cn.auto.core.stock_env import stock_event_gate
+            n_red = n_halt = 0
+            for row in rows[:20]:
+                g = stock_event_gate(row.get("code"), date=target)
+                if g.get("mode") == "halt":
+                    n_halt += 1
+                elif g.get("mode") == "reduce":
+                    n_red += 1
+            logger.info("[dragon_scan] 个股事件门(纸面) halt=%d reduce=%d / %d",
+                        n_halt, n_red, min(20, len(rows)))
+        except Exception as e:
+            logger.warning("[dragon_scan] 个股事件门失败(忽略): %s", e)
+
+    # 2026-09-28: 环境门只作用于 market_env="trend" 策略 (见 finalize_signal_rows);
+    # counter/off 策略在弱市仍出信号 — 不在主干全局拦截。
     result = store.upsert_scan_signals(target, rows, strategies=tuple(active))
     store.sync_watchlist_group(store.get_active_signals())
     store.cleanup_old(days=15)
-    logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs)",
-                len(codes), result.get("written", 0), time.time() - t0)
-    return {"status": "ok", "target": target, "codes": len(codes), "signals": result.get("written", 0)}
+    logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs) env=%s",
+                len(codes), result.get("written", 0), time.time() - t0,
+                env_info.get("mode", "-"))
+    return {"status": "ok", "target": target, "codes": len(codes),
+            "signals": result.get("written", 0), "env": env_info}
 
 
-def run_scan_knife(max_wait_sec=2400, wait_data=True):
+def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
     """盘中窗口扫描 (kind=intraday_window 策略, 由注册表动态收集: 现为 knife_catch / tail_oversold)。
 
-    调度: scheduler Task "knife_scan", 14:30 触发 (trading_only)。
+    调度: scheduler Task "knife_scan" —— **多触发点** (2026-09-29 重做):
+      sched 事实源 (all_schedules) 给每个启用策略排一个触发点, 相邻 <=30min 合并一批:
+        09:40 → lead_chase (早盘单点)   |   14:30 → knife_catch + tail_oversold (尾盘批)
+      keys = 本批策略; None = 全量 (兼容手动 CLI 与旧调用)。
+      只跑本批 ⇒ purge_buy_today / daily_limit 的作用域也只限本批
+      (_scan_cycle 按 cycle_strats.keys() 限定, 不会误伤其它策略的持仓行)。
+    为什么分批: 旧实现一天只触发一次、时刻取 min(全部策略首拍) ⇒ 早盘 lead_chase
+      09:40 把尾盘组拉到 09:40 ⇒ 死等 start_hm=14:50 ⇒ 40min 超时放弃且
+      once_per_day 已标记 ⇒ 当日 knife_catch/tail_oversold 全天 0 信号
+      (09-28 实证 13:39:28「等待超时, 放弃本次」)。
     流程:
       1. 等待到滚动起点 (有 rolling_preview 策略时取最早者, 现为 14:50; 否则 14:56 保持旧行为)
       2. 滚动判定 (14:50~14:59): 每分钟一轮; 14:50 起触发即买入 (已定价行不被冲掉)
@@ -330,8 +399,11 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()
               if strat_reg.is_enabled(k) and s.scan_spec.kind == "intraday_window"}
+    if keys is not None:
+        active = {k: v for k, v in active.items() if k in tuple(keys)}
     if not active:
-        return {"status": "no_intraday_strategy"}
+        return {"status": "no_intraday_strategy", "keys": list(keys or [])}
+    logger.info("[knife_scan] 本批策略: %s", ",".join(sorted(active)))
 
     store.ensure_tables()
     from app.market_cn.auto.monitor import (
@@ -344,13 +416,31 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     # ScanSpec 默认兜底 — 否则改 config 窗口后两处事实源分叉
     from app.market_cn.auto.sched import resolve_schedule
     starts = []
+    ends = []
     for k in preview:
         decl = resolve_schedule(k)
         if decl and decl.get("windows"):
             starts.append(decl["windows"][0])
         else:
             starts.append(active[k].scan_spec.windows[0])
-    start_hm = min(starts, default="14:56")
+    if starts:
+        start_hm = min(starts)
+    elif keys is not None:
+        # 分批触发且本批无预览策略 ⇒ 等到**本批窗口末拍**再终审。
+        # (lead_chase windows=("09:40","09:40") ⇒ 末拍 09:40 ⇒ 立即执行;
+        #  若沿用旧 fallback "14:56" 会从 09:40 死等到 14:56 再 40min 超时放弃 ——
+        #  这正是 09-28/09-29 的故障形态)
+        for k in active:
+            decl = resolve_schedule(k)
+            if decl and decl.get("windows"):
+                ends.append(decl["windows"][1])
+            else:
+                ends.append(active[k].scan_spec.windows[1])
+        start_hm = max(ends, default="14:56")
+    else:
+        start_hm = "14:56"
+    logger.info("[knife_scan] 等待目标 start_hm=%s (预览策略=%s)",
+                start_hm, ",".join(sorted(preview)) or "无")
 
     # ST / 北交所 通用排除 (knife 回测口径)
     try:
@@ -477,8 +567,9 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True):
     t0 = time.time()
     result = _scan_cycle(active, snaps)
 
-    logger.info("[knife_scan] 完成: 快照 %d, 信号 %d 笔 (%.0fs)",
-                len(snaps), result.get("written", 0), time.time() - t0)
+    logger.info("[knife_scan] 完成: 快照 %d, 信号 %d 笔 (%.0fs) [策略=%s]",
+                len(snaps), result.get("written", 0), time.time() - t0,
+                ",".join(sorted(active)))
     return {"status": "ok", "target": today, "signals": result.get("written", 0),
             "mkt_gain": round(_mkt_gain(snaps), 3)}
 
@@ -494,10 +585,12 @@ def main():
     parser.add_argument("--run", action="store_true", help="执行扫描")
     parser.add_argument("--days", type=int, default=320, help="向前取N个交易日")
     parser.add_argument("--no-wait", action="store_true", help="不等待数据就绪")
+    parser.add_argument("--keys", default="", help="只跑指定 daily_close 策略, 逗号分隔 (默认全量)")
     parser.add_argument("--knife", action="store_true", help="执行盘中接刀扫描 (手动)")
     args = parser.parse_args()
     if args.run:
-        summary = run_scan(days=args.days, wait_data=not args.no_wait)
+        keys = tuple(k.strip() for k in args.keys.split(",") if k.strip()) or None
+        summary = run_scan(days=args.days, wait_data=not args.no_wait, keys=keys)
         print(summary)
     elif args.knife:
         summary = run_scan_knife(wait_data=not args.no_wait)

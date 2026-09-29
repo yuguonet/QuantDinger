@@ -81,6 +81,45 @@ def mark_scheduler_task_done(task_name: str, trade_date: str):
         logger.warning("[scheduler] 标记完成失败(忽略): %s", e)
 
 
+def _done_row_name(r):
+    """从游标行取 task_name。游标是 RealDictCursor → 行为 dict, 勿用 r[0] (KeyError: 0)。"""
+    if isinstance(r, dict):
+        return r.get("task_name")
+    try:
+        return r[0]
+    except Exception:
+        return None
+
+
+def scheduler_done_names(task_prefix: str, trade_date: str) -> set:
+    """批量取 trade_date 当日已标记的 task_name 集合 (prefix 过滤)。失败→空集(保守补跑)。
+
+    2026-09-29: 原实现 r[0] 对 RealDictCursor 行抛 KeyError: 0 ⇒ 批量读恒失败 ⇒
+    daily_scan 每 60s「保守补跑」全市场重复扫描。改为按列名取。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            _ensure_sched_done_table(cur)
+            # prefix 经 LIKE 转义: 调用方传 "daily_scan@" 这类无通配前缀, 只在末尾补 %
+            cur.execute(
+                "SELECT task_name FROM qd_scheduler_done "
+                "WHERE trade_date = %s AND task_name LIKE %s",
+                (trade_date, task_prefix + "%"),
+            )
+            names = set()
+            for r in cur.fetchall():
+                n = _done_row_name(r)
+                if n:
+                    names.add(n)
+            cur.close()
+        return names
+    except Exception as e:
+        logger.warning("[scheduler] 批量读完成标记失败(保守补跑): %s", e)
+        return set()
+
+
 # ═══════════════════════════════════════════════════════════
 #  时段判断
 # ═══════════════════════════════════════════════════════════
@@ -201,6 +240,8 @@ def _save_dragon_hot_daily():
             )
             # 拿到当日榜 / 非交易日 / 已到最后一次尝试 → 结束; 否则等 10min 重试
             if dt.get("total", 0) > 0 or not is_trading_day(today) or attempt >= 3:
+                if dt.get("total", 0) > 0:
+                    _mark_event("lhb", today)
                 return
             logger.warning("[dragon_hot_daily] 当日龙虎榜尚未发布(attempt %d), 10min 后重试", attempt)
             _time.sleep(600)
@@ -243,10 +284,62 @@ def _refresh_realtime_snapshot():
         _lg.warning("[fund_flow] 盘中派生刷新失败(不影响 snapshot): %s", e)
 
 
-def _dragon_strategy_scan():
-    """盘后: 龙回头/V1/断板/3板接力 全市场扫描 (1D 就绪后判定, 写 qd_dragon_signals)"""
+def _mark_event(name: str, date: str = None):
+    """数据任务完成后打事件点 (策略 ScanSpec.after_events 消费; 见 auto/events.py)。"""
+    try:
+        from app.market_cn.auto.events import mark_event
+        if date is None:
+            from app.utils.trading_calendar import last_finish_trading_day
+            date = last_finish_trading_day()
+        mark_event(name, date)
+    except Exception as e:
+        logger.warning("[events] mark %s 失败: %s", name, e)
+
+
+# 进程内已扫缓存 (2026-09-29): DB 批量读抖动时仍不重复全市场扫描
+# {trade_date: {strategy_key, ...}}。与 qd_scheduler_done 双写/双读, 任一命中即视为已完成。
+_daily_scanned: dict = {}
+
+
+def _daily_scan_dispatch():
+    """盘后扫描分发 (2026-09-29): 策略 after_events/fire_at 就绪即触发 keys 子集。
+
+    取代 dragon_scan 17:25 硬编码 —— 触发声明在策略 ScanSpec / config.json schedule,
+    数据任务 mark_event, 本函数只做「就绪集 ∩ 未扫描」分发。无就绪时 cheap 返回。
+    完成标记按 **target 交易日** 记 (勿用自然日: 早盘补跑 target=昨日)。
+    """
+    from app.market_cn.auto.sched import daily_fire_ready, enabled_daily_keys
     from app.market_cn.auto.scan import run_scan
-    run_scan()
+    from app.utils.trading_calendar import last_finish_trading_day
+
+    target = last_finish_trading_day()
+    keys = enabled_daily_keys()
+    if not keys:
+        return
+    done = set(scheduler_done_names("daily_scan@", target))
+    done |= _daily_scanned.get(target, set())
+    ready = []
+    reasons = {}
+    for key in keys:
+        if f"daily_scan@{key}" in done or key in _daily_scanned.get(target, set()):
+            continue
+        ok, reason = daily_fire_ready(key, date=target)
+        reasons[key] = reason
+        if ok:
+            ready.append(key)
+    if not ready:
+        return
+    logger.info("[daily_scan] 就绪触发 keys=%s target=%s | %s", ready, target, reasons)
+    result = run_scan(keys=tuple(ready))
+    status = result.get("status") if isinstance(result, dict) else None
+    if status in ("ok", "no_active_strategy"):
+        _daily_scanned.setdefault(target, set()).update(ready)
+        for key in ready:
+            mark_scheduler_task_done(f"daily_scan@{key}", target)
+        logger.info("[daily_scan] 完成 %s → %s", ready, result)
+    else:
+        # data_not_ready 等: 不标记, 下一轮 60s 重试 (run_scan 内部 wait_data 兜 1D)
+        logger.warning("[daily_scan] 未完成(不标记, 下轮重试): %s → %s", ready, result)
 
 
 def _dragon_strategy_monitor():
@@ -255,12 +348,19 @@ def _dragon_strategy_monitor():
     run_monitor_safe()
 
 
-def _dragon_strategy_knife_scan():
-    """盘中尾盘: 窗口策略扫描 (14:30 触发预热)。
-    knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审;
-    dragon_callback: 14:50 起每分钟滚动预览 + 14:56 终审 (收盘买入, 2026-09-19 起)"""
+def _dragon_strategy_knife_scan(slot=None):
+    """盘中窗口: 窗口策略扫描 (按 slot 触发)。
+
+    slot = {"hm": "HH:MM", "keys": [...]} —— 本次只跑这批策略 (None = 兼容旧的全量调用)。
+    时刻与策略集合来自 auto/sched.py 事实源, 由 _intraday_trigger_slots() 分组:
+      09:40 → lead_chase(早盘单点)  |  14:30 → knife_catch + tail_oversold(尾盘批)
+    knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审。
+    """
     from app.market_cn.auto.scan import run_scan_knife
-    run_scan_knife()
+    if slot:
+        run_scan_knife(keys=tuple(slot["keys"]))
+    else:
+        run_scan_knife()
 
 
 def _refresh_backfill_1m():
@@ -339,12 +439,14 @@ def _post_market_batch():
 
     # 1m K线回填 (mootdx, 每标的240条) — 替代原 15m，精度更高
     _refresh_backfill_1m()
+    _mark_event("minute_1m", target)
 
     # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
     _sync_index_minute()
 
     # 指数大盘资金流同步 (kline_index_fflow, EM 1分钟累计, 只能向前攒)
     _sync_index_fflow()
+    _mark_event("index_fflow", target)
 
     _refresh_daily()
     _refresh_post_market()
@@ -355,6 +457,7 @@ def _post_market_batch():
         logger.info("[post_market] 1D 写入 %d 条", result_1d["written"])
     else:
         logger.info("[post_market] 1D 无新数据 (skipped=%s)", result_1d.get("skipped"))
+    _mark_event("daily_1d", target)
 
     # 检测数据是否到位
     dt_date = nb_date = ""
@@ -375,6 +478,8 @@ def _post_market_batch():
 
     if dt_date >= target and nb_date >= target:
         logger.info("[post_market] 数据到位 (dt=%s, nb=%s, 目标=%s)", dt_date, nb_date, target)
+        if nb_date >= target:
+            _mark_event("northbound", target)
     else:
         logger.info("[post_market] 数据未到 (dt=%s, nb=%s, 目标≥%s)，10min 后重试", dt_date, nb_date, target)
         _time.sleep(600)
@@ -427,6 +532,8 @@ class Task:
     daily_done: str = ""          # 一天一次的日期标记
     trigger_hour: int = -1        # 定时触发: 小时 (-1=不定时)
     trigger_minute: int = 0       # 定时触发: 分钟
+    once_per_slot: bool = False   # 多触发点: 每个 slot 各跑一次 (盘中窗口策略组)
+    slots_done: set = field(default_factory=set)   # 当日已完成的 slot 时刻集合
 
 
 def _dragon_interval():
@@ -435,30 +542,92 @@ def _dragon_interval():
 
 # ── 盘中窗口策略组触发时刻: 以 auto/sched.py 分段声明为唯一事实源 ──
 # (config.json schedule 段 → 各策略 first 的最早者; 接线 2026-09-09 用户批准)
-_knife_trigger_cache = {"date": "", "hm": "14:30"}
+_knife_slot_cache = {"date": "", "slots": []}
+SLOT_GAP_MIN = 30        # 相邻首拍间隔 <= 30min 合并为同一批
 
 
-def _knife_trigger_hm():
-    """knife_scan 触发时刻 "HH:MM"。按天缓存 (all_schedules 会 autodiscover, 勿每 10s 调)。"""
+def _hm_to_min(hm):
+    """“HH:MM” → 当日分钟数 (用于时刻比较/聚类)。"""
+    try:
+        h, m = str(hm).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return -1
+
+
+def _intraday_trigger_slots():
+    """盘中窗口策略组的**多个**触发点: [{"hm": "HH:MM", "keys": [...]}, ...] (hm 升序)。
+
+    事实源 = auto/sched.py::all_schedules() (策略 ScanSpec / config.json schedule 段)。
+    只排**已启用**策略 —— 停用策略不占触发点 (过滤是消费方职责, sched 只给事实源)。
+
+    ★ 相邻 <= SLOT_GAP_MIN 的首拍合并为一批: 尾盘 14:30(knife_catch) + 14:50(tail_oversold)
+      **必须**合并 —— 拆开则 14:30 批 sleep 到 15:00, 14:50 批因 `running` 防重入被
+      跳过 ⇒ tail_oversold 当天一次都不跑。批次触发时刻 = 组内最早首拍。
+    ★ 为什么不用 min(): 旧实现把所有策略压成一个时刻, 早盘/停用策略 (lead_chase
+      09:40) 会把尾盘组拉到 09:40 ⇒ 09:40 触发后死等 start_hm=14:50 ⇒ 40min 超时
+      放弃且 once_per_day 已标记 ⇒ 当日 knife_catch/tail_oversold 全天 0 信号
+      (2026-09-28 实证 13:39:28「等待超时, 放弃本次」)。
+
+    按天缓存 (all_schedules 会 autodiscover, 勿每 10s 调)。
+    """
     today = datetime.now().strftime("%Y-%m-%d")
-    if _knife_trigger_cache["date"] != today:
-        hm = "14:30"
-        try:
-            from app.market_cn.auto.sched import all_schedules
-            firsts = [ts[0] for ts in all_schedules().values() if ts]
-            if firsts:
-                hm = min(firsts)
-        except Exception as e:
-            logger.warning("[scheduler] 读取 sched 时刻表失败, knife_scan 用默认 14:30: %s", e)
-        _knife_trigger_cache.update(date=today, hm=hm)
-        logger.info("[scheduler] knife_scan 触发时刻 (sched 事实源): %s", hm)
-    return _knife_trigger_cache["hm"]
+    if _knife_slot_cache["date"] == today:
+        return _knife_slot_cache["slots"]
+
+    first_of = {}          # key -> (首拍, 末拍)
+    try:
+        from app.market_cn.auto.sched import all_schedules
+        from app.market_cn.auto.strategies import is_enabled
+        for key, times in all_schedules().items():
+            if not times or not is_enabled(key):
+                continue
+            first_of[key] = (times[0], times[-1])
+    except Exception as e:
+        logger.warning("[scheduler] 读取 sched 时刻表失败, 盘中触发点回退 14:30: %s", e)
+
+    slots = []
+    for key, (first, _last) in sorted(first_of.items(), key=lambda kv: _hm_to_min(kv[1][0])):
+        if slots and _hm_to_min(first) - _hm_to_min(slots[-1]["hm"]) <= SLOT_GAP_MIN:
+            slots[-1]["keys"].append(key)
+            if _hm_to_min(first) < _hm_to_min(slots[-1]["hm"]):
+                slots[-1]["hm"] = first
+        else:
+            slots.append({"hm": first, "keys": [key]})
+    for s in slots:
+        s["keys"] = sorted(s["keys"])
+
+    _knife_slot_cache.update(date=today, slots=slots)
+    logger.info("[scheduler] 盘中触发点 (sched 事实源): %s",
+                " | ".join(f"{s['hm']}={'+'.join(s['keys'])}" for s in slots) or "无")
+    return slots
+
+
+def _next_pending_slot(task, now_dt=None):
+    """取一个「时刻已到 且 当日未跑过」的 slot; 无则 None。"""
+    now_dt = now_dt or datetime.now()
+    today = now_dt.strftime("%Y-%m-%d")
+    hm_now = now_dt.strftime("%H:%M")
+    for slot in _intraday_trigger_slots():
+        hm = slot["hm"]
+        if hm > hm_now:
+            break                       # 升序, 后面的都还没到点
+        if hm in task.slots_done:
+            continue
+        if scheduler_task_done(f"{task.name}@{hm}", today):   # 跨重启守卫
+            task.slots_done.add(hm)
+            continue
+        return slot
+    return None
 
 
 def _task_trigger_hm(task):
-    """任务的日级触发时刻 "HH:MM"; 无定时触发返回 None。"""
-    if task.name == "knife_scan":
-        return _knife_trigger_hm()
+    """任务的日级触发时刻 "HH:MM"; 无定时触发返回 None。
+
+    多触发点任务 (once_per_slot) **不走这里** —— 时刻来自 _intraday_trigger_slots()。
+    """
+    if task.once_per_slot:
+        return None
     if task.trigger_hour >= 0:
         return f"{task.trigger_hour:02d}:{task.trigger_minute:02d}"
     return None
@@ -477,6 +646,7 @@ def _save_fund_flow_daily():
         from app.market_cn.fund_flow_api import backfill_stock_from_1m
         r = backfill_stock_from_1m(days=7)
         logger.info("[fund_flow_daily] %s", r)
+        _mark_event("fund_flow")
     except Exception as e:
         logger.warning("[fund_flow_daily] 失败: %s", e)
 
@@ -494,14 +664,18 @@ TASKS = [
     # 日级任务 (定时触发，一天一次)
     Task("morning_batch",     _morning_batch,     interval=86400, trading_only=False, once_per_day=True, trigger_hour=6,  trigger_minute=0),
     Task("post_market_batch", _post_market_batch, interval=86400, trading_only=False, once_per_day=True, trigger_hour=15, trigger_minute=30),
-    # 龙虎榜落库 17:00 (LHB ~17:00-17:30 发布, 未发布自动重试), 先于 dragon_scan(17:25)
+    # 龙虎榜落库 17:00 (LHB ~17:00-17:30 发布, 未发布自动重试)。完成后 mark_event("lhb"),
+    # 盘后策略按 ScanSpec.after_events 消费 (不再依赖固定 17:25 时刻)。
     Task("dragon_hot_daily",  _save_dragon_hot_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=0),
-    # 自动策略组: 盘后扫描(1D就绪后) + 盘中状态机(60s), 龙回头Pro已于2026-09-06下线
-    # 2026-09-18 时序重排: 16:30→17:25, 晚于龙虎榜落库(17:00+重试), 杜绝 LHB 时序错位
-    Task("dragon_scan",    _dragon_strategy_scan,    interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=25),
+    # 自动策略组: 盘后扫描(事件驱动分发) + 盘中状态机(60s)
+    # 2026-09-29: dragon_scan 17:25 硬编码 → daily_scan 按策略 after_events/fire_at 就绪触发
+    # (auto/sched.py::daily_fire_ready + auto/events.py). 数据任务 mark_event, 本任务 60s 扫就绪集。
+    Task("daily_scan",    _daily_scan_dispatch,    interval=60, trading_only=False),
     # knife_scan 触发时刻由 auto/sched.py 分段声明决定 (config.json schedule 段为事实源,
     # 见 _knife_trigger_hm; Task 上的 trigger_* 仅作 sched 不可用时的兜底)
-    Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_day=True, trigger_hour=14, trigger_minute=30),
+    # 盘中窗口策略组: **多触发点** (每个 slot 各跑一次, 时刻/策略集合来自 sched 事实源)。
+    # 不再用 trigger_hour 单一时刻 —— 那会让 09:40(lead_chase) 把尾盘组拉早 (见 _intraday_trigger_slots)。
+    Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_slot=True),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
     # 资金流日度落库 (2026-09-27 用户裁定): `kline_15m` 已作废 => 1m 是唯一可用分钟源。
     # 放 18:00 —— 晚于 post_market_batch(15:30, 内含 1m 回填), 与之解耦;
@@ -522,18 +696,25 @@ def _get_interval(task: Task) -> int:
 # ═══════════════════════════════════════════════════════════
 
 
-def _worker(task: Task):
-    """执行单个任务，完成后退出。"""
+def _worker(task: Task, slot=None):
+    """执行单个任务，完成后退出。slot 不为 None 时是多触发点任务的一次触发。"""
+    tag = f"{task.name}@{slot['hm']}" if slot else task.name
     try:
-        task.fn()
+        if slot is not None:
+            task.fn(slot)
+        else:
+            task.fn()
         # 跨重启守卫: 成功完成才标记, 失败不标记→当日仍可被补跑重试
-        if task.once_per_day:
+        if slot is not None:
+            task.slots_done.add(slot["hm"])
+            mark_scheduler_task_done(tag, datetime.now().strftime("%Y-%m-%d"))
+        elif task.once_per_day:
             mark_scheduler_task_done(task.name, datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
-        logger.error("[%s] 执行失败: %s", task.name, e)
+        logger.error("[%s] 执行失败: %s", tag, e)
     finally:
         task.running = False
-    logger.debug("[%s] 线程退出", task.name)
+    logger.debug("[%s] 线程退出", tag)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -594,6 +775,16 @@ def _scheduler_loop():
                 task.daily_done = today
                 continue
 
+            # ── 多触发点任务 (盘中窗口策略组): 每个 slot 独立触发一次 ──
+            #    必须早于下面的 interval 分支: slot 任务不受 interval(86400) 限制,
+            #    否则第一个 slot 跑完后第二个 slot 会被「间隔未到」跳过。
+            if task.once_per_slot:
+                slot = _next_pending_slot(task, now_dt)
+                if slot is None:
+                    continue
+                _launch(task, slot)
+                continue
+
             # 日级定时任务：未到触发时刻 → 跳过 (knife_scan 时刻来自 sched 事实源)
             if task.once_per_day:
                 trig = _task_trigger_hm(task)
@@ -617,16 +808,17 @@ def _scheduler_loop():
             _launch(task)
 
 
-def _launch(task: Task):
-    """拉起 worker 线程。"""
+def _launch(task: Task, slot=None):
+    """拉起 worker 线程。slot 不为 None 时只跑该 slot 的策略批。"""
     task.running = True
     task.last_run = _time.time()
     if task.once_per_day:
         task.daily_done = datetime.now().strftime("%Y-%m-%d")
 
-    t = threading.Thread(target=_worker, args=(task,), daemon=False, name=f"work-{task.name}")
+    tag = f"{task.name}@{slot['hm']}" if slot else task.name
+    t = threading.Thread(target=_worker, args=(task, slot), daemon=False, name=f"work-{tag}")
     t.start()
-    logger.info("[scheduler] → %s (间隔 %ds)", task.name, _get_interval(task))
+    logger.info("[scheduler] → %s (间隔 %ds)", tag, _get_interval(task))
 
 
 # ═══════════════════════════════════════════════════════════

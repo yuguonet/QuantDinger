@@ -252,7 +252,7 @@ class Relay3Strategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "limit_up"      # U1~U4 锚定最近涨停日 (3板日; Phase 3 顺手修复旧扫描漏过滤)
     entry_style = "r3"
-    scan_spec = ScanSpec(kind="daily_close")
+    scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(PARAMS)
 
     # ---- 信号判定 ----

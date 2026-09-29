@@ -367,6 +367,7 @@ class LeadChaseStrategy(StrategyBase):
     exit_exec_same_day = True
     signal_state = "buy_today"
     data_needs = ("daily", "snapshot", "minute_live")
+    market_env = "trend"   # 追涨顺势: 弱市 reduce/halt (2026-09-28)
 
     # ── 第一段: 全市场快照便宜预筛 (时间窗 + 可买入 + 涨幅 + 早盘噪音) ──
     def intraday_shortlist(self, snaps, mkt_gain, **params):

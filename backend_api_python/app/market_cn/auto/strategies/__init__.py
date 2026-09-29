@@ -113,8 +113,8 @@ def is_enabled(key):
     return bool(_strategy_cfg(key).get("enabled", False))
 
 
-def daily_limit(key, default=5):
-    """每日信号入库上限 (relay3 现值 2, 其余 5)。"""
+def daily_limit(key, default=20):
+    """每日信号入库上限。2026-09-28: 默认 20; 事实源=config.json strategies.<key>.daily_limit。"""
     v = _strategy_cfg(key).get("daily_limit", default)
     return int(v) if v is not None else default
 
@@ -153,3 +153,21 @@ def live_probe_enabled():
     离线按 kline 回填; 与回测探针同 schema, sample_build 可直接消费)。
     """
     return bool(load_config().get("live_probe", True))
+
+
+def market_env_of(key):
+    """策略的大盘环境门模式 (config.json 优先; 默认 off=全通)。
+
+    2026-09-28 用户裁定: 放 config 最简单; 默认全通。
+    返回: "off" | "trend" | "counter"
+    """
+    v = _strategy_cfg(key).get("market_env")
+    if v in ("off", "trend", "counter"):
+        return v
+    # 类属性兜底 (向后兼容)
+    try:
+        s = get_strategy(key)
+        v = getattr(s, "market_env", "off")
+        return v if v in ("off", "trend", "counter") else "off"
+    except Exception:
+        return "off"
