@@ -299,6 +299,13 @@ def _mark_event(name: str, date: str = None):
 # 进程内已扫缓存 (2026-09-29): DB 批量读抖动时仍不重复全市场扫描
 # {trade_date: {strategy_key, ...}}。与 qd_scheduler_done 双写/双读, 任一命中即视为已完成。
 _daily_scanned: dict = {}
+# dispatch 维护的空闲标志: 当日已扫完 → 间隔退避 600s + 压掉空转 INFO (2026-09-29)
+_daily_scan_state = {"pending": True}
+
+
+def _daily_scan_interval() -> int:
+    """有未扫策略 → 60s; 当日已扫完 → 600s 自愈兜底 (重启/补数据用)。"""
+    return 60 if _daily_scan_state.get("pending", True) else 600
 
 
 def _daily_scan_dispatch():
@@ -315,18 +322,22 @@ def _daily_scan_dispatch():
     target = last_finish_trading_day()
     keys = enabled_daily_keys()
     if not keys:
+        _daily_scan_state["pending"] = False
         return
     done = set(scheduler_done_names("daily_scan@", target))
     done |= _daily_scanned.get(target, set())
     ready = []
     reasons = {}
+    still_pending = []
     for key in keys:
         if f"daily_scan@{key}" in done or key in _daily_scanned.get(target, set()):
             continue
+        still_pending.append(key)
         ok, reason = daily_fire_ready(key, date=target)
         reasons[key] = reason
         if ok:
             ready.append(key)
+    _daily_scan_state["pending"] = bool(still_pending)
     if not ready:
         return
     logger.info("[daily_scan] 就绪触发 keys=%s target=%s | %s", ready, target, reasons)
@@ -339,8 +350,12 @@ def _daily_scan_dispatch():
             mark_scheduler_task_done(f"daily_scan@{key}", target)
         logger.info("[daily_scan] 完成 %s → %s", ready, result)
     else:
-        # data_not_ready 等: 不标记, 下一轮 60s 重试 (run_scan 内部 wait_data 兜 1D)
+        # data_not_ready 等: 不标记, 下一轮重试 (run_scan 内部 wait_data 兜 1D)
         logger.warning("[daily_scan] 未完成(不标记, 下轮重试): %s → %s", ready, result)
+    # 重算 pending: 扫成功且 ready 覆盖了全部待扫 → 退避
+    if status in ("ok", "no_active_strategy"):
+        remaining = [k for k in still_pending if k not in set(ready)]
+        _daily_scan_state["pending"] = bool(remaining)
 
 
 def _dragon_strategy_monitor():
@@ -708,9 +723,11 @@ TASKS = [
 
 
 def _get_interval(task: Task) -> int:
-    """动态间隔（dragon 自适应）。"""
+    """动态间隔（dragon / daily_scan 自适应）。"""
     if task.name == "dragon_pools":
         return _dragon_interval()
+    if task.name == "daily_scan":
+        return _daily_scan_interval()
     return task.interval
 
 
@@ -871,7 +888,12 @@ def _launch(task: Task, slot=None):
     tag = f"{task.name}@{slot['hm']}" if slot else task.name
     t = threading.Thread(target=_worker, args=(task, slot), daemon=False, name=f"work-{tag}")
     t.start()
-    logger.info("[scheduler] → %s (间隔 %ds)", tag, _get_interval(task))
+    interval = _get_interval(task)
+    # daily_scan 空转不刷 INFO (2026-09-29): 真正扫描时由 dispatch 打「就绪触发/完成」
+    if task.name == "daily_scan" and not _daily_scan_state.get("pending", True):
+        logger.debug("[scheduler] → %s (空闲退避 %ds)", tag, interval)
+    else:
+        logger.info("[scheduler] → %s (间隔 %ds)", tag, interval)
 
 
 # ═══════════════════════════════════════════════════════════

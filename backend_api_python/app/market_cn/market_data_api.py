@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """market_data_api.py — 行情事件/资金流 **数据层公共 API** (2026-09-28)
 
-定位 (与 fund_flow_api 同级):
-  auto 系统只经本模块取 **龙虎榜 / 个股资金流 / 大盘资金流**,
-  不直接 import dragon_tiger_store / fund_flow 内部实现, 保证口径单点。
+定位:
+  auto 系统经本模块取 **龙虎榜 / 个股资金流 / 大盘资金流**;
+  资金流本体的**唯一出入口是 `fund_flow_api.py`** (2026-09-29 收口:
+  实时←realtime_snapshot, 日线←kline_1m, 板块←成分聚合)。本文件对资金流
+  只做薄转发, 勿在这里加取数逻辑; 龙虎榜仍直接读 dragon_tiger_store。
 
-  大盘资金流 → fund_flow_api.market_flow_summary (已在用)
+  大盘资金流 → fund_flow_api.market_flow_summary / market_fund_flow_*
   个股资金流 → fund_flow_api.stock_fund_flow_realtime / history
   龙虎榜     → dragon_tiger_store.query_dragon_tiger (只读)
 

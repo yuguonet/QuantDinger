@@ -1,28 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-fund_flow_api.py — 通用资金流 API (2026-09-26)
+fund_flow_api.py — 资金流**唯一出入口** (2026-09-29 收口)
 
-覆盖三类对象 × 实时/历史:
-  1. 大盘   market_fund_flow_*
-  2. 个股   stock_fund_flow_*
-  3. 行业/概念  sector_fund_flow_*   (board_type = industry | concept)
+覆盖三类对象 x 实时/日线:
+  1. 大盘   market_fund_flow_realtime / market_fund_flow_history
+  2. 个股   stock_fund_flow_realtime  / stock_fund_flow_history
+  3. 行业/概念 sector_fund_flow_realtime / sector_fund_flow_history
+             (board_type = industry | concept)
 
-设计要点
---------
-- **门面层**: 取数仍走既有实现 (index / tape / fund_flow_local / hub.index_fflow),
-  本模块只做: 统一 schema → 历史入库 → 5~30 日裁剪 → 实时/历史读口。\n- **方向优先** (2026-09-26): 用户裁定不关心主力/全量分类, 只要流入/流出方向;\n  snapshot 汇总已清洗 688/北交所/脏量, 输出 net_yi + direction。
-- **历史表** (market DB):
-    qd_fund_flow_market   日度大盘 (remote EM 日线 + 我们快照可补)
-    qd_fund_flow_stock    日度个股
-    qd_fund_flow_sector   日度行业/概念 **快照累积** (上游只给 今日/3/5/10 日聚合,
-                          没有逐日序列 → 历史只能靠每日落一行)
-- **口径标注** (不编造):
-    source = eastmoney | sina | snapshot_approx | hub_index_fflow
-    approx = True 时为量价方向近似 (realtime_snapshot), 非主力/超大单分类
-- **保留天数** `KEEP_DAYS_DEFAULT=1200`(约 3.3 年): 个股表 `qd_fund_flow_stock` 是我们
-  从本地分钟 K 线回填的研究历史库(2024-01-23 起), 按 30 天滚动裁剪会把它清空;
-  大盘/板块同值 —— 两者现有规模极小(5 / 48 行), 且远端补历史与裁剪口径保持一致更省心。
-  读口 clamp 区间 [5, `KEEP_DAYS_MAX`=1200] ⇒ 可直接 `days=700` 读长历史。
+★ 取数源统一 (2026-09-29 用户裁定, 勿再混源):
+  实时/盘中  一律由 **realtime_snapshot** 量价方向近似派生 (approx=True, 零外网)
+  日线/历史  一律由 **kline_1m** 量价方向近似派生 (approx=True)
+  板块       由 stock_basic_info 成分映射 + 上述个股净额聚合, 不再打东财/新浪板块接口
+
+口径 (不编造):
+  net = Σ 符号(Δ价) x Δ量 x 价  (涨计流入 / 跌计流出 / 平 0)
+  super/large/mid/small = None (快照/1m 拍不到单型分类, 不编造)
+  source = realtime_snapshot | kline_1m
+  approx = True
+
+出入口纪律:
+  - 业务/agent/auto **只 import 本模块** 取资金流, 勿直连 index.get_*_fund_flow /
+    tape.get_fund_flow_* / fund_flow_local (后者仅作本模块内部实现细节);
+  - market_data_api 的 market_flow / stock_flow* 为薄门面, 亦转发到本模块;
+  - 历史表在 market DB (db_market / CNStock 池), 读写走 _pool()。
+
+历史表:
+  qd_fund_flow_market / qd_fund_flow_stock / qd_fund_flow_sector
+  KEEP_DAYS_DEFAULT=1200 (约 3.3 年, 勿 30 天滚动清掉研究库)
 
 用法
 ----
@@ -30,13 +35,7 @@ fund_flow_api.py — 通用资金流 API (2026-09-26)
         market_fund_flow_realtime, market_fund_flow_history,
         stock_fund_flow_realtime, stock_fund_flow_history,
         sector_fund_flow_realtime, sector_fund_flow_history,
-        sync_fund_flow_history,
     )
-
-    sync_fund_flow_history(days=30)          # 取数 + 入库 + 裁剪
-    market_fund_flow_history(days=10)
-    stock_fund_flow_realtime("600519")
-    sector_fund_flow_realtime("industry")
 """
 from __future__ import annotations
 
@@ -154,6 +153,163 @@ def _clamp_days(days: int) -> int:
     return max(KEEP_DAYS_MIN, min(KEEP_DAYS_MAX, d))
 
 
+# ================================================================
+# 0.5 统一取数源 (2026-09-29)
+#   实时 <- realtime_snapshot ; 日线 <- kline_1m
+#   板块 <- stock_basic_info 成分 x 上述个股净额
+# ================================================================
+
+_sector_maps_cache = {"ts": 0.0, "industry": {}, "concept": {}}
+_SECTOR_MAPS_TTL = 300
+
+
+def _sector_maps(board_type: str = "industry", force: bool = False) -> Dict[str, set]:
+    """{板块名: {stock_code, ...}} 来自 stock_basic_info.industry/concepts。
+
+    industry/concepts 可为多值逗号分隔 —— 一票可属多板块。
+    """
+    import time as _time
+    board_type = (board_type or "industry").lower()
+    if board_type not in ("industry", "concept"):
+        board_type = "industry"
+    now = _time.time()
+    if (not force and _sector_maps_cache[board_type]
+            and now - _sector_maps_cache["ts"] < _SECTOR_MAPS_TTL):
+        return _sector_maps_cache[board_type]
+    industry_map: Dict[str, set] = {}
+    concept_map: Dict[str, set] = {}
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, industry, concepts FROM stock_basic_info "
+                    "WHERE status = 'active'")
+                for sym, industry, concepts in cur.fetchall():
+                    sym = str(sym or "").strip()
+                    if not sym:
+                        continue
+                    for ind in str(industry or "").split(","):
+                        ind = ind.strip()
+                        if ind:
+                            industry_map.setdefault(ind, set()).add(sym)
+                    for c in str(concepts or "").split(","):
+                        c = c.strip()
+                        if c:
+                            concept_map.setdefault(c, set()).add(sym)
+    except Exception as e:
+        logger.warning("[fund_flow_api] 板块成分映射失败: %s", e)
+        return {}
+    _sector_maps_cache.update(ts=now, industry=industry_map, concept=concept_map)
+    return industry_map if board_type == "industry" else concept_map
+
+
+def _stock_nets_from_snapshot(date: Optional[str] = None) -> Dict[str, Dict[str, float]]:
+    """单日全市场 snapshot 量价方向净额 -> {code: {net, turnover}}。"""
+    day = (date or datetime.now().strftime("%Y-%m-%d"))
+    sql = (
+        "WITH t AS ("
+        "  SELECT symbol, \"last\", volume,"
+        "         lag(volume) OVER (PARTITION BY symbol ORDER BY time) AS pvol,"
+        "         lag(\"last\") OVER (PARTITION BY symbol ORDER BY time) AS plast"
+        "  FROM realtime_snapshot WHERE time::date=%s"
+        "    AND symbol NOT LIKE '688%%'"
+        "    AND symbol NOT LIKE '8%%'"
+        "    AND symbol NOT LIKE '4%%'"
+        "    AND symbol NOT LIKE '92%%'"
+        "), s AS ("
+        "  SELECT symbol,"
+        "         sum(CASE WHEN \"last\" > plast THEN (volume-pvol)*\"last\""
+        "                  WHEN \"last\" < plast THEN -(volume-pvol)*\"last\""
+        "                  ELSE 0 END) AS net,"
+        "         sum((volume-pvol)*\"last\") AS turnover"
+        "  FROM t WHERE pvol IS NOT NULL AND volume > pvol AND plast IS NOT NULL"
+        "  GROUP BY symbol"
+        ") SELECT symbol, net, turnover FROM s WHERE turnover < 200000000000"
+    )
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(day)[:10],))
+                for sym, net, to in cur.fetchall():
+                    if not sym:
+                        continue
+                    out[str(sym)] = {"net": float(net or 0), "turnover": float(to or 0)}
+    except Exception as e:
+        logger.warning("[fund_flow_api] snapshot 个股净额失败(%s): %s", day, e)
+    return out
+
+
+def _stock_nets_from_kline1m_day(day: str) -> Dict[str, Dict[str, float]]:
+    """单日全市场 1m 量价方向净额 -> {code: {net, turnover}}。"""
+    rows = _stock_flows_from_1m_day(day)
+    return {str(code): {"net": float(net), "turnover": float(amt)}
+            for code, net, amt in rows}
+
+
+def _kline1m_days(n: int, as_of: Optional[str] = None) -> List[str]:
+    """kline_1m 最近 n 个交易日 (升序)。"""
+    n = max(1, int(n or 1))
+    year = datetime.now().year
+    table = _kline_1m_year_table(year)
+    sql = (f"SELECT DISTINCT time::date FROM {table} WHERE time::date <= %s "
+           f"ORDER BY 1 DESC LIMIT %s")
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(as_of or datetime.now().strftime("%Y-%m-%d"))[:10], n))
+                days = [str(r[0])[:10] for r in cur.fetchall()]
+        return list(reversed(days))
+    except Exception as e:
+        logger.warning("[fund_flow_api] 1m 日期列表失败: %s", e)
+        return []
+
+
+def _aggregate_sector(board_type: str,
+                      day_nets: List[tuple]) -> List[Dict[str, Any]]:
+    """day_nets = [(date, {code: {net, turnover}, ...}), ...] -> 板块行。"""
+    members = _sector_maps(board_type)
+    if not members:
+        return []
+    code_to_sectors: Dict[str, list] = {}
+    for name, codes in members.items():
+        for c in codes:
+            code_to_sectors.setdefault(str(c), []).append(name)
+    out: List[Dict[str, Any]] = []
+    for day, nets in day_nets:
+        acc = {name: {"net": 0.0, "turnover": 0.0, "n": 0} for name in members}
+        for code, v in (nets or {}).items():
+            for name in code_to_sectors.get(str(code), ()):
+                a = acc[name]
+                a["net"] += float(v.get("net") or 0)
+                a["turnover"] += float(v.get("turnover") or 0)
+                a["n"] += 1
+        for name, a in acc.items():
+            if a["n"] <= 0:
+                continue
+            net, to = a["net"], a["turnover"]
+            pct = (net / to * 100.0) if to > 0 else 0.0
+            out.append({
+                "trade_date": day,
+                "board_type": board_type,
+                "code": name,
+                "name": name,
+                "change_pct": None,
+                "main_net": round(net, 2),
+                "main_pct": round(pct, 2),
+                "in_net": round(max(net, 0.0), 2),
+                "out_net": round(max(-net, 0.0), 2),
+                "turnover": round(to, 2),
+                "lead_stock": "",
+                "lead_pct": None,
+                "source": "",
+                "approx": True,
+                "nsym": a["n"],
+            })
+    return out
+
+
+
 def _prune(cur, table: str, keep_days: int, extra_where: str = "",
            extra_params: tuple = ()) -> int:
     cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
@@ -167,38 +323,48 @@ def _prune(cur, table: str, keep_days: int, extra_where: str = "",
 # ================================================================
 
 def market_fund_flow_realtime(force: bool = False) -> Dict[str, Any]:
-    """大盘实时资金流 (远端多源)。
+    """大盘实时资金流 — **realtime_snapshot** 量价方向近似 (2026-09-29 收口)。
 
     Returns:
         {trade_date, main_net, super_net, large_net, mid_net, small_net,
-         main_pct, source, raw}  失败时 {source:"none", error}
+         main_pct, inflow, outflow, turnover, direction, source, approx}
+        失败时 {source:"none", error}
     """
-    from app.market_cn.index import get_market_fund_flow_realtime as _rt
-    d = _rt(force=force) or {}
-    if not d or d.get("source") == "none" or d.get("error"):
-        return {"source": d.get("source", "none"), "error": d.get("error", "empty"),
-                "trade_date": datetime.now().strftime("%Y-%m-%d")}
+    day = datetime.now().strftime("%Y-%m-%d")
+    nets = _stock_nets_from_snapshot(day)
+    if not nets:
+        return {"source": "none", "error": "empty snapshot",
+                "trade_date": day, "approx": True}
+    net = sum(v["net"] for v in nets.values())
+    to = sum(v["turnover"] for v in nets.values())
+    inflow = sum(v["net"] for v in nets.values() if v["net"] > 0)
+    outflow = sum(-v["net"] for v in nets.values() if v["net"] < 0)
+    pct = (net / to * 100.0) if to > 0 else 0.0
     return {
-        "trade_date": str(d.get("date") or datetime.now().strftime("%Y-%m-%d")),
-        "main_net": _f(d.get("main_net")),
-        "super_net": _f(d.get("super_net")),
-        "large_net": _f(d.get("large_net")),
-        "mid_net": _f(d.get("mid_net")),
-        "small_net": _f(d.get("small_net")),
-        "main_pct": _f(d.get("main_pct")),
-        "source": d.get("source") or "eastmoney",
-        "raw": {k: v for k, v in d.items() if k != "raw"},
+        "trade_date": day,
+        "main_net": round(net, 2),
+        "super_net": None, "large_net": None,
+        "mid_net": None, "small_net": None,
+        "main_pct": round(pct, 2),
+        "inflow": round(inflow, 2), "outflow": round(outflow, 2),
+        "turnover": round(to, 2),
+        "inflow_yi": round(inflow / 1e8, 2), "outflow_yi": round(outflow / 1e8, 2),
+        "net_yi": round(net / 1e8, 2), "turnover_yi": round(to / 1e8, 2),
+        "net_pct": round(pct, 2),
+        "direction": "inflow" if net > 0 else ("outflow" if net < 0 else "flat"),
+        "source": "realtime_snapshot", "approx": True,
+        "nsym": len(nets),
     }
 
 
 def market_fund_flow_history(days: int = 30, as_of: Optional[str] = None,
                              prefer_db: bool = True) -> List[Dict[str, Any]]:
-    """大盘历史日线 (默认读库; 缺则拉远端并回填)。
+    """大盘历史日线 — **kline_1m** 量价方向近似 (2026-09-29 收口, 不再混源)。
 
     Args:
-        days: 5~30
+        days: 5~1200
         as_of: 截止日 YYYY-MM-DD (含)
-        prefer_db: True=库优先; False=强制远端拉取后写库再读
+        prefer_db: True=库优先; False=强制由 kline_1m 重算后写库再读
     """
     days = _clamp_days(days)
     ensure_fund_flow_tables()
@@ -206,12 +372,7 @@ def market_fund_flow_history(days: int = 30, as_of: Optional[str] = None,
         rows = _load_market_db(days, as_of)
         if rows:
             return rows
-    # 优先级: 1m OHLCV → 远端 EM → snapshot 派生 (2026-09-26)
     rows = _market_from_kline1m(days, as_of)
-    if not rows:
-        rows = _fetch_market_daily(days)
-    if not rows:
-        rows = _market_from_snapshot(days, as_of)
     if rows:
         upsert_market(rows)
     return _load_market_db(days, as_of) or rows
@@ -360,40 +521,31 @@ def _load_market_db(days: int, as_of: Optional[str]) -> List[Dict[str, Any]]:
 
 def stock_fund_flow_realtime(code: str, date: Optional[str] = None,
                              prefer: str = "snapshot") -> Dict[str, Any]:
-    """个股实时/当日资金流。
+    """个股实时/当日资金流 — **realtime_snapshot** 量价方向近似 (2026-09-29 收口)。
 
-    prefer:
-      snapshot = 本地 realtime_snapshot 量价方向近似 (零外网, approx=True)
-      remote   = 远端 (东财/新浪等, 有单型分类时更准)
+    prefer 参数保留兼容, 只有 snapshot 一条腿 (远端通道已从出入口摘除)。
     """
     code = (code or "").strip()
     if not code:
         return {"code": "", "error": "empty code"}
-    if prefer != "remote":
-        try:
-            from app.market_cn.fund_flow_local import get_fund_flow_from_snapshot
-            d = get_fund_flow_from_snapshot(code, date=date)
-            if d and d.get("points", 0) > 0:
-                d["scope"] = "stock"
-                d["trade_date"] = (date or datetime.now().strftime("%Y-%m-%d"))
-                return d
-        except Exception as e:
-            logger.warning("[fund_flow_api] snapshot 资金流失败(%s): %s", code, e)
-    # 远端
     try:
-        from app.market_cn.tape import get_fund_flow_realtime
-        d = get_fund_flow_realtime(code) or {}
-        d.update({"code": code, "scope": "stock", "approx": False,
-                  "trade_date": (date or datetime.now().strftime("%Y-%m-%d"))})
-        return d
+        from app.market_cn.fund_flow_local import get_fund_flow_from_snapshot
+        d = get_fund_flow_from_snapshot(code, date=date)
+        if d and d.get("points", 0) > 0:
+            d["scope"] = "stock"
+            d["source"] = "realtime_snapshot"
+            d["approx"] = True
+            d["trade_date"] = (date or datetime.now().strftime("%Y-%m-%d"))
+            return d
     except Exception as e:
-        return {"code": code, "error": str(e), "approx": True,
-                "trade_date": date or datetime.now().strftime("%Y-%m-%d")}
+        logger.warning("[fund_flow_api] snapshot 资金流失败(%s): %s", code, e)
+    return {"code": code, "error": "empty snapshot", "approx": True, "source": "realtime_snapshot",
+            "trade_date": date or datetime.now().strftime("%Y-%m-%d")}
 
 
 def stock_fund_flow_history(code: str, days: int = 30,
                             prefer_db: bool = True) -> List[Dict[str, Any]]:
-    """个股历史日线 (5~30)。库优先, 缺则远端 EM fflow 日线回填。"""
+    """个股历史日线 — **kline_1m** 量价方向近似 (2026-09-29 收口, 不再混源)。"""
     code = (code or "").strip()
     days = _clamp_days(days)
     ensure_fund_flow_tables()
@@ -402,10 +554,6 @@ def stock_fund_flow_history(code: str, days: int = 30,
         if rows:
             return rows
     rows = _stock_from_kline1m(code, days)
-    if not rows:
-        rows = _fetch_stock_daily(code, days)
-    if not rows:
-        rows = _stock_from_snapshot(code, days)
     if rows:
         upsert_stock(rows)
     return _load_stock_db(code, days) or rows
@@ -628,40 +776,26 @@ def _load_stock_db(code: str, days: int) -> List[Dict[str, Any]]:
 
 def sector_fund_flow_realtime(board_type: str = "industry",
                               indicator: str = "今日") -> List[Dict[str, Any]]:
-    """行业/概念板块资金流排名 (远端聚合)。
+    """行业/概念板块实时资金流 — **realtime_snapshot 成分聚合** (2026-09-29 收口)。
 
     board_type: industry | concept
-    indicator: 今日 / 3日 / 5日 / 10日
+    indicator: 今日 / 3日 / 5日 / 10日 (对最近 N 个有 snapshot 的交易日求和)
     """
-    from app.market_cn.index import get_sector_fund_flow
     board_type = (board_type or "industry").lower()
     if board_type not in ("industry", "concept"):
         board_type = "industry"
-    try:
-        rows = get_sector_fund_flow(indicator=indicator, board_type=board_type) or []
-    except Exception as e:
-        logger.warning("[fund_flow_api] 板块资金流失败(%s): %s", board_type, e)
+    n_map = {"今日": 1, "3日": 3, "5日": 5, "10日": 10}
+    n = n_map.get(indicator or "今日", 1)
+    dts = list(reversed(_snap_days(n)))
+    if not dts:
         return []
-    today = datetime.now().strftime("%Y-%m-%d")
-    out = []
+    day_nets = [(d, _stock_nets_from_snapshot(d)) for d in dts]
+    rows = _aggregate_sector(board_type, day_nets)
     for r in rows:
-        out.append({
-            "trade_date": today,
-            "board_type": board_type,
-            "code": str(r.get("code") or ""),
-            "name": r.get("name") or "",
-            "change_pct": _f(r.get("change_pct")),
-            "main_net": _f(r.get("main_net")),
-            "main_pct": _f(r.get("main_pct")),
-            "in_net": _f(r.get("in_net")),
-            "out_net": _f(r.get("out_net")),
-            "turnover": _f(r.get("turnover")),
-            "lead_stock": r.get("lead_stock") or "",
-            "lead_pct": _f(r.get("lead_pct")),
-            "source": "eastmoney_or_sina",
-            "indicator": indicator,
-        })
-    return out
+        r["source"] = "realtime_snapshot"
+        r["indicator"] = indicator
+    rows.sort(key=lambda x: -(x.get("main_net") or 0))
+    return rows
 
 
 def upsert_sector(rows: List[Dict[str, Any]]) -> int:
@@ -702,54 +836,31 @@ def upsert_sector(rows: List[Dict[str, Any]]) -> int:
 def sector_fund_flow_history(board_type: str = "industry", days: int = 30,
                              top_n: int = 0,
                              prefer_db: bool = True) -> List[Dict[str, Any]]:
-    """行业/概念历史 —— **来自每日快照累积** (上游无逐日序列)。
+    """行业/概念历史日线 — **kline_1m 成分聚合** (2026-09-29 收口, 不再快照累积/远端)。
 
     返回按 trade_date 升序的板块行; top_n>0 时每个交易日只留 main_net 前 N。
     """
     board_type = (board_type or "industry").lower()
+    if board_type not in ("industry", "concept"):
+        board_type = "industry"
     days = _clamp_days(days)
     ensure_fund_flow_tables()
-    if not prefer_db:
-        rows = sector_fund_flow_realtime(board_type=board_type, indicator="今日")
-        upsert_sector(rows)
-    sql = (f"SELECT trade_date, board_type, code, name, change_pct, main_net, "
-           f"main_pct, in_net, out_net, turnover, lead_stock, lead_pct, source "
-           f"FROM {T_SECTOR} WHERE board_type=%s ORDER BY trade_date DESC, main_net DESC NULLS LAST")
-    with _pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (board_type,))
-            raw = cur.fetchall()
-    out = [{
-        "trade_date": str(r[0])[:10], "board_type": r[1], "code": r[2], "name": r[3],
-        "change_pct": _f(r[4]), "main_net": _f(r[5]), "main_pct": _f(r[6]),
-        "in_net": _f(r[7]), "out_net": _f(r[8]), "turnover": _f(r[9]),
-        "lead_stock": r[10], "lead_pct": _f(r[11]), "source": r[12],
-    } for r in raw]
-    # 按日截 top_n / 只要最近 days 个日期
-    dates: List[str] = []
-    seen = set()
-    for r in out:
-        d = r["trade_date"]
-        if d not in seen:
-            seen.add(d)
-            dates.append(d)
-        if len(dates) >= days:
-            break
-    keep_dates = set(dates)
-    filtered = [r for r in out if r["trade_date"] in keep_dates]
+    dts = _kline1m_days(days)
+    if not dts:
+        return []
+    day_nets = [(d, _stock_nets_from_kline1m_day(d)) for d in dts]
+    rows = _aggregate_sector(board_type, day_nets)
+    for r in rows:
+        r["source"] = "kline_1m"
     if top_n and top_n > 0:
         by_date: Dict[str, List] = {}
-        for r in filtered:
+        for r in rows:
             by_date.setdefault(r["trade_date"], []).append(r)
-        filtered = []
-        for d, rows in by_date.items():
-            filtered.extend(rows[:top_n])
-    return sorted(filtered, key=lambda x: (x["trade_date"], -(x["main_net"] or 0)))
+        rows = []
+        for d in sorted(by_date):
+            rows.extend(sorted(by_date[d], key=lambda x: -(x.get("main_net") or 0))[:top_n])
+    return sorted(rows, key=lambda x: (x["trade_date"], -(x.get("main_net") or 0)))
 
-
-# ================================================================
-# 4. 一键同步
-# ================================================================
 
 def sync_fund_flow_history(days: int = 30,
                            codes: Optional[List[str]] = None,
