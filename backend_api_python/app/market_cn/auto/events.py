@@ -18,11 +18,11 @@
 """
 from __future__ import annotations
 
-import logging
+from app.utils.logger import get_logger  # 2026-09-29: 统一全仓 get_logger 口径
 import threading
 import time
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 策略可声明的事件名 (ScanSpec.after_events / config schedule.after_events)
 KNOWN_EVENTS = (

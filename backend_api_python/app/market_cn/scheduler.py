@@ -330,7 +330,8 @@ def _daily_scan_dispatch():
     if not ready:
         return
     logger.info("[daily_scan] 就绪触发 keys=%s target=%s | %s", ready, target, reasons)
-    result = run_scan(keys=tuple(ready))
+    # target 显式下传: 与完成标记同一交易日, 15:00 翻转边界不标旧日/扫新日
+    result = run_scan(keys=tuple(ready), target=target)
     status = result.get("status") if isinstance(result, dict) else None
     if status in ("ok", "no_active_strategy"):
         _daily_scanned.setdefault(target, set()).update(ready)
@@ -534,6 +535,8 @@ class Task:
     trigger_minute: int = 0       # 定时触发: 分钟
     once_per_slot: bool = False   # 多触发点: 每个 slot 各跑一次 (盘中窗口策略组)
     slots_done: set = field(default_factory=set)   # 当日已完成的 slot 时刻集合
+    # P1-3②: slot 失败可重试 {hm: {"n": 次数, "ts": 上次失败时间}}
+    slots_fail: dict = field(default_factory=dict)
 
 
 def _dragon_interval():
@@ -544,6 +547,8 @@ def _dragon_interval():
 # (config.json schedule 段 → 各策略 first 的最早者; 接线 2026-09-09 用户批准)
 _knife_slot_cache = {"date": "", "slots": []}
 SLOT_GAP_MIN = 30        # 相邻首拍间隔 <= 30min 合并为同一批
+SLOT_RETRY_MAX = 5       # P1-3②: 单 slot 当日最多重试次数
+SLOT_RETRY_BACKOFF_SEC = 180  # 失败后退避, 防 10s 死磕
 
 
 def _hm_to_min(hm):
@@ -584,7 +589,10 @@ def _intraday_trigger_slots():
                 continue
             first_of[key] = (times[0], times[-1])
     except Exception as e:
-        logger.warning("[scheduler] 读取 sched 时刻表失败, 盘中触发点回退 14:30: %s", e)
+        # 2026-09-29 P1-3①: 失败**不写按天缓存** —— 旧实现在此缓存空 slots,
+        # 当日 knife/tail 全天零触发且无法自愈。返回空但下一轮 10s 重试。
+        logger.warning("[scheduler] 读取 sched 时刻表失败, 不缓存(下轮重试): %s", e)
+        return []
 
     slots = []
     for key, (first, _last) in sorted(first_of.items(), key=lambda kv: _hm_to_min(kv[1][0])):
@@ -604,10 +612,16 @@ def _intraday_trigger_slots():
 
 
 def _next_pending_slot(task, now_dt=None):
-    """取一个「时刻已到 且 当日未跑过」的 slot; 无则 None。"""
+    """取一个「时刻已到 且 当日未跑过」的 slot; 无则 None。
+
+    2026-09-29 P1-3②: 失败 slot 不标完成 —— 退避 SLOT_RETRY_BACKOFF_SEC 后重试,
+    最多 SLOT_RETRY_MAX 次; 用尽才放弃并标完成 (防 timeout/no_snapshot 永久丢触发,
+    也防 10s 空转死磕同一 slot)。
+    """
     now_dt = now_dt or datetime.now()
     today = now_dt.strftime("%Y-%m-%d")
     hm_now = now_dt.strftime("%H:%M")
+    now_ts = _time.time()
     for slot in _intraday_trigger_slots():
         hm = slot["hm"]
         if hm > hm_now:
@@ -617,6 +631,15 @@ def _next_pending_slot(task, now_dt=None):
         if scheduler_task_done(f"{task.name}@{hm}", today):   # 跨重启守卫
             task.slots_done.add(hm)
             continue
+        fail = task.slots_fail.get(hm)
+        if fail:
+            if fail.get("n", 0) >= SLOT_RETRY_MAX:
+                logger.warning("[%s@%s] 失败 %d 次后放弃当日重试", task.name, hm, fail["n"])
+                task.slots_done.add(hm)
+                mark_scheduler_task_done(f"{task.name}@{hm}", today)
+                continue
+            if now_ts - fail.get("ts", 0.0) < SLOT_RETRY_BACKOFF_SEC:
+                continue
         return slot
     return None
 
@@ -696,23 +719,48 @@ def _get_interval(task: Task) -> int:
 # ═══════════════════════════════════════════════════════════
 
 
+def _task_result_ok(result) -> bool:
+    """任务返回值是否视为成功 (None=无返回值的函数也算成功)。
+
+    2026-09-29 P1-3②: run_scan_knife 的 timeout/no_snapshot 不抛异常,
+    旧 _worker 无条件标完成 ⇒ 漏触发永不重试。失败状态不标记 → 可重试。
+    """
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return result.get("status") in (None, "ok", "no_active_strategy", "no_intraday_strategy")
+    return True
+
+
 def _worker(task: Task, slot=None):
-    """执行单个任务，完成后退出。slot 不为 None 时是多触发点任务的一次触发。"""
+    """执行单个任务，完成后退出。slot 不为 None 时是多触发点任务的一次触发。
+
+    完成标记只在**成功**后写入 (P1-3②); 失败留给 _next_pending_slot 退避重试。
+    """
     tag = f"{task.name}@{slot['hm']}" if slot else task.name
+    ok = False
     try:
-        if slot is not None:
-            task.fn(slot)
-        else:
-            task.fn()
+        result = task.fn(slot) if slot is not None else task.fn()
+        ok = _task_result_ok(result)
+        if not ok:
+            logger.warning("[%s] 未成功(status=%s), 不标记完成、稍后重试",
+                           tag, (result or {}).get("status") if isinstance(result, dict) else "?")
         # 跨重启守卫: 成功完成才标记, 失败不标记→当日仍可被补跑重试
-        if slot is not None:
-            task.slots_done.add(slot["hm"])
-            mark_scheduler_task_done(tag, datetime.now().strftime("%Y-%m-%d"))
-        elif task.once_per_day:
-            mark_scheduler_task_done(task.name, datetime.now().strftime("%Y-%m-%d"))
+        if ok:
+            if slot is not None:
+                task.slots_done.add(slot["hm"])
+                task.slots_fail.pop(slot["hm"], None)
+                mark_scheduler_task_done(tag, datetime.now().strftime("%Y-%m-%d"))
+            elif task.once_per_day:
+                mark_scheduler_task_done(task.name, datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
+        ok = False
         logger.error("[%s] 执行失败: %s", tag, e)
     finally:
+        if slot is not None and not ok:
+            fail = task.slots_fail.setdefault(slot["hm"], {"n": 0, "ts": 0.0})
+            fail["n"] = int(fail.get("n", 0)) + 1
+            fail["ts"] = _time.time()
         task.running = False
     logger.debug("[%s] 线程退出", tag)
 
@@ -779,6 +827,11 @@ def _scheduler_loop():
             #    必须早于下面的 interval 分支: slot 任务不受 interval(86400) 限制,
             #    否则第一个 slot 跑完后第二个 slot 会被「间隔未到」跳过。
             if task.once_per_slot:
+                # 2026-09-29 P1-3④: 此分支会 continue, 吃不到下面的 once_per_day/
+                # trading_only 检查 —— 非交易日必须在此挡掉, 否则周末空跑。
+                from app.utils.trading_calendar import is_trading_day
+                if task.trading_only and not is_trading_day(today):
+                    continue
                 slot = _next_pending_slot(task, now_dt)
                 if slot is None:
                     continue

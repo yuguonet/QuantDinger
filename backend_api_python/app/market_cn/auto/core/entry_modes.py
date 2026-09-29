@@ -122,7 +122,16 @@ def _resolve_entry_intraday(cfg: Dict[str, Any], bars: List[Dict[str, Any]], i: 
     trigger = _resolve(cfg.get("trigger"), board_type, params)
     if trigger is None or trigger <= 0:
         return None, "no_trigger_cfg"
-    px, filled = fill_intraday(bar, trigger, side="buy")
+    # 2026-09-29 审计修复 (P2): 必须传涨停价 up —— 否则 fill_intraday 的涨停阻买
+    # (exec 框架不变量 5) 被绕过, 会按涨停价"成交" (现实中不可成交),
+    # 与 docstring 承诺的 "涨停不可买 → filled=False" 不符。
+    up = None
+    if i > 0:
+        prev_close = float(bars[i - 1].get("close") or 0)
+        if prev_close > 0:
+            from app.market_cn.auto.core.market import limit_up_price
+            up = limit_up_price(prev_close, board_type) or None
+    px, filled = fill_intraday(bar, trigger, side="buy", up=up)
     if px is None:
         return None, "no_trigger"
     if not filled:

@@ -174,24 +174,26 @@ def eval_exit_day_close(bars, entry_idx: int, entry_price: float, code: str, d1_
     today = bars[-1]["time"]
     last_bar = bars[-1]
 
-    # 持有超过到期天数 (从 D1 算起) → 到期卖
-    try:
-        d1 = datetime.strptime(str(d1_held_since or today), "%Y-%m-%d")
-        held_days = (datetime.strptime(str(today), "%Y-%m-%d") - d1).days + 1
-    except Exception:
-        held_days = 1
+    # 当日(及D1以来)是否封板住
+    # 2026-09-29 审计修复 (P1): seg[0] 即买入日 D1 —— 原实现取 seg[1] 当 D1 是差一
+    # (注释"seg[0]=买入日, seg[1]=D1"假设买入日是 D0, 与本策略"D1 开盘买入"
+    # entry_date=bars[i+1] 自相矛盾): D2 被当 D1 判封板, 封板延续单在 D2
+    # 被"S4未封板尾盘卖(补)"强平 (应走追踪/到期链)。
+    seg = bars[entry_idx:today_idx + 1]
+    if not seg:
+        return None, None
+    d1_bar = seg[0]
+    # 持有超过到期天数 (从 D1 算起) → 到期卖。
+    # 2026-09-29 审计修复 (P2): 原先用自然日 (跨周末提前到期), hold_days_max 是
+    # 交易日口径 —— 改为 seg 根数 (= D1 起的交易日数, 与回测 run_limit_seal 同口径)。
+    held_days = len(seg)
     if held_days > PARAMS["hold_days_max"]:
         return f"到期{PARAMS['hold_days_max']}天", last_bar["close"]
 
-    # 当日(及D1以来)是否封板住
-    seg = bars[entry_idx:today_idx + 1]
-    d1_bar = seg[1] if len(seg) >= 2 else (seg[0] if seg else None)
-    if d1_bar is None:
-        return None, None
     d1_touched = float(d1_bar["high"]) >= limit_price - 0.001
-    # 昨日(D1)封板但今日炸板/走弱: 追踪止损
-    if d1_touched and len(seg) >= 3:
-        d1_high = max(float(b["high"]) for b in seg[1:])
+    # D1 封板后炸板/走弱: 追踪止损 (从 D2 起可判)
+    if d1_touched and len(seg) >= 2:
+        d1_high = max(float(b["high"]) for b in seg)
         ret_from_high = (float(last_bar["close"]) / d1_high - 1) * 100 if d1_high > 0 else 0
         if ret_from_high <= PARAMS["trail_after_limit"]:
             return f"追踪止损{PARAMS['trail_after_limit']}%", last_bar["close"]
@@ -473,7 +475,8 @@ _register_exit("relay3_s4", _exit_relay3_s4)
 #    analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List
+
 from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.filters import unified_prefilter

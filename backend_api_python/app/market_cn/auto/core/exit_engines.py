@@ -191,18 +191,25 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
         # 策略专属早退 (V1 动量等) — 不在本引擎解释语义
         early = pre_exit(d, b, peak, peak_prev) if pre_exit is not None else None
 
-        if is_one_word_limit_dn(b, dn, sp):
-            pending_dn = (early is not None)
+        # A8 (2026-09-29 审计修复 P1): 一字跌停日**照常评估触发**, 只是当日不可成交
+        # → 触发一律置 pending_dn 次日开盘卖 (框架不变量 4"触发成交触及跌停→顺延",
+        # 与正常路径 fill_blocked_by_limit_dn 的顺延语义逐位一致)。原实现直接 continue
+        # 且只挂钩 early 钩子, 常规止损/追踪/峰值逃顶/到期触发整日丢失 —— 次日跳空
+        # 高开即永不卖出 (实盘启用的 dragon_callback 受影响)。
+        blocked = is_one_word_limit_dn(b, dn, sp)
+        if blocked:
             last_unfilled = True
-            continue
-        last_unfilled = False
-
-        if early == "open":
-            exit_p, exit_d, _exit_reason = float(b.get("open") or 0), d, "早退开盘"
-            break
-        if early == "close":
-            exit_p, exit_d, _exit_reason = float(b.get("close") or 0), d, "早退收盘"
-            break
+            if early is not None:
+                pending_dn = True
+                continue
+        else:
+            last_unfilled = False
+            if early == "open":
+                exit_p, exit_d, _exit_reason = float(b.get("open") or 0), d, "早退开盘"
+                break
+            if early == "close":
+                exit_p, exit_d, _exit_reason = float(b.get("close") or 0), d, "早退收盘"
+                break
 
         if d >= min_d:
             if peak_exit:
@@ -212,6 +219,9 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                     upper = (float(b.get("high") or 0) - max(float(b.get("open") or 0),
                             float(b.get("close") or 0))) / bar_range * 100 if bar_range > 0 else 0
                     if upper > peak_exit_upper and float(b.get("close") or 0) < float(b.get("high") or 0) * 0.98:
+                        if blocked:          # 跌停封死不可成交 → 顺延次日开盘
+                            pending_dn = True
+                            continue
                         exit_p, exit_d, _exit_reason = float(b.get("close") or 0), d, "峰值逃顶"
                         break
 
@@ -225,6 +235,9 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             trig = max(trig_t, trig_s)
             low = float(b.get("low") or 0)
             if low <= trig:
+                if blocked:                  # 跌停封死不可成交 → 顺延次日开盘 (A8)
+                    pending_dn = True
+                    continue
                 fill = fill_on_gap(float(b.get("open") or 0), trig)
                 if use_trig_prev:
                     # 开盘时已存在的线: open<=trig_prev 才按开盘 (防日内先视; v1 口径)
@@ -241,6 +254,9 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             # A7a (2026-09-28): 到期收盘出场同样受 min_d 守卫 —— 原来在 `if d >= min_d`
             # 之外, d<min_d 也会按当日收盘卖 (hold_days=1 即入场当日卖出),
             # 违反 spec.intraday_t0 语义 (A股 T+1: 最早 d=2 可卖)。
+            if blocked:                      # 到期日跌停封死 → 顺延次日开盘 (A8)
+                pending_dn = True
+                continue
             exit_p = float(b.get("close") or 0)
             exit_d = d
             _exit_reason = "持仓到期"

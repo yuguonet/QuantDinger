@@ -327,7 +327,10 @@ def _eval_candidates_on_rows(
                     rk.append(r)
                     continue
                 try:
-                    ok = bool(expr_mod.evaluate(expr_str, {}, p[1]))
+                    # 2026-09-29 审计修复 (P1): env 必须传策略参数命名空间 —— 生产门表
+                    # 大量使用参数名表达式 (如 `rsi6() >= rsi6_min`), 空 env 会让这些
+                    # Name 全部 ExprError→被吞→归 rejected, 候选规则求值结论系统性失真。
+                    ok = bool(expr_mod.evaluate(expr_str, params or {}, p[1]))
                 except Exception:
                     # 求值失败（函数不存在/窗口异常等）→ 归入 rejected（同原实现）
                     ok = False

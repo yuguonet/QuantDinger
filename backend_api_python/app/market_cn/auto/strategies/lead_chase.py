@@ -321,8 +321,18 @@ def _hist_slot_volume(code: str, end_day: str, days: int, slot: int):
     key = (code, end_day, days, slot)
     if key in _SLOT_CACHE:
         return _SLOT_CACHE[key]
+    # 2026-09-29 审计修复 (P1): 原先 start=end=end_day 只取当日, 再过滤 d < end_day
+    # 必为空 ⇒ 恒返回 []、时段量比门永远"基准不足"、旧规则模式零信号。
+    # 回看窗口取 days×1.6+15 日历日 (交易日→日历日放大 + 假期裕量, 同 cleanup_cutoff
+    # 思路), 多取的旧日由下方 [-days:] 截断。
+    from datetime import datetime, timedelta
     try:
-        rows = minute_1m(code, start=end_day, end=end_day)
+        start = (datetime.strptime(end_day, "%Y-%m-%d")
+                 - timedelta(days=int(days * 1.6) + 15)).strftime("%Y-%m-%d")
+    except Exception:
+        start = end_day
+    try:
+        rows = minute_1m(code, start=start, end=end_day)
     except Exception:
         rows = []
     per_day: dict = {}

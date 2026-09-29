@@ -184,7 +184,12 @@ class Ctx:
         return sum(vals) / len(vals) if vals else 0.0
 
     def rsi(self, k: int = 0, n: int = 14) -> float:
-        """第 i+k 日 Wilder RSI(%)。k 为第一个位置参数。"""
+        """第 i+k 日 Cutler (简单均值) RSI(%)。k 为第一个位置参数。
+
+        2026-09-29 审计修正: 此处原标 "Wilder RSI" 是错的 —— 实现是 Cutler
+        (涨跌幅直接算术平均), 与 app/utils/indicators.rsi (Wilder 平滑) 口径不同
+        (实测差 ~1pt), 两套口径并存属已知限度 (门表 rsi(k,n) vs 特征 rsi6())。
+        """
         self._check_k(k)   # A7 运行期 as-of 守卫 (k>0 = 读未来, 直接拒)
         end = self.i + k
         if end < n:

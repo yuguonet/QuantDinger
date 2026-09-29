@@ -19,22 +19,40 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import get_logger  # 2026-09-29: 统一全仓 get_logger 口径 (同 events.py)
+
+logger = get_logger(__name__)
 
 _LUNCH_SKIP = ("11:31", "12:59")   # 午休时刻剔除区间 (含端点)
 
 
 def expand_times(windows, interval_sec, date=None):
-    """窗口 (first, end) + 间隔秒 → 确切触发时刻表 ["HH:MM", ...] (相位锚定 first)。"""
+    """窗口 (first, end) + 间隔秒 → 确切触发时刻表 ["HH:MM", ...] (相位锚定 first)。
+
+    2026-09-29 审计修复 (P0): interval_sec 必须 >=1 —— 负值/0 会让 `t += timedelta(...)`
+    永不前进, `while t <= te` 死循环挂死整个 market_cn 调度线程 (config schedule 段
+    是运维公开入口, 一次笔误 -60 即全局停摆)。非法输入一律 raise ValueError, 由
+    all_schedules 逐策略兜住跳过, 不拖死其余策略。
+    """
     from datetime import datetime, timedelta
+
+    if not windows or len(windows) < 2:
+        raise ValueError(f"windows 非法 (需 (first, end)): {windows!r}")
+    try:
+        interval_sec = int(interval_sec)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"interval_sec 非法: {interval_sec!r}") from e
+    if interval_sec < 1:
+        raise ValueError(f"interval_sec 必须 >=1 秒 (got {interval_sec}); <=0 会死循环")
 
     first, end = windows[0], windows[1]
     d = date or datetime.now().strftime("%Y-%m-%d")
     t = datetime.strptime(f"{d} {first}", "%Y-%m-%d %H:%M")
     te = datetime.strptime(f"{d} {end}", "%Y-%m-%d %H:%M")
+    if te < t:
+        raise ValueError(f"窗口 end({end}) 早于 first({first})")
     out = []
     while t <= te:
         hm = t.strftime("%H:%M")
@@ -78,10 +96,25 @@ def resolve_schedule(strategy_key):
     decl = {"kind": spec.kind, "windows": tuple(spec.windows),
             "interval_sec": spec.interval_sec}
     cfg = _load_config().get("schedule", {}).get(strategy_key, {})
-    if cfg.get("windows"):
-        decl["windows"] = tuple(cfg["windows"])
-    if cfg.get("interval_sec"):
-        decl["interval_sec"] = int(cfg["interval_sec"])
+    # 2026-09-29 审计修复: config 覆盖须校验 —— 负 interval / 残缺 windows 直接透传
+    # 会打穿 expand_times (死循环) 或产出空时刻表; 非法覆盖回退 ScanSpec 默认并告警。
+    try:
+        if cfg.get("windows"):
+            w = tuple(cfg["windows"])
+            if len(w) >= 2:
+                decl["windows"] = w
+            else:
+                logger.warning("[sched] %s schedule.windows=%r 非法, 用 ScanSpec 默认",
+                               strategy_key, cfg.get("windows"))
+        if cfg.get("interval_sec"):
+            iv = int(cfg["interval_sec"])
+            if iv >= 1:
+                decl["interval_sec"] = iv
+            else:
+                logger.warning("[sched] %s schedule.interval_sec=%r 必须>=1, 用 ScanSpec 默认",
+                               strategy_key, cfg.get("interval_sec"))
+    except (TypeError, ValueError) as e:
+        logger.warning("[sched] %s schedule 覆盖解析失败 (%s), 用 ScanSpec 默认", strategy_key, e)
     return decl
 
 
@@ -93,7 +126,11 @@ def all_schedules(date=None):
     for key in autodiscover():
         decl = resolve_schedule(key)
         if decl:
-            out[key] = expand_times(decl["windows"], decl["interval_sec"], date)
+            try:
+                out[key] = expand_times(decl["windows"], decl["interval_sec"], date)
+            except ValueError as e:
+                # 单策略调度声明非法 → 跳过并告警, 不拖死其余策略的时刻表生成
+                logger.error("[sched] %s 时刻表生成失败, 本日跳过: %s", key, e)
     return out
 
 
@@ -175,15 +212,20 @@ def daily_fire_ready(strategy_key, now_hm=None, date=None):
     from app.market_cn.auto.events import missing_events
 
     now_hm = now_hm or datetime.now().strftime("%H:%M")
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    date = date or today
     decl = resolve_daily_fire(strategy_key)
     fire_at = decl["fire_at"]
-    if fire_at and now_hm < fire_at:
+    # 2026-09-29 审计修复 (P1): 目标日早于今天 = 补跑模式 —— 钟点/兜底时刻早已过去,
+    # 不得再拿"今天"的墙钟卡 fire_at/DAILY_FALLBACK_FIRE, 否则 T 日缺事件时
+    # 早盘一直 wait、15:00 target 翻转后 T 永久漏扫。
+    backfill = date < today
+    if fire_at and not backfill and now_hm < fire_at:
         return False, f"wait clock {fire_at}"
     missing = missing_events(decl["after_events"], date)
     if not missing:
         return True, f"events ok {list(decl['after_events'])}"
-    if now_hm >= DAILY_FALLBACK_FIRE:
+    if backfill or now_hm >= DAILY_FALLBACK_FIRE:
         return True, f"fallback {DAILY_FALLBACK_FIRE}, missing={missing}"
     return False, f"wait events {missing}"
 

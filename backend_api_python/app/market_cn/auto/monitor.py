@@ -275,6 +275,21 @@ def run_monitor():
     hm = _now_hm()
     today = _today()
 
+    # ── 0. 滞留自愈 (2026-09-29 审计修复 P1): 正式确认只覆盖 entry_date==today
+    #      的行, 15:01 窗口错过 (快照未落/当日停机) 后 buy_today 行会永久滞留
+    #      "买入"—— step5 次日不再确认, live 出场链只接 holding ⇒ 确认/出场记账
+    #      断链。已入场 (entry_date 非空) 且未标出场的滞留行统一转 holding,
+    #      交回后续 live/收盘出场链接管; 未入场行不动 (归 purge/cleanup)。
+    stuck = [r for r in ds.list_signals(states=(ds.S_BUY_TODAY,),)
+             if r.get("entry_date") and not r.get("exit_reason")
+             and str(r["entry_date"])[:10] < today]
+    for r in stuck:
+        ds.set_state(r["id"], ds.S_HOLDING,
+                     detail={"heal": "stuck_buy_today", "heal_ts": hm},
+                     expect_state=ds.S_BUY_TODAY, only_unexited=True)
+    if stuck:
+        logger.warning("[monitor] 滞留 buy_today 自愈转 holding %d 行 (确认窗口错过)", len(stuck))
+
     pending = ds.list_signals(states=(ds.S_WATCH_PENDING,), days=8)
     buy_rows = ds.list_signals(states=(ds.S_BUY_TODAY,), days=8)
     hold_rows = ds.list_signals(states=(ds.S_HOLDING,), days=8)

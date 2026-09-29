@@ -110,7 +110,9 @@ class Probe:
         d = out_dir or _PROBE_DIR
         os.makedirs(d, exist_ok=True)
         self.strategy = strategy
-        self.path = os.path.join(d, f"{strategy}_{tag or 'dbg'}_{ts}.jsonl")
+        # 2026-09-29: 加 pid —— startup 补扫与调度 daily_scan 并发时同秒互踩文件名
+        self.path = os.path.join(
+            d, f"{strategy}_{tag or 'dbg'}_{ts}_pid{os.getpid()}.jsonl")
         self.counts = {}
         self._fh = open(self.path, "w", encoding="utf-8")
 

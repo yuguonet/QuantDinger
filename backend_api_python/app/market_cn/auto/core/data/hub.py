@@ -238,14 +238,18 @@ def _query_batch_raw(market, symbols, timeframe, start_time=None, end_time=None)
 
 def _synth_bar_from_series(series, date):
     """快照序列 → 当日合成 bar (逐字收编 _bars_with_synth 合成段口径)。"""
-    day_open = series[0]["open"]
-    day_high = max(float(r["high"] or day_open) for r in series)
-    day_low = min(float(r["low"] or day_open) for r in series)
+    # A13 (2026-09-29 审计修复): 快照列可空 —— 原 float(None) 直接崩 (open/last 可空)
+    day_open = series[0].get("open")
+    if day_open is None:
+        day_open = series[0].get("last")
+    day_open = float(day_open or 0)
+    day_high = max(float(r.get("high") or day_open) for r in series)
+    day_low = min(float(r.get("low") or day_open) for r in series)
     last_r = series[-1]
-    return {"time": date, "open": float(day_open),
+    return {"time": date, "open": day_open,
             "high": float(day_high), "low": float(day_low),
-            "close": float(last_r["last"] or day_open),
-            "volume": float(last_r["volume"] or 0)}
+            "close": float(last_r.get("last") or day_open),
+            "volume": float(last_r.get("volume") or 0)}
 
 
 def synth_bar(series, date):

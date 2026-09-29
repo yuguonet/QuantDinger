@@ -100,13 +100,26 @@ def ensure_tables():
             oldname = r["conname"] if isinstance(r, dict) else r[0]
             cur.execute(f"ALTER TABLE {_SIGNALS_TABLE} DROP CONSTRAINT {oldname}")
         cur.execute("""
-            SELECT 1 FROM pg_constraint WHERE conname = 'qd_dragon_signals_ukey'
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'qd_dragon_signals_ukey'
+              AND conrelid = 'qd_dragon_signals'::regclass
         """)
         if not cur.fetchone():
             cur.execute(f"""
                 ALTER TABLE {_SIGNALS_TABLE}
                 ADD CONSTRAINT qd_dragon_signals_ukey UNIQUE (trade_date, strategy, code, entry_style)
             """)
+        # 2026-09-29 审计修复: 历史 CREATE TABLE 内联 UNIQUE 与命名 ukey 同列组重复
+        # (每个新部署多一条重复约束+索引)。保留命名 ukey, 其余同列组 UNIQUE 清除。
+        cur.execute("""
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'qd_dragon_signals'::regclass AND contype = 'u'
+              AND conname <> 'qd_dragon_signals_ukey'
+              AND pg_get_constraintdef(oid) ILIKE '%trade_date, strategy, code, entry_style%'
+        """)
+        for r in cur.fetchall():
+            dup = r["conname"] if isinstance(r, dict) else r[0]
+            cur.execute(f"ALTER TABLE {_SIGNALS_TABLE} DROP CONSTRAINT {dup}")
 
         # ── 2. qd_watchlist 加列 ──
         cur.execute("""
@@ -179,7 +192,7 @@ def signal_row(strategy_key, sig, name=""):
     """Signal → qd_dragon_signals 行 dict (扫描器通用转换, 替代各策略手写补字段)。
 
     口径与旧 dragon_scan 后处理逐字段等价:
-      entry_style = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
+      style (落库列 entry_style) = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
       score       = sig.score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
       signal_price= sig.price (0 → None; break 不定价)
       lu_date/pullback_days 来自 extra; extra 整包落库 (策略自保证 clean, None 剔除,
@@ -257,7 +270,9 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         f"AND strategy = ANY(%s)",
                         (trade_date, S_WATCH_PENDING, scope),
                     )
-                purged = cur.rowcount
+                    purged = cur.rowcount
+                else:
+                    purged = 0   # 2026-09-29 审计修复: scope 空时 cur.rowcount 取未执行游标的未定义值
                 if purge_buy_today:
                     # 2026-09-26: 只清「预览未定价」行; 已写 entry_price 的 buy_today
                     # = 已在盘中某分钟成交 (14:50 起滚动买入), **不得**被后续轮次冲掉。
@@ -519,7 +534,11 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False,
             sql += " AND trade_date = %s"
             vals.append(trade_date)
         elif days:
-            sql += " AND trade_date >= (CURRENT_DATE - %s::int)"
+            # 2026-09-29 审计修复 (P1): 已入场行 (entry_date 非空) 不受日期窗口约束 ——
+            # days 过滤的是 trade_date (D0 信号日), 持仓超窗口的行会被 monitor
+            # (days=8: 止损/出场判定停摆) 和展示层 (days=30: 组行被 sync 删除)
+            # 静默丢出视野, 与"已入场行一律可见"资金红线冲突。窗口仅约束未入场行。
+            sql += " AND (trade_date >= (CURRENT_DATE - %s::int) OR entry_date IS NOT NULL)"
             vals.append(days)
         if only_active:
             sql += " AND state = ANY(%s)"
@@ -894,14 +913,21 @@ def cleanup_cutoff(days=15):
 
 
 def cleanup_old(days=15):
-    """历史清理: signals 表保留最近约 N 个交易日 (holding 保留至自然终态)。三策略统一清理。"""
+    """历史清理: signals 表保留约 N 个交易日 (holding 保留至自然终态)。三策略统一清理。
+
+    2026-09-29 审计修复 (P2): 未平仓的已入场行 (entry_date 非空且 exit_date 空)
+    一律不删 —— buy_today 可是"14:56 已入场"(knife/tail), exit_today 是"待执行
+    卖出"; monitor 长期停摆时这些行旧于 cutoff 会被物理删除, 持仓库/UI 双消失,
+    越过"绝不能让客户忘卖"红线。已平仓行 (exit_date 非空) 照常按期清理。
+    """
     from app.utils.db import get_db_connection
     cutoff = cleanup_cutoff(days)
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
             f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = ANY(%s) AND trade_date < %s "
-            "AND state = ANY(%s)",
+            "AND state = ANY(%s) "
+            "AND (entry_date IS NULL OR exit_date IS NOT NULL)",
             (list(strategy_keys()), cutoff, [S_WATCH_PENDING, S_BUY_TODAY, S_EXIT_TODAY, S_CLOSED, S_EXPIRED]),
         )
         n = cur.rowcount

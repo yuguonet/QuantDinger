@@ -432,6 +432,22 @@ def first_1m_date():
     return best
 
 
+def _qfq_close(code, ts, close):
+    """1m 原始 close → qfq 单点换算 (A12, 2026-09-29 审计修复)。
+
+    帧内价格过 unadj_to_qfq、_rollover_pc 用 qfq close, 而 prev_closes 原先直读
+    kline_1m.close (原始价) —— 除权股的 previousClose/gap/mkt_gain 系统性算错,
+    且回测首日与次日起口径不一致。失败退回原始价 (与 _qfq_bars 同策略)。
+    """
+    try:
+        from app.data_sources.provider.adjustment import unadj_to_qfq
+        bars = unadj_to_qfq([{"time": str(ts), "open": close, "high": close,
+                              "low": close, "close": close, "volume": 0}], code)
+        return float((bars[0] if bars else {}).get("close") or close or 0)
+    except Exception:
+        return float(close or 0)
+
+
 def prev_closes(before_date):
     """每股在 before_date 之前最近一根 1m close (qfq) → {code: price} (pc_map 种子)。
 
@@ -444,7 +460,8 @@ def prev_closes(before_date):
     Y-1/Y 两表, 不需要 Y+1)。分块失败或全空**不落缓存** (A11: 脏缓存永不失效)。
     """
     date = str(before_date)[:10]
-    path = os.path.join(CACHE_DIR, f"pc_{date}.npz")
+    # 缓存名带 _qfq 后缀 (A12): 旧缓存存的是不复权原始价, 修复后不得复用
+    path = os.path.join(CACHE_DIR, f"pc_{date}_qfq.npz")
     if os.path.exists(path):
         try:
             with np.load(path, allow_pickle=False) as z:
@@ -480,11 +497,11 @@ def prev_closes(before_date):
                     params = tuple(v for _ in years
                                    for v in (chunk, f"{before_date} 09:00:00"))
                     cur.execute(
-                        f'SELECT DISTINCT ON (symbol) symbol, close '
+                        f'SELECT DISTINCT ON (symbol) symbol, time, close '
                         f'FROM ({union}) t ORDER BY symbol, time DESC',
                         params)
-                    for sym, close in cur.fetchall():
-                        out[str(sym)] = float(close or 0)
+                    for sym, ts, close in cur.fetchall():
+                        out[str(sym)] = _qfq_close(str(sym), ts, close)
         except Exception as e:
             ok = False
             logger.warning("[frames] pc 种子查询失败 (%s): %s", before_date, e)

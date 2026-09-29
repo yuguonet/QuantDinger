@@ -497,6 +497,13 @@ class DragonCallbackStrategy(StrategyBase):
         if i < 2:
             return result
         board_type = get_board_type(code)
+        # 2026-09-29 审计修复 (P2): 涨停日换手率此前从未产出 —— quality_key 承诺的
+        # "主要按换手热度"排序与展示层"换手N%"恒失效 (turnover_anchor 只有 break/v1
+        # 在产)。口径与 v1 逐字一致 (流通/总股本由调用方经 params["stock_info"] 注入,
+        # 策略不做 IO), 锚点 = 涨停日 lu_idx 的成交量。
+        _si = params.get("stock_info") or {}
+        circ = float(_si.get("circ_shares") or 0)
+        total = float(_si.get("total_shares") or 0)
 
         d0 = bars[i]
         prev_c = bars[i - 1]["close"]
@@ -632,6 +639,8 @@ class DragonCallbackStrategy(StrategyBase):
                     "d0_vs_ma20": round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
                     "pullback_depth": round(pullback_depth, 2),
                     "yin_ratio": round(yin_ratio, 2),
+                    "turnover_anchor": round(bars[lu_idx]["volume"] / circ * 100, 2) if circ > 0 else None,
+                    "turnover_anchor_total": round(bars[lu_idx]["volume"] / total * 100, 2) if total > 0 else None,
                     "tech_score": score,
                     "tech_rsi": round(rsi_val, 1) if rsi_val else None,
                     "tech_roc": round(roc, 1) if roc else None,

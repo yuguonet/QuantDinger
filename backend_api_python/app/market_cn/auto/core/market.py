@@ -233,6 +233,20 @@ def limit_dn_price(prev_close: float, board_type: str,
     return prev_close * b[1]
 
 
+def limit_up_price(prev_close: float, board_type: str,
+                   spec: Optional[MarketSpec] = None) -> float:
+    """涨停价 = 昨收 × (1 + 名义 up_pct)（不乘容差; 无涨跌停市场返回 0.0 = 不判定）。
+
+    2026-09-29 审计补: limit_dn_price 的镜像。盘中买入腿的涨停阻买
+    (exec.fill_intraday 的 `up` 参数) 需要名义涨停价, 此前无人提供 ⇒ 阻买被绕过。
+    """
+    s = spec if spec is not None else (_DEFAULT or default_market())
+    if s._band(board_type) is None:
+        return 0.0
+    up_pct = s.nominal_up_pct(board_type)
+    return prev_close * (1.0 + up_pct) if up_pct > 0 else 0.0
+
+
 def limit_dn_tol(spec: Optional[MarketSpec] = None) -> float:
     """跌停判定相对容差（一字跌停 / 顺延判定用；取默认板块档位）。"""
     s = spec if spec is not None else (_DEFAULT or default_market())

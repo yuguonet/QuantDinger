@@ -275,7 +275,16 @@ def load_actual(win, keys=None):
     from app.market_cn.auto import store
     wset = set(win)
     out = {}
-    for r in store.list_signals(days=len(win) + 10, strategies=list(keys) if keys else None):
+    # 2026-09-29 审计修复 (P2): 原 `days=len(win)+10` 是日历日启发式 —— 30 交易日
+    # ≈42 日历日已超 40, 跨长假更糟 ⇒ 窗口首部的现状行漏取, 被误判 missing
+    # (报告失真; ledger 模式对应 upsert 因 sid=None 静默跳过)。按窗口首日精确取。
+    from datetime import datetime as _dt
+    try:
+        d0 = _dt.strptime(str(win[0])[:10], "%Y-%m-%d")
+        days = (_dt.now() - d0).days + 2
+    except Exception:
+        days = len(win) + 10
+    for r in store.list_signals(days=days, strategies=list(keys) if keys else None):
         d = str(r.get("trade_date"))[:10]
         if d in wset:
             out[(d, r.get("strategy"), r.get("code"))] = r
@@ -604,8 +613,13 @@ def replay_ledger(expected, meta, bars_map, idx_map):
                    "previousClose": prev_close}]
         try:
             cdec = strat.confirm_decision(r, {"series": series})
-        except Exception:
-            cdec = None
+        except Exception as e:
+            # 2026-09-29 审计修复 (P2): 判定异常不得吞成"确认通过" —— 跳过本行
+            # (不写库), 异常单列计数; 原先 cdec=None 被静默当作确认成功记成 holding,
+            # `--ledger --apply` 会写入错误终态。
+            stat["判定异常(confirm跳过)"] += 1
+            logger.warning("[replay] confirm_decision 异常 %s/%s: %s", key, code, e)
+            continue
         if cdec is not None and not cdec.confirmed:
             # 不确认 ⇒ monitor 转 exit_today (D1 收盘价) ⇒ 次日平账成 closed (日线口径即当日了结)
             ep = getattr(cdec, "exit_price", None) or b1.get("close")
@@ -618,15 +632,22 @@ def replay_ledger(expected, meta, bars_map, idx_map):
 
         # ---- 逐日出场重放 (monitor step4, 首次 exit 即出场) ----
         hit = None
+        exit_err = None
         for j in range(d1, len(bars)):
             try:
                 edec = strat.exit_decision(r, {"mode": "day_close",
                                                "bars": bars[:j + 1], "entry_idx": d1})
-            except Exception:
-                edec = None
+            except Exception as e:
+                # 2026-09-29 审计修复 (P2): 同上 —— 异常不得吞成"未触发出场"
+                exit_err = e
+                break
             if edec is not None and edec.action == "exit":
                 hit = (j, edec)
                 break
+        if exit_err is not None:
+            stat["判定异常(exit跳过)"] += 1
+            logger.warning("[replay] exit_decision 异常 %s/%s: %s", key, code, exit_err)
+            continue
         if hit is None:
             stat["持有中"] += 1                       # 未触发出场 ⇒ 仍持仓
         else:
@@ -786,11 +807,15 @@ def apply_ledger_plan(plan, dry_run=True):
                 continue
             cur.execute(
                 "UPDATE qd_dragon_signals SET state = %s, updated_at = NOW(), "
-                "extra = extra || %s::jsonb WHERE id = %s",
+                "extra = extra || %s::jsonb WHERE id = %s "
+                "AND state = %s AND entry_date IS NULL",
                 (S_EXPIRED,
                  _json.dumps({"reason": "账本重放: 当前规则下不成立, 作废"},
                              ensure_ascii=False),
-                 sid))
+                 sid, _st or S_WATCH_PENDING))
+            # 2026-09-29 审计修复 (P2): 补守卫 —— plan→apply 窗口内 monitor 可能已推进
+            # 该行 (买入/入场), 无守卫会把已入场行误杀 (原 retire_unfilled/apply_plan
+            # 均复核 state+entry_date, 此处漏了)。守卫不中 = 0 行, 属预期。
             stat["expired"] += cur.rowcount
 
         db.commit()

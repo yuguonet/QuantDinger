@@ -491,6 +491,11 @@ def _rebuild_worker(why, fingerprint=None):
         logger.info("[auto_startup] 补扫当日 (%s)", why)
         stat = run_scan(days=320, wait_data=True, max_wait_sec=_RESCAN_MAX_WAIT_SEC)
         logger.info("[auto_startup] 补扫完成 (%s): %s", why, stat)
+        # P1-2: 扫描被互斥跳过 / 数据未就绪 → 不能进 rebuild (会基于旧应然集误写)
+        if isinstance(stat, dict) and stat.get("status") in ("busy", "data_not_ready"):
+            raise _RebuildIncomplete(f"run_scan status={stat.get('status')}")
+    except _RebuildIncomplete:
+        raise
     except Exception as e:
         logger.warning("[auto_startup] 补扫失败 (不影响重建): %s", e)
 

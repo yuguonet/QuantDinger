@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
+from contextlib import contextmanager
 
 from app.utils.logger import get_logger
 
@@ -36,6 +38,101 @@ except Exception:
     pass
 
 _BACKEND_ROOT_DEFAULT = None  # 由 app 包上下文提供
+
+
+# ================================================================
+# 全市场扫描互斥 (2026-09-29 P1-2)
+# 问题: startup `_rebuild_worker` 与调度 `daily_scan` 可并发 run_scan →
+#       2026-09-18 同款 DELETE+INSERT 死锁丢信号; Probe 文件名也互踩。
+# 解法: 进程内 threading.Lock + 跨进程 DB 行锁 (qd_scan_lock, 连接池安全;
+#       advisory lock 会随 putconn 泄漏, 故不用)。抢不到 → status="busy" 由调用方重试。
+# ================================================================
+
+_scan_thread_lock = threading.Lock()
+_SCAN_LOCK_NAME = "run_scan"
+_SCAN_LOCK_STALE_SEC = 900   # run_scan 最长 wait_data 3600 会分段; 900s 卡死可回收
+
+
+def _scan_holder() -> str:
+    return f"{os.getpid()}:{threading.get_ident()}"
+
+
+def _db_try_scan_lock(holder: str) -> bool:
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS qd_scan_lock (
+                    lock_name   VARCHAR(32) PRIMARY KEY,
+                    holder      VARCHAR(64) NOT NULL,
+                    acquired_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "DELETE FROM qd_scan_lock WHERE lock_name = %s "
+                "AND acquired_at < NOW() - (%s * INTERVAL '1 second')",
+                (_SCAN_LOCK_NAME, _SCAN_LOCK_STALE_SEC),
+            )
+            cur.execute(
+                "INSERT INTO qd_scan_lock (lock_name, holder) VALUES (%s, %s) "
+                "ON CONFLICT (lock_name) DO NOTHING",
+                (_SCAN_LOCK_NAME, holder),
+            )
+            acquired = bool(cur.rowcount and cur.rowcount > 0)
+            db.commit()
+            cur.close()
+        return acquired
+    except Exception as e:
+        logger.warning("[scan_lock] DB 锁失败(退化为仅进程内锁): %s", e)
+        return True   # DB 不可用时不挡扫描 —— 单 worker 模型下 threading 锁已够
+
+
+def _db_release_scan_lock(holder: str):
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "DELETE FROM qd_scan_lock WHERE lock_name = %s AND holder = %s",
+                (_SCAN_LOCK_NAME, holder),
+            )
+            db.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning("[scan_lock] 释放 DB 锁失败(按超时回收): %s", e)
+
+
+@contextmanager
+def _scan_mutex():
+    """抢全市场扫描互斥。yield True=持有; False=他人在扫, 调用方应 status=busy 重试。"""
+    if not _scan_thread_lock.acquire(blocking=False):
+        yield False
+        return
+    holder = _scan_holder()
+    try:
+        if not _db_try_scan_lock(holder):
+            yield False
+            return
+        yield True
+    finally:
+        try:
+            _db_release_scan_lock(holder)
+        finally:
+            _scan_thread_lock.release()
+
+
+def _mark_daily_scanned(keys, target):
+    """成功扫描后写 qd_scheduler_done (daily_scan@<key>@target) —— 任何调用方同口径,
+    含 startup 补扫, 杜绝「startup 扫了但调度器以为没扫」再扫一遍。"""
+    if not keys or not target:
+        return
+    try:
+        from app.market_cn.scheduler import mark_scheduler_task_done
+        for k in keys:
+            mark_scheduler_task_done(f"daily_scan@{k}", target)
+    except Exception as e:
+        logger.warning("[dragon_scan] 写完成标记失败(调度侧进程内缓存兜底): %s", e)
 
 
 # ================================================================
@@ -214,10 +311,26 @@ def finalize_signal_rows(rows, logger=None, env_mode=None):
 # 主扫描
 # ================================================================
 
-def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None):
-    """盘后全市场扫描 (Phase 3: 注册表分发, 策略增删不改本函数)。返回摘要 dict。
+def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None, target=None):
+    """盘后全市场扫描 (Phase 3: 注册表分发)。带跨调用方互斥, 抢不到返回 busy。
 
-    - trade_date = last_finish_trading_day()
+    Args:
+        target: 交易日 (默认 last_finish_trading_day)。调度侧应传入自己用于
+            完成标记的同一 target, 避免 15:00 翻转边界「标了旧日、扫了新日」。
+    """
+    with _scan_mutex() as _got:
+        if not _got:
+            logger.warning("[dragon_scan] 他人正在全市场扫描, 本次跳过 (keys=%s)", keys)
+            return {"status": "busy", "target": target or _target_date(),
+                    "keys": list(keys or [])}
+        return _run_scan_locked(days=days, wait_data=wait_data,
+                                max_wait_sec=max_wait_sec, keys=keys, target=target)
+
+
+def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, target=None):
+    """已持有 _scan_mutex 的扫描主体。返回摘要 dict。成功路径写 daily_scan@* 完成标记。
+
+    - trade_date = target 或 last_finish_trading_day()
     - 遍历注册表中 enabled 且 kind=daily_close 的策略 (keys 非空则只跑该子集,
       事件驱动分发用: 不同策略 after_events 就绪时刻不同, 分批触发), 统一:
       判定 → U1~U4 预过滤 (锚点=策略 prefilter_anchor) → daily_limit 截断(score降序)
@@ -254,7 +367,7 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None):
                      for k, s in active.items()}
 
     store.ensure_tables()
-    target = _target_date()
+    target = target or _target_date()
 
     # 数据就绪等待 (仿 post_market_batch)
     if wait_data:
@@ -284,6 +397,13 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None):
             # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
             if bars[-1]["time"] > target:
                 bars = [b for b in bars if b["time"] <= target]
+            elif bars[-1]["time"] < target:
+                # 2026-09-29 审计修复 (P1): 该股尚未回填到 target 日 (回填中途
+                # _data_ready 只看 000001) → 在 T-1 旧 bar 上判定会产出
+                # trade_date=target / signal_date=T-1 的错日幽灵信号 → 跳过。
+                # 残留限度: 被跳过的股若本轮后仍不回填, 不会补扫 (宜由数据就绪
+                # 闸门保证回填完整后再放行扫描)。
+                continue
             if not bars:
                 continue
             name = (stock_info.get(code) or {}).get("name", "")
@@ -363,6 +483,8 @@ def run_scan(days=320, wait_data=True, max_wait_sec=3600, keys=None):
     logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs) env=%s",
                 len(codes), result.get("written", 0), time.time() - t0,
                 env_info.get("mode", "-"))
+    # P1-2: 任何调用方 (调度 daily_scan / startup 补扫 / CLI) 成功后同口径落完成标记
+    _mark_daily_scanned(active.keys(), target)
     return {"status": "ok", "target": target, "codes": len(codes),
             "signals": result.get("written", 0), "env": env_info}
 

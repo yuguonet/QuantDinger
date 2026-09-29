@@ -44,8 +44,9 @@ def _window_bounds(days=300, as_of=None):
 def fetch_kline_db(code, days=300, as_of=None):
     """从 DB 加载日K (前复权), 返回 list[dict] (time/open/high/low/close/volume)。
 
-    as_of: **取数窗口锚点** (只影响窗口, 不额外过滤)。调用方给了 as_of 必须下传,
-    否则历史 as_of 会因窗口锁在"今天"而返回空 (审计 A1)。
+    as_of: 取数窗口锚点 + as-of 截断 (只保留 <= as_of 的 bar, 与 fetch_klines_batch
+           同语义; 2026-09-29 审计修复: 原先仅靠 end=as_of+1天 裁剪, writer.query
+           端点含等号, as_of+1 为交易日时会多一根"未来"bar, 与 batch 版口径不一致)。
     """
     start, end = _window_bounds(days, as_of)
     try:
@@ -55,6 +56,9 @@ def fetch_kline_db(code, days=300, as_of=None):
         data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
         if not data:
             return []
+        if as_of is not None:
+            cutoff = str(as_of)[:10]
+            data = [r for r in data if str(r["time"])[:10] <= cutoff]
         return unadj_to_qfq([{
             "time": str(r["time"])[:10],
             "open": float(r["open"]),
