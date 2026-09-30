@@ -297,6 +297,17 @@ agent = TaskAgent(
     # 当前设计：plan 只选技能，不选域，工具在 execute 阶段通过 ctx.tool_provider 注入。
 )
 
+# ── 启动期预热（2026-09-30）────────────────────────────────────────
+# 工具面扫描 + 能力层注册 + 同功能筛选缓存，原先挂在 nodes.NodeContext.init_tools
+# 懒加载（首条消息才跑）——CLI 启动日志看不到，也违背「启动时筛一次、消息路径不扫」。
+# 进程内 _SHARED_TOOL_PROVIDER 有缓存，预热一次即可；失败不阻断，首条消息仍会懒加载。
+try:
+    from nodes import NodeContext
+    NodeContext(llm=llm).init_tools()
+    logger.info("[启动] 工具面/能力层/同功能筛选已预热（后续消息复用缓存）")
+except Exception as e:
+    logger.warning("[启动] 工具面预热失败（首条消息时会懒加载）: %s", e)
+
 
 
 
