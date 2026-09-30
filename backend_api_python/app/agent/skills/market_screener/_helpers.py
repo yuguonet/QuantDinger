@@ -260,13 +260,15 @@ def flow_summary(code: str) -> Dict[str, Any]:
         ff = call_tool("get_fund_flow_realtime", code=code)
         if not isinstance(ff, dict) or ff.get("error"):
             return {"ok": False, "reason": (ff or {}).get("error", "无返回")}
-        main_net = _f(ff.get("main_net_inflow")) / 1e4
-        amount = _f(ff.get("amount") or ff.get("turnover"))
+        # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
+        # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0；amount/turnover 在该
+        # 返回里同样不存在，拿不到就如实给 None（不再瞎除），调试字段 raw_keys 移除。
+        main_net = _f(ff.get("total_main_net", ff.get("main_net_inflow"))) / 1e4
+        amount = _f(ff.get("amount") or ff.get("turnover") or ff.get("amount_wan"))
         return {
             "ok": True,
             "main_net_wan": round(main_net, 1),
             "net_pct_of_amount": round(main_net * 1e4 / amount * 100, 2) if amount else None,
-            "raw_keys": sorted(list(ff.keys()))[:8],
         }
     except Exception as e:
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}

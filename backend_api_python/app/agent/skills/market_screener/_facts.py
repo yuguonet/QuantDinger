@@ -115,10 +115,21 @@ def market_state() -> Dict[str, Any]:
     """
     today = _today_str()
 
+    # 三对账修正（2026-09-30）：旧实现拿平安银行（000001）个券资金流冒充“上证净流入”，
+    # 且读 net_inflow（真实键 total_main_net）恒 0 → 情绪分恒基线。改走大盘口径
+    # （get_fund_flow scope=market，键 main_net，单位元），失败如实记 0。
     net_inflow = 0
-    ff = call_tool("get_fund_flow_realtime", code="000001")
-    if isinstance(ff, dict) and not ff.get("error"):
-        net_inflow = ff.get("net_inflow", 0) or 0
+    try:
+        from app.agent.tools.finance.fund_flow_tools import get_fund_flow
+        ff = get_fund_flow(scope="market")
+        if isinstance(ff, dict) and not ff.get("error"):
+            net_inflow = float(ff.get("main_net") or ff.get("total_main_net") or 0)
+    except Exception as e:
+        try:
+            from app.agent.log import logger
+            logger.warning("[MktScreen] 大盘资金流获取失败: %s", e)
+        except Exception:
+            pass
 
     zt_pool = fetch_zt_pool(today)
     dt_pool = fetch_dt_pool(today)
@@ -132,8 +143,11 @@ def market_state() -> Dict[str, Any]:
     weak_sectors: List[Dict] = []
     sectors = fetch_hot_sectors()
     if isinstance(sectors, dict) and not sectors.get("error"):
-        for s in sectors.get("industry", [])[:10]:
-            bucket = strong_sectors if s.get("change_pct", 0) > 0 else weak_sectors
+        # 三对账修正（2026-09-30）：get_hot_sectors 返回 {code,msg,data}，板块行在
+        # data.industry 二级键——旧读顶层 industry 恒空，强弱板块永远为空。
+        _sd = sectors.get("data") if isinstance(sectors.get("data"), dict) else sectors
+        for s in (_sd.get("industry") or [])[:10]:
+            bucket = strong_sectors if (s.get("change_pct") or 0) > 0 else weak_sectors
             bucket.append({"name": s.get("name"), "change_pct": s.get("change_pct")})
 
     # 描述性情绪标签（历史口径，保持与 _helpers._mood_regime 兼容）

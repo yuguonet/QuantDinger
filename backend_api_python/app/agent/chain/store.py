@@ -537,8 +537,20 @@ def query_latest_root(stock_code: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error("[Store] 查询最近根节点失败 stock=%s: %s", stock_code, e)
         return None
+def _sql_chain_norm(col: str) -> str:
+    """链名归一 SQL 版（2026-09-30，与 domain_registry.normalize_chain_name 同语义近似：
+    剥 4~6 位实体数字段及相邻 '+'，压缩并清首尾 '+'）。
+
+    链名归一上线后新旧行键不同（stock+analyze+600929 vs stock+analyze），
+    按链名匹配的追责面（惩罚计数/最近根节点/链权重聚合）两侧必须同键，
+    否则切换点起惩罚计数清零、链权重断账。
+    """
+    return ("trim('+' from regexp_replace(regexp_replace(lower(" + col + "), "
+            "'\\+?\\d{4,6}', '', 'g'), '\\++', '+', 'g'))")
+
+
 def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
-    """查询某 chain 最近一条根节点 trace（无 stock_code 时使用）。"""
+    """查询某 chain 最近一条根节点 trace（无 stock_code 时使用；键按归一匹配）。"""
     from app.utils.db import get_db_connection
 
     try:
@@ -548,9 +560,10 @@ def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
                 SELECT id, exec_date, stock_code, stock_name, name,
                        score, action, direction, confidence, status
                 FROM qd_agent_traces
-                WHERE parent_id IS NULL AND name = %s
+                WHERE parent_id IS NULL
+                  AND %s = %s
                 ORDER BY created_at DESC LIMIT 1
-            """, (chain_name,))
+            """ % (_sql_chain_norm("name"), _sql_chain_norm("%s")), (chain_name,))
 
             row = cur.fetchone()
             if not row:
@@ -658,9 +671,9 @@ def get_penalty_count_by_chain(chain_name: str) -> int:
             cur.execute("""
                 SELECT COUNT(*) as cnt FROM qd_agent_traces
                 WHERE parent_id IS NULL
-                  AND name = %s
+                  AND %s = %s
                   AND human_verdict = 'negative_feedback'
-            """, (chain_name,))
+            """ % (_sql_chain_norm("name"), _sql_chain_norm("%s")), (chain_name,))
             row = cur.fetchone()
             return row['cnt'] if row else 0
     except Exception as e:
@@ -761,7 +774,8 @@ def query_cached_tools(domain: str, verb: str, noun: str, stock_code: str = None
 
     MAX_STEPS = 6         # 单轮最大步数
 
-    chain_name = f"{domain}+{verb}+{noun}" if domain else f"{verb}+{noun}"
+    chain_name = _normalize_chain_name(
+        f"{domain}+{verb}+{noun}" if domain else f"{verb}+{noun}")
 
     def _query(cur, extra_where: str, params: tuple) -> Optional[list]:
         """聚合查询：按 tools_called 分组，取最优链路。"""
@@ -883,6 +897,47 @@ BREW_WIN_RATE_FLOOR = 0.7    # 正确率闸门
 BREW_CONFIDENCE_CAP = 10     # 置信缩放分母（verified 达此值后不再增益）
 
 
+def _normalize_chain_name(raw: str) -> str:
+    """链名归一（双路径兼容）：剥实体码，同构链（不同标的）归同一键。"""
+    try:
+        from domain_registry import normalize_chain_name
+    except ImportError:  # pragma: no cover
+        from app.agent.domain_registry import normalize_chain_name
+    return normalize_chain_name(raw)
+
+
+def _merge_chain_rows(rows: List[dict]) -> List[dict]:
+    """按归一链名合并聚合行（2026-09-30，技能通用性修复）。
+
+    历史链名把股票代码写进了 noun 槽（stock+analyze+600929），按原始 name
+    聚合/筛选会让每只股票各产一个候选 → 酿出绑定单股的 skill。归一后合并
+    （runs/falsified/verified 求和，days_span/last_date 取大，sample_root_id 取小），
+    同构链只产一个通用候选。
+    """
+    merged: Dict[str, dict] = {}
+    for r in rows or ():
+        key = _normalize_chain_name(str(r.get("chain_name") or ""))
+        if not key:
+            continue
+        m = merged.get(key)
+        if m is None:
+            m = dict(r)
+            m["chain_name"] = key
+            merged[key] = m
+            continue
+        for k in ("runs", "falsified", "verified_correct", "verified_total"):
+            if k in m and k in r:
+                m[k] += r[k]
+        if "days_span" in m and "days_span" in r:
+            m["days_span"] = max(m.get("days_span") or 0, r.get("days_span") or 0)
+        if r.get("last_date") and (not m.get("last_date") or r["last_date"] > m["last_date"]):
+            m["last_date"] = r["last_date"]
+        if r.get("sample_root_id") and (not m.get("sample_root_id")
+                                        or r["sample_root_id"] < m["sample_root_id"]):
+            m["sample_root_id"] = r["sample_root_id"]
+    return list(merged.values())
+
+
 def query_brew_ready(min_signal: float = BREW_MIN_SIGNAL, limit: int = 5) -> list:
     """信号就绪的酿造候选（重设计 §2.5 触发策略 v2，2026-09-19）。
 
@@ -919,6 +974,7 @@ def query_brew_ready(min_signal: float = BREW_MIN_SIGNAL, limit: int = 5) -> lis
             """, (BREW_WIN_RATE_FLOOR, limit))
             rows = [dict(r) for r in cur.fetchall()]
             cur.close()
+            rows = _merge_chain_rows(rows)   # 实体码链归一合并（2026-09-30）
             out = []
             for r in rows:
                 wr = (r["verified_correct"] / r["verified_total"]) if r["verified_total"] else 0.0
@@ -971,7 +1027,7 @@ def query_brew_candidates(min_runs: int = 5, max_falsified_ratio: float = 0.3,
             """, (min_runs, max_falsified_ratio, min_days_span, limit))
             rows = cur.fetchall()
             cur.close()
-            return [dict(r) for r in rows]
+            return _merge_chain_rows([dict(r) for r in rows])   # 实体码链归一合并（2026-09-30）
     except Exception as e:
         logger.warning("[Store] 酿造候选查询失败: %s", e)
         return []
@@ -988,7 +1044,7 @@ def get_run_tree_digest(root_id: int, max_children: int = 12) -> Optional[dict]:
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT name, user_query, plan, tools_called FROM qd_agent_traces WHERE id = %s
+                SELECT name, user_query, plan, tools_called, stock_name FROM qd_agent_traces WHERE id = %s
             """, (root_id,))
             root = cur.fetchone()
             if not root:
@@ -1012,6 +1068,7 @@ def get_run_tree_digest(root_id: int, max_children: int = 12) -> Optional[dict]:
                 "user_query": root["user_query"] or "",
                 "plan": (root["plan"] or "")[:1500],
                 "tools_called": root["tools_called"] or [],
+                "stock_name": root["stock_name"] or "",
                 "steps": steps,
             }
     except Exception as e:

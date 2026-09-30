@@ -146,6 +146,25 @@ _PLAN_REPLAN_NOTE = (
 # 真隔离需求请走官方 `executor_type="e2b"/"docker"/"modal"/"blaxel"`,不要再自建解释器。
 
 
+_NUMERIC_RULES_CACHE: dict = {}
+
+
+def _numeric_rules_text() -> str:
+    """【数字规范】段（CLAIMS + 数据自检），2026-09-30 提智 #5 条件注入。
+
+    原内容为 code_agent.yaml 规则 18/19（全量常驻，8.9k system_prompt 的大头之一）。
+    现改为：分析类任务（analysis/screen/compare/技能任务）才注入完整规范；
+    纯查询/代码/解释类只背 yaml 规则 18 的一行溯源纪律。文件缺失 fail-open 为空。"""
+    if "text" not in _NUMERIC_RULES_CACHE:
+        try:
+            _p = os.path.join(os.path.dirname(__file__), "..", "prompts", "numeric_rules.txt")
+            with open(_p, encoding="utf-8") as f:
+                _NUMERIC_RULES_CACHE["text"] = f.read().strip()
+        except Exception:
+            _NUMERIC_RULES_CACHE["text"] = ""
+    return _NUMERIC_RULES_CACHE["text"]
+
+
 def _sandbox_instructions(tools: Any = None) -> str:
     """渲染执行环境说明段。
 
@@ -1210,7 +1229,7 @@ class TaskAgent(AgentBase):
 
             for s in skills:
                 name = s['name']
-                desc = s.get('description', '')[:150]
+                desc = s.get('description', '')[:300]
                 weight = skill_weights.get(name)
                 weight_tag = f" [权重:{weight:.2f}]" if weight is not None else ""
                 # A1a：取该 skill 名下的因子权重（若有），标注已校准的因子数与 top3
@@ -1226,7 +1245,7 @@ class TaskAgent(AgentBase):
                 _funcs = prescan_skill_funcs(name.replace("-", "_"))
                 for _f in _funcs[:8]:
                     _line = "    · " + _f["sig"] + (" - " + _f["doc"] if _f["doc"] else "")
-                    skills_desc.append(_line[:150])
+                    skills_desc.append(_line[:200])
         skills_text = "\n".join(skills_desc) if skills_desc else "(无可用技能)"
 
         # 注入可用域和工具名列表,让规划器知道 CodeAgent 能调什么
@@ -1929,6 +1948,7 @@ class TaskAgent(AgentBase):
         step_event_cb=None,
         run_scope: str | None = None,
         extra_tools: list | None = None,
+        numeric_report: bool = True,
     ):
         """构建 smolagents CodeAgent 实例。
 
@@ -2621,11 +2641,13 @@ class TaskAgent(AgentBase):
                 _ev = _drain_fm(executor)
                 for _et, _det in _ev:
                     _failure_memory.record(_et, _det)
+                    _failure_memory.record_fingerprint(_det)   # 8.4 通用错误指纹
                 _new = _failure_memory.new_types()
-                if not _new:
+                _fpw = _failure_memory.consume_fingerprint_warnings()
+                if not _new and not _fpw:
                     return
                 _failure_memory.mark_injected(_new)
-                _txt = _failure_memory.render()
+                _txt = _failure_memory.render(_fpw)
                 if not _txt:
                     return
                 _obs = getattr(memory_step, "observations", None)
@@ -2720,32 +2742,6 @@ class TaskAgent(AgentBase):
                     logger.warning("[FinalAnswer] 数字溯源失败,拒收要求重写:%s", guide[:160])
                     raise ValueError(guide)
             return True
-            # 数字溯源(工具输出 grounding)--2026-09-24 提智阶段 0.10 复活(审计 A1):
-            # 旧实现把两处 raise 写在 try 内、被 except Exception→logger.debug 吞掉,
-            # 本函数恒返回 True(拒收从未生效,warning 与行为脱节)。现改为:
-            # 语料采集单独 try(失败仅降级语料源),判定与 raise 在吞不掉的位置;
-            # 语料源由截断后的 observations 改为 executor.state 全量(审计 A1b:obs 已被
-            # _truncate_observations 截到 400 字符,拿它当语料会把真数值误判成编造)。
-            # 判定实现抽 utils/grounding.py 单一事实源(提智方案 E1:verify_node / 评测集共用)。
-            try:
-                from utils.grounding import collect_grounding_corpus
-                corpus = collect_grounding_corpus(getattr(executor, "state", None) or {})
-            except Exception as e:
-                logger.warning("[FinalAnswer] grounding 语料采集失败,退回 observations: %s", e)
-                corpus = "\n".join(
-                    str(getattr(step, "observations", "") or "")
-                    for step in getattr(getattr(agent, "memory", None), "steps", []) or [])
-            if corpus.strip():
-                from utils.grounding import check_grounding
-                ok, guide = check_grounding(text, corpus)
-                if not ok:
-                    try:
-                        agent._grounding_rejects = int(getattr(agent, "_grounding_rejects", 0)) + 1
-                    except Exception:
-                        pass
-                    logger.warning("[FinalAnswer] 数字溯源失败,拒收要求重写:%s", guide[:160])
-                    raise ValueError(guide)
-            return True
 
         agent = SmolCodeAgent(
             tools=smol_tools,
@@ -2772,6 +2768,10 @@ class TaskAgent(AgentBase):
                 "- 将 web_search 结果作为参考信息,结合已有数据分析\n"
                 "- web_search 结果用于补充新闻面、政策面、市场情绪等实时信息"
                 "- 【代码类任务】测试用例只用可比较的同类型元素（勿混 int 与 str）；final_answer 可含代码块，但开头要有结论句"
+                # 数字规范条件注入（2026-09-30 提智 #5）：CLAIMS/数据自检只对分析类
+                # 任务注入（prompts/numeric_rules.txt）；纯查询/代码任务只背规则 18 的
+                # 一行溯源纪律。缺省 True = 不确定时保留全量规范（fail-safe）。
+                + (("\n" + _numeric_rules_text()) if numeric_report else "")
             ),
         )
 

@@ -1,11 +1,14 @@
 ---
-name: auto_stock-analyze-600929
+name: auto_stock-analyze
 version: 0.1.0
-description: 对 A 股目标股票开展技术形态、基本面、筹码、资金流与多空研判；当用户说“分析某只股票”“看看这只票怎么样”“技术面和基本面如何”“判断多空或风险”时使用。
+description: 对 A 股目标股票开展技术形态、基本面、筹码、资金流与多空研判的一站式综合分析；当用户说“分析某只股票/个股”“分析XXX（代码或名称）”“看看这只票/这只股怎么样”“技术面和基本面如何”“给个分析”“判断多空或风险”时使用。
 tags: [A股, 个股分析, 技术分析, 基本面, 筹码分布, 资金流, 多空研判]
-tools: [all_codes, agent_get_kline, daily_live, analyze_chart_patterns, analyze_pattern, get_finance, get_capital_summary, get_chip_distribution, get_fund_flow_daily, get_dragon_tiger, get_dividend, bull_bear_research]
+tools: [all_codes, resolve_stock, get_stock_info, get_stock_sector_info, get_realtime_quote, agent_get_kline, daily_live, analyze_chart_patterns, analyze_pattern, get_finance, get_capital_summary, get_chip_distribution, get_fund_flow_daily, get_dragon_tiger, get_dividend, bull_bear_research]
 ---
-<!-- auto-brewed 2026-09-29 from root_id=992 chain=stock+analyze+600929 | human-edited 后请去除 auto_ 前缀接管 -->
+<!-- auto-brewed 2026-09-29 from root_id=992 chain=stock+analyze | human-edited 后请去除 auto_ 前缀接管 -->
+<!-- 2026-09-30 人工合并泛化：原两条按标的分裂的链（root_id=984 / root_id=992，实体码已从链名剥离）
+     合并为跨标的通用版，违反 §3.16 泛化纪律的旧目录已删；并按工具真实签名修正
+     codes 参数类型（字符串、多股逗号分隔；列表入参会让 get_fund_flow_daily 等直接报错）。 -->
 # A 股目标股票多维分析
 
 ## 使用场景
@@ -31,13 +34,13 @@ tools: [all_codes, agent_get_kline, daily_live, analyze_chart_patterns, analyze_
 
 1. **解析并确认目标股票**
    - 优先从用户输入中提取六位 A 股代码，并按字符串保存，避免丢失前导零。
-   - 如果只有股票名称，调用 `all_codes()` 获取全市场活跃代码表，再进行名称匹配。
+   - 如果只有股票名称，调用 `resolve_stock(keyword="目标名称")` 或 `all_codes()` 匹配标准代码。
    - 名称精确匹配到一只股票时，使用其标准代码继续分析；匹配不到或多只股票同名时，先向用户确认，不擅自选择。
    - 如果用户已提供代码，不重复调用全市场代码表。
 
 2. **获取历史价格和成交量数据**
-   - 调用 `agent_get_kline(codes=["目标代码"], timeframe="1D", days=120, adj="qfq")`：
-     - `codes`：字符串列表。
+   - 调用 `agent_get_kline(codes="目标代码", timeframe="1D", days=120, adj="qfq")`：
+     - `codes`：字符串，多股用英文逗号分隔（如 `"目标代码1,目标代码2"`）。
      - `timeframe`：字符串，固定为 `"1D"`。
      - `days`：整数，表示回看天数。
      - `adj`：字符串，固定为 `"qfq"`，使用前复权口径。
@@ -49,43 +52,43 @@ tools: [all_codes, agent_get_kline, daily_live, analyze_chart_patterns, analyze_
    - 将 `daily_live` 今日合成 bar 标记为“未收盘动态数据”，不得当作已确认收盘价。历史序列和实时序列重叠部分出现差异时，优先保留时间戳和复权口径明确的数据。
 
 3. **识别技术形态和当日 K 线信号**
-   - 调用 `analyze_chart_patterns(codes=["目标代码"])`，识别头肩顶/底、双顶/底、三角形、旗形、楔形、矩形、杯柄等经典形态。
-   - 调用 `analyze_pattern(codes=["目标代码"])`，获取当日锤子线、十字星、吞没、三连阳等 K 线形态及其含义。
+   - 调用 `analyze_chart_patterns(codes="目标代码")`，识别头肩顶/底、双顶/底、三角形、旗形、楔形、矩形、杯柄等经典形态。
+   - 调用 `analyze_pattern(codes="目标代码")`，获取当日锤子线、十字星、吞没、三连阳等 K 线形态及其含义。
    - 对每项结果记录工具实际返回的形态、方向、时间范围和确认条件；工具未返回确认度时，不自行编造置信度。
    - 将形态与趋势、成交量、支撑阻力共同验证。没有后续 K 线确认时，将单日吞没、锤子等信号表述为“待确认”，不直接等同于反转。
    - 支撑和阻力只使用实际 K 线高低点或明显成交密集区域，不为了给出结论而虚构精确目标价。
 
 4. **核查基本面和估值**
    - 调用 `get_finance(code="目标代码")` 获取个股基础财务数据，其中 `code` 必须传字符串。
-   - 调用 `get_capital_summary(codes=["目标代码"])` 获取营收与利润增速、ROE、PE、PB、市值及机构持仓变化等中长线指标，其中 `codes` 必须传字符串列表。
+   - 调用 `get_capital_summary(codes="目标代码")` 获取营收与利润增速、ROE、PE、PB、市值及机构持仓变化等中长线指标，其中 `codes` 必须传字符串（多股逗号分隔）。
    - 比较数据前先核对报告期和指标日期，禁止把不同报告期的数据直接横向比较。
    - 重点检查营收与利润方向是否一致、ROE 趋势、估值水平及机构持仓变化。亏损或数据异常导致 PE 无意义时，按“不可比”或“缺失”处理，不将负值当作低估值。
    - 保留工具返回的指标单位和口径；无法确认单位时不做倍数换算。
 
 5. **分析筹码分布**
-   - 调用 `get_chip_distribution(codes=["目标代码"], lookback_days=120)`：
-     - `codes`：字符串列表。
+   - 调用 `get_chip_distribution(codes="目标代码", lookback_days=120)`：
+     - `codes`：字符串，多股逗号分隔。
      - `lookback_days`：整数，回看窗口设为 120 天。
    - 联合最新价格、获利比例、平均成本、90% 筹码集中度以及套牢盘/获利盘比例，判断当前价格位于筹码分布的什么区域。
    - 将筹码分布表述为基于成交数据估算的结果，不解释为真实账户持仓。
    - 最新价格来自未收盘合成 bar 时，相关结论标记为动态结论，并说明收盘后可能变化。
 
 6. **分析历史资金流**
-   - 调用 `get_fund_flow_daily(codes=["目标代码"], days=120)`：
-     - `codes`：字符串列表。
+   - 调用 `get_fund_flow_daily(codes="目标代码", days=120)`：
+     - `codes`：字符串，多股逗号分隔。
      - `days`：整数，回看近 120 天资金流。
    - 检查近期净流入、净流出是否持续，以及资金方向是否与价格趋势、成交量变化一致。
    - 不把资金流数据等同于公司真实现金流或特定机构的实际买卖；只作为交易行为估计指标。
    - 数据行不足、日期不连续或金额单位缺失时，缩短观察窗口或直接标记数据不足，不插值、不填零。
 
 7. **按需核查龙虎榜和分红事件**
-   - 用户询问异常涨跌、席位买卖或上榜原因时，调用 `get_dragon_tiger(codes=["目标代码"], date="", days=30, detail=False)`；需要席位等明细时将 `detail` 设为布尔值 `True`。
+   - 用户询问异常涨跌、席位买卖或上榜原因时，调用 `get_dragon_tiger(codes="目标代码", date="", days=30, detail=False)`；需要席位等明细时将 `detail` 设为布尔值 `True`。
    - 龙虎榜未收录只表示该期间没有对应记录，不自动解释为资金看空或看多。
    - 用户询问历史分红、送转或除权除息时，调用 `get_dividend(code="目标代码")`，核对除权除息日期及其对前复权价格序列的影响。
 
 8. **生成并校验多空综合判断**
-   - 完成独立数据核查后，调用 `bull_bear_research(codes=["目标代码"], stock_name="已确认的股票名称")`：
-     - `codes`：字符串列表。
+   - 完成独立数据核查后，调用 `bull_bear_research(codes="目标代码", stock_name="已确认的股票名称")`：
+     - `codes`：字符串，多股逗号分隔。
      - `stock_name`：字符串；名称未确认时传空字符串 `""`，不要把股票代码填入该字段。
    - 保留工具返回的原始多空评分、方向判断和依据，不擅自改变评分尺度。
    - 将该结果作为综合摘要，而不是独立事实。逐项与价格趋势、形态、基本面、筹码和资金流交叉验证。
@@ -104,7 +107,7 @@ tools: [all_codes, agent_get_kline, daily_live, analyze_chart_patterns, analyze_
 
 ## 注意事项
 
-- 批量工具的 `codes` 必须传字符串列表，例如 `["目标代码"]`，不要传逗号拼接字符串，也不要把字符串列表误传给单标的 `code` 参数。
+- **批量工具的 `codes` 一律传字符串**（多股用英文逗号分隔，如 `"目标代码1,目标代码2"`）：`agent_get_kline / analyze_chart_patterns / analyze_pattern / get_capital_summary / get_chip_distribution / get_fund_flow_daily / get_dragon_tiger / bull_bear_research / get_realtime_quote / get_stock_info / get_stock_sector_info` 的 `codes` 参数真实签名是字符串，**不要包成 `["目标代码"]` 列表**——`get_fund_flow_daily` 等内部直接 `codes.split(",")`，传列表会直接报错。仅 `agent_get_kline` 对列表做了容错。
 - `code`、`stock_name`、`timeframe`、`adj` 和 `date` 均为字符串；`days`、`lookback_days` 为整数；`detail` 为布尔值。
 - 同一分析中统一使用前复权口径，不混用前复权、全新未复权和除权前价格。涉及历史分红时必须说明复权影响。
 - 今日合成 bar 不是已确认收盘数据。盘中出现的形态、突破、支撑失效和资金判断都应标记为临时结论。

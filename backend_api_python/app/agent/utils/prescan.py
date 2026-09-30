@@ -31,17 +31,26 @@ def _first_doc(fn) -> str:
 
 
 def _sig_str(fn) -> str:
-    """紧凑签名：name(a, b=1)（默认值简示）。"""
+    """紧凑签名：name(a: str, b: int=1)（默认值简示）。
+
+    2026-09-30 提智：补参数类型注解——酿造模板声称"签名清单含参数类型"，
+    但此前只给参数名，LLM 只能猜类型（codes 列表/字符串写反是实祸根）。
+    """
     try:
         ps = []
         for p in inspect.signature(fn).parameters.values():
             if p.name.startswith("_"):
                 continue
+            ann = ""
+            if p.annotation is not inspect.Parameter.empty:
+                a = p.annotation
+                ann = ": " + (getattr(a, "__name__", None)
+                              or str(a).replace("typing.", ""))
             if p.default is inspect.Parameter.empty:
-                ps.append(p.name)
+                ps.append(f"{p.name}{ann}")
             else:
                 d = repr(p.default)
-                ps.append(f"{p.name}={d}" if len(d) <= 12 else f"{p.name}={d[:9]}…")
+                ps.append(f"{p.name}{ann}={d}" if len(d) <= 12 else f"{p.name}{ann}={d[:9]}…")
         return f"{fn.__name__}({', '.join(ps)})"
     except (ValueError, TypeError):
         return fn.__name__ + "(…)"
@@ -190,7 +199,7 @@ def rank_tool_names(provider, query: str, limit: int = 0,
     return ordered[:limit], len(names) - limit
 
 
-def prescan_tools(provider, limit: int = 60, per_item: int = 110,
+def prescan_tools(provider, limit: int = 60, per_item: int = 140,
                   query: str = "") -> str:
     """工具预扫文本：紧凑签名清单（替代裸名字列表）。
 

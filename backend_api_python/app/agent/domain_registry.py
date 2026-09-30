@@ -126,6 +126,38 @@ def get_spec(domain: str) -> Optional[DomainSpec]:
 # ── 查找 API（核心只准走这里）────────────────────────────────
 
 
+# ── 链名归一（2026-09-30，技能通用性修复）────────────────────────────
+# chain_name（domain+verb+noun）既是酿造聚合键，也是 skill 命名词根。历史上
+# noun 槽曾被股票代码占据（如 stock+analyze+600929），导致按标的分裂出绑定
+# 单只股票的 skill（skills/auto_stock-analyze-600929），违背 AGENT_DESIGN §3.16
+# 泛化纪律。归一规则：任何链名段内的实体数字码（4~6 位连数字串，A 股代码、
+# 基金代码等）一律剥离；段因此变空则丢段。写入层（tracing）与消费层
+# （store 聚合 / skill_brewer 命名与幂等）共用本规则，保证同构链（不同标的的
+# 同意图任务）归到同一个键、酿出跨标的通用技能。
+_ENTITY_RUN_RE = re.compile(r"(?<!\d)\d{4,6}(?!\d)")
+_MARKET_SUFFIX_RE = re.compile(r"^[._-]?(sh|sz|bj|hk)$", re.I)
+
+
+def strip_entity(seg: str) -> str:
+    """剥离段内实体数字码：'600929' → ''，'stock' → 'stock'，'2026' → ''，
+    '600519.SH'（先被 normalize 小写）→ ''——市场后缀残留一并清。"""
+    s = _ENTITY_RUN_RE.sub("", seg or "").strip("-_ ")
+    return _MARKET_SUFFIX_RE.sub("", s).strip("-_ .")
+
+
+def normalize_chain_name(raw: str) -> str:
+    """链名归一：剥实体码 + 丢空段。'stock+analyze+600929' → 'stock+analyze'。
+
+    幂等：normalize(normalize(x)) == normalize(x)。
+    """
+    segs = []
+    for seg in re.split(r"[+]", raw or ""):
+        s = strip_entity(seg.strip().lower())
+        if s:
+            segs.append(s)
+    return "+".join(segs)
+
+
 def classify_verb(verb: str) -> Dict[str, str]:
     """verb → {domain, noun}；未登记返回空 dict（调用方落 unknown）。"""
     v = (verb or "").strip().lower()

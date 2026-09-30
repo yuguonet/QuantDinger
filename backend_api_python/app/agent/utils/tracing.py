@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 # 2026-09-25：verb→(domain,noun) 已抽到 domain_registry / tools/<domain>/domain_meta.py，
 # 核心不再写死 finance/stock；新领域在 domain_meta 登记即可参与追溯归类。
 from domain_registry import classify_verb as _classify_verb
+from domain_registry import normalize_chain_name as _normalize_chain_name
+from domain_registry import strip_entity as _strip_entity
 
 
 def _now_ms() -> int:
@@ -660,9 +662,15 @@ class AgentTraceRecorder:
             _cls = _classify_verb(self.intent_verb)
             if not self.domain and _cls:
                 self.domain = _cls.get("domain", "")
-            if not self.intent_noun and _cls:
-                self.intent_noun = _cls.get("noun", "")
-            chain_name = f"{self.domain or 'unknown'}+{self.intent_verb or 'unknown'}+{self.intent_noun or 'unknown'}"
+            # 实体防泄漏（2026-09-30，技能通用性修复）：noun 槽若被股票代码等实体
+            # 标识占据（历史链名 stock+analyze+600929 即此病），先剥离再走 verb
+            # 归类兜底——否则 chain 键按标的分裂，酿造会为每只股票各产一个 skill。
+            noun = _strip_entity(self.intent_noun)
+            if not noun and _cls:
+                noun = _cls.get("noun", "")
+            self.intent_noun = noun
+            chain_name = _normalize_chain_name(
+                f"{self.domain or 'unknown'}+{self.intent_verb or 'unknown'}+{noun or 'unknown'}")
 
             # 跳过大势/筛选类无标的空链：无 stock_code 且链仍含 unknown（无法归类）→
             # 不参与决策树/回测统计，避免 unknown+screen+unknown 这类毒丸数据入库。

@@ -171,20 +171,60 @@ def _validate_tools(skmd: str, provider) -> str:
     return fixed
 
 
+def _is_human_edited(text: str) -> bool:
+    """人工接管判定（2026-09-30 修）：模板自带文案里就含 "human-edited 后请去除…"
+    ——直接 `in` 匹配恒真（日志永远报“人工编辑=True”）。只认真正的接管标记。"""
+    return bool(re.search(re.escape(_HUMAN_EDITED_MARK) + r"(?!\s*后请去除)", text or ""))
+
+
 def _skill_dir_exists_for(chain_name: str) -> Optional[str]:
-    """幂等检查：该 chain 已有 auto_ skill（含人工编辑标记识别）→ 返回目录名。"""
-    if not _SKILLS_DIR.exists():
+    """幂等检查：溯源注释含 chain=<name> 的技能已存在 → 返回目录名。
+
+    2026-09-30 两处收严：
+      - 扫描范围扩到全部技能目录（人工去掉 auto_ 前缀接管后不得再触发重酿，
+        否则同一链会多出一个 auto_ 复制品与人写版并存）；
+      - 匹配加词边界（防子串误报：chain=stock+analyze 不得命中 stock+analyze+foo）。
+    """
+    if not _SKILLS_DIR.exists() or not chain_name:
         return None
-    for d in sorted(_SKILLS_DIR.glob(f"{_AUTO_PREFIX}*")):
+    pat = re.compile(r"chain=" + re.escape(chain_name) + r"(?![+a-z0-9_])")
+    for d in sorted(_SKILLS_DIR.iterdir()):
+        if not d.is_dir() or d.name.startswith("_") or d.name == "__pycache__":
+            continue
         md = d / "SKILL.md"
         if not md.exists():
             continue
         text = md.read_text(encoding="utf-8", errors="replace")
-        if chain_name in text:
+        if pat.search(text):
             logger.info("[Brewer] chain=%s 已有 %s（人工编辑=%s），跳过",
-                        chain_name, d.name, _HUMAN_EDITED_MARK in text)
+                        chain_name, d.name, _is_human_edited(text))
             return d.name
     return None
+
+
+def _find_entity_codes(skmd: str) -> list:
+    """通用性质量门（2026-09-30，§3.16 泛化纪律的代码化）：
+
+    设计文档声称“写死具体代码 = 编译失败重酿”，但此前无任何实现（校验只有
+    tools 白名单 + frontmatter 字段），auto_stock-analyze-600929 这类绑定单股
+    的技能即由此漏过。此处扫编译产物里的六位实体码（日期/溯源 id 先剥离防误伤）。
+    """
+    text = re.sub(r"\d{4}-\d{2}-\d{2}", "", skmd or "")
+    text = re.sub(r"root_id=\d+", "", text)
+    return re.findall(r"(?<!\d)\d{6}(?!\d)", text)
+
+
+def _generic_violation(skmd: str, sample_name: str = "") -> list:
+    """通用性违规清单（2026-09-30 提智扩展）：实体码 + 标的名称双维度。
+
+    名称级检查：LLM 不写代码却写“贵州茅台”同样绑定单股——样本 root 的
+    stock_name 命中产物即违规（名称 ≥2 字才检查，防单字误伤）。
+    """
+    refs = [f"code:{c}" for c in _find_entity_codes(skmd)]
+    name = str(sample_name or "").strip()
+    if len(name) >= 2 and name in (skmd or ""):
+        refs.append(f"name:{name}")
+    return refs
 
 
 # ── brew 触发 v2 常量（重设计 §2.5，2026-09-19；S6：字面量 → 命名常量）──
@@ -316,7 +356,16 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
     template = _load_brew_template()
     results = []
     for cand in candidates:
-        chain_name = cand["chain_name"]
+        # 链名归一（2026-09-30）：实体码链（stock+analyze+600929）与同构链合并，
+        # skill 命名词根不得携带标的标识——否则每只股票各酿一个技能。
+        try:
+            from domain_registry import normalize_chain_name
+        except ImportError:
+            from app.agent.domain_registry import normalize_chain_name
+        chain_name = normalize_chain_name(str(cand.get("chain_name") or ""))
+        if not chain_name:
+            results.append({"chain_name": cand.get("chain_name"), "status": "bad_chain"})
+            continue
         existing = _skill_dir_exists_for(chain_name)
         if existing:
             results.append({"chain_name": chain_name, "status": "exists", "skill_dir": existing})
@@ -361,6 +410,31 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
         if "name:" not in skmd or "description:" not in skmd:
             results.append({"chain_name": chain_name, "status": "bad_format"})
             continue
+
+        # 通用性质量门（2026-09-30，提智扩展）：产物含六位实体码**或样本标的名称**
+        # → 带提醒重酿一次；仍违规则丢弃不落盘（宁可不酿，也不固化绑定单股的技能）。
+        _sample_name = str((digest or {}).get("stock_name") or "").strip()
+        bad_codes = _generic_violation(skmd, _sample_name)
+        if bad_codes:
+            logger.warning("[Brewer] chain=%s 编译产物违反泛化（%s），带提醒重酿一次",
+                           chain_name, bad_codes[:3])
+            try:
+                import asyncio as _asyncio
+                from llm.base import ChatMessage as _CM
+                resp = _asyncio.run(llm.generate(messages=[
+                    _CM(role="system", content="你是技能工程师，只输出 SKILL.md 文件内容。"),
+                    _CM(role="user", content=prompt +
+                        "\n\n【重申】正文与参数示例禁止出现任何六位股票代码或具体标的名称"
+                        "（含样本任务里的股票名），一律用“目标股票/目标代码”占位。"),
+                ]))
+                skmd = _strip_code_fence(resp.content or "")
+            except Exception as e:
+                logger.warning("[Brewer] 重酿失败 chain=%s: %s", chain_name, e)
+            bad_codes = _generic_violation(skmd, _sample_name)
+            if bad_codes:
+                results.append({"chain_name": chain_name, "status": "not_generic",
+                                "refs": bad_codes[:5]})
+                continue
 
         # 目录名由代码决定（不信任 LLM 输出的 name——它可能改前缀/连字符风格）；
         # frontmatter 里的 name 仅作展示，_scan_markdown 的 display 映射会兜住。

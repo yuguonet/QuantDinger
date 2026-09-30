@@ -250,8 +250,6 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     except Exception as e:
         missing.append(f"市场状态: {type(e).__name__}: {e}")
 
-    _EVIDENCE_DIMS = ("tech", "patterns", "flow", "prediction")
-
     def _one(item: dict) -> dict:
         code = str(item.get("code") or "")
         name = item.get("name") or ""
@@ -259,7 +257,11 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         # _evidence 记录「这一维数据有没有拿到」，与「有没有触发信号」是两回事
         row = {"code": code, "name": name, "missing": miss, "_evidence": {}}
 
-        bars = fetch_kline(code, days=120)
+        try:
+            bars = fetch_kline(code, days=120)
+        except Exception as e:
+            miss.append(f"日线异常:{type(e).__name__}: {e}")
+            bars = []
         if not bars:
             miss.append("日线缺失")
             row["tech"] = None
@@ -350,7 +352,12 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         # confidence = 证据完整度（这一维的数据有没有拿到），不是模型对判断的把握
         ev = dict(r.pop("_evidence", {}) or {})
         ev["prediction"] = pred_ok
-        dims = ("tech", "patterns", "flow", "prediction") if with_patterns else ("tech", "flow", "prediction")
+        # 维度按开关计数：with_flow=False 时 flow 不该拉低证据完整度
+        dims = ["tech", "prediction"]
+        if with_patterns:
+            dims.append("patterns")
+        if with_flow:
+            dims.append("flow")
         have = [k for k in dims if ev.get(k)]
         r["confidence"] = round(len(have) / len(dims), 2)
         r["evidence_dims"] = have
@@ -492,12 +499,17 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
         missing.append(f"tech: {ts.get('reason')}")
         out["prediction"] = {"ok": False, "reason": "日线不足，无法预测"}
 
-    _p = (qdata or {}).get("price") or (bars[-1]["close"] if bars else None)
+    # 三对账修正（2026-09-30）：get_realtime_quote 行情dict 的真实键是
+    # last/changePercent/volume（见工具 Returns 契约）——旧读 price/change_pct 等
+    # 幻觉键，除价格有 K 线兜底外其余恒 None。保留旧键兜底以防源字段漂移。
+    _p = ((qdata or {}).get("last") or (qdata or {}).get("price")
+          or (bars[-1]["close"] if bars else None))
     out["quote"] = {
         "price": round(float(_p), 2) if _p else None,
-        "change_pct": (qdata or {}).get("change_pct"),
+        "change_pct": (qdata or {}).get("changePercent", (qdata or {}).get("change_pct")),
         "turnover_pct": (qdata or {}).get("turnover_rate") or (qdata or {}).get("turnover_pct"),
         "amount": (qdata or {}).get("amount"),
+        "volume": (qdata or {}).get("volume"),
         "volume_ratio": (qdata or {}).get("volume_ratio"),
     }
     out["flow"] = results.get("flow")

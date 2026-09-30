@@ -169,9 +169,6 @@ class QDSkillAdapter:
         d1 = here / "skills"
         if d1.exists():
             dirs.append(str(d1))
-        d2 = here.parent / "agent-nold" / "skills"
-        if d2.exists():
-            dirs.append(str(d2))
         return dirs
 
     def _scan_markdown(self, skills_dir: str):
@@ -224,10 +221,7 @@ class QDSkillAdapter:
 
             try:
                 # 用完整包路径导入
-                if "agent-nold" in str(base):
-                    mod = importlib.import_module(f"app.agent-nold.skills.{module_name}")
-                else:
-                    mod = importlib.import_module(f"skills.{module_name}")
+                mod = importlib.import_module(f"skills.{module_name}")
             except Exception:
                 continue
 
@@ -261,10 +255,7 @@ class QDSkillAdapter:
             if not run_py.exists():
                 continue
             try:
-                if "agent-nold" in str(base):
-                    mod = importlib.import_module(f"app.agent-nold.skills.{sub_dir.name}.run")
-                else:
-                    mod = importlib.import_module(f"skills.{sub_dir.name}.run")
+                mod = importlib.import_module(f"skills.{sub_dir.name}.run")
             except Exception:
                 continue
 

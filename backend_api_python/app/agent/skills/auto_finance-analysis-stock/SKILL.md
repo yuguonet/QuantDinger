@@ -2,7 +2,7 @@
 ---
 name: auto_finance-analysis-stock
 version: 0.1.0
-description: 对单只A股标的开展T+1/T+3/1W/1M多周期技术面、资金面、基本面综合诊断，输出短期走势参考结论。适用于用户要求"分析/诊断/解读某只股票"、"看下600519怎么样"、"贵州茅台短期走势如何"、"XX标的近期该关注什么"等场景。
+description: 对单只A股标的开展T+1/T+3/1W/1M多周期技术面、资金面、基本面综合诊断，输出短期走势参考结论。适用于用户要求"分析/诊断/解读某只股票"、"看下<目标代码>怎么样"、"<目标名称>短期走势如何"、"XX标的近期该关注什么"等场景。
 tags: [finance, stock, A股, 多周期分析, 技术面, 资金面, 基本面, 综合诊断]
 tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info, get_capital_summary, get_fund_flow, get_chip_distribution]
 ---
@@ -11,7 +11,7 @@ tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info,
 
 ## 使用场景
 
-当用户给出一个明确的A股标的（股票代码或名称），并要求对其近期走势进行分析、诊断或解读时，使用本技能。典型触发措辞包括但不限于："分析XXX"、"看看600519怎么样"、"贵州茅台短期走势"、"XXX（股票代码）最近能持吗"。
+当用户给出一个明确的A股标的（股票代码或名称），并要求对其近期走势进行分析、诊断或解读时，使用本技能。典型触发措辞包括但不限于："分析XXX"、"看看<目标代码>怎么样"、"<目标名称>短期走势"、"XXX（股票代码）最近能持吗"。
 
 **不适用边界**：
 - 不适用于期货、外汇、加密货币、港股、美股等非A股标的。
@@ -21,7 +21,7 @@ tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info,
 ## 执行流程
 
 ### Step 1：实体识别与代码规范化
-- 从用户输入中提取股票名称或代码，统一转换为交易所标准代码格式（如 `600519` → `600519.SH`，创业板为 `.SZ`）。
+- 从用户输入中提取股票名称或代码，统一转换为交易所标准代码格式（如 `目标代码` → `目标代码.SH`，创业板为 `.SZ`）。
 - 确认分析周期（默认 T+1/T+3/1W/1M）与数据口径（默认日线级别）。
 
 ### Step 2：并行拉取基础行情与K线
@@ -74,7 +74,7 @@ tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info,
 
 ## 注意事项
 
-- **参数类型坑**：`agent_get_kline` 与 `get_realtime_quote` 等工具的 `codes` 参数在单标的场景下**必须传字符串**（如 `'600519.SH'`）。若传入 `list` 类型，可能触发 `AttributeError: 'list' object has no attribute 'split'`。
+- **参数类型坑**：`agent_get_kline` 与 `get_realtime_quote` 等工具的 `codes` 参数在单标的场景下**必须传字符串**（如 `'目标代码.SH'`）。若传入 `list` 类型，可能触发 `AttributeError: 'list' object has no attribute 'split'`。
 - **数据缺失兜底**：`get_realtime_quote` 可能返回 `{'error': '未获取到行情'}`，此时应立即以 `agent_get_kline` 或 `technical_analysis` 返回的最新收盘价 `latest_close` 作为当前价，并标注数据来源差异。
 - **字段名保护**：部分字段可能缺失（如筹码集中度），读取前需做空值/键值检查，避免直接抛异常；机构目标价/估值分位字段不存在，不得向用户承诺。
 - **周期换算**：T+N 均按**交易日**近似计算，非自然日；若K线数据不足对应周期，需在报告中说明数据窗口限制。

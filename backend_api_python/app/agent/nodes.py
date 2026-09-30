@@ -977,8 +977,13 @@ def make_plan_node(ctx: NodeContext):
 
         replan_context = ""
         if prev_hit and prev_result:
-            replan_context = f"\n\n【前轮执行结果（步数耗尽）】\n{prev_result[:2000]}\n请基于上述进度继续完成任务。"
+            replan_context = f"\n\n【前轮执行结果（{state.get('replan_reason') or '步数耗尽'}）】\n{prev_result[:2000]}\n请基于上述进度继续完成任务。"
             logger.info("[Plan] 复盘第 %d 轮，前轮结果 %d 字符", replan_count, len(prev_result))
+        # 8.2 replan_reason 归因（2026-09-30 提智）：回 plan 的真实原因进 trace
+        #（原则 7 可自证）；此前只有“步数耗尽”一种叙事，升级/验收不过/重设计混在一起。
+        _rr = str(state.get("replan_reason") or "")
+        if _rr and trace:
+            trace.record("replan_reason", {"reason": _rr, "replan_count": replan_count})
 
         # 加载历史对话
         history_text = ""
@@ -1061,8 +1066,39 @@ def make_plan_node(ctx: NodeContext):
         from domain_registry import default_entity_type as _default_entity_type
         ctx._plan_entity_type = entity_type or _default_entity_type()
         # T2 难度透传（2026-09-24）：_plan 据此取 Best-of-N 的 N（不在 plan 期重算——
-        # 两次结果可能不同，路由抖动比误判更难查）
-        ctx._plan_difficulty = state.get("difficulty", "")
+        # 两次结果可能不同，路由抖动比误判更难查）。
+        # 2026-09-30 提智：升级语义补全——升级信号触发后必须真实抬档到 L2
+        # （best-of-N + critic + 全量 linter 生效）；此前只丢弃单段重 plan，
+        # difficulty 仍停 L1，“升级”有名无实。抬档结果回写 state.difficulty。
+        _diff = str(state.get("difficulty") or "")
+        if state.get("_upgrade_pending") and _diff.upper() in ("", "L0", "L1"):
+            _diff = "L2"
+            logger.info("[Plan] 升级抬档：difficulty → L2（重规划启用 best-of-N + critic）")
+        ctx._plan_difficulty = _diff
+
+        # ── T2 模型档位接线（2026-09-30 提智 #6）：路由矩阵 model_tier 列首次生效 ──
+        # fail-open：未配置 AGENT_MODEL_TIER_* 则沿用默认 LLM；small 档额外受
+        # AGENT_ROUTING_DOWNGRADE 启用闸（默认关）；strong 档配置即生效。换档只影响
+        # 本次 run 的 ctx.llm（不动全局单例）。
+        try:
+            from agents.routing_policy import tier_model
+            _tm = tier_model(_diff)
+            if _tm and _tm != getattr(ctx.llm, "model", ""):
+                from llm.factory import create_llm
+                _cur = ctx.llm
+                ctx.llm = create_llm({
+                    "provider": getattr(_cur, "provider", "") or "",
+                    "model": _tm,
+                    "temperature": getattr(_cur, "temperature", None),
+                    "max_tokens": getattr(_cur, "max_tokens", None),
+                })
+                logger.info("[Plan] 模型档位切换: %s → %s（difficulty=%s）",
+                            getattr(_cur, "model", "?"), _tm, _diff)
+                if trace:
+                    trace.record("model_tier", {"model": _tm,
+                                                "difficulty": _diff})
+        except Exception as _te:
+            logger.debug("[Plan] 模型档位切换跳过: %s", _te)
 
         # _plan() 内部已将所有技能名+描述注入到 plan prompt，由 LLM 选择
         plan = await ctx.agent._plan(plan_input, ctx.llm, trace, plan_ctx=ctx)
@@ -1085,6 +1121,11 @@ def make_plan_node(ctx: NodeContext):
             skill_tools.extend(_load_skill_functions(selected_skill))
             logger.info("[Plan] 渐进加载技能 '%s': %d 个工具", selected_skill, len(skill_tools))
 
+            # V2 断链修复（2026-09-30 提智）：set_skill 此前仅单段执行处调用，
+            # 多阶段任务的 run 不产 skill 子节点 → 技能权重/修订旁支对 phase 路径
+            # 永久失明。plan 期就标记，单段/phase 两路全覆盖。
+            if trace:
+                trace.set_skill(selected_skill)
             trace.record("skill_loaded", {
                 "skill": selected_skill,
                 "body_chars": len(skill_body),
@@ -1133,6 +1174,7 @@ def make_plan_node(ctx: NodeContext):
             "step_budget": _sb,
             "planning_interval": plan.get("planning_interval", 6),
             "replan_count": replan_count + (1 if prev_hit else 0),
+            "difficulty": _diff,   # 升级抬档后回写（chat 判定，升级信号可抬 L2）
             "phases": phases,
             "plan_tools": plan.get("plan_tools") or [],
             "phase_index": 0,
@@ -1596,6 +1638,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             "_phase_agents": {},
             "_phase_abort": False,
             "_phase_replan_request": True,
+            "replan_reason": "阶段目标未知（重设计）",
             "_failed_tools": [],
             "_agent_plan": "",
             "_run_error": "",
@@ -1771,6 +1814,15 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                       "只打印提炼后的关键字段\n"
                       "- 分析文本在下一段写：你写下的每个数字，都必须能在之前的 Observation 里找到\n"
                       "- 全部取数完成后用 final_answer 一次收尾")
+    # ── §8.1 事实权威层（2026-09-30 提智）：时间口径只读区块，防模型改写时间事实
+    # 且被复盘继承。facts 首次构建后存 state（可序列化），finalize 对账复用同一快照。
+    try:
+        from utils.facts import build_facts, render_facts_block
+        _facts = state.get("facts") or build_facts()
+        state["facts"] = _facts
+        task_parts.append(render_facts_block(_facts))
+    except Exception as _fe:
+        logger.debug("[Facts] 时间口径区块跳过: %s", _fe)
     full_task = "\n\n".join(task_parts)
 
     # ── 3. 批次级预算 / 内部规划 ──
@@ -1826,6 +1878,9 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
             tools=(union_tools if not any_default else None),
             step_event_cb=getattr(ctx, "event_cb", None),
             run_scope=run_scope,
+            # 数字规范条件注入（2026-09-30 提智 #5）：分析/技能类任务才带 CLAIMS/数据自检
+            numeric_report=(state.get("task_type") in ("analysis", "screen", "compare")
+                            or bool(state.get("selected_skill"))),
         )
 
     if agent is None:
@@ -1836,6 +1891,21 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                     first_id, last_id, len(union_tools), "on" if effective_interval else "off")
     else:
         logger.info("[Execute] 批次 [%d-%d] 复用 CodeAgent（重试）", first_id, last_id)
+        # 8.5 阶段重试上下文收敛（2026-09-30 提智）：重试复用实例时 memory 全量累积
+        # （v2.4 实测单阶段重试后 input 达 137k tokens）。裁到最近 N 步——工具变量在
+        # executor.state 里不受影响（跨步/跨阶段续承不靠 memory），裁剪事件留痕。
+        try:
+            _keep = int(os.getenv("AGENT_RETRY_KEEP_STEPS", "6") or "6")
+            _msteps = getattr(getattr(agent, "memory", None), "steps", None)
+            if isinstance(_msteps, list) and _keep > 0 and len(_msteps) > _keep:
+                _drop = len(_msteps) - _keep
+                del _msteps[:_drop]
+                logger.info("[Execute] 重试上下文裁剪：丢弃 %d 步旧 memory（保留 %d）",
+                            _drop, _keep)
+                if trace:
+                    trace.record("retry_memory_trim", {"dropped": _drop, "kept": _keep})
+        except Exception as _te:
+            logger.debug("[Execute] 重试上下文裁剪跳过: %s", _te)
 
     agent.max_steps = sum_budget
     _set_llm_timeout(agent, 180)
@@ -2087,6 +2157,7 @@ async def _run_phase_step(ctx: NodeContext, state: dict, phases: list) -> dict:
                 "phase_last_note": (_ff_note[:500] or "未通过验收"),
                 "_phase_agents": {}, "_phase_abort": bool(interrupted),
                 "_phase_replan_request": True,
+                "replan_reason": "阶段验收未过",
                 "_failed_tools": failed_tools, "_agent_plan": "",
                 "_run_error": repr(run_error) if run_error else "",
             }
@@ -2224,6 +2295,15 @@ def make_execute_node(ctx: NodeContext):
             task_parts.append("【附加点名工具（可直接调用；括号内为参数名）】" + ", ".join(_pt_sigs))
             logger.info("[Execute] 附加点名工具 %d 个: %s", len(_pt_sigs), plan_tools[:12])
 
+        # ── §8.1 事实权威层（2026-09-30 提智）：同 phase 路径，时间口径只读区块 ──
+        try:
+            from utils.facts import build_facts, render_facts_block
+            _facts = state.get("facts") or build_facts()
+            state["facts"] = _facts
+            task_parts.append(render_facts_block(_facts))
+        except Exception as _fe:
+            logger.debug("[Facts] 时间口径区块跳过: %s", _fe)
+
         full_task = "\n\n".join(task_parts)
 
         # 复用已有 CodeAgent 实例（跨轮 memory 自然衔接）——但实例是与"工具契约"
@@ -2269,6 +2349,8 @@ def make_execute_node(ctx: NodeContext):
                 tools=_tools_param,
                 step_event_cb=getattr(ctx, "event_cb", None),
                 run_scope=run_scope,
+                numeric_report=(state.get("task_type") in ("analysis", "screen", "compare")
+                                or bool(selected_skill)),
             )
             agent._tool_contract = _contract
             logger.info("[Execute] 新建 CodeAgent 实例（工具契约 %s）", _contract)
@@ -2381,26 +2463,29 @@ def make_execute_node(ctx: NodeContext):
         # ── T2 升级信号（2026-09-24 提智三波）：单段工具调用超阈值/数据缺口 → 丢弃单段
         # 从头 plan。判定与阈值在 agents/routing_policy（登记表化）；只触发一次
         # （_upgrade_done），且只对 L0/L1 单段路径生效（多阶段走 _phase_replan_request）。
-        # 模型自报 need_replan 的单段通道尚未建（留参待接，不假装生效）。
+        # 模型自报 need_replan（2026-09-30 提智三路闭合）：执行器以【需重规划】标记
+        # 死路（code_agent.yaml 规则 20 邀请显式自报，判定只认标记不猜语义）。
         _upgrade_pending = False
         if not state.get("_upgrade_done"):
             try:
-                from agents.routing_policy import should_upgrade
+                from agents.routing_policy import should_upgrade, detect_self_replan
                 _tc_count = len(getattr(trace, "_tool_calls", []) or [])
                 _fm_obj = getattr(agent, "_failure_memory", None)
                 # 跨域数据缺口代理信号：B3 self_check_failed 出现（validate_df 缺口）
                 _cross_gap = bool(_fm_obj and getattr(_fm_obj, "counts", {}).get("self_check_failed"))
+                _self_replan = detect_self_replan(result)
                 _upgrade_pending = should_upgrade(
                     state.get("difficulty", ""), _tc_count,
-                    cross_domain_gap=_cross_gap, need_replan=False)
+                    cross_domain_gap=_cross_gap, need_replan=_self_replan)
                 if _upgrade_pending:
-                    logger.warning("[Execute] 升级信号命中（difficulty=%s tools=%d gap=%s）"
+                    logger.warning("[Execute] 升级信号命中（difficulty=%s tools=%d gap=%s self=%s）"
                                    "→ 丢弃单段结果从头 plan",
-                                   state.get("difficulty", ""), _tc_count, _cross_gap)
+                                   state.get("difficulty", ""), _tc_count, _cross_gap, _self_replan)
                     if trace:
                         trace.record("difficulty_upgrade",
                                      {"from": state.get("difficulty", ""),
-                                      "tool_calls": _tc_count, "cross_domain_gap": _cross_gap})
+                                      "tool_calls": _tc_count, "cross_domain_gap": _cross_gap,
+                                      "self_reported_replan": _self_replan})
             except Exception as _e:
                 logger.debug("[Execute] 升级信号判定跳过: %s", _e)
 
@@ -2413,6 +2498,9 @@ def make_execute_node(ctx: NodeContext):
             "_agent_plan": agent_plan,  # smolagents 最终规划
             "_run_error": repr(run_error) if run_error else "",  # 执行异常标记（含 LLM 5xx），finalize 据此判定 run 失败
             "_budget_exceeded": _budget_exceeded,  # 0.9 成本预算超限原因（空=未超限）
+            # 8.2 归因：回 plan 的真实原因显式落 state（plan 期进任务书 + trace）
+            "replan_reason": ("难度低估（升级信号）" if _upgrade_pending
+                              else "步数耗尽" if hit_max_steps else ""),
             "_upgrade_pending": _upgrade_pending,   # T2 升级信号（每次返回显式覆盖，防旧值残留）
             "_upgrade_done": bool(state.get("_upgrade_done") or _upgrade_pending),
         }
@@ -2438,6 +2526,20 @@ def make_finalize_node(ctx: NodeContext):
         # 缓存格式化前的原始 CodeAgent 输出：trace 结构化字段提取必须用原始结果，
         # 否则 LLM 格式化版式一变，score/direction 的 regex 提取随之失效（审计 P1-3）。
         raw_agent_output = state.get("result_raw", "") or direct_answer or ""
+        # ── §8.1 事实冲突记账（2026-09-30 提智，只记不拦）：最终答案的日期断言与
+        # facts 快照对账，冲突写 trace（fact_conflict）供复盘/评测定位时间幻觉。
+        try:
+            from utils.facts import build_facts, detect_fact_conflict
+            _facts = state.get("facts") or build_facts()
+            _conflicts = detect_fact_conflict(raw_agent_output, _facts)
+            if _conflicts:
+                logger.warning("[Finalize] 事实冲突 %d 处: %s", len(_conflicts), _conflicts[:3])
+                _tr = state.get("_trace")
+                if _tr:
+                    _tr.record("fact_conflict", {"conflicts": _conflicts[:5],
+                                                  "ref_date": _facts.get("ref_date")})
+        except Exception as _fe:
+            logger.debug("[Facts] 冲突检查跳过: %s", _fe)
         # run 失败判定（P1-3 配套）：执行异常（含 LLM 网关 5xx）的 run 只留错误痕迹，
         # 不作为"成功分析"进入 qd_agent_traces 提取/回测统计——否则一次网关故障会造出一条
         # direction="neutral"、confidence=0.5 的伪决策记录参与权重训练（root_id=1737 事故）。

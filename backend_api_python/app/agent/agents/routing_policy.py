@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
     "ROUTING_MATRIX", "score_difficulty", "difficulty_block", "parse_level",
-    "planning_samples", "best_of_n", "should_upgrade", "policy",
+    "planning_samples", "best_of_n", "should_upgrade", "policy", "detect_self_replan",
+    "tier_model",
     "LEVELS",
 ]
 
@@ -123,6 +124,35 @@ def should_upgrade(level: str, tool_calls: int, *, cross_domain_gap: bool = Fals
                 or cross_domain_gap or need_replan)
 
 
+# 模型自报死路的显式标记（2026-09-30 提智，T2 升级信号第三路）。
+# code_agent.yaml 规则 20 邀请执行器在真实死路时以此开头声明卡点；
+# 判定只认标记，不做模糊语义猜测（防“无法获取”类正常报告误触发）。
+_SELF_REPORT_MARK = "【需重规划】"
+
+
+def tier_model(level: str) -> str:
+    """模型档位 → 模型名（2026-09-30 提智 #6：矩阵 model_tier 列接线，遗留清单 #2）。
+
+    env：AGENT_MODEL_TIER_SMALL / AGENT_MODEL_TIER_STRONG（模型名，空 = 沿用默认 LLM）。
+    L0/L1 的 small 档额外受 AGENT_ROUTING_DOWNGRADE 启用闸（默认关——需评测集先证
+    小模型掉点 <5pp 才开）；L2/L3 的 strong 档是显式 opt-in，配置即生效。
+    """
+    lv = str(level or "").upper()
+    tier = policy(lv).get("model_tier", "")
+    if tier == "small":
+        if not downgrade_enabled():
+            return ""
+        return (os.getenv("AGENT_MODEL_TIER_SMALL", "") or "").strip()
+    if tier == "strong":
+        return (os.getenv("AGENT_MODEL_TIER_STRONG", "") or "").strip()
+    return ""
+
+
+def detect_self_replan(text: str) -> bool:
+    """模型自报需重规划：final_answer 含【需重规划】标记 → True。"""
+    return _SELF_REPORT_MARK in str(text or "")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  确定性难度打分（零调用）
 # ═══════════════════════════════════════════════════════════════
@@ -147,7 +177,17 @@ _QUERY_ONLY = ("是多少", "多少钱", "什么价", "现价", "是什么", "�
 
 # 分析动作词（出现即不是纯查询）
 _ANALYSIS_VERBS = ("分析", "评估", "诊断", "筛选", "选出", "推荐", "研究", "归因",
-                   "对比", "预测", "判断", "怎么样", "怎么看", "值得")
+                   "对比", "预测", "判断", "怎么样", "怎么看", "值得",
+                   "买什么", "选什么", "选股")
+
+# 单标的综合分析地板（2026-09-30 提智）：分析类动作 + 实体，且非单点数据查询 →
+# 天然跨技术/财务/筹码/资金多数据域，按 L2 走（best-of-N + critic + 全量 linter）。
+# 此前这类任务落 L1（单候选规划、无 critic），是"个股分析忽好忽坏"的路由层根因。
+_ENTITY_WORD_RE = re.compile(r"(?<!\d)\d{6}(?!\d)|这只(股|票)|个股|标的|该股|股票|什么股|哪些股|"
+                           r"板块|行业|概念|组合|一篮子")
+_NARROW_DATA_RE = re.compile(
+    r"现价|最新价|多少钱|什么价|涨跌幅|市盈率|市净率|pe|pb|市值|换手率|"
+    r"收盘价|开盘价|分红|公告|是什么|什么意思")
 
 _FULL_SCALE = sum(w for _n, w, _k in FEATURE_RULES) + 1.0   # 域广度加成上界 1.0
 _BAND_EDGES = ((0.0, 1.0, "L0"), (1.0, 2.5, "L1"), (2.5, 10.0, "L2"))
@@ -201,6 +241,13 @@ def score_difficulty(text: str) -> Tuple[str, float, Dict[str, Any], bool]:
         has_verb = any(k in s for k in _ANALYSIS_VERBS)
         if has_verb or not has_query:
             level = "L1"          # 动作词或非纯查询形态 → 至少单段计算
+
+    # L2 地板（2026-09-30 提智）：综合分析类任务不许停在 L1 单候选档
+    if level in ("L0", "L1"):
+        if (any(k in s for k in _ANALYSIS_VERBS)
+                and _ENTITY_WORD_RE.search(s)
+                and not _NARROW_DATA_RE.search(s)):
+            level = "L2"
 
     # 临界带：距任一边界 ±10%×全量程
     tol = BORDERLINE_PCT * _FULL_SCALE

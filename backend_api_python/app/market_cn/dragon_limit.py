@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List
 
 from app.data_sources.rate_limiter import get_akshare_limiter
@@ -324,33 +325,47 @@ def get_dragon_tiger(start_date: str = "", end_date: str = "") -> List[Dict[str,
 
 
 def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
-    """获取涨停池（只读: 返回缓存，不触发拉取）
+    """获取涨停池。
+
+    ⚠ 2026-09-30 修正：旧实现忽略 trade_date、任何日期都返回当日实时快照——
+    fetch_recent_zt_pools(8) 会把今天这份池子当成 8 天记录（伪造历史日期维度）。
+    现：当日/未指定 → 实时缓存（零网络，不触发拉取）；历史日期 → _ak_zt_pool 按日拉取。
 
     Returns:
-        list[dict]: 涨停池行（含 stock_code/stock_name/price/change_percent/zt_time/turnover_rate/amount）；无缓存 []。
+        list[dict]: 涨停池行（含 stock_code/stock_name/price/change_percent/
+        zt_time/turnover_rate/amount/continuous_zt_days/seal_amount/reason）；无数据 []。
     """
+    _day = (trade_date or "").strip()
+    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+        return _ak_zt_pool(_day)
     if _rt_zt_pool is not None:
         return _rt_zt_pool
     return []
 
 
 def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
-    """获取跌停池（只读: 返回缓存，不触发拉取）
+    """获取跌停池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存）。
 
     Returns:
-        list[dict]: 跌停池行（键同涨停池）；无缓存 []。
+        list[dict]: 跌停池行（键同涨停池）；无数据 []。
     """
+    _day = (trade_date or "").strip()
+    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+        return _ak_dt_pool(_day)
     if _rt_dt_pool is not None:
         return _rt_dt_pool
     return []
 
 
 def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
-    """获取炸板池（只读: 返回缓存，不触发拉取）
+    """获取炸板池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存）。
 
     Returns:
-        list[dict]: 炸板池行（键同涨停池）；无缓存 []。
+        list[dict]: 炸板池行（键同涨停池）；无数据 []。
     """
+    _day = (trade_date or "").strip()
+    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+        return _ak_broken_board(_day)
     if _rt_broken_board is not None:
         return _rt_broken_board
     return []

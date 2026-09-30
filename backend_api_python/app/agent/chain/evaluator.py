@@ -691,17 +691,19 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             # 同步口径：只算有定论（correct IS NOT NULL）的链；含失败链路（链坏了
             # 也是权重信号，与 tool 层同款）；低样本不改权重（防误判）。
             # name 含 'unknown' 的不可归类链不产权重行（与酿造候选同口径排除）。
+            from chain.store import _sql_chain_norm
+            _nk = _sql_chain_norm("t.name")
             cur.execute("""
-                SELECT t.name AS chain_name,
+                SELECT %s AS chain_name,
                        COUNT(*) AS n,
                        AVG(CASE WHEN t.correct THEN 1.0 ELSE 0.0 END) AS win_rate
                 FROM qd_agent_traces t
                 WHERE t.layer = 'chain'
                   AND t.correct IS NOT NULL
-                  AND t.exec_date >= %s
+                  AND t.exec_date >= %%s
                   AND position('unknown' in t.name) = 0
-                GROUP BY t.name
-            """, (since,))
+                GROUP BY %s
+            """ % (_nk, _nk), (since,))
             for row in cur.fetchall():
                 cname, n, wr = row["chain_name"], int(row["n"]), float(row["win_rate"])
                 weight = 1.0 if n < 10 else round(max(0.5, min(2.0, 1.0 + (wr - 0.5) * 2.0)), 4)
