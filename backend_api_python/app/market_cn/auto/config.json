@@ -47,9 +47,9 @@
     },
     "v1": {
       "label": "V1",
-      "enabled": true,
+      "enabled": false,
       "daily_limit": 5,
-      "winrate": 72.7
+      "winrate": 42.7
     },
     "break": {
       "label": "断板",

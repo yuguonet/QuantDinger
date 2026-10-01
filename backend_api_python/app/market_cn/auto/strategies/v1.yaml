@@ -18,7 +18,10 @@ entry:
   price: open                 # 成交价基准 = D1 开盘价
   gap_min: {main: min_gap_main, gem_star: min_gap_gem}   # 值可引用 params 名 → 保留网格可扫
   gap_max: {gem_star: gem_gap_max}
-  require_d1_close_up: true   # 镜像 v1 的 d1_change<0 → 淘汰
+  # ⚠ 前视 (2026-09-30): d1_change 是 D1 收盘值, 用它淘汰 D1 开盘入场 = 未来信息;
+  #   实盘语义是「D2 开盘清仓」(confirm_decision weak), 已由 exit v1_combo 的 pre_exit 实现。
+  #   默认 false = 对齐实盘。置 true 仅用于复现旧回测口径做对照。
+  require_d1_close_up: false
   gap_exclude_band: {main: [main_gap_band_lo, main_gap_band_hi]}   # 主板高开 3~5% 不入场
 
 exit:

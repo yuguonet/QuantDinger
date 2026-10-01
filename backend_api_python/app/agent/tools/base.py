@@ -11,6 +11,7 @@ import importlib
 import inspect
 import json
 import logging
+import threading
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -298,6 +299,9 @@ _SKIP_FILES = {
     # 的函数注册进沙箱、以"缺必填参数 category"的破损签名覆盖正经的 _ListToolsTool，
     # 导致 Agent 调 list_tools() 报 "分类 'general' 不存在。可用分类: "（2026-09-14 实测）。
     "mcp_bridge",
+    # availability（2026-10-01）：工具可用性探测是**启动期自检设施**，不是给模型
+    # 调用的工具面。若被扫描注册，probe_* 会进工具清单白占 token，且模型可能误调。
+    "availability",
 }
 
 # 元工具模块（通过 smolagents tools=[] 注入，provider **注册表**不扫描）。
@@ -388,13 +392,25 @@ def _is_tool_function(obj, module) -> bool:
 
     单独抽成函数是为了两处判据不漂移：_register_module_functions（注册表）
     与 _load_meta_tools（元工具表）。
+
+    【模块级 `_NOT_TOOLS` 声明·2026-10-01】
+    "公开 + 有 docstring + 定义在本模块" 这条判据对**纯工具模块**是对的，但对
+    `tool_preselect.py` / `tool_discovery.py` 这类"工具面的管线模块"会误伤：
+    它们的公开函数是给 QDAgent / smoke **直接 import 调用**的（build_catalog、
+    lint_selection、apply_lint…），不是给模型调的工具。此前它们被一并注册进
+    common 域 ⇒ 进了必注入层 ⇒ 每轮白下发 13 份 schema，且模型可能真去调
+    `apply_lint` 这种内部函数。
+    这类模块声明 `_NOT_TOOLS = {...}` 即可退出注册；用模块级声明而不是改名加
+    下划线，是为了保留 `from tool_preselect import lint_selection` 的现有调用面。
     """
     if not inspect.isfunction(obj) or not inspect.getdoc(obj):
         return False
     if getattr(obj, "__module__", "") != module.__name__:
         return False
     name = getattr(obj, "__name__", "")
-    return not (name.startswith("_") or name in _ENTRY_NAME_DENY)
+    if name.startswith("_") or name in _ENTRY_NAME_DENY:
+        return False
+    return name not in (getattr(module, "_NOT_TOOLS", None) or ())
 
 
 class ToolProvider:
@@ -407,6 +423,7 @@ class ToolProvider:
 
     # 模块级单例，由 init_tools() 设置
     _default: Optional["ToolProvider"] = None
+    _default_lock = threading.Lock()
 
     @classmethod
     def set_default(cls, provider: "ToolProvider"):
@@ -417,6 +434,35 @@ class ToolProvider:
     def get_default(cls) -> Optional["ToolProvider"]:
         """获取全局默认 provider。"""
         return cls._default
+
+    @classmethod
+    def get_or_build(cls) -> "ToolProvider":
+        """取全局默认 provider；不存在则**按统一口径**扫描构建并缓存。
+
+        【为什么要有这个方法·2026-10-01】provider 的构建口径（扫顶层 domain=common
+        + 扫子目录 domain=子目录名 + 元工具表）此前在 qd_agent._scan_tool_provider
+        里**另写了一份**。工具分层需要「元工具（web_search/format_result）也必须拿到」，
+        消费方若各自 `ToolProvider()` 现造一个，就拿不到 get_meta() 里的元工具
+        （历史事故：web_search 因只在元工具表、注册表恒 None 而整体不可用）。
+        单一口径收敛到此处，消费方一律 get_or_build()。
+
+        包前缀从本模块的 __module__ 推导（app.agent.tools / tools），
+        兼容"生产以 backend_api_python 为根"与"cli 把 app/agent 放进 sys.path"两种跑法。
+        """
+        provider = cls.get_default()
+        if provider is not None:
+            return provider
+        with cls._default_lock:
+            provider = cls.get_default()
+            if provider is not None:
+                return provider
+            tools_dir = Path(__file__).resolve().parent
+            package_prefix = cls.__module__.rsplit(".", 1)[0]  # app.agent.tools | tools
+            provider = cls()
+            provider.scan_directory(tools_dir, domain="common", package_prefix=package_prefix)
+            provider.scan_subdirectories(tools_dir, package_prefix=package_prefix)
+            cls.set_default(provider)
+            return provider
 
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
@@ -548,6 +594,16 @@ class ToolProvider:
         注册表工具只在 get() 里，互相取不到（2026-09-21 事故根因）。
         """
         return self._meta_tools.get(name)
+
+    def get_meta_functions(self) -> Dict[str, Callable]:
+        """全部元工具 {name: func}（2026-10-01）。
+
+        【为什么需要】mimo 执行核的工具面由 `get_functions()` 一次性装配；元工具
+        （web_search / format_result）不在注册表里 ⇒ 只取 get_functions() 会**整体漏掉
+        web_search**，而 prompt 却硬性要求实时信息必须调用它（模型撞墙后只能瞎答）。
+        装配工具面时必须是 get_functions() + get_meta_functions() 两表并集。
+        """
+        return dict(self._meta_tools)
 
     def get_schemas(self) -> List[dict]:
         """planning 用：OpenAI Function Calling schema 列表（带缓存）。"""

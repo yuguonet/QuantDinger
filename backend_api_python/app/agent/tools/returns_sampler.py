@@ -82,19 +82,22 @@ _UNSAMPLEABLE = {"strategy_id", "indicator_id", "filters"}
 _ENTRY_DENY = {"main", "cli", "serve", "run_server", "server", "app"}
 
 
+# 写操作前缀（capabilities/ 随旧核退役后此处为单一事实源；命中即视为写操作、不采样。
+# 原真源 capabilities/scanner.WRITE_PREFIXES，随能力层删除 2026-09-30 内联。）
+WRITE_PREFIXES = (
+    "set_", "update_", "delete_", "remove_", "insert_", "upsert_", "create_",
+    "drop_", "clear_", "reset_", "save_", "write_", "run_", "start_", "stop_",
+    "trigger_", "schedule_", "sync_", "cleanup_", "ensure_", "reconcile_",
+    "emit_", "commit_", "apply_", "patch_", "migrate_", "purge_",
+)
+
+
 def _write_prefixes() -> tuple:
-    """写操作前缀（单一事实源 = capabilities/scanner.WRITE_PREFIXES）。
+    """写操作前缀（单一事实源 = 本模块 WRITE_PREFIXES）。
 
     取不到时返回 ()**并置 `_SAFE_OK=False`** ⇒ 采样整体停用（安全优先：无法证明只读就不调）。
     """
-    global _SAFE_OK
-    try:
-        from capabilities.scanner import WRITE_PREFIXES  # noqa: WPS433
-        return tuple(WRITE_PREFIXES)
-    except Exception as e:  # pragma: no cover
-        logger.warning("[returns-sampler] 写操作前缀单一事实源不可用，采样停用: %s", e)
-        _SAFE_OK = False
-        return ()
+    return tuple(WRITE_PREFIXES)
 
 
 _SAFE_OK = True

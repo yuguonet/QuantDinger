@@ -63,6 +63,7 @@ def _get_actual_return(
     from_date: date,
     hold_days: int,
     market: str = "CNStock",
+    with_extremes: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """获取股票实际涨跌数据。
 
@@ -71,9 +72,16 @@ def _get_actual_return(
         from_date: 决策日期
         hold_days: 持有天数
         market: 市场类型
+        with_extremes: 是否附带持有窗口内的最高/最低价（2026-10-01 追责系统 v1.1 加）。
+            旧链路（T+N 收益验证）不需要极值，默认 False ⇒ **返回值与行为完全不变**；
+            新链路的 `level` 型 claim（"触及目标价 / 不跌破支撑"）必须看窗口极值才能判，
+            故在此**同一处**取，而不是在 resolver 里另写一份取数逻辑
+            （两套取数口径必然漂移，是本项目的老教训）。
 
     Returns:
-        {"pnl_pct": float, "hold_days": int, "direction": str} 或 None
+        {"pnl_pct": float, "hold_days": int, "direction": str,
+         "exit_date": str} 或 None
+        with_extremes=True 时额外含 {"high": float, "low": float}
     """
     try:
         from app.data_sources.cn_stock import CNStockDataSource
@@ -145,12 +153,22 @@ def _get_actual_return(
         actual_hold = exit_idx - base_idx
         direction = classify_return(pnl_pct / 100)
 
-        return {
+        out = {
             "pnl_pct": pnl_pct,
             "hold_days": actual_hold,
             "direction": direction,
             "exit_date": klines[exit_idx].get("t", "")[:10] if isinstance(klines[exit_idx], dict) else "",
         }
+        if with_extremes:
+            # 窗口 = (base_idx, exit_idx]，**不含**决策日那根（预测是收盘后做出的）
+            window = klines[base_idx + 1: exit_idx + 1]
+            highs = [float(k.get("h") or 0) for k in window if isinstance(k, dict)]
+            lows = [float(k.get("l") or 0) for k in window if isinstance(k, dict)]
+            out["high"] = round(max(highs), 2) if highs else round(float(exit_close), 2)
+            out["low"] = round(min(lows), 2) if lows else round(float(exit_close), 2)
+            out["base_close"] = round(float(base_close), 2)
+            out["exit_close"] = round(float(exit_close), 2)
+        return out
 
     except Exception as e:
         logger.warning("[Evaluator] 获取实际涨跌失败 %s: %s", stock_code, e)
@@ -834,6 +852,46 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
         logger.error("[AutoEval] 评估失败: %s", e)
         result["evaluation"] = {"evaluated": 0, "errors": 1, "error": str(e)}
 
+    # ── v4 追责判定（claims → resolutions）──────────────────────────────────
+    # 【转接背景】2026-10-01：旧系统 `agent_smolagents/chain/evaluator.py` 的
+    # worker 行 _worker_health"等待 post_market_done → auto_evaluate"，这一步已
+    # 随 evaluator 迁移过来；**缺的是新追责链没接线** —— intaker 写的 claims
+    # 一直停在 pending，只有手工调 resolver 才会判，闭环是断的。
+    #
+    # 【为什么放在 evaluate_pending 之后】两者同源（都是 T+N 真值回溯），但
+    # 各自失败互不影响：旧的写 qd_agent_traces，新的写 qd_agent_resolutions，
+    # 任一步炸了另一边照跑（下面的 try 保证这点）。
+    #   ⚠ 旧系统 evaluate_pending 读的是 direction neutral / confidence 0.5 的
+    #   污染数据，S2 已清空重来；此后有权重的样本全部来自本步产出的 resolutions。
+    try:
+        from app.agent.chain.resolver import resolve_due_claims
+        acc = resolve_due_claims(limit=200)
+        result["accountability"] = {k: v for k, v in acc.items() if k != "details"}
+        _worker_health["last_accountability"] = result["accountability"]
+        logger.info(
+            "[AutoEval] 追责判定: due=%s resolved=%s undecidable=%s judged=%s errors=%s",
+            acc.get("due"), acc.get("resolved"), acc.get("undecidable"),
+            acc.get("judged"), acc.get("errors"))
+    except Exception as e:
+        logger.error("[AutoEval] 追责判定失败(不影响旧链路): %s", e)
+        result["accountability"] = {"error": str(e)}
+
+    # ── v4 追责 → 权重（闭环补头，2026-10-01）─────────────────────────────
+    # 上面判定出的 resolutions 此前**没有任何代码喂回权重表**，追责只是审计账本。
+    # 本步按 domain 聚合命中率慢调写 qd_agent_weights(layer='domain')，由
+    # chain/weight_hints 在工具预选 / 技能选择处消费 ⇒ 判定结果真正影响下一次选择。
+    # 独立 try：喂数失败不影响报告产出。
+    try:
+        from app.agent.chain.weight_feed import feed as _feed_weights
+        wf = _feed_weights()
+        result["weight_feed"] = wf
+        _worker_health["last_weight_feed"] = wf
+        if wf.get("updated"):
+            logger.info("[AutoEval] 追责→权重: %s", wf["updated"])
+    except Exception as e:
+        logger.error("[AutoEval] 追责→权重失败(不影响报告): %s", e)
+        result["weight_feed"] = {"error": str(e)}
+
     try:
         report = get_eval_report()
         result["report"] = report
@@ -853,6 +911,10 @@ _worker_health = {
     "last_run_at": None, "last_success_at": None,
     "last_error": None, "consecutive_failures": 0,
     "total_runs": 0, "total_successes": 0, "total_failures": 0,
+    # v4 追责判定上一次结果（None = 一次都没跑成功过，用来区分"没数据"和"没接线"）
+    "last_accountability": None,
+    # 追责→权重 上一次结果（同理：None = 没跑成功过）
+    "last_weight_feed": None,
 }
 
 def get_worker_health() -> Dict[str, Any]:

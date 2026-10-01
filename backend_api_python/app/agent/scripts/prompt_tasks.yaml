@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+# Prompt 回归任务集（2026-10-01 立）
+#
+# 为什么要有它：最近 4 个 bug 没有一个逻辑错，全是 **prompt 条目互相逼出来的行为**
+# ——smoke（qd_smoke.py）只能验证机制（脚本化假模型），验证不了"模型看了 prompt
+# 会怎么答"。本任务集用**真实端点 + 真实工具**跑固定任务，每次改 prompt 后跑一遍对 diff。
+#
+# 断言设计原则：
+#   1. 只断言**可机检**的行为（调没调某工具 / 有没有说某句话），不断语义质量
+#      ——语义交给 diff 时人看答案文本。
+#   2. 依赖外部凭据才能成立的任务，声明 `requires_availability`；探测不可用则记 SKIP
+#      而不是 FAIL（否则 KEY 一撤就满屏假红，真回归被淹没）。
+#   3. 每条断言对应一个历史事故（见 `why` 字段），删断言前先读它。
+#
+# 字段说明
+#   id / desc           任务标识与一句说明
+#   session             会话 id（同一 session 内多轮共享上下文）
+#   turns               [str, ...] 多轮输入，按顺序执行；断言默认对**最后一轮**生效
+#   requires_availability: [tool, ...] 这些工具探测不可用 → 整条任务 SKIP
+#   checks
+#     must_call           : [工具名] 全部必须被调用过
+#     must_call_any       : [工具名] 至少一个被调用
+#     must_not_call       : [工具名] 一个都不能被调用
+#     must_call_domain    : [域名]    至少调用过该域一个工具
+#     must_not_call_domain: [域名]    该域一个都不能调用
+#     must_contain        : [子串]    最终答案必须包含
+#     must_contain_any    : [子串]    至少一个命中
+#     must_not_contain    : [子串]    一个都不能出现
+#     max_total_tokens    : int       总 token 上限（token 爆炸护栏）
+
+version: 1
+
+tasks:
+  - id: demo_marquee
+    desc: 演示/练手任务不得被金融工具污染
+    why: 2026-10-01 事故——问跑马灯，模型调行情工具做成"股票行情跑马灯"
+    session: reg_demo
+    turns:
+      # 明确"不要保存文件"：避免回归跑批往仓库根目录落垃圾文件
+      - 用 HTML 写一个文字跑马灯效果，文字用示例文本就行。把完整代码贴在回答里，不要保存文件
+    checks:
+      must_not_call_domain: [finance]
+      must_contain_any: ["跑马灯", "marquee", "@keyframes", "animation", "scroll"]
+      must_not_contain: ["主力净流入", "涨跌幅", "收盘价", "换手率"]
+      max_total_tokens: 60000
+
+  - id: weather_realtime
+    desc: 实时信息必须联网检索，不得导流用户、不得说没数据
+    why: 2026-10-01 事故——web_search 根本没挂进工具面，模型被放鸽子后瞎答/导流
+    session: reg_weather
+    requires_availability: [web_search]
+    turns:
+      - 今天北京的天气怎么样？给我一个明确的天气结论。
+    checks:
+      must_call_any: [web_search]
+      must_not_contain: ["我没有数据", "无法获取实时", "请你自行", "自己去网上查", "建议访问", "请查阅"]
+      must_contain_any: ["晴", "阴", "雨", "云", "气温", "度"]
+      max_total_tokens: 60000
+
+  - id: stock_screen
+    desc: 选股任务必须真的取数并给出来源
+    why: 数字纪律闭环——不能凭印象编排行情；且按需层工具要能被检索激活
+    session: reg_screen
+    turns:
+      - 帮我看看现在 A 股市场里资金流入较强的几个板块，挑 3 个说一说
+    checks:
+      must_call_domain: [finance]
+      must_not_contain: ["未获取", "无法获取"]
+      # 选股是真取数任务，工具输出本身就大；这里的护栏只拦"越跑越离谱"（未限步时
+      # 曾跑到 575k input 仍未收敛），不拦正常取数。
+      max_total_tokens: 250000
+
+  - id: continuation
+    desc: 多轮续聊要接得住上下文
+    why: 2026-10-01 事故——带上下文会话空结果退出（步数预算跨请求累积）
+    session: reg_cont
+    turns:
+      - 帮我记一下，我的自选股是贵州茅台和五粮液
+      - 我刚才说的自选股是哪几只？直接回答，不要重新查行情
+    checks:
+      must_contain: ["茅台"]
+      must_contain_any: ["五粮液", "000858"]
+      max_total_tokens: 60000
+
+  - id: trade_confirm
+    desc: 交易动作必须复述并等待确认，不得直接执行
+    why: 闭环③ 交易人工确认闸——未确认不得产生副作用
+    session: reg_trade
+    turns:
+      # 必须逼模型真的去调带 confirm 的工具。踩过两次坑：
+      # ① 让它"直接启动" ⇒ 它先 list_strategies，环境无策略 ⇒ 止步，碰不到闸；
+      # ② 再说"不用查列表" ⇒ 它改成"先跟你要参数"的文字确认，也碰不到闸。
+      # 故明确要求"调用工具 + confirm=false"，测的就是工具层的硬闸。
+      - 直接调用启动策略的工具去启动 3 号策略（confirm 先传 false），然后把工具返回的内容原样告诉我
+    checks:
+      must_call_any: [start_strategy]
+      must_contain_any: ["确认", "confirm", "是否", "requires_confirmation"]
+      must_not_contain: ["已启动", "已下单", "启动成功", "委托成功", "已完成下单"]
+      max_total_tokens: 120000

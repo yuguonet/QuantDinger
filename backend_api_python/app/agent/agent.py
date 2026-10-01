@@ -16,7 +16,7 @@ from memory import (
     LocalMemory,
     PostgresMemory,
 )
-from agents import TaskAgent
+from qd_service import QDAgentService
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,10 @@ LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "2000"))
 MEMORY_BACKEND    = os.getenv("MEMORY_BACKEND", "local").lower()
 DATABASE_URL      = os.getenv("DATABASE_URL", "")
-MAX_TOOL_ROUNDS   = get_agent_max_steps()  # 2026-09-24 统一常量源（审计 B2）：语义/默认值见 constants.py
+# 步数语义对齐（2026-10-01）：AGENT_MAX_STEPS 旧语义 = CodeAgent 代码轮数，
+# mimo 语义 = 模型查询次数（一次查询可带多个工具调用）。1 轮 ≈ 2~3 次查询，
+# 线性放大 QD_STEP_SCALE（默认 3）；精确控制用 QD_STEP_LIMIT 直接覆盖。
+MAX_TOOL_ROUNDS = int(os.getenv("QD_STEP_LIMIT") or max(1, get_agent_max_steps() * int(os.getenv("QD_STEP_SCALE", "3"))))  # 统一常量源 constants.py（审计 B2）
 DEFAULT_SESSION_ID = "default"
 
 # ---------- settings 兼容对象（cli.py / flask_app.py 使用）----------
@@ -284,29 +287,54 @@ logger.info(
     _mode, len(skills), LLM_PROVIDER, LLM_MODEL,
 )
 
-# ---------- Agent 实例 ----------
-agent = TaskAgent(
-    llm=llm,
+# ---------- 启动自检：工具可用性探测（2026-10-01）----------
+# 目的：把"KEY 缺失 ⇒ 工具调不通"这件事在**启动期**说清楚并写进工具地图，
+# 而不是让模型在会话中撞墙后再瞎答（web_search 全引擎无 KEY 时，模型曾因
+# "prompt 要求必须联网检索"而被逼出编造结论的行为）。
+try:
+    from app.agent.tools.availability import probe_tools
+except ImportError:
+    from tools.availability import probe_tools
+
+TOOL_AVAILABILITY = probe_tools()
+for _name, _d in sorted(TOOL_AVAILABILITY.items()):
+    if _d.get("available"):
+        logger.info("[启动自检] 工具可用: %s —— %s", _name, _d.get("reason", ""))
+    else:
+        logger.warning("[启动自检] 工具不可用: %s —— %s（该能力本进程不可用，已写入工具地图）",
+                       _name, _d.get("reason", ""))
+
+# ---------- 启动期工具面预热（2026-10-01 补回）----------
+# 旧「启动期预热（NodeContext.init_tools）」随 nodes.py 退役后，工具面扫描变成
+# 懒加载：实测冷路径 3.1s（import 76 个工具模块 + 能力层注册）压在**首条用户消息**
+# 上——用户等的是这一条，不是启动日志。此处在装配期跑一次 `warmup_tool_face()`，
+# 复刻旧系统「启动时筛一次、消息路径不扫」；预热失败不阻断（fail-open，退化回懒加载）。
+try:
+    from app.agent.qd_agent import warmup_tool_face as _warmup_tool_face
+except ImportError:  # cli 直跑：app/agent 在 sys.path
+    from qd_agent import warmup_tool_face as _warmup_tool_face
+_WARMUP = _warmup_tool_face()
+if not _WARMUP.get("done"):
+    logging.getLogger(__name__).warning(
+        "[启动] 工具面未预热成功（%s），首条消息将懒加载", _WARMUP.get("error", "未知"))
+
+# ---------- Agent 实例（mimoagent 执行核，2026-09-30 一步到位） ----------
+# 旧 TaskAgent/graph/nodes/llm 适配层已退役；对外契约不变（chat/run_agent）。
+# 技能读取/记忆/RAG 均已工具化（tools/skill_tools、memory_tools、knowledge）；
+# 记忆近史 + RAG 命中由 QDAgentService 自动预取（体验与旧注入管线等价）。
+agent = QDAgentService(
     memory=memory,
     retriever=retriever,
-    system_prompt="你是 QuantDinger 量化分析 AI 助手。用中文回答。",
-    max_tool_rounds=MAX_TOOL_ROUNDS,
-    skill_adapter=skills,
-    # tool_provider 未传入，_plan() 看不到可用工具列表和域列表。
-    # 如果 plan 阶段需要选择域，需要传入 tool_provider 并在 _plan() 中使用 self._tool_provider。
-    # 当前设计：plan 只选技能，不选域，工具在 execute 阶段通过 ctx.tool_provider 注入。
+    skills=skills,
+    agent_config={
+        "step_limit": MAX_TOOL_ROUNDS,
+        # 服务级可用性事实（工具地图会照此标注，避免模型调用必失败的服务）
+        "service_availability": {"search_knowledge": retriever is not None},
+    },
 )
 
-# ── 启动期预热（2026-09-30）────────────────────────────────────────
-# 工具面扫描 + 能力层注册 + 同功能筛选缓存，原先挂在 nodes.NodeContext.init_tools
-# 懒加载（首条消息才跑）——CLI 启动日志看不到，也违背「启动时筛一次、消息路径不扫」。
-# 进程内 _SHARED_TOOL_PROVIDER 有缓存，预热一次即可；失败不阻断，首条消息仍会懒加载。
-try:
-    from nodes import NodeContext
-    NodeContext(llm=llm).init_tools()
-    logger.info("[启动] 工具面/能力层/同功能筛选已预热（后续消息复用缓存）")
-except Exception as e:
-    logger.warning("[启动] 工具面预热失败（首条消息时会懒加载）: %s", e)
+# 注：旧「启动期预热（NodeContext.init_tools）」已随 nodes.py 退役；
+# 工具注册改由 QDAgent._build_tool_registry 在会话首建时一次性完成（同样有进程内缓存）。
 
 
 

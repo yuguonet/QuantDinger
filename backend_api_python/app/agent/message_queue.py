@@ -185,7 +185,7 @@ def _worker_loop():
                     # _user_step_callbacks / _INTERRUPT_CHECKS 均“赋值 + finally 恢复”，
                     # 多 worker 并发互踩（A 收尾抹掉 B 的注册 / 陈旧探针串会话误杀，审计 B1）。
                     # 现按 session 注册到 task_agent 会话钩子表 + 线程局部绑定当前 run。
-                    from agents import task_agent as _ta_mod
+                    import qd_agent as _ta_mod  # 会话钩子表（API 与旧 task_agent 同名）
                     _sid = str(task["session_id"])
                     _ta_mod.bind_run_session(_sid)
 

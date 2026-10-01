@@ -2,7 +2,6 @@
 
 from .logger import get_logger
 from .json_parser import safe_parse_json
-from .prompt_loader import load_prompt
 from .tracing import AgentTraceRecorder
 
 
@@ -31,4 +30,4 @@ def detect_market(stock_code: str) -> str:
     return "CNStock"
 
 
-__all__ = ["get_logger", "safe_parse_json", "extract_json", "extract_decision", "load_prompt", "AgentTraceRecorder", "detect_market"]
+__all__ = ["get_logger", "safe_parse_json", "extract_json", "extract_decision", "AgentTraceRecorder", "detect_market"]

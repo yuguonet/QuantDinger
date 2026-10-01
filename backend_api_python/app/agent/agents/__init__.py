@@ -1,9 +1,9 @@
 """
 Agent 核心层
 
-提供 TaskAgent（统一的任务型 Agent，支持 direct/execute 两种阶段类型）。
+v2 迁移后仅保留响应契约（AgentBase/AgentResponse）。
+执行核为 mimoagent（见 qd_agent.py / qd_service.py），不再导出 TaskAgent。
 """
 from agents.base import AgentBase, AgentResponse
-from agents.task_agent import TaskAgent
 
-__all__ = ["AgentBase", "AgentResponse", "TaskAgent"]
+__all__ = ["AgentBase", "AgentResponse"]

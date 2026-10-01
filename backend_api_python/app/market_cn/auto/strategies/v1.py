@@ -13,7 +13,10 @@
 
 易错点:
   - D-1回调区间是 [-10%, -3%) 左闭右开; D0 涨停判定是 0.98x 板块阈值 (近似涨停);
-  - 回测 strategy_v1 的 D1 过滤含 d1_change<0 (收盘), 属回测引擎 D1 口径, 不在 entry_decision;
+  - ⚠ d1_change 是 D1 **收盘** 值, 用它过滤 D1 **开盘** 入场 = 前视 (2026-09-30 修)。
+    实盘 entry_decision 只用 gap; d1_change<0 在实盘属 confirm_decision(15:00 weak)
+    ⇒ 后果是「D2 开盘清仓」, 已由 _run_backtest._pre_exit 实现 ⇒ 回测侧默认关闭
+    (PARAMS.require_d1_close_up=False; 开=True 可复现旧口径做对照, 勿用于生产)。
   - OBV 从 i-20 起累计且 j=0 不计 — 勿"优化"起始点, 会改变边界信号。
 """
 from __future__ import annotations
@@ -44,6 +47,9 @@ PARAMS = {
     "gem_gap_max": 5.0,
     "main_gap_band_lo": 3.0,     # 主板高开 3~5% 不入场 (v4数据驱动)
     "main_gap_band_hi": 5.0,
+    # ⚠ 前视开关 (2026-09-30): D1 收盘涨跌(d1_change<0)过滤 D1 开盘入场 = 未来信息。
+    #   默认 False (=实盘口径); True 仅用于复现旧回测口径做对照。
+    "require_d1_close_up": False,
 }
 
 
@@ -291,7 +297,8 @@ class V1Strategy(StrategyBase):
                       probe=None):
         """单股 V1 全历史回测 (D0四因子判定, 次日开盘买, D1入场过滤)。
 
-        D1 过滤 (gap/change/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
+        D1 过滤 (gap/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
+        ⚠ d1_change(收盘) 过滤已默认关闭 (见 PARAMS.require_d1_close_up), 属前视;
         出场模拟 _run_backtest 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
         """
         from app.market_cn.auto.core.filters import unified_prefilter
@@ -348,7 +355,14 @@ class V1Strategy(StrategyBase):
                                     stage="d1_gap", sig=sig,
                                     extra={"d1_gap": round(d1_gap, 2)})
                 continue
-            if d1_change < 0:
+            # ⚠ 2026-09-30 前视修复: 下面这行用 D1 **收盘** (d1_change) 决定是否已在
+            #   D1 **开盘** 买入 —— 属于未来信息。实盘无此过滤 (entry_decision 只用 gap);
+            #   实盘里 d1_change<0 的语义是 confirm_decision(15:00) 判 weak ⇒ D2 开盘清仓,
+            #   已由 _run_backtest._pre_exit 正确实现。旧口径等于把该批交易整笔删除 ——
+            #   实测被剔批次均值 -7.23%/胜率 4.5% (全市场见
+            #   analysis_output/v1入场前视修复_20260930.md) ⇒ 回测收益系统性虚高。
+            #   现由 PARAMS.require_d1_close_up 控制, 默认 False (无前视, 对齐实盘)。
+            if _p.get("require_d1_close_up") and d1_change < 0:
                 if probe is not None:
                     self._probe_day(probe, day_tr, bars, i, code, stock_info,
                                     stage="d1_chg", sig=sig,
@@ -484,7 +498,8 @@ _register_exit("v1_combo", _exit_v1_combo)
 #    analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List
+
 from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.filters import unified_prefilter

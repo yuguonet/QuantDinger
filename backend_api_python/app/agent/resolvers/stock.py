@@ -15,6 +15,31 @@ _SEPARATORS = re.compile(r'[和、，,\s]+')
 # 股票相关动词（清理用）
 _STOCK_VERBS = re.compile(r'分析|看看|查一下|怎么样|什么股|股票|推荐|选|买|卖|对比|比较')
 
+# 口语填充词（2026-10-01 根因修复）：_STOCK_VERBS 只剔动词，而最口语的问法
+# "帮我分析一下贵州茅台" 剔完"分析"剩 "帮我一下贵州茅台" —— 整段送 search_stocks
+# ⇒ 零命中 ⇒ **名称解析在最常见问法上静默失效**：既不解析出标的，也不触发反问，
+# 调用方拿到 None 当"没有标的"处理（旧系统这段从未上线，缺陷一直藏着）。
+# 只在**片段级**剔除首尾填充词（不整句替换）：股票名不含这些虚词，误伤可忽略。
+# ★ 交替项必须**长的在前**：正则交替是有序的，`请` 排在 `请问` 前面时只会吃掉
+#   "请" 而留下 "问茅台"（又是一次静默失效）。
+_FILLERS = re.compile(
+    r'^(?:请问|帮我|麻烦|给我|我想|我要|看一下|看下|一下|看看|瞧瞧|请|来|再)+'
+    r'|(?:多少钱|现价|现在|如今|今日|今天|最近|走势|行情|价格|报价|涨跌|涨了|跌了'
+    r'|技术面|基本面|资金面|消息面|筹码面|财报|业绩|怎么样|如何'
+    r'|的|了|呢|吗|吧|啊|呀|哦|哈)+$')
+
+
+def _strip_fillers(fragment: str) -> str:
+    """剔除片段首尾的口语填充词（可能需多轮：'帮我一下X' → '帮我' → '一下'）。"""
+    prev = None
+    cur = fragment
+    for _ in range(3):          # 上限防病态输入；正常 1~2 轮收敛
+        if cur == prev:
+            break
+        prev = cur
+        cur = _FILLERS.sub('', cur).strip()
+    return cur
+
 # 消歧（2026-09-13）：名称模糊搜索取前 N 个候选以判定歧义。
 # 原实现用 limit=1 调 resolve_stock —— DB 至多回 1 条，歧义在结构上不可见，
 # 于是"静默取首个候选"，选错标的风险极高（整份分析作废，甚至据错误结论下单）。
@@ -125,7 +150,16 @@ class StockResolver(EntityResolver):
 
         ambiguous = []      # [(关键词, [候选, ...]), ...] 无法唯一确定 → 反问
         if clean_input:
-            names = [n.strip() for n in _SEPARATORS.split(clean_input) if n.strip() and len(n.strip()) >= 2]
+            raw_names = [n.strip() for n in _SEPARATORS.split(clean_input)
+                         if n.strip() and len(n.strip()) >= 2]
+            # 片段先去口语填充词再去查：命中率的关键（见 _FILLERS 注释）。
+            # 清洗后变短于 2 字（如"好"）即丢弃——那本来就不是标的名。
+            names, _seen_n = [], set()
+            for _rn in raw_names:
+                _sn = _strip_fillers(_rn)
+                if len(_sn) >= 2 and _sn not in _seen_n:
+                    _seen_n.add(_sn)
+                    names.append(_sn)
             for name in names:
                 if name in [e['code'] for e in entities]:
                     continue
