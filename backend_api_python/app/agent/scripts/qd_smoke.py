@@ -1398,6 +1398,52 @@ def test_30_toolface_import_health():
           f"agent={_i_agent} app={_i_app}")
 
 
+def test_31_startup_bare_imports():
+    """启动期（`app/__init__.py`）的裸名导入必须**可解析**。
+
+    事故回放 C-1：`app/__init__.py` 写 `from cron_worker import start_cron_worker`，
+    但真身是 `app/agent/cron/cron_worker.py`（顶包名是 `cron`，不是 `cron_worker`）
+    ⇒ 每次启动都 ImportError，被外层 `try/except` 吞成一行 warning ⇒
+    **定时任务从未启动过**，而启动日志一切正常。
+
+    这类「启动期裸名写错」没有任何运行时症状（不崩、不报、功能直接消失），
+    只能静态查。判据：`app/__init__.py` 里所有非标准库、非 `app.*` 的顶层模块名，
+    都必须能被 `importlib.util.find_spec` 解析到（否则就是写错了路径）。
+    """
+    print("\n[test_31] 启动期裸名导入可解析（C-1 防复发）")
+    import ast as _ast
+    import importlib.util as _ilu
+
+    _init_py = os.path.join(os.path.dirname(str(AGENT_DIR)), "__init__.py")
+    try:
+        _src = open(_init_py, encoding="utf-8-sig").read()
+        _tree = _ast.parse(_src)
+    except Exception as e:
+        check("可解析 app/__init__.py", False, f"{type(e).__name__}: {e}")
+        return
+
+    _tops = set()
+    for _n in _ast.walk(_tree):
+        if isinstance(_n, _ast.Import):
+            for _a in _n.names:
+                _tops.add(_a.name.split(".")[0])
+        elif isinstance(_n, _ast.ImportFrom) and _n.module:
+            _tops.add(_n.module.split(".")[0])
+    _tops = {t for t in _tops
+             if t and not t.startswith("app.") and t != "app"
+             and t not in sys.stdlib_module_names}
+
+    _bad = []
+    for _t in sorted(_tops):
+        try:
+            if _ilu.find_spec(_t) is None:
+                _bad.append(_t)
+        except Exception as _e:
+            _bad.append(f"{_t}({type(_e).__name__})")
+    check(f"app/__init__.py 的 {len(_tops)} 个裸名导入全部可解析（防 cron_worker 式写错）",
+          not _bad, "不可解析: " + ",".join(_bad))
+
+
 if __name__ == "__main__":
     _base = _trace_baseline()     # 自清基线：只删 smoke 自己写的行
     for t in (test_1_happy_path, test_2_trading_confirm_gate,
@@ -1415,7 +1461,8 @@ if __name__ == "__main__":
               test_26_accountability_v11, test_27_reset_wiring_observation,
               test_28_closed_loop_consumers,
               test_29_module_single_instance,
-              test_30_toolface_import_health):
+              test_30_toolface_import_health,
+              test_31_startup_bare_imports):
         try:
             t()
         except Exception as e:

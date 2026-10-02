@@ -420,8 +420,13 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.warning(f"Reflection worker not started: {e}")
         # ── Cron Worker（定时任务调度）──
+        # ⚠ 模块路径必须是 `cron.cron_worker`：真身在 `app/agent/cron/cron_worker.py`，
+        # 裸名 `cron_worker` **根本不存在**（app/agent/ 下没有同名文件）。此前写成
+        # `from cron_worker import ...` ⇒ ImportError 被下面的 except 吞成一行
+        # warning ⇒ **定时任务从未启动过**（事故 C-1，静默失效）。
+        # 与 `cron/cron_tools.py`、`app/routes/cron.py` 的写法保持一致。
         try:
-            from cron_worker import start_cron_worker
+            from cron.cron_worker import start_cron_worker
             start_cron_worker()
             logger.info("[CronWorker] 定时任务调度器已启动")
         except Exception as e:
