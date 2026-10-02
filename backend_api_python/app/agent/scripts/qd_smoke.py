@@ -1444,6 +1444,209 @@ def test_31_startup_bare_imports():
           not _bad, "不可解析: " + ",".join(_bad))
 
 
+def test_32_skill_injection_progressive():
+    """技能注入：渐进式加载 + 会话级去重 + 路标真实性（2026-10-02 防复发）。
+
+    缺陷回放（审查 `tmp/qd_service.py` 时**实测**发现，非推测）：
+      F1 `resource=` 路标无条件给出，但现网 5 个技能里 **4 个 `list_resources()`
+         为空** ⇒ 诱导模型做一次必然失败的调用（返回 `{"error":"无资源"}`）。
+      F2 指针文案写"（见上方历史）"，而上下文压缩（阈值 `_compaction_threshold`，
+         默认 65536×0.55≈36k）会改写历史、`_skill_seen` 却对此不知情 ⇒
+         压缩后正文永久只剩指针。修法：指针改给 `read_skill(name=...)`
+         不带参数 = 全文（`skill_tools.py` 实测走 `load_body`），模型可自取，
+         不再依赖历史是否还在。
+
+    判据：① 超阈值技能注入块必须带 [技能目录] + [按需读取]
+          ② resource 路标必须与 `list_resources()` 实况一致（防指向空气）
+          ③ 指针必须给出"完整正文"自取方式（防压缩后正文消失）
+          ④ 同会话二次命中→指针；换 session→重新注入正文（不串味）
+    """
+    print("\n[test_32] 技能注入渐进式加载（F1/F2 防复发）")
+    try:
+        from qd_service import (QDAgentService as _Svc,
+                                _skill_block as _blk,
+                                _SKILL_BODY_CAP as _CAP)
+        from llm.qd_skills import QDSkillAdapter
+    except Exception as e:
+        check("可导入 qd_service / qd_skills", False, f"{type(e).__name__}: {e}")
+        return
+
+    _sk = QDSkillAdapter()
+    _big = []
+    for _s in (_sk.list_skills() or []):
+        _n = _s.get("name") if isinstance(_s, dict) else str(_s)
+        try:
+            _b = _sk.load_body(_n) or ""
+        except Exception:
+            _b = ""
+        if len(_b) > _CAP:
+            _big.append((_n, _b))
+    if not _big:
+        # 技能被删/都很小时不误报：本项判据依赖"存在超阈值技能"这一前提
+        check("存在超阈值技能（无则跳过本项判据）", True,
+              f"当前无 >{_CAP} 字符的技能，①②③ 跳过")
+        return
+
+    _no_ol = [_n for _n, _b in _big if "[技能目录]" not in _blk(_n, _b, _sk)]
+    check(f"超阈值技能注入块含 [技能目录]（{len(_big)} 个）", not _no_ol, ",".join(_no_ol))
+    _no_rd = [_n for _n, _b in _big if "[按需读取]" not in _blk(_n, _b, _sk)]
+    check("超阈值技能注入块含 [按需读取] 路标", not _no_rd, ",".join(_no_rd))
+
+    _mm = []
+    for _n, _b in _big:
+        try:
+            _has = bool(_sk.list_resources(_n))
+        except Exception:
+            _has = False
+        if ("resource=" in _blk(_n, _b, _sk)) != _has:
+            _mm.append(f"{_n}(有资源={_has})")
+    check("resource 路标与 list_resources 实况一致（防指向空气·F1）",
+          not _mm, ",".join(_mm))
+
+    _svc = _Svc(skills=_sk, agent_config={})
+    _q = "帮我做个选股筛选"
+    try:
+        _t1, _ = _svc._prefetch(_q, "__t32a__")
+        _t2, _ = _svc._prefetch(_q, "__t32a__")   # 同 session 同问 ⇒ 应去重
+        _t3, _ = _svc._prefetch(_q, "__t32b__")   # 换 session ⇒ 应重注正文
+    except Exception as e:
+        check("_prefetch 可执行", False, f"{type(e).__name__}: {e}")
+        return
+
+    _ptr = "技能指针" in _t2
+    check("同会话二次命中同一技能 → 指针（去重生效）", _ptr, _t2[:120])
+    if _ptr:
+        check("指针给出完整正文自取方式（不依赖历史·F2）",
+              "要完整正文" in _t2, _t2[:160])
+        check("指针不再写'见上方历史'（压缩后会失效）", "见上方历史" not in _t2)
+    check("换 session 重新注入正文（不串味）", "相关技能" in _t3, _t3[:120])
+
+
+def test_33_skill_dispatch_and_plan_lint():
+    """执行型技能分发（差距 B）+ 计划残留轻校验（差距 A）防复发护栏（2026-10-02）。
+
+    差距 B 回放：执行型技能（market_screener / strategy_debug）原先只能靠主 agent
+    逐步取数来"手工执行"，重活全压上下文。现走 `run_skill` → 子进程 `skill_run.py`：
+    白名单注册表 + 超时可击杀 + 产物落盘 + 预览回传。风险点是**白名单被绕过**
+    （变成任意代码执行）与**链路静默不通**（工具注册了但子进程跑不起来）。
+
+    判据：① run_skill 在工具面 ② 未登记技能被白名单拦住（不落到执行）
+          ③ 真实链路通：ok=True 且 full_path 文件确实落盘
+          ④ run_skill 在**按需层**（不在必注入层）：它只服务批量流水线，
+             常驻每轮白挂 ~0.3k tokens 不划算；降级后靠 fail-open + 预选 +
+             system 点名三条兜底拿到（见 QDAgentConfig.on_demand_tools 注释）
+          ⑤ 未激活直调被 fail-open 就地激活（降级后模型仍调得到）
+    差距 A 判据：⑥ 计划留 in_progress/pending → 落 plan_lint 事件
+                ⑦ 全部 completed → 不落事件（不刷噪声）
+                ⑧ current_plan 每轮归零（是 per-run 而非 per-session）
+    """
+    print("\n[test_33] 执行型技能分发 + 计划残留校验（差距 A/B）")
+
+    # ── B① run_skill 进了工具面 ──
+    try:
+        from tools.base import ToolProvider
+        _faces = ToolProvider.get_or_build().get_functions()
+        check("run_skill 已进工具面（主 agent 才派得出去）", "run_skill" in _faces,
+              ",".join(sorted(_faces)[:5]))
+    except Exception as e:
+        check("可导入 ToolProvider / 取工具面", False, f"{type(e).__name__}: {e}")
+        return
+
+    try:
+        from tools import skill_tools as _st
+    except Exception as e:
+        check("可导入 tools.skill_tools", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ── B② 白名单拦截（未登记技能不得执行）──
+    _bad = _st.run_skill("__not_a_skill__")
+    check("未登记技能被白名单拦住（防任意代码执行）",
+          _bad.get("ok") is False and "未知技能" in str(_bad.get("error", "")),
+          str(_bad)[:200])
+    _badfn = _st.run_skill("strategy_debug", '{"fn":"__nope__"}')
+    check("未登记入口函数被白名单拦住",
+          _badfn.get("ok") is False and "白名单" in str(_badfn.get("error", "")),
+          str(_badfn)[:200])
+
+    # ── B③ 真实链路：子进程执行 + 产物落盘 + 预览回传 ──
+    _ok = _st.run_skill("strategy_debug", '{"fn":"list_strategies"}')
+    _fp = _ok.get("full_path") or ""
+    check("执行型技能真实跑通（子进程→落盘→回传）",
+          _ok.get("ok") is True and bool(_fp) and os.path.exists(_fp),
+          str(_ok)[:200])
+    if _ok.get("ok") is True:
+        check("回传体含截断预览与耗时（主上下文只拿结论）",
+              isinstance(_ok.get("result"), str) and "elapsed_s" in _ok,
+              str(sorted(_ok))[:120])
+
+    # ── B④/B⑤ 分层归属 + 降级后仍拿得到 ──
+    try:
+        import asyncio
+        from qd_service import QDAgentService
+        _svc33 = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
+                                agent_config={"tools": []})
+        asyncio.run(_svc33.chat("hi", session_id="__t33__"))
+        _ag33 = _svc33._get_agent("__t33__")
+        check("run_skill 在按需层、不在必注入层（省 ~0.3k tokens/轮）",
+              "run_skill" not in (_ag33._core_names or [])
+              and "run_skill" in (_ag33._on_demand_names or []),
+              f"core含={('run_skill' in (_ag33._core_names or []))}")
+        try:
+            _ag33.execute_action({"tool": "run_skill", "params": {"name": "__nope__"}})
+        except Exception:
+            pass   # 工具本身返回 error 字典无妨；只关心有没有被激活
+        check("未激活直调被 fail-open 就地激活（降级后仍拿得到）",
+              "run_skill" in (_ag33._activated or []), str(_ag33._activated)[:120])
+    except Exception as e:
+        check("可装配 agent 做分层判定", False, f"{type(e).__name__}: {e}")
+
+    # ── A⑥/A⑦ 计划残留 → 落 trace 事件 ──
+    try:
+        from qd_agent import QDAgent
+    except Exception as e:
+        check("可导入 qd_agent", False, f"{type(e).__name__}: {e}")
+        return
+
+    class _T:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event, **fields):
+            self.events.append((event, fields))
+
+    class _S:
+        pass
+
+    def _mk(plan):
+        s = _S()
+        s.trace = _T()
+        s.current_plan = plan
+        return s
+
+    _dirty = _mk([{"step": "看大盘", "status": "completed"},
+                  {"step": "看技术面", "status": "in_progress"},
+                  {"step": "看资金面", "status": "pending"}])
+    QDAgent._plan_lint(_dirty)
+    check("计划留残账 → 落 plan_lint 事件（收尾未清账可事后对账）",
+          _dirty.trace.events and _dirty.trace.events[0][0] == "plan_lint"
+          and _dirty.trace.events[0][1]["residue"] == ["看技术面", "看资金面"],
+          str(_dirty.trace.events)[:200])
+
+    _clean = _mk([{"step": "a", "status": "completed"}])
+    QDAgent._plan_lint(_clean)
+    check("计划已勾完 → 不落事件（不刷噪声）", not _clean.trace.events,
+          str(_clean.trace.events)[:120])
+
+    # ── A⑥ current_plan 是 per-run 生命周期 ──
+    try:
+        import inspect as _inspect
+        _src = _inspect.getsource(QDAgent._run_inner)
+        check("current_plan 每轮归零（per-run，非跨请求残留）",
+              "self.current_plan = None" in _src, "")
+    except Exception as e:
+        check("可读 _run_inner 源码", False, f"{type(e).__name__}: {e}")
+
+
 if __name__ == "__main__":
     _base = _trace_baseline()     # 自清基线：只删 smoke 自己写的行
     for t in (test_1_happy_path, test_2_trading_confirm_gate,
@@ -1462,7 +1665,9 @@ if __name__ == "__main__":
               test_28_closed_loop_consumers,
               test_29_module_single_instance,
               test_30_toolface_import_health,
-              test_31_startup_bare_imports):
+              test_31_startup_bare_imports,
+              test_32_skill_injection_progressive,
+              test_33_skill_dispatch_and_plan_lint):
         try:
             t()
         except Exception as e:

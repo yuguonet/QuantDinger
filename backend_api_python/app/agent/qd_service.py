@@ -71,6 +71,42 @@ _INTENT_RULES = (
 )
 _SKILL_INJECT_MIN = 2   # 注入阈值（总分）
 
+# 超大技能渐进式加载（2026-10-02）：正文 > 此预算时，注入改为
+# 「目录 + 首段正文 + read_skill 按需读指针」——方法论尾部章节（执行流程/注意事项）
+# 不再被 body[:3000] 硬切丢失；同会话已注入过的技能只发一行指针，不再重复注入。
+_SKILL_BODY_CAP = 2200
+
+
+def _skill_block(name: str, body: str, skills) -> str:
+    """技能注入块：小技能全文；超大技能 = 前段 + 目录 + 按需读路标。"""
+    if len(body) <= _SKILL_BODY_CAP:
+        return body
+    try:
+        headings = skills.get_section_headings(name) or []
+    except Exception as _he:
+        # 不能静默：拿不到目录时下文的 outline 会退化成"（无）"，与"该技能
+        # 本来就没有小节"在输出上完全无法区分，事后排查必然被误导。
+        headings = []
+        logger.debug("[skill_block] %s 取小节目录失败（fail-open）: %s: %s",
+                     name, type(_he).__name__, _he)
+    outline = "；".join(str(h).strip("# ").strip() for h in headings[:20]) or "（无）"
+    # resource 路标只在技能**真的有**引用文件时才给：实测 5 个技能里 4 个
+    # list_resources() 为空，无条件给会诱导模型做一次必然失败的工具调用
+    # （返回 {"error": "无资源", "resources": []}），白花一轮。
+    _res_hint = ""
+    try:
+        if skills.list_resources(name):
+            _res_hint = (f'；参考资料用 read_skill(name="{name}", '
+                         f'resource="references/<文件>")')
+    except Exception:
+        _res_hint = ""
+    return (
+        f"{body[:_SKILL_BODY_CAP]}\n……（正文共 {len(body)} 字符，已截断）\n"
+        f"[技能目录] {outline}\n"
+        f"[按需读取] 要完整正文用 read_skill(name=\"{name}\")；"
+        f"只看某小节用 read_skill(name=\"{name}\", heading=\"<小节关键词>\"){_res_hint}。"
+    )
+
 # 领域闸门（2026-10-01）：范围/意图加分**只在金融语境下生效**。
 # 没有它会出现实测到的误伤：'写个跑马灯页面' 因"无标的 ⇒ 全市场筛选类 +2"
 # 拿到 2 分，被注入 3000 字的选股技能正文 —— 正是本系统最怕的"文不对题"回归
@@ -103,10 +139,7 @@ def _skill_weight(name: str) -> float:
     try:
         from chain.weight_hints import weight_of
     except ImportError:
-        try:
-            from chain.weight_hints import weight_of
-        except ImportError:
-            return 1.0
+        return 1.0
     try:
         return float(weight_of("skill", name, 1.0))
     except Exception:
@@ -148,6 +181,9 @@ class QDAgentService:
         self.agent_config = dict(agent_config or {})
         self._env = get_environment({"environment_class": "local"})
         self._sessions: dict[str, QDAgent] = {}
+        # 会话级技能注入去重（2026-10-02 降 token）：同会话已注入过的技能
+        # 只发一行指针，不再每轮重复灌正文（5 轮 × 3000 字的重复实测存在）
+        self._skill_seen: dict[str, set] = {}
         self._lock = threading.Lock()
 
     # ── 会话 ─────────────────────────────────────────────────
@@ -228,12 +264,29 @@ class QDAgentService:
                 best_score = -scored[0][0] if scored else 0
                 hit = False
                 if best and best_score >= _SKILL_INJECT_MIN:
-                    body = self.skills.load_body(best) or ""
-                    if body:
-                        parts.append(f"[相关技能：{best}]\n{body[:3000]}")
+                    # 键归一化为 str：_get_agent 用的是 str(session_id)，
+                    # 两者必须同一口径，否则将来加清理逻辑时会漏删。
+                    seen = self._skill_seen.setdefault(str(session_id), set())
+                    if best in seen:
+                        # 已在本会话注入过：一行指针即可。
+                        # ⚠ 不写"见上方历史"：上下文压缩（阈值 _compaction_threshold）
+                        # 会改写历史，而 _skill_seen 对此不知情 ⇒ 那时"回看"是假的。
+                        # 给出 read_skill(name=...) 不带参数 = 全文（skill_tools 实测），
+                        # 模型可一句话自取，不依赖历史是否还在。
+                        parts.append(
+                            f"[技能指针：{best}] 正文本会话已注入过；"
+                            f"要完整正文用 read_skill(name=\"{best}\")，"
+                            f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。")
                         hit = True
+                    else:
+                        body = self.skills.load_body(best) or ""
+                        if body:
+                            blk = _skill_block(best, body, self.skills)
+                            parts.append(f"[相关技能：{best}]\n{blk}")
+                            seen.add(best)
+                            hit = True
                 blocks.append({"kind": "skill", "injected": hit,
-                               "chars": 3000 if hit else 0, "relevance": best_score,
+                               "chars": len(parts[-1]) if hit else 0, "relevance": best_score,
                                "name": best or "", "reason":
                                    (f"命中技能 {best}（得分 {best_score}"
                                     f"，有标的={has_entity}）" if hit

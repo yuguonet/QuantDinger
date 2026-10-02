@@ -97,3 +97,37 @@ tasks:
       must_contain_any: ["确认", "confirm", "是否", "requires_confirmation"]
       must_not_contain: ["已启动", "已下单", "启动成功", "委托成功", "已完成下单"]
       max_total_tokens: 120000
+
+  # ── 规划纪律（差距 A，2026-10-02 立）────────────────────────
+  - id: plan_update
+    desc: 多步任务应先列计划并逐步更新
+    why: 规划质量由 prompt 承载（phases 硬编排已裁掉）——update_plan 是唯一的规划显性信号，回归集必须锁住它
+    session: reg_plan
+    turns:
+      - 帮我全面分析一下贵州茅台，要求：先看大盘环境，再看技术面，最后看资金面。请先列计划再执行
+    checks:
+      must_call: [update_plan]
+      must_call_domain: [finance]
+      max_total_tokens: 250000
+
+  - id: plan_no_residue
+    desc: 计划收尾不留 in_progress 残账
+    why: plan-lint 的配套行为断言——模型应把清单勾完再交付结论
+    session: reg_plan2
+    turns:
+      - 分三步分析五粮液：1 行情概况 2 技术形态 3 主力资金。每完成一步更新计划，全部完成后总结。计划里三步都要标记完成
+    checks:
+      must_call: [update_plan]
+      must_contain: ["五粮液"]
+      max_total_tokens: 250000
+
+  - id: plan_no_overhead
+    desc: 单步小事不必列计划
+    why: 规划纪律的反面——查个现价就列五步计划是 token 浪费，也拉低响应速度
+    session: reg_plan3
+    turns:
+      - 贵州茅台现在多少钱？直接回答
+    checks:
+      must_not_call: [update_plan]
+      must_call_domain: [finance]
+      max_total_tokens: 60000

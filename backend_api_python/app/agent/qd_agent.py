@@ -294,12 +294,19 @@ class QDAgentConfig(MimocodeAgentConfig):
     extra_core_tools: List[str] = field(default_factory=lambda: [
         n.strip() for n in os.getenv("QD_EXTRA_CORE_TOOLS", "").split(",") if n.strip()])
     # 反向旋钮：把本来必注入的工具**降级**为按需（token 再压缩用）。
-    # 默认只降级 actor（≈0.8k tokens/轮）：mimo 上游 MIMOCODE_CORE_TOOL_NAMES
-    # 本就**不含** actor/compact（它们是我们自己补挂的可选项），actor 是并行子代理，
-    # 单线任务用不到 ⇒ 按需更划算；compact 是长上下文压缩手段，必须常驻。
-    # 想再省：QD_ON_DEMAND_TOOLS=actor,task（task≈2.1k，子代理派发，纯问答用不到）。
+    # 默认降级 actor + run_skill：
+    #   · actor（≈0.8k tokens/轮）是并行子代理，单线任务用不到；mimo 上游
+    #     MIMOCODE_CORE_TOOL_NAMES 本就**不含** actor/compact，它们是我们自己补挂的。
+    #     compact 是长上下文压缩手段，必须常驻。
+    #   · run_skill（≈0.3k/轮，2026-10-02 新增）只服务"全市场扫描/策略诊断"这类批量
+    #     流水线，命中率极低 ⇒ 每轮白挂不划算。降级后仍拿得到，三条兜底：
+    #     ① 分层 fail-open（下方 execute_action）：未激活直调就地激活放行；
+    #     ② 工具预选目录由 _on_demand_names 构建 ⇒ 相关任务首轮就能被点名激活；
+    #     ③ system_template 的"重活分发"小节直接点名 run_skill，模型知道名字。
+    # 想再省：QD_ON_DEMAND_TOOLS=actor,run_skill,task（task≈2.1k，纯问答用不到）。
     on_demand_tools: List[str] = field(default_factory=lambda: [
-        n.strip() for n in os.getenv("QD_ON_DEMAND_TOOLS", "actor").split(",") if n.strip()])
+        n.strip() for n in os.getenv("QD_ON_DEMAND_TOOLS", "actor,run_skill").split(",")
+        if n.strip()])
     # ── 工具预选（2026-10-01）───────────────────────────────────
     # 分层后模型要靠 search_tools→list_tools→activate_tools 三轮才能摸到一个按需
     # 工具（实测 21 次调用里 13 次是发现轮）。这里在 run 前用 **1 次轻量 LLM** 把
@@ -1054,6 +1061,7 @@ class QDAgent(MimocodeAgent):
         # 且 str(e)=="" → 空结果退出。每轮 run 前归零，预算语义改为按请求。
         self._steps_taken = 0
         self.tool_call_errors = []
+        self.current_plan = None       # 计划是 per-run 的（与步数同生命周期）
         # 工具预选：必须在 tool_map / tool_availability 渲染**之前**跑，
         # 否则地图里看不到刚被点名激活的工具，模型会以为还得先去 search。
         self.last_preselect_report = self._maybe_preselect_tools(task)
@@ -1121,6 +1129,7 @@ class QDAgent(MimocodeAgent):
                 if guide is not None:
                     status = "grounding_failed"
 
+        self._plan_lint()
         self._finish_collector(message, status)
         if self.trace is not None:
             try:
@@ -1145,6 +1154,27 @@ class QDAgent(MimocodeAgent):
             return TraceCollector(session_id=sid, user_query=query[:2000])
         except Exception:
             return None
+
+    def _plan_lint(self) -> None:
+        """计划收尾轻校验（差距 A，2026-10-02）：只告警不拦截。
+
+        update_plan 的清单若留着 in_progress/pending 收不了口，通常是任务
+        跑偏/被截断的信号——落 trace 供事后对账，不改 run 行为。
+        """
+        plan = getattr(self, "current_plan", None)
+        if not plan:
+            return
+        try:
+            residue = [p.get("step", "") for p in plan
+                       if isinstance(p, dict) and p.get("status") in ("in_progress", "pending")]
+            if residue:
+                logger.warning(
+                    "[plan-lint] run 收尾时计划未清账（%d 项）: %s", len(residue), residue[:5])
+                if self.trace is not None:
+                    self.trace.emit("plan_lint", residue=residue[:10],
+                                    plan_explanation=getattr(self, "plan_explanation", ""))
+        except Exception:
+            pass
 
     def _finish_collector(self, message: str, status: str) -> None:
         collector = getattr(self, "_collector", None)
