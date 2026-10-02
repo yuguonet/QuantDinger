@@ -864,7 +864,7 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     #   ⚠ 旧系统 evaluate_pending 读的是 direction neutral / confidence 0.5 的
     #   污染数据，S2 已清空重来；此后有权重的样本全部来自本步产出的 resolutions。
     try:
-        from app.agent.chain.resolver import resolve_due_claims
+        from chain.resolver import resolve_due_claims
         acc = resolve_due_claims(limit=200)
         result["accountability"] = {k: v for k, v in acc.items() if k != "details"}
         _worker_health["last_accountability"] = result["accountability"]
@@ -882,7 +882,7 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     # chain/weight_hints 在工具预选 / 技能选择处消费 ⇒ 判定结果真正影响下一次选择。
     # 独立 try：喂数失败不影响报告产出。
     try:
-        from app.agent.chain.weight_feed import feed as _feed_weights
+        from chain.weight_feed import feed as _feed_weights
         wf = _feed_weights()
         result["weight_feed"] = wf
         _worker_health["last_weight_feed"] = wf

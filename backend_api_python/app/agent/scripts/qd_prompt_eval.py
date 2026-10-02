@@ -38,16 +38,20 @@ from typing import Any, Dict, List, Optional, Tuple
 HERE = Path(__file__).resolve().parent         # app/agent/scripts
 AGENT_DIR = HERE.parent                        # app/agent
 BACKEND_ROOT = AGENT_DIR.parent.parent         # backend_api_python
+# 只插 backend_api_python（让 `import app.*` 可用）；不插 app/agent/，
+# 否则 agent 子模块会同时存在裸名与全名两份 module（两份单例/缓存）。
+# 顺序不能反：AGENT_DIR 必须比 BACKEND_ROOT/app 更靠前，否则 `import utils`
+# 会命中 app/utils 而不是 app/agent/utils（agent 包内一律用裸名，见 qd_smoke.py 头部说明）
 for _p in (str(BACKEND_ROOT), str(AGENT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import mimo_boot  # noqa: F401,E402  统一依赖引导（找不到 mimoagent 时给安装指引）
+import mimo_boot
 
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(BACKEND_ROOT / ".env", override=False)
 
-from app.agent.qd_service import QDAgentService  # noqa: E402
+from qd_service import QDAgentService  # noqa: E402
 
 REPORT_DIR = HERE / "prompt_eval"
 TASKS_FILE = HERE / "prompt_tasks.yaml"
@@ -116,14 +120,14 @@ def build_service(profile: str) -> Tuple[QDAgentService, str]:
     """
     if profile in ("auto", "prod"):
         try:
-            from app.agent.agent import agent as prod_agent  # noqa
+            from agent import agent as prod_agent  # noqa
             return prod_agent, "production"
         except Exception as e:
             if profile == "prod":
                 raise
             print(f"[warn] 生产装配失败，退回 minimal: {e!r}")
-    from app.agent.memory import LocalMemory
-    from app.agent.llm import QDSkillAdapter
+    from memory import LocalMemory
+    from llm import QDSkillAdapter
     svc = QDAgentService(memory=LocalMemory(max_messages=200),
                          retriever=None, skills=QDSkillAdapter(),
                          agent_config={"service_availability": {"search_knowledge": False}})
@@ -142,7 +146,7 @@ def _model_stats(svc: QDAgentService) -> Dict[str, int]:
 def _domain_map() -> Dict[str, str]:
     """工具名 → 域（按需层判定用；mimo 原生归 'mimo'）。"""
     try:
-        from app.agent.tools.base import ToolProvider
+        from tools.base import ToolProvider
         p = ToolProvider.get_or_build()
         dom = {n: p.get_domain(n) for n in p.get_functions()}
         for n in p.get_meta_functions():
@@ -392,10 +396,7 @@ def main() -> int:
         print("未配置 OPENAI_API_KEY，无法跑真实端点回归（先配 .env）", file=sys.stderr)
         return 2
 
-    try:
-        from app.agent.tools.availability import probe_tools
-    except ImportError:
-        from tools.availability import probe_tools
+    from tools.availability import probe_tools
     availability = probe_tools()
     print("工具可用性:", {k: v.get("available") for k, v in availability.items()})
 

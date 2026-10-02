@@ -88,30 +88,37 @@ _NOT_TOOLS = frozenset({
 #    旧系统踩过的坑正是"词典陈旧无人报警"（plan_linter.py 头部易错点），此处堵死。
 #
 # 关键词要用**用户会怎么写**的词（问法），不是工具的字段名。
+#
+# ⚠️ 归组后的旧工具名**不得出现在候选里**：它们已被 `_SUPERSEDED_BY_MERGE` 摘出
+# 注册表（如 analyze_trend → technical_analysis、search_stock_intel → search_intel），
+# 写旧名 = 补位补出一个不存在的名字、白跑一轮且静默。改名一律查
+# `tools/base.py::TOOL_ALIAS`（旧名 → 新名的权威映射），不要凭印象写。
 DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("quote", ("行情", "现价", "报价", "涨跌", "涨幅", "跌幅", "价格", "收盘", "实时",
                "quote", "最新"),
-     ("get_realtime_quote", "get_index_quote", "get_index_etf_quote")),
+     ("get_realtime_quote", "get_index_quote")),   # get_index_etf_quote → get_index_quote
 
     ("kline", ("k线", "K线", "日线", "周线", "历史", "走势", "均线", "ma5", "ma20",
                "ma60", "kline", "蜡烛"),
-     ("agent_get_kline", "get_index_kline", "daily", "calculate_ma")),
+     ("agent_get_kline", "get_index_kline", "daily", "technical_analysis")),  # calculate_ma → technical_analysis
 
     ("trend", ("技术面", "趋势", "形态", "支撑", "压力", "突破", "macd", "kdj", "rsi",
                "指标", "多头", "空头", "背离"),
-     ("technical_analysis", "analyze_trend", "analyze_pattern",
-      "analyze_chart_patterns", "get_indicator_snapshot", "indicator_analysis",
-      "run_indicator_signal", "list_indicators", "get_indicator_params")),
+     # analyze_trend / get_indicator_snapshot → technical_analysis；
+     # indicator_analysis → run_indicator_signal；get_indicator_params → list_indicators
+     ("technical_analysis", "analyze_pattern",
+      "analyze_chart_patterns", "run_indicator_signal", "list_indicators")),
 
     ("fundflow", ("资金流", "主力", "净流入", "净流出", "大单", "超大单", "北向",
                   "融资", "主力净额"),
-     ("get_fund_flow", "get_fund_flow_daily", "get_market_fund_flow",
-      "get_sector_fund_flow", "get_concept_fund_flow")),
+     # get_market_fund_flow / get_concept_fund_flow → get_fund_flow
+     ("get_fund_flow", "get_fund_flow_daily", "get_sector_fund_flow")),
 
     ("sector", ("板块", "题材", "概念", "行业", "龙头", "赛道"),
+     # get_sector_trend_analysis / get_sector_history_data / get_industry_ranking
+     #   → get_sector_board；get_stock_concept_blocks → get_stock_sector_info
      ("get_sector_board", "get_hot_sectors", "get_sector_stocks",
-      "get_sector_fund_flow", "get_sector_trend_analysis", "get_stock_sector_info",
-      "get_stock_concept_blocks", "get_industry_ranking", "get_sector_history_data")),
+      "get_sector_fund_flow", "get_stock_sector_info")),
 
     ("screen", ("选股", "筛选", "强势", "涨停", "跌停", "榜单", "排行", "热榜",
                 "哪些股", "几只", "排名", "涨幅榜"),
@@ -127,15 +134,17 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
      ("get_chip_distribution",)),
 
     ("volume", ("成交量", "量能", "放量", "缩量", "换手", "obv", "成交额", "量比"),
-     ("get_volume_analysis", "get_obv_analysis", "get_order_book")),
+     # get_volume_analysis / get_obv_analysis → technical_analysis
+     ("technical_analysis", "get_order_book")),
 
     ("market", ("大盘", "指数", "上证", "深证", "创业板", "沪深", "市场", "两市",
                 "科创", "北证"),
-     ("get_market_overview", "get_market_indices", "get_index_quote",
+     # get_market_indices → get_index_quote
+     ("get_market_overview", "get_index_quote",
       "get_index_kline", "get_capital_summary")),
 
     ("dragon", ("龙虎", "席位", "游资", "机构专用"),
-     ("get_dragon_tiger", "get_dragon_tiger_detail")),
+     ("get_dragon_tiger",)),   # get_dragon_tiger_detail → get_dragon_tiger
 
     ("strategy", ("策略", "回测", "启动策略", "停止策略", "信号", "交易记录"),
      ("list_strategies", "get_strategy_detail", "get_strategy_trades",
@@ -143,8 +152,9 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
 
     ("intel", ("新闻", "公告", "研报", "消息", "舆情", "政策", "公告", "为什么",
                "有什么利", "最新动态"),
-     ("search_intel", "search_stock_intel", "search_policy_intel",
-      "search_sector_intel", "search_comprehensive_intel")),
+     # search_stock_intel / search_policy_intel / search_sector_intel
+     #   / search_comprehensive_intel → search_intel
+     ("search_intel",)),
 
     ("capital", ("账户", "可用资金", "持仓", "仓位", "市值", "盈亏"),
      ("get_capital_summary",)),
@@ -382,7 +392,7 @@ def capability_domain() -> str:
     硬编码兜底只为 capabilities 包不可导入时仍能跑（此时能力层本就是空的）。
     """
     try:
-        from app.agent.capabilities.loader import CAPABILITY_DOMAIN as _D
+        from capabilities.loader import CAPABILITY_DOMAIN as _D
     except Exception:
         try:
             from capabilities.loader import CAPABILITY_DOMAIN as _D
@@ -394,7 +404,7 @@ def capability_domain() -> str:
 def _near_dup(a: str, b: str) -> bool:
     """近重名判定（让位用）——复用能力层实现，失败退化为同名判定。"""
     try:
-        from app.agent.capabilities.loader import near_dup_tool_names as _f
+        from capabilities.loader import near_dup_tool_names as _f
     except Exception:
         try:
             from capabilities.loader import near_dup_tool_names as _f

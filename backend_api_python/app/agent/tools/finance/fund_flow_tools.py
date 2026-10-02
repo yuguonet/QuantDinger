@@ -8,9 +8,9 @@ Fund Flow Tools — 资金流向（个股/板块/大盘）。
 from __future__ import annotations
 import json
 
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List
-from app.agent.utils.md_format import _batch_execute, _to_md
+from utils.md_format import _batch_execute, _to_md
 def _fund_flow_stock_realtime(codes: str) -> dict:
     """个股实时资金流 + 5日/20日累计（2026-09-28 补全多日汇总）。
 

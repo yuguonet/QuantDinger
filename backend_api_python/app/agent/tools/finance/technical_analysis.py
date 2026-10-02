@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List
 def _call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 analysis_tools 中的分析算法（同包内规范实现，非工具包装层）+ basicinfo，返回结果字典。
@@ -18,11 +18,11 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
     已改为直接走数据源，不再 import 工具包装层。
     """
     from app.utils.basicinfo_db import get_stock_basic_db
-    from app.agent.tools.finance.analysis_tools import (
+    from tools.finance.analysis_tools import (
         analyze_trend, get_indicator_snapshot, get_volume_analysis,
         analyze_pattern, get_chip_distribution,
     )
-    from app.agent.tools.finance._analysis_utils import _get_ds
+    from tools.finance._analysis_utils import _get_ds
 
     results = {}
     for name, fn in [

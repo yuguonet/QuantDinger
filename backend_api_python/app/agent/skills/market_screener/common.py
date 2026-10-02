@@ -8,7 +8,7 @@ market_screener/common.py
 
 from __future__ import annotations
 
-from app.agent.log import logger
+from log import logger
 import os
 import sys
 from collections import Counter
@@ -376,9 +376,17 @@ def _compact_json(d, max_depth=2, _depth=0):
 #  路径与环境
 # ═══════════════════════════════════════════════════════════════
 
+# ⚠ 层数必须数对：本文件在 app/agent/skills/market_screener/ 下，
+# 往上是 skills → agent → app → backend_api_python，即 **4 层** 才到 backend 根。
+# 曾经写成 3 层（= app/ 目录），于是把 `app/` 插到了 sys.path[0] 且没有配套插
+# `app/agent/` ⇒ `app/` 反超 `app/agent/` ⇒ 裸名 `import utils` 命中 **app/utils**
+# 而不是 app/agent/utils ⇒ 9 个 finance 工具模块的 `from utils.md_format import ...`
+# 全部 ModuleNotFoundError，被 ToolProvider **静默跳过**（工具面从 101 掉到 91，
+# 能力层从 40 虚增到 62 补位），且只在「直接 python cli.py」的引导时序下出现。
 _backend_root = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
 )
+# 只挂 backend 根。**禁止**把 `app/` 插进 sys.path（理由见上）。
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
 def _load_env():
@@ -420,8 +428,8 @@ def _today_str() -> str:
 # 2026-09-19：修正过时的 import 路径——工具已迁至 tools/finance/ 子目录，
 # 旧路径 app.agent.tools.screener_tools 不存在，导致整个 run.py 导入失败
 # （_load_skill_functions 静默返回 []，skill 工具全部不注入沙箱 → 模型调用被幻觉拦截）。
-from app.agent.tools.finance.screener_tools import search_stocks
-from app.agent.tools.finance.analysis_tools import get_indicator_snapshot
+from tools.finance.screener_tools import search_stocks
+from tools.finance.analysis_tools import get_indicator_snapshot
 from app.market_cn.tape import get_fund_flow_realtime
 
 _TOOL_REGISTRY = {

@@ -35,12 +35,15 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── 路径设置（直接运行 cli.py 时需要，-m 方式由 __init__.py 处理）──
+# 只挂 backend_api_python（保证 `import app.*` 可用）。**不要**挂 app/agent：
+# 那会让 agent 子模块同时存在裸名与全名两份 module（两份单例/缓存）。
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _agent_dir = os.path.abspath(os.path.dirname(__file__))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-if _agent_dir not in sys.path:
-    sys.path.insert(0, _agent_dir)
+# 顺序不能反：_agent_dir 必须比 _project_root/app 更靠前（agent 包内一律用裸名，
+# 否则 `import utils` 会命中 app/utils）
+for _p in (_project_root, _agent_dir):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 try:
     from dotenv import load_dotenv
@@ -155,7 +158,7 @@ def _print_info():
     print(f"  技能: {len(skills)} 个")
 
     try:
-        from app.agent.llm.qd_llm import _load_llm_service
+        from llm.qd_llm import _load_llm_service
         LLMService_cls, _, _ = _load_llm_service()
         svc = LLMService_cls()
         print(f"\n  ── LLMService ──")
@@ -211,7 +214,7 @@ def main():
 
     if args.message:
         try:
-            from app.agent.llm.qd_llm import _load_llm_service
+            from llm.qd_llm import _load_llm_service
             LLMService_cls, _, _ = _load_llm_service()
             svc = LLMService_cls()
             if not svc.get_api_key():

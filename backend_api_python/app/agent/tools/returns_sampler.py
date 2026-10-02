@@ -421,7 +421,7 @@ def _start_background_sampling(provider, cache_path: Path = _CACHE_PATH,
 
 if __name__ == "__main__":  # 手动冷启/重扫：python -m app.agent.tools.returns_sampler
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    from app.agent.tools.base import ToolProvider
+    from tools.base import ToolProvider
     _prov = ToolProvider()
     _tdir = Path(__file__).resolve().parent
     _prov.scan_directory(_tdir, domain="common", package_prefix="tools")

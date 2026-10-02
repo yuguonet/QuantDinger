@@ -209,7 +209,7 @@ class ChatHistoryRetriever:
     使用 PostgreSQL tsvector/tsquery 做中文关键词检索，不依赖 Embedding。
 
     使用方式：
-        from memory.postgres_memory import PostgresMemory
+        from app.agent.memory.postgres_memory import PostgresMemory
         memory = PostgresMemory()
         history_retriever = ChatHistoryRetriever(memory, top_k=5)
         docs = await history_retriever.retrieve("茅台")

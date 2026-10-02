@@ -36,7 +36,7 @@ def load_domain_policy() -> Dict[str, Dict[str, Any]]:
     读不到（表未建 / DB 不通）返回 `claims.DOMAIN_POLICY` 内置默认，
     保证"库没就绪时行为与配置一致"，不会退化成"全都入库"。
     """
-    from app.agent.chain.claims import DOMAIN_POLICY
+    from chain.claims import DOMAIN_POLICY
     try:
         with _conn() as conn:
             cur = conn.cursor()

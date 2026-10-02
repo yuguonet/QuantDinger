@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from app.agent.log import logger
+from log import logger
 import os
 import time
 from typing import Any, Dict, List

@@ -319,9 +319,23 @@ _MUST_HAVE = {"format_utils", "web_search_tools"}
 # 挂死整个进程。任何模块的同名入口一律不注册（元工具表同判据）。
 _ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "app"})
 
+# 工具模块导入失败登记表（2026-10-02）：`_load_domain_tools` 遇到 ImportError 只
+# warning 后 `continue`，属于**静默降级**——日志没人盯时工具面悄悄缺一大块，而
+# 能力层会自动补位把缺口盖住。这里登记一份，供 `qd_smoke.py::
+# test_30_toolface_import_health` 断言为空；也便于运行时自检直接读出。
+_TOOL_MODULE_IMPORT_FAILURES: list = []
+
 # 已被聚合工具取代：实现保留（技能/内部仍可 import、能力层仍可让位判定），
-# 但不再注册为工具面。key 用全限定名 "module:func"（module = importlib 导入后的
-# __name__，如 tools.finance.fund_flow_tools），避免跨模块同名误伤。
+# 但不再注册为工具面。key 用**去顶层包前缀**的 "<子目录>.<模块名>:<func>"
+# （如 finance.fund_flow_tools:get_market_fund_flow），只保留子目录+模块名即可避免
+# 跨模块同名误伤。
+#
+# ⚠ 绝不要把顶层包前缀（`tools.` / `app.agent.tools.`）写进 key：模块的 __name__
+# 取决于导入口径（裸名 vs 全名），一旦两者不一致，本表**永不命中** ⇒ 聚合摘除
+# 静默失效、废弃工具重新混进工具面。2026-10-02 回退裸名时才暴露：全名周期内
+# `tools.finance.*` 恒不匹配，20 个已归组的旧工具一直在面里，而 smoke 的词典自检
+# 反倒因它们"存在"而通过。故此处与 `_register_module_functions` 的 key 拼法
+# 必须与导入口径无关。
 #
 # 【为什么只摘注册不删实现】（工具归组化方案 §4，2026-09-27）：
 #   ① 技能层直接 import 这些函数（market_screener/common.py 等），删实现会断链；
@@ -332,31 +346,31 @@ _ENTRY_NAME_DENY = frozenset({"main", "cli", "serve", "run_server", "server", "a
 #   不得进本表——否则包装被摘、能力薄实现出静默接管，语义降级无人知（P0 定案）。
 _SUPERSEDED_BY_MERGE = frozenset({
     # 资金流 → get_fund_flow(scope=...)（P0 保留 get_fund_flow_daily/get_sector_fund_flow）
-    "tools.finance.fund_flow_tools:get_market_fund_flow",
-    "tools.finance.fund_flow_tools:get_concept_fund_flow",
+    "finance.fund_flow_tools:get_market_fund_flow",
+    "finance.fund_flow_tools:get_concept_fund_flow",
     # 指数行情 → get_index_quote(scope=...)（P0 保留 get_index_kline）
-    "tools.finance.data_tools:get_market_indices",
-    "tools.finance.data_tools:get_index_etf_quote",
+    "finance.data_tools:get_market_indices",
+    "finance.data_tools:get_index_etf_quote",
     # 情报 → search_intel(scope=...)
-    "tools.finance.news_search_tools:search_stock_intel",
-    "tools.finance.news_search_tools:search_sector_intel",
-    "tools.finance.news_search_tools:search_policy_intel",
-    "tools.finance.news_search_tools:search_comprehensive_intel",
+    "finance.news_search_tools:search_stock_intel",
+    "finance.news_search_tools:search_sector_intel",
+    "finance.news_search_tools:search_policy_intel",
+    "finance.news_search_tools:search_comprehensive_intel",
     # 龙虎榜 → get_dragon_tiger(detail=...)；板块 → get_sector_board(view=...)
-    "tools.finance.signal_tools:get_dragon_tiger_detail",
-    "tools.finance.signal_tools:get_industry_ranking",
-    "tools.finance.signal_tools:get_stock_concept_blocks",
-    "tools.finance.sector_analysis_tools:get_sector_trend_analysis",
-    "tools.finance.sector_analysis_tools:get_sector_history_data",
+    "finance.signal_tools:get_dragon_tiger_detail",
+    "finance.signal_tools:get_industry_ranking",
+    "finance.signal_tools:get_stock_concept_blocks",
+    "finance.sector_analysis_tools:get_sector_trend_analysis",
+    "finance.sector_analysis_tools:get_sector_history_data",
     # 技术分析 → technical_analysis（实现保留供技能 import）
-    "tools.finance.analysis_tools:analyze_trend",
-    "tools.finance.analysis_tools:get_indicator_snapshot",
-    "tools.finance.analysis_tools:get_volume_analysis",
-    "tools.finance.analysis_tools:get_obv_analysis",
-    "tools.finance.analysis_tools:calculate_ma",
+    "finance.analysis_tools:analyze_trend",
+    "finance.analysis_tools:get_indicator_snapshot",
+    "finance.analysis_tools:get_volume_analysis",
+    "finance.analysis_tools:get_obv_analysis",
+    "finance.analysis_tools:calculate_ma",
     # 指标策略 → list_indicators / run_indicator_signal
-    "tools.finance.indicator_tools:get_indicator_params",
-    "tools.finance.indicator_tools:indicator_analysis",
+    "finance.indicator_tools:get_indicator_params",
+    "finance.indicator_tools:indicator_analysis",
 })
 
 # 工具更名/归并的权重迁移表（旧名 → 新名）：chain/evaluator 同步权重表时，
@@ -502,8 +516,17 @@ class ToolProvider:
             except Exception as _mod_err:
                 # 2026-09-22（缺陷清单 Bug2A）：debug→warning。新工具文件 import 挂了
                 # 只有 debug 能看到 = 静默消失，工具少注册无人知。warning 不影响流程。
+                # 2026-10-02：warning 仍不够——日志没人盯时依旧是**静默降级**
+                # （曾因 sys.path 错序导致 9 个 finance 模块一起挂掉，工具面从 101
+                #  掉到 91，而能力层补位掩盖了缺口）。故同时落进模块级列表，
+                #  由 `qd_smoke.py::test_30_toolface_import_health` 断言为空。
                 logger.warning("[ToolProvider] 模块 %s 导入失败，跳过注册（%s: %s）",
                                module_name, type(_mod_err).__name__, _mod_err)
+                try:
+                    _TOOL_MODULE_IMPORT_FAILURES.append(
+                        f"{module_name}: {type(_mod_err).__name__}: {_mod_err}")
+                except NameError:      # 兜底：列表未定义时不因护栏打断注册
+                    pass
                 continue
             self._register_module_functions(mod, domain)
 
@@ -566,11 +589,14 @@ class ToolProvider:
         后者被注册表与元工具表共用（2026-09-21 判据漂移事故），塞聚合语义会污染另一处。
         """
         mod_name = getattr(module, "__name__", "")
+        # key 只取「子目录.模块名」，抹掉顶层包前缀（tools. / app.agent.tools.），
+        # 使判定与导入口径无关（详见 _SUPERSEDED_BY_MERGE 头部注释）
+        _mod_key = ".".join(mod_name.split(".")[-2:])
         for attr_name in dir(module):
             if attr_name in _ENTRY_NAME_DENY:
                 logger.debug("[ToolProvider] 跳过入口函数 %s（CLI/server 入口不注册）", attr_name)
                 continue
-            if f"{mod_name}:{attr_name}" in _SUPERSEDED_BY_MERGE:
+            if f"{_mod_key}:{attr_name}" in _SUPERSEDED_BY_MERGE:
                 logger.debug("[ToolProvider] %s:%s 已被聚合工具取代，摘除注册（实现保留）",
                              mod_name, attr_name)
                 continue

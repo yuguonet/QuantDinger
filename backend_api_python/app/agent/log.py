@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Agent Log — 兼容 app.agent.log 的轻量级桥接。
+Agent Log — 轻量级桥接（agent 包子模块的统一 logger 出口）。
 
-工具模块中 `from app.agent.log import logger` 可正常工作。
+工具模块中 `from log import logger` 可正常工作（agent 包内统一裸名导入）。
 同时将日志写入 logs/app.log，与应用其他模块共享同一个文件。
 输出经 MASK 脱敏（常设 6）。
 """

@@ -358,10 +358,7 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
     for cand in candidates:
         # 链名归一（2026-09-30）：实体码链（stock+analyze+600929）与同构链合并，
         # skill 命名词根不得携带标的标识——否则每只股票各酿一个技能。
-        try:
-            from domain_registry import normalize_chain_name
-        except ImportError:
-            from app.agent.domain_registry import normalize_chain_name
+        from domain_registry import normalize_chain_name
         chain_name = normalize_chain_name(str(cand.get("chain_name") or ""))
         if not chain_name:
             results.append({"chain_name": cand.get("chain_name"), "status": "bad_chain"})
@@ -695,7 +692,7 @@ def refresh_skill_adapter() -> None:
     """酿造后刷新运行中的 skill_adapter 缓存（长驻进程生效；cli 下次启动自然生效）。"""
     try:
         from llm.qd_skills import QDSkillAdapter
-        import agent as agent_mod          # 裸包名（app/agent 在 sys.path），全局单例
+        import agent as agent_mod
         adapter = getattr(agent_mod.agent, "skill_adapter", None)
         if isinstance(adapter, QDSkillAdapter):
             fresh = QDSkillAdapter(skills_dirs=list(adapter._default_dirs()))
@@ -711,8 +708,7 @@ if __name__ == "__main__":
     import sys
     import os  # 2026-09-24（提智阶段 0.10，审计 A5）：下文 os.path.join 需要；缺失时手动入口启动即 NameError
     _bp = Path(__file__).resolve().parents[3]
-    sys.path.insert(0, _bp)
-    sys.path.insert(0, os.path.join(_bp, "app", "agent"))
+    sys.path.insert(0, _bp)   # 只挂 backend_api_python；不挂 app/agent（会造出两份 module）
     from dotenv import load_dotenv
     load_dotenv(_bp / ".env", override=False)   # 否则 DATABASE_URL 缺失 → 候选查询空转
     logging.basicConfig(level=logging.INFO,

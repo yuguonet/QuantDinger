@@ -34,7 +34,7 @@ from typing import Any, Callable, List, Optional
 # 静默炸掉，而该分支本该是 fail-open 的）。标准 logging 在任何入口都成立。
 logger = logging.getLogger(__name__)
 
-import mimo_boot  # noqa: F401  # 统一依赖引导：找不到 mimoagent 时给安装指引（入口首行）
+import mimo_boot
 
 from mimoagent.agents.antihack import AntiHackConfig
 from mimoagent.agents.base import TerminatingException
@@ -49,9 +49,9 @@ from mimoagent.tools.base import ToolOutput
 from mimoagent.tools.registry import ToolRegistry
 
 try:  # 生产：backend_api_python 为根
-    from app.agent.tools.fn_adapter import FnToolAdapter
-    from app.agent.audit.trace_adapter import TraceAdapter
-    from app.agent.tools.tool_preselect import (
+    from tools.fn_adapter import FnToolAdapter
+    from audit.trace_adapter import TraceAdapter
+    from tools.tool_preselect import (
         build_catalog, build_catalog_grouped, build_preselect_messages,
         parse_selection, parse_plan, lint_selection, apply_lint,
         get_tool_index, has_domain_hint, capability_domain,
@@ -389,7 +389,7 @@ def _ensure_capabilities(provider) -> int:
     if getattr(provider, "_qd_caps_registered", None):
         return int(getattr(provider, "_qd_caps_count", 0) or 0)
     try:
-        from app.agent.capabilities import register_capabilities
+        from capabilities import register_capabilities
     except ImportError:
         try:
             from capabilities import register_capabilities
@@ -424,10 +424,7 @@ def warmup_tool_face() -> dict:
         return dict(_WARM_STATE)
     t0 = _time.perf_counter()
     try:
-        try:
-            from app.agent.tools.base import ToolProvider
-        except ImportError:
-            from tools.base import ToolProvider
+        from tools.base import ToolProvider
         provider = ToolProvider.get_or_build()
         n = _ensure_capabilities(provider)
         _WARM_STATE.update({
@@ -654,10 +651,7 @@ class QDAgent(MimocodeAgent):
         # 消费点。提示失败一律 fail-open（空提示 = 与没有历史数据时行为一致）。
         hist_hint = ""
         try:
-            try:
-                from app.agent.chain.weight_hints import hint_text
-            except ImportError:
-                from chain.weight_hints import hint_text
+            from chain.weight_hints import hint_text
             hist_hint = hint_text(names) or ""
         except Exception as e:
             logger.debug("[preselect] 权重提示跳过(fail-open): %s: %s",
@@ -758,7 +752,7 @@ class QDAgent(MimocodeAgent):
         """
         if report.get("selected"):
             try:
-                from app.agent.tools.preselect_stats import record_selected
+                from tools.preselect_stats import record_selected
                 record_selected("fallback" if report.get("fallback") else "ok")
             except Exception:
                 pass
@@ -771,7 +765,7 @@ class QDAgent(MimocodeAgent):
         except Exception as e:
             logger.warning("[preselect] 域兜底异常(fail-open): %s", e)
             try:
-                from app.agent.tools.preselect_stats import record_empty_face
+                from tools.preselect_stats import record_empty_face
                 record_empty_face(query, "fallback_error:%s" % type(e).__name__, len(names))
             except Exception:
                 pass
@@ -779,7 +773,7 @@ class QDAgent(MimocodeAgent):
         if not fb:
             # 第三层兜底：不静默 —— 计数 + 可查询（见 preselect_stats.report()）
             try:
-                from app.agent.tools.preselect_stats import record_empty_face
+                from tools.preselect_stats import record_empty_face
                 _pr = record_empty_face(query, self._empty_route(report), len(names))
                 report["empty_face"] = {"rate": _pr["rate"], "sample": _pr["sample"]}
             except Exception:
@@ -789,7 +783,7 @@ class QDAgent(MimocodeAgent):
         got = list(act.get("activated", [])) + list(act.get("already", []))
         if not got:
             try:
-                from app.agent.tools.preselect_stats import record_empty_face
+                from tools.preselect_stats import record_empty_face
                 record_empty_face(query, "fallback_activate_miss", len(names))
             except Exception:
                 pass
@@ -834,10 +828,7 @@ class QDAgent(MimocodeAgent):
         explicit = getattr(self.config, "tool_functions", None)
         if explicit:
             return [(fn, "common") for fn in explicit]
-        try:
-            from app.agent.tools.base import ToolProvider
-        except ImportError:
-            from tools.base import ToolProvider
+        from tools.base import ToolProvider
         provider = ToolProvider.get_or_build()
         self._maybe_register_capabilities(provider)
         out = [(f, provider.get_domain(n)) for n, f in provider.get_functions().items()]
@@ -968,10 +959,7 @@ class QDAgent(MimocodeAgent):
     def _tool_availability_text(self) -> str:
         """工具可用性（启动期探测 + 服务级事实）——写进系统提示，防模型被放鸽子。"""
         try:
-            try:
-                from app.agent.tools.availability import probe_tools
-            except ImportError:
-                from tools.availability import probe_tools
+            from tools.availability import probe_tools
             info = dict(probe_tools())
         except Exception:
             info = {}
@@ -1144,10 +1132,7 @@ class QDAgent(MimocodeAgent):
     # ── qd_traces DB 链（闭环②：TraceCollector → chain.store）────
     def _make_collector(self, task):
         try:
-            try:
-                from app.agent.trace_collector import TraceCollector
-            except ImportError:
-                from trace_collector import TraceCollector
+            from trace_collector import TraceCollector
             sid = getattr(_HOOKS_LOCAL, "session_id", None) or "default"
             query = task if isinstance(task, str) else str(task)
             # 2026-10-01：task 是 **prefetch 加工后**的文本（记忆/技能/RAG 块 + 用户问题），
@@ -1196,10 +1181,7 @@ class QDAgent(MimocodeAgent):
             return
         self.last_accountability: dict = {}
         try:
-            try:
-                from app.agent.chain.intake import record_decision
-            except ImportError:
-                from chain.intake import record_decision
+            from chain.intake import record_decision
             self.last_accountability = record_decision(
                 user_query=str(getattr(collector, "user_query", "") or ""),
                 answer=answer,
@@ -1248,7 +1230,7 @@ class QDAgent(MimocodeAgent):
     @staticmethod
     def _grounding_violation(text: str, corpus: str) -> Optional[str]:
         try:
-            from app.agent.utils.grounding import check_grounding
+            from utils.grounding import check_grounding
         except ImportError:
             try:
                 from utils.grounding import check_grounding

@@ -14,7 +14,7 @@ from flask import Blueprint
 
 # Import flask_app's working blueprint, register it to a throwaway app so
 # its view_functions dict is populated, then copy every route under /api/agent.
-from app.agent.flask_app import agent_v2_bp as _src_bp
+from flask_app import agent_v2_bp as _src_bp
 from flask import Flask as _Flask
 
 _temp = _Flask(__name__)

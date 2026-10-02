@@ -7,15 +7,15 @@ Screener Tools — Agent 选股工具。
 """
 from __future__ import annotations
 
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List, Optional
 
-from app.agent.tools.finance.screener_config import (
+from tools.finance.screener_config import (
     INDUSTRY_OPTIONS,
     CONCEPT_OPTIONS,
     MARKET_FILTER_MAP,
 )
-from app.agent.utils.md_format import _to_md
+from utils.md_format import _to_md
 
 # ══════════════════════════════════════════════════════════════
 #  东方财富 API 调用 (正本: eastmoney_search.py)

@@ -123,7 +123,7 @@ def resolve(text: str) -> Dict[str, object]:
             from domain_registry import entity_to_domain
         except ImportError:
             try:
-                from app.agent.domain_registry import entity_to_domain
+                from domain_registry import entity_to_domain
             except ImportError:
                 entity_to_domain = None       # type: ignore
         if entity_to_domain is not None:

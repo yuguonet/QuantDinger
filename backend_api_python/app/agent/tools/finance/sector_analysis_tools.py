@@ -7,10 +7,10 @@ Sector Analysis Tools — 桥接 market_cn.china_market 到 agent 工具系统�
 """
 from __future__ import annotations
 
-from app.agent.log import logger
+from log import logger
 import re
 from typing import Any, Dict, List, Literal
-from app.agent.utils.md_format import _batch_execute, _to_md
+from utils.md_format import _batch_execute, _to_md
 
 def _to_float(val, default=0.0) -> float:
     """安全转 float，处理 '-' 等异常值。"""

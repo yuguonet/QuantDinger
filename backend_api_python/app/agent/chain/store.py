@@ -899,10 +899,7 @@ BREW_CONFIDENCE_CAP = 10     # 置信缩放分母（verified 达此值后不再�
 
 def _normalize_chain_name(raw: str) -> str:
     """链名归一（双路径兼容）：剥实体码，同构链（不同标的）归同一键。"""
-    try:
-        from domain_registry import normalize_chain_name
-    except ImportError:  # pragma: no cover
-        from app.agent.domain_registry import normalize_chain_name
+    from domain_registry import normalize_chain_name
     return normalize_chain_name(raw)
 
 

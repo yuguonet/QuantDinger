@@ -39,7 +39,9 @@ def _load_web_search_module():
         return m
     except Exception:
         pass
-    for mod_name in ("app.agent.tools.web_search_tools", "tools.web_search_tools"):
+    # agent 包统一**裸名**导入（移植性：包名不硬编码进 300+ 处 import），
+    # 长名仅作兜底，顺序不能反——先短名，命中就不会再试长名。
+    for mod_name in ("tools.web_search_tools", "app.agent.tools.web_search_tools"):
         try:
             return importlib.import_module(mod_name)
         except Exception:

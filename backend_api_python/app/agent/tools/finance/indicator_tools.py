@@ -8,7 +8,7 @@ Agent-callable tools.
 from __future__ import annotations
 
 import json
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List, Optional
 
 # ── Tool functions ────────────────────────────────────────────

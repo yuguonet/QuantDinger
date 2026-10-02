@@ -8,9 +8,9 @@ Wraps TradingExecutor and StrategyService into Agent-callable tools.
 from __future__ import annotations
 
 import json
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List, Optional
-from app.agent.utils.md_format import _to_md
+from utils.md_format import _to_md
 
 # ── 显式依赖检查 ──────────────────────────────────────────────
 try:

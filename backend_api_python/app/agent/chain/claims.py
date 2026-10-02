@@ -257,10 +257,7 @@ def _quote_of(answer: str, pattern: str, span: int = 120) -> str:
 def _extract_direction(answer: str) -> Optional[str]:
     """复用 trace_collector 的方向提取器（含否定检测/条件剥离），避免两套口径。"""
     try:
-        try:
-            from app.agent.trace_collector import TraceCollector as _TC
-        except ImportError:
-            from trace_collector import TraceCollector as _TC
+        from trace_collector import TraceCollector as _TC
         d = _TC._extract_direction_from_text(answer)
     except Exception:
         d = ""

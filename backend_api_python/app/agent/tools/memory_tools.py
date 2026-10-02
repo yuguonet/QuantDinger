@@ -15,10 +15,7 @@ _MEMORY_NS = "long_term_memory"
 
 
 def _get_memory():
-    try:
-        from app.agent.agent import memory as _m
-    except ImportError:
-        from agent import memory as _m
+    from agent import memory as _m
     return _m
 
 

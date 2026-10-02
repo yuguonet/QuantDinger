@@ -25,7 +25,7 @@ Pagination & Cache — 对大数据量工具返回值做分页处理。
 from __future__ import annotations
 
 import hashlib
-from app.agent.log import logger
+from log import logger
 import threading
 import time
 from functools import wraps

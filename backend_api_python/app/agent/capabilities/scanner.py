@@ -36,12 +36,17 @@ from pathlib import Path
 
 
 def _bootstrap_path():
-    """独立运行时把 backend_api_python 与 app/agent 挂上 sys.path（幂等）。"""
+    """独立运行时把 backend_api_python 挂上 sys.path（幂等）。
+
+    只挂 backend_api_python（保证 `import app.*` 可用）。**不要**再挂 app/agent：
+    那会让 agent 子模块同时存在裸名与全名两份 module（两份单例/缓存），
+    并让 `import utils|log|tools|memory|chain|rag|llm|cron...` 在全进程命中
+    agent 下的同名包。包内一律用**裸名**（`from chain.store import ...`），
+    不用全名 `app.agent.*`（详见 app/agent/__init__.py 头部说明）。
+    """
     base = Path(__file__).resolve().parents[3]   # backend_api_python
-    agent_dir = Path(__file__).resolve().parents[1]  # app/agent
-    for p in (str(base), str(agent_dir)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    if str(base) not in sys.path:
+        sys.path.insert(0, str(base))
 
 
 _bootstrap_path()

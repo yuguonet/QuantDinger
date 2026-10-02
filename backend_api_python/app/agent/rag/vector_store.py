@@ -30,7 +30,7 @@ class QdrantVectorStore(VectorStoreBase):
     Qdrant 向量存储
 
     使用示例：
-        from rag.embeddings import DashScopeEmbedding
+        from app.agent.rag.embeddings import DashScopeEmbedding
         embedding = DashScopeEmbedding(api_key="sk-xxx")
         store = QdrantVectorStore(
             collection_name="my_knowledge",

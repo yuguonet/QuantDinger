@@ -311,7 +311,7 @@ class TraceCollector:
         """将组装好的 EvalNode 树写入 SQL。调用方在确认成功后调用。"""
         if not self._root:
             return None
-        from app.agent.chain import store
+        from chain import store
         execution_id = store.save_tree(self._root)
         self._root.id = execution_id
         return execution_id

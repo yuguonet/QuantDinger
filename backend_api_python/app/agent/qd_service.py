@@ -19,12 +19,12 @@ import re
 import threading
 from typing import Any, Optional
 
-import mimo_boot  # noqa: F401  # 统一依赖引导（先于一切 mimoagent import）
+import mimo_boot
 
 from mimoagent.environments import get_environment
 
 try:
-    from app.agent.qd_agent import (  # noqa: F401  兼容 re-export（message_queue 旧名）
+    from qd_agent import (  # noqa: F401  兼容 re-export（message_queue 旧名）
         QDAgent, QDAgentConfig,
         bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now,
     )
@@ -101,7 +101,7 @@ def _skill_score(desc_l: str, keys, msg_l: str, has_entity: bool) -> int:
 def _skill_weight(name: str) -> float:
     """技能历史权重（tie-break 用；无记录 = 1.0 中性）。"""
     try:
-        from app.agent.chain.weight_hints import weight_of
+        from chain.weight_hints import weight_of
     except ImportError:
         try:
             from chain.weight_hints import weight_of
@@ -180,10 +180,7 @@ class QDAgentService:
         # 实体解析结果（2026-10-01）：标的/领域/时间口径进上下文。
         # 澄清（clarify）不在这里处理——它在 _run_sync 里**短路反问**，不进执行。
         if resolve_info and resolve_info.get("ran"):
-            try:
-                from app.agent.resolvers.bridge import context_block
-            except ImportError:
-                from resolvers.bridge import context_block
+            from resolvers.bridge import context_block
             _rb = context_block(resolve_info)
             if _rb:
                 parts.append(_rb)
@@ -292,7 +289,7 @@ class QDAgentService:
         # 代价不对称——猜错标的/猜错时间窗 ⇒ 整份结论作废甚至据此下单；反问只花一轮。
         resolve_info: Optional[dict] = None
         try:
-            from app.agent.resolvers.bridge import resolve as _resolve, clarify_enabled
+            from resolvers.bridge import resolve as _resolve, clarify_enabled
         except ImportError:
             try:
                 from resolvers.bridge import resolve as _resolve, clarify_enabled
@@ -308,7 +305,7 @@ class QDAgentService:
                 logger.info("[resolver] 澄清反问（不进执行）: %s",
                             str(resolve_info["clarify"])[:80])
                 try:
-                    from app.agent.resolvers.bridge import context_block
+                    from resolvers.bridge import context_block
                     _cb = context_block(resolve_info)
                 except Exception:
                     _cb = ""

@@ -22,8 +22,13 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve()
 _AGENT_DIR = _HERE.parent.parent            # scripts/ → agent/
-if str(_AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(_AGENT_DIR))
+_BACKEND_ROOT = _AGENT_DIR.parent.parent    # backend_api_python
+# 只插 backend_api_python（让 `import app.*` 可用）；不插 app/agent/，
+# 否则 agent 子模块会同时存在裸名与全名两份 module（两份单例/缓存）。
+# 顺序不能反：_AGENT_DIR 必须比 _BACKEND_ROOT/app 更靠前（agent 包内一律用裸名）
+for _p in (str(_BACKEND_ROOT), str(_AGENT_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from utils.budget import empty_panel, PANEL_KEYS, render_panel  # noqa: E402
 

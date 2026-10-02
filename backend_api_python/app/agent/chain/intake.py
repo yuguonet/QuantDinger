@@ -29,11 +29,11 @@ def _policy() -> Dict[str, Dict[str, Any]]:
     if _POLICY_CACHE["policy"] and now - float(_POLICY_CACHE["ts"] or 0) < _POLICY_TTL:
         return _POLICY_CACHE["policy"]
     try:
-        from app.agent.chain.account_store import load_domain_policy
+        from chain.account_store import load_domain_policy
         pol = load_domain_policy()
     except Exception as e:
         logger.debug("[Intake] 读域策略失败，用内置默认: %s", e)
-        from app.agent.chain.claims import DOMAIN_POLICY
+        from chain.claims import DOMAIN_POLICY
         pol = dict(DOMAIN_POLICY)
     _POLICY_CACHE["policy"] = pol
     _POLICY_CACHE["ts"] = now
@@ -54,8 +54,8 @@ def record_decision(*, user_query: str, answer: str, session_id: str = "",
     out: Dict[str, Any] = {"tracked": False, "reason": "", "domain": "",
                            "decision_id": None, "claim_ids": [], "elapsed_ms": 0.0}
     try:
-        from app.agent.chain import claims as _claims
-        from app.agent.chain import account_store as _as
+        from chain import claims as _claims
+        from chain import account_store as _as
         pol = _policy()
         domain = _claims.classify_domain(user_query, answer)
         out["domain"] = domain

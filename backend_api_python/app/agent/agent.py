@@ -291,10 +291,7 @@ logger.info(
 # 目的：把"KEY 缺失 ⇒ 工具调不通"这件事在**启动期**说清楚并写进工具地图，
 # 而不是让模型在会话中撞墙后再瞎答（web_search 全引擎无 KEY 时，模型曾因
 # "prompt 要求必须联网检索"而被逼出编造结论的行为）。
-try:
-    from app.agent.tools.availability import probe_tools
-except ImportError:
-    from tools.availability import probe_tools
+from tools.availability import probe_tools
 
 TOOL_AVAILABILITY = probe_tools()
 for _name, _d in sorted(TOOL_AVAILABILITY.items()):
@@ -309,10 +306,7 @@ for _name, _d in sorted(TOOL_AVAILABILITY.items()):
 # 懒加载：实测冷路径 3.1s（import 76 个工具模块 + 能力层注册）压在**首条用户消息**
 # 上——用户等的是这一条，不是启动日志。此处在装配期跑一次 `warmup_tool_face()`，
 # 复刻旧系统「启动时筛一次、消息路径不扫」；预热失败不阻断（fail-open，退化回懒加载）。
-try:
-    from app.agent.qd_agent import warmup_tool_face as _warmup_tool_face
-except ImportError:  # cli 直跑：app/agent 在 sys.path
-    from qd_agent import warmup_tool_face as _warmup_tool_face
+from qd_agent import warmup_tool_face as _warmup_tool_face
 _WARMUP = _warmup_tool_face()
 if not _WARMUP.get("done"):
     logging.getLogger(__name__).warning(
@@ -368,11 +362,13 @@ def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> 
 
 # ---------- 盘后回溯评估 Worker ----------
 try:
-    # 2026-09-14：统一用全路径——此前 `chain.evaluator` 与 `app.agent.chain.evaluator`
-    # 是**两个模块实例**（sys.path 双路径导入的又一坑，同 L10 的 tools.staging/infra.staging），
+    # 2026-09-14：worker 只能有一个——此前 `chain.evaluator` 与 `app.agent.chain.evaluator`
+    # 是**两个模块实例**（sys.path 双路径导入 + 裸名/全名混用），
     # 各自的 `_eval_thread` 互不可见 ⇒ `is_alive()` 防重入失效 ⇒ 同进程双 worker、
     # 日志双份、每次盘后评估跑两遍。
-    from app.agent.chain.evaluator import start_eval_worker
+    # 2026-10-02：根治办法是**只保留一种导入口径**（现统一裸名），不是"选哪个名字"——
+    # 只要两种写法并存，换哪个名字都会再长出第二份。护栏：qd_smoke.py::test_29。
+    from chain.evaluator import start_eval_worker
     start_eval_worker()
     logger.info("盘后回溯评估 worker 已启动")
 except Exception as e:

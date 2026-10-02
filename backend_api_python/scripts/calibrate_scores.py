@@ -19,7 +19,7 @@ from pathlib import Path
 # 让脚本可独立运行（backend_api_python 作为根）
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.agent.utils.calibration import fit_score_map  # noqa: E402
+from utils.calibration import fit_score_map  # noqa: E402
 
 DEFAULT_SKILLS = ["technical_analysis", "bull_bear_research"]
 

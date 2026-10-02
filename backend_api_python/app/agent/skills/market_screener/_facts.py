@@ -25,7 +25,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from app.agent.log import logger
+from log import logger
 
 from .common import (
     call_tool, fetch_kline, _today_str,
@@ -120,13 +120,13 @@ def market_state() -> Dict[str, Any]:
     # （get_fund_flow scope=market，键 main_net，单位元），失败如实记 0。
     net_inflow = 0
     try:
-        from app.agent.tools.finance.fund_flow_tools import get_fund_flow
+        from tools.finance.fund_flow_tools import get_fund_flow
         ff = get_fund_flow(scope="market")
         if isinstance(ff, dict) and not ff.get("error"):
             net_inflow = float(ff.get("main_net") or ff.get("total_main_net") or 0)
     except Exception as e:
         try:
-            from app.agent.log import logger
+            from log import logger
             logger.warning("[MktScreen] 大盘资金流获取失败: %s", e)
         except Exception:
             pass
@@ -650,7 +650,7 @@ def candidate_pool(
     # ── 批量回填实时行情（事实补全，不是筛选）──
     if fill_quote and pool:
         try:
-            from app.agent.tools.finance.data_tools import get_realtime_quote
+            from tools.finance.data_tools import get_realtime_quote
             raw = get_realtime_quote(",".join(list(pool.keys())[:200])) or {}
             quotes = {}
             if isinstance(raw, dict):

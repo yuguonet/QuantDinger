@@ -158,7 +158,7 @@ def create_cron_job(
 
     # F6 调度滥用防线：表达式校验 + 最短间隔 + 任务数上限
     try:
-        from app.agent.cron import guards as _cguard
+        from cron import guards as _cguard
     except Exception:
         _cguard = None
     if _cguard is not None and cron_expr:
@@ -195,14 +195,14 @@ def create_cron_job(
 
         # 注册到 Worker
         try:
-            from app.agent.cron.cron_worker import schedule_job_from_db
+            from cron.cron_worker import schedule_job_from_db
             schedule_job_from_db(job_id)
         except Exception as e:
             logger.warning("[CronTools] 调度注册失败: %s", e)
 
         # 计算下次执行时间（用于返回给用户）
         try:
-            from app.agent.cron.cron_worker import next_cron_time
+            from cron.cron_worker import next_cron_time
             nxt = next_cron_time(cron_expr, datetime.now(TZ_CN))
             next_run = nxt.strftime("%Y-%m-%d %H:%M")
         except Exception:
@@ -298,7 +298,7 @@ def remove_cron_job(job_id: int) -> Dict:
 
         # 取消 Worker Timer
         try:
-            from app.agent.cron.cron_worker import unschedule_job
+            from cron.cron_worker import unschedule_job
             unschedule_job(job_id)
         except Exception as e:
             logger.warning("[CronTools] 取消调度失败: %s", e)
@@ -337,7 +337,7 @@ def toggle_cron_job(job_id: int, enabled: bool) -> Dict:
 
         # 更新 Worker 调度
         try:
-            from app.agent.cron.cron_worker import schedule_job_from_db, unschedule_job
+            from cron.cron_worker import schedule_job_from_db, unschedule_job
             if enabled:
                 schedule_job_from_db(job_id)
             else:

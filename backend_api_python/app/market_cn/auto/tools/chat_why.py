@@ -167,7 +167,7 @@ class LLMClient:
         self.temperature = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.2"))
         self._llm = None
         try:
-            from app.agent.llm import create_llm
+            from llm import create_llm
             self._llm = create_llm({
                 "provider": os.getenv("LLM_PROVIDER", "openai"),
                 "model": self.model,
@@ -187,7 +187,7 @@ class LLMClient:
 
     def _chat_via_factory(self, messages: list) -> str:
         import asyncio
-        from app.agent.llm import ChatMessage
+        from llm import ChatMessage
         cms = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]
         try:
             resp = asyncio.get_event_loop().run_until_complete(

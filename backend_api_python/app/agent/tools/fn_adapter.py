@@ -21,7 +21,7 @@ import inspect
 from typing import Any, Callable
 
 try:  # 生产运行时（backend_api_python 为根）
-    from app.agent.tools.base import ToolResult, func_to_openai_schema
+    from tools.base import ToolResult, func_to_openai_schema
 except ImportError:  # app/agent 直接在 sys.path 时（cli/测试路径）
     from tools.base import ToolResult, func_to_openai_schema
 

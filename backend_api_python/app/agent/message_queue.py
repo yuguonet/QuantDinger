@@ -6,7 +6,7 @@ Flask 和 Cron 共用同一个队列 + worker 线程池，
 所有消息走同一条链路: submit → queue → worker → agent.chat。
 
 用法：
-    from message_queue import submit, init_workers
+    from app.agent.message_queue import submit, init_workers
     init_workers(4)
     future = submit("提醒我上网", session_id="default")
     result = future.result(timeout=300)  # 阻塞等待
@@ -185,7 +185,7 @@ def _worker_loop():
                     # _user_step_callbacks / _INTERRUPT_CHECKS 均“赋值 + finally 恢复”，
                     # 多 worker 并发互踩（A 收尾抹掉 B 的注册 / 陈旧探针串会话误杀，审计 B1）。
                     # 现按 session 注册到 task_agent 会话钩子表 + 线程局部绑定当前 run。
-                    import qd_agent as _ta_mod  # 会话钩子表（API 与旧 task_agent 同名）
+                    import qd_agent as _ta_mod
                     _sid = str(task["session_id"])
                     _ta_mod.bind_run_session(_sid)
 

@@ -8,13 +8,13 @@ from typing import Any, Dict, List
 # _calc_rsi / _calc_boll / _calc_kdj / logger / get_realtime_quote），导致这些函数
 # 一旦被调用即 NameError（被内层 except 吞掉后只返回 {"error": ...}，静默退化）。
 # 按项目"复用优于重定义"约定改为导入单一实现，不在此复制第三份。
-from app.agent.log import logger
-from app.agent.tools.finance._analysis_utils import _fetch_ohlcv, _safe_round
-from app.agent.tools.finance.analysis_tools import (
+from log import logger
+from tools.finance._analysis_utils import _fetch_ohlcv, _safe_round
+from tools.finance.analysis_tools import (
     _calc_boll, _calc_kdj, _calc_macd, _calc_rsi,
 )
-from app.agent.tools.finance.data_tools import get_realtime_quote
-from app.agent.tools.finance.news_search_tools import search_stock_intel, search_policy_intel
+from tools.finance.data_tools import get_realtime_quote
+from tools.finance.news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
@@ -658,7 +658,7 @@ def _analyze_pattern(codes: str) -> Dict[str, Any]:
 
 def _get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
     """筹码分布分析 — 委托给 chip_distribution.get_chip_distribution。"""
-    from app.agent.tools.finance.chip_distribution import get_chip_distribution
+    from tools.finance.chip_distribution import get_chip_distribution
     return get_chip_distribution(codes, lookback_days=lookback_days)
 
 def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:

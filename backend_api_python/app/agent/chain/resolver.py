@@ -72,7 +72,7 @@ def fetch_actual(subject: str, subject_kind: str, horizon: str,
     if kind not in ("stock", "index", "symbol"):
         return None
     try:
-        from app.agent.chain.evaluator import _get_actual_return
+        from chain.evaluator import _get_actual_return
         hold = _horizon_days(horizon)
         r = _get_actual_return(subject, exec_date or date.today(), hold,
                                with_extremes=True)
@@ -217,8 +217,8 @@ def judge_one(claim: Dict[str, Any], actual: Dict[str, Any],
               dev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """请 LLM 判一条（返回 None 表示 judge 不可用 ⇒ 调用方回退代码锚点）。"""
     try:
-        from app.agent.llm.factory import create_llm
-        from app.agent.llm.base import ChatMessage
+        from llm.factory import create_llm
+        from llm.base import ChatMessage
         import asyncio
         payload = {
             "claim_type": claim.get("claim_type"),
@@ -283,7 +283,7 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
             #   claim 才说明规则有缺口。详情见 chain/judge_stats.py 的阈值表与
             #   "人工校准四步"（当前 human_verdict 列无写入路径，就是留给那一步的）。
             try:
-                from app.agent.chain import judge_stats as _js
+                from chain import judge_stats as _js
                 _js.record_call()
                 _js.record_result(
                     ok=True,
@@ -295,7 +295,7 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
             kind, model, raw, sampled = "llm_judge", j.get("model", ""), j.get("raw", ""), True
         else:
             try:
-                from app.agent.chain import judge_stats as _js
+                from chain import judge_stats as _js
                 _js.record_call()
                 _js.record_result(ok=False)
             except Exception:
@@ -320,7 +320,7 @@ def resolve_claim(claim: Dict[str, Any], exec_date: Optional[date] = None,
                   use_judge: Optional[bool] = None,
                   policy: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """判定单条 claim（含写库）。域由配置驱动分派。"""
-    from app.agent.chain import account_store as _as
+    from chain import account_store as _as
     pol = policy or _as.load_domain_policy()
     dom = claim.get("domain") or "finance"
     cfg = pol.get(dom) or {}
@@ -358,7 +358,7 @@ def resolve_claim(claim: Dict[str, Any], exec_date: Optional[date] = None,
 
 def resolve_due_claims(limit: int = 50, use_judge: Optional[bool] = None) -> Dict[str, Any]:
     """扫到期 claim 并判定（evaluator 的盘后任务会调这里）。"""
-    from app.agent.chain import account_store as _as
+    from chain import account_store as _as
     items = _as.query_due_claims(limit=limit)
     stats: Dict[str, Any] = {"due": len(items), "resolved": 0, "undecidable": 0,
                              "skipped": 0, "errors": 0, "judged": 0, "details": []}

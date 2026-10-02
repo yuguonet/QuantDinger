@@ -20,7 +20,7 @@ market_screener/_helpers.py — 事实与证据层（不做选股决策）
 from datetime import date, datetime, time
 from concurrent.futures import ThreadPoolExecutor
 
-from app.agent.log import logger
+from log import logger
 from typing import Any, Dict, List, Optional
 
 # 证据卡默认上限：候选池可达数百只，全量画像会撑爆上下文（trim 优先保证「有证据」而非「全」）
@@ -50,7 +50,7 @@ def resolve_names(code_list: List[str]) -> Dict[str, str]:
     if not code_list:
         return {}
     try:
-        from app.agent.tools.finance.data_tools import get_realtime_quote
+        from tools.finance.data_tools import get_realtime_quote
         q = get_realtime_quote(",".join(code_list))
         name_map = {}
         if isinstance(q, dict):

@@ -6,8 +6,31 @@ import sys as _sys
 
 # Make app/nanobot/ shadow any pip-installed nanobot-ai package,
 # so local patches are always used without touching import paths.
-_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__))))
-_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "agent"))
+#
+# agent 包子模块一律用**裸名**导入（`from chain.store import ...`），所以必须把
+# `app/agent/` 也放进 sys.path；路径全部由 `__file__` 相对算出，目录搬家零改动。
+# 详见 app/agent/__init__.py 头部说明。
+#
+# ⚠ 顺序不能反：先插 `app/` 再插 `app/agent/`，后者才会压在前者之上，
+# 否则 `import utils` 会命中 `app/utils` 而不是 `app/agent/utils`。
+# ⚠ 事故 M-1：曾经两处都插、但代码里裸名与全名混用，同一份源码被加载成两个
+# module 对象（裸名 `agent` 与全名 `app.agent.agent` 并存），模块级单例
+# （agent 实例 / _sessions / TraceCollector 收集器 / 各类缓存）全部双份且状态
+# 互不可见。根治办法是**只保留一种写法**（现统一裸名）+ 护栏
+# `qd_smoke.py::test_29_module_single_instance`，不要再混用。
+# 幂等保序（不是简单 insert(0)）：先把 `app/` 去重补上，再把 `app/agent/`
+# 去重后**插到 app/ 首次出现之前**。这样即便此刻 sys.path 里已经是
+# 「app/ 在 app/agent/ 之前」的错序（例如别的入口刚把 app/ 顶到最前），
+# 也会在这里被纠正回来；`import utils` 才不会命中 app/utils。
+# （不能改写成 `import app.agent` 去复用它的 ensure_path_order：那会让
+#   app.agent 包与裸名 agent.py 并存，正是上面 M-1 事故的形态。）
+_app_dir = _os.path.dirname(_os.path.abspath(__file__))
+_agent_dir = _os.path.join(_app_dir, "agent")
+if _app_dir not in _sys.path:
+    _sys.path.insert(0, _app_dir)
+while _agent_dir in _sys.path:
+    _sys.path.remove(_agent_dir)
+_sys.path.insert(_sys.path.index(_app_dir), _agent_dir)
 
 import math
 import logging
@@ -398,7 +421,7 @@ def create_app(config_name='default'):
             logger.warning(f"Reflection worker not started: {e}")
         # ── Cron Worker（定时任务调度）──
         try:
-            from app.agent.cron_worker import start_cron_worker
+            from cron_worker import start_cron_worker
             start_cron_worker()
             logger.info("[CronWorker] 定时任务调度器已启动")
         except Exception as e:
@@ -406,7 +429,7 @@ def create_app(config_name='default'):
 
         # ── 统一消息队列 Worker 线程池 ─────────────────────
         try:
-            from app.agent.message_queue import init_workers
+            from message_queue import init_workers
             init_workers(4)
             logger.info("[MQ] 统一消息队列 worker 已启动")
         except Exception as e:
@@ -437,7 +460,7 @@ def create_app(config_name='default'):
         # ── Agent 盘后回溯评估 worker（T+N 验证 → 权重迭代）──
         # 盘后自动运行，按 timeframe 取实际行情验证决策准确性
         try:
-            from app.agent.chain.evaluator import start_eval_worker
+            from chain.evaluator import start_eval_worker
             start_eval_worker()
             logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
         except Exception as e:
