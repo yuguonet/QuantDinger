@@ -143,6 +143,83 @@ from app.market_cn.auto.core.data.hub import all_codes, stock_info as _stock_inf
 from app.market_cn.auto.core.data.kline import fetch_kline_db  # noqa: E402,F401
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 全市场取数加速 (2026-10-05)
+#
+# ★ 这是生产扫描**最大的一笔**开销, 定位证据见 tmp/_hotspot04~06.py:
+#     逐票 fetch_kline_db × 5236  = 26.5ms/票 ⇒ 139s  (85% 墙钟)
+#     批量 fetch_klines_batch     =  3.0ms/票 ⇒  16s  (8.7x)
+#
+# ⚠ 等价性 (为什么不传 as_of): `fetch_kline_db(code, days)` 的窗口锚是 **now**,
+#   批量若传 `as_of=target` 则窗口锚变 target ⇒ 左缘早 (now-target) 天 ⇒ 比逐票版
+#   多出开头几根 (实测 320 → 323 根)。虽然实证对判定 **0 影响** (447 组逐字段一致),
+#   但**不传 as_of** 可让两者同窗口, 等价性是"构造性成立"而非"依赖实测"。
+#   截 target 仍走调用方原有的 `bars[-1] > target` 分支 ⇒ 与旧路径逐行一致。
+#
+# 开关: `QD_SCAN_BATCH=0` 可整段关闭 (回落逐票), 用于线上快速回滚。
+# ══════════════════════════════════════════════════════════════════════
+
+def _prefetch_bars(codes, days, logger=None):
+    """全市场日线**批量**预取 → {code: bars}; 关闭/失败返回 {} (调用方回落逐票)。"""
+    if str(os.getenv("QD_SCAN_BATCH", "1")).strip() == "0":
+        return {}
+    if not codes:
+        return {}
+    try:
+        from app.market_cn.auto.core.data.kline import fetch_klines_batch
+        t0 = time.time()
+        got = fetch_klines_batch(list(codes), days=days, as_of=None) or {}
+        if logger:
+            logger.info("[prefetch] 批量取数 %d/%d 票 (days=%d, %.1fs)",
+                        len(got), len(codes), days, time.time() - t0)
+        return got
+    except Exception as e:                      # 取数降级不能拖垮扫描: 回落逐票
+        if logger:
+            logger.warning("[prefetch] 批量取数失败(%s) → 回落逐票", e)
+        return {}
+
+
+def _prewarm_pools(active, bars_by_code, target, logger=None):
+    """给**声明了** prewarm 的策略一次建好横截面池 (声明制: 不硬编码策略 key)。
+
+    不做这件事的代价 (实测): g56.scan_signals 内部 `_ensure_pool_daily(pool_target)`
+    **不传 bars_batch** ⇒ 走逐票 `hub.daily(code, 200, as_of=)` 全市场 ⇒
+    **5224 次单票 SQL / 25.9s**, 而批量路径只需 3.9s 计算 (取数已被 _prefetch_bars 覆盖)。
+
+    ⚠ 锚必须对齐: g56 用 `str(bars[-1]["time"])[:10]` 当池锚, 而进入判定的票末根
+     恒 == target (早于 target 的已被 `continue` 跳过, 晚于的已截断) ⇒ 这里用 target
+     预热即可命中; 若预热锚与判定锚不同 ⇒ 单槽缓存失效 ⇒ 全市场池被反复重建。
+    """
+    if not bars_by_code:
+        return
+    try:
+        from app.market_cn.auto.core.data.kline import window_start
+    except Exception:
+        return
+    lo = str(window_start(200, target))[:10]
+    hi = str(target)[:10]
+    pool_bars = {}
+    for c, bs in bars_by_code.items():
+        sl = [b for b in bs if lo <= str(b["time"])[:10] <= hi]
+        if sl:
+            pool_bars[c] = sl
+    if not pool_bars:
+        return
+    for key, strat in active.items():
+        pw = getattr(strat, "prewarm", None)
+        if pw is None:
+            continue
+        try:
+            t0 = time.time()
+            pw(pool_bars, hi)
+            if logger:
+                logger.info("[prewarm] %s 横截面池 %d 票 (%.1fs)",
+                            key, len(pool_bars), time.time() - t0)
+        except Exception as e:                  # 预热失败不应阻断扫描
+            if logger:
+                logger.warning("[prewarm] %s 失败(%s) → 池改由逐票路径自建", key, e)
+
+
 # ================================================================
 # 展示归一 (2026-09-11): 同族版本链去重, 高版本优先
 # 背景: break_v2 ⊆ break 严格子集, 并行扫描同 (code, style) 双版本重复落库,
@@ -387,11 +464,18 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
         logger.warning("[dragon_scan] stock_basic_info 加载失败(%s), 换手/市值过滤降级", e)
         stock_info = {}
 
+    # 批量预取 + 横截面池预热 (2026-10-05): 逐票取数 5236 次 SQL ⇒ 少数几次往返;
+    # g56 池改由批量结果切片建, 不再逐票 hub.daily 全市场。两者失败都自动回落原路径。
+    bars_by_code = _prefetch_bars(codes, days, logger)
+    _prewarm_pools(active, bars_by_code, target, logger)
+
     rows = []
     t0 = time.time()
     try:
         for i, code in enumerate(codes):
-            bars = fetch_kline_db(code, days)
+            bars = bars_by_code.get(code)
+            if bars is None:                    # 批量未覆盖 (新股/停牌/取数缺失) → 逐票兜底
+                bars = fetch_kline_db(code, days)
             if not bars or len(bars) < 30:
                 continue
             # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
@@ -597,11 +681,15 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
             logger.info("[knife_scan] %s 便宜预筛: %d/%d%s (mkt=%.2f%%)",
                         key, len(shortlist), len(snaps),
                         " [预览]" if preview_cycle else "", mkt)
+            # 批量预取本批短名单日线 (盘中延迟敏感: 原逐票 = N 次串行往返)
+            bars60 = _prefetch_bars(list(shortlist.keys()), 60, logger)
             for code, snap in shortlist.items():
                 if not _st_ok(code):
                     continue
                 name = (stock_info.get(code) or {}).get("name", "")
-                bars = fetch_kline_db(code, days=60)
+                bars = bars60.get(code)
+                if bars is None:
+                    bars = fetch_kline_db(code, days=60)
                 series = fetch_day_snapshots([code]).get(code) or []
                 try:
                     sigs = strat.scan_signals(bars, code, ctx={

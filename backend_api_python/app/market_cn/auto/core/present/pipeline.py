@@ -64,6 +64,8 @@ from app.market_cn.auto.core.runtime.functions import (
 # 手动独立运行 (诊断/基准) 时加载 .env —— 应用内运行由 app 初始化加载, 幂等无害。
 # 路径锚点走 core/_paths (不再数 __file__ 层级: 目录一挪就静默读不到 .env)。
 from app.market_cn.auto.core._paths import STRATEGY_DIR, load_env_first_found
+# 断点续传搬运层 (2026-10-05 接线): 无感 —— 不 import 任何指标实现
+from app.market_cn.auto.core.present.resume_io import build_book, collect_points, fetch
 
 load_env_first_found(os.path.join(os.getcwd(), ".env"))
 
@@ -222,99 +224,18 @@ def audit_needs_d0(spec: StrategySpec) -> List[Dict[str, Any]]:
 # 声明方式: 策略 YAML 的 `meta.ext: <name>`; 实现注册在下面 (名字 → 提供者)。
 # 新策略加一条 register_ext, 不必改管线 —— 跨策略共用同一 build_ext 入口。
 # ================================================================
-EXT_PROVIDERS: Dict[str, Any] = {}
-EXT_MIN_N: Dict[str, int] = {}
+# ── 注册表本体已迁到 present/ext_registry.py (B1, 2026-10-05) ──
+# 这里 re-export 是为了保持 `pipeline.register_ext` / `EXT_PROVIDERS` 的对外契约
+# 不变 (present/__init__.py 与其它历史调用方都从这里取)。
+from app.market_cn.auto.core.present.ext_registry import (  # noqa: F401
+    EXT_MIN_N, EXT_PROVIDERS, register_ext)
 
 
-def register_ext(name: str, min_n: int = 1):
-    """注册编排层 ext 提供者: fn(spec, code, bars, asof_date, cache) -> dict。
-
-    min_n: 该 ext 要求的最短日线根数 (如 g56 的 G1 特征需 len>=35, 因 calc_macd
-      短序列返回 None)。**声明在提供者处而非调用点** —— 管线统一用
-      `required_min_len(spec)` 施加, 新策略/新调用方零改动即受保护。
-    cache: 共享 BarsCache (可空) —— 供提供者复用长窗口缓存派生短窗口量 (如 g56 池),
-      避免二次全市场加载; 提供者必须容忍 cache=None (退化为自取数)。
-    """
-    def _deco(fn):
-        EXT_PROVIDERS[name] = fn
-        EXT_MIN_N[name] = int(min_n)
-        return fn
-    return _deco
-
-
-# g56 横截面池日线的**单槽缓存** (键=交易日)。池统计按交易日是常量, 一次运行只服务一个
-# target; 单槽避免为每个历史日各留一份全市场日线 (内存)。窗口固定 200 根, 必须与 g56
-# 内部 hub.daily 口径一致。
-_G56_POOL_DAYS = 200
-_G56_POOL_BARS: Dict[str, Any] = {"date": None, "bars": None}
-
-
-def _g56_pool_batch(pool_target: Optional[str],
-                    cache: Optional["BarsCache"] = None
-                    ) -> Optional[Dict[str, List[Dict[str, Any]]]]:
-    """g56 池日线 (键=code) —— 窗口 200 根 + as_of=pool_target。
-
-    必须与 `g56._ensure_pool_daily` 内部 `hub.daily(code, 200, as_of=pool_target)` 完全
-    同口径 (同窗口/同复权/同截断), 否则横截面统计漂移 → 门判定不再等价 (逐笔等价前提)。
-
-    取数优先级:
-      ① 从**共享 BarsCache 切片** (days=300 缓存按 window_start(200, pool_target) 切) ——
-         因为 `fetch_kline_db(code,200,as_of=T)` 的定义就是同锚 300 窗口的下界切片,
-         二者逐行一致, 却省掉池的第二次全市场加载 (展示管线夜间的主要超支源);
-      ② 缓存窗口不覆盖切片 (未预热 / asof 过旧或过新) → 独立批量加载一次。
-
-    易错点 (A9, 2026-09-28): 切片锚与覆盖判据**必须用 pool_target**, 不能锚 now ——
-    原实现 lo=window_start(200) 锚在 now, pool_target 为历史日 (verify_split / 逐日
-    replay) 时窗口错位截短 → 池统计漂移 → g56 regime 门静默全 False (零信号)。
-    切片等价的前提是缓存窗口 [window_start(cache.days, asof), asof] 完整包含
-    [window_start(200, pool_target), pool_target]: 右缘 = asof >= pool_target,
-    左缘 = window_start(cache.days, asof) <= window_start(200, pool_target)
-    (即 asof 距 pool_target 不超过 (cache.days-200)*1.5 自然日, 勿写死数值, 用
-    window_start 比较保持口径同源)。未覆盖或切片意外全空都走 ② 权威取数。
-    """
-    if not pool_target:
-        return None
-    if _G56_POOL_BARS["date"] == pool_target:
-        return _G56_POOL_BARS["bars"]
-    from app.market_cn.auto.core.data.kline import (
-        all_codes as _all_codes, fetch_klines_batch, window_start,
-    )
-    codes = [c for c in _all_codes() if not c.startswith(("8", "4", "92"))]
-    lo = window_start(_G56_POOL_DAYS, pool_target)      # A9: 锚=pool_target (原错锚 now)
-    bars = None
-    # 右缘: cache.asof 为 None 表示无截断 (行集到今天, pool_target 恒 <= 今天) → 视为过
-    # 左缘: 缓存窗口下界须不晚于切片下界, 否则切片左端截短 (历史 replay 时必不覆盖)
-    if cache is not None and (not cache.asof or cache.asof >= pool_target) \
-            and window_start(cache.days, cache.asof) <= lo:
-        cache.warm(codes)                     # 保证全市场在共享缓存内 (池口径完整)
-        bars = {}
-        for c in codes:
-            bs = cache.get(c)
-            if not bs:
-                continue
-            sl = [b for b in bs if lo <= b["time"] <= pool_target]
-            if sl:
-                bars[c] = sl
-    if not bars:   # None(未走切片) 或 {}(切片意外全空) 都走权威取数, 不信任残缺结果
-        bars = fetch_klines_batch(codes, days=_G56_POOL_DAYS, as_of=pool_target)
-    _G56_POOL_BARS["date"], _G56_POOL_BARS["bars"] = pool_target, bars
-    return bars
-
-
-@register_ext("g56", min_n=35)
-def _ext_g56(spec: StrategySpec, code: str, bars: List[Dict[str, Any]],
-             asof_date: Optional[str],
-             cache: Optional["BarsCache"] = None) -> Dict[str, Any]:
-    """g56: 每股 G1 特征数组 + 当日横截面池 (逐字镜像 strategies/g56.py 的 day_flow 编排 ext)。
-
-    硬要求 len(bars) >= 35 (g56._g1_arrays 依赖 calc_macd, 短序列返 None) —— 已由
-    `required_min_len("g56")` 在管线侧保证; 语义上的暖机要求 (>=68) 由 g1_warmup 门
-    用 NaN 哨兵自然过滤。
-    """
-    from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
-    d = asof_date or (str(bars[-1]["time"])[:10] if bars else None)
-    return {"g56_feats": _g1_arrays(bars),
-            "g56_pool": _ensure_pool_daily(d, bars_batch=_g56_pool_batch(d, cache))}
+# ── g56 的编排层 ext 已迁到 present/ext_g56.py (B1, 2026-10-05) ──
+# ⚠️ **不是未使用的导入**: register_ext 是副作用式注册, 不 import 这个模块
+#    ⇒ 注册表里没有 'g56' ⇒ build_ext 抛 KeyError 而不是 ImportError (更隐蔽)。
+#    新策略加 ext: 照抄一份 present/ext_<策略>.py, 在这里加一行 import。
+from app.market_cn.auto.core.present import ext_g56  # noqa: F401
 
 
 def required_min_len(spec: StrategySpec) -> int:
@@ -323,15 +244,46 @@ def required_min_len(spec: StrategySpec) -> int:
     return EXT_MIN_N.get(name, 1) if name else 1
 
 
+def _bars_identity(bars: List[Dict[str, Any]]) -> str:
+    """bars 的廉价身份: (根数, 末根日期, 末根收盘)。
+
+    ★★ 必须进 `build_ext` 的缓存键 (2026-10-05 B7)。原因:
+      同一个 (code, ext名@日期) 可能被**不同内容**的 bars 调用 —— 典型是
+      `verify_split` 里 `off == 0` 策略的夜侧 bars:
+          n_bars = bars[:-1] + [placeholder_bar(bars[-1]["time"])]
+      它与全量 `bars` **根数相同、末根日期相同**, 但末根是 **close=0 的占位 bar**
+      (见 `placeholder_bar`) ⇒ ext 值根本不同。只按 (code, 名称@日期) 缓存会让两者
+      **撞同一个键**: 谁先算谁写进去, 另一个直接命中拿到错的 ext, 且**静默不报错**。
+
+      区分点: placeholder_bar 的 close/volume 恒为 0, 而真实 bars 末根 close ≠ 0
+      (唯一例外是本就停牌到 0 成交的情况, 届时两者 ext 语义也确实等价)。
+      根数一并入键, 兜住「不同长度的同一批 bars」这类更常见的分歧 (如回测切片。)。
+
+    ⚠️ 不要用 `id(bars)`: 每次调用都是新列表对象, 恒不命中, 缓存变摆设。
+    """
+    if not bars:
+        return "0|empty|0"
+    last = bars[-1]
+    return "%d|%s|%s" % (len(bars), str(last.get("time"))[:10], last.get("close"))
+
+
 def build_ext(spec: StrategySpec, code: str, bars: List[Dict[str, Any]],
               cache: Optional["BarsCache"] = None,
-              asof_date: Optional[str] = None) -> Dict[str, Any]:
+              asof_date: Optional[str] = None,
+              variant: str = "") -> Dict[str, Any]:
     """按 `meta.ext` 构造该 (策略, 股票) 的 Ctx.ext; 未声明 → {}。
 
     asof 缺省取 **bars 末根日期** —— 这正是决策日 (偏移 ≤ -1 时 = T-1; 偏移 0 时
     = 占位/合成 bar 的 T), 与回测/实盘同源。调用方**不要**传买入日: 对 g56 这类
     "D-1 判定" 策略会错取横截面池。
-    缓存键含日期, 防止夜侧(不含 D0)与盘中(含合成 D0)互相污染。
+
+    variant: 调用方**显式声明** bars 的变体 (如 "night_off0"), 进缓存键。`_bars_identity`
+             已能自动分辨绝大多数分歧; 本参数留给"内容恰好同签名但语义确实不同"的场景,
+             以及给排查留可读线索 (缓存键能直接看出这一档是谁算的)。
+
+    ── 缓存键 = (code, ext名@日期#bars身份#variant) ──────────────────────────
+    日期: 防夜侧 (不含 D0) 与盘中 (含合成 D0) 互串。
+    bars 身份: 见 `_bars_identity` —— **这一档是 B7 (2026-10-05) 补的**。
     """
     name = (spec.meta or {}).get("ext")
     if not name:
@@ -340,9 +292,10 @@ def build_ext(spec: StrategySpec, code: str, bars: List[Dict[str, Any]],
     if fn is None:
         raise KeyError(f"{spec.key}: meta.ext={name!r} 未注册 (见 present.register_ext)")
     d = asof_date or (str(bars[-1]["time"])[:10] if bars else "")
+    key = f"{name}@{d}#{_bars_identity(bars)}" + (f"#{variant}" if variant else "")
     if cache is not None:
-        # 同 (code, ext, 日期) 只算一次 —— 多策略/多轮复用同一份特征数组 (§5.3 前提②)
-        return cache.ext(code, f"{name}@{d}", lambda: fn(spec, code, bars, d, cache))
+        # 同 (code, ext, 日期, bars身份) 只算一次 —— 多策略/多轮复用同一份特征数组
+        return cache.ext(code, key, lambda: fn(spec, code, bars, d, cache))
     return fn(spec, code, bars, d, cache)
 
 
@@ -368,13 +321,25 @@ class BarsCache:
         self._ext: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.loads = 0
         self.hits = 0
+        self._ext_hits = 0
+        self._ext_miss = 0
 
     def ext(self, code: str, name: str, builder) -> Dict[str, Any]:
-        """按 (code, ext名) 记忆化派生量 —— 多策略共用一次 O(n) 特征计算。"""
+        """按 (code, ext名@日期#bars身份) 记忆化派生量 —— 多策略共用一次 O(n) 特征计算。
+
+        ★ `name` 必须自带**完整身份**: 日期 + bars 身份 + variant, 由 `build_ext`
+          拼好再传进来 (见 `_bars_identity` 的注释 —— 那里解释了为什么旧的
+          "(code, 名@日期)" 会串味)。本方法只做查表, 不重造键语义。
+        """
         k = (code, name)
         v = self._ext.get(k)
         if v is None:
+            # B6/B1#3 (2026-10-05): ext 侧命中率此前**完全无可观测性** —— 而它正是
+            # "池归预处理是否真的生效" 的唯一证据 (首拍阻塞 vs 命中)。
+            self._ext_miss += 1
             v = self._ext[k] = builder()
+        else:
+            self._ext_hits += 1
         return v
 
     def _load(self, code: str) -> List[Dict[str, Any]]:
@@ -436,7 +401,17 @@ class BarsCache:
         return bars
 
     def stats(self) -> Dict[str, Any]:
-        return {"codes": len(self._bars), "loads": self.loads, "hits": self.hits}
+        """Bars/bars ext 两侧的行踪。
+
+        B1#3 + B6 (2026-10-05): 原先只报 bars 侧, ext 侧**完全黑盒** ⇒ 无法回答
+        "g56 的横截面池到底被复用了几次、是否在每轮重算全市场 `_g1_arrays`"。
+        这两个数现在出来了: `ext_hit_rate` 低就说明有 ext 在每轮被反复重算。
+        """
+        tot = self._ext_hits + self._ext_miss
+        return {"codes": len(self._bars), "loads": self.loads, "hits": self.hits,
+                "ext_codes": len(self._ext),
+                "ext_hits": self._ext_hits, "ext_miss": self._ext_miss,
+                "ext_hit_rate": round(self._ext_hits / tot, 4) if tot else None}
 
 
 def placeholder_bar(date: str) -> Dict[str, Any]:
@@ -474,15 +449,49 @@ class StageStats:
         self.elapsed += other.elapsed
 
 
+# ================================================================
+# find_limit_ups 记忆化 (B3, 2026-10-04)
+# ================================================================
+# 背景: `find_limit_ups(bars, board_type, market_spec)` 只依赖这三个入参,
+#   而 bars 已经经 BarsCache 跨策略共享 —— 但结果没有共享。
+#   旧实现每 (策略, 股票) 重扫一遍 O(n) 逐根 is_limit_up:
+#   N 策略 × 5000 票 × 300 根, 其中 (N-1)/N 是纯重复。
+# 键含 id(market_spec) 与 id(bars): 同一 code 在不同策略下 market_spec 可能不同
+#   (core/market.py:get_board_type 的口径来自 spec.board_rules), 不能只按 code 缓存。
+# 条目持有 (bars, market_spec) 引用防 id() 复用, 命中前核对 `is`。
+# 体积上限 FIFO: 全市场扫描时上限以下不会触发, 命中收益在"同一票多策略"那段。
+# ================================================================
+_LU_CACHE: Dict[Any, Any] = {}          # (id(bars), board_type, id(spec)) -> (bars, spec, [lu])
+_LU_CACHE_CAP = 4096
+
+
+def _find_limit_ups_cached(bars, board_type, market_spec) -> List[int]:
+    key = (id(bars), board_type, id(market_spec))
+    hit = _LU_CACHE.get(key)
+    if hit is not None and hit[0] is bars and hit[1] is market_spec:
+        return hit[2]
+    got = find_limit_ups(bars, board_type, market_spec)
+    if len(_LU_CACHE) >= _LU_CACHE_CAP:
+        for stale in list(_LU_CACHE)[: _LU_CACHE_CAP // 4]:
+            _LU_CACHE.pop(stale, None)
+    _LU_CACHE[key] = (bars, market_spec, got)
+    return got
+
+
 def _candidate_lus(spec: StrategySpec, bars: List[Dict[str, Any]],
                    board_type: str, i: int) -> List[int]:
     """决策日的 lu_idx 候选 (镜像回测的当日枚举)。
 
     limit_up (dragon_callback): i 之前的每个历史涨停日都是候选 (升序)。
     day / intraday: 单候选 lu_idx=0 (门表不依赖 lu_idx)。
+
+    ⚠️ 返回的顺序是**升序**且被消费端依赖: `intraday_cycle` 的 lu_map 按此序
+    append, 再 `for h_lu in lu_map[...]` 取首个通过者 —— 与回测"升序遍历 lu_idx,
+    首个全部门通过者出信号"同源。改这里不能打乱顺序。
     """
     if str(spec.meta.get("enumeration", "limit_up")).lower() == "limit_up":
-        return [j for j in find_limit_ups(bars, board_type, spec.market_spec) if j < i]
+        return [j for j in _find_limit_ups_cached(bars, board_type, spec.market_spec)
+                if j < i]
     return [0]
 
 
@@ -497,6 +506,154 @@ def _night_bars(cache: BarsCache, code: str, off: int, buy_date: str
     return bars + [placeholder_bar(buy_date)]
 
 
+def resume_points_by_key(keys) -> Dict[str, Tuple[Any, ...]]:
+    """各策略的断点记忆点声明 —— 声明源是**策略实例**, 不是 yaml 门表。
+
+    ⚠️ 这条容易踩: `specs` 里的 StrategySpec 由 yaml 门表构造, **不带策略类属性**
+       ⇒ `collect_points(specs.values())` 恒返回空元组, 通道静默空转。
+       必须从 `strategies.get_strategy(key)` 取实例。
+    ⚠️ 未声明的策略回落**标准默认点** (Ctx 的 macd/atr/boll/kdj), 见 base.py 约定。
+    """
+    from app.market_cn.auto.core.runtime.resume import _default_points
+    try:
+        from app.market_cn.auto import strategies as strat_reg
+    except Exception:
+        strat_reg = None
+    out: Dict[str, Tuple[Any, ...]] = {}
+    for k in keys:
+        pts = tuple(getattr(strategy_object(k, strat_reg), "resume_points", None) or ())
+        out[k] = pts if pts else tuple(_default_points())
+    return out
+
+
+# ================================================================
+# 7b. 断点续传: **日线边界**语义 (2026-10-05 简化)
+# ================================================================
+#: 断点 = 「截至昨日收盘」的状态摘要; 实时侧只保留最后 `K` 根 bar (历史段由断点
+#: 代表), 递推类读数改由断点接力。
+#:
+#: ★★ **`K` 不是本模块的常量, 而是「策略声明的最大值」** (2026-10-05 下沉):
+#:    每个策略在 `strategies/<key>.py` 里声明 `warmup` = 自己判定所需的最短日线根数
+#:    (`StrategyBase.warmup`, 默认 40; g56 声明 80)。展示层取
+#:      K = max(所有启用策略的 warmup)
+#:    理由 —— 断点书是**一份**共享产物 (`precompute_night` 产一份 `resume_book`),
+#:    它的快照位置只有一个; 而 `BarsCache` 也是全策略共享的一份。任何策略若想保留
+#:    比 K 更短的历史, 就得让它的断点快照落在更晚的位置 ⇒ 需要**另一份**书 = 另一趟
+#:    全市场递推。那是零和 (省下的递推 = 多花的建书), 不做。所以本模块只承认 K 这一个数,
+#:    策略声明的差异**不会**带来每个策略不同的窗口 —— 声明的真正价值在于:
+#:      ① 新增/修改策略不需要改 pipeline 任何一个数;
+#:      ② `tests/test_warmup_slice.py` 直接读声明做加倍差分 ⇒ 声明与门禁不可能漂移。
+#:
+#: ⚠️ 收益主要不在"省递推 CPU"(全市场仅 2.3s), 而在**省取数 IO**:
+#:    实测 `fetch_klines_batch` 全市场 320 根 12.9s → 80 根 ~3.3s (省 ~9.6s)。
+#:    K 越小收益越大, 但**不能小于任一策略的窗口下限**, 否则滑窗读数失真且静默
+#:    —— 这正是"声明下沉"要防的事 (以前 K 写死 80, 谁也不知道它对应哪条策略)。
+RESUME_KEEP_FALLBACK = 40      #: 策略**没有**声明 warmup 时的兜底 (= StrategyBase.warmup)
+
+
+def strategy_object(key: str, strat_reg=None):
+    """取策略**实例** (类属性声明的唯一可信来源)。
+
+    ⚠️ 这条路一旦失败必须**看得见**: 返回 None 会让调用方静默拿到默认声明
+       (40 根窗口 / 默认记忆点) ⇒ 症状是"某个策略的窗口悄悄变小"。故调用方
+       遇到 None 应显式计数登记 (见 `resume_window_by_key` 的 `_decl_miss`)。
+    """
+    if strat_reg is None:
+        try:
+            from app.market_cn.auto import strategies as strat_reg
+        except Exception:
+            return None
+    try:
+        return strat_reg.get_strategy(key)
+    except Exception:
+        return None
+
+
+def resume_window_by_key(keys) -> Dict[str, int]:
+    """{策略 key: 它声明的窗口根数} —— 只对**数学可启用**断点 (`resume_supported`)
+    的策略返回正值; 其余返回 0 表示"不参与取 max"。
+
+    ⚠️ 声明读不到时 (`get_strategy` 失败 / 未注册) 回落 `RESUME_KEEP_FALLBACK`
+       而非 0 —— 用 0 会让该策略被排除在本轮 max 之外, 等于偷偷把全局窗口调小,
+       是**静默降级**。宁可保守地按默认窗口算, 也不冒"窗口不够导致读数失真"的风险。
+    """
+    try:
+        from app.market_cn.auto import strategies as strat_reg
+    except Exception:
+        strat_reg = None
+    out: Dict[str, int] = {}
+    for k in keys:
+        obj = strategy_object(k, strat_reg)
+        if obj is None:
+            # 保守: 用兜底窗口而非 0 (用 0 会让 max 变小 ⇒ 悄悄把全局窗口调小)
+            out[k] = RESUME_KEEP_FALLBACK
+            continue
+        out[k] = _declared_window(obj)
+    return out
+
+
+def _supports_resume(obj, default: bool = True) -> bool:
+    """该策略是否**数学可启用**断点 (`StrategyBase.resume_supported`)。
+
+    取不到实例时返回 `default` (保守=True ⇒ 让它的窗口参与取 max)。
+    """
+    if obj is None:
+        return default
+    return bool(getattr(obj, "resume_supported", True))
+
+
+def _declared_window(obj) -> int:
+    """读实例声明的窗口根数; 不可启用断点或声明非法一律返回 0 (不参与 max)。"""
+    if not _supports_resume(obj):
+        return 0
+    try:
+        w = int(getattr(obj, "warmup", 0) or 0)
+    except Exception:
+        w = 0
+    return w if w > 0 else 0
+
+
+def resume_window(keys) -> int:
+    """本次断点保留的根数 = max(各策略声明) + 兜底。
+
+    ★ 全 0 (没有任何策略参与) 时返回 `RESUME_KEEP_FALLBACK` 而不是 0 ——
+      0 会让 `_resume_prefix_bars` 退化成"前缀=全量", 断点落点与实时切片全错位
+      且**不报错**。给一个正的兜底值, 语义至少自洽。
+    """
+    vals = [v for v in resume_window_by_key(keys).values() if v > 0]
+    return max(vals) if vals else RESUME_KEEP_FALLBACK
+
+
+def resume_keys_enabled(specs) -> set:
+    """本次可启用断点的策略 key 集合 = 由**策略自己声明**是否支持。
+
+    (`StrategyBase.resume_supported`; 取代旧 pipeline 侧的硬编码 key 集合。)
+    ⚠️ 实例取不到时**保守判为可启用** —— 宁可让它走正常的取 max 路径,
+       也不要因为一次 import 抖动就悄悄把策略踢出断点。
+    """
+    try:
+        from app.market_cn.auto import strategies as strat_reg
+    except Exception:
+        strat_reg = None
+    out = set()
+    for k in specs:
+        if _supports_resume(strategy_object(k, strat_reg), default=True):
+            out.add(k)
+    return out
+
+
+def _resume_prefix_bars(cache: "BarsCache", code: str, buy_date: str,
+                        keep: int) -> List[Dict[str, Any]]:
+    """断点**前缀** bars = 夜侧 bars 去掉末 `keep` 根。
+
+    夜算按此取 snapshot (断点状态 = prefix 末根结束时的摘要);
+    盘中按**同一口径**切片 (`bars_t[len(bars_t) - keep:]`) ⇒ 天然对齐,
+    无需每票每轮再做指纹校验 (除权由预处理重建负责, 见 `build_book` 的校验)。
+    """
+    b = _night_bars(cache, code, 0, buy_date) or []
+    return b[:len(b) - keep] if len(b) > keep else []
+
+
 def precompute_night(specs: Dict[str, StrategySpec], codes, cache: BarsCache,
                      stock_info: Optional[Dict[str, Any]] = None,
                      buy_date: Optional[str] = None,
@@ -504,6 +661,17 @@ def precompute_night(specs: Dict[str, StrategySpec], codes, cache: BarsCache,
     """T-1 夜预计算: 对每个策略求 night 门 → 明日候选集。
 
     返回 {"hits": {key: [NightHit]}, "plans": {key: GatePlan}, "stats": {key: StageStats}}
+
+    ── 循环维度: **外层股票、内层策略** (B4, 2026-10-04) ──
+    旧实现是外层策略、内层股票, 导致每股的 `_night_bars` / `get_board_type` /
+    `find_limit_ups` / `Ctx._ind_cache` 全都拿不到跨策略共享 —— 这是夜算重复计算的
+    结构性根因。倒转后这些量天然每股一份。
+
+    ⚠️ `hits[key]` 的**顺序不变** (被消费端依赖, 见 `_candidate_lus` 注释):
+       两种循环序下 hits[key] 都是"按 codes 顺序 × lu 升序"展开。
+    ⚠️ `stats[key].codes/evaluated/passed` 不变; 只有 `.elapsed` 由"该策略整段墙钟"
+       变为"各股票片段累加"(纯展示用, 无消费端依赖)。
+    ⚠️ `progress_every` 由"每完成 N 个策略打印"变为"跑完统一打印"(倒转后没有中间完成点)。
     """
     si = stock_info or {}
     plans = {k: plan_gates(s) for k, s in specs.items()}
@@ -512,24 +680,38 @@ def precompute_night(specs: Dict[str, StrategySpec], codes, cache: BarsCache,
         raise ValueError("存在 偏移=0 的策略有夜门 → 必须传 buy_date 以构造虚拟 D0 bar")
 
     hits: Dict[str, List[NightHit]] = {k: [] for k in specs}
-    stats: Dict[str, StageStats] = {}
+    stats: Dict[str, StageStats] = {k: StageStats() for k in specs}
     codes = list(codes)
 
-    for key, spec in specs.items():
-        plan = plans[key]
-        st = StageStats()
-        t_key = time.time()
-        min_n = max(cache.min_len, required_min_len(spec))
-        for code in codes:
-            bars = _night_bars(cache, code, plan.decision_offset, buy_date or "")
+    # 股票级共享量: bars 按 (code, decision_offset) 缓存 (不同策略偏移不同 → 占位 bar 不同),
+    # board_type 按 (code, market_spec) 缓存 (market_spec 影响 board_rules 口径)。
+    bars_memo: Dict[Any, Any] = {}
+    bt_memo: Dict[Any, str] = {}
+
+    for code in codes:
+        info = si.get(code)
+        for key, spec in specs.items():
+            plan = plans[key]
+            st = stats[key]
+            t0 = time.time()
+            min_n = max(cache.min_len, required_min_len(spec))
+            bkey = (code, plan.decision_offset)
+            bars = bars_memo.get(bkey)
+            if bars is None:
+                bars = bars_memo.setdefault(
+                    bkey, _night_bars(cache, code, plan.decision_offset, buy_date or ""))
             if not bars or len(bars) < min_n:
+                st.elapsed += time.time() - t0
                 continue
             st.codes += 1
             if not plan.night:
+                st.elapsed += time.time() - t0
                 continue
-            bt = get_board_type(code, spec.market_spec)
+            mkey = (code, id(spec.market_spec))
+            bt = bt_memo.get(mkey)
+            if bt is None:
+                bt = bt_memo.setdefault(mkey, get_board_type(code, spec.market_spec))
             i = len(bars) - 1
-            info = si.get(code)
             ext = build_ext(spec, code, bars, cache=cache)
             for lu in _candidate_lus(spec, bars, bt, i):
                 st.evaluated += 1
@@ -539,12 +721,56 @@ def precompute_night(specs: Dict[str, StrategySpec], codes, cache: BarsCache,
                 if ok:
                     st.passed += 1
                     hits[key].append(NightHit(code=code, lu_idx=lu, board_type=bt))
-        stats[key] = st
-        st.elapsed = round(time.time() - t_key, 2)
-        if progress_every and (list(specs).index(key) + 1) % progress_every == 0:
-            print(f"  [night] {key} 通过 {st.passed} 用时 {st.elapsed:.1f}s", flush=True)
+            st.elapsed += time.time() - t0
 
-    return {"hits": hits, "plans": plans, "stats": stats}
+    for key, st in stats.items():
+        st.elapsed = round(st.elapsed, 2)
+    if progress_every:
+        for idx, key in enumerate(specs, 1):
+            if idx % progress_every == 0:
+                print(f"  [night] {key} 通过 {stats[key].passed} "
+                      f"用时 {stats[key].elapsed:.1f}s", flush=True)
+
+    # ── 断点续传产出 (2026-10-05 接线) ──────────────────────────────
+    # 无感: 只认策略**声明**的 `resume_points`; 声明来自**策略实例**
+    # (`strategies.get_strategy(key)`), 不是 yaml 门表 StrategySpec ——
+    # 后者不带策略类属性, 传它会静默拿到 0 个记忆点 (通道空转)。
+    # 未声明的策略回落**标准默认点** (Ctx 的 macd/atr/boll/kdj)。
+    # ⚠️ 断点 = 本轮夜算所见 bars 的末根 (break_date 取首票末根日期, 仅记录)。
+    # ── 断点产出: **单一档** (日线边界语义, 2026-10-05 简化) ──
+    # 不再按 keep 分档、不再按策略声明 —— 全局一份 ResumeBook, 所有非豁免策略共用。
+    by_key = resume_points_by_key(specs.keys())
+    enabled = resume_keys_enabled(specs)
+    # └ keep = **策略自己声明的窗口**的 max (见 `resume_window` 的长注释)
+    keep = resume_window([k for k in specs if k in enabled])
+    seen: set = set()
+    points_list: List[Any] = []
+    for k, ps in by_key.items():
+        if k not in enabled:
+            continue
+        for p in ps:
+            if p.key not in seen:
+                seen.add(p.key)
+                points_list.append(p)
+    points = tuple(points_list)
+    book = None
+    if points and codes:
+        try:
+            b0 = _resume_prefix_bars(cache, codes[0], buy_date or "", keep)
+            bd = str(b0[-1].get("time"))[:10] if b0 else ""
+        except Exception:
+            bd = ""
+        # ★ 除权/数据修正的**唯一处理点**: 预处理在这里一次性比对, 不一致即重建。
+        #   实时侧完全不感知除权 (见 intraday_cycle 的 use_resume 分支)。
+        book = build_book(codes, lambda c: _resume_prefix_bars(cache, c, buy_date or "", keep),
+                          points, bd)
+        if progress_every:
+            print(f"  [night] 断点续传产出: {len(codes)} 票 × {len(points)} 记忆点, "
+                  f"keep={keep}, break_date={bd}", flush=True)
+
+    return {"hits": hits, "plans": plans, "stats": stats,
+            "resume_points": points, "resume_points_by_key": by_key,
+            "resume_book": book, "resume_keep": keep}
 
 
 # ================================================================
@@ -570,8 +796,28 @@ def intraday_cycle(specs: Dict[str, StrategySpec], night: Dict[str, Any],
                    trade_date: Optional[str] = None,
                    mkt_gain: Optional[float] = None,
                    stock_info: Optional[Dict[str, Any]] = None,
-                   plugins: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   plugins: Optional[Dict[str, Any]] = None,
+                   use_resume: Optional[bool] = None) -> Dict[str, Any]:
     """D0 盘中一轮: 候选集内求 day 门 (+合成 D0 bar) → 命中行。
+
+    ── 断点续传 (2026-10-05 简化: **日线边界**语义) ──────────────────────────
+    断点 = 「截至昨日收盘」的状态摘要 (夜算产出)。启用时实时侧只保留最后
+    `K = max(各策略声明的 warmup)` 根 bar (数由夜侧算出并随 `resume_keep` 传来),
+    历史段由断点代表 ⇒ 递推类读数不再从头重算。
+
+    `use_resume`:
+       None / False (默认) → 关闭: bars 全量, `Ctx.resume={}` ⇒ 与不接时逐位一致;
+       True                → 启用 (对 `resume_supported=False` 的策略自动不生效)。
+
+    ★★ **实时侧不做任何防御** (2026-10-05 裁定):
+       除权、数据修正一律由**预处理** (`precompute_night` → `build_book`) 一次性
+       比对并重建; 实时侧只判断"断点有没有、日期对不对", 不做逐票指纹校验
+       (旧实现把指纹放在盘中每票每轮 ⇒ 160 次/23.8ms 占 75%, 是净成本的主因)。
+
+    ⚠️ `enumeration=limit_up` 家族**数学上不可启用** (策略侧声明
+       `StrategyBase.resume_supported = False`, 见 dragon_callback.py):
+       `_candidate_lus` 的候选是「**窗口内**的历史涨停日」且 `lu_idx` 是**绝对索引**
+       ⇒ 截窗会削减候选本身 (实测 dragon_callback 465→161), 断点**救不回**。
 
     盘中股池的确定顺序 (每策略):
       ① 有夜候选 (夜门能缩小) → 只用夜候选 (架构 §5.3 "候选集内门求值");
@@ -590,6 +836,18 @@ def intraday_cycle(specs: Dict[str, StrategySpec], night: Dict[str, Any],
     t0 = time.time()
     out: Dict[str, List[DayHit]] = {}
     skipped: List[str] = []
+    # ── 断点续传: 夜算产出的**单一** ResumeBook (日线边界语义) ──
+    rbook_root = night.get("resume_book") if use_resume else None
+    rpoints_all: Tuple[Any, ...] = tuple(night.get("resume_points") or ())
+    # 按策略取自己的声明 (各策略声明可能不同, 不能用全局并集)
+    rpoints_by_key: Dict[str, Tuple[Any, ...]] = dict(night.get("resume_points_by_key") or {})
+    # └ 夜侧算出的窗口 = 各策略 `warmup` 声明的 max; 盘中必须**用同一个数**,
+    #   否则两侧落点错位 (夜 vs 日永远对不上) 且不报错。
+    resume_keep = int(night.get("resume_keep") or resume_window(resume_keys_enabled(specs)))
+    if use_resume and (rbook_root is None or not rpoints_all):
+        # 要求压缩却没有断点可用 ⇒ **不做静默降级**, 关闭并计数
+        use_resume = False
+        skipped.append("use_resume=True 但无断点产出 → 退回全量重算")
     n_eval = 0
     n_hit = 0
     synth_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -629,6 +887,18 @@ def intraday_cycle(specs: Dict[str, StrategySpec], night: Dict[str, Any],
         series_cache[code] = v
         return v
 
+    # ── B4 (2026-10-05): 循环维度改为 **外层股票、内层策略** ────────────────
+    # 原实现外层策略、内层股票 ⇒ 每股的共享量都拿不到跨策略复用:
+    #   · `get_board_type(code, ...)`     每策略各算一遍
+    #   · `build_ext` → `_g1_arrays`      虽已有 cache, 但首次遍历时每策略各触发一次
+    #   · `Ctx` 的指标缓存                依赖 (bars, i) 共享, 倒转后才落在同一票上
+    # (夜侧 `precompute_night` 早已倒转, 这是当时没做完的另一半。)
+    #
+    # ★★ **out[key] 的顺序必须逐项不变** —— 这是本次改造唯一的高危点。做法:
+    #     ① 各策略的 pool 统一**按 snapshots 的顺序重排** (plugin shortlist 的构造序不可假设);
+    #     ② 外层严格按 snapshots 序遍历, 内层按 specs 序遍历;
+    #     ⇒ 任一 key 的输出序列仍 = 沿 snapshots 顺序取其在 pool 中的命中者, 与旧实现同源。
+    key_ctx: Dict[str, Dict[str, Any]] = {}
     for key, spec in specs.items():
         plan = plans[key]
         out[key] = []
@@ -650,29 +920,76 @@ def intraday_cycle(specs: Dict[str, StrategySpec], night: Dict[str, Any],
                 except Exception as e:
                     skipped.append(f"{key}: intraday_shortlist 失败 ({e}) → 退回全市场")
             pool = short if short is not None else snapshots
-        for code, snap in pool.items():
-            if code not in snapshots:
+        # ★ 按 snapshots 重排 + 只保留确实存在于 snapshots 的 code —— 见上方①
+        pool = {c: pool[c] for c in snapshots if c in pool}
+        # 本策略是否启用断点: 全局开关 ∩ 非豁免家族 ∩ 夜算确有产出
+        rkeep = bool(use_resume) and key in resume_keys_enabled(specs)
+        rbook = rbook_root if rkeep else None
+        rpts = rpoints_by_key.get(key) or rpoints_all
+        if rkeep and not rpts:
+            # 该策略没有记忆点声明 ⇒ **不做静默降级**, 关闭并计数
+            skipped.append(f"{key}: 无记忆点声明 → 退回全量重算")
+            rkeep = False
+        key_ctx[key] = {"spec": spec, "plan": plan, "lu_map": lu_map,
+                        "pool": pool, "rkeep": rkeep, "rbook": rbook, "rpts": rpts}
+
+    bt_memo: Dict[Any, Any] = {}      # (code, id(market_spec)) -> (market_spec, board_type)
+    for code in snapshots:
+        snap = snapshots[code]
+        for key, KC in key_ctx.items():
+            if code not in KC["pool"]:
                 continue
+            spec, plan = KC["spec"], KC["plan"]
+            lu_map = KC["lu_map"]
+            rkeep, rbook, rpts = KC["rkeep"], KC["rbook"], KC["rpts"]
             if code not in synth_cache:
                 bars = cache.get(code)
                 sb = synth_bar(_series(code), trade_date) if trade_date else None
                 if sb is None:
                     skipped.append(f"{code}: 无当日快照序列 → 无法合成 D0 bar")
                     synth_cache[code] = []
-                    continue
+                    # ⚠️ **必须是 break 不是 continue** (倒转后的新语义): 这里淘汰的是
+                    #    "该票没有当日快照序列" —— 与具体策略无关, 所有策略都不可用;
+                    #    continue 会变成"跳过本策略继续看下一个策略", 把同一条日志按
+                    #    策略数重复 N 遍。
+                    break
                 synth_cache[code] = bars + [sb]
             bars_t = synth_cache[code]
             if not bars_t or len(bars_t) < required_min_len(spec):
                 continue
+            # ── 断点续传消费: 截短历史 + 取断点状态 ──
+            # ★ 实时侧**不校验指纹**: 除权/修正由预处理重建保证 (见 build_book)。
+            #   这里只做"断点有没有、点数够不够"的最简判断, O(1)。
+            rstate: Dict[Any, Any] = {}
+            if rkeep and len(bars_t) > resume_keep:
+                bars_t = bars_t[len(bars_t) - resume_keep:]
+                rstate = fetch(rbook, code, rpts, None)
+                # ⚠️ 判据**必须无条件** (不能写 `if rstate and ...`):
+                #    一旦截短了 bars 而断点不全/全失效, Ctx 会在短窗口上走全量重算
+                #    ⇒ 递推初值缺失, 数值全错且**不报错**。宁可回落全量, 不可算错。
+                if len(rstate) != len(rpts):
+                    bars_t = synth_cache[code]
+                    rstate = {}
+                    skipped.append(f"{code}: 记忆点不全 → 回落全量")
             i = len(bars_t) - 1
-            bt = get_board_type(code, spec.market_spec)
+            # board_type 每股每 market_spec 只算一次 (倒转后的跨策略共享收益)
+            _mkey = (code, id(spec.market_spec))
+            _bt = bt_memo.get(_mkey)
+            if _bt is None or _bt[0] is not spec.market_spec:
+                _bt = bt_memo[_mkey] = (spec.market_spec,
+                                        get_board_type(code, spec.market_spec))
+            bt = _bt[1]
             for h_lu in lu_map.get(code, [0]):
                 n_eval += 1
+                # ⚠️ ext 必须基于**全量** bars: build_ext 的缓存键是 (code, ext名@日期),
+                #    **不含 bars 长度** ⇒ 若传截短的 bars_t 且缓存未热, 会把"短窗口特征"
+                #    写进缓存并污染后续全量调用 (静默算错)。全量侧算一次即可, 之后命中。
                 ctx = Ctx(bars_t, i, h_lu, spec.params, board_type=bt,
                           code=code, stock_info=si.get(code) if hasattr(si, "get") else None,
-                          ext=build_ext(spec, code, bars_t, cache=cache),
+                          ext=build_ext(spec, code, synth_cache[code], cache=cache),
                           latest=snapshots.get(code),
                           series=_series(code),
+                          resume=rstate or None,
                           mkt_gain=mkt_gain, market=spec.market_spec)
                 ok, _failed = evaluate_gates(spec, plan.day, ctx)
                 if not ok:
@@ -713,13 +1030,19 @@ def _first_full_pick(spec: StrategySpec, bars: List[Dict[str, Any]], code: str,
 
 def verify_split(spec: StrategySpec, bars: List[Dict[str, Any]], code: str,
                  i: int, stock_info: Optional[Dict[str, Any]] = None,
-                 ext: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 ext: Optional[Dict[str, Any]] = None,
+                 cache: Optional["BarsCache"] = None) -> Dict[str, Any]:
     """等价性自检 (单 (code, 决策日 i)): 全量 vs 夜/日分段, 比较选中的 lu_idx 与展示字段。
 
     分段侧忠实复刻管线口径 (不是"另写一遍近似"):
       夜 = plan.night 门在 night bars 上求值 → 保留**全部**通过者;
       日 = 对夜通过者按**升序**取首个 day 门通过者。
     ext 可预传 (O(n) 特征 / 横截面池) —— 批量自检时避免每股每日重算。
+    cache: 可选。给了就让 `n_ext` 也走记忆化 (B7, 2026-10-05) —— 自检对每个决策日 i
+           调一次 verify_split, 夜侧 ext 不缓存 ⇒ 每个 i 重算 O(n) 特征。
+           ⚠️ **安全前提是 build_ext 的键已含 bars 身份**: `off == 0` 时 n_bars =
+           `bars[:-1]+[placeholder_bar]` 与全量 bars 根数/末日期都相同, 键里没有
+           `_bars_identity` 就会拿到全量侧算错的 ext 且不报错。
     返回 {"ok": bool, "full_lu":…, "split_lu":…, "reason": …}。
     """
     bars = bars[:i + 1]
@@ -739,7 +1062,9 @@ def verify_split(spec: StrategySpec, bars: List[Dict[str, Any]], code: str,
         n_bars = bars
     else:
         n_bars = bars[:-1] + [placeholder_bar(bars[-1]["time"])]
-    n_ext = _ext if off <= -1 else build_ext(spec, code, n_bars, asof_date=asof)
+    # variant 显式标注"夜侧占位", 与全量侧彻底隔离 (双保险: _bars_identity 已能分辨)
+    n_ext = _ext if off <= -1 else build_ext(
+        spec, code, n_bars, cache=cache, asof_date=asof, variant="night_off0")
     night_pass: List[int] = []
     last_night_failed: List[str] = []
     for lu in _candidate_lus(spec, n_bars, bt, len(n_bars) - 1):
@@ -851,7 +1176,11 @@ def main():
                 ext = build_ext(spec, code, bars, cache=cache,
                                 asof_date=str(bars[-1]["time"])[:10])
                 for i in range(max(5, len(bars) - win), len(bars) - 1):
-                    r = verify_split(spec, bars, code, i, si.get(code), ext=ext)
+                    # cache 一并下传 ⇒ 夜侧 ext (off==0 时) 也走记忆化 (B7)。
+                    # ⚠️ 每个 i 的夜侧 bars 长度不同 ⇒ 缓存天然按 i 分份, 不要期望"只算一次";
+                    #    本循环是 --verify 小样本自检, codes/window 都有限, 内存可控。
+                    r = verify_split(spec, bars, code, i, si.get(code),
+                                     ext=ext, cache=cache)
                     if str(r.get("reason", "")).startswith("样本过短"):
                         n_skip += 1
                         continue

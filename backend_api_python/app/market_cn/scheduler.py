@@ -308,6 +308,59 @@ def _daily_scan_interval() -> int:
     return 60 if _daily_scan_state.get("pending", True) else 600
 
 
+# ---------------------------------------------------------------
+# G1 预处理推进 (2026-10-05): 必须排在盘后扫描**之前**
+# ---------------------------------------------------------------
+# 为什么: 池与单票特征都优先读预处理台账; 台账没推进到当日 ⇒ 自动回退全量
+#   (不静默, 但收益归零)。所以"推进"是"扫描能走增量"的前提, 顺序不可颠倒。
+# 失败策略: **不阻塞扫描** (扫描会回退全量, 只是慢), 但**不标记完成** ⇒ 下轮重试。
+#   ⚠ 宁可重试也不静默跳过: 推进失败却标记完成 = 永久停在旧日期且无人知晓。
+G1_PREPROCESS_TASK = "g1_preprocess"
+#: 单次补跑上限(交易日)。断档更久时逐轮追赶, 不一次性拉太长(取数/耗时不可控)
+G1_PREPROCESS_MAX_DAYS = 10
+
+
+def _g1_preprocess_dispatch(target):
+    """把预处理台账推进到 target。幂等 (按 trade_date 标记), 失败下轮重试。"""
+    try:
+        if G1_PREPROCESS_TASK in set(scheduler_done_names(G1_PREPROCESS_TASK, target)):
+            return False
+    except Exception as e:                       # 查标记失败 ⇒ 保守重试(幂等, 不危险)
+        logger.debug("[g1_preprocess] 完成标记查询失败(%s), 尝试推进: %s", target, e)
+    try:
+        from app.market_cn.auto.core.features import g1_daily as GD
+        # ★ 用 `backfill` 而不是 `run`: 前者只跑"台账最新日期之后"的日子,
+        #   于是 ① 当日已推进 ⇒ days=[] 幂等; ② 断档(停机/假期/多天没启用策略)
+        #   ⇒ **逐日**补齐。若用 `run(date=target)`, advance 只检查"bar日期 >
+        #   状态日期", 会**跳格**推进(漏掉中间那几根的递推)且不报错 —— 状态错位
+        #   是这套机制最危险的失效模式。
+        rep = GD.G1DailyRunner(win=GD.DEFAULT_WIN).backfill(
+            until=target, max_days=G1_PREPROCESS_MAX_DAYS)
+    except Exception as e:
+        logger.warning("[g1_preprocess] target=%s 推进失败(不标记, 下轮重试): %s",
+                       target, e)
+        return False
+    errs = rep.get("errors") or []
+    if errs:
+        # 有错就不算完成: 推进一半的台账会让池/特征回退, 且没人知道为什么
+        logger.warning("[g1_preprocess] target=%s 有 %d 条错误, 不标记完成: %s",
+                       target, len(errs), errs[:3])
+        return False
+    failed = rep.get("failed") or {}
+    if failed:
+        # ⚠ 个例脏票**不阻止**完成: 隔离机制的本意就是不让它拖垮整批,
+        #   若因此永不标记 ⇒ 每天重跑且永远"没完成", 反而更糟。但要看得见。
+        logger.warning("[g1_preprocess] target=%s 个例隔离 %d 票: %s",
+                       target, len(failed), list(failed)[:5])
+    try:
+        mark_scheduler_task_done(G1_PREPROCESS_TASK, target)
+    except Exception as e:
+        logger.warning("[g1_preprocess] 标记完成失败(下轮会重跑, 幂等): %s", e)
+    logger.info("[g1_preprocess] target=%s days=%s G1合计=%d",
+                target, rep.get("days"), rep.get("g1_total"))
+    return True
+
+
 def _daily_scan_dispatch():
     """盘后扫描分发 (2026-09-29): 策略 after_events/fire_at 就绪即触发 keys 子集。
 
@@ -324,6 +377,9 @@ def _daily_scan_dispatch():
     if not keys:
         _daily_scan_state["pending"] = False
         return
+    # ★ 预处理推进**先于**扫描: 台账没推进到当日 ⇒ 池/单票特征自动回退全量,
+    #   扫描照样出信号(正确性无损)但增量收益归零。失败不阻塞扫描(见函数内注)。
+    _g1_preprocess_dispatch(target)
     done = set(scheduler_done_names("daily_scan@", target))
     done |= _daily_scanned.get(target, set())
     ready = []

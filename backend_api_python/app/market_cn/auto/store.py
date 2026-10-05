@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import datetime, timedelta
@@ -45,6 +46,40 @@ from app.market_cn.auto.registry import (  # noqa: F401  (re-export, 对外 API 
 
 _SIGNALS_TABLE = "qd_dragon_signals"
 _WATCHLIST_TABLE = "qd_watchlist"
+
+
+# ================================================================
+# 日期 / 窗口 的单一事实源 (A7, 2026-10-05)
+# ================================================================
+# ★★ 本项目存在两套管"今天"的时钟, 此前**没有任何一处统合**:
+#     ① Python 侧 `datetime.now()` —— 进程本地时区 (北京时间)
+#     ② SQL 侧 `CURRENT_DATE`     —— DB 会话时区 (`db_postgres.py:144` 设
+#        `options="-c timezone=UTC"`) ⇒ 北京 00:00~07:59 拿到的是**前一天**
+#    二者混用的直接后果 (`list_signals` 的日期窗口 vs `monitor._today()`):
+#      · 北京 00:00~08:00 之间, SQL 窗口比 Python 侧多给一天 ⇒ 边界行的
+#        进出窗口时点不一致, 且随时间漂移 —— 属"看日历才复现"的幽灵 bug。
+#      · `updated_at` 由 `NOW()` 写入 ⇒ 存的是 **UTC 挂钟** (实测 id=402 的
+#        `updated_at=2026-09-30 07:01` 对应北京时间 15:01)。任何 `str(...)[:10]`
+#        把它当本地日期用的地方都在受害。
+#
+#     统一口径: **所有 SQL 日期窗口都接收 Python 传入的本地日期**, 不再依赖
+#     `CURRENT_DATE`。改动点只有下面一个函数 + 两处 SQL, 不触碰其它模块的读法。
+
+def today_str() -> str:
+    """进程本地"今天" (YYYY-MM-DD) —— **SQL 日期窗口的唯一来源**。
+
+    与 `monitor._today()` 同源 (monitor 直接委托本函数), 保证「monitor 判 today」
+    与「store 按 today 开窗」拿到同一个日期。
+    """
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+#: monitor 每 tick 拉取的候选集回看窗口 (日历日)。
+#: 必须与 `get_active_signals` 的可见窗口 **同口径** —— 否则展示层看得到、
+#: monitor 却扫不到的行会静默滞留 (A5, 2026-10-05)。
+#: 取值的硬下界 = `cleanup_old` 的清理边界 24 日历日 (`cleanup_cutoff(15)`,
+#: days×1.6) ⇒ 30 天然覆盖它: 任何还没被物理删除的行都逃不出这个窗口。
+VISIBLE_WINDOW_DAYS = 30
 
 
 # ================================================================
@@ -244,6 +279,10 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
       且不补回 (盘后扫描先写、之后任何 _scan_cycle 预览轮都会丢信号)。空 tuple
       时从 rows 推断; rows 也为空 → DELETE 0 行 (安全方向: 宁多留不误删)。
 
+    Returns:
+        {"written": 本次写入行数, "purged": 清理行数,
+         "superseded": **跨日被取代的旧观察票行数** (A11, 2026-10-05)}
+
     ⚠️ 2026-09-28 修 A1 (资金事故红线): ON CONFLICT 的 state/extra 加 CASE 守卫
     ——monitor 已推进的行 (entry_date 非空: buy_today/holding/exit) 不得被补扫
     的新信号行回滚 state 或冲掉 extra (t_legs_today/pre_confirm 等运行时字段)。
@@ -283,6 +322,45 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         (trade_date, S_BUY_TODAY, list(purge_buy_today)),
                     )
                     purged += cur.rowcount
+
+                # ── A11 (2026-10-05): 跨日幽灵观察票 —— 旧提名被新提名取代 ──
+                # 上面的 DELETE 只清 `trade_date = 本次` 的行, 而唯一键也含 trade_date
+                # ⇒ 同一 (strategy, code, entry_style) 在**更早交易日**的 watch_pending
+                #   行会原样留下。补扫 target_date ≠ 原 trade_date 时 (D+1 白天重启补
+                #   跑最常见) 就变成同时挂着两条同名观察票 —— 前端重复、且旧行由于
+                #   trade_date 早会被 A5 的 stale 逻辑判过期, 中间这段窗口它们就是幽灵。
+                #
+                # ★ 用法pending 语义**: 「同一策略对同一只票的未入场提名」在同一时刻
+                #   最多一条 —— 今天重新提名了, 昨天的提名就已被取代, 没有理由继续待
+                #   在候选集里等用户看。
+                # ⚠ 用 UPDATE 成 expired 而不是 DELETE: signals 是历史事实表, 回测/
+                #   统计要看得见这一行存在过; state=expired 既让它脱离 watch_pending
+                #   候选集, 又留下可追溯痕迹 (extra.superseded_by 记被哪天取代)。
+                # ⚠ 只按本次 rows 里出现的 (strategy, code, entry_style) 精确命中 ——
+                #   不带范围的批量 UPDATE 会重演 M12 事故 (误伤同表其它策略的行)。
+                superseded = 0
+                seen_keys = set()
+                for s in rows:
+                    k = (s.get("strategy") or DRAGON_STRATEGY,
+                         s.get("code"), s.get("style", "a"))
+                    if not k[1] or k in seen_keys:
+                        continue
+                    seen_keys.add(k)
+                    cur.execute(f"""
+                        UPDATE {_SIGNALS_TABLE}
+                           SET state = %s, updated_at = NOW(),
+                               extra = COALESCE(extra, '{{}}'::jsonb) || %s::jsonb
+                         WHERE state = %s AND trade_date < %s
+                           AND strategy = %s AND code = %s AND entry_style = %s
+                    """, (
+                        S_EXPIRED,
+                        json.dumps({"superseded_by": str(trade_date),
+                                    "superseded_ts": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                   ensure_ascii=False, default=str),
+                        S_WATCH_PENDING, trade_date, k[0], k[1], k[2],
+                    ))
+                    superseded += cur.rowcount
+
                 n = 0
                 for s in rows:
                     # 方案A (2026-09-18): extra 已由 signal_row 整包构造, 直接取 (剔除 None)
@@ -324,7 +402,7 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                     n += 1
                 db.commit()
                 cur.close()
-            return {"written": n, "purged": purged}
+            return {"written": n, "purged": purged, "superseded": superseded}
         except Exception as _e:
             _pg = getattr(_e, "pgcode", None)
             _transient = _pg in ("40P01", "40001")
@@ -509,7 +587,7 @@ def _set_state(cur, sig_id, state, detail=None, confirm_date=None, d1_chg=None, 
 
 
 def list_signals(states=None, trade_date=None, days=20, only_active=False,
-                 strategies=None, enabled_only=False):
+                 strategies=None, enabled_only=False, today=None):
     """查询信号 (signals 表)。states: 状态过滤; trade_date: 指定信号日; days: 最近N日。
 
     Args:
@@ -518,6 +596,9 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False,
             会遗忘手上还有票要卖, 是实盘资金事故 (见 startup.py 模块 docstring 硬约束)。
             即: 停用 = 不再提示新买入, 但不隐藏已有持仓/卖出提示。
             ⚠ monitor 推进状态机**不能**带此过滤 (它要接着推进已入场行), 故默认 False。
+        today: 窗口基准日 (YYYY-MM-DD), 默认 `today_str()` = 进程本地日期。
+            ★ 显式传日是为了**同一个 tick 内多处查询看到同一条日期线** —— 跨零点
+            的 monitor tick 里, 分别调 today_str() 可能拿到两个不同日期。
 
     Returns:
         list[dict]: 信号行（含 trade_date/strategy/code/name/state/score 及 entry/exit 系列字段）。
@@ -538,8 +619,13 @@ def list_signals(states=None, trade_date=None, days=20, only_active=False,
             # days 过滤的是 trade_date (D0 信号日), 持仓超窗口的行会被 monitor
             # (days=8: 止损/出场判定停摆) 和展示层 (days=30: 组行被 sync 删除)
             # 静默丢出视野, 与"已入场行一律可见"资金红线冲突。窗口仅约束未入场行。
-            sql += " AND (trade_date >= (CURRENT_DATE - %s::int) OR entry_date IS NOT NULL)"
-            vals.append(days)
+            # A7 (2026-10-05): 基准日改由 **Python 传入**, 不再用 SQL `CURRENT_DATE`
+            # —— 后者是 DB 会话时区 (UTC), 在北京 00:00~08:00 会拿到前一天 ⇒
+            #   同一时刻, monitor 的 `today`(本地) 与本窗口(UTC) 不在同一天。
+            sql += (" AND (trade_date >= (%s::date - %s::int) "
+                    "OR entry_date IS NOT NULL)")
+            vals.append(today or today_str())
+            vals.append(int(days))
         if only_active:
             sql += " AND state = ANY(%s)"
             vals.append(list(ACTIVE_GROUP_STATES))
@@ -559,7 +645,10 @@ def get_active_signals():
     Returns:
         list[dict]: 同 list_signals；仅 买入/持仓/卖出 活跃状态、最近 30 日。
     """
-    return list_signals(states=ACTIVE_GROUP_STATES, days=30, enabled_only=True)
+    # A5 (2026-10-05): 天数取 `VISIBLE_WINDOW_DAYS` 而非硬编码 30 —— 展示层窗口必须
+    # 与 monitor 候选集同源, 否则"展示看得到、monitor 扫不到"的行会无声滞留。
+    return list_signals(states=ACTIVE_GROUP_STATES, days=VISIBLE_WINDOW_DAYS,
+                        enabled_only=True)
 
 
 def get_watch_pending(trade_date=None, days=5):
@@ -580,7 +669,8 @@ def get_signal_by_code(code, trade_date=None):
     Returns:
         dict | None: 该股最新一条活跃信号行；无则 None。
     """
-    rows = list_signals(states=ACTIVE_GROUP_STATES, trade_date=trade_date, days=30)
+    rows = list_signals(states=ACTIVE_GROUP_STATES, trade_date=trade_date,
+                        days=VISIBLE_WINDOW_DAYS)
     for r in rows:
         if r["code"] == code:
             return r
@@ -601,9 +691,9 @@ def get_markers(code, days=60):
                    signal_date, signal_price, entry_date, entry_price,
                    exit_date, exit_price, exit_reason, confirm_date, d1_chg, d1_vol_r
             FROM {_SIGNALS_TABLE}
-            WHERE strategy = ANY(%s) AND code = %s AND trade_date >= (CURRENT_DATE - %s::int)
+            WHERE strategy = ANY(%s) AND code = %s AND trade_date >= (%s::date - %s::int)
             ORDER BY trade_date
-        """, (list(strategy_keys()), code, days))
+        """, (list(strategy_keys()), code, today_str(), int(days)))
         rows = [_row_to_dict(r) for r in cur.fetchall()]
         cur.close()
 
@@ -634,12 +724,13 @@ def get_markers(code, days=60):
 def _display_detail(s):
     """signals 行 → qd_watchlist.strategy_detail (前端 popover 表格明细)。v 字段用于变更检测。
 
+    v = **全字段**稳定哈希 (A6, 2026-10-05) —— 见函数尾部注释; 勿再改成字段拼接。
+
     注意: 不渲染 entry_style —— 它只是 qd_dragon_signals 的唯一键成分与 K 线 marker 文案来源
     (见 signals_markers), 前端 popover 已于 §9.3 缩减中删除"形态"行。
     """
     strat = s.get("strategy") or DRAGON_STRATEGY
-    return {
-        "v": f"{s['state']}|{s.get('entry_price')}|{s.get('exit_reason') or ''}|{s.get('score')}",
+    d = {
         "strategy": strat,
         "strategy_label": strategy_labels().get(strat, strat),
         "winrate": strategy_winrate(strat),
@@ -672,6 +763,20 @@ def _display_detail(s):
         "exit_date": s.get("exit_date"),
         "exit_price": _f(s.get("exit_price")),
     }
+    # ── A6 (2026-10-05): v = 全字段稳定哈希 ──
+    # 原实现 `v = f"{state}|{entry_price}|{exit_reason}|{score}"` 只覆盖 4 个字段,
+    # 而本函数输出 32 个。sync_watchlist_group 的 UPDATE 判据是
+    # `row["state"] != s["state"] or detail["v"] != 新v` ⇒ 其余 20 个会变的字段
+    # (entry_date/stop_price/confirm_date/d1_chg/pre_confirm/exit_date/exit_price/
+    #  turnover_*/ma60_slope/entry_gate/...) 变了**不触发刷新**。
+    # 已证实后果: ① purge_stale_detail 清掉 pre_confirm 后投影不刷新, 前端把买入当天
+    # 的「预」角标当当前预判 (store.py:437 注释自己预言过这个坑);
+    # ② update_stop_price 只改 signals ⇒ 前端一直显示旧止损价 (资金相关字段)。
+    # 现改为对全部字段做稳定哈希 (剔除 v 自身), 任一字段变化即刷新。
+    d["v"] = hashlib.sha256(
+        json.dumps(d, sort_keys=True, ensure_ascii=False, default=str)
+        .encode("utf-8")).hexdigest()[:16]
+    return d
 
 
 def _f(v):

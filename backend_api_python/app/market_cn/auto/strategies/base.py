@@ -123,6 +123,26 @@ class StrategyBase:
                              清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
       data_needs             数据需求声明 (D1, §3.4): ('daily','minute_live','quote','lhb',...);
                              框架/hub 按声明加载, 未被任何策略声明的通道零加载 (拔插), 默认 ('daily',)
+    warmup                 窗口声明 (2026-10-05): 本策略**判定所需的最短日线根数**。
+                             语义 = 加倍差分下界 —— 取 W 根与取 2W 根跑同一批股票,
+                             门判定必须完全一致 (验证见 tests/test_warmup_slice.py)。
+                             两个消费者:
+                              ① 展示层断点续传: 盘中保留的根数 = **各策略声明的最大值**
+                                 (历史段由断点代表, 见 core/present/pipeline.py);
+                              ② 切窗口/取样的一切上层。
+                             基类默认 40 (实测大多数策略的下界); 有长记忆量的策略
+                             (如 g56 的 MACD/ATR/KDJ/BOLL 链) 必须自己上调。
+                             ⚠ 改小 = 静默算错 (递推初值缺失); 只许**上调**。
+    resume_supported       False = 本策略**数学上不可断点续传**, 展示层自动排除
+                             (不再有任何 pipeline 侧硬编码 key)。典型 = L 类累积
+                             家族 (`enumeration=limit_up`): 候选是"窗口内的历史涨停日"
+                             且 lu_idx 是绝对索引 ⇒ 截窗削减候选本身, 断点救不回。
+    resume_points          断点记忆点声明 (2026-10-05): 元素为 core.runtime.resume.ResumePoint。
+                             策略在这里声明"要哪些断点记忆点、形式/格式、位置";
+                             展示层只搬运**不解释** (core/present/resume_io.py),
+                             新增策略/指标时展示层一行不改。
+                             空 tuple = 用标准默认点 (Ctx 的 macd/atr/boll/kdj)。
+                             私有记忆点建议 kind 带策略前缀 (如 "g56/g1") 防跨策略撞名。
     """
 
     key: str = ""
@@ -140,6 +160,9 @@ class StrategyBase:
     exit_exec_same_day: bool = False
     rolling_preview: bool = False
     data_needs: tuple = ("daily",)     # 数据需求声明 (hub 注入; 当前声明制 Phase 1: 仅元数据)
+    warmup: int = 40                   # 窗口声明: 判定所需最短日线根数 (见 docstring; 只许上调)
+    resume_supported: bool = True      # False = 数学上不可断点续传 (L 类累积家族), 展示层排除
+    resume_points: tuple = ()          # 断点记忆点声明 (ResumePoint, 见 core/runtime/resume.py)
     # ---- 做T 腿 (可选, T14 骨架 2026-09-26) ----
     # 只在已持仓日生效; 约束由 MarketSpec.intraday_t0 / direction 推出 (core 不特判 A股)。
     # 声明形态: {"enabled": True, "max_legs_per_day": 2, "legs": [{"action":"sell",

@@ -348,7 +348,16 @@ class TailOversoldStrategy(StrategyBase):
 
     def exit_decision(self, row, snap=None, **params):
         """出场: D1 开盘卖。live: entry_date < today → 开盘即标记卖出;
-        day_close 重放: 按 D1 开盘价出场 (与回测口径一致)。"""
+        day_close 重放: 按 D1 开盘价出场 (与回测口径一致)。
+
+        ⚠️ 记账价必须取 `snap["open"]` 而不是 `snap["last"]` (2026-10-04 A3 资金红线):
+          本策略是 `entry_at_close` + `exit_exec_same_day` 超短 (D0 14:56买 → D1 开盘卖),
+          **整个 alpha 就是隔夜跳空一两个点**; 而 monitor step2 的 live 出场窗起点是
+          09:35 (monitor.W_OPEN_HI), 若取 `last` 则记账价 = 09:35 后首拍最新价 ≠ 开盘价,
+          对超短策略是系统性偏离。day_close 重放分支取的是 `d1_bar["open"]`,
+          两口径必须对齐, 否则实盘与回测逐笔对不上。
+          `last` 只作 `open` 缺失时的退路 (停牌/集合竞价未出)。
+        """
         if not isinstance(snap, dict):
             return ExitDecision("hold")
         mode = snap.get("mode")
@@ -356,7 +365,7 @@ class TailOversoldStrategy(StrategyBase):
         if mode == "live":
             today = str(snap.get("today") or "")
             if entry_date and today and entry_date < today:
-                px = float(snap.get("last") or 0)
+                px = float(snap.get("open") or snap.get("last") or 0)
                 return ExitDecision("exit", reason="D1开盘卖出(超卖反弹兑现)",
                                     price=px if px > 0 else 0)
             return ExitDecision("hold")

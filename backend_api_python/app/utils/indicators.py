@@ -85,35 +85,132 @@ def rsi(closes, period=14):
     return 100 - 100 / (1 + rs)
 
 
-def calc_macd(closes, fast=12, slow=26, signal=9):
+# ================================================================
+# MACD 单一内核 (B6, 2026-10-04)
+# ================================================================
+# 背景: 展示层此前有**两套** MACD 实现 ——
+#   ① 本文件的 calc_macd  (cross_section._g1_arrays → g56 特征)
+#   ② core/runtime/functions.py 的 Ctx._macd (门表 DSL macd_dif/dea/hist)
+# 靠注释约定"逐值一致"维持, 正是 core/market.py:213 自己点名的
+# 「内联出第二份 = 漂移温床」。现统一到 `macd_core` 一处, ①② 都委托它。
+#
+# ★ 锚点 (anchor) —— 精确截窗, 不是估计 (2026-10-04 实测, 见 tmp/macd_state_anchor_probe.py):
+#   EMA 是 Markov 递推 e[i] = α·c[i] + (1-α)·e[i-1], **整个历史只通过 e[i-1] 一个数传递**。
+#   只要把锚点状态 (ema_fast[a], ema_slow[a], dea[a]) 传进来, 短窗口往前递推得到的序列
+#   与"从无穷远历史一路算下来"**逐位相同**。实测 20 根窗口即 100% 精确 (误差 0)。
+#   用途: 展示层窗口可从 300 根压到 40 根, 而 MACD 值不变 ⇒ g56 阈值零影响。
+#
+# ⚠️ 两个实现坑 (本轮都踩过, 改这里必看):
+#   ① 系数: signal=9 → k = 2/(signal+1) = 2/10。写成 2/11 会得到"锚定比朴素更差"的假象。
+#   ② **不能先跑完递推再覆写 e[0]**: 后续元素已在覆写前用错的 e[0] 算过,
+#      残余误差按 (1-α)^i 衰减, 表现成"窗口越长误差越小"的假象, 极具欺骗性。
+#      必须用 `ema_fwd` 从递推起点就接 e_prev。
+# ================================================================
+
+
+def _ema_naive_series(values, period):
+    """朴素播种的 EMA 序列: out[0] = values[0], 之后递推。
+
+    ⚠️ **必须逐字保持这个形态**, 不要改成 `ema_fwd(values, period, values[0])`:
+       后者首元素是 `v*a + v*(1-a)`, 浮点上**不严格等于** `v` (差 1 ULP)。
+       g56 的阈值是按本口径样本内拟合的, 改了会在边界上门判定漂移。
+       (2026-10-04 实测: 300 组随机序列里出现 MISMATCH, 即由此来)
+
+    ★ 2026-10-05: 本函数是 **EMA 的全局单一实现** (基座叶子层)。
+      `auto/core/runtime/resume.py` 的 `ema_naive` 已改为委托本函数 ——
+      依赖方向必须是 auto → utils, 反过来会让基座依赖业务层。
+    """
+    k = 2.0 / (period + 1)
+    out = [0.0] * len(values)
+    if not values:
+        return out
+    out[0] = values[0]
+    for j in range(1, len(values)):
+        out[j] = values[j] * k + out[j - 1] * (1 - k)
+    return out
+
+
+# 公开别名: 供 auto/core/runtime/resume.py 委托 (原名保留以兼容既有调用方)
+ema_naive = _ema_naive_series
+
+
+def ema_fwd(values, period, e_prev):
+    """从**前一根的状态** e_prev 往后递推 EMA。
+
+    e_prev = e[a], values[0] = c[a+1]; 返回的 out[i] = e[a+1+i]。
+    与 `ema(values, period)` 的区别: 后者用 values[0] 作初值 (朴素播种, 有暖机误差);
+    本函数接收精确初值, 无瞬态。
+    """
+    a = 2.0 / (period + 1)
+    out = [0.0] * len(values)
+    prev = float(e_prev)
+    for j, v in enumerate(values):
+        prev = v * a + prev * (1.0 - a)
+        out[j] = prev
+    return out
+
+
+def macd_state(closes, fast=12, slow=26, signal=9, upto=None):
+    """长序列前缀 → 锚点状态 (ema_fast[a], ema_slow[a], dea[a])。
+
+    upto: 取哪一根的状态 (默认末根)。a = 短窗口首根的**前一根** ⇒ 调用方传
+    `upto = len(长窗) - len(短窗) - 1`。
+    朴素播种 (closes[0]) 起算 —— 前提是长窗已足够收敛 (>=150 根实测即 0 误差)。
+    """
+    n = len(closes)
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+    a = n - 1 if upto is None else max(0, min(int(upto), n - 1))
+    kf, ks, ks9 = 2.0 / (fast + 1), 2.0 / (slow + 1), 2.0 / (signal + 1)
+    ef = _ema_naive_series(closes[: a + 1], fast)
+    es = _ema_naive_series(closes[: a + 1], slow)
+    dif = [ef[j] - es[j] for j in range(a + 1)]
+    dea = _ema_naive_series(dif, signal)
+    return (ef[a], es[a], dea[a])
+
+
+def macd_core(closes, fast=12, slow=26, signal=9, anchor=None):
+    """MACD 单一内核, 永远返回三序列 (不设长度门槛)。
+
+    anchor=None → 朴素播种 (closes[0]), 与历史口径逐位一致;
+    anchor=(ef_a, es_a, dea_a) → 锚定接力, 与"长序列算下来"逐位相同。
+
+    ⚠️ 调用方不得混用两种口径比较数值 —— 同一段数据两种锚点会得到不同结果是**预期**,
+    不是 bug; 同一锚点下必须逐位稳定。
+    """
+    n = len(closes)
+    if n == 0:
+        return [], [], []
+    kf, ks, ks9 = 2.0 / (fast + 1), 2.0 / (slow + 1), 2.0 / (signal + 1)
+    if anchor is None:
+        # 朴素播种: 必须走 _ema_naive_series, 与历史 calc_macd **逐位**一致 (见其注释)
+        ef = _ema_naive_series(closes, fast)
+        es = _ema_naive_series(closes, slow)
+        dif = [ef[j] - es[j] for j in range(n)]
+        dea = _ema_naive_series(dif, signal)
+    else:
+        ef_a, es_a, dea_a = (float(x) for x in anchor)
+        ef = ema_fwd(closes, fast, ef_a)     # 从"前一根状态"接力, 无瞬态
+        es = ema_fwd(closes, slow, es_a)
+        dif = [ef[j] - es[j] for j in range(n)]
+        dea = ema_fwd(dif, signal, dea_a)
+    hist = [2.0 * (dif[j] - dea[j]) for j in range(n)]
+    return dif, dea, hist
+
+
+def calc_macd(closes, fast=12, slow=26, signal=9, anchor=None):
     """计算MACD, 返回 (dif, dea, macd_hist) 三个序列
 
     MACD柱 = 2*(DIF-DEA), DIF=EMA(fast)-EMA(slow), DEA=EMA(DIF,signal)
+
+    anchor: 可选锚点 (ema_fast, ema_slow, dea) —— 用于短窗口精确接力长窗口,
+    见 `macd_state` / `macd_core`。缺省 None = 朴素播种 (与历史口径逐位一致)。
+    长度门槛 (n < slow+signal → 全 None) 是本公开口径的既有契约, 保持不变。
     """
     n = len(closes)
     if n < slow + signal:
         return None, None, None
-    # 计算EMA序列
-    ema_fast = [0.0] * n
-    ema_slow = [0.0] * n
-    k_f = 2 / (fast + 1)
-    k_s = 2 / (slow + 1)
-    ema_fast[0] = closes[0]
-    ema_slow[0] = closes[0]
-    for i in range(1, n):
-        ema_fast[i] = closes[i] * k_f + ema_fast[i-1] * (1 - k_f)
-        ema_slow[i] = closes[i] * k_s + ema_slow[i-1] * (1 - k_s)
-    # DIF序列
-    dif = [ema_fast[i] - ema_slow[i] for i in range(n)]
-    # DEA = EMA(DIF, signal)
-    dea = [0.0] * n
-    k_sig = 2 / (signal + 1)
-    dea[0] = dif[0]
-    for i in range(1, n):
-        dea[i] = dif[i] * k_sig + dea[i-1] * (1 - k_sig)
-    # MACD柱 = 2*(DIF-DEA)
-    hist = [2 * (dif[i] - dea[i]) for i in range(n)]
-    return dif, dea, hist
+    return macd_core(closes, fast, slow, signal, anchor=anchor)
 
 
 def calc_bollinger_bw(closes, period=20, num_std=2):

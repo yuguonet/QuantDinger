@@ -25,10 +25,57 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.market_cn.auto.core.market import MarketSpec, get_board_type, is_limit_up
+from app.market_cn.auto.core.runtime import resume as RES   # 断点续传单一内核
 
 
 class AsOfViolation(Exception):
     """调用方试图读取未来 bar (k>0)。"""
+
+
+# ================================================================
+# 指标缓存的**跨 Ctx 共享** (B2, 2026-10-04)
+# ================================================================
+# 背景: _macd / _kdj / _boll / _atr 都是"从 bars[0] 因果递推到 i"的纯函数,
+#   **只依赖 (bars[0..i], 各自的窗口参数)**, 不读 params / stock_info / ext。
+#   已逐个核对四个 _xxx 实现, 缓存键分别为 (fast,slow,signal) / (n,ks,ds) /
+#   (n,mult) / (n), 除此之外再无输入 —— 所以跨 Ctx 共享是**数学恒等**, 不是近似。
+#
+# 旧实现每 Ctx 一份 _ind_cache ⇒ `precompute_night` 对同一 (bars, i) 的每个候选
+#   lu 各建一个 Ctx, 4 个指标被重复算 N 次 (N = 历史涨停日数, dragon_callback
+#   的 enumeration=limit_up 可达几十)。这是展示管线夜算的主要重复计算源。
+#
+# ⚠️ 键**必须含 i** (本改动最容易翻车的地方):
+#   这 4 个函数都按 `m = self.i + 1` 截断后缓存数组; 只按 id(bars) 共享会让不同 i
+#   的 Ctx 拿到被截短的数组 → 列表索引越界或取到错误值。
+#
+# ⚠️ 条目持有 bars 引用 (不是裸 id): 防止 bars 被 GC 后 id() 被新对象复用而命中
+#   别人的缓存。命中前再核对 `is`, 不符就重建。
+#
+# 体积上限 FIFO 淘汰: 共享收益集中在"同一 (bars,i) 连续构造多个 Ctx"那段,
+#   小容量就够, 避免全市场扫描时堆几千份 O(n) 数组。
+# ================================================================
+_IND_CACHE: Dict[Any, Any] = {}          # (id(bars), i) -> (bars, {"macd":{},...})
+_IND_CACHE_CAP = 256
+
+
+def shared_ind_cache(bars: List[Any], i: int, resume_key: Any = None) -> Dict[str, Dict[Any, Any]]:
+    """取 (bars, i) 的共享指标缓存; 无则新建。
+
+    调用方**不得**修改键空间 (键 = 各指标函数自己的窗口参数元组)。
+    Returns:
+        dict: {"macd": {}, "kdj": {}, "boll": {}, "atr": {}} 形态的缓存容器。
+    """
+    key = (id(bars), int(i), resume_key)
+    hit = _IND_CACHE.get(key)
+    if hit is not None and hit[0] is bars:
+        return hit[1]
+    fresh: Dict[str, Dict[Any, Any]] = {"macd": {}, "kdj": {}, "boll": {}, "atr": {}}
+    if len(_IND_CACHE) >= _IND_CACHE_CAP:
+        for stale in list(_IND_CACHE)[: _IND_CACHE_CAP // 4]:   # dict 保序 = FIFO
+            _IND_CACHE.pop(stale, None)
+    _IND_CACHE[key] = (bars, fresh)
+    return fresh
+
 
 
 class Ctx:
@@ -60,9 +107,17 @@ class Ctx:
                  latest: Optional[Dict[str, Any]] = None,
                  series: Optional[List[Dict[str, Any]]] = None,
                  mkt_gain: Optional[float] = None,
-                 market: Optional[MarketSpec] = None):
+                 market: Optional[MarketSpec] = None,
+                 resume: Optional[Dict[tuple, Any]] = None,
+                 i_age: Optional[int] = None):
         self.bars = bars
         self.i = i
+        #: **逻辑数据年龄** (2026-10-05 新增, 可选): 该票自数据起点累计的日线根数。
+        #: ★ 与 `i` 的区别: `i` 是**本次传入 bars 内**的下标; 增量/播种路径下 bars
+        #:   只是窗口 (可能仅 21~35 根), 而票的真实历史有几百根 —— 暖机类门
+        #:   (如 g56 的 `warmup() >= 68`) 判的是"这票有多少历史", 必须用 `i_age`。
+        #: ⚠ 缺省 None = 视作 `i_age == i` (旧语义, 逐位一致); 只有**播种路径**才该传。
+        self.i_age = i_age
         self.lu_idx = lu_idx
         self.params = params
         self.board_type = board_type
@@ -73,10 +128,18 @@ class Ctx:
         self.latest = latest
         self.series = series if series is not None else []
         self.mkt_gain = mkt_gain
+        #: 断点续传状态 (core.runtime.resume.ResumeBook 取出的 dict):
+        #:   key = ("macd", fast, slow, signal) / ("kdj", n, ks, ds) / ...
+        #:   语义 = "bars[0] **之前**那一根结束时"的有界摘要; 缺省 {} = 全量重算。
+        #: 由**预处理**产出、实时消费, 见 resume.py 模块头的等价性契约。
+        self.resume = resume or {}
         self.n = len(bars)
         # 指标缓存（每 Ctx 自带；等价回测/展示不依赖这些指标，O(n) 单次可接收）。
         # 如需跨候选日共享，可改 id(bars) 受限缓存，但必须保证只依赖 bars 与参数（as-of 安全）。
-        self._ind_cache: Dict[str, Dict[Any, Any]] = {"macd": {}, "kdj": {}, "boll": {}, "atr": {}}
+        # B2 (2026-10-04): 跨 Ctx 共享, 键含 i —— 见模块级 shared_ind_cache 的注意事项
+        # B2: 跨 Ctx 共享, 键含 i 与 resume 指纹 (见 shared_ind_cache 注释)
+        self._ind_cache: Dict[str, Dict[Any, Any]] = shared_ind_cache(
+            bars, self.i, id(self.resume) if self.resume else None)
 
     # ---- 内部：只暴露 ≤ i 的 bar；k>0 直接拒（未来函数） ----
     def _bar(self, k: int) -> Optional[Dict[str, Any]]:
@@ -214,37 +277,30 @@ class Ctx:
     # ----------------------------------------------------------------
     # 技术指标（M2 补齐：MACD / KDJ / BOLL / ATR）
     # as-of 安全：所有序列都从 bars[0] 因果递推，访问只取 ≤ i+k 的索引；
-    # 缓存 self._ind_cache 每 Ctx 自带（见 __init__）。
+    # 缓存 self._ind_cache **按 (bars, i) 跨 Ctx 共享**（见模块级 shared_ind_cache）。
     # 约定：所有偏移函数的 k 必须是第一个位置参数（见上方 ma/rsi）。
     # ----------------------------------------------------------------
-    @staticmethod
-    def _ema(values: List[float], period: int) -> List[float]:
-        """指数平滑（从 index 0 递推，因果安全）。未足 period 也给出递推值。"""
-        n = len(values)
-        out = [0.0] * n
-        if n == 0:
-            return out
-        a = 2.0 / (period + 1)
-        out[0] = values[0]
-        for j in range(1, n):
-            out[j] = a * values[j] + (1.0 - a) * out[j - 1]
-        return out
+    # (原 Ctx._ema 已于 2026-10-05 删除: MACD 改走 core.runtime.resume 单一内核,
+    #  本地那份 EMA 变成死代码 —— 死代码是"看起来有实现、实际零作用"的隐患, 不留。)
 
     # ---- MACD（DIF / DEA / MACD柱，柱=2*(DIF-DEA) 的 A股惯例）----
     # 因果切片 [0..i]：EMA 从 index 0 递推，dif[i] 只依赖 closes[0..i]，与 common/indicators
     # 的 calc_macd(closes[:i+1]) 逐值一致；as-of 安全（绝不读 > i 的 bar）。
     def _macd(self, fast: int, slow: int, signal: int):
+        """MACD —— 委托 core.runtime.resume (单一内核, 见 resume.py 模块头)。
+
+        `self.resume` 非空时用断点状态续算 (逐位 == 全量), 否则全量重算。
+        两种路径的口径同源, 不再有"两套 MACD 靠注释约定一致"的漂移风险。
+        """
         cache = self._ind_cache["macd"]
         key = (fast, slow, signal)
         if key not in cache:
             m = self.i + 1
-            closes = [self._f(self.bars[j], "close") for j in range(m)]
-            ema_f = self._ema(closes, fast)
-            ema_s = self._ema(closes, slow)
-            dif = [ema_f[j] - ema_s[j] for j in range(m)]
-            dea = self._ema(dif, signal)
-            hist = [2.0 * (dif[j] - dea[j]) for j in range(m)]
-            cache[key] = (dif, dea, hist)
+            bars_i = self.bars[:m]
+            st = self.resume.get(("macd", fast, slow, signal))
+            cache[key] = (RES.macd_resume(st, bars_i, fast, slow, signal)
+                          if st is not None else
+                          RES.macd_compute(bars_i, fast, slow, signal))
         return cache[key]
 
     def macd_dif(self, k: int = 0, fast: int = 12, slow: int = 26, signal: int = 9) -> float:
@@ -267,24 +323,14 @@ class Ctx:
 
     # ---- KDJ（RSV n 日；K/D 用 1/3 权重平滑）---- 因果切片 [0..i]
     def _kdj(self, n: int, ks: int, ds: int):
+        """KDJ —— 委托 core.runtime.resume (state = (K, D, 最近 n 根 (h,l,c)))。"""
         cache = self._ind_cache["kdj"]
         key = (n, ks, ds)
         if key not in cache:
-            m = self.i + 1
-            K = [0.0] * m
-            D = [0.0] * m
-            J = [0.0] * m
-            k_prev, d_prev = 50.0, 50.0
-            for j in range(m):
-                lo = max(0, j - n + 1)
-                hi = max(self._f(self.bars[t], "high") for t in range(lo, j + 1))
-                low = min(self._f(self.bars[t], "low") for t in range(lo, j + 1))
-                c = self._f(self.bars[j], "close")
-                rsv = ((c - low) / (hi - low) * 100.0) if hi > low else 50.0
-                k_prev = (2.0 / 3.0) * k_prev + (1.0 / 3.0) * rsv
-                d_prev = (2.0 / 3.0) * d_prev + (1.0 / 3.0) * k_prev
-                K[j], D[j], J[j] = k_prev, d_prev, 3.0 * k_prev - 2.0 * d_prev
-            cache[key] = (K, D, J)
+            bars_i = self.bars[: self.i + 1]
+            st = self.resume.get(("kdj", n, ks, ds))
+            cache[key] = (RES.kdj_resume(st, bars_i, n, ks, ds) if st is not None
+                          else RES.kdj_compute(bars_i, n, ks, ds))
         return cache[key]
 
     def kdj_k(self, k: int = 0, n: int = 9, ks: int = 3, ds: int = 3) -> float:
@@ -307,25 +353,14 @@ class Ctx:
 
     # ---- BOLL（中轨 MA / 上下轨 ±mult·σ，总体标准差）---- 因果切片 [0..i]
     def _boll(self, n: int, mult: float):
+        """BOLL —— 委托 core.runtime.resume (state = 最近 n 根 close 窗口)。"""
         cache = self._ind_cache["boll"]
         key = (n, mult)
         if key not in cache:
-            m = self.i + 1
-            mid = [0.0] * m
-            up = [0.0] * m
-            low = [0.0] * m
-            for j in range(m):
-                lo = max(0, j - n + 1)
-                vals = [v for v in (self._f(self.bars[t], "close")
-                                    for t in range(lo, j + 1)) if v > 0]
-                if len(vals) >= 2:
-                    m_ = sum(vals) / len(vals)
-                    var = sum((v - m_) ** 2 for v in vals) / len(vals)
-                    sd = var ** 0.5
-                    mid[j], up[j], low[j] = m_, m_ + mult * sd, m_ - mult * sd
-                elif vals:
-                    mid[j] = up[j] = low[j] = vals[0]
-            cache[key] = (mid, up, low)
+            bars_i = self.bars[: self.i + 1]
+            st = self.resume.get(("boll", n, mult))
+            cache[key] = (RES.boll_resume(st, bars_i, n, mult) if st is not None
+                          else RES.boll_compute(bars_i, n, mult))
         return cache[key]
 
     def boll_mid(self, k: int = 0, n: int = 20, mult: float = 2.0) -> float:
@@ -348,27 +383,18 @@ class Ctx:
 
     # ---- ATR（Wilder 平滑真实波幅）---- 因果切片 [0..i]
     def _atr(self, n: int):
+        """ATR —— 委托 core.runtime.resume (state = (末根 atr, warm, 末根 close))。
+
+        ⚠️ 断点状态必须含 `末根 close`: 后缀首根的 TR 要拿它当"前一根收盘",
+           缺了就退化成 `h-l` ⇒ 不等价 (resume.py:_tr_series 注释有实测记录)。
+        """
         cache = self._ind_cache["atr"]
         key = n
         if key not in cache:
-            m = self.i + 1
-            tr = [0.0] * m
-            for j in range(m):
-                h = self._f(self.bars[j], "high")
-                l = self._f(self.bars[j], "low")
-                if j == 0:
-                    tr[j] = h - l
-                else:
-                    pc = self._f(self.bars[j - 1], "close")
-                    tr[j] = max(h - l, abs(h - pc), abs(l - pc))
-            atr = [0.0] * m
-            if m >= n and n > 0:
-                atr[n - 1] = sum(tr[:n]) / n
-                for j in range(n, m):
-                    atr[j] = (atr[j - 1] * (n - 1) + tr[j]) / n
-            elif m > 0:
-                atr[m - 1] = sum(tr) / m
-            cache[key] = atr
+            bars_i = self.bars[: self.i + 1]
+            st = self.resume.get(("atr", n))
+            cache[key] = (RES.atr_resume(st, bars_i, n) if st is not None
+                          else RES.atr_compute(bars_i, n))
         return cache[key]
 
     def atr(self, k: int = 0, n: int = 14) -> float:

@@ -53,7 +53,24 @@ def _now_hm() -> str:
 
 
 def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    """本 tick 的"今天" (YYYY-MM-DD) —— **委托 store.today_str(), 单一事实源**。
+
+    A7 (2026-10-05): 原先这里自己调 `datetime.now()` 而 store 侧用 SQL
+    `CURRENT_DATE`(DB 会话是 UTC, 见 db_postgres.py:144 的
+    `options="-c timezone=UTC"`) ⇒ 两套时钟。北京时间 00:00~07:59 时二者不在同一天,
+    影响 exit_today 平账 (出口 B 判 `marked >= today`) 与日期窗口的边界。
+    现统一到 store.today_str()。
+
+    ⚠️ 遗留隐患 (未改, 不在 A7 点名范围): `snapshot_day_done()` 仍用
+      `time::date = CURRENT_DATE` 判当日快照是否落齐。若该表 time 存的是本地时间戳,
+      同样会错一格 —— 改它需要先确认 time 列的写入时区, 本次未动。
+    """
+    return ds.today_str()
+
+
+#: 每 tick 拉取的候选集回看窗口 —— 来自 store.VISIBLE_WINDOW_DAYS (**不要**在本地重定义,
+#: 否则"展示层可见 / monitor 可扫"两个窗口会各自漂移, A5 复现)。
+_VISIBLE_DAYS = ds.VISIBLE_WINDOW_DAYS
 
 
 def _last_trade_day() -> str:
@@ -290,10 +307,17 @@ def run_monitor():
     if stuck:
         logger.warning("[monitor] 滞留 buy_today 自愈转 holding %d 行 (确认窗口错过)", len(stuck))
 
-    pending = ds.list_signals(states=(ds.S_WATCH_PENDING,), days=8)
-    buy_rows = ds.list_signals(states=(ds.S_BUY_TODAY,), days=8)
-    hold_rows = ds.list_signals(states=(ds.S_HOLDING,), days=8)
-    exit_rows = ds.list_signals(states=(ds.S_EXIT_TODAY,), days=8)
+    # A5 (2026-10-05, 收口另一半): `days` 必须 ≥ 展示层可见窗口 —— 原实现 8 天,
+    #   而 `get_active_signals` 是 30 天 ⇒ **展示层看得到、monitor 扫不到**的行会
+    #   静静挂在自选股里: watch_pending 永不过期, 直到 days=30 窗口外/被 cleanup 删除。
+    #   (这也是 A5 首修时把 stale 清理移出 09:25~09:35 窗口后仍修复不全的根因 ——
+    #    那些行**连候选集都进不来**。)
+    # ★ `today=` 显式传入 ⇒ 同一 tick 内四处查询共用一条日期线, 跨零点不自相矛盾。
+    _win = ds.VISIBLE_WINDOW_DAYS
+    pending = ds.list_signals(states=(ds.S_WATCH_PENDING,), days=_win, today=today)
+    buy_rows = ds.list_signals(states=(ds.S_BUY_TODAY,), days=_win, today=today)
+    hold_rows = ds.list_signals(states=(ds.S_HOLDING,), days=_win, today=today)
+    exit_rows = ds.list_signals(states=(ds.S_EXIT_TODAY,), days=_win, today=today)
 
     stats = {"pending": len(pending), "buy": len(buy_rows),
              "holding": len(hold_rows), "exit": len(exit_rows)}
@@ -303,13 +327,28 @@ def run_monitor():
     #      cand/stale 均取自本 tick 的 pending 快照, 守卫不拦正常路径, 只挡「行已被并发
     #      买入/推进后仍按过期快照写」。无守卫时并发会把已入场行作废 (遗忘持仓) 或覆盖
     #      entry_price (收益统计失真), 亦会突破 daily_limit 名额。
-    if in_window(W_OPEN_LO, W_OPEN_HI, hm) and pending:
-        target = _last_trade_day()
-        cand = [r for r in pending if str(r.get("trade_date"))[:10] == target]
+    # ── 1b. stale 观察票过期 (A4, 2026-10-05) ──
+    #      原实现把 stale 清理**绑死在 09:25~09:35 开盘窗口内**, 错过 (进程重启 /
+    #      调度抖动 / 跨周末节假日后首个 tick 不在窗口内) 就当天永不过期, 该行以
+    #      灰「观察」身份滞留自选股, 最长到 get_active_signals 的 days=30。
+    #      watch_pending 是**未入场**行, 没有任何理由过夜 —— 与"已入场行一律可见"
+    #      红线相反。故移出窗口条件, 每 tick 都可清。
+    target = _last_trade_day()
+    if pending:
         stale = [r for r in pending if str(r.get("trade_date"))[:10] < target]
         for r in stale:
-            ds.set_state(r["id"], ds.S_EXPIRED, detail={"reason": "隔日未处理,过期"},
-                         expect_state=ds.S_WATCH_PENDING)
+            n_exp = ds.set_state(r["id"], ds.S_EXPIRED,
+                                 detail={"reason": "隔日未处理,过期", "sweep_ts": hm},
+                                 expect_state=ds.S_WATCH_PENDING)
+            if n_exp:
+                stats["stale_expired"] = stats.get("stale_expired", 0) + 1
+        if stale:
+            logger.info("[dragon_monitor] 过期观察票 %d 行 (trade_date < %s)",
+                        len(stale), target)
+
+    if in_window(W_OPEN_LO, W_OPEN_HI, hm) and pending:
+        cand = [r for r in pending if str(r.get("trade_date"))[:10] == target]
+        stale = []   # 已在 1b 统一清理, 本窗口内不再重复
         # 禁用策略的存量 pending 直接过期 (09-15 事故修复: 停扫只断新信号,
         # 已入库的 pending 行此前仍会在开盘窗口被买入)
         # 2026-09-26: 批量走 store.retire_unfilled (唯一实现)。
@@ -429,9 +468,14 @@ def run_monitor():
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
                     continue
                 # 策略 live 出场 (relay3 S4 炸板即卖 / knife_catch D1开盘卖; 其它策略 live → hold)
+                # ⚠ "open" 必须注入: 策略侧写的是 `snap.get("open") or snap.get("last")`,
+                #    而本 snap 默认只有 mode/series/today ⇒ 不注入就恒回退 last (09:35 首拍价),
+                #    knife_catch/tail_oversold 的「D1 开盘卖」会静默变成「盘中价卖」。
+                #    快照 row 自带 open 列 (hub._fetch_snapshots_by_date), 取当日开盘价。
                 dec = s_obj.exit_decision(r, snap={"mode": "live",
                                                    "series": series_all.get(r["code"]) or [],
-                                                   "today": today})
+                                                   "today": today,
+                                                   "open": float(snap.get("open") or 0)})
                 if dec.action == "exit" and dec.price:
                     ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=dec.reason,
                                  exit_price=round(float(dec.price), 3),
@@ -516,36 +560,83 @@ def run_monitor():
 
     # ── 6. exit_today 执行平账 → closed ──
     #      A3 收尾 (2026-09-28): 2 处平账写入带 expect_state=exit_today —— 行集取自本 tick
-    #      的 exit_rows 快照; 幂等原靠 `if r.get("exit_date"): continue` (快照层), 但拦不住
-    #      「快照后行已被并发推进到其它终态」的情形 (会被写回 closed, 状态机倒退)。
+    #      的 exit_rows 快照; 幂等原靠快照层去重, 但拦不住「快照后行已被并发推进到其它
+    #      终态」的情形 (会被写回 closed, 状态机倒退)。
     #    默认: 隔日开盘执行 (补记账, exit_price 覆写为实际开盘价);
     #    exit_exec_same_day 策略 (knife_catch D1当日卖): 当日 14:55 后平账, 保留标记时价格
+    #
+    #      A1 (2026-10-04, 资金红线): 原 `if r.get("exit_date"): continue` 是**永久阻断** ——
+    #      rebuild.replay_ledger 写入的行是 `state=exit_today` 且 `exit_date` 已填、不写
+    #      extra.marked (见 rebuild.py:656-660), 一进本步就被跳过且永远不再处理:
+    #      不出组 (exit_today ∈ ACTIVE_GROUP_STATES)、不平账、不告警, 一直挂到
+    #      cleanup_old 的 24 日历日后被物理删除 ⇒ 「卖点出现的股票几天了还在自选股」。
+    #      而 reconcile_startup 每次重启比对指纹, 任何策略改动 → trigger_rebuild 重写
+    #      已推进行 ⇒ 触发频率极高。
+    #      改法: exit_date 已填的 exit_today = **已知终态**, 直接补记 closed;
+    #            exit_date/exit_price **保留已有值, 不重算** (实盘口径优先, 见 A2 方案3)。
+    #
+    #      A5 (2026-10-04): 本步原有 4 个静默 `continue` (exit_date 已填 / marked>=today /
+    #      无快照 / 无开盘价), 零日志零计数 —— 平账链断了没人知道, 与项目 MEMORY 点名的
+    #      「声明了但没接线」静默断链同构。现在每个出口都计数+告警, stats 带
+    #      exit_stuck_breakdown 供上层/体检读取。
+    exit_settled = 0
+    exit_stuck = {"already_dated": 0, "marked_today": 0, "no_snapshot": 0, "no_open_px": 0}
     if hm >= "09:30":
         for r in exit_rows:
+            code = r.get("code")
             if r.get("exit_date"):
+                # 出口 A (A1): 已有出场日 = 已知终态 → 收口出组, **保留** exit_date/exit_price
+                n = ds.set_state(r["id"], ds.S_CLOSED,
+                                 detail={"settled": "already_dated", "settled_ts": hm},
+                                 expect_state=ds.S_EXIT_TODAY)
+                if n:
+                    exit_settled += 1
+                    logger.info("[dragon_monitor] 平账收口(已有出场日, 保留原价) %s/%s "
+                                "exit_date=%s exit_price=%s",
+                                code, r.get("strategy"), r.get("exit_date"),
+                                r.get("exit_price"))
                 continue
             marked = (r.get("extra") or {}).get("marked") or str(r.get("updated_at"))[:10]
             s_obj = _strategy_of(r)
             same_day = s_obj is not None and getattr(s_obj, "exit_exec_same_day", False)
             if same_day:
                 if marked >= today and hm < "14:55":
-                    continue      # 当日执行的行, 等到尾盘再平账
+                    exit_stuck["marked_today"] += 1      # 当日执行的行, 等到尾盘再平账 (正常)
+                    continue
                 keep_px = float(r.get("exit_price") or 0)
                 ds.set_state(r["id"], ds.S_CLOSED, exit_date=today,
                              exit_price=round(keep_px, 3) if keep_px > 0 else None,
                              expect_state=ds.S_EXIT_TODAY)
+                exit_settled += 1
                 continue
             if marked >= today:
+                exit_stuck["marked_today"] += 1          # 隔日执行: 今天刚标记的, 明早再平 (正常)
                 continue
             snaps = latest_snapshot([r["code"]])
             snap = snaps.get(r["code"])
             if not snap:
+                exit_stuck["no_snapshot"] += 1
+                logger.warning("[dragon_monitor] 平账卡住·无当日快照 %s/%s "
+                               "exit_date=%s marked=%s (停牌/快照未回填?)",
+                               code, r.get("strategy"), r.get("exit_date"), marked)
                 continue
             open_px = float(snap.get("open") or snap.get("last") or 0)
             if open_px <= 0:
+                exit_stuck["no_open_px"] += 1
+                logger.warning("[dragon_monitor] 平账卡住·无开盘价 %s/%s marked=%s",
+                               code, r.get("strategy"), marked)
                 continue
             ds.set_state(r["id"], ds.S_CLOSED, exit_date=today, exit_price=round(open_px, 3),
                          expect_state=ds.S_EXIT_TODAY)
+            exit_settled += 1
+    stats["exit_settled"] = exit_settled
+    # 真正的卡死 = no_snapshot / no_open_px; already_dated 是 A1 新增的收口路径;
+    # marked_today 属正常待执行, 不算卡
+    stats["exit_stuck"] = exit_stuck["no_snapshot"] + exit_stuck["no_open_px"]
+    stats["exit_stuck_breakdown"] = exit_stuck
+    if stats["exit_stuck"]:
+        logger.warning("[dragon_monitor] 平账卡住 %d 行: %s (长期卡住会让票留在自选股, 见 A1)",
+                       stats["exit_stuck"], exit_stuck)
 
     # ── 7. 清理过期瞬时标记: pre_confirm/pre_ts/pre_reason 只在"当日买入行"期间有意义 ──
     #      设计口径: 14:25 加"预"角标 → **15:00 正式确认覆盖** (docs/龙回头自动化设计方案.md:92/154)。

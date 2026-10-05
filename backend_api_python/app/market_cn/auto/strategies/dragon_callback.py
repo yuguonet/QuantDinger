@@ -476,6 +476,13 @@ class DragonCallbackStrategy(StrategyBase):
                         "turn": 6, "d0_chg": 7, "quality": 7, "dedup": 8, "prefilter": 9,
                         "engine_skip": 9, "signal": 10}
 
+    # ---- 断点续传: 本策略**数学上不可启用** ----
+    # ⚠️ `enumeration=limit_up`: 候选 = **窗口内**的历史涨停日, 且 lu_idx 是绝对索引
+    #    ⇒ 截窗会削减候选本身 (实测 e2e 465→161), 断点**救不回**。
+    #    要启用必须先把涨停日列表持久化成断点状态 (另案, 需授权改 `_candidate_lus` 语义)。
+    # 声明这里后 `pipeline` 自动排除本策略 —— 框架侧不再硬编码任何策略 key。
+    resume_supported = False
+
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
                      use_tech_score=True, probe=None, **params):

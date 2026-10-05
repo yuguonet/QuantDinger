@@ -680,7 +680,8 @@ def build_ledger_plan(replay, actual, meta):
     停用策略: 未入场行 → expired; 已入场行**保留** (历史账, 不属本次校准范围)
 
     Returns:
-        dict: {upsert, insert, expire, disabled_sweep, keep_disabled, vanish_settled, ...}
+        dict: {upsert, insert, expire, disabled_sweep, keep_disabled, vanish_settled,
+               keep_actual, keep_marked, ...}
     """
     from app.market_cn.auto import registry
     from app.market_cn.auto.store import S_WATCH_PENDING
@@ -690,10 +691,20 @@ def build_ledger_plan(replay, actual, meta):
 
     upsert, insert, expire, keep_disabled, vanish_settled = [], [], [], [], []
     keep_actual = []   # A2 守卫 (2026-09-28): 重放无权改写的已推进真实行
+    keep_marked = []   # A2 守卫 (2026-10-04): 重放无权改写的**已标记出场**行
     for k, r in replay.items():
         a = actual.get(k)
         if a is None:
             insert.append(r)
+        elif a.get("exit_reason"):
+            # A2 (2026-10-04, 方案3, 用户裁定): 出场标记一经写入即**资金事实** ——
+            # 实盘已按真实成交路径记账 (盘中止损/live 标记价/当日平账价), 而 replay 是
+            # `exit_decision(mode="day_close")` 的**回测口径**, 二者本就不同源
+            # (见 monitor 模块头: 「回测尾盘卖按当日收盘成交, 自动化未执行者次日开盘记账」)。
+            # 无守卫时 replay 会用回测价**覆写实盘价**, 超短策略 (tail_oversold/knife_catch,
+            # alpha=隔夜跳空) 的账面收益被系统性带偏。
+            # 与 `_set_state(only_unexited=True)` 同一原则, 此处补齐 rebuild 侧的缺失。
+            keep_marked.append((k, a.get("state"), r.get("state")))
         elif a.get("entry_date") and not r.get("entry_date"):
             # A2: actual 已真实入场 (monitor 盘中按实时数据买入) 而重放行是
             # 占位「待次日确认(末根)」或被日线口径拒绝 (无 entry 字段) ——
@@ -726,7 +737,7 @@ def build_ledger_plan(replay, actual, meta):
     return {"upsert": upsert, "insert": insert, "expire": expire,
             "disabled_sweep": disabled_sweep, "keep_disabled": keep_disabled,
             "vanish_settled": vanish_settled, "disabled": disabled,
-            "keep_actual": keep_actual,
+            "keep_actual": keep_actual, "keep_marked": keep_marked,
             "n_replay": len(replay), "n_actual": len(actual)}
 
 
@@ -735,6 +746,7 @@ def apply_ledger_plan(plan, dry_run=True):
     from app.market_cn.auto.store import S_EXPIRED, S_WATCH_PENDING
     stat = {"upserted": 0, "inserted": 0, "expired": 0, "sweep_expired": 0,
             "insert_skipped": 0, "kept_actual": len(plan.get("keep_actual") or []),
+            "kept_marked": len(plan.get("keep_marked") or []),
             "dry_run": bool(dry_run)}
     if dry_run:
         stat.update({"upserted": len(plan["upsert"]), "inserted": len(plan["insert"]),
@@ -851,6 +863,9 @@ def render_ledger(plan, stat, replay_stat):
     p("  作废 (重放集外)    = %d   (启用策略: 当前规则下不成立)" % stat.get("expired", 0))
     p("  停用策略未入场作废 = %d" % stat.get("sweep_expired", 0))
     p("  保留 (停用策略已入场) = %d" % len(plan.get("keep_disabled") or []))
+    km = plan.get("keep_marked") or []
+    if km:
+        p("  跳过·已标记出场(A2 资金事实) = %d" % len(km))
     if stat.get("cleanup"):
         p("  收尾 cleanup_old    = %s" % stat["cleanup"])
     vs = plan.get("vanish_settled") or []
@@ -861,6 +876,13 @@ def render_ledger(plan, stat, replay_stat):
             p("     %s %-14s %s : %s → %s" % (k[0], k[1], k[2], old, new))
         if len(vs) > 20:
             p("     ... 其余 %d 条" % (len(vs) - 20))
+    if km:
+        p("")
+        p("  ✓ 已标记出场行保留实盘记账价 = %d 条 (A2: replay 不得回测口径覆写, 最多列 20):" % len(km))
+        for k, old, new in km[:20]:
+            p("     %s %-14s %s : 实盘=%s / 重放=%s (保留实盘)" % (k[0], k[1], k[2], old, new))
+        if len(km) > 20:
+            p("     ... 其余 %d 条" % (len(km) - 20))
     return "\n".join(L)
 
 
@@ -878,6 +900,8 @@ def render_apply(plan, stat):
     p("  作废未推进 ghost   = %d" % stat.get("expired", 0))
     p("  修正未推进行字段   = %d" % stat.get("fixed", 0))
     p("  跳过·已推进历史账  = %d" % len(plan.get("keep_settled") or []))
+    if stat.get("kept_marked"):
+        p("  跳过·已标记出场    = %d   (A2: 保留实盘记账价)" % stat["kept_marked"])
     p("  跳过·早于清理边界  = %d   (边界 %s)" % (len(plan.get("keep_purged") or []),
                                               plan.get("keep_from")))
     if stat.get("cleanup"):

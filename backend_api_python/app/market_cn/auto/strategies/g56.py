@@ -74,6 +74,7 @@ from app.market_cn.auto.core.indicators import calc_macd
 from app.market_cn.auto.core.market import default_market, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
+from app.market_cn.auto.core.runtime.resume import ResumePoint
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -351,9 +352,55 @@ class G56Strategy(StrategyBase):
     default_params = dict(DEFAULT_PARAMS)
     use_unified_prefilter = False      # 与 tmp 回测口径一致 (无 U1~U4)
 
+    # ---- 断点记忆点声明 (2026-10-05, 见 core/runtime/resume.py) ----
+    # 策略只声明"要什么", 展示层 (core/present/resume_io.py) 只搬运不解释。
+    # g56 的 G1 特征 (rhist_chg / dif0) 上游是 MACD —— EMA 无限记忆,
+    # 所以断点状态是刚需; ATR14 同理 (Wilder 递推)。
+    # kind 不带前缀是因为用**标准注册表** (core/runtime/resume.RESUMABLE);
+    # 若日后 g56 要存私有量 (如横截面池聚合), 用 kind="g56/pool" 并自带 codec。
+    resume_points = (
+        ResumePoint("macd", (12, 26, 9),
+                    at="window_start",
+                    note="DIF/DEA/hist 序列; rhist_chg/dif0 的上游 (EMA 无限记忆)"),
+        ResumePoint("atr", (14,),
+                    at="window_start",
+                    note="Wilder ATR14 序列; G1 池 atr 门的上游"),
+        # ★ 2026-10-05 补全: 只声明 macd+atr 时, keep=40 下 kdj 的 K/D/J 有 36 个
+        #   读数与全量不等 (误差 8.4e-4)。KDJ 的 K/D 是 (2/3,1/3) 无限记忆递推,
+        #   BOLL 需 20 根窗口 —— 两者都必须有断点, 否则**截窗即算错且不报错**。
+        #   (声明面必须覆盖"实际会读到的全部长记忆读数", 少一个就是静默错算。)
+        ResumePoint("kdj", (9, 3, 3),
+                    at="window_start",
+                    note="K/D 是 (2/3,1/3) 无限记忆递推, J=3K-2D 放大误差"),
+        ResumePoint("boll", (20, 2.0),
+                    at="window_start",
+                    note="20 根滑窗; 窗口型状态 = 最近 20 根 close"),
+    )
+    # ★ 窗口声明 80 —— 三档下界必须分开看 (tmp/_g1_window_probe12.py, 12 票实测):
+    #     · **硬下界 35**: 低于此 `_g1_arrays` 直接 IndexError (dummy MACD 退化成
+    #       0 维数组); 与 `register_ext("g56", min_n=35)` 的 35 完全一致, 不是巧合。
+    #     · **门判定等价的最小窗口 ≈ 40** (加倍差分); g56 报 80 是留了余量。
+    #     · **特征数值浮点等价的最小窗口 = 240** ⚠
+    #       —— dif0 / rhist_chg 的上游是 MACD (EMA **无限记忆**): 80 根时误差是
+    #       容差的 **4e4 倍**, 160 根仍差 2e2 倍, 240 根才 OK。其余滑窗类
+    #       (ma20/atr/big20/pctb/rma/rsi) 35 根就已经浮点等价。
+    #   ⇒ **本行的 80 只保证"门判定结果"等价, 不保证"特征值"等价**。
+    #     今天无害是因为 present 管线的 `build_ext` 走**全量** bars (见 intraday_cycle
+    #     里那条 ⚠ 注释), 80 只作用于 Ctx 的递推读数 (实测展示层读数 0 次)。
+    #     ⚠ **谁要是把 `_g1_arrays` 接到截短窗口上, 必须先解决 MACD 的无限记忆**。
+    #   ★★ 2026-10-05 已解决 (方案2): `_g1_arrays(bars, macd_anchor=...)` 支持 EMA
+    #      初值播种, 锚由 `core/features/cross_section.g1_state_init/step` 维护
+    #      (**每日只推进一格, O(1)**)。实测 (tmp/_g1_seed_probe13.py, 60 票 × 5874 次推进):
+    #      播种后 `G1_WIN_MIN`=21 根即与全量**浮点等价**, 上面那个 240 的前提被消除。
+    #      ⇒ 本行 80 是**未播种**口径的余量值; 接了播种后可下调到 35 (给表达式回看留余量),
+    #        但下调前必须确认消费方真的走了 `g1_state_features` (否则 240 的坑原样回来)。
+    #   ⚠ 展示层的断点窗口取**各策略声明的最大值** ⇒ 本行一旦上调, 全市场其它策略
+    #     也跟着保留更长历史 (成本共享)。改小会让递推初值缺失 ⇒ 静默算错。
+    warmup = 80
+
     # ---- 信号判定: 只判末根bar (D-1); as_of=k 切片用于回测逐日枚举 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
-        if not bars or len(bars) < 68:
+        if not bars:
             return []
         if code.startswith(("8", "4", "92")):
             return []
@@ -364,20 +411,55 @@ class G56Strategy(StrategyBase):
             return []
         # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
         pool_target = str(bars[-1]["time"])[:10]
-        k = len(bars) - 1 if as_of is None else as_of
+        p = self.merged_params(params)
+        ok, st, f, k, sig_bars = self._gate_from_ledger(
+            code, board, pool_target, p, as_of)
+        if f is not None:                          # 台账路径已给出结论(含不通过)
+            return [_mk_signal(code, sig_bars, k, f, st)] if ok else []
         # 暖机/越界: 原实现对小 as_of 会因 np.convolve 广播失败而崩溃 (切片不足 20 根),
         # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
+        if len(bars) < 68:
+            return []
+        k = len(bars) - 1 if as_of is None else as_of
         if not (67 <= k < len(bars)):
             return []
         # 全序列一次算 f, 不再 _g1_arrays(bars[:k+1]): 指标全部因果, f_full[k] 逐位
         # == 截断重算的第 k 个值 (实证 29360 点 0 不一致, tmp/_g56_cost.py P1)
         f = _g1_arrays(bars)
         date_k = str(bars[k]["time"])[:10]
-        p = self.merged_params(params)
         ok, st = _g56_gate(f, _ensure_pool_daily(pool_target), board, k, date_k, p=p)
         if not ok:
             return []                              # G1池 & 56%门 & 横截面 regime 门
         return [_mk_signal(code, bars, k, f, st)]
+
+    # ---- 单票特征的**预处理台账**源 (2026-10-05): 日常只判末位, 不必重算全序列 ----
+    def _gate_from_ledger(self, code, board, pool_target, p, as_of):
+        """返回 (ok, st, f, k, bars_for_signal)；`f is None` ⇒ 台账不可用, 走全量。
+
+        ⚠ 只在 `as_of is None`(判当日) 启用: 台账快照**只有当日**, 没有历史序列,
+          回测逐日枚举(`scan_days` / `as_of` 有值) 必须走全量 `_g1_arrays`。
+        ⚠ 回退**不是静默降级**: 原因进 `g1_pool_source.LAST_REASON`, 且原路径照跑。
+        """
+        if as_of is not None:
+            return False, None, None, 0, None
+        try:
+            from app.market_cn.auto.core.features import g1_pool_source as PS
+            ls = PS.try_ledger_features(code, board, pool_target)
+            if ls is None:
+                return False, None, None, 0, None
+            f, k, mk, wb = ls
+            # ★★ 池**只能取一次**: `_ensure_pool_daily` 是单槽缓存, `prewarm`
+            #    已把台账源池填进去 ⇒ 这里命中即可(O(1))。
+            #    ⚠ 不要在此调 `try_ledger_pool` —— 那是"读池历史 + 聚合全序列",
+            #      单次 0.06s, **逐票**调 = 5204 × 0.06 ≈ 312s (实测台账模式
+            #      251s vs 全量 32.5s, 慢 7.7x —— 增量反而更慢, 就是这么来的)。
+            #      池与特征不同源是安全的: 门级对账已证两者逐票一致。
+            pool = _ensure_pool_daily(pool_target)
+            ok, st = _g56_gate(f, pool, board, k, pool_target, mask=mk, p=p)
+            return ok, st, f, k, wb
+        except Exception as e:                     # 台账源不得阻断扫描
+            logger.warning("[g56] 台账特征源异常(%s), 走全量: %s", code, e)
+            return False, None, None, 0, None
 
     # ---- 横截面预热 (声明制; 编排层调 prewarm 一次, 不硬编码策略 key) ----
     def prewarm(self, bars_map, hi_date):
@@ -387,6 +469,19 @@ class G56Strategy(StrategyBase):
         target 相同仍会命中 —— 但**停牌票末根早于全市场末日**会让锚跳变 ⇒ 反复重建
         全市场池。编排层统一预热 + `scan_days` 锚取 hi_date ⇒ 全批只建一次。
         """
+        # (2026-10-05) 优先用**预处理台账**的池历史重建横截面池；不可用 ⇒ 原全量路径。
+        #   收益实测: 池 3.41s → ~0.1s（取数 7.6s 是信号判定本身要的，省不掉）。
+        #   ★ 回退不是静默降级: 原因进 `g1_pool_source.LAST_REASON` + 下面这条日志。
+        #   关闭开关: 环境变量 G1_POOL_FROM_LEDGER=0
+        try:
+            from app.market_cn.auto.core.features import g1_pool_source as PS
+            lg = PS.default_ledger(win=PS.DEFAULT_WIN)
+            if lg is not None and PS.try_ledger_pool(lg, hi_date) is not None:
+                return
+            logger.info("[g56] 池走全量(台账源不可用: %s)",
+                        PS.LAST_REASON.get("try") or PS.LAST_REASON.get("default_ledger"))
+        except Exception as e:                       # 台账源不得阻断扫描
+            logger.warning("[g56] 台账源异常, 池改由批量路径自建: %s", e)
         _ensure_pool_daily(hi_date, bars_batch=bars_map)
 
     # ---- 覆盖基类 scan_days (批量契约): 与逐日调 scan_signals 等价, 但 O(n) 而非 O(n²) ----
@@ -606,8 +701,15 @@ def g56_finite(ctx: Ctx) -> int:
 
 
 def g56_warmup(ctx: Ctx) -> int:
-    """暖机下限：镜像 _g1_mask 的 m[:68]=False → 决策日索引 i 必须 >= 68。"""
-    return 1 if ctx.i >= 68 else 0
+    """暖机下限：镜像 _g1_mask 的 m[:68]=False → 决策日索引 i 必须 >= 68。
+
+    ★ `ctx.i_age` (2026-10-05): 增量/播种路径下 bars 只是**窗口** (可短至
+    `G1_WIN_MIN`=21 根), 此时 `ctx.i` 是窗口内下标、恒 < 68 ⇒ 用它会让全市场
+    **静默归零** (门判 False 却无报错)。真实数据年龄由 `ctx.i_age` 给出。
+    ⚠ i_age 为 None (生产现状) → 退化为 ctx.i, 与历史逐位一致。
+    """
+    age = ctx.i_age if getattr(ctx, "i_age", None) is not None else ctx.i
+    return 1 if age >= 68 else 0
 
 
 def g56_pool_stat(ctx: Ctx, name: str) -> float:
@@ -969,7 +1071,8 @@ _register_exit("g56_no_trail", _exit_g56_no_trail)
 #    analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List
+
 from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.runtime.flows import register_day_flow
