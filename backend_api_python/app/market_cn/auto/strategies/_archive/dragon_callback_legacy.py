@@ -30,7 +30,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.core.indicators import (
+from app.utils.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )

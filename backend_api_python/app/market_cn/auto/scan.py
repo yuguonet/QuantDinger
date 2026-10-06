@@ -157,6 +157,26 @@ from app.market_cn.auto.core.data.kline import fetch_kline_db  # noqa: E402,F401
 #   截 target 仍走调用方原有的 `bars[-1] > target` 分支 ⇒ 与旧路径逐行一致。
 #
 # 开关: `QD_SCAN_BATCH=0` 可整段关闭 (回落逐票), 用于线上快速回滚。
+
+def _fold_on() -> bool:
+    """判定驱动是否走**折叠内核** (目标态唯一路径)。
+
+    ON  : `strat.scan_days(bars, code, lo=hi=target)` —— 与 rebuild / 回测同一条
+          驱动路径 (内核折叠: seed 一次 + 当日 evaluate), 判定循环只有一份实现。
+    OFF : `strat.scan_signals(bars, code)` —— 旧直连路径, 仅供线上快速回滚。
+
+    对账: 全市场 5236 票 × 30 交易日 = break 5 / dragon 15 / g56 11 笔,
+    两条路径**逐字段差异 0** (tmp/shadow_scan_fold3.py)。
+
+    ★★ 默认 OFF (2026-10-06 实测): ON 会**废掉 M1 实盘采集** ——
+    采样的过滤条件 `(day_tr.items or sigs)` 依赖 `scan_signals` 内部的门级 trace,
+    而递推侧只有 ring 窗口、未接 probe ⇒ day_tr 恒空。端到端实测同一批数据:
+        OFF: break 3872 条 / dragon 3633 条       ON: 两者均 0 条
+    (tmp/probes/ 已积累 371 个文件 ≈ 9GB, 该采集在役, 不能静默归零。)
+    开 ON 的前置 = 把门级 trace 补进递推路径 (break: confirm/align/prefilter;
+    dragon: 8 门), 或把 M1 采集整体剥离为独立采样器。见完成度报告 §七·遗留。
+    """
+    return str(os.getenv("QD_SCAN_FOLD", "0")).strip() == "1"
 # ══════════════════════════════════════════════════════════════════════
 
 def _prefetch_bars(codes, days, logger=None):
@@ -444,6 +464,12 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
         return {"status": "no_active_strategy", "keys": sorted(want), "target": _target_date()}
     logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
+    # 判定驱动: 折叠内核(默认) / 旧直连(回滚开关 QD_SCAN_FOLD=0)
+    FOLD_ON = _fold_on()
+    logger.info("[dragon_scan] 判定驱动 = %s (QD_SCAN_FOLD=%s)",
+                "scan_days 折叠内核" if FOLD_ON else "scan_signals 直连(回滚)",
+                "1" if FOLD_ON else "0")
+
     # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定同步过 DayTrace shim 产 sample。
     # 只记判定步落点非空的 (code,day) (纯噪声不采, 同 probe.py 约定); 标签 censored
     # (D+1 bar 当时不存在, 离线回填)。relay3 暂不支持 (scan_signals 无 probe 形参,
@@ -509,9 +535,16 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
             for key, strat in active.items():
                 day_tr = _DayTrace() if (live_probes is not None and _probe_ok.get(key)) else None
                 try:
-                    _kw = {"probe": day_tr} if day_tr is not None else {}
-                    sigs = strat.scan_signals(bars, code, **_kw,
-                                              **strat_reg.params_override(key))
+                    if FOLD_ON:
+                        # 目标态: 判定委托 `scan_days` 折叠内核 (驱动路径唯一)。
+                        # lo=hi=target ⇒ 只判当日, 语义 == scan_signals(bars[:target+1])。
+                        sigs = strat.scan_days(bars, code, lo_date=target,
+                                               hi_date=target,
+                                               **strat_reg.params_override(key))
+                    else:
+                        _kw = {"probe": day_tr} if day_tr is not None else {}
+                        sigs = strat.scan_signals(bars, code, **_kw,
+                                                  **strat_reg.params_override(key))
                 except Exception as e:
                     logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
                     continue

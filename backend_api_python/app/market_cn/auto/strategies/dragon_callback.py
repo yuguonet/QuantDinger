@@ -19,11 +19,11 @@ DRAGON_CB_PARAMS 为 facade 转发 (test_dragon.py / dragon_scan / dragon_monito
 """
 from __future__ import annotations
 
-from app.market_cn.auto.common.indicators import (
+from app.utils.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )
-from app.market_cn.auto.common.market import find_limit_ups, get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.market import find_limit_ups, get_board_name, get_board_type, is_limit_up
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
@@ -308,13 +308,13 @@ def _tech_block(closes, use_tech_score=True, *, macd_triple=None, rsi_val=None):
 #         追踪线成交, 此处保留"收盘逃顶优先"的原设计语义 (已知理想化)。
 # ================================================================
 
-# 跌停价原语收编至 common/exec_cn.py (C 阶段); 别名保持调用点不变
-from app.market_cn.auto.common.exec_cn import (
+# 跌停价原语分布在 core/exec.py 与 core/market.py (C 阶段); 别名保持调用点不变
+from app.market_cn.auto.core.exec import (
     fill_blocked_by_limit_dn,
     fill_on_gap,
     is_one_word_limit_dn,
-    limit_dn_price as _limit_dn_price,
 )
+from app.market_cn.auto.core.market import limit_dn_price as _limit_dn_price
 from app.market_cn.auto.probe import DayTrace as _DayTrace, \
     sample_feats as _probe_sample_feats   # 探针框架件 (无环; 只提供通用特征/标签)
 
@@ -1059,7 +1059,7 @@ class DragonCallbackStrategy(StrategyBase):
         probe: 调试探针 (None=零开销) — 每个到达完整判定的决策日产出一行
         sample (特征+标签+当日最深判定阶段), 廉价预筛跳过的日不采样 (纯噪声)。
         """
-        from app.market_cn.auto.common.filters import unified_prefilter
+        from app.market_cn.auto.core.filters import unified_prefilter
         board_type = get_board_type(code)
         n = len(bars)
         if n < 5:
@@ -1271,7 +1271,7 @@ def dc_ma20_dev_val(ctx: Ctx):
 
 
 def dc_rsi6(ctx: Ctx) -> float:
-    """D0 RSI6 (与 scan_signals 同一 common.indicators.rsi, 非内核 Ctx.rsi —— 算法不同)。
+    """D0 RSI6 (与 scan_signals 同一 app.utils.indicators.rsi, 非内核 Ctx.rsi —— 算法不同)。
 
     数据不足 → 100.0 (放行, 与 python 版 rsi_val=None 时跳过该门同语义)。
     """
@@ -1345,7 +1345,7 @@ _register_exit("combo", _exit_combo)
 #    analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-# ⚠ 本模块顶层用的是 **common.market** 的 find_limit_ups/get_board_name
+# ⚠ 本模块顶层用的是 **core.market** 的 find_limit_ups/get_board_name
 #    (生产链口径); 该编排必须与 core/runtime/evaluate.py 原实现同源 →
 #    显式取 **core.market** 并别名导入。两套同名实现不可混用。
 from typing import Any, Dict, List, Tuple

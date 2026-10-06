@@ -21,7 +21,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.core.indicators import calc_bollinger_bw, calc_macd
+from app.utils.indicators import calc_bollinger_bw, calc_macd
 from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (

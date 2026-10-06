@@ -285,8 +285,8 @@ class Ctx:
     #  本地那份 EMA 变成死代码 —— 死代码是"看起来有实现、实际零作用"的隐患, 不留。)
 
     # ---- MACD（DIF / DEA / MACD柱，柱=2*(DIF-DEA) 的 A股惯例）----
-    # 因果切片 [0..i]：EMA 从 index 0 递推，dif[i] 只依赖 closes[0..i]，与 common/indicators
-    # 的 calc_macd(closes[:i+1]) 逐值一致；as-of 安全（绝不读 > i 的 bar）。
+    # 因果切片 [0..i]：EMA 从 index 0 递推，dif[i] 只依赖 closes[0..i]，与
+    # app.utils.indicators 的 calc_macd(closes[:i+1]) 逐值一致；as-of 安全（绝不读 > i 的 bar）。
     def _macd(self, fast: int, slow: int, signal: int):
         """MACD —— 委托 core.runtime.resume (单一内核, 见 resume.py 模块头)。
 

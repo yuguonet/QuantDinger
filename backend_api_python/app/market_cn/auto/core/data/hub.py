@@ -27,6 +27,27 @@
   - 外部源 (data_sources/coordinator / cn_stock 等) 是 L2 盘后补数通道, 本模块盘中路径零触外网;
   - 股票索引/工作日历经 utils/basicinfo_db 与 trading_calendar, 策略不感知。
 
+IO 通道边界 (2026-10-06 登记, 防后人开出第二条"顺手写盘"通道):
+  - 本模块 = auto/ 的**市场数据只读出口** (daily/minute/snapshot/index/lhb…),
+    "唯一 IO 出口"红线的本体是它: 策略/扫描/监控/回测取数一律经此, 不直连物理源;
+  - **有意且唯一的写盘例外**: 展示层切片落盘 = `core/present/runner.StateStore`
+    (state JSON 文件, 可重建缓存)。它不是市场数据, 是展示层的持久化状态, 且是
+    落盘出口的唯一通道 (策略文件不得自己开文件写盘, 见 runner.py 头);
+  - ⇒ 除 StateStore 外, auto/ 内任何"顺手写盘" (csv/json/pickle 直落磁盘, 含
+    中途缓存/台账私有文件) 都违反红线: 要新增写通道必须先在此登记并说明理由。
+
+缓存三套 (2026-10-07 登记: "缓存都在哪"只有这一张表, 语义不同故共存):
+  1. `core/data/window_cache.py` —— 全市场**日线滑动窗口** (5236 票); pickle 单文件
+     {code: (dates, ohlcv)} + 复权因子指纹自愈; ⚠ 只服务 as_of=None 的今日窗口,
+     回测/历史重建既不进也不读 (否则与今日数据互相污染)。
+  2. 本模块 `_index_*_cache` (下文) —— **指数**日线私有文件缓存, 每 code 一个 JSON,
+     "末根 date < 今日 = 过期"的 L2 盘后补数语义, 命中即零外网。
+  3. `core/present/runner.StateStore` —— 展示层切片 (可重建缓存, 见上一条写盘例外)。
+  为何 2 不复用 1: ① 数据来源不同 —— 指数走远端降级链 (mootdx→tencent→sina→
+  baostock) 规范后的 bar, 不在 kline 分区表, window_cache 的入口是它拿不到的;
+  ② 语义不同 —— 滑动窗口 + 复权指纹是为"每天 5236 票全量重拉"省 IO, 指数只有
+  几只、每天一次, 要的是"过期才触外网"而非滑动; ③ 为几只票建滑动窗口是负收益。
+
 易错点:
   - writer.query 1m 传 start==end 单日区间可能返回空 → minute_1m 内部自动扩窗一天再按日期过滤;
   - 快照 open/high/low 是当日累计值 (非分钟 bar), volume 是累计量 → minute_live 内部差分;
@@ -504,6 +525,9 @@ def lhb(stock_code=None, trade_date="", days=30):
 
 # ================================================================
 # 指数日线 (M3 环境特征通道, 2026-09-11)
+#
+# ⚠ 本段的 `_index_*_cache` 是**指数私有**文件缓存, 不复用 window_cache 的理由见
+#   本模块头「缓存三套」第 2 条 (来源/语义/量级三条)。要动缓存先改那张表。
 # ================================================================
 
 # 路径锚点走 core/_paths.PROJECT_ROOT (与 frames.CACHE_DIR 同源), 缓存放

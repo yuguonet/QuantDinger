@@ -27,9 +27,10 @@
   - 自动网格 (缺省 --grid): 单维切片而非笛卡尔积 — 每个数值参数独立 ±1 档 (int)
     / ±15% (float, 1-2-5 取整) / bool 消融, 恰构成 OFAT 敏感性扫描; 每维 ±两档
     +基准补跑 = 3 点, 邻域平台/尖峰判定天然可用; 基准点不入切片 (由补跑出);
-  - 覆写机制: 实例级 strat.default_params = {**基准, **网格覆写} — 回测钩子内部
-    params(None) 只读 default_params; config params 仅经实盘扫描路径的
-    params_override 注入, 不进回测路径, 故实例覆写即权威且互不干扰 (跑完即还原);
+  - 覆写机制: 实例级 strat.default_params = {**基准, **网格覆写} — params(None)
+    = 实例 default_params ← config.json params ← 类默认 的合并 (2026-09-25 起已
+    config 感知, 见 base.params); config 仅在「值仍等于类默认」时放行, 故网格覆写
+    写进实例 default_params 后依旧权威且互不干扰 (跑完即还原);
   - 零落库: 只调 run_all/run_all_intraday (内存 trades), 不写 store/不改 config;
   - 数据复用: hub daily memo 跨组合复用, 第 2 组合起零重载 (865s→71s 红利);
   - 两段口径: 按 entry_date 排序前后半 (⚠️ backtest._summary 的 1st/2nd half

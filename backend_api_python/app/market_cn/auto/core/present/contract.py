@@ -10,6 +10,23 @@
 
 evaluate 在 step **之前**跑：state 的语义 = "截至昨日收盘" 的切片。
 盘中判定（如 14:56 触发）依赖的历史特征恰好是"截至昨日"，与旧版口径天然对齐。
+
+====================================================================
+两种推进模式（prev 的契约语义；2026-10-06 由"实现巧合"升为"契约"）
+====================================================================
+  stateful（有状态推进）: prev = 上一步 Progress（runner/realtime 恒传 rec.current）
+      ⇒ 按 prev **结算**上一阶段（ready→exec→exit）并**抑制**（龙回头 ±4 日去重
+      读 prev.payload）。生命周期分支（滚动 / 回测 / 实时）。
+  stateless（无状态枚举）: prev = None（批量枚举 `runner.fold_range`）⇒ **不结算、
+      不抑制**，每日只看门是否通过，产出与 `scan_signals` 同口径 —— 这不是靠对账
+      维持的巧合，而是两者本就是同一门在 stateless 下的两个入口（去重是消费方
+      /回测侧的选择，不在门里）。
+
+两种模式共用同一折叠序与同一门实现；差别**只在** prev 是否注入历史进度，且由调用
+方显式选择。凡"读 prev 才生效"的规则在 stateless 下自动失效 = 声明的语义，非 bug。
+
+⚠ payload 随 current/events 落盘且**跨切片重建保留** ⇒ **改 stage 键 / payload 结构
+= 视同改规则**（④ 的 sha 重建兜不住它：重建保留旧 payload，详见 runner.py 头）。
 """
 
 from __future__ import annotations
@@ -51,7 +68,11 @@ class Progress:
 
 @dataclass
 class DayInput:
-    """折叠一步的当日输入。三套分支只在"数据来源"上有差别，结构相同。
+    """折叠一步的当日输入。
+
+    三套分支只在**数据来源**上有差别（预处理 = 1 日延伸两根 / 回测 = 全量 bars
+    末根 / 实时 = 盘中快照）；推进模式不由本对象决定，由 evaluate 的 prev 给出
+    （见本模块顶部）—— 同一个 DayInput 在两种模式下喂给同一个门。
 
     - bar: 当日日线 {time,open,high,low,close,volume}；实时分支为部分 bar
       （快照累计值：close=last、volume=当日累计量、open=当日开盘）
@@ -90,7 +111,11 @@ class StrategyProtocol(Protocol):
 
     def evaluate(self, state: dict, inp: "DayInput",
                  prev: "Progress | None") -> list["Progress"]:
-        """返回本日产出的进度事件（0~2 条，按时间序；末条 = 当前进度）。"""
+        """返回本日产出的进度事件（0~2 条，按时间序；末条 = 当前进度）。
+
+        - prev=None 是**契约**（stateless）：不结算、不抑制，见模块顶部。
+          prev 非 None ⇒ stateful：先结算 prev 阶段，再判今日。
+        """
         ...
 
     def init_shared(self, shared: dict | None) -> None:

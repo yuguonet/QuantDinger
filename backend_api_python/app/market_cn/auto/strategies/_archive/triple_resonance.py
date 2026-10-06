@@ -49,7 +49,7 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.core.indicators import calc_macd
+from app.utils.indicators import calc_macd
 from app.market_cn.auto.core.market import get_board_type
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (

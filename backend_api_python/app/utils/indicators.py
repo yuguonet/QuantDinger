@@ -3,7 +3,8 @@
 
 上移原因: 该库原位于 auto/ 内部, 且全仓 auto 之外零引用; 而展示层 (app/watchlist) 需要
 与策略判定同一份指标口径 ⇒ 上移为共享叶子层 (与 db_market / trading_calendar / basicinfo_db 同层)。
-原路径 app.market_cn.auto.core.indicators 保留 re-export shim ⇒ auto 内引用改动 0 行。
+2026-10-07: 原路径的 re-export shim (app/market_cn/auto/core/indicators.py) **已删除** ——
+auto 内 10 处引用已统一改指本模块, 指标口径只有一处定义 (无第二跳)。
 本文件内容与原文件逐字一致 (含全部数值口径), 上移不改变任何计算结果。
 
 用途: 策略共用的纯指标计算, 与 test_dragon.py 同名函数逐字一致 (对数基准)。

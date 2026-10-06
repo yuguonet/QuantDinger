@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from app.market_cn.auto.core.indicators import ma as _ma  # D2: 收编内联, 逐字等价
+from app.utils.indicators import ma as _ma  # D2: 收编内联, 逐字等价
 from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, _closes_upto
@@ -73,7 +73,7 @@ PARAMS = {
 # 特征计算 (纯函数, 无 IO)
 # ================================================================
 
-# _ma 已收编至 common/indicators.ma (D2, 逐字等价), import 处以 _ma 别名引用。
+# _ma 已收编至 core/indicators.ma (D2, 逐字等价), import 处以 _ma 别名引用。
 
 
 def ma_bull_arrangement(bars) -> bool:

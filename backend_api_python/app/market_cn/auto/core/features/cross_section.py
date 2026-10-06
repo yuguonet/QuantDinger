@@ -12,7 +12,7 @@
   - 横截面聚合: _aggregate(by_date) + _ensure_pool_daily(pool_target, bars_batch=None)
   - 常量: ATR_Q5 (G1池 ATR14% 板块Q5下限) / ROLL / MIN_HIST (score_r 滚动窗口)
 
-依赖: calc_macd (core.indicators) / hub (core.data) / get_board_type (core.market) / numpy
+依赖: calc_macd (app.utils.indicators) / hub (core.data) / get_board_type (core.market) / numpy
 """
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ import threading
 
 import numpy as np
 
-from app.market_cn.auto.core.indicators import calc_macd
+from app.utils.indicators import calc_macd
 from app.market_cn.auto.core.market import get_board_type
-# ★ 播种/接力只从基座叶子层取 (core.indicators 是 re-export shim, 未导出这三个)
+# ★ 播种/接力只从基座叶子层取 (这三个不经 core 转发, 直接取自本文件)
 from app.utils.indicators import ema_fwd, macd_core, macd_state
 
 logger = logging.getLogger("auto")

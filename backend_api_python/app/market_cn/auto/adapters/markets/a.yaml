@@ -2,8 +2,8 @@
 # 市场适配: A 股 (基线市场, 唯一已接数据源)
 # ----------------------------------------------------------------
 # 本文件是 A 股市场规则的**唯一事实源**。此前这些数值写死在
-#   app/market_cn/auto/common/market.py  (0.098 / 0.198 / *0.98 / 前缀分板)
-#   app/market_cn/auto/common/exec_cn.py (0.10 / 0.20 / 0.002 容差)
+#   app/market_cn/auto/core/market.py    (0.098 / 0.198 / *0.98 / 前缀分板)
+#   app/market_cn/auto/core/exec.py      (0.10 / 0.20 / 0.002 容差)
 # 里 —— 接港股/美股必然要改 core。现全部外置到此处, core 只按字段取值。
 #
 # ⚠️ 数值逐字搬自旧实现, 改动前先读 docs/自动策略IDE架构设计.md §9.1/§9.3。
@@ -56,4 +56,4 @@ board_name_default: 未知
 # --- 数据源 ---
 source: a_share_daily
 runnable: true
-note: 基线市场; 涨跌停/分板数值逐字搬自旧 common/market.py + common/exec_cn.py
+note: 基线市场; 涨跌停/分板数值的事实源 = core/market.py + core/exec.py

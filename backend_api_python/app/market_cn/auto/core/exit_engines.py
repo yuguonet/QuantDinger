@@ -20,6 +20,26 @@ is_one_word_limit_dn)。本模块只做模式编排 + 状态机 (pending_dn / �
 Returns (统一 dict, 与历史策略引擎同构):
     {"exit_day", "exit_price", "return_pct", "peak_return_pct", ...}
   数据不足 / 无法成交视野 → None (调用方跳过该笔)。
+
+====================================================================
+出场逻辑登记表 (2026-10-07) —— 改出场先看这张表
+====================================================================
+旧文档"改出场逻辑必须逐份核对"是口头纪律; 这里有索引: 活跃策略的出场**全部**是本模块
+的参数化包装 (P1-7/P1-7b 收编后无独立骨架), 差异只在参数与钩子:
+
+  dragon_callback.run_backtest_dragon_callback → run_trail_stop
+      ★ 唯一保留**语义差异**的一条:
+        ① 分段追踪 trails{hi, lo, switch_pct}   ② peak_exit{ret, upper} 峰值逃顶
+        ③ stop_at_idx 重放截断                  ④ **use_trig_prev=False**
+          (dragon 历史口径: 用当日 peak 的 trig, 无 trig_prev 守卫 —— v1 才启用)
+      ★ 单实现**双消费**: 折叠 evaluate(实时/预处理) 与回测共用它 ⇒ 改一处两边同时变。
+  v1._run_backtest                    → run_trail_stop (无分段追踪, **启用** trig_prev 守卫)
+  relay3.run_backtest_relay3          → run_limit_seal
+  g56._exit_no_trail                  → run_hold_stop (无追踪; D-1 板用 STOP_LOSS_LU 紧止损)
+  break                               → defer_force_open (跌停顺延)
+
+⚠ `strategies/_archive/` 下的 run_backtest_* (dragon_v2 / dragon_callback_legacy) 是
+  **收编前的历史快照**, 已停更、不参与任何路径 —— 不得照它们改活跃代码。
 """
 from __future__ import annotations
 

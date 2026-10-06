@@ -819,7 +819,7 @@ class BreakStrategy(StrategyBase):
 
 
 def _find_limit_ups(bars, bt):
-    """涨停日索引 (is_limit_up vs 前收; 第0根无前收跳过)。与 common find_limit_ups 同语义。"""
+    """涨停日索引 (is_limit_up vs 前收; 第0根无前收跳过)。与 core.market find_limit_ups 同语义。"""
     from app.market_cn.auto.core.market import find_limit_ups
     return find_limit_ups(bars, bt)
 
@@ -1356,7 +1356,7 @@ _register_exit("break_combo", _exit_break_combo)
 #    analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List
 from app.market_cn.auto.core.entry_modes import resolve_entry
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.filters import unified_prefilter

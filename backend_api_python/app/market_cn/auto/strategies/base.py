@@ -18,9 +18,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.market_cn.auto.core.present.contract import (
-    DayInput, InsufficientHistory, Progress, Stage,
-)
+from app.market_cn.auto.core.present.contract import DayInput, Progress, Stage
+# stateless 折叠的唯一实现在内核；本类只封装，不复制折叠循环（防第二份编排）
+from app.market_cn.auto.core.present.runner import fold_range
 
 
 # ================================================================
@@ -177,9 +177,12 @@ class StrategyBase:
         统一契约的意义: 编排层 (rebuild) 对所有策略一视同仁地调这一个方法, 不因某个
         策略"内部贵"就给它单独开一条路径 —— 那会让编排层长出策略专属分支。
 
-        ★ 2026-10-06 目标态: 默认实现 = **展示层内核折叠** (seed 一次 + 逐日
-        step/evaluate), 与逐日 scan_signals 逐位等价 (break/dragon 已全市场对账;
-        knife/tail 为 intraday, 纯日线折叠不产 ready 事件)。
+        ★ 2026-10-06 目标态: 默认实现 = 内核 **stateless 折叠**
+        (`core.present.runner.fold_range`) 的薄封装 —— 本类**不写折叠循环**,
+        只做 [lo,hi] 下标换算 + ready 事件 → Signal 组装。折叠序与门实现和
+        生命周期分支 (runner/realtime) 同源; 差别由契约声明而非巧合:
+        stateless 模式 prev=None ⇒ 不结算、不抑制, 与 scan_signals 天然同口径
+        (信号落库口径 —— 去重是消费方/回测侧的选择, 不在门里)。
         覆盖条件: 判定代价高到逐日枚举不可接受时 (全序列指标 / 横截面池), 策略可在
         自己的模块里覆盖本方法做"一次预计算 + 逐日 O(1)" (g56 的做法与实证见
         g56.scan_days)。未迁移折叠契约的策略 (relay3/v1/lead_chase, config
@@ -193,34 +196,18 @@ class StrategyBase:
         i0, i1 = self._day_span(bars, lo_date, hi_date)
         if i1 < i0:
             return []
-        # seed: 内核只吃"截至昨日"的切片; 起点尽量早, 历史不足则向后滑到够为止
-        state, j = None, i0
-        while j <= i1:
-            try:
-                state = self.init_state(code, bars[:j])
-                break
-            except InsufficientHistory:
-                j += 1
-            except NotImplementedError:
-                return self._scan_days_by_signals(
-                    bars, code, lo_date=lo_date, hi_date=hi_date, **params)
-        if state is None:
-            return []
+        try:
+            pairs = fold_range(self, code, bars, i0, i1)
+        except NotImplementedError:
+            return self._scan_days_by_signals(
+                bars, code, lo_date=lo_date, hi_date=hi_date, **params)
         out: list = []
-        for k in range(j, i1 + 1):
-            try:
-                events = self.evaluate(state, DayInput(code, bars[k], None), None) or []
-            except InsufficientHistory:
-                events = []
-            for ev in events:
-                if ev.stage != "ready":
-                    continue
-                pl = ev.payload or {}
-                out.append(Signal(
-                    code=code, time=str(bars[k]["time"])[:10],
-                    score=pl.get("score", 50), price=pl.get("price", 0.0),
-                    label=pl.get("label", ""), extra=dict(pl.get("extra") or {})))
-            state = self.step(state, bars[k])
+        for k, ev in pairs:                    # 内核只回 ready 事件 (stateless)
+            pl = ev.payload or {}
+            out.append(Signal(
+                code=code, time=str(bars[k]["time"])[:10],
+                score=pl.get("score", 50), price=pl.get("price", 0.0),
+                label=pl.get("label", ""), extra=dict(pl.get("extra") or {})))
         return out
 
     @staticmethod

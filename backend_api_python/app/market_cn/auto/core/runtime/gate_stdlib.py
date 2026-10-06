@@ -171,7 +171,7 @@ def board_height(ctx: Ctx) -> int:
 
 def ma_bull(ctx: Ctx) -> bool:
     """MA5>MA10>MA20>MA60（镜像 relay3.ma_bull_arrangement，截至决策日 i）。"""
-    from app.market_cn.auto.core.indicators import ma as _ma
+    from app.utils.indicators import ma as _ma
     closes = _closes_upto(ctx)
     m5, m10, m20, m60 = _ma(closes, 5), _ma(closes, 10), _ma(closes, 20), _ma(closes, 60)
     if not (m5 and m10 and m20 and m60):

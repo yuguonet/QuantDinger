@@ -70,7 +70,7 @@ import threading
 
 import numpy as np
 
-from app.market_cn.auto.core.indicators import calc_macd
+from app.utils.indicators import calc_macd
 from app.market_cn.auto.core.market import default_market, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs

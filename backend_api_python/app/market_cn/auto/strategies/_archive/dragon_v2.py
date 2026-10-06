@@ -49,7 +49,7 @@ from app.market_cn.auto.core.exec import (
     is_one_word_limit_dn,
     limit_dn_price as _limit_dn_price,
 )
-from app.market_cn.auto.core.indicators import (
+from app.utils.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )

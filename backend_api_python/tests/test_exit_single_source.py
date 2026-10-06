@@ -82,6 +82,23 @@ def test_no_slice_namespace():
             "残留 SliceStrategyBase（已并入 StrategyBase）: %s" % os.path.relpath(p, BACKEND)
 
 
+def test_no_common_shim():
+    """`auto/common/` 兼容 shim 不得复活（4 个纯转发文件已于 10-06 退役）。
+
+    真实实现在 `core.{indicators,market,exec,filters}`；消费方只能直连 core.*。
+    """
+    common_dir = os.path.join(BACKEND, "app", "market_cn", "auto", "common")
+    assert not os.path.exists(common_dir), \
+        "auto/common/ 目录复活 —— 直连 core.{indicators,market,exec,filters}"
+    self_path = os.path.abspath(__file__)
+    for p in _iter_py():
+        if os.path.abspath(p) == self_path:
+            continue      # 本文件自身在注释里点名旧命名空间，跳过
+        with io.open(p, encoding="utf-8", errors="ignore") as f:
+            src = f.read()
+        assert "auto.common" not in src, "残留 auto.common 引用: %s" % os.path.relpath(p, BACKEND)
+
+
 def test_strategy_dir_is_only_home():
     """策略内容只在 auto/strategies/：树内不得有第二处 `class XxxStrategy`。"""
     strat_dir = os.path.join(BACKEND, "app", "market_cn", "auto", "strategies")
