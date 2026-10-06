@@ -15,6 +15,7 @@ evaluate 在 step **之前**跑：state 的语义 = "截至昨日收盘" 的切�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 
 class InsufficientHistory(Exception):
@@ -62,73 +63,50 @@ class DayInput:
     bar: dict
     ctx: dict | None = None
 
+class StrategyProtocol(Protocol):
+    """展示层对策略的**结构化契约**（core → strategies 不产生 import 依赖）。
 
-class StrategyBase:
-    """策略契约。展示层只依赖本类的六个方法/属性，不感知任何策略细节。"""
+    生产 `strategies.base.StrategyBase` 实现本 Protocol（折叠契约已并入，
+    全部策略单继承），展示层只按本 Protocol 取用，不感知任何策略细节（设计要点①）。
+    """
 
-    key: str = ""
-    name: str = ""
-    stages: tuple[Stage, ...] = ()
-    default_params: dict = {}
-    SEED_BARS: int = 200   # 框架统一 seed 根数（init_state 不够可抛 InsufficientHistory）
+    key: str
+    name: str
+    stages: tuple
+    default_params: dict
+    SEED_BARS: int
 
-    # ── ① 断点切片（策略自定义、JSON 可序列化）─────────────────
     def init_state(self, code: str, bars: list[dict]) -> dict:
         """seed：用截至昨日的全量历史 bars 建初始切片。"""
-        raise NotImplementedError
+        ...
 
     def step(self, state: dict, bar: dict) -> dict:
         """每日推进一根（O(1)~O(window)）。纯函数：返回新 state，不改入参。"""
-        raise NotImplementedError
+        ...
 
     def probe(self, state: dict) -> list[tuple[str, float]]:
-        """除权探针：切片里若干"历史某日 (date, close)"锚点，严格相等比对。
-        不等 = 历史被复权/订正改写 → 整票重建。"""
-        return []
+        """除权探针：切片里若干"历史某日 (date, close)"锚点，严格相等比对。"""
+        ...
 
-    # ── ②③ 展示点判定（回测/预处理/实时共用）────────────────
-    def evaluate(self, state: dict, inp: DayInput, prev: Progress | None) -> list[Progress]:
-        """返回本日产出的进度事件（0~2 条，按时间序；末条 = 当前进度）。
+    def evaluate(self, state: dict, inp: "DayInput",
+                 prev: "Progress | None") -> list["Progress"]:
+        """返回本日产出的进度事件（0~2 条，按时间序；末条 = 当前进度）。"""
+        ...
 
-        - prev.stage == 持仓/待执行阶段时，先结算上一阶段（如 D1 开盘出场）
-        - 再判今日是否触发（需 ctx）或预明日观察（watch，纯日线）
-        同一天可以既结算旧信号又触发新信号 → 返回两条。
-        """
-        raise NotImplementedError
-
-    # ── 策略级共享状态（跨票，如横截面池台账）────────────────
     def init_shared(self, shared: dict | None) -> None:
-        """用持久化的策略级状态恢复内部共享对象（每轮开头调用，幂等）。
-
-        ⚠ 共享状态随**本策略**的切片文件一起落盘（一轮一次 IO）。策略文件
-        不得自己开文件写盘 —— 展示层的落盘出口唯一是 StateStore。
-        默认无共享状态。
-        """
-        return None
+        """用持久化的策略级状态恢复内部共享对象（每轮开头调用，幂等）。"""
+        ...
 
     def shared_snapshot(self) -> dict | None:
         """返回需持久化的策略级状态（JSON 可序列化）；None = 无。"""
-        return None
+        ...
 
-    # ── 跨票日级聚合（可选；如横截面池）──────────────────────
     def begin_day(self, date: str, states: dict, bars: dict) -> dict | None:
-        """每日折叠前调用一次：states[code]=推进前切片，bars[code]=当日 bar。
+        """每日折叠前调用一次，返回日级上下文（经 ctx["_day"] 注入）。"""
+        ...
 
-        返回日级上下文（如 {"pool": ...}），经 ctx["_day"] 注入当日每票 evaluate；
-        默认 None = 无跨票需求。展示层不认识内容（设计要点①）。"""
-        return None
-
-    # ── 实时旁支的可选便宜预筛（默认全过）────────────────────
     def realtime_shortlist(self, codes: list[str], snaps: dict,
                            mkt_gain: float | None = None,
                            stage: str | None = None) -> list[str]:
-        """stage: 当前规则进度所处阶段 —— 预筛只服务"宽候选集的触发扫描"
-        （watch）；已触发票的阶段转换（如 D1 开盘结算）不得被触发门拦截。"""
-        return list(codes)
-
-    # ── 参数合并 ────────────────────────────────────────────
-    def params(self, overrides: dict | None = None) -> dict:
-        p = dict(self.default_params)
-        if overrides:
-            p.update(overrides)
-        return p
+        """实时旁支的便宜预筛（默认全过）。"""
+        ...

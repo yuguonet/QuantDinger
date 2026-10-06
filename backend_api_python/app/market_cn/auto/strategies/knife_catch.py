@@ -38,8 +38,8 @@ from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
-from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
-    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+from app.market_cn.auto.core.present.contract import (   # 展示层折叠契约
+    InsufficientHistory, Progress, Stage,
 )
 
 STRATEGY_KEY = "knife_catch"
@@ -130,11 +130,10 @@ def _daily_feats(bars, code, market=None):
         return None
 
 
-# SliceStrategyBase: slice 展示契约 (递推状态机/门)。放在**第二**位 ——
-# 生产 StrategyBase 在前, 其 merged_params/scan_signals 等不被 slice 基类遮盖;
-# slice 侧只有 params()/init_shared() 等生产基类没有的方法会落到 SliceStrategyBase。
+# 2026-10-06: 单继承 StrategyBase —— 折叠契约已并入生产基类，参数合并口径唯一 = params()。
+# 折叠契约已并入生产 StrategyBase（单继承）; 参数合并口径唯一 = params();
 @register
-class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
+class KnifeCatchStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
@@ -151,7 +150,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
     entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
-    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("watch", "候选观察", realtime="14:56-15:00", visible=False),
         Stage("ready", "D0尾盘触发·准备", realtime="09:31"),
@@ -162,7 +161,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
     # ---- 盘中便宜预筛 (仅用最新快照, 免拉全市场序列/日线; 阈值唯一来源在本策略) ----
     def intraday_shortlist(self, snaps, mkt_gain, **params):
         """snaps: {code: latest_snapshot_row}; 返回 {code: snap} 通过便宜预筛的候选。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if mkt_gain is None or mkt_gain > p["mkt_gate"]:
             return {}
         out = {}
@@ -198,7 +197,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
         pos 上限是槽位特征无法日级化 → 留给 shortlist (超集方向安全)。
         """
         import numpy as np
-        p = self.merged_params()
+        p = self.params()
         _dopen, dhigh, dlow = frame.day_extremes()
         pcs = np.asarray([pc_map.get(c) or 0 for c in frame.codes], dtype=float)
         ok = (pcs > 0) & (dhigh > dlow) \
@@ -207,7 +206,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
         return [c for c, k in zip(frame.codes, ok)
                 if k and not c.startswith(("8", "4", "92"))]
 
-    # ══ slice 契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
+    # ══ 展示层折叠契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
     # ⚠ 展示/预处理 evaluate 与盘中实时 scan_signals **共用同一份 _gates**。
     #   两入口只差"取哪个快照": scan_signals 判 ctx["latest"]（此刻）；
     #   evaluate 回扫当日 14:56~15:00 序列取首次触发。公式不得再写第二份。
@@ -449,7 +448,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
         门逻辑全部委托 `_gates` (与展示层 evaluate 同一实现), 本方法只负责:
         取快照 → 建切片 → 组装 Signal。probe: 门级 TRACE, 仅本入口传。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         ctx = ctx or {}
         snap = ctx.get("latest")
         series = ctx.get("series") or []
@@ -523,7 +522,7 @@ class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
         return ExitDecision("hold")
 
     def initial_stop(self, code, entry_price):
-        return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
+        return round(entry_price * (1 + self.params()["stop_pct"] / 100), 3)
 
 
 # ================================================================

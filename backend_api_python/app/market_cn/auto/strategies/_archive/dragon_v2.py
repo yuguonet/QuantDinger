@@ -382,7 +382,7 @@ class DragonV2Strategy(StrategyBase):
         与 dragon_callback.scan_signals 同构快照 + 末尾下影线门; as_of=k 只用
         bars[:k+1]; limit_ups=预计算涨停索引 (回测优化); probe=None 零开销。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         result = []

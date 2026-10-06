@@ -7,16 +7,16 @@
 import copy
 import os
 
-from app.market_cn.auto.slice.runner import DailyRunner, Record, StateStore, strategy_source_hash
-from app.market_cn.auto.slice.strategies import KnifeCatchSlim
-from app.market_cn.auto.slice.tests.common import KNIFE_HIST_CLOSES, gen_hist_bars
+from app.market_cn.auto.core.present.runner import DailyRunner, Record, StateStore, strategy_source_hash
+from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
+from tests.present.common import KNIFE_HIST_CLOSES, gen_hist_bars
 
 CODE = "600001"
 
 
 def _mk(tmp_path):
     store = StateStore(str(tmp_path / "state"))
-    return DailyRunner(store), store, KnifeCatchSlim()
+    return DailyRunner(store), store, KnifeCatchStrategy()
 
 
 def test_seed_then_advance(tmp_path):
@@ -112,7 +112,7 @@ def test_rebuild_keeps_progress_history(tmp_path):
 
 
 def test_realtime_never_writes_fold(tmp_path):
-    from app.market_cn.auto.slice.realtime import RealtimeBranch
+    from app.market_cn.auto.core.present.realtime import RealtimeBranch
     runner, store, s = _mk(tmp_path)
     bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES)
     runner.run_day(s, CODE, bars[:12], None)

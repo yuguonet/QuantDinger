@@ -11,9 +11,10 @@ import random
 
 import pytest
 
-from app.market_cn.auto.slice.contract import DayInput, Progress
-from app.market_cn.auto.slice.strategies import KnifeCatchSlim, TailOversoldSlim
-from app.market_cn.auto.slice.tests.common import (
+from app.market_cn.auto.core.present.contract import DayInput, Progress
+from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
+from app.market_cn.auto.strategies.tail_oversold import TailOversoldStrategy
+from tests.present.common import (
     KNIFE_HIST_CLOSES, TAIL_HIST_CLOSES,
     gen_hist_bars, knife_day_rows, make_snapshot_rows, tail_day_rows,
 )
@@ -51,7 +52,7 @@ def _new_ready(s, bars, code, rows, mkt_gain):
 
 def test_knife_crafted_trigger_day_matches_old():
     old = kc_old.KnifeCatchStrategy()
-    new = KnifeCatchSlim()
+    new = KnifeCatchStrategy()
     bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES)
     day = "2026-10-05"
     rows = knife_day_rows(day, pc=100.0)
@@ -71,7 +72,7 @@ def test_knife_crafted_trigger_day_matches_old():
 
 def test_knife_noise_day_matches_old():
     old = kc_old.KnifeCatchStrategy()
-    new = KnifeCatchSlim()
+    new = KnifeCatchStrategy()
     bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES)
     rows = knife_day_rows("2026-10-05", pc=100.0)
     for r in rows:                      # 横盘噪声：所有门都不过
@@ -84,7 +85,7 @@ def test_knife_noise_day_matches_old():
 
 def test_knife_fuzz_matches_old():
     old = kc_old.KnifeCatchStrategy()
-    new = KnifeCatchSlim()
+    new = KnifeCatchStrategy()
     rng = random.Random(42)
     for trial in range(15):
         n = rng.randint(10, 20)
@@ -117,7 +118,7 @@ def test_knife_fuzz_matches_old():
 
 def test_tail_crafted_trigger_day_matches_old():
     old = to_old.TailOversoldStrategy()
-    new = TailOversoldSlim()
+    new = TailOversoldStrategy()
     bars = gen_hist_bars(CODE, TAIL_HIST_CLOSES)
     rows = tail_day_rows("2026-10-05", pc=100.0)
 
@@ -134,7 +135,7 @@ def test_tail_crafted_trigger_day_matches_old():
 
 def test_tail_fuzz_matches_old():
     old = to_old.TailOversoldStrategy()
-    new = TailOversoldSlim()
+    new = TailOversoldStrategy()
     rng = random.Random(7)
     for trial in range(15):
         n = rng.randint(10, 20)
@@ -165,13 +166,13 @@ def test_tail_fuzz_matches_old():
 # ---------------- 出场（D1 开盘价 = 展示点 stage 2） ----------------
 
 @pytest.mark.parametrize("mod,cls_new,cls_old", [
-    (kc_old, KnifeCatchSlim, kc_old.KnifeCatchStrategy),
-    (to_old, TailOversoldSlim, to_old.TailOversoldStrategy),
+    (kc_old, KnifeCatchStrategy, kc_old.KnifeCatchStrategy),
+    (to_old, TailOversoldStrategy, to_old.TailOversoldStrategy),
 ])
 def test_exec_price_matches_old_exit_decision(mod, cls_new, cls_old):
     old = cls_old()
     new = cls_new()
-    bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES if cls_new is KnifeCatchSlim
+    bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES if cls_new is KnifeCatchStrategy
                          else TAIL_HIST_CLOSES)
     d0 = {"time": "2026-10-05", "open": 96.4, "high": 96.5, "low": 84.0,
           "close": 85.2, "volume": 1200.0}

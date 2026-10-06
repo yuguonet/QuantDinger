@@ -32,9 +32,9 @@ from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_fun
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
-# 递推展示层契约 (2026-10-06): 生产基类在前, slice 基类只补 params() 等。
-from app.market_cn.auto.slice.contract import (  # noqa: E402
-    DayInput, InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+# 递推展示层契约 (2026-10-06): 折叠契约已并入生产 StrategyBase（单继承）。
+from app.market_cn.auto.core.present.contract import (  # noqa: E402
+    DayInput, InsufficientHistory, Progress, Stage,
 )
 
 STRATEGY_KEY = "break"
@@ -352,7 +352,7 @@ def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
 
 
 @register
-class BreakStrategy(StrategyBase, SliceStrategyBase):
+class BreakStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # 锚定确认日(末根bar); 连板≥2已隐含U4
@@ -362,7 +362,7 @@ class BreakStrategy(StrategyBase, SliceStrategyBase):
     # 探针 day-stage 归属 (越靠后=离信号越近; 细门在 _break_signal_at 内不单列)
     PROBE_STAGE_RANK = {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,
                         "engine_skip": 5, "signal": 6}
-    # slice 展示阶段表: 递推侧只产出**信号日** (ready)。
+    # 展示阶段表: 递推侧只产出**信号日** (ready)。
     # ⚠ 出场生命周期不在递推侧重放 —— break 是多日追踪止损
     #   (exit_decision / core.exit_engines), 与 knife/tail 的 "D1 开盘即平账" 不同。
     stages = (
@@ -377,7 +377,7 @@ class BreakStrategy(StrategyBase, SliceStrategyBase):
         limit_ups: 预计算的涨停日索引列表 (回测/扫描复用, None 则现算 bars[:as_of])。
         probe: 调试探针 (None=零开销) — 门级 TRACE 打点 (粗粒度: 细门在
         _break_signal_at 内, 日级归属够用), 存档供 AI 离线分析。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         result = []
@@ -681,9 +681,9 @@ class BreakStrategy(StrategyBase, SliceStrategyBase):
         from app.market_cn.auto.probe import DayTrace
         # 入场枚举参数接线 (2026-09-13 修): 原硬编码 2,5 且经 kwargs 传 scan_signals,
         # kwargs 优先级压过实例覆写 → param_scan 网格全然无效 (实证: 全组合 n=94
-        # 同数字)。改从 merged_params(None) 取: 默认=代码默认值 (行为零差异), 实例
+        # 同数字)。改从 params(None) 取: 默认=代码默认值 (行为零差异), 实例
         # default_params 覆写 (param_scan 唯一调参入口) 即生效。
-        _p = self.merged_params(None)
+        _p = self.params(None)
         min_streak, max_break_gap = _p["min_streak"], _p["max_break_gap"]
         # 换手率门 (2026-09-11 config 透传): 实例覆写优先, 未覆写时回落 config —
         # 覆写后 config 不再参与 (实例覆写=回测权威)
@@ -707,7 +707,7 @@ class BreakStrategy(StrategyBase, SliceStrategyBase):
         fill_mode = fill_mode or "close"
         params = dict(BOARD_PARAMS[bt_type])
         # config/default_params 覆盖链: 实例 default_params / config params 中与 BOARD_PARAMS 同键的项生效
-        _mp = self.merged_params(None)
+        _mp = self.params(None)
         params.update({k: v for k, v in _mp.items() if k in params})
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
         hold_days = params["hold_days"]

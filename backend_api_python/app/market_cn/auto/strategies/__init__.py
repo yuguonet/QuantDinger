@@ -120,7 +120,7 @@ def daily_limit(key, default=20):
 
 
 def params_override(key):
-    """参数覆盖 dict (无则空 dict, 由 StrategyBase.merged_params 合并)。"""
+    """参数覆盖 dict (无则空 dict, 由 StrategyBase.params 合并)。"""
     v = _strategy_cfg(key).get("params")
     return v if isinstance(v, dict) else {}
 

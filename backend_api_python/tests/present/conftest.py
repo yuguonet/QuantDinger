@@ -7,8 +7,8 @@ Phase 2 删除旧策略后，用 AUTO_SLIM_REF 指向独立基线树运行。
 import os
 import sys
 
-_here = os.path.dirname(os.path.abspath(__file__))       # .../auto/slice/tests
-ROOT = os.path.abspath(os.path.join(_here, "..", "..", "..", "..", ".."))  # backend_api_python
+_here = os.path.dirname(os.path.abspath(__file__))       # .../tests/present
+ROOT = os.path.abspath(os.path.join(_here, "..", ".."))  # backend_api_python
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

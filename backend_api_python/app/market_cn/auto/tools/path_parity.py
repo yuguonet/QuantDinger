@@ -323,11 +323,11 @@ def runtime_intraday(strats, days, limit=None):
     整包退役 (零生产调用方; 原件在 del/20261006_core_present/) ⇒ 对账对象不存在,
     本段恒 SKIP (**非 FAIL**, 不做静默吞掉)。
 
-    盘中等价性的覆盖改由 slice 内核承担: `auto/slice/tests/` 与
-    `tools/slice_verify.py` 的 fold 等价性 (逐日 step == 全量重算, 逐位相等)。
+    盘中等价性的覆盖改由展示层内核承担: `tests/present/` 与
+    `tools/present_verify.py` 的 fold 等价性 (逐日 step == 全量重算, 逐位相等)。
     """
     return 0, ["[SKIP] B2 盘中族: IDE 门表通道已随 core/present 退役, 无对账对象 "
-               "(盘中等价性由 slice fold 覆盖) — 非 FAIL"]
+               "(盘中等价性由展示层 fold 覆盖) — 非 FAIL"]
 
 def run(static_only=False, days=60, limit=None, only=None,
         skip_b1=False, skip_b2=False, progress_every=0):

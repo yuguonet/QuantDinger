@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.market_cn.auto.core.present.contract import (
+    DayInput, InsufficientHistory, Progress, Stage,
+)
+
 
 # ================================================================
 # 调度契约 (Phase 3 只识别 daily_close; intraday_window 为分钟策略预留)
@@ -134,6 +138,10 @@ class StrategyBase:
     family_version: int = 1            # 链内版本号 (同族重叠取最高版本, 加高版本自动识别)
     scan_spec: ScanSpec = field(default_factory=ScanSpec)
     default_params: dict = field(default_factory=dict)
+    # ---- 折叠契约（本类是唯一实现；展示层只按 core.present.contract
+    #      .StrategyProtocol 取用）----
+    stages: tuple = ()                  # 展示点声明 (Stage 元组)
+    SEED_BARS: int = 200                # 框架统一 seed 根数
     use_unified_prefilter: bool = True
     signal_state: str = "watch_pending"
     entry_at_close: bool = False
@@ -169,15 +177,75 @@ class StrategyBase:
         统一契约的意义: 编排层 (rebuild) 对所有策略一视同仁地调这一个方法, 不因某个
         策略"内部贵"就给它单独开一条路径 —— 那会让编排层长出策略专属分支。
 
-        默认实现 = 逐日截断 + scan_signals (语义基准, 所有策略行为的定义)。
+        ★ 2026-10-06 目标态: 默认实现 = **展示层内核折叠** (seed 一次 + 逐日
+        step/evaluate), 与逐日 scan_signals 逐位等价 (break/dragon 已全市场对账;
+        knife/tail 为 intraday, 纯日线折叠不产 ready 事件)。
         覆盖条件: 判定代价高到逐日枚举不可接受时 (全序列指标 / 横截面池), 策略可在
-        自己的模块里覆盖本方法做"一次预计算 + 逐日 O(1)", 但**必须保证与逐日调用
-        scan_signals 逐位一致** (g56 的做法与实证见 g56.scan_days)。
+        自己的模块里覆盖本方法做"一次预计算 + 逐日 O(1)" (g56 的做法与实证见
+        g56.scan_days)。未迁移折叠契约的策略 (relay3/v1/lead_chase, config
+        均 enabled=false) 退化到 `_scan_days_by_signals` —— 其 scan_signals
+        本身就是唯一门实现, 不构成第二份逻辑。
 
         ⚠️ 只枚举 [lo_date, hi_date] 内的日期, 区间外的日期跳过 (不浪费判定)。
         """
         if not bars:
             return []
+        i0, i1 = self._day_span(bars, lo_date, hi_date)
+        if i1 < i0:
+            return []
+        # seed: 内核只吃"截至昨日"的切片; 起点尽量早, 历史不足则向后滑到够为止
+        state, j = None, i0
+        while j <= i1:
+            try:
+                state = self.init_state(code, bars[:j])
+                break
+            except InsufficientHistory:
+                j += 1
+            except NotImplementedError:
+                return self._scan_days_by_signals(
+                    bars, code, lo_date=lo_date, hi_date=hi_date, **params)
+        if state is None:
+            return []
+        out: list = []
+        for k in range(j, i1 + 1):
+            try:
+                events = self.evaluate(state, DayInput(code, bars[k], None), None) or []
+            except InsufficientHistory:
+                events = []
+            for ev in events:
+                if ev.stage != "ready":
+                    continue
+                pl = ev.payload or {}
+                out.append(Signal(
+                    code=code, time=str(bars[k]["time"])[:10],
+                    score=pl.get("score", 50), price=pl.get("price", 0.0),
+                    label=pl.get("label", ""), extra=dict(pl.get("extra") or {})))
+            state = self.step(state, bars[k])
+        return out
+
+    @staticmethod
+    def _day_span(bars, lo_date, hi_date):
+        """[lo_date, hi_date] 的下标区间 [i0, i1]（闭区间；空区间返回 i1 < i0）。"""
+        i0, i1 = 0, len(bars) - 1
+        if lo_date:
+            i0 = len(bars)
+            for k, b in enumerate(bars):
+                if str(b["time"])[:10] >= lo_date:
+                    i0 = k
+                    break
+        if hi_date:
+            i1 = -1
+            for k in range(len(bars) - 1, -1, -1):
+                if str(bars[k]["time"])[:10] <= hi_date:
+                    i1 = k
+                    break
+        return i0, i1
+
+    def _scan_days_by_signals(self, bars, code, *, lo_date=None, hi_date=None, **params):
+        """未迁移折叠契约的策略的兜底: 逐日截断 + scan_signals（语义基准）。
+
+        这些策略的 scan_signals 本身就是**唯一**的门实现，走它不是第二份逻辑。
+        """
         out = []
         for k in range(len(bars)):
             d = str(bars[k]["time"])[:10]
@@ -284,7 +352,7 @@ class StrategyBase:
         probe.sample(**rec)
 
     # ---- 便捷 ----
-    def merged_params(self, override=None):
+    def params(self, override=None):
         """default_params ← config.json params 覆盖 的合并结果。
 
         优先级 (高→低): override 显式入参 > 实例 default_params (param_scan 网格覆写)
@@ -294,6 +362,10 @@ class StrategyBase:
         文档却写「← config 覆盖」→ config.params 在回测/monitor 路径静默失效
         (仅 scan 经 params_override 单独注入)。现按文档补齐; 判定「是否仍为类默认」
         以放行 config —— param_scan 把网格写进实例 default_params 后仍保持权威。
+
+        ★ 2026-10-06: 折叠契约侧原有一份轻合并 `params()` (= 仅 default_params
+        + overrides, 不含 config)，与本方法**两个口径并存**。现归一为**本方法**
+        (config 感知, 语义更强); 旧名 `params` 删除, 调用点全部改名。
         """
         cls_def = type(self).default_params or {}
         p = dict(self.default_params or {})
@@ -307,6 +379,62 @@ class StrategyBase:
         if override:
             p.update(override)
         return p
+
+    # ================================================================
+    # 折叠契约 (= core.present.contract.StrategyProtocol 的实现面)
+    #
+    # state 语义恒定: 「截至昨日收盘」的切片。内核折叠序恒为
+    #     events = strategy.evaluate(state, DayInput(code, bar, ctx), prev)
+    #     state  = strategy.step(state, bar)          # evaluate 在 step 之前
+    # 展示层 (core/present/runner.py) 只认这六个方法, 不感知策略细节。
+    # ================================================================
+    def init_state(self, code: str, bars: list[dict]) -> dict:
+        """seed：用截至昨日的全量历史 bars 建初始切片（策略自定义 JSON）。"""
+        raise NotImplementedError
+
+    def step(self, state: dict, bar: dict) -> dict:
+        """每日推进一根（O(1)~O(window)）。纯函数：返回新 state，不改入参。"""
+        raise NotImplementedError
+
+    def probe(self, state: dict) -> list[tuple[str, float]]:
+        """除权探针：切片里若干「历史某日 (date, close)」锚点，严格相等比对。
+
+        不等 = 历史被复权/订正改写 → 整票重建。默认无锚点（不校验）。
+        """
+        return []
+
+    def evaluate(self, state: dict, inp: DayInput, prev: Progress | None) -> list[Progress]:
+        """返回本日产出的进度事件（0~2 条，按时间序；末条 = 当前进度）。
+
+        - prev.stage == 持仓/待执行阶段时，先结算上一阶段（如 D1 开盘出场）
+        - 再判今日是否触发（需 ctx）或预明日观察（watch，纯日线）
+        """
+        raise NotImplementedError
+
+    def init_shared(self, shared: dict | None) -> None:
+        """用持久化的策略级共享状态恢复内部对象（每轮开头调用，幂等）。
+
+        ⚠ 展示层的落盘出口唯一是 StateStore —— 策略文件不得自己开文件写盘。
+        """
+        return None
+
+    def shared_snapshot(self) -> dict | None:
+        """返回需持久化的策略级状态（JSON 可序列化）；None = 无。"""
+        return None
+
+    def begin_day(self, date: str, states: dict, bars: dict) -> dict | None:
+        """每日折叠前调用一次的跨票聚合（如横截面池）；返回日级上下文。"""
+        return None
+
+    def realtime_shortlist(self, codes: list[str], snaps: dict,
+                           mkt_gain: float | None = None,
+                           stage: str | None = None) -> list[str]:
+        """实时旁支的便宜预筛（默认全过）。
+
+        stage = 当前进度阶段 —— 预筛只服务「宽候选集的触发扫描」(watch)；
+        已触发票的阶段转换（如 D1 开盘结算）不得被触发门拦截。
+        """
+        return list(codes)
 
     # ---- 框架钩子 (monitor 通用流程用; 默认实现 = 旧 else 分支语义) ----
     def quality_key(self, row):
@@ -326,7 +454,7 @@ class StrategyBase:
 
     def initial_stop(self, code, entry_price):
         """入场止损价 (update_stop_price 落库)。默认取 params.stop (-8%, 板块不分档)。"""
-        stop = self.merged_params(None).get("stop", -8.0)
+        stop = self.params(None).get("stop", -8.0)
         return round(entry_price * (1 + float(stop) / 100), 3)
 
     # ================================================================
@@ -344,7 +472,7 @@ class StrategyBase:
         策略有特殊竞价规则时覆盖 (如 v1 的主板高开 3~5% 回避带——可用参数复现)。
         """
         from app.market_cn.auto.core.market import get_board_type
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if not snap:
             return EntryDecision(False, "无竞价快照")
         open_px = float(snap.get("open") or snap.get("last") or 0)
@@ -385,7 +513,7 @@ class StrategyBase:
         "bars":[...], "entry_idx":int}; live 盘中模式返回 hold (硬止损兜底在 monitor)。
         策略有特殊出场 (如龙回头分段追踪 / relay3 尾盘未封板卖) 时覆盖。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         stop = p.get("stop", -8.0)
         trail = p.get("trail", -4.0)
         hold = p.get("hold", 7)
@@ -429,7 +557,7 @@ class StrategyBase:
             return None
         from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.core.market import get_board_type
-        p = self.merged_params(None)
+        p = self.params(None)
         n = len(bars)
         if n < 30:
             return []

@@ -11,8 +11,8 @@ import random
 import numpy as np
 import pytest
 
-from app.market_cn.auto.slice.runner import DailyRunner, StateStore
-from app.market_cn.auto.slice.strategies.g56 import G56Slim, PoolLedger
+from app.market_cn.auto.core.present.runner import DailyRunner, StateStore
+from app.market_cn.auto.strategies.g56 import G56Strategy, PoolLedger
 
 g56_old = pytest.importorskip("app.market_cn.auto.strategies.g56",
                               reason="旧参照代码不可用")
@@ -93,7 +93,7 @@ def _old_daily_hits(universe, hub_patch):
 
 def _new_daily_hits(universe, tmp_path):
     """新折叠逐日：run_day_all（begin_day 池 + evaluate）。"""
-    s = G56Slim(pool_ledger=PoolLedger())
+    s = G56Strategy(pool_ledger=PoolLedger())
     runner = DailyRunner(StateStore(str(tmp_path / "st")))
     hits = {}
     for t in range(FOLD_FROM, N_DAYS):
@@ -148,7 +148,7 @@ def test_g56_backtest_trades_match_old(seed, hub_patch, tmp_path):
             old_trades[(code, tr["signal_date"])] = tr
 
     # 新折叠：从事件流水组装交易（ready → exec → exit）
-    s = G56Slim(pool_ledger=PoolLedger())
+    s = G56Strategy(pool_ledger=PoolLedger())
     runner = DailyRunner(StateStore(str(tmp_path / "st")))
     for t in range(FOLD_FROM, N_DAYS):
         date = universe["600001"][t]["time"][:10]
@@ -216,21 +216,21 @@ def test_g56_pool_matches_old_aggregate(hub_patch, tmp_path):
     old_pool = {brd: old._aggregate(bk) for brd, bk in buckets.items()}
 
     # 新折叠（全史跑完；池在 run_day_all 内部逐日积累）
-    s = G56Slim(pool_ledger=PoolLedger())
+    s = G56Strategy(pool_ledger=PoolLedger())
     runner = DailyRunner(StateStore(str(tmp_path / "st")))
     for t in range(36, N_DAYS):
         date = universe["600001"][t]["time"][:10]
         trunc = {c: b[:t + 1] for c, b in universe.items()}
         runner.run_day_all(s, date, trunc)
     # 从台账重建池
-    from app.market_cn.auto.slice import g1 as G
+    from app.market_cn.auto.core.features import cross_section as G
     new_pool = {}
     new_pool = {}
     for board in ("main", "gem_star"):
         by_date = {q["date"]: [[q["rmed"]] * q["n"], [q["dmed"]] * q["n"],
                                [q["smed"]] * q["n"]]
                    for q in s.ledger.window(board)}
-        new_pool[board] = G.aggregate(by_date)
+        new_pool[board] = G._aggregate(by_date)
     overlap = 0
     for board in ("main", "gem_star"):
         for date, st_new in new_pool[board].items():

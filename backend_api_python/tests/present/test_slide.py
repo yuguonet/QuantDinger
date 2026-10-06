@@ -8,10 +8,10 @@ import copy
 
 import pytest
 
-from app.market_cn.auto.slice.runner import DailyRunner, RebuildNeedsHistory, StateStore
-from app.market_cn.auto.slice.strategies.dragon_callback import DragonCallbackSlim
-from app.market_cn.auto.slice.strategies.g56 import G56Slim, PoolLedger
-from app.market_cn.auto.slice.tests.test_dragon import CODE, SI, _fuzz_bars, crafted_bars
+from app.market_cn.auto.core.present.runner import DailyRunner, RebuildNeedsHistory, StateStore
+from app.market_cn.auto.strategies.dragon_callback import DragonCallbackStrategy
+from app.market_cn.auto.strategies.g56 import G56Strategy, PoolLedger
+from tests.present.test_dragon import CODE, SI, _fuzz_bars, crafted_bars
 
 
 def _mk_runner(tmp_path, tag):
@@ -42,16 +42,16 @@ def _run_sliding(s, runner, bars, ctxs=None):
 
 def test_dragon_one_bar_feed_equals_full_fold(tmp_path):
     bars = crafted_bars()[:34]
-    a = _run_full(DragonCallbackSlim(), _mk_runner(tmp_path, "a"), bars)
-    b = _run_sliding(DragonCallbackSlim(), _mk_runner(tmp_path, "b"), bars)
+    a = _run_full(DragonCallbackStrategy(), _mk_runner(tmp_path, "a"), bars)
+    b = _run_sliding(DragonCallbackStrategy(), _mk_runner(tmp_path, "b"), bars)
     assert a == b, "1 日滑动 == 全量 fold（state/progress/事件流水逐位一致）"
 
 
 def test_g56_one_bar_feed_equals_full_fold(tmp_path):
-    from app.market_cn.auto.slice.tests.test_g56 import _gen
+    from tests.present.test_g56 import _gen
     universe = _gen(1)
-    sa = G56Slim(pool_ledger=PoolLedger())
-    sb = G56Slim(pool_ledger=PoolLedger())
+    sa = G56Strategy(pool_ledger=PoolLedger())
+    sb = G56Strategy(pool_ledger=PoolLedger())
     ra, rb = _mk_runner(tmp_path, "a"), _mk_runner(tmp_path, "b")
     src = {c: {b["time"]: b for b in bars} for c, bars in universe.items()}
     for k in range(36, 80):
@@ -72,7 +72,7 @@ def test_g56_one_bar_feed_equals_full_fold(tmp_path):
 
 def test_advance_daily_input_is_two_bars(tmp_path):
     """日常输入面核对：不给 history 也能推进（只有重建才需要）。"""
-    s = DragonCallbackSlim()
+    s = DragonCallbackStrategy()
     runner = _mk_runner(tmp_path, "s")
     bars = crafted_bars()[:34]
     # 先 seed 一天（重建路径，需要 history；seed 至昨日需 ≥30 根）
@@ -86,7 +86,7 @@ def test_advance_daily_input_is_two_bars(tmp_path):
 
 def test_probe_rebuild_via_probe_bars(tmp_path):
     """除权改写：数据层取回的锚 bar close 变了 → 重建（且必须带 history）。"""
-    s = DragonCallbackSlim()
+    s = DragonCallbackStrategy()
     runner = _mk_runner(tmp_path, "s")
     bars = crafted_bars()[:34]
     runner.advance(s, CODE, bars[30], yesterday=bars[29], history=bars[:31])
@@ -101,7 +101,7 @@ def test_probe_rebuild_via_probe_bars(tmp_path):
 
 
 def test_rebuild_conditions_still_hold_1d(tmp_path):
-    s = DragonCallbackSlim()
+    s = DragonCallbackStrategy()
     runner = _mk_runner(tmp_path, "s")
     bars = crafted_bars()[:34]
     runner.advance(s, CODE, bars[30], yesterday=bars[29], history=bars[:31])

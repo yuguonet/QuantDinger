@@ -7,8 +7,8 @@
 import numpy as np
 import pytest
 
-from app.market_cn.auto.slice import g1
-from app.market_cn.auto.slice.tests.common import gen_hist_bars
+from app.market_cn.auto.core.features import cross_section as g1
+from tests.present.common import gen_hist_bars
 
 cs_old = pytest.importorskip("app.market_cn.auto.core.features.cross_section",
                              reason="旧参照代码不可用")

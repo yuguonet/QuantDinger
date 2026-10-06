@@ -263,7 +263,7 @@ class Relay3Strategy(StrategyBase):
 
         as_of=k: 只用 bars[:k+1] 判定 (回测防未来函数); None 与旧 *_today_d0_signals 语义一致。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         if not bars or len(bars) < 67:
@@ -300,7 +300,7 @@ class Relay3Strategy(StrategyBase):
 
         snap=None (快照缺失) → 不可买 (与 monitor 中 open_px<=0 → skip 一致, 不强买)。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if not snap:
             return EntryDecision(False, "无竞价快照")
         open_px = float(snap.get("open") or snap.get("last") or 0)
@@ -344,7 +344,7 @@ class Relay3Strategy(StrategyBase):
 
     def initial_stop(self, code, entry_price):
         """盘中硬止损 -5% (stop_pct)。"""
-        return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
+        return round(entry_price * (1 + self.params()["stop_pct"] / 100), 3)
 
     # ---- 出场判定 ----
     def exit_decision(self, row, snap=None, **params):
@@ -377,7 +377,7 @@ class Relay3Strategy(StrategyBase):
         注意: 日线近似 S4 炸板按收盘价卖出, 实盘炸板瞬间价通常更高 → 回测偏保守。
         """
         from app.market_cn.auto.core.filters import unified_prefilter
-        p = self.merged_params(None)
+        p = self.params(None)
         n = len(bars)
         if n < 5:
             return []

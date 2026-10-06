@@ -47,7 +47,7 @@ def _run_meta(strat, days, start_date, end_date):
     except Exception:
         sha = "unknown"
     try:
-        params = strat.merged_params(None)
+        params = strat.params(None)
     except Exception:
         params = {}
     return {"git_sha": sha, "strategy": strat.key, "days": days,

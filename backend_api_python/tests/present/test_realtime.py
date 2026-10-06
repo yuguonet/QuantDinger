@@ -6,11 +6,11 @@
     D1 09:31 实时副本试推 → exec（执行）          == D1 晚预处理的 exec
 """
 
-from app.market_cn.auto.slice.contract import DayInput, Progress
-from app.market_cn.auto.slice.realtime import RealtimeBranch
-from app.market_cn.auto.slice.runner import DailyRunner, StateStore
-from app.market_cn.auto.slice.strategies import KnifeCatchSlim
-from app.market_cn.auto.slice.tests.common import KNIFE_HIST_CLOSES, gen_hist_bars, knife_day_rows
+from app.market_cn.auto.core.present.contract import DayInput, Progress
+from app.market_cn.auto.core.present.realtime import RealtimeBranch
+from app.market_cn.auto.core.present.runner import DailyRunner, StateStore
+from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
+from tests.present.common import KNIFE_HIST_CLOSES, gen_hist_bars, knife_day_rows
 
 CODE = "600001"
 MKT = -3.0
@@ -21,7 +21,7 @@ def _strip(e: Progress):
 
 
 def test_full_cycle_realtime_equals_preprocess(tmp_path):
-    s = KnifeCatchSlim()
+    s = KnifeCatchStrategy()
     store = StateStore(str(tmp_path / "state"))
     runner = DailyRunner(store)
     rb = RealtimeBranch(store, {s.key: s})
@@ -77,7 +77,7 @@ def test_full_cycle_realtime_equals_preprocess(tmp_path):
 
 def test_realtime_skips_undue_codes(tmp_path):
     """规则进度未到期的票不进实时候选（信息量极小）。"""
-    s = KnifeCatchSlim()
+    s = KnifeCatchStrategy()
     store = StateStore(str(tmp_path / "state"))
     runner = DailyRunner(store)
     rb = RealtimeBranch(store, {s.key: s})
@@ -91,7 +91,7 @@ def test_realtime_skips_undue_codes(tmp_path):
 
 def test_realtime_superset_shortlist_never_misses(tmp_path):
     """实时便宜预筛是必要条件超集：构造触发日，预筛后仍应保留该票。"""
-    s = KnifeCatchSlim()
+    s = KnifeCatchStrategy()
     rows = knife_day_rows("2026-10-05", pc=100.0)
     snap = [r for r in rows if str(r["time"])[11:16] == "14:56"][0]
     out = s.realtime_shortlist([CODE], {CODE: snap}, MKT)

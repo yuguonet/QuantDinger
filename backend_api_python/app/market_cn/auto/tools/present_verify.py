@@ -1,13 +1,13 @@
-"""tools/slice_verify.py — 展示层**单票对账**命令 (改进方案 §2.3 / §7.3 的 verify)。
+"""tools/present_verify.py — 展示层**单票对账**命令 (改进方案 §2.3 / §7.3 的 verify)。
 
 用途: 换规则/换策略/换数据后, 手工确认"新内核仍与旧口径逐位一致"。它不是
 生产链的一环, 只在人需要取证时跑 —— 因此**不做任何静默降级**: 每一项都打印
 PASS/FAIL 与证据, 任一项失败即以非 0 退出。
 
 用法:
-    python -m app.market_cn.auto.tools.slice_verify
-    python -m app.market_cn.auto.tools.slice_verify --strategy tail_oversold
-    python -m app.market_cn.auto.tools.slice_verify --source db --code 600000 --days 200
+    python -m app.market_cn.auto.tools.present_verify
+    python -m app.market_cn.auto.tools.present_verify --strategy tail_oversold
+    python -m app.market_cn.auto.tools.present_verify --source db --code 600000 --days 200
 
 检查项 (对应方案 §5 验收):
     C1 fold 等价   全量 fold(逐日 run_day) vs 1 日延伸(逐日 advance) → state/current 逐位一致
@@ -35,14 +35,15 @@ import sys
 import tempfile
 import time
 
-from app.market_cn.auto.slice.contract import DayInput, Progress
-from app.market_cn.auto.slice.realtime import RealtimeBranch
-from app.market_cn.auto.slice.runner import DailyRunner, Record, StateStore, strategy_source_hash
-from app.market_cn.auto.slice.strategies import KnifeCatchSlim, TailOversoldSlim
+from app.market_cn.auto.core.present.contract import DayInput, Progress
+from app.market_cn.auto.core.present.realtime import RealtimeBranch
+from app.market_cn.auto.core.present.runner import DailyRunner, Record, StateStore, strategy_source_hash
+from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
+from app.market_cn.auto.strategies.tail_oversold import TailOversoldStrategy
 
 STRATEGIES = {
-    "knife_catch": KnifeCatchSlim,
-    "tail_oversold": TailOversoldSlim,
+    "knife_catch": KnifeCatchStrategy,
+    "tail_oversold": TailOversoldStrategy,
 }
 
 #: 合成历史用的收盘序列 (连跌 + 前期走弱, 让日线门可判)
@@ -88,7 +89,7 @@ def _progress_sig(p: Progress | None):
 
 def _min_age(strategy, bars) -> int:
     """该策略能 seed 的最小根数(逐步试探 init_state 抛 InsufficientHistory 的边界)。"""
-    from app.market_cn.auto.slice.contract import InsufficientHistory
+    from app.market_cn.auto.core.present.contract import InsufficientHistory
     for k in range(1, min(len(bars), 60) + 1):
         try:
             strategy.init_state("verify", bars[:k])
@@ -101,9 +102,9 @@ def _min_age(strategy, bars) -> int:
 # ---------------------------------------------------------------- C1
 def check_fold_equivalence(strategy, code, bars) -> tuple[bool, str]:
     """全量 fold vs 1 日延伸: 末态 state / current / date 必须逐位一致。"""
-    from app.market_cn.auto.slice.contract import InsufficientHistory
+    from app.market_cn.auto.core.present.contract import InsufficientHistory
 
-    root = tempfile.mkdtemp(prefix="slice_verify_")
+    root = tempfile.mkdtemp(prefix="present_verify_")
     k0 = _min_age(strategy, bars)
     # A: 全量入口 run_day(逐日喂全量 bars)
     rA = DailyRunner(StateStore(os.path.join(root, "A")))
@@ -137,7 +138,7 @@ def check_fold_equivalence(strategy, code, bars) -> tuple[bool, str]:
 # ---------------------------------------------------------------- C2
 def check_realtime_equals_preprocess(strategy, code, bars) -> tuple[bool, str]:
     """实时分支(切片副本 + 未收盘快照) == 预处理在同一 bar 上的判定。"""
-    root = tempfile.mkdtemp(prefix="slice_verify_rt_")
+    root = tempfile.mkdtemp(prefix="present_verify_rt_")
     store = StateStore(root)
     runner = DailyRunner(store)
     k0 = _min_age(strategy, bars)
@@ -172,7 +173,7 @@ def check_realtime_equals_preprocess(strategy, code, bars) -> tuple[bool, str]:
 # ---------------------------------------------------------------- C3
 def check_rebuild_conditions(strategy, code, bars) -> tuple[bool, str]:
     """四条件重建 + 同日幂等: 每个条件都必须**各自**命中预期原因。"""
-    root = tempfile.mkdtemp(prefix="slice_verify_rb_")
+    root = tempfile.mkdtemp(prefix="present_verify_rb_")
     store = StateStore(root)
     runner = DailyRunner(store)
     k0 = _min_age(strategy, bars)
@@ -217,7 +218,7 @@ def check_rebuild_conditions(strategy, code, bars) -> tuple[bool, str]:
 # ---------------------------------------------------------------- C4
 def check_rebuild_equals_reseed(strategy, code, bars) -> tuple[bool, str]:
     """重建后 state == init_state(全量[:-1]); 规则进度 current 跨重建保留。"""
-    root = tempfile.mkdtemp(prefix="slice_verify_rs_")
+    root = tempfile.mkdtemp(prefix="present_verify_rs_")
     store = StateStore(root)
     runner = DailyRunner(store)
     k0 = _min_age(strategy, bars)
@@ -247,7 +248,7 @@ def check_rebuild_equals_reseed(strategy, code, bars) -> tuple[bool, str]:
 # ---------------------------------------------------------------- P
 def check_perf(strategy, code, bars) -> tuple[bool, str]:
     """全量 fold 一轮 vs 单日推进一次的耗时比 (方案 §5.4: 单日推进应 ≤ 全量 1/5)。"""
-    root = tempfile.mkdtemp(prefix="slice_verify_p_")
+    root = tempfile.mkdtemp(prefix="present_verify_p_")
     k0 = _min_age(strategy, bars)
     runner = DailyRunner(StateStore(root))
     t0 = time.perf_counter()

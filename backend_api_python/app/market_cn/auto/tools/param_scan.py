@@ -28,7 +28,7 @@
     / ±15% (float, 1-2-5 取整) / bool 消融, 恰构成 OFAT 敏感性扫描; 每维 ±两档
     +基准补跑 = 3 点, 邻域平台/尖峰判定天然可用; 基准点不入切片 (由补跑出);
   - 覆写机制: 实例级 strat.default_params = {**基准, **网格覆写} — 回测钩子内部
-    merged_params(None) 只读 default_params; config params 仅经实盘扫描路径的
+    params(None) 只读 default_params; config params 仅经实盘扫描路径的
     params_override 注入, 不进回测路径, 故实例覆写即权威且互不干扰 (跑完即还原);
   - 零落库: 只调 run_all/run_all_intraday (内存 trades), 不写 store/不改 config;
   - 数据复用: hub daily memo 跨组合复用, 第 2 组合起零重载 (865s→71s 红利);
@@ -270,7 +270,7 @@ def main():
         raise SystemExit(f"策略 {args.strategy} 未注册 "
                          f"(可用: {sorted(strat_reg.all_strategies())})")
     kind = strat.scan_spec.kind
-    base_eff = strat.merged_params(None)          # 代码默认值 (回测路径基准)
+    base_eff = strat.params(None)          # 代码默认值 (回测路径基准)
     base_eff.update(base_patch)                   # 用户注入的基准补丁
     cfg_params = strat_reg.params_override(args.strategy)
     if cfg_params and not base_patch:

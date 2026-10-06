@@ -138,7 +138,7 @@ class BreakV2Strategy(StrategyBase):
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
                      probe=None, **params):
         """与 BreakStrategy.scan_signals 同构; 差异仅前置门 (A∨B)。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         result = []
@@ -281,7 +281,7 @@ class BreakV2Strategy(StrategyBase):
                       probe=None):
         from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
-        _p0 = self.merged_params()   # 2026-09-13 接线: 原硬编码 2,5 压过实例覆写 (同 break_buy)
+        _p0 = self.params()   # 2026-09-13 接线: 原硬编码 2,5 压过实例覆写 (同 break_buy)
         min_streak, max_break_gap = _p0["min_streak"], _p0["max_break_gap"]
         # V2 门参数 (2026-09-11): config 覆盖 > 代码默认。**门在回测侧应用于
         # "v1 会选定的候选"** (dedup/used 登记之后) — 扫描内门会造成 dedup 泄漏:
@@ -294,7 +294,7 @@ class BreakV2Strategy(StrategyBase):
             _ov = {}
         _gate_kw = {k: _ov[k] for k in ("turnover_max", "env_ret20_max")
                     if _ov.get(k) is not None}
-        _mp = self.merged_params()
+        _mp = self.params()
         _tmax_g = _gate_kw.get("turnover_max", _mp.get("turnover_max"))
         _rmax_g = _gate_kw.get("env_ret20_max", _mp.get("env_ret20_max"))
         _env_ix = _mp.get("env_index") or "000300"

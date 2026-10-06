@@ -33,7 +33,7 @@
     最高, **D1 入场日起算**, 旧 peak5 D2 起漏当日冲高); 滑窗 O(n) 预计算;
     主路径 _signal_core 短路版逐字保留 (速度/等价性优先), 两版判定等价由
     tmp/_dbg_equiv.py 单测锁定 — 改规则必须两处同步并重跑单测;
-  - 参数一律 self.merged_params(None) 取 (2026-09-13 接线纪律: 禁硬编码 kwargs
+  - 参数一律 self.params(None) 取 (2026-09-13 接线纪律: 禁硬编码 kwargs
     压过实例覆写, param_scan 实例覆写即生效);
   - 未加 config.json 段: 不进实盘 schedule (只挂 dragon_scan/knife_scan/dragon_monitor),
     autodiscover 注册仅供回测; 回测基准=代码默认值。
@@ -310,7 +310,7 @@ class TripleResonanceStrategy(StrategyBase):
     # ---- 信号判定 (实盘口径: 单股单日现算指标) ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
         """D0 三金叉共振 → Signal (至多1笔)。as_of=k: 只用 bars[:k+1]。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         if len(bars) < 35:
@@ -352,7 +352,7 @@ class TripleResonanceStrategy(StrategyBase):
 
     def initial_stop(self, code, entry_price):
         """按 stop 参数 (default -8%)。"""
-        return round(entry_price * (1 + self.merged_params()["stop"] / 100), 3)
+        return round(entry_price * (1 + self.params()["stop"] / 100), 3)
 
     # ---- 出场判定 (monitor live 语义: 收盘口径, 与回测引擎同参数) ----
     def exit_decision(self, row, snap=None, **params):
@@ -363,7 +363,7 @@ class TripleResonanceStrategy(StrategyBase):
         entry_price = float(row.get("entry_price") or 0)
         if bars is None or entry_idx is None or entry_price <= 0:
             return ExitDecision("hold")
-        p = self.merged_params(None)
+        p = self.params(None)
         stop, trail, hold = p["stop"], p["trail"], int(p["hold"])
         today_idx = len(bars) - 1
         held = today_idx - entry_idx + 1
@@ -427,7 +427,7 @@ class TripleResonanceStrategy(StrategyBase):
                     labels["mae5"] = mae_arr[i]
                 # 出场模拟 (知道出场位置以出场为准; fail 行=假设 D1 开盘入场的模拟)
                 from app.market_cn.auto.strategies.v1 import _run_backtest as _run_exit
-                p = self.merged_params(None)
+                p = self.params(None)
                 bt = _run_exit(bars, i + 1, entry, int(p["hold"]), p["stop"],
                                p["trail"], get_board_type(code))
                 if bt:
@@ -443,7 +443,7 @@ class TripleResonanceStrategy(StrategyBase):
             rec.update(extra)
         probe.sample(**rec)
 
-    # ---- 回测钩子 (指标预计算 O(n), 逐日 O(win); 参数经 merged_params 接线) ----
+    # ---- 回测钩子 (指标预计算 O(n), 逐日 O(win); 参数经 params 接线) ----
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
                        probe=None):
         """单股三金叉全历史回测: D0 信号 → D1 开盘买 → v1 通用出场引擎。
@@ -453,8 +453,8 @@ class TripleResonanceStrategy(StrategyBase):
         非 probe 模式: 主路径短路版, 判定/性能与改造前逐字等价。
         """
         from app.market_cn.auto.core.filters import unified_prefilter
-        # 参数接线 (2026-09-13 纪律): 一律 merged_params(None), 禁硬编码 kwargs
-        p = self.merged_params(None)
+        # 参数接线 (2026-09-13 纪律): 一律 params(None), 禁硬编码 kwargs
+        p = self.params(None)
         n = len(bars)
         if n < 35:
             return []

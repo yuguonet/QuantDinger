@@ -412,7 +412,7 @@ class DragonCallbackStrategy(StrategyBase):
         量比/回调结构需要日线 → 留给 scan_signals 完整判定, 本层只做廉价砍量。
         无市场门控 (龙回头规则不含大盘条件, mkt_gain 仅记录不拦截)。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         # 反转日语义: 信号日是反转日(当日为上涨日, 收盘>=涨停收盘), 故便宜预筛改为"当日非大跌"
         #   (chg > -0.5 - slack) 的超集 —— 保留所有上涨日, 仅砍掉坠落刀式大跌日。
         #   (旧语义"当日为缩量小阴"已不适用: 现在小阴落在 day i-1, 信号日在 day i)
@@ -449,7 +449,7 @@ class DragonCallbackStrategy(StrategyBase):
         日线回测/重放 (ctx 为空): 直接判定 bars 末根。
         limit_ups: 预计算涨停索引 (回测优化, None 则现算)。probe=None=零开销。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         ctx = ctx or {}
         snap = ctx.get("latest")
         series = ctx.get("series") or []
@@ -606,7 +606,7 @@ class DragonCallbackStrategy(StrategyBase):
             # 引擎同样会走到数据末尾, 若照单全收 → 买入当日即被误标"持仓到期"出场。
             held = today_idx - entry_idx
             if r["exit_reason"] == "持仓到期" \
-                    and held < int(self.merged_params()["hold_days"]):
+                    and held < int(self.params()["hold_days"]):
                 return ExitDecision("hold")
             return ExitDecision("exit", reason=r["exit_reason"], price=float(r["exit_price"]))
         return ExitDecision("hold")
@@ -628,7 +628,7 @@ class DragonCallbackStrategy(StrategyBase):
             return []
         lu_all = find_limit_ups(bars, board_type)
         # 廉价预筛参数: 与 scan_signals 实际用的默认参数同源 (回测不走 config 覆盖,
-        # 与旧 facade 调用路径一致); 取 self.default_params 而非 merged_params。
+        # 与旧 facade 调用路径一致); 取 self.default_params 而非 params。
         pd_min = self.default_params["min_pullback_days"]
         pd_max = self.default_params["max_pullback_days"]
         trades = []

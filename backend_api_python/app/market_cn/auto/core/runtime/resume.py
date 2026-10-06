@@ -37,7 +37,7 @@ per-indicator 锚点)。此前 MACD 专门做了一个 `anchor=(ef,es,dea)` 参�
 ====================================================================
 曾有的 `ResumePoint` 声明表、`RESUMABLE` 名字注册表、`ResumeBook` 与
 `bars_fingerprint`, 其**唯一**消费方是已退役的展示层 `core/present/`
-(原件在 del/20261006_core_present/)。展示层的断点语义改由 slice 契约承担:
+(原件在 del/20261006_core_present/)。展示层的断点语义改由 core/present 折叠契约承担:
 **策略自己在 `init_state/step` 里递推**, 展示层不再收集/分发不透明 blob。
 
 本模块因此只剩**指标 codec 层**: 每指标的 `snapshot / resume / compute` 三件套。

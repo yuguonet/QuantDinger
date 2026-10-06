@@ -29,11 +29,11 @@ from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
-# 递推展示层契约 (2026-10-06 自 slice/strategies/dragon_callback.py 下沉):
-#   生产基类在前 ⇒ merged_params/scan_signals 不被遮盖; slice 基类只补 params()
+# 递推展示层契约 (2026-10-06: 折叠契约已并入生产 StrategyBase):
+#   折叠契约已并入生产 StrategyBase（单继承）; 参数合并口径唯一 = params()
 #   等生产侧没有的方法。放第二位, 与 knife/tail/g56 同一写法。
-from app.market_cn.auto.slice.contract import (  # noqa: E402
-    DayInput, InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+from app.market_cn.auto.core.present.contract import (  # noqa: E402
+    DayInput, InsufficientHistory, Progress, Stage,
 )
 from app.utils.indicators import macd_core, macd_state  # noqa: E402
 
@@ -528,9 +528,9 @@ def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
 def _dragon_gates(p, cand, d0, probe=None):
     """龙回头门 0a/0b → 1 → 2(gap) → 3 → 4 → 5 → 6(拐点OR) → 7 → 8a~8c —— **唯一实现**。
 
-    2026-10-06: 此前生产 `scan_signals` 循环内逐门内联、slice `_signal` 又抄一份 ——
+    2026-10-06: 此前生产 `scan_signals` 循环内逐门内联、展示层 `_signal` 又抄一份 ——
     两套实现可给出相反结果（记忆点名的雷区）。现两侧只负责**各自准备特征**:
-      生产 = 全量 bars 索引 (lu_idx/i)；slice = 递归 ring 窗口 + 冻结 lu 记录。
+      生产 = 全量 bars 索引 (lu_idx/i)；展示层 = 递归 ring 窗口 + 冻结 lu 记录。
     判定顺序/阈值/短路语义全部集中于此；改门只需改这一处。
 
     Args:
@@ -604,7 +604,7 @@ def _dragon_gates(p, cand, d0, probe=None):
 
 
 @register
-class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
+class DragonCallbackStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "limit_up"     # U1~U4 锚定涨停日 (D0 缩量小阴日评估会误杀)
@@ -614,7 +614,7 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
     PROBE_STAGE_RANK = {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4, "rsi": 5,
                         "turn": 6, "d0_chg": 7, "quality": 7, "dedup": 8, "prefilter": 9,
                         "engine_skip": 9, "signal": 10}
-    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("ready", "龙回头·准备", realtime="09:25"),
         Stage("exec", "D1开盘买入"),
@@ -639,7 +639,7 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
         probe: 调试探针 (probe.Probe / 同签名 shim), None=零开销 — TRACE 式记录
         每候选各判定步落点 (debug 形态, 数据存档供 AI 分析, 与判定行为无关)。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         result = []
@@ -703,7 +703,7 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
                 _tr = None
 
             # ── Step1~8c: 门判定**委托 `_dragon_gates`**（唯一实现，与展示层共用）──
-            #   特征在此按全量 bars 索引准备；slice 侧按 ring 窗口 + 冻结 lu 记录准备。
+            #   特征在此按全量 bars 索引准备；展示层侧按 ring 窗口 + 冻结 lu 记录准备。
             d0_vs_ma20 = _d0_vs_ma20(bars, i)
             pullback_depth = _pullback_depth(bars, lu_idx, i)
             yin_ratio = _yin_ratio(bars, lu_idx, i)
@@ -752,7 +752,7 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
         return result
 
     # ================================================================
-    # 递推展示层契约 (2026-10-06 自 slice/strategies/dragon_callback.py 下沉)
+    # 递推展示层契约 (2026-10-06: 折叠契约已并入生产 StrategyBase)
     #
     # 门判定  → `_dragon_gates`（全量路径 scan_signals 与递推路径共用一份）
     # 出场    → `run_backtest_dragon_callback`（core.exit_engines 唯一实现）
@@ -1030,8 +1030,8 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
             return ExitDecision("hold")
         board = get_board_type(row.get("code", ""))
         today_idx = len(bars) - 1
-        # 2026-09-25: 出场参数同样走 merged_params (与 backtest_stock 一致, 否则实盘/回测口径分叉)
-        _ep = self.merged_params(None)
+        # 2026-09-25: 出场参数同样走 params (与 backtest_stock 一致, 否则实盘/回测口径分叉)
+        _ep = self.params(None)
         r = run_backtest_dragon_callback(
             bars, entry_idx, entry_price, board_type=board,
             stop_at_idx=today_idx,
@@ -1066,7 +1066,7 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
             return []
         lu_all = find_limit_ups(bars, board_type)
         # 廉价预筛参数: 与 scan_signals 实际用的默认参数同源 (回测不走 config 覆盖,
-        # 与旧 facade 调用路径一致); 取 self.default_params 而非 merged_params。
+        # 与旧 facade 调用路径一致); 取 self.default_params 而非 params。
         gap_min = self.default_params["gap_min"]
         gap_max = self.default_params["gap_max"]
         trades = []
@@ -1145,9 +1145,9 @@ class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
                 continue
 
             # 2026-09-25 bugfix: 原先写死 hold_days=7, stop_loss=-8.0 且不传 trail/peak,
-            # 导致 config/default_params 出场参数在回测路径**静默失效**。改为经 merged_params
+            # 导致 config/default_params 出场参数在回测路径**静默失效**。改为经 params
             # 注入 (config > 代码默认), 与 run_backtest_dragon_callback 的 **params 合并口径一致。
-            _ep = self.merged_params(None)
+            _ep = self.params(None)
             result = run_backtest_dragon_callback(
                 bars, i + 1, entry_price, board_type=board_type,
                 hold_days=_ep.get("hold_days"),

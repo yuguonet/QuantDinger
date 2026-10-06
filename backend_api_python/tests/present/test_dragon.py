@@ -8,10 +8,10 @@ import random
 
 import pytest
 
-from app.market_cn.auto.slice.runner import DailyRunner, StateStore
-from app.market_cn.auto.slice.strategies.dragon_callback import DragonCallbackSlim
+from app.market_cn.auto.core.present.runner import DailyRunner, StateStore
+from app.market_cn.auto.strategies.dragon_callback import DragonCallbackStrategy
 
-# 出场唯一实现在生产文件（2026-10-06 下沉后 slice 侧不再有副本）
+# 出场唯一实现在生产文件（2026-10-06 下沉后 展示层侧不再有副本）
 dc_old = pytest.importorskip("app.market_cn.auto.strategies.dragon_callback",
                              reason="旧参照代码不可用")
 run_backtest_dragon_callback = dc_old.run_backtest_dragon_callback
@@ -73,7 +73,7 @@ def _fuzz_bars(seed, n=70):
 
 
 def _fold_ready(bars, tmp_path, use_tech=True, si=SI):
-    s = DragonCallbackSlim()
+    s = DragonCallbackStrategy()
     s.use_tech_score = use_tech
     runner = DailyRunner(StateStore(str(tmp_path / "st")))
     hits = {}
@@ -176,7 +176,7 @@ def test_dragon_backtest_trades_match_old(tmp_path):
     st = dc_old.DragonCallbackStrategy()
     old_trades = st.backtest_stock(bars, CODE, stock_info=SI, use_prefilter=False)
 
-    s = DragonCallbackSlim()
+    s = DragonCallbackStrategy()
     s.use_tech_score = True
     runner = DailyRunner(StateStore(str(tmp_path / "st")))
     for k in range(30, len(bars) + 1):
@@ -217,7 +217,7 @@ def test_dragon_backtest_trades_match_old(tmp_path):
 
 def test_dragon_fold_state_step_equals_init():
     """fold 等价：逐步推进 == 一次性重建（lu 冻结属性 / rsi6 / ring）。"""
-    from app.market_cn.auto.slice.strategies.dragon_callback import DragonCallbackSlim as S
+    from app.market_cn.auto.strategies.dragon_callback import DragonCallbackStrategy as S
     bars = _fuzz_bars(4, 90)
     s = S()
     st = s.init_state(CODE, bars[:60])

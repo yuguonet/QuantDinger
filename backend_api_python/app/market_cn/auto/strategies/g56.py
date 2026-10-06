@@ -113,8 +113,8 @@ from app.market_cn.auto.core.features.cross_section import (  # noqa: E402  (L73
     ATR_Q5, ROLL, MIN_HIST, _aggregate, _g1_arrays, _g1_mask, _ensure_pool_daily,
     g1_state_features, g1_state_init, g1_state_step,
 )
-from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
-    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+from app.market_cn.auto.core.present.contract import (   # 展示层折叠契约
+    InsufficientHistory, Progress, Stage,
 )
 MAIN_RMED_MIN = 0.25     # 主板 regime 门: 池 rhist_chg 中位数 (raw)
 MAIN_PCTB_MAX = 49.87    # 主板 boll %b 上限 = 56%池内 P40 (g1deep3 桶边界)
@@ -153,7 +153,7 @@ DEFAULT_PARAMS = {
 G56_WIN = 35        # 递推切片窗口 (= 生产口径 DEFAULT_WIN)
 GAP_LIM = {"main": 0.098, "gem_star": 0.198}   # entry 过滤硬编码口径 (非 up_eff)
    # 2026-10-06: 原散落在 entry_decision / backtest 两处硬编码,
-   # slice evaluate 亦抄了一份 ⇒ 收敛为单一常量。
+   # 展示层 evaluate 亦抄了一份 ⇒ 收敛为单一常量。
 # score 相关阈值 (SCORE_* / R56 / MAIN_RMED_MIN / GEM_SCORE_MIN 等) 仍冻结为模块常量 ——
 # 样本内拟合产物, 不开放 config 覆盖以防误调 (调参须走 tmp 研究链路重验)。
 
@@ -171,7 +171,7 @@ def _g56_gate(f, pool, board, k, date_k, mask=None, p=None, age=None):
       (0.0225 / 0.0238 ms, `tmp/_g56_hotspot.py`), 抹掉后单次降到 0.0013 ms (**18x**)。
       逐日/批量调用方务必预算一次并传入, 见 `_iter_gate_days`。
 
-    p: 可选 merged_params() dict, 2026-09-26 迁入 dist_ma20_min 规则门, 其他 score
+    p: 可选 params() dict, 2026-09-26 迁入 dist_ma20_min 规则门, 其他 score
       阈值仍冻结常量; p=None 或缺键时 fallback 到 DEFAULT_PARAMS["dist_ma20_min"]。
 
     返回 (bool_pass, st): st=该日横截面统计 (None=池缺失)。scan_signals 与
@@ -354,8 +354,8 @@ def _mk_signal(code, bars, k, f, st):
 # 策略插件
 # ================================================================
 
-# SliceStrategyBase 放**第二**位: 生产 StrategyBase 的 merged_params 等优先,
-# slice 基类只补 params()/init_shared() 等生产基类没有的方法。
+# 2026-10-06: 单继承 StrategyBase —— 折叠契约已并入生产基类，参数合并口径唯一 = params()。
+# 折叠契约已并入生产 StrategyBase（单继承）。
 class PoolLedger:
     """策略级台账：每 (board, date) 横截面四元组 {date, n, rmed, dmed, smed}。
 
@@ -392,7 +392,7 @@ class PoolLedger:
 
 
 @register
-class G56Strategy(StrategyBase, SliceStrategyBase):
+class G56Strategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     entry_style = "g56"
@@ -400,7 +400,7 @@ class G56Strategy(StrategyBase, SliceStrategyBase):
     scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(DEFAULT_PARAMS)
     use_unified_prefilter = False      # 与 tmp 回测口径一致 (无 U1~U4)
-    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("ready", "五重共振·准备", realtime="09:25"),
         Stage("exec", "D0开盘买入"),
@@ -412,7 +412,7 @@ class G56Strategy(StrategyBase, SliceStrategyBase):
     #:    三档下界 35/40/240 的实测记录见 .workbuddy/memory)
 
     # ---- 信号判定: 只判末根bar (D-1); as_of=k 切片用于回测逐日枚举 ----
-    # ══ slice 契约：递推状态机 + 池台账（门/信号构造委托生产唯一实现）══
+    # ══ 展示层折叠契约：递推状态机 + 池台账（门/信号构造委托生产唯一实现）══
     def __init__(self, pool_ledger=None):
         self.ledger = pool_ledger or PoolLedger()
 
@@ -577,7 +577,7 @@ class G56Strategy(StrategyBase, SliceStrategyBase):
             return []
         # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
         pool_target = str(bars[-1]["time"])[:10]
-        p = self.merged_params(params)
+        p = self.params(params)
         # 暖机/越界: 原实现对小 as_of 会因 np.convolve 广播失败而崩溃 (切片不足 20 根),
         # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
         if len(bars) < 68:
@@ -635,7 +635,7 @@ class G56Strategy(StrategyBase, SliceStrategyBase):
         if pool is None:
             pool = _ensure_pool_daily(hi_date or str(bars[-1]["time"])[:10])
         out = []
-        p = self.merged_params(params)
+        p = self.params(params)
         for k, f, st in _iter_gate_days(bars, board, pool, 0, len(bars) - 1, p=p):
             d = str(bars[k]["time"])[:10]
             if lo_date and d < lo_date:
@@ -754,7 +754,7 @@ class G56Strategy(StrategyBase, SliceStrategyBase):
                             # (同共振段连续成信号时锁仓至退出日, 防 000070 连日重复建仓)
         # 修复① O(n^2): 全序列指标一次 O(n) 预计算, 不再逐日 scan_signals 重算 _g1_arrays
         # 修复③: 顺带消除逐日重算 _g1_mask (单次 gating 的 95%, 见 _iter_gate_days)
-        p = self.merged_params()
+        p = self.params()
         # 索引换算: 原 `for s in range(68, n - 9)` ⇒ s∈[68, n-10] ⇒ k=s-1∈[67, n-11]
         for k, f, st in _iter_gate_days(bars, board, pool, 67, n - 11, p=p):
             s = k + 1                          # 入场日 D0 = 信号日 D-1 的下一交易日

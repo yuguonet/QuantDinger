@@ -54,18 +54,18 @@ def _parse_params(s):
 
 
 def _apply_params(strat, params):
-    """临时参数覆盖: 挂到实例 merged_params 链 (不动 config, 不写文件)。"""
+    """临时参数覆盖: 挂到实例 params 链 (不动 config, 不写文件)。"""
     if not params:
         return
-    # merged_params(override) 合并 config > 代码; 试调优先于二者
-    orig = strat.merged_params
+    # params(override) 合并 config > 代码; 试调优先于二者
+    orig = strat.params
 
     def _mp(override=None):
         base = orig(override)
         base.update(params)
         return base
 
-    strat.merged_params = _mp
+    strat.params = _mp
 
 
 def _recent_db_rows(key, code, limit=8):
@@ -177,7 +177,7 @@ def main(argv=None):
         if args.json:
             argv2.append("--json")
         if p_over:
-            # debug 未接 --params; 已挂在实例上, 其内部 merged_params 会吃到
+            # debug 未接 --params; 已挂在实例上, 其内部 params 会吃到
             pass
         return _run_debug(dbg, argv2)
 
@@ -193,8 +193,8 @@ def main(argv=None):
     if kind == "intraday_window":
         print("盘中策略 → 多日粗扫用 debug --date 单日逐触发; 此处只报参数与库。")
         result = {"strategy": key, "code": args.code, "kind": kind,
-                  "params": {k: strat.merged_params(None).get(k)
-                             for k in ("t_gain_pct", "stop", "hold") if hasattr(strat, 'merged_params')}}
+                  "params": {k: strat.params(None).get(k)
+                             for k in ("t_gain_pct", "stop", "hold") if hasattr(strat, 'params')}}
     else:
         result = scan_days_brief(strat, key, bars, args.code, args.days)
         hits = result.get("hits") or []

@@ -381,7 +381,7 @@ class LeadChaseStrategy(StrategyBase):
 
     # ── 第一段: 全市场快照便宜预筛 (时间窗 + 可买入 + 涨幅 + 早盘噪音) ──
     def intraday_shortlist(self, snaps, mkt_gain, **params):
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if mkt_gain is not None and mkt_gain < p["mkt_gate"]:
             return {}
         hhmm = ""
@@ -443,7 +443,7 @@ class LeadChaseStrategy(StrategyBase):
 
     # ── 第二段: 单票深判 (日线前置池 + 早盘噪音剔除 + 时段量比) ──
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         ctx = ctx or {}
         snap, series = ctx.get("latest"), ctx.get("series") or []
         if not snap or not series:
@@ -697,7 +697,7 @@ class LeadChaseStrategy(StrategyBase):
 
         盘中止损优先 (保守: 同一根 bar 内先判止损)。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         mode = str(p.get("exit_mode", "close"))
         lim = float(p.get("exit_limit_pct", 3.0))
         stop = float(p.get("stop_pct", -6.0))
@@ -745,7 +745,7 @@ class LeadChaseStrategy(StrategyBase):
     # ── 出场: 实盘/收盘重放 (与 intraday_exit 同判定) ──
     def exit_decision(self, row, snap=None, **params):
         """收盘重放: T+1 到期即卖。盘中模式一律 hold。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         mode = str(p.get("exit_mode", "close"))
         lim = float(p.get("exit_limit_pct", 3.0))
         stop = float(p.get("stop_pct", -6.0))

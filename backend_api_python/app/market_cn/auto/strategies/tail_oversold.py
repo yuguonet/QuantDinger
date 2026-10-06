@@ -25,8 +25,8 @@ from app.market_cn.auto.core.market import get_board_type, is_limit_up, default_
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
-from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
-    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+from app.market_cn.auto.core.present.contract import (   # 展示层折叠契约
+    InsufficientHistory, Progress, Stage,
 )
 
 STRATEGY_KEY = "tail_oversold"
@@ -206,10 +206,10 @@ def _tail_ret_v2(series_rows):
     return (last_px / tail_avg - 1) * 100
 
 
-# SliceStrategyBase 放**第二**位: 生产 StrategyBase 的 merged_params 等优先,
-# slice 基类只补 params()/init_shared() 等生产基类没有的方法。
+# 2026-10-06: 单继承 StrategyBase —— 折叠契约已并入生产基类，参数合并口径唯一 = params()。
+# 折叠契约已并入生产 StrategyBase（单继承）。
 @register
-class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
+class TailOversoldStrategy(StrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
@@ -225,7 +225,7 @@ class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
     exit_exec_same_day = True
     signal_state = "buy_today"
     rolling_preview = True
-    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("watch", "候选观察", realtime="14:50-15:00", visible=False),
         Stage("ready", "D0尾盘触发·准备", realtime="09:31"),
@@ -244,7 +244,7 @@ class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
         8≤amp*nf<9.85 的合法信号被预筛静默丢弃: 实盘 14:50 滚动扫描 (走本预筛)
         系统性漏信号, 与回测口径分叉。契约仍是"必要条件超集, 宁多勿漏"。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         dg_max = _shortlist_dg_max(float(p["score_min"]))
         amp_floor = float(p["amp_min"]) - _SHORTLIST_SLACK_PCT
         out = {}
@@ -273,7 +273,7 @@ class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
             out[code] = snap
         return out
 
-    # ══ slice 契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
+    # ══ 展示层折叠契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
     # ⚠ 展示/预处理 evaluate 与盘中实时 scan_signals **共用同一份 _gates**。
     #   两入口只差"取哪个快照": scan_signals 判 ctx["latest"]（此刻）；
     #   evaluate 回扫当日 14:50~15:00 序列取首次触发。公式不得再写第二份。
@@ -441,7 +441,7 @@ class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
         门逻辑全部委托 `_gates` (与展示层 evaluate 同一实现), 本方法只负责:
         取快照 → 建切片 → 组装 Signal。probe: 门级 TRACE, 仅本入口传。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         ctx = ctx or {}
         snap, series = ctx.get("latest"), ctx.get("series") or []
         if not snap or not series:
@@ -506,7 +506,7 @@ class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
         return ExitDecision("hold")
 
     def initial_stop(self, code, entry_price):
-        return round(entry_price * (1 + self.merged_params()["stop_pct"] / 100), 3)
+        return round(entry_price * (1 + self.params()["stop_pct"] / 100), 3)
 
 
 # ================================================================

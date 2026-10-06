@@ -90,7 +90,7 @@ class V1Strategy(StrategyBase):
 
         probe: 调试探针 (probe.Probe / DayTrace shim), None=零开销 —
         各过滤门 TRACE 式打点, 存档供 AI 离线分析, 与判定行为无关。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         result = []
@@ -212,7 +212,7 @@ class V1Strategy(StrategyBase):
 
         gap = (open/prev_close-1)*100, prev_close 取快照 previousClose 兜底 signal_price。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if not snap:
             return EntryDecision(False, "无竞价快照")
         open_px = float(snap.get("open") or snap.get("last") or 0)
@@ -270,7 +270,7 @@ class V1Strategy(StrategyBase):
 
         snap={"mode":"day_close","bars":[...],"entry_idx":int}; live 模式无特殊规则 → hold
         (盘中硬止损兜底在 monitor 主循环)。"""
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if not isinstance(snap, dict) or snap.get("mode") != "day_close":
             return ExitDecision("hold")
         bars = snap.get("bars")
@@ -304,9 +304,9 @@ class V1Strategy(StrategyBase):
         from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.probe import DayTrace
         # 参数接线 (2026-09-13 修): 原入场五参数/D1过滤/出场均硬编码字面量 (kwargs
-        # 压过实例覆写) → param_scan 网格无效。统一改从 merged_params(None) 取:
+        # 压过实例覆写) → param_scan 网格无效。统一改从 params(None) 取:
         # 默认=PARAMS 同值 (行为零差异), 实例 default_params 覆写即生效。
-        _p = self.merged_params(None)
+        _p = self.params(None)
         board_type = get_board_type(code)
         n = len(bars)
         if n < 30:

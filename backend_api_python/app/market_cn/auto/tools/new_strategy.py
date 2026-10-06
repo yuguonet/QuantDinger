@@ -72,9 +72,9 @@ class {cls}(StrategyBase):
         """D0 判定 — TODO: 替换为真实规则。
 
         bars: 前复权日K升序 list[dict] (time/open/high/low/close/volume);
-        as_of: 判定日索引 (回测传 i, 实盘 None=末根); 参数经 merged_params 合并。
+        as_of: 判定日索引 (回测传 i, 实盘 None=末根); 参数经 params 合并。
         """
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         n = len(bars)

@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import copy
 
-from app.market_cn.auto.slice.contract import DayInput, Progress, StrategyBase
-from app.market_cn.auto.slice.runner import Record, StateStore
+from app.market_cn.auto.core.present.contract import (
+    DayInput, Progress, StrategyProtocol,
+)
+from app.market_cn.auto.core.present.runner import Record, StateStore
 
 
 def _in_anchor(hhmm: str, anchor: str) -> bool:
@@ -38,7 +40,7 @@ def bar_from_snapshot(snap: dict) -> dict:
 
 
 class RealtimeBranch:
-    def __init__(self, store: StateStore, strategies: dict[str, StrategyBase]):
+    def __init__(self, store: StateStore, strategies: dict[str, StrategyProtocol]):
         self.store = store
         self.strategies = strategies
 

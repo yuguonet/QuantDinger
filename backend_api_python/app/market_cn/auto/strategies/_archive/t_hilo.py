@@ -92,7 +92,7 @@ class THiloStrategy(StrategyBase):
     # 入场 (演示规则: 强势后缩量回踩) — 非荐股, 仅为让策略可独立回测
     # ================================================================
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
-        p = self.merged_params(params or None)
+        p = self.params(params or None)
         if as_of is not None:
             bars = bars[:as_of + 1]
         n = len(bars)
@@ -142,7 +142,7 @@ class THiloStrategy(StrategyBase):
         from app.market_cn.auto.core.t_legs import (
             TLegsConfig, TradeIntent, eval_t_legs, t_constraints,
         )
-        p = self.merged_params(None)
+        p = self.params(None)
         if not position or not position.get("code"):
             return []
         c = t_constraints(spec)

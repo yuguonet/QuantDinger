@@ -61,10 +61,10 @@ fold 三分支共用：回测 = 循环调 run_day；预处理 = 每天调一次�
     落盘次数             16 次/日           1 次/日
 
 ⚠ **落盘出口唯一**: 策略文件不得自己开文件写盘。跨票的**策略级共享状态**
-  （如 g56 的横截面池台账）经 `StrategyBase.init_shared` / `shared_snapshot`
+  （如 g56 的横截面池台账）经 `StrategyProtocol.init_shared` / `shared_snapshot`
   契约，与本策略的每票 state 存在**同一个文件**里、同一轮一起落盘 ——
   保证两者生命周期一致（旧 g56 台账自带文件且默认不落盘 ⇒ 重启后池静默丢失、
-  分位照算不报错）。见 `slice/strategies/g56.py::PoolLedger`。
+  分位照算不报错）。见 `strategies/g56.py::PoolLedger`。
   ⇒ 四策略每日合计 ≈ 6.1 s（改前 11.3 s）；仍远低于全市场全量重算 25 s。
 
 ⚠ 第二个 IO 源 (曾占滑动 43%): `strategy_source_hash` 每票读一次策略源文件
@@ -88,7 +88,9 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from app.market_cn.auto.slice.contract import DayInput, InsufficientHistory, Progress, StrategyBase
+from app.market_cn.auto.core.present.contract import (
+    DayInput, InsufficientHistory, Progress, StrategyProtocol,
+)
 
 
 class RebuildNeedsHistory(Exception):
@@ -106,7 +108,7 @@ _HASH_TTL_SEEN: dict[str, tuple[float, str]] = {}
 _HASH_TTL = 1.0     # 秒
 
 
-def strategy_source_hash(strategy: StrategyBase) -> str:
+def strategy_source_hash(strategy: StrategyProtocol) -> str:
     """策略文件内容 sha256（④ 改规则 = 该策略切片自动重建，无版本号/迁移）。"""
     src_file = inspect.getfile(type(strategy))
     now = time.monotonic()
@@ -397,7 +399,7 @@ class DailyRunner:
         self.store = store
 
     # ---- 重建判定（1 日延伸口径：只看昨/今两根 + 探针锚） ----
-    def _rebuild_reason(self, strategy: StrategyBase, rec: Record | None,
+    def _rebuild_reason(self, strategy: StrategyProtocol, rec: Record | None,
                         today: dict, yesterday: dict | None,
                         probe_bars: dict | None) -> str | None:
         """返回重建原因；None=正常推进；"noop"=同日重跑幂等拒绝。
@@ -422,7 +424,7 @@ class DailyRunner:
             return "date_gap"                   # ② 切片不在昨根上 = 时间线不连续
         return None
 
-    def _ensure_shared(self, strategy: StrategyBase) -> None:
+    def _ensure_shared(self, strategy: StrategyProtocol) -> None:
         """把持久化的策略级共享状态灌回策略实例（幂等；每轮/每票开头调用）。
 
         ⚠ 不能按 key 去重：同 key 可有多个策略实例（测试里两个 G56Slim），
@@ -430,12 +432,12 @@ class DailyRunner:
         """
         strategy.init_shared(self.store.get_meta(strategy.key))
 
-    def probe_anchors(self, strategy: StrategyBase, code: str) -> list[tuple[str, float]]:
+    def probe_anchors(self, strategy: StrategyProtocol, code: str) -> list[tuple[str, float]]:
         """数据层按需取探针锚的历史 bar（每天 2 根）→ 传给 advance 的 probe_bars。"""
         rec = self.store.load(strategy.key, code)
         return strategy.probe(rec.state) if rec else []
 
-    def advance(self, strategy: StrategyBase, code: str, today: dict, *,
+    def advance(self, strategy: StrategyProtocol, code: str, today: dict, *,
                 yesterday: dict | None = None, ctx: dict | None = None,
                 probe_bars: dict | None = None,
                 history: list[dict] | None = None) -> tuple[Record, list[Progress]]:
@@ -460,7 +462,7 @@ class DailyRunner:
                          strategy_hash=strategy_source_hash(strategy))
         return self._fold_step(strategy, code, rec, rec.state, today, ctx)
 
-    def run_day(self, strategy: StrategyBase, code: str, bars: list[dict],
+    def run_day(self, strategy: StrategyProtocol, code: str, bars: list[dict],
                 ctx: dict | None = None) -> tuple[Record, list[Progress]]:
         """全量 bars 入口（回测分支/兼容包装）：内部走 advance 同一实现。"""
         if not bars:
@@ -470,7 +472,7 @@ class DailyRunner:
             yesterday=bars[-2] if len(bars) >= 2 else None,
             ctx=ctx, probe_bars={b["time"]: b for b in bars}, history=bars)
 
-    def _fold_step(self, strategy: StrategyBase, code: str, rec: Record,
+    def _fold_step(self, strategy: StrategyProtocol, code: str, rec: Record,
                    state: dict, bar: dict, ctx: dict | None):
         events = strategy.evaluate(state, DayInput(code, bar, ctx), rec.current)
         rec.state = strategy.step(state, bar)
@@ -482,7 +484,7 @@ class DailyRunner:
         self.store.save(strategy.key, code, rec)
         return rec, events
 
-    def advance_all(self, strategy: StrategyBase, date: str,
+    def advance_all(self, strategy: StrategyProtocol, date: str,
                     day_inputs: dict[str, dict]) -> dict[str, list[Progress]]:
         """跨票 **1 日延伸**（预处理主入口；含 begin_day 池聚合）。
 
@@ -533,7 +535,7 @@ class DailyRunner:
                     out[code] = events
             return out
 
-    def run_day_all(self, strategy: StrategyBase, date: str,
+    def run_day_all(self, strategy: StrategyProtocol, date: str,
                     bars_by_code: dict[str, list[dict]],
                     ctx_by_code: dict[str, dict] | None = None) -> dict[str, list[Progress]]:
         """全量 bars 入口（回测分支/兼容包装）：内部走 advance_all 同一实现。"""
