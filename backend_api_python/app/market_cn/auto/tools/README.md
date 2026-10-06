@@ -1,6 +1,6 @@
 # tools/ — 调试与研发工具索引
 
-`auto/tools/` 共 25 个模块 ≈ 7700 行（全仓最大单层）。本表是**唯一权威索引**：
+`auto/tools/` 现 **21** 个模块（2026-10-07 归档 4 个 T3 后）。本表是**唯一权威索引**：
 按"我要回答什么问题"找工具，不靠记文件名。旧文档 §7.2 的清单只列到 21 个且已过期，
 以本表为准。
 
@@ -26,12 +26,11 @@
 | `selftest` | 策略契约测试闸门（策略改动后第一道） |
 | `path_parity` | 三路径同源自检（M2 验收件：scan_signals / scan_days / fold 口径一致） |
 | `present_verify` | 展示层单票对账（折叠输出 vs 旧路径逐位对账） |
-| `doctor` | 一键三方对账（含 `_archive` 未进注册表等结构检查） |
+| `doctor` | 一键三方对账（config ↔ 注册表 ↔ 磁盘插件、层反转、做T 约束等结构检查） |
 | `pool_check` | 信号级复验闸门（固化"信号级复验纪律"） |
 | `verify_prefilter` | 预筛等价验证（预筛前后口径是否等价） |
 | `bench_scan` | 盘中扫描 50s 预算基准（性能闸门） |
-| `m6_check` | M6「LLM 分析闭环」验收自检 |
-| `market_spec_check` | M5 验收闸门：市场适配层（MarketSpec）自检 |
+
 
 **判定与规则研发**
 
@@ -52,24 +51,20 @@
 |---|---|
 | `snapshot_quality` | 快照拼接通道质量诊断 |
 
-**ML 旁支（低频，冻结中）**
+## 三、已归档（2026-10-07）
 
-| 工具 | 用途 |
-|---|---|
-| `ml_baseline` | M4 GBDT 基线（ML 旁支，依赖 M2 样本） |
-| `sample_build` | M2 统一样本构建器（ML 旁支） |
+移到 `del/20261007_tools_t3/`（`del/` 批次约定，与 `del/_archive/` 同一套标准）：
 
-## 三、分级（2026-10-07 提议，待确认后执行归档）
+| 原工具 | 用途 | 归档理由 |
+|---|---|---|
+| `ml_baseline` | M4 GBDT 基线 | ML 旁支冻结 |
+| `sample_build` | M2 统一样本构建器 | ML 旁支冻结 |
+| `m6_check` | M6「LLM 分析闭环」验收自检 | M6 验收已过，只留档 |
+| `market_spec_check` | M5 市场适配层（MarketSpec）自检 | M5 验收已过，只留档 |
 
-按"多久用一次"分三档，供后续归档/停更决策用：
+归档前已核验这 4 个**零被引用**（无 `import`、无 CLI 注册），断链风险为 0。
 
-- **T1 一线日常**：`why` `debug` `replay` `explain` `doctor` `selftest`
-- **T2 改动/验收时**：`path_parity` `present_verify` `pool_check` `verify_prefilter`
-  `param_scan` `rule_audit` `gate_try` `gate_funnel` `bench_scan` `new_strategy`
-  `snapshot_quality` `chat_why` `proposal`
-- **T3 低频 / 可归档候选**：`rule_stats`（归因排查专用）、`m6_check` 与
-  `market_spec_check`（M5/M6 验收已过，只留档）、`ml_baseline` `sample_build`
-  （ML 旁支冻结）
-
-⚠ T3 的处置（移 `del/` 或标停更）需与 `strategies/_archive/` 的处置一起定，
-避免两套标准。定之前本表只做标注，不动文件。
+⚠ **`rule_stats` 最初被列为 T3 候选，核验后取消归档** —— 它不是孤立工具，而是
+一批工具的**统计口径底座**：`rule_audit` / `gate_try` / `gate_funnel` / `m6_check`
+都 import 它的 `_load_rows` / `_metrics`，且 `strategy_cli.py` 的 `stats` 子命令指向它。
+归档它 = 一次断 4 处 + 一个 CLI 入口。**低频 ≠ 可归档，先查 import。**

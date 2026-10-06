@@ -41,3 +41,12 @@ wheels/
 quantdinger.db
 /data/
 /logs/
+
+# 运行时产物: 活动 SQLite (WAL 持续涨) + 记忆/会话流水
+# ⚠ 已入库的历史版本需手工摘除:
+#   git rm --cached backend_api_python/checkpoints.sqlite{,-wal,-shm} \
+#                   backend_api_python/memory/history.jsonl
+/checkpoints.sqlite
+/checkpoints.sqlite-wal
+/checkpoints.sqlite-shm
+/memory/history.jsonl

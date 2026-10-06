@@ -95,20 +95,7 @@ def check_static(findings, only=None):
         if k not in yaml_stems:
             _add(findings, WARN, "yaml", f"策略 {k} 无 YAML 门表 (present/analyze 路径不覆盖)")
 
-    # 1e. 归档目录不得被注册
-    archived = set()
-    arch_dir = os.path.join(strat_dir, "_archive")
-    if os.path.isdir(arch_dir):
-        for f in os.listdir(arch_dir):
-            if f.endswith(".py"):
-                archived.add(os.path.splitext(f)[0])
-        bad = archived & set(plugins)
-        if bad:
-            _add(findings, FAIL, "archive", f"_archive 内文件仍被 autodiscover 注册: {sorted(bad)}")
-        else:
-            _add(findings, OK, "archive", f"_archive {sorted(archived)} 未进入注册表 (正确)")
-
-    # 1f. 依赖方向: core 不得顶层 import strategies 私有符号 (层反转)
+    # 1e. 依赖方向: core 不得顶层 import strategies 私有符号 (层反转)
     #     函数内惰性 import = WARN (仍记欠债); 顶层 import = FAIL
     auto_root = os.path.dirname(strat_dir)
     core_dir = os.path.join(auto_root, "core")
@@ -159,7 +146,7 @@ def check_static(findings, only=None):
     if not inversions and not lazy_inversions:
         _add(findings, OK, "layer", "core 未反向 import 具体策略模块")
 
-    # 1g. 做T 约束 (MarketSpec 推导, 非特判)
+    # 1f. 做T 约束 (MarketSpec 推导, 非特判)
     try:
         from app.market_cn.auto.core.t_legs import explain_constraints
         _add(findings, OK, "t_legs", f"默认市场做T约束: {explain_constraints()}")
