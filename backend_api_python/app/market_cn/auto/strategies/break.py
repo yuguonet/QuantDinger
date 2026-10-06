@@ -32,6 +32,10 @@ from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_fun
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
+# 递推展示层契约 (2026-10-06): 生产基类在前, slice 基类只补 params() 等。
+from app.market_cn.auto.slice.contract import (  # noqa: E402
+    DayInput, InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+)
 
 STRATEGY_KEY = "break"
 STRATEGY_LABEL = "断板"
@@ -80,6 +84,31 @@ DEFAULT_PARAMS = dict(min_streak=2, max_break_gap=5,
 #    (109 笔/85 天, 单日最大 n=3) ⇒ `scan.py` 截断从不触发。这是 break 与 g56 的关键差异
 #    (g56 单日可达 218 笔, 换键有 ~6.7pp 收益; **break 换键零收益**, 故此处不换因子, 只做
 #    展示归一化, 保持与 confirm_chg 单调同向)。
+# ================================================================
+# 递推展示层 (2026-10-06): 连板增量台账 + 滚动窗口
+# ----------------------------------------------------------------
+# 生产 scan_signals 的候选枚举是 O(n²) 的全历史重扫:
+#     for lu_idx in find_limit_ups(bars[:i], bt):   # 全历史涨停日
+#         is_first(前 10 根无涨停) → streak_end 向前延伸到连板末日
+# 递推等价的四条判据 (每条都可证, 非近似):
+#   ① 只有**连板首日**能通过 is_first —— 段内第 j 个涨停日(j≥1)的前一根
+#      必是涨停 ⇒ 必被 is_first 拒。⇒ 候选 == 极大连续涨停段的**起点**。
+#   ② is_first 只取决于「上一个涨停日的距离」(>10 才成立) ⇒ 段起点即可定,
+#      不需要回头看历史。
+#   ③ 有效信号要求 break_idx+break_days-1 == i 且 break_days ∈ [1, max_break_gap]
+#      ⇒ 段末 end ∈ [i-max_break_gap, i-1]。⚠ 上界是 i-1 不是 i-2: end=i-1 时
+#      break_idx=i, 循环 range(i, min(i+gap, i+1)) = [i] 非空 ⇒ break_days=1
+#      (昨日仍涨停 / 今日断板 1 天, 是合法候选)。曾漏成 i-2 ⇒ 实测漏 4 笔。
+#      ⇒ 台账只需保留 end ≥ i-8 的段, 与连板多长无关。
+#   ④ 段起点的两个远历史读数 —— bars[start]["time"] 与 bars[start-20]["close"]
+#      (pre20_gain) —— 在**段起点当时**就地冻结进台账 ⇒ 段再长也不需要长窗口。
+#      窗口只须覆盖 MA20/BOLL 的 20 根 + 断板期 5 根, 取 60 留足余量。
+# ⚠ 唯一残留边界: 连板长度 > BREAK_WIN-25(≈35) 时 rel_start 越界 —— 由 pad 哑 bar
+#   用冻结的 sdate/pre_ref 补齐 (A股历史最长连板 ≈29), 故仍是**严格等价**而非截断。
+# ================================================================
+BREAK_WIN = 60            # 递推窗口 (MA20/BOLL 20 + 断板期 5 + 余量)
+BREAK_MIN_BARS = 30       # 与 scan.py 全市场扫描同一门槛 (len(bars) < 30 跳过)
+
 SCORE_BASE = 50.0        # confirm_chg = 0 对应分
 SCORE_PER_PCT = 3.0      # 确认日每 +1% 涨幅对应 +3 分 (实测 p05=-6.77 / p95=+7.36 ⇒ 值域 ≈20~74)
 
@@ -323,7 +352,7 @@ def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
 
 
 @register
-class BreakStrategy(StrategyBase):
+class BreakStrategy(StrategyBase, SliceStrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"        # 锚定确认日(末根bar); 连板≥2已隐含U4
@@ -333,6 +362,12 @@ class BreakStrategy(StrategyBase):
     # 探针 day-stage 归属 (越靠后=离信号越近; 细门在 _break_signal_at 内不单列)
     PROBE_STAGE_RANK = {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,
                         "engine_skip": 5, "signal": 6}
+    # slice 展示阶段表: 递推侧只产出**信号日** (ready)。
+    # ⚠ 出场生命周期不在递推侧重放 —— break 是多日追踪止损
+    #   (exit_decision / core.exit_engines), 与 knife/tail 的 "D1 开盘即平账" 不同。
+    stages = (
+        Stage("ready", "断板确认·准备", realtime="09:25"),
+    )
 
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
@@ -418,6 +453,138 @@ class BreakStrategy(StrategyBase):
             ))
             break  # 只取一个信号
         return result
+
+    # ================================================================
+    # 递推展示层契约 (2026-10-06)
+    #
+    # 门判定  → `_break_signal_at` + `_entry_gate`（全量路径 scan_signals 共用）
+    # 原语    → `is_limit_up` / BOARD_PARAMS / `_score_of`（本文件唯一实现）
+    # 递推量  → 连板台账 {start,end,sdate,pre_ref,first} + 近 BREAK_WIN 根 OHLCV
+    # ================================================================
+    @staticmethod
+    def _rec(b):
+        return {"t": str(b["time"])[:10], "o": float(b["open"]), "h": float(b["high"]),
+                "l": float(b["low"]), "c": float(b["close"]),
+                "v": float(b.get("volume") or 0)}
+
+    def _blank(self, code):
+        return {"v": 1, "board": get_board_type(code), "abs_i": -1,
+                "win": [], "runs": [], "last_lu": None, "open_run": False}
+
+    def init_state(self, code: str, bars: list[dict]) -> dict:
+        """全量播种 = 逐根走同一个 `_advance`（递推与全量逐位一致的构造性保证）。"""
+        if len(bars) < BREAK_MIN_BARS:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < {BREAK_MIN_BARS}")
+        st = self._blank(code)
+        for b in bars:
+            st = self._advance(st, b)
+        return st
+
+    def step(self, state: dict, bar: dict) -> dict:
+        return self._advance(state, bar)
+
+    def _advance(self, st: dict, bar: dict) -> dict:
+        rec = self._rec(bar)
+        win = list(st["win"])
+        prev_c = win[-1]["c"] if win else None
+        abs_i = st["abs_i"] + 1
+        is_lu = prev_c is not None and prev_c > 0 and is_limit_up(rec["c"], prev_c, st["board"])
+        runs = list(st["runs"])
+        last_lu, open_run = st["last_lu"], st["open_run"]
+        if is_lu:
+            if open_run and runs:
+                runs[-1] = {**runs[-1], "end": abs_i}          # 连板延续
+            else:
+                runs.append({
+                    "start": abs_i, "end": abs_i, "sdate": rec["t"],
+                    # ② is_first = 上一个涨停日距离 > 10
+                    "first": last_lu is None or (abs_i - last_lu) > 10,
+                    # ④ pre20 基准在段起点就地冻结 (win[-20] = abs_i-20)
+                    "pre_ref": win[-20]["c"] if len(win) >= 20 else None,
+                })
+            last_lu, open_run = abs_i, True
+        else:
+            open_run = False
+        win = (win + [rec])[-BREAK_WIN:]
+        # ③ end < i-5 的段永不可能再是候选 ⇒ 保留 end ≥ abs_i-8 即可
+        cut = abs_i - 8
+        runs = [r for r in runs if r["end"] >= cut]
+        return {"v": 1, "board": st["board"], "abs_i": abs_i, "win": win,
+                "runs": runs, "last_lu": last_lu, "open_run": open_run}
+
+    def probe(self, state: dict) -> list[tuple[str, float]]:
+        w = state["win"]
+        return [(w[0]["t"], w[0]["c"]), (w[-1]["t"], w[-1]["c"])]
+
+    def evaluate(self, state: dict, inp: DayInput, prev: "Progress | None") -> list:
+        """信号日判定（门逻辑与 scan_signals 同一份实现，只换特征来源）。"""
+        p = self.params()
+        bar, code = inp.bar, inp.code
+        today = self._rec(bar)
+        wb = [{"time": r["t"], "open": r["o"], "high": r["h"], "low": r["l"],
+               "close": r["c"], "volume": r["v"]} for r in state["win"]] + [{
+                   "time": today["t"], "open": today["o"], "high": today["h"],
+                   "low": today["l"], "close": today["c"], "volume": today["v"]}]
+        i_abs = state["abs_i"] + 1
+        off = i_abs - (len(wb) - 1)                  # wb[0] 的绝对下标
+        bt = state["board"]
+        board_params = BOARD_PARAMS.get(bt, BOARD_PARAMS["main"])
+        board_params = {**board_params, **{k: v for k, v in p.items() if k in board_params}}
+        min_streak, max_break_gap = p["min_streak"], p["max_break_gap"]
+        si = (inp.ctx or {}).get("stock_info") or {}
+        circ = float(si.get("circ_shares") or 0)
+        total = float(si.get("total_shares") or 0)
+
+        for run in state["runs"]:
+            if not run["first"]:
+                continue
+            end = run["end"]
+            if end < i_abs - max_break_gap or end > i_abs - 1:      # ③
+                continue
+            rel_s, rel_e = run["start"] - off, end - off
+            # ④ 段起点越出窗口时用冻结值补哑 bar（严格等价, 不是截断候选）
+            pad = max(0, -rel_s, (20 - rel_s) if run["start"] >= 20 else 0)
+            bars_v = wb
+            if pad:
+                bars_v = [{"time": "", "open": 0.0, "high": 0.0, "low": 0.0,
+                           "close": 0.0, "volume": 0.0} for _ in range(pad)] + wb
+                bars_v[rel_s + pad]["time"] = run["sdate"]
+                if run["start"] >= 20:
+                    bars_v[rel_s + pad - 20]["close"] = float(run["pre_ref"] or 0.0)
+            rs, re_ = rel_s + pad, rel_e + pad
+            i = len(bars_v) - 1                      # 今日在 bars_v 中的位置
+            sig = _break_signal_at(bars_v, code, rs, re_, min_streak,
+                                   max_break_gap, board_params)
+            if not sig:
+                continue
+            if sig["break_idx"] + sig["break_days"] - 1 != i:
+                continue                             # 确认日必须恰好落在今日
+            # ⚠ `_break_signal_at` 的 break_idx 是 **bars 下标**: 生产侧是绝对下标,
+            #   递推侧是窗口相对下标 ⇒ 落 extra 前换算回绝对 (同名不同义必踩)。
+            sig = dict(sig)
+            sig["break_idx"] = sig["break_idx"] + off - pad
+            # 换手率前置门 (与 scan_signals 同式)
+            _tmin = p.get("turnover_min")
+            if _tmin and circ > 0:
+                if float(bars_v[i]["volume"]) / circ * 100 < _tmin:
+                    continue
+            extra = dict(sig)
+            _gate, _gpctb, _gbd = _entry_gate(bars_v, i, sig.get("streak_len") or 0, code)
+            extra.update({
+                "entry_gate": _gate,
+                "entry_pctb": _gpctb,
+                "entry_bd": _gbd,
+                "turnover_anchor": round(float(bars_v[re_]["volume"]) / circ * 100, 2) if circ > 0 else None,
+                "turnover_sig": round(float(bars_v[i]["volume"]) / circ * 100, 2) if circ > 0 else None,
+                "turnover_anchor_total": round(float(bars_v[re_]["volume"]) / total * 100, 2) if total > 0 else None,
+                "turnover_sig_total": round(float(bars_v[i]["volume"]) / total * 100, 2) if total > 0 else None,
+            })
+            return [Progress(stage="ready", date=str(bar.get("time", "")), payload={
+                "price": 0.0,                        # 断板信号日不定价 (entry=D1开盘)
+                "score": _score_of(float(sig.get("confirm_chg", 0) or 0)),
+                "label": "断板", "extra": extra,
+            })]
+        return []
 
     # ---- D1 竞价处置 ----
     def entry_decision(self, row, snap=None, **params):

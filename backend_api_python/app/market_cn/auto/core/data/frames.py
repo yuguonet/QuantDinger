@@ -379,7 +379,8 @@ def trading_dates(days_back, end=None):
     ⚠ 年份必须遍历 [start.year, end.year] **整段** (2026-09-28 审计 A2): 原写法
     `for year in {start[:4], end[:4]}` 只查首尾两年, days_back ≳638 (跨 2 个年以上) 时
     **中间年份整年丢失** (实测 days_back=700 → 2025 整年 0 日, 实得 225 应约 490);
-    命中 core/backtest、present/intraday、tools/present_bench、tools/replay。
+    命中 core/backtest、tools/replay。
+    (present/intraday 与 tools/present_bench 已于 2026-10-06 P6 随 core/present 退役)
     同仓正确写法见 hub._query_batch_raw 的 `range(start.year, end.year + 1)`。
     """
     from datetime import datetime, timedelta

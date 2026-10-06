@@ -263,18 +263,22 @@ def synth_bar(series, date):
     return _synth_bar_from_series(series, date)
 
 
-def daily_live(code, days=200, series=None):
+def daily_live(code, days=200, series=None, bars=None):
     """实时日线 = 历史日线 + 今日合成 bar (若 1D 尚未回填今日)。
 
     Returns:
         list[dict]: 同 daily 结构；bars 为空或无快照序列时返回 None。
 
     series 可注入已拉取的快照序列 (monitor/scan 已有) 避免重复查询。
+    bars  可注入**已取好的历史段** (2026-10-06: monitor 走 window_cache 滑动缓存,
+           省掉每票 7.9ms 的 fetch_kline_db); 为 None 时走 fetch_kline_db 原路径。
+           合成口径 (唯一来源 _synth_bar_from_series) 不因注入而改变。
     返回 bars | None: bars 为空或无快照序列 → None (与 monitor._bars_with_synth 语义一致,
     entry_idx 定位仍由调用方完成)。
     """
     from app.market_cn.auto.core.data.kline import fetch_kline_db
-    bars = fetch_kline_db(code, days)
+    if bars is None:
+        bars = fetch_kline_db(code, days)
     if not bars:
         return None
     if series is None:

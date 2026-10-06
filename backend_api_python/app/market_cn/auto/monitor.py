@@ -254,7 +254,16 @@ def _bars_with_synth(code, entry_date):
     D1: 合成口径已上收 data/hub.daily_live (逐字一致), 此处仅保留 entry_idx 定位。
     """
     from app.market_cn.auto.core.data.hub import daily_live
-    bars = daily_live(code, days=200)
+    # 2026-10-06: 历史段走**滑动窗口缓存** (只读, 每票 7.9ms → ~0); 缓存未覆盖
+    # (首次/新股/缓存未建) ⇒ bars=None ⇒ daily_live 走 fetch_kline_db 原路径。
+    # 合成 bar 的口径唯一来源仍是 hub._synth_bar_from_series, 注入不改变它。
+    hist = None
+    try:
+        from app.market_cn.auto.core.data.window_cache import peek_windows
+        hist = peek_windows([code], 200).get(code)
+    except Exception:
+        hist = None
+    bars = daily_live(code, days=200, bars=hist)
     if not bars:
         return None, None
     idx = None

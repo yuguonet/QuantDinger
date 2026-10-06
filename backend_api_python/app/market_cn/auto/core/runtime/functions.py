@@ -40,9 +40,10 @@ class AsOfViolation(Exception):
 #   已逐个核对四个 _xxx 实现, 缓存键分别为 (fast,slow,signal) / (n,ks,ds) /
 #   (n,mult) / (n), 除此之外再无输入 —— 所以跨 Ctx 共享是**数学恒等**, 不是近似。
 #
-# 旧实现每 Ctx 一份 _ind_cache ⇒ `precompute_night` 对同一 (bars, i) 的每个候选
+# 旧实现每 Ctx 一份 _ind_cache ⇒ 展示层夜算 (已退役的 `precompute_night`) 对同一 (bars, i) 的每个候选
 #   lu 各建一个 Ctx, 4 个指标被重复算 N 次 (N = 历史涨停日数, dragon_callback
-#   的 enumeration=limit_up 可达几十)。这是展示管线夜算的主要重复计算源。
+#   的 enumeration=limit_up 可达几十)。这是那时展示管线夜算的主要重复计算源。
+#   (展示管线已退役; 本注释保留是因为它解释了为何缓存键必须跨 Ctx 共享)
 #
 # ⚠️ 键**必须含 i** (本改动最容易翻车的地方):
 #   这 4 个函数都按 `m = self.i + 1` 截断后缓存数组; 只按 id(bars) 共享会让不同 i
@@ -128,7 +129,7 @@ class Ctx:
         self.latest = latest
         self.series = series if series is not None else []
         self.mkt_gain = mkt_gain
-        #: 断点续传状态 (core.runtime.resume.ResumeBook 取出的 dict):
+        #: 断点续传状态 (core/runtime/resume.py 的 codec 产出 (由预处理注入, 当前默认关闭)):
         #:   key = ("macd", fast, slow, signal) / ("kdj", n, ks, ds) / ...
         #:   语义 = "bars[0] **之前**那一根结束时"的有界摘要; 缺省 {} = 全量重算。
         #: 由**预处理**产出、实时消费, 见 resume.py 模块头的等价性契约。

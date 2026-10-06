@@ -165,6 +165,21 @@ def _prefetch_bars(codes, days, logger=None):
         return {}
     if not codes:
         return {}
+    # 2026-10-06: 改走**滑动窗口缓存** (window_cache) —— 每天只拉窗口尾部新增的
+    # ~5236 行, 163 万行历史不再重复取数 (实测 17.1s → 数秒)。等价性是构造性的:
+    # 同一 _window_bounds 窗口 + 同一 unadj_to_qfq, 且除权会改写历史 ⇒ 每票存复权
+    # 因子指纹, 指纹变则整票全量重拉。缓存不可用/任何异常 ⇒ 回落全量 (不静默降级)。
+    try:
+        from app.market_cn.auto.core.data.window_cache import load_windows
+        t0 = time.time()
+        got = load_windows(list(codes), days=days, logger_=logger) or {}
+        if logger:
+            logger.info("[prefetch] 滑动取数 %d/%d 票 (days=%d, %.1fs)",
+                        len(got), len(codes), days, time.time() - t0)
+        return got
+    except Exception as e:                      # 取数降级不能拖垮扫描: 回落批量全量
+        if logger:
+            logger.warning("[prefetch] 滑动取数失败(%s) → 回落批量全量", e)
     try:
         from app.market_cn.auto.core.data.kline import fetch_klines_batch
         t0 = time.time()

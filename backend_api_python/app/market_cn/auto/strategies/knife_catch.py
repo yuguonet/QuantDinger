@@ -38,6 +38,9 @@ from app.market_cn.auto.core.market import get_board_type, is_limit_up
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
+from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
+    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+)
 
 STRATEGY_KEY = "knife_catch"
 STRATEGY_LABEL = "反向接刀"
@@ -56,6 +59,9 @@ PARAMS = {
     "stop_pct": -5.0,           # 止损 % (仅 D1 有意义, T+1 当日不可卖)
     "hold_days": 1,             # 持有1天 (D1开盘卖)
 }
+
+_WIN = 8        # 切片窗口 (pre5/vol5 最多用 5，余量给 probe 锚)
+_MIN_AGE = 8    # 旧 _daily_feats 口径: len(bars) < 8 → 无特征
 
 
 def _hhmm(s):
@@ -111,31 +117,24 @@ def _vw_frac(series_rows):
 
 
 def _daily_feats(bars, code, market=None):
-    """日线特征 (bars[-1]=昨日, 盘中当日 1D 未回填)。"""
-    if len(bars) < 8:
+    """日线特征 (bars[-1]=昨日, 盘中当日 1D 未回填)。
+
+    2026-10-06: 委托**切片** (`KnifeCatchStrategy.init_state` + `_feats_hist`) ——
+    特征只有一份实现。历史上本函数是全量重算版，与展示层的递推版并存，
+    属"两套实现可给出相反结果"的雷区：改任一侧都要回头对账另一侧。
+    """
+    try:
+        return KnifeCatchStrategy._feats_hist(
+            KnifeCatchStrategy.init_state(None, code, bars or [], market))
+    except InsufficientHistory:
         return None
-    closes = [float(b["close"]) for b in bars]
-    # down_streak 不含当日 (当日下跌已由 gain<0 保证, live 口径 = 1 + 昨日往前连跌数)
-    streak = 0
-    for i in range(len(closes) - 1, 0, -1):
-        if closes[i] < closes[i - 1]:
-            streak += 1
-        else:
-            break
-    pre5 = (closes[-1] / closes[-5] - 1) * 100 if closes[-5] > 0 else 0
-    vol5 = sum(float(b["volume"]) for b in bars[-5:]) / 5
-    lu_recent = 0
-    from app.market_cn.auto.core.market import get_board_type, is_limit_up
-    bt = get_board_type(code, market)
-    for d in range(len(bars) - 1, max(len(bars) - 6, 0), -1):
-        cl, pc = closes[d], closes[d - 1]
-        if pc > 0 and is_limit_up(cl, pc, bt, market):
-            lu_recent += 1
-    return {"down_streak": streak, "pre5": pre5, "vol5": vol5, "lu_recent": lu_recent}
 
 
+# SliceStrategyBase: slice 展示契约 (递推状态机/门)。放在**第二**位 ——
+# 生产 StrategyBase 在前, 其 merged_params/scan_signals 等不被 slice 基类遮盖;
+# slice 侧只有 params()/init_shared() 等生产基类没有的方法会落到 SliceStrategyBase。
 @register
-class KnifeCatchStrategy(StrategyBase):
+class KnifeCatchStrategy(StrategyBase, SliceStrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
@@ -152,6 +151,12 @@ class KnifeCatchStrategy(StrategyBase):
     entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
+    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    stages = (
+        Stage("watch", "候选观察", realtime="14:56-15:00", visible=False),
+        Stage("ready", "D0尾盘触发·准备", realtime="09:31"),
+        Stage("exec", "D1开盘卖出"),
+    )
     data_needs = ("daily", "snapshot", "minute_live")
 
     # ---- 盘中便宜预筛 (仅用最新快照, 免拉全市场序列/日线; 阈值唯一来源在本策略) ----
@@ -202,119 +207,269 @@ class KnifeCatchStrategy(StrategyBase):
         return [c for c, k in zip(frame.codes, ok)
                 if k and not c.startswith(("8", "4", "92"))]
 
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
-        """14:56 盘中判定。必须 ctx={"latest","series","mkt_gain"}; 无盘中数据返回空。
+    # ══ slice 契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
+    # ⚠ 展示/预处理 evaluate 与盘中实时 scan_signals **共用同一份 _gates**。
+    #   两入口只差"取哪个快照": scan_signals 判 ctx["latest"]（此刻）；
+    #   evaluate 回扫当日 14:56~15:00 序列取首次触发。公式不得再写第二份。
+    def init_state(self, code, bars, market=None):
+        """seed: 截至昨日的全量历史 → 切片 (win/streak/lups/age/board)。"""
+        if len(bars) < _MIN_AGE:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < {_MIN_AGE}")
+        board = get_board_type(code, market)
+        win = [{"d": b["time"], "c": float(b["close"]), "v": float(b["volume"])}
+               for b in bars[-_WIN:]]
+        closes = [float(b["close"]) for b in bars]
+        streak = 0
+        for i in range(len(closes) - 1, 0, -1):
+            if closes[i] < closes[i - 1]:
+                streak += 1
+            else:
+                break
+        lups = [1 if is_limit_up(closes[d], closes[d - 1], board, market) else 0
+                for d in range(len(closes) - 1, max(len(closes) - 6, 0), -1)]
+        lups.reverse()
+        return {"v": 1, "date": win[-1]["d"], "age": len(bars), "board": board,
+                "win": win, "streak": streak, "lups": lups[-5:]}
 
-        probe: 调试探针 (None=零开销) — 门级 TRACE 打点, 存档供 AI 离线分析。"""
-        p = self.merged_params(params or None)
-        ctx = ctx or {}
-        snap = ctx.get("latest")
-        series = ctx.get("series") or []
+    def step(self, state, bar):
+        """推进一根 (O(win))。纯函数: 返回新 state, 不改入参。"""
+        win = list(state["win"])
+        prev_c = win[-1]["c"]
+        board = state["board"]
+        c = float(bar["close"])
+        streak = state["streak"] + 1 if c < prev_c else 0
+        lups = list(state["lups"])[-4:] + [1 if is_limit_up(c, prev_c, board) else 0]
+        win = (win + [{"d": bar["time"], "c": c, "v": float(bar["volume"])}])[-_WIN:]
+        return {"v": 1, "date": bar["time"], "age": state["age"] + 1,
+                "board": board, "win": win, "streak": streak, "lups": lups}
+
+    def probe(self, state):
+        """除权探针: 窗口首尾 (date, close) —— 历史被复权/订正则不等 ⇒ 整票重建。"""
+        w = state["win"]
+        return [(w[0]["d"], w[0]["c"]), (w[-1]["d"], w[-1]["c"])]
+
+    def evaluate(self, state, inp, prev):
+        """预处理/回测/实时共用: 先结算上一阶段, 再判今日触发或明日观察。"""
+        p = self.params()
+        events = []
+        # 上一阶段结算: D1 开盘卖 (纯日线)
+        if prev is not None and prev.stage == "ready" \
+                and inp.bar.get("time", "") > prev.date:
+            open_px = float(inp.bar.get("open") or 0)
+            entry = float(prev.payload.get("price") or 0)
+            if open_px > 0:
+                events.append(Progress(
+                    stage="exec", date=inp.bar["time"],
+                    payload={
+                        "entry_date": prev.date, "entry_price": entry,
+                        "exit_price": open_px,
+                        "exit_ret": round((open_px / entry - 1) * 100, 2) if entry > 0 else None,
+                        "label": "D1开盘卖出(隔夜反弹兑现)",
+                    }, next_realtime=None))
+            else:
+                return events   # 开盘价缺失(停牌/竞价未出): 保持 prev 不推进
+
+        if inp.code.startswith(("8", "4", "92")):
+            return events       # 北交所排除 (旧回测口径, shortlist 同款)
+        hist = self._feats_hist(state)
+        if hist is None:
+            return events
+        ctx = inp.ctx or {}
+        snap_rows = ctx.get("series") or []
         mkt_gain = ctx.get("mkt_gain")
-        if not snap or not series:
-            return []
+        fired = None
+        for i, row in enumerate(snap_rows):
+            hh = _hhmm(row.get("time") or "")
+            if hh < "14:56" or hh > "15:00":
+                continue
+            fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_gain)
+            if fired:
+                break
+        if fired:
+            events.append(Progress(
+                stage="ready", date=fired["time"],
+                payload={"price": fired["price"], "score": fired["score"],
+                         "label": fired["label"], "extra": fired["extra"]},
+                next_realtime="09:31"))
+            return events
+
+        # 明日观察预筛: 只用历史可判的门 (superset, 宁多勿漏)
+        t = self._feats_today(state, inp.bar)
+        if t["age"] >= _MIN_AGE and t["down_streak"] >= p["streak_min"] - 1 \
+                and t["lu_recent"] == 0:
+            events.append(Progress(stage="watch", date=inp.bar.get("time", ""),
+                                   payload={}, next_realtime="14:56-15:00"))
+        return events
+
+    def _gates(self, p, hist, snap, series, mkt_gain, probe=None):
+        """触发门 + 评分 —— **唯一实现** (scan_signals 与 evaluate 共用)。
+
+        probe: 可选门级 TRACE 回调 `probe(stage, **kw)`, 仅 scan_signals 传。
+        返回 None=未触发; 否则 {"time","price","score","label","extra"}。
+        """
         last = float(snap.get("last") or 0)
         high = float(snap.get("high") or 0)
         low = float(snap.get("low") or 0)
         pc = float(snap.get("previousClose") or 0)
         last_time = str(snap.get("time") or "")
         if last <= 0 or pc <= 0 or high <= low:
-            return []
-        _tr = None
-        if probe is not None:
-            def _tr(stage, **kw):
-                probe.trace(stage, code=code, d0_date=last_time[:10], **kw)
-        # 窗口保护: 14:56 之后才出信号 (用户要求 14:30 启动仅为预热, 判定不变)
+            return None
+        # 窗口保护: 14:56 之后才出信号 (14:30 启动仅为预热, 判定不变)
         if _hhmm(last_time) < "14:56":
-            if _tr:
-                _tr("window", hhmm=_hhmm(last_time))
-            return []
-        # 市场门控 (分钟回测核心条件之一)
+            if probe:
+                probe("window", hhmm=_hhmm(last_time))
+            return None
         if mkt_gain is None or mkt_gain > p["mkt_gate"]:
-            if _tr:
-                _tr("mkt", mkt_gain=round(mkt_gain, 2) if mkt_gain is not None else None)
-            return []
-
+            if probe:
+                probe("mkt", mkt_gain=round(mkt_gain, 2) if mkt_gain is not None else None)
+            return None
         gain = (last / pc - 1) * 100
         amp = (high - low) / pc * 100
         pos = (last - low) / (high - low)
         if gain > p["gain_max"] or amp < p["amp_min"] or pos > p["pos_max"]:
-            if _tr:
-                _tr("feat", gain=round(gain, 2), amp=round(amp, 2), pos=round(pos, 3))
-            return []
-
+            if probe:
+                probe("feat", gain=round(gain, 2), amp=round(amp, 2), pos=round(pos, 3))
+            return None
         tail = _tail_ret(series, last, last_time, minutes=20)
         vw = _vw_frac(series)
         if tail is None or vw is None:
-            if _tr:
-                _tr("data", reason="tail_or_vw")
-            return []
+            if probe:
+                probe("data", reason="tail_or_vw")
+            return None
         if tail < p["tail_min"] or vw > p["vw_max"]:
-            if _tr:
-                _tr("tail_vw", tail=round(tail, 2), vw=round(vw, 3))
-            return []
-
-        df = _daily_feats(bars or [], code)
-        if df is None:
-            if _tr:
-                _tr("daily", reason="bars_short")
-            return []
-        vol_ratio = (float(snap.get("volume") or 0) / df["vol5"]) if df["vol5"] > 0 else 99.0
+            if probe:
+                probe("tail_vw", tail=round(tail, 2), vw=round(vw, 3))
+            return None
+        # 日线特征 (bars 不足 ⇒ 无特征; 位置与旧实现一致)
+        if hist is None:
+            if probe:
+                probe("daily", reason="bars_short")
+            return None
+        vol_ratio = (float(snap.get("volume") or 0) / hist["vol5"]) if hist["vol5"] > 0 else 99.0
         if vol_ratio > p["vol_max"]:
-            if _tr:
-                _tr("vol", vol_ratio=round(vol_ratio, 3))
-            return []
+            if probe:
+                probe("vol", vol_ratio=round(vol_ratio, 3))
+            return None
         # down_streak 含当日 (当日必跌): live口径 = 1 + 昨日往前连跌
-        streak = 1 + df["down_streak"]
+        streak = 1 + hist["down_streak"]
         if streak < p["streak_min"]:
-            if _tr:
-                _tr("streak", streak=streak)
-            return []
-        if df["pre5"] > p["pre5_max"]:
-            if _tr:
-                _tr("pre5", pre5=round(df["pre5"], 2))
-            return []
-        if df["lu_recent"] > 0:
-            if _tr:
-                _tr("lu_recent", lu_recent=df["lu_recent"])
-            return []
+            if probe:
+                probe("streak", streak=streak)
+            return None
+        if hist["pre5"] > p["pre5_max"]:
+            if probe:
+                probe("pre5", pre5=round(hist["pre5"], 2))
+            return None
+        if hist["lu_recent"] > 0:
+            if probe:
+                probe("lu_recent", lu_recent=hist["lu_recent"])
+            return None
 
-        # 评分: 仅作展示排序 (不截断, 全部展示); 连跌深+前期弱+量能适中优先
+        # 评分: 仅作展示排序 (不截断); 连跌深+前期弱+量能适中优先
         score = 60
         if streak >= 3:
             score += 10
-        if df["pre5"] <= -20:
+        if hist["pre5"] <= -20:
             score += 10
-        elif df["pre5"] <= -15:
+        elif hist["pre5"] <= -15:
             score += 5
         if 1.0 <= vol_ratio <= 1.5:
             score += 5
         if amp <= 15:
             score += 5
         score = min(90, score)
-
-        trade_date = str(last_time)[:10]
-        if _tr:
-            _tr("signal", streak=streak, gain=round(gain, 2), tail=round(tail, 2))
-        return [Signal(
-            code=code,
-            time=trade_date,
-            score=score,
-            price=last,
-            label=(f"反向接刀 gain={gain:.1f}% tail=+{tail:.1f}% streak={streak}"),
-            extra={
-                "gain": round(gain, 2),
-                "amplitude": round(amp, 2),
-                "pos_range": round(pos, 3),
-                "tail_ret": round(tail, 2),
-                "vw_frac": round(vw, 3),
-                "vol_ratio": round(vol_ratio, 3),
-                "down_streak": streak,
-                "pre5_gain": round(df["pre5"], 2),
-                "lu_recent": df["lu_recent"],
+        if probe:
+            probe("signal", streak=streak, gain=round(gain, 2), tail=round(tail, 2))
+        return {
+            "time": last_time[:10], "price": last, "score": score,
+            "label": f"反向接刀 gain={gain:.1f}% tail=+{tail:.1f}% streak={streak}",
+            "extra": {
+                "gain": round(gain, 2), "amplitude": round(amp, 2),
+                "pos_range": round(pos, 3), "tail_ret": round(tail, 2),
+                "vw_frac": round(vw, 3), "vol_ratio": round(vol_ratio, 3),
+                "down_streak": streak, "pre5_gain": round(hist["pre5"], 2),
+                "lu_recent": hist["lu_recent"],
                 "mkt_gain": round(mkt_gain, 3) if mkt_gain is not None else None,
             },
-        )]
+        }
+
+    @staticmethod
+    def _feats_hist(state):
+        """截至切片日 (= 昨日) 的特征 —— 与旧 _daily_feats 逐字段对齐。"""
+        if state["age"] < _MIN_AGE:
+            return None
+        win = state["win"]
+        closes = [w["c"] for w in win]
+        pre5 = (closes[-1] / closes[-5] - 1) * 100 if closes[-5] > 0 else 0
+        vol5 = sum(w["v"] for w in win[-5:]) / 5
+        return {"down_streak": state["streak"], "pre5": pre5,
+                "vol5": vol5, "lu_recent": int(sum(state["lups"]))}
+
+    @staticmethod
+    def _feats_today(state, bar):
+        """截至今日 (含 bar) —— 仅供明日 watch 预筛 (超集方向)。"""
+        c = float(bar.get("close") or 0)
+        pclose = state["win"][-1]["c"]
+        board = state["board"]
+        streak = state["streak"] + 1 if (c > 0 and c < pclose) else 0
+        lups = (list(state["lups"])[1:]
+                + [1 if (c > 0 and is_limit_up(c, pclose, board)) else 0])
+        return {"down_streak": streak, "lu_recent": int(sum(lups)),
+                "age": state["age"] + 1}
+
+    def realtime_shortlist(self, codes, snaps, mkt_gain=None, stage=None):
+        """实时旁支便宜预筛 (与 scan_signals 门控同源, 只取快照场)。"""
+        if stage not in (None, "watch"):
+            return list(codes)      # 阶段转换票 (exec 结算) 不得被触发门拦截
+        p = self.params()
+        if mkt_gain is None or mkt_gain > p["mkt_gate"]:
+            return []
+        out = []
+        for code in codes:
+            if code.startswith(("8", "4", "92")):
+                continue
+            snap = snaps.get(code) or {}
+            last = float(snap.get("last") or 0)
+            high = float(snap.get("high") or 0)
+            low = float(snap.get("low") or 0)
+            pc = float(snap.get("previousClose") or 0)
+            if last <= 0 or pc <= 0 or high <= low:
+                continue
+            gain = (last / pc - 1) * 100
+            amp = (high - low) / pc * 100
+            pos = (last - low) / (high - low)
+            if gain > p["gain_max"] or amp < p["amp_min"] or pos > p["pos_max"]:
+                continue
+            out.append(code)
+        return out
+
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
+        """14:56 盘中判定 —— 判**此刻** (ctx["latest"])。
+
+        门逻辑全部委托 `_gates` (与展示层 evaluate 同一实现), 本方法只负责:
+        取快照 → 建切片 → 组装 Signal。probe: 门级 TRACE, 仅本入口传。
+        """
+        p = self.merged_params(params or None)
+        ctx = ctx or {}
+        snap = ctx.get("latest")
+        series = ctx.get("series") or []
+        if not snap or not series:
+            return []
+        _tr = None
+        if probe is not None:
+            def _tr(stage, **kw):
+                probe.trace(stage, code=code,
+                            d0_date=str(snap.get("time") or "")[:10], **kw)
+        try:
+            hist = self._feats_hist(self.init_state(code, bars or []))
+        except InsufficientHistory:
+            hist = None
+        fired = self._gates(p, hist, snap, series, ctx.get("mkt_gain"), probe=_tr)
+        if not fired:
+            return []
+        return [Signal(code=code, time=fired["time"], score=fired["score"],
+                       price=fired["price"], label=fired["label"],
+                       extra=fired["extra"])]
 
     # ---- 三决策 ----
     def entry_decision(self, row, snap=None, **params):

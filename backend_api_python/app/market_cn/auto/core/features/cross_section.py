@@ -1,6 +1,6 @@
 """横截面 regime 门 + 单票 G1 特征 (2026-09-26 从 strategies/g56.py 下沉)。
 
-为什么下沉: core/runtime/evaluate.py 和 core/present/pipeline.py 各自有惰性
+为什么下沉: core/runtime/evaluate.py 和已退役的 core/present/pipeline.py 曾各自有惰性
 `from ...strategies.g56 import _ensure_pool_daily, _g1_arrays` —— 违反 core 零策略知识
 红线。这两个函数是通用横截面/特征计算, 不依赖 g56 的评分/门表规则, 独立出来后 core
 和 strategies 都从这里导入, 层清零。
@@ -236,8 +236,8 @@ def g1_state_window_bars(state):
 def g1_state_init(bars, win=G1_WIN_MIN, keep_window=False):
     """全量 bars → 断点状态 (建状态只在**首次**或**除权重建**时做一次, O(n))。
 
-    keep_window: True ⇒ 状态额外携带 win 根 OHLC 微缩窗口 (`g1_ledger` 需要;
-      日常推进时它是**唯一**的历史来源)。False (默认) = 旧行为, 逐位一致。
+    keep_window: True ⇒ 状态额外携带 win 根 OHLC 微缩窗口 (推进时它是**唯一**的历史
+      来源)。False (默认) = 旧行为, 逐位一致。
     """
     n = len(bars)
     win = int(win)
@@ -363,7 +363,7 @@ def _aggregate(by_date):
             for i, d in enumerate(dates)}
 
 
-def _ensure_pool_daily(pool_target, bars_batch=None, buckets_out=None, pool_map=None):
+def _ensure_pool_daily(pool_target, bars_batch=None):
     """返回 {target, main:{date:{rmed,score_r}}, gem_star:{...}} (key=pool_target 跨日失效; 失败不缓存)。
 
     前视防护: 每票日线截断到 ≤pool_target — 实盘扫描日=快照末日; 回测时
@@ -374,26 +374,8 @@ def _ensure_pool_daily(pool_target, bars_batch=None, buckets_out=None, pool_map=
       用于消除逐票 `hub.daily` 的 O(N) 往返 —— 横截面池是展示管线夜间的主要超支源。
       缺省 None → 保持原逐票路径 (单票调用方/实盘扫描零改动)。
 
-    pool_map (2026-10-05, 加法接入): 可选 `{board: {date: [ls_r, ls_d, ls_s]}}`。
-      给定时**直接** `_aggregate` 返回, 完全跳过取数与逐票计算 —— 预处理台账用它
-      把"全市场重算"换成"读历史 + 算当日"。★ 缺省 None ⇒ 与旧版逐位一致。
-
-    buckets_out (2026-10-05, 加法接入): 可选 dict。给定时把本次构造的**原始日级桶**
-      回填进去 (`{"main": {...}, "gem_star": {...}}`), 供一次性回填持久化。
-      ★ 只在真取数路径上回填 —— 池的构造**只有这一处实现**, 回填与日常共用同一份
-        循环, 不复制一份(两套实现必然分叉)。缺省 None ⇒ 零开销。
     """
     with _POOL_LOCK:
-        if pool_map is not None:
-            # ★ 必须写 _POOL: `prewarm` 的全部意义就是**填缓存** —— 后续每票
-            #   `scan_signals` 里的 `_ensure_pool_daily(target)` 要命中它。不写,
-            #   预热就等于白做(每票各自重算全市场)。`src` 只用于排查, 不进返回值。
-            out = {"target": pool_target,
-                   "main": _aggregate(pool_map.get("main") or {}),
-                   "gem_star": _aggregate(pool_map.get("gem_star") or {})}
-            _POOL.update(out)
-            _POOL["src"] = "ledger"
-            return dict(out)
         if _POOL["target"] == pool_target:
             # M19 同款: 命中路径也不交出共享引用; 且只交三键(src 是内部标记)
             return {k: _POOL[k] for k in ("target", "main", "gem_star")}
@@ -419,8 +401,6 @@ def _ensure_pool_daily(pool_target, bars_batch=None, buckets_out=None, pool_map=
                     b[0].append(f["rhist_chg"][k])
                     b[1].append(f["dif0"][k])
                     b[2].append(f["rsi"][k])
-            if buckets_out is not None:
-                buckets_out.update(buckets)      # 一次性回填(导出持久化), 非 None 才付代价
             main_map, gem_map = _aggregate(buckets["main"]), _aggregate(buckets["gem_star"])
         except Exception as e:
             logger.error("[g56] 池聚合失败, 当日横截面门不可用: %s", e)

@@ -14,7 +14,7 @@
                            + 从判定入口 (rebuild/scan/monitor/store/...) 出发做
                              AST import 闭包得到的 .py 清单, 各取内容 sha256。
                            变化 ⇒ 库里是旧规则算出的结果 ⇒ **必须重建**。
-       display (展示层)  = strategies/*.yaml (门表) + core/present/*.py
+       display (展示层)  = strategies/*.yaml (门表) + core/display_meta.py
                            + core/display_meta.py, 各取内容 sha256。
                            展示链每次请求实时读 ⇒ 重启即生效, **不重建**。
      为什么按语义边界切: 展示口径与判定契约曾混在同一文件 (base.py), 文件级 hash
@@ -42,7 +42,7 @@
   → UI 不再提示卖出 → 用户会遗忘手上还有这两只票。这是实盘资金事故, 不是脏数据。
 
 刻意不做的边界:
-  - **展示链** (core/present/、core/display_meta.py、strategies/*.yaml、tools/) 不进
+  - **展示链** (core/display_meta.py、strategies/*.yaml、tools/) 不进
     判定指纹: UI 实时读, 重启即生效, 重建是纯浪费。详见 core/display_meta.py 头注实证。
   - 判定闭包里**不可达**的 core 模块 (如 core/runtime/evaluate.py、expr.py —— 只被展示链
     与 tools 引用) 自然不在指纹内; 它们的守卫是 market_spec_check / path_parity。
@@ -112,10 +112,9 @@ _JUDGE_ENTRIES = (
 )
 
 # ── 展示层: 显式排除在判定指纹外 (改了只需重启) ──
-#   core/present/        展示链管线 (runtime.evaluate / expr 只被它引用)
 #   core/display_meta.py 展示口径映射 (预确认档位归一, 与判定解耦)
 #   tools/               诊断脚本 (debug/explain/gate_try/...), 不参与生产链
-_JUDGE_EXCLUDE = ("core/present/", "core/display_meta.py", "tools/")
+_JUDGE_EXCLUDE = ("core/display_meta.py", "tools/")
 
 _PKG = "app.market_cn.auto"
 
@@ -235,8 +234,7 @@ def _iter_judge_files():
 
 
 def _iter_display_files():
-    """展示层文件清单 [(relpath, abspath)]: strategies/*.yaml + core/present/**.py
-    + core/display_meta.py。
+    """展示层文件清单 [(relpath, abspath)]: strategies/*.yaml + core/display_meta.py。
 
     单独成段是为了把「展示变更」与「判定变更」分开: 展示链每次请求实时读, 改了重启即可,
     不需要重跑 rebuild。旧实现把 *.yaml 混在判定指纹里 ⇒ 只改门表也会白跑一次全量重建。
@@ -250,12 +248,6 @@ def _iter_display_files():
                 out.append(("strategies/" + fn, p))
     except OSError:
         pass
-    for dp, dn, fn in os.walk(os.path.join(_auto_root(), "core", "present")):
-        dn[:] = [d for d in dn if d != "__pycache__"]
-        for f in fn:
-            if f.endswith(".py"):
-                p = os.path.join(dp, f)
-                out.append((os.path.relpath(p, _auto_root()).replace(os.sep, "/"), p))
     dm = os.path.join(_auto_root(), "core", "display_meta.py")
     if os.path.isfile(dm):
         out.append(("core/display_meta.py", dm))
@@ -402,7 +394,7 @@ def diff(prev_detail, now_detail):
     }
     out["rules_changed"] = ((prev_detail or {}).get("rules") or {}) != \
                            ((now_detail or {}).get("rules") or {})
-    # 展示层变更 (门表 yaml / core/present / display_meta): 展示链实时读, 重启即生效,
+    # 展示层变更 (门表 yaml / display_meta): 展示链实时读, 重启即生效,
     # **不需要**重建 —— 单独标记只为在日志里与"必须重建"区分开。
     out["display_changed"] = ((prev_detail or {}).get("display") or {}) != \
                              ((now_detail or {}).get("display") or {})

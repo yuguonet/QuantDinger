@@ -316,57 +316,18 @@ def runtime_daily(strats, codes, days, si, progress_every=0):
 
 
 def runtime_intraday(strats, days, limit=None):
-    """B2: 盘中族 — 生产 run_all_intraday 的 (code,date) 集 == IDE 门表盘中通道同集。
+    """B2: 盘中族对账 —— **已随 IDE 展示通道退役** (2026-10-06, P6 清理)。
 
-    仅对 IDE 侧确有 `intraday` 枚举通道 (meta.enumeration=='intraday') 的策略对账。
-    少数 intraday_window 策略的 IDE 通道落在日线枚举 (如 dragon_callback 用
-    meta.enumeration 缺省 = limit_up, 因其实盘判定走 14:56 合成 D0 后按日线口径),
-    此时盘中口径由各自的逐笔等价脚本独立覆盖, 这里显式 SKIP 并注明 (非 FAIL)。
+    原语义: 生产 `run_all_intraday` 的 (code,date) 集 == IDE 门表盘中通道同集。
+    IDE 通道 = `core/present/intraday.run_all_intraday_ide`, 已随 `core/present/`
+    整包退役 (零生产调用方; 原件在 del/20261006_core_present/) ⇒ 对账对象不存在,
+    本段恒 SKIP (**非 FAIL**, 不做静默吞掉)。
+
+    盘中等价性的覆盖改由 slice 内核承担: `auto/slice/tests/` 与
+    `tools/slice_verify.py` 的 fold 等价性 (逐日 step == 全量重算, 逐位相等)。
     """
-    report, n_fail = [], 0
-    try:
-        from app.market_cn.auto.core.data import frames as fr
-        if not fr.first_1m_date():
-            return 0, ["[SKIP] B2 盘中族: 无 1m 快照帧缓存, 跳过 (非 FAIL)"]
-    except Exception as e:
-        return 0, [f"[SKIP] B2 盘中族: frames 不可用 ({e}), 跳过"]
-
-    from app.market_cn.auto.core.backtest import run_all_intraday
-    from app.market_cn.auto.core.runtime.evaluate import load_strategy
-    from app.market_cn.auto.core.present.intraday import run_all_intraday_ide
-    for key, strat in strats.items():
-        if strat.scan_spec.kind != "intraday_window":
-            continue
-        spec = load_strategy(key)
-        enum = str(spec.meta.get("enumeration", "limit_up")).lower()
-        if enum != "intraday" or not spec.meta.get("intraday"):
-            report.append(f"[SKIP] B2 {key:16s} IDE 通道为 '{enum}' 枚举 (无 meta.intraday), "
-                          f"盘中口径由逐笔等价脚本单独覆盖 — 非 FAIL")
-            continue
-        codes = None
-        if limit:
-            from app.market_cn.auto.core.data.hub import all_codes
-            codes = all_codes()[:limit]
-        ref = run_all_intraday(strat, days=days, codes=codes, progress_every=0)
-        ref_set = {(t.get("code"), str(t.get("entry_date") or t.get("signal_date"))[:10])
-                   for t in ref.get("trades", []) if t.get("code")}
-        try:
-            ide = run_all_intraday_ide(spec, days=days, codes=codes, progress_every=0)
-            ide_set = {(t.get("code"), str(t.get("entry_date") or t.get("signal_date"))[:10])
-                       for t in (ide or {}).get("trades", []) if t.get("code")}
-        except Exception as e:
-            report.append(f"[FAIL] B2 {key:16s} IDE 通道调用失败 ({type(e).__name__}: {e})")
-            n_fail += 1
-            continue
-        only_ref, only_ide = ref_set - ide_set, ide_set - ref_set
-        verdict = "PASS" if not only_ref and not only_ide else "FAIL"
-        report.append(f"[{verdict}] B2 {key:16s} 盘中回测={len(ref_set)} IDE={len(ide_set)} "
-                      f"仅回测={len(only_ref)} 仅IDE={len(only_ide)}"
-                      + (f"  样例 ref-only={sorted(only_ref)[:2]} ide-only={sorted(only_ide)[:2]}"
-                         if (only_ref or only_ide) else ""))
-        n_fail += int(bool(only_ref or only_ide))
-    return n_fail, report
-
+    return 0, ["[SKIP] B2 盘中族: IDE 门表通道已随 core/present 退役, 无对账对象 "
+               "(盘中等价性由 slice fold 覆盖) — 非 FAIL"]
 
 def run(static_only=False, days=60, limit=None, only=None,
         skip_b1=False, skip_b2=False, progress_every=0):

@@ -74,7 +74,6 @@ from app.market_cn.auto.core.indicators import calc_macd
 from app.market_cn.auto.core.market import default_market, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
-from app.market_cn.auto.core.runtime.resume import ResumePoint
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -111,7 +110,11 @@ STOP_LOSS_LU = -5.0
 R56 = {"main": 0.51, "gem_star": 0.66}        # rhist_chg 门 = 150天池内Q5
 # ATR_Q5 / ROLL / MIN_HIST 2026-09-26 下沉 core/features/cross_section.py (层清零)
 from app.market_cn.auto.core.features.cross_section import (  # noqa: E402  (L73 下方, 常量区之后)
-    ATR_Q5, ROLL, MIN_HIST, _g1_arrays, _g1_mask, _ensure_pool_daily,
+    ATR_Q5, ROLL, MIN_HIST, _aggregate, _g1_arrays, _g1_mask, _ensure_pool_daily,
+    g1_state_features, g1_state_init, g1_state_step,
+)
+from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
+    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
 )
 MAIN_RMED_MIN = 0.25     # 主板 regime 门: 池 rhist_chg 中位数 (raw)
 MAIN_PCTB_MAX = 49.87    # 主板 boll %b 上限 = 56%池内 P40 (g1deep3 桶边界)
@@ -146,6 +149,11 @@ SCORE_W_DIST = 0.5       # dist_ma20 权重 (dif0 占 1 − w)
 DEFAULT_PARAMS = {
     "dist_ma20_min": -4.0,   # 规则门: 信号日收盘相对 MA20 下限 % (2026-09-26 迁入; 原硬编码 DIST_MA20_MIN=-4.0; 300d 对照 n=748 胜率80.7%)
 }
+
+G56_WIN = 35        # 递推切片窗口 (= 生产口径 DEFAULT_WIN)
+GAP_LIM = {"main": 0.098, "gem_star": 0.198}   # entry 过滤硬编码口径 (非 up_eff)
+   # 2026-10-06: 原散落在 entry_decision / backtest 两处硬编码,
+   # slice evaluate 亦抄了一份 ⇒ 收敛为单一常量。
 # score 相关阈值 (SCORE_* / R56 / MAIN_RMED_MIN / GEM_SCORE_MIN 等) 仍冻结为模块常量 ——
 # 样本内拟合产物, 不开放 config 覆盖以防误调 (调参须走 tmp 研究链路重验)。
 
@@ -155,7 +163,7 @@ DEFAULT_PARAMS = {
 #   _g1_arrays / _g1_mask / _ensure_pool_daily 均已从上导入, 此处不再重复定义
 # ================================================================
 
-def _g56_gate(f, pool, board, k, date_k, mask=None, p=None):
+def _g56_gate(f, pool, board, k, date_k, mask=None, p=None, age=None):
     """五重共振门判定 (给定预计算特征 f@k / 池统计 pool / 板块 board / 信号日索引 k)。
 
     mask: 可选预计算的 `_g1_mask(f, board)` 结果。**同一 (f, board) 下 mask 恒定**,
@@ -170,7 +178,11 @@ def _g56_gate(f, pool, board, k, date_k, mask=None, p=None):
     backtest_stock 共用此单一判定事实源 — 修复 backtest 逐日重算 _g1_arrays 的 O(n^2)
     坑 (原 backtest 每历史日调 scan_signals 重算全序列指标); 改规则务必同步此处。
     """
-    mk = _g1_mask(f, board) if mask is None else mask
+    # age: **逻辑数据年龄** (递推/播种路径必传, 见 _g1_mask 文档)。
+    #   全量路径 f 是整条序列 ⇒ age=None (cut=G1_WARMUP) 与旧行为逐位一致;
+    #   递推路径 f 只有窗口 ⇒ 必须传真实 age, 否则暖机会误杀/误放。
+    #   k=-1 是递推路径的"末位"用法 (与全量 k=末日索引 同义)。
+    mk = _g1_mask(f, board, age=age) if mask is None else mask
     if not mk[k] or not f["rhist_chg"][k] > R56[board]:
         return False, None
     st = pool.get(board, {}).get(date_k)
@@ -342,8 +354,45 @@ def _mk_signal(code, bars, k, f, st):
 # 策略插件
 # ================================================================
 
+# SliceStrategyBase 放**第二**位: 生产 StrategyBase 的 merged_params 等优先,
+# slice 基类只补 params()/init_shared() 等生产基类没有的方法。
+class PoolLedger:
+    """策略级台账：每 (board, date) 横截面四元组 {date, n, rmed, dmed, smed}。
+
+    score_r 的滚动分位只回看 20 日 ⇒ 台账保留最近 30 条即够（聚合用常数数组
+    重建桶，与原始桶逐位等价 —— `_aggregate` 单一实现）。
+
+    ⚠ **不自己落盘**（2026-10-06）：展示层落盘出口唯一 = StateStore（每策略一个
+    文件、每轮一次）。共享状态经 `init_shared` / `shared_snapshot` 契约随**本策略
+    的切片文件**一起落盘。旧实现自带 `path` 且每次 append 就写一次盘，而默认
+    `path=None` 又**从不落盘** ⇒ 池台账与每票 state 生命周期不一致：重启后池
+    静默丢失、分位照算不报错 —— 最难发现的一类错误。
+    """
+
+    def __init__(self, quads: dict | None = None, keep: int = 30):
+        self.keep = keep
+        self.quads: dict[str, list] = {
+            "main": list((quads or {}).get("main") or []),
+            "gem_star": list((quads or {}).get("gem_star") or []),
+        }
+
+    def append(self, board: str, quad: dict) -> None:
+        qs = self.quads.setdefault(board, [])
+        if qs and qs[-1]["date"] >= quad["date"]:
+            qs[-1] = quad                       # 同日重跑幂等覆盖
+        else:
+            qs.append(quad)
+        del qs[:-self.keep]
+
+    def window(self, board: str) -> list:
+        return self.quads.get(board) or []
+
+    def snapshot(self) -> dict:
+        return {b: list(q) for b, q in self.quads.items()}
+
+
 @register
-class G56Strategy(StrategyBase):
+class G56Strategy(StrategyBase, SliceStrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     entry_style = "g56"
@@ -351,54 +400,171 @@ class G56Strategy(StrategyBase):
     scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(DEFAULT_PARAMS)
     use_unified_prefilter = False      # 与 tmp 回测口径一致 (无 U1~U4)
-
-    # ---- 断点记忆点声明 (2026-10-05, 见 core/runtime/resume.py) ----
-    # 策略只声明"要什么", 展示层 (core/present/resume_io.py) 只搬运不解释。
-    # g56 的 G1 特征 (rhist_chg / dif0) 上游是 MACD —— EMA 无限记忆,
-    # 所以断点状态是刚需; ATR14 同理 (Wilder 递推)。
-    # kind 不带前缀是因为用**标准注册表** (core/runtime/resume.RESUMABLE);
-    # 若日后 g56 要存私有量 (如横截面池聚合), 用 kind="g56/pool" 并自带 codec。
-    resume_points = (
-        ResumePoint("macd", (12, 26, 9),
-                    at="window_start",
-                    note="DIF/DEA/hist 序列; rhist_chg/dif0 的上游 (EMA 无限记忆)"),
-        ResumePoint("atr", (14,),
-                    at="window_start",
-                    note="Wilder ATR14 序列; G1 池 atr 门的上游"),
-        # ★ 2026-10-05 补全: 只声明 macd+atr 时, keep=40 下 kdj 的 K/D/J 有 36 个
-        #   读数与全量不等 (误差 8.4e-4)。KDJ 的 K/D 是 (2/3,1/3) 无限记忆递推,
-        #   BOLL 需 20 根窗口 —— 两者都必须有断点, 否则**截窗即算错且不报错**。
-        #   (声明面必须覆盖"实际会读到的全部长记忆读数", 少一个就是静默错算。)
-        ResumePoint("kdj", (9, 3, 3),
-                    at="window_start",
-                    note="K/D 是 (2/3,1/3) 无限记忆递推, J=3K-2D 放大误差"),
-        ResumePoint("boll", (20, 2.0),
-                    at="window_start",
-                    note="20 根滑窗; 窗口型状态 = 最近 20 根 close"),
+    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    stages = (
+        Stage("ready", "五重共振·准备", realtime="09:25"),
+        Stage("exec", "D0开盘买入"),
+        Stage("exit", "出场结算"),
     )
-    # ★ 窗口声明 80 —— 三档下界必须分开看 (tmp/_g1_window_probe12.py, 12 票实测):
-    #     · **硬下界 35**: 低于此 `_g1_arrays` 直接 IndexError (dummy MACD 退化成
-    #       0 维数组); 与 `register_ext("g56", min_n=35)` 的 35 完全一致, 不是巧合。
-    #     · **门判定等价的最小窗口 ≈ 40** (加倍差分); g56 报 80 是留了余量。
-    #     · **特征数值浮点等价的最小窗口 = 240** ⚠
-    #       —— dif0 / rhist_chg 的上游是 MACD (EMA **无限记忆**): 80 根时误差是
-    #       容差的 **4e4 倍**, 160 根仍差 2e2 倍, 240 根才 OK。其余滑窗类
-    #       (ma20/atr/big20/pctb/rma/rsi) 35 根就已经浮点等价。
-    #   ⇒ **本行的 80 只保证"门判定结果"等价, 不保证"特征值"等价**。
-    #     今天无害是因为 present 管线的 `build_ext` 走**全量** bars (见 intraday_cycle
-    #     里那条 ⚠ 注释), 80 只作用于 Ctx 的递推读数 (实测展示层读数 0 次)。
-    #     ⚠ **谁要是把 `_g1_arrays` 接到截短窗口上, 必须先解决 MACD 的无限记忆**。
-    #   ★★ 2026-10-05 已解决 (方案2): `_g1_arrays(bars, macd_anchor=...)` 支持 EMA
-    #      初值播种, 锚由 `core/features/cross_section.g1_state_init/step` 维护
-    #      (**每日只推进一格, O(1)**)。实测 (tmp/_g1_seed_probe13.py, 60 票 × 5874 次推进):
-    #      播种后 `G1_WIN_MIN`=21 根即与全量**浮点等价**, 上面那个 240 的前提被消除。
-    #      ⇒ 本行 80 是**未播种**口径的余量值; 接了播种后可下调到 35 (给表达式回看留余量),
-    #        但下调前必须确认消费方真的走了 `g1_state_features` (否则 240 的坑原样回来)。
-    #   ⚠ 展示层的断点窗口取**各策略声明的最大值** ⇒ 本行一旦上调, 全市场其它策略
-    #     也跟着保留更长历史 (成本共享)。改小会让递推初值缺失 ⇒ 静默算错。
-    warmup = 80
+
+    #: ⚠ 窗口硬下界 35: 低于此 `_g1_arrays` 直接 IndexError (dummy MACD 退化为 0 维数组)。
+    #:   (原 `warmup` / `resume_points` 声明于 2026-10-06 P6 随展示层断点机制一并移除;
+    #:    三档下界 35/40/240 的实测记录见 .workbuddy/memory)
 
     # ---- 信号判定: 只判末根bar (D-1); as_of=k 切片用于回测逐日枚举 ----
+    # ══ slice 契约：递推状态机 + 池台账（门/信号构造委托生产唯一实现）══
+    def __init__(self, pool_ledger=None):
+        self.ledger = pool_ledger or PoolLedger()
+
+    def init_shared(self, shared):
+        """用持久化的策略级状态恢复台账（每轮开头调用，幂等）。"""
+        if shared:
+            self.ledger = PoolLedger(shared.get("quads"))
+
+    def shared_snapshot(self):
+        return {"quads": self.ledger.snapshot()}
+
+    def init_state(self, code, bars):
+        """seed: 全量历史 → G1 增量状态（MACD 锚 head + win 根 OHLC 窗口 + age）。"""
+        if len(bars) < G56_WIN + 1:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < {G56_WIN + 1}")
+        return g1_state_init(bars, win=G56_WIN, keep_window=True)
+
+    def step(self, state, bar):
+        return g1_state_step(state, [bar])
+
+    def probe(self, state):
+        """除权探针: 窗口首尾 (date, close)。"""
+        w = state["window"]
+        return [(w[0][0], w[0][3]), (w[-1][0], w[-1][3])]
+
+    def begin_day(self, date, states, bars):
+        """跨票横截面池（展示层只透传 ctx["_day"]，不认识池内容）。"""
+        buckets = {"main": {}, "gem_star": {}}
+        for code, st0 in states.items():
+            if code.startswith(("8", "4", "92")):
+                continue
+            board = get_board_type(code)
+            if board not in buckets:
+                continue
+            st_day = self.step(st0, bars[code])
+            f = g1_state_features(st_day)
+            if _g1_mask(f, board, age=st_day["age"])[-1]:
+                b = buckets[board].setdefault(date, [[], [], []])
+                b[0].append(float(f["rhist_chg"][-1]))
+                b[1].append(float(f["dif0"][-1]))
+                b[2].append(float(f["rsi"][-1]))
+        pool = {}
+        for board in ("main", "gem_star"):
+            bucket = buckets[board].get(date)
+            if bucket:
+                self.ledger.append(board, {
+                    "date": date, "n": len(bucket[0]),
+                    "rmed": float(np.median(bucket[0])),
+                    "dmed": float(np.median(bucket[1])),
+                    "smed": float(np.median(bucket[2])),
+                })
+            by_date = {q["date"]: [[q["rmed"]] * q["n"], [q["dmed"]] * q["n"],
+                                   [q["smed"]] * q["n"]]
+                       for q in self.ledger.window(board)}
+            pool[board] = _aggregate(by_date)
+        return {"pool": pool}
+
+    def evaluate(self, state, inp, prev):
+        """预处理/回测/实时共用：持仓出场 → D0 入场 → 新信号（五重共振）。"""
+        p = self.params()
+        bar, code = inp.bar, inp.code
+        events = []
+        holding = None
+
+        # ── 持仓出场（d=2..7；T+1 不可卖）──
+        if prev is not None and prev.stage == "exec" and prev.payload.get("buyable") \
+                and bar.get("time", "") > prev.date:
+            entry_price = float(prev.payload["entry_price"])
+            entry_age = int(prev.payload["entry_age"])
+            d = (state["age"] + 1) - entry_age + 1       # 持仓日（d=1 入场日）
+            if d >= 2:
+                stop_use = float(prev.payload["stop_use"])
+                stop_line = entry_price * (1 + stop_use / 100)
+                highs = [w[1] for w in state["window"][-(d - 1):]] if d > 1 else []
+                peak = max(highs + [float(bar.get("high") or 0)])
+                exit_ev = None
+                if float(bar.get("low") or 0) <= stop_line:
+                    fill = min(float(bar.get("open") or 0), stop_line)
+                    exit_ev = self._exit_event(prev, bar, d, round(fill, 3),
+                                               f"止损{stop_use:g}%", peak)
+                elif d >= HOLD_DAYS:
+                    exit_ev = self._exit_event(
+                        prev, bar, d, round(float(bar.get("close") or 0), 3),
+                        f"到期{HOLD_DAYS}天", peak)
+                if exit_ev is not None:
+                    events.append(exit_ev)
+                else:
+                    holding = prev
+            else:
+                holding = prev
+        # ── D0 入场（gap 过滤 = 旧 entry_decision/backtest 同式）──
+        elif prev is not None and prev.stage == "ready" \
+                and bar.get("time", "") > prev.date:
+            open_px = float(bar.get("open") or 0)
+            pc = float(prev.payload.get("price") or 0)   # 信号日收盘
+            gap = (open_px / pc - 1) if (open_px > 0 and pc > 0) else None
+            buyable = gap is not None and gap < GAP_LIM[get_board_type(code)]
+            ev = Progress(stage="exec", date=bar.get("time", ""), payload={
+                "entry_date": bar.get("time", ""), "entry_price": open_px,
+                "signal_date": prev.date, "gap": None if gap is None else round(gap * 100, 2),
+                "buyable": buyable,
+                "stop_use": STOP_LOSS_LU if self._lu_subset(state, code) else STOP_LOSS,
+                "entry_age": state["age"] + 1,
+            }, next_realtime=None)
+            events.append(ev)
+            if buyable:
+                holding = ev
+
+        # ── 新信号（T 日盘后五重共振；持仓中不重复入场）──
+        if holding is None and not code.startswith(("8", "4", "92")):
+            st_day = self.step(state, bar)
+            f = g1_state_features(st_day)
+            board = get_board_type(code)
+            day_pool = ((inp.ctx or {}).get("_day") or {}).get("pool") or {}
+            ok, st = self._gate(f, st_day, board, day_pool, bar.get("time", ""), p)
+            if ok:
+                events.append(self._mk_ready(code, bar, f, st))
+        return events
+
+    def _gate(self, f, st_day, board, day_pool, date, p):
+        """五重共振门 —— **委托 `_g56_gate`**（唯一实现）。
+
+        递推路径：k=-1（窗口末位）+ 必须传真实 age（窗口短于真实历史）。
+        """
+        return _g56_gate(f, day_pool, board, -1, date, p=p, age=st_day["age"])
+
+    def _mk_ready(self, code, bar, f, st):
+        """ready 事件 —— **委托 `_mk_signal`**（唯一信号构造点, k=-1 取末位）。"""
+        sig = _mk_signal(code, [bar], -1, f, st)
+        return Progress(stage="ready", date=bar["time"], payload={
+            "price": sig.price, "score": sig.score, "label": sig.label,
+            "extra": sig.extra}, next_realtime="09:25")
+
+    @staticmethod
+    def _lu_subset(state, code):
+        """D-1 涨停子集紧止损（信号日 T 收盘较 T-1 涨停）。"""
+        closes = state["closes"]
+        if len(closes) < 2 or closes[-2] <= 0:
+            return False
+        return is_limit_up(closes[-1], closes[-2], get_board_type(code))
+
+    def _exit_event(self, prev, bar, d, price, reason, peak):
+        entry = float(prev.payload["entry_price"])
+        return Progress(stage="exit", date=bar.get("time", ""), payload={
+            "entry_date": prev.payload["entry_date"], "entry_price": entry,
+            "exit_date": bar.get("time", ""), "exit_price": price,
+            "exit_day": d, "reason": reason,
+            "return_pct": round((price / entry - 1) * 100, 2) if entry > 0 else None,
+            "peak_return_pct": round((peak / entry - 1) * 100, 2) if entry > 0 else None,
+        }, next_realtime=None)
+
+
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, **params):
         if not bars:
             return []
@@ -412,10 +578,6 @@ class G56Strategy(StrategyBase):
         # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
         pool_target = str(bars[-1]["time"])[:10]
         p = self.merged_params(params)
-        ok, st, f, k, sig_bars = self._gate_from_ledger(
-            code, board, pool_target, p, as_of)
-        if f is not None:                          # 台账路径已给出结论(含不通过)
-            return [_mk_signal(code, sig_bars, k, f, st)] if ok else []
         # 暖机/越界: 原实现对小 as_of 会因 np.convolve 广播失败而崩溃 (切片不足 20 根),
         # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
         if len(bars) < 68:
@@ -432,35 +594,6 @@ class G56Strategy(StrategyBase):
             return []                              # G1池 & 56%门 & 横截面 regime 门
         return [_mk_signal(code, bars, k, f, st)]
 
-    # ---- 单票特征的**预处理台账**源 (2026-10-05): 日常只判末位, 不必重算全序列 ----
-    def _gate_from_ledger(self, code, board, pool_target, p, as_of):
-        """返回 (ok, st, f, k, bars_for_signal)；`f is None` ⇒ 台账不可用, 走全量。
-
-        ⚠ 只在 `as_of is None`(判当日) 启用: 台账快照**只有当日**, 没有历史序列,
-          回测逐日枚举(`scan_days` / `as_of` 有值) 必须走全量 `_g1_arrays`。
-        ⚠ 回退**不是静默降级**: 原因进 `g1_pool_source.LAST_REASON`, 且原路径照跑。
-        """
-        if as_of is not None:
-            return False, None, None, 0, None
-        try:
-            from app.market_cn.auto.core.features import g1_pool_source as PS
-            ls = PS.try_ledger_features(code, board, pool_target)
-            if ls is None:
-                return False, None, None, 0, None
-            f, k, mk, wb = ls
-            # ★★ 池**只能取一次**: `_ensure_pool_daily` 是单槽缓存, `prewarm`
-            #    已把台账源池填进去 ⇒ 这里命中即可(O(1))。
-            #    ⚠ 不要在此调 `try_ledger_pool` —— 那是"读池历史 + 聚合全序列",
-            #      单次 0.06s, **逐票**调 = 5204 × 0.06 ≈ 312s (实测台账模式
-            #      251s vs 全量 32.5s, 慢 7.7x —— 增量反而更慢, 就是这么来的)。
-            #      池与特征不同源是安全的: 门级对账已证两者逐票一致。
-            pool = _ensure_pool_daily(pool_target)
-            ok, st = _g56_gate(f, pool, board, k, pool_target, mask=mk, p=p)
-            return ok, st, f, k, wb
-        except Exception as e:                     # 台账源不得阻断扫描
-            logger.warning("[g56] 台账特征源异常(%s), 走全量: %s", code, e)
-            return False, None, None, 0, None
-
     # ---- 横截面预热 (声明制; 编排层调 prewarm 一次, 不硬编码策略 key) ----
     def prewarm(self, bars_map, hi_date):
         """一次建好横截面池 (锚=hi_date), 供本批所有票的 scan_days 复用。
@@ -469,19 +602,9 @@ class G56Strategy(StrategyBase):
         target 相同仍会命中 —— 但**停牌票末根早于全市场末日**会让锚跳变 ⇒ 反复重建
         全市场池。编排层统一预热 + `scan_days` 锚取 hi_date ⇒ 全批只建一次。
         """
-        # (2026-10-05) 优先用**预处理台账**的池历史重建横截面池；不可用 ⇒ 原全量路径。
-        #   收益实测: 池 3.41s → ~0.1s（取数 7.6s 是信号判定本身要的，省不掉）。
-        #   ★ 回退不是静默降级: 原因进 `g1_pool_source.LAST_REASON` + 下面这条日志。
-        #   关闭开关: 环境变量 G1_POOL_FROM_LEDGER=0
-        try:
-            from app.market_cn.auto.core.features import g1_pool_source as PS
-            lg = PS.default_ledger(win=PS.DEFAULT_WIN)
-            if lg is not None and PS.try_ledger_pool(lg, hi_date) is not None:
-                return
-            logger.info("[g56] 池走全量(台账源不可用: %s)",
-                        PS.LAST_REASON.get("try") or PS.LAST_REASON.get("default_ledger"))
-        except Exception as e:                       # 台账源不得阻断扫描
-            logger.warning("[g56] 台账源异常, 池改由批量路径自建: %s", e)
+        # (2026-10-06) 池一律由批量路径自建。曾优先读 `g1_pool_source` 的台账池历史
+        #   (3.41s → 0.1s), 但该旁路需 g1_* 三件套 1531 行支撑, 已随 P6 清理删除。
+        #   全量建池 3.4s 是**一次性**成本, 按 10-05 裁定「速度非第一诉求」接受。
         _ensure_pool_daily(hi_date, bars_batch=bars_map)
 
     # ---- 覆盖基类 scan_days (批量契约): 与逐日调 scan_signals 等价, 但 O(n) 而非 O(n²) ----

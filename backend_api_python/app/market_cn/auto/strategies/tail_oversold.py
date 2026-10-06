@@ -25,6 +25,9 @@ from app.market_cn.auto.core.market import get_board_type, is_limit_up, default_
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
+from app.market_cn.auto.slice.contract import (          # slice 契约（递推展示层）
+    InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+)
 
 STRATEGY_KEY = "tail_oversold"
 STRATEGY_LABEL = "尾盘超卖超短"
@@ -107,6 +110,9 @@ PARAMS = {
     "hold_days": 1,            # 持有1天 (D1开盘卖)
 }
 _SHORTLIST_SLACK_PCT = 0.15   # 预筛容差(百分点): 吸收原始价/复权价微差, 放宽保超集
+
+_WIN = 6        # 切片窗口 (pre5 分母 closes[-5] + probe 锚)
+_MIN_AGE = 6    # 旧口径: len(closes) < 6 → 无判定
 
 # 评分除 day_gain 外其余四维的上限合计 (tail 3.0 + pos 2.0 + amp&tail 1.0 + pre5 0.3),
 # 与 _calc_score 分支表一一对应 —— 改评分表必须同步改这里。
@@ -200,8 +206,10 @@ def _tail_ret_v2(series_rows):
     return (last_px / tail_avg - 1) * 100
 
 
+# SliceStrategyBase 放**第二**位: 生产 StrategyBase 的 merged_params 等优先,
+# slice 基类只补 params()/init_shared() 等生产基类没有的方法。
 @register
-class TailOversoldStrategy(StrategyBase):
+class TailOversoldStrategy(StrategyBase, SliceStrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
@@ -217,6 +225,12 @@ class TailOversoldStrategy(StrategyBase):
     exit_exec_same_day = True
     signal_state = "buy_today"
     rolling_preview = True
+    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    stages = (
+        Stage("watch", "候选观察", realtime="14:50-15:00", visible=False),
+        Stage("ready", "D0尾盘触发·准备", realtime="09:31"),
+        Stage("exec", "D1开盘卖出"),
+    )
     data_needs = ("daily", "snapshot", "minute_live")
 
     def intraday_shortlist(self, snaps, mkt_gain, **params):
@@ -259,78 +273,192 @@ class TailOversoldStrategy(StrategyBase):
             out[code] = snap
         return out
 
-    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
-        """盘中判定 (14:50~15:00 滚动, 触发即可买)。必须 ctx={"latest","series"}。
+    # ══ slice 契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
+    # ⚠ 展示/预处理 evaluate 与盘中实时 scan_signals **共用同一份 _gates**。
+    #   两入口只差"取哪个快照": scan_signals 判 ctx["latest"]（此刻）；
+    #   evaluate 回扫当日 14:50~15:00 序列取首次触发。公式不得再写第二份。
+    def init_state(self, code, bars, market=None):
+        """seed: 截至昨日的全量历史 → 切片 (win 最近 6 根 close + age/board)。"""
+        if len(bars) < _MIN_AGE:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < {_MIN_AGE}")
+        win = [{"d": b["time"], "c": float(b["close"])} for b in bars[-_WIN:]]
+        return {"v": 1, "date": win[-1]["d"], "age": len(bars),
+                "board": get_board_type(code, market), "win": win}
 
-        probe: 调试探针 (None=零开销) — 门级 TRACE 打点, 存档供 AI 离线分析。"""
-        p = self.merged_params(params or None)
-        ctx = ctx or {}
-        snap, series = ctx.get("latest"), ctx.get("series") or []
-        if not snap or not series:
-            return []
+    def step(self, state, bar):
+        """推进一根 (O(win))。纯函数: 返回新 state, 不改入参。"""
+        win = (list(state["win"])
+               + [{"d": bar["time"], "c": float(bar["close"])}])[-_WIN:]
+        return {"v": 1, "date": bar["time"], "age": state["age"] + 1,
+                "board": state["board"], "win": win}
+
+    def probe(self, state):
+        """除权探针: 窗口首尾 (date, close) —— 历史被复权/订正则不等 ⇒ 整票重建。"""
+        w = state["win"]
+        return [(w[0]["d"], w[0]["c"]), (w[-1]["d"], w[-1]["c"])]
+
+    def evaluate(self, state, inp, prev):
+        """预处理/回测/实时共用: 先结算上一阶段, 再判今日触发或明日观察。"""
+        p = self.params()
+        events = []
+        # 上一阶段结算: D1 开盘卖
+        if prev is not None and prev.stage == "ready" \
+                and inp.bar.get("time", "") > prev.date:
+            open_px = float(inp.bar.get("open") or 0)
+            entry = float(prev.payload.get("price") or 0)
+            if open_px > 0:
+                events.append(Progress(
+                    stage="exec", date=inp.bar["time"],
+                    payload={
+                        "entry_date": prev.date, "entry_price": entry,
+                        "exit_price": open_px,
+                        "exit_ret": round((open_px / entry - 1) * 100, 2) if entry > 0 else None,
+                        "label": "D1开盘卖出(超卖反弹兑现)",
+                    }, next_realtime=None))
+            else:
+                return events
+
+        if inp.code.startswith(("8", "4", "92")):
+            return events       # 北交所排除 (v2 回测口径)
+        win = state["win"]
+        if not (state["age"] >= _MIN_AGE and win[-5]["c"] > 0):
+            return events
+        ctx = inp.ctx or {}
+        snap_rows = ctx.get("series") or []
+        fired = None
+        for i, row in enumerate(snap_rows):
+            hh = _hhmm(row.get("time") or "")
+            if hh < p["min_hhmm"] or hh > "15:00":
+                continue
+            fired = self._gates(p, inp.code, state, row, snap_rows[:i + 1])
+            if fired:
+                break
+        if fired:
+            events.append(Progress(
+                stage="ready", date=fired["time"],
+                payload={"price": fired["price"], "score": fired["score"],
+                         "label": fired["label"], "extra": fired["extra"]},
+                next_realtime="09:31"))
+            return events
+
+        # 明日观察预筛 (superset: 数据够、分母有效即可)
+        if state["age"] + 1 >= _MIN_AGE and win[-5]["c"] > 0:
+            events.append(Progress(stage="watch", date=inp.bar.get("time", ""),
+                                   payload={}, next_realtime="14:50-15:00"))
+        return events
+
+    def _gates(self, p, code, state, snap, series, probe=None):
+        """触发门 + 评分 —— **唯一实现** (scan_signals 与 evaluate 共用)。
+
+        state=None 表示切片不可用 (bars 不足) ⇒ 在 tail_ret 之后按 data/bars_short 拒,
+        与旧 scan_signals 的判门位置一致。probe 仅 scan_signals 传。
+        """
         last = float(snap.get("last") or 0)
         high = float(snap.get("high") or 0)
         low = float(snap.get("low") or 0)
         pc = float(snap.get("previousClose") or 0)
         if last <= 0 or pc <= 0 or high <= 0 or low <= 0 or high <= low:
-            return []
-        _tr = None
-        if probe is not None:
-            def _tr(stage, **kw):
-                probe.trace(stage, code=code, d0_date=str(snap.get("time") or "")[:10],
-                            **kw)
-        if _hhmm(snap.get("time") or "") < p["min_hhmm"]:    # 预览窗口起点前不出信号
-            if _tr:
-                _tr("window", hhmm=_hhmm(snap.get("time") or ""))
-            return []
+            return None
+        if _hhmm(snap.get("time") or "") < p["min_hhmm"]:  # 预览窗口起点前不出信号
+            if probe:
+                probe("window", hhmm=_hhmm(snap.get("time") or ""))
+            return None
         if last >= round(pc * (1 + _limit_pct(code)), 2) * 0.998:   # 封板买不进
-            if _tr:
-                _tr("limit", last=round(last, 3))
-            return []
-
+            if probe:
+                probe("limit", last=round(last, 3))
+            return None
         nf = _norm_factor(code)
-        day_gain = (last / pc - 1) * 100                    # 快照口径: high/low=当日累计极值
+        day_gain = (last / pc - 1) * 100            # 快照口径: high/low=当日累计极值
         amplitude = (high - low) / pc * 100
         pos_range = (last - low) / (high - low)
         tail_ret = _tail_ret_v2(series)
         if tail_ret is None:
-            if _tr:
-                _tr("data", reason="tail_ret")
-            return []
-        closes = [float(b["close"]) for b in (bars or [])]
-        if len(closes) < 6 or closes[-5] <= 0:              # bars[-1]=昨日, 分母=D-5收盘
-            if _tr:
-                _tr("data", reason="bars_short")
-            return []
+            if probe:
+                probe("data", reason="tail_ret")
+            return None
+        closes = [w["c"] for w in (state or {}).get("win") or []]
+        if len(closes) < _MIN_AGE or closes[-5] <= 0:   # bars[-1]=昨日, 分母=D-5收盘
+            if probe:
+                probe("data", reason="bars_short")
+            return None
         pre5_gain = (last / closes[-5] - 1) * 100
-        # V2 精掐五条件 (全部归一化)
         score = _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf)
         if score < p["score_min"] or pre5_gain * nf > p["pre5_max"] \
                 or amplitude * nf < p["amp_min"] \
                 or not (p["tail_lo"] <= tail_ret * nf <= p["tail_hi"]):
-            if _tr:
-                _tr("v2", score=round(score, 2), pre5_gain=round(pre5_gain, 2),
-                    amplitude=round(amplitude, 2), tail_ret=round(tail_ret, 2),
-                    pos_range=round(pos_range, 3))
-            return []
-        if _tr:
-            _tr("signal", score=round(score, 2))
-        # 2026-09-26 双层: L0 现网候选 / L1 预测分高分段 (score>=10)
-        #   120d amp8: L0 n=306 wr82.7 pl2.04 | L1 n=18 wr88.9 **pl6.30**
+            if probe:
+                probe("v2", score=round(score, 2), pre5_gain=round(pre5_gain, 2),
+                      amplitude=round(amplitude, 2), tail_ret=round(tail_ret, 2),
+                      pos_range=round(pos_range, 3))
+            return None
+        if probe:
+            probe("signal", score=round(score, 2))
         tier = "high" if score >= SCORE_HIGH_MIN else "base"
-        return [Signal(
-            code=code,
-            time=str(snap.get("time") or "")[:10],
-            score=pred_score(score, code),   # 50=平盘 100=涨停 0=跌停
-            price=last,
-            label=(f"尾盘超卖 gain={day_gain:.1f}% tail={tail_ret:+.2f}% "
-                   f"pos={pos_range:.2f} 预测分={pred_score(score, code)} v2={score:.1f} [{tier}]"),
-            extra={"gain": round(day_gain, 2), "amplitude": round(amplitude, 2),
-                   "pos_range": round(pos_range, 3), "tail_ret": round(tail_ret, 2),
-                   "pre5_gain": round(pre5_gain, 2),
-                   "v2_score": round(score, 2), "pred_score": pred_score(score, code),
-                     "pred_exp_ret": round(_v2_to_exp_ret(score), 2), "tier": tier},
-        )]
+        ps = pred_score(score, code)
+        return {
+            "time": str(snap.get("time") or "")[:10],
+            "price": last, "score": ps,
+            "label": (f"尾盘超卖 gain={day_gain:.1f}% tail={tail_ret:+.2f}% "
+                      f"pos={pos_range:.2f} 预测分={ps} v2={score:.1f} [{tier}]"),
+            "extra": {"gain": round(day_gain, 2), "amplitude": round(amplitude, 2),
+                      "pos_range": round(pos_range, 3), "tail_ret": round(tail_ret, 2),
+                      "pre5_gain": round(pre5_gain, 2), "v2_score": round(score, 2),
+                      "pred_score": ps,
+                      "pred_exp_ret": round(_v2_to_exp_ret(score), 2), "tier": tier},
+        }
+
+    def realtime_shortlist(self, codes, snaps, mkt_gain=None, stage=None):
+        """实时旁支便宜预筛 (与 scan_signals 门控同源, 只取快照场)。"""
+        if stage not in (None, "watch"):
+            return list(codes)      # 阶段转换票 (exec 结算) 不得被触发门拦截
+        p = self.params()
+        dg_max = _shortlist_dg_max(float(p["score_min"]))
+        amp_floor = float(p["amp_min"]) - _SHORTLIST_SLACK_PCT
+        out = []
+        for code in codes:
+            if code.startswith(("8", "4", "92")):
+                continue
+            snap = snaps.get(code) or {}
+            last = float(snap.get("last") or 0)
+            high = float(snap.get("high") or 0)
+            low = float(snap.get("low") or 0)
+            pc = float(snap.get("previousClose") or 0)
+            if last <= 0 or pc <= 0 or high <= 0 or low <= 0 or high <= low:
+                continue
+            nf = _norm_factor(code)
+            if dg_max is not None and (low / pc - 1) * 100 * nf > dg_max + _SHORTLIST_SLACK_PCT:
+                continue
+            if (high - low) / pc * 100 * nf < amp_floor:
+                continue
+            if last >= round(pc * (1 + _limit_pct(code)), 2) * 0.998:
+                continue
+            out.append(code)
+        return out
+
+    def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
+        """盘中判定 (14:50~15:00 滚动, 触发即可买)。必须 ctx={"latest","series"}。
+
+        门逻辑全部委托 `_gates` (与展示层 evaluate 同一实现), 本方法只负责:
+        取快照 → 建切片 → 组装 Signal。probe: 门级 TRACE, 仅本入口传。
+        """
+        p = self.merged_params(params or None)
+        ctx = ctx or {}
+        snap, series = ctx.get("latest"), ctx.get("series") or []
+        if not snap or not series:
+            return []
+        try:
+            state = self.init_state(code, bars or [])
+        except InsufficientHistory:
+            state = None
+        fired = self._gates(p, code, state, snap, series, probe=(
+            (lambda stage, **kw: probe.trace(
+                stage, code=code, d0_date=str(snap.get("time") or "")[:10], **kw))
+            if probe is not None else None))
+        if not fired:
+            return []
+        return [Signal(code=code, time=fired["time"], score=fired["score"],
+                       price=fired["price"], label=fired["label"],
+                       extra=fired["extra"])]
 
     # ---- 三决策 (14:50 起买入 → 隔夜 → D1 开盘卖) ----
     def entry_decision(self, row, snap=None, **params):

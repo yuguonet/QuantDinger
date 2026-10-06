@@ -29,6 +29,13 @@ from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
+# 递推展示层契约 (2026-10-06 自 slice/strategies/dragon_callback.py 下沉):
+#   生产基类在前 ⇒ merged_params/scan_signals 不被遮盖; slice 基类只补 params()
+#   等生产侧没有的方法。放第二位, 与 knife/tail/g56 同一写法。
+from app.market_cn.auto.slice.contract import (  # noqa: E402
+    DayInput, InsufficientHistory, Progress, Stage, StrategyBase as SliceStrategyBase,
+)
+from app.utils.indicators import macd_core, macd_state  # noqa: E402
 
 STRATEGY_KEY = "dragon_callback"
 STRATEGY_LABEL = "龙回头"
@@ -186,17 +193,70 @@ def _d0_vs_ma20(bars, i):
     return (bars[i]["close"] / ma20 - 1) * 100 if ma20 > 0 else None
 
 
-def _tech_block(closes, use_tech_score=True):
+# ================================================================
+# 递推展示层: RSI6 增量状态 (Wilder 二元组) + 窗口常量
+# ----------------------------------------------------------------
+# RSI 参与门判定 (rsi6_min=45) ⇒ 必须**逐位等于**全量 `rsi(closes, 6)`。
+# Wilder 递推是马尔可夫的: 只要 avg_g/avg_l 播种与全量一致, 逐步递推恒等
+# (实测 46/81/151/301 根与全量逐位相等)。故递推路径不需要重算全序列。
+# ================================================================
+RING = 40          # 递推窗口: 门窗口 28 + 出场重放 ≤7 天 + 跌停顺延
+
+# anchor_step 与 cross_section 同源 (G1 状态机推进 EMA 锚)
+from app.market_cn.auto.core.features.cross_section import _anchor_step  # noqa: E402
+
+
+def rsi_init(closes, period=6):
+    """全量 closes → 增量状态 [avg_g, avg_l]; len<period+1 → None。"""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    return [avg_g, avg_l]
+
+
+def rsi_step(st, prev_close, close, period=6):
+    """推进一步 (Wilder); st 为 None 时返回 None。"""
+    if st is None:
+        return None
+    d = close - prev_close
+    return [(st[0] * (period - 1) + max(d, 0)) / period,
+            (st[1] * (period - 1) + max(-d, 0)) / period]
+
+
+def rsi_value(st):
+    """增量状态 → RSI 值 (与全量 rsi() 同式)。"""
+    if st is None:
+        return None
+    avg_g, avg_l = st
+    if avg_l == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_g / avg_l)
+
+
+def _tech_block(closes, use_tech_score=True, *, macd_triple=None, rsi_val=None):
     """技术面加分块 → (score, rsi_val, roc, psy)。
 
     score/roc/psy 只进展示字段 (评分门槛已关闭, 实验结论无判别力); **rsi_val 参与判定**
     (龙强度 ③ 与质量排除), 故 use_tech_score=False 时 rsi_val=None → 对应门放行不误杀。
+
+    macd_triple / rsi_val (2026-10-06): 递推路径传入的**已算好**值 (MACD 锚播种 +
+    RSI 增量递推, 均与全量逐位一致); None 则按全量 closes 自算。两条路径共用本
+    函数 —— 打分只有一份实现, 不会分叉。
     """
     score = 0
     rsi_val = roc = psy = None
     if not use_tech_score:
         return score, rsi_val, roc, psy
-    dif, dea, hist = calc_macd(closes)
+    dif, dea, hist = macd_triple if macd_triple is not None else calc_macd(closes)
     if hist is not None and len(hist) >= 2:
         if is_macd_golden_cross(dif, dea, lookback=5):
             score += 3
@@ -209,7 +269,8 @@ def _tech_block(closes, use_tech_score=True):
             score += 1
         if dif[n_h - 1] < dea[n_h - 1] and dif[n_h - 2] >= dea[n_h - 2]:
             score -= 2
-    rsi_val = rsi(closes, period=6)
+    if rsi_val is None:            # 递推路径已算好且逐位等于全量, 不重算
+        rsi_val = rsi(closes, period=6)
     if rsi_val is not None:
         if rsi_val < 30:
             score += 2
@@ -464,8 +525,86 @@ def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
     }
 
 
+def _dragon_gates(p, cand, d0, probe=None):
+    """龙回头门 0a/0b → 1 → 2(gap) → 3 → 4 → 5 → 6(拐点OR) → 7 → 8a~8c —— **唯一实现**。
+
+    2026-10-06: 此前生产 `scan_signals` 循环内逐门内联、slice `_signal` 又抄一份 ——
+    两套实现可给出相反结果（记忆点名的雷区）。现两侧只负责**各自准备特征**:
+      生产 = 全量 bars 索引 (lu_idx/i)；slice = 递归 ring 窗口 + 冻结 lu 记录。
+    判定顺序/阈值/短路语义全部集中于此；改门只需改这一处。
+
+    Args:
+        cand: lu 候选特征 {"close","dragon","streak_h","gain20","gap"}
+        d0:   D0 特征 {"c","last_chg","rsi_val","d0_vs_ma20","depth","yin_ratio"}
+        probe: 可选 TRACE 回调 (stage, **kw)，仅生产 scan_signals 传。
+    Returns:
+        (pass: bool, reason: str|None)
+    """
+    # 0a/0b: 涨停收盘有效 且 D0 收盘仍低于涨停收盘（仍在回调中）
+    #   ⚠ 不 trace —— 与旧实现一致（原代码这两门在 _tr 定义之前）
+    if not (cand["close"] > 0) or not (d0["c"] < cand["close"]):
+        return False, "0ab"
+    # 1 找龙（滑动窗口内涨停占比）
+    if not cand["dragon"]:
+        if probe:
+            probe("dragon")
+        return False, "dragon"
+    # 2 gap ∈ [gap_min, gap_max]
+    if cand["gap"] < p["gap_min"] or cand["gap"] > p["gap_max"]:
+        if probe:
+            probe("gap")
+        return False, "gap"
+    # 3 连板高度
+    if cand["streak_h"] < p["min_streak"]:
+        if probe:
+            probe("streak")
+        return False, "streak"
+    # 4 前期热度（None → 拒）
+    if cand["gain20"] is None or cand["gain20"] < p["lu_gain20_min"]:
+        if probe:
+            probe("lu_gain20")
+        return False, "lu_gain20"
+    # 5 强势回调（rsi 未计算时放行，不误杀）
+    rsi_val = d0["rsi_val"]
+    if rsi_val is not None and rsi_val < p["rsi6_min"]:
+        if probe:
+            probe("rsi")
+        return False, "rsi"
+    # 6 拐点（三腿 OR）
+    ma20 = d0["d0_vs_ma20"]
+    cond_ma20 = ma20 is not None and p["ma20_lo"] <= ma20 < p["ma20_hi"]
+    cond_depth = d0["depth"] <= p["depth_max"]
+    cond_yin = d0["yin_ratio"] < p["yin_ratio_max"]
+    if not (cond_ma20 or cond_depth or cond_yin):
+        if probe:
+            probe("turn", d0_vs_ma20=round(ma20, 2) if ma20 is not None else None,
+                  pullback_depth=round(d0["depth"], 2), yin_ratio=round(d0["yin_ratio"], 2))
+        return False, "turn"
+    # 7 D0 企稳（严格 >）
+    if d0["last_chg"] <= p["d0_chg_min"]:
+        if probe:
+            probe("d0_chg", signal_chg=round(d0["last_chg"], 2))
+        return False, "d0_chg"
+    # 8a/8b/8c 信号质量排除
+    if d0["yin_ratio"] >= p["yin_ratio_exclude"]:
+        if probe:
+            probe("quality", reason="yin_ratio", yin_ratio=round(d0["yin_ratio"], 2))
+        return False, "quality_yin"
+    if rsi_val is not None and rsi_val < p["rsi6_exclude_lt"]:
+        if probe:
+            probe("quality", reason="rsi6_lt", rsi6=round(rsi_val, 1))
+        return False, "quality_rsi"
+    if ma20 is not None and ma20 < p["d0_ma20_exclude_lt"]:
+        if probe:
+            probe("quality", reason="d0_ma20_lt", d0_vs_ma20=round(ma20, 2))
+        return False, "quality_ma20"
+    if probe:
+        probe("signal")
+    return True, None
+
+
 @register
-class DragonCallbackStrategy(StrategyBase):
+class DragonCallbackStrategy(StrategyBase, SliceStrategyBase):
     key = STRATEGY_KEY
     name = STRATEGY_LABEL
     prefilter_anchor = "limit_up"     # U1~U4 锚定涨停日 (D0 缩量小阴日评估会误杀)
@@ -475,13 +614,20 @@ class DragonCallbackStrategy(StrategyBase):
     PROBE_STAGE_RANK = {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4, "rsi": 5,
                         "turn": 6, "d0_chg": 7, "quality": 7, "dedup": 8, "prefilter": 9,
                         "engine_skip": 9, "signal": 10}
+    # slice 展示阶段表（展示层只按此表呈现，不认识门细节）
+    stages = (
+        Stage("ready", "龙回头·准备", realtime="09:25"),
+        Stage("exec", "D1开盘买入"),
+        Stage("exit", "出场结算"),
+    )
+    # ⚠ 必须与 scan_signals 的 use_tech_score 默认(True)一致: 置 False 会让
+    #   rsi_val=None ⇒ 门5(rsi6>=45)放行 ⇒ 全市场多日 46 笔 vs 生产 30 笔 (多 34%)。
+    use_tech_score = True
 
-    # ---- 断点续传: 本策略**数学上不可启用** ----
+    # ---- 截窗警告 (原 `resume_supported` 声明, 2026-10-06 P6 随展示层断点机制移除) ----
     # ⚠️ `enumeration=limit_up`: 候选 = **窗口内**的历史涨停日, 且 lu_idx 是绝对索引
     #    ⇒ 截窗会削减候选本身 (实测 e2e 465→161), 断点**救不回**。
-    #    要启用必须先把涨停日列表持久化成断点状态 (另案, 需授权改 `_candidate_lus` 语义)。
-    # 声明这里后 `pipeline` 自动排除本策略 —— 框架侧不再硬编码任何策略 key。
-    resume_supported = False
+    #    要启用必须先持久化涨停日列表 (另案, 需授权改 `_candidate_lus` 语义)。
 
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, limit_ups=None,
@@ -556,75 +702,23 @@ class DragonCallbackStrategy(StrategyBase):
             else:
                 _tr = None
 
-            # ── Step1: 找龙 — 滑动窗口内涨停占比>=70% ──
-            # 2026-09-23: 逐字搬入 _dragon_found (与 YAML 门表共用同一实现)
-            dragon_found = _dragon_found(bars, lu_idx, board_type,
-                                         p["dragon_ratio"], p["dragon_windows"])
-            if not dragon_found:
-                if _tr:
-                    _tr("dragon")
-                continue
-
-            # ── Step2: gap [gap_min, gap_max] ──
-            if gap_from_peak < p["gap_min"] or gap_from_peak > p["gap_max"]:
-                if _tr:
-                    _tr("gap")
-                continue
-
-            # ── 龙强度门槛 (2026-09-10 三条件) ──
-            if streak_h < p["min_streak"]:
-                if _tr:
-                    _tr("streak")
-                continue
-            if lu_gain20 is None or lu_gain20 < p["lu_gain20_min"]:
-                if _tr:
-                    _tr("lu_gain20")
-                continue
-            # ③ 强势回调: D0 RSI6 下界 (use_tech_score=False 时 rsi 未计算, 放行不误杀)
-            if rsi_val is not None and rsi_val < p["rsi6_min"]:
-                if _tr:
-                    _tr("rsi")
-                continue
-
-            # ── 回调期特征 ──
-            # 2026-09-23: 逐字搬入 _d0_vs_ma20 / _pullback_depth / _yin_ratio
+            # ── Step1~8c: 门判定**委托 `_dragon_gates`**（唯一实现，与展示层共用）──
+            #   特征在此按全量 bars 索引准备；slice 侧按 ring 窗口 + 冻结 lu 记录准备。
             d0_vs_ma20 = _d0_vs_ma20(bars, i)
             pullback_depth = _pullback_depth(bars, lu_idx, i)
             yin_ratio = _yin_ratio(bars, lu_idx, i)
-
-            # ── 拐点过滤 (或关系) ──
-            cond_ma20 = d0_vs_ma20 is not None and p["ma20_lo"] <= d0_vs_ma20 < p["ma20_hi"]
-            cond_depth = pullback_depth <= p["depth_max"]
-            cond_yin = yin_ratio < p["yin_ratio_max"]
-            if not (cond_ma20 or cond_depth or cond_yin):
-                if _tr:
-                    _tr("turn", d0_vs_ma20=round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
-                        pullback_depth=round(pullback_depth, 2),
-                        yin_ratio=round(yin_ratio, 2))
+            ok, _reason = _dragon_gates(p, {
+                "close": lu_close,
+                "dragon": _dragon_found(bars, lu_idx, board_type,
+                                        p["dragon_ratio"], p["dragon_windows"]),
+                "streak_h": streak_h, "gain20": lu_gain20, "gap": gap_from_peak,
+            }, {
+                "c": d0["close"], "last_chg": last_chg, "rsi_val": rsi_val,
+                "d0_vs_ma20": d0_vs_ma20, "depth": pullback_depth,
+                "yin_ratio": yin_ratio,
+            }, probe=_tr)
+            if not ok:
                 continue
-
-            # ── 信号质量排除 ──
-            # D0 企稳: 信号日跌幅必须 > d0_chg_min (恐慌大阴日接的是落刀不是回调;
-            # last_chg 在循环外按 D0 收盘算好, 各候选同值, trace 仍随候选记录)
-            if last_chg <= p["d0_chg_min"]:
-                if _tr:
-                    _tr("d0_chg", signal_chg=round(last_chg, 2))
-                continue
-            if yin_ratio >= p["yin_ratio_exclude"]:
-                if _tr:
-                    _tr("quality", reason="yin_ratio", yin_ratio=round(yin_ratio, 2))
-                continue
-            if rsi_val is not None and rsi_val < p["rsi6_exclude_lt"]:
-                if _tr:
-                    _tr("quality", reason="rsi6_lt", rsi6=round(rsi_val, 1))
-                continue
-            if d0_vs_ma20 is not None and d0_vs_ma20 < p["d0_ma20_exclude_lt"]:
-                if _tr:
-                    _tr("quality", reason="d0_ma20_lt", d0_vs_ma20=round(d0_vs_ma20, 2))
-                continue
-
-            if _tr:
-                _tr("signal")
             result.append(Signal(
                 code=code,
                 time=bars[i]["time"],
@@ -656,6 +750,228 @@ class DragonCallbackStrategy(StrategyBase):
             ))
             break
         return result
+
+    # ================================================================
+    # 递推展示层契约 (2026-10-06 自 slice/strategies/dragon_callback.py 下沉)
+    #
+    # 门判定  → `_dragon_gates`（全量路径 scan_signals 与递推路径共用一份）
+    # 出场    → `run_backtest_dragon_callback`（core.exit_engines 唯一实现）
+    # 原语    → `_lu_streak/_lu_gain20/_dragon_found/_tech_block` + 公共层 is_limit_up
+    # 递推量  → RSI6 增量二元组 (逐位等于全量) + MACD 锚 (仅 tech_score 展示用)
+    #
+    # state 结构: {abs_i, lus(涨停日冻结记录), ring(近 RING 根), rsi6, macd 锚, board}
+    # ================================================================
+    def init_state(self, code: str, bars: list[dict]) -> dict:
+        if len(bars) < 30:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < 30")
+        bt = get_board_type(code)
+        ring = [{"t": str(b["time"])[:10], "o": float(b["open"]), "h": float(b["high"]),
+                 "l": float(b["low"]), "c": float(b["close"]), "v": float(b["volume"])}
+                for b in bars[-RING:]]
+        lus = [self._freeze_lu(bars, k, bt)
+               for k in range(1, len(bars))
+               if is_limit_up(float(bars[k]["close"]), float(bars[k - 1]["close"]), bt)]
+        closes = [float(b["close"]) for b in bars]
+        n = len(bars)
+        if n > RING:
+            anchor = list(macd_state(closes, upto=n - RING - 1))
+        else:
+            # ring 尚未滑动（ring==全序列）：朴素播种等价锚 (c0, c0, 0)
+            anchor = [closes[0], closes[0], 0.0]
+        return {"v": 1, "board": bt, "abs_i": n - 1, "lus": lus, "ring": ring,
+                "rsi6": rsi_init(closes, 6), "macd": anchor}
+
+    @staticmethod
+    def _freeze_lu(bars, k, bt):
+        """lu 形成当时冻结属性（as-of 安全：只读 ≤k 的数据）。"""
+        return {
+            "idx": k, "date": str(bars[k]["time"])[:10],
+            "close": float(bars[k]["close"]), "volume": float(bars[k]["volume"]),
+            "streak_h": _lu_streak(bars, k, bt),
+            "gain20": _lu_gain20(bars, k),
+            "dragon": _dragon_found(bars, k, bt, DRAGON_CB_PARAMS["dragon_ratio"],
+                                    DRAGON_CB_PARAMS["dragon_windows"]),
+        }
+
+    def step(self, state: dict, bar: dict) -> dict:
+        ring = list(state["ring"])
+        prev_c = ring[-1]["c"]
+        rec = {"t": str(bar["time"])[:10], "o": float(bar["open"]), "h": float(bar["high"]),
+               "l": float(bar["low"]), "c": float(bar["close"]), "v": float(bar["volume"])}
+        abs_i = state["abs_i"] + 1
+        lus = list(state["lus"])
+        # lu 冻结：新 bar 是否涨停（用 ring 尾作 prev）；属性从 ring+新bar 临时视图算
+        if is_limit_up(rec["c"], prev_c, state["board"]):
+            tmp = [{"time": r["t"], "open": r["o"], "high": r["h"], "low": r["l"],
+                    "close": r["c"], "volume": r["v"]} for r in ring] + \
+                  [{"time": rec["t"], "open": rec["o"], "high": rec["h"], "low": rec["l"],
+                    "close": rec["c"], "volume": rec["v"]}]
+            lu = self._freeze_lu(tmp, len(tmp) - 1, state["board"])
+            # ★ idx 必须是**绝对索引**（gap 门/clamp 语义锚）；tmp 是 ring 视图，
+            #   属性值在 seed≥RING/2 约定下与全量逐位一致（见模块头）。
+            lu["idx"] = abs_i
+            lus.append(lu)
+        ring = (ring + [rec])[-RING:]
+        anchor = tuple(state["macd"]) if state.get("macd") else None
+        if anchor is not None and len(state["ring"]) >= RING:
+            # ring 滑出队首 → 锚推进（喂被滑出的那根）；未满时锚不动（ring[0] 未变）
+            anchor = tuple(_anchor_step(anchor, [state["ring"][0]["c"]]))
+        return {
+            "v": 1, "board": state["board"], "abs_i": abs_i, "lus": lus, "ring": ring,
+            "rsi6": rsi_step(state["rsi6"], prev_c, rec["c"]),
+            "macd": list(anchor) if anchor is not None else None,
+        }
+
+    def probe(self, state: dict) -> list[tuple[str, float]]:
+        r = state["ring"]
+        return [(r[0]["t"], r[0]["c"]), (r[-1]["t"], r[-1]["c"])]
+
+    def evaluate(self, state: dict, inp: DayInput, prev: Progress | None) -> list[Progress]:
+        """递推路径判定（三分支共用：预处理 / 回测 / 实时）。"""
+        p = self.params()
+        bar, code = inp.bar, inp.code
+        events: list[Progress] = []
+        today_abs = state["abs_i"] + 1
+        ring_full = state["ring"] + [{
+            "t": str(bar.get("time", ""))[:10], "o": float(bar.get("open") or 0),
+            "h": float(bar.get("high") or 0), "l": float(bar.get("low") or 0),
+            "c": float(bar.get("close") or 0), "v": float(bar.get("volume") or 0)}]
+        win = [{"time": r["t"], "open": r["o"], "high": r["h"], "low": r["l"],
+                "close": r["c"], "volume": r["v"]} for r in ring_full]
+        holding = None
+
+        # ── 持仓出场（逐日重放, stop_at_idx=今日 = 旧 exit_decision）──
+        if prev is not None and prev.stage == "exec" and prev.payload.get("buyable") \
+                and bar.get("time", "") > prev.date:
+            entry_abs = int(prev.payload["entry_abs"])
+            d = today_abs - entry_abs + 1
+            entry_pos = len(win) - d          # win 末位 = 今日
+            r = run_backtest_dragon_callback(
+                win, entry_pos, float(prev.payload["entry_price"]),
+                board_type=state["board"], stop_at_idx=len(win) - 1)
+            if r is not None and not r.get("open") and r["exit_day"] == d \
+                    and r.get("exit_reason"):
+                events.append(Progress(stage="exit", date=bar.get("time", ""), payload={
+                    "entry_date": prev.payload["entry_date"],
+                    "entry_price": prev.payload["entry_price"],
+                    "exit_date": bar.get("time", ""), "exit_price": r["exit_price"],
+                    "exit_day": r["exit_day"], "reason": r["exit_reason"],
+                    "return_pct": r["return_pct"],
+                    "peak_return_pct": r["peak_return_pct"],
+                    "lu_abs": prev.payload.get("lu_abs"), "i_abs": prev.payload.get("i_abs"),
+                }, next_realtime=None))
+            else:
+                holding = prev
+        # ── D1 入场（gap 仅展示；09-07 起无 gap 过滤，open>0 即买）──
+        elif prev is not None and prev.stage == "ready" \
+                and bar.get("time", "") > prev.date:
+            open_px = float(bar.get("open") or 0)
+            pc = float(prev.payload.get("close_raw") or 0)
+            gap = (open_px / pc - 1) * 100 if (open_px > 0 and pc > 0) else None
+            ev = Progress(stage="exec", date=bar.get("time", ""), payload={
+                "entry_date": bar.get("time", ""),
+                "entry_price": round(open_px, 3), "d1_gap": None if gap is None else round(gap, 2),
+                "buyable": open_px > 0,
+                "entry_abs": today_abs,
+                "lu_abs": prev.payload.get("lu_abs"), "i_abs": prev.payload.get("i_abs"),
+            }, next_realtime=None)
+            events.append(ev)
+            if open_px > 0:
+                holding = ev
+
+        # ── 新信号（每日至多 1；去重 ±4 对齐旧 backtest_stock）──
+        if holding is None and prev is not None and prev.payload.get("i_abs") is not None:
+            i_abs = int(prev.payload["i_abs"])
+            lu_abs = int(prev.payload.get("lu_abs") or -999)
+            if abs(today_abs - i_abs) <= 4 or abs(today_abs - lu_abs) <= 4:
+                return events          # 去重拒绝（不消费 used range，旧行为）
+        if holding is None and not code.startswith(("8", "4", "92")):
+            sig = self._signal(code, state, ring_full, win, today_abs, bar,
+                               inp.ctx or {}, p)
+            if sig is not None:
+                events.append(sig)
+        return events
+
+    def _signal(self, code, state, ring_full, win, today_abs, bar, ctx, p):
+        """D0 盘后判定（门 0a..8c；胜者 = [i-7,i-5] 升序首个全门通过）。"""
+        i = len(ring_full) - 1
+        if i < 2 or ring_full[i - 1]["c"] <= 0:
+            return None
+        bt = state["board"]
+        c_i = ring_full[i]["c"]
+        last_chg = (c_i / ring_full[i - 1]["c"] - 1) * 100
+        entry_vol_r = ring_full[i]["v"] / ring_full[i - 1]["v"] if ring_full[i - 1]["v"] > 0 else 0
+        closes = [r["c"] for r in ring_full]                 # 含今日
+        macd_triple = None
+        # calc_macd 契约: n < slow+signal(35) → (None,None,None)，下游 macd 分支不激活
+        if state.get("macd") and len(closes) >= 35:
+            dif, dea, _ = macd_core(closes, anchor=tuple(state["macd"]))
+            macd_triple = (dif, dea, [2.0 * (d - e) for d, e in zip(dif, dea)])
+        # rsi6 增量口径（播种起点=origin；use_tech_score=False 时置 None → 门 5/8b 放行）
+        rsi_val = rsi_value(rsi_step(state["rsi6"], ring_full[i - 1]["c"], c_i)) \
+            if state.get("rsi6") else None
+        score, rsi_val_t, roc, psy = _tech_block(
+            closes, self.use_tech_score, macd_triple=macd_triple, rsi_val=rsi_val)
+        if not self.use_tech_score:
+            rsi_val = None
+
+        for rec in state["lus"]:
+            gap = today_abs - rec["idx"]
+            if gap > p["gap_max"]:
+                continue                     # 升序：更旧的 gap 更大，可直接剪枝
+            if gap < p["gap_min"]:
+                continue                     # 更新的还没到回调窗（gap 太小）
+            g20 = rec["gain20"]
+            # 6 拐点三腿的输入（回调期特征，由 ring 窗口算出）
+            lu_rel = len(ring_full) - 1 - gap          # lu 在 ring_full 的相对位置
+            seg = ring_full[lu_rel + 1:]
+            depth = (min(r["l"] for r in seg) / rec["close"] - 1) * 100 if seg else 0.0
+            pb_total = gap
+            pb_yin = sum(1 for r in seg if r["c"] < r["o"])
+            yin_ratio = pb_yin / pb_total if pb_total > 0 else 1.0
+            d0_vs_ma20 = None
+            if len(closes) >= 20:
+                ma20 = sum(closes[-20:]) / 20
+                d0_vs_ma20 = (c_i / ma20 - 1) * 100 if ma20 > 0 else None
+            # 门 0a/0b · 1 · 2 · 3 · 4 · 5 · 6 · 7 · 8a~8c —— **委托 `_dragon_gates`**
+            #   （生产唯一实现；本侧只负责用 ring 窗口准备同样的特征）
+            ok, _reason = _dragon_gates(p, {
+                "close": rec["close"], "dragon": rec["dragon"],
+                "streak_h": rec["streak_h"], "gain20": g20, "gap": gap,
+            }, {
+                "c": c_i, "last_chg": last_chg, "rsi_val": rsi_val,
+                "d0_vs_ma20": d0_vs_ma20, "depth": depth, "yin_ratio": yin_ratio,
+            })
+            if not ok:
+                continue
+            # ---- 胜者：构造 Signal ----
+            si = ctx.get("stock_info") or {}
+            circ = float(si.get("circ_shares") or 0)
+            total = float(si.get("total_shares") or 0)
+            extra = {
+                "board": get_board_name(code),
+                "lu_date": rec["date"], "pullback_days": gap,
+                "signal_chg": round(last_chg, 2),
+                "signal_vol_r": round(entry_vol_r, 2),
+                "signal_price": round(c_i, 3), "entry_vol_r": round(entry_vol_r, 2),
+                "buy_mode": "next_open", "gap_from_peak": gap,
+                "streak_h": rec["streak_h"],
+                "lu_gain20": round(g20, 1) if g20 is not None else None,
+                "d0_vs_ma20": round(d0_vs_ma20, 2) if d0_vs_ma20 is not None else None,
+                "pullback_depth": round(depth, 2), "yin_ratio": round(yin_ratio, 2),
+                "turnover_anchor": round(rec["volume"] / circ * 100, 2) if circ > 0 else None,
+                "turnover_anchor_total": round(rec["volume"] / total * 100, 2) if total > 0 else None,
+                "tech_score": score,
+                "tech_rsi": round(rsi_val, 1) if rsi_val else None,
+                "tech_roc": round(roc, 1) if roc else None,
+                "tech_psy": round(psy, 1) if psy else None,
+            }
+            return Progress(stage="ready", date=str(bar.get("time", "")), payload={
+                "price": round(c_i, 3), "score": 0, "label": "龙回头",
+                "extra": extra, "close_raw": c_i,
+                "lu_abs": rec["idx"], "i_abs": today_abs,
+            }, next_realtime="09:25")
+        return None
 
     # ---- D1 竞价处置 ----
     def entry_decision(self, row, snap=None, **params):

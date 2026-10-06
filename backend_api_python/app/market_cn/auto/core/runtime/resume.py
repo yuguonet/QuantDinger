@@ -18,7 +18,9 @@ per-indicator 锚点)。此前 MACD 专门做了一个 `anchor=(ef,es,dea)` 参�
 
 其中 state 的语义 = "bars_post[0] **之前**那一根结束时的状态"。
 这是**数学恒等**不是近似: 递推型靠 Markov 性 (整个历史只通过 e[a] 一个数传递);
-滑窗型靠"窗口内值即状态"。改任何实现前必须保持它 —— 见 `verify_resume.py`。
+滑窗型靠"窗口内值即状态"。改任何实现前必须保持它。
+等价性自检: 对同一 bars 比较 `resume(snapshot(bars[:k]), bars[k:])` 与
+`compute(bars)[k:]` —— 必须逐位相等 (无同名脚本, 直接跑这段对比即可)。
 
 ====================================================================
 为什么比"展示层重算短窗口"更好
@@ -31,31 +33,21 @@ per-indicator 锚点)。此前 MACD 专门做了一个 `anchor=(ef,es,dea)` 参�
    "两套 MACD 靠注释约定一致" 的漂移温床 (见 app/utils/indicators.py)。
 
 ====================================================================
-声明式检查点 (2026-10-05 用户提议) —— **展示层对策略/指标完全无感**
+声明式检查点 / 前缀指纹失效 —— **已于 2026-10-06 (P6) 移除**
 ====================================================================
-分工:
-  策略侧  声明 `resume_points` (要哪些断点记忆点: 形式/格式/位置) +
-          提供 codec (snapshot/resume) 或复用标准注册表
-  展示层  只做「收集声明 → 预处理产出不透明 blob → 实时分发」,
-          **不 import 任何指标、不认识 macd/atr/g56 是什么**
+曾有的 `ResumePoint` 声明表、`RESUMABLE` 名字注册表、`ResumeBook` 与
+`bars_fingerprint`, 其**唯一**消费方是已退役的展示层 `core/present/`
+(原件在 del/20261006_core_present/)。展示层的断点语义改由 slice 契约承担:
+**策略自己在 `init_state/step` 里递推**, 展示层不再收集/分发不透明 blob。
 
-于是新增策略/新增指标时, 展示层**一行不改** —— 这是"策略不同方法相同"的最终形态。
-展示层唯一的通用职责是**断点对齐**与**失效判定**, 见下。
-
-====================================================================
-失效判定: 前缀数据指纹 (复权是其中一种触发原因)
-====================================================================
-`ResumeBook` 每条状态都带 `input_fp = bars_fingerprint(前缀)`。
-取用时与当前前缀指纹比对, 不符即**失效 → 调用方退回全量重算**。
-
-⚠️ 为什么不做"遇复权就重算"这条特例规则:
-   复权 (qfq) 会**改写历史 bar** ⇒ 前缀 close 序列变 ⇒ 指纹自然变。
-   而数据订正、窗口变动、换数据源同样会让指纹变。
-   **用"前缀变了就重算"这一条通则覆盖全部情形**, 展示层连"什么是复权"都不必知道。
-   (特例规则的坏处: 每新增一种数据变更来源就要补一条分支, 迟早漏。)
+本模块因此只剩**指标 codec 层**: 每指标的 `snapshot / resume / compute` 三件套。
+调用方 (core/runtime/functions.py 的 Ctx) **直接点名**调用 (如 `RES.macd_resume`),
+不再经名字注册表分发。
+⚠️ `snapshot` 与 `resume` 必须**成对保留**: 删任一侧, 另一侧就拿不到状态 /
+无法验证逐位等价 —— 不要因为"当前零调用"就砍掉其中一半。
 
 ====================================================================
-实现清单 (Ctx 的 4 个长记忆指标 = 标准注册表; 策略可自带私有 codec)
+实现清单 (Ctx 的 4 个长记忆指标; 每指标 snapshot/resume/compute 三件套)
 ====================================================================
   macd(fast,slow,signal)  state = (ema_fast, ema_slow, dea)      O(1)
   atr(n)   [Wilder]       state = (当前 atr, 是否已暖机)           O(1)
@@ -341,218 +333,3 @@ def kdj_resume(state, bars_post, n=9, ks=3, ds=3):
         dp = (2.0 / 3.0) * dp + (1.0 / 3.0) * kp
         K[j], D[j], J[j] = kp, dp, 3.0 * kp - 2.0 * dp
     return K, D, J
-
-
-# ================================================================
-# 4. 注册表 + ResumeBook
-# ================================================================
-
-#: 默认检查点清单 (kind, params) —— Ctx 的 4 个长记忆指标。
-#: 新增指标时改这里; 两处 build 都从本常量取, 不再各写一份。
-DEFAULT_SPECS: Tuple[Tuple[str, tuple], ...] = (
-    ("macd", (12, 26, 9)),
-    ("atr", (14,)),
-    ("boll", (20, 2.0)),
-    ("kdj", (9, 3, 3)),
-)
-
-
-# ================================================================
-# 3b. 声明式断点记忆点 (策略侧声明, 展示层不解释)
-# ================================================================
-
-
-@dataclass(frozen=True)
-class ResumePoint:
-    """断点记忆点声明 —— 由**策略**给出, 展示层只搬不解释。
-
-    字段:
-      kind     记忆点种类名 (标准注册表键, 或策略私有命名空间)
-      params   参数元组; 参数不同状态不可复用, 故进键
-      at       断点**位置**语义。当前唯一取值 "window_start"
-               = 「展示窗口首根之前那一根结束时」(见模块头对齐约定)
-      note     形式/格式/用途说明 —— 给读代码的人看, 展示层**不解析**
-      snapshot/resume  私有 codec (callable)。为 None 时回落标准注册表 RESUMABLE。
-               私有 codec 签名: snapshot(bars, *params) -> state
-                                resume(state, bars_post, *params) -> 序列
-
-    ⚠️ `kind` 建议带策略前缀 (如 "g56/g1") 命名私有记忆点, 避免跨策略撞名。
-    """
-    kind: str
-    params: tuple = ()
-    at: str = "window_start"
-    note: str = ""
-    snapshot: Optional[Callable] = None
-    resume: Optional[Callable] = None
-
-    @property
-    def key(self) -> Tuple:
-        """状态键 —— 与 `state_key()` 同形, 保证与 Ctx 的查找键一致。"""
-        return (self.kind,) + tuple(self.params)
-
-
-#: 策略侧声明挂载点 (strategies/base.StrategyBase.resume_points) 的元素类型。
-#: 展示层经 `core.present.resume_io.collect_points()` 收集, **不认识其语义**。
-
-
-def bars_fingerprint(bars) -> str:
-    """前缀数据指纹 (blake2b-8B)。
-
-    覆盖 (date, close) 全序列: 复权改写历史 close ⇒ 指纹变 ⇒ 检查点失效;
-    数据订正 / 窗口变动 / 换数据源同理。**一条通则覆盖全部情形**。
-    用 close 而非整根 bar: 各指标只读 close/high/low, 其中 close 是复权直接作用量,
-    且 (date, close) 已足以区分任何一次历史改写 (改 high/low 不改 close 不影响
-    复权语义; 若未来需要更严, 换成整根 hash 即可, 接口不变)。
-    """
-    import hashlib as _h
-    import struct as _st
-    h = _h.blake2b(digest_size=8)
-    for b in bars:
-        h.update(str(b.get("time") or "")[:10].encode("ascii", "replace"))
-        h.update(_st.pack("<d", float(b.get("close") or 0.0)))
-    return h.hexdigest()
-
-
-RESUMABLE: Dict[str, Tuple[Callable, Callable, Callable]] = {
-    "macd": (macd_snapshot, macd_resume, macd_compute),
-    "atr": (atr_snapshot, atr_resume, atr_compute),
-    "boll": (boll_snapshot, boll_resume, boll_compute),
-    "kdj": (kdj_snapshot, kdj_resume, kdj_compute),
-}
-
-
-def _default_points() -> Tuple["ResumePoint", ...]:
-    """Ctx 的 4 个标准指标作为默认声明 (未声明 resume_points 的策略用)。"""
-    return tuple(ResumePoint(k, p) for k, p in DEFAULT_SPECS)
-
-
-def _snap_point(p: "ResumePoint", bars):
-    """按声明取 snapshot: 私有 codec 优先, 否则标准注册表。"""
-    if p.snapshot is not None:
-        return p.snapshot(bars, *p.params)
-    return snapshot(p.kind, bars, *p.params)
-
-
-def resume_point(p: "ResumePoint", state, bars_post):
-    """按声明取 resume: 私有 codec 优先, 否则标准注册表。"""
-    if p.resume is not None:
-        return p.resume(state, bars_post, *p.params)
-    return resume(p.kind, state, bars_post, *p.params)
-
-
-def state_key(kind: str, *params) -> Tuple:
-    """检查点键。kind + 参数元组 —— 参数不同状态不可复用。"""
-    return (kind,) + tuple(params)
-
-
-def snapshot(kind: str, bars, *params):
-    fn = RESUMABLE[kind][0]
-    return fn(bars, *params)
-
-
-def resume(kind: str, state, bars_post, *params):
-    fn = RESUMABLE[kind][1]
-    return fn(state, bars_post, *params)
-
-
-def compute(kind: str, bars, *params):
-    fn = RESUMABLE[kind][2]
-    return fn(bars, *params)
-
-
-class ResumeBook:
-    """每票一份检查点 (断点续传的"断点位置状态记忆")。
-
-    由**预处理**产出、**实时**消费:
-      预处理: book = ResumeBook.build(code, long_bars)   # 断点 = long_bars 末根
-      实时  : book.get(code, "macd", fast, slow, signal) → state
-              → resume(state, bars_after, ...) 只算增量
-
-    ⚠️ 对齐约定: state 的语义是"传给 resume 的 bars_post[0] **之前**那一根结束时"的状态。
-       所以预处理取 `long_bars` 的状态、实时传的 `bars_post` 必须**紧接** long_bars 末根
-       (中间不能空、不能重叠)。中间空了 ⇒ 值错; 重叠了 ⇒ 重复计入。
-    """
-
-    def __init__(self, break_date: str = ""):
-        self.break_date = break_date
-        self._st: Dict[Tuple[str, str, Tuple], Any] = {}
-        #: 每票的**前缀数据指纹** (复权/数据修订检测, 见模块头"失效判定")
-        self.fp: Dict[str, str] = {}
-        #: 指纹失效次数 (可观测性: 频繁失效说明预处理断点不稳)
-        self.stale_hits = 0
-
-    def put(self, code: str, kind: str, *params, state: Any, input_fp: str = "") -> None:
-        self._st[(code, kind, tuple(params))] = state
-        if input_fp:
-            self.fp[code] = input_fp
-
-    def get(self, code: str, kind: str, *params, default: Any = None) -> Any:
-        return self._st.get((code, kind, tuple(params)), default)
-
-    def is_stale(self, code: str, bars_prefix) -> bool:
-        """前缀指纹是否已变 (复权 / 数据订正 / 窗口变动)。变了 = 检查点不可用。
-
-        Returns:
-            bool: True = 失效, 调用方应退回全量重算。
-        """
-        want = self.fp.get(code)
-        if not want:
-            return False                      # 未记指纹 → 不判定 (调用方自担)
-        if want == bars_fingerprint(bars_prefix):
-            return False
-        self.stale_hits += 1
-        return True
-
-    def mark_stale(self, code: str) -> None:
-        """显式判废 (预处理发现复权/数据修订时调用), 该票全部记忆点作废。"""
-        for k in [k for k in self._st if k[0] == code]:
-            self._st.pop(k, None)
-        self.fp.pop(code, None)
-        self.stale_hits += 1
-
-    def __len__(self) -> int:
-        return len(self._st)
-
-    def as_ctx_dict(self, code: str) -> Dict[tuple, Any]:
-        """导出成 **Ctx.resume 期望的形状**: `{(kind, *params): state}`。
-
-        ⚠️ 这是唯一的形状适配点, **不要**自己拼 dict ——
-           `get()` 返回的是裸 state, 直接 `{kind: state}` 组装会得到
-           `{str: state}` 而 Ctx 查的是 `{tuple: state}` ⇒ 全部取到 None,
-           **静默退回短窗全量重算** (值错但不报错)。
-           2026-10-05 实测踩过一次, 表现为"三个指标同时不等价"的假象。
-        """
-        pre = f"{code}\x00"
-        out: Dict[tuple, Any] = {}
-        for (c, kind, params), st in self._st.items():
-            if c == code:
-                out[(kind,) + tuple(params)] = st
-        return out
-
-    # ---- 构造: 从长窗口一次算出全部检查点 ----
-    @classmethod
-    def build(cls, code: str, bars, break_date: str = "",
-              points: Sequence["ResumePoint"] = ()) -> "ResumeBook":
-        """为单票建检查点。
-
-        points: `ResumePoint` 声明序列 (策略侧给)。缺省建 Ctx 的 4 个标准指标。
-        """
-        book = cls(break_date)
-        fp = bars_fingerprint(bars)
-        for p in (points or _default_points()):
-            book.put(code, p.kind, *p.params,
-                     state=_snap_point(p, bars), input_fp=fp)
-        return book
-
-    @classmethod
-    def build_many(cls, bars_by_code: Dict[str, list], break_date: str = "",
-                   points: Sequence["ResumePoint"] = ()) -> "ResumeBook":
-        """全市场批量建检查点 (预处理用)。"""
-        book = cls(break_date)
-        pts = tuple(points or _default_points())
-        for code, bars in bars_by_code.items():
-            fp = bars_fingerprint(bars)
-            for p in pts:
-                book.put(code, p.kind, *p.params,
-                         state=_snap_point(p, bars), input_fp=fp)
-        return book
