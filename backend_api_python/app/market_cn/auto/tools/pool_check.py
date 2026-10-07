@@ -423,7 +423,10 @@ def _demo():
     v2, r2 = verdict(trades2, kept2, dropped2)
     print(f"\n反例: 深弱池实差 → 裁定 {v2} | {r2}")
     assert v2 == "VETO", "反例应判定 VETO"
-    print("\n✅ 自测通过: MIGRATE/VETO 裁定逻辑正确")
+    # 2026-10-07: 原为 emoji ✅ —— Windows 控制台默认 GBK, U+2705 不在 GBK 里 ⇒
+    #   print 直接 UnicodeEncodeError, `--demo` 自测在 Windows 上永远退出码非 0
+    #   (裁定逻辑其实跑完了)。CLI 输出只用 ASCII 标记 / 中文。
+    print("\n[OK] 自测通过: MIGRATE/VETO 判定逻辑正确")
     return 0
 
 

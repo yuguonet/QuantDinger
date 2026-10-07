@@ -137,11 +137,46 @@ def _load_bars(codes, days, progress=True):
 
 
 def _date_axis(bars_map):
-    """交易日轴 (取样本最长的那只为轴; 个股停牌日缺失不影响交易日集合)。"""
+    """交易日轴 —— 全部票日期的**并集** ∩ 正规交易日历。
+
+    2026-10-07 修。原实现 = `max(bars_map.values(), key=len)` (**取样本最长的那只为轴**),
+    注释写"个股停牌日缺失不影响交易日集合" —— 恰恰相反: 那只票的日历是它**私有**的,
+    长期停牌 / 退市前停更 / 上市晚 ⇒ 轴上直接缺掉那些日子。而轴是**全局基准**:
+      - `win_dates` / `lo`,`hi`: 决定枚举哪些日期 ⇒ 缺的日子上**全市场不产信号**;
+      - `last_date` (686 行): 判 `exit_today` vs `closed` ⇒ 轴末日偏早会让
+        "当日该平账"的行被错判成 closed。
+    改为并集: 单票缺某日只影响它自己取不到 bar (已有 continue 兜住), 不再污染全局轴;
+    再用 `utils.trading_calendar` 滤掉非交易日脏行 (周末行 / 退市后补数据行)。
+
+    ⚠ 日历的适用范围只能到**它自己的末日**: 超出日历范围的日期可能是日历过期后的
+      新交易日, 也可能是脏行 (如某票被写进非交易日), 二者**无法区分** —— 此时偏向
+      "保留" (理由见下)。日历只负责剔除它**认得**的那段区间里的非交易日。
+
+      失败方向的选择 (这是本函数的红线): "轴缺交易日" 的后果远重于 "轴多一个可疑日期"
+        - 缺交易日 ⇒ 那些日子**全市场不产信号**, 且 last_date 偏早把 exit_today 误判成
+          closed —— 两者都静默, 且直接伤资金账。
+        - 多一个可疑日期 ⇒ 该日正常枚举一遍 (绝大多数票取不到 bar → continue), 无损。
+      ⇒ 故: 日历未覆盖到的尾部一律保留; 日历整段不可用时回退并集; 绝不因日历让轴清零。
+    """
     if not bars_map:
         return []
-    ref = max(bars_map.values(), key=len)
-    return sorted({str(b["time"])[:10] for b in ref})
+    union = {str(b["time"])[:10] for bars in bars_map.values() for b in bars}
+    if not union:
+        return []
+    try:
+        from app.utils.trading_calendar import is_trading_day
+        axis = sorted(d for d in union if is_trading_day(d))
+        if axis:
+            tail = sorted(d for d in union if d > axis[-1])   # 日历未覆盖区 → 保留
+            if tail:
+                logger.warning("[rebuild] 交易日历末日 %s 之后的 %d 个日期未经交易日历校验 "
+                               "(日历过期?) → 保留进轴 (缺交易日的后果远大于多留可疑日期): %s",
+                               axis[-1], len(tail), tail)
+            return axis + tail
+        logger.warning("[rebuild] 交易日历与数据日期无交集 → 回退并集做轴")
+    except Exception as e:
+        logger.warning("[rebuild] 交易日历不可用 (%s) → 回退并集做轴", e)
+    return sorted(union)
 
 
 def _index_of(bars):
@@ -657,9 +692,15 @@ def replay_ledger(expected, meta, bars_map, idx_map):
             continue
 
         # ---- 逐日出场重放 (monitor step4, 首次 exit 即出场) ----
+        # ⚠ 起点必须是 **d1+1 (入场次日起)**, 不能是 d1 —— A股 T+1: 当日买入当日不可卖,
+        #   出场重放若在入场当日(j=d1)评估, 就是回放一个实盘根本不可能发生的卖出。
+        #   这不是纯理论: base/v1 的默认 exit_decision 的**止损分支没有 held 守卫**
+        #   (见 base.py:518 / v1.py:287 —— 只有"追踪"判了 held>1), 于是 j=d1 时只要
+        #   当日 low 触及止损线就当场"卖出" ⇒ 账本上出现与实盘不可比的畸形收益。
+        #   (d= 计数与 core/exit_engines 的 min_d 一致: j=d1 是 d=1 入场当日, d1+1 是 d=2。)
         hit = None
         exit_err = None
-        for j in range(d1, len(bars)):
+        for j in range(d1 + 1, len(bars)):
             try:
                 edec = strat.exit_decision(r, {"mode": "day_close",
                                                "bars": bars[:j + 1], "entry_idx": d1})
