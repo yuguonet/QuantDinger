@@ -416,13 +416,17 @@ def retire_unfilled(keys, reasons=None):
         reasons: {key: 作废原因文案}
 
     Returns:
-        dict: {策略key: 作废行数}
+        dict: {策略key: 作废行数}。**store 侧失败时返回 {}** —— 该失败由
+            ``store.retire_unfilled`` 打 ERROR, 这里不再假装成 0 行的成功结果。
     """
     keys = [k for k in (keys or []) if k]
     if not keys:
         return {}
     from app.market_cn.auto.store import retire_unfilled as _retire
     rows = _retire(keys=keys, reason_by_key=reasons or {})
+    if rows is None:        # 2026-10-07 (P2): None=失败/未知, 不可与"没有这样的行"混同
+        logger.error("[auto_startup] 作废未入场行**失败**(非「无需作废」): %s", keys)
+        return {}
     retired = {k: 0 for k in keys}
     for r in rows:
         k = r.get("strategy")

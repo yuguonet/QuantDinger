@@ -88,6 +88,16 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
       - 到期: hold_days 收盘; 视野不足 → None;
       - peak_return_pct 自入场日起累计 (统计口径, 不影响成交)。
 
+    2026-10-07 补 T+1/跌停对齐 (此前本引擎是登记表里唯一**不齐**的一个,
+    run_trail_stop 早已有这三条, g56 独缺 ⇒ 回测按"跌停价成交", 实盘卖不掉):
+      ① 一字跌停日整日不可成交 → pending_dn, 顺延次日开盘卖;
+      ② 止损成交价贴跌停 → 同样顺延 (走 core.exec 原语, 与 run_trail_stop 同源);
+      ③ 到期块补 min_d 守卫 —— hold_days < min_d 时原实现会按入场当日收盘卖出
+         (违反 T+1; run_trail_stop 的 A7a 已修, 本引擎漏修)。g56 默认 HOLD_DAYS=7
+         不触发, 但 params 覆盖 hold_days=1 即踩中。
+      ④ 顺延到数据尽头仍无处可卖 → None (与 run_trail_stop A7b 同语义, 不把
+         "无处可卖"当正常到期计入统计)。
+
     side="short" 预留 (direction=long_short 市场): 止损线反向, 涨停不可买不影响卖。
     """
     if entry_price <= 0 or entry_idx >= len(bars) or hold_days is None:
@@ -102,23 +112,66 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
     stop_line = entry_price * (1 + stop_loss / 100)
     peak = float(bars[entry_idx].get("high") or entry_price)
     min_d = _min_sell_day(sp)   # A股 T+1 → 2; t0 市场 → 1 (可当日平)
+    pending_dn = False
+    exit_p, exit_d = 0.0, 0
+    data_exhausted = False
+
     for d in range(min_d, hold_days + 1):
         i = entry_idx + d - 1
         if i >= n:
-            return None
-        peak = max(peak, float(bars[i].get("high") or 0))
-        low = float(bars[i].get("low") or 0)
+            data_exhausted = True
+            break
+        b = bars[i]
+        peak = max(peak, float(b.get("high") or 0))
+        dn = _dn_at(bars, i, board_type, sp)
+        if pending_dn:                       # 前一日封死 → 次日开盘卖 (①)
+            exit_p, exit_d = float(b.get("open") or 0), d
+            pending_dn = False
+            break
+        if is_one_word_limit_dn(b, dn, sp):  # ① 一字跌停: 整日不可成交
+            pending_dn = True
+            continue
+        low = float(b.get("low") or 0)
         if low <= stop_line:
-            fill = min(float(bars[i].get("open") or 0), stop_line)
-            return {"exit_day": d, "exit_price": round(fill, 3),
-                    "return_pct": round((fill / entry_price - 1) * 100, 2),
+            fill = fill_on_gap(float(b.get("open") or 0), stop_line)
+            if fill_blocked_by_limit_dn(fill, dn, sp):   # ② 成交价贴跌停 → 顺延
+                pending_dn = True
+                continue
+            exit_p, exit_d = fill, d
+            break
+
+    if not exit_d and not pending_dn and not data_exhausted:
+        if hold_days < min_d:                # ③ T+1: 整个视野都不可卖
+            return None
+        i = entry_idx + hold_days - 1
+        if i >= n:
+            return None
+        dn = _dn_at(bars, i, board_type, sp)
+        if is_one_word_limit_dn(bars[i], dn, sp):   # 到期日封死 → 顺延
+            pending_dn = True
+            exit_d = hold_days
+        else:
+            px = float(bars[i].get("close") or 0)
+            return {"exit_day": hold_days, "exit_price": round(px, 3),
+                    "return_pct": round((px / entry_price - 1) * 100, 2),
                     "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
-    i = entry_idx + hold_days - 1
-    if i >= n:
+
+    if pending_dn:                           # 尾块: 找第一个非一字跌停日开盘卖出
+        nxt = entry_idx + exit_d + 1
+        while nxt < n:
+            nb = bars[nxt]
+            dn2 = _dn_at(bars, nxt, board_type, sp)
+            if dn2 is not None and is_one_word_limit_dn(nb, dn2, sp):
+                nxt += 1
+                continue
+            exit_p, exit_d = float(nb.get("open") or 0), nxt - entry_idx + 1
+            pending_dn = False
+            break
+
+    if pending_dn or data_exhausted or not exit_d:   # ④ 视野不足 → None
         return None
-    px = float(bars[i].get("close") or 0)
-    return {"exit_day": hold_days, "exit_price": round(px, 3),
-            "return_pct": round((px / entry_price - 1) * 100, 2),
+    return {"exit_day": exit_d, "exit_price": round(exit_p, 3),
+            "return_pct": round((exit_p / entry_price - 1) * 100, 2),
             "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
 
 

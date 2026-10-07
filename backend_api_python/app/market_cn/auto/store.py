@@ -464,6 +464,8 @@ def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信�
     Returns:
         list[dict]: 被作废/将被作废的行 ``{id, strategy, code, trade_date}``。
         调用方按 strategy 分组即得 {key: count}。
+        ⚠ **None = 失败/未知** (2026-10-07): 空 list 严格表示"确实没有这样的行",
+          两者不再混同 —— 详见下面 except 的注释。**调用方必须判 `is None`**。
     """
     if not keys and not ids:
         return []
@@ -507,8 +509,15 @@ def retire_unfilled(keys=None, ids=None, reason="策略已停用, 未入场信�
             db.commit()
             cur.close()
     except Exception as e:
-        logger.warning("[store.retire_unfilled] 作废失败: %s", e)
-        return []
+        # 2026-10-07 (P2): 原实现吞异常后 `return []` —— **失败与"确实没有未入场行"
+        #   不可区分**, 而它处在一条会把错误放大的链上:
+        #     ① rebuild dry_run 拿到 [] ⇒ plan 认为"无需清扫" ⇒ apply 完全不执行,
+        #        行继续挂在 watch_pending (下一步 diff 仍报 missing/ghost, 越差越大);
+        #     ② 调用方的 `len(rows)` 把失败记成 **0 行**, 审计报告看不出任何异常。
+        #   ⇒ 改成 ERROR + 返回 **None** (刻意不满足 Sequence ⇒ 漏改的调用方会当场
+        #      TypeError 而不是静默地假装 0 行)。调用方见 monitor/startup/rebuild。
+        logger.error("[store.retire_unfilled] 作废失败(返回 None 表示未知, 非「无此行」): %s", e)
+        return None
     return rows
 
 

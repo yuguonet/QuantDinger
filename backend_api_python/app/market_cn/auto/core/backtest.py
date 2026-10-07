@@ -222,8 +222,16 @@ def _refine_intraday(strat, trades, bars_batch, daily_fn, *, days, start_date,
                 t["exec_basis"] = "daily"      # 窗口内有日缺 1m → 整笔回落 (不混合口径)
                 counts["daily"] += 1
                 continue
-            res = strat.intraday_replay(bars, ei, float(bars[ei]["open"]), code=code,
-                                        board_type=None, minute_by_date=mbd)
+            # 2026-10-07: 补传 `entry_gate` —— break 的 intraday_replay 靠它区分
+            #   核心/高板通道的甜点阈值 (100) 与其余 (95); 不传 ⇒ 恒取 95 ⇒ 1m 腿与
+            #   日线腿出场点分叉。(`params` 本路径不可得, 由策略侧回退 BOARD_PARAMS。)
+            # 2026-10-07: 入场价改取该笔记录的 `t["entry_price"]` —— 原写 `bars[ei]["open"]`
+            #   ⇒ close 模式入场 (如 dragon D0 收盘买) 的票在 1m 腿上被**静默改锚到当日
+            #   开盘价**, 与日线腿同一笔的入场价不一致 (收益不可比, peak/止损阈值全部
+            #   按错基准计算)。1m 腿只是"出场重放", 入场价必须与日线腿逐笔同一。
+            res = strat.intraday_replay(bars, ei, float(t["entry_price"]), code=code,
+                                        board_type=None, minute_by_date=mbd,
+                                        entry_gate=t.get("entry_gate"))
             if not res:
                 t["exec_basis"] = "daily"
                 counts["daily"] += 1

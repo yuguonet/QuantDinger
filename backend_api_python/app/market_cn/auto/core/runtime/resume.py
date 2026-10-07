@@ -289,18 +289,26 @@ def boll_resume(state, bars_post, n=20, mult=2.0):
 
 
 def kdj_compute(bars, n=9, ks=3, ds=3):
-    """全量 KDJ (与 Ctx._kdj 逐值一致)。返回 (K, D, J)。"""
+    """全量 KDJ (与 Ctx._kdj 逐值一致)。返回 (K, D, J)。
+
+    2026-10-07 修复: `ks`/`ds` 原先是**形参空转** —— 收下却不用, 递推硬编码
+    `2/3`、`1/3`, 于是 kdj_k(n=9, ks=9) 与 ks=3 得到同一条 K 线 (静默忽略实参)。
+    现按标准式 K = (ks-1)/ks·K' + 1/ks·RSV、 D = (ds-1)/ds·D' + 1/ds·K。
+    默认 ks=ds=3 ⇒ `(ks-1)/ks` 就是 `2.0/3.0` (分子同为 2.0), 浮点**逐位**不变。
+    """
     h, l, c = hlc_of(bars)
     m = len(c)
     K, D, J = [0.0] * m, [0.0] * m, [0.0] * m
     k_prev, d_prev = 50.0, 50.0
+    k_decay, k_w = (ks - 1.0) / ks, 1.0 / ks
+    d_decay, d_w = (ds - 1.0) / ds, 1.0 / ds
     for j in range(m):
         lo = max(0, j - n + 1)
-        hi = max(h[lo: j + 1]) if j >= 0 else 0.0
-        low = min(l[lo: j + 1]) if j >= 0 else 0.0
+        hi = max(h[lo: j + 1])
+        low = min(l[lo: j + 1])
         rsv = ((c[j] - low) / (hi - low) * 100.0) if hi > low else 50.0
-        k_prev = (2.0 / 3.0) * k_prev + (1.0 / 3.0) * rsv
-        d_prev = (2.0 / 3.0) * d_prev + (1.0 / 3.0) * k_prev
+        k_prev = k_decay * k_prev + k_w * rsv
+        d_prev = d_decay * d_prev + d_w * k_prev
         K[j], D[j], J[j] = k_prev, d_prev, 3.0 * k_prev - 2.0 * d_prev
     return K, D, J
 
@@ -323,13 +331,15 @@ def kdj_resume(state, bars_post, n=9, ks=3, ds=3):
     m = len(c)
     K, D, J = [0.0] * m, [0.0] * m, [0.0] * m
     kp, dp = float(k_prev), float(d_prev)
+    k_decay, k_w = (ks - 1.0) / ks, 1.0 / ks      # 同上: ks/ds 生效, 默认逐位不变
+    d_decay, d_w = (ds - 1.0) / ds, 1.0 / ds
     for j in range(m):
         hi = off + j
         lo = max(0, hi - n + 1)
         hh = max(wh[lo: hi + 1])
         ll = min(wl[lo: hi + 1])
         rsv = ((wc[hi] - ll) / (hh - ll) * 100.0) if hh > ll else 50.0
-        kp = (2.0 / 3.0) * kp + (1.0 / 3.0) * rsv
-        dp = (2.0 / 3.0) * dp + (1.0 / 3.0) * kp
+        kp = k_decay * kp + k_w * rsv
+        dp = d_decay * dp + d_w * kp
         K[j], D[j], J[j] = kp, dp, 3.0 * kp - 2.0 * dp
     return K, D, J

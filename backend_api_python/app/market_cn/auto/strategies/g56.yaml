@@ -40,6 +40,9 @@ params:                        # 与 strategies/g56.py 冻结常量同值 (逐�
   # ---- 出场阈值 (2026-09-23 补: 原硬编码于 g56.py 模块常量) ----
   hold_days: 7                 # = g56.HOLD_DAYS
   stop_loss: -8.0              # = g56.STOP_LOSS
+  # ---- 规则门阈值 (2026-10-07 补: 生产链早有此门, 门表漏配 ⇒ 见下方 dist_ma20 门) ----
+  dist_ma20_min: -4.0          # = g56.DIST_MA20_MIN / DEFAULT_PARAMS / config.json params
+                               #   (三者同为 -4.0; 300d 对照与归因见 g56.py:98-108)
 
 # 门表：一行一门。G1 池成员 (trend/atr/big20/finite/warmup) + ④ + ⑤ (分板块 regime)。
 # NaN 哨兵：缺值/暖机/池缺失 → 数值门自然失败 (与 _g1_mask 的 isfinite + m[:68]=False 同效)。
@@ -60,6 +63,12 @@ gates:
      expr: "board_is_gem() == 1 or (pool_stat('rmed') > pk('main_rmed_min') and feat('pctb') <= pk('main_pctb_max'))"}
   - {id: regime_gem, name: ⑤板块状态(20cm), role: qualify, needs_d0: 0, enabled: 1,
      expr: "board_is_main() == 1 or (pool_stat('score_r') > pk('gem_score_min') and feat('dif0') <= 0)"}
+  # 2026-10-07 补齐: 镜像 `_g56_gate` 尾部的 dist_ma20 规则门 (2026-09-25 引入, 生产侧
+  # 恒定生效)。此前**门表漏配** ⇒ tools/(explain/gate_funnel/gate_try) 经 load_strategy
+  # 跑出的信号集比实盘宽 (少了这道硬门), 本文件头部"逐笔等价"承诺不成立。
+  # 取值为 NaN → 比较 False ⇒ 拒绝, 与 _g56_gate 的 `not (dv == dv)` 同效。
+  - {id: dist_ma20, name: ⑥距MA20不过深, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "feat('dist_ma20') >= dist_ma20_min"}
 
 # 信号展示字段 (门通过后求值; 与参考版 trades 逐字段一致)
 signal:

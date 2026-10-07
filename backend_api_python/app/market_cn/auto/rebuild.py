@@ -210,16 +210,32 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
     #   反过来若逐日调 scan_signals: g56 的池锚每天变 ⇒ 单槽缓存每票每天重建全市场池。
     per_date = defaultdict(list)         # date -> [(key, Signal)]
     t_scan = time.time()
+    # 2026-10-07 (P2): 原先这里只打 DEBUG ⇒ 某策略的 scan_days 有 bug 时对全部 5235 票
+    #   逐个抛、逐个跳过, 最终**零信号且零告警**; 而缺失信号的直接下游是 audit/diff:
+    #   该策略的现状行会被判 ghost ⇒ `--apply` 时批量作废 + 清空自选股组 (即这条链的
+    #   "失败被静默 → 被 diff 放大" 的第二环)。现与 scan.py 同口径: 每策略前 3 次
+    #   WARNING, 之后降 DEBUG 防洪水, 末尾必有一条 ERROR 汇总。
+    err_by_key: dict[str, int] = {}
     for code, bars in bars_map.items():
         for key, strat in active.items():
             try:
                 sigs = strat.scan_days(bars, code, lo_date=lo, hi_date=hi)
             except Exception as e:
-                logger.debug("[rebuild] %s %s scan_days 异常: %s", code, key, e)
+                _n = err_by_key.get(key, 0) + 1
+                err_by_key[key] = _n
+                if _n <= 3:
+                    logger.warning("[rebuild] %s %s scan_days 异常(%s), 跳过该票", code, key, e)
+                else:
+                    logger.debug("[rebuild] %s %s scan_days 异常(%s), 跳过该票", code, key, e)
                 continue
             for s in sigs or []:
                 per_date[str(s.time)[:10]].append((key, s))
     logger.info("[rebuild] 判定完成 %.0fs (统一 scan_days 契约)", time.time() - t_scan)
+    if err_by_key:
+        logger.error("[rebuild] scan_days 单票异常共 %d 次 —— 该策略信号疑似缺失, "
+                     "**跑 --apply 前务必核实** (缺信号会被 diff 判成 ghost 批量作废): %s",
+                     sum(err_by_key.values()),
+                     ", ".join(f"{k}={v}" for k, v in sorted(err_by_key.items())))
 
     # ---- 逐日: U1~U4 → 同族去重 → daily_limit (与 run_scan 同序) ----
     # U1~U4 只对**已产出的信号**切片 (信号数远小于 5235×30), 不为每票每天切一次。
@@ -368,7 +384,10 @@ def build_plan(expected, actual, meta):
     disabled_sweep = []
     if disabled:
         from app.market_cn.auto.store import retire_unfilled as _retire
-        disabled_sweep = _retire(keys=disabled, dry_run=True)
+        _res = _retire(keys=disabled, dry_run=True)
+        # 2026-10-07 (P2): **None=失败**, 必须与 [] (=确实没有要作废的行) 区分 ——
+        #   退化成 [] 会让 apply 认为"无需清扫" ⇒ 静默跳过, 下次 diff 报同一批差。
+        disabled_sweep = None if _res is None else _res
 
     # ---- B. 窗口内 missing / ghost / drift ----
     def _settled(row):
@@ -446,10 +465,17 @@ def apply_plan(plan, dry_run=True):
 
     # ---- A. 停用策略未入场行 → expired (全表) ----
     # 2026-09-26: 走 store.retire_unfilled 唯一实现 (复核 state/entry_date 后写)。
-    if plan["disabled_sweep"]:
+    # 2026-10-07 (P2): `None` = dry_run 曾**失败** ⇒ 本次未清扫, 须留痕; `[]` = 无需
+    #   清扫的**正常**结果。不区分 ⇒ 下次 diff 持续报同一批 missing/ghost 且无根因。
+    if plan.get("disabled_sweep") is None:
+        stat["sweep_failed"] = True
+    elif plan["disabled_sweep"]:
         from app.market_cn.auto.store import retire_unfilled as _retire
         swept = _retire(ids=[r["id"] for r in plan["disabled_sweep"]])
-        stat["sweep_expired"] = len(swept)
+        if swept is None:
+            stat["sweep_failed"] = True
+        else:
+            stat["sweep_expired"] = len(swept)
 
     from app.utils.db import get_db_connection
     import json as _json
@@ -732,7 +758,9 @@ def build_ledger_plan(replay, actual, meta):
     disabled_sweep = []
     if disabled:
         from app.market_cn.auto.store import retire_unfilled as _retire
-        disabled_sweep = _retire(keys=disabled, dry_run=True)
+        _res = _retire(keys=disabled, dry_run=True)
+        # None=失败 (≠ 没有要作废的行), 传下去由 apply 显式留痕 —— 见 apply 同键注释
+        disabled_sweep = None if _res is None else _res
 
     return {"upsert": upsert, "insert": insert, "expire": expire,
             "disabled_sweep": disabled_sweep, "keep_disabled": keep_disabled,
@@ -756,10 +784,16 @@ def apply_ledger_plan(plan, dry_run=True):
 
     # ---- 停用策略未入场行 → expired (全表) ----
     # 2026-09-26: 走 store.retire_unfilled 唯一实现。
-    if plan["disabled_sweep"]:
+    # 2026-10-07 (P2): None=清扫失败(须留痕) vs []=无需清扫(正常), 二者不得混同。
+    if plan.get("disabled_sweep") is None:
+        stat["sweep_failed"] = True
+    elif plan["disabled_sweep"]:
         from app.market_cn.auto.store import retire_unfilled as _retire
         swept = _retire(ids=[r["id"] for r in plan["disabled_sweep"]])
-        stat["sweep_expired"] = len(swept)
+        if swept is None:
+            stat["sweep_failed"] = True
+        else:
+            stat["sweep_expired"] = len(swept)
 
     from app.utils.db import get_db_connection
     import json as _json

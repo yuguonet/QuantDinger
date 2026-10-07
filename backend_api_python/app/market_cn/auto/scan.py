@@ -50,7 +50,12 @@ _BACKEND_ROOT_DEFAULT = None  # 由 app 包上下文提供
 
 _scan_thread_lock = threading.Lock()
 _SCAN_LOCK_NAME = "run_scan"
-_SCAN_LOCK_STALE_SEC = 900   # run_scan 最长 wait_data 3600 会分段; 900s 卡死可回收
+#: ⚠ stale 必须配合**续约**使用 (2026-10-07): run_scan 内部 wait_data 最长 3600s,
+#:   远大于 900s ⇒ 合法持有者在等数据时会被第二个进程当成 dead 持有者 DELETE 掉
+#:   ⇒ 双进程并发 run_scan, 恰是 2026-09-18 DELETE+INSERT 死锁丢信号的复现条件。
+#:   故等待循环每轮 `_db_touch_scan_lock` 把 acquired_at 拨到 NOW() (周期 300s
+#:   ≪ 900s): **只有真卡死的进程才被回收, 合法等待永不被摘**, 短 stale 得以保留。
+_SCAN_LOCK_STALE_SEC = 900
 
 
 def _scan_holder() -> str:
@@ -88,6 +93,28 @@ def _db_try_scan_lock(holder: str) -> bool:
         return True   # DB 不可用时不挡扫描 —— 单 worker 模型下 threading 锁已够
 
 
+def _db_touch_scan_lock(holder: str) -> None:
+    """跨进程锁**续约** (2026-10-07 P1): 把本持有者的 acquired_at 拨到 NOW()。
+
+    没有它 ⇒ wait_data 等到 900s 时锁行"过期" ⇒ 后来的进程 DELETE+INSERT 抢到锁
+    ⇒ 两个进程同时 run_scan (注释头部要防的那件事)。失败不挡扫描: 最坏退回原状
+    (靠 stale 回收), 且打一条 warning —— 静默失效不再无声。
+    """
+    from app.utils.db import get_db_connection
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                "UPDATE qd_scan_lock SET acquired_at = NOW() "
+                "WHERE lock_name = %s AND holder = %s",
+                (_SCAN_LOCK_NAME, holder),
+            )
+            db.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning("[scan_lock] 续约失败(超 stale 后可能被他人回收): %s", e)
+
+
 def _db_release_scan_lock(holder: str):
     from app.utils.db import get_db_connection
     try:
@@ -103,9 +130,16 @@ def _db_release_scan_lock(holder: str):
         logger.warning("[scan_lock] 释放 DB 锁失败(按超时回收): %s", e)
 
 
+#: 本进程当前持有的跨进程锁标识 (**供 wait_data 续约用**, 2026-10-07)。
+#: 只在 `_scan_mutex` 持有期间非空 —— 与其自己 ctx 传递 holder 相比, 不改 API
+#: (`yield True/False` 的调用点全仓若干处), 续约方只读这一个模块级变量。
+_HELD_LOCK_HOLDER: str | None = None
+
+
 @contextmanager
 def _scan_mutex():
     """抢全市场扫描互斥。yield True=持有; False=他人在扫, 调用方应 status=busy 重试。"""
+    global _HELD_LOCK_HOLDER
     if not _scan_thread_lock.acquire(blocking=False):
         yield False
         return
@@ -114,8 +148,10 @@ def _scan_mutex():
         if not _db_try_scan_lock(holder):
             yield False
             return
+        _HELD_LOCK_HOLDER = holder
         yield True
     finally:
+        _HELD_LOCK_HOLDER = None
         try:
             _db_release_scan_lock(holder)
         finally:
@@ -222,8 +258,13 @@ def _prewarm_pools(active, bars_by_code, target, logger=None):
     **5224 次单票 SQL / 25.9s**, 而批量路径只需 3.9s 计算 (取数已被 _prefetch_bars 覆盖)。
 
     ⚠ 锚必须对齐: g56 用 `str(bars[-1]["time"])[:10]` 当池锚, 而进入判定的票末根
-     恒 == target (早于 target 的已被 `continue` 跳过, 晚于的已截断) ⇒ 这里用 target
-     预热即可命中; 若预热锚与判定锚不同 ⇒ 单槽缓存失效 ⇒ 全市场池被反复重建。
+     恒 == target ⇒ 这里用 target 预热即可命中; 若预热锚与判定锚不同 ⇒ 单槽缓存
+     失效 ⇒ 全市场池被反复重建 (26s/次 thrash)。
+     该前提由主循环 `_run_scan_locked` 的**单一不变量** (`bars[-1]["time"] != target
+     即 continue`) 保证 —— ★ 2026-10-07 前此不变量**未生效**: 只有"原始末根早于
+     target"被跳过, 截断后不复检 ⇒ target 日无 bar 的票带着 target-N 的锚进入判定
+     ⇒ 锚漂移 + 该票被"不含自己"的池评估 (百分位失真)。今后改动本预热的前提时,
+     务必回主循环核对那条不变量是否还在。
     """
     if not bars_by_code:
         return
@@ -494,6 +535,9 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
             if waited >= max_wait_sec:
                 logger.warning("[dragon_scan] 数据未就绪, 放弃本次 (target=%s)", target)
                 return {"status": "data_not_ready", "target": target}
+            # 持有期间每轮续约: 不续 ⇒ 等到 900s 时他人可回收本锁 ⇒ 并发 run_scan。
+            if _HELD_LOCK_HOLDER:
+                _db_touch_scan_lock(_HELD_LOCK_HOLDER)
             time.sleep(300)
             waited += 300
         logger.info("[dragon_scan] 数据就绪 (target=%s)", target)
@@ -512,24 +556,30 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
 
     rows = []
     t0 = time.time()
+    err_by_key: dict[str, int] = {}      # {策略: 本轮判定异常票数} → 见下方 finally 汇总
     try:
         for i, code in enumerate(codes):
             bars = bars_by_code.get(code)
             if bars is None:                    # 批量未覆盖 (新股/停牌/取数缺失) → 逐票兜底
                 bars = fetch_kline_db(code, days)
-            if not bars or len(bars) < 30:
+            if not bars:
                 continue
             # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
             if bars[-1]["time"] > target:
                 bars = [b for b in bars if b["time"] <= target]
-            elif bars[-1]["time"] < target:
-                # 2026-09-29 审计修复 (P1): 该股尚未回填到 target 日 (回填中途
-                # _data_ready 只看 000001) → 在 T-1 旧 bar 上判定会产出
-                # trade_date=target / signal_date=T-1 的错日幽灵信号 → 跳过。
-                # 残留限度: 被跳过的股若本轮后仍不回填, 不会补扫 (宜由数据就绪
-                # 闸门保证回填完整后再放行扫描)。
-                continue
-            if not bars:
+            # ⇒ **唯一不变量: 序列末根必须是 target 日** (原本两条分支各管一半)
+            #   2026-09-29 审计修复 (P1) 只做了一半: `elif bars[-1] < target: continue`
+            #   仅挡"原始末根早于 target"; 2026-10-07 补齐另一半 ——
+            #    该股 **target 日无 bar** (回填缺口 / 停牌跨过 target 但后面还有更晚
+            #    bar) 时, 截断让末根退到 target-N 且不再复检 ⇒ 在旧 bar 上判定,
+            #    产出 trade_date=target / 判定日=T-N 的**错日幽灵信号**, 恰是声称
+            #    已修的 D+1 白天补扫场景。
+            #    连锁: 该票 g56 池锚 = target-N ≠ 预热锚 target ⇒ 单槽 _POOL 反复
+            #    重建 (26s/次 thrash); 且被"不含自己"的横截面池判定 ⇒ 百分位失真。
+            #   另: 长度门槛一并挪到截断**之后** (原先在前, 门槛实际生效位置不一致)。
+            #   残留限度不变: 被跳过的股若本轮后仍不回填, 不会补扫 (宜由数据就绪
+            #   闸门保证回填完整后再放行扫描)。
+            if not bars or len(bars) < 30 or bars[-1]["time"] != target:
                 continue
             name = (stock_info.get(code) or {}).get("name", "")
             for key, strat in active.items():
@@ -546,7 +596,17 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
                         sigs = strat.scan_signals(bars, code, **_kw,
                                                   **strat_reg.params_override(key))
                 except Exception as e:
-                    logger.debug("[dragon_scan] %s %s 判定异常: %s", code, key, e)
+                    # 2026-10-07 (P2): 原为 DEBUG —— 生产 INFO 级别下**策略整静默**
+                    #   (无一行日志、无计数、无告警, 信号凭空少一批), 是本项目点名的
+                    #   "静默断链"同构。改: 每策略前 3 次打 WARNING (带 code/原因, 便于
+                    #   定位), 之后降级 DEBUG 防日志洪水 (单策略 bug 可命中全 5236 票);
+                    #   无论多少, 末尾必有 **一行汇总** (ERROR) —— 兜住"降级后没人看"。
+                    _n = err_by_key.get(key, 0) + 1
+                    err_by_key[key] = _n
+                    if _n <= 3:
+                        logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                    else:
+                        logger.debug("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
                     continue
                 # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
                 kept, last_u_fails = apply_unified_prefilter(
@@ -572,6 +632,11 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
     finally:
         for _pr in (live_probes or {}).values():
             _pr.close()
+        if err_by_key:
+            # 汇总必有: 降级 DEBUG 之后仍留一条可告警的痕迹 ⇒ 单策略异常不再是暗账
+            logger.error("[dragon_scan] 单票判定异常共 %d 次 (该策略信号可能缺失): %s",
+                         sum(err_by_key.values()),
+                         ", ".join(f"{k}={v}" for k, v in sorted(err_by_key.items())))
 
     # 2026-09-28 A: 大盘资金流环境门 —— **先于限额截断** (reduce 砍名额)
     env_info = {}

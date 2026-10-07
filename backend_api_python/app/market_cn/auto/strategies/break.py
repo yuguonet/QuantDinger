@@ -42,14 +42,19 @@ STRATEGY_LABEL = "断板"
 
 # 板块参数 (策略专用出场参数, 唯一定义在本文件; backtest.py 旧份已删, 2026-09-10 晚下沉; config.json params 可覆盖其键)
 BOARD_PARAMS = {
+    # exit_mode: 2026-10-07 由 "sweet" → "legacy" (用户裁定 A: 回测默认对齐实盘)。
+    #   sweet 与峰值逃顶**互斥** (`_run_backtest_breakbuy`: `if exit_mode != "sweet"
+    #   and ret > 10`) ⇒ 默认 sweet 时回测缺实盘那条峰值逃顶腿, 收益口径不可外推。
+    #   legacy = 止损/追踪/峰值逃顶/到期, 与 `BreakStrategy.exit_decision` 逐条镜像。
+    #   ⚠ config.json 的 break.winrate=71.3 是 **sweet 口径**产物, 需重跑刷新。
     "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 7,  # 20→7: 2026-09-22 出场研究定稿(时间上限先行)
-             "exit_mode": "sweet", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,  # E3: 甜点区出场; 核心/高板通道阈值100(让利润跑)
+             "exit_mode": "legacy", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,  # E3: 甜点区出场(仅 exit_mode=sweet 时生效); 核心/高板通道阈值100(让利润跑)
              "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
              "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
              "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
              "first_break_gap_min": 0, "first_break_chg_min": 0.0},
     "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 7,  # 15→7: 同上
-                 "exit_mode": "sweet", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,
+                 "exit_mode": "legacy", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,   # 同上 (2026-10-07 sweet→legacy)
                  "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
                  "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
                  "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
@@ -711,7 +716,10 @@ class BreakStrategy(StrategyBase):
         params.update({k: v for k, v in _mp.items() if k in params})
         stop_loss, trailing_stop = params["stop_loss"], params["trailing_stop"]
         hold_days = params["hold_days"]
-        exit_mode = str(params.get("exit_mode") or "sweet")
+        # 2026-10-07: 默认 "sweet" → "legacy" (与实盘 exit_decision 同规则集, 见
+        #   BOARD_PARAMS 注释)。想复现甜点口径需**显式**在 config params 里写
+        #   exit_mode="sweet" —— 默认不再是它, 因为回测收益要能外推到实盘。
+        exit_mode = str(params.get("exit_mode") or "legacy")
         sweet_pctb = float(params.get("sweet_pctb") or 95.0)
         sweet_pctb_core = float(params.get("sweet_pctb_core") or 100.0)
         n = len(bars)
@@ -804,18 +812,39 @@ class BreakStrategy(StrategyBase):
 
     # ---- 1m 真实腿出场重放 (P3b/P4, 2026-09-21) ----
     def intraday_replay(self, bars, entry_idx, entry_price, *, code, board_type,
-                        minute_by_date, params=None):
+                        minute_by_date, params=None, entry_gate=None):
         """断板出场在 1m 通道上重放: 止损/追踪**逐槽位**(知日内先后), 峰值逃顶/到期仍收盘语义。
 
         与 `backtest_stock` 共用**同一出场引擎** `_run_backtest_breakbuy` —— 只是多传
         `minute_by_date`, 不新增第二份出场规则。出场参数取本插件 BOARD_PARAMS (单一定义)。
         调用方 (P4 `run_all`) 负责"整笔持仓窗口覆盖一致"与口径标注 (`exec_basis`)。
+
+        ⚠ 2026-10-07: 原实现**漏传** `exit_mode`/`entry_gate`/`sweet_pctb*` ⇒ 恒走
+          `_run_backtest_breakbuy` 的函数默认值 (exit_mode="sweet" / sweet_pctb=95 /
+          entry_gate=None), 与 `backtest_stock` 和 `_exit_break_combo` **两条路径不同
+          口径**: ① exit_mode 不随 BOARD_PARAMS 走; ② 核心/高板通道的甜点阈值恒取
+          95 而非 100 ⇒ 该类票在 1m 腿上比日线腿**早出场**。
+          (A3 于 2026-09-28 修了门表路径 `_exit_break_combo` 的同一问题, 本方法当时漏网。)
+          现与 `_exit_break_combo` 用同一 `_pick` 口径: params → BOARD_PARAMS → default。
         """
         bt = board_type or get_board_type(code)
         bp = BOARD_PARAMS.get(bt, BOARD_PARAMS["main"])
+        _p = params if isinstance(params, dict) else {}
+
+        def _pick(name, default):
+            """params 覆写优先 → BOARD_PARAMS → default (与 _exit_break_combo 同口径)。"""
+            v = _p.get(name)
+            if v is None:
+                v = bp.get(name)
+            return default if v is None else v
+
         return _run_backtest_breakbuy(
             bars, entry_idx, entry_price, bp["hold_days"], bp["stop_loss"],
-            bp["trailing_stop"], bt, "close", minute_by_date)
+            bp["trailing_stop"], bt, "close", minute_by_date,
+            exit_mode=str(_pick("exit_mode", "legacy")),
+            entry_gate=entry_gate,
+            sweet_pctb=float(_pick("sweet_pctb", 95.0)),
+            sweet_pctb_core=float(_pick("sweet_pctb_core", 100.0)))
 
 
 def _find_limit_ups(bars, bt):
@@ -898,7 +927,7 @@ def _exit_series(bars):
 
 def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=-8.0,
                           trailing_stop=-6.0, board_type="main", fill_mode="close",
-                          minute_by_date=None, exit_mode="sweet", entry_gate=None,
+                          minute_by_date=None, exit_mode="legacy", entry_gate=None,
                           sweet_pctb=95.0, sweet_pctb_core=100.0):
     """断板专用回测: 追踪止损 + 峰值逃顶信号。
 
@@ -1335,7 +1364,7 @@ def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params,
         _bp(params, board_type, "trailing_stop"),
         board_type,
         _bp(params, board_type, "fill_mode"),
-        exit_mode=str(_pick("exit_mode", "sweet")),
+        exit_mode=str(_pick("exit_mode", "legacy")),   # 2026-10-07: sweet → legacy (对齐实盘)
         entry_gate=(diag or {}).get("entry_gate"),
         sweet_pctb=float(_pick("sweet_pctb", 95.0)),
         sweet_pctb_core=float(_pick("sweet_pctb_core", 100.0)),

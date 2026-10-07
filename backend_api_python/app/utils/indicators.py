@@ -199,6 +199,28 @@ def macd_core(closes, fast=12, slow=26, signal=9, anchor=None):
     return dif, dea, hist
 
 
+def macd_anchor_step(anchor, closes, fast=12, slow=26, signal=9):
+    """把锚点 `(ef, es, dea)` 沿 `closes` 往后推进, 返回推进后的末根状态。
+
+    与 `macd_core(anchor=...)` 的 anchor 分支**同一递推** (ef/es → dif → dea),
+    只是这里只要末根 (供状态机逐格推进, O(1) 摊销)。
+
+    ★ 2026-10-07: 递推本体收敛到此处 —— 此前 `core/features/cross_section._anchor_step`
+      另写了一份 ef/es/dif/dea, 是"第二份 MACD"。两侧算法一度相同但无人保证继续相同:
+      改一处忘另一处 ⇒ 特征层 MACD 与指标层 MACD 静默分叉, 且**不报错**。
+      现在特征层委托本函数, 口径只有一份。
+    """
+    n = len(closes)
+    if n == 0:
+        return tuple(float(x) for x in anchor)
+    ef_a, es_a, dea_a = (float(x) for x in anchor)
+    ef = ema_fwd(closes, fast, ef_a)
+    es = ema_fwd(closes, slow, es_a)
+    dif = [ef[j] - es[j] for j in range(n)]
+    dea = ema_fwd(dif, signal, dea_a)
+    return (ef[-1], es[-1], dea[-1])
+
+
 def calc_macd(closes, fast=12, slow=26, signal=9, anchor=None):
     """计算MACD, 返回 (dif, dea, macd_hist) 三个序列
 

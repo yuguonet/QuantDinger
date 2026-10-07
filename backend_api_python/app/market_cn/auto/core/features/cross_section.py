@@ -24,7 +24,7 @@ import numpy as np
 from app.utils.indicators import calc_macd
 from app.market_cn.auto.core.market import get_board_type
 # ★ 播种/接力只从基座叶子层取 (这三个不经 core 转发, 直接取自本文件)
-from app.utils.indicators import ema_fwd, macd_core, macd_state
+from app.utils.indicators import macd_anchor_step, macd_core, macd_state
 
 logger = logging.getLogger("auto")
 
@@ -265,13 +265,13 @@ def _anchor_step(anchor, closes):
 
     ★ 从**相对下标 0** 起推 (`out[0]` 就是"前一根的下一根"), 不能写成
       "继承第 n-1 个" —— 那会整条错位 n-1 根且**不报错**。
+
+    2026-10-07: 递推本体委托 `app.utils.indicators.macd_anchor_step`。原地在
+      这里另写一份 ef/es/dif/dea = **第二份 MACD**, 与 `macd_core(anchor=...)`
+      同构却各改各的 —— 改内核忘改这里 ⇒ 特征层 MACD 静默分叉且不报错。
+      默认 (12,26,9) 下与旧实现逐位一致。
     """
-    ef_a, es_a, dea_a = (float(x) for x in anchor)
-    ef = ema_fwd(closes, MACD_FAST, ef_a)
-    es = ema_fwd(closes, MACD_SLOW, es_a)
-    dif = [ef[j] - es[j] for j in range(len(closes))]
-    dea = ema_fwd(dif, MACD_SIGNAL, dea_a)
-    return (ef[-1], es[-1], dea[-1])
+    return macd_anchor_step(anchor, closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
 
 def g1_state_step(state, bars_new):

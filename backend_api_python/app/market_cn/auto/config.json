@@ -55,7 +55,8 @@
       "label": "断板",
       "enabled": true,
       "daily_limit": 5,
-      "winrate": 71.3
+      "winrate": 71.3,
+      "_winrate_note": "⚠ 2026-10-07: 71.3 是 **exit_mode=sweet 口径**的历史回测产物 (甜点区出场)。用户裁定 A「回测默认对齐实盘」后, 默认改为 legacy = 止损/追踪/峰值逃顶/到期, 与实盘 exit_decision 逐条镜像; 甜点与峰值逃顶在引擎里互斥, 故甜点腿不再默认启用 ⇒ 本数字**待重跑刷新**。未重跑前对外引用须注明口径; 要复现旧口径在 params 显式写 exit_mode=\"sweet\"。"
     },
     "relay3": {
       "label": "3板接力",

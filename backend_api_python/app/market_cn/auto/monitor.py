@@ -74,10 +74,24 @@ _VISIBLE_DAYS = ds.VISIBLE_WINDOW_DAYS
 
 
 def _last_trade_day() -> str:
+    """最近一个**已完成**交易日 (= 本 tick 的 target 日期线)。
+
+    ⚠ 2026-10-07 (P2): 原实现裸 `except` **静默**回退 `_today()` —— 交易日历读不出
+      来 (文件缺失 / 格式变更 / 假期表损坏) 时:
+        target = 今天 ⇒ 上一交易日入库的 watch_pending `trade_date < target` 全部判
+        "隔日未处理"当场 expired ⇒ 开盘窗口候选集 (trade_date == target) 为空 ⇒
+        **全天信号作废, 开盘零买入, 且全程无一行告警** —— 一次文件故障 = 一天哑火,
+        事后无法复盘。
+      现: 失败必打 WARNING (带原因与回退值), 语义仍是回退 today —— 监控是长跑进程,
+      宁可保守继续跑也不停机; 但**不再是暗账**。
+    """
     try:
         from app.utils.trading_calendar import last_finish_trading_day
         return last_finish_trading_day()
-    except Exception:
+    except Exception as e:
+        logger.warning("[dragon_monitor] 交易日历读取失败(%s), 回退 today=%s "
+                       "—— 若 today 非交易日, watch_pending 会被误判隔日过期",
+                       e, _today())
         return _today()
 
 
@@ -374,8 +388,15 @@ def run_monitor():
         if disabled_ids:
             swept = ds.retire_unfilled(ids=disabled_ids,
                                        reason_by_key=reason_by_key)
-            logger.warning("[dragon_monitor] 禁用策略存量信号作废: %s (n=%d)",
-                           disabled_codes, len(swept))
+            if swept is None:
+                # 2026-10-07 (P2): None=作废失败。行已从本轮候选移除 (不会被买入),
+                # 但**没有落 expired** ⇒ 会挂着 watch_pending 直到被 1b 判隔日过期。
+                # 必须报出来, 否则「停用策略的行还在」看起来像正常延迟。
+                logger.error("[dragon_monitor] 禁用策略存量信号作废**失败**(未落 expired): %s "
+                             "(n=%d)", disabled_codes, len(disabled_ids))
+            else:
+                logger.warning("[dragon_monitor] 禁用策略存量信号作废: %s (n=%d)",
+                               disabled_codes, len(swept))
         if cand:
             snaps = latest_snapshot([r["code"] for r in cand])
             from collections import defaultdict as _dd
@@ -412,8 +433,12 @@ def run_monitor():
             for strat, lst in qualified.items():
                 lst.sort(key=lambda x: x[0], reverse=True)
                 limit = strat_reg.daily_limit(strat)
+                # 2026-10-07 (P2): `0/None = 不截断` —— 与 scan 侧 `finalize_signal_rows`
+                #   (`if cap and len(grp) > cap`) **同一口径**。改前是 `i < limit`: limit=0
+                #   时恒假 ⇒ 当日候选全员判 expired, 理由还写成"当日名额已满" —— 故障伪装
+                #   成正常限额且无告警。config `_daily_limit_note` 明文写的就是 0=不截断。
                 for i, (qkey, gap, r, open_px) in enumerate(lst):
-                    if i < limit:
+                    if not limit or i < limit:
                         ds.set_state(r["id"], ds.S_BUY_TODAY,
                                      detail={"entry_gap": round(gap, 2), "rank": i + 1},
                                      entry_date=today, entry_price=round(open_px, 3),
