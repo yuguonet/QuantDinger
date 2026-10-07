@@ -379,17 +379,24 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                             signal_date = EXCLUDED.signal_date, signal_price = EXCLUDED.signal_price,
                             lu_date = EXCLUDED.lu_date, pullback_days = EXCLUDED.pullback_days,
                             updated_at = NOW(),
-                            -- A1 守卫 (2026-09-28): 已推进行 (entry_date 非空) 保留原
+                            -- A1 守卫 (2026-09-28, 2026-10-07 补「已 expired 未入场行」):
+                            -- 已推进行 (entry_date 非空) **或终态 expired 行** 保留原
                             -- state 与 extra——补扫新信号行不得回滚生命周期状态,
                             -- 不得冲掉 monitor 运行时字段 (t_legs_today/pre_confirm/marked)。
+                            -- 2026-10-07: 原判据只有 entry_date 非空 ⇒ **未入场的 expired
+                            -- 行不受保护**; expired 是终态 (信号已失效 / 已被清理), 补扫
+                            -- 会把它复活成 watch_pending ⇒ 死信号重回活跃池, 被 monitor
+                            -- 当新信号处理。
                             -- ⚠ 2026-09-28 核验修正: DO UPDATE 里引用"已存在的行"必须用
                             -- **真表名** (此处 = {_SIGNALS_TABLE}, 由 f-string 展开)。写死短
                             -- 表名前缀会让 Pg 报 missing FROM-clause entry ⇒
                             -- upsert_scan_signals 整条路径抛 UndefinedTable, 全策略信号无法
                             -- 落库 (比修前的覆盖更严重)。表名单一事实源 = 同名常量。
                             state = CASE WHEN {_SIGNALS_TABLE}.entry_date IS NOT NULL
+                                              OR {_SIGNALS_TABLE}.state = %s
                                          THEN {_SIGNALS_TABLE}.state ELSE EXCLUDED.state END,
                             extra = CASE WHEN {_SIGNALS_TABLE}.entry_date IS NOT NULL
+                                              OR {_SIGNALS_TABLE}.state = %s
                                          THEN {_SIGNALS_TABLE}.extra ELSE EXCLUDED.extra END
                     """, (
                         trade_date, s.get("strategy", DRAGON_STRATEGY), s["code"], s.get("name", ""), s.get("board", ""),
@@ -398,6 +405,7 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         s.get("lu_date"), s.get("pullback_days"),
                         json.dumps(extra, ensure_ascii=False, default=str),
                         s.get("entry_date"), s.get("entry_price"), s.get("stop_price"),
+                        S_EXPIRED, S_EXPIRED,   # ← A1 守卫 state/extra 两处 %s, 按出现顺序
                     ))
                     n += 1
                 db.commit()
@@ -818,26 +826,33 @@ def sync_watchlist_group(active_rows):
                     cur_detail = json.loads(cur_detail)
                 except Exception:
                     cur_detail = {}
-            current[d["symbol"]] = {"id": d["id"], "state": d.get("strategy_state"),
-                                    "detail": cur_detail or {}}
+            cur_detail = cur_detail or {}
+            # 2026-10-07: 折叠键改 (code, strategy) —— 原只按 symbol 折叠, 而同一只票可被
+            #   多个策略同时选中 ⇒ 折成一条后「变更检测」是在拿 A 策略的旧 detail 比
+            #   B 策略的新 detail, 恒不等 ⇒ 每轮无谓 UPDATE, 且展示内容随遍历顺序漂移。
+            #   strategy 只能从 strategy_detail JSON 取 (表无 strategy 列, 见 init.sql)。
+            current[(d["symbol"], cur_detail.get("strategy") or DRAGON_STRATEGY)] = {
+                "id": d["id"], "state": d.get("strategy_state"), "detail": cur_detail}
 
-        target = {s["code"]: s for s in active_rows}
+        target = {(s["code"], s.get("strategy") or DRAGON_STRATEGY): s for s in active_rows}
 
         inserted = updated = deleted = 0
 
         # ── UPSERT 目标集 ──
-        for code, s in target.items():
+        for key, s in target.items():
+            code = s["code"]
             detail = _display_detail(s)
-            if code in current:
-                row = current[code]
+            if key in current:
+                row = current[key]
                 if row["state"] != s["state"] or (row["detail"] or {}).get("v") != detail.get("v"):
+                    # 按 id 定位, 不再拼 (user_id, market, symbol, group_name): 后者在同票
+                    # 多策略时会打到别的策略正占用的那一行 (两策略共享物理一行)。
                     cur.execute(
                         "UPDATE qd_watchlist SET strategy_state = %s, strategy_detail = %s, "
                         "name = %s, updated_at = NOW() "
-                        "WHERE user_id = %s AND market = %s AND symbol = %s AND group_name = %s",
+                        "WHERE id = %s",
                         (s["state"], json.dumps(detail, ensure_ascii=False, default=str),
-                         s.get("name") or code, DRAGON_USER_ID, DRAGON_MARKET, code,
-                         DRAGON_GROUP_NAME),
+                         s.get("name") or code, row["id"]),
                     )
                     updated += 1
             else:
@@ -857,8 +872,14 @@ def sync_watchlist_group(active_rows):
                 inserted += 1
 
         # ── DELETE 组内多余 (已失效/已平仓/已执行卖出) ──
-        for code, row in current.items():
-            if code not in target:
+        # ⚠ 删除粒度仍是 **code**, 不跟着降成 (code, strategy): 表唯一键是
+        #   (user_id, market, symbol, group_name), 不含 strategy ⇒ 同票多策略**共享物理
+        #   一行**。若按 (code, strategy) 差集删, 该行当前的 strategy 与 target 里任一
+        #   策略不符时就会被删 —— 而它正是上面刚 UPSERT 过的那一行 (current 是 UPSERT
+        #   之前的快照) ⇒ 票会直接从自选组消失。
+        target_codes = {c for c, _ in target}
+        for key, row in current.items():
+            if key[0] not in target_codes:
                 cur.execute("DELETE FROM qd_watchlist WHERE id = %s", (row["id"],))
                 deleted += 1
 

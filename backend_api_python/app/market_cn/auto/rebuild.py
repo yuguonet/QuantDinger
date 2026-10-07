@@ -1091,6 +1091,9 @@ def render(meta, d, expected, actual, top=25):
 
 
 def main(argv=None):
+    # 2026-10-07: Windows 控制台默认 GBK, 报告里的 ⚠ 等非 GBK 字符会让 print 抛
+    #   UnicodeEncodeError ⇒ 整份 --ledger 对账报告打不出来。统一按 utf-8 输出。
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="应然信号集重建 / 账本重放")
     ap.add_argument("--window", type=int, default=None,
                     help="重建最近 N 个交易日 (默认: 信号层 30 / 账本重放 %d)" % REPLAY_WINDOW)
