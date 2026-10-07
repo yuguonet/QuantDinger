@@ -70,35 +70,60 @@ def _feat_env_ret20(code, d0, trade, index_code="000300"):
     return None
 
 
-def _feat_ev20(code, d0, trade, index_code="000300"):
-    try:
+# 进程内缓存: 同一只票的龙虎榜事件在复验全程不变, 逐笔重复查库是纯浪费
+# (pool_check 一次要跑成百上千笔交易)。
+_LHB_CACHE: dict = {}
+
+
+def _lhb_dates(code):
+    """该股龙虎榜事件日期列表 (字符串, 升序无保证, 由调用方裁剪)。
+
+    ⚠️ 2026-10-07 修 (裁定工具可信性): 原调用是 `lhb(code, days=40, as_of=d0)`, 而
+    `hub.lhb` 的签名是 `lhb(stock_code, trade_date, days)` —— **没有 as_of 形参**,
+    调用直接 TypeError, 被本文件的 `except Exception` 吞成 None/0.0 ⇒
+    ev20 恒 None、on_d1 恒 0 ⇒ 门复验的结论全是假的 (fail-open 全保留 /
+    fail-close 全否决, 两条路都得出"迁移/否决"的伪结论)。
+
+    取数改为不带 as_of, 由**本工具本地裁剪** (防未来函数: 只认 <= d0 的事件)。
+    ⚠️ 且 `lhb` 传 stock_code 时 `days` **不生效** (dragon_tiger_store 的分支:
+    trade_date 为空 + stock_code 非空 ⇒ 不加日期条件), 返回该股**全部**历史
+    (LIMIT 500) —— 所以"取多长的窗口"只能由调用方用交易日序列界定。
+    """
+    if code not in _LHB_CACHE:
         from app.market_cn.auto.core.data.hub import lhb
-        evs = lhb(code, days=40, as_of=d0) or []     # D-1 及以前的上榜事件
-        # 取截至 D-1 前 20 交易日内次数 (用事件日期 <= d0 且落在窗口)
-        cnt = 0
-        for e in evs:
-            ed = str(e.get("trade_date") or e.get("date") or "")[:10]
-            if ed <= str(d0)[:10]:
-                cnt += 1
-            if cnt >= 40:
-                break
-        return float(cnt)
+        _LHB_CACHE[code] = [str(e.get("trade_date") or e.get("date") or "")[:10]
+                            for e in (lhb(code) or [])]
+    return _LHB_CACHE[code]
+
+
+def _feat_ev20(code, d0, trade, index_code="000300"):
+    """截至 d0(含) 前 **20 个交易日**内的龙虎榜上榜次数。
+
+    窗口用真实交易日序列界定 (不是自然日近似): 20 交易日是特征定义 (见模块头),
+    用 `daily(as_of=d0)` 取 d0 及以前的交易日, 取尾部 20 个构成窗口。
+    取数/判定任一步失败 → None (fail-open/fail-close 由上层 --fail-close 裁决,
+    本函数不猜值 —— 猜出来的"0 次"会让 VETO 变成假的 MIGRATE)。
+    """
+    try:
+        from app.market_cn.auto.core.data.hub import daily
+        d0s = str(d0)[:10]
+        bars = daily(code, days=60, as_of=d0) or []
+        tdays = sorted({str(b["time"])[:10] for b in bars if str(b["time"])[:10] <= d0s})
+        if not tdays:
+            return None
+        win = set(tdays[-20:])
+        return float(sum(1 for ed in _lhb_dates(code) if ed in win))
     except Exception:
         return None
-    return None
 
 
 def _feat_on_d1(code, d0, trade, index_code="000300"):
+    """d0 当日恰上榜 → 1.0, 否则 0.0 (本地精确匹配, 同上不再传 as_of)。"""
     try:
-        from app.market_cn.auto.core.data.hub import lhb
-        evs = lhb(code, days=5, as_of=d0) or []
-        for e in evs:
-            ed = str(e.get("trade_date") or e.get("date") or "")[:10]
-            if ed == str(d0)[:10]:
-                return 1.0
+        d0s = str(d0)[:10]
+        return 1.0 if any(ed == d0s for ed in _lhb_dates(code)) else 0.0
     except Exception:
         return 0.0
-    return 0.0
 
 
 def _feat_turnover_d0(code, d0, trade, index_code="000300"):

@@ -150,6 +150,13 @@ class KnifeCatchStrategy(StrategyBase):
     entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
+    # 滚动预览 (2026-10-07 补): 本策略窗口是 14:30-15:00, 但此前**未声明** rolling_preview
+    #   ⇒ scan.run_scan_knife 的滚动轮只跑 preview 子集, knife_catch 整天只在 15:00 终审
+    #   跑一次 ⇒ 14:56 触发时前端无展示 (信号要等 15:00 那轮才落库)。
+    #   声明后 14:30 起每分钟一轮, 14:56 触发即入库刷新。
+    #   ⚠️ 不会提前买入: 入场时点由 `_gates` 的 14:56 窗口保护把守 (14:30 起跑只是预热,
+    #      判定不变), 故滚动期间只刷展示、不产生 buy_today。
+    rolling_preview = True
     # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("watch", "候选观察", realtime="14:56-15:00", visible=False),
