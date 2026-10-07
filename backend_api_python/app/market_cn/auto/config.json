@@ -1,7 +1,16 @@
 {
   "version": 1,
   "live_probe": true,
-  "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。live_probe=实盘扫描探针总开关 (M1 实盘采集, 2026-09-11; 默认 true, false 关闭 — 每日盘后扫描按策略产 sample 存档到 tmp/probes/。注意: 探针只记特征/判定轨迹, 标签 censored 由离线回填)。2026-09-13 用户裁定撤回 V2 代实验: dragon_v2/break_v2 enabled=false 留档 (停扫描, 历史行仍可查), 系统回到 V1 策略集; 策略文件与回测证据原地保留。winrate=历史回测胜率 (前端排序/展示用, 非实盘承诺, 可选缺省 null); state_labels=信号状态中文显示文案 (前端映射兜底, 可选缺省回退到状态原串)。",
+  "present_persist": {
+    "enabled": true,
+    "warmup": 25,
+    "_note": "P5-③ 写路径切换点 (2026-10-07 已切): enabled=true ⇒ present_daily.persist_days **转主线** (fold 是唯一判定) 且 scan 的 signals 行改由当日 Record.ready 投影。改法只有'行从哪来'—— 后处理链(U1~U4/同族去重/daily_limit)与 DB 变异(upsert_scan_signals 的 purge/supersede/范围)照旧, 故门禁'signals 零差异'可比。 **回滚 = 把这里翻回 false (单点)** —— 旧 writer(逐票 scan_days) 在 scan._rows_by_scan 里逐字保留, P6 随残余删。 ⚠ 首次冷启动会暖机 warmup 个交易日(切片根 data/market_cn_cache/present_state 为空时), 之后只推当日。 门禁证据: tools.projection_shadow --replay (判定日集合 + 重合日规则列逐字段, 1195 票 × 150 日, 剔暖机头 20 日后两侧均 0 不一致, rc=0)。 读取入口: strategies.present_persist_settings。"
+  },
+  "monitor_progress": {
+    "enabled": true,
+    "_note": "P5-④ 盘中判定源切换 (2026-10-07 已翻): true ⇒ monitor 三个判定点 (开盘可买 / 收盘重放 exit / 15:01 确认) 改读 RealtimeBranch 当日 progress。**回滚 = 把这里翻回 false 或删掉本段 (单点)** —— 缺键/false ⇒ `_progress_map` 返回空字典, 三个判定点全部回退旧 confirm_decision/exit_decision, 生产行为逐字不变。 ★ 安全语义: **拿不到判定** (切片缺失 / 策略无折叠契约 / 未到推进时点 / 异常) 一律不进字典 ⇒ 回退旧路径; **绝不把「无判定」当成「判定为持有」** —— 那会把没判过的票静默转成持仓, 是资金事故而非降级。 ★ 前置: P5-③ 切片 `data/market_cn_cache/present_state` 已于 2026-10-07 **主动落盘** (全市场 5224 票 × 暖机 25 交易日, persist 352s, 各策略 errors 全空, skipped=lead_chase/v1/relay3 无折叠契约走直判)。 ⚠ 投影对账 DB 差异模式仍有 missing/ghost (暖机补出的历史行 vs 库内留存行), 但写库计划 insert=0/expire=0/fix=0 ⇒ 不误写; 等价性以回放模式 `--replay` (判定日集合 + 规则列逐字段, 剔暖机后 0 不一致) 与逐笔对拍 `tools.legacy_trade_diff` (break 6/6、dragon_callback 3/3 零差异) 为准。 观察指标: `stats.confirm_prog_err` 应恒 0; 若盘中判定命中数为 0, 先查切片日期是否推进到当日。 未覆盖: knife_catch / tail_oversold 为盘中策略, 日线对拍不覆盖; g56 对拍须全市场池 (横截面 score_r)。 读取入口: strategies.monitor_progress_settings。"
+  },
+  "_comment": "自动策略配置 (当前唯一配置域)。label=策略显示名 (优先级 config label > 策略插件 name 属性 > key 原样); enabled=策略开关; daily_limit=每日信号入库上限; params=策略参数覆盖 (优先级: config > 代码 default_params)。未写键的策略按 enabled=true + 代码默认值兜底。strategies 段的 keys 也是系统成员显式声明 (registry.strategy_keys 取 keys ∪ 磁盘插件 autodiscover 为 store 查询/清理范围; enabled=false 停扫描但历史行仍可查)。schedule=分段调度声明 (per-strategy 覆盖策略 ScanSpec 默认; scheduler.py 已接线 2026-09-09, knife_scan 触发时刻取本段各策略 first 最早者, 改本段按天生效), 键=策略key, windows=[首次,截止] (截止含), interval_sec=拍间隔。live_probe=实盘扫描探针总开关 (M1 实盘采集, 2026-09-11; 默认 true, false 关闭 — 每日盘后扫描按策略产 sample 存档到 tmp/probes/。注意: 探针只记特征/判定轨迹, 标签 censored 由离线回填)。2026-09-13 用户裁定撤回 V2 代实验: dragon_v2/break_v2 enabled=false 留档 (停扫描, 历史行仍可查), 系统回到 V1 策略集; 策略文件与回测证据原地保留。winrate=历史回测胜率 (前端排序/展示用, 非实盘承诺, 可选缺省 null); state_labels=信号状态中文显示文案 (前端映射兜底, 可选缺省回退到状态原串); present_persist=展示层切片每日落盘开关 (P5 影子期, 详见该段 _note)。",
   "schedule": {
     "dragon_callback": {
       "windows": [

@@ -155,6 +155,46 @@ def live_probe_enabled():
     return bool(load_config().get("live_probe", True))
 
 
+def present_persist_settings():
+    """展示层切片每日落盘开关 + 冷切片暖机日数 (P5-③ 前置, 2026-10-07)。
+
+    config.json 顶层 (与 strategies / live_probe 平级, 非 per-strategy):
+        "present_persist": {"enabled": true, "warmup": 25}
+    缺键 / 类型不符 ⇒ {"enabled": False, "warmup": 0} —— **缺省关**, 生产行为零变化。
+    warmup 只在**冷切片**上生效 (见 auto/present_daily.py 模块头 ⚠⚠), 故设一次可长期留着。
+
+    ★ 为什么用 config 而不是环境变量: config.json 是本项目的**唯一配置域**且被 git 跟踪
+      ⇒ 影子期这个临时阶段开关在代码里可见、可复核、可回滚; 环境变量只活在部署机的
+      `.env`(未跟踪) 里, 开了什么无人可查 (违反「禁并存式过渡」)。
+    """
+    v = load_config().get("present_persist")
+    if not isinstance(v, dict):
+        return {"enabled": False, "warmup": 0}
+    try:
+        warm = max(0, int(v.get("warmup") or 0))
+    except (TypeError, ValueError):
+        warm = 0
+    return {"enabled": bool(v.get("enabled", False)), "warmup": warm}
+
+
+def monitor_progress_settings():
+    """monitor 15:01 确认的判定源开关 (P5-④ 第一步, 2026-10-07)。
+
+    config.json 顶层 (与 present_persist 平级):
+        "monitor_progress": {"enabled": true}
+    缺键 / 类型不符 ⇒ {"enabled": False} —— **缺省关**, 走旧的 `confirm_decision`。
+
+    ★ 为什么**不复用** `present_persist.enabled`: P5 要求每个子步骤**独立可回滚** ——
+      ③ (切 writer) 与 ④ (三决策退役) 是两个回滚位, 共用一个开关就分不开"是哪个
+      步骤改坏了"。本步依赖③的切片数据 (无切片 ⇒ 拿不到判定 ⇒ 调用方回退旧路径),
+      但**开关本身**必须独立。
+    """
+    v = load_config().get("monitor_progress")
+    if not isinstance(v, dict):
+        return {"enabled": False}
+    return {"enabled": bool(v.get("enabled", False))}
+
+
 def market_env_of(key):
     """策略的大盘环境门模式 (config.json 优先; 默认 off=全通)。
 

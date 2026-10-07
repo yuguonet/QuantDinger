@@ -21,6 +21,18 @@ close() 时打印计数汇总。推荐用法:
     with Probe("dragon_callback", tag="panic") as pr:
         run_all("dragon_callback", ..., probe=pr)
 
+────────────────────────────────────────────────────────────────
+P2 适配器态 (改进方案 §2.4/§183, 2026-10-07):
+  本模块已进入「适配器」阶段 —— 旧 API (trace/sample/shell/close) **签名与 JSONL
+  落盘格式完全不变**（消费面 core/backtest.py、scan.py、rule_audit.py、rule_stats.py
+  零改动），同时内部**双写**到一个 `TraceSink`（`self.sink`）：
+    - trace(stage, **kw)  →  sink.note("trace", stage=stage, **kw)
+    - sample(**kw)        →  sink.note("sample", **kw)
+    - shell(name, **kw)   →  sink.note("shell", name=name, **kw)
+  这样调试视图（replay + TraceCollector）可与离线 JSONL 分析并行拿到同一份门轨迹；
+  待策略文件从 probe.trace 迁到 sink.gate 后（P3），本适配器连同 JSONL 落盘一起退役。
+  注意: probe 记录含未来标签，只能离线分析；sink 侧亦然，绝不可回流判定/实盘路径。
+
 易错点:
   - 探针记录含未来信息 (labels), 只能离线分析, 绝不能回流进判定/实盘路径;
   - sample 只在到达完整判定的决策日产出 (廉价预筛跳过的日不采样, 否则纯噪声);
@@ -32,6 +44,8 @@ import json
 import os
 import time
 
+from app.market_cn.auto.core.trace import TraceSink
+
 # 项目根 tmp/probes/ (probe.py 位于 backend_api_python/app/market_cn/auto/, 上溯4级到根)
 _PROBE_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__),
                                            "..", "..", "..", "..", "tmp", "probes"))
@@ -42,13 +56,18 @@ class DayTrace:
 
     用法: 调用方把 DayTrace() 当 probe 传进 scan_signals, trace 只进内存不落盘,
     调用方按 (股,日/槽位) 聚合出 stage (取 PROBE_STAGE_RANK 最深) 后再 probe.sample。
+
+    P2 适配器态: 同时把 trace 双写进内部 TraceSink (``self.sink``)，使内存收集与
+    replay/TraceCollector 的调试视图同源。
     """
 
     def __init__(self):
         self.items = []
+        self.sink = TraceSink()
 
     def trace(self, stage, **kw):
         self.items.append({"stage": stage, **kw})
+        self.sink.note("trace", stage=stage, **kw)
 
 
 def sample_feats(bars, i, code, stock_info=None):
@@ -115,6 +134,7 @@ class Probe:
             d, f"{strategy}_{tag or 'dbg'}_{ts}_pid{os.getpid()}.jsonl")
         self.counts = {}
         self._fh = open(self.path, "w", encoding="utf-8")
+        self.sink = TraceSink(strategy=strategy)   # P2 适配器：双写同源
 
     def _write(self, kind, rec):
         self.counts[kind] = self.counts.get(kind, 0) + 1
@@ -126,14 +146,17 @@ class Probe:
     def trace(self, stage, **kw):
         """判定步落点 (stage 见 STAGE_RANK)。"""
         self._write("trace", {"stage": stage, **kw})
+        self.sink.note("trace", stage=stage, **kw)
 
     def sample(self, **kw):
         """决策日样本: 特征 + 标签 + stage + 规则轨迹。"""
         self._write("sample", kw)
+        self.sink.note("sample", **kw)
 
     def shell(self, name, **kw):
         """数据外壳: 输入数据整块套壳存档 (供 IDE 框架统一检查引用数据)。"""
         self._write("shell", {"name": name, **kw})
+        self.sink.note("shell", name=name, **kw)
 
     def close(self):
         if self._fh.closed:

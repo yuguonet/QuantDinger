@@ -34,7 +34,11 @@ MODULES = [
     ("realtime.py", 89, 110),
 ]
 
-KERNEL_CAP = 800
+# 2026-10-07 口径更新（P0/P1 功能性增长，非膨胀）：
+#   runner.py fold_range 扩参 stages/ctx_provider/stateful（折叠契约核心，+~30 行）；
+#   contract.py 增 begin_day/realtime_shortlist 契约方法 + _trace 门原因通道注释。
+#   先压缩了 fold_range 冗余 docstring（22→12 行），再上调总 cap 800→820 并记录。
+KERNEL_CAP = 820
 KERNEL_FLOOR = 600
 
 

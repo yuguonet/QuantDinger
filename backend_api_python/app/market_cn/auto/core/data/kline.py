@@ -146,6 +146,36 @@ def window_start(days=300, as_of=None):
     return _window_bounds(days, as_of)[0]
 
 
+#: 「判定用 as-of 序列」的最小根数（数据充分性门槛）。
+#: **唯一来源** —— 判定循环 (`scan._run_scan_locked`) 与切片落盘 (`present_daily`)
+#: 都显式引用本常量，禁各写一份 30（策略侧另有更严的窗口下界，与本门槛无关）。
+ASOF_MIN_BARS = 30
+
+
+def asof_bars(bars, target, min_bars):
+    """把一票的日线收敛成「判定用的 as-of 序列」：截断到 ≤ target，且末根必须 == target。
+
+    返回可用序列，或 None（缺票 / 过短 / **target 日无 bar**）。
+
+    为什么必须有这个函数（而不是各调用方各写四行）：
+      这是"今天这票算不算有数据"的**唯一口径**。判定循环 (`scan._run_scan_locked`) 与
+      切片落盘 (`auto/present_daily`) 都要它 —— 两处各写一份，一侧漏掉末根复检就会
+      带着 target-N 的旧 bar 进入判定，产出 **trade_date=target / 判定日=T-N 的错日
+      幽灵**（2026-09-29 审计只修了一半，2026-10-07 补齐；详见 scan 主循环注释）。
+
+    ⚠ `min_bars` 是**调用方**的数据充分性门槛（core 不留业务默认），故必传。
+
+    比较用原始字符串（`bar["time"]` 为 "YYYY-MM-DD"），与历史实现逐字一致。
+    """
+    if not bars:
+        return None
+    if bars[-1]["time"] > target:
+        bars = [b for b in bars if b["time"] <= target]
+    if not bars or len(bars) < min_bars or bars[-1]["time"] != target:
+        return None
+    return bars
+
+
 def fetch_stock_info_db():
     """全量 stock_basic_info: {symbol: {name, circ_shares, ...}} (换手率/市值/ST过滤用)。"""
     from app.utils.basicinfo_db import get_stock_basic_db

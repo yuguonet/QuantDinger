@@ -16,9 +16,9 @@ from __future__ import annotations
 import copy
 
 from app.market_cn.auto.core.present.contract import (
-    DayInput, Progress, StrategyProtocol,
+    Progress, StrategyProtocol,
 )
-from app.market_cn.auto.core.present.runner import Record, StateStore
+from app.market_cn.auto.core.present.runner import Record, StateStore, evaluate_day
 
 
 def _in_anchor(hhmm: str, anchor: str) -> bool:
@@ -72,10 +72,11 @@ class RealtimeBranch:
                     continue
                 ctx = {"latest": snap, "series": series_by_code.get(code) or [snap],
                        "mkt_gain": mkt_gain}
-                # 临时分支：副本试推，用完即弃
+                # 临时分支：副本试推，用完即弃。⚠ 与切片落盘同源（`evaluate_day`）：
+                # 否则实时预览漏掉「持仓期重合信号」那条 ready，当晚预处理又补上 ⇒ 前后不一致。
                 state_copy = copy.deepcopy(rec.state)
-                events = strategy.evaluate(
-                    state_copy, DayInput(code, bar_from_snapshot(snap), ctx), rec.current)
+                events, _head = evaluate_day(
+                    strategy, code, state_copy, bar_from_snapshot(snap), ctx, rec.current)
                 for e in events:
                     e.source = "realtime"
                     out.append((code, e))

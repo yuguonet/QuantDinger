@@ -58,6 +58,20 @@ class Signal:
     extra: dict = field(default_factory=dict)   # 策略特有字段 (gap_from_peak/lu_date/tech_score...)
 
 
+def signal_of_ready(code: str, date, payload) -> Signal:
+    """ready 事件 (date + payload) → `Signal` —— **唯一口径**。
+
+    两条消费路径共用本函数, 分叉必漂:
+      · `StrategyBase.scan_days` —— 判定入口 (折叠内核回传的 `(k, Progress)`)
+      · P5-③ 投影写入器 —— 行源改 `Record` 时读回的 ready 事件
+    与 `store.rule_row_core` 是同一件事的两半: 本函数定 Signal 字段, 它定落库列。
+    """
+    pl = payload or {}
+    return Signal(code=code, time=str(date)[:10], score=pl.get("score", 50),
+                  price=pl.get("price", 0.0), label=pl.get("label", ""),
+                  extra=dict(pl.get("extra") or {}))
+
+
 @dataclass
 class EntryDecision:
     """D1 开盘处置判定 (monitor ~09:25): 该持仓行今日是否可买"""
@@ -97,12 +111,37 @@ class ConfirmDecision:
 # 调用方: `from app.market_cn.auto.core.display_meta import confirm_level_of`
 
 
+def _has_fold_contract(strategy) -> bool:
+    """策略是否真正实现了折叠契约（init_state/step/evaluate 非基类 NotImplemented）。
+
+    P3 薄壳分流用。`hasattr` 恒真（基类有定义），必须**试调用**或对 `__func__` 比对：
+    基类三个方法体只有 `raise NotImplementedError`，用 `__code__.co_code` 比对不可读，
+    改为比对「是否被子类覆写」（`type(s).init_state is not StrategyBase.init_state`）。
+    """
+    base_cls = type(strategy).__mro__
+    for m in ("init_state", "step", "evaluate"):
+        f = getattr(type(strategy), m, None)
+        if f is None:
+            return False
+        owner = next((c for c in base_cls if m in c.__dict__), None)
+        if owner is None or owner.__name__ == "StrategyBase":
+            return False            # 未被任何非基类覆写 = 仍是 NotImplemented
+    return True
+
+
 @dataclass
 class ExitDecision:
     """出场判定 (monitor 60s tick / 回测重放): 持仓行今日是否离场"""
     action: str                        # 'hold' | 'exit'
     reason: str = ""
     price: float = 0.0                 # 出场价 (回测/重放需要; 0=未知, 盘中实盘用市价)
+    #: 成交价口径 (2026-10-07 加): "" = 按调用方默认 (多数策略 = 收盘价成交);
+    #: "open" = **按开盘价成交**。
+    #:   用于「昨日封跌停卖不出 ⇒ 今日开盘强平」—— 即旧引擎 pending_dn 顺延的次日
+    #:   `b['open']`。这类情形若仍按收盘价成交，会造出物理上不可能的成交
+    #:   (实测 break 000506 2026-06-24: 旧引擎 13.2 开盘 vs replay 13.12 收盘)。
+    #:   带默认值 ⇒ 不设的策略行为完全不变。
+    fill: str = ""
 
 
 # ================================================================
@@ -203,11 +242,7 @@ class StrategyBase:
                 bars, code, lo_date=lo_date, hi_date=hi_date, **params)
         out: list = []
         for k, ev in pairs:                    # 内核只回 ready 事件 (stateless)
-            pl = ev.payload or {}
-            out.append(Signal(
-                code=code, time=str(bars[k]["time"])[:10],
-                score=pl.get("score", 50), price=pl.get("price", 0.0),
-                label=pl.get("label", ""), extra=dict(pl.get("extra") or {})))
+            out.append(signal_of_ready(code, bars[k]["time"], ev.payload))
         return out
 
     @staticmethod
@@ -515,7 +550,10 @@ class StrategyBase:
         held = today_idx - entry_idx + 1
         peak = max(float(b["high"]) for b in bars[entry_idx:today_idx + 1])
         last_bar = bars[-1]
-        if last_bar["low"] <= entry_price * (1 + stop / 100):
+        # 2026-10-07 P1-④: 止损同样受 T+1 约束 —— 原先只有「追踪」判了 held>1, 止损分支
+        #   裸判 ⇒ held=1 (入场当日) 触及止损线就返回 exit, 等于当日买入当日卖出。
+        #   与 core/exit_engines._min_sell_day 同口径 (A股: d>=2 才评估出场)。
+        if held > 1 and last_bar["low"] <= entry_price * (1 + stop / 100):
             return ExitDecision("exit", reason=f"止损{stop}%",
                                 price=entry_price * (1 + stop / 100))
         if held > 1 and last_bar["low"] <= peak * (1 + trail / 100):
@@ -540,8 +578,38 @@ class StrategyBase:
     # ================================================================
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
                        probe=None):
+        """回测入口 —— **薄壳**（P3 切口 1）：已迁移折叠契约者走 `core.replay`。
+
+        分流（保签名、保语义，消费方零感知）：
+          - kind != daily_close      ⇒ None（盘中策略走时间线引擎，与旧行为一致）
+          - 实现 init_state/evaluate ⇒ replay（唯一编排，与生产/调试同折叠序）
+          - 未迁移（基类 NotImplemented）⇒ `_backtest_stock_legacy`（旧通用引擎）
+
+        ⚠ 语义差异（新策略须知）：旧通用引擎含 **U1~U4 统一预过滤** 与 **D1 gap 带**
+        （min_gap_main/max_gap_main 等），replay 路径**不含** —— 按改进方案「策略文件
+        = 文档」的定位，这些门应由策略 `evaluate` 自持（与 break/dragon 现状一致）。
+        现有 8 个策略全部覆写了本方法，薄壳只影响未来新策略。
+        """
         if self.scan_spec.kind != "daily_close":
             return None
+        if not _has_fold_contract(self):
+            return self._backtest_stock_legacy(bars, code, stock_info,
+                                               use_prefilter, probe)
+        from app.market_cn.auto.core.replay import (
+            DailyFeed, replay, TradesCollector)
+        if not bars or len(bars) < 30:
+            return []
+        coll = TradesCollector(code=code, strategy=self.key)
+        try:
+            res = replay(self, code, DailyFeed(bars), collectors=[coll])
+        except NotImplementedError:                # 契约形似实未实现 → 回退
+            return self._backtest_stock_legacy(bars, code, stock_info,
+                                               use_prefilter, probe)
+        return res.trades or []
+
+    def _backtest_stock_legacy(self, bars, code, stock_info=None,
+                               use_prefilter=True, probe=None):
+        """旧通用回测引擎（未迁移折叠契约的策略走此路径；P6 观察期后退役）。"""
         from app.market_cn.auto.core.filters import unified_prefilter
         from app.market_cn.auto.core.market import get_board_type
         p = self.params(None)
@@ -581,7 +649,14 @@ class StrategyBase:
                     "signal_price": float(d0["close"]), "extra": {}}
             exit_idx = exit_price = None
             exit_reason = ""
-            for j in range(entry_idx, n):
+            # ⚠ 起点 = entry_idx + 1 (入场次日 d=2), 不是 entry_idx —— A股 T+1: 当日买入
+            #   当日不可卖。对齐 core/replay 侧 (改进方案 P1-④「统一出场重放起点 D2」):
+            #   replay 的 ready→exec→exit 各占一天 ⇒ exit 事件最早落在 exec 次日 = d=2。
+            #   本循环若从 entry_idx 起就是 d=1 评估出场 —— 回放一个实盘不可能发生的卖出
+            #   (默认 exit_decision 的止损分支原本裸判 ⇒ d=1 会真触发, 见上方守卫)。
+            #   二者长期分叉, 是 P3 那次「replay == backtest_stock 逐笔一致」只在样本内
+            #   成立的原因 (样本内恰好没有入场当日触及止损的票)。
+            for j in range(entry_idx + 1, n):
                 snap = {"mode": "day_close", "bars": bars[:j + 1],
                         "entry_idx": entry_idx}
                 d = self.exit_decision(row0, snap=snap)

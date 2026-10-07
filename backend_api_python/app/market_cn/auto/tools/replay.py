@@ -63,6 +63,8 @@ def main():
     print(f"{args.code} {args.strategy} | {len(bars)} 根 "
           f"({bars[0]['time']} ~ {bars[-1]['time']})")
 
+    # P3: base.backtest_stock 已是薄壳 —— 有折叠契约且未覆写者自动走 core.replay，
+    #     覆写者仍走其自实现（逐个验证等价后删除覆写，即自动落到 replay）。
     trades = strat.backtest_stock(bars, args.code, stock_info=stock_info) or []
 
     if args.json:

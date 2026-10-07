@@ -528,6 +528,8 @@ class G56Strategy(StrategyBase):
             board = get_board_type(code)
             day_pool = ((inp.ctx or {}).get("_day") or {}).get("pool") or {}
             ok, st = self._gate(f, st_day, board, day_pool, bar.get("time", ""), p)
+            if (tr := (inp.ctx or {}).get("_trace")) is not None:   # 门原因通道（契约约定）
+                tr.gate(ok, st, date=str(bar.get("time", ""))[:10])
             if ok:
                 events.append(self._mk_ready(code, bar, f, st))
         return events

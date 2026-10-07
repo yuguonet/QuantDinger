@@ -372,6 +372,8 @@ class BreakStrategy(StrategyBase):
     #   (exit_decision / core.exit_engines), 与 knife/tail 的 "D1 开盘即平账" 不同。
     stages = (
         Stage("ready", "断板确认·准备", realtime="09:25"),
+        Stage("exec", "次日开盘买入", realtime="09:31"),
+        Stage("exit", "出场", realtime=None, visible=True),
     )
 
     # ---- 信号判定 ----
@@ -522,10 +524,30 @@ class BreakStrategy(StrategyBase):
         return [(w[0]["t"], w[0]["c"]), (w[-1]["t"], w[-1]["c"])]
 
     def evaluate(self, state: dict, inp: DayInput, prev: "Progress | None") -> list:
-        """信号日判定（门逻辑与 scan_signals 同一份实现，只换特征来源）。"""
+        """信号日判定 + 结算链（门逻辑与 scan_signals 同一份实现，只换特征来源）。
+
+        三段形态：
+          - prev=None（stateless / 生产投影）：只产 ready —— 与 scan_signals 同口径。
+          - prev=ready：今日 = D1 ⇒ 产 exec（入场价 = 今日开盘）。
+          - prev=exec ：持仓中 ⇒ 调 `exit_decision`（唯一出场实现）判定 ⇒ 产 exit。
+
+        ⚠ 结算分支**只在 prev 非 None 时触发**：stateless 下恒不进入 ⇒ 生产投影
+        口径零变化（改进方案 §2.6c「ready-only → 策略侧补结算事件」）。
+        """
         p = self.params()
         bar, code = inp.bar, inp.code
         today = self._rec(bar)
+
+        # ---- 结算分支（stateful 专属）----
+        if prev is not None:
+            stage = getattr(prev, "stage", "")
+            if stage == "ready":
+                return self._exec_event(state, inp, prev)
+            if stage == "exec":
+                return self._exit_event(state, inp, prev)
+
+        # ---- 判定分支（stateless / stateful 共用）----
+
         wb = [{"time": r["t"], "open": r["o"], "high": r["h"], "low": r["l"],
                "close": r["c"], "volume": r["v"]} for r in state["win"]] + [{
                    "time": today["t"], "open": today["o"], "high": today["h"],
@@ -591,6 +613,69 @@ class BreakStrategy(StrategyBase):
             })]
         return []
 
+    # ---- 结算事件（P3 §2.6c：break 事件链完备化，仅 stateful 触发）----
+    def _exec_event(self, state: dict, inp: DayInput, prev) -> list:
+        """prev=ready 且今日为 D1 ⇒ 产 exec（入场价 = 今日开盘，对齐旧 backtest_stock）。
+
+        旧 `backtest_stock` 的入场段只拦 `entry_price <= 0`（无 gap 门），此处同口径。
+        """
+        bar, code = inp.bar, inp.code
+        entry_price = float(bar.get("open") or 0)
+        if entry_price <= 0:
+            return []
+        return [Progress(stage="exec", date=str(bar.get("time", "")), payload={
+            "entry_date": str(bar.get("time", ""))[:10],
+            "entry_price": entry_price,
+            "entry_idx": state["abs_i"] + 1,        # 绝对下标（持仓天数用）
+            "buyable": True,
+        })]
+
+    def _exit_event(self, state: dict, inp: DayInput, prev) -> list:
+        """prev=exec ⇒ 调 `exit_decision`（唯一出场实现）判定今日是否离场。
+
+        `exit_decision` 需要「入场以来至今的 bars 片段 + entry_idx 相对位置」；此处
+        由 `state["win"]`（ring 窗口，60 根 ≫ hold_days=7）按 entry_date 定位切片。
+        ⚠ 不在本方法内重写任何出场规则 —— 那是第二份回测。
+        """
+        bar, code = inp.bar, inp.code
+        pl = getattr(prev, "payload", None) or {}
+        entry_price = float(pl.get("entry_price") or 0)
+        if entry_price <= 0:
+            return [Progress(stage="exit", date=str(bar.get("time", "")), payload={
+                "exit_reason": "入场价缺失", "exit_price": 0.0})]
+
+        today = self._rec(bar)
+        win = list(state["win"]) + [today]
+        entry_date = str(pl.get("entry_date") or "")[:10]
+        pos = next((k for k in range(len(win) - 1, -1, -1)
+                    if str(win[k]["t"])[:10] == entry_date), None)
+        if pos is None:                              # 窗口已滚掉入场日（>60 根，不应发生）
+            pos = max(0, len(win) - 2)
+        seg = [{"open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"]}
+               for r in win[pos:]]
+        dec = self.exit_decision(
+            {"code": code, "entry_price": entry_price},
+            snap={"mode": "day_close", "bars": seg, "entry_idx": 0})
+        if dec.action != "exit":
+            return []
+        # ⚠ `dec.price` 是**理论触发价**（追踪止损 = peak×0.94，实盘挂单用）；回测默认
+        #   fill_mode="close" = 收盘判定 + **收盘价成交**（对齐 `_run_backtest_breakbuy`）。
+        #   用 dec.price 成交会高估收益（实测 9.46% vs 3.73%）。
+        # 2026-10-07: `fill="open"` = 顺延强平 (昨日封跌停卖不出, 今日开盘成交) ⇒
+        #   按**开盘价**成交 (旧引擎 pending_dn 的次日 b['open'])。其余情形维持收盘价
+        #   成交 (对齐 fill_mode="close")。
+        exit_price = (float(today["o"]) if getattr(dec, "fill", "") == "open"
+                      else float(today["c"]))
+        peak = max(float(r["h"]) for r in win[pos:])
+        return [Progress(stage="exit", date=str(bar.get("time", "")), payload={
+            "exit_date": str(bar.get("time", ""))[:10],
+            "exit_price": exit_price,
+            "exit_reason": dec.reason,
+            "exit_day": len(win) - pos,
+            "return_pct": round((exit_price / entry_price - 1) * 100, 2),
+            "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
+        })]
+
     # ---- D1 竞价处置 ----
     def entry_decision(self, row, snap=None, **params):
         """break 无开盘 gap 过滤 (恒可买); 快照缺失不可买 (与 monitor skip 一致)。"""
@@ -641,9 +726,22 @@ class BreakStrategy(StrategyBase):
         return round(entry_price * (1 + (-10.0 if gem else -8.0) / 100), 3)
 
     # ---- 出场判定 ----
+    #: 旧引擎 `_run_backtest_breakbuy` 里带「跌停卖不出 ⇒ 顺延次日开盘」(pending_dn) 的腿。
+    #: ⚠ 逃顶/到期腿**不在内** —— 旧引擎对这两条腿不设 pending_dn (到期走尾部
+    #:   defer_force_open) ⇒ 给它们加判定反而会造出新的不等价。
+    _DN_GUARDED_REASONS = ("止损", "追踪止损")
+
     def exit_decision(self, row, snap=None, **params):
         """收盘价口径 (monitor break 分支 / run_backtest_breakbuy 语义):
-        止损 / 追踪止损(ret>0) / 峰值逃顶 / 到期。live 模式 → hold (硬止损在 monitor 主循环)。"""
+        止损 / 追踪止损(ret>0) / 峰值逃顶 / 到期。live 模式 → hold (硬止损在 monitor 主循环)。
+
+        2026-10-07 补「跌停不可卖」—— §5.1 逐笔对拍暴露的 **replay 侧缺陷**:
+          旧引擎在止损/甜点/追踪三条腿上都有 `close <= dn*1.002 ⇒ pending_dn` 顺延
+          (次日开盘 b['open'] 强平), 且一字跌停 `is_one_word_limit_dn` 整天无法成交;
+          本函数此前**一条都没有** ⇒ 贴跌停日仍按收盘价成交, 产生物理上不可能的成交。
+          实测 000506: 2026-06-23 收盘 13.54 (跌停价 15.04×0.9=13.536) ⇒ 旧引擎顺延至
+          06-24 开盘 13.2 成交, replay 却当日 13.54 成交。现按同口径补齐。
+        """
         if not isinstance(snap, dict) or snap.get("mode") != "day_close":
             return ExitDecision("hold")
         bars = snap.get("bars")
@@ -654,25 +752,65 @@ class BreakStrategy(StrategyBase):
         bt = get_board_type(row.get("code", ""))
         bp = BOARD_PARAMS["gem_star" if bt == "gem_star" else "main"]
         stop, trail, hold = bp["stop_loss"], bp["trailing_stop"], bp["hold_days"]
+
+        def _dn_at(i):
+            """bars[i] 的跌停价 (以前一日收盘为基准, 与旧引擎 dn 同式)。"""
+            pc = float(bars[i - 1]["close"]) if i > 0 and bars[i - 1].get("close") else 0
+            return _limit_dn_price(pc, bt) if pc > 0 else None
+
+        def _decide(end_idx):
+            """截至 bars[end_idx] 的出场判定 → (是否出场, reason, price)。"""
+            seg = bars[entry_idx:end_idx + 1]
+            if not seg:
+                return False, "", 0.0
+            peak = max(float(b["high"]) for b in seg)
+            lb = bars[end_idx]
+            r = (lb["close"] / entry_price - 1) * 100
+            rfh = (lb["close"] / peak - 1) * 100 if peak > 0 else 0
+            held = end_idx - entry_idx + 1
+            if r <= stop:
+                return True, f"止损{stop}%", entry_price * (1 + stop / 100)
+            if rfh <= trail and r > 0:
+                return True, f"追踪止损{trail}%", peak * (1 + trail / 100)
+            if r > 10:
+                bar_range = lb["high"] - lb["low"]
+                upper = ((lb["high"] - max(lb["open"], lb["close"])) / bar_range * 100
+                         if bar_range > 0 else 0)
+                if upper > 40 and lb["close"] < lb["high"] * 0.98:
+                    return True, "峰值逃顶", float(lb["close"])
+            if held >= hold:
+                return True, f"持仓到期{hold}天", float(lb["close"])
+            return False, "", 0.0
+
         today_idx = len(bars) - 1
-        held = today_idx - entry_idx + 1
-        entry_seg = bars[entry_idx:today_idx + 1]
-        peak = max(float(b["high"]) for b in entry_seg)
-        last_bar = bars[-1]
-        ret = (last_bar["close"] / entry_price - 1) * 100
-        ret_from_high = (last_bar["close"] / peak - 1) * 100 if peak > 0 else 0
-        if ret <= stop:
-            return ExitDecision("exit", reason=f"止损{stop}%", price=entry_price * (1 + stop / 100))
-        if ret_from_high <= trail and ret > 0:
-            return ExitDecision("exit", reason=f"追踪止损{trail}%", price=peak * (1 + trail / 100))
-        if ret > 10:
-            bar_range = last_bar["high"] - last_bar["low"]
-            upper = (last_bar["high"] - max(last_bar["open"], last_bar["close"])) / bar_range * 100 if bar_range > 0 else 0
-            if upper > 40 and last_bar["close"] < last_bar["high"] * 0.98:
-                return ExitDecision("exit", reason="峰值逃顶", price=float(last_bar["close"]))
-        if held >= hold:
-            return ExitDecision("exit", reason=f"持仓到期{hold}天", price=float(last_bar["close"]))
-        return ExitDecision("hold")
+        if today_idx < entry_idx:
+            return ExitDecision("hold")
+
+        # ① 昨日触发但该日封跌停卖不出 ⇒ 今日开盘强平 (旧引擎 pending_dn → 次日 b['open'])
+        if today_idx - 1 >= entry_idx:
+            y_trig, y_reason, _yp = _decide(today_idx - 1)
+            y_dn = _dn_at(today_idx - 1)
+            if (y_trig and y_reason.startswith(self._DN_GUARDED_REASONS)
+                    and y_dn is not None
+                    and float(bars[today_idx - 1]["close"]) <= y_dn * 1.002):
+                return ExitDecision("exit", reason=y_reason,
+                                    price=float(bars[today_idx]["open"]),
+                                    fill="open")      # ⇒ 调用方按开盘价成交
+
+        dn_today = _dn_at(today_idx)
+        # ② 一字跌停: 全天无成交可能 ⇒ 持仓顺延 (旧引擎 is_one_word_limit_dn → continue)
+        if dn_today is not None and is_one_word_limit_dn(bars[today_idx], dn_today):
+            return ExitDecision("hold")
+
+        trig, reason, price = _decide(today_idx)
+        if not trig:
+            return ExitDecision("hold")
+
+        # ③ 今日触发但收盘贴跌停 ⇒ 当日卖不出, 顺延次日开盘 (旧引擎 pending_dn)
+        if (reason.startswith(self._DN_GUARDED_REASONS) and dn_today is not None
+                and float(bars[today_idx]["close"]) <= dn_today * 1.002):
+            return ExitDecision("hold")
+        return ExitDecision("exit", reason=reason, price=price)
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_break_stock 逐字搬入, 对数零差异) ----
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,

@@ -514,3 +514,88 @@ def prev_closes(before_date):
         except OSError as e:
             logger.debug("[frames] pc 缓存写盘失败: %s", e)
     return out
+
+
+def load_code_minutes(code, start, end):
+    """单票区间分钟线 → {date: [bar, ...]} (qfq, 按时间升序)。
+
+    与 ``build_frame`` 的分工: build_frame 面向**全市场单日**(横截面聚合, 走 npz 缓存);
+    单票回放(``core/replay/intraday``)需要的是**单票全历史** —— 若逐日调 build_frame,
+    无缓存日要重建全市场帧(数十秒/日), 1m 覆盖 160+ 交易日 ⇒ 全历史回放不可行
+    (改进方案 §6-4 的已知瓶颈, 旧 ``run_all_intraday`` 同样受限于此)。
+
+    本函数一次 SQL 取全区间(约 240 行/交易日), 内存按日切分。**qfq 对整段一次完成**:
+    复权因子是时间序列连续量, 按日切片各自 qfq 会在段间引入断点。
+
+    ⚠ 分钟表按年分表 ⇒ 跨年区间逐年查(年份表不存在时告警并跳过, 不静默补空)。
+    """
+    code = str(code)
+    start, end = str(start)[:10], str(end)[:10]
+    rows = []
+    from app.utils.db_market import get_market_db_manager
+    mgr = get_market_db_manager()
+    pool = mgr._get_pool("CNStock")
+    for y in range(int(start[:4]), int(end[:4]) + 1):
+        lo = f"{start} 00:00:00" if y == int(start[:4]) else f"{y}-01-01 00:00:00"
+        hi = f"{end} 23:59:59" if y == int(end[:4]) else f"{y}-12-31 23:59:59"
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f'SELECT time, open, high, low, close, volume '
+                        f'FROM "kline_1m_{y}" WHERE symbol = %s '
+                        f'AND time >= %s AND time <= %s ORDER BY time',
+                        (code, lo, hi))
+                    cols = [d[0] for d in cur.description]
+                    rows.extend(dict(zip(cols, r)) for r in cur.fetchall())
+        except Exception as e:
+            logger.warning("[frames] %s %d 年分钟取数失败: %s", code, y, e)
+    if not rows:
+        return {}
+    bars = _qfq_bars(code, [
+        {"time": str(r["time"]), "open": float(r["open"] or 0), "high": float(r["high"] or 0),
+         "low": float(r["low"] or 0), "close": float(r["close"] or 0),
+         "volume": float(r["volume"] or 0)}
+        for r in rows])
+    out: dict[str, list[dict]] = {}
+    for b in bars:
+        out.setdefault(str(b["time"])[:10], []).append(b)
+    return out
+
+
+def snap_series(date, bars, pc, lo_hhmm="09:31", hi_hhmm="15:00"):
+    """当日分钟 bars → 快照序列 (与 ``MinuteFrame.snap`` 逐字段同形)。
+
+    单票回放没有 MinuteFrame(那是全市场结构), 快照口径必须与它**逐字段一致**, 否则
+    knife/tail 的盘中判定与生产链(走 frame.snap)分叉:
+      - ``last``/``open`` = bar[pos].open (位置口径, 不是该分钟收盘)
+      - ``high``/``low``  = 截至 pos-1 的累计极值 (exclusive; pos=0 退化为 last)
+      - ``volume``        = 截至 pos(含)的累计量
+      - ``time``          = "YYYY-MM-DD HH:MM:SS" (knife._tail_ret 依赖 strptime 解析)
+    """
+    if not bars:
+        return []
+    try:
+        lo, hi = hhmm_to_pos(lo_hhmm), hhmm_to_pos(hi_hhmm)
+    except ValueError:
+        return []
+    if lo < 0 or hi < lo:
+        return []
+    out, vcum, hi_v, lo_v = [], 0.0, None, None
+    for pos, b in enumerate(bars):
+        if pos > hi:
+            break
+        vcum += float(b.get("volume") or 0)
+        if pos < lo:
+            hi_v = b["high"] if hi_v is None else max(hi_v, b["high"])
+            lo_v = b["low"] if lo_v is None else min(lo_v, b["low"])
+            continue
+        last = float(b["open"])
+        out.append({"time": f"{str(date)[:10]} {MI_HHMM[pos]}:00", "open": last,
+                    "high": float(hi_v) if hi_v is not None else last,
+                    "low": float(lo_v) if lo_v is not None else last,
+                    "last": last, "previousClose": float(pc) if pc else 0,
+                    "volume": vcum})
+        hi_v = b["high"] if hi_v is None else max(hi_v, b["high"])
+        lo_v = b["low"] if lo_v is None else min(lo_v, b["low"])
+    return out

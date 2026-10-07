@@ -77,7 +77,8 @@ class DayInput:
     - bar: 当日日线 {time,open,high,low,close,volume}；实时分支为部分 bar
       （快照累计值：close=last、volume=当日累计量、open=当日开盘）
     - ctx: 盘中数据 {"latest": 快照, "series": [快照行], "mkt_gain": float}；
-      纯日线判定时为 None
+      纯日线判定时为 None。可选键 `"_trace"`: core.trace.TraceSink（门原因通道；
+      (ok,reason) 约定与 payload 保留键名表见 core/trace.py 头）
     """
 
     code: str

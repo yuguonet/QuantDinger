@@ -64,26 +64,63 @@ def ema(values, period):
     return e
 
 
-def rsi(closes, period=14):
-    """计算RSI (相对强弱指数)"""
+# ================================================================
+# RS(相对强弱) —— Wilder 递推, 单一实现 (2026-10-07)
+#   state = [avg_g, avg_l] (Wilder 平滑的均涨幅/均跌幅) —— 有界摘要 (2 个 float)。
+#   三种口径共用同一份递推:
+#       rsi_state(closes,p)    全量 → state (seed, O(n))
+#       rsi_step(state,pc,c,p) 逐格推进 (O(1))
+#       rsi_value(state)       state → RSI 数值
+#       rsi(closes,p)          终端值 = rsi_value(rsi_state(closes, p))
+#   ★ 此前 `strategies/dragon_callback.rsi_init/rsi_step/rsi_value` 另写一份**同式**
+#     实现 (周期 6): 与 `rsi()` 逐位同源却各改各的 = 漂移温床。现收敛到本处,
+#     dragon 改为委托 (见 core/increm.RsiKernel / dragon 顶部 import)。
+# ⚠ 与 `core/features/cross_section._rsi` **不是**同一指标: 后者用**滑窗均值**
+#   (SMA of gains/losses, period=14, 序列口径), 本处是 **Wilder 平滑**。二者数值
+#   不同, 各有其门阈值 —— **不要互换**。
+# ================================================================
+
+def rsi_state(closes, period=14):
+    """全量 closes → Wilder 状态 [avg_g, avg_l]; len < period+1 → None。"""
     if len(closes) < period + 1:
         return None
     gains, losses = [], []
     for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
+        d = closes[i] - closes[i - 1]
         gains.append(max(d, 0))
         losses.append(max(-d, 0))
-    # 初始SMA
+    # 初始 SMA
     avg_g = sum(gains[:period]) / period
     avg_l = sum(losses[:period]) / period
-    # EMA平滑
+    # Wilder 平滑
     for i in range(period, len(gains)):
         avg_g = (avg_g * (period - 1) + gains[i]) / period
         avg_l = (avg_l * (period - 1) + losses[i]) / period
+    return [avg_g, avg_l]
+
+
+def rsi_step(state, prev_close, close, period=14):
+    """Wilder 递推一步 (state None → None)。"""
+    if state is None:
+        return None
+    d = close - prev_close
+    return [(state[0] * (period - 1) + max(d, 0)) / period,
+            (state[1] * (period - 1) + max(-d, 0)) / period]
+
+
+def rsi_value(state):
+    """Wilder 状态 → RSI 数值 (state None → None)。"""
+    if state is None:
+        return None
+    avg_g, avg_l = state
     if avg_l == 0:
         return 100.0
-    rs = avg_g / avg_l
-    return 100 - 100 / (1 + rs)
+    return 100 - 100 / (1 + avg_g / avg_l)
+
+
+def rsi(closes, period=14):
+    """计算RSI (相对强弱指数) —— 终端值 = rsi_value(rsi_state(closes, period))。"""
+    return rsi_value(rsi_state(closes, period))
 
 
 # ================================================================

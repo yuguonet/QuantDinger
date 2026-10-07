@@ -204,42 +204,24 @@ RING = 40          # 递推窗口: 门窗口 28 + 出场重放 ≤7 天 + 跌停
 
 # anchor_step 与 cross_section 同源 (G1 状态机推进 EMA 锚)
 from app.market_cn.auto.core.features.cross_section import _anchor_step  # noqa: E402
+# Wilder RSI 递推单一实现 (基座叶子层) —— 本文件只留策略口径包装 (周期 6)
+from app.utils.indicators import (  # noqa: E402
+    rsi_state as _rsi_state, rsi_step as _rsi_step_i, rsi_value as _rsi_value_i)
 
 
 def rsi_init(closes, period=6):
     """全量 closes → 增量状态 [avg_g, avg_l]; len<period+1 → None。"""
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_g = sum(gains[:period]) / period
-    avg_l = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_g = (avg_g * (period - 1) + gains[i]) / period
-        avg_l = (avg_l * (period - 1) + losses[i]) / period
-    return [avg_g, avg_l]
+    return _rsi_state(closes, period)
 
 
 def rsi_step(st, prev_close, close, period=6):
     """推进一步 (Wilder); st 为 None 时返回 None。"""
-    if st is None:
-        return None
-    d = close - prev_close
-    return [(st[0] * (period - 1) + max(d, 0)) / period,
-            (st[1] * (period - 1) + max(-d, 0)) / period]
+    return _rsi_step_i(st, prev_close, close, period)
 
 
 def rsi_value(st):
     """增量状态 → RSI 值 (与全量 rsi() 同式)。"""
-    if st is None:
-        return None
-    avg_g, avg_l = st
-    if avg_l == 0:
-        return 100.0
-    return 100 - 100 / (1 + avg_g / avg_l)
+    return _rsi_value_i(st)
 
 
 def _tech_block(closes, use_tech_score=True, *, macd_triple=None, rsi_val=None):
@@ -942,6 +924,8 @@ class DragonCallbackStrategy(StrategyBase):
                 "c": c_i, "last_chg": last_chg, "rsi_val": rsi_val,
                 "d0_vs_ma20": d0_vs_ma20, "depth": depth, "yin_ratio": yin_ratio,
             })
+            if (tr := (ctx or {}).get("_trace")) is not None:   # 门原因通道（契约约定）
+                tr.gate(ok, _reason, cand=rec["date"], date=str(bar.get("time", ""))[:10])
             if not ok:
                 continue
             # ---- 胜者：构造 Signal ----

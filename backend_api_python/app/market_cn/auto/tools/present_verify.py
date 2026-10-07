@@ -37,7 +37,9 @@ import time
 
 from app.market_cn.auto.core.present.contract import DayInput, Progress
 from app.market_cn.auto.core.present.realtime import RealtimeBranch
-from app.market_cn.auto.core.present.runner import DailyRunner, Record, StateStore, strategy_source_hash
+from app.market_cn.auto.core.present.runner import (
+    DailyRunner, Record, StateStore, evaluate_day, strategy_source_hash,
+)
 from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
 from app.market_cn.auto.strategies.tail_oversold import TailOversoldStrategy
 
@@ -148,16 +150,20 @@ def check_realtime_equals_preprocess(strategy, code, bars) -> tuple[bool, str]:
     prev = Progress(stage="ready", date=d0["time"], payload={"price": entry_px},
                     next_realtime="09:31")
 
-    # 预处理侧: 权威切片 + 完整 bar
-    ev_pre = strategy.evaluate(dict(state), DayInput(code, d1, None), prev)
-    # 实时侧: 落一份带 prev 的记录 → 走 RealtimeBranch.tick (副本试推, 不落盘)
-    rec = Record(date=d0["time"], state=state, current=prev,
-                 strategy_hash=strategy_source_hash(strategy))
-    store.save(strategy.key or "verify", code, rec)
+    # 实时侧输入 = 未收盘快照 (两侧必须**同一份**, 否则比的是两个输入而不是两个分支)
     snap = {"time": f"{d1['time']} 09:31:00", "open": float(d1["open"]),
             "high": float(d1["high"]), "low": float(d1["low"]),
             "last": float(d1["open"]), "volume": float(d1["volume"]),
             "previousClose": float(d0["close"])}
+
+    # 预处理侧: 权威切片 + 完整 bar。**必须与实时分支用同一个判定入口**
+    #   (`evaluate_day`: ready 恒 stateless + 生命周期 stateful)，否则比的是两个语义。
+    ctx = {"latest": snap, "series": [snap], "mkt_gain": None}
+    ev_pre, _head = evaluate_day(strategy, code, dict(state), d1, ctx, prev)
+    # 实时侧: 落一份带 prev 的记录 → 走 RealtimeBranch.tick (副本试推, 不落盘)
+    rec = Record(date=d0["time"], state=state, current=prev,
+                 strategy_hash=strategy_source_hash(strategy))
+    store.save(strategy.key or "verify", code, rec)
     rt = RealtimeBranch(store, {strategy.key or "verify": strategy})
     hits = rt.tick("09:31", [code], {code: snap}, {code: [snap]}, None)
     ev_rt = [p for _, p in hits]

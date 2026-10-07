@@ -313,38 +313,58 @@ def _conclude_gate(out: dict) -> str:
 # ================================================================
 def report_plugin(key: str, strat, bars: list, code: str, stock_info,
                   date: str, days: int) -> dict:
-    """*.py 策略单候选追踪: backtest_stock(probe=内存探针) → 目标日 sample/rule_trace。"""
-    probe = MemProbe()
-    try:
-        trades = strat.backtest_stock(bars, code, stock_info=stock_info,
-                                     probe=probe) or []
-    except TypeError:
-        # 极少数策略未接 probe 形参 → 退化为无探针逐笔
-        trades = strat.backtest_stock(bars, code, stock_info=stock_info) or []
+    """*.py 策略单候选追踪: 调试视图 = replay + TraceCollector（P2 落地）。
 
-    day_samples = [s for s in probe.samples
-                   if str(s.get("d0_date") or "")[:10] == date]
+    旧实现走 ``backtest_stock(probe=MemProbe)`` —— g56 的 backtest_stock 根本不
+    用 probe 形参，probe.samples/traces 恒空，只能拿 trades。现改为 replay 驱动：
+      - trades   ← TradesCollector（事件链 → 逐笔，golden 已对账）
+      - 门原因   ← TraceCollector（ctx["_trace"]，dragon/g56 已接线）
+    未接 _trace 的旧策略（P3 才抽血）门原因为空，退化为仅 trades（与旧行为一致，
+    不报错）。横截面池策略（g56）走 replay_batch。
+    """
     out = {"mode": "plugin", "strategy": key, "code": code, "date": date,
-           "samples": day_samples, "traces": probe.traces, "trades": trades,
-           "conclusion": ""}
+           "samples": [], "traces": [], "trades": [], "conclusion": ""}
 
-    if day_samples:
-        for s in day_samples:
-            print(f"  决策日追踪 (策略自带 TRACE): stage={s.get('stage')}")
-            for t in (s.get("rule_trace") or []):
-                kw = {k: v for k, v in t.items() if k != "stage"}
-                print(f"    · {t.get('stage'):<14} {kw}")
-            feats = s.get("features") or {}
-            if feats:
-                show = {k: feats.get(k) for k in
-                        ("d0_pct_chg", "vol_r", "turnover_d0", "rsi6", "board_type")
-                        if k in feats}
-                print(f"    特征: {show}")
-            if s.get("sig"):
-                print(f"    信号: {s['sig']}")
+    from app.market_cn.auto.core.replay import (
+        replay_batch, TradesCollector, TraceCollector)
+    # g56 等横截面池策略：单票 replay 缺 begin_day 池 ⇒ 走 replay_batch
+    tc = TraceCollector(code=code, strategy=key)
+    trades_coll = TradesCollector(code=code, strategy=key)
+    try:
+        res = replay_batch(strat, {code: bars},
+                           collectors={code: [trades_coll, tc]})
+        r = res.get(code)
+        trades = (r.trades if r else []) or []
+        traces = (r.trace if r else []) or []
+    except Exception:
+        # replay 不可用（未迁移折叠契约的旧策略）→ 退化为旧 backtest_stock
+        trades = []
+        try:
+            trades = strat.backtest_stock(bars, code, stock_info=stock_info) or []
+        except TypeError:
+            trades = strat.backtest_stock(bars, code, stock_info=stock_info) or []
+        traces = []
+
+    out["trades"] = trades
+    out["traces"] = traces
+    day_traces = [t for t in traces if str(t.get("date") or "")[:10] == date]
+    if day_traces:
+        print(f"  决策日门原因链 (TraceCollector): {len(day_traces)} 条")
+        for t in day_traces:
+            passed = bool(t.get("ok"))
+            mark = "✓" if passed else "✗"
+            reason = t.get("reason")
+            if reason:
+                why = reason
+            elif passed:
+                why = "(通过)"
+            else:
+                why = "(落选, 聚合器未提供原因 — 见 P0/P3 门聚合器 reason 补全)"
+            kw = {k: v for k, v in t.items()
+                  if k not in ("t", "ok", "reason", "code")}
+            print(f"    {mark} {why} {kw}")
     else:
-        print(f"  {date} 无判定样本 (该日未到达完整判定 / 廉价预筛跳过 — "
-              f"策略对'预筛跳过日'不采样)")
+        print(f"  {date} 无门原因记录 (该策略未接 ctx['_trace'] 打点 / 该日未进判定)")
 
     sig_key = ("signal_date", "d0_date")
     mine = next((t for t in trades
@@ -360,10 +380,14 @@ def _conclude_plugin(out: dict) -> str:
         return (f"✅ {out['date']} 出信号 → 买入 @{t.get('entry_price')} → "
                 f"出场 {t.get('exit_reason') or ''} @{t.get('exit_price')} "
                 f"| 收益 {t.get('return_pct')}%")
-    if out.get("samples"):
-        st = out["samples"][0].get("stage")
-        return f"✗ {out['date']} 无信号 — 最深判定步 stage={st} (见上方 TRACE)"
-    return f"✗ {out['date']} 无信号 — 该日未到达完整判定 (预筛跳过; 用法见 `qd gates` 看聚合)"
+    if out.get("traces"):
+        last = out["traces"][-1]
+        if last.get("reason"):
+            return (f"✗ {out['date']} 无信号 — 末条门原因: "
+                    f"{last.get('reason')} (见上方门原因链)")
+        return (f"✗ {out['date']} 无信号 — 末条门落选 (聚合器未提供原因, "
+                f"见 P0/P3 reason 补全)")
+    return f"✗ {out['date']} 无信号 — 该日未进判定 (见上方门原因链)"
 
 
 # ================================================================

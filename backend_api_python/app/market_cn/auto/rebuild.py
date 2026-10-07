@@ -188,7 +188,8 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
     """重算最近 window 个交易日的应然信号集。
 
     返回 (expected, meta):
-      expected: {(date, strategy, code): row}  row 与 store.signal_row 同构
+      expected: {(date, strategy, code, entry_style): row}  row 与 store.signal_row 同构
+                (2026-10-07 A2: 键补 entry_style, 与 load_actual / 库唯一键同粒度)
       meta    : 诊断信息 (轴/窗口/成本/跳过项)
     """
     from app.market_cn.auto import store
@@ -298,7 +299,10 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
         for r in rows:
             # signal_row 不含 trade_date (它以 signal_date 表达); 写库需要显式 trade_date
             r = dict(r, trade_date=date)
-            expected[(date, r["strategy"], r["code"])] = r
+            # 2026-10-07 A2 修复: 键补 entry_style（与库唯一键同粒度）。本处是**重放侧**，
+            #   replay 的键源自这里，必须与 load_actual 同粒度 —— 否则 build_ledger_plan
+            #   的 actual.get(k) 判不到已有行 ⇒ 全表走 insert（生产写库事故）。
+            expected[(date, r["strategy"], r["code"], r.get("style") or "a")] = r
 
     meta = {
         "days": days, "window": len(win), "win_from": lo, "win_to": hi,
@@ -322,7 +326,7 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
 # ================================================================
 
 def load_actual(win, keys=None):
-    """从库里读窗口内的现状行 → {(date, strategy, code): row}。"""
+    """从库里读窗口内的现状行 → {(date, strategy, code, entry_style): row}。"""
     from app.market_cn.auto import store
     wset = set(win)
     out = {}
@@ -338,7 +342,9 @@ def load_actual(win, keys=None):
     for r in store.list_signals(days=days, strategies=list(keys) if keys else None):
         d = str(r.get("trade_date"))[:10]
         if d in wset:
-            out[(d, r.get("strategy"), r.get("code"))] = r
+            # 2026-10-07 A2 修复: 键补 entry_style（与 project_rows / 库唯一键同粒度），
+            #   详见 store.load_projection 内注释 —— 三处必须同步改。
+            out[(d, r.get("strategy"), r.get("code"), r.get("entry_style") or "a")] = r
     return out
 
 
@@ -392,8 +398,8 @@ def build_plan(expected, actual, meta):
     """应然集 vs 现状 → 可执行写库计划。
 
     Args:
-        expected: {(date, strategy, code): row}  应然集
-        actual:   {(date, strategy, code): row}  库现状 (窗口内)
+        expected: {(date, strategy, code, entry_style): row}  应然集
+        actual:   {(date, strategy, code, entry_style): row}  库现状 (窗口内)
         meta:     build_expected 的 meta
 
     Returns:

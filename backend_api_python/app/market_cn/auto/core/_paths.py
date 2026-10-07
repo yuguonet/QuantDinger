@@ -46,6 +46,11 @@ MARKETS_DIR: str = os.path.join(AUTO_DIR, "adapters", "markets")
 ENV_FILE: str = os.path.join(PROJECT_ROOT, ".env")
 #: 缓存根（不进源码树）
 CACHE_ROOT: str = os.path.join(PROJECT_ROOT, "data", "market_cn_cache")
+#: 展示层切片落盘根（StateStore 的唯一**生产** root；P5 影子期起用）。
+#: 归 CACHE_ROOT 名下：与 frames/index 同类 ——「不进源码树的可重建产物」。
+#: ⚠ 放这里而不是 core/data/hub.py：hub 是市场数据**只读**出口，StateStore 是登记过的
+#:   唯一**写盘**例外，两者根锚点分开写反而容易各自漂。
+PRESENT_STATE_DIR: str = os.path.join(CACHE_ROOT, "present_state")
 
 
 def load_env_first_found(*extra: str) -> None:

@@ -1,18 +1,9 @@
 """runner.py — 生命周期（展示层全部职责）。
 
-每日 D+1 收盘、数据齐全后跑一步折叠；状态可疑 → 切片重建（唯一恢复手段，
-没有回退/降级/迁移）。重建条件（设计要点④ + 同日幂等）：
-
-    同日重跑（bar 日期 == 切片日期）且无异常 → 幂等 no-op（不重复出事件）
-    ① 日期错位：bar 日期 < 切片日期（乱序/旧数据重发）
-    ② 日期断档：切片不在 bars[-2]（昨根）上（漏推进/停牌复牌补录/来源切换）
-    ③ 除权/订正：probe(state) 锚点与当前 bars 严格相等比对失败（锚窗口两端：
-       首根防历史整体改写，末根防同日修正）
-    ④ 策略文件被修改：state 里存的策略源码 sha256 ≠ 当前
-
-重建 = 只重建数据切片 state；规则进度 current 与事件流水 events 是
-"发生过的事实"（设计要点②的展示记录），跨重建保留——持仓阶段不会因数据
-修复被静默丢弃（否则"永不过期/信号丢失"类 bug 复现）。
+每日 D+1 收盘、数据齐全后跑一步折叠；状态可疑 → 切片重建（唯一恢复手段，没有回退/
+降级/迁移；四个重建条件与同日幂等见 `_rebuild_reason`）。重建 = 只重建数据切片 state；
+规则进度 current 与事件流水 events 是"发生过的事实"（设计要点②的展示记录），**跨重建
+保留** —— 持仓阶段不会因数据修复被静默丢弃（否则"永不过期/信号丢失"类 bug 复现）。
 
 ⚠ 保留的代价: 旧结构 payload 会被新 evaluate 当 prev 消费 ⇒ **改 stage 键 / payload
   结构 = 视同改规则**，但 ④ 的 sha 重建**兜不住**（旧 payload 保留）⇒ 走重的一档:
@@ -21,46 +12,26 @@
 fold 三分支共用：回测 = 循环调 run_day；预处理 = 每天调一次并落盘。
 
 ====================================================================
-落盘与缓存（2026-10-06）—— 滑动展示必须配读写缓存，否则全耗在磁盘
+落盘与缓存 —— 滑动展示必须配读写缓存，否则全耗在磁盘
 ====================================================================
-逐票单文件 + 每步立即落盘的代价（实测 Windows/NTFS, per 票）:
-    save 6.7~7.3 ms (makedirs 1.5 + dump/open 1.9 + replace 3.2)、load 0.3 ms
-  ⇒ 一步 advance ≈ **7 ms 几乎全是 save**；5236 票 ≈ 36 s/日, 比现有批量全量
-    重算 25 s **更慢** —— 不加缓存就让生产改滑动是净负收益。
-
-目标态（本文件现状，只有两件事）:
-  1. **进程内共享缓存**: 同 root 的 StateStore 共享一份后端, 实例重建不清空
-     (否则"save 后新建实例读"必然落空 ⇒ 只能每次落盘 ⇒ 缓存白加)。
-  2. **一个策略 key 一个文件, 一轮只写一次**: 写 = 只更新缓存 + 标脏；落盘只在
-     flush()（batching() 退出 / 显式调用 / atexit 兜底）。单票 advance 不落盘。
-
-为什么**不**分片（2026-10-06 实测推翻同日上午的分片方案）:
-  5236 票 state 仅 1.9~16.6 MB ⇒ **dump 不是瓶颈，IO 次数才是**：每次
-  open+os.replace 固定成本 3.2 ms × 片数 = 纯劣势，全程无拐点（write ms）:
-    片数:      1      4     16     64    256
-    knife    353    392    497    804   1921   （读同向 85 → 2271）
-    dragon  2454   2488   2710   3030   4338   （读同向 505 → 3224）
-  ⇒ 1 片（每 key 单文件）写读双胜，且少一层 crc32 分片映射。
-  ⚠ 教训: 上午扫到"越少越快"后却取 16，理由是"单文件太大"这个**无数据的主观顾虑**
-    —— 扫描必须走到极值再收手。
-  ⚠ 单文件代价: ① 崩溃丢失面变大 —— 但 tmp+os.replace 原子替换 ⇒ 旧文件完好，下次
-    由重建条件②检出重建；② 实时 tick 点查首读整文件（dragon 16.6 MB ≈ 505 ms）——
-    后端进程内缓存只 load 一次，长驻进程每天只付一次。
-
-端到端实测（5236 票，seed 一次 + 连续 3 日滑动，合成日线，同机；改前=16 分片）:
-    knife 0.91→0.243 s (3.7x) | tail 0.87→0.260 s (3.3x) | dragon 3.67→1.007 s (3.6x)
-    g56   5.86→4.571 s (1.3x —— 瓶颈是 begin_day 横截面池计算, 不是 IO)
-    落盘次数 16 次/日 → 1 次/日
+当前态（实测数据与决策过程见 .workbuddy/memory / 改进方案 §5.4）:
+  1. **进程内共享缓存**（同 root 共享一份后端）: 否则"save 后新建实例读"必然落空
+     ⇒ 只能每次落盘 ⇒ 缓存白加。
+  2. **一个策略 key 一个文件，一轮只写一次**: 写 = 更新缓存 + 标脏；落盘只在
+     flush()（batching() 退出 / 显式 / atexit 兜底）。单票 advance 不落盘。
+     ⚠ **不分片**: dump 不是瓶颈、IO 次数才是（每次 open+os.replace 固定 3.2 ms
+     × 片数 ⇒ 片数越多越慢，全程无拐点）⇒ 1 片写读双胜。
+     ⚠ 单文件代价: 崩溃丢失面变大（靠 tmp+os.replace 原子替换 + 重建条件②兜）；
+     实时点查首读整文件（dragon 16.6 MB ≈ 505 ms，长驻进程每天只付一次）。
 
 ⚠ **落盘出口唯一**: 策略文件不得自己开文件写盘。跨票的**策略级共享状态**（如 g56
   的横截面池台账）经 `init_shared`/`shared_snapshot` 契约与本策略每票 state 存在
   **同一文件**、同一轮落盘 ⇒ 生命周期一致（旧 g56 台账自带文件且默认不落盘 ⇒ 重启
-  后池静默丢失、分位照算不报错）。⇒ 四策略每日 ≈ 6.1 s（改前 11.3 s），低于全量重算 25 s。
+  后池静默丢失、分位照算不报错）。
 
-⚠ 第二个 IO 源 (曾占滑动 43%): `strategy_source_hash` 每票读一次策略源文件算
-  sha256 = 0.157 ms × 5236 = **0.82 s/日**。现单条缓存 (上次校验时刻, mtime, size,
-  sha): TTL(1s) 内直接回、过期才 stat 且 (mtime,size) 未变就不读文件 ⇒ 3.5 ms/日，
-  且 ④"改策略文件就重建" 语义保持。
+⚠ 第二个 IO 源: `strategy_source_hash` 每票读一次策略源算 sha256 = 0.82 s/日（曾占
+  滑动 43%）。现单条缓存 (上次校验时刻, mtime, size, sha): TTL 内直接回、过期才 stat
+  且 (mtime,size) 未变就不读文件 ⇒ 3.5 ms/日，④ 语义保持。
 
 ⚠ 切片格式变更的处置只有一条: **删状态目录重建**。文件里读不出 `codes` 段就视同
   损坏（按无记录装载，下轮 flush 整文件覆写），不做旧格式兼容分支。
@@ -90,10 +61,8 @@ class RebuildNeedsHistory(Exception):
     """重建触发但调用方未提供全量历史（1 日延伸接口的硬要求：重建必须能重seed）。"""
 
 
-#: path -> (上次校验时刻, mtime, size, sha256) —— **一个条目一种失效语义**。
-#: ⚠ 不缓存的代价（实测）: 每票每天重读策略源文件算 sha256 = 0.157 ms/次
-#:   × 5236 票 = **0.82 s/日**，与落盘同量级，曾占滑动总耗时的 43%。
-#:   ⇒ 3.5 ms/日，且 ④ 语义保持: 改策略文件后下一轮（≥1s）必然检出并重建。
+#: path -> (上次校验时刻, mtime, size, sha256) —— **一个条目一种失效语义**（见文件头
+#: 「第二个 IO 源」）。TTL 内直接回；过期 stat 且 (mtime,size) 未变则不读文件。
 _HASH_CACHE: dict[str, tuple[float, float, int, str]] = {}
 _HASH_TTL = 1.0     # 秒
 
@@ -166,25 +135,15 @@ class Record:
 
 
 class StateStoreFlushError(OSError):
-    """flush 落盘失败。
-
-    ⚠ 必须显式抛出并登记，不得静默：静默的落盘失败 = 展示层"看起来在推进、
-    实际每次都从头重建"，是最难发现的一类缺陷。
-    """
+    """flush 落盘失败。⚠ 必须显式抛出并登记：静默的落盘失败 = 展示层"看起来在推进、
+    实际每次都从头重建"，最难发现的一类缺陷。"""
 
 
 class _Backend:
-    """一个 state 根目录对应的**进程内共享**缓存 + 单文件落盘后端。
+    """一个 state 根目录对应的**进程内共享**缓存 + 单文件落盘后端（见文件头「落盘与缓存」）。
 
-    为什么是进程内共享（而不是每个 StateStore 实例一份）:
-        调用方/测试会**重复构造** StateStore(root)。若缓存随实例走，
-        "save 之后新建实例读"必然落空 ⇒ 只能退化成每次 save 都落盘 ⇒ 缓存白加。
-        共享后缓存生命周期 = 进程，与实例个数无关，落盘时机才解放出来。
-
-    为什么一个 key 一个文件（而不是逐票单文件、也不是分片）:
-        见文件头实测。落盘代价 = 每次 open+os.replace 的**固定成本**(3.2 ms)
-        + 与总字节成正比的 dump 成本；5236 票 state 仅 1.9~16.6 MB，dump 不是
-        瓶颈，**IO 次数才是** ⇒ 直接取极值：每 key 一次 IO。
+    ⚠ 共享而非随实例: 调用方/测试会重复构造 StateStore(root)，缓存随实例走则
+      "save 之后新建实例读"必然落空 ⇒ 只能每次 save 都落盘 ⇒ 缓存白加。
     """
 
     def __init__(self, root: str):
@@ -203,8 +162,8 @@ class _Backend:
     def _ensure(self, key: str) -> None:
         """首次访问某 key 时**整文件一次读入**（天然批量预取，无分片映射）。
 
-        ⚠ 未知格式 = 视同损坏（不解析、不迁移）：可重建缓存不为旧格式背兼容债，此处按
-          "无记录"装载，下轮 flush 覆写 ⇒ 格式处置只剩"删状态目录重建"（打 stderr，不静默）。
+        ⚠ 未知格式 = 视同损坏（不解析、不迁移）: 按"无记录"装载，下轮 flush 覆写
+          ⇒ 格式处置只剩"删状态目录重建"（打 stderr，不静默）。
         """
         if key in self._loaded:
             return
@@ -257,11 +216,10 @@ class _Backend:
             p = self.path(key)
             tmp = p + ".tmp"
             try:
-                # 每次 flush 无条件 makedirs: 每天 ~4-8 次 flush，毫秒级成本，换掉
-                # `_dir_ready` 标志"目录被外部删除后写失败"的坑。
+                # 无条件 makedirs: 每天几次 flush，毫秒级成本，换掉 `_dir_ready` 标志
+                # "目录被外部删除后写失败"的坑。紧凑分隔符: 体积/dump 时间各降 ~1/3
+                # （state 是不透明 blob，不靠人读）。
                 os.makedirs(self.root, exist_ok=True)
-                # 紧凑分隔符: 体积与 dump 时间都降约 1/3（state 是不透明 blob，
-                # 不靠人读，可读性让步给 IO）
                 s = json.dumps({"codes": payload, "meta": self._meta.get(key) or {}},
                                ensure_ascii=False, separators=(",", ":"))
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -298,7 +256,7 @@ _BACKENDS: dict[str, _Backend] = {}
 
 
 def _flush_all_at_exit() -> None:
-    """进程退出兜底：把还没落盘的推进写出去。失败必须吵出来（不静默）。"""
+    """进程退出兜底：把未落盘的推进写出去。失败必须吵出来（不静默）。"""
     for root, b in list(_BACKENDS.items()):
         try:
             b.flush()
@@ -312,9 +270,8 @@ atexit.register(_flush_all_at_exit)
 class StateStore:
     """切片状态存取（展示层把 state 当不透明 blob）。
 
-    读 = 进程内共享缓存（首次按 key 整文件载入）；写 = 只更新缓存并标脏；
-    落盘 = `flush()` / `batching()` 退出 / atexit。**不要指望 save 已落盘**。
-    """
+    读 = 进程内共享缓存（首次按 key 整文件载入）；写 = 只更新缓存并标脏；落盘 =
+    `flush()` / `batching()` 退出 / atexit。**不要指望 save 已落盘**。"""
 
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
@@ -326,6 +283,10 @@ class StateStore:
     # ---- 基本存取 ----
     def load(self, key: str, code: str) -> Record | None:
         return self._b.get(key, code)
+
+    def exists(self, key: str) -> bool:
+        """该 key 是否已有切片（冷启动判定；不装载文件，也不让外部拼路径）。"""
+        return os.path.exists(self._b.path(key))
 
     def save(self, key: str, code: str, rec: Record) -> None:
         self._b.put(key, code, rec)
@@ -368,30 +329,79 @@ class StateStore:
                 self.flush()
 
 
+def evaluate_day(strategy: StrategyProtocol, code: str, state: dict, bar: dict,
+                 ctx: dict | None, prev: Progress | None
+                 ) -> tuple[list[Progress], Progress | None]:
+    """**展示工作表「一日事件」的唯一判定处**（2026-10-07 口径裁定）。
+
+    裁定: **判定(ready) 恒 stateless，生命周期(exec/exit 闭合) 恒 stateful**。
+    ⇒ 本函数 = `evaluate(state, inp, prev)` 的全量（结算链 + 状态机，`rec.current`
+    的来源）+ **stateless ready 补齐**。理由与实测证据见改进方案 §2.6d；一句话：
+    stateful 在持仓/入场日「先结算、提前返回」⇒ 当天不判 ready，而生产 `scan_signals`
+    是 stateless ⇒ 生产落库、切片却没有的「持仓期重合信号日」（回放实测: 判定日集合的
+    唯一分歧就是它，只生产 15/15 全落在投影持仓区间内）。不补 = 切 writer 后历史信号
+    凭空消失，那不是等价切换而是改行为。
+
+    ⚠ 补齐的事件**追加在当日生命周期事件之后**（exec 09:30 在前、ready 收盘在后）——
+      链配对的前提: 「开启交易的 ready」= exec 之前最后一条 ready（见 `store.project_rows`）；
+      顺序写反会把当日那条信号误认成入场信号。
+    ⚠ 只补 (stage,日期) 未出现过的 ready（平仓日两路同一条 ⇒ 去重）；`prev is None`
+      时 stateful ≡ stateless ⇒ 只算一次，其余日子跑两遍（evaluate 无副作用，正确性优先）。
+    """
+    inp = DayInput(code, bar, ctx)
+    events = list(strategy.evaluate(state, inp, prev) or [])
+    if prev is None:
+        return events, (events[-1] if events else None)
+    head = events[-1] if events else None          # ← 生命周期头，绝不取补齐的那条
+    seen = {(e.stage, str(e.date)[:10]) for e in events}
+    for e in (strategy.evaluate(state, inp, None) or []):
+        if e.stage == "ready" and (e.stage, str(e.date)[:10]) not in seen:
+            events.append(e)
+    return events, head
+
+
 def _fold_one(strategy: StrategyProtocol, code: str, state: dict, bar: dict,
-              ctx: dict | None, prev: Progress | None) -> tuple[dict, list[Progress]]:
+              ctx: dict | None, prev: Progress | None, *,
+              dual: bool = False) -> tuple[dict, list[Progress], Progress | None]:
     """折叠一步 —— **推进序的唯一定义处**（evaluate 在 step 之前）。
 
     prev 由调用方的模式给出（stateless=None / stateful=rec.current），见 contract
     顶部「两种推进模式」。InsufficientHistory **不在此吞**: stateless 视为本日无事件
     但照常 step，stateful 冒泡 —— 一个函数抹平两种语义比两处循环更危险。
+
+    dual=True ⇒ 事件走 `evaluate_day`（工作表口径），只有 `_fold_step`（切片落盘）用；
+    `fold_range`/回放枚举恒 False —— 回测链语义不能被补齐事件污染。
+    返回 ``(state, events, head)``；head = `rec.current` 的来源。dual 下 head 取
+    **stateful 那一路**（补齐的 ready 不许顶替生命周期头，否则次日双开仓）。
     """
-    events = strategy.evaluate(state, DayInput(code, bar, ctx), prev) or []
-    return strategy.step(state, bar), events
+    if dual:
+        events, head = evaluate_day(strategy, code, state, bar, ctx, prev)
+    else:
+        events = strategy.evaluate(state, DayInput(code, bar, ctx), prev) or []
+        head = events[-1] if events else None
+    return strategy.step(state, bar), events, head
 
 
 def fold_range(strategy: StrategyProtocol, code: str, bars: list[dict],
-               i0: int = 0, i1: int | None = None) -> list[tuple[int, Progress]]:
-    """stateless 模式的**唯一**折叠实现：seed 一次 + 逐日 (`_fold_one`)。
+               i0: int = 0, i1: int | None = None, *,
+               stages: tuple[str, ...] | None = ("ready",),
+               ctx_provider=None,
+               stateful: bool = False) -> list[tuple[int, Progress]]:
+    """**唯一**折叠实现：seed 一次 + 逐日 (`_fold_one`)。两种推进模式在此切换。
 
-    返回 [(bar 下标, ready 事件)]。与 stateful（DailyRunner._fold_step）共用同一
-    折叠序、同一门实现，差别**只有** prev 恒 None —— 契约见 contract 顶部。
+    返回 [(bar 下标, Progress)]。与 DailyRunner._fold_step 共用同一折叠序/门实现，
+    差别只有 prev 来源（契约见 contract「两种推进模式」）。
 
-    ⚠ 批量枚举调用方（策略基类 scan_days / 诊断工具）必须走本函数，不得自写折叠
-    循环：那等于第二份编排，两套口径只能靠对账维持一致（要点③否定的模式）。
+    Args:
+        stages: 收集哪些阶段。``None``=全收（回测/调试 ready→exec→exit 完整链）；
+            默认 ``("ready",)``=只收 ready（生产投影口径）。
+        ctx_provider: 可选 ``callable(idx, bars)->dict|None``。intraday 策略（knife/
+            tail）的 evaluate 需 ``ctx["series"]`` 快照序列，由 feed 侧供给。
+        stateful: ``False``（默认）=stateless，prev 恒 None（不结算/不抑制，生产投影
+            口径）；``True``=prev=上一步末事件（回测/调试必须，否则 exec/exit 不闭合）。
 
-    ⚠ init_state 未实现（未迁移折叠契约的旧策略）抛 NotImplementedError，由调用方
-    退化到其 scan_signals —— 那份 scan_signals 本身就是唯一门实现。
+    ⚠ 批量枚举调用方（scan_days / 诊断工具）必须走本函数，不得自写折叠循环；
+    init_state 未实现的旧策略抛 NotImplementedError，由调用方退化到 scan_signals。
     """
     i1 = len(bars) - 1 if i1 is None else i1
     state, j = None, i0
@@ -404,12 +414,18 @@ def fold_range(strategy: StrategyProtocol, code: str, bars: list[dict],
     if state is None:
         return []
     out: list[tuple[int, Progress]] = []
+    prev: Progress | None = None
     for k in range(j, i1 + 1):
+        ctx = ctx_provider(k, bars) if ctx_provider is not None else None
         try:
-            state, events = _fold_one(strategy, code, state, bars[k], None, None)
+            state, events, head = _fold_one(strategy, code, state, bars[k], ctx, prev)
         except InsufficientHistory:
-            state, events = strategy.step(state, bars[k]), []
-        out.extend((k, e) for e in events if e.stage == "ready")
+            state, events, head = strategy.step(state, bars[k]), [], None
+        if head is not None and stateful:
+            prev = head                     # 与 DailyRunner.rec.current 同语义
+        for e in events:
+            if stages is None or e.stage in stages:
+                out.append((k, e))
     return out
 
 
@@ -434,9 +450,8 @@ class DailyRunner:
         if today["time"] < rec.date:
             return "reordered"                  # ① 乱序/旧数据
         if probe_bars:
-            by_date = probe_bars
             for d, c in strategy.probe(rec.state):  # ③（锚窗口两端）
-                b = by_date.get(d)
+                b = probe_bars.get(d)
                 if b is not None and float(b["close"]) != float(c):
                     return "probe_mismatch"     # 锚缺失=无法校验，跳过；不等=改写
         if today["time"] == rec.date:
@@ -495,12 +510,16 @@ class DailyRunner:
 
     def _fold_step(self, strategy: StrategyProtocol, code: str, rec: Record,
                    state: dict, bar: dict, ctx: dict | None):
-        rec.state, events = _fold_one(strategy, code, state, bar, ctx, rec.current)
+        """一日推进 + 落盘。**事件流走 `dual=True`**（ready 恒 stateless，2026-10-07 裁定）
+        —— 本方法是 `Record.events` 的**唯一**生产者，故裁定只需落在这里；
+        `rec.current` 取生命周期头（head），补齐的 ready 不参与推进。"""
+        rec.state, events, head = _fold_one(strategy, code, state, bar, ctx,
+                                            rec.current, dual=True)
         rec.date = bar["time"]
-        if events:
-            rec.current = events[-1]
-            for e in events:
-                rec.events.append(_progress_to_dict(e))
+        if head is not None:
+            rec.current = head
+        for e in events:
+            rec.events.append(_progress_to_dict(e))
         self.store.save(strategy.key, code, rec)
         return rec, events
 

@@ -89,22 +89,21 @@ def _fold_ready(bars, tmp_path, use_tech=True, si=SI):
 
 
 def _old_hits(bars, use_tech=True, si=SI):
-    """旧口径逐日扫描 + backtest_stock 去重 ±4（评估目标 = 信号集而非 raw 集）。"""
+    """旧口径**逐日**扫描 = 生产 `scan_signals` / `scan_days` 的信号集。
+
+    ⚠ **不施加 ±4 多日去重**：那条去重只活在 `backtest_stock`（回测口径）里，生产
+      `scan_signals` 没有它 ⇒ 库内按日一行（唯一键含 trade_date）。切片工作表的口径已
+      裁定为「判定(ready) 恒 stateless」（见 `runner.evaluate_day`）⇒ 对拍目标就是这里
+      的 raw 集。回测链语义（去重/抑制）由 `test_dragon_backtest_trades_match_old`
+      （比**交易**而非比信号集）覆盖，不再混进信号集对拍 —— 混进去会让「持仓期重合
+      信号」既算差异又不算差异。
+    """
     st = dc_old.DragonCallbackStrategy()
-    raw = []
+    hits = {}
     for k in range(30, len(bars)):
         for s in st.scan_signals(bars[:k + 1], CODE, use_tech_score=use_tech,
                                  stock_info=si):
-            raw.append((k, s))
-    hits = {}
-    used = None                        # (lu_abs, i_abs) 上一接受区间
-    for k, sig in raw:
-        d = str(sig.time)[:10]
-        lu_abs = [j for j, b in enumerate(bars) if str(b["time"])[:10] == str(sig.extra["lu_date"])[:10]][0]
-        if used is not None and (abs(k - used[0]) <= 4 or abs(k - used[1]) <= 4):
-            continue
-        used = (lu_abs, k)
-        hits[d] = sig
+            hits.setdefault(str(s.time)[:10], s)
     return hits
 
 
@@ -186,13 +185,18 @@ def test_dragon_backtest_trades_match_old(tmp_path):
     new_trades = []
     sig = ent = None
     for e in rec.events:
-        if e["stage"] == "ready":
-            sig = e
-        elif e["stage"] == "exec" and sig is not None:
-            ent = e if e["payload"].get("buyable") else None
+        st = e["stage"]
+        if st == "ready":
+            # ⚠ 持仓/已入场时出现的 ready 是**判定流**（生产会落库的持仓期重合信号日），
+            #   不开启新的交易链 —— 链语义是「exec 之前最后一条 ready」（见 evaluate_day）。
             if ent is None:
-                sig = None
-        elif e["stage"] == "exit" and sig is not None and ent is not None:
+                sig = e
+        elif st == "exec" and ent is None and sig is not None:
+            if e["payload"].get("buyable"):
+                ent = e
+            else:
+                sig = None                      # gap 拒绝 ⇒ 该信号作废
+        elif st == "exit" and ent is not None:
             i_idx = [j for j, b in enumerate(bars)
                      if str(b["time"])[:10] == str(sig["date"])[:10]][0]
             if i_idx <= len(bars) - 2:          # 旧 backtest i ∈ [2, n-2]
@@ -207,7 +211,7 @@ def test_dragon_backtest_trades_match_old(tmp_path):
                     "peak_return_pct": e["payload"]["peak_return_pct"],
                     "exit_reason": e["payload"]["reason"],
                 })
-            sig = ent = None
+            sig = ent = None                    # 平仓 ⇒ 链结束，等下一个 ready
     assert len(old_trades) >= 1, "构造历史应当含交易"
     assert len(old_trades) == len(new_trades), (old_trades, new_trades)
     for o, nw in zip(old_trades, new_trades):

@@ -23,8 +23,8 @@ import numpy as np
 
 from app.utils.indicators import calc_macd
 from app.market_cn.auto.core.market import get_board_type
-# ★ 播种/接力只从基座叶子层取 (这三个不经 core 转发, 直接取自本文件)
-from app.utils.indicators import macd_anchor_step, macd_core, macd_state
+# ★ 播种/接力只从基座叶子层取 (macd_state/macd_core 直接取自本文件顶层导入)
+from app.utils.indicators import macd_core, macd_state
 
 logger = logging.getLogger("auto")
 
@@ -39,69 +39,27 @@ _POOL = {"target": None, "main": {}, "gem_star": {}}
 
 
 # ================================================================
-# 纯 numpy helper (逐字移植 tmp/migrate_150.py 行49-73, 保证对账一致)
+# 通用滚动核 —— 2026-10-07 已提炼到 `core/increm.py`（唯一增量形态，单一 home）。
+# 本文件只保留**业务参数化包装**：G1 的窗口常量 (ROLL/MIN_HIST/MACD_*) 属于本层，
+# 不搬进 core（core 零业务常量）。纯 numpy 实体见 increm.roll_sum / sma / rsi /
+# atr_pct / boll_pctb / pctl_roll / window_of / anchor_step。
 # ================================================================
 
-def _roll_sum(x, n):
-    """滑窗和 (逐窗**独立**累加) —— 结果与**窗口长度无关**, 全量/截窗 逐位一致。
-
-    ⚠ 2026-10-05 从 `cumsum` 差改为 `np.convolve`:
-       · cumsum 差的结果依赖**累加起点** ⇒ 全量 198 根与窗口 35 根差 ~1e-13,
-         而门是**阶跃函数** ⇒ 边界值 (如 rma 恰好 -2.5) 会翻转布尔结果
-         (实测 200 票 × 全历史: mask 翻转 2.5e-5)。这是"增量路径"的致命隐患:
-         浮点等价(1e-6 容差) **不等于** 门判定等价。
-       · convolve 每个窗口都由**同样的 n 个数按同样顺序**累加 ⇒ 与起点无关,
-         且更精确 (无灾难性抵消); 实测还**更快** (0.79x, tmp/_g1_rollsum_cmp17.py)。
-    """
-    out = np.full(len(x), np.nan)
-    if len(x) >= n:
-        out[n - 1:] = np.convolve(np.asarray(x, dtype=float), np.ones(n), "valid")
-    return out
-
-
-def _sma_np(x, n):
-    return _roll_sum(x, n) / n
-
-
-def _rsi(c, n=14):
-    d = np.diff(c, prepend=c[0])
-    g = _roll_sum(np.clip(d, 0, None)[1:], n)
-    lo = _roll_sum(np.clip(-d, 0, None)[1:], n)
-    out = np.full(len(c), np.nan)
-    out[1:] = 100 - 100 / (1 + (g / n) / np.where(lo == 0, np.nan, lo / n))
-    return out
-
-
-def _atr(h, l, c, n=14):
-    pc = np.roll(c, 1)
-    pc[0] = c[0]
-    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
-    return _roll_sum(tr, n) / n / c * 100
-
-
-def _boll_pctb(c, n=20, k=2.0):
-    """布林 %b (0-100 口径: lo=0, up=100); 前 n-1 根 NaN; 带退化记 50 中性。"""
-    m = len(c)
-    pctb = np.full(m, np.nan)
-    w = np.ones(n) / n
-    ma = np.convolve(c, w, "valid")
-    c2 = np.convolve(c * c, w, "valid")
-    sd = np.sqrt(np.maximum(c2 - ma * ma, 0.0))
-    lo = ma - k * sd
-    up = ma + k * sd
-    denom = up - lo
-    pctb[n - 1:] = np.where(denom > 0, (c[n - 1:] - lo) / denom * 100, 50.0)
-    return pctb
+from app.market_cn.auto.core import increm  # noqa: E402
+from app.market_cn.auto.core.increm import (  # noqa: E402
+    anchor_step,
+    atr_pct as _atr,
+    boll_pctb as _boll_pctb,
+    roll_sum as _roll_sum,
+    rsi as _rsi,
+    sma as _sma_np,
+    window_of as _window_of,
+)
 
 
 def _pctl_roll(day_val, w=ROLL, min_hist=MIN_HIST):
-    """日度序列滚动分位 (不含当日, 零前视); 历史不足 min_hist 为 nan — 同 regime3。"""
-    out = np.full(len(day_val), np.nan)
-    for i in range(len(day_val)):
-        hist = day_val[max(0, i - w):i]
-        if len(hist) >= min_hist:
-            out[i] = (hist < day_val[i]).mean()
-    return out
+    """G1 口径的滚动分位 (业务窗口默认 ROLL/MIN_HIST)；实体在 increm.pctl_roll。"""
+    return increm.pctl_roll(day_val, w, min_hist)
 
 
 # ================================================================
@@ -214,17 +172,7 @@ MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 #: 状态机可观测计数 (★ 静默降级是头号敌人: 任何作废/错位必须在这里留痕)
 G1_STATE_STATS = {"init": 0, "step": 0, "reject": 0, "date_mismatch": 0}
 
-
-def _window_of(bars, win):
-    """bars → 紧凑 OHLC 微缩窗口 (`[[YYYY-MM-DD, high, low, close], ...]`)。
-
-    ★ 为什么状态要自带窗口: `_g1_arrays` 的 ATR 要 **high/low**, 光有 closes 队列
-      不足以算特征 ⇒ 若状态不含窗口, 每天推进后还得**回库再取一次历史 bars**,
-      "每天只处理 D+1 的量"就是假的。带上窗口 ⇒ 推进只需喂当日 1 根新 bar。
-    ⚠ 只存有用的 4 个字段 (open 不参与任何 G1 特征), 省 ~20%。
-    """
-    return [[str(b["time"])[:10], float(b["high"]), float(b["low"]), float(b["close"])]
-            for b in bars[-win:]]
+# `_window_of` 已从 increm 导入（模块顶部 import 块），此处不再本地定义。
 
 
 def g1_state_window_bars(state):
@@ -261,17 +209,14 @@ def g1_state_init(bars, win=G1_WIN_MIN, keep_window=False):
 
 
 def _anchor_step(anchor, closes):
-    """锚往后推进 `len(closes)` 格, 返回新末根状态 (EMA 接力, 无瞬态)。
+    """G1 口径的 MACD 锚推进（业务参数 MACD_FAST/SLOW/SIGNAL）。
 
-    ★ 从**相对下标 0** 起推 (`out[0]` 就是"前一根的下一根"), 不能写成
-      "继承第 n-1 个" —— 那会整条错位 n-1 根且**不报错**。
-
-    2026-10-07: 递推本体委托 `app.utils.indicators.macd_anchor_step`。原地在
-      这里另写一份 ef/es/dif/dea = **第二份 MACD**, 与 `macd_core(anchor=...)`
-      同构却各改各的 —— 改内核忘改这里 ⇒ 特征层 MACD 静默分叉且不报错。
-      默认 (12,26,9) 下与旧实现逐位一致。
+    ★ 递推本体唯一实现在 `app.utils.indicators.macd_anchor_step`（经 increm.anchor_step
+      转发）。此前本文件另写一份 ef/es/dif/dea = **第二份 MACD**，改内核忘改这里
+      ⇒ 特征层 MACD 静默分叉且不报错。现仅保留业务参数包装。
+    ⚠ 必须从**相对下标 0** 起推，不能写成"继承第 n-1 个"（错位 n-1 根且不报错）。
     """
-    return macd_anchor_step(anchor, closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    return anchor_step(anchor, closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
 
 def g1_state_step(state, bars_new):

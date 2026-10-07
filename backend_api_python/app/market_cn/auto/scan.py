@@ -176,7 +176,9 @@ def _mark_daily_scanned(keys, target):
 # 2026-09-10: stock_info 改走 hub (fetch_stock_info_db 已归位 data/hub.py)
 # ================================================================
 from app.market_cn.auto.core.data.hub import all_codes, stock_info as _stock_info  # noqa: E402,F401
-from app.market_cn.auto.core.data.kline import fetch_kline_db  # noqa: E402,F401
+from app.market_cn.auto.core.data.kline import (  # noqa: E402,F401
+    ASOF_MIN_BARS, asof_bars, fetch_kline_db,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -194,25 +196,14 @@ from app.market_cn.auto.core.data.kline import fetch_kline_db  # noqa: E402,F401
 #
 # 开关: `QD_SCAN_BATCH=0` 可整段关闭 (回落逐票), 用于线上快速回滚。
 
-def _fold_on() -> bool:
-    """判定驱动是否走**折叠内核** (目标态唯一路径)。
+# 判定驱动 = `scan_days` 折叠内核 (**唯一**路径, 2026-10-07 P5-③ 切换)。
+#   · 与 rebuild / 回测同一条驱动路径 (内核 seed 一次 + 当日 evaluate), 判定循环只有一份实现。
+#   · 等价性: 全市场 5236 票 × 30 交易日 逐字段差异 0 (tmp/shadow_scan_fold3.py);
+#     回放对账 (投影 Record.ready vs scan_days) 双向 0 (tools/projection_shadow --replay)。
+#   · 旧的 `scan_signals` 直连分支与 `QD_SCAN_FOLD` 回滚开关已删除 (禁并存式过渡):
+#     该旁路曾因「折叠判定不产门级 trace ⇒ M1 采集归零」而保留; 阻塞已由独立采样器
+#     (auto/sampler.py, independent=True 自跑取 trace) 解除 ⇒ 不再需要第二份驱动。
 
-    ON  : `strat.scan_days(bars, code, lo=hi=target)` —— 与 rebuild / 回测同一条
-          驱动路径 (内核折叠: seed 一次 + 当日 evaluate), 判定循环只有一份实现。
-    OFF : `strat.scan_signals(bars, code)` —— 旧直连路径, 仅供线上快速回滚。
-
-    对账: 全市场 5236 票 × 30 交易日 = break 5 / dragon 15 / g56 11 笔,
-    两条路径**逐字段差异 0** (tmp/shadow_scan_fold3.py)。
-
-    ★★ 默认 OFF (2026-10-06 实测): ON 会**废掉 M1 实盘采集** ——
-    采样的过滤条件 `(day_tr.items or sigs)` 依赖 `scan_signals` 内部的门级 trace,
-    而递推侧只有 ring 窗口、未接 probe ⇒ day_tr 恒空。端到端实测同一批数据:
-        OFF: break 3872 条 / dragon 3633 条       ON: 两者均 0 条
-    (tmp/probes/ 已积累 371 个文件 ≈ 9GB, 该采集在役, 不能静默归零。)
-    开 ON 的前置 = 把门级 trace 补进递推路径 (break: confirm/align/prefilter;
-    dragon: 8 门), 或把 M1 采集整体剥离为独立采样器。见完成度报告 §七·遗留。
-    """
-    return str(os.getenv("QD_SCAN_FOLD", "0")).strip() == "1"
 # ══════════════════════════════════════════════════════════════════════
 
 def _prefetch_bars(codes, days, logger=None):
@@ -505,25 +496,25 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
         return {"status": "no_active_strategy", "keys": sorted(want), "target": _target_date()}
     logger.info("[dragon_scan] 活跃策略: %s", sorted(active))
 
-    # 判定驱动: 折叠内核(默认) / 旧直连(回滚开关 QD_SCAN_FOLD=0)
-    FOLD_ON = _fold_on()
-    logger.info("[dragon_scan] 判定驱动 = %s (QD_SCAN_FOLD=%s)",
-                "scan_days 折叠内核" if FOLD_ON else "scan_signals 直连(回滚)",
-                "1" if FOLD_ON else "0")
+    # P5-③ (2026-10-07) **写路径切换点**: `present_persist.enabled` 一个开关决定行从哪来。
+    #   false (缺省) = 旧 writer —— 判定循环内逐票 `scan_days` + `signal_row`, 逐字保留,
+    #                是**迁移期单点回滚位** (回滚 = 翻回 false), P6 随残余一并删除。
+    #   true        = 新 writer —— `present_daily.persist_days` **转主线** (fold 是唯一判定;
+    #                判定期失败**按策略退回直判并打 ERROR**, 不静默吞 —— 静默的部分写入
+    #                会连带把当日 watch_pending purge 掉), 行源改为当日 `Record.ready`;
+    #                后处理链 (U1~U4 → finalize) 与 DB 变异 (`upsert_scan_signals`) 完全照旧
+    #                ⇒ 门禁「signals 零差异」可直接比。
+    from app.market_cn.auto import present_daily
+    WRITER = "record" if present_daily.enabled() else "scan"
+    logger.info("[dragon_scan] 行源 = %s (present_persist.enabled=%s, warmup=%d 日)",
+                {"record": "Record.ready 投影", "scan": "scan 直判(回滚位)"}[WRITER],
+                "true" if WRITER == "record" else "false", present_daily.warmup_days())
 
-    # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定同步过 DayTrace shim 产 sample。
-    # 只记判定步落点非空的 (code,day) (纯噪声不采, 同 probe.py 约定); 标签 censored
-    # (D+1 bar 当时不存在, 离线回填)。relay3 暂不支持 (scan_signals 无 probe 形参,
-    # **params 静默吞掉 → 无 trace 无采样, 判定行为不受影响)。
-    live_probes = None
-    if strat_reg.live_probe_enabled():
-        import inspect
-        from app.market_cn.auto.probe import DayTrace as _DayTrace, Probe as _Probe
-        live_probes = {k: _Probe(k, tag="live") for k in active}
-        # probe 形参显式支持才传 (relay3 scan_signals 无 probe 形参 — **params 会静默吞掉,
-        # 探针对象混进 params 有隐患; 未支持策略不传, 判定行为零变化)
-        _probe_ok = {k: "probe" in inspect.signature(s.scan_signals).parameters
-                     for k, s in active.items()}
+    # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定落点非空的 (code,day) 产 sample。
+    # 2026-10-07 (P5 前置): 采集**剥离**为独立采样器 (auto/sampler.py) —— 它自跑
+    #   `scan_signals(probe=)` 取 trace, 与判定走哪条路径无关 ⇒ 两条 writer 下采样同一份实现。
+    from app.market_cn.auto.sampler import LiveSampler
+    sampler = LiveSampler(active, strat_reg.params_override)
 
     store.ensure_tables()
     target = target or _target_date()
@@ -556,82 +547,41 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
 
     rows = []
     t0 = time.time()
+    # ---- 取数收敛 (两条 writer 共用) ----
+    # ⇒ **唯一不变量: 序列末根必须是 target 日**。收敛口径 = `kline.asof_bars`
+    #   (「今天这票算不算有数据」的**唯一实现**; 判定循环与切片落盘 `present_daily`
+    #   共用同一函数 —— 各写一份必漂, 漏检那一侧产错日幽灵)。
+    #   2026-09-29 审计修复 (P1) 只做了一半: `elif bars[-1] < target: continue`
+    #   仅挡"原始末根早于 target"; 2026-10-07 补齐另一半 ——
+    #    该股 **target 日无 bar** (回填缺口 / 停牌跨过 target 但后面还有更晚 bar) 时,
+    #   截断让末根退到 target-N 且不再复检 ⇒ 在旧 bar 上判定, 产出
+    #    trade_date=target / 判定日=T-N 的**错日幽灵信号**, 恰是声称已修的 D+1 白天补扫场景。
+    #    连锁: 该票 g56 池锚 = target-N ≠ 预热锚 target ⇒ 单槽 _POOL 反复重建
+    #    (26s/次 thrash); 且被"不含自己"的横截面池判定 ⇒ 百分位失真。
+    #   残留限度不变: 被跳过的股若本轮后仍不回填, 不会补扫 (宜由数据就绪闸门保证)。
+    # ⚠ 回写: 兜底逐票取的 bars 也进 bars_by_code ⇒ 判定与切片落盘是**同一份对象**
+    #   (present_daily 只按 as-of 再截到更早日期, 不再取一次数 —— 取两次会漂)。
+    for i, code in enumerate(codes):
+        bars = bars_by_code.get(code)
+        if bars is None:                    # 批量未覆盖 (新股/停牌/取数缺失) → 逐票兜底
+            bars = fetch_kline_db(code, days)
+        bars = asof_bars(bars, target, ASOF_MIN_BARS)
+        if bars is None:
+            bars_by_code.pop(code, None)
+            continue
+        bars_by_code[code] = bars
+        if (i + 1) % 1000 == 0:
+            logger.info("[dragon_scan] 取数收敛 %d/%d (%.0fs)",
+                        i + 1, len(codes), time.time() - t0)
+
     err_by_key: dict[str, int] = {}      # {策略: 本轮判定异常票数} → 见下方 finally 汇总
     try:
-        for i, code in enumerate(codes):
-            bars = bars_by_code.get(code)
-            if bars is None:                    # 批量未覆盖 (新股/停牌/取数缺失) → 逐票兜底
-                bars = fetch_kline_db(code, days)
-            if not bars:
-                continue
-            # 只判定 target 日 (as-of: 用到 target 收盘为止的数据)
-            if bars[-1]["time"] > target:
-                bars = [b for b in bars if b["time"] <= target]
-            # ⇒ **唯一不变量: 序列末根必须是 target 日** (原本两条分支各管一半)
-            #   2026-09-29 审计修复 (P1) 只做了一半: `elif bars[-1] < target: continue`
-            #   仅挡"原始末根早于 target"; 2026-10-07 补齐另一半 ——
-            #    该股 **target 日无 bar** (回填缺口 / 停牌跨过 target 但后面还有更晚
-            #    bar) 时, 截断让末根退到 target-N 且不再复检 ⇒ 在旧 bar 上判定,
-            #    产出 trade_date=target / 判定日=T-N 的**错日幽灵信号**, 恰是声称
-            #    已修的 D+1 白天补扫场景。
-            #    连锁: 该票 g56 池锚 = target-N ≠ 预热锚 target ⇒ 单槽 _POOL 反复
-            #    重建 (26s/次 thrash); 且被"不含自己"的横截面池判定 ⇒ 百分位失真。
-            #   另: 长度门槛一并挪到截断**之后** (原先在前, 门槛实际生效位置不一致)。
-            #   残留限度不变: 被跳过的股若本轮后仍不回填, 不会补扫 (宜由数据就绪
-            #   闸门保证回填完整后再放行扫描)。
-            if not bars or len(bars) < 30 or bars[-1]["time"] != target:
-                continue
-            name = (stock_info.get(code) or {}).get("name", "")
-            for key, strat in active.items():
-                day_tr = _DayTrace() if (live_probes is not None and _probe_ok.get(key)) else None
-                try:
-                    if FOLD_ON:
-                        # 目标态: 判定委托 `scan_days` 折叠内核 (驱动路径唯一)。
-                        # lo=hi=target ⇒ 只判当日, 语义 == scan_signals(bars[:target+1])。
-                        sigs = strat.scan_days(bars, code, lo_date=target,
-                                               hi_date=target,
-                                               **strat_reg.params_override(key))
-                    else:
-                        _kw = {"probe": day_tr} if day_tr is not None else {}
-                        sigs = strat.scan_signals(bars, code, **_kw,
-                                                  **strat_reg.params_override(key))
-                except Exception as e:
-                    # 2026-10-07 (P2): 原为 DEBUG —— 生产 INFO 级别下**策略整静默**
-                    #   (无一行日志、无计数、无告警, 信号凭空少一批), 是本项目点名的
-                    #   "静默断链"同构。改: 每策略前 3 次打 WARNING (带 code/原因, 便于
-                    #   定位), 之后降级 DEBUG 防日志洪水 (单策略 bug 可命中全 5236 票);
-                    #   无论多少, 末尾必有 **一行汇总** (ERROR) —— 兜住"降级后没人看"。
-                    _n = err_by_key.get(key, 0) + 1
-                    err_by_key[key] = _n
-                    if _n <= 3:
-                        logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
-                    else:
-                        logger.debug("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
-                    continue
-                # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
-                kept, last_u_fails = apply_unified_prefilter(
-                    sigs, bars, code, stock_info.get(code), strat)
-                # M1 采样: 判定步有落点才记 (stage 口径镜像回测 — U1~U4 拒=prefilter,
-                # 全过=signal, 其余取当日最深判定步); sig 传 dict (Signal dataclass 落盘可读)
-                if live_probes is not None and _probe_ok.get(key) and (day_tr.items or sigs):
-                    if sigs and not kept:
-                        stage, u_fails = "prefilter", last_u_fails
-                    elif kept:
-                        stage, u_fails = "signal", None
-                    else:
-                        stage, u_fails = None, None
-                    from dataclasses import asdict as _asdict
-                    strat._probe_day(
-                        live_probes[key], day_tr, bars, len(bars) - 1, code,
-                        stock_info.get(code), stage=stage, u_fails=u_fails,
-                        sig=_asdict(kept[0] if kept else sigs[0]) if sigs else None)
-                rows.extend(store.signal_row(key, s, name) for s in kept)
-            if (i + 1) % 500 == 0:
-                logger.info("[dragon_scan] 进度 %d/%d, 信号 %d, 用时 %.0fs",
-                            i + 1, len(codes), len(rows), time.time() - t0)
+        if WRITER == "record":
+            rows = _rows_by_record(active, bars_by_code, target, stock_info, sampler)
+        else:
+            rows, err_by_key = _rows_by_scan(active, bars_by_code, target, stock_info, sampler)
     finally:
-        for _pr in (live_probes or {}).values():
-            _pr.close()
+        sampler.close()
         if err_by_key:
             # 汇总必有: 降级 DEBUG 之后仍留一条可告警的痕迹 ⇒ 单策略异常不再是暗账
             logger.error("[dragon_scan] 单票判定异常共 %d 次 (该策略信号可能缺失): %s",
@@ -680,10 +630,108 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
     logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs) env=%s",
                 len(codes), result.get("written", 0), time.time() - t0,
                 env_info.get("mode", "-"))
+
     # P1-2: 任何调用方 (调度 daily_scan / startup 补扫 / CLI) 成功后同口径落完成标记
     _mark_daily_scanned(active.keys(), target)
     return {"status": "ok", "target": target, "codes": len(codes),
             "signals": result.get("written", 0), "env": env_info}
+
+
+def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
+    """**旧 writer** (迁移期回滚位, P6 删): 循环内逐票 `scan_days` 判定 → `signal_row`。
+
+    即 P5-③ 之前的生产实现, 逐字保留 —— 它是回滚时唯一要回到的那条路。
+    返回 `(rows, err_by_key)`。
+    """
+    from app.market_cn.auto import store, strategies as strat_reg
+
+    rows = []
+    err_by_key: dict[str, int] = {}
+    for i, (code, bars) in enumerate(bars_by_code.items()):
+        name = (stock_info.get(code) or {}).get("name", "")
+        for key, strat in active.items():
+            try:
+                # 判定委托 `scan_days` 折叠内核 (驱动路径唯一)。
+                # lo=hi=target ⇒ 只判当日, 语义 == scan_signals(bars[:target+1])。
+                sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target,
+                                       **strat_reg.params_override(key))
+            except Exception as e:
+                # 2026-10-07 (P2): 原为 DEBUG —— 生产 INFO 级别下**策略整静默**
+                #   (无一行日志、无计数、无告警, 信号凭空少一批), 是本项目点名的
+                #   "静默断链"同构。改: 每策略前 3 次打 WARNING (带 code/原因, 便于
+                #   定位), 之后降级 DEBUG 防日志洪水 (单策略 bug 可命中全 5236 票);
+                #   无论多少, 末尾必有 **一行汇总** (ERROR) —— 兜住"降级后没人看"。
+                _n = err_by_key.get(key, 0) + 1
+                err_by_key[key] = _n
+                if _n <= 3:
+                    logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                else:
+                    logger.debug("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                continue
+            # U1~U4 统一预过滤 (锚点由策略声明; 易错点: 龙回头不能用缩量信号日评估, 会误杀)
+            kept, _ = apply_unified_prefilter(sigs, bars, code, stock_info.get(code), strat)
+            sampler.observe(key, strat, code, bars, stock_info)
+            rows.extend(store.signal_row(key, s, name) for s in kept)
+        if (i + 1) % 500 == 0:
+            logger.info("[dragon_scan] 判定 %d/%d, 信号 %d", i + 1, len(bars_by_code), len(rows))
+    return rows, err_by_key
+
+
+def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None):
+    """**新 writer** (P5-③): fold 是唯一判定 (由 `present_daily.persist_days` 转主线完成),
+    行源 = 当日 `Record.ready`。**只有"行从哪来"变了** —— U1~U4 / `signal_row` 照旧。
+
+    Args:
+        root: 切片根 (缺省 = 生产 `_paths.PRESENT_STATE_DIR`); 测试用临时根注入。
+
+    ⚠ 判定期异常 = **整日整策略失败**（`advance_all` 不在票级兜异常，与旧路径逐票 try 不等价）。
+      而 `upsert_scan_signals` 是「先 DELETE 当日 watch_pending 再 INSERT」⇒ 拿残缺行去写会把
+      没判出来的那部分信号**删掉**。故失败策略**整体退回直判**（与「无折叠契约」同一条出口）：
+      既不写残缺、也不让整个扫描挂掉（那会一份信号都不落）—— 两条都是不可接受的结局。
+      回退必打 ERROR，不是静默降级。
+    """
+    from app.market_cn.auto import present_daily, store, strategies as strat_reg
+
+    pstat = present_daily.persist_days(
+        active, [target], bars_by_code, root=root,
+        warmup=present_daily.warmup_days(), logger_=logger)
+    logger.info("[dragon_scan] 切片落盘完成: root=%s 日期=%s 跳过=%s 明细=%s",
+                pstat["root"], pstat["dates"], pstat["skipped"] or "-",
+                {k: {"天": v["days"], "有事件": v["advanced"], "暖机": v["warmed"],
+                     "错误": len(v["errors"])} for k, v in pstat["strategies"].items()})
+    #: 本策略行源不可用（无折叠契约 / 切片推进失败）⇒ 走下面的逐票直判分支
+    direct = {k: ("无折叠契约" if k in pstat["skipped"] else "切片推进失败")
+              for k in active if k in pstat["skipped"]
+              or (pstat["strategies"].get(k) or {}).get("errors")}
+    if direct:
+        logger.error("[dragon_scan] 行源退回 scan 直判 (不静默): %s", direct)
+
+    rows = []
+    for key, strat in active.items():
+        params = strat_reg.params_override(key)
+        if key in direct:
+            for code, bars in bars_by_code.items():
+                try:
+                    sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target, **params)
+                except Exception as e:              # noqa: BLE001 - 与旧路径同级容忍
+                    logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                    continue
+                kept, _ = apply_unified_prefilter(
+                    sigs, bars, code, stock_info.get(code), strat)
+                sampler.observe(key, strat, code, bars, stock_info)
+                rows.extend(store.signal_row(key, s, (stock_info.get(code) or {}).get("name", ""))
+                            for s in kept)
+            continue
+        ready = pstat["ready"].get(key) or {}
+        for code, bars in bars_by_code.items():
+            sampler.observe(key, strat, code, bars, stock_info)
+            sigs = ready.get(code)
+            if not sigs:
+                continue
+            kept, _ = apply_unified_prefilter(sigs, bars, code, stock_info.get(code), strat)
+            name = (stock_info.get(code) or {}).get("name", "")
+            rows.extend(store.signal_row(key, s, name) for s in kept)
+    return rows
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):

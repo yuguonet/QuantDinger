@@ -305,6 +305,80 @@ def _eval_exit_day_close(row):
     return s_obj.exit_decision(row, snap={"mode": "day_close", "bars": bars, "entry_idx": idx})
 
 
+def _d1_chg_of(row, rows_):
+    """d1_chg (2026-10-07, P5-④) —— **展示/统计字段**, 不进判定指纹 (见文件头)。
+
+    口径: 当日 last vs signal_price (缺则 entry_price)。新判定源 (progress) 下策略的
+    `confirm_decision` 不再被调用, d1_chg 由本函数统一产出。
+    """
+    last = float((rows_[-1] or {}).get("last") or 0) if rows_ else 0.0
+    base = float(row.get("signal_price") or row.get("entry_price") or 0)
+    if last > 0 and base > 0:
+        return (last / base - 1) * 100
+    return None
+
+
+def _progress_enabled() -> bool:
+    """P5-④ 开关 (2026-10-07): 盘中判定是否走 RealtimeBranch progress。**缺省关**。
+
+    单独提出来是因为 step4 (收盘重放) 要先判开关再决定取不取当日快照 —— 缺省关时
+    若照旧无条件取数, 就**多出一次 DB 查询**, 违反「缺省关 ⇒ 生产行为逐字不变」。
+    """
+    from app.market_cn.auto.strategies import monitor_progress_settings
+    return bool(monitor_progress_settings().get("enabled"))
+
+
+def _progress_map(rows, series, hm, stats=None):
+    """P5-④ (2026-10-07): 盘中判定的**新事实源** = RealtimeBranch 当日 progress。
+
+    开盘窗口 (可买 gap) 与 15:01 确认共用本函数 —— 两者都是"拿这只票今天的 progress"。
+
+    返回 {(strategy_key, code): Progress} —— **只含真正拿到判定的票**。
+    ⚠ 「拿不到判定」(切片缺失 / 策略无折叠契约 / 未到推进时点 / 异常) 一律**不进字典**,
+      由调用方回退旧路径 `confirm_decision`。**绝不能把"无判定"当成"判定为持有"**
+      —— 那会把根本没判过的票静默转成持仓, 是实盘资金事故而非降级。
+    """
+    if not _progress_enabled():
+        return {}
+    from app.market_cn.auto import present_daily
+    from app.market_cn.auto.core.present import RealtimeBranch, StateStore
+
+    by_key = {}
+    for r in rows:
+        s_obj = _strategy_of(r)
+        key = getattr(s_obj, "key", None) if s_obj is not None else None
+        if not key:
+            continue
+        by_key.setdefault(key, (s_obj, []))[1].append(r)
+
+    out = {}
+    store = StateStore(present_daily.default_root())
+    for key, (s_obj, rs) in by_key.items():
+        snaps = {}
+        for r in rs:
+            rows_ = series.get(r["code"]) or []
+            if rows_:
+                snaps[r["code"]] = rows_[-1]
+        if not snaps:
+            continue
+        try:
+            hits = RealtimeBranch(store, {key: s_obj}).tick(
+                hm, list(snaps.keys()), snaps, series, None)
+        except Exception as e:                                  # noqa: BLE001
+            logger.error("[dragon_monitor] progress 判定失败 策略=%s: %s: %s "
+                         "(回退 confirm_decision)", key, type(e).__name__, e)
+            if stats is not None:
+                stats["confirm_prog_err"] = stats.get("confirm_prog_err", 0) + 1
+            continue
+        for code, prog in hits or []:
+            out[(key, code)] = prog
+    if stats is not None:
+        stats["confirm_prog_hit"] = stats.get("confirm_prog_hit", 0) + len(out)
+        stats["confirm_prog_miss"] = stats.get("confirm_prog_miss", 0) + max(
+            0, len(rows) - len(out))
+    return out
+
+
 # ================================================================
 # 主 tick
 # ================================================================
@@ -399,6 +473,11 @@ def run_monitor():
                                disabled_codes, len(swept))
         if cand:
             snaps = latest_snapshot([r["code"] for r in cand])
+            # P5-④ 第二步 (2026-10-07): 可买判定源可切到 RealtimeBranch 当日 progress
+            #   (同一开关 monitor_progress.enabled)。开盘窗口只有最新快照, series 按
+            #   单帧构造 (tick 内部对 series 缺失也有 [snap] 兜底)。
+            prog_map = _progress_map(cand, {c: [s] for c, s in (snaps or {}).items()},
+                                     hm, stats)
             from collections import defaultdict as _dd
             qualified = _dd(list)      # strategy → [(quality_key, row, open_px, gap)]
             n_exp = 0
@@ -418,6 +497,21 @@ def run_monitor():
                 s_obj = strat_reg.get_strategy(strat)
                 if s_obj is None:
                     logger.warning("[dragon_monitor] 未知策略 %s (row %s), 跳过", strat, r.get("id"))
+                    continue
+                prog = prog_map.get((getattr(s_obj, "key", None), code))
+                if prog is not None and getattr(prog, "stage", "") == "exec":
+                    # 折叠内核的 gap 门在 exec payload 的 `buyable` 里 (break._exec_event)。
+                    # ⚠ 只有**拿到 exec 判定**才走新路径; 拿到的是别的 stage / 没拿到
+                    #   ⇒ 落回下面旧的 entry_decision, 不猜。
+                    pl = getattr(prog, "payload", None) or {}
+                    if pl.get("buyable") is False:
+                        ds.set_state(r["id"], ds.S_EXPIRED,
+                                     detail={"gap": round(gap, 2), "src": "progress",
+                                             "reason": f"{ds.strategy_labels().get(strat, strat)}开盘gap超出可买区间"},
+                                     expect_state=ds.S_WATCH_PENDING)
+                        n_exp += 1
+                        continue
+                    qualified[strat].append((s_obj.quality_key(r), gap, r, open_px))
                     continue
                 if not s_obj.entry_decision(r, snap).buyable:
                     ds.set_state(r["id"], ds.S_EXPIRED,
@@ -460,6 +554,10 @@ def run_monitor():
             snaps = latest_snapshot([r["code"] for r in guard_rows])
             # live 模式出场需要当日全天快照序列 (relay3 封板/炸板判定)
             series_all = fetch_day_snapshots([r["code"] for r in guard_rows])
+            # P5-④ 第二步 (2026-10-07): 盘中**策略**出场判定源可切到 progress (同一开关)。
+            #   ⚠ 上面的硬止损 (px <= stop_px) **永不迁** —— 那是资金红线, 不是"规则性
+            #   判定", 文档风险表第 8 条明写。本步只换它之后的策略 live 出场。
+            prog_map = _progress_map(guard_rows, series_all, hm, stats)
             for r in guard_rows:
                 if r.get("exit_reason"):
                     continue
@@ -506,6 +604,21 @@ def run_monitor():
                 #    而本 snap 默认只有 mode/series/today ⇒ 不注入就恒回退 last (09:35 首拍价),
                 #    knife_catch/tail_oversold 的「D1 开盘卖」会静默变成「盘中价卖」。
                 #    快照 row 自带 open 列 (hub._fetch_snapshots_by_date), 取当日开盘价。
+                prog = prog_map.get((getattr(s_obj, "key", None), r["code"]))
+                if prog is not None:
+                    # 拿到内核判定 ⇒ **以它为准**, 不再回退旧路径 (两个事实源不能打架):
+                    #   exit ⇒ 今日出场; 其它 stage (exec/ready…) ⇒ 今日不出场。
+                    if getattr(prog, "stage", "") == "exit":
+                        pl = getattr(prog, "payload", None) or {}
+                        xp = pl.get("exit_price") or px
+                        ds.set_state(r["id"], ds.S_EXIT_TODAY,
+                                     exit_reason=pl.get("exit_reason") or "progress_exit",
+                                     exit_price=round(float(xp), 3) if xp else None,
+                                     detail={"marked": today, "intraday": True,
+                                             "src": "progress"},
+                                     only_unexited=True)
+                        stats["live_exit"] = stats.get("live_exit", 0) + 1
+                    continue
                 dec = s_obj.exit_decision(r, snap={"mode": "live",
                                                    "series": series_all.get(r["code"]) or [],
                                                    "today": today,
@@ -547,8 +660,29 @@ def run_monitor():
 
     # ── 4. 收盘窗口: 出场重放 (holding, 注册表分发 day_close 模式) ──
     if in_window(W_CLOSESIM_LO, W_CLOSESIM_HI, hm):
+        # P5-④ (2026-10-07): 判定源可切到 progress (同一开关)。旧路径用合成 bars 重放
+        #   exit_decision; 新路径用当日快照试推。**先判开关再取数** —— 缺省关时不许多
+        #   出这次快照查询 (见 `_progress_enabled` 注)。
+        prog_map = {}
+        if hold_rows and _progress_enabled():
+            prog_map = _progress_map(
+                hold_rows, fetch_day_snapshots([r["code"] for r in hold_rows]),
+                hm, stats)
         for r in hold_rows:
             if r.get("exit_reason"):
+                continue
+            s_obj = _strategy_of(r)
+            prog = prog_map.get((getattr(s_obj, "key", None), r["code"])) if s_obj else None
+            if prog is not None:
+                # 拿到内核判定 ⇒ 以它为准: exit ⇒ 出场; 其它 stage ⇒ 今日不出场。
+                if getattr(prog, "stage", "") == "exit":
+                    pl = getattr(prog, "payload", None) or {}
+                    ds.set_state(r["id"], ds.S_EXIT_TODAY,
+                                 exit_reason=pl.get("exit_reason") or "progress_exit",
+                                 exit_price=round(float(pl.get("exit_price")), 3)
+                                 if pl.get("exit_price") else None,
+                                 detail={"marked": today, "src": "progress"},
+                                 expect_state=ds.S_HOLDING, only_unexited=True)
                 continue
             dec = _eval_exit_day_close(r)
             if dec is not None and dec.action == "exit":
@@ -565,6 +699,10 @@ def run_monitor():
         today_buys = [r for r in buy_rows if str(r.get("entry_date"))[:10] == today]
         if today_buys and snapshot_day_done():
             series = fetch_day_snapshots([r["code"] for r in today_buys])
+            # P5-④ (2026-10-07): 判定源可切到 RealtimeBranch 的当日 progress
+            #   (开关 monitor_progress.enabled)。**只认真正拿到的判定** —— 没判到的票
+            #   走下面原来的 confirm_decision, 绝不因"新路径没数据"而漏确认或误判。
+            prog_map = _progress_map(today_buys, series, hm, stats)
             for r in today_buys:
                 rows_ = series.get(r["code"])
                 if not rows_:
@@ -574,6 +712,23 @@ def run_monitor():
                     continue
                 if r.get("exit_reason"):
                     # 盘中已标记出场 (止损/live) 的行不再确认 (防误转 holding)
+                    continue
+                prog = prog_map.get((getattr(s_obj, "key", None), r["code"]))
+                if prog is not None:
+                    pl = getattr(prog, "payload", None) or {}
+                    if getattr(prog, "stage", "") == "exit":
+                        xp = pl.get("exit_price") or (rows_[-1] or {}).get("last")
+                        ds.set_state(r["id"], ds.S_EXIT_TODAY, confirm_date=today,
+                                     d1_chg=_d1_chg_of(r, rows_),
+                                     exit_reason=pl.get("exit_reason") or "progress_exit",
+                                     exit_price=round(float(xp), 3) if xp else None,
+                                     detail={"marked": today, "src": "progress"},
+                                     expect_state=ds.S_BUY_TODAY, only_unexited=True)
+                    else:
+                        ds.set_state(r["id"], ds.S_HOLDING, confirm_date=today,
+                                     d1_chg=_d1_chg_of(r, rows_),
+                                     detail={"src": "progress"},
+                                     expect_state=ds.S_BUY_TODAY, only_unexited=True)
                     continue
                 dec = s_obj.confirm_decision(r, {"series": rows_})
                 if dec is None:

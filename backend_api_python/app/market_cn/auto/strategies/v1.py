@@ -284,7 +284,9 @@ class V1Strategy(StrategyBase):
         entry_seg = bars[entry_idx:today_idx + 1]
         peak = max(float(b["high"]) for b in entry_seg)
         last_bar = bars[-1]
-        if last_bar["low"] <= entry_price * (1 + stop / 100):
+        # 2026-10-07 P1-④ (与 base.exit_decision 同口径): 止损补 T+1 守卫 —— 原裸判,
+        #   held=1 (入场当日) 触及止损线即卖, 违反 A股 T+1。
+        if held > 1 and last_bar["low"] <= entry_price * (1 + stop / 100):
             return ExitDecision("exit", reason=f"止损{stop}%", price=entry_price * (1 + stop / 100))
         if held > 1 and last_bar["low"] <= peak * (1 + trail / 100):
             return ExitDecision("exit", reason=f"追踪止损{trail}%", price=peak * (1 + trail / 100))

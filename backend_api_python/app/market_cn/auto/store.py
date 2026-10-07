@@ -223,35 +223,49 @@ def _row_to_dict(r):
     return d
 
 
-def signal_row(strategy_key, sig, name=""):
-    """Signal → qd_dragon_signals 行 dict (扫描器通用转换, 替代各策略手写补字段)。
+def rule_row_core(strategy_key, code, name, price, score, extra):
+    """(price/score/extra) → qd_dragon_signals **规则列** dict —— 字段映射**唯一**口径。
+
+    两条入口共用本函数，保证对同一信号产的规则列逐字段一致：
+      · `signal_row`    —— 生产扫描入口（输入 = Signal，sig.price/score/extra）
+      · `project_rows`  —— 投影入口（输入 = Record.events 的 ready payload）
+    分叉本函数 = 投影与生产必然漂移，故映射只此一处。
 
     口径与旧 dragon_scan 后处理逐字段等价:
       style (落库列 entry_style) = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
-      score       = sig.score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
-      signal_price= sig.price (0 → None; break 不定价)
+      score       = score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
+      signal_price= price (0 → None; break 不定价)
       lu_date/pullback_days 来自 extra; extra 整包落库 (策略自保证 clean, None 剔除,
       顶层已映射键 board/lu_date/pullback_days 不重复进子字典) → qd_dragon_signals.extra JSON
     """
-    ex = sig.extra or {}
+    ex = extra or {}
     from app.market_cn.auto.core.market import get_board_name
     row = {
         "strategy": strategy_key,
-        "code": sig.code,
+        "code": code,
         "name": name,
-        "board": ex.get("board") or get_board_name(sig.code),
+        "board": ex.get("board") or get_board_name(code),
         "style": getattr(_strategy_meta(strategy_key), "entry_style", "a"),
-        "score": int(sig.score or 0),
-        "signal_date": sig.time,
-        "signal_price": float(sig.price) if sig.price else None,
+        "score": int(score or 0),
+        "signal_price": float(price) if price else None,
         "lu_date": ex.get("lu_date"),
         "pullback_days": ex.get("pullback_days"),
     }
-    # 方案A (2026-09-18): 拔插式 —— 不再有全局白名单, Signal.extra 整包落库。
+    # 方案A (2026-09-18): 拔插式 —— 不再有全局白名单, extra 整包落库。
     # 约定: 策略仅把应落库的字段放进 extra (不塞内部调试量)。
     _top = {"board", "lu_date", "pullback_days"}   # 已在上面映射为顶层列, 不重复
     row["extra"] = {k: v for k, v in ex.items()
                     if v is not None and k not in _top}
+    return row
+
+
+def signal_row(strategy_key, sig, name=""):
+    """Signal → qd_dragon_signals 行 dict (扫描器通用转换, 替代各策略手写补字段)。
+
+    字段口径见 `rule_row_core` (唯一映射处); 本函数只补 signal_date = sig.time。
+    """
+    row = rule_row_core(strategy_key, sig.code, name, sig.price, sig.score, sig.extra)
+    row["signal_date"] = sig.time
     return row
 
 
@@ -424,6 +438,178 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
             logger.error("[upsert_scan_signals] 失败(attempt %d): %s", _attempt, _e)
             raise
     raise last_err
+
+
+# ================================================================
+# 投影写入器 (P5-① · §2.7：判定事实源 = Record；signals 表 = 物化投影)
+# ================================================================
+#
+# 分工（裁定原件见改进方案 §2.7）：
+#   · 判定事实（信号/生命周期/规则结论） → **Record**（core.present.runner，工作表）
+#   · 操作事实（人工标记/实盘价/运行时字段） → **库**（append-only，不可重建）
+#   · qd_dragon_signals 全表 → **物化投影**（规则列从 Record 再生，操作列原地保留）
+#
+# 本段只做「Record.events → 规则列」的再生（纯映射，零判定）；写库门槛与「操作列永不
+# 重建」由调用方复用 rebuild 的 plan/apply 机器（同一份红线：只碰未推进行）。
+# 也就是说：**投影 = build_expected 的另一种事实源**（Record 而非重算规则），
+# expected/actual 之后的 diff/plan/apply 完全共用，故不存在第二套写库实现。
+
+def _d10(v):
+    """事件时间 → 日期串 (YYYY-MM-DD)；None 安全。
+
+    ⚠ intraday 策略（knife/tail）的 ready.date 是分钟时间戳（`fired["time"]` 含 HH:MM:SS），
+    而 signals 的 trade_date/signal_date 是 DATE 列 ⇒ 只取日期部分（与生产 signal_date
+    落库口径一致：PG DATE 列对带时间的字符串隐式截断，两边结果同为日）。
+    """
+    if v is None:
+        return None
+    s = str(v)
+    return s[:10] if len(s) >= 10 else s
+
+
+def project_rows(strategy_key, code, record, name=""):
+    """Record(事件流水) → qd_dragon_signals **规则列**行列表（纯函数，无 DB、无副作用）。
+
+    §2.7：判定事实源 = Record；`qd_dragon_signals` = 物化投影。本函数只把事件链
+    再生为规则列，**不产操作列** —— state 的运行时推进、实盘成交价、extra 里的运行时键
+    （t_legs_today/pre_confirm/marked）不可推导，写库时原地保留（见上）。
+
+    ★ **每一条 ready 事件产一行** —— 与库内唯一键 `(trade_date, strategy, code,
+      entry_style)` 同粒度。同一 (策略,票) 在一个窗口内可以出多次信号（各占一行，
+      实测库内 v1 600792 同键两行）⇒ 「只取首条 ready」是错的：首条只是"当前生命周期
+      位置"，不是信号全集。
+
+    链配对（只影响 state/entry_*/exit_* 这几个**推导列**；操作列不由本函数生产）:
+      · 「开启一段交易的 ready」= **exec 之前最后一条 ready**。顺序前提由
+        `runner.evaluate_day` 保证：当日补齐的 ready 追加在生命周期事件之后
+        ⇒ 它绝不会插在「触发入场的 ready」与其 exec 之间。
+      · exec 的 `buyable is False`（g56 gap 越界）⇒ 不入场：该 ready 行保持
+        watch_pending（对齐旧 entry_decision 口径）。
+      · 两段链（knife/tail: exec 自带 exit_price）当日闭合 ⇒ 该行 state=closed。
+        ⚠ 判据与 `core.replay.trade_map.is_self_closed` 同源；此处**不 import 回放层**
+          （store 是存储层，不反向依赖应用层）。
+
+    Args:
+        record: 任何有 `.events`（list[dict]，每项 {stage,date,payload,...}）的对象，
+                典型为 core.present.runner.Record。
+
+    Returns:
+        list[row]（规则行 dict，字段与 `signal_row` 同构 + trade_date/state/entry_*/
+        exit_*；按事件流顺序 = 时间序）。**[] = 该 (策略,票) 从未出信号**。
+    """
+    rows = []
+    open_i = None            # 当前持仓行的下标（None = 空仓）
+    last_ready = None        # 最近一条 ready 行的下标（入场配对的候选）
+    for e in (getattr(record, "events", None) or []):
+        st = e.get("stage")
+        if st == "ready":
+            pl = e.get("payload") or {}
+            row = rule_row_core(strategy_key, code, name,
+                                pl.get("price"), pl.get("score"), pl.get("extra"))
+            row["trade_date"] = _d10(e.get("date"))
+            row["signal_date"] = _d10(e.get("date"))
+            row["state"] = S_WATCH_PENDING
+            rows.append(row)
+            last_ready = len(rows) - 1
+        elif st == "exec" and last_ready is not None:
+            pl = e.get("payload") or {}
+            if pl.get("buyable") is False:
+                continue                          # gap 越界不入场（旧 entry_decision 口径）
+            row = rows[last_ready]
+            row["entry_date"] = _d10(pl.get("entry_date") or e.get("date"))
+            row["entry_price"] = pl.get("entry_price")
+            row["state"] = S_HOLDING
+            open_i = last_ready
+            if "exit_price" in pl:                # 两段链：exec 自带出场，当日闭合
+                row["exit_date"] = _d10(pl.get("exit_date") or e.get("date"))
+                row["exit_price"] = pl.get("exit_price")
+                row["exit_reason"] = pl.get("exit_reason") or pl.get("reason") or ""
+                row["state"] = S_CLOSED
+                open_i = None
+        elif st == "exit" and open_i is not None:
+            pl = e.get("payload") or {}
+            row = rows[open_i]
+            row["exit_date"] = _d10(pl.get("exit_date") or e.get("date"))
+            row["exit_price"] = pl.get("exit_price")
+            row["exit_reason"] = pl.get("exit_reason") or pl.get("reason") or ""
+            row["state"] = S_CLOSED
+            open_i = None
+    return rows
+
+
+def project_records(strategy_key, records, names=None):
+    """{code: Record}（或 (code, Record) 序列）→ 规则行列表（**扁平**；跳过无 ready 的票）。
+
+    Returns:
+        list[row] —— 与 rebuild.build_expected 的 expected 逐行同构，可直接喂
+        `rebuild.diff` / `build_plan`（即 expected 的另一种事实源）。
+    """
+    names = names or {}
+    items = records.items() if hasattr(records, "items") else records
+    out = []
+    for code, rec in items:
+        out.extend(project_rows(strategy_key, code, rec, name=names.get(code, "")))
+    return out
+
+
+def load_records(root, strategies=None):
+    """从切片根读出全部 Record → {key: {code: Record}}。
+
+    切片文件布局（`{root}/{key}.json`，含 `codes` 段）是 `runner._Backend` 的私事，
+    而只读消费方有两个（投影行 `load_projection`、回放对账 `tools/projection_shadow`）
+    ⇒ 在此收成**唯一**读入口：布局一改只动这一处，不在别处拼路径。
+    格式未知 = 视同损坏（与 `_Backend._ensure` 同语义，打 WARNING **不静默**）。
+    """
+    import os
+
+    from app.market_cn.auto.core.present.runner import Record
+
+    keys = list(strategies) if strategies else [
+        f[:-5] for f in sorted(os.listdir(root)) if f.endswith(".json")
+    ] if os.path.isdir(root) else []
+    out = {}
+    for key in keys:
+        path = os.path.join(root, f"{key}.json")
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not (isinstance(raw, dict) and "codes" in raw):
+            logger.warning("[projection] 切片格式未知(视同损坏, 跳过): %s", path)
+            continue
+        out[key] = {code: Record.from_json(d)
+                    for code, d in (raw["codes"] or {}).items()}
+    return out
+
+
+def load_projection(root, strategies=None, names=None):
+    """从 StateStore 切片根目录读出全部 Record → {(trade_date, strategy, code, entry_style): row}。
+
+    与 `rebuild.load_actual` 对称：同一 key 口径（trade_date/strategy/code/entry_style
+    **四元键**，与库唯一键同粒度；2026-10-07 A2 由三元组修正），
+    故可直接做双向 diff（`rebuild.diff`）。**每一条 ready 日各一行**（见 `project_rows`）
+    —— 同一 (策略,票) 在窗口内多次出信号时逐行展开；只取首条会漏掉后面的。
+
+    ⚠ `names`: {code: 证券简称}。**必须由调用方给** —— Record 里没有 name（它不在事件
+      载荷里，是写库时由 stock_info 补的展示列）。缺省 ⇒ 投影行 name 为空；
+      若该投影直接喂 `apply_plan` 的 insert，空 name 会被写进库（`r.get("name","")`）。
+    """
+    names = names or {}
+    out = {}
+    for key, recs in load_records(root, strategies).items():
+        for code, rec in recs.items():
+            for row in project_rows(key, code, rec, name=names.get(code, "")):
+                if row.get("trade_date"):
+                    # 2026-10-07 A2 修复: 键补第 4 元素 entry_style —— 库唯一键是
+                    #   (trade_date, strategy, code, entry_style)，同一 (票,日) 可出多条
+                    #   ready（实测 v1 600792 同键两行，见 project_rows docstring）。
+                    #   原三元组键 ⇒ 同票同日多条互相覆盖，投影侧**静默少行**；而对拍另侧
+                    #   rebuild.load_actual 同为三元组 ⇒ 两侧同构少行 ⇒ diff「以错对错」通过。
+                    #   ★ 三处必须同步改（本处 / rebuild.build_expected / rebuild.load_actual）：
+                    #   只改一侧会让 `build_ledger_plan` 的 actual.get(k) 全 None ⇒ 账本
+                    #   重建把全部行判成 insert（生产写库事故）。
+                    out[(row["trade_date"], key, code, row.get("style") or "a")] = row
+    return out
 
 
 def set_state(sig_id, state, detail=None, confirm_date=None, d1_chg=None, d1_vol_r=None,
