@@ -334,9 +334,12 @@ def _progress_map(rows, series, hm, stats=None):
     开盘窗口 (可买 gap) 与 15:01 确认共用本函数 —— 两者都是"拿这只票今天的 progress"。
 
     返回 {(strategy_key, code): Progress} —— **只含真正拿到判定的票**。
-    ⚠ 「拿不到判定」(切片缺失 / 策略无折叠契约 / 未到推进时点 / 异常) 一律**不进字典**,
-      由调用方回退旧路径 `confirm_decision`。**绝不能把"无判定"当成"判定为持有"**
-      —— 那会把根本没判过的票静默转成持仓, 是实盘资金事故而非降级。
+    ⚠ 「拿不到判定」(切片缺失 / 策略无折叠契约 / 未到推进时点 / 异常 / **非活仓无事件**)
+      一律不进字典, 由调用方回退旧路径 `confirm_decision`。**绝不能把"无判定"当成
+      "判定为持有"** —— 那会把根本没判过的票静默转成持仓, 是实盘资金事故而非降级。
+    ★ 唯一的无事件入典形态 = `stage="hold"` (P5-④ tick verdict): 仅当 **prev=exec
+      (活仓) 且本 tick 评定无出场** 时产出 —— 这是"评过了, 继续持有"的真判定;
+      死仓/无仓的无事件不产 hold (见 realtime.py 该分支注释, P2 实证)。
     """
     if not _progress_enabled():
         return {}
@@ -703,6 +706,7 @@ def run_monitor():
             #   (开关 monitor_progress.enabled)。**只认真正拿到的判定** —— 没判到的票
             #   走下面原来的 confirm_decision, 绝不因"新路径没数据"而漏确认或误判。
             prog_map = _progress_map(today_buys, series, hm, stats)
+            n_fallback = 0
             for r in today_buys:
                 rows_ = series.get(r["code"])
                 if not rows_:
@@ -730,6 +734,7 @@ def run_monitor():
                                      detail={"src": "progress"},
                                      expect_state=ds.S_BUY_TODAY, only_unexited=True)
                     continue
+                n_fallback += 1
                 dec = s_obj.confirm_decision(r, {"series": rows_})
                 if dec is None:
                     continue
@@ -746,6 +751,8 @@ def run_monitor():
                                  d1_chg=dec.d1_chg, d1_vol_r=dec.d1_vol_r,
                                  detail=dec.detail or {},
                                  expect_state=ds.S_BUY_TODAY, only_unexited=True)
+            # P5-④ 观察灯: 回退旧路径的行数。目标 0 = tick verdict 覆盖全分支，可删 confirm_decision
+            stats["no_judgment"] = n_fallback
 
     # ── 6. exit_today 执行平账 → closed ──
     #      A3 收尾 (2026-09-28): 2 处平账写入带 expect_state=exit_today —— 行集取自本 tick
@@ -840,14 +847,3 @@ def run_monitor():
     return stats
 
 
-def run_monitor_safe():
-    try:
-        stats = run_monitor()
-        logger.info("[dragon_monitor] tick: %s", stats)
-    except Exception as e:
-        logger.error("[dragon_monitor] tick 异常: %s", e, exc_info=True)
-
-
-if __name__ == "__main__":
-    import json as _json
-    print(_json.dumps(run_monitor(), ensure_ascii=False, indent=2))

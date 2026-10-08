@@ -218,7 +218,6 @@ class TailOversoldStrategy(StrategyBase):
                          entry_at="14:50")   # 2026-09-26: 14:50 起即可买入 (非仅 15:00 终审)
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
-    PROBE_STAGE_RANK = {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5}
     # 契约: 回测未含 U1~U4 / 14:50 起尾盘入场 (T+1) / D1 开盘卖当日平账 / 滚动预览
     use_unified_prefilter = False
     entry_at_close = True
@@ -325,12 +324,14 @@ class TailOversoldStrategy(StrategyBase):
             return events
         ctx = inp.ctx or {}
         snap_rows = ctx.get("series") or []
+        _tr = ctx.get("_trace")   # 门原因通道（契约约定）：落选门名进 TraceSink，无 sink 零开销
         fired = None
         for i, row in enumerate(snap_rows):
             hh = _hhmm(row.get("time") or "")
             if hh < p["min_hhmm"] or hh > "15:00":
                 continue
-            fired = self._gates(p, inp.code, state, row, snap_rows[:i + 1])
+            fired = self._gates(p, inp.code, state, row, snap_rows[:i + 1],
+                                probe=(_tr.note if _tr is not None else None))
             if fired:
                 break
         if fired:
@@ -450,10 +451,11 @@ class TailOversoldStrategy(StrategyBase):
             state = self.init_state(code, bars or [])
         except InsufficientHistory:
             state = None
+        _sink = (ctx or {}).get("_trace")
         fired = self._gates(p, code, state, snap, series, probe=(
-            (lambda stage, **kw: probe.trace(
+            (lambda stage, **kw: (_sink.note if _sink is not None else probe.trace)(
                 stage, code=code, d0_date=str(snap.get("time") or "")[:10], **kw))
-            if probe is not None else None))
+            if (probe is not None or _sink is not None) else None))
         if not fired:
             return []
         return [Signal(code=code, time=fired["time"], score=fired["score"],

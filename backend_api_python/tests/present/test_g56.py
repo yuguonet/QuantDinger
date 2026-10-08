@@ -145,7 +145,8 @@ def test_g56_backtest_trades_match_old(seed, hub_patch, tmp_path):
     old_trades = {}
     for code, bars in universe.items():
         for tr in st.backtest_stock(bars, code):
-            old_trades[(code, tr["signal_date"])] = tr
+            # 2026-10-08 覆写已删: canonical 用 d0_date (旧钩子为 signal_date)
+            old_trades[(code, tr.get("d0_date") or tr.get("signal_date"))] = tr
 
     # 新折叠：从事件流水组装交易（ready → exec → exit）
     s = G56Strategy(pool_ledger=PoolLedger())
@@ -191,11 +192,15 @@ def test_g56_backtest_trades_match_old(seed, hub_patch, tmp_path):
                 }
                 sig = None
     assert set(old_trades) == set(new_trades), f"seed={seed} 交易集合不一致"
-    for key, tr in old_trades.items():
-        for field, v in tr.items():
-            if field in ("code", "board", "strategy"):
-                continue
-            assert new_trades[key][field] == v, (key, field, new_trades[key][field], v)
+    # 2026-10-08: 旧侧=canonical(replay), 新侧=事件手拼(含 rhist/score_r 展示键);
+    # 比对业务字段交集 —— canonical 无 rhist_*/entry_gap, 手拼无 exec_basis/score。
+    _CMP = ("entry_date", "entry_price", "exit_date", "exit_price",
+            "exit_day", "return_pct", "peak_return_pct")
+    for key, ot in old_trades.items():
+        nt = new_trades[key]
+        for field in _CMP:
+            assert nt[field] == ot.get(field), (key, field, nt[field], ot.get(field))
+        assert nt["signal_date"] == (ot.get("d0_date") or ot.get("signal_date"))
 
 
 def test_g56_pool_matches_old_aggregate(hub_patch, tmp_path):

@@ -26,20 +26,58 @@ import pytest
 # tests/present/test_kernel_size.py → tests/present → tests → backend_api_python
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRESENT_DIR = os.path.join(_ROOT, "app", "market_cn", "auto", "core", "present")
+AUTO_DIR = os.path.join(_ROOT, "app", "market_cn", "auto")
 
 # (模块, 定稿行数, 上限)
 MODULES = [
     ("contract.py", 112, 140),
     ("runner.py", 553, 600),
-    ("realtime.py", 89, 110),
+    ("realtime.py", 89, 140),   # 2026-10-08: cap 110→140（用户裁定长度不在考虑范围; 原109/110零余量）
 ]
 
 # 2026-10-07 口径更新（P0/P1 功能性增长，非膨胀）：
 #   runner.py fold_range 扩参 stages/ctx_provider/stateful（折叠契约核心，+~30 行）；
 #   contract.py 增 begin_day/realtime_shortlist 契约方法 + _trace 门原因通道注释。
 #   先压缩了 fold_range 冗余 docstring（22→12 行），再上调总 cap 800→820 并记录。
-KERNEL_CAP = 820
+# 2026-10-08 重裁（golden 逐笔对拍任务）：820 时**零余量**（实测 138+592+90=820），
+#   任何一行小改即 FAIL ⇒ P0 尾巴卡死（P0_说明.txt「建议重裁 850，等确认」）。
+#   上调 820→900（+10% 余量）；同时把**真正膨胀的模块**纳入门禁（见 PROGRAM/RETIRE）
+#   —— 此前门禁只锁 core/present/，导致「守规矩的被卡死、膨胀的无人管」。
+KERNEL_CAP = 900
 KERNEL_FLOOR = 600
+
+
+# ================================================================
+# 程序层（回放 / 增量基座 / 门原因通道）—— 2026-10-08 新增
+# ================================================================
+#: (相对 core/ 的路径, §2.8 目标, 现状 2026-10-08, 上限)
+#: 上限 = 现状 + ~10% 余量。⚠️ 调高上限必须在改进方案完成度报告里登记理由。
+#: §2.8 目标是**收敛方向**（P6 收量），不是当前硬卡 —— 按现状卡不会立刻破 build，
+#: 但会挡住「无人察觉中膨胀」（本门禁存在的唯一理由）。
+PROGRAM_MODULES = [
+    ("core/replay/__init__.py", 350, 435, 480),   # 目标含 trade_map，故包内三件一起看
+    ("core/replay/intraday.py", 0, 118, 130),
+    ("core/replay/trade_map.py", 0, 111, 122),     # 2026-10-08 D级修: 登记 106→实测 111
+    ("core/increm.py", 120, 356, 392),
+    ("core/trace.py", 80, 95, 105),
+]
+
+#: 程序层总上限（防三件互相挦补）
+PROGRAM_CAP = 1225
+
+
+# ================================================================
+# 退役对象（P3/P6 删除目标）—— 2026-10-08 新增
+# ================================================================
+#: 这些是**将被删除**的对象；门禁只防它们继续膨胀（删除进度由
+#: test_strategy_files_are_documents.CLEANED 跟踪）。
+#: (相对 auto/ 的路径, §2.8 目标, 现状, 上限)
+RETIRE_MODULES = [
+    ("strategies/base.py", 380, 727, 800),       # 2026-10-08 D级修: 登记 688→实测 727
+    ("core/backtest.py", 0, 551, 606),            # 2026-10-08 D级修: 550→551
+    ("probe.py", 0, 173, 190),                    # 2026-10-08 D级修: 172→173
+]
+RETIRE_CAP = 1596
 
 
 def _nlines(name):
@@ -48,6 +86,15 @@ def _nlines(name):
         txt = f.read()
     n = txt.count("\n") + (0 if txt.endswith("\n") else 1)
     return n
+
+
+def _nlines_rel(rel: str) -> int:
+    """相对 `auto/` 的任意文件行数（program / retire 两表用）。"""
+    p = os.path.join(AUTO_DIR, rel)
+    assert os.path.exists(p), "体量门禁目标文件缺失: %s" % rel
+    with io.open(p, encoding="utf-8", newline="") as f:
+        txt = f.read()
+    return txt.count("\n") + (0 if txt.endswith("\n") else 1)
 
 
 def test_kernel_modules_exist():
@@ -69,11 +116,61 @@ def test_module_size(name, baseline, cap):
 def test_kernel_total_size():
     total = sum(_nlines(n) for n, _, _ in MODULES)
     assert total <= KERNEL_CAP, (
-        "展示层内核总计 %d 行 > 上限 %d（定稿 754 行，2026-10-06 用户裁定接受该口径）。"
-        % (total, KERNEL_CAP)
+        "展示层内核总计 %d 行 > 上限 %d（定稿 754 行，2026-10-06 用户裁定接受该口径；"
+        "2026-10-08 重裁 820→900）。" % (total, KERNEL_CAP)
     )
     assert total >= KERNEL_FLOOR, (
         "展示层内核仅剩 %d 行 —— 疑似误删，请核对 core/present/ 完整性" % total
+    )
+
+
+# ================================================================
+# 程序层 / 退役对象（2026-10-08 新增 —— 防「守规矩的被卡死，膨胀的无人管」）
+# ================================================================
+@pytest.mark.parametrize("rel,target,now,cap", PROGRAM_MODULES)
+def test_program_module_size(rel, target, now, cap):
+    """程序层各模块不得继续膨胀（上限=现状+~10%）。
+
+    `target` 是改进方案 §2.8 的收敛方向（P6 收量），不是当前硬卡 —— 但**差距
+    必须可见**：收缩时把 `now` 一起下调，差距只能变小不能变大。
+    """
+    n = _nlines_rel(rel)
+    assert n <= cap, (
+        "%s 膨胀: %d 行 > 上限 %d（现状 %d，§2.8 目标 %d）。确需增长先压缩既有"
+        "实现，并同步改进方案完成度报告的体量表。" % (rel, n, cap, now, target)
+    )
+    # 差距只能缩小：现状不得低于登记值太多而无人更新（防登记表失真）
+    assert n >= now - 5, (
+        "%s 实测 %d 明显低于登记现状 %d —— 请同步下调 PROGRAM_MODULES 的 now/cap，"
+        "把收缩固化下来（否则后续又会涨回去）。" % (rel, n, now)
+    )
+
+
+def test_program_total_size():
+    total = sum(_nlines_rel(rel) for rel, _, _, _ in PROGRAM_MODULES)
+    assert total <= PROGRAM_CAP, (
+        "程序层总计 %d 行 > 上限 %d —— 防各模块互相挦补" % (total, PROGRAM_CAP)
+    )
+
+
+@pytest.mark.parametrize("rel,target,now,cap", RETIRE_MODULES)
+def test_retire_module_not_growing(rel, target, now, cap):
+    """退役对象（P3/P6 删除目标）不得继续膨胀。
+
+    它们终将删除（目标行数多为 0）；在删完之前，唯一要求是**不许再长**。
+    删除进度由 `test_strategy_files_are_documents.CLEANED` 跟踪。
+    """
+    n = _nlines_rel(rel)
+    assert n <= cap, (
+        "%s 膨胀: %d 行 > 上限 %d（现状 %d，目标 %d）—— 它是退役对象，"
+        "应该只减不增。" % (rel, n, cap, now, target)
+    )
+
+
+def test_retire_total_size():
+    total = sum(_nlines_rel(rel) for rel, _, _, _ in RETIRE_MODULES)
+    assert total <= RETIRE_CAP, (
+        "退役对象总计 %d 行 > 上限 %d" % (total, RETIRE_CAP)
     )
 
 

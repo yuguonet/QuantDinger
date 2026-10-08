@@ -214,9 +214,15 @@ def test_dragon_backtest_trades_match_old(tmp_path):
             sig = ent = None                    # 平仓 ⇒ 链结束，等下一个 ready
     assert len(old_trades) >= 1, "构造历史应当含交易"
     assert len(old_trades) == len(new_trades), (old_trades, new_trades)
+    # 2026-10-08: 覆写已删, backtest_stock=薄壳→replay(canonical: d0_date 等);
+    # fold 侧手拼仍用 signal_date/d1_gap 展示键 ⇒ 比对 canonical 业务字段交集。
+    _CMP = ("entry_date", "entry_price", "exit_price", "exit_day",
+            "return_pct", "peak_return_pct", "exit_reason")
     for o, nw in zip(old_trades, new_trades):
-        for k in nw:
-            assert o.get(k) == nw[k], (k, o.get(k), nw[k])
+        assert (o.get("d0_date") or o.get("signal_date")) == nw.get("signal_date"), \
+            (o.get("d0_date"), nw.get("signal_date"))
+        for k in _CMP:
+            assert o.get(k) == nw.get(k), (k, o.get(k), nw.get(k))
 
 
 def test_dragon_fold_state_step_equals_init():

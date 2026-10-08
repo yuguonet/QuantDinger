@@ -40,20 +40,22 @@ PROCEDURAL_PATTERNS = (
 )
 
 #: 逐文件基线（2026-10-07 实测）。删一个钩子 → 下调对应数字（只允许下降）。
+#: 2026-10-08 P3-④ 批次下调：组装件（_probe_day）与 rank 表（PROBE_STAGE_RANK）
+#: 迁 probe.py（build_day_sample/STAGE_RANK），策略文件程序性符号大降。
 BASELINE = {
-    "base.py": 21,
-    "dragon_callback.py": 25,
-    "break.py": 22,
-    "v1.py": 19,
-    "lead_chase.py": 6,
-    "knife_catch.py": 6,
-    "g56.py": 6,
-    "tail_oversold.py": 5,
-    "relay3.py": 5,
+    "base.py": 9,   # 2026-10-08 +1: legacy probe=probe 转发 (P2 尾巴, 随 legacy P6 删)
+    "dragon_callback.py": 14,
+    "break.py": 9,
+    "v1.py": 4,
+    "g56.py": 5,
+    "relay3.py": 4,
+    "lead_chase.py": 1,
+    "knife_catch.py": 1,
+    "tail_oversold.py": 0,
 }
 
 #: 已清零的文件（P3-④ 完成后逐个加入；一旦加入，回退即 FAIL）
-CLEANED: tuple = ()
+CLEANED: tuple = ("tail_oversold.py",)
 
 
 def _count(name: str) -> int:

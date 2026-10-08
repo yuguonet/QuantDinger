@@ -76,6 +76,7 @@ from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
+    data_end_close,
 )
 from app.utils.logger import get_logger
 
@@ -261,7 +262,8 @@ def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None):
         except Exception:
             pass
     from app.market_cn.auto.core.exit_engines import run_hold_stop
-    return run_hold_stop(bars, s, entry, hold_days=_hold, stop_loss=_stop)
+    # with_reason=True: day_flow/trade 需带 exit_reason (对齐 replay canonical, 草案①等价)
+    return run_hold_stop(bars, s, entry, hold_days=_hold, stop_loss=_stop, with_reason=True)
 
 
 def _score_of(dist_ma20, dif0):
@@ -286,40 +288,6 @@ def _score_of(dist_ma20, dif0):
     return int(min(100, max(0, round(v))))
 
 
-def next_day_view(score) -> dict:
-    """预测分 → **下一交易日** 心理预期 (仅 g56 池内校准; 每日收盘后调用)。
-
-    用户语义 (2026-09-26): D0 分看 D1、D5 分看 D6; 出场后停用; 是「预测分」不是持有评分。
-
-    prob_up 样本内校准 (g56 信号日 n=748, score(T)→T+1 收>前收):
-      <35≈68% | 35–49≈63% | 50–64≈79% | ≥65≈89%
-    label 为口语心里预期 (≈50 视为持平, 与用户举例对齐)。
-
-    Returns:
-        {score, label, prob_up, note}
-    """
-    try:
-        s = int(score)
-    except Exception:
-        return {"score": None, "label": "—", "prob_up": None,
-                "note": "无预测分"}
-    # label: 用户心里预期口径 (≈50=持平); prob_up: g56 信号日实测 P(T+1涨)
-    if s >= 80:
-        label, prob = "大概率涨", 0.90
-    elif s >= 65:
-        label, prob = "偏涨", 0.89
-    elif s >= 55:
-        label, prob = "持平偏涨", 0.79
-    elif s >= 45:
-        label, prob = "大概率持平", 0.63
-    else:
-        label, prob = "偏跌", 0.68
-    return {
-        "score": s,
-        "label": label,
-        "prob_up": prob,
-        "note": "预测分仅对下一交易日有效; 出场后停用; 出池无效",
-    }
 
 
 def _mk_signal(code, bars, k, f, st):
@@ -516,7 +484,8 @@ class G56Strategy(StrategyBase):
                 "buyable": buyable,
                 "stop_use": STOP_LOSS_LU if self._lu_subset(state, code) else STOP_LOSS,
                 "entry_age": state["age"] + 1,
-            }, next_realtime=None)
+                # P5-④ 前置 (2026-10-08): 买入当日 15:01 实时确认（持仓 / 当日出场）。
+            }, next_realtime="15:01")
             events.append(ev)
             if buyable:
                 holding = ev
@@ -740,57 +709,6 @@ class G56Strategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (信号判定走 _g56_gate 统一路径, 指标一次预计算; 出场 _exit_no_trail 无追踪 2026-09-17) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=False,
-                       probe=None):
-        if code.startswith(("8", "4", "92")) or len(bars) < 68:
-            return []
-        board = get_board_type(code)
-        lim = 0.098 if board == "main" else 0.198
-        n = len(bars)
-        o = np.array([float(b["open"]) for b in bars])
-        c = np.array([float(b["close"]) for b in bars])
-        # 横截面 regime 池: 锚=快照末日, 一次聚合后按 target 跨股/逐日缓存复用
-        pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
-        trades = []
-        last_exit_idx = -1   # 修复② 持仓窗口去重: 上一笔未退出前不重复入场
-                            # (同共振段连续成信号时锁仓至退出日, 防 000070 连日重复建仓)
-        # 修复① O(n^2): 全序列指标一次 O(n) 预计算, 不再逐日 scan_signals 重算 _g1_arrays
-        # 修复③: 顺带消除逐日重算 _g1_mask (单次 gating 的 95%, 见 _iter_gate_days)
-        p = self.params()
-        # 索引换算: 原 `for s in range(68, n - 9)` ⇒ s∈[68, n-10] ⇒ k=s-1∈[67, n-11]
-        for k, f, st in _iter_gate_days(bars, board, pool, 67, n - 11, p=p):
-            s = k + 1                          # 入场日 D0 = 信号日 D-1 的下一交易日
-            if s <= last_exit_idx or o[s] <= 0:
-                continue
-            gap = o[s] / c[s - 1] - 1
-            if gap >= lim:
-                continue                        # D0 开盘不可买 (一字/触板)
-            r = _exit_no_trail(bars, s, float(o[s]), code=code)
-            if not r:
-                continue
-            rhc = float(f["rhist_chg"][k])
-            trades.append({
-                "code": code,
-                "board": board,
-                "strategy": STRATEGY_KEY,
-                "signal_date": str(bars[k]["time"])[:10],
-                "entry_date": str(bars[s]["time"])[:10],
-                "entry_price": round(float(o[s]), 3),
-                "entry_gap": round(gap * 100, 2),
-                "exit_date": str(bars[s + r["exit_day"] - 1]["time"])[:10]
-                if 0 < r["exit_day"] and s + r["exit_day"] - 1 < n else None,
-                "exit_price": r["exit_price"],
-                "exit_day": r["exit_day"],
-                "return_pct": r["return_pct"],
-                "peak_return_pct": r["peak_return_pct"],
-                "rhist_chg": round(rhc, 3),
-                "boll_pctb": round(float(f["pctb"][k]), 2),
-                "rmed": round(st["rmed"], 3),
-                "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
-                "buy_mode": "next_open",
-            })
-            last_exit_idx = s + r["exit_day"] - 1   # 锁仓至退出日 (含), 期间不重复入场
-        return trades
 
 
 # ================================================================
@@ -1246,6 +1164,9 @@ def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilt
                           entry_idx=site["entry_idx"], entry_price=site["entry_price"],
                           code=code, board_type=board_type, params=_p, diag=site["diag"])
         if not result:
+            # R1: 数据结束未平 → 末日收盘平仓（与主回测路径同口径）
+            result = data_end_close(bars, site["entry_idx"], site["entry_price"])
+        if not result:
             continue
 
         sig = build_signal(ctx, spec)
@@ -1264,6 +1185,7 @@ def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilt
             "exit_day": result["exit_day"],
             "return_pct": result["return_pct"],
             "peak_return_pct": result["peak_return_pct"],
+            "exit_reason": result.get("exit_reason"),
             **sig,
             "buy_mode": "next_open",
         })

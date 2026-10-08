@@ -106,15 +106,21 @@ def _sha256_file(path):
 
 
 # ── 判定链入口: 生产链 (实盘 scan / 盘中 monitor / 启动 rebuild / 查询 store) 的起点 ──
+# P6/⑤-4 (2026-10-08): probe.py 移出 —— 它是调试观测层 (契约: probe=None 判定不变、
+#   记录绝不回流判定), 改它不该触发重建; 且闭包会经 strategies/*.py 的 lazy import
+#   把它拉回 ⇒ 光删 entry 不缩指纹, 必须同时进 _JUDGE_EXCLUDE (与 display_meta 同模式)。
 _JUDGE_ENTRIES = (
-    "__init__.py", "api.py", "monitor.py", "probe.py", "rebuild.py",
+    "__init__.py", "api.py", "monitor.py", "rebuild.py",
     "registry.py", "scan.py", "sched.py", "store.py", "strategies/base.py",
 )
 
-# ── 展示层: 显式排除在判定指纹外 (改了只需重启) ──
+# ── 展示层/观测层: 显式排除在判定指纹外 (改了只需重启) ──
 #   core/display_meta.py 展示口径映射 (预确认档位归一, 与判定解耦)
-#   tools/               诊断脚本 (debug/explain/gate_try/...), 不参与生产链
-_JUDGE_EXCLUDE = ("core/display_meta.py", "tools/")
+#   probe.py               调试探针适配层 (JSONL/sink 双写; 契约上零判定影响)
+#   tools/                 诊断脚本 (debug/explain/gate_try/...), 不参与生产链
+# ⚠ 维护约束: 被排除的模块**必须**保持零判定逻辑 —— 一旦塞入影响判定的代码,
+#   改动就不会触发重建 (同 display_meta 头注的实证教训)。
+_JUDGE_EXCLUDE = ("core/display_meta.py", "probe.py", "tools/")
 
 _PKG = "app.market_cn.auto"
 
@@ -470,17 +476,18 @@ class _RebuildIncomplete(Exception):
 
 
 def _rebuild_worker(why, fingerprint=None):
-    """后台线程体: 先补扫当日 (幂等), 再跑**账本重放**并写库校准。
+    """后台线程体: 先补扫当日 (幂等), 再跑**投影刷新**并写库校准 (P5-⑤-1)。
 
     为什么两件都做:
       - run_scan 是实盘口径的当日写入权威 (含 wait_data 等数据就绪), 且带
         sync_watchlist_group / cleanup_old 收尾;
-      - rebuild 账本重放覆盖**窗口内全部历史行**, 是 run_scan 做不到的 (它只判当天)。
-      - 顺序不可颠倒: 先让当日入库, rebuild 读到的现状才是最新的 (缺失判定才准)。
-    为什么是账本重放而不是信号层:
-      信号层只产 watch_pending(观察); 状态推进只在 monitor 且**每步锚定"今天"**
-      ⇒ 历史行永不推进, 补出来下个交易日开盘就被 expired。要显示 买入/持有/卖出,
-      只能自己把状态机重放一遍 (rebuild.replay_ledger)。
+      - 投影刷新覆盖**窗口内全部历史行**, 是 run_scan 做不到的 (它只判当天)。
+      - 顺序不可颠倒: 先让当日入库, 刷新读到的现状才是最新的 (缺失判定才准)。
+    为什么是投影而不是信号层 / 旧账本重放 (2026-10-08, P5-⑤):
+      信号层只产 watch_pending, monitor 不推进历史行 ⇒ 补出来下个交易日就被
+      expired 扫掉。旧 replay_ledger 能推状态但有三类口径差 (幽灵交易/理论价/
+      结算时点), 且自 A2 起四元组解包必崩。Record 切片的事件链已含完整
+      lifecycle (ready→exec→exit), `store.load_projection` 直推即得 买入/持有/卖出。
     """
     try:
         from app.market_cn.auto.scan import run_scan
@@ -498,30 +505,24 @@ def _rebuild_worker(why, fingerprint=None):
     done, calibrated_for = False, None
     try:
         from app.market_cn.auto import rebuild as _rb
-        logger.info("[auto_startup] 账本重建开始 (window=%d, %s)", _REBUILD_WINDOW, why)
+        logger.info("[auto_startup] 投影刷新开始 (window=%d, %s)", _REBUILD_WINDOW, why)
         t0 = time.time()
-        expected, meta = _rb.build_expected(window=_REBUILD_WINDOW)
-        if meta.get("error"):
-            # ★ 早退路径: 不推进指纹 —— 否则"取数为空"这类可恢复失败会被永久记成已完成
-            logger.warning("[auto_startup] 重建跳过: %s (指纹不推进, 下次启动会重试)",
-                           meta["error"])
-            raise _RebuildIncomplete(meta["error"])
-        actual = _rb.load_actual(meta.get("win_dates") or [])
-        # 账本重放 (而非信号层): 只有它能把状态推到 买入/持有/卖出。
-        # 信号层只产 watch_pending(观察), 且 monitor 不推进历史行 (每步锚定"今天"),
-        # 补出来的老信号下个交易日开盘就被 expired 扫掉 —— 修不了"界面还是旧状态"。
-        replay, rstat = _rb.replay_ledger(expected, meta,
-                                           meta["bars_map"], meta["idx_map"])
-        plan = _rb.build_ledger_plan(replay, actual, meta)
-        stat = _rb.apply_ledger_plan(plan, dry_run=False)
-        logger.info("[auto_startup] 账本重建完成 (%.0fs): %s | 重放分支=%s",
-                    time.time() - t0, stat, rstat)
+        # P5-⑤-1 (2026-10-08): 投影刷新替代 build_expected + replay_ledger。
+        # 源 = store.load_projection (Record 事件链直推 lifecycle)。回滚 = 还原本段
+        # 调回 build_expected/replay_ledger/build_ledger_plan/apply_ledger_plan 四连。
+        plan, rstat = _rb.projection_ledger_refresh(window=_REBUILD_WINDOW, dry_run=False)
+        if plan is None:
+            err = (rstat or {}).get("error") or "投影刷新无计划"
+            logger.warning("[auto_startup] 投影刷新跳过: %s (指纹不推进, 下次启动会重试)", err)
+            raise _RebuildIncomplete(err)
+        logger.info("[auto_startup] 投影刷新完成 (%.0fs): %s",
+                    time.time() - t0, rstat)
         done = True
-        calibrated_for = meta.get("target") or (meta.get("win_dates") or [None])[-1]
+        calibrated_for = (plan.get("projection_meta") or {}).get("win_to")
     except _RebuildIncomplete:
         pass
     except Exception as e:
-        logger.warning("[auto_startup] 账本重建失败 (不影响启动): %s", e)
+        logger.warning("[auto_startup] 投影刷新失败 (不影响启动): %s", e)
 
     # ★ 指纹只在**校准成功后**推进 (见模块 docstring "快照 = 已校准的凭据")。
     #   中途夭折 / 数据未就绪 都保持旧快照 ⇒ 下次启动同指纹仍会重跑, 不会永久漏补。
@@ -562,15 +563,6 @@ def _rescan_worker(why):
         logger.warning("[auto_startup] 补扫失败 (不影响启动): %s", e)
 
 
-def trigger_rescan(why, background=True):
-    """触发补扫。默认后台线程 (不阻塞启动); background=False 时同步执行 (仅供 CLI/调试)。"""
-    if background:
-        t = threading.Thread(target=_rescan_worker, args=(why,), daemon=True,
-                             name="auto-startup-rescan")
-        t.start()
-        return {"mode": "background", "why": why}
-    _rescan_worker(why)
-    return {"mode": "sync", "why": why}
 
 
 # ================================================================

@@ -79,8 +79,11 @@ def _can_short(spec) -> bool:
 # ================================================================
 
 def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
-                  board_type="main", spec=None, side="long"):
+                  board_type="main", spec=None, side="long", with_reason=False):
     """出场 = min(止损触发, 到期收盘)。无追踪。
+
+    with_reason=True: 结果附 exit_reason 标签 (对齐 run_trail_stop; 日线等价对拍用,
+    默认 False 不改任何判定/成交字段)。
 
     与 g56._exit_no_trail 逐位同构 (2026-09-26 迁出):
       - 最早可卖日 = spec.intraday_t0 ? d=1 : d=2 (A股 T+1);
@@ -115,6 +118,7 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
     pending_dn = False
     exit_p, exit_d = 0.0, 0
     data_exhausted = False
+    _reason = ""
 
     for d in range(min_d, hold_days + 1):
         i = entry_idx + d - 1
@@ -126,6 +130,7 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
         dn = _dn_at(bars, i, board_type, sp)
         if pending_dn:                       # 前一日封死 → 次日开盘卖 (①)
             exit_p, exit_d = float(b.get("open") or 0), d
+            _reason = "跌停顺延开盘"
             pending_dn = False
             break
         if is_one_word_limit_dn(b, dn, sp):  # ① 一字跌停: 整日不可成交
@@ -138,6 +143,7 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                 pending_dn = True
                 continue
             exit_p, exit_d = fill, d
+            _reason = "止损%g%%" % stop_loss
             break
 
     if not exit_d and not pending_dn and not data_exhausted:
@@ -152,9 +158,12 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             exit_d = hold_days
         else:
             px = float(bars[i].get("close") or 0)
-            return {"exit_day": hold_days, "exit_price": round(px, 3),
-                    "return_pct": round((px / entry_price - 1) * 100, 2),
-                    "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
+            out = {"exit_day": hold_days, "exit_price": round(px, 3),
+                   "return_pct": round((px / entry_price - 1) * 100, 2),
+                   "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
+            if with_reason:
+                out["exit_reason"] = "持仓到期"
+            return out
 
     if pending_dn:                           # 尾块: 找第一个非一字跌停日开盘卖出
         nxt = entry_idx + exit_d + 1
@@ -165,14 +174,18 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                 nxt += 1
                 continue
             exit_p, exit_d = float(nb.get("open") or 0), nxt - entry_idx + 1
+            _reason = "跌停顺延开盘"
             pending_dn = False
             break
 
     if pending_dn or data_exhausted or not exit_d:   # ④ 视野不足 → None
         return None
-    return {"exit_day": exit_d, "exit_price": round(exit_p, 3),
-            "return_pct": round((exit_p / entry_price - 1) * 100, 2),
-            "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
+    out = {"exit_day": exit_d, "exit_price": round(exit_p, 3),
+           "return_pct": round((exit_p / entry_price - 1) * 100, 2),
+           "peak_return_pct": round((peak / entry_price - 1) * 100, 2)}
+    if with_reason:
+        out["exit_reason"] = _reason
+    return out
 
 
 # ================================================================

@@ -80,6 +80,7 @@ def build_trade(*, code, strategy, ready_date=None, ready_pl=None,
     # exit 段优先（三段链），否则退到 exec 自带出场（两段链）
     closed_pl = exit_pl if exit_pl else (exec_pl if is_self_closed(exec_pl) else {})
 
+    self_closed = (not exit_pl) and is_self_closed(exec_pl)
     src = dict(exec_pl)
     src.update(closed_pl)                       # 同名字段 exit 覆盖 exec
 
@@ -96,8 +97,12 @@ def build_trade(*, code, strategy, ready_date=None, ready_pl=None,
         "entry_price": round(float(entry_price), 3) if entry_price else None,
         "exit_date": str(exit_date)[:10] if exit_date else None,
         "exit_price": round(float(exit_price), 3) if exit_price else None,
-        "exit_day": _pick(src, "exit_day"),
-        "exit_reason": _pick(src, "exit_reason") or ready_pl.get("label"),
+        # 两段链（self-closed，knife/tail 隔夜形态）：出场口径 = 旧引擎契约
+        # （intraday_exit 固定 exit_day=1、exit_reason="d1_open"，其标签在 exec 的 label 里）
+        "exit_day": _pick(src, "exit_day") or (1 if self_closed else None),
+        "exit_reason": _pick(src, "exit_reason") \
+            or (exec_pl.get("label") if self_closed else None) \
+            or ready_pl.get("label"),
         "return_pct": _pick(src, "return_pct"),
         "peak_return_pct": _pick(src, "peak_return_pct"),
         "exec_basis": exec_basis,

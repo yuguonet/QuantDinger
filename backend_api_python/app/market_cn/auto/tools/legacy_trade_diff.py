@@ -20,10 +20,30 @@ P6 清理收量也就拿不到通行证。
 
     python -m app.market_cn.auto.tools.legacy_trade_diff --strategy break --n 20 --days 300
 
+    # 外部参照模式（§2.2.3）：旧侧来自**独立旧版树**（P6 删除树内旧代码后照跑）
+    python -m app.market_cn.auto.tools.legacy_trade_diff --strategy break \
+        --ref D:\\ref\\QuantDinger-auto展示层正常
+    # 等价：export AUTO_SLIM_REF=<旧版树根>  后省略 --ref
+
 退出码: 0 = 逐笔一致（可删）；1 = 有差异或样本为空。
+
+★ 删除开关的升级（§2.2.3 落地约定，2026-10-08）：
+    原：冻结 JSON 全绿（tests/golden/test_golden_parity）。
+    升级为：**冻结 JSON 全绿 + 外部旧版参照对拍全绿**（本工具 --ref 模式 /
+    tests/golden/test_ref_parity）。旧整树归档在 GitHub main 的
+    `QuantDinger-auto展示层正常.zip`，删除旧代码因此**可逆**。
 
 ⚠ 口径：差异一旦出现，按 §2.2.1 裁定「缺陷不入基线」⇒ **以 replay 为准**，
   不得为了对拍通过而把旧回测的缺陷（如 T+1 违规）焊进新引擎。
+⚠ §2.2.2 边界：外部参照用于验证**架构等价**；R1/R2 是有意的规则变更
+  （末日平仓收尾 / 出场起点 D2），参照树是变更前版本 ⇒ 该两类差异属**已登记**，
+  以重冻基线为准，不以旧版为准（详见 docs/口径差异报告.md）。
+
+外部参照模式的隔离设计（为什么走子进程）
+----------------------------------------
+旧版树的 `from app.market_cn.auto...` 与当前树**同包名**，进程内 import 必串包。
+⇒ `--ref` 把旧侧放进**独立子进程**：PYTHONPATH 指向旧版树的 backend_api_python，
+旧代码整体在自己的包空间里跑，零污染、零依赖当前树（P6 删完也照跑）。参照树**只读**。
 """
 from __future__ import annotations
 
@@ -37,6 +57,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import argparse
+import json
+import os
+import subprocess
 
 #: §5.1 规定的容差
 EPS = 1e-12
@@ -50,6 +73,65 @@ _FIELDS = (
     ("exit_price", "exit_price"),
     ("return_pct", "return_pct"),
 )
+
+#: 子进程里跑旧引擎的脚本（独立解释器 + PYTHONPATH=旧版树 ⇒ 包空间隔离）。
+_REF_RUNNER = r"""
+import json, sys
+data = json.load(sys.stdin)
+from app.market_cn.auto import strategies as reg
+reg.autodiscover()
+s = reg.get_strategy(data["strategy"])
+if s is None:
+    raise SystemExit("strategy not registered in ref tree: " + data["strategy"])
+kw = data.get("kwargs") or {}
+si = data.get("stock_info")
+try:
+    if si is not None:
+        out = s.backtest_stock(data["bars"], data["code"], stock_info=si, **kw)
+    else:
+        out = s.backtest_stock(data["bars"], data["code"], **kw)
+except TypeError:
+    out = s.backtest_stock(data["bars"], data["code"])   # 旧签名不收 kwargs
+if isinstance(out, dict):
+    out = out.get("trades") or []
+json.dump(list(out or []), sys.stdout)
+"""
+
+
+def resolve_ref_backend(ref_root):
+    """旧版树根 → backend_api_python 路径（接受仓库根或 backend 目录两种）。"""
+    ref_root = os.path.abspath(ref_root)
+    cand = os.path.join(ref_root, "backend_api_python")
+    return cand if os.path.isdir(os.path.join(cand, "app")) else ref_root
+
+
+def ref_trades(ref_root, strategy, code, bars, *, stock_info=None, kwargs=None,
+               timeout=300):
+    """外部参照树的 `backtest_stock` 输出（独立子进程跑，参照树只读）。
+
+    返回 trades list（dict 未规范化，与 legacy_trades 同形状）；失败抛 RuntimeError
+    （含子进程 stderr，**不静默**）。
+    """
+    backend = resolve_ref_backend(ref_root)
+    if not os.path.isdir(os.path.join(backend, "app")):
+        raise RuntimeError(f"参照树不是有效工程: {ref_root}（resolve→{backend}）")
+    payload = {"strategy": strategy, "code": code, "bars": bars,
+               "stock_info": stock_info, "kwargs": kwargs or {}}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = backend + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        p = subprocess.run(
+            [sys.executable, "-c", _REF_RUNNER],
+            input=json.dumps(payload), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", cwd=backend, env=env,
+            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"参照树子进程超时 ({timeout}s): {strategy}/{code}")
+    if p.returncode != 0:
+        raise RuntimeError(f"参照树子进程失败 ({strategy}/{code}): "
+                           f"{p.stderr.strip()[-500:]}")
+    return json.loads(p.stdout or "[]")
 
 
 def _norm_date(v):
@@ -122,6 +204,10 @@ def main(argv=None) -> int:
     ap.add_argument("--n", type=int, default=20, help="样本票数")
     ap.add_argument("--days", type=int, default=300)
     ap.add_argument("--top", type=int, default=12, help="差异明细打印条数")
+    ap.add_argument("--ref", default=os.environ.get("AUTO_SLIM_REF"),
+                    help="外部旧版树根（§2.2.3）；默认取 $AUTO_SLIM_REF。"
+                         "给定后旧侧 = 参照树的 backtest_stock（独立子进程），"
+                         "P6 删除树内旧代码后照跑")
     a = ap.parse_args(argv)
 
     from app.market_cn.auto import strategies as reg
@@ -145,6 +231,9 @@ def main(argv=None) -> int:
         StrategyBase, "begin_day", None)
     if pooled:
         print(f"[{a.strategy}] 横截面策略 (覆写 begin_day) ⇒ 走 replay_batch")
+        if a.ref:
+            print(f"[{a.strategy}] ⚠ 外部参照模式下旧侧为**单票**旧引擎（无池接线），"
+                  f"横截面策略的参照对拍仅供定性，等价结论以冻结基线为准")
 
     bars_map = {}
     for c in (all_codes() or [])[:a.n]:
@@ -162,11 +251,16 @@ def main(argv=None) -> int:
         replay_batch(strat, bars_map, collectors=cols)
         batch_trades = {c: list(cols[c][0].trades) for c in bars_map}
 
+    if a.ref:
+        print(f"[{a.strategy}] 外部参照模式: {resolve_ref_backend(a.ref)}"
+              f"（§2.2.3；参照树只读；R1/R2 已登记差异见 docs/口径差异报告.md）")
+
     n_leg = n_rep = n_only_l = n_only_r = n_bad = 0
     rows = []
     for code, bars in bars_map.items():
         try:
-            lg = legacy_trades(strat, code, bars)
+            lg = (ref_trades(a.ref, a.strategy, code, bars) if a.ref
+                  else legacy_trades(strat, code, bars))
         except Exception as e:                      # 旧引擎炸了也要记账，不能静默
             n_bad += 1
             rows.append((code, "<legacy>", f"{type(e).__name__}: {e}", ""))

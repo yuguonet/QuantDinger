@@ -19,6 +19,8 @@ DRAGON_CB_PARAMS 为 facade 转发 (test_dragon.py / dragon_scan / dragon_monito
 """
 from __future__ import annotations
 
+from app.market_cn.auto.sampler import STAGE_RANK as _STAGE_RANK
+
 from app.utils.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
@@ -28,6 +30,7 @@ from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_fun
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
+    data_end_close,
 )
 # 递推展示层契约 (2026-10-06: 折叠契约已并入生产 StrategyBase):
 #   折叠契约已并入生产 StrategyBase（单继承）; 参数合并口径唯一 = params()
@@ -593,9 +596,6 @@ class DragonCallbackStrategy(StrategyBase):
     scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(DRAGON_CB_PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近; 引擎/回测钩子经 getattr 读取)
-    PROBE_STAGE_RANK = {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4, "rsi": 5,
-                        "turn": 6, "d0_chg": 7, "quality": 7, "dedup": 8, "prefilter": 9,
-                        "engine_skip": 9, "signal": 10}
     # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
         Stage("ready", "龙回头·准备", realtime="09:25"),
@@ -673,10 +673,13 @@ class DragonCallbackStrategy(StrategyBase):
             streak_h = _lu_streak(bars, lu_idx, board_type)
             lu_gain20 = _lu_gain20(bars, lu_idx)
 
-            # 探针 shim (TRACE 宏语义): probe=None 时 _tr=None, 判定内零开销
-            if probe is not None:
+            # 探针 shim (TRACE 宏语义): trace 统一分发（ctx["_trace"].note 优先 /
+            # probe.trace 兼容）⇒ M1 采样可不依赖 probe 对象（影子对拍: test_m1_sampler）
+            _sink = (ctx or {}).get("_trace")
+            if probe is not None or _sink is not None:
                 def _tr(stage, **kw):
-                    probe.trace(stage, code=code, d0_date=str(bars[i]["time"])[:10],
+                    (_sink.note if _sink is not None else probe.trace)(
+                        stage, code=code, d0_date=str(bars[i]["time"])[:10],
                                 lu_date=str(bars[lu_idx]["time"])[:10],
                                 gap_from_peak=gap_from_peak, streak_h=streak_h,
                                 lu_gain20=round(lu_gain20, 1) if lu_gain20 is not None else None,
@@ -856,7 +859,8 @@ class DragonCallbackStrategy(StrategyBase):
                 "buyable": open_px > 0,
                 "entry_abs": today_abs,
                 "lu_abs": prev.payload.get("lu_abs"), "i_abs": prev.payload.get("i_abs"),
-            }, next_realtime=None)
+                # P5-④ 前置 (2026-10-08): 买入当日 15:01 实时确认（持仓 / 当日出场）。
+            }, next_realtime="15:01")
             events.append(ev)
             if open_px > 0:
                 holding = ev
@@ -1034,141 +1038,6 @@ class DragonCallbackStrategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_dragon_stock 逐字搬入, 对数零差异) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
-                       probe=None):
-        """单股龙回头全历史回测, 返回 trades 列表 (字段与基线 JSON 对齐)。
-
-        编排 (枚举/去重±4/预过滤锚点/预筛) 是策略规则故归位本插件; 出场模拟
-        run_backtest_dragon_callback 在本文件 (策略专用出场规则)。
-        probe: 调试探针 (None=零开销) — 每个到达完整判定的决策日产出一行
-        sample (特征+标签+当日最深判定阶段), 廉价预筛跳过的日不采样 (纯噪声)。
-        """
-        from app.market_cn.auto.core.filters import unified_prefilter
-        board_type = get_board_type(code)
-        n = len(bars)
-        if n < 5:
-            return []
-        lu_all = find_limit_ups(bars, board_type)
-        # 廉价预筛参数: 与 scan_signals 实际用的默认参数同源 (回测不走 config 覆盖,
-        # 与旧 facade 调用路径一致); 取 self.default_params 而非 params。
-        gap_min = self.default_params["gap_min"]
-        gap_max = self.default_params["gap_max"]
-        trades = []
-        used_ranges = []
-        # 波次起点 (波次窗口口径, 2026-09-10 用户裁定): 最近一次"第一条规则(找龙)未通过"
-        # 的次日 = 本波行情起点; 供探针标签用 (判定路径不读)。廉价预筛跳过日与
-        # stage=dragon/no_candidate 都算"找龙未通过" → 波次断点。
-        wave_start = 0
-
-        for i in range(2, n - 1):
-            # 廉价预筛 (数学必要条件超集, 非加规则 — 行为零差异): scan_signals 必过
-            # Step2 — 存在涨停日 lu: gap∈[gap_min,gap_max] 且 D0收盘仍低于涨停收盘;
-            # 不满足则该日不可能出信号, 跳过昂贵的逐日全量判定 (closes 复制 +
-            # MACD/RSI/ROC/PSY, 426s→48s 的根因修复)。若回测覆盖 gap 参数须同步此处。
-            d0c = bars[i]["close"]
-            if not any(gap_min <= i - j <= gap_max and d0c < bars[j]["close"]
-                       for j in lu_all):
-                wave_start = i + 1      # 该日不可能出信号 (找龙未通过) → 波次断点
-                continue
-
-            # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
-            # debug 模式: day_tr 聚合该日全部候选的判定步落点 (_DayTrace, probe=None 零开销)
-            day_tr = _DayTrace() if probe is not None else None
-            sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
-                bars[:i + 1], code, limit_ups=[j for j in lu_all if j < i],
-                probe=day_tr)]
-
-            if not sigs:
-                if probe is not None:
-                    stage = max((t["stage"] for t in day_tr.items),
-                                key=lambda s: self.PROBE_STAGE_RANK.get(s, 0),
-                                default="no_candidate")
-                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
-                                 stage=stage, rule_trace=day_tr.items,
-                                 **_dragon_sample_feats(bars, i, code,
-                                                        stock_info=stock_info, wave_start=wave_start))
-                    if stage in ("dragon", "no_candidate"):
-                        wave_start = i + 1      # 找龙未通过 → 波次断点
-                continue
-            sig = sigs[0]
-            lu_idx = _find_bar_idx(bars, sig["lu_date"])
-
-            # 去重 (±4天内跳过); 注意去重在过滤之前 (对数基线行为)
-            skip = False
-            for (s, e) in used_ranges:
-                if abs(i - s) <= 4 or abs(i - e) <= 4:
-                    skip = True
-                    break
-            if skip:
-                if probe is not None:
-                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
-                                 stage="dedup", rule_trace=day_tr.items, sig=sig,
-                                 **_dragon_sample_feats(bars, i, code,
-                                                        stock_info=stock_info, wave_start=wave_start))
-                continue
-            used_ranges.append((lu_idx, i))
-
-            # U1~U4 预过滤 (锚定涨停日, 无未来函数)
-            if use_prefilter and lu_idx > 0:
-                ok, fails = unified_prefilter(bars, lu_idx, code, stock_info)
-                if not ok:
-                    if probe is not None:
-                        probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
-                                     stage="prefilter", rule_trace=day_tr.items,
-                                     sig=sig, u_fails=list(fails),
-                                     **_dragon_sample_feats(bars, i, code,
-                                                            stock_info=stock_info, wave_start=wave_start))
-                    continue
-
-            # 入场: 次日(D+1)开盘价
-            d0 = bars[i]
-            d1 = bars[i + 1]
-            d1_gap = (d1["open"] / d0["close"] - 1) * 100 if d0["close"] > 0 else 0
-            entry_price = d1["open"]
-            if entry_price <= 0:
-                continue
-
-            # 2026-09-25 bugfix: 原先写死 hold_days=7, stop_loss=-8.0 且不传 trail/peak,
-            # 导致 config/default_params 出场参数在回测路径**静默失效**。改为经 params
-            # 注入 (config > 代码默认), 与 run_backtest_dragon_callback 的 **params 合并口径一致。
-            _ep = self.params(None)
-            result = run_backtest_dragon_callback(
-                bars, i + 1, entry_price, board_type=board_type,
-                hold_days=_ep.get("hold_days"),
-                stop_loss=_ep.get("stop_loss"),
-                trail_lo=_ep.get("trail_lo"),
-                trail_hi=_ep.get("trail_hi"),
-                trail_switch_pct=_ep.get("trail_switch_pct"),
-                peak_exit_ret=_ep.get("peak_exit_ret"),
-                peak_exit_upper=_ep.get("peak_exit_upper"),
-            )
-            if not result:
-                if probe is not None:
-                    probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
-                                 stage="engine_skip", rule_trace=day_tr.items,
-                                 sig=sig, **_dragon_sample_feats(bars, i, code,
-                                                                 stock_info=stock_info, wave_start=wave_start))
-                continue
-
-            if probe is not None:
-                probe.sample(code=code, d0_date=str(bars[i]["time"])[:10],
-                             stage="signal", rule_trace=day_tr.items, sig=sig,
-                             engine={k: result.get(k) for k in
-                                     ("return_pct", "peak_return_pct",
-                                      "exit_reason", "exit_day")},
-                             **_dragon_sample_feats(bars, i, code,
-                                                    stock_info=stock_info, wave_start=wave_start))
-
-            trades.append({
-                **sig,
-                "entry_date": d1["time"],
-                "entry_price": round(entry_price, 3),
-                "buy_mode": "next_open",
-                "d1_gap": round(d1_gap, 2),
-                **result,
-            })
-
-        return trades
 
 
 def _find_bar_idx(bars, date_str):
@@ -1398,6 +1267,9 @@ def _backtest_limit_up(bars, code, spec, ev, board_type, stock_info, use_prefilt
         result = run_exit(spec.exit.get("mode", "combo"), bars=bars, entry_idx=i,
                           entry_price=entry_price, code=code, board_type=board_type,
                           params=spec.params, diag={})
+        if not result:
+            # R1: 数据结束未平 → 末日收盘平仓（本路径入场=D0 收盘，entry_idx=i）
+            result = data_end_close(bars, i, entry_price)
         if not result:
             continue
         # 信号附带字段（与 _signal_to_legacy_dict + scan_signals.extra 完全一致）

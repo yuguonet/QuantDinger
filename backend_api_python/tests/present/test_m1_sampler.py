@@ -50,13 +50,22 @@ class _FakeStrat:
         self.calls = []
 
     def scan_signals(self, bars, code, *, probe=None, **params):
-        if probe is not None:
-            probe.trace("a", code=code, v=1)
-            probe.trace("b", code=code, v=2)
+        # 分发契约（与真实策略同款）: ctx["_trace"].note 优先 / probe.trace 兼容
+        sink = (params.get("ctx") or {}).get("_trace")
+
+        def _emit(stage, **kw):
+            if sink is not None:
+                sink.note(stage, **kw)
+            elif probe is not None:
+                probe.trace(stage, **kw)
+        _emit("a", code=code, v=1)
+        _emit("b", code=code, v=2)
         return [_Sig(code=code, time=bars[-1]["time"])]
 
     def _probe_day(self, probe, day_tr, bars, i, code, stock_info,
                    stage=None, sig=None, u_fails=None, extra=None):
+        # P3-④ 后 observe 不再调策略方法（组装归 probe.build_day_sample）；
+        # 保留本 stub 仅当旧接口兼容层测试用。
         self.calls.append({
             "stage": stage,
             "u_fails": list(u_fails) if u_fails else None,
@@ -90,24 +99,29 @@ def _mk(active, tmp_path, monkeypatch, *, enabled=True):
 
 
 def test_observe_self_runs_and_emits_sample(tmp_path, monkeypatch):
-    """核心不变量: `observe` 自跑 scan_signals(probe=) 取 trace 并产出一行 sample。"""
+    """核心不变量: `observe` 自跑 scan_signals 取 trace 并产出一行 sample。
+
+    P3-④ 后组装走 probe.build_day_sample（输出直达 probe 对象）⇒ 断言捕获 probe。
+    """
     st = _FakeStrat()
     s = _mk({"fake": st}, tmp_path, monkeypatch)
+    cap = s.probes["fake"] = _CaptureProbe()
     s.observe("fake", st, "000001", _bars(), {})
     s.close()
-    assert st.calls, "自跑应产 sample"
-    assert s.probes["fake"].counts.get("sample") == 1
+    assert len(cap.samples) == 1, "自跑应产 sample"
+    assert cap.samples[0]["code"] == "000001"
     # trace 由自跑的 scan_signals 写出 (折叠判定不产 trace ⇒ 全靠自跑)
-    assert [t["stage"] for t in st.calls[0]["trace"]] == ["a", "b"]
+    assert [t["stage"] for t in cap.samples[0]["rule_trace"]] == ["a", "b"]
 
 
 def test_stage_signal_when_prefilter_passes(tmp_path, monkeypatch):
     st = _FakeStrat()
     s = _mk({"fake": st}, tmp_path, monkeypatch)
+    cap = s.probes["fake"] = _CaptureProbe()
     s.observe("fake", st, "000001", _bars(), {})
     s.close()
-    assert st.calls[0]["stage"] == "signal"
-    assert st.calls[0]["u_fails"] is None
+    assert cap.samples[0]["stage"] == "signal"
+    assert cap.samples[0].get("u_fails") is None
 
 
 def test_stage_prefilter_when_rejected(tmp_path, monkeypatch):
@@ -117,10 +131,11 @@ def test_stage_prefilter_when_rejected(tmp_path, monkeypatch):
     s = sampler_mod.LiveSampler(
         {"fake": st}, lambda k: {}, out_dir=str(tmp_path),
         prefilter=lambda sigs, bars, code, info, strat: ([], ["u1_fail"]))
+    cap = s.probes["fake"] = _CaptureProbe()
     s.observe("fake", st, "000001", _bars(), {})
     s.close()
-    assert st.calls[0]["stage"] == "prefilter"
-    assert st.calls[0]["u_fails"] == ["u1_fail"]
+    assert cap.samples[0]["stage"] == "prefilter"
+    assert cap.samples[0]["u_fails"] == ["u1_fail"]
 
 
 def test_disabled_is_zero_cost(tmp_path, monkeypatch):
@@ -159,3 +174,85 @@ def test_self_run_exception_does_not_raise(tmp_path, monkeypatch):
     s = _mk({"b": st}, tmp_path, monkeypatch)
     s.observe("b", st, "000001", _bars(), {})   # 不抛
     s.close()
+
+
+# ================================================================
+# 影子对拍（P3 迁移开关，2026-10-08）：ctx["_trace"] 路径 == probe 路径
+# ================================================================
+class _CaptureProbe:
+    def __init__(self):
+        self.samples = []
+
+    def sample(self, **kw):
+        self.samples.append(kw)
+
+
+@pytest.mark.parametrize("spec_name,skey", [
+    ("break_real_000032", "break"),
+    ("dragon_crafted", "dragon_callback"),
+])
+def test_m1_shadow_trace_path_equals_probe_path(monkeypatch, spec_name, skey):
+    """影子对拍：ctx["_trace"] 路径与 probe 路径产出逐字节同源（P3 迁移开关）。
+
+    覆盖：sigs/kept/u_fails/rule_trace + 真 `_probe_day` 组装的整 sample。
+    逐日扫描（observe 是逐日采样），双证据防假绿（≥1 信号日 + ≥1 落选轨迹日）。
+    全绿后 observe 方可切到影子路径，probe 面（P3-④）才谈得上退役。
+    g56/relay3 的 scan_signals 无 probe 形参（M1 天然不采）；knife/tail 无 ctx
+    供给不产出 —— 均不在对拍名单，分发器已统一（零行为差异由全量测试背书）。
+    """
+    import json as _json
+    import os as _os
+    from dataclasses import asdict
+
+    from app.market_cn.auto import strategies as reg
+    from tests.golden.inputs import INPUT_SETS
+
+    reg.autodiscover()
+    monkeypatch.setattr("app.market_cn.auto.strategies.live_probe_enabled",
+                        lambda: True)
+    spec = next(s for s in INPUT_SETS if s["name"] == spec_name)
+    bars, code = spec["build"](), spec["code"]
+    # observe 逐日采样（bars 截到采样日）⇒ 按基线信号日截断，信号在末日
+    _base = _json.load(open(_os.path.join(
+        _os.path.dirname(__file__), "..", "golden", "baselines",
+        spec_name + ".json"), encoding="utf-8"))
+    _d0 = _base["trades"][0]["d0_date"]
+    _cut = next(i for i, b in enumerate(bars) if str(b["time"])[:10] == _d0)
+    bars = bars[:_cut + 1]
+    strat = reg.get_strategy(skey)
+    smp = sampler_mod.LiveSampler({skey: strat}, lambda k: {})
+    si = {code: spec.get("stock_info") or {}}
+
+    saw_signal = saw_trace = 0
+    for cut in range(30, len(bars) + 1):
+        day_bars = bars[:cut]
+        sigs0, kept0, uf0, tr0 = smp._self_run(skey, strat, code, day_bars, si)
+        sigs1, kept1, uf1, tr1 = smp._self_run_via_trace(
+            skey, strat, code, day_bars, si)
+        assert [asdict(s) for s in (sigs0 or [])] == [asdict(s) for s in (sigs1 or [])]
+        assert [asdict(s) for s in (kept0 or [])] == [asdict(s) for s in (kept1 or [])]
+        assert list(uf0 or []) == list(uf1 or [])
+        assert tr0.items == tr1.items, (cut, tr0.items, tr1.items)
+        if sigs0:
+            saw_signal += 1
+        if tr0.items:
+            saw_trace += 1
+        if sigs0 or tr0.items:
+            def _assemble(day_tr, sigs, kept, u_fails):
+                if sigs and not kept:
+                    stage, _uf = "prefilter", u_fails
+                elif kept:
+                    stage, _uf = "signal", None
+                else:
+                    stage, _uf = None, None
+                cap = _CaptureProbe()
+                sig = asdict(kept[0] if kept else sigs[0]) if sigs else None
+                sampler_mod.build_day_sample(
+                    cap, day_tr, day_bars, len(day_bars) - 1, code,
+                    si.get(code), strategy=strat, stage=stage,
+                    u_fails=_uf if sigs else None, sig=sig)
+                return cap.samples
+            assert _assemble(tr0, sigs0, kept0, uf0) == \
+                   _assemble(tr1, sigs1, kept1, uf1), cut
+    assert saw_signal >= 1, "%s 全程无信号 —— 对拍无证据（假绿防线）" % spec_name
+    assert saw_trace >= 1, "%s 全程无落选轨迹 —— trace 同源无证据（假绿防线）" % spec_name

@@ -132,3 +132,74 @@ def test_probe_adapter_double_writes_sink():
         lines = [json.loads(x) for x in f.read().strip().splitlines()]
     # JSONL 落盘格式不变（kind/strategy/ts + 载荷），rule_audit 消费面零破坏
     assert [x["kind"] for x in lines] == ["trace", "sample", "shell"]
+
+
+def test_knife_evaluate_writes_trace_and_zero_diff():
+    """knife 接线（P0-① 余量）：_gates 的 probe 回调进 sink；带/不带 sink 逐位一致。
+
+    knife/tail 的 `_gates` 自带门级 TRACE 回调（probe(stage, **kw)），
+    `tr.note` 与其同形 ⇒ evaluate 侧零胶水接线。
+    """
+    from tests.present.common import (KNIFE_HIST_CLOSES, gen_hist_bars,
+                                      knife_day_rows)
+    from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
+
+    bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES)
+    d0 = {"time": "2026-10-05", "open": 96.4, "high": 96.5, "low": 84.0,
+          "close": 85.2, "volume": 1200.0}
+    rows = knife_day_rows(d0["time"], pc=100.0)
+    ctx0 = {"latest": rows[-1], "series": rows, "mkt_gain": -3.0}
+
+    s = KnifeCatchStrategy()
+    state = s.init_state(CODE, bars)
+    sink = TraceSink(code=CODE, strategy=s.key)
+    ctx1 = {**ctx0, "_trace": sink}
+    ev1 = s.evaluate(state, DayInput(CODE, d0, ctx1), None) or []
+    ev0 = s.evaluate(state, DayInput(CODE, d0, ctx0), None) or []
+    assert [e.stage for e in ev1] == ["ready"], [e.stage for e in ev1]
+    assert [(e.stage, e.date, e.payload) for e in ev0] == \
+           [(e.stage, e.date, e.payload) for e in ev1], "带 sink 不得改变行为"
+    # 门轨迹应进 sink：命中记 signal，落选记门名（window/mkt/feat/...）
+    known = ("signal", "window", "mkt", "feat", "tail_vw", "vol", "streak",
+             "daily", "data")
+    assert sink.records, "门轨迹未进 sink（接线失效）"
+    assert all(r.get("kind") in known for r in sink.records), sink.records[:5]
+    assert any(r.get("kind") == "signal" for r in sink.records), sink.records[:5]
+
+
+def test_break_evaluate_writes_trace_and_zero_diff():
+    """break 接线：判定分支 4 落选点 + 命中点进 sink；带/不带 sink 逐位一致。"""
+    from tests.golden.inputs import INPUT_SETS
+    from app.market_cn.auto import strategies as reg
+
+    reg.autodiscover()
+    spec = next(s for s in INPUT_SETS if s["name"] == "break_real_000032")
+    bars = spec["build"]()
+    code = spec["code"]
+    s = reg.get_strategy("break")
+    assert s is not None
+
+    def _walk(ctx):
+        state, j = None, 0
+        while j < len(bars):
+            try:
+                state = s.init_state(code, bars[:j])
+                break
+            except InsufficientHistory:
+                j += 1
+        assert state is not None
+        evs = []
+        for k in range(j, len(bars)):
+            evs.extend(s.evaluate(state, DayInput(code, bars[k], ctx), None) or [])
+            state = s.step(state, bars[k])
+        return evs
+
+    sink = TraceSink(code=code, strategy="break")
+    ev1 = _walk({"_trace": sink, "stock_info": spec.get("stock_info") or {}})
+    ev0 = _walk({"stock_info": spec.get("stock_info") or {}})
+    assert [(e.stage, e.date, e.payload) for e in ev0] == \
+           [(e.stage, e.date, e.payload) for e in ev1], "带 sink 不得改变行为"
+    known = ("signal", "run_window", "no_signal", "confirm_day", "turnover")
+    assert sink.records, "门轨迹未进 sink（接线失效）"
+    assert all(r.get("kind") in known for r in sink.records), sink.records[:5]
+    assert any(r.get("kind") == "signal" for r in sink.records), sink.records[:5]

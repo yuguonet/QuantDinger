@@ -141,9 +141,6 @@ class KnifeCatchStrategy(StrategyBase):
     scan_spec = ScanSpec(kind="intraday_window", windows=("14:30", "15:00"), interval_sec=60)
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
-    PROBE_STAGE_RANK = {"window": 1, "mkt": 2, "feat": 3, "data": 4, "tail_vw": 5,
-                        "daily": 6, "vol": 7, "streak": 8, "pre5": 8,
-                        "lu_recent": 9, "signal": 10}
     # 框架契约扩展 (base.py 文档): 回测未含 U1~U4, 不做统一预过滤;
     # 14:56 入场当日不可卖 (T+1); 出场当日执行并当日平账
     use_unified_prefilter = False
@@ -283,12 +280,14 @@ class KnifeCatchStrategy(StrategyBase):
         ctx = inp.ctx or {}
         snap_rows = ctx.get("series") or []
         mkt_gain = ctx.get("mkt_gain")
+        _tr = ctx.get("_trace")   # 门原因通道（契约约定）：落选门名进 TraceSink，无 sink 零开销
         fired = None
         for i, row in enumerate(snap_rows):
             hh = _hhmm(row.get("time") or "")
             if hh < "14:56" or hh > "15:00":
                 continue
-            fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_gain)
+            fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_gain,
+                                probe=(_tr.note if _tr is not None else None))
             if fired:
                 break
         if fired:
@@ -462,10 +461,12 @@ class KnifeCatchStrategy(StrategyBase):
         if not snap or not series:
             return []
         _tr = None
-        if probe is not None:
+        _sink = (ctx or {}).get("_trace")
+        if probe is not None or _sink is not None:
             def _tr(stage, **kw):
-                probe.trace(stage, code=code,
-                            d0_date=str(snap.get("time") or "")[:10], **kw)
+                (_sink.note if _sink is not None else probe.trace)(
+                    stage, code=code,
+                    d0_date=str(snap.get("time") or "")[:10], **kw)
         try:
             hist = self._feats_hist(self.init_state(code, bars or []))
         except InsufficientHistory:

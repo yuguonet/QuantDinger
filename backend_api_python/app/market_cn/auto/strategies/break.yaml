@@ -1,6 +1,6 @@
 # ================================================================
 # 断板接力策略 (连板→断板期确认日 → 次日开盘买入) — IDE 门表单文件 (M2/M4)
-# 与 strategies/break_buy.py (BreakStrategy.backtest_stock) 逐笔等价 (见 tmp/_break_equivalence.py)
+# 与 strategies/break_buy.py (core.replay) 逐笔等价 (见 tmp/_break_equivalence.py)
 # ----------------------------------------------------------------
 # 结构 (连板→断板期→确认日) 收编为注册函数 feat(name)（见 strategies/break_buy.py），
 # 5a~5g 判定全部上提为下列门表 → IDE 能逐门展示"为何放行/拦截"。

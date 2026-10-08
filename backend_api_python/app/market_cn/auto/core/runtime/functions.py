@@ -477,17 +477,6 @@ def register_function(name: str, fn, is_offset: bool = False,
         REGISTERED_D0[name] = int(needs_d0)
 
 
-def declared_d0_dep(name: str, key: str = None) -> Optional[int]:
-    """内核/注册函数声明的决策日依赖；未声明 → None (调用方按 1 处理)。
-
-    若传入 key，优先查策略命名空间 STRATEGY_GATE_D0[key][name]（见 declared_d0_for_strategy）；
-    这是重构后 feat('x') 等跨策略同名函数能各自声明 D0 依赖的关键。
-    """
-    if key is not None and key in STRATEGY_GATE_D0 and name in STRATEGY_GATE_D0[key]:
-        return STRATEGY_GATE_D0[key][name]
-    if name in REGISTERED_D0:
-        return REGISTERED_D0[name]
-    return D0_DEPS.get(name)
 
 
 def offset_funcs() -> set:

@@ -537,19 +537,6 @@ def project_rows(strategy_key, code, record, name=""):
     return rows
 
 
-def project_records(strategy_key, records, names=None):
-    """{code: Record}（或 (code, Record) 序列）→ 规则行列表（**扁平**；跳过无 ready 的票）。
-
-    Returns:
-        list[row] —— 与 rebuild.build_expected 的 expected 逐行同构，可直接喂
-        `rebuild.diff` / `build_plan`（即 expected 的另一种事实源）。
-    """
-    names = names or {}
-    items = records.items() if hasattr(records, "items") else records
-    out = []
-    for code, rec in items:
-        out.extend(project_rows(strategy_key, code, rec, name=names.get(code, "")))
-    return out
 
 
 def load_records(root, strategies=None):

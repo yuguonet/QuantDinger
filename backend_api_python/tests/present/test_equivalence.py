@@ -1,10 +1,25 @@
-"""test_equivalence.py — 与旧版 scan_signals / exit_decision 逐门对打（等价性验收）。
+"""test_equivalence.py — **跨路径一致性**（scan 入口 vs fold 入口）。
 
-旧版参照代码从仓库提取物 import（conftest 注入 sys.path）；不可用则整模块跳过。
-对比口径：同一 (历史 bars, 盘中快照序列) 输入下——
-  - 首次触发的分钟、成交价、评分、extra 特征 一致
-  - 不触发场景两边一致
-  - D1 开盘出场价与旧 exit_decision(day_close) 一致
+⚠️ **命名修正（2026-10-08，golden 逐笔对拍任务）**：
+  本文件原自述「与旧版 scan_signals / exit_decision 逐门对打（等价性验收）」，
+  **与事实不符** —— 实测参数是 `cls_new=KnifeCatchStrategy, cls_old=kc_old.KnifeCatchStrategy`，
+  两侧**同一个类**（`kc_old` 就是当前树的 `app.market_cn.auto.strategies.knife_catch`，
+  不是什么「仓库提取物」）。真正在比的是：
+
+    · `strategy.scan_signals(...)`（生产扫描入口，旧链）
+    · `strategy.evaluate(state, DayInput, prev)`（折叠契约入口，新链）
+
+  同一条策略的两个**入口**必须给同一判定 —— 这是「两条消费路径共用一个口径」
+  的不变量（同 `base.signal_of_ready` 头注的「两条消费路径共用本函数，分叉必滴」），
+  **有价值，保留**。但它是**内部一致性**，不是新旧对拍。
+
+★ 真正的「与旧版对拍」在哪里：`tests/golden/test_golden_parity.py`（逐笔对拍冻结基线，
+  删除旧代码的唯一开关）。两者互补，不重复。
+
+易错点：
+  - 不要用 `pytest.importorskip` —— 静默 skip = 假绿（本项目门禁通则）。
+    原实现用了，且注释声称「不可用则整模块跳过」，实际上永远不会不可用。
+  - fuzz 用固定 seed（42/7）：换 seed 不会变结果，但会让历史失败不可复现。
 """
 
 import random
@@ -12,17 +27,15 @@ import random
 import pytest
 
 from app.market_cn.auto.core.present.contract import DayInput, Progress
+from app.market_cn.auto.strategies import knife_catch as kc_old   # = 当前树的 scan 入口
+from app.market_cn.auto.strategies import tail_oversold as to_old  # 同上
 from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
 from app.market_cn.auto.strategies.tail_oversold import TailOversoldStrategy
+
 from tests.present.common import (
     KNIFE_HIST_CLOSES, TAIL_HIST_CLOSES,
     gen_hist_bars, knife_day_rows, make_snapshot_rows, tail_day_rows,
 )
-
-kc_old = pytest.importorskip("app.market_cn.auto.strategies.knife_catch",
-                             reason="旧参照代码不可用")
-to_old = pytest.importorskip("app.market_cn.auto.strategies.tail_oversold",
-                             reason="旧参照代码不可用")
 
 CODE = "600001"
 
@@ -165,14 +178,18 @@ def test_tail_fuzz_matches_old():
 
 # ---------------- 出场（D1 开盘价 = 展示点 stage 2） ----------------
 
-@pytest.mark.parametrize("mod,cls_new,cls_old", [
+@pytest.mark.parametrize("mod,cls_fold,cls_scan", [
     (kc_old, KnifeCatchStrategy, kc_old.KnifeCatchStrategy),
     (to_old, TailOversoldStrategy, to_old.TailOversoldStrategy),
 ])
-def test_exec_price_matches_old_exit_decision(mod, cls_new, cls_old):
-    old = cls_old()
-    new = cls_new()
-    bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES if cls_new is KnifeCatchStrategy
+def test_exec_price_matches_exit_decision(mod, cls_fold, cls_scan):
+    """fold 入口（evaluate）与 scan 入口（exit_decision）出场价一致。
+
+    ⚠️ 两侧是**同一个类的两个方法**（不是新旧版本）——见文件头注命名修正。
+    """
+    old = cls_scan()
+    new = cls_fold()
+    bars = gen_hist_bars(CODE, KNIFE_HIST_CLOSES if cls_fold is KnifeCatchStrategy
                          else TAIL_HIST_CLOSES)
     d0 = {"time": "2026-10-05", "open": 96.4, "high": 96.5, "low": 84.0,
           "close": 85.2, "volume": 1200.0}

@@ -100,7 +100,9 @@ class LiveSampler:
         """
         if not self.wants(key):
             return
-        sigs, kept, u_fails, day_tr = self._self_run(
+        # 2026-10-08 起走影子路径（trace 经 ctx["_trace"]，与 probe 路径逐字节
+        # 同源 —— test_m1_sampler 影子对拍硬断言）。`_self_run` 留作对拍参照，P6 清。
+        sigs, kept, u_fails, day_tr = self._self_run_via_trace(
             key, strategy, code, bars, stock_info)
         if sigs is None:
             return
@@ -116,9 +118,9 @@ class LiveSampler:
             stage, _uf = None, None
         from dataclasses import asdict
         try:
-            strategy._probe_day(
+            build_day_sample(
                 self.probes[key], day_tr, bars, len(bars) - 1, code, stock_info,
-                stage=stage, u_fails=_uf,
+                strategy=strategy, stage=stage, u_fails=_uf,
                 sig=asdict(kept[0] if kept else sigs[0]) if sigs else None)
         except Exception as e:
             # 采样失败不得影响判定 (判定结果已产出); 但也不能静默 —— 打 WARNING
@@ -158,3 +160,105 @@ class LiveSampler:
             logger.debug("[sampler] %s %s 独立采样预过滤异常 (该票不采): %s", code, key, e)
             return None, None, None, None
         return sigs, kept, u_fails, day_tr
+
+
+# ================================================================
+# 影子路径（P3 迁移，2026-10-08）：trace 经 ctx["_trace"] 收集，不依赖 probe 对象
+# ---------------------------------------------------------------
+# 策略侧 scan_signals 内的打点已统一分发（`_emit`：ctx["_trace"].note 优先，
+# probe.trace 兼容）⇒ 同一份代码、同一 taxonomy、同一候选枚举。本路径与
+# `_self_run` 的产出（sigs/kept/u_fails/day_tr.items）**逐字节同源**，由
+# test_m1_sampler 的影子对拍硬断言。切换 observe 到本路径后，probe 对象/
+# `_probe_day`/PROBE_STAGE_RANK 方可按 P3-④ 退役（组装迁本模块）。
+# ================================================================
+class _DayTrShim:
+    """DayTrace.items 同格式收集器（note(stage, **kw) → {"stage": stage, **kw}）。"""
+
+    def __init__(self):
+        self.items = []
+
+    def note(self, stage, **kw):
+        self.items.append({"stage": stage, **kw})
+
+
+def _self_run_via_trace(self, key, strategy, code, bars, stock_info):
+    """`_self_run` 的影子路径：trace 走 ctx["_trace"]，其余口径逐字不变。
+
+    返回同四元组 (sigs, kept, u_fails, day_tr)。异常同样吞掉（该票不采）。
+    """
+    shim = _DayTrShim()
+    try:
+        sigs = strategy.scan_signals(
+            bars, code, ctx={"_trace": shim},
+            **self._params_override(key)) or []
+    except Exception as e:
+        logger.debug("[sampler] %s %s 影子自跑异常 (该票不采): %s", code, key, e)
+        return None, None, None, None
+    try:
+        prefilter = self._prefilter
+        if prefilter is None:
+            from app.market_cn.auto.scan import apply_unified_prefilter
+            prefilter = apply_unified_prefilter
+        kept, u_fails = prefilter(sigs, bars, code,
+                                  (stock_info or {}).get(code), strategy)
+    except Exception as e:
+        logger.debug("[sampler] %s %s 影子预过滤异常 (该票不采): %s", code, key, e)
+        return None, None, None, None
+    return sigs, kept, u_fails, shim
+
+
+LiveSampler._self_run_via_trace = _self_run_via_trace
+
+
+# ================================================================
+# STAGE_RANK 注册表 + build_day_sample 通用组装（P3-④ 迁移，2026-10-08）
+# ---------------------------------------------------------------
+# 来源：各策略类属性 PROBE_STAGE_RANK + StrategyBase._probe_day。M1 sample 的
+# 「stage 归属 + rule_trace + 特征/标签」组装是**采样器的职责**（调试归内核），
+# 策略文件只产判定。格式/内容与旧 `_probe_day` 逐字一致（test_m1_sampler 影子
+# 对拍背书）；rank 表是 taxonomy 元数据，按策略 key 集中登记在此。
+# ================================================================
+
+#: stage 归属排名（per-strategy taxonomy；"最深判定步"归属用）
+STAGE_RANK = {
+    "break": {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,
+              "engine_skip": 5, "signal": 6},
+    "dragon_callback": {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4,
+                        "rsi": 5, "turn": 6, "d0_chg": 7, "quality": 7,
+                        "dedup": 8, "prefilter": 9, "engine_skip": 9,
+                        "signal": 10},
+    "knife_catch": {"window": 1, "mkt": 2, "feat": 3, "data": 4, "tail_vw": 5,
+                    "daily": 6, "vol": 7, "streak": 8, "pre5": 8,
+                    "lu_recent": 9, "signal": 10},
+    "lead_chase": {"window": 1, "mkt": 2, "pool": 3, "noise": 4,
+                   "volume": 5, "board": 6, "signal": 7},
+    "tail_oversold": {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5},
+    "v1": {"lu": 1, "ret20": 2, "pullback": 3, "obv": 4, "vol": 5,
+           "overheat": 6, "prefilter": 7, "d1_gap": 8, "d1_chg": 8,
+           "d1_band": 8, "engine_skip": 9, "signal": 10},
+}
+
+
+def build_day_sample(probe, day_tr, bars, i, code, stock_info,
+                     strategy=None, stage=None, sig=None, u_fails=None,
+                     extra=None):
+    """按决策日产出一行 sample（旧 StrategyBase._probe_day 逐字搬入，签名同构）。
+
+    stage=None 时取 day_tr 中 STAGE_RANK[strategy.key] 最深的判定步做 day 级归属。
+    """
+    rec = {"code": code, "d0_date": str(bars[i]["time"])[:10], "stage": stage}
+    if stage is None:
+        key = getattr(strategy, "key", "") or ""
+        rank = STAGE_RANK.get(key, {})
+        rec["stage"] = max((t["stage"] for t in (day_tr.items if day_tr else [])),
+                           key=lambda s: rank.get(s, 0), default="no_gate")
+    from app.market_cn.auto.probe import sample_feats
+    rec.update({"rule_trace": day_tr.items if day_tr is not None else [],
+                **sample_feats(bars, i, code, stock_info)})
+    if sig is not None:
+        rec["sig"] = sig
+    if u_fails is not None:
+        rec["u_fails"] = list(u_fails)
+    if extra:
+        rec.update(extra)
+    probe.sample(**rec)

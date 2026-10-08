@@ -2,21 +2,21 @@
 """auto/backtest.py — 框架内全市场回测流水线 (B 阶段, 2026-09-09; 09-10 分发插件化)
 
 用途: 把 test_dragon.py 的"全市场回测流水线"收进框架。本文件只做**薄编排**:
-     全市场循环 → hub.daily 取数 → 策略钩子 backtest_stock → trades → 标准统计。
-     策略枚举判定经注册表分发 (strategies 插件的 backtest_stock 钩子, 2026-09-10 起),
-     **新建策略零改动本文件** — 插件内实现 backtest_stock 即自动进入流水线。
+     全市场循环 → 取数 → 出场/统计 (日线主路径见 run_all docstring)。
 
-设计点:
-  - 与实盘同一份 scan_signals (as_of 切片语义), 对数 PASS 后 test_dragon 双同步约定作废;
-  - 编排层无规则: 去重/预过滤锚点/D1过滤/预筛/出场模拟都在各插件 backtest_stock 内
-    (2026-09-10 晚裁定: 出场模拟是策略专用规则, 归各策略文件; backtest.py 只留
-    通用引擎 — 枚举分发/统计/时间线引擎, 见 run_all_intraday);
-  - 数据走 hub.daily (与 test_dragon.fetch_kline_db 逐字等价: 窗口取数+qfq, 已验证)。
+2026-10-08 (P6 切口 2 facade):
+  - daily_close 主路径 = `core.replay_batch`（折叠契约单编排, 与生产/golden 同源）;
+  - `probe≠None` 过渡走策略 `backtest_stock` 钩子（rule_stats/rule_audit 采样依赖）;
+  - 策略覆写删除与参照物切换见 docs/P5收口执行记录.md 方案修订草案①（待批）。
+
+历史设计点 (仍生效的部分):
+  - 数据走 hub.daily / fetch_klines_batch (同窗口+同 qfq+同 as-of, 已验证等价);
+  - 编排层无规则: 门/去重/出场都在策略 evaluate (replay) 或钩子 (probe 过渡) 内;
+  - run_all_intraday 仍是独立时间线引擎 (P1.5 未接入 IntradayFeed)。
 
 易错点:
-  - 枚举终点 n-1: 最后一根无 D+1, 不能做 D0 (约定在插件循环内);
-  - 未实现 backtest_stock 的策略 (盘中窗口类 tail/knife) run_all 直接报错提示;
-  - run 输出 trades 含 tech_score 等字段, 与 tmp/ 基线 JSON 字段对齐供逐笔对数。
+  - 枚举终点 n-1: 最后一根无 D+1, 不能做 D0 (约定在策略侧循环内);
+  - run 输出 trades 为 canonical 字段 (trade_map.build_trade), 与基线 JSON 对齐供逐笔对数。
 """
 from __future__ import annotations
 
@@ -61,17 +61,20 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
     """全市场回测 (策略经注册表分发, 按 scan_spec.kind 选路径)。
 
     strategy: 任意已注册策略 key。
-      - daily_close 类 (dragon/v1/break): 日线枚举快路径 (backtest_stock 钩子)。
+      - daily_close 类: **主路径 = core.replay_batch**（P6 切口 2 facade, 2026-10-08）——
+        折叠契约单编排, 与生产/调试/golden 同源; `use_prefilter` 对此路径为 no-op
+        (U1~U4/门已内联在策略 evaluate, P5-② 投影对拍已证等价)。
+        ⚠ 过渡: ``probe≠None`` 仍走策略 ``backtest_stock`` 钩子 (rule_stats/rule_audit
+        依赖钩子内 scan_signals(probe=) 产 sample) —— P2 尾巴迁完后删此分支与旧循环。
       - intraday_window 类 (tail/knife): 时间线引擎 (1m 快照帧重建, 与实盘同判定路径)。
     probe: 调试探针 (probe.Probe, None=关闭)。回测只负责验证, 探针数据存档供 AI 分析。
     exec_engine (P4, 2026-09-21): **回测成交口径** (入口参数, 不污染 scan_spec.kind):
-      - ``None`` / ``"daily"`` = 现有日线枚举 (**零行为变化**);
+      - ``None`` / ``"daily"`` = 日线腿 (replay 零行为; 过渡钩子=旧枚举);
       - ``"intraday"`` / ``"auto"`` = 日线初筛 + **1m 真实腿精修出场** (分段式), 逐笔标注
-        ``trade["exec_basis"] = "1m" | "daily"``; ``auto`` 额外限制入口日须在常量 ``DEFAULT_MINUTE_DAYS`` 个交易日内 (近端)。策略未实现 `intraday_replay` → 整批日线腿。
+        ``trade["exec_basis"] = "1m" | "daily"``; ``auto`` 额外限制入口日须在常量 ``DEFAULT_MINUTE_DAYS`` 个交易日内 (近端)。
     返回 {"trades": [...], "stats": {...}}; trades 直接可 json.dump 与基线对数。
     """
     from app.market_cn.auto import strategies as strat_reg
-    from app.market_cn.auto.strategies.base import StrategyBase
 
     strat_reg.autodiscover()
     strat = strat_reg.get_strategy(strategy)
@@ -84,9 +87,6 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
                                probe=probe)
         res["meta"] = _run_meta(strat, days, start_date, end_date)
         return res
-
-    if type(strat).backtest_stock is StrategyBase.backtest_stock:
-        raise ValueError(f"strategy={strategy} 未实现日线枚举回测钩子 backtest_stock")
 
     from app.market_cn.auto.core.data.hub import all_codes, daily
     from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
@@ -109,25 +109,53 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
         _bars_batch = fetch_klines_batch(codes, days=days)
     except Exception:                                         # noqa: BLE001
         _bars_batch = {}                                     # 批量失败 → 全部回落逐票
+
     trades = []
     n_ok = 0
-    for k, code in enumerate(codes, 1):
-        if is_st_stock(code):
-            continue
-        bars = _bars_batch.get(code) or daily(code, days)
-        if not bars:
-            continue
-        trades.extend(strat.backtest_stock(
-            bars, code,
-            stock_info=stock_info.get(code) if stock_info else None,
-            use_prefilter=use_prefilter, probe=probe) or [])
-        n_ok += 1
-        if progress_every and k % progress_every == 0:
-            print(f"[{k}/{len(codes)}] trades={len(trades)} "
-                  f"({time.time() - t0:.0f}s)", flush=True)
+    # ---- P6 切口 2 facade: probe=None 主路径走 replay_batch ----
+    from app.market_cn.auto.strategies.base import _has_fold_contract
+    use_replay = probe is None and _has_fold_contract(strat)
+    if use_replay:
+        from app.market_cn.auto.core.replay import TradesCollector, replay_batch
+        bars_map = {}
+        for k, code in enumerate(codes, 1):
+            if is_st_stock(code):
+                continue
+            bars = _bars_batch.get(code) or daily(code, days)
+            if not bars:
+                continue
+            bars_map[code] = bars
+            n_ok += 1
+            if progress_every and k % progress_every == 0:
+                print(f"[{k}/{len(codes)}] loaded={len(bars_map)} "
+                      f"({time.time() - t0:.0f}s)", flush=True)
+        skey = strat.key or strategy
+        collectors = {c: [TradesCollector(c, skey)] for c in bars_map}
+        results = replay_batch(strat, bars_map, collectors=collectors)
+        for r in results.values():
+            trades.extend(r.trades or [])
+    else:
+        # 过渡分支: probe 采样依赖旧钩子内 scan_signals(probe=) —— P2 尾巴迁完删
+        for k, code in enumerate(codes, 1):
+            if is_st_stock(code):
+                continue
+            bars = _bars_batch.get(code) or daily(code, days)
+            if not bars:
+                continue
+            trades.extend(strat.backtest_stock(
+                bars, code,
+                stock_info=stock_info.get(code) if stock_info else None,
+                use_prefilter=use_prefilter, probe=probe) or [])
+            n_ok += 1
+            if progress_every and k % progress_every == 0:
+                print(f"[{k}/{len(codes)}] trades={len(trades)} "
+                      f"({time.time() - t0:.0f}s)", flush=True)
+
     out = {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
            "elapsed": round(time.time() - t0, 1),
            "meta": _run_meta(strat, days, start_date, end_date)}
+    if use_replay:
+        out["engine"] = "replay"
     _eng = str(exec_engine or "daily").lower()
     if _eng in ("intraday", "auto") and trades:
         out["exec_engine"] = _eng
@@ -390,7 +418,8 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
                 sigs, _ = apply_unified_prefilter(
                     sigs, bars, code, _si.get(code), strat)
                 if probe is not None:
-                    rank = getattr(strat, "PROBE_STAGE_RANK", {})
+                    from app.market_cn.auto.sampler import STAGE_RANK as _SR
+                    rank = _SR.get(getattr(strat, "key", "") or "", {})
                     stage = max((t["stage"] for t in slot_tr.items),
                                 key=lambda s: rank.get(s, 0), default="no_gate")
                     dbg[code] = {"code": code, "d0_date": date,

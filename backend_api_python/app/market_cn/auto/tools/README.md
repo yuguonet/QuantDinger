@@ -1,6 +1,7 @@
 # tools/ — 调试与研发工具索引
 
-`auto/tools/` 现 **22** 个模块（2026-10-07 归档 4 个 T3 后 + 新增 `projection_shadow`）。
+`auto/tools/` 现 **18** 个模块（2026-10-07 归档 4 个 T3 + 新增 `projection_shadow`；
+2026-10-08 归档 5 个 T4）。
 本表是**唯一权威索引**：按"我要回答什么问题"找工具，不靠记文件名。旧文档 §7.2 的清单
 只列到 21 个且已过期，以本表为准。
 
@@ -23,14 +24,11 @@
 
 | 工具 | 用途 |
 |---|---|
-| `selftest` | 策略契约测试闸门（策略改动后第一道） |
 | `path_parity` | 三路径同源自检（M2 验收件：scan_signals / scan_days / fold 口径一致） |
 | `present_verify` | 展示层单票对账（折叠输出 vs 旧路径逐位对账） |
 | `projection_shadow` | **P5 影子对账**：① `--replay` **历史回放**「生产 `scan_days` vs 投影 `Record.ready`」判定日集合（★ 影子期的正路 —— 数据/结果可复现，**不等日历天数**）；② 与 `qd_dragon_signals` 库现状双向 diff（切 writer 前置；带覆盖度护栏，`--apply` 才落库）。退出码 0 = 0 不一致 |
 | `doctor` | 一键三方对账（config ↔ 注册表 ↔ 磁盘插件、层反转、做T 约束等结构检查） |
 | `pool_check` | 信号级复验闸门（固化"信号级复验纪律"） |
-| `verify_prefilter` | 预筛等价验证（预筛前后口径是否等价） |
-| `bench_scan` | 盘中扫描 50s 预算基准（性能闸门） |
 
 
 **判定与规则研发**
@@ -42,17 +40,32 @@
 | `rule_stats` | 入场规则归因统计（低胜率 / 低盈亏比排查） |
 | `gate_try` | 候选规则试算（改门前先试算） |
 | `gate_funnel` | 策略漏斗可调用接口（各门通过率） |
-| `new_strategy` | 新策略脚手架生成器 |
 | `proposal` | LLM 建议产物 + 红线校验 + 应用 + 回滚 |
 | `chat_why` | 口语化策略调试聊天（同一套调试能力的对话入口） |
 
 **数据通道质量**
 
-| 工具 | 用途 |
-|---|---|
-| `snapshot_quality` | 快照拼接通道质量诊断 |
+_（T4 归档后暂空——`snapshot_quality` 已移 del/）_
 
-## 三、已归档（2026-10-07）
+## 三、已归档
+
+### T4（2026-10-08，P6 收量）
+
+移到 `del/20261008_tools_t4/`：
+
+| 原工具 | 用途 | 归档理由 |
+|---|---|---|
+| `selftest` | 策略契约测试闸门 | pytest 套件已覆盖（tests/present/ 全量 261 绿），独立 CLI 无外部调用 |
+| `verify_prefilter` | 预筛等价验证 | 同上，等价断言已进 pytest |
+| `bench_scan` | 盘中扫描 50s 基准 | 性能基准脚本，零 import 零 CLI 调用 |
+| `new_strategy` | 新策略脚手架 | 生成器，按需可从 del/ 取回 |
+| `snapshot_quality` | 快照拼接质量诊断 | 零引用；quality 分级已入数据层 |
+
+归档前核验：**零 import、零 `python -m` 调用**（全树扫描；命中的 2~5 处引用均为
+历史设计文档 .md）。`chat_why` 因被活的 `agent/skills/strategy_debug/SKILL.md`
+点名为备用 CLI，**保留**。
+
+### T3（2026-10-07）
 
 移到 `del/20261007_tools_t3/`（`del/` 批次约定，与 `del/_archive/` 同一套标准）：
 

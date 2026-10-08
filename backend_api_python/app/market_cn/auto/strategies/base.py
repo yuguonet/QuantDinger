@@ -111,6 +111,68 @@ class ConfirmDecision:
 # 调用方: `from app.market_cn.auto.core.display_meta import confirm_level_of`
 
 
+# ================================================================
+# 数据结束平仓 —— 断链收尾的**唯一实现**（改进方案 §2.3）
+# ================================================================
+#: 数据结束平仓的原因文案。⚠️ 勿改 —— golden 基线与 core/replay.REASON_DATA_END 依赖此文案。
+DATA_END_REASON = "数据结束平仓"
+
+
+def data_end_close(bars, entry_idx, entry_price):
+    """数据结束仍未平仓 → **末日收盘平仓**（断链收尾的唯一实现）。
+
+    背景（2026-10-08 口径分歧 #1 修复）：
+      本口径原本只活在 `StrategyBase._backtest_stock_legacy`（本文件下文）里；
+      **五个策略的 backtest_stock 覆写都没有** —— 它们在出场引擎返回 None（视野
+      不足）时 `if not result: continue` **静默丢弃**该笔交易 ⇒ 历史回测**低估了
+      交易数**（未平仓直接消失，不进统计，胜率/盈亏比受污染）。
+      同时 `core/replay` 有 `REASON_DATA_END` 同口径实现 ⇒ 新旧两侧不一致。
+      ⇒ 本函数把口径收成一份，通用引擎 / 五个覆写 / 回放三方对齐。
+
+    口径（与 `_backtest_stock_legacy` 原实现逐位同构）：
+      · 出场点 = 数据末根（`bars[n-1]`）；
+      · 成交价 = 末根收盘价；
+      · `exit_day` = 末根索引 - entry_idx + 1（d=1 是入场当日）；
+      · `peak_return_pct` = [entry_idx, 末根] 区间内 **high** 峰值相对入场价；
+      · `return_pct` / `peak_return_pct` 保留 2 位，价格保留 3 位。
+
+    Args:
+        bars: 日线（升序，前复权）。
+        entry_idx: 入场根索引（D1）。
+        entry_price: 入场价。
+
+    Returns:
+        dict（可直接 `**` 合入 trades.append）或 **None**（入场价/末日价非法时，
+        调用方照旧丢弃 —— 与原 `if exit_price <= 0: continue` 同语义）。
+
+    ⚠️ 易错点：
+      · `entry_idx` 是**入场根**（D1），不是信号根（D0）。传错会让 exit_day 偏一天。
+      · peak 取的是区间内 `high`（不是 close），与 `_backtest_stock_legacy` 一致；
+        改成 close 会让 peak_return_pct 静默偏低。
+      · 本函数**不做判定**（不判止损/追踪/到期）—— 判定在各出场引擎；它只负责
+        「判定没结果时怎么收尾」。在引擎有结果时调用会变成第二份回测。
+    """
+    n = len(bars) if bars is not None else 0
+    if n == 0 or entry_idx is None or not (0 <= entry_idx < n):
+        return None
+    entry_price = float(entry_price or 0)
+    if entry_price <= 0:
+        return None
+    exit_idx = n - 1
+    exit_price = float(bars[exit_idx].get("close") or 0)
+    if exit_price <= 0:
+        return None
+    peak = max(float(b.get("high") or 0) for b in bars[entry_idx:exit_idx + 1])
+    return {
+        "exit_date": str(bars[exit_idx].get("time"))[:10],
+        "exit_price": round(exit_price, 3),
+        "exit_day": exit_idx - entry_idx + 1,
+        "exit_reason": DATA_END_REASON,
+        "return_pct": round((exit_price / entry_price - 1) * 100, 2),
+        "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
+    }
+
+
 def _has_fold_contract(strategy) -> bool:
     """策略是否真正实现了折叠契约（init_state/step/evaluate 非基类 NotImplemented）。
 
@@ -350,29 +412,6 @@ class StrategyBase:
         """
         return None
 
-    # ---- 探针 sample 组装 (debug 模式专用; probe=None 路径不会走到) ----
-    def _probe_day(self, probe, day_tr, bars, i, code, stock_info,
-                   stage=None, sig=None, u_fails=None, extra=None):
-        """按决策日产出一行 sample (特征/标签共用 sample_feats, 通用组装件)。
-
-        stage=None 时取 day_tr 中 PROBE_STAGE_RANK 最深的判定步做 day 级归属。
-        """
-        from app.market_cn.auto.probe import sample_feats
-        if stage is None:
-            rank = getattr(self, "PROBE_STAGE_RANK", {})
-            stage = max((t["stage"] for t in day_tr.items),
-                        key=lambda s: rank.get(s, 0), default="no_gate")
-        rec = {"code": code, "d0_date": str(bars[i]["time"])[:10], "stage": stage,
-               "rule_trace": day_tr.items if day_tr is not None else [],
-               **sample_feats(bars, i, code, stock_info)}
-        if sig is not None:
-            rec["sig"] = sig
-        if u_fails is not None:
-            rec["u_fails"] = list(u_fails)
-        if extra:
-            rec.update(extra)
-        probe.sample(**rec)
-
     # ---- 便捷 ----
     def params(self, override=None):
         """default_params ← config.json params 覆盖 的合并结果。
@@ -582,17 +621,19 @@ class StrategyBase:
 
         分流（保签名、保语义，消费方零感知）：
           - kind != daily_close      ⇒ None（盘中策略走时间线引擎，与旧行为一致）
-          - 实现 init_state/evaluate ⇒ replay（唯一编排，与生产/调试同折叠序）
-          - 未迁移（基类 NotImplemented）⇒ `_backtest_stock_legacy`（旧通用引擎）
+          - **probe≠None** ⇒ `_backtest_stock_legacy`（P2 尾巴：rule_stats/rule_audit
+            采样依赖 scan_signals(probe=)；legacy 转发 probe；迁完删此分支与 legacy）
+          - 未迁移折叠契约（C 裁定 2026-10-08：停用策略无兼容模式，legacy 仅服务
+            **迁折叠前的临时回测**，P6 随薄壳删）⇒ `_backtest_stock_legacy`
+          - 已迁移 ⇒ replay；**横截面策略（有 prewarm 声明，如 g56）** 经
+            DailyFeed.ctx_provider 注入一次全市场池（薄壳单票不走 begin_day）
 
-        ⚠ 语义差异（新策略须知）：旧通用引擎含 **U1~U4 统一预过滤** 与 **D1 gap 带**
-        （min_gap_main/max_gap_main 等），replay 路径**不含** —— 按改进方案「策略文件
-        = 文档」的定位，这些门应由策略 `evaluate` 自持（与 break/dragon 现状一致）。
-        现有 8 个策略全部覆写了本方法，薄壳只影响未来新策略。
+        ⚠ 语义差异（新策略须知）：legacy 含 **U1~U4 统一预过滤** 与 **D1 gap 带**，
+        replay 路径不含 —— 这些门应由策略 `evaluate` 自持（与 break/dragon 现状一致）。
         """
         if self.scan_spec.kind != "daily_close":
             return None
-        if not _has_fold_contract(self):
+        if not _has_fold_contract(self) or probe is not None:
             return self._backtest_stock_legacy(bars, code, stock_info,
                                                use_prefilter, probe)
         from app.market_cn.auto.core.replay import (
@@ -601,7 +642,18 @@ class StrategyBase:
             return []
         coll = TradesCollector(code=code, strategy=self.key)
         try:
-            res = replay(self, code, DailyFeed(bars), collectors=[coll])
+            if hasattr(self, "prewarm"):
+                # 横截面策略: 单票回测无 begin_day ⇒ 池按**终点锚**惰性建一次
+                # (与旧 g56 回测钩子同式; _ensure_pool_daily 结果含全部
+                #  历史日键, ctx_provider 每日注入同一池 —— 逐日重建会全市场×N)
+                from app.market_cn.auto.core.features.cross_section import (
+                    _ensure_pool_daily)
+                _pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
+                feed = DailyFeed(
+                    bars, ctx_provider=lambda i, b: {"_day": {"pool": _pool}})
+            else:
+                feed = DailyFeed(bars)
+            res = replay(self, code, feed, collectors=[coll])
         except NotImplementedError:                # 契约形似实未实现 → 回退
             return self._backtest_stock_legacy(bars, code, stock_info,
                                                use_prefilter, probe)
@@ -621,7 +673,8 @@ class StrategyBase:
         for i in range(25, n - 1):
             if i <= last_exit_idx:          # 持仓去重
                 continue
-            sigs = self.scan_signals(bars[:i + 1], code, stock_info=stock_info)
+            sigs = self.scan_signals(bars[:i + 1], code, stock_info=stock_info,
+                                     probe=probe)
             if not sigs:
                 continue
             sig = sigs[0]

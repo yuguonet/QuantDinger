@@ -187,9 +187,6 @@ def event_ready(name: str, date: str) -> bool:
     return False
 
 
-def events_ready(names, date: str) -> bool:
-    """全部事件就绪才 True。空序列 = 无依赖 = 就绪。"""
-    return all(event_ready(n, date) for n in (names or ()))
 
 
 def missing_events(names, date: str):

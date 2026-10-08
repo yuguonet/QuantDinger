@@ -166,7 +166,7 @@ def check_realtime_equals_preprocess(strategy, code, bars) -> tuple[bool, str]:
     store.save(strategy.key or "verify", code, rec)
     rt = RealtimeBranch(store, {strategy.key or "verify": strategy})
     hits = rt.tick("09:31", [code], {code: snap}, {code: [snap]}, None)
-    ev_rt = [p for _, p in hits]
+    ev_rt = [p for _, p in hits if p.stage != "hold"]   # hold 是判定非事件，不进对拍
 
     key = lambda es: [(e.stage, e.date, json.dumps(e.payload, sort_keys=True, default=str)) for e in es]
     if key(ev_pre) != key(ev_rt):

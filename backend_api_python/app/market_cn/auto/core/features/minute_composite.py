@@ -117,12 +117,6 @@ def minute_live_full(code: str, days: int = 5, *, series: Optional[List[Dict[str
     return (bars, gaps) if report_gaps else bars
 
 
-def split_by_date(bars: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """序列 → ``{date: [bars]}``（回测逐日推进用）。"""
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for b in bars:
-        out.setdefault(b["date"], []).append(b)
-    return out
 
 
 # ================================================================

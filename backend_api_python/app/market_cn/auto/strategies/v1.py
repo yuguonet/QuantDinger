@@ -21,11 +21,14 @@
 """
 from __future__ import annotations
 
+from app.market_cn.auto.sampler import build_day_sample
+
 from app.utils.indicators import calc_bollinger_bw, calc_macd
 from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
+    data_end_close,
 )
 
 STRATEGY_KEY = "v1"
@@ -80,9 +83,6 @@ class V1Strategy(StrategyBase):
     scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
-    PROBE_STAGE_RANK = {"lu": 1, "ret20": 2, "pullback": 3, "obv": 4, "vol": 5,
-                        "overheat": 6, "prefilter": 7, "d1_gap": 8, "d1_chg": 8,
-                        "d1_band": 8, "engine_skip": 9, "signal": 10}
 
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
@@ -107,12 +107,15 @@ class V1Strategy(StrategyBase):
         d_2 = bars[i - 2]
         if d_2["close"] <= 0 or d_1["close"] <= 0:
             return result
-        # 探针 shim (TRACE 宏语义): probe=None 时零开销
-        if probe is not None:
+        # 探针 shim (TRACE 宏语义): trace 统一分发（ctx["_trace"].note 优先 /
+        # probe.trace 兼容）⇒ M1 采样可不依赖 probe 对象（影子对拍: test_m1_sampler）
+        _sink = (ctx or {}).get("_trace")
+        if probe is not None or _sink is not None:
             _pd = str(d0["time"])[:10]
 
             def _tr(stage, **kw):
-                probe.trace(stage, code=code, d0_date=_pd, **kw)
+                (_sink.note if _sink is not None else probe.trace)(
+                    stage, code=code, d0_date=_pd, **kw)
         else:
             _tr = None
 
@@ -295,124 +298,6 @@ class V1Strategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (2026-09-10 自 backtest.backtest_v1_stock 逐字搬入, 对数零差异) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
-                      probe=None):
-        """单股 V1 全历史回测 (D0四因子判定, 次日开盘买, D1入场过滤)。
-
-        D1 过滤 (gap/高开区间) 属回测引擎 D1 口径, 不在 entry_decision — 勿合并;
-        ⚠ d1_change(收盘) 过滤已默认关闭 (见 PARAMS.require_d1_close_up), 属前视;
-        出场模拟 _run_backtest 在本文件 (策略专用出场规则, 2026-09-10 晚下沉)。
-        """
-        from app.market_cn.auto.core.filters import unified_prefilter
-        from app.market_cn.auto.probe import DayTrace
-        # 参数接线 (2026-09-13 修): 原入场五参数/D1过滤/出场均硬编码字面量 (kwargs
-        # 压过实例覆写) → param_scan 网格无效。统一改从 params(None) 取:
-        # 默认=PARAMS 同值 (行为零差异), 实例 default_params 覆写即生效。
-        _p = self.params(None)
-        board_type = get_board_type(code)
-        n = len(bars)
-        if n < 30:
-            return []
-        trades = []
-
-        for i in range(25, n - 1):
-            # debug 模式: day_tr 聚合该日判定门落点 (probe=None 零开销)
-            day_tr = DayTrace() if probe is not None else None
-            # 逐日候选判定: 与实盘 scan 完全同一函数 (切片 as_of 语义; 经 facade 等价路径)
-            sigs = [_signal_to_legacy_dict(s, code) for s in self.scan_signals(
-                bars[:i + 1], code,
-                ret_20d_min=_p["ret_20d_min"], d_1_pullback_min=_p["d_1_pullback_min"],
-                d_1_pullback_max=_p["d_1_pullback_max"], obv_filter=_p["obv_filter"],
-                d_1_vol_max=_p["d_1_vol_max"], stock_info=stock_info,
-                probe=day_tr)]
-            if not sigs:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info)
-                continue
-            sig = sigs[0]
-
-            # U1~U4 (信号日D0收盘可知; 20日涨幅>=30%已隐含U4)
-            if use_prefilter:
-                ok, fails = unified_prefilter(bars, i, code, stock_info)
-                if not ok:
-                    if probe is not None:
-                        self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                        stage="prefilter", sig=sig, u_fails=fails)
-                    continue
-
-            # 入场: 次日开盘价 + D1当日过滤
-            d0 = bars[i]
-            d1 = bars[i + 1]
-            entry_price = d1["open"]
-            if entry_price <= 0:
-                continue
-            entry_idx = i + 1
-            entry_date = d1["time"]
-            d1_change = (d1["close"] / d0["close"] - 1) * 100
-            d1_gap = (d1["open"] / d0["close"] - 1) * 100
-            min_d1_gap = _p["min_gap_main"] if board_type == "main" else _p["min_gap_gem"]
-            if d1_gap < min_d1_gap:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                    stage="d1_gap", sig=sig,
-                                    extra={"d1_gap": round(d1_gap, 2)})
-                continue
-            # ⚠ 2026-09-30 前视修复: 下面这行用 D1 **收盘** (d1_change) 决定是否已在
-            #   D1 **开盘** 买入 —— 属于未来信息。实盘无此过滤 (entry_decision 只用 gap);
-            #   实盘里 d1_change<0 的语义是 confirm_decision(15:00) 判 weak ⇒ D2 开盘清仓,
-            #   已由 _run_backtest._pre_exit 正确实现。旧口径等于把该批交易整笔删除 ——
-            #   实测被剔批次均值 -7.23%/胜率 4.5% (全市场见
-            #   analysis_output/v1入场前视修复_20260930.md) ⇒ 回测收益系统性虚高。
-            #   现由 PARAMS.require_d1_close_up 控制, 默认 False (无前视, 对齐实盘)。
-            if _p.get("require_d1_close_up") and d1_change < 0:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                    stage="d1_chg", sig=sig,
-                                    extra={"d1_change": round(d1_change, 2)})
-                continue
-            if board_type == "gem_star" and d1_gap >= _p["gem_gap_max"]:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                    stage="d1_band", sig=sig,
-                                    extra={"d1_gap": round(d1_gap, 2), "board": "gem_star"})
-                continue
-            # 主板高开3%~5%不入场 (v4数据驱动)
-            if board_type == "main" and _p["main_gap_band_lo"] <= d1_gap < _p["main_gap_band_hi"]:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                    stage="d1_band", sig=sig,
-                                    extra={"d1_gap": round(d1_gap, 2), "board": "main"})
-                continue
-
-            d1_limit_up_val = is_limit_up(d1["close"], d0["close"], board_type)
-            bt = _run_backtest(bars, entry_idx, entry_price, _p["hold"], _p["stop"],
-                              _p["trail"], board_type, is_v1=True,
-                              d1_limit_up=d1_limit_up_val, d1_change=d1_change,
-                              d1_gap=d1_gap)
-            if not bt:
-                if probe is not None:
-                    self._probe_day(probe, day_tr, bars, i, code, stock_info,
-                                    stage="engine_skip", sig=sig)
-                continue
-
-            if probe is not None:
-                self._probe_day(
-                    probe, day_tr, bars, i, code, stock_info, stage="signal",
-                    sig=sig, extra={"engine": {k: bt.get(k) for k in
-                                               ("return_pct", "peak_return_pct",
-                                                "exit_reason", "exit_day")}})
-            trades.append({
-                **sig,
-                "entry_date": entry_date,
-                "entry_price": round(entry_price, 3),
-                "buy_mode": "next_open",
-                "d1_change": round(d1_change, 2),
-                "d1_gap": round(d1_gap, 2),
-                "intraday": round(d1_change - d1_gap, 2),
-                **bt,
-            })
-
-        return trades
 
 
 # ================================================================
@@ -575,6 +460,9 @@ def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilt
         bt = run_exit(spec.exit.get("mode", "v1_combo"), bars=bars, entry_idx=entry_idx,
                       entry_price=entry_price, code=code, board_type=board_type,
                       params=_p, diag=diag)
+        if not bt:
+            # R1: 数据结束未平 → 末日收盘平仓（与主回测路径同口径）
+            bt = data_end_close(bars, entry_idx, entry_price)
         if not bt:
             continue
 

@@ -623,7 +623,7 @@ def replay_ledger(expected, meta, bars_map, idx_map):
     """对每个应然信号重放「入场 → 确认 → 出场」, 产出带完整生命周期字段的行。
 
     Returns:
-        (rows, stat): rows = {(date, key, code): row}; stat = 各分支计数
+        (rows, stat): rows = {四元键: row}（与 expected 同键粒度）；stat = 各分支计数
     """
     active = _active_strategies(meta.get("strategies"))
     axis = meta.get("win_dates") or []
@@ -631,7 +631,9 @@ def replay_ledger(expected, meta, bars_map, idx_map):
     rows, stat = {}, defaultdict(int)
 
     for k, row in expected.items():
-        date, key, code = k
+        # A2 (2026-10-07) 后 expected 键是四元组 (date, key, code, entry_style);
+        # 原三元组解包自那时起必炸 —— 此处按四元组取前三元, style 不参与重放。
+        date, key, code = k[0], k[1], k[2]
         strat = active.get(key)
         bars = bars_map.get(code) or []
         times = idx_map.get(code) or []
@@ -921,6 +923,73 @@ def apply_ledger_plan(plan, dry_run=True):
     except Exception as e:
         logger.warning("[rebuild] 收尾 (watchlist/cleanup) 失败: %s", e)
     return stat
+
+
+# ================================================================
+# P5-⑤ 投影刷新 (2026-10-08) —— 替代 build_expected + replay_ledger
+# ================================================================
+def projection_ledger_refresh(window=30, keys=None, dry_run=True):
+    """Record 切片投影 → 生命周期行 → 写库计划 (P5-⑤-1)。
+
+    替代旧链 `build_expected`(scan_days 全市场重算) + `replay_ledger`(三决策重放)。
+    源 = `store.load_projection` (P5-① 已落地的 Record→规则行, 每 ready 一行,
+    project_rows 从事件链直接推导 state/entry_*/exit_*)。
+
+    与 replay_ledger 的口径差 (2026-10-08 全量对拍实证, 见
+    tmp/_p5_lifecycle_equivalence.py, 21 共同键 / 8 差异全部为以下三类):
+      1. 持仓期重合 ready: 重放当独立交易模拟出幽灵持仓, 投影正确标 watch_pending;
+      2. exit_price: 重放用理论触发价, 投影用引擎成交价 (与 golden 同口径);
+      3. exit_today vs closed: 重放按"出场日=末日"判待平账, 投影按事件已闭合判 closed。
+    ⇒ 投影**不劣于**重放; 重放自 A2 (2026-10-07) 起四元组解包必崩, 生产早已不走它。
+
+    Returns:
+        (plan, stat): plan 形态同 build_ledger_plan; stat 带 source 标记。
+        (None, {"error": ...}): 切片缺失/无投影等可恢复失败。
+    """
+    from app.market_cn.auto import store as _store
+    from app.market_cn.auto.core import _paths
+
+    active = _active_strategies(keys)
+    if not active:
+        return None, {"error": "无活跃日线策略", "source": "projection"}
+
+    active_keys = sorted(active)
+    names = {}
+    try:
+        from app.market_cn.auto.core.data.hub import stock_info
+        names = {c: (v or {}).get("name", "") for c, v in (stock_info() or {}).items()}
+    except Exception as e:
+        logger.warning("[rebuild] stock_info 加载失败 (投影 name 列空): %s", e)
+
+    root = _paths.PRESENT_STATE_DIR
+    proj_all = _store.load_projection(root, strategies=active_keys, names=names)
+    if not proj_all:
+        return None, {"error": "切片无投影 (present_state 缺失或全空)", "source": "projection"}
+
+    # 窗口 = 投影内最近 window 个交易日 (与旧 build_expected 的 axis[-window:] 同语义)
+    dates = sorted({k[0] for k in proj_all})
+    win = dates[-window:] if dates else []
+    win_set = set(win)
+    proj = {k: v for k, v in proj_all.items() if k[0] in win_set}
+
+    actual = load_actual(win, keys=active_keys)
+    meta = {"strategies": active_keys, "win_dates": win, "source": "projection"}
+    plan = build_ledger_plan(proj, actual, meta)
+    plan["projection_meta"] = {
+        "source": "projection", "window": window, "win_from": win[0] if win else None,
+        "win_to": win[-1] if win else None, "proj_rows": len(proj),
+        "all_proj_rows": len(proj_all), "actual_rows": len(actual),
+        "plan_counts": {k: (len(v) if isinstance(v, list) else v)
+                        for k, v in plan.items() if isinstance(v, list)},
+    }
+    stat = {"source": "projection", "dry_run": bool(dry_run),
+            "proj_rows": len(proj), "actual_rows": len(actual)}
+    if dry_run:
+        return plan, stat
+    applied = apply_ledger_plan(plan, dry_run=False)
+    applied["source"] = "projection"
+    applied["win_to"] = win[-1] if win else None
+    return plan, applied
 
 
 def _now_str():

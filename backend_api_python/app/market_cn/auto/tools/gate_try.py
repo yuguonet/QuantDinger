@@ -162,15 +162,6 @@ def expr_min_bars(expr_str: str) -> int:
     return need
 
 
-def required_window(exprs: Optional[List[str]] = None) -> int:
-    """候选表达式组所需的采样窗口（根数）。
-
-    ⚠️ 与 days 无关：探针行可用窗口恒为 PROBE_WIN_BARS(30)。
-    本函数返回的是"理想所需"，供调用方判断 30 够不够（见 window_ok）。
-    """
-    if not exprs:
-        return DEFAULT_DAYS_DAILY
-    return max([expr_min_bars(e) for e in exprs] + [0]) or DEFAULT_DAYS_DAILY
 
 
 def _get_probe_rows(strategy: str, days: int, codes, label: str,
@@ -510,12 +501,3 @@ def _expr_func_names(expr_str: str) -> List[str]:
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
 
 
-def cache_stats() -> Dict[str, Any]:
-    """当前缓存状态（调试用）。"""
-    return {
-        "entries": len(_PROBE_CACHE),
-        "cache_bytes": _CACHE_BYTES,
-        "cache_mb": round(_CACHE_BYTES / 1024 / 1024, 1),
-        "max_mb": round(_CACHE_MAX_BYTES / 1024 / 1024, 0),
-        "keys": [f"{k[0]}_{k[1]}d_{k[2][:8]}" for k in _PROBE_CACHE],
-    }

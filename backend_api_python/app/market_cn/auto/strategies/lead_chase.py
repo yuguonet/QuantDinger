@@ -369,8 +369,6 @@ class LeadChaseStrategy(StrategyBase):
     # ★ 单点窗口: dev_40 含到 09:40 的量价, 早成交=前视; 晚成交 alpha 衰减 (见 [v7-0])
     scan_spec = ScanSpec(kind="intraday_window", windows=("09:40", "09:40"), interval_sec=60)
     default_params = dict(PARAMS)
-    PROBE_STAGE_RANK = {"window": 1, "mkt": 2, "pool": 3, "noise": 4,
-                        "volume": 5, "board": 6, "signal": 7}
     # 框架契约: 回测未含 U1~U4 (自实现门); 盘中即买 → T+1 当日不可卖
     use_unified_prefilter = False
     entry_at_close = True

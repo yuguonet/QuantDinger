@@ -50,6 +50,7 @@ from app.market_cn.auto.core.runtime.functions import Ctx, _closes_upto
 from app.market_cn.auto.core.runtime.gate_stdlib import board_height, ma_bull
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
+    data_end_close,
 )
 
 STRATEGY_KEY = "relay3"
@@ -127,14 +128,8 @@ def calc_features(bars, code) -> dict:
 # 三决策辅助 (独立函数, 类方法与 facade 共用)
 # ================================================================
 
-def gap_buyable(gap: float) -> bool:
-    """D1 开盘 gap 过滤: (-2%, +9%)。"""
-    return PARAMS["gap_min"] <= gap <= PARAMS["gap_max"]
 
 
-def entry_stop(entry_price: float, code: str) -> float:
-    """-5% 盘中硬止损价。"""
-    return round(entry_price * (1 + PARAMS["stop_pct"] / 100), 3)
 
 
 def eval_exit_live(row, snap_rows, entry_price: float):
@@ -368,63 +363,6 @@ class Relay3Strategy(StrategyBase):
         return ExitDecision("hold")
 
     # ---- 回测钩子 (日线近似 S4, 2026-09-16 新增) ----
-    def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
-                       probe=None):
-        """单股 relay3 全历史日线回测 → trades 列表。
-
-        枚举: i=D0 (恰为board_height连板收盘日) → scan_signals → D1开盘gap过滤
-        → run_backtest_relay3 出场模拟。U1~U4 锚定 D0 涨停日。
-        注意: 日线近似 S4 炸板按收盘价卖出, 实盘炸板瞬间价通常更高 → 回测偏保守。
-        """
-        from app.market_cn.auto.core.filters import unified_prefilter
-        p = self.params(None)
-        n = len(bars)
-        if n < 5:
-            return []
-        trades = []
-        for i in range(1, n - 1):  # i=D0, i+1=D1(入场日)
-            sigs = self.scan_signals(bars[:i + 1], code)
-            if not sigs:
-                continue
-            sig = sigs[0]
-            # U1~U4 预过滤 (锚定 D0 涨停日)
-            if use_prefilter:
-                ok, _fails = unified_prefilter(bars, i, code, stock_info)
-                if not ok:
-                    continue
-            # D1 开盘 gap 过滤
-            entry_price = float(bars[i + 1]["open"])
-            if entry_price <= 0:
-                continue
-            prev_close = float(bars[i]["close"])
-            if prev_close <= 0:
-                continue
-            gap = (entry_price / prev_close - 1) * 100
-            if not (p["gap_min"] <= gap <= p["gap_max"]):
-                continue
-            # 出场模拟
-            result = run_backtest_relay3(bars, i + 1, entry_price, code, p)
-            if not result or result.get("open"):
-                continue  # 跳过开放持仓 (数据不足, 回测只统计已平仓)
-            ex = sig.extra or {}
-            trades.append({
-                "code": code,
-                "board": get_board_type(code),
-                "path": self.key,
-                "path_label": self.name,
-                "signal_date": bars[i]["time"],
-                "entry_date": bars[i + 1]["time"],
-                "entry_price": round(entry_price, 3),
-                "buy_mode": "next_open",
-                "d1_gap": round(gap, 2),
-                "lu_date": ex.get("lu_date"),
-                "board_height": ex.get("board_height"),
-                "ma_bull": ex.get("ma_bull"),
-                "lu_vol_ratio": ex.get("lu_vol_ratio"),
-                "rsi": ex.get("rsi"),
-                **result,
-            })
-        return trades
 
 
 # ================================================================
@@ -517,7 +455,11 @@ def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilt
                           entry_idx=site["entry_idx"], entry_price=site["entry_price"],
                           code=code, board_type=board_type, params=_p, diag=site["diag"])
         if not result or result.get("open"):
-            continue  # 参考版跳过开放持仓（数据不足, 只统计已平仓）
+            # R1: 数据结束未平/open → 末日收盘平仓（与主回测路径同口径；
+            # 原「参考版跳过开放持仓」是 R1 修复前的旧行为）
+            result = data_end_close(bars, site["entry_idx"], site["entry_price"])
+        if not result:
+            continue
 
         # 信号展示字段（镜像 relay3 calc_features: board_height/ma_bull/lu_vol_ratio/rsi）
         feats = relay3_features(Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,

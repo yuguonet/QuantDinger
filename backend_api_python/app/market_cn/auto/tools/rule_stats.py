@@ -328,7 +328,9 @@ def main():
     if strat is None:
         print(f"strategy={args.strategy} 未注册", file=sys.stderr)
         return 1
-    rank_map = dict(getattr(strat, "PROBE_STAGE_RANK", {}) or {})
+    from app.market_cn.auto.sampler import STAGE_RANK
+    rank_map = dict(STAGE_RANK.get(getattr(strat, "key", "") or "", {})
+                    or getattr(strat, "PROBE_STAGE_RANK", {}) or {})
     if not rank_map:
         print(f"{args.strategy} 无 PROBE_STAGE_RANK (未接探针?), 无法归因", file=sys.stderr)
         return 1

@@ -195,6 +195,25 @@ def monitor_progress_settings():
     return {"enabled": bool(v.get("enabled", False))}
 
 
+def ref_tree_settings():
+    """外部旧版参照树根 (§2.2.3 切口 9, 2026-10-08) —— 删除旧代码的可逆保障。
+
+    config.json 顶层 (与 present_persist 平级):
+        "ref_tree": {"root": "<旧版树根>"}
+    缺键 / 类型不符 ⇒ {"root": None} —— 对拍组保持 skip (**skip ≠ 通过**)。
+
+    ★ 为什么放 config 而不是只靠环境变量: 参照树是 P6 删除旧代码的**唯一可逆保障**,
+      路径必须可复核; `AUTO_SLIM_REF` 只活在部署机 shell 里, 换机/重启即失效 ⇒
+      对拍组静默 skip (无证据, 却看着像"没跑过也没关系")。**环境变量保留为本地覆盖**
+      (优先级高于 config), 便于临时换一棵参照树对比。
+    """
+    v = load_config().get("ref_tree")
+    if not isinstance(v, dict):
+        return {"root": None}
+    root = v.get("root")
+    return {"root": str(root) if root else None}
+
+
 def market_env_of(key):
     """策略的大盘环境门模式 (config.json 优先; 默认 off=全通)。
 
