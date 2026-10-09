@@ -2,8 +2,8 @@
 
 Phase 3: 策略判定全部经 strategies 注册表分发, 本文件不含策略名分支:
   开盘窗口: entry_decision (gap 过滤) + quality_key (排名) + daily_limit (名额)
-  盘中:     stop_price 硬止损 (通用) + exit_decision live 模式 (relay3 炸板即卖)
-  15:00:    confirm_decision (dragon/break 无确认直持仓; v1 日内动量; relay3 封板判定)
+  盘中:     stop_price 硬止损 (通用) + exit_decision live 模式 (策略盘中出场)
+  15:00:    confirm_decision (dragon/break 无确认直持仓; 各策略确认由宏/插件决定)
   14:58:    exit_decision day_close 模式 (收盘重放, 与回测同一路径)
 各策略入场/确认/出场规则详见 strategies/*.py 模块头注释。
 卖出执行: 次日开盘按开盘价记账 closed 并出组 (建议人工尾盘/次日开盘执行)。
@@ -550,12 +550,12 @@ def run_monitor():
             stats["open_buy"] = n_buy
             stats["open_expired"] = n_exp
 
-    # ── 2. 盘中硬止损保护 (buy_today/holding) + 策略盘中出场 (relay3 炸板即卖等, live 模式) ──
+    # ── 2. 盘中硬止损保护 (buy_today/holding) + 策略盘中出场 (live 模式) ──
     if "09:35" <= hm < "15:00":
         guard_rows = buy_rows + hold_rows
         if guard_rows:
             snaps = latest_snapshot([r["code"] for r in guard_rows])
-            # live 模式出场需要当日全天快照序列 (relay3 封板/炸板判定)
+            # live 模式出场需要当日全天快照序列 (策略盘中出场判定)
             series_all = fetch_day_snapshots([r["code"] for r in guard_rows])
             # P5-④ 第二步 (2026-10-07): 盘中**策略**出场判定源可切到 progress (同一开关)。
             #   ⚠ 上面的硬止损 (px <= stop_px) **永不迁** —— 那是资金红线, 不是"规则性
@@ -602,7 +602,7 @@ def run_monitor():
                                  only_unexited=True)
                     stats["intraday_stop"] = stats.get("intraday_stop", 0) + 1
                     continue
-                # 策略 live 出场 (relay3 S4 炸板即卖 / knife_catch D1开盘卖; 其它策略 live → hold)
+                # 策略 live 出场 (knife_catch D1开盘卖等; 其它策略 live → hold)
                 # ⚠ "open" 必须注入: 策略侧写的是 `snap.get("open") or snap.get("last")`,
                 #    而本 snap 默认只有 mode/series/today ⇒ 不注入就恒回退 last (09:35 首拍价),
                 #    knife_catch/tail_oversold 的「D1 开盘卖」会静默变成「盘中价卖」。

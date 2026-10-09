@@ -5,7 +5,7 @@
 
 支持的模式（与 docs/自动策略IDE架构设计.md §4.1 对应）：
     close : 信号日收盘买入（D0 尾盘, dragon_callback）
-    open  : 次日(D1)开盘买入 + gap 过滤（v1 / relay3）
+    open  : 次日(D1)开盘买入 + gap 过滤（次日开盘入场的策略）
     intraday : 盘中触发买入（日线近似腿: 当日 high 触 trigger 即按线价成交; 1m 真实腿见 P4）
 
 `open` 模式的过滤项（全部可选，缺省不拦截）：
@@ -106,15 +106,16 @@ def resolve_entry(cfg: Dict[str, Any], bars: List[Dict[str, Any]], i: int,
 
 def _resolve_entry_intraday(cfg: Dict[str, Any], bars: List[Dict[str, Any]], i: int,
                            board_type: str, params: Dict[str, Any]):
-    """盘中触发入场 (日线近似腿; 1m 真实腿由 run_all 时间线引擎在 P4 接线)。
+    """盘中触发入场 (日线近似腿; 1m 真实腿由盘中折叠的槽位序列提供)。
 
     - 入场日 = 决策日 i 本身 (offset 0, 与 close 同);
     - 触发价 trigger 来自 entry.trigger (字符串→params 引用 / 数字 / {board:值});
     - 日线近似腿: 复用 P1 原语 ``exec.fill_intraday(bar, trigger, side='buy')`` ——
       当日 high >= trigger 即触发, 成交价 = max(open, trigger) (开盘已在线上的按开盘),
       涨停不可买 → filled=False; 未触线 → (None, False) (与其余引擎同一成交语义)。
-    - 1m 真实腿 (P4): 在 run_all_intraday 槽位序列里找首个满足触发条件的槽位,
-      成交价 = 该槽位 open —— 届时由引擎调用本模式并把 1m bar 传入, 判定逻辑同构。
+    - 1m 真实腿: 盘中回测 (``run_all_intraday`` → 主干折叠 ``IntradayFeed``+``core.replay``)
+      的 ``evaluate`` 在 ``[min_hhmm, 15:00]`` 整窗逐槽回扫取首个满足触发条件的槽位,
+      成交价 = 该槽位 open —— 判定逻辑与日线近似腿同构。
     """
     if i < 0 or i >= len(bars):
         return None, "no_bar"

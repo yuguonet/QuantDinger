@@ -1,33 +1,23 @@
 # ================================================================
-# 龙回头 (dragon_callback) — IDE 门表镜像
+# 龙回头 (dragon_callback) — IDE 门表单文件
 # ----------------------------------------------------------------
-# 规则事实源 = strategies/dragon_callback.py 的"判定原语"段 (2026-09-23 抽出):
-#   本文件的每个门只是**调用**策略模块注册的私有门函数 (dragon/streak/lu_gain20/
-#   depth/yin/ma20_dev/rsi6/gap_days), 不重写任何判定逻辑 —— 改规则只改 .py 一处。
-# 引擎编排 (core/runtime/evaluate.py):
-#   enumeration=limit_up → 枚举候选日 i → 资格门 → 遍历 lu_idx 升序, 首个通过即出信号
-#   → 去重 ±4 → U1~U4 预过滤(锚定涨停日) → 入场 → exit_modes.combo 出场。
-#   与 python 版 backtest_stock 编排同构 (编排差异见下方 entry 段 TODO)。
-#
-# ⚠️ 已知口径差 (待 core 支持, 不属门表范围):
-#   生产链 = 信号日(D0) 次日开盘买入 (buy_mode="next_open", entry_idx=i+1);
-#   门表引擎 limit_up 分支当前硬编码 entry=D0 收盘价 (entry_idx=i)。
-#   ⇒ 门表与 python 的**信号集(选股+选涨停日)应逐日一致** (A 段可验),
-#     成交价/入场日逐笔等价需引擎支持 next_open 后才成立 (B 段)。
+# 门表 expr 调用策略模块注册的私有门函数 (dragon/streak/lu_gain20/depth/yin/
+# ma20_dev/rsi6/gap_days), 具体阈值在本文件 params 段 —— 改规则改本文件。
+# 引擎编排: enumeration=limit_up → 枚举候选日 i → 资格门 → 遍历 lu_idx 升序, 首个通过
+# 即出信号 → 去重 ±4 → U1~U4 预过滤 → 次日(D1)开盘入场 → exit_modes.combo 出场。
 # ================================================================
 meta:
   name: 龙回头
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 2
+  enabled: true                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: limit_up        # 引擎: 遍历 lu_idx 升序, 首个通过即出信号 (与 scan_signals 同)
   # 结构说明: "涨停 → 回调 → 反转"的 lu_idx 循环属引擎编排, 不写进门表; 门表只表达
   # "给定 (决策日 i, 涨停日 lu_idx) 是否放行"。
 
 entry:
-  mode: next_open              # 语义声明: 次日(D1)开盘买入 (引擎编排支持后生效)
+  mode: next_open              # 次日(D1)开盘买入
   price: d1_open
-  # TODO(core): evaluate._run_backtest_limit_up 目前固定 entry_price=bars[i].close;
-  #  支持 next_open 后本段即生效, 届时 B 段可逐笔等价。
 
 exit:
   mode: combo                  # core/exit_modes: dragon 出场引擎 (追踪/止损/到期/峰值逃顶)
@@ -36,7 +26,7 @@ params:                        # 可调参数 (网格扫描 / 敏感性分析直
   # --- 回调窗口 (gap = i - lu_idx, 与 .py 的 gap_min/gap_max 同义) ---
   gap_min: 5
   gap_max: 7
-  # 引擎廉价预筛专用: core evaluate limit_up 读这两个键, 判定 i-lu ∈ [pd_min+1, pd_max+1]
+  # 引擎廉价预筛专用: dragon 单日判定读这两个键, 拦截 i-lu ∉ [pd_min+1, pd_max+1]
   # (= [gap_min, gap_max]); 改 gap_min/gap_max 必须同步此处, 否则预筛与门表不一致。
   min_pullback_days: 4
   max_pullback_days: 6
@@ -44,8 +34,6 @@ params:                        # 可调参数 (网格扫描 / 敏感性分析直
   dragon_ratio: 0.7
   dragon_windows: [4, 5, 7, 10, 15, 20]
   # --- 龙强度三条件 ---
-  # min_streak 3→2 (A6, 2026-09-28): _lu_streak off-by-one 修复后度量回归真实连板高度,
-  # 3→2 保持实际行为不变 (修复前 ms=3 在 buggy 度量上恰好=真实>=2, 600d 逐笔等价 167/167)。
   min_streak: 2                # 涨停日真实连板高度 >= 2 ("龙"的最低成色)
   lu_gain20_min: 60.0          # 涨停日 20 日涨幅 >= 60%
   rsi6_min: 45.0               # D0 RSI6 >= 45 (强势回调)
@@ -96,7 +84,7 @@ gates:
   - {id: g10, name: 排除-跌破MA20, role: required, needs_d0: 1, enabled: 1,
      expr: "ma20_dev() >= d0_ma20_exclude_lt"}
 
-# 信号展示字段 (python 版 extra 字段镜像; 引擎支持 signal.fields 后生效)
+# 信号展示字段 (build_signal 按本段求值, 与 .py 的 Signal.extra 逐字段一致)
 signal:
   fields:
     gap_from_peak:    {expr: "gap_days()", fmt: int}

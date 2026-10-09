@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""策略插件契约 (auto/strategies/base.py) —— Phase 1 骨架, 2026-09-07
+"""策略插件契约 (auto/strategies/base.py)
 
 定义策略与框架之间的全部契约: Signal / 三Decision / ScanSpec / StrategyBase。
-Phase 1 仅为契约定义 (运行时扫描/监控仍在旧模块, Phase 3 切换注册表分发)。
 
 核心原则: 策略=纯函数, 输入输出规范化。
   - 输入: bars(list[dict] 前复权升序) + code + as_of(as-of索引, 回测禁用其后数据) + ctx(预计算缓存)
@@ -32,8 +31,11 @@ class ScanSpec:
     windows: tuple = ()                # intraday_window 生效: ("09:30","10:00") 等窗口端点
     interval_sec: int = 60             # intraday_window 生效: 窗口内轮询间隔
     data: str = "daily"                # daily=喂日K | minute=喂分钟K (1m 通道 Phase 3+ 接)
-    entry_at: str = ""                 # intraday_window 生效: 成交触发时刻 ("14:56"=终审语义,
-                                       #   窗口内其它触发仅预览不成交; 空=每个触发点均可成交)
+    entry_at: str = ""                 # intraday_window 生效: **最早可成交时刻** (= 成交扫描
+                                       #   窗口起点)。窗口内按 interval_sec 逐槽轮询, 首个触发
+                                       #   即成交 (与生产 rolling_preview "14:50 起即可买入" 同
+                                       #   口径); 空 = 从 windows[0] 起扫。⚠ 曾误作"只回该时刻"
+                                       #   (2026-10-09 D4 修正: 那会漏掉起点之后才触发的信号)
     # ---- 盘后触发声明 (2026-09-29; scheduler 不再硬编码 17:25) ----
     # after_events: 数据就绪事件依赖 (auto/events.py KNOWN_EVENTS), 全齐才允许触发。
     #   空 = daily_close 默认 ("daily_1d",); 加 lhb 表示必须等龙虎榜落库。
@@ -85,8 +87,7 @@ class ConfirmDecision:
 
     confirmed=False 且 reason 非空 → monitor 转 exit_today (exit_reason=reason);
     策略可返回 None 表示"无法判定"(快照缺失等), monitor 不做状态转移。
-    d1_chg/d1_vol_r/detail 由策略按自身口径填写 (落库字段, 基准各策略不同:
-    多数用 signal_price, relay3 用 entry_price)。
+    d1_chg/d1_vol_r/detail 由策略按自身口径填写 (落库字段, 基准各策略不同)。
 
     reason 是**策略内部语义串**(ok / g56_hold / sealed_hold / 一整句中文), 只作审计,
     不是展示档位 —— 档位一律经 `core/display_meta.confirm_level_of()` 归一, 勿直取
@@ -97,7 +98,7 @@ class ConfirmDecision:
     d1_chg: float = None
     d1_vol_r: float = None
     detail: dict = None
-    exit_price: float = None   # confirmed=False 时可带参考卖出价 (relay3 未封板尾盘卖=最新价)
+    exit_price: float = None   # confirmed=False 时可带参考卖出价 (策略按自身口径提供)
 
 
 # ================================================================
@@ -112,65 +113,13 @@ class ConfirmDecision:
 
 
 # ================================================================
-# 数据结束平仓 —— 断链收尾的**唯一实现**（改进方案 §2.3）
+# 数据结束平仓（断链收尾）
 # ================================================================
-#: 数据结束平仓的原因文案。⚠️ 勿改 —— golden 基线与 core/replay.REASON_DATA_END 依赖此文案。
-DATA_END_REASON = "数据结束平仓"
-
-
-def data_end_close(bars, entry_idx, entry_price):
-    """数据结束仍未平仓 → **末日收盘平仓**（断链收尾的唯一实现）。
-
-    背景（2026-10-08 口径分歧 #1 修复）：
-      本口径原本只活在 `StrategyBase._backtest_stock_legacy`（本文件下文）里；
-      **五个策略的 backtest_stock 覆写都没有** —— 它们在出场引擎返回 None（视野
-      不足）时 `if not result: continue` **静默丢弃**该笔交易 ⇒ 历史回测**低估了
-      交易数**（未平仓直接消失，不进统计，胜率/盈亏比受污染）。
-      同时 `core/replay` 有 `REASON_DATA_END` 同口径实现 ⇒ 新旧两侧不一致。
-      ⇒ 本函数把口径收成一份，通用引擎 / 五个覆写 / 回放三方对齐。
-
-    口径（与 `_backtest_stock_legacy` 原实现逐位同构）：
-      · 出场点 = 数据末根（`bars[n-1]`）；
-      · 成交价 = 末根收盘价；
-      · `exit_day` = 末根索引 - entry_idx + 1（d=1 是入场当日）；
-      · `peak_return_pct` = [entry_idx, 末根] 区间内 **high** 峰值相对入场价；
-      · `return_pct` / `peak_return_pct` 保留 2 位，价格保留 3 位。
-
-    Args:
-        bars: 日线（升序，前复权）。
-        entry_idx: 入场根索引（D1）。
-        entry_price: 入场价。
-
-    Returns:
-        dict（可直接 `**` 合入 trades.append）或 **None**（入场价/末日价非法时，
-        调用方照旧丢弃 —— 与原 `if exit_price <= 0: continue` 同语义）。
-
-    ⚠️ 易错点：
-      · `entry_idx` 是**入场根**（D1），不是信号根（D0）。传错会让 exit_day 偏一天。
-      · peak 取的是区间内 `high`（不是 close），与 `_backtest_stock_legacy` 一致；
-        改成 close 会让 peak_return_pct 静默偏低。
-      · 本函数**不做判定**（不判止损/追踪/到期）—— 判定在各出场引擎；它只负责
-        「判定没结果时怎么收尾」。在引擎有结果时调用会变成第二份回测。
-    """
-    n = len(bars) if bars is not None else 0
-    if n == 0 or entry_idx is None or not (0 <= entry_idx < n):
-        return None
-    entry_price = float(entry_price or 0)
-    if entry_price <= 0:
-        return None
-    exit_idx = n - 1
-    exit_price = float(bars[exit_idx].get("close") or 0)
-    if exit_price <= 0:
-        return None
-    peak = max(float(b.get("high") or 0) for b in bars[entry_idx:exit_idx + 1])
-    return {
-        "exit_date": str(bars[exit_idx].get("time"))[:10],
-        "exit_price": round(exit_price, 3),
-        "exit_day": exit_idx - entry_idx + 1,
-        "exit_reason": DATA_END_REASON,
-        "return_pct": round((exit_price / entry_price - 1) * 100, 2),
-        "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
-    }
+# 断链收尾（末日收盘平仓）的**唯一实现**已收敛到事件流投影：`core/replay.REASON_DATA_END`。
+# 本文件曾另有一份同名实现（`data_end_close()` + `DATA_END_REASON`），是旧「通用回测引擎」
+# (`_backtest_stock_legacy`) 与五份策略 `backtest_stock` 覆写共用的口径来源；三者已于
+# 终态② Step 3+（2026-10-09）退役 ⇒ 一并删除，杜绝第二处口径分叉（护栏见
+# tests/golden/test_known_divergence.py）。
 
 
 def _has_fold_contract(strategy) -> bool:
@@ -223,7 +172,7 @@ class StrategyBase:
       entry_at_close    入场在尾盘/收盘 (T+1 当日不可卖, monitor 止损守卫跳过当日; 默认 False)
       exit_exec_same_day     出场当日执行并当日平账 (默认 False=次日开盘执行)
       intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
-      intraday_exit          时间线引擎出场回调 (默认 = 次交易日开盘卖; 多日持有策略必须覆盖)
+      intraday_exit          盘中回测出场回调 (默认 = 次交易日开盘卖; 多日持有策略必须覆盖)
       rolling_preview        True=窗口起点起每分钟滚动预览 (run_scan_knife 循环调用, 每轮
                              清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
       data_needs             数据需求声明 (D1, §3.4): ('daily','minute_live','quote','lhb',...);
@@ -286,9 +235,9 @@ class StrategyBase:
         (信号落库口径 —— 去重是消费方/回测侧的选择, 不在门里)。
         覆盖条件: 判定代价高到逐日枚举不可接受时 (全序列指标 / 横截面池), 策略可在
         自己的模块里覆盖本方法做"一次预计算 + 逐日 O(1)" (g56 的做法与实证见
-        g56.scan_days)。未迁移折叠契约的策略 (relay3/v1/lead_chase, config
-        均 enabled=false) 退化到 `_scan_days_by_signals` —— 其 scan_signals
-        本身就是唯一门实现, 不构成第二份逻辑。
+        g56.scan_days)。未迁移折叠契约的策略退化到 `_scan_days_by_signals` ——
+        其 scan_signals 本身就是唯一门实现, 不构成第二份逻辑 (2026-10-09 P6-6/7
+        退役 relay3/v1/lead_chase 后当前无此类策略)。
 
         ⚠️ 只枚举 [lo_date, hi_date] 内的日期, 区间外的日期跳过 (不浪费判定)。
         """
@@ -345,11 +294,10 @@ class StrategyBase:
     # 仅 scan_signals 保持抽象必填。
 
     # ---- 回测钩子 ----
-    # backtest_stock 见文末「通用回测引擎」段 (2026-09-18 P2 起提供智能默认,
-    # 新策略零回测代码; 契约: 与实盘同一份 scan_signals, trades 字段对齐基线 JSON,
-    # 枚举内去重/预过滤/D1 过滤属策略规则; intraday_window 策略不适用)。
-    # 2026-09-26: 删除此前「默认返回 None」的死 stub —— 它被文末通用引擎定义覆盖,
-    # 误导读代码的人以为默认无回测能力。
+    # backtest_stock 见文末「回测入口」段（2026-09-18 P2；2026-10-09 终态② 收敛为事件流
+    # 折叠薄壳）：实现折叠契约（init_state/step/evaluate）者走 core.replay，无契约者报错
+    # （无兜底引擎）。契约：判定/入场/出场全在策略 evaluate，trades 字段对齐基线 JSON；
+    # intraday_window 策略不适用（走 run_all_intraday，其内部委托主干折叠 core.replay）。
 
     def day_prefilter(self, frame, pc_map):
         """日级必要条件超集预筛 (intraday_window 回测提速, 2026-09-10; 默认 None=不预筛)。
@@ -379,7 +327,7 @@ class StrategyBase:
                            spec=spec, already=already)
 
     def intraday_exit(self, bars, code, entry_date, entry_price, entry_idx=None, **params):
-        """时间线引擎 (intraday_window 回测) 的出场回调 —— 默认 = 次交易日开盘卖。
+        """盘中回测 (intraday_window) 的出场回调 —— 默认 = 次交易日开盘卖。
 
         默认实现与 tail/knife 基线口径逐字一致 (D1 开盘卖, exit_day=1); 返回 None =
         视野不足 (该笔不计入)。**多日持有策略必须覆盖** (如龙回头 15 日追踪/止损/逃顶),
@@ -414,15 +362,19 @@ class StrategyBase:
 
     # ---- 便捷 ----
     def params(self, override=None):
-        """default_params ← config.json params 覆盖 的合并结果。
+        """default_params ← **策略宏 yaml params** 覆盖 的合并结果。
 
         优先级 (高→低): override 显式入参 > 实例 default_params (param_scan 网格覆写)
-                      > config.json params > 类默认 default_params。
+                      > 策略宏 `<key>.yaml` params (回退 config.json params) > 类默认 default_params。
 
         2026-09-25 bugfix: 原实现只做 default_params+override, **从未读 config**,
         文档却写「← config 覆盖」→ config.params 在回测/monitor 路径静默失效
         (仅 scan 经 params_override 单独注入)。现按文档补齐; 判定「是否仍为类默认」
         以放行 config —— param_scan 把网格写进实例 default_params 后仍保持权威。
+
+        ★ 2026-10-09 (终态②/D4): 覆盖源由 config.json 上移到**策略宏 yaml params**
+        —— 参数单一事实源收敛到宏内一处（`strategies.params_override` 已 yaml 优先）。
+        无 yaml 的策略仍回退 config（2026-10-09 P6-6/7 退役 lead_chase 后当前无此类），行为不变。
 
         ★ 2026-10-06: 折叠契约侧原有一份轻合并 `params()` (= 仅 default_params
         + overrides, 不含 config)，与本方法**两个口径并存**。现归一为**本方法**
@@ -501,7 +453,7 @@ class StrategyBase:
     def quality_key(self, row):
         """开盘窗口质量排序键 (越大越优先)。**消费方 = `monitor.py:245` 开盘名额**。
 
-        默认读 `extra.confirm_chg` (break/relay3 口径)。
+        默认读 `extra.confirm_chg` (break 口径)。
         ⚠ 2026-09-24 核查: **全集群只有 break(22处) 与 relay3(1处) 产出 confirm_chg**,
           其余策略若不 override 本方法 ⇒ 恒 `(0,)` ⇒ 名额排序**退化为入库顺序**。
           当前未 override 的: knife_catch / tail_oversold (均 intraday_window, 库内无
@@ -555,7 +507,7 @@ class StrategyBase:
     def confirm_decision(self, row, snap=None, **params):
         """通用默认: D1 收盘确认通过 (d1_chg 按 signal_price 基准)。
 
-        策略有特殊确认规则时覆盖 (如 v1 日内动量 / relay3 封板确认)。
+        策略有特殊确认规则时覆盖 (如各策略的专属确认逻辑)。
         返回 None = 无法判定 (无快照), monitor 不转移。
         """
         series = (snap or {}).get("series") if isinstance(snap, dict) else None
@@ -572,7 +524,7 @@ class StrategyBase:
 
         v1.exit_decision 的逐字通用化 (2026-09-18): snap={"mode":"day_close",
         "bars":[...], "entry_idx":int}; live 盘中模式返回 hold (硬止损兜底在 monitor)。
-        策略有特殊出场 (如龙回头分段追踪 / relay3 尾盘未封板卖) 时覆盖。
+        策略有特殊出场 (如龙回头分段追踪) 时覆盖。
         """
         p = self.params(params or None)
         stop = p.get("stop", -8.0)
@@ -604,138 +556,55 @@ class StrategyBase:
         return ExitDecision("hold")
 
     # ================================================================
-    # 通用回测引擎 (2026-09-18 P2): 新策略零回测代码的默认 backtest_stock。
-    # 路径: as_of 枚举 → scan_signals → U1~U4 → D1 开盘买(gap带) →
-    #       exit_decision 收盘重放出场 (与实盘同一出场路径)。
-    # 口径说明:
-    #   - 出场填价=决策价 (收盘重放口径), 与 v1 回测专用引擎的"次日开盘"口径不同
-    #     —— 新策略无基线对数负担, 以实盘同路径为准;
-    #   - D1 gap 带用 params (min_gap_*/max_gap_*) — 若策略覆盖 entry_decision
-    #     改了竞价规则, 须同步 params 或自写 backtest_stock (引擎会告警);
-    #   - 持仓期内新信号跳过 (平仓次一日起可再入场);
-    #   - intraday_window 策略不适用 (返回 None, 走 run_all_intraday 时间线引擎)。
+    # 回测入口 —— 薄壳：只有实现折叠契约的策略可回测（终态②）
+    # ================================================================
+    # 回测编排已收敛到**事件流折叠**（core.replay），本方法只是它的薄壳（bars → DailyFeed
+    # → replay → TradesCollector）；判定/入场/出场全在策略 evaluate（折叠契约），引擎零
+    # 第二份编排。
+    #
+    # 历史（2026-09-18 P2 → 2026-10-09 终态② Step 3+）：本方法曾内置一套**通用回测引擎**
+    # (`_backtest_stock_legacy`：as_of 枚举 → scan_signals → U1~U4 → D1 开盘买 →
+    # exit_decision 收盘重放)，给「未迁移折叠契约」的遗留策略兜底。那是迁移期的临时第二套
+    # 判定+出场编排（违背「一条主干」），已随链 A `run_backtest` 退役一并删除：未实现折叠
+    # 契约的策略**不再有回测路径**，调用即报错（明确指向迁移折叠契约），杜绝第二套引擎复活。
     # ================================================================
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True,
                        probe=None):
-        """回测入口 —— **薄壳**（P3 切口 1）：已迁移折叠契约者走 `core.replay`。
+        """回测入口 —— **薄壳**：有折叠契约者走 `core.replay`；无契约者报错。
 
-        分流（保签名、保语义，消费方零感知）：
-          - kind != daily_close      ⇒ None（盘中策略走时间线引擎，与旧行为一致）
-          - **probe≠None** ⇒ `_backtest_stock_legacy`（P2 尾巴：rule_stats/rule_audit
-            采样依赖 scan_signals(probe=)；legacy 转发 probe；迁完删此分支与 legacy）
-          - 未迁移折叠契约（C 裁定 2026-10-08：停用策略无兼容模式，legacy 仅服务
-            **迁折叠前的临时回测**，P6 随薄壳删）⇒ `_backtest_stock_legacy`
-          - 已迁移 ⇒ replay；**横截面策略（有 prewarm 声明，如 g56）** 经
-            DailyFeed.ctx_provider 注入一次全市场池（薄壳单票不走 begin_day）
+        分流（保签名、消费方零感知）：
+          - kind != daily_close ⇒ None（盘中策略走 run_all_intraday，其内部委托主干折叠）
+          - 未实现折叠契约 ⇒ `NotImplementedError`（**无兜底引擎**，见上；当前无此类策略）
+          - 已实现 ⇒ replay；横截面策略（有 prewarm 声明，如 g56）经 DailyFeed.ctx_provider
+            注入一次全市场池（薄壳单票不走 begin_day）
 
-        ⚠ 语义差异（新策略须知）：legacy 含 **U1~U4 统一预过滤** 与 **D1 gap 带**，
-        replay 路径不含 —— 这些门应由策略 `evaluate` 自持（与 break/dragon 现状一致）。
+        ⚠ `probe` / `use_prefilter` / `stock_info` 形参仅为**签名兼容**（消费方零感知）：采样
+        已迁 sampler.LiveSampler 实盘侧；U1~U4 预筛由策略 `evaluate` 自持（与 break/dragon
+        现状一致），replay 路径不再在引擎侧叠加。
         """
         if self.scan_spec.kind != "daily_close":
             return None
-        if not _has_fold_contract(self) or probe is not None:
-            return self._backtest_stock_legacy(bars, code, stock_info,
-                                               use_prefilter, probe)
+        if not _has_fold_contract(self):
+            raise NotImplementedError(
+                f"{self.key}: 未实现折叠契约（init_state/step/evaluate），不支持回测 —— "
+                f"回测编排已收敛到事件流折叠（core.replay）单源，不再提供通用兜底引擎。"
+                f"如需回测，请先为该策略迁移折叠契约。")
         from app.market_cn.auto.core.replay import (
             DailyFeed, replay, TradesCollector)
         if not bars or len(bars) < 30:
             return []
         coll = TradesCollector(code=code, strategy=self.key)
-        try:
-            if hasattr(self, "prewarm"):
-                # 横截面策略: 单票回测无 begin_day ⇒ 池按**终点锚**惰性建一次
-                # (与旧 g56 回测钩子同式; _ensure_pool_daily 结果含全部
-                #  历史日键, ctx_provider 每日注入同一池 —— 逐日重建会全市场×N)
-                from app.market_cn.auto.core.features.cross_section import (
-                    _ensure_pool_daily)
-                _pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
-                feed = DailyFeed(
-                    bars, ctx_provider=lambda i, b: {"_day": {"pool": _pool}})
-            else:
-                feed = DailyFeed(bars)
-            res = replay(self, code, feed, collectors=[coll])
-        except NotImplementedError:                # 契约形似实未实现 → 回退
-            return self._backtest_stock_legacy(bars, code, stock_info,
-                                               use_prefilter, probe)
+        if hasattr(self, "prewarm"):
+            # 横截面策略: 单票回测无 begin_day ⇒ 池按**终点锚**惰性建一次
+            # (与旧 g56 回测钩子同式; _ensure_pool_daily 结果含全部历史日键,
+            #  ctx_provider 每日注入同一池 —— 逐日重建会全市场×N)
+            from app.market_cn.auto.core.features.cross_section import (
+                _ensure_pool_daily)
+            _pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
+            feed = DailyFeed(
+                bars, ctx_provider=lambda i, b: {"_day": {"pool": _pool}})
+        else:
+            feed = DailyFeed(bars)
+        res = replay(self, code, feed, collectors=[coll])
         return res.trades or []
 
-    def _backtest_stock_legacy(self, bars, code, stock_info=None,
-                               use_prefilter=True, probe=None):
-        """旧通用回测引擎（未迁移折叠契约的策略走此路径；P6 观察期后退役）。"""
-        from app.market_cn.auto.core.filters import unified_prefilter
-        from app.market_cn.auto.core.market import get_board_type
-        p = self.params(None)
-        n = len(bars)
-        if n < 30:
-            return []
-        trades = []
-        last_exit_idx = -1
-        for i in range(25, n - 1):
-            if i <= last_exit_idx:          # 持仓去重
-                continue
-            sigs = self.scan_signals(bars[:i + 1], code, stock_info=stock_info,
-                                     probe=probe)
-            if not sigs:
-                continue
-            sig = sigs[0]
-            if use_prefilter and self.use_unified_prefilter:
-                ok, _fails = unified_prefilter(bars, i, code, stock_info)
-                if not ok:
-                    continue
-            d0, d1 = bars[i], bars[i + 1]
-            entry_price = float(d1["open"] or 0)
-            if entry_price <= 0:
-                continue
-            entry_idx = i + 1
-            d1_gap = (entry_price / float(d0["close"]) - 1) * 100
-            d1_change = (float(d1["close"]) / float(d0["close"]) - 1) * 100
-            if get_board_type(code) == "gem_star":
-                if not (p.get("min_gap_gem", -10.0) <= d1_gap
-                        < p.get("max_gap_gem", 20.5)):
-                    continue
-            else:
-                if not (p.get("min_gap_main", -8.0) <= d1_gap
-                        < p.get("max_gap_main", 11.0)):
-                    continue
-            # 出场: exit_decision 收盘重放 (与实盘同一出场路径)
-            row0 = {"code": code, "entry_price": entry_price,
-                    "signal_price": float(d0["close"]), "extra": {}}
-            exit_idx = exit_price = None
-            exit_reason = ""
-            # ⚠ 起点 = entry_idx + 1 (入场次日 d=2), 不是 entry_idx —— A股 T+1: 当日买入
-            #   当日不可卖。对齐 core/replay 侧 (改进方案 P1-④「统一出场重放起点 D2」):
-            #   replay 的 ready→exec→exit 各占一天 ⇒ exit 事件最早落在 exec 次日 = d=2。
-            #   本循环若从 entry_idx 起就是 d=1 评估出场 —— 回放一个实盘不可能发生的卖出
-            #   (默认 exit_decision 的止损分支原本裸判 ⇒ d=1 会真触发, 见上方守卫)。
-            #   二者长期分叉, 是 P3 那次「replay == backtest_stock 逐笔一致」只在样本内
-            #   成立的原因 (样本内恰好没有入场当日触及止损的票)。
-            for j in range(entry_idx + 1, n):
-                snap = {"mode": "day_close", "bars": bars[:j + 1],
-                        "entry_idx": entry_idx}
-                d = self.exit_decision(row0, snap=snap)
-                if d is not None and getattr(d, "action", "") == "exit":
-                    exit_idx = j
-                    exit_price = float(d.price or 0)
-                    exit_reason = d.reason
-                    break
-            if exit_idx is None:             # 数据结束未触发 → 末日收盘平仓
-                exit_idx, exit_price, exit_reason = n - 1, float(bars[n - 1]["close"]), "数据结束平仓"
-            if exit_price <= 0:
-                continue
-            last_exit_idx = exit_idx
-            peak = max(float(b["high"]) for b in bars[entry_idx:exit_idx + 1])
-            trades.append({
-                "code": code, "strategy": self.key, "path": self.key,
-                "d0_date": str(d0["time"])[:10], "d0_close": float(d0["close"]),
-                "score": int(sig.score), "label": sig.label,
-                "entry_date": str(d1["time"])[:10],
-                "entry_price": round(entry_price, 3), "buy_mode": "next_open",
-                "d1_change": round(d1_change, 2), "d1_gap": round(d1_gap, 2),
-                "exit_date": str(bars[exit_idx]["time"])[:10],
-                "exit_price": round(exit_price, 3),
-                "exit_day": exit_idx - entry_idx + 1,
-                "exit_reason": exit_reason,
-                "return_pct": round((exit_price / entry_price - 1) * 100, 2),
-                "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
-            })
-        return trades

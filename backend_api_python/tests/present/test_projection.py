@@ -158,6 +158,73 @@ def test_projection_equals_signal_row_on_real_break():
             d, diffs, {k: p.get(k) for k in diffs}, {k: j.get(k) for k in diffs})
 
 
+def test_break_signal_fields_match_macro():
+    """D6 门禁: 宏 break.yaml `signal.fields` 是展示字段**唯一事实源**。
+
+    生产单日（`_scan_one`）产出的 `Signal.extra` 键集必须与宏声明逐字一致 —— 防止
+    「宏里加了字段、.py 却不产出」的静默脱节（g56 的 nd_score/nd_tag/nd_exp 即此形态，
+    见 P5收口执行记录 R1）。break 的 extra 完全由 `build_signal` 产出，故为**相等**。
+    """
+    from app.market_cn.auto.core.runtime.evaluate import load_strategy
+    declared = set(load_strategy("break").signal.get("fields") or {})
+    assert declared, "宏 signal.fields 不应为空"
+    s = _break_cls()()
+    bars = _bars()
+    hits = []
+    for k in range(len(bars)):
+        hits.extend(s.scan_signals(bars, "600000", as_of=k))
+    assert hits, "夹具须含正例 (防空转假绿)"
+    for sig in hits:
+        assert set(sig.extra) == declared, (
+            sig.time, "多=%s 缺=%s" % (sorted(set(sig.extra) - declared),
+                                        sorted(declared - set(sig.extra))))
+
+
+def test_intraday_signal_fields_match_macro():
+    """偏离1 门禁: 盘中宏 knife/tail 的 `signal.fields` 是 `extra` **唯一事实源**。
+
+    与 `test_break_signal_fields_match_macro` 同旨，覆盖**盘中路径**：`scan_signals`
+    （生产实时入口）产出的 `Signal.extra` 键集必须与宏声明**逐字相等** —— 防止
+    「改 yaml `signal.fields` 不改产物」的静默脱节（即偏离1 前的双份形态：
+    `.py _gates` 手拼 extra，yaml 是死声明）。
+
+    盘中 extra 完全由 `build_signal(ctx, spec)` 产出 ⇒ 与宏**相等**（多/缺任一即 FAIL）。
+    夹具来自 `tests/present/common`：已证 14:56 起满足全门（与 golden `*_synth_1456` 同源）。
+    注：g56 的 `nd_*` 是**已知**未接线字段（偏离6 / P6-8），不在本门禁范围。
+    """
+    import importlib
+
+    from app.market_cn.auto.core.runtime.evaluate import load_strategy
+    from tests.present.common import (KNIFE_HIST_CLOSES, TAIL_HIST_CLOSES,
+                                      gen_hist_bars, knife_day_rows, tail_day_rows)
+
+    cases = (
+        ("knife_catch", "app.market_cn.auto.strategies.knife_catch",
+         "KnifeCatchStrategy", KNIFE_HIST_CLOSES, knife_day_rows),
+        ("tail_oversold", "app.market_cn.auto.strategies.tail_oversold",
+         "TailOversoldStrategy", TAIL_HIST_CLOSES, tail_day_rows),
+    )
+    code, day, mkt = "600001", "2026-10-05", -3.0
+    checked = 0
+    for key, mod, cls, closes, rows_fn in cases:
+        declared = set(load_strategy(key).signal.get("fields") or {})
+        assert declared, "%s 宏 signal.fields 不应为空" % key
+        s = getattr(importlib.import_module(mod), cls)()
+        bars = gen_hist_bars(code, closes)
+        rows = rows_fn(day, pc=100.0)
+        sigs = s.scan_signals(bars, code,
+                              ctx={"latest": rows[-1], "series": rows, "mkt_gain": mkt})
+        assert sigs, "%s 夹具未触发（空转 = 假绿）" % key
+        for sig in sigs:
+            extra = set(sig.extra or {})
+            assert extra == declared, (
+                "%s: extra != 宏 signal.fields（改 yaml 不再改变产物 = 双份回归）\n"
+                "  多=%s\n  缺=%s" % (key, sorted(extra - declared),
+                                      sorted(declared - extra)))
+            checked += 1
+    assert checked >= 2, "被检盘中策略过少（%d）= 假绿" % checked
+
+
 # ================================================================
 # 事件链 → state 推导（合成 events）
 # ================================================================
@@ -298,7 +365,7 @@ def test_replay_report_flags_both_directions():
     """回放报告必须把**两个方向**都打出来（只报一个方向 = 漏一半分歧）。"""
     res = {"win": ("2026-06-01", "2026-08-28"), "window": 60, "root": "X", "bars": 100,
            "errors": [], "warm_cut": "2026-06-29",
-           "skipped_no_fold": ["v1"],
+           "skipped_no_fold": ["legacy_no_fold"],
            "skipped_intraday": [("knife_catch", "intraday_window")],
            "per_strategy": {"break": {
                "codes": 2, "prod_days": 3, "proj_days": 2, "both": 1,
@@ -315,7 +382,7 @@ def test_replay_report_flags_both_directions():
     txt = shadow._render_replay(res)
     assert "2026-06-01..2026-08-28" in txt and "只生产" in txt and "只投影" in txt
     # 两类别名登记必须出现（静默跳过是头号敌人）
-    assert "v1" in txt and "knife_catch" in txt
+    assert "legacy_no_fold" in txt and "knife_catch" in txt
     assert "600000" in txt and "000001" in txt
     # 暖机剔除 + 归因必须单列（否则 g56 冷启动假象会被当成真分歧、口径差会被当万能挡箭牌）
     assert "剔除暖机头 20 日" in txt and "2026-06-29" in txt and "未归因" in txt

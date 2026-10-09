@@ -369,7 +369,7 @@ def _dragon_strategy_knife_scan(slot=None):
 
     slot = {"hm": "HH:MM", "keys": [...]} —— 本次只跑这批策略 (None = 兼容旧的全量调用)。
     时刻与策略集合来自 auto/sched.py 事实源, 由 _intraday_trigger_slots() 分组:
-      09:40 → lead_chase(早盘单点)  |  14:30 → knife_catch + tail_oversold(尾盘批)
+      14:30 → knife_catch + tail_oversold(尾盘批)
     knife_catch: 14:56 终审; tail_oversold: 14:50 起每分钟滚动预览 + 14:56 终审。
     """
     from app.market_cn.auto.scan import run_scan_knife

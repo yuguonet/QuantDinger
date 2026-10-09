@@ -120,6 +120,22 @@ def test_g56_day_signals_match_old(seed, hub_patch, tmp_path):
         assert sig.extra == p["extra"], key
 
 
+def test_g56_signal_fields_match_macro(hub_patch, tmp_path):
+    """D6/R1 门禁: 宏 g56.yaml `signal.fields` 是展示字段**唯一事实源**。
+
+    折叠 (主干) 产出的 extra 键集必须与宏声明逐字一致 —— 防止「宏里加了字段、.py 却
+    不产出」的静默脱节 (此前的 nd_score/nd_tag/nd_exp 就是这样: 宏声明了、产物没有,
+    见 P5收口执行记录 R1)。结构性键 `buy_mode` 由 .py 追加, 不计入宏字段。
+    """
+    from app.market_cn.auto.core.runtime.evaluate import load_strategy
+    declared = set(load_strategy("g56").signal.get("fields") or {})
+    assert declared, "宏 signal.fields 不应为空"
+    hits = _new_daily_hits(_gen(1), tmp_path)
+    assert hits, "夹具须含正例 (防空转假绿)"
+    for key, p in hits.items():
+        assert set(p["extra"]) - {"buy_mode"} == declared, (key, sorted(p["extra"]))
+
+
 def test_g56_has_positive_signals():
     """防空转：固定种子集必须含真实正例。"""
     hub = pytest.importorskip("app.market_cn.auto.core.data.hub")

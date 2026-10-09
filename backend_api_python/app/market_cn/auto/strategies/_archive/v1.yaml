@@ -1,15 +1,16 @@
 # ================================================================
-# V1 追板策略 (D0四因子 → 次日开盘买入) — IDE 门表单文件 (M2)
-# 策略停用中(C裁定2026-10-08无兼容模式); day_flow=启用时判定路径, 启用前须迁折叠契约并与 core.replay 对拍 (见 tmp/_v1_equivalence.py)
+# V1 追板策略 (D0四因子 → 次日开盘买入) — IDE 门表单文件
+# 策略停用中 (enabled=false); 启用前须迁折叠契约 (init_state/step/evaluate)。
 # ================================================================
 meta:
   name: V1
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 1
+  enabled: false                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: day             # 枚举方式: 逐日候选 → D0 信号 → 次日开盘入场 (区别于 dragon 的 lu_idx 遍历)
-  day_flow: v1                 # day 流程口径 (信号展示字段集); relay3 用 relay3
-  day_start: 25                # 逐日起点 (镜像 v1.backtest_stock 的 range(25, n-1))
-  day_min_n: 30                # 低于此长度直接返回空 (镜像 v1 的 n<30 早返回)
+  day_flow: v1                 # day 流程口径 (信号展示字段集)
+  day_start: 25                # 逐日起点
+  day_min_n: 30                # 低于此根数直接返回空
   # 说明: 本策略无 lu_idx 依赖 (信号在 D0 当日判定), 引擎逐日枚举决策日 i,
   # 门表一次性求所有门; 入场/出场由 entry_modes / exit_modes 按本文件 entry/exit 块选择。
 
@@ -18,7 +19,7 @@ entry:
   price: open                 # 成交价基准 = D1 开盘价
   gap_min: {main: min_gap_main, gem_star: min_gap_gem}   # 值可引用 params 名 → 保留网格可扫
   gap_max: {gem_star: gem_gap_max}
-  # ⚠ 前视 (2026-09-30): d1_change 是 D1 收盘值, 用它淘汰 D1 开盘入场 = 未来信息;
+  # ⚠ 前视: d1_change 是 D1 收盘值, 用它淘汰 D1 开盘入场 = 未来信息;
   #   实盘语义是「D2 开盘清仓」(confirm_decision weak), 已由 exit v1_combo 的 pre_exit 实现。
   #   默认 false = 对齐实盘。置 true 仅用于复现旧回测口径做对照。
   require_d1_close_up: false
@@ -30,7 +31,7 @@ exit:
   trail: -5.0                 # 追踪止损 % (自入场后峰值回撤)
   max_hold: 7                 # 到期天数
 
-params:                        # 与 strategies/v1.py PARAMS 默认同值 (逐笔等价基线)
+params:                        # 可调参数 (表达式直接引用)
   ret_20d_min: 30.0
   d_1_pullback_min: -10.0
   d_1_pullback_max: -3.0
@@ -50,11 +51,11 @@ params:                        # 与 strategies/v1.py PARAMS 默认同值 (逐�
 # v1 无 lu_idx 依赖 → 全部为 qualify (决策日一次性求值); required 列仅保留 schema 兼容
 gates:
   - {id: g_priced, name: 数据有效, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "close(-1) > 0 and close(-2) > 0"}      # 镜像 v1 顶部 d_1/d_2 close<=0 早返回
+     expr: "close(-1) > 0 and close(-2) > 0"}      # D-1/D-2 收盘价有效
   - {id: g_lu, name: D0近似涨停, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "is_approx_limit_up()"}                 # 镜像 v1 因子1 (0.98x 板块阈值近似)
+     expr: "is_approx_limit_up()"}                 # 因子1 (0.98x 板块阈值近似)
   - {id: g_ret20, name: 20日涨幅, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "ret_n(20) >= ret_20d_min"}             # 镜像 v1 因子2 (i<20 或 close<=0 → ret_n 返 -1e9 拦截)
+     expr: "ret_n(20) >= ret_20d_min"}             # 因子2 (i<20 或 close<=0 → ret_n 返 -1e9 拦截)
   - {id: g_pullback, name: D-1回调, role: qualify, needs_d0: 0, enabled: 1,
      expr: "chg(-1) >= d_1_pullback_min and chg(-1) < d_1_pullback_max"}  # 因子3 [-10%,-3%)
   - {id: g_obv, name: OBV上升, role: qualify, needs_d0: 0, enabled: 1,

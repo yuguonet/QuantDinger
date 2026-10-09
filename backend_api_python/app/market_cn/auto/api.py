@@ -1,6 +1,6 @@
 """api.py (原 dragon_api.py) — 自动策略组信号 API (蓝图, 挂载于 /api/market)
 
-覆盖策略: dragon_callback(龙回头·方案2) / v1 / break(断板) / relay3(3板接力)
+覆盖策略: dragon_callback(龙回头·方案2) / break(断板) / g56(五重共振) / knife_catch(反向接刀) / tail_oversold(尾盘超卖)
 
 端点:
   GET /api/market/dragon/today   今日分层信号: action(买入/持仓/卖出) + watch(观察池)

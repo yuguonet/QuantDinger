@@ -11,12 +11,14 @@
     保证与旧报告数字可比；
   - 参数敏感性: **复用 tools/param_scan.py** 的 `_auto_grid` / `_seg_stats`（可选段）；
   - 信号级复验: 不在此工具内跑, 由 proposal.validate 走 tools/pool_check.py (红线②)。
-  - 与 rule_audit/param_scan 不同点: 本工具走 **门表路径**(core/runtime/evaluate.run_backtest),
-    而非插件 + RULE_DEFS 路径 —— 这正是 M5 后新架构的主路径。
+  - 与 rule_audit/param_scan 不同点: 本工具走 **门表路径**, 而非插件 + RULE_DEFS 路径 ——
+    这正是 M5 后新架构的主路径。终态② Step 3 (2026-10-09) 起, 门向量改由 **事件流投影**
+    (core.replay + GateDebugCollector) 采集, 与回测主路径完全同源; 无折叠契约的策略
+    (无折叠契约的策略) 不再支持 explain (链 A run_backtest 已退役)。
 
-数据来源 (M6-1 新增诊断钩子):
-  `run_backtest(..., gate_dbg=cb)` 在 **gate_dbg=None 时零开销**; 非 None 时每次门求值额外
-  回调全门布尔向量 `cb(phase, code, i, lu_idx, {gate_id: bool})`。本工具按 (股, 决策日) 聚合。
+数据来源 (M6-1 诊断钩子 / Step 3 迁移):
+  replay 侧 `GateDebugCollector` 在每次门求值时收集全门布尔向量 `(phase, code, i, lu_idx, vec)`,
+  本工具按 (股, 决策日) 聚合。旧 `run_backtest(..., gate_dbg=cb)` 通道随链 A 一并退役。
 
 命令:
   python -m app.market_cn.auto.tools.explain --strategy dragon_callback --days 300
@@ -59,39 +61,12 @@ _PHASES = ("qualify", "decision", "all")
 
 
 # ================================================================
-# 门向量采集 (gate_dbg 回调)
+# 门向量采集
+# ----------------------------------------------------------------
+# 终态② Step 3 (2026-10-09): 原 `GateCollector`(链 A run_backtest 的 gate_dbg 回调聚合器)
+# 已退役 —— 门向量改由 core/replay/gate_dbg.GateDebugCollector 在**事件流投影**侧采集
+# (聚合语义逐位一致; core 不 import tools, 故为独立实现)。
 # ================================================================
-
-class GateCollector:
-    """按 (code, 决策日索引) 聚合门向量。
-
-    limit_up 类: 同一天会先 fire qualify (一次) 再 fire decision (每个 lu 候选一次, 命中即 break)。
-    day 类: 每天只 fire all (一次)。
-    聚合规则: all 直接取; 否则 qualify 打底 + decision 覆盖 (decision 保留最后一次 = 决定该日
-    结论的那次尝试)。
-    """
-
-    def __init__(self):
-        self.by_key = {}      # (code, i) -> {phase: vec}
-
-    def __call__(self, phase, code, i, lu_idx, vec):
-        d = self.by_key.setdefault((code, i), {})
-        d[phase] = dict(vec)
-
-    def merged(self):
-        """→ {(code, i): {gate_id: bool}} (仅当日至少 fire 过一次的键)。"""
-        out = {}
-        for key, d in self.by_key.items():
-            if "all" in d:
-                out[key] = dict(d["all"])
-                continue
-            v = {}
-            if "qualify" in d:
-                v.update(d["qualify"])
-            if "decision" in d:
-                v.update(d["decision"])
-            out[key] = v
-        return out
 
 
 def _first_false(gate_order, vec):
@@ -107,16 +82,27 @@ def _first_false(gate_order, vec):
 # ================================================================
 
 def run_explain_backtest(spec, days, codes, sample_codes=0, seed=42, progress_every=0):
-    """按门表路径跑回测, 采集 (rows, trades, pool_mode)。
+    """跑事件流投影 (replay) 采集 (rows, trades, pool_mode)。
 
     rows: 每行 = 一个 (股, 决策日) 的门向量 + 标签 (供漏斗/rule_audit 消费)。
-    trades: 门表回测实际成行的交易 (供两段稳定性/最终池)。
+    trades: 事件流折叠实际成行的交易 (供两段稳定性/最终池)。
     """
     from app.market_cn.auto.core.data.hub import all_codes
     from app.market_cn.auto.core.data.kline import fetch_klines_batch
     from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
-    from app.market_cn.auto.core.runtime.evaluate import run_backtest
     from app.market_cn.auto.probe import sample_feats
+    from app.market_cn.auto import strategies as strat_reg
+    from app.market_cn.auto.strategies.base import _has_fold_contract
+    # 终态② Step 3 (2026-10-09): 门向量只经**事件流投影**采集 (replay + GateDebugCollector),
+    # 与回测主路径同源。链 A `run_backtest` 已退役 ⇒ 无折叠契约的策略无采集通道 —— 显式
+    # 拒绝, 不再静默退化 (2026-10-09 P6-6/7 退役 v1/relay3/lead_chase 后当前无此类策略)。
+    strat = strat_reg.get_strategy(spec.key)
+    if strat is None or not _has_fold_contract(strat):
+        raise RuntimeError(
+            f"策略 {spec.key} 无折叠契约 (init_state/evaluate/step)，explain 的门诊断依赖"
+            f"事件流投影；链 A (run_backtest) 已退役 ⇒ 无门向量采集通道。请改用已迁移折叠"
+            f"契约的策略 (dragon_callback/break/knife_catch/tail_oversold/g56)，或先为该"
+            f"策略迁移折叠契约。")
 
     gate_order = [g.id for g in spec.enabled_gates]
     if codes is None:
@@ -146,10 +132,21 @@ def run_explain_backtest(spec, days, codes, sample_codes=0, seed=42, progress_ev
         if not bars or len(bars) < 5:
             continue
         si = si_map.get(code) if si_map else None
-        coll = GateCollector()
-        trades.extend(run_backtest(bars, code, spec, stock_info=si,
-                                   use_prefilter=True, gate_dbg=coll) or [])
-        merged = coll.merged()
+        # 终态② Step 3: 门向量只经事件流投影采集（replay + GateDebugCollector，与主路径同源）。
+        from app.market_cn.auto.core.replay import (
+            DailyFeed, GateDebugCollector, TradesCollector, replay)
+        gc = GateDebugCollector(code=code)
+        if hasattr(strat, "prewarm"):
+            from app.market_cn.auto.core.features.cross_section import (
+                _ensure_pool_daily)
+            _pool = _ensure_pool_daily(str(bars[-1]["time"])[:10])
+            feed = DailyFeed(bars, ctx_provider=lambda i, b: {"_day": {"pool": _pool}})
+        else:
+            feed = DailyFeed(bars)
+        res = replay(strat, code, feed,
+                     collectors=[TradesCollector(code=code, strategy=spec.key), gc])
+        trades.extend(res.trades or [])
+        merged = res.gates
         for (c, i), vec in merged.items():
             if i < 0 or i >= len(bars):
                 continue
@@ -214,16 +211,25 @@ def build_sensitivity(spec, days, codes, sample_codes, seed, only, max_combos):
 
     → {param: [{"value":..., "n":..., "winrate":..., "avg_ret":..., "two_seg":...}, ...]}。
     复用 param_scan._auto_grid 生成切片 (与 param_scan 同规则)。组合超 max_combos → 截断。
+
+    ⚠ 终态② Step 3 (2026-10-09): 参数覆写改走**实例级 default_params** (与 param_scan
+    同机制) —— 链 A `run_backtest(spec.params 直改)` 已退役。判定引擎单源到
+    `StrategyBase.backtest_stock` (薄壳→replay); 参数经 `StrategyBase.params` 合并生效。
+    无折叠契约的策略不参与敏感性 (与 run_explain_backtest 同口径拒绝; 当前无此类)。
     """
     from app.market_cn.auto.core.data.hub import all_codes, daily
     from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
-    from app.market_cn.auto.core.runtime.evaluate import run_backtest
+    from app.market_cn.auto import strategies as strat_reg
+    from app.market_cn.auto.strategies.base import _has_fold_contract
     from app.market_cn.auto.tools.param_scan import _auto_grid, _seg_stats
 
     grid, skipped = _auto_grid(spec.params, only=only)
     if not grid:
         return {}, skipped
-    base = dict(spec.params)
+    strat = strat_reg.get_strategy(spec.key)
+    if strat is None or not _has_fold_contract(strat):
+        return {}, list(skipped or []) + [f"{spec.key}: 无折叠契约, 跳过参数敏感性"]
+    base_eff = dict(strat.params(None))     # 基准=实例生效参数 (param_scan 同口径)
     if codes is None:
         allc = sorted(all_codes())
         codes = (random.sample(allc, min(sample_codes, len(allc)))
@@ -239,7 +245,8 @@ def build_sensitivity(spec, days, codes, sample_codes, seed, only, max_combos):
             bars = daily(code, days)
             if not bars or len(bars) < 5:
                 continue
-            trs.extend(run_backtest(bars, code, spec, stock_info=si_map.get(code)) or [])
+            trs.extend(strat.backtest_stock(bars, code,
+                                            stock_info=si_map.get(code)) or [])
         return trs
 
     out = {}
@@ -249,7 +256,7 @@ def build_sensitivity(spec, days, codes, sample_codes, seed, only, max_combos):
         for v in vals:
             if n_run >= max_combos:
                 break
-            spec.params = {**base, kdim: v}
+            strat.default_params = {**base_eff, kdim: v}   # 实例级覆写 (finally 还原)
             try:
                 trs = _run_one()
                 (wr1, avg1), (wr2, avg2) = _seg_stats(trs)
@@ -261,7 +268,7 @@ def build_sensitivity(spec, days, codes, sample_codes, seed, only, max_combos):
                     "avg_ret": round(sum(rets) / len(rets), 2) if rets else None,
                     "seg1_avg": avg1, "seg2_avg": avg2})
             finally:
-                spec.params = dict(base)
+                strat.__dict__.pop("default_params", None)     # 还原实例覆写
             n_run += 1
     return out, skipped
 
@@ -400,9 +407,15 @@ def main():
 
     print(f"explain {args.strategy} days={args.days} label={args.label} peak={args.peak} "
           f"| market={spec.market_key} | 门 {len(spec.enabled_gates)} 道", flush=True)
-    rows, trades, run_meta = run_explain_backtest(
-        spec, args.days, codes, sample_codes=args.sample_codes, seed=args.seed,
-        progress_every=args.progress_every)
+    try:
+        rows, trades, run_meta = run_explain_backtest(
+            spec, args.days, codes, sample_codes=args.sample_codes, seed=args.seed,
+            progress_every=args.progress_every)
+    except RuntimeError as e:
+        # 终态② Step 3: 无折叠契约的策略显式拒绝, 退出码 2 (现无此类; 退役策略见 _archive/)
+        # (与 rule_stats/rule_audit 的引导性报错同惯例)。
+        print(f"[explain] {e}", file=sys.stderr)
+        return 2
     run_meta["days"] = args.days
     if not rows:
         print("无门向量样本 (检查策略/窗口/股票池)", file=sys.stderr)

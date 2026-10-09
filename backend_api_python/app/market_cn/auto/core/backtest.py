@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""auto/backtest.py — 框架内全市场回测流水线 (B 阶段, 2026-09-09; 09-10 分发插件化)
+"""auto/backtest.py — 框架内全市场回测流水线 (薄编排: 全市场循环 → 取数 → 结算统计)
 
-用途: 把 test_dragon.py 的"全市场回测流水线"收进框架。本文件只做**薄编排**:
-     全市场循环 → 取数 → 出场/统计 (日线主路径见 run_all docstring)。
+日线主路径 (daily_close 类): `run_all` 逐票调 `StrategyBase.backtest_stock`
+(薄壳 → core.replay 事件流折叠), 与生产/调试/golden 同源 —— 编排层无规则
+(门/去重/出场都在策略折叠契约内)。
 
-2026-10-08 (P6 切口 2 facade):
-  - daily_close 主路径 = `core.replay_batch`（折叠契约单编排, 与生产/golden 同源）;
-  - `probe≠None` 过渡走策略 `backtest_stock` 钩子（rule_stats/rule_audit 采样依赖）;
-  - 策略覆写删除与参照物切换见 docs/P5收口执行记录.md 方案修订草案①（待批）。
-
-历史设计点 (仍生效的部分):
+设计点:
   - 数据走 hub.daily / fetch_klines_batch (同窗口+同 qfq+同 as-of, 已验证等价);
-  - 编排层无规则: 门/去重/出场都在策略 evaluate (replay) 或钩子 (probe 过渡) 内;
-  - run_all_intraday 仍是独立时间线引擎 (P1.5 未接入 IntradayFeed)。
+  - run_all_intraday 已是**薄适配器**（2026-10-09 偏离2）并已 **canonical 化**（P6-1）:
+    委托 `IntradayFeed` + `core.replay` 折叠，直接产出 canonical trade（与日线 `run_all`
+    同格式, `trade_map.build_trade`）—— 不再有第二套时间线编排, 也不再还原旧 trade 形状。
 
 易错点:
   - 枚举终点 n-1: 最后一根无 D+1, 不能做 D0 (约定在策略侧循环内);
@@ -47,7 +44,15 @@ def _run_meta(strat, days, start_date, end_date):
     except Exception:
         sha = "unknown"
     try:
-        params = strat.params(None)
+        # 参数事实源 (2026-10-09 终态②/B-D3): 有 yaml 宏的策略 = **yaml params**
+        # (判定/出场真正消费的那份); 无 yaml 的遗留策略退回 self.params()。
+        # 原实现只读 self.params() ⇒ 对日线策略记录的是 py 常量, 与实际生效值脱节
+        # (溯源元信息失真的静默陷阱)。
+        try:
+            from app.market_cn.auto.core.runtime.evaluate import load_strategy
+            params = dict(load_strategy(strat.key).params)
+        except Exception:
+            params = strat.params(None)
     except Exception:
         params = {}
     return {"git_sha": sha, "strategy": strat.key, "days": days,
@@ -61,13 +66,12 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
     """全市场回测 (策略经注册表分发, 按 scan_spec.kind 选路径)。
 
     strategy: 任意已注册策略 key。
-      - daily_close 类: **主路径 = core.replay_batch**（P6 切口 2 facade, 2026-10-08）——
-        折叠契约单编排, 与生产/调试/golden 同源; `use_prefilter` 对此路径为 no-op
-        (U1~U4/门已内联在策略 evaluate, P5-② 投影对拍已证等价)。
-        ⚠ 过渡: ``probe≠None`` 仍走策略 ``backtest_stock`` 钩子 (rule_stats/rule_audit
-        依赖钩子内 scan_signals(probe=) 产 sample) —— P2 尾巴迁完后删此分支与旧循环。
-      - intraday_window 类 (tail/knife): 时间线引擎 (1m 快照帧重建, 与实盘同判定路径)。
-    probe: 调试探针 (probe.Probe, None=关闭)。回测只负责验证, 探针数据存档供 AI 分析。
+      - daily_close 类: 逐票调 ``StrategyBase.backtest_stock``（薄壳 → core.replay 折叠,
+        与生产/调试/golden 同源）。``use_prefilter`` 与 ``probe`` 对此路径均为 no-op
+        (U1~U4/门已内联在策略 evaluate; 采样已迁实盘侧 sampler.LiveSampler)。
+      - intraday_window 类 (tail/knife): **薄适配器 → IntradayFeed + core.replay**
+        (与实盘/展示同判定路径, 见 run_all_intraday)。
+    probe: 调试探针 (probe.Probe, None=关闭)。仅 intraday_window 路径使用, daily_close 忽略。
     exec_engine (P4, 2026-09-21): **回测成交口径** (入口参数, 不污染 scan_spec.kind):
       - ``None`` / ``"daily"`` = 日线腿 (replay 零行为; 过渡钩子=旧枚举);
       - ``"intraday"`` / ``"auto"`` = 日线初筛 + **1m 真实腿精修出场** (分段式), 逐笔标注
@@ -112,50 +116,30 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
 
     trades = []
     n_ok = 0
-    # ---- P6 切口 2 facade: probe=None 主路径走 replay_batch ----
-    from app.market_cn.auto.strategies.base import _has_fold_contract
-    use_replay = probe is None and _has_fold_contract(strat)
-    if use_replay:
-        from app.market_cn.auto.core.replay import TradesCollector, replay_batch
-        bars_map = {}
-        for k, code in enumerate(codes, 1):
-            if is_st_stock(code):
-                continue
-            bars = _bars_batch.get(code) or daily(code, days)
-            if not bars:
-                continue
-            bars_map[code] = bars
-            n_ok += 1
-            if progress_every and k % progress_every == 0:
-                print(f"[{k}/{len(codes)}] loaded={len(bars_map)} "
-                      f"({time.time() - t0:.0f}s)", flush=True)
-        skey = strat.key or strategy
-        collectors = {c: [TradesCollector(c, skey)] for c in bars_map}
-        results = replay_batch(strat, bars_map, collectors=collectors)
-        for r in results.values():
-            trades.extend(r.trades or [])
-    else:
-        # 过渡分支: probe 采样依赖旧钩子内 scan_signals(probe=) —— P2 尾巴迁完删
-        for k, code in enumerate(codes, 1):
-            if is_st_stock(code):
-                continue
-            bars = _bars_batch.get(code) or daily(code, days)
-            if not bars:
-                continue
-            trades.extend(strat.backtest_stock(
-                bars, code,
-                stock_info=stock_info.get(code) if stock_info else None,
-                use_prefilter=use_prefilter, probe=probe) or [])
-            n_ok += 1
-            if progress_every and k % progress_every == 0:
-                print(f"[{k}/{len(codes)}] trades={len(trades)} "
-                      f"({time.time() - t0:.0f}s)", flush=True)
+    # ---- 主路径 = 事件流折叠 (终态② Step 2, 2026-10-09): 统一走 backtest_stock(薄壳→replay) ----
+    # 不再走 run_backtest（第二条判定+出场编排，Step 3 退役）。等价性:
+    # run_backtest == backtest_stock(薄壳→replay) 已由 _break/_g56_equivalence 逐笔验证。
+    # ⚠ probe 参数对 daily_close 已是 no-op（采样已迁 sampler.LiveSampler 实盘侧，
+    #   回测侧 probe 分支是死代码 —— rule_stats/rule_audit 的 run_all(probe=) 已改道）。
+    for k, code in enumerate(codes, 1):
+        if is_st_stock(code):
+            continue
+        bars = _bars_batch.get(code) or daily(code, days)
+        if not bars:
+            continue
+        trades.extend(strat.backtest_stock(
+            bars, code,
+            stock_info=stock_info.get(code) if stock_info else None,
+            use_prefilter=use_prefilter) or [])
+        n_ok += 1
+        if progress_every and k % progress_every == 0:
+            print(f"[{k}/{len(codes)}] trades={len(trades)} "
+                  f"({time.time() - t0:.0f}s)", flush=True)
 
     out = {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
            "elapsed": round(time.time() - t0, 1),
            "meta": _run_meta(strat, days, start_date, end_date)}
-    if use_replay:
-        out["engine"] = "replay"
+    out["engine"] = "replay"
     _eng = str(exec_engine or "daily").lower()
     if _eng in ("intraday", "auto") and trades:
         out["exec_engine"] = _eng
@@ -292,209 +276,139 @@ def _refine_intraday(strat, trades, bars_batch, daily_fn, *, days, start_date,
 
 
 # ================================================================
-# 时间线引擎 (intraday_window 类: 1m 快照帧重建, 与实盘同判定路径)
+# 盘中回测辅助 (intraday_window: 成交槽展开 / 薄适配器)
 # ================================================================
 
 def _exec_trigger_mis(spec):
-    """ScanSpec → 成交触发槽位列表 (entry_at 终审语义: 只回该时刻)。"""
+    """ScanSpec → 成交触发槽位列表。
+
+    扫描窗口 = ``[entry_at 或 windows[0], windows[1]]``, 按 ``interval_sec`` 逐槽展开;
+    窗口内**首个触发槽**即成交 —— 与生产 ``scan._scan_cycle`` 的 rolling_preview 同语义
+    (每分钟一轮, "14:50 起触发即买入", 先到先得)。
+
+    ⚠️ 易错点 (2026-10-09 D4 修正): 原实现对 ``entry_at`` 非空的策略**只回该单个槽位**
+    (旧措辞 "终审语义: 只回该时刻")。这与生产口径矛盾 —— ``entry_at`` 是 **最早可成交
+    时刻** (窗口起点), 非"唯一成交时刻" (见 ScanSpec 注释 + tail 2026-09-26 "14:50 起即可
+    买入")。只判单点会**系统性漏掉 entry_at 之后才触发的信号**: 实证 tail 000993 于 14:58
+    才触发, 折叠/生产均命中而时间线引擎漏计 ⇒ 回测少计信号。现统一为"整窗逐槽扫描取首个
+    触发", 与折叠 ``evaluate`` 的 ``[min_hhmm, 15:00]`` 回扫同构。
+    """
     from app.market_cn.auto.core.data.frames import hhmm_to_pos
-    if spec.entry_at:
-        mi = hhmm_to_pos(spec.entry_at)
-        return [mi] if mi >= 0 else []
     from app.market_cn.auto.sched import expand_times
+    if not spec.windows or len(spec.windows) < 2:
+        return []
+    first = spec.windows[0]
+    if spec.entry_at and spec.entry_at > first:
+        first = spec.entry_at          # entry_at = 最早可成交时刻 (不早于窗口起点)
+    if first > spec.windows[1]:
+        return []                      # entry_at 晚于窗口终点 ⇒ 无成交槽
     mis = []
-    for t in expand_times(spec.windows, spec.interval_sec):
+    for t in expand_times((first, spec.windows[1]), spec.interval_sec):
         mi = hhmm_to_pos(t)
         if mi >= 0 and mi not in mis:
             mis.append(mi)
     return sorted(mis)
 
 
+# ================================================================
+# 盘中回测 —— 主干折叠 (intraday_window: 委托 IntradayFeed + core.replay, 产 canonical trade)
+# ================================================================
+
 def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None,
                      progress_every=1, probe=None):
-    """intraday_window 策略全市场回测 (时间线引擎)。
+    """intraday_window 策略全市场回测 —— 主干折叠（委托 IntradayFeed + core.replay）。
 
-    数据通道混用: 1m 快照帧 (盘中判定+入场价) + 日线 (策略上下文 as-of D-1 / 次日开盘出场),
-    快照通道由 kline_1m 重建 (终审口径, 与 realtime_snapshot 有分钟级微差属已知边界)。
-    触发语义 "bar 开盘触发": 信息截至 p-1 收盘 + bar[p].open 已出现, 入场即 bar[p].open。
-    出场: 次交易日日线开盘价 (与 tail/knife 基线 "D1 开盘卖" 一致)。
-    probe: 调试探针 (None=零开销)。sample 由引擎按 (股,日) 聚合产出 — 每日每股只留
-    最晚触发槽位的评估记录 (数据外壳: stage/rule_trace 来自策略门打点 + ctx 摘要 +
-    以触发价为入场基准的 d1 开盘/收盘标签); shortlist 之外的廉价预筛拒绝不采样。
+    2026-10-09 偏离2: 旧独立时间线引擎已退役。P6-1: 旧 trade 形状还原层
+    （``_ReadyBag`` / ``_legacy_intraday_trade`` / ``trigger`` 载荷槽 /
+    ``exit_reason="d1_open"`` 文案）一并删除 —— 本函数直接产出 **canonical trade**
+    （``trade_map.build_trade`` 字段，与日线 ``run_all`` 同格式）。
+    判定/入场/出场全在策略 ``evaluate``（与展示/实时/生产同源，单主干）。
+
+    窗口语义: 折叠从「窗口起点前一交易日」起（避免首日 as-of 含当日=未来函数），
+    向后多留 ``_SETTLE_BUF`` 个交易日供 D1 出场结算，最后按 ``d0_date∈窗口`` 收口
+    （等价旧引擎「只在窗口日入场」）。
+
+    市场门 (knife 的 ``kc_mkt``): **逐槽 as-of** —— ``load_market_slots(lo_d, hi_d)``
+      逐日建全市场分钟帧、按槽取横截面均涨幅，与生产 ``scan._mkt_gain`` 同口径
+      （消除「用当日收盘门控 14:56 入场」的前视）；缺该日则回退日频 ``mkt_map``
+      （旧口径，仅兜底）。见 ``docs/市场门口径评估_20261009.md``。
+      成本: 每窗口交易日 1 次全市场建帧（npz 缓存），随窗口长度线性增长。
+
+    probe: 兼容旧签名（旧引擎 DayTrace 采样）；折叠路径采样改走 ``TraceCollector`` /
+      ``GateDebugCollector``（见 core/replay），本参数不再消费（保留=零破坏）。
     """
     from app.market_cn.auto.core.data import frames as fr
-    from app.market_cn.auto.core.data.hub import daily
-    from app.market_cn.auto.probe import DayTrace as _SlotTrace
+    from app.market_cn.auto.core.data.hub import all_codes, daily
+    from app.market_cn.auto.core.replay import TradesCollector, market_gain, replay
+    from app.market_cn.auto.core.replay.intraday import IntradayFeed
+
+    _SEED_BARS = 10        # 折叠起点: 窗口起点前 N 根日线 (供 init_state/as-of 切片)
+    _SETTLE_BUF = 15       # 窗口终点后 N 个交易日 (供 D1 出场结算; 覆盖长假)
 
     t0 = time.time()
     all_dates = fr.trading_dates(days_back=days, end=end_date)
-    dates = all_dates
     first_1m = fr.first_1m_date()
-    if first_1m:
-        dates = [d for d in dates if d >= first_1m]     # 1m 覆盖之前的天直接跳过 (空帧浪费)
+    dates = [d for d in all_dates if d >= first_1m] if first_1m else list(all_dates)
     if start_date:
         dates = [d for d in dates if d >= str(start_date)[:10]]
     if not dates:
         return {"trades": [], "stats": _summary([]), "codes_ok": 0, "elapsed": 0}
-    # 首日 prev_date: 取覆盖起点前一交易日 (2026-09-10 修复: 原首日 prev_date=date →
-    # as_of 含当日日线, 单日复现/窗口首日成未来函数, knife 单日 87笔 vs 窗口同日 52笔口径)
-    _i0 = all_dates.index(dates[0]) if dates[0] in all_dates else -1
-    _first_prev = all_dates[_i0 - 1] if _i0 > 0 else None
-    code_set = set(codes) if codes else None
-    mis = _exec_trigger_mis(strat.scan_spec)
-    if not mis:
-        raise ValueError(f"{strat.key}: scan_spec 无有效成交触发时刻 "
-                         f"(entry_at={strat.scan_spec.entry_at!r} windows={strat.scan_spec.windows})")
+    lo_d, hi_d = dates[0], dates[-1]
+    code_list = list(codes) if codes else all_codes()
 
-    pc_map = fr.prev_closes(dates[0])                   # {code: 前一1m日收盘(qfq)}
-    # ST 过滤与实盘 scan 同口径 (name 含 'ST' 排除, 含 *ST)
-    from app.market_cn.auto.core.data.hub import stock_info as _hub_stock_info
-    try:
-        _si = _hub_stock_info()
-    except Exception:
-        _si = {}
+    # 日线 (窗口 + 历史; 对齐旧引擎 `_daily_asof` 的 daily(code, 300))
+    bars_by_code = {}
+    for c in code_list:
+        try:
+            b = daily(c, 300)
+        except Exception:                               # noqa: BLE001
+            b = None
+        if b:
+            bars_by_code[c] = b
+    # 市场门 (knife 的 mkt_gate) —— **两层**（2026-10-09 评估后收口）:
+    #   ① **逐槽 as-of（正解）** = `load_market_slots`: 每个决策槽读**当时**的全市场
+    #      横截面（与生产 `scan._mkt_gain(snaps)` / `MinuteFrame.mkt_gain` 同口径）——
+    #      消除「用当日收盘门控 14:56 入场」的单向**前视**（见 docs/市场门口径评估_20261009.md）。
+    #   ② **日频 close 横截面（回退）** = `mkt_map`: 仅当 ① 缺该日（取数失败/无分钟帧）时
+    #      回落 —— 与旧口径一致，但保留前视（只作兜底，勿再当主源）。
+    # ⚠ mkt_map 必须是**全市场**横截面 —— 票池为子集时按子集算会因样本不足 (<min_n)
+    #   让 mkt_gain 缺失 ⇒ knife 的 kc_mkt 门 fail-closed ⇒ 静默零 trade (实测 36 票子集复现)。
+    from app.market_cn.auto.core.replay import load_market_gain
+    from app.market_cn.auto.core.replay.mkt_slots import load_market_slots
+    mkt_map = market_gain(bars_by_code) if not codes else load_market_gain(lo_d, hi_d)
+    mkt_slots = load_market_slots(lo_d, hi_d)
 
-    def _st_ok(code):
-        nm = (_si.get(code) or {}).get("name", "") or ""
-        return "ST" not in nm.upper()
-
-    # 日线 per-run memo (2026-09-10 提速): 同股跨槽位重复判定曾反复打库
-    # (实测 knife 151 天 37440 次幸存→37440 次 daily() 查询 ≈ 250s)。单次运行内
-    # fetch_kline_db 返回恒定 → memo 全量 bars + as_of 本地切片, 语义等价。
-    _daily_memo = {}
-
-    def _daily_asof(code, prev_date):
-        bars = _daily_memo.get(code)
-        if bars is None:
-            bars = _daily_memo.setdefault(code, daily(code, 300))
-        if prev_date:
-            return [b for b in bars if str(b["time"])[:10] <= str(prev_date)[:10]]
-        return bars
-
-    trades, seen = [], set()
-    dbg = {} if probe is not None else None   # debug: code -> 当日最晚槽位评估记录 (日终统一落盘)
-    for di, date in enumerate(dates):
-        frame = fr.build_frame(date)
-        if len(frame) == 0:
+    trades, n_ok = [], 0
+    for i, code in enumerate(code_list, 1):
+        bars = bars_by_code.get(code)
+        if not bars:
             continue
-        prev_date = dates[di - 1] if di > 0 else _first_prev
-        if prev_date is None:       # 覆盖起点前再无交易日 → 无日线上下文, 该日无法判定
+        idx = {str(b["time"])[:10]: j for j, b in enumerate(bars)}
+        win_pos = [j for d, j in idx.items() if lo_d <= d <= hi_d]
+        if not win_pos:
             continue
-        # 日级必要条件超集预筛 (策略钩子, 默认 None=不预筛): 平静日整日跳过,
-        # 免建 31 槽 × 全市场快照 (B 档提速; 钩子契约见 StrategyBase.day_prefilter)
-        day_sel = strat.day_prefilter(frame, pc_map)
-        if day_sel is not None:
-            day_sel = set(day_sel)
-            if code_set is not None:
-                day_sel &= code_set
-            if not day_sel:
-                if progress_every and (di + 1) % progress_every == 0:
-                    print(f"[{di + 1}/{len(dates)}] {date} 日级预筛=0 跳过 "
-                          f"累计={len(trades)} ({time.time() - t0:.0f}s)", flush=True)
-                pc_map = _rollover_pc(frame, pc_map)
+        lo = max(min(win_pos) - _SEED_BARS, 0)
+        hi = min(max(win_pos) + _SETTLE_BUF, len(bars) - 1)
+        feed = IntradayFeed(bars, code, lo=lo, hi=hi,
+                            mkt_map=mkt_map, mkt_slots=mkt_slots)
+        coll = TradesCollector(code, strat.key, exec_basis="1m")
+        res = replay(strat, code, feed, collectors=[coll])
+        for t in (res.trades or []):
+            d0 = str(t.get("d0_date") or "")[:10]
+            if not (lo_d <= d0 <= hi_d):                # 只收口窗口内入场 (对齐旧引擎)
                 continue
-        else:
-            day_sel = code_set
-        n_sig_day = 0
-        for mi in mis:
-            snaps = frame.snaps_at(mi, pc_map, codes=day_sel)
-            mkt = frame.mkt_gain(mi, pc_map)
-            short = strat.intraday_shortlist(snaps, mkt) or {}
-            for code, snap in short.items():
-                if (code, date) in seen or not _st_ok(code):
-                    continue                            # 每股每日首信号成交; ST 与实盘同排除
-                bars = _daily_asof(code, prev_date)   # 截至D-1 (插件契约: bars[-1]=昨日)
-                slot_tr = _SlotTrace() if probe is not None else None
-                sigs = strat.scan_signals(
-                    bars, code,
-                    ctx={"latest": snap, "series": frame.series(code, mi),
-                         "mkt_gain": mkt}, probe=slot_tr) or []
-                # U1~U4 统一预过滤 (与实盘 run_scan_knife / daily 回测 backtest_stock 同源;
-                # 锚点 prefilter_anchor)。仅声明 use_unified_prefilter=True 的策略走本段
-                # (knife/tail/g56 声明 False, 行为不变), 否则盘中回测会缺 U1~U4 而与其
-                # 实盘/日线回测口径分叉 (2026-09-20 收敛: 结构分叉 P0)。
-                # 2026-09-26 P0-4: 应用循环收编至 scan.apply_unified_prefilter。
-                from app.market_cn.auto.scan import apply_unified_prefilter
-                sigs, _ = apply_unified_prefilter(
-                    sigs, bars, code, _si.get(code), strat)
-                if probe is not None:
-                    from app.market_cn.auto.sampler import STAGE_RANK as _SR
-                    rank = _SR.get(getattr(strat, "key", "") or "", {})
-                    stage = max((t["stage"] for t in slot_tr.items),
-                                key=lambda s: rank.get(s, 0), default="no_gate")
-                    dbg[code] = {"code": code, "d0_date": date,
-                                 "trigger": frames_hhmm(mi), "stage": stage,
-                                 "rule_trace": slot_tr.items,
-                                 "ctx": {"mkt_gain": round(mkt, 2) if mkt is not None else None,
-                                         "last": round(float(snap.get("last") or 0), 3)},
-                                 "entry0": float(snap.get("last") or 0)}
-                if not sigs:
-                    continue
-                s = sigs[0]
-                seen.add((code, date))
-                entry_price = float(snap["last"])
-                if entry_price <= 0:
-                    continue
-                # 出场: 策略回调 (默认 = 次交易日开盘卖; 多日持有策略覆盖 intraday_exit)
-                full = _daily_asof(code, None)
-                ei = next((j for j, b in enumerate(full)
-                           if str(b["time"])[:10] == str(date)[:10]), None)
-                if ei is None:
-                    continue
-                ex = strat.intraday_exit(full, code, date, entry_price, entry_idx=ei)
-                if not ex:
-                    continue
-                # extra 先展开 → 引擎字段后覆盖 (buy_mode/exit_* 标签以引擎为准);
-                # tail/knife 的 extra 无键冲突 → 交易 dict 与基线逐字不变
-                _tr = {
-                    **(s.extra or {}),
-                    "code": code, "signal_date": date, "entry_date": date,
-                    "entry_price": round(entry_price, 3), "buy_mode": "intraday_trigger",
-                    "trigger": strat.scan_spec.entry_at or frames_hhmm(mi),
-                    "exit_date": ex.get("exit_date"), "exit_price": ex.get("exit_price"),
-                    "exit_day": ex.get("exit_day"), "exit_reason": ex.get("exit_reason"),
-                    "return_pct": ex.get("return_pct"),
-                }
-                # 峰值标签仅在策略给出时写入 (tail/knife 交易 dict 保持逐字不变, 基线可对数)
-                if ex.get("peak_return_pct") is not None:
-                    _tr["peak_return_pct"] = ex["peak_return_pct"]
-                trades.append(_tr)
-                n_sig_day += 1
-        # debug 样本日终落盘: 以触发价为入场基准, D+1 开盘/收盘为标签 (视野不足不硬凑)
-        if dbg:
-            for code, rec in dbg.items():
-                entry0 = rec.pop("entry0", 0)
-                labels = {}
-                if entry0 > 0:
-                    labels["entry_trigger"] = round(entry0, 3)
-                    full_d = _daily_asof(code, None)
-                    nxt = next((b for b in full_d if str(b["time"])[:10] > date), None)
-                    if nxt is not None and float(nxt["open"]) > 0:
-                        labels["ret_d1o"] = round((float(nxt["open"]) / entry0 - 1) * 100, 2)
-                        labels["ret_d1c"] = round((float(nxt["close"]) / entry0 - 1) * 100, 2)
-                probe.sample(labels=labels, **rec)
-            dbg.clear()
-        # pc_map 结转 (当日 1m 最后一根 close)
-        pc_map = _rollover_pc(frame, pc_map)
-        if progress_every and (di + 1) % progress_every == 0:
-            print(f"[{di + 1}/{len(dates)}] {date} shortlist后信号={n_sig_day} "
-                  f"累计={len(trades)} ({time.time() - t0:.0f}s)", flush=True)
-    return {"trades": trades, "stats": _summary(trades), "codes_ok": len(dates),
-            "elapsed": round(time.time() - t0, 1)}
+            trades.append(t)
+        n_ok += 1
+        if progress_every and i % progress_every == 0:
+            print(f"[{i}/{len(code_list)}] trades={len(trades)} ({time.time() - t0:.0f}s)",
+                  flush=True)
+    return {"trades": trades, "stats": _summary(trades), "codes_ok": n_ok,
+            "elapsed": round(time.time() - t0, 1), "engine": "replay"}
 
 
 def frames_hhmm(mi):
     from app.market_cn.auto.core.data.frames import MI_HHMM
     return MI_HHMM[mi] if 0 <= mi < len(MI_HHMM) else ""
-
-
-def _rollover_pc(frame, pc_map):
-    """pc_map 结转: 当日 1m 最后一根 close (跳过的日级预筛日也必须结转, 否则次日 pc 断链)。"""
-    for code in frame.codes:
-        lc = frame.last_close(code)
-        if lc > 0:
-            pc_map[code] = lc
-    return pc_map
 
 
 def _summary(trades):

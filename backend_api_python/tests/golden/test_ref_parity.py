@@ -78,9 +78,9 @@ pytestmark = pytest.mark.skipif(
     not _have_ref(),
     reason="AUTO_SLIM_REF 未设/无效 —— 外部参照对拍无证据，不算通过（§2.2.3）")
 
-# 盘中条目（intraday）不进本组：其旧侧是 run_all_intraday 时间线引擎（无
-# backtest_stock 钩子），外部参照子进程跑不出东西；它们的冻结交叉验证走
-# `freeze --check`（树内旧引擎），外部参照扩展到时间线引擎是后续项（P6 后）。
+# 盘中条目（intraday）不进本组：其旧侧走 `run_all_intraday` 折叠（无外部
+# backtest_stock 参照），外部参照子进程跑不出东西；它们的冻结交叉验证走
+# `freeze --check`（树内折叠源）。外部参照扩展到盘中折叠为后续项。
 _SPECS = [s for s in INPUT_SETS if not s.get("pooled") and not s.get("intraday")]
 
 

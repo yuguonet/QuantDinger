@@ -43,16 +43,15 @@ PROCEDURAL_PATTERNS = (
 #: 2026-10-08 P3-④ 批次下调：组装件（_probe_day）与 rank 表（PROBE_STAGE_RANK）
 #: 迁 probe.py（build_day_sample/STAGE_RANK），策略文件程序性符号大降。
 BASELINE = {
-    "base.py": 9,   # 2026-10-08 +1: legacy probe=probe 转发 (P2 尾巴, 随 legacy P6 删)
+    "base.py": 5,   # 2026-10-09 -4: 删 legacy 兜底引擎 _backtest_stock_legacy (含 probe=probe 转发)
     "dragon_callback.py": 14,
     "break.py": 9,
-    "v1.py": 4,
     "g56.py": 5,
-    "relay3.py": 4,
-    "lead_chase.py": 1,
     "knife_catch.py": 1,
     "tail_oversold.py": 0,
 }
+# 2026-10-09 P6-6/7: v1/relay3/lead_chase 退役归档 strategies/_archive/ ⇒ 从 BASELINE 移除
+# (本门禁要求 BASELINE 覆盖全部现存策略文件, 见 test_baseline_covers_all_strategy_files)。
 
 #: 已清零的文件（P3-④ 完成后逐个加入；一旦加入，回退即 FAIL）
 CLEANED: tuple = ("tail_oversold.py",)

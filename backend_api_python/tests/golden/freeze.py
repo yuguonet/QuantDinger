@@ -9,7 +9,8 @@
 ★ 冻结源（2026-10-08 批准切换）：**core.replay**（与对拍体合一）。
   原源 = `backtest_stock` 旧钩子（将删之物）。存量基线**不重冻**，继续作为
   冻结时点真相；golden 证 replay ≡ 存量基线 ⇒ 新源 `--check` 应一致。
-  盘中条目仍走 `run_all_intraday` 时间线引擎（P1.5 IntradayFeed 未接入，独立轨道）。
+  盘中条目（knife/tail）冻结源亦已改走折叠：`run_all_intraday` 现为**薄适配器**
+  （委托 `IntradayFeed` + `core.replay`，见下方 `_old_intraday_trades`），与对拍体同源。
 
 ★ 为什么必须「先冻结、后删除」：
   冻结后 `tests/golden/baselines/*.json` 就是不可变的真相源；`test_golden_parity`
@@ -57,7 +58,10 @@ CORE_ALWAYS_COMPARABLE = (
 
 
 def _project(raw: dict, bars: list[dict], code: str, strategy: str) -> dict:
-    """旧引擎 trade dict → canonical 比对字段。
+    """trade dict → canonical 比对字段。
+
+    兼容两套命名（旧 `signal_date`/`exit_rule` ↔ canonical `d0_date`/`exit_reason`）：
+    现冻结源已统一到 `core.replay`（canonical），旧名分支仅为存量基线/外部参照保留。
 
     `exit_date` 旧 dict 不带（dragon/break 均如此），按 `entry_date + (exit_day-1)`
     从 bars 推 —— 只做**搬运**，不做判定（trade_map 同一纪律）。
@@ -264,73 +268,28 @@ def freeze(check_only: bool = False) -> int:
 
 
 # ================================================================
-# P1.5-② 盘中条目旧侧：时间线引擎 + 合成帧（2026-10-08）
-# 来源：改进方案_v2.1 §4-P1.5-②。run_all_intraday 的数据面（帧/分钟/prev_close）
-# 全部合成 patch —— **取数接线，不是规则**（同 g56 池接线的归属原则）。
+# P1.5-② 盘中条目旧侧：**折叠源**（2026-10-09 偏离2 后与对拍体同源）
+# 旧独立时间线引擎已退役 ⇒ 盘中冻结源改走 `core.replay` + `IntradayFeed`（同对拍体），
+# 数据面（分钟/日线/市场门）全部合成 patch —— **取数接线，不是规则**（同 g56 池接线原则）。
 # ================================================================
-class _FakeFrame:
-    """MinuteFrame 面的最小仿体（run_all_intraday 实际用到的 6 个面）。
-
-    易错点: day_extremes 逐元素数组（day_prefilter 用 numpy 逐票判定）；
-    snaps_at 的 slot 语义 = 最后一根 <= 该 hhmm 的行（与 frames.frames_hhmm 同口径）。
-    """
-
-    def __init__(self, rows_by_code, mkt):
-        self._rows = {c: r for c, r in rows_by_code.items() if r}
-        self.codes = sorted(self._rows)
-        self._mkt = mkt
-
-    def __len__(self):
-        return len(self.codes)
-
-    def _at(self, code, mi):
-        from app.market_cn.auto.core.backtest import frames_hhmm
-        hh = frames_hhmm(mi)
-        row = None
-        for r in self._rows.get(code, []):
-            if str(r["time"])[11:16] <= hh:
-                row = r
-        return row
-
-    def snaps_at(self, mi, pc_map, codes=None):
-        out = {}
-        for c in (codes if codes is not None else self.codes):
-            r = self._at(c, mi)
-            if r is not None:
-                out[c] = r
-        return out
-
-    def series(self, code, mi):
-        from app.market_cn.auto.core.backtest import frames_hhmm
-        hh = frames_hhmm(mi)
-        return [r for r in self._rows.get(code, [])
-                if str(r["time"])[11:16] <= hh]
-
-    def mkt_gain(self, mi, pc_map):
-        return self._mkt
-
-    def day_extremes(self):
-        import numpy as np
-        do, dh, dl = [], [], []
-        for c in self.codes:
-            rs = self._rows[c]
-            do.append(float(rs[0]["last"]))
-            dh.append(max(float(r["high"]) for r in rs))
-            dl.append(min(float(r["low"]) for r in rs))
-        return np.asarray(do), np.asarray(dh), np.asarray(dl)
-
-    def last_close(self, code):
-        rs = self._rows.get(code) or []
-        return float(rs[-1]["last"]) if rs else 0.0
-
-
 def _old_intraday_trades(spec: dict) -> list[dict]:
-    """盘中条目的旧回测：run_all_intraday 时间线引擎（数据面合成 patch）。"""
+    """盘中条目的旧侧：`run_all_intraday`（主干折叠）→ 合成数据面 → canonical trades。
+
+    P6-1 后 `run_all_intraday` 直接产 canonical trade（不再是旧 trade 形状）；
+    `build()` 的 `_project` 负责投影到比对字段（含 `exit_reason` 标签→代码归一），
+    与日线条目同款 —— 冻结基线（`baselines/*.json`）不动，仍为不可变真相源。
+
+    市场门数据面同样 patch 两层（2026-10-09 逐槽 as-of）:
+      `load_market_gain`（日频回退）+ `load_market_slots`（逐槽）—— 两者都填**同一标量**
+      `mkt`，故逐槽序列 == 日频标量 ⇒ 冻结输出逐位不变（顺带覆盖新逐槽路径）。
+    """
     import unittest.mock as mock
 
     import app.market_cn.auto.core.backtest as bt
     import app.market_cn.auto.core.data.frames as fr_mod
     import app.market_cn.auto.core.data.hub as hub_mod
+    import app.market_cn.auto.core.replay as replay_mod
+    import app.market_cn.auto.core.replay.mkt_slots as mktslots_mod
     from app.market_cn.auto import strategies as reg
 
     reg.autodiscover()
@@ -340,26 +299,35 @@ def _old_intraday_trades(spec: dict) -> list[dict]:
     code = spec["code"]
     bars = spec["build"]()
     rows_by_date = spec["day_rows"]()
-    mkt, pc = spec["mkt_gain"], spec["pc"]
+    mkt = spec["mkt_gain"]
     dates = sorted(rows_by_date)
+    d0 = dates[0]
     # 引擎首日 as-of 语义（core/backtest.py 2026-09-10 修复）：trading_dates 必须
     # **含覆盖起点前一交易日**，否则 prev_date=None → as-of 含当日 = 未来函数。
-    d0 = dates[0]
     prev_td = [str(b["time"])[:10] for b in bars if str(b["time"])[:10] < d0][-1:]
 
-    def _prev_closes(d):
-        return {code: pc}
+    def _daily(c, n=300, **k):
+        return list(bars)
 
-    def _build_frame(d):
-        return _FakeFrame({code: rows_by_date[d]}, mkt) if d in rows_by_date \
-            else _FakeFrame({}, mkt)
+    def _load_minutes(c, start, end):
+        lo, hi = str(start)[:10], str(end)[:10]
+        return {d: rows for d, rows in rows_by_date.items() if lo <= d <= hi}
+
+    def _snap_series(date, rows, pc, lo_hhmm="09:31", hi_hhmm="15:00"):
+        # 合成行已是**快照形**（与生产 frame.snap 同形），直接透传（不再重建累计量）
+        return [dict(r) for r in rows]
 
     with mock.patch.object(fr_mod, "trading_dates",
                            lambda *a, **k: prev_td + dates), \
             mock.patch.object(fr_mod, "first_1m_date", lambda: None), \
-            mock.patch.object(fr_mod, "prev_closes", _prev_closes), \
-            mock.patch.object(fr_mod, "build_frame", _build_frame), \
-            mock.patch.object(hub_mod, "daily", lambda c, n=300, **k: list(bars)):
+            mock.patch.object(fr_mod, "load_code_minutes", _load_minutes), \
+            mock.patch.object(fr_mod, "snap_series", _snap_series), \
+            mock.patch.object(replay_mod, "load_market_gain",
+                              lambda *a, **k: {d0: mkt}), \
+            mock.patch.object(mktslots_mod, "load_market_slots",
+                              lambda *a, **k: {d0: {str(r["time"])[11:16]: mkt
+                                                    for r in rows_by_date[d0]}}), \
+            mock.patch.object(hub_mod, "daily", _daily):
         out = bt.run_all_intraday(strat, days=len(bars) + 5, codes=[code],
                                   start_date=str(bars[0]["time"])[:10],
                                   end_date=str(bars[-1]["time"])[:10])

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""tail_oversold.py — 尾盘超卖超短策略 (14:50 起滚动买入 → D1 开盘卖)
+"""tail_oversold.py — 尾盘超卖超短 (14:50 起滚动买入 → D1 开盘卖)。
 
-超卖反弹: 当日深跌 + 尾盘适度回落 + 贴近日内低位 + 近5日深度超卖 + 振幅大 → 次日开盘
-高概率反弹。D0 14:50~15:00 任一分钟触发即买, D1 开盘卖。规则来源 test_v2_tail_buy.py。
-回测 (2026-09-09~10 终审): N=275 胜率80.7% 均收+2.74%; 50天 56笔/87.5%/+5.28%/PL3.31。
-
+超卖反弹: 当日深跌 + 尾盘适度回落 + 贴近日内低位 + 近5日深度超卖 + 振幅大 → 次日
+开盘高概率反弹。D0 14:50~15:00 任一分钟触发即买, D1 开盘卖。规则来源 test_v2_tail_buy.py。
 入场五条件 (归一化 nf: 创/科板 0.5, 主板 1.0): ①非ST/非北交所/未封板 ②score>=8
 ③pre5*nf<=-10 ④amplitude*nf>=10 ⑤tail_ret*nf ∈ [-2.8,-0.5] (14:20~14:40 均价→触发时现价)。
-
-流程: 14:30 预热 → 14:50 起每分钟滚动判定/买入 (10 分钟窗, 先到先得)
-→ 15:01 确认持有 → D1 开盘卖。快速判定=两级管线: shortlist 用最新快照必要条件预筛
-(score>=8 数学蕴含 day_gain*nf<=-5; 盘中 low 只会更低 → 预览口径是终审超集), 幸存股
-(约10~50只) 才拉序列+日线完整判定。规则改动验证: `python -m app.market_cn.auto.core.backtest`
-框架对数 (test_dragon/test_v2 双同步约定已于 09-09 B 阶段对数 PASS 后作废)。
+流程: 14:30 预热 → 14:50 起每分钟滚动判定/买入 (10 分钟窗, 先到先得) → 15:01 确认持有
+→ D1 开盘卖。快速判定 = 两级管线: shortlist 用最新快照必要条件预筛 (预览口径是终审超集),
+幸存股 (约10~50只) 才拉序列+日线完整判定。
 
 易错点: 快照 open/high/low=当日累计值非分钟bar; bars[-1]=昨日 (1D 盘中未回填);
 分子原始价 vs 分母 qfq 日线除权日有偏差 (盘后以 kline_1m 复权口径为准);
 tail_ret 需 mi 199~219 槽位 ≥15 个; T+1 当日不可卖。
+
+回测终审数据 (N=275 胜率80.7% 均收+2.74% 等) → `docs/策略研究依据归档.md#tail_oversold`。
 """
 
 from app.market_cn.auto.strategies import register
@@ -348,64 +345,58 @@ class TailOversoldStrategy(StrategyBase):
                                    payload={}, next_realtime="14:50-15:00"))
         return events
 
-    def _gates(self, p, code, state, snap, series, probe=None):
-        """触发门 + 评分 —— **唯一实现** (scan_signals 与 evaluate 共用)。
+    def _gates(self, p, code, state, snap, series, probe=None, market=None):
+        """触发门 + 评分 —— **规则单源到 yaml 门表**（GateEvaluator 求门 + build_signal 产 extra）。
 
-        state=None 表示切片不可用 (bars 不足) ⇒ 在 tail_ret 之后按 data/bars_short 拒,
-        与旧 scan_signals 的判门位置一致。probe 仅 scan_signals 传。
+        判定/字段口径由 `strategies/tail_oversold.yaml` 的 `gates` + `signal.fields` 单源表达；
+        本方法只剩「建 Ctx → 求门 → 组 Signal」的适配职责（§3.1: .py 只提供词, 不改规则）。
+        probe 的 stage 名经 `_TO_GATE_STAGE` 映射回旧 taxonomy（离线采样/调试口径不变）。
+        state=None 表示切片不可用 (bars 不足) ⇒ `to_data` 门按 data/bars_short 拒。
         """
+        from app.market_cn.auto.core.runtime.evaluate import GateEvaluator, build_signal
+        from app.market_cn.auto.core.runtime.expr import evaluate as _eval_expr
+        from app.market_cn.auto.core.runtime.functions import build_funcs
+        spec = _to_spec()
         last = float(snap.get("last") or 0)
         high = float(snap.get("high") or 0)
         low = float(snap.get("low") or 0)
         pc = float(snap.get("previousClose") or 0)
+        # 数据合法性守卫（旧实现在任何 probe 之前就返回 ⇒ 保持「无 probe」语义）
         if last <= 0 or pc <= 0 or high <= 0 or low <= 0 or high <= low:
             return None
-        if _hhmm(snap.get("time") or "") < p["min_hhmm"]:  # 预览窗口起点前不出信号
-            if probe:
-                probe("window", hhmm=_hhmm(snap.get("time") or ""))
-            return None
-        if last >= round(pc * (1 + _limit_pct(code)), 2) * 0.998:   # 封板买不进
-            if probe:
-                probe("limit", last=round(last, 3))
-            return None
-        nf = _norm_factor(code)
-        day_gain = (last / pc - 1) * 100            # 快照口径: high/low=当日累计极值
-        amplitude = (high - low) / pc * 100
-        pos_range = (last - low) / (high - low)
-        tail_ret = _tail_ret_v2(series)
-        if tail_ret is None:
-            if probe:
-                probe("data", reason="tail_ret")
-            return None
         closes = [w["c"] for w in (state or {}).get("win") or []]
-        if len(closes) < _MIN_AGE or closes[-5] <= 0:   # bars[-1]=昨日, 分母=D-5收盘
-            if probe:
-                probe("data", reason="bars_short")
-            return None
-        pre5_gain = (last / closes[-5] - 1) * 100
-        score = _calc_score(day_gain, tail_ret, pos_range, amplitude, pre5_gain, nf)
-        if score < p["score_min"] or pre5_gain * nf > p["pre5_max"] \
-                or amplitude * nf < p["amp_min"] \
-                or not (p["tail_lo"] <= tail_ret * nf <= p["tail_hi"]):
-            if probe:
-                probe("v2", score=round(score, 2), pre5_gain=round(pre5_gain, 2),
-                      amplitude=round(amplitude, 2), tail_ret=round(tail_ret, 2),
-                      pos_range=round(pos_range, 3))
-            return None
-        if probe:
-            probe("signal", score=round(score, 2))
-        tier = "high" if score >= SCORE_HIGH_MIN else "base"
+        board = get_board_type(code, market)
+        ctx = Ctx([], 0, lu_idx=0, params=p, board_type=board, code=code, latest=snap,
+                  series=series or [], ext={"to_closes": closes}, market=spec.market_spec)
+        gates = spec.enabled_gates
+        if probe is not None:
+            funcs = build_funcs(ctx, spec.key, spec.func_names)
+            for g in gates:
+                try:
+                    passed = bool(_eval_expr(g.expr, p, funcs))
+                except Exception:
+                    passed = False
+                if not passed:
+                    probe(_TO_GATE_STAGE.get(g.id, g.id),
+                          **_to_probe_kw(g.id, _to_cache(ctx), last))
+                    return None
+        else:
+            ev = GateEvaluator(spec, board_type=board, code=code)
+            ok, _failed = ev.evaluate_all([], 0, p, ctx=ctx)
+            if not ok:
+                return None
+        cache = _to_cache(ctx)
+        score = float(cache["score"])
         ps = pred_score(score, code)
+        tier = "high" if score >= SCORE_HIGH_MIN else "base"
+        if probe is not None:
+            probe("signal", score=round(score, 2))
         return {
             "time": str(snap.get("time") or "")[:10],
             "price": last, "score": ps,
-            "label": (f"尾盘超卖 gain={day_gain:.1f}% tail={tail_ret:+.2f}% "
-                      f"pos={pos_range:.2f} 预测分={ps} v2={score:.1f} [{tier}]"),
-            "extra": {"gain": round(day_gain, 2), "amplitude": round(amplitude, 2),
-                      "pos_range": round(pos_range, 3), "tail_ret": round(tail_ret, 2),
-                      "pre5_gain": round(pre5_gain, 2), "v2_score": round(score, 2),
-                      "pred_score": ps,
-                      "pred_exp_ret": round(_v2_to_exp_ret(score), 2), "tier": tier},
+            "label": (f"尾盘超卖 gain={cache['day_gain']:.1f}% tail={cache['tail_ret']:+.2f}% "
+                      f"pos={cache['pos_range']:.2f} 预测分={ps} v2={score:.1f} [{tier}]"),
+            "extra": build_signal(ctx, spec),
         }
 
     def realtime_shortlist(self, codes, snaps, mkt_gain=None, stage=None):
@@ -541,7 +532,11 @@ def _to_hhmm(s) -> str:
 
 
 def _to_cache(ctx: Ctx) -> dict:
-    """tail 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 数据助手。"""
+    """tail 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 数据助手。
+
+    日线 close 来源: 优先 `ctx.ext["to_closes"]`（`_gates` 注入的 state.win close 序列，
+    折叠路径无 bars 也可用）；无则回退 `ctx.bars` 的 close —— 两条来源同源, 值逐位一致。
+    """
     cache = ctx.__dict__.get("_to_cache")
     if cache is not None:
         return cache
@@ -562,7 +557,9 @@ def _to_cache(ctx: Ctx) -> dict:
         cache["pos_range"] = (last - low) / (high - low)
         tr = _to_tail_ret_v2(ctx.series or [])
         cache["tail_ret"] = float("nan") if tr is None else tr
-        closes = [float(b["close"]) for b in (ctx.bars or [])]
+        ext = ctx.ext or {}
+        closes = ext["to_closes"] if "to_closes" in ext \
+            else [float(b["close"]) for b in (ctx.bars or [])]
         if len(closes) >= 6 and closes[-5] > 0:
             cache["pre5_gain"] = (last / closes[-5] - 1) * 100
             cache["score"] = _to_calc_score(cache["day_gain"], cache["tail_ret"],
@@ -592,8 +589,66 @@ def to_ok(ctx: Ctx, name: str) -> int:
     v = float(_to_cache(ctx).get(name, float("nan")))
     return 0 if v != v else 1        # nan != nan → 不可用
 
+
+_SPEC: dict = {}
+
+
+def _to_spec():
+    """tail_oversold 门表 StrategySpec 单例缓存（判定单源到 yaml 门表后 `_gates` 用它求门）。"""
+    if "tail_oversold" not in _SPEC:
+        from app.market_cn.auto.core.runtime.evaluate import load_strategy
+        _SPEC["tail_oversold"] = load_strategy("tail_oversold")
+    return _SPEC["tail_oversold"]
+
+
+#: 门 id → 旧 probe stage 名（保 probe taxonomy 逐字不变；见 sampler.STAGE_RANK["tail_oversold"]）
+_TO_GATE_STAGE = {
+    "to_window": "window", "to_limit": "limit", "to_data": "data", "to_v2": "v2",
+}
+
+
+def _to_probe_kw(gate_id, cache, last):
+    """门 id → 旧 `_gates` 的 probe kwargs（逐字对齐旧口径）。"""
+    if gate_id == "to_window":
+        return {"hhmm": cache.get("hhmm", "")}
+    if gate_id == "to_limit":
+        return {"last": round(last, 3)}
+    if gate_id == "to_data":
+        v = cache["tail_ret"]
+        return {"reason": "tail_ret" if v != v else "bars_short"}
+    if gate_id == "to_v2":
+        return {"score": round(cache["score"], 2),
+                "pre5_gain": round(cache["pre5_gain"], 2),
+                "amplitude": round(cache["amplitude"], 2),
+                "tail_ret": round(cache["tail_ret"], 2),
+                "pos_range": round(cache["pos_range"], 3)}
+    return {}
+
+
+def to_v2(ctx: Ctx) -> float:
+    """V2 原始评分（宏 `v2_score` 字段来源）。"""
+    return float(_to_cache(ctx).get("score", float("nan")))
+
+
+def to_pred_score(ctx: Ctx) -> int:
+    """预测分 0~100（宏 `pred_score` 字段来源; = pred_score 唯一实现）。"""
+    return pred_score(float(_to_cache(ctx).get("score", float("nan"))), ctx.code)
+
+
+def to_pred_exp(ctx: Ctx) -> float:
+    """预测次日收益% 经验锚点（宏 `pred_exp_ret` 字段来源）。"""
+    return _v2_to_exp_ret(float(_to_cache(ctx).get("score", float("nan"))))
+
+
+def to_tier(ctx: Ctx) -> str:
+    """评分档位 high/base（宏 `tier` 字段来源）。"""
+    s = float(_to_cache(ctx).get("score", float("nan")))
+    return "high" if s >= SCORE_HIGH_MIN else "base"
+
+
 register_strategy_funcs(
     'tail_oversold',
-    {"feat": to_metric, "hhmm": to_hhmm, "limit_hit": to_limit_hit, "ok": to_ok, "nf": to_nf},
+    {"feat": to_metric, "hhmm": to_hhmm, "limit_hit": to_limit_hit, "ok": to_ok, "nf": to_nf,
+     "v2": to_v2, "pred_score": to_pred_score, "pred_exp": to_pred_exp, "tier": to_tier},
     d0={"nf": 0},
 )

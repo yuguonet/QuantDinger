@@ -7,6 +7,7 @@
   - 折叠仍复用 `fold_range`（唯一编排），只通过 ctx_provider 补 ctx；
   - 快照由 `core.data.frames.snap_series` 生成，与 `MinuteFrame.snap` **逐字段同形**
     （生产链走 frame.snap，回放走 snap_series，口径必须一致）。
+  - 市场门注入两层：**逐槽** `ctx["mkt_series"]`（as-of 正解）+ 日频 `ctx["mkt_gain"]`（回退）。
 
 取数策略（重要）:
   - **不走** ``build_frame(date)``：那是**全市场单日**帧，单票回放逐日调用 = N 个
@@ -54,10 +55,12 @@ class IntradayFeed(DailyFeed):
     def __init__(self, bars: list[dict], code: str, *,
                  window: tuple[str, str] = DEFAULT_WINDOW,
                  lo: int = 0, hi: int | None = None, preload: bool = True,
-                 mkt_map: dict[str, float] | None = None):
+                 mkt_map: dict[str, float] | None = None,
+                 mkt_slots: dict[str, dict[str, float]] | None = None):
         super().__init__(bars, lo=lo, hi=hi, mkt_map=mkt_map)
         self.code = str(code)
         self.window = window
+        self.mkt_slots = mkt_slots or {}   # {date:{HH:MM:值}} 逐槽市场门(as-of); 缺省退回 mkt_map
         self._mins: dict[str, list[dict]] = {}
         self._loaded = False
         self.minute_days = 0
@@ -99,10 +102,19 @@ class IntradayFeed(DailyFeed):
         return fr.snap_series(date, rows, pc, self.window[0], self.window[1])
 
     def _ctx_for(self, k: int, bars: list[dict]) -> dict:
-        """快照序列 + 市场门（mkt_gain 由 DailyFeed 的横截面表注入）。"""
+        """快照序列 + 市场门（逐槽 as-of 优先；缺 mkt_slots 时退回日频标量 mkt_gain）。
+
+        市场门 fail-closed（knife `kc_mkt` 读 ctx.mkt_gain）：mkt_slots 缺该日 → 不注入
+        mkt_series → 策略回退标量。逐槽值按快照行的 "HH:MM" 对齐（缺槽 None ⇒ 该槽拒）。
+        """
         pc = float(bars[k - 1].get("close") or 0) if k > 0 else 0.0
         ctx = super()._ctx_for(k, bars)
-        ctx["series"] = self.series(str(bars[k].get("time"))[:10], pc)
+        date = str(bars[k].get("time"))[:10]
+        rows = self.series(date, pc)
+        ctx["series"] = rows
+        day = self.mkt_slots.get(date) if self.mkt_slots else None
+        if day:
+            ctx["mkt_series"] = [day.get(str(r.get("time") or "")[11:16]) for r in rows]
         return ctx
 
 
@@ -111,8 +123,8 @@ def make_feed(strategy, code: str, bars: list[dict], *,
     """按策略 scan_spec 取窗口构造 IntradayFeed。
 
     Args:
-        mkt_map: {date: 全市场均涨幅%}。盘中策略的市场门 ``mkt_gate`` **fail-closed**，
-            缺它则零触发（不报错）。批量场景用 ``replay.market_gain(bars_by_code)``，
-            单票场景用 ``replay.load_market_gain(start, end)``。
+        mkt_map: {date: 全市场均涨幅%}——**日频 close 回退**。盘中策略的市场门
+            ``mkt_gate`` **fail-closed**，缺它则零触发（不报错）。
+        **kw:    透传 IntradayFeed（如 ``mkt_slots``=逐槽 as-of 市场门，见 mkt_slots.py）。
     """
     return IntradayFeed(bars, code, window=DEFAULT_WINDOW, mkt_map=mkt_map, **kw)

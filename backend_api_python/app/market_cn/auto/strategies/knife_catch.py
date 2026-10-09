@@ -1,34 +1,19 @@
-"""strategies/knife_catch.py — 反向接刀策略 (StrategyBase 插件实现, 14:56 盘中窗口扫描版)
+"""strategies/knife_catch.py — 反向接刀 (14:56 盘中窗口扫描版)。
 
 核心逻辑: 大盘下跌日 + 个股深跌 + 尾盘卖盘枯竭(尾盘回升) + 全天压制VWAP下方
-          + 收盘贴低点 = 次日高概率反弹 → D0 尾盘(14:56)买入 → D1 开盘卖出
+          + 收盘贴低点 = 次日高概率反弹 → D0 尾盘(14:56)买入 → D1 开盘卖出。
 
-回测口径 (2026-09-08 终审, tmp/_knife_plugin_result.json / _knife_plugin_backtest2.log):
-  ⚠️ 时间线是生死线: alpha 在 "D0尾盘→D1开盘" 的隔夜反弹段
-    - D0 14:56买→D1开盘卖 (本策略): 门控内 72.2%/+2.06% 两段稳定(73.0/71.3)
-    - D1开盘买→D2开盘卖 (旧版, 已废弃): 35%/-2.93% — 晚买一晚 alpha 消失, 任何过滤/排名都救不回
-  出场终审: D1开盘卖 = 现实最优 (+2.06%); "挂涨停价未成交尾盘卖"现实口径 -0.61% (弃用)
-  宁缺勿滥质量过滤 (各单过滤方向一致, 叠加更强, 门控内 230→107笔):
-    lu_recent==0 (81.7 vs 72.2) / down_streak>=2 (80.3) / vol_ratio<=1.5 (77.8) / pre5<=-15 (81.9)
-    → 四过滤叠加 87.9%/+4.13%/PL1.16
-  ⚠️ regime 集中: 信号集中在恐慌期 (2026-06~09 样本集中在7月), 上线后需持续跟踪
-  ⚠️ 截断裁定 (用户 2026-09-08): >3只不截断 — "全拿"73.8%/+2.25% 好于任何Top3排名
-    (跌最深/位置最低选出的最容易继续崩); daily_limit=0, 全部展示由用户自行取舍
-
-执行流程:
-  14:30  scheduler Task "knife_scan" 启动 (预热窗口, 用户要求不过早占用资源)
-  14:56  全市场快照就绪 → intraday_shortlist 便宜预筛(gain/amp/pos/门控)
-         → 候选股补拉当日快照序列+日线 → scan_signals 完整判定 → 落库 buy_today
-  14:56+ 用户按信号买入 (signal_price = 14:56 最新价)
-  15:01  confirm_decision → holding (隔夜持有)
-  D1     exit_decision live 模式开盘即标记卖出 (exit_exec_same_day, 当日14:55后平账)
+执行: 14:30 预热 → 14:56 快照就绪 (intraday_shortlist 便宜预筛 → 候选股补拉当日快照
+序列+日线 → scan_signals 完整判定 → 落库 buy_today) → 用户按信号买入 → 15:01
+confirm_decision(holding) → D1 开盘 exit_decision 卖 (exit_exec_same_day)。
 
 易错点:
-  - 必须走 ctx (latest/series/mkt_gain), 无盘中快照时返回空 (回测重放/盘后调用安全)
-  - tail_ret = 最新价 vs 20分钟前价 (分钟回测口径 14:36→14:56)
-  - vw_frac 用 60s 快照序列近似 1m bar 的 VWAP 上方占比 (Δvolume 累计算 VWAP)
-  - 日线 bars[-1] 是昨日 (盘中 1D 未回填), down_streak/pre5/lu_recent 的口径见各函数注释
-  - T+1: 14:56 买入当日不可卖, monitor 止损守卫对 entry_at_close 策略跳过当日
+  - **时间线是生死线**: alpha 在 "D0尾盘→D1开盘" 的隔夜反弹段 (晚买一晚 alpha 消失)。
+  - 必须走 ctx (latest/series/mkt_gain), 无盘中快照时返回空 (回测重放/盘后调用安全)。
+  - tail_ret = 最新价 vs 20分钟前价; vw_frac 用 60s 快照近似 1m VWAP 上方占比。
+  - 日线 bars[-1] 是昨日 (盘中 1D 未回填); T+1 当日不可卖。
+
+回测口径 (2026-09-08 终审) / 质量过滤实证 / regime 集中 / 截断裁定 → `docs/策略研究依据归档.md#knife_catch`。
 """
 from __future__ import annotations
 
@@ -51,7 +36,7 @@ PARAMS = {
     "pos_max": 0.1,             # 收盘位置上限 (0=最低点, 1=最高点)
     "tail_min": 0.5,            # 尾盘20分钟回升下限 % (卖盘枯竭)
     "vw_max": 0.2,              # 全天 VWAP 上方占比上限 (全天被压制)
-    "mkt_gate": -1.0,           # 市场门控: 全市场均涨幅 <= 此值才扫描 (由 ctx.mkt_gain 提供)
+    "mkt_gate": -1.0,           # 市场门控: 全市场均涨幅 <= 此值才扫描 (逐槽 ctx.mkt_series[i]; 回退 ctx.mkt_gain)
     "vol_max": 1.5,             # 量比上限 (14:56量/昨日量; >=1.5 过度恐慌继续崩)
     "pre5_max": -15.0,          # 近5日涨幅上限 % (前期已走弱)
     "streak_min": 2,            # 连跌天数下限 (含当日; 单日深跌的接刀差)
@@ -280,14 +265,21 @@ class KnifeCatchStrategy(StrategyBase):
         ctx = inp.ctx or {}
         snap_rows = ctx.get("series") or []
         mkt_gain = ctx.get("mkt_gain")
+        # 逐槽 as-of 市场门（折叠 IntradayFeed 注入，与 snap_rows **逐槽对齐**；缺槽=None
+        # ⇒ 该槽 fail-closed）。缺省回退日频标量 mkt_gain —— 生产实时与合成 golden 走
+        # 回退支（生产本来就 as-of；合成喂的是单一标量）。见
+        # docs/市场门口径评估_20261009.md（消除「用收盘门控 14:56 入场」的前视）。
+        mkt_series = ctx.get("mkt_series") or []
         _tr = ctx.get("_trace")   # 门原因通道（契约约定）：落选门名进 TraceSink，无 sink 零开销
         fired = None
         for i, row in enumerate(snap_rows):
             hh = _hhmm(row.get("time") or "")
             if hh < "14:56" or hh > "15:00":
                 continue
-            fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_gain,
-                                probe=(_tr.note if _tr is not None else None))
+            mkt_i = mkt_series[i] if i < len(mkt_series) else mkt_gain
+            fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_i,
+                                probe=(_tr.note if _tr is not None else None),
+                                code=inp.code, board=state.get("board"))
             if fired:
                 break
         if fired:
@@ -306,96 +298,61 @@ class KnifeCatchStrategy(StrategyBase):
                                    payload={}, next_realtime="14:56-15:00"))
         return events
 
-    def _gates(self, p, hist, snap, series, mkt_gain, probe=None):
-        """触发门 + 评分 —— **唯一实现** (scan_signals 与 evaluate 共用)。
+    def _gates(self, p, hist, snap, series, mkt_gain, probe=None, code="", board=None):
+        """触发门 + 评分 —— **规则单源到 yaml 门表**（GateEvaluator 求门 + build_signal 产 extra）。
 
-        probe: 可选门级 TRACE 回调 `probe(stage, **kw)`, 仅 scan_signals 传。
+        判定/字段口径由 `strategies/knife_catch.yaml` 的 `gates` + `signal.fields` 单源表达；
+        本方法只剩「建 Ctx → 求门 → 组 Signal」的适配职责（§3.1: .py 只提供词, 不改规则）。
+
+        - 门顺序/短路/NaN 语义 = yaml gates（GateEvaluator 按 yaml 顺序逐门短路）；
+        - extra = build_signal（宏 signal.fields 单源, 与 break/g56 同款）；
+        - probe: 门级 TRACE 回调，stage 名经 `_KC_GATE_STAGE` 映射回旧 taxonomy
+          （离线采样/调试口径不变）；仅 debug/sampler 传。
         返回 None=未触发; 否则 {"time","price","score","label","extra"}。
         """
+        from app.market_cn.auto.core.runtime.evaluate import GateEvaluator, build_signal
+        from app.market_cn.auto.core.runtime.expr import evaluate as _eval_expr
+        from app.market_cn.auto.core.runtime.functions import build_funcs
+        spec = _kc_spec()
         last = float(snap.get("last") or 0)
         high = float(snap.get("high") or 0)
         low = float(snap.get("low") or 0)
         pc = float(snap.get("previousClose") or 0)
         last_time = str(snap.get("time") or "")
+        # 数据合法性守卫（旧实现在任何 probe 之前就返回 ⇒ 保持「无 probe」语义）
         if last <= 0 or pc <= 0 or high <= low:
             return None
-        # 窗口保护: 14:56 之后才出信号 (14:30 启动仅为预热, 判定不变)
-        if _hhmm(last_time) < "14:56":
-            if probe:
-                probe("window", hhmm=_hhmm(last_time))
-            return None
-        if mkt_gain is None or mkt_gain > p["mkt_gate"]:
-            if probe:
-                probe("mkt", mkt_gain=round(mkt_gain, 2) if mkt_gain is not None else None)
-            return None
-        gain = (last / pc - 1) * 100
-        amp = (high - low) / pc * 100
-        pos = (last - low) / (high - low)
-        if gain > p["gain_max"] or amp < p["amp_min"] or pos > p["pos_max"]:
-            if probe:
-                probe("feat", gain=round(gain, 2), amp=round(amp, 2), pos=round(pos, 3))
-            return None
-        tail = _tail_ret(series, last, last_time, minutes=20)
-        vw = _vw_frac(series)
-        if tail is None or vw is None:
-            if probe:
-                probe("data", reason="tail_or_vw")
-            return None
-        if tail < p["tail_min"] or vw > p["vw_max"]:
-            if probe:
-                probe("tail_vw", tail=round(tail, 2), vw=round(vw, 3))
-            return None
-        # 日线特征 (bars 不足 ⇒ 无特征; 位置与旧实现一致)
-        if hist is None:
-            if probe:
-                probe("daily", reason="bars_short")
-            return None
-        vol_ratio = (float(snap.get("volume") or 0) / hist["vol5"]) if hist["vol5"] > 0 else 99.0
-        if vol_ratio > p["vol_max"]:
-            if probe:
-                probe("vol", vol_ratio=round(vol_ratio, 3))
-            return None
-        # down_streak 含当日 (当日必跌): live口径 = 1 + 昨日往前连跌
-        streak = 1 + hist["down_streak"]
-        if streak < p["streak_min"]:
-            if probe:
-                probe("streak", streak=streak)
-            return None
-        if hist["pre5"] > p["pre5_max"]:
-            if probe:
-                probe("pre5", pre5=round(hist["pre5"], 2))
-            return None
-        if hist["lu_recent"] > 0:
-            if probe:
-                probe("lu_recent", lu_recent=hist["lu_recent"])
-            return None
-
-        # 评分: 仅作展示排序 (不截断); 连跌深+前期弱+量能适中优先
-        score = 60
-        if streak >= 3:
-            score += 10
-        if hist["pre5"] <= -20:
-            score += 10
-        elif hist["pre5"] <= -15:
-            score += 5
-        if 1.0 <= vol_ratio <= 1.5:
-            score += 5
-        if amp <= 15:
-            score += 5
-        score = min(90, score)
-        if probe:
-            probe("signal", streak=streak, gain=round(gain, 2), tail=round(tail, 2))
+        ctx = Ctx([], 0, lu_idx=0, params=p, board_type=board or "main", code=code,
+                  latest=snap, series=series or [], mkt_gain=mkt_gain,
+                  ext={"kc_hist": hist}, market=spec.market_spec)
+        gates = spec.enabled_gates
+        if probe is not None:
+            funcs = build_funcs(ctx, spec.key, spec.func_names)
+            for g in gates:
+                try:
+                    passed = bool(_eval_expr(g.expr, p, funcs))
+                except Exception:
+                    passed = False
+                if not passed:
+                    probe(_KC_GATE_STAGE.get(g.id, g.id),
+                          **_kc_probe_kw(g.id, _kc_cache(ctx), mkt_gain))
+                    return None
+        else:
+            ev = GateEvaluator(spec, board_type=board or "main", code=code)
+            ok, _failed = ev.evaluate_all([], 0, p, ctx=ctx)
+            if not ok:
+                return None
+        cache = _kc_cache(ctx)
+        streak = int(cache["streak"])
+        score = _kc_score(cache)
+        if probe is not None:
+            probe("signal", streak=streak, gain=round(cache["gain"], 2),
+                  tail=round(cache["tail"], 2))
         return {
             "time": last_time[:10], "price": last, "score": score,
-            "label": f"反向接刀 gain={gain:.1f}% tail=+{tail:.1f}% streak={streak}",
-            "extra": {
-                "gain": round(gain, 2), "amplitude": round(amp, 2),
-                "pos_range": round(pos, 3), "tail_ret": round(tail, 2),
-                "vw_frac": round(vw, 3), "vol_ratio": round(vol_ratio, 3),
-                "down_streak": streak, "pre5_gain": round(hist["pre5"], 2),
-                "lu_recent": hist["lu_recent"],
-                "mkt_gain": round(mkt_gain, 3) if mkt_gain is not None else None,
-            },
+            "label": (f"反向接刀 gain={cache['gain']:.1f}% "
+                      f"tail=+{cache['tail']:.1f}% streak={streak}"),
+            "extra": build_signal(ctx, spec),
         }
 
     @staticmethod
@@ -471,7 +428,8 @@ class KnifeCatchStrategy(StrategyBase):
             hist = self._feats_hist(self.init_state(code, bars or []))
         except InsufficientHistory:
             hist = None
-        fired = self._gates(p, hist, snap, series, ctx.get("mkt_gain"), probe=_tr)
+        fired = self._gates(p, hist, snap, series, ctx.get("mkt_gain"), probe=_tr,
+                            code=code, board=get_board_type(code))
         if not fired:
             return []
         return [Signal(code=code, time=fired["time"], score=fired["score"],
@@ -558,7 +516,12 @@ _KC_NAN_KEYS = ("gain", "amp", "pos", "tail", "vw", "vol_ratio", "streak",
 
 
 def _kc_cache(ctx: Ctx) -> dict:
-    """knife 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 3 个数据助手。"""
+    """knife 盘中判定中间量（每 Ctx 记忆化）。覆盖 scan_signals + 3 个数据助手。
+
+    日线特征来源: 优先 `ctx.ext["kc_hist"]`（`_gates` 注入的 `_feats_hist` 结果，折叠路径
+    无 bars 也可用）；无则回退按 `ctx.bars`/`ctx.code` 现算 —— 两条来源同源
+    (`_daily_feats` == `_feats_hist(init_state(bars))`)，值逐位一致。
+    """
     cache = ctx.__dict__.get("_kc_cache")
     if cache is not None:
         return cache
@@ -578,7 +541,9 @@ def _kc_cache(ctx: Ctx) -> dict:
         vw = _kc_vw_frac(ctx.series or [])
         cache["tail"] = float("nan") if tail is None else tail
         cache["vw"] = float("nan") if vw is None else vw
-        df = _kc_daily_feats(ctx.bars or [], ctx.code, ctx.market)
+        ext = ctx.ext or {}
+        df = ext["kc_hist"] if "kc_hist" in ext \
+            else _kc_daily_feats(ctx.bars or [], ctx.code, ctx.market)
         if df is not None:
             cache["vol_ratio"] = (Ctx._f(snap, "volume") / df["vol5"]) if df["vol5"] > 0 else 99.0
             cache["streak"] = 1 + df["down_streak"]
@@ -588,9 +553,80 @@ def _kc_cache(ctx: Ctx) -> dict:
     return cache
 
 
+_SPEC: dict = {}
+
+
+def _kc_spec():
+    """knife_catch 门表 StrategySpec 单例缓存（判定单源到 yaml 门表后 `_gates` 用它求门）。"""
+    if "knife_catch" not in _SPEC:
+        from app.market_cn.auto.core.runtime.evaluate import load_strategy
+        _SPEC["knife_catch"] = load_strategy("knife_catch")
+    return _SPEC["knife_catch"]
+
+
+#: 门 id → 旧 probe stage 名（保 probe taxonomy 逐字不变；见 sampler.STAGE_RANK["knife_catch"]）
+_KC_GATE_STAGE = {
+    "kc_window": "window", "kc_mkt": "mkt", "kc_feat": "feat", "kc_data": "data",
+    "kc_tail_vw": "tail_vw", "kc_daily": "daily", "kc_vol": "vol",
+    "kc_streak": "streak", "kc_pre5": "pre5", "kc_lu_recent": "lu_recent",
+}
+
+
+def _kc_probe_kw(gate_id, cache, mkt_gain):
+    """门 id → 旧 `_gates` 的 probe kwargs（逐字对齐旧口径）。"""
+    if gate_id == "kc_window":
+        return {"hhmm": cache.get("hhmm", "")}
+    if gate_id == "kc_mkt":
+        return {"mkt_gain": round(mkt_gain, 2) if mkt_gain is not None else None}
+    if gate_id == "kc_feat":
+        return {"gain": round(cache["gain"], 2), "amp": round(cache["amp"], 2),
+                "pos": round(cache["pos"], 3)}
+    if gate_id == "kc_data":
+        return {"reason": "tail_or_vw"}
+    if gate_id == "kc_tail_vw":
+        return {"tail": round(cache["tail"], 2), "vw": round(cache["vw"], 3)}
+    if gate_id == "kc_daily":
+        return {"reason": "bars_short"}
+    if gate_id == "kc_vol":
+        return {"vol_ratio": round(cache["vol_ratio"], 3)}
+    if gate_id == "kc_streak":
+        return {"streak": cache["streak"]}
+    if gate_id == "kc_pre5":
+        return {"pre5": round(cache["pre5"], 2)}
+    if gate_id == "kc_lu_recent":
+        return {"lu_recent": cache["lu_recent"]}
+    return {}
+
+
+def _kc_score(cache) -> int:
+    """评分（仅展示排序, 不截断）—— 连跌深+前期弱+量能适中优先（与旧 `_gates` 逐位一致）。"""
+    streak = cache["streak"]
+    pre5 = cache["pre5"]
+    vol_ratio = cache["vol_ratio"]
+    amp = cache["amp"]
+    score = 60
+    if streak >= 3:
+        score += 10
+    if pre5 <= -20:
+        score += 10
+    elif pre5 <= -15:
+        score += 5
+    if 1.0 <= vol_ratio <= 1.5:
+        score += 5
+    if amp <= 15:
+        score += 5
+    return min(90, score)
+
+
 def kc_metric(ctx: Ctx, name: str) -> float:
     """knife 特征取值（缺少/无效 → nan，数值门自然失败）。"""
     return float(_kc_cache(ctx).get(name, float("nan")))
+
+
+def kc_ok(ctx: Ctx, name: str) -> int:
+    """该特征是否可用（1=非 nan）—— 镜像旧 `_gates` 的 tail/vw None / hist None 早返回。"""
+    v = float(_kc_cache(ctx).get(name, float("nan")))
+    return 0 if v != v else 1        # nan != nan → 不可用
 
 
 def kc_hhmm(ctx: Ctx) -> str:
@@ -604,5 +640,5 @@ def kc_mkt_gain(ctx: Ctx) -> float:
 
 register_strategy_funcs(
     'knife_catch',
-    {"feat": kc_metric, "hhmm": kc_hhmm, "mkt_gain": kc_mkt_gain},
+    {"feat": kc_metric, "ok": kc_ok, "hhmm": kc_hhmm, "mkt_gain": kc_mkt_gain},
 )

@@ -37,8 +37,8 @@ logger = get_logger(__name__)
 def _accepts_probe(strategy) -> bool:
     """scan_signals 是否显式声明 probe 形参。
 
-    ⚠ 未声明者传 probe 会被 `**params` 静默吞掉 (relay3 现状) —— 探针对象混进
-      params 有隐患, 故此类策略**不采集** (判定行为零变化)。
+    ⚠ 未声明者传 probe 会被 `**params` 静默吞掉 —— 探针对象混进 params 有隐患,
+      故此类策略**不采集** (判定行为零变化)。
     """
     try:
         return "probe" in inspect.signature(strategy.scan_signals).parameters
@@ -221,8 +221,7 @@ LiveSampler._self_run_via_trace = _self_run_via_trace
 
 #: stage 归属排名（per-strategy taxonomy；"最深判定步"归属用）
 STAGE_RANK = {
-    "break": {"confirm": 1, "align": 2, "dedup": 3, "prefilter": 4,
-              "engine_skip": 5, "signal": 6},
+    "break": {"confirm": 1, "prefilter": 2, "signal": 3},
     "dragon_callback": {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4,
                         "rsi": 5, "turn": 6, "d0_chg": 7, "quality": 7,
                         "dedup": 8, "prefilter": 9, "engine_skip": 9,
@@ -230,12 +229,7 @@ STAGE_RANK = {
     "knife_catch": {"window": 1, "mkt": 2, "feat": 3, "data": 4, "tail_vw": 5,
                     "daily": 6, "vol": 7, "streak": 8, "pre5": 8,
                     "lu_recent": 9, "signal": 10},
-    "lead_chase": {"window": 1, "mkt": 2, "pool": 3, "noise": 4,
-                   "volume": 5, "board": 6, "signal": 7},
     "tail_oversold": {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5},
-    "v1": {"lu": 1, "ret20": 2, "pullback": 3, "obv": 4, "vol": 5,
-           "overheat": 6, "prefilter": 7, "d1_gap": 8, "d1_chg": 8,
-           "d1_band": 8, "engine_skip": 9, "signal": 10},
 }
 
 

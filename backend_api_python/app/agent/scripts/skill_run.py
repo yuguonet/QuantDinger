@@ -8,7 +8,7 @@
 
 用法：
     python scripts/skill_run.py market_screener
-    python scripts/skill_run.py strategy_debug '{"fn": "debug_strategy", "kwargs": {"strategy": "v1", "code": "600519"}}'
+    python scripts/skill_run.py strategy_debug '{"fn": "debug_strategy", "kwargs": {"strategy": "break", "code": "600519"}}'
 
 输出（stdout，单行 JSON）：
     {"name":..., "ok":bool, "result":<截断>, "full_path":"tmp/skill_output/xxx.json", "elapsed_s":...}

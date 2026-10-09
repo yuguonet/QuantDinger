@@ -244,7 +244,8 @@ INPUT_SETS = (
 # ================================================================
 # P1.5-② 盘中策略合成条目（2026-10-08，补齐 knife/tail golden 覆盖）
 # 来源：改进方案_v2.1 §4-P1.5-② | 配方：tests/present/common（已验证会触发 14:56 ready）
-# 旧侧 = run_all_intraday 时间线引擎（合成帧），新侧 = replay + 快照 ctx（同一 evaluate）
+# 两侧同走 `core.replay` + 快照 ctx（同一 evaluate）：旧侧数据面经 freeze._old_intraday_trades
+# 合成帧管道（不打 DB），新侧走生产实时入口 scan_signals
 # ================================================================
 from tests.present.common import (KNIFE_HIST_CLOSES, TAIL_HIST_CLOSES,  # noqa: E402
                                   gen_hist_bars, knife_day_rows, tail_day_rows)

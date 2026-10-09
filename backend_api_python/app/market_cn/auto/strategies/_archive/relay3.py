@@ -1,6 +1,6 @@
-"""strategies/relay3.py — 3板接力策略 (StrategyBase 插件实现, Phase 2 迁移)
+"""strategies/relay3.py — 3板接力策略 (StrategyBase 插件实现)
 
-⚠️ 2026-09-23 停用 (config.json enabled=false) + 逻辑复盘 (docstrong):
+⚠️ 停用中 (yaml meta.enabled=false) + 逻辑复盘:
   入场逻辑缺陷: 3板接力的正确买点只有 2进3 (2板次日买第3板) 或 3进4 (3板次日买第4板);
   涨停价无法购买 — 本策略 D0=3板确认日、D1 开盘竞价买入, 无盘中确认, 且原回测对
   一字/秒板按 open 虚假成交。
@@ -18,8 +18,8 @@
   对照: 断板策略 (break, T3出场) 同期 +3.67% — 调整后确认介入 优于 情绪顶直追;
   若重做接力, 应基于断板框架高板位通道 (B4'), 而非复活本策略的开盘竞价入口。
 
-策略来源: 2026-09-06 全量回测 (150天/9996接力样本/112笔1m出场模拟)。
-本文件是 relay3 的**唯一实现**; 旧 auto/relay3.py 已改为 facade 转发到本模块。
+策略来源: 全量回测 (150天/9996接力样本/112笔1m出场模拟)。
+本文件是 relay3 的**唯一实现**; 当前停用中 (无折叠契约)。
 
 入场 (D0 盘后扫描 → D1 竞价):
   池子: 昨日恰为 3 连板的票 (主板 9.8%/创科 19.8% 阈值, 排除 ST/北交所)
@@ -50,7 +50,6 @@ from app.market_cn.auto.core.runtime.functions import Ctx, _closes_upto
 from app.market_cn.auto.core.runtime.gate_stdlib import board_height, ma_bull
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
-    data_end_close,
 )
 
 STRATEGY_KEY = "relay3"
@@ -226,7 +225,7 @@ def run_backtest_relay3(bars, entry_idx, entry_price, code, params):
 # ================================================================
 
 def _signal_to_legacy_dict(sig: Signal) -> dict:
-    """Signal → 旧 relay3_today_d0_signals 的 dict 形态 (facade 兼容层)。"""
+    """Signal → 展示用 dict 形态。"""
     ex = sig.extra or {}
     return {
         "strategy": STRATEGY_KEY,
@@ -404,89 +403,12 @@ _register_exit("relay3_s4", _exit_relay3_s4)
 
 
 # ================================================================
-# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# 门表回测编排已退役 (2026-10-09 终态② Step 3)
 # ----------------------------------------------------------------
-# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
-# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
-# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
-# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
-#    analysis_output/auto架构分层_20260928.md
+# 2026-09-28: 原 core/runtime/evaluate.py 的门表回测编排曾**纯搬运**回本模块自注册
+#   (register_day_flow("relay3", _backtest_day_flow))。
+# 2026-10-09: 回测主路径收敛到事件流折叠 (backtest_stock 薄壳 → core.replay) ⇒ 该全历史
+#   回测编排与注册**退役**。relay3 为**停用**策略 (config.json enabled=False) 且无折叠契约
+#   ⇒ 现仅经 backtest_stock 的 legacy 通用路径 (scan_signals + exit_decision) 回测。
 # ================================================================
 
-from typing import Any, Dict, List
-
-from app.market_cn.auto.core.entry_modes import resolve_entry
-from app.market_cn.auto.core.exit_modes import run_exit
-from app.market_cn.auto.core.filters import unified_prefilter
-from app.market_cn.auto.core.runtime.flows import register_day_flow
-
-def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 relay3(3板接力) 全历史回测，返回 trades 列表（与 relay3.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 relay3.backtest_stock：逐日 D0 判定（门表: 非北交所 + 恰3连板 + MA多头）
-    → U1~U4 锚定 D0 涨停日 → 入场=entry_modes(open, gap -2~9%) → 出场=exit_modes(relay3_s4)。
-    参考版 scan_signals 要求 len(bars[:i+1])>=67 → meta.day_start=66 精确复现该下界。
-    """
-    n = len(bars)
-    if n < int(spec.meta.get("day_min_n", 5)):
-        return []
-    _p = spec.params
-    trades: List[Dict[str, Any]] = []
-
-    for i in range(int(spec.meta.get("day_start", 66)), n - 1):
-        # D0 逐日判定（门表一次性求所有门，与 relay3.scan_signals 同一逻辑）
-        ok, _ = ev.evaluate_all(bars, i, _p)
-        if not ok:
-            continue
-
-        # U1~U4（锚定 D0 涨停日；relay3 prefilter_anchor='limit_up'）
-        if use_prefilter:
-            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-
-        # 入场 = entry_modes（open + gap 过滤）
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-
-        # 出场 = exit_modes（relay3_s4 日线近似；成交语义见 core/exec.py）
-        result = run_exit(spec.exit.get("mode", "relay3_s4"), bars=bars,
-                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
-                          code=code, board_type=board_type, params=_p, diag=site["diag"])
-        if not result or result.get("open"):
-            # R1: 数据结束未平/open → 末日收盘平仓（与主回测路径同口径；
-            # 原「参考版跳过开放持仓」是 R1 修复前的旧行为）
-            result = data_end_close(bars, site["entry_idx"], site["entry_price"])
-        if not result:
-            continue
-
-        # 信号展示字段（镜像 relay3 calc_features: board_height/ma_bull/lu_vol_ratio/rsi）
-        feats = relay3_features(Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
-                                    market=spec.market_spec))
-        trades.append({
-            "code": code,
-            "board": get_board_type(code, spec.market_spec),
-            "path": spec.key,
-            "path_label": spec.meta.get("name", spec.key),
-            "signal_date": bars[i]["time"],
-            "entry_date": site["entry_date"],
-            "entry_price": round(site["entry_price"], 3),
-            "buy_mode": "next_open",
-            "d1_gap": round(site["diag"]["d1_gap"], 2),
-            "lu_date": bars[i]["time"],
-            "board_height": feats.get("board_height"),
-            "ma_bull": feats.get("ma_bull"),
-            "lu_vol_ratio": feats.get("lu_vol_ratio"),
-            "rsi": feats.get("rsi"),
-            **result,
-        })
-    return trades
-
-
-# ================================================================
-# 枚举方式 B / day_flow=break（断板接力，D0 确认日 → 次日开盘入场）
-# 逐字镜像 break_buy.BreakStrategy.backtest_stock（见 tmp/_break_equivalence.py 验收）
-# ================================================================
-
-register_day_flow("relay3", _backtest_day_flow)

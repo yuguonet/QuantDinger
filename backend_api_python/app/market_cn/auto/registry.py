@@ -7,7 +7,9 @@
 
 设计点:
   - 策略 key 是跨层契约: qd_dragon_signals.strategy 列 / strategies/ 插件注册名 /
-    config.json 开关键 三处一致, 改名需三处同改;
+    config.json strategies 段 key 三处一致, 改名需三处同改;
+    (策略开关 enabled 2026-10-09 已迁至**策略宏 <key>.yaml 的 meta.enabled** —
+     见 strategies.is_enabled; config 的 enabled 键仅服务无 yaml 的遗留策略);
   - strategy_labels() 三层: config.json label > 策略插件 name 属性 > key 原样 —
     查得到的 key 必在 config 或磁盘插件二者有其一 (strategy_keys 并集), 无需静态兜底;
   - 历史胜率等展示型元数据 (winrate) 单一事实源 = config.json strategies[key].winrate;
@@ -18,8 +20,9 @@
   - 查询/清理范围 (store) 走 strategy_keys() = config.json strategies 段 keys ∪ 磁盘插件
     autodiscover (并集): config 显式声明 (enabled=false 停扫描但不删查询, 历史行仍可见),
     autodiscover 兜底防新增策略漏登记 config 复发"落库后查询看不见";
-  - 彻底移除某策略 (插件+config key 都删) 后其历史行退出查询/清理范围, 永久残留属预期;
-  - relay3 是已停用策略但历史行仍在表里, key 不能删。
+  - 彻底移除某策略 (插件+config key 都删) 后其历史行退出查询/清理范围, 永久残留属预期
+    (2026-10-09 P6-6/7: relay3/v1/lead_chase 按此彻底退役 ⇒ 其历史 DB 行不再进查询/
+    清理范围; 若库中仍存其未平仓行需人工处置)。
 """
 from __future__ import annotations
 
@@ -43,9 +46,10 @@ DRAGON_STRATEGY = "dragon_callback"
 # 2026-09-26: 补 g56/break_v2/dragon_v2/triple_resonance; 去掉已归档的
 # dragon_callback_legacy (见 strategies/_archive/)。改名/增删策略时同步此表。
 # 2026-09-27: break_v2/dragon_v2/triple_resonance/t_hilo 归档 _archive/, 同步删 fallback
+# 2026-10-09: v1/relay3/lead_chase 退役归档 _archive/ (P6-6/7), 同步删 fallback
 _STRATEGIES_FALLBACK = (
-    "dragon_callback", "v1", "break",
-    "relay3", "knife_catch", "tail_oversold", "g56", "lead_chase",
+    "dragon_callback", "break",
+    "knife_catch", "tail_oversold", "g56",
 )
 
 
@@ -123,8 +127,9 @@ def strategy_labels():
 # 历史回测胜率 (前端策略组排序/展示用, 非实盘承诺): 单一事实源已迁 config.json
 #   strategies[key].winrate (2026-09-18 迁出, 代码不再写死胜率数值)。取值见 strategy_winrate()。
 # 各策略现实化口径基线 (仅作参考, 不在代码写死, 全部以 config 为准):
-#   v1=139笔/72.7%/+3.51%; break=94笔/71.3%/+4.31%; dragon_callback=50笔/62.0%/+2.63% (300d, 门槛后);
-#   tail_oversold=275笔/80.7%/+2.74%; relay3=53.4%; knife_catch=36笔/97.2% (样本集中07恐慌段)。
+#   break=94笔/71.3%/+4.31%; dragon_callback=50笔/62.0%/+2.63% (300d, 门槛后);
+#   tail_oversold=275笔/80.7%/+2.74%; knife_catch=36笔/97.2% (样本集中07恐慌段)。
+#   (v1/relay3 的胜率随其 2026-10-09 退役一并移除; 历史值见 docs/策略研究依据归档.md)
 def strategy_winrate(key):
     """历史回测胜率 (前端策略组排序/展示用, 非实盘承诺)。
 

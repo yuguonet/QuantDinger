@@ -6,8 +6,12 @@
   - 注册: 策略模块内 `@register` 装饰 StrategyBase 子类, key 必须唯一;
   - autodiscover: importlib 遍历本目录 *.py (跳过 base/__init__), **per-module 容错** —
     单个模块 import 失败只记 CRITICAL 并跳过, 绝不拖死整个注册表 (L3 故障隔离);
-  - 配置: auto/config.json 单文件 (当前唯一配置域=策略开关/限额/参数覆盖),
-    优先级 config > 代码 default_params; 文件缺失/损坏时全部策略按 enabled=True 兜底。
+  - 开关 (2026-10-09 终态②/A-D2): **事实源 = 策略宏 `<key>.yaml` 的 `meta.enabled`**
+    (§3.5「改宏即开关」) —— 宏内一行即上下线, 不再去另一个配置域改。无 yaml 的
+    策略回退 `config.json strategies.<key>.enabled` (2026-10-09 P6-6/7 退役
+    v1/relay3/lead_chase 后当前无此类策略, 该分支为通用兜底); 两边都无 ⇒ False。
+  - 配置: auto/config.json (label/限额/胜率/params 覆盖等**元数据**),
+    优先级 config > 代码 default_params; 文件缺失/损坏时按默认兜底。
 易错点: is_enabled/daily_limit/params_override 对未注册 key 返回安全默认值, 不抛 KeyError。
 """
 from __future__ import annotations
@@ -63,7 +67,69 @@ def autodiscover():
 
 
 # ================================================================
-# config.json 加载 (auto/config.json: enabled/daily_limit/params 覆盖)
+# 策略开关 —— 单一事实源 = 策略宏 <key>.yaml 的 `meta.enabled` (§3.5)
+# ----------------------------------------------------------------
+# 「改宏即开关」: 上线/下线只改策略宏里的一行, 与 label/params 的宏内自描述一致。
+# config.json 的 `strategies.<key>.enabled` 退为**无宏策略的兜底** (通用兜底分支,
+# 2026-10-09 P6-6/7 退役 v1/relay3/lead_chase 后当前无此类);
+# 有 yaml 的策略一律以 meta.enabled 为准 (忽略 config 同名键)。
+# 缺省 False: 沿用 2026-09-15 安全语义 —— 未显式声明 = 不进实盘。
+# ================================================================
+_STRATEGY_DIR = os.path.dirname(os.path.abspath(__file__))
+_YAML_DOC_CACHE = {}         # key -> (mtime, doc|None)  策略宏解析缓存 (开关/参数共用)
+
+
+def _yaml_doc(key):
+    """读策略宏 `<key>.yaml` 的解析结果 (mtime 缓存); 无 yaml / 解析失败 → None。
+
+    带 mtime 缓存 (与 load_config 同法): 改 yaml 后无需重启后端, 下一轮读即生效;
+    解析失败返回 None (交调用方回退), 绝不因一个坏 yaml 抛死调用方。
+    """
+    path = os.path.join(_STRATEGY_DIR, f"{key}.yaml")
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return None, None
+    hit = _YAML_DOC_CACHE.get(key)
+    if hit is not None and hit[0] == mt:
+        return hit[1], mt
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+        if not isinstance(doc, dict):
+            doc = None
+    except Exception as e:
+        logger.error("[strategies] %s.yaml 解析失败, 回退 config: %s", key, e)
+        doc = None
+    _YAML_DOC_CACHE[key] = (mt, doc)
+    return doc, mt
+
+
+def _yaml_meta_enabled(key):
+    """读策略宏 `<key>.yaml` 的 `meta.enabled`; 无 yaml / 无该键 / 解析失败 → None。"""
+    doc, _ = _yaml_doc(key)
+    if doc is None:
+        return None
+    raw = (doc.get("meta") or {}).get("enabled")
+    return bool(raw) if raw is not None else None
+
+
+def yaml_params(key):
+    """读策略宏 `<key>.yaml` 的 `params` 段; 无 yaml / 无该键 / 解析失败 → None。
+
+    这是**参数（params）的单一事实源**（目标态 §2/§3.1）: 策略宏里的 params 段,
+    判定（`spec.params`）/出场/生产扫描（`StrategyBase.params`）都读它。
+    """
+    doc, _ = _yaml_doc(key)
+    if doc is None:
+        return None
+    raw = doc.get("params")
+    return raw if isinstance(raw, dict) else None
+
+
+# ================================================================
+# config.json 加载 (auto/config.json: label/daily_limit/params 等元数据)
 # ================================================================
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 _config_cache = None
@@ -103,13 +169,19 @@ def _strategy_cfg(key):
 
 
 def is_enabled(key):
-    """策略开关 (默认 False: 未显式写 config 段 = 不进实盘)。
+    """策略开关 (§3.5「改宏即开关」): yaml `meta.enabled` 权威 → config 兜底 → 缺省 False。
 
-    2026-09-15 事故修复: 旧缺省 True 导致无 config 段的磁盘插件 (如
-    triple_resonance) 被 autodiscover 捡回实盘扫描。系统成员以 config
-    strategies 段显式声明为准 — 想让新策略实盘必须在 config.json 写段
-    (enabled=true); 仅回测/离线用途的策略不写段即自动隔离。
+    优先级 (2026-10-09 终态②/A-D2 定):
+      ① `<key>.yaml` 的 `meta.enabled` (有 yaml 者一律以此为准 —— 单一事实源)
+      ② `config.json strategies.<key>.enabled` (无 yaml 策略的兜底; 当前无此类)
+      ③ False (两边都未声明 = 不进实盘)
+
+    2026-09-15 事故语义保留: 缺省 False ⇒ 无配置的磁盘插件不会被 autodiscover 捡回实盘;
+    新策略实盘 = 在自己的 yaml `meta` 里写 `enabled: true` (与规则同处一文件, 改宏即生效)。
     """
+    v = _yaml_meta_enabled(key)
+    if v is not None:
+        return v
     return bool(_strategy_cfg(key).get("enabled", False))
 
 
@@ -120,8 +192,19 @@ def daily_limit(key, default=20):
 
 
 def params_override(key):
-    """参数覆盖 dict (无则空 dict, 由 StrategyBase.params 合并)。"""
-    v = _strategy_cfg(key).get("params")
+    """参数覆盖 dict (无则空 dict, 由 StrategyBase.params 合并)。
+
+    **单一事实源 = 策略宏 `<key>.yaml` 的 `params` 段**（目标态 §2/§3.1/D4,
+    2026-10-09 收敛）: 判定（`spec.params`）/出场/生产扫描（`scan_signals →
+    StrategyBase.params`）/回测/参数网格都读同一份。
+
+    优先级: yaml `params` → config.json `strategies.<key>.params`（**无 yaml 策略
+    的兜底**, 当前无此类）→ {}。日线策略的 config params 已在 B-D3 清空;
+    盘中策略（knife/tail）的 config params 于 D4 一并清空（消除「盘中双源」）。
+    """
+    v = yaml_params(key)
+    if v is None:
+        v = _strategy_cfg(key).get("params")
     return v if isinstance(v, dict) else {}
 
 
@@ -175,6 +258,20 @@ def present_persist_settings():
     except (TypeError, ValueError):
         warm = 0
     return {"enabled": bool(v.get("enabled", False)), "warmup": warm}
+
+
+def scan_writer():
+    """生产链判定引擎开关 (P2, 2026-10-08)。
+
+    config.json 顶层 (与 present_persist 平级):
+        "scan_writer": "scan_day" | "record" | "scan"
+    缺键 / 非法 ⇒ "record" —— **缺省 = 折叠 Record.ready (P5-③ 现状)**, 生产行为零变化。
+      · "scan_day" = 门表引擎 scan_day (P2 目标态, 门表唯一规则源)
+      · "record"   = 折叠内核 persist_days → Record.ready (P5-③ 现状)
+      · "scan"     = 折叠内核 scan_days (旧回滚位)
+    """
+    v = load_config().get("scan_writer")
+    return v if v in ("scan_day", "record", "scan") else "record"
 
 
 def monitor_progress_settings():

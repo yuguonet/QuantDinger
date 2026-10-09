@@ -1,68 +1,22 @@
-"""strategies/g56.py — 五重共振 (原"56%规则G+", 三金叉共振G+链收窄版, 2026-09-17 定稿上线)
+"""strategies/g56.py — 五重共振 (D-1 盘后判定 → D0 开盘买; 纯 7d/-8% 出场)。
 
-策略来源: tmp/regime3~5_150.py / g1deep3_150.py (近150天研究, MEMORY.md 行55-63/67)。
+入场 = 五重共振缺一不可 (精确阈值 = 门表 `g56.yaml` gates; `_g1_mask` 为等价向量化预筛):
+  ① 趋势 MA5/MA10 收敛 + rma_chg>0    ② 波动 ATR14% > 板块Q5
+  ③ 基因 前20日≥5%大涨≥2次           ④ 金叉 rhist_chg 板块池内前5%
+  ⑤ 板块 regime 门 (主板 rmed>0.25 & %b≤49.87 / 20cm score_r>0.65 & dif0≤0)
+出场 = 持有期 d≥2 任一日 low≤入场价×0.92 → 止损卖 (跳空按开盘); 否则第 7 日收盘卖。
+评分 = 0.5·归一(dist_ma20) + 0.5·归一(−dif0) —— 展示 + 实盘每日限额截断键。
 
-规则总览 (人类可读版; 精确阈值=下方冻结常量, 证据=MEMORY.md 行55-67):
-入场 = D-1 盘后判定, 五重共振缺一不可 → D0 开盘买 (gap≥涨停幅度=一字/触板剔除):
-  维度        信号                        判定什么
-  ① 趋势     MA5/MA10 收敛 + rma_chg>0   短期均线靠拢、趋势向上, 不是下跌中继
-  ② 波动     ATR14% > 板块Q5             波动率够, 有爆发空间 (太稳的股不动)
-  ③ 基因     前20日≥5%大涨≥2次           有涨停/大阳基因, 不是慢牛型
-  ④ 金叉预测 rhist_chg 板块池内前5%      MACD 柱加速变长, 金叉正在形成
-  ⑤ 板块状态 板块动量为正 + 未超买        个股+板块同向, 不是个股独立异动
-    (⑤ = 横截面 regime 门: 主板 rmed>0.25 & 布林%b≤49.87 / 20cm score_r>0.65 & dif0≤0)
-评分 (展示 + **实盘每日限额截断键**) = 0.5·归一(dist_ma20) + 0.5·归一(−dif0),
-  2026-09-24 由 rhist_chg 换键而来, 依据与阈值见 SCORE_* 常量处注释。
-出场 = 纯 7d/-8% 无追踪 (2026-09-17 出场研究定稿: trail 保留系数全区间单调, 紧追踪
-  系统性打断启动初期动量): 持有期任一日 (d≥2, T+1) low≤入场价×0.92 → 止损卖
-  (跳空穿越按开盘价成交); 否则第 7 个交易日收盘卖。
-分板块冻结口径 (2026-09-17, ①②③=G1池):
-  主板 = G1池 & ④rhist_chg>0.51 & ⑤rmed>0.25 & %b≤49.87 (150天 +7.51%/81.0% 正3/4月)
-  20cm = G1池 & ④rhist_chg>0.66 & ⑤score_r>0.65 & dif0≤0   (150天 +9.95%/83.9% 正4/5月)
+易错点 (改对红线):
+  - **全部 G1 指标必须因果** (f[k] 只依赖 ≤k 数据) ⇒ 可用未切片全序列一次算第 k 日特征;
+    将来若引入非因果指标 (centered MA / 未来值回填), 此前提失效, 必须回退切片否则前视。
+  - 前视防护: 池聚合每票 bars 必须 as_of=pool_target 截断; score_r 滚动分位不含当日。
+  - 出场是**结构终点非阈值拟合**, 勿改回追踪; **勿动下方 `_run_backtest` 回调** (含追踪逻辑,
+    exit_day 为"兜底残影/触发"混合值, 截断重放下不可区分)。
+  - regime 门 (rmed/score_r) 是 G1 池级统计量, 经 `_ensure_pool_daily` 惰性聚合 (失败→
+    当日不产信号); 判定单源到门表, 三条路径 (scan_signals/evaluate/scan_days) 全走门表。
 
-关键设计:
-  - 横截面 regime 门 (rmed/score_r 是 G1池级统计量) 在单票回调架构下的实现:
-    模块级惰性聚合缓存 _ensure_pool_daily(pool_target) — 首次调用拉全市场日线
-    (hub.all_codes + hub.daily 逐票200根, as_of=pool_target 截断防前视), 逐票逐日算
-    G1特征 → 按板块分池日度聚合 (n/rmed/dmed/smed) → 滚动20日分位 (不含当日,
-    min_hist=5) → {board: {date: {rmed, score_r}}}。key=pool_target 跨日自动失效;
-    聚合失败 → 当日不产信号 (宁缺勿滥, 与"09月自动空仓"精神一致)。
-  - 回测=实盘同链路: scan_signals 只判末根bar (D-1); 聚合锚 pool_target 取**切片前**
-    bars 末根日期 (实盘=扫描日, 回测=快照末日), 查表 date=切片后末根日期 (D-1) —
-    同一 date 的池统计只由 ≤该日 数据算出 (逐日特征因果), 回测=实盘同 key 同值。
-  - 特征公式与 tmp/migrate_150.py 逐字一致 (_sma_np/_rsi/_atr/_boll_np 本地移植 —
-    indicators.rsi 是 Wilder EMA 口径, 与研究成果不一致, 勿替换; MACD 复用
-    indicators.calc_macd 与研究同源)。
-  - 逐日/批量路径统一走 `_iter_gate_days` (2026-09-23 性能改动): f 与 mask 对同一
-    (bars, board) 恒定, 抽出为生成器后一次 O(n) 预计算 + 逐日 O(1) 查表; 原实现虽已
-    预计算 f, 仍每历史日重算整条 _g1_mask (占单次 gating 95%) ⇒ 回测全历史 **5.3x**
-    (6.69→1.26 ms/票, 全市场 244 天 35.0s→6.6s; tmp/_g56_speed.py)。等价性由
-    tmp/_g56_diff.py 证实: 20440 项逐字段 0 不一致。
-
-易错点:
-  - **全部 G1 指标因果** (实证: f_full[k] 逐位 == _g1_arrays(bars[:k+1])[k],
-    29360 点 0 不一致, tmp/_g56_cost.py P1) ⇒ 可用**未切片**全序列一次算出第 k 日
-    特征, 与"按 as_of 切片后重算"完全相同 ⇒ scan_signals 已不再真的切片。
-    ⚠️ 若将来引入非因果/双向平滑指标 (如 centered MA / 用未来值回填), 此前提失效,
-    必须回退切片, 否则会引入前视。
-  - `_g56_gate` 的 mask 参数应传预算值: 不传则内部重算整条 mask (95% 开销)。目前仅
-    单次调用的 scan_signals 路径允许省略; 一切循环/批量路径必须走 _iter_gate_days。
-  - 前视防护: 聚合每票 bars 必须 as_of=pool_target 截断; 池统计按特征日(D-1)为 key,
-    score_r 滚动分位不含当日 (同 tmp/regime3_150._pctl_roll)。
-  - 与研究的已知口径差 (仅边缘日微差): 研究池统计来自 g1deep3 缓存 — 行级隐含
-    D0-gap 过滤与引擎完成度条件 (D0 信息回流进池); 生产池=纯 G1 成员 (零前视,
-    更严格), 验收按"量级一致"而非逐笔一致。
-  - 出场 = 无追踪纯 7d/-8% (2026-09-17 出场研究定稿: trail 保留系数 0.85~0.97 全区间
-    单调, 0.75~0.85 平台化≈无追踪 → 纯 7d/-8% 是结构终点非阈值拟合; 月度全向改善,
-    仅主板 06 月 -0.48pp)。day_close 重放 = _exit_no_trail 同式: 止损线 low≤
-    entry*0.92 按 min(open, 止损线) 成交, d≥7 到期收盘。**勿改回调 _run_backtest**
-    — 其含追踪逻辑且 exit_day 是"兜底残影"与"触发"的混合值, 截断重放下无法区分。
-    一字跌停日误标出场无实害: 框架 exit 次日开盘执行, 天然等价于"跌停顺延次日开盘强平"。
-  - live 模式只做 -8% 硬止损兜底 (框架 stop_price 守卫已覆盖, 此处防 stop_price
-    缺失); D0 当日跌破止损由框架标记 → 次日开盘执行 (回测引擎 T+1 忽略 D0 破位,
-    live 更保守, 全框架策略同此口径)。
-  - 阈值 (R56/ATR_Q5/RMED/SCORE/PCTB) 全部为150天窗口样本内拟合, 08月样本占比
-    偏高 (20cm 69%) — 纸面跟踪期持续看月度结构, 见 MEMORY.md 行62-63。
+研究依据 / 150 天回测结论 / 与研究口径差 / 性能优化史 → `docs/策略研究依据归档.md#g56`。
 """
 from __future__ import annotations
 
@@ -76,7 +30,6 @@ from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
-    data_end_close,
 )
 from app.utils.logger import get_logger
 
@@ -112,7 +65,7 @@ R56 = {"main": 0.51, "gem_star": 0.66}        # rhist_chg 门 = 150天池内Q5
 # ATR_Q5 / ROLL / MIN_HIST 2026-09-26 下沉 core/features/cross_section.py (层清零)
 from app.market_cn.auto.core.features.cross_section import (  # noqa: E402  (L73 下方, 常量区之后)
     ATR_Q5, ROLL, MIN_HIST, _aggregate, _g1_arrays, _g1_mask, _ensure_pool_daily,
-    g1_state_features, g1_state_init, g1_state_step,
+    g1_state_features, g1_state_init, g1_state_step, g1_state_window_bars,
 )
 from app.market_cn.auto.core.present.contract import (   # 展示层折叠契约
     InsufficientHistory, Progress, Stage,
@@ -164,56 +117,21 @@ GAP_LIM = {"main": 0.098, "gem_star": 0.198}   # entry 过滤硬编码口径 (�
 #   _g1_arrays / _g1_mask / _ensure_pool_daily 均已从上导入, 此处不再重复定义
 # ================================================================
 
-def _g56_gate(f, pool, board, k, date_k, mask=None, p=None, age=None):
-    """五重共振门判定 (给定预计算特征 f@k / 池统计 pool / 板块 board / 信号日索引 k)。
-
-    mask: 可选预计算的 `_g1_mask(f, board)` 结果。**同一 (f, board) 下 mask 恒定**,
-      逐日循环里若不传入则每次重算整条序列 —— 实测占 _g56_gate 单次耗时 **95%**
-      (0.0225 / 0.0238 ms, `tmp/_g56_hotspot.py`), 抹掉后单次降到 0.0013 ms (**18x**)。
-      逐日/批量调用方务必预算一次并传入, 见 `_iter_gate_days`。
-
-    p: 可选 params() dict, 2026-09-26 迁入 dist_ma20_min 规则门, 其他 score
-      阈值仍冻结常量; p=None 或缺键时 fallback 到 DEFAULT_PARAMS["dist_ma20_min"]。
-
-    返回 (bool_pass, st): st=该日横截面统计 (None=池缺失)。scan_signals 与
-    backtest_stock 共用此单一判定事实源 — 修复 backtest 逐日重算 _g1_arrays 的 O(n^2)
-    坑 (原 backtest 每历史日调 scan_signals 重算全序列指标); 改规则务必同步此处。
-    """
-    # age: **逻辑数据年龄** (递推/播种路径必传, 见 _g1_mask 文档)。
-    #   全量路径 f 是整条序列 ⇒ age=None (cut=G1_WARMUP) 与旧行为逐位一致;
-    #   递推路径 f 只有窗口 ⇒ 必须传真实 age, 否则暖机会误杀/误放。
-    #   k=-1 是递推路径的"末位"用法 (与全量 k=末日索引 同义)。
-    mk = _g1_mask(f, board, age=age) if mask is None else mask
-    if not mk[k] or not f["rhist_chg"][k] > R56[board]:
-        return False, None
-    st = pool.get(board, {}).get(date_k)
-    if st is None:
-        return False, None                          # 池统计缺失 (聚合失败/暖机/空池)
-    if board == "main":
-        if not (st["rmed"] > MAIN_RMED_MIN and f["pctb"][k] <= MAIN_PCTB_MAX):
-            return False, None
-    else:
-        if not (st["score_r"] is not None and st["score_r"] > GEM_SCORE_MIN
-                and f["dif0"][k] <= 0):
-            return False, None
-    # 规则门: 信号日不得深跌于 MA20 (2026-09-25; dist_ma20 是特征阈值, 非 score)
-    # 2026-09-26 迁入 config: 优先从 p 读, fallback 模块常量 (兼容旧调用方)
-    d20 = f.get("dist_ma20")
-    lo = (p or {}).get("dist_ma20_min", DIST_MA20_MIN)
-    if d20 is not None and k < len(d20):
-        dv = float(d20[k])
-        if not (dv == dv) or dv < lo:          # nan → 不放行
-            return False, None
-    return True, st
+# _g56_gate 已退役 (2026-10-09 P6): 判定单源到门表后无调用点。其判定逻辑现由
+# g56.yaml 门表 + GateEvaluator.evaluate_all 唯一承载; 阈值常量 (R56/MAIN_RMED_MIN/
+# MAIN_PCTB_MAX/GEM_SCORE_MIN/DIST_MA20_MIN) 保留作研究依据注释 (见上方常量区)。
+# 历史性能注记: 逐日循环重算 _g1_mask 占单次 gating 95% (0.0225/0.0238 ms,
+# tmp/_g56_hotspot.py), 现由 `_iter_gate_days` 一次性预计算 + O(1) 查表替代 (18x)。
 
 
-def _iter_gate_days(bars, board, pool, lo_k, hi_k, p=None):
-    """单票逐日列出通过五重共振门的 (k, f, st) —— 共用事实源, 一次预计算 + 逐日 O(1)。
+def _iter_gate_days(bars, board, pool, lo_k, hi_k, code):
+    """单票逐日列出通过五重共振门的 (k, f, st) —— 判定单源到门表, 一次预计算 + 逐日 O(1)。
 
-    2026-09-26 新增 p 参数透传 dist_ma20_min 规则门阈值 (见 _g56_gate 签名)。
-    从 backtest_stock 抽出: `f` 与 `mask` 对同一 (bars, board) 恒定, 但原实现在每个
-    历史日都重算 `_g1_mask` 整条序列 (占 _g56_gate 95%)。此处一次算完, 逐日只做标量
-    索引与标量比较 ⇒ 单次 gating 0.0238 → 0.0013 ms (18x, `tmp/_g56_hotspot.py`)。
+    判定单源（切口 2 收尾）: 精确判定走门表 `ev.evaluate_all`（唯一规则事实源），
+    `_g1_mask` 仅作**向量化预筛**（其 ①②③+warmup+finite 与门表 g1_trend/atr/big20/
+    warmup/finite 门等价, 见 cross_section._g1_mask —— 阈值同步是遗留项）。预筛把
+    绝大多数非候选日 O(1) 跳过, 只有 mask 通过的日子才付门表求值开销 ⇒ 实测比折叠
+    慢 1.4x、比无预筛快 7x（tmp 性能对比）。
 
     前视安全: 所有 G1 指标**因果**(实证: 29360 点逐位比对, `f_full[k]` ==
     `_g1_arrays(bars[:k+1])[k]`, 0 不一致, `tmp/_g56_cost.py` P1) ⇒ 可以用未切片
@@ -222,18 +140,26 @@ def _iter_gate_days(bars, board, pool, lo_k, hi_k, p=None):
     索引: lo_k..hi_k **含端点**, 越界自动裁剪; 与 `_g1_mask` 的 `m[:68]=False`
     一致, k<68 恒不通过, 无需调用方过滤。
     """
+    from app.market_cn.auto.core.runtime.evaluate import GateEvaluator
     n = len(bars)
     lo = max(0, lo_k)
     hi = min(n - 1, hi_k)
     if hi < lo:
         return
     f = _g1_arrays(bars)
-    mask = _g1_mask(f, board)
+    mask = _g1_mask(f, board)          # 向量化预筛（阈值与门表同源，见遗留项注释）
+    spec = _g56_spec()
+    ev = GateEvaluator(spec, board_type=board, code=code, stock_info={})
     for k in range(lo, hi + 1):
         if not mask[k]:
             continue
-        ok, st = _g56_gate(f, pool, board, k, str(bars[k]["time"])[:10], mask=mask, p=p)
+        ctx = Ctx(bars, k, lu_idx=0, params=spec.params, board_type=board, code=code,
+                  stock_info={}, ext={"g56_feats": f, "g56_pool": pool},
+                  market=spec.market_spec)
+        ok, _ = ev.evaluate_all(bars, k, spec.params, ctx=ctx)
         if ok:
+            st = {"rmed": g56_pool_field(ctx, "rmed"),
+                  "score_r": g56_pool_field(ctx, "score_r")}
             yield k, f, st
 
 
@@ -243,22 +169,25 @@ def _iter_gate_days(bars, board, pool, lo_k, hi_k, p=None):
 # ================================================================
 
 
-def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None):
+def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None,
+                   stop_loss_lu=None):
     """无追踪出场模拟 — 骨架上收 core.exit_engines.run_hold_stop。
 
-    hold_days / stop_loss: 由调用方注入 (g56.yaml); 传 None 回落模块常量。
-    code: 可选, 用于判断信号日是否涨停 (D-1 板) —— 该子集用 STOP_LOSS_LU 紧止损,
+    hold_days / stop_loss / stop_loss_lu: 由调用方注入 (g56.yaml); 传 None 回落模块常量
+        (常量降级为兜底默认值, yaml 是权威事实源, 二者值一致)。
+    code: 可选, 用于判断信号日是否涨停 (D-1 板) —— 该子集用 stop_loss_lu 紧止损,
         降低 -8% 深亏触发 (2026-09-25)。缺 code 时行为与历史逐笔一致。
     返回 {'exit_day','exit_price','return_pct','peak_return_pct'}。
     """
     _hold = HOLD_DAYS if hold_days is None else int(hold_days)
     _stop = STOP_LOSS if stop_loss is None else float(stop_loss)
+    _stop_lu = STOP_LOSS_LU if stop_loss_lu is None else float(stop_loss_lu)
     if code and s >= 1:
         try:
             from app.market_cn.auto.core.market import get_board_type, is_limit_up
             bt = get_board_type(code)
             if is_limit_up(float(bars[s - 1]["close"]), float(bars[s - 2]["close"]), bt):
-                _stop = max(_stop, STOP_LOSS_LU)  # -5 大于 -8 → 更紧
+                _stop = max(_stop, _stop_lu)  # -5 大于 -8 → 更紧
         except Exception:
             pass
     from app.market_cn.auto.core.exit_engines import run_hold_stop
@@ -288,15 +217,38 @@ def _score_of(dist_ma20, dif0):
     return int(min(100, max(0, round(v))))
 
 
+_SPEC: dict = {}
 
 
-def _mk_signal(code, bars, k, f, st):
-    """命中日 k → Signal (单日 scan_signals 与批量 scan_days 共用的唯一构造点)。
+def _g56_spec():
+    """门表 StrategySpec 单例缓存（判定单源到门表后 scan_signals 用它求门）。"""
+    if "g56" not in _SPEC:
+        from app.market_cn.auto.core.runtime.evaluate import load_strategy
+        _SPEC["g56"] = load_strategy("g56")
+    return _SPEC["g56"]
 
-    抽出的理由: 两处若各写一份, 字段口径迟早分叉 (score 取整/pctb 位数/score_r None
+
+def _mk_signal(code, bars, k, f, pool=None):
+    """命中日 k → Signal (单日 scan_signals / 批量 scan_days / 折叠 ready **共用的唯一构造点**)。
+
+    抽出的理由: 多处若各写一份, 字段口径迟早分叉 (score 取整/pctb 位数/score_r None
     处理都是易错点)。改任一字段必须只改这里。
+
+    ★ 2026-10-09 (D6/R1 收口): extra 的**展示字段由宏 g56.yaml `signal.fields` 单源产出**
+    —— 经 `build_signal` 逐条求值 expr (feat('rhist_chg') / pool_field('rmed') ...)。
+    本函数只补结构性键 (`buy_mode`)。宏加字段而引擎无对应 expr 会在加载期(静态 as-of)或
+    求值期立即暴露, 不再出现「宏里写着、产物里没有」的静默漂移 (对照旧实现: 硬编码的
+    dif0/dist_ma20 与宏声明 nd_* 双向不一致)。
+    pool: 横截面池 {board: {date: st}} —— rmed/score_r 的取值来源 (由各调用路径注入;
+          `_scan_one`/`scan_days` 有池, 折叠 `_mk_ready` 传当日池)。缺省 {}。
     """
-    rhc = float(f["rhist_chg"][k])
+    from app.market_cn.auto.core.runtime.evaluate import build_signal
+    spec = _g56_spec()
+    board = get_board_type(code)
+    ctx = Ctx(bars, k, lu_idx=0, params=spec.params, board_type=board, code=code,
+              ext={"g56_feats": f, "g56_pool": pool or {}}, market=spec.market_spec)
+    extra = build_signal(ctx, spec)
+    extra["buy_mode"] = "next_open"
     dist = (float(bars[k]["close"]) / float(f["ma20"][k]) - 1) * 100
     return Signal(
         code=code,
@@ -304,17 +256,7 @@ def _mk_signal(code, bars, k, f, st):
         score=_score_of(dist, float(f["dif0"][k])),
         price=float(bars[k]["close"]),
         label=STRATEGY_LABEL + SIGNAL_OPEN_RANGE_HINT,
-        extra={
-            # 不写 "board" 键: store.signal_row 回退 get_board_name (中文板块名,
-            # 与全表落库口径一致); 板块类型由 code 前缀可逆推导
-            "rhist_chg": round(rhc, 3),
-            "boll_pctb": round(float(f["pctb"][k]), 2),
-            "dif0": round(float(f["dif0"][k]), 3),
-            "dist_ma20": round(dist, 2),
-            "rmed": round(st["rmed"], 3),
-            "score_r": None if st["score_r"] is None else round(st["score_r"], 3),
-            "buy_mode": "next_open",
-        },
+        extra=extra,
     )
 
 
@@ -440,7 +382,6 @@ class G56Strategy(StrategyBase):
 
     def evaluate(self, state, inp, prev):
         """预处理/回测/实时共用：持仓出场 → D0 入场 → 新信号（五重共振）。"""
-        p = self.params()
         bar, code = inp.bar, inp.code
         events = []
         holding = None
@@ -452,23 +393,35 @@ class G56Strategy(StrategyBase):
             entry_age = int(prev.payload["entry_age"])
             d = (state["age"] + 1) - entry_age + 1       # 持仓日（d=1 入场日）
             if d >= 2:
-                stop_use = float(prev.payload["stop_use"])
-                stop_line = entry_price * (1 + stop_use / 100)
-                highs = [w[1] for w in state["window"][-(d - 1):]] if d > 1 else []
-                peak = max(highs + [float(bar.get("high") or 0)])
-                exit_ev = None
-                if float(bar.get("low") or 0) <= stop_line:
-                    fill = min(float(bar.get("open") or 0), stop_line)
-                    exit_ev = self._exit_event(prev, bar, d, round(fill, 3),
-                                               f"止损{stop_use:g}%", peak)
-                elif d >= HOLD_DAYS:
-                    exit_ev = self._exit_event(
-                        prev, bar, d, round(float(bar.get("close") or 0), 3),
-                        f"到期{HOLD_DAYS}天", peak)
-                if exit_ev is not None:
-                    events.append(exit_ev)
-                else:
+                # 出场单源（切口 2）: 委托 `exit_decision`（唯一逐日出场实现），不在此
+                # 手写止损/到期判定。evaluate 的 state 是「截至昨日」（step 在 evaluate 后），
+                # window 末位=昨日、bar=今日 ⇒ seg = window 末 (d+1) 根（D-2..昨日）+ 今日 bar，
+                # entry_idx=2 指向入场日（seg[0]=D-2 / seg[1]=D-1 信号日 / seg[2]=入场日），
+                # 使 exit_decision 的 D-1 涨停子集紧止损（bars[ei-1]/[ei-2]）正常判定 —— 与旧
+                # 手写 `prev.payload["stop_use"]`（exec 时 _lu_subset 算好）逐位等价。
+                # window 是 [date, high, low, close]（无 open），止损 fill=min(open,止损线)
+                # 只在「今日」读 open ⇒ 历史 open 用 close 占位不影响判定。
+                win_w = state["window"]
+                seg = [{"time": w[0], "open": w[3], "high": w[1], "low": w[2], "close": w[3]}
+                       for w in win_w[-(d + 1):]]
+                seg.append({"time": str(bar.get("time", ""))[:10],
+                            "open": float(bar.get("open") or 0),
+                            "high": float(bar.get("high") or 0),
+                            "low": float(bar.get("low") or 0),
+                            "close": float(bar.get("close") or 0)})
+                dec = self.exit_decision(
+                    {"code": code, "entry_price": entry_price},
+                    snap={"mode": "day_close", "bars": seg, "entry_idx": 2})
+                if dec.action != "exit":
                     holding = prev
+                else:
+                    exit_price = (float(seg[-1]["open"]) if getattr(dec, "fill", "") == "open"
+                                  else float(dec.price))
+                    peak = max((float(w[1]) for w in win_w[-(d - 1):]),
+                               default=float(bar.get("high") or 0))
+                    peak = max(peak, float(bar.get("high") or 0))
+                    events.append(self._exit_event(prev, bar, d, round(exit_price, 3),
+                                                   dec.reason, peak))
             else:
                 holding = prev
         # ── D0 入场（gap 过滤 = 旧 entry_decision/backtest 同式）──
@@ -482,7 +435,7 @@ class G56Strategy(StrategyBase):
                 "entry_date": bar.get("time", ""), "entry_price": open_px,
                 "signal_date": prev.date, "gap": None if gap is None else round(gap * 100, 2),
                 "buyable": buyable,
-                "stop_use": STOP_LOSS_LU if self._lu_subset(state, code) else STOP_LOSS,
+                "stop_use": self._stop_use(state, code),
                 "entry_age": state["age"] + 1,
                 # P5-④ 前置 (2026-10-08): 买入当日 15:01 实时确认（持仓 / 当日出场）。
             }, next_realtime="15:01")
@@ -496,23 +449,77 @@ class G56Strategy(StrategyBase):
             f = g1_state_features(st_day)
             board = get_board_type(code)
             day_pool = ((inp.ctx or {}).get("_day") or {}).get("pool") or {}
-            ok, st = self._gate(f, st_day, board, day_pool, bar.get("time", ""), p)
+            # 门诊断通道（Step 1）：ctx["_gate_dbg"] 注入全门向量回调（与链 A gate_dbg 同签名）
+            _gate_dbg = (inp.ctx or {}).get("_gate_dbg")
+            ok, st = self._gate(f, st_day, board, day_pool, bar.get("time", ""), code,
+                                gate_dbg=_gate_dbg)
             if (tr := (inp.ctx or {}).get("_trace")) is not None:   # 门原因通道（契约约定）
                 tr.gate(ok, st, date=str(bar.get("time", ""))[:10])
             if ok:
-                events.append(self._mk_ready(code, bar, f, st))
+                events.append(self._mk_ready(code, bar, f, day_pool,
+                                              g1_state_window_bars(st_day)))
         return events
 
-    def _gate(self, f, st_day, board, day_pool, date, p):
-        """五重共振门 —— **委托 `_g56_gate`**（唯一实现）。
+    def _gate(self, f, st_day, board, day_pool, date, code, gate_dbg=None):
+        """五重共振门 —— 判定单源到门表（切口 2）：递推窗口 → Ctx(ext) → GateEvaluator。
 
-        递推路径：k=-1（窗口末位）+ 必须传真实 age（窗口短于真实历史）。
+        递推路径 bars 只是窗口（G56_WIN=35 根），门表 `feat()`/`finite()` 用 `ctx.i`
+        （窗口末位下标）索引窗口特征，`warmup()` 用 `ctx.i_age` 判暖机。
+        ⚠ `ctx.i_age` 的口径 = **信号日 0-based 真实绝对索引**（与 `ctx.i` 同单位，见
+        Ctx 契约「缺省 None = 视作 i_age == i」）。`st_day["age"]` 是**累计根数**
+        (= 索引 + 1，见 g1_state_init: age=n)，故传入时**必须 -1**。
+        等价性由 tmp/verify_g56_evaluate.py 背书（14513 判定点 0 不一致，含暖机边界）。
+        参数用 spec.params（yaml 是门表唯一事实源），不再走 self.params()（config 覆盖）。
+        返回 (bool_pass, st)；st = {rmed, score_r}（门通过时从 ctx 池取，与折叠同源）。
+
+        gate_dbg（Step 1）：非 None 时 evaluate_all 自动 fire phase="all" 全门向量。
+        fire 的 i = `st_day["age"] - 1`（信号日 **0-based 绝对索引**）—— 对齐链 A
+        `_backtest_day_flow` 的 `i = s-1`（信号日 0-based 绝对索引），门向量聚合 key
+        (code, i) 才逐点可比。此位置仅在 gate_dbg 非 None 时被消费（evaluate_all 传了
+        ctx ⇒ i 不参与判定），故对判定/交易**零影响**。
+
+        ★ 2026-10-09 修两处「age 口径」off-by-one（链 B 门诊断对齐链 A，见
+        tmp/_verify_g56_gatedbg_equiv.py / _e2e.py）：
+          ① fire 键：曾用 `st_day["age"]`（= 索引+1）⇒ 全体 fire key 比链 A 大 1，
+             门漏斗与链 A 系统性错位（930 点 474 不一致 → 修后 0）。仅诊断影响。
+          ② 暖机门：`i_age=st_day["age"]`（计数）使 `warmup()` 判 `age>=68` ⇔ 索引>=67，
+             比单源口径（`_g1_mask` / 旧 `_g56_gate` / `scan_*` 均为 **索引>=68**）早一天 ⇒
+             信号日 67 被错误放行（潜在多发一笔）。改传 `age-1` 后与全系统一致。
         """
-        return _g56_gate(f, day_pool, board, -1, date, p=p, age=st_day["age"])
+        from app.market_cn.auto.core.runtime.evaluate import GateEvaluator
+        spec = _g56_spec()
+        si = {}            # 递推路径无 stock_info（g56 门不依赖股本元数据）
+        wb = g1_state_window_bars(st_day)
+        i = len(wb) - 1
+        # 候选预筛（fire 时机对齐链 A `_backtest_day_flow`）：暖机期不 fire gate_dbg。
+        # 链 A 的信号日 i=s-1 从 67 起（s=day_start=68 入场日），故 fire 从信号日 67 起
+        # ⇒ 递推路径 age<68（= 信号日<67）不 fire。i=67 当日暖机门为 False（正确拒绝），
+        # 但链 A 仍 fire 该日向量 ⇒ 此处也须 fire，才能逐点可比。
+        # 末 9 日缓冲（day_end=9）属回测窗口边界，递推走到末日，差异在验证记录说明。
+        if st_day["age"] < 68:
+            return False, None
+        ev = GateEvaluator(spec, board_type=board, code=code, stock_info=si,
+                           gate_dbg=gate_dbg)
+        ctx = Ctx(wb, i, lu_idx=0, params=spec.params, board_type=board, code=code,
+                  stock_info=si, ext={"g56_feats": f, "g56_pool": day_pool},
+                  market=spec.market_spec, i_age=st_day["age"] - 1)
+        ok, _ = ev.evaluate_all(wb, st_day["age"] - 1, spec.params, ctx=ctx)
+        if not ok:
+            return False, None
+        st = {"rmed": g56_pool_field(ctx, "rmed"),
+              "score_r": g56_pool_field(ctx, "score_r")}
+        return True, st
 
-    def _mk_ready(self, code, bar, f, st):
-        """ready 事件 —— **委托 `_mk_signal`**（唯一信号构造点, k=-1 取末位）。"""
-        sig = _mk_signal(code, [bar], -1, f, st)
+    def _mk_ready(self, code, bar, f, pool, wb):
+        """ready 事件 —— **委托 `_mk_signal`**（唯一信号构造点）。
+
+        wb = 与特征数组 f 对齐的窗口 bars (`g1_state_window_bars(st_day)`)；末位换成真
+        `bar`（窗口微缩只有 date/close，真 bar 含完整 time）。这样 `_mk_signal` 内
+        build_signal 的 `feat()` 能以 `ctx.i = len-1`（非 -1 —— feat 拒绝负下标）取当日
+        特征、`pool_field()` 取当日板块池；`Signal.time/price` 仍来自真 bar（语义不变）。
+        """
+        bars_ctx = list(wb[:-1]) + [bar]
+        sig = _mk_signal(code, bars_ctx, len(bars_ctx) - 1, f, pool=pool)
         return Progress(stage="ready", date=bar["time"], payload={
             "price": sig.price, "score": sig.score, "label": sig.label,
             "extra": sig.extra}, next_realtime="09:25")
@@ -524,6 +531,17 @@ class G56Strategy(StrategyBase):
         if len(closes) < 2 or closes[-2] <= 0:
             return False
         return is_limit_up(closes[-1], closes[-2], get_board_type(code))
+
+    @staticmethod
+    def _stop_use(state, code):
+        """出场止损幅度（yaml 权威 + 模块常量兜底，值一致）。
+
+        D-1 涨停子集用 stop_loss_lu（-5% 紧止损），否则 stop_loss（-8%）。
+        """
+        sp = _g56_spec().params
+        stop = float(sp.get("stop_loss", STOP_LOSS))
+        stop_lu = float(sp.get("stop_loss_lu", STOP_LOSS_LU))
+        return stop_lu if G56Strategy._lu_subset(state, code) else stop
 
     def _exit_event(self, prev, bar, d, price, reason, peak):
         entry = float(prev.payload["entry_price"])
@@ -546,24 +564,19 @@ class G56Strategy(StrategyBase):
         board = get_board_type(code)
         if board not in ("main", "gem_star"):
             return []
-        # 聚合锚=切片前末根 (回测=快照末日); as_of 只决定取哪一根, 不再真的切片
-        pool_target = str(bars[-1]["time"])[:10]
-        p = self.params(params)
-        # 暖机/越界: 原实现对小 as_of 会因 np.convolve 广播失败而崩溃 (切片不足 20 根),
-        # 现按 _g1_mask 的 m[:68]=False 口径静默返回空 —— 该区间本就不可能出信号
+        # 暖机/越界: m[:68]=False 口径静默返回空（该区间不可能出信号）
         if len(bars) < 68:
             return []
         k = len(bars) - 1 if as_of is None else as_of
         if not (67 <= k < len(bars)):
             return []
-        # 全序列一次算 f, 不再 _g1_arrays(bars[:k+1]): 指标全部因果, f_full[k] 逐位
-        # == 截断重算的第 k 个值 (实证 29360 点 0 不一致, tmp/_g56_cost.py P1)
-        f = _g1_arrays(bars)
-        date_k = str(bars[k]["time"])[:10]
-        ok, st = _g56_gate(f, _ensure_pool_daily(pool_target), board, k, date_k, p=p)
-        if not ok:
-            return []                              # G1池 & 56%门 & 横截面 regime 门
-        return [_mk_signal(code, bars, k, f, st)]
+        # 门表单日判定（复用 _scan_one，判定单源；池锚=信号日，修前视）
+        spec = _g56_spec()
+        from app.market_cn.auto.core.runtime.evaluate import GateEvaluator
+        si = (params or {}).get("stock_info")
+        ev = GateEvaluator(spec, board_type=board, code=code, stock_info=si)
+        sig = _scan_one(spec, ev, bars, k, board, si)
+        return [sig] if sig is not None else []
 
     # ---- 横截面预热 (声明制; 编排层调 prewarm 一次, 不硬编码策略 key) ----
     def prewarm(self, bars_map, hi_date):
@@ -606,14 +619,13 @@ class G56Strategy(StrategyBase):
         if pool is None:
             pool = _ensure_pool_daily(hi_date or str(bars[-1]["time"])[:10])
         out = []
-        p = self.params(params)
-        for k, f, st in _iter_gate_days(bars, board, pool, 0, len(bars) - 1, p=p):
+        for k, f, _st in _iter_gate_days(bars, board, pool, 0, len(bars) - 1, code):
             d = str(bars[k]["time"])[:10]
             if lo_date and d < lo_date:
                 continue
             if hi_date and d > hi_date:
                 continue
-            out.append(_mk_signal(code, bars, k, f, st))
+            out.append(_mk_signal(code, bars, k, f, pool=pool))
         return out
 
     # ---- D0 竞价处置 (monitor ~09:25): gap≥涨停幅度 → 不可买 (同回测 gap 过滤) ----
@@ -664,9 +676,14 @@ class G56Strategy(StrategyBase):
         entry_price = float(row.get("entry_price") or 0)
         if entry_price <= 0:
             return ExitDecision("hold")
+        # 出场参数单源到 yaml (spec.params 权威, 模块常量兜底, 二者值一致)
+        sp = _g56_spec().params
+        _hold = int(params.get("hold_days", sp.get("hold_days", HOLD_DAYS)))
+        _stop = float(params.get("stop_loss", sp.get("stop_loss", STOP_LOSS)))
+        _stop_lu = float(params.get("stop_loss_lu", sp.get("stop_loss_lu", STOP_LOSS_LU)))
         mode = snap.get("mode")
-        # D-1 涨停子集紧止损 (2026-09-25, STOP_LOSS_LU); 信号日 = entry_idx-1
-        stop_use = STOP_LOSS
+        # D-1 涨停子集紧止损 (2026-09-25, stop_loss_lu); 信号日 = entry_idx-1
+        stop_use = _stop
         try:
             ei = snap.get("entry_idx")
             bars_chk = snap.get("bars") or []
@@ -675,7 +692,7 @@ class G56Strategy(StrategyBase):
                 if is_limit_up(float(bars_chk[ei - 1]["close"]),
                                float(bars_chk[ei - 2]["close"]),
                                get_board_type(row["code"])):
-                    stop_use = max(STOP_LOSS, STOP_LOSS_LU)
+                    stop_use = max(_stop, _stop_lu)
         except Exception:
             pass
         if mode == "live":
@@ -703,12 +720,12 @@ class G56Strategy(StrategyBase):
             fill = min(float(b["open"]), stop_line)   # 跳空穿越按开盘 (模拟同式)
             return ExitDecision("exit", reason=f"止损{stop_use:g}%",
                                 price=round(fill, 3))
-        if d >= HOLD_DAYS:
-            return ExitDecision("exit", reason=f"到期{HOLD_DAYS}天",
+        if d >= _hold:
+            return ExitDecision("exit", reason=f"到期{_hold}天",
                                 price=round(float(b["close"]), 3))
         return ExitDecision("hold")
 
-    # ---- 回测钩子 (信号判定走 _g56_gate 统一路径, 指标一次预计算; 出场 _exit_no_trail 无追踪 2026-09-17) ----
+    # ---- 回测钩子 (信号判定走门表统一路径, 指标一次预计算; 出场 _exit_no_trail 无追踪 2026-09-17) ----
 
 
 # ================================================================
@@ -748,8 +765,10 @@ def g56_warmup(ctx: Ctx) -> int:
 
     ★ `ctx.i_age` (2026-10-05): 增量/播种路径下 bars 只是**窗口** (可短至
     `G1_WIN_MIN`=21 根), 此时 `ctx.i` 是窗口内下标、恒 < 68 ⇒ 用它会让全市场
-    **静默归零** (门判 False 却无报错)。真实数据年龄由 `ctx.i_age` 给出。
+    **静默归零** (门判 False 却无报错)。真实数据**0-based 索引**由 `ctx.i_age` 给出
+    (与 `ctx.i` 同单位 —— Ctx 契约「缺省 None = 视作 i_age == i」)。
     ⚠ i_age 为 None (生产现状) → 退化为 ctx.i, 与历史逐位一致。
+    ⚠ 传的是**索引不是计数**（seeds 侧 `state["age"]` 是累计根数, 传前须 -1）。
     """
     age = ctx.i_age if getattr(ctx, "i_age", None) is not None else ctx.i
     return 1 if age >= 68 else 0
@@ -789,6 +808,12 @@ def board_is_gem(ctx: Ctx) -> int:
 
 # ================================================================
 # 「明日操作分」(v2, 2026-09-24 重标定) —— 展示用独立分, 不参与任何门/评分/截断
+# ----------------------------------------------------------------
+# ⚠⚠ 当前**未接线**(2026-10-09 D6): 本段计算已从 `g56.yaml:signal.fields` 移出, 无任何
+#   消费方 (build_signal 不再求值它) —— 属"待产品决策"的候选展示字段, 不是现役产物。
+#   结构约束: 需 ~20 日窗口 + 龙虎榜, 而主干折叠 ready 仅携带单根 bar ⇒ 折叠路径**无法**
+#   产出 (与 scan 全历史口径不一致) ⇒ 直接声明进 fields 会违反「四视图同读一份投影」。
+#   二选一待定: (a) 折叠携带历史窗口使其上线; (b) 删除本段(~200 行)。
 # ----------------------------------------------------------------
 # 语义: 用 **T 日收盘后可知**的信息, 估算 **T+1 开盘买 → T+1 收盘卖** 的相对强弱。
 #       50 = 明日全市场平均。偏离 50 的幅度 ∝ 预期超额收益 (加权 1pp ↔ 100 分)。
@@ -1048,7 +1073,11 @@ def _nd_lhb2(code, dates):
 
 
 def g56_nd_score(ctx: Ctx):
-    """门表私有函数: 明日操作分 = P(T+1 涨)×100 (signal.fields 用; 缺数据 ⇒ None)。"""
+    """门表私有函数: 明日操作分 = P(T+1 涨)×100（缺数据 ⇒ None）。
+
+    ⚠ 2026-10-09 起**未接线**: 已从 `g56.yaml:signal.fields` 移出（折叠无法产出，见上方
+    块头）。此函数仍注册为 g56 私有词 `nd_score`，但无 expr 引用 ⇒ build_funcs 不绑定。
+    """
     p = _nd_parts(ctx.bars, ctx.i, ctx.board_type, ctx.market)
     if p is None:
         return None
@@ -1097,7 +1126,8 @@ def _exit_g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params
     return _exit_no_trail(bars, entry_idx, entry_price,
                           _bp(params, board_type, "hold_days"),
                           _bp(params, board_type, "stop_loss"),
-                          code=code)
+                          code=code,
+                          stop_loss_lu=_bp(params, board_type, "stop_loss_lu"))
 
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
@@ -1105,91 +1135,43 @@ _register_exit("g56_no_trail", _exit_g56_no_trail)
 
 
 # ================================================================
-# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# 门表单日判定 (2026-09-28 下沉 / 2026-10-09 终态② Step 3 退役回测编排)
 # ----------------------------------------------------------------
-# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
-# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
-# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
-# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
-#    analysis_output/auto架构分层_20260928.md
+# 2026-09-28: 原 core/runtime/evaluate.py 的门表回测编排**纯搬运**回本模块自注册。
+# 2026-10-09 终态② Step 3: 回测主路径收敛到事件流折叠 (backtest_stock 薄壳 → core.replay)
+#   ⇒ 全历史回测编排 `_backtest_day_flow` 与 register_day_flow 注册**退役**;
+#   本模块仅保留 `_scan_one` (register_scan_one) 供生产单日判定 (scan_day) 使用。
+# 逐笔等价回归见 analysis_output/auto架构分层_20260928.md
 # ================================================================
 
-from typing import Any, Dict, List
+from app.market_cn.auto.core.runtime.flows import register_scan_one
 
-from app.market_cn.auto.core.entry_modes import resolve_entry
-from app.market_cn.auto.core.exit_modes import run_exit
-from app.market_cn.auto.core.runtime.flows import register_day_flow
 
-def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 g56(五重共振) 全历史回测，返回 trades 列表（与 g56.backtest_stock 逐笔等价）。
+def _scan_one(spec, ev, bars, i, board_type, stock_info):
+    """g56 单日判定 → Signal|None（门表引擎，生产链 scan_day 用）。
 
-    编排逐字镜像 backtest_stock：北交所/长度早返回 → 特征 O(n) 一次预计算 → 横截面池聚合
-    → 逐日 s（信号日 k=s-1）→ 锁仓去重（s <= last_exit_idx 跳过，**在门表之前**）→ 门表求值
-    → 入场=entry_modes(open + gap_max 分板块) → 出场=exit_modes(g56_no_trail 无追踪 7d/-8%)
-    → 锁仓至退出日。g56 无 U1~U4（use_unified_prefilter=False）。
-    起点/终点由 meta.day_start(68) / day_end(9) 声明（镜像 range(68, n-9)）。
+    判定走门表 expr（`ev.evaluate_all`，ctx 带 ext 池）；Signal 组装复用 `_mk_signal`
+    （唯一构造点），展示字段由 `_mk_signal` 经宏 `signal.fields` 产出（rmed/score_r 取自
+    注入的 `g56_pool`）——regime 门已保证池命中，故 rmed 非 None。
     """
     from app.market_cn.auto.core.features.cross_section import _ensure_pool_daily, _g1_arrays
-    # build_signal 属 core.runtime.evaluate; 此处**必须**函数体内 import —— 顶层 import 会
-    # 在 evaluate 半初始化 (ensure_gate_init → autodiscover → 本模块) 时取不到该名字而成环。
-    from app.market_cn.auto.core.runtime.evaluate import build_signal
-
-    if str(code).startswith(("8", "4", "92")) or len(bars) < 68:
-        return []
+    code = ev.code
+    if code.startswith(("8", "4", "92")):
+        return None
+    board = get_board_type(code)
+    if board not in ("main", "gem_star"):
+        return None
+    if len(bars) < 68 or not (67 <= i < len(bars)):
+        return None
     _p = spec.params
-    n = len(bars)
-    # 特征一次预计算（镜像修复① O(n^2)→O(n)）；池按 pool_target 跨股缓存复用
     ext = {"g56_feats": _g1_arrays(bars),
-           "g56_pool": _ensure_pool_daily(str(bars[-1]["time"])[:10])}
-    trades: List[Dict[str, Any]] = []
-    last_exit_idx = -1
+           "g56_pool": _ensure_pool_daily(str(bars[i]["time"])[:10])}
+    ctx = Ctx(bars, i, lu_idx=0, params=_p, board_type=board, code=code,
+              stock_info=stock_info, ext=ext, market=spec.market_spec)
+    ok, _ = ev.evaluate_all(bars, i, _p, ctx=ctx)
+    if not ok:
+        return None
+    return _mk_signal(code, bars, i, ext["g56_feats"], pool=ext["g56_pool"])
 
-    for s in range(int(spec.meta.get("day_start", 68)), n - int(spec.meta.get("day_end", 9))):
-        if float(bars[s].get("open") or 0) <= 0 or s <= last_exit_idx:
-            continue                        # 锁仓去重（镜像修复②：未退出前不重复入场）
-        i = s - 1                           # 信号日 D-1
-        ctx = Ctx(bars, i, lu_idx=0, params=_p, board_type=board_type, code=code,
-                  stock_info=stock_info, ext=ext, market=spec.market_spec)
-        ok, _ = ev.evaluate_all(bars, i, _p, ctx=ctx)
-        if not ok:
-            continue
 
-        # 入场 = entry_modes（open + gap_max；gap >= 涨停幅度 → 一字/触板不可买）
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-
-        # 出场 = exit_modes（g56_no_trail，无追踪 7d/-8%）
-        result = run_exit(spec.exit.get("mode", "g56_no_trail"), bars=bars,
-                          entry_idx=site["entry_idx"], entry_price=site["entry_price"],
-                          code=code, board_type=board_type, params=_p, diag=site["diag"])
-        if not result:
-            # R1: 数据结束未平 → 末日收盘平仓（与主回测路径同口径）
-            result = data_end_close(bars, site["entry_idx"], site["entry_price"])
-        if not result:
-            continue
-
-        sig = build_signal(ctx, spec)
-        ed = s + int(result["exit_day"]) - 1
-        trades.append({
-            "code": code,
-            "board": board_type,
-            "strategy": spec.key,
-            "signal_date": str(bars[i]["time"])[:10],
-            "entry_date": str(bars[s]["time"])[:10],
-            "entry_price": round(float(bars[s]["open"]), 3),
-            "entry_gap": round(float(site["diag"]["d1_gap"]), 2),
-            "exit_date": str(bars[ed]["time"])[:10]
-            if 0 < int(result["exit_day"]) and ed < n else None,
-            "exit_price": result["exit_price"],
-            "exit_day": result["exit_day"],
-            "return_pct": result["return_pct"],
-            "peak_return_pct": result["peak_return_pct"],
-            "exit_reason": result.get("exit_reason"),
-            **sig,
-            "buy_mode": "next_open",
-        })
-        last_exit_idx = ed
-    return trades
-
-register_day_flow("g56", _backtest_day_flow)
+register_scan_one("day", "g56", _scan_one)

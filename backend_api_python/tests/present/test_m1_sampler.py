@@ -76,7 +76,7 @@ class _FakeStrat:
 
 
 class _NoProbeStrat:
-    """scan_signals **不声明** probe 形参 (relay3 现状) ⇒ 不采集。"""
+    """scan_signals **不声明** probe 形参 ⇒ 不采集。"""
 
     def scan_signals(self, bars, code, **params):
         return [_Sig(code=code, time=bars[-1]["time"])]
@@ -197,7 +197,7 @@ def test_m1_shadow_trace_path_equals_probe_path(monkeypatch, spec_name, skey):
     覆盖：sigs/kept/u_fails/rule_trace + 真 `_probe_day` 组装的整 sample。
     逐日扫描（observe 是逐日采样），双证据防假绿（≥1 信号日 + ≥1 落选轨迹日）。
     全绿后 observe 方可切到影子路径，probe 面（P3-④）才谈得上退役。
-    g56/relay3 的 scan_signals 无 probe 形参（M1 天然不采）；knife/tail 无 ctx
+    g56 的 scan_signals 无 probe 形参（M1 天然不采）；knife/tail 无 ctx
     供给不产出 —— 均不在对拍名单，分发器已统一（零行为差异由全量测试背书）。
     """
     import json as _json

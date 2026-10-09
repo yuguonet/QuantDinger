@@ -7,7 +7,7 @@
 
 三条路径 (docs/自动策略框架设计.md §3):
   实盘       scan.run_scan (daily_close) / scan.run_scan_knife (intraday_window)
-  盘中回测   backtest.run_all_intraday (时间线引擎)
+  盘中回测   backtest.run_all_intraday (薄适配器 → 主干折叠 IntradayFeed+core.replay)
   日线回测   strategy.backtest_stock (base 默认 or 策略覆盖)
 
 两层检查:
@@ -17,7 +17,7 @@
      A3 路径/引擎文件禁出现执行约束原语的**内联等价式** (如 * (1 - 0.10) 内联跌停价)。
   B. 运行时同源 (行为对账):
      B1 日线族: 回测 d0_date 集合 ⊆ 实盘口径 kept 集合 (回测只能判实盘会判的日子);
-     B2 盘中族: run_all_intraday 的 (code,date) 集 == IDE 门表通道同集 (两套独立实现同一语义)。
+     B2 盘中族: (已退役, 2026-10-06) 原对账 IDE 门表盘中通道; 该通道随 core/present 退役, 无对账对象。
 
 易错点:
   - 本工具只判定"是否同源", 不做调试 (调试=probe); 分叉定位靠逐笔等价脚本;

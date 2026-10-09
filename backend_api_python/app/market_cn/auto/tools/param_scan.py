@@ -41,7 +41,7 @@
 易错点:
   - 自动网格跳过 None/str/list/dict/0 值参数 (无法相对基准偏移), 打印 skipped
     清单; bool 参数切片后仅基准 1 个邻居, 邻域报"无法判定"属预期 (开关本就二元);
-  - intraday_window 策略 (tail/knife) 走时间线引擎, 1m 历史仅 ~2026-04-20 后,
+  - intraday_window 策略 (tail/knife) 走盘中折叠 (run_all_intraday), 1m 历史仅 ~2026-04-20 后,
     days 给大无增量且慢; 其回测基准=代码默认值 (config params 不进回测路径,
     报告头部已注明; 如需以实盘参数为基准用 --base-params 注入);
   - 显式网格键不在 default_params 时会警告 (可能是拼写错, 或策略不消费该参数);

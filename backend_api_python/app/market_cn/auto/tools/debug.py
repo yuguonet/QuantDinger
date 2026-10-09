@@ -14,10 +14,12 @@
 三种引擎 (自动择一):
 
   A 门表引擎 — strategies/<key>.yaml 存在, 且编排为受支持形态
-      (enumeration=limit_up / day(v1|relay3|break)):
+      (enumeration=limit_up / day(break); 且有折叠契约):
       门值由 **core.runtime.expr.evaluate** 给出 (as-of 安全, 唯一求值器);
-      最终"是否成信号"由 **core.runtime.evaluate.run_backtest** 判定 —— 因为去重±4 /
-      U1~U4 预筛 / 入场腿依赖前序窗口, 只能在整窗引擎里成立; 本工具不复制这些层。
+      最终"是否成信号"由 **StrategyBase.backtest_stock (薄壳→core.replay)** 判定 ——
+      因为去重±4 / U1~U4 预筛 / 入场腿依赖前序窗口, 只能在整窗引擎里成立; 本工具不复制
+      这些层。终态② Step 3 (2026-10-09): 链 A run_backtest 已退役 ⇒ 无折叠契约的策略
+      (无折叠契约的策略) 转插件引擎 (见 B), 不再走门表引擎的"结论"。
 
   B 插件引擎 — 无 YAML (dragon_v2/break_v2/triple_resonance) 或 YAML 需特化
       (g56 横截面 ext):
@@ -56,7 +58,9 @@ import sys
 _ALIAS = {"dragon": "dragon_callback", "dragon2": "dragon_v2", "break_buy": "break"}
 
 # 门表引擎支持的 day 编排 (其余走插件引擎; 见文件头 A/B 分工)
-_GATE_DAY_FLOWS = {"v1", "relay3", "break"}
+# 终态② Step 3 (2026-10-09): 无折叠契约的策略已随链 A 退役而绝迹 (v1/relay3 亦于
+# 2026-10-09 退役归档) ⇒ 门表 day 编排只剩 break。
+_GATE_DAY_FLOWS = {"break"}
 
 
 # ================================================================
@@ -214,11 +218,16 @@ def _funcs(spec, ctx):
 # 引擎 A: 门表追踪
 # ================================================================
 def report_gate_table(key: str, spec, bars: list, code: str, stock_info, i: int,
-                      max_lu: int = 5, pin_lu: str | None = None) -> dict:
-    """门表策略单候选追踪: 逐门值 + 引擎结论 (不复制去重/预筛/入场层)。"""
+                      max_lu: int = 5, pin_lu: str | None = None,
+                      strat=None) -> dict:
+    """门表策略单候选追踪: 逐门值 + 引擎结论 (不复制去重/预筛/入场层)。
+
+    strat: 策略实例。终态② Step 3 (2026-10-09): 引擎结论统一走 ``backtest_stock``
+    (薄壳→replay); 链 A ``run_backtest`` 已退役 ⇒ 无折叠契约者无结论 (调用方转插件引擎)。
+    """
     from app.market_cn.auto.core.market import find_limit_ups
-    from app.market_cn.auto.core.runtime.evaluate import run_backtest
     from app.market_cn.auto.core.market import get_board_type
+    from app.market_cn.auto.strategies.base import _has_fold_contract
 
     date = str(bars[i]["time"])[:10]
     enum = str(spec.meta.get("enumeration", "limit_up")).lower()
@@ -269,8 +278,15 @@ def report_gate_table(key: str, spec, bars: list, code: str, stock_info, i: int,
             print(f"    ... 另有 {len(cands) - max_lu} 个涨停候选 (--max-lu 0 全展 / --lu 锁定)")
 
     # ---- 引擎结论 (去重±4 / U1~U4 / 入场腿只能在整窗引擎里成立) ----
-    trades = run_backtest(bars, code, spec, stock_info=stock_info,
-                          use_prefilter=True) or []
+    # 终态② Step 3 (2026-10-09): 引擎结论统一走 backtest_stock (薄壳→replay); 链 A
+    # run_backtest 已退役 —— 门表结论只对**有折叠契约**的策略可复现, 无契约者由调用方
+    # 置 use_gate=False 转插件引擎 (此处仅兜底)。
+    if strat is not None and _has_fold_contract(strat):
+        trades = strat.backtest_stock(bars, code, stock_info=stock_info,
+                                      use_prefilter=True) or []
+    else:
+        print(f"  [门表引擎结论不可用] 策略 {key} 无折叠契约 (链 A run_backtest 已退役)")
+        trades = []
     out["trades"] = trades
     sig_key = ("signal_date", "d0_date", "lu_date")
     mine = None
@@ -325,6 +341,17 @@ def report_plugin(key: str, strat, bars: list, code: str, stock_info,
     out = {"mode": "plugin", "strategy": key, "code": code, "date": date,
            "samples": [], "traces": [], "trades": [], "conclusion": ""}
 
+    # 终态② Step 3+ (2026-10-09): 无折叠契约的策略在事件流投影上**无法重现** ——
+    # 通用兜底引擎 (`_backtest_stock_legacy`) 已退役, 不再退化到旧 backtest_stock
+    # (那会经薄壳 raise)。显式提示后空返回 (不崩), 与 explain 的「拒绝 + 引导」同口径。
+    from app.market_cn.auto.strategies.base import _has_fold_contract
+    if not _has_fold_contract(strat):
+        print(f"  策略 {key} 未实现折叠契约（init_state/step/evaluate）—— 无法在事件流投影上"
+              f"重现 (回测编排已收敛到 core.replay, 通用兜底引擎已退役)。")
+        out["conclusion"] = (f"{key}: 无折叠契约, 调试通道不可用 "
+                             f"(如需调试请先迁移该策略到事件流折叠契约)")
+        return out
+
     from app.market_cn.auto.core.replay import (
         replay_batch, TradesCollector, TraceCollector)
     # g56 等横截面池策略：单票 replay 缺 begin_day 池 ⇒ 走 replay_batch
@@ -336,14 +363,10 @@ def report_plugin(key: str, strat, bars: list, code: str, stock_info,
         r = res.get(code)
         trades = (r.trades if r else []) or []
         traces = (r.trace if r else []) or []
-    except Exception:
-        # replay 不可用（未迁移折叠契约的旧策略）→ 退化为旧 backtest_stock
-        trades = []
-        try:
-            trades = strat.backtest_stock(bars, code, stock_info=stock_info) or []
-        except TypeError:
-            trades = strat.backtest_stock(bars, code, stock_info=stock_info) or []
-        traces = []
+    except Exception as e:                                    # noqa: BLE001
+        # 有折叠契约者已由上方守卫生效 ⇒ 此处异常是**真错误**, 显式暴露 (不静默)。
+        print(f"  [replay 失败] {type(e).__name__}: {e}")
+        trades, traces = [], []
 
     out["trades"] = trades
     out["traces"] = traces
@@ -528,16 +551,23 @@ def main() -> int:
     use_gate = bool(yaml_path)
     if use_gate:
         from app.market_cn.auto.core.runtime.evaluate import load_strategy
+        from app.market_cn.auto.strategies.base import _has_fold_contract
         spec = load_strategy(key)
         enum = str(spec.meta.get("enumeration", "limit_up")).lower()
-        flow = str(spec.meta.get("day_flow", "v1")).lower()
-        if enum == "day" and flow not in _GATE_DAY_FLOWS:
+        flow = str(spec.meta.get("day_flow", "")).lower()
+        # 终态② Step 3 (2026-10-09): 链 A run_backtest 已退役 ⇒ 门表**引擎结论**只对
+        # 有折叠契约的策略可复现; 无契约者 (当前无, 退役策略见 _archive/) 转插件引擎。
+        if not _has_fold_contract(strat):
+            use_gate = False
+            print("  [无折叠契约 → 转插件引擎 (门表引擎结论不可复现, 链 A 已退役)]")
+        elif enum == "day" and flow not in _GATE_DAY_FLOWS:
             use_gate = False               # g56 等需横截面 ext → 走插件引擎
             print(f"  [门表编排 day_flow={flow} 需特化上下文 → 转插件引擎 (策略自带 TRACE)]")
 
     if use_gate:
         out = report_gate_table(key, spec, bars, args.code, info, i,
-                                max_lu=args.max_lu, pin_lu=args.lu or None)
+                                max_lu=args.max_lu, pin_lu=args.lu or None,
+                                strat=strat)
         out["conclusion"] = _conclude_gate(out)
     else:
         out = report_plugin(key, strat, bars, args.code, info, date, args.days)

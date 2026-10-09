@@ -16,7 +16,11 @@ Excel 比喻：本模块 = 「统计/透视表」与「历史小计」共用的�
     必须走 IntradayFeed（P1.5）。这不是折叠缺陷，是 feed 缺口。
   - **市场门是 fail-closed**：`ctx.mkt_gain` 为 None 时 knife/tail 的门直接拒
     （knife_catch._gates:328）⇒ 回放不供给 mkt_gain = 零 trade 且不报错。
-    本模块用日线横截面 `market_gain()` 供给（与 frames.mkt_gain 同口径）。
+    市场门输入分两层（2026-10-09 评估后收口）：
+      ① **逐槽 as-of**（正解）= `load_market_slots()` → `ctx["mkt_series"]`（盘中折叠用，
+         与生产 `scan._mkt_gain` 同口径；消除「用收盘门控 14:56 入场」的前视）；
+      ② **日频 close 横截面** = `market_gain()` / `load_market_gain()` → `ctx["mkt_gain"]`
+         （仅作 ① 缺失时的回退，勿再当主源 —— 见 docs/市场门口径评估_20261009.md）。
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from app.market_cn.auto.core.present.runner import fold_range
+from app.market_cn.auto.core.replay.gate_dbg import GateDebugCollector
 from app.market_cn.auto.core.replay.trade_map import build_trade, is_self_closed
 
 #: 未闭合链的收尾原因（对齐旧 backtest_stock 口径，勿改文案——golden 依赖）
@@ -33,6 +38,10 @@ REASON_DATA_END = "数据结束平仓"
 
 def market_gain(bars_by_code: dict[str, list[dict]], min_n: int = 50) -> dict[str, float]:
     """批量日线 → {date: 全市场均涨幅%}（横截面，与 `frames.mkt_gain` 同口径）。
+
+    ⚠ **日频口径**（当日 close，全天恒定）。盘中市场门的**正解**是逐槽 as-of
+    `load_market_slots()`（`ctx["mkt_series"]`）；本函数只作其缺失时的**回退**
+    （用收盘门控 14:56 入场 = 前视 —— 见 docs/市场门口径评估_20261009.md）。
 
     盘中策略的市场门 ``mkt_gate`` 是 **fail-closed**：``ctx.mkt_gain`` 为 None 时门
     直接返回 None（永不触发）。日线回放没有全市场分钟帧 ⇒ 必须由横截面日线供给，
@@ -108,24 +117,29 @@ class DailyFeed:
         g = self.mkt_map.get(str(bars[k].get("time"))[:10])
         return {} if g is None else {"mkt_gain": g}
 
-    def run(self, strategy, code: str, *, trace_sink=None) -> list[tuple[int, object]]:
+    def run(self, strategy, code: str, *, trace_sink=None,
+            gate_dbg=None) -> list[tuple[int, object]]:
         """产出 [(bar 下标, Progress)] —— 唯一折叠路径。
 
         ⚠ 必须 ``stateful=True``：exec/exit 链依赖 prev 传递，stateless（prev=None）
         下策略永远不产 exec —— 回测会静默空转（不报错、零 trade）。
 
-        trace_sink: 可选 ``TraceSink``。传入则注入 ``ctx["_trace"]``（调试视图），
-        门原因由策略在 evaluate 内主动打点；不影响任何判定语义。
+        trace_sink: 注入 ``ctx["_trace"]``（门原因，调试视图）。gate_dbg: 注入
+        ``ctx["_gate_dbg"]``（全门向量，门漏斗视图，终态② Step 1）。两者均不影响判定。
         """
         provider = self.ctx_provider
+        extra = {}
         if trace_sink is not None:
-            sink = trace_sink
+            extra["_trace"] = trace_sink
+        if gate_dbg is not None:
+            extra["_gate_dbg"] = gate_dbg
+        if extra:
             base = self.ctx_provider
 
             def provider(idx, bars):
                 ctx = base(idx, bars) if base is not None else None
                 ctx = dict(ctx) if ctx else {}
-                ctx["_trace"] = sink
+                ctx.update(extra)
                 return ctx
         return fold_range(strategy, code, self.bars, self.lo, self.hi,
                           stages=None, ctx_provider=provider,
@@ -149,6 +163,8 @@ class ReplayResult:
     trades: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
     trace: list[dict] = field(default_factory=list)
+    # 门诊断向量 {(code, i): {gate_id: bool}}（终态② Step 1，GateDebugCollector 产出）
+    gates: dict = field(default_factory=dict)
 
 
 class TraceCollector:
@@ -333,6 +349,17 @@ def replay_batch(strategy, bars_by_code: dict[str, list[dict]], *,
         if trace_sink is not None:
             break
 
+    # 门诊断回调（终态② Step 1）：任一票挂了 GateDebugCollector → 全程注入同一回调。
+    # 聚合 key 含 code，跨票共享一个回调不冲突（与 GateCollector 同语义）。
+    gate_dbg = None
+    for cl in collectors.values():
+        for c in cl:
+            if isinstance(c, GateDebugCollector):
+                gate_dbg = c
+                break
+        if gate_dbg is not None:
+            break
+
     states: dict[str, dict] = {}
     prevs: dict[str, object] = {}
     start: dict[str, int] = {}
@@ -379,6 +406,8 @@ def replay_batch(strategy, bars_by_code: dict[str, list[dict]], *,
                 ctx["mkt_gain"] = mkt_map[date]
             if trace_sink is not None:
                 ctx["_trace"] = trace_sink
+            if gate_dbg is not None:
+                ctx["_gate_dbg"] = gate_dbg
             if ctx_provider is not None:
                 ctx.update(ctx_provider(code, date, bars_by_code[code]) or {})
             i = idx_of[code][date]
@@ -407,6 +436,11 @@ def replay_batch(strategy, bars_by_code: dict[str, list[dict]], *,
                 results[code].trades = c.trades
             if isinstance(c, TraceCollector):
                 results[code].trace = c.records
+    if gate_dbg is not None:
+        # 跨票共享同一 GateDebugCollector：merged() 后按 code 拆分回各票结果。
+        merged = gate_dbg.merged()
+        for code in states:
+            results[code].gates = {k: v for k, v in merged.items() if k[0] == code}
     return results
 
 
@@ -416,11 +450,14 @@ def replay(strategy, code: str, feed: DailyFeed, *,
 
     collectors 中每个对象需实现 ``feed(idx, ev)`` 与 ``finish(feed)``。
     若含 ``TraceCollector``，其 sink 自动注入 ``ctx["_trace"]``（调试视图）。
+    若含 ``GateDebugCollector``，其回调自动注入 ``ctx["_gate_dbg"]``（门漏斗视图）。
     """
     trace_sink = next((c.sink for c in collectors
                        if isinstance(c, TraceCollector)), None)
+    gate_dbg = next((c for c in collectors
+                     if isinstance(c, GateDebugCollector)), None)
     res = ReplayResult(code=code, strategy=getattr(strategy, "key", "") or "")
-    for idx, ev in feed.run(strategy, code, trace_sink=trace_sink):
+    for idx, ev in feed.run(strategy, code, trace_sink=trace_sink, gate_dbg=gate_dbg):
         res.events.append({"idx": idx, "stage": getattr(ev, "stage", ""),
                            "date": getattr(ev, "date", ""),
                            "payload": getattr(ev, "payload", None) or {}})
@@ -432,4 +469,6 @@ def replay(strategy, code: str, feed: DailyFeed, *,
             res.trades = c.trades
         if isinstance(c, TraceCollector):
             res.trace = c.records
+        if isinstance(c, GateDebugCollector):
+            res.gates = c.merged()
     return res

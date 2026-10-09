@@ -153,7 +153,7 @@ def is_approx_limit_up(ctx: Ctx) -> bool:
 
 
 def board_height(ctx: Ctx) -> int:
-    """截至决策日 i 的连续涨停天数（板高）。镜像 relay3.consecutive_limit_ups。"""
+    """截至决策日 i 的连续涨停天数（板高）。原镜像 relay3.consecutive_limit_ups（relay3 已于 2026-10-09 退役）。"""
     bars = ctx.bars
     i = ctx.i
     bt = ctx.board_type
@@ -170,7 +170,7 @@ def board_height(ctx: Ctx) -> int:
 
 
 def ma_bull(ctx: Ctx) -> bool:
-    """MA5>MA10>MA20>MA60（镜像 relay3.ma_bull_arrangement，截至决策日 i）。"""
+    """MA5>MA10>MA20>MA60（原镜像 relay3.ma_bull_arrangement，截至决策日 i；relay3 已退役）。"""
     from app.utils.indicators import ma as _ma
     closes = _closes_upto(ctx)
     m5, m10, m20, m60 = _ma(closes, 5), _ma(closes, 10), _ma(closes, 20), _ma(closes, 60)
@@ -180,7 +180,7 @@ def ma_bull(ctx: Ctx) -> bool:
 
 
 def is_bse(ctx: Ctx) -> bool:
-    """是否北交所 / 新三板代码（8/4/92 开头）—— 镜像 relay3.scan_signals 的池子排除。"""
+    """是否北交所 / 新三板代码（8/4/92 开头）—— 原镜像 relay3.scan_signals 的池子排除（relay3 已退役）。"""
     return str(ctx.code or "").startswith(("8", "4", "92"))
 
 

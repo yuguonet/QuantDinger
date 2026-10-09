@@ -1,18 +1,18 @@
 # ================================================================
-# 断板接力策略 (连板→断板期确认日 → 次日开盘买入) — IDE 门表单文件 (M2/M4)
-# 与 strategies/break_buy.py (core.replay) 逐笔等价 (见 tmp/_break_equivalence.py)
+# 断板接力策略 (连板→断板期确认日 → 次日开盘买入) — IDE 门表单文件
 # ----------------------------------------------------------------
-# 结构 (连板→断板期→确认日) 收编为注册函数 feat(name)（见 strategies/break_buy.py），
+# 结构 (连板→断板期→确认日) 由 strategies/break.py 的 feat('is_candidate')(bk_struct) 提供,
 # 5a~5g 判定全部上提为下列门表 → IDE 能逐门展示"为何放行/拦截"。
 # ================================================================
 meta:
   name: 断板
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 1
+  enabled: true                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: day             # 逐日候选 → D0 确认日 → 次日开盘入场
   day_flow: break              # day 流程口径 (信号展示字段集 + 去重键 (streak_start, break_date))
-  day_start: 4                 # 逐日起点 (镜像 break_buy.backtest_stock 的 range(4, n-1))
-  day_min_n: 6                 # 低于此长度直接返回空 (镜像 break_buy 的 n<6 早返回)
+  day_start: 4                 # 逐日起点 (低于此根数不判)
+  day_min_n: 6                 # 低于此根数直接返回空
 
 entry:
   mode: open                   # 次日(D1)开盘买入 (next_open)
@@ -23,15 +23,15 @@ exit:
   mode: break_combo            # 收盘价口径 combo (止损/追踪(需 ret>0)/峰值逃顶/到期) — 分板块阈值
   stop_loss: {main: -8.0, gem_star: -10.0}
   trailing_stop: {main: -6.0, gem_star: -8.0}
-  hold_days: {main: 7, gem_star: 7}   # 20/15→7: 2026-09-22 出场研究定稿(时间上限先行)
+  hold_days: {main: 7, gem_star: 7}   # 最长持有交易日
 
-params:                        # 与 break_buy.BOARD_PARAMS / DEFAULT_PARAMS 同值 (逐笔等价基线)
-  min_streak: 2                # 连板下限 (DEFAULT_PARAMS)
-  max_break_gap: 5             # 断板期最长天数 (DEFAULT_PARAMS)
-  turnover_min: null           # 确认日换手率前置门; null=关 (config 未开启, 与参考默认一致)
-  enhance_filter: true         # 5f 增强过滤开关 (BOARD_PARAMS)
-  ma_bull_filter: false        # 5g 均线多头开关 (BOARD_PARAMS 实为 False → 该门恒放行)
-  # ---- 断板期判定阈值 (BOARD_PARAMS; 分板块用 {board: 值}) ----
+params:                        # 可调参数 (表达式直接引用; 分板块用 {board: 值})
+  min_streak: 2                # 连板下限
+  max_break_gap: 5             # 断板期最长天数
+  turnover_min: null           # 确认日换手率前置门; null = 关 (该门恒放行)
+  enhance_filter: true         # 5f 增强过滤开关
+  ma_bull_filter: false        # 5g 均线多头开关; false ⇒ 该门恒放行
+  # ---- 断板期判定阈值 (分板块用 {board: 值}) ----
   vol_min: 1.2                 # 5b 断板期缩量下限 (均量比, vs 涨停日量)
   vol_max: {main: 2.0, gem_star: 2.5}     # 5b 缩量上限 (>= 上限 拦截)
   drawdown_max: {main: -10, gem_star: -15}  # 5e 断板期回撤下限 (vs 涨停日收盘)
@@ -41,10 +41,10 @@ params:                        # 与 break_buy.BOARD_PARAMS / DEFAULT_PARAMS 同
   confirm_chg_max: 2.0
   vol_r_or_min: 1.4            # 5f 通道2: 断板期均量比 >= 该值 (换手充分)
   pre20_min: 30.0              # 5f 通道3: 连板前20日涨幅 >= 该值 (前期热度)
-  # ---- 出场阈值 (BOARD_PARAMS; 由 exit.mode=break_combo 的分板块解析读取) ----
+  # ---- 出场阈值 (由 exit.mode=break_combo 的分板块解析读取) ----
   stop_loss: {main: -8.0, gem_star: -10.0}
   trailing_stop: {main: -6.0, gem_star: -8.0}
-  hold_days: {main: 7, gem_star: 7}   # 20/15→7: 2026-09-22 出场研究定稿(时间上限先行)
+  hold_days: {main: 7, gem_star: 7}   # 最长持有交易日
 
 # 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门
 # needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)
@@ -70,3 +70,30 @@ gates:
      expr: "not ma_bull_filter or feat('ma_bull') != 0"}  # 5g (仅 ma_bull=False 拦截; None 放行)
   - {id: g_turnover, name: 确认日换手率门, role: qualify, needs_d0: 1, enabled: 1,
      expr: "not turnover_min or turnover_sig() >= turnover_min"}  # ML归因前置门 (默认关)
+
+# 信号展示字段（门通过后求值）。**本表是展示字段的唯一事实源**：.py 提供"词"
+# （bkf/entry_* 原语），本表决定"展示哪些"。生产单日（scan_day/_scan_one）与主干折叠
+# （evaluate）的 Signal.extra 均由本表经 build_signal 求值产出 —— 改字段只改这里。
+# ⚠ 用 `bkf(...)` 而非门表的 `feat(...)`：feat 为门判定服务，非候选日返回失败哨兵值
+#   （first_break_chg=-1e18 / ma_bull 编码 1/-1/0），展示会失真；bkf 返回原始值。
+signal:
+  fields:
+    streak_len:    {expr: "bkf('streak_len')"}
+    streak_start:  {expr: "bkf('streak_start')"}
+    streak_end:    {expr: "bkf('streak_end')"}
+    break_date:    {expr: "bkf('break_date')"}
+    break_days:    {expr: "bkf('break_days')"}
+    break_chg:     {expr: "bkf('break_chg')"}
+    break_gap:     {expr: "bkf('break_gap')"}
+    break_vol_r:   {expr: "bkf('break_vol_r')"}
+    confirm_chg:   {expr: "bkf('confirm_chg')"}
+    confirm_gap:   {expr: "bkf('confirm_gap')"}
+    pre20_gain:    {expr: "bkf('pre20_gain')"}
+    ma_bull:       {expr: "bkf('ma_bull')"}
+    entry_gate:    {expr: "entry_gate()"}
+    entry_pctb:    {expr: "entry_pctb()"}
+    entry_bd:      {expr: "entry_bd()"}
+    turnover_anchor:       {expr: "bkf('turnover_anchor')"}
+    turnover_sig:          {expr: "bkf('turnover_sig')"}
+    turnover_anchor_total: {expr: "bkf('turnover_anchor_total')"}
+    turnover_sig_total:    {expr: "bkf('turnover_sig_total')"}

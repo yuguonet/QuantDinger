@@ -1,9 +1,10 @@
 """ide/evaluate.py — 门表策略加载与回测编排 (M1 原型 → M2 泛化)。
 
-核心：把 strategies/*.py 插件的"信号判定"替换为门表求值；回测编排按 `meta.enumeration`
-分派枚举方式（limit_up=遍历涨停日 / day=逐日），入场/出场则由 **entry_modes / exit_modes**
-按 YAML 的 `entry.mode` / `exit.mode` 选择 —— 成交语义只实现一份（共用 core/exec.py）。
-从而产出与 python 参考版**逐笔等价**的 trades。
+核心：把 strategies/*.py 插件的"信号判定"替换为门表求值（单日判定入口 `scan_day`），
+入场/出场则由 **entry_modes / exit_modes** 按 YAML 的 `entry.mode` / `exit.mode` 选择。
+全历史回测编排（原 `run_backtest`，链 A：门表 runner + 独立出场编排）已于终态② Step 3
+（2026-10-09）退役 —— 回测主路径收敛到事件流折叠（core/backtest.run_all →
+StrategyBase.backtest_stock 薄壳 → core.replay），判定引擎单源。
 
 as-of 守护：Ctx 只暴露 ≤ 决策日 i 的数据（见 functions.Ctx）；门表表达式经
 expr.static_asof_check 加载期静态校验 + 运行时偏移强制，双重杜绝未来函数。
@@ -16,6 +17,8 @@ expr.static_asof_check 加载期静态校验 + 运行时偏移强制，双重杜
 分层 (2026-09-28): 本文件曾是「门表求值 + 5 份策略专属回测编排」的混合体 (840 行,
 其中 415 行 = v1/relay3/break/g56/limit_up 的逐字镜像编排, 占 49%)。编排已**纯搬运**
 回 strategies/<key>.py 并经 core/runtime/flows 自注册; 本文件只留门表加载/求值 + 分派。
+终态② Step 3 (2026-10-09): 再删去 `run_backtest` 分派入口与 5 份 day_flow runner 注册
+(回测主路径已收敛到事件流折叠), 本文件只剩门表加载/求值 + 单日判定分派 (`scan_day`)。
 """
 
 from __future__ import annotations
@@ -29,17 +32,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from app.market_cn.auto.adapters.markets.registry import load_market, require_runnable
-from app.market_cn.auto.core.filters import unified_prefilter
-from app.market_cn.auto.core.market import (
-    MarketSpec, find_limit_ups, get_board_name, get_board_type, is_limit_up,
-)
-from app.market_cn.auto.core.entry_modes import resolve_entry
-from app.market_cn.auto.core.exit_modes import run_exit
+from app.market_cn.auto.core.market import MarketSpec, get_board_type
 from app.market_cn.auto.core.runtime.expr import ExprError, evaluate, static_asof_check
 from app.market_cn.auto.core.runtime.functions import (
-    AsOfViolation, Ctx, OFFSET_FUNCS, build_funcs, offset_funcs, ensure_gate_init,
+    AsOfViolation, Ctx, build_funcs, offset_funcs, ensure_gate_init,
 )
-from app.market_cn.auto.core.runtime.flows import UnknownFlow, available_flows, get_flow
+from app.market_cn.auto.core.runtime.flows import (
+    UnknownFlow, get_scan_one,
+)
 ensure_gate_init()  # 副作用: 注册门表 DSL 标准库 (gate_stdlib) + 各策略私有门函数 (autodiscover)
 
 from app.utils.logger import get_logger
@@ -299,14 +299,19 @@ class GateEvaluator:
                    code=self.code, stock_info=self.stock_info, market=self.spec.market_spec)
 
     def evaluate_prefilter(self, bars: List[Dict[str, Any]], i: int,
-                           params: Dict[str, Any]) -> Tuple[bool, List[str]]:
+                           params: Dict[str, Any],
+                           ctx: Optional[Ctx] = None) -> Tuple[bool, List[str]]:
         """资格门（与 lu_idx 无关）。返回 (全过, 失败门id列表)。
 
         短路求值: 首个失败门即返回 (布尔结论等价, failed 仅保留拦截门; 见 evaluate_gates)。
         gate_dbg 非 None 时额外回调全门向量 (phase="qualify")。
+
+        ctx 可选：调用方若需复用外部构造的 Ctx（携带 ext 注入冻结值等盘中上下文），
+        可传入 —— 与 evaluate_all 的 ctx 语义一致。
         """
         gates = self.spec.prefilter_gates()
-        ctx = self._ctx(bars, i, 0, params)
+        if ctx is None:
+            ctx = self._ctx(bars, i, 0, params)
         funcs = build_funcs(ctx, self.spec.key, self.spec.func_names)
         if self.gate_dbg is not None:
             vec = self._vector(gates, params, funcs)
@@ -322,12 +327,17 @@ class GateEvaluator:
         return True, []
 
     def evaluate_decision(self, bars: List[Dict[str, Any]], i: int, lu_idx: int,
-                          params: Dict[str, Any]) -> Tuple[bool, List[str]]:
+                          params: Dict[str, Any],
+                          ctx: Optional[Ctx] = None) -> Tuple[bool, List[str]]:
         """判定门（依赖 lu_idx）。返回 (全过, 失败门id列表)。短路求值 (同 evaluate_gates)。
         gate_dbg 非 None 时额外回调全门向量 (phase="decision")。
+
+        ctx 可选：调用方若需复用外部构造的 Ctx（携带 ext 注入冻结值等盘中上下文），
+        可传入 —— 与 evaluate_all 的 ctx 语义一致。
         """
         gates = self.spec.decision_gates()
-        ctx = self._ctx(bars, i, lu_idx, params)
+        if ctx is None:
+            ctx = self._ctx(bars, i, lu_idx, params)
         funcs = build_funcs(ctx, self.spec.key, self.spec.func_names)
         if self.gate_dbg is not None:
             vec = self._vector(gates, params, funcs)
@@ -344,7 +354,7 @@ class GateEvaluator:
 
     def evaluate_all(self, bars: List[Dict[str, Any]], i: int,
                      params: Dict[str, Any], ctx: Optional[Ctx] = None) -> Tuple[bool, List[str]]:
-        """一次性求所有启用门（v1/relay3/break 等无 lu_idx 依赖策略）。返回 (全过, 失败门id列表)。
+        """一次性求所有启用门（break/g56/dragon 等无 lu_idx 依赖策略）。返回 (全过, 失败门id列表)。
 
         短路求值 (同 evaluate_gates)。ctx 可选：调用方若需复用同一 Ctx（命中结构/指标
         记忆化），可外部构造并传入。gate_dbg 非 None 时额外回调全门向量 (phase="all")。
@@ -368,55 +378,55 @@ class GateEvaluator:
 
 
 # ================================================================
-# 回测编排（枚举分派：limit_up / day；day 再按 meta.day_flow 分派信号字段口径）
-# ================================================================
-def run_backtest(bars: List[Dict[str, Any]], code: str, spec: StrategySpec,
-                 stock_info: Optional[Dict[str, Any]] = None,
-                 use_prefilter: bool = True,
-                 gate_dbg: Optional[Any] = None) -> List[Dict[str, Any]]:
-    """门表策略全历史回测入口 —— **只做分派**, 编排实现在各 strategies/<key>.py。
-
-    - "limit_up"（dragon_callback）：枚举候选日 → 遍历 lu_idx → 收盘买入。
-    - "day"（v1 / relay3 / break / g56）：逐日候选 → D0 信号 → 次日开盘入场。
-
-    分派 = 查 core/runtime/flows 注册表 (策略模块自注册), **未登记即抛 UnknownFlow**
-    (2026-09-28 分层改造)。改造前这里是闭集 `if flow == ...` + `return ..._v1(...)` 兜底:
-    yaml 里 day_flow 拼错会**静默**按 V1 口径算收益 —— 门是 g56 的门、编排是 v1 的编排,
-    回测数字看着像真的, 实盘选股全错。现在宁可炸, 绝不静默。
-
-    入场/出场由 entry_modes / exit_modes 按 YAML 选择 → 逐笔等价于对应 python 参考版。
-    gate_dbg: M6 诊断回调 (None=零开销); 非 None 时每次门求值回调全门向量, 供 explain 采集。
-    """
-    board_type = get_board_type(code, spec.market_spec)
-    ev = GateEvaluator(spec, board_type, code=code, stock_info=stock_info, gate_dbg=gate_dbg)
-    enumeration = str(spec.meta.get("enumeration", "limit_up")).lower()
-    if enumeration == "intraday":
-        # 盘中策略走时间线引擎 (scan.py / 分钟快照帧), run_backtest 的日线编排不适用。
-        # 改造前此处会**静默**落 limit_up 编排 (等于拿龙回头的枚举跑接刀/超卖) —— 显式拒绝。
-        raise UnknownFlow(
-            f"策略 {spec.key} 的 enumeration=intraday, 不经 run_backtest "
-            f"(盘中策略走时间线引擎: scan.py / 分钟快照帧)")
-    flow = ""
-    if enumeration == "day":
-        flow = str(spec.meta.get("day_flow", "")).lower()
-        if not flow:
-            raise UnknownFlow(
-                f"策略 {spec.key} 的 meta.enumeration=day 但未声明 day_flow; 请显式写 "
-                f"day_flow: <{', '.join(available_flows()) or '...'}>")
-    runner = get_flow(enumeration, flow)
-    return runner(bars, code, spec, ev, board_type, stock_info, use_prefilter)
-
-
-# ================================================================
-# 编排下沉声明 (2026-09-28 分层改造)
+# 单日判定（scan_day = 生产链入口；全历史回测编排已退役 2026-10-09 终态② Step 3）
 # ----------------------------------------------------------------
-# 本文件曾内嵌 5 份策略专属回测编排 (415 行 / 840 行 = 49%)。现已**纯搬运**回各自
-# 策略模块 (签名与语义逐字不变), core 只保留门表加载/求值 + 通用分派:
-#   strategies/v1.py               register_day_flow("v1", ...)
-#   strategies/relay3.py           register_day_flow("relay3", ...)
-#   strategies/break.py            register_day_flow("break", ...)
-#   strategies/g56.py              register_day_flow("g56", ...)
-#   strategies/dragon_callback.py  register_enum_flow("limit_up", ...)
-# 新增策略 = 写 strategies/<key>.py + yaml 声明 day_flow, core 零改动。
-# 逐笔等价回归见 analysis_output/auto架构分层_20260928.md
+# 本文件曾另含 run_backtest（门表策略**全历史回测**编排分派，链 A：按 meta.enumeration
+# 分派 limit_up / day，day 再按 meta.day_flow 分派）。2026-09-28 分层改造把 5 份策略专属
+# 编排纯搬运回 strategies/<key>.py 并经 core/runtime/flows 自注册。
+# 终态② Step 3：回测主路径已完全收敛到事件流折叠（core/backtest.run_all →
+# StrategyBase.backtest_stock 薄壳 → core.replay），判定引擎只剩折叠一处 ⇒
+# run_backtest 与 flows 的 _FLOWS 半边（day_flow runner 表）一并退役。
+# ================================================================
+
+def scan_day(spec, bars, code, target, board_type=None, stock_info=None) -> list:
+    """门表单日判定 → list[Signal]（生产链切门表引擎的入口）。
+
+    复用 `load_strategy` 的门表 + `GateEvaluator` 单日求门；经 flows 单日判定注册表分派
+    到策略模块（`register_scan_one` 登记的 fn，**只做单日判定**：不做出场模拟、不去重
+    —— 去重是回测/写库层的事，生产单日口径与 `scan_days(lo=hi=target)` 一致）。
+
+    返回 list[Signal]（空表=当日无信号）；intraday 策略不经此入口（走主干折叠）。
+    """
+    if str(spec.meta.get("enumeration", "")).lower() == "intraday":
+        raise UnknownFlow("intraday 策略走主干折叠（IntradayFeed + core.replay），不经 scan_day")
+    from app.market_cn.auto.core.market import get_board_type
+    board_type = board_type or get_board_type(code, spec.market_spec)
+    ev = GateEvaluator(spec, board_type, code=code, stock_info=stock_info)
+    i = None
+    for k, b in enumerate(bars):
+        if str(b.get("time", ""))[:10] == target:
+            i = k
+            break
+    if i is None:
+        return []
+    enumeration = str(spec.meta.get("enumeration", "")).lower()
+    flow = str(spec.meta.get("day_flow", "")).lower() if enumeration == "day" else ""
+    fn = get_scan_one(enumeration, flow)
+    sig = fn(spec, ev, bars, i, board_type, stock_info)
+    return [sig] if sig is not None else []
+
+
+# ================================================================
+# 编排下沉 + 退役声明 (2026-09-28 分层 / 2026-10-09 终态② Step 3)
+# ----------------------------------------------------------------
+# 2026-09-28: 本文件曾内嵌 5 份策略专属回测编排 (415 行 / 840 行 = 49%)，已**纯搬运**
+#   回各自策略模块 (签名与语义逐字不变)，core 只保留门表加载/求值 + 通用分派。
+#   逐笔等价回归见 analysis_output/auto架构分层_20260928.md。
+# 2026-10-09 终态② Step 3: 回测主路径收敛到事件流折叠后，链 A 的 `run_backtest` 与
+#   flows 的 `_FLOWS` 半边 (day_flow runner 表) 一并退役。判定引擎只剩一处 ——
+#   strategies/<key>.py 的折叠契约 (init_state/evaluate/step)，经 core.replay 驱动。
+#   仍存续的登记点 (生产单日判定，保留):
+#     strategies/break.py            register_scan_one("day", "break", ...)
+#     strategies/g56.py              register_scan_one("day", "g56", ...)
+#     strategies/dragon_callback.py  register_scan_one("limit_up", "", ...)
 # ================================================================

@@ -54,16 +54,26 @@ KERNEL_FLOOR = 600
 #: 上限 = 现状 + ~10% 余量。⚠️ 调高上限必须在改进方案完成度报告里登记理由。
 #: §2.8 目标是**收敛方向**（P6 收量），不是当前硬卡 —— 按现状卡不会立刻破 build，
 #: 但会挡住「无人察觉中膨胀」（本门禁存在的唯一理由）。
+#: 2026-10-09 登记（市场门 逐槽 as-of 修复，docs/市场门口径评估_20261009.md）：
+#:   · 新增 `core/replay/mkt_slots.py`（66 行，单一职责：窗口→逐槽全市场均涨幅）；
+#:     独立成件正是为了**不让** replay/__init__ 与 intraday 无声膨胀。
+#:   · `intraday.py` 118→130（mkt_slots/mkt_series 注入；因零余量，cap 130→143 给回余量）；
+#:   · `__init__.py` 466→474（市场门两层口径的文档更正；cap 500 不动）；
+#:   · PROGRAM_CAP 1225→1330（新增一件的必然结果；实测 1305）。
+#:   属**功能增长**（消除回测唯一的前视输入），非膨胀 —— 按门禁规定登记后上调。
 PROGRAM_MODULES = [
-    ("core/replay/__init__.py", 350, 435, 480),   # 目标含 trade_map，故包内三件一起看
-    ("core/replay/intraday.py", 0, 118, 130),
+    ("core/replay/__init__.py", 350, 474, 500),   # 目标含 trade_map，故包内三件一起看
+    ("core/replay/intraday.py", 0, 130, 143),     # 2026-10-09: +12 (mkt_slots/mkt_series)
     ("core/replay/trade_map.py", 0, 111, 122),     # 2026-10-08 D级修: 登记 106→实测 111
+    ("core/replay/gate_dbg.py", 60, 69, 80),       # 终态② Step1 新增门诊断收集器
+    ("core/replay/mkt_slots.py", 0, 66, 73),       # 2026-10-09 新增: 市场门逐槽 as-of 取数
     ("core/increm.py", 120, 356, 392),
     ("core/trace.py", 80, 95, 105),
 ]
 
 #: 程序层总上限（防三件互相挦补）
-PROGRAM_CAP = 1225
+#: 2026-10-09: 1225→1330（新增 mkt_slots.py 66 行 + intraday 118→130 + __init__ 466→474）。
+PROGRAM_CAP = 1330
 
 
 # ================================================================

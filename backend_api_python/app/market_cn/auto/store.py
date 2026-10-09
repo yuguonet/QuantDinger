@@ -232,7 +232,7 @@ def rule_row_core(strategy_key, code, name, price, score, extra):
     分叉本函数 = 投影与生产必然漂移，故映射只此一处。
 
     口径与旧 dragon_scan 后处理逐字段等价:
-      style (落库列 entry_style) = 策略类属性 entry_style (dragon=a/v1=v1/break=brk/relay3=r3)
+      style (落库列 entry_style) = 策略类属性 entry_style (dragon=a/break=brk/...)
       score       = score (策略构造时已按旧口径设好; 0 值保留 —— dragon 历史口径恒0)
       signal_price= price (0 → None; break 不定价)
       lu_date/pullback_days 来自 extra; extra 整包落库 (策略自保证 clean, None 剔除,

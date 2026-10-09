@@ -355,22 +355,15 @@ def main():
                 print(f"[warn] 存档无 {k} 标签 (口径不符; 请用 --trail 匹配或去掉 --probe-file 重跑)",
                       file=sys.stderr)
     else:
-        from app.market_cn.auto.core.backtest import run_all
-        from app.market_cn.auto.probe import Probe
-        # 标签由策略文件内的 DEBUG_* 常量生成 (框架不注入口径 — 2026-09-10 裁定);
-        # 这里只校验所选档位确实会被生成, 避免"分析了一个存档里没有的键"。
-        if dbg_trails and trails and trails[0] not in dbg_trails:
-            print(f"[warn] --trail {trails[0]:g} 不在策略 {args.strategy}.DEBUG_TRAILS="
-                  f"{dbg_trails} 中 (改口径请改策略文件)", file=sys.stderr)
-        codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None
-        t0 = time.time()
-        tag = (f"rule{args.hold}" if args.exit_mode == "hold"
-               else f"w{dbg_wave}tr{trails[0]:g}")
-        with Probe(args.strategy, tag=tag) as pr:
-            res = run_all(strategy=args.strategy, days=args.days, codes=codes, probe=pr)
-        rows = _load_rows(pr.path)
-        print(f"回测完成: {res['stats'].get('n')} 笔信号 / {len(rows)} 行 sample "
-              f"({time.time() - t0:.0f}s)")
+        # 终态② Step 2 (2026-10-09): 回测侧 probe 采样已退役（采样迁 sampler.LiveSampler
+        # 实盘侧 + 折叠内核）。本工具「无 --probe-file 重跑」不再可用，请：
+        #   1) 用 `explain --strategy <key> --probe-out tmp/probes/x.jsonl` 产出兼容存档；
+        #   2) 或 `--probe-file` 复用历史 JSONL / 实盘 LiveSampler 产出。
+        print("⚠ 回测侧 probe 采样已退役（终态② Step 2）。请用 "
+              "`explain --strategy %s --probe-out ...` 产出 sample 存档后 "
+              "`--probe-file` 复用，或复用历史 JSONL。" % args.strategy,
+              file=sys.stderr)
+        return 2
 
     funnel, power, meta = analyze(rows, rank_map, days=args.hold,
                                   label=args.probe_file or f"{args.strategy}@{args.days}d",

@@ -613,7 +613,7 @@ def apply_plan(plan, dry_run=True):
 #   - 日线重放**无法复现盘中动作**: monitor step2 (盘中硬止损) 与 step3 (14:30 预确认)
 #     需要分钟快照, 本重放不覆盖 ⇒ 出场时点由日线判定决定, 可能比实盘更晚/更早
 #   - D1 竞价用开盘价合成, 实盘用 9:26 实时价 (通常接近但不总等)
-#   - confirm 的 series 只有 1 个点 ⇒ 依赖"日内序列形状"的规则 (如 relay3 封板需 high)
+#   - confirm 的 series 只有 1 个点 ⇒ 依赖"日内序列形状"的规则 (如需 high 的封板判定)
 #     用 D1 的 high 近似
 
 REPLAY_WINDOW = 20      # 账本重放默认窗口 (交易日)
@@ -703,7 +703,7 @@ def replay_ledger(expected, meta, bars_map, idx_map):
         # ⚠ 起点必须是 **d1+1 (入场次日起)**, 不能是 d1 —— A股 T+1: 当日买入当日不可卖,
         #   出场重放若在入场当日(j=d1)评估, 就是回放一个实盘根本不可能发生的卖出。
         #   这不是纯理论: base/v1 的默认 exit_decision 的**止损分支没有 held 守卫**
-        #   (见 base.py:518 / v1.py:287 —— 只有"追踪"判了 held>1), 于是 j=d1 时只要
+        #   (见 base 的 exit_decision 止损分支 —— 只有"追踪"判了 held>1), 于是 j=d1 时只要
         #   当日 low 触及止损线就当场"卖出" ⇒ 账本上出现与实盘不可比的畸形收益。
         #   (d= 计数与 core/exit_engines 的 min_d 一致: j=d1 是 d=1 入场当日, d1+1 是 d=2。)
         hit = None

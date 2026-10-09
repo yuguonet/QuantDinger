@@ -362,16 +362,15 @@ def main():
         raw = _load_rows(args.probe_file)
         print(f"复用探针存档: {args.probe_file} → {len(raw)} 行 sample")
     else:
-        from app.market_cn.auto.core.backtest import run_all
-        from app.market_cn.auto.probe import Probe
-        codes = [c.strip() for c in args.codes.split(",") if c.strip()] or None
-        t0 = time.time()
-        with Probe(args.strategy, tag=f"audit{args.days}") as pr:
-            res = run_all(strategy=args.strategy, days=args.days, codes=codes,
-                          probe=pr)
-        raw = _load_rows(pr.path)
-        print(f"回测完成: {res['stats'].get('n')} 笔信号 / {len(raw)} 行 sample "
-              f"({time.time() - t0:.0f}s)")
+        # 终态② Step 2 (2026-10-09): 回测侧 probe 采样已退役（采样迁 sampler.LiveSampler
+        # 实盘侧 + 折叠内核）。本工具「无 --probe-file 重跑」不再可用，请：
+        #   1) 用 `explain --strategy <key> --probe-out tmp/probes/x.jsonl` 产出兼容存档；
+        #   2) 或 `--probe-file` 复用历史 JSONL / 实盘 LiveSampler 产出。
+        print("⚠ 回测侧 probe 采样已退役（终态② Step 2）。请用 "
+              "`explain --strategy %s --probe-out ...` 产出 sample 存档后 "
+              "`--probe-file` 复用，或复用历史 JSONL。" % args.strategy,
+              file=sys.stderr)
+        return 1
 
     rows, dropped = _gate_rows(raw)
     if not rows:

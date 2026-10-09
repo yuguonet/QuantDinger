@@ -76,7 +76,7 @@ def why_strategy(strategy: str, code: str, date: str = "",
     """口语调试主入口: 多日粗扫 / 单日深潜 / 参数试调 / 库对照。
 
     Args:
-        strategy: 策略 key (t_hilo / v1 / break / dragon_callback / knife_catch ...)
+        strategy: 策略 key (break / dragon_callback / g56 / knife_catch / tail_oversold ...)
         code: 股票代码, 如 600519
         date: 给定 YYYY-MM-DD 则单日深潜 (逐门); 不给则多日粗扫
         days: 多日窗口自然日 (默认 15)

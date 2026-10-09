@@ -505,10 +505,11 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
     #                后处理链 (U1~U4 → finalize) 与 DB 变异 (`upsert_scan_signals`) 完全照旧
     #                ⇒ 门禁「signals 零差异」可直接比。
     from app.market_cn.auto import present_daily
-    WRITER = "record" if present_daily.enabled() else "scan"
-    logger.info("[dragon_scan] 行源 = %s (present_persist.enabled=%s, warmup=%d 日)",
-                {"record": "Record.ready 投影", "scan": "scan 直判(回滚位)"}[WRITER],
-                "true" if WRITER == "record" else "false", present_daily.warmup_days())
+    WRITER = strat_reg.scan_writer()
+    logger.info("[dragon_scan] 行源 = %s (scan_writer=%s, warmup=%d 日)",
+                {"scan_day": "门表 scan_day", "record": "折叠 Record.ready",
+                 "scan": "scan 直判(回滚位)"}[WRITER],
+                WRITER, present_daily.warmup_days())
 
     # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定落点非空的 (code,day) 产 sample。
     # 2026-10-07 (P5 前置): 采集**剥离**为独立采样器 (auto/sampler.py) —— 它自跑
@@ -576,7 +577,9 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
 
     err_by_key: dict[str, int] = {}      # {策略: 本轮判定异常票数} → 见下方 finally 汇总
     try:
-        if WRITER == "record":
+        if WRITER == "scan_day":
+            rows, err_by_key = _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler)
+        elif WRITER == "record":
             rows = _rows_by_record(active, bars_by_code, target, stock_info, sampler)
         else:
             rows, err_by_key = _rows_by_scan(active, bars_by_code, target, stock_info, sampler)
@@ -677,6 +680,40 @@ def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
     return rows, err_by_key
 
 
+def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
+    """**门表 writer** (P2): 判定走门表引擎 `scan_day`（门表唯一规则源）。
+
+    行源 = `evaluate.scan_day`（门表单日 → Signal）。后处理链（U1~U4 → signal_row）照旧。
+    三个日线策略（break/g56/dragon）均已注册 `_scan_one`；v1/relay3 已于 2026-10-09 退役。
+    """
+    from app.market_cn.auto import store
+    from app.market_cn.auto.core.runtime.evaluate import load_strategy, scan_day
+
+    rows = []
+    err_by_key: dict[str, int] = {}
+    specs = {key: load_strategy(key) for key in active}
+    for i, (code, bars) in enumerate(bars_by_code.items()):
+        name = (stock_info.get(code) or {}).get("name", "")
+        for key, strat in active.items():
+            try:
+                sigs = scan_day(specs[key], bars, code, target,
+                                stock_info=stock_info.get(code))
+            except Exception as e:
+                _n = err_by_key.get(key, 0) + 1
+                err_by_key[key] = _n
+                if _n <= 3:
+                    logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                else:
+                    logger.debug("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                continue
+            kept, _ = apply_unified_prefilter(sigs, bars, code, stock_info.get(code), strat)
+            sampler.observe(key, strat, code, bars, stock_info)
+            rows.extend(store.signal_row(key, s, name) for s in kept)
+        if (i + 1) % 500 == 0:
+            logger.info("[dragon_scan] 判定 %d/%d, 信号 %d", i + 1, len(bars_by_code), len(rows))
+    return rows, err_by_key
+
+
 def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None):
     """**新 writer** (P5-③): fold 是唯一判定 (由 `present_daily.persist_days` 转主线完成),
     行源 = 当日 `Record.ready`。**只有"行从哪来"变了** —— U1~U4 / `signal_row` 照旧。
@@ -739,7 +776,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
 
     调度: scheduler Task "knife_scan" —— **多触发点** (2026-09-29 重做):
       sched 事实源 (all_schedules) 给每个启用策略排一个触发点, 相邻 <=30min 合并一批:
-        09:40 → lead_chase (早盘单点)   |   14:30 → knife_catch + tail_oversold (尾盘批)
+        14:30 → knife_catch + tail_oversold (尾盘批)
       keys = 本批策略; None = 全量 (兼容手动 CLI 与旧调用)。
       只跑本批 ⇒ purge_buy_today / daily_limit 的作用域也只限本批
       (_scan_cycle 按 cycle_strats.keys() 限定, 不会误伤其它策略的持仓行)。
@@ -794,7 +831,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
         start_hm = min(starts)
     elif keys is not None:
         # 分批触发且本批无预览策略 ⇒ 等到**本批窗口末拍**再终审。
-        # (lead_chase windows=("09:40","09:40") ⇒ 末拍 09:40 ⇒ 立即执行;
+        # (早盘单点策略 windows=("09:40","09:40") ⇒ 末拍 09:40 ⇒ 立即执行;
         #  若沿用旧 fallback "14:56" 会从 09:40 死等到 14:56 再 40min 超时放弃 ——
         #  这正是 09-28/09-29 的故障形态)
         for k in active:

@@ -64,14 +64,18 @@ def check_static(findings, only=None):
         plugins = [k for k in plugins if k in only]
         keys = [k for k in keys if k in only]
 
-    # 1a. 插件无 config 段 → 永久黑暗
+    # 1a. 开关可达性 + 停用提示
+    #     事实源 (2026-10-09 终态②/A-D2): yaml meta.enabled > config.json enabled > False
     for k in plugins:
-        if k not in cfg_keys:
-            _add(findings, FAIL, "config", f"插件 {k} 无 config.json 段 → is_enabled 恒 False, 永久黑暗")
+        yml = strat_reg._yaml_meta_enabled(k)
+        if yml is None and k not in cfg_keys:
+            _add(findings, FAIL, "config",
+                 f"插件 {k} 既无 yaml meta.enabled 也无 config.json 段 → 开关不可达 (恒 False, 永久黑暗)")
         elif not strat_reg.is_enabled(k):
             note = (cfg.get("strategies", {}).get(k) or {}).get("_disabled_note")
+            src = "yaml meta.enabled" if yml is not None else "config.json"
             extra = f" ({note})" if note else ""
-            _add(findings, WARN, "enabled", f"策略 {k} 已注册但 enabled=false{extra}")
+            _add(findings, WARN, "enabled", f"策略 {k} 已注册但 enabled=false [来源 {src}]{extra}")
 
     # 1b. config 无插件
     for k in cfg_keys:
@@ -94,6 +98,25 @@ def check_static(findings, only=None):
     for k in plugins:
         if k not in yaml_stems:
             _add(findings, WARN, "yaml", f"策略 {k} 无 YAML 门表 (present/analyze 路径不覆盖)")
+
+    # 1d-2. 折叠契约覆盖 (终态②): 日线策略无契约 = **非完整宏** ⇒ 无回测/调试路径。
+    #       §3.5 要求「enabled=false 仍可回测/调试」以"完整宏"为前提 —— 无契约者做不到,
+    #       属 §3.1 宏组成偏离 (需补 init_state/step/evaluate 或退役), 显式暴露于此。
+    try:
+        from app.market_cn.auto.strategies.base import _has_fold_contract
+        nocon = []
+        for k in plugins:
+            s = strat_reg.get_strategy(k)
+            if s is not None and s.scan_spec.kind == "daily_close" and not _has_fold_contract(s):
+                nocon.append(k)
+        if nocon:
+            _add(findings, WARN, "contract",
+                 "日线策略未实现折叠契约 (非完整宏 ⇒ 无回测/调试路径; 补契约或退役): "
+                 + ", ".join(sorted(nocon)))
+        else:
+            _add(findings, OK, "contract", "全部日线策略已实现折叠契约 (回测/调试路径完整)")
+    except Exception as e:
+        _add(findings, WARN, "contract", f"折叠契约检查不可用: {e}")
 
     # 1e. 依赖方向: core 不得顶层 import strategies 私有符号 (层反转)
     #     函数内惰性 import = WARN (仍记欠债); 顶层 import = FAIL

@@ -1,15 +1,16 @@
 # ================================================================
-# 3板接力 (relay3) — IDE 门表单文件 (M4)
-# 策略停用中(C裁定2026-10-08无兼容模式); day_flow=启用时判定路径, 启用前须迁折叠契约并与 core.replay 对拍 (见 tmp/_relay3_equivalence.py)
+# 3板接力 (relay3) — IDE 门表单文件
+# 策略停用中 (enabled=false); 启用前须迁折叠契约 (init_state/step/evaluate)。
 # ================================================================
 meta:
   name: 3板接力
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 1
+  enabled: false                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: day             # 逐日候选 → D0 信号 → 次日开盘入场
   day_flow: relay3             # day 流程口径 (信号展示字段集 board_height/ma_bull/lu_vol_ratio/rsi)
-  day_start: 66                # 镜像 relay3.scan_signals 的 len(bars[:i+1])>=67 下界
-  day_min_n: 5                 # 镜像 relay3.backtest_stock 的 n<5 早返回
+  day_start: 66                # 逐日起点 (需 ≥67 根, 低于不判)
+  day_min_n: 5                 # 低于此根数直接返回空
 
 entry:
   mode: open                   # D1 开盘买入 (next_open)
@@ -23,7 +24,7 @@ exit:
   trail_after_limit: -8.0      # 封板延续期追踪止损 % (自 D1 以来最高点)
   break_sell_ratio: 0.995      # 炸板判定: last < 涨停价*0.995
 
-params:                        # 与 strategies/relay3.py PARAMS 默认同值 (逐笔等价基线)
+params:                        # 可调参数 (表达式直接引用)
   board_height: 3
   ma_bull: true
   gap_min: -2.0
@@ -38,8 +39,8 @@ params:                        # 与 strategies/relay3.py PARAMS 默认同值 (�
 # 注: "左=实算(函数), 右=参数" 的写法 (如 board_height() == board_height) 让阈值仍可被网格扫描。
 gates:
   - {id: g_exch, name: 非北交所, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "not is_bse()"}                         # 镜像 relay3 池子排除 8/4/92 开头代码
+     expr: "not is_bse()"}                         # 排除 8/4/92 开头代码
   - {id: g_board, name: 恰3连板, role: qualify, needs_d0: 0, enabled: 1,
-     expr: "board_height() == board_height"}       # 镜像 relay3 的 board_height 硬门槛
+     expr: "board_height() == board_height"}       # 连板高度硬门槛
   - {id: g_ma, name: MA多头排列, role: qualify, needs_d0: 0, enabled: 1,
      expr: "ma_bull() or not ma_bull"}             # 左=实算 MA5>MA10>MA20>MA60, 右=params.ma_bull 开关

@@ -1,6 +1,4 @@
-"""strategies/v1.py — V1 追板策略 (StrategyBase 插件实现, Phase 2 迁移)
-
-实现已迁移至本文件; core.v1_today_d0_signals 为 facade 转发到这里。
+"""strategies/v1.py — V1 追板策略 (StrategyBase 插件实现)
 
 入场 (D0 盘后扫描 → D1 竞价):
   D0 四因子: 涨停(0.98x阈值) + 20日涨>30% + D-1回调[-10%,-3%) + OBV 5日上升 + D-1非放量(<1.5x 5日均量)
@@ -13,9 +11,9 @@
 
 易错点:
   - D-1回调区间是 [-10%, -3%) 左闭右开; D0 涨停判定是 0.98x 板块阈值 (近似涨停);
-  - ⚠ d1_change 是 D1 **收盘** 值, 用它过滤 D1 **开盘** 入场 = 前视 (2026-09-30 修)。
+  - ⚠ d1_change 是 D1 **收盘** 值, 用它过滤 D1 **开盘** 入场 = 前视。
     实盘 entry_decision 只用 gap; d1_change<0 在实盘属 confirm_decision(15:00 weak)
-    ⇒ 后果是「D2 开盘清仓」, 已由 _run_backtest._pre_exit 实现 ⇒ 回测侧默认关闭
+    ⇒ 后果是「D2 开盘清仓」, 已由下方 `_pre_exit` 钩子实现 ⇒ 回测侧默认关闭
     (PARAMS.require_d1_close_up=False; 开=True 可复现旧口径做对照, 勿用于生产)。
   - OBV 从 i-20 起累计且 j=0 不计 — 勿"优化"起始点, 会改变边界信号。
 """
@@ -28,7 +26,6 @@ from app.market_cn.auto.core.market import get_board_name, get_board_type, is_li
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
-    data_end_close,
 )
 
 STRATEGY_KEY = "v1"
@@ -57,7 +54,7 @@ PARAMS = {
 
 
 def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
-    """Signal → 旧 v1_today_d0_signals 的 dict 形态 (facade 兼容层)。"""
+    """Signal → 展示用 dict 形态。"""
     ex = sig.extra or {}
     return {
         "code": code,
@@ -376,106 +373,12 @@ _register_exit("v1_combo", _exit_v1_combo)
 
 
 # ================================================================
-# 门表回测编排 (2026-09-28 分层改造: 自 core/runtime/evaluate.py **纯搬运**下沉)
+# 门表回测编排已退役 (2026-10-09 终态② Step 3)
 # ----------------------------------------------------------------
-# 为什么搬回来: 编排是策略的一部分 (枚举顺序/去重键/展示字段集/入场腿), 放在 core
-# 会让"改 g56 口径"变成改架构层, 且 core 反过来惰性 import strategies.* (层反转)。
-# 自注册到 core/runtime/flows 注册表 → core 只查表, 未登记即 fail-fast (不再静默落 v1)。
-# ⚠ 搬运要求: 签名与语义**逐字不变**; 逐笔等价回归见
-#    analysis_output/auto架构分层_20260928.md
+# 2026-09-28: 原 core/runtime/evaluate.py 的门表回测编排曾**纯搬运**回本模块自注册
+#   (register_day_flow("v1", _backtest_day_flow))。
+# 2026-10-09: 回测主路径收敛到事件流折叠 (backtest_stock 薄壳 → core.replay) ⇒ 该全历史
+#   回测编排与注册**退役**。v1 为**停用**策略 (config.json enabled=False) 且无折叠契约
+#   ⇒ 现仅经 backtest_stock 的 legacy 通用路径 (scan_signals + exit_decision) 回测。
 # ================================================================
 
-from typing import Any, Dict, List
-
-from app.market_cn.auto.core.entry_modes import resolve_entry
-from app.market_cn.auto.core.exit_modes import run_exit
-from app.market_cn.auto.core.filters import unified_prefilter
-from app.market_cn.auto.core.runtime.flows import register_day_flow
-
-def _backtest_day_flow(bars, code, spec, ev, board_type, stock_info, use_prefilter):
-    """门表版 V1 全历史回测，返回 trades 列表（与 v1.backtest_stock 逐笔等价）。
-
-    编排逐字镜像 v1.backtest_stock：逐日候选判定（门表求值）→ U1~U4 锚定 D0 →
-    入场=entry_modes(open + gap 过滤) → 出场=exit_modes(v1_combo，含 V1 动量 D2 清仓)。
-    v1 原版无去重 ±4（本路径不施加）；起点/最小长度由 meta.day_start / day_min_n 声明。
-    """
-    n = len(bars)
-    if n < int(spec.meta.get("day_min_n", 30)):
-        return []
-    _p = spec.params
-    trades: List[Dict[str, Any]] = []
-
-    for i in range(int(spec.meta.get("day_start", 25)), n - 1):
-        # D0 逐日判定（门表一次性求所有门，与 scan_signals 同一逻辑）
-        ok, _ = ev.evaluate_all(bars, i, _p)
-        if not ok:
-            continue
-
-        # U1~U4（信号日 D0 锚定，v1 prefilter_anchor='signal'）
-        if use_prefilter:
-            ok, _ = unified_prefilter(bars, i, code, stock_info, spec.market_spec)
-            if not ok:
-                continue
-
-        # 入场 = entry_modes（open + gap 过滤；阈值来自 YAML entry 块，可引用 params 名）
-        d0 = bars[i]
-        site, _reason = resolve_entry(spec.entry, bars, i, board_type, _p)
-        if site is None:
-            continue
-        entry_idx = site["entry_idx"]
-        entry_price = site["entry_price"]
-        entry_date = site["entry_date"]
-        d1_gap = site["diag"]["d1_gap"]
-        d1_change = site["diag"]["d1_change"]
-
-        # 信号附字段（与 _signal_to_legacy_dict + backtest_stock 完全一致）
-        d_1 = bars[i - 1]
-        d_2 = bars[i - 2]
-        # 20 日收益 (信号展示字段; 与 v1 参考版同式)。⚠ 2026-09-28 审计 P2: 原无零值守卫,
-        # 参照 close<=0 的脏数据会在此抛 ZeroDivisionError 打断整轮回测 (v1.py:119 有守卫)。
-        _ref20 = float(bars[i - 20]["close"])
-        ret_20d = (float(d0["close"]) / _ref20 - 1) * 100 if _ref20 > 0 else None
-        d_1_change = (float(d_1["close"]) / float(d_2["close"]) - 1) * 100
-        circ = float((stock_info or {}).get("circ_shares") or 0)
-        total = float((stock_info or {}).get("total_shares") or 0)
-        sig = {
-            "code": code,
-            "board": get_board_name(code, spec.market_spec),
-            "path": "v1",
-            "path_label": "V1",
-            "d0_date": d0["time"],
-            "d0_close": round(float(d0["close"]), 3),
-            "ret_20d": round(ret_20d, 2) if ret_20d is not None else None,
-            "d_1_change": round(d_1_change, 2),
-            "turnover_anchor": round(float(d0["volume"]) / circ * 100, 2) if circ > 0 else None,
-            "turnover_anchor_total": round(float(d0["volume"]) / total * 100, 2) if total > 0 else None,
-            "buy_mode": "next_open",
-        }
-
-        # 出场 = exit_modes（v1_combo；成交语义见 core/exec.py，只此一份）
-        d1 = bars[i + 1]
-        diag = dict(site["diag"])
-        diag["d1_limit_up"] = is_limit_up(float(d1["close"]), float(d0["close"]),
-                                        board_type, spec.market_spec)
-        bt = run_exit(spec.exit.get("mode", "v1_combo"), bars=bars, entry_idx=entry_idx,
-                      entry_price=entry_price, code=code, board_type=board_type,
-                      params=_p, diag=diag)
-        if not bt:
-            # R1: 数据结束未平 → 末日收盘平仓（与主回测路径同口径）
-            bt = data_end_close(bars, entry_idx, entry_price)
-        if not bt:
-            continue
-
-        trades.append({
-            **sig,
-            "entry_date": entry_date,
-            "entry_price": round(entry_price, 3),
-            "buy_mode": "next_open",
-            "d1_change": round(d1_change, 2),
-            "d1_gap": round(d1_gap, 2),
-            "intraday": round(d1_change - d1_gap, 2),
-            **bt,
-        })
-    return trades
-
-register_day_flow("v1", _backtest_day_flow)

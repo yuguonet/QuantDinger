@@ -1,15 +1,15 @@
 # ================================================================
-# knife_catch 反向接刀 (14:56 尾盘买入 → D1 开盘卖) — IDE 门表单文件 (M4)
-# 与 strategies/knife_catch.py (scan_signals) 逐笔等价 (见 tmp/_knife_equivalence.py)
+# knife_catch 反向接刀 (14:56 尾盘买入 → D1 开盘卖) — IDE 门表单文件
 # ----------------------------------------------------------------
 # 大盘下跌日 + 个股深跌 + 尾盘卖盘枯竭 + 全天压制 VWAP 下方 + 收盘贴低点
 # → 次日高概率反弹。四过滤叠加（宁缺勿滥质量门）。
-# 盘中通道：时间线引擎（1m 快照帧）逐槽位判定；qualify 门 = 快照级、required 门 = 需序列/日线。
+# 盘中通道：主干折叠（IntradayFeed + core.replay，1m 快照注入）逐槽位判定；qualify 门 = 快照级、required 门 = 需序列/日线。
 # ================================================================
 meta:
   name: 反向接刀
   market: A
   version: 1
+  enabled: true                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: intraday
   intraday:
     windows: ["14:30", "15:00"]   # 扫描窗口 (14:30 起预热, 14:56 后出信号)
@@ -22,7 +22,8 @@ entry:
 exit:
   mode: d1_open                   # 次交易日(D1)开盘卖 (T+1)
 
-params:                           # 与 strategies/knife_catch.py PARAMS 同值 (逐笔等价基线)
+params:                           # ★ 参数单一事实源 (目标态 §2/§3.1): 判定/出场/生产扫描
+                                  #   都读本段 (config.json 的同名 params 已清空)。
   gain_max: -8.0                  # 当日涨幅上限 % (深跌)
   amp_min: 12.0                   # 当日振幅下限 % (排除窄幅阴跌)
   pos_max: 0.1                    # 收盘位置上限 (0=最低点)
@@ -32,11 +33,15 @@ params:                           # 与 strategies/knife_catch.py PARAMS 同值 
   vol_max: 1.5                    # 量比上限 (过度恐慌继续崩)
   pre5_max: -15.0                 # 近5日涨幅上限 % (前期已走弱)
   streak_min: 2                   # 连跌天数下限 (含当日)
+  stop_pct: -5.0                  # 止损 % (仅 D1 有意义, T+1 当日不可卖)
+  hold_days: 1                    # 持有1天 (D1开盘卖)
 
 # 门表：qualify = 快照级 (只需 latest/mkt_gain) / required = 需快照序列 + 日线上下文。
 # NaN 哨兵：缺值/序列不足/日线不足 → 数值门自然失败 (与参考版早返回同效)。
+# ★ 门顺序 = 判定短路顺序，本身即规则的一部分：改门顺序会改变离线采样（probe）的
+#   stage 归属（经 knife_catch._KC_GATE_STAGE 映射到 sampler.STAGE_RANK）。
 # 说明: 参考版另有 intraday_shortlist/day_prefilter 两层"便宜预筛"（必要条件超集，
-#       只影响枚举规模不影响 trades），IDE 盘中通道复用它们（见 ide/intraday.py 模块头）。
+#       只影响枚举规模不影响 trades），盘中通道复用它们（见 strategies/knife_catch.py）。
 gates:
   - {id: kc_window, name: 尾盘窗口, role: qualify, needs_d0: 1, enabled: 1,
      expr: "hhmm() >= '14:56'"}                  # 14:56 之后才出信号
@@ -44,8 +49,12 @@ gates:
      expr: "mkt_gain() <= mkt_gate"}             # None → nan → 拦截 (镜像 mkt_gain is None)
   - {id: kc_feat, name: 深跌+振幅+贴低, role: qualify, needs_d0: 1, enabled: 1,
      expr: "feat('gain') <= gain_max and feat('amp') >= amp_min and feat('pos') <= pos_max"}
+  - {id: kc_data, name: 尾盘特征可用, role: required, needs_d0: 1, enabled: 1,
+     expr: "ok('tail') == 1 and ok('vw') == 1"}  # tail/vw None → 拦截 (镜像 tail_or_vw 早返回)
   - {id: kc_tail_vw, name: 尾盘回升+压制VWAP, role: required, needs_d0: 1, enabled: 1,
      expr: "feat('tail') >= tail_min and feat('vw') <= vw_max"}   # None → nan → 拦截
+  - {id: kc_daily, name: 日线特征可用, role: required, needs_d0: 1, enabled: 1,
+     expr: "ok('vol_ratio') == 1"}               # bars 不足 → 拦截 (镜像 hist is None 早返回)
   - {id: kc_vol, name: 量比上限, role: required, needs_d0: 1, enabled: 1,
      expr: "feat('vol_ratio') <= vol_max"}
   - {id: kc_streak, name: 连跌下限, role: required, needs_d0: 1, enabled: 1,
@@ -55,7 +64,9 @@ gates:
   - {id: kc_lu_recent, name: 近期无涨停, role: required, needs_d0: 1, enabled: 1,
      expr: "feat('lu_recent') == 0"}
 
-# 信号展示字段（门通过后求值; 与参考版 Signal.extra 逐字段一致）
+# 信号展示字段（宏 = 唯一事实源）：`knife_catch._gates` 经 `build_signal(ctx, spec)` 按本段
+#   产出 Signal.extra ⇒ 改本段即改产物。「宏 fields == extra 键集」门禁：
+#   tests/present/test_projection.py::test_intraday_signal_fields_match_macro。
 signal:
   fields:
     gain: {expr: "feat('gain')", fmt: r2}

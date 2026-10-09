@@ -108,4 +108,8 @@ def build_trade(*, code, strategy, ready_date=None, ready_pl=None,
         "exec_basis": exec_basis,
         "score": ready_pl.get("score"),
         "label": ready_pl.get("label"),
+        # 最小集 extra 透传（终态② Step 2.2）：entry_gate 供 1m 精修区分核心/高板
+        # 甜点阈值（break 特有；dragon/g56 的 extra 无此键 → None，无副作用）。
+        # 只透传这一项，全量 flatten 留作展示层（避免放大 blast radius）。
+        "entry_gate": (ready_pl.get("extra") or {}).get("entry_gate"),
     }

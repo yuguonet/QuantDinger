@@ -18,7 +18,7 @@ sink —— 策略文件中不出现任何调试逻辑（无 stage 排名、无 
 
 契约约定（改进方案 §2.4/§2.6d；因内核体量门禁（test_kernel_size）登记于本模块，
 contract.py 仅留指针）：
-  - 门**聚合器**（_dragon_gates/_g56_gate 一层）返回 `(ok, reason)`；叶子谓词保持
+  - 门**判定**（门表 GateEvaluator 一层）返回 `(ok, reason)`；叶子谓词保持
     bool 不强求。reason 是策略内部语义串，只作审计，不是展示档位。
   - **payload 保留键名表**（新策略照此写，旧策略由 replay/trade_map 兑）：
     交易载荷（stage=exec/exit）: entry_date / entry_price / exit_date / exit_price /
