@@ -43,8 +43,6 @@ Returns (统一 dict, 与历史策略引擎同构):
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
-
 from app.market_cn.auto.core.exec import (
     fill_blocked_by_limit_dn, fill_on_gap, is_one_word_limit_dn,
 )

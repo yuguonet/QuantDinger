@@ -16,10 +16,6 @@ meta:
     interval_sec: 60
     entry_at: "14:50"             # 14:50 起即可成交 (滚动预览窗口起点)
 
-entry:
-  mode: intraday                  # 触发槽位现价买入 (14:56)
-  price: last
-
 exit:
   mode: d1_open                   # 次交易日(D1)开盘卖
 

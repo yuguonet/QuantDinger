@@ -772,7 +772,15 @@ def _worker(task: Task, slot=None):
                 mark_scheduler_task_done(task.name, datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
         ok = False
-        logger.error("[%s] 执行失败: %s", tag, e)
+        # 接线错误 (ImportError/AttributeError/ModuleNotFoundError) = 代码缺陷, 不是业务失败。
+        # 2026-10-09 审计 B-1: dragon_monitor 因 import 不存在的 run_monitor_safe 每 60s
+        # 抛一次, 被这里降级成一行 "执行失败" ⇒ 盘中链整条停摆却看不出是代码问题。
+        # 故: 接线错误打完整 traceback + 显式点名, 绝不与业务失败混为一谈。
+        if isinstance(e, (ImportError, AttributeError, ModuleNotFoundError)):
+            logger.exception("[%s] 接线错误(import/属性不存在) —— 这是代码缺陷, 非业务失败; "
+                             "该任务实际未执行, 其覆盖能力全部停摆", tag)
+        else:
+            logger.error("[%s] 执行失败: %s", tag, e)
     finally:
         if slot is not None and not ok:
             fail = task.slots_fail.setdefault(slot["hm"], {"n": 0, "ts": 0.0})

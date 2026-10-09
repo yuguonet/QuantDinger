@@ -1,7 +1,8 @@
 """ide/evaluate.py — 门表策略加载与回测编排 (M1 原型 → M2 泛化)。
 
 核心：把 strategies/*.py 插件的"信号判定"替换为门表求值（单日判定入口 `scan_day`），
-入场/出场则由 **entry_modes / exit_modes** 按 YAML 的 `entry.mode` / `exit.mode` 选择。
+出场由 **exit_modes** 按 YAML 的 `exit.mode` 派发（dragon 已接线，break/g56 待扩适配器契约）；
+入场**不走分派** —— 由各策略折叠 `step` 内部状态机产出（`core/entry_modes.py` 已于 2026-10-09 退役）。
 全历史回测编排（原 `run_backtest`，链 A：门表 runner + 独立出场编排）已于终态② Step 3
 （2026-10-09）退役 —— 回测主路径收敛到事件流折叠（core/backtest.run_all →
 StrategyBase.backtest_stock 薄壳 → core.replay），判定引擎单源。
@@ -92,7 +93,6 @@ class Gate:
 class StrategySpec:
     key: str
     meta: Dict[str, Any]
-    entry: Dict[str, Any]
     exit: Dict[str, Any]
     params: Dict[str, Any]
     signal: Dict[str, Any] = field(default_factory=dict)
@@ -159,7 +159,7 @@ def load_strategy(key: str) -> StrategySpec:
         for g in (doc.get("gates") or [])
     ]
     spec = StrategySpec(
-        key=key, meta=doc.get("meta", {}), entry=doc.get("entry", {}),
+        key=key, meta=doc.get("meta", {}),
         exit=doc.get("exit", {}), params=doc.get("params", {}),
         signal=doc.get("signal", {}) or {}, gates=gates,
     )

@@ -18,7 +18,7 @@ tail_ret 需 mi 199~219 槽位 ≥15 个; T+1 当日不可卖。
 
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
-from app.market_cn.auto.core.market import get_board_type, is_limit_up, default_market
+from app.market_cn.auto.core.market import get_board_type
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -102,7 +102,6 @@ PARAMS = {
     "tail_lo": -2.8,           # tail_ret*nf 下限
     "tail_hi": -0.5,           # tail_ret*nf 上限 (跌太多=还在崩)
     "min_hhmm": "14:50",       # 快照时间下限 (= 滚动预览窗口起点, 早于此不出信号)
-    "daily_limit": 0,          # 0=不截断 (信号本就少, 全部展示)
     "stop_pct": -8.0,          # 止损 % (仅信息展示, T+1 当日不可卖, D1 开盘卖)
     "hold_days": 1,            # 持有1天 (D1开盘卖)
 }

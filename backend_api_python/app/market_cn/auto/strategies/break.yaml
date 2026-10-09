@@ -14,16 +14,12 @@ meta:
   day_start: 4                 # 逐日起点 (低于此根数不判)
   day_min_n: 6                 # 低于此根数直接返回空
 
-entry:
-  mode: open                   # 次日(D1)开盘买入 (next_open)
-  price: open                  # 成交价基准 = D1 开盘价
-  # 断板无竞价 gap 过滤 (恒可买); gap 判定交给 D1 数据 (与 break_buy.entry_decision 一致)
-
 exit:
-  mode: break_combo            # 收盘价口径 combo (止损/追踪(需 ret>0)/峰值逃顶/到期) — 分板块阈值
-  stop_loss: {main: -8.0, gem_star: -10.0}
-  trailing_stop: {main: -6.0, gem_star: -8.0}
-  hold_days: {main: 7, gem_star: 7}   # 最长持有交易日
+  # P1-7: `exit:` 块**只声明 mode**（出场引擎选择），阈值一律读下方 `params:` 段。
+  #   修前此处还写了 stop_loss/trailing_stop/hold_days，与 params 段完全重复且
+  #   **从未被任何代码读取**（spec.exit 零消费点）⇒ 是"看起来能改、改了不生效"
+  #   的空承诺。已删除重复阈值，并把下方 params 段的错误注释一并更正。
+  mode: break_combo            # 收盘价口径 combo (止损/追踪(需 ret>0)/峰值逃顶/到期)
 
 params:                        # 可调参数 (表达式直接引用; 分板块用 {board: 值})
   min_streak: 2                # 连板下限
@@ -41,7 +37,7 @@ params:                        # 可调参数 (表达式直接引用; 分板块�
   confirm_chg_max: 2.0
   vol_r_or_min: 1.4            # 5f 通道2: 断板期均量比 >= 该值 (换手充分)
   pre20_min: 30.0              # 5f 通道3: 连板前20日涨幅 >= 该值 (前期热度)
-  # ---- 出场阈值 (由 exit.mode=break_combo 的分板块解析读取) ----
+  # ---- 出场阈值 (★ 唯一事实源; 上方 exit: 块只声明 mode, 不重复阈值) ----
   stop_loss: {main: -8.0, gem_star: -10.0}
   trailing_stop: {main: -6.0, gem_star: -8.0}
   hold_days: {main: 7, gem_star: 7}   # 最长持有交易日

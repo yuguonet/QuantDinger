@@ -22,10 +22,8 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.sampler import build_day_sample
-
 from app.market_cn.auto.core.market import (
-    find_limit_ups, get_board_name, get_board_type, is_limit_up,
+    find_limit_ups, get_board_type, is_limit_up,
 )
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
@@ -47,13 +45,15 @@ BOARD_PARAMS = {
     #   and ret > 10`) ⇒ 默认 sweet 时回测缺实盘那条峰值逃顶腿, 收益口径不可外推。
     #   legacy = 止损/追踪/峰值逃顶/到期, 与 `BreakStrategy.exit_decision` 逐条镜像。
     #   ⚠ config.json 的 break.winrate=71.3 是 **sweet 口径**产物, 需重跑刷新。
-    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "take_profit": 15.0, "hold_days": 7,  # 20→7: 2026-09-22 出场研究定稿(时间上限先行)
+    # ⚠ take_profit 已删 (2026-10-09 死代码清理): 全仓零消费点, 出场只走
+    #   止损/追踪(需 ret>0)/峰值逃顶/到期四条腿, 无"固定止盈"腿。
+    "main": {"stop_loss": -8.0, "trailing_stop": -6.0, "hold_days": 7,  # 20→7: 2026-09-22 出场研究定稿(时间上限先行)
              "exit_mode": "legacy", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,  # E3: 甜点区出场(仅 exit_mode=sweet 时生效); 核心/高板通道阈值100(让利润跑)
              "vol_min": 1.2, "vol_max": 2.0, "drawdown_max": -10,
              "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
              "vol_r_or_min": 1.4, "pre20_min": 30.0, "ma_bull_filter": False,
              "first_break_gap_min": 0, "first_break_chg_min": 0.0},
-    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "take_profit": 20.0, "hold_days": 7,  # 15→7: 同上
+    "gem_star": {"stop_loss": -10.0, "trailing_stop": -8.0, "hold_days": 7,  # 15→7: 同上
                  "exit_mode": "legacy", "sweet_pctb": 95.0, "sweet_pctb_core": 100.0,   # 同上 (2026-10-07 sweet→legacy)
                  "vol_min": 1.2, "vol_max": 2.5, "drawdown_max": -15,
                  "enhance_filter": True, "confirm_chg_min": 0.0, "confirm_chg_max": 2.0,
@@ -212,57 +212,6 @@ def _entry_gate(bars, i, streak_len, code):
     if bd == 1 and pctb >= 95:
         return "强势", round(pctb, 1), bd
     return "观察", round(pctb, 1), bd
-
-
-def break_entry_gate(bars, i, streak_len, code):
-    """入场通道标注的 IDE 侧入口 (薄封装 `_entry_gate`)。
-
-    2026-09-28: 供本模块的 day_flow 编排 (`_backtest_day_flow`, 自 core/runtime/evaluate.py
-    下沉而来) 引用。编排已搬回策略层 ⇒ 不再需要 core 惰性 import strategies (层反转已消除)。
-    口径与参考版**同一份实现**, 保证 IDE 门表回测的 entry_gate/entry_pctb/entry_bd
-    与 .py 生产链逐笔一致。
-
-    Returns: (gate:str, pctb:float|None, bd:int|None)
-    """
-    return _entry_gate(bars, i, streak_len, code)
-
-
-def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
-    """Signal → 展示用 dict 形态。
-
-    **易错点**: 必须显式列字段 — 不含 break_idx (内部变量), 全量透传 extra
-    会让回测 trades 多键, 破坏逐笔对数。streak_start/streak_end 是日期字符串。
-    """
-    ex = sig.extra or {}
-    return {
-        "code": code,
-        "board": get_board_name(code),
-        "path": "break_buy",
-        "path_label": "断板",
-        "mode": "streak_break",
-        "streak_len": ex.get("streak_len"),
-        "streak_start": ex.get("streak_start"),
-        "streak_end": ex.get("streak_end"),
-        "break_date": ex.get("break_date"),
-        "signal_date": sig.time,
-        "break_days": ex.get("break_days"),
-        "break_chg": ex.get("break_chg"),
-        "break_gap": ex.get("break_gap"),
-        "break_vol_r": ex.get("break_vol_r"),
-        "confirm_chg": ex.get("confirm_chg"),
-        "confirm_gap": ex.get("confirm_gap"),
-        "pre20_gain": ex.get("pre20_gain"),
-        "ma_bull": ex.get("ma_bull"),
-        "entry_gate": ex.get("entry_gate"),
-        "entry_pctb": ex.get("entry_pctb"),
-        "entry_bd": ex.get("entry_bd"),
-        "turnover_anchor": ex.get("turnover_anchor"),
-        "turnover_sig": ex.get("turnover_sig"),
-        "turnover_anchor_total": ex.get("turnover_anchor_total"),
-        "turnover_sig_total": ex.get("turnover_sig_total"),
-        "entry_price": None,
-        "buy_mode": "next_open",
-    }
 
 
 @register
@@ -624,7 +573,15 @@ class BreakStrategy(StrategyBase):
             return _limit_dn_price(pc, bt) if pc > 0 else None
 
         def _decide(end_idx):
-            """截至 bars[end_idx] 的出场判定 → (是否出场, reason, price)。"""
+            """截至 bars[end_idx] 的出场判定 → (是否出场, reason, price)。
+
+            ★ 2026-10-09 审计 B1 修复: 止损/追踪/峰值逃顶一律加 `held > 1` 守卫
+              （A 股 T+1：d>=2 才评估出场）。原实现裸判⇒ 入场日（held=1）收盘触及
+              止损线就返回 exit，等于**当日买当日卖**。
+              与 `strategies/base.py: exit_decision`（2026-10-07 P1-④ 已修）及
+              `core/exit_engines._min_sell_day` 同口径。
+              「持仓到期」不加守卫：它是**日历日**而非止损线，持仓到期本就该按期平仓。
+            """
             seg = bars[entry_idx:end_idx + 1]
             if not seg:
                 return False, "", 0.0
@@ -633,11 +590,12 @@ class BreakStrategy(StrategyBase):
             r = (lb["close"] / entry_price - 1) * 100
             rfh = (lb["close"] / peak - 1) * 100 if peak > 0 else 0
             held = end_idx - entry_idx + 1
-            if r <= stop:
+            can_sell = held > 1          # T+1：入场当日不可卖
+            if can_sell and r <= stop:
                 return True, f"止损{stop}%", entry_price * (1 + stop / 100)
-            if rfh <= trail and r > 0:
+            if can_sell and rfh <= trail and r > 0:
                 return True, f"追踪止损{trail}%", peak * (1 + trail / 100)
-            if r > 10:
+            if can_sell and r > 10:
                 bar_range = lb["high"] - lb["low"]
                 upper = ((lb["high"] - max(lb["open"], lb["close"])) / bar_range * 100
                          if bar_range > 0 else 0)
@@ -652,7 +610,10 @@ class BreakStrategy(StrategyBase):
             return ExitDecision("hold")
 
         # ① 昨日触发但该日封跌停卖不出 ⇒ 今日开盘强平 (旧引擎 pending_dn → 次日 b['open'])
-        if today_idx - 1 >= entry_idx:
+        # ★ 2026-10-09 审计 B1: 原判`today_idx - 1 >= entry_idx`，当 bars 从入场日开始时
+        #   today_idx-1 == entry_idx ⇒ **入场日(D1) 的止损触线会产出 D2 开盘出场**，
+        #   违反项目 R2 口径「D1 的止损触线不产生出场」。改为严格大于 ⇒ 1分支只看 D2 及以后。
+        if today_idx - 1 > entry_idx:
             y_trig, y_reason, _yp = _decide(today_idx - 1)
             y_dn = _dn_at(today_idx - 1)
             if (y_trig and y_reason.startswith(self._DN_GUARDED_REASONS)
@@ -712,12 +673,6 @@ class BreakStrategy(StrategyBase):
             entry_gate=entry_gate,
             sweet_pctb=float(_pick("sweet_pctb", 95.0)),
             sweet_pctb_core=float(_pick("sweet_pctb_core", 100.0)))
-
-
-def _find_limit_ups(bars, bt):
-    """涨停日索引 (is_limit_up vs 前收; 第0根无前收跳过)。与 core.market find_limit_ups 同语义。"""
-    from app.market_cn.auto.core.market import find_limit_ups
-    return find_limit_ups(bars, bt)
 
 
 # ================================================================
@@ -1256,7 +1211,11 @@ def _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params=Non
     hold = int(_hold)
     strat = BreakStrategy()
     _RULE = {"止损": "stop", "追踪": "trail", "峰值": "escape", "持仓到期": "time"}
-    for d in range(1, hold + 1):
+    # ★ 2026-10-09 审计 B1修复: 原从 d=1（入场当日）起调 exit_decision
+    #   ⇒ 入场日收盘触止损/峰值逃顶时返回 exit_day=1（**当日买当日卖，T+1 违规**）。
+    #   改为 d=2 起（A 股最早可卖日）；`exit_day` 坐标口径为
+    #   「持仓第 N 个交易日，N=1 为入场当日」，故此处返回的 d 与全局坐标一致。
+    for d in range(2, hold + 1):
         idx = entry_idx + d - 1
         if idx >= len(bars):
             break

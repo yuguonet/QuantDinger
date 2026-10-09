@@ -36,7 +36,9 @@ def _config():
         return {}
 
 
-# 组名与用户 (固定名: 自动策略组, 三策略共用: 龙回头/V1/断板)
+# 组名与用户 (固定名: 自动策略组, 全活跃策略共用)
+# ⚠ 2026-10-09 文档漂移已修: 原注释列举"龙回头/V1/断板", 其中 V1 已退役归档
+#   (strategies/_archive/, P6-6/7); 现改为不枚举具体策略, 免得再次漂移。
 DRAGON_GROUP_NAME = "自动策略组"
 DRAGON_USER_ID = 1
 DRAGON_MARKET = "CNStock"

@@ -187,7 +187,8 @@ def is_bse(ctx: Ctx) -> bool:
 def pk(ctx: Ctx, name: str):
     """板块感知参数取值：params[name] 为 {board: 值} → 按 ctx.board_type 取；标量原样返回。
 
-    镜像 entry_modes._resolve 的 dict 语义，使同一份门表可对主板/创业板给出不同阈值
+    （分板块 dict 语义原镜像自 `core/entry_modes._resolve`，该模块 2026-10-09 退役，
+      契约保留在此）使同一份门表可对主板/创业板给出不同阈值
     （break 的 vol_max/drawdown_max/stop_loss/... 分板块）。
     """
     v = ctx.params.get(name)

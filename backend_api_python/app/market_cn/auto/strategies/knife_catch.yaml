@@ -15,10 +15,6 @@ meta:
     windows: ["14:30", "15:00"]   # 扫描窗口 (14:30 起预热, 14:56 后出信号)
     interval_sec: 60              # 每分钟一槽
 
-entry:
-  mode: intraday                  # 触发槽位现价买入 (14:56 尾盘)
-  price: last
-
 exit:
   mode: d1_open                   # 次交易日(D1)开盘卖 (T+1)
 

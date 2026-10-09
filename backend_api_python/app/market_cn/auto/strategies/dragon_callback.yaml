@@ -15,10 +15,6 @@ meta:
   # 结构说明: "涨停 → 回调 → 反转"的 lu_idx 循环属引擎编排, 不写进门表; 门表只表达
   # "给定 (决策日 i, 涨停日 lu_idx) 是否放行"。
 
-entry:
-  mode: next_open              # 次日(D1)开盘买入
-  price: d1_open
-
 exit:
   mode: combo                  # core/exit_modes: dragon 出场引擎 (追踪/止损/到期/峰值逃顶)
 

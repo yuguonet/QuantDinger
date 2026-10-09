@@ -7,7 +7,7 @@
   1. 数据就绪检测 (当日 1D bar 是否已回填, 未就绪则轮询等待)
   2. 全市场逐股跑策略判定 (与回测同一份判定, core facade)。
      策略清单以注册表为准 (autodiscover + config enabled 且 kind=daily_close):
-     现网 dragon_callback / v1 / break / g56 等; 盘中窗口类走 run_scan_knife
+     现网 dragon_callback / break / g56 / knife_catch / tail_oversold 等; 盘中窗口类走 run_scan_knife
   3. 结果写 qd_dragon_signals (state=watch_pending, 待次日 D1 开盘处置)
   4. 历史清理 + 组对账 (组内活跃集不变, 防漂移)
 

@@ -9,16 +9,22 @@
   本模块补的是「启动即对齐」, 不替代 monitor 窗口逻辑。
 
 职责:
-  1. 计算策略指纹 —— **两段, 边界 = 语义边界**:
-       rules   (判定链)  = config.json strategies 段的 enabled/daily_limit/params
+  1. 计算策略指纹 —— **三段, 边界 = 语义边界**:
+       strategies(配置事实) = 每个策略的 enabled / daily_limit / params
+                           —— **走事实源 API**（`strategies.is_enabled` /
+                              `params_override`），即 yaml `meta.enabled` / `params` 段
+                              优先、config 兜底（2026-10-09 审计 B-3 修复）。
+       rules   (判定链)  = strategies/*.yaml (策略宏: 门表 + 参数 + 开关 + 出场)
                            + 从判定入口 (rebuild/scan/monitor/store/...) 出发做
                              AST import 闭包得到的 .py 清单, 各取内容 sha256。
                            变化 ⇒ 库里是旧规则算出的结果 ⇒ **必须重建**。
-       display (展示层)  = strategies/*.yaml (门表) + core/display_meta.py
-                           + core/display_meta.py, 各取内容 sha256。
+       display (展示层)  = core/display_meta.py, 取内容 sha256。
                            展示链每次请求实时读 ⇒ 重启即生效, **不重建**。
      为什么按语义边界切: 展示口径与判定契约曾混在同一文件 (base.py), 文件级 hash
      切不开 ⇒ 改一次档位映射就白跑一次全量重建 (实证 2026-09-23 19:33)。
+     ★ 2026-10-09 审计 B-3: `strategies/*.yaml` 从 display 段**移入 rules 段**。它是规则
+       （含 meta.enabled / params / gates），留在展示段会让「改宏即开关/改参数」只得到
+       display_changed ⇒ 走「仅展示层变更 → 无需重建」分支 ⇒ 补偿链全部失效。
   2. 与上次持久化快照比对, 得出变更集
   3. 按变更类型分流补偿:
      - 策略被禁用 或 从 config 移除 → 该策略「未入场」的活跃行 → expired
@@ -42,8 +48,9 @@
   → UI 不再提示卖出 → 用户会遗忘手上还有这两只票。这是实盘资金事故, 不是脏数据。
 
 刻意不做的边界:
-  - **展示链** (core/display_meta.py、strategies/*.yaml、tools/) 不进
-    判定指纹: UI 实时读, 重启即生效, 重建是纯浪费。详见 core/display_meta.py 头注实证。
+  - **展示链** (core/display_meta.py、tools/) 不进判定指纹: UI 实时读, 重启即生效,
+    重建是纯浪费。详见 core/display_meta.py 头注实证。
+    ★ 但 `strategies/*.yaml` **已在 rules 段**（策略宏是规则，不是展示）。
   - 判定闭包里**不可达**的 core 模块 (如 core/runtime/evaluate.py、expr.py —— 只被展示链
     与 tools 引用) 自然不在指纹内; 它们的守卫是 market_spec_check / path_parity。
   - 首次运行 (无快照) 同样触发一次后台校准 —— 首次恰是库最可能与代码不一致的时刻。
@@ -240,10 +247,32 @@ def _iter_judge_files():
 
 
 def _iter_display_files():
-    """展示层文件清单 [(relpath, abspath)]: strategies/*.yaml + core/display_meta.py。
+    """展示层文件清单 [(relpath, abspath)]: core/display_meta.py。
 
     单独成段是为了把「展示变更」与「判定变更」分开: 展示链每次请求实时读, 改了重启即可,
     不需要重跑 rebuild。旧实现把 *.yaml 混在判定指纹里 ⇒ 只改门表也会白跑一次全量重建。
+
+    ★ 2026-10-09 审计 B-3: `strategies/*.yaml` 已移出本段（归 rules 段，见 `fingerprint`）
+      —— 策略宏是**规则**（含 meta.enabled / params / gates），改它必须触发重建。
+      本段现仅剩 `core/display_meta.py`（纯展示元数据）。
+      保留跳过逻辑是为了向后兼容: 若将来有别的展示文件（如前端文案 yaml），在此追加即可。
+    """
+    out = []
+    dm = os.path.join(_auto_root(), "core", "display_meta.py")
+    if os.path.isfile(dm):
+        out.append(("core/display_meta.py", dm))
+    return sorted(out)
+
+
+def _iter_strategy_macros():
+    """策略宏清单 [(relpath, abspath)]: strategies/*.yaml。
+
+    ★ 2026-10-09 审计 B-3 新增: 策略宏是**规则**（`meta.enabled` / `params` / `gates`），
+      但它既不在判定链闭包里（`_closure_judge_files` 只收 `.py`，yaml 不参与 import 解析），
+      也不该留在展示段（改它必须触发重建）。故单列一段并入 fingerprint 的 **rules 段**。
+
+      没有这一段的后果（比原 bug 更糟）: yaml 从指纹里**彻底消失** ⇒ 改 yaml 既不触发
+      `retire_unfilled` 补偿、也不触发 rebuild，且连 display_changed 都收不到。
     """
     out = []
     sd = _strategies_dir()
@@ -252,11 +281,8 @@ def _iter_display_files():
             p = os.path.join(sd, fn)
             if fn.endswith(".yaml") and os.path.isfile(p):
                 out.append(("strategies/" + fn, p))
-    except OSError:
-        pass
-    dm = os.path.join(_auto_root(), "core", "display_meta.py")
-    if os.path.isfile(dm):
-        out.append(("core/display_meta.py", dm))
+    except OSError as e:
+        logger.warning("[auto_startup] 策略宏清单读取失败: %s", e)
     return sorted(out)
 
 
@@ -268,6 +294,15 @@ def fingerprint():
                "rules":   {relpath: sha256_32}}   ← 判定链, 变化 ⇒ 必须重建
                "display": {relpath: sha256_32}}   ← 展示层, 变化 ⇒ 重启即可
         config / 插件目录双双异常时 strategies 为空 (调用方应视作「无可比对」并跳过补偿)。
+
+    ★ 2026-10-09 审计 B-3 修复: `enabled` / `params` 的事实源已迁策略宏
+      （`<key>.yaml` 的 `meta.enabled` 与 `params`段，见 strategies.is_enabled /
+      params_override docstring）。旧实现只从 config.json 读这两个键，而 config
+      对有 yaml 的策略**不再写enabled 键** ⇒ 5个策略 enabled 恒 False、params 恒 {}。
+      后果: ① 在 yaml 里禁用策略不再触发 `retire_unfilled` 补偿（2026-09-23 事故的
+      补偿路径失效，只剩 monitor 开盘 sweep 与 stale 次日兜底）；② 改 yaml params
+      不触发 rebuild 校准 ⇒ 窗口内历史行仍是旧参数判定。
+      修法: strategies 段**走既有事实源 API**（不自己解析 YAML）。
     """
     fp = {"strategies": {}, "rules": {}, "display": {}}
     try:
@@ -278,16 +313,25 @@ def fingerprint():
         keys = sorted(set(cfg) | set(strat_reg.all_strategies()))
         for k in keys:
             c = cfg.get(k) or {}
+            # enabled / params 走事实源 API（yaml 优先，config 兜底），不直接读 config 键
             fp["strategies"][k] = {
-                "enabled": bool(c.get("enabled", False)),
-                "daily_limit": c.get("daily_limit"),
-                "params": c.get("params") if isinstance(c.get("params"), dict) else {},
+                "enabled": bool(strat_reg.is_enabled(k)),
+                "daily_limit": strat_reg.daily_limit(k),
+                "params": strat_reg.params_override(k) or {},
             }
     except Exception as e:
         logger.warning("[auto_startup] 指纹-策略段失败: %s", e)
         fp["strategies"] = {}
 
+    # ⚠ strategies/*.yaml 归**rules 段**（判定链），不再是 display 段
+    #   （`_closure_judge_files` 只收 .py，故必须由 `_iter_strategy_macros` 显式补入，
+    #    否则 yaml 会从指纹里彻底消失 —— 比原 bug 更糟）。
+    #   留在 display 段会让「改 yaml 开关/参数」只得到 display_changed ⇒
+    #   走「仅展示层变更 → 无需重建」分支（startup.py:_apply_fingerprint 的分支）。
+    #   代价: 只改展示字段也会触发 rebuild —— 偏保守，方向是 fail-safe，可接受。
     for rel, p in _iter_judge_files():
+        fp["rules"][rel] = _sha256_file(p)
+    for rel, p in _iter_strategy_macros():
         fp["rules"][rel] = _sha256_file(p)
     for rel, p in _iter_display_files():
         fp["display"][rel] = _sha256_file(p)
@@ -400,8 +444,9 @@ def diff(prev_detail, now_detail):
     }
     out["rules_changed"] = ((prev_detail or {}).get("rules") or {}) != \
                            ((now_detail or {}).get("rules") or {})
-    # 展示层变更 (门表 yaml / display_meta): 展示链实时读, 重启即生效,
+    # 展示层变更 (display_meta): 展示链实时读, 重启即生效,
     # **不需要**重建 —— 单独标记只为在日志里与"必须重建"区分开。
+    # ★ 2026-10-09 审计 B-3: `strategies/*.yaml` 已移入 rules 段，故此处不再含门表 yaml。
     out["display_changed"] = ((prev_detail or {}).get("display") or {}) != \
                              ((now_detail or {}).get("display") or {})
     return out
@@ -672,11 +717,11 @@ def reconcile_startup(async_=True, once=True, force=False):
         logger.info("[auto_startup] 检测到 %s → 已触发补扫+重建校准 (指纹待校准成功后推进)",
                     why)
     else:
-        # 无重建需求 → 立即推进指纹。典型: 只改了展示层 (门表 yaml / 展示管线 / 档位映射),
+        # 无重建需求 → 立即推进指纹。典型: 只改了展示层 (展示管线 / 档位映射),
         # 展示链每次请求实时读, 重启即生效, 重建纯属浪费。
         _save_snapshot(now_fp, calibrated_for=(prev or {}).get("calibrated_for"))
         if d.get("display_changed"):
-            logger.info("[auto_startup] 仅展示层变更 (门表/展示管线/档位映射) → "
+            logger.info("[auto_startup] 仅展示层变更 (展示管线/档位映射) → "
                         "无需重建, 重启即生效; 指纹已推进")
         else:
             logger.info("[auto_startup] 无重建需求 (停用类变更已同步处理) → 指纹已推进")

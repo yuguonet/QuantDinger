@@ -56,12 +56,13 @@ class LiveSampler:
         sampler = LiveSampler(active, strat_reg.params_override)
         for code in codes:
             for key, strat in active.items():
-                sigs = strat.scan_days(bars, code, lo_date=d, hi_date=d)
-                kept, u_fails = apply_unified_prefilter(sigs, ...)
-                sampler.observe(key, strat, code, bars, stock_info,
-                                sigs=sigs, kept=kept, u_fails=u_fails,
-                                independent=True)
+                sampler.observe(key, strat, code, bars, stock_info)
         sampler.close()
+
+    ⚠ 2026-10-09 文档漂移已修: 本示例原写 `observe(..., sigs=..., kept=...,
+      u_fails=..., independent=True)` —— 与实际签名 `observe(key, strategy,
+      code, bars, stock_info)` 不符, 照抄即 TypeError。现为真实调用形态。
+      （`sigs`/`kept`/`u_fails` 由本模块自跑 `scan_signals(probe=)` 内部产出。）
     """
 
     def __init__(self, active: dict, params_override=None, *,
@@ -220,16 +221,13 @@ LiveSampler._self_run_via_trace = _self_run_via_trace
 # ================================================================
 
 #: stage 归属排名（per-strategy taxonomy；"最深判定步"归属用）
+# ⚠ 2026-10-09 清理 (audit_prod B-8): 原表登记 4 条, 其中 dragon_callback /
+#   knife_catch / tail_oversold 三条**永不命中** —— 全仓 `probe.trace(stage=…)` 的
+#   生产者只有 `strategies/break.py:_emit` 一处 (打点值 = confirm/prefilter/signal/
+#   no_signal), 其余策略不产门级 trace ⇒ rank_map 非空却永远匹配不上, 归因结果
+#   **静默取第一项** = 假数据。现收敛到唯一真实生产者。
 STAGE_RANK = {
     "break": {"confirm": 1, "prefilter": 2, "signal": 3},
-    "dragon_callback": {"dragon": 1, "gap": 2, "streak": 3, "lu_gain20": 4,
-                        "rsi": 5, "turn": 6, "d0_chg": 7, "quality": 7,
-                        "dedup": 8, "prefilter": 9, "engine_skip": 9,
-                        "signal": 10},
-    "knife_catch": {"window": 1, "mkt": 2, "feat": 3, "data": 4, "tail_vw": 5,
-                    "daily": 6, "vol": 7, "streak": 8, "pre5": 8,
-                    "lu_recent": 9, "signal": 10},
-    "tail_oversold": {"window": 1, "limit": 2, "data": 3, "v2": 4, "signal": 5},
 }
 
 

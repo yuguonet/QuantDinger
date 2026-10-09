@@ -847,3 +847,13 @@ def run_monitor():
     return stats
 
 
+# 调度器契约名 = 本模块主 tick。
+# 历史: scheduler._dragon_strategy_monitor 按此名 import, 但该名一直不存在 ⇒
+#   每次触发在 import 处抛 ImportError, 被 scheduler._worker 的 except Exception
+#   吞成一条日志 ⇒ 开盘 gap 买入 / 盘中止损 / 预确认 / 收盘出场 / 15:01 确认 /
+#   exit 平账 / 组对账 整条盘中链在生产上停摆 (2026-10-09 审计 B-1 修复)。
+# 铁律: 这是**契约别名**, 语义恒等于 run_monitor。
+#   不要在此包 try/except —— 盘中链失败必须抛出并被调度器记账, 绝不静默降级。
+run_monitor_safe = run_monitor
+
+

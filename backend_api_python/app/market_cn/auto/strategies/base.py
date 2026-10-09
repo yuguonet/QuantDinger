@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.market_cn.auto.core.present.contract import DayInput, Progress, Stage
+from app.market_cn.auto.core.present.contract import DayInput, Progress
 # stateless 折叠的唯一实现在内核；本类只封装，不复制折叠循环（防第二份编排）
 from app.market_cn.auto.core.present.runner import fold_range
 

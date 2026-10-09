@@ -21,11 +21,6 @@ import os
 import time
 
 
-def is_st_stock(code):
-    """显式 ST 过滤 (与 test_dragon 一致): 无股票名称数据时依赖涨停阈值自然排除。"""
-    return False
-
-
 # ================================================================
 # 全市场流水线 (编排层: 经注册表分发, 无策略名分支)
 # ================================================================
@@ -122,8 +117,6 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
     # ⚠ probe 参数对 daily_close 已是 no-op（采样已迁 sampler.LiveSampler 实盘侧，
     #   回测侧 probe 分支是死代码 —— rule_stats/rule_audit 的 run_all(probe=) 已改道）。
     for k, code in enumerate(codes, 1):
-        if is_st_stock(code):
-            continue
         bars = _bars_batch.get(code) or daily(code, days)
         if not bars:
             continue

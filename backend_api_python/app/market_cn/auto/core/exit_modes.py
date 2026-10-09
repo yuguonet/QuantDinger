@@ -8,7 +8,9 @@
 
 统一适配器签名（所有 mode 实现必须一致）：
     fn(bars, entry_idx, entry_price, *, code, board_type, params, diag) -> Optional[dict]
-- entry_idx / entry_price：入场日索引与成交价（由 entry_modes 决定）。
+- entry_idx / entry_price：入场日索引与成交价（由各策略折叠 state 决定）。
+  ⚠ 2026-10-09 已退役 `core/entry_modes.py`：入场时机由各策略折叠 `step` 内部
+  状态机产出，与出场**不同构**，不存在「一次调用算出 entry_idx」的分派形态。
 - diag：入场侧派生量（d1_gap / d1_change / d1_limit_up …），供出场规则使用；无则 {}。
 - 返回 dict 会被 `**` 展开进 trade（字段与 python 参考版逐笔一致）；None = 放弃该笔。
 
@@ -25,6 +27,22 @@ from typing import Any, Callable, Dict, List, Optional
 EXIT_MODES: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {}
 
 
+# 启动时由注册层注入的 `autodiscover` 可调用对象（见 `set_exit_bootstrap`）。
+# ⚠ 2026-10-09 P1-7：原先 `run_exit` 在函数体内 `from ...strategies import autodiscover`
+#   ⇒ **core → strategies 反向 import**，违反设计 §2.2 依赖方向，且服务的是当时零调用的
+#   死路径。改为**依赖注入**：core 只保留分派与协议，注册时机交给上层（层反转）。
+_BOOTSTRAP: Optional[Callable[[], None]] = None
+
+
+def set_exit_bootstrap(fn: Optional[Callable[[], None]]) -> None:
+    """注入 autodiscover（幂等），供 `run_exit` 在 EXIT_MODES 为空时懒加载策略包。
+
+    由 `app.market_cn.auto.registry`（启动时）调用，使 core 无需 import strategies。
+    """
+    global _BOOTSTRAP
+    _BOOTSTRAP = fn
+
+
 def register_exit(mode: str, fn: Callable[..., Optional[Dict[str, Any]]]) -> None:
     """注册一个出场模式实现（同名覆盖）。
 
@@ -35,24 +53,28 @@ def register_exit(mode: str, fn: Callable[..., Optional[Dict[str, Any]]]) -> Non
 
 def run_exit(mode: str, *, bars: List[Dict[str, Any]], entry_idx: int, entry_price: float,
              code: str, board_type: str, params: Dict[str, Any],
-             diag: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+             diag: Optional[Dict[str, Any]] = None, stop_at_idx: Optional[int] = None,
+             **extra: Any) -> Optional[Dict[str, Any]]:
     """按 exit.mode 分派出场引擎。未注册的 mode → KeyError（fail-fast，不静默兜底）。
+
+    ⚠ `stop_at_idx` 是折叠路径**必需**的：逐日重放只许看到「截至今日」的 bars，
+      否则出场判定吃到未来数据（切口 2 的出场腿单源后，所有策略共用本入口 ⇒
+      该形参必须在契约里，不能让某一策略自己内联截断）。
 
     调用前须保证策略包已 autodiscover（strategy_cli / evaluate.ensure_gate_init /
     backtest.run_all 均已具备）；否则 mode 未注册会 fail-fast 暴露加载顺序问题。
     """
     fn = EXIT_MODES.get(mode)
     if fn is None:
-        # 惰性 autodiscover: 策略模块 import 时会 register_exit; 若调用方尚未
-        # 加载策略包, 先补一次 (幂等), 避免加载顺序导致 fail-fast 误报。
-        if not EXIT_MODES:
-            from app.market_cn.auto.strategies import autodiscover
-            autodiscover()
+        # 惰性 autodiscover（**依赖注入**，非 core→strategies 反向 import）：
+        # 策略模块 import 时会 register_exit; 若调用方尚未加载策略包, 先补一次 (幂等)。
+        if not EXIT_MODES and _BOOTSTRAP is not None:
+            _BOOTSTRAP()
             fn = EXIT_MODES.get(mode)
     if fn is None:
         raise KeyError(f"未注册的出场模式 exit.mode={mode!r}（已注册: {sorted(EXIT_MODES)}）")
     return fn(bars, entry_idx, entry_price, code=code, board_type=board_type,
-              params=params, diag=diag or {})
+              params=params, diag=diag or {}, stop_at_idx=stop_at_idx, **extra)
 
 
 def _bp(params, board_type, name):
@@ -69,11 +91,17 @@ def _bp(params, board_type, name):
 # 通用模式（不依赖策略, 留在 core）
 # ================================================================
 
-def _d1_open(bars, entry_idx, entry_price, *, code, board_type, params, diag):
+def _d1_open(bars, entry_idx, entry_price, *, code, board_type, params, diag,
+             stop_at_idx=None):
     """盘中窗口策略出场：次交易日(D1)开盘卖 —— 与 base.StrategyBase.intraday_exit 默认同语义。
 
     (knife_catch / tail_oversold 的 14:56 尾盘买入 → D1 开盘卖；成交价=次交易日 open)。
+
+    ⚠ `stop_at_idx` 对 D1 开盘模式无意义（出场固定为 D1 开盘，不存在重放截断），
+      仅为满足 `run_exit` 的统一适配器签名而接收；非空则 fail-fast 暴露误接线。
     """
+    if stop_at_idx is not None:
+        raise NotImplementedError("d1_open 出场不支持重放截断(stop_at_idx)")
     if entry_idx + 1 >= len(bars):
         return None
     nxt = bars[entry_idx + 1]

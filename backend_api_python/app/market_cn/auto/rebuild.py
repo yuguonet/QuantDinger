@@ -69,6 +69,26 @@ except Exception:
 
 
 # ================================================================
+# 投影键格式化（**唯一实现**，设计 §2.3「只允许有一份实现」）
+# ================================================================
+
+def fmt_key(k):
+    """投影键 → 字符串（``trade_date|strategy|code|entry_style``）。
+
+    ★ 2026-10-09 审计 B-4 修复: 键自 2026-10-07 A2 起是**四元组**
+      `(trade_date, strategy, code, entry_style)`（`build_expected` / `load_actual` /
+      `store.load_projection` 三处同步改过），但 `main` 的 `--json` 分支仍用
+      `"%s|%s|%s" % k` ⇒ `TypeError: not all arguments converted`
+      ⇒ **整个结构化落盘路径必崩**（render 分支早已改显式索引，唯独 json 漏改）。
+
+    统一走本函数：既修好崩溃，也避免「render 与 json 各写一份格式化」再次分叉。
+    用显式索引而非 ``"|".join``：join 对非字符串分量会抛 TypeError，
+    而分量含 ``None``（entry_style 缺失时归 ``"a"``，但 strategy 可能为 None）。
+    """
+    return "%s|%s|%s|%s" % (k[0], k[1], k[2], k[3])
+
+
+# ================================================================
 # 活跃策略集 (与 run_scan 同一判定: enabled 且 kind=daily_close)
 # ================================================================
 
@@ -1223,9 +1243,9 @@ def main(argv=None):
             json.dump({
                 "meta": {k: v for k, v in meta.items()
                          if k not in ("bars_map", "idx_map")},
-                "missing": ["%s|%s|%s" % k for k in d["missing"]],
-                "ghost": ["%s|%s|%s" % k for k in d["ghost"]],
-                "drift": [{"key": "%s|%s|%s" % k,
+                "missing": [fmt_key(k) for k in d["missing"]],
+                "ghost": [fmt_key(k) for k in d["ghost"]],
+                "drift": [{"key": fmt_key(k),
                            "fields": [{"f": x[0], "db": str(x[1]), "exp": str(x[2])}
                                       for x in f]} for k, f in d["drift"]],
             }, fh, ensure_ascii=False, indent=2, default=str)

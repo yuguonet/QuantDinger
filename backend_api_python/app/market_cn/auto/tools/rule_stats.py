@@ -329,15 +329,23 @@ def main():
         print(f"strategy={args.strategy} 未注册", file=sys.stderr)
         return 1
     from app.market_cn.auto.sampler import STAGE_RANK
-    rank_map = dict(STAGE_RANK.get(getattr(strat, "key", "") or "", {})
-                    or getattr(strat, "PROBE_STAGE_RANK", {}) or {})
+    key = getattr(strat, "key", "") or ""
+    rank_map = dict(STAGE_RANK.get(key, {}) or {})
     if not rank_map:
-        print(f"{args.strategy} 无 PROBE_STAGE_RANK (未接探针?), 无法归因", file=sys.stderr)
+        # ⚠ 2026-10-09 修: 原文案指向已退役的 `PROBE_STAGE_RANK` 类属性
+        #   (全仓 grep 0 命中) ⇒ 排障时被误导去"给策略补类属性", 而真实原因是
+        #   该策略不在门级 trace 生产路径上。现文案直指根因。
+        print(f"{args.strategy} 无 day-stage 归因表: sampler.STAGE_RANK 未登记 "
+              f"key={key!r}。全仓仅 break 经 strategies/break.py:_emit 打 stage, "
+              f"其余策略不产门级 trace ⇒ day 级归因不可用。", file=sys.stderr)
         return 1
-    # 调试标签口径 (策略文件内常量; 框架只读不注入)
-    dbg_trails = tuple(float(x) for x in (getattr(strat, "DEBUG_TRAILS", ()) or ()))
-    dbg_hold = int(getattr(strat, "DEBUG_HOLD_DAYS", 0) or 0)
-    dbg_wave = int(getattr(strat, "DEBUG_WAVE_DAYS", args.wave_days) or 0)
+    # 调试标签口径 —— DEBUG_* 是**策略模块级**常量, 必须经模块对象取。
+    # ⚠ 2026-10-09 修: 原 `getattr(strat, "DEBUG_*")` 从**实例**取 ⇒ 恒空,
+    #   标签口径静默退化为 "(无)" (假绿)。现经 sys.modules 取真实模块。
+    _mod = sys.modules.get(type(strat).__module__)
+    dbg_trails = tuple(float(x) for x in (getattr(_mod, "DEBUG_TRAILS", ()) or ()))
+    dbg_hold = int(getattr(_mod, "DEBUG_HOLD_DAYS", 0) or 0)
+    dbg_wave = int(getattr(_mod, "DEBUG_WAVE_DAYS", args.wave_days) or 0)
     if dbg_hold and args.exit_mode == "hold" and dbg_hold != args.hold:
         print(f"[warn] 策略 DEBUG_HOLD_DAYS={dbg_hold} 与 --hold {args.hold} 不符 "
               f"(以策略文件为准)", file=sys.stderr)

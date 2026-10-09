@@ -327,3 +327,19 @@ def market_env_of(key):
         return v if v in ("off", "trend", "counter") else "off"
     except Exception:
         return "off"
+
+
+# ================================================================
+# 启动时注入：出场派发器的懒加载钩子 (P1-7)
+# ----------------------------------------------------------------
+# `core.exit_modes.run_exit` 在 EXIT_MODES 为空时需要补一次 autodiscover
+# （策略模块 import 时才会 register_exit）。原先它在函数体内
+# `from ...strategies import autodiscover` ⇒ **core → strategies 反向 import**，
+# 违反设计 §2.2 依赖方向。改为**依赖注入**：core 只留分派与协议，
+# 由本模块（合法方向 strategies → core）在 import 尾部注册钩子。
+# 幂等：注册的是同一个函数对象，重复 import 不会重复生效。
+try:  # pragma: no cover - 防御性：core 缺失时不阻断策略加载
+    from app.market_cn.auto.core.exit_modes import set_exit_bootstrap
+    set_exit_bootstrap(autodiscover)
+except Exception:
+    pass
