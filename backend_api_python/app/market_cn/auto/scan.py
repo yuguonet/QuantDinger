@@ -576,13 +576,17 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
                         i + 1, len(codes), time.time() - t0)
 
     err_by_key: dict[str, int] = {}      # {策略: 本轮判定异常票数} → 见下方 finally 汇总
+    skip_rows: list = []                 # P2-11: 被跳过的票 (行级) → upsert 保留旧行+stale
     try:
         if WRITER == "scan_day":
-            rows, err_by_key = _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler)
+            rows, err_by_key, skip_rows = _rows_by_scan_day(
+                active, bars_by_code, target, stock_info, sampler)
         elif WRITER == "record":
-            rows = _rows_by_record(active, bars_by_code, target, stock_info, sampler)
+            rows, err_by_key, skip_rows = _rows_by_record(
+                active, bars_by_code, target, stock_info, sampler)
         else:
-            rows, err_by_key = _rows_by_scan(active, bars_by_code, target, stock_info, sampler)
+            rows, err_by_key, skip_rows = _rows_by_scan(
+                active, bars_by_code, target, stock_info, sampler)
     finally:
         sampler.close()
         if err_by_key:
@@ -627,7 +631,8 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
 
     # 2026-09-28: 环境门只作用于 market_env="trend" 策略 (见 finalize_signal_rows);
     # counter/off 策略在弱市仍出信号 — 不在主干全局拦截。
-    result = store.upsert_scan_signals(target, rows, strategies=tuple(active))
+    result = store.upsert_scan_signals(target, rows, strategies=tuple(active),
+                                       skip_rows=skip_rows)
     store.sync_watchlist_group(store.get_active_signals())
     store.cleanup_old(days=15)
     logger.info("[dragon_scan] 完成: 全市场 %d 只, 信号 %d 笔 (%.0fs) env=%s",
@@ -637,19 +642,24 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
     # P1-2: 任何调用方 (调度 daily_scan / startup 补扫 / CLI) 成功后同口径落完成标记
     _mark_daily_scanned(active.keys(), target)
     return {"status": "ok", "target": target, "codes": len(codes),
-            "signals": result.get("written", 0), "env": env_info}
+            "signals": result.get("written", 0), "env": env_info,
+            # P2-11: 行级 ERROR 报告 (被跳过的票) + 保留并标记 stale 的旧行数
+            "stale": result.get("stale", 0),
+            "row_errors": result.get("row_errors") or []}
 
 
 def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
     """**旧 writer** (迁移期回滚位, P6 删): 循环内逐票 `scan_days` 判定 → `signal_row`。
 
     即 P5-③ 之前的生产实现, 逐字保留 —— 它是回滚时唯一要回到的那条路。
-    返回 `(rows, err_by_key)`。
+    返回 `(rows, err_by_key, skip_rows)` (2026-10-10 P2-11 补回 skip_rows: 供
+    `upsert_scan_signals` 保留「被跳过且无新行」票的旧行并标记 stale, 不再信号蒸发)。
     """
     from app.market_cn.auto import store, strategies as strat_reg
 
     rows = []
     err_by_key: dict[str, int] = {}
+    skip_rows: list = []   # P2-11: [{"strategy","code","error"}] 行级跳过记录
     for i, (code, bars) in enumerate(bars_by_code.items()):
         name = (stock_info.get(code) or {}).get("name", "")
         for key, strat in active.items():
@@ -666,6 +676,7 @@ def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
                 #   无论多少, 末尾必有 **一行汇总** (ERROR) —— 兜住"降级后没人看"。
                 _n = err_by_key.get(key, 0) + 1
                 err_by_key[key] = _n
+                skip_rows.append({"strategy": key, "code": code, "error": str(e)})   # P2-11
                 if _n <= 3:
                     logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
                 else:
@@ -677,7 +688,7 @@ def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
             rows.extend(store.signal_row(key, s, name) for s in kept)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 判定 %d/%d, 信号 %d", i + 1, len(bars_by_code), len(rows))
-    return rows, err_by_key
+    return rows, err_by_key, skip_rows
 
 
 def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
@@ -691,6 +702,7 @@ def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
 
     rows = []
     err_by_key: dict[str, int] = {}
+    skip_rows: list = []   # P2-11: 行级跳过记录, 同 _rows_by_scan
     specs = {key: load_strategy(key) for key in active}
     for i, (code, bars) in enumerate(bars_by_code.items()):
         name = (stock_info.get(code) or {}).get("name", "")
@@ -701,6 +713,7 @@ def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
             except Exception as e:
                 _n = err_by_key.get(key, 0) + 1
                 err_by_key[key] = _n
+                skip_rows.append({"strategy": key, "code": code, "error": str(e)})   # P2-11
                 if _n <= 3:
                     logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
                 else:
@@ -711,7 +724,7 @@ def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
             rows.extend(store.signal_row(key, s, name) for s in kept)
         if (i + 1) % 500 == 0:
             logger.info("[dragon_scan] 判定 %d/%d, 信号 %d", i + 1, len(bars_by_code), len(rows))
-    return rows, err_by_key
+    return rows, err_by_key, skip_rows
 
 
 def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None):
@@ -721,11 +734,17 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
     Args:
         root: 切片根 (缺省 = 生产 `_paths.PRESENT_STATE_DIR`); 测试用临时根注入。
 
+    Returns:
+        `(rows, err_by_key, skip_rows)` (2026-10-10 P2-11):
+        err_by_key = {策略: 本轮判定异常票数} (与旧/门表 writer 同形, 供 finally 汇总);
+        skip_rows = [{"strategy","code","error"}] 行级跳过记录, 交 upsert 保留旧行+stale。
+
     ⚠ 判定期异常 = **整日整策略失败**（`advance_all` 不在票级兜异常，与旧路径逐票 try 不等价）。
-      而 `upsert_scan_signals` 是「先 DELETE 当日 watch_pending 再 INSERT」⇒ 拿残缺行去写会把
-      没判出来的那部分信号**删掉**。故失败策略**整体退回直判**（与「无折叠契约」同一条出口）：
-      既不写残缺、也不让整个扫描挂掉（那会一份信号都不落）—— 两条都是不可接受的结局。
+      故失败策略**整体退回直判**（与「无折叠契约」同一条出口）：既不写残缺、也不让
+      整个扫描挂掉（那会一份信号都不落）—— 两条都是不可接受的结局。
       回退必打 ERROR，不是静默降级。
+      （2026-10-10 P2-11 后 upsert 的前置 DELETE 已收窄为「只删本轮未复现的键」，
+      被跳过的票旧行保留+stale，部分失败不再等于部分信号蒸发；但退回直判的口径不变。）
     """
     from app.market_cn.auto import present_daily, store, strategies as strat_reg
 
@@ -744,6 +763,8 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
         logger.error("[dragon_scan] 行源退回 scan 直判 (不静默): %s", direct)
 
     rows = []
+    err_by_key: dict[str, int] = {}   # P2-11: 回传判定异常汇总 (原恒为空 ⇒ 连 ERROR 都不打)
+    skip_rows: list = []              # P2-11: 行级跳过记录, 同 _rows_by_scan
     for key, strat in active.items():
         params = strat_reg.params_override(key)
         if key in direct:
@@ -751,7 +772,13 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
                 try:
                     sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target, **params)
                 except Exception as e:              # noqa: BLE001 - 与旧路径同级容忍
-                    logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                    _n = err_by_key.get(key, 0) + 1
+                    err_by_key[key] = _n
+                    skip_rows.append({"strategy": key, "code": code, "error": str(e)})
+                    if _n <= 3:
+                        logger.warning("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
+                    else:
+                        logger.debug("[dragon_scan] %s %s 判定异常(%s), 跳过该票", code, key, e)
                     continue
                 kept, _ = apply_unified_prefilter(
                     sigs, bars, code, stock_info.get(code), strat)
@@ -768,7 +795,7 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
             kept, _ = apply_unified_prefilter(sigs, bars, code, stock_info.get(code), strat)
             name = (stock_info.get(code) or {}).get("name", "")
             rows.extend(store.signal_row(key, s, name) for s in kept)
-    return rows
+    return rows, err_by_key, skip_rows
 
 
 def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
@@ -873,6 +900,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
         today = _today()
         mkt = _mkt_gain(snaps)
         rows = []
+        skip_rows = []   # P2-11: 本轮判定异常跳过的票 → upsert 保留旧行+stale
         for key, strat in cycle_strats.items():
             params = strat_reg.params_override(key)
             shortlist = strat.intraday_shortlist(snaps, mkt, **params)
@@ -896,6 +924,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
                 except Exception as e:
                     logger.warning("[knife_scan] %s %s 判定异常(已跳过该股): %s",
                                    code, key, e)
+                    skip_rows.append({"strategy": key, "code": code, "error": str(e)})
                     continue
                 # U1~U4 统一预过滤 (与盘后 run_scan 同源; 锚点由策略 prefilter_anchor 声明)。
                 # 只有声明 use_unified_prefilter=True 的策略走本段 —— knife/tail 声明 False,
@@ -923,7 +952,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
         # 仅清 buy_today 态, 不碰 15:01 确认后已转移的 holding/exit 等状态
         result = store.upsert_scan_signals(
             today, rows, purge_buy_today=tuple(cycle_strats.keys()),
-            strategies=tuple(cycle_strats.keys()))
+            strategies=tuple(cycle_strats.keys()), skip_rows=skip_rows)
         if not preview_cycle and not rows:
             logger.info("[knife_scan] 终审 0 笔 → purge 预览 buy_today (策略=%s); "
                         "预览曾命中的票不会留在库里",

@@ -22,8 +22,9 @@
 """
 from __future__ import annotations
 
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
 from app.market_cn.auto.core.market import (
-    find_limit_ups, get_board_type, is_limit_up,
+    find_limit_ups, get_board_type, is_limit_up, limit_up_price,
 )
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
@@ -417,11 +418,17 @@ class BreakStrategy(StrategyBase):
         entry_price = float(bar.get("open") or 0)
         if entry_price <= 0:
             return []
+        # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实非策略规则): D1 开盘封死涨停
+        #   → 物理买不进, exec 带 buyable=False (消费方 replay/monitor/store 均已认此旗)。
+        win_s = state.get("win") or []
+        prev_c = float(win_s[-1]["c"]) if win_s else 0.0
+        up = limit_up_price(prev_c, state.get("board", "")) if prev_c > 0 else 0.0
+        buyable = not fill_blocked_by_limit_up(entry_price, up)
         return [Progress(stage="exec", date=str(bar.get("time", "")), payload={
             "entry_date": str(bar.get("time", ""))[:10],
             "entry_price": entry_price,
             "entry_idx": state["abs_i"] + 1,        # 绝对下标（持仓天数用）
-            "buyable": True,
+            "buyable": buyable,
             # P5-④ 前置: 买入当日 15:01 需实时确认（持仓 or 当日出场）—— 与 monitor
             # `W_CONFIRM_LO` 的 15:01 确认窗同一时点。此前 exec 不带锚 ⇒ 确认恒回退。
         }, next_realtime="15:01")]
@@ -435,6 +442,8 @@ class BreakStrategy(StrategyBase):
         """
         bar, code = inp.bar, inp.code
         pl = getattr(prev, "payload", None) or {}
+        if pl.get("buyable") is False:
+            return []        # 未入场 (涨停阻买/gap 越界) ⇒ 无仓可出 (与 g56 同守卫)
         entry_price = float(pl.get("entry_price") or 0)
         if entry_price <= 0:
             return [Progress(stage="exit", date=str(bar.get("time", "")), payload={
@@ -474,12 +483,20 @@ class BreakStrategy(StrategyBase):
 
     # ---- D1 竞价处置 ----
     def entry_decision(self, row, snap=None, **params):
-        """break 无开盘 gap 过滤 (恒可买); 快照缺失不可买 (与 monitor skip 一致)。"""
+        """break 无开盘 gap 过滤 (恒可买); 快照缺失不可买 (与 monitor skip 一致)。
+
+        ★ 唯一例外 = 涨停阻买 (市场事实): 开盘封死涨停 → 物理买不进。
+        """
         if not snap:
             return EntryDecision(False, "无竞价快照")
         open_px = float(snap.get("open") or snap.get("last") or 0)
         if open_px <= 0:
             return EntryDecision(False, "开盘价缺失")
+        prev_close = float(snap.get("previousClose") or row.get("signal_price") or 0)
+        if prev_close <= 0:
+            return EntryDecision(False, "昨收缺失, 无法判涨停")
+        if fill_blocked_by_limit_up(open_px, limit_up_price(prev_close, get_board_type(row.get("code", "")))):
+            return EntryDecision(False, "开盘涨停封死, 不可买(市场事实)")
         return EntryDecision(True, "断板无gap过滤, 开盘可买")
 
     # ---- 15:00 收盘确认 ----

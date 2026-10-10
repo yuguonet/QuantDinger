@@ -19,7 +19,8 @@ from __future__ import annotations
 
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
-from app.market_cn.auto.core.market import get_board_type, is_limit_up
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.market import get_board_type, is_limit_up, limit_up_price
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
 )
@@ -320,6 +321,10 @@ class KnifeCatchStrategy(StrategyBase):
         last_time = str(snap.get("time") or "")
         # 数据合法性守卫（旧实现在任何 probe 之前就返回 ⇒ 保持「无 probe」语义）
         if last <= 0 or pc <= 0 or high <= low:
+            return None
+        # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实): 触发价封死涨停 → 物理买不进。
+        #   旧口径零漂移 = 严格达到名义涨停价才拒 (同 g56 GAP_LIM 口径)。
+        if fill_blocked_by_limit_up(last, limit_up_price(pc, board or "main")):
             return None
         ctx = Ctx([], 0, lu_idx=0, params=p, board_type=board or "main", code=code,
                   latest=snap, series=series or [], mkt_gain=mkt_gain,

@@ -20,7 +20,8 @@ from app.utils.indicators import (
     calc_macd, calc_psy, calc_roc, is_macd_golden_cross,
     is_macd_hist_shrinking_negative, is_macd_hist_turning_positive, rsi,
 )
-from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up, limit_up_price
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.strategies import register
@@ -715,16 +716,19 @@ class DragonCallbackStrategy(StrategyBase):
             open_px = float(bar.get("open") or 0)
             pc = float(prev.payload.get("close_raw") or 0)
             gap = (open_px / pc - 1) * 100 if (open_px > 0 and pc > 0) else None
+            # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实): 开盘封死涨停 → 买不进。
+            _up = limit_up_price(pc, state.get("board", "")) if pc > 0 else 0.0
+            buyable = open_px > 0 and not fill_blocked_by_limit_up(open_px, _up)
             ev = Progress(stage="exec", date=bar.get("time", ""), payload={
                 "entry_date": bar.get("time", ""),
                 "entry_price": round(open_px, 3), "d1_gap": None if gap is None else round(gap, 2),
-                "buyable": open_px > 0,
+                "buyable": buyable,
                 "entry_abs": today_abs,
                 "lu_abs": prev.payload.get("lu_abs"), "i_abs": prev.payload.get("i_abs"),
                 # P5-④ 前置 (2026-10-08): 买入当日 15:01 实时确认（持仓 / 当日出场）。
             }, next_realtime="15:01")
             events.append(ev)
-            if open_px > 0:
+            if buyable:
                 holding = ev
 
         # ── 新信号（每日至多 1；去重 ±4 对齐旧 backtest_stock）──
@@ -857,6 +861,10 @@ class DragonCallbackStrategy(StrategyBase):
         if prev_close <= 0:
             return EntryDecision(False, "昨收缺失")
         gap = (open_px / prev_close - 1) * 100
+        # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实): 开盘封死涨停 → 物理买不进。
+        if fill_blocked_by_limit_up(
+                open_px, limit_up_price(prev_close, get_board_type(row.get("code", "")))):
+            return EntryDecision(False, f"开盘涨停封死, 不可买(gap={gap:.2f}%)")
         tag = "高开" if gap > 2 else ("低开" if gap < -3 else "")
         return EntryDecision(True, f"gap={gap:.2f}% 可买{tag}")
 

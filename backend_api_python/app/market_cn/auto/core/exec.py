@@ -62,6 +62,21 @@ def fill_blocked_by_limit_dn(fill: float, dn: Optional[float],
     return dn is not None and fill <= dn * (1 + tol)
 
 
+def fill_blocked_by_limit_up(fill: float, up: Optional[float],
+                             *, tol: float = 0.0) -> bool:
+    """买入成交价达到涨停价 → **买不到** (封死/一字)。
+
+    `fill_blocked_by_limit_dn` 的买侧镜像 (2026-10-10 把 2026-09-29 的
+    `market.limit_up_price` 修复接入活路径, 审计 #8-2 / 修复核对 §3)。
+
+    - `up` = 名义涨停价 (`market.limit_up_price`), 无涨跌停市场传 0/None → 不判定；
+    - `tol` = 相对容差, 默认 0 = **严格达到即拒**（与 g56 既有 GAP_LIM 口径逐位一致,
+      零漂移）；`fill_intraday` 买腿传 `_limit_dn_tol(spec)`（保留其历史容差语义）。
+    ⚠ 买侧交易的**唯一**涨停阻买判定入口，禁止在策略/工具内联比较涨停价。
+    """
+    return up is not None and up > 0 and fill >= up * (1 - tol)
+
+
 def fill_intraday(bar: dict, trigger: float, *, side: str = "sell",
                   dn: Optional[float] = None, up: Optional[float] = None,
                   spec: Optional[MarketSpec] = None) -> tuple:
@@ -90,8 +105,9 @@ def fill_intraday(bar: dict, trigger: float, *, side: str = "sell",
     if side == "buy":
         if bar["high"] >= trigger:
             fill = bar["open"] if bar["open"] > trigger else trigger
-            # 涨停不可买 (up 为涨停价; 无 up 时不判)
-            if up is not None and fill >= up * (1 - _limit_dn_tol(spec)):
+            # 涨停不可买 (up 为涨停价; 无 up 时不判)。★ 2026-10-10 抽出为
+            # fill_blocked_by_limit_up (唯一实现); tol 传 _limit_dn_tol 保留原容差语义。
+            if fill_blocked_by_limit_up(fill, up, tol=_limit_dn_tol(spec)):
                 return fill, False
             return fill, True
         return None, False

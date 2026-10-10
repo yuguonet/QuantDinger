@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.market_cn.auto.core.market import get_board_type, is_limit_up
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.market import get_board_type, is_limit_up, limit_up_price
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.core.runtime.functions import Ctx, register_strategy_funcs
 from app.market_cn.auto.strategies.base import (
@@ -101,7 +102,11 @@ DEFAULT_PARAMS = {
 }
 
 G56_WIN = 35        # 递推切片窗口 (= 生产口径 DEFAULT_WIN)
-GAP_LIM = {"main": 0.098, "gem_star": 0.198}   # entry 过滤硬编码口径 (非 up_eff)
+# ★ 2026-10-10 (审计 D-1 收敛): 原 `GAP_LIM = {"main": 0.098, "gem_star": 0.198}`
+#   entry 过滤硬编码口径已删 —— 涨停幅度是**市场事实**, 统一走
+#   `market.limit_up_price` + `exec.fill_blocked_by_limit_up`（唯一实现）。
+#   现值语义逐位不变: 旧 `gap < GAP_LIM` ⟺ 新 `not fill_blocked_by_limit_up(open, up)`
+#   （严格达到名义涨停价才拒, 与旧口径零漂移）。
    # 2026-10-06: 原散落在 entry_decision / backtest 两处硬编码,
    # 展示层 evaluate 亦抄了一份 ⇒ 收敛为单一常量。
 # score 相关阈值 (SCORE_* / R56 / MAIN_RMED_MIN / GEM_SCORE_MIN 等) 仍冻结为模块常量 ——
@@ -426,7 +431,10 @@ class G56Strategy(StrategyBase):
             open_px = float(bar.get("open") or 0)
             pc = float(prev.payload.get("price") or 0)   # 信号日收盘
             gap = (open_px / pc - 1) if (open_px > 0 and pc > 0) else None
-            buyable = gap is not None and gap < GAP_LIM[get_board_type(code)]
+            # ★ 涨停阻买 (市场事实, 唯一实现): 旧 GAP_LIM 口径逐位等价 (严格达到名义涨停价才拒)
+            buyable = (open_px > 0 and pc > 0
+                       and not fill_blocked_by_limit_up(
+                           open_px, limit_up_price(pc, get_board_type(code))))
             ev = Progress(stage="exec", date=bar.get("time", ""), payload={
                 "entry_date": bar.get("time", ""), "entry_price": open_px,
                 "signal_date": prev.date, "gap": None if gap is None else round(gap * 100, 2),
@@ -634,9 +642,11 @@ class G56Strategy(StrategyBase):
         prev_close = float(snap.get("previousClose") or row.get("signal_price") or 0)
         if prev_close <= 0:
             return EntryDecision(False, "昨收缺失")
-        lim = 0.198 if get_board_type(row.get("code", "")) == "gem_star" else 0.098
         gap = open_px / prev_close - 1
-        if gap >= lim:
+        # ★ 涨停阻买 (2026-10-10 D-1 收敛): 旧 `lim=0.198/0.098` 硬编码已删,
+        #   统一走 limit_up_price + fill_blocked_by_limit_up (严格口径, 零漂移)。
+        if fill_blocked_by_limit_up(
+                open_px, limit_up_price(prev_close, get_board_type(row.get("code", "")))):
             return EntryDecision(False, f"gap={gap * 100:.2f}%≥涨停幅度, 一字/触板不可买")
         return EntryDecision(True, f"gap={gap * 100:.2f}% 可买")
 

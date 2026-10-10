@@ -278,11 +278,17 @@ def _strategy_meta(key):
 
 
 def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = (), max_retries: int = 5,
-                        strategies: tuple = ()):
+                        strategies: tuple = (), skip_rows=()):
     """扫描结果写入 (幂等): rows 为各策略今日信号列表, 行内带 strategy 键。
 
     扫描是 watch_pending 状态的权威来源: 先清该 trade_date 的旧 watch_pending
     (防止参数/数据变化后残留幽灵信号), 再插入本轮结果。
+    ⚠ 2026-10-10 (P2-11) 前置 DELETE 已收窄为「只删本轮未复现的键」——
+      不再无条件删该日该策略全部 watch_pending:
+        · 本轮出了新行的键 → 由 ON CONFLICT 原地更新 (不再先删后插);
+        · 被跳过但无新行的票 (skip_rows, 判定异常/取数缺失) → **旧行保留并标记
+          stale** (extra.stale=true), 不静默消失 —— 部分判定失败不再等于部分信号蒸发;
+        · 其余键 (本轮干净判定且无信号 / 未复现) → 照旧删除 (防参数变化残留幽灵)。
     行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
     (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
     purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
@@ -292,10 +298,15 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
       watch_pending——不带范围时会把同 trade_date 其它策略的盘后信号整批删掉
       且不补回 (盘后扫描先写、之后任何 _scan_cycle 预览轮都会丢信号)。空 tuple
       时从 rows 推断; rows 也为空 → DELETE 0 行 (安全方向: 宁多留不误删)。
+    skip_rows: 本轮被跳过的票 (list of {"strategy","code","error"}), 由 writer 回传
+      (P2-11)。只保留「被跳过且本轮无新行」的票的旧行; 同键已有新行时以新行为准。
 
     Returns:
         {"written": 本次写入行数, "purged": 清理行数,
-         "superseded": **跨日被取代的旧观察票行数** (A11, 2026-10-05)}
+         "superseded": **跨日被取代的旧观察票行数** (A11, 2026-10-05),
+         "stale": 保留并标记 stale 的旧行数 (P2-11),
+         "row_errors": 行级 ERROR 清单 (P2-11):
+           [{"strategy","code","error","action": stale_kept|no_old_row}]}
 
     ⚠️ 2026-09-28 修 A1 (资金事故红线): ON CONFLICT 的 state/extra 加 CASE 守卫
     ——monitor 已推进的行 (entry_date 非空: buy_today/holding/exit) 不得被补扫
@@ -312,17 +323,42 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
     # M12: DELETE 策略范围 (显式传入优先, 否则从 rows 推断; 都空 → 删 0 行)
     scope = sorted({str(s) for s in strategies if s}) or \
         sorted({str(r.get("strategy") or DRAGON_STRATEGY) for r in rows})
+    # ── P2-11 (2026-10-10): 前置 DELETE 收窄 —— 只删「本轮未复现」的键 ──
+    # 原实现无条件删该日该策略全部 watch_pending 再插本轮 rows ⇒ 判定异常/取数缺失
+    # 被 continue 跳过的票, 旧行已删且无新行顶上 = **信号蒸发** (审计 L-11 / B-5)。
+    # 收窄口径:
+    #   new_keys  = 本轮产出新行的键 (trade_date, strategy, code, entry_style)
+    #               —— 由下方 ON CONFLICT 原地更新, 不再先删后插 (id 不再翻新);
+    #   skip_pairs = 被跳过且本轮无新行的 (strategy, code) —— 删除语句**豁免**它们,
+    #               旧行原地保留并标记 stale (见下), 判定异常不再蒸发旧信号;
+    #   其余键 (干净判定后无信号) → 照旧删, 防参数/数据变化残留幽灵信号。
+    # ⚠ 行值 NOT IN 依赖 PostgreSQL 行构造器比较 `(a,b,c) NOT IN ((..),(..))`;
+    #   空集时省略子句 (SQL 里 `NOT IN ()` 非法), 语义等价「全不豁免」。
+    new_keys = sorted({(str(r.get("strategy") or DRAGON_STRATEGY), str(r["code"]),
+                        str(r.get("style", "a")))
+                       for r in rows if r.get("code")})
+    new_pairs = {(k[0], k[1]) for k in new_keys}
+    skip_pairs = sorted({(str(sr.get("strategy") or DRAGON_STRATEGY), str(sr.get("code")))
+                         for sr in (skip_rows or ())
+                         if sr.get("code")
+                         and (str(sr.get("strategy") or DRAGON_STRATEGY),
+                              str(sr.get("code"))) not in new_pairs})
     last_err = None
     for _attempt in range(1, max_retries + 1):
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
                 if scope:
-                    cur.execute(
-                        f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s AND state = %s "
-                        f"AND strategy = ANY(%s)",
-                        (trade_date, S_WATCH_PENDING, scope),
-                    )
+                    del_sql = (f"DELETE FROM {_SIGNALS_TABLE} WHERE trade_date = %s "
+                               f"AND state = %s AND strategy = ANY(%s)")
+                    del_params = [trade_date, S_WATCH_PENDING, scope]
+                    if new_keys:
+                        del_sql += " AND (strategy, code, entry_style) NOT IN %s"
+                        del_params.append(new_keys)
+                    if skip_pairs:
+                        del_sql += " AND (strategy, code) NOT IN %s"
+                        del_params.append(skip_pairs)
+                    cur.execute(del_sql, tuple(del_params))
                     purged = cur.rowcount
                 else:
                     purged = 0   # 2026-09-29 审计修复: scope 空时 cur.rowcount 取未执行游标的未定义值
@@ -336,6 +372,46 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         (trade_date, S_BUY_TODAY, list(purge_buy_today)),
                     )
                     purged += cur.rowcount
+
+                # ── P2-11: 被跳过但无新行的票 —— 旧行保留 + 标记 stale, 不静默消失 ──
+                # 上面 DELETE 已豁免 skip_pairs; 这里给留下的旧行打 stale 标记
+                # (extra.stale=true + 原因/时间), 让展示层与人工能看到「此行是上一轮
+                # 判定的遗留, 本轮未能复核」而不是把它当成新鲜信号。
+                # 只碰当日 watch_pending: 不动已推进行 (A1 同一红线), 不跨日。
+                stale = 0
+                stale_hit = set()
+                stale_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                for st_pair in skip_pairs:
+                    cur.execute(f"""
+                        UPDATE {_SIGNALS_TABLE}
+                           SET updated_at = NOW(),
+                               extra = COALESCE(extra, '{{}}'::jsonb) || %s::jsonb
+                         WHERE trade_date = %s AND state = %s
+                           AND strategy = %s AND code = %s
+                    """, (
+                        json.dumps({"stale": True,
+                                    "stale_reason": "本轮判定异常/取数缺失跳过, 保留旧行 (P2-11)",
+                                    "stale_ts": stale_ts},
+                                   ensure_ascii=False, default=str),
+                        trade_date, S_WATCH_PENDING, st_pair[0], st_pair[1]))
+                    if cur.rowcount:
+                        stale += cur.rowcount
+                        stale_hit.add(st_pair)
+
+                # 行级 ERROR 报告 (P2-11 验收: 报告里有行级 ERROR, 不是只有汇总计数):
+                # 每个被跳过的票一条; 保住了旧行的打 ERROR 日志 (不静默消失)。
+                row_errors = []
+                for sr in (skip_rows or ()):
+                    p = (str(sr.get("strategy") or DRAGON_STRATEGY), str(sr.get("code")))
+                    kept = p in stale_hit
+                    row_errors.append({"strategy": p[0], "code": p[1],
+                                       "error": str(sr.get("error") or ""),
+                                       "action": "stale_kept" if kept else "no_old_row"})
+                    if kept:
+                        logger.error(
+                            "[upsert_scan_signals] 行级 ERROR: %s %s 本轮判定异常, "
+                            "旧行保留并标记 stale (不静默消失): %s",
+                            p[0], p[1], sr.get("error") or "")
 
                 # ── A11 (2026-10-05): 跨日幽灵观察票 —— 旧提名被新提名取代 ──
                 # 上面的 DELETE 只清 `trade_date = 本次` 的行, 而唯一键也含 trade_date
@@ -352,28 +428,26 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                 #   候选集, 又留下可追溯痕迹 (extra.superseded_by 记被哪天取代)。
                 # ⚠ 只按本次 rows 里出现的 (strategy, code, entry_style) 精确命中 ——
                 #   不带范围的批量 UPDATE 会重演 M12 事故 (误伤同表其它策略的行)。
+                # 2026-10-10 (P2-11 附带 · A11 批量化): 原逐键 UPDATE = N+1 往返,
+                # 改单条批量 UPDATE (行值 IN 精确键列表), 语义等价 —— 仍**只**命中本次
+                # rows 的精确 (strategy, code, entry_style), 不是范围 UPDATE (不重演 M12
+                # 误伤), 往返 O(N)→O(1)。
                 superseded = 0
-                seen_keys = set()
-                for s in rows:
-                    k = (s.get("strategy") or DRAGON_STRATEGY,
-                         s.get("code"), s.get("style", "a"))
-                    if not k[1] or k in seen_keys:
-                        continue
-                    seen_keys.add(k)
+                if new_keys:
                     cur.execute(f"""
                         UPDATE {_SIGNALS_TABLE}
                            SET state = %s, updated_at = NOW(),
                                extra = COALESCE(extra, '{{}}'::jsonb) || %s::jsonb
                          WHERE state = %s AND trade_date < %s
-                           AND strategy = %s AND code = %s AND entry_style = %s
+                           AND (strategy, code, entry_style) IN %s
                     """, (
                         S_EXPIRED,
                         json.dumps({"superseded_by": str(trade_date),
                                     "superseded_ts": time.strftime("%Y-%m-%d %H:%M:%S")},
                                    ensure_ascii=False, default=str),
-                        S_WATCH_PENDING, trade_date, k[0], k[1], k[2],
+                        S_WATCH_PENDING, trade_date, new_keys,
                     ))
-                    superseded += cur.rowcount
+                    superseded = cur.rowcount
 
                 n = 0
                 for s in rows:
@@ -424,7 +498,8 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                     n += 1
                 db.commit()
                 cur.close()
-            return {"written": n, "purged": purged, "superseded": superseded}
+            return {"written": n, "purged": purged, "superseded": superseded,
+                    "stale": stale, "row_errors": row_errors}
         except Exception as _e:
             _pg = getattr(_e, "pgcode", None)
             _transient = _pg in ("40P01", "40001")

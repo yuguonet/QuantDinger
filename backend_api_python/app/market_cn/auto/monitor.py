@@ -39,6 +39,8 @@ except Exception:
 
 from app.market_cn.auto import store as ds
 from app.market_cn.auto import strategies as strat_reg
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.market import get_board_type, limit_up_price
 # 展示档位归一 (非判定): 单独模块, 不进判定指纹 —— 见 core/display_meta.py 头注
 from app.market_cn.auto.core.display_meta import confirm_level_of
 
@@ -61,9 +63,8 @@ def _today() -> str:
     影响 exit_today 平账 (出口 B 判 `marked >= today`) 与日期窗口的边界。
     现统一到 store.today_str()。
 
-    ⚠️ 遗留隐患 (未改, 不在 A7 点名范围): `snapshot_day_done()` 仍用
-      `time::date = CURRENT_DATE` 判当日快照是否落齐。若该表 time 存的是本地时间戳,
-      同样会错一格 —— 改它需要先确认 time 列的写入时区, 本次未动。
+    ⚠️ 原遗留隐患 `snapshot_day_done()` 的 `CURRENT_DATE` 时钟已于 2026-10-10
+      (审计 B-7) 统一到本函数 —— 两套时钟收口完成。
     """
     return ds.today_str()
 
@@ -114,12 +115,21 @@ _SNAPSHOT_TABLE = "realtime_snapshot"
 
 
 def snapshot_day_done() -> bool:
+    """当日快照是否已落齐 (MAX(time) ≥ 15:00)。
+
+    ★ 2026-10-10 审计 B-7 修复: 原 `time::date = CURRENT_DATE` —— DB 会话是 UTC
+      (db_postgres.py:144 `options="-c timezone=UTC"`), 而 time 列存的是**北京时间**
+      本地戳 (realtime_snapshot.py 以 `datetime.now(TZ_CN)` 写入) ⇒ 北京 00:00~07:59
+      两者不在同一天, 15:01 确认闸门误判。现统一到 `_today()` (store.today_str,
+      与 A7 时钟收口同一事实源), 参数化传入, 顺带消除 SQL 注入面。
+    """
     try:
         pool = _snapshot_pool()
+        today = _today()
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT MAX(time) FROM \"{_SNAPSHOT_TABLE}\" "
-                            "WHERE time::date = CURRENT_DATE")
+                            "WHERE time::date = %s", (today,))
                 r = cur.fetchone()
         if not r or r[0] is None:
             return False
@@ -496,6 +506,17 @@ def run_monitor():
                 if prev_close <= 0:
                     continue
                 gap = (open_px / prev_close - 1) * 100
+                # ★ 涨停阻买 (2026-10-10 审计 #8-2, **市场事实**而非策略规则):
+                #   开盘封死涨停 → 物理买不进, 不得转 buy_today。统一走 exec 唯一实现
+                #   (折叠加 exec payload 的 buyable 同一旗标口径)。
+                if fill_blocked_by_limit_up(
+                        open_px, limit_up_price(prev_close, get_board_type(code))):
+                    ds.set_state(r["id"], ds.S_EXPIRED,
+                                 detail={"gap": round(gap, 2), "src": "limit_up_guard",
+                                         "reason": "开盘涨停封死, 不可买(市场事实)"},
+                                 expect_state=ds.S_WATCH_PENDING)
+                    n_exp += 1
+                    continue
                 strat = r.get("strategy") or ds.DRAGON_STRATEGY
                 s_obj = strat_reg.get_strategy(strat)
                 if s_obj is None:
