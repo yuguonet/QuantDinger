@@ -1,9 +1,10 @@
 # A股 Agent 经验库体系设计 —— 从预测到经验引擎
 
-> **日期**：2026-10-09（初版）/ 2026-10-10（v2 修订）
+> **日期**：2026-10-09（初版）/ 2026-10-10（v2 修订）/ 2026-10-10（v2.1 落地定制）
 > **来源**：会话讨论记录整理
 > **主题**：如何让 Agent 在 A 股中短线分析中建立持续进化的能力
-> **状态**：v2 修订稿 —— 合并设计审核结论：统计契约（记账规则）、经验条目账本（exp_claims）、生命周期与呈现权重、标签口径规格书
+> **状态**：v2.1 落地定制版 —— 已对照 QuantDinger `backend_api_python` 实际代码库调整：表名/模块名/钩子全部落到真实位置，组件映射见 §15
+> **适用仓库**：`backend_api_python/app/agent/`（追责系统 v1.1 + 提智方案 T1 之后的存量代码基线）
 >
 > **v2 修订要点**：引擎不预设哪些经验是真的。任何经验（直觉/人工/挖掘）都可入库并自带战绩账本；门槛设在「呈现权重」上，不设在「准入」上。统计契约对所有经验一视同仁地记账，让市场来投票哪些经验活下来。
 
@@ -235,8 +236,13 @@ CREATE TABLE exp_cases (
 
 CREATE INDEX ON exp_cases (layer, created_at DESC);
 CREATE INDEX ON exp_cases (layer, entity_id) WHERE entity_id IS NOT NULL;
-CREATE INDEX ON exp_cases USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- 向量存储沿用本仓真实约束（见 case_memory.py / rag/pg_vector_store.py）：
+-- pgvector 扩展不可依赖，embedding 存 JSONB + Python 余弦，限扫限批量；
+-- 无 embedding 配置时退化为 2-gram 词面相似（fail-open，通道不断）。
+-- 不建 ivfflat 索引（冷启动数据量下召回极差，且扩展不可用）。
 ```
+
+> **v2.1 存储裁决**：向量方案照抄 `rag/pg_vector_store.py` 同款形态（JSONB 存向量 + Python 余弦），embedding 走 `rag/embeddings.py` 工厂（env EMBEDDING_*）。表结构落 `migrations/agent_v5_experience.sql`，风格对齐 `migrations/agent_v4_trace.sql`（CREATE TABLE IF NOT EXISTS，可重复执行）。
 
 #### L0 市场经验
 
@@ -504,9 +510,9 @@ CREATE INDEX ON exp_claims USING gin (condition_tpl);
     AND outcome_verified_at IS NOT NULL
   → 候选池 200-500 条
   │
-  ▼ 【Step 3: 向量语义排序（pgvector，~20ms）】
-  situation_embedding <=> query_embedding
-  → 取 Top-20
+  ▼ 【Step 3: 向量语义排序（本仓向量库，限扫 2000）】
+  situation_embedding ~ query_embedding（JSONB + Python 余弦，同 case_memory.retrieve_cases）
+  → 取 Top-20（无 embedding 配置时退化为词面相似，fail-open）
   │
   ▼ 【Step 4: 二次排序（代码，~1ms）】
   score = similarity × 0.4
@@ -595,10 +601,11 @@ def build_experience_digest(query_situation, cases, claims):
 Agent 完成一次分析
   │
   ▼
-finish_collector 提取案例（代码做，不用LLM）
+trace_collector finalize 后置钩子提取案例（代码做，不用LLM；
+同 case_memory.record_case 挂点，改造为经验库写入端）
   ├─ situation 特征 ← resolver + 工具输出 + 量化指标
   ├─ situation_text ← 模板化生成（确定性）
-  ├─ embedding ← BGE 编码
+  ├─ embedding ← rag/embeddings.py 工厂
   ├─ judgment ← Agent 的结论（写入时必须声明 label_spec：命中判定式+观察窗口）
   └─ outcome ← 暂空，T+N 回填
   │
@@ -606,7 +613,9 @@ finish_collector 提取案例（代码做，不用LLM）
 写入 exp_cases + exp_claims 关联（该判断引用/印证/反驳了哪条经验）
   │
   ▼
-（T+N 后）evaluator 回填 outcome（未出手/undecidable 同样回填）
+（T+N 后）chain/resolver + evaluator.evaluate_pending 回填 outcome
+（未出手/undecidable 同样回填；沿用 backfill_by_root 的 P1 写保护语义——
+只在 label 仍为 pending 时回填，人工反馈 human_reviewed 不得覆盖）
   │
   ▼
 定期任务：更新 exp_claims 战绩账本 → exp_calibration 校准
@@ -666,6 +675,8 @@ def build_situation_text(case):
 | 反向证据率 | 给出方向结论时调用反向工具的比例 | 下降 = cherry-picking |
 | **有效性指纹** | 滚动 out-of-time 命中率 vs 报告置信度的 ECE + 相对量化基线的增量 | ECE 上升或增量归零 = 统计在失真（前四个全绿也可能在自信地错） |
 
+> **v2.1 落点**：前四个指纹扩展 `chain/judge_stats.py` 的计数器形态（同款"先证明有必要再谈校准"的观测姿态，只观测不改判定行为）；有效性指纹由 `exp_calibration` 产出，滚动窗口计算，同存 `qd_agent_weights` 新 layer 或 exp 侧新表。
+
 ---
 
 ## 10. 各层经验的沉淀速度与冷启动
@@ -687,24 +698,26 @@ def build_situation_text(case):
 
 ## 11. 与现有系统的接线
 
-### 保留不动
+### 保留不动（真实组件）
 
 | 组件 | 作用 |
 |------|------|
-| 102 工具分级下发 | 信息覆盖 |
-| grounding gate | 数字可溯源 |
-| T+N 真值判定（resolutions） | 结果验证 |
-| 追责四表 | 判定留档 |
-| 回测引擎 | 掐尖筛选 + L4 策略经验生成 |
+| `tools/tool_preselect.py` + `tool_discovery.py`（102 工具分级下发） | 信息覆盖 |
+| `utils/grounding.py`（grounding gate） | 数字可溯源 |
+| `qd_agent_resolutions`（`chain/resolver.py` 阶段A代码算数 + 阶段B judge） | T+N 真值判定 |
+| 追责四表：`qd_agent_decisions / qd_agent_claims / qd_agent_resolutions / qd_domain_resolvers` | 判定留档 |
+| `tools/finance/backtest_tools.py` 回测引擎 | 掐尖筛选 + L4 策略经验生成 |
+| `chain/evaluator.py` 的 `return_per_day` 口径 | 核心指标已是期望收益率而非胜率，与 label_spec 同向，不改 |
 
-### 需要改造
+### 需要改造（真实落点）
 
 | 改动 | 说明 |
 |------|------|
-| `decisions` 表加 `symbol/theme/regime` 字段 | 数据模型地基，必须现在做 |
-| `case_memory.py` 接线 | 从 0 调用改为生产链路，改造为经验库写入端 |
-| claims 提取增加 situation 上下文 | 记录当前市场状态/题材阶段 |
-| 校准粒度从域级改为模式级 | `exp_calibration` 替代 `domain × EMA` |
+| `qd_agent_decisions` 加 `symbol/theme/regime` 三列（DDL 落 `migrations/agent_v5_experience.sql`；`chain/account_store.save_decision` 增参透传） | 数据模型地基，必须现在做。反面教材就在本仓：`chain/weight_feed.py` 的 P0-1 教训——decision 只带 domain/intent 时最细只能诚实做到 domain 粒度，硬反推就是伪精确 |
+| `utils/case_memory.py` 接线改造为经验库写入端 | 现状：`qd_agent_cases` 已有 record/retrieve/backfill + label 权重（incorrect 硬排除、pending 0.5×）——**这正是 §5.7 呈现权重的雏形**，已实现一半；改造点：挂 situation 上下文、写 exp_claims 关联、四态 status（待验证/有效/退化中/已退役）接上现有 label |
+| `chain/claims.py` 提取增加 situation 上下文 | 记录当前市场状态/题材阶段；两条红线保持：confidence 抽不到一律 None（绝不填 0.5）、提取器复用 trace_collector 口径不搞两套 |
+| 校准职责分层 | 本仓已有三层校准，必须分清不混：`utils/calibration.py`（isotonic score→hit_rate，桶级）、`app/services/ai_calibration.py`（market 级买卖阈值）、`chain/weight_feed.py`（domain×EMA 慢调）。exp_calibration 是第四层（claim 级战绩校准），不替代前三层，但共用 qd_agent_weights 存储时用独立 layer 隔离 |
+| 统计契约接线到存量代码 | `utils/calibration.py` 的 `_MIN_SAMPLES=10` 偏低 → 收紧到契约口径（n_eff≥30 才出命中率，输出带 CI + 收缩）；`backfill_by_root` 的 P1 写保护语义（human_reviewed 不覆盖）直接复用为契约条款 7 的实现基础 |
 
 ### 需要新建
 
@@ -725,22 +738,25 @@ def build_situation_text(case):
 
 ```
 立即可做（1-2周）：
-├── ① decisions 表加 symbol/theme/regime 三字段
-├── ② 修标签口径三条缺陷（涨跌停/交易成本/相对基准）
-├── ③ 建五个统计指纹计数器（防退化 + 有效性）
+├── ① qd_agent_decisions 加 symbol/theme/regime（migrations/agent_v5_experience.sql
+│      + chain/account_store.py save_decision 透传）
+├── ② 修标签口径三条缺陷（涨跌停/交易成本/相对基准；
+│      与 chain/evaluator.py classify_return / DIRECTION_THRESHOLD 同口径）
+├── ③ 五个统计指纹计数器（chain/judge_stats.py 形态扩展 + exp 侧有效性指纹）
 └── ④ 统计契约 + label_spec 规格书 + exp_claims 建表
-    ⚠️ 与②同批落地——否则第一周积累的数据就是带病数据，后面全要返工
+    ⚠️ 与②同批落地；存量 utils/calibration.py 的 _MIN_SAMPLES 同步收紧
 
 短期见效（2-4周）：
-├── ⑤ 接线 case_memory → 改造为经验库写入端（含 exp_claims 写入与关联）
-├── ⑥ 回测引擎按 regime × 板块输出统计（冷启动 L1/L4）
+├── ⑤ utils/case_memory.py 改造为经验库写入端（含 exp_claims 写入与关联，
+│      沿用 fail-open + P1 写保护）
+├── ⑥ tools/finance/backtest_tools.py 按 regime × 板块输出统计（冷启动 L1/L4）
 ├── ⑦ situation_template 模板化生成（特征空间开放，不设受控枚举）
-└── ⑧ experience_search 两阶段检索
+└── ⑧ experience_search 两阶段检索（向量层复用 rag/pg_vector_store.py 形态）
 
 中期建设（1-3月）：
 ├── ⑨ build_digest 经验摘要压缩（claim 引用为主版）
-├── ⑩ exp_calibration 置信度校准（claim 级，受最小样本约束）
-└── ⑪ 归因标注但不动作（攒一个月定枚举）
+├── ⑩ exp_calibration 置信度校准（claim 级，受最小样本约束，独立 layer 隔离）
+└── ⑪ 归因标注但不动作（攒一个月定枚举；参考 judge_stats.py 的"先观测后校准"）
     ⚠️ pattern_miner 依赖④统计契约：契约未落地前不启动；
        启动后产物只进"待验证"赛道，不得直接升格为有效经验
 
@@ -781,3 +797,33 @@ def build_situation_text(case):
 > **预测不是目标，经验积累才是。通过校准从经验中分析和提高未来的命中率，在量化和纯主观之间找到属于自己的位置。**
 >
 > **引擎不预设哪些经验是真的**：任何经验都可入库并自带战绩账本（n、置信区间、最近灵验/失效时间），门槛设在呈现权重而非准入。直觉与挖掘同赛道竞争，统计契约对所有经验一视同仁地记账，让市场来投票哪些经验活下来。
+
+---
+
+## 15. 落地映射总表（本仓代码索引）
+
+> 本节是 v2.1 针对 QuantDinger `backend_api_python` 的定制内容：设计组件 → 真实代码位置 → 动作。
+
+| 设计组件 | 真实代码位置 | 动作 | 优先级 |
+|---|---|---|---|
+| 经验案例表 exp_cases | 新表，`migrations/agent_v5_experience.sql`（对齐 agent_v4_trace.sql 幂等风格） | 新建（向量存储照抄 `rag/pg_vector_store.py` JSONB+Python 余弦，不依赖 pgvector） | P0-④ |
+| 经验条目账本 exp_claims | 同上，新表 | 新建 | P0-④ |
+| label_spec 规格书 | 新 `app/agent/chain/label_spec.py`（纯函数，对齐 claims.py 不碰 DB 的分层） | 新建 | P0-④ |
+| situation 上下文写入 | `chain/account_store.save_decision` + `chain/claims.py` | 改造（decisions 加 symbol/theme/regime 三列） | P0-① |
+| 案例写入端 | `utils/case_memory.py`（record_case 钩子） | 改造（挂 situation + exp_claims 关联 + 四态 status） | P1-⑤ |
+| T+N outcome 回填 | `chain/resolver.py` + `chain/evaluator.py`（backfill_by_root 写保护复用） | 改造（含未出手/undecidable 回填） | P1-⑤ |
+| 两阶段检索 experience_search | 新 `app/agent/utils/experience_search.py` | 新建（硬过滤 SQL + 余弦排序 + 二次排序） | P1-⑧ |
+| 摘要压缩 build_digest | 新 `app/agent/utils/experience_digest.py` | 新建（claim 引用为主版） | P2-⑨ |
+| 置信度校准 exp_calibration | `qd_agent_weights` 新 layer 或 exp 侧新表；拟合逻辑参照 `utils/calibration.py` | 新建（claim 级，独立 layer 与 domain/calibration 隔离） | P2-⑩ |
+| 统计指纹 | `chain/judge_stats.py` 形态扩展（只观测不改行为） | 新建/扩展 | P0-③ |
+| 有效样本折算 effective_sample_size | 新 `app/agent/utils/exp_stats.py`（Wilson CI / beta-binomial 收缩 / 聚类折算） | 新建 | P0-④ |
+| 模式挖掘 pattern_miner | 新 `app/agent/cron/` 定时任务 | 新建（受统计契约门控） | P3-⑮ |
+| L4 策略经验冷启动 | `tools/finance/backtest_tools.py` | 改造（regime × 板块统计输出） | P1-⑥ |
+
+**开发纪律（沿用本仓既有红线）**：
+
+- fail-open：经验库是增益层，绝不阻断规划/收尾主链，但失败必须 warning 可见（本模块高发"声明了没接线"，静默=断链复发）；
+- 一切判定口径单一事实源：命中判定只在 label_spec 一处定义，禁止各工具自己算（同 calibration.py 的项目红线）；
+- confidence 抽不到一律 None，绝不填 0.5（旧表校准曲线退化成常数的根因）；
+- 提取器复用 `trace_collector` 口径，不搞两套方向判定；
+- 人工反馈（human_reviewed）任何自动流程不得覆盖（backfill_by_root P1 写保护同款语义）。
