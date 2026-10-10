@@ -58,8 +58,9 @@ def _relevance(query: str, text: str) -> int:
 #   ① 范围信号：由 resolvers 解析出的**标的**决定——有标的 → 个股类技能加分；
 #      无标的 → 全市场筛选类技能加分（这条正是"贵州茅台"类问法缺的那 2 分）。
 #   ② 意图信号：query 里的动作词（分析/查询/策略）与技能描述里的同类词对应加分。
-#   ③ 历史权重只做 **tie-break**（词典分打平时让验证过的技能胜出）——
-#      它来自 qd_agent_weights（盘后产出），初始恒 1.0，无信号时不改变排序。
+#   ③ 历史权重是**排序分乘子**（G，2026-10-10：score × (0.5+0.5×weight)，见
+#      _rank_skills）——它来自 qd_agent_weights（盘后产出），初始恒 1.0（乘子 1.0，
+#      冷启动与纯词典序一致）；注入阈值仍看原始词典分（权重只调序不过滤）。
 _SCOPE_SINGLE = ("单只", "个股", "目标股票")     # 个股类技能
 _SCOPE_SCREEN = ("全市场", "筛选")              # 选股/全市场类
 _SCOPE_STRAT = ("策略",)                        # 策略调试类
@@ -75,6 +76,60 @@ _SKILL_INJECT_MIN = 2   # 注入阈值（总分）
 # 「目录 + 首段正文 + read_skill 按需读指针」——方法论尾部章节（执行流程/注意事项）
 # 不再被 body[:3000] 硬切丢失；同会话已注入过的技能只发一行指针，不再重复注入。
 _SKILL_BODY_CAP = 2200
+
+
+_EXECUTABLE_SKILLS_CACHE: Optional[dict] = None
+
+
+def _executable_skills() -> dict:
+    """执行型技能白名单（单一真源 = scripts/skill_run.EXECUTABLE_SKILLS）。
+
+    【为什么按文件路径导入·2026-10-10】`import scripts.*` 在 sys.path 错序时会
+    解析到 backend_api_python/scripts（本仓吃过 `utils` 命中 app/utils 的亏，
+    见 test_30）；按 __file__ 相对路径加载是唯一不受 sys.path 影响的取法。
+    fail-open：取不到返回 {}（退化为注正文，行为等同改前，不会更坏）。
+    """
+    global _EXECUTABLE_SKILLS_CACHE
+    if _EXECUTABLE_SKILLS_CACHE is not None:
+        return _EXECUTABLE_SKILLS_CACHE
+    try:
+        import importlib.util
+        from pathlib import Path as _P
+        _p = _P(__file__).resolve().parent / "scripts" / "skill_run.py"
+        _spec = importlib.util.spec_from_file_location("_qd_skill_run_wl", _p)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _EXECUTABLE_SKILLS_CACHE = dict(getattr(_mod, "EXECUTABLE_SKILLS", {}) or {})
+    except Exception as e:
+        logger.debug("[skill_block] 执行型白名单加载失败（fail-open 退化为注正文）: %s", e)
+        _EXECUTABLE_SKILLS_CACHE = {}
+    return _EXECUTABLE_SKILLS_CACHE
+
+
+def _dispatch_card(name: str, spec) -> str:
+    """执行型技能 → 分发卡片（2026-10-10）：不注方法论正文，只注
+    「何时派 / 怎么派 / 入口 / 结果怎么读」。
+
+    【为什么执行型不注正文】正文是分步方法论，注进主上下文有两个害处：
+    ① 正确姿势是 run_skill 一行派活、只回预览摘要，正文全量注入违背 B 的
+    「上下文 O(摘要)」；② 模型照着分步方法论在主对话硬跑的概率上升——与
+    system_template §重活分发**抢方向盘**。正文并未删除：read_skill 按需读
+    兜底仍在，模型真要方法论仍拿得到。
+    """
+    try:
+        _mod_path, entries, default_fn = list(spec)[:3]
+    except Exception:
+        entries, default_fn = (), "run"
+    entries = list(entries or ())
+    fn_note = "、".join(entries) if entries else str(default_fn or "run")
+    return (
+        f"- 何时用：全市场扫描/筛选/策略诊断等**批量流水线**任务（重活派活，不在主对话逐步取数）\n"
+        f'- 怎么派：run_skill(name="{name}", arguments=\'{{"fn":"<入口>","kwargs":{{…}}}}\')\n'
+        f"- 入口：{fn_note}（默认 {default_fn or 'run'}）\n"
+        f"- 结果读法：返回体 {{ok, result(截断预览), full_path, elapsed_s}}——"
+        f"结论引用预览，明细看 full_path 文件，不要全量贴回对话\n"
+        f'- 方法论原文（通常不必）：read_skill(name="{name}")'
+    )
 
 
 def _skill_block(name: str, body: str, skills) -> str:
@@ -135,7 +190,7 @@ def _skill_score(desc_l: str, keys, msg_l: str, has_entity: bool) -> int:
 
 
 def _skill_weight(name: str) -> float:
-    """技能历史权重（tie-break 用；无记录 = 1.0 中性）。"""
+    """技能历史权重（无记录 = 1.0 中性）。"""
     try:
         from chain.weight_hints import weight_of
     except ImportError:
@@ -144,6 +199,31 @@ def _skill_weight(name: str) -> float:
         return float(weight_of("skill", name, 1.0))
     except Exception:
         return 1.0
+
+
+def _rank_skills(cands: list, keys, msg_l: str, has_entity: bool) -> list:
+    """候选技能排序（G，2026-10-10：权重从 tie-break 升级为排序分乘子）。
+
+    返回 [(乘子化分, 原始词典分, name), ...] 按分降序。
+    · 乘子 = 0.5 + 0.5×weight（weight∈[0.5,2.0]，evaluator 写侧口径）⇒ 乘子∈[0.75,1.5]；
+      冷启动无记录 weight=1.0 ⇒ ×1.0，排序与纯词典分 bit 级一致（验收「不误伤」）。
+    · 样本纪律在写侧（weight_feed n<MIN_SAMPLES 只记账、evaluator n<10 恒 1.0），
+      读侧不重复校验；负向词面证据不足时 weight 仍为 1.0 ⇒ 自动回中性。
+    · 注入阈值（_SKILL_INJECT_MIN）消费**原始词典分**——权重只调序不过滤，
+      与 weight_hints.hint_text / case 同型标签一致的 fail-open 哲学。
+    """
+    out = []
+    for c in cands:
+        if not isinstance(c, dict):
+            continue
+        hay = f"{c.get('name', '')} {c.get('description', '')}".lower()
+        nm = c.get("name") or ""
+        sc = _skill_score(hay, keys, msg_l, has_entity)
+        if sc > 0:
+            w = _skill_weight(nm)
+            out.append((sc * (0.5 + 0.5 * w), sc, nm))
+    out.sort(key=lambda t: (-t[0], -t[1], t[2]))
+    return out
 
 
 def _build_default_model():
@@ -250,18 +330,9 @@ class QDAgentService:
                 # 范围信号来自实体解析（无 resolver 信息时 has_entity=False，
                 # 退化为"词典分 + 意图信号"，不会比原实现更差）
                 has_entity = bool((resolve_info or {}).get("entity_code"))
-                scored = []
-                for c in cands:
-                    if not isinstance(c, dict):
-                        continue
-                    hay = f"{c.get('name', '')} {c.get('description', '')}".lower()
-                    nm = c.get("name") or ""
-                    sc = _skill_score(hay, keys, msg_l, has_entity)
-                    if sc > 0:
-                        scored.append((-sc, -_skill_weight(nm), nm))
-                scored.sort()
-                best = scored[0][2] if scored else None
-                best_score = -scored[0][0] if scored else 0
+                ranked = _rank_skills(cands, keys, msg_l, has_entity)
+                best = ranked[0][2] if ranked else None
+                best_score = ranked[0][1] if ranked else 0   # 阈值看原始分（权重只调序）
                 hit = False
                 if best and best_score >= _SKILL_INJECT_MIN:
                     # 键归一化为 str：_get_agent 用的是 str(session_id)，
@@ -273,18 +344,29 @@ class QDAgentService:
                         # 会改写历史，而 _skill_seen 对此不知情 ⇒ 那时"回看"是假的。
                         # 给出 read_skill(name=...) 不带参数 = 全文（skill_tools 实测），
                         # 模型可一句话自取，不依赖历史是否还在。
+                        _ptr_tail = ("（执行型技能：重活直接派 run_skill，别读正文硬跑）"
+                                     if _executable_skills().get(best) else "")
                         parts.append(
                             f"[技能指针：{best}] 正文本会话已注入过；"
                             f"要完整正文用 read_skill(name=\"{best}\")，"
-                            f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。")
+                            f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。{_ptr_tail}")
                         hit = True
                     else:
-                        body = self.skills.load_body(best) or ""
-                        if body:
-                            blk = _skill_block(best, body, self.skills)
-                            parts.append(f"[相关技能：{best}]\n{blk}")
+                        # 2026-10-10 分叉：执行型技能不注方法论正文，只注分发卡片
+                        # （正文会诱导主对话硬跑，与 §重活分发抢方向盘；见 _dispatch_card）
+                        _spec_exec = _executable_skills().get(best)
+                        if _spec_exec is not None:
+                            blk = _dispatch_card(best, _spec_exec)
+                            parts.append(f"[技能分发卡片：{best}]\n{blk}")
                             seen.add(best)
                             hit = True
+                        else:
+                            body = self.skills.load_body(best) or ""
+                            if body:
+                                blk = _skill_block(best, body, self.skills)
+                                parts.append(f"[相关技能：{best}]\n{blk}")
+                                seen.add(best)
+                                hit = True
                 blocks.append({"kind": "skill", "injected": hit,
                                "chars": len(parts[-1]) if hit else 0, "relevance": best_score,
                                "name": best or "", "reason":
@@ -323,6 +405,33 @@ class QDAgentService:
                 logger.debug("[prefetch] RAG 检索失败（fail-open）: %s", e)
                 blocks.append({"kind": "rag", "injected": False, "chars": 0,
                                "reason": f"检索异常（fail-open）: {e}"})
+        # few-shot 金例注入（2026-10-10 接线：case_memory 机制此前 0 调用方，
+        # 「建好了电没通」）。正确性语义由 case_memory 保证：incorrect 硬排除 /
+        # pending 降权 / 失败案例只给坑不给修复路径（见其模块头注释）。
+        # 选例按任务类型标签加权（taxonomy 六类，只调序不过滤）。
+        try:
+            from utils import case_memory as _cm
+            if _cm.case_memory_enabled():
+                _tags = _cm.classify_case_tags(message)
+                _cases = _cm.retrieve_cases(message, top_k=_cm.CASE_INJECT_TOP_K,
+                                            tags=_tags or None)
+                _blk = _cm.format_case_injection(_cases)
+                if _blk:
+                    parts.append(_blk)
+                blocks.append({"kind": "case", "injected": bool(_blk),
+                               "chars": len(_blk), "relevance": len(_cases),
+                               "reason": (f"命中 {len(_cases)} 条相似案例"
+                                          f"（标签：{'/'.join(_tags) or '未分类'}）"
+                                          if _blk else
+                                          f"无达标案例（相似度<阈值，宁缺毋滥；"
+                                          f"标签：{'/'.join(_tags) or '未分类'}）")})
+            else:
+                blocks.append({"kind": "case", "injected": False, "chars": 0,
+                               "reason": "CASE_MEMORY_ENABLED=0 关闭"})
+        except Exception as e:
+            logger.debug("[prefetch] 案例注入失败（fail-open）: %s", e)
+            blocks.append({"kind": "case", "injected": False, "chars": 0,
+                           "reason": f"注入异常（fail-open）: {e}"})
         report = {
             "blocks": blocks,
             "injected_kinds": [b["kind"] for b in blocks if b.get("injected")],

@@ -59,6 +59,9 @@ class TestPrimitive:
     def test_blocked_exactly_at_limit(self):
         up = limit_up_price(100.0, "main")
         assert fill_blocked_by_limit_up(up, up) is True
+        # 字面量涨停价 vs 计算值 (up=109.80000000000001, 浮点噪声): 同样必须拒。
+        # 这是"严格达到即拒"契约的原语级锁 —— g56/dragon 边界红例的病灶就在此。
+        assert fill_blocked_by_limit_up(109.8, up) is True
 
     def test_green_below_limit(self):
         up = limit_up_price(100.0, "main")
@@ -165,7 +168,9 @@ class TestDragon:
         row = {"code": "600000"}
         red = st.entry_decision(row, snap={"open": 109.8, "previousClose": 100.0})
         assert red.buyable is False and "涨停" in red.reason
-        green = st.entry_decision(row, snap={"open": 112.0, "previousClose": 100.0})
+        # 绿例必须在名义涨停价 (昨收×1.098=109.8) **之下**: 112.0 高于涨停价,
+        # 是物理上不可能出现的开盘快照, 会被阻买原语正确拒掉 (不是"高开不拦"的样本)。
+        green = st.entry_decision(row, snap={"open": 109.0, "previousClose": 100.0})
         assert green.buyable is True   # 高开不拦（2026-09-07 起无 gap 范围过滤），只拦涨停
 
 

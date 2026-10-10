@@ -49,19 +49,22 @@ def _run_both(target=READY_DAY, active=None, bars_by_code=None):
     active = active or {"break": s}
     bars_by_code = bars_by_code or {CODE: bars}
     info = {CODE: {"name": NAME}}
-    old, errs = scan._rows_by_scan(active, dict(bars_by_code), target, info, _NullSampler())
+    # 2026-10-10 P2-11: 两个 writer 都改回三元组 (rows, err_by_key, skip_rows)
+    old, errs, _old_skip = scan._rows_by_scan(active, dict(bars_by_code), target, info,
+                                              _NullSampler())
     root = tempfile.mkdtemp(prefix="writer_parity_")
-    new = scan._rows_by_record(active, dict(bars_by_code), target, info, _NullSampler(),
-                               root=root)
-    return old, new, errs, bars
+    new, new_errs, _new_skip = scan._rows_by_record(active, dict(bars_by_code), target, info,
+                                                    _NullSampler(), root=root)
+    return old, new, errs, new_errs, bars
 
 
 # ================================================================
 # 1. 新旧行源逐字段零差异
 # ================================================================
 def test_rows_by_record_equals_rows_by_scan():
-    old, new, errs, _bars_ = _run_both()
+    old, new, errs, new_errs, _bars_ = _run_both()
     assert not errs, f"旧路径判定异常: {errs}"
+    assert not new_errs, f"record 路径判定异常（P2-11 起不再恒空）: {new_errs}"
     assert old, "旧路径 0 行 ⇒ 该日不产信号, 断言会退化成空集对空集（换 READY_DAY）"
     assert _canon(old) == _canon(new), (
         "行源切换后行发生分叉（P5-③ 门禁「signals 零差异」被破坏）\n"
@@ -93,11 +96,14 @@ def test_rows_by_record_falls_back_when_persist_failed(monkeypatch):
             "strategies": {"break": {"days": 0, "advanced": 0, "warm_skipped": 0,
                                      "errors": [f"{READY_DAY}: boom"], "warmed": False}}}
     monkeypatch.setattr(present_daily, "persist_days", lambda *a, **k: fake)
-    rows = scan._rows_by_record({"break": _break_cls()()}, {CODE: _bars()}, READY_DAY,
-                                {CODE: {"name": NAME}}, _NullSampler(), root="/tmp/x")
+    rows, errs, skip = scan._rows_by_record({"break": _break_cls()()}, {CODE: _bars()},
+                                            READY_DAY, {CODE: {"name": NAME}},
+                                            _NullSampler(), root="/tmp/x")
     assert len(rows) == 1, ("切片推进失败时未退回直判 ⇒ 当日该策略信号整批丢失"
                             "（且它是静默的：调用方只看到 0 行）")
     assert rows[0]["strategy"] == "break" and rows[0]["code"] == CODE
+    assert not errs and not skip, (f"退回直判路径应无判定异常/跳过记录, "
+                                   f"errs={errs} skip={skip}")
 
 
 # ================================================================
@@ -115,8 +121,10 @@ def test_rows_by_record_falls_back_for_no_fold_contract(monkeypatch):
                            extra={"note": "fallback"})]
 
     monkeypatch.setattr(present_daily, "enabled", lambda: True)
-    rows = scan._rows_by_record({"nofold": _NoFold()}, {CODE: _bars()}, READY_DAY,
-                                {CODE: {"name": NAME}}, _NullSampler(),
-                                root=tempfile.mkdtemp(prefix="writer_nofold_"))
+    rows, errs, skip = scan._rows_by_record({"nofold": _NoFold()}, {CODE: _bars()},
+                                            READY_DAY, {CODE: {"name": NAME}},
+                                            _NullSampler(),
+                                            root=tempfile.mkdtemp(prefix="writer_nofold_"))
     assert len(rows) == 1, "无折叠契约的策略被静默丢行（该策略信号会整批消失）"
     assert rows[0]["strategy"] == "nofold" and rows[0]["score"] == 60
+    assert not errs and not skip, (f"直判兜底成功则不应有异常记录, errs={errs} skip={skip}")

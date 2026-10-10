@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+# 能力级评测任务集（改进路线 C，2026-10-10 立）
+#
+# 【它与 prompt_tasks.yaml 的分工】
+#   prompt_tasks.yaml = **回归级**（防改坏：调没调工具/说没说某句话，PASS/FAIL）
+#   bench_tasks.yaml  = **能力级**（质量标尺：总分+分项，"选股分析质量 82 分"）
+# 两者互补：回归套件红了 = 改坏了；benchmark 分数动了 = 变好/变坏了多少。
+#
+# 【样本来源】source 字段标明：
+#   seed    = 领域种子题（先让标尺立起来；DB 可用后用 `qd_bench import-traces`
+#             从 qd_traces 拉真实任务逐步替换/扩充，目标 20~50 条）
+#   traces  = 已从 qd_traces 导入的真实任务
+#
+# 【字段】
+#   id / category / tags / query / source / weight
+#   dims        计分维度子集（缺省 = [grounding, claims, structure, coverage]；
+#               human 维度单独走标注文件，不列在这里）
+#   baseline.must   好答案的最低要求（机器可判：检查项 id 或自定义规则）
+#   baseline.should 加分项/评审 rubric（人工标注，供 agreement 一致率对账）
+#
+# 【must 可用的检查项 id】（qd_bench._CHECKS，改代码时两边同步）
+#   has_direction      有明确方向/操作结论（看多|看空|买入|持有|观望…）
+#   has_numbers        ≥3 个数字（价格/百分比/数量）
+#   has_horizon        有时间口径（T+N / 未来三天 / 一周…）
+#   has_risk_note      有风险提示（风险|不构成投资建议|谨慎…）
+#   has_levels         有关键价位（支撑|压力|目标价|止损位…）
+#   has_screen_criteria 有筛选条件（选股题：条件|筛选|入选…）
+#   has_data_basis     有数据依据（依据|数据|显示|来看…）
+#   action_defined     有明确操作动作（买入|卖出|止损|止盈|持有|观望）
+#   no_fake_certainty  无绝对化承诺（必然|保证|稳赚|100%|包赚）
+#   compliance_clean   无合规禁用词（grounding.BANNED_PHRASES）
+# 自定义规则：{kw_any: [...]} / {kw_all: [...]} / {regex: "..."} 三种映射形式。
+
+version: 1
+categories: [个股分析, 选股, 复盘, 交易确认, 通用问答]
+
+tasks:
+  # ── 个股分析（5）────────────────────────────────────────────
+  - id: stock_01
+    category: 个股分析
+    tags: [诊个股]
+    query: "帮我分析一下贵州茅台600519，未来三天怎么看"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, has_numbers, has_horizon, has_risk_note]
+      should:
+        - "技术面 + 资金面至少两个维度交叉，不止单维度下结论"
+        - "给出支撑/压力关键价位"
+  - id: stock_02
+    category: 个股分析
+    tags: [诊个股]
+    query: "分析一下宁德时代300750的筹码结构和主力动向"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_numbers, has_data_basis, has_risk_note]
+      should:
+        - "筹码分布与主力资金两个来源相互印证"
+  - id: stock_03
+    category: 个股分析
+    tags: [诊个股, 止损复核]
+    query: "比亚迪002594现在这个位置能补仓吗"
+    source: seed
+    weight: 1.2
+    baseline:
+      must: [has_direction, action_defined, has_risk_note, no_fake_certainty]
+      should:
+        - "给出补仓的前提条件与失效位（什么情况下不补）"
+  - id: stock_04
+    category: 个股分析
+    tags: [诊个股]
+    query: "看看中芯国际688981最近资金面怎么样"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_numbers, has_data_basis]
+      should:
+        - "区分子单/大单口径，注明数据时点"
+  - id: stock_05
+    category: 个股分析
+    tags: [诊个股, 选股]
+    query: "贵州茅台600519和五粮液000858哪个更值得持有"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, has_numbers, has_risk_note]
+      should:
+        - "给出比较维度（估值/成长/资金面）而非单句结论"
+
+  # ── 选股（5）───────────────────────────────────────────────
+  - id: screen_01
+    category: 选股
+    tags: [选股]
+    query: "帮我从全市场筛选出5只短线强势股"
+    source: seed
+    weight: 1.2
+    baseline:
+      must: [has_screen_criteria, has_numbers, has_risk_note, no_fake_certainty]
+      should:
+        - "先说筛选条件再说结果，条件可复算"
+  - id: screen_02
+    category: 选股
+    tags: [选股, 板块复盘]
+    query: "今天涨停池里哪些股票明天可以关注"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_screen_criteria, has_risk_note, has_horizon]
+      should:
+        - "区分首板/连板，说明晋级逻辑"
+  - id: screen_03
+    category: 选股
+    tags: [选股]
+    query: "选几只低估值高股息的银行股"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_screen_criteria, has_numbers]
+      should:
+        - "给出估值与股息率的具体门槛数值"
+  - id: screen_04
+    category: 选股
+    tags: [选股]
+    query: "帮我找主力资金连续流入的科技股"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_screen_criteria, has_data_basis, has_numbers]
+      should:
+        - "说明连续流入的天数口径与数据来源"
+  - id: screen_05
+    category: 选股
+    tags: [选股, 交易确认]
+    query: "从沪深300里挑3只适合做T的标的"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_screen_criteria, has_numbers, has_risk_note]
+      should:
+        - "做T标的给出波动率/流动性依据"
+
+  # ── 复盘（5）───────────────────────────────────────────────
+  - id: review_01
+    category: 复盘
+    tags: [板块复盘]
+    query: "今天半导体板块为什么大跌，帮我复盘"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_data_basis, has_numbers]
+      should:
+        - "区分消息面/资金面归因，不把相关当因果"
+  - id: review_02
+    category: 复盘
+    tags: [大盘研判]
+    query: "复盘一下今天大盘的走势和情绪"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, has_numbers, has_data_basis]
+      should:
+        - "给出涨跌家数/成交额等情绪量化指标"
+  - id: review_03
+    category: 复盘
+    tags: [大盘研判, 板块复盘]
+    query: "帮我复盘本周北向资金和板块轮动"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_numbers, has_data_basis, has_horizon]
+      should:
+        - "轮动给出承接线索（谁接力谁退潮）"
+  - id: review_04
+    category: 复盘
+    tags: [板块复盘, 大盘研判]
+    query: "今天涨停梯队怎么看，明天情绪会怎么走"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, has_horizon, has_risk_note]
+      should:
+        - "梯队高度/晋级率数据支撑情绪判断"
+  - id: review_05
+    category: 复盘
+    tags: [止损复核]
+    query: "帮我复盘一下我这周的交易记录，问题在哪"
+    source: seed
+    weight: 1.2
+    baseline:
+      must: [has_data_basis, has_risk_note, no_fake_certainty]
+      should:
+        - "指出可执行的改进点（仓位/买点/止损纪律）"
+
+  # ── 交易确认（5）───────────────────────────────────────────
+  - id: trade_01
+    category: 交易确认
+    tags: [交易确认]
+    query: "现在可以买入贵州茅台600519吗"
+    source: seed
+    weight: 1.2
+    baseline:
+      must: [has_direction, action_defined, has_risk_note, no_fake_certainty]
+      should:
+        - "给出仓位建议与止损位，不只说买/不买"
+  - id: trade_02
+    category: 交易确认
+    tags: [交易确认, 止损复核]
+    query: "我持有宁德时代300750，明天要止盈还是继续拿"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, action_defined, has_horizon]
+      should:
+        - "给出两种走势下的分支操作，而非单边押注"
+  - id: trade_03
+    category: 交易确认
+    tags: [交易确认, 止损复核]
+    query: "帮我确认一下：1400元买入茅台，止损设在多少合适"
+    source: seed
+    weight: 1.2
+    baseline:
+      must: [has_levels, action_defined, has_risk_note]
+      should:
+        - "止损位有依据（前低/均线/波动率），并说明仓位关系"
+  - id: trade_04
+    category: 交易确认
+    tags: [交易确认, 止损复核]
+    query: "我现在满仓被套，要不要割肉"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, action_defined, has_risk_note, no_fake_certainty]
+      should:
+        - "先问持仓结构再给建议；若已给出建议须标注前提"
+  - id: trade_05
+    category: 交易确认
+    tags: [交易确认]
+    query: "明天开盘集合竞价挂单买入比亚迪合适吗"
+    source: seed
+    weight: 1.0
+    baseline:
+      must: [has_direction, action_defined, has_risk_note, has_horizon]
+      should:
+        - "提示集合竞价挂单可撤/流动性风险等交易机制风险"
+
+  # ── 通用问答（5）───────────────────────────────────────────
+  - id: qa_01
+    category: 通用问答
+    tags: []
+    query: "什么是市盈率，怎么用"
+    source: seed
+    weight: 0.8
+    dims: [grounding, structure, coverage]
+    baseline:
+      must: [has_data_basis]
+      should:
+        - "给出适用边界（周期股/亏损股失灵）"
+  - id: qa_02
+    category: 通用问答
+    tags: []
+    query: "股票被ST是什么意思，有什么风险"
+    source: seed
+    weight: 0.8
+    dims: [grounding, structure, coverage]
+    baseline:
+      must: [has_risk_note]
+      should:
+        - "涵盖财务类/交易类退市风险要点"
+  - id: qa_03
+    category: 通用问答
+    tags: []
+    query: "A股的交易时间和规则是怎样的"
+    source: seed
+    weight: 0.8
+    dims: [grounding, structure, coverage]
+    baseline:
+      must: [has_numbers]
+      should:
+        - "含集合竞价与 T+1 规则"
+  - id: qa_04
+    category: 通用问答
+    tags: []
+    query: "帮我解释一下复权价和不复权价的区别"
+    source: seed
+    weight: 0.8
+    dims: [grounding, structure, coverage]
+    baseline:
+      must: [has_data_basis]
+      should:
+        - "说明对技术指标/回测的影响"
+  - id: qa_05
+    category: 通用问答
+    tags: []
+    query: "写一个跑马灯页面"
+    source: seed
+    weight: 0.8
+    dims: [grounding, structure, coverage]
+    baseline:
+      must: [compliance_clean, no_fake_certainty]
+      should:
+        - "识别为非金融任务并得体处理（不误走金融工具面，不做投资建议）"

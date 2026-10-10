@@ -74,9 +74,15 @@ def _both(key, target=READY_DAY):
     info = {CODE: {"name": NAME}}
     s = _NullSampler()
 
-    sd_rows, sd_err = scan._rows_by_scan_day(active, dict(bars_by_code), target, info, s)
+    # 2026-10-10 P2-11: 两个 writer 均为三元组 (rows, err_by_key, skip_rows)
+    sd_rows, sd_err, _sd_skip = scan._rows_by_scan_day(active, dict(bars_by_code), target,
+                                                       info, s)
     root = tempfile.mkdtemp(prefix="writer_switch_")
-    rec_rows = scan._rows_by_record(active, dict(bars_by_code), target, info, s, root=root)
+    rec_rows, rec_err, rec_skip = scan._rows_by_record(active, dict(bars_by_code), target,
+                                                       info, s, root=root)
+    # err/skip 也必须对称: record 侧 P2-11 起不再恒空, 两侧行级异常口径应一致
+    assert rec_err == sd_err, f"两 writer 判定异常汇总不一致: record={rec_err} scan_day={sd_err}"
+    assert rec_skip == _sd_skip, "两 writer 行级跳过记录不一致"
     return sd_rows, rec_rows, sd_err
 
 

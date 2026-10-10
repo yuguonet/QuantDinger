@@ -164,6 +164,24 @@ class TraceCollector:
         """标记当前 skill 执行结束。"""
         self._current_skill_node = None
 
+    # ── 案例原料（case_memory 消费）───────────────────────────
+
+    def plan_digest(self) -> List[dict]:
+        """执行摘要：各阶段 + 其工具链（2026-10-10 案例记忆接线）。
+
+        形状对齐 case_memory.query_brew_case_signals 的聚类键：
+        每项 {step: 阶段名, tools: [工具名...]} ——各阶段 tools 有序拼接即工具链签名。
+        技能节点取其 tools_called；无技能归属的工具收进 _orphan 阶段。
+        """
+        digest: List[dict] = []
+        for node in self._skill_nodes:
+            digest.append({"step": getattr(node, "name", "") or "skill",
+                           "tools": list(getattr(node, "tools_called", None) or [])})
+        orphans = [t.name for t in self._orphan_tools if getattr(t, "name", "")]
+        if orphans:
+            digest.append({"step": "_orphan", "tools": orphans})
+        return digest
+
     # ── Tool 调用回调（由 TracedTool 自动触发）─────────────────
 
     @staticmethod

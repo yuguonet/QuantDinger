@@ -24,8 +24,10 @@
 易错点：
   · 本模块**公开函数会被自动注册为模型可调工具**（_is_tool_function 判据）——
     内部函数一律下划线开头，只留 search_knowledge 一个公开名；
-  · docstring 的 `Returns:` 段是返回结构契约单一真源（tools/returns_contract.py），
-    改返回结构必须同步改它（W17/W18 测试锁定此契约）；
+  · docstring 的 `Returns:` 段是返回结构契约单一真源（由 tools/base.func_to_openai_schema
+    并入工具 schema 的 description，每轮随工具定义下发）；改返回结构必须同步改它
+    （W17/W18 测试锁定此契约）。原抽取器 tools/returns_contract.py 已归档
+    del/tools_returns_contract_20261010/（2026-10-10，验尸报告见彼处 README）；
   · 域=knowledge 会进 planner 的「可用工具域」清单；选中它 = 只带通用+本域工具，
     知识检索需求恰好如此，但金融取数任务误选会丢 finance 工具面（planner 提示已
     明示"错填=丢一半工具"，此处不另加兜底）。

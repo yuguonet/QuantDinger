@@ -164,7 +164,16 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             return out
 
     if pending_dn:                           # 尾块: 找第一个非一字跌停日开盘卖出
-        nxt = entry_idx + exit_d + 1
+        # 起点 = **阻塞日的次日** (2026-10-10 P1-3 专项修正)。
+        # 论证: 本引擎无逐日占位 (与 run_trail_stop 不同), 能带着 pending_dn 走到
+        #   这里的阻塞日**只可能是到期日 d=hold_days** —— 更早的阻塞在下一循环
+        #   迭代开头 (pending 分支) 就地顺延成交, 除非数据尽头 (下方 ④ 返回 None)。
+        #   到期日索引 = entry_idx + hold_days - 1 ⇒ 次日 = entry_idx + hold_days。
+        # ⚠ 旧公式 `entry_idx + exit_d + 1` 是已知异常的成因 (test_exit_rollover_
+        #   real_behavior 锁过): loop 尾阻塞时 exit_d 恒为 0 ⇒ 退化成 entry_idx+1,
+        #   在阻塞日**之前**就平仓 (到期日封跌停 → exit_day=2/price=10.0);
+        #   而到期块分支 (exit_d=hold_days) 又会多跳一天。两处都按阻塞日换算才自洽。
+        nxt = entry_idx + hold_days
         while nxt < n:
             nb = bars[nxt]
             dn2 = _dn_at(bars, nxt, board_type, sp)

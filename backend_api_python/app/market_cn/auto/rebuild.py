@@ -760,9 +760,35 @@ def replay_ledger(expected, meta, bars_map, idx_map):
     return rows, dict(stat)
 
 
-# 账本写库涉及的字段 (UPDATE 用)
+# 账本写库涉及的字段 (UPDATE 用)。
+# 2026-10-10 (P2-12) 拆成两类, 覆盖语义不同:
+#   · 判定列 (state/entry_date/score/signal_price) → 重放可整写 (判定以重放为准);
+#   · 操作事实列 (entry_price/stop_price/exit_date/exit_price/exit_reason/confirm_date)
+#     → **库值优先**: `COALESCE(库列, 重放值)`, 库有则保留、无则补 (设计 §2.2
+#     「操作事实不可重建」—— monitor 实价/实盘确认不得被重放的理论价覆写)。
 _LEDGER_COLS = ("state", "entry_date", "entry_price", "stop_price",
                 "exit_date", "exit_price", "exit_reason", "confirm_date", "extra")
+#: 操作事实列 (库值优先, 见 _LEDGER_COLS 注释与 P2-12)
+_LEDGER_OPS_COLS = ("entry_price", "stop_price",
+                    "exit_date", "exit_price", "exit_reason", "confirm_date")
+
+
+def _vanish_settled_mode() -> str:
+    """vanish_settled (已推进行状态被改写) 的处置模式 (P2-12)。
+
+    config.json `rebuild.vanish_settled`:
+      - "warn"  (默认): 只在报告里警告 (历史行为);
+      - "error": **拦截写库** —— apply_ledger_plan 拒绝执行并抛错 (fail-fast,
+        设计 §5.3), 让人工先裁决, 而不是静默改写已推进行的状态。
+    读不到配置/值非法 → 回退 warn (缺省 = 不改变既有行为, 翻 error 是显式动作)。
+    """
+    try:
+        from app.market_cn.auto import strategies as strat_reg
+        cfg = strat_reg.load_config() or {}
+        mode = str((cfg.get("rebuild") or {}).get("vanish_settled") or "warn").lower()
+    except Exception:   # noqa: BLE001 - 配置读取失败不得阻断报告路径
+        return "warn"
+    return mode if mode in ("warn", "error") else "warn"
 
 
 def build_ledger_plan(replay, actual, meta):
@@ -839,17 +865,40 @@ def build_ledger_plan(replay, actual, meta):
 
 
 def apply_ledger_plan(plan, dry_run=True):
-    """执行账本写库计划。only 索引 0/1/2 (id,key,row) 形态见 build_ledger_plan。"""
+    """执行账本写库计划。only 索引 0/1/2 (id,key,row) 形态见 build_ledger_plan。
+
+    P2-12 (2026-10-10):
+      · UPDATE 中操作事实列 (entry_price/stop_price/exit_*/confirm_date) 一律
+        `COALESCE(库列, 重放值)` —— 库有则保留、无则补, 重放只写判定列;
+      · vanish_settled (已推进行状态被改写) 按 `rebuild.vanish_settled` 配置处置:
+        "warn"(默认) 照旧报告; "error" **拒绝写库并抛错** (fail-fast)。
+        dry_run 下不抛, 只在 stat 标 `vanish_would_block` (预演要给人看全貌)。
+    """
     from app.market_cn.auto.store import S_EXPIRED, S_WATCH_PENDING
     stat = {"upserted": 0, "inserted": 0, "expired": 0, "sweep_expired": 0,
             "insert_skipped": 0, "kept_actual": len(plan.get("keep_actual") or []),
             "kept_marked": len(plan.get("keep_marked") or []),
             "dry_run": bool(dry_run)}
+    vs = plan.get("vanish_settled") or []
+    vs_mode = _vanish_settled_mode()
+    if vs:
+        stat["vanish_mode"] = vs_mode
     if dry_run:
         stat.update({"upserted": len(plan["upsert"]), "inserted": len(plan["insert"]),
                      "expired": len(plan["expire"]),
                      "sweep_expired": len(plan["disabled_sweep"])})
+        if vs and vs_mode == "error":
+            stat["vanish_would_block"] = True
         return stat
+    if vs and vs_mode == "error":
+        # 拦截 (P2-12): 已推进行状态将被重放改写 —— error 模式下宁可让 rebuild
+        # 失败留痕 (指纹不推进, 下次启动重试), 也不静默改写。首条 key 供排障。
+        raise RuntimeError(
+            "[rebuild] vanish_settled 拦截 (config rebuild.vanish_settled=error): "
+            "%d 条已推进行状态将被重放改写 (如 %s %s %s : %s → %s), 拒绝写库。"
+            "请人工核对后改回 warn 或先修正重放口径。" % (
+                len(vs), vs[0][0][0], vs[0][0][1], vs[0][0][2],
+                vs[0][1], vs[0][2]))
 
     # ---- 停用策略未入场行 → expired (全表) ----
     # 2026-09-26: 走 store.retire_unfilled 唯一实现。
@@ -897,7 +946,11 @@ def apply_ledger_plan(plan, dry_run=True):
             else:
                 stat["insert_skipped"] += 1
 
-        # ---- UPDATE (完全以重放为准; extra 合并以保留真实审计字段) ----
+        # ---- UPDATE (P2-12: 判定列照写; 操作事实列 COALESCE 库值优先) ----
+        # 操作列 (entry_price/stop_price/exit_*/confirm_date) = 资金/操作事实:
+        # monitor 按快照实价记的 entry_price 不得被重放的理论 D1 开盘价覆写
+        # (设计 §2.2「操作事实不可重建」)。COALESCE(库列, 重放值) = 库有则保留、
+        # 无则补 —— 对 PG 而言 SET 右侧的列引用即"该行现存值"。
         for sid, _k, r in plan["upsert"]:
             if sid is None:
                 continue
@@ -905,8 +958,13 @@ def apply_ledger_plan(plan, dry_run=True):
             extra["replayed_at"] = _now_str()
             cur.execute(
                 "UPDATE qd_dragon_signals SET "
-                "state = %s, entry_date = %s, entry_price = %s, stop_price = %s, "
-                "exit_date = %s, exit_price = %s, exit_reason = %s, confirm_date = %s, "
+                "state = %s, entry_date = %s, "
+                "entry_price = COALESCE(qd_dragon_signals.entry_price, %s), "
+                "stop_price = COALESCE(qd_dragon_signals.stop_price, %s), "
+                "exit_date = COALESCE(qd_dragon_signals.exit_date, %s), "
+                "exit_price = COALESCE(qd_dragon_signals.exit_price, %s), "
+                "exit_reason = COALESCE(qd_dragon_signals.exit_reason, %s), "
+                "confirm_date = COALESCE(qd_dragon_signals.confirm_date, %s), "
                 "score = %s, signal_price = COALESCE(%s, signal_price), "
                 "extra = extra || %s::jsonb, updated_at = NOW() "
                 "WHERE id = %s",
@@ -1046,6 +1104,10 @@ def render_ledger(plan, stat, replay_stat):
             p("     %s %-14s %s : %s → %s" % (k[0], k[1], k[2], old, new))
         if len(vs) > 20:
             p("     ... 其余 %d 条" % (len(vs) - 20))
+        if stat.get("vanish_mode") == "error":
+            p("  ✖ rebuild.vanish_settled=error ⇒ 写库将被拦截 (apply 抛错, 人工先裁决)")
+        elif stat.get("vanish_would_block"):
+            p("  ✖ rebuild.vanish_settled=error ⇒ 本次 apply 将被拦截")
     if km:
         p("")
         p("  ✓ 已标记出场行保留实盘记账价 = %d 条 (A2: replay 不得回测口径覆写, 最多列 20):" % len(km))

@@ -160,6 +160,18 @@ def _domain_map() -> Dict[str, str]:
 #  执行
 # ═══════════════════════════════════════════════════════════════
 
+def _tool_available(name: str, availability: Dict[str, Any]) -> bool:
+    """探测表命中 → 用探测结果;不在探测表的本地工具 → 看是否注册进工具面。"""
+    hit = (availability.get(name) or {}).get("available")
+    if hit is not None:
+        return bool(hit)
+    try:
+        from tools.base import ToolProvider
+        return name in ToolProvider.get_or_build().get_functions()
+    except Exception:
+        return False
+
+
 def run_task(svc: QDAgentService, task: dict, dom: Dict[str, str],
              availability: Dict[str, Any], timeout: int, step_limit: int = 0) -> dict:
     session = task.get("session") or f"reg_{task['id']}"
@@ -171,8 +183,10 @@ def run_task(svc: QDAgentService, task: dict, dom: Dict[str, str],
     }
 
     # 环境闸门：依赖不可用 → SKIP（不记 FAIL，否则 KEY 一撤满屏假红）
+    # 探测表只覆盖外部连通性（web_search 等）；本地工具（run_skill…）不在表里，
+    # 必须回退到"是否注册进工具面"判定，否则 plan_dispatch 这类任务永远 SKIP。
     need = task.get("requires_availability") or []
-    missing = [n for n in need if not (availability.get(n) or {}).get("available")]
+    missing = [n for n in need if not _tool_available(n, availability)]
     if missing:
         out["status"] = "skip"
         out["error"] = f"依赖工具不可用: {', '.join(missing)}"

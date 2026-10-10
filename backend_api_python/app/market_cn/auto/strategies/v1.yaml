@@ -1,0 +1,70 @@
+# ================================================================
+# V1 追板策略 (可买真首板 → 次日开盘买入, 让利润奔跑) — IDE 门表单文件
+# 定位: 与龙回头(连板龙头回调)/断板(涨停开板)错开赛道, 只做前期无涨停的低位首板。
+# 2026-10-10 上线 (enabled=true): 出场=让利润奔跑(let_profits_run, trail/stop/expiry, 非 D2 一刀切)。
+# 辨识度: 2026-10-10 数据驱动重设 (tmp/v1_board_buyable_study.py) — 8门见 gates 段;
+#   一字板连板率高但 D1 买不进(消息股) ⇒ 剔除, 只研究可买首板内部的 1进2 因子。
+# 回测: 2026-10-10 经 v1.py 自持回测入口覆写恢复官方 CLI 回测
+#   (scan_signals + 竞价 gate + _run_backtest), 无需迁折叠契约即可跑通。
+# ================================================================
+meta:
+  name: V1
+  market: A                    # A / HK / US / Polymarket → MarketSpec
+  version: 1
+  enabled: true                 # 策略开关 (§3.5): 宏内一行 = 上下线; 2026-10-10 上线(让利润奔跑口径)
+  enumeration: day             # 枚举方式: 逐日候选 → D0 信号 → 次日开盘入场 (区别于 dragon 的 lu_idx 遍历)
+  day_flow: v1                 # day 流程口径 (信号展示字段集)
+  day_start: 25                # 逐日起点
+  day_min_n: 30                # 低于此根数直接返回空
+  # 说明: 本策略无 lu_idx 依赖 (信号在 D0 当日判定), 引擎逐日枚举决策日 i,
+  # 门表一次性求所有门; 入场/出场由 entry_modes / exit_modes 按本文件 entry/exit 块选择。
+
+entry:
+  mode: open                  # v1 次日开盘买入 (next_open)
+  price: open                 # 成交价基准 = D1 开盘价
+  gap_min_high: gap_min_high  # 高开线 (≥8% 强势连板, 唯一正EV区); 上限=板块涨停价(排除一字D1) 由代码判
+  # ⚠ 前视: d1_change 是 D1 收盘值, 用它淘汰 D1 开盘入场 = 未来信息;
+  #   实盘语义是「D2 开盘清仓」(confirm_decision weak), 已由 exit v1_combo 的 pre_exit 实现。
+  #   默认 false = 对齐实盘。置 true 仅用于复现旧回测口径做对照。
+  require_d1_close_up: false
+
+exit:
+  mode: v1_combo              # 复用 v1 专属出场引擎 (stop/trail/max_hold + V1 动量 D2 清仓)
+  stop: -10.0                 # 固定止损 % (与 PARAMS 同值; 峰值≥入场时被 -5% 追踪线支配, 实际不触发)
+  trail: -5.0                 # 追踪止损 % (自入场后峰值回撤)
+  max_hold: 7                 # 到期天数
+
+params:                        # 可调参数 (表达式直接引用; 2026-10-10 数据驱动重设 → 可买真首板)
+  prior_lu_free_days: 10       # 真首板: 前 N 日内无涨停 (不与龙回头/断板重合)
+  ret_20d_min: 10.0            # 弱趋势门槛 (原30; 实证>30 反伤 1进2)
+  float_mv_max: 200.0          # 流通市值上限(亿) (实证 >500亿 连板仅5.6%)
+  d_1_band_min: -3.0           # D-1 横盘下限% (替代旧回调[-10,-3))
+  d_1_band_max: 3.0            # D-1 横盘上限%
+  vol_ratio_min: 1.0           # D0 量比下限 (排除缩量<1 逆向选择)
+  vol_ratio_max: 5.0           # D0 量比上限 (排除爆量>5 出货)
+  let_profits_run: true        # 出场模式: true=让利润奔跑(trail/stop/expiry, 非D2一刀切); false=1进2 D2清仓
+  hold: 7
+  stop: -10.0
+  trail: -5.0
+  gap_min_high: 8.0            # 竞价高开线下限% (≥8 强势连板; 上限=板块涨停价保可买, 排除一字D1)
+
+# 门表：一行一门 (像 Excel 表格, IDE 渲染为表格)。role: qualify=资格门 / required=判定门 / audit=只记录
+# needs_d0: 该门是否需要 D0 当日数据 (展示端提前计算依据, 见架构 §5)
+# v1 无 lu_idx 依赖 → 全部为 qualify (决策日一次性求值); required 列仅保留 schema 兼容
+gates:
+  - {id: g_priced, name: 数据有效, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "close(-1) > 0 and close(-2) > 0"}                   # D-1/D-2 收盘价有效
+  - {id: g_lu, name: D0近似涨停, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "is_approx_limit_up()"}                              # ① 首板身份 (0.98x 板块阈值)
+  - {id: g_buyable, name: 非一字可买, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "open_pct() < limit_pct()"}                          # ② D0开盘<涨停价 (排除一字/秒板消息股)
+  - {id: g_first_board, name: 真首板, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "not no_lu_last(prior_lu_free_days)"}                # ③ 前10日无涨停 (不与龙回头/断板重合)
+  - {id: g_mkt_cap, name: 小盘, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "float_mv() <= float_mv_max"}                        # ④ 流通市值≤上限 (排除大盘低连板)
+  - {id: g_ret20, name: 弱趋势, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "ret_n(20) >= ret_20d_min"}                          # ⑤ ret_20d≥10 (放宽; >30反伤1进2)
+  - {id: g_d1_band, name: D-1横盘, role: qualify, needs_d0: 0, enabled: 1,
+     expr: "chg(-1) >= d_1_band_min and chg(-1) < d_1_band_max"}  # ⑥ [-3,3) (替代旧深回调)
+  - {id: g_vol_ratio, name: 温和量比, role: qualify, needs_d0: 1, enabled: 1,
+     expr: "vol_ratio() >= vol_ratio_min and vol_ratio() < vol_ratio_max"}  # ⑦ [1,5)

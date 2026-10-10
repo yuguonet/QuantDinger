@@ -9,7 +9,34 @@
   5. 审计轨迹：qd_agent_runs.jsonl 事件齐全（run_start/tool_call/tool_result/run_finish）
 
 运行（需 mimoagent 已安装，或 MIMOAGENT_SRC 指向其 src/）：
-  python app/agent/scripts/qd_smoke.py
+  python app/agent/scripts/qd_smoke.py              # 默认 = CI 模式：缺件也 FAIL，行为与历史一致
+  python app/agent/scripts/qd_smoke.py --with-env   # 本地/发布前：缺件断言 fail→SKIP，退出码只反映真实回归
+  python app/agent/scripts/qd_smoke.py --help
+
+两种模式（差距 J 第 3 步，2026-10-10）：
+  - 默认模式（CI 用）：与历史行为一致——只出 PASS/FAIL、`== ok/n passed ==`、
+    退出码 0 ⇔ 全过。环境缺件（无 PG、缺依赖、缺归档）一律计 FAIL，回归信号不稀释。
+  - --with-env：断言条件**一字不改**，只把「缺环境导致的失败」改归类为 SKIP；
+    汇总分开计数 `passed · failed · skipped`，退出码 0 ⇔ failed=0（skip 不算失败）。
+    「是否缺件」由**真实环境探测**判定（连不上 PG / 第三方包 import 失败 / 归档文件
+    不存在 / shell 跑不了 cat），不搞测试名黑名单——探针说环境齐而断言挂 → 照旧 FAIL。
+
+五类环境缺件 → 探针（check(env=...) 标注在受影响断言上，探针惰性执行并缓存）：
+  pg                 连不上 PostgreSQL（DATABASE_URL 未配/库不可达）→ 决策入库断言
+  stock_directory    股票名录库查不到 600519（stock_basic_info 不可用）→ resolver 断言
+  archive_formatters / archive_returns
+                     项目根 del/ 归档件不在工作副本（归档入库是手工提交）→ 归档断言
+  posix_shell        shell 执行不了 POSIX cat（如 Windows cmd 无 cat）→ test_6 bash 断言
+  tool_deps          工具模块因**第三方包未安装**导入失败（ModuleNotFoundError 且缺的
+                     不是项目内模块）→ 词典⊆注册表 / 导入失败登记 / 工具面数量断言
+
+易错点：
+  - tool_deps 依赖 ToolProvider 扫描完成，只能在断言失败时惰性触发，不可事前预扫；
+    其余探针同样懒跑（pg 探测要等 .env 加载进进程之后才准）。
+  - 环境缺件若以未捕获异常形态冒出（main 的 except 分支），两模式都计 FAIL——
+    实测五类缺件均以断言失败形态出现。
+  - 探针只证明「数据/依赖在不在」，不覆盖数据路径自身的代码回归：那类问题在
+    环境齐时照旧 FAIL（默认模式任何时候都兜底）。
 """
 from __future__ import annotations
 
@@ -175,12 +202,152 @@ def _observations(agent) -> str:
     )
 
 
-PASS = []
+PASS = []            # True=PASS / False=FAIL / "SKIP"=环境缺件（仅 --with-env）
+WITH_ENV = False     # --with-env 开关；默认 False = CI 行为与历史逐字节一致
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    PASS.append(cond)
-    print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail and not cond else ""))
+# ═══════════════════════════════════════════════════════════════
+#  环境缺件探针（--with-env 专用）—— 判定只靠真实探测，无测试名黑名单
+# ═══════════════════════════════════════════════════════════════
+
+def _probe_pg() -> tuple[bool, str]:
+    """PG 可用性：走生产同款连接执行 SELECT 1（连不上/未配 → 缺件）。"""
+    try:
+        from app.utils.db import get_db_connection
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}".replace("\n", " ")[:120]
+
+
+def _probe_stock_directory() -> tuple[bool, str]:
+    """股票名录库可用性：底层 search_stocks 能查到 600519（resolver 断言的数据前提）。"""
+    try:
+        from app.utils.basicinfo_db import get_stock_basic_db
+        rows = get_stock_basic_db().search_stocks("600519", limit=1) or []
+        hit = any(str(r.get("symbol")) == "600519" for r in rows)
+        return hit, "" if hit else "stock_basic_info 查不到 600519（名录库不可用）"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}".replace("\n", " ")[:120]
+
+
+def _probe_archive_formatters() -> tuple[bool, str]:
+    """formatters 归档件：项目根 del/agent_formatters_20261001 在不在工作副本。"""
+    d = os.path.abspath(__file__)
+    for _ in range(5):      # scripts → agent → app → backend_api_python → 项目根
+        d = os.path.dirname(d)
+    p = os.path.join(d, "del", "agent_formatters_20261001")
+    ok = os.path.isdir(p)
+    return ok, "" if ok else f"归档不存在: {p}"
+
+
+def _probe_archive_returns() -> tuple[bool, str]:
+    """returns 归档件：项目根 del/tools_returns_contract_20261010 三个文件齐不齐。"""
+    root = os.path.abspath(os.path.join(str(AGENT_DIR), "..", "..", ".."))  # 项目根
+    base = os.path.join(root, "del", "tools_returns_contract_20261010")
+    missing = [f for f in ("returns_sampler.py", "returns_contract.py", "README.md")
+               if not os.path.isfile(os.path.join(base, f))]
+    return (not missing), ("" if not missing else f"归档缺件: {','.join(missing)}")
+
+
+def _probe_posix_shell() -> tuple[bool, str]:
+    """test_6 bash 断言的数据前提：与工具同通道（LocalEnvironment.execute）跑得动 cat。"""
+    try:
+        import tempfile
+        from mimoagent.environments import get_environment
+        d = tempfile.mkdtemp(prefix="qdsmoke_probe_")
+        p = os.path.join(d, "probe.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("qd_smoke_env_probe")
+        env = get_environment({"environment_class": "local", "cwd": d})
+        r = env.execute(f"cat {p}") or {}
+        out = str(r.get("output", ""))
+        ok = "qd_smoke_env_probe" in out and int(r.get("returncode", 1) or 0) == 0
+        return ok, "" if ok else f"shell 跑 cat 失败(rc={r.get('returncode')}): {out[:80]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}".replace("\n", " ")[:120]
+
+
+def _is_project_top_name(name: str) -> bool:
+    """顶层模块名是否属于本项目（是 → 导入失败是 sys.path/代码问题=真回归）。"""
+    for base in (str(AGENT_DIR), str(BACKEND_ROOT)):
+        if (os.path.isdir(os.path.join(base, name))
+                or os.path.isfile(os.path.join(base, name + ".py"))):
+            return True
+    return False
+
+
+def _probe_tool_deps() -> tuple[bool, str]:
+    """工具面导入失败登记里，是否存在「第三方包未安装」（真缺件）。
+
+    只认 ModuleNotFoundError 的 `No module named 'X'`：X 是项目内模块 → sys.path
+    错序/写错路径（真回归，不 skip）；X 不在项目里 → 第三方依赖没装（缺件，skip）。
+    其余错误类型（SyntaxError / cannot import name 等）一律不当缺件。
+    """
+    import re
+    from tools.base import _TOOL_MODULE_IMPORT_FAILURES
+    missing: list[str] = []
+    for entry in _TOOL_MODULE_IMPORT_FAILURES:
+        m = re.search(r"No module named '([^']+)'", str(entry))
+        if not m:
+            continue
+        top = m.group(1).split(".")[0]
+        if _is_project_top_name(top):
+            continue
+        if top not in missing:
+            missing.append(top)
+    if missing:
+        return False, "缺第三方依赖: " + ",".join(missing)
+    return True, ""
+
+
+_ENV_PROBES = {
+    "pg": _probe_pg,
+    "stock_directory": _probe_stock_directory,
+    "archive_formatters": _probe_archive_formatters,
+    "archive_returns": _probe_archive_returns,
+    "posix_shell": _probe_posix_shell,
+    "tool_deps": _probe_tool_deps,
+}
+_ENV_PROBE_CACHE: dict = {}
+
+
+def _env_probe(name: str) -> tuple[bool, str]:
+    """按名取探针结果（进程内缓存一次）。未知探针名 → 可用（保守：宁 FAIL 不误 SKIP）。"""
+    if name not in _ENV_PROBE_CACHE:
+        fn = _ENV_PROBES.get(name)
+        if fn is None:
+            _ENV_PROBE_CACHE[name] = (True, f"未知探针 {name}")
+        else:
+            try:
+                _ENV_PROBE_CACHE[name] = fn()
+            except Exception as e:
+                _ENV_PROBE_CACHE[name] = (
+                    False, f"探针异常 {type(e).__name__}: {e}".replace("\n", " ")[:120])
+    return _ENV_PROBE_CACHE[name]
+
+
+def check(name: str, cond: bool, detail: str = "", *, env: str = None):
+    """记录一项断言。env = 该断言依赖的环境前提（_ENV_PROBES 里的探针名，可省）。
+
+    cond=True → PASS。cond=False 时：默认模式一律 FAIL（与历史一致）；--with-env
+    下先跑 env 探针——证实缺件 → 记 SKIP（不进退出码），证实环境齐 → 照旧 FAIL。
+    """
+    if cond:
+        PASS.append(True)
+        print(f"  [PASS] {name}")
+        return
+    if WITH_ENV and env:
+        ok, reason = _env_probe(env)
+        if not ok:
+            PASS.append("SKIP")
+            print(f"  [SKIP] {name} — 环境缺件[{env}]: {reason}")
+            return
+    PASS.append(False)
+    print(f"  [FAIL] {name}" + (f" — {detail}" if detail else ""))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -277,7 +444,7 @@ def test_6_native_mimo_capabilities():
     check("AntiHackGuard 已启用", getattr(getattr(agent, "antihack", None), "config", None) is not None and agent.antihack.config.enabled is True)
     status, result = agent.run("帮我建个文件并看看内容")
     check("原版 write 工具生效", (Path(tmp) / "demo.txt").read_text() == "hello qd")
-    check("原版 bash 工具生效", "hello qd" in _observations(agent))
+    check("原版 bash 工具生效", "hello qd" in _observations(agent), env="posix_shell")
     check("领域工具与原版共存", "get_demo_quotes" in names)
     check("update_plan 计划工具已挂", "update_plan" in names)
 
@@ -318,6 +485,9 @@ def test_7_service_facade():
     check("预取保留用户问题", "[用户问题]" in user_msg)
 
     # 技能自动加载（提智点 A）
+    # 2026-10-10 设计变更：market_screener 是**执行型**技能（skill_run 白名单）⇒
+    # 命中不再注方法论正文，改注「分发卡片」（正文会诱导主对话硬跑，与 §重活分发
+    # 抢方向盘；见 qd_service._dispatch_card 与 test_38）。
     class _Skills:
         def list_skills(self):
             return [{"name": "market_screener", "description": "选股与市场筛选"}]
@@ -330,7 +500,9 @@ def test_7_service_facade():
     asyncio.run(svc2.chat("帮我做个选股筛选", "s9"))
     agent2 = svc2._get_agent("s9")
     user_msg2 = next(m["content"] for m in agent2.messages if m.get("role") == "user")
-    check("技能自动注入", "相关技能：market_screener" in user_msg2 and "先看资金面" in user_msg2)
+    check("技能自动注入（执行型→分发卡片，正文不入）",
+          "技能分发卡片：market_screener" in user_msg2
+          and "run_skill" in user_msg2 and "先看资金面" not in user_msg2)
 
 
 def test_8_context_awareness():
@@ -718,7 +890,8 @@ def test_23_preselect_lint():
     # ── 词典自检：词典引用的工具名必须逐字存在于注册表 ──
     # 旧系统教训：词典与注册表两处漂移 ⇒ 词典失效无人报警（plan_linter 头部易错点）
     stale = check_domain_dict(names)
-    check("词典工具名 ⊆ 注册表（防词典陈旧）", stale == [], str(stale))
+    # env=tool_deps：词典引用的工具所在模块因缺第三方包没注册上 → 缺件而非词典陈旧
+    check("词典工具名 ⊆ 注册表（防词典陈旧）", stale == [], str(stale), env="tool_deps")
     check("词典非空且每域有首选", len(DATA_DOMAINS) >= 10
           and all(len(t) >= 1 for _d, _k, t in DATA_DOMAINS), str(len(DATA_DOMAINS)))
 
@@ -1020,9 +1193,11 @@ def test_26_accountability_v11():
             print("  [SKIP] DB 不可用，跳过入库端到端断言")
         else:
             # ★ 别写 `a and b`：b 是 list 时整个表达式是 list，`sum(PASS)` 会炸
+            # env=pg：PG 不可达时 save 失败 ⇒ tracked/claim_ids 必空（缺件而非回归）；
+            # 下一条「一行都没写库」在 PG 缺失时只会碰巧通过，不会因缺件失败，故不标。
             check("金融决策已入库并带 claim",
                   bool(r_fin.get("tracked")) and bool(r_fin.get("claim_ids")),
-                  str(r_fin))
+                  str(r_fin), env="pg")
             check("不追责的**一行都没写库**",
                   not r_weather.get("tracked") and r_weather.get("decision_id") is None,
                   str(r_weather))
@@ -1232,14 +1407,17 @@ def test_28_closed_loop_consumers():
     try:
         from resolvers.bridge import resolve, context_block
         i1 = resolve("帮我分析一下贵州茅台")
+        # env=stock_directory：名录库（stock_basic_info）不可用时解析不到标的属缺件
         check("resolvers 已接线：口语问法能解析出标的",
               i1.get("ran") and i1.get("entity_code") == "600519",
-              f"{i1.get('entity_code')} / ran={i1.get('ran')}")
+              f"{i1.get('entity_code')} / ran={i1.get('ran')}",
+              env="stock_directory")
         i2 = resolve("写个跑马灯页面")
         check("非金融问题不误解析出标的",
               not i2.get("entity_code"), str(i2.get("entity_code")))
         check("实体块可渲染（有解析结果时非空）",
-              "贵州茅台" in context_block(i1), context_block(i1)[:60])
+              "贵州茅台" in context_block(i1), context_block(i1)[:60],
+              env="stock_directory")
         check("无实体时上下文块为空（不占位）", context_block(i2) == "", "")
     except Exception as e:
         check("resolvers 桥接可导入", False, f"{type(e).__name__}: {e}")
@@ -1265,7 +1443,8 @@ def test_28_closed_loop_consumers():
         for _ in range(5):      # scripts → agent → app → backend_api_python → 项目根
             _d = _os.path.dirname(_d)
         archived = _os.path.isdir(_os.path.join(_d, "del", "agent_formatters_20261001"))
-        check("实现已归档（可回滚，不是硬删）", archived, "")
+        check("实现已归档（可回滚，不是硬删）", archived, "",
+              env="archive_formatters")
     except Exception as e:
         check("formatters 摘除护栏可用", False, f"{type(e).__name__}: {e}")
 
@@ -1374,14 +1553,16 @@ def test_30_toolface_import_health():
         check("可导入 ToolProvider", False, f"{type(e).__name__}: {e}")
         return
 
+    # env=tool_deps：登记表里是「第三方包没装」才算缺件；sys.path 错序等项目内
+    # 模块缺失不满足探针条件 → 照旧 FAIL（这条防线防的就是那类真回归）
     check("无工具模块导入失败（防 sys.path 错序等静默降级）",
           not _TOOL_MODULE_IMPORT_FAILURES,
-          "; ".join(_TOOL_MODULE_IMPORT_FAILURES[:4]))
+          "; ".join(_TOOL_MODULE_IMPORT_FAILURES[:4]), env="tool_deps")
 
     try:
         _n = len(ToolProvider.get_or_build().get_functions())
         # 基线 101（含能力层 40）；下调阈值留出正常增删余量，但能挡住成片掉模块
-        check(f"工具面数量充足（{_n} ≥ 95）", _n >= 95, str(_n))
+        check(f"工具面数量充足（{_n} ≥ 95）", _n >= 95, str(_n), env="tool_deps")
     except Exception as e:
         check("工具面数量充足", False, f"{type(e).__name__}: {e}")
 
@@ -1647,7 +1828,536 @@ def test_33_skill_dispatch_and_plan_lint():
         check("可读 _run_inner 源码", False, f"{type(e).__name__}: {e}")
 
 
+def test_34_case_memory_wiring():
+    """few-shot 金例接线（2026-10-10）：写入侧 record_case + 注入侧 format_case_injection。
+
+    事故回放：utils/case_memory.py 机制完备（T+N 延迟标签回填 / incorrect 硬排除 /
+    pending 降权）但 record_case() 与 format_case_injection() **0 处调用**——CBR
+    案例库「建好了、电没通」。这里锁四件事：
+      ① 两个入口必须有真实调用方（源码断言，防再断线）；
+      ② taxonomy 六类标签分类（金例按任务类型选例的前提）；
+      ③ 注入语义：成功案例给骨架+坑、失败案例**只给坑**（防抄修复路径）；
+      ④ 端到端：金例进 task + prefetch 留痕 / run 收尾自动落案例（monkeypatch 捕获）。
+    """
+    print("\n[test_34] few-shot 金例接线（case_memory 写入侧+注入侧）")
+
+    # ① 防再断线：调用方必须真实存在（只算代码行，不算注释/文档提及）
+    def _wired(path: str, *needles) -> bool:
+        src = open(path, encoding="utf-8").read()
+        lines = [l for l in src.splitlines() if not l.strip().startswith("#")]
+        return all(any(n in l for l in lines) for n in needles)
+
+    _agent_py = os.path.join(str(AGENT_DIR), "qd_agent.py")
+    _svc_py = os.path.join(str(AGENT_DIR), "qd_service.py")
+    check("写入侧已接线：_finish_collector 后置调 _record_case → record_case",
+          _wired(_agent_py, "self._record_case(", "case_memory.record_case("), "")
+    check("注入侧已接线：_prefetch 调 format_case_injection",
+          _wired(_svc_py, "format_case_injection(", "retrieve_cases("), "")
+
+    try:
+        from utils import case_memory as _cm
+    except Exception as e:
+        check("case_memory 可导入", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ② taxonomy：六类枚举 + 问法分类（选例加权的前提）
+    check("taxonomy 六类齐备且顺序固定",
+          tuple(_cm.CASE_TAGS) == ("诊个股", "选股", "板块复盘", "大盘研判",
+                                   "交易确认", "止损复核"),
+          str(_cm.CASE_TAGS))
+    for _q, _want in (("帮我分析一下贵州茅台600519", "诊个股"),
+                      ("今天买什么股票好，推荐几只", "选股"),
+                      ("我止损了接下来怎么办", "止损复核"),
+                      ("帮我看看大盘接下来一周", "大盘研判"),
+                      ("半导体板块今天为什么大跌", "板块复盘"),
+                      ("现在可以买入吗", "交易确认")):
+        _got = _cm.classify_case_tags(_q)
+        check(f"分类命中：{_q[:12]}… → {_want}", _want in _got, str(_got))
+    check("无信息问法不硬塞标签（不产噪声标签）",
+          _cm.classify_case_tags("那现在呢") == [], "")
+
+    # ③ 注入语义两类：成功给骨架+坑 / 失败只给坑
+    _ok_txt = _cm.format_case_injection([{
+        "task_summary": "分析某白酒龙头短线走势",
+        "plan_digest": [{"step": "auto_stock-analyze", "tools": ["daily", "fund_flow"]}],
+        "outcome": {"label": "correct"}, "failure_modes": ["复权口径未对齐"]}])
+    _bad_txt = _cm.format_case_injection([{
+        "task_summary": "追高买入某题材股",
+        "plan_digest": [{"step": "s", "tools": ["x"]}],
+        "outcome": {"label": "incorrect"}, "failure_modes": ["追高被套"]}])
+    check("成功案例给工具链骨架+坑", "daily → fund_flow" in _ok_txt
+          and "复权口径未对齐" in _ok_txt, _ok_txt[:120])
+    check("失败案例只给坑、不附修复路径/工具链",
+          "此路不通" in _bad_txt and "→" not in _bad_txt and "工具链" not in _bad_txt,
+          _bad_txt[:120])
+    check("注入含免责（历史个案不得照抄结论）", "不要照抄结论" in _ok_txt, "")
+    check("无案例返回空串（宁缺毋滥，不占上下文）",
+          _cm.format_case_injection([]) == "", "")
+
+    # ④ 端到端（monkeypatch 检索/入库，不依赖 DB；需 mimoagent，与全仓同前置）
+    try:
+        import asyncio
+        from qd_service import QDAgentService
+    except Exception as e:
+        print(f"  [SKIP] 端到端不可用: {type(e).__name__}: {e}")
+        return
+
+    _orig_retrieve, _orig_record = _cm.retrieve_cases, _cm.record_case
+    _recorded = []
+
+    def _fake_retrieve(query, top_k=3, tags=None):
+        return [{"case_id": "CASE-T", "task_summary": "分析某白酒龙头短线走势",
+                 "plan_digest": [{"step": "auto_stock-analyze", "tools": ["daily"]}],
+                 "outcome": {"label": "correct"}, "failure_modes": [],
+                 "sim": 0.9, "score": 0.9, "label": "correct"}]
+
+    def _fake_record(task_summary, **kw):
+        _recorded.append(dict(kw, task_summary=task_summary))
+        return "CASE-FAKE"
+
+    _cm.retrieve_cases, _cm.record_case = _fake_retrieve, _fake_record
+    try:
+        _svc34 = QDAgentService(model=ScriptedModel([
+            {"content": "", "tool_calls": [_tool_call("get_demo_quotes", {})]},
+            {"content": "结论：贵州茅台现价 1688.0 元（来源：get_demo_quotes）"},
+        ]), agent_config={"tools": [],
+                          "tool_functions": [get_demo_quotes, place_demo_order, run_shell]})
+        asyncio.run(_svc34.chat("帮我分析一下贵州茅台600519", session_id="s34"))
+        _ag34 = _svc34._get_agent("s34")
+        _rep = getattr(_ag34, "last_prefetch_report", {}) or {}
+        check("案例块进入注入留痕（kind=case）", "case" in (_rep.get("injected_kinds") or []),
+              str(_rep)[:200])
+        _msgs = "\n".join(str(m.get("content", "")) for m in _ag34.messages)
+        check("金例注入进 task 文本（模型可见历史相似案例）",
+              "历史相似案例" in _msgs, _msgs[:200])
+        check("写入侧自动落案例（run 收尾，无需模型主动调）", bool(_recorded),
+              str(_recorded)[:200])
+        if _recorded:
+            _r = _recorded[-1]
+            check("案例原料齐全（summary/tags/plan_digest/cost）",
+                  bool(_r.get("task_summary")) and isinstance(_r.get("tags"), list)
+                  and isinstance(_r.get("plan_digest"), list)
+                  and isinstance(_r.get("cost"), dict), str(sorted(_r))[:160])
+            check("plan_digest 带工具链（酿造聚类签名原料）",
+                  any(s.get("tools") for s in (_r.get("plan_digest") or [])),
+                  str(_r.get("plan_digest"))[:120])
+            _cm_src = open(os.path.join(str(AGENT_DIR), "utils", "case_memory.py"),
+                           encoding="utf-8").read()
+            check("入库 label 恒为 pending + 回填只改 pending 行（防错误自我复制）",
+                  "\"label\": \"pending\"" in _cm_src
+                  and "outcome->>'label' = 'pending'" in _cm_src,
+                  "record/backfill 的 label 约束丢失")
+    except Exception as e:
+        check("few-shot 端到端可跑", False, f"{type(e).__name__}: {e}")
+    finally:
+        _cm.retrieve_cases, _cm.record_case = _orig_retrieve, _orig_record
+
+    # ⑤ fail-open：检索炸了不能拦主链
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated case_memory failure")
+    _cm.retrieve_cases = _boom
+    try:
+        _svc34b = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
+                                 agent_config={"tools": []})
+        asyncio.run(_svc34b.chat("你好", session_id="s34b"))
+        check("案例检索异常 fail-open（不影响主链出结论）", True, "")
+    except Exception as e:
+        check("案例检索异常 fail-open（不影响主链出结论）", False,
+              f"{type(e).__name__}: {e}")
+    finally:
+        _cm.retrieve_cases = _orig_retrieve
+
+
+def test_35_returns_contract_archive():
+    """返回结构注入件归档护栏（2026-10-10）：防死代码回流 tools/ 扫描目录。
+
+    事故回放：returns_sampler.py（429 行）/ returns_contract.py（206 行）自述接线点
+    nodes.py / task_agent.py 随旧编排层删除后，全仓 0 调用方 ——「半死代码」留在
+    tools/ 根目录，而该目录每个模块都会被 ToolProvider import，公开函数名会被
+    自动注册成模型可调工具（get_return_contract 实测被注册过）。归档判据与回滚
+    方式见 del/tools_returns_contract_20261010/README.md。
+    """
+    print("\n[test_35] 返回结构注入件已归档（防死代码回流 tools/）")
+    _tools_dir = os.path.join(str(AGENT_DIR), "tools")
+    _root = os.path.abspath(os.path.join(str(AGENT_DIR), "..", "..", ".."))  # 项目根
+    _archived = os.path.join(_root, "del", "tools_returns_contract_20261010")
+
+    check("returns_sampler/returns_contract 不在生产 tools/ 目录",
+          not os.path.exists(os.path.join(_tools_dir, "returns_sampler.py"))
+          and not os.path.exists(os.path.join(_tools_dir, "returns_contract.py")), "")
+    check("实现已归档（可回滚，不是硬删）",
+          os.path.isfile(os.path.join(_archived, "returns_sampler.py"))
+          and os.path.isfile(os.path.join(_archived, "returns_contract.py"))
+          and os.path.isfile(os.path.join(_archived, "README.md")), _archived,
+          env="archive_returns")
+
+    # 无调用方断言（防有人悄悄接回一半又丢一半）
+    _stubs = ("start_background_sampling", "get_sampled_structures",
+              "_build_return_contract_block")
+    _users = []
+    _self = os.path.normcase(os.path.abspath(__file__))
+    for _dir, _dirs, _files in os.walk(str(AGENT_DIR)):
+        _dirs[:] = [d for d in _dirs if d not in ("__pycache__",)]
+        for _f in _files:
+            if not _f.endswith(".py"):
+                continue
+            _p = os.path.join(_dir, _f)
+            if os.path.normcase(os.path.abspath(_p)) == _self:
+                continue        # 本用例自己列着桩名，不算消费方
+            try:
+                _src = open(_p, encoding="utf-8").read()
+            except Exception:
+                continue
+            for _s in _stubs:
+                if any(_s in l and not l.strip().startswith("#")
+                       for l in _src.splitlines()):
+                    _users.append(f"{_f}:{_s}")
+    check("生产代码无 returns_* 调用方（埋点确系死代码）", not _users, str(_users[:4]))
+
+    # 替代机制必须活着：Returns: 段确实并进 schema description（否则归档=能力丢失）
+    try:
+        from tools.base import func_to_openai_schema
+
+        def _demo(x: int) -> dict:
+            """演示工具。
+
+            Returns: dict: {code, price}。数据在 demo['price']（float）。
+
+            Args:
+                x: 参数
+            """
+            return {}
+
+        _schema = func_to_openai_schema(_demo)
+        _desc = str(_schema.get("description", "") or
+                    (_schema.get("function") or {}).get("description", ""))
+        check("替代机制活着：Returns: 段并入工具 schema 描述",
+              "price" in _desc, _desc[:160])
+    except Exception as e:
+        check("替代机制活着：Returns: 段并入工具 schema 描述", False,
+              f"{type(e).__name__}: {e}")
+
+
+def test_36_capability_bench():
+    """能力级评测标尺（路线 C，2026-10-10）：任务集 + 打分器 + 历史可对比。
+
+    与 prompt_tasks.yaml（回归级 PASS/FAIL）分工不同：这里验的是**质量分**
+    （总分+分项，0~100）能不能当标尺用。锁四件事：
+      ① 任务集体检（≥20 条、五类覆盖、检查项已知）；
+      ② 打分器**确定性**且能区分好坏答案（强答案 > 弱答案，总分与分项均是）；
+      ③ baseline.must 机检规则真生效（含自定义 kw 规则）；
+      ④ run 存档/历史对比/两人标注一致率（验收线 ≥80%）。
+    """
+    print("\n[test_36] 能力级评测标尺（qd_bench）")
+    import json as _json
+    import tempfile as _tf
+    _td = _tf.mkdtemp(prefix="qdbench_")
+    os.environ["QD_BENCH_DIR"] = _td          # 必须在 import 前设（模块级路径计算）
+    _scripts = str(HERE.parent)               # scripts/ 不在 sys.path（裸名导入约定）
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    try:
+        import qd_bench as B
+    except Exception as e:
+        check("qd_bench 可导入", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ① 任务集体检
+    try:
+        tasks = B.load_tasks()
+        ok, errs = B.validate_tasks(tasks)
+        check("任务集体检通过（≥20 条/五类覆盖/检查项已知）", ok, str(errs[:3]))
+        check("任务集规模在 20~50 区间", 20 <= len(tasks) <= 50, str(len(tasks)))
+    except Exception as e:
+        check("任务集可加载", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ② 打分器确定性 + 区分度
+    _task = {"id": "t", "category": "个股分析", "query": "贵州茅台600519 未来三天怎么看",
+             "baseline": {"must": ["has_direction", "has_numbers", "has_horizon",
+                                    "has_risk_note"]}}
+    _strong = ("结论：偏空，未来三天看回调。当前价 1680 元（来源：行情工具），"
+               "支撑 1400 元、压力 1750 元。技术面跌破 20 日线、资金面净流出 12.3 亿，"
+               "预计回调 3% 左右。风险提示：不构成投资建议。")
+    _weak = "肯定涨，必然涨停，稳赚不赔，闭眼买。"
+    r1 = B.score_answer(_task, _strong)
+    r2 = B.score_answer(_task, _weak)
+    check("打分器确定性（同输入同输出）", r1 == B.score_answer(_task, _strong), str(r1)[:120])
+    check("强答案总分显著高于弱答案", r1["total"] > r2["total"] + 30,
+          f"strong={r1['total']} weak={r2['total']}")
+    check("分项同样拉开（coverage/grounding/structure）",
+          all(r1["dims"].get(d, 0) > r2["dims"].get(d, 0)
+              for d in ("coverage", "grounding", "structure")),
+          f"{r1['dims']} vs {r2['dims']}")
+    check("弱答案命中绝对化承诺 → no_fake_certainty 判负",
+          not B._CHECKS["no_fake_certainty"](_weak, _task), "")
+
+    # ③ must 机检规则（含自定义 kw）
+    _t2 = {"id": "t2", "category": "选股", "query": "选股",
+           "baseline": {"must": [{"kw_any": ["筛选条件", "入选"]}, "has_numbers"]}}
+    r3 = B.score_answer(_t2, "筛选条件：近5日涨幅>3%，量比>2。入选3只：示例A/B/C。")
+    check("自定义 kw_any 规则生效 + has_numbers 生效",
+          r3["dims"].get("coverage") == 100.0, str(r3))
+    r4 = B.score_answer(_t2, "随便看看吧")
+    check("must 未命中 → coverage 掉分", r4["dims"].get("coverage", 0) < 34, str(r4))
+
+    # ④ run 存档 + 历史 + 一致率
+    _preds = [{"task_id": t["id"], "answer": _strong, "meta": {"model": "m1"}}
+              for t in tasks[:3]]
+    s1 = B.score_batch(tasks, _preds)
+    rid = B._save_run(s1, {"model": "m1", "run_id": "t36_a"})
+    s2 = B.score_batch(tasks, [{"task_id": t["id"], "answer": _weak}
+                               for t in tasks[:3]])
+    B._save_run(s2, {"model": "m2", "run_id": "t36_b"})
+    runs = B._load_runs()
+    check("run 落档且历史可读（trend 地基）",
+          len(runs) >= 2 and {r["run_id"] for r in runs} >= {"t36_a", "t36_b"},
+          str([r.get("run_id") for r in runs]))
+    check("两次 run 总分可比（强 > 弱）",
+          next(r for r in runs if r["run_id"] == "t36_a")["total"]
+          > next(r for r in runs if r["run_id"] == "t36_b")["total"], "")
+    _p = _td + "/ann_a.json"
+    _q = _td + "/ann_b.json"
+    open(_p, "w", encoding="utf-8").write(_json.dumps({"t": 80, "t2": 70}))
+    open(_q, "w", encoding="utf-8").write(_json.dumps({"t": 85, "t2": 62}))
+    rc = B.main(["agreement", "--a", _p, "--b", _q, "--tol", "10"])
+    check("两人标注一致率达标 → 退出码 0", rc == 0, str(rc))
+    open(_q, "w", encoding="utf-8").write(_json.dumps({"t": 20, "t2": 10}))
+    rc2 = B.main(["agreement", "--a", _p, "--b", _q, "--tol", "10"])
+    check("一致率不达标 → 退出码 1（验收线 80%）", rc2 == 1, str(rc2))
+
+
+def test_37_dispatch_ab_harness():
+    """差距 B 验收测量器（2026-10-10）：分发 vs 不分发 对照的判定数学与实验臂。
+
+    B 的验收是对照实验（成本 ≤40% 且质量不降），必须有工具把实验固化，
+    否则每次改分发相关 prompt 都得人肉对数。这里锁三件事：
+      ① 判定数学：成本比/质量差的阈值判定正确（含失败归因）；
+      ② 对照臂构造：inline 臂摘 run_skill、其余工具面与实验臂完全一致
+         （差异只能来自“有没有分发通道”这一件事）；
+      ③ 报告落盘/回读/--rejudge 复核（改阈值不重跑实验）。
+    """
+    print("\n[test_37] 分发 A/B 对照测量器（B 验收）")
+    import json as _json
+    import tempfile as _tf
+    _scripts = str(HERE.parent)
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    try:
+        import qd_dispatch_ab as AB
+    except Exception as e:
+        check("qd_dispatch_ab 可导入", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ① 判定数学
+    _rec_ok = [{"task_id": "t1",
+                "dispatch": {"tokens": 300, "quality": 80.0},
+                "inline": {"tokens": 1000, "quality": 82.0}}]
+    v_ok = AB._verdict(_rec_ok)
+    check("成本比 0.3 ≤ 0.4 且质量降 2 在容差内 → PASS",
+          v_ok["pass"] and v_ok["per_task"][0]["pass_cost"]
+          and v_ok["per_task"][0]["pass_quality"], str(v_ok))
+    _rec_cost = [{"task_id": "t1", "dispatch": {"tokens": 600, "quality": 80.0},
+                  "inline": {"tokens": 1000, "quality": 80.0}}]
+    v_cost = AB._verdict(_rec_cost)
+    check("成本比 0.6 > 0.4 → FAIL 且归因到成本",
+          not v_cost["pass"] and any("成本比" in f for f in v_cost["failures"]),
+          str(v_cost["failures"]))
+    _rec_q = [{"task_id": "t1", "dispatch": {"tokens": 200, "quality": 60.0},
+               "inline": {"tokens": 1000, "quality": 80.0}}]
+    v_q = AB._verdict(_rec_q)
+    check("质量降 20 > 容差 5 → FAIL 且归因到质量",
+          not v_q["pass"] and any("质量降" in f for f in v_q["failures"]),
+          str(v_q["failures"]))
+    v_re = AB._verdict(_rec_cost, cost_max=0.8)      # 放宽阈值重判
+    check("--rejudge 语义：改阈值可翻案（不必重跑实验）", v_re["pass"], str(v_re["per_task"]))
+
+    # ② 对照臂构造（纯函数部分；差异只能来自 run_skill）
+    _names = ["run_skill", "daily", "fund_flow", "web_search"]
+    _on = AB.arm_whitelist("dispatch", _names)
+    _off = AB.arm_whitelist("inline", _names)
+    check("实验臂含 run_skill、对照臂摘掉 run_skill",
+          "run_skill" in _on and "run_skill" not in _off, f"on={_on} off={_off}")
+    check("两臂工具面除 run_skill 外完全一致（单变量对照）",
+          sorted(set(_on) - {"run_skill"}) == sorted(_off), f"{set(_on) ^ set(_off)}")
+    try:
+        _real = AB._all_tool_names()
+        check("生产工具面确实含 run_skill（否则对照实验无意义）",
+              "run_skill" in _real, str(_real[:8]))
+    except Exception as e:
+        check("生产工具面可枚举", False, f"{type(e).__name__}: {e}")
+
+    # ③ 报告落盘/回读/rejudge 退出码
+    _td = _tf.mkdtemp(prefix="qdab_")
+    AB.REPORT_DIR = Path(_td)
+    _rep = {"records": _rec_cost, "verdict": v_cost}
+    _p = AB.save_report(_rep)
+    _back = AB.load_report(str(_p))
+    check("报告落盘可回读（records 判定可复核）",
+          _back["records"][0]["dispatch"]["tokens"] == 600, str(_p))
+    rc_fail = AB.main(["--rejudge", str(_p), "--cost-max", "0.4"])
+    rc_pass = AB.main(["--rejudge", str(_p), "--cost-max", "0.8"])
+    check("rejudge 退出码：不达标 1 / 达标 0",
+          rc_fail == 1 and rc_pass == 0, f"{rc_fail}/{rc_pass}")
+
+
+def test_38_exec_skill_dispatch_card():
+    """执行型技能注入分叉（2026-10-10）：分发卡片，不注方法论正文。
+
+    事故回放（设计层缺陷，非推测）：渐进式加载对**所有**命中技能一视同仁注正文，
+    包括 market_screener/strategy_debug 这类执行型——① 正确姿势是 run_skill 一行
+    派活，正文全量进上下文违背 B 的「O(摘要)」；② 分步方法论诱导模型在主对话
+    硬跑，与 system_template §重活分发抢方向盘。判据：
+      ① 白名单单一真源可读（skill_run.EXECUTABLE_SKILLS，按路径加载防 sys.path 错序）；
+      ② 卡片内容：run_skill 签名 + 入口 + 结果读法 + read_skill 兜底，且短；
+      ③ 集成：执行型命中→卡片且无正文；知识型命中→仍注正文（渐进式加载不被误伤）；
+      ④ 防再断线：_prefetch 必须带执行型分叉。
+    """
+    print("\n[test_38] 执行型技能分发卡片（不注正文）")
+    try:
+        from qd_service import (_executable_skills, _dispatch_card,
+                                QDAgentService as _Svc)
+    except Exception as e:
+        check("可导入 qd_service 分发卡片件", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ① 白名单单一真源
+    wl = _executable_skills()
+    check("执行型白名单可读（含 market_screener/strategy_debug）",
+          "market_screener" in wl and "strategy_debug" in wl, str(sorted(wl)))
+    check("入口清单来自单一真源（strategy_debug 四入口）",
+          "debug_strategy" in wl.get("strategy_debug", ("", (), ""))[1], str(wl.get("strategy_debug")))
+
+    # ② 卡片内容与体积
+    card = _dispatch_card("market_screener", wl["market_screener"])
+    check("卡片含 run_skill 调用签名与结果读法",
+          'run_skill(name="market_screener"' in card and "full_path" in card, card[:120])
+    check("卡片含入口清单与 read_skill 兜底",
+          "入口：" in card and 'read_skill(name="market_screener")' in card, card[:120])
+    check("卡片是卡片不是正文（≤600 字符）", len(card) <= 600, str(len(card)))
+
+    # ③ 集成：技能命中路径的分叉（用假技能注册表 + 直接调 _prefetch，不跑模型）
+    class _FakeSkills:
+        def __init__(self, items):
+            self.items = items            # {name: (description, body)}
+
+        def list_skills(self):
+            return [{"name": n, "description": d} for n, (d, b) in self.items.items()]
+
+        def load_body(self, name):
+            return self.items.get(name, ("", ""))[1]
+
+        def list_resources(self, name=None):
+            return []
+
+        def get_section_headings(self, name):
+            return []
+
+    try:
+        _svc38 = _Svc(model=ScriptedModel([{"content": "ok"}]),
+                      skills=_FakeSkills({
+                          "market_screener": ("从a股全市场筛选短线标的的批量流水线",
+                                               "METHOD_BODY_MARKET_SCANNER_V1 步骤一…步骤九"),
+                          "auto_stock-analyze": ("对单只a股标的开展多周期技术面资金面基本面综合诊断",
+                                                  "METHOD_BODY_STOCK_ANALYZE_V1 第一步…"),
+                      }), agent_config={"tools": []})
+        task1, rep1 = _svc38._prefetch("帮我从a股全市场筛选短线标的", "s38a", None)
+        check("执行型命中→分发卡片且正文不注入",
+              "技能分发卡片：market_screener" in task1
+              and "METHOD_BODY_MARKET_SCANNER" not in task1, task1[:200])
+        check("留痕记录技能块（kind=skill，含卡片）",
+              any(b.get("kind") == "skill" and b.get("injected")
+                  for b in (rep1.get("blocks") or [])), str(rep1)[:160])
+        task2, _ = _svc38._prefetch("帮我分析一下贵州茅台600519技术面资金面基本面",
+                                    "s38b", None)
+        check("知识型命中→仍注正文（渐进式加载不被误伤）",
+              "相关技能：auto_stock-analyze" in task2
+              and "METHOD_BODY_STOCK_ANALYZE" in task2, task2[:200])
+    except Exception as e:
+        check("分叉集成可跑", False, f"{type(e).__name__}: {e}")
+
+    # ④ 防再断线
+    import inspect as _inspect
+    _src = _inspect.getsource(_Svc._prefetch)
+    check("_prefetch 带执行型分叉（防回退成一律注正文）",
+          "_dispatch_card(" in _src and "_executable_skills(" in _src, "")
+
+
+def test_39_skill_weight_multiplier():
+    """差距 G 验收（2026-10-10）：权重从 tie-break 升级为排序分乘子。
+
+    验收原文：「构造胜率差异明显的技能对，断言高胜率者稳定排前；冷启动（无数据）
+    行为与现状一致」。判据：
+      ① 冷启动（weight 全 1.0）⇒ 乘子=1.0，排序与纯词典分一致（不误伤）；
+      ② 同分技能对：高权重稳定排前，且权重对调后顺序对称翻转（排除名字序假象）；
+      ③ 乘子语义超出 tie-break：高词典分×低权重 能被 低词典分×高权重 反超；
+      ④ 注入阈值仍消费原始词典分（权重只调序不过滤，防回退源码断言）。
+    """
+    print("\n[test_39] 技能权重排序分乘子（G 验收）")
+    try:
+        import qd_service as QS
+    except Exception as e:
+        check("可导入 qd_service", False, f"{type(e).__name__}: {e}")
+        return
+
+    cands = [{"name": "alpha", "description": "高词典分技能"},
+             {"name": "beta", "description": "同分技能甲"},
+             {"name": "gamma", "description": "同分技能乙"}]
+    # 桩：词典分 alpha=5 > beta=gamma=3（按 name 精确控制，不受描述词面影响）
+    _raw = {"alpha": 5, "beta": 3, "gamma": 3}
+    orig_score, orig_weight = QS._skill_score, QS._skill_weight
+    try:
+        QS._skill_score = lambda hay, keys, msg, ent: next(
+            (v for n, v in _raw.items() if n in hay), 0)
+
+        # ① 冷启动
+        QS._skill_weight = lambda name: 1.0
+        cold = QS._rank_skills(cands, set(), "", False)
+        check("冷启动：乘子=1.0 且排序与纯词典分一致（alpha>beta>gamma 名序）",
+              [t[2] for t in cold] == ["alpha", "beta", "gamma"]
+              and all(t[0] == t[1] for t in cold), str(cold))
+
+        # ② 同分对：高权重排前 + 权重对调对称翻转
+        w_hi_lo = {"alpha": 1.0, "beta": 0.6, "gamma": 1.4}
+        QS._skill_weight = lambda name: w_hi_lo.get(name, 1.0)
+        r1 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
+        w_swap = {"alpha": 1.0, "beta": 1.4, "gamma": 0.6}
+        QS._skill_weight = lambda name: w_swap.get(name, 1.0)
+        r2 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
+        check("同分对：高权重稳定排前（gamma 前于 beta）", r1[1:] == ["gamma", "beta"], str(r1))
+        check("权重对调 → 顺序对称翻转（排除名字序假象）", r2[1:] == ["beta", "gamma"], str(r2))
+
+        # ③ 乘子反超：alpha(5×0.8=4.0) < gamma(3×1.5=4.5)
+        w_flip = {"alpha": 0.6, "beta": 1.0, "gamma": 2.0}
+        QS._skill_weight = lambda name: w_flip.get(name, 1.0)
+        r3 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
+        check("乘子语义超出 tie-break：低词典分×高权重可反超",
+              r3 == ["gamma", "alpha", "beta"], str(r3))
+
+        # ④ 阈值消费原始词典分（源码防回退）
+        import inspect as _inspect
+        from qd_service import QDAgentService as _Svc
+        _src = _inspect.getsource(_Svc._prefetch)
+        check("注入阈值取原始词典分（ranked[0][1]，权重只调序不过滤）",
+              "ranked[0][1]" in _src and "_rank_skills(" in _src, "")
+    finally:
+        QS._skill_score, QS._skill_weight = orig_score, orig_weight
+
+
 if __name__ == "__main__":
+    import argparse
+    _ap = argparse.ArgumentParser(
+        prog="qd_smoke.py",
+        description="QDAgent smoke 回归（脚本化假模型，不需要 API key）")
+    _ap.add_argument(
+        "--with-env", action="store_true", dest="with_env",
+        help="环境缺件（无 PG/缺第三方依赖/缺 del 归档件/无 POSIX shell）时对应断言转 SKIP，"
+             "汇总分开计数，退出码只反映真实回归；默认关闭=CI 行为不变")
+    _args = _ap.parse_args()
+    WITH_ENV = bool(_args.with_env)
+    if WITH_ENV:
+        print("[MODE] --with-env：环境缺件 → SKIP（退出码 0 ⇔ failed=0）")
+
     _base = _trace_baseline()     # 自清基线：只删 smoke 自己写的行
     for t in (test_1_happy_path, test_2_trading_confirm_gate,
               test_3_danger_guard, test_4_grounding_gate, test_5_trace_events,
@@ -1667,13 +2377,25 @@ if __name__ == "__main__":
               test_30_toolface_import_health,
               test_31_startup_bare_imports,
               test_32_skill_injection_progressive,
-              test_33_skill_dispatch_and_plan_lint):
+              test_33_skill_dispatch_and_plan_lint,
+              test_34_case_memory_wiring,
+              test_35_returns_contract_archive,
+              test_36_capability_bench,
+              test_37_dispatch_ab_harness,
+              test_38_exec_skill_dispatch_card,
+              test_39_skill_weight_multiplier):
         try:
             t()
         except Exception as e:
             PASS.append(False)
             print(f"  [FAIL] 异常: {e!r}")
     _cleanup_trace_rows(_base)
-    ok = sum(PASS)
+    _scored = [x for x in PASS if x != "SKIP"]      # SKIP 只在 --with-env 出现
+    ok = sum(_scored)
+    _nskip = len(PASS) - len(_scored)
+    if WITH_ENV:
+        _nfail = len(_scored) - ok
+        print(f"\n== {ok}/{len(PASS)} passed · {_nfail} failed · {_nskip} skipped ==")
+        sys.exit(0 if _nfail == 0 else 1)
     print(f"\n== {ok}/{len(PASS)} passed ==")
     sys.exit(0 if ok == len(PASS) else 1)

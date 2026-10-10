@@ -22,13 +22,27 @@
 
 注意：计数器是**进程内**的，重启归零。要看长期趋势得落库或进日志聚合，
 短期内以 warning 日志为准（`grep "preselect-empty-face"`）。
+
+【差距 K 追加（2026-10）：任务→实际调用工具 配对通道】
+    `record_task_calls()` 在 run 收口处把「用户问题 + 本轮真正调用过的工具」
+    追加进 JSONL（`QD_PRESELECT_PAIRS_FILE`，默认 agent/traces/preselect_pairs.jsonl），
+    供周级离线算共现权重（见 `preselect_cooc.py`）。仍是先攒数、不改任何行为：
+    配对文件只被离线脚本读，在线预选完全不依赖它。
 """
 
+import json
+import os
 import time
 from collections import Counter, deque
-from typing import Any, Deque, Dict, List
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Sequence
 
 logger = __import__("logging").getLogger(__name__)
+
+# 管线函数退出工具注册（公开函数是给代码 import 的，不是给模型调的——
+# 判据同 tools/base._is_tool_function；**新增公开函数必须同步登记**，
+# 否则会静默多出一份必注入 schema，token 回升）。
+_NOT_TOOLS = frozenset({"record_task_calls", "pairs_path"})
 
 # 最近样例保留条数（够看规律，又不占内存）
 _SAMPLE_LIMIT = 50
@@ -37,7 +51,59 @@ _LATENCY = {"total": 0, "empty": 0}
 _ROUTES: Counter = Counter()          # 触发原因 → 次数
 _DOMAINS: Counter = Counter()         # 兜底也没命中的 #domain → 次数
 _SAMPLES: Deque[Dict[str, str]] = deque(maxlen=_SAMPLE_LIMIT)
+_PAIRS = {"n": 0}                     # 成功落盘的配对数（进程内，重启归零）
 _STARTED = time.time()
+
+
+def pairs_path() -> Path:
+    """「任务→实际调用工具」配对 JSONL 的落盘路径。
+
+    env `QD_PRESELECT_PAIRS_FILE` 覆盖；相对路径按**本文件位置**解析
+    （tools/ → agent/），与 cwd 无关——周级脚本在哪个目录跑都能读到同一份。
+    """
+    raw = os.getenv("QD_PRESELECT_PAIRS_FILE") or "traces/preselect_pairs.jsonl"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent.parent / p
+    return p
+
+
+def record_task_calls(query: str, tools: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """攒一对「任务 → 实际调用工具」，追加进 JSONL（差距 K 的在线攒数口）。
+
+    【定位】离线共现权重（`preselect_cooc.build_weights`）的原料。只写文件、
+    不读不判——在线行为零变化；读侧（周级脚本）拿不到/读不懂就退化，见
+    preselect_cooc 的退化规则。
+
+    Args:
+        query: 用户原始问题（qd_agent 传 collector.user_query，已剥 prefetch 注入块）。
+        tools: 本轮实际调用过的工具名（collector._all_tools_called，去重保序）。
+
+    Returns:
+        {"pairs": 累计条数, "file": 路径}；空输入返回 None（不记也不算错误）；
+        写盘失败返回 None 并 warning（fail-open，绝不影响回复主链）。
+    """
+    q = str(query or "").strip()
+    seen: List[str] = []
+    for t in tools or ():
+        t = str(t or "").strip()
+        if t and t not in seen:
+            seen.append(t)
+    if not q or not seen:
+        return None
+    path = pairs_path()
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "query": q[:2000], "tools": seen}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("[preselect-pairs] 配对写盘失败(fail-open): %s: %s",
+                       type(e).__name__, e)
+        return None
+    _PAIRS["n"] += 1
+    return {"pairs": _PAIRS["n"], "file": str(path)}
 
 
 def record_selected(route: str = "ok") -> None:
@@ -96,6 +162,7 @@ def report() -> Dict[str, Any]:
         "by_route": dict(_ROUTES.most_common()),
         "by_domain_miss": dict(_DOMAINS.most_common()),
         "recent_samples": list(_SAMPLES)[-10:],
+        "pairs_written": _PAIRS["n"],
         "uptime_sec": int(time.time() - _STARTED),
         "verdict": _verdict(rate),
     }
@@ -131,7 +198,8 @@ def reset() -> None:
     _ROUTES.clear()
     _DOMAINS.clear()
     _SAMPLES.clear()
+    _PAIRS["n"] = 0
 
 
 __all__ = ["record_selected", "record_empty_face", "empty_rate", "report",
-           "reset", "DECISION_NOTE"]
+           "reset", "DECISION_NOTE", "record_task_calls", "pairs_path"]

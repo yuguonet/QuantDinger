@@ -2,21 +2,12 @@
 
 ## 项目：QuantDinger
 - **本地**: D:/QuantDinger
-- **用途**: A股量化交易系统，小资金快速复利
+- **用途**: A股量化交易系统，小资金中短线快速复利,追求单位时间收益比
 - **技术栈**: Python 后端 (Flask + mimo agents + quantdinger) + Vue 前端 + PostgreSQL
 - **用户环境**: Windows10 + 40核 64G, D:\QuantDinger\, powershell, vscode
 ## 关键设计文档
-- docs目录中及系统目录下
+- docs目录中及根目录/当前系统目录下
 
-- 执行层用上游 **smolagents[openai]>=1.27.0**（CodeAgent）；未引入 langchain / pydantic-ai / agno / openai-agents。
-- 差异化内核（不可替换）：`chain/`（EvalNode 树 + 盘后评估/权重迭代）、`capabilities/` 准入、`tools/finance/` 领域工具、`skills/`(SKILL.md)、`rag/`、`resolvers/`、`message_queue`。
-- 契约：Tool 兼容 OpenAI Function Calling；Skill 兼容 Anthropic SKILL。
-- **实际图结构**（以代码为准）：`chat → plan → execute → finalize` 四节点，注册在 `agents/task_agent.py:1765-1771`，节点工厂在 `nodes.py`（`make_chat_node:374` / `make_plan_node:592` / `make_execute_node:1228` / `make_finalize_node:1400`）。
-- ⚠️ **文档与代码有既定落差**：`docs/AGENT_ACCOUNTABLE.md` 头部自述"状态: 实施中（LangGraph 版本）"，其 §二~§七 描述的是**目标架构**（LangGraph StateGraph + prepare/planner/agent 3-LLM + `messages: Annotated[...,add]` + `cached_tools` + `_collectors` + PostgresSaver + 通用 entity_code/entity_type）；而**代码现状**是自研 graph + chat/plan/execute + step_budget/phases + 金融专用。即"换 LangGraph"是项目自己已定的方向，只是**尚未落地**。评估时一律以代码为准。
-- `docs/harness改造计划.md` 是上一轮改造计划（用 smolagents 替换旧 executor.py/runner.py/factory.py），**已完成**。
-- 项目**只有一套** agent 实现（`app/agent`），不存在 `app/nanobot` 等第二套。
-- ⚠️ `AgentState`（`nodes.py:39`）含**不可序列化字段**：`_code_agent`、`_phase_agents`（smolagents CodeAgent 实例）。启用任何"序列化整个 state"的 checkpointer 前，必须先把这些字段移出 state。
-- Checkpointer 接口自研且**当前未启用**（`task_agent.py:1765` 附近注明"暂不启用 checkpointer，需要数据库连接池"）→ "可回测/可复现"存在真实缺口。
 ## 方向和约束
 - 做 A 股量化交易,代码修改和迭代,项目研究和评估
 - 网上找轮子比自己造轮子更好

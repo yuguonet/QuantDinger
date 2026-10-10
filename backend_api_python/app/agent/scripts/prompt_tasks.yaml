@@ -131,3 +131,33 @@ tasks:
       must_not_call: [update_plan]
       must_call_domain: [finance]
       max_total_tokens: 60000
+
+  # ── 规划纪律补完（差距 A 收尾，2026-10-10：3 条 → 5 条，达 A 验收线）──
+  - id: plan_dispatch
+    desc: 批量重活应分发给 run_skill，不在主上下文硬跑
+    why: B 分发纪律的行为断言，兼作 B 验收「派活率」探针——主上下文跑全市场扫描是
+        token/注意力双输（B 的核心论点）；若这条红了，先看 system_template §重活分发
+        是否被误改，再看技能白名单/预选是否把 run_skill 排除出面
+    session: reg_plan4
+    requires_availability: [run_skill]
+    turns:
+      - 帮我做一次全市场短线强势股筛选，把筛选条件和结果要点总结给我，明细不用全贴
+    checks:
+      must_call: [run_skill]
+      must_not_contain: ["以下是全部", "全部 5000", "完整列表如下"]
+      max_total_tokens: 150000
+
+  - id: plan_acceptance
+    desc: 多步任务收口要交代验收口径：做了什么/数据有没有缺口
+    why: 规划收尾质量——_plan_lint 只能发现「清单没勾完」，发现不了「结论不交代
+        覆盖面」；交付时主动说明缺口是可验收性的一半（与 plan_no_residue 配对）
+    session: reg_plan5
+    turns:
+      - 分三步完成：1 查比亚迪 002594 现价 2 看它最近一个交易日资金面 3 给出是否适合做 T 的结论。
+        每完成一步更新计划，最后给出结论并说明数据覆盖情况和缺口
+    checks:
+      must_call: [update_plan]
+      must_call_domain: [finance]
+      must_contain: ["比亚迪"]
+      must_contain_any: ["缺口", "未获取", "限制", "覆盖", "口径"]
+      max_total_tokens: 250000

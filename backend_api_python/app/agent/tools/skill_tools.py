@@ -86,16 +86,21 @@ def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
     Returns:
         {"ok": True, "result": <预览>, "full_path": ..., "elapsed_s": ...} 或 {"error": ...}
     """
+    import os
     import subprocess
     import sys
     from pathlib import Path
 
     runner = Path(__file__).resolve().parent.parent / "scripts" / "skill_run.py"
     try:
+        # 子进程 stdout 是 UTF-8（ensure_ascii=False 的中文 JSON）；不显式指定编码时
+        # Windows 父进程按 GBK 解码 → 读线程 UnicodeDecodeError，stdout 整个丢掉。
         proc = subprocess.run(
             [sys.executable, str(runner), name, arguments or ""],
-            capture_output=True, text=True, timeout=_SKILL_RUN_TIMEOUT,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_SKILL_RUN_TIMEOUT,
             cwd=str(Path(__file__).resolve().parents[3]),   # backend_api_python
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
     except subprocess.TimeoutExpired:
         return {"error": f"skill_run 超时（>{_SKILL_RUN_TIMEOUT}s）已中止: {name}"}

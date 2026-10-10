@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.utils.logger import get_logger
 
@@ -64,14 +64,24 @@ _WATCHLIST_TABLE = "qd_watchlist"
 #
 #     统一口径: **所有 SQL 日期窗口都接收 Python 传入的本地日期**, 不再依赖
 #     `CURRENT_DATE`。改动点只有下面一个函数 + 两处 SQL, 不触碰其它模块的读法。
+#
+# ★★ 2026-10-10 L-13 根因收口: 原 `today_str` 用裸 `datetime.now()` (进程/容器
+#    本地时区) —— 仅在宿主 TZ=Asia/Shanghai 时恰好等于北京日; UTC 运行时 (裸启
+#    `python run.py` / CI / 误配容器) 会拿前一天, L-13 的"两套时钟"只是从 DB 会话
+#    搬到了容器 TZ, 根因未闭。现显式绑定北京时间, 与 realtime_snapshot 写入端
+#    (TZ_CN) 同一口径, 不再依赖宿主/容器时区。
+
+#: 北京时间时区 (与 app/market_cn/realtime_snapshot.py:55 同一定义, 不重复造轮子)。
+TZ_CN = timezone(timedelta(hours=8))
 
 def today_str() -> str:
-    """进程本地"今天" (YYYY-MM-DD) —— **SQL 日期窗口的唯一来源**。
+    """进程本地"今天" (YYYY-MM-DD) —— **SQL 日期窗口的唯一来源 (北京时间, 显式)**。
 
     与 `monitor._today()` 同源 (monitor 直接委托本函数), 保证「monitor 判 today」
-    与「store 按 today 开窗」拿到同一个日期。
+    与「store 按 today 开窗」拿到同一个**北京**日期, 与 realtime_snapshot.time
+    列 (以 TZ_CN 写入) 同口径, 不依赖宿主/容器时区。
     """
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(TZ_CN).strftime("%Y-%m-%d")
 
 
 #: monitor 每 tick 拉取的候选集回看窗口 (日历日)。
@@ -1292,7 +1302,8 @@ def cleanup_cutoff(days=15):
     rebuild 用它区分「真漏发」(边界内该有却没有) 与「已被清理」(边界外, 补了也会被再删)。
     单一事实源在此, 禁止各处重写公式。
     """
-    return (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
+    # L-13 根因收口: 用北京时间, 与 today_str 同口径 (避免 UTC 运行时边界偏一天)。
+    return (datetime.now(TZ_CN) - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
 
 
 def cleanup_old(days=15):

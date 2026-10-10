@@ -51,7 +51,9 @@ W_CONFIRM_LO = "15:01"
 
 
 def _now_hm() -> str:
-    return datetime.now().strftime("%H:%M")
+    # L-13 根因收口: 盘中窗口锚是北京时间, 必须显式 TZ_CN, 不依赖宿主时区
+    # (与 store.today_str 同源, 避免 UTC 运行时窗口判错)。
+    return datetime.now(ds.TZ_CN).strftime("%H:%M")
 
 
 def _today() -> str:

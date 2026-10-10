@@ -73,8 +73,12 @@ def fill_blocked_by_limit_up(fill: float, up: Optional[float],
     - `tol` = 相对容差, 默认 0 = **严格达到即拒**（与 g56 既有 GAP_LIM 口径逐位一致,
       零漂移）；`fill_intraday` 买腿传 `_limit_dn_tol(spec)`（保留其历史容差语义）。
     ⚠ 买侧交易的**唯一**涨停阻买判定入口，禁止在策略/工具内联比较涨停价。
+    ⚠ 浮点边界 (2026-10-10 #8-2 红例): `up` 由 `prev_close*(1+up_pct)` 得来, 乘积
+      常落在 tick 网格外一档浮点噪声 (100×1.098 = 109.80000000000001), 裸 `>=`
+      会在名义涨停价上**恰好漏拒** (fill=109.8)。"严格达到"指名义价的数学语义,
+      故比较带同量级 epsilon (1e-9 绝对值 ≫ 浮点噪声 1e-14 ≪ 最小 tick 1e-2)。
     """
-    return up is not None and up > 0 and fill >= up * (1 - tol)
+    return up is not None and up > 0 and fill >= up * (1 - tol) - 1e-9
 
 
 def fill_intraday(bar: dict, trigger: float, *, side: str = "sell",

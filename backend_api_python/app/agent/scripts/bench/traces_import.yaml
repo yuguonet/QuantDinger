@@ -1,0 +1,61 @@
+# import-traces 生成（人工补齐 baseline.must/should 后再并入主任务集）
+  - id: trace_01
+    category: 通用问答
+    source: traces
+    query: "你好"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_02
+    category: 通用问答
+    source: traces
+    query: "帮我分析一下贵州茅台600519"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_03
+    category: 通用问答
+    source: traces
+    query: "hi"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_04
+    category: 通用问答
+    source: traces
+    query: "茅台现在什么价"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_05
+    category: 通用问答
+    source: traces
+    query: "随便问一句"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_06
+    category: 通用问答
+    source: traces
+    query: "现在什么行情"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_07
+    category: 通用问答
+    source: traces
+    query: "茅台现在多少钱"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_08
+    category: 通用问答
+    source: traces
+    query: "写一个跑马灯的代码并运行"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_09
+    category: 通用问答
+    source: traces
+    query: "继续"
+    baseline:
+      must: [has_data_basis]
+  - id: trace_10
+    category: 通用问答
+    source: traces
+    query: "看行情"
+    baseline:
+      must: [has_data_basis]

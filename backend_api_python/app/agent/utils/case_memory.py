@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "record_case", "retrieve_cases", "backfill_by_root",
     "query_brew_case_signals", "format_case_injection", "case_memory_enabled",
+    "classify_case_tags", "CASE_TAGS", "CASE_INJECT_TOP_K",
 ]
 
 # ── 阈值（env=运维可调；C8 家族：上线后用评测/命中率校准）──────────────────
@@ -58,6 +59,48 @@ CASE_DUP_SIM = float(os.getenv("CASE_DUP_SIM", "0.95") or "0.95")
 CASE_SCAN_LIMIT = 2000
 # pending 降权系数
 _PENDING_WEIGHT = 0.5
+# few-shot 注入条数上限（2026-10-10 接线；金例成本 ≤ 500 tokens/例的预算约束）
+CASE_INJECT_TOP_K = int(os.getenv("CASE_INJECT_TOP_K", "3") or "3")
+
+# ── 任务 taxonomy（改进路线 E / 方案评估 §2.4：金例按任务类型选例的前提）──
+# 六类枚举固定顺序（诊断 → 选股 → 板块 → 大盘 → 交易 → 风控），分类结果按此序输出。
+CASE_TAGS: Tuple[str, ...] = (
+    "诊个股", "选股", "板块复盘", "大盘研判", "交易确认", "止损复核",
+)
+
+# 规则式分类（零成本、可解释、可回归）：命中即入标签，允许多标签。
+# 为什么不走 LLM 分类：这是**入库侧**的高频路径，加一轮生成等于每个 run 多花一次钱和时延；
+# 词面规则漏一点没关系——标签只做选例加权（检索侧 bonus），不做硬过滤，误分类不会丢案例。
+_TAG_RULES: Tuple[Tuple[str, "re.Pattern"], ...] = (
+    ("止损复核", re.compile(
+        r"止损|割肉|被套|套牢|扛单|补仓|亏损|风控|回撤|要不要卖|还能持有")),
+    ("交易确认", re.compile(
+        r"买入|卖出|加仓|减仓|建仓|清仓|止盈|抄底|下单|挂单|成交|做T|调仓|仓位|进场|入场|出手")),
+    ("选股", re.compile(
+        r"选股|筛选|挑股|金股|潜力股|标的池|股票池|涨停池|哪些(股|标的|票)|"
+        r"什么(股|标的|票)|推荐.{0,4}(股|标的|票)|短线.{0,4}(股|标的|票)")),
+    ("板块复盘", re.compile(
+        r"板块|行业|概念|题材|复盘|情绪周期|梯队|轮动|涨停.{0,2}(家|梯队)")),
+    ("大盘研判", re.compile(
+        r"大盘|上证|沪指|深成指|创业板指|科创|指数|两市|市场情绪|牛熊|行情(走向|趋势)")),
+    ("诊个股", re.compile(
+        r"个股|这只|该股|这只票|技术面|基本面|资金面|筹码|走势|诊断|"
+        r"分析.{0,6}(股票|标的|个股|股|票)|\d{6}")),
+)
+
+
+def classify_case_tags(query: str, answer: str = "") -> List[str]:
+    """问法 → 任务类型标签（taxonomy 六类，按 CASE_TAGS 固定序返回）。
+
+    主判 query；query 判不出时退化用 answer 兜底（短问句"那现在呢"这类
+    无信息问法不至于贴空标签）。无命中返回 []——不硬塞"其他"，避免噪声标签
+    参与选例加权。
+    """
+    text = (query or "").strip()
+    tags = [t for t, pat in _TAG_RULES if pat.search(text)]
+    if not tags and (answer or "").strip():
+        tags = [t for t, pat in _TAG_RULES if pat.search(str(answer)[:800])]
+    return [t for t in CASE_TAGS if t in tags]
 # 信号④：聚类最小出现次数 / 最小已验证样本 / correct 率门槛
 CASE_CLUSTER_MIN = 3
 CASE_CLUSTER_MIN_LABELED = 2
@@ -289,10 +332,14 @@ def backfill_by_root(root_id: int, correct: Optional[bool],
 #  检索 + 注入
 # ═══════════════════════════════════════════════════════════════
 
-def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
+def retrieve_cases(query: str, top_k: int = 3,
+                   tags: Optional[Sequence[str]] = None) -> List[dict]:
     """检索相似案例（加权 + 近重复去重 + 阈值过滤）。无命中返回 []（宁缺毋滥）。
 
     返回行：{case_id, task_summary, plan_digest, outcome, failure_modes, score, sim}。
+
+    tags（2026-10-10）：任务类型标签（`classify_case_tags` 产出）。有重叠的案例
+    拿小加成（×1.2）——只调序不过滤，避免分类漏召回把同类金例挡在外面。
     """
     if not case_memory_enabled() or not (query or "").strip():
         return []
@@ -303,7 +350,7 @@ def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
             cur = conn.cursor()
             _ensure_schema(cur, conn)
             cur.execute(
-                "SELECT case_id, task_summary, plan_digest, outcome, failure_modes,"
+                "SELECT case_id, task_summary, tags, plan_digest, outcome, failure_modes,"
                 " embedding, created_at FROM qd_agent_cases"
                 " ORDER BY created_at DESC LIMIT %s", (CASE_SCAN_LIMIT,))
             rows = cur.fetchall()
@@ -330,6 +377,7 @@ def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
         #   案例召回整条链断掉却只在日志里留一行。与 store/evaluator 的 row['k'] 一致。
         case_id = row["case_id"]
         summary = row["task_summary"]
+        row_tags = row["tags"]
         digest = row["plan_digest"]
         outcome = row["outcome"]
         fmode = row["failure_modes"]
@@ -351,6 +399,13 @@ def retrieve_cases(query: str, top_k: int = 3) -> List[dict]:
         if sim < CASE_SIM_MIN:
             continue                                   # 宁缺毋滥
         weight = 1.0 if label == "correct" else _PENDING_WEIGHT
+        # 标签同型加成（只调序不过滤，见 docstring）
+        try:
+            row_tags = row_tags if isinstance(row_tags, list) else json.loads(row_tags or "[]")
+        except Exception:
+            row_tags = []
+        if tags and row_tags and (set(map(str, tags)) & set(map(str, row_tags))):
+            weight *= 1.2
         digest = digest if isinstance(digest, list) else json.loads(digest or "[]")
         fmode = fmode if isinstance(fmode, list) else json.loads(fmode or "[]")
         scored.append({

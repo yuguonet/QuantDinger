@@ -49,9 +49,15 @@ BASELINE = {
     "g56.py": 5,
     "knife_catch.py": 1,
     "tail_oversold.py": 0,
+    "v1.py": 1,     # 2026-10-10 上调 0→1 (登记理由): v1 无折叠契约 ⇒ base.backtest_stock 直接
+                    #   NotImplementedError, V1 自持 `def backtest_stock` 覆写以恢复官方 CLI 回测
+                    #   (2026-10-10 恢复)。这是**过渡脚手架** —— 待 V1 迁折叠契约(init_state/step/
+                    #   evaluate)并入 core.replay 后删除该覆写, 计数降回 0。仅 `def` 一处命中
+                    #   (注释已去 backtest_stock 字面量); 回测引擎本体在 _run_backtest/v1_combo 不计。
 }
 # 2026-10-09 P6-6/7: v1/relay3/lead_chase 退役归档 strategies/_archive/ ⇒ 从 BASELINE 移除
 # (本门禁要求 BASELINE 覆盖全部现存策略文件, 见 test_baseline_covers_all_strategy_files)。
+# 2026-10-10: v1 移回 strategies/ 调试 ⇒ 重新加入 BASELINE (count=0)。
 
 #: 已清零的文件（P3-④ 完成后逐个加入；一旦加入，回退即 FAIL）
 CLEANED: tuple = ("tail_oversold.py",)

@@ -1,38 +1,33 @@
-"""test_exit_rollover_real_behavior.py — 出场顺延路径的**现状特征锁**（审计 core B3-2 复核）。
+"""test_exit_rollover_real_behavior.py — 出场顺延路径的行为锁（审计 core B3-2 / P1-3 专项）。
 
-本文件记录的是**实测现状**，不是「应该怎样」。目的是：
-1. 任何人改动出场顺延路径时，立刻看到行为差异（而不是静默改了收益）；
-2. 为后续专项修复 B3-2 提供**可对比的基线数据**。
+本文件记录实测行为，任何人改动出场顺延路径时会立刻看到行为差异（而不是静默改了收益）。
 
 审计结论的修正（重要）
 ----------------------
 `audit_core.md` B3-2 断言「尾块 `nxt = entry_idx + exit_d + 1` 多一个 +1 ⇒ 跳过
 一个交易日」，并称 `run_trail_stop` 靠「每日写到期不 break」与它**互相抵消**。
 
-**实测复核结论：该诊断不成立，本次不修。** 证据（hold_days=3、entry_idx=0、
-到期日 = idx2、构造一字跌停）：
+**实测复核结论：该诊断对 `run_trail_stop` 不成立**（`+1` 与它的逐日占位坐标自洽）；
+真病灶是 `run_hold_stop` 的**阻塞日换算**（`exit_d` 三处赋值点结构）。证据
+（hold_days=3、entry_idx=0、到期日 = idx2、构造一字跌停）：
 
-| 场景 | run_hold_stop | run_trail_stop |
-|------|---------------|----------------|
-| 跌停在 idx1（非到期日） | `exit_day=3, price=8.0` | `exit_day=3, price=8.0` |
-| 跌停在 idx2（**到期日**） | `exit_day=2, price=10.0` ⚠ | `exit_day=4, price=8.0` |
-| 无跌停 | `exit_day=3, price=10.0` | `exit_day=3, price=10.0` |
+| 场景 | run_hold_stop（修复前） | run_hold_stop（2026-10-10 专项后） | run_trail_stop（不变） |
+|------|---------------|----------------|----------------|
+| 跌停在 idx1（非到期日） | `exit_day=3, price=8.0` | `exit_day=3, price=8.0` | `exit_day=3, price=8.0` |
+| 跌停在 idx2（**到期日**） | `exit_day=2, price=10.0` ⚠ | **`exit_day=4, price=8.0`** ✓ | `exit_day=4, price=8.0` |
+| 无跌停 | `exit_day=3, price=10.0` | `exit_day=3, price=10.0` | `exit_day=3, price=10.0` |
 
-- `run_trail_stop` 在**所有**场景下输出自洽（`nxt = entry_idx + exit_d + 1` 是正确的，
-  因为 `d` 的坐标是「持仓第 d 交易日」⇒ 封死日索引 `= entry_idx + d - 1`，
-  次一交易日 `= entry_idx + d` … 尾块多 +1 是为了跳到封死日**之后**的下一个可成交日，
-  与 trail_stop 循环内 `pending_dn` 分支的 `d` 已经自增语义配套）。
-- `run_hold_stop` 在「到期日封跌停」场景下确实异常（`exit_day=2 / price=10.0`，
-  即在到期日之前就按开盘价平仓），但**成因不是 `+1` 公式**：
-  到期判定位于循环**之后**，而「一字跌停 / 成交贴跌停」分支只置 `pending_dn`、**未记 `exit_d`**
-  ⇒ 循环结束时 `exit_d` 仍为 0 ⇒ 尾块起点退化成 `entry_idx + 1`。
-  已实测：仅补`exit_d = d` 会得到 `exit_day=5 / price=7.0`（**仍不对**，因为到期分支
-  随后又把 `exit_d` 覆盖为 `hold_days`，与尾块公式再次错位）。
-  ⇒ 该缺陷牵涉 `exit_d` 三处赋值点与两个引擎的**不同结构**（hold_stop 到期在循环后、
-  trail_stop 到期在循环内），**不是一处最小修**，需专项复核后再动。
-
-因此本文件只锁现状，不锁「期望值」。若将来专项修复 B3-2，本文件应被
-「期望行为」测试替换，并把这里的差异作为验收依据。
+P1-3 专项修复（2026-10-10，`exit_engines.run_hold_stop` 尾块）
+----------------------------------------------------------------
+- 成因：本引擎**无逐日占位**（与 trail 不同），loop 尾阻塞时 `exit_d` 恒为 0 ⇒
+  旧公式 `nxt = entry_idx + exit_d + 1` 退化成 `entry_idx + 1`，在阻塞日**之前**
+  就平仓（已知异常 `exit_day=2/price=10.0`）；而到期块分支（`exit_d=hold_days`）
+  同一公式又会多跳一天 —— 这就是「不是一处最小修」的三赋值点结构问题。
+- 修法：尾块起点统一改为 `nxt = entry_idx + hold_days`（= 阻塞日次日；带 pending
+  走到尾块的阻塞日只可能是到期日，论证见 `run_hold_stop` 尾块注释）。
+- `run_trail_stop` **零改动**（其 `+1` 与逐日占位坐标自洽，修复未触碰它）。
+- 影响面：仅「到期日封跌停」分支的 g56 回测笔会变（出场日 2→4、价格 10.0→8.0），
+  已在 `docs/口径差异报告.md` 登记；其余场景与 trail 输出逐位不变。
 """
 
 from __future__ import annotations
@@ -106,38 +101,35 @@ def test_trail_stop_dn_on_expiry_day():
     )
 
 
-def test_hold_stop_dn_on_expiry_day_is_known_anomaly():
-    """⚠ **已知异常现状**（审计 core B3-2，本次不修，见模块头）。
+def test_hold_stop_dn_on_expiry_day():
+    """「到期日封跌停」⇒ 顺延到到期日次一交易日开盘卖出（P1-3 专项后期望行为）。
 
-    「到期日封跌停」时 `run_hold_stop` 在到期日**之前**就平仓：
-    `exit_day=2 / price=10.0`（idx1 开盘），而合理值应是 `exit_day=4 / price=8.0`
-    （idx3 开盘）。
-
-    本条锁住**异常现状**而不是期望值 —— 这样修复一旦发生，本条会红，
-    强制执行者更新文档与口径记录，不会静默改掉收益统计。
-    若改成了 `exit_day=4 / price=8.0`，请把本条改为断言期望值并删掉本段警告。
+    修复前是已知异常 `exit_day=2 / price=10.0`（在阻塞日之前平仓），
+    与 `run_trail_stop` 同场景输出 (4, 8.0) 分歧。2026-10-10 专项修正后
+    两引擎一致；本条即专项验收断言（见模块头论证）。
     """
     out = ee.run_hold_stop(_with_one_word_dn(2), 0, 10.0, **HOLD_KW)
-    assert (out["exit_day"], out["exit_price"]) == (2, 10.0), (
-        f"hold_stop 的已知异常已变化: {out}。"
-        f"若已修复，请改为断言 (4, 8.0) 并在 docs/口径差异报告.md 登记"
+    assert (out["exit_day"], out["exit_price"]) == (4, 8.0), (
+        f"hold_stop 到期日封跌停行为回退: {out}。"
+        f"期望顺延到次一交易日 (4, 8.0) —— 若有意变更口径, "
+        f"请同步 docs/口径差异报告.md 并复核 run_trail_stop 同场景"
     )
+    assert out["exit_reason"] == "跌停顺延开盘"
 
 
 # ================================================================
-# 两引擎一致性现状（有差异，不是本文件要修的东西，只做记录）
+# 两引擎一致性（2026-10-10 P1-3 专项后: 全场景一致）
 # ================================================================
 @pytest.mark.parametrize("dn_idx", [1, 2])
-def test_two_engines_differ_only_on_expiry_day_dn(dn_idx):
-    """记录两引擎在「跌停恰逢到期日」时的**分歧**（现状，非期望）。
+def test_two_engines_agree_on_all_dn_scenarios(dn_idx):
+    """两引擎在跌停顺延场景输出一致（专项修复后的**期望**，替代修复前的分歧记录）。
 
-    非到期日跌停时两者一致；到期日跌停时分歧 ⇒ B3-2 的真实病灶范围。
+    修复前 dn_idx=2（到期日）时两者分歧（hold=2/10.0 vs trail=4/8.0）；
+    现在必须逐位一致 —— 若再分歧，说明顺延坐标又改坏了。
     """
     h = ee.run_hold_stop(_with_one_word_dn(dn_idx), 0, 10.0, **HOLD_KW)
     t = ee.run_trail_stop(_with_one_word_dn(dn_idx), 0, 10.0, **TRAIL_KW)
-    if dn_idx == 1:
-        assert (h["exit_day"], h["exit_price"]) == (t["exit_day"], t["exit_price"])
-    else:
-        assert (h["exit_day"], h["exit_price"]) != (t["exit_day"], t["exit_price"]), (
-            "两引擎在到期日跌停场景已一致 ⇒ B3-2 可能已修复，请复核并更新本文件"
-        )
+    assert (h["exit_day"], h["exit_price"]) == (t["exit_day"], t["exit_price"]), (
+        f"两引擎在 dn_idx={dn_idx} 场景分歧: hold={h} trail={t} —— "
+        f"顺延坐标必须同口径（P1-3 专项验收）"
+    )
