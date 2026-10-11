@@ -1034,6 +1034,21 @@ def projection_ledger_refresh(window=30, keys=None, dry_run=True):
     if not active:
         return None, {"error": "无活跃日线策略", "source": "projection"}
 
+    # 2026-10-11: 无折叠契约的策略 (scan 走直判, 如 v1) **不在投影集里** —— 它们的
+    # 库行由 scan/monitor 独家管辖。若不排除, load_actual 会带入它们的 watch_pending
+    # 行而投影侧恒空 ⇒ 全部被 build_ledger_plan 判"重放集外"作废 (当日实证: 启动
+    # 对账把 v1 的 5 笔真实观察行批量 expired, g56 因有契约幸免)。与
+    # present_daily.persist_days 用同一谓词 (_has_fold_contract), 具名登记不静默。
+    from app.market_cn.auto.strategies.base import _has_fold_contract
+    direct = sorted(k for k, s in active.items() if not _has_fold_contract(s))
+    if direct:
+        logger.warning("[rebuild] 投影刷新排除直判策略 (无折叠契约, 行由 scan/monitor "
+                       "管辖, 不进校准范围): %s", ", ".join(direct))
+        active = {k: s for k, s in active.items() if _has_fold_contract(s)}
+    if not active:
+        return None, {"error": "活跃日线策略均为直判 (无折叠契约)", "source": "projection",
+                      "direct_jurisdiction": direct}
+
     active_keys = sorted(active)
     names = {}
     try:
@@ -1065,6 +1080,8 @@ def projection_ledger_refresh(window=30, keys=None, dry_run=True):
     }
     stat = {"source": "projection", "dry_run": bool(dry_run),
             "proj_rows": len(proj), "actual_rows": len(actual)}
+    if direct:
+        stat["direct_jurisdiction"] = direct
     if dry_run:
         return plan, stat
     applied = apply_ledger_plan(plan, dry_run=False)

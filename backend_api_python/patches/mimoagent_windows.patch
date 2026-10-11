@@ -1,0 +1,525 @@
+# ═══════════════════════════════════════════════════════════════════════
+# mimoagent Windows 兼容补丁（QuantDinger 专用）
+# 目标包：mimoagent 0.1.0（XiaomiMiMo/mimoagent，mimo-oss 分支）
+# 安装位置：.venv/Lib/site-packages/
+# 应用：  python patches/apply_mimoagent_patch.py --apply
+# 校验：  python patches/apply_mimoagent_patch.py --check
+# 基线：  app/agent/tmp/mimo_orig/（mimoagent 原始四文件，diff -u 生成）
+# 内容：  paths.py    —— resolve_path 认 Windows 盘符/UNC 绝对路径
+#         local.py    —— execute/copy_to 路由 Git Bash（POSIX 语义）+ PATH 前置
+#                        + 真解释器（venv Scripts）前置与 python3.exe 幂等别名
+#                        （消除 WindowsApps Store stub rc=49）
+#         ripgrep.py  —— Windows rg.exe 解析/下载 + rg 目录前置 PATH
+#         prompts.py  —— bash 工具描述 OS/Shell 从加载方判断（windows/Git Bash），
+#                        不再写死 linux/bash 误导模型
+# 平台：  所有新增分支 os.name == "nt" 才生效；Linux/macOS 与上游一致。
+# ═══════════════════════════════════════════════════════════════════════
+--- mimoagent/tools/mimocode/paths.py
++++ mimoagent/tools/mimocode/paths.py
+@@ -1,5 +1,15 @@
+ """Path helpers for the agent-local MiMo session cwd."""
+ 
++# ══ QD 补丁（patches/mimoagent_windows.patch）════════════════════════════
++# 【根因】上游 resolve_path 只认 POSIX 绝对路径（startswith("/")），Windows 的
++# `C:\xxx` / `\\server\share` 会被当成相对路径拼到 cwd 后面 ⇒ 原生 read/write/edit
++# 在 Windows 上传绝对路径必炸 FileNotFoundError。这里在函数入口加 Windows 绝对
++# 形态分支（盘符 / UNC）→ ntpath 规范化，其余分支与上游**逐字节一致**。
++# 【平台】仅 os.name == "nt" 走新分支；Linux/macOS 行为与未打补丁时完全相同。
++# ════════════════════════════════════════════════════════════════════════
++
++import ntpath
++import os
+ import posixpath
+ from typing import Any
+ 
+@@ -15,6 +25,10 @@
+ 
+ def resolve_path(path: str, context: dict[str, Any] | None) -> str:
+     """Resolve a model path against the agent-local cwd, using POSIX paths."""
++    if os.name == "nt":  # [QD] Windows 绝对形态（盘符/UNC）→ ntpath 规范化
++        p = str(path)
++        if ntpath.isabs(p) or p.startswith("\\\\"):
++            return ntpath.normpath(p)
+     if path.startswith("/"):
+         return posixpath.normpath(path)
+     base = session_cwd(context)
+--- mimoagent/environments/local.py
++++ mimoagent/environments/local.py
+@@ -1,10 +1,42 @@
++import logging
+ import os
+ import platform
++import re
+ import shutil
+ import subprocess
++import sys
++import tempfile
+ from dataclasses import asdict, dataclass, field
+ from typing import Any
+ 
++# ══ QD 补丁（patches/mimoagent_windows.patch）════════════════════════════
++# 【根因】上游 execute 用 subprocess.run(shell=True)，Windows 上恒走 cmd.exe，
++# 而工具发的命令是 POSIX 形态（`[ -f ]` / `[ -r x ] && echo OK` / `find|sort` /
++# `shopt -s globstar`）——cmd.exe 不是"命令找不到"，是**语法层不认**
++# （实测 `cmd /c "if [ -f x ]"` → 「此时不应有 -f」），单行同样会挂。
++# ⇒ 统一把执行通道路由到 Git Bash（写临时 .sh 执行），mimo 原版
++# read/edit/grep/glob/write/bash 全部原样可用，无需替代实现。
++#
++# 【三件关键处理】
++#  1. 路径 token 转正斜杠（只转盘符/UNC 开头的 token，不碰正则里的 \\d、\\1）
++#     + MSYS_NO_PATHCONV=1：防 bash 把 `C:\Users` 的 `\U` 当转义吃掉（方案 A
++#     `bash -c` 即因此被否）。
++#  2. LANG=C.UTF-8 / PYTHONIOENCODING=utf-8：zh-CN(GBK) 环境子进程按旧代码页
++#     输出会乱码（实测目录列表 `?????ļ???`）——官方 shell.ts 的 chcp 65001 等价物。
++#  3. copy_to 同走 bash 通道：POSIX 目标路径（edit 投递的 /tmp/mimo_edit_*）
++#     经 shutil 会落到"当前盘 \tmp"，与 bash 的 MSYS /tmp 不是一处 ⇒ awk
++#     getline 打不开（MIMO_EDIT:AWKFAIL:6）。经 bash mkdir+cp 后语义一致。
++#
++# 【前置依赖】Git for Windows 的 usr\bin 前置进程 PATH（POSIX 工具可达）；
++# 找不到 bash.exe 则回退原 cmd.exe 路径（fail-soft，不引入新崩溃）。
++# 【解释器注入】顺带把 venv Scripts（sys.executable 所在目录）移到 PATH 最前，
++# 并幂等补齐 python3.exe 别名 —— 后端进程 PATH 常无真 python3，bash 会命中
++# WindowsApps 的 Store 占位 stub（rc=49 零输出，llm_inputs.log 实证）。
++# 【平台】所有分支仅 os.name == "nt" 生效，Linux/macOS 与上游逐字节一致。
++# ════════════════════════════════════════════════════════════════════════
++
++logger = logging.getLogger(__name__)
++
+ 
+ @dataclass
+ class LocalEnvironmentConfig:
+@@ -13,6 +45,114 @@
+     timeout: int = 30
+ 
+ 
++# ── [QD] Windows：Git 工具链定位与 PATH 前置 ──────────────────────────────
++def _locate_git_bin_dirs() -> list:
++    """定位 Git for Windows 的 POSIX 工具目录（usr/bin + bin），按存在性返回。"""
++    candidates = []
++    _bash = shutil.which("bash")
++    if _bash:
++        _bdir = os.path.dirname(os.path.abspath(_bash))
++        candidates.append(_bdir)                              # …\Git\bin
++        candidates.append(os.path.join(os.path.dirname(_bdir), "usr", "bin"))
++    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
++    prog86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
++    for base in (prog, prog86, r"C:\msys64", r"C:\scoop\apps\git\current"):
++        candidates.append(os.path.join(base, "Git", "usr", "bin"))
++        candidates.append(os.path.join(base, "Git", "bin"))
++        candidates.append(os.path.join(base, "usr", "bin"))
++        candidates.append(os.path.join(base, "bin"))
++    seen = set()
++    out = []
++    for d in candidates:
++        d = os.path.normpath(d)
++        if d in seen:
++            continue
++        seen.add(d)
++        if os.path.isdir(d) and os.path.exists(os.path.join(d, "cat.exe")):
++            out.append(d)
++    return out
++
++
++def _find_git_bash_exe() -> str:
++    """定位 Git for Windows 的 bash.exe（POSIX 执行后端）。"""
++    candidates = []
++    for d in _locate_git_bin_dirs():
++        parent = os.path.dirname(d)
++        candidates.append(os.path.join(d, "bash.exe"))
++        candidates.append(os.path.join(parent, "bin", "bash.exe"))
++        candidates.append(os.path.join(parent, "bash.exe"))
++    for c in candidates:
++        if os.path.isfile(c):
++            return c
++    return ""
++
++
++def _front_python_interpreter() -> str:
++    """[QD] 把真解释器目录（venv Scripts）移到 PATH 最前，返回该目录。
++
++    - python.exe 以 sys.executable 为准，必然真实可用；
++    - python3.exe 缺失时幂等复制 python.exe（同目录副本可正常解析
++      pyvenv.cfg 进入 venv，已实测 import venv 包无误）。
++    动机：后端进程 PATH 常无真 python3，bash 搜索会落到 WindowsApps 的
++    Store 占位 stub（AppInstallerPythonRedirector，rc=49 零输出，
++    llm_inputs.log 实证），且该别名 os.path.islink=False 无法可靠识别
++    ⇒ 不做探测，直接用"已知真解释器前置"消除竞态。
++    """
++    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
++    py, py3 = os.path.join(exe_dir, "python.exe"), os.path.join(exe_dir, "python3.exe")
++    if os.path.isfile(py) and not os.path.isfile(py3):
++        try:
++            shutil.copyfile(py, py3)
++            logger.info("[mimoagent-qd] 已补齐 python3.exe 别名：%s", py3)
++        except OSError as e:
++            logger.warning("[mimoagent-qd] 补齐 python3.exe 别名失败（%s）；"
++                           "bash 内 `python3` 可能命中原系统 stub。", e)
++    if not os.path.isfile(py):
++        logger.warning("[mimoagent-qd] sys.executable 不可用：%s", sys.executable)
++        return ""
++    # 无论是否已在 PATH，都移到最前（已在 PATH 但排在 WindowsApps 之后同样致命）
++    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep)
++             if p and os.path.normpath(p).lower() != os.path.normpath(exe_dir).lower()]
++    os.environ["PATH"] = os.pathsep.join([exe_dir] + parts)
++    logger.info("[mimoagent-qd] 真解释器目录已前置 PATH：%s", exe_dir)
++    return exe_dir
++
++
++# 路径 token 转正斜杠：判据是"以盘符 `C:` 或 UNC `\\` 开头"⇒ 必是路径；
++# 正则里的 `\d`、`\1`、`[a\-z]` 等转义序列不以盘符开头，不受影响。
++_WIN_PATH_TOKEN = re.compile(
++    r"""(?:"(?:[A-Za-z]:|\\\\)[^"]*"|'(?:[A-Za-z]:|\\\\)[^']*'"""
++    r"""|(?:[A-Za-z]:|\\\\)[^'"\s;|&<>()]*)"""
++)
++
++
++def _win_paths_to_posix(cmd: str) -> str:
++    """把命令里的 Windows 路径 token（盘符 / UNC 开头）内反斜杠转正斜杠。"""
++    return _WIN_PATH_TOKEN.sub(lambda m: m.group(0).replace("\\", "/"), cmd)
++
++
++if os.name == "nt":
++    # Git POSIX 工具链前置进程 PATH（cat/[.exe 等；含 rg 目录由 ripgrep 补丁负责）
++    _git_dirs = [d for d in _locate_git_bin_dirs()
++                 if d not in os.environ.get("PATH", "").split(os.pathsep)]
++    if _git_dirs:
++        os.environ["PATH"] = os.pathsep.join(_git_dirs + [os.environ.get("PATH", "")])
++        logger.info("[mimoagent-qd] Git POSIX 工具链已前置 PATH：%s",
++                    os.pathsep.join(_git_dirs))
++    else:
++        logger.warning(
++            "[mimoagent-qd] 未找到 Git for Windows 的 POSIX 工具链（cat.exe）；"
++            "Windows 上 POSIX 命令可能失败。请安装 Git for Windows。")
++    # 真解释器目录移到最前（必须在 Git 前置之后执行，否则被 Git dirs 顶掉）
++    _front_python_interpreter()
++    _GIT_BASH = _find_git_bash_exe()
++    if not _GIT_BASH:
++        logger.warning(
++            "[mimoagent-qd] 未找到 bash.exe；execute 将回退 cmd.exe（POSIX 命令会失败）。")
++else:
++    _GIT_BASH = ""
++
++
+ class LocalEnvironment:
+     def __init__(self, *, config_class: type = LocalEnvironmentConfig, **kwargs):
+         """This class executes bash commands directly on the local machine."""
+@@ -22,11 +162,39 @@
+         """No-op for local environment."""
+         pass
+ 
+-    def execute(self, command: str, cwd: str = "", timeout: int = None):
+-        """Execute a command in the local environment and return the result as a dict."""
+-        if timeout is None:
+-            timeout = self.config.timeout
+-        cwd = cwd or self.config.cwd or os.getcwd()
++    # ── [QD] POSIX 执行后端：命令写临时 .sh 交 Git Bash ──────────────────
++    def _run_via_gitbash(self, command: str, cwd: str, timeout: int) -> dict:
++        path = ""
++        try:
++            script = _win_paths_to_posix(command)
++            fd, path = tempfile.mkstemp(suffix=".sh", prefix="qd_bash_")
++            with os.fdopen(fd, "w", encoding="utf-8") as f:
++                f.write(script if script.endswith("\n") else script + "\n")
++            env = dict(os.environ)
++            env.update(getattr(self.config, "env", None) or {})
++            env["LANG"] = "C.UTF-8"
++            env["PYTHONIOENCODING"] = "utf-8"
++            env["MSYS_NO_PATHCONV"] = "1"
++            res = subprocess.run(
++                [_GIT_BASH, path], cwd=cwd, env=env, timeout=timeout,
++                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++                text=True, encoding="utf-8", errors="replace",
++            )
++            return {"output": res.stdout, "returncode": res.returncode}
++        except subprocess.TimeoutExpired:
++            return {"output": "Command timed out", "returncode": 124}
++        except OSError:
++            # fail-soft：Git Bash 起不来就退回 cmd.exe，不引入新崩溃
++            return self._run_via_comspec(command, cwd, timeout)
++        finally:
++            if path and os.path.exists(path):
++                try:
++                    os.remove(path)
++                except OSError:
++                    pass
++
++    def _run_via_comspec(self, command: str, cwd: str, timeout: int) -> dict:
++        """上游原版 shell=True 路径（cmd.exe / POSIX sh），保持逐字节一致。"""
+         result = subprocess.run(
+             command,
+             shell=True,
+@@ -41,12 +209,42 @@
+         )
+         return {"output": result.stdout, "returncode": result.returncode}
+ 
++    def execute(self, command: str, cwd: str = "", timeout: int = None):
++        """Execute a command in the local environment and return the result as a dict."""
++        if timeout is None:
++            timeout = self.config.timeout
++        cwd = cwd or self.config.cwd or os.getcwd()
++        if os.name == "nt" and _GIT_BASH:
++            return self._run_via_gitbash(command, cwd, timeout)
++        return self._run_via_comspec(command, cwd, timeout)
++
+     def execute_detached(self, command: str, cwd: str = "", timeout: int = None, **_ignored) -> dict[str, Any]:
+         """No transport to detach from locally: a plain execute."""
+         return self.execute(command, cwd=cwd, timeout=timeout)
+ 
+     def copy_to(self, src_path: str, dest_path: str, *, timeout: int = 300, max_retries: int = 10) -> None:
+         """Copy a file or directory into the "environment" (plain local copy)."""
++        # [QD] POSIX 目标路径必须与 execute 同走 bash 通道（/tmp 语义一致性）
++        if os.name == "nt" and _GIT_BASH and str(dest_path).startswith("/"):
++            import shlex as _shlex
++
++            src = str(src_path)
++            # src 通常是 Windows 绝对路径（bash 认盘符形态）；不存在时
++            # 下方 cp 自然失败并被包装为 OSError，无需预检。
++            q_src, q_dst = _shlex.quote(src), _shlex.quote(str(dest_path))
++            # 目录走"合并式"拷贝（对齐 shutil.copytree(dirs_exist_ok=True)），
++            # 文件走 cp -f。edit 工具 ship 的是整个 local_dir（目录）。
++            if os.path.isdir(src):
++                cmd = "mkdir -p %s && cp -Rf %s/. %s/" % (q_dst, q_src, q_dst)
++            else:
++                parent = str(dest_path).rsplit("/", 1)[0] or "/"
++                cmd = "mkdir -p %s && cp -f %s %s" % (
++                    _shlex.quote(parent), q_src, q_dst)
++            r = self._run_via_gitbash(
++                cmd, cwd=self.config.cwd or os.getcwd(), timeout=timeout)
++            if r.get("returncode") == 0:
++                return
++            raise OSError(f"copy_to 经 bash 失败：{r.get('output', '')[:300]}")
+         src_path = os.path.abspath(src_path)
+         if not os.path.exists(src_path):
+             raise FileNotFoundError(f"source not found: {src_path}")
+--- mimoagent/tools/ripgrep.py
++++ mimoagent/tools/ripgrep.py
+@@ -11,16 +11,37 @@
+ 
+ The download is guarded by a file lock so parallel workers do not race, and
+ the binary is verified with ``rg --version`` before it is handed out.
++
++═══ QD 补丁（patches/mimoagent_windows.patch）════════════════════════════
++【根因】上游三处只认 Linux 形态，Windows 上永远解析不到可用 rg：
++  ① RG_ASSET 只绑 linux musl tarball（解压出的 `rg` 是 ELF，非 PE）；
++  ② 缓存文件名硬编码 `rg`（Windows 需 `rg.exe`）；
++  ③ 缺口在链路之外：Grep/Glob 的 `_ensure_rg` 第一步 `command -v rg` 走
++     bash PATH，找不到就落 POSIX 暂存 `copy_to("/usr/local/bin/rg")`——
++     Windows 无此目录语义。
++【Windows 行为】
++  - 资产换 `ripgrep-<ver>-x86_64-pc-windows-msvc.zip`，缓存文件 `rg.exe`，
++    `_download` 支持 zip 解压（rglob 找 `rg.exe`）；
++  - 解析顺序保持与原 qd_agent shim 等价：env → PATH(which) → 缓存 → 下载；
++  - 模块导入时（仅 nt）解析 rg 并**把其所在目录前置 PATH** ⇒
++    `command -v rg` 直接命中，POSIX 暂存逻辑根本不执行；
++    fail-soft：rg 缺失只 warning，grep/glob 按上游口径明确报错。
++  - 缓存基目录 `MIMOAGENT_CACHE_DIR` 或 `~/.cache/mimoagent-qd`（与原
++    shim 基线一致，不走 platformdirs 的 LocalAppData 形态）。
++【平台】非 Windows 分支与上游逐字节一致。
++═══════════════════════════════════════════════════════════════════════
+ """
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import shutil
+ import subprocess
+ import tarfile
+ import tempfile
+ import urllib.request
++import zipfile
+ from pathlib import Path
+ 
+ from platformdirs import user_cache_dir
+@@ -31,12 +52,30 @@
+ RG_PATH_ENV = "MIMOAGENT_RG_PATH"
+ RG_URL_ENV = "MIMOAGENT_RG_URL"
+ 
++logger = logging.getLogger(__name__)
++
++# [QD] Windows 资产：上游只绑了 linux musl tarball，Windows 换官方 msvc zip。
++RG_WIN_ASSET = f"ripgrep-{RG_VERSION}-x86_64-pc-windows-msvc.zip"
++DEFAULT_RG_WIN_URL = (
++    f"https://github.com/BurntSushi/ripgrep/releases/download/{RG_VERSION}/{RG_WIN_ASSET}"
++)
++
+ 
+ class RipgrepUnavailable(RuntimeError):
+     """No usable ``rg`` binary could be resolved for staging."""
+ 
+ 
++def _rg_name() -> str:
++    """缓存/归档内的二进制文件名：Windows 为 rg.exe，其余与上游一致。"""
++    return "rg.exe" if os.name == "nt" else "rg"
++
++
+ def _cache_dir() -> Path:
++    if os.name == "nt":
++        # [QD] 与原 qd_agent shim 基线一致（~/.cache/mimoagent-qd），不走 platformdirs
++        base = os.getenv("MIMOAGENT_CACHE_DIR") or os.path.join(
++            os.path.expanduser("~"), ".cache", "mimoagent-qd")
++        return Path(base) / "ripgrep" / RG_VERSION
+     return Path(os.getenv("MIMOAGENT_CACHE_DIR") or user_cache_dir("mimoagent")) / "ripgrep" / RG_VERSION
+ 
+ 
+@@ -50,19 +89,27 @@
+ 
+ 
+ def _download(url: str, dest: Path) -> None:
+-    """Fetch the release tarball and extract ``rg`` to ``dest`` (atomic rename)."""
++    """Fetch the release archive and extract ``rg`` to ``dest`` (atomic rename)."""
+     dest.parent.mkdir(parents=True, exist_ok=True)
+     with tempfile.TemporaryDirectory(dir=dest.parent) as tmp:
+-        archive = Path(tmp) / "rg.tar.gz"
+-        with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as out:
+-            shutil.copyfileobj(response, out)
+-        extracted = Path(tmp) / "extracted"
+-        with tarfile.open(archive) as tar:
+-            tar.extractall(extracted, filter="data")
+-        candidates = list(extracted.rglob("rg"))
++        if url.endswith(".zip"):  # [QD] Windows msvc zip（上游只处理 tar.gz）
++            archive = Path(tmp) / "rg.zip"
++            with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as out:
++                shutil.copyfileobj(response, out)
++            extracted = Path(tmp) / "extracted"
++            with zipfile.ZipFile(archive) as zf:
++                zf.extractall(extracted)
++        else:
++            archive = Path(tmp) / "rg.tar.gz"
++            with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as out:
++                shutil.copyfileobj(response, out)
++            extracted = Path(tmp) / "extracted"
++            with tarfile.open(archive) as tar:
++                tar.extractall(extracted, filter="data")
++        candidates = list(extracted.rglob(dest.name))
+         if not candidates:
+             raise RipgrepUnavailable(f"{url} does not contain an rg binary")
+-        staged = Path(tmp) / "rg"
++        staged = Path(tmp) / dest.name
+         shutil.copy2(candidates[0], staged)
+         staged.chmod(0o755)
+         os.replace(staged, dest)
+@@ -81,13 +128,19 @@
+             return path
+         raise RipgrepUnavailable(f"{RG_PATH_ENV}={explicit} is not a runnable rg binary")
+ 
+-    cached = _cache_dir() / "rg"
++    if os.name == "nt":  # [QD] PATH 优先（与原 shim 顺序 env → which → 缓存 → 下载 等价）
++        on_path = shutil.which("rg.exe") or shutil.which("rg")
++        if on_path and _is_runnable(Path(on_path)):
++            return Path(on_path)
++
++    cached = _cache_dir() / _rg_name()
+     if _is_runnable(cached):
+         return cached
+     if not download:
+         raise RipgrepUnavailable(f"no cached rg at {cached}")
+ 
+-    url = os.getenv(RG_URL_ENV) or DEFAULT_RG_URL
++    url = os.getenv(RG_URL_ENV) or (DEFAULT_RG_WIN_URL if os.name == "nt" else DEFAULT_RG_URL)
++    asset = RG_WIN_ASSET if os.name == "nt" else RG_ASSET
+     lock_path = cached.with_suffix(".lock")
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+     with lock_path.open("w") as lock:
+@@ -96,10 +149,10 @@
+             if not _is_runnable(cached):
+                 try:
+                     _download(url, cached)
+-                except (OSError, tarfile.TarError) as e:
++                except (OSError, tarfile.TarError, zipfile.BadZipFile) as e:
+                     raise RipgrepUnavailable(
+                         f"could not download ripgrep from {url}: {e}. Set {RG_PATH_ENV} to a local static rg "
+-                        f"binary, or {RG_URL_ENV} to a mirror of {RG_ASSET}."
++                        f"binary, or {RG_URL_ENV} to a mirror of {asset}."
+                     ) from e
+         finally:
+             _unlock(lock)
+@@ -108,6 +161,28 @@
+     return cached
+ 
+ 
++# ── [QD] 模块导入时把 rg 目录前置 PATH（仅 Windows）──────────────────────
++# 使 Grep/Glob 的 `_ensure_rg` 第一步 `command -v rg` 即命中，其 POSIX 暂存
++# `copy_to("/usr/local/bin/rg")` 分支不会执行。fail-soft：失败只 warning。
++def _preflight_rg() -> None:
++    try:
++        rg = resolve_host_rg()
++    except Exception as e:
++        logger.warning(
++            "[mimoagent-qd] 未找到可用 rg.exe（grep/glob 将按上游口径报错）：%s。"
++            "请放置 rg.exe 到 PATH 或设置 %s。", e, RG_PATH_ENV)
++        return
++    rg_dir = os.path.dirname(os.path.abspath(str(rg)))
++    path_env = os.environ.get("PATH", "")
++    if rg_dir not in path_env.split(os.pathsep):
++        os.environ["PATH"] = rg_dir + os.pathsep + path_env
++    logger.info("[mimoagent-qd] ripgrep 已就绪并前置 PATH：%s", rg)
++
++
++if os.name == "nt":
++    _preflight_rg()
++
++
+ def _lock(handle) -> None:
+     try:
+         import fcntl
+--- mimoagent/tools/mimocode/prompts.py
++++ mimoagent/tools/mimocode/prompts.py
+@@ -2,11 +2,36 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from functools import cache
+ from pathlib import Path
+ 
+ _ROOT = Path(__file__).parent
+ 
++# ══ QD 补丁（patches/mimoagent_windows.patch）════════════════════════════
++# 【根因】上游把 ${os}/${shell} 写死为 linux/bash —— 其 sandbox恒为 Linux
++# pod（见 load_bash_prompt 内注释），读 host 会跨 worker 不一致。但
++# LocalEnvironment 在 Windows 上执行时，沙箱事实是 Windows + Git Bash：
++# 告诉模型 "OS: linux" 会诱导它按 GNU/Linux 假设行事（llm_inputs.log 实证：
++# 模型敢用 `python3 -c`，命中 WindowsApps Store 占位 stub，rc=49 零输出）。
++# 【修法】按用户裁定"从加载方判断 OS 和 shell"：仅 os.name == "nt" 时渲染
++# 真实值（windows + Git Bash/cmd 取决于 local 的实际路由），其余平台与
++# 上游逐字节一致（sandbox 恒 Linux 的假设保持原样）。
++# ════════════════════════════════════════════════════════════════════════
++
++
++def _detect_os_shell() -> tuple[str, str]:
++    """从实际执行环境判断 bash 工具的 OS/shell 字段（加载方视角）。"""
++    if os.name != "nt":
++        return "linux", "bash"  # 上游原值：sandbox 恒 Linux pod 的假设
++    shell = "cmd.exe"           # local 无 Git Bash 时的回退执行通道
++    try:
++        from mimoagent.environments.local import _GIT_BASH
++        shell = "Git Bash" if _GIT_BASH else "cmd.exe"
++    except Exception:  # 导入失败不致命：至少 OS 要报真
++        pass
++    return "windows", shell
++
+ 
+ @cache
+ def load_tool_prompt(name: str) -> str:
+@@ -24,13 +49,15 @@
+     failing test. The output budget is rendered for the same reason — the
+     prompt must describe the cut the tool actually makes.
+     """
+-    # The sandbox's facts, not the host's: env.execute runs `/bin/bash -lc` in
+-    # a Linux pod, and a prompt that read the host's platform / $SHELL varied
+-    # across workers.
++    # Upstream: the sandbox's facts, not the host's — env.execute runs
++    # `/bin/bash -lc` in a Linux pod, and a prompt that read the host's
++    # platform / $SHELL varied across workers. [QD] Windows 上 LocalEnvironment
++    # 的沙箱事实就是 Windows + Git Bash，改为加载方判断（_detect_os_shell）。
++    _os_name, _shell_name = _detect_os_shell()
+     return (
+         load_tool_prompt("bash")
+-        .replace("${os}", "linux")
+-        .replace("${shell}", "bash")
++        .replace("${os}", _os_name)
++        .replace("${shell}", _shell_name)
+         .replace("${default_timeout_ms}", str(default_timeout_s * 1000))
+         .replace("${max_timeout_ms}", str(max_timeout_s * 1000))
+         .replace("${max_output_lines}", str(max_output_lines))

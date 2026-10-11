@@ -67,135 +67,6 @@ except ImportError:  # cli/测试：app/agent 在 sys.path
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Windows 路径兼容 shim（mimo 原生 read/write/edit/glob/grep/bash）
-# ═══════════════════════════════════════════════════════════════
-#
-# 【根因】mimoagent 的 tools/mimocode/paths.py::resolve_path 只认 POSIX 绝对路径：
-#     if path.startswith("/"): return normpath(path)
-#     else: join(session_cwd, path)
-# Windows 的 `C:\xxx` / `\\server\share` 不走第一支 ⇒ 被当成相对路径拼到 cwd 后面，
-# 得到 "C:\Temp\tmpXXX/C:\Temp\tmpXXX/demo.txt" 这种鬼东西 ⇒ 原生 write/read 在
-# Windows 上**只要传绝对路径就必炸 FileNotFoundError**（smoke test 6 即此，改前必现）。
-# 而生产环境进程 cwd 是 backend_api_python，模型从 bash 的 pwd 拿到的一定是
-# `D:\...` 绝对形式 ⇒ 这不是测试问题，是 Windows 上的实盘缺陷。
-#
-# 【为什么是 shim 而不是改包】mimoagent 是第三方依赖，改 site-packages 不可持续。
-# 各消费模块是 `from ...paths import resolve_path`（**按值绑定**），只改 paths 模块
-# 属性无效 ⇒ 需要在 paths 与 6 个消费模块上同时重绑。收敛在本函数，一处可回滚。
-def _install_windows_path_shim() -> None:
-    import ntpath
-    import importlib
-
-    try:
-        from mimoagent.tools.mimocode import paths as _paths
-    except Exception:
-        return
-    if getattr(_paths, "_qd_win_shim", False):
-        return
-    _orig = _paths.resolve_path
-
-    def _resolve_path(path: str, context) -> str:
-        p = str(path)
-        # Windows 绝对形态：盘符（C:\ 或 C:/）与 UNC（\\host\share）→ 原样规范化
-        if ntpath.isabs(p) or p.startswith("\\\\"):
-            return ntpath.normpath(p)
-        return _orig(p, context)
-
-    _paths.resolve_path = _resolve_path
-    for _mod in ("bash", "edit", "glob", "grep", "read", "write"):
-        try:
-            m = importlib.import_module(f"mimoagent.tools.mimocode.{_mod}")
-            if hasattr(m, "resolve_path"):
-                m.resolve_path = _resolve_path
-        except Exception:
-            continue
-    _paths._qd_win_shim = True
-
-
-_install_windows_path_shim()
-
-
-# ═══════════════════════════════════════════════════════════════
-#  Windows shell 工具链 shim（mimo 原生 read/write/edit/bash/grep/glob）
-# ═════════════════════════════════════════════════════════════
-#
-# 【根因】mimo 原生工具的 execute 全部经 LocalEnvironment.execute →
-#   subprocess.run(command, shell=True) → Windows 上走 cmd.exe，而命令是 POSIX 形态
-#   （`[ -f ]`、`cat`、`find`、`grep`…）。这些命令只有「进程 PATH 挂了 Git-Bash 的
-#   POSIX 工具（`[.exe`/`cat.exe`…）」时才能跑通；否则 cmd.exe 不认 `[ -f ]` ⇒
-#   verify 步骤失败 ⇒ 工具误报 `Failed to write file`（2026-10-11 真实 run 即此）。
-#   开发机交互 shell 有 Git-Bash 故正常，但 backend 服务进程未必继承完整 PATH
-#   （服务/IDE 启动方式不同）→ 实盘炸。
-#
-# 【修复＝方案 B】把 Git 的 `usr\bin`/`bin` 前置到进程 PATH，让现有的
-#   shell=True(cmd.exe)→MSYS 工具链畅通，与开发机行为完全一致。
-#   **保留 MSYS 的 Windows 反斜杠路径转换**（mimo 命令里常内嵌 `C:\...` 绝对路径，
-#   test_6 即依赖它）——这是不能改用 `bash -c` 包裹的根因（见下）。
-#
-# 【方案 A 为何弃用】早先设想「让 LocalEnvironment 显式走 `bash -c`」以避免依赖
-#   cmd.exe 碰巧捞到 `[.exe`。但实证：`bash -c "<cmd>"` 会先让 bash 自身处理反斜杠
-#   转义，把 `C:\Users\x` 里的 `\U`/`\x` 吃掉 ⇒ MSYS 拿到的路径已残缺 ⇒ 比 cmd.exe
-#   更糟（test_6 直接挂）。根因就是 PATH 缺 Git，补 PATH 即根治，不碰命令机制。
-#
-# 【为何是 shim 而非改包】mimoagent 是第三方依赖，且只需在 Windows 上一次性把 Git
-#   工具链塞进进程环境，一处可回滚；与上方路径 shim 同口径。
-def _locate_git_bin_dirs() -> List[str]:
-    """定位 Git for Windows 的 POSIX 工具目录（usr/bin + bin），按存在性返回。"""
-    import shutil
-    candidates: List[str] = []
-    # 1) 当前 PATH 已能 which 到 bash ⇒ 直接用其邻近目录（最准）
-    _bash = shutil.which("bash")
-    if _bash:
-        _bdir = os.path.dirname(os.path.abspath(_bash))
-        candidates.append(_bdir)                              # …\Git\bin
-        candidates.append(os.path.join(os.path.dirname(_bdir), "usr", "bin"))
-    # 2) 常见安装位置兜底
-    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
-    prog86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    for base in (prog, prog86, r"C:\msys64", r"C:\scoop\apps\git\current"):
-        candidates.append(os.path.join(base, "Git", "usr", "bin"))
-        candidates.append(os.path.join(base, "Git", "bin"))
-        candidates.append(os.path.join(base, "usr", "bin"))
-        candidates.append(os.path.join(base, "bin"))
-    seen: set = set()
-    out: List[str] = []
-    for d in candidates:
-        d = os.path.normpath(d)
-        if d in seen:
-            continue
-        seen.add(d)
-        if os.path.isdir(d) and os.path.exists(os.path.join(d, "cat.exe")):
-            out.append(d)
-    return out
-
-
-def _install_windows_shell_shim() -> None:
-    if os.name != "nt":
-        return
-    if getattr(_install_windows_shell_shim, "_done", False):
-        return
-    dirs = _locate_git_bin_dirs()
-    if not dirs:
-        logger.warning(
-            "[qd_agent] 未找到 Git for Windows 的 POSIX 工具链（cat.exe）；"
-            "mimo 原生 read/write/bash 在 Windows 上可能误报失败。"
-            "请确认已安装 Git for Windows 或将其 usr\\bin 加入系统 PATH。")
-        _install_windows_shell_shim._done = True
-        return
-    cur = os.environ.get("PATH", "")
-    parts = cur.split(os.pathsep)
-    add = [d for d in dirs if d not in parts]
-    if add:
-        os.environ["PATH"] = os.pathsep.join(add + parts)
-        logger.info("[qd_agent] 已将 Git POSIX 工具链前置到进程 PATH：%s",
-                    os.pathsep.join(add))
-    _install_windows_shell_shim._done = True
-
-
-_install_windows_shell_shim()
-
-
-# ═══════════════════════════════════════════════════════════════
 #  增强版 system template（mimo 原版基座句 + 金融域纪律）
 # ═══════════════════════════════════════════════════════════════
 
@@ -268,7 +139,9 @@ _DENY_PATH_RE = re.compile(
 
 _DENY_CMD_RE = re.compile(
     r"(\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r|\bmkfs\b|\bdd\s+if=|\bshred\b"
-    r"|\bwipefs\b|/dev/sd|>\s*/dev/|\bvisudo\b|\bcrontab\b|\b(useradd|usermod|passwd)\b"
+    # (?!null\b)：`2>/dev/null` 是无害重定向（日志中 `which ... 2>/dev/null`
+    # 被误拒），只拦写设备（/dev/sda 等）；/dev/sd 分支不受影响。
+    r"|\bwipefs\b|/dev/sd|>\s*/dev/(?!null\b)|\bvisudo\b|\bcrontab\b|\b(useradd|usermod|passwd)\b"
     r"|chmod\s+.*authorized_keys|chown\s+.*authorized_keys"
     r"|\bsystemctl\s+(enable|disable)\b|curl[^|]*\|\s*(ba)?sh|wget[^|]*\|\s*(ba)?sh)",
     re.IGNORECASE,
@@ -920,6 +793,11 @@ class QDAgent(MimocodeAgent):
     # ── 工具注册：mimo 原版 lowercase 目录 + FnToolAdapter 函数工具 ─────
     def _build_tool_registry(self) -> MimocodeToolRegistry:
         registry = super()._build_tool_registry()  # bash/read/write/edit/grep/glob/task/compact
+
+        # 注：Windows 兼容性由 **mimoagent 源码补丁**统一解决
+        # （patches/mimoagent_windows.patch：paths/local/ripgrep 三件），qd_agent 不再
+        # 挂任何执行层 shim；此处不替换任何工具实例 —— 保持 mimoagent 原版工具
+        # 逐字节生效，避免重写工具契约（上游升级即漂移）。
         for fn, domain in self._collect_tool_functions():
             tool = FnToolAdapter(fn, domain=domain)
             if self.config.tool_whitelist and tool.name not in self.config.tool_whitelist:
