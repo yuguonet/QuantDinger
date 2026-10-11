@@ -666,7 +666,10 @@ def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
             try:
                 # 判定委托 `scan_days` 折叠内核 (驱动路径唯一)。
                 # lo=hi=target ⇒ 只判当日, 语义 == scan_signals(bars[:target+1])。
+                # stock_info 透传 (2026-10-11): v1 门③(流通市值)/turnover_anchor 依赖
+                # 它; 此前漏传 ⇒ 门③实盘失效 (回测有传), 实盘/回测口径分叉。
                 sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target,
+                                       stock_info=stock_info.get(code),
                                        **strat_reg.params_override(key))
             except Exception as e:
                 # 2026-10-07 (P2): 原为 DEBUG —— 生产 INFO 级别下**策略整静默**
@@ -770,7 +773,9 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
         if key in direct:
             for code, bars in bars_by_code.items():
                 try:
-                    sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target, **params)
+                    # stock_info 透传 (2026-10-11): 与旧 writer/回测同口径, v1 门③生效。
+                    sigs = strat.scan_days(bars, code, lo_date=target, hi_date=target,
+                                           stock_info=stock_info.get(code), **params)
                 except Exception as e:              # noqa: BLE001 - 与旧路径同级容忍
                     _n = err_by_key.get(key, 0) + 1
                     err_by_key[key] = _n

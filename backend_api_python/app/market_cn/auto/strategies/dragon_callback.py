@@ -841,7 +841,13 @@ class DragonCallbackStrategy(StrategyBase):
                                        circ, total)
             extra.update(build_signal(ctx_d, spec))
             return Progress(stage="ready", date=str(bar.get("time", "")), payload={
-                "price": round(c_i, 3), "score": 0, "label": "龙回头",
+                # ★ 2026-10-11 L-14: score 由恒 0 改为 tech_score —— 与 quality_key 的
+                #   首元素**同源**（截断键 row["score"] 降序 ↔ monitor 名额排序 tech_score 优先），
+                #   消灭「score=0 ⇒ daily_limit 截断按入库顺序任意」的双口径。
+                #   口径变更登记：dragon daily_limit=5 的截断从「任意」变「tech_score 降序」。
+                "price": round(c_i, 3),
+                "score": round(float(extra.get("tech_score") or 0), 1),
+                "label": "龙回头",
                 "extra": extra, "close_raw": c_i,
                 "lu_abs": rec["idx"], "i_abs": today_abs,
             }, next_realtime="09:25")
@@ -1200,7 +1206,9 @@ def _scan_one(spec, ev, bars, i, board_type, stock_info):
     extra = _dragon_extra_base(code, bars[lu_idx]["time"], i - lu_idx, c_i,
                                last_chg, entry_vol_r, lu_vol, circ, total)
     extra.update(feats)
-    return Signal(code=code, time=str(d0["time"])[:10], score=0,
+    # ★ 2026-10-11 L-14: score 与折叠路径同源 = tech_score（详见 _signal 内注释）
+    return Signal(code=code, time=str(d0["time"])[:10],
+                  score=round(float(extra.get("tech_score") or 0), 1),
                   price=round(c_i, 3), label="龙回头", extra=extra)
 
 

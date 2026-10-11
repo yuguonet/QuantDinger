@@ -24,9 +24,10 @@
 """
 from __future__ import annotations
 
-from app.market_cn.auto.sampler import build_day_sample
-
-from app.market_cn.auto.core.market import get_board_name, get_board_type, is_limit_up
+from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.market import (
+    get_board_name, get_board_type, is_limit_up, limit_up_price,
+)
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -113,7 +114,11 @@ class V1Strategy(StrategyBase):
         if i < 2:
             return result
         board_type = get_board_type(code)
-        threshold = 0.098 if board_type == "main" else 0.198
+        # ★ 2026-10-11 N-2 收敛: 原 `threshold = 0.098 if main else 0.198` 内联阈值已删——
+        #   涨停幅度是**市场事实**, 统一走 `market.is_limit_up`（检测）与
+        #   `market.limit_up_price` + `exec.fill_blocked_by_limit_up`（可买性, 唯一实现）。
+        #   现值语义逐位不变 (门0 = 旧 threshold*0.98 = is_limit_up 的 up_eff;
+        #   门1/竞价 = 旧 gap>=threshold = 严格达到名义涨停价才拒)。
         # === 门0: 板块过滤 (only_main=True 只做主板 —— 实证主板高开单位优势 ≫ 创业板) ===
         if p.get("only_main") and board_type != "main":
             return result
@@ -134,14 +139,14 @@ class V1Strategy(StrategyBase):
         else:
             _tr = None
 
-        if (d0["close"] / d_1["close"] - 1) < threshold * 0.98:
+        if not is_limit_up(d0["close"], d_1["close"], board_type):
             if _tr:
                 _tr("lu", d0_pct_chg=round((d0["close"] / d_1["close"] - 1) * 100, 2))
             return result
 
         # === 门1: 非一字可买 —— D0 开盘 < 涨停价 (排除一字/开盘即封消息股, D1 才买得进) ===
         open_pct = (d0["open"] / d_1["close"] - 1) * 100
-        if open_pct >= threshold * 100:
+        if fill_blocked_by_limit_up(d0["open"], limit_up_price(d_1["close"], board_type)):
             if _tr:
                 _tr("buyable", open_pct=round(open_pct, 2))
             return result
@@ -236,10 +241,10 @@ class V1Strategy(StrategyBase):
         gap = (open_px / prev_close - 1) * 100
         gap_min_high = float(p.get("gap_min_high", 8.0))
         board_type = get_board_type(row.get("code", ""))
-        threshold = 0.098 if board_type == "main" else 0.198
+        # ★ 2026-10-11 N-2: 涨停可买性统一走唯一实现 (旧 threshold 内联已删, 语义不变)
         if gap < gap_min_high:
             return EntryDecision(False, f"gap={gap:.2f}%<高开线{gap_min_high}%")
-        if gap >= threshold * 100:
+        if fill_blocked_by_limit_up(open_px, limit_up_price(prev_close, board_type)):
             return EntryDecision(False, f"gap={gap:.2f}% 一字开盘不可买")
         return EntryDecision(True, f"gap={gap:.2f}% 高开可买")
 
@@ -318,16 +323,22 @@ class V1Strategy(StrategyBase):
     #   (scan_signals→U1~U4→D1 开盘买→exit_decision 收盘重放); 此后未迁移折叠契约的策略
     #   该回测入口直接 NotImplementedError。V1 当时未迁折叠契约 ⇒ 官方 CLI
     #   (tools.replay / core.backtest) 调 V1 即断。
-    # 本覆写**行为零改**: 复用 V1 既有 scan_signals + entry_decision(竞价 gate) +
+    # 本覆写判定/决策/出场零改: 复用 V1 既有 scan_signals + entry_decision(竞价 gate) +
     #   _run_backtest(出场引擎, 含 D1 动量<3%→D2 开盘清仓), 与单测 harness 逐笔验证的
     #   V1 自有链路同源。仅为 V1 自持的回测包装 —— 不引入第二套通用引擎 (base 已明确
     #   不为非折叠策略提供兜底), 也不动任何信号/决策/出场逻辑。
+    #   2026-10-11 口径对齐: 信号池接入 U1~U4 (use_prefilter=True 缺省开, 与实盘 scan
+    #   行构建同层同参)。此前回测池比实盘宽 —— U2 换手≥3% 实盘滤、回测不滤 (10-09
+    #   实证: 判定 9 票, 实盘 U1~U4 后落库 5), 胜率数字对实盘信号池失真; 门③(市值)两侧
+    #   本就生效 (run_all 传单票 stock_info, 此处透传给 scan_signals)。
     def backtest_stock(self, bars, code, stock_info=None, use_prefilter=True, probe=None):
         """V1 日线回测 (daily_close 类) — 经官方 CLI 跑通。
 
         枚举每个候选 D0 (as_of) → 竞价 gate(相对 D0 收盘的开盘 gap) → D1 开盘买入 →
         _run_backtest 出场(止损-10 / 追踪-5 / 到期 7 / D1 未涨停→D2 开盘清仓, 均受 T+1 约束)。
         持仓期内跳过新信号 (不重叠建仓)。出场参数取自 self.params() (yaml 事实源)。
+        use_prefilter=True (缺省) 时信号池过 U1~U4, 与实盘 scan 同口径 (锚=D0 截断窗
+        末根, 与生产 "bars 止于 target" 同形); False 供研究侧对照宽池。
         """
         if self.scan_spec.kind != "daily_close":
             return None
@@ -344,6 +355,13 @@ class V1Strategy(StrategyBase):
             sigs = self.scan_signals(bars, code, as_of=as_of, stock_info=stock_info) or []
             if not sigs:
                 continue
+            if use_prefilter:
+                # 惰性导入避免 strategies → scan 的模块环; 锚=截断窗末根 (=D0)。
+                from app.market_cn.auto.scan import apply_unified_prefilter
+                sigs, _ = apply_unified_prefilter(sigs, bars[:as_of + 1], code,
+                                                  stock_info, self)
+                if not sigs:
+                    continue
             sig = sigs[0]
             entry_idx = as_of + 1
             if entry_idx >= n:
@@ -406,13 +424,10 @@ class V1Strategy(StrategyBase):
 # ================================================================
 # 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
 # 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
+# ★ 2026-10-11 死 import 清理 (pyflakes): 原顶层导入的 fill_blocked_by_limit_dn /
+#   fill_on_gap / is_one_word_limit_dn / _limit_dn_price 从未被本文件引用——
+#   出场成交由出场引擎内部消费 exec 原语, 本文件不需要顶层导入, 已删。
 # ================================================================
-from app.market_cn.auto.core.exec import (
-    fill_blocked_by_limit_dn,
-    fill_on_gap,
-    is_one_word_limit_dn,
-    limit_dn_price as _limit_dn_price,
-)
 
 
 def _run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None, let_profits_run=False):

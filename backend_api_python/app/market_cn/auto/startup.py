@@ -534,40 +534,44 @@ def _rebuild_worker(why, fingerprint=None):
       结算时点), 且自 A2 起四元组解包必崩。Record 切片的事件链已含完整
       lifecycle (ready→exec→exit), `store.load_projection` 直推即得 买入/持有/卖出。
     """
+    scan_ok = True
     try:
         from app.market_cn.auto.scan import run_scan
         logger.info("[auto_startup] 补扫当日 (%s)", why)
         stat = run_scan(days=320, wait_data=True, max_wait_sec=_RESCAN_MAX_WAIT_SEC)
         logger.info("[auto_startup] 补扫完成 (%s): %s", why, stat)
-        # P1-2: 扫描被互斥跳过 / 数据未就绪 → 不能进 rebuild (会基于旧应然集误写)
+        # P1-2: 扫描被互斥跳过 / 数据未就绪 → 不能进 rebuild (会基于旧应然集误写)。
+        # 2026-10-11: 不再 raise _RebuildIncomplete 穿出线程 (daemon 未捕获异常 +
+        # 跳过下方指纹日志), 改置 scan_ok=False → 走既有 done=False 优雅路径
+        # (打「指纹不推进, 下次启动会重试」警告, 不落快照)。语义与原 raise 等价。
         if isinstance(stat, dict) and stat.get("status") in ("busy", "data_not_ready"):
-            raise _RebuildIncomplete(f"run_scan status={stat.get('status')}")
-    except _RebuildIncomplete:
-        raise
+            logger.warning("[auto_startup] 补扫 status=%s → 跳过投影刷新 (P1-2)", stat.get("status"))
+            scan_ok = False
     except Exception as e:
         logger.warning("[auto_startup] 补扫失败 (不影响重建): %s", e)
 
     done, calibrated_for = False, None
-    try:
-        from app.market_cn.auto import rebuild as _rb
-        logger.info("[auto_startup] 投影刷新开始 (window=%d, %s)", _REBUILD_WINDOW, why)
-        t0 = time.time()
-        # P5-⑤-1 (2026-10-08): 投影刷新替代 build_expected + replay_ledger。
-        # 源 = store.load_projection (Record 事件链直推 lifecycle)。回滚 = 还原本段
-        # 调回 build_expected/replay_ledger/build_ledger_plan/apply_ledger_plan 四连。
-        plan, rstat = _rb.projection_ledger_refresh(window=_REBUILD_WINDOW, dry_run=False)
-        if plan is None:
-            err = (rstat or {}).get("error") or "投影刷新无计划"
-            logger.warning("[auto_startup] 投影刷新跳过: %s (指纹不推进, 下次启动会重试)", err)
-            raise _RebuildIncomplete(err)
-        logger.info("[auto_startup] 投影刷新完成 (%.0fs): %s",
-                    time.time() - t0, rstat)
-        done = True
-        calibrated_for = (plan.get("projection_meta") or {}).get("win_to")
-    except _RebuildIncomplete:
-        pass
-    except Exception as e:
-        logger.warning("[auto_startup] 投影刷新失败 (不影响启动): %s", e)
+    if scan_ok:
+        try:
+            from app.market_cn.auto import rebuild as _rb
+            logger.info("[auto_startup] 投影刷新开始 (window=%d, %s)", _REBUILD_WINDOW, why)
+            t0 = time.time()
+            # P5-⑤-1 (2026-10-08): 投影刷新替代 build_expected + replay_ledger。
+            # 源 = store.load_projection (Record 事件链直推 lifecycle)。回滚 = 还原本段
+            # 调回 build_expected/replay_ledger/build_ledger_plan/apply_ledger_plan 四连。
+            plan, rstat = _rb.projection_ledger_refresh(window=_REBUILD_WINDOW, dry_run=False)
+            if plan is None:
+                err = (rstat or {}).get("error") or "投影刷新无计划"
+                logger.warning("[auto_startup] 投影刷新跳过: %s (指纹不推进, 下次启动会重试)", err)
+                raise _RebuildIncomplete(err)
+            logger.info("[auto_startup] 投影刷新完成 (%.0fs): %s",
+                        time.time() - t0, rstat)
+            done = True
+            calibrated_for = (plan.get("projection_meta") or {}).get("win_to")
+        except _RebuildIncomplete:
+            pass
+        except Exception as e:
+            logger.warning("[auto_startup] 投影刷新失败 (不影响启动): %s", e)
 
     # ★ 指纹只在**校准成功后**推进 (见模块 docstring "快照 = 已校准的凭据")。
     #   中途夭折 / 数据未就绪 都保持旧快照 ⇒ 下次启动同指纹仍会重跑, 不会永久漏补。

@@ -344,6 +344,8 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
     #   其余键 (干净判定后无信号) → 照旧删, 防参数/数据变化残留幽灵信号。
     # ⚠ 行值 NOT IN 依赖 PostgreSQL 行构造器比较 `(a,b,c) NOT IN ((..),(..))`;
     #   空集时省略子句 (SQL 里 `NOT IN ()` 非法), 语义等价「全不豁免」。
+    # ⚠ 传参必须是 **tuple** (2026-10-11 修复): psycopg2 把 list 适配成 ARRAY[...]
+    #   (语法错误), tuple 才适配成 ((..),(..)) 行值列表。sorted() 返回 list, 勿直接传。
     new_keys = sorted({(str(r.get("strategy") or DRAGON_STRATEGY), str(r["code"]),
                         str(r.get("style", "a")))
                        for r in rows if r.get("code")})
@@ -364,10 +366,10 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                     del_params = [trade_date, S_WATCH_PENDING, scope]
                     if new_keys:
                         del_sql += " AND (strategy, code, entry_style) NOT IN %s"
-                        del_params.append(new_keys)
+                        del_params.append(tuple(new_keys))
                     if skip_pairs:
                         del_sql += " AND (strategy, code) NOT IN %s"
-                        del_params.append(skip_pairs)
+                        del_params.append(tuple(skip_pairs))
                     cur.execute(del_sql, tuple(del_params))
                     purged = cur.rowcount
                 else:
@@ -455,7 +457,7 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                         json.dumps({"superseded_by": str(trade_date),
                                     "superseded_ts": time.strftime("%Y-%m-%d %H:%M:%S")},
                                    ensure_ascii=False, default=str),
-                        S_WATCH_PENDING, trade_date, new_keys,
+                        S_WATCH_PENDING, trade_date, tuple(new_keys),
                     ))
                     superseded = cur.rowcount
 

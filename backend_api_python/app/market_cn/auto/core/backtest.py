@@ -62,8 +62,9 @@ def run_all(strategy="dragon", days=300, codes=None, stock_info=None,
 
     strategy: 任意已注册策略 key。
       - daily_close 类: 逐票调 ``StrategyBase.backtest_stock``（薄壳 → core.replay 折叠,
-        与生产/调试/golden 同源）。``use_prefilter`` 与 ``probe`` 对此路径均为 no-op
-        (U1~U4/门已内联在策略 evaluate; 采样已迁实盘侧 sampler.LiveSampler)。
+        与生产/调试/golden 同源）。``probe`` 为 no-op (采样已迁实盘侧 sampler.LiveSampler);
+        ``use_prefilter`` 对薄壳 no-op (U1~U4/门已内联在策略 evaluate), 自定义覆写
+        (如 v1) 接它对齐实盘信号池 (2026-10-11)。
       - intraday_window 类 (tail/knife): **薄适配器 → IntradayFeed + core.replay**
         (与实盘/展示同判定路径, 见 run_all_intraday)。
     probe: 调试探针 (probe.Probe, None=关闭)。仅 intraday_window 路径使用, daily_close 忽略。

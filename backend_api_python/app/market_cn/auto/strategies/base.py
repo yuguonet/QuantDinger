@@ -140,6 +140,18 @@ def _has_fold_contract(strategy) -> bool:
     return True
 
 
+#: 逃生舱豁免名单（2026-10-11 复检 N-1）：启用但**有意**不迁折叠契约的策略。
+#: 设计依据：`.py` 插件是逃生舱（目标态 §3.1），未迁折叠不等于缺陷，但必须**登记**——
+#: 未登记的缺契约策略 = 生产判定路径断裂（record writer 只能靠「退回直判」+ ERROR 活着）。
+#: 消费方：tests/present/test_enable_switch（门禁）、tools/doctor（显式标注）。
+#: 清退条件：策略迁完折叠契约（init_state/step/evaluate）后**立即移出本名单**。
+FOLD_CONTRACT_EXEMPT: dict = {
+    "v1": ("2026-10-10 实证改造后回归（V1策略迭代与新策略实证_20261010.md）："
+           "自持回测 _run_backtest + scan_signals，未迁折叠契约；"
+           "record writer 下走「退回直判」分支（带 ERROR 日志），monitor 回退旧三决策。"),
+}
+
+
 @dataclass
 class ExitDecision:
     """出场判定 (monitor 60s tick / 回测重放): 持仓行今日是否离场"""

@@ -87,8 +87,15 @@ def scan_days_brief(strat, key, bars, code, days):
     hits = []
     last_reject = None
     scanned = 0
+    # stock_info 透传 (2026-10-11): 与生产判定同口径 (v1 门③/换手锚依赖);
+    # 加载失败不致命 (fail-soft, 与本工具风格一致), 仅门③缺省跳过。
     try:
-        sigs_all = strat.scan_days(bars, code) or []
+        from app.market_cn.auto.core.data.hub import stock_info as _hub_si
+        _si = (_hub_si() or {}).get(code)
+    except Exception:
+        _si = None
+    try:
+        sigs_all = strat.scan_days(bars, code, stock_info=_si) or []
         for s in sigs_all:
             hits.append({
                 "date": str(s.time)[:10],
@@ -102,7 +109,7 @@ def scan_days_brief(strat, key, bars, code, days):
         for i in range(lo, n):
             scanned += 1
             try:
-                sigs = strat.scan_signals(bars[:i + 1], code) or []
+                sigs = strat.scan_signals(bars[:i + 1], code, stock_info=_si) or []
             except Exception as e:
                 last_reject = {"date": str(bars[i]["time"])[:10], "err": str(e)}
                 continue

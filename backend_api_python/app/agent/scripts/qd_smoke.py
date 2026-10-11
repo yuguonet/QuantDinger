@@ -968,9 +968,11 @@ def test_24_tool_grading():
     check("必选层不含预选/lint 管线函数", not leaked, f"leaked={leaked}")
     check("管线模块公开面已全部登记 _NOT_TOOLS", (pub - set(_NOT_TOOLS)) == set(),
           f"未登记={sorted(pub - set(_NOT_TOOLS))}")
-    check("必选层仍保留真工具（发现/记忆/文件）",
-          {"search_tools", "list_tools", "activate_tools", "read_text", "recall"} <= common,
+    check("必选层仍保留真工具（发现/记忆）",
+          {"search_tools", "list_tools", "activate_tools", "recall"} <= common,
           str(sorted(common)))
+    # 注：文件读写能力已由 mimo 原生 read/write 承担（核心工具，不在 common 域），
+    # 由 test_6_native_mimo_capabilities 覆盖；filesystem_tools 已于 2026-10-11 退役。
     check("能力层来源域名一致", capability_domain() == "capability", capability_domain())
 
     # ② 能力层为空 ⇒ 目录不生成第二段（零 token、零幻觉空间）

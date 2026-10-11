@@ -42,7 +42,7 @@ from mimoagent.agents.base import TerminatingException
 # （MiMo Desktop 引擎：10KB 精调核心 prompt + task 子代理 + compact 上下文压缩
 #  + <context_usage> 预算感知 + AntiHackGuard + 入参 schema 硬校验）
 from mimoagent.agents.mimocode.mimocode_agent import (
-    MimocodeAgent, MimocodeAgentConfig, _CORE_PROMPT,
+    MimocodeAgent, MimocodeAgentConfig,
 )
 from mimoagent.tools.mimocode import MIMOCODE_CORE_TOOL_NAMES, MimocodeToolRegistry
 from mimoagent.tools.base import ToolOutput
@@ -116,13 +116,103 @@ _install_windows_path_shim()
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Windows shell 工具链 shim（mimo 原生 read/write/edit/bash/grep/glob）
+# ═════════════════════════════════════════════════════════════
+#
+# 【根因】mimo 原生工具的 execute 全部经 LocalEnvironment.execute →
+#   subprocess.run(command, shell=True) → Windows 上走 cmd.exe，而命令是 POSIX 形态
+#   （`[ -f ]`、`cat`、`find`、`grep`…）。这些命令只有「进程 PATH 挂了 Git-Bash 的
+#   POSIX 工具（`[.exe`/`cat.exe`…）」时才能跑通；否则 cmd.exe 不认 `[ -f ]` ⇒
+#   verify 步骤失败 ⇒ 工具误报 `Failed to write file`（2026-10-11 真实 run 即此）。
+#   开发机交互 shell 有 Git-Bash 故正常，但 backend 服务进程未必继承完整 PATH
+#   （服务/IDE 启动方式不同）→ 实盘炸。
+#
+# 【修复＝方案 B】把 Git 的 `usr\bin`/`bin` 前置到进程 PATH，让现有的
+#   shell=True(cmd.exe)→MSYS 工具链畅通，与开发机行为完全一致。
+#   **保留 MSYS 的 Windows 反斜杠路径转换**（mimo 命令里常内嵌 `C:\...` 绝对路径，
+#   test_6 即依赖它）——这是不能改用 `bash -c` 包裹的根因（见下）。
+#
+# 【方案 A 为何弃用】早先设想「让 LocalEnvironment 显式走 `bash -c`」以避免依赖
+#   cmd.exe 碰巧捞到 `[.exe`。但实证：`bash -c "<cmd>"` 会先让 bash 自身处理反斜杠
+#   转义，把 `C:\Users\x` 里的 `\U`/`\x` 吃掉 ⇒ MSYS 拿到的路径已残缺 ⇒ 比 cmd.exe
+#   更糟（test_6 直接挂）。根因就是 PATH 缺 Git，补 PATH 即根治，不碰命令机制。
+#
+# 【为何是 shim 而非改包】mimoagent 是第三方依赖，且只需在 Windows 上一次性把 Git
+#   工具链塞进进程环境，一处可回滚；与上方路径 shim 同口径。
+def _locate_git_bin_dirs() -> List[str]:
+    """定位 Git for Windows 的 POSIX 工具目录（usr/bin + bin），按存在性返回。"""
+    import shutil
+    candidates: List[str] = []
+    # 1) 当前 PATH 已能 which 到 bash ⇒ 直接用其邻近目录（最准）
+    _bash = shutil.which("bash")
+    if _bash:
+        _bdir = os.path.dirname(os.path.abspath(_bash))
+        candidates.append(_bdir)                              # …\Git\bin
+        candidates.append(os.path.join(os.path.dirname(_bdir), "usr", "bin"))
+    # 2) 常见安装位置兜底
+    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
+    prog86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    for base in (prog, prog86, r"C:\msys64", r"C:\scoop\apps\git\current"):
+        candidates.append(os.path.join(base, "Git", "usr", "bin"))
+        candidates.append(os.path.join(base, "Git", "bin"))
+        candidates.append(os.path.join(base, "usr", "bin"))
+        candidates.append(os.path.join(base, "bin"))
+    seen: set = set()
+    out: List[str] = []
+    for d in candidates:
+        d = os.path.normpath(d)
+        if d in seen:
+            continue
+        seen.add(d)
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, "cat.exe")):
+            out.append(d)
+    return out
+
+
+def _install_windows_shell_shim() -> None:
+    if os.name != "nt":
+        return
+    if getattr(_install_windows_shell_shim, "_done", False):
+        return
+    dirs = _locate_git_bin_dirs()
+    if not dirs:
+        logger.warning(
+            "[qd_agent] 未找到 Git for Windows 的 POSIX 工具链（cat.exe）；"
+            "mimo 原生 read/write/bash 在 Windows 上可能误报失败。"
+            "请确认已安装 Git for Windows 或将其 usr\\bin 加入系统 PATH。")
+        _install_windows_shell_shim._done = True
+        return
+    cur = os.environ.get("PATH", "")
+    parts = cur.split(os.pathsep)
+    add = [d for d in dirs if d not in parts]
+    if add:
+        os.environ["PATH"] = os.pathsep.join(add + parts)
+        logger.info("[qd_agent] 已将 Git POSIX 工具链前置到进程 PATH：%s",
+                    os.pathsep.join(add))
+    _install_windows_shell_shim._done = True
+
+
+_install_windows_shell_shim()
+
+
+# ═══════════════════════════════════════════════════════════════
 #  增强版 system template（mimo 原版基座句 + 金融域纪律）
 # ═══════════════════════════════════════════════════════════════
 
 def _load_system_template() -> str:
-    """mimo 原版 _CORE_PROMPT（行为基座）+ 金融域覆盖层（后置，指令晚者优先）。"""
-    p = Path(__file__).resolve().parent / "prompts" / "qd_system.txt"
-    return _CORE_PROMPT + "\n\n---\n\n" + p.read_text(encoding="utf-8").strip()
+    """精简 Agent 行为基座 + 金融域覆盖层（后置，指令晚者优先）。
+
+    2026-10-11 token 瘦身：原先直接复用 mimoagent 的 `_CORE_PROMPT`
+    （mimocode_core.txt，9948 字符 ≈ 4960 tokens/轮），其大半是"写代码/重构/
+    开 dev server"等**软件工程指令**，与 A 股研究助手无关，却是每轮必发的固定死重。
+    改用本项目自有精简基座 `prompts/qd_core_base.txt`（≈900 字符），只保留真正
+    影响工具循环的行为（上下文有限/注入防御/原生工具清单/优先专用工具/
+    工具结果当数据/{{cwd}}）；金融纪律仍由 qd_system.txt 后置覆盖。
+    """
+    here = Path(__file__).resolve().parent / "prompts"
+    base = (here / "qd_core_base.txt").read_text(encoding="utf-8").strip()
+    layer = (here / "qd_system.txt").read_text(encoding="utf-8").strip()
+    return base + "\n\n---\n\n" + layer
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -659,8 +749,18 @@ class QDAgent(MimocodeAgent):
             logger.debug("[preselect] 共现排序跳过(fail-open): %s: %s",
                          type(e).__name__, e)
 
+        # 2026-10-11 预选目录瘦身：能力层（低优先级，本就"域内无覆盖才用"）不再逐个
+        # 列进目录（40 行 name|desc|params ≈ 2900 字符，每轮白发）。能力层工具运行时
+        # 经核心层 `call_capability`/`search_capabilities` 按名可达，不影响执行；只留一行
+        # 指针，防止 PRESELECT_SYSTEM「目录找不到就删交付要素」误删需能力层的交付项。
+        # ★ build_catalog_grouped 契约不动（能力层传入仍出第二段）——改的只是这里的调用。
         catalog, names = build_catalog_grouped(
-            self._defs_by_name, dom_names, cap_names)
+            self._defs_by_name, dom_names, [], max_desc=60)
+        if cap_names:
+            catalog += (
+                f"\n\n（能力层另有 {len(cap_names)} 个低优先级函数，运行时经 "
+                f"`call_capability`/`search_capabilities` 按名调用。**因域内工具无法覆盖"
+                f"而需依赖能力层的交付要素请照常保留**，不要因为不在下方目录就删除。）")
         report["catalog_size"] = len(names)
         if not names:
             report["reason"] = "目录为空"

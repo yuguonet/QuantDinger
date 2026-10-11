@@ -275,7 +275,10 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
     for code, bars in bars_map.items():
         for key, strat in active.items():
             try:
-                sigs = strat.scan_days(bars, code, lo_date=lo, hi_date=hi)
+                # stock_info 透传 (2026-10-11): 与 scan 直判同口径, v1 门③(市值)/
+                # 换手锚在历史重建中同样生效 (此前漏传 ⇒ 重建口径比实盘宽)。
+                sigs = strat.scan_days(bars, code, lo_date=lo, hi_date=hi,
+                                       stock_info=stock_info.get(code))
             except Exception as e:
                 _n = err_by_key.get(key, 0) + 1
                 err_by_key[key] = _n

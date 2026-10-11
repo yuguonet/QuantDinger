@@ -288,10 +288,19 @@ def replay_ready_days(days=320, window=60, keys=None, limit=None, root=None,
     # 「signals 零差异」的行级版本；只比日期集合会漏掉 payload 分叉）。
     prod: dict[tuple, dict] = {}
     errors = []
+    try:
+        from app.market_cn.auto.core.data.hub import stock_info as _hub_si
+        _si_map = _hub_si() or {}
+    except Exception as e:                                  # noqa: BLE001
+        logger.warning("[回放影子] stock_info 加载失败(%s) — 门③口径降级", e)
+        _si_map = {}
     for code, bars in bars_map.items():
         for key, strat in active.items():
             try:
-                sigs = strat.scan_days(bars, code, lo_date=lo, hi_date=hi) or []
+                # stock_info 透传 (2026-10-11): 生产侧必须镜像生产实参 (scan 直判
+                # 已传), 否则 v1 门③在此侧缺省 ⇒ 对账失去意义。
+                sigs = strat.scan_days(bars, code, lo_date=lo, hi_date=hi,
+                                       stock_info=_si_map.get(code)) or []
             except Exception as e:                          # noqa: BLE001 - 单票不拖垮全局
                 errors.append(f"{key}:{code} {type(e).__name__}: {e}")
                 continue

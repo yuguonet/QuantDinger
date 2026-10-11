@@ -7,7 +7,7 @@
   1. name/description/parameters ← func_to_openai_schema(func)
      （docstring 的 Returns: 段是返回结构契约真源，2026-09-21 收束后不再采样）
   2. 返回值序列化 ← ToolResult.to_str()（现行 token 最省格式：扁平 dict 逐行
-     k:v、表形 TSV、嵌套缩进 JSON）
+     k:v、表形/嵌套统一 TSV 或点路径键值，彻底去 JSON 冗余）
   3. requires_confirm ← 签名带 `confirm` 参数的工具（trading_tools 人工确认闸），
      由 QDAgent 的 ActionInterceptor 消费；函数内 confirm 硬闸保留（双保险）
 
