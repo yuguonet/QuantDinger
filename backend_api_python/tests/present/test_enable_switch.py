@@ -162,3 +162,20 @@ def test_daily_close_without_fold_contract_is_exposed():
             pass
         assert _has_fold_contract(_NoContract()) is False, \
             "_has_fold_contract 认不出缺契约者 ⇒ ①②恒真 = 假绿"
+
+
+def test_fold_exempt_entries_are_structured():
+    """逃生舱条目必须带 ticket + expires（2026-10-12 §13.1 A-2：豁免不得无到期）。
+
+    只卡**结构**（有工单、有到期日、日期可解析）；逾期本身不 FAIL——
+    到期即红会让门禁变成闹钟，可见性由 doctor 的 WARN 承担（豁免体检逐条输出）。
+    """
+    from app.market_cn.auto.strategies.base import FOLD_CONTRACT_EXEMPT, exemption_report
+    assert FOLD_CONTRACT_EXEMPT, "名单为空？删除本测试前请确认策略已全部迁折叠契约"
+    for ent in exemption_report():
+        assert ent["ticket"], "%s 豁免无 ticket（迁移工单）" % ent["key"]
+        assert ent["expires"], "%s 豁免无 expires（豁免不得无到期）" % ent["key"]
+        assert ent["reason"], "%s 豁免无 reason" % ent["key"]
+        if ent["expired"]:
+            print("[warn] 逃生舱 %s 已到期 %s（%s）—— 迁移工单：%s"
+                  % (ent["key"], ent["expires"], ent["days_left"], ent["ticket"]))

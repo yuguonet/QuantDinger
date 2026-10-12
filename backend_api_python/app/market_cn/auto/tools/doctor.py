@@ -124,6 +124,24 @@ def check_static(findings, only=None):
                  "逃生舱豁免 (已登记 FOLD_CONTRACT_EXEMPT; 生产走 scan 退回直判+ERROR / "
                  "rebuild 排除出投影集 / monitor 旧三决策, 回测走策略自持入口): "
                  + ", ".join(sorted(exempt)))
+            # 2026-10-12 A-2: 豁免不是"没问题"，是"有意缺了什么" —— 逐条列出缺视图与到期
+            try:
+                from app.market_cn.auto.strategies.base import exemption_report
+                for ent in exemption_report():
+                    if ent["key"] not in set(exempt):
+                        continue
+                    views = ",".join(ent["missing_views"]) or "—"
+                    tag = (f"逃生舱 {ent['key']}: 缺视图[{views}] "
+                           f"ticket={ent['ticket'] or '—'} expires={ent['expires'] or '无'}")
+                    if not ent["expires"]:
+                        _add(findings, WARN, "contract", tag + " —— 无到期日(豁免不得无到期)")
+                    elif ent["expired"]:
+                        _add(findings, WARN, "contract",
+                             tag + f" —— 已逾期 {-(ent['days_left'] or 0)} 天，迁移工单应开工")
+                    else:
+                        _add(findings, OK, "contract", tag + f" (剩 {ent['days_left']} 天)")
+            except Exception as _e2:
+                _add(findings, WARN, "contract", f"逃生舱体检不可用: {_e2}")
         if stale:
             _add(findings, WARN, "contract",
                  "FOLD_CONTRACT_EXEMPT 有陈旧登记 (key 已不存在, 请移出名单): "
