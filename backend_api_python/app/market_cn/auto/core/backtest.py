@@ -336,7 +336,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
 
     市场门 (knife 的 ``kc_mkt``): **逐槽 as-of** —— ``load_market_slots(lo_d, hi_d)``
       逐日建全市场分钟帧、按槽取横截面均涨幅，与生产 ``scan._mkt_gain`` 同口径
-      （消除「用当日收盘门控 14:56 入场」的前视）；缺该日则回退日频 ``mkt_map``
+      （消除「用当日收盘门控 14:50 入场」的前视）；缺该日则回退日频 ``mkt_map``
       （旧口径，仅兜底）。见 ``docs/市场门口径评估_20261009.md``。
       成本: 每窗口交易日 1 次全市场建帧（npz 缓存），随窗口长度线性增长。
 
@@ -374,7 +374,7 @@ def run_all_intraday(strat, days=120, codes=None, start_date=None, end_date=None
     # 市场门 (knife 的 mkt_gate) —— **两层**（2026-10-09 评估后收口）:
     #   ① **逐槽 as-of（正解）** = `load_market_slots`: 每个决策槽读**当时**的全市场
     #      横截面（与生产 `scan._mkt_gain(snaps)` / `MinuteFrame.mkt_gain` 同口径）——
-    #      消除「用当日收盘门控 14:56 入场」的单向**前视**（见 docs/市场门口径评估_20261009.md）。
+    #      消除「用当日收盘门控 14:50 入场」的单向**前视**（见 docs/市场门口径评估_20261009.md）。
     #   ② **日频 close 横截面（回退）** = `mkt_map`: 仅当 ① 缺该日（取数失败/无分钟帧）时
     #      回落 —— 与旧口径一致，但保留前视（只作兜底，勿再当主源）。
     # ⚠ mkt_map 必须是**全市场**横截面 —— 票池为子集时按子集算会因样本不足 (<min_n)

@@ -95,7 +95,7 @@ def _d1_open(bars, entry_idx, entry_price, *, code, board_type, params, diag,
              stop_at_idx=None):
     """盘中窗口策略出场：次交易日(D1)开盘卖 —— 与 base.StrategyBase.intraday_exit 默认同语义。
 
-    (knife_catch / tail_oversold 的 14:56 尾盘买入 → D1 开盘卖；成交价=次交易日 open)。
+    (knife_catch / tail_oversold 的 14:50 尾盘买入 → D1 开盘卖；成交价=次交易日 open)。
 
     ⚠ `stop_at_idx` 对 D1 开盘模式无意义（出场固定为 D1 开盘，不存在重放截断），
       仅为满足 `run_exit` 的统一适配器签名而接收；非空则 fail-fast 暴露误接线。

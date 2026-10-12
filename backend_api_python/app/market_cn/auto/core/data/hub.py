@@ -60,7 +60,10 @@ from __future__ import annotations
 import json as _json
 import os as _os
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# P1 2026-10-12: 统一时钟口径 (北京时间), 与 store.today_str() 同源
+from app.market_cn.auto.store import TZ_CN, today_str
 
 from app.utils.logger import get_logger
 
@@ -98,7 +101,7 @@ def _fetch_snapshots_by_date(codes, date=None):
     if not codes:
         return {}
     from datetime import datetime
-    d = date or datetime.now().strftime("%Y-%m-%d")
+    d = date or today_str()
     try:
         pool = _snapshot_pool()
         with pool.connection() as conn:
@@ -225,7 +228,7 @@ def _query_batch_raw(market, symbols, timeframe, start_time=None, end_time=None)
     elif end_dt:
         years.add(end_dt.year)
     if not years:
-        years = {datetime.now().year}
+        years = {datetime.now(TZ_CN).year}
 
     out = {}
     pool = mgr._get_pool(market)
@@ -298,7 +301,7 @@ def daily_live(code, days=200, series=None, bars=None):
         series = _fetch_snapshots_by_date([code]).get(code)
     if not series:
         return None
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_str()
     if bars[-1]["time"] < today:
         bars.append(_synth_bar_from_series(series, today))
     return bars
@@ -322,9 +325,9 @@ def minute_1m(code, start=None, end=None, as_of=None, limit=100000):
     if end is not None and len(str(end)) == 10:
         end = str(end) + " 23:59:59"          # 防日期型 end 被 DB 层按 00:00 截掉最后一日
     if end is None:
-        end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        end = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
     if start is None:
-        start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        start = (datetime.now(TZ_CN) - timedelta(days=30)).strftime("%Y-%m-%d")
     start_wide = start
     if str(start)[:10] == str(end)[:10]:     # 单日区间 → 扩窗防空表
         start_wide = (datetime.strptime(str(end)[:10], "%Y-%m-%d")
@@ -574,7 +577,7 @@ def index_daily(code="000001", days=800, as_of=None, force=False):
     from datetime import datetime
     cached = _index_load_cache(code)
     fetch_days = min(max(days, 400), _INDEX_FETCH_CAP)
-    stale = (not cached) or cached[-1]["date"] < datetime.now().strftime("%Y-%m-%d")
+    stale = (not cached) or cached[-1]["date"] < today_str()
     if force or stale or len(cached) < days:
         try:
             from app.market_cn.index import get_index_daily_kline
@@ -731,7 +734,7 @@ def reconcile_daily_live(target=None, codes=None, sample=50):
             from app.utils.trading_calendar import last_finish_trading_day
             target = last_finish_trading_day()
         except Exception:
-            target = datetime.now().strftime("%Y-%m-%d")
+            target = today_str()
     if codes is None:
         cs = all_codes()
         random.seed(int(_time.time()))

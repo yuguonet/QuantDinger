@@ -38,7 +38,7 @@ def test_full_cycle_realtime_equals_preprocess(tmp_path):
         runner.run_day(s, CODE, bars[:i], None)
     rec = store.load(s.key, CODE)
     assert rec.current.stage == "watch"
-    assert rec.current.next_realtime == "14:56-15:00"
+    assert rec.current.next_realtime == "14:50-15:00"
 
     # 2) D0 14:56 实时：只挑规则进度到期的票
     rows_1456 = [r for r in rows if str(r["time"])[11:16] <= "14:56"]

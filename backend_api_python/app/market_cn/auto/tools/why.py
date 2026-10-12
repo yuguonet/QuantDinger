@@ -28,18 +28,9 @@ import sys
 
 
 def _load_env():
-    """2026-10-12 P2: 收口到官方锚点 `core._paths.load_env_first_found`（原手写副本已删）。
-
-    候选路径逐位保留原实现：cwd/.env → 4 级上溯/.env（`load_env_first_found` 内部
-    另有 `ENV_FILE` 兜底，找不到即静默跳过）。
-    """
-    try:
-        from app.market_cn.auto.core._paths import load_env_first_found
-        load_env_first_found(os.path.join(os.getcwd(), ".env"),
-                             os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                                 os.path.dirname(os.path.abspath(__file__))))), ".env"))
-    except Exception:
-        pass
+    # P0 搬移 2026-10-12: 收口到 tools/common.py::load_env
+    from app.market_cn.auto.tools.common import load_env
+    load_env()
 
 
 _ALIAS = {"dragon": "dragon_callback", "dragon2": "dragon_v2", "break_buy": "break"}

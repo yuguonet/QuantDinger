@@ -408,18 +408,29 @@ class BreakStrategy(StrategyBase):
 
     # ---- 结算事件（P3 §2.6c：break 事件链完备化，仅 stateful 触发）----
     def _exec_event(self, state: dict, inp: DayInput, prev) -> list:
-        """prev=ready 且今日为 D1 ⇒ 产 exec（入场价 = 今日开盘，对齐旧 backtest_stock）。
+        """prev=ready 且今日为 D1 ⇒ 产 exec（入场价 = entry.price 基准, 默认 open）。
 
         旧 `backtest_stock` 的入场段只拦 `entry_price <= 0`（无 gap 门），此处同口径。
         """
         bar = inp.bar            # (code 未用: exec 载荷不带 code, 由 build_trade 统一注入)
-        entry_price = float(bar.get("open") or 0)
+        from app.market_cn.auto.strategies.base import entry_fill_price, entry_gap_ok
+        entry_price = entry_fill_price(self.entry_spec(), bar)
         if entry_price <= 0:
             return []
-        # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实非策略规则): D1 开盘封死涨停
-        #   → 物理买不进, exec 带 buyable=False (消费方 replay/monitor/store 均已认此旗)。
+        # ★ entry.gap_min/gap_max 通用过滤 (D2 极小 schema): 与 monitor 同口径
         win_s = state.get("win") or []
         prev_c = float(win_s[-1]["c"]) if win_s else 0.0
+        if prev_c > 0:
+            gap_pct = (entry_price / prev_c - 1) * 100
+            if not entry_gap_ok(self.entry_spec(), gap_pct):
+                return [Progress(stage="exec", date=str(bar.get("time", "")), payload={
+                    "entry_date": str(bar.get("time", ""))[:10],
+                    "entry_price": entry_price,
+                    "entry_idx": state["abs_i"] + 1,
+                    "buyable": False,       # gap 越界不入场 (与 monitor entry_gap_ok 同旗标)
+                }, next_realtime="15:01")]
+        # ★ 涨停阻买 (2026-10-10 审计 #8-2, 市场事实非策略规则): D1 开盘封死涨停
+        #   → 物理买不进, exec 带 buyable=False (消费方 replay/monitor/store 均已认此旗)。
         up = limit_up_price(prev_c, state.get("board", "")) if prev_c > 0 else 0.0
         buyable = not fill_blocked_by_limit_up(entry_price, up)
         return [Progress(stage="exec", date=str(bar.get("time", "")), payload={

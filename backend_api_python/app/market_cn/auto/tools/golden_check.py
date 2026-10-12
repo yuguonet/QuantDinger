@@ -259,8 +259,10 @@ def main(argv=None) -> int:
                 failed += 1
         return 1 if failed else 0
 
-    keys = (["dragon_callback", "g56", "knife_catch", "tail_oversold", "break"]
-            if a.all else [a.strategy])
+    # 2026-10-12 D-R1: 原硬编码列表 ["dragon_callback","g56","knife_catch","tail_oversold","break"]
+    #   改为动态取 strategy_keys() —— 新增/退役策略自动跟, 不再手工同步。
+    from app.market_cn.auto import registry as _reg
+    keys = (list(_reg.strategy_keys()) if a.all else [a.strategy])
     failed = 0
     for k in keys:
         r = run(k, n=a.n, days=a.days)

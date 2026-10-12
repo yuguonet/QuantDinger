@@ -811,6 +811,19 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
     return rows, err_by_key, skip_rows
 
 
+def _earliest_window(active: dict) -> str:
+    """从活动策略声明中取最早的窗口起点 (P1 2026-10-12: 取代硬编码 '14:50' 回退)。"""
+    starts = []
+    for s in active.values():
+        w = getattr(s, "scan_spec", None)
+        if w and w.windows:
+            starts.append(str(w.windows[0]))
+        ea = getattr(w, "entry_at", "")
+        if ea:
+            starts.append(str(ea))
+    return min(starts) if starts else ""
+
+
 def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
     """盘中窗口扫描 (kind=intraday_window 策略, 由注册表动态收集: 现为 knife_catch / tail_oversold)。
 
@@ -825,7 +838,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
       once_per_day 已标记 ⇒ 当日 knife_catch/tail_oversold 全天 0 信号
       (09-28 实证 13:39:28「等待超时, 放弃本次」)。
     流程:
-      1. 等待到滚动起点 (有 rolling_preview 策略时取最早者, 现为 14:50; 否则 14:56 保持旧行为)
+      1. 等待到滚动起点 (有 rolling_preview 策略时取最早者, 现为 14:50; 否则 14:50 (缺省))
       2. 滚动判定 (14:50~14:59): 每分钟一轮; 14:50 起触发即买入 (已定价行不被冲掉)
          (幂等 upsert + 本轮落选 buy_today 清理), 前端自选组实时刷新, 用户提前准备
       3. 15:00 收口: 再跑一轮全量; 仅清 entry_price 为空的预览行
@@ -853,7 +866,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
         latest_snapshot, fetch_day_snapshots, _today,
     )
 
-    # 滚动预览策略 (14:50 起每分钟重判; 无则等待起点=14:56, 与旧行为一致)
+    # 滚动预览策略 (14:50 起每分钟重判; 无则等待起点=14:50 (缺省))
     preview = {k: s for k, s in active.items() if getattr(s, "rolling_preview", False)}
     # 起点与 scheduler 触发同源: config.json schedule 段覆盖优先 (resolve_schedule),
     # ScanSpec 默认兜底 — 否则改 config 窗口后两处事实源分叉
@@ -871,7 +884,7 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
     elif keys is not None:
         # 分批触发且本批无预览策略 ⇒ 等到**本批窗口末拍**再终审。
         # (早盘单点策略 windows=("09:40","09:40") ⇒ 末拍 09:40 ⇒ 立即执行;
-        #  若沿用旧 fallback "14:56" 会从 09:40 死等到 14:56 再 40min 超时放弃 ——
+        #  若沿用旧 fallback "14:56" 会从 09:40 死等到 14:50 再 40min 超时放弃 ——
         #  这正是 09-28/09-29 的故障形态)
         for k in active:
             decl = resolve_schedule(k)
@@ -879,9 +892,11 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
                 ends.append(decl["windows"][1])
             else:
                 ends.append(active[k].scan_spec.windows[1])
-        start_hm = max(ends, default="14:56")
+        # P1 2026-10-12: 硬编码 "14:50" → 读策略声明 (最早窗口起点)
+        start_hm = max(ends) if ends else _earliest_window(active)
     else:
-        start_hm = "14:56"
+        # P1 2026-10-12: 硬编码 "14:50" → 读策略声明 (最早窗口起点)
+        start_hm = _earliest_window(active)
     logger.info("[knife_scan] 等待目标 start_hm=%s (预览策略=%s)",
                 start_hm, ",".join(sorted(preview)) or "无")
 

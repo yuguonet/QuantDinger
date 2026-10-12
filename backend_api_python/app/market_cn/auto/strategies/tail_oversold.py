@@ -134,8 +134,7 @@ def _shortlist_dg_max(score_min):
 from app.market_cn.auto.core.data.hub import prep_minutes as _prep_minutes  # noqa: E402
 
 
-def _hhmm(s):
-    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+from app.market_cn.auto.strategies.common.timebox import hhmm as _hhmm  # noqa: F401  P0 搬移 2026-10-12
 
 
 def _is_gem_star(code: str, market=None) -> bool:
@@ -216,7 +215,6 @@ class TailOversoldStrategy(StrategyBase):
     # 探针 day-stage 归属 (越靠后=离信号越近)
     # 契约: 回测未含 U1~U4 / 14:50 起尾盘入场 (T+1) / D1 开盘卖当日平账 / 滚动预览
     use_unified_prefilter = False
-    entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
     rolling_preview = True
@@ -390,9 +388,13 @@ class TailOversoldStrategy(StrategyBase):
         tier = "high" if score >= SCORE_HIGH_MIN else "base"
         if probe is not None:
             probe("signal", score=round(score, 2))
+        # D-C: entry_fill_price 消费 entry.price (close=last / open=开盘价), 缺省=close(盘中语义)
+        from app.market_cn.auto.strategies.base import entry_fill_price
+        entry_px = entry_fill_price(self.entry_spec(), {"close": last, "last": last,
+                                                        "open": float(snap.get("open") or last)})
         return {
             "time": str(snap.get("time") or "")[:10],
-            "price": last, "score": ps,
+            "price": entry_px, "score": ps,
             "label": (f"尾盘超卖 gain={cache['day_gain']:.1f}% tail={cache['tail_ret']:+.2f}% "
                       f"pos={cache['pos_range']:.2f} 预测分={ps} v2={score:.1f} [{tier}]"),
             "extra": build_signal(ctx, spec),
@@ -471,7 +473,7 @@ class TailOversoldStrategy(StrategyBase):
         day_close 重放: 按 D1 开盘价出场 (与回测口径一致)。
 
         ⚠️ 记账价必须取 `snap["open"]` 而不是 `snap["last"]` (2026-10-04 A3 资金红线):
-          本策略是 `entry_at_close` + `exit_exec_same_day` 超短 (D0 14:56买 → D1 开盘卖),
+          本策略是 `entry.mode=intraday_window` + `exit_exec_same_day` 超短 (D0 14:50买 → D1 开盘卖),
           **整个 alpha 就是隔夜跳空一两个点**; 而 monitor step2 的 live 出场窗起点是
           09:35 (monitor.W_OPEN_HI), 若取 `last` 则记账价 = 09:35 后首拍最新价 ≠ 开盘价,
           对超短策略是系统性偏离。day_close 重放分支取的是 `d1_bar["open"]`,

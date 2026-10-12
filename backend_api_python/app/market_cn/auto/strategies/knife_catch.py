@@ -1,9 +1,9 @@
-"""strategies/knife_catch.py — 反向接刀 (14:56 盘中窗口扫描版)。
+"""strategies/knife_catch.py — 反向接刀 (14:50 盘中窗口扫描版)。
 
 核心逻辑: 大盘下跌日 + 个股深跌 + 尾盘卖盘枯竭(尾盘回升) + 全天压制VWAP下方
-          + 收盘贴低点 = 次日高概率反弹 → D0 尾盘(14:56)买入 → D1 开盘卖出。
+          + 收盘贴低点 = 次日高概率反弹 → D0 尾盘(14:50)买入 → D1 开盘卖出。
 
-执行: 14:30 预热 → 14:56 快照就绪 (intraday_shortlist 便宜预筛 → 候选股补拉当日快照
+执行: 14:30 预热 → 14:50 快照就绪 (intraday_shortlist 便宜预筛 → 候选股补拉当日快照
 序列+日线 → scan_signals 完整判定 → 落库 buy_today) → 用户按信号买入 → 15:01
 confirm_decision(holding) → D1 开盘 exit_decision 卖 (exit_exec_same_day)。
 
@@ -32,13 +32,14 @@ STRATEGY_KEY = "knife_catch"
 STRATEGY_LABEL = "反向接刀"
 
 PARAMS = {
+    "min_hhmm": "14:50",         # 快照时间下限 (P2 参数化, 与 scan_spec.entry_at 同值)
     "gain_max": -8.0,           # 当日涨幅上限 % (深跌)
     "amp_min": 12.0,            # 当日振幅下限 % (排除窄幅阴跌)
     "pos_max": 0.1,             # 收盘位置上限 (0=最低点, 1=最高点)
     "tail_min": 0.5,            # 尾盘20分钟回升下限 % (卖盘枯竭)
     "vw_max": 0.2,              # 全天 VWAP 上方占比上限 (全天被压制)
     "mkt_gate": -1.0,           # 市场门控: 全市场均涨幅 <= 此值才扫描 (逐槽 ctx.mkt_series[i]; 回退 ctx.mkt_gain)
-    "vol_max": 1.5,             # 量比上限 (14:56量/昨日量; >=1.5 过度恐慌继续崩)
+    "vol_max": 1.5,             # 量比上限 (14:50量/昨日量; >=1.5 过度恐慌继续崩)
     "pre5_max": -15.0,          # 近5日涨幅上限 % (前期已走弱)
     "streak_min": 2,            # 连跌天数下限 (含当日; 单日深跌的接刀差)
     "stop_pct": -5.0,           # 止损 % (仅 D1 有意义, T+1 当日不可卖)
@@ -49,12 +50,11 @@ _WIN = 8        # 切片窗口 (pre5/vol5 最多用 5，余量给 probe 锚)
 _MIN_AGE = 8    # 旧 _daily_feats 口径: len(bars) < 8 → 无特征
 
 
-def _hhmm(s):
-    return str(s)[11:16] if s and len(str(s)) >= 16 else ""
+from app.market_cn.auto.strategies.common.timebox import hhmm as _hhmm  # noqa: F401  P0 搬移 2026-10-12
 
 
 def _tail_ret(series_rows, last_px, last_time, minutes=20):
-    """尾盘回升 %: 最新价 vs ~minutes 分钟前的最新价 (分钟回测口径 14:36→14:56)。"""
+    """尾盘回升 %: 最新价 vs ~minutes 分钟前的最新价 (分钟回测口径 14:36→14:50)。"""
     if not series_rows or last_px <= 0:
         return None
     from datetime import datetime, timedelta
@@ -123,25 +123,25 @@ class KnifeCatchStrategy(StrategyBase):
     name = STRATEGY_LABEL
     prefilter_anchor = "signal"
     entry_style = "kc"
-    scan_spec = ScanSpec(kind="intraday_window", windows=("14:30", "15:00"), interval_sec=60)
+    scan_spec = ScanSpec(kind="intraday_window", windows=("14:30", "15:00"), interval_sec=60,
+                     entry_at="14:50")   # 最早可成交时刻 (evaluate 的触发门读此声明)
     default_params = dict(PARAMS)
     # 探针 day-stage 归属 (越靠后=离信号越近)
     # 框架契约扩展 (base.py 文档): 回测未含 U1~U4, 不做统一预过滤;
-    # 14:56 入场当日不可卖 (T+1); 出场当日执行并当日平账
+    # 14:50 入场当日不可卖 (T+1); 出场当日执行并当日平账
     use_unified_prefilter = False
-    entry_at_close = True
     exit_exec_same_day = True
     signal_state = "buy_today"
     # 滚动预览 (2026-10-07 补): 本策略窗口是 14:30-15:00, 但此前**未声明** rolling_preview
     #   ⇒ scan.run_scan_knife 的滚动轮只跑 preview 子集, knife_catch 整天只在 15:00 终审
-    #   跑一次 ⇒ 14:56 触发时前端无展示 (信号要等 15:00 那轮才落库)。
-    #   声明后 14:30 起每分钟一轮, 14:56 触发即入库刷新。
-    #   ⚠️ 不会提前买入: 入场时点由 `_gates` 的 14:56 窗口保护把守 (14:30 起跑只是预热,
+    #   跑一次 ⇒ 14:50 触发时前端无展示 (信号要等 15:00 那轮才落库)。
+    #   声明后 14:30 起每分钟一轮, 14:50 触发即入库刷新。
+    #   ⚠️ 不会提前买入: 入场时点由 `_gates` 的 14:50 窗口保护把守 (14:30 起跑只是预热,
     #      判定不变), 故滚动期间只刷展示、不产生 buy_today。
     rolling_preview = True
     # 展示阶段表（展示层只按此表呈现，不认识门细节）
     stages = (
-        Stage("watch", "候选观察", realtime="14:56-15:00", visible=False),
+        Stage("watch", "候选观察", realtime="14:50-15:00", visible=False),
         Stage("ready", "D0尾盘触发·准备", realtime="09:31"),
         Stage("exec", "D1开盘卖出"),
     )
@@ -198,7 +198,7 @@ class KnifeCatchStrategy(StrategyBase):
     # ══ 展示层折叠契约：递推状态机 + 门（**门逻辑唯一实现**）═════════════
     # ⚠ 展示/预处理 evaluate 与盘中实时 scan_signals **共用同一份 _gates**。
     #   两入口只差"取哪个快照": scan_signals 判 ctx["latest"]（此刻）；
-    #   evaluate 回扫当日 14:56~15:00 序列取首次触发。公式不得再写第二份。
+    #   evaluate 回扫当日 14:50~15:00 序列取首次触发。公式不得再写第二份。
     def init_state(self, code, bars, market=None):
         """seed: 截至昨日的全量历史 → 切片 (win/streak/lups/age/board)。"""
         if len(bars) < _MIN_AGE:
@@ -268,13 +268,14 @@ class KnifeCatchStrategy(StrategyBase):
         # 逐槽 as-of 市场门（折叠 IntradayFeed 注入，与 snap_rows **逐槽对齐**；缺槽=None
         # ⇒ 该槽 fail-closed）。缺省回退日频标量 mkt_gain —— 生产实时与合成 golden 走
         # 回退支（生产本来就 as-of；合成喂的是单一标量）。见
-        # docs/市场门口径评估_20261009.md（消除「用收盘门控 14:56 入场」的前视）。
+        # docs/市场门口径评估_20261009.md（消除「用收盘门控 14:50 入场」的前视）。
         mkt_series = ctx.get("mkt_series") or []
         _tr = ctx.get("_trace")   # 门原因通道（契约约定）：落选门名进 TraceSink，无 sink 零开销
         fired = None
+        _earliest = self.scan_spec.entry_at   # P2: 读声明单源, 无硬编码回退
         for i, row in enumerate(snap_rows):
             hh = _hhmm(row.get("time") or "")
-            if hh < "14:56" or hh > "15:00":
+            if hh < _earliest or hh > "15:00":
                 continue
             mkt_i = mkt_series[i] if i < len(mkt_series) else mkt_gain
             fired = self._gates(p, hist, row, snap_rows[:i + 1], mkt_i,
@@ -295,7 +296,7 @@ class KnifeCatchStrategy(StrategyBase):
         if t["age"] >= _MIN_AGE and t["down_streak"] >= p["streak_min"] - 1 \
                 and t["lu_recent"] == 0:
             events.append(Progress(stage="watch", date=inp.bar.get("time", ""),
-                                   payload={}, next_realtime="14:56-15:00"))
+                                   payload={}, next_realtime="14:50-15:00"))
         return events
 
     def _gates(self, p, hist, snap, series, mkt_gain, probe=None, code="", board=None):
@@ -352,8 +353,12 @@ class KnifeCatchStrategy(StrategyBase):
         if probe is not None:
             probe("signal", streak=streak, gain=round(cache["gain"], 2),
                   tail=round(cache["tail"], 2))
+        # D-C: entry_fill_price 消费 entry.price (close=last / open=开盘价), 缺省=close(盘中语义)
+        from app.market_cn.auto.strategies.base import entry_fill_price
+        entry_px = entry_fill_price(self.entry_spec(), {"close": last, "last": last,
+                                                        "open": float(snap.get("open") or last)})
         return {
-            "time": last_time[:10], "price": last, "score": score,
+            "time": last_time[:10], "price": entry_px, "score": score,
             "label": (f"反向接刀 gain={cache['gain']:.1f}% "
                       f"tail=+{cache['tail']:.1f}% streak={streak}"),
             "extra": build_signal(ctx, spec),
@@ -410,7 +415,7 @@ class KnifeCatchStrategy(StrategyBase):
         return out
 
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
-        """14:56 盘中判定 —— 判**此刻** (ctx["latest"])。
+        """14:50 盘中判定 —— 判**此刻** (ctx["latest"])。
 
         门逻辑全部委托 `_gates` (与展示层 evaluate 同一实现), 本方法只负责:
         取快照 → 建切片 → 组装 Signal。probe: 门级 TRACE, 仅本入口传。
@@ -442,7 +447,7 @@ class KnifeCatchStrategy(StrategyBase):
 
     # ---- 三决策 ----
     def entry_decision(self, row, snap=None, **params):
-        """无开盘入场步骤 (14:56 尾盘直接买入, 信号即 buy_today)。兜底可买。"""
+        """无开盘入场步骤 (14:50 尾盘直接买入, 信号即 buy_today)。兜底可买。"""
         return EntryDecision(True, "kc 尾盘已入场, 无开盘步骤")
 
     def confirm_decision(self, row, snap=None, **params):
@@ -464,7 +469,7 @@ class KnifeCatchStrategy(StrategyBase):
         day_close 重放: entry_idx+1 存在 → 按 D1 开盘价出场 (与回测 X0 口径一致)。
 
         ⚠️ 记账价必须取 `snap["open"]` 而不是 `snap["last"]` (2026-10-04 A3 资金红线):
-          本策略是 `entry_at_close` + `exit_exec_same_day` 超短 (D0 14:56买 → D1 开盘卖),
+          本策略是 `entry.mode=intraday_window` + `exit_exec_same_day` 超短 (D0 14:50买 → D1 开盘卖),
           **整个 alpha 就是隔夜跳空一两个点**; 而 monitor step2 的 live 出场窗起点是
           09:35 (monitor.W_OPEN_HI), 若取 `last` 则记账价 = 09:35 后首拍最新价 ≠ 开盘价,
           对超短策略是系统性偏离。day_close 重放分支取的是 `d1_bar["open"]`,

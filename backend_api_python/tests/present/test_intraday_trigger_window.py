@@ -35,17 +35,18 @@ def test_trigger_slots_cover_full_window_when_entry_at_set():
 
 
 def test_trigger_slots_knife_unchanged():
-    """entry_at 空的策略 (knife) 行为不变: 仍扫整窗 14:30~15:00。"""
+    """entry_at 非空的策略 (knife, P1 2026-10-12 声明 entry_at="14:50") 从 entry_at 起扫。"""
     from app.market_cn.auto import strategies as reg
     from app.market_cn.auto.core.backtest import _exec_trigger_mis, frames_hhmm
 
     reg.autodiscover()
     spec = reg.get_strategy("knife_catch").scan_spec
+    assert spec.entry_at == "14:50"  # P1 2026-10-12: 已声明, 不再是空 entry_at
     hh = [frames_hhmm(m) for m in _exec_trigger_mis(spec)]
 
-    assert hh[0] == "14:30" and hh[-1] == "15:00"
+    assert hh[0] == "14:50" and hh[-1] == "15:00"
     assert "14:56" in hh
-    assert len(hh) == 31
+    assert len(hh) == 11   # 14:50~15:00 每分钟一槽
 
 
 def test_trigger_slots_empty_when_entry_at_after_window_end():

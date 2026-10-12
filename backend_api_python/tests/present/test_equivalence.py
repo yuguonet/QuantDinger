@@ -71,7 +71,7 @@ def test_knife_crafted_trigger_day_matches_old():
     rows = knife_day_rows(day, pc=100.0)
     g = -3.0
 
-    i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, g, "14:56")
+    i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, g, "14:50")
     assert sig is not None, "构造场景应当触发"
     ev = _new_ready(new, bars, CODE, rows, g)
     assert ev is not None
@@ -80,7 +80,7 @@ def test_knife_crafted_trigger_day_matches_old():
     assert ev.payload["label"] == sig.label
     assert ev.payload["extra"] == sig.extra
     assert ev.date == sig.time
-    assert str(rows[i]["time"])[11:16] == "14:56"
+    assert str(rows[i]["time"])[11:16] >= "14:50"   # 触发在 entry 窗口内 (具体时刻随门通过时刻浮动)
 
 
 def test_knife_noise_day_matches_old():
@@ -91,7 +91,7 @@ def test_knife_noise_day_matches_old():
     for r in rows:                      # 横盘噪声：所有门都不过
         r["last"] = 99.0
         r["high"], r["low"] = 99.5, 98.5
-    i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, -3.0, "14:56")
+    i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, -3.0, "14:50")
     assert sig is None
     assert _new_ready(new, bars, CODE, rows, -3.0) is None
 
@@ -116,7 +116,7 @@ def test_knife_fuzz_matches_old():
         rows = make_snapshot_rows(day, pc, prices, day_high, day_low,
                                   total_vol=rng.uniform(500, 2000))
         g = rng.uniform(-6, 2)
-        i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, g, "14:56")
+        i, sig = _old_first_fire(old.scan_signals, bars, CODE, rows, g, "14:50")
         ev = _new_ready(new, bars, CODE, rows, g)
         if sig is None:
             assert ev is None, f"trial={trial} 旧不触发新触发"

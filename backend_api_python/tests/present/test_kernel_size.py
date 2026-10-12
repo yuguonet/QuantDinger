@@ -96,7 +96,7 @@ PROGRAM_CAP = 1350
 #: **last_measured 登记值**，由 test_registered_linecounts_are_fresh 校验不失真
 #: （|实测-登记| > 30 即 FAIL，逼人回来更新登记表）。
 RETIRE_MODULES = [
-    ("strategies/base.py", 380, 669, 800),       # 2026-10-12 登记刷新: 727→625→669（A-2 豁免体检机制 +44，功能增长已留痕）
+    ("strategies/base.py", 380, 641, 800),       # 2026-10-12 登记刷新: 735→641（P0 搬移 entry/contract → common/ -94，功能增长已留痕）
     ("core/backtest.py", 0, 514, 606),            # 2026-10-12 登记刷新: 551→514（退役中）
     ("probe.py", 0, 173, 190),                    # 2026-10-08 D级修: 172→173
 ]

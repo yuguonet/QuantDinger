@@ -24,6 +24,8 @@
   - 快照帧的 codes = 当日 1m 有 bar 的股票 (停牌股自然缺席, 与基线 group_days 同效果);
   - 本模块**零策略规则** — 预筛/判定全部在策略插件 (intraday_shortlist/scan_signals)。
 """
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN
 import os
 import glob
 import numpy as np
@@ -42,7 +44,7 @@ CACHE_VER = "v2"        # 帧结构版本 (v1=跨股 cumsum 量纲污染, 已弃
                         # v2 结构增强 (A1): 新增 hcum/lcum 键 — 保持 v2 号避免已建 151 帧
                         # 全部作废重建; 读侧对缺键旧文件加载期补算并原子升级, 语义不变
 
-# 位置(=分钟槽) → HH:MM, 与基线 _mi_to_hhmm 一致: 0↔09:31, 119↔11:30, 120↔13:01, 235↔14:56
+# 位置(=分钟槽) → HH:MM, 与基线 _mi_to_hhmm 一致: 0↔09:31, 119↔11:30, 120↔13:01, 235↔14:50
 MI_HHMM = []
 for _mi in range(240):
     _minutes = 571 + _mi if _mi <= 119 else 661 + _mi
@@ -385,7 +387,7 @@ def trading_dates(days_back, end=None):
     """
     from datetime import datetime, timedelta
     from app.utils.db_market import get_market_db_manager
-    end = str(end or datetime.now().strftime("%Y-%m-%d"))[:10]
+    end = str(end or datetime.now(TZ_CN).strftime("%Y-%m-%d"))[:10]
     start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=int(days_back))).strftime("%Y-%m-%d")
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")

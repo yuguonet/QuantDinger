@@ -48,6 +48,9 @@ as-of 纪律: 本工具只做**取数 + 排版**, 判定一律经 core 的求值
 """
 from __future__ import annotations
 
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN, today_str
+
 import argparse
 import ast
 import json
@@ -57,10 +60,10 @@ import sys
 # 旧 CLI 别名 (与 tools/replay.py、strategy_cli.py 保持一致)
 _ALIAS = {"dragon": "dragon_callback", "dragon2": "dragon_v2", "break_buy": "break"}
 
-# 门表引擎支持的 day 编排 (其余走插件引擎; 见文件头 A/B 分工)
-# 终态② Step 3 (2026-10-09): 无折叠契约的策略已随链 A 退役而绝迹 (v1/relay3 亦于
-# 2026-10-09 退役归档) ⇒ 门表 day 编排只剩 break。
-_GATE_DAY_FLOWS = {"break"}
+# 门表引擎支持的 day 编排判定 (2026-10-12 D-R1: 取代原 _GATE_DAY_FLOWS={"break"} 硬编码):
+#   spec.meta.ext 声明了编排层预计算上下文 (如 g56 的横截面池) ⇒ 门表引擎
+#   单独跑不了, 转插件引擎; 无 ext 的 day 策略 (如 break) 可走门表引擎。
+#   见文件头 A/B 分派说明。
 
 
 # ================================================================
@@ -172,11 +175,9 @@ def _print_gate_rows(title: str, rows: list) -> None:
 # 数据准备 (镜像引擎的 ctx 构造; 判定语义仍由 core 唯一提供)
 # ================================================================
 def _load_env() -> None:
-    try:
-        from app.market_cn.auto.core._paths import load_env_first_found
-        load_env_first_found(os.path.join(os.getcwd(), ".env"))
-    except Exception:
-        pass
+    # P0 搬移 2026-10-12: 收口到 tools/common.py::load_env
+    from app.market_cn.auto.tools.common import load_env
+    load_env()
 
 
 def _bars_and_info(code: str, days: int):
@@ -526,7 +527,7 @@ def main() -> int:
     if spec_kind == "intraday_window":
         if not date:
             from datetime import datetime
-            date = datetime.now().strftime("%Y-%m-%d")
+            date = today_str()
         print(f"策略 {key} {getattr(strat, 'name', '')} | 形态 盘中窗口 | 目标日 {date}")
         out = report_intraday(key, strat, args.code, date, args.days)
         return _emit(out, args)
@@ -560,8 +561,8 @@ def main() -> int:
         if not _has_fold_contract(strat):
             use_gate = False
             print("  [无折叠契约 → 转插件引擎 (门表引擎结论不可复现, 链 A 已退役)]")
-        elif enum == "day" and flow not in _GATE_DAY_FLOWS:
-            use_gate = False               # g56 等需横截面 ext → 走插件引擎
+        elif enum == "day" and spec.meta.get("ext"):
+            use_gate = False               # 有 ext 上下文依赖 → 走插件引擎
             print(f"  [门表编排 day_flow={flow} 需特化上下文 → 转插件引擎 (策略自带 TRACE)]")
 
     if use_gate:
@@ -599,9 +600,9 @@ def _board_name(code: str) -> str:
 
 
 def _yaml_path(key: str) -> str:
-    from app.market_cn.auto.core._paths import STRATEGY_DIR
-    p = os.path.join(STRATEGY_DIR, f"{key}.yaml")
-    return p if os.path.isfile(p) else ""
+    # P0 搬移 2026-10-12: 收口到 tools/common.py::yaml_path
+    from app.market_cn.auto.tools.common import yaml_path
+    return yaml_path(key)
 
 
 if __name__ == "__main__":

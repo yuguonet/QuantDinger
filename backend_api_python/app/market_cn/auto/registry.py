@@ -48,19 +48,23 @@ DRAGON_USER_ID = 1
 DRAGON_MARKET = "CNStock"
 DRAGON_STRATEGY = "dragon_callback"
 
-# 兜底 (config 与 autodiscover 双双异常时使用, 与磁盘插件保持一致)
-# 2026-09-26: 补 g56/break_v2/dragon_v2/triple_resonance; 去掉已归档的
-# dragon_callback_legacy (见 strategies/_archive/)。改名/增删策略时同步此表。
-# 2026-09-27: break_v2/dragon_v2/triple_resonance/t_hilo 归档 _archive/, 同步删 fallback
-# 2026-10-09: v1/relay3/lead_chase 退役归档 _archive/ (P6-6/7), 同步删 fallback
-# 2026-10-12: **补回 v1** —— 10-10 v1 回归上线 (v1.yaml meta.enabled=true) 时
-#   未把 10-09 删掉的 key 反向补回 ⇒ 兜底名单落后于磁盘插件一份。教训与
-#   strategies/base.py 的 FOLD_CONTRACT_EXEMPT 同类:**退役时做的清理, 回归时必须
-#   反向还原**。doctor check_static 1c 会自动比对二者, 再漂移会 WARN。
-_STRATEGIES_FALLBACK = (
-    "dragon_callback", "break", "v1",
-    "knife_catch", "tail_oversold", "g56",
-)
+def _disk_strategy_keys():
+    """兜底策略 key: 扫描 strategies/ 目录文件名 (动态, 零硬编码清单)。
+
+    只在 config 与 autodiscover 双双异常时使用。即使 import 全挂,
+    磁盘上的 .py 文件名仍告诉我们「应该有哪些策略」, store 查询范围不致失明。
+    (2026-10-12 D-R1: 取代原 _STRATEGIES_FALLBACK 硬编码元组 —— 手工清单
+     必然滞后于磁盘, v1 退役/回归时已踩过一次。)
+    """
+    import os
+    import pkgutil
+    strat_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategies")
+    out = []
+    for m in pkgutil.iter_modules([strat_dir]):
+        if m.name in ("base", "__init__") or m.name.startswith("_"):
+            continue
+        out.append(m.name)
+    return out
 
 
 def strategy_keys():
@@ -71,7 +75,7 @@ def strategy_keys():
 
     快速拔插: 新增策略=丢文件进 strategies/ (+ config.json 写开关/限额), 本文件零改动;
     config keys 显式声明系统成员 (enabled=false 停扫描但历史行仍可查);
-    autodiscover 兜底防新增漏登记 config。两边都挂时用 _STRATEGIES_FALLBACK。
+    autodiscover 兜底防新增漏登记 config。两边都挂时扫 strategies/ 目录文件名。
     """
     keys: list = []
     try:
@@ -90,7 +94,7 @@ def strategy_keys():
             "[registry] 数据源探测失败(已走兜底): %s", e)
         pass
     if not keys:
-        keys = list(_STRATEGIES_FALLBACK)
+        keys = _disk_strategy_keys()
     return tuple(dict.fromkeys(keys))  # 去重保序
 
 

@@ -1,5 +1,5 @@
 # ================================================================
-# knife_catch 反向接刀 (14:56 尾盘买入 → D1 开盘卖) — IDE 门表单文件
+# knife_catch 反向接刀 (14:50 尾盘买入 → D1 开盘卖) — IDE 门表单文件
 # ----------------------------------------------------------------
 # 大盘下跌日 + 个股深跌 + 尾盘卖盘枯竭 + 全天压制 VWAP 下方 + 收盘贴低点
 # → 次日高概率反弹。四过滤叠加（宁缺勿滥质量门）。
@@ -12,14 +12,20 @@ meta:
   enabled: true                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: intraday
   intraday:
-    windows: ["14:30", "15:00"]   # 扫描窗口 (14:30 起预热, 14:56 后出信号)
+    windows: ["14:30", "15:00"]   # 扫描窗口 (14:30 起预热, 14:50 后出信号)
     interval_sec: 60              # 每分钟一槽
+
+entry:
+  mode: intraday_window           # 盘中窗口内成交 (D2 极小 schema, 2026-10-12)
+  price: close                    # 触发时刻最新价 (= intraday close 等价物; entry_fill_price 消费)
+                                  # gap 未在本策略 exec 路径接线 ⇒ 不写 (防死配置)
 
 exit:
   mode: d1_open                   # 次交易日(D1)开盘卖 (T+1)
 
 params:                           # ★ 参数单一事实源 (目标态 §2/§3.1): 判定/出场/生产扫描
                                   #   都读本段 (config.json 的同名 params 已清空)。
+  min_hhmm: "14:50"               # 快照时间下限 (P2 参数化, 与 scan_spec.entry_at 同值)
   gain_max: -8.0                  # 当日涨幅上限 % (深跌)
   amp_min: 12.0                   # 当日振幅下限 % (排除窄幅阴跌)
   pos_max: 0.1                    # 收盘位置上限 (0=最低点)
@@ -40,7 +46,7 @@ params:                           # ★ 参数单一事实源 (目标态 §2/§3
 #       只影响枚举规模不影响 trades），盘中通道复用它们（见 strategies/knife_catch.py）。
 gates:
   - {id: kc_window, name: 尾盘窗口, role: qualify, needs_d0: 1, enabled: 1,
-     expr: "hhmm() >= '14:56'"}                  # 14:56 之后才出信号
+     expr: "hhmm() >= min_hhmm"}                  # 参数化时间门 (P2, 与 scan_spec.entry_at 同值)
   - {id: kc_mkt, name: 市场门控, role: qualify, needs_d0: 1, enabled: 1,
      expr: "mkt_gain() <= mkt_gate"}             # None → nan → 拦截 (镜像 mkt_gain is None)
   - {id: kc_feat, name: 深跌+振幅+贴低, role: qualify, needs_d0: 1, enabled: 1,

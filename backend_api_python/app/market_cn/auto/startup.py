@@ -76,6 +76,8 @@ import threading
 import time
 from datetime import datetime
 
+from app.market_cn.auto.store import TZ_CN
+
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -392,7 +394,7 @@ def _save_snapshot(fp, calibrated_for=None):
     from app.utils.db import get_db_connection
     payload = json.dumps({
         "hash": _fp_hash(fp),
-        "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+        "calibrated_at": datetime.now(TZ_CN).isoformat(timespec="seconds"),
         "calibrated_for": calibrated_for,
         "detail": fp,
     }, sort_keys=True, ensure_ascii=False, default=str)

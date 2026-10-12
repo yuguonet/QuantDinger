@@ -95,7 +95,7 @@ def test_mkt_gate_is_per_slot_asof():
 def test_mkt_gate_control_day_level_scalar_unchanged():
     """对照：日频标量路径（无 mkt_series）恒在 14:56 成交 —— 证明 ② 的差异只来自逐槽。"""
     got = _fold_entry(mkt_series=None, scalar=-3.0)
-    assert got == [("2026-10-05", 85.1)], got
+    assert got == [("2026-10-05", 85.0)], got  # 2026-10-12: 14:50 起动后触发时刻提前, 入场价随之下移
 
 
 def test_mkt_series_all_fail_no_trade():

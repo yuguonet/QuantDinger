@@ -56,7 +56,6 @@ def check_static(findings, only=None):
     cfg = load_config() or {}
     cfg_keys = [k for k, v in (cfg.get("strategies") or {}).items() if isinstance(v, dict)]
     plugins = sorted(strat_reg.all_strategies())
-    fallback = list(getattr(registry, "_STRATEGIES_FALLBACK", ()))
     keys = registry.strategy_keys()
 
     if only:
@@ -65,7 +64,7 @@ def check_static(findings, only=None):
         keys = [k for k in keys if k in only]
 
     # 1a. 开关可达性 + 停用提示
-    #     事实源 (2026-10-09 终态②/A-D2): yaml meta.enabled > config.json enabled > False
+    #     事实源 (2026-09-15 → 2026-10-09 终态②/A-D2): yaml meta.enabled > config.json enabled > False
     for k in plugins:
         yml = strat_reg._yaml_meta_enabled(k)
         if yml is None and k not in cfg_keys:
@@ -82,14 +81,16 @@ def check_static(findings, only=None):
         if k not in plugins:
             _add(findings, FAIL, "config", f"config 有 {k} 但磁盘无插件 → 开关无效")
 
-    # 1c. fallback 过期
-    if fallback:
-        missing = [k for k in plugins if k not in fallback]
-        extra = [k for k in fallback if k not in plugins]
-        if missing:
-            _add(findings, WARN, "fallback", f"_STRATEGIES_FALLBACK 缺: {missing}")
-        if extra:
-            _add(findings, WARN, "fallback", f"_STRATEGIES_FALLBACK 多出 (已归档?): {extra}")
+    # 1c. 磁盘文件 vs 已注册 (2026-10-12 D-R1: 取代原 _STRATEGIES_FALLBACK 比对)
+    #     文件在盘上但未注册 = import 失败, 策略「物理存在但逻辑消亡」
+    disk_keys = registry._disk_strategy_keys()
+    if only:
+        disk_keys = [k for k in disk_keys if k in only]
+    if disk_keys:
+        unregistered = [k for k in disk_keys if k not in plugins]
+        if unregistered:
+            _add(findings, FAIL, "fallback",
+                 f"磁盘有策略文件但未注册 (import 失败?): {unregistered}")
 
     # 1d. YAML/py 配对
     strat_dir = os.path.dirname(os.path.abspath(strat_reg.__file__))

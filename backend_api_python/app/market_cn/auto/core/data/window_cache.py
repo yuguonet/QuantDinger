@@ -35,6 +35,8 @@ import pickle
 import time
 from datetime import date, datetime, timedelta
 
+from app.market_cn.auto.store import TZ_CN
+
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -122,7 +124,9 @@ def _factor_fp(code: str) -> int:
 # ================================================================
 
 def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    # P1 2026-10-12: 委托 store.today_str() (北京时区显式), 消灭裸 datetime.now() 双源
+    from app.market_cn.auto.store import today_str
+    return today_str()
 
 
 def _ord(d: str) -> int:
@@ -307,7 +311,7 @@ def _slide(codes, days: int, lg) -> dict:
         return _rebuild(codes, days, start, end, unadj_to_qfq, lg)
     # ②b 到期全量刷新: 增量看不见「历史行被订正」, 靠周期性重建兜底
     _bi = str(meta.get("built_at") or "")
-    if _bi and _bi <= (datetime.now()
+    if _bi and _bi <= (datetime.now(TZ_CN)
                        - timedelta(days=MAX_AGE_DAYS)).strftime("%Y-%m-%d"):
         lg.info("[window_cache] 缓存建于 %s (>%d 天) ⇒ 全量刷新",
                 _bi, MAX_AGE_DAYS)
@@ -365,7 +369,7 @@ def _slide(codes, days: int, lg) -> dict:
     #   清成 1 票。退市/长期停牌票改由 seen 日期淘汰 (STALE_DAYS 天未出现)。
     lo_o = _ord(start)
     seen = dict(meta.get("seen") or {})
-    _now = datetime.now()
+    _now = datetime.now(TZ_CN)
     today_s = _now.strftime("%Y-%m-%d")
     for c in codes:
         if c in data:

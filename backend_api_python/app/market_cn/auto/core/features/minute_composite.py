@@ -28,7 +28,11 @@
 统一定义（用户 2026-09-21 裁定，同时定死 §9-9 的 `auto` 分界 = 固定常量而非动态探测）。
 """
 
+
 from __future__ import annotations
+
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN, today_str
 
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -67,8 +71,8 @@ def minute_live_full(code: str, days: int = 5, *, series: Optional[List[Dict[str
         _fetch_snapshots_by_date, minute_1m, prep_minutes)
     from app.market_cn.auto.core.data.frames import _qfq_bars
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=int(days * 1.5) + 2)).strftime("%Y-%m-%d")
+    today = today_str()
+    start = (datetime.now(TZ_CN) - timedelta(days=int(days * 1.5) + 2)).strftime("%Y-%m-%d")
 
     raw = minute_1m(code, start=start, end=today)   # 含当日（若已回填）
     by_date: Dict[str, List[Dict[str, Any]]] = {}
@@ -267,7 +271,7 @@ def window_minutes(code: str, start_date: str, end_date: str, *,
         if bars:
             out[d] = bars
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_str()
     if e >= today and today not in by_date:      # 当日未回填 → 快照 (仅盘中/盘后未回填时)
         if series is None:
             series = _fetch_snapshots_by_date([code]).get(code) or []

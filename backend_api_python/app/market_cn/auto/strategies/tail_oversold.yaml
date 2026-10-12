@@ -14,7 +14,10 @@ meta:
   intraday:
     windows: ["14:50", "15:00"]   # 滚动预览窗口 (14:50 起)
     interval_sec: 60
-    entry_at: "14:50"             # 14:50 起即可成交 (滚动预览窗口起点)
+
+entry:
+  mode: intraday_window           # 盘中窗口内成交 (D2 极小 schema, 2026-10-12)
+  price: close                    # 触发时刻最新价 (= intraday close 等价物; entry_fill_price 消费)
 
 exit:
   mode: d1_open                   # 次交易日(D1)开盘卖

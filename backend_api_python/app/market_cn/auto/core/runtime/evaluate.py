@@ -95,6 +95,7 @@ class StrategySpec:
     meta: Dict[str, Any]
     exit: Dict[str, Any]
     params: Dict[str, Any]
+    entry: Dict[str, Any] = field(default_factory=dict)   # 极小 schema (D2): mode/price/gap_min/gap_max
     signal: Dict[str, Any] = field(default_factory=dict)
     gates: List[Gate] = field(default_factory=list)
     # 本策略所属市场的 MarketSpec（由 meta.market 解析，见 load_strategy）。core 各处
@@ -161,6 +162,7 @@ def load_strategy(key: str) -> StrategySpec:
     spec = StrategySpec(
         key=key, meta=doc.get("meta", {}),
         exit=doc.get("exit", {}), params=doc.get("params", {}),
+        entry=doc.get("entry", {}) or {},
         signal=doc.get("signal", {}) or {}, gates=gates,
     )
     # 市场适配（架构 §9）: 策略只写 `meta.market: <key>`, 其余维度由 MarketSpec 决定。

@@ -300,9 +300,9 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
           stale** (extra.stale=true), 不静默消失 —— 部分判定失败不再等于部分信号蒸发;
         · 其余键 (本轮干净判定且无信号 / 未复现) → 照旧删除 (防参数变化残留幽灵)。
     行内可选 state/entry_date/entry_price/stop_price 覆盖默认值
-    (knife_catch 等盘中即买策略: state=buy_today, 14:56 已入场)。
+    (knife_catch 等盘中即买策略: state=buy_today, 14:50 已入场)。
     purge_buy_today: 额外清理这些策略今日 state=buy_today 的旧行
-      (tail_oversold 滚动预览/终审专用: 14:50~14:56 每分钟重判, 上一轮命中本轮落选的
+      (tail_oversold 滚动预览/终审专用: 14:50 起每分钟重判, 上一轮命中本轮落选的
        股票须删行, 否则残留误导用户; 仅清 buy_today 态, 不碰已转移的 holding 等)。
     strategies: 本批扫描的策略范围 (修 M12)。前置 DELETE 只清这些策略的
       watch_pending——不带范围时会把同 trade_date 其它策略的盘后信号整批删掉
@@ -1298,7 +1298,7 @@ def cleanup_old(days=15):
     """历史清理: signals 表保留约 N 个交易日 (holding 保留至自然终态)。三策略统一清理。
 
     2026-09-29 审计修复 (P2): 未平仓的已入场行 (entry_date 非空且 exit_date 空)
-    一律不删 —— buy_today 可是"14:56 已入场"(knife/tail), exit_today 是"待执行
+    一律不删 —— buy_today 可是"14:50 已入场"(knife/tail), exit_today 是"待执行
     卖出"; monitor 长期停摆时这些行旧于 cutoff 会被物理删除, 持仓库/UI 双消失,
     越过"绝不能让客户忘卖"红线。已平仓行 (exit_date 非空) 照常按期清理。
     """

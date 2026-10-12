@@ -13,6 +13,9 @@
 """
 from __future__ import annotations
 
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN, today_str
+
 import argparse
 import json
 import os
@@ -95,7 +98,7 @@ def _replay_intraday(strat, args):
     from app.market_cn.auto.core.data.hub import daily
     from app.market_cn.auto.core.backtest import _exec_trigger_mis
 
-    end = args.end_date or datetime.now().strftime("%Y-%m-%d")
+    end = args.end_date or today_str()
     start = args.start_date or (datetime.strptime(end, "%Y-%m-%d")
                                 - timedelta(days=args.days)).strftime("%Y-%m-%d")
     dates = [d for d in fr.trading_dates(days_back=(datetime.strptime(end, "%Y-%m-%d")

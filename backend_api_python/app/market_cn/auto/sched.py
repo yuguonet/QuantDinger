@@ -18,6 +18,9 @@
 """
 from __future__ import annotations
 
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN, today_str
+
 import json
 import os
 
@@ -48,7 +51,7 @@ def expand_times(windows, interval_sec, date=None):
         raise ValueError(f"interval_sec 必须 >=1 秒 (got {interval_sec}); <=0 会死循环")
 
     first, end = windows[0], windows[1]
-    d = date or datetime.now().strftime("%Y-%m-%d")
+    d = date or today_str()
     t = datetime.strptime(f"{d} {first}", "%Y-%m-%d %H:%M")
     te = datetime.strptime(f"{d} {end}", "%Y-%m-%d %H:%M")
     if te < t:
@@ -180,7 +183,7 @@ def enabled_daily_keys():
     from app.market_cn.auto import store as ds
     from app.market_cn.auto.strategies import all_strategies, autodiscover, is_enabled
 
-    # 2026-10-12 P2: 原为 `datetime.now().strftime("%Y-%m-%d")` —— 直接违反 monitor.py:66
+    # 2026-10-12 P2: 原为 `today_str()` —— 直接违反 monitor.py:66
     #   立的纪律（「今天」单一事实源 = `store.today_str()`，北京时间显式；DB 会话是 UTC
     #   ⇒ 北京 00:00~07:59 两套时钟不在同一天）。此处是**按天缓存**的 key，跨时区错位会让
     #   缓存在错误的一侧多留/少留一天。收口到同一锚点。
@@ -217,8 +220,8 @@ def daily_fire_ready(strategy_key, now_hm=None, date=None):
 
     from app.market_cn.auto.events import missing_events
 
-    now_hm = now_hm or datetime.now().strftime("%H:%M")
-    today = datetime.now().strftime("%Y-%m-%d")
+    now_hm = now_hm or datetime.now(TZ_CN).strftime("%H:%M")
+    today = today_str()
     date = date or today
     decl = resolve_daily_fire(strategy_key)
     fire_at = decl["fire_at"]

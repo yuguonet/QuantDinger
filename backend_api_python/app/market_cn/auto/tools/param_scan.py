@@ -60,6 +60,8 @@ import os
 import time
 from datetime import datetime
 
+from app.market_cn.auto.store import TZ_CN
+
 
 # ================================================================
 # 小工具
@@ -456,7 +458,7 @@ def main():
     root = os.path.normpath(os.path.join(d, "..", "..", "..", "..", ".."))
     tmp_dir = os.path.join(root, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M")
     stem = os.path.join(tmp_dir, f"param_scan_{args.strategy}_{ts}")
     out_md = args.out or stem + ".md"
 
@@ -478,7 +480,7 @@ def main():
 
     md = [f"# param_scan 报告 — {args.strategy}",
           "",
-          f"- 生成 {datetime.now().strftime('%Y-%m-%d %H:%M')} | kind={kind} "
+          f"- 生成 {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M')} | kind={kind} "
           f"| days={args.days} | 窗口 {start_date or '∞'}~{end_date or '今'} "
           f"| {pool_mode} | 组合 {len(combos)} | 总耗时 {total_s}s",
           f"- 扫描网格 ({'自动·单维切片' if auto_mode else '显式·笛卡尔积'}): "

@@ -4,15 +4,15 @@ Phase 3: 策略判定全部经 strategies 注册表分发, 本文件不含策略
   开盘窗口: entry_decision (gap 过滤) + quality_key (排名) + daily_limit (名额)
   盘中:     stop_price 硬止损 (通用) + exit_decision live 模式 (策略盘中出场)
   15:00:    confirm_decision (dragon/break 无确认直持仓; 各策略确认由宏/插件决定)
-  14:58:    exit_decision day_close 模式 (收盘重放, 与回测同一路径)
+  14:50:    exit_decision day_close 模式 (收盘重放, 与回测同一路径)
 各策略入场/确认/出场规则详见 strategies/*.py 模块头注释。
 卖出执行: 次日开盘按开盘价记账 closed 并出组 (建议人工尾盘/次日开盘执行)。
 
-与回测的已知差异: 回测"尾盘卖"按当日收盘成交; 自动化在 14:58 提示、
+与回测的已知差异: 回测"尾盘卖"按当日收盘成交; 自动化在 14:50 提示、
 未执行者次日开盘记账。盘中追踪止损不做分钟级模拟 (日线粒度)。
 
 易错点 (2026-09-28 修 A3): run_monitor 每 tick 开头批量取行快照 (buy_rows/hold_rows),
-step2/3/4/5 共用同一份 —— step2 与 step3 (14:25~14:45)、step4 (14:58~15:00) 时间窗重叠。
+step2/3/4/5 共用同一份 —— step2 与 step3 (14:25~14:45)、step4 (14:50~15:00) 时间窗重叠。
 对快照行的所有 set_state 必须带条件守卫 (expect_state=快照态 / only_unexited),
 否则 step2 刚做出的出场会被旧快照回滚或被确认结果覆盖, 出场价/原因丢失后
 该行永不回归出场态。出场标记 (exit_reason) 一经写入即资金事实, 任何写入不得覆盖。
@@ -46,8 +46,24 @@ from app.market_cn.auto.core.display_meta import confirm_level_of
 
 W_OPEN_LO, W_OPEN_HI = "09:25", "09:35"
 W_PRECONF_LO, W_PRECONF_HI = "14:25", "14:45"
-W_CLOSESIM_LO, W_CLOSESIM_HI = "14:58", "15:06"
+W_CLOSESIM_LO, W_CLOSESIM_HI = "14:50", "15:06"   # 缺省收盘出场窗起点; 策略可经 meta.close_sim_at 覆盖
 W_CONFIRM_LO = "15:01"
+
+
+def _close_sim_start(s_obj) -> str:
+    """策略的收盘出场重放起点: yaml meta.close_sim_at 优先, 缺省 W_CLOSESIM_LO。
+
+    (2026-10-12 D-A: 收盘窗 per-strategy 维度 —— 原全局常量让不同策略的收盘
+     出场窗被迫统一; 现策略可在自己的 yaml meta.close_sim_at 声明起点。)
+    """
+    try:
+        from app.market_cn.auto.strategies import _yaml_doc
+        key = getattr(s_obj, "key", "")
+        doc, _ = _yaml_doc(key)
+        v = ((doc or {}).get("meta") or {}).get("close_sim_at")
+        return str(v) if v else W_CLOSESIM_LO
+    except Exception:
+        return W_CLOSESIM_LO
 
 
 def _now_hm() -> str:
@@ -59,7 +75,7 @@ def _now_hm() -> str:
 def _today() -> str:
     """本 tick 的"今天" (YYYY-MM-DD) —— **委托 store.today_str(), 单一事实源**。
 
-    A7 (2026-10-05): 原先这里自己调 `datetime.now()` 而 store 侧用 SQL
+    A7 (2026-10-05): 原先这里自己调 `datetime.now(TZ_CN)` 而 store 侧用 SQL
     `CURRENT_DATE`(DB 会话是 UTC, 见 db_postgres.py:144 的
     `options="-c timezone=UTC"`) ⇒ 两套时钟。北京时间 00:00~07:59 时二者不在同一天,
     影响 exit_today 平账 (出口 B 判 `marked >= today`) 与日期窗口的边界。
@@ -107,10 +123,8 @@ def in_window(lo, hi, hm=None):
 # 快照读取 (market DB, realtime_snapshot 单表)
 # ================================================================
 
-def _snapshot_pool():
-    from app.utils.db_market import get_market_db_manager
-    return get_market_db_manager()._get_pool("CNStock")
-
+# P1 2026-10-12: 收口 hub 单源 (原 monitor.py 本地副本已删)
+from app.market_cn.auto.core.data.hub import _snapshot_pool  # noqa: F401
 
 # 2026-09-26 由按年分表改为单表
 _SNAPSHOT_TABLE = "realtime_snapshot"
@@ -294,7 +308,7 @@ def evaluate_confirm(row, series_rows):
 
 
 # ================================================================
-# 出场重放 (14:58): bars + 当日合成bar, 按策略各自规则
+# 出场重放 (14:50): bars + 当日合成bar, 按策略各自规则
 # ================================================================
 
 def _bars_with_synth(code, entry_date):
@@ -462,7 +476,7 @@ def _panel_observe(stats, date, hm, path=None, enabled=None):
     total = hit + miss
     rate = round((miss + err) / total, 4) if total else 0.0
     stats["prog_fallback_rate"] = rate
-    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "date": date, "hm": hm,
+    rec = {"ts": datetime.now(ds.TZ_CN).isoformat(timespec="seconds"), "date": date, "hm": hm,
            "prog_enabled": enabled, "confirm_prog_hit": hit, "confirm_prog_miss": miss,
            "confirm_prog_err": err, "no_judgment": nj, "fallback_rate": rate}
     try:
@@ -614,6 +628,16 @@ def run_monitor():
                 if s_obj is None:
                     logger.warning("[dragon_monitor] 未知策略 %s (row %s), 跳过", strat, r.get("id"))
                     continue
+                # ★ entry.gap_min/gap_max 通用过滤 (D2 极小 schema 2026-10-12):
+                #   市场事实(涨停阻买)之后、策略 entry_decision 之前; 未设 = 不限。
+                from app.market_cn.auto.strategies.base import entry_gap_ok
+                if not entry_gap_ok(getattr(s_obj, "entry_spec", lambda: {})(), gap):
+                    ds.set_state(r["id"], ds.S_EXPIRED,
+                                 detail={"gap": round(gap, 2), "src": "entry_schema",
+                                         "reason": f"{ds.strategy_labels().get(strat, strat)}gap超出entry过滤区间"},
+                                 expect_state=ds.S_WATCH_PENDING)
+                    n_exp += 1
+                    continue
                 prog = prog_map.get((getattr(s_obj, "key", None), code))
                 if prog is not None and getattr(prog, "stage", "") == "exec":
                     # 折叠内核的 gap 门在 exec payload 的 `buyable` 里 (break._exec_event)。
@@ -680,8 +704,9 @@ def run_monitor():
                 s_obj = _strategy_of(r)
                 if s_obj is None:
                     continue
-                # T+1 保护: 尾盘入场策略 (knife_catch 14:56买) 当日不可卖, 跳过当日止损/出场
-                if getattr(s_obj, "entry_at_close", False) and \
+                # T+1 保护: 尾盘入场策略 当日不可卖, 跳过当日止损/出场
+                # entry.mode (yaml) 单一事实源 (P2 2026-10-12 删类属性兜底)
+                if s_obj and s_obj.entry_is_at_close() and \
                         str(r.get("entry_date") or "")[:10] == today:
                     continue
                 snap = snaps.get(r["code"])
@@ -788,6 +813,9 @@ def run_monitor():
             if r.get("exit_reason"):
                 continue
             s_obj = _strategy_of(r)
+            # D-A: 策略级收盘窗起点 (meta.close_sim_at), 未到该策略起点则跳过
+            if s_obj and hm < _close_sim_start(s_obj):
+                continue
             prog = prog_map.get((getattr(s_obj, "key", None), r["code"])) if s_obj else None
             if prog is not None:
                 # 拿到内核判定 ⇒ 以它为准: exit ⇒ 出场; 其它 stage ⇒ 今日不出场。
@@ -803,7 +831,7 @@ def run_monitor():
             dec = _eval_exit_day_close(r)
             if dec is not None and dec.action == "exit":
                 # A3 (2026-09-28): hold_rows 是 tick 开头快照 —— step2 (窗口重叠
-                # 14:58~15:00) 可能刚给该行做过 live 出场/盘中止损。条件写入:
+                # 14:50~15:00) 可能刚给该行做过 live 出场/盘中止损。条件写入:
                 # 仅当行仍是 holding 且无出场标记才落, 收盘重放不得覆盖已有出场价/原因。
                 ds.set_state(r["id"], ds.S_EXIT_TODAY, exit_reason=dec.reason,
                              exit_price=round(float(dec.price), 3) if dec.price else None,

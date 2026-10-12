@@ -56,17 +56,9 @@ _CONFIRMED: set = set()
 
 
 def _load_env():
-    """加载 .env（DB 连接等），静默失败。
-
-    2026-10-12 P2: 原本有自己的遍历实现（tools/ 下 5 份手写副本之一）⇒ 收口到官方
-    锚点 `core._paths.load_env_first_found`（与 debug.py 同款），路径候选逐位保留。
-    """
-    try:
-        from app.market_cn.auto.core._paths import load_env_first_found
-        load_env_first_found(os.path.join(PROJECT_ROOT, ".env"),
-                             os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env")))
-    except Exception:
-        pass
+    # P0 搬移 2026-10-12: 收口到 tools/common.py::load_env
+    from app.market_cn.auto.tools.common import load_env
+    load_env()
 
 
 def n_codes_of(codes=None) -> int:

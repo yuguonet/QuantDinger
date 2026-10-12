@@ -40,13 +40,23 @@ from app.market_cn.auto.core.present.realtime import RealtimeBranch
 from app.market_cn.auto.core.present.runner import (
     DailyRunner, Record, StateStore, evaluate_day, strategy_source_hash,
 )
-from app.market_cn.auto.strategies.knife_catch import KnifeCatchStrategy
-from app.market_cn.auto.strategies.tail_oversold import TailOversoldStrategy
 
-STRATEGIES = {
-    "knife_catch": KnifeCatchStrategy,
-    "tail_oversold": TailOversoldStrategy,
-}
+
+def _fold_strategies() -> dict:
+    """动态发现有折叠契约 (init_state/step/evaluate 非基类空壳) 的策略实例。
+
+    (2026-10-12 D-R1: 取代原硬编码 {knife_catch, tail_oversold} map ——
+     break/g56/dragon 已有折叠契约却不在 choices 里; 盘中/日线由
+     scan_spec.kind 自动识别, 不靠人工名单。)
+    """
+    from app.market_cn.auto.strategies import all_strategies, autodiscover
+    from app.market_cn.auto.strategies.base import _has_fold_contract
+    autodiscover()
+    return {k: inst for k, inst in all_strategies().items() if _has_fold_contract(inst)}
+
+
+#: 有折叠契约的策略 key → 实例 (动态发现, 调用时重扫)
+STRATEGIES = _fold_strategies()
 
 #: 合成历史用的收盘序列 (连跌 + 前期走弱, 让日线门可判)
 _SYNTH_CLOSES = [126, 124, 122, 120, 118, 116, 114, 112,
@@ -273,14 +283,16 @@ def check_perf(strategy, code, bars) -> tuple[bool, str]:
 
 
 def main(argv=None) -> int:
+    strategies = _fold_strategies()
     ap = argparse.ArgumentParser(description="展示层单票对账 (verify)")
-    ap.add_argument("--strategy", default="knife_catch", choices=sorted(STRATEGIES))
+    ap.add_argument("--strategy", default=sorted(strategies)[0] if strategies else "knife_catch",
+                    choices=sorted(strategies) or ["knife_catch"])
     ap.add_argument("--code", default="600000")
     ap.add_argument("--days", type=int, default=120)
     ap.add_argument("--source", default="synth", choices=("synth", "db"))
     a = ap.parse_args(argv)
 
-    strategy = STRATEGIES[a.strategy]()
+    strategy = strategies[a.strategy]
     strategy.key = strategy.key or a.strategy
     bars = _load_bars(a.source, a.code, a.days)
     print(f"[verify] strategy={a.strategy} code={a.code} source={a.source} bars={len(bars)} "

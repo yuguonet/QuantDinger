@@ -128,13 +128,9 @@ def _estimate_size(obj) -> int:
 
 
 def _load_env():
-    """2026-10-12 P2: 收口到官方锚点 `core._paths.load_env_first_found`（同 gate_funnel）。"""
-    try:
-        from app.market_cn.auto.core._paths import load_env_first_found
-        load_env_first_found(os.path.join(PROJECT_ROOT, ".env"),
-                             os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env")))
-    except Exception:
-        pass
+    # P0 搬移 2026-10-12: 收口到 tools/common.py::load_env
+    from app.market_cn.auto.tools.common import load_env
+    load_env()
 
 
 def expr_min_bars(expr_str: str) -> int:

@@ -46,6 +46,16 @@ class ScanSpec:
 
 
 # ================================================================
+# entry: 极小 schema 消费工具 (D2 裁决 2026-10-12, 目标态 §3.2.2)
+# ----------------------------------------------------------------
+# 实现已迁 strategies/common/entry.py (P0 搬移 2026-10-12); 此处 re-export 保兼容。
+# ================================================================
+from app.market_cn.auto.strategies.common.entry import (  # noqa: E402,F401
+    entry_mode_is_close, entry_fill_price, entry_gap_ok,
+)
+
+
+# ================================================================
 # 标准化输出
 # ================================================================
 @dataclass
@@ -122,80 +132,16 @@ class ConfirmDecision:
 # tests/golden/test_known_divergence.py）。
 
 
-def _has_fold_contract(strategy) -> bool:
-    """策略是否真正实现了折叠契约（init_state/step/evaluate 非基类 NotImplemented）。
-
-    P3 薄壳分流用。`hasattr` 恒真（基类有定义），必须**试调用**或对 `__func__` 比对：
-    基类三个方法体只有 `raise NotImplementedError`，用 `__code__.co_code` 比对不可读，
-    改为比对「是否被子类覆写」（`type(s).init_state is not StrategyBase.init_state`）。
-    """
-    base_cls = type(strategy).__mro__
-    for m in ("init_state", "step", "evaluate"):
-        f = getattr(type(strategy), m, None)
-        if f is None:
-            return False
-        owner = next((c for c in base_cls if m in c.__dict__), None)
-        if owner is None or owner.__name__ == "StrategyBase":
-            return False            # 未被任何非基类覆写 = 仍是 NotImplemented
-    return True
-
-
-#: 逃生舱豁免名单（2026-10-11 复检 N-1；2026-10-12 §13.1 A-2 加到期机制）：
-#: 启用但**有意**不迁折叠契约的策略。
-#: 设计依据：`.py` 插件是逃生舱（目标态 §3.1），未迁折叠不等于缺陷，但必须**登记**——
-#: 未登记的缺契约策略 = 生产判定路径断裂（record writer 只能靠「退回直判」+ ERROR 活着）。
-#: 消费方：tests/present/test_enable_switch（门禁）、tools/doctor（显式标注 + 逾期告警）。
-#:
-#: 条目结构（2026-10-12 A-2，**豁免不得无到期**）：
-#:   reason        为什么豁免（含出处文档）
-#:   ticket        迁移工单 / 计划条目（设计 §13.1 A-x），指向收口动作
-#:   expires       到期日（YYYY-MM-DD）；逾期不自动清退，但必须可见
-#:   missing_views 豁免期间**缺失的能力视图**——doctor 逐条列出，
-#:                 防「CI 绿 = 功能全」的错觉（逃生舱常常是四视图缺两个）
-#: 清退条件：策略迁完折叠契约（init_state/step/evaluate）后**立即移出本名单**。
-FOLD_CONTRACT_EXEMPT: dict = {
-    "v1": {
-        "reason": ("2026-10-10 实证改造后回归（V1策略迭代与新策略实证_20261010.md）："
-                   "自持回测编排 scan_signals + entry_decision + run_exit(\"v1_combo\")，"
-                   "未迁折叠契约；"
-                   "record writer 下走「退回直判」分支（带 ERROR 日志），monitor 回退旧三决策。"
-                   "（2026-10-12 A-1b：原自持 `_run_backtest` 已参数化迁 core.exit_engines。）"),
-        "ticket": "§13.1 A-5（v1 补折叠契约 init_state/step/evaluate 后移出本名单）",
-        "expires": "2026-12-31",
-        "missing_views": ["realtime_progress", "present_slice"],
-    },
-}
-
-
-def exemption_report(today=None) -> list:
-    """逃生舱豁免体检表（doctor / 门禁共用；纯函数，不触库不触盘）。
-
-    返回 [{key, ticket, expires, days_left, expired, missing_views, reason}]，按 key 排序。
-    易错点：
-      · expires 是**日历日**不是交易日；
-      · 日期写错（解析失败）**视同逾期**，不许静默放过；
-      · 逾期不自动清退（清退是人工动作），本函数只负责把事实摆到台面上。
-    """
-    from datetime import date as _date
-    td = today or _date.today()
-    out = []
-    for key in sorted(FOLD_CONTRACT_EXEMPT):
-        ent = FOLD_CONTRACT_EXEMPT[key]
-        if not isinstance(ent, dict):        # 兼容旧字符串条目，别让老写法炸掉门禁
-            ent = {"reason": str(ent), "ticket": "", "expires": "", "missing_views": []}
-        exp_raw = str(ent.get("expires") or "")
-        days_left, expired = None, False
-        if exp_raw:
-            try:
-                days_left = (_date.fromisoformat(exp_raw) - td).days
-                expired = days_left < 0
-            except ValueError:
-                expired = True               # 日期格式错 = 视同逾期
-        out.append({"key": key, "ticket": ent.get("ticket", ""), "expires": exp_raw,
-                    "days_left": days_left, "expired": expired,
-                    "missing_views": list(ent.get("missing_views") or []),
-                    "reason": ent.get("reason", "")})
-    return out
+# ================================================================
+# 折叠契约检测 (P0 搬移 2026-10-12 → strategies/common/contract.py)
+# ----------------------------------------------------------------
+# 实现已迁 common/contract.py; 此处 re-export 保兼容（_has_fold_contract 旧名保留）。
+# ================================================================
+from app.market_cn.auto.strategies.common.contract import (  # noqa: E402,F401
+    has_fold_contract as _has_fold_contract,
+    FOLD_CONTRACT_EXEMPT,
+    exemption_report,
+)
 
 
 @dataclass
@@ -227,12 +173,12 @@ class StrategyBase:
       default_params    策略参数默认值 (config.json strategies.<key>.params 可覆盖)
       use_unified_prefilter  扫描层是否做 U1~U4 统一预过滤 (默认 True; 回测未含 U1~U4 的策略设 False)
       signal_state      扫描落库初始状态 (默认 watch_pending; 盘中即买策略设 buy_today)
-      entry_at_close    入场在尾盘/收盘 (T+1 当日不可卖, monitor 止损守卫跳过当日; 默认 False)
+      entry_is_at_close   是否收盘/盘中入场 (yaml entry.mode 驱动; T+1 当日不可卖)
       exit_exec_same_day     出场当日执行并当日平账 (默认 False=次日开盘执行)
       intraday_shortlist     kind=intraday_window 策略需实现: 仅用最新快照的便宜预筛, 返回 {code: snap}
       intraday_exit          盘中回测出场回调 (默认 = 次交易日开盘卖; 多日持有策略必须覆盖)
       rolling_preview        True=窗口起点起每分钟滚动预览 (run_scan_knife 循环调用, 每轮
-                             清理本轮落选的 buy_today 行), 14:56 终审 (默认 False=仅终审一次)
+                             清理本轮落选的 buy_today 行), 14:50 终审 (默认 False=仅终审一次)
       data_needs             数据需求声明 (D1, §3.4): ('daily','minute_live','quote','lhb',...);
                              框架/hub 按声明加载, 未被任何策略声明的通道零加载 (拔插), 默认 ('daily',)
     """
@@ -252,7 +198,6 @@ class StrategyBase:
     SEED_BARS: int = 200                # 框架统一 seed 根数
     use_unified_prefilter: bool = True
     signal_state: str = "watch_pending"
-    entry_at_close: bool = False
     exit_exec_same_day: bool = False
     rolling_preview: bool = False
     data_needs: tuple = ("daily",)     # 数据需求声明 (hub 注入; 当前声明制 Phase 1: 仅元数据)
@@ -450,6 +395,29 @@ class StrategyBase:
         if override:
             p.update(override)
         return p
+
+    def entry_spec(self) -> dict:
+        """策略宏 `<key>.yaml` 的 `entry:` 段 (D2 极小 schema, 2026-10-12)。
+
+        无 yaml / 无 entry: 键 → {} (调用方按类属性/缺省行为)。
+        mtime 缓存由 strategies._yaml_doc 承担; 本方法只是取段。
+        """
+        try:
+            from app.market_cn.auto.strategies import _yaml_doc
+            doc, _ = _yaml_doc(self.key)
+            e = (doc or {}).get("entry")
+            return e if isinstance(e, dict) else {}
+        except Exception:
+            return {}
+
+    def entry_is_at_close(self) -> bool:
+        """是否收盘/盘中入场: yaml `entry.mode` 单一事实源 (P2 2026-10-12 删类属性兜底)。
+
+        mode=close|intraday_window → True; mode=next_open → False; 未声明 → False。
+        """
+        from app.market_cn.auto.strategies.common.entry import entry_mode_is_close
+        v = entry_mode_is_close(self.entry_spec())
+        return v if v is not None else False
 
     # ================================================================
     # 折叠契约 (= core.present.contract.StrategyProtocol 的实现面)

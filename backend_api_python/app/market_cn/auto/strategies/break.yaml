@@ -14,6 +14,10 @@ meta:
   day_start: 4                 # 逐日起点 (低于此根数不判)
   day_min_n: 6                 # 低于此根数直接返回空
 
+entry:
+  mode: next_open              # D1 开盘入场 (D2 极小 schema, 2026-10-12)
+  price: open                  # 成交价 = D1 开盘价 (entry_fill_price 消费)
+
 exit:
   # P1-7: `exit:` 块**只声明 mode**（出场引擎选择），阈值一律读下方 `params:` 段。
   #   修前此处还写了 stop_loss/trailing_stop/hold_days，与 params 段完全重复且

@@ -45,6 +45,9 @@
 """
 from __future__ import annotations
 
+# P1 2026-10-12: 统一时钟口径
+from app.market_cn.auto.store import TZ_CN, today_str
+
 import argparse
 import bisect
 import json
@@ -1098,7 +1101,7 @@ def projection_ledger_refresh(window=30, keys=None, dry_run=True):
 
 def _now_str():
     from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def render_ledger(plan, stat, replay_stat):
