@@ -77,8 +77,7 @@ per-indicator 锚点)。此前 MACD 专门做了一个 `anchor=(ef,es,dea)` 参�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 # ★ EMA / MACD 的纯数学只有一份, 在基座叶子层 `app/utils/indicators.py`。
 #   依赖方向必须是 auto → utils (基座不得反向依赖业务层), 故本模块**委托**而非自带副本。

@@ -22,12 +22,9 @@ canonical schema（对齐现有基线 JSON 字段名，新增策略照此写）:
 
 from __future__ import annotations
 
-#: canonical 输出字段顺序（稳定，便于 golden 逐字段比对）
-CANONICAL_FIELDS = (
-    "code", "strategy", "d0_date", "entry_date", "entry_price",
-    "exit_date", "exit_price", "exit_day", "exit_reason",
-    "return_pct", "peak_return_pct", "exec_basis", "score", "label",
-)
+#: 2026-10-12 P2: 原 `CANONICAL_FIELDS`（字段顺序表）声明供 golden 逐字段比对，
+#: 实际**零消费者**（全仓 grep 仅命中本处定义）⇒ 删。真正的字段契约就是下面
+#: `build_trade` 的返回字典——留一份不同步的表，反而会在加字段时悄悄漂移。
 
 #: 载荷别名 → canonical 名（旧策略由本表兜，新策略直接用 canonical 名）
 _ALIAS = {

@@ -50,7 +50,6 @@ from app.market_cn.auto.core.increm import (  # noqa: E402
     anchor_step,
     atr_pct as _atr,
     boll_pctb as _boll_pctb,
-    roll_sum as _roll_sum,
     rsi as _rsi,
     sma as _sma_np,
     window_of as _window_of,

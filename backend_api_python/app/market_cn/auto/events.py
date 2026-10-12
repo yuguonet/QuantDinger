@@ -145,21 +145,6 @@ def mark_event(name: str, date: str) -> bool:
     return name in KNOWN_EVENTS
 
 
-def mark_if_ready(name: str, date: str) -> bool:
-    """deriver 判定已就绪才 mark。无 deriver 的事件恒 False(请直接 mark_event)。"""
-    deriver = _DERIVERS.get(name)
-    if deriver is None:
-        return False
-    try:
-        ok = bool(deriver(date))
-    except Exception as e:
-        logger.debug("[events] mark_if_ready(%s,%s) deriver 异常: %s", name, date, e)
-        return False
-    if ok:
-        mark_event(name, date)
-    return ok
-
-
 def event_ready(name: str, date: str) -> bool:
     """事件在 date 是否就绪: 缓存 ∪ DB ∪ deriver 自愈。"""
     key = (name, date)

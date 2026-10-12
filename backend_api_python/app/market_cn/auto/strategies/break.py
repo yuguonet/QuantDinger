@@ -177,8 +177,6 @@ def _entry_gate(bars, i, streak_len, code):
       gate ∈ {"核心", "高板", "温和", "强势", "观察"}
     """
     closes = [float(b["close"]) for b in bars]
-    highs = [float(b["high"]) for b in bars]
-    lows = [float(b["low"]) for b in bars]
     # %B (BOLL 20,2)
     if i < 19:
         return "观察", None, None
@@ -414,7 +412,7 @@ class BreakStrategy(StrategyBase):
 
         旧 `backtest_stock` 的入场段只拦 `entry_price <= 0`（无 gap 门），此处同口径。
         """
-        bar, code = inp.bar, inp.code
+        bar = inp.bar            # (code 未用: exec 载荷不带 code, 由 build_trade 统一注入)
         entry_price = float(bar.get("open") or 0)
         if entry_price <= 0:
             return []
@@ -856,7 +854,7 @@ def _run_backtest_breakbuy(bars, entry_idx, entry_price, hold_days=7, stop_loss=
             if _mbars:
                 # P3b 1m 真实腿: 逐槽位重放止损/追踪 (知日内先后; 线用开盘时已知峰值)
                 _fill, _mi, _peak_after = replay_sell_intraday(
-                    _mbars, entry_price=entry_price, stop_line=stop_line,
+                    _mbars, stop_line=stop_line,           # entry_price 形参已删(从未使用)
                     trail_pct=trailing_stop, require_profit=entry_price,
                     dn=dn, peak=peak_prev)
                 if _peak_after > peak:
@@ -1123,10 +1121,14 @@ def turnover_sig(ctx: Ctx) -> float:
 
 
 def break_features(ctx: Ctx, stock_info=None) -> dict:
-    """break 信号展示字段（逐字镜像 break._signal_to_legacy_dict + scan_signals 的 extra）。
+    """break 信号展示字段（与 `scan_signals` 产出的 `extra` 同键集，二者必须同步改）。
 
     门表用 bk_feat 判资格；本函数额外给出**信号展示字段**（连板/断板期/换手率），
     保证与 python 参考版 trades 逐字一致。逻辑单点维护于此。
+
+    ⚠ 2026-10-12: 原 docstring 声称镜像 `break._signal_to_legacy_dict` —— 该符号在
+      break.py **并不存在**（同名函数只存在于 v1/relay3，且已删）⇒ 是失效引用。
+      实际同口径对象是 `scan_signals` 的 Signal.extra（见 tests/present/test_projection.py）。
     """
     s = bk_struct(ctx)
     if s is None:

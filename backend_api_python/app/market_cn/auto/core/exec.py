@@ -126,7 +126,7 @@ def _slot_ohlc(slot: dict) -> tuple:
             float(slot["low"]), float(slot["close"]))
 
 
-def replay_sell_intraday(minute_bars, *, entry_price: Optional[float] = None,
+def replay_sell_intraday(minute_bars, *,   # 2026-10-12 P2: 删从未使用的 entry_price 形参
                          stop_line: Optional[float] = None,
                          trail_pct: Optional[float] = None,
                          require_profit: Optional[float] = None,

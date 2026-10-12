@@ -31,14 +31,12 @@ import traceback
 
 
 def _load_env():
+    """2026-10-12 P2: 收口到官方锚点 `core._paths.load_env_first_found`（原手写副本已删）。"""
     try:
-        from dotenv import load_dotenv
-        for _p in (os.path.join(os.getcwd(), ".env"),
-                   os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                       os.path.dirname(os.path.abspath(__file__))))), ".env")):
-            if os.path.isfile(_p):
-                load_dotenv(_p, override=False)
-                break
+        from app.market_cn.auto.core._paths import load_env_first_found
+        load_env_first_found(os.path.join(os.getcwd(), ".env"),
+                             os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                                 os.path.dirname(os.path.abspath(__file__))))), ".env"))
     except Exception:
         pass
 

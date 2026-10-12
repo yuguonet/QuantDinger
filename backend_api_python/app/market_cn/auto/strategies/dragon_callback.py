@@ -806,18 +806,11 @@ class DragonCallbackStrategy(StrategyBase):
                 continue                     # 升序：更旧的 gap 更大，可直接剪枝
             if gap < sp["gap_min"]:
                 continue                     # 更新的还没到回调窗（gap 太小）
-            g20 = rec["gain20"]
-            # 6 拐点三腿的输入（回调期特征，由 ring 窗口算出）
+            # ★ 回调期三腿特征 (depth/yin/ma20_dev) **不在此手算** —— 它们由注册门函数
+            #   `dc_depth/dc_yin/dc_ma20_dev_val` 各自从 Ctx(win, lu_rel, i) 现算
+            #   (2026-10-12 清理: 此处曾有一份同式的局部变量练习 —— g20/seg/depth/
+            #   pb_yin/yin_ratio/d0_vs_ma20 —— 重构到注册函数后全部成死变量)。
             lu_rel = len(ring_full) - 1 - gap          # lu 在 ring_full 的相对位置
-            seg = ring_full[lu_rel + 1:]
-            depth = (min(r["l"] for r in seg) / rec["close"] - 1) * 100 if seg else 0.0
-            pb_total = gap
-            pb_yin = sum(1 for r in seg if r["c"] < r["o"])
-            yin_ratio = pb_yin / pb_total if pb_total > 0 else 1.0
-            d0_vs_ma20 = None
-            if len(closes) >= 20:
-                ma20 = sum(closes[-20:]) / 20
-                d0_vs_ma20 = (c_i / ma20 - 1) * 100 if ma20 > 0 else None
             # 门 g1~g10 —— **门表求值**（冻结 lu 特征 + 增量 rsi6 经 ext 注入）
             ctx_d = Ctx(win, i, lu_idx=lu_rel, params=sp, board_type=bt, code=code,
                         stock_info=si, ext={"lu_frozen": rec, "rsi6_val": rsi_val},

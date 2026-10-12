@@ -485,8 +485,8 @@ def main():
           + "; ".join(f"{k}∈[{'/'.join(_fmt(v) for v in grid[k])}]" for k in keys),
           f"- 基准参数 (代码默认{'+补丁' if base_patch else ''}): "
           f"{json.dumps({k: base_eff[k] for k in keys if k in base_eff}, ensure_ascii=False)}",
-          f"- 两段=按入场日排序前后半; **单段有效=过拟合; 只认长窗口 "
-          f"(150d/300d/600d 可差 10pp)**; 本报告落 tmp/ 非权威, 采纳前须与代码现状比对",
+          "- 两段=按入场日排序前后半; **单段有效=过拟合; 只认长窗口 "
+          "(150d/300d/600d 可差 10pp)**; 本报告落 tmp/ 非权威, 采纳前须与代码现状比对",
           "",
           "## 全组合表 (按均收降序)",
           _md_table(hdr, [_row_cells(r, keys) for r in ranked[:max(args.top, 1)]]),

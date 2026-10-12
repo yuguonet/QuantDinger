@@ -61,8 +61,14 @@ KERNEL_FLOOR = 600
 #:   · `__init__.py` 466→474（市场门两层口径的文档更正；cap 500 不动）；
 #:   · PROGRAM_CAP 1225→1330（新增一件的必然结果；实测 1305）。
 #:   属**功能增长**（消除回测唯一的前视输入），非膨胀 —— 按门禁规定登记后上调。
+#: 2026-10-12 登记（P1-5 修复，见 docs/auto代码审计报告_20261011.md §7.5）：
+#:   `core/replay/__init__.py` 474→490（TradesCollector.finish 不再用 `ei<0 → ei=0`
+#:   静默兜底 —— 那会把 peak 扩成**全历史最高价**、exit_day 报成**全窗口长度**而不报错；
+#:   改为跳过该笔 + `unmatched_entry` 落明细 + WARNING）。
+#:   PROGRAM_CAP 1330→1350、`__init__` cap 500→520：给回余量。
+#:   属**功能增长**（消除一处静默降级，纪律 #14），非膨胀 —— 已登记后上调。
 PROGRAM_MODULES = [
-    ("core/replay/__init__.py", 350, 474, 500),   # 目标含 trade_map，故包内三件一起看
+    ("core/replay/__init__.py", 350, 490, 520),   # 目标含 trade_map，故包内三件一起看
     ("core/replay/intraday.py", 0, 130, 143),     # 2026-10-09: +12 (mkt_slots/mkt_series)
     ("core/replay/trade_map.py", 0, 111, 122),     # 2026-10-08 D级修: 登记 106→实测 111
     ("core/replay/gate_dbg.py", 60, 69, 80),       # 终态② Step1 新增门诊断收集器
@@ -73,7 +79,7 @@ PROGRAM_MODULES = [
 
 #: 程序层总上限（防三件互相挦补）
 #: 2026-10-09: 1225→1330（新增 mkt_slots.py 66 行 + intraday 118→130 + __init__ 466→474）。
-PROGRAM_CAP = 1330
+PROGRAM_CAP = 1350
 
 
 # ================================================================

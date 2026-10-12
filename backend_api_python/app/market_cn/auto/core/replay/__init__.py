@@ -25,6 +25,8 @@ Excel 比喻：本模块 = 「统计/透视表」与「历史小计」共用的�
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -145,9 +147,7 @@ class DailyFeed:
                           stages=None, ctx_provider=provider,
                           stateful=True)
 
-    def last_bar(self):
-        return self.bars[-1] if self.bars else None
-
+    # 2026-10-12 P2: 删零调用的 `last_bar()`（省 fallback 于 goto git 历史）
     def index_of_date(self, date: str) -> int:
         for i, b in enumerate(self.bars):
             if str(b.get("time"))[:10] == str(date)[:10]:
@@ -241,6 +241,11 @@ class TradesCollector:
         self.exec_basis = exec_basis
         self.trades: list[dict] = []
         self._chain: dict | None = None
+        # 2026-10-12 P1-5: 契约破损登记 —— finish() 时入场日不在回放窗口的笔明细。
+        #   旧实现 `ei < 0 → ei = 0` 会把 peak 扩成**全历史最高价**、exit_day 报成
+        #   **全窗口长度**, 且既不报错也不登记 ⇒ 静默产出严重虚高的 trade。这里改为
+        #   跳过该笔 + 落明细 + WARNING（纪律: 静默降级是头号敌人）。正常路径永不触发。
+        self.unmatched_entry: list[dict] = []
 
     # ---- 流式消费 ----
     def feed(self, idx: int, ev) -> None:
@@ -285,9 +290,22 @@ class TradesCollector:
         entry_price = float(exec_pl.get("entry_price") or 0)
         if entry_price <= 0:
             return
-        ei = feed.index_of_date(exec_pl.get("entry_date") or chain.get("exec_date") or "")
+        ed = exec_pl.get("entry_date") or chain.get("exec_date") or ""
+        ei = feed.index_of_date(ed)
         if ei < 0:
-            ei = 0
+            # 2026-10-12 P1-5: 入场日不在回放窗口 ⇒ peak / exit_day 都无从计算。
+            #   旧 `ei = 0` 兜底的后果: peak 取全窗口最高 (虚高)、exit_day = 窗口长度
+            #   (虚高) ⇒ peak_return_pct / ret_per_day 失真且**完全静默**。宁可不产这一笔。
+            rec = {"code": self.code, "strategy": self.strategy,
+                   "entry_date": str(ed)[:10],
+                   "ready_date": str(chain.get("ready_date") or "")[:10],
+                   "win": [str(b.get("time"))[:10] for b in feed.bars[:1] + feed.bars[-1:]]}
+            self.unmatched_entry.append(rec)
+            logging.getLogger(__name__).warning(
+                "[replay] %s/%s 入场日 %s 不在回放窗口 %s ⇒ 该笔不计入 trades"
+                "（旧口径 ei=0 会产出虚高 peak/exit_day）",
+                self.code, self.strategy, rec["entry_date"], rec["win"])
+            return
         last = feed.bars[-1]
         exit_price = float(last.get("close") or 0)
         if exit_price <= 0:

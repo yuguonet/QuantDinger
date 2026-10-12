@@ -143,7 +143,8 @@ def run_truth(days: int = 300) -> list[dict]:
     """生产信号对账：回放是否复现同一天的 ready。"""
     from app.market_cn.auto import strategies as reg
     from app.market_cn.auto.core.data.hub import daily
-    from app.market_cn.auto.core.replay import DailyFeed, TradesCollector, replay
+    # 2026-10-12 P2: 原此处另有一行 `from ...core.replay import DailyFeed, TradesCollector,
+    #   replay` —— 与本行同模块同对象且是严格子集 ⇒ 恒被覆盖(F811)。删冗余行。
     from app.market_cn.auto.core.replay import (DailyFeed, TradesCollector, replay,
                                                 replay_batch, load_market_gain)
     from app.market_cn.auto.core.replay.intraday import make_feed

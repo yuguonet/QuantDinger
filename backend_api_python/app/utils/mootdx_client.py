@@ -63,6 +63,42 @@ def _live_servers() -> list:
         return []
 
 
+def _daemonize_heartbeat() -> None:
+    """把 TDX 客户端的心跳线程设为 daemon（2026-10-12 实测修复，见 tmp/_screener_hang.py）
+
+    现象：run_skill(market_screener) 恒定 600s 超时，但流水线本体只要 ~55s。
+    真因：`Quotes.factory(heartbeat=True)` 会起一条 tdxpy.heartbeat.HeartBeatThread，
+    它是**非 daemon** 线程（10s 周期 stop_event.wait() 无限循环，只有 disconnect
+    才停）。主线程结束后 threading._shutdown() 会 join 它 ⇒ 永不返回 ⇒
+    ① subprocess.run(timeout=600) 必然超时；② concurrent.futures 的池线程靠
+    threading._register_atexit 唤醒，而该回调排在 join 之后 ⇒ 连唤醒信号都收不到，
+    于是「mkline-timeout_*」这类线程也一起卡住。
+
+    心跳只为长连接保活，进程要退出时不值得等它 —— 设为 daemon 即可随进程退出。
+    两条可能的来源库（mootdx 2.x 走 tdxpy，1.x 走 pytdx）都覆盖，幂等。
+    """
+    import importlib
+
+    for mod_name, cls_name in (("tdxpy.heartbeat", "HeartBeatThread"),
+                               ("pytdx.heartbeat", "HqHeartBeatThread")):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None or getattr(cls, "_qd_daemonized", False):
+            continue
+        _orig_init = cls.__init__
+
+        def _init(self, *args, __orig=_orig_init, **kwargs):
+            __orig(self, *args, **kwargs)
+            self.daemon = True       # 在 start() 之前改写，daemon 只有在启动前可设
+
+        cls.__init__ = _init
+        cls._qd_daemonized = True
+        logger.debug("[mootdx] %s.%s 已改为 daemon 线程", mod_name, cls_name)
+
+
 def _create_client(servers: Optional[list] = None) -> Optional[object]:
     """创建并连接一个 mootdx Quotes 客户端（provider 服务器优先，bestip 回退）。
 
@@ -73,6 +109,10 @@ def _create_client(servers: Optional[list] = None) -> Optional[object]:
         servers: 依次尝试的 (host, port) 列表；None 时按默认顺序取 live 服务器。
     """
     from mootdx.quotes import Quotes
+
+    # 必须早于 Quotes.factory(heartbeat=True)：心跳线程在 connect() 里 start，
+    # daemon 属性只能在 start 之前改写。
+    _daemonize_heartbeat()
 
     # 策略1: 从 provider.tdx_ex 获取已探测的可用 HQ 服务器
     if servers is None:

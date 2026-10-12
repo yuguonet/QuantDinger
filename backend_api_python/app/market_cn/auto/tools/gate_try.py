@@ -36,7 +36,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -71,7 +70,8 @@ MIN_BARS_HINT: Dict[str, int] = {
 # 旧的 FULL_MARKET_WARN=500 固定阈值已于 2026-09-22 废弃：全市场实测显示
 # 深层门试算只要 0.25s/条，按股票只数拦是误伤；改为按预估耗时/内存判断。
 from app.market_cn.auto.tools.gate_funnel import (  # noqa: E402
-    guard_cost, estimate_cost, TRIAL_MS_PER_ROW,
+    guard_cost, TRIAL_MS_PER_ROW,
+    _pool_signature,        # 2026-10-12 P2: 复用同一份实现（原为逐字重复的第二份）
 )
 
 # 进程内缓存：key = (strategy, days, pool_sig, label) → (rows, gate_order, t_loaded)
@@ -128,22 +128,13 @@ def _estimate_size(obj) -> int:
 
 
 def _load_env():
+    """2026-10-12 P2: 收口到官方锚点 `core._paths.load_env_first_found`（同 gate_funnel）。"""
     try:
-        from dotenv import load_dotenv
-        for _p in (os.path.join(PROJECT_ROOT, ".env"),
-                   os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env"))):
-            if os.path.isfile(_p):
-                load_dotenv(_p, override=False)
-                break
+        from app.market_cn.auto.core._paths import load_env_first_found
+        load_env_first_found(os.path.join(PROJECT_ROOT, ".env"),
+                             os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env")))
     except Exception:
         pass
-
-
-def _pool_signature(codes) -> str:
-    """股票池签名（缓存 key 用）。"""
-    if codes is None:
-        return "full"
-    return hashlib.md5(",".join(sorted(codes)).encode()).hexdigest()[:12]
 
 
 def expr_min_bars(expr_str: str) -> int:
@@ -206,15 +197,23 @@ def _get_probe_rows(strategy: str, days: int, codes, label: str,
 def _order_funnel_local(rows: list, order: list) -> list:
     """逐门漏斗：(gate_id, reach, passed, rejected)。
 
-    与 rule_audit._order_funnel 同口径，但返回结构化列表。
+    2026-10-12 P1-7 修正 —— 与 rule_audit._order_funnel **统一为「非 False 即通过」**：
+      原写法用 `is True` 判通过 ⇒ 第三态 (短路未求值的 None / 配置级 "off" / 字段缺失)
+      的行**既不算 pass 也不算 reject，凭空消失**；而 `current = passed` 递推会把这种
+      丢失逐门累积，深层门的到达池被清空 ⇒ 恒报"到达池为空" (:413)，实际到达池非空。
+      rule_audit 侧一直是 `(rejected if g is False else passed)` —— 同一批 sample 两个
+      工具必须给出同一个漏斗，否则 docstring 自陈的"同口径"是假声明。
+      修正后 passed ∪ rejected = reach（完备且互斥），第三态归入"未被拦截"。
+    ⚠ 仍存一处**已知差异**（本次不修，勿当成 bug）：rule_audit 会额外按 `_attr` 剔除
+      "已在更前门被拦截"的行（其 `pre` 集合），本函数无该排它语义。
     """
     current = list(rows)
     result = []
     for gid in order:
-        passed = [r for r in current if r.get("_g", {}).get(gid) is True]
         rejected = [r for r in current if r.get("_g", {}).get(gid) is False]
+        passed = [r for r in current if r.get("_g", {}).get(gid) is not False]
         result.append((gid, list(current), passed, rejected))
-        current = passed  # 下一道门的到达池 = 本门通过的
+        current = passed  # 下一道门的到达池 = 本门未被拦截的行
     return result
 
 
@@ -476,8 +475,8 @@ def gate_try(
             "reach": len(reach_pool),
             "n_exprs": len(exprs),
             "est_trial_sec": est_trial_sec,
-            "note": (f"深层门到达池小（实测全市场 g_overheat 仅 172 行 → 0.25s/条）；"
-                     f"浅层门到达池可达 50 万行 → 约 21s/条。试算前先看 reach 判断量级。"),
+            "note": ("深层门到达池小（实测全市场 g_overheat 仅 172 行 → 0.25s/条）；"
+                     "浅层门到达池可达 50 万行 → 约 21s/条。试算前先看 reach 判断量级。"),
             "build": cost,
         },
         "window": {

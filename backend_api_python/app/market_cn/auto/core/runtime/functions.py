@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.market_cn.auto.core.market import MarketSpec, get_board_type, is_limit_up
+from app.market_cn.auto.core.market import MarketSpec, is_limit_up
 from app.market_cn.auto.core.runtime import resume as RES   # 断点续传单一内核
 
 
@@ -538,7 +538,8 @@ def ensure_gate_init() -> None:
     """
     import app.market_cn.auto.strategies as strategies_pkg  # 触发 autodiscover（注册策略私有函数）
     strategies_pkg.autodiscover()
-    import app.market_cn.auto.core.runtime.gate_stdlib  # noqa: F401（注册 stdlib 共享函数）
+    # 副作用导入：注册 stdlib 共享函数（不是"未使用的导入"，勿删）
+    import app.market_cn.auto.core.runtime.gate_stdlib  # noqa: F401
 
 
 def _bind(ctx: Ctx, name: str, fn, is_offset: bool):

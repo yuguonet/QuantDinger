@@ -20,7 +20,6 @@ step2/3/4/5 共用同一份 —— step2 与 step3 (14:25~14:45)、step4 (14:58~
 from __future__ import annotations
 
 import os
-import json
 from datetime import datetime
 
 from app.utils.logger import get_logger
@@ -183,23 +182,41 @@ def _hold_day(row, today):
         return 2
 
 
+_TLEG_SPEC_CACHE = {}
+
+
+def _market_spec_of(key):
+    """策略声明的市场 MarketSpec (架构 §9: `meta.market` → MarketSpec)。
+
+    ⚠ 2026-10-11 P0-2: 做T 的 T+1 约束必须按**该策略自己的市场**推导。此前
+    `_eval_t_legs` 未把 spec 传下去 ⇒ `t_legs.t_constraints` 落 `default_market()`;
+    当前默认市场恰为 A 故"侥幸正确", 一旦策略声明其它市场 (intraday_t0=True)
+    就会用错的 min_hold_day / net_zero。
+    """
+    if key not in _TLEG_SPEC_CACHE:
+        from app.market_cn.auto.core.runtime.evaluate import load_strategy
+        _TLEG_SPEC_CACHE[key] = load_strategy(key).market_spec
+    return _TLEG_SPEC_CACHE[key]
+
+
 def _t_leg_position(row, today, spec=None):
     """持仓行 → t_legs.eval_t_legs 的 position dict (含 sellable_qty)。
 
     A股 T+1: 入场当日 sellable=0; 其后=仓位 (signals 表无数量列, 用 extra.position_qty
     或默认 1.0 归一化仓位)。t0 市场 (spec.intraday_t0) 当日即可卖。
+
+    ⚠ spec **必须由调用方传入该策略的市场** (2026-10-11 P0-2); 留 None 会退化
+    `default_market()`, 跨市场时用错 intraday_t0。
     """
     extra = row.get("extra") or {}
     qty = float(extra.get("position_qty") or 1.0)
     hold = _hold_day(row, today)
-    entry_today = str(row.get("entry_date") or "")[:10] == str(today)[:10]
-    try:
-        from app.market_cn.auto.core.market import default_market
-        sp = spec or default_market()
-        t0 = bool(getattr(sp, "intraday_t0", False))
-    except Exception:
-        t0 = False
-    sellable = qty if (t0 or not entry_today) else 0.0
+    # 2026-10-11 P0-2: T+1 语义收口到 `t_constraints` 唯一实现 (此前此处内联
+    # `t0 or not entry_today`, 与 core/t_legs 的第二份语义; 且 try/except 吞掉取
+    # spec 失败后 t0=False, 属静默降级)。min_hold_day: t0 市场=1, A股=2。
+    from app.market_cn.auto.core.t_legs import t_constraints
+    min_hold = int(t_constraints(spec)["min_hold_day"])
+    sellable = qty if hold >= min_hold else 0.0
     return {"code": row.get("code"), "qty": qty, "sellable_qty": sellable,
             "entry_price": float(row.get("entry_price") or 0), "hold_day": hold}
 
@@ -220,11 +237,15 @@ def _eval_t_legs(row, s_obj, today, snap, series_rows):
     hold = _hold_day(row, today)
     if hold < 1:
         return []
-    pos = _t_leg_position(row, today)
+    # 2026-10-11 P0-2: 取**本策略声明的市场**并一路传下去 —— 此前 spec 未传,
+    # t_constraints 落 default_market() (多市场并存时 T+1/net_zero 全错)。
+    sp = _market_spec_of(row.get("strategy") or ds.DRAGON_STRATEGY)
+    pos = _t_leg_position(row, today, spec=sp)
     if pos["sellable_qty"] <= 0 and hold <= 1:
         return []
-    # ctx: 当日快照统计 (t_hilo 等示例约定)
+    # ctx: 当日快照统计 (t_hilo 等示例约定) + 市场约束 (供触发器/覆写钩子读, 免重算)
     from app.market_cn.auto.core.t_legs import t_constraints
+    cons = t_constraints(sp)
     stats = None
     if snap:
         try:
@@ -241,9 +262,10 @@ def _eval_t_legs(row, s_obj, today, snap, series_rows):
         except (TypeError, ValueError):
             stats = None
     ctx = {"snap": snap, "day": stats, "series": series_rows or [],
-           "sold_today_pct": float(extra.get("t_sold_today_pct") or 0)}
+           "sold_today_pct": float(extra.get("t_sold_today_pct") or 0),
+           "constraints": cons}
     try:
-        intents = s_obj.t_leg_intents(pos, ctx, hold_day=hold) or []
+        intents = s_obj.t_leg_intents(pos, ctx, hold_day=hold, spec=sp) or []
     except Exception as e:
         logger.warning("[dragon_monitor] t_legs 求值失败 %s/%s: %s",
                        row.get("code"), row.get("strategy"), e)

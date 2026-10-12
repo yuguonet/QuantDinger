@@ -128,6 +128,9 @@ def _dispatch_card(name: str, spec) -> str:
         f"- 入口：{fn_note}（默认 {default_fn or 'run'}）\n"
         f"- 结果读法：返回体 {{ok, result(截断预览), full_path, elapsed_s}}——"
         f"结论引用预览，明细看 full_path 文件，不要全量贴回对话\n"
+        f"- **空结果 = 结论已成立**：`analyzed` 为空时按 §重活分发的空结果纪律直接收尾交付"
+        f"（说清 strategy / pool_size / hard_reasons / missing），"
+        f"**不要**转为主对话逐个取数把同一套筛选重跑一遍\n"
         f'- 方法论原文（通常不必）：read_skill(name="{name}")'
     )
 

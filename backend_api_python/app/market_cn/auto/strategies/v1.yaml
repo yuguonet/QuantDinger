@@ -2,6 +2,7 @@
 # V1 追板策略 (可买真首板 → 次日开盘买入, 让利润奔跑) — IDE 门表单文件
 # 定位: 与龙回头(连板龙头回调)/断板(涨停开板)错开赛道, 只做前期无涨停的低位首板。
 # 2026-10-10 上线 (enabled=true): 出场=让利润奔跑(let_profits_run, trail/stop/expiry, 非 D2 一刀切)。
+# ⚠ 2026-10-12 曾短暂下线 (enabled=false) 后按用户裁定**回滚为上线** —— 见 meta.enabled 注释。
 # 辨识度: 2026-10-10 数据驱动重设 (tmp/v1_board_buyable_study.py) — 8门见 gates 段;
 #   一字板连板率高但 D1 买不进(消息股) ⇒ 剔除, 只研究可买首板内部的 1进2 因子。
 # 回测: 2026-10-10 经 v1.py 自持回测入口覆写恢复官方 CLI 回测
@@ -11,7 +12,18 @@ meta:
   name: V1
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 1
-  enabled: true                 # 策略开关 (§3.5): 宏内一行 = 上下线; 2026-10-10 上线(让利润奔跑口径)
+  # 策略开关 (§3.5): 宏内一行 = 上下线。2026-10-10 上线 (让利润奔跑口径)。
+  # 折叠契约: v1 **无** init_state/step/evaluate, 但已按「逃生舱」登记在
+  #   strategies/base.py::FOLD_CONTRACT_EXEMPT (2026-10-11) —— `.py` 插件未迁折叠
+  #   ≠ 缺陷, 但必须**登记**。生产侧降级路径具名: scan「退回直判」+ERROR /
+  #   rebuild 排除出投影集 / present_daily 落 skipped / monitor 回退旧三决策;
+  #   回测走本文件自持 `backtest_stock`(_run_backtest), 不经 base 薄壳。
+  #   (2026-10-12: 曾因 test_enable_switch/doctor **没读这份名单**误报"契约缺失=断裂",
+  #    已修两处消费者; 详见 docs/auto代码审计报告_20261011.md §7.7。)
+  # 若要真正迁折叠契约: 先抽「共用门实现」使 scan_signals 与 evaluate 同源
+  #   → 补 init_state/step/evaluate → present 切片回归 + golden 对拍(约 120 行) →
+  #   **并把 v1 移出 FOLD_CONTRACT_EXEMPT**(否则 test_enable_switch 的陈旧登记守卫会红)。
+  enabled: true
   enumeration: day             # 枚举方式: 逐日候选 → D0 信号 → 次日开盘入场 (区别于 dragon 的 lu_idx 遍历)
   day_flow: v1                 # day 流程口径 (信号展示字段集)
   day_start: 25                # 逐日起点

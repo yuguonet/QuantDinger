@@ -940,20 +940,6 @@ def get_watch_pending(trade_date=None, days=5):
                         enabled_only=True)
 
 
-def get_signal_by_code(code, trade_date=None):
-    """取某票当前活跃信号 (买入/持仓/卖出) 最新一条。
-
-    Returns:
-        dict | None: 该股最新一条活跃信号行；无则 None。
-    """
-    rows = list_signals(states=ACTIVE_GROUP_STATES, trade_date=trade_date,
-                        days=VISIBLE_WINDOW_DAYS)
-    for r in rows:
-        if r["code"] == code:
-            return r
-    return None
-
-
 def get_markers(code, days=60):
     """买卖点标记 (K线图 overlay 用): 信号点/买点/卖点。
 

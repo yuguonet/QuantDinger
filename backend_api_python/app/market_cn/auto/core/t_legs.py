@@ -19,8 +19,10 @@ as-of: trigger 由上层受控表达式/预计算量求值, 本模块只消费�
 """
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from app.market_cn.auto.core.market import default_market
 
@@ -133,7 +135,12 @@ def _eval_trigger(trigger, ctx: Any) -> bool:
     if callable(trigger):
         try:
             return bool(trigger(ctx))
-        except Exception:
+        except Exception as e:            # noqa: BLE001
+            # 2026-10-12 P2: 原为裸吞 (静默 return False) ⇒ 触发器表达式写错时该做T腿
+            #   **永不触发且无任何告警** (最难查的一类 failure)。保留 fail-closed 语义,
+            #   但必须留痕 (纪律: 静默降级是头号敌人)。
+            logging.getLogger(__name__).warning(
+                "[t_legs] trigger 求值失败 ⇒ 该腿 fail-closed 不触发: %s", e)
             return False
     return bool(trigger)
 

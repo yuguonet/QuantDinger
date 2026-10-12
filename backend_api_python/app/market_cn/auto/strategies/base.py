@@ -562,7 +562,10 @@ class StrategyBase:
         if held > 1 and last_bar["low"] <= peak * (1 + trail / 100):
             return ExitDecision("exit", reason=f"追踪止损{trail}%",
                                 price=peak * (1 + trail / 100))
-        if held >= hold:
+        # 2026-10-12 P2 (§4.5 降级项, 防御性): 到期分支补 T+1 下限 —— 止损/追踪两分支
+        #   已有 `held > 1` (见上注释), 唯到期分支裸 `held >= hold`; 当前 `hold` 最小为
+        #   v1 的 7 ⇒ 不可达。加 `max(hold, 1)` 防未来新增策略传 hold<=1 引入当日买当日卖。
+        if held >= max(int(hold), 1) and held > 1:
             return ExitDecision("exit", reason=f"持仓到期{hold}天",
                                 price=float(last_bar["close"]))
         return ExitDecision("hold")

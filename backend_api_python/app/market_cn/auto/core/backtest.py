@@ -235,7 +235,19 @@ def _refine_intraday(strat, trades, bars_batch, daily_fn, *, days, start_date,
             #   ⇒ close 模式入场 (如 dragon D0 收盘买) 的票在 1m 腿上被**静默改锚到当日
             #   开盘价**, 与日线腿同一笔的入场价不一致 (收益不可比, peak/止损阈值全部
             #   按错基准计算)。1m 腿只是"出场重放", 入场价必须与日线腿逐笔同一。
-            res = strat.intraday_replay(bars, ei, float(t["entry_price"]), code=code,
+            # 2026-10-12 P1-4: canonical 契约缺字段一律 None ⇒ `entry_price` 可能缺失。
+            #   原裸下标 `float(t["entry_price"])` 会 KeyError/TypeError 中断**整批**精修
+            #   (同一循环对 exit_day 用的是 `.get`, 即 :201/:225 —— 两处写法不一致属遗漏)。
+            #   入场锚缺失时 1m 腿无从重放, 整笔回落日线腿并计数 (回落是**已接管**语义)。
+            try:
+                _ep = float(t.get("entry_price") or 0)
+            except (TypeError, ValueError):
+                _ep = 0.0
+            if _ep <= 0:
+                t["exec_basis"] = "daily"
+                counts["daily"] += 1
+                continue
+            res = strat.intraday_replay(bars, ei, _ep, code=code,
                                         board_type=None, minute_by_date=mbd,
                                         entry_gate=t.get("entry_gate"))
             if not res:
@@ -413,7 +425,11 @@ def _summary(trades):
     """
     if not trades:
         return {"n": 0}
-    rets = [t["return_pct"] for t in trades]
+    # 2026-10-12 P1-3: canonical `build_trade` 契约明写「缺字段一律置 None」⇒ return_pct
+    #   可能为 None (未结算 / 数据缺口)。None 参与 `r > 0` ⇒ TypeError 中断整份报告。
+    #   同函数的 `peaks` 早已写了 `is not None` 过滤 —— rets 漏了同一道, 属遗漏而非设计。
+    rets = [r for r in (t.get("return_pct") for t in trades) if r is not None]
+    n_invalid = len(trades) - len(rets)
     wins = [r for r in rets if r > 0]
     losses = [r for r in rets if r <= 0]
     buckets = {"≤-10": 0, "-10~-3": 0, "-3~+3": 0, "+3~+10": 0, ">+10": 0}
@@ -424,23 +440,34 @@ def _summary(trades):
     peaks = [t["peak_return_pct"] for t in trades if t.get("peak_return_pct") is not None]
     months = sorted({str(t.get("entry_date", ""))[:7] for t in trades} - {""})
     n_h = len(trades) // 2
-    seg = lambda ts: round(sum(1 for t in ts if t["return_pct"] > 0) / len(ts) * 100, 1) if ts else None
+
+    def _seg(ts):
+        """分段胜率。None 笔既不计分子也不计分母 (与总 winrate 同口径, 不可混入)。"""
+        vs = [t.get("return_pct") for t in ts if t.get("return_pct") is not None]
+        return round(sum(1 for r in vs if r > 0) / len(vs) * 100, 1) if vs else None
+
     hold_days_avg = sum(t.get("exit_day") or 0 for t in trades) / len(trades)
     return {
         "n": len(trades),
-        "winrate": round(len(wins) / len(trades) * 100, 1),
-        "avg_ret": round(sum(rets) / len(rets), 2),
+        "n_valid": len(rets),
+        "n_invalid": n_invalid,
+        "winrate": round(len(wins) / len(rets) * 100, 1) if rets else None,
+        "avg_ret": round(sum(rets) / len(rets), 2) if rets else None,
+        # P1-2 (2026-10-12): 守卫必须判**和非零** —— losses 含 `<= 0` 的 0, 全组平收时
+        #   sum(losses)=0 ⇒ 原 `sum(...)/len(losses)` 非零但分母 `abs(0/len)` = 0 ⇒ 除零。
+        #   与 `tools/pool_check._stats` 的正确守卫 `if ws and ls and sum(ls)` 同口径。
         "pl_ratio": round((sum(wins) / len(wins)) / abs(sum(losses) / len(losses)), 2)
-        if wins and losses else None,
+        if wins and losses and sum(losses) else None,
         "ret_buckets": buckets,
         "peak": {"mean": round(sum(peaks) / len(peaks), 2) if peaks else None,
                  "lt10": sum(1 for p in peaks if p < 10),
                  "10_20": sum(1 for p in peaks if 10 <= p < 20),
                  "ge20": sum(1 for p in peaks if p >= 20)},
         "monthly_avg": round(len(trades) / len(months), 1) if months else None,
-        "ret_per_day": round(sum(rets) / len(rets) / hold_days_avg, 3) if hold_days_avg else None,
-        "winrate_1st_half": seg(trades[:n_h]),
-        "winrate_2nd_half": seg(trades[n_h:]),
+        "ret_per_day": round(sum(rets) / len(rets) / hold_days_avg, 3)
+        if rets and hold_days_avg else None,
+        "winrate_1st_half": _seg(trades[:n_h]),
+        "winrate_2nd_half": _seg(trades[n_h:]),
     }
 
 

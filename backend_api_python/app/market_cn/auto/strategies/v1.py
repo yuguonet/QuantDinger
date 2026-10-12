@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
 from app.market_cn.auto.core.market import (
-    get_board_name, get_board_type, is_limit_up, limit_up_price,
+    get_board_type, is_limit_up, limit_up_price,
 )
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
@@ -67,24 +67,6 @@ PARAMS = {
     #   默认 False (=实盘口径); True 仅用于复现旧回测口径做对照。
     "require_d1_close_up": False,
 }
-
-
-def _signal_to_legacy_dict(sig: Signal, code: str) -> dict:
-    """Signal → 展示用 dict 形态。"""
-    ex = sig.extra or {}
-    return {
-        "code": code,
-        "board": get_board_name(code),
-        "path": "v1",
-        "path_label": "V1",
-        "d0_date": sig.time,
-        "d0_close": ex.get("d0_close"),
-        "ret_20d": ex.get("ret_20d"),
-        "d_1_change": ex.get("d_1_change"),
-        "turnover_anchor": ex.get("turnover_anchor"),
-        "turnover_anchor_total": ex.get("turnover_anchor_total"),
-        "buy_mode": "next_open",
-    }
 
 
 @register

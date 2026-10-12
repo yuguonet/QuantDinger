@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 import mimo_boot
 
 from mimoagent.agents.antihack import AntiHackConfig
-from mimoagent.agents.base import TerminatingException
+from mimoagent.agents.base import TerminatingException, LimitsExceeded
 # 执行核升级（2026-09-30）：DefaultAgent（基线循环）→ MimocodeAgent
 # （MiMo Desktop 引擎：10KB 精调核心 prompt + task 子代理 + compact 上下文压缩
 #  + <context_usage> 预算感知 + AntiHackGuard + 入参 schema 硬校验）
@@ -240,6 +240,30 @@ class QDAgentConfig(MimocodeAgentConfig):
     # 闭环②：数字溯源门
     grounding_gate: bool = True
     grounding_max_retries: int = 1
+    # ── observation 字符闸门（2026-10-12 P0 修复）──────────────────────────
+    # 上游 MimocodeAgentConfig 把 max_observation_length 显式设为 **0（关闭）**，
+    # 理由是 MiMo 自带工具目录自我限流（bash 2000 行/50KB、read 2000 行/50KB、
+    # grep/glob 100 条），再叠一层字符截断会把"工具自称未截断"的中段悄悄砍掉。
+    # 但本项目 **102 个金融工具走 FnToolAdapter，输出没有任何自我限流**
+    # （tools/base.py 全程无 truncate）⇒ 继承这个 0 = 放弃了唯一的字符闸门。
+    # 生效路径已核实：DefaultAgent._format_observation → truncate_middle(out, 本值)，
+    # MimocodeAgent 是 super() 调用后再拼 <context_usage> 页脚，故本值有效。
+    # 设 QD_MAX_OBSERVATION_CHARS=0 可退回上游行为。
+    max_observation_length: int = field(
+        default_factory=lambda: int(os.getenv("QD_MAX_OBSERVATION_CHARS", "30000")))
+    # ── 成本硬预算（2026-10-12 P0 修复）────────────────────────────────────
+    # 光有 step_limit 一个刹车不够：**步数便宜、上下文贵**。实测「明天买什么股」
+    # 一轮 15 次调用、累计 ≈40 万 token、上下文每轮 ~29k tokens（其中工具 schema
+    # 就占 ~22k），且**零产出**——21 步的步数预算对 token 毫无约束力。
+    # 阈值沿用 utils/budget.py 既有 env（该模块此前零消费方），不另起一套口径。
+    run_token_budget: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_RUN_TOKEN_BUDGET", "200000")))
+    run_tool_call_budget: int = field(
+        default_factory=lambda: int(os.getenv("AGENT_RUN_TOOL_CALL_BUDGET", "60")))
+    # 整个请求（含空回复轻推轮 + 溯源重写轮）的**累计步数**上限。
+    # 0 = 自动取 step_limit + run_step_grace（给重试轮留几步，不让它们瞬死）。
+    run_step_cap: int = field(default_factory=lambda: int(os.getenv("QD_RUN_STEP_CAP", "0")))
+    run_step_grace: int = field(default_factory=lambda: int(os.getenv("QD_RUN_STEP_GRACE", "3")))
     # 闭环③：交易人工确认闸（interceptor；函数内 confirm 硬闸保留）
     trading_confirm: bool = True
     # 危险面守卫
@@ -423,6 +447,18 @@ class QDAgent(MimocodeAgent):
     def __init__(self, model, env, *, config_class: Callable = QDAgentConfig, **kwargs):
         super().__init__(model, env, config_class=config_class, **kwargs)
         self.interrupt_switch = False  # 旧 interrupt_switch 语义兼容（message_queue 探针读取）
+        # ── 成本累计量（2026-10-12 P0）──
+        # 按「请求」计：_run_inner 开头归零，重试轮**不**归零（见 _account_budget）。
+        #
+        # ⚠️ 命名红线（2026-10-12 血案）：`_run_tool_calls` **不能用** ——
+        # mimoagent `DefaultAgent._run_tool_calls(tool_calls)` 是**方法**
+        # （default.py:245；mimocode_agent.py:161 调用它）。这里若设成 int，
+        # 实例属性会覆盖祖先方法 ⇒ 模型第一次调任何工具即
+        # `TypeError: 'int' object is not callable`，整轮崩溃。
+        # ⇒ 本项目自加的实例属性一律 `qd_` 前缀，与框架命名空间隔离。
+        self._qd_run_tokens = 0
+        self._qd_run_steps_total = 0
+        self._qd_run_tool_calls = 0
         self.trace = TraceAdapter(self.config.trace_dir or None) if self.config.trace_enabled else None
         # ── 工具分层台账（在 registry 建好后立刻快照）──
         # _defs_by_name：全量定义（按需激活时从此取）；_core_names：每轮必下发；
@@ -435,6 +471,11 @@ class QDAgent(MimocodeAgent):
         # 压缩阈值兜底：dataclass default_factory 已算好，仅在显式传 None 时补。
         if not getattr(self.config, "compaction_threshold_tokens", None):
             self.config.compaction_threshold_tokens = _compaction_threshold()
+        # 累计步数上限兜底：0 → step_limit + grace（重试轮要留几步，否则一进来就死）
+        if not getattr(self.config, "run_step_cap", 0):
+            self.config.run_step_cap = (
+                max(1, int(getattr(self.config, "step_limit", 0) or 0))
+                + max(0, int(getattr(self.config, "run_step_grace", 3) or 0)))
         self._sync_tool_tiers()
         if self.config.trading_confirm:
             self.add_action_interceptor(self._trading_confirm_guard)
@@ -987,12 +1028,62 @@ class QDAgent(MimocodeAgent):
 
     def after_step(self) -> None:
         super().after_step()
+        # 成本熔断必须在埋点**之前**：超预算就直接终止，不再往下走。
+        self._account_budget()
         if self.trace is not None:
             try:
                 self.trace.on_step(self, self._steps_taken)
             except Exception:
                 pass
         self._emit_action_step()
+
+    def _account_budget(self) -> None:
+        """成本记账 + 硬熔断（2026-10-12 P0：单轮烧 40 万 token 且零产出）。
+
+        记账源 = 框架原生的 `_last_request_tokens`（base.query 每次请求后写入
+        input+output 增量），因此覆盖主轮 + 空回复轻推轮 + 溯源重写轮。
+
+        **为什么不能跟着 `_steps_taken` 归零**：那两处归零（_run_inner 的空回复
+        轻推、grounding 重写）本意是"给重试轮独立步数预算"，否则主轮耗尽后重试
+        一进来就 LimitsExceeded。若成本也跟着归零，等于重试轮能无限续杯 ——
+        21 步 × 3 轮 × ~29k tokens/步 的口子就是这么来的。故本计数器按请求计。
+
+        熔断方式：抛 `LimitsExceeded`（TerminatingException 子类），
+        base.run 捕获后返回 (type(e).__name__, str(e))，即 ("LimitsExceeded", 提示)，
+        _run_inner 的兜底分支会因 msg 非空而把提示原样交给用户 —— 软收尾，不硬崩。
+        """
+        self._qd_run_tokens += int(getattr(self, "_last_request_tokens", 0) or 0)
+        self._qd_run_steps_total += 1
+        self._qd_run_tool_calls += self._last_step_tool_calls()
+        try:
+            from utils.budget import check_budget, budget_wrapup_hint
+        except Exception:
+            return  # 预算模块不可用时静默退化（fail-open，同本仓红线）
+        reason = check_budget(run_tokens=self._qd_run_tokens,
+                              tool_calls=self._qd_run_tool_calls)
+        if reason is None and self.config.run_step_cap > 0 \
+                and self._qd_run_steps_total >= self.config.run_step_cap:
+            reason = "run_steps:%d/%d" % (self._qd_run_steps_total, self.config.run_step_cap)
+        if reason is None:
+            return
+        if self.trace is not None:
+            try:
+                self.trace.emit("budget_exceeded", reason=reason,
+                                run_tokens=self._qd_run_tokens,
+                                steps=self._qd_run_steps_total)
+            except Exception:
+                pass
+        raise LimitsExceeded(budget_wrapup_hint(reason))
+
+    def _last_step_tool_calls(self) -> int:
+        """本步模型实际发起的工具调用数（取最后一条 assistant 消息）。"""
+        try:
+            for msg in reversed(self.messages):
+                if msg.get("role") == "assistant":
+                    return len(msg.get("tool_calls") or [])
+        except Exception:
+            pass
+        return 0
 
     def _emit_action_step(self) -> None:
         ev_cb = _hooks_now().get("event_cb")
@@ -1052,6 +1143,12 @@ class QDAgent(MimocodeAgent):
         # _steps_taken 跨请求累积 → 轮次多了新消息一进来就 LimitsExceeded()
         # 且 str(e)=="" → 空结果退出。每轮 run 前归零，预算语义改为按请求。
         self._steps_taken = 0
+        # 成本累计量按**请求**归零（2026-10-12 P0）。下面两处 `_steps_taken = 0`
+        # （空回复轻推轮 / 溯源重写轮）**故意不归零**这三个计数器 —— 详见
+        # _account_budget 的说明：重试轮归零成本 = 无限续杯。
+        self._qd_run_tokens = 0
+        self._qd_run_steps_total = 0
+        self._qd_run_tool_calls = 0
         self.tool_call_errors = []
         self.current_plan = None       # 计划是 per-run 的（与步数同生命周期）
         # 工具预选：必须在 tool_map / tool_availability 渲染**之前**跑，
@@ -1081,7 +1178,10 @@ class QDAgent(MimocodeAgent):
             status, message = "truncated", (
                 "（本轮达到步数上限被截断——请把问题拆小分步重试）")
         elif msg_text in ("", "Empty assistant response"):
-            self._steps_taken = 0  # 轻推轮给独立预算，不跟主轮抢
+            # 只归零**步数**：轻推轮给独立预算，不跟主轮抢。
+            # 成本计数器（_qd_run_tokens/_qd_run_steps_total/_qd_run_tool_calls）**不动** ——
+            # 累计步数仍受 run_step_cap 约束，成本仍受 AGENT_RUN_TOKEN_BUDGET 约束。
+            self._steps_taken = 0
             status, message = super().run("请用文字直接给出本轮结论（不要再调用工具）。")
             if not (message or "").strip():
                 status, message = "empty", "（模型未返回文字内容，请重试或换个问法）"
@@ -1111,7 +1211,9 @@ class QDAgent(MimocodeAgent):
                 retries = 0
                 while guide is not None and retries < self.config.grounding_max_retries:
                     retries += 1
-                    self._steps_taken = 0  # 溯源重写轮独立预算（否则主轮耗尽后重试瞬死）
+                    # 同上：只归零步数（否则主轮耗尽后重写轮一进来就死），
+                    # 成本与累计步数继续累计，由 run_step_cap / token 预算兜底。
+                    self._steps_taken = 0
                     status, message = super().run(
                         f"【数字溯源拦截】{guide}\n"
                         "请只依据本轮工具输出中的数字重写结论；无法溯源的数字改为"

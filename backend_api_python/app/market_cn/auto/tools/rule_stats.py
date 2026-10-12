@@ -104,8 +104,11 @@ def _metrics(rows, key_ret="ret_d7c", key_peak="peak7", key_mae="mae7",
     losses = [x for x in rets if x <= 0]
     out["winrate"] = round(len(wins) / n * 100, 1)
     out["avg_ret"] = round(sum(rets) / n, 2)
+    # 2026-10-12 P1-2: 守卫必须判**和非零** —— losses 含 `<= 0` 的 0, 全组平收时
+    #   sum(losses)=0 ⇒ `abs(sum/len)` = 0 ⇒ 除零。与 `tools/pool_check._stats`
+    #   的正确守卫 `if ws and ls and sum(ls)` 同口径。
     out["pl_ratio"] = (round((sum(wins) / len(wins)) / abs(sum(losses) / len(losses)), 2)
-                       if wins and losses else None)
+                       if wins and losses and sum(losses) else None)
     if peaks:
         out["peak_mean"] = round(sum(peaks) / len(peaks), 2)
         out["peak"] = {}
@@ -289,6 +292,23 @@ def render_md(strategy, funnel, power, meta):
     return "\n".join(L)
 
 
+def _require_probe_file(probe_file, strategy, cmd):
+    """`--probe-file` 缺失时的统一早失败引导（2026-10-12 P1-6）。
+
+    终态② Step 2 (2026-10-09) 后回测侧 probe 采样已退役（采样迁 `sampler.LiveSampler`
+    实盘侧 + 折叠内核）⇒ 不带存档跑本工具**必然失败**。与其让它跑到底再 return 非 0，
+    不如开局就把「怎么拿到存档」的可执行命令交给用户。
+    """
+    if probe_file:
+        return False
+    print("⚠ 回测侧 probe 采样已退役（终态② Step 2），本工具必须带 --probe-file 运行。\n"
+          "  ① 产出存档: explain --strategy %s --probe-out tmp/probes/x.jsonl\n"
+          "  ② 再复用  : %s --strategy %s --probe-file <上一步路径>\n"
+          "  （也可复用历史 JSONL / 实盘 LiveSampler 产出）" % (strategy, cmd, strategy),
+          file=sys.stderr)
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description="入场规则归因统计 (固定持有口径)")
     ap.add_argument("--strategy", default="dragon_callback")
@@ -312,6 +332,10 @@ def main():
     ap.add_argument("--full", action="store_true",
                     help="(已废弃, 保留兼容) 探针始终保留完整特征窗口")
     args = ap.parse_args()
+    # 2026-10-12 P1-6: 本工具**必须**带存档运行 ⇒ 检查前置。旧实现埋在读策略/DEBUG
+    #   常量之后, 白跑一圈才失败, 且 `strategy_cli stats` 转发过来时用户无从预判。
+    if _require_probe_file(args.probe_file, args.strategy, "rule_stats.py"):
+        return 2
 
     try:
         from dotenv import load_dotenv
@@ -354,24 +378,13 @@ def main():
           f"wave={dbg_wave}日")
 
     trails = [float(x) for x in str(args.trail).split(",") if x.strip()]
-    if args.probe_file:
-        rows = _load_rows(args.probe_file)
-        print(f"复用探针存档: {args.probe_file} → {len(rows)} 行 sample")
-        if args.exit_mode == "trail":
-            k = f"ret_tr{trails[0]:g}"
-            if rows and not any((r.get("labels") or {}).get(k) is not None for r in rows):
-                print(f"[warn] 存档无 {k} 标签 (口径不符; 请用 --trail 匹配或去掉 --probe-file 重跑)",
-                      file=sys.stderr)
-    else:
-        # 终态② Step 2 (2026-10-09): 回测侧 probe 采样已退役（采样迁 sampler.LiveSampler
-        # 实盘侧 + 折叠内核）。本工具「无 --probe-file 重跑」不再可用，请：
-        #   1) 用 `explain --strategy <key> --probe-out tmp/probes/x.jsonl` 产出兼容存档；
-        #   2) 或 `--probe-file` 复用历史 JSONL / 实盘 LiveSampler 产出。
-        print("⚠ 回测侧 probe 采样已退役（终态② Step 2）。请用 "
-              "`explain --strategy %s --probe-out ...` 产出 sample 存档后 "
-              "`--probe-file` 复用，或复用历史 JSONL。" % args.strategy,
-              file=sys.stderr)
-        return 2
+    rows = _load_rows(args.probe_file)   # P1-6: 前置检查已保证非空
+    print(f"复用探针存档: {args.probe_file} → {len(rows)} 行 sample")
+    if args.exit_mode == "trail":
+        k = f"ret_tr{trails[0]:g}"
+        if rows and not any((r.get("labels") or {}).get(k) is not None for r in rows):
+            print(f"[warn] 存档无 {k} 标签 (口径不符; 请用 --trail 匹配该档)",
+                  file=sys.stderr)
 
     funnel, power, meta = analyze(rows, rank_map, days=args.hold,
                                   label=args.probe_file or f"{args.strategy}@{args.days}d",
@@ -380,7 +393,11 @@ def main():
     meta["wave_days"] = dbg_wave
     md = render_md(args.strategy, funnel, power, meta)
     ts = time.strftime("%Y%m%d_%H%M")
-    out = args.out or os.path.join("..", "..", "..", "..", "tmp",
+    # 2026-10-12 P1-10: 原用相对路径上溯 4 级 ⇒ 落点随 CWD 漂移 (且级数也不对)。
+    #   对齐 rule_audit.py 的 `__file__` 锚定 + 5 级上溯 ⇒ 恒为仓库根 `tmp/`。
+    d = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.normpath(os.path.join(d, "..", "..", "..", "..", ".."))
+    out = args.out or os.path.join(root, "tmp",
                                    f"规则归因_{args.strategy}_{ts}.md")
     out = os.path.normpath(out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

@@ -433,7 +433,6 @@ def minute_live(code, series=None):
         list[dict]: [{mi, ts, o, h, l, c, v, cv}] 标准化分钟槽位序列（mi 升序）。
     """
     if series is None:
-        from datetime import datetime
         series = _fetch_snapshots_by_date([code]).get(
             code, None) or []
     return prep_minutes(series, volume_cumulative=True)
@@ -610,8 +609,9 @@ def _tail_trading_days(bars, days):
 
     2026-09-28 审计 A1b: index_minute/index_fflow 原先 `bars[-days:]` 把 days 当
     **bar 行数**, 而这两张表是分钟粒度 (约 240 行/交易日) ⇒ `days=10` 只拿到 10 **分钟**。
-    调用方的语义是交易日: `tools/pool_check` 传 10、`features/env_flow` 传 lookback+6=26
-    ⇒ 二者实际拿到的窗口被压缩了 ~240 倍, env_flow 因此恒 None。
+    调用方的语义是交易日: `tools/pool_check` 传 10（2026-10-12: 另一举例
+    `features/env_flow` 已随该模块退役归档到 `del/20261012_env_flow_retired/`, 此处
+    举例同步收敛为仍在用的 pool_check）⇒ 修正前实际拿到的窗口被压缩 ~240 倍。
     bars 需按 time 升序 (两函数 SQL 均 ORDER BY time ASC)。
     """
     if not days or days <= 0:
@@ -652,14 +652,14 @@ def index_minute(code="000300", days=800, as_of=None):
         with conn.cursor() as cur:
             if as_of:
                 cur.execute(
-                    f'SELECT time, open, high, low, close, volume, up_count, down_count '
-                    f'FROM "kline_index_5m" WHERE symbol = %s AND time::date <= %s '
-                    f'ORDER BY time ASC',
+                    'SELECT time, open, high, low, close, volume, up_count, down_count '
+                    'FROM "kline_index_5m" WHERE symbol = %s AND time::date <= %s '
+                    'ORDER BY time ASC',
                     (sym, str(as_of)[:10]))
             else:
                 cur.execute(
-                    f'SELECT time, open, high, low, close, volume, up_count, down_count '
-                    f'FROM "kline_index_5m" WHERE symbol = %s ORDER BY time ASC',
+                    'SELECT time, open, high, low, close, volume, up_count, down_count '
+                    'FROM "kline_index_5m" WHERE symbol = %s ORDER BY time ASC',
                     (sym,))
             rows = cur.fetchall()
     bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"), "open": r[1], "high": r[2],
@@ -726,7 +726,6 @@ def reconcile_daily_live(target=None, codes=None, sample=50):
     """
     import random
     from datetime import datetime
-    from app.market_cn.auto.core.data.kline import fetch_kline_db
     if target is None:
         try:
             from app.utils.trading_calendar import last_finish_trading_day

@@ -867,14 +867,54 @@ class ToolProvider:
         return self._domains.get(name, "common")
 
     def search(self, query: str, domain: str = "") -> List[tuple]:
-        """按关键词搜索工具。返回 [(name, description)]。支持 domain 过滤。"""
-        q = query.lower()
+        """按关键词搜索工具。返回 [(name, description)]。支持 domain 过滤。
+
+        2026-10-12 修复（CLI 实测暴露）：原实现是**整串子串匹配**——
+        `"run_skill 执行技能流水线" in "run_skill"` 恒 False，
+        模型用自然语言短语检索必零命中，于是判定"工具不存在"并转去
+        bash 占位探测（run7/本次跑 11~15 步零产出的近因之一）。
+
+        改为两段式，**向后兼容**：
+          ① 先按原语义做整串匹配（精确优先，排序在前）；
+          ② 仅当①为空时，降级为「空格/中英标点分词后 OR 匹配」兜底。
+        既有精确检索行为不变，只是不再把短语查询判成"无此工具"。
+        """
+        import re as _re
+
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+
+        # ① 原语义：整串匹配
         results = []
         for name, func in self._tools.items():
             if domain and self._domains.get(name, "common") != domain:
                 continue
             desc = (inspect.getdoc(func) or "").split("\n")[0][:120]
             if q in name.lower() or q in desc.lower():
+                results.append((name, desc))
+        if results:
+            return results
+
+        # ② 兜底：分词 OR 匹配（短语 → 词元）
+        terms = [t for t in _re.split(r"[\s,，、;；/|\-]+", q) if t]
+        if not terms:
+            terms = [q]
+        # 中文短语没有分隔符时，退化为按整体再试一次（已由①覆盖），
+        # 此处额外把纯中文长串按 2~4 字滑窗切词，提升命中率
+        if len(terms) == 1 and len(terms[0]) > 4 and _re.search(r"[\u4e00-\u9fff]", terms[0]):
+            w = terms[0]
+            terms = list({w[i:i + 3] for i in range(len(w) - 2)})
+        seen = set()
+        for name, func in self._tools.items():
+            if domain and self._domains.get(name, "common") != domain:
+                continue
+            if name in seen:
+                continue
+            desc = (inspect.getdoc(func) or "").split("\n")[0][:120]
+            hay = name.lower() + " " + desc.lower()
+            if any(t in hay for t in terms):
+                seen.add(name)
                 results.append((name, desc))
         return results
 

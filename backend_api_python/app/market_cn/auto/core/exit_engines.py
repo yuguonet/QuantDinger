@@ -31,10 +31,16 @@ Returns (统一 dict, 与历史策略引擎同构):
       ★ 唯一保留**语义差异**的一条:
         ① 分段追踪 trails{hi, lo, switch_pct}   ② peak_exit{ret, upper} 峰值逃顶
         ③ stop_at_idx 重放截断                  ④ **use_trig_prev=False**
-          (dragon 历史口径: 用当日 peak 的 trig, 无 trig_prev 守卫 —— v1 才启用)
+          (dragon 历史口径: 追踪线用当日 peak; 2026-10-11 P0-1 该开关语义已正名为
+           **追踪线基准** —— True=peak_prev 防先视 / False=peak 历史口径。
+           dragon 切 True 是**改回测输出**的口径变更, 须 golden 重冻后再翻)
       ★ 单实现**双消费**: 折叠 evaluate(实时/预处理) 与回测共用它 ⇒ 改一处两边同时变。
-  v1._run_backtest                    → run_trail_stop (无分段追踪, **启用** trig_prev 守卫)
+  v1._run_backtest                    → run_trail_stop (无分段追踪, **启用** trig_prev 守卫
+                                          ⇒ 追踪线走 peak_prev, 已无日内先视)
   relay3.run_backtest_relay3          → run_limit_seal
+      ⚠ relay3 已归档 (strategies/_archive/, autodiscover 不递归) ⇒ 本引擎**当前零调用方**;
+        2026-10-12 P1-8 为其补上 `_min_sell_day` 守卫 (原 D1 收盘卖在 A股= T+0 违规),
+        t0 市场行为逐位不变。恢复使用前请先确认 T+1 语义是否符合预期。
   g56._exit_no_trail                  → run_hold_stop (无追踪; D-1 板用 STOP_LOSS_LU 紧止损)
   break                               → defer_force_open (跌停顺延)
 
@@ -208,7 +214,9 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
 
     与 v1._run_backtest 主循环同构 (2026-09-26 参数化迁出):
       - T+1: 最早可卖日 = spec.intraday_t0 ? 1 : 2;
-      - 追踪线用 **开盘时已知峰值** peak_prev 防日内先视 (fill_on_gap 误用修正);
+      - 追踪线基准由 use_trig_prev 决定 (2026-10-11 P0-1 根因修复):
+          True  → 开盘时已知峰值 peak_prev, **触发与成交同源**, 防日内先视;
+          False → peak (含当日 high), dragon 历史口径;
       - 触发成交贴跌停 → pending_dn 顺延次日开盘; 一字跌停整日跳过;
       - 到期日一字跌停 → last_unfilled 顺延强平。
 
@@ -218,6 +226,14 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             返回 "open"/"close" = 以该价清仓后结束; None = 继续常规判定。
         peak_exit: 涨幅>7% 且上影>30% → 收盘逃顶 (dragon/v1 可选)。
         extra_diag: 额外字段并入返回 dict (如 d1_limit_up)。
+        use_trig_prev: **追踪线基准开关** (2026-10-11 P0-1 语义正名)。
+            True  (默认) → 线用 peak_prev: 日线无法分辨 high/low 先后, 用当日 high
+              抬线再判当日 low 触线 = 日内先视 (真实"先跌穿后冲高"不应触发却触发,
+              出场系统性偏早)。peak_prev 是开盘时已知量, 无此偏误。
+            False → 线用 peak: **dragon 历史口径**, 与其历史回测逐笔一致。
+               ⚠ 该口径仍含上述先视。切 True 只需翻转 dragon_callback.py 的实参,
+               但属**改回测输出的口径变更**, 须先 golden 重冻 (见
+               `修复核对与偏离度_20261010.md` P1-4 —— 该条被推迟的原因)。
 
     Returns:
         dict | None
@@ -318,12 +334,21 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                         exit_p, exit_d, _exit_reason = float(b.get("close") or 0), d, "峰值逃顶"
                         break
 
-            trail_pct = trail_hi
-            if trail_switch is not None and (peak / entry_price - 1) * 100 >= float(trail_switch):
-                trail_pct = trail_hi
-            elif trail_switch is not None:
-                trail_pct = trail_lo
-            trig_t = peak * (1 + trail_pct / 100)
+            # ---- 追踪线基准 (2026-10-11 P0-1 根因修复) ----
+            # 原实现: 触发判定恒用 peak (已含**当日** high), 而 use_trig_prev 只在
+            # 触发后二次修正成交价 ⇒ 触发本身仍是"先跌穿旧线、后冲高"的日线不可分辨
+            # 场景下的**日内先视** (出场系统性偏早)。docstring 一直声明"追踪线用开盘时
+            # 已知峰值 peak_prev", 实现与契约不符。
+            # 根因修法: 让 use_trig_prev 真正控制**基准峰值**, 触发与成交同源:
+            #   True  → peak_prev (开盘时已知) —— 防先视 (v1 口径)
+            #   False → peak (含当日 high)     —— dragon 历史口径, 逐笔保持不变
+            base_peak = peak_prev if use_trig_prev else peak
+            if trail_switch is not None:
+                gain_pct = (base_peak / entry_price - 1) * 100
+                trail_pct = trail_hi if gain_pct >= float(trail_switch) else trail_lo
+            else:
+                trail_pct = trail_hi          # == trailing_stop (无分段追踪)
+            trig_t = base_peak * (1 + trail_pct / 100)
             trig_s = entry_price * (1 + stop_loss / 100)
             trig = max(trig_t, trig_s)
             low = float(b.get("low") or 0)
@@ -331,12 +356,10 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                 if blocked:                  # 跌停封死不可成交 → 顺延次日开盘 (A8)
                     pending_dn = True
                     continue
+                # trig 已是 base_peak 口径 ⇒ fill_on_gap 天然区分"开盘就在线下(跳空)
+                # → open" 与 "盘中跌破 → trig"。原 use_trig_prev 的 trig_prev 二次
+                # 修正属补丁 (只修成交价不修触发), 已由 base_peak 在源头统一, 故删。
                 fill = fill_on_gap(float(b.get("open") or 0), trig)
-                if use_trig_prev:
-                    # 开盘时已存在的线: open<=trig_prev 才按开盘 (防日内先视; v1 口径)
-                    trig_prev = max(peak_prev * (1 + trail_pct / 100), trig_s)
-                    if float(b.get("open") or 0) > trig_prev:
-                        fill = trig
                 if fill_blocked_by_limit_dn(fill, dn, sp):
                     pending_dn = True
                     continue
@@ -414,7 +437,9 @@ def defer_force_open(bars, entry_idx, exit_d, *, last_unfilled, pending_dn,
             return None
         nb = bars[nxt]
         dn2 = _dn_at(bars, nxt, board_type, sp)
-        if is_one_word_limit_dn(nb, dn2, sp):
+        # 2026-10-12 P2: 补 `dn2 is not None` 前置, 与同文件 :186/:385 两处写法对齐
+        #   (行为同 —— `is_one_word_limit_dn` 内部对 None 已返回 False; 此处只消样子差异)
+        if dn2 is not None and is_one_word_limit_dn(nb, dn2, sp):
             last_unfilled, pending_dn = True, False
             nxt += 1
             continue
@@ -435,7 +460,16 @@ def run_limit_seal(bars, entry_idx, entry_price, *, board_type="main",
       - D1 未触涨停 → S4 尾盘卖 (D1 close);
       - D1 触板未封 (close < limit*ratio) → 炸板卖 (D1 close);
       - D1 封住 → D2+ 追踪 (close/peak-1 <= trail_after_limit) / 到期 hold_days_max。
-    ⚠️ 保留历史口径 (含 D1 收盘卖): relay3 已停用, 迁移**不改行为**。
+
+    ⚠️ 2026-10-12 P1-8 修正 —— T+1 守卫:
+      上述"D1 收盘卖"在 A 股是 **T+0 违规** (入场当日不可卖, 见本模块登记表第 8 行)，
+      与本模块其余引擎 (`run_trail_stop` / `run_hold_stop` 的 `_min_sell_day`) 不一致。
+      原先刻意"保留历史口径不改行为"的前提是 relay3 迁移期的逐位同构; 而 relay3
+      已于 2026-10-09 归档 (`strategies/_archive/`)、`autodiscover` 不递归 ⇒ 本引擎
+      **当前零调用方**, 继续保留缺陷已无意义。
+      修正后: 判定仍读 D1 数据 (触板/封板是**判定依据**, 不是卖出动作), 但**卖出日**
+      推迟到 `_min_sell_day(spec)` (A股=2 / t0 市场=1 ⇒ t0 市场行为与原实现逐位一致)。
+      到期分支同样取 `max(hold_days_max, min_d)`, 避免 hold_days_max=1 时又漏一道。
     """
     if entry_idx >= len(bars) or entry_price <= 0:
         return None
@@ -444,9 +478,11 @@ def run_limit_seal(bars, entry_idx, entry_price, *, board_type="main",
     # "core 零市场常量"硬规则, 接港/美股或增设新档位时会静默算错)。
     # 档位值与原硬编码一致 (main 0.098 / 未命中回落 band_default=gem_star 0.198)。
     nominal = sp.nominal_up_pct(board_type)
+    min_d = _min_sell_day(sp)      # 2026-10-12 P1-8: A股 T+1 → 2; t0 市场 → 1
     if not nominal or nominal <= 0:
         # 无涨跌停市场: 不判触板/封板, 直接按到期逻辑 (docstring 许诺的语义, 原实现漏)
-        max_days0 = int(hold_days_max)
+        # P1-8: 到期日不得早于最早可卖日 (hold_days_max=1 且 A股时原实现会当日买当日卖)
+        max_days0 = max(int(hold_days_max), min_d)
         last_idx0 = min(entry_idx + max_days0 - 1, len(bars) - 1)
         if last_idx0 < entry_idx:
             return {"open": True, "exit_day": max_days0}
@@ -465,20 +501,30 @@ def run_limit_seal(bars, entry_idx, entry_price, *, board_type="main",
     d1_touched = d1_high >= limit_price - 0.001
     d1_sealed = d1_touched and d1_close >= seal_th
 
+    # P1-8 (2026-10-12): 判定读 D1 数据, **卖出**不早于最早可卖日。
+    #   A股 (min_d=2) → 顺延到 D2 收盘; t0 市场 (min_d=1) → 仍是 D1 收盘, 与原实现逐位一致。
+    sell_day = max(1, min_d)
+    sell_idx = entry_idx + sell_day - 1
+    if sell_idx >= n:
+        return {"open": True, "exit_day": sell_day}
+    sell_close = float(bars[sell_idx].get("close") or 0)
+    sell_peak = max((float(bars[j].get("high") or 0)
+                     for j in range(entry_idx, sell_idx + 1)), default=d1_high)
+
     if not d1_touched:
-        return {"exit_price": round(d1_close, 3), "exit_day": 1,
+        return {"exit_price": round(sell_close, 3), "exit_day": sell_day,
                 "exit_reason": "S4未封板尾盘卖",
-                "return_pct": round((d1_close / entry_price - 1) * 100, 2),
-                "peak_return_pct": round((d1_high / entry_price - 1) * 100, 2),
+                "return_pct": round((sell_close / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((sell_peak / entry_price - 1) * 100, 2),
                 "open": False}
     if not d1_sealed:
-        return {"exit_price": round(d1_close, 3), "exit_day": 1,
+        return {"exit_price": round(sell_close, 3), "exit_day": sell_day,
                 "exit_reason": "炸板卖出(S4)",
-                "return_pct": round((d1_close / entry_price - 1) * 100, 2),
-                "peak_return_pct": round((d1_high / entry_price - 1) * 100, 2),
+                "return_pct": round((sell_close / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((sell_peak / entry_price - 1) * 100, 2),
                 "open": False}
     peak_high = d1_high
-    max_days = int(hold_days_max)
+    max_days = max(int(hold_days_max), min_d)   # P1-8: 到期日同样不早于最早可卖日
     for day in range(2, max_days + 1):
         idx = entry_idx + day - 1
         if idx >= n:

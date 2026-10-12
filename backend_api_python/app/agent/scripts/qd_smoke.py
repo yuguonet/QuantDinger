@@ -2238,6 +2238,24 @@ def test_38_exec_skill_dispatch_card():
           "入口：" in card and 'read_skill(name="market_screener")' in card, card[:120])
     check("卡片是卡片不是正文（≤600 字符）", len(card) <= 600, str(len(card)))
 
+    # ②b 空结果纪律（2026-10-12 补，防再断线）：D-18 的「run_skill 空结果 → 模型回退
+    # 主对话硬跑 6 个取数工具」是**声明了没接线**的老账——开发纪律第 15 条早已写明
+    # 「空结果也是结果」，但 prompt 与分发卡片里一直没有对应条款，等于没有约束。
+    # 这里锁两处：卡片带空结果提示、qd_system.txt §重活分发带三步纪律。
+    check("卡片含空结果纪律（analyzed 为空 ⇒ 直接收尾，不回退主对话硬跑）",
+          all(t in card for t in ("空结果", "analyzed", "主对话")), card[-160:])
+    try:
+        import os as _os38
+        _sys_txt = open(_os38.path.join(_os38.path.dirname(_os38.path.abspath(__file__)),
+                                        "..", "prompts", "qd_system.txt"),
+                        encoding="utf-8").read()
+        _sec = _sys_txt.split("## 重活分发", 1)[1].split("\n## ", 1)[0]
+        check("qd_system.txt §重活分发含空结果纪律（三步：交付/再派一次/禁止重跑）",
+              "空结果纪律" in _sec and "analyzed" in _sec
+              and "禁止" in _sec and "再派一次" in _sec, _sec[:160])
+    except Exception as _e38:
+        check("qd_system.txt §重活分发可读", False, f"{type(_e38).__name__}: {_e38}")
+
     # ③ 集成：技能命中路径的分叉（用假技能注册表 + 直接调 _prefetch，不跑模型）
     class _FakeSkills:
         def __init__(self, items):

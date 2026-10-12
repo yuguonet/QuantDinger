@@ -91,6 +91,20 @@ def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
     import sys
     from pathlib import Path
 
+    # 名称归一化（2026-10-12）：SKILL.md frontmatter 的 name 用连字符
+    # （market-screener / strategy-debug），而 skill_run.py 的执行注册表键是**目录名**
+    # 下划线（market_screener / strategy_debug），且那边是精确匹配、不做归一化。
+    # 模型从 list_skills() / [相关技能：xxx] 拿到的是**显示名**，不经归一化直达子进程
+    # 会恒定返回「未知技能。可执行: ['market_screener', 'strategy_debug']」。
+    # 注册表是唯一事实源（QDSkillAdapter.get 已有 display_name → 目录名映射），
+    # 这里复用它，不再另写一份字符串替换。
+    try:
+        _info = _get_skills().get(name)
+        if _info is not None and getattr(_info, "name", ""):
+            name = _info.name
+    except Exception:
+        pass
+
     runner = Path(__file__).resolve().parent.parent / "scripts" / "skill_run.py"
     try:
         # 子进程 stdout 是 UTF-8（ensure_ascii=False 的中文 JSON）；不显式指定编码时

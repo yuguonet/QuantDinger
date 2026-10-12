@@ -36,8 +36,8 @@
 | 工具 | 用途 |
 |---|---|
 | `param_scan` | 参数网格扫描 + 敏感性报告 |
-| `rule_audit` | 门级规则审计：拦截表 + 判别力 + 换序稳定性 |
-| `rule_stats` | 入场规则归因统计（低胜率 / 低盈亏比排查） |
+| `rule_audit` | 门级规则审计：拦截表 + 判别力 + 换序稳定性（**须带 `--probe-file`**，见下） |
+| `rule_stats` | 入场规则归因统计（低胜率 / 低盈亏比排查）（**须带 `--probe-file`**，见下） |
 | `gate_try` | 候选规则试算（改门前先试算） |
 | `gate_funnel` | 策略漏斗可调用接口（各门通过率） |
 | `proposal` | LLM 建议产物 + 红线校验 + 应用 + 回滚 |
@@ -82,3 +82,19 @@ _（T4 归档后暂空——`snapshot_quality` 已移 del/）_
 一批工具的**统计口径底座**：`rule_audit` / `gate_try` / `gate_funnel` / `m6_check`
 都 import 它的 `_load_rows` / `_metrics`，且 `strategy_cli.py` 的 `stats` 子命令指向它。
 归档它 = 一次断 4 处 + 一个 CLI 入口。**低频 ≠ 可归档，先查 import。**
+
+### ⚠️ `rule_audit` / `rule_stats` 必须带 `--probe-file`（2026-10-12 P1-6）
+
+终态② Step 2（2026-10-09）后**回测侧 probe 采样已退役**（采样迁 `sampler.LiveSampler`
+实盘侧 + 折叠内核）。这两个工具**不再能自行采样** —— 不带 `--probe-file` 时会在入口
+处直接退出并打印补救命令（原先是跑完取数与策略加载才 `return 1/2`，白跑一圈）。
+
+```bash
+# ① 先产出存档
+python strategy_cli.py explain --strategy dragon_callback --probe-out tmp/probes/x.jsonl
+# ② 再复用
+python strategy_cli.py stats  --strategy dragon_callback --probe-file tmp/probes/x.jsonl
+python strategy_cli.py audit  --strategy dragon_callback --probe-file tmp/probes/x.jsonl
+```
+
+历史 JSONL / 实盘 LiveSampler 产出同样可用。

@@ -56,14 +56,15 @@ _CONFIRMED: set = set()
 
 
 def _load_env():
-    """加载 .env（DB 连接等），静默失败。"""
+    """加载 .env（DB 连接等），静默失败。
+
+    2026-10-12 P2: 原本有自己的遍历实现（tools/ 下 5 份手写副本之一）⇒ 收口到官方
+    锚点 `core._paths.load_env_first_found`（与 debug.py 同款），路径候选逐位保留。
+    """
     try:
-        from dotenv import load_dotenv
-        for _p in (os.path.join(PROJECT_ROOT, ".env"),
-                   os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env"))):
-            if os.path.isfile(_p):
-                load_dotenv(_p, override=False)
-                break
+        from app.market_cn.auto.core._paths import load_env_first_found
+        load_env_first_found(os.path.join(PROJECT_ROOT, ".env"),
+                             os.path.normpath(os.path.join(PROJECT_ROOT, "..", ".env")))
     except Exception:
         pass
 
@@ -184,8 +185,8 @@ def strategy_funnel(
     peak_key = PEAK_KEYS[peak]
 
     # 成本守卫：按预估耗时/内存判断（旧逻辑按固定 500 股，对深层门是误伤）
-    cost = guard_cost(strategy, days, codes, label,
-                      force_full_market=force_full_market, call="strategy_funnel")
+    guard_cost(strategy, days, codes, label,        # 副作用调用（超限即 SystemExit），不取值
+               force_full_market=force_full_market, call="strategy_funnel")
 
     t0 = time.time()
     rows, trades, run_meta = run_explain_backtest(

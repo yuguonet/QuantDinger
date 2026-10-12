@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from app.utils.logger import get_logger
 
@@ -59,7 +59,9 @@ def stock_flow_gate(code: str, date: Optional[str] = None,
         net = 0.0
     # 近似净占比: 个股 snapshot 路径无 turnover 时用 |net| 自比无意义 → 只用方向/绝对额
     metrics = {"net": round(net, 2), "approx": bool(f.get("approx", False)),
-               "source": f.get("source") or f.get("source", "fund_flow_api")}
+               # 2026-10-12 P2: 原写法 `f.get("source") or f.get("source", "fund_flow_api")`
+               #   —— 左侧为假时右侧返回**同一个假值**, 兜底永不生效 ⇒ 恒 None。修正为直给。
+               "source": f.get("source") or "fund_flow_api"}
     # 若有 net_pct 字段则用
     pct = f.get("net_pct") or f.get("main_pct")
     if pct is not None:

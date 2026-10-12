@@ -8,7 +8,6 @@ as-of 纪律：所有函数只用 ctx.bars[0..i]（≤ 决策日），绝不读�
 """
 from __future__ import annotations
 
-from typing import Any
 
 from app.market_cn.auto.core.market import is_limit_up
 from app.market_cn.auto.core.runtime.functions import (

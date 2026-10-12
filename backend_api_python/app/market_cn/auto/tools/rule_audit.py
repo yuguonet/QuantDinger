@@ -37,7 +37,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import random
 import sys
@@ -153,8 +152,8 @@ def render_md(strategy, order, funnel, meta, swap, args, dropped, label_desc):
          f"(fail 日含; 无 gates 向量剔除 {dropped} 行) | 标签口径: {label_desc}",
          f"- 分母口径: 段2/3/4 只统计标签有效样本 (censored=视野不足已排除); "
          f"段5 矩阵/段6 分布用全部 {n_rows} 行 — 两处拦截数会差一个 censored 量",
-         f"- 两层口径: 段2~5=门向量视角 (前瞻假设入场); 段6/7=stage 视角 "
-         f"(含 prefilter/engine_skip 层, 最终池已实际成行)",
+         "- 两层口径: 段2~5=门向量视角 (前瞻假设入场); 段6/7=stage 视角 "
+         "(含 prefilter/engine_skip 层, 最终池已实际成行)",
          f"- off 门 (不参与拦截): {meta['off'] or '无'}",
          ""]
     if meta["warns"]:
@@ -325,6 +324,13 @@ def main():
     ap.add_argument("--out", default="", help="markdown 报告路径 (默认 tmp/规则审计_<策略>_<ts>.md)")
     args = ap.parse_args()
 
+    # 2026-10-12 P1-6: 本工具**必须**带存档运行 => 判断前置（与 rule_stats 同口径,
+    #   helper 复用 rule_stats._require_probe_file, 不写第二份实现）。旧实现埋在读完
+    #   策略/RULE_DEFS 之后才判, `strategy_cli audit` 转发过来时白跑一圈才 return 1。
+    from app.market_cn.auto.tools.rule_stats import _require_probe_file
+    if _require_probe_file(args.probe_file, args.strategy, 'rule_audit.py'):
+        return 1
+
     try:
         from dotenv import load_dotenv
         p = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -358,19 +364,8 @@ def main():
                   "d10": "ret_d10o (持有10日到D10开盘卖)"}[args.label] + \
         f"; 峰值={peak_desc}; MAE=mae5 (D1 起 5 日最低)"
 
-    if args.probe_file:
-        raw = _load_rows(args.probe_file)
-        print(f"复用探针存档: {args.probe_file} → {len(raw)} 行 sample")
-    else:
-        # 终态② Step 2 (2026-10-09): 回测侧 probe 采样已退役（采样迁 sampler.LiveSampler
-        # 实盘侧 + 折叠内核）。本工具「无 --probe-file 重跑」不再可用，请：
-        #   1) 用 `explain --strategy <key> --probe-out tmp/probes/x.jsonl` 产出兼容存档；
-        #   2) 或 `--probe-file` 复用历史 JSONL / 实盘 LiveSampler 产出。
-        print("⚠ 回测侧 probe 采样已退役（终态② Step 2）。请用 "
-              "`explain --strategy %s --probe-out ...` 产出 sample 存档后 "
-              "`--probe-file` 复用，或复用历史 JSONL。" % args.strategy,
-              file=sys.stderr)
-        return 1
+    raw = _load_rows(args.probe_file)   # P1-6: 前置检查已保证非空
+    print(f"复用探针存档: {args.probe_file} → {len(raw)} 行 sample")
 
     rows, dropped = _gate_rows(raw)
     if not rows:

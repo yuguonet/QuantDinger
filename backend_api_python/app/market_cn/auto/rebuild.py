@@ -213,8 +213,7 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
       meta    : 诊断信息 (轴/窗口/成本/跳过项)
     """
     from app.market_cn.auto import store
-    from app.market_cn.auto.core.filters import unified_prefilter
-    from app.market_cn.auto.scan import _anchor_idx, _dedupe_family, _stock_info, all_codes
+    from app.market_cn.auto.scan import _stock_info, all_codes
 
     t0 = time.time()
     active = _active_strategies(keys)
@@ -299,7 +298,6 @@ def build_expected(days=320, window=30, keys=None, limit=None, progress=True):
     # ---- 逐日: U1~U4 → 同族去重 → daily_limit (与 run_scan 同序) ----
     # U1~U4 只对**已产出的信号**切片 (信号数远小于 5235×30), 不为每票每天切一次。
     # 2026-09-26 P0-4: 应用循环走 scan.apply_unified_prefilter; 归一走 finalize_signal_rows。
-    from app.market_cn.auto import strategies as strat_reg
     from app.market_cn.auto.scan import apply_unified_prefilter, finalize_signal_rows
     expected = {}
     stat = defaultdict(lambda: {"raw": 0, "prefilter": 0, "kept": 0})
@@ -523,8 +521,13 @@ def apply_plan(plan, dry_run=True):
             "inserted": len(plan["insert"]),
             "expired": len(plan["expire"]),
             "fixed": len(plan["fix"]),
-            "sweep_expired": len(plan["disabled_sweep"]),
         })
+        # 2026-10-12 P1-1: 与下方 apply 分支同口径 —— `None` = 清扫失败(须留痕),
+        #   `[]` = 无需清扫(正常)。原写法对 None 取 len() ⇒ dry-run 报告 TypeError。
+        if plan.get("disabled_sweep") is None:
+            stat["sweep_failed"] = True
+        else:
+            stat["sweep_expired"] = len(plan["disabled_sweep"])
         return stat
 
     # ---- A. 停用策略未入场行 → expired (全表) ----
@@ -808,7 +811,6 @@ def build_ledger_plan(replay, actual, meta):
                keep_actual, keep_marked, ...}
     """
     from app.market_cn.auto import registry
-    from app.market_cn.auto.store import S_WATCH_PENDING
 
     active_keys = set(meta.get("strategies") or [])
     disabled = sorted(set(registry.strategy_keys()) - set(registry.enabled_keys()))
@@ -888,8 +890,12 @@ def apply_ledger_plan(plan, dry_run=True):
         stat["vanish_mode"] = vs_mode
     if dry_run:
         stat.update({"upserted": len(plan["upsert"]), "inserted": len(plan["insert"]),
-                     "expired": len(plan["expire"]),
-                     "sweep_expired": len(plan["disabled_sweep"])})
+                     "expired": len(plan["expire"])})
+        # 2026-10-12 P1-1: 同上 (`None` = 清扫失败须留痕 vs `[]` = 正常), 原写法必崩
+        if plan.get("disabled_sweep") is None:
+            stat["sweep_failed"] = True
+        else:
+            stat["sweep_expired"] = len(plan["disabled_sweep"])
         if vs and vs_mode == "error":
             stat["vanish_would_block"] = True
         return stat
@@ -1075,8 +1081,8 @@ def projection_ledger_refresh(window=30, keys=None, dry_run=True):
         "source": "projection", "window": window, "win_from": win[0] if win else None,
         "win_to": win[-1] if win else None, "proj_rows": len(proj),
         "all_proj_rows": len(proj_all), "actual_rows": len(actual),
-        "plan_counts": {k: (len(v) if isinstance(v, list) else v)
-                        for k, v in plan.items() if isinstance(v, list)},
+        # 2026-10-12 P2: 过滤条件已保证是 list ⇒ `else v` 分支恒不可达, 简化为直计长度
+        "plan_counts": {k: len(v) for k, v in plan.items() if isinstance(v, list)},
     }
     stat = {"source": "projection", "dry_run": bool(dry_run),
             "proj_rows": len(proj), "actual_rows": len(actual)}

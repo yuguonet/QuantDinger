@@ -26,13 +26,17 @@
 """
 from __future__ import annotations
 
+import logging
+
 
 def _config():
     """读取 config.json (带异常兜底, 失败返回空 dict); 仅取元数据, 不做任何 IO 持久化。"""
     try:
         from app.market_cn.auto.strategies import load_config
         return load_config() or {}
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         return {}
 
 
@@ -70,12 +74,16 @@ def strategy_keys():
         from app.market_cn.auto.strategies import load_config
         keys += [k for k, v in load_config().get("strategies", {}).items()
                  if isinstance(v, dict)]
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         pass
     try:
         from app.market_cn.auto import strategies as _reg
         keys += list(_reg.autodiscover())
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         pass
     if not keys:
         keys = list(_STRATEGIES_FALLBACK)
@@ -98,7 +106,9 @@ def enabled_keys():
         keys = [k for k in strategy_keys() if _reg.is_enabled(k)]
         # 全空时回退全集: 若 config 读取异常, 宁可多显示也不要把界面清空
         return tuple(keys) if keys else strategy_keys()
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         return strategy_keys()
 
 
@@ -114,14 +124,18 @@ def strategy_labels():
         for key, s in _reg.all_strategies().items():
             if getattr(s, "name", ""):
                 out[key] = s.name
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         pass
     try:
         from app.market_cn.auto.strategies import load_config
         for key, v in load_config().get("strategies", {}).items():
             if isinstance(v, dict) and v.get("label"):
                 out[key] = v["label"]
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         pass
     return out
 
@@ -140,7 +154,9 @@ def strategy_winrate(key):
     try:
         v = _config().get("strategies", {}).get(key, {}).get("winrate")
         return float(v) if v is not None else None
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         return None
 
 # 信号状态机 (qd_dragon_signals.state)
@@ -161,5 +177,7 @@ def state_label(state):
     """状态中文显示名; 未配置回退到状态原串 (如 watch_pending)。"""
     try:
         return _config().get("state_labels", {}).get(state, state)
-    except Exception:
+    except Exception as e:        # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "[registry] 数据源探测失败(已走兜底): %s", e)
         return state

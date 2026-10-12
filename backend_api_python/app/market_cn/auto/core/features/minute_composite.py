@@ -31,7 +31,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 def minute_live_full(code: str, days: int = 5, *, series: Optional[List[Dict[str, Any]]] = None,

@@ -116,14 +116,49 @@ def test_backtest_and_debug_entry_ignore_enable_switch():
 
 
 def test_daily_close_without_fold_contract_is_exposed():
-    """非完整宏（日线无折叠契约）必须可被 doctor 识别（§3.1 偏离显式化）。"""
-    from app.market_cn.auto.strategies.base import _has_fold_contract
+    """缺折叠契约的日线策略：**要么迁契约，要么在 `FOLD_CONTRACT_EXEMPT` 登记**。
+
+    2026-10-12 修正（原断言有误，是测试文件自身的问题）：
+      本测试原写「启用中的日线策略必须全部有契约」，而 `strategies/base.py::
+      FOLD_CONTRACT_EXEMPT`（2026-10-11 引入）的**设计**是：`.py` 插件是逃生舱
+      （目标态 §3.1），未迁折叠契约 ≠ 缺陷，但必须**登记**；base 的注释也明文
+      写着「消费方：tests/present/test_enable_switch（门禁）、tools/doctor」。
+      但那次提交**没有同步本文件** ⇒ 名单写好了却没人读，已登记的 v1 被当缺陷恒报 FAIL。
+      （时间线佐证：本文件最后提交 2026-10-09，FOLD_CONTRACT_EXEMPT 在 2026-10-11。）
+
+    现按 base 的设计分流：
+      · **未登记**的缺契约 ⇒ FAIL（= 真断裂：record writer 只能靠「退回直判」+ERROR 活着）
+      · **已登记**的逃生舱 ⇒ 允许，但要求名单**不陈旧**（key 存在且确实缺契约）
+        —— 生产侧对已登记者已有具名降级路径（scan.py「退回直判」+ERROR /
+        rebuild.py 排除出投影集 / present_daily 落 stat.skipped / monitor 回退旧三决策），
+        不是「断裂」。
+    """
+    from app.market_cn.auto.strategies.base import (
+        _has_fold_contract, FOLD_CONTRACT_EXEMPT)
     reg.autodiscover()
     daily = [k for k in reg.all_strategies()
              if reg.get_strategy(k).scan_spec.kind == "daily_close"]
     assert daily, "无 daily_close 策略？发现逻辑失效 = 假绿"
     nocon = [k for k in daily if not _has_fold_contract(reg.get_strategy(k))]
-    # 已知：v1/relay3 已于 2026-10-09 退役 ⇒ 当前已无缺契约者；启用中的日线策略必须全部有契约
-    enabled_nocon = [k for k in nocon if reg.is_enabled(k)]
-    assert not enabled_nocon, (
-        "启用中的日线策略缺折叠契约（生产判定/回测路径断裂）: %s" % enabled_nocon)
+    # ① 未登记的缺契约 = 生产判定/回测路径真断裂
+    unregistered = [k for k in nocon if k not in FOLD_CONTRACT_EXEMPT]
+    assert not unregistered, (
+        "日线策略缺折叠契约且未在 FOLD_CONTRACT_EXEMPT 登记"
+        "（真断裂：生产判定/回测路径不可用）: %s —— "
+        "补 init_state/step/evaluate，或在 strategies/base.py 的 FOLD_CONTRACT_EXEMPT "
+        "具名登记并写明降级路径" % unregistered)
+    # ② 豁免名单不得陈旧：登记项须真实存在且确实缺契约（迁完契约就要立刻移出名单）。
+    #    存在性用**全量注册表**判定（不受 daily_close 过滤影响，否则登记盘中策略会误判陈旧）。
+    stale = [k for k in FOLD_CONTRACT_EXEMPT
+             if k not in set(reg.all_strategies())
+             or _has_fold_contract(reg.get_strategy(k))]
+    assert not stale, (
+        "FOLD_CONTRACT_EXEMPT 有陈旧登记（key 已不存在 / 已迁契约）: %s —— 请移出名单"
+        % stale)
+    # ③ 发现逻辑自证（防假绿）：万一某天全部策略都迁完契约、名单也清空，①②就是空跑 ——
+    #    此时用合成对象证明检测器对「无 init_state/step/evaluate」确实返回 False（灵敏度）。
+    if not nocon and not FOLD_CONTRACT_EXEMPT:
+        class _NoContract:  # 三个方法一个都没有
+            pass
+        assert _has_fold_contract(_NoContract()) is False, \
+            "_has_fold_contract 认不出缺契约者 ⇒ ①②恒真 = 假绿"

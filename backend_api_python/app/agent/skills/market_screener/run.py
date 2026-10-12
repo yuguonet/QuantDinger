@@ -567,5 +567,28 @@ def run() -> dict:
     bundle = _profile_candidates(prescreen_result, limit=10, with_flow=False, with_pred=False)
     codes = [p["code"] for p in bundle.get("profiles", []) if not p.get("hard")]
     if not codes:
-        return SkillResult({"strategy": bundle.get("strategy"), "analyzed": [], "signal": "无符合硬条件的候选"})
+        # 空结果必须「可汇报」（2026-10-12）。原先只回 {analyzed: [], signal: "…"}，
+        # 模型拿不到任何可写的口径 ⇒ 无法收尾 ⇒ 只能转为主对话逐个取数重跑一遍同样的
+        # 逻辑（D-18 记的「run_skill 空结果 → 主对话硬跑 6 个取数工具」正是这么来的，
+        # 一次几十轮、烧掉几十万 token 且结论不变）。
+        # 这里把「筛了多少 / 因什么硬条件被淘汰 / 有什么数据缺口」一并给出，
+        # 让「空」本身成为一个能直接交付的结论，而不是一个等待被重跑的失败信号。
+        _profiles = list(bundle.get("profiles") or [])
+        _hard_reasons: list = []
+        for _p in _profiles:
+            for _r in (_p.get("hard") or []):
+                if str(_r) not in _hard_reasons:
+                    _hard_reasons.append(str(_r))
+        return SkillResult({
+            "strategy": bundle.get("strategy"),
+            "analyzed": [],
+            "signal": "无符合硬条件的候选",
+            "pool_size": len(_profiles),
+            "hard_blocked": sum(1 for _p in _profiles if _p.get("hard")),
+            "hard_reasons": _hard_reasons[:10],
+            "missing": list(bundle.get("missing") or [])[:6],
+            "errors": list(bundle.get("errors") or [])[:3],
+            "mood_regime": bundle.get("mood_regime"),
+            "themes": list(bundle.get("themes") or [])[:5],
+        })
     return deep_analyze(",".join(codes[:8]))

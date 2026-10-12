@@ -165,7 +165,7 @@ def _print_gate_rows(title: str, rows: list) -> None:
             bits.append(f"值 {_fmt_val(r['value'])}")
         if r["leaves"]:
             bits.append(", ".join(f"{s}={_fmt_val(v)}" for s, v in r["leaves"]))
-        print(f"        ↳ " + " | ".join(bits))
+        print("        ↳ " + " | ".join(bits))
 
 
 # ================================================================

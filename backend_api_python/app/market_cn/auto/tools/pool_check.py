@@ -290,7 +290,7 @@ def _fmt_row(tag, trs):
 def render_md(gate_spec, index_code, windows, fail_close, per_window):
     lines = [f"# 信号级复验: {gate_spec} (index={index_code}, "
              f"{'fail-close' if fail_close else 'fail-open'})\n",
-             f"- 纪律: 归因宇宙(全样本)≠策略宇宙(信号池); 门须信号级迁移才可实装",
+             "- 纪律: 归因宇宙(全样本)≠策略宇宙(信号池); 门须信号级迁移才可实装",
              f"- 裁定: kept.avg_ret>universe 且 dropped.avg_ret<universe 且 kept.n>={MIN_N}; "
              f"两段全正才稳定\n"]
     for wname, (universe, kept, dropped, vlabel, vreasons) in per_window:
@@ -329,7 +329,8 @@ def render_md(gate_spec, index_code, windows, fail_close, per_window):
 
 def load_trades(args):
     if args.trades:
-        return json.load(open(args.trades, encoding="utf-8"))
+        with open(args.trades, encoding="utf-8") as fh:   # 2026-10-12 P2: 句柄显式关闭
+            return json.load(fh)                          #   (Windows 下不关会锁文件)
     if args.strategy:
         from app.market_cn.auto.core.backtest import run_all
         res = run_all(strategy=args.strategy, days=args.days or 600)

@@ -99,21 +99,36 @@ def check_static(findings, only=None):
         if k not in yaml_stems:
             _add(findings, WARN, "yaml", f"策略 {k} 无 YAML 门表 (present/analyze 路径不覆盖)")
 
-    # 1d-2. 折叠契约覆盖 (终态②): 日线策略无契约 = **非完整宏** ⇒ 无回测/调试路径。
-    #       §3.5 要求「enabled=false 仍可回测/调试」以"完整宏"为前提 —— 无契约者做不到,
-    #       属 §3.1 宏组成偏离 (需补 init_state/step/evaluate 或退役), 显式暴露于此。
+    # 1d-2. 折叠契约覆盖 (终态②): 日线策略无契约 = 非完整宏 ⇒ 走不了折叠回测/调试路径。
+    #       ⚠ 但 `.py` 插件是逃生舱 (目标态 §3.1) ⇒ **已登记 FOLD_CONTRACT_EXEMPT 的不算缺陷**
+    #       (2026-10-12: 本检查原先不读那份名单, 把已登记的 v1 误报成 WARN, 与
+    #        strategies/base.py:148 注释声明的「消费方: doctor(显式标注)」不符 —— 已接线)。
+    #       未登记者才是真断裂 (record writer 只能靠「退回直判」+ERROR 活着)。
     try:
-        from app.market_cn.auto.strategies.base import _has_fold_contract
-        nocon = []
+        from app.market_cn.auto.strategies.base import (
+            _has_fold_contract, FOLD_CONTRACT_EXEMPT)
+        nocon, exempt = [], []
         for k in plugins:
             s = strat_reg.get_strategy(k)
             if s is not None and s.scan_spec.kind == "daily_close" and not _has_fold_contract(s):
-                nocon.append(k)
+                (exempt if k in FOLD_CONTRACT_EXEMPT else nocon).append(k)
+        # 陈旧登记 = 全量注册表里已不存在（**不受 --only 过滤影响**，否则只查子集时会误判）
+        stale = [k for k in FOLD_CONTRACT_EXEMPT
+                 if k not in set(strat_reg.all_strategies())]
         if nocon:
             _add(findings, WARN, "contract",
-                 "日线策略未实现折叠契约 (非完整宏 ⇒ 无回测/调试路径; 补契约或退役): "
-                 + ", ".join(sorted(nocon)))
-        else:
+                 "日线策略缺折叠契约且未登记 (真断裂 ⇒ 补 init_state/step/evaluate 或在 "
+                 "strategies/base.py::FOLD_CONTRACT_EXEMPT 具名登记): " + ", ".join(sorted(nocon)))
+        if exempt:
+            _add(findings, OK, "contract",
+                 "逃生舱豁免 (已登记 FOLD_CONTRACT_EXEMPT; 生产走 scan 退回直判+ERROR / "
+                 "rebuild 排除出投影集 / monitor 旧三决策, 回测走策略自持入口): "
+                 + ", ".join(sorted(exempt)))
+        if stale:
+            _add(findings, WARN, "contract",
+                 "FOLD_CONTRACT_EXEMPT 有陈旧登记 (key 已不存在, 请移出名单): "
+                 + ", ".join(sorted(stale)))
+        if not nocon and not exempt and not stale:
             _add(findings, OK, "contract", "全部日线策略已实现折叠契约 (回测/调试路径完整)")
     except Exception as e:
         _add(findings, WARN, "contract", f"折叠契约检查不可用: {e}")

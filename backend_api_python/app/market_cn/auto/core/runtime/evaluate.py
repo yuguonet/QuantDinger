@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from app.market_cn.auto.adapters.markets.registry import load_market, require_runnable
-from app.market_cn.auto.core.market import MarketSpec, get_board_type
+from app.market_cn.auto.core.market import MarketSpec
 from app.market_cn.auto.core.runtime.expr import ExprError, evaluate, static_asof_check
 from app.market_cn.auto.core.runtime.functions import (
     AsOfViolation, Ctx, build_funcs, offset_funcs, ensure_gate_init,

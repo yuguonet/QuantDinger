@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 
-from app.market_cn.auto.core.present.contract import DayInput, Progress
+from app.market_cn.auto.core.present.contract import Progress
 from app.market_cn.auto.core.present.realtime import RealtimeBranch
 from app.market_cn.auto.core.present.runner import (
     DailyRunner, Record, StateStore, evaluate_day, strategy_source_hash,
@@ -142,8 +142,7 @@ def check_realtime_equals_preprocess(strategy, code, bars) -> tuple[bool, str]:
     """实时分支(切片副本 + 未收盘快照) == 预处理在同一 bar 上的判定。"""
     root = tempfile.mkdtemp(prefix="present_verify_rt_")
     store = StateStore(root)
-    runner = DailyRunner(store)
-    k0 = _min_age(strategy, bars)
+    _min_age(strategy, bars)     # 守卫: 数据够不够 seed（不足直接 SystemExit），不取值
     d0, d1 = bars[-2], bars[-1]
     state = strategy.init_state(code, bars[:-1])
     entry_px = float(d0["close"])

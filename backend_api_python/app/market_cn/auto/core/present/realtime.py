@@ -16,7 +16,7 @@ import copy
 from app.market_cn.auto.core.present.contract import (
     Progress, StrategyProtocol,
 )
-from app.market_cn.auto.core.present.runner import Record, StateStore, evaluate_day
+from app.market_cn.auto.core.present.runner import StateStore, evaluate_day
 
 
 def _in_anchor(hhmm: str, anchor: str) -> bool:

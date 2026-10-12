@@ -87,8 +87,8 @@ _SNAPSHOT_KEY = "strategy_fingerprint"
 # 2026-09-26: 唯一实现 = store.retire_unfilled (本常量仅作语义备忘, 不再被 SQL 使用)
 _RETIREABLE_STATES = ("watch_pending",)
 
-# 补扫最长等待数据就绪的时间 (后台线程, 不阻塞启动)
-_RESCAN_MAX_WAIT_SEC = 1800
+# 2026-10-12 P2: `_RESCAN_MAX_WAIT_SEC` 随未接线的 `_rescan_worker` 一并删除（原为
+#   "只缺当天数据"的轻量补扫保留态，生产无调用点；需要时从 git 历史找回）。
 
 _reconcile_lock = threading.Lock()
 _reconciled_once = False
@@ -312,7 +312,6 @@ def fingerprint():
         # key 取 config ∪ 注册表并集 —— 新增/移除策略两侧都能感知
         keys = sorted(set(cfg) | set(strat_reg.all_strategies()))
         for k in keys:
-            c = cfg.get(k) or {}
             # enabled / params 走事实源 API（yaml 优先，config 兜底），不直接读 config 键
             fp["strategies"][k] = {
                 "enabled": bool(strat_reg.is_enabled(k)),
@@ -599,19 +598,6 @@ def trigger_rebuild(why, background=True, fingerprint=None):
         return {"mode": "background", "why": why}
     _rebuild_worker(why, fingerprint)
     return {"mode": "sync", "why": why}
-
-
-def _rescan_worker(why):
-    """后台线程体: 只补扫当日 (不带历史校准)。保留给"只缺当天数据"的轻量场景。"""
-    try:
-        from app.market_cn.auto.scan import run_scan
-        logger.info("[auto_startup] 触发补扫 (%s)", why)
-        stat = run_scan(days=320, wait_data=True, max_wait_sec=_RESCAN_MAX_WAIT_SEC)
-        logger.info("[auto_startup] 补扫完成 (%s): %s", why, stat)
-    except Exception as e:
-        logger.warning("[auto_startup] 补扫失败 (不影响启动): %s", e)
-
-
 
 
 # ================================================================

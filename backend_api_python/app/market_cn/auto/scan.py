@@ -483,8 +483,6 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
     """
     from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
-    from app.market_cn.auto.core.filters import unified_prefilter
-    from app.market_cn.auto.core.market import is_limit_up, get_board_type
 
     strat_reg.autodiscover()
     want = set(keys) if keys else None
@@ -830,7 +828,6 @@ def run_scan_knife(max_wait_sec=2400, wait_data=True, keys=None):
     """
     from app.market_cn.auto import store
     from app.market_cn.auto import strategies as strat_reg
-    from app.market_cn.auto.core.filters import unified_prefilter
 
     strat_reg.autodiscover()
     active = {k: s for k, s in strat_reg.all_strategies().items()

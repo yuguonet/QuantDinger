@@ -177,11 +177,14 @@ def enabled_daily_keys():
 
     autodiscover 按天缓存; is_enabled/kind 每次现查 —— config 开关即时生效。
     """
-    from datetime import datetime
-
+    from app.market_cn.auto import store as ds
     from app.market_cn.auto.strategies import all_strategies, autodiscover, is_enabled
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    # 2026-10-12 P2: 原为 `datetime.now().strftime("%Y-%m-%d")` —— 直接违反 monitor.py:66
+    #   立的纪律（「今天」单一事实源 = `store.today_str()`，北京时间显式；DB 会话是 UTC
+    #   ⇒ 北京 00:00~07:59 两套时钟不在同一天）。此处是**按天缓存**的 key，跨时区错位会让
+    #   缓存在错误的一侧多留/少留一天。收口到同一锚点。
+    today = ds.today_str()
     if enabled_daily_keys.cache["date"] != today:
         autodiscover()
         enabled_daily_keys.cache.update(
@@ -192,7 +195,10 @@ def enabled_daily_keys():
             st = all_strategies().get(key)
             if st is not None and is_enabled(key) and st.scan_spec.kind == "daily_close":
                 out.append(key)
-        except Exception:
+        except Exception as e:                             # noqa: BLE001
+            # 2026-10-12 P2: 原为裸吞 ⇒ 某策略取不到时被**静默跳过**(信号凭空少一批,
+            #   无任何日志/计数)。fail-closed 语义不变, 但必须留痕(纪律: 静默降级=头号敌人)。
+            logger.warning("[sched] enabled_daily_keys 取策略 %s 失败, 跳过: %s", key, e)
             continue
     return out
 
