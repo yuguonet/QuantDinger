@@ -1035,8 +1035,13 @@ def dc_rsi6(ctx: Ctx) -> float:
 
 
 def dc_tech_score(ctx: Ctx) -> int:
-    """技术面加分 (仅展示, 不参与过滤)。"""
-    return _tech_block(_ctx_closes(ctx))[0]
+    """技术面评分 (展示 + quality_key 排序, 0~100 与其他策略同刻度)。
+
+    2026-10-12: 归一化修复 —— 原始分范围 [-6,+9] 会出现负值 (如 RSI∈[40,60) → -1),
+    与 tail_oversold/v1 的 0~100 刻度不一致。映射: normalized = (raw + 6) / 15 * 100。
+    """
+    raw = _tech_block(_ctx_closes(ctx))[0]
+    return max(0, min(100, round((raw + 6) / 15 * 100)))
 
 
 def dc_tech_rsi(ctx: Ctx):
