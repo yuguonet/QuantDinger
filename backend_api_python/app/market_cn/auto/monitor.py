@@ -19,6 +19,7 @@ step2/3/4/5 共用同一份 —— step2 与 step3 (14:25~14:45)、step4 (14:58~
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 
@@ -376,6 +377,12 @@ def _progress_map(rows, series, hm, stats=None):
       死仓/无仓的无事件不产 hold (见 realtime.py 该分支注释, P2 实证)。
     """
     if not _progress_enabled():
+        # §13.1 A-4 (2026-10-12): 「关着」必须与「坏了」可区分 —— 计数**显式归零**,
+        #   不是不记 (面板上的 0 = 没开新判定源, 非空 = 开了且在回退/报错)。
+        if stats is not None:
+            stats.update({"prog_enabled": False, "confirm_prog_hit": 0,
+                          "confirm_prog_miss": 0, "confirm_prog_err": 0,
+                          "no_judgment": 0})
         return {}
     from app.market_cn.auto import present_daily
     from app.market_cn.auto.core.present import RealtimeBranch, StateStore
@@ -413,7 +420,68 @@ def _progress_map(rows, series, hm, stats=None):
         stats["confirm_prog_hit"] = stats.get("confirm_prog_hit", 0) + len(out)
         stats["confirm_prog_miss"] = stats.get("confirm_prog_miss", 0) + max(
             0, len(rows) - len(out))
+        stats["prog_enabled"] = True
     return out
+
+
+# ================================================================
+# §13.1 A-4 (2026-10-12) 回退计数观测面板 —— 只观测不改行为
+# ================================================================
+#: progress 回退率告警阈值: (miss+err)/(hit+miss) 超过即 WARN（回退过半 = 新判定源
+#: 可能坏了/覆盖不足, 必须有人看一眼）。可按运营经验调; 取 0.5 是保守起点。
+_PROG_FALLBACK_RATE_ALERT = 0.5
+#: 面板落盘: 项目根 tmp/traces/panel.jsonl（文件卫生约定 tmp/; probe 同款）。
+#: 根锚点走 core._paths（禁在 core 外自算路径, 见 _paths.py 头注）。
+from app.market_cn.auto.core._paths import PROJECT_ROOT as _PROJECT_ROOT
+_PANEL_PATH = os.path.join(_PROJECT_ROOT, "tmp", "traces", "panel.jsonl")
+
+
+def _panel_observe(stats, date, hm, path=None, enabled=None):
+    """回退计数落 panel.jsonl + 超阈告警（A-4：只观测不改行为）。
+
+    语义（区分三种状态，不许静默）：
+      · `monitor_progress.enabled=false` ⇒ 计数**显式归零**并标 `prog_enabled=false`
+        （「关着」不是「坏了」，没有判定源和判定源坏了是两回事）；
+      · enabled 且 `confirm_prog_err>0` ⇒ ERROR（新判定源异常已回退旧三决策）；
+      · enabled 且回退率超 `_PROG_FALLBACK_RATE_ALERT` ⇒ WARNING（覆盖不足/切片缺失）。
+    JSONL 追加一行/tick（周面板/后续告警消费）；写失败只 WARN ——
+    观测通道不得反噬生产 tick。
+    """
+    enabled = _progress_enabled() if enabled is None else bool(enabled)
+    hit = int(stats.get("confirm_prog_hit", 0) or 0)
+    miss = int(stats.get("confirm_prog_miss", 0) or 0)
+    err = int(stats.get("confirm_prog_err", 0) or 0)
+    nj = int(stats.get("no_judgment", 0) or 0)
+    if not enabled:
+        hit = miss = err = nj = 0
+        stats.update({"prog_enabled": False, "confirm_prog_hit": 0,
+                      "confirm_prog_miss": 0, "confirm_prog_err": 0,
+                      "no_judgment": 0})
+    else:
+        stats["prog_enabled"] = True
+    total = hit + miss
+    rate = round((miss + err) / total, 4) if total else 0.0
+    stats["prog_fallback_rate"] = rate
+    rec = {"ts": datetime.now().isoformat(timespec="seconds"), "date": date, "hm": hm,
+           "prog_enabled": enabled, "confirm_prog_hit": hit, "confirm_prog_miss": miss,
+           "confirm_prog_err": err, "no_judgment": nj, "fallback_rate": rate}
+    try:
+        p = path or _PANEL_PATH
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:                                  # noqa: BLE001
+        logger.warning("[dragon_monitor] panel.jsonl 写入失败(仅观测, 不影响 tick): %s", e)
+    if enabled:
+        if err > 0:
+            logger.error("[dragon_monitor] progress 判定异常 %d 次 ⇒ 已回退旧三决策"
+                         " (新判定源坏了, 看 panel.jsonl / A-4 面板)", err)
+        if total and rate > _PROG_FALLBACK_RATE_ALERT:
+            logger.warning("[dragon_monitor] progress 回退率 %.0f%% (%d/%d) 超阈 %.0f%%"
+                           " —— 检查切片/折叠契约覆盖 (§13.1 A-4)",
+                           rate * 100, miss + err, total,
+                           _PROG_FALLBACK_RATE_ALERT * 100)
+    return rec
 
 
 # ================================================================
@@ -889,6 +957,8 @@ def run_monitor():
 
     # ── 8. 组对账 ──
     ds.sync_watchlist_group(ds.get_active_signals())
+    # ── §13.1 A-4 (2026-10-12) 回退计数观测面板（只观测不改行为） ──
+    _panel_observe(stats, today, hm)
     return stats
 
 

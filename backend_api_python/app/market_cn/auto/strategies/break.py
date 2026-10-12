@@ -432,10 +432,12 @@ class BreakStrategy(StrategyBase):
         }, next_realtime="15:01")]
 
     def _exit_event(self, state: dict, inp: DayInput, prev) -> list:
-        """prev=exec ⇒ 调 `exit_decision`（唯一出场实现）判定今日是否离场。
+        """prev=exec ⇒ **经 `run_exit` 单一分派**判定今日是否离场（§13.1 A-1，2026-10-12）。
 
-        `exit_decision` 需要「入场以来至今的 bars 片段 + entry_idx 相对位置」；此处
-        由 `state["win"]`（ring 窗口，60 根 ≫ hold_days=7）按 entry_date 定位切片。
+        出场规则只有一份：`exit.mode=break_combo` 适配器内部逐日调 `exit_decision`
+        （与展示/实时同一份判定；legacy close 成交 / `fill="open"` 顺延强平亦由适配器承载）。
+        本方法只做「重放坐标 → run_exit 入参」搬运与 `exit_day == 今日` 的闭合判定
+        （与 dragon 折叠同款）；`stop_at_idx` 必需 —— 逐日重放只许看到截至今日的 bars（防先视）。
         ⚠ 不在本方法内重写任何出场规则 —— 那是第二份回测。
         """
         bar, code = inp.bar, inp.code
@@ -454,29 +456,28 @@ class BreakStrategy(StrategyBase):
                     if str(win[k]["t"])[:10] == entry_date), None)
         if pos is None:                              # 窗口已滚掉入场日（>60 根，不应发生）
             pos = max(0, len(win) - 2)
-        seg = [{"open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"]}
-               for r in win[pos:]]
-        dec = self.exit_decision(
-            {"code": code, "entry_price": entry_price},
-            snap={"mode": "day_close", "bars": seg, "entry_idx": 0})
-        if dec.action != "exit":
+        from app.market_cn.auto.core.exit_modes import run_exit
+        sp = _break_spec()
+        bars = [{"time": r["t"], "open": r["o"], "high": r["h"], "low": r["l"],
+                 "close": r["c"], "volume": r["v"]} for r in win]
+        r = run_exit(
+            sp.exit.get("mode", "break_combo"),
+            bars=bars, entry_idx=pos, entry_price=entry_price,
+            code=code, board_type=state.get("board", ""), params=sp.params,
+            stop_at_idx=len(bars) - 1)
+        # 仅在「今日 = 出场日」闭合（r 是截至今日的出场结论, 按 exit_day 对表）。
+        if r is None or r.get("exit_day") != len(win) - pos or not r.get("exit_reason"):
             return []
-        # ⚠ `dec.price` 是**理论触发价**（追踪止损 = peak×0.94，实盘挂单用）；回测默认
-        #   fill_mode="close" = 收盘判定 + **收盘价成交**（对齐 `_run_backtest_breakbuy`）。
-        #   用 dec.price 成交会高估收益（实测 9.46% vs 3.73%）。
-        # 2026-10-07: `fill="open"` = 顺延强平 (昨日封跌停卖不出, 今日开盘成交) ⇒
-        #   按**开盘价**成交 (旧引擎 pending_dn 的次日 b['open'])。其余情形维持收盘价
-        #   成交 (对齐 fill_mode="close")。
-        exit_price = (float(today["o"]) if getattr(dec, "fill", "") == "open"
-                      else float(today["c"]))
-        peak = max(float(r["h"]) for r in win[pos:])
+        # 成交口径（适配器已承载）: legacy close = 收盘判定 + 收盘价成交（对齐
+        # `_run_backtest_breakbuy`）—— 用 dec.price 成交会高估收益（实测 9.46% vs 3.73%）；
+        # `fill="open"` = 顺延强平 (昨日封跌停卖不出, 今日开盘成交)。
         return [Progress(stage="exit", date=str(bar.get("time", "")), payload={
             "exit_date": str(bar.get("time", ""))[:10],
-            "exit_price": exit_price,
-            "exit_reason": dec.reason,
-            "exit_day": len(win) - pos,
-            "return_pct": round((exit_price / entry_price - 1) * 100, 2),
-            "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
+            "exit_price": r["exit_price"],
+            "exit_reason": r["exit_reason"],
+            "exit_day": r["exit_day"],
+            "return_pct": r["return_pct"],
+            "peak_return_pct": r["peak_return_pct"],
         })]
 
     # ---- D1 竞价处置 ----
@@ -1215,14 +1216,22 @@ register_strategy_funcs(
 
 
 # ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
-def _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params=None):
+def _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params=None,
+                      stop_at_idx=None):
     """逐日调 exit_decision 模拟持仓出场 → dict（等价 _run_backtest_breakbuy 的 legacy close 路径）。
 
     切口 2（出场单源）: 回测/门表的出场与展示/实时走**同一份** `exit_decision` 判定，
     等价性由 tmp/verify_exit_equivalence.py 背书（300 票 12 笔 0 不一致）。
     参数单源到 yaml (spec.params 权威, 分板块; BOARD_PARAMS 兜底, 值一致, 2026-10-09)。
+
+    §13.1 A-1 (2026-10-12): 折叠路径经 `run_exit` 分派到此 —— `stop_at_idx` 为折叠
+    逐日重放的截断点（防先视），传 None 时按全量 bars 走（回测主干口径）。
+    返回 dict 附 canonical `exit_date`/`exit_reason`（人读标签, 与折叠原 payload 同值）,
+    `exit_rule`（代码）保留供对拍。
     """
     from app.market_cn.auto.core.exit_modes import _bp as _bp_exit
+    if stop_at_idx is not None:
+        bars = bars[:stop_at_idx + 1]          # 只许看到截至今日的 bars（防先视）
     _sp = _break_spec().params
     _hold = _bp_exit(_sp, board_type, "hold_days")
     if _hold is None:
@@ -1248,7 +1257,9 @@ def _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params=Non
             rule = next((v for k, v in _RULE.items()
                          if str(dec.reason).startswith(k)), "time")
             return {
+                "exit_date": str(bars[idx].get("time") or "")[:10] or None,
                 "exit_price": round(px, 3), "exit_day": d, "exit_rule": rule,
+                "exit_reason": dec.reason,
                 "return_pct": round((px / entry_price - 1) * 100, 2),
                 "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
             }
@@ -1256,18 +1267,25 @@ def _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params=Non
     last_px = float(bars[last_idx]["close"])
     peak = max(float(b["high"]) for b in bars[entry_idx:last_idx + 1])
     return {
+        "exit_date": str(bars[last_idx].get("time") or "")[:10] or None,
         "exit_price": round(last_px, 3), "exit_day": hold, "exit_rule": "time",
+        "exit_reason": "持仓到期%d天" % hold,
         "return_pct": round((last_px / entry_price - 1) * 100, 2),
         "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
     }
 
 
-def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag):
+def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag,
+                      stop_at_idx=None):
     """断板 combo 出场 (止损/追踪/峰值逃顶/甜点区/到期, 分板块) — 供 YAML exit.mode=break_combo。
 
     切口 2（出场单源）: 默认（legacy close）走 `_exit_by_decision`（逐日 exit_decision，
     与展示/实时同源）；扩展（sweet 甜点区 / fill_mode=intraday 盘中）保留
     `_run_backtest_breakbuy`。
+
+    §13.1 A-1 (2026-10-12): 折叠出场经 `run_exit` 分派到此；`stop_at_idx` = 折叠逐日
+    重放截断点（防先视）——legacy 路径透传给 `_exit_by_decision`，sweet/intraday 路径
+    在此截断（`_run_backtest_breakbuy` 无重放坐标，截断即 as-of 语义）。
     """
     from app.market_cn.auto.core.exit_modes import _bp
     _bpar = BOARD_PARAMS.get(board_type, BOARD_PARAMS["main"])
@@ -1283,8 +1301,10 @@ def _exit_break_combo(bars, entry_idx, entry_price, *, code, board_type, params,
     fill_mode = _bp(params, board_type, "fill_mode")
     if exit_mode != "sweet" and fill_mode in (None, "", "close"):
         # 默认 legacy close：出场单源到 exit_decision（逐日判定）
-        return _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params)
-
+        return _exit_by_decision(bars, entry_idx, entry_price, code, board_type, params,
+                                 stop_at_idx=stop_at_idx)
+    if stop_at_idx is not None:
+        bars = bars[:stop_at_idx + 1]          # sweet/intraday 腿的 as-of 截断（防先视）
     return _run_backtest_breakbuy(
         bars, entry_idx, entry_price,
         _bp(params, board_type, "hold_days"),

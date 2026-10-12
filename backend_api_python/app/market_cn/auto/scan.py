@@ -508,6 +508,13 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
                 {"scan_day": "门表 scan_day", "record": "折叠 Record.ready",
                  "scan": "scan 直判(回滚位)"}[WRITER],
                 WRITER, present_daily.warmup_days())
+    # §13.1 A-3 (2026-10-12) writer 收口: 单一生产主线 = record；scan_day/scan 已降级
+    #   为对拍/回滚位（只服务 path_parity 等对照，不进常态生产）。非主线必须**显式**
+    #   可见 —— WARN 每次跑都报，防止“临时回滚忘了翻回来”变成静默多源判定。
+    if WRITER != strat_reg.WRITER_MAINLINE:
+        logger.warning(
+            "[dragon_scan] ⚠ writer=%s 非生产主线(%s) —— 对拍/回滚位, 不得作为常态生产配置",
+            WRITER, strat_reg.WRITER_MAINLINE)
 
     # M1 实盘采集 (2026-09-11): 每策略一份探针存档, 判定落点非空的 (code,day) 产 sample。
     # 2026-10-07 (P5 前置): 采集**剥离**为独立采样器 (auto/sampler.py) —— 它自跑
@@ -648,6 +655,7 @@ def _run_scan_locked(days=320, wait_data=True, max_wait_sec=3600, keys=None, tar
 
 def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
     """**旧 writer** (迁移期回滚位, P6 删): 循环内逐票 `scan_days` 判定 → `signal_row`。
+    §13.1 A-3 (2026-10-12): **降级为对拍/回滚位**，不进常态生产（主线 = `_rows_by_record`）。
 
     即 P5-③ 之前的生产实现, 逐字保留 —— 它是回滚时唯一要回到的那条路。
     返回 `(rows, err_by_key, skip_rows)` (2026-10-10 P2-11 补回 skip_rows: 供
@@ -694,6 +702,7 @@ def _rows_by_scan(active, bars_by_code, target, stock_info, sampler):
 
 def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
     """**门表 writer** (P2): 判定走门表引擎 `scan_day`（门表唯一规则源）。
+    §13.1 A-3 (2026-10-12): **降级为对拍工具**（服务 path_parity/门表对照），不进常态生产。
 
     行源 = `evaluate.scan_day`（门表单日 → Signal）。后处理链（U1~U4 → signal_row）照旧。
     三个日线策略（break/g56/dragon）均已注册 `_scan_one`；v1/relay3 已于 2026-10-09 退役。
@@ -731,6 +740,7 @@ def _rows_by_scan_day(active, bars_by_code, target, stock_info, sampler):
 def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None):
     """**新 writer** (P5-③): fold 是唯一判定 (由 `present_daily.persist_days` 转主线完成),
     行源 = 当日 `Record.ready`。**只有"行从哪来"变了** —— U1~U4 / `signal_row` 照旧。
+    §13.1 A-3 (2026-10-12): **生产主线（唯一进常态生产的行源）**。
 
     Args:
         root: 切片根 (缺省 = 生产 `_paths.PRESENT_STATE_DIR`); 测试用临时根注入。

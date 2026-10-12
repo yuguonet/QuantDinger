@@ -25,6 +25,8 @@
 from __future__ import annotations
 
 from app.market_cn.auto.core.exec import fill_blocked_by_limit_up
+from app.market_cn.auto.core.exit_engines import run_d1_limit_up_trail
+from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.market import (
     get_board_type, is_limit_up, limit_up_price,
 )
@@ -63,9 +65,6 @@ PARAMS = {
     #   最佳) ⇒ 全 V1 反而 57→32 笔/均收 1.93→-0.59% 变差: 单因子最佳≠组合最佳, D0门+出场会翻盘。
     #   故 gap 不分板(统一 8), 勿再单因子调 gap。低平[-3,3)/中开(3,8) 负EV死区。
     "gap_min_high": 8.0,         # 高开线下限% (甜区 [8, 涨停价))
-    # ⚠ 前视开关 (2026-09-30): D1 收盘涨跌(d1_change<0)过滤 D1 开盘入场 = 未来信息。
-    #   默认 False (=实盘口径); True 仅用于复现旧回测口径做对照。
-    "require_d1_close_up": False,
 }
 
 
@@ -233,7 +232,7 @@ class V1Strategy(StrategyBase):
     # ---- 15:00 收盘确认 ----
     def confirm_decision(self, row, snap=None, **params):
         """v1 收盘确认。let_profits_run=True(2026-10-10 让利润奔跑): 一律确认持有, 不 D2 一刀切,
-        交给 exit_decision 的 trail/stop/expiry(与回测 _run_backtest(let_profits_run=True) 同口径)。
+        交给 exit_decision 的 trail/stop/expiry(与回测 run_d1_limit_up_trail(let_profits_run=True) 同口径)。
 
         let_profits_run=False(1进2 设计): 进二日(D1)收盘相对首板收盘(D0)未达涨停 ⇒ weak ⇒ D2 开盘清仓。
         snap={"series":[...当日快照序列]}; last_r["last"] = D1 收盘, row.signal_price = D0 收盘。
@@ -306,7 +305,7 @@ class V1Strategy(StrategyBase):
     #   该回测入口直接 NotImplementedError。V1 当时未迁折叠契约 ⇒ 官方 CLI
     #   (tools.replay / core.backtest) 调 V1 即断。
     # 本覆写判定/决策/出场零改: 复用 V1 既有 scan_signals + entry_decision(竞价 gate) +
-    #   _run_backtest(出场引擎, 含 D1 动量<3%→D2 开盘清仓), 与单测 harness 逐笔验证的
+    #   run_d1_limit_up_trail(ex-v1._run_backtest, 出场引擎, 含 D1 未涨停→D2 开盘清仓), 与单测 harness 逐笔验证的
     #   V1 自有链路同源。仅为 V1 自持的回测包装 —— 不引入第二套通用引擎 (base 已明确
     #   不为非折叠策略提供兜底), 也不动任何信号/决策/出场逻辑。
     #   2026-10-11 口径对齐: 信号池接入 U1~U4 (use_prefilter=True 缺省开, 与实盘 scan
@@ -317,7 +316,7 @@ class V1Strategy(StrategyBase):
         """V1 日线回测 (daily_close 类) — 经官方 CLI 跑通。
 
         枚举每个候选 D0 (as_of) → 竞价 gate(相对 D0 收盘的开盘 gap) → D1 开盘买入 →
-        _run_backtest 出场(止损-10 / 追踪-5 / 到期 7 / D1 未涨停→D2 开盘清仓, 均受 T+1 约束)。
+        run_exit("v1_combo") 出场(止损-10 / 追踪-5 / 到期 7 / D1 未涨停→D2 开盘清仓, 均受 T+1 约束)。
         持仓期内跳过新信号 (不重叠建仓)。出场参数取自 self.params() (yaml 事实源)。
         use_prefilter=True (缺省) 时信号池过 U1~U4, 与实盘 scan 同口径 (锚=D0 截断窗
         末根, 与生产 "bars 止于 target" 同形); False 供研究侧对照宽池。
@@ -361,10 +360,13 @@ class V1Strategy(StrategyBase):
             if not ed.buyable:
                 continue
             board_type = get_board_type(code)
-            res = _run_backtest(bars, entry_idx, entry_price, hold_days=hold,
-                                stop_loss=stop, trailing_stop=trail,
-                                board_type=board_type, is_v1=True,
-                                let_profits_run=p.get("let_profits_run", False))
+            # §13.1 A-1 (2026-10-12): 出场**经 exit.mode 派发** (run_exit → v1_combo 适配器
+            # → core.run_d1_limit_up_trail), 不再直调策略内编排。
+            res = run_exit(
+                "v1_combo", bars=bars, entry_idx=entry_idx, entry_price=entry_price,
+                code=code, board_type=board_type,
+                params={"hold": hold, "stop": stop, "trail": trail,
+                        "let_profits_run": p.get("let_profits_run", False)})
             if res is None:
                 continue
             busy_until = entry_idx + res["exit_day"]   # 占用至出场日, 防重叠
@@ -404,85 +406,34 @@ class V1Strategy(StrategyBase):
 
 
 # ================================================================
-# 出场模拟 (2026-09-10 晚自 backtest.py 下沉回归本文件 — 出场规则是策略专用,
-# 通用流水线不承载策略专属出场; 逐字搬运, 回归以三策略对数验证)
-# ★ 2026-10-11 死 import 清理 (pyflakes): 原顶层导入的 fill_blocked_by_limit_dn /
-#   fill_on_gap / is_one_word_limit_dn / _limit_dn_price 从未被本文件引用——
-#   出场成交由出场引擎内部消费 exec 原语, 本文件不需要顶层导入, 已删。
+# 出场: 参数化引擎已迁 core (2026-10-12 §13.1 A-1b)
+# ----------------------------------------------------------------
+# 原 `_run_backtest` (V1/通用出场编排, 约 75 行) 已参数化迁入
+#   `core/exit_engines.run_d1_limit_up_trail` (骨架 run_trail_stop + D1 涨停确认钩子),
+#   策略文件回归「文档」; 本模块只剩适配器 `_exit_v1_combo` (参数接线)。
+# ★ 2026-10-11 死 import 清理 (pyflakes) 仍适用: 出场成交由引擎内部消费 exec 原语,
+#   本文件不需要顶层导入 fill_* / is_one_word_limit_dn。
 # ================================================================
 
 
-def _run_backtest(bars, entry_idx, entry_price, hold_days=7, stop_loss=-10.0, trailing_stop=-8.0, board_type="main", peak_exit=False, is_v1=False, d1_limit_up=None, d1_change=None, d1_gap=None, let_profits_run=False):
-    """V1/通用出场 — 2026-09-26 P1-7: 骨架上收 core.exit_engines.run_trail_stop。
+def _exit_v1_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag,
+                   stop_at_idx=None):
+    """V1 combo 出场 (止损/追踪/到期 + D1 未涨停→D2 开盘清仓) — 供 YAML exit.mode=v1_combo。
 
-    现实约束 (T+1 / 跳空 / 跌停顺延) 已在引擎内按 MarketSpec 处理:
-      spec.intraday_t0=false → 最早 d=2 卖 (A股); true → d=1 (HK/US)。
-    本函数只保留 V1 专属:
-      - d1_limit_up 判定 (若调用方未传入);
-      - D1 未涨停(收盘未达涨停) → D2 开盘清仓 (pre_exit 钩子, 经 is_limit_up)。
-    let_profits_run=True (2026-10-10 让利润奔跑): 去掉 D2 一刀切, 由 run_trail_stop 的
-      追踪止损/到期出场 (破峰回撤 trail% 才走 ≈ "破分时均线才走"的日线代理) —— 留住大肉、
-      砍弱票。False=原 1进2 (非连板 D2 开盘清仓)。
+    §13.1 A-1b (2026-10-12): 本适配器只做参数接线 (yaml params → 引擎形参),
+    出场实现在 `core.exit_engines.run_d1_limit_up_trail`（唯一）。
+    ⚠ 2026-10-12 同步修一处分歧: 此前适配器漏传 `let_profits_run` (恒 False),
+    与官方 CLI 回测包装 (读 yaml params) 不同口径 ⇒ 现统一读 params。
     """
-    if entry_price <= 0 or entry_idx >= len(bars):
-        return None
-    from app.market_cn.auto.core.exit_engines import run_trail_stop
-
-    # d1_limit_up: 若外部未传入则在回测内计算 (兼容旧调用)。
-    #   ⚠ 锚是「进二日(D1=入场日)收盘 相对 首板收盘(D0) 是否涨停」= 1进2 设计口径。
-    #   旧实现误用 bars[entry_idx+1](=D2) 相对 D1 开盘, 既错 bar 又错基准 ⇒ 修。
-    if d1_limit_up is None:
-        d1_limit_up = False
-        if entry_idx > 0 and entry_idx < len(bars):
-            d1_close = float(bars[entry_idx]["close"])
-            d0_close = float(bars[entry_idx - 1]["close"])
-            if d0_close > 0 and is_limit_up(d1_close, d0_close, board_type):
-                d1_limit_up = True
-
-    def _pre_exit(d, b, peak, peak_prev):
-        # let_profits_run: 无 D2 一刀切 —— 交给 run_trail_stop 的 trail/stop/expiry 出场(让利润跑)
-        if let_profits_run:
-            return None
-        # V1 出场 (1进2 设计): 进二日(D1=入场日)收盘相对首板收盘(D0)未达涨停 ⇒ 非连板
-        #   ⇒ D2 开盘清仓 (T+1: 入场当日不可卖)。与"D1 日内动量<3%"旧启发式脱钩 —— 旧式会
-        #   误清一字板(开=收=涨停, 动量≈0)且误持高开非涨停(动量≥3%), 与"没涨停就跑"设计不符。
-        if not (is_v1 and d == 2):
-            return None
-        if d1_change is not None and d1_gap is not None:
-            # 供给路径(diag): 用 D1收盘/D0收盘 比值经 is_limit_up 判连板 (与扫描同口径)
-            _d0 = 100.0
-            _d1c = _d0 * (1 + d1_change / 100.0)
-            return "open" if not is_limit_up(_d1c, _d0, board_type) else None
-        if entry_idx <= 0 or entry_idx >= len(bars):
-            return None
-        d1_close = float(bars[entry_idx]["close"])
-        d0_close = float(bars[entry_idx - 1]["close"])
-        if d0_close <= 0:
-            return None
-        return "open" if not is_limit_up(d1_close, d0_close, board_type) else None
-
-    result = run_trail_stop(
+    return run_d1_limit_up_trail(
         bars, entry_idx, entry_price,
-        hold_days=hold_days, stop_loss=stop_loss, trailing_stop=trailing_stop,
-        board_type=board_type, peak_exit=peak_exit,
-        pre_exit=_pre_exit if is_v1 else None,
-    )
-    if result is not None and d1_limit_up:
-        result["d1_limit_up"] = d1_limit_up
-    return result
-
-
-# ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
-def _exit_v1_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag):
-    """V1 combo 出场 (止损/追踪/到期 + D1 动量清仓) — 供 YAML exit.mode=v1_combo。"""
-    return _run_backtest(
-        bars, entry_idx, entry_price,
-        params["hold"], params["stop"], params["trail"], board_type,
-        is_v1=True,
-        d1_limit_up=diag.get("d1_limit_up"),
-        d1_change=diag.get("d1_change"),
-        d1_gap=diag.get("d1_gap"),
-    )
+        hold_days=params["hold"], stop_loss=params["stop"],
+        trailing_stop=params["trail"], board_type=board_type,
+        let_profits_run=bool(params.get("let_profits_run", False)),
+        d1_limit_up=(diag or {}).get("d1_limit_up"),
+        d1_change=(diag or {}).get("d1_change"),
+        d1_gap=(diag or {}).get("d1_gap"),
+        stop_at_idx=stop_at_idx)
 
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
@@ -496,7 +447,7 @@ _register_exit("v1_combo", _exit_v1_combo)
 #   (register_day_flow("v1", _backtest_day_flow))。
 # 2026-10-09: 回测主路径收敛到事件流折叠 (薄壳 → core.replay), 通用兜底引擎已删除 ——
 #   薄壳对非折叠契约策略直接 NotImplementedError。v1 无折叠契约 ⇒ 标准回测入口对其关闭;
-#   V1 自有链路走 scan_signals + entry_decision + _run_backtest (v1_combo 出场引擎)。
+#   V1 自有链路走 scan_signals + entry_decision + run_exit("v1_combo") (core.run_d1_limit_up_trail 出场引擎)。
 #   要接入生产 core.replay 链路须先迁移折叠契约 (init_state/step/evaluate)。
 # ================================================================
 

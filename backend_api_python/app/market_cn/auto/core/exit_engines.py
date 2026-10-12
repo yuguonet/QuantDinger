@@ -35,13 +35,16 @@ Returns (统一 dict, 与历史策略引擎同构):
            **追踪线基准** —— True=peak_prev 防先视 / False=peak 历史口径。
            dragon 切 True 是**改回测输出**的口径变更, 须 golden 重冻后再翻)
       ★ 单实现**双消费**: 折叠 evaluate(实时/预处理) 与回测共用它 ⇒ 改一处两边同时变。
-  v1._run_backtest                    → run_trail_stop (无分段追踪, **启用** trig_prev 守卫
+  v1 (exit.mode=v1_combo)           → run_d1_limit_up_trail → run_trail_stop
+      (2026-10-12 §13.1 A-1b: 原 v1._run_backtest 参数化迁 core, 策略侧只剩适配器;
+       无分段追踪, **启用** trig_prev 守卫
                                           ⇒ 追踪线走 peak_prev, 已无日内先视)
   relay3.run_backtest_relay3          → run_limit_seal
       ⚠ relay3 已归档 (strategies/_archive/, autodiscover 不递归) ⇒ 本引擎**当前零调用方**;
         2026-10-12 P1-8 为其补上 `_min_sell_day` 守卫 (原 D1 收盘卖在 A股= T+0 违规),
         t0 市场行为逐位不变。恢复使用前请先确认 T+1 语义是否符合预期。
-  g56._exit_no_trail                  → run_hold_stop (无追踪; D-1 板用 STOP_LOSS_LU 紧止损)
+  g56 (exit.mode=g56_no_trail)     → 适配器逐日 exit_decision 循环 (折叠/回测同源;
+      2026-10-12 A-1 接线后 `_exit_no_trail` → run_hold_stop 暂无生产调用方, 见 g56.py 头注)
   break                               → defer_force_open (跌停顺延)
 
 ⚠ `strategies/_archive/` 下的 run_backtest_* (dragon_v2 / dragon_callback_legacy) 是
@@ -52,7 +55,7 @@ from __future__ import annotations
 from app.market_cn.auto.core.exec import (
     fill_blocked_by_limit_dn, fill_on_gap, is_one_word_limit_dn,
 )
-from app.market_cn.auto.core.market import default_market, limit_dn_price
+from app.market_cn.auto.core.market import default_market, is_limit_up, limit_dn_price
 
 
 def _spec_or_default(spec=None):
@@ -212,7 +215,8 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
                    with_reason=False):
     """止损/追踪合并触发 + 峰值逃顶(可选) + 到期收盘 + 跌停顺延。
 
-    与 v1._run_backtest 主循环同构 (2026-09-26 参数化迁出):
+    与 v1 出场主循环同构 (2026-09-26 参数化迁出; 2026-10-12 A-1b 后其包装已并入
+    run_d1_limit_up_trail):
       - T+1: 最早可卖日 = spec.intraday_t0 ? 1 : 2;
       - 追踪线基准由 use_trig_prev 决定 (2026-10-11 P0-1 根因修复):
           True  → 开盘时已知峰值 peak_prev, **触发与成交同源**, 防日内先视;
@@ -413,6 +417,75 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
         for k, v in extra_diag.items():
             if v is not None:
                 result[k] = v
+    return result
+
+
+# ================================================================
+# 2b. d1 涨停确认 + trail (1进2 形态: v1 参数化, 2026-10-12 §13.1 A-1b 迁 core)
+# ================================================================
+
+def run_d1_limit_up_trail(bars, entry_idx, entry_price, *, hold_days, stop_loss,
+                          trailing_stop=None, board_type="main", peak_exit=False,
+                          let_profits_run=False, d1_limit_up=None, d1_change=None,
+                          d1_gap=None, stop_at_idx=None, spec=None, side="long",
+                          with_reason=False):
+    """「1进2」参数化出场: D1(入场日)收盘未达涨停 ⇒ D2 开盘清仓; 连板/让利润奔跑则
+    trail/stop/expiry —— 骨架复用 `run_trail_stop`（pre_exit 钩子）。
+
+    2026-10-12 §13.1 A-1b: 原 `strategies/v1._run_backtest` 参数化迁 core
+    （策略文件回归「文档」）; 消费方 = v1 的 `v1_combo` 适配器与 `backtest_stock`，
+    两者均经 `exit_modes.run_exit` 分派。
+
+    语义 (1进2 设计, 与 v1 monitor 分支同口径):
+      - d1_limit_up 锚 = 「进二日(D1=入场日)收盘 相对 首板收盘(D0) 是否涨停」。
+        ⚠ 旧实现误用 bars[entry_idx+1](=D2) 相对 D1 开盘, 既错 bar 又错基准 ⇒ 已修。
+      - D1 未涨停 ⇒ 非连板 ⇒ D2 开盘清仓 (T+1: 入场当日不可卖)。不用「D1 日内动量<3%」
+        旧启发式 —— 会误清一字板(开=收=涨停, 动量≈0)且误持高开非涨停(动量≥3%)。
+      - let_profits_run=True: 去掉 D2 一刀切, 全程交 run_trail_stop 的 trail/stop/expiry
+        (让利润奔跑: 破峰回撤 trail% 才走 ≈ “破分时均线才走”的日线代理)。
+      - d1_change/d1_gap: 供给路径(diag)时用 D1收盘/D0收盘 比值经 is_limit_up 判连板
+        (与扫描同口径); 缺省则从 bars 取 (兼容旧调用)。
+      - d1_limit_up: 外部未传入则由 bars 推断; 命中时并入返回 dict (d1_limit_up=True)。
+    现实约束 (T+1 / 跳空 / 跌停顺延) 已在 run_trail_stop 内按 MarketSpec 处理。
+    """
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    # d1_limit_up: 若外部未传入则在回测内计算 (兼容旧调用)。
+    if d1_limit_up is None:
+        d1_limit_up = False
+        if entry_idx > 0 and entry_idx < len(bars):
+            d1_close = float(bars[entry_idx]["close"])
+            d0_close = float(bars[entry_idx - 1]["close"])
+            if d0_close > 0 and is_limit_up(d1_close, d0_close, board_type):
+                d1_limit_up = True
+
+    def _pre_exit(d, b, peak, peak_prev):
+        # let_profits_run: 无 D2 一刀切 —— 交给 run_trail_stop 的 trail/stop/expiry 出场(让利润跑)
+        if let_profits_run:
+            return None
+        if d != 2:
+            return None
+        if d1_change is not None and d1_gap is not None:
+            # 供给路径(diag): 用 D1收盘/D0收盘 比值经 is_limit_up 判连板 (与扫描同口径)
+            _d0 = 100.0
+            _d1c = _d0 * (1 + d1_change / 100.0)
+            return "open" if not is_limit_up(_d1c, _d0, board_type) else None
+        if entry_idx <= 0 or entry_idx >= len(bars):
+            return None
+        d1_close = float(bars[entry_idx]["close"])
+        d0_close = float(bars[entry_idx - 1]["close"])
+        if d0_close <= 0:
+            return None
+        return "open" if not is_limit_up(d1_close, d0_close, board_type) else None
+
+    result = run_trail_stop(
+        bars, entry_idx, entry_price,
+        hold_days=hold_days, stop_loss=stop_loss, trailing_stop=trailing_stop,
+        board_type=board_type, peak_exit=peak_exit, spec=spec, side=side,
+        pre_exit=_pre_exit, stop_at_idx=stop_at_idx, with_reason=with_reason,
+    )
+    if result is not None and d1_limit_up:
+        result["d1_limit_up"] = d1_limit_up
     return result
 
 

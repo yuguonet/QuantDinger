@@ -3,13 +3,13 @@
 目的
 ----
 V1 的**官方 CLI 回测入口** `StrategyBase.backtest_stock` 已由 v1.py 自持覆写恢复
-(2026-10-10: scan_signals + entry_decision 竞价 gate + _run_backtest, 行为零改;
+(2026-10-10: scan_signals + entry_decision 竞价 gate + run_d1_limit_up_trail, 行为零改;
 base.py:587 的通用兜底引擎已于 2026-10-09 终态② 删除, 故覆写为 V1 自有包装,
 非第二套通用引擎)。本 harness 直接驱动该同一入口 `v1.backtest_stock`, 验证 V1 在
 120 交易日 × N 票上无异常地跑通整个链路:
 
     scan_signals (D0 盘后信号) → entry_decision (D1 竞价 gap) →
-    _run_backtest (v1_combo 出场引擎, 含「D1 未涨停 → D2 开盘清仓」pre_exit 钩子)
+    run_d1_limit_up_trail (ex-v1._run_backtest, 2026-10-12 §13.1 A-1b 迁 core; 含「D1 未涨停 → D2 开盘清仓」pre_exit 钩子)
 
 注意: 这与 `python -m app.market_cn.auto.tools.replay --strategy v1 --code X --days 120`
 及 `core/backtest.py --strategy v1 --days 120` 调用的是**同一个** `backtest_stock` 方法
@@ -23,7 +23,7 @@ base.py:587 的通用兜底引擎已于 2026-10-09 终态② 删除, 故覆写�
 注意
 ----
 这不是生产 `core.replay` 折叠链路 (后者需策略迁折叠契约 init_state/step/evaluate);
-本 harness 验证的是 V1 既有 scan_signals/决策/_run_backtest 在长窗口下的正确性与健壮性,
+本 harness 验证的是 V1 既有 scan_signals/决策/核心出场引擎在长窗口下的正确性与健壮性,
 即 V1 经官方 CLI 回测所走的实际路径。
 
 可作为 pytest 收集, 也可 `python tests/test_v1_backtest_120d.py` 直接打印报告。
@@ -37,8 +37,9 @@ from datetime import date, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.market_cn.auto.strategies.v1 import V1Strategy, _run_backtest
+from app.market_cn.auto.core.exit_engines import run_d1_limit_up_trail as _run_backtest
 from app.market_cn.auto.core.market import get_board_type
+from app.market_cn.auto.strategies.v1 import V1Strategy
 
 N_DAYS = 120
 SEED = 20261010
@@ -167,7 +168,7 @@ def run_stock_chain(strat, bars, code, hold=7):
             board_type = get_board_type(code)
             res = _run_backtest(bars, entry_idx, entry_price, hold_days=hold,
                                 stop_loss=-10.0, trailing_stop=-5.0,
-                                board_type=board_type, is_v1=True)
+                                board_type=board_type)
             if res is None:
                 rec.update({"exit": None})
                 trades.append(rec)

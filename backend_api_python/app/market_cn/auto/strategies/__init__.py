@@ -260,18 +260,27 @@ def present_persist_settings():
     return {"enabled": bool(v.get("enabled", False)), "warmup": warm}
 
 
+#: 行源/判定引擎全集（§13.1 A-3, 2026-10-12 writer 收口）
+WRITERS = ("scan_day", "record", "scan")
+#: 生产主线 writer（唯一进常态生产的行源）；其余为对拍/回滚位，不进常态生产。
+WRITER_MAINLINE = "record"
+
+
 def scan_writer():
-    """生产链判定引擎开关 (P2, 2026-10-08)。
+    """生产链判定引擎开关 (P2, 2026-10-08；§13.1 A-3 收口 2026-10-12)。
 
     config.json 顶层 (与 present_persist 平级):
         "scan_writer": "scan_day" | "record" | "scan"
-    缺键 / 非法 ⇒ "record" —— **缺省 = 折叠 Record.ready (P5-③ 现状)**, 生产行为零变化。
-      · "scan_day" = 门表引擎 scan_day (P2 目标态, 门表唯一规则源)
-      · "record"   = 折叠内核 persist_days → Record.ready (P5-③ 现状)
-      · "scan"     = 折叠内核 scan_days (旧回滚位)
+    缺键 / 非法 ⇒ "record" —— **缺省 = 折叠 Record.ready (生产主线)**。
+      · "record"   = 折叠内核 persist_days → Record.ready —— **生产主线（现役）**
+      · "scan_day" = 门表引擎 scan_day —— **降级为对拍工具**（服务 path_parity/门表
+        对照，不进常态生产；config 翻到它 = 显式对拍/回滚，run_scan 会 WARN）
+      · "scan"     = 折叠内核 scan_days（旧回滚位，同样不进常态生产）
+    ⚠ A-3 (2026-10-12): 三 writer 并存 = 多源判定风险，已收口为「单一主线 +
+      两个对拍/回滚位」；最终三选一删除待后续批次（删前先确认无人依赖回滚位）。
     """
     v = load_config().get("scan_writer")
-    return v if v in ("scan_day", "record", "scan") else "record"
+    return v if v in WRITERS else WRITER_MAINLINE
 
 
 def monitor_progress_settings():

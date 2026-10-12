@@ -154,7 +154,20 @@ def refresh_decision_summary(decision_id: int) -> None:
 
 
 def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict[str, Any]]:
-    """取到期未判的 claim（含决策上下文，供 judge 看原话）。"""
+    """取到期未判的 claim（含决策上下文，供 judge 看原话）。
+
+    ★ 2026-10-12 修正（G0 Bug ①/②）：
+      旧实现只看 `due_date <= today`，把「到期」当成「可判定」。但两者不同：
+        · 休市期间到期（如国庆）：行情尚未产生 ⇒ 取数必失败；
+        · 长假前做的决策：自然日已过但交易日未走完。
+      新增**视界门①**（移植 evaluator.py:239-250 已验证的门）：
+        只取「按交易日历算，已走完 N 个交易日**且**日历覆盖到位」的 claim；
+        未到视界的**直接不返回**（不是失败，不占重试额度）。
+      这样把「未到期」与「到期但取不到数」区分开：前者继续等，后者计重试次数。
+
+    重试节流：同一 claim 两次尝试间隔 `QD_CLAIM_RETRY_HOURS`（默认 6 小时），
+    避免盘后 worker 每小时重复撞同一批尚未就绪的数据。
+    """
     day = as_of or date.today()
     try:
         with _conn() as conn:
@@ -168,13 +181,40 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
                 " JOIN qd_agent_decisions d ON d.id = c.decision_id"
                 " WHERE c.status = 'pending'"
                 "   AND (c.due_date IS NULL OR c.due_date <= %s)"
+                "   AND (c.last_attempt_at IS NULL"
+                "        OR c.last_attempt_at <= now() - make_interval(hours => %s))"
                 " ORDER BY c.due_date NULLS LAST, c.id"
                 " LIMIT %s",
-                (day, int(limit)))
-            return [dict(r) for r in (cur.fetchall() or [])]
+                (day, _retry_hours(), int(limit)))
+            rows = [dict(r) for r in (cur.fetchall() or [])]
     except Exception as e:
         logger.warning("[AccountStore] 查询到期 claim 失败: %s", e)
         return []
+
+    # ── 视界门①（时间门）：按交易日历校验「第 N 个交易日是否已走完」
+    from chain.claims import _HORIZON_DAYS, _nth_trading_day
+    ready: List[Dict[str, Any]] = []
+    for r in rows:
+        days = _HORIZON_DAYS.get(r.get("horizon") or "")
+        ed = r.get("exec_date")
+        if not days or ed is None:
+            ready.append(r)          # 视界未知 ⇒ 不阻挠（保持旧行为）
+            continue
+        # 数据可用日 = exec 之后第 N 个交易日；取不到（日历未覆盖）⇒ 不阻挠
+        due_td = _nth_trading_day(ed, days)
+        if due_td is None or due_td <= day:
+            ready.append(r)
+        # else: 交易日未走完 ⇒ 本轮跳过（不计失败）
+    return ready[:int(limit)]
+
+
+def _retry_hours() -> int:
+    """同一 claim 两次判定尝试的最小间隔小时数（默认 6）。"""
+    import os
+    try:
+        return max(0, int(os.getenv("QD_CLAIM_RETRY_HOURS", "6") or "6"))
+    except ValueError:
+        return 6
 
 
 def save_resolution(*, claim_id: int, actual: Dict[str, Any],
@@ -185,7 +225,20 @@ def save_resolution(*, claim_id: int, actual: Dict[str, Any],
                     resolver_kind: str = "market_data", resolver_model: str = "",
                     resolver_ver: str = "", judge_raw: str = "",
                     cost_tokens: int = 0, sampled: bool = False) -> Optional[int]:
-    """写判定结果 + 偏差细则。"""
+    """写判定结果 + 偏差细则，并按**重试治理**更新 claim 状态。
+
+    ★ 2026-10-12 修正（G0 Bug B）：
+      旧实现只要 `undecidable + data_missing` 就置 `unresolvable`（终态，永不重试）。
+      但 `data_missing` 是**暂时性**失败（数据只是还没到）—— 实测案例：
+        10/1 的 claim 在 10/7 因国庆休市取不到数 ⇒ 被终态化；
+        而数据 10/9 已可得 ⇒ 教训永久丢失（6 条）。
+      新语义（*暂时性失败可重试*）：
+        · 失败 → `verify_fail_count += 1`，状态**保持 pending**（下轮还会被扫到）；
+        · 达上限（`QD_CLAIM_MAX_RETRY`，默认 5）→ 才置 `unresolvable`
+          （沿用 `chain/evaluator` 既有毒丸机制的 5 次阀值，不新造规则）；
+        · **真实判定（hit/miss/partial）不受影响**：直接 resolved，fail_count 归零。
+      ⇒ 区分「到期」与「数据已就绪」：到期但数据未到 ⇒ 只计失败次数，**不当结论**。
+    """
     try:
         with _conn() as conn:
             cur = conn.cursor()
@@ -202,16 +255,60 @@ def save_resolution(*, claim_id: int, actual: Dict[str, Any],
                  resolver_model or "", resolver_ver or "", judge_raw or "",
                  int(cost_tokens or 0), bool(sampled)))
             row = cur.fetchone()
-            cur.execute("UPDATE qd_agent_claims SET status = %s WHERE id = %s",
-                        ("unresolvable" if verdict == "undecidable" and
-                         attribution == "data_missing" else "resolved",
-                         int(claim_id)))
+            _advance_claim_status(cur, int(claim_id), verdict, attribution)
             conn.commit()
             return int(row["id"]) if row else None
     except Exception as e:
         logger.warning("[AccountStore] 写 resolution 失败(忽略): %s: %s",
                        type(e).__name__, e)
         return None
+
+
+def _max_retry() -> int:
+    """暂时性失败的最大重试次数（默认 5，与 `chain/evaluator` 毒丸阀值同口径）。"""
+    import os
+    try:
+        return max(1, int(os.getenv("QD_CLAIM_MAX_RETRY", "5") or "5"))
+    except ValueError:
+        return 5
+
+
+def _advance_claim_status(cur, claim_id: int, verdict: str, attribution: str) -> None:
+    """按判定结果推进 claim 状态（重试治理，见 `save_resolution` 注释）。
+
+    分三类：
+      A) 真实结论（hit/miss/partial）  ⇒ resolved，fail_count 归零
+      B) 取数不可用（undecidable+data_missing）⇒ fail_count+1，**保持 pending**
+         （达上限才 unresolvable）
+      C) 其余 undecidable（如 caliber/口径问题）⇒ unresolvable
+         （不是数据未到，而是判不了；重试无意义）
+    """
+    transient = (verdict == "undecidable" and attribution == "data_missing")
+    if transient:
+        limit = _max_retry()
+        cur.execute("""
+            UPDATE qd_agent_claims
+               SET verify_fail_count = COALESCE(verify_fail_count, 0) + 1,
+                   last_attempt_at = now(),
+                   status = CASE
+                       WHEN COALESCE(verify_fail_count, 0) + 1 >= %s THEN 'unresolvable'
+                       ELSE 'pending'
+                   END
+             WHERE id = %s
+        """, (limit, claim_id))
+        return
+
+    if verdict == "undecidable":
+        # C) 判不了（非数据未到）：终态；不占重试额度
+        cur.execute(
+            "UPDATE qd_agent_claims SET status = 'unresolvable',"
+            " last_attempt_at = now() WHERE id = %s", (claim_id,))
+        return
+
+    # A) 真实结论：已定论，不再参与扫描
+    cur.execute(
+        "UPDATE qd_agent_claims SET status = 'resolved',"
+        " last_attempt_at = now() WHERE id = %s", (claim_id,))
 
 
 def stats(limit_days: int = 30) -> Dict[str, Any]:

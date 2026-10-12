@@ -226,13 +226,64 @@ def guess_confidence(text: str) -> Optional[float]:
     return None
 
 
+def _nth_trading_day(base: date, n: int, max_calendar_days: int = 400) -> Optional[date]:
+    """base 之后第 n 个交易日（base 本身不算）。日历不足则 None。
+
+    不调 `next_trading_day()`：它在日历越界时会一路拖到底再逐天回退，
+    实测在 2026-12-20 之后要 n=20 会抛 `OverflowError: date value out of range`
+    （缓存日历只到 2026-12-31）。故直接读日历集合，带**自然日上限**限步。
+    """
+    try:
+        from app.utils.trading_calendar import _load
+        cal = _load()
+    except Exception:
+        return None
+    if not cal:
+        return None
+    d, cnt = base, 0
+    for _ in range(max_calendar_days):
+        d = d + timedelta(days=1)
+        if d.strftime("%Y-%m-%d") in cal:
+            cnt += 1
+            if cnt >= n:
+                return d
+    return None
+
+
 def due_date_of(horizon: str, exec_date: Optional[date] = None) -> Optional[date]:
-    """视界 → 到期日（自然日估算，与 evaluator 同口径）。n/a 返回 None。"""
+    """视界 → 到期日。n/a 返回 None。
+
+    ★ 2026-10-12 修正（G0 Bug A）：
+      旧实现是**自然日估算**（`base + timedelta(days=int(N*1.5)+2)`），完全不看休市：
+        · 10/1（国庆首日）的 T+1 算得 due=10/4 —— 而 10/1~10/7 全部休市；
+        · 到期扫描（`due_date <= today`）于是在 10/7 就命中，但此刻 >= 10/1 的
+          K 线**尚不存在** ⇒ base_idx=None ⇒ data_missing ⇒ 被写成 unresolvable；
+        · 数据 10/9 已可得，但 claim 已在 10/7 永久出队。
+      ⇒ 改为**按交易日历数第 N 个交易日**（与设计 §4.1「按交易日计」对齐）。
+
+    语义选择（重要）：本函数继续返回**自然日 date**（不改列类型、不改扫描 SQL），
+    只把日期算准 —— 到期日 = exec_date 之后第 N 个交易日。
+
+    兵分两路：
+      · 日历可命中 ⇒ 精确交易日口径；
+      · 日历越界（缓存通常只到当年年底）⇒ 回退**自然日估算**。
+    默认再取两者**较大值**（宁可晚判，不可早判）—— 早判会拿到不完整窗口，
+    而这是旧 `_maturity_days` 已被实证过的致命错误。
+    `QD_DUEDATE_EXACT=1` 可改为完全信任日历（不取 max）。
+    """
     days = _HORIZON_DAYS.get(horizon)
     if not days:
         return None
     base = exec_date or date.today()
-    return base + timedelta(days=int(days * 1.5) + 2)
+    naive = base + timedelta(days=int(days * 1.5) + 2)
+
+    exact = _nth_trading_day(base, days)
+    if exact is None:
+        return naive
+    import os
+    if os.getenv("QD_DUEDATE_EXACT", "").strip().lower() in ("1", "true", "yes", "on"):
+        return exact
+    return max(exact, naive)
 
 
 def _conclusion_text(answer: str, span: int = 600) -> str:

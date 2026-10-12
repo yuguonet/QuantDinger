@@ -156,9 +156,11 @@ def _has_fold_contract(strategy) -> bool:
 FOLD_CONTRACT_EXEMPT: dict = {
     "v1": {
         "reason": ("2026-10-10 实证改造后回归（V1策略迭代与新策略实证_20261010.md）："
-                   "自持回测 _run_backtest + scan_signals，未迁折叠契约；"
-                   "record writer 下走「退回直判」分支（带 ERROR 日志），monitor 回退旧三决策。"),
-        "ticket": "§13.1 A-5（v1 的 _run_backtest 迁 core 参数化后补折叠契约）",
+                   "自持回测编排 scan_signals + entry_decision + run_exit(\"v1_combo\")，"
+                   "未迁折叠契约；"
+                   "record writer 下走「退回直判」分支（带 ERROR 日志），monitor 回退旧三决策。"
+                   "（2026-10-12 A-1b：原自持 `_run_backtest` 已参数化迁 core.exit_engines。）"),
+        "ticket": "§13.1 A-5（v1 补折叠契约 init_state/step/evaluate 后移出本名单）",
         "expires": "2026-12-31",
         "missing_views": ["realtime_progress", "present_slice"],
     },

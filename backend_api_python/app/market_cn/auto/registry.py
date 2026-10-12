@@ -53,8 +53,12 @@ DRAGON_STRATEGY = "dragon_callback"
 # dragon_callback_legacy (见 strategies/_archive/)。改名/增删策略时同步此表。
 # 2026-09-27: break_v2/dragon_v2/triple_resonance/t_hilo 归档 _archive/, 同步删 fallback
 # 2026-10-09: v1/relay3/lead_chase 退役归档 _archive/ (P6-6/7), 同步删 fallback
+# 2026-10-12: **补回 v1** —— 10-10 v1 回归上线 (v1.yaml meta.enabled=true) 时
+#   未把 10-09 删掉的 key 反向补回 ⇒ 兜底名单落后于磁盘插件一份。教训与
+#   strategies/base.py 的 FOLD_CONTRACT_EXEMPT 同类:**退役时做的清理, 回归时必须
+#   反向还原**。doctor check_static 1c 会自动比对二者, 再漂移会 WARN。
 _STRATEGIES_FALLBACK = (
-    "dragon_callback", "break",
+    "dragon_callback", "break", "v1",
     "knife_catch", "tail_oversold", "g56",
 )
 

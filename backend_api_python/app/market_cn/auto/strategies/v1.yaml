@@ -29,22 +29,20 @@ meta:
   day_start: 25                # 逐日起点
   day_min_n: 30                # 低于此根数直接返回空
   # 说明: 本策略无 lu_idx 依赖 (信号在 D0 当日判定), 引擎逐日枚举决策日 i,
-  # 门表一次性求所有门; 入场/出场由 entry_modes / exit_modes 按本文件 entry/exit 块选择。
+  # 门表一次性求所有门; 出场由 exit_modes 按本文件 exit.mode 分派 (阈值取 params)。
+  # 入场**不走分派**: 依赖竞价快照等累积状态 ⇒ 由 v1.py 的 step / entry_decision 承载
+  #   (core/entry_modes.py 已于 2026-10-09 退役; 目标态 §3.2.2)。
 
-entry:
-  mode: open                  # v1 次日开盘买入 (next_open)
-  price: open                 # 成交价基准 = D1 开盘价
-  gap_min_high: gap_min_high  # 高开线 (≥8% 强势连板, 唯一正EV区); 上限=板块涨停价(排除一字D1) 由代码判
-  # ⚠ 前视: d1_change 是 D1 收盘值, 用它淘汰 D1 开盘入场 = 未来信息;
-  #   实盘语义是「D2 开盘清仓」(confirm_decision weak), 已由 exit v1_combo 的 pre_exit 实现。
-  #   默认 false = 对齐实盘。置 true 仅用于复现旧回测口径做对照。
-  require_d1_close_up: false
-
+# ⚠ 阈值 / 入场过滤参数一律在 `params:` —— 唯一事实源 (目标态 §3.2.1/§3.2.2,
+#   2026-10-12 裁决 D1/D2)。禁止另设 `entry:` 块或在 `exit:` 里写阈值:
+#   代码不消费 ⇒ 复刻 "改了不生效" 陷阱。
+#   (2026-10-12 清理: 原 `entry:` 块 8 行 + `exit:` 的 stop/trail/max_hold 3 行
+#    实测全为零消费死配置, 已删; 知识留档如下。)
+#   ⚠ 前视备忘 (原 entry.require_d1_close_up): d1_change 是 D1 收盘值,
+#     用它淘汰 D1 开盘入场 = 未来信息; 实盘语义是「D2 开盘清仓」
+#     (confirm_decision weak), 已由 exit v1_combo 的 pre_exit 实现。
 exit:
-  mode: v1_combo              # 复用 v1 专属出场引擎 (stop/trail/max_hold + V1 动量 D2 清仓)
-  stop: -10.0                 # 固定止损 % (与 PARAMS 同值; 峰值≥入场时被 -5% 追踪线支配, 实际不触发)
-  trail: -5.0                 # 追踪止损 % (自入场后峰值回撤)
-  max_hold: 7                 # 到期天数
+  mode: v1_combo              # 复用 v1 专属出场引擎 (阈值取 params: stop/trail/hold)
 
 params:                        # 可调参数 (表达式直接引用; 2026-10-10 数据驱动重设 → 可买真首板)
   prior_lu_free_days: 10       # 真首板: 前 N 日内无涨停 (不与龙回头/断板重合)

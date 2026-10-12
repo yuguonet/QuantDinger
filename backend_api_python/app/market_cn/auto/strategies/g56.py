@@ -174,6 +174,12 @@ def _exit_no_trail(bars, s, entry, hold_days=None, stop_loss=None, code=None,
                    stop_loss_lu=None):
     """无追踪出场模拟 — 骨架上收 core.exit_engines.run_hold_stop。
 
+    ⚠ 2026-10-12 §13.1 A-1 接线后**暂无生产调用方**: g56 折叠/回测出场统一走
+    `_exit_g56_no_trail`（逐日 exit_decision 循环, 与展示/实时同源）。
+    本函数与 run_hold_stop 保留为 hold/stop 形态参数化引擎（test_exit_rollover_
+    real_behavior 钉住其跌停顺延语义）；待 R-1 把 g56 exit_decision 腿并入
+    run_hold_stop 后再决定去留 —— 在此之前不得照它改活跃出场路径。
+
     hold_days / stop_loss / stop_loss_lu: 由调用方注入 (g56.yaml); 传 None 回落模块常量
         (常量降级为兜底默认值, yaml 是权威事实源, 二者值一致)。
     code: 可选, 用于判断信号日是否涨停 (D-1 板) —— 该子集用 stop_loss_lu 紧止损,
@@ -410,19 +416,21 @@ class G56Strategy(StrategyBase):
                             "high": float(bar.get("high") or 0),
                             "low": float(bar.get("low") or 0),
                             "close": float(bar.get("close") or 0)})
-                dec = self.exit_decision(
-                    {"code": code, "entry_price": entry_price},
-                    snap={"mode": "day_close", "bars": seg, "entry_idx": 2})
-                if dec.action != "exit":
+                # §13.1 A-1 (2026-10-12): 出场**经 exit.mode 派发**（run_exit →
+                # g56_no_trail 适配器，内部逐日调 exit_decision，与旧直调逐位同源）。
+                # 未注册 mode ⇒ run_exit 抛 KeyError（fail-fast，不静默兜底）。
+                from app.market_cn.auto.core.exit_modes import run_exit
+                _sp = _g56_spec()
+                r = run_exit(
+                    _sp.exit.get("mode", "g56_no_trail"),
+                    bars=seg, entry_idx=2, entry_price=entry_price,
+                    code=code, board_type=get_board_type(code), params=_sp.params,
+                    stop_at_idx=len(seg) - 1)
+                # 仅在「今日 = 出场日」闭合（r 为截至今日的出场结论, 按 exit_day 对表）。
+                if r is None or r.get("exit_day") != d or not r.get("exit_reason"):
                     holding = prev
                 else:
-                    exit_price = (float(seg[-1]["open"]) if getattr(dec, "fill", "") == "open"
-                                  else float(dec.price))
-                    peak = max((float(w[1]) for w in win_w[-(d - 1):]),
-                               default=float(bar.get("high") or 0))
-                    peak = max(peak, float(bar.get("high") or 0))
-                    events.append(self._exit_event(prev, bar, d, round(exit_price, 3),
-                                                   dec.reason, peak))
+                    events.append(self._exit_event(prev, bar, d, r))
             else:
                 holding = prev
         # ── D0 入场（gap 过滤 = 旧 entry_decision/backtest 同式）──
@@ -547,14 +555,19 @@ class G56Strategy(StrategyBase):
         stop_lu = float(sp.get("stop_loss_lu", STOP_LOSS_LU))
         return stop_lu if G56Strategy._lu_subset(state, code) else stop
 
-    def _exit_event(self, prev, bar, d, price, reason, peak):
+    def _exit_event(self, prev, bar, d, r):
+        """exit 事件载荷 —— 由 `run_exit` 适配器返回 dict 搬运（§13.1 A-1，2026-10-12）。
+
+        字段与旧路径逐位同值: exit_price=round3、return_pct 自**四舍五入后**的成交价、
+        peak_return_pct 自入场以来 high 峰值（适配器与旧折叠同式）。
+        """
         entry = float(prev.payload["entry_price"])
         return Progress(stage="exit", date=bar.get("time", ""), payload={
             "entry_date": prev.payload["entry_date"], "entry_price": entry,
-            "exit_date": bar.get("time", ""), "exit_price": price,
-            "exit_day": d, "reason": reason,
-            "return_pct": round((price / entry - 1) * 100, 2) if entry > 0 else None,
-            "peak_return_pct": round((peak / entry - 1) * 100, 2) if entry > 0 else None,
+            "exit_date": bar.get("time", ""), "exit_price": r["exit_price"],
+            "exit_day": r["exit_day"], "reason": r["exit_reason"],
+            "return_pct": r["return_pct"] if entry > 0 else None,
+            "peak_return_pct": r["peak_return_pct"] if entry > 0 else None,
         }, next_realtime=None)
 
 
@@ -823,24 +836,48 @@ register_strategy_funcs(
 # ---- exit_modes 注册 (2026-09-26 P1-9 层反转) ----
 def _exit_g56_no_trail(bars, entry_idx, entry_price, *, code, board_type, params, diag,
                        stop_at_idx=None):
-    """g56 无追踪 7d/-8% 出场 — 供 YAML exit.mode=g56_no_trail。
+    """g56 无追踪 7d/-8% 出场 — 供 YAML exit.mode=g56_no_trail（折叠唯一出场分派）。
 
-    ⚠ `_exit_no_trail` 不接受 `stop_at_idx`：g56 的折叠出场是**逐日 exit_decision**
-      （见 `G56Strategy.evaluate` 的 `exit_decision` 分支），重放截断由该分支的
-      `d` 参数天然保证（只喂到今日），本适配器仅服务**回测主干**
-      （`run_all` → 全量 bars）。
+    §13.1 A-1 (2026-10-12) 接线: 折叠出场**经 `run_exit` 分派**到此（此前为「适配器
+    已注册待接」）。实现 = 逐日调 `G56Strategy.exit_decision`（与展示/实时**同一份**
+    判定，不在此重写出场规则 —— 切口 2 纪律）；成交/峰值口径与折叠原 `_exit_event`
+    路径逐位一致（golden 逐笔等价背书）。
+
+    `stop_at_idx` = 折叠逐日重放截断点（防先视）；`bars` 须含入场日**及之前 ≥2 根**
+    （D-1 涨停紧止损读 bars[entry_idx-1/-2]，与折叠 seg(entry_idx=2) 同口径）。
+    视野内未触发出场 → None（交易未闭合，由事件链收尾/下一重放日再判）。
     """
     from app.market_cn.auto.core.exit_modes import _bp
     if stop_at_idx is not None:
-        # 折叠路径请走 exit_decision 分支；此处 fail-fast 而非静默忽略,
-        # 否则「改了 mode 却没生效」又会变成空承诺（P1-7 病灶）。
-        raise NotImplementedError(
-            "g56_no_trail 不支持重放截断(stop_at_idx)；折叠出场走 exit_decision 分支")
-    return _exit_no_trail(bars, entry_idx, entry_price,
-                          _bp(params, board_type, "hold_days"),
-                          _bp(params, board_type, "stop_loss"),
-                          code=code,
-                          stop_loss_lu=_bp(params, board_type, "stop_loss_lu"))
+        bars = bars[:stop_at_idx + 1]          # 只许看到截至今日的 bars（防先视）
+    if entry_price <= 0 or entry_idx >= len(bars):
+        return None
+    _sp = _g56_spec().params
+    _hold = _bp(params, board_type, "hold_days")
+    if _hold is None:
+        _hold = _sp.get("hold_days", HOLD_DAYS)
+    hold = int(_hold)
+    strat = G56Strategy()
+    for d in range(2, hold + 1):               # T+1: 入场当日(d=1)不可卖
+        idx = entry_idx + d - 1
+        if idx >= len(bars):
+            break                              # 视野尽头 → None（未闭合, 不造收尾）
+        dec = strat.exit_decision(
+            {"code": code, "entry_price": entry_price},
+            snap={"mode": "day_close", "bars": bars[:idx + 1], "entry_idx": entry_idx},
+            **(params or {}))
+        if dec.action == "exit":
+            px = (float(bars[idx]["open"]) if getattr(dec, "fill", "") == "open"
+                  else float(dec.price))
+            px = round(px, 3)                  # 与折叠 _exit_event 的 round(price, 3) 同口径
+            peak = max(float(b["high"]) for b in bars[entry_idx:idx + 1])
+            return {
+                "exit_date": str(bars[idx].get("time") or "")[:10] or None,
+                "exit_price": px, "exit_day": d, "exit_reason": dec.reason,
+                "return_pct": round((px / entry_price - 1) * 100, 2),
+                "peak_return_pct": round((peak / entry_price - 1) * 100, 2),
+            }
+    return None
 
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit

@@ -61,8 +61,18 @@ def fetch_actual(subject: str, subject_kind: str, horizon: str,
                  exec_date: Optional[date] = None) -> Optional[Dict[str, Any]]:
     """按 subject 取真实行情（复用 evaluator 的单一取数口径，含窗口极值）。
 
+    ★ 2026-10-12 新增 `truncated` 标记（G0 Bug C）：
+      `_get_actual_return` 内部是 `exit_idx = min(base_idx + hold_days, len-1)`，
+      数据不足时**不报错**，而是用最后一根 K 线交卷。实测：
+        请求 T+10 → 实际只算 2 天（6 例中 4 例被截断）。
+      若不拦，T+N 标签会静默变成更短窗口（与设计 §4.2「主窗口唯一」直接冲突）。
+      旧链路早已修过此坑（evaluator.py:260-267 视界门②，2026-09-27 修 E2），
+      本函数是把它**移植**过来（同一口径、不另写一套）。
+
     Returns:
-        {"pct","dir","high","low","close","as_of","source"} 或 None（取不到/不支持）
+        {"pct","dir","high","low","close","as_of","source"}
+        或 None（取不到/不支持）
+        额外：`"truncated": True` 表示窗口被截断（调用方**不得定论**）。
     """
     if not subject:
         return None
@@ -92,7 +102,7 @@ def fetch_actual(subject: str, subject_kind: str, horizon: str,
         as_of = date.fromisoformat(str(r.get("exit_date") or "")[:10])
     except (ValueError, TypeError):
         as_of = None
-    return {
+    out = {
         "pct": round(pct, 2),
         "dir": d,
         "high": r.get("high"),
@@ -101,6 +111,15 @@ def fetch_actual(subject: str, subject_kind: str, horizon: str,
         "as_of": as_of,
         "source": "CNStockDataSource.get_kline(1D)",
     }
+    # ── 视界门②（截断）：实际持有根数 < 应有根数 ⇒ 窗口不完整
+    try:
+        actual_hold = int(r.get("hold_days") or 0)
+    except (TypeError, ValueError):
+        actual_hold = 0
+    out["hold_days"] = actual_hold
+    out["hold_days_expected"] = hold
+    out["truncated"] = bool(actual_hold < hold)
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -271,6 +290,23 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
                 "attribution_note": f"取不到真实数据（subject={claim.get('subject')}, "
                                     f"kind={claim.get('subject_kind')}）",
                 "resolver_kind": "market_data", "sampled": False}
+
+    # ── 视界门②（G0 Bug C）：窗口被截断**不得定论**（ports evaluator.py:260-267）
+    #   数据不足（长期停牌/退市/数据缺口/提前扫描）时 _get_actual_return 会用
+    #   最后一根 K 线交卷。若不拦，T+N 标签会静默缩成更短窗口，而事后无法识别。
+    #   语义选择：仍归 data_missing（与旧链路 `_bump_eval_failure` 一致）
+    #   ⇒ 由 account_store 的重试治理累积次数，**不终态化**，不占真实战绩。
+    if actual.get("truncated"):
+        return {"actual": {k: (v.isoformat() if isinstance(v, date) else v)
+                            for k, v in actual.items()},
+                "deviation": {}, "verdict": "undecidable", "verdict_score": None,
+                "attribution": "data_missing",
+                "attribution_note": (
+                    "窗口被截断（实际持有 %s 根 < 应有 %s 根）：数据未走完，"
+                    "不得定论（视界门②）"
+                    % (actual.get("hold_days"), actual.get("hold_days_expected"))),
+                "resolver_kind": "market_data", "sampled": False}
+
     dev = compute_deviation(claim, actual)
     out = verdict_by_rule(claim, actual, dev)
     kind, model, raw = "market_data", "", ""

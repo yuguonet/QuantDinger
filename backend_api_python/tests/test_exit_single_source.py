@@ -7,7 +7,7 @@
     一旦有人再抄一份出场引擎，测试硬 FAIL。
 
 判据（不做静默降级）:
-    1. 四个出场引擎函数在**整个 backend_api_python 树**内各只有 1 处 `def`
+    1. 五个出场引擎函数在**整个 backend_api_python 树**内各只有 1 处 `def`
        （排除 del/、node_modules、.venv、__pycache__）。
     2. 每个出场调用点都必须 import 自 `core.exit_engines`（不允许 `from ... import`
        别的模块后调用同名函数）。
@@ -26,7 +26,8 @@ import pytest
 
 BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-EXIT_ENGINES = ("run_hold_stop", "run_trail_stop", "run_limit_seal", "defer_force_open")
+EXIT_ENGINES = ("run_hold_stop", "run_trail_stop", "run_limit_seal", "defer_force_open",
+                "run_d1_limit_up_trail")
 
 SKIP_DIRS = {"del", "node_modules", ".venv", "__pycache__", ".git", ".pytest_cache",
              "venv", "build", "dist", "_archive"}
@@ -80,6 +81,40 @@ def test_no_slice_namespace():
         assert "auto.slice" not in src, "残留 auto.slice 引用: %s" % os.path.relpath(p, BACKEND)
         assert "SliceStrategyBase" not in src, \
             "残留 SliceStrategyBase（已并入 StrategyBase）: %s" % os.path.relpath(p, BACKEND)
+
+
+# ================================================================
+# §13.1 A-1 (2026-10-12) 验收扩展: 全策略出场路径单分派
+# ================================================================
+def test_fold_exits_dispatch_via_run_exit():
+    """折叠/回测出场必须经 `run_exit` 单一分派（依赖反转, 不直调出场函数）。
+
+    有折叠 exit 事件链的策略 (dragon_callback / break / g56) 与 v1 的 backtest_stock
+    均须 `run_exit(` 分派；knife/tail 为 exec 自闭合链（D1 开盘卖）无折叠 exit 段，
+    不在此列（其 `d1_open` 模式已注册，接入排后续批次）。
+    """
+    sdir = os.path.join(BACKEND, "app", "market_cn", "auto", "strategies")
+    for fn in ("dragon_callback.py", "break.py", "g56.py", "v1.py"):
+        src = io.open(os.path.join(sdir, fn), encoding="utf-8").read()
+        assert "run_exit(" in src, (
+            "%s 未经 run_exit 分派出场 —— 出场路径必须单分派（§13.1 A-1）" % fn)
+
+
+def test_exit_adapters_accept_stop_at_idx():
+    """已接线的出场适配器必须收 `stop_at_idx`（折叠逐日重放防先视契约）。
+
+    `run_exit` 统一传 `stop_at_idx`；适配器不收 ⇒ TypeError（P1-7 接线时踩过），
+    或更糟——静默看到未来 bars。"""
+    import inspect
+
+    from app.market_cn.auto import strategies as reg
+    from app.market_cn.auto.core.exit_modes import EXIT_MODES
+    reg.autodiscover()
+    for mode in ("combo", "break_combo", "g56_no_trail", "v1_combo"):
+        fn = EXIT_MODES.get(mode)
+        assert fn is not None, "出场模式未注册: %s" % mode
+        assert "stop_at_idx" in inspect.signature(fn).parameters, (
+            "出场适配器 %s 不收 stop_at_idx —— 折叠重放截断契约缺失" % mode)
 
 
 def test_no_common_shim():
