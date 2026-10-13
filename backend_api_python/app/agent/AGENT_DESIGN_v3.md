@@ -519,7 +519,7 @@ run 级一次性 few-shot（CBR），填技能酿造的粒度空档。**增益�
 
 | 尺 | 管什么 | 产物 |
 |---|---|---|
-| `scripts/qd_smoke.py` | 回归（不调模型） | **256** 项断言（40 个 test 函数）；`--with-env` 把环境缺件 fail→skip ⚠️ §3.13 早期版本写「248 项」与 §9 的 256 自相矛盾，以 256 为准 |
+| `scripts/qd_smoke.py` | 回归（不调模型） | **257** 项断言（40 个 test 函数，2026-10-13 晚实测 255/257）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「248 项」「256 项」是更早时点的数，现以 **257** 为准（口径演变见 §9） |
 | `scripts/qd_prompt_eval.py` + `prompt_tasks.yaml` | prompt 行为（真实端点） | 10 任务/35 断言，含规划 5 题 |
 | `scripts/qd_bench.py` + `bench_tasks.yaml` | 能力质量（C） | 25 题五类各 5；五维确定性打分 |
 | `scripts/qd_dispatch_ab.py` | 成本对照（B） | 分发 vs 不分发单变量 A/B；`--rejudge` 不重跑复核 |
@@ -658,6 +658,11 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 > M-1「同一份源码两套 module 对象」病根消失。实测**活代码裸名 import 0 处**
 > （仅 `tmp/*.bak` 备份件残留），`ensure_path_order()` **全仓已不存在**。
 > ⇒ 下表标注 ✅ 的三条**不要再照着改代码**，保留只为理解历史；标 ⚠️ 的三条仍然有效。
+> ⚠️ **守卫缺口（2026-10-13 发现）**：P5 的红线守卫 `tests/test_v6_import_modernize.py`
+> （断言零裸名 / 零 sys.path / 零断裂引用）已随 **P16 归档**到
+> `del/agentcore_retired_20261013/tests/`，**现无守卫** ⇒ 有人重新引入裸名 import
+> 或 `sys.path` 注入不会 FAIL。建议从 `del/` 取回该守卫（它守的是 P5 契约，与
+> agentcore 是否退役无关），或补一条等价断言。
 
 | 坑 | 说明 |
 |---|---|
@@ -1347,7 +1352,7 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 | **O-5** | 经验存储**合一**：一次推理一行 case（内嵌 EV-1 + pair + condition_key，frame 按 as_of 单独存） | 从「同一次推理散在 4 个文件」到一次写入一次检索 | 要改 `qd_agent_cases` 的 payload schema（本来就要扩展） | **⑤ 做** |
 | **O-6** | 权重闭环粒度从 `domain` 升到 `condition_key`（新增 `layer='cond'`） | 闭环对象与条件化引擎对齐；domain 层保留作粗粒度 | 每格 30 簇 ⇒ **只作展示，不作行为调整** | **⑥ 做（限展示）** |
 | **O-7** | 观测计数器进程内 → 落盘 JSONL（D-8） | 拿到长期趋势 | 便宜 | **⑦ 做** |
-| **O-8** | `app/agent/utils` → `qdutils`（D-13） | 消除 sys.path 顺序依赖这颗长期雷 | 涉 9 处改名 | ⑧ 做（可并到 O-1 一起改） |
+| **O-8** | `app/agent/utils` → `qdutils`（D-13） | 可读性：同名目录在 grep / IDE 检索里易串 | 涉 9 处改名 | ⑧ **降级为可选**（⚠️ 2026-10-13 复核：原动机「sys.path 顺序雷」已被 P5 根治，本项不再是"排雷"，只余可读性收益，不必抢在 O-1 前后做） |
 | **O-9** | 日配额 `add_day_usage` 接线 + 自适应算力 U 路由（G9 + §19.2） | 自适应路由不会绕过日成本保护 | 要定 U 的三个权重（不许拍，先观测一季） | ⑨ 做 |
 | **O-10** | `admission.json` 落进工作副本 | 干净环境不再「注册 0 个、不抛错」地静默降级 | 与「本地不入库」裁定不冲突（落工作副本即可） | ⑩ 做 |
 | **O-11** | 小项打包：`run_skill` 白名单下沉（D-11）/ `_skill_seen` LRU（D-12）/ 旧系统反向依赖（D-2） | 各自都是几十分钟 | 低 | ⑪ 打包做 |
