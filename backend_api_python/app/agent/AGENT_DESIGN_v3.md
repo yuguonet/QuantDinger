@@ -1328,7 +1328,7 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 | P0-1 `delisted` 单列 | ✅ 已落地 | `chain/resolver.py` `verdict='delisted'` |
 | P0-2 `_VERDICT_SCORE` 补 `delisted: 0.0` | ✅ 已落地 | `chain/weight_feed.py` `_COUNTED_VERDICTS` 含 `delisted`；`_VERDICT_SCORE` `delisted: 0.0` |
 | P0-3 判定取价改本地 K 线 | ✅ **已落地**（2026-10-13） | `evaluator._get_actual_return` 已改为按交易日历算真实跨度取足够长窗口 + 走 `CNStockDataSource().get_kline(...,"1D",...)`；源码注释即实测案例（`from_date=2026-08-29/T+3` 原取到 `2026-09-22`） |
-| P0-4 验证 `weight_feed` 真喂数 | 🟨 待验 | 需跑后断言 `sample_count` 全 0 的行数下降 |
+| P0-4 验证 `weight_feed` 真喂数 | 🟨 待验 | **接线已确认存在**（`evaluator.py:972` `from .weight_feed import feed as _feed_weights`，2026-10-13 复核）；仍缺跑后断言：`sample_count` 全 0 的行数下降 |
 | D1 `context_frame.py` | ✅ 已建 + 已接线 | 392 行；`data/context_frames/context_frames_2026-10.jsonl` 已落帧 |
 | D2 `sampler.py` | ✅ 已建 + 已接线 | 292 行；`data/daily_universe/daily_universe_2026-10.jsonl` 已落 |
 | D3 双窗口标签 | ✅ 已落地 | 同条 resolution 挂 T+1/T+3；`tests/test_v5_dual_window.py` |
@@ -1387,7 +1387,7 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 | **O-7** | 观测计数器进程内 → 落盘 JSONL（D-8） | 拿到长期趋势 | 便宜 | **⑦ 做** |
 | **O-8** | `app/agent/utils` → `qdutils`（D-13） | 可读性：同名目录在 grep / IDE 检索里易串 | 涉 9 处改名 | ⑧ **降级为可选**（⚠️ 2026-10-13 复核：原动机「sys.path 顺序雷」已被 P5 根治，本项不再是"排雷"，只余可读性收益，不必抢在 O-1 前后做） |
 | **O-9** | 日配额 `add_day_usage` 接线 + 自适应算力 U 路由（G9 + §19.2） | 自适应路由不会绕过日成本保护 | 要定 U 的三个权重（不许拍，先观测一季） | ⑨ 做 |
-| **O-10** | `admission.json` 落进工作副本 | 干净环境不再「注册 0 个、不抛错」地静默降级 | 与「本地不入库」裁定不冲突（落工作副本即可） | ⑩ 做 |
+| **O-10** | `admission.json` 落进工作副本 | 干净环境不再「注册 0 个、不抛错」地静默降级 | 与「本地不入库」裁定不冲突（落工作副本即可） | ✅ **已落地（2026-10-13 复核）**：文件实测在 `app/agent/capabilities/admission.json`、未被 .gitignore 忽略（P13 已订正「不在工作副本」的旧说法）。**本项关闭**；残留问题转为 D-9（文件在，但 71 条 `doc` 全空） |
 | **O-11** | 小项打包：`run_skill` 白名单下沉（D-11）/ `_skill_seen` LRU（D-12）/ 旧系统反向依赖（D-2） | 各自都是几十分钟 | 低 | ⑪ 打包做 |
 | ~~`preselect_stats._NOT_TOOLS`（D-3）~~ | ✅ **已由 P10 根治**（非工具模块改 `_` 前缀，扫描器天然跳过；名单方案整体删除） | — | — | **不做（已解决）** |
 | **O-12** | ~~工具面简化：撤掉「LLM plan + lint + 共现权重」三层~~ | ~~省掉预选那一整轮 LLM~~ | ❌ **方向错了**：实测预选 `stock_screen` **-72%** token / `trade_confirm` **-65%**；且净收益随工具数**单调递增**（见 §22.4 成本模型） | **不做（明确保留）** |
@@ -1587,15 +1587,15 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 | **D-4** | 会话上下文不跨进程持久化 | 重启即失忆 | 🔒 **裁定不做**（附录 B.1） |
 | **D-5** | 能力评测样本与人工基线未铺开 | 标尺可信度不足 | 🟨 标尺已立；缺真实样本 + 双人标注 |
 | **D-6** | `agents/` 死代码 | 0 引用 | ✅ 已清 |
-| **D-7** | `tracing.py` 读 3 个已删 prompt ⇒ `prompt_sha` 恒 missing | 复盘时对不上版本 | ⬜ 未做（O-2 顺手解决） |
+| **D-7** | `tracing.py` 读 3 个已删 prompt ⇒ `prompt_sha` 恒 missing | 复盘时对不上版本 | ✅ **已修（2026-10-13，与 G10 同源）**：`_repro_meta` 由硬编码 5 个文件名改为**扫描 `app/agent/prompts/` 目录**（`_PROMPT_SUFFIXES` + `QD_PROMPT_SHA_FILES` 收窄），结构上不可能再恒 missing。⚠️ 本行旧写「⬜ 未做（O-2 顺手解决）」与附录 D.2 的 G10「✅ 已修」**自相矛盾**，2026-10-13 复核后统一为已修 |
 | **D-8** | 观测计数器进程内，重启归零 | 拿不到长期趋势 | ⬜ 未做（→ O-7） |
-| **D-9** | `admission.json` 的 `doc` 字段全空 | `func_overlap` 分支永不命中 | ⬜ 待定（本地文件不在工作副本） |
+| **D-9** | `admission.json` 的 `doc` 字段全空 | `func_overlap` 分支永不命中 | ⬜ **doc 仍全空（实测 71/71 条为空，2026-10-13 复核）**；⚠️ 旧注「本地文件不在工作副本」**已过期** —— 该文件就在 `app/agent/capabilities/admission.json`（24 KB，未被 .gitignore 忽略，P13 已订正过一次），缺的是**内容**不是文件 |
 | **D-10** | 发布工程：归档/准入件不在版本控制 | 干净 clone 缺件 | ✅ 收口（裁定不入库） |
-| **D-11** | `run_skill` 白名单硬编码 | 违反"规则不在代码里" | ⬜ 未做 |
+| **D-11** | `run_skill` 白名单硬编码 | 违反"规则不在代码里" | 🟨 **2026-10-13 复核：原指控的"硬编码名单"已不存在** —— 执行型技能由各 skill 模块自行导出 `EXECUTABLE_SKILLS`（`qd_service._executable_skills()` 动态读取），按需工具开关也已是 env（`QD_ON_DEMAND_TOOLS`）。**残余待确认**：`skill_brewer` 写盘时的 tools 白名单是否仍含硬编码常量（见 `chain/skill_brewer.py:146` 附近的元工具名单） |
 | **D-12** | `_skill_seen` 无 LRU 淘汰 | 长跑内存增长点 | ⬜ 未做 |
 | **D-13** | `app/agent/utils` 与 `app/utils` 同名 | ⚠️ **前提已被 P5 根治**（2026-10-13 复核）：P5 起 `app/agent/` 不进 `sys.path`、全包统一 `app.agent.*`，活代码裸名 `import utils` **0 处** ⇒ 「sys.path 顺序雷」**已不存在**。残余风险只是**人读混淆**（同名目录，grep / IDE 检索易串） | 🟨 顺序雷已消；改名属可读性改善（→ O-8 降级） |
 | **D-14** | `weight_feed` EMA 参数未经真实样本校准 | 慢调强度是拍的 | ⬜ 待攒样本 |
-| **D-15** | judge 未校准；LLM 网关可用性未端到端验证 | 阶段 B 不敢开 | ⬜ 未验证 |
+| **D-15** | judge 未校准；LLM 网关可用性未端到端验证 | 阶段 B 不敢开 | 🟨 **网关可用性已实测（2026-10-13 晚）**：`logs/app.log` 单日 `APITimeoutError` **129 次** / `APIConnectionError` **8 次**（端点 `api.g2claw.com`；详见 §8 的 `QD_C3P_*` 超时条目与 §7.5 TYPE 标签陷阱）⇒ 状态不是"未验证"，而是**已验证为不达标**；judge 校准仍 ⬜ |
 | **D-16** | 工具预选底座仍是启发式 | 同义问法召回差 | 🟨 K 共现权重已落地；召回 ≥95% 待跑批 |
 | **D-17** | 超大技能靠字数截断出首段 | 首段未必最该看 | ⬜ 未做（TL;DR） |
 | **D-18** | 分发降本未达标：成本比 0.889 > 0.40 | 重活分发只省 11% | 🟨 空结果纪律已接线，**待重跑** |
