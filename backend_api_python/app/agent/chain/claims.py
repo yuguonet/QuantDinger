@@ -82,11 +82,24 @@ _RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:~|-|—|到|至)\s*(\d+(?:\.\d+)?)
 # 视界
 _HORIZON_RULES: Tuple[Tuple[str, str], ...] = (
     (r"(明日|明天|次日|下一个交易日|T\+?1|短线|短期)", "T+1"),
-    (r"(T\+?3|三天|3天|本周|本周内|3个交易日)", "T+3"),
-    (r"(T\+?5|一周|5天|下周|5个交易日|周内)", "T+5"),
-    (r"(两周|半个月|10个?交易日|2周)", "2W"),
+    # ⚠ `N\s*个?\s*交易日`：中文里 "3 个交易日"（带空格）比 "3个交易日" 更常见，
+    #   不放开空格 ⇒ 这种最常见写法**根本抽不到视界**（只能落到口语词/默认）。
+    (r"(T\+?3|三天|3天|本周|本周内|3\s*个?\s*交易日)", "T+3"),
+    (r"(T\+?5|一周|5天|下周|5\s*个?\s*交易日|周内)", "T+5"),
+    (r"(两周|半个月|10\s*个?\s*交易日|2周)", "2W"),
     (r"(一个月|1个月|月内|中期|1M)", "1M"),
 )
+
+# ★ 2026-10-14 修 S-1：「显式窗口」判据。
+#   判的是**实际匹配到的那段文本**（不是规则串本身）：带具体期限才算显式
+#     · `T+3` / `T5` / `3 个交易日` / `10个交易日`
+#     · 中文数字期限：`三天` / `一周` / `两周` / `半个月` / `1个月`
+#   纯口语词（短线 / 短期 / 中期 / 明天 / 本周 / 下周 / 月内）**不算** ——
+#   它们表达的是"大致风格"，不是作者标定的期限。
+#   ⚠ 为什么必须判"匹配到的文本"而不是"规则串"：`T\+?1` 与 `短线` 写在**同一条**
+#   规则里，按规则串判断会把"短线"也当成显式 ⇒ 修复失效。
+_EXPLICIT_HORIZON_RE = re.compile(
+    r"T\+?\d|\d+\s*个?\s*交易日|[0-9一二三四五六七八九十两半]+\s*(?:天|周|个月|月)")
 
 # 置信度：抽不到 → None（★ 不填 0.5）
 _CONF_HIGH = ("高度确信", "非常确定", "很有把握", "高置信", "confidence: high", "大概率")
@@ -207,11 +220,30 @@ def guess_subject(query: str, answer: str = "") -> Tuple[Optional[str], Optional
 
 
 def guess_horizon(text: str, default: str = "T+3") -> str:
-    """从文本抽视界，抽不到用域默认（默认 T+3）。"""
+    r"""从文本抽视界，抽不到用域默认（默认 T+3）。
+
+    ★ 两遍扫描（2026-10-14 修 S-1）：**显式窗口优先于口语词**。
+
+    原实现是"规则表首个命中即返回"，而 `_HORIZON_RULES` 里 `短线|短期`→T+1
+    排在 `T\+?3`→T+3 **之前** ⇒ 「短线看多,T+3 目标价 1900」被判成 **T+1**：
+    分析者**明示**的窗口被口语词压掉了。标签窗口与声明窗口错位（T+1 与 T+3
+    的方向可以相反）⇒ 直接污染 T+N 判定与下游校准。
+
+    两遍：① 只看命中里带具体期限的（见 `_EXPLICIT_HORIZON_RE`）；
+          ② 一个显性都没有 ⇒ 退回口语词的**首个命中**（原行为，不回归）。
+    """
+    t = text or ""
+    hits: List[tuple] = []
     for pattern, horizon in _HORIZON_RULES:
-        if re.search(pattern, text or ""):
+        m = re.search(pattern, t)
+        if m:
+            hits.append((bool(_EXPLICIT_HORIZON_RE.search(m.group(0))), horizon))
+    if not hits:
+        return default
+    for explicit, horizon in hits:          # ① 显式窗口
+        if explicit:
             return horizon
-    return default
+    return hits[0][1]                       # ② 口语词（原行为）
 
 
 def guess_confidence(text: str) -> Optional[float]:

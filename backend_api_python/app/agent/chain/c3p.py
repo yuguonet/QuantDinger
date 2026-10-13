@@ -55,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date, datetime
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -247,6 +248,29 @@ def _json_obj(text: str) -> Optional[Dict[str, Any]]:
     return out if isinstance(out, dict) else None
 
 
+def _json_safe(obj: Any) -> Any:
+    """把 `date` / `datetime` 递归转成 ISO 串 —— **evidence 的契约是可 JSON 序列化**。
+
+    ★ 为什么必须有这一步（2026-10-14 实测 cli 抓到）：
+      `claims.due_date_of()` 有意返回 **`date` 对象**（§9：不改列类型、不改扫描 SQL）。
+      当 LLM 没产出 claims 时，`extract_evidence` 会**直接拿原始 claim 兜底**
+      ⇒ `date` 混进 `evidence.claims[*].due_date` ⇒ 下游 `case_memory.record_case`
+      的 `json.dumps(outcome)` 抛 `TypeError: Object of type date is not JSON
+      serializable` ⇒ **案例一条都进不了库**（fail-open，只有一条 warn，静默）。
+
+    ⚠ 更阴的地方：`evidence.append_evidence()` 落盘用的是 `default=str`，
+      所以 JSONL 里看到的是规规矩矩的 `"2026-10-20"` —— **落盘看不出问题**，
+      只有走 `record_case` 那条路才炸。排查时别被 JSONL 骗了。
+    """
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def extract_evidence(*, user_query: str = "", answer: str = "",
                      subject: Optional[str] = None,
                      frame: Optional[Dict[str, Any]] = None,
@@ -276,12 +300,15 @@ def extract_evidence(*, user_query: str = "", answer: str = "",
         ev = _evidence.build_evidence(
             subject=subject,
             as_of=(frame or {}).get("as_of"),
-            claims=obj.get("claims") or ([claim] if claim else []),
+            # ★ 兜底用原始 claim 时必须先过 `_json_safe`：claim 里的 `due_date`
+            #   是 `date` 对象（见 `_json_safe` 的注释）。
+            claims=obj.get("claims") or ([_json_safe(claim)] if claim else []),
             discriminators=obj.get("discriminators") or [],
             falsifiers=obj.get("falsifiers") or [],
             frame=frame,
-            extra={k: v for k, v in obj.items()
-                   if k not in ("claims", "discriminators", "falsifiers")},
+            extra=_json_safe({k: v for k, v in obj.items()
+                              if k not in ("claims", "discriminators",
+                                           "falsifiers")}),
         )
         try:
             _evidence.append_evidence(ev)
@@ -379,9 +406,26 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
                 coefs = None
             _calib_meta = (coefs or {}).get("source_level") or (
                 "" if coefs else "none")
-            r = _agg.aggregate(pb, ev, ck, coefs=coefs)
-            pf = r.get("p_final")
-            pf = float(pf) if isinstance(pf, (int, float)) else pb
+            if degraded:
+                # ★ v3 §19.1 降级门（2026-10-14 补，修 S-3）：缺证伪条件 ⇒ 本次降级。
+                #   ① 根本**不进经验环节**（不是"算了再压回去"）——aggregate 的
+                #      Δlogit 一律作废 ⇒ p_final = p_base（不给经验加成）。
+                #      原实现里 degraded 只是 extra 里的 flag，aggregate 照常跑 ⇒
+                #      ev=None + coefs={"b0":0.25} 时 p_final≈0.61 ≠ p_base。
+                #      当前 coefs=None 让它无症状（fail-open 本就等于 p_base）；
+                #      P3 一接线，这些"没证伪条件"的样本就会带着假 Δp 进拟合。
+                #   ② **留痕必须跟着变**：`calib_source` 写 "degraded"，且
+                #      `calib.used` 记 False —— 否则降级样本会被记成
+                #      「source=cell（用了本格系数）但 Δp=0」，事后按来源层分组
+                #      统计时出现自相矛盾的行（可审计性）。
+                #   ③ **pair 照记**：G20 的「降级比例」需要这个分母。
+                r = {"p_final": pb, "clipped": False, "used_coefs": False}
+                pf = pb
+                _calib_meta = "degraded"
+            else:
+                r = _agg.aggregate(pb, ev, ck, coefs=coefs)
+                pf = r.get("p_final")
+                pf = float(pf) if isinstance(pf, (int, float)) else pb
             try:
                 _agg.record_pair(
                     cid, pb, pf, condition_key=ck, as_of=(as_of or None),
@@ -405,7 +449,9 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
             out["pairs"].append({"claim_id": cid, "p_base": pb, "p_final": pf,
                                  "condition_key": ck, "degraded": degraded})
             if out.get("calib") is None:
-                out["calib"] = {"used": bool(coefs), "source": _calib_meta,
+                # ★ 降级 ⇒ 系数拿来了也没用（`used=False`），留痕才对得上
+                out["calib"] = {"used": bool(coefs) and not degraded,
+                                "source": _calib_meta,
                                 "n_clusters": int(
                                     (coefs or {}).get("n_clusters") or 0),
                                 "pooled_n_clusters": int(

@@ -122,6 +122,24 @@ def lookback_days() -> int:
     return _env_int("QD_CALIB_LOOKBACK_DAYS", 0)
 
 
+def exclude_degraded() -> bool:
+    """降级样本（`extra.degraded`）是否**排除出拟合**（默认排除）。
+
+    ★ 为什么走 env 而不是写死：这是**口径**，不是实现细节。
+      v3 §19.1：「没有证伪条件 ⇒ 本次预测降级，**不给经验加成**」。
+      拟合侧的同源纪律：降级样本不许参与决定**给别人**的加成
+      （它们的 Δp 来源不可解释 —— 证伪条件缺失意味着这条经验没经过对照）。
+
+    ⚠ 反直觉、留个可回滚的口子：降级样本**理论上仍携带「基线错配」信息** ——
+      它们的 `p_final` 恒 = `p_base`（c3p 侧降级门压平的），恰恰是**不含自我修正**
+      的最干净样本，而 β₀ 的 estimand 就是「实际胜率 − p_base 均值」。
+      ⇒ 若日后判定"样本量不够、格子迟迟达不到 30 簇"，把本开关关掉即可让
+      降级样本回流（**样本量会明显变多**），不必改代码。
+    """
+    return str(os.getenv("QD_CALIB_EXCLUDE_DEGRADED", "1")).strip().lower() not in (
+        "0", "false", "no", "off", "")
+
+
 def _as_float(v: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         f = float(v)
@@ -208,11 +226,16 @@ def build_samples(pairs: Optional[List[Dict[str, Any]]],
     ★ `p_base` **只取 p_base，不取 p_final**：β₀ 的 estimand 是
       「基线模型的错配」（实际胜率 − p_base 均值）。若用 p_final，
       系数会去追自己上一轮的修正 ⇒ **自我强化**（越推越偏）。
+
+    ★ `extra.degraded` 的样本**默认不收**（2026-10-14 补，S-3 拟合侧）：
+      缺证伪条件 ⇒ 该次已在 c3p 侧降级（不给经验加成）；同一条纪律要求它
+      **也不许参与决定给别人**的加成。开关见 `exclude_degraded()`。
     """
     hz = _norm_horizon(horizon_filter or horizon())
     scores = _latest_score_by_claim(resolutions)
     if not scores:
         return []
+    drop_degraded = exclude_degraded()      # 口径只读一次，不进循环读 env
     out: List[Dict[str, Any]] = []
     for p in pairs or []:
         cid = _as_int(p.get("claim_id"))
@@ -225,6 +248,8 @@ def build_samples(pairs: Optional[List[Dict[str, Any]]],
         if not ck:
             continue
         ex = p.get("extra") or {}
+        if drop_degraded and bool(ex.get("degraded")):
+            continue                      # ★ §19.1 降级样本 ⇒ 不进拟合（口径可关）
         if _norm_horizon(ex.get("horizon")) != hz:
             continue                      # 口径错配 ⇒ 不收（不猜 horizon）
         day = str(p.get("as_of") or "")[:10]
