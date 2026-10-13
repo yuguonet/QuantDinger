@@ -42,7 +42,9 @@ P2 适配器态 (改进方案 §2.4/§183, 2026-10-07):
 """
 import json
 import os
-import time
+from datetime import datetime
+
+from app.market_cn.auto.store import TZ_CN
 
 from app.market_cn.auto.core.trace import TraceSink
 
@@ -125,7 +127,7 @@ class Probe:
     """探针收集器 (TRACE 式: 策略函数收 probe=None 即零开销)。"""
 
     def __init__(self, strategy, tag=None, out_dir=None):
-        ts = time.strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
         d = out_dir or _PROBE_DIR
         os.makedirs(d, exist_ok=True)
         self.strategy = strategy
@@ -140,7 +142,7 @@ class Probe:
         self.counts[kind] = self.counts.get(kind, 0) + 1
         self._fh.write(json.dumps(
             {"kind": kind, "strategy": self.strategy,
-             "ts": time.strftime("%H:%M:%S"), **rec},
+             "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"), **rec},
             ensure_ascii=False, default=str) + "\n")
 
     def trace(self, stage, **kw):
@@ -170,4 +172,3 @@ class Probe:
 
     def __exit__(self, *exc):
         self.close()
-

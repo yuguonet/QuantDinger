@@ -35,8 +35,9 @@ import argparse
 import json
 import os
 import sys
-import time
+from datetime import datetime
 
+from app.market_cn.auto.store import TZ_CN
 # peak 区间分布桶 (单位 %): 与"是否有逃顶空间"直接相关
 PEAK_BUCKETS = (("<5", lambda p: p < 5), ("5~10", lambda p: 5 <= p < 10),
                 ("10~20", lambda p: 10 <= p < 20), ("≥20", lambda p: p >= 20))
@@ -223,7 +224,7 @@ def render_md(strategy, funnel, power, meta):
          "",
          f"- 出场口径: {exit_desc}",
          f"- 样本: {meta['n_rows']} 个决策日 (探针 sample 行, 廉价预筛已跳过噪声日)",
-         f"- 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+         f"- 生成时间: {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}",
          "",
          "## 1. 落选阶段分布 (样本在哪一步被拒)",
          "",
@@ -392,7 +393,7 @@ def main():
                                   max_days=args.max_hold)
     meta["wave_days"] = dbg_wave
     md = render_md(args.strategy, funnel, power, meta)
-    ts = time.strftime("%Y%m%d_%H%M")
+    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M")
     # 2026-10-12 P1-10: 原用相对路径上溯 4 级 ⇒ 落点随 CWD 漂移 (且级数也不对)。
     #   对齐 rule_audit.py 的 `__file__` 锚定 + 5 级上溯 ⇒ 恒为仓库根 `tmp/`。
     d = os.path.dirname(os.path.abspath(__file__))

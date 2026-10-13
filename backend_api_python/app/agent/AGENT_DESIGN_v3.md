@@ -217,7 +217,29 @@ backend_api_python/app/agent/
 ├── skills/       [6 目录]  market_screener / strategy_debug(**含 run.py,可执行**)
 │                           + auto_stock-analyze / auto_finance-analysis-stock
 │                           / auto_finance-query-stock / auto_agent
-├── rag/[6] memory/[5] utils/[11] resolvers/[6] cron/[4] audit/[2] preselect/[4]
+├── rag/          [6 py, 1230 行]  检索:BGE reranker + pgvector(PgVectorStore) + PG FTS + 聊天历史/关键词
+│     消费方 3:agent.py(_build_retriever 四路线 / _build_reranker)、tools/knowledge/knowledge_tools.py:62、utils/case_memory.py:200
+│     ⚠️ 消费方**全用相对 import**(`.rag.X`) —— 只扫绝对形式会漏成"零引用"
+│       (2026-10-13 差点据此把它误判死代码归档,见 §7.1 三形式判据)
+├── memory/       [5 py,  672 行]  跨会话记忆 remember/recall;base + local/postgres/redis 三后端
+│     消费方 4:agent.py:15、scripts/qd_bench.py、scripts/qd_dispatch_ab.py、scripts/qd_prompt_eval.py
+├── utils/        [11 py, 2800 行] 共用件:budget / calibration / case_memory / grounding / json_parser /
+│                                 logger / mask / md_format / prescan / tracing
+│     消费方 28(**全包最大枢纽**):chain×4、qd_*×4、scripts×3、tools/finance×11、
+│                                 tools/knowledge、trace_collector、tests×3
+├── resolvers/    [6 py,  968 行] 实体/时间/复合解析 + 澄清优先(bridge 挂取数前,clarify 非空短路反问)
+│     消费方 2:qd_service.py(296/451/454/467)、scripts/qd_smoke.py
+├── cron/         [4 py,  969 行] 定时任务:cron_tools(工具面) + cron_worker(执行) + guards
+│     消费方 4 **全在包外**:app/__init__.py:423(启动 start_cron_worker)、routes/cron.py、
+│                            routes/health.py、tests/test_v6_legacy_boundary.py
+│     ⚠️ 即 D-2「被**旧系统**反向依赖」:摘旧路由会直接断掉定时任务启动
+├── audit/        [2 py,  106 行] TraceAdapter 执行留痕(root/skill/tool 三层)
+│     消费方 1:qd_agent.py:53 顶层导入,按 `trace_enabled` 实例化
+└── preselect/    [4 py, 1629 行] 预选管线(P9 从 tools/ 迁出):tool_preselect / preselect_stats /
+      │                           preselect_cooc(共现权重 K) / __init__
+      └─ 消费方 8:qd_preselect.py、qd_tool_face.py、qd_aftercare.py、scripts/qd_smoke.py、
+                   tests/{_p9_preselect_baseline,test_preselect_cooc,test_v14_preselect_capability_catalog,
+                   test_v9_preselect_pipeline}.py
 ├── **qd_agent.py 的 P6 拆分产物**(执行核按职责拆开,不是散落的杂物):
 │   ├── qd_tool_face.py       # 工具面 get_model_query_kwargs(每轮现算)/ 启动期预加载
 │   ├── qd_preselect.py       # _maybe_preselect_tools(预选接线)
@@ -706,6 +728,13 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 - **负向验证必须确认缺陷真注入**：曾因 heredoc 转义出错导致缺陷没注入却跑出全绿，差点误判"护栏失效"。改为落盘脚本（`inject`/`restore`）+ 断言还原后与原文字节相等。
 - **env 类改动优先用真旋钮做负向验证**：如 `QD_ON_DEMAND_TOOLS=actor` 复跑。
 - **护栏判据要可证伪**：新增判据后跑一次「注入缺陷 → 必须 FAIL → 还原 → 必须 PASS」。口径收口批的变异检验实测 **8/8 全被抓到**。
+- ⚠️ **`llm_inputs.log` 的 `TYPE=` 标签是启发式，不等于实际用途**（2026-10-13 排查实录）：
+  标签由 `mimoagent/models/openai_chat.py::_debug_dump_messages` **按「有无 tools 参数」二分**
+  —— `is_main = bool(call_kwargs.get("tools"))` ⇒ 只有 `MAIN主任务` / `PRESELECT预选` 两种。
+  于是**所有不带 tools 的轻量调用都被打成 `PRESELECT预选`**，包括 C3P 证据抽取
+  （`chain/c3p.py::_EV_SYSTEM`「你是证据抽取器」）、skill_brewer、resolver、func_overlap。
+  排查时**看 system prompt 判真实用途，别信 TYPE**。该标签在第三方包内，升级会被覆盖，
+  不要去改它；要准确标签得由调用方传（现 mimo 调用点未传 tag）。
 
 ---
 
@@ -746,6 +775,10 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 | `QD_CF_VOL_LOW` / `_VOL_HIGH` | 0.12 / 0.22 | 情境帧波动分档（年化） |
 | `QD_CF_HEAT_LOW` / `_HEAT_HIGH` | 0.5 / 1.5 | 情境帧题材热度分档（头部板块均涨幅 pct） |
 | `QD_CF_INDEX_CODE` / `_KLINE_DAYS` / `_CLOSE_HM` | 000001 / 30 / 15:05 | 情境帧基准指数 / 回看天数 / 收盘时刻 |
+| **C3P 接线（P2 新增）** | | |
+| `QD_C3P_ENABLED` / `QD_C3P_MAX_CLAIMS` / `QD_C3P_BARS` | 1 / 2 / 120 | C3P 总开关 / 一次最多处理几条 claim / 取数根数 |
+| `QD_C3P_LLM_MODEL` | `""`（=用全局模型） | ⚠️ **建议单独指定轻量快模型**：证据抽取是轻量 JSON 活，不需推理模型。未设时吃全局模型（`mimo-v2.6-pro` 类慢模型）⇒ 又慢又贵，直接加剧超时 |
+| `QD_C3P_LLM_TIMEOUT` | **20** 秒 | ⚠️ **20s 对推理型模型 + 慢网关偏紧**（2026-10-13 实测当日 `APITimeoutError` 129 次、`APIConnectionError` 8 次；网关 `api.g2claw.com` 间歇性不稳）。超时本身不阻断主链（`extract_evidence` fail-open 返回 None 降级），但 mimo 的 tenacity 硬编码 5 次退避（4→60s）最坏要等 5×timeout 才放弃，用户体感是"卡住"。建议按网关实测中位延迟放大到 45~60s，或换轻量模型 |
 
 > ⚠️ 上下文窗口**统一由 `QDAgent._context_window()` 读**：`QD_CONTEXT_WINDOW` > `QD_COMPACT_WINDOW`（旧名兼容）> `OPENAI_MAX_TOKENS` > 32768。
 > ⚠️ 下列**非 env** 开关在 `QDAgentConfig`（继承自 mimo）：`AntiHackGuard` **默认开**；`wrap_up_hint` **保持关**。
@@ -1638,6 +1671,45 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
   - ⑤ 修 **§3.13 与 §9 的内部矛盾**（smoke 项数 248 vs 256，统一为 **256**）。
   - 📌 **本次订正立下的纪律**：本文中的「实测」数字**必须标时点与口径**；
     改代码批次（P2/P6/P9/P10/P12）后**必须回写本文全文的相关引用**，而不只是补自己改的那一段。
+- 2026-10-13 深夜 **二次审核订正（superpowers + 架构气味视角，机检 99 项全 OK / 偏离率 0.0%）**
+  本次专查「文档自身可优化处」，主攻**过时事实**与**内部不一致**，不改任何规范性断言。
+  - 🔴 **C-1 §7.1 整节描述的是 P5 之前的世界**（本次最高价值发现）：该节自称「导入与路径，
+    本包统一**裸名**，最容易踩」，但实测**活代码裸名 import 0 处**（仅 `tmp/*.bak` 残留）、
+    `ensure_path_order()` **全仓 0 命中**、`app/__init__.py` 头注明载 P5 已统一为 `app.agent.*`
+    （M-1 双模块实例病根已消失）。**读者照它去调 sys.path 顺序、或去"同时 patch 两条路径"，
+    等于按已根治的旧坑施工**。处置：节标题改为「P5 起统一 `app.agent.*`」，7 条逐条标
+    ✅ 已根治（保留历史教训）/ ⚠️ 仍有效，并补第 7 条「扫 import 要覆盖三种形式」。
+  - 🔴 **C-2 连带 D-13 / O-8 前提失效**：「`app/agent/utils` 与 `app/utils` 同名 = sys.path
+    顺序雷」随 P5 已消（裸名 `import utils` 0 处）⇒ D-13 改记「顺序雷已消，残余只是人读混淆」，
+    **O-8 改名从"排雷"降级为可选**（不必抢在 O-1 前后做）。
+  - 🔴 **C-3 守卫缺口**：P5 的红线守卫 `tests/test_v6_import_modernize.py`（零裸名/零 sys.path/
+    零断裂引用）已随 **P16 归档**进 `del/agentcore_retired_20261013/tests/` ⇒ **现无守卫**，
+    重新引入裸名 import 不会 FAIL。已在 §7.1 记明，建议取回该守卫（它守的是 P5 契约，
+    与 agentcore 退役无关）。
+  - **C-4 数字与口径统一**：§9 全量 tests 761 → 记 **652 passed / 4 skipped**（P16 后实测，
+    归档 6 个 `test_v6_*` 所致，业务测试一条未少，761 留作 P12 时点沿革）；
+    smoke 项数 **256 → 257**（§2.2 / §3.13 / §9 / 附录 F C-14 四处统一，实测 255/257）；
+    §2.2 能力层 **准入 69 → 68**（幽灵条目改 `admitted:false` 后排除 2→3，注册数恒 39）。
+  - **C-5 文内自相矛盾**：§1.3「金融域工具面（**102**）」与 §1.1「102 已作废」冲突 ⇒ 改 92 并留痕。
+  - **M 排版**：§1.1 三行约束表被 📌 引文块**从中间截断**（渲染成两个断表）⇒ 引文块移到表前；
+    §3.5「表分层」整段中文被误包进 ASCII 图代码块 ⇒ 移出代码块。
+  - **机检探针自身两处假检测**（`tmp/probe_design_drift_20261013.py` 已修）：
+    ① D20 把注释/文档里的**沿革叙述**当残留引用，恒报假偏离 ⇒ 改只认**活 import** 行；
+    ② F4 把结论**硬编码成实参**（恒输出"§3.13 写248 / §9 写256"），根本没读文档 ⇒
+    改为真解析两处数字比对。修后 **可判定 99 项 / OK 99 / DRIFT 0 / 偏离率 0.0%**。
+  - ✅ **P18-b §2.2 目录树补「消费方」（用户裁定"修补吧"，2026-10-13 21:35）**：
+    `rag/ memory/ utils/ resolvers/ cron/ audit/ preselect/` 七目录原被压成一行、
+    只有一句功能说明，**没写谁在消费** —— `rag/`（1230 行）因此一度被误判死代码。
+    现逐行展开为「目录 + 规模 + 职责 + **真实消费方**（文件:行号）」，并把易错点标进树里：
+    · `rag/` 消费方全用**相对 import**（`.rag.X`），只扫绝对形式会漏成零引用；
+    · `utils/` 是全包最大枢纽（**28 个消费方**：chain×4 / qd_*×4 / scripts×3 /
+      tools/finance×11 / tools/knowledge / trace_collector / tests×3）；
+    · `cron/` 消费方**全在包外**（`app/__init__.py:423` 启动 + `routes/cron.py` +
+      `routes/health.py`）⇒ 这正是 D-2「被旧系统反向依赖」的实证；
+    · `audit/` 仅 `qd_agent.py:53` 一处消费，`preselect/` 8 处。
+    数据来源：`tmp/probe_agent_consumers_20261013.py`（三形式 import 解析，
+    扫描范围**全仓**——初版只扫 `app/agent/` 会把 cron 的包外消费方漏成"仅自引用"）。
+    机检复跑 **99 项全 OK / 偏离率 0.0%**，不变。
 
 ---
 

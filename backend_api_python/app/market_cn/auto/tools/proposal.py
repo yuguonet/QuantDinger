@@ -57,8 +57,9 @@ import os
 import re
 import shutil
 import sys
-import time
+from datetime import datetime
 
+from app.market_cn.auto.store import TZ_CN
 from app.market_cn.auto.core._paths import STRATEGY_DIR as _DEFAULT_STRATEGY_DIR
 
 _EDIT_KINDS = {"param", "gate_expr", "gate_enabled", "gate_add", "gate_del"}
@@ -373,7 +374,7 @@ def cmd_apply(args):
 
     hist = os.path.join(args.strategy_dir, ".history")
     os.makedirs(hist, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
     backup = os.path.join(hist, f"{strategy}.{ts}.yaml")
     shutil.copy2(p, backup)
     with open(p, "w", encoding="utf-8") as f:

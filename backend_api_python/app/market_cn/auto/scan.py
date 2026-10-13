@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 from app.utils.logger import get_logger
 
@@ -333,7 +334,10 @@ def _dedupe_family(rows):
 
 def _target_date():
     from app.utils.trading_calendar import last_finish_trading_day
-    return last_finish_trading_day()
+    from app.market_cn.auto.store import TZ_CN
+
+    ref_dt = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+    return last_finish_trading_day(ref_dt=ref_dt)
 
 
 def _data_ready(target: str) -> bool:

@@ -40,8 +40,9 @@ import argparse
 import os
 import random
 import sys
-import time
+from datetime import datetime
 
+from app.market_cn.auto.store import TZ_CN
 from app.market_cn.auto.tools.rule_stats import _load_rows, _metrics
 
 # 标签口径: ret_d1c=D1收盘卖; ret_d5o/ret_d10o=持有N日到开盘卖 (D1开盘入场基准);
@@ -148,7 +149,7 @@ def render_md(strategy, order, funnel, meta, swap, args, dropped, label_desc):
     n_rows = meta["n_rows"]
     L = [f"# 门级规则审计 — {strategy}",
          "",
-         f"- 生成 {time.strftime('%Y-%m-%d %H:%M')} | 样本 {n_rows} 决策日 "
+         f"- 生成 {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M')} | 样本 {n_rows} 决策日 "
          f"(fail 日含; 无 gates 向量剔除 {dropped} 行) | 标签口径: {label_desc}",
          f"- 分母口径: 段2/3/4 只统计标签有效样本 (censored=视野不足已排除); "
          f"段5 矩阵/段6 分布用全部 {n_rows} 行 — 两处拦截数会差一个 censored 量",
@@ -380,7 +381,8 @@ def main():
     d = os.path.dirname(os.path.abspath(__file__))
     root = os.path.normpath(os.path.join(d, "..", "..", "..", "..", ".."))
     out = args.out or os.path.join(root, "tmp",
-                                   f"规则审计_{args.strategy}_{time.strftime('%Y%m%d_%H%M')}.md")
+                                   f"规则审计_{args.strategy}_"
+                                   f"{datetime.now(TZ_CN).strftime('%Y%m%d_%H%M')}.md")
     out = os.path.normpath(out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

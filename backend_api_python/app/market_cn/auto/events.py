@@ -110,6 +110,7 @@ def _db_has(name: str, date: str) -> bool:
 
 
 def _db_mark(name: str, date: str):
+    from app.market_cn.auto.store import today_str
     from app.utils.db import get_db_connection
     try:
         with get_db_connection() as db:
@@ -121,7 +122,8 @@ def _db_mark(name: str, date: str):
                 (name, date),
             )
             cur.execute(
-                "DELETE FROM qd_data_events WHERE trade_date < (CURRENT_DATE - 60)"
+                "DELETE FROM qd_data_events WHERE trade_date < (%s::date - 60)",
+                (today_str(),),
             )
             db.commit()
             cur.close()

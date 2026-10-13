@@ -554,7 +554,8 @@ def _index_save_cache(code, bars):
         _os.makedirs(INDEX_CACHE_DIR, exist_ok=True)
         tmp = _index_cache_path(code) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump({"code": code, "fetched_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            _json.dump({"code": code, "fetched_at": datetime.now(TZ_CN).strftime(
+                            "%Y-%m-%d %H:%M:%S"),
                         "bars": bars}, f, ensure_ascii=False)
         _os.replace(tmp, _index_cache_path(code))    # 原子落盘
     except OSError as e:
@@ -732,7 +733,8 @@ def reconcile_daily_live(target=None, codes=None, sample=50):
     if target is None:
         try:
             from app.utils.trading_calendar import last_finish_trading_day
-            target = last_finish_trading_day()
+            ref_dt = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+            target = last_finish_trading_day(ref_dt=ref_dt)
         except Exception:
             target = today_str()
     if codes is None:

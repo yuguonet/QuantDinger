@@ -392,7 +392,7 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                 # 只碰当日 watch_pending: 不动已推进行 (A1 同一红线), 不跨日。
                 stale = 0
                 stale_hit = set()
-                stale_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                stale_ts = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
                 for st_pair in skip_pairs:
                     cur.execute(f"""
                         UPDATE {_SIGNALS_TABLE}
@@ -455,7 +455,8 @@ def upsert_scan_signals(trade_date: str, rows: list, purge_buy_today: tuple = ()
                     """, (
                         S_EXPIRED,
                         json.dumps({"superseded_by": str(trade_date),
-                                    "superseded_ts": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                    "superseded_ts": datetime.now(TZ_CN).strftime(
+                                        "%Y-%m-%d %H:%M:%S")},
                                    ensure_ascii=False, default=str),
                         S_WATCH_PENDING, trade_date, tuple(new_keys),
                     ))

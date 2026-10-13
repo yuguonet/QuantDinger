@@ -46,8 +46,10 @@ import os
 import random
 import sys
 import time
+from datetime import datetime
 
 from app.market_cn.auto.core._paths import PROJECT_ROOT
+from app.market_cn.auto.store import TZ_CN
 
 # 项目根 = backend_api_python 的上一级 (D:\QuantDinger); tmp/ 与 probe.py 的落点同级。
 _REPO_ROOT = os.path.dirname(PROJECT_ROOT)
@@ -281,7 +283,7 @@ def render_md(spec, key_ret, peak_name, funnel, meta, seg, sens, skipped,
               run_meta, with_sens):
     L = [f"# explain 报告 — {spec.key} ({spec.meta.get('name', spec.key)})",
          "",
-         f"- 生成 {time.strftime('%Y-%m-%d %H:%M')} | 路径: 门表 (core/runtime/evaluate) "
+         f"- 生成 {datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M')} | 路径: 门表 (core/runtime/evaluate) "
          f"| market={spec.market_key}",
          f"- 窗口 {run_meta['days']}d | {run_meta['pool_mode']} | "
          f"决策日样本 {meta['n_rows']} 行 | 回测耗时 {run_meta['elapsed']}s",
@@ -433,12 +435,12 @@ def main():
                    run_meta, args.with_sensitivity)
 
     stem = os.path.join(_TMP_DIR,
-                        f"explain_{args.strategy}_{time.strftime('%Y%m%d_%H%M')}")
+                        f"explain_{args.strategy}_{datetime.now(TZ_CN).strftime('%Y%m%d_%H%M')}")
     out_md = args.out or stem + ".md"
     out_json = args.json_out or stem + ".json"
     out_probe = args.probe_out or os.path.join(_TMP_DIR, "probes",
                                                f"explain_{args.strategy}_"
-                                               f"{time.strftime('%Y%m%d_%H%M')}.jsonl")
+                                               f"{datetime.now(TZ_CN).strftime('%Y%m%d_%H%M')}.jsonl")
     for p in (out_md, out_json, out_probe):
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
 
@@ -446,7 +448,8 @@ def main():
         "meta": {"strategy": args.strategy, "name": spec.meta.get("name", args.strategy),
                  "market": spec.market_key, "days": args.days,
                  "label": key_ret, "peak": peak_name,
-                 "gate_order": gate_order, "generated": time.strftime("%Y%m%d_%H%M"),
+                 "gate_order": gate_order,
+                 "generated": datetime.now(TZ_CN).strftime("%Y%m%d_%H%M"),
                  "pool_mode": run_meta["pool_mode"], "elapsed": run_meta["elapsed"]},
         "funnel": [{"gate": g, "reach": m_in["n"], "pass": m_p["n"], "reject": m_r["n"],
                     "pass_stats": m_p, "reject_stats": m_r}

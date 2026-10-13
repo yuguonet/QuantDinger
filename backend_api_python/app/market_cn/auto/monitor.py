@@ -106,7 +106,8 @@ def _last_trade_day() -> str:
     """
     try:
         from app.utils.trading_calendar import last_finish_trading_day
-        return last_finish_trading_day()
+        ref_dt = datetime.now(ds.TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+        return last_finish_trading_day(ref_dt=ref_dt)
     except Exception as e:
         logger.warning("[dragon_monitor] 交易日历读取失败(%s), 回退 today=%s "
                        "—— 若 today 非交易日, watch_pending 会被误判隔日过期",
