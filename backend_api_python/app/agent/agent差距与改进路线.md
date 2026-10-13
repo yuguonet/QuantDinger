@@ -39,7 +39,7 @@
 ## B. 执行型技能无子 agent 分发通道（收尾：机制齐 + 验收测量器就绪）
 
 **现状**(2026-10-10 收尾）:
-- **机制三条已落地**:1 `run_skill(name, args)`(`tools/skill_tools.py`)--执行白名单 `skill_run.EXECUTABLE_SKILLS`(market_screener/strategy_debug)、子进程 600s 超时击杀、产物落 `tmp/skill_output/`、截断预览 + full_path 回传;2 `prompts/qd_system.txt` §重活分发（点名 run_skill、只回结论摘要、明细去文件看）;3 产物约定 → 上下文 O(摘要） 而非 O(全量）。smoke test_33 B2~5 锁住（白名单拦截/真实链路/分层归属/降级激活）。
+- **机制三条已落地**:1 `run_skill(name, args)`(`tools/skill_tools.py`)--执行白名单 `skill_run.EXECUTABLE_SKILLS`(market_screener/strategy_debug)、子进程 600s 超时击杀、产物落 `<backend_api_python>/tmp/skill_output/`（2026-10-14 随 agent/tmp 移除迁址）、截断预览 + full_path 回传;2 `prompts/qd_system.txt` §重活分发（点名 run_skill、只回结论摘要、明细去文件看）;3 产物约定 → 上下文 O(摘要） 而非 O(全量）。smoke test_33 B2~5 锁住（白名单拦截/真实链路/分层归属/降级激活）。
 - **验收测量器就绪**(2026-10-10):`scripts/qd_dispatch_ab.py`--分发 vs 不分发单变量对照（对照臂仅摘 `run_skill`,其余工具面全同）一键出数：成本比（tokens/步数/耗时）+ 质量差（与 C 同一把尺 qd_bench);判定：成本比 ≤ COST_MAX(默认 0.40)且质量降 ≤ 5;`--rejudge` 改阈值复核不必重跑;smoke test_37 锁判定数学与对照臂构造（9 项）。
 - **冗余切片已收**(2026-10-10):执行型技能（skill_run 白名单内）命中不再注方法论正文，改注**分发卡片**(何时派/怎么派/入口/结果读法，~280 字符）--正文既费 token 又诱导主对话硬跑（与 §重活分发抢方向盘）;`read_skill` 兜底保留。与渐进式加载的分工：**知识型注方法论（渐进式加载）,执行型注分发卡片（run_skill 派活）**,两层正交不冗余。smoke test_38 锁分叉（9 项）。
 

@@ -2,8 +2,10 @@
 """mimoagent Windows 兼容补丁 —— 标准 patch 流程的重放工具。
 
 补丁文件：patches/mimoagent_windows.patch（diff -u 生成，-p0 直达 site-packages）
-基线来源：app/agent/tmp/mimo_orig/（mimoagent 0.1.0 原始四文件：
+基线来源：patches/mimo_orig/（mimoagent 0.1.0 原始四文件：
           paths.py / local.py / ripgrep.py / prompts.py）
+          ★ 2026-10-14：随 `app/agent/tmp/` 移除，基线快照迁到 patches/ 下
+          （它是补丁的"改前样本"，与补丁文件同住才可重新生成）。
 
 用法（在仓库任意位置运行，路径自动解析）：
   python patches/apply_mimoagent_patch.py            # 等同 --check

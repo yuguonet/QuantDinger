@@ -11,7 +11,8 @@
     python scripts/skill_run.py strategy_debug '{"fn": "debug_strategy", "kwargs": {"strategy": "break", "code": "600519"}}'
 
 输出（stdout，单行 JSON）：
-    {"name":..., "ok":bool, "result":<截断>, "full_path":"tmp/skill_output/xxx.json", "elapsed_s":...}
+    {"name":..., "ok":bool, "result":<截断>,
+     "full_path":"<backend_api_python>/tmp/skill_output/xxx.json", "elapsed_s":...}
 """
 from __future__ import annotations
 
@@ -33,7 +34,12 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
     ),
 }
 
-_OUT_DIR = Path(__file__).resolve().parents[1] / "tmp" / "skill_output"
+# ★ 2026-10-14 迁址：原为 `parents[1]`（= app/agent）⇒ 产物落在 `app/agent/tmp/`
+#   skill_output/。随 `app/agent/tmp/` 整体移除，改到**项目级** `backend_api_python/tmp/`
+#   skill_output/ —— 与项目约定「临时文件/结果/日志一律放 tmp/」一致，也让 agent 包
+#   目录里不再夹带运行时产物（`app/agent` 只放代码）。
+#   parents: 0=scripts 1=agent 2=app 3=backend_api_python
+_OUT_DIR = Path(__file__).resolve().parents[3] / "tmp" / "skill_output"
 _PREVIEW_LIMIT = 20000   # 回传主 agent 的预览上限（字符）；全量落盘不受限
 
 

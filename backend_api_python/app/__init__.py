@@ -29,7 +29,8 @@ import os as _os
 #     是空文件，本来就拿不到 `MarketStore`（`_HAS_DEPS` 早就是 False）；
 #   · `scripts/calibrate_scores.py:22` —— 只挂了 backend 根，`utils.calibration`
 #     并不存在（该脚本本就断链）；
-#   · `app/agent/tmp/*.bak.py` —— 备份文件，非活代码。
+#   · 原 `app/agent/tmp/*.bak.py`（备份文件）—— 该目录已于 2026-10-14 整体移入
+#     `del/agent_tmp_20261014/`，此处仅为当时的复核记录。
 # 动态加载路径也不依赖它：`app/agent/cron/cron_worker.py` 与 `app/routes/cron.py`
 # 走 `resolve_function_path()` 给裸名补包前缀后才 `importlib.import_module`，
 # `app/agent/capabilities/scanner.py` 挂的是 backend 根而不是 `app/`。

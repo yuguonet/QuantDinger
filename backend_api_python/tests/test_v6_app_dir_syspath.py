@@ -14,7 +14,8 @@
   · 全仓扫「裸名 import 且指向 app/* 顶层名」只有三处命中，且**删前删后都失败**：
     `app/market_store/plugin_api.py`（`app/market_store/__init__.py` 是空文件，
     `_HAS_DEPS` 早就是 False）、`scripts/calibrate_scores.py`（`utils.calibration`
-    不存在，脚本本就断链）、`app/agent/tmp/*.bak.py`（备份文件）；
+    不存在，脚本本就断链）、原 `app/agent/tmp/*.bak.py`（备份文件，
+    该目录已于 2026-10-14 移入 `del/agent_tmp_20261014/`）；
   · 动态加载不依赖它：cron 走 `resolve_function_path()` 补包前缀，
     `capabilities/scanner.py` 挂的是 backend 根。
 

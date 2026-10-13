@@ -425,7 +425,8 @@ backend_api_python/app/agent/
   └─ run_skill(name, arguments)  ──► 子进程 scripts/skill_run.py
         1 技能名白名单(EXECUTABLE_SKILLS)  2 fn 白名单
         3 inspect.signature 未知参数拦截(不执行就退出)
-        4 执行 → 产物落 app/agent/tmp/skill_output/*.json
+        4 执行 → 产物落 <backend_api_python>/tmp/skill_output/*.json
+                  （2026-10-14 迁址：原 app/agent/tmp/skill_output/，随 agent/tmp 移除）
         5 回传 {ok, result(预览≤20k字符), full_path, elapsed_s}
         6 空结果 ⇒ 按「空结果纪律」收尾交付,不得回退主对话逐个取数重跑
 ```
@@ -1492,7 +1493,7 @@ qd_agent_cases 一行 = { 原有 CBR 字段
 
 ### 22.4 O-12 成本模型（2026-10-13 实测，为什么净收益单调递增）
 
-> 测量脚本：`app/agent/tmp/measure_preselect_cost.py`。当前工具面 **53 个**（finance 41 / common 11 / knowledge 1）
+> 测量脚本：`tmp/measure_preselect_cost.py`（2026-10-14 随 agent/tmp 移除迁到项目级 tmp/）。当前工具面 **53 个**（finance 41 / common 11 / knowledge 1）
 > —— ⚠️ 早期版本写「58 个 / common 16」，是 P10 清理误注册统计函数之前的数（2026-10-13 订正）。
 
 **单位成本（实测）**
