@@ -1,7 +1,6 @@
 """strategies/common/contract.py — 插件契约检测（公共接口）。
 
 P0 搬移（2026-10-12 策略接口统一方案）：收拢 strategies/base.py 中的
-has_fold_contract / FOLD_CONTRACT_EXEMPT。
 has_fold_contract / FOLD_CONTRACT_EXEMPT。当前无需折叠豁免的内置策略。
 """
 
