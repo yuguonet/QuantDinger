@@ -34,16 +34,22 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# ── 路径设置（直接运行 cli.py 时需要，-m 方式由 __init__.py 处理）──
-# 只挂 backend_api_python（保证 `import app.*` 可用）。**不要**挂 app/agent：
-# 那会让 agent 子模块同时存在裸名与全名两份 module（两份单例/缓存）。
+# ── 路径设置（**直接**运行 cli.py 时需要；`python -m app.agent.cli` 由 Python 自带）──
+# 只挂 backend_api_python 一层（保证 `import app.*` 可用）。
+#
+# ★ 2026-10-14 修正（对照 P5 红线）：原实现还把 `app/agent` 本身也 insert 到
+#   sys.path[0]，注释写着"agent 包内一律用裸名"——那是 **P5 之前**的旧口径。
+#   P5 起全包统一 `app.agent.*`、活代码裸名 import 0 处，这段既无必要又有害：
+#   实证（`tmp/probe_cli_syspath_20261014.py`）显示它执行后裸名 `tools`/`memory`/
+#   `rag` 均可被 import，且 **`tools` 裸名与 `app.agent.tools` 是两个不同的
+#   module 对象**（同一份文件加载两遍）= 事故 M-1（模块级单例双份、状态互不可见）
+#   在 CLI 进程里的活跃风险敞口。
+#   ⚠ 残留（解释器行为，改不掉）：直接跑 `python app/agent/cli.py` 时 Python 会
+#   自动把脚本所在目录放进 sys.path[0]，裸名仍然可达 —— 所以**统一用
+#   `python -m app.agent.cli`**（docstring 里的用法），别直接跑脚本文件。
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_agent_dir = os.path.abspath(os.path.dirname(__file__))
-# 顺序不能反：_agent_dir 必须比 _project_root/app 更靠前（agent 包内一律用裸名，
-# 否则 `import utils` 会命中 app/utils）
-for _p in (_project_root, _agent_dir):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 try:
     from dotenv import load_dotenv

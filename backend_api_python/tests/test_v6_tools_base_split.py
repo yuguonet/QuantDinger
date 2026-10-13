@@ -106,8 +106,10 @@ def test_tool_alias_is_identical_object() -> None:
 # ★ 相对 tools/ 的路径。finance/ 子目录同样受扫描，故一并列入。
 #   `em_utils` / `screener_config` 就住在 finance/ 下 —— 2026-10-13 我核查"死条目"
 #   时只看了顶层，误判它们是死条目（真死条目只有 registry / cache_tools 两个）。
+# ★ 2026-10-14：`_pagination`（444 行，全仓零引用）已归档到 del/deadcode_20261014/，
+#   从本表移除。它的下划线命名约定依然有效 —— 只是那个模块本身没了。
 _KERNEL_MODULES = ["_base", "_serialize", "_schema_gen", "_provider",
-                   "_fn_adapter", "_pagination", "_availability",
+                   "_fn_adapter", "_availability",
                    "finance/_em_utils", "finance/_screener_config"]
 _TOOLS_DIR = _LEGACY_DIR / "tools"
 

@@ -6,11 +6,13 @@
 `evidence.build_evidence()` / `aggregator.aggregate()` / `aggregator.record_pair()`
 这三个**已建好但零生产调用方**的孤岛，现在有没有真被跑起来。
 
-## ★ 接线后 Δp 恒为 0 是**设计内的预期行为**
+## ★ Δp 为 0 仍然可能是**设计内的预期行为**（P3 已接线，但仍在冷启动期）
 
-P3 校准（`chain/calibration.py`）未上线 ⇒ `coefs=None` ⇒ `Δlogit=0` ⇒ `p_final == p_base`。
-依据 v3 §15.1：「无经验时（新格子/冷启动）β₀=0, βⱼ=0 ⇒ p_final=p_base，fail-open 天然成立。」
-⇒ **本文件不测「Δp 非零」**，只测「pair 在落、condition_key 对、evidence 有回传」。
+2026-10-14 P3 已接线：`coefs` 由 `chain/calib_feed.coefs_for(ck)` 供给。
+但**样本不足时它返回 None**（独立簇 < min_clusters 只出先验）⇒ `Δlogit=0`
+⇒ `p_final == p_base`。依据 v3 §15.1：「无经验时 β₀=0 ⇒ p_final=p_base」。
+⇒ **默认路径仍不测「Δp 非零」**，只测「pair 在落、condition_key 对、evidence 有回传」；
+「Δp 非零」单独在**注入假系数**的用例里测（见本文件末尾 P3 接线守卫那组）。
 
 ## 两个反向的 fail-open 语义（别搞混，搞混就产生假数据）
 
@@ -292,3 +294,66 @@ def test_bars_n_never_below_model_minimum(monkeypatch):
         "改了模型下限却忘了改这里，会静默取回不够长的 K 线（不报错，只返回 None）")
     monkeypatch.setenv("QD_C3P_BARS", "10")
     assert c3p.bars_n() >= MIN_BARS
+
+
+# ═══════════════════════════════════════════════════════════════
+#  P3 接线守卫（2026-10-14）：coefs 不许再是常量 None
+# ═══════════════════════════════════════════════════════════════
+
+def test_aggregate_coefs_is_not_constant_none():
+    """★ `aggregate(coefs=...)` 的实参**不许是常量 None**（P3 接线回退守卫）。
+
+    用 **AST** 而不是全文匹配：全文匹配会被注释 / docstring 里的 `coefs=None`
+    骗过去（假绿），AST 只认**真实调用点**。
+    变异检验：把调用点改回 `coefs=None` ⇒ 本用例 FAIL。
+    """
+    import ast
+
+    src = (c3p.__file__ and open(c3p.__file__, encoding="utf-8").read()) or ""
+    tree = ast.parse(src)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = f.attr if isinstance(f, ast.Attribute) else (
+            f.id if isinstance(f, ast.Name) else "")
+        if name != "aggregate":
+            continue
+        for kw in node.keywords or []:
+            if kw.arg == "coefs":
+                found.append(kw.value)
+    assert found, "c3p 里找不到 aggregate(coefs=...) 调用 ⇒ P3 接线被摘掉了"
+    for v in found:
+        assert not (isinstance(v, ast.Constant) and v.value is None), (
+            "aggregate(coefs=None) ⇒ 系数恒空、Δp 永远为 0（P3 接线回退）")
+
+
+def test_injected_coefs_move_p_final_and_are_auditable(env, monkeypatch):
+    """给入系数 ⇒ `p_final` 必须真的动，且**来源层**写进 pair（可审计）。"""
+    monkeypatch.setattr(
+        c3p._cfd, "coefs_for",
+        lambda ck, refresh=False: {"b0": 0.4, "source_level": "cell",
+                                   "n_clusters": 40, "pooled_n_clusters": 40,
+                                   "pooled_from": None})
+    r = _run(claim_ids=[11], claims=[_claim()])
+    row = c3p.load_recent_pairs("2026-10-12")[0]
+    assert row["p_final"] > row["p_base"], (
+        f"b0=0.4 ⇒ p_final 必须高于基线，实得 {row['p_final']} vs {row['p_base']}")
+    assert r["calib"]["used"] is True and r["calib"]["source"] == "cell"
+    assert row["extra"]["calib_source"] == "cell", "来源层必须留痕（否则分不清是不是借来的）"
+    assert row["extra"]["calib_n"] == 40
+
+
+def test_calibration_failure_is_failed_open(env, monkeypatch):
+    """校准链路抛异常 ⇒ **不许**带崩推理，退回无系数（p_final == p_base）。"""
+
+    def boom(*a, **k):
+        raise RuntimeError("calib down")
+
+    monkeypatch.setattr(c3p._cfd, "coefs_for", boom)
+    r = _run(claim_ids=[11], claims=[_claim()])          # 不许抛
+    assert r["n_pairs"] == 1
+    assert r["calib"]["used"] is False and r["calib"]["source"] == "none"
+    row = c3p.load_recent_pairs("2026-10-12")[0]
+    assert row["p_final"] == pytest.approx(row["p_base"])

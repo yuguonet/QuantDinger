@@ -16,12 +16,16 @@ v3 附录 F 的偏差核对结论：C3P 的第 ②③ 段**没接线** ——
 3. run 级可能根本没有单一标的（"帮我看看大盘"），而 claim 一定有 `subject`
    （`claims.guess_subject` 抽不出标的就不产 claim）。
 
-## ★ 接线后 Δp 恒为 0 是**设计内的预期行为**
+## ★ Δp 为 0 仍然可能是**设计内的预期行为**（P3 已接线，但仍在冷启动期）
 
-P3 校准（`chain/calibration.py`）未上线 ⇒ `coefs=None` ⇒ `Δlogit=0` ⇒ `p_final == p_base`。
-依据 v3 §15.1：「无经验时（新格子/冷启动）β₀=0, βⱼ=0 ⇒ p_final=p_base，fail-open 天然成立。」
-⇒ 本模块的价值是**开始积累 pair 数据**（p_base + condition_key + evidence），
-   P3 一上线就能出 β。**不要为了"看到非零 Δp"去凭空编系数。**
+2026-10-14 **P3 已接线**：`coefs` 不再恒为 `None`，改由
+`chain/calib_feed.coefs_for(ck)` 供给（pairs × resolutions → 条件格 → 独立簇折算
+→ 层级池化 → β₀）。但**样本不足时它仍然返回 None** ——
+独立簇 < `min_clusters` 的格只出先验（P3-3 禁进判定）⇒ `Δlogit=0`
+⇒ `p_final == p_base`。
+依据 v3 §15.1：「无经验时（新格子/冷启动）β₀=0, βⱼ=0 ⇒ p_final=p_base，fail-open
+天然成立。」⇒ 攒够之前 Δp 恒 0 是**对的**，
+**不要为了"看到非零 Δp"去凭空编系数。**
 
 ## 两个方向相反的 fail-open（最容易写反，写反就产生假数据）
 
@@ -57,6 +61,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..log import logger
 
 from . import aggregator as _agg
+from . import calib_feed as _cfd
 from . import context_frame as _cf
 from . import evidence as _evidence
 from . import kline_feed as _kf
@@ -310,7 +315,7 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
         "ran": False, "reason": "", "as_of": str(as_of or "")[:10],
         "decision_id": decision_id, "n_claims": 0, "n_pairs": 0,
         "condition_key": "", "evidence": None, "degraded": False,
-        "pairs": [], "schema_ver": SCHEMA_VER, "elapsed_ms": 0.0,
+        "pairs": [], "calib": None, "schema_ver": SCHEMA_VER, "elapsed_ms": 0.0,
     }
     try:
         if not enabled():
@@ -362,7 +367,19 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
             pb = p_base_of(code)
             if pb is None:
                 continue                            # ★ 没有对照臂 ⇒ 不记（记了是假数据）
-            r = _agg.aggregate(pb, ev, ck, coefs=None)
+            # ★ P3 接线（2026-10-14）：系数来自「攒下来的 pair × 判定」的条件校准。
+            #   样本不足 ⇒ calib_feed 返回 None ⇒ aggregate 走 fail-open（p_final=p_base），
+            #   与接线前**完全一致** —— 不给"估估看"的系数（那等于拿噪声当信号）。
+            coefs = None
+            try:
+                coefs = _cfd.coefs_for(ck)
+            except Exception as e:                  # 校准是旁路：挂了不许带崩推理
+                logger.debug("[C3P] 取校准系数失败(降级为无系数): %s: %s",
+                             type(e).__name__, e)
+                coefs = None
+            _calib_meta = (coefs or {}).get("source_level") or (
+                "" if coefs else "none")
+            r = _agg.aggregate(pb, ev, ck, coefs=coefs)
             pf = r.get("p_final")
             pf = float(pf) if isinstance(pf, (int, float)) else pb
             try:
@@ -375,12 +392,24 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
                            "ev_ver": (ev or {}).get("ev_ver", ""),
                            "schema_ver": SCHEMA_VER,
                            "decision_id": decision_id,
-                           "clipped": bool(r.get("clipped"))})
+                           "clipped": bool(r.get("clipped")),
+                           # ★ 校准来源层：事后能一眼看出这条 Δp 是"本格自己的"
+                           #   还是"借来的"（把借来的当成自己的 = 静默放大）
+                           "calib_source": _calib_meta,
+                           "calib_n": int((coefs or {}).get("n_clusters") or 0),
+                           "calib_pooled_n": int(
+                               (coefs or {}).get("pooled_n_clusters") or 0)})
             except Exception as e:
                 logger.debug("[C3P] 配对落盘跳过: %s", e)
                 continue
             out["pairs"].append({"claim_id": cid, "p_base": pb, "p_final": pf,
                                  "condition_key": ck, "degraded": degraded})
+            if out.get("calib") is None:
+                out["calib"] = {"used": bool(coefs), "source": _calib_meta,
+                                "n_clusters": int(
+                                    (coefs or {}).get("n_clusters") or 0),
+                                "pooled_n_clusters": int(
+                                    (coefs or {}).get("pooled_n_clusters") or 0)}
             out["n_pairs"] += 1
 
         out["ran"] = True

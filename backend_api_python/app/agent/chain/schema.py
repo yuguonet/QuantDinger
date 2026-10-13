@@ -389,6 +389,27 @@ class EvalNode:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 判定计分（verdict → 分数）—— 全链**单一真源**
+# ═══════════════════════════════════════════════════════════════
+# ★ 2026-10-14 从 `chain/weight_feed.py` 上移到本文件。
+#   为什么必须上移：verdict 计分出现**第二个消费方** —— P3 条件校准要按 claim 的
+#   判定算「该格实际胜率」（`chain/calib_feed.py`）。两处各写一份必然分叉，而
+#   weight_feed 已因此踩过一次：2026-10-13 只改 `_VERDICT_SCORE` 却漏掉 SQL 的
+#   verdict IN 列表 ⇒ delisted 根本进不了聚合，前面两处改动全白做。
+#   ⇒ 真源放这里，`weight_feed` / `calib_feed` 都来取，谁都不许另立一套。
+#
+# · partial 折半；undecidable / data_missing **不在白名单**（是常量污染，不是"半票"）；
+# · delisted 不是「不知道」，而是**确定的最差结果** ⇒ 必须计入且按 0.0。
+
+# 进聚合的 verdict 白名单 —— Python 与 SQL 共用同一份，禁止在 SQL 里硬编码
+COUNTED_VERDICTS: tuple = ("hit", "partial", "miss", "delisted")
+
+# verdict → 计分（0~1，可直接当「该 claim 的实际胜率」用）
+VERDICT_SCORE: Dict[str, float] = {"hit": 1.0, "partial": 0.5,
+                                   "miss": 0.0, "delisted": 0.0}
+
+
+# ═══════════════════════════════════════════════════════════════
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════
 

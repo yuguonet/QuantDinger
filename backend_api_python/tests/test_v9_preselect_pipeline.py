@@ -31,16 +31,24 @@ TP = PRESELECT_DIR / "tool_preselect.py"
 # 本次**有意**的行为变化（其余一律必须与基线逐键相等）
 # ① 迁移：三个模块移出 tools/ 扫描目录 ⇒ `_NOT_TOOLS` 名单整体作废
 # ② 补齐 parse_selection 容错链最后一环：结构化 JSON 无工具字段时回退逐字扫描
+# ③ 【2026-10-14 G2】lint R4 **中间分支**（remain<MIN_FACE 但未达 R4b 门槛）补留痕：
+#    原先不裁、不记、不告警 ⇒ trace 里 `pruned: []` 被读成"没发现零相关"，
+#    实际是"发现了但决策被丢弃"。现补一条 warning（**行为仍是不裁**）。
+#    ⚠ 基线连 `dirty` 一起变：保护名单场景原先 warnings 为空 ⇒ dirty=False，
+#      现在多了留痕 ⇒ dirty=True。两者同源，一并登记。
 EXPECTED_CHANGES = {
     "module",                                   # 新增探针：模块全名（迁移本身）
     "not_tools",                                # 名单作废 → 空
     "parse_selection.dict_names_in_goal",       # 容错链补齐 → 召回工具名
     "parse_plan.dict_names_in_goal.tools",      # 同上
+    "lint.normal.trace.warnings",               # G2 留痕：多一条 R4 中间分支告警
+    "lint.protected.trace.warnings",            # 同上（保护名单场景原先为空）
+    "lint.protected.dirty",                     # 同源：warnings 非空 ⇒ dirty False→True
 }
 
 
 def test_baseline_parity_except_expected():
-    """改造前后逐键对拍：除登记在案的 4 处有意变更，其余必须一字不差。"""
+    """改造前后逐键对拍：除登记在案的 7 处有意变更，其余必须一字不差。"""
     bad = [d for d in diff(collect(), load_baseline())
            if d.split(":")[0].strip() not in EXPECTED_CHANGES]
     assert not bad, "预选管线输出发生未登记的变化：\n  " + "\n  ".join(bad[:30])

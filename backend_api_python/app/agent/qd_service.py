@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
+from collections import OrderedDict
 from typing import Any, Optional
 
 from . import mimo_boot
@@ -71,29 +73,65 @@ _SKILL_INJECT_MIN = 2   # 注入阈值（总分）
 # 不再被 body[:3000] 硬切丢失；同会话已注入过的技能只发一行指针，不再重复注入。
 _SKILL_BODY_CAP = 2200
 
+# ── 会话级技能去重表的容量上限（D-12，2026-10-14）────────────────
+# 【为什么必须有上限】`_skill_seen` 是 {session_id: {已注入技能名}}，原实现只增
+# 不减 ⇒ 服务不重启就一直涨（长跑内存增长点，设计文档 D-12）。
+# 【为什么是 LRU 不是 FIFO】这张表的唯一作用是「同会话不重复灌正文」（降 token）。
+# 若按 FIFO 淘汰，一个长期活跃的老会话会被先踢 ⇒ 它下一轮重新灌一次正文，
+# 恰恰是这张表要避免的事。所以按**访问**刷新热度。
+# 【为什么淘汰是安全的】它只影响「正文 vs 一行指针」：淘汰 ⇒ 下次重注一次正文，
+# 正确性不变，只多花一次 token ⇒ fail-open 方向天然安全。
+# 【为什么走 env】工程红线：阈值不硬编码。脏值回落默认且夹紧到 >=1 ——
+# 容量 0 会让「刚插入就被自己挤掉」，去重表蜕化成永空集，静默放大 token 看不出报错。
+_SKILL_SEEN_MAX_DEFAULT = 512
+
+
+def _skill_seen_max() -> int:
+    """`_skill_seen` 的会话容量上限（QD_SKILL_SEEN_MAX，默认 512）。
+
+    约定：解析失败 / 非正值一律夹紧到 >=1（或回落默认），**不抛**——
+    这张表挂了最坏也只是多注一次正文，不该让整轮对话失败。
+    """
+    raw = os.getenv("QD_SKILL_SEEN_MAX")
+    if raw is None or not str(raw).strip():
+        return _SKILL_SEEN_MAX_DEFAULT
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.debug("[skill_seen] QD_SKILL_SEEN_MAX=%r 非整数，回落默认 %s",
+                     raw, _SKILL_SEEN_MAX_DEFAULT)
+        return _SKILL_SEEN_MAX_DEFAULT
+    if v < 1:
+        # 0/负数 ⇒ 去重表会变永空集（每轮重复灌正文），按 1 处理至少保住当前会话
+        return 1
+    return v
+
 
 _EXECUTABLE_SKILLS_CACHE: Optional[dict] = None
 
 
 def _executable_skills() -> dict:
-    """执行型技能白名单（单一真源 = scripts/skill_run.EXECUTABLE_SKILLS）。
+    """执行型技能白名单（单一真源 = app.agent.scripts.skill_run.EXECUTABLE_SKILLS）。
 
-    【为什么按文件路径导入·2026-10-10】`import scripts.*` 在 sys.path 错序时会
-    解析到 backend_api_python/scripts（本仓吃过 `utils` 命中 app/utils 的亏，
-    见 test_30）；按 __file__ 相对路径加载是唯一不受 sys.path 影响的取法。
+    【加载方式·2026-10-14 D-11 收敛】此前用 `spec_from_file_location` 按文件路径
+    加载，理由是「`import scripts.*` 在 sys.path 错序时会解析到
+    backend_api_python/scripts」（本仓吃过 `utils` 命中 app/utils 的亏，见 test_30）。
+    两个前提现在都不成立了：
+      · P5 起 `app/agent` 不进 sys.path、全包统一 `app.agent.*`；
+      · 用**包内相对导入**（`from .scripts.skill_run import ...`）根本不经过
+        sys.path 查找，不存在被顶层 scripts/ 抢解析的可能。
+    而按路径加载会造出**第二个模块实例**（不进 sys.modules 的影子模块）——
+    与 P5 根治的"双模块实例"是同一类隐患：将来谁正常 import 一次，两份
+    EXECUTABLE_SKILLS 就分叉。故改为包内相对导入（守卫见
+    tests/test_v6_d11_whitelist_knobs.py）。
     fail-open：取不到返回 {}（退化为注正文，行为等同改前，不会更坏）。
     """
     global _EXECUTABLE_SKILLS_CACHE
     if _EXECUTABLE_SKILLS_CACHE is not None:
         return _EXECUTABLE_SKILLS_CACHE
     try:
-        import importlib.util
-        from pathlib import Path as _P
-        _p = _P(__file__).resolve().parent / "scripts" / "skill_run.py"
-        _spec = importlib.util.spec_from_file_location("_qd_skill_run_wl", _p)
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        _EXECUTABLE_SKILLS_CACHE = dict(getattr(_mod, "EXECUTABLE_SKILLS", {}) or {})
+        from .scripts.skill_run import EXECUTABLE_SKILLS as _WL
+        _EXECUTABLE_SKILLS_CACHE = dict(_WL or {})
     except Exception as e:
         logger.debug("[skill_block] 执行型白名单加载失败（fail-open 退化为注正文）: %s", e)
         _EXECUTABLE_SKILLS_CACHE = {}
@@ -260,7 +298,12 @@ class QDAgentService:
         self._sessions: dict[str, QDAgent] = {}
         # 会话级技能注入去重（2026-10-02 降 token）：同会话已注入过的技能
         # 只发一行指针，不再每轮重复灌正文（5 轮 × 3000 字的重复实测存在）
-        self._skill_seen: dict[str, set] = {}
+        #
+        # D-12（2026-10-14）：改为**带容量上限的 LRU**。OrderedDict 的键顺序即热度
+        # （尾=最近访问）；写入与淘汰一律经 `_skill_seen_for()`，不要在这里直接
+        # setdefault —— 那会绕过上限，把 D-12 改回没做（有 AST 守卫盯着，见
+        # tests/test_v6_skill_seen_lru.py::test_prefetch_does_not_use_bare_setdefault）。
+        self._skill_seen: "OrderedDict[str, set]" = OrderedDict()
         self._lock = threading.Lock()
 
     # ── 会话 ─────────────────────────────────────────────────
@@ -274,6 +317,28 @@ class QDAgentService:
                 agent = QDAgent(self._model, self._env, **self.agent_config)
                 self._sessions[key] = agent
             return agent
+
+    def _skill_seen_for(self, session_id: Any) -> set:
+        """取（并刷新）某会话的技能去重集合——`_skill_seen` 的**唯一**入口。
+
+        · 键归一化为 `str(session_id)`：与 `_get_agent` 同口径（设计 §易错点），
+          否则将来加清理逻辑时会漏删。
+        · 访问即 `move_to_end`：实现 LRU（不是 FIFO）。
+        · 超容量淘汰最久未访问的会话。被淘汰者下次拿到**空集** ⇒ 重注一次正文，
+          正确性不变（fail-open）。
+        """
+        key = str(session_id)
+        with self._lock:
+            seen = self._skill_seen.get(key)
+            if seen is None:
+                seen = set()
+                self._skill_seen[key] = seen
+            self._skill_seen.move_to_end(key)
+            cap = _skill_seen_max()
+            while len(self._skill_seen) > cap:
+                # last=False ⇒ 淘汰队首（最久未访问）
+                self._skill_seen.popitem(last=False)
+            return seen
 
     # ── 自动预取（功能对账：RAG/记忆注入体验等价）──────────────
     def _prefetch(self, message: str, session_id: str,
@@ -332,9 +397,9 @@ class QDAgentService:
                 best_score = ranked[0][1] if ranked else 0   # 阈值看原始分（权重只调序）
                 hit = False
                 if best and best_score >= _SKILL_INJECT_MIN:
-                    # 键归一化为 str：_get_agent 用的是 str(session_id)，
-                    # 两者必须同一口径，否则将来加清理逻辑时会漏删。
-                    seen = self._skill_seen.setdefault(str(session_id), set())
+                    # 键口径 + LRU 容量上限都在 _skill_seen_for 里（D-12），
+                    # 这里不要再直接动 self._skill_seen。
+                    seen = self._skill_seen_for(session_id)
                     if best in seen:
                         # 已在本会话注入过：一行指针即可。
                         # ⚠ 不写"见上方历史"：上下文压缩（阈值 _compaction_threshold）

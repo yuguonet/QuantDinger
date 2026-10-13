@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import re
 import shutil
 from datetime import date
@@ -145,8 +146,28 @@ def _extract_frontmatter_tools(skmd: str) -> list:
 
 # 元工具/沙箱内置：始终在场，写进 skill tools 白名单只是噪音（LLM 从日志推断时
 # 常把 list_tools/search_tools 混进来——它们是"查工具的工具"，不是数据能力）。
-_META_TOOLS = {"list_tools", "search_tools", "format_result", "final_answer",
-               "python_interpreter", "web_search"}
+#
+# 【2026-10-14·D-11 下沉】原为硬编码集合，违反"阈值/口径走 env 或配置层"红线
+# ⇒ 改为 `QD_META_TOOLS`（逗号分隔）可配，默认沿用原 6 个。
+# 【为什么只能配置、不能从 provider 推导】元工具里只有 format_result/web_search
+# 这类来自 `_MUST_HAVE` 模块（provider.get_meta_names() 查得到）；**其余四个
+# （list_tools / search_tools / final_answer / python_interpreter）是框架内置，
+# 根本不进 ToolProvider 注册表** ⇒ 推导必然盖不全，不能假装推导成"零配置"。
+_META_TOOLS_DEFAULT = ("list_tools", "search_tools", "format_result",
+                       "final_answer", "python_interpreter", "web_search")
+
+
+def _meta_tools() -> frozenset:
+    """写盘前要剔除的"元工具"名单（QD_META_TOOLS，逗号分隔；空=未配置=回落默认）。
+
+    ⚠ 空 env 回落**默认**而不是空集：空集会让元工具名写进 SKILL.md 的 tools
+    白名单（噪音，且诱导 planner 去"调用"查工具的工具）。
+    """
+    raw = os.getenv("QD_META_TOOLS")
+    if raw is None or not raw.strip():
+        return frozenset(_META_TOOLS_DEFAULT)
+    names = {t.strip() for t in raw.split(",") if t.strip()}
+    return frozenset(names) if names else frozenset(_META_TOOLS_DEFAULT)
 
 
 def _validate_tools(skmd: str, provider) -> str:
@@ -156,9 +177,10 @@ def _validate_tools(skmd: str, provider) -> str:
     """
     if provider is None:
         return skmd
-    valid = set(provider.get_tool_names()) - _META_TOOLS
+    meta = _meta_tools()
+    valid = set(provider.get_tool_names()) - meta
     tools = _extract_frontmatter_tools(skmd)
-    bad = [t for t in tools if t and (t not in valid or t in _META_TOOLS)]
+    bad = [t for t in tools if t and (t not in valid or t in meta)]
     if not bad:
         return skmd
     kept = [t for t in tools if t not in bad]

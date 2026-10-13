@@ -459,7 +459,8 @@ def build_catalog_grouped(
 # ═══════════════════════════════════════════════════════════════════════════
 _CODE_HINT_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
 
-_DEFAULT_HINTS = (
+# 通用词（不含领域专有名词）：判断"像不像要动专业工具"的弱特征。
+_GENERIC_HINTS = (
     "股", "股票", "个股", "A股", "港股", "美股", "行情", "K线", "k线", "涨停", "跌停",
     "板块", "题材", "概念", "资金流", "主力", "龙虎", "技术面", "均线", "MACD", "KDJ",
     "估值", "财报", "业绩", "选股", "龙头", "强势", "持仓", "仓位", "止损", "止盈",
@@ -467,6 +468,20 @@ _DEFAULT_HINTS = (
     "stock", "quote", "sector", "ticker",
     "数据", "统计", "查一下", "对比",
 )
+
+# ★ 2026-10-14 G5：**单源派生**，闸门词表 = 通用词 ∪ 域词典关键字。
+# 此前两套词表手工并行维护，实测域词典 129 词里有 **100 个**不在闸门里
+# （现价 / 北向 / 收盘 / 形态 / 支撑 / macd / 净流入 …）⇒ 这些再明确不过的金融
+# 查询**根本进不了** plan+lint 质量路径，只能吃盲兜底（词典首选 ≤4 个）。
+# 改为派生后：新增域词自动进闸门，不会再出现"词典认得、闸门不认"的漂移。
+#
+# ⚠ 行为变更（需知悉）：闸门放行面扩大 ⇒ 更多查询会花一次预选 LLM。
+#   这是**回到设计**而非新增行为：`has_domain_hint` 的定位是**成本闸**不是质量闸
+#   （见其 docstring："为了不出错干脆不做，把收益一起扔了"是方向错误），
+#   真正的误选防线是 lint 的零相关裁剪/整体作废。仍可用 `QD_PRESELECT_HINTS`
+#   整体覆盖，或 `QD_PRESELECT_GATE=0` 关闸。
+_DEFAULT_HINTS = tuple(dict.fromkeys(
+    _GENERIC_HINTS + tuple(w for _d, kws, _t in DATA_DOMAINS for w in kws)))
 
 
 def has_domain_hint(query: str, hints: Optional[Sequence[str]] = None) -> bool:
@@ -603,7 +618,11 @@ def parse_selection(text: str, valid_names: Sequence[str], max_tools: int) -> Li
         #   ⇒ 与 docstring 声明的"目录逐字扫描兜底"不符，白丢一次召回。
         #   反之，模型**显式**给了空列表（`"tools": []`）时必须尊重：那是
         #   "这任务不用工具"的判断，从正文捞名字硬塞就是自作主张（宁可不补）。
-        raw_items = [n for n in valid_names if n and n in body]
+        # ★ 2026-10-14 G6：原为裸子串 `n in body` ⇒ 前缀名会误捞：正文只提
+        #   `get_fund_flow_daily` 时，`get_fund_flow`（它的前缀且在目录里）一起被捞进。
+        #   噪声被推给下游 lint。改成标识符词边界匹配（`(?<![\w])n(?![\w])`）。
+        raw_items = [n for n in valid_names if n and re.search(
+            r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(n), body)]
 
     out: List[str] = []
     seen: Set[str] = set()
@@ -809,6 +828,15 @@ def lint_selection(
                 rep.pruned = pruned
                 rep.warnings.append(
                     "R4 零相关裁剪 %d 个（保留面 %d）" % (len(pruned), remain))
+            else:
+                # ★ 2026-10-14 G2：中间分支（remain < MIN_FACE，但 ratio 未达
+                #   R4b 门槛、或 R1 已补位）原先**什么都不做** —— 不裁、不记、不告警。
+                #   后果：trace 里 `pruned: []` 会被读成"本轮没发现零相关工具"，
+                #   而事实是"发现了但决策被丢弃" ⇒ 观测与行为脱钩，预选质量统计失真。
+                #   行为维持**不裁**（保守原则：裁了会低于 MIN_FACE），只把决策落痕。
+                rep.warnings.append(
+                    "R4 保留 %d 个零相关不裁（remain=%d < MIN_FACE=%d，未达 R4b 作废门槛）：%s"
+                    % (len(pruned), remain, MIN_FACE, pruned[:5]))
 
         # 低置信兜底：仅索引相关 → 只告警，不动工具面
         for n in index_candidates(plan_text, index, avail):

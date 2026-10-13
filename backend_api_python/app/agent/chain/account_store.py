@@ -342,6 +342,62 @@ def _advance_claim_status(cur, claim_id: int, verdict: str, attribution: str) ->
         " last_attempt_at = now() WHERE id = %s", (claim_id,))
 
 
+# ═══════════════════════════════════════════════════════════════
+#  读取（P3 条件校准的喂数口）
+# ═══════════════════════════════════════════════════════════════
+def load_latest_resolutions(claim_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """每 claim 只取**最新一条** resolution 明细（G24：一 claim 一票）。
+
+    ★ 为什么必须去重：`save_resolution()` 是纯 INSERT（判定**留痕**，不是"一 claim
+      一结果"），同一 claim 每次重判都会**新增一行** ⇒ 直接聚合会把**重试次数**当成
+      样本数（实测 16 条 resolution 只对应 10 个 claim）。
+
+    ★ 与 `weight_feed._dedup_latest` 的关系：**同一条纪律，两个实现**。
+      那边在 Python 侧去重（因为它要 join domain 的明细行），这边用 PG 原生
+      `DISTINCT ON` 在库侧去重 —— 口径一致、各取所长。将来 `weight_feed` 应改为
+      调本函数，彻底消掉分叉（现在不动它：它有守卫测试在守，改动收益 < 风险）。
+
+    Args:
+        claim_ids: 只取这些 claim；`None` = 全量。
+
+    Returns:
+        [{"claim_id","res_id","verdict","verdict_score","actual_as_of","resolved_at"}, ...]
+        库不可达 ⇒ `[]`（追责是旁路，读失败**不许**打断调用方）。
+    """
+    ids: List[int] = []
+    for i in (claim_ids or []):
+        try:
+            ids.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    sql = """
+        SELECT DISTINCT ON (r.claim_id)
+               r.claim_id      AS claim_id,
+               r.id            AS res_id,
+               r.verdict       AS verdict,
+               r.verdict_score AS verdict_score,
+               r.actual_as_of  AS actual_as_of,
+               r.resolved_at   AS resolved_at
+          FROM qd_agent_resolutions r
+    """
+    params: tuple = ()
+    if ids:
+        sql += " WHERE r.claim_id = ANY(%s)"
+        params = (ids,)
+    sql += " ORDER BY r.claim_id, r.id DESC"
+    try:
+        with _conn() as conn:
+            cur = conn.cursor()              # ★ RealDictRow：必须 row['k']
+            cur.execute(sql, params)
+            rows = [dict(x) for x in (cur.fetchall() or [])]
+            cur.close()
+        return rows
+    except Exception as e:
+        logger.debug("[AccountStore] 读 resolution 明细失败(返回空): %s: %s",
+                     type(e).__name__, e)
+        return []
+
+
 def stats(limit_days: int = 30) -> Dict[str, Any]:
     """追责健康度（验收 §7 的机检口径）：入库量 / claim 率 / 判定分布。"""
     out: Dict[str, Any] = {"decisions": 0, "claims": 0, "resolved": 0,

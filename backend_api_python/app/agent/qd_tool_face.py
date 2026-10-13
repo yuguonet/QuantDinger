@@ -292,7 +292,15 @@ class ToolFaceMixin:
             activated = [n for n in getattr(self, "_activated", [])
                          if n not in self._core_names]
             if activated:
-                lines += ["[已激活·本轮可直接调用，**不要再** search_tools/activate_tools]",
+                # ★ 2026-10-14 G4（措辞订正）：`_activated` 是**会话级**累积（只做加法，
+                #   多轮里上一轮激活的工具还可能用得上），这里原先写"本轮"与事实不符
+                #   ⇒ 模型会以为名单里的都是本轮预选成果。措辞改为"本会话"。
+                #   ⚠ 未修部分（结构性，待拍板）：FIFO 淘汰（cap=QD_MAX_ACTIVE_TOOLS）
+                #   对本轮预选项**没有 pin**，预选 ≤8 + search 自动激活 ≤8 可达 16 > 12
+                #   ⇒ 同一 run 内预选成果会被后到激活静默顶掉（`_activated.pop(0)`）。
+                #   功能不坏（execute_action 有 fail-open 就地再激活），但会抖、留痕乱。
+                lines += ["[已激活·本会话可直接调用（含历史轮次），**不要再** "
+                          "search_tools/activate_tools]",
                           "  " + ", ".join(activated)]
             lines.append("[按需·需先 search_tools 检索、activate_tools 激活]")
             if groups:

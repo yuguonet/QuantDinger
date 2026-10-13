@@ -65,7 +65,9 @@ _SOURCE_VAR_RE = re.compile(
 _CORPUS_MAX_CHARS = 200_000
 
 # E3（2026-09-24）：越界性/营销式确定性承诺单语表——**单一事实源**
-# 消费方：nodes.py::make_verify_node 三查「越界性」、tests/evals/runner.py L1 禁用表述。
+# 消费方：nodes.py::make_verify_node 三查「越界性」、原 evals/runner.py L1
+# 禁用表述（⚠ 2026-10-14 核实：仓库内已无 evals/ 目录，该 runner 已移除，此引用为
+# 历史残留；判分取数现由 `tests/test_v6_domain_taxonomy_20261014.py` 一类守卫覆盖）。
 BANNED_PHRASES = (
     "保证收益", "稳赚", "必然涨停", "百分百", "无风险套利", "包赚", "必涨无疑",
     "保证盈利", "稳簿不赔",

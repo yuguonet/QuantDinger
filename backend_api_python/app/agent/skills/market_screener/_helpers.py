@@ -394,7 +394,9 @@ def attach_prediction(items: List[Dict], market: dict = None) -> List[Dict]:
 
 
 def enrich_predictive(results: list, market: dict = None) -> list:
-    """兼容旧名：打分 + 按情绪门槛标记 selected + 重排（tests/test_market_screener_pred.py 契约）。
+    """兼容旧名：打分 + 按情绪门槛标记 selected + 重排（⚠ 原本的契约用例
+    test_market_screener_pred 已删除——2026-10-14 核实 tests/ 下只剩 __pycache__
+    字节码，无 .py；此处契约改为由 qd_smoke 的选股项与基线对拍守卫覆盖）。
 
     2026-09-29：主流程改用 attach_prediction()（只打分不裁剪，取舍交给 LLM）。
     本函数保留「门槛裁剪 + selected 标记」语义，供既有调用方/回归测试使用，请勿在新代码中调用。

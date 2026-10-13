@@ -11,8 +11,11 @@
   3. 注释里的 `app/agent/...` 路径引用会误导后来人
 
 守卫范围（本文件只管「旧系统还活着且路径正确」；
-新版隔离红线——零 sys.path 注入 / 零裸名导入 / 零 agent 引用——见
-`tests/test_v6_isolation.py`，骨架落地时一并建立）。
+新版隔离红线——零 sys.path 注入 / 零裸名导入 / 零 agent 引用——原计划落在
+`test_v6_isolation.py`（该文件**从未在 tests/ 下建立**，只存在于 P16 归档目录
+`del/agentcore_retired_20261013/` 里，2026-10-14 核实）。
+  ⚠ 因此「零 sys.path 注入」这条红线目前由
+  `tests/test_v6_app_dir_syspath.py`（app/ 与 app/agent 两级，子进程级验证）把守。
 """
 from __future__ import annotations
 

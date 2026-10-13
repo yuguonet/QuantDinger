@@ -23,7 +23,10 @@
   就踩过一次：改完后 `app/agent` 变成新版骨架，包内残留的 `app.agent.tools.finance`
   指向了不存在的模块，`chain/context_frame.py` 与 `chain/sampler.py` 两条链路
   ImportError 静默炸掉、全量测试零覆盖无人发现 —— 见
-  `tests/test_v6_import_modernize.py::test_no_dangling_app_agent_references`）。
+  该守卫 `test_v6_import_modernize.py::test_no_dangling_app_agent_references`
+  **已随 P16 归档到 `del/agentcore_retired_20261013/tests/`**，2026-10-14 核实
+  `tests/` 下已无此文件 ⇒ P5 红线**当前没有守卫**，重新引入裸名 import 不会 FAIL。
+  要恢复就把它从 del/ 取回（并改掉其中的 agentcore 口径）。
 
 【约束】
   1. 新增模块不得再用裸名导入（红线 R2 自动拦）。

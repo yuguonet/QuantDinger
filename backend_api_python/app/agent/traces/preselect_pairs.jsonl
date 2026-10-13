@@ -649,3 +649,54 @@
 {"ts": "2026-10-13 23:57:23", "query": "看行情", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-13 23:57:24", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-13 23:57:32", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:51", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:51", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-14 00:35:52", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-14 00:35:52", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:52", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:54", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-14 00:35:55", "query": "看看茅台的行情多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:56", "query": "看行情", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:35:57", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 00:36:05", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:04", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:04", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-14 01:21:04", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-14 01:21:05", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:05", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:07", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-14 01:21:08", "query": "看看茅台的行情多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:09", "query": "看行情", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:10", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:21:18", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:31", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:32", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-14 01:31:32", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-14 01:31:32", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:32", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:34", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-14 01:31:35", "query": "看看茅台的行情多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:36", "query": "看行情", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:37", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 01:31:45", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 03:49:01", "query": "查询贵州茅台最新价", "tools": ["get_realtime_quote"]}
+{"ts": "2026-10-14 04:11:01", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:02", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-14 04:11:02", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-14 04:11:02", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:02", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:04", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-14 04:11:05", "query": "看看茅台的行情多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:06", "query": "看行情", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:07", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:11:15", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:23", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:23", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-14 04:33:23", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-14 04:33:23", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:23", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:25", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-14 04:33:26", "query": "看看茅台的行情多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:27", "query": "看行情", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:28", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 04:33:36", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}

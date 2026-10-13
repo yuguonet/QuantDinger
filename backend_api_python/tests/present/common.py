@@ -1,4 +1,9 @@
-"""tests/common.py — 合成数据生成（日线历史 + 盘中 60s 快照序列）。"""
+"""tests/present/common.py — 合成数据生成（日线历史 + 盘中 60s 快照序列）。
+
+⚠ 2026-10-14 订正：文件头原把自身路径写成缺少 `present/` 段的旧路径（文件从
+tests/ 根目录迁到 tests/present/ 时没跟着改）。路径型注释失真是"幻觉引用"的
+近亲，同样会把人引到不存在的位置。
+"""
 
 from __future__ import annotations
 

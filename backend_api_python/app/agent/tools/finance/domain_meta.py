@@ -20,9 +20,6 @@ _VERB_NOUNS = {
     "explain": "indicator",
 }
 
-# 需要拉金融工具面的任务动词（刻意不含 code/explain：纯推理任务不该拉金融工具）
-_INTENT_VERBS = frozenset({"screen", "analysis", "compare", "query"})
-
 # 行情/交易语境词（出现才考虑交易日口径与语义异常；纯闲聊不搅）
 # 与 resolvers/time.py 历史口径保持一致，勿擅自增删（差一词就可能给错日期）
 _MARKET_WORDS = re.compile(
@@ -31,99 +28,32 @@ _MARKET_WORDS = re.compile(
     r"涨幅|跌幅|振幅|换手|成交|量比|市盈率|市值|涨速|跌速|封板|炸板|打板"
 )
 
-# plan_linter R1 数据域词典：(数据域, 触发关键词, 候选工具[0]=首选)
-# 工具名必须逐字来自 provider 注册表（tools ∪ capabilities 并集）。
-# ⚠️ 2026-09-27：工具归组摘除 17 个旧名后本词典曾整行失效（intel_news 一行
-#    0 有效候选）而无人报警——当时声称的"CI 断言"是幻觉引用。本轮已按
-#    TOOL_ALIAS 全部迁移（失效名 0），并已补上真实断言：tests/test_wiring.py
-#    W20a/W20b/W20c（词典 ⊆ 注册表 / 每域首选可用 / 摘除名不得回流）。
-_DATA_DOMAINS = (
-    ("realtime_quote",
-     ("实时", "现价", "最新价", "盘口", "快照", "分时", "realtime", "报价", "现在多少钱"),
-          ("get_realtime_quote", "get_order_book")),
-    ("kline",
-     ("日线", "周线", "月线", "k线", "历史行情", "走势", "复权", "分钟线", "均线"),
-          ("agent_get_kline", "index_daily", "get_sector_board", "day_series")),
-    ("fund_flow",
-     ("资金流", "主力", "净流入", "净流出", "大单", "北向", "外资", "资金面", "fund_flow"),
-          ("get_fund_flow", "get_fund_flow_daily", "get_capital_summary")),
-    ("financials",
-     ("财务", "业绩", "营收", "净利润", "财报", "毛利率", "roe", "基本面", "财报数据"),
-          ("get_capital_summary", "get_stock_info")),
-    ("valuation",
-     ("估值", "市盈", "市净", "市值", "贵不贵", "值多少钱", "dcf", "目标价", "定价"),
-     ("batch_valuation_compare", "get_stock_info")),
-    ("sector",
-     ("板块", "行业", "概念", "题材", "产业链", "板块转动"),
-          ("get_hot_sectors", "get_sector_stocks", "get_sector_board",
-      "get_sector_fund_flow", "get_stock_sector_info")),
-    ("dragon_tiger",
-     ("龙虎榜", "席位", "游资", "营业部", "机构专用"),
-          ("get_dragon_tiger",)),
-    ("hot_rank",
-     ("人气", "热度", "关注度", "人气榜", "热搜"),
-     ("get_hot_rank", "get_hot_stocks_with_reason")),
-    ("limit_pool",
-     ("涨停", "跌停", "炸板", "连板", "封板", "打板", "首板", "接力", "晋级"),
-          ("get_limit_pool", "get_dragon_tiger")),
-    ("screen",
-     ("筛选", "选股", "选出", "找出", "挑出", "有哪些", "股票池", "排行"),
-     ("search_stocks", "get_screener_presets", "build_keyword_from_filters")),
-    ("technical",
-     ("技术面", "技术分析", "指标", "macd", "kdj", "rsi", "金叉", "死叉", "形态",
-      "布林", "背驰", "背离", "量能"),
-          ("technical_analysis", "run_indicator_signal", "analyze_chart_patterns",
-      "list_indicators")),
-    ("intel_news",
-     ("消息面", "新闻", "公告", "研报", "舆情", "利好", "利空", "政策", "事件驱动", "传闻"),
-          ("search_intel",)),
-    ("market_overview",
-     ("大盘", "指数", "市场概览", "沪深", "上证", "创业板指", "行情总览"),
-          ("get_market_overview", "get_index_quote")),
-    ("sentiment",
-     ("情绪", "恐慌", "赚钱效应", "亏钱效应", "情绪周期", "高潮", "冰点"),
-          ("get_market_overview", "fear_greed_index")),
-    ("chip",
-     ("筹码", "成本分布", "获利盘", "套牢盘", "筹码集中度"),
-     ("get_chip_distribution",)),
-    ("backtest",
-     ("回测", "胜率", "收益率", "绩效", "策略表现", "历史表现"),
-     ("run_backtest", "get_backtest_history", "list_strategies", "get_strategy_detail")),
-    ("lockup",
-     ("解禁", "限售"),
-     ("get_lockup_expiry",)),
-    ("dividend",
-     ("分红", "股息", "派息"),
-     ("get_capital_summary",)),
-    ("signals",
-     ("信号", "买点", "卖点", "触发条件"),
-     ("search_intel", "run_indicator_signal", "list_strategies", "strategy_keys")),
-)
-
-# R2 依赖登记
-_LIST_PRODUCERS = frozenset({
-    "search_stocks", "get_limit_pool", "get_dragon_tiger",
-    "get_hot_rank", "get_hot_stocks_with_reason",
-    "get_hot_sectors", "get_sector_stocks", "get_sector_board",
-    "list_strategies", "search_intel", "all_codes",
-})
-_LIST_CONSUMERS = frozenset({
-    "agent_get_kline", "get_realtime_quote", "technical_analysis",
-    "analyze_pattern", "analyze_chart_patterns", "run_indicator_signal", "get_fund_flow",
-    "get_fund_flow_daily", "get_chip_distribution", "get_stock_info", "get_stock_sector_info",
-    "search_intel", "batch_valuation_compare", "get_capital_summary", "resolve_stock",
-    "get_lockup_expiry",
-})
-
+# ★ 2026-10-14：`_DATA_DOMAINS` / `_LIST_PRODUCERS` / `_LIST_CONSUMERS` /
+#   `_INTENT_VERBS` 四个常量与 `primary=True` 已删除。
+#   它们只喂给 `domain_registry` 那 6 个零消费方函数（旧编排层 plan_linter 遗产），
+#   本次随函数一并删除；对应的 DomainSpec 字段也已移除（见其头注）。
+#
+# ⚠️ 关于那份被删的 `_DATA_DOMAINS`（**为什么不能再照它复原**）：
+#   · 它是`数据域词典`的**第二份**，与活的那份
+#     `app/agent/preselect/tool_preselect.py::DATA_DOMAINS` 早已分叉：
+#     这里是 realtime_quote / fund_flow / financials / dragon_tiger / hot_rank /
+#     limit_pool / intel_news / market_overview，活的那份是 quote / fundflow /
+#     trend / chip / volume / market / dragon / strategy / intel / capital /
+#     knowledge —— 同一件事两套拼法，正是"同一决策两个事实源"。
+#   · 它引用的工具名里 `index_daily`、`day_series` **已下线**（2026-10-14 实测
+#     注册表 53 个工具里没有这两个）；若照抄会把失效名带回活链路。
+#
+# ⚠️ 顺带订正一处**幻觉引用**（2026-10-14 核实）：本文件原先声称"已补上真实断言
+#    W20a/W20b/W20c（词典 ⊆ 注册表 / 每域首选可用 / 摘除名不得回流）"，并指到一个
+#    tests 目录下名为 test_wiring 的用例文件 —— 那个文件**根本不存在**，
+#    即"声称有守卫、其实没有"（2026-10-13 那份外部审查报告里也出现过同类幻觉引用）。
+#    真实守卫是 `tests/test_v9_preselect_pipeline.py` 的**基线逐键对拍**
+#    （`tests/fixtures/p9_tool_preselect_baseline.json`）+ `app/agent/scripts/
+#    qd_smoke.py` 里的 `check_domain_dict`。以后引断言请引这两个。
 SPEC = DomainSpec(
     name="finance",
-    primary=True,
     entity_types=("stock",),
     trading_calendar=True,
     verb_nouns=_VERB_NOUNS,
-    intent_verbs=_INTENT_VERBS,
     word_pattern=_MARKET_WORDS,
-    data_domains=_DATA_DOMAINS,
-    list_producers=_LIST_PRODUCERS,
-    list_consumers=_LIST_CONSUMERS,
 )

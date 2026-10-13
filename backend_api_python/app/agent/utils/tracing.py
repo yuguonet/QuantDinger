@@ -10,7 +10,7 @@ AGENT_TRACE_FILE=traces/agent_runs.jsonl
 AGENT_TRACE_MAX_CHARS=12000
 AGENT_EVAL_DUMP=<path>       评测侧车出口（默认不设=关闭）：每次 finish() 追加一行 JSON，
                             含 route(意图路由) / used_tools / 工具观测语料，供
-                            tests/evals/runner.py --live 判分取数
+                            原 evals/runner.py --live 判分取数（该 runner 已移除）
 """
 
 import json
@@ -82,7 +82,8 @@ def _jsonl_enabled() -> bool:
 
 
 # ── 评测侧车出口（2026-09-24 提智 · E1 评测集取数通道）────────────────────
-# 背景：`tests/evals/runner.py --live` 此前只能从 CLI stdout 正则回收工具名，
+# 背景：`evals/runner.py --live`（⚠ 2026-10-14 核实：该 runner 已移除，仓库内无
+#        evals/ 目录，此处为历史背景描述）此前只能从 CLI stdout 正则回收工具名，
 # 拿不到 route（意图路由）与工具观测语料 ⇒ 用例里声明的 `expect_route` 恒判失败、
 # `min_grounding_rate` 恒被跳过（"声明了没接线"的判分项，基线失真）。
 # 这三个量其实**已被本采集器收在内存里**（intent_verb / _tool_calls），只是没有出口：
@@ -595,7 +596,7 @@ class AgentTraceRecorder:
     def _write_eval_dump(self) -> None:
         """把判分所需的三件套追加一行到 AGENT_EVAL_DUMP（未设置则直接返回）。
 
-        字段契约（tests/evals/runner.py 按 session_id 取最后一行）：
+        字段契约（原 evals/runner.py 按 session_id 取最后一行；该 runner 已移除）：
           route       意图路由（chat/cron/task），对齐用例的 expect_route
           intent_verb 意图分类原始动词（analysis/screen/... 便于排查）
           used_tools  本次调用的工具名（去重保序，来源 _tool_calls）

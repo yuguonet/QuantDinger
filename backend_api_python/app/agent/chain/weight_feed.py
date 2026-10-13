@@ -43,6 +43,9 @@ import logging
 import os
 from typing import Dict, List
 
+from .schema import COUNTED_VERDICTS as _COUNTED_VERDICTS   # 真源在 schema.py
+from .schema import VERDICT_SCORE as _VERDICT_SCORE         # 真源在 schema.py
+
 logger = logging.getLogger(__name__)
 
 MIN_SAMPLES = int(os.getenv("QD_FEED_MIN_SAMPLES", "5"))
@@ -52,11 +55,10 @@ _EMA_MIN, _EMA_MAX = 0.10, 0.50
 # 进聚合的 verdict 白名单 —— **SQL 与测试共用同一份**，禁止在 SQL 里硬编码。
 # 2026-10-13 教训：只改 _VERDICT_SCORE 而漏掉 SQL 的 IN 列表 ⇒ delisted 根本进不了
 # 聚合，前面两处改动全部白做。抽成常量后由 tests/test_v5_p0_closure.py 守住。
-_COUNTED_VERDICTS = ("hit", "partial", "miss", "delisted")
-
-# verdict → 计分（partial 折半；undecidable / data_missing 不计入，见模块头）
-# ★ delisted 不是「不知道」，而是**确定的最差结果**，必须计入且按 0.0。
-_VERDICT_SCORE = {"hit": 1.0, "partial": 0.5, "miss": 0.0, "delisted": 0.0}
+#
+# ★ 2026-10-14：真源已上移到 `chain/schema.py`（P3 条件校准是第二个消费方，
+#   两处各写一份必然分叉）。本模块顶部保留**原私有别名**做引用，不是抄一份 ——
+#   改口径请改 schema.py，本模块与外部测试读到的仍是同一个对象。
 
 
 def _alpha(n: int) -> float:

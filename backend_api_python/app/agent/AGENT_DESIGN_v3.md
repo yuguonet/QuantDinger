@@ -159,7 +159,8 @@ backend_api_python/app/agent/
 ├── trace_collector.py    # TraceCollector → qd_agent_traces(root/skill/tool 三层)
 ├── mimo_boot.py          # mimoagent 依赖引导
 ├── constants.py          # 全局常量单一事实源(AGENT_MAX_STEPS 等)
-├── domain_registry.py    # 跨层分类学注册表
+├── domain_registry.py    # 跨层分类学注册表（2026-10-14 精简：只留有消费方的 4 字段/4 API；
+│                         #   数据域词典**单源**在 preselect/tool_preselect.py::DATA_DOMAINS）
 ├── log.py
 │
 ├── tools/        [38 py]  工具层:顶层 14(含 __init__) + finance 21 + knowledge 3
@@ -174,7 +175,6 @@ backend_api_python/app/agent/
 │   ├── _schema_gen.py        # OpenAI schema + 「什么是工具函数」判据
 │   ├── _serialize.py         # 结果序列化(TSV/紧凑 JSON/空值剥离)
 │   ├── _fn_adapter.py        # FnToolAdapter:裸函数工具零改动适配 mimo BaseTool
-│   ├── _pagination.py        # @paginated + page_tool(TTL 隔离)
 │   ├── _availability.py      # 启动期工具可用性探测(进系统提示工具地图)
 │   └── finance/(21) knowledge/(3)
 │     ※ **扫描规则(2026-10-13 P10)**:文件名以 `_` 开头 = 非工具模块,
@@ -183,11 +183,15 @@ backend_api_python/app/agent/
 │       finance/ 下同样适用:_em_utils / _screener_config / _analysis_utils。
 │     ※ **非工具模块已于 P10 改 `_` 前缀**(base→_base、availability→_availability);
 │       本清单早期版本把新旧两个名字并列(base.py 与 _base.py)且 tool_discovery
-│       重复列两次,是文档笔误,现已按实际目录订正为 14 个(含 __init__.py)。
+│       重复列两次,是文档笔误,现已按实际目录订正为 14 个(含 __init__.py);
+│       2026-10-14 归档 _pagination.py 后为 **13 个**。
 │     ※ 预选管线(tool_preselect / preselect_stats / preselect_cooc)已于 P9 迁出
 │       本目录到 app/agent/preselect/ —— 它们不是工具,不该住在自发现目录里。
 │     ※ mcp_bridge.py 于 P10 删除(从未接线:requirements 未声明 mcp、零启动入口)
 │     ※ filesystem_tools.py 已退役;mimo 原生 lowercase 目录由基类注册
+│     ※ **_pagination.py(444 行)于 2026-10-14 归档 del/deadcode_20261014/**
+│        —— AST 复核(三形式 import + 全仓扫描 + 同名异物判定)确认全仓零引用。
+│        目录树顶层随之 14 → 13。
 │
 ├── capabilities/ [4 py]  三级能力层(admission.json 准入 **68** → 注册 39)
 │     ※ **admission.json 就在工作副本里**(2026-10-13 订正:早期注「不在工作副本」
@@ -197,7 +201,7 @@ backend_api_python/app/agent/
 │       已改 `admitted:false` + `recheck_note`,故排除数 2→3、准入 69→68。
 │       **零行为变更**:注册数始终 39,它从来没注册上。)
 │
-├── chain/        [22 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
+├── chain/        [23 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
 │   ├── claims.py             # 域判定 / 入库闸门 / Claim 提取(纯函数,零 LLM)
 │   ├── intake.py             # record_decision 唯一入口
 │   ├── account_store.py      # decisions/claims/resolutions 持久化
@@ -211,7 +215,9 @@ backend_api_python/app/agent/
 │   ├── collector.py          # ★ 日采集编排 run_daily_collection
 │   ├── evidence.py           # ★ EV-1 证据向量构建 + 条件键 + R1 拦截
 │   ├── aggregator.py         # ★ 定量聚合器 aggregate() + record_pair()(无 LLM)
-│   ├── calibration.py        # ★ 条件校准与层级部分池化 fit_with_pooling / coef_usable
+│   ├── calibration.py        # ★ 条件校准与层级部分池化 fit_with_pooling / coef_usable（纯算法）
+│   ├── calib_feed.py         # ★ P3 接线(2026-10-14)：pairs × resolutions → cells → β₀ → coefs
+│   │     消费方 1：chain/c3p.py::_c3p_pipeline（aggregate 的 coefs 实参）
 │   └── reset.py / schema.py / store.py / judge_stats.py / skill_brewer.py
 │
 ├── skills/       [6 目录]  market_screener / strategy_debug(**含 run.py,可执行**)
@@ -223,6 +229,13 @@ backend_api_python/app/agent/
 │       (2026-10-13 差点据此把它误判死代码归档,见 §7.1 三形式判据)
 ├── memory/       [5 py,  672 行]  跨会话记忆 remember/recall;base + local/postgres/redis 三后端
 │     消费方 4:agent.py:15、scripts/qd_bench.py、scripts/qd_dispatch_ab.py、scripts/qd_prompt_eval.py
+│     ※ **redis_memory.py 曾被误判为死代码(2026-10-14 纠正)**:复核探针的**相对 import
+│       解析在 `__init__.py` 上少剥一层** ⇒ 漏掉 `memory/__init__.py:8` 的
+│       `from .redis_memory import RedisMemory` ⇒ 判成"零引用"并归档,结果
+│       `import app.agent.memory` 直接 ModuleNotFoundError。**已回滚**。
+│       事实:`RedisMemory` 在 `__init__.py` 的 `__all__` 里 —— 是包的**公开导出**,
+│       不算死代码(工厂虽从不创建它,但导出契约存在)。要删须先改 `__init__` 并确认
+│       仓外无人 import,属"降能力"操作,不在死代码清理范围。
 ├── utils/        [11 py, 2800 行] 共用件:budget / calibration / case_memory / grounding / json_parser /
 │                                 logger / mask / md_format / prescan / tracing
 │     消费方 28(**全包最大枢纽**):chain×4、qd_*×4、scripts×3、tools/finance×11、
@@ -435,7 +448,11 @@ backend_api_python/app/agent/
 
 > 📌 **与 mimo 原生子代理的关系（别混）**：`run_skill` 是**独立子进程**跑本项目自己的流水线；mimo 的 `task`/`actor` 是**同进程子循环**（共享 env/model）。两者**正交，不要互相替代**。
 
-⚠️ 白名单目前仍是**硬编码在 `skill_run.py` 里**的字典 —— 与"规则不在代码里"相悖，见 D-11。
+> **白名单为什么留在代码里（2026-10-14 D-11 结论，别再当"硬编码"去搬）**：
+> `EXECUTABLE_SKILLS` 的取值是**模块路径 + 允许函数名 + 默认函数名**（`skills.market_screener.run` /
+> `("run",)`），属**代码契约**而非"阈值/口径" ⇒ 塞进 env 只会更易错、且失去重构保护。
+> `qd_service._executable_skills()` 把它当**单一真源**读取（2026-10-14 起改为包内相对导入，
+> 不再按文件路径加载），另见 D-11 关于元工具名单 `QD_META_TOOLS` 的下沉。
 
 ### 3.5 追责闭环（`chain/`）
 
@@ -794,8 +811,8 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 | `qd_prompt_eval --validate` | ✅ 10 条任务 / 35 项断言；plan_* 断言 **17/19** |
 | `qd_bench` | 25 题；真实端点首跑 **71.7**（coverage 81.5 / grounding 86.8 / claims 38.0 / structure 62.6） |
 | `qd_dispatch_ab` | 首跑成本比 **0.889**（未达 0.40，见 D-18）、质量Δ +0.5 |
-| v5 单测（pytest） | **138 passed / 1 skipped**（13 个 `test_v5_*.py`，含新增 `test_v5_c3p.py` 18 条） |
-| 全量 `tests/` | **652 passed / 4 skipped**（**2026-10-13 P16 后实测**）。⚠️ 口径演变：P12 后曾为 **761 passed / 4 skipped**；P16 归档 6 个 `test_v6_*` 到 `del/agentcore_retired_20261013/tests/` 后降为 652（业务测试一条未少）。更早期版本写「529 passed」是 P12 之前的数 |
+| v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`；2026-10-14 P3 接线新增 `test_v5_calib_feed.py` 21 条 + `test_v5_c3p.py` 接线守卫 3 条 ⇒ 138 → 162） |
+| 全量 `tests/` | **716 passed / 4 skipped**（**2026-10-14 O-11 收口后实测**）。⚠️ 口径演变：P12 后曾为 **761 passed / 4 skipped**；P16 归档 6 个 `test_v6_*` 到 `del/agentcore_retired_20261013/tests/` 后降为 652；2026-10-14 P3 接线 +24 ⇒ 676；同日 O-11 三项收口再 +41（新增 `test_v6_skill_seen_lru.py` 15 / `test_v6_d11_whitelist_knobs.py` 13 / `test_v6_cron_boundary.py` 13），同时因 `_pagination` 归档删除 1 个参数化用例 ⇒ **716**。更早期版本写「529 passed」是 P12 之前的数 |
 | 工具面 | 注册表 **92**（工具 53 + 能力层 39）；必注入 **21** / 按需 **71** |
 | schema 体积 | 全量 **49,507 字符** → 必注入（common+meta 11 个）**4,188 字符** |
 | 技能 | **6** 个目录，其中可执行 **2** 个 |
@@ -1164,6 +1181,12 @@ w      = n_cell / (n_cell + τ)
 
 **实现**：`chain/calibration.py` —— `fit_cell()` / `fit_with_pooling()` / `_parent_key()` / `is_fresh()` / `coef_usable()` / `calibration_report()`；`min_clusters()`、`tau_days()` 走 env。
 
+**喂数层**：`chain/calib_feed.py`（2026-10-14 P3 接线）—— `build_samples()`（pairs × resolutions JOIN，含 G24 一 claim 一票 + horizon 口径过滤）/ `build_cells()`（独立簇**折算**，走 `app.utils.stat_power.estimate_independent_clusters`）/ `coefs_for()`（进程内缓存 → 落盘 τ 内复用 → 重拟合）/ `build_report()`。`ρ` / `horizon` / 缓存秒数 / 回看天数一律走 env。
+
+> ⚠️ **算法层与喂数层为何分家**：`calibration.py` 保持**纯函数**（零 IO、好测），
+> `calib_feed.py` 承担读 JSONL + 查 PG + 缓存/落盘。与 `weight_feed`（resolutions → weights）
+> 同一范式 —— 别把 IO 塞回 `calibration.py`，否则 P3 的单测就要连库。
+
 ### 17.4 借力的诚实边界
 
 > **借力增加的是稳定性，不是新信息。**
@@ -1341,17 +1364,19 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 | P2-2 `p_base` 复用 | ✅ **已接线** | `c3p.p_base_of()` → `kline_feed` → `predict_next_day`；`_MIN_BARS` 与 `predict.MIN_BARS` 有守卫测试绑死 |
 | P2-3 `record_pair` | ✅ **已接线** | 按 **claim_id** 落三条（p_base / p_final / Δp），写 JSONL |
 | P2-4 R2 守卫 | ✅ **已落地** | `qd_smoke` test_40 ④ 扫 `app/watchlist/**` 不得反向 import chain；变异检验 M7（真注入违规）证明有 bite |
-| P3 `calibration.py` | ✅ 已建 · ⬜ **零生产消费方** | 206 行；`fit_with_pooling` 仅被自身 `calibration_report()` 调用。**这是下一个要接的孤岛** |
+| P3 `calibration.py` | ✅ **已接线（2026-10-14）** | 经 `chain/calib_feed.py` 接入：`c3p._c3p_pipeline` 的 `aggregate(..., coefs=calib_feed.coefs_for(ck))`；守卫 `test_v5_c3p.py::test_aggregate_coefs_is_not_constant_none`（AST 级，变异检验已证有 bite）。**四个孤岛全通** |
 
-> ✅ **2026-10-13 P2 接线已完成**：C3P 的 ②③ 段已接进生产链路，四个孤岛里**三个已通**
-> （`evidence` / `aggregator` / P1-2 写侧），只剩 `calibration`（P3）。
-> 接线点：`qd_agent._finish_collector` → `_intake_accountability` → **`_c3p_pipeline`** → `_record_case`。
+> ✅ **2026-10-14 P3 接线已完成**：四个孤岛（`evidence` / `aggregator` / P1-2 写侧 /
+> `calibration`）**全部接通**。新增接线层 `chain/calib_feed.py`（喂数），
+> `chain/calibration.py` 保持纯算法层不动。
+> 接线点：`qd_agent._finish_collector` → `_intake_accountability` → **`_c3p_pipeline`**
+> → `calib_feed.coefs_for(ck)` → `aggregate()` → `_record_case`。
 >
-> ⚠️ **接线后 Δp 恒为 0 是设计内的预期行为**（P3 未上线 ⇒ `coefs=None` ⇒ `p_final == p_base`）。
+> ⚠️ **Δp 仍恒为 0 是设计内的预期行为**（冷启动）：样本不足 ⇒ `coefs_for()` 返回
+> `None`（独立簇 < `min_clusters` 只出先验，P3-3 禁进判定）⇒ `p_final == p_base`。
 > 本阶段在**攒数据**，不是看效果 —— 别为了"看到非零 Δp"去凭空编系数。
->
-> 🔴 **下一个最大偏差**：`calibration.fit_with_pooling()` 仍零生产消费方 ⇒ 条件校准没跑起来
-> ⇒ 即使攒够 pair 也不会有 β。P3 接线是当前最高优先级。详见附录 F。
+> ⇒ 判别「接线有没有真生效」不看 Δp，看 `build_report()` 的格子与簇数，
+> 以及 smoke/单测的接线守卫（详见 §21.4）。
 
 ### 21.3 分层配额（v5 §19.2 拍板，已落代码）
 
@@ -1366,6 +1391,45 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 > **为什么必须分层**（第二条理由，同样硬）：若采样集中在少数活跃股，`theme_heat`/`vol_bucket` 等情境维在样本里近乎**常数** ⇒ **条件化失效**（β₀/βⱼ 估不出来）。
 > 而 §10.2 的表说明：覆盖 5,000 只 ⇒ 共享参数 361 簇 / 7.4pp；覆盖 500 只 ⇒ 个股级只有 24 簇 / 28.4pp。
 > ⇒ **数万条案例的价值，取决于它们覆盖了多少只不同的股票，而不是总条数。**
+
+### 21.4 P3 接线细则（2026-10-14 新增）
+
+```
+pairs_*.jsonl（p_base / condition_key / claim_id / extra.horizon）
+   ×  qd_agent_resolutions（每 claim 只取最新一条，G24）
+      →  samples[{ck, as_of, p_base, y}]        # y ∈ {hit 1.0, partial 0.5, miss/delisted 0.0}
+        →  cells{ck: {n_clusters, win_rate, mean_p_base}}
+          →  calibration.fit_with_pooling() → β₀（含来源层标注）
+            →  coefs_for(ck) → aggregator.aggregate(coefs=...) → p_final
+```
+
+| 环节 | 口径 | 为什么不这么写会出事 |
+|---|---|---|
+| **JOIN 键** | `claim_id`（不是 run / 不是股票） | Δp 的真值 y 挂在 claim 上，按 run 配对会对不上 |
+| **y 的来源** | resolution 的 `verdict`（`verdict_score` 缺失时取 `schema.VERDICT_SCORE`） | `undecidable` / `data_missing` 是**常量污染**，不是半票 ⇒ 不进样本 |
+| **一 claim 一票** | 同一 claim 多条留痕只认 `res_id` 最大 | resolution 是纯 INSERT（留痕）⇒ 不去重会把**重试次数**当样本数，n 虚涨 ⇒ 门槛虚过 |
+| **horizon 过滤** | 默认只收 `T+1`（`QD_CALIB_HORIZON`） | `p_base` 来自 `predict_next_day`（**次日**概率）；拿 T+3 判定校它 = A 尺子量 B |
+| **只用 p_base** | β₀ 的 estimand 是「实际胜率 − p_base 均值」 | 用 `p_final` 会让系数去追自己上一轮的修正 ⇒ **自我强化** |
+| **n_clusters** | `stat_power.estimate_independent_clusters(天数, 每日本人)` 折算 | 150 只/日 ≈ 4.5 个独立观察；用名义样本数当 n 会**严重高估功效** |
+| **τ 与落盘** | 系数落 `data/calib/coefs_cal1.json`，τ 内跨进程复用 | 若每次冷启动都重拟合，`fitted_at` 恒为 now ⇒ τ（季度重估）形同虚设 |
+
+**观测入口**（接线生效与否，不看 Δp 看这些）：
+
+```python
+from app.agent.chain import calib_feed
+calib_feed.build_report()      # 每格：n_obs / n_days / n_clusters / win_rate / β₀ / source_level
+```
+`_c3p_pipeline` 的返回值带 `calib{used, source, n_clusters, pooled_n_clusters}`，
+pair 的 `extra` 带 `calib_source` / `calib_n` / `calib_pooled_n` ⇒ **事后能一眼看出
+这条 Δp 是本格自己的还是借来的**（把借来的当成自己的 = 静默放大）。
+
+> ⚠️ **诚实的边界**：`win_rate` / `mean_p_base` 是**样本等权**均值，而门槛用的是
+> **折算簇数** —— 两者口径不同：当"每日本人很多、天数很少"时，点估计方差仍被低估。
+> `min_clusters` 门槛 + 层级池化已在保护，但**严格按日等权**要等 O-4 建 `exp_pair`
+> 表之后再做（现在先记着，别当它不存在）。
+>
+> ⚠️ **P3-1 的 `exp_cond_calib` 表仍未建**（附录 F D-2）：当前用 JSON 落盘替代，
+> 够跑通链路但不做 JOIN。建表属 O-4 批次，不阻塞 P3 已接线的事实。
 
 ---
 
@@ -1388,7 +1452,7 @@ U = w1·格子样本缺口(max(0, 1 − n_eff/30))
 | **O-8** | `app/agent/utils` → `qdutils`（D-13） | 可读性：同名目录在 grep / IDE 检索里易串 | 涉 9 处改名 | ⑧ **降级为可选**（⚠️ 2026-10-13 复核：原动机「sys.path 顺序雷」已被 P5 根治，本项不再是"排雷"，只余可读性收益，不必抢在 O-1 前后做） |
 | **O-9** | 日配额 `add_day_usage` 接线 + 自适应算力 U 路由（G9 + §19.2） | 自适应路由不会绕过日成本保护 | 要定 U 的三个权重（不许拍，先观测一季） | ⑨ 做 |
 | **O-10** | `admission.json` 落进工作副本 | 干净环境不再「注册 0 个、不抛错」地静默降级 | 与「本地不入库」裁定不冲突（落工作副本即可） | ✅ **已落地（2026-10-13 复核）**：文件实测在 `app/agent/capabilities/admission.json`、未被 .gitignore 忽略（P13 已订正「不在工作副本」的旧说法）。**本项关闭**；残留问题转为 D-9（文件在，但 71 条 `doc` 全空） |
-| **O-11** | 小项打包：`run_skill` 白名单下沉（D-11）/ `_skill_seen` LRU（D-12）/ 旧系统反向依赖（D-2） | 各自都是几十分钟 | 低 | ⑪ 打包做 |
+| **O-11** | 小项打包：`run_skill` 白名单下沉（D-11）/ `_skill_seen` LRU（D-12）/ 旧系统反向依赖（D-2） | 各自都是几十分钟 | 低 | ✅ **三项全部收口（2026-10-14）**：D-11 元工具名单下沉 `QD_META_TOOLS` + 白名单改包内相对导入；D-12 LRU 容量上限 `QD_SKILL_SEEN_MAX`；D-2 cron 对外能力出口契约入代码。新增 3 个守卫文件（`test_v6_skill_seen_lru.py` / `test_v6_d11_whitelist_knobs.py` / `test_v6_cron_boundary.py`），变异检验 15/15 全有 bite。**本项关闭** |
 | ~~`preselect_stats._NOT_TOOLS`（D-3）~~ | ✅ **已由 P10 根治**（非工具模块改 `_` 前缀，扫描器天然跳过；名单方案整体删除） | — | — | **不做（已解决）** |
 | **O-12** | ~~工具面简化：撤掉「LLM plan + lint + 共现权重」三层~~ | ~~省掉预选那一整轮 LLM~~ | ❌ **方向错了**：实测预选 `stock_screen` **-72%** token / `trade_confirm` **-65%**；且净收益随工具数**单调递增**（见 §22.4 成本模型） | **不做（明确保留）** |
 | **O-13** | 冻结基线 `p_base` 换成更强的量化模型 | 短期绝对准确率更高 | ❌ 会引入「两腿互喂」风险，且 Δp 的分母变得不可复现 | **不做**（与红线 R2 同源） |
@@ -1582,7 +1646,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 | # | 问题 | 影响 | 现状 |
 |---|---|---|---|
 | **D-1** | 因子层未闭环：`get_factor_weights` 恒返回空 | 权重闭环只到 domain | ⬜ 输出名与维度名不匹配，恒走回退常量 |
-| **D-2** | `cron/` 被**旧系统**反向依赖 | 删旧系统会断掉定时任务 | ⬜ 未做 |
+| **D-2** | `cron/` 被**旧系统**反向依赖 | 删旧系统会断掉定时任务 | ✅ **已收口（2026-10-14，O-11）**：复核结论是**方向本身不是缺陷，是契约没被记录**。外部 → `app.agent.cron` 正是"方案代码只在 app/agent"的预期形态（agent 是能力提供方）；风险只在**反向**（cron → `app.routes`/`app.services`）会与消费方成环。已做三件事：① `app/agent/cron/__init__.py` 写明对外能力出口契约（三个消费方 `app/__init__.py`(启动) / `app/routes/cron.py` / `app/routes/health.py` + 迁移指引 + 已知历史包袱：routes 借用 `_execute_prompt_job`/`_execute_function_job` 两个私有名）；② 守卫 `tests/test_v6_cron_boundary.py`（导出名 8 个 / cron 不得反向 import Web·服务层 / 全 agent 不得 import `app.routes` / 契约注释不得删），**相对 import 按包解析**已覆盖（变异 5/5 有 bite）；③ 例外已登记：`tools/finance/*` 依赖 `app.services.*`（筹码唯一内核在服务层）是"不造轮子"的既定产物，故"禁 services"**只作用于 cron 子包** |
 | **D-3** | ~~`preselect_stats.py` `_NOT_TOOLS` 只登记 2 个新名~~ | ✅ **已由 P10 根治（2026-10-13）**：非工具模块统一改 `_` 前缀，扫描器对 `startswith("_")` 天然跳过 ⇒ 名单方案（含 `_NOT_TOOLS`/`_SKIP_FILES`/`_ENTRY_NAME_DENY` 三套）整体删除，管线函数根本不会被扫进注册表。**不要再按本条去"补名单"** | ✅ 已解决 |
 | **D-4** | 会话上下文不跨进程持久化 | 重启即失忆 | 🔒 **裁定不做**（附录 B.1） |
 | **D-5** | 能力评测样本与人工基线未铺开 | 标尺可信度不足 | 🟨 标尺已立；缺真实样本 + 双人标注 |
@@ -1591,8 +1655,8 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 | **D-8** | 观测计数器进程内，重启归零 | 拿不到长期趋势 | ⬜ 未做（→ O-7） |
 | **D-9** | `admission.json` 的 `doc` 字段全空 | `func_overlap` 分支永不命中 | ⬜ **doc 仍全空（实测 71/71 条为空，2026-10-13 复核）**；⚠️ 旧注「本地文件不在工作副本」**已过期** —— 该文件就在 `app/agent/capabilities/admission.json`（24 KB，未被 .gitignore 忽略，P13 已订正过一次），缺的是**内容**不是文件 |
 | **D-10** | 发布工程：归档/准入件不在版本控制 | 干净 clone 缺件 | ✅ 收口（裁定不入库） |
-| **D-11** | `run_skill` 白名单硬编码 | 违反"规则不在代码里" | 🟨 **2026-10-13 复核：原指控的"硬编码名单"已不存在** —— 执行型技能由各 skill 模块自行导出 `EXECUTABLE_SKILLS`（`qd_service._executable_skills()` 动态读取），按需工具开关也已是 env（`QD_ON_DEMAND_TOOLS`）。**残余待确认**：`skill_brewer` 写盘时的 tools 白名单是否仍含硬编码常量（见 `chain/skill_brewer.py:146` 附近的元工具名单） |
-| **D-12** | `_skill_seen` 无 LRU 淘汰 | 长跑内存增长点 | ⬜ 未做 |
+| **D-11** | `run_skill` 白名单硬编码 | 违反"规则不在代码里" | 🟨 **2026-10-13 复核：原指控的"硬编码名单"已不存在** —— 执行型技能由各 skill 模块自行导出 `EXECUTABLE_SKILLS`（`qd_service._executable_skills()` 动态读取），按需工具开关也已是 env（`QD_ON_DEMAND_TOOLS`）。**残余项已于 2026-10-14 收口（O-11）**：① `skill_brewer` 的元工具名单由硬编码集合下沉为 `QD_META_TOOLS`（默认沿用原 6 个；空 env 回落默认而非空集）—— 之所以只能配置不能"从 provider 推导"，是因为 `list_tools`/`search_tools`/`final_answer`/`python_interpreter` 是框架内置、**不进 ToolProvider 注册表**，`get_meta_names()` 盖不全；② `_executable_skills()` 由 `spec_from_file_location` 按文件路径加载改为**包内相对导入**（按路径加载会造出第二个模块实例，与 P5 根治的"双模块实例"同类）。守卫 `tests/test_v6_d11_whitelist_knobs.py`（变异 4/4 有 bite）。⚠️ `EXECUTABLE_SKILLS` 本体仍留在 `skill_run.py`：它的取值是**模块路径 + 函数名**（代码契约），塞进 env 只会更易错，不属"阈值/口径"红线范围 |
+| **D-12** | `_skill_seen` 无 LRU 淘汰 | 长跑内存增长点 | ✅ **已做（2026-10-14，O-11）**：`qd_service._skill_seen` 改为带容量上限的 LRU（`OrderedDict` + `move_to_end`，容量 `QD_SKILL_SEEN_MAX` 默认 512，脏值/非正值夹紧 ≥1）；写入与淘汰**唯一入口** `_skill_seen_for(session_id)`（键仍严格 `str(session_id)`，与 `_get_agent` 同口径）。淘汰只影响"正文 vs 一行指针"⇒ 被淘汰会话下次重注一次正文，正确性不变（fail-open 方向天然安全）。守卫 `tests/test_v6_skill_seen_lru.py`（含 AST 守卫禁止绕过助手直接 `setdefault`，变异 6/6 有 bite） |
 | **D-13** | `app/agent/utils` 与 `app/utils` 同名 | ⚠️ **前提已被 P5 根治**（2026-10-13 复核）：P5 起 `app/agent/` 不进 `sys.path`、全包统一 `app.agent.*`，活代码裸名 `import utils` **0 处** ⇒ 「sys.path 顺序雷」**已不存在**。残余风险只是**人读混淆**（同名目录，grep / IDE 检索易串） | 🟨 顺序雷已消；改名属可读性改善（→ O-8 降级） |
 | **D-14** | `weight_feed` EMA 参数未经真实样本校准 | 慢调强度是拍的 | ⬜ 待攒样本 |
 | **D-15** | judge 未校准；LLM 网关可用性未端到端验证 | 阶段 B 不敢开 | 🟨 **网关可用性已实测（2026-10-13 晚）**：`logs/app.log` 单日 `APITimeoutError` **129 次** / `APIConnectionError` **8 次**（端点 `api.g2claw.com`；详见 §8 的 `QD_C3P_*` 超时条目与 §7.5 TYPE 标签陷阱）⇒ 状态不是"未验证"，而是**已验证为不达标**；judge 校准仍 ⬜ |
@@ -1710,6 +1774,76 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
     数据来源：`tmp/probe_agent_consumers_20261013.py`（三形式 import 解析，
     扫描范围**全仓**——初版只扫 `app/agent/` 会把 cron 的包外消费方漏成"仅自引用"）。
     机检复跑 **99 项全 OK / 偏离率 0.0%**，不变。
+- 2026-10-14 **P3 条件校准接线（附录 F A-6 关闭，孤岛清零）**
+  - 🔴 **动了什么**：`chain/calibration.py` 此前是**唯一还断着的孤岛**（`fit_with_pooling()`
+    只被自身 `calibration_report()` 调用）⇒ 生产链路 `aggregate(coefs=None)` ⇒ **Δp 恒为 0**。
+    新建 **喂数层 `chain/calib_feed.py`**（与 `weight_feed` 同范式：IO 与纯算法分家），
+    `c3p._c3p_pipeline` 的 `coefs` 实参改由 `calib_feed.coefs_for(ck)` 供给。
+  - **新增模块 `chain/calib_feed.py`**（`build_samples` / `build_cells` / `coefs_for` /
+    `build_report`）；`chain/calibration.py` **一行未改**（保持纯函数、零 IO）。
+  - **顺带收敛的重复**：verdict 计分此前只有 `weight_feed._VERDICT_SCORE` 一份，
+    P3 是第二个消费方 ⇒ **上移到 `chain/schema.py`**（`VERDICT_SCORE` / `COUNTED_VERDICTS`），
+    `weight_feed` 保留原私有别名做引用（不是抄一份）。守卫：
+    `test_v5_calib_feed.py::test_verdict_score_has_single_source` 断言二者是**同一个对象**
+    （2026-10-13 踩过「改了计分漏了 SQL 白名单」的分叉坑，见附录 F C-2）。
+  - **新增查询** `account_store.load_latest_resolutions()`（PG 侧 `DISTINCT ON (claim_id)`，
+    一 claim 一票 G24）；`weight_feed` **未改**（它有守卫在守，改动收益 < 风险，
+    已在函数 docstring 记明「同一条纪律两个实现，将来应收敛到本函数」）。
+  - **口径 decisions**（详见新增 §21.4）：JOIN 键 = `claim_id`；只收与 `p_base`
+    同口径的 horizon（默认 `T+1`，`QD_CALIB_HORIZON`）；`n_clusters` 走
+    `stat_power.estimate_independent_clusters` 折算（**不用名义样本数**）；
+    样本不足 ⇒ `coefs_for()` 返回 `None`（P3-3 禁进判定），**不编系数**。
+  - **τ 为什么必须落盘**：若每次冷启动都重拟合，`fitted_at` 恒为 now ⇒ τ（季度重估）
+    形同虚设 ⇒ 系数落 `data/calib/coefs_cal1.json`，τ 内跨进程复用（有单测守）。
+  - **守卫与验证**：AST 级接线守卫 `test_v5_c3p.py::test_aggregate_coefs_is_not_constant_none`
+    （全文匹配会被注释里的 `coefs=None` 骗过去 ⇒ 用 AST 只认真实调用点）；
+    **变异检验 4/4 全被抓到**（`tmp/mutate_p3_guard_20261014.py`：
+    coefs 回退常量 None / 取第一条留痕 / 用名义样本冒充簇 / 落盘失效）。
+  - **回归**：全量 `tests/` **652 → 676 passed / 4 skipped**；v5 单测
+    **138 → 162 passed / 1 skipped**（14 个文件）；`qd_smoke` **255/257 / 0 failed** 不变。
+  - ⚠️ **别误判**：接线后 **Δp 仍然恒为 0**，因为样本还没攒够（当前 2 条 pair、0 条判定
+    ⇒ 全部只出先验）。这是**设计行为**，不是回退。看接线生效与否请用
+    `calib_feed.build_report()`（每格的 n_obs / n_clusters / β₀ / source_level）与接线守卫。
+
+- **2026-10-14 晚 · O-11 小项打包（D-11 残留 / D-12 LRU / D-2）+ 死代码复核归档**
+  - **D-11 残留**：`chain/skill_brewer` 的元工具名单由硬编码集合下沉为
+    `QD_META_TOOLS`（默认沿用原 6 个；空 env 回落默认**而非空集**）。**为什么只能配置**：
+    `list_tools`/`search_tools`/`final_answer`/`python_interpreter` 是框架内置、
+    不进 `ToolProvider` 注册表 ⇒ `get_meta_names()` 盖不全，不能假装"零配置推导"。
+    另：`qd_service._executable_skills()` 由 `spec_from_file_location` **按文件路径加载**
+    改为**包内相对导入** —— 按路径加载会造出第二个模块实例（与 P5 根治的"双模块实例"
+    同类）；P5 后 `app/agent` 不进 sys.path，"防顶层 scripts/ 抢解析"的前提已不成立。
+    ⚠ 源码守卫用 **AST 找调用**，不能用 `in src`：docstring 里写了
+    "spec_from_file_location" 解释为什么废弃它 ⇒ 全文匹配恒红（P3 同款陷阱的反面）。
+  - **D-12**：`_skill_seen` 改为带容量上限的 LRU（`OrderedDict` + `move_to_end`，
+    `QD_SKILL_SEEN_MAX` 默认 512，脏值/非正值夹紧 ≥1）。写入与淘汰**唯一入口**
+    `_skill_seen_for()`，AST 守卫禁止绕过助手直接 `setdefault`。
+    淘汰只影响"正文 vs 一行指针" ⇒ 被淘汰会话下次重注一次正文，正确性不变。
+  - **D-2**：判定为「**对外能力出口契约未记录**」而非缺陷 —— 外部 → `app.agent.cron`
+    正是"方案代码只在 app/agent"的预期形态；风险只在反向（cron → `app.routes`/
+    `app.services`）会成环。已把契约写进 `cron/__init__.py` docstring（三个消费方 +
+    迁移指引 + 已知历史包袱：routes 借用两个私有名），并用
+    `test_v6_cron_boundary.py` 钉住导出名与方向红线（**相对 import 也解析**）。
+    例外登记：`tools/finance/*` 依赖 `app.services.*`（筹码唯一内核在服务层，
+    "不造轮子"的既定产物）⇒ "禁 services" 只作用于 cron 子包，不下到全 agent。
+  - **死代码**：`tools/_pagination.py`(444) 经 `tmp/probe_deadcode_refs_20261014.py`
+    复核（三形式 import + 全仓扫描 + **同名异物判定**）确认零引用 ⇒ 归档
+    `del/deadcode_20261014/`（含 README：回滚方式与基线回改点）。
+    **函数级只出清单不动活代码**；其中 `budget.add_day_usage` 等是**设计 O-9 的
+    待接线点**、不是死代码（外部审查报告只做引用扫描、没对照设计文档 ⇒ 报告的问题）。
+  - ⚠️ **`memory/redis_memory.py` 同批被误判并归档、当日回滚**：探针的相对 import
+    解析在 `__init__.py` 上**少剥一层** ⇒ 漏掉 `memory/__init__.py:8` 的
+    `from .redis_memory import RedisMemory` ⇒ 判成"零引用"。归档后
+    `import app.agent.memory` 报 ModuleNotFoundError —— **由导入冒烟抓到，
+    全量 pytest 没抓到**（无单测 import 该包）。事实是 `RedisMemory` 在
+    `memory/__init__.py` 的 `__all__` 里 = **包的公开导出**，不属于死代码。
+    **教训已固化**：判"零引用"前必须做导入冒烟，静态扫描的口径 bug 会以
+    "假零引用"的形式吃掉活代码（这是本仓第三次同类事故，前两次是 P17-b / P18-b）。
+  - **变异检验**：D-12 6/6、D-11 4/4、D-2 5/5，全部有 bite
+    （`tmp/mutate_d12_lru_20261014.py` / `mutate_d11_knobs_20261014.py` /
+    `mutate_d2_cron_20261014.py`）。
+  - **回归**：全量 `tests/` **676 → 716 passed / 4 skipped**；设计机检
+    **100/100 OK / 偏离率 0.0%**（新增 A21/A22 守"这两个文件应已归档"）。
 
 ---
 
@@ -1743,7 +1877,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 | **A-3** | §16 段④：一次推理落三条，`Δp` 进判定 | ✅ **已接线**：`c3p` 按 **claim_id** 调 `aggregator.record_pair()`，落 `p_base`/`p_final`/`delta_p`；`exp_pair` 表未建（落 JSONL，符合"先落 JSONL"决策） | ① |
 | **A-4** | §13：EV-1 随案例入库（P1-2） | ✅ **写侧已通**：`qd_agent._record_case()` 传 `evidence=`（值来自 `_c3p_pipeline`）。守卫 `qd_smoke` test_40 ③ 断言实参**不是常量** `None`（变异检验 M6 证明该判据有 bite） | ① |
 | **A-5** | §15.2：`p_base` 复用 `predict_next_day` | ✅ **已接线**：`c3p.p_base_of()` → `chain/kline_feed.py` → `predict_next_day`；`_MIN_BARS` 与 `predict.MIN_BARS` 有守卫测试绑死（防两边漂移） | ① |
-| **A-6** | §17.3：层级池化产出 β | ⬜ **仍未接线**：`chain/calibration.py::fit_with_pooling` 仅被自身 `calibration_report()` 调用；`calibration_report` 仅被测试调用。**这是当前最大偏差** | ③ |
+| **A-6** | §17.3：层级池化产出 β | ✅ **已接线（2026-10-14 P3）**：`chain/calib_feed.py` 把 pairs × resolutions 喂成 cells，`fit_with_pooling` 由此进生产链路（`c3p._c3p_pipeline` 的 `coefs` 实参）。⚠️ **冷启动期仍返回 None**（簇数不足只出先验）—— 这是设计行为，不是回退；判别看 `build_report()` 与接线守卫 | ③ |
 | **A-7** | §21.2：采集链 | ✅ 采集链：`evaluator` → `collector.run_daily_collection()` → `context_frame.build_frame()` + `sampler.pick_daily_universe()`；`data/context_frames/context_frames_2026-10.jsonl`（1 帧）、`data/daily_universe/daily_universe_2026-10.jsonl` 均已落盘 | ① |
 
 > **P2 接线的接线点与形态**（2026-10-13 晚）
@@ -1797,12 +1931,12 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 | # | 项 | 证据 |
 |---|---|---|
 | **D-1** | P2-4 R2 静态守卫 | `qd_smoke.py` 全文**无** `watchlist` 扫描断言（红线当前未被违反，但无守卫 ⇒ 将来有人接上不会 FAIL） |
-| **D-2** | `exp_pair` / `exp_cond_calib` / `exp_cond_registry` 三表 | `migrations/` 全量 grep **零命中**（符合「先落 JSONL、不建表」决策；但 P3 的按格聚合做不了 JOIN ⇒ 见 O-4） |
+| **D-2** | `exp_pair` / `exp_cond_calib` / `exp_cond_registry` 三表 | `migrations/` 全量 grep **零命中**（符合「先落 JSONL、不建表」决策）。🟨 **2026-10-14 部分缓解**：P3 接线已不依赖这三表 —— `calib_feed` 用「pairs JSONL × resolutions（PG 侧 `DISTINCT ON`）」在 Python 侧 JOIN，系数落 `data/calib/coefs_cal1.json`。**按格 JOIN 的能力仍缺**（O-4 批次，不阻塞 P3 已接线） |
 | **D-3** | G23 条件格预注册台账 | 无 |
 | **D-4** | G19 `ρ_pair` 实测 | 一条 Δp 都没有 ⇒ 无从估 |
-| **D-5** | G9 日配额 `add_day_usage` | 零调用方 |
+| **D-5** | G9 日配额 `add_day_usage` | 零调用方（**注意：是设计 O-9 的待接线点，不是死代码** —— 外部审查报告据此列进"死代码清单"属误判，勿删） |
 | **D-6** | ~~D-3 `preselect_stats._NOT_TOOLS` 只登记 2 个~~（原证据：`_NOT_TOOLS = {"record_task_calls","pairs_path"}`，而公开函数有 7 个 ⇒ 5 个管线函数被误注册） | ✅ **已由 P10 根治**：预选管线已于 P9 迁出 `tools/` 到 `app/agent/preselect/`，且 P10 起非工具模块走 `_` 前缀、名单机制删除 ⇒ 双重不再成立。工具面实测 common 由 16 降为 **11**（消失的 5 个即这些误注册函数） | ✅ 已解决 |
-| **D-7** | D-11 `run_skill` 白名单硬编码 | `scripts/skill_run.py:27 EXECUTABLE_SKILLS` 仍是字典（改善：`qd_service.py:85-106` 已把它当**单一真源**读取并缓存，不是又抄一份） |
+| **D-7** | D-11 `run_skill` 白名单硬编码 | `scripts/skill_run.py::EXECUTABLE_SKILLS` 仍是字典 —— **2026-10-14 裁定保留**：它的取值是模块路径+函数名（代码契约，非阈值/口径），搬进 env 更易错。`qd_service._executable_skills()` 把它当**单一真源**读取并缓存（2026-10-14 起改为**包内相对导入**，不再是按文件路径加载 ⇒ 消除第二个模块实例） |
 | **D-8** | D-7 `prompt_sha` 的**旧链路**残留 | `tracing.py` 已修；但 D-7 原文指向的「读已删 prompt」问题随 O-2（traces 退役）一并消失 |
 | **D-9** | D-8 观测计数器进程内 | `preselect_stats` / `judge_stats` 均为模块级字典 |
 
@@ -1824,16 +1958,19 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
            qd_agent  ──► intake ──► decisions/claims ──► (T+N) ──► resolutions
            qd_agent  ──► ★ _c3p_pipeline ──► evidence ──► build_evidence ──► data/evidence/*.jsonl
                                         ├──► kline_feed ──► predict_next_day ──► p_base
-                                        ├──► aggregate()  ──► p_final          （P2 已通）
+                                        ├──► calib_feed ──► calibration.fit_with_pooling ──► β₀  ★P3(2026-10-14)
+                                        ├──► aggregate(p_base, ev, ck, coefs=β₀) ──► p_final
                                         ├──► record_pair() ──► data/pairs/*.jsonl
                                         └──► evidence ──► case_memory(outcome.evidence)
 
-⚠️ 孤岛(已建·零接线) —— 复核后只剩 1 个:
-           chain/calibration.py ── fit_with_pooling()    ✗ 仅被自身 report 调用
+✅ 孤岛清零(2026-10-14 复核): 四个孤岛(evidence / aggregator / P1-2 写侧 / calibration)
+   全部接通 —— 最后一个 `calibration` 由新增的 `chain/calib_feed.py` 接上。
 
-⇒ 结论(复核后): 采集在跑、标签在判、权重在喂,「经验 → 概率位移」主链 **已跑通**,
-   但 Δp 恒为 0 —— 因为最后一环(条件校准)还没接,聚合器没有系数可用。
-   P3 的剩余工作 = 把 calibration 接进 c3p,让 β 从攒下来的 pair 里估出来。
+⇒ 结论(复核后): 采集在跑、标签在判、权重在喂、系数在算,
+   「经验 → 概率位移」主链 **端到端已通**。
+   ⚠️ 但 Δp **仍然恒为 0** —— 不是没接线,而是**样本还没攒够**:
+      独立簇 < min_clusters(默认 30) ⇒ 只出先验 ⇒ coefs=None ⇒ p_final == p_base。
+      判别接线是否生效: 看 `calib_feed.build_report()` 的格子/簇数,不是看 Δp。
 ```
 
 **复核说明（2026-10-13 晚）**：初核时 A 组 5 条「未接线」中有 4 条在 P2 接线后转为「已接线」；

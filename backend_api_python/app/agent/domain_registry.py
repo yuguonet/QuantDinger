@@ -33,30 +33,35 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 # 数据域元组：(数据域名, 触发关键词元组, 候选工具元组[0]=首选)
-DataDomainRow = Tuple[str, Tuple[str, ...], Tuple[str, ...]]
-
-
 @dataclass(frozen=True)
 class DomainSpec:
-    """单个领域的共享分类学。"""
+    """单个领域的共享分类学。
+
+    ★ 2026-10-14 精简（对照 `app/agent/领域domain作用梳理_20261014.md`）：
+      删掉 `primary` / `intent_verbs` / `data_domains` / `list_producers` /
+      `list_consumers` 五个字段 —— 它们**只**被本模块那 6 个零消费方函数读
+      （`fallback_domain` / `domain_intent_verbs` / `iter_data_domains` /
+      `list_producers` / `list_consumers` / `default_entity_type`），随本次一并删除。
+      保留的四个字段都**有活消费方**：`entity_types`（entity_to_domain）、
+      `trading_calendar`（trading_calendar_domains → 交易日口径）、
+      `verb_nouns`（classify_verb → 链名归一）、`word_pattern`（word_domain_hints）。
+
+      ⚠ **不要再把"数据域词典"加回这里**：活的唯一一份在
+      `app/agent/preselect/tool_preselect.py::DATA_DOMAINS`（15 域，驱动 lint
+      R1 补位 / R4 裁剪 / 域兜底）。旧 `tools/finance/domain_meta.py::_DATA_DOMAINS`
+      与它**早已分叉**（realtime_quote vs quote、fund_flow vs fundflow，且引用了
+      已下线的 index_daily / day_series），两套并行正是本次要根治的"同一决策两个
+      事实源"。新增域请改活的那份。
+    """
     name: str
-    # planner 域字段缺失时的优先兜底域（全注册表至多一个 True）
-    primary: bool = False
     # 实体类型 → 本域（chat 阶段先于 plan，只能靠 entity_type 倒推）
     entity_types: Tuple[str, ...] = ()
     # 是否使用【交易日】口径（相对日词解析）
     trading_calendar: bool = False
     # verb → noun（追溯链名 domain+verb+noun 缺省段补齐）
     verb_nouns: Mapping[str, str] = field(default_factory=dict)
-    # 需要拉取本域工具面的任务动词（domain 通道兜底）
-    intent_verbs: frozenset = field(default_factory=frozenset)
     # 输入语汇 → 本域（无实体时的兜底信号）
     word_pattern: Optional[re.Pattern] = None
-    # plan_linter R1 数据域词典
-    data_domains: Tuple[DataDomainRow, ...] = ()
-    # R2 依赖登记（清单生产者/消费者，按工具名）
-    list_producers: frozenset = field(default_factory=frozenset)
-    list_consumers: frozenset = field(default_factory=frozenset)
 
 
 _SPECS: Dict[str, DomainSpec] = {}
@@ -97,17 +102,14 @@ def _load_from_tools() -> None:
                     "[DomainRegistry] %s/domain_meta.SPEC.name=%s 与目录名不一致，以目录名为准",
                     sub.name, spec.name,
                 )
+                # ★ 2026-10-14：只搬运**仍有消费方**的四个字段（见 DomainSpec 头注）。
+                #   精简前这里逐个拷贝全部 8 个字段，字段一删就会静默漏搬。
                 spec = DomainSpec(
                     name=sub.name,
-                    primary=spec.primary,
                     entity_types=spec.entity_types,
                     trading_calendar=spec.trading_calendar,
                     verb_nouns=dict(spec.verb_nouns),
-                    intent_verbs=spec.intent_verbs,
                     word_pattern=spec.word_pattern,
-                    data_domains=spec.data_domains,
-                    list_producers=spec.list_producers,
-                    list_consumers=spec.list_consumers,
                 )
             register(spec)
 
@@ -186,35 +188,6 @@ def trading_calendar_domains() -> frozenset:
     return frozenset(s.name for s in _ensure().values() if s.trading_calendar)
 
 
-def default_entity_type() -> str:
-    """默认实体类型：恒为空——禁止核心臆造 stock。"""
-    return ""
-
-
-def fallback_domain(available: Iterable[str]) -> str:
-    """planner 域字段缺失时的兜底域。
-
-    优先 primary 且可用；否则唯一可用域；多域且无 primary → 空（不臆造）。
-    """
-    avail = {a for a in (available or ()) if a}
-    if not avail:
-        return ""
-    for spec in _ensure().values():
-        if spec.primary and spec.name in avail:
-            return spec.name
-    if len(avail) == 1:
-        return next(iter(avail))
-    return ""
-
-
-def domain_intent_verbs() -> frozenset:
-    """需要拉域的任务动词并集（domain 通道兜底判据）。"""
-    out = set()
-    for spec in _ensure().values():
-        out |= set(spec.intent_verbs or ())
-    return frozenset(out)
-
-
 def word_domain_hints() -> List[Tuple[re.Pattern, str]]:
     """输入语汇 → 领域（按注册顺序）。"""
     out: List[Tuple[re.Pattern, str]] = []
@@ -224,23 +197,11 @@ def word_domain_hints() -> List[Tuple[re.Pattern, str]]:
     return out
 
 
-def iter_data_domains() -> Tuple[DataDomainRow, ...]:
-    """plan_linter R1 词典（跨域按注册顺序拼接）。"""
-    rows: List[DataDomainRow] = []
-    for spec in _ensure().values():
-        rows.extend(spec.data_domains)
-    return tuple(rows)
-
-
-def list_producers() -> frozenset:
-    out = set()
-    for spec in _ensure().values():
-        out |= set(spec.list_producers or ())
-    return frozenset(out)
-
-
-def list_consumers() -> frozenset:
-    out = set()
-    for spec in _ensure().values():
-        out |= set(spec.list_consumers or ())
-    return frozenset(out)
+# ★ 2026-10-14：`iter_data_domains` / `list_producers` / `list_consumers` /
+#   `domain_intent_verbs` / `fallback_domain` / `default_entity_type` 六个函数已在
+#   本次精简中删除（全仓**零消费方**，只被已退役的旧编排层 plan_linter /
+#   selected_domain / task_agent 用过）。
+#   它们读的 `data_domains` / `list_producers` / `list_consumers` /
+#   `intent_verbs` / `primary` 五个 DomainSpec 字段随之删除（见 DomainSpec 头注）。
+#   ⚠ 其中 `data_domains` 那份词典与活词典早已分叉，**不要**照这里的旧条目复原——
+#     活的唯一一份是 `app/agent/preselect/tool_preselect.py::DATA_DOMAINS`。

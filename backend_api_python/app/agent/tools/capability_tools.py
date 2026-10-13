@@ -90,6 +90,21 @@ def call_capability(name: str, arguments: dict = None) -> Dict[str, Any]:
     if provider is not None and name in provider:
         return {"error": f"工具层已有同名工具 {name}（工具层优先），请直接调用该工具"}
 
+    # ★ 2026-10-14 G1：上面**只判同名**，与另两个执行点不同口径 ——
+    #   注册期 `capabilities/loader.py::register_capabilities` 用「同名 + 近重名」
+    #   （`_shadows_domain_tool`）、预选期 `lint_selection` R0 用 `near_dup_tool_names`。
+    #   后果：名字不同但功能近重的能力（如 `get_fund_flow_daily` 对上域内
+    #   `get_fund_flow`）在注册期被判让位（根本不注册），派发期却能照常执行 ——
+    #   让位裁定被旁路，工具层 > 能力层形同虚设。此处补上近重名判据，三处同口径。
+    if provider is not None:
+        shadow = loader._shadows_domain_tool(name, provider)
+        if shadow:
+            # ⚠ `(generic)` 是 `_shadows_domain_tool` 对通用名（daily/quote…）的返回值，
+            #   不是工具名 —— 判 truthiness 即可，别去工具表里比对它。
+            where = "" if shadow == "(generic)" else f" {shadow}"
+            return {"error": f"能力 {name} 已让位给工具层{where}（同名/近重名，"
+                             f"工具层优先），请改用工具层工具"}
+
     entry = None
     for mod_path, fn_name, timeout_s, max_chars in (loader.load_admitted() or []):
         if fn_name == name:
@@ -109,5 +124,9 @@ def call_capability(name: str, arguments: dict = None) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"能力执行失败: {e}"}
     if isinstance(result, dict):
-        return {"name": fn_name, **result}
+        # ★ 2026-10-14 G7②：展开顺序必须是 **result 在前、标注键在后**。
+        #   原写法 `{"name": fn_name, **result}` 让能力返回值里的 `name` **赢**，
+        #   trace/追责里记到的就成了能力内部自报的名字（留痕失真）。
+        #   其余字段仍原样透传，契约形状不变。
+        return {**result, "name": fn_name}
     return {"name": fn_name, "result": result}

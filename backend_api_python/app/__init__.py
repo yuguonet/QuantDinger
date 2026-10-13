@@ -2,29 +2,41 @@
 QuantDinger Python API - Flask application factory.
 """
 import os as _os
-import sys as _sys
 
-# Make app/nanobot/ shadow any pip-installed nanobot-ai package,
-# so local patches are always used without touching import paths.
+# 【2026-10-13 · P5 导入现代化 / 2026-10-14 补刀】**本文件不得把任何目录塞进 sys.path。**
 #
-# 【2026-10-13 · P5 导入现代化】**本处不再把 `app/agent/` 塞进 sys.path。**
+# ── 历史包袱（2026-10-14 清除）──
+# 早期这里把 `app/` 插到 sys.path[0]，动机有两条，均已失效：
+#   ① 让 `app/nanobot/` 遮蔽 pip 里的 nanobot-ai —— 2026-10-14 实测
+#      `app/nanobot/` 已不存在、pip 里也没有 nanobot（find_spec 返回 None）；
+#   ② 让 legacy 包内裸名导入（`from chain.store import ...`）成立 —— P5 起
+#      包内改相对导入、包外改绝对导入（`from app.agent.chain.evaluator import
+#      start_eval_worker`），单一 module 名 `app.agent.*`，不再需要注入。
 #
-# 旧做法：legacy 包内一律裸名导入（`from chain.store import ...`），为此必须把
-# `app/agent/` 插到 sys.path 且压在 `app/` 之上。代价是该目录下 30 个顶层名
-# （tools / chain / utils / log / memory / rag / skills / cron / ...）变成全进程裸名，
-# 于是同一份源码能同时以裸名 `chain.store` 和全名 `app.agent.chain.store`
-# 加载成**两个 module 对象**，模块级单例双份且状态互不可见（事故 M-1）。
-# 而且"谁排在前面"取决于 import 时序，历史上反复被别处的一次 insert 打翻
-# （2026-10-02：skills/market_screener/common.py 误插 `app/` ⇒ 9 个 finance 工具
+# ── 保留注入的代价（实测，`tmp/probe_app_dir_syspath_20261014.py`）──
+# `app/` 在 sys.path 会让 11 个顶层目录名变成全进程裸名：
+#   agent / utils / routes / services / config / data / data_sources /
+#   data_providers / market_cn / market_store / watchlist
+# 于是 `app.agent` 与裸名 `agent`、`app/agent/utils` 与 `app/utils` 都能各加载成
+# **两个 module 对象** —— 这正是事故 M-1（模块级单例双份、状态互不可见）与
+# D-13（同名目录 grep/IDE 易串）的共同成因。历史上还被别处的一次 insert 打翻过
+# （2026-10-02：`skills/market_screener/common.py` 误插 `app/` ⇒ 9 个 finance 工具
 #  模块静默跳过，工具面 101→91 无人察觉）。
 #
-# 现做法：legacy 包内改为**相对导入**、包外改为**绝对导入**
-# （`from app.agent.chain.evaluator import start_eval_worker`），
-# 单一 module 名 `app.agent.*`，M-1 病根消失，本目录也不必再进 sys.path。
-# 红线守在 `tests/test_v6_import_modernize.py`（零裸名 / 零 sys.path / 零断裂引用）。
-_app_dir = _os.path.dirname(_os.path.abspath(__file__))
-if _app_dir not in _sys.path:
-    _sys.path.insert(0, _app_dir)
+# ── 为什么删得掉（有效消费方 = 0）──
+# 全仓扫裸名 import 指向 `app/*` 的命中只有三处，且**移除前后都 import 失败**：
+#   · `app/market_store/plugin_api.py:48,322` —— `app/market_store/__init__.py`
+#     是空文件，本来就拿不到 `MarketStore`（`_HAS_DEPS` 早就是 False）；
+#   · `scripts/calibrate_scores.py:22` —— 只挂了 backend 根，`utils.calibration`
+#     并不存在（该脚本本就断链）；
+#   · `app/agent/tmp/*.bak.py` —— 备份文件，非活代码。
+# 动态加载路径也不依赖它：`app/agent/cron/cron_worker.py` 与 `app/routes/cron.py`
+# 走 `resolve_function_path()` 给裸名补包前缀后才 `importlib.import_module`，
+# `app/agent/capabilities/scanner.py` 挂的是 backend 根而不是 `app/`。
+#
+# 红线守在 `tests/test_v6_app_dir_syspath.py`：**子进程级**验证 `import app` 之后
+# `app/` 不得出现在 sys.path、裸名不得解析进 `app/`；源码级用 AST 禁止本文件
+# 出现任何 `sys.path.insert/append`（文本匹配会被注释里的字样骗过）。
 
 import math
 import logging
