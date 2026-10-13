@@ -23,9 +23,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 import time
+
+# ── ★ stdout = 结果通道：在**任何第三方 import 之前**先把日志钉到 stderr ──
+# CLI 的 stdout 要能被直接消费（`python -m app.agent.cli "问题" | ...`）。
+# 但 mimoagent 及其依赖会在 import 期就 logger.info(...)，若那时 root 还没有
+# handler，后配置的人只能"事后补救"——**已经写出去的那几行追不回来**
+# （实测：`--info` 的 stdout 前 6 行就是 mimo 的 ripgrep / Git 工具链日志）。
+# ⇒ 入口处**最先** basicConfig（后续 `app.agent.log` 检测到已有 handler 会跳过，
+#   且其"stdout handler 一律改指 stderr"的收口仍保留，双保险）。
+logging.basicConfig(
+    stream=sys.stderr,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").strip().upper(), logging.INFO),
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 
 # gbk 控制台编码保护（与 run.py 一致）：模型输出可能含 emoji/特殊符号，
 # 若 stdout 为 gbk 控制台会因无法编码崩溃。统一重配置为 utf-8 + replace。
@@ -58,13 +72,38 @@ except ImportError:
     pass
 
 
+def _pin_mimo_log_to_stderr():
+    """把 mimoagent 的日志钉到 stderr，返回本次被改指的 handler 数。
+
+    ★ 调用时机是**硬要求**：必须赶在「可能触发 mimoagent 子模块 import 的动作」
+      **之前**。它绕开 root（具名 logger + propagate=False），入口的 basicConfig
+      与 `log.py` import 期的收口都管不到；而 ripgrep / Git 工具链模块是
+      **import 当场**就往 stdout 打就绪日志 —— 晚一步那几行就追不回来。
+    """
+    import mimoagent  # noqa: F401  # 触发其 import 期日志配置（import 幂等，开销≈0）
+    from app.agent.log import ensure_console_on_stderr
+    return ensure_console_on_stderr()
+
+
 def _import_agent():
     """延迟导入 agent 组件（避免包命名空间冲突）。"""
     # 【2026-10-13 P1】原来这里还导出一个进程级 `llm` 实例（旧自建 llm/ 包的
     # create_llm()），交互循环退出时 `await llm.close()`。LLM 出口统一到
     # `app.agent.llm` 后没有这个对象了 —— mimo 的 Model 没有 async close，
     # 连接随进程退出回收即可。
+    # ★ 收口必须**卡在 mimoagent import 之后、agent 包 import 之前**：
+    #   mimoagent 在 **import 期**就给具名 logger `mimoagent` 挂 RichHandler→stdout
+    #   并 `propagate=False`（`.venv/.../mimoagent/utils/log.py` 的
+    #   `_setup_root_logger()`）——它绕开 root，入口的 basicConfig 与 `log.py`
+    #   import 期的收口都管不到它；而它 import 链里（ripgrep / Git 工具链就绪
+    #   日志）**当场就往 stdout 写**，晚一步那几行就追不回来。
+    #   ⚠ 顺序不能换：先 import mimoagent 让它把 logger 配完，再收口，
+    #   然后才 import agent 包（此时它 import 链里的日志已全部走 stderr）。
+    _pin_mimo_log_to_stderr()
+
     from app.agent.agent import agent, settings, skills, DEFAULT_SESSION_ID
+    from app.agent.log import ensure_console_on_stderr
+    ensure_console_on_stderr()  # agent 包 import 期可能又带进新的第三方 logger
     return agent, settings, skills, DEFAULT_SESSION_ID
 
 
@@ -184,8 +223,40 @@ def _print_info():
 
 
 def _list_tools():
-    """列出所有工具。"""
-    print("\n[wrench] 工具通过 list_tools/search_tools 动态发现。")
+    """列出**运行期**拼出来的工具面（按域分组）。
+
+    ★ 2026-10-14：原来只打印一句"工具通过 list_tools/search_tools 动态发现"
+      —— 等于这个入口什么也没给用户。工具面是**运行期拼装**的：
+      域目录扫描 + 能力层让位（`capabilities.loader` 会按同名/近重名让位，
+      实测 29 项工具层让位），**只看代码目录无法得知最终有哪些工具**，
+      所以 CLI 必须能把它打出来（而不是让使用者去猜）。
+    """
+    # 工具面预热会 import mimoagent.tools.*（ripgrep / Git 工具链），那些模块
+    # import 当场就往 stdout 打就绪日志 ⇒ 预热**之前**先收口（见
+    # `_pin_mimo_log_to_stderr` 的时机说明）。
+    _pin_mimo_log_to_stderr()
+
+    from app.agent.qd_tool_face import warmup_tool_face
+    from app.agent.tools._base import ToolProvider
+
+    warm = warmup_tool_face()
+    provider = ToolProvider.get_or_build()
+
+    by_domain = {}
+    for name in provider.get_tool_names() or []:
+        by_domain.setdefault(provider.get_domain(name) or "?", []).append(name)
+
+    print(f"\n[wrench] 工具面 {len(by_domain) and sum(len(v) for v in by_domain.values())} 个"
+          f"（域工具 + 能力层 {warm.get('capabilities', 0)}；预热 {warm.get('elapsed', 0)}s）\n")
+    for dom in sorted(by_domain, key=lambda d: (-len(by_domain[d]), d)):
+        names = by_domain[dom]
+        print(f"  ── {dom}  ({len(names)})")
+        for i in range(0, len(names), 3):     # 每行 3 个，别把终端刷爆
+            print("     " + "".join(f"{n:<34s}" for n in names[i:i + 3]).rstrip())
+    print("\n  运行期还会按任务**预选**子集（`preselect/tool_preselect.py`），"
+          "不是每轮全量下发。")
+    if warm.get("error"):
+        print(f"\n  ⚠ 能力层预热失败: {warm['error']}")
 
 
 def _list_skills():

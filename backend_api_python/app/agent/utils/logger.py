@@ -26,7 +26,9 @@ def get_logger(name: str, level: Optional[str] = None) -> logging.Logger:
     level = (level or "INFO").upper()
     logger.setLevel(getattr(logging, level, logging.INFO))
 
-    handler = logging.StreamHandler(sys.stdout)
+    # ★ 2026-10-14：走 **stderr**（与 `app/agent/log.py` 同一条纪律）——
+    #   stdout 是结果通道，日志混进去会污染 CLI 的可解析输出。
+    handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(getattr(logging, level, logging.INFO))
 
     formatter = logging.Formatter(

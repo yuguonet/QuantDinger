@@ -166,8 +166,15 @@ class QDSkillAdapter:
         dirs = skills_dirs or self._default_dirs()
         for d in dirs:
             self._scan_python(d)
+        n_py = len(self._skills)
         for d in dirs:
             self._scan_markdown(d)  # SKILL.md 最终覆盖
+        # ★ 2026-10-14：总数**必须等两阶段都扫完**再打印。
+        #   原实现只在 `_scan_python` 末尾打一句"已发现 N 个 Skill"（Python 阶段
+        #   的数）⇒ 启动日志显示 1，而 `--list-skills` 显示 6 —— 同一进程两个
+        #   数字，排查时会误判成"技能没装载全"。
+        logger.info("[QDSkills] 技能装载完成: 共 %d 个（Python 阶段 %d + SKILL.md 阶段 %d）",
+                    len(self._skills), n_py, len(self._skills) - n_py)
 
     @staticmethod
     def _default_dirs() -> List[str]:
@@ -298,7 +305,11 @@ class QDSkillAdapter:
                         self._skills[info.name] = info
                         self._display_to_name[name] = info.name
 
-        logger.info("[QDSkills] 已发现 %d 个 Skill", len(self._skills))
+        # ★ 2026-10-14：这是**阶段数**（Python 阶段），不是最终总数 ——
+        #   打印成"已发现 N 个 Skill"会让启动日志与 `--list-skills` 对不上
+        #   （实测 1 vs 6）。降为 debug，总数由 `__init__` 末尾那条 INFO 负责。
+        logger.debug("[QDSkills] Python 阶段扫到 %d 个（SKILL.md 阶段还会覆盖/补充）",
+                     len(self._skills))
 
     def get(self, name: str) -> Optional[SkillInfo]:
         info = self._skills.get(name)
