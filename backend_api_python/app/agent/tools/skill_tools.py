@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 
 def _get_skills():
-    from agent import skills as _s
+    from ..agent import skills as _s
     return _s
 
 

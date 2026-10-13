@@ -46,12 +46,12 @@ for _p in (str(BACKEND_ROOT), str(AGENT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import mimo_boot
+from app.agent import mimo_boot
 
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(BACKEND_ROOT / ".env", override=False)
 
-from qd_service import QDAgentService  # noqa: E402
+from app.agent.qd_service import QDAgentService
 
 REPORT_DIR = HERE / "prompt_eval"
 TASKS_FILE = HERE / "prompt_tasks.yaml"
@@ -120,14 +120,14 @@ def build_service(profile: str) -> Tuple[QDAgentService, str]:
     """
     if profile in ("auto", "prod"):
         try:
-            from agent import agent as prod_agent  # noqa
+            from app.agent.agent import agent as prod_agent
             return prod_agent, "production"
         except Exception as e:
             if profile == "prod":
                 raise
             print(f"[warn] 生产装配失败，退回 minimal: {e!r}")
-    from memory import LocalMemory
-    from llm import QDSkillAdapter
+    from app.agent.memory import LocalMemory
+    from app.agent.skills_adapter import QDSkillAdapter
     svc = QDAgentService(memory=LocalMemory(max_messages=200),
                          retriever=None, skills=QDSkillAdapter(),
                          agent_config={"service_availability": {"search_knowledge": False}})
@@ -146,7 +146,7 @@ def _model_stats(svc: QDAgentService) -> Dict[str, int]:
 def _domain_map() -> Dict[str, str]:
     """工具名 → 域（按需层判定用；mimo 原生归 'mimo'）。"""
     try:
-        from tools.base import ToolProvider
+        from app.agent.tools._base import ToolProvider
         p = ToolProvider.get_or_build()
         dom = {n: p.get_domain(n) for n in p.get_functions()}
         for n in p.get_meta_functions():
@@ -166,7 +166,7 @@ def _tool_available(name: str, availability: Dict[str, Any]) -> bool:
     if hit is not None:
         return bool(hit)
     try:
-        from tools.base import ToolProvider
+        from app.agent.tools._base import ToolProvider
         return name in ToolProvider.get_or_build().get_functions()
     except Exception:
         return False
@@ -410,7 +410,7 @@ def main() -> int:
         print("未配置 OPENAI_API_KEY，无法跑真实端点回归（先配 .env）", file=sys.stderr)
         return 2
 
-    from tools.availability import probe_tools
+    from app.agent.tools._availability import probe_tools
     availability = probe_tools()
     print("工具可用性:", {k: v.get("available") for k, v in availability.items()})
 

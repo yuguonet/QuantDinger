@@ -41,11 +41,7 @@ logger = logging.getLogger(__name__)
 #   word_domain_hints()          —— 输入语汇 → 领域，用于"没有实体但语境明确"的兜底。
 # 2026-09-25：三表均已抽到 domain_registry / tools/<domain>/domain_meta.py，
 # 核心不再写死 finance/stock。
-from domain_registry import (
-    entity_to_domain as _entity_to_domain,
-    trading_calendar_domains as _trading_calendar_domains,
-    word_domain_hints as _word_domain_hints,
-)
+from ..domain_registry import entity_to_domain as _entity_to_domain, trading_calendar_domains as _trading_calendar_domains, word_domain_hints as _word_domain_hints
 
 _WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 

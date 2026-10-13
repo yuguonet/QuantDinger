@@ -23,6 +23,19 @@ v1.1 裁定：追责是慢调、允许少量误判。单条判定不足以翻转
 样本越少越保守（最低只吃 10% 的新证据）；最小样本 MIN_SAMPLES 以下只记账不调权。
 
 【不计入权重的两类】undecidable / data_missing —— 常量污染，与"容忍误判"两回事。
+
+【G24：一 claim 一票（2026-10-13 实测新增）】
+`qd_agent_resolutions` 是**判定留痕**而非"一 claim 一结果"：
+`account_store.save_resolution()` 是纯 INSERT（无 UPSERT），同一 claim 每次重新
+判定都会**新增一行**。实测 16 条 resolution 只对应 10 个 claim（claim 89~94 各两条）。
+
+原实现直接 `FROM qd_agent_resolutions r ... GROUP BY d.domain` ⇒ **同一 claim 的
+每一条留痕都被当成一票**。当前侥幸没爆，只因为重复的 6 条恰好都是 undecidable
+（不在白名单里）；一旦重算或重试后翻成 hit/miss，n 就会随重试次数虚涨。
+
+裁决：**保留留痕语义**（不动 save_resolution），只把统计口径改成
+「每 claim 只取最新一条」。去重与聚合都做成纯函数（_dedup_latest / _aggregate_domain），
+SQL 只负责取明细 —— 既便于离线守口径，也为 P2/P3 按 condition_key 分组留好位置。
 """
 from __future__ import annotations
 
@@ -51,57 +64,115 @@ def _alpha(n: int) -> float:
     return max(_EMA_MIN, min(_EMA_MAX, n / _EMA_DIVISOR))
 
 
-def collect_domain_stats() -> List[dict]:
-    """按 domain 聚合已判定 resolutions。
+# verdict → 聚合桶名（与 _COUNTED_VERDICTS / _VERDICT_SCORE 同源，不另立一套）
+_BUCKET = {"hit": "hits", "partial": "partial", "miss": "misses", "delisted": "delisted"}
+
+
+def _dedup_latest(rows: List[dict]) -> List[dict]:
+    """一 claim 只留**最新一条** resolution（G24）。
+
+    ★ 判定依据是**时间顺序**（res_id 最大），不是"哪条看起来更有用"：
+      同一 claim 的旧留痕可能仍是 undecidable，新留痕已翻成 hit，
+      若按 verdict 过滤来"凑"结果，就会变成"只数好看的那条"，与 G18 同类错误。
+
+    Args:
+        rows: [{"claim_id","res_id","domain","verdict"}, ...]
 
     Returns:
-        [{"domain","n","hits","partial","misses","win_rate"}, ...]
+        去重后的明细行（每 claim_id 至多一条）
+    """
+    best: Dict[object, dict] = {}
+    for r in rows or []:
+        cid = r.get("claim_id")
+        try:
+            rid = int(r.get("res_id") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        prev = best.get(cid)
+        if prev is None:
+            best[cid] = r
+            continue
+        try:
+            prev_rid = int(prev.get("res_id") or 0)
+        except (TypeError, ValueError):
+            prev_rid = 0
+        if rid > prev_rid:
+            best[cid] = r
+    return list(best.values())
+
+
+def _aggregate_domain(rows: List[dict]) -> List[dict]:
+    """按 domain 聚合已判定 resolutions（纯函数，口径唯一真源）。
+
+    白名单与计分都取自模块常量，SQL 侧不再各自 GROUP BY ——
+    改一处漏一处是 2026-10-13 踩过的坑（只改 _VERDICT_SCORE 漏掉 SQL 白名单）。
+
+    Returns:
+        [{"domain","n","hits","partial","misses","delisted","win_rate"}, ...]
+    """
+    acc: Dict[str, dict] = {}
+    for r in rows or []:
+        dom = r.get("domain")
+        if not dom:
+            continue
+        v = str(r.get("verdict") or "")
+        bucket = _BUCKET.get(v)
+        if bucket is None:                  # undecidable / data_missing：不计入
+            continue
+        a = acc.setdefault(str(dom), {"domain": str(dom), "hits": 0, "partial": 0,
+                                      "misses": 0, "delisted": 0})
+        a[bucket] += 1
+    out: List[dict] = []
+    for a in acc.values():
+        n = a["hits"] + a["partial"] + a["misses"] + a["delisted"]
+        if n <= 0:
+            continue
+        a["n"] = n
+        # delisted 已在分母里（n 含它）且计 0 分 ⇒ 自然拉低胜率（v4 G18）
+        a["win_rate"] = round((a["hits"] + 0.5 * a["partial"]) / n, 4)
+        out.append(a)
+    return out
+
+
+def collect_domain_stats() -> List[dict]:
+    """按 domain 聚合已判定 resolutions（每 claim 只算一票，见模块头 G24）。
+
+    ★ SQL 只负责取**明细行**，去重/过滤/计分全部在纯函数里完成：
+      口径只有一份（可离线测），将来按 condition_key 分组（P2/P3）也只改 Python 侧。
+      量级评估：日频 150 只 × 3 claim ≈ 450 条/日，年 10 万级；盘后跑一次取全量
+      明细可接受。若将来成为瓶颈，再下沉为 SQL 侧 `DISTINCT ON (claim_id)`，
+      但**口径定义仍以 _dedup_latest / _aggregate_domain 为准**。
+
+    Returns:
+        [{"domain","n","hits","partial","misses","delisted","win_rate"}, ...]
     """
     try:
         from app.utils.db import get_db_connection
     except ImportError:
         return []
-    # ★ 白名单来自模块常量，不在这里硬编码（改一处漏一处的教训，2026-10-13）
+    # ★ 白名单来自模块常量，不在这里硬编码（改一处漏一处的教训，2026-10-13）。
+    #   SQL 侧先用同一常量做一次粗筛（省传输），真正的口径仍在 Python 侧。
     _in_list = ", ".join("'" + str(v) + "'" for v in _COUNTED_VERDICTS)
     sql = f"""
-        SELECT d.domain AS domain,
-               count(*) FILTER (WHERE r.verdict = 'hit')      AS hits,
-               count(*) FILTER (WHERE r.verdict = 'partial')  AS partial,
-               count(*) FILTER (WHERE r.verdict = 'miss')     AS misses,
-               count(*) FILTER (WHERE r.verdict = 'delisted') AS delisted
+        SELECT r.claim_id AS claim_id,
+               r.id       AS res_id,
+               d.domain   AS domain,
+               r.verdict  AS verdict
         FROM qd_agent_resolutions r
         JOIN qd_agent_claims     c ON c.id = r.claim_id
         JOIN qd_agent_decisions  d ON d.id = c.decision_id
         WHERE r.verdict IN ({_in_list})
-        GROUP BY d.domain
     """
-    rows = []
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()          # ★ RealDictRow：必须 row['k']
             cur.execute(sql)
-            raw = cur.fetchall()
+            raw = [dict(x) for x in (cur.fetchall() or [])]
             cur.close()
     except Exception as e:
         logger.warning("[weight_feed] 聚合失败: %s: %s", type(e).__name__, e)
         return []
-    for r in raw:
-        dom = r.get("domain")
-        if not dom:
-            continue
-        hits = int(r.get("hits") or 0)
-        part = int(r.get("partial") or 0)
-        miss = int(r.get("misses") or 0)
-        dls = int(r.get("delisted") or 0)     # 退市：计入分母，拉低胜率（最差结果）
-        n = hits + part + miss + dls
-        if n <= 0:
-            continue
-        rows.append({
-            "domain": dom, "n": n, "hits": hits, "partial": part, "misses": miss,
-            "delisted": dls,
-            "win_rate": round((hits + 0.5 * part) / n, 4),
-        })
-    return rows
+    return _aggregate_domain(_dedup_latest(raw))
 
 
 def feed(dry_run: bool = False) -> dict:

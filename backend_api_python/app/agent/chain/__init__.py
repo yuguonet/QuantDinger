@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Chain — 编排/决策层。
 
@@ -12,18 +12,8 @@ Chain — 编排/决策层。
   tool_chains.py — 编排路径缓存（读写链路断裂，改用 qd_agent_traces）
   contract.py    — SkillReport 解析契约（Skill 直接构造 SkillReport，不再需要解析）
 """
-from chain.schema import (
-    EvalNode, SkillReport, FactorItem,
-    Layer, Status, Action, Direction,
-    VETO_SCORE, COVERAGE_THRESHOLD, DIRECTION_THRESHOLD,
-    classify_return, is_direction_correct,
-)
-from chain.store import (
-    save_tree, load_tree, query_roots, query_pending_verify,
-    update_verify_results, update_skill_verify,
-    get_skill_weights, get_factor_weights, get_tool_weights, get_eval_stats,
-    query_cached_tools, query_low_weight_tools,
-)
+from .schema import EvalNode, SkillReport, FactorItem, Layer, Status, Action, Direction, VETO_SCORE, COVERAGE_THRESHOLD, DIRECTION_THRESHOLD, classify_return, is_direction_correct
+from .store import save_tree, load_tree, query_roots, query_pending_verify, update_verify_results, update_skill_verify, get_skill_weights, get_factor_weights, get_tool_weights, get_eval_stats, query_cached_tools, query_low_weight_tools
 
 __all__ = [
     "EvalNode", "SkillReport", "FactorItem",

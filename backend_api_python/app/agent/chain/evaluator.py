@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Evaluator — 回溯评估引擎（重写版）。
 
@@ -18,33 +18,48 @@ from __future__ import annotations
 
 import json
 import os
-from log import logger
+from ..log import logger
 import math
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from chain.schema import (
-    DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct,
-)
-from chain import store
+from .schema import DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct
+from . import store
+from . import label_spec as _ls
 # ═══════════════════════════════════════════════════════════════
 # timeframe → 验证窗口映射
 # ═══════════════════════════════════════════════════════════════
+# ★ 2026-10-13（v5 P1-1 收口）：本文件**不再自持**任何 horizon→days 映射，
+#   全部委派 `chain/label_spec.HOLDS`（唯一真源）。
+#
+#   此前 `_TIMEFRAME_DAYS`（1M=22）与 `HOLD_LABELS`（1M=20）两处各写一份且数值
+#   不同 —— 改一处忘一处即**静默漂移**。当时判断"两者语义不同（自然月 vs 交易日），
+#   不许合并"，**这个判断已查证推翻**：
+#     · 消费端按**交易日**解释 —— `_maturity_days` 注释原文「hold_days 按交易日计」，
+#       且 `_get_actual_return` 用 `base_idx + hold_days` 偏移 **K 线根数**；
+#     · 22 与表内 `1Y=252` 不自洽（22×12=264 > 252，一年没那么多交易日）；
+#     · 影响面实测为零：`qd_agent_traces` 根节点 timeframe **恒为空**（1256 条），
+#       22/66/252 从未被消费。
+#   ⇒ 已统一为 `HOLDS`（1M=21 / 3M=63，与 1Y=252 自洽）。详见 label_spec 模块头。
 
-_TIMEFRAME_DAYS = {
-    "T+1": 1,
-    "T+3": 3,
-    "T+5": 5,
-    "1W": 5,
-    "1M": 22,
-    "3M": 66,
-    "1Y": 252,
-}
+_TIMEFRAME_DAYS = _ls.HOLDS                  # 单位：**交易日**（唯一真源）
+HOLD_LABELS = _ls.HOLD_LABELS                # 天数 → 标签（先到先得）
+LABEL_HOLDS: Dict[str, int] = {v: k for k, v in HOLD_LABELS.items()}
 
-_DEFAULT_HOLD_DAYS = 3  # timeframe 缺失时的默认值
+_DEFAULT_HOLD_DAYS = _ls.DEFAULT_HOLD_DAYS   # 标签缺失/无法识别时的默认值
+
+
 def _get_hold_days(timeframe: str) -> int:
-    """timeframe → 验证用持有天数。"""
-    return _TIMEFRAME_DAYS.get(timeframe, _DEFAULT_HOLD_DAYS)
+    """timeframe → 验证用持有**交易日**数。
+
+    与 claim 的 T+N **同一套口径**（`label_spec.HOLDS`），不再分两套。
+    未知/缺失标签兜底 `_DEFAULT_HOLD_DAYS` —— 兜底点仅 `resolve_hold_days` 一处。
+    """
+    return _ls.resolve_hold_days(timeframe)
+
+
+# 注：`HOLD_LABELS` / `LABEL_HOLDS` 已在上方随 `_TIMEFRAME_DAYS` 一并委派
+#     到 `chain/label_spec`（v5 P1-1）。此处不再重复定义。
 
 
 def _maturity_days(hold_days: int) -> int:
@@ -65,24 +80,35 @@ def _get_actual_return(
     hold_days: int,
     market: str = "CNStock",
     with_extremes: bool = False,
+    extra_holds: Optional[List[int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """获取股票实际涨跌数据。
 
     Args:
         stock_code: 股票代码
         from_date: 决策日期
-        hold_days: 持有天数
+        hold_days: 持有天数（**主窗口**）
         market: 市场类型
         with_extremes: 是否附带持有窗口内的最高/最低价（2026-10-01 追责系统 v1.1 加）。
             旧链路（T+N 收益验证）不需要极值，默认 False ⇒ **返回值与行为完全不变**；
             新链路的 `level` 型 claim（"触及目标价 / 不跌破支撑"）必须看窗口极值才能判，
             故在此**同一处**取，而不是在 resolver 里另写一份取数逻辑
             （两套取数口径必然漂移，是本项目的老教训）。
+        extra_holds: **附加窗口**的持有天数（v5 D3 方案 D，2026-10-13）。
+            例如主窗口 T+3 时传 `[1]` ⇒ 一次取数同时给出 T+1 结果，落在返回值的
+            `windows` 里。**不传则行为与改动前完全一致**（旧链路零影响）。
+            ★ 之所以要"一次取数算多窗口"：本函数每次调用都会重新 `get_kline`
+              （网络 IO），若让调用方对同一标的调两次，成本真翻倍；而本函数一次
+              就拉回整段 K 线，T+1 的 exit 就是 `base_idx + 1`，**数据本来就在**。
 
     Returns:
         {"pnl_pct": float, "hold_days": int, "direction": str,
-         "exit_date": str} 或 None
+         "exit_date": str, "truncated": bool, "hold_days_expected": int,
+         "windows": {str(hold_days): <同构子结果>}} 或 None
         with_extremes=True 时额外含 {"high": float, "low": float}
+        ★ `windows` 的键是**持有天数的十进制字符串**（"1"/"3"），
+          由 `chain/resolver` 映射成 horizon 标签（"T+1"/"T+3"）——
+          本函数只认天数，不认标签，避免把标签语义渗进通用取数层。
     """
     try:
         from app.data_sources.cn_stock import CNStockDataSource
@@ -169,28 +195,66 @@ def _get_actual_return(
         if exit_idx <= base_idx:
             return None
 
-        exit_close = klines[exit_idx].get("c", 0)
-        if not exit_close:
-            return None
-        pnl_pct = round((exit_close - base_close) / base_close * 100, 2)
-        actual_hold = exit_idx - base_idx
-        direction = classify_return(pnl_pct / 100)
+        # ── 单窗口计算（内部闭包）：主窗口与附加窗口**共用这一份逻辑** ──────
+        # 抽出来是为了让"多窗口"与"单窗口"走**完全相同**的算数口径 ——
+        # 若另写一份给 windows 用，两套口径必然漂移（老教训，不重犯）。
+        def _window(hold: int) -> Optional[Dict[str, Any]]:
+            """在**已取回的同一份** klines 上算单个 hold 的窗口结果。
 
-        out = {
-            "pnl_pct": pnl_pct,
-            "hold_days": actual_hold,
-            "direction": direction,
-            "exit_date": klines[exit_idx].get("t", "")[:10] if isinstance(klines[exit_idx], dict) else "",
-        }
-        if with_extremes:
-            # 窗口 = (base_idx, exit_idx]，**不含**决策日那根（预测是收盘后做出的）
-            window = klines[base_idx + 1: exit_idx + 1]
-            highs = [float(k.get("h") or 0) for k in window if isinstance(k, dict)]
-            lows = [float(k.get("l") or 0) for k in window if isinstance(k, dict)]
-            out["high"] = round(max(highs), 2) if highs else round(float(exit_close), 2)
-            out["low"] = round(min(lows), 2) if lows else round(float(exit_close), 2)
-            out["base_close"] = round(float(base_close), 2)
-            out["exit_close"] = round(float(exit_close), 2)
+            返回 None 表示该 hold 算不出来（数据不足/收盘价为 0），
+            调用方决定是「整体失败」还是「仅该窗口缺席」。
+            """
+            if hold <= 0:
+                return None
+            ei = min(base_idx + hold, len(klines) - 1)
+            if ei <= base_idx:
+                return None
+            ec = klines[ei].get("c", 0) if isinstance(klines[ei], dict) else 0
+            if not ec:
+                return None
+            pct = round((ec - base_close) / base_close * 100, 2)
+            w: Dict[str, Any] = {
+                "pnl_pct": pct,
+                "hold_days": ei - base_idx,
+                "hold_days_expected": hold,
+                # ★ 视界门②：实际根数 < 应有根数 ⇒ 窗口不完整，**不得定论**
+                "truncated": bool(ei - base_idx < hold),
+                "direction": classify_return(pct / 100),
+                "exit_date": (klines[ei].get("t", "")[:10]
+                              if isinstance(klines[ei], dict) else ""),
+            }
+            if with_extremes:
+                # 窗口 = (base_idx, ei]，**不含**决策日那根（预测是收盘后做出的）
+                seg = klines[base_idx + 1: ei + 1]
+                highs = [float(k.get("h") or 0) for k in seg if isinstance(k, dict)]
+                lows = [float(k.get("l") or 0) for k in seg if isinstance(k, dict)]
+                w["high"] = round(max(highs), 2) if highs else round(float(ec), 2)
+                w["low"] = round(min(lows), 2) if lows else round(float(ec), 2)
+                w["base_close"] = round(float(base_close), 2)
+                w["exit_close"] = round(float(ec), 2)
+            return w
+
+        out = _window(hold_days)
+        if out is None:
+            return None
+
+        # ── 附加窗口（v5 D3 方案 D）：**不再取数**，只在已取回的 klines 上多算几次
+        #    ⇒ 边际成本近零（省掉的是一整次 get_kline 网络往返）。
+        #    主窗口恒在；某个附加窗口算不出来就**缺席**，不牵连主窗口。
+        wins: Dict[str, Dict[str, Any]] = {}
+        want = {hold_days}
+        for _h in (extra_holds or []):
+            try:
+                _hi = int(_h)
+            except (TypeError, ValueError):
+                continue
+            if _hi > 0:
+                want.add(_hi)
+        for _h in sorted(want):
+            _w = _window(_h)
+            if _w is not None:
+                wins[str(_h)] = _w
+        out["windows"] = wins
         return out
 
     except Exception as e:
@@ -456,7 +520,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             cur.execute("SELECT name FROM qd_agent_weights WHERE layer = 'skill'")
             existing_skills = {row['name'] for row in cur.fetchall()}
 
-            from llm.qd_skills import QDSkillAdapter
+            from ..skills_adapter import QDSkillAdapter
             adapter = QDSkillAdapter()
             for skill_info in adapter.list_skills():
                 name = skill_info["name"]
@@ -485,7 +549,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             live_tools: set = set()
             try:
                 from pathlib import Path as _Path
-                from tools.base import ToolProvider as _TP
+                from ..tools._base import ToolProvider as _TP
                 _tp = _TP()
                 _tools_dir = _Path(__file__).resolve().parent.parent / "tools"
                 _tp.scan_directory(_tools_dir, domain="common", package_prefix="tools")
@@ -506,7 +570,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 for name in sorted(existing_tools - live_tools):
                     # 工具归并的权重迁移（2026-09-27）：旧名→新名，样本量加权并入后再删旧行，
                     # 避免 EvalNode 历史学习被冷启动清零。多旧名并入同新名时逐个累加。
-                    from tools.base import TOOL_ALIAS
+                    from ..tools._base import TOOL_ALIAS
                     target = TOOL_ALIAS.get(name)
                     if target and target in live_tools:
                         cur.execute("""
@@ -564,7 +628,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             # 护栏 2 真实现（2026-09-24 提智 0.3）：修订过的技能只统计**新版本**产出的 run
             # （exec_date ≥ 修订时刻）——设计 §3.17“新版本重新积累”此前只写了权重行 reset，
             # 本轮 update_weights 又用 90 日窗全量重算，重置恒被覆盖（护栏 2 名存实亡的一半）。
-            from chain.store import get_skill_revisions as _gsrs
+            from .store import get_skill_revisions as _gsrs
             _revisions = _gsrs()
 
             skill_trades: Dict[str, List[Dict]] = {}
@@ -732,7 +796,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             # 同步口径：只算有定论（correct IS NOT NULL）的链；含失败链路（链坏了
             # 也是权重信号，与 tool 层同款）；低样本不改权重（防误判）。
             # name 含 'unknown' 的不可归类链不产权重行（与酿造候选同口径排除）。
-            from chain.store import _sql_chain_norm
+            from .store import _sql_chain_norm
             _nk = _sql_chain_norm("t.name")
             cur.execute("""
                 SELECT %s AS chain_name,
@@ -780,8 +844,8 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
     _updated = stats["skill_updated"] + stats["factor_updated"] + stats["tool_updated"]
     if _updated > 0:
         try:
-            from chain.skill_brewer import maybe_revise
-            from chain.store import get_skill_weight_rows as _gswr
+            from .skill_brewer import maybe_revise
+            from .store import get_skill_weight_rows as _gswr
             _rev_results = maybe_revise(_gswr())
             if any(r.get("status") == "revised" for r in _rev_results):
                 stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
@@ -887,7 +951,7 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     #   ⚠ 旧系统 evaluate_pending 读的是 direction neutral / confidence 0.5 的
     #   污染数据，S2 已清空重来；此后有权重的样本全部来自本步产出的 resolutions。
     try:
-        from chain.resolver import resolve_due_claims
+        from .resolver import resolve_due_claims
         acc = resolve_due_claims(limit=200)
         result["accountability"] = {k: v for k, v in acc.items() if k != "details"}
         _worker_health["last_accountability"] = result["accountability"]
@@ -905,7 +969,7 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     # chain/weight_hints 在工具预选 / 技能选择处消费 ⇒ 判定结果真正影响下一次选择。
     # 独立 try：喂数失败不影响报告产出。
     try:
-        from chain.weight_feed import feed as _feed_weights
+        from .weight_feed import feed as _feed_weights
         wf = _feed_weights()
         result["weight_feed"] = wf
         _worker_health["last_weight_feed"] = wf
@@ -960,6 +1024,29 @@ def _seconds_until_post_market() -> float:
         from datetime import timedelta
         target += timedelta(days=1)
     return max(0, (target - now).total_seconds())
+def run_v5_collection() -> Dict[str, Any]:
+    """盘后采集钩子（v5 阶段 D4，2026-10-13）。
+
+    ★ 存在的理由：D1 情境帧与 D2 分层配额只有函数、**没人调用** ⇒ 数据一天都不攒。
+      而 C 类情境**不可重建**（今天没记，事后补不回来）。故在此挂进盘后 worker。
+
+    设计：**采集失败不影响 T+N 验证** —— 本函数吞掉一切异常只记日志，
+    盘后主线（验证 + 酿造）必须照跑。
+    """
+    try:
+        from .collector import run_daily_collection
+        r = run_daily_collection()
+        if r.get("ok"):
+            logger.info("[EvalWorker] v5 采集完成 as_of=%s", r.get("as_of"))
+        else:
+            logger.warning("[EvalWorker] v5 采集部分失败 as_of=%s errors=%s",
+                           r.get("as_of"), r.get("errors"))
+        return r
+    except Exception as e:
+        logger.warning("[EvalWorker] v5 采集中止（不影响验证）: %s", e)
+        return {"ok": False, "errors": [f"collector: {type(e).__name__}: {e}"]}
+
+
 def start_eval_worker():
     """启动后台评估 worker（盘后 15:30 每天运行一次，T+N 验证）。"""
     global _eval_thread, _eval_stop
@@ -1008,12 +1095,17 @@ def start_eval_worker():
                 _worker_health["last_error"] = str(e)
                 logger.warning("[EvalWorker] 盘后验证失败: %s", e)
 
+            # ── v5 盘后采集（阶段 D4）：情境帧 + 分层配额样本 ──────────────
+            # ★ 必须每天跑：C 类情境**不可重建**，今天没记事后补不回来。
+            #   放在验证之后、酿造之前：验证是主线，采集失败不影响主线。
+            run_v5_collection()
+
             # 技能酿造挂钩（2026-09-19 升级为触发策略 v2，重设计 §2.5）：
             # 每日调用一次 brew_skills(trigger="auto")，节拍由信号分内部决定
             # （信号就绪立即酿 / 7 日兜底 / 冷却），状态落 qd_agent_weights
             # （layer='brew_state'），重启不丢。worker 不再管理日期。
             try:
-                from chain.skill_brewer import brew_skills, refresh_skill_adapter
+                from .skill_brewer import brew_skills, refresh_skill_adapter
                 _brewed = brew_skills(trigger="auto")
                 if any(r.get("status") == "brewed" for r in _brewed):
                     refresh_skill_adapter()

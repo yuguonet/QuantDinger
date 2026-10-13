@@ -19,20 +19,14 @@ import re
 import threading
 from typing import Any, Optional
 
-import mimo_boot
+from . import mimo_boot
 
 from mimoagent.environments import get_environment
 
 try:
-    from qd_agent import (  # noqa: F401  兼容 re-export（message_queue 旧名）
-        QDAgent, QDAgentConfig,
-        bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now,
-    )
+    from .qd_agent import QDAgent, QDAgentConfig, bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now
 except ImportError:
-    from qd_agent import (  # noqa: F401
-        QDAgent, QDAgentConfig,
-        bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now,
-    )
+    from .qd_agent import QDAgent, QDAgentConfig, bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +189,7 @@ def _skill_score(desc_l: str, keys, msg_l: str, has_entity: bool) -> int:
 def _skill_weight(name: str) -> float:
     """技能历史权重（无记录 = 1.0 中性）。"""
     try:
-        from chain.weight_hints import weight_of
+        from .chain.weight_hints import weight_of
     except ImportError:
         return 1.0
     try:
@@ -299,7 +293,7 @@ class QDAgentService:
         # 实体解析结果（2026-10-01）：标的/领域/时间口径进上下文。
         # 澄清（clarify）不在这里处理——它在 _run_sync 里**短路反问**，不进执行。
         if resolve_info and resolve_info.get("ran"):
-            from resolvers.bridge import context_block
+            from .resolvers.bridge import context_block
             _rb = context_block(resolve_info)
             if _rb:
                 parts.append(_rb)
@@ -413,7 +407,7 @@ class QDAgentService:
         # pending 降权 / 失败案例只给坑不给修复路径（见其模块头注释）。
         # 选例按任务类型标签加权（taxonomy 六类，只调序不过滤）。
         try:
-            from utils import case_memory as _cm
+            from .utils import case_memory as _cm
             if _cm.case_memory_enabled():
                 _tags = _cm.classify_case_tags(message)
                 _cases = _cm.retrieve_cases(message, top_k=_cm.CASE_INJECT_TOP_K,
@@ -454,10 +448,10 @@ class QDAgentService:
         # 代价不对称——猜错标的/猜错时间窗 ⇒ 整份结论作废甚至据此下单；反问只花一轮。
         resolve_info: Optional[dict] = None
         try:
-            from resolvers.bridge import resolve as _resolve, clarify_enabled
+            from .resolvers.bridge import resolve as _resolve, clarify_enabled
         except ImportError:
             try:
-                from resolvers.bridge import resolve as _resolve, clarify_enabled
+                from .resolvers.bridge import resolve as _resolve, clarify_enabled
             except ImportError:
                 _resolve, clarify_enabled = None, None      # type: ignore
         if _resolve is not None:
@@ -470,7 +464,7 @@ class QDAgentService:
                 logger.info("[resolver] 澄清反问（不进执行）: %s",
                             str(resolve_info["clarify"])[:80])
                 try:
-                    from resolvers.bridge import context_block
+                    from .resolvers.bridge import context_block
                     _cb = context_block(resolve_info)
                 except Exception:
                     _cb = ""

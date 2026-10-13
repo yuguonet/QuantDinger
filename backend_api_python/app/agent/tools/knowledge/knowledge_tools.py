@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """search_knowledge —— 执行期知识检索工具（提智方案 三波 T1，2026-09-24，署名：OpenClaw agent）。
 
 来源：`agent_tizhi_final_plan_20260923.md` §三 三波 T1（search_knowledge）+
@@ -59,7 +59,7 @@ def _search_analysis_memory(query: str, count: int):
     if not dsn:
         return [], "历史结论库未配置（DATABASE_URL 缺失）"
     try:
-        from rag.postgres_fts import PostgresFTSRetriever
+        from ...rag.postgres_fts import PostgresFTSRetriever
         retr = PostgresFTSRetriever(dsn=dsn, top_k=max(1, count))
         docs = _run_sync(retr.retrieve(query, top_k=max(1, count))) or []
         out = []
@@ -80,7 +80,7 @@ def _search_analysis_memory(query: str, count: int):
 def _search_case_memory(query: str, count: int):
     """来源②：qd_agent_cases 案例库（延迟标签已定论优先）。返回 (rows, note)。"""
     try:
-        from utils.case_memory import retrieve_cases
+        from ...utils.case_memory import retrieve_cases
         cases = retrieve_cases(query, top_k=max(1, count))
         out = []
         for c in cases:

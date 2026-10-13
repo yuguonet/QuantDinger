@@ -19,7 +19,7 @@ import json
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from log import logger
+from ..log import logger
 
 
 def _conn():
@@ -36,7 +36,7 @@ def load_domain_policy() -> Dict[str, Dict[str, Any]]:
     读不到（表未建 / DB 不通）返回 `claims.DOMAIN_POLICY` 内置默认，
     保证"库没就绪时行为与配置一致"，不会退化成"全都入库"。
     """
-    from chain.claims import DOMAIN_POLICY
+    from .claims import DOMAIN_POLICY
     try:
         with _conn() as conn:
             cur = conn.cursor()
@@ -192,7 +192,7 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
         return []
 
     # ── 视界门①（时间门）：按交易日历校验「第 N 个交易日是否已走完」
-    from chain.claims import _HORIZON_DAYS, _nth_trading_day
+    from .claims import _HORIZON_DAYS, _nth_trading_day
     ready: List[Dict[str, Any]] = []
     for r in rows:
         days = _HORIZON_DAYS.get(r.get("horizon") or "")

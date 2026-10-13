@@ -17,7 +17,7 @@ import time as _time
 from datetime import date
 from typing import Any, Dict, Optional
 
-from log import logger
+from ..log import logger
 
 # 域策略缓存：避免每轮对话都查库（策略极少变，60s 足够）
 _POLICY_CACHE: Dict[str, Any] = {"ts": 0.0, "policy": None}
@@ -29,11 +29,11 @@ def _policy() -> Dict[str, Dict[str, Any]]:
     if _POLICY_CACHE["policy"] and now - float(_POLICY_CACHE["ts"] or 0) < _POLICY_TTL:
         return _POLICY_CACHE["policy"]
     try:
-        from chain.account_store import load_domain_policy
+        from .account_store import load_domain_policy
         pol = load_domain_policy()
     except Exception as e:
         logger.debug("[Intake] 读域策略失败，用内置默认: %s", e)
-        from chain.claims import DOMAIN_POLICY
+        from .claims import DOMAIN_POLICY
         pol = dict(DOMAIN_POLICY)
     _POLICY_CACHE["policy"] = pol
     _POLICY_CACHE["ts"] = now
@@ -48,14 +48,21 @@ def record_decision(*, user_query: str, answer: str, session_id: str = "",
 
     Returns:
         {"tracked": bool, "reason": str, "domain": str,
-         "decision_id": Optional[int], "claim_ids": list, "elapsed_ms": float}
+         "decision_id": Optional[int], "claim_ids": list, "claims": list,
+         "elapsed_ms": float}
+
+        ★ `claims` 是**抽取出的 claim 内容**（与 `claim_ids` 同序），v5 P2 接线加入：
+          C3P（`chain/c3p.py`）需要 claim 里的 `subject` / `subject_kind` / `horizon`
+          才能算 `p_base` 并按 claim 配对。只有 id 就只能回库再查一遍（多一次往返，
+          且顺序没有保证）。**纯增量字段**，不影响既有消费方。
     """
     t0 = _time.perf_counter()
     out: Dict[str, Any] = {"tracked": False, "reason": "", "domain": "",
-                           "decision_id": None, "claim_ids": [], "elapsed_ms": 0.0}
+                           "decision_id": None, "claim_ids": [], "claims": [],
+                           "elapsed_ms": 0.0}
     try:
-        from chain import claims as _claims
-        from chain import account_store as _as
+        from . import claims as _claims
+        from . import account_store as _as
         pol = _policy()
         domain = _claims.classify_domain(user_query, answer)
         out["domain"] = domain
@@ -83,7 +90,8 @@ def record_decision(*, user_query: str, answer: str, session_id: str = "",
             _as.refresh_decision_summary(decision_id)
         except Exception:
             pass
-        out.update({"tracked": True, "decision_id": decision_id, "claim_ids": ids})
+        out.update({"tracked": True, "decision_id": decision_id,
+                    "claim_ids": ids, "claims": list(extracted or [])})
         logger.info("[Intake] 入库 decision=%s domain=%s claims=%d",
                     decision_id, domain, len(ids))
     except Exception as e:                      # 旁路永不阻断主链

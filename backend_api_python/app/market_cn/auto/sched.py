@@ -15,6 +15,7 @@
 易错点:
   - end 时刻**含**在表内 (14:50~15:00/60s → 11 拍, 末拍即终审);
   - config.json schedule 段的键须与策略 key 一致, 未声明的策略用 ScanSpec 默认。
+  - 市场墙钟统一使用北京时间 (UTC+8)；不要依赖宿主时区或数据库会话时区。
 """
 from __future__ import annotations
 
@@ -51,6 +52,7 @@ def expand_times(windows, interval_sec, date=None):
         raise ValueError(f"interval_sec 必须 >=1 秒 (got {interval_sec}); <=0 会死循环")
 
     first, end = windows[0], windows[1]
+    # `date` 是北京时间市场日期；窗口本身是北京墙钟 HH:MM，不做宿主时区换算。
     d = date or today_str()
     t = datetime.strptime(f"{d} {first}", "%Y-%m-%d %H:%M")
     te = datetime.strptime(f"{d} {end}", "%Y-%m-%d %H:%M")
@@ -215,6 +217,7 @@ def daily_fire_ready(strategy_key, now_hm=None, date=None):
     判定链: ① fire_at 未到 → 等钟点; ② after_events 未齐 → 等数据
             (过 DAILY_FALLBACK_FIRE 放行, 打印缺失集); ③ 就绪。
     已扫描去重不在本函数 — 归 scheduler 的 qd_scheduler_done。
+    now_hm 是可注入的北京时间 HH:MM；缺省时取 TZ_CN 当前时间。
     """
     from datetime import datetime
 

@@ -360,7 +360,7 @@ def load_actual(win, keys=None):
     from datetime import datetime as _dt
     try:
         d0 = _dt.strptime(str(win[0])[:10], "%Y-%m-%d")
-        days = (_dt.now() - d0).days + 2
+        days = (_dt.now(TZ_CN).date() - d0.date()).days + 2
     except Exception:
         days = len(win) + 10
     for r in store.list_signals(days=days, strategies=list(keys) if keys else None):
@@ -1322,7 +1322,7 @@ def main(argv=None):
         from app.market_cn.auto import store as _st
         from datetime import datetime as _dt
         _n = _st.purge_stale_detail(("pre_confirm", "pre_ts", "pre_reason"), _st.S_BUY_TODAY,
-                                    _dt.now().strftime("%Y-%m-%d"))
+                                    _dt.now(TZ_CN).strftime("%Y-%m-%d"))
         txt += "\n清理过期预判标记(pre_confirm/pre_ts/pre_reason): %d 行" % _n
     print(txt)
     if a.out:

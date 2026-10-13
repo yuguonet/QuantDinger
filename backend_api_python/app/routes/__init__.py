@@ -68,6 +68,9 @@ def register_routes(app: Flask):
     app.register_blueprint(shichang_bp, url_prefix='/api/shichang')
     app.register_blueprint(_cards_bp, url_prefix='/api/shichang')
     app.register_blueprint(agent_bp)
+    # ★ 2026-10-13 P16：`/api/agent2`（v6 骨架 app/agentcore）已退役删除。
+    #   该路由注册原为「刻意不做 try/except 兜底」，故目录删除必须同步摘掉这里，
+    #   否则 Flask 启动当场 ImportError。前端对该前缀零调用，无影响。
     app.register_blueprint(analysis_bp)
     app.register_blueprint(stock_screener_bp, url_prefix='/api/stock-screener')
     app.register_blueprint(market_local_bp, url_prefix='/api/market-local')

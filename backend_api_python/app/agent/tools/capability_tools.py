@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 
 
 def _load_loader():
-    from capabilities import loader as _l
+    from ..capabilities import loader as _l
     return _l
 
 
@@ -81,10 +81,11 @@ def call_capability(name: str, arguments: dict = None) -> Dict[str, Any]:
         {"name": ..., "result": ...} 或 {"error": ...}
     """
     import importlib
+    from ..modpath import import_module
 
     loader = _load_loader()
     # 工具层 > 能力层：同名工具存在时硬拦，指向工具层
-    from tools.base import ToolProvider
+    from ._base import ToolProvider
     provider = ToolProvider.get_default()
     if provider is not None and name in provider:
         return {"error": f"工具层已有同名工具 {name}（工具层优先），请直接调用该工具"}
@@ -99,7 +100,7 @@ def call_capability(name: str, arguments: dict = None) -> Dict[str, Any]:
 
     mod_path, fn_name, timeout_s, max_chars = entry
     try:
-        fn = getattr(importlib.import_module(mod_path), fn_name)
+        fn = getattr(import_module(mod_path), fn_name)
     except Exception as e:
         return {"error": f"能力导入失败: {e}"}
     wrapped = loader._wrap_guards(fn, timeout_s, max_chars, fn_name)

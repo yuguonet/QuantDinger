@@ -37,8 +37,9 @@ def exemption_report(today=None) -> list:
       · 日期写错（解析失败）**视同逾期**，不许静默放过；
       · 逾期不自动清退（清退是人工动作），本函数只负责把事实摆到台面上。
     """
-    from datetime import date as _date
-    td = today or _date.today()
+    from datetime import date as _date, datetime as _datetime
+    from app.market_cn.auto.store import TZ_CN
+    td = today or _datetime.now(TZ_CN).date()
     out = []
     for key in sorted(FOLD_CONTRACT_EXEMPT):
         ent = FOLD_CONTRACT_EXEMPT[key]

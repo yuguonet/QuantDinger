@@ -48,28 +48,25 @@ HERE = Path(__file__).resolve()
 AGENT_DIR = HERE.parent.parent            # app/agent
 BACKEND_ROOT = HERE.parent.parent.parent.parent  # backend_api_python
 
-# 插两个目录：backend_api_python（让 `import app.*` 可用）+ app/agent（让裸名可用）。
-#
-# 【导入约定】agent 包内一律用**裸名**（`from chain.store import ...`），不用全名
-# `app.agent.chain.store`。原因：全名把包名硬编码进 300+ 处 import，一旦移动/重命名
-# 目录就得全量改；裸名只依赖这里一处 `__file__` 相对计算，移动时零改动。
-# 代价是 app/agent 下的 23 个顶层名（chain/tools/utils/log/memory/rag/llm/...）
-# 成为全局裸名 —— 因此 **AGENT_DIR 必须排在 BACKEND_ROOT/app 之前**，否则
-# `import utils` 会命中 app/utils。已实测与 site-packages 无同名冲突。
-for p in (str(BACKEND_ROOT), str(AGENT_DIR)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# 【2026-10-13·P5】只插 backend_api_python（让 `import app.*` 可用）。
+# 原本还要插 `app/agent`（让包内裸名可用）—— 那正是事故 M-1 的成因：
+# 同一份源码能同时以裸名 `chain.store` 与全名 `app.agent.chain.store`
+# 加载成两个 module 对象，模块级单例双份且状态互不可见。
+# 现在包内一律**相对导入**、包外一律**绝对导入**，本脚本自身也用绝对导入，
+# 因此不再需要把包目录塞进 sys.path。
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 _mimo_src = os.getenv("MIMOAGENT_SRC", "")
 if _mimo_src and _mimo_src not in sys.path:
     sys.path.insert(0, _mimo_src)
 
-import mimo_boot
+from app.agent import mimo_boot
 
 from mimoagent.models import TokenStats  # noqa: E402
 from mimoagent.environments import get_environment  # noqa: E402
 
-from qd_agent import QDAgent  # noqa: E402
+from app.agent.qd_agent import QDAgent
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -85,7 +82,7 @@ def _preselect_marker() -> str:
     ⇒ ScriptedModel 不再短路预选 ⇒ 所有按"第 N 次调用 = 第 N 个动作"编排的
     用例错位一格。故判据必须与常量绑定，不写死文案。
     """
-    from tools.tool_preselect import PRESELECT_SYSTEM as _ps
+    from app.agent.preselect import PRESELECT_SYSTEM as _ps
     return str(_ps).strip()[:16]
 
 
@@ -288,7 +285,7 @@ def _probe_tool_deps() -> tuple[bool, str]:
     其余错误类型（SyntaxError / cannot import name 等）一律不当缺件。
     """
     import re
-    from tools.base import _TOOL_MODULE_IMPORT_FAILURES
+    from app.agent.tools._base import _TOOL_MODULE_IMPORT_FAILURES
     missing: list[str] = []
     for entry in _TOOL_MODULE_IMPORT_FAILURES:
         m = re.search(r"No module named '([^']+)'", str(entry))
@@ -453,7 +450,7 @@ def test_7_service_facade():
     print("test 7: 服务门面（chat 契约 + 会话复用 + 记忆落史 + 预取注入）")
     import asyncio
     from types import SimpleNamespace
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     class _Mem:
         def __init__(self):
@@ -508,7 +505,7 @@ def test_7_service_facade():
 def test_8_context_awareness():
     print("test 8: 上下文感知（多轮连贯 + 时间注入 + wrap-up 预算感知）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     model = ScriptedModel([
         {"content": "第一轮回答完成。"},
@@ -531,7 +528,7 @@ def test_8_context_awareness():
 def test_9_step_budget_per_run():
     print("test 9: 步数预算按请求归零（回归：带上下文会话空结果退出）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     model = ScriptedModel([
         {"content": "", "tool_calls": [_tool_call("get_demo_quotes", {})]},   # 轮1: 步1
@@ -550,7 +547,7 @@ def test_9_step_budget_per_run():
 def test_10_empty_reply_fallback():
     print("test 10: 空回复兜底（reasoning-only → 轻推补结论）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     model = ScriptedModel([
         {"content": "", "reasoning_content": "模型思考中…"},   # 空正文
@@ -569,7 +566,7 @@ def test_11_prefetch_no_pollution():
     print("test 11: 预取防污染（无关记忆/检索不注入，回归：问跑马灯变行情跑马灯）")
     import asyncio
     from types import SimpleNamespace
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     class _Mem:
         async def add(self, sid, role, content):
@@ -597,7 +594,7 @@ def test_11_prefetch_no_pollution():
 def test_12_retry_independent_budget():
     print("test 12: 溯源重试独立预算（回归：主轮耗尽后重试瞬死）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     model = ScriptedModel([
         {"content": "", "tool_calls": [_tool_call("get_demo_quotes", {})]},
@@ -614,7 +611,7 @@ def test_12_retry_independent_budget():
 def test_13_empty_response_nudge():
     print("test 13: Empty assistant response 走轻推（回归：误判为截断）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     model = ScriptedModel([
         {"content": "", "tool_calls": []},   # 全空→基类抛 LimitsExceeded('Empty assistant response')
@@ -648,8 +645,8 @@ def test_14_demo_task_discipline():
 def test_16_meta_tools_mounted():
     print("test 16: 元工具必须挂进工具面（回归：web_search 只在元工具表，模型根本调不到）")
     import asyncio
-    from qd_service import QDAgentService
-    from tools.base import ToolProvider
+    from app.agent.qd_service import QDAgentService
+    from app.agent.tools._base import ToolProvider
 
     svc = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
                          agent_config={"tools": []})
@@ -667,7 +664,7 @@ def test_16_meta_tools_mounted():
 def test_17_tool_tiering():
     print("test 17: 工具分层（按需域默认不下发，激活后才下发）")
     import asyncio
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     svc = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
                          agent_config={"tools": []})
@@ -695,8 +692,8 @@ def test_17_tool_tiering():
 def test_18_activate_and_auto_activate():
     print("test 18: 激活通道（activate_tools 点名 + 未激活直调 fail-open）")
     import asyncio
-    from qd_service import QDAgentService
-    from tools.tool_discovery import search_tools, activate_tools
+    from app.agent.qd_service import QDAgentService
+    from app.agent.tools.tool_discovery import search_tools, activate_tools
 
     svc = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
                          agent_config={"tools": []})
@@ -728,8 +725,8 @@ def test_18_activate_and_auto_activate():
 def test_19_availability_probe():
     print("test 19: 工具可用性探测（结果进系统提示）")
     import asyncio
-    from qd_service import QDAgentService
-    from tools.availability import probe_tools
+    from app.agent.qd_service import QDAgentService
+    from app.agent.tools._availability import probe_tools
 
     info = probe_tools()
     check("探测返回结构化结果", isinstance(info, dict) and "web_search" in info, str(info)[:200])
@@ -751,7 +748,7 @@ def test_20_prefetch_trace():
     print("test 20: 预取留痕（注入/丢弃都落 trace 事件）")
     import asyncio
     from types import SimpleNamespace
-    from qd_service import QDAgentService
+    from app.agent.qd_service import QDAgentService
 
     class _Mem:
         async def add(self, sid, role, content):
@@ -848,7 +845,8 @@ def test_22_context_window_single_source():
     QD_CONTEXT_WINDOW），只改一个会打架，页脚分母和催收阈值对不上。
     """
     print("test 22: 上下文窗口单一口径 + 阈值留余量")
-    from qd_agent import QDAgentConfig, _context_window
+    # P3 拆分后 _context_window 住在 qd_config（单一口径源），不在 qd_agent
+    from app.agent.qd_config import QDAgentConfig, _context_window
     cfg = QDAgentConfig()
     win = cfg.compaction_context_window
     thr = cfg.compaction_threshold_tokens
@@ -871,11 +869,8 @@ def test_23_preselect_lint():
       R4 裁剪——与 plan 自述目标零相关 → 裁（保留面 >= MIN_FACE）
       R4b 作废——几乎全零相关且词典也无需求 → 整体作废（天气 +136% 的治法）
     """
-    from tools.tool_preselect import (
-        lint_selection, apply_lint, detect_domains, check_domain_dict,
-        get_tool_index, DATA_DOMAINS, MIN_FACE,
-    )
-    from tools.base import ToolProvider
+    from app.agent.preselect import lint_selection, apply_lint, detect_domains, check_domain_dict, get_tool_index, DATA_DOMAINS, MIN_FACE
+    from app.agent.tools._base import ToolProvider
 
     provider = ToolProvider.get_or_build()
     names = list(provider.get_functions())
@@ -941,33 +936,38 @@ def test_24_tool_grading():
       三级 能力层：capabilities/ 准入函数 → 域内无同功能工具时才用
 
     本用例专治两个真问题：
-      ① 管线函数被当工具——tool_preselect 的公开函数是给代码 import 的，
-         不是给模型调的；此前它们全部进了必选层（27 个里占 13 个）。
+      ① 管线函数被当工具——预选管线的公开函数是给代码 import 的，不是给模型
+         调的；此前它们住在 tools/ 自发现目录下，全部进了必选层（27 个里占 13 个）。
+         2026-10-13 P9 已**迁出扫描目录**到 `app/agent/preselect/`：名单式排除
+         （`_NOT_TOOLS`）要手工同步、忘了是静默的，移出目录才是根治。
       ② 能力层"有实现没接线"——register_capabilities 无调用点，且 admission
          缺失 ⇒ 能力层永不参与筛选。此处用**合成能力**验证让位与排序，
          免得接线后才发现规则是死的。
     """
-    from tools.base import ToolProvider
-    from tools.tool_preselect import (
-        build_catalog_grouped, capability_domain, lint_selection, apply_lint,
-        CAP_SECTION_NOTE, _NOT_TOOLS,
-    )
+    from app.agent.tools._base import ToolProvider
+    from app.agent.preselect import build_catalog_grouped, capability_domain, lint_selection, apply_lint, CAP_SECTION_NOTE
 
     provider = ToolProvider.get_or_build()
     common = set(provider.list_by_domain("common"))
 
     # ① 必选层里不得出现管线函数（它们是代码内部调用面，不是工具面）
-    #    ★ 判据用「模块实际公开函数」而不是 _NOT_TOOLS 名单：后者是人写的，
-    #      新增函数忘了登记时它会一起漏——那就测不出来了（自己验自己）。
+    #    ★ 判据用「模块实际公开函数」而不是任何名单：名单是人写的，新增函数
+    #      忘了登记时它会一起漏——那就测不出来了（自己验自己）。
     import inspect
-    from tools import tool_preselect as _tp
-    pub = {n for n, o in vars(_tp).items()
-           if inspect.isfunction(o) and getattr(o, "__module__", "") == _tp.__name__
-           and not n.startswith("_")}
-    leaked = sorted(common & pub)
-    check("必选层不含预选/lint 管线函数", not leaked, f"leaked={leaked}")
-    check("管线模块公开面已全部登记 _NOT_TOOLS", (pub - set(_NOT_TOOLS)) == set(),
-          f"未登记={sorted(pub - set(_NOT_TOOLS))}")
+    from app.agent.preselect import tool_preselect as _tp
+    from app.agent.preselect import preselect_cooc as _cooc
+    from app.agent.preselect import preselect_stats as _stats
+    registered = set(provider.get_tool_names())
+    for _mod, _label in ((_tp, "预选管线"), (_cooc, "共现权重"), (_stats, "观测计数器")):
+        pub = {n for n, o in vars(_mod).items()
+               if inspect.isfunction(o) and getattr(o, "__module__", "") == _mod.__name__
+               and not n.startswith("_")}
+        leaked = sorted(registered & pub)
+        check(f"{_label}的公开函数一律不是工具", not leaked, f"leaked={leaked}")
+    check("预选管线已移出 tools/ 自发现目录",
+          all(m.__name__.startswith("app.agent.preselect.")
+              for m in (_tp, _cooc, _stats)),
+          "/".join(m.__name__ for m in (_tp, _cooc, _stats)))
     check("必选层仍保留真工具（发现/记忆）",
           {"search_tools", "list_tools", "activate_tools", "recall"} <= common,
           str(sorted(common)))
@@ -1020,9 +1020,9 @@ def test_24_tool_grading():
     # ⑤ 能力层**真的接上了线**（2026-10-01 复制 admission.json 后补）
     #    此前 register_capabilities 有实现无调用方 + admission.json 不在仓库
     #    ⇒ 能力层双重死代码。这里锁死：有准入就必须能注册，且不得进必选层。
-    from qd_agent import CORE_TOOL_DOMAINS
-    from capabilities.loader import load_admitted_meta
-    from capabilities import register_capabilities
+    from app.agent.qd_agent import CORE_TOOL_DOMAINS
+    from app.agent.capabilities.loader import load_admitted_meta
+    from app.agent.capabilities import register_capabilities
     check("能力层不在必选层（三级而非一级）",
           "capability" not in CORE_TOOL_DOMAINS, str(CORE_TOOL_DOMAINS))
     admitted = load_admitted_meta()
@@ -1053,9 +1053,11 @@ def test_25_toolface_preload():
          "只有通用工具"的裸沙箱（09-19 故障机制）。预选空手时按域词典补核心子集，
          纯字符串匹配、零 LLM；**命中不了就一个不补**（天气问题不许被硬塞股票工具）。
     """
-    from tools.base import ToolProvider
-    from tools.tool_preselect import fallback_domain_tools
-    from qd_agent import warmup_tool_face, _ensure_capabilities, QDAgent
+    from app.agent.tools._base import ToolProvider
+    from app.agent.preselect import fallback_domain_tools
+    from app.agent.qd_agent import warmup_tool_face, QDAgent
+    # P3 拆分后 _ensure_capabilities 住在 qd_tool_face
+    from app.agent.qd_tool_face import _ensure_capabilities
 
     # ① 预热：done + 工具数 > 0，且重复调用不重扫（elapsed 沿用首次）
     w1 = warmup_tool_face()
@@ -1121,8 +1123,8 @@ def test_26_accountability_v11():
       ③ **多域通用留位**——域开关来自**配置**，把 finance 关掉后同样的问题
          产出 0 条 claim ⇒ 证明调用方没有 `if domain == 'finance'` 硬编码。
     """
-    from chain import claims as C
-    from chain.resolver import compute_deviation, verdict_by_rule
+    from app.agent.chain import claims as C
+    from app.agent.chain.resolver import compute_deviation, verdict_by_rule
 
     # ① 闸门：金融放行，天气/纯查询拦下
     q_fin = "帮我看看贵州茅台600519接下来三天怎么走"
@@ -1186,7 +1188,7 @@ def test_26_accountability_v11():
 
     # ⑤ 端到端入库（有 DB 才验；无 DB 不影响主结论）
     try:
-        from chain.intake import record_decision
+        from app.agent.chain.intake import record_decision
         r_fin = record_decision(user_query=q_fin, answer=a_fin, session_id="smoke26")
         r_weather = record_decision(user_query="今天北京天气怎么样",
                                     answer="北京今天晴，气温 22 度，适宜出行。",
@@ -1242,7 +1244,7 @@ def test_27_reset_wiring_observation():
     """
     # ① 复位入口：默认必须是 dry_run（防破坏）
     try:
-        from chain import reset as R
+        from app.agent.chain import reset as R
         d = R.reset_accountability(dry_run=True)
         check("追责复位默认 dry_run（不真删）",
               d.get("dry_run") is True and not d.get("deleted"), str(d)[:80])
@@ -1258,7 +1260,7 @@ def test_27_reset_wiring_observation():
     # ② 盘后接线：auto_evaluate 必须调用 v4 追责（否则闭环断）
     #    用源码 + 返回值双保险：源码锁"写了"，返回键锁"跑到了"
     import inspect
-    from chain import evaluator as EV
+    from app.agent.chain import evaluator as EV
     src = inspect.getsource(EV.auto_evaluate)
     check("盘后 auto_evaluate 已接 v4 追责（防断链回归）",
           "resolve_due_claims" in src, "auto_evaluate 源码无 resolve_due_claims")
@@ -1268,7 +1270,7 @@ def test_27_reset_wiring_observation():
     check("worker 健康视图含追责字段", "last_accountability" in health, str(list(health)))
 
     # ③ 空域观测：归类稳定 + 比例计算正确
-    from tools import preselect_stats as PS
+    from app.agent.preselect import preselect_stats as PS
     PS.reset()
     for _ in range(9):
         PS.record_selected("ok")
@@ -1283,7 +1285,7 @@ def test_27_reset_wiring_observation():
     check("样本足够后按阈值给结论", "健康" in PS.report()["verdict"], PS.report()["verdict"])
 
     # ④ 空手原因归类稳定（改文案不能断统计）
-    from qd_agent import QDAgent
+    from app.agent.qd_agent import QDAgent
     check("_empty_route 归类：闸门",
           QDAgent._empty_route({"reason": "无领域特征，跳过预选(闸门)"}) == "gate", "")
     check("_empty_route 归类：模型未点名",
@@ -1294,7 +1296,7 @@ def test_27_reset_wiring_observation():
           QDAgent._empty_route({"reason": "某种全新文案"}) == "unknown", "")
 
     # ⑤ judge 观测：默认未启用时应明确提示，且一致率口径正确
-    from chain import judge_stats as JS
+    from app.agent.chain import judge_stats as JS
     JS.reset()
     j0 = JS.report()
     check("judge 未启用时给出明确结论（而非静默 0）",
@@ -1376,7 +1378,7 @@ def test_28_closed_loop_consumers():
     """
     # ① 权重消费端：快照可读、低权重判定、提示段可生成
     try:
-        from chain import weight_hints as WH
+        from app.agent.chain import weight_hints as WH
         WH.reset()
         snap = WH.snapshot(force=True)
         check("权重快照含四层(skill/tool/chain/domain)",
@@ -1396,7 +1398,7 @@ def test_28_closed_loop_consumers():
 
     # ①b 追责→权重喂数：dry_run 必须不写库
     try:
-        from chain import weight_feed as WF
+        from app.agent.chain import weight_feed as WF
         r = WF.feed(dry_run=True)
         check("追责→权重 dry_run 不写库",
               r.get("updated") == {} and "would_update" in r, str(r)[:80])
@@ -1407,7 +1409,7 @@ def test_28_closed_loop_consumers():
 
     # ② resolvers 接线：标的解析 + 歧义反问（防错的核心）
     try:
-        from resolvers.bridge import resolve, context_block
+        from app.agent.resolvers.bridge import resolve, context_block
         i1 = resolve("帮我分析一下贵州茅台")
         # env=stock_directory：名录库（stock_basic_info）不可用时解析不到标的属缺件
         check("resolvers 已接线：口语问法能解析出标的",
@@ -1452,7 +1454,7 @@ def test_28_closed_loop_consumers():
 
     # ④ 技能选择：金融问法命中 / 跑马灯不得注入（文不对题回归防线）
     try:
-        from qd_service import _skill_score, _FINANCE_GATE
+        from app.agent.qd_service import _skill_score, _FINANCE_GATE
         keys_f = {w for w in "帮我分析一下贵州茅台"
                   if False} | {"分析", "茅台", "贵州"}
         desc_ana = "对单只a股标的开展多周期技术面、资金面、基本面综合诊断".lower()
@@ -1475,41 +1477,48 @@ def test_29_module_single_instance():
     TraceCollector 收集器 / weight_hints 缓存 / capabilities 缓存）全部双份且
     状态互不可见。
 
-    现行约定：**统一裸名**（`from chain.store import ...`）。理由是全名把包名硬编码
-    进 300+ 处 import，移动/重命名目录时移植成本极高；裸名只依赖 `__file__` 相对
-    计算的一处 bootstrap。因此判据与长名方案**相反**，共五条：
-      ① sys.path 必须含 app/agent（裸名可解析的前提）
-      ② sys.modules 不得出现 `app.agent.*` 子模块长名键（出现=混用=双份）
-      ③ 裸名必须真的解析到 app/agent 下（防 `utils` 命中 app/utils）
+    现行约定（2026-10-13·P5 改）：**包内相对导入 + 包外绝对导入，本目录不进
+    sys.path**。裸名方案已被证明是 M-1 的直接成因（两种写法 ⇒ 两个 module 对象），
+    故判据整体反转：
+      ① sys.path **不得**含 legacy 目录（裸名不该再成立）
+      ② sys.modules 里 legacy 模块**只能**以 `app.agent.*` 出现
+      ③ 不得存在裸名副本（出现即说明有人又把目录塞回了 sys.path）
       ④ 同一文件不得对应多个 module 名
       ⑤ 重复 import 拿到同一 module 对象
     """
-    print("\n[test_29] 模块单实例（M-1 防复发·裸名方案）")
+    print("\n[test_29] 模块单实例（M-1 防复发·相对/绝对导入方案）")
     _agent_dir = os.path.normcase(os.path.abspath(str(AGENT_DIR)))
 
     _on_path = [p for p in sys.path
                 if p and os.path.normcase(os.path.abspath(str(p))) == _agent_dir]
-    check("app/agent 目录在 sys.path（裸名导入的前提）", bool(_on_path), str(sys.path[:3]))
+    check("legacy 目录**不在** sys.path（裸名不该再成立）",
+          not _on_path, str(_on_path[:2]))
 
-    # `app.agent` 包本身允许存在（bootstrap 会 import 它，其 __init__ 无状态），
-    # 但任何 `app.agent.<子模块>` 长名键都意味着两种写法混用 ⇒ 必然双份。
-    _long_mod = [n for n in sys.modules
-                 if n.startswith("app.agent.") and n != "app.agent"]
-    check("sys.modules 无 app.agent.* 子模块长名键（防裸名/全名双份）",
-          not _long_mod, ",".join(sorted(_long_mod)[:5]))
+    # 裸名副本：这些顶层名若出现在 sys.modules，说明注入回潮 ⇒ M-1 风险
+    _bare = [n for n in ("chain", "tools", "utils", "log", "memory", "rag",
+                         "qd_agent", "qd_service", "agent", "trace_collector",
+                         "capabilities", "cron", "skills", "resolvers")
+             if n in sys.modules]
+    check("sys.modules 无裸名副本（防相对/裸名双份）",
+          not _bare, ",".join(sorted(_bare)[:5]))
 
-    _wrong = []
-    for _n in ("chain", "tools", "utils", "log", "memory", "rag", "llm",
-               "qd_agent", "qd_service", "agent", "trace_collector"):
-        _m = sys.modules.get(_n)
-        _f = getattr(_m, "__file__", None) if _m is not None else None
-        if not _f:
-            continue
-        # 包（chain）的 __file__ 是 .../chain/__init__.py，故用 startswith 而非等于
-        if not os.path.normcase(os.path.abspath(_f)).startswith(_agent_dir + os.sep):
-            _wrong.append(f"{_n}->{_f}")
-    check("裸名模块解析到 app/agent 下（防 utils 命中 app/utils）",
-          not _wrong, ";".join(_wrong[:3]))
+    # legacy 模块必须统一以 app.agent.* 出现
+    _legacy_mods = [n for n in sys.modules if n.startswith("app.agent.")]
+    _odd = [n for n in sys.modules
+            # ★ 必须带点：形如 `app.agentxxx.*` 的邻居包同样以 "app.agent" 开头
+            #   但并非本包模块，不带点会把它们算进来。
+            #   （P6~P15 期间的邻居是 `app.agentcore.*`，已于 P16 退役归档；
+            #    判据本身与具体邻居无关，保留"必须带点"这一条即可。）
+            # ★ 但包根 `app.agent` 自己**没有点** —— 只写 startswith("app.agent.")
+            #   会把包根误判成"没走全名的双份"（P6 实测：这一项当场变红）。
+            #   所以包根要单独放行：它是合法的全名，不是裸名副本。
+            if n and n != "app.agent" and not n.startswith("app.agent.")
+            and n not in ("__main__", "__mp_main__")   # 脚本自身被载入，不算双份
+            and getattr(sys.modules[n], "__file__", None)
+            and os.path.normcase(os.path.abspath(str(sys.modules[n].__file__)))
+            .startswith(_agent_dir + os.sep)]
+    check("legacy 模块统一以 app.agent.* 命名", not _odd,
+          ",".join(sorted(_odd)[:5]) or f"(已在册 {len(_legacy_mods)} 个)")
 
     _byfile = {}
     for _name, _m in list(sys.modules.items()):
@@ -1528,10 +1537,9 @@ def test_29_module_single_instance():
 
     try:
         import importlib
-        _m1 = sys.modules.get("qd_agent")
-        _m2 = importlib.import_module("qd_agent")
-        check("重复 import 拿到同一 module 对象",
-              _m1 is not None and _m1 is _m2, str(_m1))
+        _m1 = importlib.import_module("app.agent.qd_agent")
+        _m2 = importlib.import_module("app.agent.qd_agent")
+        check("重复 import 拿到同一 module 对象", _m1 is _m2, str(_m1))
     except Exception as e:
         check("重复 import 拿到同一 module 对象", False, f"{type(e).__name__}: {e}")
 
@@ -1550,7 +1558,7 @@ def test_30_toolface_import_health():
     """
     print("\n[test_30] 工具面导入健康（防静默降级）")
     try:
-        from tools.base import ToolProvider, _TOOL_MODULE_IMPORT_FAILURES
+        from app.agent.tools._base import ToolProvider, _TOOL_MODULE_IMPORT_FAILURES
     except Exception as e:
         check("可导入 ToolProvider", False, f"{type(e).__name__}: {e}")
         return
@@ -1563,22 +1571,23 @@ def test_30_toolface_import_health():
 
     try:
         _n = len(ToolProvider.get_or_build().get_functions())
-        # 基线 101（含能力层 40）；下调阈值留出正常增删余量，但能挡住成片掉模块
-        check(f"工具面数量充足（{_n} ≥ 95）", _n >= 95, str(_n), env="tool_deps")
+        # 基线 101（含能力层 40）；下调阈值留出正常增删余量，但能挡住成片掉模块。
+        # ★ 2026-10-13 P9 基线变更 -5：`preselect_stats` 迁出 tools/ 自发现目录后，
+        #   其 5 个统计函数（report / reset / record_selected / record_empty_face /
+        #   empty_rate）不再被注册成"模型可调工具"——它们本来就是代码调用面
+        #   （`reset` 能让模型清空观测计数器，是实打实的洞）。工具面 97 → 92，
+        #   阈值同步 95 → 90；**不是**为了躲这条检查，是这 5 个本就不该计数。
+        check(f"工具面数量充足（{_n} ≥ 90）", _n >= 90, str(_n), env="tool_deps")
     except Exception as e:
         check("工具面数量充足", False, f"{type(e).__name__}: {e}")
 
-    # 顺序判据：app/agent 必须压在 app/ 之前，且唯一（否则裸名解析随时可能错位）
+    # 顺序判据（2026-10-13·P5 反转）：legacy 目录**不得**出现在 sys.path。
+    # 旧判据是"必须压在 app/ 之前"—— 那是在为裸名导入服务，而裸名正是 2026-10-02
+    # 工具面 101→91 那次静默降级的成因。改造后不需要、也不允许。
     _agent_dir = os.path.normcase(os.path.abspath(str(AGENT_DIR)))
-    _app_dir = os.path.dirname(_agent_dir)
     _i_agent = [i for i, p in enumerate(sys.path)
                 if p and os.path.normcase(os.path.abspath(str(p))) == _agent_dir]
-    _i_app = [i for i, p in enumerate(sys.path)
-              if p and os.path.normcase(os.path.abspath(str(p))) == _app_dir]
-    check("app/agent 在 sys.path 中唯一（避免重复条目）", len(_i_agent) == 1, str(_i_agent))
-    check("app/agent 严格排在 app/ 之前（防 import utils 命中 app/utils）",
-          bool(_i_agent) and (not _i_app or _i_agent[0] < _i_app[0]),
-          f"agent={_i_agent} app={_i_app}")
+    check("legacy 目录不在 sys.path（裸名导入已废除）", not _i_agent, str(_i_agent))
 
 
 def test_31_startup_bare_imports():
@@ -1646,10 +1655,8 @@ def test_32_skill_injection_progressive():
     """
     print("\n[test_32] 技能注入渐进式加载（F1/F2 防复发）")
     try:
-        from qd_service import (QDAgentService as _Svc,
-                                _skill_block as _blk,
-                                _SKILL_BODY_CAP as _CAP)
-        from llm.qd_skills import QDSkillAdapter
+        from app.agent.qd_service import QDAgentService as _Svc, _skill_block as _blk, _SKILL_BODY_CAP as _CAP
+        from app.agent.skills_adapter import QDSkillAdapter
     except Exception as e:
         check("可导入 qd_service / qd_skills", False, f"{type(e).__name__}: {e}")
         return
@@ -1727,7 +1734,7 @@ def test_33_skill_dispatch_and_plan_lint():
 
     # ── B① run_skill 进了工具面 ──
     try:
-        from tools.base import ToolProvider
+        from app.agent.tools._base import ToolProvider
         _faces = ToolProvider.get_or_build().get_functions()
         check("run_skill 已进工具面（主 agent 才派得出去）", "run_skill" in _faces,
               ",".join(sorted(_faces)[:5]))
@@ -1736,7 +1743,7 @@ def test_33_skill_dispatch_and_plan_lint():
         return
 
     try:
-        from tools import skill_tools as _st
+        from app.agent.tools import skill_tools as _st
     except Exception as e:
         check("可导入 tools.skill_tools", False, f"{type(e).__name__}: {e}")
         return
@@ -1765,7 +1772,7 @@ def test_33_skill_dispatch_and_plan_lint():
     # ── B④/B⑤ 分层归属 + 降级后仍拿得到 ──
     try:
         import asyncio
-        from qd_service import QDAgentService
+        from app.agent.qd_service import QDAgentService
         _svc33 = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
                                 agent_config={"tools": []})
         asyncio.run(_svc33.chat("hi", session_id="__t33__"))
@@ -1785,7 +1792,7 @@ def test_33_skill_dispatch_and_plan_lint():
 
     # ── A⑥/A⑦ 计划残留 → 落 trace 事件 ──
     try:
-        from qd_agent import QDAgent
+        from app.agent.qd_agent import QDAgent
     except Exception as e:
         check("可导入 qd_agent", False, f"{type(e).__name__}: {e}")
         return
@@ -1851,13 +1858,15 @@ def test_34_case_memory_wiring():
 
     _agent_py = os.path.join(str(AGENT_DIR), "qd_agent.py")
     _svc_py = os.path.join(str(AGENT_DIR), "qd_service.py")
+    # P3 拆分后 _finish_collector 住在 qd_aftercare.py（不再在 qd_agent.py）
+    _after_py = os.path.join(str(AGENT_DIR), "qd_aftercare.py")
     check("写入侧已接线：_finish_collector 后置调 _record_case → record_case",
-          _wired(_agent_py, "self._record_case(", "case_memory.record_case("), "")
+          _wired(_after_py, "self._record_case(", "case_memory.record_case("), "")
     check("注入侧已接线：_prefetch 调 format_case_injection",
           _wired(_svc_py, "format_case_injection(", "retrieve_cases("), "")
 
     try:
-        from utils import case_memory as _cm
+        from app.agent.utils import case_memory as _cm
     except Exception as e:
         check("case_memory 可导入", False, f"{type(e).__name__}: {e}")
         return
@@ -1899,7 +1908,7 @@ def test_34_case_memory_wiring():
     # ④ 端到端（monkeypatch 检索/入库，不依赖 DB；需 mimoagent，与全仓同前置）
     try:
         import asyncio
-        from qd_service import QDAgentService
+        from app.agent.qd_service import QDAgentService
     except Exception as e:
         print(f"  [SKIP] 端到端不可用: {type(e).__name__}: {e}")
         return
@@ -2018,7 +2027,7 @@ def test_35_returns_contract_archive():
 
     # 替代机制必须活着：Returns: 段确实并进 schema description（否则归档=能力丢失）
     try:
-        from tools.base import func_to_openai_schema
+        from app.agent.tools._base import func_to_openai_schema
 
         def _demo(x: int) -> dict:
             """演示工具。
@@ -2217,8 +2226,7 @@ def test_38_exec_skill_dispatch_card():
     """
     print("\n[test_38] 执行型技能分发卡片（不注正文）")
     try:
-        from qd_service import (_executable_skills, _dispatch_card,
-                                QDAgentService as _Svc)
+        from app.agent.qd_service import _executable_skills, _dispatch_card, QDAgentService as _Svc
     except Exception as e:
         check("可导入 qd_service 分发卡片件", False, f"{type(e).__name__}: {e}")
         return
@@ -2315,7 +2323,7 @@ def test_39_skill_weight_multiplier():
     """
     print("\n[test_39] 技能权重排序分乘子（G 验收）")
     try:
-        import qd_service as QS
+        from app.agent import qd_service as QS
     except Exception as e:
         check("可导入 qd_service", False, f"{type(e).__name__}: {e}")
         return
@@ -2356,12 +2364,100 @@ def test_39_skill_weight_multiplier():
 
         # ④ 阈值消费原始词典分（源码防回退）
         import inspect as _inspect
-        from qd_service import QDAgentService as _Svc
+        from app.agent.qd_service import QDAgentService as _Svc
         _src = _inspect.getsource(_Svc._prefetch)
         check("注入阈值取原始词典分（ranked[0][1]，权重只调序不过滤）",
               "ranked[0][1]" in _src and "_rank_skills(" in _src, "")
     finally:
         QS._skill_score, QS._skill_weight = orig_score, orig_weight
+
+
+def test_40_c3p_wiring_and_r2_guard():
+    """v5 **P2 接线**验收（2026-10-13）：C3P 的 ②③ 段真的接进生产链路了吗。
+
+    背景（v3 附录 F 偏差核对）：`evidence.build_evidence()` / `aggregator.aggregate()` /
+    `aggregator.record_pair()` **生产代码零调用方**，`case_memory.record_case(..., evidence=)`
+    参数就绪却没人传 ⇒ `p_final` 从未被真实产出、Δp 一条都没落过。
+
+    本用例守五件事（都是"静态可证"的接线事实，不依赖网络与 DB）：
+      ① `chain/c3p.py` 存在且可导入；
+      ② `_finish_collector` 的调用顺序是 intake → c3p → record_case
+         （顺序错了就没有 claim_id，或 evidence 传不到案例记忆）；
+      ③ `record_case(` 调用**带** `evidence=`（P1-2 缺的写侧）；
+      ④ 红线 **R2**：`app/watchlist/**` 不得反向 import agent 的 chain；
+      ⑤ `c3p.py` 代码里不得出现反馈信号表名（基线不得接入自己的历史战绩）。
+    """
+    print("\n[test_40] C3P 接线 + 红线 R2 守卫（v5 P2）")
+    from pathlib import Path as _P
+
+    _agent = _P(__file__).resolve().parents[1]
+
+    # ① c3p 存在且可导入
+    try:
+        from app.agent.chain import c3p as _c3p
+        check("① chain/c3p.py 存在且可导入", hasattr(_c3p, "run_for_decision")
+              and hasattr(_c3p, "p_base_of") and hasattr(_c3p, "extract_evidence"), "")
+    except Exception as e:
+        check("① chain/c3p.py 存在且可导入", False, f"{type(e).__name__}: {e}")
+        return
+
+    # ② 收尾钩子顺序：intake → c3p → record_case
+    try:
+        import inspect as _inspect
+        # P3 拆分后 _finish_collector 住在 qd_aftercare.AftercareMixin
+        from app.agent.qd_aftercare import AftercareMixin as _A
+        _src = _inspect.getsource(_A._finish_collector)
+        i_acc = _src.find("_intake_accountability(")
+        i_c3p = _src.find("_c3p_pipeline(")
+        i_case = _src.find("_record_case(")
+        check("② 收尾顺序 intake → c3p → record_case（c3p 夹在中间）",
+              i_acc >= 0 and i_c3p > i_acc and i_case > i_c3p,
+              f"acc={i_acc} c3p={i_c3p} case={i_case}")
+    except Exception as e:
+        check("② 收尾顺序 intake → c3p → record_case（c3p 夹在中间）", False,
+              f"{type(e).__name__}: {e}")
+
+    # ③ record_case 调用必须带 evidence=（P1-2 写侧）
+    #    用 inspect 取整个方法源码再断言 —— 按 ")" 切会撞上嵌套调用（如
+    #    classify_case_tags(query, message)），是典型的"判据写脆"。
+    try:
+        import re as _re
+        from app.agent.qd_agent import QDAgent as _A3
+        _rsrc = _inspect.getsource(_A3._record_case)
+        # ★ 判据必须"值是从 c3p 流过来的"，不能只匹配 `evidence=` 这几个字符 ——
+        #   否则 `evidence=None` 也能蒙混过关（变异检验 M6 抓到的就是这个洞）。
+        _m = _re.search(r"evidence\s*=\s*([A-Za-z_][\w.]*)", _rsrc)
+        check("③ record_case 的 evidence 取自 c3p（不是常量 None）",
+              bool(_m) and _m.group(1) != "None" and "last_c3p" in _rsrc,
+              f"evidence 实参={_m.group(1) if _m else '未找到'}（必须是 c3p 的产物）")
+    except Exception as e:
+        check("③ record_case 的 evidence 取自 c3p（不是常量 None）", False,
+              f"{type(e).__name__}: {e}")
+
+    # ④ 红线 R2：p_base 路径禁止反向依赖 agent 的 chain
+    _wl = _P(__file__).resolve().parents[3] / "app" / "watchlist"
+    _bad = []
+    for _f in sorted(_wl.glob("*.py")):
+        try:
+            _t = _f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for _pat in ("app.agent.chain", "from chain import", "import chain",
+                     "from chain.", "app.agent.utils"):
+            if _pat in _t:
+                _bad.append(f"{_f.name}:{_pat}")
+    check("④ 红线 R2：app/watchlist 未反向 import agent chain（基线不得接入反馈）",
+          not _bad, "; ".join(_bad[:5]))
+
+    # ⑤ c3p 代码里不得出现反馈信号表名
+    _body = (_agent / "chain" / "c3p.py").read_text(encoding="utf-8").split('"""', 2)[-1]
+    _hit = [t for t in ("qd_agent_weights", "exp_cond_calib", "exp_pair") if t in _body]
+    check("⑤ c3p 代码里无反馈信号表名（红线 R2）", not _hit, "; ".join(_hit))
+
+    # ⑥ 接线后仍保持"无系数 ⇒ 不动"的 fail-open 语义
+    _r = _c3p.run_for_decision(user_query="x", answer="y", tracked=False)
+    check("⑥ 旁路跳过时给得出 reason（不静默）",
+          _r.get("ran") is False and _r.get("reason") == "not_tracked", str(_r)[:160])
 
 
 if __name__ == "__main__":
@@ -2403,7 +2499,8 @@ if __name__ == "__main__":
               test_36_capability_bench,
               test_37_dispatch_ab_harness,
               test_38_exec_skill_dispatch_card,
-              test_39_skill_weight_multiplier):
+              test_39_skill_weight_multiplier,
+              test_40_c3p_wiring_and_r2_guard):
         try:
             t()
         except Exception as e:

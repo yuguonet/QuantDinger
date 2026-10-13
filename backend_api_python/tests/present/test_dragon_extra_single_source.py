@@ -21,10 +21,12 @@ import os
 
 DRAGON = os.path.join("app", "market_cn", "auto", "strategies", "dragon_callback.py")
 BASE_KEYS = {
-    "board", "lu_date", "pullback_days", "signal_chg", "signal_vol_r",
+    "label", "board", "lu_date", "pullback_days", "signal_chg", "signal_vol_r",
     "signal_price", "entry_vol_r", "buy_mode", "turnover_anchor",
     "turnover_anchor_total",
 }
+#: `_signal` 的 Progress payload 允许手写的键（非 extra 键, 仅供折叠事件展示）
+PAYLOAD_KEYS = {"label"}
 MACRO_KEYS = {
     "gap_from_peak", "streak_h", "lu_gain20", "d0_vs_ma20", "pullback_depth",
     "yin_ratio", "tech_score", "tech_rsi", "tech_roc", "tech_psy",
@@ -96,7 +98,7 @@ def test_fold_signal_has_no_handwritten_extra_keys():
     tree = ast.parse(_src(DRAGON))
     fn = _fn(tree, "_signal")
     assert fn is not None, "折叠 _signal 不见了"
-    leaked = _extra_key_writes(fn)
+    leaked = _extra_key_writes(fn) - PAYLOAD_KEYS
     assert not leaked, (
         "折叠 _signal 仍在手写 extra 键 %s —— 应全部来自 `_dragon_extra_base` "
         "+ build_signal(宏)；双写即漂移（审计 B3）" % sorted(leaked))
@@ -109,5 +111,5 @@ def test_macro_fields_and_base_are_disjoint_and_complete():
     assert fkeys == MACRO_KEYS, "宏 signal.fields 键集变了: %s" % sorted(fkeys)
     assert not (fkeys & BASE_KEYS), (
         "宏与基座键重叠 %s —— 同一键两处赋值，谁后谁生效不可测" % sorted(fkeys & BASE_KEYS))
-    assert len(fkeys | BASE_KEYS) == 20, (
+    assert len(fkeys | BASE_KEYS) == 21, (
         "extra 全集应为 20 键，实际 %d" % len(fkeys | BASE_KEYS))

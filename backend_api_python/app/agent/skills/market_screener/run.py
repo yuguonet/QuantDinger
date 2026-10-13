@@ -19,19 +19,11 @@ LLM 只能消费别人替它算好的结论 —— 这就是「自由度太小�
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from log import logger
+from ...log import logger
 
-from skills.market_screener._helpers import (
-    select_strategy, build_report, resolve_names,
-    profile_candidates as _profile_candidates,
-    filter_candidates as _filter_candidates,
-    tech_summary, predict_one, _mood_regime,
-)
-from skills.market_screener._facts import (
-    candidate_pool, market_state as _market_state, multitimeframe as _multitimeframe,
-    detect_patterns as _detect_patterns, POOL_SOURCES, _PATTERN_PARAMS_DEFAULT,
-)
-from skills.market_screener.common import SkillResult, fetch_kline
+from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime
+from ._facts import candidate_pool, market_state as _market_state, multitimeframe as _multitimeframe, detect_patterns as _detect_patterns, POOL_SOURCES, _PATTERN_PARAMS_DEFAULT
+from .common import SkillResult, fetch_kline
 
 
 # 单票深挖的总等待上限：外部源（龙虎榜/板块/资金）偶发挂起，不能拖死整轮选股
@@ -424,7 +416,7 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
             return name, None
 
     def _quote():
-        from tools.finance.data_tools import get_realtime_quote
+        from ...tools.finance.data_tools import get_realtime_quote
         return get_realtime_quote(code)
 
     def _bars():
@@ -435,11 +427,11 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
         return flow_summary(code)
 
     def _fund_hist():
-        from tools.finance.fund_flow_tools import get_fund_flow
+        from ...tools.finance.fund_flow_tools import get_fund_flow
         return get_fund_flow(scope="stock_daily", codes=code, days=10)
 
     def _theme():
-        from tools.finance.sector_analysis_tools import get_stock_sector_info
+        from ...tools.finance.sector_analysis_tools import get_stock_sector_info
         return get_stock_sector_info(code)
 
     def _zt():
@@ -457,11 +449,11 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
         return hist
 
     def _dragon():
-        from tools.finance.dragon_tools import get_dragon_tiger
+        from ...tools.finance.dragon_tools import get_dragon_tiger
         return get_dragon_tiger(codes=code, detail=True)
 
     def _boards():
-        from tools.finance.sector_analysis_tools import get_sector_board
+        from ...tools.finance.sector_analysis_tools import get_sector_board
         return get_sector_board(view="ranking", top_n=30)
 
     tasks = [_quote, _bars, _flow, _theme, _zt]

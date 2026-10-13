@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """chain/skill_brewer.py — 技能酿造器（2026-09-18，用户方案）
 
 思路：高频且回测验证效果好的节点树（qd_agent_traces），周期性由 LLM 编译成
@@ -53,7 +53,7 @@ def _brew_locked(locked_result):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            from chain.store import acquire_run_lock, release_run_lock
+            from .store import acquire_run_lock, release_run_lock
             if not acquire_run_lock(_BREW_LOCK_NAME, _BREW_LOCK_TTL):
                 logger.warning("[Brewer] %s 正被其他进程持有（eval worker 与手动入口并发？）→ 本次跳过",
                                _BREW_LOCK_NAME)
@@ -235,7 +235,7 @@ BREW_FALLBACK_DAYS = 7      # 距上次尝试达到该天数 → 兜底重试（
 
 
 @_brew_locked(locked_result=[])
-def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> list:
+def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> list:
     """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto_*/SKILL.md。
 
     触发分派（重设计 §2.5，2026-09-19）：
@@ -247,7 +247,6 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
       trigger="manual" → 原 query_brew_candidates 全量门槛（手动入口语义不变）
 
     Args:
-        llm: LLMBase 实例；None 时自动创建。仅同步上下文调用。
         min_runs: 酿造候选的最小 run 数。
         limit: 单轮最多酿造几个技能。
         trigger: auto=混合信号触发；manual=手动全量门槛。
@@ -255,9 +254,7 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
     Returns:
         酿造结果列表 [{"chain_name", "status", ...}]，失败项带 error。
     """
-    from chain.store import (query_brew_candidates, query_brew_ready,
-                             get_run_tree_digest, get_tool_weights,
-                             get_brew_states, set_brew_state)
+    from .store import query_brew_candidates, query_brew_ready, get_run_tree_digest, get_tool_weights, get_brew_states, set_brew_state
 
     _today = date.today()
     states = {s["chain_name"]: s for s in get_brew_states()} if trigger == "auto" else {}
@@ -295,7 +292,7 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
         # 不必等技能统计跑起来（用户方案："更早的观察窗口"）。语义对齐通道 1（信号达标
         # 即酿，不看 last_brew_date），但同样受冷却门约束。fail-open：案例库不可用=通道缺席。
         try:
-            from utils.case_memory import query_brew_case_signals
+            from ..utils.case_memory import query_brew_case_signals
             for c in query_brew_case_signals(limit=limit):
                 name = c.get("chain_name")
                 if not name or name in seen:
@@ -316,22 +313,17 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
         logger.info("[Brewer] 无酿造候选（trigger=%s）", trigger)
         return []
 
-    if llm is None:
-        # 优先复用主 agent 的 LLM 实例（provider/model 与 .env 一致）；create_llm()
-        # 的 auto 模式解析链不同（曾出现 fallback 到不存在的模型 → 400）。
-        try:
-            import agent as agent_mod
-            llm = agent_mod.llm
-        except Exception:
-            from llm.factory import create_llm
-            llm = create_llm()
+    # 【2026-10-13 P1】原先这里要"优先复用主 agent 的 LLM 实例"，因为旧 create_llm()
+    # 的 auto 解析链跟主 agent 不一致（实测 fallback 到不存在的模型 → 400）。
+    # 统一出口 `app.agent.llm` 后 provider/model 只有一套解析逻辑，不存在两套
+    # 解析链打架的问题，这段也就没有存在理由了 —— LLM 在真正调用处按需取。
 
     # 工具质量上下文（领域无关：签名清单=全 provider；低权重名单=回测统计）
     provider = None
     signatures = "（不可用）"
     low_tools = "（无数据）"
     try:
-        from tools.base import ToolProvider
+        from ..tools._base import ToolProvider
         provider = ToolProvider.get_default()
         if provider is None:
             # 手动酿造入口没经过 plan_node 的 init_tools——自建一份用于校验/签名
@@ -341,9 +333,9 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             provider.scan_directory(_td, domain="common", package_prefix="tools")
             provider.scan_subdirectories(_td, package_prefix="tools")
         if provider:
-            from utils.prescan import prescan_tools
+            from ..utils.prescan import prescan_tools
             signatures = prescan_tools(provider, limit=40, query="")
-        from chain.store import get_tool_weights as _gtw
+        from .store import get_tool_weights as _gtw
         weights = _gtw()
         # S5（2026-09-19）：阈值改用模块常量 LOW_WEIGHT_THRESHOLD（单一事实源），
         # 与 task_agent.py plan 提示处同源。「工具差」三源口径不同
@@ -358,7 +350,7 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
     for cand in candidates:
         # 链名归一（2026-09-30）：实体码链（stock+analyze+600929）与同构链合并，
         # skill 命名词根不得携带标的标识——否则每只股票各酿一个技能。
-        from domain_registry import normalize_chain_name
+        from ..domain_registry import normalize_chain_name
         chain_name = normalize_chain_name(str(cand.get("chain_name") or ""))
         if not chain_name:
             results.append({"chain_name": cand.get("chain_name"), "status": "bad_chain"})
@@ -390,14 +382,15 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             skill_name=skill_name,
         )
         try:
-            import asyncio
-            from llm.base import ChatMessage
-            # 仅同步上下文调用（eval worker 线程 / 手动入口）；事件循环内调用会抛
-            # RuntimeError → 由 except 捕获记 llm_error，不影响主流程。
-            resp = asyncio.run(llm.generate(messages=[
-                ChatMessage(role="system", content="你是技能工程师，只输出 SKILL.md 文件内容。"),
-                ChatMessage(role="user", content=prompt),
-            ]))
+            # 【2026-10-13 P1】旧实现用 asyncio.run 包 async generate，因此**不能在
+            # 事件循环内**调用（RuntimeError → 记 llm_error 跳过）。统一出口是同步
+            # `complete()`，这个限制消失：酿造现在在 eval worker 线程和事件循环里
+            # 都能跑，不再因为上下文而静默跳过。
+            from app.agent.llm import complete
+            resp = complete([
+                {"role": "system", "content": "你是技能工程师，只输出 SKILL.md 文件内容。"},
+                {"role": "user", "content": prompt},
+            ])
             skmd = _strip_code_fence(resp.content or "")
         except Exception as e:
             logger.warning("[Brewer] LLM 编译失败 chain=%s: %s", chain_name, e)
@@ -416,14 +409,13 @@ def brew_skills(llm=None, min_runs: int = 5, limit: int = 3, trigger: str = "aut
             logger.warning("[Brewer] chain=%s 编译产物违反泛化（%s），带提醒重酿一次",
                            chain_name, bad_codes[:3])
             try:
-                import asyncio as _asyncio
-                from llm.base import ChatMessage as _CM
-                resp = _asyncio.run(llm.generate(messages=[
-                    _CM(role="system", content="你是技能工程师，只输出 SKILL.md 文件内容。"),
-                    _CM(role="user", content=prompt +
+                from app.agent.llm import complete
+                resp = complete([
+                    {"role": "system", "content": "你是技能工程师，只输出 SKILL.md 文件内容。"},
+                    {"role": "user", "content": prompt +
                         "\n\n【重申】正文与参数示例禁止出现任何六位股票代码或具体标的名称"
-                        "（含样本任务里的股票名），一律用“目标股票/目标代码”占位。"),
-                ]))
+                        "（含样本任务里的股票名），一律用“目标股票/目标代码”占位。"},
+                ])
                 skmd = _strip_code_fence(resp.content or "")
             except Exception as e:
                 logger.warning("[Brewer] 重酿失败 chain=%s: %s", chain_name, e)
@@ -488,7 +480,7 @@ def _bump_version(version: str) -> str:
 
 
 @_brew_locked(locked_result={"status": "locked"})
-def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = None) -> dict:
+def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> dict:
     """修订单个 auto_ 技能（§2.6 旁支主体）。
 
     护栏（§2.6 五条）：
@@ -499,7 +491,7 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
     （correct=TRUE 教改进，FALSE 供坑）；修订是 LLM 对旧文档的增量更新，
     不是从零重编译。
     """
-    from chain.store import get_delta_digest, get_skill_revision, set_skill_revision, reset_skill_weight
+    from .store import get_delta_digest, get_skill_revision, set_skill_revision, reset_skill_weight
 
     skill_path = Path(skill_dir) / "SKILL.md"
     if not skill_path.exists():
@@ -522,14 +514,6 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
     skill_name = Path(skill_dir).name
     rev = get_skill_revision(skill_name)
 
-    if llm is None:
-        try:
-            import agent as agent_mod
-            llm = agent_mod.llm
-        except Exception:
-            from llm.factory import create_llm
-            llm = create_llm()
-
     runs_txt = "\n".join(
         f"  - [{r['exec_date']}] {'✓正确' if r['correct'] is True else ('✗错误' if r['correct'] is False else '未验证')}"
         f" 任务:{r['user_query'][:60]} 摘要:{r['summary'][:120]}"
@@ -544,12 +528,11 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
         "只输出修订后的完整 SKILL.md（frontmatter + 正文），version 的 minor 位 +1。"
     )
     try:
-        import asyncio
-        from llm.base import ChatMessage
-        resp = asyncio.run(llm.generate(messages=[
-            ChatMessage(role="system", content="你是技能工程师，只输出修订后的 SKILL.md 文件内容。"),
-            ChatMessage(role="user", content=prompt),
-        ]))
+        from app.agent.llm import complete
+        resp = complete([
+            {"role": "system", "content": "你是技能工程师，只输出修订后的 SKILL.md 文件内容。"},
+            {"role": "user", "content": prompt},
+        ])
         new_doc = _strip_code_fence(resp.content or "")
     except Exception as e:
         logger.warning("[Brewer] 修订 LLM 失败 chain=%s: %s", chain_name, e)
@@ -560,7 +543,7 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
 
     # tools 白名单真实性校验（与首酿同规则）
     try:
-        from tools.base import ToolProvider
+        from ..tools._base import ToolProvider
         provider = ToolProvider.get_default()
         if provider is None:
             provider = ToolProvider()
@@ -606,7 +589,7 @@ def revise_skill(chain_name: str, skill_dir: str, llm=None, pre_weight: float = 
             "revision": rev["revision"] + 1}
 
 
-def maybe_revise(skill_rows: dict, skill_adapter=None, llm=None) -> list:
+def maybe_revise(skill_rows: dict, skill_adapter=None) -> list:
     """update_weights 收口调度入口（evaluator 只调本函数，一行）。
 
     入参：skill 层权重行 {name: {weight, sample_count}}（chain/store.get_skill_weight_rows）。
@@ -620,7 +603,7 @@ def maybe_revise(skill_rows: dict, skill_adapter=None, llm=None) -> list:
       · 修订尝试失败（llm_error/bad_format/no_delta）不作数——那是基础设施抖动，不是“修完仍差”。
     护栏 4：human-edited（无 auto_ 前缀）不修；护栏 5：low_streak ≥ REVISE_MAX_STREAK → 转淘汰。
     """
-    from chain.store import get_skill_revisions, set_skill_low_streak as _ssl
+    from .store import get_skill_revisions, set_skill_low_streak as _ssl
     results = []
     autos = sorted((n, r) for n, r in skill_rows.items()
                    if n.startswith(_AUTO_PREFIX) and isinstance(r, dict)
@@ -682,7 +665,7 @@ def maybe_revise(skill_rows: dict, skill_adapter=None, llm=None) -> list:
             rev = {**rev, "low_streak": low_streak}
         # 注：旧版此处 `chain_name = name[...].replace("-", "+")` 是算了不用的死变量（反推
         # chain 反正不可靠，已改由 header 注释读真实 chain），一并删除。
-        r = revise_skill(real_chain, str(skill_dir), llm=llm, pre_weight=w)
+        r = revise_skill(real_chain, str(skill_dir), pre_weight=w)
         results.append(r)
         # 修订尝试失败（llm_error/bad_format/no_delta）不计入 low_streak（见函数头语义）。
     return results
@@ -691,8 +674,8 @@ def maybe_revise(skill_rows: dict, skill_adapter=None, llm=None) -> list:
 def refresh_skill_adapter() -> None:
     """酿造后刷新运行中的 skill_adapter 缓存（长驻进程生效；cli 下次启动自然生效）。"""
     try:
-        from llm.qd_skills import QDSkillAdapter
-        import agent as agent_mod
+        from ..skills_adapter import QDSkillAdapter
+        from .. import agent as agent_mod
         adapter = getattr(agent_mod.agent, "skill_adapter", None)
         if isinstance(adapter, QDSkillAdapter):
             fresh = QDSkillAdapter(skills_dirs=list(adapter._default_dirs()))
@@ -706,7 +689,7 @@ if __name__ == "__main__":
     # 手动酿造入口（同步上下文）：
     #   <python> app/agent/chain/skill_brewer.py [min_runs]
     import sys
-    import os  # 2026-09-24（提智阶段 0.10，审计 A5）：下文 os.path.join 需要；缺失时手动入口启动即 NameError
+    import os
     _bp = Path(__file__).resolve().parents[3]
     sys.path.insert(0, _bp)   # 只挂 backend_api_python；不挂 app/agent（会造出两份 module）
     from dotenv import load_dotenv

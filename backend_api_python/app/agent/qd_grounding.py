@@ -1,0 +1,46 @@
+# -*- coding: utf-8 -*-
+"""闭环②数字溯源门 —— 结论里的数字必须能在工具观察值里找到出处。
+
+从 `qd_agent.py` 拆出（2026-10-13 P3 拆分）。
+
+【为什么要有这道门】A 股研究助手最贵的失败不是"答错"，而是**数字看着很像真的
+但没人说得清从哪来**。grounding gate 在 run 收尾时比对答复文本与工具语料，
+不可溯源就要求模型重写（最多 `grounding_max_retries` 次）。
+
+【★ 全部 fail-open】判定模块不可用 / 抛异常 ⇒ 返回 None（放行）。
+溯源是增益纪律，绝不能因为门坏了让用户收不到答复。
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+
+class GroundingMixin:
+    """数字溯源：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
+
+    def _observation_corpus(self) -> str:
+        """闭环②语料：本轮全部工具观察值（取代旧 executor.state 语料源）。"""
+        parts = []
+        for msg in self.messages:
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _grounding_violation(text: str, corpus: str) -> Optional[str]:
+        """返回 None = 通过；返回 str = 违规，内容是给模型的整改指引。"""
+        try:
+            from .utils.grounding import check_grounding
+        except ImportError:
+            try:
+                from .utils.grounding import check_grounding
+            except ImportError:
+                return None
+        try:
+            ok, guide = check_grounding(text, corpus)
+            return None if ok else guide
+        except Exception:
+            return None

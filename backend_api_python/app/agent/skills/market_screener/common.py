@@ -8,7 +8,7 @@ market_screener/common.py
 
 from __future__ import annotations
 
-from log import logger
+from ...log import logger
 import os
 import sys
 from collections import Counter
@@ -378,17 +378,20 @@ def _compact_json(d, max_depth=2, _depth=0):
 
 # ⚠ 层数必须数对：本文件在 app/agent/skills/market_screener/ 下，
 # 往上是 skills → agent → app → backend_api_python，即 **4 层** 才到 backend 根。
-# 曾经写成 3 层（= app/ 目录），于是把 `app/` 插到了 sys.path[0] 且没有配套插
-# `app/agent/` ⇒ `app/` 反超 `app/agent/` ⇒ 裸名 `import utils` 命中 **app/utils**
-# 而不是 app/agent/utils ⇒ 9 个 finance 工具模块的 `from utils.md_format import ...`
-# 全部 ModuleNotFoundError，被 ToolProvider **静默跳过**（工具面从 101 掉到 91，
-# 能力层从 40 虚增到 62 补位），且只在「直接 python cli.py」的引导时序下出现。
+# （2026-10-02 事故：曾写成 3 层 = 插成了 `app/`，于是 `import utils` 命中
+#  **app/utils** 而不是 app/agent/utils ⇒ 9 个 finance 工具模块的
+#  `from utils.md_format import ...` 全部 ModuleNotFoundError，被 ToolProvider
+#  **静默跳过**，工具面从 101 掉到 91、能力层从 40 虚增到 62 补位掩盖缺口。）
 _backend_root = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
 )
-# 只挂 backend 根。**禁止**把 `app/` 插进 sys.path（理由见上）。
-if _backend_root not in sys.path:
-    sys.path.insert(0, _backend_root)
+# 【2026-10-13·P5】**不再**把 backend 根插进 sys.path。
+# 本文件是技能模块，由 QDSkillAdapter 以 `app.agent.skills.*` 加载，
+# 包内一律相对导入；历史上那次"插 app/ 保序"的补丁正是 2026-10-02 事故的成因，
+# 现在既不必要也不允许（红线 R3 会拦）。`_backend_root` 仅保留给下面 _load_env
+# 定位 .env 用（纯路径计算，不动 sys.path）。
+
+
 def _load_env():
     try:
         from dotenv import load_dotenv
@@ -428,8 +431,8 @@ def _today_str() -> str:
 # 2026-09-19：修正过时的 import 路径——工具已迁至 tools/finance/ 子目录，
 # 旧路径 app.agent.tools.screener_tools 不存在，导致整个 run.py 导入失败
 # （_load_skill_functions 静默返回 []，skill 工具全部不注入沙箱 → 模型调用被幻觉拦截）。
-from tools.finance.screener_tools import search_stocks
-from tools.finance.analysis_tools import get_indicator_snapshot
+from ...tools.finance.screener_tools import search_stocks
+from ...tools.finance.analysis_tools import get_indicator_snapshot
 from app.market_cn.tape import get_fund_flow_realtime
 
 _TOOL_REGISTRY = {

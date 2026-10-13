@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from domain_registry import DomainSpec
+from ...domain_registry import DomainSpec
 
 # verb → noun（追溯链名 domain+verb+noun 的缺省补齐）
 _VERB_NOUNS = {

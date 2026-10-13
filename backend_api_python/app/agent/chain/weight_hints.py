@@ -38,10 +38,10 @@ _cache_bad = {"ts": 0.0}   # 上次回源失败时间（避免故障时每轮都
 def _threshold() -> float:
     """低权重阈值（单一事实源 = chain.skill_brewer.LOW_WEIGHT_THRESHOLD）。"""
     try:
-        from chain.skill_brewer import LOW_WEIGHT_THRESHOLD
+        from .skill_brewer import LOW_WEIGHT_THRESHOLD
     except ImportError:
         try:
-            from chain.skill_brewer import LOW_WEIGHT_THRESHOLD
+            from .skill_brewer import LOW_WEIGHT_THRESHOLD
         except ImportError:
             return 0.7
     return float(LOW_WEIGHT_THRESHOLD)

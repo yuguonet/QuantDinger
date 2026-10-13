@@ -64,11 +64,14 @@ def main() -> int:
 
     t0 = time.time()
     try:
-        # 路径层级：本文件在 app/agent/scripts/ → parents[3]=backend_api_python, parents[1]=app/agent
-        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))   # backend_api_python（app.* 导入）
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # app/agent（skills.* 导入）
+        # 只挂 backend_api_python（保证 `import app.*` 成立）。
+        # 【2026-10-13·P5】原本还挂 app/agent 让 `skills.*` 裸名成立 ——
+        # 改造后包内相对导入，EXECUTABLE_SKILLS 里的裸名由 modpath.resolve 补前缀，
+        # 不再需要把包目录塞进 sys.path（那正是 M-1 双实例的成因）。
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
         import importlib
-        fn = getattr(importlib.import_module(mod_path), fn_name)
+        from app.agent.modpath import import_module
+        fn = getattr(import_module(mod_path), fn_name)
         sig = inspect.signature(fn)
         unknown = set(kwargs) - set(sig.parameters)
         if unknown:

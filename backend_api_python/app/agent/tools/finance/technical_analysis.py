@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from log import logger
+from ...log import logger
 from typing import Any, Dict, List
 def _call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 analysis_tools 中的分析算法（同包内规范实现，非工具包装层）+ basicinfo，返回结果字典。
@@ -18,11 +18,11 @@ def _call_tools(stock_code: str) -> Dict[str, Any]:
     已改为直接走数据源，不再 import 工具包装层。
     """
     from app.utils.basicinfo_db import get_stock_basic_db
-    from tools.finance.analysis_tools import (
+    from .analysis_tools import (
         analyze_trend, get_indicator_snapshot, get_volume_analysis,
         analyze_pattern, get_chip_distribution,
     )
-    from tools.finance._analysis_utils import _get_ds
+    from ._analysis_utils import _get_ds
 
     results = {}
     for name, fn in [
@@ -224,7 +224,7 @@ def _algo_analyze(
     _DEFAULT_WEIGHTS = {"趋势": 0.40, "指标": 0.25, "量价": 0.20,
                         "形态": 0.10, "筹码": 0.05, "流通盘": 0.00}
     try:
-        from chain.store import get_factor_weights
+        from ...chain.store import get_factor_weights
         _calibrated = get_factor_weights("technical_analysis")
     except Exception as _e:
         logger.debug("[technical_analysis] 因子权重读取失败，回退常量: %s", _e)
@@ -259,7 +259,7 @@ def _algo_analyze(
     # 置信度优先用 hit_rate 区间映射（>0.6 high / 0.4-0.6 medium / <0.4 low），
     # 无校准则回退原"有效因子数"逻辑。
     try:
-        from utils.calibration import apply as _cal_apply
+        from ...utils.calibration import apply as _cal_apply
         hit_rate = _cal_apply("technical_analysis", final_score)
     except Exception:
         hit_rate = None

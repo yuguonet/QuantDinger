@@ -52,11 +52,20 @@ def test_panel_disabled_zeroes_counters(tmp_path):
 
 
 def test_panel_rate_counts_errors_as_fallback(tmp_path):
-    """err 也算回退（新判定源坏了就是在回退）—— rate=(miss+err)/total。"""
+    """err 也算回退（新判定源坏了就是在回退）—— rate=(miss+err)/total。
+
+    ★ 2026-10-13 改判据（测试自身算错，非代码问题）：
+      `monitor._panel_observe` 的分母是 `total = hit + miss + err`（monitor.py:483），
+      即 **err 本身也是一次已发生的判定尝试**，要计入分母。
+      本例 hit=8 / miss=0 / err=2 ⇒ total=10 ⇒ rate=(0+2)/10=0.2。
+      原断言写成 `round(2/8, 4)`=0.25，把 8（hit）误当成了 total，
+      与本函数 docstring 自述的 `(miss+err)/total` 口径自相矛盾。
+      代码口径正确（err 计入分母才有"每 10 次里 2 次回退"的含义），改测试不改代码。
+    """
     p = str(tmp_path / "panel.jsonl")
     stats = {"confirm_prog_hit": 8, "confirm_prog_miss": 0, "confirm_prog_err": 2}
     rec = monitor._panel_observe(stats, "2026-10-12", "15:01", path=p, enabled=True)
-    assert rec["fallback_rate"] == round(2 / 8, 4)
+    assert rec["fallback_rate"] == round((0 + 2) / (8 + 0 + 2), 4)   # = 0.2
     assert stats["prog_fallback_rate"] == rec["fallback_rate"]
 
 

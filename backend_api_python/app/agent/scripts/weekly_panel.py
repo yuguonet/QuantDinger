@@ -30,7 +30,7 @@ for _p in (str(_BACKEND_ROOT), str(_AGENT_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from utils.budget import empty_panel, PANEL_KEYS, render_panel  # noqa: E402
+from app.agent.utils.budget import empty_panel, PANEL_KEYS, render_panel
 
 
 def _panel_path(arg: str = "") -> Path:

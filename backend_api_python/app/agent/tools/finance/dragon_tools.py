@@ -7,9 +7,9 @@ Dragon Tools — 龙虎榜/涨跌停/热榜。
 from __future__ import annotations
 import json
 
-from log import logger
+from ...log import logger
 from typing import Any, Dict, List
-from utils.md_format import _batch_execute, _to_md
+from ...utils.md_format import _batch_execute, _to_md
 
 def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
                      detail: bool = False) -> dict:
@@ -68,7 +68,7 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
 
     # detail=True：逐股追加 seats/institution（委托原 get_dragon_tiger_detail 实现，
     # 不自算第三份；单股等价性 = 原工具单股返回的 seats/institution 子集）
-    from tools.finance.signal_tools import get_dragon_tiger_detail as _detail
+    from .signal_tools import get_dragon_tiger_detail as _detail
     data = base.get("data") if isinstance(base, dict) else None
     if not isinstance(data, dict):
         return base

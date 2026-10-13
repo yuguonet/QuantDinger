@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from domain_registry import DomainSpec
+from ...domain_registry import DomainSpec
 
 SPEC = DomainSpec(
     name="knowledge",

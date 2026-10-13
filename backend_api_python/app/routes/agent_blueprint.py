@@ -3,6 +3,7 @@
 /api/agent/* —  Thin proxy routing to app.agent.flask_app.
 
 All agent logic lives in app/agent/flask_app.py (or the llm/ subpackage).
+（2026-10-13：旧执行系统整体迁到 app/agent/，本文件只做蓝图再导出，路径不变。）
 This file just fixes sys.path so the agent modules can import each other,
 then re-exports flask_app's working routes under the /api/agent prefix.
 """
@@ -14,7 +15,7 @@ from flask import Blueprint
 
 # Import flask_app's working blueprint, register it to a throwaway app so
 # its view_functions dict is populated, then copy every route under /api/agent.
-from flask_app import agent_v2_bp as _src_bp
+from app.agent.flask_app import agent_v2_bp as _src_bp
 from flask import Flask as _Flask
 
 _temp = _Flask(__name__)

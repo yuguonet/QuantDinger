@@ -19,7 +19,7 @@ class _MaskFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            from utils.mask import mask_text
+            from .utils.mask import mask_text
             record.msg = mask_text(str(record.msg))
             if record.args:
                 record.args = tuple(

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Store — qd_agent_traces 树形持久化层（替代旧 qd_evaluations）。
 
@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import json
 import re
-from log import logger
+from ..log import logger
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from chain.schema import EvalNode, FactorItem, Layer, Status
+from .schema import EvalNode, FactorItem, Layer, Status
 def _list_to_pg_array(items: list) -> str:
     """将 Python list 转为 PostgreSQL TEXT[] 格式。
 
@@ -431,7 +431,7 @@ def update_verify_results(
         return
     # 延迟标签回填（T1）：失败不影响验证主链
     try:
-        from utils.case_memory import backfill_by_root
+        from ..utils.case_memory import backfill_by_root
         backfill_by_root(root_id, correct, t_plus_n=pnl_pct)
     except Exception as e:
         logger.warning("[Store] 案例标签回填跳过 root_id=%d: %s", root_id, e)
@@ -442,7 +442,7 @@ def update_skill_verify(root_id: int, actual_direction: str):
       - neutral 预测 → correct = NULL（不参与统计）
       - correct/wrong → 正常写入
     """
-    from chain.schema import is_direction_correct
+    from .schema import is_direction_correct
     from app.utils.db import get_db_connection
 
     try:
@@ -899,7 +899,7 @@ BREW_CONFIDENCE_CAP = 10     # 置信缩放分母（verified 达此值后不再�
 
 def _normalize_chain_name(raw: str) -> str:
     """链名归一（双路径兼容）：剥实体码，同构链（不同标的）归同一键。"""
-    from domain_registry import normalize_chain_name
+    from ..domain_registry import normalize_chain_name
     return normalize_chain_name(raw)
 
 

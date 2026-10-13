@@ -56,7 +56,7 @@ for _p in (str(BACKEND_ROOT), str(AGENT_DIR)):
         sys.path.insert(0, _p)
 
 try:
-    import mimo_boot  # noqa: E402,F401   （执行核依赖；缺失只影响 run 模式）
+    from app.agent import mimo_boot
     _BOOT_ERR = ""
 except Exception as _e:            # validate/score/agreement 不依赖执行核，软失败
     _BOOT_ERR = f"{type(_e).__name__}: {_e}"
@@ -94,7 +94,7 @@ def _chk_direction(a: str, t: dict) -> bool:
 
 
 def _chk_numbers(a: str, t: dict) -> bool:
-    from utils.grounding import extract_numbers
+    from app.agent.utils.grounding import extract_numbers
     return len(extract_numbers(a)) >= 3
 
 
@@ -127,7 +127,7 @@ def _chk_no_fake(a: str, t: dict) -> bool:
 
 
 def _chk_compliance(a: str, t: dict) -> bool:
-    from utils.grounding import check_banned_phrases
+    from app.agent.utils.grounding import check_banned_phrases
     return not check_banned_phrases(a)
 
 
@@ -229,7 +229,7 @@ def _score_coverage(task: dict, answer: str) -> Tuple[float, dict]:
 
 
 def _score_grounding(task: dict, answer: str, corpus: str = "") -> float:
-    from utils.grounding import check_banned_phrases, check_grounding, extract_numbers
+    from app.agent.utils.grounding import check_banned_phrases, check_grounding, extract_numbers
     banned = check_banned_phrases(answer)
     compliance = 100.0 if not banned else 50.0
     certainty = 100.0 if not _FAKE_CERT.search(answer) else 50.0
@@ -248,7 +248,7 @@ def _score_grounding(task: dict, answer: str, corpus: str = "") -> float:
 
 def _score_claims(task: dict, answer: str) -> float:
     try:
-        from chain.claims import extract_claims
+        from app.agent.chain.claims import extract_claims
         cs = extract_claims(task.get("query", ""), answer, "finance") or []
     except Exception:
         return 0.0
@@ -365,8 +365,8 @@ def _load_runs() -> List[dict]:
 def _try_db_attach(summary: dict, meta: dict) -> bool:
     """把 run 挂到 qd_traces 树（root=bench_run, child=任务）。fail-open。"""
     try:
-        from chain.schema import EvalNode, Layer
-        from chain import store
+        from app.agent.chain.schema import EvalNode, Layer
+        from app.agent.chain import store
         root = EvalNode(layer=Layer.CHAIN.value, name=f"qd_bench:{meta.get('run_id')}",
                         analysis=json.dumps({"total": summary["total"],
                                              "dims": summary["dims"]},
@@ -428,8 +428,8 @@ def cmd_run(args) -> int:
     try:
         from dotenv import load_dotenv
         load_dotenv(BACKEND_ROOT / ".env", override=False)
-        from qd_service import QDAgentService
-        from memory import LocalMemory
+        from app.agent.qd_service import QDAgentService
+        from app.agent.memory import LocalMemory
     except Exception as e:
         print(f"[ENV] 运行条件不满足: {type(e).__name__}: {e}" +
               (f" | 执行核: {_BOOT_ERR}" if _BOOT_ERR else ""))

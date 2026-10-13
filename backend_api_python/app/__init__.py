@@ -7,30 +7,24 @@ import sys as _sys
 # Make app/nanobot/ shadow any pip-installed nanobot-ai package,
 # so local patches are always used without touching import paths.
 #
-# agent 包子模块一律用**裸名**导入（`from chain.store import ...`），所以必须把
-# `app/agent/` 也放进 sys.path；路径全部由 `__file__` 相对算出，目录搬家零改动。
-# 详见 app/agent/__init__.py 头部说明。
+# 【2026-10-13 · P5 导入现代化】**本处不再把 `app/agent/` 塞进 sys.path。**
 #
-# ⚠ 顺序不能反：先插 `app/` 再插 `app/agent/`，后者才会压在前者之上，
-# 否则 `import utils` 会命中 `app/utils` 而不是 `app/agent/utils`。
-# ⚠ 事故 M-1：曾经两处都插、但代码里裸名与全名混用，同一份源码被加载成两个
-# module 对象（裸名 `agent` 与全名 `app.agent.agent` 并存），模块级单例
-# （agent 实例 / _sessions / TraceCollector 收集器 / 各类缓存）全部双份且状态
-# 互不可见。根治办法是**只保留一种写法**（现统一裸名）+ 护栏
-# `qd_smoke.py::test_29_module_single_instance`，不要再混用。
-# 幂等保序（不是简单 insert(0)）：先把 `app/` 去重补上，再把 `app/agent/`
-# 去重后**插到 app/ 首次出现之前**。这样即便此刻 sys.path 里已经是
-# 「app/ 在 app/agent/ 之前」的错序（例如别的入口刚把 app/ 顶到最前），
-# 也会在这里被纠正回来；`import utils` 才不会命中 app/utils。
-# （不能改写成 `import app.agent` 去复用它的 ensure_path_order：那会让
-#   app.agent 包与裸名 agent.py 并存，正是上面 M-1 事故的形态。）
+# 旧做法：legacy 包内一律裸名导入（`from chain.store import ...`），为此必须把
+# `app/agent/` 插到 sys.path 且压在 `app/` 之上。代价是该目录下 30 个顶层名
+# （tools / chain / utils / log / memory / rag / skills / cron / ...）变成全进程裸名，
+# 于是同一份源码能同时以裸名 `chain.store` 和全名 `app.agent.chain.store`
+# 加载成**两个 module 对象**，模块级单例双份且状态互不可见（事故 M-1）。
+# 而且"谁排在前面"取决于 import 时序，历史上反复被别处的一次 insert 打翻
+# （2026-10-02：skills/market_screener/common.py 误插 `app/` ⇒ 9 个 finance 工具
+#  模块静默跳过，工具面 101→91 无人察觉）。
+#
+# 现做法：legacy 包内改为**相对导入**、包外改为**绝对导入**
+# （`from app.agent.chain.evaluator import start_eval_worker`），
+# 单一 module 名 `app.agent.*`，M-1 病根消失，本目录也不必再进 sys.path。
+# 红线守在 `tests/test_v6_import_modernize.py`（零裸名 / 零 sys.path / 零断裂引用）。
 _app_dir = _os.path.dirname(_os.path.abspath(__file__))
-_agent_dir = _os.path.join(_app_dir, "agent")
 if _app_dir not in _sys.path:
     _sys.path.insert(0, _app_dir)
-while _agent_dir in _sys.path:
-    _sys.path.remove(_agent_dir)
-_sys.path.insert(_sys.path.index(_app_dir), _agent_dir)
 
 import math
 import logging
@@ -426,7 +420,7 @@ def create_app(config_name='default'):
         # warning ⇒ **定时任务从未启动过**（事故 C-1，静默失效）。
         # 与 `cron/cron_tools.py`、`app/routes/cron.py` 的写法保持一致。
         try:
-            from cron.cron_worker import start_cron_worker
+            from app.agent.cron.cron_worker import start_cron_worker
             start_cron_worker()
             logger.info("[CronWorker] 定时任务调度器已启动")
         except Exception as e:
@@ -434,7 +428,7 @@ def create_app(config_name='default'):
 
         # ── 统一消息队列 Worker 线程池 ─────────────────────
         try:
-            from message_queue import init_workers
+            from app.agent.message_queue import init_workers
             init_workers(4)
             logger.info("[MQ] 统一消息队列 worker 已启动")
         except Exception as e:
@@ -465,7 +459,7 @@ def create_app(config_name='default'):
         # ── Agent 盘后回溯评估 worker（T+N 验证 → 权重迭代）──
         # 盘后自动运行，按 timeframe 取实际行情验证决策准确性
         try:
-            from chain.evaluator import start_eval_worker
+            from app.agent.chain.evaluator import start_eval_worker
             start_eval_worker()
             logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
         except Exception as e:

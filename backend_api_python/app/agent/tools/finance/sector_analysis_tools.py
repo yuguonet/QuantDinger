@@ -7,10 +7,10 @@ Sector Analysis Tools — 桥接 market_cn.china_market 到 agent 工具系统�
 """
 from __future__ import annotations
 
-from log import logger
+from ...log import logger
 import re
 from typing import Any, Dict, List, Literal
-from utils.md_format import _batch_execute, _to_md
+from ...utils.md_format import _batch_execute, _to_md
 
 def _to_float(val, default=0.0) -> float:
     """安全转 float，处理 '-' 等异常值。"""
@@ -219,7 +219,7 @@ def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
     """
     v = (view or "ranking").strip().lower()
     if v == "ranking":
-        from tools.finance.signal_tools import get_industry_ranking
+        from .signal_tools import get_industry_ranking
         return get_industry_ranking(top_n=top_n)
     if v == "history":
         return get_sector_history_data(board_type=board_type, days=days)
@@ -257,7 +257,7 @@ def get_stock_sector_info(codes: str) -> dict:
     concept_map: Dict[str, dict] = {}
     concept_error_all = ""
     try:
-        from tools.finance.signal_tools import get_stock_concept_blocks as _concept
+        from .signal_tools import get_stock_concept_blocks as _concept
         cb_all = _concept(",".join(code_list))
         if isinstance(cb_all, dict):
             if "error" in cb_all and not cb_all.get("data"):

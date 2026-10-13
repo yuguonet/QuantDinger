@@ -86,7 +86,7 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
     前端 agent.js 已实现 node/tool/step/progress 全部回调，事件契约不变。
     """
     import queue as _queue
-    from message_queue import submit
+    from .message_queue import submit
 
     ev_queue: _queue.Queue = _queue.Queue()
 
@@ -155,7 +155,7 @@ def _sse_stream(message: str, session_id: str, timeout: int = 300):
 @agent_v2_bp.route("/health", methods=["GET"])
 def health():
     try:
-        from agent import settings, skills
+        from .agent import settings, skills
         return jsonify({
             "status": "ok",
             "version": settings.version,
@@ -169,7 +169,7 @@ def health():
 @agent_v2_bp.route("/info", methods=["GET"])
 def info():
     try:
-        from agent import settings, skills
+        from .agent import settings, skills
         return jsonify({
             "version": settings.version,
             "env": settings.env,
@@ -188,7 +188,7 @@ def list_tools():
 @agent_v2_bp.route("/skills", methods=["GET"])
 def list_skills():
     try:
-        from agent import skills
+        from .agent import skills
         return jsonify({"total": len(skills), "skills": skills.list_skills()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -271,7 +271,7 @@ def stop():
         session_id = (data.get("session_id") or "").strip()
         if not session_id:
             return jsonify({"error": "session_id 不能为空"}), 400
-        from message_queue import request_stop
+        from .message_queue import request_stop
         request_stop(session_id)                              # 原样（前端已带命名空间）
         request_stop(f"{_resolve_user_ns()}:{session_id}")    # 补前缀（与 chat/task 对齐）
         return jsonify({"ok": True, "session_id": session_id})

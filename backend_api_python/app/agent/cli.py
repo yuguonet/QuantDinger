@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Agent CLI — 命令行入口（壳）。
@@ -54,8 +54,12 @@ except ImportError:
 
 def _import_agent():
     """延迟导入 agent 组件（避免包命名空间冲突）。"""
-    from agent import agent, settings, skills, DEFAULT_SESSION_ID, llm
-    return agent, settings, skills, DEFAULT_SESSION_ID, llm
+    # 【2026-10-13 P1】原来这里还导出一个进程级 `llm` 实例（旧自建 llm/ 包的
+    # create_llm()），交互循环退出时 `await llm.close()`。LLM 出口统一到
+    # `app.agent.llm` 后没有这个对象了 —— mimo 的 Model 没有 async close，
+    # 连接随进程退出回收即可。
+    from app.agent.agent import agent, settings, skills, DEFAULT_SESSION_ID
+    return agent, settings, skills, DEFAULT_SESSION_ID
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -71,7 +75,7 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
     _future_sink: 可选列表，调用方传入后本次任务的 Future 会被 append 进去，
     供 SIGINT handler / KeyboardInterrupt 分支置取消位（Ctrl+C 协作中止）。
     """
-    from message_queue import submit
+    from app.agent.message_queue import submit
 
     print(f"\n[会话] Session: {session_id}")
     print(f"[对话] Message: {message}")
@@ -92,7 +96,7 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
     # 改为 0.5s 分片轮询：每个分片醒来查一次停止位；停止位由 SIGINT handler /
     # KeyboardInterrupt 分支置上（message_queue.request_stop）——
     # worker 的中断探针在工具/步边界中止 agent.run，这里随即收尾。
-    from message_queue import request_stop as _req_stop, _is_stop_requested
+    from app.agent.message_queue import request_stop as _req_stop, _is_stop_requested
 
     _stop_asked = False
     deadline = time.time() + _timeout
@@ -158,15 +162,15 @@ def _print_info():
     print(f"  技能: {len(skills)} 个")
 
     try:
-        from llm.qd_llm import _load_llm_service
-        LLMService_cls, _, _ = _load_llm_service()
-        svc = LLMService_cls()
-        print(f"\n  ── LLMService ──")
-        print(f"  Provider: {svc.provider.value}")
-        print(f"  Model: {svc.get_default_model()}")
-        print(f"  API Key: {'已配置' if svc.get_api_key() else '未配置'}")
+        from app.agent.llm import resolve_provider
+        spec = resolve_provider()
+        print(f"\n  ── LLM（mimoagent models）──")
+        print(f"  Provider: {spec.name}")
+        print(f"  Base URL: {spec.base_url}")
+        print(f"  Model: {spec.model}")
+        print(f"  API Key: {'已配置' if spec.api_key else '未配置'}")
     except Exception as e:
-        print(f"\n  LLMService: {e}")
+        print(f"\n  LLM: {e}")
 
     print("\n" + "=" * 60)
 
@@ -209,20 +213,19 @@ def main():
         _list_skills()
         return
 
-    _, _, _, DEFAULT_SESSION_ID, _ = _import_agent()
+    _, _, _, DEFAULT_SESSION_ID = _import_agent()
     session_id = args.session or DEFAULT_SESSION_ID
 
     if args.message:
         try:
-            from llm.qd_llm import _load_llm_service
-            LLMService_cls, _, _ = _load_llm_service()
-            svc = LLMService_cls()
-            if not svc.get_api_key():
-                print(f"⚠  警告: {svc.provider.value} API Key 未配置")
+            from app.agent.llm import resolve_provider
+            spec = resolve_provider()
+            if not spec.api_key:
+                print(f"⚠  警告: {spec.name} API Key 未配置")
         except Exception:
             pass
 
-        from message_queue import init_workers
+        from app.agent.message_queue import init_workers
         init_workers(4)
         asyncio.run(_run_chat(args.message, session_id))
         # 单次消息模式：跑完即退（见 _flush_and_exit 说明——否则会被数据源线程池拖住）
@@ -230,7 +233,7 @@ def main():
     else:
         # 交互模式（单个事件循环，避免 PostgresMemory 连接池随循环销毁重建）
         import signal
-        from message_queue import init_workers
+        from app.agent.message_queue import init_workers
         init_workers(4)
 
         _ctrl_c_count = 0
@@ -247,7 +250,7 @@ def main():
                 print("\n 强制退出!")
                 os._exit(0)
             try:
-                from message_queue import request_stop
+                from app.agent.message_queue import request_stop
                 request_stop(session_id)
             except Exception:
                 pass
@@ -259,7 +262,7 @@ def main():
 
         async def _interactive_loop():
             nonlocal _ctrl_c_count
-            _, _, _, _, llm = _import_agent()
+            _import_agent()
             while True:
                 try:
                     _ctrl_c_count = 0  # 每轮重置
@@ -289,16 +292,10 @@ def main():
                 finally:
                     signal.signal(signal.SIGINT, signal.default_int_handler)
 
-            # 退出时关闭 LLM 客户端，释放连接。
-            # 退出路径吞掉关闭期异常（含 KeyboardInterrupt / CancelledError / httpx 在
-            # 事件循环收尾期的关闭噪音）—— 进程即将退出，连接池关不关无所谓，
-            # 否则会打印一条无害但吓人的 traceback（实测 Windows + Ctrl+C 退出时
-            # `await llm.close()` 被 KeyboardInterrupt 打断）。
-            if llm and hasattr(llm, 'close'):
-                try:
-                    await llm.close()
-                except (Exception, KeyboardInterrupt, asyncio.CancelledError):
-                    pass
+            # 【2026-10-13 P1】原先在这里 `await llm.close()` 关 LLM 客户端。
+            # 统一到 `app.agent.llm` 后没有这个对象：mimo 的 Model 只持一个
+            # openai client，没有 async close，连接随进程退出回收。
+            # 需要显式释放的场合调 `app.agent.llm.clear_model_cache()`。
 
         try:
             asyncio.run(_interactive_loop())

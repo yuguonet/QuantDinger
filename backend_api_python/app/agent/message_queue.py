@@ -144,7 +144,7 @@ def submit(
 def _worker_loop():
     """Worker 线程：从队列取消息 → agent.chat → 回写结果。"""
     import asyncio
-    from agent import agent
+    from .agent import agent
 
     while True:
         task = _task_queue.get()
@@ -185,7 +185,7 @@ def _worker_loop():
                     # _user_step_callbacks / _INTERRUPT_CHECKS 均“赋值 + finally 恢复”，
                     # 多 worker 并发互踩（A 收尾抹掉 B 的注册 / 陈旧探针串会话误杀，审计 B1）。
                     # 现按 session 注册到 task_agent 会话钩子表 + 线程局部绑定当前 run。
-                    import qd_agent as _ta_mod
+                    from . import qd_agent as _ta_mod
                     _sid = str(task["session_id"])
                     _ta_mod.bind_run_session(_sid)
 

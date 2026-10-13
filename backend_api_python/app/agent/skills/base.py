@@ -15,7 +15,10 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from llm.base import LLMBase, ChatMessage, LLMResponse
+# 【2026-10-13 P1】原先 `from llm.base import LLMBase, ChatMessage, LLMResponse`。
+# 旧自建 llm/ 包已退役：LLM 出口统一到 `app.agent.llm`，消息格式就是 OpenAI 原生
+# dict（不再有 ChatMessage），LLMBase 这条抽象链整体消失。
+from app.agent.llm import LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +41,9 @@ class Skill(ABC):
     description: str = ""
     system_prompt: str = ""
 
-    def __init__(self, llm: Optional[LLMBase] = None):
-        """
-        初始化 Skill
-
-        :param llm: LLM 实例（不传则需要在调用时注入）
-        """
-        self._llm = llm
-
-    def set_llm(self, llm: LLMBase):
-        """设置 LLM 实例"""
-        self._llm = llm
-
-    @property
-    def llm(self) -> LLMBase:
-        """获取 LLM 实例"""
-        if self._llm is None:
-            raise RuntimeError(f"Skill '{self.name}' 未设置 LLM 实例，请先调用 set_llm()")
-        return self._llm
+    # 【2026-10-13 P1】不再持有 LLM 实例：Skill 原来靠 `set_llm()` 注入一个
+    # LLMBase 对象（实测全项目无人调用，属死接口）。统一出口 `app.agent.llm`
+    # 内部按 provider+model+timeout 缓存 Model，Skill 侧不需要也不该持有连接。
 
     async def call_llm(
         self,
@@ -73,14 +61,15 @@ class Skill(ABC):
         :param max_tokens: 最大 token 数
         :return: LLMResponse
         """
+        from app.agent.llm import acomplete
         messages = []
         sys_msg = system_message or self.system_prompt
         if sys_msg:
-            messages.append(ChatMessage(role="system", content=sys_msg))
-        messages.append(ChatMessage(role="user", content=user_message))
+            messages.append({"role": "system", "content": sys_msg})
+        messages.append({"role": "user", "content": user_message})
 
-        return await self.llm.generate(
-            messages=messages,
+        return await acomplete(
+            messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )

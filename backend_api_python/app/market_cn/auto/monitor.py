@@ -115,6 +115,7 @@ def _last_trade_day() -> str:
 
 
 def in_window(lo, hi, hm=None):
+    """按北京时间 HH:MM 判定盘中窗口；显式传入的 hm 也必须是北京时间。"""
     hm = hm or _now_hm()
     return lo <= hm < hi
 
@@ -1005,4 +1006,3 @@ def run_monitor():
 # 铁律: 这是**契约别名**, 语义恒等于 run_monitor。
 #   不要在此包 try/except —— 盘中链失败必须抛出并被调度器记账, 绝不静默降级。
 run_monitor_safe = run_monitor
-

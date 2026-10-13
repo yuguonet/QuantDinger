@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 def _window_bounds(days=300, as_of=None):
     """取数窗口 (start, end) = [anchor - days*1.5 日历日, anchor + 1 日历日]。
 
-    anchor = as_of (给了就锚在它) 否则 now。
+    anchor = as_of (给了就锚在它) 否则当前北京时间 (TZ_CN)，不依赖进程宿主时区。
     2026-09-28 审计 A1: 窗口原先**恒锚 now**, 于是 `hub.daily(code, days, as_of=历史日)`
     的 as_of 过滤会把窗口内的根**全部**裁掉 ⇒ 静默空集 (命中 tools/pool_check、
     strategies/lead_chase、g56.scan_signals 逐日枚举、tools/debug、tools/replay)。
@@ -31,12 +31,13 @@ def _window_bounds(days=300, as_of=None):
     故**不可**改成尾部精确截断 (改了会让切片等价性破功)。
     """
     from datetime import datetime as _dt
-    anchor = _dt.now()
+    from app.market_cn.auto.store import TZ_CN
+    anchor = _dt.now(TZ_CN)
     if as_of:
         try:
-            anchor = _dt.strptime(str(as_of)[:10], "%Y-%m-%d")
+            anchor = _dt.strptime(str(as_of)[:10], "%Y-%m-%d").replace(tzinfo=TZ_CN)
         except ValueError:
-            anchor = _dt.now()          # as_of 形态异常时退回旧行为 (保持宽松, 不抛)
+            anchor = _dt.now(TZ_CN)     # as_of 形态异常时退回北京时间, 保持宽松不抛
     return ((anchor - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d"),
             (anchor + timedelta(days=1)).strftime("%Y-%m-%d"))
 

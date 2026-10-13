@@ -30,6 +30,8 @@ import re
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import label_spec
+
 GATE_VER = "v1.1"
 EXTRACTOR_VER = "v1.1"
 
@@ -105,7 +107,11 @@ _SECTOR_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*(?:板块|概念|题
 
 # 视界 → 到期日（自然日估算，与 evaluator._maturity_days 同口径：
 # 1 交易日 ≈ 1.5 自然日 + 2 天周末/节假日缓冲）
-_HORIZON_DAYS: Dict[str, int] = {"T+1": 1, "T+3": 3, "T+5": 5, "2W": 10, "1M": 20, "n/a": 0}
+# ★ 2026-10-13（v5 P1-1 收口）：委派 `chain/label_spec.HOLDS`（唯一真源）。
+#   此前本文件自持一份（与 evaluator 的另两份并存且 1M 数值不同），
+#   改一处忘两处 = 静默漂移；现三者已统一为一张表（1M=21，与 1Y=252 自洽）。
+#   `n/a: 0` 表示"无到期日"（不是"持有 0 天"），见 label_spec。
+_HORIZON_DAYS: Dict[str, int] = label_spec.HOLDS
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -308,7 +314,7 @@ def _quote_of(answer: str, pattern: str, span: int = 120) -> str:
 def _extract_direction(answer: str) -> Optional[str]:
     """复用 trace_collector 的方向提取器（含否定检测/条件剥离），避免两套口径。"""
     try:
-        from trace_collector import TraceCollector as _TC
+        from ..trace_collector import TraceCollector as _TC
         d = _TC._extract_direction_from_text(answer)
     except Exception:
         d = ""

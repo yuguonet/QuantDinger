@@ -21,9 +21,9 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 try:  # 生产：backend_api_python 为根
-    from tools.base import ToolProvider
+    from ._base import ToolProvider
 except ImportError:  # cli/测试：app/agent 在 sys.path
-    from tools.base import ToolProvider
+    from ._base import ToolProvider
 
 
 # 一次 search_tools 最多自动激活的工具数（防止"搜一次把整个域全激活"，

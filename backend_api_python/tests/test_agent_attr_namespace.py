@@ -20,15 +20,36 @@ from pathlib import Path
 
 import pytest
 
-QD_AGENT_SRC = Path(__file__).resolve().parent.parent / "app" / "agent" / "qd_agent.py"
+LEGACY_DIR = Path(__file__).resolve().parent.parent / "app" / "agent"
+
+# ★ 2026-10-13 P3 拆分后必须扫**全部组成文件**：原先只扫 qd_agent.py 一个文件，
+#   方法散到 mixin 后 `self.X = ...` 也跟着散走 —— 只扫一个文件等于把这张网
+#   剪了个洞（正是本守卫存在的理由：2026-10-12 `_run_tool_calls` 血案）。
+#   组成文件新增/改名必须同步这里，否则守卫静默失效。
+QD_AGENT_SOURCES = (
+    "qd_agent.py",      # 执行核主干（QDAgent 本体）
+    "qd_tool_face.py",  # ToolFaceMixin
+    "qd_preselect.py",  # PreselectMixin
+    "qd_guards.py",     # GuardMixin
+    "qd_budgeting.py",  # BudgetMixin
+    "qd_aftercare.py",  # AftercareMixin
+    "qd_grounding.py",  # GroundingMixin
+    "qd_config.py",     # QDAgentConfig（无 mixin，兜底扫）
+    "qd_hooks.py",      # 钩子表（无 mixin，兜底扫）
+)
 
 
 def _own_attributes() -> set[str]:
-    """静态解析 QDAgent 类内所有 `self.X = ...` / `self.X += ...` 的属性名。"""
-    tree = ast.parse(QD_AGENT_SRC.read_text(encoding="utf-8"))
+    """静态解析所有组成文件里 `self.X = ...` / `self.X += ...` 的属性名。"""
     names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "QDAgent":
+    for fname in QD_AGENT_SOURCES:
+        path = LEGACY_DIR / fname
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
             for sub in ast.walk(node):
                 targets = []
                 if isinstance(sub, ast.Assign):
@@ -40,6 +61,14 @@ def _own_attributes() -> set[str]:
                             and t.value.id == "self"):
                         names.add(t.attr)
     return names
+
+
+def test_all_split_sources_exist() -> None:
+    """组成文件不能少：少一个就说明守卫扫不全（会静默放过命名空间冲突）。"""
+    missing = [f for f in QD_AGENT_SOURCES if not (LEGACY_DIR / f).is_file()]
+    assert not missing, (
+        f"QDAgent 组成文件缺失 {missing} —— 本守卫会漏扫 `self.X` 赋值，"
+        f"请同步更新 QD_AGENT_SOURCES")
 
 
 def _ancestor_callables() -> dict[str, str]:

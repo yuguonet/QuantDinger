@@ -66,9 +66,9 @@ def _build():
             from .stock import StockResolver
             from .time import TimeResolver
         except ImportError:  # 直跑（app/agent 在 sys.path）时的裸导入
-            from resolvers.composite import CompositeResolver
-            from resolvers.stock import StockResolver
-            from resolvers.time import TimeResolver
+            from .composite import CompositeResolver
+            from .stock import StockResolver
+            from .time import TimeResolver
 
         def _time_factory(ctx):
             """时间解析必须拿到"由标的反推的领域"，否则交易日口径不生效。"""
@@ -120,10 +120,10 @@ def resolve(text: str) -> Dict[str, object]:
     # 领域倒推：chat 阶段拿不到 selected_domain，只能由实体类型反推
     if out["entity_type"] and out["entity_type"] not in ("entity_clarify",):
         try:
-            from domain_registry import entity_to_domain
+            from ..domain_registry import entity_to_domain
         except ImportError:
             try:
-                from domain_registry import entity_to_domain
+                from ..domain_registry import entity_to_domain
             except ImportError:
                 entity_to_domain = None       # type: ignore
         if entity_to_domain is not None:

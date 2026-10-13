@@ -171,7 +171,19 @@ def test_fold_exempt_entries_are_structured():
     到期即红会让门禁变成闹钟，可见性由 doctor 的 WARN 承担（豁免体检逐条输出）。
     """
     from app.market_cn.auto.strategies.base import FOLD_CONTRACT_EXEMPT, exemption_report
-    assert FOLD_CONTRACT_EXEMPT, "名单为空？删除本测试前请确认策略已全部迁折叠契约"
+
+    # ★ 2026-10-13 改判据：策略已全部迁折叠契约 ⇒ 名单清空是**合法终态**。
+    #   原断言 `assert FOLD_CONTRACT_EXEMPT` 的注释本就写明"名单为空？删除本测试前
+    #   请确认策略已全部迁折叠契约" —— 该前提现已成立（同文件
+    #   `test_daily_close_without_fold_contract_is_exposed` 实测通过且 nocon 为空）。
+    #   ⇒ 判据改为：空名单直接过；一旦有人再登记豁免，**仍逐条校验结构**。
+    #   这样既不把终态误判为红，也不丢掉"新增豁免必须带工单+到期日"这条守卫。
+    if not FOLD_CONTRACT_EXEMPT:
+        # 自证不是假绿：空名单时 exemption_report 必须返回空列表（而非炸或编造）
+        assert exemption_report() == [], \
+            "名单为空但 exemption_report 非空 ⇒ 报告函数与名单不同源，属假绿"
+        return
+
     for ent in exemption_report():
         assert ent["ticket"], "%s 豁免无 ticket（迁移工单）" % ent["key"]
         assert ent["expires"], "%s 豁免无 expires（豁免不得无到期）" % ent["key"]

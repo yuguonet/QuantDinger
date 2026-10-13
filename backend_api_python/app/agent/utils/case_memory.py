@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """案例记忆（提智方案 三波 T1，CBR，2026-09-24，署名：OpenClaw agent）。
 
 来源：`agent_tizhi_final_plan_20260923.md` §三 三波 T1 + 用户方案 §三 一（案例记忆）。
@@ -197,7 +197,7 @@ def _get_embedder():
         provider = (os.getenv("EMBEDDING_PROVIDER", "") or "").strip()
         if not provider:
             return None
-        from rag.embeddings import EmbeddingModel
+        from ..rag.embeddings import EmbeddingModel
         _embedder = EmbeddingModel(
             provider=provider,
             model=os.getenv("EMBEDDING_MODEL", ""),
@@ -246,7 +246,8 @@ def record_case(task_summary: str, *, root_id: Optional[int] = None, level: str 
                 plan_digest: Optional[List[dict]] = None,
                 failure_modes: Optional[List[str]] = None,
                 cost: Optional[dict] = None,
-                confidence: Optional[float] = None) -> Optional[str]:
+                confidence: Optional[float] = None,
+                evidence: Optional[dict] = None) -> Optional[str]:
     """落一条案例（finalize 后置钩子调用；fail-open）。
 
     outcome.label 恒以 `pending` 开局——correct/incorrect 由 T+N 回测经
@@ -268,7 +269,8 @@ def record_case(task_summary: str, *, root_id: Optional[int] = None, level: str 
     except Exception as e:
         logger.debug("[CaseMemory] embedding 跳过: %s", e)
 
-    outcome = {"label": "pending", "t_plus_n": None, "confidence": confidence}
+    # v5 P1-3：EV-1 证据向量随案例入库（`outcome.evidence` 子键，**不加列**）
+    outcome = _build_outcome(confidence=confidence, evidence=evidence)
     try:
         with _get_conn() as conn:
             if conn is None:
@@ -437,8 +439,62 @@ def retrieve_cases(query: str, top_k: int = 3,
     return kept[:top_k]
 
 
-def format_case_injection(cases: Sequence[dict]) -> str:
-    """案例 → planner 注入文本（严格两类语义，见头部"易错点"）。空/无案例返回 ""。"""
+def _build_outcome(confidence: Optional[float] = None,
+                   evidence: Optional[dict] = None) -> dict:
+    """组装 `outcome` jsonb（v5 P1-3）。
+
+    EV-1 证据向量存在 `outcome.evidence` **子键**里 —— **不加列**（不可逆 DDL）。
+    `backfill_by_root` 用 `jsonb_set(outcome,'{label}',...)` 只改 label，不受影响。
+
+    ★ 没有 evidence 时**不塞空壳**：空壳会让「没采集」看起来像「采集了但为空」，
+      两者语义完全不同，事后无法区分。
+    """
+    out: dict = {"label": "pending", "t_plus_n": None, "confidence": confidence}
+    if evidence:
+        out["evidence"] = evidence
+    return out
+
+
+def _checklist_lines(ev: Optional[dict]) -> List[str]:
+    """判别特征检查清单（v5 P1-3）。
+
+    ★ 为什么给"判别特征"而不是"结论"：模型拿到「当时判对了」只会照抄结构；
+      给它「当时**凭什么**这么判」，才是可迁移的预测力。
+
+    ★ 不伪造：没有判别特征就**如实说明**，不许填占位符 ——
+      否则模型会把「没记录」误读成「此处不适用」。
+    """
+    out: List[str] = []
+    if not ev:
+        out.append("    · （本例尚未记录判别特征 —— 这是「没采集」，"
+                   "不等于「不适用」，勿据此跳过论证）")
+        return out
+    ck = str(ev.get("condition_key") or "").strip()
+    if ck:
+        out.append(f"    · 适用市况：{ck}（市况不同则本例经验未必迁移）")
+    disc = [str(d).strip() for d in (ev.get("discriminators") or []) if str(d).strip()]
+    fals = [str(f).strip() for f in (ev.get("falsifiers") or []) if str(f).strip()]
+    if disc:
+        out.append("    · 判别特征：" + "；".join(disc[:4]))
+    if fals:
+        # 证伪条件 —— v5「证伪 gate」在注入侧的落地
+        out.append("    · 证伪条件（出现即本例经验不成立）：" + "；".join(fals[:3]))
+    if not disc and not fals:
+        out.append("    · （本例尚未记录判别特征 —— 这是「没采集」，"
+                   "不等于「不适用」，勿据此跳过论证）")
+    return out
+
+
+def format_case_injection(cases: Sequence[dict],
+                          with_checklist: bool = True) -> str:
+    """案例 → planner 注入文本（严格两类语义，见头部"易错点"）。空/无案例返回 ""。
+
+    ★ 2026-10-13 升级（v5 P1-3）：每条案例后追加**判别特征检查清单**
+      （适用市况 / 判别特征 / 证伪条件），来源是 `outcome.evidence`（EV-1）。
+    ★ **向后兼容红线**：返回串必须仍以 `【历史相似案例——仅作参考，不要照搬结构】`
+      开头 —— 压缩守卫（`tests/test_v5_compaction_guard.py`）与摘要指令
+      （`qd_agent._QD_COMPACT_NOTES` 第 6 条）都按这个指纹点名保护。
+    """
     if not cases:
         return ""
     lines = ["【历史相似案例——仅作参考，不要照搬结构】"]
@@ -458,6 +514,8 @@ def format_case_injection(cases: Sequence[dict]) -> str:
             if fmode:
                 line += "失败坑：" + "；".join(fmode)
             lines.append(line)
+            if with_checklist:
+                lines.extend(_checklist_lines((c.get("outcome") or {}).get("evidence")))
             continue
         tag = "T+N 校验正确" if label == "correct" else "校验中（未定论）"
         line = '- 任务"%s"：%s。' % (summary, tag)
@@ -466,6 +524,8 @@ def format_case_injection(cases: Sequence[dict]) -> str:
         if fmode:
             line += "坑：" + "；".join(fmode) + "。"
         lines.append(line)
+        if with_checklist:
+            lines.extend(_checklist_lines((c.get("outcome") or {}).get("evidence")))
     lines.append("（以上为历史个案；市况/口径不同必须自行重新论证，不要照抄结论。）")
     return "\n".join(lines)
 

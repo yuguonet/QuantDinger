@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
-from rag.vector_store import VectorStoreBase
+from .vector_store import VectorStoreBase
 
 logger = logging.getLogger(__name__)
 

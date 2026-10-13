@@ -6,7 +6,7 @@
   2. 有统计时排序变化：共现问法能把目标工具顶到候选面首位；
   3. held-out 召回率计算：「实际调用工具 ∈ 预选面」的命中率口径 + ≥95% 判定。
 
-约定：与生产同款**裸名导入**（app/agent 先进 sys.path），避免同一模块双实例。
+约定：与生产同款**绝对导入** `app.agent.*`（2026-10-13 P5 起）。
 """
 import importlib
 import inspect
@@ -14,17 +14,14 @@ import os
 import sys
 
 _BACKEND = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_AGENT = os.path.join(_BACKEND, "app", "agent")
-for _p in (_BACKEND, _AGENT):          # 与 app/agent/__init__ 同序：agent 在前
-    if _p in sys.path:
-        sys.path.remove(_p)
-    sys.path.insert(0, _p)
-
-from tools.preselect_cooc import (  # noqa: E402
+# ★ 必须是 agent：新版 app/agent 目录已建起来，它下面也有 tools/ 包，
+#   把新版目录塞进 sys.path 会让裸名 `tools` 命中新版，旧模块直接消失。
+# 【2026-10-13·P5】不再把 legacy 目录塞进 sys.path，改用绝对导入。
+from app.agent.preselect import (  # noqa: E402
     build_weights, get_weights, heldout_recall, load_pairs, load_weights,
     rank_candidates, save_weights, weights_path,
 )
-from tools import preselect_stats as PS  # noqa: E402
+from app.agent.preselect import preselect_stats as PS  # noqa: E402
 
 
 def _pairs_repeat(query: str, tools: list, n: int) -> list:
@@ -168,14 +165,25 @@ def test_weights_save_load_roundtrip(tmp_path, monkeypatch):
 
 
 def test_not_tools_coverage():
-    """新模块公开函数必须全部退出工具注册（否则静默多一份必注入 schema）。"""
-    cooc = importlib.import_module("tools.preselect_cooc")
-    pub = {n for n, o in vars(cooc).items()
-           if inspect.isfunction(o) and getattr(o, "__module__", "") == cooc.__name__
-           and not n.startswith("_")}
-    assert pub <= set(cooc._NOT_TOOLS), sorted(pub - set(cooc._NOT_TOOLS))
+    """预选管线的公开函数**一个都不许进注册表**。
 
-    # preselect_stats：既有 5 个计数器函数保持原状（token 基线不动），
-    # 但新增的配对口必须登记退出注册
-    stats = importlib.import_module("tools.preselect_stats")
-    assert {"record_task_calls", "pairs_path"} <= set(stats._NOT_TOOLS)
+    ★ 2026-10-13 P9 换了判据：不再查 `_NOT_TOOLS` 名单是否登记齐全
+      （名单是人写的，漏登记时这条测试会跟着一起漏 —— 自己验自己），
+      改为查**判据的源头**：这三个模块根本不在 `tools/` 自发现目录下，
+      且它们没有一个公开函数出现在注册表里。
+      附带修掉一个真洞：`preselect_stats` 此前只登记了 2 个名字，
+      `report` / `reset` / `record_selected` / `record_empty_face` / `empty_rate`
+      实际一直被注册成模型可调工具（等于把"清空计数器"开放给了模型）。
+    """
+    from app.agent.tools._base import ToolProvider
+
+    registered = set(ToolProvider.get_or_build().get_tool_names())
+    for mod_name in ("tool_preselect", "preselect_cooc", "preselect_stats"):
+        mod = importlib.import_module(f"app.agent.preselect.{mod_name}")
+        assert mod.__name__ == f"app.agent.preselect.{mod_name}", mod.__name__
+        pub = {n for n, o in vars(mod).items()
+               if inspect.isfunction(o) and getattr(o, "__module__", "") == mod.__name__
+               and not n.startswith("_")}
+        assert pub, f"{mod_name} 没扫到公开函数（模块路径错了？）"
+        leaked = sorted(registered & pub)
+        assert not leaked, f"{mod_name} 的公开函数被注册成了工具：{leaked}"

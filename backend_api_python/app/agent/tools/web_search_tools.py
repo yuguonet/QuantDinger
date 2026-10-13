@@ -8,7 +8,7 @@ web_search_tools — Agent 联网搜索工具
   3. baidusearch — 直接爬百度，免费无限额
   4. SearXNG — 自建兜底，无配额限制
 
-【注册方式·易错点】本模块在 tools/base.py 的 `_MUST_HAVE` 名单里 ⇒ scan_directory
+【注册方式·易错点】本模块在 tools/_base.py 的 `_MUST_HAVE` 名单里 ⇒ scan_directory
 **跳过它**、ToolProvider 里**没有** web_search ⇒ 上层包装（task_agent.py 的
 _WebSearchTool）必须**直接 import 本模块的实现**，绝不能 `provider.get("web_search")`
 （恒为 None，2026-09-21 事故）。曾误写为"由 ToolRegistry 自动发现，无需手动注册"。

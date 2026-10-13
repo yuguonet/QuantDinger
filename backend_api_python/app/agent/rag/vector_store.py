@@ -8,7 +8,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Optional, Any
 
-from rag.embeddings import EmbeddingBase
+from .embeddings import EmbeddingBase
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Cron Worker — Agent 定时任务后台执行器（自调度模式）。
 
@@ -19,6 +19,8 @@ SSE 推送：
 from __future__ import annotations
 
 import importlib
+
+from ..modpath import resolve_function_path
 import logging
 import queue
 import threading
@@ -220,9 +222,9 @@ def _next_cron_single(cron_expr: str, after: datetime, max_search_days: int = 62
 
 
 def _import_function(path: str) -> Callable:
-    module_path, _, func_name = path.rpartition(".")
-    if not module_path:
-        raise ImportError(f"Invalid function path: {path}")
+    # ⚠ DB 里存量定时任务存的是**裸名**（如 `cron.cron_tools.xxx`），改造后必须
+    # 补包前缀才 import 得到；新写的配置可以是绝对名。resolve_function_path 两者都认。
+    module_path, func_name = resolve_function_path(path)
     mod = importlib.import_module(module_path)
     fn = getattr(mod, func_name)
     if not callable(fn):
@@ -242,7 +244,7 @@ def _execute_prompt_job(job: Dict[str, Any]):
     _publish(_make_event("job_start", job_id, job_name, mode="prompt"))
 
     try:
-        from message_queue import submit
+        from ..message_queue import submit
         future = submit(prompt, session_id=job.get("session_id", "default"), timeout=300)
         content = future.result(timeout=300)
 

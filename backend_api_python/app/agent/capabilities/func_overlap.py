@@ -88,21 +88,29 @@ def code_judge_pair(cap: Dict[str, str], tool: Dict[str, str]) -> Tuple[str, str
     return "different", "无重合信号"
 
 
-def llm_judge_pairs(unsure: List[Tuple[Dict, Dict]], llm=None) -> Dict[str, str]:
+def llm_judge_pairs(unsure: List[Tuple[Dict, Dict]]) -> Dict[str, str]:
     """对 unsure 对做一次批量 LLM 判定（启动期，可选）。
 
     Returns: {f"{cap_name}|{tool_name}": "same"|"different"}
     失败/无 LLM → 全部按 "different"（宁可多留能力，也不误杀独立能力）。
+
+    【2026-10-13 P1】两处改动：
+    · LLM 出口改为 `app.agent.llm.complete()`（mimo models），旧的 `llm/`
+      自建层已退役，`llm=` 入参一并去掉（从来没有外部传过）。
+    · **修了一个从未生效的 bug**：旧代码 `resp = llm.generate(...)` 没有 await，
+      拿到的是 coroutine，`resp.content` 当场 AttributeError 被 except 吞掉，
+      于是这条判定永远走"全部 different"。换同步 `complete()` 后它才真正工作。
+      ⚠ 行为变化：启动期能力重叠判定现在真会判出 "same"（让位）。若观察到
+      误杀，先查 `load_or_build(use_llm=False)` 的降级开关，不要改判定逻辑。
     """
     if not unsure:
         return {}
-    if llm is None:
-        try:
-            from llm.factory import create_llm  # type: ignore
-            llm = create_llm()
-        except Exception as e:
-            logger.info("[func_overlap] 无 LLM，unsure 对按 different 保留: %s", e)
-            return {f"{c['name']}|{t['name']}": "different" for c, t in unsure}
+    try:
+        from app.agent.llm import resolve_provider
+        resolve_provider()  # 配置不全（无 key / 未知 provider）会抛，走下面 except
+    except Exception as e:
+        logger.info("[func_overlap] 无 LLM，unsure 对按 different 保留: %s", e)
+        return {f"{c['name']}|{t['name']}": "different" for c, t in unsure}
 
     lines = []
     for i, (c, t) in enumerate(unsure, 1):
@@ -116,8 +124,8 @@ def llm_judge_pairs(unsure: List[Tuple[Dict, Dict]], llm=None) -> Dict[str, str]
         "把握不大一律 false。\n\n" + "\n".join(lines)
     )
     try:
-        from llm.base import ChatMessage
-        resp = llm.generate(messages=[ChatMessage(role="user", content=prompt)])
+        from app.agent.llm import complete
+        resp = complete([{"role": "user", "content": prompt}])
         text = (resp.content or "").strip()
         # 捞 JSON 数组
         a, b = text.find("["), text.rfind("]")
@@ -141,8 +149,7 @@ def llm_judge_pairs(unsure: List[Tuple[Dict, Dict]], llm=None) -> Dict[str, str]
 
 def build_report(domain_tools: List[Dict[str, str]],
                  cap_entries: List[Dict[str, str]],
-                 use_llm: bool = True,
-                 llm=None) -> Dict[str, Any]:
+                 use_llm: bool = True) -> Dict[str, Any]:
     """产出 {capability_name: {decision, superseded_by, reason}}。
 
     decision: "shadowed"（让位）| "keep"
@@ -192,7 +199,7 @@ def build_report(domain_tools: List[Dict[str, str]],
             }
 
     if use_llm and unsure:
-        verdicts = llm_judge_pairs(unsure, llm=llm)
+        verdicts = llm_judge_pairs(unsure)
         for cap_name, meta in list(report.items()):
             if meta.get("reason") != "pending_llm":
                 continue
@@ -275,8 +282,7 @@ def collect_cap_meta_from_admission(admitted: List[Tuple]) -> List[Dict[str, str
     return out
 
 
-def load_or_build(provider, admitted, use_llm: bool = True, force: bool = False,
-                  llm=None) -> Dict[str, Any]:
+def load_or_build(provider, admitted, use_llm: bool = True, force: bool = False) -> Dict[str, Any]:
     """启动期入口：指纹未变用缓存，否则重算（可选 LLM）。"""
     domain_meta = collect_domain_meta(provider)
     cap_meta = collect_cap_meta_from_admission(admitted)
@@ -289,7 +295,7 @@ def load_or_build(provider, admitted, use_llm: bool = True, force: bool = False,
             return cached["report"]
 
     used_llm = bool(use_llm)
-    report = build_report(domain_meta, cap_meta, use_llm=use_llm, llm=llm)
+    report = build_report(domain_meta, cap_meta, use_llm=use_llm)
     save_cache(fp, report, used_llm=used_llm)
     n_shadow = sum(1 for v in report.values() if v.get("decision") == "shadowed")
     logger.info("[func_overlap] 同功能筛选完成: %d 能力, 让位 %d, llm=%s",

@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import json
 import os
-from log import logger
+from ...log import logger
 from typing import Any, Dict, List, Optional
 
-from tools.finance._analysis_utils import _get_ds
-from utils.md_format import _batch_execute, _to_md
+from ._analysis_utils import _get_ds
+from ...utils.md_format import _batch_execute, _to_md
 
 # ── 指数行情 / 市场概览 ──────────────────────────────────────
 
@@ -489,7 +489,7 @@ def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
         return result
 
     if len(code_list) == 1:
-        from tools.base import as_code_envelope
+        from .._base import as_code_envelope
         one = _filter_stock_info(_one(code_list[0]), detail)
         _NUM_KEYS = ("pe_ratio", "pb_ratio", "market_cn", "mcap_yi", "float_mcap_yi",
                      "roe", "price", "change_pct", "pe_ttm", "pe_static", "turnover_pct",
@@ -736,7 +736,7 @@ def _market_prefix(code: str) -> str:
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
     """融资融券摘要。提取融资余额趋势+近期变化幅度。"""
-    from tools.finance.em_utils import em_datacenter
+    from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPTA_WEB_RZRQ_GGMX",
         filter_str=f'(SCODE="{code}")',
@@ -763,7 +763,7 @@ def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
 
 def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
     """大宗交易摘要。提取近期成交笔数、平均溢价率、机构买卖方向。"""
-    from tools.finance.em_utils import em_datacenter
+    from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPT_DATA_BLOCKTRADE",
         filter_str=f'(SECURITY_CODE="{code}")',
@@ -800,7 +800,7 @@ def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
 
 def _get_holder_count(code: str) -> Dict[str, Any]:
     """股东户数摘要。提取最新户数、环比变化趋势。"""
-    from tools.finance.em_utils import em_datacenter
+    from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPT_HOLDERNUMLATEST",
         filter_str=f'(SECURITY_CODE="{code}")',
@@ -827,7 +827,7 @@ def _get_holder_count(code: str) -> Dict[str, Any]:
 
 def _get_dividend_history(code: str) -> Dict[str, Any]:
     """分红送转摘要。提取累计分红次数、连续分红年数、近期派息水平。"""
-    from tools.finance.em_utils import em_datacenter
+    from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPT_SHAREBONUS_DET",
         filter_str=f'(SECURITY_CODE="{code}")',

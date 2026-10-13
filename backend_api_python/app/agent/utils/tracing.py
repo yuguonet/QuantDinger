@@ -1,4 +1,4 @@
-﻿"""
+"""
 Agent 运行轨迹记录 + 结构化存储。
 
 统一采集：事件追加到 JSONL，finish() 时从事件流提取结构化字段写入 qd_agent_traces。
@@ -23,8 +23,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from llm.base import ChatMessage, LLMResponse
-
 logger = logging.getLogger(__name__)
 
 # 意图动词 → 兜底归类（2026-09-14）。
@@ -38,9 +36,9 @@ logger = logging.getLogger(__name__)
 # 若意图分类器仍把非金融任务标成 query，链名会错记 finance+query+stock（污染酿造候选）。
 # 2026-09-25：verb→(domain,noun) 已抽到 domain_registry / tools/<domain>/domain_meta.py，
 # 核心不再写死 finance/stock；新领域在 domain_meta 登记即可参与追溯归类。
-from domain_registry import classify_verb as _classify_verb
-from domain_registry import normalize_chain_name as _normalize_chain_name
-from domain_registry import strip_entity as _strip_entity
+from ..domain_registry import classify_verb as _classify_verb
+from ..domain_registry import normalize_chain_name as _normalize_chain_name
+from ..domain_registry import strip_entity as _strip_entity
 
 
 def _now_ms() -> int:
@@ -130,22 +128,10 @@ def _truncate(value: Any, limit: Optional[int] = None) -> Any:
     return value
 
 
-def messages_to_dict(messages: list[ChatMessage]) -> list[dict]:
-    return [msg.to_dict() for msg in messages]
-
-
-def llm_response_to_dict(response: LLMResponse) -> dict:
-    return {
-        "content": response.content,
-        "tool_calls": response.tool_calls,
-        "model": response.model,
-        "finish_reason": response.finish_reason,
-        "tokens_used": response.tokens_used,
-        "prompt_tokens": response.prompt_tokens,
-        "completion_tokens": response.completion_tokens,
-        "metadata": response.metadata,
-    }
-
+# 【2026-10-13 P1】原 `messages_to_dict` / `llm_response_to_dict` 两个转换函数删除：
+# 它们把旧的 `ChatMessage` / `LLMResponse` 转成 dict，而统一出口之后消息**本来就是**
+# OpenAI 原生 dict、结果直接带 dict 语义，转换层纯属空转；且实测全项目零调用。
+# 旧 llm/ 包随之退役，`from llm.base import ...` 一并去掉。
 
 # ═══════════════════════════════════════════════════════════════
 #  结构化字段提取（从 final_answer 提取 score/direction/action 等）
@@ -153,7 +139,7 @@ def llm_response_to_dict(response: LLMResponse) -> dict:
 
 def _extract_from_json(answer: str) -> dict:
     """从 Agent 输出的 JSON 中提取字段。返回空 dict 表示未命中。"""
-    from utils.json_parser import extract_decision
+    from .json_parser import extract_decision
     result = extract_decision(answer)
     return result if result else {}
 
@@ -258,6 +244,10 @@ def _extract_stock_from_answer(answer: str) -> tuple[str, str]:
 #  AgentTraceRecorder
 # ═══════════════════════════════════════════════════════════════
 
+# 纳入 prompt_sha 的文件后缀（扫描 `app/agent/prompts/` 时用）
+_PROMPT_SUFFIXES = (".txt", ".yaml", ".yml", ".md")
+
+
 def _repro_meta(tool_manifest=None) -> dict:
     """run 级可复现字段（2026-09-24 提智 0.8，agent提智 #8）：
     prompt 哈希 + 模型/温度/seed + 工具清单哈希 + 代码版本标识。
@@ -270,15 +260,28 @@ def _repro_meta(tool_manifest=None) -> dict:
     def _sha_file(path: Path) -> str:
         try:
             return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-        except Exception:
+        except Exception as e:
+            logger.debug("[Trace] prompt 无法读取 %s: %s", path, e)
             return "missing"
 
     prompts = Path(__file__).resolve().parent.parent / "prompts"
+
+    # ★ 2026-10-13 修 G10（v5 P1-4）：原实现**硬编码 5 个文件名**，其中
+    #   `plan_system.txt` / `code_agent.yaml` / `intent_classifier.txt` 早已删除
+    #   ⇒ `prompt_sha` 恒为 3/5 `"missing"` —— **静默降级**，复盘时对不上版本，
+    #   而这正是 `_repro_meta` 存在的唯一理由（回答"这单结论是哪套配置给出的"）。
+    #   改为**扫描目录**：删了/加了自动跟随，结构上不可能再出现恒 missing。
+    #   `QD_PROMPT_SHA_FILES` 可显式指定（逗号分隔），用于只关心部分文件时收窄。
+    _listed = os.getenv("QD_PROMPT_SHA_FILES", "").strip()
+    if _listed:
+        files = [prompts / n.strip() for n in _listed.split(",") if n.strip()]
+    else:
+        files = sorted(p for p in prompts.glob("*")
+                       if p.is_file() and p.suffix.lower() in _PROMPT_SUFFIXES)
+    if not files:
+        logger.warning("[Trace] prompts 目录未扫到任何 prompt 文件: %s", prompts)
     meta = {
-        "prompt_sha": {p.name: _sha_file(p) for p in (
-            prompts / "plan_system.txt", prompts / "code_agent.yaml",
-            prompts / "intent_classifier.txt", prompts / "skill_brew.txt",
-            prompts / "skill_revise.txt")},
+        "prompt_sha": {p.name: _sha_file(p) for p in files},
         "model": os.getenv("OPENAI_MODEL", ""),
         "temperature": os.getenv("AGENT_LLM_TEMPERATURE", ""),
         "seed": os.getenv("AGENT_LLM_SEED", ""),
@@ -352,7 +355,7 @@ class AgentTraceRecorder:
 
         # 0.9 计数器面板：从事件流汇总（原则 7：校验环自证在工作）。
         try:
-            from utils.budget import empty_panel, bump
+            from .budget import empty_panel, bump
             self._panel = empty_panel()
             self._panel["runs"] = 1
             self._bump = bump
@@ -560,7 +563,7 @@ class AgentTraceRecorder:
 
     def _write_jsonl(self):
         try:
-            from utils.mask import mask_obj as _mask
+            from .mask import mask_obj as _mask
         except Exception:
             _mask = lambda x: x  # noqa: E731
 
@@ -631,7 +634,7 @@ class AgentTraceRecorder:
         不参与 T+N 回测与权重聚合——query_pending_verify 只取 status='ok'）。
         """
         try:
-            from chain.schema import EvalNode, Layer
+            from ..chain.schema import EvalNode, Layer
 
             # 提取 stock_code（优先上下文，降级从答案提取）
             stock_code = self.stock_code
@@ -758,7 +761,7 @@ class AgentTraceRecorder:
             root.tools_called = [tc["name"] for tc in self._tool_calls]
 
             # 写入 qd_agent_traces
-            from chain import store
+            from ..chain import store
             execution_id = store.save_tree(root)
             if execution_id:
                 root.id = execution_id

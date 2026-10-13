@@ -53,7 +53,7 @@ for _p in (str(BACKEND_ROOT), str(AGENT_DIR)):
         sys.path.insert(0, _p)
 
 try:
-    import mimo_boot  # noqa: E402,F401   （执行核依赖；--rejudge 不依赖它）
+    from app.agent import mimo_boot
 except Exception:
     pass
 
@@ -116,7 +116,7 @@ def _verdict(records: List[dict], cost_max: float = COST_MAX,
 
 def _all_tool_names() -> List[str]:
     """生产工具面全名单（函数工具 + 元工具）——对照臂从这里摘 run_skill。"""
-    from tools.base import ToolProvider
+    from app.agent.tools._base import ToolProvider
     p = ToolProvider.get_or_build()
     names = set(p.get_functions() or {}) | set(p.get_meta_functions() or {})
     return sorted(names)
@@ -131,8 +131,8 @@ def arm_whitelist(arm: str, names: Optional[List[str]] = None) -> List[str]:
 
 
 def _build_service(arm: str, step_limit: int):
-    from qd_service import QDAgentService
-    from memory import LocalMemory
+    from app.agent.qd_service import QDAgentService
+    from app.agent.memory import LocalMemory
     cfg: Dict[str, Any] = {"tool_whitelist": arm_whitelist(arm)}
     if step_limit:
         cfg["step_limit"] = int(step_limit)
@@ -182,7 +182,7 @@ def _quality(task_id: str, query: str, answer: str, corpus: str) -> float:
 def run_experiment(queries: List[Tuple[str, str]], step_limit: int = 0,
                    model: str = "") -> dict:
     """queries = [(task_id, query)]；每题两臂各跑一次。"""
-    import qd_bench as B          # noqa: F401  （_quality 的评分口径）
+    import qd_bench as B
     records = []
     svc_dispatch = _build_service("dispatch", step_limit)
     svc_inline = _build_service("inline", step_limit)
@@ -268,8 +268,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if rep["verdict"]["pass"] else 1
 
     try:
-        import qd_bench as B  # noqa: F401
-        from qd_service import QDAgentService  # noqa: F401
+        import qd_bench as B
+        from app.agent.qd_service import QDAgentService
     except Exception as e:
         print(f"[ENV] 运行条件不满足: {type(e).__name__}: {e}")
         return 2

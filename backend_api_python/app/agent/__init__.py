@@ -1,60 +1,33 @@
 # -*- coding: utf-8 -*-
-"""Agent package — 统一路径设置（裸名导入的唯一切入点）。
+"""QuantDinger 执行系统（Agent）—— 包内一律**相对导入**，零 sys.path 注入。
 
-【导入约定】agent 包内一律用**裸名**：`from chain.store import ...`、
-`import agent as agent_mod`，而**不用**全名 `app.agent.chain.store`。
+【导入约定 · 2026-10-13 改】
+包内一律**相对导入**：`from .chain.store import ...`、`from ..tools._base import ...`；
+包外一律**绝对导入**：`from app.agent.chain.evaluator import start_eval_worker`。
+**本目录不进 sys.path**，因此包内不存在裸名导入这种写法。
 
-为什么不用全名：全名把包名硬编码进 300+ 处 import，一旦移动或重命名目录
-（`app/agent` → 别处）就得全量改，移植成本极高。裸名只依赖本文件里一处
-`__file__` 相对计算，目录怎么搬都不用改代码。
+为什么改（事故 M-1 的根治）：
+  旧写法是把本目录塞进 sys.path，包内全用裸名（`from chain.store import ...`）。
+  代价是本目录下 30 个顶层名（chain / tools / utils / log / memory / rag /
+  skills / cron / capabilities / ...）变成**全进程**裸名，于是同一份源码可以同时
+  以裸名 `chain.store` 和全名 `app.agent.chain.store` 被加载成**两个 module
+  对象** —— 模块级单例（agent 实例 / 会话表 / TraceCollector / 权重缓存）全部双份
+  且状态互不可见。这不是理论风险，实测发生过。
 
-代价与约束（必须遵守）：
-  1. `app/agent/` 下 23 个顶层名（chain / tools / utils / log / memory / rag /
-     llm / skills / cron / audit / agents / capabilities / constants / cli /
-     resolvers / ...）会成为**全进程**裸名。已实测与 site-packages 无同名冲突，
-     新增顶层模块前请先确认不与第三方包重名。
-  2. **`app/agent/` 必须排在 `app/` 之前**，否则 `import utils` 会命中
-     `app/utils` 而不是 `app/agent/utils`。两处 bootstrap（本文件与
-     `app/__init__.py`）都按「先 app/ 后 app/agent/」的顺序 insert(0)。
-  3. 绝不能出现「同一模块既用裸名又用全名」——那会加载成两个 module 对象，
-     模块级单例（QDAgentService / 会话表 / TraceCollector 收集器 / 权重缓存）
-     全部双份且状态互不可见（事故 M-1）。护栏：`qd_smoke.py::test_29`。
+  相对导入保留了原本选择裸名的那个理由（目录搬家不用改代码），同时消灭了
+  "两种名字"这个病根：相对导入解析后的 `__name__` 就是唯一的 `app.agent.*`
+  ，与包外绝对导入指向同一个对象。
 
-⚠ 关于第 2 条的历史事故（2026-10-02）：`app/agent` 与 `app` 的先后顺序**不是
-一次 insert 就能保证的**，它取决于「谁先被 import」的时序。曾经
-`skills/market_screener/common.py` 把 `app/`（误当成 backend 根）insert 到
-sys.path[0]，且没配套插 `app/agent/` ⇒ `app/` 反超 ⇒ `import utils` 命中
-`app/utils` ⇒ 9 个 finance 工具模块因 `utils.md_format` 找不到被静默跳过。
-因此本文件提供幂等的 `ensure_path_order()`：**去重 + 强制保序**，任何 bootstrap
-点都可以重复调用，不会把顺序改坏。
+为什么不用全名绝对导入：
+  相对导入让"整体重命名目录"变成零改动（历史上 `app/agent` → `app/agent`
+  就踩过一次：改完后 `app/agent` 变成新版骨架，包内残留的 `app.agent.tools.finance`
+  指向了不存在的模块，`chain/context_frame.py` 与 `chain/sampler.py` 两条链路
+  ImportError 静默炸掉、全量测试零覆盖无人发现 —— 见
+  `tests/test_v6_import_modernize.py::test_no_dangling_app_agent_references`）。
+
+【约束】
+  1. 新增模块不得再用裸名导入（红线 R2 自动拦）。
+  2. 不得再往 sys.path 里塞本目录（红线 R3/R4 自动拦）。
+  3. 入口脚本（`cli.py`、`scripts/*.py`）可以用绝对导入 + 挂 backend 根 ——
+     它们以 `python xxx.py` 直跑，没有包上下文，是唯一豁免区。
 """
-import os
-import sys
-
-_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_agent_dir = os.path.abspath(os.path.dirname(__file__))
-_app_dir = os.path.dirname(_agent_dir)
-
-
-def ensure_path_order():
-    """幂等：保证 `app/agent/` 严格排在 `app/` 之前，且两目录在 sys.path 中唯一。
-
-    可重复调用。任何往 sys.path 里塞目录的代码（`app/__init__.py`、各 CLI 脚本、
-    skills 下的独立入口）都应在插入后调用一次，避免把 `app/` 顶到 `app/agent/`
-    之上造成裸名解析错位（详见本文件头部事故说明）。
-    """
-    # 只补 backend 根；**不主动引入 app/**（那是 app/__init__.py 的职责，
-    # 提前加会把 app 下的顶层包也变成裸名）。下面只做「保序」。
-    if _project_root not in sys.path:
-        sys.path.insert(0, _project_root)
-    # 去重：把 _agent_dir 的所有出现摘掉，再插到 _app_dir 首次出现之前
-    while _agent_dir in sys.path:
-        sys.path.remove(_agent_dir)
-    if _app_dir in sys.path:
-        sys.path.insert(sys.path.index(_app_dir), _agent_dir)
-    else:
-        sys.path.insert(0, _agent_dir)
-
-
-# 顺序不能反：后插的在 sys.path 更靠前 ⇒ _agent_dir 最终压在 _project_root/app 之上
-ensure_path_order()

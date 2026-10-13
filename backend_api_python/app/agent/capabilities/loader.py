@@ -30,6 +30,8 @@ from __future__ import annotations
 import functools
 import os
 import importlib
+
+from ..modpath import import_module
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -218,7 +220,7 @@ def _wrap_guards(fn, timeout_s, max_chars, tool_name):
                 logger.warning("[capability:%s] 落盘失败: %s", tool_name, e)
             # 2026-09-25 智力下降修复：旧形态只有 {note,file,preview}，模型按
             # 业务工具习惯写 r["data"][code]/r[0] → KeyError，整段分析被拖垮。
-            # 统一补可下标 data + count + truncated，与 tools.base 信封对齐。
+            # 统一补可下标 data + count + truncated，与 tools._base 信封对齐。
             data_obj = result if isinstance(result, (list, dict)) else None
             if isinstance(result, list):
                 data_obj = result[: max(1, min(50, max_chars // 80))]
@@ -291,7 +293,7 @@ def register_capabilities(provider, admission_path=None,
                 conflicts.append(f"{mod_path}:{name}(近重名让位→{_shadows})")
                 continue
         try:
-            mod = importlib.import_module(mod_path)
+            mod = import_module(mod_path)
             fn = getattr(mod, name)
             if not callable(fn):
                 raise TypeError("not callable")

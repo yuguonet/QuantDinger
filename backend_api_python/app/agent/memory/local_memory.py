@@ -8,7 +8,7 @@
 """
 from collections import defaultdict
 
-from memory.base import MemoryBase, MemoryMessage
+from .base import MemoryBase, MemoryMessage
 
 
 class LocalMemory(MemoryBase):

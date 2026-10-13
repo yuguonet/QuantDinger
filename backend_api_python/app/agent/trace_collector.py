@@ -31,16 +31,14 @@ TraceCollector — Agent 执行追踪器（mimo 新系统的决策树写入侧�
 """
 from __future__ import annotations
 
-from log import logger
+from .log import logger
 import re
 import time
 from datetime import date
 from typing import Any, List, Optional
 
-from chain.schema import (
-    EvalNode, Layer, Status,
-)
-from utils.json_parser import extract_decision
+from .chain.schema import EvalNode, Layer, Status
+from .utils.json_parser import extract_decision
 
 
 # ── 标的代码识别（2026-10-01）──────────────────────────────────
@@ -329,7 +327,7 @@ class TraceCollector:
         """将组装好的 EvalNode 树写入 SQL。调用方在确认成功后调用。"""
         if not self._root:
             return None
-        from chain import store
+        from .chain import store
         execution_id = store.save_tree(self._root)
         self._root.id = execution_id
         return execution_id

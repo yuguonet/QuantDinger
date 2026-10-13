@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 
-from log import logger
+from ...log import logger
 from typing import Any, Dict, List
-from utils.md_format import _batch_execute, _to_md
+from ...utils.md_format import _batch_execute, _to_md
 # 工具层短时缓存: 同一 symbol 60s 内直接返回
 _search_cache: Dict[str, tuple] = {}  # key → (timestamp, result)
 _CACHE_TTL = 60
@@ -120,7 +120,7 @@ def search_stock_intel(codes: str, name: str = "") -> dict:
         return _build_result(items, f"个股:{stock_code}")
 
     if len(code_list) == 1:
-        from tools.base import as_code_envelope
+        from .._base import as_code_envelope
         return as_code_envelope(code_list[0], _one(code_list[0]))
 
     results = {}

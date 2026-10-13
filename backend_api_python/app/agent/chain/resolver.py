@@ -32,7 +32,8 @@ import re
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional
 
-from log import logger
+from . import label_spec
+from ..log import logger
 
 JUDGE_VER = "v1.1"
 
@@ -54,12 +55,94 @@ def _env_flag(name: str, default: bool) -> bool:
 #  阶段 A：真实数据（确定性）
 # ═══════════════════════════════════════════════════════════════
 def _horizon_days(horizon: str) -> int:
-    return {"T+1": 1, "T+3": 3, "T+5": 5, "2W": 10, "1M": 20}.get(horizon or "", 3)
+    """horizon 标签 → 持有交易日数。
+
+    ★ 委派 `chain/label_spec`（v5 P1-1 起的**唯一真源**），**不在此另写一份映射**。
+      口径曾在 evaluator / claims / resolver 三处各写一份且数值不同，
+      改一处忘两处 = 静默漂移（老教训）。
+    ★ 这里**允许兜底**（未知标签 → 3）：resolver 面对的是模型自由文本，
+      识别不了是常态而非异常。全项目仅 `label_spec.resolve_hold_days` 提供该兜底。
+    """
+    return label_spec.resolve_hold_days(horizon, default=3)
+
+
+def _days_label(days: int) -> str:
+    """持有交易日数 → horizon 标签（双窗口输出用）。"""
+    return label_spec.hold_label(days)
+
+
+def _label_windows() -> List[str]:
+    """双窗口的**窗口集合**（env 可配，禁止硬编码）。
+
+    `QD_LABEL_WINDOWS` 默认 `T+1,T+3`。语义（v5 §0.4 用户拍板）：
+      · **T+3 是主判据** —— 进 `verdict` / `verdict_score`、进权重；
+      · **T+1 只报告** —— 挂 `actual.windows` / `deviation.windows` 供快速诊断，
+        不进权重（否则同一预测被记两票，与 G24 是同一类错误）。
+
+    ★ 集合里**不含** claim 自身 horizon 时，主窗口仍会被算（主窗口恒在），
+      集合只决定**额外**多算哪几个观测点。
+    """
+    raw = os.getenv("QD_LABEL_WINDOWS", "T+1,T+3").strip()
+    out: List[str] = []
+    for tok in raw.split(","):
+        t = tok.strip().upper()
+        # 未识别的标签**丢弃**而不是兜底成默认值：静默兜底会让口径悄悄漂移。
+        # 成员资格直接问 label_spec（唯一真源），不在此另写一份标签清单。
+        if t and label_spec.hold_days(t) is not None and t not in out:
+            out.append(t)
+    return out
+
+
+def _actual_view(r: Dict[str, Any]) -> Dict[str, Any]:
+    """把 `_get_actual_return` 的原始结果（主窗口或 `windows` 子项）转成 actual 形态。
+
+    ★ 主窗口与附加窗口**共用这一个转换** —— 保证两者同构、口径一致。
+      若给附加窗口另写一份，就会出现「T+1 用一套阈值、T+3 用另一套」的静默漂移。
+    """
+    pct = float(r.get("pnl_pct") or 0.0)
+    if pct > _FLAT_PCT:
+        d = "bullish"
+    elif pct < -_FLAT_PCT:
+        d = "bearish"
+    else:
+        d = "neutral"
+    try:
+        as_of = date.fromisoformat(str(r.get("exit_date") or "")[:10])
+    except (ValueError, TypeError):
+        as_of = None
+    try:
+        ah = int(r.get("hold_days") or 0)
+    except (TypeError, ValueError):
+        ah = 0
+    exp = r.get("hold_days_expected")
+    return {
+        "pct": round(pct, 2),
+        "dir": d,
+        "high": r.get("high"),
+        "low": r.get("low"),
+        "close": r.get("exit_close"),
+        "as_of": as_of,
+        "source": "CNStockDataSource.get_kline(1D)",
+        "hold_days": ah,
+        "hold_days_expected": exp,
+        "truncated": bool(r.get("truncated")),
+    }
 
 
 def fetch_actual(subject: str, subject_kind: str, horizon: str,
-                 exec_date: Optional[date] = None) -> Optional[Dict[str, Any]]:
+                 exec_date: Optional[date] = None,
+                 extra_windows: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """按 subject 取真实行情（复用 evaluator 的单一取数口径，含窗口极值）。
+
+    ★ 2026-10-13 新增 `windows`（v5 阶段 D3 方案 D：双窗口标签）：
+      除主窗口（= claim 的 horizon，默认 T+3）外，按 `QD_LABEL_WINDOWS`
+      额外多算若干观测点（默认 T+1），**一次取数**全部给出。
+      语义红线：**只有主窗口进 `verdict`**，附加窗口只挂在
+      `actual.windows` / `deviation.windows` 供快速诊断，不进权重。
+
+    Args:
+        extra_windows: 覆盖 env 的附加窗口集合（测试/特殊用途）。
+            与主 horizon 相同的标签会被**自动剔除**（主窗口恒在，不重复算）。
 
     ★ 2026-10-12 新增 `truncated` 标记（G0 Bug C）：
       `_get_actual_return` 内部是 `exit_idx = min(base_idx + hold_days, len-1)`，
@@ -81,44 +164,35 @@ def fetch_actual(subject: str, subject_kind: str, horizon: str,
         return None                     # v1 不支持板块指数取数 ⇒ data_missing
     if kind not in ("stock", "index", "symbol"):
         return None
+    main = (horizon or "T+3").strip().upper()
+    hold = _horizon_days(main)
+    # 附加窗口：剔除与主窗口相同的标签（主窗口**恒在**，不重复算）
+    extra = [w for w in (extra_windows if extra_windows is not None
+                         else _label_windows())
+             if w != main]
+    holds = [_horizon_days(w) for w in extra]
     try:
-        from chain.evaluator import _get_actual_return
-        hold = _horizon_days(horizon)
+        from .evaluator import _get_actual_return
         r = _get_actual_return(subject, exec_date or date.today(), hold,
-                               with_extremes=True)
+                               with_extremes=True, extra_holds=holds)
     except Exception as e:
         logger.debug("[Resolver] 取真实数据失败 %s: %s", subject, e)
         return None
     if not r:
         return None
-    pct = float(r.get("pnl_pct") or 0.0)
-    if pct > _FLAT_PCT:
-        d = "bullish"
-    elif pct < -_FLAT_PCT:
-        d = "bearish"
-    else:
-        d = "neutral"
-    try:
-        as_of = date.fromisoformat(str(r.get("exit_date") or "")[:10])
-    except (ValueError, TypeError):
-        as_of = None
-    out = {
-        "pct": round(pct, 2),
-        "dir": d,
-        "high": r.get("high"),
-        "low": r.get("low"),
-        "close": r.get("exit_close"),
-        "as_of": as_of,
-        "source": "CNStockDataSource.get_kline(1D)",
-    }
-    # ── 视界门②（截断）：实际持有根数 < 应有根数 ⇒ 窗口不完整
-    try:
-        actual_hold = int(r.get("hold_days") or 0)
-    except (TypeError, ValueError):
-        actual_hold = 0
-    out["hold_days"] = actual_hold
-    out["hold_days_expected"] = hold
-    out["truncated"] = bool(actual_hold < hold)
+    out = _actual_view(r)
+    # ── 双窗口（v5 D3 方案 D）：把 `windows`（键为天数字符串）映射成 horizon 标签
+    #    主窗口与附加窗口共用 `_actual_view`，保证同构。
+    wins: Dict[str, Any] = {}
+    for h_str, w in (r.get("windows") or {}).items():
+        if not isinstance(w, dict):
+            continue
+        try:
+            h = int(h_str)
+        except (TypeError, ValueError):
+            continue
+        wins[_days_label(h)] = _actual_view(w)
+    out["windows"] = wins
     return out
 
 
@@ -236,9 +310,10 @@ def judge_one(claim: Dict[str, Any], actual: Dict[str, Any],
               dev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """请 LLM 判一条（返回 None 表示 judge 不可用 ⇒ 调用方回退代码锚点）。"""
     try:
-        from llm.factory import create_llm
-        from llm.base import ChatMessage
-        import asyncio
+        # 【2026-10-13 P1】旧实现为兼容"可能在事件循环里/可能不在"搓了三层分支
+        # （get_event_loop → ThreadPoolExecutor → asyncio.run）。统一出口是同步的
+        # `complete()`，两种上下文都直接可用，分支全部消失。
+        from app.agent.llm import complete
         payload = {
             "claim_type": claim.get("claim_type"),
             "subject": claim.get("subject"),
@@ -248,20 +323,11 @@ def judge_one(claim: Dict[str, Any], actual: Dict[str, Any],
             "deviation": dev,
             "confidence": claim.get("confidence"),
         }
-        llm = create_llm(None)
-        msgs = [ChatMessage(role="system", content=JUDGE_SYSTEM),
-                ChatMessage(role="user", content=json.dumps(payload, ensure_ascii=False))]
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures as _cf
-                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                    resp = ex.submit(asyncio.run, llm.generate(msgs)).result()
-            else:
-                resp = loop.run_until_complete(llm.generate(msgs))
-        except RuntimeError:
-            resp = asyncio.run(llm.generate(msgs))
-        text = (getattr(resp, "content", "") or "").strip()
+        resp = complete([
+            {"role": "system", "content": JUDGE_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ])
+        text = (resp.content or "").strip()
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
             return None
@@ -271,7 +337,7 @@ def judge_one(claim: Dict[str, Any], actual: Dict[str, Any],
                 "attribution": str(obj.get("attribution") or ""),
                 "note": str(obj.get("note") or "")[:300],
                 "raw": text[:2000],
-                "model": getattr(llm, "model", "") or ""}
+                "model": resp.model or ""}
     except Exception as e:
         logger.debug("[Resolver] judge 失败(回退规则判定): %s", e)
         return None
@@ -337,6 +403,15 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
                 "resolver_kind": "market_data", "sampled": False}
 
     dev = compute_deviation(claim, actual)
+    # ── 双窗口偏差（v5 D3 方案 D）：每个观测点各算一份，挂 `deviation.windows`
+    #    ★ **只作诊断，不参与 verdict** —— 主判据恒为主窗口 T+3（v5 §0.4 用户拍板）。
+    #      若让 T+1 也进 verdict，同一条预测就会被记两票（与 G24 同一类错误）。
+    _wd: Dict[str, Any] = {}
+    for _lab, _wa in (actual.get("windows") or {}).items():
+        if isinstance(_wa, dict):
+            _wd[_lab] = compute_deviation(claim, _wa)
+    if _wd:
+        dev["windows"] = _wd
     out = verdict_by_rule(claim, actual, dev)
     kind, model, raw = "market_data", "", ""
     sampled = False
@@ -348,7 +423,7 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
             #   claim 才说明规则有缺口。详情见 chain/judge_stats.py 的阈值表与
             #   "人工校准四步"（当前 human_verdict 列无写入路径，就是留给那一步的）。
             try:
-                from chain import judge_stats as _js
+                from . import judge_stats as _js
                 _js.record_call()
                 _js.record_result(
                     ok=True,
@@ -360,7 +435,7 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
             kind, model, raw, sampled = "llm_judge", j.get("model", ""), j.get("raw", ""), True
         else:
             try:
-                from chain import judge_stats as _js
+                from . import judge_stats as _js
                 _js.record_call()
                 _js.record_result(ok=False)
             except Exception:
@@ -385,7 +460,7 @@ def resolve_claim(claim: Dict[str, Any], exec_date: Optional[date] = None,
                   use_judge: Optional[bool] = None,
                   policy: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """判定单条 claim（含写库）。域由配置驱动分派。"""
-    from chain import account_store as _as
+    from . import account_store as _as
     pol = policy or _as.load_domain_policy()
     dom = claim.get("domain") or "finance"
     cfg = pol.get(dom) or {}
@@ -423,7 +498,7 @@ def resolve_claim(claim: Dict[str, Any], exec_date: Optional[date] = None,
 
 def resolve_due_claims(limit: int = 50, use_judge: Optional[bool] = None) -> Dict[str, Any]:
     """扫到期 claim 并判定（evaluator 的盘后任务会调这里）。"""
-    from chain import account_store as _as
+    from . import account_store as _as
     items = _as.query_due_claims(limit=limit)
     stats: Dict[str, Any] = {"due": len(items), "resolved": 0, "undecidable": 0,
                              "skipped": 0, "errors": 0, "judged": 0, "details": []}

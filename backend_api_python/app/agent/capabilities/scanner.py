@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import importlib
+
+from ..modpath import import_module
 import inspect
 import json
 import sys
@@ -36,20 +38,16 @@ from pathlib import Path
 
 
 def _bootstrap_path():
-    """独立运行时把 backend_api_python 挂上 sys.path（幂等）。
+    """仅限**命令行独立运行**时把 backend_api_python 挂上 sys.path（幂等）。
 
-    只挂 backend_api_python（保证 `import app.*` 可用）。**不要**再挂 app/agent：
-    那会让 agent 子模块同时存在裸名与全名两份 module（两份单例/缓存），
-    并让 `import utils|log|tools|memory|chain|rag|llm|cron...` 在全进程命中
-    agent 下的同名包。包内一律用**裸名**（`from chain.store import ...`），
-    不用全名 `app.agent.*`（详见 app/agent/__init__.py 头部说明）。
+    【2026-10-13·P5】原来是在模块级无条件调用，任何 `import capabilities.scanner`
+    都会污染全进程 sys.path。现在包内一律相对导入、包外一律绝对导入，
+    只有 `python capabilities/scanner.py` 这种**直跑**场景才需要 backend 根
+    （保证 `import app.*` 成立），因此挪进 `__main__` 块。
     """
     base = Path(__file__).resolve().parents[3]   # backend_api_python
     if str(base) not in sys.path:
         sys.path.insert(0, str(base))
-
-
-_bootstrap_path()
 
 # ── 显式扫描范围（第一域: auto/ 数据与信号接口层）──
 SCAN_TARGETS = [
@@ -114,7 +112,7 @@ def scan(targets=None):
     functions = []
     for mod_path in targets:
         try:
-            mod = importlib.import_module(mod_path)
+            mod = import_module(mod_path)
         except Exception as e:
             functions.append({"module": mod_path, "error": f"import failed: {e}"})
             continue
@@ -229,4 +227,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _bootstrap_path()
     main()

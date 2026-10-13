@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import importlib
+
+from .modpath import import_module
 import logging
 import re
 from dataclasses import dataclass, field
@@ -84,7 +86,7 @@ def _load_from_tools() -> None:
         if not meta.is_file():
             continue
         try:
-            mod = importlib.import_module(f"tools.{sub.name}.domain_meta")
+            mod = import_module(f"tools.{sub.name}.domain_meta")
         except Exception as e:
             logger.warning("[DomainRegistry] 装载 %s/domain_meta 失败：%s", sub.name, e)
             continue

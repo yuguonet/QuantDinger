@@ -10,13 +10,10 @@ import os
 import logging
 from types import SimpleNamespace
 
-from constants import get_agent_max_steps
-from llm import create_llm, QDSkillAdapter
-from memory import (
-    LocalMemory,
-    PostgresMemory,
-)
-from qd_service import QDAgentService
+from .constants import get_agent_max_steps
+from .skills_adapter import QDSkillAdapter
+from .memory import LocalMemory, PostgresMemory
+from .qd_service import QDAgentService
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +65,11 @@ settings = SimpleNamespace(
 )
 
 # ---------- 初始化 ----------
-llm = create_llm({
-    "provider": LLM_PROVIDER,
-    "model": LLM_MODEL,
-    "api_key": LLM_API_KEY,
-    "base_url": LLM_BASE_URL,
-    "temperature": LLM_TEMPERATURE,
-    "max_tokens": LLM_MAX_TOKENS,
-    "seed": LLM_SEED,
-})
+# 【2026-10-13 P1】这里原先是 `llm = create_llm({...})`，持一个全局 LLM 实例供
+# chain/skill_brewer 复用（`agent_mod.llm`）。旧自建 llm/ 包已退役，LLM 出口统一到
+# `app.agent.llm.complete()`（mimo models 驱动，内部按 provider+model+timeout 缓存
+# Model 实例），不再需要一个进程级单例对象 —— 酿造侧已改为直接调 complete()。
+# 配置展示仍走上面的 `settings.llm`（纯 SimpleNamespace，不含连接）。
 
 if MEMORY_BACKEND == "postgres" and DATABASE_URL:
     memory = PostgresMemory(
@@ -117,7 +110,7 @@ def _build_reranker():
     if not RERANKER_PROVIDER:
         return None
     try:
-        from rag.retriever import BGEReranker
+        from .rag.retriever import BGEReranker
         use_api = RERANKER_PROVIDER.lower() == "api"
         reranker = BGEReranker(
             model_path=RERANKER_MODEL,
@@ -135,10 +128,7 @@ def _build_reranker():
 def _build_retriever():
     """构建 RAG 检索器。"""
     try:
-        from rag import (
-            EmbeddingModel, QdrantVectorStore, Retriever,
-            KeywordRetriever, MultiRouteRetriever, RetrieverRoute,
-        )
+        from .rag import EmbeddingModel, QdrantVectorStore, Retriever, KeywordRetriever, MultiRouteRetriever, RetrieverRoute
 
         routes = []
 
@@ -151,7 +141,7 @@ def _build_retriever():
                     api_key=EMBEDDING_API_KEY,
                     base_url=EMBEDDING_BASE_URL,
                 )
-                from rag.pg_vector_store import PgVectorStore
+                from .rag.pg_vector_store import PgVectorStore
                 vector_store = PgVectorStore(
                     dsn=DATABASE_URL,
                     embedding=embedding,
@@ -170,7 +160,7 @@ def _build_retriever():
         # 路线 2: PostgreSQL 全文搜索（从 qd_analysis_memory）
         if DATABASE_URL:
             try:
-                from rag.postgres_fts import PostgresFTSRetriever
+                from .rag.postgres_fts import PostgresFTSRetriever
                 fts_retriever = PostgresFTSRetriever(dsn=DATABASE_URL, top_k=RAG_TOP_K)
                 routes.append(RetrieverRoute("fts", fts_retriever, weight=0.8))
                 logger.info("[RAG] PostgreSQL FTS 已启用")
@@ -180,7 +170,7 @@ def _build_retriever():
         # 路线 3: 聊天历史全文检索（PG FTS，需开启总开关）
         if CHAT_HISTORY_SEARCH_ENABLED and MEMORY_BACKEND == "postgres":
             try:
-                from rag.retriever import ChatHistoryRetriever
+                from .rag.retriever import ChatHistoryRetriever
                 chat_history_retriever = ChatHistoryRetriever(
                     memory=memory,
                     top_k=RAG_TOP_K,
@@ -291,7 +281,7 @@ logger.info(
 # 目的：把"KEY 缺失 ⇒ 工具调不通"这件事在**启动期**说清楚并写进工具地图，
 # 而不是让模型在会话中撞墙后再瞎答（web_search 全引擎无 KEY 时，模型曾因
 # "prompt 要求必须联网检索"而被逼出编造结论的行为）。
-from tools.availability import probe_tools
+from .tools._availability import probe_tools
 
 TOOL_AVAILABILITY = probe_tools()
 for _name, _d in sorted(TOOL_AVAILABILITY.items()):
@@ -306,7 +296,7 @@ for _name, _d in sorted(TOOL_AVAILABILITY.items()):
 # 懒加载：实测冷路径 3.1s（import 76 个工具模块 + 能力层注册）压在**首条用户消息**
 # 上——用户等的是这一条，不是启动日志。此处在装配期跑一次 `warmup_tool_face()`，
 # 复刻旧系统「启动时筛一次、消息路径不扫」；预热失败不阻断（fail-open，退化回懒加载）。
-from qd_agent import warmup_tool_face as _warmup_tool_face
+from .qd_agent import warmup_tool_face as _warmup_tool_face
 _WARMUP = _warmup_tool_face()
 if not _WARMUP.get("done"):
     logging.getLogger(__name__).warning(
@@ -368,7 +358,7 @@ try:
     # 日志双份、每次盘后评估跑两遍。
     # 2026-10-02：根治办法是**只保留一种导入口径**（现统一裸名），不是"选哪个名字"——
     # 只要两种写法并存，换哪个名字都会再长出第二份。护栏：qd_smoke.py::test_29。
-    from chain.evaluator import start_eval_worker
+    from .chain.evaluator import start_eval_worker
     start_eval_worker()
     logger.info("盘后回溯评估 worker 已启动")
 except Exception as e:

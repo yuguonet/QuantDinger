@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Optional
 
-from memory.base import MemoryBase, MemoryMessage
+from .base import MemoryBase, MemoryMessage
 
 logger = logging.getLogger(__name__)
 
