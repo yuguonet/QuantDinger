@@ -250,7 +250,10 @@ class StrategyBase:
         if i1 < i0:
             return []
         try:
-            pairs = fold_range(self, code, bars, i0, i1)
+            stock_info = params.get("stock_info")
+            ctx_provider = (lambda _idx, _bars: {"stock_info": stock_info}) \
+                if stock_info is not None else None
+            pairs = fold_range(self, code, bars, i0, i1, ctx_provider=ctx_provider)
         except NotImplementedError:
             return self._scan_days_by_signals(
                 bars, code, lo_date=lo_date, hi_date=hi_date, **params)
@@ -636,4 +639,3 @@ class StrategyBase:
             feed = DailyFeed(bars)
         res = replay(self, code, feed, collectors=[coll])
         return res.trades or []
-

@@ -1139,6 +1139,7 @@ def _dragon_extra_base(code, lu_date, pullback_days, c_i, last_chg, entry_vol_r,
     - `signal_chg`/`signal_vol_r`：D0 相对**昨日**
     """
     return {
+        "label": "龙回头",
         "board": get_board_name(code),
         "lu_date": lu_date,
         "pullback_days": pullback_days,

@@ -32,15 +32,17 @@ EXIT_MODES: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {}
 #   ⇒ **core → strategies 反向 import**，违反设计 §2.2 依赖方向，且服务的是当时零调用的
 #   死路径。改为**依赖注入**：core 只保留分派与协议，注册时机交给上层（层反转）。
 _BOOTSTRAP: Optional[Callable[[], None]] = None
+_BOOTSTRAPPED = False
 
 
 def set_exit_bootstrap(fn: Optional[Callable[[], None]]) -> None:
-    """注入 autodiscover（幂等），供 `run_exit` 在 EXIT_MODES 为空时懒加载策略包。
+    """注入 autodiscover（幂等），供 `run_exit` 在目标模式未注册时懒加载策略包。
 
     由 `app.market_cn.auto.registry`（启动时）调用，使 core 无需 import strategies。
     """
-    global _BOOTSTRAP
+    global _BOOTSTRAP, _BOOTSTRAPPED
     _BOOTSTRAP = fn
+    _BOOTSTRAPPED = False
 
 
 def register_exit(mode: str, fn: Callable[..., Optional[Dict[str, Any]]]) -> None:
@@ -67,9 +69,11 @@ def run_exit(mode: str, *, bars: List[Dict[str, Any]], entry_idx: int, entry_pri
     fn = EXIT_MODES.get(mode)
     if fn is None:
         # 惰性 autodiscover（**依赖注入**，非 core→strategies 反向 import）：
-        # 策略模块 import 时会 register_exit; 若调用方尚未加载策略包, 先补一次 (幂等)。
-        if not EXIT_MODES and _BOOTSTRAP is not None:
+        # 仅有通用模式已注册不代表目标策略模式已加载；缺模式时补一次发现。
+        global _BOOTSTRAPPED
+        if not _BOOTSTRAPPED and _BOOTSTRAP is not None:
             _BOOTSTRAP()
+            _BOOTSTRAPPED = True
             fn = EXIT_MODES.get(mode)
     if fn is None:
         raise KeyError(f"未注册的出场模式 exit.mode={mode!r}（已注册: {sorted(EXIT_MODES)}）")

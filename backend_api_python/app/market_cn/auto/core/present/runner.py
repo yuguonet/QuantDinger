@@ -167,19 +167,22 @@ class _Backend:
         """
         if key in self._loaded:
             return
-        self._loaded.add(key)
         p = self.path(key)
         if not os.path.exists(p):
+            self._loaded.add(key)
             return
         self.stats["file_reads"] += 1
         with open(p, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict) and "codes" in raw:   # 现行格式：每票 state + 策略级共享状态
-            self._recs[key] = {code: Record.from_json(d)
-                               for code, d in (raw["codes"] or {}).items()}
-            self._meta[key] = raw.get("meta") or {}
+            records = {code: Record.from_json(d)
+                       for code, d in (raw["codes"] or {}).items()}
+            meta = raw.get("meta") or {}
+            self._recs[key] = records
+            self._meta[key] = meta
         else:
             print(f"[StateStore] 切片格式未知，视同损坏: {p}", file=sys.stderr)
+        self._loaded.add(key)
 
     def get(self, key: str, code: str) -> Record | None:
         self.stats["loads"] += 1
@@ -228,9 +231,9 @@ class _Backend:
             except OSError as e:
                 err = f"{key}: {type(e).__name__}: {e}"
                 break
+            self._dirty.discard(key)
             self.stats["file_writes"] += 1
             n += len(payload)
-        self._dirty.clear()
         self.stats["flushes"] += 1
         self.last_flush_error = err
         if err:

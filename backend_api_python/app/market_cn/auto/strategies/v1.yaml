@@ -13,16 +13,8 @@ meta:
   market: A                    # A / HK / US / Polymarket → MarketSpec
   version: 1
   # 策略开关 (§3.5): 宏内一行 = 上下线。2026-10-10 上线 (让利润奔跑口径)。
-  # 折叠契约: v1 **无** init_state/step/evaluate, 但已按「逃生舱」登记在
-  #   strategies/base.py::FOLD_CONTRACT_EXEMPT (2026-10-11) —— `.py` 插件未迁折叠
-  #   ≠ 缺陷, 但必须**登记**。生产侧降级路径具名: scan「退回直判」+ERROR /
-  #   rebuild 排除出投影集 / present_daily 落 skipped / monitor 回退旧三决策;
-  #   回测走本文件自持 `backtest_stock`(_run_backtest), 不经 base 薄壳。
-  #   (2026-10-12: 曾因 test_enable_switch/doctor **没读这份名单**误报"契约缺失=断裂",
-  #    已修两处消费者; 详见 docs/auto代码审计报告_20261011.md §7.7。)
-  # 若要真正迁折叠契约: 先抽「共用门实现」使 scan_signals 与 evaluate 同源
-  #   → 补 init_state/step/evaluate → present 切片回归 + golden 对拍(约 120 行) →
-  #   **并把 v1 移出 FOLD_CONTRACT_EXEMPT**(否则 test_enable_switch 的陈旧登记守卫会红)。
+  # 折叠契约: v1 的 init_state/step/evaluate 复用 scan_signals 单一判定实现；
+  #   record writer、回测与实时进度共用折叠事件链，stock_info 通过 ctx 注入。
   enabled: true
   enumeration: day             # 枚举方式: 逐日候选 → D0 信号 → 次日开盘入场 (区别于 dragon 的 lu_idx 遍历)
   day_flow: v1                 # day 流程口径 (信号展示字段集)
@@ -30,7 +22,7 @@ meta:
   day_min_n: 30                # 低于此根数直接返回空
   # 说明: 本策略无 lu_idx 依赖 (信号在 D0 当日判定), 引擎逐日枚举决策日 i,
   # 门表一次性求所有门; 出场由 exit_modes 按本文件 exit.mode 分派 (阈值取 params)。
-  # 入场**不走分派**: 依赖竞价快照等累积状态 ⇒ 由 v1.py 的 step / entry_decision 承载
+  # 入场**不走分派**: 依赖竞价快照等累积状态 ⇒ 由 v1.py 的 evaluate / entry_decision 承载
   #   (core/entry_modes.py 已于 2026-10-09 退役; 目标态 §3.2.2)。
 
 # ⚠ 阈值 / 入场过滤参数一律在 `params:` —— 唯一事实源 (目标态 §3.2.1/§3.2.2,

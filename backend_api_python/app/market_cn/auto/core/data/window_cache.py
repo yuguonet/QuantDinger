@@ -31,7 +31,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import pickle
+import tempfile
+import threading
 import time
 from datetime import date, datetime, timedelta
 
@@ -41,7 +45,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-CACHE_VER = 3
+CACHE_VER = 4
 
 # 缓存按 BASE_DAYS 的窗口存一份; 请求 days <= BASE_DAYS 时用 window_start(days)
 # 切片派生 (kline.window_start 的语义: 长窗口内 time >= start 的部分 == 短窗口)。
@@ -109,14 +113,14 @@ def _factor_fp(code: str) -> int:
             _FP_FAST = False                    # 私有结构变了 ⇒ 回落公开 API
             fs = None
     if _FP_FAST is False or fs is None:
-        try:
-            from app.data_sources.provider.adjustment import fetch_qfq_factors
-            fs = fetch_qfq_factors(code)
-        except Exception:
-            return 0
+        from app.data_sources.provider.adjustment import fetch_qfq_factors
+        fs = fetch_qfq_factors(code)
     if not fs:
         return 0
-    return hash(tuple((str(d), float(f)) for d, f in fs)) & 0x7FFFFFFFFFFFFFFF
+    normalized = [(str(d), float(f)) for d, f in fs]
+    payload = json.dumps(normalized, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
 # ================================================================
@@ -166,6 +170,7 @@ def _to_bars(ds, arr) -> list[dict]:
 # 后续用 (mtime_ns, size) 签名校验: 文件被本进程 scan 更新或外部改动 ⇒ 重读。
 # ⚠ 就地修改 data 前**必须**先浅拷贝 (见 _slide), 否则异常路径会留下脏 memo。
 _MEMO: dict = {}
+_SAVE_LOCK = threading.Lock()
 
 
 def _load_cache(days: int):
@@ -195,17 +200,26 @@ def _load_cache(days: int):
 
 def _save_cache(days: int, data: dict, meta: dict):
     p = _path(days)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump({"_ver": CACHE_VER, "data": data, "meta": meta}, f,
-                    protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, p)
-    try:                                    # 刷新 memo 签名, 免得下一票又读一次 73MB
-        st = os.stat(p)
-        _MEMO[days] = ((st.st_mtime_ns, st.st_size), data, meta)
-    except Exception:
-        _MEMO.pop(days, None)
+    directory = os.path.dirname(p)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp",
+                               dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump({"_ver": CACHE_VER, "data": data, "meta": meta}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        # Unique temp paths make replacement safe across processes; the lock also
+        # keeps the process-local memo in sync when same-process writers overlap.
+        with _SAVE_LOCK:
+            os.replace(tmp, p)
+            try:                            # 免得下一次读取又反序列化整份缓存
+                st = os.stat(p)
+                _MEMO[days] = ((st.st_mtime_ns, st.st_size), data, meta)
+            except Exception:
+                _MEMO.pop(days, None)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # ================================================================
@@ -255,8 +269,14 @@ def peek_windows(codes, days: int = BASE_DAYS) -> dict:
     if not enabled():
         return {}
     base = days if days > BASE_DAYS else BASE_DAYS
-    data, _meta = _load_cache(base)
+    data, meta = _load_cache(base)
     if not data:
+        return {}
+    try:
+        built_at = date.fromisoformat(str(meta.get("built_at") or ""))
+    except ValueError:
+        return {}
+    if built_at <= datetime.now(TZ_CN).date() - timedelta(days=MAX_AGE_DAYS):
         return {}
     lo = _window_bounds(days, None)[0]
     lo_o = _ord(lo)
@@ -266,8 +286,10 @@ def peek_windows(codes, days: int = BASE_DAYS) -> dict:
         if item is None:
             continue
         ds_arr, arr = item
-        if len(ds_arr) and int(ds_arr[0]) < lo_o:
-            k = int((ds_arr >= lo_o).argmax())
+        if len(ds_arr):
+            k = int(ds_arr.searchsorted(lo_o, side="left"))
+            if k >= len(ds_arr):
+                continue
             ds_arr, arr = ds_arr[k:], arr[k:]
         if len(ds_arr):
             out[c] = _to_bars(ds_arr, arr)
@@ -335,7 +357,10 @@ def _slide(codes, days: int, lg) -> dict:
         fp = _factor_fp(code)
         if fp != old_fps.get(code):
             todo.append(code)
-            fps[code] = fp
+            # 旧复权数据已不可信。若全量重拉暂时没有返回该票，必须移除旧缓存，
+            # 否则会把旧价格与新指纹一起保存，后续调用将误认为缓存已更新。
+            data.pop(code, None)
+            fps.pop(code, None)
             continue
         rows = new_rows.get(code)
         if not rows:
@@ -381,7 +406,11 @@ def _slide(codes, days: int, lg) -> dict:
         seen.pop(c, None)
     for code, (ds_arr, arr) in list(data.items()):
         if len(ds_arr) and int(ds_arr[0]) < lo_o:
-            k = int((ds_arr >= lo_o).argmax())
+            k = int(ds_arr.searchsorted(lo_o, side="left"))
+            if k >= len(ds_arr):
+                data.pop(code, None)
+                fps.pop(code, None)
+                continue
             data[code] = (ds_arr[k:], arr[k:])
 
     _save_cache(days, data, {"start": start, "end": end, "fps": fps,

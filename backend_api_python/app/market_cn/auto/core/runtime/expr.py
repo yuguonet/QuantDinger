@@ -97,10 +97,22 @@ def static_asof_check(expr: str, offset_funcs: set) -> List[tuple]:
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
                 and n.func.id in offset_funcs and n.args:
             a = n.args[0]   # 偏移量 k 必须是第一个位置参数
-            if isinstance(a, ast.Constant) and isinstance(a.value, (int, float)) \
-                    and a.value > 0:
-                problems.append((n.func.id, a.value))
+            offset = _literal_number(a)
+            if offset is not None and offset > 0:
+                problems.append((n.func.id, offset))
     return problems
+
+
+def _literal_number(node: ast.AST) -> int | float | None:
+    """取带一元正负号的数值字面量；变量和计算表达式留给运行时守卫。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _literal_number(node.operand)
+        if value is None:
+            return None
+        return value if isinstance(node.op, ast.UAdd) else -value
+    return None
 
 
 def evaluate(expr: str, env: Dict[str, Any], funcs: Dict[str, Callable]) -> Any:

@@ -36,8 +36,14 @@ MIN_SAMPLES = int(os.getenv("QD_FEED_MIN_SAMPLES", "5"))
 _EMA_DIVISOR = 50.0
 _EMA_MIN, _EMA_MAX = 0.10, 0.50
 
-# verdict → 计分（partial 折半；undecidable/data_missing 不计入，见模块头）
-_VERDICT_SCORE = {"hit": 1.0, "partial": 0.5, "miss": 0.0}
+# 进聚合的 verdict 白名单 —— **SQL 与测试共用同一份**，禁止在 SQL 里硬编码。
+# 2026-10-13 教训：只改 _VERDICT_SCORE 而漏掉 SQL 的 IN 列表 ⇒ delisted 根本进不了
+# 聚合，前面两处改动全部白做。抽成常量后由 tests/test_v5_p0_closure.py 守住。
+_COUNTED_VERDICTS = ("hit", "partial", "miss", "delisted")
+
+# verdict → 计分（partial 折半；undecidable / data_missing 不计入，见模块头）
+# ★ delisted 不是「不知道」，而是**确定的最差结果**，必须计入且按 0.0。
+_VERDICT_SCORE = {"hit": 1.0, "partial": 0.5, "miss": 0.0, "delisted": 0.0}
 
 
 def _alpha(n: int) -> float:
@@ -55,15 +61,18 @@ def collect_domain_stats() -> List[dict]:
         from app.utils.db import get_db_connection
     except ImportError:
         return []
-    sql = """
+    # ★ 白名单来自模块常量，不在这里硬编码（改一处漏一处的教训，2026-10-13）
+    _in_list = ", ".join("'" + str(v) + "'" for v in _COUNTED_VERDICTS)
+    sql = f"""
         SELECT d.domain AS domain,
-               count(*) FILTER (WHERE r.verdict = 'hit')     AS hits,
-               count(*) FILTER (WHERE r.verdict = 'partial') AS partial,
-               count(*) FILTER (WHERE r.verdict = 'miss')    AS misses
+               count(*) FILTER (WHERE r.verdict = 'hit')      AS hits,
+               count(*) FILTER (WHERE r.verdict = 'partial')  AS partial,
+               count(*) FILTER (WHERE r.verdict = 'miss')     AS misses,
+               count(*) FILTER (WHERE r.verdict = 'delisted') AS delisted
         FROM qd_agent_resolutions r
         JOIN qd_agent_claims     c ON c.id = r.claim_id
         JOIN qd_agent_decisions  d ON d.id = c.decision_id
-        WHERE r.verdict IN ('hit', 'partial', 'miss')
+        WHERE r.verdict IN ({_in_list})
         GROUP BY d.domain
     """
     rows = []
@@ -83,11 +92,13 @@ def collect_domain_stats() -> List[dict]:
         hits = int(r.get("hits") or 0)
         part = int(r.get("partial") or 0)
         miss = int(r.get("misses") or 0)
-        n = hits + part + miss
+        dls = int(r.get("delisted") or 0)     # 退市：计入分母，拉低胜率（最差结果）
+        n = hits + part + miss + dls
         if n <= 0:
             continue
         rows.append({
             "domain": dom, "n": n, "hits": hits, "partial": part, "misses": miss,
+            "delisted": dls,
             "win_rate": round((hits + 0.5 * part) / n, 4),
         })
     return rows

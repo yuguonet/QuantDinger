@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
 import traceback
+
+logger = logging.getLogger(__name__)
 
 
 def _load_env():
@@ -150,7 +153,14 @@ def _tool_brief() -> str:
 
 
 class LLMClient:
-    """async create_llm 或同步 HTTP 兜底。"""
+    """统一 LLM 出口（mimoagent models）或同步 HTTP 兜底。
+
+    【2026-10-13 P1】原先走 `from llm import create_llm`（agent 的自建
+    LLM 层），那套已退役，改走 `app.agent.llm.complete()`。
+    本类自带宽容：构造时**不**连网，调用时才走统一出口；出口抛错（配置缺失 /
+    网关不通）则回退 `_chat_http`（市场侧"为什么涨/跌"是给用户看的解释，宁可
+    降级出一段粗解释，也不能整个 500）。
+    """
 
     def __init__(self, model="", api_key="", base_url=""):
         self.model = model or os.getenv("OPENAI_MODEL", "qwen-plus")
@@ -158,37 +168,27 @@ class LLMClient:
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL")
                          or "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.temperature = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.2"))
-        self._llm = None
-        try:
-            from llm import create_llm
-            self._llm = create_llm({
-                "provider": os.getenv("LLM_PROVIDER", "openai"),
-                "model": self.model,
-                "api_key": self.api_key,
-                "base_url": self.base_url,
-                "temperature": self.temperature,
-                "max_tokens": 2048,
-            })
-        except Exception:
-            self._llm = None
+        # 本类的配置可能与 agent 主链不同（默认 dashscope 兼容端点），所以三件套
+        # 全部显式传入，不让统一层去按 provider 名猜。
+        self._provider = os.getenv("LLM_PROVIDER", "openai") or "openai"
 
     def chat(self, messages: list) -> str:
         """messages: [{role, content}] → 文本。"""
-        if self._llm is not None:
-            return self._chat_via_factory(messages)
-        return self._chat_http(messages)
-
-    def _chat_via_factory(self, messages: list) -> str:
-        import asyncio
-        from llm import ChatMessage
-        cms = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]
         try:
-            resp = asyncio.get_event_loop().run_until_complete(
-                self._llm.generate(cms))
-            return getattr(resp, "content", None) or str(resp)
-        except RuntimeError:
-            # 无 running loop
-            return asyncio.run(self._llm.generate(cms))
+            from app.agent.llm import complete
+            resp = complete(
+                messages,
+                provider=self._provider,
+                model=self.model,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                temperature=self.temperature,
+                max_tokens=2048,
+            )
+            return resp.content or ""
+        except Exception as e:
+            logger.debug("[chat_why] 统一出口失败，转 HTTP 兜底: %s", e)
+            return self._chat_http(messages)
 
     def _chat_http(self, messages: list) -> str:
         import urllib.request

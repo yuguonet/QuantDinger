@@ -133,13 +133,14 @@ def run_hold_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             data_exhausted = True
             break
         b = bars[i]
-        peak = max(peak, float(b.get("high") or 0))
         dn = _dn_at(bars, i, board_type, sp)
         if pending_dn:                       # 前一日封死 → 次日开盘卖 (①)
             exit_p, exit_d = float(b.get("open") or 0), d
+            peak = max(peak, exit_p)
             _reason = "跌停顺延开盘"
             pending_dn = False
             break
+        peak = max(peak, float(b.get("high") or 0))
         if is_one_word_limit_dn(b, dn, sp):  # ① 一字跌停: 整日不可成交
             pending_dn = True
             continue
@@ -294,10 +295,13 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
         dn = _dn_at(bars, idx, board_type, sp)
 
         if pending_dn:
-            exit_p, exit_d, _exit_reason = float(b.get("open") or 0), d, "跌停顺延开盘"
+            exit_p = float(b.get("open") or 0)
+            peak = max(peak_prev, exit_p)
+            exit_d, _exit_reason = d, "跌停顺延开盘"
             # A7 (2026-09-28): 此分支已实际成交 —— 必须清 pending_dn/last_unfilled,
             # 否则尾块 (last_unfilled or pending_dn) 视为仍未成交再顺延一次,
             # 出场推后 2 个交易日 (break.py 自研引擎同病灶, 其 :774 注释早有记载)。
+            # 顺延卖出在开盘成交，当日 high 发生在卖出之后，不能计入持仓峰值。
             pending_dn = last_unfilled = False
             break
 
@@ -319,6 +323,7 @@ def run_trail_stop(bars, entry_idx, entry_price, *, hold_days, stop_loss,
             last_unfilled = False
             if early == "open":
                 exit_p, exit_d, _exit_reason = float(b.get("open") or 0), d, "早退开盘"
+                peak = max(peak_prev, exit_p)
                 break
             if early == "close":
                 exit_p, exit_d, _exit_reason = float(b.get("close") or 0), d, "早退收盘"

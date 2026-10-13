@@ -30,6 +30,7 @@ from app.market_cn.auto.core.exit_modes import run_exit
 from app.market_cn.auto.core.market import (
     get_board_type, is_limit_up, limit_up_price,
 )
+from app.market_cn.auto.core.present.contract import DayInput, InsufficientHistory, Progress, Stage
 from app.market_cn.auto.strategies import register
 from app.market_cn.auto.strategies.base import (
     ConfirmDecision, EntryDecision, ExitDecision, ScanSpec, Signal, StrategyBase,
@@ -76,7 +77,104 @@ class V1Strategy(StrategyBase):
     entry_style = "v1"
     scan_spec = ScanSpec(kind="daily_close", after_events=("daily_1d", "lhb"))
     default_params = dict(PARAMS)
+    SEED_BARS = 25
+    stages = (
+        Stage("ready", "V1首板·准备", realtime="09:25"),
+        Stage("exec", "V1竞价·入场", realtime="15:01"),
+        Stage("exit", "V1出场", realtime=None),
+    )
     # 探针 day-stage 归属 (越靠后=离信号越近)
+
+    @staticmethod
+    def _fold_bar(bar):
+        return {key: bar[key] for key in ("time", "open", "high", "low", "close", "volume")
+                if key in bar}
+
+    def init_state(self, code, bars):
+        if len(bars) < self.SEED_BARS:
+            raise InsufficientHistory(f"{code}: bars={len(bars)} < {self.SEED_BARS}")
+        return {"version": 1, "abs_i": len(bars) - 1,
+                "bars": [self._fold_bar(bar) for bar in bars[-self.SEED_BARS:]]}
+
+    def step(self, state, bar):
+        return {"version": 1, "abs_i": state["abs_i"] + 1,
+                "bars": (list(state["bars"]) + [self._fold_bar(bar)])[-self.SEED_BARS:]}
+
+    def probe(self, state):
+        bars = state.get("bars") or []
+        if not bars:
+            return []
+        return [(bars[0]["time"], bars[0]["close"]),
+                (bars[-1]["time"], bars[-1]["close"])]
+
+    def evaluate(self, state, inp: DayInput, prev: Progress | None):
+        if prev is not None:
+            if prev.stage == "ready" and str(inp.bar.get("time", ""))[:10] > prev.date[:10]:
+                return self._exec_event(state, inp, prev)
+            if prev.stage == "exec" and prev.payload.get("buyable") is not False:
+                return self._exit_event(state, inp, prev)
+
+        bars = list(state["bars"]) + [self._fold_bar(inp.bar)]
+        ctx = inp.ctx or {}
+        params = self.params()
+        signals = self.scan_signals(
+            bars, inp.code, ctx=ctx, stock_info=ctx.get("stock_info") or {}, **params)
+        return [Progress(stage="ready", date=str(sig.time), payload={
+            "price": sig.price, "score": sig.score, "label": sig.label,
+            "extra": sig.extra,
+        }, next_realtime="09:25") for sig in signals]
+
+    def _exec_event(self, state, inp: DayInput, prev):
+        bar = inp.bar
+        price = float(bar.get("open") or 0)
+        row = {"code": inp.code, "signal_price": float(prev.payload.get("price") or 0),
+               "extra": dict(prev.payload.get("extra") or {})}
+        snap = {"open": price, "last": price,
+                "previousClose": row["signal_price"]}
+        decision = self.entry_decision(row, snap)
+        payload = {
+            "signal_date": prev.date,
+            "entry_date": str(bar.get("time", ""))[:10],
+            "entry_price": price,
+            "entry_idx": state["abs_i"] + 1,
+            "buyable": decision.buyable,
+            "entry_reason": decision.reason,
+        }
+        return [Progress(stage="exec", date=str(bar.get("time", "")), payload=payload,
+                         next_realtime="15:01" if decision.buyable else None)]
+
+    def _exit_event(self, state, inp: DayInput, prev):
+        payload = prev.payload or {}
+        if payload.get("buyable") is False:
+            return []
+        entry_price = float(payload.get("entry_price") or 0)
+        if entry_price <= 0:
+            return [Progress(stage="exit", date=str(inp.bar.get("time", "")),
+                             payload={"exit_reason": "入场价缺失", "exit_price": 0.0})]
+
+        bars = list(state["bars"]) + [self._fold_bar(inp.bar)]
+        entry_date = str(payload.get("entry_date") or "")[:10]
+        entry_idx = next((i for i, bar in enumerate(bars)
+                          if str(bar.get("time", ""))[:10] == entry_date), None)
+        if entry_idx is None:
+            return []
+
+        result = run_exit(
+            "v1_combo", bars=bars, entry_idx=entry_idx, entry_price=entry_price,
+            code=inp.code, board_type=get_board_type(inp.code), params=self.params(),
+            stop_at_idx=len(bars) - 1, with_reason=True)
+        if result is None or result.get("exit_day") != len(bars) - entry_idx:
+            return []
+        return [Progress(stage="exit", date=str(inp.bar.get("time", "")), payload={
+            "entry_date": entry_date,
+            "entry_price": entry_price,
+            "exit_date": str(inp.bar.get("time", ""))[:10],
+            "exit_price": result["exit_price"],
+            "exit_day": result["exit_day"],
+            "exit_reason": result.get("exit_reason", ""),
+            "return_pct": result["return_pct"],
+            "peak_return_pct": result["peak_return_pct"],
+        })]
 
     # ---- 信号判定 ----
     def scan_signals(self, bars, code, *, as_of=None, ctx=None, probe=None, **params):
@@ -417,7 +515,7 @@ class V1Strategy(StrategyBase):
 
 
 def _exit_v1_combo(bars, entry_idx, entry_price, *, code, board_type, params, diag,
-                   stop_at_idx=None):
+                   stop_at_idx=None, with_reason=False):
     """V1 combo 出场 (止损/追踪/到期 + D1 未涨停→D2 开盘清仓) — 供 YAML exit.mode=v1_combo。
 
     §13.1 A-1b (2026-10-12): 本适配器只做参数接线 (yaml params → 引擎形参),
@@ -433,7 +531,7 @@ def _exit_v1_combo(bars, entry_idx, entry_price, *, code, board_type, params, di
         d1_limit_up=(diag or {}).get("d1_limit_up"),
         d1_change=(diag or {}).get("d1_change"),
         d1_gap=(diag or {}).get("d1_gap"),
-        stop_at_idx=stop_at_idx)
+        stop_at_idx=stop_at_idx, with_reason=with_reason)
 
 
 from app.market_cn.auto.core.exit_modes import register_exit as _register_exit
@@ -445,9 +543,6 @@ _register_exit("v1_combo", _exit_v1_combo)
 # ----------------------------------------------------------------
 # 2026-09-28: 原 core/runtime/evaluate.py 的门表回测编排曾**纯搬运**回本模块自注册
 #   (register_day_flow("v1", _backtest_day_flow))。
-# 2026-10-09: 回测主路径收敛到事件流折叠 (薄壳 → core.replay), 通用兜底引擎已删除 ——
-#   薄壳对非折叠契约策略直接 NotImplementedError。v1 无折叠契约 ⇒ 标准回测入口对其关闭;
-#   V1 自有链路走 scan_signals + entry_decision + run_exit("v1_combo") (core.run_d1_limit_up_trail 出场引擎)。
-#   要接入生产 core.replay 链路须先迁移折叠契约 (init_state/step/evaluate)。
+# 2026-10-09: 回测主路径收敛到事件流折叠 (薄壳 → core.replay), 通用兜底引擎已删除。
+# V1 仍保留官方 CLI 兼容包装；生产扫描与实时进度走本类折叠契约。
 # ================================================================
-

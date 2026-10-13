@@ -17,6 +17,7 @@ Evaluator — 回溯评估引擎（重写版）。
 from __future__ import annotations
 
 import json
+import os
 from log import logger
 import math
 from datetime import date, timedelta
@@ -89,7 +90,29 @@ def _get_actual_return(
 
         # 直接走底层数据源 cn_stock（agent_get_kline 工具即其封装 + 归一）。
         # 不再 import 工具包装层，避免破坏拔插式单一真相源。
-        raw = CNStockDataSource().get_kline(stock_code, "1D", max(hold_days + 10, 1))
+        # ── 取数窗口必须覆盖 from_date（2026-10-13 修复，v5 P0-3）────────────
+        # 原实现固定取 max(hold_days + 10, 1) 根（T+3 ⇒ 仅 13 根），且是「截至当前」取的。
+        # 当 from_date 早于这 13 根时，下面「第一个 k_date >= from_date」**恒为第 0 根**
+        # ⇒ base_idx = 0 ⇒ exit_date 变成「窗口内第 hold_days 根」，与 from_date 完全脱钩。
+        # 又因「当前」每天都在变，同一历史日期在不同日子调用会得到不同收益 ——
+        # 这是「稳定地算错 + 随调用时刻漂移」，不报错，只安静污染每一个 T+N 标签。
+        # 实测：from_date=2026-08-29 / hold_days=3 ⇒ 期望 exit=2026-09-02，实际 2026-09-22。
+        # 修法：按交易日历算出 from_date 距今的真实交易日跨度，据此取足够长的窗口。
+        _need = max(hold_days + 10, 1)
+        try:
+            from app.utils import trading_calendar as _tc
+
+            _span = int(_tc.trading_days_count(
+                from_date.isoformat(), _dt.now().date().isoformat()) or 0)
+            if _span > 0:
+                _need = _span + hold_days + 10
+        except Exception as _e:
+            logger.debug("[Evaluator] 交易日历不可用，退回默认窗口: %s", _e)
+        # 上限保护：防止 from_date 极早时取回海量 K 线（阈值可配，禁止硬编码语义）
+        _cap = int(os.getenv("QD_EVAL_KLINE_MAX", "500"))
+        if _need > _cap:
+            _need = _cap
+        raw = CNStockDataSource().get_kline(stock_code, "1D", _need)
 
         def _ts_to_date(ts):
             # ★ 必须带年份（%Y-%m-%d）。cn_stock 的 1D 行只有 time（无 date 字段），

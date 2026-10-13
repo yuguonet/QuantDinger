@@ -291,6 +291,35 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
                                     f"kind={claim.get('subject_kind')}）",
                 "resolver_kind": "market_data", "sampled": False}
 
+    # ── 退市 / 长期停牌单列（v4 G18 ⇒ v5 P0-1）：防幸存者偏差 ──────────
+    # 判据必须**两条同时成立**（误判代价不对称，宁可漏判不可错判）：
+    #   ① 重试已耗尽：verify_fail_count >= QD_CLAIM_MAX_RETRY（默认 5）
+    #   ② 最后一根 K 线距今超过 QD_DELISTED_STALE_DAYS 个自然日（默认 15）
+    # 只满足 ① = 数据缺口 ⇒ 保持 undecidable 继续重试（不占真实战绩）；
+    # 只满足 ② = 可能只是数据源延迟 ⇒ 同样不判。
+    # ★ verdict_score 必须是 0.0 而不是 None：None 在 weight_feed 里不计入，
+    #   等于把最差的尾巴又丢回去了，修了和没修一样。
+    _max_retry = int(os.getenv("QD_CLAIM_MAX_RETRY", "5"))
+    _stale_days = int(os.getenv("QD_DELISTED_STALE_DAYS", "15"))
+    _fail_n = int(claim.get("verify_fail_count") or 0)
+    _last_kline = str(actual.get("exit_date") or "")[:10]
+    if _fail_n >= _max_retry and _last_kline:
+        try:
+            if (date.today() - date.fromisoformat(_last_kline)).days > _stale_days:
+                return {
+                    "actual": {k: (v.isoformat() if isinstance(v, date) else v)
+                               for k, v in actual.items()},
+                    "deviation": {}, "verdict": "delisted", "verdict_score": 0.0,
+                    "attribution": "delisted",
+                    "attribution_note": (
+                        f"重试耗尽（{_fail_n} 次）且最后 K 线 {_last_kline} 距今超过 "
+                        f"{_stale_days} 天：判定退市 / 长期停牌，按最差路径计入"
+                        f"（防幸存者偏差，v4 G18）"),
+                    "resolver_kind": "market_data", "sampled": False,
+                }
+        except (ValueError, TypeError):
+            pass  # 日期不可解析 ⇒ 无法判定，落到后续常规分支
+
     # ── 视界门②（G0 Bug C）：窗口被截断**不得定论**（ports evaluator.py:260-267）
     #   数据不足（长期停牌/退市/数据缺口/提前扫描）时 _get_actual_return 会用
     #   最后一根 K 线交卷。若不拦，T+N 标签会静默缩成更短窗口，而事后无法识别。

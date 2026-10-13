@@ -145,7 +145,7 @@ def _ready_of(store, key, bars_by_code, base_dates, signal_of_ready):
 
 
 def persist_days(active, dates, bars_by_code, *, root=None, warmup=0,
-                 min_bars=None, logger_=None):
+                 min_bars=None, logger_=None, ctx_by_code=None):
     """把 `dates` (升序) 的判定进度逐日落盘。同日重跑由 `advance_all` 幂等拒绝。
 
     Args:
@@ -155,6 +155,7 @@ def persist_days(active, dates, bars_by_code, *, root=None, warmup=0,
         root: 切片根; 缺省 `_paths.PRESENT_STATE_DIR`。
         warmup: >0 且该策略切片为冷时, 自动前置 [末日-warmup .. 末日) 的暖机重放。
         min_bars: as-of 门槛; 缺省 `kline.ASOF_MIN_BARS`。
+        ctx_by_code: 可选的策略输入上下文，按票注入每个折叠日（如 stock_info）。
 
     Returns:
         {"root", "dates", "strategies": {key: {days, advanced, errors, warmed}},
@@ -199,6 +200,9 @@ def persist_days(active, dates, bars_by_code, *, root=None, warmup=0,
                     per["errors"].append(f"{d}: as-of 输入为空 (无票末根 == {d})")
                     lg.error("[present_daily] %s %s 无可用输入, 跳过", key, d)
                 continue
+            for code, day_input in di.items():
+                if code in (ctx_by_code or {}):
+                    day_input["ctx"] = dict(ctx_by_code[code])
             try:
                 res = runner.advance_all(strat, d, di)
             except Exception as e:                      # noqa: BLE001 - 单日失败不拖垮其余

@@ -99,6 +99,8 @@ def boll_pctb(c, n=20, k=2.0):
     """布林 %b（0-100 口径: lo=0, up=100）；前 n-1 根 NaN；退化记 50 中性。"""
     m = len(c)
     pctb = np.full(m, np.nan)
+    if m < n:
+        return pctb
     w = np.ones(n) / n
     ma = np.convolve(c, w, "valid")
     c2 = np.convolve(c * c, w, "valid")

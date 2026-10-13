@@ -761,7 +761,9 @@ def _rows_by_record(active, bars_by_code, target, stock_info, sampler, root=None
 
     pstat = present_daily.persist_days(
         active, [target], bars_by_code, root=root,
-        warmup=present_daily.warmup_days(), logger_=logger)
+            warmup=present_daily.warmup_days(), logger_=logger,
+            ctx_by_code={code: {"stock_info": info}
+                         for code, info in (stock_info or {}).items()})
     logger.info("[dragon_scan] 切片落盘完成: root=%s 日期=%s 跳过=%s 明细=%s",
                 pstat["root"], pstat["dates"], pstat["skipped"] or "-",
                 {k: {"天": v["days"], "有事件": v["advanced"], "暖机": v["warmed"],

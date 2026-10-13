@@ -426,14 +426,21 @@ def _progress_map(rows, series, hm, stats=None):
             logger.error("[dragon_monitor] progress 判定失败 策略=%s: %s: %s "
                          "(回退 confirm_decision)", key, type(e).__name__, e)
             if stats is not None:
-                stats["confirm_prog_err"] = stats.get("confirm_prog_err", 0) + 1
+                stats["confirm_prog_err"] = (
+                    stats.get("confirm_prog_err", 0) + len(snaps))
             continue
+        group_hits = set()
         for code, prog in hits or []:
+            if code not in snaps:
+                continue
             out[(key, code)] = prog
+            group_hits.add(code)
+        if stats is not None:
+            stats["confirm_prog_hit"] = (
+                stats.get("confirm_prog_hit", 0) + len(group_hits))
+            stats["confirm_prog_miss"] = (
+                stats.get("confirm_prog_miss", 0) + len(snaps) - len(group_hits))
     if stats is not None:
-        stats["confirm_prog_hit"] = stats.get("confirm_prog_hit", 0) + len(out)
-        stats["confirm_prog_miss"] = stats.get("confirm_prog_miss", 0) + max(
-            0, len(rows) - len(out))
         stats["prog_enabled"] = True
     return out
 
@@ -441,7 +448,7 @@ def _progress_map(rows, series, hm, stats=None):
 # ================================================================
 # §13.1 A-4 (2026-10-12) 回退计数观测面板 —— 只观测不改行为
 # ================================================================
-#: progress 回退率告警阈值: (miss+err)/(hit+miss) 超过即 WARN（回退过半 = 新判定源
+#: progress 回退率告警阈值: (miss+err)/(hit+miss+err) 超过即 WARN（回退过半 = 新判定源
 #: 可能坏了/覆盖不足, 必须有人看一眼）。可按运营经验调; 取 0.5 是保守起点。
 _PROG_FALLBACK_RATE_ALERT = 0.5
 #: 面板落盘: 项目根 tmp/traces/panel.jsonl（文件卫生约定 tmp/; probe 同款）。
@@ -473,7 +480,7 @@ def _panel_observe(stats, date, hm, path=None, enabled=None):
                       "no_judgment": 0})
     else:
         stats["prog_enabled"] = True
-    total = hit + miss
+    total = hit + miss + err
     rate = round((miss + err) / total, 4) if total else 0.0
     stats["prog_fallback_rate"] = rate
     rec = {"ts": datetime.now(ds.TZ_CN).isoformat(timespec="seconds"), "date": date, "hm": hm,
@@ -998,5 +1005,4 @@ def run_monitor():
 # 铁律: 这是**契约别名**, 语义恒等于 run_monitor。
 #   不要在此包 try/except —— 盘中链失败必须抛出并被调度器记账, 绝不静默降级。
 run_monitor_safe = run_monitor
-
 

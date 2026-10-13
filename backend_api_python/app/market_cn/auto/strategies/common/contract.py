@@ -2,7 +2,7 @@
 
 P0 搬移（2026-10-12 策略接口统一方案）：收拢 strategies/base.py 中的
 has_fold_contract / FOLD_CONTRACT_EXEMPT。
-纯搬移，零行为改。
+has_fold_contract / FOLD_CONTRACT_EXEMPT。当前无需折叠豁免的内置策略。
 """
 
 #: 设计依据：`.py` 插件是逃生舱（目标态 §3.1），未迁折叠不等于缺陷，但必须**登记**。
@@ -13,18 +13,7 @@ has_fold_contract / FOLD_CONTRACT_EXEMPT。
 #:   expires       到期日（YYYY-MM-DD）；逾期不自动清退，但必须可见
 #:   missing_views 豁免期间**缺失的能力视图**
 #: 清退条件：策略迁完折叠契约（init_state/step/evaluate）后**立即移出本名单**。
-FOLD_CONTRACT_EXEMPT: dict = {
-    "v1": {
-        "reason": ("2026-10-10 实证改造后回归（V1策略迭代与新策略实证_20261010.md）："
-                   "自持回测编排 scan_signals + entry_decision + run_exit(\"v1_combo\")，"
-                   "未迁折叠契约；"
-                   "record writer 下走「退回直判」分支（带 ERROR 日志），monitor 回退旧三决策。"
-                   "（2026-10-12 A-1b：原自持 `_run_backtest` 已参数化迁 core.exit_engines。）"),
-        "ticket": "§13.1 A-5（v1 补折叠契约 init_state/step/evaluate 后移出本名单）",
-        "expires": "2026-12-31",
-        "missing_views": ["realtime_progress", "present_slice"],
-    },
-}
+FOLD_CONTRACT_EXEMPT: dict = {}
 
 
 def has_fold_contract(strategy) -> bool:

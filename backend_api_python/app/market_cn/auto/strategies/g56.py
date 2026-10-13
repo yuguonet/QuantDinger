@@ -335,8 +335,7 @@ class G56Strategy(StrategyBase):
 
     def init_shared(self, shared):
         """用持久化的策略级状态恢复台账（每轮开头调用，幂等）。"""
-        if shared:
-            self.ledger = PoolLedger(shared.get("quads"))
+        self.ledger = PoolLedger((shared or {}).get("quads"))
 
     def shared_snapshot(self):
         return {"quads": self.ledger.snapshot()}
