@@ -68,5 +68,16 @@ if _file_handler is None:
     root.addHandler(_file_handler)
 
 logger = logging.getLogger("app.agent")
+
+# ⚠️ filter 挂 logger 只覆盖「直接打到 app.agent 这条 logger」的记录。
+# 子 logger（logging.getLogger("app.agent.xxx")，agent 包内绝大多数模块都是这种）
+# 的 record 是 **propagate** 上来的：Python 不会让它经过父 logger 的 filter，
+# 只经过父 logger 的 **handler** 的 filter。
+# ⇒ 只挂 logger.filters 时，脱敏对 app.agent.* 全部失效，api_key / 手机号等
+#   会明文落进 logs/app.log。必须挂到 handler 上才真正生效。
+_mask = _MaskFilter()
 if not any(isinstance(f, _MaskFilter) for f in logger.filters):
-    logger.addFilter(_MaskFilter())
+    logger.addFilter(_mask)
+for _h in list(root.handlers):
+    if not any(isinstance(f, _MaskFilter) for f in _h.filters):
+        _h.addFilter(_mask)

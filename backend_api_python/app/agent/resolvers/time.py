@@ -253,7 +253,23 @@ class TimeResolver(EntityResolver):
                 #   区间型捕获组是数字（近5…），须补上词干（个交易日/天/周/月）→ m.end(1)+词干长；
                 #   二者都不含正则可选尾缀（如「的行情」）——否则日期被插到谓语后面拆散句意。
                 _stem = _RANGE_STEMS.get(kind, "")
-                _word_end = m.end(1) + (len(_stem) if _stem else 0) if m.groups() else m.end()
+                if _stem:
+                    # 区间型（近5个交易日 / 3天前）：捕获组是数字，补上词干长度
+                    _word_end = m.end(1) + len(_stem)
+                elif m.groups():
+                    # 多捕获组型（如「上周三」= 组1「上」+ 组2「周三」）：
+                    # 钉在**最后一个非空组**的末尾。用 m.end(1) 会插成
+                    # 「上(2026-10-07)周三」——把时间词拆散且日期与词不对应。
+                    _gi = max(i for i in range(1, m.re.groups + 1)
+                              if m.group(i) is not None)
+                    _word_end = m.end(_gi)
+                else:
+                    _word_end = m.end()
+                # 重叠去重：同一段文字常被多个 pattern 命中（「上周三」同时命中
+                # weekday_rel 与 weekday_abs），只保留首个（_PATTERNS 顺序即优先级），
+                # 否则同一处叠两个日期 → effective_input 被污染。
+                if any(m.start() < e and _word_end > s for s, e, _ in edits):
+                    continue
                 edits.append((m.start(), _word_end, inline))
 
         # 就地内联（2026-09-15 用户定格式）：日期钉在**原文的时间词上**，

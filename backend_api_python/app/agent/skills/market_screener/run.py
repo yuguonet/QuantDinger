@@ -309,26 +309,34 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     from ._helpers import _FETCH_TIMEOUT_S, attach_prediction
     raw: list = []
     done: set = set()
+    futs: dict = {}
+    # C7（假超时）：这里**不能**用 `with ThreadPoolExecutor(...)` —— 退出 __exit__
+    # 等价于 shutdown(wait=True)，会一直阻塞到挂死线程结束，于是 as_completed 的
+    # timeout 形同虚设（外部源挂起时调用线程照样被钉死，_FETCH_TIMEOUT_S 失效）。
+    # 改显式 shutdown(wait=False, cancel_futures=True)：超时立即返回，未开始的任务
+    # 取消，仍在跑的线程不再等待（挂起源由其自身超时收尾）。
+    ex = ThreadPoolExecutor(max_workers=min(8, len(items)))
     try:
-        with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
-            futs = {ex.submit(_one, it): str(it.get("code") or "") for it in items}
-            for fut in as_completed(futs, timeout=max(30.0, _FETCH_TIMEOUT_S * 2)):
-                done.add(fut)
-                _code = futs[fut]
-                try:
-                    r = fut.result()
-                    if r is not None:
-                        raw.append(r)
-                    else:
-                        errors.append({"code": _code, "error": "分析返回 None（多为数据不足）"})
-                except Exception as e:
-                    errors.append({"code": _code, "error": f"{type(e).__name__}: {e}"})
+        futs = {ex.submit(_one, it): str(it.get("code") or "") for it in items}
+        for fut in as_completed(futs, timeout=max(30.0, _FETCH_TIMEOUT_S * 2)):
+            done.add(fut)
+            _code = futs[fut]
+            try:
+                r = fut.result()
+                if r is not None:
+                    raw.append(r)
+                else:
+                    errors.append({"code": _code, "error": "分析返回 None（多为数据不足）"})
+            except Exception as e:
+                errors.append({"code": _code, "error": f"{type(e).__name__}: {e}"})
     except Exception as e:  # 线程池超时 / 崩溃：已入场的结果照用，缺席的必须留痕
         missing.append(f"并发分析中断: {type(e).__name__}: {e}")
     else:
         for fut, _code in futs.items():
             if fut not in done:
                 errors.append({"code": _code, "error": "未在时限内返回（多为外部源挂起）"})
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     if len(raw) < len(items):
         missing.append(f"{len(items) - len(raw)} 只票未在时限内完成")
 
@@ -462,15 +470,17 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
 
     results = {}
     fut_names = {}
+    ex = ThreadPoolExecutor(max_workers=max(1, len(tasks)))   # 同 C7：不用 with
     try:
-        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as ex:
-            fut_names = {ex.submit(_task, fn.__name__.lstrip("_"), fn): fn.__name__.lstrip("_")
-                         for fn in tasks}
-            for fut in as_completed(fut_names, timeout=_INSPECT_DEADLINE_S):
-                name, val = fut.result()
-                results[name] = val
+        fut_names = {ex.submit(_task, fn.__name__.lstrip("_"), fn): fn.__name__.lstrip("_")
+                     for fn in tasks}
+        for fut in as_completed(fut_names, timeout=_INSPECT_DEADLINE_S):
+            name, val = fut.result()
+            results[name] = val
     except Exception as e:
         missing.append(f"并发取数: {type(e).__name__}: {e}")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     # 超时未返回的源必须留痕 —— 否则 LLM 会把「拿不到」误读成「没有」
     for fut, name in fut_names.items():
         if name not in results:

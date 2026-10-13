@@ -26,7 +26,7 @@ import queue
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +155,17 @@ def _next_hm(hours: set, minutes: set, cur_h: int, cur_m: int) -> tuple:
     return min(hours), min(minutes)
 
 
-def next_cron_time(cron_expr: str, after: datetime, max_search_days: int = 62) -> datetime:
-    """计算下一个匹配时间。支持 | 分隔的多段表达式，返回最早的匹配。"""
+def next_cron_time(cron_expr: str, after: datetime,
+                   max_search_days: int = 62) -> Optional[datetime]:
+    """计算下一个匹配时间。支持 | 分隔的多段表达式，返回最早的匹配。
+
+    Returns:
+        下一个匹配时刻；**表达式非法或窗口内无匹配时返回 None**。
+
+        ⚠️ 早期实现在找不到匹配时回退 `after + 1 分钟`：调用方把它当成合法
+        delay（60 秒）设进 Timer ⇒ 一条**无效 cron 表达式 = 每分钟真实跑一遍
+        agent**，烧 token、写决策库，而日志看起来完全正常。宁可不调度，也不假调度。
+    """
     sub_exprs = cron_expr.split("|")
     if len(sub_exprs) > 1:
         candidates = []
@@ -164,14 +173,16 @@ def next_cron_time(cron_expr: str, after: datetime, max_search_days: int = 62) -
             t = _next_cron_single(sub.strip(), after, max_search_days)
             if t:
                 candidates.append(t)
-        return min(candidates) if candidates else after + timedelta(minutes=1)
-    return _next_cron_single(cron_expr.strip(), after, max_search_days) or (after + timedelta(minutes=1))
+        return min(candidates) if candidates else None
+    return _next_cron_single(cron_expr.strip(), after, max_search_days)
 
 
-def _next_cron_single(cron_expr: str, after: datetime, max_search_days: int = 62) -> datetime:
-    """单段 cron 表达式的下一个匹配时间。"""
+def _next_cron_single(cron_expr: str, after: datetime,
+                      max_search_days: int = 62) -> Optional[datetime]:
+    """单段 cron 表达式的下一个匹配时间；非法或窗口内无匹配返回 None。"""
     parts = cron_expr.strip().split()
     if len(parts) != 5:
+        logger.error("[CronWorker] cron 表达式不是 5 段，拒绝调度: %r", cron_expr)
         return None
 
     minutes_f = _parse_cron_field(parts[0], 0, 59)
@@ -179,6 +190,15 @@ def _next_cron_single(cron_expr: str, after: datetime, max_search_days: int = 62
     days_f = _parse_cron_field(parts[2], 1, 31)
     months_f = _parse_cron_field(parts[3], 1, 12)
     weekdays_f = _parse_cron_field(parts[4], 0, 6)
+
+    # 任一字段解析成空集 ⇒ 该表达式永远匹配不上（或语法非法）。
+    # 必须在此拒绝：否则后面 `min(hours_f)` 会 ValueError，或循环空转 62 天。
+    for _n, _f in (("分钟", minutes_f), ("小时", hours_f), ("日", days_f),
+                   ("月", months_f), ("星期", weekdays_f)):
+        if not _f:
+            logger.error("[CronWorker] cron 字段 %s 解析为空集，拒绝调度: %r",
+                         _n, cron_expr)
+            return None
 
     dt = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
@@ -195,20 +215,28 @@ def _next_cron_single(cron_expr: str, after: datetime, max_search_days: int = 62
                 dt = dt.replace(hour=target_h, minute=target_m)
             else:
                 dt = (dt + timedelta(days=1)).replace(hour=min(hours_f), minute=min(minutes_f))
-        return after + timedelta(days=1)
+        logger.error("[CronWorker] cron 表达式 %r 在 %d 天内无匹配，不调度",
+                     cron_expr, max_search_days)
+        return None
 
     # 每天固定时间：逐天跳
     if parts[1] != "*":
         for _ in range(max_search_days + 1):
             py_wday = dt.isoweekday() % 7
-            if dt.hour in hours_f and dt.minute in minutes_f and py_wday in weekdays_f:
+            # ⚠️ 月 / 日两字段必须一并校验：早期实现只比 hour / minute / weekday，
+            # 于是 `0 9 * 1 *`（仅 1 月每天 9:00）被当成**全年每天 9:00**执行。
+            if (dt.month in months_f and dt.day in days_f
+                    and dt.hour in hours_f and dt.minute in minutes_f
+                    and py_wday in weekdays_f):
                 return dt
             target_h, target_m = _next_hm(hours_f, minutes_f, dt.hour, dt.minute)
             if target_h > dt.hour or (target_h == dt.hour and target_m > dt.minute):
                 dt = dt.replace(hour=target_h, minute=target_m)
             else:
                 dt = (dt + timedelta(days=1)).replace(hour=min(hours_f), minute=min(minutes_f))
-        return after + timedelta(days=1)
+        logger.error("[CronWorker] cron 表达式 %r 在 %d 天内无匹配，不调度",
+                     cron_expr, max_search_days)
+        return None
 
     # 分钟级/小时级：逐分钟遍历
     for _ in range(1440 * max_search_days):
@@ -218,7 +246,9 @@ def _next_cron_single(cron_expr: str, after: datetime, max_search_days: int = 62
                 and py_wday in weekdays_f):
             return dt
         dt += timedelta(minutes=1)
-    return after + timedelta(minutes=1)
+    logger.error("[CronWorker] cron 表达式 %r 在 %d 天内无匹配，不调度",
+                 cron_expr, max_search_days)
+    return None
 
 
 def _import_function(path: str) -> Callable:
@@ -382,6 +412,12 @@ def _reschedule_job(job_id: int):
         cron_expr = job["cron_expr"]
         now = datetime.now(TZ_CN)
         nxt = next_cron_time(cron_expr, now)
+        if nxt is None:
+            # 表达式非法 / 永不匹配 ⇒ 不设 Timer。
+            # 早期实现这里会退化成 60 秒后触发，等于每分钟跑一遍 agent。
+            logger.error("[CronWorker] 任务 %d 的 cron 表达式无效，已跳过调度: %r",
+                         job_id, cron_expr)
+            return
         delay = max((nxt - now).total_seconds(), 1)
         _schedule_job(job_id, job, delay)
 
@@ -427,6 +463,10 @@ def _load_and_schedule_all():
             job_id = job["id"]
             cron_expr = job["cron_expr"]
             nxt = next_cron_time(cron_expr, now)
+            if nxt is None:
+                logger.error("[CronWorker] 任务 %d 的 cron 表达式无效，跳过: %r",
+                             job_id, cron_expr)
+                continue
             delay = max((nxt - now).total_seconds(), 1)
             _schedule_job(job_id, job, delay)
 

@@ -60,9 +60,21 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         bull_score = trend_score
 
     indicator = data.get("indicator", {})
+    # ⚠️ 生产者 `_get_indicator_snapshot`（本模块 :664）返回的是**嵌套**结构：
+    #   {"codes", "latest_close", "ma5"…,
+    #    "macd": {dif, dea, macd, bar_trend, position, signals},
+    #    "rsi":  {rsi6, rsi6_zone, rsi12, …}, "boll": {…}, "kdj": {…}}
+    # 早期在**顶层**平取 `rsi6` / `macd_hist` ⇒ 恒取到默认值 ⇒ RSI 超卖/超买与
+    # MACD 多头/空头这四条论据**从未生成**，多空研究员实际只靠趋势 + 量价打分。
+    # 另注：MACD 柱值的键名是 `macd`（见 `_calc_macd` 返回），不是 macd_hist。
+    _ind = indicator if (isinstance(indicator, dict) and "error" not in indicator) else {}
+    _rsi_d = _ind.get("rsi") if isinstance(_ind.get("rsi"), dict) else {}
+    _macd_d = _ind.get("macd") if isinstance(_ind.get("macd"), dict) else {}
+    _rsi6 = _rsi_d.get("rsi6", 50)
+    _macd_hist = _macd_d.get("macd", 0)
     if isinstance(indicator, dict) and "error" not in indicator:
-        rsi = indicator.get("rsi6", 50)
-        macd_hist = indicator.get("macd_hist", 0)
+        rsi = _rsi6
+        macd_hist = _macd_hist
         if rsi < 30:
             bull_factors.append(f"RSI{rsi:.0f}超卖")
             bull_signals.append(f"RSI超卖:{rsi:.0f}")
@@ -95,8 +107,10 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         bear_score = 100 - trend_score
 
     if isinstance(indicator, dict) and "error" not in indicator:
-        rsi = indicator.get("rsi6", 50)
-        macd_hist = indicator.get("macd_hist", 0)
+        # 见多头论据处的结构说明：从嵌套子结构取（rsi.rsi6 / macd.macd），
+        # 不在顶层平取 —— 顶层没有这两个键，平取只会拿到默认值。
+        rsi = _rsi6
+        macd_hist = _macd_hist
         if rsi >= 70:
             bear_factors.append(f"RSI{rsi:.0f}超买")
             bear_signals.append(f"RSI超买:{rsi:.0f}")

@@ -94,35 +94,61 @@ def save_decision(*, session_id: str = "", trace_root_id: Optional[int] = None,
 
 
 def save_claims(decision_id: int, claims: List[Dict[str, Any]],
-                extractor_ver: str = "") -> List[int]:
-    """批量写 claim，返回写入的 id 列表。"""
+                extractor_ver: str = "") -> List[Optional[int]]:
+    """批量写 claim，返回**与 claims 等长同序**的 id 列表，失败位为 None。
+
+    ★ 等长同序是硬契约（intake docstring 已声明「claims 与 claim_ids 同序」）：
+      下游 `c3p` 用 `zip(claim_ids, claims)` 按下标把 Δp/证据归因到具体 claim，
+      一旦某条 INSERT 失败就让后续 id 前移，Δp 会**记到别的 claim 上**——
+      功能看起来在工作，实际产出的是假数据，且没有任何报错。
+
+    实现上每条 INSERT 包一层 SAVEPOINT：Postgres 事务一旦 abort 必须回滚到
+    保存点才能继续，否则「一条坏」会变成「整批坏」（后续 INSERT 全部失败）。
+    """
     if not decision_id or not claims:
         return []
-    ids: List[int] = []
+    ids: List[Optional[int]] = []
     try:
         with _conn() as conn:
             cur = conn.cursor()
             for c in claims:
-                cur.execute(
-                    "INSERT INTO qd_agent_claims"
-                    " (decision_id, seq, claim_type, subject, subject_kind, horizon,"
-                    "  due_date, predicted, confidence, evidence, source_quote,"
-                    "  extractor_ver)"
-                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (int(decision_id), int(c.get("seq") or 0),
-                     str(c.get("claim_type") or ""), c.get("subject"),
-                     c.get("subject_kind"), str(c.get("horizon") or "T+3"),
-                     c.get("due_date"),
-                     json.dumps(c.get("predicted") or {}, ensure_ascii=False),
-                     c.get("confidence"), (c.get("evidence") or "")[:1000],
-                     (c.get("source_quote") or "")[:500], extractor_ver or ""))
-                row = cur.fetchone()
-                if row:
-                    ids.append(int(row["id"]))
+                try:
+                    cur.execute("SAVEPOINT qd_claim")
+                    cur.execute(
+                        "INSERT INTO qd_agent_claims"
+                        " (decision_id, seq, claim_type, subject, subject_kind, horizon,"
+                        "  due_date, predicted, confidence, evidence, source_quote,"
+                        "  extractor_ver)"
+                        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                        (int(decision_id), int(c.get("seq") or 0),
+                         str(c.get("claim_type") or ""), c.get("subject"),
+                         c.get("subject_kind"), str(c.get("horizon") or "T+3"),
+                         c.get("due_date"),
+                         json.dumps(c.get("predicted") or {}, ensure_ascii=False),
+                         c.get("confidence"), (c.get("evidence") or "")[:1000],
+                         (c.get("source_quote") or "")[:500], extractor_ver or ""))
+                    row = cur.fetchone()
+                    cur.execute("RELEASE SAVEPOINT qd_claim")
+                except Exception as e:
+                    logger.warning("[AccountStore] 单条 claim 落库失败(该位置 None):"
+                                   " %s: %s", type(e).__name__, e)
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT qd_claim")
+                    except Exception as e2:
+                        # 保存点也回滚不掉 ⇒ 事务已废，剩余条目标 None 后退出
+                        logger.warning("[AccountStore] SAVEPOINT 回滚失败，"
+                                       "终止本批: %s: %s", type(e2).__name__, e2)
+                        ids.extend([None] * (len(claims) - len(ids)))
+                        break
+                    row = None
+                ids.append(int(row["id"]) if row else None)
             conn.commit()
     except Exception as e:
         logger.warning("[AccountStore] 写 claims 失败(忽略): %s: %s",
                        type(e).__name__, e)
+    # 契约收口：无论中途怎么退出，长度必须等于 claims（对齐优先于“写成功”）
+    if len(ids) < len(claims):
+        ids.extend([None] * (len(claims) - len(ids)))
     return ids
 
 
@@ -173,9 +199,14 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
         with _conn() as conn:
             cur = conn.cursor()
             cur.execute(
+                # ⚠️ verify_fail_count 必须在此选出：resolver 的退市判据
+                # （G18 防幸存者偏差）读 claim["verify_fail_count"]，漏选会让该分支
+                # 恒为 0 → 判据①永不成立 → delisted 分支不可达（功能静默失效）。
+                # 列由 migrations/agent_v5_claim_retry.sql 添加，DEFAULT 0。
                 "SELECT c.id, c.decision_id, c.claim_type, c.subject, c.subject_kind,"
                 "       c.horizon, c.due_date, c.predicted, c.confidence,"
-                "       c.source_quote, d.domain, d.intent, d.user_query, d.answer,"
+                "       c.source_quote, c.verify_fail_count,"
+                "       d.domain, d.intent, d.user_query, d.answer,"
                 "       d.created_at::date AS exec_date"
                 " FROM qd_agent_claims c"
                 " JOIN qd_agent_decisions d ON d.id = c.decision_id"

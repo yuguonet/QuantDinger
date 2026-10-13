@@ -12,6 +12,29 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _align_vectors(texts: list[str], vectors: list[list[float]],
+                   valid_texts: list[str]) -> list[list[float]]:
+    """把「过滤空文本后」的向量结果填回**原始入参的位置**。
+
+    ⚠️ 契约（务必保持）：`embed_documents` 的返回长度必须等于入参长度，
+    空文本 / 失败位置返回 `[]`。
+    早期实现先 `if t and t.strip()` 过滤再请求，返回条数少于入参 ⇒ 下游
+    `zip(texts, vectors)` 按下标配对时**整体错位**，文档与向量静默错配
+    （连 metadata 一起错），且不报任何错。
+
+    若上游返回条数与请求条数不一致，说明发生了无法归因的错位 —— 宁可全空
+    也不按猜测对齐（避免「编造数据」）。
+    """
+    src = list(texts or [])
+    if len(vectors) != len(valid_texts):
+        logger.error(
+            "[Embedding] 返回条数 %d 与请求条数 %d 不一致，放弃本批（不按猜测对齐）",
+            len(vectors), len(valid_texts))
+        return [[] for _ in src]
+    it = iter(vectors)
+    return [next(it) if (t and str(t).strip()) else [] for t in src]
+
+
 class EmbeddingBase(ABC):
     """Embedding 基类"""
 
@@ -22,7 +45,12 @@ class EmbeddingBase(ABC):
 
     @abstractmethod
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量文本向量化"""
+        """批量文本向量化。
+
+        Returns:
+            与 `texts` **等长**的向量列表；空文本或失败位置为 `[]`。
+            下游必须跳过空向量，不得按下标盲配。
+        """
         ...
 
 
@@ -67,10 +95,11 @@ class DashScopeEmbedding(EmbeddingBase):
             return []
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量文本向量化"""
-        valid_texts = [t.strip()[:4096] for t in texts if t and t.strip()]
+        """批量文本向量化（返回与 texts 等长，空/失败位置为 []）。"""
+        src = list(texts or [])
+        valid_texts = [t.strip()[:4096] for t in src if t and t.strip()]
         if not valid_texts:
-            return []
+            return [[] for _ in src]
 
         try:
             import dashscope
@@ -80,13 +109,14 @@ class DashScopeEmbedding(EmbeddingBase):
             response = TextEmbedding.call(model=self.model, input=valid_texts)
 
             if response.status_code == 200:
-                return [item["embedding"] for item in response.output["embeddings"]]
+                vecs = [item["embedding"] for item in response.output["embeddings"]]
+                return _align_vectors(src, vecs, valid_texts)
             else:
                 logger.error(f"批量 Embedding 失败: {getattr(response, 'message', response)}")
-                return []
+                return [[] for _ in src]
         except Exception as e:
             logger.error(f"批量 Embedding 异常: {e}")
-            return []
+            return [[] for _ in src]
 
 
 class OpenAIEmbedding(EmbeddingBase):
@@ -120,14 +150,17 @@ class OpenAIEmbedding(EmbeddingBase):
             return []
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量文本向量化"""
+        """批量文本向量化（返回与 texts 等长，空/失败位置为 []）。"""
+        src = list(texts or [])
         try:
             client = self._get_client()
-            response = client.embeddings.create(model=self.model, input=texts)
-            return [item.embedding for item in response.data]
+            response = client.embeddings.create(model=self.model, input=src)
+            vecs = [item.embedding for item in response.data]
+            # 请求未过滤空文本，向量应与入参一一对应；不对应则不猜、不配。
+            return _align_vectors(src, vecs, src)
         except Exception as e:
             logger.error(f"OpenAI 批量 Embedding 异常: {e}")
-            return []
+            return [[] for _ in src]
 
 
 class LlamaCppEmbedding(OpenAIEmbedding):

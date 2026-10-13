@@ -263,8 +263,11 @@ def stop():
 
     与 CLI Ctrl+C / Cron 共用 `message_queue.request_stop()`——跨终端立即停止。
     session_id 需与 chat/task 入队时一致（带用户命名空间前缀，如 "user:3:session_xxx"）。
-    为兼容前端是否携带前缀两种情形，原样与补前缀两个键都投递（request_stop 幂等，
-    残留位对不存在会话无副作用）。
+    为兼容前端是否携带前缀两种情形，带前缀与不带前缀两种写法都接受。
+
+    ⚠️ 安全边界：停止范围**只允许落在当前调用者自己的命名空间内**。
+    早期实现会「原样」把任意 session_id 投给 request_stop ⇒ 只要知道他人
+    完整的命名空间键（"user:5:xxx"），就能停掉对方正在跑的任务或定时任务。
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -272,9 +275,15 @@ def stop():
         if not session_id:
             return jsonify({"error": "session_id 不能为空"}), 400
         from .message_queue import request_stop
-        request_stop(session_id)                              # 原样（前端已带命名空间）
-        request_stop(f"{_resolve_user_ns()}:{session_id}")    # 补前缀（与 chat/task 对齐）
-        return jsonify({"ok": True, "session_id": session_id})
+        ns = _resolve_user_ns()
+        # 只在本用户命名空间内解析：已带本用户前缀就直接用，否则补上前缀。
+        # 带**他人**前缀的键一律拒绝（不原样投递）。
+        if session_id.startswith(f"{ns}:"):
+            target = session_id
+        else:
+            target = f"{ns}:{session_id}"
+        request_stop(target)
+        return jsonify({"ok": True, "session_id": target})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

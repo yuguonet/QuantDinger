@@ -152,7 +152,9 @@ def _flush_and_exit(code: int = 0) -> None:
 
 def _print_info():
     """显示配置信息。"""
-    _, settings, skills, _, _ = _import_agent()
+    # ⚠️ _import_agent() 返回 4 元组 (agent, settings, skills, DEFAULT_SESSION_ID)。
+    # 早期版本按 5 个解包，必然 ValueError 崩溃（--info 从未真正工作过）。
+    _, settings, skills, _ = _import_agent()
 
     print("=" * 60)
     print("QuantDinger Agent — CLI")
@@ -182,7 +184,7 @@ def _list_tools():
 
 def _list_skills():
     """列出所有技能。"""
-    _, _, skills, _, _ = _import_agent()
+    _, _, skills, _ = _import_agent()   # 4 元组，见 _print_info 处的说明
 
     print(f"\n[skills] 可用技能 ({len(skills)} 个):\n")
     for info in skills.list_skills():

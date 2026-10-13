@@ -140,7 +140,15 @@ def _algo_analyze(
     volume_score = 50
     if isinstance(volume, dict) and "error" not in volume:
         vol_ratio = volume.get("volume_ratio", 1.0)
-        turnover = volume.get("turnover_rate", 0)
+        # ⚠️ 生产者 `get_volume_analysis` **不返回** `turnover_rate`
+        # （其返回键见 analysis_tools.py:1190 docstring：stock_code/latest_volume/
+        # avg_volume_5d/avg_volume_20d/volume_ratio/volume_status/volume_trend/
+        # vol_price_relation/is_intraday）⇒ 早期写法恒取到 0，
+        # `if turnover > 10` 永不触发，换手率这个因子一直是死的。
+        # 换手率的真实来源是 `get_stock_info` 的 `turnover_pct`（data_tools.py:478）。
+        _si = tool_results.get("get_stock_info", {})
+        turnover = ((_si.get("turnover_pct") if isinstance(_si, dict) else None)
+                    or volume.get("turnover_rate") or 0)
         vol_trend = volume.get("volume_trend", "")
 
         if vol_ratio > 2.0:
@@ -154,9 +162,11 @@ def _algo_analyze(
             volume_score += 5
             signals.append(f"换手率{turnover:.1f}%")
 
-        if vol_trend == "递增":
+        # ⚠️ 生产者只产出 "上升"/"下降"/"平稳"/"数据不足"（analysis_tools.py:1247），
+        # 早期按 "递增"/"递减" 比对 ⇒ 恒不匹配，量能趋势修正从未生效。
+        if vol_trend == "上升":
             volume_score += 5
-        elif vol_trend == "递减":
+        elif vol_trend == "下降":
             volume_score -= 5
 
         volume_score = max(0, min(100, volume_score))
@@ -188,8 +198,15 @@ def _algo_analyze(
     chip = tool_results.get("get_chip_distribution", {})
     chip_score = 50
     if isinstance(chip, dict) and "error" not in chip:
-        concentration = chip.get("concentration", 0)
-        profit_ratio = chip.get("profit_ratio", 50)
+        # ⚠️ 两处与生产者（chip_distribution._calc_chip_distribution）契约对不上：
+        # ① 键名是 `concentration_90`（且值是 "高"/"中"/"低" **字符串**），
+        #    不是 `concentration` ⇒ 早期写法恒取到 0，集中度信息从未生效；
+        # ② `profit_ratio` 生产者口径是 **0~1**（不是 0~100），而下面的判据按
+        #    百分比写（>80 / <20）⇒ 0~1 的值**永远命中 <20**，于是任何标的
+        #    都被判成"获利盘低、超跌"，加分方向完全反了。
+        concentration = chip.get("concentration_90", "") or ""   # "高"/"中"/"低"
+        _pr = chip.get("profit_ratio", 0.5)
+        profit_ratio = (_pr * 100.0) if _pr is not None and _pr <= 1.0 else float(_pr or 0)
         if profit_ratio > 80:
             chip_score -= 10
             signals.append(f"获利盘{profit_ratio:.0f}%，抛压风险")
@@ -197,7 +214,10 @@ def _algo_analyze(
             chip_score += 10
             signals.append(f"获利盘{profit_ratio:.0f}%，超跌")
         chip_score = max(0, min(100, chip_score))
-        factors.append({"name": "筹码", "value": f"获利{profit_ratio:.0f}%", "score": chip_score})
+        factors.append({"name": "筹码",
+                        "value": f"获利{profit_ratio:.0f}%"
+                                 + (f" 集中度{concentration}" if concentration else ""),
+                        "score": chip_score})
     else:
         factors.append({"name": "筹码", "value": "数据缺失", "score": 50})
 
@@ -310,7 +330,11 @@ def _algo_analyze(
     if isinstance(indicator_raw, dict):
         rsi_dict = indicator_raw.get("rsi", {})
         if isinstance(rsi_dict, dict):
-            rsi_val = rsi_dict.get("rsi") or rsi_dict.get("value")
+            # ⚠️ 键名对齐生产者：get_indicator_snapshot 的 rsi 子结构给的是
+            # rsi6/rsi12/rsi24（本文件 :99 取 rsi6 即据此）。早期按 "rsi"/"value"
+            # 取恒 None ⇒ 可证伪条件里的 RSI 分支从未生成。
+            rsi_val = (rsi_dict.get("rsi6") or rsi_dict.get("rsi")
+                       or rsi_dict.get("value"))
     falsifiable = []
     if direction == "bullish":
         if ma5 and ma20:

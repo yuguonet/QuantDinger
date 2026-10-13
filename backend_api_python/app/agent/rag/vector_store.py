@@ -117,6 +117,9 @@ class QdrantVectorStore(VectorStoreBase):
             points = []
             ids = []
             for idx, (text, vector) in enumerate(zip(texts, vectors)):
+                # 空文本 / 该条向量化失败：跳过，避免写入内容与向量错配的脏点
+                if not vector:
+                    continue
                 doc_id = str(uuid.uuid4())
                 ids.append(doc_id)
                 metadata = metadatas[idx] if metadatas else {}

@@ -94,6 +94,12 @@ def record_decision(*, user_query: str, answer: str, session_id: str = "",
                     "claim_ids": ids, "claims": list(extracted or [])})
         logger.info("[Intake] 入库 decision=%s domain=%s claims=%d",
                     decision_id, domain, len(ids))
+        # claim_ids 与 claims 等长同序；None 位＝该条未落库，下游 c3p 会跳过归因。
+        # 这里必须显式记一笔——否则"抽取成功但没入库"会完全静默。
+        _miss = sum(1 for i in ids if i is None)
+        if _miss:
+            logger.warning("[Intake] decision=%s 有 %d/%d 条 claim 未落库(跳过归因)",
+                           decision_id, _miss, len(ids))
     except Exception as e:                      # 旁路永不阻断主链
         out["reason"] = f"error:{type(e).__name__}"
         logger.warning("[Intake] 追责入库失败(忽略): %s: %s", type(e).__name__, e)

@@ -418,7 +418,9 @@ def indicator_analysis(codes: str, user_id: int = 1,
 
     # ── 5. 有信号 → 基础分 + 历史加权 + 衰减 ──
     factors = []
-    total_score = 50.0
+    # score_delta = Σ ±(score - 50)·conf —— 以 50 为中性原点的**加权偏移量**。
+    # ⚠️ 基线 50 是原点，不是可参与除法的分子项。
+    score_delta = 0.0
     total_weight = 0.0
 
     for ev in active_buy:
@@ -430,7 +432,7 @@ def indicator_analysis(codes: str, user_id: int = 1,
         conf *= decay
         if decay_reason:
             label += f" [{decay_reason}]"
-        total_score += score * conf
+        score_delta += (score - 50.0) * conf
         total_weight += conf
         factors.append({
             "name": f"{ev['name']}:买入",
@@ -449,7 +451,7 @@ def indicator_analysis(codes: str, user_id: int = 1,
         conf *= decay
         if decay_reason:
             label += f" [{decay_reason}]"
-        total_score -= score * conf
+        score_delta -= (score - 50.0) * conf
         total_weight += conf
         factors.append({
             "name": f"{ev['name']}:卖出",
@@ -460,8 +462,13 @@ def indicator_analysis(codes: str, user_id: int = 1,
         })
 
     # 加权平均
+    # ⚠️ 早期实现为 `(50 + Σ ±score·conf) / Σconf`：基线 50 被当成分子一起除，
+    # 于是 ① 单信号必然输出极端分（例：1 个买入 score=60 conf=0.3 →
+    # (50+18)/0.3 = 226 → 截断成 100）；② **一买一卖互相抵消时仍会给出
+    # 83 分这种明明中性却偏多的分数**（(50+18-18)/0.6）。
+    # 正确式：以 50 为原点做加权平均偏移 —— 50 + Σ ±(score-50)·conf / Σconf。
     if total_weight > 0:
-        final_score = max(0, min(100, total_score / total_weight))
+        final_score = max(0, min(100, 50.0 + score_delta / total_weight))
     else:
         final_score = 50
 
@@ -547,8 +554,14 @@ def _evaluate_indicator(indicator_id: int, codes: str, user_id: int) -> Optional
     backtest = result.get("backtest_preview", {})
 
     # run_indicator_signal：最近5根K线的逐根信号
+    # ⚠️ 该函数的 `stock_code` 是**无默认值的位置必填参数**（定义在本文件 :133），
+    # 早期实现漏传 ⇒ 每次调用直接 TypeError。异常被上层的宽 except 吞掉，
+    # 表现是「逐根信号」整段静默失效（永远拿不到，也不报错）。
+    # `codes` 是本函数的批量串（逗号分隔），逐根信号只针对单只 ⇒ 取第一只。
+    _codes = [c.strip() for c in str(codes or "").split(",") if c.strip()]
     sig = run_indicator_signal(
         indicator_id=indicator_id,
+        stock_code=_codes[0] if _codes else "",
         codes=codes,
         timeframe="1D",
         days=10,

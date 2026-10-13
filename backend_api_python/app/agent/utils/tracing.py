@@ -535,6 +535,15 @@ class AgentTraceRecorder:
         if status == "success":
             if final_answer:
                 self._finished_root_id = self._write_qd_agent_traces(final_answer)
+            else:
+                # B6：success 但答案为空 —— 旧实现既不落库也不记日志 ⇒
+                # "跑完了、库里却查不到"完全无从排查（排查黑洞）。
+                # 按 failed 口径留痕（与 error run 同：根节点留痕、不参与 T+N 回测），
+                # 并显式标注空答案，避免它冒充一条成功决策进入统计。
+                logger.warning("[Trace] run %s 状态 success 但 final_answer 为空，"
+                               "按 failed 留痕", self.trace_id)
+                self._finished_root_id = self._write_qd_agent_traces(
+                    "", status="failed", error="empty_final_answer")
         else:
             err = str((response or {}).get("error") or "")
             self._finished_root_id = self._write_qd_agent_traces(

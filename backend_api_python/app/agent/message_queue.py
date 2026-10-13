@@ -17,10 +17,29 @@ import json
 import logging
 import queue
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _settle(future: Future, result=None, exc: Optional[BaseException] = None) -> None:
+    """给 Future 落终态，**永不抛**（worker 线程保活的前提）。
+
+    concurrent.futures 语义：Future 只能落一次终态，对已取消/已完成的 Future
+    再 set_result / set_exception 抛 `InvalidStateError`。worker 里这个异常会
+    一路逃出 `while True` ⇒ **worker 线程永久死亡**（消费者悄悄少一个，队列
+    堆积且不报错）。典型触发：调用方 `cancel()` 后 worker 仍跑完去 set_result。
+    """
+    if future is None or future.cancelled() or future.done():
+        return
+    try:
+        if exc is not None:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+    except InvalidStateError:
+        pass  # 竞态下终态已被别处落下，目的已达成
 
 
 # ── F4 续跑凭据识别（2026-09-28 修 E7 读侧）────────────────
@@ -102,7 +121,8 @@ def init_workers(n: int = 4):
     _workers_started = True
     _worker_count = n
     for i in range(n):
-        t = threading.Thread(target=_worker_loop, daemon=True, name=f"mq-worker-{i}")
+        t = threading.Thread(target=_worker_loop_guarded, daemon=True,
+                             name=f"mq-worker-{i}")
         t.start()
     logger.info("[MQ] 已启动 %d 个 worker 线程", n)
 
@@ -141,6 +161,23 @@ def submit(
     return future
 
 
+def _worker_loop_guarded():
+    """Worker 线程入口：保活壳。
+
+    `_worker_loop` 只在收到毒丸时 return；任何从任务处理中逃逸的异常都会走到
+    这里并**重启消费循环**。不这么做的话，一次偶发异常（例如对已取消 Future
+    的二次 set_result）就会让该 worker 线程永久消失——4 个消费者变 3 个、2 个…
+    表现为"队列悄悄堆积"，日志里只有一条 traceback，极易误判为"agent 卡死"。
+    """
+    while True:
+        try:
+            _worker_loop()
+            return          # 正常退出只可能是毒丸
+        except BaseException as e:      # noqa: BLE001 - 保活优先
+            logger.error("[MQ] Worker 循环异常，重启消费循环(线程保活): %s",
+                         e, exc_info=True)
+
+
 def _worker_loop():
     """Worker 线程：从队列取消息 → agent.chat → 回写结果。"""
     import asyncio
@@ -152,7 +189,16 @@ def _worker_loop():
             break
 
         future: Future = task["future"]
-        if future.cancelled():
+        # 声明"开始执行"（concurrent.futures 契约，C1）：
+        #   ① 此后调用方 cancel() 恒返回 False，且**不会**把 future 置为 CANCELLED
+        #      ⇒ 运行中的任务不会被"取消"掉，后续 set_result 也不会撞
+        #      InvalidStateError（那是 worker 线程死亡的直接原因）；
+        #   ② 若调用方在排队期间就已取消 ⇒ 返回 False，直接丢弃不跑（省一次 LLM）。
+        try:
+            started = future.set_running_or_notify_cancel()
+        except RuntimeError:
+            started = False     # 终态/CANCELLED_AND_NOTIFIED 等非常态
+        if not started:
             continue
         clear_stop(str(task["session_id"]))  # 新任务开始，清掉该会话残留停止位
         # F4 续跑凭据识别（修 E7）：agent_resume JSON → 续跑上下文 prompt，
@@ -214,7 +260,7 @@ def _worker_loop():
                         _ta_mod.unregister_run_hooks(_sid)
 
                 resp = loop.run_until_complete(asyncio.wait_for(_run_with_events(), timeout=task["timeout"]))
-                future.set_result(resp.content or "")
+                _settle(future, result=resp.content or "")
             finally:
                 # 不 close 共享 LLM 客户端（审计 P0-3）：客户端绑定 event loop 且全局共享，
                 # 任务级 close 会误杀并发 worker 的在途请求，且下一个任务在新 loop 上复用
@@ -223,15 +269,21 @@ def _worker_loop():
         except (Exception, asyncio.CancelledError) as e:
             if isinstance(e, asyncio.CancelledError):
                 logger.warning("[MQ] Worker 任务超时被取消（放行）")
-                future.set_result("")
+                # C2：wait_for 超时只是"不再等"，协程可能仍卡在不可取消的同步 IO 里
+                # 继续烧 token、继续写记忆/决策库（孤儿 run）。置会话停止位 ⇒ 残留
+                # run 在下一个 step / 工具守卫探针检查点协作自停；钩子由它自己
+                # 的 finally 收尾（此处不反注册，否则会切断尚在途的事件回调）。
+                try:
+                    request_stop(str(task["session_id"]))
+                except Exception as se:
+                    logger.warning("[MQ] 超时后置停止位失败: %s: %s",
+                                   type(se).__name__, se)
+                _settle(future, result="")
             elif type(e).__name__ == "_UserInterruptError":
                 # 用户停止（CLI Ctrl+C / Web request_stop）：安静收尾。
                 # set_result('') 让仍阻塞在 result() 的调用方立刻解除（不抛给无人等的场景）。
                 logger.warning("[MQ] Worker 任务被用户停止，已中止 agent.run")
-                try:
-                    future.set_result("")
-                except Exception:
-                    pass
+                _settle(future, result="")
             else:
                 logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
-                future.set_exception(e)
+                _settle(future, exc=e)

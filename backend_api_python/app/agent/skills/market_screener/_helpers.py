@@ -488,17 +488,23 @@ def profile_candidates(
                 bars_map[code] = []
                 errors.append({"code": code, "stage": "fetch_kline", "error": str(e)})
 
+    ex = None
     try:
-        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-            try:
-                list(ex.map(_fetch, pool, timeout=_FETCH_TIMEOUT_S))
-            except Exception as e:  # 超时/线程崩：已取到的照用，缺口计入 missing
-                missing.append(f"并发取数超时: {type(e).__name__}: {e}")
-                logger.warning("[MktScreen] 并发取数超时: %s", e)
+        # 同 C7（假超时）：不用 `with`（__exit__ = shutdown(wait=True) 会干等到
+        # 挂死线程结束，把 ex.map 的 timeout 抵消掉）
+        ex = ThreadPoolExecutor(max_workers=_FETCH_WORKERS)
+        try:
+            list(ex.map(_fetch, pool, timeout=_FETCH_TIMEOUT_S))
+        except Exception as e:  # 超时/线程崩：已取到的照用，缺口计入 missing
+            missing.append(f"并发取数超时: {type(e).__name__}: {e}")
+            logger.warning("[MktScreen] 并发取数超时: %s", e)
     except Exception as e:  # 线程池不可用 → 退化为串行，不留死角
         logger.warning("[MktScreen] 并发取数失败，退化为串行: %s", e)
         for c in pool:
             _fetch(c)
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     profiles: List[Dict] = []
     for c in pool:
@@ -559,13 +565,17 @@ def profile_candidates(
                 p["flow"] = {"ok": False, "reason": str(e)}
                 p["missing"].append(f"资金流异常:{e}")
 
+        _fex = None
         try:
-            with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as ex:
-                list(ex.map(_flow, profiles[:limit]))
+            _fex = ThreadPoolExecutor(max_workers=_FETCH_WORKERS)
+            list(_fex.map(_flow, profiles[:limit]))
         except Exception as e:
             logger.warning("[MktScreen] 资金流并发失败: %s", e)
             for p in profiles[:limit]:
                 _flow(p)
+        finally:
+            if _fex is not None:
+                _fex.shutdown(wait=False, cancel_futures=True)
 
     if with_pred:
         profiles = attach_prediction(profiles, market=market)

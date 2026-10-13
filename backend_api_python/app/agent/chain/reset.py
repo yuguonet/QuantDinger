@@ -27,6 +27,37 @@ logger = __import__("logging").getLogger(__name__)
 _ACCOUNT_TABLES: List[str] = ["qd_agent_resolutions", "qd_agent_claims",
                               "qd_agent_decisions"]
 
+# 窗口基准：只有 decisions 有 created_at，另两张表需沿外键回溯到它
+_DECISIONS_IN_WINDOW = ("SELECT id FROM qd_agent_decisions"
+                        " WHERE created_at > NOW() - (%s || ' days')::interval")
+
+
+def _scoped_sql(t: str, limit_days: int, verb: str) -> tuple:
+    """生成带 `limit_days` 窗口限定的 SQL（verb 为 'DELETE FROM' 或 'SELECT count(*) AS n FROM'）。
+
+    ⚠️ 三张表必须共用**同一个窗口口径**。早期实现只对 `qd_agent_decisions` 加
+    `created_at > NOW() - N days`，claims / resolutions 走 else 全表 ⇒ 带
+    `limit_days` 清理时，反而把窗口之外的**全部历史**销毁了 —— 与「只清最近
+    N 天」的语义完全相反（且 dry_run 预览的数字同样是错的，看不出来）。
+
+    关联路径：`claims.decision_id` → decisions；resolutions 无 decision_id，
+    需经 `resolutions.claim_id` → claims → decisions 再回溯一层。
+    """
+    if not limit_days:
+        return f"{verb} {t}", ()
+    n = (int(limit_days),)
+    if t == "qd_agent_decisions":
+        return (f"{verb} qd_agent_decisions"
+                " WHERE created_at > NOW() - (%s || ' days')::interval", n)
+    if t == "qd_agent_claims":
+        return (f"{verb} qd_agent_claims"
+                f" WHERE decision_id IN ({_DECISIONS_IN_WINDOW})", n)
+    if t == "qd_agent_resolutions":
+        return (f"{verb} qd_agent_resolutions WHERE claim_id IN"
+                f" (SELECT id FROM qd_agent_claims"
+                f"   WHERE decision_id IN ({_DECISIONS_IN_WINDOW}))", n)
+    raise ValueError(f"未知的追责表: {t}")
+
 # 权重复位目标值 —— 与 evaluator.update_weights 新注册行的初值口径一致
 _WEIGHT_INITIAL = 1.0
 _SAMPLE_INITIAL = 0
@@ -46,12 +77,9 @@ def snapshot(limit_days: int = 0) -> Dict[str, Any]:
         with get_db_connection() as conn:
             cur = conn.cursor()
             for t in _ACCOUNT_TABLES:
-                if limit_days and t == "qd_agent_decisions":
-                    cur.execute("SELECT count(*) AS n FROM qd_agent_decisions"
-                                " WHERE created_at > NOW() - (%s || ' days')::interval",
-                                (int(limit_days),))
-                else:
-                    cur.execute(f"SELECT count(*) AS n FROM {t}")
+                sql, params = _scoped_sql(t, int(limit_days or 0),
+                                          "SELECT count(*) AS n FROM")
+                cur.execute(sql, params)
                 out["tables"][t] = int((cur.fetchone() or {}).get("n") or 0)
             # 权重的“脏”= 被真实样本写过（区别于从未更新过的工厂行）
             cur.execute("SELECT count(*) AS n, count(*) FILTER "
@@ -91,12 +119,8 @@ def reset_accountability(limit_days: int = 0, dry_run: bool = True) -> Dict[str,
         with get_db_connection() as conn:
             cur = conn.cursor()
             for t in _ACCOUNT_TABLES:
-                if limit_days and t == "qd_agent_decisions":
-                    cur.execute("DELETE FROM qd_agent_decisions"
-                                " WHERE created_at > NOW() - (%s || ' days')::interval",
-                                (int(limit_days),))
-                else:
-                    cur.execute(f"DELETE FROM {t}")
+                sql, params = _scoped_sql(t, int(limit_days or 0), "DELETE FROM")
+                cur.execute(sql, params)
                 out["deleted"][t] = int(cur.rowcount or 0)
             conn.commit()
         out["ok"] = True

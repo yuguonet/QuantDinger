@@ -1465,8 +1465,11 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
                     # ── 乌云盖顶（Dark Cloud Cover）──
             if n >= 2:
                 po2, ph2, pl2, pc2 = o[-2], h[-2], l[-2], c[-2]
+                # ⚠️ 早期写成 `lo > lh`：lo 是**当日开盘**、lh 是**当日最高**，
+                # 「开盘 > 当日最高」恒 False ⇒ 该形态永不触发。
+                # 乌云盖顶的「高开」是相对**前一日收盘** pc2 而言（跳空高开）。
                 if (pc2 > po2 and  # 前一根阳线
-                        lo > lh and  # 高开
+                        lo > pc2 and  # 高开（高于前一日收盘，跳空高开）
                         lc < po and  # 收盘低于前一根开盘
                         lc > (po2 + pc2) / 2 and  # 收盘深入前一根实体一半以上
                         abs(lc - lo) > 0):  # 当日有实体
@@ -1475,10 +1478,14 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
             # ── 刺透形态（Piercing Pattern）──
             if n >= 2:
                 po2, ph2, pl2, pc2 = o[-2], h[-2], l[-2], c[-2]
+                # ⚠️ 早期写成 `lc > po2 and lc < (po2+pc2)/2`：前一根是阴线时
+                # pc2 < po2 ⇒ (po2+pc2)/2 < po2 ⇒ 两个条件互斥，恒 False ⇒ 永不触发。
+                # 刺透的语义是「收盘**向上深入**前一根阴线实体一半以上，但仍未超过其开盘」，
+                # 故区间应为 (均值, po2)，即下界是均值、上界是前开盘。
                 if (pc2 < po2 and  # 前一根阴线
                         lo < pl2 and  # 低开
-                        lc > po2 and  # 收盘高于前一根开盘
-                        lc < (po2 + pc2) / 2 and  # 收盘深入前一根实体一半以上（从下方）
+                        lc > (po2 + pc2) / 2 and  # 收盘深入前一根实体一半以上（从下方）
+                        lc < po2 and  # 收盘仍未超过前一根开盘
                         abs(lc - lo) > 0):  # 当日有实体
                     patterns.append("刺透形态（底部反转）")
 

@@ -6,10 +6,24 @@ PostgreSQL 向量存储
 """
 import json
 import logging
+import re
 import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# SQL 标识符白名单：表名 / JSONB 键名在 psycopg2 里无法用 %s 占位
+# （`metadata ->> %s` 不是合法 PG 语法），只能拼接 ⇒ 必须在拼接前校验字符集。
+# 只允许不含引号、点号、空白的纯标识符，任何越界输入直接 ValueError（不静默放行）。
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _assert_ident(name: str, what: str) -> str:
+    """校验 SQL 标识符合法性，非法即抛（不做静默清理，避免掩盖调用方 bug）。"""
+    s = str(name or "")
+    if not _IDENT_RE.match(s):
+        raise ValueError(f"非法的{what}（只允许字母/数字/下划线且不以数字开头）: {name!r}")
+    return s
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -44,7 +58,8 @@ class PgVectorStore:
     ):
         self.dsn = dsn
         self.embedding = embedding
-        self.table = table
+        # 表名会 f-string 拼进 CREATE TABLE / INSERT / SELECT，必须先过标识符白名单
+        self.table = _assert_ident(table, "表名")
         self.score_threshold = score_threshold
         self._initialized = False
 
@@ -89,6 +104,10 @@ class PgVectorStore:
             cur = conn.cursor()
             ids = []
             for idx, (text, vector) in enumerate(zip(texts, vectors)):
+                # 空文本 / 该条向量化失败：embed_documents 在该位置返回 []，
+                # 必须跳过 —— 写进去就是「内容与向量不一致」的脏数据。
+                if not vector:
+                    continue
                 doc_id = str(uuid.uuid4())
                 metadata = metadatas[idx] if metadatas else {}
                 cur.execute(
@@ -125,6 +144,8 @@ class PgVectorStore:
             if filter:
                 conditions = []
                 for key, value in filter.items():
+                    # key 拼进 SQL（`metadata->>'...'`），必须校验；value 走 %s 占位
+                    _assert_ident(key, "metadata 过滤键")
                     conditions.append(f"metadata->>'{key}' = %s")
                     params.append(str(value))
                 sql += " WHERE " + " AND ".join(conditions)

@@ -330,6 +330,10 @@ def run_for_decision(*, user_query: str = "", answer: str = "",
         # claim_id 与 claim 按下标对齐（intake 的落库顺序即抽取顺序）
         works: List[tuple] = []
         for cid, c in list(zip(ids, cl))[:max_claims()]:
+            if cid is None:
+                # 该 claim 未落库（save_claims 的失败位）⇒ 没有可回写的 id。
+                # 必须**跳过**而不是沿用下一个 id：那会把 Δp 记到别人的账上。
+                continue
             code = resolve_subject(c)
             if code:
                 works.append((cid, c, code))

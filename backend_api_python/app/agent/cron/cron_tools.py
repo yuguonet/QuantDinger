@@ -204,7 +204,9 @@ def create_cron_job(
         try:
             from .cron_worker import next_cron_time
             nxt = next_cron_time(cron_expr, datetime.now(TZ_CN))
-            next_run = nxt.strftime("%Y-%m-%d %H:%M")
+            # 表达式非法时 next_cron_time 返回 None（不会被执行），如实告知用户
+            next_run = (nxt.strftime("%Y-%m-%d %H:%M") if nxt
+                        else "(表达式无效，不会执行)")
         except Exception:
             next_run = "(计算失败)"
 
