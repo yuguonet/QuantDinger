@@ -299,7 +299,17 @@ def _worker_loop():
                     except _UserInterruptError:
                         raise
                     finally:
-                        _ta_mod.unregister_run_hooks(_sid)
+                        # A-02 ③（2026-10-14）：**先置停止位、再处理钩子**（顺序，双保险）。
+                        # 超时取消（CancelledError）：置停止位让孤儿 run 协作自停，并**保留**钩子
+                        # （方向2，`_run_sync` 真正结束时清理，不在此注销）；正常/用户停止路径：
+                        # 照常注销（避免泄漏）。
+                        # ★ 顺序保证：`request_stop_run` 必须出现在 `unregister_run_hooks` 之前，
+                        #   否则孤儿 run 在钩子断掉后才收到停止位 ⇒ 读不到、停不下来（A-02 缺口）。
+                        import sys
+                        if isinstance(sys.exc_info()[1], asyncio.CancelledError):
+                            request_stop_run(str(task["run_id"]))   # ← 先置停止位
+                        else:
+                            _ta_mod.unregister_run_hooks(_sid)          # ← 仅非超时路径注销
 
                 resp = loop.run_until_complete(asyncio.wait_for(_run_with_events(), timeout=task["timeout"]))
                 _settle(future, result=resp.content or "")

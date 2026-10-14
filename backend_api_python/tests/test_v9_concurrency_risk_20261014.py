@@ -9,16 +9,21 @@ r"""A-01 / A-02：并发与超时风险的**复现断言**（2026-10-14，审计
     里偏重的措辞**（报告说"停止标记无法再被执行体读取"，实测只有 interrupt_switch
     那条通道断，`_stop_runs` 通道仍活着；A-02 止血①后停止位改为 per-run 粒度）。
 
-A-01：`qd_service.py:307` 的 `self._lock` 只包住 `_get_agent()` 的查找/创建，
-       `chat()` 里 `await asyncio.to_thread(self._run_sync, ...)`（:569）**在锁外**
-       ⇒ 同会话并发请求会在两个线程里跑**同一个 QDAgent 实例**。
-A-02：`wait_for` 超时 → 内层 `finally: unregister_run_hooks(_sid)`（:295-296）**先**
-       执行 → 外层 except CancelledError 才 `request_stop_run(run_id)`（:321，A-02 止血①
-       后只停**自己的 run**，不波及其他 run / 会话）。
+A-01（**已修复 + 更正**，2026-10-14）：串行化下沉到 `_run_sync`（T2 工作线程）内用
+       **threading.Lock**（`_session_lock()` 唯一入口），覆盖超时孤儿 run（asyncio.Lock
+       在 chat 层会在超时取消时提前释放锁）。`test_run_sync_real_serializes_same_session`
+       用真实 `_run_sync` 驱动证明：同会话两 run 区间不重叠、跨会话并行。
+A-02（**已全收口**，2026-10-14）：① 止血① per-run 停止位（`request_stop_run` 只停自己）；
+       ② 方向2 超时保留钩子（`_run_sync` 真正结束时清理）；③ 停止位顺序（`request_stop_run`
+       在 `unregister_run_hooks` 之前）——`test_stop_is_flagged_before_hooks_are_unregistered`
+       从**假 xfail 转正**（原匹配 bug：查 `request_stop` 而实际是 `request_stop_run`）。
 """
 from __future__ import annotations
 
+import asyncio
 import ast
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -62,32 +67,109 @@ def test_same_session_gets_the_same_agent_instance(monkeypatch):
     assert len(_FakeAgent.instances) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A-01 已知缺口：run 路径（`chat` / `_run_sync`）没有被会话级锁保护，"
-           "锁只包住 `_get_agent` 的查找/创建 ⇒ 同会话并发会交错改写 run 状态。"
-           "若本用例 XPASS，说明已做串行化 ⇒ 必须回来改审计报告结论与设计文档。",
-)
-def test_run_path_is_guarded_by_the_session_lock():
-    raw = _QS.read_text(encoding="utf-8")
-    tree = ast.parse(raw)
-    # ★ 必须 ast.walk 全树：`chat` / `_run_sync` 是 **QDAgentService 的方法**，
-    #   不是模块顶层函数。只扫 `tree.body` 会得到 None ⇒ 断言因"函数没找到"而失败，
-    #   看起来是 xfail，实际**根本没在测锁**（变异 M1 就是这么溜过去的）。
-    fns = {n.name: n for n in ast.walk(tree)
-           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    guarded = []
-    for name in ("chat", "_run_sync"):
-        fn = fns.get(name)
-        assert fn is not None, f"未找到 {name}（源码结构变了？需同步本守卫）"
-        src = ast.get_source_segment(raw, fn) or ""
-        assert src, f"取不到 {name} 的源码"
-        guarded.append("self._lock" in src)
-    # ★ 用 any 不用 all：run 路径**任一层**持有会话锁就足以串行化
-    #   （锁在 `chat` 这一层已经把 `_run_sync` 罩住了）。
-    #   写 all 会漏掉"只在 chat 加锁"这种正当修法 —— 变异 M1-A01-fixed 实测
-    #   就是这么从台账底下溜过去的（加了锁却仍 xfail ⇒ 台账形同虚设）。
-    assert any(guarded), f"run 路径未持会话锁：chat={guarded[0]} _run_sync={guarded[1]}"
+def test_session_lock_is_per_session_singleton():
+    """结构性前提：`_session_lock()` 同会话复用同一把锁、不同会话不同锁。
+
+    同会话不复用 ⇒ 串行化失效（退化成无锁）；不同会话复用 ⇒ 跨会话被误伤串行。
+    """
+    svc = QDAgentService(model=object(), memory=None, agent_config={})
+    l1 = svc._session_lock("x")
+    l2 = svc._session_lock("x")
+    l3 = svc._session_lock("y")
+    assert l1 is l2, "同会话应复用同一把锁（否则串行化失效）"
+    assert l1 is not l3, "不同会话必须拿到不同锁（否则跨会话被串行化误伤）"
+    # A-01 更正后应为**同步锁**（threading/_thread 的 Lock），不是 asyncio.Lock——
+    # 后者会在超时取消（CancelledError）时让 `async with` 提前释放，孤儿 run 逃逸串行化。
+    # 注：mimoagent 启动时会把 `threading.Lock` 替换为工厂函数（底层仍返回 _thread.lock），
+    # 故不 isinstance 检查，改用 type 的 module 判定，避免 TypeError。
+    assert type(l1).__module__ in ("_thread", "threading"), \
+        f"A-01 更正后应为同步锁（threading/_thread），实际: {type(l1)}"
+
+
+def test_run_sync_serializes_same_session_different_parallel():
+    """A-01 更正后：串行化在 `_run_sync`（T2 工作线程）内用 threading.Lock 实现，
+    覆盖超时孤儿 run（asyncio.Lock 在 chat 层会在取消时提前释放）。本例直接驱动
+    `_session_lock` 的 acquire/release 机制（与 `_run_sync` 内部一致），验证同会话
+    峰值并发==1、跨会话峰值>=2。
+    """
+    svc = QDAgentService(model=object(), memory=None, agent_config={})
+    global_active = {"n": 0}
+    global_max = {"v": 0}
+    sess_active: dict = {}
+    sess_max: dict = {}
+
+    def body(message, session_id):
+        lk = svc._session_lock(session_id)
+        lk.acquire()
+        try:
+            global_active["n"] += 1
+            global_max["v"] = max(global_max["v"], global_active["n"])
+            sess_active[session_id] = sess_active.get(session_id, 0) + 1
+            sess_max[session_id] = max(sess_max.get(session_id, 0), sess_active[session_id])
+            time.sleep(0.05)
+            sess_active[session_id] -= 1
+            global_active["n"] -= 1
+            return f"r:{session_id}"
+        finally:
+            lk.release()
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(body, f"m{i}", sid)
+                for i, sid in enumerate(["sA", "sA", "sB"])]
+        for f in futs:
+            f.result()
+
+    # 同会话必须串行 ⇒ 峰值并发恰为 1
+    assert sess_max["sA"] == 1, f"同会话峰值并发={sess_max['sA']}（应==1，未串行化）"
+    # 跨会话必须并行 ⇒ 全局峰值 >= 2
+    assert global_max["v"] >= 2, f"跨会话峰值并发={global_max['v']}（应>=2，锁误伤吞吐）"
+
+
+def test_run_sync_real_serializes_same_session(monkeypatch):
+    """真实 `_run_sync` 同会话串行化（A-01 更正：threading.Lock 在 T2 内）。
+
+    隔离 resolver（强制 ImportError ⇒ fail-open），mock `_get_agent`/`_prefetch`，
+    用线程池并发调 sA/sA/sB，验证 sA 两 run 区间不重叠（串行）、跨会话并行。
+    ★ 有 bite：去掉 `_run_sync` 内的 `lk.acquire()` ⇒ sA 两 run 并发交错 ⇒ 断言失败。
+    """
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "app.agent.resolvers.bridge", None)  # 强制 resolver 走 fail-open
+
+    svc = QDAgentService(model=object(), memory=None, agent_config={})
+    events: list = []
+    ev_lock = threading.Lock()
+
+    def _make_agent(sid):
+        class _FA:
+            def run(self, task):
+                with ev_lock:
+                    events.append(("enter", sid, time.perf_counter()))
+                time.sleep(0.05)
+                with ev_lock:
+                    events.append(("exit", sid, time.perf_counter()))
+                return ("ok", "fake")
+        return _FA()
+
+    svc._get_agent = _make_agent
+    svc._prefetch = lambda m, sid, ri: ("task", {"report": {}})
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(svc._run_sync, f"m{i}", sid)
+                for i, sid in enumerate(["sA", "sA", "sB"])]
+        for f in futs:
+            f.result()
+
+    sa = sorted([e for e in events if e[1] == "sA"], key=lambda x: x[2])
+    assert len(sa) == 4, f"sA 事件数异常: {sa}"
+    assert (sa[0][0], sa[1][0], sa[2][0], sa[3][0]) == ("enter", "exit", "enter", "exit"), \
+        f"sA 两 run 并发交错（未串行化）: {[x[0] for x in sa]}"
+    assert sa[1][2] <= sa[2][2] + 1e-6, f"sA 两 run 区间重叠（未串行化）: {sa}"
+    # 跨会话并行：sB 区间与 sA 总区间重叠
+    sb = [e for e in events if e[1] == "sB"]
+    assert len(sb) == 2, f"sB 事件数异常: {sb}"
+    assert sb[0][2] < sa[3][2] and sb[1][2] > sa[0][2], "跨会话未并行（per-session 锁误伤吞吐）"
 
 
 # ── A-02：停止位 vs 钩子注销 ──
@@ -129,13 +211,15 @@ def test_interrupt_switch_channel_is_cut_after_unregister():
         hooks.unregister_run_hooks(sid)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A-02 已知缺口：置停止位发生在注销钩子**之后**（unregister 在内层 finally，"
-           "request_stop 在外层 except）。若本用例 XPASS，说明顺序已修正 ⇒ "
-           "必须回来改审计报告结论与本文件头注释。",
-)
 def test_stop_is_flagged_before_hooks_are_unregistered():
+    """A-02 ③ 已修（2026-10-14）：置停止位（`request_stop_run`）在钩子注销
+    （`unregister_run_hooks`）**之前**（源码行号顺序）。超时取消路径置位后保留钩子
+    （方向2），孤儿 run 的 step 探针能读到停止位协作自停。
+
+    ★ 修了匹配 bug：原测试查 `name == "request_stop"`，而实际调用是 `request_stop_run`
+      ⇒ `lines["request_stop"]` 恒空，断言恒因「没找到调用点」而失败（假 xfail，从没真正
+      测到顺序）。现改为同时匹配两种名字，才真正校验「置位早于注销」。
+    """
     tree = ast.parse(_MQ.read_text(encoding="utf-8"))
     lines = {"unregister": [], "request_stop": []}
     for node in ast.walk(tree):
@@ -145,7 +229,7 @@ def test_stop_is_flagged_before_hooks_are_unregistered():
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
         if name == "unregister_run_hooks":
             lines["unregister"].append(node.lineno)
-        elif name == "request_stop":
+        elif name in ("request_stop", "request_stop_run"):  # 修 bug：实际调用是 request_stop_run
             lines["request_stop"].append(node.lineno)
     assert lines["request_stop"] and lines["unregister"], "没找到两个调用点（结构变了？）"
     assert min(lines["request_stop"]) < min(lines["unregister"]), (

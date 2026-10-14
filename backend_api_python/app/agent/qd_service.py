@@ -305,6 +305,32 @@ class QDAgentService:
         # tests/test_v6_skill_seen_lru.py::test_prefetch_does_not_use_bare_setdefault）。
         self._skill_seen: "OrderedDict[str, set]" = OrderedDict()
         self._lock = threading.Lock()
+        # A-01（2026-10-14，更正）：per-session 串行化锁，用 **threading.Lock** 且
+        # 串行化点下沉到 `_run_sync`（to_thread 的 T2 工作线程）内。
+        # 早期版本把 asyncio.Lock 放在 `chat`（协程层），但超时取消（`wait_for` 抛
+        # CancelledError）会让 `async with` 释放锁，孤儿 run 的 T2 线程逃逸出串行化，
+        # 与后续同会话 run 并发交错改同一 QDAgent 实例 —— 锁形同虚设。
+        # threading.Lock 在 T2 内 acquire/release，不受 asyncio 取消影响，覆盖所有路径
+        # （正常 / 超时孤儿 / 后续重入）；不同会话拿不同锁 ⇒ 并行不误伤吞吐。
+        # 字典本身由 `self._lock` 保护（瞬态加锁，不跨 await 持有）。
+        self._session_locks: dict[str, threading.Lock] = {}
+
+    # ── 会话级串行化锁（A-01）──
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        """取（并惰性创建）某会话的串行化锁 —— 本类**唯一**入口。
+
+        返回 **threading.Lock**（不是 asyncio.Lock）：串行化点在 `_run_sync`（T2 工作
+        线程）内 acquire/release，不受 asyncio 取消影响，覆盖超时孤儿 run。共享的
+        `QDAgent` 实例不会被同会话的两个线程并发 `run()` 交错改写；`bind_run_session`
+        的会话钩子表也不会被同一会话的并发 run 互相抹。不同会话拿不同锁 ⇒ 并行不误伤。
+        """
+        key = str(session_id)
+        with self._lock:                      # threading.Lock 只保护字典增删（瞬态）
+            lk = self._session_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._session_locks[key] = lk
+            return lk
 
     # ── 会话 ─────────────────────────────────────────────────
     def _get_agent(self, session_id: str) -> QDAgent:
@@ -508,64 +534,91 @@ class QDAgentService:
     # ── 同步执行（worker 线程内跑）────────────────────────────
     def _run_sync(self, message: str, session_id: str) -> str:
         bind_run_session(session_id)  # to_thread 换线程，重新绑定钩子表
-        # ── 实体解析（2026-10-01 接线）：chat 阶段等价物，取数之前 ──
-        # 澄清优先（base.ResolveResult 契约）：拿不到准确信息就**反问**，绝不猜着执行。
-        # 代价不对称——猜错标的/猜错时间窗 ⇒ 整份结论作废甚至据此下单；反问只花一轮。
-        resolve_info: Optional[dict] = None
+        # A-01（2026-10-14，更正）：同会话串行化在 **本线程（T2）** 内用 threading.Lock
+        # 实现 —— 覆盖超时孤儿 run（asyncio.Lock 在 chat 层会在取消时提前释放）。
+        # A-02 方向2（2026-10-14）：run 真正结束（含超时后的孤儿 run 自然结束）时
+        # 释放锁 + 清理会话钩子表。超时取消时 message_queue 的 `_run_with_events`
+        # 已跳过 unregister（保留钩子让 step 探针读到本 run 停止位协作自停），此处是
+        # 最终清理点，避免钩子泄漏被后续线程误读（误停止）。try/finally 覆盖所有路径。
+        lk = self._session_lock(session_id)
+        lk.acquire()
         try:
-            from .resolvers.bridge import resolve as _resolve, clarify_enabled
-        except ImportError:
+            # ── 实体解析（2026-10-01 接线）：chat 阶段等价物，取数之前 ──
+            # 澄清优先（base.ResolveResult 契约）：拿不到准确信息就**反问**，绝不猜着执行。
+            # 代价不对称——猜错标的/猜错时间窗 ⇒ 整份结论作废甚至据此下单；反问只花一轮。
+            resolve_info: Optional[dict] = None
             try:
                 from .resolvers.bridge import resolve as _resolve, clarify_enabled
             except ImportError:
-                _resolve, clarify_enabled = None, None      # type: ignore
-        if _resolve is not None:
-            try:
-                resolve_info = _resolve(message)
-            except Exception as e:      # fail-open（bridge 内部已兜一层，这里是双保险）
-                logger.debug("[resolver] 解析不可用（已忽略）: %s: %s", type(e).__name__, e)
-                resolve_info = None
-            if resolve_info and resolve_info.get("clarify") and clarify_enabled():
-                logger.info("[resolver] 澄清反问（不进执行）: %s",
-                            str(resolve_info["clarify"])[:80])
                 try:
-                    from .resolvers.bridge import context_block
-                    _cb = context_block(resolve_info)
-                except Exception:
-                    _cb = ""
-                return (str(resolve_info["clarify"]) + (("\n\n" + _cb) if _cb else ""))
-        agent = self._get_agent(session_id)
-        task, prefetch_report = self._prefetch(message, session_id, resolve_info)
-        try:
-            agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
-        except Exception as e:
-            logger.debug("[prefetch] 留痕失败（不影响主流程）: %s", e)
-        # ★ 把**用户原始问题**挂在 agent 上，供工具预选使用（2026-10-01）。
-        #   预选绝不能用 prefetch 增强后的 task：那里面塞着记忆/RAG/技能块，
-        #   实测把"今天北京天气"的预选 goal 带成了"个股综合分析"（历史记忆是
-        #   个股分析）⇒ 点名 7 个股票工具 ⇒ 该任务 token +136%。这是"预选不稳定"
-        #   的真正成因之一——不是模型随机，是**输入被上下文污染**。
-        try:
-            agent.last_user_query = message
-            # 供收尾格式化（formatters）选 domain / 填实体，避免再解析一次
-            agent.last_resolve_info = resolve_info or {}
-        except Exception:
-            pass
-        status, text = agent.run(task)
-        if status == "_ProbeInterrupt":
-            return ""  # 用户停止：安静收尾（与旧请求停止语义一致）
-        # 历史落记忆（best-effort）
-        if self.memory is not None:
+                    from .resolvers.bridge import resolve as _resolve, clarify_enabled
+                except ImportError:
+                    _resolve, clarify_enabled = None, None      # type: ignore
+            if _resolve is not None:
+                try:
+                    resolve_info = _resolve(message)
+                except Exception as e:      # fail-open（bridge 内部已兜一层，这里是双保险）
+                    logger.debug("[resolver] 解析不可用（已忽略）: %s: %s", type(e).__name__, e)
+                    resolve_info = None
+                if resolve_info and resolve_info.get("clarify") and clarify_enabled():
+                    logger.info("[resolver] 澄清反问（不进执行）: %s",
+                                str(resolve_info["clarify"])[:80])
+                    try:
+                        from .resolvers.bridge import context_block
+                        _cb = context_block(resolve_info)
+                    except Exception:
+                        _cb = ""
+                    return (str(resolve_info["clarify"]) + (("\n\n" + _cb) if _cb else ""))
+            agent = self._get_agent(session_id)
+            task, prefetch_report = self._prefetch(message, session_id, resolve_info)
             try:
-                asyncio.run(self.memory.add(session_id, "user", message))
-                if text:
-                    asyncio.run(self.memory.add(session_id, "assistant", text))
+                agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
             except Exception as e:
-                logger.debug("[memory] 历史写入失败（fail-open）: %s", e)
-        return text or ""
+                logger.debug("[prefetch] 留痕失败（不影响主流程）: %s", e)
+            # ★ 把**用户原始问题**挂在 agent 上，供工具预选使用（2026-10-01）。
+            #   预选绝不能用 prefetch 增强后的 task：那里面塞着记忆/RAG/技能块，
+            #   实测把"今天北京天气"的预选 goal 带成了"个股综合分析"（历史记忆是
+            #   个股分析）⇒ 点名 7 个股票工具 ⇒ 该任务 token +136%。这是"预选不稳定"
+            #   的真正成因之一——不是模型随机，是**输入被上下文污染**。
+            try:
+                agent.last_user_query = message
+                # 供收尾格式化（formatters）选 domain / 填实体，避免再解析一次
+                agent.last_resolve_info = resolve_info or {}
+            except Exception:
+                pass
+            status, text = agent.run(task)
+            if status == "_ProbeInterrupt":
+                return ""  # 用户停止：安静收尾（与旧请求停止语义一致）
+            # 历史落记忆（best-effort）
+            if self.memory is not None:
+                try:
+                    asyncio.run(self.memory.add(session_id, "user", message))
+                    if text:
+                        asyncio.run(self.memory.add(session_id, "assistant", text))
+                except Exception as e:
+                    logger.debug("[memory] 历史写入失败（fail-open）: %s", e)
+            return text or ""
+        finally:
+            # 最终清理：先释放同会话锁（让同会话后续 run 可进），再删全局 _HOOKS[session_id]。
+            # 顺序重要：锁释放后同会话后续 run 的 `_run_with_events` 才 register，不会被本次
+            # unregister 误删（A-02 方向2 已知边缘局限：若后续 run 已提前 register，本次
+            # unregister 可能误删其钩子 ⇒ 该 run 暂时不可中断，但不破坏状态；残留钩子被
+            # 误读才会「误停止」，故此处无脑清理优于泄漏）。
+            try:
+                lk.release()
+            except Exception:
+                pass
+            try:
+                unregister_run_hooks(session_id)
+            except Exception:
+                pass
 
     # ── 对外契约：agent.chat(message, session_id=...) ─────────
     async def chat(self, message: str, session_id: str = "default", **kwargs):
+        # A-01（2026-10-14，更正）：同会话串行化下沉到 `_run_sync`（T2 工作线程）内
+        # 用 threading.Lock 实现 —— 若把锁放在此处用 asyncio.Lock，超时取消会让
+        # `async with` 释放锁，孤儿 run 的 T2 线程逃逸串行化，与后续同会话 run 并发
+        # 交错改同一 QDAgent 实例。此处只负责派发，串行化交由 `_run_sync` 完成。
         content = await asyncio.to_thread(self._run_sync, message, session_id)
         return _AgentResponse(content)
 
