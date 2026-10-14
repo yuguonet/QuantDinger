@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-market_screener/_facts.py — 纯客观事实层（无评分、无取舍、无阈值）
+market-screener/_facts.py — 纯客观事实层（无评分、无取舍、无阈值）
 
 2026-09-29 v7：原 intraday.py / eod.py / post_market.py 三个「策略模块」把四样东西
   混在一个文件里 —— ① 真正的客观计算 ② 选股规则 ③ 评分梯形 ④ 报告口径。

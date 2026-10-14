@@ -56,10 +56,10 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
     Args:
         domain: 域名过滤。空=必注入层(common)工具；"all"=全部；或指定子域如 finance。
         query: 可选关键词，只列名称/简介命中的工具。
-        limit: 最多列多少条，默认 40。
+        limit: 最多列多少条，默认 40（domain='all' 是"看全量"的显式请求，忽略本上限）。
 
     Returns:
-        工具名 + 一行简介的清单文本；末尾附按需域概览。
+        工具名(参数签名) + 一行简介的清单文本；末尾附按需域概览。
     """
     p = _provider()
     if domain == "all":
@@ -80,7 +80,10 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
         names = kept
 
     total = len(names)
-    names = names[: max(1, limit)]
+    # domain='all' 是"看全量"的显式请求（qd_system.txt 亦如此承诺），不做截断，
+    # 否则会静默藏掉一半工具、与提示词自相矛盾；其余域/关键词浏览仍受 limit 约束。
+    if domain != "all":
+        names = names[: max(1, limit)]
     import inspect
     lines = [f"工具清单（{len(names)}/{total}，domain='{domain or 'common'}'）："]
     for n in names:
@@ -88,7 +91,14 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
         if fn is None:
             continue
         desc = (inspect.getdoc(fn) or "").strip().split("\n")[0][:100]
-        lines.append(f"  - {n} — {desc}")
+        sig_str = ""
+        try:
+            sig = inspect.signature(fn)
+            sig_str = ", ".join(
+                pname for pname in sig.parameters if not pname.startswith("_"))
+        except Exception:
+            sig_str = ""
+        lines.append(f"  - {n}({sig_str}) — {desc}")
     lines.append("按需域（默认未激活，需 search_tools/activate_tools）：")
     lines.append(_domains_overview(p))
     if domain != "all":

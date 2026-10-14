@@ -117,6 +117,22 @@ def is_transient_control(text: Any) -> bool:
     return s.startswith(TRANSIENT_CONTROL_MARKERS)
 
 
+# 成本熔断软收尾提示的固定前缀（= TRANSIENT_CONTROL_MARKERS 首项）。
+# 单独一个口径供 `qd_agent._run_inner` 判定"本轮是超预算被中断"——
+# 命中它就必须走一次纯文字收尾（把已取数据变成部分结论），不能原样透传。
+_BUDGET_WRAPUP_PREFIX = TRANSIENT_CONTROL_MARKERS[0]
+
+
+def is_budget_wrapup(text: Any) -> bool:
+    """该文本是否是**成本熔断软收尾提示**（`utils/budget.budget_wrapup_hint`）。
+
+    与 `is_transient_control` 的区别：后者是一大类瞬态控制消息的总闸（用于清污染），
+    本函数只认"超预算熔断"这一种，因为它触发的是**另一条处理路径**（冻结预算 +
+    禁用工具的纯文字收尾），而不是简单丢弃。
+    """
+    return str(text or "").strip().startswith(_BUDGET_WRAPUP_PREFIX)
+
+
 def _context_window() -> int:
     """模型上下文窗口（token）——compaction 与 wrap_up 的**唯一**口径。
 

@@ -506,36 +506,13 @@ def has_domain_hint(query: str, hints: Optional[Sequence[str]] = None) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  五、提示词 —— 外置 plan（对齐 plan_system.txt 的"工具面 = 任务书副产品"）
+#  2026-10-14 外置到 prompts/tool_preselect.yaml（system + user 两段，勿再写回常量）
 # ═══════════════════════════════════════════════════════════════════════════
-PRESELECT_SYSTEM = (
-    "你是外部规划器，为执行器挑选本轮**沙箱工具面**。\n"
-    "先想清楚这个任务要交付什么信息，再据此声明**最小工具面**——工具是目标的副产品，"
-    "不是凭感觉罗列。\n"
-    "工具面标准（两条同时成立，缺一不可）：\n"
-    "1. 只选**主链路必须经过**的工具，不凑数；\n"
-    "2. **关键链路不能断**：你承诺交付的每一条信息，都必须有对应取数工具支撑"
-    "（宁多不可断）。\n"
-    "若某条交付信息在候选目录里**找不到**对应工具，就在 deliverables 里删掉它——"
-    "不要为了兑现承诺硬塞无关工具。\n"
-    "工具名必须**逐字来自候选目录**，禁止编造（编造的名字会被丢弃并留痕）。\n"
-    "「已常驻」清单里的工具无需再选。"
-)
+from ..prompts import load_prompt_doc as _load_prompt_doc
 
-PRESELECT_PROMPT = """用户问题：
-{query}
-
-已常驻可直接调用、**不需要再选**的工具：
-{already}
-
-候选工具目录（每行：工具名 | 说明 | 参数）：
-{catalog}
-{history}
-只输出 JSON，不要解释、不要代码块：
-{{
-  "goal": "可执行翻译后的目标（不是复述原话）",
-  "deliverables": ["交付要素1", "交付要素2"],
-  "tools": ["工具名", ...（最多 {max_tools} 个；确实无关则 []）]
-}}"""
+_preselect_prompts = _load_prompt_doc("tool_preselect")
+PRESELECT_SYSTEM = _preselect_prompts["system"]
+PRESELECT_PROMPT = _preselect_prompts["user"]
 
 
 def build_preselect_messages(

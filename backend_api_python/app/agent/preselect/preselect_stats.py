@@ -53,7 +53,14 @@ logger = __import__("logging").getLogger(__name__)
 # 最近样例保留条数（够看规律，又不占内存）
 _SAMPLE_LIMIT = 50
 
-_LATENCY = {"total": 0, "empty": 0}
+# warning 的最小样本下限：样本不足时只 info（**别拿 1/1=100% 下结论**，
+# 与本模块 `_verdict` 的"<50 样本继续观测"同一立场，取 20 兼顾响应速度）。
+_WARN_MIN_SAMPLE = 20
+
+# `_LATENCY`：total / empty 是**空域率**的分子分母（只统计"本应给出工具面却没给"）；
+# gate 是"闸门有意跳过"的独立计数 —— 闲聊/代码类任务**本就不需要工具**，
+# 把它算进空域率会污染退化指标（本次事故：打招呼即 1/1=100% 告警）。
+_LATENCY = {"total": 0, "empty": 0, "gate": 0}
 _ROUTES: Counter = Counter()          # 触发原因 → 次数
 _DOMAINS: Counter = Counter()         # 兜底也没命中的 #domain → 次数
 _SAMPLES: Deque[Dict[str, str]] = deque(maxlen=_SAMPLE_LIMIT)
@@ -137,16 +144,26 @@ def record_empty_face(query: str = "", route: str = "", domain_count: int = 0) -
     Returns:
         本次统计摘要（同时写 warning 日志）。
     """
-    _LATENCY["total"] += 1
-    _LATENCY["empty"] += 1
-    _ROUTES[route or "unknown"] += 1
     sample = {"ts": time.strftime("%H:%M:%S"), "route": route or "unknown",
               "q": _mask_user_text(query or "")[:60]}
     _SAMPLES.append(sample)
 
+    # 闸门跳过（gate）是**有意为之**（闲聊/代码类本就无需工具），不是空域失败：
+    # 单列计数、不进 empty_rate 分母、**永不打 warning**。
+    if (route or "") == "gate":
+        _LATENCY["gate"] += 1
+        _ROUTES["gate"] += 1
+        logger.info("[preselect-gate-skip] 闸门有意跳过预选（不计空域） q=%s", sample["q"])
+        return {"gate": _LATENCY["gate"], "total": _LATENCY["total"],
+                "rate": empty_rate(), "sample": sample}
+
+    _LATENCY["total"] += 1
+    _LATENCY["empty"] += 1
+    _ROUTES[route or "unknown"] += 1
+
     rate = empty_rate()
-    # 只在比例**抬头过阈值**时刷 warning，避免每条都刷把日志淹了
-    level = "warning" if rate > 0.02 else "info"
+    # 只在**样本足够 且**比例抬头过阈值时刷 warning，避免 1/1 噪声把日志淹了
+    level = "warning" if (_LATENCY["total"] >= _WARN_MIN_SAMPLE and rate > 0.02) else "info"
     getattr(logger, level)(
         "[preselect-empty-face] 工具面跑空 route=%s rate=%.2f%% (%d/%d) q=%s",
         route, rate * 100, _LATENCY["empty"], _LATENCY["total"], sample["q"])
@@ -165,6 +182,7 @@ def report() -> Dict[str, Any]:
     return {
         "total": _LATENCY["total"],
         "empty": _LATENCY["empty"],
+        "gate_skip": _LATENCY["gate"],
         "empty_rate": round(rate, 4),
         "by_route": dict(_ROUTES.most_common()),
         "by_domain_miss": dict(_DOMAINS.most_common()),
@@ -201,7 +219,7 @@ DECISION_NOTE = """
 
 def reset() -> None:
     """清零（仅供测试）。"""
-    _LATENCY.update(total=0, empty=0)
+    _LATENCY.update(total=0, empty=0, gate=0)
     _ROUTES.clear()
     _DOMAINS.clear()
     _SAMPLES.clear()

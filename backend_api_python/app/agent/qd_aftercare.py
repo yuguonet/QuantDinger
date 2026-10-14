@@ -29,6 +29,11 @@ from .qd_hooks import _HOOKS_LOCAL
 
 logger = logging.getLogger(__name__)
 
+# 「异常收尾」状态集：只有这些状态下，计划残留在才是"跑偏/被截断"的真信号。
+# 正常 Idle 收尾时模型常把 plan 当 TODO 用、不回写 completed ⇒ 残留是噪声。
+_ABNORMAL_RUN_STATUS = ("truncated", "LimitsExceeded", "grounding_failed",
+                        "empty", "budget_wrapped")
+
 
 class AftercareMixin:
     """run 收尾：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
@@ -41,7 +46,7 @@ class AftercareMixin:
             query = task if isinstance(task, str) else str(task)
             # 2026-10-01：task 是 **prefetch 加工后**的文本（记忆/技能/RAG 块 + 用户问题），
             # 直接落库会让 qd_agent_traces.user_query 变成一坨注入块，复盘时看不到
-            # 用户到底问了什么（实测首条修复记录就是 "[相关技能：auto_stock-analyze]…"）。
+            # 用户到底问了什么（实测首条修复记录就是 "[相关技能：auto-stock-analyze]…"）。
             # 这里剥掉注入前缀，只留 [用户问题] 之后的原文。
             marker = "\n[用户问题]\n"
             if marker in query:
@@ -50,11 +55,14 @@ class AftercareMixin:
         except Exception:
             return None
 
-    def _plan_lint(self) -> None:
+    def _plan_lint(self, status: str = "") -> None:
         """计划收尾轻校验（差距 A，2026-10-02）：只告警不拦截。
 
-        update_plan 的清单若留着 in_progress/pending 收不了口，通常是任务
-        跑偏/被截断的信号——落 trace 供事后对账，不改 run 行为。
+        update_plan 的清单若留着 in_progress/pending 收不了口，**只有在 run 非正常
+        收尾时**才是"任务跑偏/被截断"的信号（预算熔断 / 步数耗尽 / 溯源失败 / 空回复）。
+        正常 Idle 收尾时模型常把 plan 当 TODO 用、不回写 completed —— 此时残留是纯噪声
+        （实测「分析600519」正常收尾也报 5 项残留）。故：异常收尾才 WARNING，
+        正常收尾降为 debug；两种情况下都照旧落 trace 事件供事后对账。
         """
         plan = getattr(self, "current_plan", None)
         if not plan:
@@ -63,10 +71,16 @@ class AftercareMixin:
             residue = [p.get("step", "") for p in plan
                        if isinstance(p, dict) and p.get("status") in ("in_progress", "pending")]
             if residue:
-                logger.warning(
-                    "[plan-lint] run 收尾时计划未清账（%d 项）: %s", len(residue), residue[:5])
+                if str(status or "") in _ABNORMAL_RUN_STATUS:
+                    logger.warning(
+                        "[plan-lint] run 异常收尾(status=%s)且计划未清账（%d 项）: %s",
+                        status, len(residue), residue[:5])
+                else:
+                    logger.debug(
+                        "[plan-lint] 正常收尾仍有计划残留（%d 项，非异常·不告警）", len(residue))
                 if self.trace is not None:
                     self.trace.emit("plan_lint", residue=residue[:10],
+                                    status=str(status or ""),
                                     plan_explanation=getattr(self, "plan_explanation", ""))
         except Exception:
             pass
@@ -146,7 +160,7 @@ class AftercareMixin:
             failures: List[str] = []
             if status == "grounding_failed":
                 failures.append("数字溯源未通过（结论含不可溯源数字）")
-            if status in ("truncated", "LimitsExceeded", "empty"):
+            if status in ("truncated", "LimitsExceeded", "empty", "budget_wrapped"):
                 failures.append("run 未正常收尾（status=%s）" % status)
             try:
                 residue = [p.get("step", "") for p in (getattr(self, "current_plan", None) or [])

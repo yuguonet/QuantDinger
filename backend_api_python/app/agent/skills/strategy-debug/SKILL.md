@@ -1,13 +1,10 @@
 ---
 name: strategy-debug
-version: 1.0.0
 description: 自动策略调试助手。用户口语问「某票/某策略为什么不出信号」「卡在哪道门」「改个参数试试」「和库里对照」时使用。覆盖 t_hilo/v1/break/dragon_callback/g56/knife_catch 等 auto 策略。不含荐股、不含实盘下单。
-tags: [strategy, debug, quant, auto, a_share]
-tools:
-  - list_strategies
-  - why_strategy
-  - debug_strategy
-  - doctor_auto
+metadata:
+  version: 1.0.0
+  tags: strategy, debug, quant, auto, a_share
+  tools: list_strategies, why_strategy, debug_strategy, doctor_auto
 ---
 
 # 策略口语化调试 (strategy-debug)

@@ -1,21 +1,10 @@
 ---
 name: market-screener
-version: 7.0.0
 description: 从A股全市场筛选短线标的。用户问"今天买什么股""有什么好股票""短线选什么"时使用。不含个股分析。
-tags: [market, screener, short_term, a_share]
-tools:
-  - get_fund_flow
-  - technical_analysis
-  - search_stocks
-  - agent_get_kline
-  - get_realtime_quote
-  - get_hot_sectors
-  - get_sector_board
-  - get_stock_sector_info
-  - get_dragon_tiger
-  - get_limit_pool
-  - get_hot_stocks_with_reason
-  - search_intel
+metadata:
+  version: 7.0.0
+  tags: market, screener, short_term, a_share
+  tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
 ---
 
 # 全市场短线选股 (market-screener)
@@ -47,17 +36,26 @@ tools:
 - 把数据缺口当成「无信号」（画像里的 missing 与调用失败要看）
 - 编造数据：工具没给出的数值，不允许出现在结论里
 
-## 工具面（按证据粒度分层）
+## 工具面（`run.py` 公开函数，docstring 首行即描述）
 
-| 工具 | 作用 | 何时用 |
+> 经 `run_skill` 派活时入口是 `run()`（无入参，一次性跑完整流程）；其余函数是它的内部阶段，
+> 用于理解 `run()` 的取数与口径。
+
+| 函数（真实签名） | 作用 | 何时用 |
 | --- | --- | --- |
+| `run()` | 一次性跑完整流程：pre_screen → profile_candidates（取 hard 过滤）→ deep_analyze(Top8)。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
 | `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 | 起手，判断大环境 |
-| `pre_screen(sources, queries, limit)` | 候选池：自选来源（连板/尾盘封板/龙回头/热点/条件搜索） | 起手取池 |
-| `profile_candidates(result, limit)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍 | 核心，几乎所有场景都要跑 |
-| `deep_analyze(codes, with_mtf)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / p_up），无任何主观评分 | 对你挑出的少数票做证据汇总 |
-| `detect_patterns(codes, params)` | 六种 K 线形态识别，回答「是不是」不回答「好不好」 | 想验证形态 / 做阈值敏感性检查 |
-| `multitimeframe(code)` | 日线 + 15m + 5m 的结构量与速记标签 | 盘中判断日内强弱时用 |
-| `inspect_stock(code, deep)` | 单票深挖：题材归属、资金、涨停史、龙虎榜席位、客观风险点 | 想验证某只票 / 证据互相矛盾时 |
+| `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：自选来源（连板/尾盘封板/龙回头/热点/条件搜索/近期涨停），不做取舍与排序 | 起手取池 |
+| `profile_candidates(prescreen_result, limit=20, with_flow=True, with_pred=True)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍。**入参是上一步的 dict** | 核心，几乎所有场景都要跑 |
+| `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / p_up / **实时行情对账**），无任何主观评分 | 对你挑出的少数票做证据汇总 |
+| `detect_patterns(codes, days=60, params=None)` | 六种 K 线形态识别，回答「是不是」不回答「好不好」；`params` 是 JSON 几何定义覆盖 | 想验证形态 / 做阈值敏感性检查 |
+| `multitimeframe(code, daily_days=60, minute_days=5)` | 日线 + 15m + 5m 的结构量与速记标签 | 盘中判断日内强弱时用 |
+| `inspect_stock(code, deep=False)` | 单票深挖：题材归属、资金、涨停史、龙虎榜席位、客观风险点；`deep=True` 追加快源 | 想验证某只票 / 证据互相矛盾时 |
+| `filter_candidates(prescreen_result)` | 便捷形式（旧流程兼容）：保守剔除有硬障碍的候选，返回逗号分隔 codes | 只要 codes 清单时（要看证据用 `profile_candidates`） |
+
+> ⚠️ 除 `run()` 外，其余函数都是 `run()` 的**内部阶段**，当前**未经 `run_skill` 暴露**
+> （`skill_run.EXECUTABLE_SKILLS["market-screener"]` 只登记了 `run`）。其中
+> `profile_candidates` / `filter_candidates` 的入参是上一步的返回值，独立子进程间无法传递。
 
 ### 两条数据硬约束
 
@@ -67,12 +65,15 @@ tools:
 `profile_candidates` 返回的每行字段含义：
 
 - `p_up` 模型给出的次日上涨概率；`tech` 收盘 / 涨跌 / 量比 / RSI / MA 乖离 / 20 日位置 / 连板数
+- `rt` 实时快照（价格 / 涨跌幅 / 涨跌停）；`stale_bar=True` 时 `tech` 的收盘/涨跌停已按 rt 修正（MA/RSI 仍基于日线）。**有 rt 就不要在主对话重拉实时行情**
 - `theme.hit` 题材是否落在当日主线；`hard` 客观障碍清单；`missing` 数据缺口
 - `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
 - `filter_candidates` 保守地把 hard 与 warnings 一并剔除；走 `profile_candidates` 你能看到全部候选
 
-## 工作流（不必线性，可以回头）
+## 工作流（`run()` 内部阶段示意，不必线性）
+
+> 下面用内部阶段函数展示 `run()` 的取数顺序与口径；实际派活只调 `run()`（无入参）。
 
 ```python
 st = market_state()                       # 先看环境
@@ -156,4 +157,4 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 - `references/analysis-framework.md` — 六维分析框架与失败模式清单（推荐先读）
 - `references/trading-logic.md` — 核心交易逻辑
 - `references/market-sentiment.md` — 市场情绪判断标准
-- `references/limit-rules.md` — 涨跌停规则
+- `references/limit-rules.md` — 涨跌停幅度表（过滤/排序规则已迁至 strategy-rules.md §三）

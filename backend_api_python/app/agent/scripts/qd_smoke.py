@@ -482,15 +482,15 @@ def test_7_service_facade():
     check("预取保留用户问题", "[用户问题]" in user_msg)
 
     # 技能自动加载（提智点 A）
-    # 2026-10-10 设计变更：market_screener 是**执行型**技能（skill_run 白名单）⇒
+    # 2026-10-10 设计变更：market-screener 是**执行型**技能（skill_run 白名单）⇒
     # 命中不再注方法论正文，改注「分发卡片」（正文会诱导主对话硬跑，与 §重活分发
     # 抢方向盘；见 qd_service._dispatch_card 与 test_38）。
     class _Skills:
         def list_skills(self):
-            return [{"name": "market_screener", "description": "选股与市场筛选"}]
+            return [{"name": "market-screener", "description": "选股与市场筛选"}]
 
         def load_body(self, name):
-            return "# 分析框架\n先看资金面再看技术面。" if name == "market_screener" else None
+            return "# 分析框架\n先看资金面再看技术面。" if name == "market-screener" else None
 
     model2 = ScriptedModel([{"content": "选股完成。"}])
     svc2 = QDAgentService(model=model2, skills=_Skills(), agent_config={"tools": [], "tool_functions": [get_demo_quotes]})
@@ -498,7 +498,7 @@ def test_7_service_facade():
     agent2 = svc2._get_agent("s9")
     user_msg2 = next(m["content"] for m in agent2.messages if m.get("role") == "user")
     check("技能自动注入（执行型→分发卡片，正文不入）",
-          "技能分发卡片：market_screener" in user_msg2
+          "技能分发卡片：market-screener" in user_msg2
           and "run_skill" in user_msg2 and "先看资金面" not in user_msg2)
 
 
@@ -1442,13 +1442,22 @@ def test_28_closed_loop_consumers():
         wired = [l for l in src.splitlines()
                  if "_maybe_format_result(" in l and not l.strip().startswith("#")]
         check("主链路已无 formatter 调用（防延迟回归）", not wired, str(wired)[:120])
-        # 归档在**项目根** del/（约定：删除一律 shutil.move 到根 del/，不硬删）
+        # 归档在**项目根** del/（约定：删除一律 shutil.move 到根 del/，不硬删）。
+        # 【2026-10-14 收口】B.2（2026-10-11）裁定「本地即运行、不做 git 入库」后，
+        # del/ 归档不在工作副本是**已知副作用**（设计文档 B.2 明文），不是回归。
+        # 防回流主不变量已由上两项保证（formatters 不在生产包 + 主链无调用）。
+        # ⇒ 归档在：照旧断言可回滚；不在：SKIP + 注明 B.2，不记失败。
         _d = _os.path.abspath(__file__)
         for _ in range(5):      # scripts → agent → app → backend_api_python → 项目根
             _d = _os.path.dirname(_d)
-        archived = _os.path.isdir(_os.path.join(_d, "del", "agent_formatters_20261001"))
-        check("实现已归档（可回滚，不是硬删）", archived, "",
-              env="archive_formatters")
+        _arch_fmt = _os.path.join(_d, "del", "agent_formatters_20261001")
+        if _os.path.isdir(_arch_fmt):
+            check("实现已归档（可回滚，不是硬删）", True, "",
+                  env="archive_formatters")
+        else:
+            PASS.append("SKIP")
+            print("  [SKIP] 实现已归档 — B.2 本地模式："
+                  f"{_arch_fmt} 不在工作副本（回滚件不可用；防回流由前两项保证）")
     except Exception as e:
         check("formatters 摘除护栏可用", False, f"{type(e).__name__}: {e}")
 
@@ -1547,7 +1556,7 @@ def test_29_module_single_instance():
 def test_30_toolface_import_health():
     """工具面无静默降级。
 
-    事故回放（2026-10-02）：`skills/market_screener/common.py` 把 **`app/`**（误当
+    事故回放（2026-10-02）：`skills/market-screener/common.py` 把 **`app/`**（误当
     backend 根）insert 到 sys.path[0]，使 `app/` 反超 `app/agent/` ⇒ 裸名
     `import utils` 命中 `app/utils` ⇒ 9 个 finance 工具模块的
     `from utils.md_format import ...` 全部 ModuleNotFoundError ⇒ 工具面 101→91。
@@ -1651,7 +1660,9 @@ def test_32_skill_injection_progressive():
     判据：① 超阈值技能注入块必须带 [技能目录] + [按需读取]
           ② resource 路标必须与 `list_resources()` 实况一致（防指向空气）
           ③ 指针必须给出"完整正文"自取方式（防压缩后正文消失）
-          ④ 同会话二次命中→指针；换 session→重新注入正文（不串味）
+          ④ 同会话二次命中→指针；换 session→重新注入（知识型=正文 / 执行型=分发卡片，不串味）
+            （2026-10-14 修正：market-screener 等执行型二次注入是**分发卡片**，
+              不再是「相关技能」正文——旧断言跟 2026-10-10 分叉前行为）
     """
     print("\n[test_32] 技能注入渐进式加载（F1/F2 防复发）")
     try:
@@ -1709,13 +1720,15 @@ def test_32_skill_injection_progressive():
         check("指针给出完整正文自取方式（不依赖历史·F2）",
               "要完整正文" in _t2, _t2[:160])
         check("指针不再写'见上方历史'（压缩后会失效）", "见上方历史" not in _t2)
-    check("换 session 重新注入正文（不串味）", "相关技能" in _t3, _t3[:120])
+    check("换 session 重新注入（知识型正文/执行型分发卡片，不串味）",
+          ("相关技能" in _t3 or "技能分发卡片" in _t3) and "技能指针" not in _t3,
+          _t3[:120])
 
 
 def test_33_skill_dispatch_and_plan_lint():
     """执行型技能分发（差距 B）+ 计划残留轻校验（差距 A）防复发护栏（2026-10-02）。
 
-    差距 B 回放：执行型技能（market_screener / strategy_debug）原先只能靠主 agent
+    差距 B 回放：执行型技能（market-screener / strategy-debug）原先只能靠主 agent
     逐步取数来"手工执行"，重活全压上下文。现走 `run_skill` → 子进程 `skill_run.py`：
     白名单注册表 + 超时可击杀 + 产物落盘 + 预览回传。风险点是**白名单被绕过**
     （变成任意代码执行）与**链路静默不通**（工具注册了但子进程跑不起来）。
@@ -1753,13 +1766,13 @@ def test_33_skill_dispatch_and_plan_lint():
     check("未登记技能被白名单拦住（防任意代码执行）",
           _bad.get("ok") is False and "未知技能" in str(_bad.get("error", "")),
           str(_bad)[:200])
-    _badfn = _st.run_skill("strategy_debug", '{"fn":"__nope__"}')
+    _badfn = _st.run_skill("strategy-debug", '{"fn":"__nope__"}')
     check("未登记入口函数被白名单拦住",
           _badfn.get("ok") is False and "白名单" in str(_badfn.get("error", "")),
           str(_badfn)[:200])
 
     # ── B③ 真实链路：子进程执行 + 产物落盘 + 预览回传 ──
-    _ok = _st.run_skill("strategy_debug", '{"fn":"list_strategies"}')
+    _ok = _st.run_skill("strategy-debug", '{"fn":"list_strategies"}')
     _fp = _ok.get("full_path") or ""
     check("执行型技能真实跑通（子进程→落盘→回传）",
           _ok.get("ok") is True and bool(_fp) and os.path.exists(_fp),
@@ -1890,7 +1903,7 @@ def test_34_case_memory_wiring():
     # ③ 注入语义两类：成功给骨架+坑 / 失败只给坑
     _ok_txt = _cm.format_case_injection([{
         "task_summary": "分析某白酒龙头短线走势",
-        "plan_digest": [{"step": "auto_stock-analyze", "tools": ["daily", "fund_flow"]}],
+        "plan_digest": [{"step": "auto-stock-analyze", "tools": ["daily", "fund_flow"]}],
         "outcome": {"label": "correct"}, "failure_modes": ["复权口径未对齐"]}])
     _bad_txt = _cm.format_case_injection([{
         "task_summary": "追高买入某题材股",
@@ -1918,7 +1931,7 @@ def test_34_case_memory_wiring():
 
     def _fake_retrieve(query, top_k=3, tags=None):
         return [{"case_id": "CASE-T", "task_summary": "分析某白酒龙头短线走势",
-                 "plan_digest": [{"step": "auto_stock-analyze", "tools": ["daily"]}],
+                 "plan_digest": [{"step": "auto-stock-analyze", "tools": ["daily"]}],
                  "outcome": {"label": "correct"}, "failure_modes": [],
                  "sim": 0.9, "score": 0.9, "label": "correct"}]
 
@@ -1996,11 +2009,19 @@ def test_35_returns_contract_archive():
     check("returns_sampler/returns_contract 不在生产 tools/ 目录",
           not os.path.exists(os.path.join(_tools_dir, "returns_sampler.py"))
           and not os.path.exists(os.path.join(_tools_dir, "returns_contract.py")), "")
-    check("实现已归档（可回滚，不是硬删）",
-          os.path.isfile(os.path.join(_archived, "returns_sampler.py"))
-          and os.path.isfile(os.path.join(_archived, "returns_contract.py"))
-          and os.path.isfile(os.path.join(_archived, "README.md")), _archived,
-          env="archive_returns")
+    # 【2026-10-14 收口】B.2 本地即运行：del/tools_returns_contract_20261010
+    # 不在工作副本是已知副作用，不是回归。防回流主不变量 = 生产 tools/ 无该文件
+    # + 下方无调用方断言。归档在：照旧断言可回滚；不在：SKIP + 注明 B.2。
+    if os.path.isfile(os.path.join(_archived, "returns_sampler.py")):
+        check("实现已归档（可回滚，不是硬删）",
+              os.path.isfile(os.path.join(_archived, "returns_sampler.py"))
+              and os.path.isfile(os.path.join(_archived, "returns_contract.py"))
+              and os.path.isfile(os.path.join(_archived, "README.md")), _archived,
+              env="archive_returns")
+    else:
+        PASS.append("SKIP")
+        print(f"  [SKIP] 实现已归档 — B.2 本地模式：{_archived} 不在工作副本"
+              f"（回滚件不可用；防回流由 tools/ 干净 + 无调用方保证）")
 
     # 无调用方断言（防有人悄悄接回一半又丢一半）
     _stubs = ("start_background_sampling", "get_sampled_structures",
@@ -2216,7 +2237,7 @@ def test_38_exec_skill_dispatch_card():
     """执行型技能注入分叉（2026-10-10）：分发卡片，不注方法论正文。
 
     事故回放（设计层缺陷，非推测）：渐进式加载对**所有**命中技能一视同仁注正文，
-    包括 market_screener/strategy_debug 这类执行型——① 正确姿势是 run_skill 一行
+    包括 market-screener/strategy-debug 这类执行型——① 正确姿势是 run_skill 一行
     派活，正文全量进上下文违背 B 的「O(摘要)」；② 分步方法论诱导模型在主对话
     硬跑，与 system_template §重活分发抢方向盘。判据：
       ① 白名单单一真源可读（skill_run.EXECUTABLE_SKILLS，按路径加载防 sys.path 错序）；
@@ -2233,17 +2254,17 @@ def test_38_exec_skill_dispatch_card():
 
     # ① 白名单单一真源
     wl = _executable_skills()
-    check("执行型白名单可读（含 market_screener/strategy_debug）",
-          "market_screener" in wl and "strategy_debug" in wl, str(sorted(wl)))
-    check("入口清单来自单一真源（strategy_debug 四入口）",
-          "debug_strategy" in wl.get("strategy_debug", ("", (), ""))[1], str(wl.get("strategy_debug")))
+    check("执行型白名单可读（含 market-screener/strategy-debug）",
+          "market-screener" in wl and "strategy-debug" in wl, str(sorted(wl)))
+    check("入口清单来自单一真源（strategy-debug 四入口）",
+          "debug_strategy" in wl.get("strategy-debug", ("", (), ""))[1], str(wl.get("strategy-debug")))
 
     # ② 卡片内容与体积
-    card = _dispatch_card("market_screener", wl["market_screener"])
+    card = _dispatch_card("market-screener", wl["market-screener"])
     check("卡片含 run_skill 调用签名与结果读法",
-          'run_skill(name="market_screener"' in card and "full_path" in card, card[:120])
+          'run_skill(name="market-screener"' in card and "full_path" in card, card[:120])
     check("卡片含入口清单与 read_skill 兜底",
-          "入口：" in card and 'read_skill(name="market_screener")' in card, card[:120])
+          "入口：" in card and 'read_skill(name="market-screener")' in card, card[:120])
     check("卡片是卡片不是正文（≤600 字符）", len(card) <= 600, str(len(card)))
 
     # ②b 空结果纪律（2026-10-12 补，防再断线）：D-18 的「run_skill 空结果 → 模型回退
@@ -2263,6 +2284,24 @@ def test_38_exec_skill_dispatch_card():
               and "禁止" in _sec and "再派一次" in _sec, _sec[:160])
     except Exception as _e38:
         check("qd_system.txt §重活分发可读", False, f"{type(_e38).__name__}: {_e38}")
+
+    # ②c 非空结果纪律（2026-10-14 补）：run_skill 证据齐（tech/flow/p_up/rt）后
+    # 主 agent 仍自设计划「技术面+资金流+实时报价验证」逐只重拉 —— 实测 11 步 /
+    # 21 万 token / budget_wrapped。空结果纪律只堵了「空」，没堵「非空但不信任」。
+    # 锁两处：卡片带非空提示、qd_system.txt 带「非空结果纪律」+ 禁止重验。
+    check("卡片含非空结果纪律（证据齐 ⇒ 直接写结论，禁止逐只重拉 quote/flow/tech）",
+          all(t in card for t in ("非空结果", "禁止", "inspect_stock")), card[-200:])
+    try:
+        import os as _os39
+        _sys_txt39 = open(_os39.path.join(_os39.path.dirname(_os39.path.abspath(__file__)),
+                                         "..", "prompts", "qd_system.txt"),
+                          encoding="utf-8").read()
+        _sec2 = _sys_txt39.split("## 重活分发", 1)[1].split("\n## ", 1)[0]
+        check("qd_system.txt §重活分发含非空结果纪律（直接交付 + ≤2 轮补取）",
+              "非空结果纪律" in _sec2 and "禁止" in _sec2
+              and "inspect_stock" in _sec2 and "≤2" in _sec2, _sec2[-200:])
+    except Exception as _e39:
+        check("qd_system.txt §重活分发非空纪律可读", False, f"{type(_e39).__name__}: {_e39}")
 
     # ③ 集成：技能命中路径的分叉（用假技能注册表 + 直接调 _prefetch，不跑模型）
     class _FakeSkills:
@@ -2284,14 +2323,14 @@ def test_38_exec_skill_dispatch_card():
     try:
         _svc38 = _Svc(model=ScriptedModel([{"content": "ok"}]),
                       skills=_FakeSkills({
-                          "market_screener": ("从a股全市场筛选短线标的的批量流水线",
+                          "market-screener": ("从a股全市场筛选短线标的的批量流水线",
                                                "METHOD_BODY_MARKET_SCANNER_V1 步骤一…步骤九"),
-                          "auto_stock-analyze": ("对单只a股标的开展多周期技术面资金面基本面综合诊断",
+                          "auto-stock-analyze": ("对单只a股标的开展多周期技术面资金面基本面综合诊断",
                                                   "METHOD_BODY_STOCK_ANALYZE_V1 第一步…"),
                       }), agent_config={"tools": []})
         task1, rep1 = _svc38._prefetch("帮我从a股全市场筛选短线标的", "s38a", None)
         check("执行型命中→分发卡片且正文不注入",
-              "技能分发卡片：market_screener" in task1
+              "技能分发卡片：market-screener" in task1
               and "METHOD_BODY_MARKET_SCANNER" not in task1, task1[:200])
         check("留痕记录技能块（kind=skill，含卡片）",
               any(b.get("kind") == "skill" and b.get("injected")
@@ -2299,7 +2338,7 @@ def test_38_exec_skill_dispatch_card():
         task2, _ = _svc38._prefetch("帮我分析一下贵州茅台600519技术面资金面基本面",
                                     "s38b", None)
         check("知识型命中→仍注正文（渐进式加载不被误伤）",
-              "相关技能：auto_stock-analyze" in task2
+              "相关技能：auto-stock-analyze" in task2
               and "METHOD_BODY_STOCK_ANALYZE" in task2, task2[:200])
     except Exception as e:
         check("分叉集成可跑", False, f"{type(e).__name__}: {e}")
@@ -2507,10 +2546,10 @@ if __name__ == "__main__":
             PASS.append(False)
             print(f"  [FAIL] 异常: {e!r}")
     _cleanup_trace_rows(_base)
-    _scored = [x for x in PASS if x != "SKIP"]      # SKIP 只在 --with-env 出现
+    _scored = [x for x in PASS if x != "SKIP"]  # SKIP：--with-env 缺件 或 B.2 归档缺件
     ok = sum(_scored)
     _nskip = len(PASS) - len(_scored)
-    if WITH_ENV:
+    if WITH_ENV or _nskip:
         _nfail = len(_scored) - ok
         print(f"\n== {ok}/{len(PASS)} passed · {_nfail} failed · {_nskip} skipped ==")
         sys.exit(0 if _nfail == 0 else 1)

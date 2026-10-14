@@ -100,12 +100,12 @@ def budget_wrapup_hint(reason: str) -> str:
     2026-10-12：本模块此前**零消费方**，提示语还停在 smolagents 时代
     （让模型调 `final_answer(...)`）——mimoagent 执行核没有这个工具，照抄会
     诱导模型去调一个不存在的工具。改为框架中立的"直接给文字结论"。
+    2026-10-14：文案外置 prompts/wrapup_budget_hint.md；前缀
+    「（本轮已触及成本上限：」是 `qd_config.TRANSIENT_CONTROL_MARKERS` 约定，
+    **不可改**（改了瞬态清理/熔断识别会失效）。
     """
-    return (
-        "（本轮已触及成本上限：%s，已停止继续探索。）\n"
-        "下面是目前已经取到 / 算出的部分；关键数据若未取到，如实标注为「未获取」，"
-        "不要编造，也不要再展开新的取数。" % reason
-    )
+    from ..prompts import load_prompt
+    return load_prompt("wrapup_budget_hint").format(reason=reason)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

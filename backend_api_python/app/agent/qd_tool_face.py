@@ -199,8 +199,15 @@ class ToolFaceMixin:
         except Exception:
             return ""
 
-    def get_model_query_kwargs(self) -> dict:
-        """每轮只下发「必注入层 + 已激活」的工具定义（原版是全量下发）。"""
+    def get_model_query_kwargs(self, *, no_tools: bool = False) -> dict:
+        """每轮只下发「必注入层 + 已激活」的工具定义（原版是全量下发）。
+
+        `no_tools=True`：**纯文字收尾轮**用（预算熔断后，见
+        `qd_agent._budget_summary_turn`）——彻底清空工具面，逼模型只据已有工具输出
+        总结，不能再取数；不带 tools/tool_choice，走模型原生纯文本回合。
+        """
+        if no_tools:
+            return {}
         return {"tools": self._active_tool_definitions(), "tool_choice": "auto"}
 
     def _active_tool_definitions(self) -> list:

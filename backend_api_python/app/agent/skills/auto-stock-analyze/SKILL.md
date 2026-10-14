@@ -1,11 +1,12 @@
 ---
-name: auto_stock-analyze
-version: 0.1.0
+name: auto-stock-analyze
 description: 对 A 股目标股票开展技术形态、基本面、筹码、资金流与多空研判的一站式综合分析；当用户说“分析某只股票/个股”“分析XXX（代码或名称）”“看看这只票/这只股怎么样”“技术面和基本面如何”“给个分析”“判断多空或风险”时使用。
-tags: [A股, 个股分析, 技术分析, 基本面, 筹码分布, 资金流, 多空研判]
-tools: [all_codes, resolve_stock, get_stock_info, get_stock_sector_info, get_realtime_quote, agent_get_kline, daily_live, analyze_chart_patterns, analyze_pattern, get_finance, get_capital_summary, get_chip_distribution, get_fund_flow_daily, get_dragon_tiger, get_dividend, bull_bear_research]
+metadata:
+  version: 0.1.0
+  tags: A股, 个股分析, 技术分析, 基本面, 筹码分布, 资金流, 多空研判
+  tools: all_codes, resolve_stock, get_stock_info, get_stock_sector_info, get_realtime_quote, agent_get_kline, daily_live, analyze_chart_patterns, analyze_pattern, get_finance, get_capital_summary, get_chip_distribution, get_fund_flow_daily, get_dragon_tiger, get_dividend, bull_bear_research
 ---
-<!-- auto-brewed 2026-09-29 from root_id=992 chain=stock+analyze | human-edited 后请去除 auto_ 前缀接管 -->
+<!-- auto-brewed 2026-09-29 from root_id=992 chain=stock+analyze | human-edited 后请去除 auto- 前缀接管 -->
 <!-- 2026-09-30 人工合并泛化：原两条按标的分裂的链（root_id=984 / root_id=992，实体码已从链名剥离）
      合并为跨标的通用版，违反 §3.16 泛化纪律的旧目录已删；并按工具真实签名修正
      codes 参数类型（字符串、多股逗号分隔；列表入参会让 get_fund_flow_daily 等直接报错）。 -->

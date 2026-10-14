@@ -374,7 +374,7 @@ P2（聚合器）、P3（条件校准）仍属后续批次，另行立项。
 - 要做的：实现 `pick_daily_universe(date, n)`，按 **活跃 60% / 中热 25% / 低热+随机 15%**
   分层配额返回标的列表。配额**按 date 强制**（不许因当日活跃股多而多采），
   每条结果带 `sample_layer` 字段（活跃/中热/低热）以便分层记账。
-  活跃池复用既有资产：`tools/finance/dragon_tools.py`、`skills/market_screener/`。
+  活跃池复用既有资产：`tools/finance/dragon_tools.py`、`skills/market-screener/`。
   ⚠️ 阈值走 env，禁止硬编码。
 - 验证：单测断言三次调用的层比例恒为 0.6/0.25/0.15（容差 ±1 只）；
   且低热层**非空**（防止实现者因「价值低」跳过）。
@@ -819,7 +819,7 @@ qd_agent._finish_collector(message, status)
 
 **为什么要新建 `kline_feed.py`（不是抄第三份）**：项目约定「重复调用代码段 2 处以上 ⇒ 生成统一接口」。当前 K 线取数已有 3 处：
 ① `chain/evaluator._get_actual_return`（内联 `CNStockDataSource`，要 `t` 为日期串）
-② `skills/market_screener/common.py::fetch_kline`
+② `skills/market-screener/common.py::fetch_kline`
 ③ 本阶段新增。
 ⇒ `kline_feed` 同时给 `t`（`YYYY-MM-DD`）与 `time`（int ts）两个键，**两个消费方都能用**；
 **但本阶段不迁移 `evaluator`**（它刚在 P0-3 修过且有守卫，动它风险大于收益）—— 迁移记入遗留表，作为 O-14 后续项。

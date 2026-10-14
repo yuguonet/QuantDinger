@@ -1,11 +1,12 @@
-<!-- auto-brewed 2026-09-21 from root_id=2579 chain=finance+query+stock | human-edited 后请去除 auto_ 前缀接管 -->
 ---
-name: auto_finance-query-stock
-version: 0.1.0
+name: auto-finance-query-stock
 description: 查询 A 股个股的最新实时行情与涨跌幅信息（最新价、涨跌额、涨跌幅、今开/最高/最低、昨收、成交量、换手率、量比、PE、PB、总市值等），并按指定周期（T+1/T+3/1W/1M）计算周期涨跌幅。适用于用户询问"XX股票最新行情"、"XX涨了多少"、"XX今天/这周/这个月涨跌幅度"等场景。同义表述包括：实时报价、最新价、当前股价、今日涨跌、涨幅、跌幅、行情快照。
-tags: [finance, stock, query, realtime-quote, kline, change-percent, A股]
-tools: [get_realtime_quote, agent_get_kline, get_stock_info]
+metadata:
+  version: 0.1.0
+  tags: finance, stock, query, realtime-quote, kline, change-percent, A股
+  tools: get_realtime_quote, agent_get_kline, get_stock_info
 ---
+<!-- auto-brewed 2026-09-21 from root_id=2579 chain=finance+query+stock | human-edited 后请去除 auto- 前缀接管 -->
 
 # A股个股实时行情与周期涨跌幅查询技能
 

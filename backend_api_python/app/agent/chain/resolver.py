@@ -292,18 +292,10 @@ def verdict_by_rule(claim: Dict[str, Any], actual: Dict[str, Any],
 
 # ═══════════════════════════════════════════════════════════════
 #  阶段 B：LLM judge（默认关闭）
+#  2026-10-14 外置 prompts/verdict_judge.md
 # ═══════════════════════════════════════════════════════════════
-JUDGE_SYSTEM = (
-    "你是预测判定器。给定一条**模型此前做出的声明**、代码已经算好的真实数据与数值偏差，"
-    "判定它算不算说中。\n"
-    "规则（放宽口径，慢调用途，宁可判宽不判严）：\n"
-    "1. 方向一致即算 hit（score ≥0.7），幅度差得多只降不否；\n"
-    "2. 方向相反才 miss（score ≤0.3）；\n"
-    "3. 原话模糊到无法判定（可能/不好说/没说清）⇒ undecidable，**不要**当成说错；\n"
-    "4. 只输出 JSON，禁止额外文字。\n"
-    '输出：{"verdict":"hit|partial|miss|undecidable","verdict_score":0~1,'
-    '"attribution":"data_missing|logic_error|black_swan|timing|caliber|noise","note":"…"}'
-)
+from ..prompts import load_prompt as _load_prompt
+JUDGE_SYSTEM = _load_prompt("verdict_judge")
 
 
 def judge_one(claim: Dict[str, Any], actual: Dict[str, Any],

@@ -1255,9 +1255,11 @@ def _label_payload(s) -> dict:
         except (TypeError, ValueError, OverflowError):
             valid_score = False
         if not valid_score:
-            logger.warning(
-                "[dragon_store] 忽略超出 label 合约的信号评分 %s %s: %r",
-                s.get("strategy") or DRAGON_STRATEGY, s.get("code"), score)
+            strategy = s.get("strategy") or DRAGON_STRATEGY
+            log = (logger.debug if strategy == "dragon_callback" and score == -1
+                   else logger.warning)
+            log("[dragon_store] 忽略超出 label 合约的信号评分 %s %s: %r",
+                strategy, s.get("code"), score)
             score = None
     state_rows = [{"label": "状态",
                    "value": d.get("state_label") or s.get("state") or ""}]

@@ -2,7 +2,7 @@
 """chain/skill_brewer.py — 技能酿造器（2026-09-18，用户方案）
 
 思路：高频且回测验证效果好的节点树（qd_agent_traces），周期性由 LLM 编译成
-SKILL.md（auto_ 前缀目录），下次同类问题 planner 优先技能调用——
+SKILL.md（auto- 前缀目录），下次同类问题 planner 优先技能调用——
 "用数据库代替 Hermes 的 Skill 固化，回测 = 给编排 Skill 打分"。
 
 与 path_cache/模板短路路线的取舍：本路线复用已接线的 skill 全链
@@ -13,11 +13,11 @@ qd_agent_weights layer='skill' 打分），无需键匹配与短路逻辑。
 不假设轨迹所属领域；签名清单/低权重规避经占位符注入）。
 
 易错点：
-  - 生成的 SKILL.md 必须符合 market_screener 样例的 frontmatter 契约
-    （name/version/description/tags/tools），否则 _scan_markdown 解析失败静默丢弃；
+  - 生成的 SKILL.md 必须符合 market-screener 样例的 frontmatter 契约
+    （name/description + metadata.version/tags/tools），否则 _scan_markdown 解析失败静默丢弃；
   - tools 白名单真实性：LLM 从日志推断工具名可能编造——写盘前与 provider
     注册表求交集剔除（不存在的名字 = 执行期必踩坑）；
-  - 幂等：chain 已有 auto_ skill 则跳过（避免重复酿造）；人工编辑过的 auto_ 技能
+  - 幂等：chain 已有 auto- skill 则跳过（避免重复酿造）；人工编辑过的 auto- 技能
     （文件含 "human-edited" 标记）永不覆盖；
   - LLM 输出可能裹 markdown 代码围栏，需剥离后再写盘；
   - QDLLM.generate 只收 ChatMessage 对象（dict 无 to_dict）；事件循环内调用
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "skill_brew.txt"
-_AUTO_PREFIX = "auto_"
+_AUTO_PREFIX = "auto-"
 _HUMAN_EDITED_MARK = "human-edited"
 _BREW_TEMPLATE: Optional[str] = None
 
@@ -137,11 +137,19 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _extract_frontmatter_tools(skmd: str) -> list:
-    """从 SKILL.md frontmatter 提取 tools 列表（用于真实性校验）。"""
-    m = re.search(r"^tools:\s*\[([^\]]*)\]", skmd, re.M)
+    """从 SKILL.md frontmatter 提取 tools 列表（用于真实性校验）。
+
+    兼容两种写法：legacy 顶层 `tools: [a, b]` 与规范 `metadata.tools: a, b`
+    （值可能带引号/方括号，正则不限缩进）。
+    """
+    m = re.search(r"^[ \t]*tools:[ \t]*(.+?)[ \t]*$", skmd, re.M)
     if not m:
         return []
-    return [t.strip().strip("'\"") for t in m.group(1).split(",") if t.strip()]
+    raw = m.group(1).strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    raw = raw.strip("'\"")
+    return [t.strip().strip("'\"") for t in raw.split(",") if t.strip()]
 
 
 # 元工具/沙箱内置：始终在场，写进 skill tools 白名单只是噪音（LLM 从日志推断时
@@ -174,6 +182,7 @@ def _validate_tools(skmd: str, provider) -> str:
     """tools 白名单真实性校验：剔除编造名 + 元工具，并告警。
 
     LLM 从 Execution logs 推断工具名可能编造；写死不存在的名字 = 执行期必踩坑。
+    写回时**保留原有写法**（legacy `[a, b]` 维持方括号，规范 `a, b` 维持逗号串）。
     """
     if provider is None:
         return skmd
@@ -184,10 +193,16 @@ def _validate_tools(skmd: str, provider) -> str:
     if not bad:
         return skmd
     kept = [t for t in tools if t not in bad]
+
+    def _repl(m):
+        prefix, value = m.group(1), m.group(2).strip()
+        body = "[" + ", ".join(kept) + "]" if value.startswith("[") else ", ".join(kept)
+        return prefix + body
+
     fixed = re.sub(
-        r"^(tools:\s*)\[[^\]]*\]$",
-        lambda m: m.group(1) + "[" + ", ".join(kept) + "]",
-        skmd, flags=re.M,
+        r"^([ \t]*tools:[ \t]*)(.*)$",
+        _repl,
+        skmd, count=1, flags=re.M,
     )
     logger.warning("[Brewer] 剔除编造的工具名（不在 provider 注册表）: %s", bad)
     return fixed
@@ -203,8 +218,8 @@ def _skill_dir_exists_for(chain_name: str) -> Optional[str]:
     """幂等检查：溯源注释含 chain=<name> 的技能已存在 → 返回目录名。
 
     2026-09-30 两处收严：
-      - 扫描范围扩到全部技能目录（人工去掉 auto_ 前缀接管后不得再触发重酿，
-        否则同一链会多出一个 auto_ 复制品与人写版并存）；
+      - 扫描范围扩到全部技能目录（人工去掉 auto- 前缀接管后不得再触发重酿，
+        否则同一链会多出一个 auto- 复制品与人写版并存）；
       - 匹配加词边界（防子串误报：chain=stock+analyze 不得命中 stock+analyze+foo）。
     """
     if not _SKILLS_DIR.exists() or not chain_name:
@@ -228,7 +243,7 @@ def _find_entity_codes(skmd: str) -> list:
     """通用性质量门（2026-09-30，§3.16 泛化纪律的代码化）：
 
     设计文档声称“写死具体代码 = 编译失败重酿”，但此前无任何实现（校验只有
-    tools 白名单 + frontmatter 字段），auto_stock-analyze-600929 这类绑定单股
+    tools 白名单 + frontmatter 字段），auto-stock-analyze-600929 这类绑定单股
     的技能即由此漏过。此处扫编译产物里的六位实体码（日期/溯源 id 先剥离防误伤）。
     """
     text = re.sub(r"\d{4}-\d{2}-\d{2}", "", skmd or "")
@@ -258,7 +273,7 @@ BREW_FALLBACK_DAYS = 7      # 距上次尝试达到该天数 → 兜底重试（
 
 @_brew_locked(locked_result=[])
 def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> list:
-    """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto_*/SKILL.md。
+    """酿造主入口：筛候选 → 逐链 LLM 编译 → 写 skills/auto-*/SKILL.md。
 
     触发分派（重设计 §2.5，2026-09-19）：
       trigger="auto"   → 混合四通道：信号就绪（query_brew_ready）立即酿；
@@ -410,7 +425,7 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
             # 都能跑，不再因为上下文而静默跳过。
             from app.agent.llm import complete
             resp = complete([
-                {"role": "system", "content": "你是技能工程师，只输出 SKILL.md 文件内容。"},
+                {"role": "system", "content": _ENGINEER_SYS["brew_system"]},
                 {"role": "user", "content": prompt},
             ])
             skmd = _strip_code_fence(resp.content or "")
@@ -433,10 +448,9 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
             try:
                 from app.agent.llm import complete
                 resp = complete([
-                    {"role": "system", "content": "你是技能工程师，只输出 SKILL.md 文件内容。"},
+                    {"role": "system", "content": _ENGINEER_SYS["brew_system"]},
                     {"role": "user", "content": prompt +
-                        "\n\n【重申】正文与参数示例禁止出现任何六位股票代码或具体标的名称"
-                        "（含样本任务里的股票名），一律用“目标股票/目标代码”占位。"},
+                        "\n\n" + _ENGINEER_SYS["generic_retry_suffix"].strip()},
                 ])
                 skmd = _strip_code_fence(resp.content or "")
             except Exception as e:
@@ -455,7 +469,7 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
         skill_dir.mkdir(parents=True, exist_ok=True)
         header = (f"<!-- auto-brewed {date.today().isoformat()} from root_id="
                   f"{cand['sample_root_id']} chain={chain_name} | "
-                  f"{_HUMAN_EDITED_MARK} 后请去除 auto_ 前缀接管 -->\n")
+                  f"{_HUMAN_EDITED_MARK} 后请去除 auto- 前缀接管 -->\n")
         # B3：溯源注释放 frontmatter 之后，保证 _parse_skill_md 能读到 name/description/tools
         (skill_dir / "SKILL.md").write_text(_compose_skill_doc(header, skmd), encoding="utf-8")
         logger.info("[Brewer] 酿成技能: %s (chain=%s)", final_name, chain_name)
@@ -471,25 +485,24 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
 
 
 # ═══════════════════════════════════════════════════════════════
-#  auto_ 技能迭代升级（重设计 §2.6，2026-09-19）
+#  auto- 技能迭代升级（重设计 §2.6，2026-09-19）
 #  原则（D6）：全链复用——用户消息 → planner 选 auto_skill → 执行入库 → T+N 回测
 #  → 追责打分，整条链不改；本节只做"打分后旁支"：差技能 → 修订而非只降权。
 # ═══════════════════════════════════════════════════════════════
 
-_REVISE_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "skill_revise.txt"
+# 修订提示词（2026-10-14 外置 prompts/skill_revise.md）：原 prompts/skill_revise.txt
+# 长期未接线后一度收进本模块常量，现已与酿造同规外置；Anthropic SKILL 纪律与
+# skill_brew 同源，修订侧只多「增量/不推翻结构/version minor+1」三条。
+from ..prompts import load_prompt as _load_prompt, load_prompt_doc as _load_prompt_doc
+_REVISE_TEMPLATE = _load_prompt("skill_revise")
+_ENGINEER_SYS = _load_prompt_doc("skill_engineer")
+
 LOW_WEIGHT_THRESHOLD = 0.7       # 与 planner 低权重告警同阈值（原 B3 硬编码收敛）
 REVISE_MAX_STREAK = 2            # 连续修订 N 轮仍差 → 转淘汰（护栏 5）
 # 判定最小样本（2026-09-24，护栏 5 语义②“带最小样本”）：修订后的新版本至少要攒到
 # 15 个已回测样本才作“仍差/回升”判定——evaluator 的 sample_scale 在 n≤15 时把权重
 # 拉向 1.0，样本不足时“权重仍低于阈值”根本观测不到，判了就是误杀。
 REVISE_JUDGE_MIN_SAMPLES = 15
-
-
-def _load_revise_template() -> str:
-    if not _REVISE_PROMPT_PATH.exists():
-        # 修订模板缺失时退化为酿造模板（修订提示 = 原料里带旧文档 + 新轨迹）
-        return _load_brew_template()
-    return _REVISE_PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def _bump_version(version: str) -> str:
@@ -503,12 +516,12 @@ def _bump_version(version: str) -> str:
 
 @_brew_locked(locked_result={"status": "locked"})
 def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> dict:
-    """修订单个 auto_ 技能（§2.6 旁支主体）。
+    """修订单个 auto- 技能（§2.6 旁支主体）。
 
     护栏（§2.6 五条）：
       2. 权重重置：修订完成后 weight=1.0、sample_count=0（新版本重新积累评价）
       3. .bak 单版本回滚：修订前把旧 SKILL.md 复制为 SKILL.md.bak
-      4. human-edited（已去 auto_ 前缀）技能不在本函数射程（调用方过滤）
+      4. human-edited（已去 auto- 前缀）技能不在本函数射程（调用方过滤）
     原料（护栏 1）：旧 SKILL.md 全文 + origin root_id 之后的增量轨迹
     （correct=TRUE 教改进，FALSE 供坑）；修订是 LLM 对旧文档的增量更新，
     不是从零重编译。
@@ -540,19 +553,23 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
         f"  - [{r['exec_date']}] {'✓正确' if r['correct'] is True else ('✗错误' if r['correct'] is False else '未验证')}"
         f" 任务:{r['user_query'][:60]} 摘要:{r['summary'][:120]}"
         for r in digest["runs"])
-    prompt = (
-        "你是技能工程师。以下是同一个 auto_ 技能的当前文档与本链路最新执行轨迹。"
-        "请修订文档：从成功轨迹提炼步骤/参数改进，把失败轨迹中的坑写进「注意事项」；"
-        "不要推翻文档结构，不要删除已有但未在轨迹中出现的条目；只更新有依据的部分。\n\n"
-        f"## 当前文档\n{old_doc}\n\n"
-        f"## 增量轨迹（本链 {digest['chain_name']}，"
-        f"正确 {digest['n_correct']} 条 / 证伪 {digest['n_falsified']} 条）\n{runs_txt}\n\n"
-        "只输出修订后的完整 SKILL.md（frontmatter + 正文），version 的 minor 位 +1。"
-    )
+    # 修订提示词 = 模块常量 _REVISE_TEMPLATE（2026-10-14）：原 prompts/skill_revise.txt
+    # 长期未接线且与 skill_brew 契约重复，已移 del/。此处直接 format，无文件 IO。
+    try:
+        prompt = _REVISE_TEMPLATE.format(
+            old_doc=old_doc,
+            chain_name=digest["chain_name"],
+            n_correct=digest["n_correct"],
+            n_falsified=digest["n_falsified"],
+            runs_txt=runs_txt or "（无）",
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        logger.warning("[Brewer] 修订模板占位符不匹配 chain=%s: %s", chain_name, e)
+        return {"chain_name": chain_name, "status": "bad_template", "error": str(e)}
     try:
         from app.agent.llm import complete
         resp = complete([
-            {"role": "system", "content": "你是技能工程师，只输出修订后的 SKILL.md 文件内容。"},
+            {"role": "system", "content": _ENGINEER_SYS["revise_system"]},
             {"role": "user", "content": prompt},
         ])
         new_doc = _strip_code_fence(resp.content or "")
@@ -578,9 +595,10 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
         logger.debug("[Brewer] 修订版工具校验跳过: %s", e)
 
     # 版本递增（优先用 LLM 输出的 version；没给就本地 bump）
-    m_old = re.search(r"^version:\s*([\d.]+)", old_doc, re.M)
+    m_old = re.search(r"^[ \t]*version:[ \t]*([\d.]+)", old_doc, re.M)
     new_version = _bump_version(m_old.group(1)) if m_old else "0.2.0"
-    new_doc = re.sub(r"^(version:\s*)[\d.]+$", lambda mm: "version: " + new_version,
+    new_doc = re.sub(r"^([ \t]*version:[ \t]*)[\d.]+.*$",
+                     lambda mm: mm.group(1) + new_version,
                      new_doc, count=1, flags=re.M)
 
     # 护栏 3：.bak 回滚点（2026-09-24 升级为轮转归档，保留 BREW_BAK_KEEP 份）
@@ -592,7 +610,7 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
     header = (f"<!-- auto-brewed&revised {date.today().isoformat()} origin_root_id={origin} "
               f"chain={chain_name} | revision={rev['revision'] + 1} | "
               f"pre_weight={pre_weight if pre_weight is not None else 'NA'} | "
-              f"{_HUMAN_EDITED_MARK} 后请去除 auto_ 前缀接管 -->\n")
+              f"{_HUMAN_EDITED_MARK} 后请去除 auto- 前缀接管 -->\n")
     skill_path.write_text(_compose_skill_doc(header, new_doc), encoding="utf-8")
 
     # 护栏 2 真落地（2026-09-24，设计 §3.17）：修订完成 → 权重重置 1.0、sample_count 归零
@@ -623,7 +641,7 @@ def maybe_revise(skill_rows: dict, skill_adapter=None) -> list:
         （修订尝试失败不推进 revision → 不重复计，防基础设施抖动误淘汰）；
       · 权重回升 ≥ 阈值（带最小样本）→ 清零（自救成功，切断“连续”链）；
       · 修订尝试失败（llm_error/bad_format/no_delta）不作数——那是基础设施抖动，不是“修完仍差”。
-    护栏 4：human-edited（无 auto_ 前缀）不修；护栏 5：low_streak ≥ REVISE_MAX_STREAK → 转淘汰。
+    护栏 4：human-edited（无 auto- 前缀）不修；护栏 5：low_streak ≥ REVISE_MAX_STREAK → 转淘汰。
     """
     from .store import get_skill_revisions, set_skill_low_streak as _ssl
     results = []
@@ -639,7 +657,7 @@ def maybe_revise(skill_rows: dict, skill_adapter=None) -> list:
         rev = revisions.get(name) or {"revision": 0, "low_streak": 0, "revised_at": None}
 
         # 权重回升清零（护栏 5 语义②：“权重回升至阈值上（带最小样本）才清零”）——
-        # 必须扫全部 auto_ 技能（不止低权重），否则自救成功后 low_streak 永久滞留，
+        # 必须扫全部 auto- 技能（不止低权重），否则自救成功后 low_streak 永久滞留，
         # 数月后一次正常回撤就凑满“连续 2 轮”误淘汰。
         if (rev["low_streak"] > 0 and rev["revision"] > 0
                 and n >= REVISE_JUDGE_MIN_SAMPLES and w >= LOW_WEIGHT_THRESHOLD):

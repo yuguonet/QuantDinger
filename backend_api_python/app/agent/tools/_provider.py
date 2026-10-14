@@ -81,7 +81,7 @@ _TOOL_MODULE_IMPORT_FAILURES: list = []
 # 必须与导入口径无关。
 #
 # 【为什么只摘注册不删实现】（工具归组化方案 §4，2026-09-27）：
-#   ① 技能层直接 import 这些函数（market_screener/common.py 等），删实现会断链；
+#   ① 技能层直接 import 这些函数（market-screener/common.py 等），删实现会断链；
 #   ② 能力层同名让位机制依赖"包装函数存在"做语义对比（loader.py 先注册者胜出）；
 #   ③ 归组的目的是缩注入面，不是抹掉代码。
 # 【易错点】摘名后能力层会**自动补位**（loader.py:170 既定行为）。凡同名让位项

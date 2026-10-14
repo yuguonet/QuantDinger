@@ -7,8 +7,8 @@
   3. 产物天然落文件（大结果不必挤进上下文）。
 
 用法：
-    python scripts/skill_run.py market_screener
-    python scripts/skill_run.py strategy_debug '{"fn": "debug_strategy", "kwargs": {"strategy": "break", "code": "600519"}}'
+    python scripts/skill_run.py market-screener
+    python scripts/skill_run.py strategy-debug '{"fn": "debug_strategy", "kwargs": {"strategy": "break", "code": "600519"}}'
 
 输出（stdout，单行 JSON）：
     {"name":..., "ok":bool, "result":<截断>,
@@ -26,9 +26,9 @@ from pathlib import Path
 # 技能执行注册表：name → (模块路径, 允许调用的函数, 默认函数)
 # 白名单制——run_skill 不执行任意代码，只跑这里登记过的入口。
 EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
-    "market_screener": ("skills.market_screener.run", ("run",), "run"),
-    "strategy_debug": (
-        "skills.strategy_debug.run",
+    "market-screener": ("skills.market-screener.run", ("run",), "run"),
+    "strategy-debug": (
+        "skills.strategy-debug.run",
         ("list_strategies", "why_strategy", "debug_strategy", "doctor_auto"),
         "debug_strategy",
     ),
@@ -113,7 +113,7 @@ if __name__ == "__main__":
     _rc = main()
     # 本进程是**一次性**的：结果已写盘、已回传 stdout，之后没有任何东西需要优雅收尾。
     # 走正常解释器退出会被第三方常驻线程拖死 —— 实测（2026-10-12，tmp/_screener_hang.py）：
-    # market_screener 的 run() 只跑 51~58s，随后进程 >10min 不退出（TDX 心跳线程是
+    # market-screener 的 run() 只跑 51~58s，随后进程 >10min 不退出（TDX 心跳线程是
     # 非 daemon，threading._shutdown() 死等它），于是 run_skill 恒定表现为
     # 「超时（>600s）已中止」。流水线本身并不慢，是退出卡住制造了慢的假象。
     # 因此显式 flush 后直接 os._exit，把控制权立刻交还父进程。

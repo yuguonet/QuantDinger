@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-market_screener/run.py — LLM 工具出口（不含任何选股规则）
+market-screener/run.py — LLM 工具出口（不含任何选股规则）
 
 2026-09-29 v7：彻底删掉 intraday.py / eod.py / post_market.py 三个「策略模块」。
 这三个文件把 ① 客观计算 ② 选股规则 ③ 评分梯形 ④ 报告口径 混在一起，
@@ -40,7 +40,7 @@ def market_state() -> dict:
     try:
         return SkillResult(_market_state())
     except Exception as e:
-        logger.warning("[market_screener] market_state 失败: %s", e)
+        logger.warning("[market-screener] market_state 失败: %s", e)
         return SkillResult({"error": str(e), "mood": "未知", "mood_score": None})
 
 
@@ -61,7 +61,7 @@ def pre_screen(sources: str = None, queries: str = None, search_top_n: int = 50,
             dragon_pullback / eod_zt=各来源明细；main_themes=当日主线；missing=取数缺口。
     """
     strategy = select_strategy()
-    logger.info("[market_screener] pre_screen 策略: %s 来源: %s", strategy, sources or "默认")
+    logger.info("[market-screener] pre_screen 策略: %s 来源: %s", strategy, sources or "默认")
 
     missing: list = []
     try:
@@ -72,7 +72,7 @@ def pre_screen(sources: str = None, queries: str = None, search_top_n: int = 50,
             limit=None if limit is None else int(limit),
         )
     except Exception as e:
-        logger.warning("[market_screener] 候选池取数失败: %s", e)
+        logger.warning("[market-screener] 候选池取数失败: %s", e)
         return SkillResult({
             "strategy": strategy, "error": str(e),
             "candidates": [], "main_themes": [], "market": {}, "missing": [str(e)],
@@ -141,7 +141,7 @@ def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> dic
         return SkillResult(_multitimeframe(code, daily_days=int(daily_days or 60),
                                            minute_days=int(minute_days or 5)))
     except Exception as e:
-        logger.warning("[market_screener] multitimeframe %s 失败: %s", code, e)
+        logger.warning("[market-screener] multitimeframe %s 失败: %s", code, e)
         return SkillResult({"ok": False, "code": code, "error": str(e), "missing": [str(e)]})
 
 
@@ -220,9 +220,12 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         with_mtf: 是否取多周期结构（需要分钟源，更慢）
 
     返回:
-        dict: analyzed[{code,name,patterns,tech,flow,mtf,score,direction,confidence,signal,missing}]；
+        dict: analyzed[{code,name,patterns,tech,flow,mtf,score,direction,confidence,signal,missing,
+            rt{price,change_pct,previous_close,limit_up,limit_up_price,time},stale_bar,rt_risks}]；
             strategy / missing / errors。confidence 是**证据完整度**（拿到几维 / 共几维），
             不是模型对自己判断的把握。
+            rt = 实时快照；stale_bar=True 表示本地日线滞后，tech 的收盘/涨跌停已按 rt
+            修正（MA/RSI 等历史指标仍基于 bar）。**有 rt 就不必再主对话重拉实时行情**。
     """
     strategy = select_strategy()
     errors: list = []
@@ -342,6 +345,20 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
 
     order = {c: k for k, c in enumerate(code_list)}
     raw.sort(key=lambda r: order.get(str(r.get("code")), 999))
+
+    # 实时覆盖层（2026-10-14）：本地日线盘后可能未刷当日 bar，tech 的涨跌停/收盘
+    # 会与真值打架（实测 600408 bar +4.53% 非涨停 vs 实时 +10.03% 封板）。历史指标
+    # 仍用 bar，可执行性字段以 rt 为准；缺 rt 不阻断。
+    from ._helpers import fetch_rt_map, apply_rt_overlay
+    rt_map = fetch_rt_map(code_list)
+    if not rt_map:
+        missing.append("实时行情缺失（tech 为日线口径，涨跌停/收盘可能滞后）")
+    for r in raw:
+        _rt = rt_map.get(str(r.get("code") or ""))
+        apply_rt_overlay(r, _rt, code=str(r.get("code") or ""), name=str(r.get("name") or ""))
+        if _rt is None and r.get("tech"):
+            r.setdefault("missing", []).append("实时行情缺失")
+
     raw = attach_prediction(raw, market=market)
 
     for r in raw:
@@ -371,6 +388,16 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                 f"距MA20 {_tech.get('dist_ma20_pct')}%、量比{_tech.get('vol_ratio')}、"
                 f"RSI{_tech.get('rsi14')}"
             )
+        _rt = r.get("rt") or {}
+        if _rt.get("price") is not None:
+            _rt_chg = _rt.get("change_pct")
+            _bits.append(
+                f"实时{_rt.get('price')}"
+                + (f"（{_rt_chg:+.2f}%）" if _rt_chg is not None else "")
+                + ("·涨停封板" if _rt.get("limit_up") else "")
+            )
+        if r.get("stale_bar"):
+            _bits.append("⚠日线滞后，收盘/涨跌停以实时为准")
         r["signal"] = "；".join(_bits) or "无形态与技术信号"
 
     report = build_report(raw, selected_codes=code_list)

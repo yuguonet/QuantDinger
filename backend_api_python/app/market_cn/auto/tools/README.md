@@ -62,7 +62,7 @@ _（T4 归档后暂空——`snapshot_quality` 已移 del/）_
 | `snapshot_quality` | 快照拼接质量诊断 | 零引用；quality 分级已入数据层 |
 
 归档前核验：**零 import、零 `python -m` 调用**（全树扫描；命中的 2~5 处引用均为
-历史设计文档 .md）。`chat_why` 因被活的 `agent/skills/strategy_debug/SKILL.md`
+历史设计文档 .md）。`chat_why` 因被活的 `agent/skills/strategy-debug/SKILL.md`
 点名为备用 CLI，**保留**。
 
 ### T3（2026-10-07）

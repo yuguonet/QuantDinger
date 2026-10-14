@@ -150,6 +150,26 @@ def _executable_skills() -> dict:
     return _EXECUTABLE_SKILLS_CACHE
 
 
+def _canonical_skill_name(skills, name: str) -> str:
+    """显示名 → 目录名（2026-10-14）。
+
+    `list_skills()` 返回的是 frontmatter **显示名**，与 `EXECUTABLE_SKILLS` 的键
+    （**目录名**）同口径（2026-10-14 kebab 化后两者均为连字符，如 market-screener）。
+    历史遗留里显示名（连字符）与目录名（下划线）不同口径，不归一化会让
+    `_executable_skills().get(显示名)` 恒为 None ⇒ 执行型技能永远进不了
+    分发卡片分支、退化成灌方法论正文（实测注 2529 字正文而非 407 字卡片）。
+    复用 adapter 既有的 display→name 映射（`skills.get()`，与 `skill_tools.run_skill`
+    同口径，见其 2026-10-12 注释），不另写字符串替换。取不到时原样返回（fail-open）。
+    """
+    try:
+        info = skills.get(name)
+        if info is not None and getattr(info, "name", ""):
+            return info.name
+    except Exception:
+        pass
+    return name
+
+
 def _dispatch_card(name: str, spec) -> str:
     """执行型技能 → 分发卡片（2026-10-10）：不注方法论正文，只注
     「何时派 / 怎么派 / 入口 / 结果怎么读」。
@@ -175,6 +195,9 @@ def _dispatch_card(name: str, spec) -> str:
         f"- **空结果 = 结论已成立**：`analyzed` 为空时按 §重活分发的空结果纪律直接收尾交付"
         f"（说清 strategy / pool_size / hard_reasons / missing），"
         f"**不要**转为主对话逐个取数把同一套筛选重跑一遍\n"
+        f"- **非空结果 = 结论已成立**：证据齐（tech/flow/p_up/rt）时直接写结论，"
+        f"以 rt/tech/flow 为准（stale_bar 已修正）；**禁止**逐只重拉 quote/flow/tech；"
+        f"只允许对 Top1–2 调 inspect_stock 或补明确 missing 的口径（合计 ≤2 轮）\n"
         f'- 方法论原文（通常不必）：read_skill(name="{name}")'
     )
 
@@ -393,6 +416,12 @@ class QDAgentService:
         _t0 = _time.perf_counter()
         parts: list[str] = []
         blocks: list[dict] = []
+        # 执行型技能注入时卡片点名的工具（2026-10-14 解耦修复）：卡片让模型用
+        # `run_skill` 派活，但 `run_skill` 是**按需工具**（QD_ON_DEMAND_TOOLS 默认
+        # `actor,run_skill`），而预选看的是剥掉注入后的**用户原始问题**、看不到技能
+        # ⇒ 预选不会点它 ⇒ 模型要白花一轮 `search_tools` 才发现（实测 trace step1）。
+        # 这里收集卡片点名的工具，经 report 传给 agent 在预选后就地激活。
+        force_tools: list[str] = []
         # 实体解析结果（2026-10-01）：标的/领域/时间口径进上下文。
         # 澄清（clarify）不在这里处理——它在 _run_sync 里**短路反问**，不进执行。
         if resolve_info and resolve_info.get("ran"):
@@ -438,14 +467,21 @@ class QDAgentService:
                     # 键口径 + LRU 容量上限都在 _skill_seen_for 里（D-12），
                     # 这里不要再直接动 self._skill_seen。
                     seen = self._skill_seen_for(session_id)
+                    # 显示名（连字符）→ 目录名（下划线）后再查执行型白名单：
+                    # 白名单键是目录名，显示名直查恒 None（见 _canonical_skill_name）。
+                    _best_canon = _canonical_skill_name(self.skills, best)
                     if best in seen:
                         # 已在本会话注入过：一行指针即可。
                         # ⚠ 不写"见上方历史"：上下文压缩（阈值 _compaction_threshold）
                         # 会改写历史，而 _skill_seen 对此不知情 ⇒ 那时"回看"是假的。
                         # 给出 read_skill(name=...) 不带参数 = 全文（skill_tools 实测），
                         # 模型可一句话自取，不依赖历史是否还在。
+                        _exec_spec = _executable_skills().get(_best_canon)
+                        if _exec_spec is not None:
+                            # 指针同样点名了 run_skill ⇒ 一并激活（否则又得 search_tools）
+                            force_tools.append("run_skill")
                         _ptr_tail = ("（执行型技能：重活直接派 run_skill，别读正文硬跑）"
-                                     if _executable_skills().get(best) else "")
+                                     if _exec_spec is not None else "")
                         parts.append(
                             f"[技能指针：{best}] 正文本会话已注入过；"
                             f"要完整正文用 read_skill(name=\"{best}\")，"
@@ -454,10 +490,13 @@ class QDAgentService:
                     else:
                         # 2026-10-10 分叉：执行型技能不注方法论正文，只注分发卡片
                         # （正文会诱导主对话硬跑，与 §重活分发抢方向盘；见 _dispatch_card）
-                        _spec_exec = _executable_skills().get(best)
+                        _spec_exec = _executable_skills().get(_best_canon)
                         if _spec_exec is not None:
                             blk = _dispatch_card(best, _spec_exec)
                             parts.append(f"[技能分发卡片：{best}]\n{blk}")
+                            # 卡片第一行就让模型 run_skill 派活 ⇒ 必须让它在首轮工具面里，
+                            # 否则模型要先 search_tools 发现（本次实测的额外一轮）。
+                            force_tools.append("run_skill")
                             seen.add(best)
                             hit = True
                         else:
@@ -538,6 +577,8 @@ class QDAgentService:
             "dropped_kinds": [b["kind"] for b in blocks if not b.get("injected")],
             "chars_total": sum(len(p) for p in parts),
             "elapsed_ms": round((_time.perf_counter() - _t0) * 1000, 2),
+            # 执行型技能卡片点名的工具（去重、保序）⇒ agent 在预选后激活（见 _run_inner）
+            "skill_force_tools": list(dict.fromkeys(force_tools)),
         }
         if not parts:
             return message, report
@@ -587,6 +628,14 @@ class QDAgentService:
                 agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
             except Exception as e:
                 logger.debug("[prefetch] 留痕失败（不影响主流程）: %s", e)
+            # ★ 技能卡片 ↔ 工具激活解耦（2026-10-14）：prefetch 注入执行型技能时卡片
+            #   点名 run_skill，它却是按需工具 ⇒ 交给 agent 在预选后激活（见 qd_agent._run_inner）。
+            #   挂在 agent 上（同 last_user_query 范式），run 后由 _run_inner 清空防跨轮残留。
+            try:
+                agent.prefetch_force_tools = list(
+                    prefetch_report.get("skill_force_tools") or [])
+            except Exception:
+                pass
             # ★ 把**用户原始问题**挂在 agent 上，供工具预选使用（2026-10-01）。
             #   预选绝不能用 prefetch 增强后的 task：那里面塞着记忆/RAG/技能块，
             #   实测把"今天北京天气"的预选 goal 带成了"个股综合分析"（历史记忆是

@@ -1,6 +1,6 @@
 # 选股规则手册（rules live here, not in code）
 
-> 这份文档是 **market_screener 唯一存放规则的地方**。
+> 这份文档是 **market-screener 唯一存放规则的地方**。
 > `_facts.py` / `_helpers.py` / `run.py` 只提供客观事实，**不含任何取舍**。
 > 下面所有条目的性质不同，请注意区分三档：
 
@@ -20,6 +20,9 @@
 - 【历史】旧 `intraday.analyze_code` 里的「15m 共振 +5」「5m+15m 共振 +5」「5m MACD 强弱 ±8/-5」在旧代码里**从未真正生效过**
   （因为 m15 / m5 永远取不到值）——这是旧版「分析深度不够」的一个实证来源。
 - 日线 (`fetch_kline`) 正常；`search_stocks` 走东方财富，偶发失败，失败会进 `missing`。
+- **bar vs rt 对账（2026-10-14）**：`deep_analyze` 的技术指标来自日线，但**可执行性字段
+  （收盘 / 涨跌停）以 `rt` 为准**；本地日线滞后时标 `stale_bar=true`（详见
+  `analysis-framework.md` 维度 6）。不要拿 bar 口径的涨停/收盘去推「今天能不能买」。
 
 ## 二、候选来源（仪器，`pre_screen(sources=...)` 自选）
 

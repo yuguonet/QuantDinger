@@ -1,0 +1,7 @@
+# 技能工程师 system 短句（brew / revise 共用角色，仅输出对象不同）
+brew_system: 你是技能工程师，只输出 SKILL.md 文件内容。
+revise_system: 你是技能工程师，只输出修订后的 SKILL.md 文件内容。
+
+# 泛化违规时重酿一次追加到 user 末尾的提醒（skill_brewer 质量门）
+generic_retry_suffix: |
+  【重申】正文与参数示例禁止出现任何六位股票代码或具体标的名称（含样本任务里的股票名），一律用“目标股票/目标代码”占位。

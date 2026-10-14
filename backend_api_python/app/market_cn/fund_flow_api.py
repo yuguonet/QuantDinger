@@ -569,6 +569,7 @@ def _fetch_stock_daily(code: str, days: int) -> List[Dict[str, Any]]:
     items = d.get("data") or d.get("rows") or d.get("list") or []
     if isinstance(items, dict):
         items = items.get("data") or []
+    src = d.get("source") or "eastmoney"
     out = []
     for r in items:
         if not isinstance(r, dict):
@@ -581,7 +582,7 @@ def _fetch_stock_daily(code: str, days: int) -> List[Dict[str, Any]]:
             "large_net": _f(r.get("large_net")),
             "mid_net": _f(r.get("mid_net")),
             "small_net": _f(r.get("small_net")),
-            "source": "eastmoney",
+            "source": src,
             "approx": False,
         })
     return [r for r in out if r["trade_date"]]

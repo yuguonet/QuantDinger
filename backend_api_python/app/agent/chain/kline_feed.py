@@ -5,7 +5,7 @@
 项目约定：**重复调用代码段 2 处以上 ⇒ 生成统一接口**。K 线取数此前已有 3 处：
 
 1. `chain/evaluator._get_actual_return` —— 内联 `CNStockDataSource`，要 `t` 为**日期串**
-2. `skills/market_screener/common.py::fetch_kline` —— 技能侧
+2. `skills/market-screener/common.py::fetch_kline` —— 技能侧
 3. 本阶段 C3P 的 `p_base` —— 需要 `time` 为 **int 时间戳**
 
 ⇒ 本模块**同时给 `t`（`YYYY-MM-DD`）与 `time`（int 时间戳）两个键**，两个消费方都能吃。

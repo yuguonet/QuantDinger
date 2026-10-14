@@ -39,11 +39,11 @@
 ## B. 执行型技能无子 agent 分发通道（收尾：机制齐 + 验收测量器就绪）
 
 **现状**(2026-10-10 收尾）:
-- **机制三条已落地**:1 `run_skill(name, args)`(`tools/skill_tools.py`)--执行白名单 `skill_run.EXECUTABLE_SKILLS`(market_screener/strategy_debug)、子进程 600s 超时击杀、产物落 `<backend_api_python>/tmp/skill_output/`（2026-10-14 随 agent/tmp 移除迁址）、截断预览 + full_path 回传;2 `prompts/qd_system.txt` §重活分发（点名 run_skill、只回结论摘要、明细去文件看）;3 产物约定 → 上下文 O(摘要） 而非 O(全量）。smoke test_33 B2~5 锁住（白名单拦截/真实链路/分层归属/降级激活）。
+- **机制三条已落地**:1 `run_skill(name, args)`(`tools/skill_tools.py`)--执行白名单 `skill_run.EXECUTABLE_SKILLS`(market-screener/strategy-debug)、子进程 600s 超时击杀、产物落 `<backend_api_python>/tmp/skill_output/`（2026-10-14 随 agent/tmp 移除迁址）、截断预览 + full_path 回传;2 `prompts/qd_system.txt` §重活分发（点名 run_skill、只回结论摘要、明细去文件看）;3 产物约定 → 上下文 O(摘要） 而非 O(全量）。smoke test_33 B2~5 锁住（白名单拦截/真实链路/分层归属/降级激活）。
 - **验收测量器就绪**(2026-10-10):`scripts/qd_dispatch_ab.py`--分发 vs 不分发单变量对照（对照臂仅摘 `run_skill`,其余工具面全同）一键出数：成本比（tokens/步数/耗时）+ 质量差（与 C 同一把尺 qd_bench);判定：成本比 ≤ COST_MAX(默认 0.40)且质量降 ≤ 5;`--rejudge` 改阈值复核不必重跑;smoke test_37 锁判定数学与对照臂构造（9 项）。
 - **冗余切片已收**(2026-10-10):执行型技能（skill_run 白名单内）命中不再注方法论正文，改注**分发卡片**(何时派/怎么派/入口/结果读法，~280 字符）--正文既费 token 又诱导主对话硬跑（与 §重活分发抢方向盘）;`read_skill` 兜底保留。与渐进式加载的分工：**知识型注方法论（渐进式加载）,执行型注分发卡片（run_skill 派活）**,两层正交不冗余。smoke test_38 锁分叉（9 项）。
 
-**差距**(余下，2026-10-10 晚首跑出数）:成本比 **0.889 > 0.40 不达标**（质量Δ +0.5 ✓）——run_skill 被调用（trace 1849，52.5s 成功）但返回**空结果**（`analyzed: []`，盘后策略无候选）→ 模型读产物后回退主对话硬跑 6 个取数工具 → 只省 11%。方向:①prompt §重活分发补「技能空结果时接受结论或换策略重派，不回主对话硬跑」;②排查 market_screener 非交易日/盘后空筛（联动 eastmoney 断连）。
+**差距**(余下，2026-10-10 晚首跑出数）:成本比 **0.889 > 0.40 不达标**（质量Δ +0.5 ✓）——run_skill 被调用（trace 1849，52.5s 成功）但返回**空结果**（`analyzed: []`，盘后策略无候选）→ 模型读产物后回退主对话硬跑 6 个取数工具 → 只省 11%。方向:①prompt §重活分发补「技能空结果时接受结论或换策略重派，不回主对话硬跑」;②排查 market-screener 非交易日/盘后空筛（联动 eastmoney 断连）。
 **验收**:一次全市场筛选任务，主 agent 消耗 ≤ 无分发方案的 40%,结论质量不降 ⬜——
 首跑数据（screen_01, step-limit30, `dispatch_ab_20261010_210328.json`）:dispatch 163,980 tok/7步/314.6s/q86.7 vs inline 184,557 tok/7步/231.1s/q86.2 → 成本比 0.8885、质量Δ +0.5;`--rejudge` 可改阈值复核。测量器三坑已修（漏 `load_dotenv` 致"先跑臂必炸"假象、RetryError 报错文本误当答案打分、臂失败 verdict 假通过）。
 
@@ -106,7 +106,7 @@
 
 ## I. 超大技能 TL;DR 头部（内容工程）
 
-**现状**:渐进式加载（目录+首段+按需读路标）已上线;但 `auto_stock-analyze`(5.2k 字/6 节）等大技能仍靠截断出首段。
+**现状**:渐进式加载（目录+首段+按需读路标）已上线;但 `auto-stock-analyze`(5.2k 字/6 节）等大技能仍靠截断出首段。
 **差距**:截断点是字数不是语义，首段未必是最该看的（何时用/核心流程/硬约束）。
 **方案**:给每个 ≥3k 字的 SKILL.md 加 300~500 字 TL;DR 头部（何时用/三步主流程/三条硬约束）,`_skill_block` 优先注入 TL;DR+目录。**内容由技能作者写**(方法论取舍是业务判断，代码不猜）。
 **验收**:注入块 ≤1200 字符且覆盖"何时用/主流程/硬约束"三要素。

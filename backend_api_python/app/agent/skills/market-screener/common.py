@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-market_screener/common.py
+market-screener/common.py
 
 通用基础设施：数据加载、技术指标计算、涨停/跌停/炸板池、龙回头检测。
 三个策略（盘中/尾盘/盘后）共享此模块。
@@ -376,7 +376,7 @@ def _compact_json(d, max_depth=2, _depth=0):
 #  路径与环境
 # ═══════════════════════════════════════════════════════════════
 
-# ⚠ 层数必须数对：本文件在 app/agent/skills/market_screener/ 下，
+# ⚠ 层数必须数对：本文件在 app/agent/skills/market-screener/ 下，
 # 往上是 skills → agent → app → backend_api_python，即 **4 层** 才到 backend 根。
 # （2026-10-02 事故：曾写成 3 层 = 插成了 `app/`，于是 `import utils` 命中
 #  **app/utils** 而不是 app/agent/utils ⇒ 9 个 finance 工具模块的
@@ -448,7 +448,7 @@ def call_tool(name: str, **kwargs) -> Any:
     try:
         return fn(**kwargs)
     except Exception as e:
-        logger.warning("[market_screener] 工具 %s 调用失败: %s", name, e)
+        logger.warning("[market-screener] 工具 %s 调用失败: %s", name, e)
         return {"error": str(e)}
 # ═══════════════════════════════════════════════════════════════
 #  通用数据采集

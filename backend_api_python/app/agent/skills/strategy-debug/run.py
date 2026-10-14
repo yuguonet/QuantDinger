@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-strategy_debug/run.py — 策略调试工具面 (供 LLM 调用)
+strategy-debug/run.py — 策略调试工具面 (供 LLM 调用)
 
 定位 (2026-09-26): 把 auto/tools/why|debug|doctor 包成 agent skill 工具,
 让「600519 为啥不出信号」这类口语问题由 LLM 转调取证 + 人话解读。

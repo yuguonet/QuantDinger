@@ -20,7 +20,7 @@ import os as _os
 # 于是 `app.agent` 与裸名 `agent`、`app/agent/utils` 与 `app/utils` 都能各加载成
 # **两个 module 对象** —— 这正是事故 M-1（模块级单例双份、状态互不可见）与
 # D-13（同名目录 grep/IDE 易串）的共同成因。历史上还被别处的一次 insert 打翻过
-# （2026-10-02：`skills/market_screener/common.py` 误插 `app/` ⇒ 9 个 finance 工具
+# （2026-10-02：`skills/market-screener/common.py` 误插 `app/` ⇒ 9 个 finance 工具
 #  模块静默跳过，工具面 101→91 无人察觉）。
 #
 # ── 为什么删得掉（有效消费方 = 0）──

@@ -86,6 +86,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 | **领域中立** | 域走配置表 `qd_domain_resolvers`，代码里没有 `if domain == 'finance'` |
 | **先量化再决定** | 拿不准的先装观测计数器，不写自动调参逻辑 |
 | **规则不在代码里** | 决策规则外置（yaml / 参考文档），代码只做客观计算 |
+| **标准兼容** | Tool 完全兼容 **OpenAI Function Calling** 标准（JSON Schema 入参）；Skill 完全兼容 **Anthropic SKILL** 标准（`<目录>/SKILL.md` + frontmatter：**仅 `name`/`description` 置顶**，`version`/`tags`/`tools` 收进 `metadata`）。兼容性契约真源见 `skills/__init__.py`（2026-10-14 与 S3 对齐，旧文写 `name/version/description/tags/tools` 平铺为历史口径） |
 
 ### 1.3 四条关键取舍
 
@@ -220,9 +221,9 @@ backend_api_python/app/agent/
 │   │     消费方 1：chain/c3p.py::_c3p_pipeline（aggregate 的 coefs 实参）
 │   └── reset.py / schema.py / store.py / judge_stats.py / skill_brewer.py
 │
-├── skills/       [6 目录]  market_screener / strategy_debug(**含 run.py,可执行**)
-│                           + auto_stock-analyze / auto_finance-analysis-stock
-│                           / auto_finance-query-stock / auto_agent
+├── skills/       [6 目录]  market-screener / strategy-debug(**含 run.py,可执行**)
+│                           + auto-stock-analyze / auto-finance-analysis-stock
+│                           / auto-finance-query-stock / auto-agent
 ├── rag/          [6 py, 1230 行]  检索:BGE reranker + pgvector(PgVectorStore) + PG FTS + 聊天历史/关键词
 │     消费方 3:agent.py(_build_retriever 四路线 / _build_reranker)、tools/knowledge/knowledge_tools.py:62、utils/case_memory.py:200
 │     ⚠️ 消费方**全用相对 import**(`.rag.X`) —— 只扫绝对形式会漏成"零引用"
@@ -272,7 +273,10 @@ backend_api_python/app/agent/
 │     ⚠️ 注意区分两个不同东西：被删的是**旧自建 `llm/` 子包**（`LLMFactory` /
 │     `QDSkillAdapter` 那套）；现在的是**单文件 `llm.py`**（mimo models 驱动的
 │     `complete`/`acomplete`/`resolve_provider`/`LLMResponse`）。同名不同物。
-├── prompts/      [4 txt]  qd_core_base.txt(基座,~900字)/ qd_system.txt(金融纪律)/ skill_brew.txt / skill_revise.txt
+├── prompts/      提示词外置（2026-10-14 全量收口；loader=prompts/__init__.py）
+│                 qd_core_base.txt / qd_system.txt / skill_brew.txt
+│                 skill_revise.md / tool_preselect.yaml / wrapup_summary.md
+│                 evidence_extract.md / verdict_judge.md / skill_engineer.yaml / func_overlap.yaml
 ├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 257 项,2026-10-13 实测;旧记 256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
 │                                  qd_bench.py + yaml(25 题)/ qd_dispatch_ab.py / skill_run.py / weekly_panel.py
 └── traces/, data/, tmp/   辅助目录
@@ -406,9 +410,18 @@ backend_api_python/app/agent/
 **实测收益（重任务）**：`stock_screen` 153,960 tok / 6 步 → 43,318 / 2 步（**-72%**）；
 `trade_confirm` 100,150 / 6 步 → 34,976 / 2 步（**-65%**）。
 
+> ✅ **「已注入执行型技能时能否跳过预选」A/B 结论（2026-10-14，问题=现在买什么股）**：**不能跳**。
+> buy2（正常预选）4 步 / 64,159 tok / 200.9s / 4 次调用 ← 最优；
+> buy3（跳过**域**预选、保留能力层）7 步 / 133,726 tok / 313.2s / 9 次；
+> buy4（整段跳过预选）10 步 / 238,960 tok / 286.5s / 15 次（3×`search_tools` + `list_skills` + `read_skill` 的工具发现抖动）。
+> 预选这次 LLM 调用**必要**：它预先激活正确的域工具；跳过省下的 token 会以「工具发现抖动」加倍还回去。
+> 真正的收益来自 §3.4 的技能注入 bug 修复，与「跳预选」无关；实验分支代码已回退（净保留 `_canonical_skill_name` 修复与 `get_fund_flow_daily` 主备翻转）。
+
 **域兜底（不许落回裸工具面）**：`fallback_domain_tools(query, available, limit=4)`（纯词典、零 LLM）补核心子集 —— 「帮我看看大盘」→ market 补 4 个；「今天北京天气」「写个跑马灯」→ **0 个**（命中不了不硬塞）。
 
 ### 3.4 技能系统
+
+> 📌 **兼容性契约（对外承诺，变更需评审）**：**Tool 完全兼容 OpenAI Function Calling 标准**（JSON Schema 参数描述）；**Skill 完全兼容 Anthropic SKILL 标准**（`<目录>/SKILL.md` + frontmatter：仅 `name`/`description` 置顶，`version`/`tags`/`tools` 收进 `metadata`）。真源：`app/agent/skills/__init__.py` 头注；酿造提示词 `prompts/skill_brew.txt` + 修订模板 `chain/skill_brewer._REVISE_TEMPLATE`（须与 `skills_adapter._validate_frontmatter` 同口径）。
 
 | 环节 | 机制 |
 |---|---|
@@ -418,7 +431,7 @@ backend_api_python/app/agent/
 | **读** | `read_skill(name)` 全文 / `read_skill(name, heading=)` 小节 / `read_skill(name, resource=)` 资源 |
 | **执行** | `run_skill(name, arguments)` → 子进程 `scripts/skill_run.py`（仅执行型技能） |
 
-**执行型技能分发**（`market_screener` / `strategy_debug`）：
+**执行型技能分发**（`market-screener` / `strategy-debug`）：
 
 ```
 主 agent
@@ -434,13 +447,16 @@ backend_api_python/app/agent/
 三重收益：**超时可击杀**（600s）、**崩溃隔离**（不污染主进程）、**主上下文只拿摘要**（O(摘要) 而非 O(全量)）。
 
 > ⚠️ **技能名两个拼写，必须归一化**：
-> - **目录名**（下划线）= 执行注册表键：`skills/market_screener/` ⇔ `skill_run.EXECUTABLE_SKILLS["market_screener"]`。
+> - **目录名**（下划线）= 执行注册表键：`skills/market-screener/` ⇔ `skill_run.EXECUTABLE_SKILLS["market-screener"]`。
 > - **显示名**（连字符）= SKILL.md frontmatter `name: market-screener`，是 `list_skills()` / 注入给模型的那个名字。
 > - `read_skill` 能吃显示名；`run_skill` 必须归一化后再传 `skill_run.py`（那边是精确匹配）。
 > - 仍存在的隐患：**同一份上下文里两种拼写并存**，名字不一致本身就在诱导模型犹豫。
+> - ✅ **2026-10-14 已修（注入路径）**：`qd_service._prefetch` 曾用**显示名**去查 `_executable_skills()`（键是**目录名**）→ 恒 `None` → 落回正文注入分支，把整份 SKILL.md 正文灌进上下文，**分发卡片自 2026-10-10 起对所有执行型技能实际失效**。修复：新增 `_canonical_skill_name(skills, name)`（复用 adapter 的 display→name 映射 `skills.get(name).name`，取不到原样返回，fail-open），先归一化再查白名单。实测（现在买什么股）：注入 2529→407 字符，步数 9→4、元工具调用 6→0、token 290,065→64,159（**-78%**）、耗时 328.9s→200.9s。回归守卫 `tests/test_v6_d11_whitelist_knobs.py`（新增 4 项 `_canonical_skill_name` 断言）。
+> - ✅ **2026-10-14 解耦修复（技能卡片 ↔ 工具激活）**：执行型技能注入分发卡片点名的 `run_skill` 是**按需工具**（`QD_ON_DEMAND_TOOLS` 默认含它），而 §3.3 的预选看的是**剥掉注入后的用户原始问题**（`qd_preselect._preselect_query`）⇒ 看不到技能、不会点 `run_skill` ⇒ 模型实测要白花一轮 `search_tools` 才发现（trace step1）。兜底 ②（"预选目录由 `_on_demand_names` 构建"）在此场景**不成立**：目录里有名，但模型不知道有技能。修法：`_prefetch` 把卡片点名的工具写进 `report["skill_force_tools"]`（卡片分支与二次指针分支都写），service 挂到 `agent.prefetch_force_tools`，agent 在**预选之后、`tool_map` 渲染之前** `activate_tools`（放 `_activated` 尾部，避开 FIFO 先淘汰）。回归守卫 `tests/test_v6_d11_whitelist_knobs.py` §④（4 项）。
+> - ✅ **2026-10-14 实时覆盖层 + 非空结果纪律（`deep_analyze` bar/rt 对账）**：`run()`/`deep_analyze` 的 tech 只吃 `fetch_kline`（本地日线），盘后 bar 滞后时可执行性字段与真值打架（实测 600408：bar 3.69/+4.53%/非涨停 vs 实时 4.06/+10.03%/封板）。主 agent 闻到矛盾后自设计划「技术面+资金流+实时报价验证」逐只重拉 ⇒ **11 步 / 210k token / budget_wrapped**（对照 buy2 基线 4 步 / 64k）。修法两件：① `_helpers.fetch_rt_map` + `apply_rt_overlay` —— 历史指标（MA/RSI/20 日位）留 bar，可执行性字段（收盘/涨跌停）以 rt 为准，显式标 `stale_bar` / `rt` / `rt_risks`；② `qd_system.txt` §重活分发 + `_dispatch_card` 补**非空结果纪律**（证据齐 ⇒ 直接交付；禁止逐只重拉 quote/flow/tech；只允许 Top1–2 `inspect_stock` 或补明确 missing，合计 ≤2 轮）。守卫 `tests/test_v6_market_screener_rt.py`（4 项）+ `qd_smoke` test_38 ②c（2 项）。
 
 > ⚠️ **子进程「跑完退不出」陷阱 —— 600s 超时的真身不是流水线慢**：
-> - 现象：盘前 `run_skill(market_screener)` 恒定 `Error: skill_run 超时（>600s）已中止`，一度被读作「盘前全市场扫描比盘后慢 12 倍」。
+> - 现象：盘前 `run_skill(market-screener)` 恒定 `Error: skill_run 超时（>600s）已中止`，一度被读作「盘前全市场扫描比盘后慢 12 倍」。
 > - 实测：`run()` 本体只要 **51~58s**，随后**进程 10 分钟不退出**。真因：取大盘日线走 mootdx，`Quotes.factory(heartbeat=True)` 会起 `tdxpy.heartbeat.HeartBeatThread` —— **非 daemon**，主线程结束后 `threading._shutdown()` join 它 ⇒ 永不返回。
 > - 两道防线：① `app/utils/mootdx_client.py::_daemonize_heartbeat()` 把心跳线程设为 daemon（**根治**）；② `scripts/skill_run.py` 的 `__main__` 显式 `os._exit(_rc)`（止血）。
 > - 守卫：`tests/test_skill_run_exits.py`。修复后子进程 **43.6s 自行退出**。
@@ -450,7 +466,7 @@ backend_api_python/app/agent/
 > 📌 **与 mimo 原生子代理的关系（别混）**：`run_skill` 是**独立子进程**跑本项目自己的流水线；mimo 的 `task`/`actor` 是**同进程子循环**（共享 env/model）。两者**正交，不要互相替代**。
 
 > **白名单为什么留在代码里（2026-10-14 D-11 结论，别再当"硬编码"去搬）**：
-> `EXECUTABLE_SKILLS` 的取值是**模块路径 + 允许函数名 + 默认函数名**（`skills.market_screener.run` /
+> `EXECUTABLE_SKILLS` 的取值是**模块路径 + 允许函数名 + 默认函数名**（`skills.market-screener.run` /
 > `("run",)`），属**代码契约**而非"阈值/口径" ⇒ 塞进 env 只会更易错、且失去重构保护。
 > `qd_service._executable_skills()` 把它当**单一真源**读取（2026-10-14 起改为包内相对导入，
 > 不再按文件路径加载），另见 D-11 关于元工具名单 `QD_META_TOOLS` 的下沉。
@@ -658,7 +674,7 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 ```
 用户:"全市场扫一遍"
   → 主 agent 读 system「重活分发」纪律(或预选激活)
-  → run_skill(name="market_screener")
+  → run_skill(name="market-screener")
        └ 子进程 skill_run.py → 白名单校验 → 执行 → 产物落盘
   → 回传预览 + full_path
   → 主 agent 引用预览写结论,明细留在文件里(不搬进上下文)
@@ -708,7 +724,7 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 |---|---|
 | ✅ **（P5 已根治）`app/agent` 必须排在 `app/` 之前** | 旧世界：裸名 `import utils` 会命中 `app/utils`（23 个裸名全错位），故有 `ensure_path_order()` 保序。**现况**：裸名 import 与 `ensure_path_order()` 均已随 P5 删除，**无需再管 sys.path 顺序** |
 | ✅ **（P5 已根治）`chain.X` 与 `app.agent.chain.X` 双模块实例** | 旧世界：`app/agent` 被单独加进 `sys.path` ⇒ 两套路径各有一份模块、模块级常量互相独立，测试须 patch 两条路径。**现况**：单一 `app.agent.*`，只 patch 一条 |
-| ⚠️ **`skills/market_screener/common.py` 的路径层级** | 曾按"..×3"算成 3 层，实为 4 层 ⇒ 把 `app/` 插到 sys.path[0] ⇒ 9 个 finance 工具静默挂掉，而**能力层补位把缺口掩盖了**。改包内路径时仍按实数层级核 |
+| ⚠️ **`skills/market-screener/common.py` 的路径层级** | 曾按"..×3"算成 3 层，实为 4 层 ⇒ 把 `app/` 插到 sys.path[0] ⇒ 9 个 finance 工具静默挂掉，而**能力层补位把缺口掩盖了**。改包内路径时仍按实数层级核 |
 | ⚠️ **`cron_worker` 不是顶层名** | 必须写全 `from app.agent.cron.cron_worker import start_cron_worker`（`app/__init__.py` 即此写法）。裸名 `cron_worker` 根本不存在 ⇒ ImportError 被吞 ⇒ 定时任务从未启动 |
 | ⚠️ **判定"是否真执行"查标志位** | 别靠日志（logger propagate 不可靠），查 `_worker_started` 这类状态标志 |
 | ⚠️ **`python -m` 跑 smoke 会误报** | `-m` 会先导入 `app.agent.scripts` 包，留下长名键 ⇒ test_29 判"无 `app.agent.*` 长名键"失败。必须 `python app/agent/scripts/qd_smoke.py` |
@@ -1558,7 +1574,7 @@ N=500 时目录本身 36.7k 字符、占预选输入 99% —— 这确实是个�
 | F | 参数精调 | ⬜ | 5 参数无扫描 |
 | G | 胜率反哺 → 排序权重 | ✅ | 乘子化 + smoke 五断言，冷启动 bit 级一致 |
 | H | 成本/时延 SLO | 🟨 | token/工具/累计步数三线已接线；**日配额仍未接线** |
-| I | 超大技能 TL;DR 头部 | 🟨 | market_screener 有、strategy_debug 部分、auto_* 四个未写 |
+| I | 超大技能 TL;DR 头部 | 🟨 | market-screener 有、strategy-debug 部分、auto-* 四个未写 |
 | J | 发布工程收尾 | ✅ | `--with-env` 落地；入库两项裁定不做 |
 | K | 工具预选可学习 | 🟨 | 机制落地、冷启动一致；真实召回 ≥95% 待跑批 |
 | L | 备选路线 B（MiMo-Code 大脑） | 🟨 | 存档未采纳，重启条件见附录 B.3 |
@@ -1947,7 +1963,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 |---|---|---|
 | **E-1** | P0-3 判定取价 **已修**（2026-10-13），而 v5 §14 P0-3 / §16 G21 仍写「未做」 | §21.2 + 附录 D G21 已改 ✅；O-3 降级为「加固」 |
 | **E-2** | `sample_layer` 分层记账已落代码，且 `context_frame` 已实测出 `regime=down / theme_heat=cold / vol_bucket=low` 三值齐备 | §21.3 已写明；§14.1 维度表按实测值对齐 |
-| **E-3** | `predict_next_day` 在 `market_screener` 里**已经在用**（设计只说「P2 要复用它」） | §21.2 A-5 标注为「旁路有、主链无」，并把 O-5 的接线路径指向它 |
+| **E-3** | `predict_next_day` 在 `market-screener` 里**已经在用**（设计只说「P2 要复用它」） | §21.2 A-5 标注为「旁路有、主链无」，并把 O-5 的接线路径指向它 |
 | **E-4** | `weight_feed` 的 SQL `IN` 列表坑已被注释固化（只改 `_VERDICT_SCORE` 不够） | 附录 F C-2 记录，防回退 |
 
 ### F.3 一张图看懂当前接线状态
@@ -1976,5 +1992,5 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 
 **复核说明（2026-10-13 晚）**：初核时 A 组 5 条「未接线」中有 4 条在 P2 接线后转为「已接线」；
 `chain/kline_feed.py` 是本次为收敛「K 线取数」第 3 处重复而新建的统一接口
-（另两处：`evaluator._get_actual_return` 内联、`skills/market_screener/common.py::fetch_kline`）。
+（另两处：`evaluator._get_actual_return` 内联、`skills/market-screener/common.py::fetch_kline`）。
 `evaluator` 的迁移**未在本批做**（它刚在 P0-3 修过、有守卫在守，动它风险大于收益），记为遗留项。

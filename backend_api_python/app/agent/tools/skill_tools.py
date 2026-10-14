@@ -4,7 +4,7 @@
 旧核心用 _SkillSectionTool/_SkillResourceTool/_SkillFuncTool（smolagents 载体）把技能
 喂给模型；mimoagent 范式下技能走统一函数工具通道，语义不变：
   目录 → list_skills；正文/小节/资源 → read_skill。
-技能的 run.py 类执行入口（market_screener 等）由任务方按需直接调用，暂不入工具面。
+技能的 run.py 类执行入口（market-screener 等）由任务方按需直接调用，暂不入工具面。
 """
 from __future__ import annotations
 
@@ -75,13 +75,13 @@ _SKILL_RUN_TIMEOUT = 600   # 秒；流水线上限，超时击杀子进程
 
 
 def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
-    """执行执行型技能流水线（market_screener / strategy_debug），返回结论预览。
+    """执行执行型技能流水线（market-screener / strategy-debug），返回结论预览。
 
     批量任务（全市场扫描、策略诊断等）用本工具，不要在主对话里逐步跑取数；
     结果很大时引用返回的 full_path，不要把明细全量贴进对话。
 
     Args:
-        name: 技能名（market_screener / strategy_debug）
+        name: 技能名（market-screener / strategy-debug）
         arguments: JSON 字符串，可含 fn（调用哪个入口，默认 run/debug_strategy）
                    与 kwargs（传给入口的参数）；无参可传空
 
@@ -95,9 +95,9 @@ def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
 
     # 名称归一化（2026-10-12）：SKILL.md frontmatter 的 name 用连字符
     # （market-screener / strategy-debug），而 skill_run.py 的执行注册表键是**目录名**
-    # 下划线（market_screener / strategy_debug），且那边是精确匹配、不做归一化。
+    # 下划线（market-screener / strategy-debug），且那边是精确匹配、不做归一化。
     # 模型从 list_skills() / [相关技能：xxx] 拿到的是**显示名**，不经归一化直达子进程
-    # 会恒定返回「未知技能。可执行: ['market_screener', 'strategy_debug']」。
+    # 会恒定返回「未知技能。可执行: ['market-screener', 'strategy-debug']」。
     # 注册表是唯一事实源（QDSkillAdapter.get 已有 display_name → 目录名映射），
     # 这里复用它，不再另写一份字符串替换。
     try:

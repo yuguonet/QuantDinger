@@ -66,7 +66,7 @@ def _live_servers() -> list:
 def _daemonize_heartbeat() -> None:
     """把 TDX 客户端的心跳线程设为 daemon（2026-10-12 实测修复，见 tmp/_screener_hang.py）
 
-    现象：run_skill(market_screener) 恒定 600s 超时，但流水线本体只要 ~55s。
+    现象：run_skill(market-screener) 恒定 600s 超时，但流水线本体只要 ~55s。
     真因：`Quotes.factory(heartbeat=True)` 会起一条 tdxpy.heartbeat.HeartBeatThread，
     它是**非 daemon** 线程（10s 周期 stop_event.wait() 无限循环，只有 disconnect
     才停）。主线程结束后 threading._shutdown() 会 join 它 ⇒ 永不返回 ⇒

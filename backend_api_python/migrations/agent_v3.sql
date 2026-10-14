@@ -118,7 +118,7 @@ INSERT INTO qd_skill_weights (skill_name, weight) VALUES
 ('researcher',        1.0),
 ('trading_agent',      1.0),
 ('data_agent',         0.8),
-('market_screener',    1.0),
+('market-screener',   1.0),
 ('bb_screener',        1.0);
 
 

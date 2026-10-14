@@ -123,6 +123,69 @@ def _parse_skill_md(content: str) -> tuple:
     return meta, body
 
 
+# ── Anthropic Agent Skills 规范：字段读取 + 轻量校验（S3/S4，2026-10-14）──
+# 规范定义 frontmatter 必填 name/description，其余自定义字段一律收进
+# `metadata:`（map<string,string>）。历史技能把 version/tags/tools/priority 写在
+# 顶层（非标准），故读取时**优先 metadata、回落顶层**，兼容存量文件。
+_LEGACY_TOPLEVEL_FIELDS = ("version", "tags", "tools", "priority")
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _meta_field(meta: dict, key: str, default: Any) -> Any:
+    """优先取 `metadata.<key>`（规范位置），回落顶层同名键（legacy）。"""
+    block = meta.get("metadata") if isinstance(meta, dict) else None
+    if isinstance(block, dict) and block.get(key) not in (None, ""):
+        return block[key]
+    if isinstance(meta, dict) and meta.get(key) not in (None, ""):
+        return meta[key]
+    return default
+
+
+def _as_str_list(value: Any) -> List[str]:
+    """归一化列表字段：规范里 metadata 值是字符串（逗号分隔），legacy 是 YAML 列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [p.strip() for p in re.split(r"[,，]", str(value)) if p.strip()]
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _validate_frontmatter(meta: dict, dir_name: str) -> List[str]:
+    """SKILL.md frontmatter 的轻量规范校验（S4）。fail-open：返回告警列表，不抛错。
+
+    ⚠ 只告警不阻断——历史技能存在 name≠目录名（market-screener）与目录含下划线
+    （auto_*）的已知偏差，收严成"拒装"会让整个适配器罢工。
+    """
+    issues: List[str] = []
+    name = meta.get("name")
+    if not name:
+        issues.append("缺少 name（规范必填）")
+    else:
+        name = str(name)
+        if len(name) > 64:
+            issues.append(f"name 超长 {len(name)}>64")
+        if not _SKILL_NAME_RE.match(name):
+            issues.append(f"name 含非法字符（规范仅小写字母/数字/连字符）: {name!r}")
+        if name != dir_name:
+            issues.append(f"name 与目录名不一致: {name!r} != {dir_name!r}")
+    desc = meta.get("description")
+    if not desc:
+        issues.append("缺少 description（规范必填）")
+    elif len(str(desc)) > 1024:
+        issues.append(f"description 超长 {len(str(desc))}>1024")
+    legacy = [k for k in _LEGACY_TOPLEVEL_FIELDS if k in meta]
+    if legacy:
+        issues.append(f"非标准顶层字段（应移入 metadata）: {legacy}")
+    return issues
+
+
 def _split_sections(body: str) -> List[SkillSection]:
     """按 ## 标题切分 SKILL.md body 为多个段落。"""
     sections: List[SkillSection] = []
@@ -163,6 +226,7 @@ class QDSkillAdapter:
         self._skills: Dict[str, SkillInfo] = {}
         self._display_to_name: Dict[str, str] = {}
         self._docs: Dict[str, SkillDocument] = {}  # SkillDocument 缓存
+        self._skill_issues: Dict[str, List[str]] = {}  # SKILL.md 规范校验告警（S4）
         dirs = skills_dirs or self._default_dirs()
         for d in dirs:
             self._scan_python(d)
@@ -175,6 +239,9 @@ class QDSkillAdapter:
         #   数字，排查时会误判成"技能没装载全"。
         logger.info("[QDSkills] 技能装载完成: 共 %d 个（Python 阶段 %d + SKILL.md 阶段 %d）",
                     len(self._skills), n_py, len(self._skills) - n_py)
+        # S4：Anthropic Agent Skills 规范的轻量校验——fail-open，仅 WARN 不阻断装载。
+        for nm, issues in sorted(self._skill_issues.items()):
+            logger.warning("[QDSkills] SKILL.md 规范校验告警 %s: %s", nm, "; ".join(issues))
 
     @staticmethod
     def _default_dirs() -> List[str]:
@@ -209,15 +276,18 @@ class QDSkillAdapter:
                 name=skill_dir.name,
                 display_name=display_name,
                 description=meta.get("description", ""),
-                tags=meta.get("tags", []),
-                priority=meta.get("priority", 5),
-                tools=meta.get("tools", []),
+                tags=_as_str_list(_meta_field(meta, "tags", [])),
+                priority=_as_int(_meta_field(meta, "priority", 5), 5),
+                tools=_as_str_list(_meta_field(meta, "tools", [])),
                 body=body,
                 dir_path=str(skill_dir),
                 skill_type="markdown",
             )
             self._skills[info.name] = info
             self._display_to_name[display_name] = info.name
+            issues = _validate_frontmatter(meta, skill_dir.name)
+            if issues:
+                self._skill_issues[info.name] = issues
 
     def _scan_python(self, skills_dir: str):
         """扫描 Python 类技能（继承 Skill 基类）。"""
@@ -264,7 +334,7 @@ class QDSkillAdapter:
                 self._skills[info.name] = info
                 self._display_to_name[name] = info.name
 
-        # 也扫描子目录（如 market_screener）
+        # 也扫描子目录（如 market-screener）
         for sub_dir in sorted(base.iterdir()):
             if not sub_dir.is_dir() or sub_dir.name.startswith("_"):
                 continue

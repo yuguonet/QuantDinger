@@ -1,0 +1,9 @@
+# 能力层 vs 域工具 功能重叠判定（user 模板，str.format：pairs）
+# 由 capabilities/func_overlap.llm_judge_pairs 使用
+# ⚠ 字面花括号必须写 {{ }}，否则 .format 会当占位符
+judge_pairs: |
+  判断下列「能力函数」与「域工具」是否功能等价（做同一件事/同一数据）。
+  只输出 JSON 数组，每项 {{"i": 序号, "same": true|false}}。
+  把握不大一律 false。
+
+  {pairs}

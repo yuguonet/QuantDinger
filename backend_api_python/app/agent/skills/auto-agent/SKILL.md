@@ -1,23 +1,13 @@
 ---
-name: auto_agent
-version: 0.1.0
+name: auto-agent
 description: 股票多维度资本面尽调流水线——一次性拉取 K线走势、筹码分布、融资融券/大宗交易摘要、主力/超大单资金流向，用于个股或批量股票的复盘、调研、资金面画像。当用户表述类似"分析/复盘/调研/梳理/拆解XX股票"、"XX资金面怎么样"、"看一下XX筹码结构"、"XX主力流向"时优先匹配本技能。
-tags:
-  - stock-analysis
-  - kline
-  - chip-distribution
-  - fund-flow
-  - capital-summary
-  - multi-dimensional-analysis
-tools:
-  - activate_tools
-  - agent_get_kline
-  - get_chip_distribution
-  - get_capital_summary
-  - get_fund_flow
+metadata:
+  version: 0.1.0
+  tags: stock-analysis, kline, chip-distribution, fund-flow, capital-summary, multi-dimensional-analysis
+  tools: activate_tools, agent_get_kline, get_chip_distribution, get_capital_summary, get_fund_flow
 ---
-<!-- auto-brewed 2026-10-09 from root_id=398 chain=agent | human-edited 后请去除 auto_ 前缀接管 -->
-# 股票多维度资本面尽调（auto_agent）
+<!-- auto-brewed 2026-10-09 from root_id=398 chain=agent | human-edited 后请去除 auto- 前缀接管 -->
+# 股票多维度资本面尽调（auto-agent）
 
 ## 使用场景
 

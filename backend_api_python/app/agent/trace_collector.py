@@ -20,7 +20,7 @@ TraceCollector — Agent 执行追踪器（mimo 新系统的决策树写入侧�
 
 树形结构（skill 是 tool 的容器，tool 不包含 skill）：
   chain (根)
-  ├── skill: market_screener
+  ├── skill: market-screener
   │   ├── tool: search_stocks
   │   └── tool: get_realtime_quote
   ├── skill: stock_analysis

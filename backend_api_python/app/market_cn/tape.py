@@ -10,7 +10,8 @@
 数据源:
   五档行情:  mootdx(TCP) → 腾讯财经(HTTP)
   分笔数据:  mootdx(TCP) — 仅此一个源
-  资金流向:  本地快照派生(主) → 新浪日级(2026-09-22 主备翻转) → 东财 push2(末级兜底,熔断)
+  资金流向:  分钟级 本地快照派生(主) → 新浪日级(2026-09-22 主备翻转) → 东财 push2(末级兜底,熔断)
+             日级   新浪(2026-10-14 主备翻转) → 东财 push2his(兜底,熔断)
 
 依赖: pip install mootdx
 """
@@ -996,6 +997,33 @@ _push2_blocked_until = 0.0
 _PUSH2_BLOCK_SECONDS = 600
 
 
+def _sina_moneyflow_rows(code: str, num: int) -> Optional[List[Dict[str, Any]]]:
+    """新浪日级资金流原始行（num 条，opendate 降序）。失败/空返回 None。
+
+    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
+    字段: opendate(日期), netamount(主力净流入,元), r0_net(超大单净额,元),
+          turnover(成交额)。
+    ⚠ 新浪该接口仅提供「主力净流入 + 超大单」两档，无大/中/小单拆分。
+    抽成单函数供分钟级(_fund_flow_sina)与日级(_fund_flow_sina_daily)共用，
+    避免 URL/参数/headers 两处漂移。
+    """
+    import requests
+    code_num = code.split(".")[0]
+    daima = ("sh" if code_num.startswith("6") else "sz") + code_num
+    url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+           "json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs")
+    params = {"page": 1, "num": max(1, int(num)), "sort": "opendate",
+              "asc": 0, "daima": daima}
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json()
+        return d if isinstance(d, list) and d else None
+    except Exception as e:
+        logger.debug("[sina] 资金流行获取失败(%s): %s", code, e)
+        return None
+
+
 def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
     """当日个股资金流向（新浪日级，主源，无反爬）。
 
@@ -1008,37 +1036,70 @@ def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
              mid_net, large_net, super_net}]}（近似映射，小/中单为 0）
         失败: None（不抛异常，交给下级兜底）
     """
-    import requests
-    code_num = code.split(".")[0]
-    daima = ("sh" if code_num.startswith("6") else "sz") + code_num
-    url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
-           "json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs")
-    params = {"page": 1, "num": 1, "sort": "opendate", "asc": 0, "daima": daima}
-    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
-        if not isinstance(d, list) or not d:
-            return None
-        row = d[0]
-        t = row.get("opendate", "") or ""
-        main_net = _safe_float(row.get("netamount"))
-        return {
-            "code": code,
-            "points": 1,
-            "total_main_net": round(main_net, 2),
-            "data": [{
-                "time": t,
-                "main_net": main_net,
-                "small_net": 0.0,
-                "mid_net": 0.0,
-                "large_net": _safe_float(row.get("r0_net")),
-                "super_net": 0.0,
-            }],
-        }
-    except Exception as e:
-        logger.debug("[sina] 个股资金流向失败(%s): %s", code, e)
+    d = _sina_moneyflow_rows(code, 1)
+    if not d:
         return None
+    row = d[0]
+    t = row.get("opendate", "") or ""
+    main_net = _safe_float(row.get("netamount"))
+    return {
+        "code": code,
+        "points": 1,
+        "total_main_net": round(main_net, 2),
+        "data": [{
+            "time": t,
+            "main_net": main_net,
+            "small_net": 0.0,
+            "mid_net": 0.0,
+            # 新浪 r0_net = 超大单净额；本文件既有约定（同 _fund_flow_sina 旧实现）
+            # 放在 large_net 槽位，日级路径保持一致，勿单改一侧。
+            "large_net": _safe_float(row.get("r0_net")),
+            "super_net": 0.0,
+        }],
+    }
+
+
+def _fund_flow_sina_daily(code: str, days: int = 120) -> Optional[Dict[str, Any]]:
+    """近 N 日日级资金流（新浪，主外部源，无反爬）。失败返回 None。
+
+    与分钟级同源（ssl_qsfx_zjlrqs 的 num=N 即返回 N 个交易日），因此日级历史
+    无需依赖东财 push2his。字段映射见 _sina_moneyflow_rows 说明。
+
+    Returns:
+        {code, total_days, recent_5d_main_net, recent_20d_main_net,
+         data:[{date, main_net, small_net, mid_net, large_net, super_net}]（升序）,
+         source:"sina"}
+        失败: None（不抛异常，交给东财兜底）
+    """
+    raw = _sina_moneyflow_rows(code, days)
+    if not raw:
+        return None
+    rows: List[Dict[str, Any]] = []
+    for row in raw:
+        dt = str(row.get("opendate", "") or "")
+        if not dt:
+            continue
+        rows.append({
+            "date": dt,
+            "main_net": _safe_float(row.get("netamount")),
+            "small_net": 0.0,
+            "mid_net": 0.0,
+            "large_net": _safe_float(row.get("r0_net")),  # 见 _fund_flow_sina 约定
+            "super_net": 0.0,
+        })
+    if not rows:
+        return None
+    rows.sort(key=lambda x: x["date"])  # 升序（旧→新），与东财口径一致
+    recent_5 = rows[-5:] if len(rows) >= 5 else rows
+    recent_20 = rows[-20:] if len(rows) >= 20 else rows
+    return {
+        "code": code,
+        "total_days": len(rows),
+        "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
+        "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
+        "data": rows,
+        "source": "sina",
+    }
 
 
 def _mark_push2_blocked() -> None:
@@ -1106,43 +1167,16 @@ def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
         return {"code": code, "error": str(e)}
 
 
-def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
-    """获取近 N 日日级资金流向（东财 push2his API）
+def _fund_flow_eastmoney_daily(code: str, days: int) -> Dict[str, Any]:
+    """近 N 日日级资金流（东财 push2his，兜底路径，熔断保护）。
 
-    数据来源: 东方财富数据中心（历史数据）
-    接口: push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
-
-    用途:
-      - 分析近 120 日的主力资金趋势
-      - 判断机构是在持续建仓还是减仓
-      - 配合股价走势做资金面分析
-
-    Args:
-        code: 股票代码，如 "600519"
-        days: 获取天数，默认 120（约半年交易日）
-
-    Returns:
-        成功: {
-            code: "600519",
-            total_days: 120,           # 实际返回天数
-            recent_20d_main_net: 5e8,  # 最近20日主力累计净流入（元）
-            data: [{
-                date: "2025-01-15",
-                main_net: 12345678.90,
-                small_net: -5000000.00,
-                mid_net: 2000000.00,
-                large_net: 8000000.00,
-                super_net: 4345678.90,
-            }, ...]
-        }
-        失败: {code, error: "..."}
-
-    Example:
-        >>> flow = get_fund_flow_daily("600519", 60)
-        >>> recent = flow["data"][-5:]  # 最近5天
-        >>> for day in recent:
-        ...     print(f"{day['date']}: 主力净流入 {day['main_net']/10000:.0f}万")
+    2026-10-14 收口：push2his 会对连续请求的 IP 掐连接（实证 002866:
+    RemoteDisconnected），故降为兜底并复用 push2 熔断
+    （_push2_allowed/_mark_push2_blocked），与分钟级 _fund_flow_eastmoney 同款。
     """
+    if not _push2_allowed():
+        logger.warning("[eastmoney] 日级资金流: push2 熔断期内，跳过东财(%s)", code)
+        return {"code": code, "error": "push2 blocked (circuit breaker)"}
     import requests
 
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
@@ -1181,7 +1215,62 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
             "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
             "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
             "data": rows,
+            "source": "eastmoney",
         }
     except Exception as e:
-        logger.warning("[eastmoney] 日级资金流失败(%s): %s", code, e)
+        _mark_push2_blocked()
+        logger.warning("[eastmoney] 日级资金流失败(%s): %s — 触发 push2 熔断", code, e)
         return {"code": code, "error": str(e)}
+
+
+def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
+    """获取近 N 日日级资金流向。
+
+    数据源优先级（2026-10-14 主备翻转，对齐实时资金流）：
+      1. **新浪日级**（ssl_qsfx_zjlrqs，num=N，无反爬）—— 主外部源；
+      2. 东财 push2his 远程 —— 兜底（熔断期内自动跳过，不反复打扰反爬源）。
+    历史背景：原实现只挂东财 push2his，该源会对连续请求的 IP 掐连接
+    （RemoteDisconnected），导致 002866 等日线维度整体取数失败。
+
+    用途:
+      - 分析近 120 日的主力资金趋势
+      - 判断机构是在持续建仓还是减仓
+      - 配合股价走势做资金面分析
+
+    Args:
+        code: 股票代码，如 "600519"
+        days: 获取天数，默认 120（约半年交易日）
+
+    Returns:
+        成功: {
+            code: "600519",
+            total_days: 120,           # 实际返回天数
+            recent_20d_main_net: 5e8,  # 最近20日主力累计净流入（元）
+            data: [{
+                date: "2025-01-15",
+                main_net: 12345678.90,
+                small_net: -5000000.00,
+                mid_net: 2000000.00,
+                large_net: 8000000.00,
+                super_net: 4345678.90,
+            }, ...],
+            source: "sina" | "eastmoney",
+        }
+        失败: {code, error: "..."}
+
+    ⚠ 新浪主源仅提供 主力净流入 + 超大单（映射到 large_net 槽位，见
+      _fund_flow_sina 约定），大/中/小单为 0；完整拆分需东财可用。
+
+    Example:
+        >>> flow = get_fund_flow_daily("600519", 60)
+        >>> recent = flow["data"][-5:]  # 最近5天
+        >>> for day in recent:
+        ...     print(f"{day['date']}: 主力净流入 {day['main_net']/10000:.0f}万")
+    """
+    # 1) 新浪主源（无反爬，2026-10-14 主备翻转）
+    sina = _fund_flow_sina_daily(code, days)
+    if sina:
+        return sina
+
+    # 2) 东财 push2his 兜底（熔断期内自动跳过）
+    return _fund_flow_eastmoney_daily(code, days)

@@ -118,11 +118,10 @@ def llm_judge_pairs(unsure: List[Tuple[Dict, Dict]]) -> Dict[str, str]:
             f"{i}. capability `{c['name']}` doc={c.get('doc','')[:80]!r} "
             f"vs tool `{t['name']}` doc={t.get('doc','')[:80]!r}"
         )
-    prompt = (
-        "判断下列「能力函数」与「域工具」是否功能等价（做同一件事/同一数据）。\n"
-        "只输出 JSON 数组，每项 {\"i\": 序号, \"same\": true|false}。\n"
-        "把握不大一律 false。\n\n" + "\n".join(lines)
-    )
+    # 2026-10-14 外置 prompts/func_overlap.yaml
+    from ..prompts import load_prompt_doc as _load_prompt_doc
+    prompt = _load_prompt_doc("func_overlap")["judge_pairs"].format(
+        pairs="\n".join(lines))
     try:
         from app.agent.llm import complete
         resp = complete([{"role": "user", "content": prompt}])

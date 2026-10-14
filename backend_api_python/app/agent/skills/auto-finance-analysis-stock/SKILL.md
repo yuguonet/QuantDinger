@@ -1,11 +1,12 @@
-<!-- auto-brewed 2026-09-21 from root_id=2540 chain=finance+analysis+stock | human-edited 后请去除 auto_ 前缀接管 -->
 ---
-name: auto_finance-analysis-stock
-version: 0.1.0
+name: auto-finance-analysis-stock
 description: 对单只A股标的开展T+1/T+3/1W/1M多周期技术面、资金面、基本面综合诊断，输出短期走势参考结论。适用于用户要求"分析/诊断/解读某只股票"、"看下<目标代码>怎么样"、"<目标名称>短期走势如何"、"XX标的近期该关注什么"等场景。
-tags: [finance, stock, A股, 多周期分析, 技术面, 资金面, 基本面, 综合诊断]
-tools: [agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info, get_capital_summary, get_fund_flow, get_chip_distribution]
+metadata:
+  version: 0.1.0
+  tags: finance, stock, A股, 多周期分析, 技术面, 资金面, 基本面, 综合诊断
+  tools: agent_get_kline, technical_analysis, get_realtime_quote, get_stock_info, get_capital_summary, get_fund_flow, get_chip_distribution
 ---
+<!-- auto-brewed 2026-09-21 from root_id=2540 chain=finance+analysis+stock | human-edited 后请去除 auto- 前缀接管 -->
 
 # 单只A股多周期综合诊断
 

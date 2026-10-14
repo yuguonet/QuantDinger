@@ -1044,7 +1044,7 @@ CREATE INDEX IF NOT EXISTS exp_cit_dec   ON exp_claim_citations (decision_id);
 | F 参数精调（单变量扫描） | **丢弃，被测量场 A/B 取代** | 扫描是拍脑袋参数的补救；有 A/B 直接出 diff，不必单开流程 |
 | G 权重乘子（`_rank_skills`） | **保留**（聚合级信号） | 与经验 digest 分工（§14.4），不重复计权 |
 | H 成本 SLO（`utils/budget.py`） | **保留 + 接线**（唯一的欠账） | 机制三线齐备但零消费方；接进 `qd_agent._run_inner` 后经验检索 / digest 一并吃预算 |
-| I 技能 TL;DR | **保留**（内容活） | 渐进式加载的一部分；auto_* 四个待写 |
+| I 技能 TL;DR | **保留**（内容活） | 渐进式加载的一部分；auto-* 四个待写 |
 | J 发布工程（smoke 248 + `--with-env`） | **保留** | 回归底线；v3 新组件必须同步补 smoke |
 | K 可学习预选（preselect_cooc） | **保留**（工具面，与经验库正交） | 两者都是「历史影响选择」，计权口径要分开 |
 | L MiMo-Code 路线 B | **保留存档** | v3 的 mimoagent blackbox 就是它的接入点，条件触发 |

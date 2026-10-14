@@ -6,7 +6,7 @@ market_screener 独立调试 & 回测工具
   用途
 ═══════════════════════════════════════════════════════════════════
 
-  对 backend_api_python/app/agent/skills/market_screener/ 进行:
+  对 backend_api_python/app/agent/skills/market-screener/ 进行:
   1. 独立调试 — 不启动 Flask/smolagents，直接调用 skill 内部函数
   2. 策略回测 — 对筛选结果做 T+N 回测，验证选股质量
   3. 分策略测试 — 单独测试 early/intraday/eod/post_market
@@ -77,22 +77,32 @@ def _import_screener():
     if "run" in _screener_cache:
         return _screener_cache
     try:
-        from skills.market_screener import run as screener_run
-        from skills.market_screener.common import (
-            SkillReport, SkillResult, FactorItem,
-            fetch_kline, compute_ma, compute_rsi, compute_macd,
-            compute_volume_ratio, compute_kdj, compute_atr,
-            scan_dragon_pullback, fetch_zt_pool, fetch_dt_pool,
-            fetch_broken_board, fetch_hot_sectors, fetch_hot_stocks_with_reason,
-            get_limit_pct, is_limit_locked, _get_writer, _get_basic_db,
-        )
-        from skills.market_screener._helpers import (
-            select_strategy, analyze_batch, build_report, resolve_names,
-            filter_candidates,
-        )
-        from skills.market_screener.run import (
-            pre_screen, deep_analyze, run,
-        )
+        # ⚠ 技能目录按 Anthropic 规范 kebab 化（market-screener）——连字符名
+        #   不能写进 `from x import y`，只能走 importlib 字符串导入（与
+        #   backend_api_python/app/agent/scripts/skill_run.py 同款）。
+        import importlib
+        screener_run = importlib.import_module("app.agent.skills.market-screener.run")
+        _common = importlib.import_module("app.agent.skills.market-screener.common")
+        _helpers = importlib.import_module("app.agent.skills.market-screener._helpers")
+        (SkillReport, SkillResult, FactorItem) = (
+            _common.SkillReport, _common.SkillResult, _common.FactorItem)
+        (fetch_kline, compute_ma, compute_rsi, compute_macd,
+         compute_volume_ratio, compute_kdj, compute_atr,
+         scan_dragon_pullback, fetch_zt_pool, fetch_dt_pool,
+         fetch_broken_board, fetch_hot_sectors, fetch_hot_stocks_with_reason,
+         get_limit_pct, is_limit_locked, _get_writer, _get_basic_db) = (
+            _common.fetch_kline, _common.compute_ma, _common.compute_rsi,
+            _common.compute_macd, _common.compute_volume_ratio, _common.compute_kdj,
+            _common.compute_atr, _common.scan_dragon_pullback, _common.fetch_zt_pool,
+            _common.fetch_dt_pool, _common.fetch_broken_board, _common.fetch_hot_sectors,
+            _common.fetch_hot_stocks_with_reason, _common.get_limit_pct,
+            _common.is_limit_locked, _common._get_writer, _common._get_basic_db)
+        (select_strategy, analyze_batch, build_report, resolve_names,
+         filter_candidates) = (
+            _helpers.select_strategy, _helpers.analyze_batch, _helpers.build_report,
+            _helpers.resolve_names, _helpers.filter_candidates)
+        (pre_screen, deep_analyze, run) = (
+            screener_run.pre_screen, screener_run.deep_analyze, screener_run.run)
         _screener_cache.update({
             "run_module": screener_run,
             "SkillReport": SkillReport, "SkillResult": SkillResult, "FactorItem": FactorItem,

@@ -54,7 +54,7 @@ from .audit.trace_adapter import TraceAdapter
 
 # ── 职责模块（详见文件头拆分表）──────────────────────────────────
 from .qd_config import (QDAgentConfig, CORE_TOOL_DOMAINS, _QD_COMPACT_NOTES,
-                        _compaction_threshold, is_transient_control)
+                        _compaction_threshold, is_transient_control, is_budget_wrapup)
 from .qd_hooks import _ProbeInterrupt, _hooks_now, bind_run_session, register_run_hooks, unregister_run_hooks
 from .qd_tool_face import warmup_tool_face, ToolFaceMixin
 from .qd_preselect import PreselectMixin
@@ -82,6 +82,15 @@ def _purge_transient_control(messages: list) -> int:
         or not is_transient_control(m.get("content"))
     ]
     return before - len(messages)
+
+
+# 成本熔断后的一次性收尾 prompt（P0 修复，2026-10-14）。
+# ★ 必须**以预算提示前缀开头**：它会被当作 user 消息追加进 self.messages，
+#   下一轮开头由 `_purge_transient_control` 清掉（否则残留污染下一轮）。
+# 搜索 `_budget_summary_turn` 可定位消费点。
+# 2026-10-14 外置 prompts/wrapup_summary.md（前缀「（本轮已触及成本上限」不可删）。
+from .prompts import load_prompt as _load_prompt
+_WRAPUP_SUMMARY_PROMPT = _load_prompt("wrapup_summary")
 
 
 class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
@@ -192,6 +201,46 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         except Exception:
             pass
 
+    def _budget_summary_turn(self, hint: str) -> tuple[str, str]:
+        """成本熔断后的**一次性**纯文字收尾（P0 修复，2026-10-14）。
+
+        【事故】`_account_budget` 超限抛 `LimitsExceeded(budget_wrapup_hint(...))`；
+        mimo `BaseAgent.run` 把提示字符串当本轮 answer 返回，而成本计数器**故意不
+        归零** ⇒ 任何重试轮一进 after_step 立刻再次超限 ⇒ 用户只拿到控制文案，
+        **前面多步取到的数据全被丢弃**（实测「现在买什么股」10 步零结论）。
+
+        【修法·治本】绕开主循环，对模型做**一次**收尾查询：工具面清空
+        （`get_model_query_kwargs(no_tools=True)`）+ 不经过 `after_step`（无预算熔断）
+        ⇒ 模型只能据已有工具输出给部分结论。成功即用它替换控制文案；失败才退回
+        控制文案（软收尾，不硬崩）。
+        """
+        # mimo 终止时已把 hint 作为 user 消息追加进 messages；先摘掉它，
+        # 免得出现"连续两条 user"以及下一轮残留（hint 前缀属瞬态控制消息）。
+        while (self.messages and self.messages[-1].get("role") == "user"
+               and is_transient_control(self.messages[-1].get("content"))):
+            self.messages.pop()
+        self.add_message("user", _WRAPUP_SUMMARY_PROMPT)
+        text = ""
+        try:
+            response = self.model.query(
+                self.messages, **self.get_model_query_kwargs(no_tools=True))
+            content = response.get("content") if isinstance(response, dict) else None
+            if isinstance(content, list):
+                content = "".join(
+                    str(p.get("text") or p.get("content") or "") if isinstance(p, dict) else str(p)
+                    for p in content)
+            text = str(content or "").strip()
+        except Exception as e:
+            logger.warning("[budget-wrapup] 纯文字收尾查询失败(fail-open): %s: %s",
+                           type(e).__name__, e)
+        if text:
+            try:
+                self.add_message("assistant", content=text)
+            except Exception:
+                pass
+            return "budget_wrapped", text
+        return "truncated", hint
+
     def step(self) -> dict | None:
         # 协作取消检查（旧 _cancel_check 语义）：每步开头跑 step_checks，
         # 命中即抛错中止——异常类名 _UserInterruptError 由 message_queue 名字匹配收口。
@@ -249,6 +298,21 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
                 self.trace.emit("tool_preselect", **self.last_preselect_report)
             except Exception:
                 pass
+        # 技能卡片 ↔ 工具激活解耦（2026-10-14）：prefetch 注入执行型技能时，分发卡片
+        # 点名 `run_skill`，但它是按需工具、预选看的是剥掉注入后的原始问题 ⇒ 预选不点它
+        # ⇒ 模型要白花一轮 `search_tools` 才发现（实测 trace step1）。这里把卡片点名的
+        # 工具在**预选之后**激活（放 `_activated` 尾部，避免被 FIFO 先淘汰），且必须在
+        # tool_map / tool_availability 渲染之前 —— 否则地图里看不到，又得去 search。
+        _force = list(getattr(self, "prefetch_force_tools", None) or [])
+        if _force:
+            try:
+                act = self.activate_tools(_force)
+                self.last_preselect_report["skill_force"] = list(
+                    act.get("activated", [])) + list(act.get("already", []))
+            except Exception as e:
+                logger.debug("[preselect] 技能点名工具激活失败(fail-open): %s", e)
+            finally:
+                self.prefetch_force_tools = []
         # 上下文感知：动态上下文注入 system_template（{{ now }} + {{ tool_map }}）
         self.extra_template_vars["now"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.extra_template_vars["tool_map"] = self._tool_map_text()
@@ -267,6 +331,10 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         if status == "LimitsExceeded" and msg_text == "":
             status, message = "truncated", (
                 "（本轮达到步数上限被截断——请把问题拆小分步重试）")
+        elif is_budget_wrapup(msg_text):
+            # 成本熔断（P0）：控制文案不是结论 —— 冻结预算 + 禁用工具，强制一次
+            # 纯文字收尾，把已取到的数据变成部分结论；失败才退回控制文案。
+            status, message = self._budget_summary_turn(msg_text)
         elif msg_text in ("", "Empty assistant response"):
             # 只归零**步数**：轻推轮给独立预算，不跟主轮抢。
             # 成本计数器（_qd_run_tokens/_qd_run_steps_total/_qd_run_tool_calls）**不动** ——
@@ -294,7 +362,9 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         # 且阶段验收的价值主要在"多轮大循环的大项目"里（单轮短任务加了只增成本）。
         # 将来要做的落点就在这里（formatter 之后、grounding 之前），判据与埋点见
         # docs/AGENT_DESIGN_v2_20261001.md §阶段验收（暂缓）。搜索本标记即可定位。
-        if self.config.grounding_gate:
+        # 异常收尾（截断/空回复/预算软收尾）不做溯源重写：文案本身是控制语，
+        # 重写轮还会立刻再触发同一熔断（成本计数器不归零），纯属浪费。
+        if self.config.grounding_gate and status not in ("truncated", "empty", "budget_wrapped"):
             corpus = self._observation_corpus()
             if corpus.strip():
                 guide = self._grounding_violation(message, corpus)
@@ -313,7 +383,7 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
                 if guide is not None:
                     status = "grounding_failed"
 
-        self._plan_lint()
+        self._plan_lint(status)
         self._finish_collector(message, status)
         if self.trace is not None:
             try:

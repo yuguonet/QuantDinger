@@ -63,7 +63,7 @@ v3 的问题不是缺机制——它缺**尺度感**：
 | # | v3 位置 | v3 原述 | 复核结论 | 代码证据（本次实测） |
 |---|---|---|---|---|
 | E1 | §20.7 / §13（映射表 priority=24）/ §19.4 | `utils/budget.py` 零消费方，提智④的前提是「接线」 | ❌ **已过期** | `qd_agent.py:1040 _account_budget()` 已挂 `after_step`（`:1029-1038`），调 `check_budget`（`:1059/:1062`），超限 `raise LimitsExceeded`（`:1076`）。**今天的真相**：run 级预算（token/工具调用/步数）已接；`utils/budget.py:63 add_day_usage` **仍零调用方**——日配额未接 |
-| E2 | §4.6 第 4 条 | 「regime 单一事实源**缺位**：未指定谁算、多久刷新」 | ⚠️ **判断错向**：不是缺位，是**已分裂且词表不兼容** | ① `app/services/experiment/regime.py:24 REGIME_VERSION='market-regime-v1'`，`:26 REGIME_PROFILES` = `bull_trend` / `bear_trend` / `range_compression` / `high_volatility` / `transition`；② `app/agent/skills/market_screener/_helpers.py:315 _mood_regime()` → `weak` / `neutral` / `strong`。两套并存，**取值空间无映射** |
+| E2 | §4.6 第 4 条 | 「regime 单一事实源**缺位**：未指定谁算、多久刷新」 | ⚠️ **判断错向**：不是缺位，是**已分裂且词表不兼容** | ① `app/services/experiment/regime.py:24 REGIME_VERSION='market-regime-v1'`，`:26 REGIME_PROFILES` = `bull_trend` / `bear_trend` / `range_compression` / `high_volatility` / `transition`；② `app/agent/skills/market-screener/_helpers.py:315 _mood_regime()` → `weak` / `neutral` / `strong`。两套并存，**取值空间无映射** |
 | E3 | §4.1 | 「按**交易日**计」（未指定实现） | ⚠️ **不完整**：模块存在，但它本身是可变事实 | `app/utils/trading_calendar.py:77 is_trading_day` / `:88 prev_trading_day` / `:169 trade_date_range`；`_cached_dates` 为模块级 pickle 缓存（`:22/:35`）。**临时休市/调休会修订历史日历** ⇒ 到期日会漂移（§5.1） |
 | E4 | §20.1 | 「agent 侧**没有** PIT 特征基建」，是「1 周」任务 | ❌ **重大误判**：取数层已有 as-of，缺的是 agent 层接线 | `app/market_cn/auto/core/data/hub.py:157 daily(code, days=300, as_of=None)`，注释明写「**as_of 必须下传给取数层当窗口锚（2026-09-28 审计 A1）**」（`:163-164`）；`data/kline.py:75 fetch_klines_batch(codes, days, as_of, shards)` 同款；`core/replay/mkt_slots.py:1` 逐槽 as-of。详见 §3 |
 | E5 | §5.4 / §13 | 「`qd_agent_decisions` 加 `symbol/theme/regime` 三列」 | ✅ **确证**（且比 v3 说的更必要） | `migrations/agent_v4_trace.sql:22 qd_agent_decisions` 现列为 session_id/trace_root_id/run_id/domain/intent/user_query/answer/model/total_tokens/latency_ms/claim_count/resolve_status/due_date/gate_ver/gate_reason；`chain/account_store.py:69 save_decision()` 签名同款，**确无 symbol/theme/regime** |
@@ -806,7 +806,7 @@ T+N 回填同样便宜（一次 DB 查询），不是瓶颈。
 
 | # | 偏倚 | 机制 | 修法 | 优先级 |
 |---|---|---|---|---|
-| **1** | **可成交口径** | 涨停 / 一字板股**买不到**，但价格会涨。若按价格判「命中」，整库虚高 | ~~复用 `market_screener` 的 `hard_blocked`（`run.py:587`）当可成交过滤~~ ⚠️ **本条已修正，见 §24**：判定维度不变，只**记录两个事实旗标**（`limit_locked` / `tradeable_next_open`），样本全量进库 | 🟡 **降至：记事实，不定规则** |
+| **1** | **可成交口径** | 涨停 / 一字板股**买不到**，但价格会涨。若按价格判「命中」，整库虚高 | ~~复用 `market-screener` 的 `hard_blocked`（`run.py:587`）当可成交过滤~~ ⚠️ **本条已修正，见 §24**：判定维度不变，只**记录两个事实旗标**（`limit_locked` / `tradeable_next_open`），样本全量进库 | 🟡 **降至：记事实，不定规则** |
 | 2 | 无基准（水平≠信息） | 没有对照 ⇒ 只有「命中率 62%」，无法回答「比不用强吗」 | **加对照臂**：同日同池随机抽 20–30 只**不被任何信号选中**的票 | 🔴 高 |
 | 3 | 条件分布偏移 | 只在异常股上建库 ⇒ 库对「安静股」外推失效 | 检索时强制标注「该经验来自异常股群体」；安静股落库要显式扩样 | 🟠 中 |
 | 4 | 同日共同因子 | 150 只共享当日行情，涨一起涨 | 按 `date` 聚类（v3 §4.5 条款 4 已有） | ✅ 已有 |
@@ -1282,7 +1282,7 @@ v3 §9.3 说轨迹转换脚本「现成」（`convert_2_train_json.py` / `collec
 
 ### 24.3 用户方案已在代码里（三处证据，本次实测）
 
-**① `market_screener/_helpers.py:138-140`（已区分「当日买不进」与「盘后提示」）**
+**① `market-screener/_helpers.py:138-140`（已区分「当日买不进」与「盘后提示」）**
 
 ```python
 if item.get("limit_locked"):
@@ -1304,7 +1304,7 @@ if item.get("limit_locked"):
 
 | 位置 | 口径 |
 |---|---|
-| `market_screener/common.py:482 is_limit_locked()` | 收盘价距涨停 ≤0.5% 即视封板 |
+| `market-screener/common.py:482 is_limit_locked()` | 收盘价距涨停 ≤0.5% 即视封板 |
 | `market_cn/auto/rebuild.py:695 dec.buyable` | gap 越界拒绝入场 |
 | `sync_sector_daily.py:279 _get_limit_ratio()` | 主板 10% / 创业科创 20% / ST 5% / 北交所 30% |
 

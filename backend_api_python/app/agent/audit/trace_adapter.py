@@ -34,6 +34,8 @@ class TraceAdapter:
         self.path = base / "qd_agent_runs.jsonl"
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self._t0 = time.time()
+        # 已摘取的 messages 游标（on_step 只摘"本步新增"的消息，见 on_step 说明）。
+        self._msg_cursor = 0
 
     # ── repro（run 级可复现字段）────────────────────────────────
     @staticmethod
@@ -62,12 +64,22 @@ class TraceAdapter:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     def run_start(self, agent: Any, task: str) -> None:
+        # 游标 = 本轮 task 入队前的消息数：本 run 只摘此后新增的消息。
+        self._msg_cursor = len(getattr(agent, "messages", []) or [])
         self.emit("run_start", task_sha=_sha(task), repro=self.build_repro(agent))
 
     def on_step(self, agent: Any, step_idx: int) -> None:
-        """从 messages 摘最近一轮 assistant/tool 事件。"""
+        """从 messages 摘**本步新增**的 assistant/tool 事件。
+
+        【为什么用游标而不是 `msgs[-8:]`（2026-10-14 修复）】旧实现每步都遍历末尾
+        8 条消息，导致同一条带 tool_calls 的 assistant 消息在后续多步被**反复 emit**
+        （实测同一 tool_call_id 在 step1/2/3 各出现一次）⇒ 工具调用数被放大数倍、
+        step 归属不可信。改为只摘 `_msg_cursor` 之后的新消息，每步只落一次。
+        """
         msgs = getattr(agent, "messages", []) or []
-        for msg in msgs[-8:]:
+        if len(msgs) < self._msg_cursor:
+            self._msg_cursor = 0  # 压缩/重建后回退，重扫一遍（少见，宁多不漏）
+        for msg in msgs[self._msg_cursor:]:
             role = msg.get("role")
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -90,6 +102,7 @@ class TraceAdapter:
                     ok=not text.startswith("Error:"),
                     out_sha=_sha(text[:2000]),
                 )
+        self._msg_cursor = len(msgs)
 
     def on_error(self, step_idx: int, exc: BaseException) -> None:
         self.emit("step_error", step=step_idx, error=repr(exc)[:500])

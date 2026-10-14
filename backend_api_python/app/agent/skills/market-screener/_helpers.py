@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-market_screener/_helpers.py — 事实与证据层（不做选股决策）
+market-screener/_helpers.py — 事实与证据层（不做选股决策）
 
 2026-09-29 改版（v6）：
     旧版把「分策略筛选规则 / 排序 / 情绪分桶裁剪」硬编码在本模块，LLM 只剩格式化输出，
@@ -272,6 +272,131 @@ def flow_summary(code: str) -> Dict[str, Any]:
         }
     except Exception as e:
         return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  实时行情覆盖层（bar vs rt 对账，2026-10-14）
+# ═══════════════════════════════════════════════════════════════
+# 【为什么必须有】deep_analyze 的 tech 只吃 fetch_kline（本地日线）。盘后本地库
+# 未刷当日 bar 时，整份证据是旧数据 —— 实测 2026-10-14：600408 bar close 3.69
+# / +4.53% / limit_up=false，实时 4.06 / +10.03% / 涨停封板。主 agent 闻到矛盾
+# 就会在主对话逐只重拉 quote/flow/tech（一轮烧十几个 LLM 步）。
+# 【对账原则】历史指标（MA/RSI/20 日位置）仍基于日线（改了就不自洽）；
+# 可执行性字段（当日收盘 / 涨跌幅 / 涨跌停）以 rt 为准，并显式标 stale_bar。
+
+# bar close 与 rt last 相对偏差超过该阈值 ⇒ 判定日线滞后
+_STALE_BAR_REL_TOL = 0.005
+
+
+def fetch_rt_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """批量取实时行情快照。返回 {code: {...}}；取不到的代码**缺席**（不塞空壳）。
+
+    字段口径与 get_realtime_quote 三键契约对齐：last / changePercent /
+    previousClose / limit_up（涨停价）/ time。
+    """
+    if not codes:
+        return {}
+    try:
+        from ...tools.finance.data_tools import get_realtime_quote
+        q = get_realtime_quote(",".join(codes[:20]))
+    except Exception as e:
+        logger.warning("[MktScreen] 实时行情批量取数失败: %s", e)
+        return {}
+    if not isinstance(q, dict) or q.get("error"):
+        logger.warning("[MktScreen] 实时行情返回异常: %s", (q or {}).get("error"))
+        return {}
+    data = q.get("data") if isinstance(q.get("data"), dict) else q
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(data, dict):
+        return out
+    for code, info in data.items():
+        if not isinstance(info, dict) or info.get("error"):
+            continue
+        last = _f(info.get("last") or info.get("price"))
+        if last is None:
+            continue
+        out[str(code)] = {
+            "price": round(float(last), 2),
+            "change_pct": _f(info.get("changePercent", info.get("change_pct"))),
+            "previous_close": _f(info.get("previousClose") or info.get("prev_close")),
+            "limit_up_price": _f(info.get("limit_up")),
+            "limit_down_price": _f(info.get("limit_down")),
+            "high": _f(info.get("high")),
+            "low": _f(info.get("low")),
+            "time": info.get("time"),
+            "name": info.get("name") or "",
+        }
+    return out
+
+
+def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
+                     code: str = "", name: str = "") -> None:
+    """把实时行情对账进证据行（原地改 row）。
+
+    · row["rt"]：实时快照（缺 rt 时不写，不塞 None 壳）
+    · row["stale_bar"]：bar close 与 rt last 相对偏差 > 0.5% ⇒ True
+    · tech.limit_up / 顶层可执行价：以 rt 为准修正（涨停买不进是 hard 条件）
+    · tech 的 MA/RSI/位置类指标不动（历史几何，rt 改不了也不该改）
+    """
+    if not rt:
+        return
+    from .common import get_limit_pct, is_limit_locked
+
+    tech = row.get("tech") if isinstance(row.get("tech"), dict) else {}
+    bar_close = _f(tech.get("close")) if tech else None
+    rt_price = _f(rt.get("price"))
+    stale = False
+    if bar_close and rt_price and bar_close > 0:
+        stale = abs(rt_price - bar_close) / bar_close > _STALE_BAR_REL_TOL
+
+    prev_close = _f(rt.get("previous_close"))
+    if prev_close is None and tech:
+        # bar 的 prev 不在 tech 里；用 bar close 反推不到就留 None，limit_up 用涨跌停价判
+        prev_close = None
+
+    # 涨跌停真值：优先「现价 vs 涨停价」，缺涨停价再用涨跌停幅度近似
+    limit_up_price = _f(rt.get("limit_up_price"))
+    if limit_up_price and rt_price:
+        limit_up = bool(rt_price >= float(limit_up_price) - 0.01)
+    elif rt_price and prev_close:
+        limit_up = bool(is_limit_locked(code or row.get("code", ""), name or row.get("name", ""),
+                                        rt_price, prev_close))
+    else:
+        limit_up = None
+
+    row["rt"] = {
+        "price": rt.get("price"),
+        "change_pct": round(rt["change_pct"], 2) if rt.get("change_pct") is not None else None,
+        "previous_close": rt.get("previous_close"),
+        "limit_up": limit_up,
+        "limit_up_price": rt.get("limit_up_price"),
+        "time": rt.get("time"),
+    }
+    row["stale_bar"] = stale
+
+    if tech:
+        if limit_up is not None:
+            tech["limit_up"] = limit_up
+        if stale and rt_price:
+            # 可执行性口径以 rt 为准；历史指标保留 bar 几何
+            tech["close"] = round(float(rt_price), 2)
+            if rt.get("change_pct") is not None:
+                tech["change_pct"] = round(float(rt["change_pct"]), 2)
+            tech["bar_close"] = round(float(bar_close), 2) if bar_close else None
+        tech["data_asof"] = "rt" if (stale or limit_up is not None) else "bar"
+
+    if name and not row.get("name"):
+        row["name"] = name
+    if limit_up_price and row.get("tech") is not None and limit_up:
+        # 买不进：与 hard_exclusions 同语义，但 deep_analyze 不做淘汰，只标事实
+        risks = row.setdefault("rt_risks", [])
+        if "涨停封板-当日买不进" not in risks:
+            risks.append("涨停封板-当日买不进")
+    if stale:
+        risks = row.setdefault("rt_risks", [])
+        note = f"日线滞后(bar_close={bar_close}, rt={rt_price})"
+        if note not in risks:
+            risks.append(note)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -635,7 +760,7 @@ def build_report(results: list, selected_codes: List[str] = None):
     valid = [r for r in results if r is not None and isinstance(r, dict)]
     if not valid:
         return SkillReport(
-            skill_name="market_screener",
+            skill_name="market-screener",
             score=50.0,
             signal="无有效分析结果",
         )
@@ -662,7 +787,7 @@ def build_report(results: list, selected_codes: List[str] = None):
     avg_conf = sum(confs) / len(confs) if confs else 0.5
 
     return SkillReport(
-        skill_name="market_screener",
+        skill_name="market-screener",
         score=round(avg_score, 1),
         direction=direction,
         confidence=round(avg_conf, 2),
