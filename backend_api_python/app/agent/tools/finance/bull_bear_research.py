@@ -28,7 +28,8 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         factors(list), analysis(str), hit_rate(float|None), missing_data(list[str]),
         falsifiable_conditions(str), output_data(bull_case/bear_case/verdict 嵌套)。
         factors 同 technical_analysis 格式：list[dict{"name","score","direction"}]，
-        因子名带 "多头:" / "空头:" 前缀，按 direction 字段过滤。
+        因子名 = 五维评分键 ma/macd/rsi/boll/kdj（与 `_BB_DEFAULT_WEIGHTS` 键同名，
+        校准闭环靠此对齐；多空论据完整保留在 output_data.bull_case/bear_case）。
         失败 → {"error": str, "retriable": bool}。
     """
         
@@ -165,11 +166,21 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         signal_parts.append(f"空:{','.join(bear_signals[:2])}")
     signal = " | ".join(signal_parts) if signal_parts else "多空均衡"
 
+    # ── 校准因子（与 `_BB_DEFAULT_WEIGHTS` 键同名，闭合 factor 闭环）──
+    # 早期这里塞的是"多头:xxx"/"空头:xxx"**论据**名（f-string 动态生成），与上方
+    # 加权用的五维评分键 ma/macd/rsi/boll/kdj **两套不同的东西** ⇒ evaluator 从
+    # traces 取名写 `layer='factor'` 后 `get_factor_weights` 按同名读回永远 miss
+    # （见 AGENT_DESIGN_v3.md D-1 键名层）。现统一为五维评分键：攒够样本即命中校准值。
+    # 多空论据仍完整保留在 output_data.bull_case/bear_case（不丢信息）。
+    # ★ 用 append（非列表字面量）写，因子名才是字面量常量 —— 守卫
+    #   `test_v9_factor_weight_keys` 靠 `factors.append({"name": <字面量>})` 抽取键名。
+    _t = trend if (isinstance(trend, dict) and "error" not in trend) else {}
     factors = []
-    for f in bull_factors[:3]:
-        factors.append({"name": f"多头:{f}", "score": bull_score, "direction": "bullish"})
-    for f in bear_factors[:3]:
-        factors.append({"name": f"空头:{f}", "score": bear_score, "direction": "bearish"})
+    factors.append({"name": "ma", "score": int(_t.get("ma_score", 50)), "direction": direction})
+    factors.append({"name": "macd", "score": int(_t.get("macd_score", 50)), "direction": direction})
+    factors.append({"name": "rsi", "score": int(_t.get("rsi_score", 50)), "direction": direction})
+    factors.append({"name": "boll", "score": int(_t.get("boll_score", 50)), "direction": direction})
+    factors.append({"name": "kdj", "score": int(_t.get("kdj_score", 50)), "direction": direction})
 
     dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
     all_signals = (bull_signals or []) + (bear_signals or [])
@@ -177,7 +188,7 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     if hit_rate is not None:
         md += f" 历史命中率{hit_rate*100:.0f}%"
     if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors[:4])
+        md += "\n" + " ".join(f"{f['name']}:{f['score']}" for f in factors)
     if all_signals:
         md += "\n" + " ".join(all_signals[:3])
     md += f"\n{verdict}"
@@ -354,12 +365,12 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
             #   ① 样本层：`qd_agent_weights WHERE layer='factor'` **实测 0 行**
             #      （`tmp/probe_factor_weights_20261014.py`）⇒ 闭环样本还没攒够，
             #      这层会随时间自愈，getter 本身实现是对的（不是恒空的实现问题）。
-            #   ② 键名层：本模块输出的 factors 名是"多头:xxx"/"空头:xxx"（**论据**），
-            #      而这里加权的是**五维评分** ma/macd/rsi/boll/kdj —— 两套不同东西：
-            #      趋势≠ma（趋势来自 trend 数据源，ma 由均线排列算）、量价与情报在
-            #      五维里根本没有对应项 ⇒ **不是改个命名就能对齐的**，需设计裁定（D-1）。
-            #   ⚠ 对照：`technical_analysis` 是**自洽**的（它输出的 factors 名就是
-            #      趋势/指标/量价/形态/筹码/流通盘，与自己的权重键同名）⇒ 那边只等样本。
+            #   ② 键名层：**已于 2026-10-14 对齐** —— 外层 `factors` 的因子名现在就是
+            #      ma/macd/rsi/boll/kdj（与下方 `_BB_DEFAULT_WEIGHTS` 键同名），与
+            #      `technical_analysis` 一样自洽 ⇒ 样本攒够即命中校准值，不再有"两套
+            #      东西"的错位（旧实现把"多头:xxx"/"空头:xxx"论据当因子名，与五维评分键
+            #      永不相交）。多空论据仍完整保留在 output_data.bull_case/bear_case。
+            #   ⚠ 对照：`technical_analysis` 同样自洽（趋势/指标/量价/形态/筹码/流通盘）。
             _BB_DEFAULT_WEIGHTS = {"ma": 0.30, "macd": 0.25, "rsi": 0.20,
                                    "boll": 0.15, "kdj": 0.10}
             try:
@@ -435,6 +446,11 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
                 "data_points": len(closes),
                 # A1a：权重是否来自 qd_agent_weights 校准
                 "calibrated": _bb_calibrated_flag,
+                # 2026-10-14 对齐（D-1 键名层）：把五维评分标量透传给外层，作为
+                # 校准因子名（与 `_BB_DEFAULT_WEIGHTS` 键同名），让 factor 闭环能命中。
+                "ma_score": ma_score, "macd_score": macd_score,
+                "rsi_score": rsi_score, "boll_score": boll_score,
+                "kdj_score": kdj_score,
             }
         except Exception as e:
             logger.error("_analyze_trend(%s) failed: %s", codes, e)

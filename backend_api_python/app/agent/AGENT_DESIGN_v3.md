@@ -651,7 +651,7 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
                                         └→ qd_service._skill_score(tie-break)
 ```
 
-⚠️ 非遗漏的设计选择：**只提示不过滤**（硬过滤与 fail-open 冲突）；**粒度只到 domain**（resolutions 不带 tool/skill 归因）；**因子层未闭环**（`get_factor_weights` 仍返回 `{}`，见 D-1；⚠️ 2026-10-14 复核：措辞不准 —— 不是 getter 恒空，是**样本层 0 行** + **bull_bear 键名不自洽**两层，technical_analysis 键是自洽的，详见 D-1 行）。
+⚠️ 非遗漏的设计选择：**只提示不过滤**（硬过滤与 fail-open 冲突）；**粒度只到 domain**（resolutions 不带 tool/skill 归因）；**因子层未闭环**（`get_factor_weights` 仍返回 `{}`，见 D-1；⚠️ 2026-10-14 复核：措辞不准 —— 不是 getter 恒空，是**样本层 0 行**，bull_bear 的**键名层已于 2026-10-14 对齐**（外层 factors 名 = ma/macd/rsi/boll/kdj，与权重键同名），technical_analysis 键也自洽，详见 D-1 行）。
 
 ### 5.3 执行型技能分发流
 
@@ -1646,7 +1646,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 
 | # | 问题 | 影响 | 现状 |
 |---|---|---|---|
-| **D-1** | 因子层未闭环：`get_factor_weights` 恒返回空 | 权重闭环只到 domain | 🟨 **2026-10-14 复核（审计 A-05）拆成两种截然不同的情况，别再一刀切**：① **样本层**：`qd_agent_weights WHERE layer='factor'` **实测 0 行**（`tmp/probe_factor_weights_20261014.py`）⇒ 两个消费方当前都走回退常量，这层随样本自愈，**getter 实现是对的**（不是"恒空的实现问题"）。② **键名层**：`technical_analysis` **键自洽**（产出的 factors 名 = 趋势/指标/量价/形态/筹码/流通盘，与自己的权重键同名）⇒ 攒够样本自动命中，**无需改键**；`bull_bear_research` **键不自洽**（产出"多头:xxx"/"空头:xxx"**论据**，加权的却是 ma/macd/rsi/boll/kdj **五维评分**，两套不同东西：趋势≠ma，量价/情报在五维里无对应项）⇒ **不是改命名就能对齐**，待设计裁定方向。已落：两侧代码注释改为准确描述 + 守卫 `tests/test_v9_factor_weight_keys_20261014.py`（TA 键双向对称断言 / BB 五维键契约 / store 逐处查 layer='factor'，变异 4/4 有 bite）+ BB 缺口登记为 `xfail(strict=True)` 台账（一旦修好会 XPASS 报错，逼回改本行） |
+| **D-1** | 因子层未闭环：`get_factor_weights` 恒返回空 | 权重闭环只到 domain | 🟨 **2026-10-14 复核（审计 A-05）拆成两种截然不同的情况，别再一刀切**：① **样本层**：`qd_agent_weights WHERE layer='factor'` **实测 0 行**（`tmp/probe_factor_weights_20261014.py`）⇒ 两个消费方当前都走回退常量，这层随样本自愈，**getter 实现是对的**（不是"恒空的实现问题"）。② **键名层**：`technical_analysis` **键自洽**（产出的 factors 名 = 趋势/指标/量价/形态/筹码/流通盘，与自己的权重键同名）⇒ 攒够样本自动命中；`bull_bear_research` **2026-10-14 已对齐**（外层 factors 名改为 ma/macd/rsi/boll/kdj，与 `_BB_DEFAULT_WEIGHTS` 键**同名**，多空论据仍保留在 output_data.bull_case/bear_case）⇒ **键名层已闭环**，只剩样本层 0 行随样本自愈。已落：两侧代码注释改准确 + 守卫 `tests/test_v9_factor_weight_keys_20261014.py`（TA 键双向对称断言 / BB 五维键双向对称断言 / store 逐处查 layer='factor'，变异 4/4 有 bite）；BB 旧 `xfail(strict=True)` 台账已于对齐当日转为**真实断言**（XPASS 风险消除） |
 | **D-2** | `cron/` 被**旧系统**反向依赖 | 删旧系统会断掉定时任务 | ✅ **已收口（2026-10-14，O-11）**：复核结论是**方向本身不是缺陷，是契约没被记录**。外部 → `app.agent.cron` 正是"方案代码只在 app/agent"的预期形态（agent 是能力提供方）；风险只在**反向**（cron → `app.routes`/`app.services`）会与消费方成环。已做三件事：① `app/agent/cron/__init__.py` 写明对外能力出口契约（三个消费方 `app/__init__.py`(启动) / `app/routes/cron.py` / `app/routes/health.py` + 迁移指引 + 已知历史包袱：routes 借用 `_execute_prompt_job`/`_execute_function_job` 两个私有名）；② 守卫 `tests/test_v6_cron_boundary.py`（导出名 8 个 / cron 不得反向 import Web·服务层 / 全 agent 不得 import `app.routes` / 契约注释不得删），**相对 import 按包解析**已覆盖（变异 5/5 有 bite）；③ 例外已登记：`tools/finance/*` 依赖 `app.services.*`（筹码唯一内核在服务层）是"不造轮子"的既定产物，故"禁 services"**只作用于 cron 子包** |
 | **D-3** | ~~`preselect_stats.py` `_NOT_TOOLS` 只登记 2 个新名~~ | ✅ **已由 P10 根治（2026-10-13）**：非工具模块统一改 `_` 前缀，扫描器对 `startswith("_")` 天然跳过 ⇒ 名单方案（含 `_NOT_TOOLS`/`_SKIP_FILES`/`_ENTRY_NAME_DENY` 三套）整体删除，管线函数根本不会被扫进注册表。**不要再按本条去"补名单"** | ✅ 已解决 |
 | **D-4** | 会话上下文不跨进程持久化 | 重启即失忆 | 🔒 **裁定不做**（附录 B.1） |

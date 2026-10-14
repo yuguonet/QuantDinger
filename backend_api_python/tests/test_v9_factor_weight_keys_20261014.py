@@ -6,16 +6,18 @@ r"""A-05 / 设计 D-1：因子权重的**键名对齐**守卫（2026-10-14）。
     这层会随样本自愈，**getter 实现本身是对的**（不是"恒空的实现问题"）。
   · `technical_analysis` **键自洽**：它生产的 factors 名 = 趋势/指标/量价/形态/筹码/
     流通盘，与自己的 `_DEFAULT_WEIGHTS` 键**同名** ⇒ 攒够样本自动命中，无需改键。
-  · `bull_bear_research` **键不自洽**：生产的是"多头:xxx"/"空头:xxx"（**论据**），
-    加权用的却是**五维评分** ma/macd/rsi/boll/kdj —— 两套不同的东西
-    （趋势≠ma；量价、情报在五维里无对应项）⇒ 不是改命名就能对齐，待设计裁定。
+  · `bull_bear_research` **现已对齐（2026-10-14 修复）**：外层 `factors` 的因子名
+    改为五维评分键 ma/macd/rsi/boll/kdj，与 `_BB_DEFAULT_WEIGHTS` 键**同名** ⇒
+    校准闭环可命中（剩样本层 0 行随样本自愈，getter 实现没问题）。多空论据仍完整
+    保留在 output_data.bull_case/bear_case，不丢信息。
 
 本文件的职责：
   ① 用 AST 钉死 `technical_analysis` 的键自洽（一旦有人改了 factors 名或权重键
      而忘了另一边，这里立刻报红 —— 键名漂移正是 D-1 的成因）。
-  ② 把 `bull_bear_research` 的缺口做成 **xfail(strict=True) 台账**：
-     今天它"确实不匹配"（xfail 通过）；哪天被修好了会变成 XPASS，strict 会**报错**
-     ⇒ 强制回来同步设计文档 D-1 与本文件注释，避免"修了但设计还写着未做"。
+  ② 钉死 `bull_bear_research` 的键自洽（2026-10-14 已对齐：外层 factors 名 =
+     `_BB_DEFAULT_WEIGHTS` 的五维键 ma/macd/rsi/boll/kdj，双向对称断言）。
+     早期这里是 `xfail(strict=True)` 台账（产出"多头:xxx"论据名、加权用五维键，
+     两套不交）；修复后 XPASS 会让 strict 报错 ⇒ 已转成真实断言。
 """
 from __future__ import annotations
 
@@ -103,21 +105,21 @@ def test_technical_analysis_weight_keys_are_not_silently_renamed():
         f"与本用例的契约断言")
 
 
-# ── ② bull_bear：已知缺口台账（修好后 strict 会报错，逼你回来改设计）──
+# ── ② bull_bear：键自洽（2026-10-14 修复后转真实断言）──
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="D-1 已知缺口：bull_bear 产出的是论据名(多头:xxx)，加权用的是五维评分键"
-           "(ma/macd/rsi/boll/kdj)，两套不同东西，非改命名可对齐。若本用例 XPASS，"
-           "说明已对齐 ⇒ 必须回头改 AGENT_DESIGN_v3.md 的 D-1 与本文件头注释。",
-)
-def test_bull_bear_factor_names_should_match_its_dimension_keys():
+def test_bull_bear_factor_names_match_its_dimension_keys():
+    """D-1 键名层已对齐：外层 factors 名 = 五维评分键，与 `_BB_DEFAULT_WEIGHTS` 同名
+    ⇒ 校准闭环可命中。
+
+    ★ 双向对称断言（与 technical_analysis 同款）：produced 与 weighted 必须**完全相等**
+      —— 只查单向会漏掉"只改一处命名"的漂移（改了权重键忘改 factors，或反之）。
+    """
     tree = _parse(_BB)
-    produced = _factor_names(tree)          # 论据名是 f-string ⇒ 抽不到字面量
+    produced = _factor_names(tree)          # 现在抽得到字面量 ma/macd/rsi/boll/kdj
     weighted = _weight_keys(tree, "_BB_DEFAULT_WEIGHTS")
-    assert weighted == {"ma", "macd", "rsi", "boll", "kdj"}
-    assert produced & weighted, (
-        "bull_bear 产出的因子名与五维评分键无交集 ⇒ 因子校准永不命中")
+    assert produced == weighted == {"ma", "macd", "rsi", "boll", "kdj"}, (
+        f"bull_bear 因子名与权重键不再自洽：produced={sorted(produced)} "
+        f"weighted={sorted(weighted)}（D-1 键名层回退）")
 
 
 def test_bull_bear_dimension_keys_are_stable():

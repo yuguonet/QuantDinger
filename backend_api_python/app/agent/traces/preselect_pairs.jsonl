@@ -773,3 +773,6 @@
 {"ts": "2026-10-14 08:45:08", "query": "看行情", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-14 08:45:09", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-14 08:45:17", "query": "帮我分析一下贵州茅台600519", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-14 09:41:52", "query": "查询股票 600519 的最新价、涨跌幅和成交量", "tools": ["get_realtime_quote"]}
+{"ts": "2026-10-14 09:54:01", "query": "查询股票 600519 的最新价、涨跌幅和成交量", "tools": ["get_realtime_quote"]}
+{"ts": "2026-10-14 10:08:31", "query": "现在买什么股?", "tools": ["read_skill", "get_market_overview", "update_plan", "activate_tools", "run_skill", "get_fund_flow", "get_hot_sectors", "search_stocks"]}

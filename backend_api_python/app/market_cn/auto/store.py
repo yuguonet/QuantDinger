@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -1245,13 +1246,26 @@ def _label_payload(s) -> dict:
     空段不会抹掉 system 已有的支撑位/压力位答案。
     """
     d = _display_detail(s)
+    score = d.get("score")
+    if score is not None:
+        try:
+            valid_score = (not isinstance(score, bool)
+                           and math.isfinite(float(score))
+                           and 0 <= float(score) <= 100)
+        except (TypeError, ValueError, OverflowError):
+            valid_score = False
+        if not valid_score:
+            logger.warning(
+                "[dragon_store] 忽略超出 label 合约的信号评分 %s %s: %r",
+                s.get("strategy") or DRAGON_STRATEGY, s.get("code"), score)
+            score = None
     state_rows = [{"label": "状态",
                    "value": d.get("state_label") or s.get("state") or ""}]
     pre = _confirm_pre_text(s.get("state"), d)
     if pre:                                  # 无预判 ⇒ **不产出该行**（"无"是展示文案, 不该由数据层造）
         state_rows.append({"label": "预判", "value": pre})
     return {
-        "score": d.get("score"),
+        "score": score,
         "score_version": None,          # auto 的评分口径归 auto, 本批未定义 ⇒ 不声明
         "supports": [],
         "resistances": [],
