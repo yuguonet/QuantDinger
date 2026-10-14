@@ -17,6 +17,7 @@ import json
 import logging
 import queue
 import threading
+import uuid
 from concurrent.futures import Future, InvalidStateError
 from typing import Optional
 
@@ -82,35 +83,70 @@ _task_queue: queue.Queue = queue.Queue(maxsize=256)
 _workers_started = False
 _worker_count = 0
 
-# ── 跨终端立即停止（2026-09-17）──
-# 停止指令注册表：session_id → stop 标记。CLI Ctrl+C / Web / API 统一走 request_stop()，
-# worker 侧的 step callback 与工具守卫每次检查——命中即中止当前 run。
-_stop_flags: set = set()
+# ── 跨终端立即停止（2026-09-17 / A-02 止血① 2026-10-14）──
+# 停止位是 **run 粒度**（不是 session 粒度）：每个 submit 分配一个 run_id，停止位
+# 登记在 run_id 上。原因——同会话可并发多个 run（多标签页 / cron 多 job），若按
+# session 登记，一个 run 超时 `request_stop(session)` 会把同会话**其他正常运行的
+# run 一并误杀**（审计 A-02「误杀邻居」）。
+# 映射：_active[run_id] = session_id（worker 拉到任务时登记、结束时注销），供
+# `request_stop(session)` 把"用户停会话"翻译成"停该会话当前所有活跃 run"——
+# 已结束 / 尚未开始的 run 不受影响（既不误杀邻居，也不会因新任务启动把停止位误留）。
+_stop_runs: set = set()              # 已请求停止的 run_id
+_active: dict = {}                  # run_id -> session_id（当前正在执行的任务）
 _stop_lock = threading.Lock()
 
 
 def request_stop(session_id: str) -> None:
-    """请求停止指定会话当前正在执行的任务（幂等，线程安全）。
+    """停止指定会话**当前正在执行**的所有任务（按 run 粒度，互不误杀）。
 
-    任何终端都可以调用：CLI Ctrl+C / Flask 端点 / Cron。停止位在任务开始时清除、
-    任务结束后保留至下次 start——worker 侧见 _is_stop_requested。
+    任何终端都可以调用：CLI Ctrl+C / Flask 端点 / Cron。把 session 翻译成当前活跃
+    run 后登记停止位；已结束或尚未开始的 run 不受影响。
     """
     if not session_id:
         return
     with _stop_lock:
-        _stop_flags.add(str(session_id))
-    logger.warning("[MQ] 已请求停止会话 %s 的当前任务", session_id)
+        targets = [rid for rid, sid in _active.items() if sid == str(session_id)]
+        _stop_runs.update(targets)
+    logger.warning("[MQ] 已请求停止会话 %s 的当前任务（run=%s）", session_id, targets)
 
 
-def clear_stop(session_id: str) -> None:
-    """清除停止位（任务真正开始执行时调用，防止残留位误杀新任务）。"""
+def request_stop_run(run_id: str) -> None:
+    """停止单个 run（worker 超时分支用：只停自己的 run，不波及其他）。"""
+    if not run_id:
+        return
     with _stop_lock:
-        _stop_flags.discard(str(session_id))
+        _stop_runs.add(str(run_id))
 
 
-def _is_stop_requested(session_id: str) -> bool:
+def clear_stop_run(run_id: str) -> None:
+    """清除单个 run 的停止位（任务真正开始执行时调用，防止残留位误杀新任务）。"""
     with _stop_lock:
-        return str(session_id) in _stop_flags
+        _stop_runs.discard(str(run_id))
+
+
+def is_stop_requested_run(run_id: str) -> bool:
+    with _stop_lock:
+        return str(run_id) in _stop_runs
+
+
+def is_session_stop_requested(session_id: str) -> bool:
+    """是否有**活跃** run 属于该会话且已被请求停止（供 CLI 轮询判定）。
+
+    已结束 run 已注销 active ⇒ 返回 False，避免把历史停止位误判为"仍在停"。
+    """
+    sid = str(session_id)
+    with _stop_lock:
+        return any(s == sid and rid in _stop_runs for rid, s in _active.items())
+
+
+def _register_active(run_id: str, session_id: str) -> None:
+    with _stop_lock:
+        _active[str(run_id)] = str(session_id)
+
+
+def _clear_active(run_id: str) -> None:
+    with _stop_lock:
+        _active.pop(str(run_id), None)
 
 
 def init_workers(n: int = 4):
@@ -147,11 +183,13 @@ def submit(
         init_workers()
 
     future: Future = Future()
+    run_id = uuid.uuid4().hex  # per-run 标识（A-02 止血①：停止位按 run 粒度，互不误杀）
     try:
         # 队列满时快速失败而不是无限挂起调用线程（SSE 请求会被拖死，审计 P2）
         _task_queue.put({
             "message": message,
             "session_id": session_id,
+            "run_id": run_id,
             "timeout": timeout,
             "future": future,
             "event_cb": event_cb,
@@ -200,7 +238,8 @@ def _worker_loop():
             started = False     # 终态/CANCELLED_AND_NOTIFIED 等非常态
         if not started:
             continue
-        clear_stop(str(task["session_id"]))  # 新任务开始，清掉该会话残留停止位
+        _register_active(str(task["run_id"]), str(task["session_id"]))
+        clear_stop_run(str(task["run_id"]))  # 新任务开始，清掉该 run 残留停止位
         # F4 续跑凭据识别（修 E7）：agent_resume JSON → 续跑上下文 prompt，
         # 普通消息原样透传（详见 _rewrite_resume_message 注释块）。
         task["message"] = _rewrite_resume_message(str(task.get("message") or ""))
@@ -220,10 +259,12 @@ def _worker_loop():
                     pass
 
                 def _cancel_check(_step_data):
-                    # 触发源：会话停止位（任意终端 request_stop；CLI Ctrl+C 也归一到此）。
+                    # 触发源：本 run 的停止位（任意终端 request_stop；CLI Ctrl+C 也归一到此）。
                     # 不再查 future.cancelled()——Future.cancel 对运行中任务返回 False
                     # 且不置位（concurrent.futures 语义），查它是坏开关。
-                    if _is_stop_requested(str(task["session_id"])):
+                    # ★ A-02 止血①：按 run_id 查，不是 session——同会话并发的
+                    #   另一个 run 不会被"误杀邻居"。
+                    if is_stop_requested_run(str(task["run_id"])):
                         raise _UserInterruptError("user interrupted")
 
                 async def _run_with_events():
@@ -239,8 +280,9 @@ def _worker_loop():
                     # （任意终端 request_stop，CLI Ctrl+C 归一到此）/ smolagents
                     # interrupt_switch。工具守卫每次工具调用进入前执行探针 → step 内即停。
                     def _interrupt_probe():
-                        # 只查停止位 + interrupt_switch（future.cancelled() 对运行中任务恒 False）
-                        if _is_stop_requested(_sid):
+                        # 只查本 run 停止位 + interrupt_switch
+                        # （future.cancelled() 对运行中任务恒 False）
+                        if is_stop_requested_run(str(task["run_id"])):
                             raise _UserInterruptError("user interrupted")
                         _ca = _ta_mod._hooks_now().get("active_agent")
                         if _ca is not None and getattr(_ca, "interrupt_switch", False):
@@ -270,11 +312,13 @@ def _worker_loop():
             if isinstance(e, asyncio.CancelledError):
                 logger.warning("[MQ] Worker 任务超时被取消（放行）")
                 # C2：wait_for 超时只是"不再等"，协程可能仍卡在不可取消的同步 IO 里
-                # 继续烧 token、继续写记忆/决策库（孤儿 run）。置会话停止位 ⇒ 残留
-                # run 在下一个 step / 工具守卫探针检查点协作自停；钩子由它自己
+                # 继续烧 token、继续写记忆/决策库（孤儿 run）。置**本 run** 停止位 ⇒
+                # 残留 run 在下一个 step / 工具守卫探针检查点协作自停；钩子由它自己
                 # 的 finally 收尾（此处不反注册，否则会切断尚在途的事件回调）。
+                # ★ A-02 止血①：只停自己的 run（request_stop_run），**绝不**波及同会话
+                #   其他 run（旧 request_stop(session) 会误杀邻居）。
                 try:
-                    request_stop(str(task["session_id"]))
+                    request_stop_run(str(task["run_id"]))
                 except Exception as se:
                     logger.warning("[MQ] 超时后置停止位失败: %s: %s",
                                    type(se).__name__, se)
@@ -287,3 +331,8 @@ def _worker_loop():
             else:
                 logger.error("[MQ] Worker 异常: %s", e, exc_info=True)
                 _settle(future, exc=e)
+        finally:
+            # 任务彻底结束（正常/超时/中断/异常）注销本 run 的活跃登记（A-02 止血①）。
+            # 已结束 run 注销后，is_session_stop_requested 才能正确回落为 False，
+            # 且不会被"历史停止位"误判为仍在停。
+            _clear_active(str(task["run_id"]))

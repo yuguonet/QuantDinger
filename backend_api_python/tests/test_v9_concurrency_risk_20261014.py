@@ -7,13 +7,14 @@ r"""A-01 / A-02：并发与超时风险的**复现断言**（2026-10-14，审计
     避免"改了但没人知道"。
   · 现状为"成立"的项（如停止位不依赖钩子）用普通断言 —— 它们同时**修正了审计报告
     里偏重的措辞**（报告说"停止标记无法再被执行体读取"，实测只有 interrupt_switch
-    那条通道断，`_stop_flags` 通道仍活着）。
+    那条通道断，`_stop_runs` 通道仍活着；A-02 止血①后停止位改为 per-run 粒度）。
 
 A-01：`qd_service.py:307` 的 `self._lock` 只包住 `_get_agent()` 的查找/创建，
        `chat()` 里 `await asyncio.to_thread(self._run_sync, ...)`（:569）**在锁外**
        ⇒ 同会话并发请求会在两个线程里跑**同一个 QDAgent 实例**。
-A-02：`wait_for` 超时 → 内层 `finally: unregister_run_hooks(_sid)`（:259-260）**先**
-       执行 → 外层 except CancelledError 才 `request_stop(_sid)`（:277）。
+A-02：`wait_for` 超时 → 内层 `finally: unregister_run_hooks(_sid)`（:295-296）**先**
+       执行 → 外层 except CancelledError 才 `request_stop_run(run_id)`（:321，A-02 止血①
+       后只停**自己的 run**，不波及其他 run / 会话）。
 """
 from __future__ import annotations
 
@@ -92,18 +93,26 @@ def test_run_path_is_guarded_by_the_session_lock():
 # ── A-02：停止位 vs 钩子注销 ──
 
 def test_stop_flag_is_independent_of_hooks():
-    """修正审计措辞：置位后**即使钩子已注销**，停止位仍可读 ⇒ 残留 run 仍能协作自停。"""
+    """修正审计措辞：置位后**即使钩子已注销**，停止位仍可读 ⇒ 残留 run 仍能协作自停。
+
+    A-02 止血①后停止位是 per-run 粒度：`request_stop(session)` 只停该会话**当前活跃**
+    的 run；故先注册一个活跃 run，再置位，验证「置位」不受「钩子注销」影响。
+    """
     sid = "test.concurrency.A02.flag"
+    rid = "A02.run.1"
     try:
+        mq._register_active(rid, sid)
         mq.request_stop(sid)
-        assert mq._is_stop_requested(sid) is True
+        assert mq.is_session_stop_requested(sid) is True
+        assert mq.is_stop_requested_run(rid) is True
         hooks.bind_run_session(sid)
         hooks.register_run_hooks(sid, event_cb=None, step_checks=[], probes=[])
         hooks.unregister_run_hooks(sid)          # ← 审计说的"先注销"
-        assert mq._is_stop_requested(sid) is True, (
+        assert mq.is_session_stop_requested(sid) is True, (
             "注销钩子后停止位读不到了 ⇒ 残留 run 彻底停不下来（比审计描述更严重）")
     finally:
-        mq._stop_flags.discard(str(sid))
+        mq._clear_active(rid)
+        mq.clear_stop_run(rid)
         hooks.unregister_run_hooks(sid)
 
 

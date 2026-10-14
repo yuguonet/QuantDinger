@@ -141,7 +141,7 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
     # 改为 0.5s 分片轮询：每个分片醒来查一次停止位；停止位由 SIGINT handler /
     # KeyboardInterrupt 分支置上（message_queue.request_stop）——
     # worker 的中断探针在工具/步边界中止 agent.run，这里随即收尾。
-    from app.agent.message_queue import request_stop as _req_stop, _is_stop_requested
+    from app.agent.message_queue import request_stop as _req_stop, is_session_stop_requested
 
     _stop_asked = False
     deadline = time.time() + _timeout
@@ -154,7 +154,7 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
             pass
         except KeyboardInterrupt:
             _stop_asked = True
-        if _stop_asked or _is_stop_requested(str(session_id)):
+        if _stop_asked or is_session_stop_requested(str(session_id)):
             if not _stop_asked:
                 pass
             print("\n⚠ 已请求停止，等 worker 在当前工具/步边界停下…（再按 Ctrl+C 强制退出）")

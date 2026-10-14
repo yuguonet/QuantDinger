@@ -275,7 +275,11 @@ def _execute_prompt_job(job: Dict[str, Any]):
 
     try:
         from ..message_queue import submit
-        future = submit(prompt, session_id=job.get("session_id", "default"), timeout=300)
+        # 每个 cron job 用独立 session（cron:<job_id>），而非共享 "default"——
+        # 否则所有定时任务串味（共享同一份记忆/上下文），且多 job 并发会互相踩
+        # （A-02 评估项）。若 job 显式带了 session_id 则尊重之。
+        _cron_sid = job.get("session_id") or ("cron:" + str(job.get("id") or "default"))
+        future = submit(prompt, session_id=_cron_sid, timeout=300)
         content = future.result(timeout=300)
 
         _update_job_status(job_id, success=True)

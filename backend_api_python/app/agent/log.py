@@ -8,6 +8,7 @@ Agent Log — 轻量级桥接（agent 包子模块的统一 logger 出口）。
 """
 from __future__ import annotations
 
+import collections.abc
 import logging
 import os
 import sys
@@ -21,7 +22,17 @@ class _MaskFilter(logging.Filter):
         try:
             from .utils.mask import mask_text
             record.msg = mask_text(str(record.msg))
-            if record.args:
+            if isinstance(record.args, collections.abc.Mapping):
+                # 当 dict/Mapping 作为唯一实参传给 logger.info(msg, r) 时，
+                # logging.LogRecord.__init__ 会把它直接赋给 record.args（Mapping 特判）。
+                # 此时**不能**当序列遍历——那会退化成 keys 元组，使 `"%s" % (key1, key2)`
+                # 抛 "not all arguments converted during string formatting"。
+                # 保持 mapping 结构，只对其值脱敏。
+                record.args = {
+                    k: mask_text(v) if isinstance(v, str) else v
+                    for k, v in record.args.items()
+                }
+            elif record.args:
                 record.args = tuple(
                     mask_text(a) if isinstance(a, str) else a for a in record.args
                 )
