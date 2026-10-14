@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # 若意图分类器仍把非金融任务标成 query，链名会错记 finance+query+stock（污染酿造候选）。
 # 2026-09-25：verb→(domain,noun) 已抽到 domain_registry / tools/<domain>/domain_meta.py，
 # 核心不再写死 finance/stock；新领域在 domain_meta 登记即可参与追溯归类。
+from .mask import mask_user_text as _mask_user_text
 from ..domain_registry import classify_verb as _classify_verb
 from ..domain_registry import normalize_chain_name as _normalize_chain_name
 from ..domain_registry import strip_entity as _strip_entity
@@ -327,7 +328,13 @@ class AgentTraceRecorder:
         self.trace_id = str(uuid.uuid4())
         self.agent_type = agent_type
         self.session_id = session_id
-        self.user_input = user_input
+        # ★ A-04（2026-10-14）：用户输入**在入口处**就脱敏，一次覆盖全部出口 ——
+        #   run_start 事件（`agent_runs.jsonl` / `qd_agent_runs.jsonl` 的
+        #   `user_input`）以及 finish() 写的两处 DB 列
+        #   （`input_params.user_query` :703 与 `user_query` :711）都取自
+        #   `self.user_input`。放在这里而不是各出口分别抹，是为了避免
+        #   **半边脱敏**（漏一个出口 = 等于没脱）。开关见 `mask.mask_user_text`。
+        self.user_input = _mask_user_text(user_input)
         self.started_at_ms = _now_ms()
         self.events: list[dict] = []
         self.metadata = metadata or {}
@@ -369,7 +376,7 @@ class AgentTraceRecorder:
             {
                 "agent_type": agent_type,
                 "session_id": session_id,
-                "user_input": user_input,
+                "user_input": self.user_input,   # 已脱敏（见 __init__ 处说明）
                 "metadata": self.metadata,
             },
         )

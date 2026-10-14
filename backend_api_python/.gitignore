@@ -50,3 +50,12 @@ quantdinger.db
 /checkpoints.sqlite-wal
 /checkpoints.sqlite-shm
 /memory/history.jsonl
+
+# 运行时产物: agent 运行记录（A-04，2026-10-14）
+#   traces/*.jsonl 内含**用户输入**（user_input / query），属保留面最大的一类数据：
+#   写入侧已统一走 `utils.mask.mask_user_text` 脱敏，但**历史明文仍在库里**。
+# ⚠ 已入库的历史版本需手工摘除:
+#   git rm --cached backend_api_python/app/agent/traces/*.jsonl
+#   库里那份历史（含已提交的明文）如需彻底清掉，另需历史重写（filter-repo/BFG），
+#   单靠 rm --cached 只停增量、不动历史 —— 是否值得做请数据所有者定夺。
+/app/agent/traces/*.jsonl

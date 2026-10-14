@@ -347,9 +347,19 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
 
             # ── 综合评分 ──
             # A1a 因子权重接线（2026-09-26）：五维权重优先从 qd_agent_weights 取校准值，
-            # 无数据回退启发式常量 + calibrated=false。
-            # 注意：当前 factors 输出名是"多头:xxx"/"空头:xxx"，与维度名(ma/macd/...)不匹配，
-            # 故 get_factor_weights 暂返回空 → 走回退分支。A1b 统一 factors 命名后自动生效。
+            # 无数据回退启发式常量 + calibrated=false（缺口显式 > 硬凑数字，项目红线）。
+            #
+            # ★ 2026-10-14 复核（审计 A-05 / 设计 D-1）：这里**恒回退有二层原因**，
+            #   别再笼统写成"get_factor_weights 恒空"——那样会误导人去改 getter：
+            #   ① 样本层：`qd_agent_weights WHERE layer='factor'` **实测 0 行**
+            #      （`tmp/probe_factor_weights_20261014.py`）⇒ 闭环样本还没攒够，
+            #      这层会随时间自愈，getter 本身实现是对的（不是恒空的实现问题）。
+            #   ② 键名层：本模块输出的 factors 名是"多头:xxx"/"空头:xxx"（**论据**），
+            #      而这里加权的是**五维评分** ma/macd/rsi/boll/kdj —— 两套不同东西：
+            #      趋势≠ma（趋势来自 trend 数据源，ma 由均线排列算）、量价与情报在
+            #      五维里根本没有对应项 ⇒ **不是改个命名就能对齐的**，需设计裁定（D-1）。
+            #   ⚠ 对照：`technical_analysis` 是**自洽**的（它输出的 factors 名就是
+            #      趋势/指标/量价/形态/筹码/流通盘，与自己的权重键同名）⇒ 那边只等样本。
             _BB_DEFAULT_WEIGHTS = {"ma": 0.30, "macd": 0.25, "rsi": 0.20,
                                    "boll": 0.15, "kdj": 0.10}
             try:

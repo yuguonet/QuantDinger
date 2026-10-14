@@ -241,6 +241,13 @@ def _algo_analyze(
     # A1a 因子权重接线（2026-09-26）：优先从 qd_agent_weights 取校准权重（按 (skill,factor)
     # 双键的时间衰减准确率），无数据则回退启发式常量并显式标 calibrated=false。
     # 禁止静默假装修准过——缺口显式 > 硬凑数字（项目红线）。
+    #
+    # ★ 2026-10-14 复核（审计 A-05 / 设计 D-1）：本模块**键是自洽的** —— 上面生产的
+    #   factors 名（趋势/指标/量价/形态/筹码/流通盘）与这里 `_DEFAULT_WEIGHTS` 的键
+    #   **同名** ⇒ 只要攒够样本（`layer='factor'` 且 `sample_count>=5`）就会自动命中，
+    #   不需要改任何键名（有 AST 守卫盯着，见
+    #   `tests/test_v9_factor_weight_keys_20261014.py`）。
+    #   当前仍回退是**样本层**原因：`qd_agent_weights WHERE layer='factor'` 实测 0 行。
     _DEFAULT_WEIGHTS = {"趋势": 0.40, "指标": 0.25, "量价": 0.20,
                         "形态": 0.10, "筹码": 0.05, "流通盘": 0.00}
     try:

@@ -37,6 +37,11 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence
 
+# ★ A-04（2026-10-14）：用户输入落盘前统一脱敏，与 `utils/tracing.py` 共用
+#   同一个入口（`utils.mask.mask_user_text`）——两个 sink 必须同一个开关，
+#   否则会出现「traces 脱了、preselect 没脱」的半边脱敏。
+from ..utils.mask import mask_user_text as _mask_user_text
+
 logger = __import__("logging").getLogger(__name__)
 
 # ★ 2026-10-13 P9：本模块已迁出 `tools/` 自发现目录（现 `app/agent/preselect/`），
@@ -94,7 +99,8 @@ def record_task_calls(query: str, tools: Sequence[str]) -> Optional[Dict[str, An
         return None
     path = pairs_path()
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-           "query": q[:2000], "tools": seen}
+           # 脱敏后再截断（先截断会把 `sk-xxx…` 切坏、抹不干净）
+           "query": _mask_user_text(q)[:2000], "tools": seen}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -135,7 +141,7 @@ def record_empty_face(query: str = "", route: str = "", domain_count: int = 0) -
     _LATENCY["empty"] += 1
     _ROUTES[route or "unknown"] += 1
     sample = {"ts": time.strftime("%H:%M:%S"), "route": route or "unknown",
-              "q": (query or "")[:60]}
+              "q": _mask_user_text(query or "")[:60]}
     _SAMPLES.append(sample)
 
     rate = empty_rate()
