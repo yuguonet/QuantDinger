@@ -79,6 +79,44 @@ _QD_COMPACT_NOTES = (
 CORE_TOOL_DOMAINS = ("common", "meta")
 
 
+# ── 瞬态控制消息（跨轮防泄漏口径，2026-10-14）──────────────────────────
+# 【实测事故·002866】会话内上一轮「现在买什么股?」烧穿 per-run token 预算
+# （run_token:202346/200000），`qd_budgeting._account_budget` 抛
+# `LimitsExceeded(budget_wrapup_hint(...))`；mimo `BaseAgent.run` 捕获后
+# `add_message('user', str(e))` 并返回 `('LimitsExceeded', str(e))`。于是这条
+# **控制指令**（"已停止继续探索…不要再展开新的取数"）同时留在：
+#   ① 会话复用同一 QDAgent 的 `self.messages`（role=user，永久污染下一轮）；
+#   ② `qd_service._run_sync` 把返回文本当 assistant 落进记忆库。
+# 下一轮「分析002866」（预选已正确点名 get_realtime_quote 等 10 个工具）被这条
+# 旧指令带偏 ⇒ **零工具调用**、直接把全部字段写成「未获取」
+# （trace: status=Idle, steps=1, children=0）。
+#
+# 本表是这几类**系统生成、非用户输入**的控制语的唯一指纹口径，供两处消费：
+#   · `qd_agent._run_inner` 开轮前从 `self.messages` 清除（防跨轮泄漏）；
+#   · `qd_service._should_store_assistant` 跳过 assistant 记忆写入（防入库污染）。
+# ⚠ 只认**固定前缀/整体**：宁可漏判（当普通文本）也不误判用户问题（会静默丢输入）。
+TRANSIENT_CONTROL_MARKERS = (
+    "（本轮已触及成本上限：",       # utils/budget.budget_wrapup_hint（成本熔断）
+    "（本轮达到步数上限被截断",     # qd_agent._run_inner 步数耗尽兜底文案
+    "（模型未返回文字内容",         # qd_agent._run_inner 空回复兜底文案
+    "请用文字直接给出本轮结论",     # qd_agent._run_inner 空回复轻推 prompt
+    "【数字溯源拦截】",             # qd_agent._run_inner 溯源重写 prompt
+    "Empty assistant response",     # mimo BaseAgent.query 空响应字面量
+)
+
+
+def is_transient_control(text: Any) -> bool:
+    """一段文本是否是**内部瞬态控制消息**（不得跨轮/入库）。
+
+    只看开头是否命中 `TRANSIENT_CONTROL_MARKERS` —— 这几个文案全部由系统生成，
+    不会以它们开头出现在真实用户提问或正常答复里。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    return s.startswith(TRANSIENT_CONTROL_MARKERS)
+
+
 def _context_window() -> int:
     """模型上下文窗口（token）——compaction 与 wrap_up 的**唯一**口径。
 

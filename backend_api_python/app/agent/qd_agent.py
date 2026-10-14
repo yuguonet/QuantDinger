@@ -53,7 +53,8 @@ from mimoagent.agents.mimocode.mimocode_agent import MimocodeAgent
 from .audit.trace_adapter import TraceAdapter
 
 # ── 职责模块（详见文件头拆分表）──────────────────────────────────
-from .qd_config import QDAgentConfig, CORE_TOOL_DOMAINS, _QD_COMPACT_NOTES, _compaction_threshold
+from .qd_config import (QDAgentConfig, CORE_TOOL_DOMAINS, _QD_COMPACT_NOTES,
+                        _compaction_threshold, is_transient_control)
 from .qd_hooks import _ProbeInterrupt, _hooks_now, bind_run_session, register_run_hooks, unregister_run_hooks
 from .qd_tool_face import warmup_tool_face, ToolFaceMixin
 from .qd_preselect import PreselectMixin
@@ -61,6 +62,26 @@ from .qd_guards import GuardMixin
 from .qd_budgeting import BudgetMixin
 from .qd_aftercare import AftercareMixin
 from .qd_grounding import GroundingMixin
+
+
+def _purge_transient_control(messages: list) -> int:
+    """从会话消息里清除**上一轮遗留**的瞬态控制消息（防跨轮污染，2026-10-14）。
+
+    会话复用同一 QDAgent，mimo 会把每条控制指令 / 兜底文案
+    （`add_message('user', ...)`）永久留在 `self.messages`，让**下一轮**的模型把
+    "已停止继续探索 / 不要再展开新的取数" 当成对本轮的约束 —— 实测「分析002866」
+    因此零工具调用、全字段「未获取」（见 qd_config.TRANSIENT_CONTROL_MARKERS）。
+
+    本函数在每轮 run 开头、本轮 task 尚未入队时调用：只删**内容命中瞬态指纹**的
+    user/assistant 消息，不动真正的对话；返回删除条数（供测试与埋点）。
+    """
+    before = len(messages)
+    messages[:] = [
+        m for m in messages
+        if m.get("role") not in ("user", "assistant")
+        or not is_transient_control(m.get("content"))
+    ]
+    return before - len(messages)
 
 
 class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
@@ -203,6 +224,15 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         # _steps_taken 跨请求累积 → 轮次多了新消息一进来就 LimitsExceeded()
         # 且 str(e)=="" → 空结果退出。每轮 run 前归零，预算语义改为按请求。
         self._steps_taken = 0
+        # 跨轮防泄漏（2026-10-14）：先清掉**上一轮**残留的预算/步数/溯源/空回复
+        # 控制消息，否则模型会把"已停止继续探索"当成对本轮的约束（002866 零调用根因）。
+        # 必须在预选与 super().run 之前 —— 那时本轮的 task 还没进 messages。
+        purged = _purge_transient_control(self.messages)
+        if purged and self.trace is not None:
+            try:
+                self.trace.emit("purge_transient_control", removed=purged)
+            except Exception:
+                pass
         # 成本累计量按**请求**归零（2026-10-12 P0）。下面两处 `_steps_taken = 0`
         # （空回复轻推轮 / 溯源重写轮）**故意不归零**这三个计数器 —— 详见
         # _account_budget 的说明：重试轮归零成本 = 无限续杯。

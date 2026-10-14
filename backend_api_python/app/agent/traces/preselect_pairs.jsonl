@@ -776,3 +776,7 @@
 {"ts": "2026-10-14 09:41:52", "query": "查询股票 600519 的最新价、涨跌幅和成交量", "tools": ["get_realtime_quote"]}
 {"ts": "2026-10-14 09:54:01", "query": "查询股票 600519 的最新价、涨跌幅和成交量", "tools": ["get_realtime_quote"]}
 {"ts": "2026-10-14 10:08:31", "query": "现在买什么股?", "tools": ["read_skill", "get_market_overview", "update_plan", "activate_tools", "run_skill", "get_fund_flow", "get_hot_sectors", "search_stocks"]}
+{"ts": "2026-10-14 12:20:23", "query": "分析002866", "tools": ["get_chip_distribution", "get_realtime_quote", "agent_get_kline", "get_capital_summary", "get_fund_flow_daily", "technical_analysis"]}
+{"ts": "2026-10-14 12:25:55", "query": "'今天大盘怎么样，热门板块是哪个'", "tools": ["get_hot_sectors", "get_market_overview", "search_tools", "get_fund_flow"]}
+{"ts": "2026-10-14 12:29:35", "query": "'现在买什么股'", "tools": ["read_skill", "get_market_overview", "update_plan", "activate_tools", "run_skill", "bash", "get_hot_sectors", "grep", "read", "get_fund_flow", "search_stocks", "technical_analysis"]}
+{"ts": "2026-10-14 12:31:58", "query": "'分析600519'", "tools": ["update_plan", "get_fund_flow_daily", "search_intel", "get_realtime_quote", "get_chip_distribution", "agent_get_kline", "get_capital_summary", "technical_analysis", "batch_valuation_compare"]}

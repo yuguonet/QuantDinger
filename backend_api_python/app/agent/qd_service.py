@@ -29,6 +29,7 @@ try:
     from .qd_agent import QDAgent, QDAgentConfig, bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now
 except ImportError:
     from .qd_agent import QDAgent, QDAgentConfig, bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now
+from .qd_config import is_transient_control
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,17 @@ def _relevance(query: str, text: str) -> int:
         return 0
     keys = {q[i:i + 2] for i in range(max(0, len(q) - 1))} | {w for w in q.split() if len(w) >= 2}
     return sum(1 for k in keys if k in t)
+
+
+def _should_store_assistant(text: str) -> bool:
+    """本轮回复是否入会话记忆（best-effort 写侧闸门）。
+
+    2026-10-14：预算熔断/步数耗尽/空回复/溯源拦截等**瞬态控制文案**会被
+    `agent.run()` 当作 message 原样返回；若照旧落 `assistant` 记忆，下一轮预取
+    又把它注回上下文 ⇒ 跨轮污染（实测 002866 全字段「未获取」的成因之一）。
+    故只有**非空且非瞬态控制**的文本才写库。
+    """
+    return bool((text or "").strip()) and not is_transient_control(text)
 
 
 # ── 技能选择（2026-10-01 重写：词典分 + 范围信号 + 历史权重）─────────────
@@ -593,7 +605,7 @@ class QDAgentService:
             if self.memory is not None:
                 try:
                     asyncio.run(self.memory.add(session_id, "user", message))
-                    if text:
+                    if _should_store_assistant(text):
                         asyncio.run(self.memory.add(session_id, "assistant", text))
                 except Exception as e:
                     logger.debug("[memory] 历史写入失败（fail-open）: %s", e)
