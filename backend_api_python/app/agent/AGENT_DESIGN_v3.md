@@ -680,6 +680,162 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
   → 主 agent 引用预览写结论,明细留在文件里(不搬进上下文)
 ```
 
+### 5.4 T+N 回评流向（全景；2026-10-15 补驱动器与判定口径）
+
+```
+【驱动器】app/agent/scripts/exp_grind.py（小量刷经验；不写任何合成数据，只是生产链路的驱动器）
+  daily_universe 分层轮采(hot/warm/cold,同日确定) → run_agent 真实分析(每票独立 session)
+    → claims/pairs 落库                                  ← S-5「daily_universe 只写不读」缺环至此闭合
+                    ↓
+【到期判定】盘后 worker(15:30) 或 exp_grind 跑完立即驱一次
+  evaluator.auto_evaluate() → 到期 pending claims(due_date ≤ 今日)
+    → resolver.resolve_due_claims()
+        ├ 取真实 K 线(exec_date 为基准★;as_of 必须是 ISO 字符串)
+        ├ 阶段A 算偏差 → verdict/score/attribution
+        └ 写 qd_agent_resolutions(写败计 errors,不装成 resolved★)
+              ↓                        ↘
+   weight_feed.feed()(EMA 慢调)   calib_feed.build_samples()(pairs × resolutions JOIN)
+     → qd_agent_weights(行为,§5.2)   → cells → fit_with_pooling → β₀ → p_final(§21.4)
+```
+
+判定口径表（每一行都是静默事故换来的）：
+
+| 环节 | 口径 | 不这么写会出事 |
+|---|---|---|
+| `resolutions.actual` | `as_of` 等日期字段一律 ISO 字符串 | date 对象（含 windows 嵌套）过不了 `json.dumps`，被 except 吞 ⇒ **82/86 条静默失败、报表却报 resolved=86**（B1，2026-10-15 实证修复） |
+| `resolve_due_claims` 统计 | `resolution_id=None` 计 errors + warn | 计成 resolved ⇒ 报表 errors=0 一切完好、实际零落库（B2） |
+| 一 claim 一票 | resolutions 按 claim 取最新一条 | 同 claim 多条判定会重复投票，权重被单票放大 |
+| horizon 过滤 | 只判 T+1/T+3 到期的 claim | 提前判定 = 拿未来数据评过去（as-of 破坏） |
+| 校准只用 `p_base` | pairs 进 samples 只取 p_base | p_final 已含 β₀，二次代入 = 自我强化循环 |
+| `n_samples=0` / `Δp≡0` | **冷启动设计行为**，不是故障 | 簇 < `QD_CALIB_MIN_CLUSTERS`(30) 只出先验，`coefs_for()` 返回 None；**不要**为看非零 Δp 去编系数。观测入口 `calib_feed.build_report()` |
+| `due=0` | 正常 | T+1 claim 要下一个交易日才到期；exp_grind 快照行的 resolutions/n_samples 计数是观测面 |
+
+### 5.5 闭环与问责总图（三环合一；专题细节在各指针章）
+
+```
+                 ┌──────────────── 追责环（每次请求都转）────────────────┐
+用户问题 → ReAct → intake.record_decision → decisions ─┬─→ claims（闸门通过才写）─┐
+                    （C3P 五段,§12）                   │                        │ T+N 到期
+                        └─→ record_pair → pairs_*.jsonl┘                        ↓
+                                                    resolver.resolve_due_claims()
+                                                                    │
+                                                    qd_agent_resolutions（verdict/score/attribution）
+                                                          ↙              ↘
+                                    weight_feed.feed() → qd_agent_weights   calib_feed → cells → β₀
+                                              ↓                                  ↓
+                                    weight_hints.py（唯一读取口,TTL 600s）   c3p.aggregate(coefs=β₀)
+                                        ↙            ↘                            ↓
+                          预选 history_hint    _skill_score(tie-break)        p_final → 下一次配对
+```
+
+| 环 | 转的是什么 | 产物 | 专题位置 |
+|---|---|---|---|
+| 追责环 | 一次请求的留痕 → 可判定的 claim | decisions / claims / resolutions | §3.5、§5.2 |
+| 校准环 | 历史 pair 的概率位移校准 | β₀ → p_final | §17、§21.4 |
+| 问责环 | verdict 反作用于工具/技能选择 | weights → 行为 | §5.2、§3.5 |
+
+本节与 §3.5 / §5.2 / §21.4 / §F.3 的分工：那四处是**各环专题**（含代码级接线），本节是**语义级全景**——三环共用同一个 `qd_agent_resolutions` 岔口，改任一环的落库口径都必须回这里对账。
+
+### 5.6 skill/tools 工具流（一次请求内的工具面生命周期）
+
+```
+① 分层（§3.2）  必注入层(21,每轮必带) / 二级·域内(预选集) / 三级·能力层(39,按需激活)
+② 预选（§3.3）  plan_lint(加法先于减法★) → history_hint(只提示不过滤) → 激活 schema
+③ ReAct 循环    每轮 = 必注入 + 已激活 schema + 历史；未激活直调就地激活
+④ grounding     无依据数字拦截（§3.7）→ 文字结论 → TraceCollector.flush(root/skill/tool 三层)
+
+能力层（三级）供给链：
+  capabilities/scanner 全仓扫公开函数（SCAN_TARGETS 显式列 auto 的 hub/store/registry）
+    → admission.json 人工准入（70 项；auto 只放行只读函数）
+    → loader 导入 + 写操作前缀二次硬拒 + 60s 超时 + >8000 字符落 tmp/capability_output/
+    → 注册为 CAPABILITY_DOMAIN（planner 不可选域，只走按需激活）
+
+技能 vs 工具的分界：
+  工具 = 一次确定性调用（转调函数，结果回注上下文）
+  技能 = 多步编排（子进程 + 白名单 + 产物落盘，§5.3）
+  先例：skills/strategy-debug 把 auto/tools 的 why/debug/doctor 包成 4 个工具
+        （转调 CLI、零第二份规则；chat_why 是其退役前的轻量聊天壳）
+```
+
+| 坑 | 说明 |
+|---|---|
+| 每轮现算工具面 | 框架只在 init 算一次；不 override `get_model_query_kwargs` 则激活无效 |
+| 预选输入只认 `last_user_query` | 剥掉 prefetch 注入块，否则 goal 被历史个股带偏 |
+| `run_` 前缀硬拒 | admission 的 `WRITE_PREFIXES` 把 `run_*` 一网打尽 ⇒ **只读语义的桥函数取名也要避开**（§5.7 的 `agent_backtest_strategy` 即因此命名） |
+| fail-open 边界 | 工具挂不杀请求但必须 trace 留痕；"看得见调不动"比挂更糟 |
+
+### 5.7 agent × market_cn/auto 回测桥（设计态，2026-10-15 立项；未实现）
+
+用户裁定三原则：① **独立桥**——不侵入/破坏 agent 与 auto 两套架构；② **直传策略**——agent 自己想出的策略直接给 auto 回测；③ **不污染**——不影响其它回测链路中的数据。
+
+⚠️ **2026-10-15 复核（数据流缺口）**：立项稿把 ①② 写成 `proposal.apply` 写活 yaml、③ 写成把 `.py/.yaml` 丢进 `strategies/`、执行写成同进程 `run_all`。这三条**同时违反原则 ①③**：
+
+| 立项稿做法 | 实际串扰 |
+|---|---|
+| `proposal.apply` / 改活 `strategies/<key>.yaml` | `_yaml_doc` 按 mtime 热读；生产 scan/monitor/**别人的** `run_all` 下一轮就吃到 agent 改过的门 |
+| 新策略落 `strategies/` | `autodiscover` 拾取；重复 key 直接抛；`strategy_keys()` 并进 store 查询/清理范围 |
+| 同进程调 `run_all` | 共享 `_REGISTRY` 单例、`strategies/*._SPEC` 懒缓存、`cross_section._POOL` 单槽、`param_scan` 式 `default_params` 实例覆写；与盘中 scan/其它回测互踩 |
+| 能力层 60s / `run_*` 前缀硬拒 | 全盘 5k 票远超 60s；函数名踩 `WRITE_PREFIXES` 会被 loader 当写操作拒 |
+| 接到现有 `tools/finance/backtest_tools.py` | 那是 **指标/脚本策略链**（`BacktestService` → `qd_backtest_runs`），与 auto 折叠回测是两套口径 |
+
+修正后的数据流（原则③的根 = **子进程 + 作业目录 overlay，永不 apply 到活策略树**）：
+
+```
+agent（LLM 想出策略假设："断板后缩量回踩 5 日线，胜率/盈亏比如何？"）
+ ├─ 个股/小集合（默认）→ 工具 agent_backtest_strategy（三级能力层；名字避 run_ 前缀★）
+ └─ 全盘            → 技能 skills/auto-backtest（§5.3 子进程+产物落盘；能力层 60s 扛不住）
+        └─ app/agent/chain/backtest_bridge.py（独立桥：载体解析 / overlay 物化 / 预算 / 归一化 / 落盘）
+            ├─ ① 载体 → 作业目录 data/backtest_bridge/jobs/<job_id>/
+            │     yaml overlay +（③才有）.py；validate 用 proposal.py（只校验，禁止 --apply）
+            ├─ ② 预算钳制：QD_BT_MAX_DAYS / QD_BT_MAX_CODES / QD_BT_TIMEOUT / QD_BT_MAX_CONCURRENT
+            └─► 子进程 python -m app.market_cn.auto.backtest_cli
+                  env: QD_STRATEGY_YAML_OVERLAY_DIR=<job>  （子进程才读 overlay）
+                  公开入口仍是 run_all / backtest_stock → replay → fold_range → stdout JSON
+            ←─ ③ 归一化 summary（n/winrate/pl_ratio/ret_buckets + meta{git_sha,effective_params,overlay_digest}）
+            ←─ ④ 桥自有 JSONL：data/backtest_bridge/runs/<date>_<job>.jsonl
+        └─ 回 agent：解读结论；（可选）§5.4 记一条 claim——回测假设可被 T+N 问责
+```
+
+与现网两条回测链的关系（必须画开，否则工具预选会把「回测」送到错链）：
+
+```
+用户说「回测」
+  ├─ 指标/脚本策略（strategy_id 整数）→ 已有 run_backtest → BacktestService → qd_backtest_runs
+  └─ auto 折叠策略（strategy_key 字符串 / proposal / 新 .py+.yaml）
+        → 本桥 → backtest_cli → 内存 trades；零写 qd_backtest_runs / qd_dragon_signals
+```
+
+策略载体三档（用户拍板三档全上；物化目标 = **作业目录**，不是活 `strategies/`）：
+
+| 档 | 载体 | 校验/红线 | 回滚 |
+|---|---|---|---|
+| ① proposal | 对现有策略 yaml 的 JSON（`param`/`gate_expr`/`gate_enabled`/`gate_add`/`gate_del`） | `proposal.validate` 全套红线（路径白名单改成「overlay 里的 `<key>.yaml`」；选择集须附 stability+pool_check；不删 qualify；as-of 禁正偏移）。**禁止 `apply --apply`** | 删作业目录即回滚；活 yaml 从未改过 |
+| ② gate_add | ① 的子集：只加门，expr 限 `gate_stdlib` + 该策略已注册私有函数 | 同① | 同① |
+| ③ 新策略 | `.py`（`@register` + 折叠契约）+ `.yaml` 成对放进**作业目录** | 子进程 `importlib` 按路径加载，key 必须 `agentbt_<job>_*` 前缀（防撞生产 key）；折叠契约三方法非基类；yaml 过 as-of 静态检查。**禁止写入 `app/market_cn/auto/strategies/`** | 删作业目录；生产 `autodiscover` 看不见 |
+
+auto 侧唯一允许的薄钩子（原则①的「不破坏」边界——加法，默认关闭则行为与今日逐字节相同）：
+
+- `_paths.STRATEGY_DIR` / `evaluate.load_strategy` / `strategies._yaml_doc`：若 env `QD_STRATEGY_YAML_OVERLAY_DIR` 下存在 `<key>.yaml`，**子进程**优先读它。未设 env ⇒ 现路径。生产进程不设此 env。
+- 不改 `run_all` / `backtest_stock` / replay / fold / scan / store 的判定与写域。
+- `proposal.py` 已有 `--strategy-dir`，validate 直指作业目录，零改也能用。
+
+隔离清单（原则③；「数据」= 库表 + 进程内单例 + 磁盘策略树 + 生产缓存，四层都要列）：
+
+| 不碰 | 为什么 |
+|---|---|
+| 活 `strategies/*.yaml` `*.py` `config.json` `.history/` | 物化只进作业目录；禁止 apply |
+| `_REGISTRY` / `_*_SPEC` / `cross_section._POOL` / 实例 `default_params` | 子进程私有；父进程（Flask/scan/其它回测）零共享 |
+| `qd_dragon_signals` / `qd_watchlist` | 生产 scan/rebuild/monitor 写域 |
+| `qd_backtest_runs` / `qd_backtest_trades` | 指标回测链；混口径即污染 |
+| `window_cache` 写路径 | `run_all` 日线主路走 `fetch_klines_batch`（不进缓存）；禁止桥调 `load_windows`/`scan`/`rebuild`。`load_market_gain` 会读滑动缓存——桥不传这条路径 |
+| `daily_universe` | agent 采集链，桥不需要 |
+| `run_scan` / `rebuild` / `monitor` / `store` 写函数 | 生产写者 |
+| 共享表零写 | 桥只写 `data/backtest_bridge/**` |
+
+JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overlay_digest / scope(codes|all) / days / stats{n,winrate,pl_ratio} / meta{git_sha,effective_params} / pid / conclusion_ref`。
+
+实现落点见同目录 `backtest_bridge_plan.md`（TDD 先行）。代码落点：`app/agent/chain/backtest_bridge.py` ＋ `app/agent/tools/finance/auto_bt_tools.py`（**不**塞进现有 `backtest_tools.py`）＋ `skills/auto-backtest/` ＋ overlay 三行钩子 ＋ 守卫（桥不 import auto 写者、不碰四张表、作业目录不得位于 `strategies/`）。
+
 ---
 
 ## 6 精巧处
@@ -807,6 +963,9 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 | `QD_C3P_ENABLED` / `QD_C3P_MAX_CLAIMS` / `QD_C3P_BARS` | 1 / 2 / 120 | C3P 总开关 / 一次最多处理几条 claim / 取数根数 |
 | `QD_C3P_LLM_MODEL` | `""`（=用全局模型） | ⚠️ **建议单独指定轻量快模型**：证据抽取是轻量 JSON 活，不需推理模型。未设时吃全局模型（`mimo-v2.6-pro` 类慢模型）⇒ 又慢又贵，直接加剧超时 |
 | `QD_C3P_LLM_TIMEOUT` | **20** 秒 | ⚠️ **20s 对推理型模型 + 慢网关偏紧**（2026-10-13 实测当日 `APITimeoutError` 129 次、`APIConnectionError` 8 次；网关 `api.g2claw.com` 间歇性不稳）。超时本身不阻断主链（`extract_evidence` fail-open 返回 None 降级），但 mimo 的 tenacity 硬编码 5 次退避（4→60s）最坏要等 5×timeout 才放弃，用户体感是"卡住"。建议按网关实测中位延迟放大到 45~60s，或换轻量模型 |
+| **§5.7 回测桥（设计态，未接线）** | | |
+| `QD_BT_MAX_DAYS` / `_MAX_CODES` / `_TIMEOUT` / `_MAX_CONCURRENT` | 120 / 50 / 120 / 1 | 个股工具预算；全盘技能另用更宽超时。并发默认 1，避免与 scan 抢核 |
+| `QD_STRATEGY_YAML_OVERLAY_DIR` | 空 | **只许子进程设置**。该目录下存在 `<key>.yaml` 则 `load_strategy`/`_yaml_doc` 优先读它。生产进程不设 |
 
 > ⚠️ 上下文窗口**统一由 `QDAgent._context_window()` 读**：`QD_CONTEXT_WINDOW` > `QD_COMPACT_WINDOW`（旧名兼容）> `OPENAI_MAX_TOKENS` > 32768。
 > ⚠️ 下列**非 env** 开关在 `QDAgentConfig`（继承自 mimo）：`AntiHackGuard` **默认开**；`wrap_up_hint` **保持关**。
@@ -1855,6 +2014,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
     `mutate_d2_cron_20261014.py`）。
   - **回归**：全量 `tests/` **676 → 716 passed / 4 skipped**；设计机检
     **100/100 OK / 偏离率 0.0%**（新增 A21/A22 守"这两个文件应已归档"）。
+- 2026-10-15 **§5.7 回测桥数据流复核**：立项稿的 `proposal.apply` / 活 `strategies/` 落盘 / 同进程 `run_all` 违反「不污染其它回测链路」。改为子进程 `backtest_cli` + 作业目录 overlay；全盘走技能（能力层 60s 不够）；工具不塞进现有 `backtest_tools.py`。施工清单：`backtest_bridge_plan.md`。
 
 ---
 
