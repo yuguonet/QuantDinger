@@ -101,6 +101,10 @@ def _build_report(result: dict[str, Any], strategy: str, start: str, end: str) -
         "stats": _summary(cohort),
         "daily_activity": _activity(cohort),
         "trades": cohort,
+        # meta 透传（git_sha/effective_params 等，2026-10-15 批次B质量审查 C2）：
+        # agent 回测桥按 report["meta"] 回读可复测证据（backtest_bridge_plan Task 4 契约），
+        # 纯字段透传，不参与任何回测行为/判定。
+        "meta": result.get("meta"),
     }
 
 

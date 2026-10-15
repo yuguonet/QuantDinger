@@ -150,7 +150,7 @@ def search_stocks(
 #  筛选条件转换（原 screener_filters.py）
 # ══════════════════════════════════════════════════════════════
 
-def build_keyword_from_filters(filters: Dict[str, Any]) -> str:
+def _build_keyword_from_filters(filters: Dict[str, Any]) -> str:
     """条件转关键词：将 filters 字典转为自然语言查询字符串，供 search_stocks 使用。
 
     Returns:

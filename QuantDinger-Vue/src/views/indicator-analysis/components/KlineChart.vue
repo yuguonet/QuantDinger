@@ -203,6 +203,18 @@ import request from '@/utils/request'
 import { decryptCodeAuto, needsDecrypt } from '@/utils/codeDecrypt'
 import ExchangeKlineWs from '@/utils/exchangeWs'
 import { INDICATOR_REGISTRY } from './indicatorCalculations'
+// 视口/刻度纯函数：进入态跨度、右缘锚定、极坐标冗余、分时 30 分钟刻度（可脱离浏览器验证）
+import {
+  ENTRY_VISIBLE_BARS,
+  ENTRY_BREATH_BARS,
+  MINUTE_GRID_INTERVAL_MIN,
+  MINUTE_X_TICK_MIN_GAP_PX,
+  clampBarSpace,
+  entryBarSpace,
+  rightOffsetPx,
+  polarHalfPrice,
+  minuteGridMarks
+} from './klineViewport'
 import { readPrefs, writePrefs } from '@/utils/uiPrefs'
 
 export default {
@@ -2495,6 +2507,176 @@ json.dumps(output)
     // 指标线与库原生画线（含日K的收盘价线）走同一条逐帧重绘管线：每次绘制都
     // 用当前轴范围现算坐标，天然跟随锁定范围，永不脱节。
 
+    // ==================================================================================
+    // 视口定位原语（所有程序化视口变化的唯一出口）
+    // ==================================================================================
+    // 背景：分时铺满时段、蜡烛进入态、换股回到最新、周期现场恢复，这四条路径此前各写
+    // 一套库调用序列，且都会互相污染 —— 分时把「右缘空位」写成几百 px 后，蜡烛周期
+    // 的最新柱被整体推离右缘（“最新数据在最左边、右侧一大片空白”），而 applyNewData
+    // 只会 resetOffsetRightDistance() 沿用现值，永远拉不回来。
+    // 因此这里收口成三个原语：读当前跨度 / 设右缘空位 / 还原出厂右缘空位。
+
+    /** 读当前 barSpace（公开 API 返回数值；部分版本返回 {bar}，两种都兼容） */
+    const readBarSpace = (chart) => {
+      const c = chart || chartRef.value
+      if (!c || typeof c.getBarSpace !== 'function') return 0
+      try {
+        const bs = c.getBarSpace()
+        const v = typeof bs === 'number' ? bs : (bs && bs.bar)
+        return v > 0 ? v : 0
+      } catch (_) { return 0 }
+    }
+
+    /**
+     * 绘图区宽度（不含 Y 轴）。优先取主图绘图区的精确值（与库内部 _totalBarSpace 同源），
+     * 退化到 DOM clientWidth；都拿不到返回 0（调用方放弃换算，沿用当前 barSpace）。
+     */
+    const resolvePlotWidth = (chart) => {
+      const c = chart || chartRef.value
+      if (!c) return 0
+      try {
+        if (typeof c.getSize === 'function') {
+          const size = c.getSize('candle_pane', 'main')
+          if (size && size.width > 0) return size.width
+        }
+      } catch (_) { /* 预期内 */ }
+      try {
+        const dom = typeof c.getDom === 'function' ? c.getDom('candle_pane', 'main') : null
+        if (dom && dom.clientWidth > 0) return dom.clientWidth
+      } catch (_) { /* 预期内 */ }
+      // 退化到底层容器尺寸：init/applyNewData 刚完成时库内部尺寸可能尚未就绪，
+      // 用 DOM 宽度兜底，保证 entryBarSpace 能算出自适应 barSpace
+      // （否则宽度取 0 → entryBarSpace 返回 0 → 不重设 barSpace → 沿用默认/残留跨度
+      //   → 进入态只看到几根蜡烛、最新柱被推离右缘）
+      try {
+        const container = typeof document !== 'undefined' ? document.getElementById('kline-chart-container') : null
+        if (container && container.clientWidth > 0) return container.clientWidth
+      } catch (_) { /* 预期内 */ }
+      return 0
+    }
+
+    /** 图表出厂右缘空位（px）。库默认 80；建图后抓一次，用于清掉分时留下的巨大空位 */
+    let _chartDefaultOffsetRightPx = null
+    const captureChartDefaultOffset = () => {
+      const chart = chartRef.value
+      if (!chart || _chartDefaultOffsetRightPx != null) return
+      try {
+        if (typeof chart.getOffsetRightDistance === 'function') {
+          const v = Number(chart.getOffsetRightDistance())
+          if (Number.isFinite(v) && v >= 0) _chartDefaultOffsetRightPx = v
+        }
+      } catch (_) { /* 预期内 */ }
+      if (_chartDefaultOffsetRightPx == null) _chartDefaultOffsetRightPx = 80
+    }
+
+    /**
+     * 还原出厂右缘空位。
+     *
+     * 为什么必须还原：分时把 _offsetRightDistance 改成「剩余时段 × barSpace」（几百 px），
+     * 它是**图表实例级**状态 —— applyNewData 内部的 resetOffsetRightDistance() 会沿用它，
+     * 于是切回蜡烛周期后最新柱被推离右缘；同时 scrollToRealTime() 用
+     * getInitialOffsetRightDistance()（同为现值）算距离，被污染后距离恒为 0，
+     * 「回到最新」变成空操作。
+     */
+    const resetRightOffsetToDefault = () => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.setOffsetRightDistance !== 'function') return
+      captureChartDefaultOffset()
+      try { chart.setOffsetRightDistance(_chartDefaultOffsetRightPx) } catch (_) { /* 预期内 */ }
+    }
+
+    /**
+     * 把右缘空位直接设成 N 根柱。
+     * 库的 setOffsetRightDistance 收像素并立即重算 diff = px / barSpace，
+     * 所以必须在 setBarSpace 之后、用当前 barSpace 现算（见 klineViewport.rightOffsetPx）。
+     */
+    const setRightSideDiffBars = (bars, barSpace) => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.setOffsetRightDistance !== 'function') return false
+      const bs = barSpace > 0 ? barSpace : readBarSpace(chart)
+      if (!(bs > 0)) return false
+      try {
+        chart.setOffsetRightDistance(rightOffsetPx(bs, bars))
+        return true
+      } catch (_) { return false }
+    }
+
+    /** 记录分时锁定后的可见范围（范围变动回调据此判断是否被外力扰动） */
+    const syncMinuteLockedRange = (count) => {
+      const chart = chartRef.value
+      if (!chart) return
+      try {
+        const range = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
+        _minuteLockedRange = range
+          ? { from: Math.round(range.from), to: Math.round(range.to) }
+          : { from: 0, to: Math.max(0, (Number(count) || 1) - 1) }
+      } catch (_) { /* 预期内 */ }
+    }
+
+    /**
+     * 分时视口锚定（增量路径的最小动作）：只重设右缘空位 = 剩余时段 × barSpace。
+     *
+     * 性质：diff = 全时段柱数 - 当前柱数 ⇒ count + diff 恒为全时段柱数，
+     * 而库的横坐标 dataIndexToCoordinate(i) = W - (count + diff - i - 0.5) × barSpace，
+     * 即「第 i 根柱的横坐标只由 i 决定」⇒ 新柱到达时既有柱**原地不动**，新柱长在右侧。
+     * 反之，若沿用 applyNewData 里的 resetOffsetRightDistance（空位不变），
+     * 整条序列会每分钟左移一根、再被铺满逻辑拉回 —— 那就是用户看到的窗口抖动。
+     * 调用只触发库内一次 adjustVisibleRange（不换 barSpace、不滚动、不切滚动开关）。
+     */
+    const anchorMinuteViewport = () => {
+      const chart = chartRef.value
+      if (!chart || _minuteAnchoring) return
+      let count = 0
+      try {
+        const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
+        count = (list || []).length
+      } catch (_) { /* 预期内 */ }
+      if (!count) return
+      const bs = readBarSpace(chart)
+      if (!(bs > 0)) return
+      const totalBars = minuteSessionBarCount(getMinuteLineSession())
+      _minuteAnchoring = true
+      try {
+        if (typeof chart.setOffsetRightDistance === 'function') {
+          chart.setOffsetRightDistance(Math.max(0, totalBars - count) * bs)
+        }
+      } catch (_) { /* 预期内：图表未就绪时等下一轮 */ } finally {
+        _minuteAnchoring = false
+      }
+      // 同步锁定范围：放在锚定之后，供范围回调判断“当前范围是否被外力扰动”
+      syncMinuteLockedRange(count)
+    }
+
+    /** 首次进入图表（本组件实例的第一次蜡烛数据就绪）→ 走「进入态视口」而非恢复持久化现场 */
+    let _entryViewportPending = true
+
+    /**
+     * 蜡烛周期「进入态」视口：最新 120 根 + 2 根呼吸位铺满绘图区，最新柱贴右缘。
+     *
+     * 为什么要显式定位：库默认跨度是 barSpace = 8，可见根数随窗口宽度变化
+     * （实测 988px 绘图区 ≈ 124 根，1600px 窗口 ≈ 200 根），且分时留下的跨度/空位会残留。
+     * 何时用：首次进入、以及该周期没有现场可恢复（不再退化成"库默认跨度"）。
+     */
+    const applyEntryViewport = () => {
+      const chart = chartRef.value
+      if (!chart || isMinuteLine.value) return false
+      const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
+      if (!list || !list.length) return false
+      // 程序化定位不归档现场（否则会把"进入态"写进用户拖拽存档）
+      suppressSceneCapture()
+      const bs = entryBarSpace({
+        plotWidth: resolvePlotWidth(chart),
+        barCount: list.length,
+        visibleBars: ENTRY_VISIBLE_BARS,
+        breathBars: ENTRY_BREATH_BARS
+      })
+      if (bs > 0 && typeof chart.setBarSpace === 'function') {
+        try { chart.setBarSpace(bs) } catch (_) { /* 预期内：越界时库会静默拒绝，沿用当前跨度 */ }
+      }
+      setRightSideDiffBars(ENTRY_BREATH_BARS)
+      return true
+    }
+
     // --- 分时图交互控制相关变量 ---
     /** 分时图模式下禁用滚轮/拖拽的事件处理器引用，用于恢复时移除 */
     let _minuteWheelHandler = null
@@ -2511,6 +2693,12 @@ json.dumps(output)
     let _minuteFitting = false
     /** 分时：最近一次数据真正发生变化的时刻（用于停滞看门狗） */
     let _minuteLastChangeTs = 0
+    /**
+     * 分时锚定重入保护：setOffsetRightDistance 会**无条件**触发 onVisibleRangeChange，
+     * 而该回调又会在范围不符时调 anchorMinuteViewport ⇒ 没有这个标志就会无限递归
+     * （每次重设都再触发一次回调，而 _minuteLockedRange 还没来得及同步）。
+     */
+    let _minuteAnchoring = false
     /** 分时：看门狗上次全量重载的时刻（限流，避免频繁重载） */
     let _minuteWatchdogTs = 0
     /** 分时：整分钟强制刷新定时器，保证每一分钟的新柱在过界后立刻补上 */
@@ -2524,14 +2712,15 @@ json.dumps(output)
 
     /**
      * 分时图模式：把可见视口固定锁死为「整个交易时段」。
-     * 数据多长就多长（不再用 null 占位柱补齐未来时段），改为纯视口方案：
      *   1. barSpace = 绘图区宽度 / 全时段总柱数（A股=240，港股=330，见 minuteSessionBarCount）；
-     *   2. scrollToDataIndex(count-1) 先让最后一根真实柱贴到右缘（diff=0 基准）；
-     *   3. setOffsetRightDistance((总柱数-数据数)×barSpace) 把数据锚定到最左侧（from=0），
-     *      右侧留白即为尚未走完的未来时段；X 轴刻度按库原生行为只画到最后一根真实柱；
-     *   4. finally 中 setScrollEnabled(false) 锁死视口（不再随滚动/缩放变化）。
-     * 由于 barSpace 恒定（= 宽度/总柱数），实时追加新柱时视图零抖动，只需重设右侧空位。
-     * 注意：setBarSpace / scrollToDataIndex 依赖滚动能力，必须在 setScrollEnabled(false) 之前执行。
+     *   2. 右缘空位 = 剩余时段 × barSpace ⇒ 数据贴左、右侧留白即尚未走完的时段；
+     *   3. finally 中 setScrollEnabled(false) 锁死视口（不再随滚动/缩放变化）。
+     *
+     * 只在「进入分时 / 绘图区尺寸变化 / 全量重载」时调用；实时增量的最小动作是
+     * anchorMinuteViewport()（见其注释）。barSpace 与目标值一致时不碰 setBarSpace ——
+     * setBarSpace 自己会 adjustVisibleRange + 重排整个视口，白跑一次就是"窗口又调了一下"。
+     * 注：不再需要临时开滚动（早版靠 scrollToDataIndex 定位；现在空位由 setOffsetRightDistance
+     * 一次设定，不依赖滚动能力），也就少了一开一关的交互状态抖动。
      */
     const fitMinuteLineView = () => {
       const chart = chartRef.value
@@ -2539,48 +2728,19 @@ json.dumps(output)
       _minuteFitting = true
       try {
         const dataList = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
-        const count = dataList.length
-        if (!count) return
-        // 铺满与滚动需要滚动能力，先临时恢复（finally 中统一关闭）
-        if (typeof chart.setScrollEnabled === 'function') chart.setScrollEnabled(true)
+        if (!dataList || !dataList.length) return
         const totalBars = minuteSessionBarCount(getMinuteLineSession())
-        // 绘图区宽度：优先取主图 drawing 区精确值（不含 Y 轴，与库内部 _totalBarSpace 同源），
-        // 失败时退化为 DOM clientWidth，再失败则放弃换算（沿用当前 barSpace 只做锚定）
-        let plotWidth = 0
-        try {
-          if (typeof chart.getSize === 'function') {
-            const size = chart.getSize('candle_pane', 'main')
-            if (size && size.width > 0) plotWidth = size.width
-          }
-        } catch (_) { /* 预期内 */ }
-        if (!(plotWidth > 0)) {
-          try {
-            const dom = typeof chart.getDom === 'function' ? chart.getDom('candle_pane', 'main') : null
-            if (dom && dom.clientWidth > 0) plotWidth = dom.clientWidth
-          } catch (_) { /* 预期内 */ }
-        }
+        const plotWidth = resolvePlotWidth(chart)
         // barSpace 合法域与库一致（MIN=1 / MAX=50），越界会被 setBarSpace 静默拒绝
-        let barSpace = plotWidth > 0 ? Math.max(1, Math.min(50, plotWidth / totalBars)) : 0
-        if (barSpace > 0 && typeof chart.setBarSpace === 'function') {
+        const barSpace = plotWidth > 0 ? clampBarSpace(plotWidth / totalBars) : 0
+        const current = readBarSpace(chart)
+        // 阈值用 0.5px（而非 1e-6）：库内部对 barSpace 有取整/舍入，逐 tick 的浮点漂移
+        // 会恒定超过 1e-6 → 每帧都重设 barSpace → 触发整视口重排 → 每分钟可见抖动。
+        // 0.5px 的差异在视觉上不可辨，仅在真实尺寸变化（resize）时才重铺。
+        if (barSpace > 0 && Math.abs(current - barSpace) > 0.5 && typeof chart.setBarSpace === 'function') {
           chart.setBarSpace(barSpace)
         }
-        if (typeof chart.getBarSpace === 'function') {
-          // 公开 API getBarSpace() 返回数值；部分版本/内部实现返回对象 {bar,...}，两种都兼容
-          const bs = chart.getBarSpace()
-          const bsVal = typeof bs === 'number' ? bs : (bs && bs.bar)
-          if (bsVal > 0) barSpace = bsVal
-        }
-        if (!(barSpace > 0)) return
-        // 数据锚定最左侧：先让最后一根贴右缘（diff=0），再设置右侧空位 = 未走完的未来时段
-        if (typeof chart.scrollToDataIndex === 'function') chart.scrollToDataIndex(count - 1, 0)
-        if (typeof chart.setOffsetRightDistance === 'function') {
-          chart.setOffsetRightDistance(Math.max(0, totalBars - count) * barSpace, true)
-        }
-        // 记录锁定后的实际范围（to 被库钳到数据数），供范围反弹回调判断是否被外力扰动
-        const range = typeof chart.getVisibleRange === 'function' ? chart.getVisibleRange() : null
-        _minuteLockedRange = range
-          ? { from: Math.round(range.from), to: Math.round(range.to) }
-          : { from: 0, to: count - 1 }
+        anchorMinuteViewport()
       } catch (_) {
         // 预期内：图表未就绪时无法铺满，静默降级
       } finally {
@@ -2677,13 +2837,15 @@ json.dumps(output)
       container.addEventListener('touchstart', _minuteTouchStartHandler, { passive: true })
       container.addEventListener('touchmove', _minuteTouchMoveHandler, { passive: false })
 
-      // 兜底锁死可见范围：任何范围变化（applyNewData / resize 等）都立即重新铺满
+      // 兜底锁死可见范围：任何范围变化（applyNewData / resize 等）都立即重新锚定
+      // （只重设右缘空位，不重铺：barSpace 恒定，重铺会多一次布局重排且会与 applyNewData
+      //  内部的 resetOffsetRightDistance 来回拉锯 —— 那正是"每分钟窗口抖一下"的直接来源）
       if (chartRef.value && typeof chartRef.value.subscribeAction === 'function') {
         _minuteRangeChangeCallback = () => {
-          if (_minuteLockedRange && !_minuteFitting && chartRef.value && isMinuteLine.value) {
+          if (_minuteLockedRange && !_minuteFitting && !_minuteAnchoring && chartRef.value && isMinuteLine.value) {
             const current = chartRef.value.getVisibleRange()
             if (current && (Math.round(current.from) !== _minuteLockedRange.from || Math.round(current.to) !== _minuteLockedRange.to)) {
-              fitMinuteLineView()
+              anchorMinuteViewport()
             }
           }
         }
@@ -3043,12 +3205,16 @@ json.dumps(output)
               // 实时新增/替换分钟柱后重新铺满，避免 applyNewData 重置 barSpace 导致时段不再占满宽度
               fitMinuteLineView()
             }
+            // 防御性重装 30 分钟 X 轴刻度补丁：applyMinutePrevCloseAxis 已在调度前调用过，
+            // 但 init/首帧时轴实例可能未就绪导致补丁未挂上；此处数据就绪后再挂一次，
+            // 保证「30 分钟时间标签 + 背景竖向虚线」稳定生效（幂等，已挂则跳过）。
+            installMinuteXAxisTicks()
             // 【注意】这里不再调 maybeUpdateIndicators()：
             // 1) applyNewData 内部会异步重算全部图表指标实例（AVP 均价线/MA/VOL 均自动跟随新数据）；
             // 2) updateIndicators 是「全删重建」，每次都会重挂 VOL 副图与主图指标，
             //    分时下每 10s 重建一次会表现为周期性的窗口闪烁/抖动。
-            // 盘中创新高/新低会扩大波动区间 → 重新锁定 Y 轴（锚点未变则内部跳过）
-            applyMinutePrevCloseAxis()
+            // Y 轴锁定（applyMinutePrevCloseAxis）由 mergeMinuteLineRealtime 在调度前已同步调用，
+            // 此处不再重复 → 避免「每分钟两次区域调整」（applyNewData 重置 + 锚定 + Y 轴双锁）。
           } catch (_) { /* 预期内：图表未就绪时等待下一轮全量加载 */ }
         }
       }, wait)
@@ -3187,24 +3353,38 @@ json.dumps(output)
       }
     }
 
-    /** 恢复指定周期的图表现场；无现场时保持默认视图（最新居右） */
+    /** 恢复指定周期的图表现场。
+     *
+     * @returns {boolean} true = 已按现场定位；false = 无可用现场（调用方应回落到进入态视口）
+     */
     const restoreChartScene = (tf) => {
       const chart = chartRef.value
       const scene = tf ? _tfSceneMap[tf] : null
-      if (!chart || !scene || !(scene.barSpace > 0) || scene.savedTo == null) return
+      if (!chart || !scene || !(scene.barSpace > 0) || scene.savedTo == null) return false
       try {
         const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
         const count = list.length
-        if (!count) return
-        if (typeof chart.setBarSpace === 'function') chart.setBarSpace(scene.barSpace)
-        if (typeof chart.scrollToDataIndex !== 'function' || typeof chart.scrollByDistance !== 'function') return
+        if (!count) return false
+        if (typeof chart.scrollToDataIndex !== 'function' || typeof chart.scrollByDistance !== 'function') return false
+        // 先清掉分时可能留下的巨大右缘空位：恢复位置靠 scrollByDistance 的相对量算，
+        // 而 scroll() 的基准是当前 diff ⇒ 带着污染值恢复会把位置整体推偏
+        resetRightOffsetToDefault()
+        const currentBs = readBarSpace(chart)
+        if (typeof chart.setBarSpace === 'function' && Math.abs(currentBs - scene.barSpace) > 1e-6) {
+          // 跨度不同才换（相同就跳过，避免白跑一次布局重排）
+          chart.setBarSpace(scene.barSpace)
+        }
         // 先把最后一根贴右缘（diff=0 基准），再按保存的 to 反解 diff 精确滚动
         chart.scrollToDataIndex(count - 1, 0)
         const savedTo = Math.min(Math.max(scene.savedTo, 1), count)
         const targetDiff = savedTo - count - 0.5
         const distance = -targetDiff * scene.barSpace
         if (distance) chart.scrollByDistance(distance, 0)
-      } catch (_) { /* 预期内：数据尚未就绪时放弃本次恢复 */ }
+        return true
+      } catch (_) {
+        // 预期内：数据尚未就绪时放弃本次恢复
+        return false
+      }
     }
 
     /** 程序化视口定位(切股滚最新/恢复现场/换数据)的抑制窗口:
@@ -3214,22 +3394,6 @@ json.dumps(output)
     const suppressSceneCapture = () => {
       if (_sceneCaptureTimer) { clearTimeout(_sceneCaptureTimer); _sceneCaptureTimer = null }
       _sceneSuppressUntil = Date.now() + 400
-    }
-
-    /** 换股定位: 最新K线右缘留 2bar 呼吸位(保留缩放跨度)。
-     *  scrollToRealTime 先贴右缘(diff=0 基准), 再向右露 2 根 bar 宽 ——
-     *  方向与 restoreChartScene 的反解一致: distance = -diff * barSpace */
-    const goLatestWithBreath = () => {
-      const chart = chartRef.value
-      if (!chart) return
-      try {
-        if (typeof chart.scrollToRealTime === 'function') chart.scrollToRealTime()
-        const bs = typeof chart.getBarSpace === 'function' ? chart.getBarSpace() : 0
-        const bar = bs && typeof bs === 'object' ? bs.bar : bs
-        if (bar > 0 && typeof chart.scrollByDistance === 'function') {
-          chart.scrollByDistance(-2 * bar, 0)
-        }
-      } catch (_) { /* 预期内 */ }
     }
 
     /** 周期现场写 uiPrefs (kline-scene 模块): 刷新/重开浏览器后可恢复各周期的跨度与起止 */
@@ -3384,6 +3548,8 @@ json.dumps(output)
     }
     /** 关键位线型：虚线 + 1px，与实线价格序列区分 */
     const MINUTE_SR_DASH = [4, 4]
+    /** 涨跌停线配色：涨停向上=红、跌停向下=绿（与 A 股涨跌色彩语义一致） */
+    const MINUTE_LIMIT_STYLE = { up: '#f5222d', down: '#52c41a' }
     /** 右端价格标签字号（与分时 tooltip 同量级，不抢戏） */
     const MINUTE_SR_FONT = '10px sans-serif'
     /** 价格标签底色（贯穿线标签与贴边标记共用，压住下方分时线保证可读） */
@@ -3588,6 +3754,90 @@ json.dumps(output)
       } catch (_) { /* 预期内：指标未就绪时由自愈重试补上 */ }
     }
 
+    // ==================================================================================
+    // 分时极坐标：涨停/跌停线（±limit 价格）
+    // ==================================================================================
+    // 为什么不能只靠 Y 轴刻度：极坐标把范围锁成「昨收 ± limit% × (1 + 冗余)」，
+    // 刻度间隔由库的 nice(range/8) 决定（例如 10 元 / ±10% → 间隔 0.3），
+    // 恰好落在 11.00 / 9.00 的刻度经常不存在，而且边缘处的刻度会被过滤掉 ⇒
+    // 用户看到的是「跌停和涨停线看不到」。这里直按价格画线（与 0 轴线/关键位线同一机制：
+    // 原生指标逐帧重绘，每次绘制现算坐标），不依赖刻度间隔。
+    const MINUTE_LIMIT_LINES_IND = 'MINUTE_POLAR_LIMIT_LINES'
+    /** 分时极坐标：当前要画的涨跌停位（由 applyMinutePrevCloseAxis 维护；空数组=不画） */
+    let _minutePolarLevels = []
+    const MINUTE_LIMIT_LINES_DRAW = ({ ctx, bounding, yAxis, indicator }) => {
+      try {
+        if (!ctx || !bounding || !(bounding.width > 0) || !(bounding.height > 0)) return true
+        if (!Array.isArray(_minutePolarLevels) || !_minutePolarLevels.length) return true
+        const axis = yAxis || (indicator && indicator.yAxis)
+        if (!axis || typeof axis.convertToPixel !== 'function') return true
+        ctx.save()
+        ctx.font = MINUTE_SR_FONT
+        ctx.textBaseline = 'middle'
+        for (const lv of _minutePolarLevels) {
+          let y = null
+          try { y = axis.convertToPixel(lv.price) } catch (_) { y = null }
+          if (y == null || !Number.isFinite(y)) continue
+          const yy = Math.round(y) + 0.5 // 半像素对齐，避免 1px 线被反锯齿糊成 2px
+          // 放宽边界裁剪：极坐标冗余加大后线通常落在 pane 内部，但图高较矮时仍可能贴近边缘，
+          // 允许线体画到 pane 边缘（半像素对齐），避免「涨停/跌停线看不到」
+          if (yy < 0.5 || yy > bounding.height - 0.5) continue
+          ctx.strokeStyle = lv.color
+          ctx.lineWidth = 1
+          ctx.setLineDash(MINUTE_SR_DASH)
+          ctx.beginPath()
+          ctx.moveTo(0, yy)
+          ctx.lineTo(bounding.width, yy)
+          ctx.stroke()
+          ctx.setLineDash([])
+          // 标签放左端：右端已被 0 轴线/关键位标签占用，避免叠字
+          const text = `${lv.title} ${lv.price.toFixed(2)}`
+          const tw = ctx.measureText(text).width
+          ctx.fillStyle = MINUTE_SR_LABEL_BG
+          ctx.fillRect(2, yy - 7, tw + 4, 14)
+          ctx.fillStyle = lv.color
+          ctx.fillText(text, 4, yy)
+        }
+        ctx.restore()
+      } catch (_) { /* 预期内：轴未就绪时由下一帧重绘 */ }
+      return true
+    }
+
+    /** 分时极坐标：确保涨跌停线指标已挂上（与 0 轴线/关键位线独立，不依赖昨收是否已解析） */
+    const ensureMinuteLimitLinesIndicator = () => {
+      const chart = chartRef.value
+      if (!chart || !isMinuteLine.value) return
+      const want = _minutePolarLevels.length > 0
+      try {
+        let names = []
+        try {
+          const instances = chart.getIndicatorByPaneId('candle_pane')
+          if (instances && typeof instances.keys === 'function') names = Array.from(instances.keys())
+        } catch (_) { /* 预期内 */ }
+        const exists = names.includes(MINUTE_LIMIT_LINES_IND)
+        if (!want) {
+          if (exists) chart.removeIndicator('candle_pane', MINUTE_LIMIT_LINES_IND)
+          return
+        }
+        if (exists) return
+        registerIndicator({
+          name: MINUTE_LIMIT_LINES_IND,
+          shortName: '',
+          series: 'price',
+          precision: 2,
+          figures: [{ key: 'limitLine', title: '', type: 'line' }],
+          styles: {
+            lines: [{ color: '#8c8c8c', style: 'dashed', dashedValue: MINUTE_SR_DASH, size: 1 }]
+          },
+          // figure 恒为 null：全部绘制由 draw 接管（避免默认逐柱连线画出一条无意义的横线）
+          calc: (list) => (list || []).map(() => ({ limitLine: null })),
+          draw: MINUTE_LIMIT_LINES_DRAW
+        })
+        // isStack 必须为 true：false 会执行 `paneInstances = []`，把均价线/0 轴线/关键位线一起清空
+        chart.createIndicator(MINUTE_LIMIT_LINES_IND, true, { id: 'candle_pane' })
+      } catch (_) { /* 预期内：指标未就绪时由自愈重试补上 */ }
+    }
+
     /** 已应用的锚点区间，避免实时刷新时无谓重建 */
     let _minuteAxisRange = null
     /** 是否已锁定主图 Y 轴范围（退出分时时用于精确还原，避免影响其它周期） */
@@ -3736,37 +3986,45 @@ json.dumps(output)
       }
       return ticks
     }
-    /** 文本小数位截断（保留前缀/千分位/符号，仅限制小数点后位数） */
+    /**
+     * 文本小数位收敛（保留前缀/千分位/符号，仅限制小数点后位数）：
+     *  - 先截断到最多 maxDec 位小数（价格精度 > maxDec 时）；
+     *  - 再去掉尾随的 0 与残留小数点：50.000 → 50，50.10 → 50.1，50.123 → 50.123
+     */
     const capTextDecimals = (text, maxDec) => {
       const s = String(text)
       const i = s.indexOf('.')
-      if (i < 0 || s.length - i - 1 <= maxDec) return s
-      return s.slice(0, i + maxDec + 1)
+      if (i < 0) return s
+      const out = s.length - i - 1 <= maxDec ? s : s.slice(0, i + maxDec + 1)
+      return out.replace(/0+$/, '').replace(/\.$/, '')
     }
     /**
-     * 给分时主图 Y 轴安装自定义刻度：
-     *  - percentage（涨跌幅轴）：昨收定基重定基刻度，1 位小数（buildMinuteRebasedTicks）
-     *  - normal（金额轴）：Y 轴刻度最多 3 位小数（图表价格精度 >3 时仅截断显示文本，
-     *    不改数据与精度本身；<3 时透传库默认刻度，与其它周期表现一致）
-     * 仅分时锁定态生效，退出分时/切普通周期时透传并最终还原。
+     * 主图 Y 轴刻度策略（安装一次，常驻；两个分支各自按当前状态生效）：
+     *  - normal（金额轴，**所有周期**）：价格刻度文本最多 3 位小数，且去掉尾随零
+     *    （50.000 → 50）—— 图表价格精度 >=3 时收敛显示文本，不改数据与精度本身；
+     *    <3 时透传库默认刻度，表现不变。
+     *    早期这个补丁只装在分时流程里（退出分时还会卸载），导致蜡烛周期右侧 Y 轴
+     *    仍会出现 4~5 位小数 —— 现在改为建图时常驻。
+     *  - percentage（涨跌幅轴，仅分时锁定态）：昨收定基重定基刻度，1 位小数
+     *    （buildMinuteRebasedTicks）。百分比轴属于分时专用，蜡烛周期不受影响。
      */
-    const installMinuteAxisTicks = (axis) => {
+    const installAxisTickPolicy = (axis) => {
       if (!axis || typeof axis.createTicks !== 'function') return
       if (_minutePcTickAxis === axis) return
       try {
         _minutePcOrigCreateTicks = axis.createTicks
         axis.createTicks = function ({ range, bounding, defaultTicks }) {
           try {
-            if (_minuteAxisLocked && typeof this.getType === 'function') {
-              const type = this.getType()
-              if (type === 'percentage' && range) {
-                const rebased = buildMinuteRebasedTicks(this, range, bounding)
-                if (rebased.length) return rebased
-              } else if (type === 'normal') {
-                const chartStore = this.getParent().getChart().getChartStore()
-                if (chartStore && chartStore.getPrecision().price > 3) {
-                  return defaultTicks.map(t => ({ ...t, text: capTextDecimals(t.text, 3) }))
-                }
+            const type = typeof this.getType === 'function' ? this.getType() : 'normal'
+            if (type === 'percentage' && _minuteAxisLocked && isMinuteLine.value && range) {
+              const rebased = buildMinuteRebasedTicks(this, range, bounding)
+              if (rebased.length) return rebased
+            } else if (type === 'normal') {
+              const chartStore = this.getParent().getChart().getChartStore()
+              // 价格精度 >= 3 时收敛为「最多 3 位小数并去掉尾随零」：
+              // 精度 3 的标的（50.000 等）也需处理，否则原样显示 50.000
+              if (chartStore && chartStore.getPrecision().price >= 3) {
+                return (defaultTicks || []).map(t => ({ ...t, text: capTextDecimals(t.text, 3) }))
               }
             }
           } catch (_) { /* 预期内：退化到库默认刻度 */ }
@@ -3777,8 +4035,8 @@ json.dumps(output)
         _minutePcTickAxis = axis
       } catch (_) { /* 预期内 */ }
     }
-    /** 还原分时 Y 轴自定义刻度（退出分时/清理时调用） */
-    const restoreMinuteAxisTicks = () => {
+    /** 卸载 Y 轴刻度策略（图表实例销毁 / 清理时调用；切周期时不卸，金额轴截断要贯穿所有周期） */
+    const restoreAxisTickPolicy = () => {
       if (_minutePcTickAxis) {
         try { delete _minutePcTickAxis.createTicks } catch (_) { /* 预期内 */ }
         try { _minutePcTickAxis.buildTicks(true) } catch (_) { /* 预期内 */ }
@@ -3800,15 +4058,15 @@ json.dumps(output)
     }
 
     /**
-     * 安装分时十字光标水平标签的补丁：
-     *  - percentage：读数改为「昨收定基」涨跌幅，1 位小数（库默认按今开基准 → 光标
-     *    移动时百分比与昨收定基的坐标刻度不一致，即“光标百分比比例不对”）
-     *  - normal：价格读数小数位 >3 时截断为 3 位（与 Y 轴刻度规则一致）
-     * 仅分时主图生效，退出分时还原库原型实现。
+     * 主图右轴（Y 轴）十字光标水平读数策略（安装一次，常驻）：
+     *  - percentage（仅分时锁定态）：读数改为「昨收定基」涨跌幅，1 位小数（库默认按今开
+     *    基准 → 光标移动时百分比与昨收定基的坐标刻度不一致，即“光标百分比比例不对”）
+     *  - normal（**所有周期**）：价格读数小数位 >=3 时收敛为最多 3 位并去尾零
+     *    （与 Y 轴刻度同规则，否则轴上写 50.000、光标标签也写 50.000 但本应显示 50）
      */
-    const installMinuteCrosshairRebase = () => {
+    const installCrosshairReadoutPolicy = () => {
       const chart = chartRef.value
-      if (!chart || !isMinuteLine.value) return
+      if (!chart) return
       try {
         const pane = chart._candlePane
         const widget = pane && typeof pane.getYAxisWidget === 'function' ? pane.getYAxisWidget() : null
@@ -3819,7 +4077,8 @@ json.dumps(output)
         view.getText = function (crosshair, chartStore, axis) {
           try {
             const type = axis && typeof axis.getType === 'function' ? axis.getType() : ''
-            if (type === 'percentage' && crosshair && typeof axis.convertFromPixel === 'function') {
+            if (type === 'percentage' && _minuteAxisLocked && isMinuteLine.value &&
+                crosshair && typeof axis.convertFromPixel === 'function') {
               const pc = minutePrevClose.value
               if (pc != null && pc > 0) {
                 const price = axis.convertFromPixel(crosshair.y)
@@ -3832,7 +4091,7 @@ json.dumps(output)
               }
             } else if (type === 'normal' && crosshair && chartStore &&
                        typeof chartStore.getPrecision === 'function' &&
-                       chartStore.getPrecision().price > 3 &&
+                       chartStore.getPrecision().price >= 3 &&
                        typeof axis.convertFromPixel === 'function') {
               // 价格读数最多 3 位小数（保留库的完整格式化后仅截断小数位）
               const t = _minuteCrosshairOrigGetText.call(this, crosshair, chartStore, axis)
@@ -3846,13 +4105,82 @@ json.dumps(output)
         _minuteCrosshairView = view
       } catch (_) { /* 预期内 */ }
     }
-    /** 还原分时十字光标水平标签的库实现（退出分时/清理时调用） */
-    const restoreMinuteCrosshairRebase = () => {
+    /** 卸载右轴读数策略（图表实例销毁 / 清理时调用；切周期时不卸，金额轴截断要贯穿所有周期） */
+    const restoreCrosshairReadoutPolicy = () => {
       if (_minuteCrosshairView) {
         try { delete _minuteCrosshairView.getText } catch (_) { /* 预期内 */ }
         _minuteCrosshairView = null
       }
       _minuteCrosshairOrigGetText = null
+    }
+
+    /** 分时背景网格虚线样式（30 分钟一根竖向虚线；库用 destination-over 画在数据之下） */
+    const MINUTE_GRID_DASH = [3, 3]
+    /** 分时 X 轴刻度补丁：已补丁的轴实例与原实现（图表实例销毁时还原） */
+    let _minuteXAxisTickAxis = null
+    let _minuteXAxisOrigOptimalTicks = null
+    /**
+     * 主图 X 轴（时间轴）刻度策略：分时锁定态下改为「固定 30 分钟一根」。
+     *
+     * 为什么要接管：库的 X 轴刻度是「可见索引按 nice 间隔均分」（nice(range/8)），
+     * 可见柱数一变间隔就变（10/15/30 分钟不定），不是交易时段本身的 30 分钟刻度；
+     * 而背景竖向虚线正好画在 X 轴刻度位置（GridView 读 xAxis.getTicks()）⇒
+     * 接管刻度 = 同时拿到「30 分钟时间标签」与「30 分钟背景虚线」两件事。
+     * 仅分时锁定态生效（_minuteAxisLocked），其它周期透传库默认实现。
+     */
+    const installMinuteXAxisTicks = () => {
+      const chart = chartRef.value
+      if (!chart || typeof chart.getXAxisPane !== 'function') return
+      let axis = null
+      try {
+        const pane = chart.getXAxisPane()
+        axis = pane && typeof pane.getAxisComponent === 'function' ? pane.getAxisComponent() : null
+      } catch (_) { axis = null }
+      if (!axis || typeof axis.optimalTicks !== 'function' || _minuteXAxisTickAxis === axis) return
+      try {
+        _minuteXAxisOrigOptimalTicks = axis.optimalTicks
+        axis.optimalTicks = function (ticks) {
+          try {
+            if (isMinuteLine.value && _minuteAxisLocked) {
+              const list = typeof chart.getDataList === 'function' ? chart.getDataList() : []
+              const marks = minuteGridMarks({
+                bars: list,
+                session: getMinuteLineSession(),
+                intervalMin: MINUTE_GRID_INTERVAL_MIN,
+                barSpace: readBarSpace(chart),
+                minGapPx: MINUTE_X_TICK_MIN_GAP_PX
+              })
+              if (marks.length) {
+                // convertToPixel 收的是**数据索引**（XAxisImp.convertToPixel → dataIndexToCoordinate）
+                return marks.map(m => ({ text: m.text, coord: this.convertToPixel(m.index), value: m.timestamp }))
+              }
+            }
+          } catch (_) { /* 预期内：退化到库默认刻度 */ }
+          return typeof _minuteXAxisOrigOptimalTicks === 'function'
+            ? _minuteXAxisOrigOptimalTicks.call(this, ticks)
+            : ticks
+        }
+        _minuteXAxisTickAxis = axis
+      } catch (_) { /* 预期内 */ }
+    }
+    /** 卸载 X 轴刻度策略（图表实例销毁 / 清理时调用） */
+    const restoreMinuteXAxisTicks = () => {
+      if (_minuteXAxisTickAxis) {
+        try { delete _minuteXAxisTickAxis.optimalTicks } catch (_) { /* 预期内 */ }
+        _minuteXAxisTickAxis = null
+      }
+      _minuteXAxisOrigOptimalTicks = null
+    }
+    /**
+     * 图表实例上的全部补丁/一次性抓取值复位（重新 init 时调用）。
+     * 不重置会导致：新轴的实例与旧补丁的比较永真，补丁永远装不上，且出厂右缘空位
+     * 会沿用上一实例的值。
+     */
+    const _resetChartAxisBindings = () => {
+      restoreAxisTickPolicy()
+      restoreCrosshairReadoutPolicy()
+      restoreMinuteXAxisTicks()
+      _chartDefaultOffsetRightPx = null
     }
 
     /**
@@ -4078,8 +4406,12 @@ json.dumps(output)
       const reanchored = qDev < anchorDev / 2
       if (reanchored || qDev > anchorDev) anchorDev = qDev
 
-      const halfPrice = polarLimit > 0
-        ? pc * (polarLimit / 100)
+      // ★ 极坐标必须留冗余：恰好 昨收±limit% 时，±limit 那一刻度正落在 pane 上下边缘，
+      //   会被库的 optimalTicks 边缘过滤（y > textHeight && y < height - textHeight）滤掉，
+      //   表现为「跌停/涨停线看不到」。放宽 MINUTE_POLAR_PADDING 后刻度回到 pane 内部。
+      const polarHalf = polarLimit > 0 ? polarHalfPrice(pc, polarLimit) : 0
+      const halfPrice = polarHalf > 0
+        ? polarHalf
         : anchorDev * (1 + MINUTE_AXIS_PADDING)
       const fromPrice = pc - halfPrice
       const toPrice = pc + halfPrice
@@ -4138,10 +4470,13 @@ json.dumps(output)
       }
       // 涨跌幅轴下隐藏库的最新价标签（基准=今开，与昨收定基刻度矛盾）；金额轴保留
       setMinutePriceTagHidden(percentMode)
-      // 分时 Y 轴自定义刻度（涨跌幅轴：昨收定基 1 位小数；金额轴：刻度 ≤3 位小数）
-      installMinuteAxisTicks(axis)
-      // 十字光标读数昨收定基（涨跌幅轴）+ 价格读数 ≤3 位小数
-      installMinuteCrosshairRebase()
+      // 主图 Y 轴刻度策略（涨跌幅轴：昨收定基 1 位小数；金额轴：刻度 ≤3 位小数）；
+      // 常驻补丁，这里再调一次是为兼容“建图路径早于补丁安装”的时序
+      installAxisTickPolicy(axis)
+      // 十字光标读数：涨跌幅轴昨收定基 + 价格读数 ≤3 位小数
+      installCrosshairReadoutPolicy()
+      // X 轴：分时锁定态固定 30 分钟刻度（背景竖向虚线画在刻度位置）
+      installMinuteXAxisTicks()
 
       // 区间判定全部交给纯函数（当日作用域 / 当日柱数下限 / 涨跌停上限自洽 / 锚点归属与重锚）
       const polarLimit = _minutePolarEnabled ? _minutePolarLimit(props.market, props.symbol) : 0
@@ -4188,6 +4523,19 @@ json.dumps(output)
         return
       }
       const { from, to, fromPrice, toPrice } = plan
+
+      // ---- 极坐标：涨跌停线（涨停/跌停价）—— 必须在"锚点未变化就跳过"之前维护，
+      //      否则关掉极坐标时若范围恰好没变，线会滞留在图上 ----
+      // 为什么直按价格画线而不靠刻度：极坐标锁定范围的刻度间隔由库 nice(range/8) 决定，
+      // 往往不落在整数涨跌停价上（10 元 ±10% → 间隔 0.3，11.00/9.00 不是刻度），
+      // 加上边缘刻度会被过滤 ⇒ 不画就真的“看不到涨跌停线”。
+      _minutePolarLevels = polarLimit > 0
+        ? [
+            { price: pc * (1 + polarLimit / 100), title: '涨停', color: MINUTE_LIMIT_STYLE.up },
+            { price: pc * (1 - polarLimit / 100), title: '跌停', color: MINUTE_LIMIT_STYLE.down }
+          ]
+        : []
+      ensureMinuteLimitLinesIndicator()
 
       // 锚点未变化且仍处于锁定态则跳过，避免实时刷新时反复重排
       if (axis && _minuteAxisRange &&
@@ -4273,10 +4621,8 @@ json.dumps(output)
     /** 分时图：解除 Y 轴范围锁定并还原默认 gap（切换回普通周期时调用） */
     const clearMinutePrevCloseAxis = () => {
       const chart = chartRef.value
-      // 还原分时 Y 轴自定义刻度（重定基刻度仅分时涨跌幅轴使用）
-      restoreMinuteAxisTicks()
-      // 还原十字光标水平标签的库实现
-      restoreMinuteCrosshairRebase()
+      // 【不卸刻度/读数策略】金额轴 ≤3 位小数与光标读数截断要贯穿所有周期，
+      // 退出分时只需 _minuteAxisLocked=false 让涨跌幅轴专属分支自然失效（见 restoreAxisTickPolicy 注释）
       // 还原库的最新价标签
       setMinutePriceTagHidden(false)
       try {
@@ -4286,6 +4632,9 @@ json.dumps(output)
           try { chart.removeIndicator('candle_pane', 'MINUTE_PREV_CLOSE_AXIS') } catch (_) { /* 预期内：旧版无实例 */ }
           // 关键位线同样只在分时存在，退出分时一并移除（否则会画到日K上）
           chart.removeIndicator('candle_pane', MINUTE_SR_LINES_IND)
+          // 极坐标涨跌停线同理（下次进分时按新的昨收重建）
+          chart.removeIndicator('candle_pane', MINUTE_LIMIT_LINES_IND)
+          _minutePolarLevels = []
         }
       } catch (_) { /* 预期内 */ }
       _minuteAxisRange = null
@@ -4340,6 +4689,8 @@ json.dumps(output)
         applyMinutePrevCloseAxis()
         // 关键位线同样会被 updateIndicators 的 isStack=false 清掉，此处补挂
         ensureMinuteSrLinesIndicator()
+        // 极坐标涨跌停线同理（同属主图叠加指标）
+        ensureMinuteLimitLinesIndicator()
       } catch (_) { /* 预期内 */ }
     }
 
@@ -4387,6 +4738,43 @@ json.dumps(output)
       clearMinutePrevCloseAxis()
     }
 
+    // ==================================================================================
+    // 左上角图例（candle.tooltip）—— 单一来源
+    // ==================================================================================
+    // 背景：库的 merge() 只赋值 isValid（非 null/undefined）的值，因此 `custom: null`
+    // **无法清掉**已写入的 custom；而 ChartStore.setOptions 只对**数组**形态的 custom
+    // 做专用覆盖。结果是分时那份函数形态（时间/价格/成交量）会永久残留到蜡烛周期，
+    // 与库默认的数组形态（含最高/最低价）交替生效 —— 就是“有时三行、有时信息更多”的根源。
+    // 结论：两条路径都必须写**可赋值形态**（数组或函数），永远不要再传 null。
+    /** 蜡烛周期图例行：数组形态 = 库默认六行（i18n key 由库自身本地化），含开高低收 */
+    const CANDLE_TOOLTIP_ROWS = [
+      { title: 'time', value: '{time}' },
+      { title: 'open', value: '{open}' },
+      { title: 'high', value: '{high}' },
+      { title: 'low', value: '{low}' },
+      { title: 'close', value: '{close}' },
+      { title: 'volume', value: '{volume}' }
+    ]
+    /**
+     * 分时周期图例行：函数形态（分时关心的是时间/价格/成交量，开高低收属噪声；
+     * 均价一行由主图上的内置 AVP 指标自动附带）。
+     */
+    const minuteTooltipRows = (data) => {
+      const cur = data && data.current ? data.current : {}
+      const d = new Date(cur.timestamp)
+      const p = pricePrecision.value
+      const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+      const close = Number(cur.close)
+      const valid = cur.close != null && Number.isFinite(close)
+      return [
+        { title: '时间', value: timeStr },
+        { title: '价格', value: valid ? close.toFixed(p) : '--' },
+        { title: '成交量', value: String(cur.volume || 0) }
+      ]
+    }
+    /** 当前渲染模式对应的图例配置（切主题/换模式时都要重中一次，避免被上一次的形态残留） */
+    const tooltipCustomForMode = () => (isMinuteLine.value ? minuteTooltipRows : CANDLE_TOOLTIP_ROWS)
+
     /** 设置图表为分时图模式 */
     const applyMinuteLineChartStyle = () => {
       if (!chartRef.value) return
@@ -4425,21 +4813,20 @@ json.dumps(output)
             tooltip: {
               showRule: 'always',
               showType: 'standard',
-              // klinecharts 9.8 的 candle.tooltip 自定义行已改为 custom（旧 labels/values 不再被消费）；
-              // 均价一行由主图上的内置 AVP 指标自动附带（figures.title = '均价: '）
-              custom: (data) => {
-                const cur = data && data.current ? data.current : {}
-                const d = new Date(cur.timestamp)
-                const p = pricePrecision.value
-                const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-                const close = Number(cur.close)
-                const valid = cur.close != null && Number.isFinite(close)
-                return [
-                  { title: '时间', value: timeStr },
-                  { title: '价格', value: valid ? close.toFixed(p) : '--' },
-                  { title: '成交量', value: String(cur.volume || 0) }
-                ]
-              }
+              // 行定义走 minuteTooltipRows（函数形态），与蜡烛周期的数组形态互不残留，见上方说明
+              custom: minuteTooltipRows
+            }
+          },
+          // 分时背景网格：30 分钟一根竖向虚线（库 GridView 用 destination-over 画在数据之下，
+          // 刻度位置 = X 轴刻度位置 → 与 installMinuteXAxisTicks 的 30 分钟刻度天然对齐）
+          grid: {
+            show: true,
+            vertical: {
+              show: true,
+              color: themeConfig.value.gridLineColorDashed || themeConfig.value.gridLineColor,
+              style: 'dashed',
+              size: 1,
+              dashedValue: MINUTE_GRID_DASH
             }
           },
           // 禁用滚动条视觉
@@ -4546,13 +4933,19 @@ json.dumps(output)
                 lineStyle: 'dashed'
               }
             },
-            // 恢复日K tooltip：9.8 起 candle.tooltip.labels/values 已不再被消费（死配置），
-            // 这里只需把分时的 custom 回调清掉——setStyles 是深度合并，不清会残留分时的三行
+            // 恢复日K tooltip：9.8 起 candle.tooltip.labels/values 已不再被消费（死配置）；
+            // ★ 必须写**数组**：库 merge() 会跳过 null（custom:null 清不掉残留），
+            //   而数组形态会命中 ChartStore.setOptions 的专用覆盖分支 ⇒ 回到六行标准图例
             tooltip: {
               showRule: 'always',
               showType: 'standard',
-              custom: null
+              custom: CANDLE_TOOLTIP_ROWS
             }
+          },
+          // 关掉分时专用竖向网格（30 分钟背景虚线只在分时开）
+          grid: {
+            show: true,
+            vertical: { show: false }
           },
           // 滚动/缩放能力的恢复由 enableMinuteInteractions 通过 klinecharts API 完成
           scroll: {
@@ -4714,15 +5107,31 @@ json.dumps(output)
                   restoreNormalChartStyle()
                 }
                 _lastRenderedMode = 'normal'
-                // 换股后的本次加载: 最新K线停在距右缘 2bar 处(保留缩放跨度);
-                // 程序化定位不归档现场 —— 该周期用户拖拽保存的窗口位置保持不变
-                // 其余场景(切周期/页面刷新): 恢复该周期上次的图表现场
-                if (_goLatestOnNextLoad) {
+                // 视口定位优先级：首次进入 → 进入态（最新 120 根）；换股 → 进入态（最新 120 根，
+                // 右缘留呼吸位，丢弃上一张图残留的缩放/右缘空位）；其余（切周期/页面刷新）→ 恢复现场
+                if (_entryViewportPending) {
+                  _entryViewportPending = false
+                  applyEntryViewport()
+                } else if (_goLatestOnNextLoad) {
                   _goLatestOnNextLoad = false
-                  goLatestWithBreath()
-                } else {
-                  restoreChartScene(props.timeframe)
+                  // ★ 换股也走进入态视口：只设右缘空位（旧 goLatestWithBreath 的做法）
+                  //   不改 barSpace，会继承分时残留的巨大右缘空位与上一张图的缩放跨度；
+                  //   applyEntryViewport 显式重算 barSpace（最新 120 根铺满）+ 右缘呼吸位，根因修复。
+                  applyEntryViewport()
+                } else if (!restoreChartScene(props.timeframe)) {
+                  // 该周期没有现场：统一走进入态视口
+                  applyEntryViewport()
                 }
+                // 蜡烛周期防御性收口：强制单一图例来源 + 常驻轴补丁
+                // （修切换股/切周期时残留的分时图例、右轴价格小数未截断——
+                //  轴补丁在 init 时轴实例可能未就绪而失效，蜡烛周期不再重装就会漏掉）
+                try {
+                  if (chartRef.value) {
+                    chartRef.value.setStyles({ candle: { tooltip: { custom: CANDLE_TOOLTIP_ROWS } } })
+                  }
+                } catch (_) { /* 预期内 */ }
+                installAxisTickPolicy(getCandleYAxis())
+                installCrosshairReadoutPolicy()
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
@@ -5487,6 +5896,16 @@ json.dumps(output)
         }
         // 换实例后废弃左轴旧绑定（包装的 buildTicks/订阅），_syncPctRuler 会按新实例重建
         _resetPctAxisBindings()
+        // 换实例后废弃轴刻度/光标读数补丁与一次性抓取值，下面重新安装到新实例
+        _resetChartAxisBindings()
+        // 主图 Y 轴刻度策略（全周期常驻：价格刻度 ≤3 位小数）
+        installAxisTickPolicy(getCandleYAxis())
+        // 右轴光标读数策略（全周期常驻：价格读数 ≤3 位小数）
+        installCrosshairReadoutPolicy()
+        // X 轴刻度策略（仅分时锁定态生效：固定 30 分钟刻度）
+        installMinuteXAxisTicks()
+        // 记录出厂右缘空位（库默认 80px），供清掉分时留下的巨大空位
+        captureChartDefaultOffset()
         // 换实例后买卖点标记已丢失: 复位签名后重挂 (数据未就绪时由 klineData watch 兜底)
         nextTick(applyTradeMarkers)
 
@@ -5609,13 +6028,23 @@ json.dumps(output)
                 if (chartRef.value) {
                   restoreNormalChartStyle()
                   _lastRenderedMode = 'normal'
-                  // 与上方「图表已存在」分支同规则: 换股最新K线留 2bar 呼吸位, 其余恢复现场
-                  if (_goLatestOnNextLoad) {
+                  // 与上方「图表已存在」分支同规则：进入态/换股/现场恢复三选一
+                  if (_entryViewportPending) {
+                    _entryViewportPending = false
+                    applyEntryViewport()
+                  } else if (_goLatestOnNextLoad) {
                     _goLatestOnNextLoad = false
-                    goLatestWithBreath()
-                  } else {
-                    restoreChartScene(props.timeframe)
+                    // 同 loadKlineData 分支：改用进入态视口，根因修复换股残留缩放/右缘
+                    applyEntryViewport()
+                  } else if (!restoreChartScene(props.timeframe)) {
+                    applyEntryViewport()
                   }
+                  // 蜡烛周期防御性收口：强制单一图例来源 + 常驻轴补丁（见「图表已存在」分支说明）
+                  try {
+                    chartRef.value.setStyles({ candle: { tooltip: { custom: CANDLE_TOOLTIP_ROWS } } })
+                  } catch (_) { /* 预期内 */ }
+                  installAxisTickPolicy(getCandleYAxis())
+                  installCrosshairReadoutPolicy()
                 }
               })
             }
@@ -5689,7 +6118,12 @@ json.dumps(output)
             size: 1
           },
           vertical: {
-            show: false
+            // 分时专用 30 分钟背景虚线（蜡烛周期保持关闭）；切主题不能在分时下把网格顺带关掉
+            show: isMinuteLine.value,
+            color: theme.gridLineColorDashed || theme.gridLineColor,
+            style: 'dashed',
+            size: 1,
+            dashedValue: MINUTE_GRID_DASH
           }
         },
         separator: {
@@ -5712,7 +6146,9 @@ json.dumps(output)
           },
           tooltip: {
             showRule: 'always',
-            showType: 'standard'
+            showType: 'standard',
+            // 主题切换也要重中图例形态（否则切主题会把分时/蜡烛的模式残留带过去）
+            custom: tooltipCustomForMode()
           },
           // ★ 主题切换也必须跟随当前配色方案（曾写死 cn ⇒ 切主题后 intl 用户蜡烛跳回红涨）
           bar: candleBarColors(chartColorScheme.value, isDark, theme.borderColor),
@@ -7882,6 +8318,8 @@ json.dumps(output)
       if (_wmObserver) { _wmObserver.disconnect(); _wmObserver = null }
       // 清理左侧百分比坐标轴（取消 rAF/observer，并在销毁前还原被包装的 buildTicks）
       _disposePctRuler()
+      // 还原轴刻度/光标读数/X 轴刻度补丁（实例即将销毁，但保持删除自身属性的行为一致）
+      _resetChartAxisBindings()
       // 清理分时图交互禁用事件处理器
       enableMinuteInteractions()
       if (chartRef.value) {

@@ -332,13 +332,6 @@ def _parse_filters_from_text(text: str) -> Dict[str, Any]:
 
     return filters
 
-
-def _build_keyword_from_filters(filters: Dict[str, Any]) -> str:
-    """将结构化筛选条件转换为自然语言关键词字符串。"""
-    from app.agent.tools.finance.screener_tools import build_keyword_from_filters
-    return build_keyword_from_filters(filters)
-
-
 # ══════════════════════════════════════════════════════════════
 #  路由
 # ══════════════════════════════════════════════════════════════

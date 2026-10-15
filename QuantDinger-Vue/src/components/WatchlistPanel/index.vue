@@ -10,7 +10,15 @@
         <a-menu slot="overlay" class="wl-group-menu" @click="onGroupMenuClick">
           <template v-for="g in watchlistGroups">
             <a-menu-item :key="`switch:${g.name}`" :class="{ 'wl-group-current': g.name === currentGroup }">
-              <div class="wl-group-item">
+              <div
+                class="wl-group-item"
+                :class="{ 'wl-group-item-dragover': dragOverGroupName === g.name }"
+                draggable="true"
+                @dragstart="onGroupDragStart(g.name, $event)"
+                @dragover.prevent="onGroupDragOver(g.name, $event)"
+                @drop="onGroupDrop(g.name, $event)"
+                @dragend="onGroupDragEnd"
+              >
                 <span class="wl-group-item-name">{{ groupLabel(g.name) }}</span>
                 <span class="wl-group-item-count">{{ g.count }}</span>
                 <a-icon v-if="g.name === currentGroup" type="check" class="wl-group-item-check" />
@@ -450,7 +458,7 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, reorderWatchlist, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies, getTradingStatus } from '@/api/market'
+import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies, getTradingStatus } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 import { prefValue, setPrefValue } from '@/utils/uiPrefs'
 
@@ -471,6 +479,13 @@ export default {
       watchlistPrices: {},
       dragKey: null,
       dragOverKey: null,
+      // 前端记忆的自选排序（localStorage, 不提交后端）:
+      //   itemOrder: { [组名]: ['市场:代码', ...] } —— 组内股票的用户自定义顺序
+      //   groupOrder: [组名, ...] —— 分组列表的用户自定义顺序（所有组均可拖拽）
+      itemOrder: {},
+      groupOrder: [],
+      dragGroupName: null,
+      dragOverGroupName: null,
       localUserInfo: {},
       loadingUserInfo: false,
       userId: 1,
@@ -567,14 +582,41 @@ export default {
         map[name].count += 1
       })
       const groups = Object.values(map)
-      groups.sort((a, b) => (a.name === DEFAULT_GROUP_NAME ? -1 : b.name === DEFAULT_GROUP_NAME ? 1 : 0))
+      // 分组顺序完全由前端记忆 (groupOrder) 决定 —— 所有组(含默认组)均可拖拽, 不提交后端
+      const order = this.groupOrder || []
+      groups.sort((a, b) => {
+        const ia = order.indexOf(a.name)
+        const ib = order.indexOf(b.name)
+        const fa = ia < 0
+        const fb = ib < 0
+        if (fa && fb) return a.name < b.name ? -1 : 1 // 尚未记忆的新组: 按名称稳定兜底
+        if (fa) return 1
+        if (fb) return -1
+        return ia - ib
+      })
       return groups
     },
     visibleWatchlist () {
       const wl = this.watchlist || []
       const rows = wl.filter(s => (s.group_name || DEFAULT_GROUP_NAME) === this.currentGroup)
       const isStrategy = rows.some(s => s.strategy_state)
-      if (!isStrategy) return rows
+      if (!isStrategy) {
+        // 普通自选组: 顺序由前端记忆的 itemOrder 决定 (拖拽排序, 不提交后端)
+        const order = (this.itemOrder && this.itemOrder[this.currentGroup]) || []
+        if (!order.length) return rows
+        const keyOf = s => `${s.market}:${s.symbol}`
+        const rank = new Map()
+        order.forEach((k, i) => rank.set(k, i))
+        const idxInRows = new Map()
+        rows.forEach((s, i) => idxInRows.set(keyOf(s), i))
+        return rows.slice().sort((a, b) => {
+          const ra = rank.has(keyOf(a)) ? rank.get(keyOf(a)) : Infinity
+          const rb = rank.has(keyOf(b)) ? rank.get(keyOf(b)) : Infinity
+          if (ra !== rb) return ra - rb
+          // 未记忆的新增股票: 保持其在后端列表中的相对先后
+          return (idxInRows.get(keyOf(a)) || 0) - (idxInRows.get(keyOf(b)) || 0)
+        })
+      }
       const weight = { 'exit_today': 0, 'holding': 1, 'buy_today': 2, 'watch_pending': 3 }
       const wrMap = this.strategyWinrates || {}
       return rows.slice().sort((a, b) => {
@@ -955,12 +997,15 @@ export default {
         const res = await getWatchlist({ userid: this.userId })
         if (res && res.code === 1 && res.data) {
           this.watchlist = res.data.map(item => ({ ...item, price: 0, change: 0, changePercent: 0 }))
-          // 首次加载: 恢复上次记住的自选组 (仅一次, 不干扰用户后续手动切换)
+          // 首次加载: 恢复上次记住的自选组与前端排序 (仅一次, 不干扰用户后续手动操作)
           if (!this._groupPrefRestored) {
             this._groupPrefRestored = true
             const names = new Set(this.watchlist.map(s => s.group_name || DEFAULT_GROUP_NAME))
             const saved = prefValue('watchlist', 'group', '')
             if (saved && names.has(saved)) this.currentGroup = saved
+            // 前端记忆的排序 (localStorage, 与后端无关): 组内股票顺序 + 分组列表顺序
+            this.itemOrder = prefValue('watchlist', 'itemOrder', {}) || {}
+            this.groupOrder = prefValue('watchlist', 'groupOrder', []) || []
           }
           await this.loadWatchlistPrices()
         }
@@ -1224,15 +1269,44 @@ export default {
       if (moving.strategy_state) return
       list.splice(fromIdx, 1)
       list.splice(toIdx, 0, moving)
-      const orderIds = list.map(s => s.id)
-      this.watchlist = this.watchlist.slice().sort((a, b) => {
-        const ia = orderIds.indexOf(a.id)
-        const ib = orderIds.indexOf(b.id)
-        return (ia < 0 ? 99999 : ia) - (ib < 0 ? 99999 : ib)
-      })
+      // 仅前端记忆顺序, 不提交后端 (排序与后端无关)
+      const order = Object.assign({}, this.itemOrder)
+      order[this.currentGroup] = list.map(s => `${s.market}:${s.symbol}`)
+      this.itemOrder = order
+      setPrefValue('watchlist', 'itemOrder', order)
+    },
+    // ---- 分组拖拽排序 (纯前端记忆, 不提交后端) ----
+    onGroupDragStart (name, e) {
+      this.dragGroupName = name
       try {
-        await reorderWatchlist({ items: list.map((s, i) => ({ id: s.id, sort_order: i + 1 })) })
-      } catch (err) { /* 静默: 下次同步按服务器顺序 */ }
+        e.dataTransfer.setData('text/plain', name)
+        e.dataTransfer.effectAllowed = 'move'
+      } catch (err) { /* 旧浏览器忽略 */ }
+    },
+    onGroupDragOver (name, e) {
+      if (this.dragGroupName && name !== this.dragGroupName) this.dragOverGroupName = name
+    },
+    onGroupDragEnd () {
+      this.dragGroupName = null
+      this.dragOverGroupName = null
+    },
+    onGroupDrop (name, e) {
+      const from = this.dragGroupName
+      this.dragGroupName = null
+      this.dragOverGroupName = null
+      if (!from || from === name) return
+      // 以当前分组列表为准构建顺序, 再把被拖分组插入到目标位置
+      const names = this.watchlistGroups.map(g => g.name)
+      const base = (this.groupOrder && this.groupOrder.slice()) || names.slice()
+      const filtered = base.filter(n => names.includes(n))
+      names.forEach(n => { if (!filtered.includes(n)) filtered.push(n) })
+      const fromIdx = filtered.indexOf(from)
+      const toIdx = filtered.indexOf(name)
+      if (fromIdx < 0 || toIdx < 0) return
+      filtered.splice(fromIdx, 1)
+      filtered.splice(toIdx, 0, from)
+      this.groupOrder = filtered
+      setPrefValue('watchlist', 'groupOrder', filtered)
     },
     async handleAddStock () {
       // Determine which symbols to add
@@ -1739,7 +1813,9 @@ export default {
   max-height: 320px;
   overflow-y: auto;
   .ant-dropdown-menu-item { padding: 0; line-height: 1.4; }
-  .wl-group-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; min-height: 34px;
+  .wl-group-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; min-height: 34px; cursor: grab;
+    &:active { cursor: grabbing; }
+    &.wl-group-item-dragover { box-shadow: inset 0 2px 0 0 var(--primary-color, #1890ff); background: color-mix(in srgb, var(--primary-color, #1890ff) 12%, transparent); }
     .wl-group-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
     .wl-group-item-count { flex-shrink: 0; min-width: 18px; text-align: center; font-size: 11px; color: #8c8c8c; background: #f0f2f5; border-radius: 9px; padding: 0 5px; line-height: 18px; }
     .wl-group-item-check { flex-shrink: 0; color: var(--primary-color, #1890ff); }
@@ -1755,5 +1831,6 @@ body.dark .wl-group-menu, body.realdark .wl-group-menu {
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
   .ant-dropdown-menu-item { color: #ccc; &:hover { background: #26262a; } }
   .wl-group-item-count { background: #2a2a2c; color: #888; }
+  .wl-group-item-dragover { box-shadow: inset 0 2px 0 0 var(--primary-color, #1890ff); background: color-mix(in srgb, var(--primary-color, #1890ff) 16%, #1a1a1c); }
 }
 </style>

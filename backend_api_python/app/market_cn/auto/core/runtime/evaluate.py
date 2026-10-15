@@ -148,9 +148,27 @@ def _referenced_funcs(exprs: Tuple[str, ...]) -> frozenset:
 # ================================================================
 # 加载
 # ================================================================
+def _overlay_yaml_path(key: str) -> str:
+    """§5.7 桥钩子：子进程 env QD_STRATEGY_YAML_OVERLAY_DIR 优先，回退活策略树。
+
+    为什么不 import strategies 复用 _resolve_yaml_path：core→strategies 是反向依赖
+    （依赖方向红线），三行路径解析就地复制并在此注明。
+    """
+    overlay = os.environ.get("QD_STRATEGY_YAML_OVERLAY_DIR")
+    if overlay:
+        p = os.path.join(overlay, f"{key}.yaml")
+        if os.path.isfile(p):
+            return p
+    return os.path.join(_STRATEGY_DIR, f"{key}.yaml")
+
+
 def load_strategy(key: str) -> StrategySpec:
-    """从 strategies/<key>.yaml 加载策略；并对门表做静态 as-of 校验。"""
-    path = os.path.join(_STRATEGY_DIR, f"{key}.yaml")
+    """从 strategies/<key>.yaml 加载策略；并对门表做静态 as-of 校验。
+
+    §5.7 桥钩子（2026-10-15）: 子进程 env QD_STRATEGY_YAML_OVERLAY_DIR 指向作业目录时,
+    overlay 的 `<key>.yaml` 优先 —— 活策略树只读, 生产进程不设此 env, 行为不变。
+    """
+    path = _overlay_yaml_path(key)
     with open(path, "r", encoding="utf-8") as f:
         doc = yaml.safe_load(f)
     gates = [

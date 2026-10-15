@@ -399,36 +399,6 @@ def add_watchlist():
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
-@market_bp.route('/watchlist/reorder', methods=['POST'])
-@login_required
-def reorder_watchlist():
-    """保存用户拖动排序: items = [{id, sort_order}] (仅限本人行; 策略组行由引擎排序, 传了也无效)"""
-    try:
-        user_id = g.user_id
-        data = request.get_json() or {}
-        items = data.get('items') or []
-        if not isinstance(items, list) or not items:
-            return jsonify({'code': 0, 'msg': '缺少 items', 'data': None}), 400
-        with get_db_connection() as db:
-            cur = db.cursor()
-            n = 0
-            for it in items:
-                try:
-                    cur.execute(
-                        "UPDATE qd_watchlist SET sort_order = ?, updated_at = NOW() WHERE id = ? AND user_id = ?",
-                        (int(it.get('sort_order') or 0), int(it.get('id')), user_id)
-                    )
-                    n += cur.rowcount or 0
-                except Exception:
-                    continue
-            db.commit()
-            cur.close()
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'updated': n}})
-    except Exception as e:
-        logger.error(f"reorder_watchlist failed: {str(e)}")
-        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
-
-
 @market_bp.route('/watchlist/remove', methods=['POST'])
 @login_required
 def remove_watchlist():
