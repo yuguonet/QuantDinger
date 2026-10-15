@@ -121,7 +121,16 @@ def _actual_view(r: Dict[str, Any]) -> Dict[str, Any]:
         "high": r.get("high"),
         "low": r.get("low"),
         "close": r.get("exit_close"),
-        "as_of": as_of,
+        # ★ as_of 必须是 **ISO 字符串**，不是 date 对象（2026-10-15 修，P0）：
+        #   `actual` 整个 dict（含 `windows` 里嵌套的本函数产物）最终要
+        #   `json.dumps` 进 qd_agent_resolutions.actual（JSON 列）——
+        #   date 对象会让 json.dumps 抛 TypeError。
+        #   10-13 D3 双窗口引入 `windows` 后，`_resolve_finance` 三个返回点
+        #   的**浅层** `{k: v.isoformat() ...}` 推导罩不住嵌套层 ⇒ 82/86 条
+        #   判定写入全部静默失败（被 save_resolution 的 except 吞掉，
+        #   resolve_due_claims 还把失败计成 resolved ⇒ 报表显示一切正常）。
+        #   在**生产者**保证类型正确，而不是在消费侧逐个补推导。
+        "as_of": as_of.isoformat() if as_of else None,
         "source": "CNStockDataSource.get_kline(1D)",
         "hold_days": ah,
         "hold_days_expected": exp,
@@ -360,7 +369,12 @@ def _resolve_finance(claim: Dict[str, Any], exec_date: Optional[date],
     _max_retry = int(os.getenv("QD_CLAIM_MAX_RETRY", "5"))
     _stale_days = int(os.getenv("QD_DELISTED_STALE_DAYS", "15"))
     _fail_n = int(claim.get("verify_fail_count") or 0)
-    _last_kline = str(actual.get("exit_date") or "")[:10]
+    # ★ 2026-10-15 修：旧代码读 `actual.get("exit_date")` —— `fetch_actual` 返回的
+    #   actual **从来没有这个键**（原始 exit_date 只存在于 `_get_actual_return` 的
+    #   返回值里，`_actual_view` 只转存 as_of）⇒ `_last_kline` 恒为空串 ⇒ 本分支
+    #   （G18 退市/长期停牌单列，防幸存者偏差）**永不可达**，功能静默失效。
+    #   改读实际存在的 `as_of`（`_actual_view` 产出，ISO 字符串）。
+    _last_kline = str(actual.get("as_of") or "")[:10]
     if _fail_n >= _max_retry and _last_kline:
         try:
             if (date.today() - date.fromisoformat(_last_kline)).days > _stale_days:
@@ -504,6 +518,15 @@ def resolve_due_claims(limit: int = 50, use_judge: Optional[bool] = None) -> Dic
             r = resolve_claim(c, exec_date=c.get("exec_date"), use_judge=use_judge)
             if r.get("skipped"):
                 stats["skipped"] += 1
+                continue
+            # ★ 2026-10-15 修：写库失败（resolution_id=None，save_resolution 的
+            #   fail-open 路径）**不许计成 resolved** —— 旧代码无条件
+            #   `resolved += 1`，判定实际没落库也报"已判定"，报表说谎
+            #   （10-15 实测：86 条声称 resolved，实际 0 条落库）。
+            if r.get("resolution_id") is None:
+                stats["errors"] += 1
+                logger.warning("[Resolver] claim %s 判定未落库"
+                               "（resolution_id=None，按错误计）", c.get("id"))
                 continue
             stats["resolved"] += 1
             if r.get("verdict") == "undecidable":

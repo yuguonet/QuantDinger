@@ -39,19 +39,29 @@ RETRY_EXHAUSTED = 99                # 远大于 QD_CLAIM_MAX_RETRY（默认 5）
 
 
 def _stale_actual() -> dict:
-    """长期无数据（退市/长期停牌）的 actual 形态。"""
+    """长期无数据（退市/长期停牌）的 actual 形态。
+
+    ★ 键名必须对齐 `fetch_actual` 的**真实产出**（`_actual_view` 的转换结果）：
+      `as_of`（ISO 字符串）而不是 `exit_date` —— 后者只存在于更上游的
+      `_get_actual_return` 的返回值里，`fetch_actual` 层面**不存在这个键**。
+      2026-10-15 修 B3 前 `_resolve_finance` 读 `exit_date`（幻象键）⇒ 生产
+      链路里 `_last_kline` 恒空、退市分支永不可达；彼时本 mock 喂的正是那个
+      幻象键，测试"绿"但守的是 phantom 契约。现按生产形态给键。
+    """
     return {
-        "pnl_pct": 0.0, "hold_days": 0, "hold_days_expected": 3,
-        "direction": "flat", "exit_date": STALE_EXIT_DATE, "truncated": True,
+        "pct": 0.0, "dir": "neutral", "high": None, "low": None, "close": None,
+        "as_of": STALE_EXIT_DATE, "source": "test",
+        "hold_days": 0, "hold_days_expected": 3, "truncated": True,
     }
 
 
 def _fresh_actual() -> dict:
-    """正常标的：窗口走完、数据是新的。"""
+    """正常标的：窗口走完、数据是新的（与 _stale_actual 同一套键名契约）。"""
     recent = (date.today() - timedelta(days=3)).isoformat()
     return {
-        "pnl_pct": 1.5, "hold_days": 3, "hold_days_expected": 3,
-        "direction": "up", "exit_date": recent, "truncated": False,
+        "pct": 1.5, "dir": "bullish", "high": None, "low": None, "close": None,
+        "as_of": recent, "source": "test",
+        "hold_days": 3, "hold_days_expected": 3, "truncated": False,
     }
 
 

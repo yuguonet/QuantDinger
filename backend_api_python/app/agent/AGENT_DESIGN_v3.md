@@ -762,13 +762,7 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 - **负向验证必须确认缺陷真注入**：曾因 heredoc 转义出错导致缺陷没注入却跑出全绿，差点误判"护栏失效"。改为落盘脚本（`inject`/`restore`）+ 断言还原后与原文字节相等。
 - **env 类改动优先用真旋钮做负向验证**：如 `QD_ON_DEMAND_TOOLS=actor` 复跑。
 - **护栏判据要可证伪**：新增判据后跑一次「注入缺陷 → 必须 FAIL → 还原 → 必须 PASS」。口径收口批的变异检验实测 **8/8 全被抓到**。
-- ⚠️ **`llm_inputs.log` 的 `TYPE=` 标签是启发式，不等于实际用途**（2026-10-13 排查实录）：
-  标签由 `mimoagent/models/openai_chat.py::_debug_dump_messages` **按「有无 tools 参数」二分**
-  —— `is_main = bool(call_kwargs.get("tools"))` ⇒ 只有 `MAIN主任务` / `PRESELECT预选` 两种。
-  于是**所有不带 tools 的轻量调用都被打成 `PRESELECT预选`**，包括 C3P 证据抽取
-  （`chain/c3p.py::_EV_SYSTEM`「你是证据抽取器」）、skill_brewer、resolver、func_overlap。
-  排查时**看 system prompt 判真实用途，别信 TYPE**。该标签在第三方包内，升级会被覆盖，
-  不要去改它；要准确标签得由调用方传（现 mimo 调用点未传 tag）。
+- ~~⚠️ `llm_inputs.log` 的 `TYPE=` 标签是启发式，不等于实际用途~~（2026-10-15 **已根除**）：该调试转储（`mimoagent/models/openai_chat.py::_debug_dump_messages`，受 QD_LLM_DEBUG 控制）是历史调试产物，随 mimoagent 重装为纯净上游版（只打 `patches/mimoagent_windows.patch`）已从包内移除，`llm_inputs.log` 不再产生。保留两条教训：① **第三方包内的行为升级即被覆盖，别去改它**；② 启发式二分标签曾把所有不带 tools 的轻量调用错标成 `PRESELECT预选`（含 C3P 证据抽取 / resolver），排查看 system prompt 别信标签。
 
 ---
 

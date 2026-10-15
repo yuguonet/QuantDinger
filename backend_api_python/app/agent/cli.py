@@ -71,17 +71,11 @@ try:
 except ImportError:
     pass
 
-# ── ★ stdout = 结果通道：关闭 mimoagent 默认开启的 LLM-INPUT 调试打印 ──
-# mimoagent（`models/openai_chat.py::_debug_dump_messages`）默认 `QD_LLM_DEBUG="1"`：
-# 开启时**裸 print() 一行摘要直冲 stdout**（形如
-# `[LLM-INPUT::<model>] TYPE=... n_msgs=... -> llm_inputs.log`），并把完整 LLM
-# 输入落盘 CWD 下的 `llm_inputs.log`。
-# 这条 print 走的是 stdout 而非 logging handler —— 上轮修的「logger handler 一律
-# 朝 stderr」收口**管不到它**，CLI 的「`python -m app.agent.cli "问题" | ...`」
-# 契约（stdout 只能有结果）会被再次打破。
-# ⇒ 入口处把开关默认关掉；开发者如需落盘调试可显式 `QD_LLM_DEBUG=1`（或写进
-#   `.env`）覆盖本默认。（setdefault 不覆盖 .env / shell 已设的值）
-os.environ.setdefault("QD_LLM_DEBUG", "0")
+# ── ★ stdout = 结果通道 ──
+# 2026-10-15：mimoagent 重装为纯净上游版后，其 QD_LLM_DEBUG 调试转储
+# （裸 print 摘要 + CWD 落 llm_inputs.log，历史调试产物）已从包内根除 ——
+# 原「默认关」策略（曾在本入口、后上移 mimo_boot）随之撤销。
+# 日志 handler 的 stderr 收口见 `_pin_mimo_log_to_stderr()` 与 mimo_boot，仍有效。
 
 
 def _pin_mimo_log_to_stderr():
