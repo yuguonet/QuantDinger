@@ -200,15 +200,27 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
     ret5 = ((close / closes[-6]) - 1) * 100 if len(closes) > 6 else None
     ret20 = ((close / closes[-win20]) - 1) * 100 if len(closes) > win20 else None
 
-    # 连续涨停（用涨跌停幅度近似，尾部倒序）
+    # 连续涨停（用涨跌停幅度近似，尾部倒序）；limit_pct<=0（新股无涨跌幅）时恒 0
     limit_pct = get_limit_pct(code, name)
     streak = 0
-    for i in range(len(bars) - 1, 0, -1):
-        pc = bars[i - 1]["close"]
-        if pc and (bars[i]["close"] - pc) / pc * 100 >= limit_pct - 0.8:
-            streak += 1
-        else:
-            break
+    if limit_pct > 0:
+        for i in range(len(bars) - 1, 0, -1):
+            pc = bars[i - 1]["close"]
+            if pc and (bars[i]["close"] - pc) / pc * 100 >= limit_pct - 0.8:
+                streak += 1
+            else:
+                break
+
+    def _dist(ma_v):
+        return round((close - ma_v) / ma_v * 100, 2) if ma_v and close else None
+
+    dist_ma5 = _dist(_last(ma5))
+    dist_ma10 = _dist(_last(ma10))
+    # 支撑距离（供 LLM 直接用支撑框架，无需 read_skill）
+    _cands = [("ma5", dist_ma5, _last(ma5)), ("ma10", dist_ma10, _last(ma10)),
+              ("ma20", dist_ma20, ma20_v)]
+    _valid = [c for c in _cands if c[1] is not None and abs(c[1]) <= 3.0]
+    nearest = min(_valid, key=lambda c: abs(c[1])) if _valid else None
 
     intraday_pos = None
     rng = today["high"] - today["low"]
@@ -227,7 +239,17 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
         "ma5": round(_last(ma5), 2) if _last(ma5) else None,
         "ma10": round(_last(ma10), 2) if _last(ma10) else None,
         "ma20": round(ma20_v, 2) if ma20_v else None,
+        "dist_ma5_pct": dist_ma5,
+        "dist_ma10_pct": dist_ma10,
         "dist_ma20_pct": round(dist_ma20, 2) if dist_ma20 is not None else None,
+        "support": {
+            "nearest": nearest[0] if nearest else None,
+            "nearest_dist_pct": nearest[1] if nearest else None,
+            "near_support": bool(nearest),  # |dist|<=3% 视为贴支撑
+            "ma5": round(_last(ma5), 2) if _last(ma5) else None,
+            "ma10": round(_last(ma10), 2) if _last(ma10) else None,
+            "ma20": round(ma20_v, 2) if ma20_v else None,
+        },
         "ma_bull_stack": bool(_last(ma5) and _last(ma10) and ma20_v and _last(ma5) > _last(ma10) > ma20_v),
         "pos_in_20d_pct": round(pos20, 1) if pos20 is not None else None,
         "is_20d_high": bool(pos20 is not None and pos20 >= 99),
@@ -241,6 +263,8 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
 
 def _prev_streak(bars: List[Dict], limit_pct: float, streak: int) -> int:
     """截至上一交易日结束时的连板高度（判断「连板后首阴」等形态用）。"""
+    if limit_pct <= 0:
+        return 0
     idx = len(bars) - 1 - max(streak, 0)
     n = 0
     while idx > 0:
@@ -354,24 +378,59 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
         # bar 的 prev 不在 tech 里；用 bar close 反推不到就留 None，limit_up 用涨跌停价判
         prev_close = None
 
-    # 涨跌停真值：优先「现价 vs 涨停价」，缺涨停价再用涨跌停幅度近似
-    limit_up_price = _f(rt.get("limit_up_price"))
-    if limit_up_price and rt_price:
+    # 涨跌停真值：优先「现价 vs 涨停价」。quote 侧哨兵：
+    #   >0  = 有效涨跌停价
+    #   <=0 = 明确「无涨跌停」（新股上市首日/无限制）→ 不得回退公式，否则 N 联亚会被误判涨停
+    #   缺失 = 源无此字段 → 才用 get_limit_pct 近似
+    # 2026-10-15 实测：N联亚药业(301569) -1/-1；*ST天成(600112) -1/-1；ST 且 quote 价与 get_limit_pct 不一致。
+    def _parse_limit_px(v) -> tuple:
+        if v is None or v == "":
+            return None, "missing"
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None, "missing"
+        if x > 0:
+            return x, "price"
+        return None, "no_limit"
+
+    limit_up_price, up_kind = _parse_limit_px(rt.get("limit_up_price"))
+    limit_down_price, _dn_kind = _parse_limit_px(rt.get("limit_down_price"))
+    if up_kind == "price" and rt_price:
         limit_up = bool(rt_price >= float(limit_up_price) - 0.01)
+    elif up_kind == "no_limit":
+        limit_up = False
     elif rt_price and prev_close:
         limit_up = bool(is_limit_locked(code or row.get("code", ""), name or row.get("name", ""),
                                         rt_price, prev_close))
     else:
         limit_up = None
 
+    # 跌停封死（无流动性）：与涨停对称，供「不可买」判定
+    limit_down = None
+    if limit_down_price and rt_price:
+        limit_down = bool(rt_price <= float(limit_down_price) + 0.01)
+    elif _dn_kind == "no_limit":
+        limit_down = False
+
     row["rt"] = {
         "price": rt.get("price"),
         "change_pct": round(rt["change_pct"], 2) if rt.get("change_pct") is not None else None,
         "previous_close": rt.get("previous_close"),
         "limit_up": limit_up,
-        "limit_up_price": rt.get("limit_up_price"),
+        "limit_down": limit_down,
+        "limit_up_price": limit_up_price,
+        "limit_down_price": limit_down_price,
+        "limit_band": up_kind,  # price | no_limit | missing（跌停侧同 kind 语义，无限制时两价皆空）
         "time": rt.get("time"),
     }
+    # 可买性：封板（涨/跌）当日不可买 —— 写进 rt_risks，LLM 不得放入可买表
+    if limit_up is True:
+        row["rt"]["buyable"] = False
+    elif limit_down is True:
+        row["rt"]["buyable"] = False
+    else:
+        row["rt"]["buyable"] = None if (limit_up is None and limit_down is None) else True
     row["stale_bar"] = stale
 
     if tech:
@@ -392,6 +451,10 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
         risks = row.setdefault("rt_risks", [])
         if "涨停封板-当日买不进" not in risks:
             risks.append("涨停封板-当日买不进")
+    if limit_down is True:
+        risks = row.setdefault("rt_risks", [])
+        if "跌停封死-无流动性" not in risks:
+            risks.append("跌停封死-无流动性")
     if stale:
         risks = row.setdefault("rt_risks", [])
         note = f"日线滞后(bar_close={bar_close}, rt={rt_price})"

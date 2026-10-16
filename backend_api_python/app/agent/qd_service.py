@@ -195,9 +195,12 @@ def _dispatch_card(name: str, spec) -> str:
         f"- **空结果 = 结论已成立**：`analyzed` 为空时按 §重活分发的空结果纪律直接收尾交付"
         f"（说清 strategy / pool_size / hard_reasons / missing），"
         f"**不要**转为主对话逐个取数把同一套筛选重跑一遍\n"
-        f"- **非空结果 = 结论已成立**：证据齐（tech/flow/p_up/rt）时直接写结论，"
-        f"以 rt/tech/flow 为准（stale_bar 已修正）；**禁止**逐只重拉 quote/flow/tech；"
-        f"只允许对 Top1–2 调 inspect_stock 或补明确 missing 的口径（合计 ≤2 轮）\n"
+        f"- **非空结果 = 结论已成立**：证据齐（tech/flow/p_up/rt）时**直接写结论**，"
+        f"按返回体最前的 `report_guide` 落笔（支撑≫涨跌幅、T+1/+3/+5、封板不可买），"
+        f"以 rt/tech/flow 为准；**run_skill 只调这一次**，起手也**不要** get_hot_sectors / "
+        f"get_market_overview（market 已在结果里），"
+        f"**禁止**再调 search_tools / read_skill / get_dragon_tiger / 逐只 quote；"
+        f"**rt.buyable=false（涨停/跌停封板）只进排除表**；只允许对最终可买 Top1 调 inspect_stock（≤1 轮）\n"
         f'- 方法论原文（通常不必）：read_skill(name="{name}")'
     )
 

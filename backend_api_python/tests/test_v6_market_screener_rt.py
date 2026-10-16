@@ -18,6 +18,53 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def test_apply_rt_overlay_limit_down_not_buyable():
+    """跌停封死 → rt.buyable=False，且 rt_risks 标明（不得进可买表）。"""
+    h = _helpers()
+    row = {"code": "001231", "name": "农心科技",
+           "tech": {"ok": True, "close": 22.82, "limit_up": False}}
+    rt = {"price": 22.82, "change_pct": -9.98, "previous_close": 25.35,
+          "limit_up_price": 27.89, "limit_down_price": 22.82,
+          "time": "2026-10-15 13:20:00"}
+    h.apply_rt_overlay(row, rt, code="001231", name="农心科技")
+    assert row["rt"]["limit_down"] is True, row["rt"]
+    assert row["rt"]["buyable"] is False, row["rt"]
+    assert any("跌停" in x for x in row.get("rt_risks") or []), row
+
+
+def test_apply_rt_overlay_limit_up_not_buyable():
+    h = _helpers()
+    row = {"code": "600812", "name": "华北制药",
+           "tech": {"ok": True, "close": 6.57, "limit_up": True}}
+    rt = {"price": 6.57, "change_pct": 10.05, "previous_close": 5.97,
+          "limit_up_price": 6.57, "limit_down_price": 5.37,
+          "time": "2026-10-15 10:00:00"}
+    h.apply_rt_overlay(row, rt, code="600812", name="华北制药")
+    assert row["rt"]["limit_up"] is True
+    assert row["rt"]["buyable"] is False, row["rt"]
+
+
+def test_get_limit_pct_board_and_st_and_new():
+    """2026-10-15 重写：ST 跟随板；N/C 新股无涨跌幅。"""
+    from app.agent.modpath import import_module
+    c = import_module("app.agent.skills.market-screener.common")
+    # 普通
+    assert c.get_limit_pct("600000", "浦发银行") == 10.0
+    assert c.get_limit_pct("300750", "宁德时代") == 20.0
+    assert c.get_limit_pct("688981", "中芯国际") == 20.0
+    assert c.get_limit_pct("920090", "同辉北创") == 30.0
+    # ST 跟随所在板（实测主板 ST ±10%，创业 ST ±20%）
+    assert c.get_limit_pct("002168", "ST惠程") == 10.0
+    assert c.get_limit_pct("600381", "*ST春天") == 10.0
+    assert c.get_limit_pct("300147", "*ST香雪") == 20.0
+    # 新股 N/C → 0
+    assert c.get_limit_pct("301569", "N联亚药业") == 0.0
+    assert c.get_limit_pct("301660", "C粤芯半导体-U") == 0.0
+    # 无涨跌幅时 is_limit_locked 不得误判涨停
+    assert c.is_limit_locked("301569", "N联亚药业", 30.77, 7.0) is False
+    assert c.is_limit_locked("600000", "浦发银行", 10.62, 9.65) is True
+
+
 def _helpers():
     from app.agent.modpath import import_module
     return import_module("app.agent.skills.market-screener._helpers")
@@ -83,6 +130,34 @@ def test_apply_rt_overlay_missing_rt_is_noop():
     assert "stale_bar" not in row
     assert row["tech"]["close"] == 1.0
     assert row["tech"]["limit_up"] is False
+
+
+def test_apply_rt_overlay_sentinel_no_limit_new_stock():
+    """新股上市首日 quote 给 -1/-1 = 无涨跌幅；不得回退公式误判涨停（2026-10-15 N联亚）。"""
+    h = _helpers()
+    row = {"code": "301569", "name": "N联亚药业",
+           "tech": {"ok": True, "close": 30.77, "limit_up": False, "rsi14": 80.0}}
+    rt = {"price": 30.77, "change_pct": 339.57, "previous_close": 7.0,
+          "limit_up_price": -1.0, "limit_down_price": -1.0, "time": "2026-10-15 10:45:00"}
+    h.apply_rt_overlay(row, rt, code="301569", name="N联亚药业")
+    assert row["rt"]["limit_up_price"] is None, row["rt"]
+    assert row["rt"]["limit_down_price"] is None, row["rt"]
+    assert row["rt"]["limit_band"] == "no_limit"
+    assert row["rt"]["limit_up"] is False, row["rt"]
+    assert row["tech"]["limit_up"] is False
+    assert not any("涨停封板" in x for x in row.get("rt_risks") or []), row
+
+
+def test_apply_rt_overlay_sentinel_st_not_limit_up():
+    """*ST 哨兵 -1 不得判涨停（2026-10-15 *ST天成）。"""
+    h = _helpers()
+    row = {"code": "600112", "name": "*ST天成",
+           "tech": {"ok": True, "close": 0.73, "limit_up": False}}
+    rt = {"price": 0.73, "change_pct": 0.0, "previous_close": 0.73,
+          "limit_up_price": -1.0, "limit_down_price": -1.0, "time": "2026-10-15 10:00:00"}
+    h.apply_rt_overlay(row, rt, code="600112", name="*ST天成")
+    assert row["rt"]["limit_up"] is False, row["rt"]
+    assert row["rt"]["limit_band"] == "no_limit"
 
 
 def test_fetch_rt_map_parses_quote_contract():

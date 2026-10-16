@@ -19,6 +19,12 @@
 
 【★ 接线后 Δp 恒为 0 是预期行为】P3 校准未上线 ⇒ `coefs=None` ⇒ `p_final=p_base`。
 本阶段在**攒数据**，不是在看效果。别为了"看到非零 Δp"去凭空编系数。
+
+【用户维度（2026-10-15 用户裁定，长期有效）】追责链与案例链**不按用户区分**：
+collector.session_id 只作弱关联（API 层带 `user:<uid>:` 前缀；exp_grind/cron 传
+合成 sid；hooks 未设时 `_make_collector` 回落 "default"），decisions/cases 均无
+user_id——有意设计，空/合成 session_id 与 "default" 都不是 bug，放行即可。
+详见 `chain/intake.py` 模块头【用户维度】段。
 """
 from __future__ import annotations
 

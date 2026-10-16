@@ -71,7 +71,12 @@ def save_decision(*, session_id: str = "", trace_root_id: Optional[int] = None,
                   user_query: str = "", answer: str = "", model: str = "",
                   total_tokens: int = 0, latency_ms: int = 0,
                   gate_ver: str = "", gate_reason: str = "") -> Optional[int]:
-    """写决策头，返回 decision_id（失败返回 None）。"""
+    """写决策头，返回 decision_id（失败返回 None）。
+
+    用户维度（2026-10-15 用户裁定）：本表**无 user_id 列**、session_id 可空——
+    闭环/问责不按用户区分，session_id 仅弱关联（API 命名空间/exp_grind·cron
+    合成 sid），是有意设计；勿"补"user_id 列或把空值当 bug（详见 intake 模块头）。
+    """
     try:
         with _conn() as conn:
             cur = conn.cursor()

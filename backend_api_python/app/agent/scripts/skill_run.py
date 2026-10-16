@@ -32,6 +32,7 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
         ("list_strategies", "why_strategy", "debug_strategy", "doctor_auto"),
         "debug_strategy",
     ),
+    "auto-backtest": ("skills.auto-backtest.run", ("run",), "run"),
 }
 
 # ★ 2026-10-14 迁址：原为 `parents[1]`（= app/agent）⇒ 产物落在 `app/agent/tmp/`
@@ -81,7 +82,18 @@ def main() -> int:
         sig = inspect.signature(fn)
         unknown = set(kwargs) - set(sig.parameters)
         if unknown:
-            print(json.dumps({"ok": False, "error": f"未知参数: {sorted(unknown)}"}, ensure_ascii=False))
+            # 2026-10-15：模型编造 kwargs（strategy/market_cap/with_mtf…）被拒后
+            # 会 read_skill 查用法再重试 —— 直接把正确调法 + 结论规则回给它。
+            allowed = sorted(sig.parameters)
+            print(json.dumps({
+                "ok": False,
+                "error": f"未知参数: {sorted(unknown)}",
+                "hint": f"请只用: {allowed}；一键入口 arguments='{{\"fn\":\"{fn_name}\"}}' 或 arguments=''（全默认）",
+                "report_guide": {
+                    "STEPS": "按 hint 重试 run_skill 一次即可；禁止 read_skill / search_tools / get_market_overview",
+                    "priority": "支撑与弱转强/强转弱 ≫ 涨跌幅",
+                },
+            }, ensure_ascii=False))
             return 2
         result = fn(**kwargs)
     except Exception as e:

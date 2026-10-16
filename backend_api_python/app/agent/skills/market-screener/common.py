@@ -472,21 +472,34 @@ def fetch_kline(code: str, days: int = 60) -> List[Dict]:
     except Exception:
         return []
 def get_limit_pct(code: str, name: str = "") -> float:
-    """根据股票代码和名称返回涨跌停幅度。"""
-    if "ST" in name.upper():
-        return 5.0
+    """涨跌停幅度（%）。返回 0.0 = 无涨跌幅限制。
+
+    2026-10-15 实测重写（见 references/limit-rules.md）：
+    · ST/风险警示**跟随所在板**（主板 ST 亦 ±10%，创业/科创 ST ±20%），不再单独 ±5%
+    · 新股 N=上市首日 / C=注册制第 2~5 日：无涨跌幅（返回 0）
+    · 仅作 rt 缺失时的近似；有 rt.limit_*_price 时以 rt 为准
+    """
+    code = (code or "").strip()
+    name = (name or "").strip()
+    # 新股标记（N联亚药业 / C粤芯半导体-U）；A 股简称 N/C 后为中文
+    if len(name) >= 2 and name[0] in ("N", "C"):
+        return 0.0
     if code.startswith(("300", "301")):
         return 20.0
-    if code.startswith("688"):
+    if code.startswith(("688", "689")):
         return 20.0
-    if code.startswith(("8", "4")):
+    if code.startswith(("8", "4", "92")):
         return 30.0
     return 10.0
+
+
 def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bool:
     """判断是否涨停封板（买不进去）。"""
     if prev_close <= 0 or close <= 0:
         return False
     limit_pct = get_limit_pct(code, name)
+    if limit_pct <= 0:
+        return False  # 无涨跌幅（新股），不存在「封板买不进」
     change_pct = (close - prev_close) / prev_close * 100
     return change_pct >= limit_pct - 0.5
 def fetch_zt_pool(date: str) -> List[Dict]:

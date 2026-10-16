@@ -20,15 +20,68 @@ from typing import Any, Dict, Generator, Optional
 
 import requests
 
-from app.data_sources.asia_stock_kline import (
-    _get_twelve_data_api_key,
-    _td_symbol_and_exchange,
-    ak_a_code_from_tencent,
-    ak_hk_code_from_tencent,
-)
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 符号/密钥工具 — 从已废弃的 app.data_sources.asia_stock_kline 内联
+# (2026-10-16 该文件移除: 这 4 个函数全库仅本文件消费, 内联而非另开共享模块)
+# ---------------------------------------------------------------------------
+
+
+def ak_a_code_from_tencent(tencent_code: str) -> str:
+    """Tencent 代码 → AkShare A 股代码（剥掉 sh/sz 前缀）。"""
+    c = (tencent_code or "").strip().lower()
+    if len(c) >= 8 and c[:2] in ("sh", "sz"):
+        return c[2:]
+    return c
+
+
+def ak_hk_code_from_tencent(tencent_code: str) -> str:
+    """Tencent 代码 → AkShare 港股代码（5 位数字）。"""
+    c = (tencent_code or "").strip().upper().replace(".HK", "")
+    if c.startswith("HK"):
+        num = c[2:]
+    else:
+        num = c
+    if num.isdigit():
+        return num.zfill(5)
+    return num
+
+
+def _get_twelve_data_api_key() -> str:
+    """Twelve Data API 密钥：附加配置优先，回落环境变量。"""
+    try:
+        from app.utils.config_loader import load_addon_config
+        key = load_addon_config().get("twelve_data", {}).get("api_key", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return (os.getenv("TWELVE_DATA_API_KEY") or "").strip()
+
+
+def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
+    """Convert Tencent code to Twelve Data (symbol, exchange).
+
+    Twelve Data time_series requires exchange *name* (SSE / SZSE / HKEX / BSE),
+    not the MIC code (XSHG / XSHE / XHKG).
+    """
+    c = (tencent_code or "").strip().upper()
+    if is_hk:
+        num = c.replace("HK", "")
+        if num.isdigit():
+            num = str(int(num)).zfill(4)
+        return num, "HKEX"
+    digits = c.lstrip("SHSZBJ")
+    if c.startswith("SH") or digits.startswith(("6", "9")):
+        return digits, "SSE"
+    if c.startswith("BJ") or digits.startswith(("43", "82", "83", "87", "88")):
+        return digits, "BSE"
+    return digits, "SZSE"
+
 
 _PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 

@@ -82,16 +82,20 @@
   **空 ≠ 失败**，空是一个合法、可交付、可复盘的结论。
 - **非空结果纪律（硬约束）**：`run_skill` 返回 `analyzed` 非空且证据字段齐
   （tech / flow / p_up / rt）时，**结果已够写结论**，按两条处置：
-  ① **直接交付结论**：按输出契约写结论表 / 取舍 / 组合风险 / 数据缺口；
+  ① **直接交付结论**：按返回体最前 `report_guide` + 输出契约写结论表 / 取舍 / 组合风险 / 数据缺口；
      实时价、涨跌停、资金、技术指标以 `analyzed` 里的 `rt` / `tech` / `flow` 为准
-     （`stale_bar=true` 时收盘与涨跌停已按 rt 修正），**禁止**再逐只调
-     get_realtime_quote / get_fund_flow / technical_analysis 重验同一口径；
-  ② 允许的补取只有两类，且合计 ≤2 轮工具：
-     · 对**最终推荐的 Top1–2** 调 `inspect_stock`（题材 / 龙虎榜 / 风险点交叉验证）；
-     · 补 `run_skill` 结果里**明确 missing** 的口径（如公告 / 新闻），不得扩展新维度。
-  理由：证据包已含实时对账，主对话重拉同口径只会烧十几轮 LLM 得到同一份数
-  （实测 11 步 / 21 万 token / budget_wrapped）；要更全的证据就再派一次 run_skill
-  调大 limit / 开 with_mtf，而不是在主对话手工重跑流水线。
+     （`stale_bar=true` 时收盘与涨跌停已按 rt 修正）。
+     **工具白名单（跑完 run_skill 之后）**：**禁止**再调
+     search_tools / read_skill / get_market_overview / get_hot_sectors /
+     get_dragon_tiger / get_realtime_quote / get_fund_flow / technical_analysis——
+     run_skill **一次**已含市场状态、热点与逐票证据（实测二次 run_skill / read_skill /
+     旁路取数会把 3 步拖成 7~10 步）。**起手也不要** get_hot_sectors / get_market_overview，
+     直接 run_skill。
+     **可买表纪律**：`rt.buyable=false`（涨停封板 / 跌停封死）只进排除表，禁止进可买/推荐表。
+  ② 允许的补取只有一类，≤1 轮：对**最终可买 Top1** 调 `inspect_stock`。
+  理由：证据包已含实时对账；主对话重拉或再跑流水线只会多烧数轮 LLM 得到同一份数
+  （实测 11 步 / 21 万 token；2026-10-15 仍见 7 步）。要更全证据就再派一次 run_skill
+  调大 limit / 开 with_mtf（且仅限空结果或明确 missing）。
 - 多步骤任务先用 update_plan 列计划、逐步勾销；单步小事（如查现价）不要列计划。
   **用户明确给出分步要求的任务（"分三步…1 2 3"）必须留在主对话里用 update_plan
   逐步勾销，不要整体丢给 task 子代理**——子代理里的计划主对话看不见，无法审计收口；

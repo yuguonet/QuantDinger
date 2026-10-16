@@ -53,7 +53,10 @@ def test_real_skills_parse_from_metadata_and_no_legacy_toplevel():
     assert len(adapter) >= 6
     ms = adapter.get("market-screener")          # 走 display→name 映射
     assert ms is not None and ms.name == "market-screener"
-    assert ms.tags == ["market", "screener", "short_term", "a_share"]
+    # v8.1.0（2026-10-15）起 tags 增 mid_term —— 技能定位「全市场短中线选股」
+    # （SKILL.md description 同文），属有意图的技能元数据变更；期望随元数据同步，
+    # 防「技能改了 tags 没人登记」的静默漂移。
+    assert ms.tags == ["market", "screener", "short_term", "mid_term", "a_share"]
     assert len(ms.tools) == 12
     # 迁移完成后：任何技能都不应再报"非标准顶层字段"
     assert all(

@@ -10,6 +10,13 @@
 
 【全链路 fail-open】
   追责是旁路：任何异常都**不许**影响主对话。`record_decision` 永不抛异常。
+
+【用户维度（2026-10-15 用户裁定，长期有效）】
+  闭环/问责与**用户无关**：decisions/claims/resolutions 全链**没有 user_id 列**，
+  也不建注入链路——是有意设计，不是漏字段、更不是待修 bug。
+  session_id 由调用方透传，仅作弱关联/排查线索：Flask 层带 `user:<uid>:` 命名
+  空间前缀；exp_grind/cron 传合成 sid；直接调用不传 = 空串。**空或合成的
+  session_id 放行即可**，勿按"丢了用户身份"去补注入链（旧 M4 同族，已裁定搁置）。
 """
 from __future__ import annotations
 

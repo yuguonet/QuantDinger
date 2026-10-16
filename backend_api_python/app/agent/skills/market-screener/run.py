@@ -205,6 +205,22 @@ def filter_candidates(prescreen_result: dict) -> str:
     return _filter_candidates(prescreen_result)
 
 
+# 结论写法（内嵌到结果**最前**，主 agent 打开预览第一眼看到；不必 read_skill）
+_REPORT_GUIDE = {
+    "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
+             "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote",
+    "buyable": "rt.limit_up=true（涨停封板）或 rt.limit_down=true（跌停封死）→ **只进排除表，禁止进可买表**；"
+               "stale_bar 不影响此条",
+    "horizon": "主写 T+1/T+3/T+5；T+10/T+20 可选，证据不够写「不适用」；p_up 仅 T+1",
+    "priority": "支撑与弱转强/强转弱 ≫ 涨跌幅；禁止按涨跌幅排序",
+    "support_rule": "盘中红绿不决定安全；可怕的是无支撑阴跌。-8%弱转强+有支撑 可以比 +8%转分歧更安全",
+    "fields": "tech.support.nearest/near_support 看贴哪条均线；rt 看现价/涨跌停；stale_bar 盘中常态，可执行性已按 rt 修正",
+    "board_cut": "zt_streak>=3 默认只写 T+1",
+    "words": "选股用 看多/中性/看空/回避（不入选）；用户问持仓才写「兑现」",
+    "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors",
+}
+
+
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                  with_patterns: bool = True, with_mtf: bool = False) -> dict:
     """对指定股票批量汇总全部可用证据，并按标定模型的 P(次日涨) 排序。
@@ -221,11 +237,14 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
 
     返回:
         dict: analyzed[{code,name,patterns,tech,flow,mtf,score,direction,confidence,signal,missing,
-            rt{price,change_pct,previous_close,limit_up,limit_up_price,time},stale_bar,rt_risks}]；
+            rt{price,change_pct,previous_close,limit_up,limit_up_price,limit_down_price,limit_band,time},
+            stale_bar,rt_risks}]；
             strategy / missing / errors。confidence 是**证据完整度**（拿到几维 / 共几维），
             不是模型对自己判断的把握。
-            rt = 实时快照；stale_bar=True 表示本地日线滞后，tech 的收盘/涨跌停已按 rt
-            修正（MA/RSI 等历史指标仍基于 bar）。**有 rt 就不必再主对话重拉实时行情**。
+            rt = 实时快照；limit_band=price|no_limit|missing（新股无涨跌幅为 no_limit，
+            两价为 None 且 limit_up=false，勿用公式回退）。stale_bar=True 表示本地日线滞后，
+            tech 的收盘/涨跌停已按 rt 修正（MA/RSI 等历史指标仍基于 bar）。
+            **有 rt 就不必再主对话重拉实时行情**。
     """
     strategy = select_strategy()
     errors: list = []
@@ -233,6 +252,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     code_list = [c.strip() for c in str(codes or "").split(",") if c.strip()][:max(1, int(limit or 8))]
     if not code_list:
         return SkillResult({
+            "report_guide": _REPORT_GUIDE,
             "score": 45.0, "direction": "neutral", "confidence": 0.5,
             "signal": "无股票可分析", "analyzed": [], "strategy": strategy,
             "errors": [], "missing": [],
@@ -395,7 +415,10 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                 f"实时{_rt.get('price')}"
                 + (f"（{_rt_chg:+.2f}%）" if _rt_chg is not None else "")
                 + ("·涨停封板" if _rt.get("limit_up") else "")
+                + ("·跌停封死" if _rt.get("limit_down") else "")
             )
+        if _rt.get("buyable") is False:
+            _bits.append("不可买（封板）")
         if r.get("stale_bar"):
             _bits.append("⚠日线滞后，收盘/涨跌停以实时为准")
         r["signal"] = "；".join(_bits) or "无形态与技术信号"
@@ -408,6 +431,8 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         a.pop("_bars", None)
 
     return SkillResult({
+        # report_guide 放最前：skill_run 预览= json.dumps，键序即阅读序
+        "report_guide": _REPORT_GUIDE,
         "score": report.score,
         "direction": report.direction,
         "confidence": report.confidence,
@@ -588,11 +613,26 @@ def _safe_market() -> dict:
         return {}
 
 
-def run() -> dict:
-    """一次性跑完整流程（pre_screen → profile → 分析 Top8）。分步调用更灵活，本函数供快捷场景使用。"""
-    prescreen_result = pre_screen()
+def run(sources: str = None, queries: str = None,
+        min_turnover: float = None, limit: int = None) -> dict:
+    """一次性跑完整流程（pre_screen → profile → 分析 Top8）。供 run_skill 快捷派活。
+
+    可选参数（与 pre_screen 同义；全部可省）：
+        sources: 候选来源，如 "zt,dragon,search"；省略用时段默认
+        queries: 条件搜索词
+        min_turnover: 换手率下限；省略=不过滤
+        limit: 候选截断；省略=不截断
+    **不要传** strategy / min_market_cap / with_mtf 等不存在的参数。
+    """
+    prescreen_result = pre_screen(
+        sources=sources, queries=queries,
+        min_turnover=min_turnover, limit=limit,
+    )
     if prescreen_result.get("error"):
-        return prescreen_result
+        return SkillResult({
+            "report_guide": _REPORT_GUIDE,
+            **prescreen_result,
+        })
     bundle = _profile_candidates(prescreen_result, limit=10, with_flow=False, with_pred=False)
     codes = [p["code"] for p in bundle.get("profiles", []) if not p.get("hard")]
     if not codes:
@@ -609,6 +649,7 @@ def run() -> dict:
                 if str(_r) not in _hard_reasons:
                     _hard_reasons.append(str(_r))
         return SkillResult({
+            "report_guide": _REPORT_GUIDE,
             "strategy": bundle.get("strategy"),
             "analyzed": [],
             "signal": "无符合硬条件的候选",

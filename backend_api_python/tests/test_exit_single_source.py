@@ -30,7 +30,10 @@ EXIT_ENGINES = ("run_hold_stop", "run_trail_stop", "run_limit_seal", "defer_forc
                 "run_d1_limit_up_trail")
 
 SKIP_DIRS = {"del", "node_modules", ".venv", "__pycache__", ".git", ".pytest_cache",
-             "venv", "build", "dist", "_archive"}
+             "venv", "build", "dist", "_archive", "tmp"}
+# tmp（2026-10-16 补入）：项目约定的临时/探针/结果区——P0-② 回测桥冒烟脚本与
+# 其产物按约定落 tmp/，其中含折叠契约策略类（探针载体，不是第二份策略实现）。
+# 门禁管**出货代码**（app/ 树）不管草稿区；del/ 同理已在跳过集。
 
 DEF_RE = {
     name: re.compile(r"^\s*def\s+%s\s*\(" % name, re.M) for name in EXIT_ENGINES

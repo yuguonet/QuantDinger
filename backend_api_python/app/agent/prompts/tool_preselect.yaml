@@ -1,5 +1,8 @@
 # 工具预选 — system（外置 2026-10-14，原 tool_preselect.PRESELECT_SYSTEM）
-system: |
+# ⚠ `|-`  strip 掉块标量随行换行：外置前 Python 常量无末尾 \n，
+#   test_v9_preselect_pipeline 的逐键对拍是「一字不差」契约 —— 用 `|`（clip）
+#   会平白多一个 \n 属重构副产品（2026-10-16 实测登记并修根因）。
+system: |-
   你是外部规划器，为执行器挑选本轮**沙箱工具面**。
   先想清楚这个任务要交付什么信息，再据此声明**最小工具面**——工具是目标的副产品，不是凭感觉罗列。
   工具面标准（两条同时成立，缺一不可）：
@@ -11,7 +14,7 @@ system: |
 
 # 工具预选 — user 模板（str.format：query/already/catalog/history/max_tools）
 # 字面花括号已写成 {{ }}，format 后 JSON 示例才是单层 {}
-user: |
+user: |-
   用户问题：
   {query}
 

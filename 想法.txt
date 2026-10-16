@@ -2036,3 +2036,13 @@ market_cn/auto系统越改冗余越大
 测试是需要加载虚拟环境,在.venv目录,进入app/agent,调用cli.py运行和监视,用户消息应该多问几个金融方面的问题: 分析xxx股票; 现在买什么股;今天大盘怎么样,热门板块是哪个.需要注意几个方面,输入输出内容是否正确没重复,token数是否能精简,步数(一般不会超过7步)是否能再减小,工具或技能调用是否正确,响应时间是否合理.答案是否简单明了.
 
 我想将金融领域的工具和能力层的共有的工具进行缩小,金融领域的工具主要放bull_bear_research.py,technical_analysis.py这种多工具集合的工具,基础工具get_realtime_quote;get_index_kline交给能力层,
+
+/Superpowers 工程方法论 AGENT_DESIGN_v3.md 文案里还缺少几个数据流向,主流程已经基本正常了,应该写一个更直观,T+N回评流向还没有画,闭环和问责的流向,skill/tools工具流,
+特别是agent调用market_cn/auto全盘回测和个股回测系统的流向,这一部分应该缺失严重,我对回测系统数据流这一块的思路是:
+1.相对独立的桥,不侵入/破坏agent和auto|backtest两个系统的架构
+2.允许直接传agent自己想出来的策略给auto|backtest进行回测
+3.agent借auto|backtest进行回测不会影响其它回测链路中的数据
+
+先把https://github.com/yuguonet/QuantDinger项目以zip或tar.gz的形式趴下来,用代理或镜像的方式可能比较快,下回来解压,加载memory
+
+扫描目录产出「函数+docstring」清单缓存（内存/文件），哈希校验决定是否重扫，调用方直接消费清单。不写元数据声明、不维护中央名字表。

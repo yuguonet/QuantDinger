@@ -1,6 +1,7 @@
 """test_known_divergence.py — **已知口径分歧的显式登记 + 修复回归护栏**。
 
-来源：golden 逐笔对拍任务 | 产出：2026-10-08 | 状态：分歧 #1 **已修复**
+来源：golden 逐笔对拍任务 | 产出：2026-10-08 | 状态：分歧 #1 **已修复**；
+分歧 #2（dragon g8 阴线门复活）**已登记**（2026-10-16）
 
 ★ 为什么要有这个文件：
   golden 逐笔对拍（`test_golden_parity`）只覆盖**两侧一致**的分支。那些**确实不一致**
@@ -184,3 +185,54 @@ def test_divergence_documented_in_report():
         assert key in txt, (
             "docs/口径差异报告.md 未登记「%s」—— 分歧 #1 必须写进报告，不能只活在测试里"
             % key)
+    # 分歧 #2（2026-10-16 g8 阴线门复活）同样必须登记在案
+    for key in ("yin_ratio_exclude", "阴线", "winrate_tuning"):
+        assert key in txt, (
+            "docs/口径差异报告.md 未登记「%s」—— 分歧 #2（g8 复活）必须写进报告"
+            % key)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 分歧 #2｜dragon g8 阴线门复活（yin_ratio_exclude 哨兵 1.01→0.5）
+#            —— 已登记在案（2026-10-16），两侧行为都钉住
+# ═══════════════════════════════════════════════════════════════════════
+# 【经过】
+#   2026-09-16 逐门消融：阴线>=0.6 排除门判「砍掉的 2 笔是赚钱票」⇒ 用户裁定
+#   「尝试关闭, 不删除」—— 用哨兵参数 1.01 停用（判定代码原样保留）。
+#   2026-10-15 winrate_tuning 复活 @0.5（用户口径=胜率升且盈亏比不降；
+#   300d 胜率 62.3→64.0% / PL 1.96→1.97；600d 50.9→51.8% / PL 1.48→1.48）。
+#   ⇒ 合成配方 crafted_bars 的回调段原为 6/7 阴线（0.857）被 g8 拒 ⇒ dragon
+#   全族零信号（golden 4 + present 2 + fold 3 + m1 1 + 本文件 3，共 13 个测试
+#   同根失败）。配方已手术：27/28/29 只改开盘价（低开高走），收盘不动 ⇒
+#   重冻后 trades 与旧基线**逐位相同**，仅 bars_fingerprint 变。
+#
+# 【本测试钉住另一侧】把 27/28/29 开盘改回连续阴线形态 ⇒ 零交易。
+#   A/B 只差 3 个开盘价，而开盘价只进 yin_ratio 一门（depth 由 bar29 的
+#   low=125 主导，其余门全走收盘价）⇒ 因果唯一：证明门确实在阴阳占比上起作用，
+#   且哨兵若被谁关回 1.01 / 门槛被悄悄再降，这里 FAIL。
+#   假绿防线：直接断言阴阳占比数值（0.43 vs 0.857），不是空集对空集。
+def test_g8_yin_gate_rejects_deep_red_pullback():
+    from app.market_cn.auto import strategies as reg
+    from app.market_cn.auto.strategies.dragon_callback import _yin_ratio
+    from tests.present.test_dragon import CODE, SI, crafted_bars
+
+    reg.autodiscover()
+    s = reg.get_strategy("dragon_callback")
+
+    mixed = crafted_bars()                       # A 侧：现配方（27/28/29 低开高走）
+    red = list(mixed)                            # B 侧：仅把这三根开盘改回前收×1.002
+    for i in (27, 28, 29):
+        red[i] = {**mixed[i], "open": round(mixed[i - 1]["close"] * 1.002, 3)}
+
+    yin_mixed = _yin_ratio(mixed, 25, 32)        # lu=25 → D0=32 回调窗（7 根）
+    yin_red = _yin_ratio(red, 25, 32)
+    assert yin_mixed < 0.5, "现配方应过 g8 门，实得阴线占比 %r" % yin_mixed
+    assert yin_red >= 0.5, "还原连续阴线应被 g8 拒，实得阴线占比 %r" % yin_red
+
+    trades_mixed = s.backtest_stock(mixed, CODE, stock_info=SI,
+                                    use_prefilter=False) or []
+    assert len(trades_mixed) == 1, "现配方应产出 1 笔，实得 %r" % trades_mixed
+    trades_red = s.backtest_stock(red, CODE, stock_info=SI,
+                                  use_prefilter=False) or []
+    assert trades_red == [], "重阴线回调（阴线占比 %.3f）应被 g8 拒＝零交易，实得 %r" % (
+        yin_red, trades_red)
