@@ -95,14 +95,15 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
 
     ("kline", ("k线", "K线", "日线", "周线", "历史", "走势", "均线", "ma5", "ma20",
                "ma60", "kline", "蜡烛"),
-     ("agent_get_kline", "get_index_kline", "daily", "technical_analysis")),  # calculate_ma → technical_analysis
+     ("agent_get_kline", "get_index_kline", "technical_analysis")),  # calculate_ma → technical_analysis
 
     ("trend", ("技术面", "趋势", "形态", "支撑", "压力", "突破", "macd", "kdj", "rsi",
                "指标", "多头", "空头", "背离"),
      # analyze_trend / get_indicator_snapshot → technical_analysis；
-     # indicator_analysis → run_indicator_signal；get_indicator_params → list_indicators
+     # indicator_tools 模块已并入 technical_analysis（run_indicator_signal /
+     # list_indicators 不再注册），指标类查询一律走 technical_analysis
      ("technical_analysis", "analyze_pattern",
-      "analyze_chart_patterns", "run_indicator_signal", "list_indicators")),
+      "analyze_chart_patterns")),
 
     ("fundflow", ("资金流", "主力", "净流入", "净流出", "大单", "超大单", "北向",
                   "融资", "主力净额"),
@@ -118,7 +119,7 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("screen", ("选股", "筛选", "强势", "涨停", "跌停", "榜单", "排行", "热榜",
                 "哪些股", "几只", "排名", "涨幅榜"),
      ("search_stocks", "get_limit_pool", "get_hot_stocks_with_reason",
-      "get_hot_rank", "get_screener_presets", "build_keyword_from_filters",
+      "get_hot_rank", "get_screener_presets",
       "get_market_overview")),
 
     ("valuation", ("估值", "市盈率", "pe", "pb", "市净率", "财报", "业绩", "营收",
@@ -142,8 +143,11 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
      ("get_dragon_tiger",)),   # get_dragon_tiger_detail → get_dragon_tiger
 
     ("strategy", ("策略", "回测", "启动策略", "停止策略", "信号", "交易记录"),
+     # run_backtest / get_backtest_history 已下线：回测桥工具更名为
+     # agent_backtest_strategy（auto 泳道）/ agent_backtest_svc（指标·脚本泳道）
      ("list_strategies", "get_strategy_detail", "get_strategy_trades",
-      "start_strategy", "stop_strategy", "run_backtest", "get_backtest_history")),
+      "start_strategy", "stop_strategy",
+      "agent_backtest_strategy", "agent_backtest_svc")),
 
     ("intel", ("新闻", "公告", "研报", "消息", "舆情", "政策", "公告", "为什么",
                "有什么利", "最新动态"),

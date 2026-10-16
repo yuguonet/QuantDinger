@@ -24,7 +24,6 @@ metadata:
 - 市场情绪/温度判断（贪恐指数、情绪历史、情绪快照）：改用 `get_fear_greed` / `get_emotion_history` / `get_emotion_latest`。
 - 个股基础财务、估值横向对比、F10 详情：改用 `get_finance` / `batch_valuation_compare` / `get_f10_*`。
 - 全市场扫雷、活跃代码表扫描：改用 `all_codes` / `get_hot_rank` / `get_hot_sectors`。
-- 策略回测历史查询：改用 `get_backtest_history`。
 
 ## 执行流程
 

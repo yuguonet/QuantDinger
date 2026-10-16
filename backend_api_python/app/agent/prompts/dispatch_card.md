@@ -1,0 +1,7 @@
+- 何时用：全市场扫描/筛选/策略诊断等**批量流水线**任务（重活派活，不在主对话逐步取数）
+- 怎么派：run_skill(name="{name}", arguments='{{"fn":"<入口>","kwargs":{{…}}}}')
+- 入口：{fn_note}（默认 {default_fn}）
+- 结果读法：返回体 {{ok, result(截断预览), full_path, elapsed_s}}——结论引用预览，明细看 full_path 文件，不要全量贴回对话
+- **空结果 = 结论已成立**：`analyzed` 为空时按 §重活分发的空结果纪律直接收尾交付（说清 strategy / pool_size / hard_reasons / missing），**不要**转为主对话逐个取数把同一套筛选重跑一遍
+- **非空结果 = 结论已成立**：证据齐（tech/flow/p_up/rt）时**直接写结论**，按返回体最前的 `report_guide` 落笔（支撑≫涨跌幅、T+1/+3/+5、封板不可买），以 rt/tech/flow 为准；**run_skill 只调这一次**，起手也**不要** get_hot_sectors / get_market_overview（market 已在结果里），**禁止**再调 search_tools / read_skill / get_dragon_tiger / 逐只 quote；**rt.buyable=false（涨停/跌停封板）只进排除表**；只允许对最终可买 Top1 调 inspect_stock（≤1 轮）
+- 方法论原文（通常不必）：read_skill(name="{name}")

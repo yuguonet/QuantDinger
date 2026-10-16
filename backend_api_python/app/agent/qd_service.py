@@ -30,6 +30,7 @@ try:
 except ImportError:
     from .qd_agent import QDAgent, QDAgentConfig, bind_run_session, register_run_hooks, unregister_run_hooks, _hooks_now
 from .qd_config import is_transient_control
+from .prompts import load_prompt as _load_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,15 @@ def _canonical_skill_name(skills, name: str) -> str:
     return name
 
 
+# 分发卡片模板（2026-10-16 外置）：卡片正文规则在 prompts/dispatch_card.md，
+# 本文件只保留参数计算与 format 填充——改卡片措辞无需动代码。模板是模块
+# import 时加载的常量（prompts/ 加载器约定），改 .md 后需重启进程生效。
+# 【逐字保文】模板输出必须与 2026-10-10 起的 f-string 版本逐字节一致：
+# qd_smoke.test_38 对卡片有内容断言（run_skill 签名/入口/结果读法/空结果
+# 纪律/非空纪律），改措辞前先 dump 基线做字节级比对（tmp/dispatch_card_verify.py）。
+_DISPATCH_CARD_TPL = _load_prompt("dispatch_card")
+
+
 def _dispatch_card(name: str, spec) -> str:
     """执行型技能 → 分发卡片（2026-10-10）：不注方法论正文，只注
     「何时派 / 怎么派 / 入口 / 结果怎么读」。
@@ -179,6 +189,11 @@ def _dispatch_card(name: str, spec) -> str:
     「上下文 O(摘要)」；② 模型照着分步方法论在主对话硬跑的概率上升——与
     system_template §重活分发**抢方向盘**。正文并未删除：read_skill 按需读
     兜底仍在，模型真要方法论仍拿得到。
+
+    【外置·2026-10-16】卡片正文外置到 prompts/dispatch_card.md（占位符
+    {name}/{fn_note}/{default_fn}；字面花括号写 {{ }}），本函数只算三个实参。
+    `default_fn or "run"` 的落空逻辑保留在此处算完再传 str 进模板——模板里
+    不放表达式，避免措辞之外的行为也散进 .md。
     """
     try:
         _mod_path, entries, default_fn = list(spec)[:3]
@@ -186,23 +201,8 @@ def _dispatch_card(name: str, spec) -> str:
         entries, default_fn = (), "run"
     entries = list(entries or ())
     fn_note = "、".join(entries) if entries else str(default_fn or "run")
-    return (
-        f"- 何时用：全市场扫描/筛选/策略诊断等**批量流水线**任务（重活派活，不在主对话逐步取数）\n"
-        f'- 怎么派：run_skill(name="{name}", arguments=\'{{"fn":"<入口>","kwargs":{{…}}}}\')\n'
-        f"- 入口：{fn_note}（默认 {default_fn or 'run'}）\n"
-        f"- 结果读法：返回体 {{ok, result(截断预览), full_path, elapsed_s}}——"
-        f"结论引用预览，明细看 full_path 文件，不要全量贴回对话\n"
-        f"- **空结果 = 结论已成立**：`analyzed` 为空时按 §重活分发的空结果纪律直接收尾交付"
-        f"（说清 strategy / pool_size / hard_reasons / missing），"
-        f"**不要**转为主对话逐个取数把同一套筛选重跑一遍\n"
-        f"- **非空结果 = 结论已成立**：证据齐（tech/flow/p_up/rt）时**直接写结论**，"
-        f"按返回体最前的 `report_guide` 落笔（支撑≫涨跌幅、T+1/+3/+5、封板不可买），"
-        f"以 rt/tech/flow 为准；**run_skill 只调这一次**，起手也**不要** get_hot_sectors / "
-        f"get_market_overview（market 已在结果里），"
-        f"**禁止**再调 search_tools / read_skill / get_dragon_tiger / 逐只 quote；"
-        f"**rt.buyable=false（涨停/跌停封板）只进排除表**；只允许对最终可买 Top1 调 inspect_stock（≤1 轮）\n"
-        f'- 方法论原文（通常不必）：read_skill(name="{name}")'
-    )
+    return _DISPATCH_CARD_TPL.format(
+        name=name, fn_note=fn_note, default_fn=str(default_fn or "run"))
 
 
 def _skill_block(name: str, body: str, skills) -> str:

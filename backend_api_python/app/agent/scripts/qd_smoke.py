@@ -1586,7 +1586,12 @@ def test_30_toolface_import_health():
         #   empty_rate）不再被注册成"模型可调工具"——它们本来就是代码调用面
         #   （`reset` 能让模型清空观测计数器，是实打实的洞）。工具面 97 → 92，
         #   阈值同步 95 → 90；**不是**为了躲这条检查，是这 5 个本就不该计数。
-        check(f"工具面数量充足（{_n} ≥ 90）", _n >= 90, str(_n), env="tool_deps")
+        # ★ 2026-10-16 基线变更 -3：`finance` 三个模块整体下线——`kline_tools`(daily)
+        #   与 `backtest_tools`(run_backtest / get_backtest_history) 已由 `agent_get_kline`
+        #   / `agent_backtest_strategy`·`agent_backtest_svc` 替代，`indicator_tools`
+        #   (list_indicators / run_indicator_signal) 无替代直接退役 ⇒ 工具面 92 → 89，
+        #   阈值同步 90 → 87（仍留 2 的余量，成片掉模块依旧会触发）。
+        check(f"工具面数量充足（{_n} ≥ 87）", _n >= 87, str(_n), env="tool_deps")
     except Exception as e:
         check("工具面数量充足", False, f"{type(e).__name__}: {e}")
 

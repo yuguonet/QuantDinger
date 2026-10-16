@@ -111,9 +111,9 @@ _SUPERSEDED_BY_MERGE = frozenset({
     "finance.analysis_tools:get_volume_analysis",
     "finance.analysis_tools:get_obv_analysis",
     "finance.analysis_tools:calculate_ma",
-    # 指标策略 → list_indicators / run_indicator_signal
-    "finance.indicator_tools:get_indicator_params",
-    "finance.indicator_tools:indicator_analysis",
+    # 指标策略模块（finance.indicator_tools）已整体下线：其 list_indicators /
+    # run_indicator_signal / get_indicator_params / indicator_analysis 不再注册，
+    # 故此处不再登记摘除项（module 不在扫描树，登记亦永不命中）。
 })
 
 # 工具更名/归并的权重迁移表（旧名 → 新名）：chain/evaluator 同步权重表时，
@@ -139,8 +139,8 @@ TOOL_ALIAS: Dict[str, str] = {
     "get_volume_analysis": "technical_analysis",
     "get_obv_analysis": "technical_analysis",
     "calculate_ma": "technical_analysis",
-    "get_indicator_params": "list_indicators",
-    "indicator_analysis": "run_indicator_signal",
+    # 指标策略模块已下线：不再映射 get_indicator_params / indicator_analysis
+    # （旧名行由 evaluator 的"已删除工具"分支直接清理，无历史权重可迁移）。
 }
 
 
