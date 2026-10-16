@@ -478,11 +478,19 @@ def refresh_dragon_tiger():
         logger.warning("[refresh] refresh_dragon_tiger 失败: %s", e)
 
 def load_dragon_tiger_from_db(trade_date: str = ""):
-    """从 CNStock_db 加载龙虎榜数据到缓存"""
+    """从 CNStock_db 加载龙虎榜数据到缓存
+
+    trade_date 为空时: 加载数据库中最后一个有数据交易日的单日全量
+    （query_dragon_tiger_latest）—— 不按"最近 N 天"混合, 保证拿到的是完整的一日快照。
+    指定日期时: 按日精确查询（save_daily 落库后刷新缓存用）。
+    """
     global _rt_dragon_tiger
     try:
-        from app.market_cn.dragon_tiger_store import query_dragon_tiger
-        data = query_dragon_tiger(trade_date=trade_date)
+        from app.market_cn import dragon_tiger_store
+        if trade_date:
+            data = dragon_tiger_store.query_dragon_tiger(trade_date=trade_date)
+        else:
+            data = dragon_tiger_store.query_dragon_tiger_latest()
         if data:
             _rt_dragon_tiger = data
             logger.info("[db] 龙虎榜从DB加载: %d 条", len(data))

@@ -226,6 +226,25 @@ _CANDIDATE_SERVERS: List[Tuple[str, int, str]] = [
 # ================================================================
 
 
+# ════════════════════════════════════════════════════════════════
+# 行情时间折算（provider 自给自足，不调用任何外围接口）
+# ════════════════════════════════════════════════════════════════
+# pytdx 行情行自带 servertime（如 "15:16:52.224"）—— 这是本源自己的字段，
+# 但只有时分秒、没有日期，所以补当天日期后与其它源同格式
+# （"YYYY-MM-DD HH:MM:SS"）。
+# 局限: 非交易时段该时间戳是"最近一次交易所快照时间"，日期仍按当日本地日期
+# 渲染，跨节假日会与实际成交日不符 —— 需要精确成交日的场景请读 K 线的 time。
+
+def _quote_time(q: Dict[str, Any]) -> str:
+    raw = str(q.get("servertime") or "").strip()
+    hhmmss = raw.split(".")[0]
+    now = datetime.now(_TZ_CN)
+    if len(hhmmss) != 8 or hhmmss.count(":") != 2:
+        hhmmss = now.strftime("%H:%M:%S")
+    return "%s %s" % (now.strftime("%Y-%m-%d"), hhmmss)
+
+
+
 # [并发常量] 最大并发线程数 — Coordinator.allocate_threads() 据此分配 worker。
 # ⚠️ 请勿删除或随意修改: 此常量直接影响调度层线程分配，改错会导致请求过载或资源浪费。
 # 选值依据: pytdx TCP长连接，受服务器连接数限制。
@@ -445,7 +464,9 @@ class TdxExDataSource:
         if not categories:
             return None
 
-        nc = normalize_cn_code(code)
+            # normalize_cn_code 返回大写前缀（SH600519），必须 lower 后再判断，
+            # 否则 startswith("sh") 恒为 False → 沪市股票被当深市 market=0，返回空数据。
+        nc = (normalize_cn_code(code) or "").lower()
         market_sh = nc.startswith("sh")
         symbol = nc[2:]
 
@@ -526,7 +547,7 @@ class TdxExDataSource:
     @classmethod
     def _fetch_quote_raw(cls, code: str) -> Optional[Dict[str, Any]]:
         """获取单只股票实时行情（内部）"""
-        nc = normalize_cn_code(code)
+        nc = (normalize_cn_code(code) or "").lower()
         market_sh = nc.startswith("sh")
         symbol = nc[2:]
 
@@ -568,8 +589,8 @@ class TdxExDataSource:
                 "open": open_p,
                 "previousClose": prev,
                 "volume": vol,
-                "time": "",
-                "name": "",
+                "time": _quote_time(q),
+                "name": "",  # pytdx 协议不返回证券名称；provider 不得回调外围 → 留空
                 "symbol": symbol,
             }
         except Exception as e:
@@ -597,7 +618,7 @@ class TdxExDataSource:
             pairs: List[Tuple[int, str]] = []
             code_map: Dict[int, str] = {}   # index → 原始输入 code
             for raw_code in batch_codes:
-                nc = normalize_cn_code(raw_code)
+                nc = (normalize_cn_code(raw_code) or "").lower()
                 market_sh = nc.startswith("sh")
                 symbol = nc[2:]
                 if proto == "exhq":
@@ -640,8 +661,8 @@ class TdxExDataSource:
                         "open": float(q.get("open", 0) or last),
                         "previousClose": prev,
                         "volume": vol,
-                        "time": "",
-                        "name": "",
+                        "time": _quote_time(q),
+                        "name": "",  # 同上：不回调外围，名称留给上层补
                         "symbol": nc[2:],
                     }
             except Exception as e:

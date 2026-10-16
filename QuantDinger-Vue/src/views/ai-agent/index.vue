@@ -202,6 +202,7 @@ import {
   deleteChatSession
 } from '@/api/agent'
 import request from '@/utils/request'
+import { readUserPrefs, writeUserPrefs } from '@/utils/uiPrefs'
 
 // ── 模块级流式连接（跨组件生命周期存活）────────────────
 let _activeStream = null          // 当前活跃的流式连接 { close() }
@@ -267,30 +268,29 @@ export default {
       return indicators.value.find((s) => s.id === selectedStrategy.value) || null
     })
 
-    // ── 消息持久化 ────────────────────────────────────
+    // ── 消息持久化（账号私有域: 严格按用户隔离, 未登录不落盘）────────────
 
-    const STORAGE_KEY = 'ai_agent_messages'
-    const SESSION_KEY = 'ai_agent_session_id'
+    /** 持久化消息条数上限: 防长会话把 localStorage 撑爆(超配额后写入静默丢=不长效) */
+    const MAX_PERSISTED_MESSAGES = 200
 
     function saveMessages () {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.value))
-        localStorage.setItem(SESSION_KEY, sessionId.value)
+        // 只截断持久化副本, 不动内存中的完整会话
+        const list = messages.value.length > MAX_PERSISTED_MESSAGES
+          ? messages.value.slice(-MAX_PERSISTED_MESSAGES)
+          : messages.value
+        writeUserPrefs('ai-agent', { messages: list, sessionId: sessionId.value })
       } catch (_) {}
     }
 
     function restoreMessages () {
       try {
-        const saved = localStorage.getItem(STORAGE_KEY)
-        const savedSession = localStorage.getItem(SESSION_KEY)
-        if (saved) {
-          const parsed = JSON.parse(saved)
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            messages.value = parsed
-          }
+        const saved = readUserPrefs('ai-agent')
+        if (Array.isArray(saved.messages) && saved.messages.length > 0) {
+          messages.value = saved.messages
         }
-        if (savedSession) {
-          sessionId.value = savedSession
+        if (saved.sessionId) {
+          sessionId.value = saved.sessionId
         }
       } catch (_) {}
     }
@@ -585,8 +585,7 @@ export default {
         // 3. 清本地
         messages.value = []
         try {
-          localStorage.removeItem(STORAGE_KEY)
-          localStorage.setItem(SESSION_KEY, sessionId.value)
+          writeUserPrefs('ai-agent', { messages: [], sessionId: sessionId.value })
         } catch (_) {}
       } else if (key === 'sessions') {
         showTaskDrawer.value = true
@@ -608,7 +607,7 @@ export default {
 
     // ── 生命周期 ────────────────────────────────────────
 
-    sessionId.value = localStorage.getItem(SESSION_KEY) ||
+    sessionId.value = readUserPrefs('ai-agent').sessionId ||
       'session_' + (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2))
     initTaskStream()
     loadIndicators()

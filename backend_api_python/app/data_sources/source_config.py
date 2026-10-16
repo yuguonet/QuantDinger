@@ -35,6 +35,9 @@ from typing import Dict, Set, Tuple
 # 各 Provider 的 max_workers 与 Provider.MAX_CONCURRENCY 保持一致。
 # 每个 Provider 文件定义自己的 MAX_CONCURRENCY 常量（模块级），
 # 新增/删除数据源只需增删 Provider 文件 + 本表对应条目。
+#
+# ⚠ 注意: 实际调度线程数由 Coordinator 读取 Provider.max_concurrency 决定，
+#   本表 max_workers 仅用于无 sources 参数的回退路径与吞吐统计，不参与线程分配。
 
 
 @dataclass
@@ -201,7 +204,7 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # 支持 A股 + 港股，与 Provider.max_concurrency 保持一致
     "tencent": SourceConfig(
         name="tencent",
-        max_workers=6,  # = provider/tencent.py MAX_CONCURRENCY
+        max_workers=6,
         markets={"CNStock", "HKStock"},
         batch_capable=True,
         batch_size=500,
@@ -211,32 +214,28 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # 与 Provider.max_concurrency 保持一致
     "sina": SourceConfig(
         name="sina",
-        max_workers=4,  # = provider/sina.py MAX_CONCURRENCY
+        max_workers=4,
         markets={"CNStock"},
         batch_capable=True,
         batch_size=500,
     ),
 
-    # 东财 datacenter — 数据最全，支持大批次
-    # batch_size=6000（东财 API 单次支持大量数据）
-    "eastmoney": SourceConfig(
-        name="eastmoney",
-        max_workers=4,  # = provider/eastmoney.py MAX_CONCURRENCY
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=6000,
-    ),
+    # 东财(eastmoney) Provider 已移除（2026-10-16）:
+    #   仅支持 HTTPS 的 push2/push2his 数据端点在部署网络被上游按出口 IP 断连
+    #   （curl 56/52，换协议/指纹/CDN 主机/请求头均无效），保留只会拖慢降级链路。
+    #   注意: 东财 datacenter-web / push2ex 是另一条通路（本机可达），
+    #   由 app/agent/tools/finance 与 app/market_cn 消费，不受本移除影响。
 
 
 
-    # 同花顺(10jqka) — HTTP 接口，分钟分时+日/周K线
+    # 同花顺(10jqka) — HTTP 接口，分钟分时(当天) + 日/周K线；无批量行情
     # 仅支持 A 股
     "10jqka": SourceConfig(
         name="10jqka",
         max_workers=4,  # = provider/10jqka.py MAX_CONCURRENCY
         markets={"CNStock"},
-        batch_capable=True,
-        batch_size=500,
+        batch_capable=False,   # fetch_batch_quotes 返回 NotSupportedResult
+        batch_size=1,
     ),
 
     # 通达信 pytdx 二进制协议 — 最快的免费A股实时源
@@ -244,7 +243,7 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # 行情延迟 ~100ms，无需开户/入金，全平台支持
     "tdx_ex": SourceConfig(
         name="tdx_ex",
-        max_workers=8,  # = provider/tdx_ex.py MAX_CONCURRENCY
+        max_workers=8,
         markets={"CNStock"},
         batch_capable=True,
         batch_size=80,  # pytdx 单次请求硬限 80 只
@@ -252,40 +251,43 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
 
 
 
-    # TwelveData — 国际数据源，支持 A股 + 港股
-    "twelvedata": SourceConfig(
-        name="twelvedata",
-        max_workers=2,  # = provider/twelve_data.py MAX_CONCURRENCY
-        markets={"CNStock", "HKStock"},
-        batch_capable=False,
-        batch_size=1,
-    ),
+# ── 未实现: provider/twelvedata.py 不存在（保留配置便于日后接入）──
+#     # TwelveData — 国际数据源，支持 A股 + 港股
+#     "twelvedata": SourceConfig(
+#         name="twelvedata",
+#         max_workers=2,  # = provider/twelve_data.py MAX_CONCURRENCY
+#         markets={"CNStock", "HKStock"},
+#         batch_capable=False,
+#         batch_size=1,
+#     ),
 
     # ── 新增源（从 akline_market.py 迁移）──
 
-    # 东方财富 trends2 极速源 — 最快的免费A股源
-    # 通过 push2.eastmoney.com trends2 API，1min聚合为15min
-    "em_trends2": SourceConfig(
-        name="em_trends2",
-        max_workers=6,  # = provider/em_trends2.py MAX_CONCURRENCY
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=50,
-    ),
+# ── 未实现: provider/em_trends2.py 不存在（保留配置便于日后接入）──
+#     # 东方财富 trends2 极速源 — 最快的免费A股源
+#     # 通过东财 trends2 API，1min聚合为15min（未实现，仅预留配置）
+#     "em_trends2": SourceConfig(
+#         name="em_trends2",
+#         max_workers=6,  # = provider/em_trends2.py MAX_CONCURRENCY
+#         markets={"CNStock"},
+#         batch_capable=True,
+#         batch_size=50,
+#     ),
 
-    # 雪球 — 投资社区数据源
-    "xueqiu": SourceConfig(
-        name="xueqiu",
-        max_workers=8,  # = provider/xueqiu.py MAX_CONCURRENCY
-        markets={"CNStock"},
-        batch_capable=True,
-        batch_size=50,
-    ),
+# ── 未实现: provider/xueqiu.py 不存在（保留配置便于日后接入）──
+#     # 雪球 — 投资社区数据源
+#     "xueqiu": SourceConfig(
+#         name="xueqiu",
+#         max_workers=8,  # = provider/xueqiu.py MAX_CONCURRENCY
+#         markets={"CNStock"},
+#         batch_capable=True,
+#         batch_size=50,
+#     ),
 
     # 搜狐财经 — 免费数据源
     "sohu": SourceConfig(
         name="sohu",
-        max_workers=8,  # = provider/sohu.py MAX_CONCURRENCY
+        max_workers=8,
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,
@@ -294,7 +296,7 @@ SOURCE_CONFIGS: Dict[str, SourceConfig] = {
     # 百度股市通 — 免费数据源
     "baidu": SourceConfig(
         name="baidu",
-        max_workers=8,  # = provider/baidu.py MAX_CONCURRENCY
+        max_workers=8,
         markets={"CNStock"},
         batch_capable=True,
         batch_size=50,

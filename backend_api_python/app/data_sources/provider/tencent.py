@@ -93,18 +93,56 @@ _TF_MAP = {
 }
 
 
+def _split_dt(v) -> tuple:
+    """把 8/10/12/14 位数字时间戳拆成 (完整时间, 日期)。
+
+    实测 mkline（分钟线）返回 "202608261445"（12 位）与 "202610151500"，
+    fqkline（日线）返回 "2026-08-26"；原先的格式表既不含 12 位数字，
+    落到时间戳分支又因 1970 越界失败 → 分钟线整段被丢弃。
+    """
+    s = str(v or "").strip()
+    if s.isdigit():
+        if len(s) == 12:
+            return ("%s-%s-%s %s:%s:00" % (s[:4], s[4:6], s[6:8], s[8:10], s[10:12]), None)
+        if len(s) == 14:
+            return ("%s-%s-%s %s:%s:%s" % (s[:4], s[4:6], s[6:8], s[8:10], s[10:12], s[12:14]), None)
+        if len(s) == 10:
+            return ("%s-%s-%s" % (s[:4], s[4:6], s[6:8]), None)
+        if len(s) == 8:
+            return (None, "%s-%s-%s" % (s[:4], s[4:6], s[6:8]))
+    for fmt, has_time in (("%Y-%m-%d %H:%M:%S", True), ("%Y-%m-%d %H:%M", True),
+                          ("%Y-%m-%d", False), ("%Y/%m/%d", False)):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return (dt.strftime("%Y-%m-%d %H:%M:%S") if has_time else None,
+                    dt.strftime("%Y-%m-%d"))
+        except ValueError:
+            continue
+    # 纯数字时间戳（毫秒/秒）兜底 — 用本地时区，避免 UTC 偏移
+    try:
+        ts = int(float(s))
+        if ts > 10 ** 12:
+            ts = ts // 1000
+        return (datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"), None)
+    except (ValueError, OverflowError, OSError):
+        return (None, None)
+
+
 def _parse_time(ds: str) -> Optional[str]:
     """解析时间字符串为标准格式 'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD'"""
     raw = str(ds or "").strip()
     if not raw:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(raw, fmt).strftime(
-                "%Y-%m-%d %H:%M:%S" if " " in raw else "%Y-%m-%d"
-            )
-        except ValueError:
-            continue
+    full, day_only = _split_dt(raw)
+    if full:
+        return full
+    if day_only:
+        return day_only
+    full, day_only = _split_dt(raw)
+    if full:
+        return full
+    if day_only:
+        return day_only
     # 纯数字时间戳（毫秒/秒）
     try:
         ts = int(float(raw))
@@ -115,10 +153,20 @@ def _parse_time(ds: str) -> Optional[str]:
         return None
 
 
-def _rows_to_dicts(rows: list, timeframe: str = "1D") -> List[Dict[str, Any]]:
-    """将腾讯API返回的原始行数据转换为标准化K线字典列表"""
+def _rows_to_dicts(rows: list, timeframe: str = "1D",
+                   quote_row: Optional[list] = None) -> List[Dict[str, Any]]:
+    """将腾讯API返回的原始行数据转换为标准化K线字典列表。
+
+    quote_row: mkline 响应里的 qt.<code> 实时行情行，含日期；
+               分钟线 rows 的时间只有 "HH:MM:SS"，需用它补全日期。
+    """
     out = []
     _daily_tfs = {"1D", "1W"}
+    _qdate = ""
+    if isinstance(quote_row, (list, tuple)) and len(quote_row) > 30:
+        _rt = str(quote_row[30]).strip()
+        if len(_rt) == 14 and _rt.isdigit():
+            _qdate = "%s-%s-%s" % (_rt[:4], _rt[4:6], _rt[6:8])
     for r in rows:
         if not isinstance(r, (list, tuple)) or len(r) < 6:
             continue
@@ -132,6 +180,9 @@ def _rows_to_dicts(rows: list, timeframe: str = "1D") -> List[Dict[str, Any]]:
         # 统一时间格式: 日线以上 YYYY-MM-DD, 分时线 YYYY-MM-DD HH:MM:00
         if timeframe in _daily_tfs:
             ts = ts[:10]
+        elif len(ts) <= 8 and _qdate:
+            # "09:45:00" → 用行情行日期补全
+            ts = "%s %s" % (_qdate, ts[:8])
         else:
             try:
                 _dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
@@ -207,7 +258,9 @@ class TencentDataSource:
 
         if endpoint == "mkline":
             url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
-            params = {"param": f"{c},{tc_tf},{int(count)}"}
+            # 实测(2026-10): 带 count 的 param（sh600519,m15,30）返回 0 行，
+            # 去掉 count（sh600519,m15）返回全量。取全量后本地截断，失败再退回带 count。
+            params = {"param": f"{c},{tc_tf}"}
         else:
             url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
             # fqkline 原生支持日期范围: param=code,period,start,end,count,adj
@@ -242,6 +295,18 @@ class TencentDataSource:
         rows = None
         if endpoint == "mkline":
             rows = root.get(tc_tf)
+            if not rows:
+                params = {"param": f"{c},{tc_tf},{int(count)}"}
+                resp = requests.get(
+                    url, headers=get_request_headers(referer=_tc_kline_referers.next()),
+                    params=params, timeout=timeout,
+                )
+                try:
+                    data = resp.json()
+                    root = (data.get("data") or {}).get(c)
+                    rows = (root or {}).get(tc_tf)
+                except Exception:
+                    rows = None
         else:
             # fqkline 返回的 key 随 adj 变化:
             #   adj="qfq" → "qfqday", adj="hfq" → "hfqday", adj="" → "day"
@@ -256,9 +321,13 @@ class TencentDataSource:
                         rows = v
                         break
 
-        bars = _rows_to_dicts(rows, timeframe) if isinstance(rows, list) else []
+        bars = _rows_to_dicts(rows, timeframe, quote_row=root.get("qt", {}).get(c)
+                              if isinstance(root.get("qt"), dict) else None)
         if not bars:
             return {}
+        # mkline 取的是全量，按 count 截断（保留最新 count 根）
+        if endpoint == "mkline" and count and len(bars) > int(count):
+            bars = bars[-int(count):]
         return {"bars": bars, "count": len(bars)}
 
     def fetch_ticker(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
@@ -373,11 +442,16 @@ class TencentDataSource:
                 parts = data.strip('"').split("~")
                 if len(parts) < 6 or not parts[1]:
                     continue
+                # 精确提取响应里的代码（var_name 形如 v_sh600519），
+                # 避免子串匹配造成的误关联与 O(批×行) 扫描
+                resp_code = var_name.split("_", 1)[1].strip().lower() if "_" in var_name else ""
                 for c in batch:
-                    if c in var_name:
+                    if c == resp_code or (not resp_code and c in var_name):
                         last = float(parts[3]) if parts[3] else 0
                         if last <= 0:
-                            break
+                            # 停牌/无报价：跳过该代码，不能 break ——
+                            # break 会连带丢掉同一响应行里其余代码的行情
+                            continue
                         prev = float(parts[4]) if parts[4] else 0
                         chg = round(last - prev, 4) if prev else 0
                         vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0

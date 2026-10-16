@@ -30,7 +30,7 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
   sina(15)       — 新浪财经，A股第二选择，全周期K线+原生批量行情
   10jqka(20)     — 同花顺HTTP接口，分钟级分时+日/周K线，无批量行情
   tdx_ex(22)     — pytdx二进制协议，全周期K线+原生批量行情，需pytdx库
-  eastmoney(25)  — 东方财富，全周期K线+原生全市场批量行情(clist一次6000只)
+#  eastmoney(25)  — 已移除（2026-10-16: 数据端点在部署网络被上游 IP 封锁）
   xueqiu(40)     — 雪球，全周期K线(原生前复权)，需cookie
   sohu(45)       — 搜狐，日/周/月线K线，无行情接口
   baidu(50)      — 百度股市通，全周期K线(分钟级ktype命名:min1/min5/.../min60)，无复权
@@ -38,7 +38,7 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
 各源单位速查（volume是否需要×100转"股"）:
   tencent:    行情×100, K线×100  ← 原始返回"手"
   sina:       行情不×,  K线不×   ← 原始返回"股"
-  eastmoney:  行情×100, K线不×   ← ticker/clist返回"手"，kline返回"股"
+#  eastmoney:（已移除，单位口径记录不再适用）
   em_trends2: 已×100             ← trends2返回"手"，代码中已转
   10jqka:     行情不×,  K线不×   ← 原始返回"股"
   tdx_ex:     行情×100, K线不×   ← 行情返回"手"，K线返回"股"
@@ -50,7 +50,7 @@ A股数据源 Provider 框架 — 自注册 + 能力声明 + 统一接口
   USStock (美股) → yfinance / twelvedata / finnhub
   Crypto (加密)  → ccxt (binance/okx/bybit)
   Forex (外汇)   → twelvedata / tiingo
-  Futures (期货) → ccxt / eastmoney
+  Futures (期货) → ccxt
 
 
 ===============================================================================

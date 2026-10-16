@@ -14,7 +14,7 @@ API来源 & 最新信息:
   路径规则: hq.stock.sohu.com/{market}/{code_last3}/{biz_code}-9_{period}m.html
   code_last3 = 纯数字代码的后3位, 如 600519 → 519
   例: hq.stock.sohu.com/cn/519/cn_600519-9_5m.html
-  支持: 5m / 15m / 30m / 60m
+  支持: 5m / 15m / 30m / 60m（对外统一映射为 1H）
   返回: JSONP kline_Xm([[时间戳,开,收,高,低,成交量(手),成交额,涨跌%,涨跌额,换手率], ...])
   时间戳格式: 'YYMMDDHHMM' (10位), 如 '2605071345' → 2026-05-07 13:45
 
@@ -45,7 +45,7 @@ API来源 & 最新信息:
 
 支持的功能:
   - K线: ✅ 日线(period=d) + 周线(period=w) + 月线(period=m)
-  - K线 分钟线: ✅ 5m / 15m / 30m / 60m（历史分钟K线） + 当日1m分时
+  - K线 分钟线: ✅ 5m / 15m / 30m / 1H（上游 60m，映射后对外为 1H） + 当日1m分时
   - fetch_ticker: ✅ 通过 -1.html 心跳接口获取实时行情
   - fetch_batch_quotes: ✅ 通过 hqm getqjson 批量接口（一次请求多只）
 
@@ -54,7 +54,8 @@ API来源 & 最新信息:
   - fetch_kline: volume(r[7])返回"手"，代码中已×100转"股"
   - fetch_ticker / fetch_batch_quotes: volume 返回"股"（代码中总手×100）
   - 价格字段直接是"元"，不需要÷
-  - amount 字段单位为"万元"
+  - amount: 上游返回"万元"，代码已 ×10000 统一为"元"
+    （与东财 f6 / 腾讯 / 同花顺一致；下游 market-screener 按"元"再 /1e4 展示为万元）
   - 复权: 仅支持不复权
 """
 
@@ -258,12 +259,20 @@ def _fetch_sohu_minute_kline(
         if len(r) < 6:
             continue
         try:
+            o, c, h, low_ = (round(float(r[1]), 4), round(float(r[2]), 4),
+                             round(float(r[3]), 4), round(float(r[4]), 4))
+            # 上游分钟线偶有 high/low 不含 open/close 的越界行（实测 3/60），
+            # 做包含性修正：只扩展 high/low 使其包住 open/close，不伪造数值。
+            if h < max(o, c):
+                h = max(o, c)
+            if low_ > min(o, c):
+                low_ = min(o, c)
             result.append({
                 "time": _parse_minute_timestamp(r[0]),
-                "open": round(float(r[1]), 4),
-                "high": round(float(r[3]), 4),
-                "low": round(float(r[4]), 4),
-                "close": round(float(r[2]), 4),
+                "open": o,
+                "high": h,
+                "low": low_,
+                "close": c,
                 "volume": round(float(r[5]) * 100, 2),  # 手 → 股
             })
         except (ValueError, TypeError, IndexError):
@@ -369,6 +378,8 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
     #   [14]=振幅  [15]=?  [16]=总市值  [17]=?
     result = {
         "code": pa1[0],
+        # 统一契约: 批量行情已带 symbol，单只也补上（下游按 symbol 定位标的）
+        "symbol": re.sub(r"\D", "", str(pa1[0])),
         "name": pa1[1],
         "last": _float(pa1[2]),
         "open": _float(pa2[3]),
@@ -378,7 +389,7 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
         "change": _float(pa1[3]),
         "changePercent": _float(pa1[4]),
         "volume": round(float(pa2[8]) * 100, 2) if _float(pa2[8]) else 0,  # 总手→股
-        "amount": _float(pa2[12]),  # 总金额(万)
+        "amount": round(_float(pa2[12]) * 10000.0, 2),  # 万元 → 元（统一口径）
         "turnover_rate": _float(pa2[6]),
         "PE": _float(pa2[10]),
         "amplitude": _float(pa2[14]),
@@ -476,7 +487,7 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
                     "changePercent": _float(arr[3]),
                     "change": _float(arr[4]),
                     "volume": round(float(arr[5]) * 100, 2) if _float(arr[5]) else 0,
-                    "amount": _float(arr[7]),
+                    "amount": round(_float(arr[7]) * 10000.0, 2),  # 万元 → 元（统一口径）
                     "turnover_rate": _float(arr[8]),
                     "high": _float(arr[10]),
                     "low": _float(arr[11]),
@@ -537,7 +548,7 @@ class SohuDataSource:
     搜狐财经数据源 — A股数据源（priority=45）。
 
     能力:
-      - K线: 日/周/月 + 5m/15m/30m/60m 历史分钟线 + 当日1m分时
+      - K线: 日/周 + 5m/15m/30m/1H 历史分钟线 + 当日1m分时（无月线，1M 不在能力集内）
       - 实时行情: 单只 (-1.html) + 批量 (getqjson)
       - 全市场批量: 并发获取全市场K线
 
@@ -555,7 +566,7 @@ class SohuDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 45,
-        "kline_tf": {"1D", "1W", "1M", "1m", "5m", "15m", "30m", "60m"},
+        "kline_tf": {"1D", "1W", "1m", "5m", "15m", "30m", "1H"},
         "kline_batch": True,
         "kline_batch_priority": 45,
         "quote": True,
@@ -573,7 +584,8 @@ class SohuDataSource:
     }
 
     # 分钟级周期: 直接走 hq.stock.sohu.com 的独立接口
-    _MINUTE_PERIODS = {"5m", "15m", "30m", "60m"}
+    # 注: 搜狐上游只认 60m，对外统一用全链路周期名 "1H"（fetch_kline 内做映射）
+    _MINUTE_PERIODS = {"5m", "15m", "30m", "1H"}
     # 当日分时
     _INTRADAY_PERIODS = {"1m"}
 
@@ -585,7 +597,7 @@ class SohuDataSource:
         timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, Any]:
-        """获取单只股票K线。支持日/周/月线 + 5m/15m/30m/60m历史分钟线 + 当日1m分时。"""
+        """获取单只股票K线。支持日/周线 + 5m/15m/30m/1H历史分钟线 + 当日1m分时。"""
         # 当日分时 (1m)
         if timeframe in self._INTRADAY_PERIODS:
             data = _fetch_sohu_intraday(code)
@@ -595,9 +607,10 @@ class SohuDataSource:
                 data = data[-count:]  # 取最近 count 条
             return {"bars": data, "count": len(data)}
 
-        # 历史分钟K线 (5m/15m/30m/60m)
+        # 历史分钟K线 (5m/15m/30m/1H)
         if timeframe in self._MINUTE_PERIODS:
-            data = _fetch_sohu_minute_kline(code, timeframe, count)
+            upstream_tf = "60m" if timeframe == "1H" else timeframe
+            data = _fetch_sohu_minute_kline(code, upstream_tf, count)
             if not data:
                 return {}
             return {"bars": data, "count": len(data)}

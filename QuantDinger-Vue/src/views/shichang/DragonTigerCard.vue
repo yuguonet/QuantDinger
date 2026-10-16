@@ -7,7 +7,7 @@
       </button>
     </header>
     <div class="module-content table-container">
-      <table class="data-table">
+      <table v-if="list.length > 0" class="data-table">
         <thead><tr>
           <th @click="sortTable('code')">代码 ▼</th>
           <th @click="sortTable('name')">名称 ▼</th>
@@ -23,7 +23,22 @@
           </tr>
         </tbody>
       </table>
-      <div class="table-footer">
+      <!-- 错误态: 请求失败时明确提示 + 重试，不再静默空白 -->
+      <div v-else-if="error" class="state-block">
+        <p class="state-title state-error">⚠️ 加载失败</p>
+        <p class="state-desc">{{ errorText }}</p>
+        <button class="btn-retry" @click="refresh">重试</button>
+      </div>
+      <!-- 空态: 后端返回空列表(库中暂无任何龙虎榜记录 / 当日榜单尚未落库) -->
+      <div v-else-if="!loading" class="state-block">
+        <p class="state-title">暂无龙虎榜数据</p>
+        <p class="state-desc">
+          数据库暂无龙虎榜记录。当日榜单通常在收盘后写入，可稍后点击"刷新"。
+        </p>
+        <button class="btn-retry" @click="refresh">刷新</button>
+      </div>
+      <div v-else class="state-block state-loading">加载中...</div>
+      <div v-if="list.length > 0" class="table-footer">
         <span>共{{ list.length }}条</span>
         <button v-if="list.length > 10" class="btn-more" @click="showDetail = true">更多...</button>
       </div>
@@ -42,6 +57,11 @@
 import DetailModal from './DetailModal.vue'
 import request from '@/utils/request'
 
+// 空结果自动重试（次数 / 间隔 ms）— 后端已在缓存未命中时回退 DB 最近交易日
+// （见 backend cards/dragon_tiger.py），正常不会为空; 此处仅兜底数据库瞬时不可用
+const EMPTY_RETRY_MAX = 3
+const EMPTY_RETRY_DELAY = 20000
+
 export default {
   name: 'DragonTigerCard',
   components: { DetailModal },
@@ -49,6 +69,9 @@ export default {
     return {
       list: [],
       loading: false,
+      error: null,
+      retryCount: 0,
+      retryTimer: null,
       sortKey: '',
       sortOrder: 1,
       showDetail: false,
@@ -67,6 +90,11 @@ export default {
     }
   },
   computed: {
+    errorText () {
+      const e = this.error
+      if (!e) return ''
+      return e.message || String(e)
+    },
     filteredList () {
       const arr = [...this.list]
       if (this.sortKey) {
@@ -85,11 +113,13 @@ export default {
   },
   methods: {
     async refresh () {
+      this._clearRetryTimer()
       this.loading = true
+      this.error = null
       try {
         const resp = await request({ url: '/api/shichang/cards/dragon-tiger', method: 'GET' })
         const d = resp.data || resp
-        this.list = (d.dragonTigerList || []).map(item => {
+        const list = (d.dragonTigerList || []).map(item => {
           const full = (item.reason || '').replace(/成功率/g, '')
           return {
             ...item,
@@ -98,10 +128,28 @@ export default {
             change: String(item.change ?? '0')
           }
         })
+        this.list = list
+        this.retryCount = 0
+        // 空结果: 有限自动重试，仅兜底数据库瞬时不可用（正常不会走到）
+        if (list.length === 0) this._scheduleEmptyRetry()
       } catch (e) {
         console.error('龙虎榜刷新失败:', e)
+        this.error = e
       } finally {
         this.loading = false
+      }
+    },
+    _scheduleEmptyRetry () {
+      if (this.retryCount >= EMPTY_RETRY_MAX) return
+      this.retryTimer = setTimeout(() => {
+        this.retryCount += 1
+        this.refresh()
+      }, EMPTY_RETRY_DELAY)
+    },
+    _clearRetryTimer () {
+      if (this.retryTimer) {
+        clearTimeout(this.retryTimer)
+        this.retryTimer = null
       }
     },
     sortTable (k) {
@@ -112,7 +160,10 @@ export default {
       }
     }
   },
-  mounted () { this.refresh() }
+  mounted () { this.refresh() },
+  beforeDestroy () {
+    this._clearRetryTimer()
+  }
 }
 </script>
 
@@ -131,6 +182,17 @@ export default {
   border-radius: 4px; cursor: pointer; font-size: 12px;
 }
 .btn-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 空态 / 错误态 / 加载态 */
+.state-block { padding: 24px 16px; text-align: center; color: #999; font-size: 13px; }
+.state-block .state-title { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: #666; }
+.state-block .state-title.state-error { color: #f56c6c; }
+.state-block .state-desc { margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
+.state-loading { color: #409eff; }
+.btn-retry {
+  padding: 4px 14px; background: #ecf5ff; color: #409eff; border: 1px solid #b3d8ff;
+  border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.btn-retry:hover { background: #409eff; color: #fff; }
 .table-container { overflow-x: auto; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border-color); }

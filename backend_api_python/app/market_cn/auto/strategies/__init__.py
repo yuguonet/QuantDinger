@@ -6,6 +6,10 @@
   - 注册: 策略模块内 `@register` 装饰 StrategyBase 子类, key 必须唯一;
   - autodiscover: importlib 遍历本目录 *.py (跳过 base/__init__), **per-module 容错** —
     单个模块 import 失败只记 CRITICAL 并跳过, 绝不拖死整个注册表 (L3 故障隔离);
+  - overlay ③档通道 (2026-10-15, §5.7 回测桥): 仅当**子进程** env
+    QD_STRATEGY_YAML_OVERLAY_DIR 指向桥作业目录时生效 —— `<key>.yaml` 路径解析
+    overlay 优先 + autodiscover 尾部按路径加载 `agentbt_` 前缀新策略; 生产进程
+    永不设此 env ⇒ 行为与无此通道时逐字节相同 (活策略树只读);
   - 开关 (2026-10-09 终态②/A-D2): **事实源 = 策略宏 `<key>.yaml` 的 `meta.enabled`**
     (§3.5「改宏即开关」) —— 宏内一行即上下线, 不再去另一个配置域改。无 yaml 的
     策略回退 `config.json strategies.<key>.enabled` (2026-10-09 P6-6/7 退役
@@ -16,10 +20,12 @@
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import os
 import pkgutil
+import sys
 
 from app.market_cn.auto.strategies.base import (  # noqa: F401  (re-export 契约)
     ScanSpec, Signal, EntryDecision, ConfirmDecision, ExitDecision, StrategyBase,
@@ -54,6 +60,8 @@ def autodiscover():
     """扫描本包全部策略模块并触发注册 (幂等: 已注册的 key 跳过重复 import 副作用)。
 
     per-module 容错: 任何一个模块损坏只跳过自身, 保证扫描主流程不被单策略拖死。
+    §5.7 桥钩子 (2026-10-15): 包内扫描后追加 overlay ③档通道 —— 仅子进程 env
+    QD_STRATEGY_YAML_OVERLAY_DIR 指向作业目录时生效, 生产进程 env 未设 = no-op。
     """
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     for m in pkgutil.iter_modules([pkg_dir]):
@@ -63,7 +71,61 @@ def autodiscover():
             importlib.import_module(f"{__name__}.{m.name}")
         except Exception as e:
             logger.critical("[strategies] 模块 %s 加载失败, 已跳过 (不影响其它策略): %s", m.name, e)
+    _import_overlay_modules()
     return sorted(_REGISTRY)
+
+
+def _import_overlay_modules():
+    """§5.7 ③档通道：import 作业目录 overlay 里的新策略 .py（仅子进程；env 未设 = no-op）。
+
+    红线：
+      - 只注册 key 以 `agentbt_` 开头的模块 —— AST 静态预检（不 exec 就能拒），
+        防止 overlay 模块撞生产 key（register 重复 key 会抛，但无碰撞的新 key 会静默注册）；
+      - per-module 容错与包内 autodiscover 同款：单模块失败只 CRITICAL 不拖死；
+      - 模块名走 `qd_overlay_<stem>` 命名空间，绝不与包内模块同名（sys.modules 防撞、幂等）。
+    """
+    import importlib.util
+
+    overlay = os.environ.get(OVERLAY_DIR_ENV)
+    if not overlay or not os.path.isdir(overlay):
+        return
+    for fn in sorted(os.listdir(overlay)):
+        if not fn.endswith(".py") or fn.startswith("_"):
+            continue
+        path = os.path.join(overlay, fn)
+        # mod_name 提前到 try 外：except 的 sys.modules 清理需要它（ast.parse 炸时也必须已赋值）。
+        mod_name = f"qd_overlay_{fn[:-3]}"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=fn)
+            # 编写约定（fail-closed）：仅识别裸 `key = '<字符串常量>'` 的 Assign 节点。
+            # ast.walk 递归全树 ⇒ **函数体内的 key 赋值也看得见**（比"只认类体"更宽，
+            # 方向是 fail-closed：漏不了声明；代价是函数里写 `key = "evil"` 会连坐
+            # 全模块被拒——overlay 作者按最小策略类写法即可，别在函数内演示 key）；
+            # 真正不识别的是 AnnAssign（`key: str = ...`）与非常量右值（Name/BinOp/
+            # f-string）⇒ 不识别一律拒绝注册。
+            declared = [
+                n.value.value
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)
+                and isinstance(n.value, ast.Constant)
+                and isinstance(n.value.value, str)
+            ]
+            if not declared or not all(k.startswith("agentbt_") for k in declared):
+                logger.critical("[strategies] overlay 模块 %s 未声明 agentbt_ 前缀 key, 拒绝注册", fn)
+                continue
+            if mod_name in sys.modules:
+                continue
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = mod
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            # 加载失败不留半初始化缓存（标准 importlib 语义）：否则同进程再次
+            # autodiscover 命中 `mod_name in sys.modules` 永不重试。
+            sys.modules.pop(mod_name, None)
+            logger.critical("[strategies] overlay 模块 %s 加载失败, 已跳过: %s", fn, e)
 
 
 # ================================================================
@@ -76,21 +138,42 @@ def autodiscover():
 # 缺省 False: 沿用 2026-09-15 安全语义 —— 未显式声明 = 不进实盘。
 # ================================================================
 _STRATEGY_DIR = os.path.dirname(os.path.abspath(__file__))
-_YAML_DOC_CACHE = {}         # key -> (mtime, doc|None)  策略宏解析缓存 (开关/参数共用)
+_YAML_DOC_CACHE = {}         # path -> (mtime, doc|None)  策略宏解析缓存 (开关/参数共用)
+
+#: 子进程 overlay 目录（§5.7 回测桥专用，2026-10-15）：env 仅由 chain/backtest_bridge
+#: 派生的子进程设置；生产进程（scan/monitor/常规 run_all）永不设 ⇒ 下面的解析函数
+#: 全部走原路径，行为与今日逐字节相同。
+OVERLAY_DIR_ENV = "QD_STRATEGY_YAML_OVERLAY_DIR"
+
+
+def _resolve_yaml_path(key):
+    """解析 `<key>.yaml` 实际路径：overlay 目录优先（仅子进程），回退活策略树。
+
+    易错点：返回值同时用作 _YAML_DOC_CACHE 的缓存键 —— 活树与 overlay 同 key 必须是
+    两个缓存槽位，否则同进程先读 overlay 再回退活树会串缓存（测试
+    test_yaml_doc_cache_keyed_by_path 钉住）。
+    """
+    overlay = os.environ.get(OVERLAY_DIR_ENV)
+    if overlay:
+        p = os.path.join(overlay, f"{key}.yaml")
+        if os.path.isfile(p):
+            return p
+    return os.path.join(_STRATEGY_DIR, f"{key}.yaml")
 
 
 def _yaml_doc(key):
-    """读策略宏 `<key>.yaml` 的解析结果 (mtime 缓存); 无 yaml / 解析失败 → None。
+    """读策略宏 `<key>.yaml` 的解析结果（mtime 缓存，缓存键=解析后路径）；无 yaml / 解析失败 → None。
 
-    带 mtime 缓存 (与 load_config 同法): 改 yaml 后无需重启后端, 下一轮读即生效;
-    解析失败返回 None (交调用方回退), 绝不因一个坏 yaml 抛死调用方。
+    带 mtime 缓存: 改 yaml 后无需重启后端; 解析失败返回 None (交调用方回退)。
+    §5.7 桥钩子: 子进程 env QD_STRATEGY_YAML_OVERLAY_DIR 指向作业目录时, overlay 的
+    `<key>.yaml` 优先 —— 活策略树只读, 生产进程不设此 env, 行为不变。
     """
-    path = os.path.join(_STRATEGY_DIR, f"{key}.yaml")
+    path = _resolve_yaml_path(key)
     try:
         mt = os.path.getmtime(path)
     except OSError:
         return None, None
-    hit = _YAML_DOC_CACHE.get(key)
+    hit = _YAML_DOC_CACHE.get(path)
     if hit is not None and hit[0] == mt:
         return hit[1], mt
     try:
@@ -100,9 +183,9 @@ def _yaml_doc(key):
         if not isinstance(doc, dict):
             doc = None
     except Exception as e:
-        logger.error("[strategies] %s.yaml 解析失败, 回退 config: %s", key, e)
+        logger.error("[strategies] %s 解析失败, 回退 config: %s", path, e)
         doc = None
-    _YAML_DOC_CACHE[key] = (mt, doc)
+    _YAML_DOC_CACHE[path] = (mt, doc)
     return doc, mt
 
 

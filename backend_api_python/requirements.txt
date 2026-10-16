@@ -42,6 +42,13 @@ PyYAML>=6.0
 # 代码按 1.26 生命周期写并实测（max_steps 末步标记 AgentMaxStepsError，见 nodes._detect_max_steps）；
 # 曾声明 >=1.27 而实装 1.26.0（环境漂移）。升 1.27 前先复核该行为与 executor.state 生命周期。
 smolagents[openai]>=1.26.0
+# ── CN 行情数据源强依赖（缺失时对应 Provider 静默不注册）──
+# eastmoney: TLS 指纹绕过（push2 CDN 对 urllib/requests 封锁 JA3）
+curl_cffi>=0.7.0
+# tdx_ex: 通达信二进制协议；backfill_db: 盘后 K 线覆写
+pytdx>=1.72
+mootdx>=0.11.7
+
 # smolagents built-in tool dependencies
 ddgs>=7.0.0
 markdownify>=0.14.0

@@ -37,7 +37,7 @@ _TZ_CN = timezone(timedelta(hours=8))
 
 import requests
 
-from app.data_sources.normalizer import normalize_cn_code as to_sina_code
+from app.data_sources.normalizer import normalize_cn_code as _normalize_cn_code
 from app.data_sources.rate_limiter import (
     get_request_headers, RateLimiter, get_shared_session,
 )
@@ -45,6 +45,11 @@ from app.data_sources.provider import register, NotSupportedResult
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def to_sina_code(code: str) -> str:
+    """归一化新浪代码 — 上游 hq.sinajs.cn 只认小写前缀（SH600519 → 空字符串）。"""
+    return (_normalize_cn_code(code) or "").lower()
 
 
 # ================================================================
@@ -205,7 +210,7 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
 # 同步位置: source_config.py max_workers 需与此值保持一致。
 MAX_CONCURRENCY = 4
 
-@register(priority=20)
+@register(priority=15)  # 与类属性 priority=15 保持一致（装饰器值仅在类未声明时生效）
 class SinaDataSource:
     """
     新浪财经数据源 — A股第二选择（priority=20）。

@@ -28,6 +28,12 @@ _MARKET_ALIASES: Dict[str, str] = {
     "russia": "MOEX",
 }
 
+#: 数据源工厂支持的市场全集 = _create_source 分支集（_MARKET_ALIASES 的 value 集）。
+#: 用途：svc 回测泳道 market 枚举单源（backtest_bridge_plan.md 批次E质量审查 Minor 4）——
+#: 外部消费者（chain/backtest_bridge._svc_markets）取此公开常量，
+#: 不许跨模块读私有 _MARKET_ALIASES；工厂新增市场自动跟进。
+SUPPORTED_MARKETS = frozenset(_MARKET_ALIASES.values())
+
 
 class DataSourceFactory:
     """
@@ -43,7 +49,7 @@ class DataSourceFactory:
         if not market:
             return "CNStock"
         raw = str(market).strip()
-        if raw in ("Crypto", "Forex", "Futures", "USStock", "CNStock", "HKStock", "MOEX"):
+        if raw in SUPPORTED_MARKETS:   # 同一集合单源（勿再另列 tuple 造成第二份清单）
             return raw
         key = raw.lower().replace(" ", "").replace("-", "_")
         return _MARKET_ALIASES.get(key, raw)

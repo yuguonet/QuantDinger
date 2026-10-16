@@ -1,36 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-港股/H股数据源 — 直接调用 Provider 层
+港股/H股数据源 — 通过 Coordinator 统一调度 Provider 层
 
 架构:
-  get_ticker()      → 逐源尝试 fetch_ticker，第一个成功的直接返回
-  get_kline()       → 逐源尝试 fetch_kline，第一个成功的直接返回
+  get_ticker()  → coordinator.coordinate_ticker(market="HKStock")  — 多源 Race 抢答
+  get_kline()   → coordinator.coordinate_kline(market="HKStock")   — 多源顺序降级
 
-数据源:
-  从 Provider 层按 HKStock market 自动发现，按 priority 排序。
-  tencent   (priority=10)  ← 首选，国内直连
-  akshare   (priority=50)  ← 兜底
+为什么走 Coordinator（而不是像旧版直接循环 Provider）:
+  1. 源发现/优先级/熔断/超时都在协作层统一处理，与 A 股链路同构，避免两套逻辑漂移
+  2. 熔断器与 A 股共用 _realtime_cb，源的故障状态全局一致（旧版用了另一个同名熔断器实例，
+     港股侧熔断后 A 股侧仍认为该源健康）
+  3. 旧版依赖的 app.data_sources.cache_manager 在当前代码库已不存在（导入即崩）
+
+Provider 现状（markets 含 HKStock 的源）:
+  tencent (priority=10) — 当前唯一支持港股的 Provider，后续新增源自动纳入，无需改本文件
+
+缓存:
+  本模块内置轻量 TTL 缓存（替代已移除的 cache_manager）：
+    行情 600s / 日线周线 300s / 分钟线 120s
+  key 含 timeframe + limit + before_time，避免不同窗口互相污染。
+
+数据格式:
+  get_kline 返回 time 为 Unix 秒（int）的升序列表 — 由 BaseDataSource.filter_and_limit 归一化，
+  与 cn_stock/us_stock 等市场数据源保持一致。
 """
 
 from __future__ import annotations
 
-import time
-from typing import Dict, List, Any, Optional
+import threading
+import time as _time
+from typing import Dict, List, Any, Optional, Tuple
 
 from app.data_sources.base import BaseDataSource
+from app.data_sources.coordinator import get_coordinator
 from app.data_sources.normalizer import normalize_hk_code
-from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.cache_manager import (
-    get_realtime_cache,
-    get_kline_cache,
-    generate_kline_cache_key,
-)
-from app.data_sources.provider import get_providers
-from app.data_sources.source_config import get_source_config
 from app.config.data_sources import DataSourceConfig
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 缓存 TTL（秒）
+_TICKER_TTL = 600.0
+_KLINE_TTL_DAILY = 300.0
+_KLINE_TTL_MINUTE = 120.0
 
 
 def _get_timeout() -> float:
@@ -38,64 +50,74 @@ def _get_timeout() -> float:
     return float(DataSourceConfig.DEFAULT_TIMEOUT or 10)
 
 
-class HKStockDataSource(BaseDataSource):
-    """港股/H股数据源 — 直接调用 Provider，不经过 Coordinator"""
+class _TTLCache:
+    """极简线程安全 TTL 缓存（键 → (写入时间, 值)）。
 
-    name = "HKStock/direct"
+    仅用于港股单只行情/K线的短时复用；容量上限保护内存，超限淘汰最旧。
+    """
+
+    def __init__(self, max_size: int = 512):
+        self._max_size = max_size
+        self._data: Dict[str, Tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str, ttl: float) -> Optional[Any]:
+        with self._lock:
+            item = self._data.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if ttl > 0 and (_time.time() - ts) > ttl:
+            with self._lock:
+                self._data.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._data[key] = (_time.time(), value)
+            if len(self._data) > self._max_size:
+                oldest = sorted(self._data, key=lambda k: self._data[k][0])
+                for k in oldest[: len(self._data) - self._max_size]:
+                    self._data.pop(k, None)
+
+
+_cache = _TTLCache()
+
+
+class HKStockDataSource(BaseDataSource):
+    """港股/H股数据源 — 经 Coordinator 调度 Provider 层"""
+
+    name = "HKStock/coordinator"
 
     def __init__(self):
-        self.cb = get_realtime_circuit_breaker()
-        self.realtime_cache = get_realtime_cache()
-        self.kline_cache = get_kline_cache()
+        self.coordinator = get_coordinator()
 
-    def _get_hk_providers(self, capability: str = "kline"):
-        """获取支持港股的 Provider 列表（按 priority 排序，过滤已熔断的）"""
-        providers = get_providers(
-            capability=capability,
-            market="HKStock",
-        )
-        return [p for p in providers if self.cb.is_available(p.name)]
+    # ── 单只行情 ──────────────────────────────────────────────
 
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """获取最新报价 — 逐源尝试，第一个成功的直接返回"""
+        """获取最新报价 — Coordinator Race 抢答，失败返回占位行情。"""
         code = normalize_hk_code(symbol)
+        if not code:
+            return {"last": 0, "symbol": symbol}
 
-        # 先检查缓存
-        cache_key = f"ticker:{code}"
-        cached = self.realtime_cache.get(cache_key)
+        cached = _cache.get("ticker:%s" % code, _TICKER_TTL)
         if cached:
-            return cached
+            return dict(cached)
 
-        providers = self._get_hk_providers(capability="quote")
-        if not providers:
-            logger.warning("[港股行情] 无可用 Provider: %s", symbol)
-            return {"last": 0, "symbol": code}
+        quote = self.coordinator.coordinate_ticker(
+            symbol=code,
+            market="HKStock",
+            timeout=_get_timeout(),
+        )
+        if quote and (quote.get("last") or quote.get("price")):
+            _cache.set("ticker:%s" % code, quote)
+            return quote
 
-        for p in providers:
-            try:
-                start = time.time()
-                result = p.fetch_ticker(code)
-                elapsed = time.time() - start
-
-                if result and ("last" in result or "price" in result):
-                    self.cb.record_success(p.name)
-                    cfg = get_source_config(p.name)
-                    cfg.record(True, elapsed)
-                    self.realtime_cache.set(cache_key, result, ttl=600)
-                    logger.info("[港股行情] %s 命中 %s", symbol, p.name)
-                    return result
-                else:
-                    self.cb.record_failure(p.name, "empty")
-                    cfg = get_source_config(p.name)
-                    cfg.record(False, elapsed)
-            except Exception as e:
-                self.cb.record_failure(p.name, str(e))
-                cfg = get_source_config(p.name)
-                cfg.record(False, 0)
-                logger.debug("[港股行情] %s %s 失败: %s", p.name, symbol, e)
-
-        logger.warning("[港股行情] 所有 Provider 均失败: %s", symbol)
+        logger.warning("[港股行情] 所有源失败: %s", symbol)
         return {"last": 0, "symbol": code}
+
+    # ── K 线 ─────────────────────────────────────────────────
 
     def get_kline(
         self,
@@ -105,60 +127,40 @@ class HKStockDataSource(BaseDataSource):
         before_time: Optional[int] = None,
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """获取 K 线 — 逐源尝试，第一个成功的直接返回"""
+        """获取 K 线 — Coordinator 多源顺序降级，返回 time 为 Unix 秒的升序列表。"""
         code = normalize_hk_code(symbol)
-        tf = timeframe
+        if not code:
+            return []
         lim = max(int(limit or 300), 1)
+        cache_key = "kline:%s:%s:%d:%s" % (code, timeframe, lim, before_time or "")
 
-        # 先检查缓存
-        cache_key = generate_kline_cache_key(code, tf, lim, before_time)
-        cached = self.kline_cache.get(cache_key)
+        ttl = _KLINE_TTL_DAILY if timeframe in ("1D", "1W") else _KLINE_TTL_MINUTE
+        cached = _cache.get(cache_key, ttl)
         if cached:
-            return cached
+            return [dict(b) for b in cached]
 
-        providers = self._get_hk_providers(capability="kline")
-        if not providers:
-            logger.warning("[港股K线] 无可用 Provider: %s", symbol)
-            return []
-
-        bars = None
-        for p in providers:
-            try:
-                start = time.time()
-                result = p.fetch_kline(code, tf, lim)
-                elapsed = time.time() - start
-
-                if result:
-                    self.cb.record_success(p.name)
-                    cfg = get_source_config(p.name)
-                    cfg.record(True, elapsed)
-                    bars = result
-                    logger.info("[港股K线] %s tf=%s 命中 %s bars=%d",
-                               symbol, tf, p.name, len(bars))
-                    break
-                else:
-                    self.cb.record_failure(p.name, "empty")
-                    cfg = get_source_config(p.name)
-                    cfg.record(False, elapsed)
-            except Exception as e:
-                self.cb.record_failure(p.name, str(e))
-                cfg = get_source_config(p.name)
-                cfg.record(False, 0)
-                logger.debug("[港股K线] %s %s 失败: %s", p.name, symbol, e)
-
-        if not bars:
-            logger.warning("[港股K线终止] %s tf=%s 所有 Provider 失败", symbol, tf)
-            return []
-
-        # 过滤 + 截断
-        out = self.filter_and_limit(
-            bars, limit=lim, before_time=before_time,
-            after_time=after_time, truncate=(after_time is None),
+        result = self.coordinator.coordinate_kline(
+            symbol=code,
+            timeframe=timeframe,
+            limit=lim,
+            market="HKStock",
+            timeout=_get_timeout(),
         )
+        bars = (result or {}).get("bars") or []
+        if not bars:
+            logger.warning("[港股K线] 所有源失败: %s tf=%s", symbol, timeframe)
+            return []
 
-        # 写入缓存
-        kline_ttl = 300.0 if tf in ("1D", "1W") else 120.0
-        self.kline_cache.set(cache_key, out, ttl=kline_ttl)
-
-        logger.info("[港股K线成功] %s tf=%s bars=%d", symbol, tf, len(out))
+        # 归一化 time 为 Unix 秒 + 时间窗过滤 + 截断
+        out = self.filter_and_limit(
+            [dict(b) for b in bars],
+            limit=lim,
+            before_time=before_time,
+            after_time=after_time,
+            truncate=(after_time is None),
+        )
+        if out:
+            _cache.set(cache_key, out)
+        logger.info("[港股K线] %s tf=%s 命中 %s bars=%d",
+                    symbol, timeframe, result.get("source", "?"), len(out))
         return out

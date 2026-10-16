@@ -280,6 +280,45 @@ def query_dragon_tiger(trade_date: str = "", stock_code: str = "", days: int = 3
         return []
 
 
+def query_dragon_tiger_latest(limit: int = 500) -> List[Dict[str, Any]]:
+    """查询数据库中最后一个有数据交易日的龙虎榜（单日全量快照）
+
+    与 query_dragon_tiger(trade_date="") 的区别: 后者空日期取"最近 N 天混合"
+    （days=30, LIMIT 500 会把多日数据混在一页）。市场卡片需要的是"最后一日"
+    快照 —— 非交易时段/后端重启后内存缓存未刷新时, 直接展示库里最新一日的
+    数据, 展示不依赖当前时间是否落在交易时段。
+
+    Args:
+        limit: 单日最多返回条数（与 query_dragon_tiger 一致）
+
+    Returns:
+        龙虎榜记录列表（按净买入额 DESC）；库为空时 []。
+    """
+    sql = """
+        SELECT trade_date, stock_code, stock_name, reason,
+               buy_amount, sell_amount, net_amount,
+               change_percent, close_price, turnover_rate, amount,
+               buy_seat_count, sell_seat_count
+        FROM cnd_dragon_tiger_list
+        WHERE trade_date = (SELECT MAX(trade_date) FROM cnd_dragon_tiger_list)
+        ORDER BY net_amount DESC
+        LIMIT %s
+    """
+
+    try:
+        pool = _get_cnstock_pool()
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, (limit,))
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.warning("[dragon_tiger_store] 查询最近交易日龙虎榜失败: %s", e)
+        return []
+
+
 def query_hot_rank(trade_date: str = "", stock_code: str = "") -> List[Dict[str, Any]]:
     """查询热榜数据
 

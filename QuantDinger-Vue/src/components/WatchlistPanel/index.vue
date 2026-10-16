@@ -645,8 +645,27 @@ export default {
   mounted () {
     this.startWatchlistPriceRefresh()
   },
+  // keep-alive: 父路由(xuangu / indicator-ide, meta.keepAlive=true)缓存本组件时,
+  // 离开页面走 deactivated 而非 beforeDestroy —— 15s 轮询必须在此暂停,
+  // 否则每个缓存页各留一套后台轮询持续打后端(与 KlineChart 同类问题)
+  deactivated () {
+    if (this.watchlistSyncTimer) {
+      clearInterval(this.watchlistSyncTimer)
+      this.watchlistSyncTimer = null
+    }
+    if (this.searchTimer) {
+      clearTimeout(this.searchTimer)
+      this.searchTimer = null
+    }
+  },
+  activated () {
+    // 恢复轮询; startWatchlistPriceRefresh 幂等(先清后建),
+    // 首挂载时 mounted + activated 双调用也不会泄漏
+    this.startWatchlistPriceRefresh()
+  },
   beforeDestroy () {
     if (this.watchlistSyncTimer) clearInterval(this.watchlistSyncTimer)
+    if (this.searchTimer) clearTimeout(this.searchTimer)
   },
   watch: {
     value (val) {
@@ -1072,6 +1091,11 @@ export default {
     startWatchlistPriceRefresh () {
       // 统一 15s 单定时器: 成员同步(读库) + 交易时段内的价格轮询;
       // 盘后不轮询价格(仅进页面首刷 + 列表变更补刷一次新成员的收盘价)
+      // 幂等: keep-alive 下 mounted 与 activated 都会调用, 先清旧定时器再建, 避免泄漏
+      if (this.watchlistSyncTimer) {
+        clearInterval(this.watchlistSyncTimer)
+        this.watchlistSyncTimer = null
+      }
       this.watchlistSyncTimer = setInterval(() => { this._watchlistTick() }, 15000)
       if (this.watchlist && this.watchlist.length > 0) this.loadWatchlistPrices()
     },

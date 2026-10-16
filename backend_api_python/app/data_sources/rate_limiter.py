@@ -242,12 +242,14 @@ def retry_with_backoff(
 # 全局限流器实例
 # ============================================
 
-# 东方财富接口限流器（较严格）
-_eastmoney_limiter = RateLimiter(
-    min_interval=2.0,
-    jitter_min=1.0,
-    jitter_max=3.0
-)
+# 东方财富接口限流器 —— 已随 provider/eastmoney.py 一并移除（2026-10-16）。
+# 原配置: min_interval=2.0, jitter_min=1.0, jitter_max=3.0
+# 若日后恢复东财行情源，取消下面注释即可（调用方 get_eastmoney_limiter 同步恢复）。
+# _eastmoney_limiter = RateLimiter(
+#     min_interval=2.0,
+#     jitter_min=1.0,
+#     jitter_max=3.0
+# )
 
 # 腾讯财经接口限流器（较宽松）
 _tencent_limiter = RateLimiter(
@@ -264,10 +266,9 @@ _akshare_limiter = RateLimiter(
 )
 
 
-def get_eastmoney_limiter() -> RateLimiter:
-    """获取东方财富限流器"""
-    return _eastmoney_limiter
-
+# def get_eastmoney_limiter() -> RateLimiter:
+#     """获取东方财富限流器"""
+#     return _eastmoney_limiter
 
 def get_tencent_limiter() -> RateLimiter:
     """获取腾讯财经限流器"""

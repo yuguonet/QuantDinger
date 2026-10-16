@@ -1059,6 +1059,7 @@ import { ACCESS_TOKEN } from '@/store/mutation-types'
 import { baseMixin } from '@/store/app-mixin'
 import request from '@/utils/request'
 import { getUserInfo } from '@/api/login'
+import { readUserPrefs, writeUserPrefs } from '@/utils/uiPrefs'
 import { getWatchlist, addWatchlist, searchSymbols } from '@/api/market'
 import KlineChart from '@/views/indicator-analysis/components/KlineChart.vue'
 import BacktestHistoryDrawer from '@/views/indicator-analysis/components/BacktestHistoryDrawer.vue'
@@ -1094,6 +1095,10 @@ const DATE_PRESETS = [
 /** 与指标分析 / AI 资产分析一致的市场列表（含 A 股、H 股、预测市场） */
 const IDE_ADD_MARKET_KEYS = ['Crypto', 'USStock', 'CNStock', 'HKStock', 'Forex', 'Futures', 'PredictionMarket']
 
+/**
+ * 旧版自构造 localStorage key (仅保留用于一次性迁移: 读出旧数据提升到
+ * uiPrefs 账号私有域后即删除; 新代码一律走 readUserPrefs/writeUserPrefs)
+ */
 function purchasedMarketHintStorageKey (userId) {
   const u = userId != null && userId !== '' ? String(userId) : '0'
   return `qd_ide_purchased_market_hint_dismissed_${u}`
@@ -1741,9 +1746,17 @@ export default {
 
     loadPurchasedMarketHintDismissed () {
       try {
-        const raw = storage.get(purchasedMarketHintStorageKey(this.userId))
-        this.purchasedMarketHintDismissed =
-          raw === true || raw === 1 || raw === '1' || raw === 'true'
+        let dismissed = readUserPrefs('ide-hint').dismissed === true
+        if (!dismissed) {
+          // 旧版自构造 key 一次性迁移: 命中即提升到账号私有域并删旧键
+          const raw = storage.get(purchasedMarketHintStorageKey(this.userId))
+          if (raw != null && raw !== '') {
+            dismissed = true
+            writeUserPrefs('ide-hint', { dismissed: true })
+            storage.remove(purchasedMarketHintStorageKey(this.userId))
+          }
+        }
+        this.purchasedMarketHintDismissed = dismissed
       } catch (_) {
         this.purchasedMarketHintDismissed = false
       }
@@ -1752,7 +1765,7 @@ export default {
     dismissPurchasedMarketHint () {
       this.purchasedMarketHintDismissed = true
       try {
-        storage.set(purchasedMarketHintStorageKey(this.userId), '1')
+        writeUserPrefs('ide-hint', { dismissed: true })
       } catch (_) { /* ignore quota */ }
     },
 
@@ -1760,10 +1773,20 @@ export default {
       if (!this.userId) return
       try {
         if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
-        const raw = storage.get(ideUiCacheStorageKey(this.userId))
-        if (raw == null || raw === '') return
-        const s = typeof raw === 'string' ? JSON.parse(raw) : raw
-        if (!s || typeof s !== 'object') return
+        let s = readUserPrefs('ide-ui')
+        if (!s || typeof s !== 'object' || Object.keys(s).length === 0) {
+          // 旧版自构造 key 一次性迁移: 命中即提升到账号私有域并删旧键
+          const raw = storage.get(ideUiCacheStorageKey(this.userId))
+          if (raw != null && raw !== '') {
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+            if (parsed && typeof parsed === 'object') {
+              writeUserPrefs('ide-ui', parsed, false)
+              storage.remove(ideUiCacheStorageKey(this.userId))
+              s = readUserPrefs('ide-ui')
+            }
+          }
+        }
+        if (!s || typeof s !== 'object' || Object.keys(s).length === 0) return
         if (s.market && s.symbol) {
           this.market = String(s.market)
           this.symbol = String(s.symbol)
@@ -1855,7 +1878,8 @@ export default {
           // 左侧自选股面板宽度 (百分比, 拖拽手柄调整)
           leftPanelPct: this.leftPanelWidthPct
         }
-        storage.set(ideUiCacheStorageKey(this.userId), JSON.stringify(payload))
+        // 账号私有域 (ide-ui 模块): 整体替换快照, 不 merge (payload 即完整状态)
+        writeUserPrefs('ide-ui', payload, false)
       } catch (_) { /* ignore quota */ }
     },
     normalizePersistedChartIndicators (items) {

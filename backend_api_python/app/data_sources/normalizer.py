@@ -5,6 +5,7 @@ A股数据标准化层 — 工具函数 + safe 类型转换
   - safe_float / safe_int: 安全类型转换（处理 None/"-"/""/"nan"/"--"）
   - normalize_cn_code / normalize_hk_code: 股票代码格式归一
   - to_raw_digits / detect_market / add_market_prefix / strip_market_prefix: 市场前缀工具
+  - normalize_chart_timeframe: 图表周期归一化（全库唯一实现，2026-10-16 迁入）
   - Tencent 行情 helpers (fetch_quote / parse_quote_to_ticker)
 
 注: 龙虎榜/涨跌停池/热榜的 normalize 函数已迁移至 app.market_cn.dragon_limit
@@ -294,6 +295,60 @@ def strip_market_prefix(symbol: str) -> str:
         return s
 
     return s  # 无法识别，原样返回
+
+
+# ================================================================
+# 图表周期归一化 — 全库唯一实现
+# (2026-10-16 从 asia_stock_kline 迁入并合并 kline_clean 别名表;
+#  asia_stock_kline 已删本地副本, cn_stock 改从这里 import)
+# ================================================================
+
+# 别名表: key = 小写输入, value = 规范输出
+# 规范口径: 分钟族小写 (1m/5m/15m/30m) / 小时族大写 (1H/2H/4H) / 日周 (1D/1W)
+# 易错点: "2h"→"2H" 是历史漏注册项 — 旧 asia_stock_kline 表无此键,
+# "2h" 输入原样返回小写, 导致 cn_stock 聚合分支 tuple 匹配失败走远端
+_CHART_TF_ALIASES = {
+    # 分钟族 (小写规范)
+    "1m": "1m", "m": "1m", "min": "1m", "1min": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    # 小时族 (大写规范)
+    "1h": "1H", "h": "1H", "60m": "1H", "60min": "1H",
+    "2h": "2H", "120m": "2H", "120min": "2H",
+    "4h": "4H", "240m": "4H", "240min": "4H",
+    # 日线
+    "1d": "1D", "d": "1D", "day": "1D", "daily": "1D", "1day": "1D",
+    # 周线
+    "1w": "1W", "w": "1W", "week": "1W", "weekly": "1W", "wk": "1W", "1week": "1W",
+}
+
+
+def normalize_chart_timeframe(timeframe: str) -> str:
+    """
+    归一化图表周期字符串为规范口径。
+
+    规范输出:
+      分钟族  1m / 5m / 15m / 30m   (小写)
+      小时族  1H / 2H / 4H          (大写)
+      日/周   1D / 1W               (大写)
+
+    未登记输入 → 原样返回 (保留原始大小写); 空值 → "1D"。
+
+    Examples:
+        normalize_chart_timeframe("60m")   → "1H"
+        normalize_chart_timeframe("2h")    → "2H"   # 旧表漏注册, 曾原样返回 "2h"
+        normalize_chart_timeframe("240m")  → "4H"
+        normalize_chart_timeframe("1DAY")  → "1D"
+        normalize_chart_timeframe("3m")    → "3m"   # 未登记, 原样返回
+    """
+    t = (timeframe or "1D").strip()
+    if not t:
+        return "1D"
+    key = t.lower()
+    if key in _CHART_TF_ALIASES:
+        return _CHART_TF_ALIASES[key]
+    return t
 
 
 # ================================================================

@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import math
 import threading
 import time
 from collections import deque
@@ -202,19 +203,55 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 # 比 SourceConfig 里的超时更严格 — 这是硬上限。
 PER_TASK_TIMEOUT = 8.0
 
+
+class _ProviderCallError(Exception):
+    """Preserve provider exceptions without confusing them with Future timeouts."""
+
+
+class _ExecutorSaturatedError(RuntimeError):
+    """Raised rather than queuing more work behind stuck provider calls."""
+
+
+def _run_provider_call(fn: Callable, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        raise _ProviderCallError(str(exc)) from exc
+
+
 # 超时辅助线程池 — 长生命周期，避免每次 _fetch_with_timeout 都创建新线程池。
-# max_workers=8 足够覆盖并发的超时监控需求（实际 fetch 在主池执行，这里只是等待+取消）。
+# 限制在途任务数，避免无界排队；已启动的 Python 线程无法被 Future.cancel() 强制终止。
 _timeout_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="coord-timeout"
 )
+_timeout_slots = threading.BoundedSemaphore(8)
 atexit.register(_timeout_pool.shutdown, wait=False)
 
-# market_kline 专用硬超时池 — 防止 fetch_kline 卡死阻塞 worker 线程。
-# 独立于 _timeout_pool，避免 market_kline 大批量场景挤占 coordinate_kline 的超时监控。
+# 批量行情与全市场 K 线各自隔离；固定容量 + 有界在途任务，避免互相占满线程池。
+_batch_timeout_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=12, thread_name_prefix="bquote-timeout"
+)
+_batch_timeout_slots = threading.BoundedSemaphore(12)
+atexit.register(_batch_timeout_pool.shutdown, wait=False)
+
 _mkline_timeout_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=12, thread_name_prefix="mkline-timeout"
 )
+_mkline_timeout_slots = threading.BoundedSemaphore(12)
 atexit.register(_mkline_timeout_pool.shutdown, wait=False)
+
+
+def _submit_bounded(pool, slots, fn: Callable, *args, **kwargs):
+    """Submit without allowing an unbounded queue to form behind stuck workers."""
+    if not slots.acquire(blocking=False):
+        raise _ExecutorSaturatedError("provider executor has no free worker slots")
+    try:
+        future = pool.submit(_run_provider_call, fn, *args, **kwargs)
+    except Exception:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _: slots.release())
+    return future
 
 
 # ================================================================
@@ -264,17 +301,33 @@ def _is_valid_kline(bars) -> bool:
         return False
     if len(bars) == 0:
         return False
-    # 至少第一个元素得是 dict
-    if not isinstance(bars[0], dict):
+    if any(not isinstance(bar, dict) for bar in bars):
         return False
-    # 检查是否有至少一个非空值（排除 {"code": "SH600519"} 这种只有 code 没行情的）
-    first = bars[0]
-    has_data = any(
-        v is not None and v != "" and v != 0 and v != "0"
-        for k, v in first.items()
-        if k not in ("code", "symbol", "name")  # 排除标识字段
-    )
-    return has_data
+    identity_fields = {"code", "symbol", "name", "date", "time", "datetime"}
+    for bar in bars:
+        has_data = False
+        for key, value in bar.items():
+            if str(key).lower() in identity_fields or value is None:
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, str):
+                value = value.strip()
+                if not value or value.lower() in {
+                    "nan", "none", "null", "inf", "+inf", "-inf", "infinity",
+                    "+infinity", "-infinity",
+                }:
+                    continue
+            if isinstance(value, (int, float)):
+                if not math.isfinite(value) or value == 0:
+                    continue
+            elif value == 0 or value == "0":
+                continue
+            has_data = True
+            break
+        if not has_data:
+            return False
+    return True
 
 
 # ================================================================
@@ -355,7 +408,7 @@ def _discover_sources(
     timeframe: str,
     preferred_source: str = "",
     capability: str = "kline",
-    
+
     skip_cb_filter: bool = False,
 ) -> List[Tuple[str, Callable, SourceConfig]]:
     """
@@ -377,14 +430,15 @@ def _discover_sources(
         capability: 能力类型
           - "kline"  → 获取K线数据（默认）
           - "quote"  → 获取实时行情
-          - "qfq"  → 前复权
-          - "hfq"  → 后复权
-          - ""     → 不复权（默认）
+          - "kline_batch"  → 全市场批量K线（由 coordinate_market_kline 过滤）
+          - "batch_quote"  → 批量行情（由 coordinate_batch_quotes 过滤）
+        注: 复权不在本层处理，K线一律取不复权数据。
 
     Returns:
         [(源名称, fetch_fn, 源配置), ...]
         fetch_fn 签名:
-          - capability="kline": fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+          - capability="kline": fetch_fn(symbol, timeframe, limit) -> Dict | None
+            （形如 {"bars": [...], "count": n}；失败/不支持返回 None）
           - capability="quote": fetch_fn(symbol) -> Dict | None
     """
     from app.data_sources.provider import get_providers
@@ -526,7 +580,7 @@ class Coordinator:
         timeout: float = 15.0,
         preferred_source: str = "",
         sources: Optional[List[Tuple[str, Callable]]] = None,
-        
+
     ) -> Dict[str, Any]:
         """
         单股K线获取 — 多源顺序尝试，第一个成功即返回。
@@ -544,7 +598,7 @@ class Coordinator:
             preferred_source: 指定首选源（如 "tencent"），优先使用，失败后回退
             sources:   手动指定源列表（可选）。为 None 时自动从 Provider 层发现。
                        格式: [(name, fetch_fn), ...]
-                       fetch_fn 签名: fetch_fn(symbol, timeframe, limit) -> List[Dict] | None
+                       fetch_fn 签名: fetch_fn(symbol, timeframe, limit) -> Dict | None
             （仅支持不复权）
 
         Returns:
@@ -553,6 +607,15 @@ class Coordinator:
         """
         if not symbol:
             return {}
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            logger.warning("[协助层] kline 无效总超时: %r", timeout)
+            return {}
+        if not math.isfinite(timeout) or timeout <= 0:
+            logger.warning("[协助层] kline 总超时必须为正数: %r", timeout)
+            return {}
+        deadline = time.monotonic() + timeout
 
         from app.data_sources.normalizer import add_market_prefix, strip_market_prefix
 
@@ -583,16 +646,24 @@ class Coordinator:
 
         # ── 顺序尝试每个源，第一个成功即返回 ──
         for name, cfg in available:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.debug("[协助层] kline %s 到达总超时 %.2fs", pure_symbol, timeout)
+                break
             fetch_fn = source_map[name]
-            start = time.time()
+            start = time.monotonic()
             try:
-                future = _timeout_pool.submit(fetch_fn, prefixed_symbol, timeframe, limit)
-                result = future.result(timeout=PER_TASK_TIMEOUT)
-                elapsed = time.time() - start
+                task_timeout = min(PER_TASK_TIMEOUT, remaining)
+                future = _submit_bounded(
+                    _timeout_pool, _timeout_slots, fetch_fn,
+                    prefixed_symbol, timeframe, limit,
+                )
+                result = future.result(timeout=task_timeout)
+                elapsed = time.monotonic() - start
 
                 if result:
                     bars = result.get("bars", [])
-                    if bars:
+                    if _is_valid_kline(bars):
                         _realtime_cb.record_success(name)
                         cfg.record(True, elapsed)
                         logger.info("[协助层] kline %s 命中 %s (%d条)", pure_symbol, name, len(bars))
@@ -600,15 +671,16 @@ class Coordinator:
                 cfg.record(False, elapsed)
                 logger.debug("[协助层] kline %s %s 返回空", name, pure_symbol)
             except concurrent.futures.TimeoutError:
-                elapsed = time.time() - start
+                elapsed = time.monotonic() - start
                 _realtime_cb.record_failure(name, "timeout")
                 cfg.record(False, elapsed)
                 future.cancel()
                 logger.debug("[协助层] kline %s %s 超时 (%ss)", name, pure_symbol, elapsed)
             except Exception as e:
-                elapsed = time.time() - start
+                elapsed = time.monotonic() - start
                 # 熔断只对超时计数
-                if elapsed > PER_TASK_TIMEOUT:
+                if (not isinstance(e, (_ExecutorSaturatedError, _ProviderCallError))
+                        and elapsed > PER_TASK_TIMEOUT):
                     _realtime_cb.record_failure(name, str(e))
                 cfg.record(False, elapsed)
                 logger.debug("[协助层] kline %s %s 失败: %s", name, pure_symbol, e)
@@ -721,8 +793,9 @@ class Coordinator:
                 return
             if not _realtime_cb.is_available(source_name):
                 return
+            # start 必须在 try 外：fetch_fn 抛异常时 except 分支要读 elapsed
+            start = time.time()
             try:
-                start = time.time()
                 result = fetch_fn(symbol)
                 elapsed = time.time() - start
 
@@ -947,12 +1020,13 @@ class Coordinator:
                 return False
             # 至少要有 price 或 close 字段且非零
             price = q.get("price") or q.get("close") or q.get("last")
-            if price is None:
+            if price is None or isinstance(price, bool):
                 return False
             try:
-                if float(price) <= 0:
+                numeric_price = float(price)
+                if not math.isfinite(numeric_price) or numeric_price <= 0:
                     return False
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 return False
             return True
 
@@ -968,7 +1042,8 @@ class Coordinator:
                     return main_pool.popleft()
 
             # 主池空了，从重试池凑一批
-            my_fails = source_fails[source_name]
+            with source_fails_lock:
+                my_fails = set(source_fails[source_name])
             batch = []
             with retry_pool_lock:
                 deferred = []
@@ -993,6 +1068,10 @@ class Coordinator:
             源返回空/无效结果时视为该源失败，由其他源换源重试；
             超过 1/2 活源都试过才判定彻底失败。
             """
+            with results_lock:
+                if sym in results:
+                    return
+
             # 正常失败流程：加锁 → 标记 → 检查是否超过1/2活源试过
             with source_fails_lock:
                 source_fails[source_name].add(sym)
@@ -1001,8 +1080,13 @@ class Coordinator:
             # 超过1/2活源（未熔断）试过就彻底失败
             active_count = sum(1 for src in available if _realtime_cb.is_available(src.name))
             if active_count > 0 and fail_count * 2 > active_count:
-                with permanent_fail_set_lock:
-                    permanent_fail.add(sym)
+                with results_lock:
+                    if sym in results:
+                        return
+                    with permanent_fail_set_lock:
+                        if sym in permanent_fail:
+                            return
+                        permanent_fail.add(sym)
                 with permanent_fail_lock:
                     permanent_fail_count[0] += 1
                 with done_lock:
@@ -1018,6 +1102,9 @@ class Coordinator:
             with results_lock:
                 if sym in results:
                     return False
+                with permanent_fail_set_lock:
+                    if sym in permanent_fail:
+                        return False
                 # 数据校验
                 if not _is_valid_quote(quote):
                     return False
@@ -1051,11 +1138,13 @@ class Coordinator:
                 if done_count[0] >= total:
                     return False
 
+            # start 必须在 try 外：submit/后续逻辑抛异常时 except 要读 elapsed
             start = time.time()
             try:
                 # ── 硬超时包装 ──
                 _hard_timeout = _PER_TASK_TIMEOUT + 2
-                _fetch_future = _mkline_timeout_pool.submit(
+                _fetch_future = _submit_bounded(
+                    _batch_timeout_pool, _batch_timeout_slots,
                     provider.fetch_batch_quotes,
                     batch, timeout=int(_PER_TASK_TIMEOUT),
                 )
@@ -1087,22 +1176,29 @@ class Coordinator:
 
                 # 有返回数据 → 逐 symbol 处理
                 if task_result:
-                    _realtime_cb.record_success(source_name)
-                    cfg = get_source_config(source_name)
-                    cfg.record(True, elapsed)
-
-                    returned = set()
+                    requested = {strip_market_prefix(sym) for sym in batch}
+                    returned: Set[str] = set()
                     ok_count = 0
+                    valid_count = 0
                     for psym, quote in task_result.items():
                         d = strip_market_prefix(psym)
+                        if d not in requested:
+                            logger.debug("[batch_quotes] %s 返回请求外代码 %s，忽略",
+                                         source_name, psym)
+                            continue
                         if d in returned:
                             continue
-                        returned.add(d)
+                        if not _is_valid_quote(quote):
+                            continue
                         # 已被其他源完成，跳过
                         with results_lock:
-                            if d in results:
-                                continue
+                            already_completed = d in results
+                        if already_completed:
+                            returned.add(d)
+                            continue
                         is_first = _mark_success(d, quote, source_name)
+                        returned.add(d)
+                        valid_count += 1
                         if is_first:
                             ok_count += 1
                             with stats_lock:
@@ -1113,8 +1209,16 @@ class Coordinator:
                     for sym in missing:
                         _return_to_retry(sym, source_name)
 
+                    cfg = get_source_config(source_name)
+                    if valid_count:
+                        _realtime_cb.record_success(source_name)
+                        cfg.record(True, elapsed)
+                    else:
+                        cfg.record(False, elapsed)
                     with stats_lock:
                         source_stats[source_name]["batches"] += 1
+                        if not valid_count:
+                            source_stats[source_name]["fail"] += 1
                     return ok_count > 0
 
                 # 空结果 → 整批失败
@@ -1128,7 +1232,8 @@ class Coordinator:
 
             except Exception as e:
                 elapsed = time.time() - start
-                is_timeout = elapsed > _PER_TASK_TIMEOUT
+                is_timeout = (not isinstance(e, _ProviderCallError)
+                              and elapsed > _PER_TASK_TIMEOUT)
                 # 熔断只对超时计数，错误代码和没数据的不进行计数
                 if is_timeout:
                     _realtime_cb.record_failure(source_name, str(e))
@@ -1223,7 +1328,7 @@ class Coordinator:
         market: str = "",
         timeframe: str = "1D",
         count: int = 500,
-        
+
         timeout: float = 60.0,
         preferred_source: str = "",
         start_date: str = "",
@@ -1387,7 +1492,7 @@ class Coordinator:
         source_fails: Dict[str, Set[str]] = {p.name: set() for p in available}
         source_fails_lock = threading.Lock()
 
-        # 彻底失败集合: 已被2个源试过失败的 symbol（用于从重试池中过滤）
+        # 彻底失败集合: 已超过 1/2 活源试过且都失败的 symbol（用于从重试池中过滤）
         permanent_fail: Set[str] = set()
         permanent_fail_set_lock = threading.Lock()
 
@@ -1400,7 +1505,7 @@ class Coordinator:
         }
         stats_lock = threading.Lock()
 
-        _PER_TASK_TIMEOUT = PER_TASK_TIMEOUT  # 使用全局常量（60s硬上限）
+        _PER_TASK_TIMEOUT = PER_TASK_TIMEOUT  # 使用全局常量（8s 硬上限，见文件顶部）
 
         # ── 第五步: 内部辅助函数 ──
 
@@ -1424,7 +1529,8 @@ class Coordinator:
                     return main_pool.popleft()
 
             # 主池空了，从重试池取"该源失败表中没有的"
-            my_fails = source_fails[source_name]
+            with source_fails_lock:
+                my_fails = set(source_fails[source_name])
             with retry_pool_lock:
                 deferred = []
                 found = None
@@ -1450,6 +1556,10 @@ class Coordinator:
 
             记录到该源的失败表。检查是否超过1/2活源试过此 symbol → 是则彻底失败。
             """
+            with results_lock:
+                if sym in results:
+                    return
+
             # 正常失败流程：加锁 → 标记 → 检查是否超过1/2活源试过
             with source_fails_lock:
                 source_fails[source_name].add(sym)
@@ -1458,8 +1568,13 @@ class Coordinator:
             # 超过1/2活源（未熔断）试过就彻底失败
             active_count = sum(1 for src in available if _realtime_cb.is_available(src.name))
             if active_count > 0 and fail_count * 2 > active_count:
-                with permanent_fail_set_lock:
-                    permanent_fail.add(sym)
+                with results_lock:
+                    if sym in results:
+                        return
+                    with permanent_fail_set_lock:
+                        if sym in permanent_fail:
+                            return
+                        permanent_fail.add(sym)
                 with permanent_fail_lock:
                     permanent_fail_count[0] += 1
                 with done_lock:
@@ -1482,6 +1597,9 @@ class Coordinator:
             with results_lock:
                 if sym in results:
                     return False  # 已被其他源抢先，丢弃
+                with permanent_fail_set_lock:
+                    if sym in permanent_fail:
+                        return False
                 results[sym] = bars
 
             with done_lock:
@@ -1516,7 +1634,8 @@ class Coordinator:
                 # 用 _mkline_timeout_pool 在独立线程中执行，超时后 abandon 该线程，
                 # worker 线程不再等待，立即走失败→重试→熔断流程。
                 _hard_timeout = _PER_TASK_TIMEOUT + 2  # 比 provider 自身 timeout 稍长
-                _fetch_future = _mkline_timeout_pool.submit(
+                _fetch_future = _submit_bounded(
+                    _mkline_timeout_pool, _mkline_timeout_slots,
                     provider.fetch_kline,
                     code=strip_market_prefix(sym), timeframe=timeframe, count=count,
                     timeout=int(_PER_TASK_TIMEOUT),
@@ -1568,7 +1687,8 @@ class Coordinator:
 
             except Exception as e:
                 elapsed = time.time() - start
-                is_timeout = elapsed > _PER_TASK_TIMEOUT
+                is_timeout = (not isinstance(e, _ProviderCallError)
+                              and elapsed > _PER_TASK_TIMEOUT)
                 # 熔断只对超时计数，错误代码和没数据的不进行计数
                 if is_timeout:
                     _realtime_cb.record_failure(source_name, str(e))

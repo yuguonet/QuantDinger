@@ -5792,10 +5792,16 @@ json.dumps(output)
       if (!_realtimePaused) return
       _realtimePaused = false
       startRealtime()
+      // 恢复被 deactivated 暂停的轻量绘制守护(水印 / 左轴百分比标尺)；
+      // _resumeLightweightPaint 内部均为幂等操作，重入安全
+      try { _resumeLightweightPaint() } catch (_) { /* 预期内 */ }
     })
     onDeactivated(() => {
       _realtimePaused = true
       stopRealtime()
+      // 暂停轻量绘制守护：_pctWatchdog(800ms) / _wmTimer(3s) / _wmObserver 此前只在
+      // onBeforeUnmount 清理；keep-alive 缓存(deactivated 但未卸载)时会在隐藏页空转，此处停掉
+      _pauseLightweightPaint()
     })
 
     // --- 图表初始化函数 ---
@@ -8277,6 +8283,45 @@ json.dumps(output)
           _wmObserver.observe(parent, { childList: true })
         }
       }
+    }
+
+    /**
+     * keep-alive 挂起(deactivated)时暂停"轻量绘制守护"的周期任务：
+     *   - _pctWatchdog(800ms) / _wmTimer(3s)：两个 setInterval
+     *   - _wmObserver：MutationObserver
+     * 这些此前只在 onBeforeUnmount 清理；组件被 keep-alive 缓存(deactivated 但未卸载)时
+     * 仍会在隐藏页空转(评估签名 / 回调)。暂停后由 onActivated → _resumeLightweightPaint 幂等重建。
+     * 说明：ResizeObserver(chartResizeObserver / _pctPaneObserver / _chipPaneObserver / _observers)
+     *   监听的是隐藏元素，display:none 下不触发，故不在此停，避免恢复逻辑复杂化；
+     *   一次性 rAF(_pctRafId / _chipRafId)自限且触发时有签名保护，也不停。
+     *   若暂停后组件被直接卸载(onBeforeUnmount)，各清理点均已做 null 判空，无二次释放风险。
+     */
+    const _pauseLightweightPaint = () => {
+      if (_pctWatchdog != null) {
+        try { clearInterval(_pctWatchdog) } catch (_) { /* 预期内 */ }
+        _pctWatchdog = null
+      }
+      if (_wmTimer != null) {
+        try { clearInterval(_wmTimer) } catch (_) { /* 预期内 */ }
+        _wmTimer = null
+      }
+      if (_wmObserver) {
+        try { _wmObserver.disconnect() } catch (_) { /* 预期内 */ }
+        _wmObserver = null
+      }
+    }
+
+    /** keep-alive 恢复(onActivated)时重建被暂停的轻量绘制守护，并立即补绘一次(签名保护去重) */
+    const _resumeLightweightPaint = () => {
+      try { _startWmGuard() } catch (_) { /* 预期内 */ }
+      try { _ensureWmLayer() } catch (_) { /* 预期内 */ }
+      // 仅重建被暂停的 pct 看门狗(与 _syncPctRuler 的看门狗一致, 800ms)；此处不调 _syncPctRuler，
+      // 因其会重复重建 _pctPaneObserver 并向 _observers 累积已断开对象 —— subscription /
+      // buildTicks 包装 / paneObserver 均未随 deactivation 销毁、仍然有效，无需重建。
+      if (_pctWatchdog == null && typeof setInterval === 'function') {
+        _pctWatchdog = setInterval(() => _schedulePctRulerPaint(), 800)
+      }
+      try { _schedulePctRulerPaint() } catch (_) { /* 预期内 */ }
     }
 
     onBeforeUnmount(() => {

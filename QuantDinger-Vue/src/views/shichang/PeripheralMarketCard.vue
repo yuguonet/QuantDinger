@@ -85,8 +85,15 @@ import request from '@/utils/request'
 
 // 最多显示条数
 const MAX_DISPLAY = 3
-// 异动检测阈值（百分比）
+// 异动检测阈值（百分比）— 进入异动态的门槛
 const ANOMALY_THRESHOLD = 2.0
+// 退出异动态阈值（百分比）— 滞回: 低于此值才清除报警状态，
+// 防止指标在 2% 临界反复抖动导致每分钟重复报警
+const ANOMALY_RELEASE = 1.5
+// 同一指标同向"升级报警"所需最小增幅（百分点）与冷却间隔 —
+// 异动态是持续状态(后端 change 为当日累计涨跌幅), 不升级就不再打扰
+const ESCALATE_STEP = 0.5
+const NOTIFY_COOLDOWN = 3 * 60 * 1000
 // 默认三项 key
 const DEFAULT_KEYS = ['sent_fear_greed', 'sent_vix', 'sent_dxy']
 // 定时轮询间隔（ms）
@@ -138,11 +145,40 @@ export default {
       return result
     }
   },
+  created () {
+    // 非响应式实例字段（不进 data，避免无谓依赖收集）:
+    //   _notified       key → { dir, mag, ts } 每个指标上次报警时的方向/幅度/时间
+    //   _baselineReady  首载/切回页面后的首次数据只建基线不报警
+    //   _paused         keep-alive 缓存（切走页面）期间静默，不弹报警
+    this._notified = {}
+    this._baselineReady = false
+    this._paused = false
+  },
   mounted () {
     // 启动：读缓存
     this.fetchCache()
     // 定时器：轮询比对时间戳，变了才刷新显示
     this.pollTimer = setInterval(() => this.pollCache(), POLL_INTERVAL)
+  },
+  activated () {
+    // keep-alive（/shichang 路由 keepAlive=true）: 从其它页面切回 —
+    // 恢复轮询并重置报警基线，避免把离开期间累积的异动一次性弹出来
+    this._paused = false
+    this._notified = {}
+    this._baselineReady = false
+    this.fetchCache()
+    if (!this.pollTimer) {
+      this.pollTimer = setInterval(() => this.pollCache(), POLL_INTERVAL)
+    }
+  },
+  deactivated () {
+    // keep-alive: 离开页面 — 停轮询。
+    // 路由被缓存时 beforeDestroy 不触发，旧实现定时器在后台空转并持续弹报警
+    this._paused = true
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
+    }
   },
   beforeDestroy () {
     this.isDestroyed = true
@@ -343,10 +379,57 @@ export default {
         this.overallScore = Math.round(totalSentiment / items.length)
       }
 
+      // 清理已不在数据源中的指标报警状态，防止 _notified 无限增长
+      const aliveKeys = new Set(items.map(i => i.key))
+      Object.keys(this._notified).forEach(k => {
+        if (!aliveKeys.has(k)) delete this._notified[k]
+      })
+
       const alerts = items.filter(i => i.anomaly)
-      if (alerts.length > 0) {
-        this.sendAnomalyNotification(alerts)
+      if (alerts.length > 0) this._notifyAnomalies(alerts)
+    },
+
+    // ─── 异动报警去重（纯前端策略，不改数据与检测阈值） ───
+    // 背景: 后端 change 为当日累计涨跌幅，指标一旦越过 2% 全天都处于异动态；
+    // 旧实现每次轮询(60s)都无脑重发 → 一分钟一弹。现按状态机只发送三类事件:
+    //   ① 新异动(此前不在异动态)  ② 方向反转  ③ 同向且幅度明显扩大(升级)
+    _notifyAnomalies (alerts) {
+      if (this._paused) return // 页面被缓存(切走)时静默
+      if (!this._baselineReady) {
+        // 首次数据(进页面/切回页面): 只记录基线不报警，防止一进来就弹一串
+        alerts.forEach(a => this._recordNotify(a.key, a.change))
+        this._baselineReady = true
+        return
       }
+      const fresh = alerts.filter(a => this._shouldNotify(a.key, a.change))
+      if (fresh.length > 0) this.sendAnomalyNotification(fresh)
+    },
+    _recordNotify (key, change) {
+      this._notified[key] = {
+        dir: change > 0 ? 'bullish' : 'bearish',
+        mag: Math.abs(change),
+        ts: Date.now()
+      }
+    },
+    _shouldNotify (key, change) {
+      const abs = Math.abs(change)
+      if (abs < ANOMALY_RELEASE) {
+        delete this._notified[key] // 滞回释放: 退出线以下才清状态
+        return false
+      }
+      if (abs < ANOMALY_THRESHOLD) return false // 滞回区: 维持状态，不重复报警
+      const prev = this._notified[key]
+      const dir = change > 0 ? 'bullish' : 'bearish'
+      if (!prev || prev.dir !== dir) {
+        this._recordNotify(key, change)
+        return true
+      }
+      // 同方向: 仅"幅度明显扩大 + 过了冷却期"才升级报警
+      if (abs - prev.mag >= ESCALATE_STEP && Date.now() - prev.ts >= NOTIFY_COOLDOWN) {
+        this._recordNotify(key, change)
+        return true
+      }
+      return false
     },
 
     detectAnomaly (key, change) {

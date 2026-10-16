@@ -836,6 +836,19 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 
 实现落点见同目录 `backtest_bridge_plan.md`（TDD 先行）。代码落点：`app/agent/chain/backtest_bridge.py` ＋ `app/agent/tools/finance/auto_bt_tools.py`（**不**塞进现有 `backtest_tools.py`）＋ `skills/auto-backtest/` ＋ overlay 三行钩子 ＋ 守卫（桥不 import auto 写者、不碰四张表、作业目录不得位于 `strategies/`）。
 
+> **施工回填（2026-10-15，双泳道已建成；署名：Trae agent / backtest_bridge_plan·Task 9 批次F）**：
+> 上面的设计与缺口分析已全部落地（9 任务，批次A-E；施工中的计划修订 v2-v6 见 `backtest_bridge_plan.md` 文末；改进 A~N 逐条锚点见 `backtest_bridge_plan.md` §0）。设计者只需知道以下**与计划初稿不同的终态结构与不变量**：
+> 1. **overlay 三钩子**（批次A）：`strategies/__init__.py` 的 `_resolve_yaml_path`（`_yaml_doc` 的路径解析统一走它）与 `_import_overlay_modules`（`autodiscover` 尾部，模块名 `qd_overlay_<stem>` 防撞 sys.modules；AST 静态预检 key 必须 `agentbt_` 前缀——不 exec 就能拒；exec 失败 `sys.modules.pop` 清残留，防"命中即永不重试"）；`evaluate.py::_overlay_yaml_path`（core 不反向 import strategies，自带薄实现——刻意的双份路径逻辑，非漂移）。
+> 2. **桥核心 v4 修正**：existing 载体 key 单一事实源 = `carrier["key"]`（`strategy_key` 参数仅作回退，`carrier.get("key") or strategy_key`）；proposal 形状校验前移 Phase1（畸形入参不落任何盘）；`_assert_guards` 上移 **mkdir 前**（写域白名单先于任何写盘）；作业目录包含判断以 `os.sep` 锚定（`strategies_backup` 类兄弟目录不误拒）；`backtest_cli._build_report` 补 `meta` 纯字段透传（`report["meta"]` 回读 git_sha/effective_params 契约闭环）；`_manifest_is_stale` 判死超期 running（崩溃残留不锁桥）；posix `start_new_session` 杀树不误伤桥自己；scope=codes 空 codes 直接拒绝（堵 MAX_CODES 静默绕过）。
+> 3. **载体规整单源**（批次C，v5 根修）：`backtest_bridge.parse_carrier` 是工具面/技能面共用的唯一入口——分发、days 归一、形状校验只此一份，技能 `run.py` 不再有降级副本（半③档不再静默路由成 existing）。失败形态统一 finance 域约定**裸 `{"error": ...}`**（`_fn_adapter._to_output` 单键判据才置 success=False；双键 `{"ok","error"}` 会把失败误标成功）。
+> 4. **源码守卫单源**（批次D）：`tests/_ast_guard.py::_ast_violations(source, *, import_prefixes, call_names, package)`——import 前缀边界匹配 + 调用名（Attribute/Name）断言 + 相对 import 按 package 解析（解析不了 = fail-closed）；三静态 import 形态全闭环。svc CLI 守卫 3 个全部 AST 级（docstring 解释权恢复，改进 N 兑现）。
+> 5. **svc 泳道与口径诚实**（批次E）：manifest 以 `lane` 字段区分双泳道、`_spawn_and_wait` 共用；`backtest_svc_cli.py` 只调 `run_strategy_snapshot`，persist_run/ensure_storage_schema 仅存于 docstring（零落库是铁律不是开关）；market 枚举单源 = `app/data_sources/factory.py::SUPPORTED_MARKETS`（7 市场公开 frozenset，工厂加市场自动跟进，桥不硬编码）；`cost_model` 口径标注——显式 `0` = 零费率毛收益、`None` = 引擎默认，summary 记 `source`，不造隐式费率默认值；svc 结论按「探索性参考」进 answer（问责边界在工具 docstring，`lane=svc` JSONL 可过滤）；user_id 全链透传（工具→桥→snapshot spec→CLI→Resolver，CLI spec 驱动故不加 argv）。
+> 6. **不变量**：`services/backtest.py` **零改动**（桥只读消费，回填时已核实零引用桥/钩子符号）；测试终态 `tests/test_backtest_bridge.py` 23 例 / `tests/test_auto_bt_tools.py` 24 例 / `tests/test_auto_overlay_hooks.py` 8 例，各自独立全绿（venv 解释器、backend 根 cwd，不与现网基线混跑判成败）。
+> 7. **执行域钉死**（改进 F，终态约束）：一期 `exec_engine="daily"`——双泳道回测引擎执行域固定 daily（桥签名默认值即 `"daily"`，`backtest_bridge.py` 作业入口注明"由调用方保证"），intraday/auto 的 1m 精修路径取数缓存行为未验证，二期验证只读后再放开；manifest/summary 记 `exec_engine` 供审计。
+> 8. **claim 闭环归属**（改进 G，终态裁定）：**桥不记 claim**——回测结论不直接写 claims 表，agent 把结论写进 answer，由主请求 finalize 流程经 `chain/intake.record_decision`（闸门→提取→落库）自动接住；JSONL 只留 `conclusion_ref`（=session_id）作关联。svc 泳道结论按「探索性参考」表述（`lane=svc` 可在 JSONL 过滤），不与 auto 泳道结论同权重进 T+N 判定闭环。⚠ 澄清：上文立项稿数据流图中「（可选）§5.4 记一条 claim」字样已被改进 G 终态裁定取代——桥不记 claim，主流程接住，该行仅存历史价值。
+> 9. **E/A/I 落点补充**：`apply --strategy-dir <作业overlay> --apply` 是唯一物化通道（禁的是活树 apply；`.history` 备份随 `--strategy-dir` 落在作业目录内）；摘要只搬 `stats`，**桥绝不重算指标**（口径单源 `core.backtest._summary`）；子进程固定 `cwd=backend_api_python` 根（CLI 的 `.env` 读取与 `python -m` 模块解析都依赖它）。
+> 10. **状态澄清**：§5.7 回测桥自 2026-10-15 起为**已建成终态**（本章标题及 §8 配置表中「设计态/未接线」表述仅存历史价值）；§8 表中回测桥 env 默认值与代码不符——以 `backtest_bridge.py` 常量区为准：`QD_BT_MAX_DAYS=365` / `QD_BT_TIMEOUT=900` / `QD_BT_MAX_CONCURRENT=1` / `QD_BT_JOB_TTL_DAYS=7`（`QD_BT_MAX_CODES=50` 不变），表值 120/50/120/1 系立项稿预填，勿按表配置。
+
 ---
 
 ## 6 精巧处
@@ -2015,6 +2028,7 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
   - **回归**：全量 `tests/` **676 → 716 passed / 4 skipped**；设计机检
     **100/100 OK / 偏离率 0.0%**（新增 A21/A22 守"这两个文件应已归档"）。
 - 2026-10-15 **§5.7 回测桥数据流复核**：立项稿的 `proposal.apply` / 活 `strategies/` 落盘 / 同进程 `run_all` 违反「不污染其它回测链路」。改为子进程 `backtest_cli` + 作业目录 overlay；全盘走技能（能力层 60s 不够）；工具不塞进现有 `backtest_tools.py`。施工清单：`backtest_bridge_plan.md`。
+- 2026-10-15 **§5.7 回测桥施工回填（终态）**：双泳道 9 任务建成（批次A-E；施工中计划修订 v2-v6 见 `backtest_bridge_plan.md` 文末，与初稿差异的终态细节见 §5.7 末「施工回填」块）。要点：overlay 三钩子（`_resolve_yaml_path`/`_import_overlay_modules`/`_overlay_yaml_path`，exec 失败清 sys.modules、fail-closed AST 预检 `agentbt_` 前缀）；桥核心 v4 修正（existing 读 `carrier["key"]`、proposal 形状校验前移、`_assert_guards` 上移 mkdir 前、`os.sep` 锚定、`_build_report` 补 meta 透传、`_manifest_is_stale` 判死、posix start_new_session、空 codes 拒 scope=codes）；`parse_carrier` 载体规整单源（工具/技能两面收敛）+ 失败形态统一裸 `{"error"}`（finance 域 `_fn_adapter` 单键判据）；AST 守卫单源 `tests/_ast_guard.py::_ast_violations`（import_prefixes/call_names/package，相对导入解析 + fail-closed，svc CLI 守卫 3 个全 AST 级）；svc 泳道（manifest `lane` 字段/`_spawn_and_wait` 共用/`backtest_svc_cli.py` 零落库/工具 `agent_backtest_svc`）+ market 枚举单源 `data_sources/factory.py::SUPPORTED_MARKETS`（7 市场，不硬编码）+ `cost_model` 口径标注（显式 0=零费率毛收益 vs None=引擎默认）+ svc 结论「探索性参考」+ user_id 全链透传。不变量：`services/backtest.py` 零改动；测试 `test_backtest_bridge.py` 23 例 / `test_auto_bt_tools.py` 24 例 / `test_auto_overlay_hooks.py` 8 例各自独立全绿。署名：Trae agent / backtest_bridge_plan·Task 9（批次F）。
 
 ---
 

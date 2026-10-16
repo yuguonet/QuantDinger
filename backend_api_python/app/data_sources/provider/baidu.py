@@ -244,6 +244,11 @@ class BaiduDataSource:
 
     线程安全性:
       - 纯标准库 HTTP，线程安全
+
+    ⚠ 环境相关（2026-10 实测）:
+      finance.pae.baidu.com 对非浏览器流量返回 HTTP 403 {"msg":"hit risk"}
+      （isCaptchaEnabled=true，风控拦截，非代码问题）。当前环境下本源不可用，
+      依赖 Coordinator 多源自动降级；如长期 403 建议在部署侧评估是否保留本源。
     """
 
     name = "baidu"
@@ -259,8 +264,10 @@ class BaiduDataSource:
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W", "1M"},
         "kline_batch": True,
         "kline_batch_priority": 50,
-        "quote": True,
-        "quote_priority": 50,
+        # 实测(2026-10): quote 端点 finance.pae.baidu.com 返回 403 hit risk（风控），
+        # 行情通道不可用；K线(日/周) 稳定可用。故只声明 kline 能力，
+        # 避免被调度为行情源后白等超时再回退。
+        "quote": False,
         "batch_quote": False,
         "hk": False,
         "markets": {"CNStock"},
@@ -276,6 +283,10 @@ class BaiduDataSource:
         "1W": "week",
         "1M": "month",
     }
+
+    def prepare(self) -> bool:
+        """百度是纯 HTTP 源，无 cookie / 服务器探测等前置依赖，直接就绪。"""
+        return True
 
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 200,

@@ -1316,6 +1316,7 @@ import { listExchangeCredentials } from '@/api/credentials'
 import { getNotificationSettings } from '@/api/user'
 import { baseMixin } from '@/store/app-mixin'
 import request from '@/utils/request'
+import { readUserPrefs, writeUserPrefs } from '@/utils/uiPrefs'
 import TradingRecords from './components/TradingRecords.vue'
 import PositionRecords from './components/PositionRecords.vue'
 import StrategyTypeSelector from './components/StrategyTypeSelector.vue'
@@ -1380,10 +1381,6 @@ export default {
     showAssistantGuide () {
       if (this.$route.meta && this.$route.meta.scriptStrategiesOnly) return false
       return !this.assistantGuideDismissed
-    },
-    assistantGuideStorageKey () {
-      const userId = this.$store.getters.userInfo?.id || 'guest'
-      return `trading-assistant-guide-dismissed:${userId}`
     },
     strategyFormWrapClass () {
       const classes = ['strategy-form-modal']
@@ -1895,7 +1892,17 @@ export default {
   methods: {
     restoreAssistantGuidePreference () {
       try {
-        this.assistantGuideDismissed = window.localStorage.getItem(this.assistantGuideStorageKey) === '1'
+        let dismissed = readUserPrefs('guide').assistantDismissed === true
+        if (!dismissed) {
+          // 旧版裸 localStorage key 一次性迁移 (命中即提升并删旧键)
+          const legacy = `trading-assistant-guide-dismissed:${this.$store.getters.userInfo?.id || 'guest'}`
+          if (window.localStorage.getItem(legacy) === '1') {
+            dismissed = true
+            writeUserPrefs('guide', { assistantDismissed: true })
+            window.localStorage.removeItem(legacy)
+          }
+        }
+        this.assistantGuideDismissed = dismissed
       } catch (e) {
         this.assistantGuideDismissed = false
       }
@@ -1903,7 +1910,7 @@ export default {
     dismissAssistantGuide () {
       this.assistantGuideDismissed = true
       try {
-        window.localStorage.setItem(this.assistantGuideStorageKey, '1')
+        writeUserPrefs('guide', { assistantDismissed: true })
       } catch (e) {}
     },
     goToStrategyTab () {
