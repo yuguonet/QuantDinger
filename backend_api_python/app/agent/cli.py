@@ -128,10 +128,10 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
     """
     from app.agent.message_queue import submit
 
-    print(f"\n[会话] Session: {session_id}")
-    print(f"[对话] Message: {message}")
-    print(f"[wrench] 模式: task | 技能: {len(_import_agent()[2])} 个")
-    print("-" * 50)
+    print(f"\n[会话] Session: {session_id}", flush=True)
+    print(f"[对话] Message: {message}", flush=True)
+    print(f"[wrench] 模式: task | 技能: {len(_import_agent()[2])} 个", flush=True)
+    print("-" * 50, flush=True)
 
     # 2026-09-14：原先 300s 是硬编码，多阶段任务跑到一半就被掐断
     # （实测 phase #1 单阶段就 188s，4 阶段必然超时，日志里只看到 TimeoutError，
@@ -174,7 +174,10 @@ async def _run_chat(message: str, session_id: str = "cli", _future_sink: list = 
             future.cancel()
             content = f"[run_error] 超过 {_timeout}s 未完成"
             break
-    print(f"\n{content}")
+    # ★ flush=True 必需（2026-10-16 实测根因）：stdout 走管道/重定向时为**块缓冲**
+    # ⇒ 不 flush 的话答案要等**进程退出**才可见，用户会误判成"被收尾（C3P）阻塞"。
+    # ① 的结果先出本身是好的（agent 返回后立刻到这里），卡住的是缓冲区。
+    print(f"\n{content}", flush=True)
     return content
 
 
@@ -313,6 +316,13 @@ def main():
         from app.agent.message_queue import init_workers
         init_workers(4)
         asyncio.run(_run_chat(args.message, session_id))
+        # ① 结果先出：收尾链在后台线程里（C3P 实测 80~155s）。此处显式等一次，
+        #   否则 `os._exit` 会把本轮落库/追责/案例一起带走（2026-10-16 结构性实证）。
+        try:
+            from app.agent.qd_aftercare import wait_tail_grace
+            wait_tail_grace()
+        except Exception:
+            pass
         # 单次消息模式：跑完即退（见 _flush_and_exit 说明——否则会被数据源线程池拖住）
         _flush_and_exit(0)
     else:
@@ -332,14 +342,20 @@ def main():
             nonlocal _ctrl_c_count
             _ctrl_c_count += 1
             if _ctrl_c_count >= 2:
-                print("\n 强制退出!")
+                print("\n 强制退出!", flush=True)
+                # ① 收尾保护：给了上限（默认 12s），超时即放弃；用户是有意强退
+                try:
+                    from app.agent.qd_aftercare import wait_tail_grace
+                    wait_tail_grace()
+                except Exception:
+                    pass
                 os._exit(0)
             try:
                 from app.agent.message_queue import request_stop
                 request_stop(session_id)
             except Exception:
                 pass
-            print("\n⚠ 已请求停止；再按一次 Ctrl+C 强制退出")
+            print("\n⚠ 已请求停止；再按一次 Ctrl+C 强制退出", flush=True)
 
         print(f"\n[机器人] QuantDinger Agent CLI")
         print(f"[会话] Session: {session_id}")
@@ -353,7 +369,7 @@ def main():
                     _ctrl_c_count = 0  # 每轮重置
                     message = input("You> ").strip()
                 except (EOFError, KeyboardInterrupt):
-                    print("\n 再见!")
+                    print("\n 再见!", flush=True)
                     break
 
                 if not message:
@@ -369,7 +385,7 @@ def main():
                 except KeyboardInterrupt:
                     # 2026-09-17 Ctrl+C 修复：置取消位让 worker 协作中止；
                     # 连续第二次 Ctrl+C 由 _force_exit 直接 os._exit（计数不再被清零）
-                    print("\n⚠ 已请求中断（再按一次 Ctrl+C 强制退出）")
+                    print("\n⚠ 已请求中断（再按一次 Ctrl+C 强制退出）", flush=True)
                 except Exception as e:
                     print(f"\n 异常: {e}")
                     import traceback
@@ -386,6 +402,11 @@ def main():
             asyncio.run(_interactive_loop())
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass  # 退出期信号，忽略
+        try:
+            from app.agent.qd_aftercare import wait_tail_grace
+            wait_tail_grace()          # 正常退出（/quit、EOF）也等一次，有界
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

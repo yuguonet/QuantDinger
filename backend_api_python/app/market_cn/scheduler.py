@@ -12,7 +12,7 @@ import logging
 import time as _time
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -259,11 +259,6 @@ def _refresh_daily():
 def _refresh_policy():
     from app.market_cn.china_market import refresh_policy
     refresh_policy()
-
-
-def _refresh_backfill_15m():
-    from app.data_sources.backfill_db import run_15m
-    run_15m()
 
 
 def _refresh_realtime_snapshot():

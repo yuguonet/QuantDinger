@@ -415,6 +415,9 @@ def test_5_trace_events():
         {"content": "结论：贵州茅台现价 1688.0 元（来源：get_demo_quotes）"},
     ])
     agent.run("看看茅台")
+    # 收尾链默认异步（QD_TAIL_ASYNC=1，2026-10-16）：run_finish 在后台线程落盘，
+    # 直接读文件会与后台赛跑 ⇒ 必须先 wait_tail() 再读（同步模式此调用是 no-op）。
+    agent.wait_tail()
     path = agent.trace.path
     lines = path.read_text(encoding="utf-8").strip().splitlines()
     events = [__import__("json").loads(x) for x in lines]
@@ -518,9 +521,20 @@ def test_8_context_awareness():
     user_texts = [m["content"] for m in agent.messages if m.get("role") == "user"]
     check("两轮对话同上下文", any("茅台" in t for t in user_texts) and any("自选是什么" in t for t in user_texts))
     sys_msg = next(m["content"] for m in agent.messages if m.get("role") == "system")
-    idx = sys_msg.find("当前时间")
-    val = sys_msg[idx + 4:idx + 12].lstrip(":：;； ") if idx >= 0 else ""
-    check("系统模板注入当前时间", idx >= 0 and val[:1].isdigit(), sys_msg[:120])
+    # 【F9 2026-10-17】system prompt 每会话只 seed 一次、跨轮冻结（见 base.py
+    # first_turn），故 `now` 交由**本轮任务文本**动态注入（qd_tool_face.
+    # _dynamic_context_text）；system 只保留「当前时间」指引语。
+    check("系统模板保留当前时间指引", "当前时间" in sys_msg, sys_msg[:120])
+    hit = ""
+    for blob in (m["content"] for m in agent.messages
+                 if m.get("role") in ("user", "system")):
+        i = blob.find("当前时间")
+        if i >= 0:
+            cand = blob[i + 4:].lstrip(":：;； \n]】")
+            if cand[:1].isdigit():
+                hit = cand[:24]
+                break
+    check("本轮任务动态注入当前时间", bool(hit), hit or sys_msg[:120])
     check("原版 context_usage 预算感知开启", agent.config.show_context_usage is True)
     check("compact 上下文压缩可用", "compact" in agent.tool_registry.list_tools())
 
@@ -1952,6 +1966,9 @@ def test_34_case_memory_wiring():
         ]), agent_config={"tools": [],
                           "tool_functions": [get_demo_quotes, place_demo_order, run_shell]})
         asyncio.run(_svc34.chat("帮我分析一下贵州茅台600519", session_id="s34"))
+        # 收尾链默认异步（QD_TAIL_ASYNC=1，2026-10-16）：_record_case 在后台线程，
+        # 不等就检查 _recorded 会与后台赛跑 ⇒ 先 wait_tail()（同步模式 no-op）。
+        _svc34._get_agent("s34").wait_tail()
         _ag34 = _svc34._get_agent("s34")
         _rep = getattr(_ag34, "last_prefetch_report", {}) or {}
         check("案例块进入注入留痕（kind=case）", "case" in (_rep.get("injected_kinds") or []),
@@ -2270,7 +2287,11 @@ def test_38_exec_skill_dispatch_card():
           'run_skill(name="market-screener"' in card and "full_path" in card, card[:120])
     check("卡片含入口清单与 read_skill 兜底",
           "入口：" in card and 'read_skill(name="market-screener")' in card, card[:120])
-    check("卡片是卡片不是正文（≤600 字符）", len(card) <= 600, str(len(card)))
+    # 阈值重校（2026-10-16）：卡片于 10-12 补「空结果纪律」、10-14 补「非空结果纪律」，
+    # 正文外置到 prompts/dispatch_card.md，实测 market-screener 745 / strategy-debug 806 字符。
+    # 600 是 10-12 前的旧预算（未含两条纪律）；900 仍远小于最短执行型技能正文
+    # （strategy-debug SKILL.md 2803 字符），「卡片 ≪ 正文」的判据不变。
+    check("卡片是卡片不是正文（≤900 字符）", len(card) <= 900, str(len(card)))
 
     # ②b 空结果纪律（2026-10-12 补，防再断线）：D-18 的「run_skill 空结果 → 模型回退
     # 主对话硬跑 6 个取数工具」是**声明了没接线**的老账——开发纪律第 15 条早已写明
@@ -2302,9 +2323,11 @@ def test_38_exec_skill_dispatch_card():
                                          "..", "prompts", "qd_system.txt"),
                           encoding="utf-8").read()
         _sec2 = _sys_txt39.split("## 重活分发", 1)[1].split("\n## ", 1)[0]
-        check("qd_system.txt §重活分发含非空结果纪律（直接交付 + ≤2 轮补取）",
+        # 口径订正（2026-10-16）：prompt 侧（qd_system.txt:95 与 dispatch_card.md:6）均为
+        # 「≤1 轮」（对最终可买 Top1 调 inspect_stock），测试旧值「≤2」为 10-14 首版遗留。
+        check("qd_system.txt §重活分发含非空结果纪律（直接交付 + ≤1 轮补取）",
               "非空结果纪律" in _sec2 and "禁止" in _sec2
-              and "inspect_stock" in _sec2 and "≤2" in _sec2, _sec2[-200:])
+              and "inspect_stock" in _sec2 and "≤1" in _sec2, _sec2[-200:])
     except Exception as _e39:
         check("qd_system.txt §重活分发非空纪律可读", False, f"{type(_e39).__name__}: {_e39}")
 
@@ -2419,9 +2442,13 @@ def test_39_skill_weight_multiplier():
 def test_40_c3p_wiring_and_r2_guard():
     """v5 **P2 接线**验收（2026-10-13）：C3P 的 ②③ 段真的接进生产链路了吗。
 
-    背景（v3 附录 F 偏差核对）：`evidence.build_evidence()` / `aggregator.aggregate()` /
-    `aggregator.record_pair()` **生产代码零调用方**，`case_memory.record_case(..., evidence=)`
-    参数就绪却没人传 ⇒ `p_final` 从未被真实产出、Δp 一条都没落过。
+    背景（v3 附录 F 偏差核对）：`evidence.build_evidence()` / `aggregator.aggregate()` 早期
+    **生产代码零调用方**，`case_memory.record_case(..., evidence=)` 参数就绪却没人传
+    ⇒ `p_final` 从未被真实产出、Δp 一条都没落过。
+    ★ **2026-10-18 复核已更新**：该偏差已修复——`chain/c3p.py:437` 现调用
+    `aggregator.record_pair()`（agent 推理时自动记 pair），`data/pairs/pairs_2026-10.jsonl`
+    已累计 128 条（10-13→10-18 每日生成）。故「record_pair 零调用方」描述**已过时**，
+    勿据此误判 calibration 管道为死代码（见项目「判死代码硬流程」）。本用例仍守接线事实不依赖此描述。
 
     本用例守五件事（都是"静态可证"的接线事实，不依赖网络与 DB）：
       ① `chain/c3p.py` 存在且可导入；

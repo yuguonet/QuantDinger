@@ -14,6 +14,9 @@ system: |-
 
 # 工具预选 — user 模板（str.format：query/already/catalog/history/max_tools）
 # 字面花括号已写成 {{ }}，format 后 JSON 示例才是单层 {}
+#   ★ {skills}（2026-10-17 skill 进预选）**贴在工具目录标题行行首**：技能段必须
+#     排在工具目录**之前**（方法论先行，用户裁定）。空串时该行与改造前逐字一致
+#     ⇒ v9 逐键对拍基线**零登记**（非空时由 Python 侧带尾换行拼进来）。
 user: |-
   用户问题：
   {query}
@@ -21,7 +24,7 @@ user: |-
   已常驻可直接调用、**不需要再选**的工具：
   {already}
 
-  候选工具目录（每行：工具名 | 说明 | 参数）：
+  {skills}候选工具目录（每行：工具名 | 说明 | 参数）：
   {catalog}
   {history}
   只输出 JSON，不要解释、不要代码块：

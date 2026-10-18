@@ -7,10 +7,13 @@ sync_index_fflow.py — A股主要指数大盘资金流同步 (kline_index_fflow
 
 数据源: EM fflow/kline (klt=1, 1分钟, 当日240根)
   - host 优先级: push2(实时, 秒级延迟) → push2delay(延迟镜像, ~15分钟滞后)
-    2026-09-12 实测: push2/push2his 对本机 IP 级封锁 (5 种 TLS 指纹全 curl 56 RST,
-    push2delay 同指纹畅通 → 非指纹问题); host 回退使封锁解除后自动升级实时
-  - 必须走 curl_cffi (app.data_sources.provider.eastmoney._em_get):
-    东财 push2 CDN 对 urllib TLS 指纹 (JA3) 封锁, edge101 指纹可通过
+    2026-09-12 实测: push2/push2his 对 urllib/requests TLS 指纹 (JA3) 封锁
+    (RemoteDisconnected 无状态码), curl_cffi edge101 指纹可通过
+  - 2026-10-18 重修: 原依赖的 app.data_sources.provider.eastmoney._em_get 随该
+    模块于 10-16 被移除（部署网络 IP 封锁），import 失败导致 9 指数全断采。
+    实测本机 curl_cffi edge101 直连 push2 HTTP 200 + 240 根，故在脚本内重建
+    同款指纹封装 _em_get（不再依赖 provider 层）；push2delay 实测 RST 不通，
+    保留仅作部署网络下的回退位。
   - 仅返回当日 240 根 → 每日增量即全量, 断采不可回补 (只能向前攒)
   - 日级历史: --backfill 走 push2his fflow/daykline (lmt=0 多年, akshare 同款参数),
     写为每日 15:00 单行 (当日累计=日级值); **需在用户本机终端跑** — push2his 对
@@ -70,6 +73,8 @@ TABLE = "kline_index_fflow"
 # f52~f56 净流入字段 → 库列名 (累计值, 元)
 NET_COLS = ["main_net", "small_net", "mid_net", "big_net", "super_net"]
 # host 优先级: 实时主站优先 (秒级), 封锁时自动落延迟镜像 (~15分钟滞后)
+# 2026-10-18 实测: push2 (edge101 指纹) HTTP 200 通; push2delay RST 不通,
+# 保留仅作部署网络下的回退位
 FFLOW_HOSTS = [
     "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
     "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get",
@@ -86,25 +91,56 @@ def _to_secid(symbol: str) -> str:
     return ("1" if suffix == "SH" else "0") + "." + code
 
 
+def _em_get(url: str, timeout: float = 15, retries: int = 3) -> Optional[str]:
+    """东财 GET — curl_cffi edge101 TLS 指纹封装，返回响应文本，失败 None。
+
+    2026-10-18: 原 app.data_sources.provider.eastmoney._em_get 随该模块被移除，
+    本脚本 import 失败导致指数资金流全断。实测本机 curl_cffi edge101/chrome120
+    直连 push2 HTTP 200 + 240 根，requests 裸连 RemoteDisconnected（JA3 封锁）。
+    故在脚本内重建同款封装，不再依赖 provider 层。
+    """
+    import time as _t
+    try:
+        from curl_cffi import requests as _cr
+    except ImportError:
+        print("    [fflow] curl_cffi 未安装 (pip install curl_cffi)")
+        return None
+    # 东财 CDN 对 urllib/requests TLS 指纹 (JA3) 封锁 (RemoteDisconnected 无状态码),
+    # curl_cffi edge101 指纹可通过。 Referer 必须带 (quote.eastmoney.com);
+    # UA 不覆盖 — edge101 自带 UA 与指纹一致 (2026-10-18 00:50 实证配置)。
+    # 注意: 东财另有 IP 级风控 (09-12/10-16/10-18 均实测到全指纹 RST 的封锁期),
+    # 封锁期内任何配置都通, 需等待恢复 (通常小时级)。
+    headers = {"Referer": "https://quote.eastmoney.com/"}
+    last_err = None
+    for i in range(retries):
+        try:
+            s = _cr.Session(impersonate="edge101")
+            r = s.get(url, timeout=timeout, headers=headers)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                _t.sleep(1.5 * (i + 1))
+    print(f"    [fflow] _em_get 重试 {retries} 次失败: {repr(last_err)[:100]}")
+    return None
+
+
 def fetch_fflow(symbol: str) -> Optional[list]:
     """EM 1分钟资金流。返回 [{time, main_net, small_net, mid_net, big_net,
     super_net}] (净额为当日累计, 元; time 为 bar 起始时刻), 失败 None。"""
     import json
-    try:
-        from app.data_sources.provider.eastmoney import _em_get
-    except ImportError as e:
-        print(f"    [fflow] 依赖导入失败: {e}")
-        return None
+    txt = None
     for base in FFLOW_HOSTS:
         url = (base
                + "?lmt=0&klt=1&fields1=f1,f2,f3,f7"
                + "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
                + f"&secid={_to_secid(symbol)}")
-        txt = _em_get(url, timeout=15, retries=3)
+        txt = _em_get(url, timeout=15, retries=2)
         if txt:
             break  # 任一 host 成功即用 (实时优先, 封锁自动落 delay)
     if not txt:
-        print("    [fflow] 拉取失败 (全部 host _em_get None)")
+        print("    [fflow] 拉取失败 (全部 host 无响应)")
         return None
     try:
         d = json.loads(txt)

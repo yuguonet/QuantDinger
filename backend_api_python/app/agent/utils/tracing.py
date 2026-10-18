@@ -64,11 +64,22 @@ _AGENT_DIR = Path(__file__).resolve().parent.parent  # utils/ → agent/
 _DEFAULT_TRACE_FILE = "traces/agent_runs.jsonl"
 
 
-def _trace_file_path() -> Path:
-    """解析 AGENT_TRACE_FILE：绝对路径原样使用，相对路径锚定 app/agent/。"""
-    raw = (os.getenv("AGENT_TRACE_FILE") or "").strip() or _DEFAULT_TRACE_FILE
+def anchored_path(env_name: str, default_rel: str) -> Path:
+    """AGENT_*_FILE 类路径解析：绝对路径原样使用，相对路径锚定**本包目录**（app/agent/）。
+
+    2026-10-18 抽为公共函数：原先 `_trace_file_path` 与 `_eval_dump_path` 各写一遍
+    同样的三行锚定逻辑（EvalWorker 健康探针落盘是第三个消费者）——两处以上重复按
+    项目纪律应收口成一个接口。锚定理由（CWD 漂移实踩坑）见 `_trace_file_path`
+    历史注释：同一份配置会因启动位置不同写到两个文件。
+    """
+    raw = (os.getenv(env_name) or "").strip() or default_rel
     p = Path(raw).expanduser()
     return p if p.is_absolute() else (_AGENT_DIR / p)
+
+
+def _trace_file_path() -> Path:
+    """解析 AGENT_TRACE_FILE：绝对路径原样使用，相对路径锚定 app/agent/。"""
+    return anchored_path("AGENT_TRACE_FILE", _DEFAULT_TRACE_FILE)
 
 
 def _jsonl_enabled() -> bool:
@@ -95,11 +106,9 @@ _EVAL_CORPUS_MAX = 200_000  # 观测语料总长上限（grounding 溯源用，�
 
 def _eval_dump_path() -> Optional[Path]:
     """解析 AGENT_EVAL_DUMP：未设置返回 None（关闭），相对路径锚定 app/agent/。"""
-    raw = (os.getenv("AGENT_EVAL_DUMP") or "").strip()
-    if not raw:
+    if not (os.getenv("AGENT_EVAL_DUMP") or "").strip():
         return None
-    p = Path(raw).expanduser()
-    return p if p.is_absolute() else (_AGENT_DIR / p)
+    return anchored_path("AGENT_EVAL_DUMP", "traces/eval_dump.jsonl")
 
 
 def _eval_route(intent_verb: str) -> str:

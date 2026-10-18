@@ -415,13 +415,25 @@ class QDSkillAdapter:
         lines.append("</available_skills>")
         return "\n".join(lines)
 
-    def list_skills(self) -> List[Dict[str, str]]:
+    def list_skills(self) -> List[Dict[str, Any]]:
+        """技能清单（按 priority 降序）。
+
+        ★ `tools`（2026-10-17 补暴露）：frontmatter 声明的工具**早已加载进
+        `SkillInfo.tools`** 却被本函数吃掉 ⇒ 全仓零消费方（第二个
+        shrink_catalog 式白写元数据）。预选器（preselect.build_skill_catalog）
+        因此盲于技能需求 —— run8 实证：auto-agent 步骤 1 要 `agent_get_kline`，
+        预选没给它 ⇒ 该步骤被静默跳过。这里补出来，供
+        ① 预选目录（技能候选 + 已声明工具）② 声明工具补位 消费。
+        【兼容性】已有消费方（服务侧技能打分 / CLI / flask API / skill_tools /
+        evaluator）只读 name/description/tags/type ⇒ 加键无回归。
+        """
         return [
             {
                 "name": info.display_name,
                 "description": info.description[:200],
                 "tags": info.tags,
                 "type": info.skill_type,
+                "tools": list(info.tools or []),
             }
             for info in sorted(self._skills.values(), key=lambda x: x.priority, reverse=True)
         ]

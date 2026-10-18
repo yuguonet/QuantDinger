@@ -18,6 +18,17 @@ from .news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
+    ⚠️ 与其它技术工具的关系（2026-10-17，防重复取数与口径误读）：
+    · 本工具**内部已自行取数并计算**：实时行情 + 120 日 K 线 + 五维技术快照
+      （ma/macd/rsi/boll/kdj，`score_model=bb5_weighted(...)`）+ 个股情报。
+      与 `get_realtime_quote`/`agent_get_kline`/`technical_analysis` 同批调用时，
+      后三者的取数与技术快照部分是**重复劳动**（费 token，不影响正确性）；仅当
+      需要它们独有的输出（如 technical_analysis 的六维加权分与
+      `score_model=trend_composite(...)` 复合共振口径）时才值得同批调。
+    · 本工具的 `score`（多空五维加权）与 `technical_analysis` 的 `score`
+      （六维加权）**是两套不同评分模型**，分歧是设计使然；引用时必须带
+      `score_model` 身份，不得互相当作同一指标对比或对冲。
+
     Args:
         codes: 股票代码，如 "600066"
         stock_name: 股票名称，可选
@@ -251,7 +262,18 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
 # ── 内联自 analysis_tools.py ──
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:
-    """技术趋势（内部复用）：同 analysis_tools.analyze_trend，仅供 bull_bear_research 内部调用，外部请用 analyze_trend。
+    """技术趋势（内部复用）：五维加权模型（ma/macd/rsi/boll/kdj × _BB_DEFAULT_WEIGHTS），
+    仅供 bull_bear_research 内部调用，外部请用 analyze_trend。
+
+    ⚠️ 与 analysis_tools.analyze_trend 的关系（2026-10-17 澄清）：
+    这不是"过期副本"，而是**独立评分模型** —— 五维加权、校准命名空间
+    `bull_bear_research`（因子名 ma/macd/rsi/boll/kdj 与 _BB_DEFAULT_WEIGHTS
+    同名，A1a 闭环靠此对齐，见 test_v9_factor_weight_keys_20261014.py）。
+    analysis_tools 那份是复合共振模型（共振过滤+背离+量能），**同股同数据
+    给出不同分是设计使然**（各自服务不同消费方）。历史上两个模型输出同名
+    键 `trend_score` 却无身份标识，导致下游报告把 52 vs 17 的矛盾误诊为
+    "因子对冲"——现以 `score_model` 键自证身份修复。禁止为"统一"把本函数
+    改成转调 analysis_tools：那会删掉 bull_bear 的校准模型（降智）。
 
     Args:
         codes: 多股用逗号分隔"
@@ -442,6 +464,9 @@ def _analyze_trend(codes: str) -> Dict[str, Any]:
                 "trend": overall,
                 "buy_signal": buy_signal,
                 "signal_score": signal_score,
+                # 评分模型自证（2026-10-17）：五维加权独立模型，与 analysis_tools
+                # 的复合共振模型（score_model=trend_composite(...)）区分口径。
+                "score_model": "bb5_weighted(ma/macd/rsi/boll/kdj)",
                 "all_signals": all_signals,
                 "data_points": len(closes),
                 # A1a：权重是否来自 qd_agent_weights 校准

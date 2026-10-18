@@ -2,6 +2,17 @@
 
 数据源优先级:
     新浪 → 东财 → TwelveData → akshare(倒二) → yfinance(垫底)
+
+2026-10-18 TwelveData td 映射实测（免费计划，非猜测）:
+  BZ/PL/SI/CL/HG/NG/GC/PA 这批"期货代码"在 TwelveData 上解析成**同名美股**，
+  属于静默假数据（比取不到更糟）：BZ=Kanzhun(BOSS直聘ADR) 16.74、
+  PL=Planet Labs 13.56、CL=Colgate-Palmolive 94.11、SI=Shoulder Innovations
+  18.09、HG=Hamilton Insurance 36.21、NG=NovaGold 6.60。
+  免费计划实测可用: 仅 XAU/USD（黄金现货 ~4164，值域合理）；
+  XAG/XBR/XPT/XPD/HG1 均返回 "available starting with Grow or Venture plan"；
+  WTI = W&T Offshore 股票（又一个同名陷阱）。
+  ⇒ td 映射仅保留黄金，其余置 None，_fetch_td_single 的 `if not td_sym`
+  自然跳过。恢复其余品种需升级套餐并按上方实测结论重填代码。
 """
 from __future__ import annotations
 
@@ -21,42 +32,42 @@ logger = get_logger(__name__)
 COMMODITIES = [
     {
         "symbol": "GC=F", "name_cn": "黄金", "name_en": "Gold", "unit": "USD/oz",
-        "sina": "hf_GC", "eastmoney": "101.GC", "td": "GC",
+        "sina": "hf_GC", "eastmoney": "101.GC", "td": "XAU/USD",
         "tiingo": "xauusd",
     },
     {
         "symbol": "SI=F", "name_cn": "白银", "name_en": "Silver", "unit": "USD/oz",
-        "sina": "hf_SI", "eastmoney": "101.SI", "td": "SI",
+        "sina": "hf_SI", "eastmoney": "101.SI", "td": None,
         "tiingo": "xagusd",
     },
     {
         "symbol": "CL=F", "name_cn": "原油 WTI", "name_en": "Crude Oil WTI", "unit": "USD/bbl",
-        "sina": "hf_CL", "eastmoney": "101.CL", "td": "CL",
+        "sina": "hf_CL", "eastmoney": "101.CL", "td": None,
         "tiingo": None,
     },
     {
         "symbol": "BZ=F", "name_cn": "原油 Brent", "name_en": "Brent Oil", "unit": "USD/bbl",
-        "sina": "hf_BOIL", "eastmoney": None, "td": "BZ",
+        "sina": "hf_BOIL", "eastmoney": None, "td": None,
         "tiingo": None,
     },
     {
         "symbol": "HG=F", "name_cn": "铜", "name_en": "Copper", "unit": "USD/lb",
-        "sina": "hf_HG", "eastmoney": None, "td": "HG",
+        "sina": "hf_HG", "eastmoney": None, "td": None,
         "tiingo": None,
     },
     {
         "symbol": "NG=F", "name_cn": "天然气", "name_en": "Natural Gas", "unit": "USD/MMBtu",
-        "sina": "hf_NG", "eastmoney": "101.NG", "td": "NG",
+        "sina": "hf_NG", "eastmoney": "101.NG", "td": None,
         "tiingo": None,
     },
     {
         "symbol": "PL=F", "name_cn": "铂金", "name_en": "Platinum", "unit": "USD/oz",
-        "sina": "hf_PL", "eastmoney": None, "td": "PL",
+        "sina": "hf_PL", "eastmoney": None, "td": None,
         "tiingo": None,
     },
     {
         "symbol": "PA=F", "name_cn": "钯金", "name_en": "Palladium", "unit": "USD/oz",
-        "sina": "hf_PA", "eastmoney": None, "td": "PA",
+        "sina": "hf_PA", "eastmoney": None, "td": None,
         "tiingo": None,
     },
 ]

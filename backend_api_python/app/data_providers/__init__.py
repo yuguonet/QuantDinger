@@ -31,12 +31,9 @@ CACHE_TTL = {
     "market_sentiment": 21600,       # legacy, 不再直接使用
     # ── 情绪/宏观指标独立 TTL ──
     "sentiment_fear_greed": 14400,   # 4h — 恐贪指数每天更新一次
-    "sentiment_vix": 300,            # 5min — 美股盘中活跃
-    "sentiment_vxn": 300,            # 5min
-    "sentiment_dxy": 600,            # 10min — 美元指数
     "sentiment_yield_curve": 600,    # 10min — 收益率曲线
-    "sentiment_gvz": 600,            # 10min — 金波动率
-    "sentiment_vix_term": 300,       # 5min — VIX期限结构
+    # 已摘除指标的 TTL 键（2026-10-17 DXY；2026-10-18 VIX 族 vix/vxn/gvz/vix_term）:
+    #   sentiment_vix / sentiment_vxn / sentiment_dxy / sentiment_gvz / sentiment_vix_term
 }
 
 _DEFAULT_TTL = 60

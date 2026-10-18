@@ -238,3 +238,45 @@ def test_no_legacy_llm_imports_remain():
                         hits.append(f"{py.relative_to(_LEGACY)}:{i}: {stripped}")
                         break
     assert not hits, "仍残留旧 llm 包引用：\n" + "\n".join(hits)
+
+
+# ── 4. 模型缓存键：extra 可含 dict（F5 收敛后的回归）────────────
+def test_get_model_cache_key_accepts_dict_extra(clean_env, monkeypatch):
+    """extra 里必须能带 dict（如 model_kwargs）—— 主链现在就是这么传的。
+
+    旧实现把 `tuple(sorted(extra.items()))` 直接拼进缓存键，dict 值会让
+    `_MODEL_CACHE.get(key)` 抛 `unhashable type`，整条 chat 链两轮全断
+    （真实探针复现）。改成 `_freeze` 递归冻结后：同 extra 命中缓存、
+    不同 extra 不串味、同值不同插入顺序同键。
+    """
+    created: list = []
+
+    def _factory(_model_name, cfg):
+        created.append(dict(cfg))
+        return object()
+
+    monkeypatch.setattr(unified, "_mimo_get_model", _factory)
+    unified.clear_model_cache()
+    kwargs = dict(
+        provider="openai", model="m1", timeout=120.0,
+        base_url="https://gw.test/v1", api_key="k",
+    )
+    try:
+        a = unified.get_model(**kwargs, model_kwargs={"temperature": 0.1,
+                                                      "max_tokens": 16384})
+        b = unified.get_model(**kwargs, model_kwargs={"temperature": 0.1,
+                                                      "max_tokens": 16384})
+        assert a is b
+        assert len(created) == 1
+
+        c = unified.get_model(**kwargs, model_kwargs={"temperature": 0.7,
+                                                      "max_tokens": 16384})
+        assert c is not a
+        assert len(created) == 2
+
+        d = unified.get_model(**kwargs, model_kwargs={"max_tokens": 16384,
+                                                      "temperature": 0.1})
+        assert d is a
+        assert len(created) == 2
+    finally:
+        unified.clear_model_cache()

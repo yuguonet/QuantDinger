@@ -52,25 +52,30 @@
 
 ### 1.1 要解决的问题
 
-Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（个股分析、全市场筛选、策略诊断、交易确认、通用问答），在 **92 个工具**的面上收敛出当轮最小可用工具集，跑 ReAct 闭环，输出结论，并把可证伪的断言留档、T+N 用真实行情判定。
+Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（个股分析、全市场筛选、策略诊断、交易确认、通用问答），在 **89 个工具**的面上收敛出当轮最小可用工具集，跑 ReAct 闭环，输出结论，并把可证伪的断言留档、T+N 用真实行情判定。
 
 三个硬约束决定了后面所有的架构选择：
 
-> 📌 **本文所有「实测」数字的时点与口径（2026-10-13 统一订正）**
-> - 工具面构成：自发现工具 **53**（common 11 / finance 41 / knowledge 1）+ 能力层 **39** = **92**。
-> - 必注入口径：`CORE_TOOL_DOMAINS = ("common","meta")` ⇒ 注册表内 **11** 个，
->   加上元工具 `web_search`/`format_result`（**2**，走 `_MUST_HAVE` 独立通道、不进注册表）、
->   `update_plan`（**1**）与 mimo 原生 lowercase 目录（bash/read/write/edit/grep/glob/task，**7**）。
->   合计口径约 **21**。**旧文档写「19 个来自注册表」是 P10 清理误注册统计函数之前的数**。
-> - ⚠️ 早期版本的「102 个 / 全量 32,703 字符 / 必注入 7,912」与 §22.4 的「58 个」
->   分属不同时点且口径不一，现全部作废，**以本节为准**。
-> - 工具变少而 schema 反而变大（32,703 → 49,507）：因为 P12 恢复了 finance 的
->   自包含参数（如 kdj 的 m1/m2），单工具 schema 变胖。结论方向**不变且更强**
->   —— 全量下发更不可行，分级与预选的必要性只增不减。
+> 📌 **本文所有「实测」数字的时点与口径（2026-10-18 重测；2026-10-13 版留档见附录 Z）**
+> - **窄口径（QD 自建工具面 = 工具 + 能力层，探针 `tmp/probe_design_drift_*.py` 可复现）**：
+>   注册表 **89** 个（工具 **49** + 能力层 **40**）；必注入 **11** / 按需 **78**
+>   （`CORE_TOOL_DOMAINS=("common","meta")` 域）。
+> - **宽口径（叠加 mimo 原生工具）**：2026-10-17 快照 **101**（必注入 **15** / 按需 **86**）。
+>   ⚠️ 10-17 曾把宽口径 101 与 10-13 窄口径 92 直接相比（"工具数 92→101"）、把宽口径
+>   schema 75,299 与窄口径 49,507 相比 —— 均为**口径混用**（2026-10-18 订正，见附录 Z）。
+>   同口径下 10-13 的 92 → 10-18 的 89，差在 finance 工具净减 4：`indicator_tools`
+>   模块下线（并入 `technical_analysis`）、`backtest_tools` 两工具被 `agent_*` 系列替代，
+>   `auto_bt_tools` 同批新增。**10-18 起正文一律以窄口径为准，宽口径数仅作 10-17 留档。**
+> - **schema 体积（窄口径 2026-10-18 实测）**：全量 **51,572 字符**、必注入 **4,315 字符**。
+>   ⚠️ 2026-10-17 记的全量 75,299 / 必注入 11,281 是**宽口径**（含原生编码家族 schema），
+>   不可与窄口径数相比。**体积口径以本行为准，历史数勿再引用。**
+> - 工具变少而 schema 反而变大（P12 时就有此现象）：P12 恢复了 finance 的
+>   自包含参数（如 kdj 的 m1/m2），单工具 schema 变胖；2026-10-17 又叠加描述增厚。
+>   结论方向**不变且更强** —— 全量下发更不可行，分级与预选的必要性只增不减。
 
 | 约束 | 后果 |
 |---|---|
-| 工具面 **92** 个（工具 53 + 能力层 39）、全量 schema **49,507 字符**（实测） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
+| 工具面 **89** 个、全量 schema **51,572 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
 | 结论里的数字必须可溯源 | 需要 grounding gate（数字溯源拦截） |
 | 用户会问"你上次说的对不对" | 需要追责四表 + T+N 真值判定 + 反哺行为 |
 
@@ -78,7 +83,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 
 | 原则 | 落地形态 |
 |---|---|
-| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **21** 个 / 全量 **92** 个（口径见 §1.1） |
+| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **11** 个 / 全量 **89** 个（窄口径，见 §1.1） |
 | **fail-open 优先** | 预选空手有域兜底、未激活直调就地激活、能力层补位；宁多不可断 |
 | **可追责** | `decisions/claims/resolutions` 三表 + T+N 判定 + 权重反哺 |
 | **只提示、不过滤** | 权重/历史表现只做 hint，不做硬过滤（硬过滤与 fail-open 冲突） |
@@ -91,7 +96,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 ### 1.3 四条关键取舍
 
 1. **删掉自研编排**：旧版 StateGraph + 4 节点 + phase acceptance 全部删除，只保留 mimo 单 ReAct 循环 + 一个 `update_plan` 清单工具。
-   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**92**，口径见 §1.1；⚠️ 此处早期写 102，是已作废旧数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
+   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**89**，窄口径见 §1.1；⚠️ 早期写 102、其后写 92/101 均为历史时点或宽口径数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
 2. **分级是架构不是配置**：框架只在 init 算一次工具定义，我们 override `get_model_query_kwargs` 改成**每轮现算**，否则 `activate_tools` 激活了也不生效 —— 这是整套分层的前提。
 3. **权重只提示不过滤**：硬过滤会让模型在真需要某工具时拿不到它。粒度也只到 domain —— resolutions 不带 tool/skill 归因，硬按 `user_query` 反推"当时用了哪几个工具"是伪精确。
 4. **接入组件前先问"它要几次 LLM 往返"**：本地计算（权重提示 0ms / 实体解析 95ms）与一整轮 LLM 生成（结论格式化 11.7s）是两类东西，评审阶段就要区分，不能等用户说"变慢了"再归因。
@@ -159,25 +164,28 @@ backend_api_python/app/agent/
 ├── message_queue.py      # 统一消息队列(Flask/Cron 共用)
 ├── trace_collector.py    # TraceCollector → qd_agent_traces(root/skill/tool 三层)
 ├── mimo_boot.py          # mimoagent 依赖引导
+├── upstream_compat.py    # ★ mimoagent 内部契约唯一访问口(F15,2026-10-18)：token_stats/
+│                         #   cache_read_tokens/_do_compact/MIMOCODE_CORE_TOOL_NAMES；
+│                         #   缺失=None/False+WARNING(探测+记痕+问责,非兜底)
 ├── constants.py          # 全局常量单一事实源(AGENT_MAX_STEPS 等)
 ├── domain_registry.py    # 跨层分类学注册表（2026-10-14 精简：只留有消费方的 4 字段/4 API；
 │                         #   数据域词典**单源**在 preselect/tool_preselect.py::DATA_DOMAINS）
 ├── log.py
 │
-├── tools/        [38 py]  工具层:顶层 14(含 __init__) + finance 21 + knowledge 3
+├── tools/        [35 py]  工具层:顶层 13(含 __init__) + finance 19 + knowledge 3
 │   ├── tool_discovery.py     # search_tools / list_tools / activate_tools(两级装载)
 │   ├── skill_tools.py        # list_skills / read_skill / run_skill
 │   ├── capability_tools.py   # search_capabilities / call_capability / list_capabilities
 │   ├── memory_tools.py       # remember / recall
 │   ├── format_utils.py       # 元工具 format_result(_MUST_HAVE,不进注册表)
 │   ├── web_search_tools.py   # 元工具 web_search(博查/Tavily/baidusearch/SearXNG 四引擎降级)
-│   ├── _base.py              # Tool ABC + ToolResult + re-export(下划线=非工具)
+│   ├── _base.py              # Tool ABC + ToolResult(含 metadata 槽,F16) + re-export(下划线=非工具)
 │   ├── _provider.py          # ToolProvider 注册表(扫描/注册/查询/元数据)
 │   ├── _schema_gen.py        # OpenAI schema + 「什么是工具函数」判据
 │   ├── _serialize.py         # 结果序列化(TSV/紧凑 JSON/空值剥离)
-│   ├── _fn_adapter.py        # FnToolAdapter:裸函数工具零改动适配 mimo BaseTool
+│   ├── _fn_adapter.py        # FnToolAdapter:裸函数工具零改动适配 mimo BaseTool(F16:from_raw+metadata 合并)
 │   ├── _availability.py      # 启动期工具可用性探测(进系统提示工具地图)
-│   └── finance/(21) knowledge/(3)
+│   └── finance/(19) knowledge/(3)
 │     ※ **扫描规则(2026-10-13 P10)**:文件名以 `_` 开头 = 非工具模块,
 │       扫描器天然跳过。取代已删除的 `_SKIP_FILES` 名单(曾有两份且实测漂移:
 │       mcp 侧漏登记 availability ⇒ 自检函数被暴露成 MCP 工具)。
@@ -193,16 +201,21 @@ backend_api_python/app/agent/
 │     ※ **_pagination.py(444 行)于 2026-10-14 归档 del/deadcode_20261014/**
 │        —— AST 复核(三形式 import + 全仓扫描 + 同名异物判定)确认全仓零引用。
 │        目录树顶层随之 14 → 13。
+│     ※ **finance/ 21 → 19（2026-10-16~18）**：`indicator_tools` 模块整体下线
+│       （并入 `technical_analysis`，见 `_provider.py` 注释）、`backtest_tools`
+│       两工具（run_backtest / get_backtest_history）被 `agent_*` 系列替代；
+│       `auto_bt_tools` 同批新增（§5.3）⇒ 净 -4 工具、-2 文件。
 │
-├── capabilities/ [4 py]  三级能力层(admission.json 准入 **68** → 注册 39)
+├── capabilities/ [4 py]  三级能力层(admission.json 准入 **68** → 注册 40)
 │     ※ **admission.json 就在工作副本里**(2026-10-13 订正:早期注「不在工作副本」
-│       与事实相反)。实测 **71 条目 / 68 准入 / 3 排除 / 29 项让位域内 ⇒ 注册 39**。
+│       与事实相反)。实测 **71 条目 / 68 准入 / 3 排除 / 29 项让位域内 ⇒ 注册 39**(10-13 时点)。
 │       (2026-10-13 晚 P14 又订正:此前写「69 准入 / 1 项导入失败」——那项
 │       `app.market_cn.auto.store:get_signal_by_code` 是**幽灵条目**(函数从未存在),
 │       已改 `admitted:false` + `recheck_note`,故排除数 2→3、准入 69→68。
-│       **零行为变更**:注册数始终 39,它从来没注册上。)
+│       **零行为变更**:注册数当时为 39,它从来没注册上。)
+│       (2026-10-18 基线同步:注册 39→40,为 admission 增长后当前实测,探针 B3。)
 │
-├── chain/        [23 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
+├── chain/        [24 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
 │   ├── claims.py             # 域判定 / 入库闸门 / Claim 提取(纯函数,零 LLM)
 │   ├── intake.py             # record_decision 唯一入口
 │   ├── account_store.py      # decisions/claims/resolutions 持久化
@@ -219,11 +232,15 @@ backend_api_python/app/agent/
 │   ├── calibration.py        # ★ 条件校准与层级部分池化 fit_with_pooling / coef_usable（纯算法）
 │   ├── calib_feed.py         # ★ P3 接线(2026-10-14)：pairs × resolutions → cells → β₀ → coefs
 │   │     消费方 1：chain/c3p.py::_c3p_pipeline（aggregate 的 coefs 实参）
+│   ├── backtest_bridge.py    # ★ §5.3 回测桥(2026-10-18 随 auto-backtest 落地,含预算/钳制/落盘)
 │   └── reset.py / schema.py / store.py / judge_stats.py / skill_brewer.py
 │
-├── skills/       [6 目录]  market-screener / strategy-debug(**含 run.py,可执行**)
+├── skills/       [7 目录]  market-screener / strategy-debug / auto-backtest(**含 run.py,可执行**)
 │                           + auto-stock-analyze / auto-finance-analysis-stock
 │                           / auto-finance-query-stock / auto-agent
+├── exec/        [2 py]  ★ 子进程作业执行器（F26-D1，2026-10-18）：job_runner
+│                         #   kill_tree(杀进程树)/run_job(墙钟+停滞看门狗)/touch_progress；
+│                         #   bridge _kill_tree 已移交（留委托 seam），skill_run 经此出口
 ├── rag/          [6 py, 1230 行]  检索:BGE reranker + pgvector(PgVectorStore) + PG FTS + 聊天历史/关键词
 │     消费方 3:agent.py(_build_retriever 四路线 / _build_reranker)、tools/knowledge/knowledge_tools.py:62、utils/case_memory.py:200
 │     ⚠️ 消费方**全用相对 import**(`.rag.X`) —— 只扫绝对形式会漏成"零引用"
@@ -249,11 +266,11 @@ backend_api_python/app/agent/
 │     ⚠️ 即 D-2「被**旧系统**反向依赖」:摘旧路由会直接断掉定时任务启动
 ├── audit/        [2 py,  106 行] TraceAdapter 执行留痕(root/skill/tool 三层)
 │     消费方 1:qd_agent.py:53 顶层导入,按 `trace_enabled` 实例化
-└── preselect/    [4 py, 1629 行] 预选管线(P9 从 tools/ 迁出):tool_preselect / preselect_stats /
-      │                           preselect_cooc(共现权重 K) / __init__
+└── preselect/    [5 py, 2380 行] 预选管线(P9 从 tools/ 迁出):tool_preselect / preselect_stats /
+      │                           preselect_cooc(共现权重 K) / tool_groups(T7 组注册表,2026-10-17) / __init__
       └─ 消费方 8:qd_preselect.py、qd_tool_face.py、qd_aftercare.py、scripts/qd_smoke.py、
                    tests/{_p9_preselect_baseline,test_preselect_cooc,test_v14_preselect_capability_catalog,
-                   test_v9_preselect_pipeline}.py
+                   test_v9_preselect_pipeline,test_v17i_tool_groups,test_v17j_skill_preselect}.py
 ├── **qd_agent.py 的 P6 拆分产物**(执行核按职责拆开,不是散落的杂物):
 │   ├── qd_tool_face.py       # 工具面 get_model_query_kwargs(每轮现算)/ 启动期预加载
 │   ├── qd_preselect.py       # _maybe_preselect_tools(预选接线)
@@ -277,8 +294,8 @@ backend_api_python/app/agent/
 │                 qd_core_base.txt / qd_system.txt / skill_brew.txt
 │                 skill_revise.md / tool_preselect.yaml / wrapup_summary.md
 │                 evidence_extract.md / verdict_judge.md / skill_engineer.yaml / func_overlap.yaml
-├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 257 项,2026-10-13 实测;旧记 256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
-│                                  qd_bench.py + yaml(25 题)/ qd_dispatch_ab.py / skill_run.py / weekly_panel.py
+├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 258 项,2026-10-18 实测;旧记 257/256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
+│                                  qd_bench.py + yaml(25 题;F19 加 selftest/--num-rollouts)/ qd_dispatch_ab.py / skill_run.py / weekly_panel.py
 └── traces/, data/, tmp/   辅助目录
 ```
 
@@ -299,7 +316,8 @@ backend_api_python/app/agent/
 | `qd_tool_face.py` | 工具面 | ★ override `get_model_query_kwargs` **每轮现算**工具面 —— 整套分层的前提；工具面启动期预加载 |
 | `qd_aftercare.py` | 收尾三件 | `_finish_collector` → `_intake_accountability`（追责入库）→ `_record_case`（经验留痕） |
 | `tools/_provider.py` | 工具注册与扫描 | 扫描判据：文件名以 `_` 开头即跳过（**P10 起**）。⚠️ 早期版本的 `_NOT_TOOLS` / `_SKIP_FILES` / `_ENTRY_NAME_DENY` 三套名单**均已删除**，不要再按旧文档把它们加回来 |
-| `preselect/tool_preselect.py` | 预选 + lint | 加法先于减法；有补位则不得作废（P9 已从 `tools/` 迁出） |
+| `preselect/tool_preselect.py` | 预选 + lint | 加法先于减法；有补位则不得作废。★ 2026-10-17：新增 `build_skill_catalog`（技能目录）/ `parse_skill_field`（skill 字段解析），`parse_plan` 加**关键字** `valid_skills`（不传则不含 skill 键 ⇒ v9 基线形态不变）（P9 已从 `tools/` 迁出） |
+| `preselect/tool_groups.py` | T7 组注册表 | ★ 2026-10-17 新增：data 组成员**从 `DATA_DOMAIN_TOOLS` 派生**（单一事实源）；展开规则 = 单项优先、组间冲突 `disabled` 最严格胜出 |
 | `tools/skill_tools.py` | 技能读写 + 执行分发 | `read_skill` 读方法论；`run_skill` 跑流水线（子进程） |
 | `scripts/skill_run.py` | 执行型技能子进程入口 | 白名单注册表 + fn 白名单 + 参数校验 + 超时击杀 + 产物落盘 |
 | `chain/claims.py` | 追责抽取 | 纯函数；闸门判不出来就拦（宁漏不脏） |
@@ -354,17 +372,24 @@ backend_api_python/app/agent/
 
 ### 3.2 工具面：三级分级 + 分层下发 + 按需降级
 
-| 级 | 定义 | 实测 |
-|---|---|---|
-| **一级 必注入** | `tools/` 顶层 + mimo 原生/元工具 | **21**（注册表 11 + 元工具 `web_search`/`format_result` 2 + `update_plan` 1 + mimo 原生 7，口径见 §1.1） |
-| **二级 域内** | `tools/finance` + `tools/knowledge` | 域内优先于能力层（finance 41 / knowledge 1） |
-| **三级 能力层** | `capabilities/` 准入函数 | 准入 **68** → 注册 **39**（29 项让位给域内） |
+> ✅ **2026-10-17 对齐代码**（本节数字按当日实测重写；历史快照见附录 Z）。
+> 改动实质：分层不再裸读 `QD_ON_DEMAND_TOOLS`，改由 **T7 四态推导链**产出（见本节末）。
+> ⚠️ **2026-10-18 口径分流**：10-17 的 **101 / 15 / 86** 是**宽口径**
+> （`connect_state_counts`，含 mimo 原生工具）；本节计数 10-18 起改以**窄口径**
+> （QD 自建工具面，探针 `probe_design_drift` 可复现）为准：**89 / 11 / 78**。
+> 宽口径数仅作 10-17 留档、不参与判定（§1.1 口径注、附录 Z 2026-10-18 更新）。
 
-- 注册表总量 **92**（工具 53 + 能力层 39）；必注入 **21** + 按需 **71**（**全口径**，含元工具与 mimo 原生）。
-  ⚠️ **两种口径别混**：只数注册表内的子域/能力层，按需是 **81**（=92−11）；
-  加上元工具 2 + `update_plan` 1 + mimo 原生 7 这 10 个「注册表外但必注入」的，按需才是 71。
-- **schema 体积**：全量 **49,507 字符** ⇒ 必注入（注册表 common+meta 11 个）**4,188 字符**。每轮请求都带这一整块，prompt cache 省钱但**不省窗口**。
-- **"域内优先"的三处落实**：① `build_catalog_grouped` 目录分两段、能力层垫底；② lint **R0 能力层让位**；③ `apply_lint(capability_names=)` 排序垫底。
+| 级 | 定义 | 实测（窄口径，2026-10-18） |
+|---|---|---|
+| **一级 必注入** | `tools/` 顶层中 `common`+`meta` 域（宽口径另计元工具/`update_plan`/mimo 原生） | **11** |
+| **二级 域内** | `tools/finance` + `tools/knowledge` | 域内优先于能力层 |
+| **三级 能力层** | `capabilities/` 准入函数 | 准入 **68** → 注册 **40** |
+
+- 注册表总量 **89**（必注入 **11** / 按需 **78**，窄口径）；宽口径（叠加 mimo 原生）10-17 快照为 **101**（必注入 15 / 按需 86）。与附录 Z 早期快照（92 / 21 / 71）的差异见该表。
+- **T2 起的默认降级**：`QD_ON_DEMAND_TOOLS` 默认 **8 个**（`actor,run_skill,task,edit,read,write,glob,grep`）——
+  mimo 原生编码家族实测 30 次工具调用里 0 次被业务用到，白付 9,673 tok/轮（占必注入体积 77.5%）。
+- **"域内优先"的三处落实**：① `build_catalog_grouped` 目录分两段、能力层垫底；
+  ② lint **R0 能力层让位**；③ `apply_lint(capability_names=)` 排序垫底。
 
 > ✅ **① 已于 2026-10-13（P14）修回**。此前它是**代码缺陷**（非设计问题）：
 > `qd_preselect.py` 调 `build_catalog_grouped(defs, dom_names, [])` **第三参传空**，
@@ -376,12 +401,38 @@ backend_api_python/app/agent/
 > 能力层是**域内无覆盖时的唯一兜底**，指针行只报数量、不列名字 ⇒ 模型既无法按名
 > 调用，也会把只能由能力层支撑的交付要素整条删掉。**不可见即不可用。**
 >
-> **代价实测**：预选目录 4,144 → 6,946 字符（**+2,802，+67.6%**），仅发生在预选那一轮；
-> 相对全量 schema 49,507 字符仍是量级优势（§22.4）。取舍结论：**省下的 token 换不来
-> 一条被误删的交付要素**，本项目取"能力可达"而非"省 token"。
 > ②③ 在缺陷期间仍生效，故线上表现为"能力层几乎选不中"而非"完全不可用"。
 
-**按需降级旋钮**：`QD_ON_DEMAND_TOOLS`（默认 `actor,run_skill`）可把必注入工具降级为按需。降级后仍拿得到，三条兜底：
+> ⚠️ **能力层目录已做「组面折叠」（2026-10-17，O2 残留）**：40 行全列 ⇒
+> 「capability（N 个）…例：代表 6 个 + `list_tools(domain='capability')` 检索指针」。
+> P14 的不变量（代表名可见 + 兜底可达）因此保住，同时目录不再随能力层 O(N) 增长。
+> `QD_PRESELECT_CAP_FOLD=0` 回退全列。
+
+**T7 分层推导链（2026-10-17 接线；此前 `QD_TOOL_CONNECT` 是零消费方哑炮）**：
+
+```
+config 基座     on_demand_tools ∈ 名单 ⇒ deferred，否则 resident
+QD_TOOL_CONNECT 覆盖（组级条目先经 preselect/tool_groups.expand_overrides 展开）
+能力层总闸       QD_CAPABILITIES=0 ⇒ 整个 capability 域 disabled
+resident 既有规则 extra_core / 非 FnToolAdapter / CORE_TOOL_DOMAINS ⇒ core
+```
+
+- **四态**：`resident`（常驻）/ `deferred`（注册但延迟暴露）/ `disabled`（不注册、
+  **直调回退仍放行**，见 `execute_action` fail-open）/ `capability`（第四态，专指能力层）。
+- **组注册表单一事实源**：`preselect/tool_groups.py` 的 data 组成员**从
+  `DATA_DOMAIN_TOOLS` 派生**（不另维护名单）；展开规则 = 单项优先、组间冲突
+  `disabled` 最严格胜出。
+- **fail-loud**：非法 state 值 → ERROR 日志 + 登记 `tool_connect_invalid()` + 忽略该条
+  （**不 raise**：这是请求级运行时读取；也**不许静默兜底**成 resident）。
+- **热生效载体**：`_apply_tool_connect()` 挂在 `reset_run_activation()`（每 run 调用）⇒
+  改 `QD_TOOL_CONNECT` 后**下一 run 即生效，无需重启进程**。
+- **口径唯一**：`trace_collector.tool_face_snapshot` 带 `connect_state_counts`
+  （四键）/ `disabled_count` / `deferred_count` / `connect_invalid`。
+  ⚠️ **状态计数 ≠ 层计数**：`connect_state_counts` 是声明视角；`deferred_count` 是
+  面视角（resident 态但按 `CORE_TOOL_DOMAINS` 规则落入按需层的子域工具也算）。
+
+**按需降级旋钮**：`QD_ON_DEMAND_TOOLS`（默认 8 个，见上）可把必注入工具降级为按需。
+`QD_TOOL_CONNECT` 可按单个工具/按组覆盖（更细，见上）。降级后仍拿得到，三条兜底：
 
 1. **分层 fail-open**（`qd_agent.py::execute_action`）：已注册但未激活的工具被直调时**就地激活放行**，不会 `Unknown tool`；
 2. **工具预选目录由 `_on_demand_names` 构建** ⇒ 相关任务首轮就能被点名激活，不产生"search→list→activate"三轮发现；
@@ -394,18 +445,41 @@ backend_api_python/app/agent/
 **为什么不是"让 LLM 裸选工具"**：裸选会让天气问题被塞 8 个股票工具、token +136%、净收益≈0。真根因是**预选输入被 prefetch 污染**（用了含历史个股记忆的增强文本）。
 
 ```
-1 域特征闸门 has_domain_hint()   -- 纯字符串,成本≈0,不命中才跳预选
-2 分级计算 cap/dom               -- ★ 必须在闸门之前算,否则兜底拿不到候选
-3 build_catalog_grouped()        -- 域内段 + 能力层段
-4 LLM 产出 plan {goal, deliverables, tools, step_budget, phases}(带 history_hint)
-5 parse_plan() → 6 lint_selection()(不调 LLM)
+0 域特征闸门 has_domain_hint()   -- 纯字符串,成本≈0,不命中才跳预选
+1 分级计算 cap/dom               -- ★ 必须在闸门之前算,否则兜底拿不到候选
+2 目录预过滤 shrink_catalog()    -- QD_PRESELECT_CATALOG_MAX=24;缩的只是**呈现**,
+                                   合法点名集仍是全量按需层(目录外的名字照样能激活)
+3 build_skill_catalog()          -- ★ 技能目录,**排在工具目录之前**(方法论先行)
+4 build_catalog_grouped()        -- 域内段 + 能力层段(后者已组面折叠)
+5 LLM 产出 plan {goal, deliverables, tools, skill}(带 history_hint / coding_hint)
+6 parse_plan() → 7 lint_selection()(不调 LLM)
      R0 能力层让位(域内已覆盖则裁)
      R1 域词典覆盖补位(加法,高置信)
      R4 零相关裁剪(减法)  R4b 整体作废
      ⚠ 有补位则不得作废
-7 apply_lint()  -- 先加法后减法,清空则保留原面
-8 _finish_preselect()  -- 空手时用 fallback_domain_tools 兜底
+8 _merge_skill_declared()        -- ★ 技能声明工具补位(加法/只补按需层合法名/有上限)
+9 apply_lint()  -- 先加法后减法,清空则保留原面
+10 _finish_preselect()  -- 空手时用 fallback_domain_tools 兜底
 ```
+
+**技能进预选层（2026-10-17）**：预选这一次 LLM 调用**同时**产出「技能 + 工具」。
+技能段由 `build_skill_catalog` 从 `skills.list_skills()` 派生（名 + 场景 + **frontmatter
+声明的工具**），经模板 `{skills}` 槽贴在工具目录标题行**行首**（空串时与改造前逐字一致
+⇒ v9 基线零登记）。三条接线：
+
+1. `skill` 字段（幻觉名丢弃、显式 `null` 尊重、字段缺失才正文扫描兜底）；
+2. 选中技能的**声明工具加法补位**（run8 实证：auto-agent 步骤 1 要 `agent_get_kline`，
+   改造前预选看不见技能正文 ⇒ 该步骤被静默跳过）；上限
+   `QD_PRESELECT_SKILL_TOOLS_MAX=4`（8+4=12=`QD_MAX_ACTIVE_TOOLS` ⇒ 不触发 FIFO 顶掉模型点名），
+   陈旧声明（注册表里没有）进 `skill_declared_unknown` + WARNING，**fail-loud 不静默**；
+3. 补位进来的工具进 lint `protected_names`——R4 的判据是"plan 正文提到过它"，
+   而提到它的是**技能正文**（模型没读到）⇒ 不护住就补了等于没补。
+
+> ⚠️ **run 顺序已变（2026-10-17）**：预选（含技能选择）**前移到 `_prefetch` 之前**——
+> 技能要当强提示传进 `_prefetch` 覆盖关键词 top-1（§3.4），晚了就没效果；
+> `reset_run_activation()` 跟着前移（必须先于预选），`_run_inner` 经一次性标记
+> `_preselect_prerun_done()` 跳过重跑（它内部的 reset 会**清掉**预选激活成果），
+> service 的 `finally` 清标记防跨 run 残留。详见 §4.1。
 
 **实测收益（重任务）**：`stock_screen` 153,960 tok / 6 步 → 43,318 / 2 步（**-72%**）；
 `trade_confirm` 100,150 / 6 步 → 34,976 / 2 步（**-65%**）。
@@ -425,13 +499,20 @@ backend_api_python/app/agent/
 
 | 环节 | 机制 |
 |---|---|
-| **选技能** | 词典分 + 范围信号（有无标的）+ 意图信号；权重仅 tie-break；`_FINANCE_GATE` 防"跑马灯"被注入选股技能 |
+| **选技能** | ✅ **2026-10-17 改为 LLM 语义选择**：预选器从技能目录里点名（`plan.skill`）⇒ 该名经 `skill_hint` **覆盖** `_rank_skills` 的关键词 top-1，且**绕过** `_SKILL_INJECT_MIN`（该阈值防的是**弱关键词**误注大正文，显式点名不属于它要防的情形）。非法/幻觉名 ⇒ 丢弃回落关键词（fail-open，不猜不静默）。`_rank_skills`（词典分 + 范围信号 + 意图信号 + `_FINANCE_GATE`）**降级为 fallback** 保留，未删 |
 | **注入** | 渐进式：`_skill_block` = 正文首段（上限 2200 字符）+ `[技能目录]` + `[按需读取]` 路标。**执行型技能不注正文**：命中 `EXECUTABLE_SKILLS` 时改注**分发卡片** `_dispatch_card()`（≤600 字符门禁） |
-| **去重** | `_skill_seen`（per session）：二次命中只给一行指针，正文不再重复注入 |
+| **去重** | `_skill_seen`（per session，LRU 有容量上限）：二次命中只给一行指针，正文不再重复注入 |
 | **读** | `read_skill(name)` 全文 / `read_skill(name, heading=)` 小节 / `read_skill(name, resource=)` 资源 |
 | **执行** | `run_skill(name, arguments)` → 子进程 `scripts/skill_run.py`（仅执行型技能） |
 
-**执行型技能分发**（`market-screener` / `strategy-debug`）：
+> 📌 **技能 frontmatter `tools:` 声明的是「agent 工具」，不是技能内部函数**
+> （2026-10-17 实锤）：`strategy-debug` 原声明 `why_strategy`/`debug_strategy`/
+> `doctor_auto`——这三个是它 `run.py` 的**子进程导出函数**（`EXECUTABLE_SKILLS`
+> 的 exports 元组），**注册表里没有**。声明它们 = 让预选目录教模型直调不存在的工具
+> （幻觉）。执行型技能的 agent 侧入口只有 `run_skill`。
+> 守卫：`tests/test_v17k_contract_fixes_20261017.py`（声明 ⊆ 注册表∪provider∪准入口）。
+
+**执行型技能分发**（`market-screener` / `strategy-debug` / `auto-backtest`，2026-10-18 起三个）：
 
 ```
 主 agent
@@ -520,6 +601,7 @@ skill/factor/tool/chain 由旧 `evaluator.update_weights`（traces 侧）负责�
 `update_plan` 的清单若收尾时仍留 `in_progress`/`pending`，通常是跑偏/被截断的信号。
 `_plan_lint()` 在 run 收尾落 `plan_lint` trace 事件 + warning，**只告警不拦截**。
 `current_plan` 是 **per-run** 的（与步数同生命周期，run 开头归 `None`）。
+⚠️ **落点（2026-10-15 拆分后）**：`qd_aftercare.py::AftercareMixin._plan_lint`；`qd_agent.py` 只保留 run 主干与 `execute_action`（§2.3）。
 
 ### 3.9 观测计数器（只观测，不改行为）
 
@@ -575,7 +657,7 @@ run 级一次性 few-shot（CBR），填技能酿造的粒度空档。**增益�
 
 | 尺 | 管什么 | 产物 |
 |---|---|---|
-| `scripts/qd_smoke.py` | 回归（不调模型） | **257** 项断言（40 个 test 函数，2026-10-13 晚实测 255/257）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「248 项」「256 项」是更早时点的数，现以 **257** 为准（口径演变见 §9） |
+| `scripts/qd_smoke.py` | 回归（不调模型） | **258** 项断言（40 个 test 函数，**2026-10-18 实测 258/260 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **258** 为准（口径演变见 §9） |
 | `scripts/qd_prompt_eval.py` + `prompt_tasks.yaml` | prompt 行为（真实端点） | 10 任务/35 断言，含规划 5 题 |
 | `scripts/qd_bench.py` + `bench_tasks.yaml` | 能力质量（C） | 25 题五类各 5；五维确定性打分 |
 | `scripts/qd_dispatch_ab.py` | 成本对照（B） | 分发 vs 不分发单变量 A/B；`--rejudge` 不重跑复核 |
@@ -596,20 +678,27 @@ QDAgentService.chat()  (外部经 agent.run_agent 同步入口进入)
   ├── 设 agent.last_user_query = 原始问题(★ 预选只认它,防 prefetch 污染)
   ├── 0 resolvers/bridge.resolve() 在 _run_sync 内调用 → (info, clarify)
   │       └ clarify 非空且 clarify_enabled() ⇒ 短路反问,直接返回(不进执行)
-  ├── _prefetch(resolve_info) → (text, report):记忆/RAG/技能渐进式注入,report 落 trace
+  ├── preselect_prerun()(★ 2026-10-17 前移):reset_run_activation → _maybe_preselect_tools
+  │       └ 产出 plan{goal, deliverables, tools, skill};skill 作 skill_hint 交给下一步
+  ├── _prefetch(resolve_info, skill_hint) → (text, report):记忆/RAG/技能渐进式注入,report 落 trace
+  │       └ skill_hint 覆盖关键词 top-1(非法名回落),执行型卡片点名的工具进 skill_force_tools
   ▼
 QDAgent._run_inner()
   ├── _steps_taken = 0 / current_plan = None     (per-run,不跨请求累积)
-  ├── 1 _maybe_preselect_tools:闸门 → 目录 → LLM plan(带 history_hint)→ lint → activate
-  ├── 2 注入 now / tool_map / tool_availability
-  ├── 3 super().run()  ReAct(每轮现算工具面;未激活直调 → fail-open 就地激活)
-  ├── 4 空结果兜底:LimitsExceeded→可读文案;Empty→轻推一次(独立预算)
-  ├── 5 grounding_gate:数字溯源拦截,最多重试 N 次(独立预算)
-  ├── 6 _plan_lint():计划残账告警
-  └── 7 _finish_collector → _intake_accountability(追责入库)→ _record_case(经验留痕)
+  ├── 1 _preselect_prerun_done()? → 已预跑则跳过(否则 reset + _maybe_preselect_tools)
+  ├── 2 prefetch_force_tools 激活(技能卡片点名的 run_skill 等)
+  ├── 3 注入 now / tool_map / tool_availability
+  ├── 4 super().run()  ReAct(每轮现算工具面;未激活直调 → fail-open 就地激活)
+  ├── 5 空结果兜底:LimitsExceeded→可读文案;Empty→轻推一次(独立预算)
+  ├── 6 grounding_gate:数字溯源拦截,最多重试 N 次(独立预算)
+  ├── 7 _plan_lint():计划残账告警
+  └── 8 _finish_collector → _intake_accountability(追责入库)→ _record_case(经验留痕)
 ```
 
-> ⚠️ **顺序有讲究，别随便挪**：resolver 在最前（歧义要在花钱调工具之前拦截）；weight_hints 在预选时读（要影响工具选择，就得在选之前）。
+> ⚠️ **顺序有讲究，别随便挪**：resolver 在最前（歧义要在花钱调工具之前拦截）；
+> weight_hints 在预选时读（要影响工具选择，就得在选之前）。
+> **2026-10-17 新增一条**：预选必须早于 `_prefetch`——技能要当 hint 传进去才能覆盖
+> 关键词选择；因此 `reset_run_activation` 也一并前移，`_run_inner` 靠一次性标记跳过重跑。
 
 ### 4.2 步数与预算语义
 
@@ -632,6 +721,24 @@ QDAgent._run_inner()
 
 四者**独立 try，失败互不影响**；健康度看 `worker_health.last_weight_feed`。
 ⚠️ 四段各自扫表、各自取数 ⇒ 下编 §22 的 O-1 建议合并为单条日终结算流水线。
+
+**停摆自愈 + 健康探针（2026-10-18 用户裁定 B+C，附录 AJ）**：
+
+- **B 停摆自愈**：worker 线程启动时跑一次 `_post_market_catchup_plan()`——
+  已过 15:30 + 交易日 + `scheduler_task_done("post_market_batch", 今日)` 为假
+  ⇒ **等 `post_market_done` 事件**（批次由 scheduler 主循环在 ~10s 内补跑，
+  单一触发点不破；EvalWorker 不自己跑批次），而不是睡到次日 15:30 错过事件；
+  批次已完成而评估今日未成功（健康落盘有历史成功证据）⇒ **立即补评**。
+  无证据（首次部署/从未跑过）⇒ 不敢补评（`weight_feed` 是 EMA，双跑会双步进）。
+- **B' 消费即清**：`post_market_done` 改为**等到即 clear**（清在消费侧
+  `_wait_post_market_done`，不在 batch 起始侧——后者与 15:30 准点 wake 有竞态）。
+  修复「长跑进程第 2 天起等待恒跳过、15:30 评估与 backfill 赛跑」。
+- **C 健康探针**：`_worker_health` 快照每轮落盘
+  `traces/eval_worker_health.jsonl`（`AGENT_EVAL_HEALTH_FILE` 可改，相对路径
+  锚定 app/agent/）；`probe_worker_health()` 只读判 staleness（上次成功 →
+  下一交易日 15:30 + `QD_EVAL_STALL_GRACE_HOURS` 宽限仍无新成功 ⇒ stalled）；
+  CLI：`python -m app.agent.chain.evaluator --health`（stalled/unreadable ⇒
+  exit 1，宿主 down 时也可从外部判活）。
 
 ---
 
@@ -739,22 +846,27 @@ decisions/claims ──T+N到期──→ resolver.resolve_due_claims()
 ### 5.6 skill/tools 工具流（一次请求内的工具面生命周期）
 
 ```
-① 分层（§3.2）  必注入层(21,每轮必带) / 二级·域内(预选集) / 三级·能力层(39,按需激活)
-② 预选（§3.3）  plan_lint(加法先于减法★) → history_hint(只提示不过滤) → 激活 schema
+① 分层（§3.2）  必注入层(15,每轮必带) / 二级·域内(预选集) / 三级·能力层(40,按需激活)
+② 预选（§3.3）  技能目录前置 + 目录预过滤 → plan(skill+tools) → lint(加法先于减法★)
+               → 技能声明工具补位 → history_hint(按本轮 query 过滤,只提示不过滤) → 激活 schema
 ③ ReAct 循环    每轮 = 必注入 + 已激活 schema + 历史；未激活直调就地激活
 ④ grounding     无依据数字拦截（§3.7）→ 文字结论 → TraceCollector.flush(root/skill/tool 三层)
 
 能力层（三级）供给链：
   capabilities/scanner 全仓扫公开函数（SCAN_TARGETS 显式列 auto 的 hub/store/registry）
-    → admission.json 人工准入（70 项；auto 只放行只读函数）
+    → admission.json 人工准入（68 项；auto 只放行只读函数）
     → loader 导入 + 写操作前缀二次硬拒 + 60s 超时 + >8000 字符落 tmp/capability_output/
     → 注册为 CAPABILITY_DOMAIN（planner 不可选域，只走按需激活）
 
 技能 vs 工具的分界：
   工具 = 一次确定性调用（转调函数，结果回注上下文）
   技能 = 多步编排（子进程 + 白名单 + 产物落盘，§5.3）
-  先例：skills/strategy-debug 把 auto/tools 的 why/debug/doctor 包成 4 个工具
-        （转调 CLI、零第二份规则；chat_why 是其退役前的轻量聊天壳）
+  ★ 二者**在预选层合流**（2026-10-17）：技能目录排在工具目录之前，LLM 一次点名两者；
+    技能的 frontmatter 声明工具是方法论合同，参与工具补位（见 §3.3）。
+    换言之：技能不再是"工具面之外的东西"，而是**工具面的上游约束**。
+  先例：skills/strategy-debug 把 auto/tools 的 why/debug/doctor 包成子进程 4 个导出
+        （零第二份规则；chat_why 是其退役前的轻量聊天壳）——注意这些是**子进程导出**，
+        不是 agent 工具，声明时只写 agent 侧入口 run_skill
 ```
 
 | 坑 | 说明 |
@@ -906,6 +1018,10 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | **管线函数被注册成工具** | ✅ **已由 P10 根治（2026-10-13）**：非工具模块统一改 `_` 前缀（`_base` / `_provider` / `_em_utils` …），扫描器对 `startswith("_")` 天然跳过 ⇒ 目录名即契约。**不再需要任何名单**。⚠️ **旧文档让你"补 `_NOT_TOOLS`"（见 D-3 / O-11 / 附录 F D-6）—— 那是 P10 之前的方案，别照着做，加了等于回退**。新模块不是工具就直接改下划线前缀 |
 | **模块导入失败 = 静默降级** | 只 warning 没人看 ⇒ 落 `_TOOL_MODULE_IMPORT_FAILURES`，由 smoke test_30 断言为空 |
 | **聚合摘除 key 要抹顶层前缀** | `_SUPERSEDED_BY_MERGE` 的 key 用「子目录.模块名:函数名」，否则长名/短名周期命中不一致 |
+| **★ 工具描述就是给 LLM 的契约** | docstring 首行承诺了实现不返回的字段 = 教模型承诺拿不到的数据（2026-10-17 实锤两例：`get_realtime_quote` 承诺换手率/量比/PE/PB/总市值、`get_order_book` 承诺换手率/PE/市值，返回里都没有）。**改实现必须同步描述**；撤承诺要**同时给出路**（该口径去哪个工具取），否则模型只能写"未获取"。守卫对着 `func_to_openai_schema(...)["function"]["description"]` 验 |
+| **★ 声明 ≠ 存在：frontmatter 的 `tools:` 要对着"可调全集"核** | 技能声明的是 **agent 工具**；执行型技能的 `run.py` 导出函数（`why_strategy` 等）**不在注册表里**，声明它们等于制造幻觉。判"死名"要用**三来源并集**（agent 注册表 ∪ `ToolProvider.list_tools()` ∪ `capabilities.load_admitted()`）——⚠️ 单用注册表会因能力层挂载时序**单跑绿全量红** |
+| **★ 读上游内部契约会静默失效（F15）** | `getattr(model, "token_stats", None)` / `hasattr(agent, "_do_compact")` 这类访问，上游改名**不报错、只拿默认值** ⇒ cached 落库恒 NULL（F10）、轮界压缩静默不触发（F12），**无人知**。全部改走 `upstream_compat.py`（唯一入口，探测+记痕+问责）；守卫 `test_v36` 用 AST 禁生产码（`app/agent` 除 `scripts/`）出现这 5 个字段名的读取/导入。结构性 import（`MimocodeAgent` 等）会响亮 ImportError，**不在收口范围** |
+| **★ ToolResult 的 `output` 一字段两用（F16）** | 改造前 `output: Any` 同时承载结构化数据与给模型的文本（`to_str()` 同字段转换）⇒ **trace 记的 ≠ 模型拿到的**。现 `ToolResult.metadata` 承载结构化元数据、`to_str()` 不序列化它；`_fn_adapter` 经 `from_raw()` 构造并把 `result.metadata` 合并进 `ToolOutput.metadata`。改执行出口必须守**逐字等价**（v37 用 13 样本 oracle 冻结改造前后文本） |
 
 ### 7.3 数据库与统计
 
@@ -945,13 +1061,21 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | `QD_PRESELECT_GATE` / `_HINTS` / `_MAX` | 1 / "" / 8 | 域特征闸门与预选上限 |
 | `QD_TOOL_TIER_MODE` | tiered | 分级口径 |
 | `QD_EXTRA_CORE_TOOLS` | "" | 追加必注入工具 |
-| `QD_ON_DEMAND_TOOLS` | `actor,run_skill` | **反向旋钮**：把必注入降级为按需 |
+| `QD_ON_DEMAND_TOOLS` | `actor,run_skill,task,edit,read,write,glob,grep`（8 个） | **反向旋钮**：把必注入降级为按需（config 基座） |
+| **`QD_TOOL_CONNECT`** | "" | ★ **T7 覆盖层**（2026-10-17 接线）：`工具=态` 多条覆盖 config 基座，`;`/`,` 分隔；值域 `resident`/`deferred`/`disabled`/`capability`；非法值 **fail-loud**（ERROR + 登记，不静默）。支持**组级**条目（组表见 `preselect/tool_groups.py`）。例：`get_sector_board=disabled` |
+| **`QD_PRESELECT_CATALOG_MAX`** | 24 | 预选**目录呈现**上限（`shrink_catalog`）。⚠️ 只缩"LLM 能看到什么"，**合法点名集仍是全量按需层**——目录外的名字从正文捞到照样能激活 |
+| **`QD_PRESELECT_CAP_FOLD`** | 1 | 能力层目录**组面折叠**（代表 6 名 + 检索指针）；0 = 回退全列 |
+| **`QD_PRESELECT_SKILL`** | 1 | 技能目录是否进预选。0 ⇒ 无技能段、无 `skill` 字段、无声明补位 ⇒ 与 2026-10-17 前逐位一致 |
+| **`QD_PRESELECT_SKILL_TOOLS_MAX`** | 4 | 技能声明工具的补位上限（`8+4=12` 与激活上限对齐 ⇒ 不触发 FIFO 顶掉模型点名） |
 | `QD_MAX_ACTIVE_TOOLS` / `QD_AUTO_ACTIVATE_MAX` | 12 / 8 | 激活上限 |
 | `QD_CAPABILITIES` | 1 | 三级能力层总开关 |
 | `QD_TOOL_PROBE_LIVE` / `_TTL` | "" / 600 | 启动期可用性探测 |
 | `QD_CONTEXT_WINDOW` / `QD_COMPACT_WINDOW` | 65536 / - | 上下文窗口（统一由 `_context_window()` 读） |
 | `QD_COMPACT_NOTES` / `QD_COMPACT_RATIO` / `QD_COMPACT_THRESHOLD` | - / 0.55 / - | 压缩纪律与触发阈值 |
 | `QD_STEP_LIMIT` / `QD_STEP_SCALE` / `QD_EVAL_STEP_LIMIT` / `QD_EVAL_TIMEOUT` | - / 3 / 8 / 240 | 步数与超时 |
+| **`QD_JOB_STALL_SECONDS`** | -（= 沿用各调用方 timeout） | ★ **F26-D1**（2026-10-18）：`exec/job_runner` 停滞看门狗全局提前杀阈值；目录内任何文件 mtime 算进度信号，超期未更新判死杀树。未设/0/负/非法 ⇒ 不提前杀（纯墙钟）。⚠️ 单产物长作业（技能流水线只在收尾写 result.json）设小了会误杀 |
+| **`QD_SKILL_RUN_TIMEOUT`** | 600 | ★ **F26-D2**（2026-10-18）：`run_skill` 流水线墙钟（秒）；0/负/非法回落 600。到点杀**进程树**（此前 subprocess.run 只杀直接子进程） |
+| **`QD_BENCH_MAX_ROLLOUTS`** | 5 | ★ **F19**（2026-10-18）：`qd_bench run --num-rollouts N` 的 N 上限（预算闸门，防误触烧钱）；未设/0/负/非法 ⇒ 告警回落 5。N 超上限 ⇒ 触服务前拒绝（exit 2）。每轮仍受 `AGENT_RUN_TOKEN_BUDGET` 约束 ⇒ N 轮总成本 ≈ N × 单轮 |
 | `QD_WEIGHT_TTL` / `QD_FEED_MIN_SAMPLES` | 600 / 5 | 权重快照 / 慢调最小样本 |
 | `QD_RESOLVER` / `QD_RESOLVER_CLARIFY` | 1 / 1 | 实体解析总开关 / 只反问 vs 只解析 |
 | `QD_PROVIDER_MAP` / `QD_CODE_VERSION` | - / unknown | 供应商映射 / 版本标识 |
@@ -990,20 +1114,22 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | 项 | 实测 |
 |---|---|
 | `compileall app/ scripts/` | ✅ 通过 |
-| `qd_smoke.py` | ✅ **257 项**（40 个 test 函数）；本机 `--with-env` **255 passed / 0 failed / 2 skipped**（2 skip 均为 `del/` 归档缺件）。⚠️ 口径演变：P12 时点写「256 项」、附录 F C-14 写「256 项 / 254 pass」，**2026-10-13 晚实测 255/257**，以本行为准 |
+| `qd_smoke.py` | ✅ **258 项**（40 个 test 函数）；**2026-10-18 实测 258/260 passed · 0 failed · 2 skipped**（2 skip 均为 `del/` 归档缺件）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259，**2026-10-18 为 258/260** |
 | `qd_prompt_eval --validate` | ✅ 10 条任务 / 35 项断言；plan_* 断言 **17/19** |
 | `qd_bench` | 25 题；真实端点首跑 **71.7**（coverage 81.5 / grounding 86.8 / claims 38.0 / structure 62.6） |
 | `qd_dispatch_ab` | 首跑成本比 **0.889**（未达 0.40，见 D-18）、质量Δ +0.5 |
-| v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`；2026-10-14 P3 接线新增 `test_v5_calib_feed.py` 21 条 + `test_v5_c3p.py` 接线守卫 3 条 ⇒ 138 → 162） |
-| 全量 `tests/` | **716 passed / 4 skipped**（**2026-10-14 O-11 收口后实测**）。⚠️ 口径演变：P12 后曾为 **761 passed / 4 skipped**；P16 归档 6 个 `test_v6_*` 到 `del/agentcore_retired_20261013/tests/` 后降为 652；2026-10-14 P3 接线 +24 ⇒ 676；同日 O-11 三项收口再 +41（新增 `test_v6_skill_seen_lru.py` 15 / `test_v6_d11_whitelist_knobs.py` 13 / `test_v6_cron_boundary.py` 13），同时因 `_pagination` 归档删除 1 个参数化用例 ⇒ **716**。更早期版本写「529 passed」是 P12 之前的数 |
-| 工具面 | 注册表 **92**（工具 53 + 能力层 39）；必注入 **21** / 按需 **71** |
-| schema 体积 | 全量 **49,507 字符** → 必注入（common+meta 11 个）**4,188 字符** |
-| 技能 | **6** 个目录，其中可执行 **2** 个 |
+| v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`） |
+| 全量 `tests/` | ✅ **1301 passed / 4 skipped / 0 failed**（**2026-10-18 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ） |
+| 工具面 | 注册表 **89**（窄口径：工具 **49** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **11** / 按需 **78** |
+| 技能 | **7** 个目录，其中可执行 **3** 个（`market-screener`/`strategy-debug`/`auto-backtest`） |
 | `formatters/` | 不在生产包内（已归档 `del/agent_formatters_20261001/`） |
 
 ⚠️ smoke 输出里的 Traceback 多来自 `chain/store.py save_tree` 在无 `DATABASE_URL` 时的 fail-open ERROR（smoke 不加载 `.env`）—— 已知、非故障，别误判。
 
 **跑法**：`cd backend_api_python && python app/agent/scripts/qd_smoke.py`（**不要用 `-m`**，原因见 §7.1）。
+**全量 pytest**：`python -m pytest -q --ignore=del`。⚠️ ① 不加 `--ignore=del` 会收集归档目录并因
+`app.agentcore` 已退役而 collection error（`Interrupted`，易误判"全崩"）；② **跑全量期间不要改源文件**
+——`inspect.getsource` 类守卫会读到半新半旧的文件而假红（2026-10-17 实踩：单跑绿、全量红）。
 
 ---
 
@@ -2162,3 +2288,527 @@ HOLDS = {"T+1":1, "T+3":3, "T+5":5, "1W":5, "2W":10,
 `chain/kline_feed.py` 是本次为收敛「K 线取数」第 3 处重复而新建的统一接口
 （另两处：`evaluator._get_actual_return` 内联、`skills/market-screener/common.py::fetch_kline`）。
 `evaluator` 的迁移**未在本批做**（它刚在 P0-3 修过、有守卫在守，动它风险大于收益），记为遗留项。
+
+---
+
+## 附录 Z · 工具面口径漂移登记（2026-10-17，只登记不改正文）
+
+> 署名: QuantDinger 会话 · 2026-10-17
+> 出处: `tmp/v3_toolface_vs_t7_comparison_20261017.md` §七（T7 选型对账时实测）。
+> 纪律: 本文正文的历史数字**不擅改**（那是各轮改造时的实测快照）；漂移在此
+> 登记，代码现状以本节 + 探针实测为准。
+
+| 项 | 正文数字（历史快照） | 代码现状（2026-10-17 实测） | 漂移原因 |
+|---|---|---|---|
+| `QD_ON_DEMAND_TOOLS` 默认 | `actor,run_skill`（§3.2/§8，2 个） | `actor,run_skill,task,edit,read,write,glob,grep`（`qd_config.py:47`，8 个） | T2 编码工具移出必注入后扩了默认名单，文档未同步 |
+| 必注入层工具数 | 21（§3.2） | 15（探针 `tool_face_ready.core_count`，run6） | mimo 原生工具集与注册表口径随版本收敛 |
+| 注册表总量 | 92（§1.1，工具 53 + 能力层 39） | 101（同一次快照 `connect_state_counts` 之和：93 resident + 8 deferred） | 能力层准入名单随本地 admission.json 增长 + 原生工具计入 |
+
+**同步动作（本轮已做）**：`qd_config.tool_connect()` 的 on-demand 派生改调
+`_tool_connect_defaults()`（消灭读口与 `QDAgentConfig.default_factory` 的
+None-vs-"" 双语义）；`trace_collector.tool_face_snapshot` 新增
+`connect_state_counts / disabled_count / deferred_count / connect_invalid`
+四字段（§8.6 口径唯一验收），归档可直接还原当轮生效态。
+
+**教训归类**：本文 §7.4「prompt 与代码会漂移」的又一实例——三处漂移全部
+发生在"改造成功但文档数字是旧快照"的模式上。处置惯例即本条：**追加登记，
+不回改历史数字**。
+
+**✅ 2026-10-17 13:50 更新：本表三项已在正文对齐**（用户裁定"更新设计文档对齐代码"）。
+§3.2 表、§8 `QD_ON_DEMAND_TOOLS` 默认值（8 个）、§9 工具面口径（101 / 15 / 86）
+全部改为当日实测；**本表保留为历史快照与漂移原因记录**（含"不回改历史数字"的
+纪律说明本身——该纪律适用于"实验结论"，不适用于"可实测的当前口径"）。
+
+**✅ 2026-10-18 更新：窄/宽口径分流 + 设计机检全量对账**（探针
+`tmp/probe_design_drift_20261013.py` 实跑 99 项：86 OK / 13 DRIFT ⇒ 逐项对账后
+探针基线与正文同步，复跑 0 DRIFT）：
+
+- **口径分流（本表最大的一条）**：10-17 对齐时把**宽口径 101**
+  （`connect_state_counts` = 93 resident + 8 deferred，含 mimo 原生工具）与 10-13
+  **窄口径 92** 直接相比并归因"工具数 92→101"，schema 49,507→75,299 同病 ——
+  均为口径混用。10-18 起正文（§1.1/§3.2/§9）以**窄口径**为准（探针可复现）：
+  **89 = 工具 49 + 能力层 40；必注入 11 / 按需 78；schema 51,572 / 4,315**。
+  宽口径数（101/15/86、75,299/11,281）留档为 10-17 快照。
+- **chain/ 23 → 24 py**：`backtest_bridge.py`（§5.3 回测桥，随 auto-backtest 落地）——
+  §2.2 目录树漏记该文件，已补。
+- **skills 6 → 7 目录**：`auto-backtest/`；可执行技能 **2 → 3**（`EXECUTABLE_SKILLS`
+  第三键，`skills.auto-backtest.run`）。
+- **finance 工具 41 → 37、tools/finance 21 → 19 py**：`indicator_tools` 模块整体下线
+  （并入 `technical_analysis`）、`backtest_tools` 两工具被 `agent_*` 系列替代；
+  `auto_bt_tools` 新增。tools/ 总 py 37 → 35（§2.2 树头"顶层 14"与注释"13"的
+  自相矛盾一并订正为 13）。
+- **能力层注册 39 → 40**：admission 增长后的当前实测（探针 B3）。
+- **`_plan_lint` 落点 qd_agent.py → qd_aftercare.py**（2026-10-15 拆分）：探针 D10
+  断言随迁；§3.8 已补落点注。
+- **smoke 项数文内不一致**（§9 写 258 / §3.13 写 257）：统一为 **258**
+  （2026-10-18 实测 258/260 passed · 0 failed · 2 skipped）。
+
+---
+
+## 附录 AA · 2026-10-17 三轮改造的正文对齐清单（skill 进预选 + 契约修复）
+
+> 署名: QuantDinger 会话 · 2026-10-17
+> 出处: `tmp/skill_in_preselect_impl_20261017.md`、`tmp/llm_io_content_analysis_run8_20261017.md` §七
+> 性质: 记录**改了哪些章节、为什么**，便于日后核对"文档说的"与"代码做的"。
+
+| 章节 | 变更 | 触发 |
+|---|---|---|
+| §3.2 | 表与计数改实测（15/86/101/能力层 40）；新增 **T7 四态推导链**小节（覆盖层、组表、fail-loud、热生效、口径唯一）；`QD_ON_DEMAND_TOOLS` 默认 8 个；补能力层**组面折叠**说明 | T7 接线（P0/P1） |
+| §3.3 | 流程图重排（0-10 步）：加**目录预过滤**、**技能目录前置**、**声明工具补位**；`plan` 契约加 `skill`；补 run 顺序变更警示 | skill 进预选 |
+| §3.4 | 「选技能」行改为 **LLM 语义选择 + `_rank_skills` 降级 fallback**；新增 frontmatter 声明语义警示（声明 agent 工具 ≠ 子进程导出函数） | skill 进预选 |
+| §4.1 | 流程图重排：`_prefetch` 之前插入 `preselect_prerun()`；`_run_inner` 第 1 步改为条件跳过 | skill 进预选 |
+| §5.6 | ①必注入 15、能力层 40；②预选链补两环；技能 vs 工具分界补"**在预选层合流，技能是工具面的上游约束**" | skill 进预选 |
+| §7.2 | 新增两条坑：**工具描述即给 LLM 的契约**（撤承诺须给出路）、**声明 ⊆ 可调全集须用三来源** | 契约修复 |
+| §8 | 新增 5 个 env：`QD_TOOL_CONNECT` / `QD_PRESELECT_CATALOG_MAX` / `QD_PRESELECT_CAP_FOLD` / `QD_PRESELECT_SKILL` / `QD_PRESELECT_SKILL_TOOLS_MAX` | T7 + skill |
+| §9 | 基线刷新（全量 **1045/4**、smoke **257/259**、工具面 101/15/86、技能 7 目录/3 可执行）；补全量跑法两条坑（`--ignore=del`、跑批期间不改文件） | 本轮实测 |
+
+**未进正文但已登记的残留**：skill 目录 1,584 字符未压缩；LLM 技能选择未进 evaluator
+权重回路（L2，`_rank_skills` 保留 fallback）；执行型技能 force_tools 补丁与声明
+补位两条激活路径待合并；`get_capital_summary` 表格单位标注与数值不符（输出侧）。
+
+---
+
+## 附录 AB · F20 收口：能力层 doc 派生 + 导入红线守卫取回（2026-10-17，只登记不改正文）
+
+> 署名: opencode · big-pickle（QuantDinger 会话）· 2026-10-17
+> 出处: `tmp/agent_优化合并总账与修复方案_20261017.md`（F20）、`tmp/tool_layer_analysis_20261017.md`
+> 纪律: 同附录 Z —— 正文历史数字**不擅改**（那是各轮改造时的实测快照），收口/漂移在此登记。
+
+本附录关闭 / 变更正文三处（正文原文一律保留）：
+
+| 正文位置 | 原文口径 | 2026-10-17 现状 |
+|---|---|---|
+| **D-9**（`:1921`：doc 全空 → `func_overlap` 分支永不命中） | ⬜ doc 仍全空（71/71） | ✅ **已收口（F20-①）** |
+| **C-3**（`:2014`：P5 导入红线守卫随 P16 归档、现无守卫） | 🔴 现无守卫，重引裸名不会 FAIL | ✅ **守卫已取回（F20-⑤）** |
+| **O-14** 触发条件（`:1724` / `:1791`） | 「工具面**破 120 个**时启动」 | ⚠️ **触发量纲已改（F14）**：由"工具**个数**"改为"schema **总字符数**" |
+
+**① D-9 收口（能力层 doc 派生 · 单一事实源）**
+`admission.json` 的 `doc` 字段从不手填（实测 0/68 条非空），而 `func_overlap.code_judge_pair`
+的「文档共同词」分支要求 cap doc 非空 ⇒ 68 条能力该分支**永不命中**，域内让位只能靠名字清单
+（不是语义）。修法 **不复制文本**（两份文本必然各自漂移）：`loader.load_admitted_meta` 新增
+`_doc_from_entry`，显式 `doc` 优先、否则由人工 `review_note` 派生（截断 160，与工具侧 `_doc_first` 同口径）。
+配套三件：① `fingerprint_inventory` 能力条目哈希**纳入 doc**（否则 `overlap_cache.json` 命中会掩盖修复）；
+② 新增 `func_overlap.summarize_report` 问责摘要（`doc_missing` / `by_reason`），`load_or_build` 在
+`doc_missing>0` 时 `logger.warning` ——「无描述」不再伪装成「无重合」（G4 问责半边）；
+③ `admission.json` 顶层 `note` **append** 口径核对（entries=71 / admitted=68；历史「70 项」按纪律不擅改）。
+守卫：`tests/test_v34_capability_overlap_unlock_20261017.py`（8 例）。
+
+**② C-3 守卫取回（P5 导入红线）**
+从 `del/agentcore_retired_20261013/tests/test_v6_import_modernize.py` 取回 **R2 / R3 / R5 / R6(+R6b)**
++ 行为回归（`chain.context_frame._default_sources()` / `chain.sampler._default_sources()`），
+落在当前 `app/agent` 结构上：零裸名导入 / 零 sys.path 注入（白名单唯 `mimo_boot.py`）/ 单一 module
+实例 / `modpath` 动态名解析规则。**丢弃 R1**（守已退役的 `app.agentcore`，目录不存在）
+**与 R4**（legacy 目录不在 sys.path —— 已由 `test_v6_app_dir_syspath.py` 以子进程级覆盖，不重复造轮子）。
+守卫：`tests/test_v35_import_redlines_20261017.py`（7 例，扫 145 个源文件）。
+
+**③ O-14 触发条件量纲变更（F14 已落地，正文不动）**
+正文 `:1724` / `:1791` 写「触发条件：工具面破 120 个」。F14 已把分级展开做进预选
+（`preselect/tool_preselect.py`：`schema_chars_of` / `_preselect_tier_chars` / `tier_catalog_enabled`，
+env `QD_PRESELECT_TIER_CHARS` 默认 60000，0/负=恒触发），触发判据由"工具**个数**"改判
+"预选目录 schema **总字符数**"。理由（源码注释已固化）：成本真变量是字符数（token），与工具个数只是
+弱相关（描述厚度差异大）—— ⚠️ 2026-10-18 订正：此处「工具 92→101」是**窄口径 92 对宽口径 101 的口径混用**，同口径下为 92→89；schema 49,507→75,299 同为口径混用（窄口径现为 51,572，见 §1.1 口径注）。
+「工具没涨、描述涨胖」正是按个数触发的盲区。
+
+---
+
+## 附录 AC · 4c 收口：F15 上游契约收口 + F16 ToolResult 契约（2026-10-18）
+
+> 署名: WorkBuddy 会话（ex_D2J9tfz2tgUO）· 2026-10-18
+> 出处: `tmp/agent_优化合并总账与修复方案_20261017.md`（F15/F16）、`tmp/批4_剩余项实施总方案_20261017.md` §4
+> 说明: 4c 代码 2026-10-18 00:23–01:04 由前一会话落地但**零登记**；本附录补登记 + 收红（2 个红测根因修复）。
+> 纪律: 同附录 Z —— 正文历史数字不擅改；本附录登记的新结构（新文件/新字段）已同步进正文（§2 拓扑 / §7.2 / §9）。
+
+**① F15-A 入口死代码（低风险）**
+`run.py` 原「插 `app/` 目录 + nanobot 影子注释」已除（`app/nanobot/` 目录早已不存在，与 `app/__init__.py`
+「本文件不得把任何目录塞进 sys.path」自相矛盾）；`gunicorn_config.py` 无任何 sys.path 操作；
+`run.py` 仅剩「插自身目录（backend 根）」且注释已更正。守卫 `test_v36` 两例（入口不插 app/、不引用已删 nanobot）。
+
+**② F15-B 上游契约收口（`upstream_compat.py`，135 行，零 app 内部 import）**
+对 mimoagent 内部实现的访问原本散落 10+ 处、绝大多数 `getattr(obj, "字段", 默认)` 形态 —— 上游改名
+**不报错、只拿默认值**（两个已踩实例：F10 cached 落库恒 NULL、F12 轮界压缩静默不触发）。
+收口 5 类：`token_stats` / `cache_read_tokens` / `_do_compact` / `MIMOCODE_CORE_TOOL_NAMES` /
+（`compaction_threshold_tokens` 是我方 config 字段，不属上游契约）。语义 = **探测 + 记痕 + 问责**：
+缺失返 `None`/`False`/`()` + `_warn_once` WARNING + `contract_warnings()` 审计口 —— 不是兜底。
+生产链已全改走：`llm.py:346`、`qd_aftercare.py:257/380`、`qd_budgeting.py:50`（`invoke_compaction`）、
+`preselect_cooc.py`/`qd_config.py`（`core_tool_names()`）。守卫 `test_v36`（9 例）：AST 双形态
+（`getattr/hasattr` 字符串字段 + 属性 Load）扫 `app/agent/**` 除 `scripts/`（探针脚本不在生产链）；
+结构性 import（`MimocodeAgent`/`ToolOutput` 等）会响亮 ImportError，**不在收口范围**（写在守卫 docstring）。
+
+**③ F16 ToolResult 契约（`metadata` 槽 + `from_raw` 工厂）**
+`ToolResult` 原三字段（success/output/error），`output: Any` 同时承载结构化数据与模型文本
+（`to_str()` 同字段转换）⇒ trace 记的 ≠ 模型拿到的。现：`metadata: dict = field(default_factory=dict)`；
+`to_str()` **不序列化 metadata**；`_fn_adapter.py:108` 改走 `ToolResult.from_raw(result).to_str()`
+并把 `result.metadata` 合并进 `ToolOutput.metadata`（上游侧本就分栏，我方跟上）。
+守卫 `test_v37`（11 函数 / 23 例）：含 **13 样本逐字等价 oracle**（改造前后 `to_str()` 文本一致）——
+动 101 个工具唯一执行出口的前提；另钉 tracing 两 stream 分工与 `trace_collector` 误称修复
+（`AgentTracer` → 真实类名 `AgentTraceRecorder`）。
+
+**④ 4c 收红：`test_v35` R3 守卫三机制恢复（2026-10-18，根因修复非兜底）**
+4c 收尾重写 v35 时丢了三样（对照归档原件 `test_v6_import_modernize` R3 实证），把 10 个**正当**的
+直跑引导误报为违规：① `_is_entry_script` 豁免（原件 `:203`）—— 8 个 `scripts/*.py` 恢复豁免；
+② `__main__` 块**体语句**全收（原件 `ast.walk(node)`）—— `skill_brewer.py:734`（就在 `__main__` 里）恢复；
+③ 「被 `__main__` 调用的函数体同属入口语义」（原件 `:210-219`，注释原话即 scanner 的
+`_bootstrap_path()`）—— `scanner.py:50` 恢复。生产代码**零改动**（根因在守卫不在代码）。
+另修 v35 docstring 归档引用带 `.py` 触发通用幻觉引用守卫（4b 踩坑项被 reintroduce；引用改不带 `.py`）。
+新增 2 例钉死三机制（`test_main_block_ids_covers_three_entry_semantics` / `test_syspath_guard_exempts_entry_scripts`）。
+
+**⑤ 回归基线（2026-10-18 实测）**
+全量 pytest **1169 passed / 4 skipped / 0 failed**（1135@4b + v36 9 + v37 23 + 收红 2，计数闭合）；
+qd_smoke **258/260 · 0 failed · 2 skipped**（`_fn_adapter` 改动零回归）。§9 已同步。
+
+---
+
+## 附录 AD · 批 4d：F26 执行范式统一（D1 抽 job_runner + D2 skill_run 作业目录）（2026-10-18）
+
+> 署名: WorkBuddy 会话（ex_D2J9tfz2tgUO）· 2026-10-18
+> 出处: `tmp/agent_优化合并总账与修复方案_20261017.md`（F26）、`tmp/批4_剩余项实施总方案_20261017.md` §5
+> 用户裁定（总账附录 D）：F26 **只做 D1+D2**（D3「bridge 接看门狗」不做——bridge 是 2026-10-15 终态）。
+
+**① D1：`app/agent/exec/job_runner.py`（新目录，单一事实源）**
+- `kill_tree(proc)`：从 `chain/backtest_bridge.py` **原样移交**（Windows `taskkill /T /F`，
+  posix `killpg`，失败回落 `proc.kill()`——回落理由见源码注释）。bridge 只留**委托 seam**
+  `_kill_tree → kill_tree`：`tests/test_backtest_bridge.py` monkeypatch `B._kill_tree` 的接缝不变，
+  删函数会让那个替身静默失效。
+- `run_job(cmd, *, job_dir, timeout_s, stall_s, env, cwd, poll_s, check_rc)`：Popen（Windows
+  `CREATE_NEW_PROCESS_GROUP` / posix `start_new_session`）→ 墙钟超时杀树抛 `TimeoutExpired`；
+  停滞看门狗（新增）：作业目录**任何文件 mtime** 算进度信号（manifest 也是），超 `stall_s`
+  未更新判死杀树抛 `JobStalled`；**空目录 = 无信号 ⇒ 明示退回墙钟**（logger.info，不静默）。
+  返回 `(stdout, stderr, returncode)`；`check_rc=True`（缺省）时非 0 退出抛 `RuntimeError`；
+  `check_rc=False` 把 rc 交还调用方 —— 供 **stdout 结构化错误通道**型子进程用。
+  ⚠ 冒烟 B② 实锤的回归：skill_run 的 rc≠0 路径 stdout 仍是给模型的 ok=False JSON
+  （"未知参数"带 `hint`/`report_guide` 重试指引），父进程必须照常解析；若由 run_job
+  统一抛错，指引被吞成一句"启动失败" = 降智。run_skill 因此传 `check_rc=False`。
+- env `QD_JOB_STALL_SECONDS`：全局提前杀旋钮，**缺省沿用调用方 timeout**（= 改造前墙钟语义）。
+  ⚠ 单产物长作业设小了会误杀（模块头已警告）。
+- skill_run 路径由此**首次获得杀树能力**——此前 `subprocess.run(timeout=600)` 超时只杀
+  直接子进程，孙进程残留（TDX 心跳线程史）。
+
+**② D2：`skill_run` 作业目录 + manifest（对齐 bridge 范式）**
+- 父进程（`tools/skill_tools.py::run_skill`）：建 `tmp/skill_output/jobs/<ts>_<name>_<rand>/`
+  + `manifest.json`（state=running、ts、timeout_s）→ 经 `run_job` 派活（env 传
+  `QD_SKILL_JOB_DIR`）→ 终态回写 manifest（done/failed/timeout/stalled，ts 保持起始时刻）。
+- 子进程（`scripts/skill_run.py`）：`touch_progress` 在**调用前后**各留一次进度戳；
+  全量结果写 `<job>/result.json`（预览截断不影响全量）；`full_path` 指向它。
+- 人工直跑（无 `QD_SKILL_JOB_DIR`）保持旧扁平输出 `tmp/skill_output/<ts>_<name>.json`
+  —— 文档化直跑用法，不是兜底。
+- `QD_SKILL_RUN_TIMEOUT`（缺省 600）替换原硬编码；返回字典新增 `job_dir` 键（可观测）。
+
+**③ 未做（明示）**：bridge 侧不接看门狗（D3 用户裁定不做）；skill 作业**无 GC/TTL**
+（旧扁平输出同样无 GC，非回归；bridge 的 `gc_jobs` 是长寿命审计件，语义不同，不硬搬）。
+
+**④ 守卫**：`tests/test_v38_job_runner_20261018.py`（15 例）：kill_tree 委托+实现移交 AST、
+停滞判死/不误杀、**真子进程**超时杀树（孙进程 finally 不执行 = 真被杀）、无信号明示退回墙钟、
+bridge 结构六件未动、非 0 退出抛错 / `check_rc=False` 交还 rc、stall env 三态、
+run_skill 建目录+三终态 manifest、**结构化错误通道透传**（冒烟 B② 回归防护）、
+child 写 result.json/last_progress、无 env 回落扁平输出。
+
+## 附录 AE · 批 4e：F18 qd_smoke 迁 pytest + F19 qd_bench CLI（2026-10-18）
+
+> 署名: WorkBuddy 会话（ex_D2J9tfz2tgUO）· 2026-10-18
+> 出处: `tmp/agent_优化合并总账与修复方案_20261017.md` 附录 G、`tmp/批4_剩余项实施总方案_20261017.md` §6
+
+**① F18：qd_smoke 40 个函数级用例进 pytest（壳测试，一行不改 qd_smoke）**
+- 新增 `pytest.ini`（markers：`slow`=qd_smoke 套件必须串行 / `integration`）。
+- `tests/test_v30_qd_smoke_suite.py`：模块自省 `test_\d+_*` 清单（qd_smoke 新增 test_41
+  自动跟上，无第二份名单）；PASS 切片拦截（`check()` 结果里有 False 即红，`[FAIL]` 明细
+  随 captured output 呈现）；异常不吞；module 级 fixture 复刻 `__main__` 的 trace 自清。
+- `tests/test_v31_qd_smoke_wrapper_20261018.py`（4 例）：marker 注册 / 壳覆盖全部模块用例 /
+  注入 FAIL 壳变红 / 真子进程 `-m` 过滤（exit 5 vs 收集到）。
+- ⚠️ **进程全局判据与外来污染**（全量首跑 2 红定位出的真问题，详见总账附录 G）：
+  test_29①/test_30③ 是进程全局断言（脚本直跑 fresh 恒真）；pytest 全量里排前的文件
+  （test_v9 函数内 import `exp_grind`、v32 收集期 import `qd_bench`）按 R3 入口脚本豁免
+  把 `app/agent` 插进 sys.path。壳的处置：**导入期差集断言**（qd_smoke 自身链引入 legacy
+  目录 ⇒ 收集期报错，P5 真回归绕不过）+ **每例前摘除外来条目**（还原 fresh 前提，
+  广播一次）+ v32 改 fixture 延迟导入。生产代码零改动；掩盖面两条路都响
+  （① 收集期断言 / 包内非入口模块插入走 test_v35 R3 全仓 AST 扫描）；脚本直跑仍是更严口径。
+  **遗留**：6 个入口脚本（exp_grind/qd_bench/qd_prompt_eval/qd_dispatch_ab/weekly_panel/
+  llm_probe）的 AGENT_DIR 模块级插入建议按 qd_smoke P5 同款清理——R3 豁免使其合法，
+  故不属回归，列为下批候选。
+
+**② F19：qd_bench CLI 扩展**
+- `selftest` 子命令：内置 fixture（好/坏/缺项三档答案 + 标注对）六项判据——可分辨性 /
+  确定性 / must 逐条可判（缺一项精确减 1）/ agreement 自比 100% / 容差内外可判 /
+  无交集 n=0。零网络零外部依赖（改评分函数后先跑它；红了 = 标尺自己坏了）。
+- `run --num-rollouts N`：`_max_rollouts()` 上限闸门（`QD_BENCH_MAX_ROLLOUTS` 缺省 5，
+  非正/非法告警回落；N 超限**触服务前** exit 2 拒跑——fail-loud 防烧钱）；
+  `_aggregate_rollouts` 总体/分项/逐任务三层 mean±std（单次分差先和噪声比）；
+  逐轮各落一个 run（`_r{i}` 后缀，trend/diff/agreement 直接消费），聚合记录另存
+  `runs/rollouts/`（trend/diff 不读：统计记录 ≠ 可比 run）。
+- 纯函数 `agreement_rate(a,b,tol)->(rate,mad,agree,n)` 从 cmd_agreement 抽出（输出逐字不变）。
+- 守卫 `tests/test_v32_qd_bench_cli_20261018.py`（13 例，覆盖方案 6.2 五条验收）。
+
+**③ 回归（2026-10-18 实测）**：全量 pytest **1241 passed / 4 skipped / 0 failed**
+（1184@4d + 44 + 13，计数闭合）；qd_smoke 脚本直跑 **258/260 · 0 failed · 2 skipped**（逐字基线）。
+
+## 附录 AF · 批 4f：F21 标准对照臂 blackbox_runner（2026-10-18）
+
+> 署名: WorkBuddy 会话（ex_D2J9tfz2tgUO）· 2026-10-18
+> 出处: `tmp/agent_优化合并总账与修复方案_20261017.md` 附录 H、`tmp/批4_剩余项实施总方案_20261017.md` §7.1
+
+**① 定位**：`backend_api_python/scripts/blackbox_runner.py`（scripts 侧跑批工具，**不进 CI**）。
+把同一批能力任务分别喂给外部 blackbox 编码 agent（opencode/claude_code/codex CLI）与
+主链 QD agent，用**同一把尺**（qd_bench.score_answer）打质量分——qd_dispatch_ab 回答
+"分发通道值不值"（内生对照），本工具回答"我们和外部通用编码 agent 差多少"（外部基线）。
+
+**② 复用不重写**（测试 `is` 断言钉死同一函数对象）：`qd_bench.load_tasks/score_answer`
+（尺）、`qd_dispatch_ab._verdict`（判定）、`_build_service`/`_run_arm`（主链臂装配与
+token delta 口径）。报告 schema 与 qd_dispatch_ab 同构；records 双臂槽位语义一致——
+**dispatch 槽 = 被测方（外部 CLI），inline 槽 = 基线（主链 QD）**；质量Δ = blackbox - qd。
+
+**③ 成本维明示不判**（`thresholds.cost_judged=false`）：CLI 不暴露 token ⇒ blackbox 臂
+无 tokens 字段 ⇒ `_verdict` 成本比恒 0.0（`float(x or 0)` 机械结果，非"零消耗"）；
+打印与报告一律「—（CLI 无计量）」。成本对照请用 qd_dispatch_ab。
+
+**④ 输出**：preds JSONL（qd_bench preds 格式 ⇒ `qd_bench score --preds` 落 run ⇒
+`diff`/`agreement` 消费）+ 报告 JSON（qd_dispatch_ab 同构，`--rejudge` 换阈值复判）。
+缺后端（PATH 无可执行）⇒ [SKIP] + exit 2 明示，不是失败。
+
+**⑤ 环境事实（2026-10-18 实测）**：Windows npm shim 是 `.CMD`，`shutil.which` 解析出
+带扩展名全路径，而 subprocess 列表形式不过 PATHEXT ⇒ argv[0] 必须用 `which()` 返回值
+（裸名 WinError 2）。本机 opencode 1.19.3 已装但无 provider 认证会挂起 ⇒ 按
+`QD_BLACKBOX_TIMEOUT`（缺省 300）超时记臂失败（设计行为）。命令模板可 env 覆写
+（`QD_BLACKBOX_CMD_<BACKEND>`，`{query}` 占位）。
+
+**⑥ 遗留**：`TraceAdapter.emit` 写全局共享文件 `app/agent/traces/qd_agent_runs.jsonl`
+无跨进程/半写保护——4f 开发期一个被杀的冒烟进程留下撕裂行，毒化 test_5/test_20 的
+全量读取（数据已修复，生产码未动）。候选修法：O_APPEND 单 `os.write` 原子追加 /
+按 run 分文件 / 读者容忍尾部撕裂。属审计路径结构性项，留待专门批次。
+
+**⑦ 守卫与回归**：`tests/test_v39_blackbox_arm_20261018.py`（14 例）；全量 pytest
+**1255 passed / 4 skipped / 0 failed**；qd_smoke 258/260 · 0 failed · 2 skipped。
+
+## 附录 AG · 批 4g：F22 harness 口径对照方案 + 设计机检对账（2026-10-18）
+
+> 署名: WorkBuddy 会话（ex_D2J9tfz2tgUO）· 2026-10-18
+> 出处: `tmp/F22_harness口径对照方案_20261018.md`、`tmp/probe_design_drift_20261013.py`
+
+**① F22 定位（只出方案不动码）**：上游 mimoagent 的 harness 三函数
+（`save_traj` / `_fold_usage` / `rubric_judge`）经全仓检索**本仓零命中** ⇒ 不存在
+"悄悄分叉"，只有"将来要对齐时按哪张口径表对齐"的问题。方案文档给出三张对照表
+（token 统计 / 轨迹序列化 / 评分）与选型建议 **A（口径对照）**：把上游口径写成本仓
+可复现的断言清单（T1–T8），逐条落地，而非搬函数或预埋适配层。B（搬函数）/C（预埋
+适配层）不推荐的理由见方案 §5。
+
+**② 已一致免对部分**：EvalNode 的 `total_tokens`/`cached_tokens` 含在内口径、to_dict
+树、`VERDICT_SCORE`/`COUNTED_VERDICTS` 计分真源（`chain/schema.py`）与上游 reward
+公式结构同构；差异集中在 usage 键名（claude_code 的 `cache_read_input_tokens`/
+`cache_creation_input_tokens` vs codex 的 `cached_input_tokens` 且无 cache_creation）
+与轨迹落盘形态，均已逐行登记出处（2026-10-18 实测）。
+
+**③ 三个待裁点（转用户裁定，方案 §6）**：① 选 A 还是 F22 整体挂起；
+② T8（EvalNode 增加 `schema_version`/`trajectory_format` 字段）是否同批做；
+③ 上游 `_fold_usage` 的按后端 usage 键名差异，仅登记还是预埋适配层（方案建议仅登记）。
+
+**④ 附带：设计机检全量对账（本附录登记，探针属 tmp/ 一次性工具）**：
+`tmp/probe_design_drift_20261013.py` 实跑 99 项 **86 OK / 13 DRIFT** ⇒ 逐项对账
+（chain 24 py、skills 7 目录、可执行技能 3、tools 35/finance 19、注册表 89=49+40、
+必注入 11/按需 78、schema 51,572/4,315、`_plan_lint` 落点 qd_aftercare.py、
+smoke 项数文内统一 258）后同步正文（§1.1/§2.2/§3.2/§3.4/§3.8/§3.13/§9 + 附录 Z
+10-18 更新块）与探针硬编码基线，复跑 **99 OK / 0 DRIFT**。最大一条发现：2026-10-17
+附录 Z 对齐时把**宽口径 101**（connect_state_counts，含 mimo 原生）与**窄口径 92**
+直接相比，属口径混用；10-18 起正文一律以窄口径（探针可复现）为准，宽口径数留档。
+
+## 附录 AH · F22 A 口径对照落地 + T8 序列化锚点（2026-10-18）
+
+> 用户裁定（2026-10-18）：附录 AG 三个待裁点中的 ①②——选 **A 口径对照**、
+> **T8 同批做**；③（上游 `_fold_usage` 按后端 usage 键名差异）按方案建议
+> **仅登记**，不预埋适配层（零消费方的预埋 = 死代码）。
+
+**F22 A = `tests/test_v40_harness_contract_20261018.py`（新文件，19 例）**
+按 `tmp/F22_harness口径对照方案_20261018.md` §3 逐条落地 T1–T8 一致性断言：
+T1 `cached_tokens ≤ total_tokens` / T2 缓存率 ∈ [0,1] / T3 非负 + None≠0 /
+T4 `to_dict→from_dict` round-trip 幂等 / T5 取值域（timeframe 域唯一定源
+`chain/label_spec.HOLDS`，不硬编码）/ T6 `score_answer` 与 `agreement_rate`
+尺度 / T7 `VERDICT_SCORE` 值域 + 白名单（键集断言与 `test_v5_calib_feed`
+合并，本文件补值域）/ T8 格式锚点。纯本地零网络；函数内延迟导入（4e 的
+sys.path 污染教训）。**T1–T7 现网即绿**——口径不变量本就成立，本批是把
+它们钉成断言（对照表的价值一半在"免对"，一半在"错了会红"）。
+
+**T8 = `chain/schema.py` 序列化锚点（本批唯一生产码改动）**
+- 新增格式级常量 `TRAJECTORY_FORMAT = "quantdinger-evalnode"` /
+  `SCHEMA_VERSION = 1`（对齐上游 `save_traj` 的 `trajectory_format` 口径；
+  取常量而非实例字段：同一进程所有节点共享同一形状）。
+- `to_dict` 发射两键（`to_json` 同一出口）；`from_dict`：缺键 = T8 以前的
+  dump，按当前版解析（向后兼容）；外来 `trajectory_format` / 更高
+  `schema_version` / 非 int version 一律 **ValueError fail-loud**
+  （禁兜底，同 `upstream_compat` 纪律）。
+- **DB 层零影响**：`store.save_tree` 走显式列映射（UPDATE/INSERT 各约 40 个
+  占位符），从不消费 `to_dict` ⇒ 无迁移、无 DDL 变更；两键只进序列化出口。
+
+**附带根因修：`pytest.ini` 补 `testpaths = tests`**
+落地时裸 `pytest` 从 rootdir 递归，把 `del/agentcore_retired_20261013/tests/`
+（import 已退役的 `app.agentcore`）拖进收集 ⇒ 4 个 collection error 直接
+Interrupted，酷似"全崩"。钉死收集范围后裸跑与 `pytest tests/` 同数
+（1274，两种命令实测一致）；显式传路径时本项不生效，既有用法不受影响。
+
+**回归**：全量 pytest **1274 passed / 4 skipped / 0 failed**（1255 + 19）；
+qd_smoke **258/260 · 0 failed · 2 skipped**；设计机检 **99 OK / 0 DRIFT**。
+
+## 附录 AI · F23 取数收口登记：agent 内部统一 + 专用并行（2026-10-18，用户裁定）
+
+> 用户裁定（2026-10-18）：① **不加 AST 守卫钉死取数收口**——系统现状乱，
+> `get_kline` 与读库各有优缺点，将来再调整；当前只做「**agent 系统内部统一**」。
+> ② `market_cn/auto` 已有专用取数实现 ⇒ **自己写自己**，不强行融合，以后优化。
+
+**§1 agent 系统内部取数盘点（2026-10-18 实测）**
+
+| 链路 | 取数方式 | 复权 | 状态 |
+|---|---|---|---|
+| 追责判定 `resolver → evaluator._get_actual_return` | `CNStockDataSource().get_kline("1D", _need)`（窗口按交易日历算，`QD_EVAL_KLINE_MAX=500` 上限） | 门面出口 qfq | ✅ 门面 |
+| C3P `p_base` | `chain/kline_feed.daily_bars`（v5 P2 收口模块，同发 `t` 日期串 + `time` 时间戳双键） | 门面出口 qfq | ✅ 门面 |
+| 工具面 `agent_get_kline` / `_analysis_utils` | 门面 | 门面出口 qfq | ✅ 门面 |
+| `skills/market-screener.fetch_kline` | **2026-10-18 已收口**：改走 `CNStockDataSource().get_kline("1D", limit=days)`（F23 改造，原直连 `db_market` writer + 自调 `unadj_to_qfq`）。`days`=根数契约直传 limit；返回 `time` 日期串形状不变（门面 int 时间戳在函数内显式转北京时区串）。对拍：tmp/fetch_kline_baseline_20261018.json + compare 脚本，8 股 × 2 窗口 **ohlcv 零差异**、行数 59→60/119→120（根数语义精确化，只增不减） | 门面出口 qfq | ✅ 门面 |
+| 大盘 K 线 | `watchlist.predict.load_market_klines`（int 时间戳口径） | — | 独立口径（kline_feed docstring 已警示勿重复取） |
+
+⇒ **T+N 回测/回评链（追责 + C3P）已统一走门面**；market-screener 直读库是
+skill 全市场批量扫描的专用场景（`limit=0` 无截断 + 任意时间窗），与
+`market_cn/auto` 同性质，按本次裁定暂列「自己写自己」，不并入门面。
+
+> **2026-10-18 晚更新**：用户复议「500 只无压力 ⇒ agent 的所有 K 线调用接
+> get_kline 没问题」，market-screener 的 `fetch_kline` **已收口**（改造与
+> 对拍见上表该行与附录 AI §2b）。⇒ 至此 **`app/agent` 内部 K 线取数全部走
+> 门面**，无例外；`market_cn/auto` 与 `app/watchlist`（大盘线）仍按裁定
+> 各自专用，不融合。500 只压力账见 §2b（无结构性压力；扩展瓶颈 =
+> 单标接口×N 次往返，批量接口属「将来再调整」）。
+
+**§2 `get_kline` 历史段落能力实测（修正「取不到任意历史段落」的前提）**
+`get_kline(symbol, tf, limit, before_time, after_time)` **支持时间窗**，且
+1D/1W 内部收口保证「先按时间窗过滤、再按 limit 截断」（否则旧区间会被
+截断掉）。限制仅在：`limit` 必配（缺省 300）、`limit=0` 全量不支持。
+⇒ 「读库的优点」精确落在 **limit=0 全量扫描** 与**窗口自由**两点；
+单标的带窗口的取数门面已覆盖。此差异登记，待将来架构调整时再统一。
+
+**§2b `get_kline` 数据源与 500 只压力实测（2026-10-18）**
+取数是**混合架构、DB 优先**：主路径 `_read_db` 读 `kline_1D_2026`（不复权
+原始价，每只 limit=10000 全量）→ 盘中从 `realtime_snapshot` 拼当日 lastbar
+（非交易日/盘后零查询）→ **仅当 DB 不够新**（缺最新交易日）才走远端 HTTP
+慢路径，合并后写回 DB；出口统一 `unadj_to_qfq`（因子 `_mem` 缓存 5225 只，
+命中零 IO）。⇒ 平时（盘后+库新）**纯本地**，只有数据缺口碰远端。
+500 只盘后压力账（对账 market-screener 现状）：DB 查询同级（都是单标 ×500
+次循环，**两边均无批量接口**——「读库优点=批量」不成立，实际优点是窗口自由）、
+因子同函数同缓存、snapshot 盘后零查询；真差异仅三处且均非量级问题：
+① `_read_db` 拉全量 vs market-screener 的 start/end 窗口（单只行数多）；
+② 盘中多 500 次 snapshot 点查（轻）；③ 缺数据股触发远端补满+写库
+（500 只中少数，fail-soft）——唯一能拉长墙钟的路径。⇒ **500 只规模无
+结构性压力**；扩展瓶颈是「单标接口×N 次往返」，上到 5000 只/分钟级才需
+`get_klines(codes[])` 批量接口，属「将来再调整」范畴。
+
+**§3 复权口径（不变）**
+门面双收口（1D/1W→`_finalize_1d`→`unadj_to_qfq`；分钟线→`_get_kline_intraday`
+→`unadj_to_qfq`）；market-screener 直读后自调同一 `unadj_to_qfq` ⇒ 两条路
+复权口径未漂。库表三层（kline_1D/1m/snapshot）为不复权原始价，禁当复权源用。
+
+**§4 挂起不预埋（纪律）**
+- 取数架构统一（门面 vs 读库的能力并集）：**将来再调整**，当前不预埋适配层。
+- `market_cn/auto` 专用实现融合：**以后优化**，当前不动。
+- 「用今天因子重算历史 T+N」类需求：立 as_of 因子时点口径后才可做
+  （`unadj_to_qfq` 只有「当前因子」单口径；追责一判终态 + actual 快照随
+  resolution 落库，已免疫因子日更）。
+
+---
+
+## 附录 AJ · EvalWorker 停摆自愈（B）+ 健康探针（C）（2026-10-18，用户裁定 B+C）
+
+> 用户裁定（2026-10-18）：「回到 EvalWorker 线中，确认走 B+C 方式」。A/B/C
+> 选项出处为本会话方案比选：A 运维层常驻（零代码）/ **B A+停摆自愈补丁** /
+> **C B+health 探针**。用户选 B+C。
+
+### 1 根因复核（先查证再动码）
+
+- **EvalWorker 线已完整接线**（用户方案三部分全部验证成立）：scheduler
+  `_post_market_batch`（TASKS，15:30）串行 backfill 1m→日档→龙虎榜/北向→
+  1D→板块→自选股标签，末尾 `post_market_done.set()`；EvalWorker 线程
+  （evaluator.py）等事件后 `auto_evaluate`（resolve_due_claims + weight_feed
+  + report）→ `run_v5_collection` → `brew_skills`。cron_worker「残疾」证实
+  （`qd_agent_cron_jobs` 零行），不用管。
+- **真缺口①（B）**：flask 在 15:30 之后才起（宿主机几天没开/重启）时，
+  scheduler **主循环**（`_scheduler_loop` 10s tick，scheduler.py:833-881）
+  会照常补跑当日 `post_market_batch`（启动补跑路径刻意跳过它只为避开与
+  mq-worker 的启动期导入竞争，主循环不跳过）；但 EvalWorker 按
+  `_seconds_until_post_market()` 睡到**次日 15:30** ⇒ 事件被错过、当日闭环
+  静默顺延，v5 情境帧（C 类不可重建）**永久丢失**。
+- **真缺口②（B'，顺带根治）**：`post_market_done` 历史上**从不 clear** ⇒
+  长跑进程从第 2 天起「等待盘后数据同步完成」恒跳过，15:30 评估与 backfill
+  赛跑（靠 resolver 视界门② + 重试治理兜底不烧 claim，但违背设计意图）。
+- **真缺口③（C）**：`_worker_health` 只在进程内 ⇒ 宿主不起时外部无从得知
+  （10-16 15:54 后停摆 2 天无任何外部症状）。
+
+### 2 落地内容（生产码：evaluator.py + tracing.py，零 scheduler 改动）
+
+| 件 | 内容 |
+|---|---|
+| `_post_market_catchup_plan(now=None)` | 停摆自愈判定：`wait`（已过 15:30+交易日+批次未完成）/ `run_now`（批次完成但评估今日未成功、**且有历史成功证据**）/ `none`。证据门：无健康落盘或 `total_successes=0` ⇒ 不敢补评（`weight_feed` 是 EMA 慢调，双跑双步进；漏诊交给 C 探针暴露，不错算） |
+| `_wait_post_market_done(timeout)` | 等事件 + **消费即清**（B'）。清在消费侧而非 batch 起始侧：后者与 15:30 准点 wake 有竞态。导入失败 ⇒ 按旧语义返回 True 继续并记 warning（C-1 事故纪律） |
+| `_worker()` 循环 | 启动时判一次 plan：`wait` ⇒ 等事件（≤`QD_EVAL_WAIT_POST_MARKET_SECONDS`，默认 3600）替代睡到明日；`run_now` ⇒ 直接评估；自愈只生效一次后回归正常节拍 |
+| `_persist_worker_health(extra)` | 每事件一行 JSONL 落 `traces/eval_worker_health.jsonl`（`AGENT_EVAL_HEALTH_FILE` 可改）；fail-soft，观测不成为新故障源 |
+| `probe_worker_health(now=None)` | 只读 staleness 探针：上次成功 → 下一交易日 15:30 + `QD_EVAL_STALL_GRACE_HOURS`（默认 2h）仍无新成功 ⇒ `stalled`；从未成功按最后一条线日期同理（当天宽限前 `pending`）；文件缺失 `no_data`、无可解析行 `unreadable`；**容忍尾撕裂行**（对齐 TraceAdapter 遗留项的读者侧防护） |
+| `get_worker_health()` | 合并探针字段（`stalled`/`health_status`/`health_detail`/`health_file`/`last_persisted_success_at`）；既有字段（含 smoke 判据 `last_accountability`）不回归 |
+| `main()` CLI | `python -m app.agent.chain.evaluator --health`（stalled/unreadable ⇒ exit 1，宿主 down 可外部判活）/ `--catchup-plan`（自愈判定预演，只读） |
+| `tracing.anchored_path(env, default)` | 路径锚定收口（第三处复用：trace/eval_dump/health 共用）；`_trace_file_path`/`_eval_dump_path` 改为委托，行为不变 |
+
+**未做（有意）**：① EvalWorker **不自己跑** `_post_market_batch`——批次执行
+权归 scheduler 主循环（用户要求「scheduler.py 中只有一个触发点」），自愈只
+改「等不等」不改「谁跑」；② scheduler.py 零改动（主循环补跑行为已满足 B 的
+前提，代码走查 + 逐行 trace 证实）；③ 启动补跑路径对 post_market_batch 的
+跳过保持原样（避开启动期导入竞争是 C-1 同源风险，不该在本批动）。
+
+### 3 测试与变异检验
+
+- 新文件 `tests/test_v41_eval_worker_selfheal_20261018.py`（**27 例**，全函数内
+  延迟导入）：B 判定 8 例（wait/边界 15:30:00/未到时刻/非交易日/今日已完成/
+  run_now/无证据 none/从未成功 none）+ B' 4 例（置位即消费且清/超时返回 False
+  不冒充就绪/等待期间被 set/导入失败按旧语义）+ C 13 例（落盘形状/fail-soft/
+  探针 ok/stalled/pending/从未成功/尾撕裂/no_data/unreadable）+ 接线守卫 +
+  进程内视图合并 + CLI exit 码 + anchored_path 2 例。
+- **变异检验 4/4 有咬合**：① 触发时刻 `<`→`<=`（边界例红）；② 去掉消费即清
+  （2 例红）；③ 去掉 run_now 证据门（2 例红）；④ 探针停判据反转（7 例红）。
+- **回归**：全量 pytest **1301 passed / 4 skipped / 0 failed**（1274+27 闭合）；
+  qd_smoke **258/260 · 0 failed · 2 skipped**（逐字基线，未改一行）；
+  设计机检 **99 OK / 0 DRIFT**。
+
+### 4 遗留（登记不动）
+
+- **宿主常驻仍属运维层**（A 的议题）：B+C 让「起了之后」自愈且可见，但
+  「根本不起」只能靠外部监控消费 `--health`（exit 1）或进程守护。
+- 6 个入口脚本 AGENT_DIR 模块级插入清理；TraceAdapter.emit 跨进程/半写保护
+  （本批只在读者侧容忍，写入侧原子追加仍未做）。
+
+### 5 配套复核结论（2026-10-18，用户追问 P1/P2）
+
+连真库复核脚本见 `tmp/verify_two_problems_20261018.py`：
+
+- **P1（auto 策略 + agent 链路完整且正常）：成立。** 接线点全部就位——
+  `reconcile_startup`（app/__init__.py:467-468）、`start_eval_worker`（:475）、
+  链节点 auto_evaluate/run_v5_collection/resolve_due_claims/weight_feed.feed/
+  calib_feed 均可导入；本附录 B+C 自愈钩子 `_post_market_catchup_plan()` 判定
+  正确（12:13 早于 15:30 ⇒ `mode=none`）。「运行正常」依赖宿主常驻（运维层，
+  见 §4 遗留①），B+C 已让起后自愈 + 外部可见。
+- **P2（CalibFeed Δp=0）：根因已修，Δp=0 本身非故障，勿误读为「经验库无效」。**
+  真库现状 resolutions=188 / pending=205 / decisions=209；校准 n_samples=20、
+  n_clusters_total=8、门槛 30 ⇒ 0 格达门槛、全出先验、Δp=0。结论：
+  1. Δp≡0（簇<30 只出先验）是 calibration.py / aggregator.py 头注 / §817 明定的
+     **冷启动设计行为**，把噪声当信号才是灾难——故「经验库无效」是误判。
+  2. 数据管道未断：pair 由 `c3p.py:437` 推理时调 `record_pair()` 每日生成，
+     `data/pairs/pairs_2026-10.jsonl` 已 128 条（10-13→10-18 连续）。
+  3. 128 条 pair **全部 condition_key=`down|low`**（9 格校准空间仅 1 格填充，
+     regime×vol_bucket 条件化所致，余格待市场轮动）；即便该格仅 8 簇 < 30。
+  4. pending=205 但 resolver 跑出 due:0 属正常：`query_due_claims` 还要
+     `due_date<=今天`（T+N 交易日未走完），claim 逐日成熟。
+  5. 闭环：B+C 根治「宿主停摆→resolver 断更」；Δp 转非零只需 `down|low` 跨 30
+     簇，约 1-2 周每日驱动（B+C 保驱动）即自愈，非代码缺陷。
+- **附带修正**（防误判死代码）：qd_smoke:2446 旧注「`aggregator.record_pair()`
+  生产零调用方」已过时（c3p.py:437 在调）→ 改为标注过时；test_40 重跑 1 passed。
+
+### 6 待办（用户裁定暂缓，2026-10-18）：skill 权重硬反馈未落地
+
+复核发现（连真库）：问责闭环产出的权重分两层，效果相反——
+- **domain 层**（闭环直接产物，finance）：已被 `weight_feed.feed()` 真实慢调
+  （weight=0.4074、win_rate=0.4091、sample_count=110、last_updated 2026-10-16，
+  10-16 后随宿主停摆中断，B+C 已自愈）→ 但其**唯一调用方是 `weight_hints.hint_text`**
+  （软提示文本），全仓**无** `weight_of("domain",...)` 的硬乘子调用；
+- **skill 层**（硬乘子 `qd_service._rank_skills` 的 `sc×(0.5+0.5×w)`）：真库 5 行**全 1.0**
+  （写侧纪律 `n<10` 恒 1.0，样本未攒够）→ 硬反馈暂未生效，排序纯靠词典分。
+- **文档/代码偏差**：`weight_feed.py:12` 与 `evaluator.py:968` 注释称 domain 权重
+  「供技能排序」，但代码里 `_rank_skills` 只吃 `layer='skill'`，domain 根本没进硬排序。
+- **裁定**：该问题暂缓，先记录；skill 还有更大的"闭环无限生成 skill 拖垮预选"问题
+  优先处理（见后续讨论 / 待落实施计划）。本 § 仅留痕，不在此批动码。

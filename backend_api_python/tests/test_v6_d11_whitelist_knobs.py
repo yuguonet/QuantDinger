@@ -301,5 +301,5 @@ def test_run_inner_consumes_prefetch_force_tools():
     assert "prefetch_force_tools" in src, (
         "qd_agent._run_inner 未消费 prefetch_force_tools —— 技能卡片点名的 run_skill "
         "不会被激活（解耦修复失效）")
-    assert "activate_tools(_force)" in src.replace(" ", "").replace("\t", ""), (
+    assert "activate_tools(_force," in src.replace(" ", "").replace("\t", ""), (
         "未在 _run_inner 里对 force 工具调用 activate_tools")

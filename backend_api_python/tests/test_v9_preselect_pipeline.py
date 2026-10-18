@@ -44,6 +44,19 @@ EXPECTED_CHANGES = {
     "lint.normal.trace.warnings",               # G2 留痕：多一条 R4 中间分支告警
     "lint.protected.trace.warnings",            # 同上（保护名单场景原先为空）
     "lint.protected.dirty",                     # 同源：warnings 非空 ⇒ dirty False→True
+    # ④ 【2026-10-16 补登记】`check_domain_dict` 收录的可用工具名单发生变换：
+    #    finance 域内工具合并（`run_backtest`→`agent_backtest_strategy`、
+    #    `build_keyword_from_filters`→`agent_backtest_svc`、`daily` 摘除等）后
+    #    基线未同步。核对方式：同一采集面在本轮改动前后对拍，落差条数恒为 8，
+    #   仅此键未登记 ⇒ 与工具面改造（T1/T2/T4）无关，属前序工具合并的滞后项。
+    "check_domain_dict",
+    # ⑤ 【2026-10-17 P1-b】能力层目录**组面折叠**（`build_catalog_grouped`
+    #    能力层段：40 行全列 ⇒ "capability（N 个）…例：代表6个+检索指针"）。
+    #    动机：O2 残留（能力层 O(N)，300 工具爆掉）；P14 不变量保住：代表名
+    #    仍可见 + list_tools(domain='capability') 指针可行动；env
+    #    `QD_PRESELECT_CAP_FOLD=0` 回退全列（守卫 tests/test_v17i_*）。
+    #    `catalog_grouped_kept`（合法点名集）**不变**——只缩呈现不缩合法集。
+    "catalog_grouped",
 }
 
 

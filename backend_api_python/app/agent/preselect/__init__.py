@@ -35,17 +35,32 @@ from .tool_preselect import (
     LintReport, apply_lint, build_catalog, build_catalog_grouped,
     build_preselect_messages, build_tool_index, capability_domain,
     check_domain_dict, detect_domains, fallback_domain_tools,
-    get_tool_index, has_domain_hint, index_candidates, lint_selection,
-    names_in_text, parse_plan, parse_selection,
+    fast_route_tools, get_tool_index, has_domain_hint, index_candidates,
+    lint_selection, names_in_text, parse_plan, parse_selection,
+    single_target_anchor,
+    # 2026-10-17 目录预过滤（shrink_catalog 写好两年无人调，接线时补公开导出）
+    shrink_catalog, _preselect_catalog_limit, single_target_default_tools,
+    # 2026-10-17 F14（E3）：O-14 分级触发改判 schema 总字符数
+    schema_chars_of, _preselect_tier_chars, tier_catalog_enabled,
+    # 2026-10-17 skill 进预选（技能目录 / skill 字段解析 / 两个 env 旋钮）
+    build_skill_catalog, parse_skill_field,
+    _preselect_skill_on, _preselect_skill_tools_max, _SKILL_LINE,
 )
 from .preselect_cooc import (
     build_weights, get_weights, heldout_recall, load_pairs,
     load_pairs_from_db, load_weights, rank_candidates,
     record_pairs_path, save_weights, weights_path,
+    # F23（2026-10-17）：held-out 双口径评估（口径单一真源）
+    eval_heldout,
 )
 from .preselect_stats import (
-    empty_rate, pairs_path, record_empty_face, record_selected,
-    record_task_calls, report, reset,
+    empty_rate, gate_miss_rate, pairs_path, record_empty_face, record_gate_miss,
+    record_selected, record_task_calls, report, reset,
+    # F23（2026-10-17）：观测快照落盘 + 跨重启聚合（O-7）
+    stats_path, snapshot, load_snapshots, aggregate_snapshots,
+)
+from .tool_groups import (
+    CODING_NATIVE_TOOLS, GROUP_DESC, expand_overrides, group_members,
 )
 
 __all__ = [
@@ -55,13 +70,28 @@ __all__ = [
     "LintReport", "apply_lint", "build_catalog", "build_catalog_grouped",
     "build_preselect_messages", "build_tool_index", "capability_domain",
     "check_domain_dict", "detect_domains", "fallback_domain_tools",
-    "get_tool_index", "has_domain_hint", "index_candidates", "lint_selection",
-    "names_in_text", "parse_plan", "parse_selection",
+    "fast_route_tools", "get_tool_index", "has_domain_hint", "index_candidates",
+    "lint_selection", "names_in_text", "parse_plan", "parse_selection",
+    "single_target_anchor",
+    # 目录预过滤（2026-10-17 接线）
+    "shrink_catalog", "_preselect_catalog_limit", "single_target_default_tools",
+    # O-14 分级触发（2026-10-17 F14/E3：改判 schema 总字符数）
+    "schema_chars_of", "_preselect_tier_chars", "tier_catalog_enabled",
+    # skill 进预选（2026-10-17）
+    "build_skill_catalog", "parse_skill_field",
+    "_preselect_skill_on", "_preselect_skill_tools_max", "_SKILL_LINE",
+    # 组注册表（T7 group 单位唯一事实源，2026-10-17）
+    "CODING_NATIVE_TOOLS", "GROUP_DESC", "expand_overrides", "group_members",
     # 共现权重
     "build_weights", "get_weights", "heldout_recall", "load_pairs",
     "load_pairs_from_db", "load_weights", "rank_candidates",
     "record_pairs_path", "save_weights", "weights_path",
+    # F23（2026-10-17）：held-out 双口径评估（口径单一真源）
+    "eval_heldout",
     # 观测计数器
-    "empty_rate", "pairs_path", "record_empty_face", "record_selected",
+    "empty_rate", "gate_miss_rate", "pairs_path", "record_empty_face",
+    "record_gate_miss", "record_selected",
     "record_task_calls", "report", "reset",
+    # F23（2026-10-17）：观测快照落盘 + 跨重启聚合（O-7）
+    "stats_path", "snapshot", "load_snapshots", "aggregate_snapshots",
 ]

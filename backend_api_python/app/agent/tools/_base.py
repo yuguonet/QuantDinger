@@ -106,6 +106,11 @@ class ToolResult:
     success: bool = True
     output: Any = None
     error: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_raw(cls, result: Any, metadata: Optional[dict] = None):
+        return cls(output=result, metadata=dict(metadata or {}))
 
     def to_str(self) -> str:
         """转为字符串（用于传回 LLM），按数据形态选择最省 token 的格式。

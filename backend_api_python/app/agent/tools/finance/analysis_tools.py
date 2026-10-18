@@ -706,6 +706,13 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
 
     包含多指标共振检测、背离检测、均线收敛度、乖离率极值等高级信号。
 
+    ⚠️ 评分模型标识（2026-10-17）：本函数的 `trend_score` 是**复合共振模型**
+    （多指标加权 + 多重共振过滤 + 背离/量能修正），与
+    `bull_bear_research._analyze_trend` 的**五维加权模型**（ma/macd/rsi/boll/kdj）
+    **是两套不同口径**，同股同数据给出不同分是设计使然（各自服务不同消费方与
+    校准命名空间），不是 bug。输出以 `score_model` 键自证身份；跨工具引用评分
+    时必须核对 `score_model`，不得把两个模型的分数当同一指标对比或对冲。
+
     Returns:
         dict: {trend_score(0-100), trend, strength, all_signals(list), macd/rsi/kdj/boll 各为 dict}；多代码→{count, data:{代码:上述}}；error=失败。
 
@@ -1102,6 +1109,9 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 "trend_score": total_score,
                 "trend": overall,
                 "strength": strength,
+                # 评分模型自证（2026-10-17）：与 bull_bear_research 的五维加权模型
+                # 区分，防下游把两套口径的分数当同一指标对比（实测同股 17 vs 52）。
+                "score_model": "trend_composite(共振+背离+量能+波动)",
                 "all_signals": all_signals,
                 "evaluation": evaluation,
                 "data_points": len(closes),

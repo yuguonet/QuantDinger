@@ -96,6 +96,7 @@ from typing import Optional
 
 import yaml
 
+from ..exec.job_runner import kill_tree
 from ..log import logger
 
 #: backend 根（backtest_cli 要求 cwd=backend_api_python；parents[3]=chain←agent←app←backend）
@@ -395,25 +396,13 @@ def _overlay_digest(overlay: Path) -> tuple:
 # ================================================================
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """杀整棵进程树。Windows: taskkill /T /F；posix: killpg（孙进程残留史见模块头）。
+    """杀整棵进程树。
 
-    taskkill 失败（权限/竞态退出）必须回落 proc.kill()：后续还有 communicate() 等管道
-    收尾，进程若没死会挂到自然退出，超时语义被破坏。
+    2026-10-18 F26-D1：实现已抽至 `app/agent/exec/job_runner.kill_tree`（单一事实源，
+    skill_run 路径同出口）。此处**只留委托 seam**——`tests/test_backtest_bridge.py`
+    monkeypatch `B._kill_tree` 的接缝不变；删掉本函数会让那个替身静默失效。
     """
-    if os.name == "nt":
-        tk = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                            capture_output=True)
-        if tk.returncode != 0:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-    else:
-        import signal
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+    kill_tree(proc)
 
 
 def _spawn_and_wait(cmd: list, *, env: dict, timeout_s: int) -> tuple:

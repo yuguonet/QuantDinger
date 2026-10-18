@@ -8,7 +8,6 @@
     idx  = get_indices()       # 同上
 """
 import json as _json
-import os as _os
 import threading
 import time
 import logging
@@ -194,22 +193,23 @@ def _safe_refresh(endpoint, fn):
 # ############################################################
 
 def _sentiment_fetch() -> dict:
-    """7 个宏观情绪指标 + 大宗商品，原始获取。"""
+    """2 个宏观情绪指标（收益率曲线 + 恐惧贪婪）+ 大宗商品，原始获取。
+
+    2026-10-18: VIX 族 vix/vxn/gvz/vix_term 随 sentiment._ORDER 整族摘除
+    （用户不需要 VIX 具体值，且各源实测无效）；fear_greed/yield_curve 保留。
+    _pack_sentiment 的 vix/vxn/gvz/vix_term/dxy 占位键不变，下游
+    market_data_collector 以 value>0 守卫判定，占位 0 值不会注入。
+    """
     from .sentiment import (
-        fetch_fear_greed_index, fetch_vix, fetch_dollar_index,
-        fetch_yield_curve, fetch_vxn, fetch_gvz, fetch_put_call_ratio,
+        fetch_fear_greed_index,
+        fetch_yield_curve,
         _set_cached_indicator,
     )
     from .commodities import fetch_commodities
 
     fetchers = {
         "fear_greed":  fetch_fear_greed_index,
-        "vix":         fetch_vix,
-        "dxy":         fetch_dollar_index,
         "yield_curve": fetch_yield_curve,
-        "vxn":         fetch_vxn,
-        "gvz":         fetch_gvz,
-        "vix_term":    fetch_put_call_ratio,
     }
     results = {}
     with ThreadPoolExecutor(max_workers=len(fetchers)) as pool:
@@ -271,6 +271,11 @@ def _news_fetch(lang="all"):
 
 
 def _pack_sentiment(results, commodities=None):
+    # "dxy" 及 vix/vxn/gvz/vix_term 是指标摘除后保留的结构占位（恒为 0/1.0），
+    # 目的是不改动前端/下游的响应结构。dxy 于 2026-10-17 移除；VIX 族于
+    # 2026-10-18 整族摘除（sentiment._ORDER 已无这些指标）。下游
+    # market_data_collector 以 `value > 0` 判定是否注入（vix_term 另需
+    # vix/vix3m 双键 > 0），占位值不会被当作真实数据使用。
     return {
         "fear_greed":  results.get("fear_greed")  or {"value": 50, "classification": "Neutral"},
         "vix":         results.get("vix")         or {"value": 0, "level": "unknown"},
@@ -289,7 +294,7 @@ def _pack_sentiment(results, commodities=None):
 # ############################################################
 
 def get_sentiment() -> dict:
-    """7 个宏观情绪指标 + 大宗商品，自动缓存。"""
+    """6 个宏观情绪指标 + 大宗商品，自动缓存。"""
     data = _cached_fetch("sentiment", _sentiment_fetch, timeout=30)
     if data is None:
         data = _pack_sentiment({})

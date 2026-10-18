@@ -7,19 +7,21 @@ backfill_db.py — A 股 K 线盘后覆写（mootdx 直连）
 
 核心职责:
   1. 交易日 15:05 后覆写当日 1m bar（每标的 240 条）
-  2. 交易日 15:05 后覆写当日 15m bar（每标的 16 条）
-  3. 交易日 17:00 后覆写当日 1D bar（每标的 1 条）
-  4. 首次运行时做历史回填
+  2. 交易日 17:00 后覆写当日 1D bar（每标的 1 条）
+  3. 首次运行时做历史回填
 
 设计原则:
   1. mootdx 直连，不走 coordinator
   2. 盘后全量覆写：先拉取 → 有数据才 DELETE → INSERT
   3. 无 cn_last_update，无修复循环
-  4. 对外接口: run_1d() / run_15m() / run_1m()（调度由 scheduler.py 管理）
+  4. 对外接口: run_1d() / run_1m()（调度由 scheduler.py 管理）
 
 数据说明:
   - mootdx bars() 返回的是不复权原始数据，与 kline 表存储方式一致
   - 复权因子由 app/data_sources/provider/adjustment.py 单独维护，查询时按需复权
+  - **只写 1D 与 1m**。15m 已于 2026-10-17 移除写入方（`kline_15m` 早已作废，
+    见 fund_flow_api.py / market-screener/_facts.py 的历史裁定）；5m/15m/30m/1H
+    等分钟周期一律由 cn_stock.py 从 `kline_1m` 现场聚合，不落库。
 """
 
 import os
@@ -85,14 +87,12 @@ def _recreate_executor() -> None:
 
 _TDX_FREQ = {
     "1D": 4,    # 日线
-    "15m": 1,   # 15分钟
     "1m": 7,    # 1分钟 (pytdx frequency=7)
 }
 
 # 每标的一个完整交易日应有的 bar 数（用于拉取数量 + 完整性校验）
 _TF_DAILY_BAR_COUNT = {
     "1D": 1,
-    "15m": 16,
     "1m": 240,
 }
 
@@ -355,7 +355,7 @@ def sync_tf(tf: str, symbols: Optional[List[str]] = None) -> dict:
     failed = 0
     failed_list = []
 
-    # 每标的当日 bar 数：1D=1, 15m=16, 1m=240（mootdx offset 上限 800，均在其内）
+    # 每标的当日 bar 数：1D=1, 1m=240（mootdx offset 上限 800，均在其内）
     count = _TF_DAILY_BAR_COUNT.get(tf, 1)
     target_date = bar_time.strftime("%Y-%m-%d")
 
@@ -447,12 +447,6 @@ def run_1d(symbols: Optional[List[str]] = None) -> dict:
         "written": result["written"],
         "skipped": result["written"] == 0 and result["status"] == "ok",
     }
-
-
-def run_15m(symbols: Optional[List[str]] = None) -> str:
-    """覆写 15m，返回 "ok" / "error"。"""
-    result = sync_tf("15m", symbols)
-    return result["status"]
 
 
 def run_1m(symbols: Optional[List[str]] = None) -> dict:

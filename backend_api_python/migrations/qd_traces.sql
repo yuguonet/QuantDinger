@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS qd_agent_traces (
     user_query      TEXT,
     model           VARCHAR(100),
     total_tokens    INTEGER,
+    cached_tokens   INTEGER,            -- 命中前缀缓存 input token（F10，2026-10-17）
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -85,3 +86,9 @@ CREATE INDEX IF NOT EXISTS idx_traces_pending ON qd_agent_traces(id) WHERE layer
 -- 缺列会让整条 INSERT 报错 ⇒ qd_agent_traces 一条都写不进去（声明了却静默断链）。
 -- CREATE TABLE IF NOT EXISTS 不会改动已存在的表，故此处单独幂等补列。
 ALTER TABLE qd_agent_traces ADD COLUMN IF NOT EXISTS plan text;
+
+-- 存量库补列（F10，2026-10-17）：cached_tokens = 命中前缀缓存的 input token 数，
+-- 由网关 usage.prompt_tokens_details.cached_tokens 回填、经 store 落到根节点行。
+-- 与 plan 同理：app 侧 chain/store._ensure_trace_columns 也做同一条幂等 ALTER，
+-- 两处并存（本文件服务 docker 首启；应用侧服务已运行的存量库）。
+ALTER TABLE qd_agent_traces ADD COLUMN IF NOT EXISTS cached_tokens integer;

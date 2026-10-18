@@ -32,6 +32,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.agent.chain import c3p
@@ -357,3 +359,58 @@ def test_calibration_failure_is_failed_open(env, monkeypatch):
     assert r["calib"]["used"] is False and r["calib"]["source"] == "none"
     row = c3p.load_recent_pairs("2026-10-12")[0]
     assert row["p_final"] == pytest.approx(row["p_base"])
+
+
+# ═══════════════════════════════════════════════════════════════
+#  C3P 输入压缩（2026-10-16）：输入截断 / 输出上限 / 尝试次数全可配
+# ═══════════════════════════════════════════════════════════════
+
+def test_extract_evidence_payload_caps_follow_env(monkeypatch):
+    """输入 payload 的 user_query/answer 截断长度必须来自 env。"""
+    seen = {}
+    monkeypatch.setattr(c3p, "_call_llm",
+                        lambda system, user, timeout: seen.update(user=user) or "{}")
+    monkeypatch.setenv("QD_C3P_MAX_QUERY_CHARS", "10")
+    monkeypatch.setenv("QD_C3P_MAX_ANSWER_CHARS", "20")
+    c3p.extract_evidence(user_query="Q" * 100, answer="A" * 100,
+                         subject="002031", claim={"claim_type": "direction"})
+    payload = json.loads(seen["user"])
+    assert payload["user_query"] == "Q" * 10
+    assert payload["answer"] == "A" * 20
+
+
+def test_extract_evidence_payload_defaults_are_tight(monkeypatch):
+    """默认截断长度已收紧（≤400 / ≤1500），不再是无脑 600/2000。"""
+    monkeypatch.delenv("QD_C3P_MAX_QUERY_CHARS", raising=False)
+    monkeypatch.delenv("QD_C3P_MAX_ANSWER_CHARS", raising=False)
+    seen = {}
+    monkeypatch.setattr(c3p, "_call_llm",
+                        lambda system, user, timeout: seen.update(user=user) or "{}")
+    c3p.extract_evidence(user_query="Q" * 9999, answer="A" * 9999, subject="002031")
+    payload = json.loads(seen["user"])
+    assert len(payload["user_query"]) <= 400
+    assert len(payload["answer"]) <= 1500
+
+
+def test_call_llm_knobs_from_env(monkeypatch):
+    """`_call_llm` 必须传 max_tokens 与 attempts；默认收紧（800 / 1），env 可覆盖。"""
+    import app.agent.llm as llm
+    captured = {}
+
+    def fake(messages, **kw):
+        captured.clear()
+        captured.update(kw)
+        return type("R", (), {"content": "{}"})()
+
+    monkeypatch.setattr(llm, "complete_direct", fake)
+    monkeypatch.delenv("QD_C3P_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("QD_C3P_LLM_ATTEMPTS", raising=False)
+    c3p._call_llm("sys", "user", 5.0)
+    assert captured["max_tokens"] == 800
+    assert captured["attempts"] == 1
+
+    monkeypatch.setenv("QD_C3P_MAX_OUTPUT_TOKENS", "333")
+    monkeypatch.setenv("QD_C3P_LLM_ATTEMPTS", "3")
+    c3p._call_llm("sys", "user", 5.0)
+    assert captured["max_tokens"] == 333
+    assert captured["attempts"] == 3

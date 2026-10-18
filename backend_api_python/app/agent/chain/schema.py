@@ -152,6 +152,21 @@ class SkillReport:
 # EvalNode — 评估树节点（qd_evaluations 表的一行）
 # ═══════════════════════════════════════════════════════════════
 
+# ★ 序列化契约锚点（T8 / F22 A，2026-10-18；上游对照见
+#   tmp/F22_harness口径对照方案_20261018.md §1.2）。
+#   上游 harness `save_traj` 落盘带 `trajectory_format: "mimoagent"` 标识序列化
+#   形态；本仓 to_dict 此前无任何格式/版本标识 ⇒ 外来字典反序列化时认不出
+#   形状，schema 演进也没有锚点（T4 round-trip 只保证"当时"稳定）。
+# 口径：
+#   · trajectory_format = 序列化**形态家族**标识（我们的轨迹是什么形状）；
+#   · schema_version    = to_dict **形状版本**，不兼容变更时 +1（不是数据版本；
+#     同一进程所有节点共享同一形状 ⇒ 格式级常量而非实例字段）。
+# from_dict 兼容策略：缺键 = T8 以前的 dump，按当前版解析；外来 format /
+# 更高 version / 非 int version 一律 ValueError fail-loud（禁兜底，与
+# upstream_compat 同款纪律：探测+上报 ≠ 兜底，不静默错读）。
+TRAJECTORY_FORMAT: str = "quantdinger-evalnode"
+SCHEMA_VERSION: int = 1
+
 @dataclass
 class EvalNode:
     """评估树节点。
@@ -191,6 +206,12 @@ class EvalNode:
     user_query: str = ""
     model: str = ""
     total_tokens: Optional[int] = None
+    # 【F10 埋点，2026-10-17】命中前缀缓存（prompt prefix cache）的 input token 数。
+    # 数据源：网关回填 `usage.prompt_tokens_details.cached_tokens` → mimo
+    # `token_stats.cache_read_tokens`（实测 tmp/llm_probe/** 大量非零，网关确实回填）。
+    # 口径：它**含在** total_tokens 之内（不是增量）。用途=对账「总 token 里有多少
+    # 被缓存复用」⇒ 衡量上下文复用效率、验证分层/压缩改造的真实收益（原则 5 成本）。
+    cached_tokens: Optional[int] = None
 
     # 正向: 调用信息
     input_params: Dict[str, Any] = field(default_factory=dict)
@@ -311,6 +332,8 @@ class EvalNode:
     def to_dict(self) -> Dict[str, Any]:
         d = {
             "id": self.id, "parent_id": self.parent_id, "root_id": self.root_id,
+            "schema_version": SCHEMA_VERSION,
+            "trajectory_format": TRAJECTORY_FORMAT,
             "layer": self.layer, "name": self.name, "step_order": self.step_order,
             "exec_date": self.exec_date.isoformat() if self.exec_date else None,
             "stock_code": self.stock_code, "stock_name": self.stock_name,
@@ -322,6 +345,7 @@ class EvalNode:
             "plan": self.plan, "session_id": self.session_id,
             "user_query": self.user_query, "model": self.model,
             "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
             "input_params": self.input_params,
             "tools_called": self.tools_called,
             "missing_data": self.missing_data, "data_source": self.data_source,
@@ -341,7 +365,26 @@ class EvalNode:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "EvalNode":
-        """从字典构建（不含 children，children 由 store.load_tree 处理）。"""
+        """从字典构建（不含 children，children 由 store.load_tree 处理）。
+
+        T8 契约锚点校验（fail-loud，禁兜底）：缺键 = T8 以前的 dump，按当前版
+        解析；外来 trajectory_format / 更高 schema_version / 非 int version
+        一律 ValueError——不静默错读成另一种形状。
+        """
+        fmt = d.get("trajectory_format")
+        if fmt is not None and fmt != TRAJECTORY_FORMAT:
+            raise ValueError(
+                f"trajectory_format 不兼容: {fmt!r}"
+                f"（本模块只解析 {TRAJECTORY_FORMAT!r}）")
+        ver = d.get("schema_version", SCHEMA_VERSION)
+        if isinstance(ver, bool) or not isinstance(ver, int):
+            raise ValueError(
+                f"schema_version 必须是 int，得到 {type(ver).__name__}: {ver!r}")
+        if ver > SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version={ver} 高于本模块支持的 {SCHEMA_VERSION}："
+                "拒绝用旧解析器读更新形状")
+
         exec_date = d.get("exec_date")
         if isinstance(exec_date, str):
             from datetime import date as _date
@@ -374,6 +417,7 @@ class EvalNode:
             user_query=d.get("user_query", ""),
             model=d.get("model", ""),
             total_tokens=d.get("total_tokens"),
+            cached_tokens=d.get("cached_tokens"),
             input_params=d.get("input_params", {}),
             tools_called=d.get("tools_called", []),
             missing_data=d.get("missing_data", []),

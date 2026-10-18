@@ -29,14 +29,161 @@ user_id——有意设计，空/合成 session_id 与 "default" 都不是 bug，
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import List, Optional
 
-from .qd_hooks import _HOOKS_LOCAL
+from .qd_hooks import current_session_id
+from .upstream_compat import read_cache_tokens, read_token_stats
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# ── 技能归属信号（P2-a / 2026-10-16）─────────────────────────────────
+# `TraceCollector.begin_skill` 原设计由 planner_node 输出 current_skill 驱动，但本项目
+# 无 planner_node：执行型技能经 `run_skill` 工具走**子进程**，其内部工具调用不回流父
+# collector。故以「run_skill 调用点」作为 skill 层信号——每次 run_skill 开一个 skill
+# 节点，其后的 on_tool_call（本次即 run_skill 自身）归入该节点，让「Chain→Skill→Tool」
+# 三层树真正生效（plan_digest / 案例聚类的 step 维度不再恒为 _orphan）。
+_SKILL_DISPATCH_TOOLS = ("run_skill",)
+
+
+def _skill_dispatch_name(action: dict) -> str:
+    """从工具调用里解析技能名：仅 `run_skill` 命中，取其 `name` 入参。永不抛。"""
+    try:
+        if str(action.get("tool", "")).strip() not in _SKILL_DISPATCH_TOOLS:
+            return ""
+        return str((action.get("params") or {}).get("name", "") or "").strip()
+    except Exception:
+        return ""
+
 # 「异常收尾」状态集：只有这些状态下，计划残留在才是"跑偏/被截断"的真信号。
 # 正常 Idle 收尾时模型常把 plan 当 TODO 用、不回写 completed ⇒ 残留是噪声。
+# ── 收尾链异步（2026-10-16 / ① 结果先出）──────────────────────────────
+# 【为什么】主轮出答案后还要跑 `_plan_lint → flush → intake → C3P → 案例`，其中
+# C3P 证据提取在本网关实测需 80~155 秒（成功）/更久（重试）⇒ 用户干等。
+# 移入后台后答案立刻返回；每 agent 一个**单线程** executor ⇒ 同会话收尾串行、
+# 不重叠，但**不阻塞** run() 返回。`QD_TAIL_ASYNC=0` 可回退同步。
+_TAIL_ASYNC_ON = (os.getenv("QD_TAIL_ASYNC") or "1").strip() not in ("0", "false", "False")
+_TAIL_WAIT_S = float(os.getenv("QD_TAIL_WAIT_S", "300") or 300)
+
+
+def _tail_executor(agent):
+    """取（或惰性创建）该 agent 的收尾执行器。
+
+    单线程 ⇒ 同会话收尾**串行不重叠**（上一轮收尾没完，下一轮排队），
+    但**不阻塞** `run()` 返回。
+    """
+    ex = getattr(agent, "_tail_exec", None)
+    if ex is None:
+        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qd-tail")
+        agent._tail_exec = ex
+    return ex
+
+
+# ── 进程退出兜底（2026-10-16）──────────────────────────────────────────
+# 【为什么必须有】异步收尾是**后台线程**，而一次性进程（CLI / 脚本 / 服务退出）
+# 会在打印答案后立刻返回解释器 ⇒ 线程被杀 ⇒ 本轮 `flush/intake/C3P/案例`
+# **全部丢失且静默**。结构性实证：异步模式下 `[Intake] 入库`/`run_finish`/案例
+# 三者皆无；同步模式（QD_TAIL_ASYNC=0）三者齐全。
+# 等待只发生在**退出阶段**，不影响 `run()` 的返回时刻。
+# 【局限·2026-10-16 实测】`os._exit()` **绕过** atexit ⇒ 一次性 CLI
+# （`cli.py:_flush_and_exit`）走不到这里。故退出点另配显式 `wait_tail_grace()`；
+# 本钩子保留给"库方式使用 / 正常解释器退出"的场景（无害的二次保险）。
+_TAIL_PENDING: "list" = []
+# 【2026-10-16 二次修正·竞态】原实现登记 **agent 对象**，而 CLI 主线程的
+# `wait_tail_grace()` 可能早于 agent 线程里的 `_spawn_tail` 执行（那时表是空的
+# ⇒ 直接返回 ⇒ 丢落库；实测异步 2 次里 1 次出现）。改为登记 **Event 本身**，
+# 并让 `wait_tail_grace` 对"在飞集合"轮询 —— 不再依赖登记时刻与登记对象。
+_TAIL_INFLIGHT: "list" = []          # [(event, done_future)]，线程安全（GIL 下 list 操作原子）
+
+
+def _register_inflight(ev, fut) -> None:
+    """登记"在飞收尾"（ev=落库阶段完成事件）。完成后自动摘除。"""
+    try:
+        _TAIL_INFLIGHT.append((ev, fut))
+    except Exception:
+        pass
+    try:
+        fut.add_done_callback(lambda _f: _drop_inflight(ev))
+    except Exception:
+        pass
+
+
+def _drop_inflight(ev) -> None:
+    try:
+        _TAIL_INFLIGHT[:] = [x for x in _TAIL_INFLIGHT if x[0] is not ev]
+    except Exception:
+        pass
+
+
+def _register_pending_tail(agent) -> None:
+    """登记一个"有待收尾"的 agent（atexit 时逐个等）。"""
+    try:
+        if not any(a is agent for a in _TAIL_PENDING):
+            _TAIL_PENDING.append(agent)
+
+    except Exception:
+        pass
+
+
+def _wait_pending_tails() -> None:
+    """atexit：等所有未完成收尾（每个最多 `QD_TAIL_WAIT_S` 秒）。永不抛。"""
+    while _TAIL_PENDING:
+        ag = _TAIL_PENDING.pop()
+        fut = getattr(ag, "_pending_tail", None)
+        if fut is None:
+            continue
+        try:
+            fut.result(timeout=_TAIL_WAIT_S)
+        except Exception:
+            try:
+                logger.warning("[tail] 退出前等待收尾超时/失败（%.0fs 上限），"
+                               "本轮落库可能不完整", _TAIL_WAIT_S)
+            except Exception:
+                pass
+
+
+try:
+    import atexit as _atexit
+    _atexit.register(_wait_pending_tails)
+except Exception:
+    pass
+
+
+def wait_tail_grace(grace_s: float = None) -> bool:
+    """退出点显式等收尾（有界）。返回 True=没有未完成收尾。
+
+    【为什么不用 atexit】`os._exit()` 绕过 atexit，而一次性 CLI 正是走它
+    （`cli.py:_flush_and_exit`，为躲数据源线程池的 join 卡死而有意为之）。
+    故退出点必须**显式**等一次，并给硬性上限：`QD_TAIL_EXIT_GRACE_S`（默认 30 秒）。
+    """
+    # 先摘掉已完成的（顺手清理）
+    for ev, fut in list(_TAIL_INFLIGHT):
+        if ev.is_set() or (fut is not None and fut.done()):
+            _drop_inflight(ev)
+    evs = [ev for ev, _f in list(_TAIL_INFLIGHT)]
+    # 只等**落库阶段**（flush+intake+案例，实测 ≤1s），不等 C3P（80~155s）。
+    g = float(grace_s if grace_s is not None else
+              (os.getenv("QD_TAIL_EXIT_GRACE_S") or 30))
+    deadline = _time.monotonic() + max(0.0, g)
+    # 轮询：即使此刻 `_spawn_tail` 还没执行（集合暂空），也给它一段宽限窗口，
+    # 因为收尾通常在本函数进入后毫秒级内被提交（run 的异步边界）。
+    while True:
+        pend = [ev for ev, _f in list(_TAIL_INFLIGHT) if not ev.is_set()]
+        if not pend:
+            if evs or _time.monotonic() >= deadline:
+                logger.info("[tail] 退出前已等完落库阶段（C3P 仍可在后台继续）")
+                return True
+            if _time.monotonic() >= (deadline - max(0.0, g) + 2.0):
+                # 宽限 2s 仍未见登记 ⇒ 本轮没有收尾（如未走 agent 路径）
+                logger.info("[tail] 退出前无待收尾任务")
+                return True
+        elif _time.monotonic() >= deadline:
+            logger.warning("[tail] 退出前等待**落库阶段**超时（%.0fs 上限）；"
+                           "C3P 证据提取属增益层，未完成不影响主数据", g)
+            return False
+        _time.sleep(0.05)
 _ABNORMAL_RUN_STATUS = ("truncated", "LimitsExceeded", "grounding_failed",
                         "empty", "budget_wrapped")
 
@@ -48,7 +195,7 @@ class AftercareMixin:
     def _make_collector(self, task):
         try:
             from .trace_collector import TraceCollector
-            sid = getattr(_HOOKS_LOCAL, "session_id", None) or "default"
+            sid = current_session_id() or "default"
             query = task if isinstance(task, str) else str(task)
             # 2026-10-01：task 是 **prefetch 加工后**的文本（记忆/技能/RAG 块 + 用户问题），
             # 直接落库会让 qd_agent_traces.user_query 变成一坨注入块，复盘时看不到
@@ -91,6 +238,122 @@ class AftercareMixin:
         except Exception:
             pass
 
+    # ── ① 结果先出：收尾链异步（2026-10-16）────────────────────────
+    def _spawn_tail(self, message: str, status: str, trace=None) -> None:
+        """把收尾链（计划校正 / 落库 / 追责 / C3P / 案例 / run_finish）丢到后台。
+
+        【快照纪律】后台要用的一切**在 spawn 时捕获**：`collector` 引用 + message +
+        status + stats + trace。线程起来后不再读 agent 的易变状态（agent 可能已被
+        下一轮复用）—— `self._collector` 也在此处摘除并交给 `_run_tail` 收尾。
+        【不阻塞】同 agent 单线程串行 ⇒ 上一轮收尾未完成时，新一轮的收尾排队，但
+        `run()` 本身**立刻返回**。
+        """
+        collector = getattr(self, "_collector", None)
+        self._collector = None
+        # ★ 快照纪律（2026-10-16 补）：agent 实例按 session 缓存、跨 run 复用
+        #   （qd_service._get_agent）⇒ 后台线程**不能**读 self.* 的易变字段，
+        #   否则第 N+1 轮会把 _steps_taken 归零 / 改写，run_finish 就会把
+        #   下一轮的 steps/tokens/model 记到本轮账上。此处一次性取值。
+        stats = read_token_stats(self.model)
+        _snap = {
+            "steps": int(getattr(self, "_steps_taken", 0) or 0),
+            "err": [e for e in (getattr(self, "tool_call_errors", None) or []) if e],
+            "tokens": int(getattr(stats, "total_tokens", 0) or 0),
+            # F10：网关回填的前缀缓存 input token（含在 tokens 内）。
+            # 缺省 0=网关未上报，写库侧据此落 NULL，不与"真实 0"混淆。
+            # F15b：改经 upstream_compat —— 上游改名时告警而非静默恒 NULL。
+            "cached": read_cache_tokens(self.model) or 0,
+            "model": str(getattr(getattr(self.model, "config", None),
+                                "model_name", "") or ""),
+        }
+
+        import threading as _threading
+        _db_ev = _threading.Event()          # 落库阶段完成事件（creator 先于 _collect 定义）
+
+        def _collect():
+            """后台：落库 + 追责（原 `_finish_collector` 的前半，顺序是契约）。"""
+            if collector is None:
+                return None
+            try:
+                from .preselect import record_task_calls
+                record_task_calls(str(getattr(collector, "user_query", "") or ""),
+                                  list(getattr(collector, "_all_tools_called", None) or []))
+            except Exception:
+                pass
+            # O-7（F23）：每 run 收口落一行观测快照（跨重启聚合看长期趋势）
+            try:
+                from .preselect import snapshot
+                snapshot()
+            except Exception:
+                pass
+            root_id = None
+            try:
+                collector.on_agent_finish(
+                    final_answer=message or "",
+                    total_steps=_snap["steps"],
+                    total_tokens=_snap["tokens"],
+                    model=_snap["model"],
+                    cached_tokens=_snap["cached"],
+                )
+                root_id = collector.flush()
+            except Exception:
+                pass
+            self._intake_accountability(collector, message or "", root_id, stats)
+            # ★ 落库阶段到此为止（traces=flush / decisions+claims=intake）。
+            #   先放行退出点，再跑增益层（C3P 实测 80~155s、案例依赖其 evidence）。
+            if trace is not None:
+                try:
+                    class _SnapAgent:               # run_finish 只读这两个字段
+                        pass
+                    _sa = _SnapAgent()
+                    _sa._steps_taken = _snap["steps"]
+                    _sa.tool_call_errors = _snap["err"]
+                    trace.run_finish(_sa, message or "", status)
+                except Exception:
+                    pass
+            try:
+                _db_ev.set()
+            except Exception:
+                pass
+            self._c3p_pipeline(collector, message or "")
+            self._record_case(collector, message or "", status, root_id, stats)
+            return root_id
+
+        if not _TAIL_ASYNC_ON:
+            self._plan_lint(status)
+            _collect()
+            if trace is not None:
+                try:
+                    trace.run_finish(self, message, status)
+                except Exception:
+                    pass
+            return
+
+        def _job():
+            try:
+                self._plan_lint(status)
+                _collect()                     # flush → intake → run_finish → C3P → 案例
+                logger.info("[tail] 收尾完成（后台）：status=%s", status)
+            except Exception as e:              # 收尾是旁路：绝不冒泡
+                logger.warning("[tail] 收尾异常(fail-open): %s: %s", type(e).__name__, e)
+
+        self._tail_db_done = _db_ev
+        self._pending_tail = _tail_executor(self).submit(_job)
+        _register_inflight(self._tail_db_done, self._pending_tail)
+        _register_pending_tail(self)          # atexit 兜底：进程退出前等它（见模块级注释）
+        logger.info("[tail] 收尾已转入后台（status=%s，QD_TAIL_ASYNC=0 可回退同步）", status)
+
+    def wait_tail(self, timeout: Optional[float] = None) -> bool:
+        """等本轮后台收尾完成（测试/脚本用）。返回 True=已完成或本就无任务。"""
+        fut = getattr(self, "_pending_tail", None)
+        if fut is None:
+            return True
+        try:
+            fut.result(timeout=float(timeout if timeout is not None else _TAIL_WAIT_S))
+            return True
+        except Exception:
+            return False
+
     def _finish_collector(self, message: str, status: str) -> None:
         """四条旁路的总入口；调用次序是契约（见本模块文件头）。"""
         collector = getattr(self, "_collector", None)
@@ -105,15 +368,22 @@ class AftercareMixin:
                               list(getattr(collector, "_all_tools_called", None) or []))
         except Exception:
             pass
+        # O-7（F23）：每 run 收口落一行观测快照（与上面配对同一收口点）
+        try:
+            from .preselect import snapshot
+            snapshot()
+        except Exception:
+            pass
         root_id = None
         stats = None
         try:
-            stats = getattr(self.model, "token_stats", None)
+            stats = read_token_stats(self.model)
             collector.on_agent_finish(
                 final_answer=message or "",
                 total_steps=self._steps_taken,
                 total_tokens=int(getattr(stats, "total_tokens", 0) or 0),
                 model=str(getattr(getattr(self.model, "config", None), "model_name", "") or ""),
+                cached_tokens=read_cache_tokens(self.model) or 0,
             )
             root_id = collector.flush()
         except Exception:
@@ -183,6 +453,9 @@ class AftercareMixin:
             cost = {
                 "steps": int(getattr(self, "_steps_taken", 0) or 0),
                 "tokens": int(getattr(stats, "total_tokens", 0) or 0),
+                # F10：命中前缀缓存 input token（含在 tokens 内）——经验库据此
+                # 对账「同题复跑的上下文复用率」，验证缓存是否真省了钱。
+                "cached": read_cache_tokens(self.model) or 0,
                 "latency_ms": int(getattr(root, "elapsed_ms", 0) or 0),
                 "model": str(getattr(getattr(self.model, "config", None),
                                      "model_name", "") or ""),
@@ -243,6 +516,14 @@ class AftercareMixin:
         collector = getattr(self, "_collector", None)
         if collector is None:
             return
+        # 技能归属（P2-a，2026-10-16）：run_skill 分发时开一个 skill 节点，其 on_tool_call
+        # 归入该节点（详见模块头 `_skill_dispatch_name`）。无论成败都收口（finally）。
+        skill = _skill_dispatch_name(action)
+        if skill:
+            try:
+                collector.begin_skill(skill)
+            except Exception:
+                skill = ""
         try:
             out = result.get("output") if isinstance(result, dict) else result
             err = error or (None if not isinstance(result, dict) or result.get("success", True)
@@ -251,3 +532,9 @@ class AftercareMixin:
                                    out, elapsed_ms, error=err)
         except Exception:
             pass
+        finally:
+            if skill:
+                try:
+                    collector.end_skill()
+                except Exception:
+                    pass

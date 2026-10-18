@@ -4,7 +4,12 @@ description: 自动策略调试助手。用户口语问「某票/某策略为什
 metadata:
   version: 1.0.0
   tags: strategy, debug, quant, auto, a_share
-  tools: list_strategies, why_strategy, debug_strategy, doctor_auto
+  # ★ 2026-10-17 修正：原声明 `list_strategies, why_strategy, debug_strategy,
+  #   doctor_auto` —— 后三个是**本技能 run.py 的子进程导出函数**，不是 agent
+  #   工具（注册表 101 个里没有，见 EXECUTABLE_SKILLS 的 exports 元组）。把它们
+  #   当工具声明 ⇒ 预选目录（2026-10-17 起真的进 LLM 输入）会教模型去直调不存在
+  #   的工具 = 制造幻觉。执行型技能的唯一 agent 侧入口是 `run_skill` 派活。
+  tools: list_strategies, run_skill
 ---
 
 # 策略口语化调试 (strategy-debug)

@@ -384,6 +384,10 @@ def _algo_analyze(
         "score": final_score,
         "direction": direction,
         "confidence": confidence,
+        # 评分模型自证（2026-10-17）：六维加权（趋势/指标/量价/形态/筹码/流通盘），
+        # 其中「趋势」维取自 analyze_trend 的复合共振分；与 bull_bear_research 的
+        # 五维加权（score_model=bb5_weighted(...)）是两套口径，引用须带身份。
+        "score_model": "tech6_weighted(趋势/指标/量价/形态/筹码/流通盘)",
         "signal": signal,
         "factors": factors,
         "analysis": analysis,
@@ -412,6 +416,12 @@ def _algo_analyze(
     return _r
 def technical_analysis(codes: str) -> dict:
     """技术面综合评分：内部调用 analyze_trend+get_indicator_snapshot+get_volume_analysis+analyze_pattern+get_chip_distribution，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
+
+    ⚠️ 评分口径（2026-10-17）：本分数是**六维加权**（趋势/指标/量价/形态/筹码/
+    流通盘，输出 `score_model=tech6_weighted(...)`），其中「趋势」维取自
+    analyze_trend 的复合共振分。与 `bull_bear_research` 的五维加权
+    （`score_model=bb5_weighted(...)`）**是两套不同模型**，同股给出不同分
+    属设计使然，不得互相当作同一指标对比或对冲。
 
     Args:
         codes: 股票代码（6位数字），如 "600519"

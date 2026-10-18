@@ -29,15 +29,33 @@ from __future__ import annotations
 import logging
 import os
 import time as _time
+from datetime import datetime
 from typing import Any, Callable, List, Optional
 
 from mimoagent.tools.mimocode import MimocodeToolRegistry
 from .tools._fn_adapter import FnToolAdapter
-from .preselect import capability_domain
-from .qd_config import CORE_TOOL_DOMAINS
+from .preselect import capability_domain, expand_overrides, group_members
+from .qd_config import (
+    CORE_TOOL_DOMAINS,
+    _activate_priority_enabled,
+    tool_connect_overrides,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# ── F24 激活来源优先级（序数越大越晚淘汰）─────────────────────────────
+#  【为什么】淘汰点全仓唯一（下方 `activate_tools`），原为纯 FIFO：`search_tools`
+#  中途检索自动激活的 top-N（`tool_discovery`，source="auto"）会把模型**刚点名**
+#  的工具从 `_activated` 挤掉 ⇒ 点名不生效 = 降智。
+#  顺序：模型点名 > 技能卡片/声明补位 > 预选 > 域兜底 > 自动检索。
+_ACTIVATION_SOURCE_RANK = {
+    "auto": 0,       # search_tools 自动激活（栈底，最先被淘汰）
+    "fallback": 1,   # 预选域兜底
+    "preselect": 2,  # LLM 预选 / 确定性快路由
+    "declared": 3,   # 技能卡片声明的 force 工具
+    "named": 4,      # 模型显式点名（activate_tools / fail-open 直调）
+}
 
 # ═══════════════════════════════════════════════════════════════
 #  工具面预加载（2026-10-01）—— 复刻旧系统「启动时筛一次，消息路径不扫」
@@ -129,12 +147,67 @@ class ToolFaceMixin:
     """
 
     # ── 工具分层 ────────────────────────────────────────────────
+    def _partition_tools(self) -> tuple:
+        """按「config 基座 + T7 覆盖」派生 (core, on_demand, disabled, states)。
+
+        ★ T7 接线（2026-10-17，审计 G1）：分层不再裸读 config.on_demand_tools，
+        而是经 `tool_connect_overrides()` 叠加 `QD_TOOL_CONNECT` 覆盖——
+        此前读口零消费方，改 env 对工具面零效果（哑炮，`tmp/t7_improvement_gaps_
+        20261017.md` G1）。推导链（单一推导；states 供 tool_face 快照复用）：
+          base     = name ∈ config.on_demand_tools ? deferred : resident
+                     （显式 config 口径优先于 env 默认——刻意优先级）
+          override = QD_TOOL_CONNECT 覆盖（**组级条目先经 tool_groups
+                     expand_overrides 展开到成员**，单项优先、组间冲突
+                     disabled 最严格胜出；再赢过 base）
+          cap_off  = domain==capability 且 QD_CAPABILITIES=0 ⇒ disabled
+          之后     = resident 走既有规则（extra_core→core / 非 FnToolAdapter→core /
+                     domain∈CORE_TOOL_DOMAINS→core / 其余 on_demand）
+        ★ 默认 env 下与改造前逐位一致——v6 分层测试 + p9 基线是判据。
+        """
+        forced_on_demand = set(self.config.on_demand_tools or ())
+        overrides = expand_overrides(tool_connect_overrides(),
+                                     group_members(self.tool_registry))
+        cap_off = (os.getenv("QD_CAPABILITIES") or "1").strip() in ("0", "false", "False")
+        cap_dom = capability_domain()
+        core: List[str] = []
+        on_demand: List[str] = []
+        disabled: List[str] = []
+        states: dict = {}
+        for name in self.tool_registry.list_tools():
+            try:
+                tool = self.tool_registry.get(name)
+            except Exception:
+                tool = None
+            domain = getattr(tool, "domain", "") or ""
+            state = overrides.get(name.lower()) or (
+                "deferred" if name in forced_on_demand else "resident")
+            if state == "resident" and cap_off and domain == cap_dom:
+                state = "disabled"      # 能力层总闸：QD_CAPABILITIES=0 整域下线
+            states[name] = state
+            if state == "disabled":
+                disabled.append(name)   # 注册表与 defs 仍在 ⇒ 回退可救（§8.3）
+                continue
+            if state in ("deferred", "capability"):
+                on_demand.append(name)
+                continue
+            # resident：既有规则不动（2026-09-19 故障的直接机制就是原生工具掉出必注入）
+            if name in (self.config.extra_core_tools or []):
+                core.append(name)
+            elif not isinstance(tool, FnToolAdapter):
+                core.append(name)          # mimo 原生 / update_plan
+            elif domain in CORE_TOOL_DOMAINS:
+                core.append(name)
+            else:
+                on_demand.append(name)
+        return core, on_demand, disabled, states
+
     def _sync_tool_tiers(self) -> None:
-        """快照工具定义并按域切分必注入层 / 按需层。
+        """快照工具定义并按域切分必注入层 / 按需层 / 禁用层。
 
         【必注入层的判定】非 FnToolAdapter（mimo 原生 + update_plan）恒必注入；
         FnToolAdapter 看 domain：common（tools/ 顶层）与 meta（元工具：web_search /
         format_result）必注入，子域（finance/knowledge…）按需。
+        【三分组来源】`_apply_tool_connect()`（T7 覆盖在其内叠加）。
         """
         defs = {}
         for d in self.tool_registry.get_function_definitions():
@@ -143,54 +216,161 @@ class ToolFaceMixin:
                 defs[name] = d
         self._defs_by_name = defs
         self._all_defs = [defs[n] for n in self.tool_registry.list_tools() if n in defs]
-        core, on_demand = [], []
-        forced_on_demand = set(self.config.on_demand_tools or ())
-        for name in self.tool_registry.list_tools():
-            if name in forced_on_demand:
-                on_demand.append(name)
-                continue
-            if name in (self.config.extra_core_tools or []):
-                core.append(name)
-                continue
-            try:
-                tool = self.tool_registry.get(name)
-            except Exception:
-                core.append(name)
-                continue
-            if not isinstance(tool, FnToolAdapter):
-                core.append(name)          # mimo 原生 / update_plan
-            elif getattr(tool, "domain", "common") in CORE_TOOL_DOMAINS:
-                core.append(name)
-            else:
-                on_demand.append(name)
+        self._apply_tool_connect()
+
+    def _apply_tool_connect(self) -> None:
+        """（重）算 T7 三分组：core / on_demand / disabled + 生效态字典。
+
+        【热生效载体】改 `QD_TOOL_CONNECT` 后**下一 run** 工具面即变，
+        无需重启进程（方案 §8.6「无重启」验收项）。挂在 `reset_run_activation()`
+        （`_run_inner` 每 run 已调用）⇒ 不新增 qd_agent 行数（420 行护栏）。
+        【为什么不重建 defs】`_defs_by_name` 是全量 schema 快照，与 T7 状态
+        无关；本方法只做 O(工具数) 的字符串/集合比较，零网络零 schema 序列化。
+        """
+        core, on_demand, disabled, states = self._partition_tools()
         self._core_names = core
         self._on_demand_names = on_demand
+        self._disabled_names = disabled
+        self._connect_states = states
 
-    def activate_tools(self, names: List[str]) -> dict:
+    def reset_run_activation(self) -> None:
+        """每 run 开头清空按需层激活 + 刷新 T7 三分组（P2-c + T7 热生效）。
+
+        【为什么按 run 清空】`_activated` 原为**会话级**累积（2026-10-14 G4 旧注
+        「多轮里上轮激活的工具还可能用得上」），实测每会话多漏 ≈2,280 tok schema
+        （审计文档 §三）。会话级在新架构下已无必要：按需层本就是"用什么激活什么"，
+        上轮激活过、本轮又被点名的工具由 `execute_action` 的 fail-open 就地再激活。
+        【必须在预选之前】`qd_agent._run_inner` 在 `_maybe_preselect_tools` 之前调用，
+        否则残留项会挤占 FIFO 名额、顶掉本轮预选成果。
+        【T7 热生效（2026-10-17）】同点刷新三分组：`_activated` 清空后重算
+        core/on_demand/disabled，保证"改配置 ⇒ 下一 run 生效"且不带着上轮的
+        禁用/延迟残留。顺序在清空**之后**：先丢激活态，再按新配置分组。
+        """
+        self._activated = []
+        self._activated_source = {}
+        self._apply_tool_connect()
+
+    def _src_map(self) -> dict:
+        """惰性取/建「工具 → 来源优先级序数」表（F24）。
+
+        【为什么惰性】ToolFaceMixin 的测试 stand 只设 `_activated`（不跑 `__init__`），
+        故不能假定 `_activated_source` 已建；这里按需补建，兼容真实 agent 与 stand。
+        """
+        m = getattr(self, "_activated_source", None)
+        if m is None:
+            m = self._activated_source = {}
+        return m
+
+    def activate_tools(self, names: List[str], *, source: str = "named") -> dict:
         """激活按需层工具（模型经 activate_tools / search_tools 调用）。
 
-        返回 {"activated","already","unknown","active_total","cap"}。
-        超容量时按 FIFO 淘汰最早的激活项。
+        返回 {"activated","already","unknown","disabled","active_total","cap"}。
+        超容量时按 **来源优先级** 淘汰（F24）：序数小者先淘汰，同序数退回 FIFO（早插先淘汰）。
+        `source` ∈ {"named","declared","preselect","fallback","auto"}；非法值直接
+        `ValueError`（fail-loud，不静默归 named —— 避免误用悄悄降保护级）。
+        `QD_ACTIVATE_PRIORITY=0` ⇒ 一键退回纯 FIFO 淘汰。
+
+        ★ T7 disabled（2026-10-17）：`QD_TOOL_CONNECT` 置 disabled 的工具
+        **不接受激活**（进 `disabled` 桶，调用方可见）——否则 trace 的
+        active_tool_names 会虚报"已激活"而面里根本没有（审计对不上账）。
+        但**直调回退仍放行**：`execute_action` 的 fail-open 不依赖本函数的
+        返回值，registry 持有实例 ⇒ 模型直接点名照样执行（§8.3「回退可救」）。
         """
+        if source not in _ACTIVATION_SOURCE_RANK:
+            raise ValueError(
+                f"unknown activation source {source!r}; "
+                f"expect one of {sorted(_ACTIVATION_SOURCE_RANK)}")
+        rank = _ACTIVATION_SOURCE_RANK[source]
         cap = max(1, int(self.config.max_active_domain_tools))
-        activated, already, unknown = [], [], []
+        activated, already, unknown, disabled = [], [], [], []
+        src = self._src_map()
+        off = set(getattr(self, "_disabled_names", None) or [])
         for n in (names or []):
             n = str(n).strip()
             if not n:
                 continue
-            if n not in self._defs_by_name:
+            if n in off:
+                disabled.append(n)
+            elif n not in self._defs_by_name:
                 unknown.append(n)
             elif n in self._core_names or n in self._activated:
                 already.append(n)
+                # 更强的来源再次点名既激活项 ⇒ 升级其保护级（如 auto 激活后被模型点名）
+                if n in self._activated and rank > src.get(n, -1):
+                    src[n] = rank
             else:
                 self._activated.append(n)
+                src[n] = rank
                 activated.append(n)
         while len(self._activated) > cap:
-            self._activated.pop(0)         # FIFO：先激活的先淘汰
+            if _activate_priority_enabled():
+                idx = min(range(len(self._activated)),
+                          key=lambda k: (src.get(self._activated[k], 0), k))
+            else:
+                idx = 0                       # 回退：纯 FIFO（先激活的先淘汰）
+            src.pop(self._activated[idx], None)
+            self._activated.pop(idx)
         return {
             "activated": activated, "already": already, "unknown": unknown,
+            "disabled": disabled,
             "active_total": len(self._activated), "cap": cap,
         }
+
+    # ── 能力目录（T1：让被延迟的工具可被模型看见）────────────────────
+    #  `_sync_tool_tiers` 的 on_demand_tools 会把工具移出必注入层；移出后若地图
+    #  只给"域 + 数量"，模型就**不知道这些能力存在** ⇒ 静默消失。
+    #  这里按"组名 + 适配场景 + 组内名单"补齐。
+    #
+    #  ★ 口径对齐 OpenAI tool search：延迟的工具仍暴露**名字与一句描述**，
+    #    只是不暴露参数 schema —— 所以这里极便宜（名字远小于 schema）。
+    #  ★ 组描述是检索面：模型主要靠它决定"要不要加载这一组" ⇒ 每组的
+    #    "适配场景"必须写清用途，而不是罗列工具名。
+    #  ★ 名单在加载时刻生成，不硬编码任何文件名/命令。
+    #  ⚠ 名单长度：原生 coding 组仅 8 个，全列；大域（finance 37 / capability 40）
+    #    沿用"例：…"口径省 token，精确检索交给 search_tools。
+    _DEFERRED_NATIVE_LABELS = {
+        "task": "派子 agent 执行独立子任务",
+        "bash": "执行 shell 命令（装包/跑脚本/调试/批量处理）",
+        "edit": "精确字符串替换修改文件",
+        "write": "整文件写入/覆盖",
+        "read": "读取文件内容",
+        "glob": "按文件名模式查找",
+        "grep": "按内容正则检索",
+        "compact": "压缩上下文",
+    }
+    _DEFERRED_DOMAIN_HINTS = {
+        "finance": "A股行情/财务/资金面/板块等取数与分析",
+        "knowledge": "本地知识库检索",
+        "common": "通用技能执行入口",
+        "capability": "外部能力包",
+        "other": "其他未分域工具",
+        "native": "agent 原生能力（文件/shell/子任务）",
+    }
+
+    def _deferred_names(self) -> List[str]:
+        """延迟层（注册表有、但不在必注入层）—— 正确性来自"注册表 − core"差集。
+
+        ★ 2026-10-17 T7：再减 `_disabled_names`——disabled 工具从目录消失
+        （§8.3「目录条目同时消失」），否则地图/目录仍会把它报给模型。
+        默认配置（无 T7 覆盖）下 disabled 恒为空 ⇒ 本改动零副作用。
+        """
+        try:
+            core = set(self._core_names or [])
+            disabled = set(getattr(self, "_disabled_names", None) or [])
+            return [n for n in self.tool_registry.list_tools()
+                    if n not in core and n not in disabled]
+        except Exception:
+            return []
+
+    def _deferred_group_desc(self, group: str) -> str:
+        """组描述（检索面）：coding 用贴合量化场景的自述，其余走域/原生提示表。"""
+        if group == "coding":
+            return ("读写改文件 / 跑 shell 命令 / 派子任务，"
+                    "用于写分析脚本、调试回测、查代码")
+        if group.startswith("native"):
+            return "agent 原生能力（文件/shell/子任务）"
+        return self._DEFERRED_DOMAIN_HINTS.get(
+            group, "%s 域工具" % group if group and group != "other" else "其他未分域工具")
 
     def _tool_domain(self, name: str) -> str:
         """工具的来源域（common / finance / knowledge / capability …）。"""
@@ -214,8 +394,13 @@ class ToolFaceMixin:
         if self.config.tool_tier_mode != "tiered":
             return self._all_defs
         names = list(self._core_names)
-        names += [n for n in self._activated if n not in self._core_names]
-        return [self._defs_by_name[n] for n in names if n in self._defs_by_name]
+        names += [n for n in (getattr(self, "_activated", None) or [])
+                  if n not in self._core_names]
+        # ★ T7 disabled：本 run 中途被禁用的工具（如上轮激活残留）立即从面里
+        # 消失；execute_action 的 fail-open 仍放行直调（回退可救，§8.3）。
+        disabled = set(getattr(self, "_disabled_names", None) or [])
+        return [self._defs_by_name[n] for n in names
+                if n in self._defs_by_name and n not in disabled]
 
     def active_tool_names(self) -> list:
         return [(d.get("function") or {}).get("name") for d in self._active_tool_definitions()]
@@ -281,7 +466,42 @@ class ToolFaceMixin:
         """
         return _ensure_capabilities(provider)
 
-    # ── 工具地图（写进 system template，省发现轮）──────────────
+    # ── 每轮动态上下文（注入本轮 task，不进 system）──────────────
+    def _dynamic_context_text(self, task):
+        """F9：把 per-turn 动态上下文（当前时间 + 工具地图）前置到本轮 task。
+
+        【为什么必须离开 system_template】mimo `agents/base.py:213` 只在会话
+        **第一条消息**时 seed system（`if first_turn: add_message("system", ...)`），
+        之后 system 永久冻结。而 `now`（秒级）与 `tool_map`（含
+        `[已激活·本轮…]`，依赖每轮 `_activated`）都是 per-turn 量 ⇒ 若留在
+        system 里，自 turn2 起即陈旧（实测 turn2 的 system 仍是 turn1 的
+        时间戳）。而 task 每轮都新进 messages ⇒ 是唯一可靠的 per-turn 通道。
+
+        【tool_availability 为何留下】它是启动期实测的进程内不变量
+        （`probe_tools`），会话内不变 ⇒ 仍在 system 里渲染，且**只算一次**
+        （首个 run、`self.messages` 尚空时）—— 避免每轮白算。system 冻结对
+        prompt cache 友好（跨轮前缀逐字节稳定），故不逐轮重渲 system。
+
+        【token 代价】工具地图每轮随 task 进一次（约 k 级 tok）；换取"模型
+        每轮看到真实工具面/时间"。旧实现在 turn2+ 既不刷新、又每轮白算，两头亏。
+        """
+        if not getattr(self, "messages", None):
+            try:
+                self.extra_template_vars["tool_availability"] = self._tool_availability_text()
+            except Exception:
+                pass
+        if not isinstance(task, str):
+            return task
+        try:
+            head = "[当前时间] " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tmap = self._tool_map_text()
+            if tmap:
+                head += "\n[工具地图]\n" + tmap
+            return head + "\n\n" + task
+        except Exception:
+            return task
+
+    # ── 工具地图（作 [工具地图] 块注入本轮 task，省发现轮）──────
     def _tool_map_text(self) -> str:
         """提智点 C：分层工具地图（必注入层列名，按需层只给域+数量以省 token）。"""
         try:
@@ -299,26 +519,54 @@ class ToolFaceMixin:
             activated = [n for n in getattr(self, "_activated", [])
                          if n not in self._core_names]
             if activated:
-                # ★ 2026-10-14 G4（措辞订正）：`_activated` 是**会话级**累积（只做加法，
-                #   多轮里上一轮激活的工具还可能用得上），这里原先写"本轮"与事实不符
-                #   ⇒ 模型会以为名单里的都是本轮预选成果。措辞改为"本会话"。
-                #   ⚠ 未修部分（结构性，待拍板）：FIFO 淘汰（cap=QD_MAX_ACTIVE_TOOLS）
-                #   对本轮预选项**没有 pin**，预选 ≤8 + search 自动激活 ≤8 可达 16 > 12
-                #   ⇒ 同一 run 内预选成果会被后到激活静默顶掉（`_activated.pop(0)`）。
-                #   功能不坏（execute_action 有 fail-open 就地再激活），但会抖、留痕乱。
-                lines += ["[已激活·本会话可直接调用（含历史轮次），**不要再** "
+                # ★ 2026-10-16 改口径：`_activated` 现为**per-run**（`qd_agent._run_inner`
+                #   每轮开头清空）——原为会话级累积（2026-10-14 G4），实测每会话多漏
+                #   ≈2,280 tok schema，故改按 run 重置。措辞恢复"本轮"（名单即本轮预选/
+                #   激活成果）。上轮激活过、本轮又被点名的工具由 execute_action 的
+                #   fail-open 就地再激活。
+                # ★ 2026-10-17 审计 T3：预选 lint 覆盖补位加进来的工具带**原因**
+                #   标注（"任务涉及估值/基本面"）——旧版只列名字，模型不知道为何
+                #   多出一个没点过的工具，实测把能补 PE/PB 的 batch_valuation_compare
+                #   白白放着没用，报告留了本可避免的"未获取"缺口。
+                #   来源：qd_agent 在预选后、渲染前写好 last_preselect_report；
+                #   此处现算（不落新属性）以守住 qd_agent ≤420 行拆分红线。
+                from .qd_preselect import preselect_additions
+                additions = preselect_additions(
+                    getattr(self, "last_preselect_report", {}) or {})
+                lines += ["[已激活·本轮可直接调用，**不要再** "
                           "search_tools/activate_tools]",
-                          "  " + ", ".join(activated)]
-            lines.append("[按需·需先 search_tools 检索、activate_tools 激活]")
+                          "  " + ", ".join(
+                              n + (f"（预选补充：任务涉及{additions[n]}）"
+                                   if n in additions else "")
+                              for n in activated)]
+            lines.append("[延迟·需先 activate_tools 点名激活；不确定名字用 search_tools 检索]")
             if groups:
                 cap_domain = capability_domain()
+                coding_names = sorted(n for n in self._deferred_names()
+                                      if n in self._DEFERRED_NATIVE_LABELS)
+                if coding_names:
+                    lines.append(f"  - coding（{len(coding_names)} 个）"
+                                 f"{self._deferred_group_desc('coding')}："
+                                 f"{', '.join(coding_names)}")
                 for dom, names in sorted(groups.items()):
-                    # 域内工具优先于能力层：把优先级写进地图，别指望模型自己猜
-                    note = ("（低优先级：域内工具无覆盖时才用）" if dom == cap_domain else "")
-                    lines.append(f"  - {dom}: {len(names)} 个{note} —— 例："
-                                 f"{', '.join(sorted(names)[:3])}")
+                    if dom == "native":
+                        continue                 # 原生工具已并入 coding 组
+                    if dom == "other":
+                        # 已并入 coding 组的原生工具不再在 other 里重复出现
+                        names = [n for n in names if n not in self._DEFERRED_NATIVE_LABELS]
+                        if not names:
+                            continue
+                    desc = self._deferred_group_desc(dom)
+                    low = "，低优先级" if dom == cap_domain else ""
+                    lines.append(f"  - {dom}（{len(names)} 个{low}）{desc} —— 例："
+                                 f"{', '.join(sorted(names)[:6])}")
+                other_native = sorted(n for n in self._deferred_names()
+                                      if n not in self._DEFERRED_NATIVE_LABELS
+                                      and self._tool_domain(n) in ("", "native"))
+                if other_native:
+                    lines.append("  - native-其他: " + ", ".join(other_native))
             else:
-                lines.append("  （本会话无按需层工具）")
+                lines.append("（本会话无按需层工具）")
             return "\n".join(lines)
         except Exception:
             return ""

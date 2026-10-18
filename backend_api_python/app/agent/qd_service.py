@@ -45,6 +45,30 @@ def _relevance(query: str, text: str) -> int:
     return sum(1 for k in keys if k in t)
 
 
+# 句子/行边界字符（按优先级从高到低）：换行 > 句末 > 分句 > 逗号
+_BOUNDARY_CHARS = "\n。！？；"
+
+
+def _clip(text: str, limit: int) -> str:
+    """按 limit 截断，但**落在句子/行边界**上，不盲切。
+
+    为什么改（2026-10-17 审计 I2a）：近史/参考资料原先用裸 `[:200]`/`[:300]`
+    硬切，实测三条近史全部断在句子中间（"不建议在分歧转一"、"行情快照
+    （2026-10-1"、"## 一、"）——断句残片进上下文，模型读着费 token 还容易
+    把半句话当事实引用。切点优先取 ≤limit 的最后一个边界字符；前半段内
+    一个边界都没有（罕见：无标点长串）才退化为硬切。
+    """
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    window = s[:limit]
+    for ch in _BOUNDARY_CHARS:
+        i = window.rfind(ch)
+        if i >= limit // 2:          # 边界太靠前（前半段都没有）就换下一个字符
+            return window[:i + 1]
+    return window                    # 无可用边界：硬切（保持原上限语义）
+
+
 def _should_store_assistant(text: str) -> bool:
     """本轮回复是否入会话记忆（best-effort 写侧闸门）。
 
@@ -228,8 +252,11 @@ def _skill_block(name: str, body: str, skills) -> str:
                          f'resource="references/<文件>")')
     except Exception:
         _res_hint = ""
+    # 截断走 _clip（句子边界），不盲切：盲切会把步骤 4 的标题腰斩在半个词上
+    # （2026-10-17 审计：auto-agent 正文 4459c 被切在"### 步骤 4"后一行中间），
+    # 模型拿到的是半句指令，比"明确告知已截断"更难识破。
     return (
-        f"{body[:_SKILL_BODY_CAP]}\n……（正文共 {len(body)} 字符，已截断）\n"
+        f"{_clip(body, _SKILL_BODY_CAP)}\n……（正文共 {len(body)} 字符，已截断）\n"
         f"[技能目录] {outline}\n"
         f"[按需读取] 要完整正文用 read_skill(name=\"{name}\")；"
         f"只看某小节用 read_skill(name=\"{name}\", heading=\"<小节关键词>\"){_res_hint}。"
@@ -300,19 +327,37 @@ def _rank_skills(cands: list, keys, msg_l: str, has_entity: bool) -> list:
 
 
 def _build_default_model():
-    """从 .env 构建 mimoagent 模型（OpenAI 兼容 chat 协议）。"""
+    """从 .env 构建 mimoagent 模型（OpenAI 兼容 chat 协议）。
+
+    【F5（2026-10-17）：收敛到 llm.py —— agent 链路唯一 LLM 出口】
+    此前这里直调 `mimoagent.models.get_model(config={...})`，与 chain/、skill/
+    evidence 全都经 `llm.get_model` 形成**第二条构造路径**：绕过 provider 解析、
+    模型实例缓存，且不带超时（回落 mimo 默认 3600s，一次网络挂起吊死整条链）。
+    现统一走 `llm.get_model` ⇒ 与其余调用点共用同一份「解析 + 缓存 + 超时」。
+
+    保持不变的部分：`temperature` / `max_tokens` 仍经 `model_kwargs` 原样透传；
+    base_url / api_key / model 仍只认 `OPENAI_*`（与改造前逐字同源，不随
+    `LLM_PROVIDER` 漂移）。
+
+    超时（用户裁定 A1，2026-10-17）：主链默认 **120s**（原 mimo 默认 3600s），
+    `QD_LLM_TIMEOUT` 显式设置时覆盖 —— 与 chain/skill 同一旋钮、同一默认值档。
+    """
     import os
-    from mimoagent.models import get_model
-    return get_model(config={
-        "model_name": os.getenv("OPENAI_MODEL", "qwen-plus"),
-        "protocol": "chat",
-        "model_kwargs": {
-            "base_url": os.getenv("OPENAI_BASE_URL") or None,
-            "api_key": os.getenv("OPENAI_API_KEY", ""),
+    from .llm import get_model
+    try:
+        timeout = float((os.getenv("QD_LLM_TIMEOUT") or "").strip() or 120)
+    except ValueError:
+        timeout = 120
+    return get_model(
+        base_url=os.getenv("OPENAI_BASE_URL") or None,
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        model=os.getenv("OPENAI_MODEL", "qwen-plus"),
+        timeout=timeout,
+        model_kwargs={
             "temperature": float(os.getenv("AGENT_LLM_TEMPERATURE", "0.1")),
             "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "16384")),
         },
-    })
+    )
 
 
 class QDAgentService:
@@ -406,14 +451,21 @@ class QDAgentService:
 
     # ── 自动预取（功能对账：RAG/记忆注入体验等价）──────────────
     def _prefetch(self, message: str, session_id: str,
-                  resolve_info: Optional[dict] = None) -> tuple[str, dict]:
+                  resolve_info: Optional[dict] = None,
+                  skill_hint: str = "") -> tuple[str, dict]:
         """拼装上下文并返回 (注入后任务文本, 留痕报告)。
 
         留痕报告（2026-10-01）记录每个候选块：注入/丢弃 + 字符数 + 原因，
         由 QDAgent.trace_prefetch 落 trace —— "为什么它会这么说"不再靠猜。
 
         resolve_info（2026-10-01 新增）：`resolvers/bridge.resolve()` 的产出。
-        用于 ①注入已识别标的/领域 ②给技能选择提供"有没有标的"这个范围信号。
+        用于 ①注入已识别标的/领域 ②给技能选择提供"有没有标的"这个范围信号
+        ③F2 返工（2026-10-17）：其 effective_input 含相对日就地标注（如「后天(2026-10-19)」），
+        作为**模型看到的用户问题**下发，禁止模型自行口算相对日 ⇒ 消除日期幻觉。
+
+        skill_hint（2026-10-17 新增，skill 进预选）：预选器 LLM 从**技能目录**
+        里点名的技能名，作强提示覆盖 `_rank_skills` 的关键词 top-1。空串 =
+        没有提示 ⇒ 与改造前完全一致（关键词选择仍是唯一路径）。
         """
         import time as _time
         _t0 = _time.perf_counter()
@@ -434,13 +486,18 @@ class QDAgentService:
                 parts.append(_rb)
                 blocks.append({"kind": "resolve", "injected": True, "chars": len(_rb),
                                "reason": "已识别实体/领域"})
+        # 时间/实体增强后的用户问题（2026-10-17 F2 返工）：解析器（TimeResolver 等）把
+        # 相对日词**就地标注**进 effective_input（如「后天(2026-10-19)」）。必须把它作为
+        # 模型看到的用户问题下发——否则模型只拿原始问句自算相对日 ⇒ 幻觉（run10 H1）。
+        # 原始 message 仅作各种匹配（技能/记忆相关度）与回落，避免被增强文本污染。
+        _user_q = str((resolve_info or {}).get("effective_input") or "").strip() or message
         # 记忆近史（相关度闸门：无关历史不注入——2026-10-01 文不对题回归，
         # 问跑马灯被旧股票记忆带偏成行情跑马灯）
         if self.memory is not None:
             try:
                 hist = asyncio.run(self.memory.get_history(session_id, limit=6))
                 if hist:
-                    lines = [f"- {getattr(m, 'role', 'user')}: {str(getattr(m, 'content', ''))[:200]}" for m in hist]
+                    lines = [f"- {getattr(m, 'role', 'user')}: {_clip(str(getattr(m, 'content', '')), 200)}" for m in hist]
                     block = "\n".join(lines)
                     score = _relevance(message, block)
                     if score >= 2:
@@ -453,6 +510,8 @@ class QDAgentService:
                 blocks.append({"kind": "memory", "injected": False, "chars": 0,
                                "reason": f"召回异常（fail-open）: {e}"})
         # 技能自动加载（提智点 A）：按任务关键词匹配技能，命中即注入方法论正文
+        # F1（2026-10-17）：实际注入的技能名 ⇒ 供 service 侧按**实际注入技能**补声明工具
+        _skill_resolved = ""
         if self.skills is not None:
             try:
                 cands = self.skills.list_skills() or []
@@ -465,8 +524,26 @@ class QDAgentService:
                 ranked = _rank_skills(cands, keys, msg_l, has_entity)
                 best = ranked[0][2] if ranked else None
                 best_score = ranked[0][1] if ranked else 0   # 阈值看原始分（权重只调序）
+                # ★ skill 进预选（2026-10-17）：预选器 LLM 点名的技能作**强提示**
+                #   覆盖关键词 top-1。两个设计判据：
+                #   ① 为什么可信——7 个技能里有 3 个都声明适用"分析某只股票"
+                #      （auto-agent / auto-finance-analysis-stock / auto-stock-analyze），
+                #      关键词 top-1 在这种真歧义上只能靠词频硬挑；LLM 是看着
+                #      「技能名 + 适用场景 + 声明工具」选的，证据强一档。
+                #   ② 为什么绕过 _SKILL_INJECT_MIN——该阈值防的是**关键词弱证据**
+                #      误注大正文（2,178c 技能预览）；显式点名不属于它要防的情形。
+                #      非法名（幻觉/不在目录）⇒ 丢弃回落关键词（fail-open，与
+                #      parse_selection 的"编造名丢弃"同哲学），不静默、不猜。
+                hint_used = False
+                if skill_hint:
+                    _hint = str(skill_hint).strip()
+                    if _hint in {c.get("name") for c in cands if isinstance(c, dict)}:
+                        best, hint_used = _hint, True
+                    else:
+                        logger.debug("[prefetch] 预选技能名不在目录，回落关键词选择: %s",
+                                     _hint)
                 hit = False
-                if best and best_score >= _SKILL_INJECT_MIN:
+                if best and (hint_used or best_score >= _SKILL_INJECT_MIN):
                     # 键口径 + LRU 容量上限都在 _skill_seen_for 里（D-12），
                     # 这里不要再直接动 self._skill_seen。
                     seen = self._skill_seen_for(session_id)
@@ -509,13 +586,17 @@ class QDAgentService:
                                 parts.append(f"[相关技能：{best}]\n{blk}")
                                 seen.add(best)
                                 hit = True
+                _skill_resolved = best if hit else ""
                 blocks.append({"kind": "skill", "injected": hit,
                                "chars": len(parts[-1]) if hit else 0, "relevance": best_score,
-                               "name": best or "", "reason":
-                                   (f"命中技能 {best}（得分 {best_score}"
-                                    f"，有标的={has_entity}）" if hit
-                                    else f"最佳候选 {best} 得分 {best_score} "
-                                         f"< {_SKILL_INJECT_MIN}，未注入")})
+                               "name": best or "", "hint": str(skill_hint or ""),
+                               "hint_used": hint_used, "reason":
+                                   (f"预选指定技能 {best}（LLM 语义选择，绕过关键词阈值）"
+                                    if (hit and hint_used)
+                                    else (f"命中技能 {best}（得分 {best_score}"
+                                          f"，有标的={has_entity}）" if hit
+                                          else f"最佳候选 {best} 得分 {best_score} "
+                                               f"< {_SKILL_INJECT_MIN}，未注入"))})
             except Exception as e:
                 logger.debug("[prefetch] 技能匹配失败（fail-open）: %s", e)
                 blocks.append({"kind": "skill", "injected": False, "chars": 0,
@@ -533,7 +614,7 @@ class QDAgentService:
                             continue
                         sc = _relevance(message, str(d.get('content', '')))
                         if sc >= 2:
-                            lines.append(f"- {str(d.get('content', ''))[:300]}")
+                            lines.append(f"- {_clip(str(d.get('content', '')), 300)}")
                             kept += 1
                         else:
                             dropped += 1
@@ -582,10 +663,13 @@ class QDAgentService:
             "elapsed_ms": round((_time.perf_counter() - _t0) * 1000, 2),
             # 执行型技能卡片点名的工具（去重、保序）⇒ agent 在预选后激活（见 _run_inner）
             "skill_force_tools": list(dict.fromkeys(force_tools)),
+            # F1（2026-10-17）：实际注入正文/卡片的技能名（"" = 未注入）⇒ service 按它
+            # 补声明工具（`supplement_skill_declared`），消除"注入正文却无工具"悬空。
+            "skill_resolved": _skill_resolved,
         }
         if not parts:
-            return message, report
-        return "\n\n".join(parts) + f"\n\n[用户问题]\n{message}", report
+            return _user_q, report
+        return "\n\n".join(parts) + f"\n\n[用户问题]\n{_user_q}", report
 
     # ── 同步执行（worker 线程内跑）────────────────────────────
     def _run_sync(self, message: str, session_id: str) -> str:
@@ -598,6 +682,7 @@ class QDAgentService:
         # 最终清理点，避免钩子泄漏被后续线程误读（误停止）。try/finally 覆盖所有路径。
         lk = self._session_lock(session_id)
         lk.acquire()
+        agent = None                 # 供 finally 清 `_preselect_prerun`（防跨 run 残留）
         try:
             # ── 实体解析（2026-10-01 接线）：chat 阶段等价物，取数之前 ──
             # 澄清优先（base.ResolveResult 契约）：拿不到准确信息就**反问**，绝不猜着执行。
@@ -626,7 +711,38 @@ class QDAgentService:
                         _cb = ""
                     return (str(resolve_info["clarify"]) + (("\n\n" + _cb) if _cb else ""))
             agent = self._get_agent(session_id)
-            task, prefetch_report = self._prefetch(message, session_id, resolve_info)
+            # ★ 把**用户原始问题**挂在 agent 上，供工具预选使用（2026-10-01）。
+            #   预选绝不能用 prefetch 增强后的 task：那里面塞着记忆/RAG/技能块，
+            #   实测把"今天北京天气"的预选 goal 带成了"个股综合分析"（历史记忆是
+            #   个股分析）⇒ 点名 7 个股票工具 ⇒ 该任务 token +136%。这是"预选不稳定"
+            #   的真正成因之一——不是模型随机，是**输入被上下文污染**。
+            try:
+                agent.last_user_query = message
+                # 供收尾格式化（formatters）选 domain / 填实体，避免再解析一次
+                agent.last_resolve_info = resolve_info or {}
+                # 技能对象挂给 agent 供预选构**技能目录**（2026-10-17 skill 进预选，
+                # 同 last_user_query 范式）：技能体系在服务侧，预选在 agent 侧。
+            except Exception:
+                pass
+            try:
+                agent.skills = self.skills
+            except Exception:
+                pass
+            # ★★ skill 进预选（2026-10-17）：**预选先于 prefetch**。
+            #    预选这一次 LLM 调用同时产出「技能 + 工具」；技能要当强提示传进
+            #    _prefetch 覆盖 _rank_skills 的关键词 top-1 ⇒ 必须早于它。
+            #    reset+预选整体前移（`_run_inner` 经 `_preselect_prerun_done()`
+            #    跳过重跑——它内部的 reset 会清掉预选刚激活的工具）。
+            #    fail-open：任一步抛异常 ⇒ flag 不置位 ⇒ _run_inner 走原路径
+            #    （reset+预选照常，只是没有技能提示）⇒ 与改造前一致。
+            skill_hint = ""
+            try:
+                skill_hint = str((agent.preselect_prerun(message) or {}).get("skill") or "")
+            except Exception as e:
+                logger.debug("[preselect] run 前预选失败（fail-open，转 _run_inner 原路径）"
+                             ": %s: %s", type(e).__name__, e)
+            task, prefetch_report = self._prefetch(message, session_id, resolve_info,
+                                                   skill_hint=skill_hint)
             try:
                 agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
             except Exception as e:
@@ -637,19 +753,20 @@ class QDAgentService:
             try:
                 agent.prefetch_force_tools = list(
                     prefetch_report.get("skill_force_tools") or [])
-            except Exception:
-                pass
-            # ★ 把**用户原始问题**挂在 agent 上，供工具预选使用（2026-10-01）。
-            #   预选绝不能用 prefetch 增强后的 task：那里面塞着记忆/RAG/技能块，
-            #   实测把"今天北京天气"的预选 goal 带成了"个股综合分析"（历史记忆是
-            #   个股分析）⇒ 点名 7 个股票工具 ⇒ 该任务 token +136%。这是"预选不稳定"
-            #   的真正成因之一——不是模型随机，是**输入被上下文污染**。
-            try:
-                agent.last_user_query = message
-                # 供收尾格式化（formatters）选 domain / 填实体，避免再解析一次
-                agent.last_resolve_info = resolve_info or {}
-            except Exception:
-                pass
+                # ★ F1（2026-10-17）：按**实际注入的技能**补声明工具。
+                #   preselect 的技能补位只认 planner 点名的 skill 字段；而此处注入的
+                #   `skill_resolved` 可能是关键词回落 top-1（planner 未点名）⇒ 正文
+                #   引用的工具不在面里（run10 D1）。复用 agent.supplement_skill_declared
+                #   （同源 _merge_skill_declared + build_skill_catalog + 同一上限）。
+                _resolved = str(prefetch_report.get("skill_resolved") or "")
+                if _resolved:
+                    _add = agent.supplement_skill_declared(
+                        _resolved, extra_selected=agent.prefetch_force_tools)
+                    if _add:
+                        agent.prefetch_force_tools = list(
+                            agent.prefetch_force_tools) + list(_add)
+            except Exception as e:
+                logger.debug("[prefetch] 技能声明工具补位失败（fail-open）: %s", e)
             status, text = agent.run(task)
             if status == "_ProbeInterrupt":
                 return ""  # 用户停止：安静收尾（与旧请求停止语义一致）
@@ -672,6 +789,14 @@ class QDAgentService:
                 lk.release()
             except Exception:
                 pass
+            # 清一次性标记（skill 进预选，2026-10-17）：run 中途异常/用户停止时
+            # `_run_inner` 可能根本没跑到消费点 ⇒ 标记残留会让**下一次** run
+            # 跳过 reset+预选（上轮激活残留 + 无技能提示），是跨 run 污染源。
+            if agent is not None:
+                try:
+                    agent._preselect_prerun = False
+                except Exception:
+                    pass
             try:
                 unregister_run_hooks(session_id)
             except Exception:

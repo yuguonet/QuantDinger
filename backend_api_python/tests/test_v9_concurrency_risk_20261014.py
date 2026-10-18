@@ -152,7 +152,9 @@ def test_run_sync_real_serializes_same_session(monkeypatch):
         return _FA()
 
     svc._get_agent = _make_agent
-    svc._prefetch = lambda m, sid, ri: ("task", {"report": {}})
+    # skill_hint（2026-10-17 skill 进预选）：真实 `_prefetch` 多了一个带默认值的
+    # 形参，stub 必须跟签名一致——否则测的是"stub 接不住新参数"，不是串行化。
+    svc._prefetch = lambda m, sid, ri, skill_hint="": ("task", {"report": {}})
 
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:

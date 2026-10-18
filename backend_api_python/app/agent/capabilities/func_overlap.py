@@ -57,8 +57,31 @@ def fingerprint_inventory(domain_tools: List[Dict[str, str]],
     for item in sorted(domain_tools, key=lambda x: x["name"]):
         h.update(f"D|{item['name']}|{item.get('doc', '')}\n".encode("utf-8", "replace"))
     for item in sorted(cap_entries, key=lambda x: (x["module"], x["name"])):
-        h.update(f"C|{item['module']}|{item['name']}\n".encode("utf-8", "replace"))
+        h.update(f"C|{item['module']}|{item['name']}|{item.get('doc', '')}\n".encode("utf-8", "replace"))
     return h.hexdigest()
+
+
+def summarize_report(report: Dict[str, Any],
+                     cap_meta: List[Dict[str, str]]) -> Dict[str, Any]:
+    """问责摘要：让位/保留的 reason 分布 + 无描述能力数（供日志与测试）。
+
+    【为什么需要】`doc` 空的能力在 code_judge_pair 里只能落 `different`
+    —— 结论看似"无重合"，实则是"没法判"。这个计数把它显式暴露出来，
+    避免"对账跑过了"的假安全感（G4 的问责半边）。
+    """
+    by_reason: Dict[str, int] = {}
+    for v in (report or {}).values():
+        r = str((v or {}).get("reason") or "")
+        by_reason[r] = by_reason.get(r, 0) + 1
+    doc_missing = sum(1 for m in (cap_meta or [])
+                      if not str(m.get("doc") or "").strip())
+    return {
+        "caps": len(report or {}),
+        "shadowed": sum(1 for v in (report or {}).values()
+                        if (v or {}).get("decision") == "shadowed"),
+        "doc_missing": doc_missing,
+        "by_reason": by_reason,
+    }
 
 
 def code_judge_pair(cap: Dict[str, str], tool: Dict[str, str]) -> Tuple[str, str]:
@@ -296,7 +319,12 @@ def load_or_build(provider, admitted, use_llm: bool = True, force: bool = False)
     used_llm = bool(use_llm)
     report = build_report(domain_meta, cap_meta, use_llm=use_llm)
     save_cache(fp, report, used_llm=used_llm)
-    n_shadow = sum(1 for v in report.values() if v.get("decision") == "shadowed")
-    logger.info("[func_overlap] 同功能筛选完成: %d 能力, 让位 %d, llm=%s",
-                len(report), n_shadow, used_llm)
+    st = summarize_report(report, cap_meta)
+    logger.info("[func_overlap] 同功能筛选完成: %d 能力, 让位 %d, llm=%s, 分布=%s",
+                len(report), st["shadowed"], used_llm, st["by_reason"])
+    if st["doc_missing"]:
+        logger.warning(
+            "[func_overlap] %d/%d 项能力无描述(doc/review_note 皆空)，"
+            "「文档共同词」判定对它们失效——补 admission.json 的 review_note 可解锁",
+            st["doc_missing"], st["caps"])
     return report

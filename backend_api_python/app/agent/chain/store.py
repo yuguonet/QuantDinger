@@ -37,6 +37,29 @@ def _list_to_pg_array(items: list) -> str:
 # 写入
 # ═══════════════════════════════════════════════════════════════
 
+_TRACE_COLUMNS_ENSURED = False
+
+
+def _ensure_trace_columns(cur) -> None:
+    """幂等补齐 qd_agent_traces 的新增列（F10：cached_tokens）。
+
+    仓库无增量 migration runner（`migrations/*.sql` 仅在 docker 首次起容器时
+    经 docker-entrypoint-initdb.d 执行）⇒ 沿用既有惯例：应用内
+    `ADD COLUMN IF NOT EXISTS` + fail-open。缺列会让**整条 INSERT 报错**
+    （见 `migrations/qd_traces.sql` 对 plan 列的注释：声明了却静默断链），
+    故在首次写入前前置保障一次（进程级 flag，成功/失败都只试一次）。
+    """
+    global _TRACE_COLUMNS_ENSURED
+    if _TRACE_COLUMNS_ENSURED:
+        return
+    try:
+        cur.execute("ALTER TABLE qd_agent_traces "
+                    "ADD COLUMN IF NOT EXISTS cached_tokens integer")
+    except Exception as e:
+        logger.warning("[Store] 补列 cached_tokens 失败(按旧库继续): %s", e)
+    _TRACE_COLUMNS_ENSURED = True
+
+
 def save_tree(root: EvalNode) -> Optional[int]:
     """将整棵 EvalNode 树写入 qd_agent_traces。
 
@@ -51,6 +74,7 @@ def save_tree(root: EvalNode) -> Optional[int]:
     try:
         with get_db_connection() as conn:
             cur = conn.cursor()
+            _ensure_trace_columns(cur)
             root_id = _save_node(cur, root, parent_id=None, root_id=None,
                                  root_exec_date=root.exec_date or date.today())
             conn.commit()
@@ -87,6 +111,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
                 score=%s, direction=%s, action=%s, signal=%s, confidence=%s,
                 timeframe=%s, factors=%s, output_summary=%s, analysis=%s,
                 plan=%s, session_id=%s, user_query=%s, model=%s, total_tokens=%s,
+                cached_tokens=%s,
                 input_params=%s, tools_called=%s, missing_data=%s, data_source=%s,
                 status=%s, error=%s, elapsed_ms=%s,
                 exit_date=%s, exit_reason=%s, pnl_pct=%s, hold_days=%s,
@@ -99,6 +124,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
             node.plan, node.session_id, node.user_query, node.model, node.total_tokens,
+            node.cached_tokens,
             input_json, tools_pg_array, missing_pg_array, node.data_source,
             node.status, node.error, node.elapsed_ms,
             node.exit_date, node.exit_reason, node.pnl_pct, node.hold_days,
@@ -114,7 +140,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
                 exec_date, stock_code, stock_name,
                 score, direction, action, signal, confidence,
                 timeframe, factors, output_summary, analysis,
-                plan, session_id, user_query, model, total_tokens,
+                plan, session_id, user_query, model, total_tokens, cached_tokens,
                 input_params, tools_called, missing_data, data_source,
                 status, error, elapsed_ms,
                 exit_date, exit_reason, pnl_pct, hold_days,
@@ -124,7 +150,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
                 %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s, %s,
@@ -136,6 +162,7 @@ def _save_node(cur, node: EvalNode, parent_id: Optional[int], root_id: Optional[
             node.score, node.direction, node.action, node.signal, node.confidence,
             node.timeframe, factors_json, output_json, node.analysis,
             node.plan, node.session_id, node.user_query, node.model, node.total_tokens,
+            node.cached_tokens,
             input_json, tools_pg_array, missing_pg_array, node.data_source,
             node.status, node.error, node.elapsed_ms,
             node.exit_date, node.exit_reason, node.pnl_pct, node.hold_days,

@@ -129,6 +129,7 @@ def next_trading_day(date: Optional[str] = None, n: int = 1) -> str:
         dt += timedelta(days=1)
     return result[-1]
 
+
 def last_finish_trading_day(ref_dt: Optional[str] = None) -> str:
     """返回已经结束的最近一个交易日。
 

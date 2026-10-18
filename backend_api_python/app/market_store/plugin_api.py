@@ -287,31 +287,10 @@ def _convert_sentiment(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             }),
         })
 
-    # VIX
-    vix = data.get("vix", {})
-    if vix.get("value") is not None:
-        rows.append({
-            "category":   "sentiment",
-            "symbol":     "VIX",
-            "name":       "恐慌指数VIX",
-            "name_en":    "CBOE VIX",
-            "price":      float(vix["value"]),
-            "change_pct": float(vix.get("change", 0)),
-            "extra":      json.dumps({"level": vix.get("level", "unknown")}),
-        })
-
-    # DXY
-    dxy = data.get("dxy", {})
-    if dxy.get("value") is not None:
-        rows.append({
-            "category":   "sentiment",
-            "symbol":     "DXY",
-            "name":       "美元指数",
-            "name_en":    "US Dollar Index",
-            "price":      float(dxy["value"]),
-            "change_pct": float(dxy.get("change", 0)),
-            "extra":      json.dumps({"level": dxy.get("level", "unknown")}),
-        })
+    # VIX / DXY 段已于 2026-10-18 删除: 指标分别在 sentiment 侧整族摘除
+    # (VIX 族) 与移除 (DXY, 10-17), _pack_sentiment 仅保留占位键
+    # ({"value": 0})。原 `is not None` 守卫会把 0 占位当真实数据 ingest
+    # 成假行; 指标不存在即不建行, 与 market_data_collector 的 `> 0` 守卫对齐。
 
     return rows
 

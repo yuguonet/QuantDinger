@@ -92,16 +92,20 @@ class FnToolAdapter(BaseTool):
 
     @staticmethod
     def _to_output(result: Any, metadata: dict) -> ToolOutput:
+        extra = {}
         if isinstance(result, ToolResult):
             text = result.to_str()
             success = bool(result.success)
             if not success and result.error:
                 text = f"[工具执行失败] {result.error}"
+            if getattr(result, "metadata", None):
+                extra = dict(result.metadata)
         elif isinstance(result, dict) and set(result.keys()) == {"error"}:
             # 金融工具失败约定：{"error": ...}
             text = f"Error: {result['error']}"
             success = False
         else:
-            text = ToolResult(output=result).to_str()
+            text = ToolResult.from_raw(result).to_str()
             success = True
-        return ToolOutput(output=text, success=success, metadata=metadata)
+        out_meta = {**metadata, **extra} if extra else metadata
+        return ToolOutput(output=text, success=success, metadata=out_meta)

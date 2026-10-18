@@ -20,20 +20,35 @@
   python -m scripts.qd_bench validate                # 校验任务集（不调模型）
   python -m scripts.qd_bench score --preds p.jsonl   # 对已有输出打分（确定性）
   python -m scripts.qd_bench run [--only id1,id2]    # 真实端点跑任务集 + 打分
+  python -m scripts.qd_bench run --num-rollouts 3    # 重复采样 3 次聚合成 mean±std
   python -m scripts.qd_bench trend                   # 历史曲线（总分+分项）
   python -m scripts.qd_bench diff --a ID --b ID      # 两次 run 的任务级对比
   python -m scripts.qd_bench agreement --a a.json --b b.json --tol 10
+  python -m scripts.qd_bench selftest                # 内置 fixture 自洽校验（零网络）
   python -m scripts.qd_bench import-traces --limit 30 --out extra_tasks.yaml
 
 【preds 文件格式】JSONL，每行：
   {"task_id": "stock_01", "answer": "...", "corpus": "工具输出拼接（可选，供溯源）",
    "meta": {"model": "...", "prompt_rev": "..."}}
 
-【退出码】0=正常；1=校验/对比不通过；2=环境不可用（缺模型端点/DB 等）。
+【退出码】0=正常；1=校验/对比/selftest 不通过；2=环境或预算条件不满足
+（缺模型端点/DB，或 --num-rollouts 超 QD_BENCH_MAX_ROLLOUTS 上限被拒——
+拒绝执行而非失败，防误触烧钱）。
 
 【落库】`score`/`run` 默认只落本地 JSONL（`scripts/bench/runs/`）；加 `--to-db` 才
 挂 qd_traces 树（EvalNode：root=bench_run，child=任务）。DB 不可用一律 fail-open
 跳过——benchmark 是标尺，标尺自己不能因为环境缺件而不出分。
+
+【selftest】`qd_bench selftest` 用内置 fixture（好/坏/缺项三档答案 + 标注对）校验
+评分机制自身：可分辨性 / 确定性 / must 逐条可判 / agreement 口径，零网络零外部依赖。
+改评分函数后先跑它——红了说明标尺自己坏了，跑分结果不可信。
+
+【rollouts】`run --num-rollouts N` 把任务集重复采样 N 次：逐轮各落一个 run
+（run_id 后缀 `_r{i}`，trend/diff/agreement 可直接消费），另存聚合记录
+（mean±std，落 `runs/rollouts/`，trend/diff 不读它——聚合是统计记录不是可比 run）。
+N 受 env `QD_BENCH_MAX_ROLLOUTS` 上限约束（缺省 5，非正/非法回落缺省并告警），
+超限在触服务前直接拒绝（exit 2）。每轮本身仍受 `AGENT_RUN_TOKEN_BUDGET`
+单 run 预算约束 ⇒ N 轮总成本 ≈ N × 单轮。
 """
 from __future__ import annotations
 
@@ -335,6 +350,97 @@ def score_batch(tasks: List[dict], preds: List[dict],
 
 
 # ═══════════════════════════════════════════════════════════════
+#  selftest（F19：内置 fixture 自洽校验，零网络零外部依赖）
+# ═══════════════════════════════════════════════════════════════
+
+# fixture 任务与 bench_tasks.yaml 的 stock_01 同构（dims 全开，must 四条），
+# 答案按"全中/全不中/缺一项"三档构造——三档的差就是评分机制的判据本身。
+_SELFTEST_TASK = {
+    "id": "selftest_01",
+    "category": "个股分析",
+    "query": "帮我分析一下贵州茅台600519，未来三天怎么看",
+    "weight": 1.0,
+    "baseline": {
+        "must": ["has_direction", "has_numbers", "has_horizon", "has_risk_note"],
+    },
+}
+# 好答案：四条 must 全中，且无绝对化承诺/合规禁用词
+_SELFTEST_GOOD = (
+    "结论：贵州茅台600519短线偏多，未来三天以震荡上行为主，建议持有观望。"
+    "依据数据显示，现价报1329.00元，日涨幅1.80%，成交量12.5万手，换手率0.45%。"
+    "技术面站稳五日与十日年线，资金面主力净流入，上方压力1365元，下方支撑1300元，"
+    "跌破止损位1288元可考虑减仓。"
+    "风险提示：以上仅供参考，不构成投资建议，注意市场波动风险。"
+)
+# 坏答案：四条 must 全不中（与好答案形成严格可分差，防"满分壳"）
+_SELFTEST_BAD = "建议关注该股。"
+# 缺项答案：好答案删去风险提示句 ⇒ has_risk_note 精确减 1（验证 must 逐条可判）
+_SELFTEST_MISSING = (
+    "结论：贵州茅台600519短线偏多，未来三天以震荡上行为主，建议持有观望。"
+    "依据数据显示，现价报1329.00元，日涨幅1.80%，成交量12.5万手，换手率0.45%。"
+    "技术面站稳五日与十日年线，资金面主力净流入，上方压力1365元，下方支撑1300元，"
+    "跌破止损位1288元可考虑减仓。"
+)
+
+
+def cmd_selftest(args) -> int:
+    """内置 fixture 自洽校验（改评分函数后先跑它；红了 = 标尺自己坏了）。
+
+    六项判据：评分可分辨（好>坏）/ 打分确定性 / must 逐条可判（缺一项精确减 1）/
+    agreement 自比 100% / 容差内外可判 / 无交集 n=0。零网络零外部依赖。
+    """
+    checks: List[Tuple[str, bool, str]] = []
+
+    good = score_answer(_SELFTEST_TASK, _SELFTEST_GOOD)
+    bad = score_answer(_SELFTEST_TASK, _SELFTEST_BAD)
+    checks.append(("评分可分辨（好答案 > 坏答案）", good["total"] > bad["total"],
+                   f"good={good['total']} > bad={bad['total']}"))
+
+    again = score_answer(_SELFTEST_TASK, _SELFTEST_GOOD)
+    checks.append(("打分确定性（同输入同输出）", good == again,
+                   "两次调用返回逐项相等"))
+
+    cov_good, det_good = _score_coverage(_SELFTEST_TASK, _SELFTEST_GOOD)
+    cov_miss, det_miss = _score_coverage(_SELFTEST_TASK, _SELFTEST_MISSING)
+    checks.append(("must 逐条可判（缺一项精确减 1）",
+                   det_good["pass"] == 4 and det_miss["pass"] == 3
+                   and cov_miss < cov_good
+                   and "has_risk_note" in det_miss["missing"],
+                   f"{det_good['pass']}/4 → {det_miss['pass']}/4"
+                   f"（coverage {cov_good} → {cov_miss}，缺项 "
+                   f"{'、'.join(map(str, det_miss['missing']))}）"))
+
+    ann = {"t1": 80, "t2": 60, "t3": 95}
+    rate, mad, agree, n = agreement_rate(ann, ann, 10)
+    checks.append(("agreement 自比 100%",
+                   (rate, mad, agree, n) == (1.0, 0.0, 3, 3),
+                   f"rate={rate:.0%} mad={mad} agree={agree}/{n}"))
+
+    near = {"t1": 85, "t2": 66, "t3": 90}      # |Δ| 全部 ≤ tol=10
+    far = {"t1": 95, "t2": 40, "t3": 90}       # 两条 |Δ| > tol=10
+    r_near, _, _, _ = agreement_rate(ann, near, 10)
+    r_far, _, _, _ = agreement_rate(ann, far, 10)
+    checks.append(("agreement 容差内外可判", r_near == 1.0 and r_far < 1.0,
+                   f"tol 内 {r_near:.0%} / tol 外 {r_far:.0%}"))
+
+    r_none, mad_none, a_none, n_none = agreement_rate({"t1": 80}, {"t9": 80}, 10)
+    checks.append(("agreement 无交集 n=0",
+                   (r_none, mad_none, a_none, n_none) == (0.0, 0.0, 0, 0),
+                   "无交集返 (0,0,0,0)，不把空集谎报成 0% 一致率"))
+
+    fails = [c for c in checks if not c[1]]
+    print("== qd_bench selftest（内置 fixture，零网络零外部依赖）==")
+    for name, ok, detail in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}：{detail}")
+    if fails:
+        print(f"[FAIL] selftest {len(fails)}/{len(checks)} 项失败——评分标尺自身可疑，"
+              f"先修评分再谈跑分")
+        return 1
+    print(f"[PASS] selftest 全部通过（{len(checks)}/{len(checks)}）")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════
 #  存档 / 历史
 # ═══════════════════════════════════════════════════════════════
 
@@ -386,6 +492,94 @@ def _try_db_attach(summary: dict, meta: dict) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  rollouts（F19：重复采样 N 次聚合成 mean±std，绑预算上限）
+# ═══════════════════════════════════════════════════════════════
+
+DEFAULT_MAX_ROLLOUTS = 5      # QD_BENCH_MAX_ROLLOUTS 缺省上限（防误触烧钱）
+
+
+def _max_rollouts() -> int:
+    """`--num-rollouts` 上限：env `QD_BENCH_MAX_ROLLOUTS`（缺省 5）。
+
+    未设 ⇒ 缺省；非正/非法 ⇒ 告警并回落缺省（配置错误不静默，但不当成"禁止跑"）。
+    上限本身是预算闸门：N 超它 ⇒ cmd_run 在触服务前拒绝（exit 2）。
+    """
+    raw = (os.getenv("QD_BENCH_MAX_ROLLOUTS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_ROLLOUTS
+    try:
+        v = int(raw)
+    except ValueError:
+        print(f"[WARN] QD_BENCH_MAX_ROLLOUTS 非法（{raw!r}），"
+              f"回落缺省 {DEFAULT_MAX_ROLLOUTS}")
+        return DEFAULT_MAX_ROLLOUTS
+    if v <= 0:
+        print(f"[WARN] QD_BENCH_MAX_ROLLOUTS={v} 非正数，回落缺省 {DEFAULT_MAX_ROLLOUTS}")
+        return DEFAULT_MAX_ROLLOUTS
+    return v
+
+
+def _ms_stats(vals: List[float]) -> dict:
+    """均值±标准差（总体 std）+ min/max/n。空列表返全 0（不造数）。"""
+    n = len(vals)
+    if n == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "n": 0}
+    m = sum(vals) / n
+    std = (sum((v - m) ** 2 for v in vals) / n) ** 0.5
+    return {"mean": round(m, 1), "std": round(std, 1),
+            "min": round(min(vals), 1), "max": round(max(vals), 1), "n": n}
+
+
+def _aggregate_rollouts(summaries: List[dict]) -> dict:
+    """N 次 rollout 的 summary 聚合：总分 + 分项 + 逐任务的 mean±std。
+
+    用途：单次跑分的波动要先和噪声比——std 大说明分差可能是采样噪声而非改动。
+    """
+    agg: dict = {"n_rollouts": len(summaries), "total": _ms_stats(
+        [float(s.get("total", 0.0)) for s in summaries]), "dims": {}, "tasks": {}}
+    dims = sorted({d for s in summaries for d in (s.get("dims") or {})})
+    for d in dims:
+        agg["dims"][d] = _ms_stats(
+            [float((s.get("dims") or {}).get(d, 0.0)) for s in summaries])
+    tids = sorted({str(r.get("task_id")) for s in summaries
+                   for r in s.get("tasks", [])})
+    for tid in tids:
+        agg["tasks"][tid] = _ms_stats(
+            [float(r.get("total", 0.0)) for s in summaries
+             for r in s.get("tasks", []) if str(r.get("task_id")) == tid])
+    return agg
+
+
+def _save_rollouts(agg: dict, meta: dict) -> Path:
+    """聚合记录落 `runs/rollouts/`（trend/diff/agreement 不读它：统计记录 ≠ 可比 run）。"""
+    out_dir = RUNS_DIR / "rollouts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_id = meta.get("run_id") or ("bench_" + time.strftime("%Y%m%d_%H%M%S"))
+    record = dict(meta, run_id=run_id, ts=time.strftime("%Y-%m-%d %H:%M:%S"),
+                  kind="rollouts", **agg)
+    path = out_dir / f"{run_id}.json"
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+    return path
+
+
+def _print_rollouts(agg: dict, run_ids: List[str]) -> None:
+    t = agg["total"]
+    print(f"\n== rollouts ×{agg['n_rollouts']} · 总分 mean={t['mean']} "
+          f"std={t['std']}（min {t['min']} / max {t['max']}）==")
+    for d, st in sorted(agg["dims"].items()):
+        print(f"  {d:<10} mean={st['mean']:<6} std={st['std']:<6} "
+              f"（{st['min']}~{st['max']}）")
+    noisy = sorted(((tid, st) for tid, st in agg["tasks"].items()),
+                   key=lambda x: -x[1]["std"])[:5]
+    if noisy:
+        print("  波动最大任务（std）：")
+        for tid, st in noisy:
+            print(f"    {tid:<12} mean={st['mean']:>5} std={st['std']:>5}")
+    print(f"  逐轮 run：{' '.join(run_ids)}")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  子命令
 # ═══════════════════════════════════════════════════════════════
 
@@ -423,8 +617,45 @@ def cmd_score(args) -> int:
     return 0
 
 
+def _rollout_preds(svc, tasks: List[dict], model: str, tag: str) -> List[dict]:
+    """单轮 rollout：逐任务过真实端点收集 preds（tag 用于 session_id 后缀防串味）。"""
+    import asyncio
+    preds = []
+    for t in tasks:
+        sid = f"bench_{t['id']}" + (f"_{tag}" if tag else "")
+        t0 = time.time()
+        try:
+            resp = asyncio.run(svc.chat(str(t.get("query")), session_id=sid))
+            ans = resp if isinstance(resp, str) else (getattr(resp, "content", None) or "")
+            agent = svc._get_agent(sid)
+            corpus = agent._observation_corpus() if hasattr(agent, "_observation_corpus") else ""
+            print(f"  [{t['id']}] {time.time() - t0:.1f}s len={len(ans)}")
+        except Exception as e:
+            ans, corpus = f"(run error: {type(e).__name__}: {e})", ""
+            print(f"  [{t['id']}] ERROR {type(e).__name__}")
+        preds.append({"task_id": t["id"], "answer": ans, "corpus": corpus,
+                      "meta": {"model": model or "default"}})
+    return preds
+
+
+def _rollout_suffix(path: str, tag: str) -> str:
+    """preds 输出文件按轮次加后缀（p.jsonl → p_r0.jsonl）；无 tag 原样返回。"""
+    if not tag:
+        return path
+    p = Path(path)
+    return str(p.with_name(f"{p.stem}_{tag}{p.suffix}"))
+
+
 def cmd_run(args) -> int:
-    """真实端点跑任务集。环境不可用 → exit 2（不是失败，是没条件跑）。"""
+    """真实端点跑任务集。环境/预算条件不满足 → exit 2（不是失败，是没条件跑）。"""
+    # 预算闸门：超 QD_BENCH_MAX_ROLLOUTS 上限在触服务前拒绝（fail-loud 防烧钱）
+    n_roll = max(1, int(getattr(args, "num_rollouts", 1) or 1))
+    cap = _max_rollouts()
+    if n_roll > cap:
+        print(f"[REFUSE] --num-rollouts {n_roll} 超过上限 {cap}"
+              f"（env QD_BENCH_MAX_ROLLOUTS；每轮仍受 AGENT_RUN_TOKEN_BUDGET "
+              f"单 run 预算约束，拒跑是防误触烧钱，不是失败）")
+        return 2
     try:
         from dotenv import load_dotenv
         load_dotenv(BACKEND_ROOT / ".env", override=False)
@@ -434,7 +665,6 @@ def cmd_run(args) -> int:
         print(f"[ENV] 运行条件不满足: {type(e).__name__}: {e}" +
               (f" | 执行核: {_BOOT_ERR}" if _BOOT_ERR else ""))
         return 2
-    import asyncio
     tasks = load_tasks()
     if args.only:
         keep = {x.strip() for x in args.only.split(",")}
@@ -447,36 +677,43 @@ def cmd_run(args) -> int:
     except Exception as e:
         print(f"[ENV] 服务装配失败: {type(e).__name__}: {e}")
         return 2
-    preds = []
-    for t in tasks:
-        sid = f"bench_{t['id']}"
-        t0 = time.time()
-        try:
-            resp = asyncio.run(svc.chat(str(t.get("query")), session_id=sid))
-            ans = resp if isinstance(resp, str) else (getattr(resp, "content", None) or "")
-            agent = svc._get_agent(sid)
-            corpus = agent._observation_corpus() if hasattr(agent, "_observation_corpus") else ""
-            print(f"  [{t['id']}] {time.time() - t0:.1f}s len={len(ans)}")
-        except Exception as e:
-            ans, corpus = f"(run error: {type(e).__name__}: {e})", ""
-            print(f"  [{t['id']}] ERROR {type(e).__name__}")
-        preds.append({"task_id": t["id"], "answer": ans, "corpus": corpus,
-                      "meta": {"model": args.model or "default"}})
-    if args.save_preds:
-        Path(args.save_preds).write_text(
-            "\n".join(json.dumps(p, ensure_ascii=False) for p in preds) + "\n",
-            encoding="utf-8")
     ann = {}
     if args.annotations:
         raw = json.loads(Path(args.annotations).read_text(encoding="utf-8"))
         ann = {k: (v.get("score") if isinstance(v, dict) else v) for k, v in raw.items()}
-    summary = score_batch(load_tasks(), preds, ann)
-    meta = {"model": args.model or "default", "source": "run",
-            "run_note": args.note or ""}
-    run_id = _save_run(summary, meta)
-    if args.to_db:
-        _try_db_attach(summary, meta)
-    _print_summary(run_id, summary)
+    base_id = "bench_" + time.strftime("%Y%m%d_%H%M%S")
+    summaries: List[dict] = []
+    run_ids: List[str] = []
+    for i in range(n_roll):
+        tag = f"r{i}" if n_roll > 1 else ""
+        if n_roll > 1:
+            print(f"\n-- rollout {i + 1}/{n_roll} --")
+        preds = _rollout_preds(svc, tasks, args.model, tag)
+        if args.save_preds:
+            Path(_rollout_suffix(args.save_preds, tag)).write_text(
+                "\n".join(json.dumps(p, ensure_ascii=False) for p in preds) + "\n",
+                encoding="utf-8")
+        summary = score_batch(load_tasks(), preds, ann)
+        meta = {"model": args.model or "default", "source": "run",
+                "run_note": args.note or "",
+                "run_id": f"{base_id}_{tag}" if tag else ""}
+        run_id = _save_run(summary, meta)
+        run_ids.append(run_id)
+        summaries.append(summary)
+        if args.to_db:
+            _try_db_attach(summary, meta)
+        if n_roll == 1:
+            _print_summary(run_id, summary)
+    if n_roll > 1:
+        agg = _aggregate_rollouts(summaries)
+        path = _save_rollouts(agg, {"model": args.model or "default",
+                                    "source": "rollouts",
+                                    "run_note": args.note or "",
+                                    "run_id": base_id, "run_ids": run_ids})
+        _print_rollouts(agg, run_ids)
+        print(f"  聚合记录 → {path}")
+        print(f"  （每轮仍受 AGENT_RUN_TOKEN_BUDGET 单 run 预算约束；"
+              f"{n_roll} 轮总成本 ≈ {n_roll} × 单轮）")
     return 0
 
 
@@ -518,22 +755,33 @@ def cmd_diff(args) -> int:
     return 0
 
 
-def cmd_agreement(args) -> int:
-    """两人标注一致率（验收线 ≥80%）：|a-b| ≤ tol 记一致。"""
-    a = json.loads(Path(args.a).read_text(encoding="utf-8"))
-    b = json.loads(Path(args.b).read_text(encoding="utf-8"))
+def agreement_rate(a: dict, b: dict, tol: float) -> tuple:
+    """两人标注一致率（F19 从 cmd_agreement 内联逻辑抽出，供 selftest 复用）。
+
+    |a-b| ≤ tol 记一致。返回 (rate, mad, agree, n)；无交集时 rate=0、n=0。
+    """
     keys = sorted(set(a) & set(b))
 
     def _s(v):
         return float(v.get("score") if isinstance(v, dict) else v)
 
     if not keys:
-        print("[FAIL] 两份标注无交集")
-        return 1
-    agree = sum(1 for k in keys if abs(_s(a[k]) - _s(b[k])) <= args.tol)
+        return 0.0, 0.0, 0, 0
+    agree = sum(1 for k in keys if abs(_s(a[k]) - _s(b[k])) <= tol)
     rate = agree / len(keys)
     mad = sum(abs(_s(a[k]) - _s(b[k])) for k in keys) / len(keys)
-    print(f"交集任务 {len(keys)} 条 · 一致 {agree} · 一致率 {rate:.0%} · 平均差 {mad:.1f}")
+    return rate, mad, agree, len(keys)
+
+
+def cmd_agreement(args) -> int:
+    """两人标注一致率（验收线 ≥80%）：|a-b| ≤ tol 记一致。"""
+    a = json.loads(Path(args.a).read_text(encoding="utf-8"))
+    b = json.loads(Path(args.b).read_text(encoding="utf-8"))
+    rate, mad, agree, n = agreement_rate(a, b, args.tol)
+    if not n:
+        print("[FAIL] 两份标注无交集")
+        return 1
+    print(f"交集任务 {n} 条 · 一致 {agree} · 一致率 {rate:.0%} · 平均差 {mad:.1f}")
     print(f"[{'PASS' if rate >= 0.8 else 'FAIL'}] 一致率 {'≥' if rate >= 0.8 else '<'} 80%")
     return 0 if rate >= 0.8 else 1
 
@@ -606,6 +854,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--save-preds", default="")
     p.add_argument("--annotations", default="")
     p.add_argument("--note", default="")
+    p.add_argument("--num-rollouts", type=int, default=1,
+                   help="重复采样轮数（聚合成 mean±std；上限 QD_BENCH_MAX_ROLLOUTS）")
     p.add_argument("--to-db", action="store_true")
 
     sub.add_parser("trend", help="历史曲线（总分+分项）")
@@ -619,6 +869,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--b", required=True)
     p.add_argument("--tol", type=float, default=10.0)
 
+    sub.add_parser("selftest", help="内置 fixture 自洽校验（零网络零外部依赖）")
+
     p = sub.add_parser("import-traces", help="从 qd_traces 拉真实任务题面")
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--out", default="")
@@ -626,6 +878,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     return {"validate": cmd_validate, "score": cmd_score, "run": cmd_run,
             "trend": cmd_trend, "diff": cmd_diff, "agreement": cmd_agreement,
+            "selftest": cmd_selftest,
             "import-traces": cmd_import_traces}[args.cmd](args)
 
 

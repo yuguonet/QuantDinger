@@ -6,8 +6,10 @@
       <div class="main-body">
         <!-- 自选股面板（独立模块） -->
         <watchlist-panel
+          ref="watchlistPanel"
           v-model="selectedSymbol"
           @select="onWatchlistSelect"
+          @refresh="onWatchlistRefresh"
         />
         <!-- 右侧：工具栏 + AI 分析 -->
         <div class="right-panel">
@@ -94,7 +96,7 @@
                     </div>
                   </div>
                   <div class="hero-cta">
-                    <a-button type="primary" size="large" icon="plus" @click="showAddStockModal = true">
+                    <a-button type="primary" size="large" icon="plus" @click="openWatchlistAddModal">
                       {{ $t('dashboard.analysis.watchlist.add') }}
                     </a-button>
                     <a-button size="large" icon="thunderbolt" :disabled="!selectedSymbol" @click="startFastAnalysis">
@@ -120,128 +122,6 @@
 
       </div>
     </div>
-
-    <!-- 添加股票弹窗 -->
-    <a-modal
-      :title="$t('dashboard.analysis.modal.addStock.title')"
-      :visible="showAddStockModal"
-      @ok="handleAddStock"
-      @cancel="handleCloseAddStockModal"
-      :confirmLoading="addingStock"
-      width="600px"
-      :wrapClassName="isDarkTheme ? 'qd-dark-modal' : ''"
-      :okText="$t('dashboard.analysis.modal.addStock.confirm')"
-      :cancelText="$t('dashboard.analysis.modal.addStock.cancel')"
-    >
-      <div class="add-stock-modal-content">
-        <!-- Tab标签 -->
-        <a-tabs v-model="selectedMarketTab" @change="handleMarketTabChange" class="market-tabs">
-          <a-tab-pane
-            v-for="marketType in marketTypes"
-            :key="marketType.value"
-            :tab="$t(marketType.i18nKey || `dashboard.analysis.market.${marketType.value}`)"
-          >
-          </a-tab-pane>
-        </a-tabs>
-
-        <!-- 搜索/输入框 -->
-        <div class="symbol-search-section">
-          <a-input-search
-            v-model="symbolSearchKeyword"
-            :placeholder="$t('dashboard.analysis.modal.addStock.searchOrInputPlaceholder')"
-            @search="handleSearchOrInput"
-            @change="handleSymbolSearchInput"
-            :loading="searchingSymbols"
-            size="large"
-            allow-clear
-          >
-            <a-button slot="enterButton" type="primary" icon="search">
-              {{ $t('dashboard.analysis.modal.addStock.search') }}
-            </a-button>
-          </a-input-search>
-        </div>
-
-        <!-- 搜索结果 -->
-        <div v-if="symbolSearchResults.length > 0" class="search-results-section">
-          <div class="section-title">
-            <a-icon type="search" style="margin-right: 4px;" />
-            {{ $t('dashboard.analysis.modal.addStock.searchResults') }}
-          </div>
-          <a-list
-            :data-source="symbolSearchResults"
-            :loading="searchingSymbols"
-            size="small"
-            class="symbol-list"
-          >
-            <a-list-item slot="renderItem" slot-scope="item" class="symbol-list-item" @click="selectSymbol(item)">
-              <a-list-item-meta>
-                <template slot="title">
-                  <div class="symbol-item-content">
-                    <span class="symbol-code">{{ item.symbol }}</span>
-                    <span class="symbol-name">{{ item.name }}</span>
-                    <a-tag v-if="item.exchange" size="small" color="blue" style="margin-left: 8px;">
-                      {{ item.exchange }}
-                    </a-tag>
-                  </div>
-                </template>
-              </a-list-item-meta>
-            </a-list-item>
-          </a-list>
-        </div>
-
-        <!-- 热门标的 -->
-        <div class="hot-symbols-section">
-          <div class="section-title">
-            <a-icon type="fire" style="color: #ff4d4f; margin-right: 4px;" />
-            {{ $t('dashboard.analysis.modal.addStock.hotSymbols') }}
-          </div>
-          <a-spin :spinning="loadingHotSymbols">
-            <a-list
-              v-if="hotSymbols.length > 0"
-              :data-source="hotSymbols"
-              size="small"
-              class="symbol-list"
-            >
-              <a-list-item slot="renderItem" slot-scope="item" class="symbol-list-item" @click="selectSymbol(item)">
-                <a-list-item-meta>
-                  <template slot="title">
-                    <div class="symbol-item-content">
-                      <span class="symbol-code">{{ item.symbol }}</span>
-                      <span class="symbol-name">{{ item.name }}</span>
-                      <a-tag v-if="item.exchange" size="small" color="orange" style="margin-left: 8px;">
-                        {{ item.exchange }}
-                      </a-tag>
-                    </div>
-                  </template>
-                </a-list-item-meta>
-              </a-list-item>
-            </a-list>
-            <a-empty v-else :description="$t('dashboard.analysis.modal.addStock.noHotSymbols')" :image="false" />
-          </a-spin>
-        </div>
-
-        <!-- 选中的标的显示 -->
-        <div v-if="selectedSymbolForAdd" class="selected-symbol-section">
-          <a-alert
-            :message="$t('dashboard.analysis.modal.addStock.selectedSymbol')"
-            type="info"
-            show-icon
-            closable
-            @close="selectedSymbolForAdd = null"
-          >
-            <template slot="description">
-              <div class="selected-symbol-info">
-                <a-tag :color="getMarketColor(selectedSymbolForAdd.market)" style="margin-right: 8px;">
-                  {{ $t(`dashboard.analysis.market.${selectedSymbolForAdd.market}`) }}
-                </a-tag>
-                <strong>{{ selectedSymbolForAdd.symbol }}</strong>
-                <span v-if="selectedSymbolForAdd.name" style="color: #999; margin-left: 8px;">{{ selectedSymbolForAdd.name }}</span>
-              </div>
-            </template>
-          </a-alert>
-        </div>
-      </div>
-    </a-modal>
 
     <a-modal
       :visible="showPositionModal"
@@ -502,7 +382,7 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols } from '@/api/market'
+import { getWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 import { fastAnalyze, getAllAnalysisHistory, deleteAnalysisHistory } from '@/api/fast-analysis'
 import FastAnalysisReport from './components/FastAnalysisReport.vue'
@@ -537,8 +417,6 @@ export default {
       userId: 1,
       watchlist: [],
       loadingWatchlist: false,
-      showAddStockModal: false,
-      addingStock: false,
       selectedSymbol: undefined,
       analyzing: false,
       analysisResult: null,
@@ -553,16 +431,6 @@ export default {
       currentTaskId: null,
       taskPollingTimer: null,
       taskPollingStartedAt: 0,
-      marketTypes: [],
-      selectedMarketTab: '',
-      symbolSearchKeyword: '',
-      symbolSearchResults: [],
-      searchingSymbols: false,
-      hotSymbols: [],
-      loadingHotSymbols: false,
-      selectedSymbolForAdd: null,
-      searchTimer: null,
-      hasSearched: false,
       positions: [],
       monitors: [],
       positionSummaryMap: {},
@@ -634,7 +502,6 @@ export default {
   },
   created () {
     this.loadUserInfo()
-    this.loadMarketTypes()
     this.loadWatchlist()
     this.loadPositionData()
   },
@@ -723,7 +590,7 @@ export default {
     },
     handleSymbolChange (value) {
       if (value === '__add_stock_option__') {
-        this.showAddStockModal = true
+        this.openWatchlistAddModal()
         this.$nextTick(() => {
           this.selectedSymbol = undefined
         })
@@ -750,6 +617,17 @@ export default {
       this.analysisError = null
       this.analysisErrorTone = 'error'
       this.$emit('symbol-change', this.selectedSymbol)
+    },
+    // 复用 WatchlistPanel 内唯一的「添加自选股」弹窗，避免重复实现
+    openWatchlistAddModal () {
+      const panel = this.$refs.watchlistPanel
+      if (panel && typeof panel.openAddStockModal === 'function') {
+        panel.openAddStockModal()
+      }
+    },
+    // 自选股新增/移除后，同步右侧分析工具栏的标的下拉列表
+    onWatchlistRefresh () {
+      this.loadWatchlist()
     },
     getMonitorMeta (stock) {
       if (!stock) return null
@@ -1497,190 +1375,6 @@ export default {
         this.loadWatchlistPrices()
       }
     },
-    async handleAddStock () {
-      let market = ''
-      let symbol = ''
-      let name = ''
-
-      if (this.selectedSymbolForAdd) {
-        market = this.selectedSymbolForAdd.market
-        symbol = this.selectedSymbolForAdd.symbol.toUpperCase()
-        name = this.selectedSymbolForAdd.name || ''
-      } else if (this.symbolSearchKeyword && this.symbolSearchKeyword.trim()) {
-        if (!this.selectedMarketTab) {
-          this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket'))
-          return
-        }
-        market = this.selectedMarketTab
-        symbol = this.symbolSearchKeyword.trim().toUpperCase()
-        name = ''
-      } else {
-        this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectOrEnterSymbol'))
-        return
-      }
-
-      this.addingStock = true
-      try {
-        const res = await addWatchlist({
-          userid: this.userId,
-          market: market,
-          symbol: symbol,
-          name: name
-        })
-        if (res && res.code === 1) {
-          this.$message.success(this.$t('dashboard.analysis.message.addStockSuccess'))
-          this.handleCloseAddStockModal()
-          await this.loadWatchlist()
-        } else {
-          this.$message.error(res?.msg || this.$t('dashboard.analysis.message.addStockFailed'))
-        }
-      } catch (error) {
-        const errorMsg = error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.message.addStockFailed')
-        this.$message.error(errorMsg)
-      } finally {
-        this.addingStock = false
-      }
-    },
-    handleCloseAddStockModal () {
-      this.showAddStockModal = false
-      this.selectedSymbolForAdd = null
-      this.symbolSearchKeyword = ''
-      this.symbolSearchResults = []
-      this.hasSearched = false
-      this.selectedMarketTab = this.marketTypes.length > 0 ? this.marketTypes[0].value : ''
-    },
-    handleMarketTabChange (activeKey) {
-      this.selectedMarketTab = activeKey
-      this.symbolSearchKeyword = ''
-      this.symbolSearchResults = []
-      this.selectedSymbolForAdd = null
-      this.hasSearched = false
-      this.loadHotSymbols(activeKey)
-    },
-    handleSymbolSearchInput (e) {
-      const keyword = e.target.value
-      this.symbolSearchKeyword = keyword
-
-      if (this.searchTimer) {
-        clearTimeout(this.searchTimer)
-      }
-
-      if (!keyword || keyword.trim() === '') {
-        this.symbolSearchResults = []
-        this.hasSearched = false
-        this.selectedSymbolForAdd = null
-        return
-      }
-
-      this.searchTimer = setTimeout(() => {
-        this.searchSymbolsInModal(keyword)
-      }, 500)
-    },
-    handleSearchOrInput (keyword) {
-      if (!keyword || !keyword.trim()) return
-
-      if (!this.selectedMarketTab) {
-        this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket'))
-        return
-      }
-
-      if (this.symbolSearchResults.length > 0) return
-
-      if (this.hasSearched && this.symbolSearchResults.length === 0) {
-        this.handleDirectAdd()
-      } else {
-        this.searchSymbolsInModal(keyword)
-      }
-    },
-    async searchSymbolsInModal (keyword) {
-      if (!keyword || keyword.trim() === '') {
-        this.symbolSearchResults = []
-        this.hasSearched = false
-        return
-      }
-
-      if (!this.selectedMarketTab) {
-        this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket'))
-        return
-      }
-
-      this.searchingSymbols = true
-      this.hasSearched = true
-      try {
-        const res = await searchSymbols({
-          market: this.selectedMarketTab,
-          keyword: keyword.trim(),
-          limit: 20
-        })
-        if (res && res.code === 1 && res.data && res.data.length > 0) {
-          this.symbolSearchResults = res.data
-        } else {
-          this.symbolSearchResults = []
-          this.selectedSymbolForAdd = {
-            market: this.selectedMarketTab,
-            symbol: keyword.trim().toUpperCase(),
-            name: ''
-          }
-        }
-      } catch (error) {
-        this.symbolSearchResults = []
-        this.selectedSymbolForAdd = {
-          market: this.selectedMarketTab,
-          symbol: keyword.trim().toUpperCase(),
-          name: ''
-        }
-      } finally {
-        this.searchingSymbols = false
-      }
-    },
-    handleDirectAdd () {
-      if (!this.symbolSearchKeyword || !this.symbolSearchKeyword.trim()) {
-        this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseEnterSymbol'))
-        return
-      }
-
-      if (!this.selectedMarketTab) {
-        this.$message.warning(this.$t('dashboard.analysis.modal.addStock.pleaseSelectMarket'))
-        return
-      }
-
-      this.selectedSymbolForAdd = {
-        market: this.selectedMarketTab,
-        symbol: this.symbolSearchKeyword.trim().toUpperCase(),
-        name: ''
-      }
-    },
-    selectSymbol (symbol) {
-      this.selectedSymbolForAdd = {
-        market: symbol.market,
-        symbol: symbol.symbol,
-        name: symbol.name || symbol.symbol
-      }
-    },
-    async loadHotSymbols (market) {
-      if (!market) {
-        market = this.selectedMarketTab || (this.marketTypes.length > 0 ? this.marketTypes[0].value : '')
-      }
-
-      if (!market) return
-
-      this.loadingHotSymbols = true
-      try {
-        const res = await getHotSymbols({
-          market: market,
-          limit: 10
-        })
-        if (res && res.code === 1 && res.data) {
-          this.hotSymbols = res.data
-        } else {
-          this.hotSymbols = []
-        }
-      } catch (error) {
-        this.hotSymbols = []
-      } finally {
-        this.loadingHotSymbols = false
-      }
-    },
     async removeFromWatchlist (stock) {
       if (!this.userId) return
       // 支持传入 stock 对象或单独的 symbol/market
@@ -1709,39 +1403,6 @@ export default {
       if (typeof num === 'string') return num
       return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     },
-    async loadMarketTypes () {
-      try {
-        const res = await getMarketTypes()
-        if (res && res.code === 1 && res.data && Array.isArray(res.data)) {
-          this.marketTypes = res.data.map(item => ({
-            value: item.value,
-            i18nKey: item.i18nKey || `dashboard.analysis.market.${item.value}`
-          }))
-        } else {
-          this.marketTypes = [
-            { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
-            { value: 'CNStock', i18nKey: 'dashboard.analysis.market.CNStock' },
-            { value: 'HKStock', i18nKey: 'dashboard.analysis.market.HKStock' },
-            { value: 'Crypto', i18nKey: 'dashboard.analysis.market.Crypto' },
-            { value: 'Forex', i18nKey: 'dashboard.analysis.market.Forex' },
-            { value: 'Futures', i18nKey: 'dashboard.analysis.market.Futures' }
-          ]
-        }
-      } catch (error) {
-        this.marketTypes = [
-          { value: 'USStock', i18nKey: 'dashboard.analysis.market.USStock' },
-          { value: 'CNStock', i18nKey: 'dashboard.analysis.market.CNStock' },
-          { value: 'HKStock', i18nKey: 'dashboard.analysis.market.HKStock' },
-          { value: 'Crypto', i18nKey: 'dashboard.analysis.market.Crypto' },
-          { value: 'Forex', i18nKey: 'dashboard.analysis.market.Forex' },
-          { value: 'Futures', i18nKey: 'dashboard.analysis.market.Futures' }
-        ]
-      }
-
-      if (this.marketTypes.length > 0 && !this.selectedMarketTab) {
-        this.selectedMarketTab = this.marketTypes[0].value
-      }
-    }
   },
   watch: {
     presetSymbol (newVal) {
@@ -1761,25 +1422,6 @@ export default {
         this.startFastAnalysis()
       })
     },
-    showAddStockModal (newVal) {
-      if (newVal) {
-        if (this.marketTypes.length > 0 && !this.selectedMarketTab) {
-          this.selectedMarketTab = this.marketTypes[0].value
-        }
-        if (this.selectedMarketTab) {
-          this.loadHotSymbols(this.selectedMarketTab)
-        }
-      } else {
-        this.selectedSymbolForAdd = null
-        this.symbolSearchKeyword = ''
-        this.symbolSearchResults = []
-        this.hasSearched = false
-        if (this.searchTimer) {
-          clearTimeout(this.searchTimer)
-          this.searchTimer = null
-        }
-      }
-    }
   }
 }
 </script>

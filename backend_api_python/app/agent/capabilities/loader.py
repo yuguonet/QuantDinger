@@ -158,6 +158,19 @@ def load_admitted(admission_path=None):
     return out
 
 
+def _doc_from_entry(ent) -> str:
+    """能力描述：显式 `doc` 优先，否则由 `review_note` 派生（单一事实源）。
+
+    【2026-10-17 F20】此前 admission.json 从不填 `doc`，导致 func_overlap 的
+    「文档共同词」判定对 68 条能力**永不命中**。这里从已有的人工 review_note
+    派生，而不是把 review_note 复制进 doc——两份文本必然各自漂移。
+    """
+    doc = str(ent.get("doc") or "").strip()
+    if doc:
+        return doc[:160]
+    return str(ent.get("review_note") or "").strip()[:160]
+
+
 def load_admitted_meta(admission_path=None) -> list:
     """准入条目全量元数据（含 superseded_by，供同功能筛选）。"""
     path = Path(admission_path) if admission_path else _ADMISSION_PATH
@@ -178,7 +191,7 @@ def load_admitted_meta(admission_path=None) -> list:
             "name": name,
             "timeout_s": int(ent.get("timeout_s") or defaults.get("timeout_s") or 60),
             "max_chars": int(ent.get("max_chars") or defaults.get("max_chars") or 8000),
-            "doc": ent.get("doc") or "",
+            "doc": _doc_from_entry(ent),
             "superseded_by": ent.get("superseded_by") or "",
         })
     return out

@@ -20,14 +20,126 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from mimoagent.agents.antihack import AntiHackConfig
 from mimoagent.agents.mimocode.mimocode_agent import MimocodeAgentConfig
-from mimoagent.tools.mimocode import MIMOCODE_CORE_TOOL_NAMES
+
+from .upstream_compat import core_tool_names
 
 logger = logging.getLogger(__name__)
 
+
+# ── T7 快速接入/断开：统一读口（2026-10-16；2026-10-17 接线 + fail-loud）──────
+# 【设计口径】方案 §8.3 要的是"接入=加一行、断开=置位"的三态开关：
+#   resident（常驻）/ deferred（注册但延迟暴露）/ disabled（不注册）。
+#   ★ 2026-10-17 补第四态 capability（方案 §8.3 示例第 4 行 / §8.4"按域暴露"）：
+#     注册、按需激活、目录里按组呈现——能力层的正式状态名（与 deferred 同路径）。
+# 【落地取舍】**不新建平行体系** —— 本项目各域早已各有关闭/延迟开关
+#   （provider：不注册 / 能力层：admission.json / 工具：on_demand_tools /
+#    技能：skills_adapter 的 env）。故此处只做**统一读口**：
+#     · `QD_TOOL_CONNECT` 一份覆盖表（`name=state`，用 ; 或 , 分隔）；
+#     · 未覆盖的项由既有 env 派生（默认口径与现状一致）；
+#     · 只回答"某单位处于什么状态"，不接管注册/执行（避免双写风险）。
+# 【2026-10-17 G1 接线】读口自此被 `qd_tool_face._partition_tools` 消费
+#   （经 `tool_connect_overrides()`）：改 `QD_TOOL_CONNECT` 下一 run 生效。
+#   此前零调用方 ⇒ 开关是哑炮（审计报告 G1）。
+# 【2026-10-17 G4 fail-loud】非法 state 值（拼错如 defered/disable）不再静默
+#   兜底成 resident——那正是"禁止兜底"红线要修的行为：ERROR 日志（每条目一次）
+#   + 登记进 `tool_connect_invalid()` 供 tool_face 快照审计，该条被忽略。
+#   不 raise：这是请求级运行时读取，raise 会把配置笔误升级成 500；
+#   "留痕可观测"即是修（与 grounding/T2 那轮 None 不回落 0 同一条纪律）。
+_TOOL_CONNECT_STATES = ("resident", "deferred", "disabled", "capability")
+
+# 非法 state 登记表（进程级，逐条一次）：供 tool_face_snapshot 的 connect_invalid
+_TOOL_CONNECT_INVALID: set = set()
+
+
+def _tool_connect_defaults() -> "list":
+    """本文件 `on_demand_tools` 的代码默认值（读口与分层共用，避免两处漂移）。
+
+    ★ `os.getenv(...) or 默认` 语义：env 未设**或为空串**都回落代码默认
+    （9 个）。旧读口曾用 None-vs-"" 双语义（空串 ⇒ 空集），与
+    `QDAgentConfig.default_factory`（走本函数）口径不一致 ⇒ 读口说 resident、
+    真实分层是 deferred（2026-10-17 锤实的第二处漂移，随接线一并消灭）。
+
+    【F11 加 bash（2026-10-17，E2/R2）】实测 `bash` 单工具 schema **4,280 字符
+    = 核心面（11,281）的 38%**，而现场 trace 全程未调用 ⇒ 按「提智不降智、总
+    token 越小越好」降级为按需。不是删能力：仍注册、仍可点名激活 / `search_tools`
+    发现 / execute_action 直调 fail-open（三入口可见性 T1 已补），只是不再每步白挂。
+    """
+    return [w.strip() for w in
+            (os.getenv("QD_ON_DEMAND_TOOLS")
+             or "actor,run_skill,task,edit,read,write,glob,grep,bash").split(",") if w.strip()]
+
+
+def _flag_tool_connect_invalid(item: str) -> None:
+    """登记并 ERROR 报警一条非法 `QD_TOOL_CONNECT` 条目（每条目一次）。"""
+    if item in _TOOL_CONNECT_INVALID:
+        return
+    _TOOL_CONNECT_INVALID.add(item)
+    logger.error(
+        "[tool_connect] 非法 state 值已忽略：%r（合法值 %s）——"
+        "该条不生效，请修 env；本条已登记进 tool_face 快照 connect_invalid",
+        item, "/".join(_TOOL_CONNECT_STATES))
+
+
+def tool_connect_overrides() -> Dict[str, str]:
+    """解析 `QD_TOOL_CONNECT` 覆盖表 ⇒ {name/group: state}（非法条忽略+fail-loud）。
+
+    ★ 解析器唯一事实源：`tool_connect()` 读口与 `qd_tool_face` 分层共用，
+    避免"读口一套解析、消费方另一套"的第三处漂移。组级条目（quote/coding/…）
+    原样返回，由消费方按成员展开（`preselect/tool_groups.expand_overrides`）。
+    """
+    out: Dict[str, str] = {}
+    raw = (os.getenv("QD_TOOL_CONNECT") or "").strip()
+    if not raw:
+        return out
+    for item in raw.replace(",", ";").split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        key, val = k.strip().lower(), v.strip().lower()
+        if not key:
+            continue
+        if val not in _TOOL_CONNECT_STATES:
+            _flag_tool_connect_invalid(f"{key}={val}")
+            continue
+        out[key] = val
+    return out
+
+
+def tool_connect_invalid() -> tuple:
+    """进程内已登记的全部非法 `QD_TOOL_CONNECT` 条目（供快照/审计）。"""
+    return tuple(sorted(_TOOL_CONNECT_INVALID))
+
+
+def tool_connect(name: str) -> str:
+    """查某工具/域/能力/技能单位的暴露状态（env-only 读口，回答"默认配置下"）。
+
+    `QD_TOOL_CONNECT="coding=deferred;ability=disabled"` 可覆盖（也接受逗号分隔；
+    大小写/空格容差）。未覆盖时按既有开关派生，保证**默认行为与改造前逐位一致**：
+      · 在 `QD_ON_DEMAND_TOOLS` 名单里 ⇒ deferred
+      · 能力层且 `QD_CAPABILITIES=0` ⇒ disabled
+      · 其余 ⇒ resident
+    ★ 与 live 面的关系：真实分层（`_partition_tools`）以 **config.on_demand_tools
+    为基座**、本覆盖表赢之；本函数是无 config 时的回答者（测试/探针/smoke 用）。
+    显式 config 覆盖（如 on_demand_tools=[]）在 live 面优先——这是刻意优先级：
+    显式配置 > env 默认。
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return "resident"
+    ov = tool_connect_overrides()
+    if key in ov:
+        return ov[key]
+    if key in set(_tool_connect_defaults()):
+        return "deferred"
+    if key in ("capability", "capabilities", "ability", "abilities"):
+        if (os.getenv("QD_CAPABILITIES") or "1").strip() in ("0", "false", "False"):
+            return "disabled"
+    return "resident"
 
 def _load_system_template() -> str:
     """精简 Agent 行为基座 + 金融域覆盖层（后置，指令晚者优先）。
@@ -180,6 +292,40 @@ def _compaction_threshold() -> Optional[int]:
     return max(2048, int(_context_window() * min(max(ratio, 0.1), 0.95)))
 
 
+def _turn_compact_threshold() -> int:
+    """轮界主动压缩阈值（F12，C2）。
+
+    优先级：QD_TURN_COMPACT_THRESHOLD > QD_TURN_COMPACT_RATIO*窗口 > 默认 0.30。
+    QD_TURN_COMPACT=0 时返回 0（关闭）。
+    """
+    # 一键回退
+    if str((os.getenv("QD_TURN_COMPACT") or "").strip()).lower() == "0":
+        return 0
+    raw_thr = (os.getenv("QD_TURN_COMPACT_THRESHOLD") or "").strip()
+    if raw_thr:
+        try:
+            v = int(raw_thr)
+            return max(0, v)
+        except ValueError:
+            logger.warning("[ctx] QD_TURN_COMPACT_THRESHOLD 非整数，忽略: %r", raw_thr)
+    try:
+        ratio = float(os.getenv("QD_TURN_COMPACT_RATIO", "0.30"))
+    except ValueError:
+        ratio = 0.30
+    ratio = min(max(ratio, 0.05), 0.95)
+    return max(0, int(_context_window() * ratio))
+
+
+def _activate_priority_enabled() -> bool:
+    """F24 激活优先级栈开关（默认开）。
+
+    `QD_ACTIVATE_PRIORITY=0/false/off` ⇒ 退回纯 FIFO 淘汰（旧行为）。
+    为什么默认开：FIFO 只按插入序淘汰，会让 `search_tools` 中途检索自动激活的
+    工具把模型**刚点名**的那几个挤掉（点名不生效 = 降智）。旋钮只为出问题时一键回退。
+    """
+    return str(os.getenv("QD_ACTIVATE_PRIORITY", "1")).strip().lower() not in ("0", "false", "off")
+
+
 @dataclass
 class QDAgentConfig(MimocodeAgentConfig):
     """mimo 原版 MimocodeAgentConfig 之上只加增强项。"""
@@ -187,8 +333,9 @@ class QDAgentConfig(MimocodeAgentConfig):
     instance_template: str = "Your task: {{task}}"
     # 原版核心 7 件 + compact（模型自主上下文压缩，长程任务关键）
     # + actor（并行子代理，多线索分析；并发受 actor_max_concurrency 约束）
+    # F15b：核心工具名经 upstream_compat 取（上游改名 → 告警，不再静默空表）
     tools: List[Any] = field(
-        default_factory=lambda: [{"tool": n} for n in MIMOCODE_CORE_TOOL_NAMES]
+        default_factory=lambda: [{"tool": n} for n in core_tool_names()]
         + [{"tool": "compact"}, {"tool": "actor"}])
     # AntiHackGuard 默认开启（上线安全；误杀时可临时 enabled=False 回退）
     antihack: Any = field(default_factory=lambda: AntiHackConfig(enabled=True))
@@ -233,10 +380,16 @@ class QDAgentConfig(MimocodeAgentConfig):
     # all：退回"全量下发"（排查/对照用；QD_TOOL_TIER_MODE=all）
     tool_tier_mode: str = field(
         default_factory=lambda: (os.getenv("QD_TOOL_TIER_MODE", "tiered").strip().lower() or "tiered"))
-    # 单次会话最多同时激活多少个按需工具（FIFO 淘汰）。
-    # 太大 ⇒ 分了等于没分；太小 ⇒ 多线索任务来回换手。默认 12。
+    # 单次会话最多同时激活多少个按需工具（F24 起按**优先级栈**淘汰，见 qd_tool_face）。
+    # 太大 ⇒ 分了等于没分；太小 ⇒ 多线索任务来回换手。默认 20。
+    # 【F6 抬闸（2026-10-17）】原值 12 = 「点名上限 8 + 技能补位 4」的数值巧合；
+    #   但 F6 裁定「技能声明工具是方法论合同，补位不截断」⇒ 技能声明可达 15 个
+    #   （auto-stock-analyze），12 会在 FIFO 淘汰里**顶掉模型刚点名的工具**。
+    #   抬到 20 让「点名(≤8) + 技能声明(≤15)」在常见情形下不触发淘汰；真正的
+    #   容量治理与优先级（点名 > 声明补位 > 域兜底）已由 F24 优先级栈实现
+    #   （qd_tool_face._ACTIVATION_SOURCE_RANK，回退旋钮 QD_ACTIVATE_PRIORITY=0）。
     max_active_domain_tools: int = field(
-        default_factory=lambda: int(os.getenv("QD_MAX_ACTIVE_TOOLS", "12")))
+        default_factory=lambda: int(os.getenv("QD_MAX_ACTIVE_TOOLS", "20")))
     # 额外强制进必注入层的工具名（例：高频金融工具，避免每次都要激活一轮）
     extra_core_tools: List[str] = field(default_factory=lambda: [
         n.strip() for n in os.getenv("QD_EXTRA_CORE_TOOLS", "").split(",") if n.strip()])
@@ -250,10 +403,23 @@ class QDAgentConfig(MimocodeAgentConfig):
     #     ① 分层 fail-open（execute_action）：未激活直调就地激活放行；
     #     ② 工具预选目录由 _on_demand_names 构建 ⇒ 相关任务首轮就能被点名激活；
     #     ③ system_template 的"重活分发"小节直接点名 run_skill，模型知道名字。
-    # 想再省：QD_ON_DEMAND_TOOLS=actor,run_skill,task（task≈2.1k，纯问答用不到）。
-    on_demand_tools: List[str] = field(default_factory=lambda: [
-        n.strip() for n in os.getenv("QD_ON_DEMAND_TOOLS", "actor,run_skill").split(",")
-        if n.strip()])
+    # 【2026-10-16 T2】默认再追加 7 个**原生编码工具**（task/edit/read/write/glob/grep）：
+    #   现场 trace 的 30 次工具调用里，这 6 类**一次都没出现**（业务走域工具 + 技能
+    #   流水线 run_skill）；8 个 SKILL.md 对它们零引用，market-screener/run.py 甚至
+    #   明写"禁止在技能内二次调用"。21 个必注入工具实测 12,486 tokens/轮，原生
+    #   agentic 家族占 9,673（77.5%）⇒ 移出后每轮 ≈5.6k。
+    #   【不是删能力】工具仍在注册表、仍由执行器执行；地图（tool_map）用中文列出
+    #   "coding（N 个）… 组内名单"，点名即 activate；直调走 execute_action 的
+    #   fail-open 就地激活。三入口（地图/list_tools/search_tools）均已补可见性（T1）。
+    #   【F11：bash 也降级（2026-10-17）】原此处置「bash 是"能跑命令"的兜底通路
+    #   （技能脚本调试），单独一步待定」。实测 bash schema 4,280 字符 = 核心面
+    #   38%（单工具最贵）且现场零调用 ⇒ 已并入本名册按需化。技能脚本调试若真需要，
+    #   走三入口（地图/list_tools/search_tools）点名或 execute_action 直调 fail-open。
+    #   compact 与会话收尾相关，常驻（不降级）。
+    #   【怎么回退】QD_ON_DEMAND_TOOLS="actor,run_skill" 即恢复 T2 前的行为；
+    #   要单独把 bash 放回必注入层，用不含 bash 的名册覆盖即可（非 FnToolAdapter
+    #   在 resident 分支恒必注入，见 qd_tool_face._partition_tools）。
+    on_demand_tools: List[str] = field(default_factory=_tool_connect_defaults)
     # ── 工具预选（2026-10-01）───────────────────────────────────
     # 分层后模型要靠 search_tools→list_tools→activate_tools 三轮才能摸到一个按需
     # 工具（实测 21 次调用里 13 次是发现轮）。这里在 run 前用 **1 次轻量 LLM** 把

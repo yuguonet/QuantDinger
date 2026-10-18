@@ -113,11 +113,19 @@ def low_weight(layer: str, names: Optional[List[str]] = None,
             if v < th][:limit]
 
 
-def hint_text(available_tools: Optional[List[str]] = None) -> str:
+def hint_text(available_tools: Optional[List[str]] = None,
+              query: str = "") -> str:
     """给预选 LLM 看的「历史表现提示」段（没有异常就返回空串，不占位）。
 
     只做**提示**不做**过滤**：低权重工具仍可被点名——历史胜率低不等于这次不需要，
     硬过滤会让模型在确实需要该工具时拿不到它（fail-open 一致性）。
+
+    ★ `query`（2026-10-17，run8 §2.6）：领域命中率提示此前**无视本轮问什么**，
+    把快照里所有低命中域一并倒给每轮——run8 实测一轮普通个股分析也收到
+    「finance 命中率偏低」，与本轮无关却占 token、还暗示"你的结论不可靠"。
+    给了 query 时只保留**与本轮相关**的域（域词典 = preselect.DATA_DOMAINS，
+    与 lint/域兜底同源 ⇒ 不引第二份口径）；query 为空或一个域都不命中时
+    退回旧行为（全列）——老调用方零改动。
     """
     parts = []
     low_tools = low_weight("tool", available_tools)
@@ -130,6 +138,10 @@ def hint_text(available_tools: Optional[List[str]] = None) -> str:
                      + "、".join(low_chains))
     dom = snapshot().get("domain", {}) or {}
     if dom:
+        if query:
+            dom = {k: v for k, v in dom.items() if k in _query_domains(query)}
+        if not dom:
+            return "；".join(parts)
         th = _threshold()
         bad = sorted((k for k, v in dom.items() if v < th))
         good = sorted(((k, v) for k, v in dom.items() if v >= th),
@@ -141,6 +153,23 @@ def hint_text(available_tools: Optional[List[str]] = None) -> str:
             parts.append("领域历史判定命中率：" +
                          "，".join(f"{k} {v:.0%}" for k, v in good))
     return "；".join(parts)
+
+
+def _query_domains(query: str) -> set:
+    """本轮问题命中的域集合（复用 preselect 的域词典，失败按"未命中"处理）。
+
+    域词典是 lint / 域兜底 / 预选目录共用的那一份（`preselect.detect_domains`），
+    此处**不另维护映射**——引第二份就是下一处必然漂移的地方。
+    导入失败（极早期/裁剪部署）返回空集 ⇒ 上游按"无命中"退回全列旧行为。
+    """
+    try:
+        from ..preselect import detect_domains
+    except ImportError:
+        return set()
+    try:
+        return set(detect_domains(query or "") or ())
+    except Exception:
+        return set()
 
 
 def report() -> dict:

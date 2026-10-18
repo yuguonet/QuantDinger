@@ -18,6 +18,15 @@ from typing import Optional
 class GroundingMixin:
     """数字溯源：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
 
+    def _grounding_violation_timed(self, text: str, corpus: str):
+        """带分时的判定（QD_GROUND_TIMING=1 时打点）。判定本体仍走静态方法。"""
+        import time as _t
+        t0 = _t.perf_counter()
+        out = self._grounding_violation(text, corpus)
+        self._g_mark("check", t0, "verdict=%s corpus=%d字 answer=%d字" % (
+            "违规" if out else "通过", len(corpus or ""), len(text or "")))
+        return out
+
     def _observation_corpus(self) -> str:
         """闭环②语料：本轮全部工具观察值（取代旧 executor.state 语料源）。"""
         parts = []
@@ -28,6 +37,19 @@ class GroundingMixin:
             if isinstance(content, str):
                 parts.append(content)
         return "\n".join(parts)
+
+    # ── 溯源分时埋点（QD_GROUND_TIMING=1 / 2026-10-16）──────────────
+    # 用户实测：复杂问题答案段 95 秒、期间零工具调用 ⇒ 需分辨
+    # "规则判定慢" 还是 "重写轮（super().run 带全上下文）慢"。
+    def _g_mark(self, tag: str, t0: float, extra: str = "") -> None:
+        import os as _os, time as _time, logging as _lg
+        if (_os.getenv("QD_GROUND_TIMING") or "").strip() in ("", "0", "false", "False"):
+            return
+        try:
+            _lg.getLogger("app.agent.grounding").warning(
+                "[GROUND] %s 耗时 %.1fs %s", tag, _time.perf_counter() - t0, extra)
+        except Exception:
+            pass
 
     @staticmethod
     def _grounding_violation(text: str, corpus: str) -> Optional[str]:

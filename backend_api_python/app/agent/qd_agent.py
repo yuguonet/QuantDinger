@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import logging
 import time as _time
-from datetime import datetime
 from typing import Any, Callable
 
 # ⚠ 本模块**没有**沿用项目 `from log import logger` 的写法：cli 直跑与单元测试两种
@@ -51,6 +50,8 @@ from . import mimo_boot
 
 from mimoagent.agents.mimocode.mimocode_agent import MimocodeAgent
 from .audit.trace_adapter import TraceAdapter
+# 工具面快照（T1/T2 埋点）：纯计算函数，写 trace 仍走 trace.emit
+from .trace_collector import tool_face_snapshot
 
 # ── 职责模块（详见文件头拆分表）──────────────────────────────────
 from .qd_config import (QDAgentConfig, CORE_TOOL_DOMAINS, _QD_COMPACT_NOTES,
@@ -62,7 +63,6 @@ from .qd_guards import GuardMixin
 from .qd_budgeting import BudgetMixin
 from .qd_aftercare import AftercareMixin
 from .qd_grounding import GroundingMixin
-
 
 def _purge_transient_control(messages: list) -> int:
     """从会话消息里清除**上一轮遗留**的瞬态控制消息（防跨轮污染，2026-10-14）。
@@ -83,7 +83,6 @@ def _purge_transient_control(messages: list) -> int:
     ]
     return before - len(messages)
 
-
 # 成本熔断后的一次性收尾 prompt（P0 修复，2026-10-14）。
 # ★ 必须**以预算提示前缀开头**：它会被当作 user 消息追加进 self.messages，
 #   下一轮开头由 `_purge_transient_control` 清掉（否则残留污染下一轮）。
@@ -91,7 +90,6 @@ def _purge_transient_control(messages: list) -> int:
 # 2026-10-14 外置 prompts/wrapup_summary.md（前缀「（本轮已触及成本上限」不可删）。
 from .prompts import load_prompt as _load_prompt
 _WRAPUP_SUMMARY_PROMPT = _load_prompt("wrapup_summary")
-
 
 class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
               AftercareMixin, GroundingMixin, MimocodeAgent):
@@ -118,7 +116,7 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         self.trace = TraceAdapter(self.config.trace_dir or None) if self.config.trace_enabled else None
         # ── 工具分层台账（在 registry 建好后立刻快照）──
         # _defs_by_name：全量定义（按需激活时从此取）；_core_names：每轮必下发；
-        # _activated：按需层"已点名"的工具（FIFO，受 max_active_domain_tools 约束）
+        # _activated：按需层已激活工具（F24 按来源优先级栈淘汰，见 qd_tool_face）
         self._defs_by_name: dict = {}
         self._all_defs: list = []
         self._core_names: list = []
@@ -288,11 +286,14 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         self._qd_run_tokens = 0
         self._qd_run_steps_total = 0
         self._qd_run_tool_calls = 0
+        self._maybe_turn_compact()   # F12 轮界主动压缩（fail-open 见 BudgetMixin）
         self.tool_call_errors = []
         self.current_plan = None       # 计划是 per-run 的（与步数同生命周期）
-        # 工具预选：必须在 tool_map / tool_availability 渲染**之前**跑，
-        # 否则地图里看不到刚被点名激活的工具，模型会以为还得先去 search。
-        self.last_preselect_report = self._maybe_preselect_tools(task)
+        if not self._preselect_prerun_done():   # skill 进预选（2026-10-17）：service 已预跑 reset+预选（技能提示必须先于 prefetch）⇒ 跳过；这里再 reset 会清掉预选激活成果
+            self.reset_run_activation()     # P2-c：按 run 清空按需层激活（防跨 run schema 泄漏）
+            # 工具预选：必须在 tool_map / tool_availability 渲染**之前**跑，
+            # 否则地图里看不到刚被点名激活的工具，模型会以为还得先去 search。
+            self.last_preselect_report = self._maybe_preselect_tools(task)
         if self.trace is not None:
             try:
                 self.trace.emit("tool_preselect", **self.last_preselect_report)
@@ -301,25 +302,28 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         # 技能卡片 ↔ 工具激活解耦（2026-10-14）：prefetch 注入执行型技能时，分发卡片
         # 点名 `run_skill`，但它是按需工具、预选看的是剥掉注入后的原始问题 ⇒ 预选不点它
         # ⇒ 模型要白花一轮 `search_tools` 才发现（实测 trace step1）。这里把卡片点名的
-        # 工具在**预选之后**激活（放 `_activated` 尾部，避免被 FIFO 先淘汰），且必须在
+        # 工具在**预选之后**以 declared 优先级激活（F24：高于预选/域兜底，不被顶掉），且必须在
         # tool_map / tool_availability 渲染之前 —— 否则地图里看不到，又得去 search。
         _force = list(getattr(self, "prefetch_force_tools", None) or [])
         if _force:
             try:
-                act = self.activate_tools(_force)
+                act = self.activate_tools(_force, source="declared")
                 self.last_preselect_report["skill_force"] = list(
                     act.get("activated", [])) + list(act.get("already", []))
             except Exception as e:
                 logger.debug("[preselect] 技能点名工具激活失败(fail-open): %s", e)
             finally:
                 self.prefetch_force_tools = []
-        # 上下文感知：动态上下文注入 system_template（{{ now }} + {{ tool_map }}）
-        self.extra_template_vars["now"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.extra_template_vars["tool_map"] = self._tool_map_text()
-        self.extra_template_vars["tool_availability"] = self._tool_availability_text()
+        # ★ F9（2026-10-17）：system 每会话只 seed 一次（mimo base.py:213）即永久冻结
+        #   ⇒ now/tool_map 若留 system 则自 turn2 起陈旧；改注入本轮 task（每轮新进）。
+        #   tool_availability 进程内不变，仍留 system（helper 内仅首个 run 算一次）。
+        # ★ F23：collector 先于动态上下文建，否则注入头污染 user_query/pairs（实测 42 条）
         self._collector = self._make_collector(task)
+        task = self._dynamic_context_text(task)
         if self.trace is not None:
+            # 当轮下发面（装配已完成）；带逐工具 token ⇒ 归档可直接算本轮 schema 成本
             try:
+                self.trace.emit("tool_face_ready", **tool_face_snapshot(self))
                 self.trace.run_start(self, task if isinstance(task, str) else str(task))
             except Exception:
                 pass
@@ -367,29 +371,31 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         if self.config.grounding_gate and status not in ("truncated", "empty", "budget_wrapped"):
             corpus = self._observation_corpus()
             if corpus.strip():
-                guide = self._grounding_violation(message, corpus)
-                retries = 0
+                _t0g = _time.perf_counter(); guide = self._grounding_violation_timed(message, corpus); retries = 0
                 while guide is not None and retries < self.config.grounding_max_retries:
                     retries += 1
                     # 同上：只归零步数（否则主轮耗尽后重写轮一进来就死），
                     # 成本与累计步数继续累计，由 run_step_cap / token 预算兜底。
                     self._steps_taken = 0
+                    _t1g = _time.perf_counter(); self._g_mark("REWRITE#%d 前 messages=%d" % (retries, len(getattr(self, "messages", []) or [])), _t0g)
                     status, message = super().run(
                         f"【数字溯源拦截】{guide}\n"
                         "请只依据本轮工具输出中的数字重写结论；无法溯源的数字改为"
                         "\"未获取\"并说明缺失口径。"
                     )
-                    guide = self._grounding_violation(message, corpus)
+                    self._g_mark("REWRITE#%d 后" % retries, _t1g)
+                    guide = self._grounding_violation_timed(message, corpus)
                 if guide is not None:
                     status = "grounding_failed"
 
-        self._plan_lint(status)
-        self._finish_collector(message, status)
-        if self.trace is not None:
-            try:
-                self.trace.run_finish(self, message, status)
-            except Exception:
-                pass
+        # ① 结果先出：收尾链转后台（C3P 实测 80~155s，原先用户干等）；细节见
+        #   `qd_aftercare._spawn_tail`，QD_TAIL_ASYNC=0 回退同步。
+        _tf = self.trace
+        try:
+            self.trace.emit("tool_face_final", **tool_face_snapshot(self))
+        except Exception:
+            pass
+        self._spawn_tail(message, status, _tf)
         return status, message
 
     def trace_prefetch(self, report: dict) -> None:

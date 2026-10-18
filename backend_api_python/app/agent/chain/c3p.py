@@ -71,7 +71,13 @@ SCHEMA_VER = "c3p1"
 
 _DEFAULT_MAX_CLAIMS = 2          # 一次最多处理几条 claim（控成本）
 _DEFAULT_BARS = 120              # 取数根数（远大于模型下限）
-_DEFAULT_LLM_TIMEOUT = 20.0      # 秒
+_DEFAULT_LLM_TIMEOUT = 180.0     # 秒
+# 【2026-10-16 实测校正 20 → 180】本网关（api.g2claw.com / DeepSeek-V4.1-Flash）
+#   处理本任务需 80~155 秒：同一 payload 实测成功耗时 83.8 / 96.4 / 154.1 秒。
+#   旧默认 20s 配上 mimo 通道的 tenacity 5 次重试 ⇒ 5 次全超时、墙钟 124.9s
+#   后降级（白烧且拿不到证据）。改走独立通道（`llm.complete_direct`，attempts=2）
+#   后，本值即"单次读取超时"，最坏墙钟 ≈ 2×180+6s，且只影响后台旁路。
+#   可用 `QD_C3P_LLM_TIMEOUT` 覆盖（换更快的网关/小模型时可下调）。
 _MIN_BARS = 60                   # 与 app.watchlist.predict.MIN_BARS 对齐（有守卫测试）
 
 _CODE_RE = re.compile(r"(\d{6})")
@@ -202,16 +208,27 @@ def _call_llm(system: str, user: str, timeout: float) -> str:
     `asyncio.run`，有循环时塞 ThreadPoolExecutor，外面再套 `wait_for`。三层嵌套
     只为完成"一次调用"，而且 wait_for 取消不了线程里已经发出去的 HTTP 请求 ——
     超时只是"不再等"，请求仍在跑（旧的 LLM 出口没有 timeout 参数可传）。
-    统一到 `app.agent.llm.complete()` 之后超时由 client 侧真正生效，这里只剩一行。
+    【2026-10-16 二次改】原走上层 `complete()`（mimo 通道）⇒ 其 `_query` 上的
+    tenacity **硬编码 5 次**重试改不掉，一次调用的墙钟 = 5 ×(timeout+退避)，
+    实测 `timeout=5` 花 52.9s、`timeout=20` 花 124.9s 且**必然失败**
+    （该网关对本任务本身就慢：成功调用 15.4/77.5/81.3/189.7 秒）。
+    现改走 `app.agent.llm.complete_direct()` —— 独立 requests 通道，
+    尝试次数/读取超时/输出上限全部由本模块控制，并回传**精确 usage**。
+    主链路与其它调用点仍用 `complete()`，两个出口并存是有意为之。
 
     `QD_C3P_LLM_MODEL` 优先于全局模型：C3P 的证据提取是轻量活，允许单独指定小模型。
     """
-    from app.agent.llm import complete
+    from app.agent.llm import complete_direct
 
-    resp = complete(
+    # 2026-10-16 输入压 token：输出上限默认 1200→800（抽取 JSON 远小于此），
+    # 尝试次数默认 2→1（`QD_C3P_LLM_ATTEMPTS`；C3P 已转后台，少一次重试即少一份
+    # 重复输入 token）。两值均可 env 覆盖，不硬编码。
+    resp = complete_direct(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         model=llm_model() or None,
         timeout=timeout,
+        max_tokens=_env_int("QD_C3P_MAX_OUTPUT_TOKENS", 800),
+        attempts=_env_int("QD_C3P_LLM_ATTEMPTS", 1),
     )
     return str(resp.content or "")
 
@@ -270,10 +287,13 @@ def extract_evidence(*, user_query: str = "", answer: str = "",
       ③ 模型合规率可控（不产出就降级，且能被 G20 的降级比例看见）。
     """
     try:
+        # 2026-10-16 输入压 token：query/answer 截断长度改 env 可配且收紧默认
+        # （600→400 / 2000→1500）。这两段是 payload 的绝对大头；claim 自带
+        # `source_quote`，故缩短 answer 仍保留判断依据。
         payload = {
             "subject": subject,
-            "user_query": str(user_query or "")[:600],
-            "answer": str(answer or "")[:2000],
+            "user_query": str(user_query or "")[:_env_int("QD_C3P_MAX_QUERY_CHARS", 400)],
+            "answer": str(answer or "")[:_env_int("QD_C3P_MAX_ANSWER_CHARS", 1500)],
             "claim": {k: claim.get(k) for k in
                       ("claim_type", "subject", "horizon", "predicted", "source_quote")
                       if isinstance(claim, dict) and claim.get(k) is not None},

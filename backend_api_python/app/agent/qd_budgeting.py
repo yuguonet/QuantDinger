@@ -18,9 +18,44 @@ from __future__ import annotations
 
 from mimoagent.agents.base import LimitsExceeded
 
+from .upstream_compat import invoke_compaction
+
 
 class BudgetMixin:
     """成本记账：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
+
+    def _maybe_turn_compact(self) -> int:
+        """轮界主动压缩（F12，C2）。非首轮 + 历史超阈值时调用 _do_compact()，fail-open。
+
+        Return: 压缩前 token 估算（>0 表示已尝试压缩）。
+        """
+        try:
+            from .qd_config import _turn_compact_threshold
+        except Exception:
+            return 0
+        thr = _turn_compact_threshold()
+        if thr <= 0:
+            return 0
+        try:
+            msgs = getattr(self, "messages", None)
+            if not msgs:
+                return 0
+            has_prior_round = any(m.get("role") in ("assistant", "tool") for m in msgs)
+            if not has_prior_round:
+                return 0
+            from mimoagent.utils.cal_token import rough_token_count_estimation_for_messages
+            pre = rough_token_count_estimation_for_messages(msgs)
+            if pre < thr:
+                return 0
+            # F15b：经 upstream_compat 调用 —— `_do_compact` 缺失时显式告警（F12 静默失效 → 可见）
+            invoke_compaction(self)
+            return int(pre)
+        except Exception as e:
+            try:
+                logger.debug("[turn_compact] 主动压缩失败(fail-open): %s", e)
+            except Exception:
+                pass
+            return 0
 
     def _account_budget(self) -> None:
         """累计本请求成本，超预算即抛 LimitsExceeded（软收尾）。"""

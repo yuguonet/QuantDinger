@@ -32,12 +32,14 @@ TraceCollector — Agent 执行追踪器（mimo 新系统的决策树写入侧�
 from __future__ import annotations
 
 from .log import logger
+import json
 import re
 import time
 from datetime import date
 from typing import Any, List, Optional
 
 from .chain.schema import EvalNode, Layer, Status
+from .qd_config import tool_connect_invalid
 from .utils.json_parser import extract_decision
 
 
@@ -244,8 +246,13 @@ class TraceCollector:
     # ── Agent 结束，组装树并存库 ─────────────────────────────
 
     def on_agent_finish(self, final_answer: str, total_steps: int,
-                        total_tokens: int, model: str) -> EvalNode:
-        """Agent 结束，构建完整 EvalNode 树并存库。"""
+                        total_tokens: int, model: str,
+                        cached_tokens: int = 0) -> EvalNode:
+        """Agent 结束，构建完整 EvalNode 树并存库。
+
+        cached_tokens（F10，2026-10-17）：命中前缀缓存的 input token 数，
+        由调用方从 `model.token_stats.cache_read_tokens` 透传（缺省 0=未上报）。
+        """
         # 防空
         if not final_answer:
             final_answer = ""
@@ -298,7 +305,9 @@ class TraceCollector:
             user_query=(self.user_query or "")[:2000],
             stock_code=str(stock_code)[:32],
             stock_name=self._stock_name or extracted.get("stock_name", ""),
-            input_params={"user_query": self.user_query},
+            # 步数没有专列，进 run 级元数据袋（问责要能读到步数）。
+            input_params={"user_query": self.user_query,
+                          "total_steps": int(total_steps or 0)},
             analysis=extracted.get("analysis", final_answer[:2000]),
             score=score,
             direction=direction,
@@ -307,6 +316,14 @@ class TraceCollector:
             confidence=confidence,
             timeframe=extracted.get("timeframe", ""),
             elapsed_ms=(time.time() - self.start_time) * 1000,
+            # 【2026-10-17 补断点，随 F10 一并修】此前三个形参
+            # total_steps/total_tokens/model **只收不用** ⇒ 走本主链
+            # （qd_aftercare → TraceCollector → store）的根节点 model/total_tokens
+            # 恒为 NULL，只有 `utils/tracing.AgentTraceRecorder` 那条支链在写这两列。
+            # 后果：F10 的 cached_tokens 若单独落库，比率分母缺失 ⇒ 缓存率算不出来。
+            model=str(model or ""),
+            total_tokens=(int(total_tokens) if total_tokens else None),
+            cached_tokens=(int(cached_tokens) if cached_tokens else None),
         )
 
         # 挂载 skill 节点（每个 skill 已包含其 tool 子节点）
@@ -504,3 +521,68 @@ class TraceCollector:
         if any(kw in answer_lower for kw in ["不太确定", "有风险", "low confidence"]):
             return 0.3
         return 0.5
+
+
+# ── 当轮工具面快照（模块级；2026-10-16 从 TraceCollector 类中迁出）──────────
+# ⚠️ 必须留在**模块级**：此前误插在 `class TraceCollector` 中途（0 缩进），
+#    直接终止了类定义，导致其后的 on_tool_call/on_agent_finish/flush 及全部
+#    extract 辅助被嵌套成死代码 ⇒ 轨迹链被到处 try/except 静默吞掉，一行不落库。
+def tool_face_snapshot(agent: Any) -> dict:
+    """当轮工具面快照（供 `qd_agent` 写 `tool_face_ready` / `tool_face_final`）。
+
+    【为什么是模块函数而不是 TraceCollector 方法】2026-10-16 实跑暴露：本文件是
+    **审计树**组件，没有 `emit`（写 jsonl 的是 `TraceAdapter.emit`）——原先写成
+    `self.emit(...)` 必然 AttributeError，被调用点的 `try/except: pass` 吞掉，
+    事件一条不落盘（CLI 实跑实证 0 条）。改成纯计算函数后，agent 侧走与
+    `tool_preselect` / `run_start` **同一条** `self.trace.emit(...)` 通路。
+
+    【为什么要埋】`TraceAdapter.run_start` 只存 `tool_list_hash`（全量名单哈希）
+    ⇒ 归档无法还原"当轮究竟下发了哪些工具"：`_activated` 跨 run 累积的浪费只能
+    靠代码路径+FIFO 模拟推下界；预选命中率/白带 token 也无法按轮次归因。
+
+    【字段】active_tool_names 只含**按需层已激活**工具（core 恒在、单独计
+    core_count/core_schema_tokens）；token 按各工具自身 schema 长度估算，
+    **不把全量 schema 写进 trace**（trace 是审计流，体积要控）。
+    """
+    try:
+        names = list(getattr(agent, "_activated", None) or [])
+    except Exception:
+        names = []
+    defs = getattr(agent, "_defs_by_name", None) or {}
+
+    def _tok(name: str) -> int:
+        try:
+            return len(json.dumps(defs[name], ensure_ascii=False)) // 2
+        except Exception:
+            return 0
+
+    per_tool = {n: _tok(n) for n in names}
+    core = list(getattr(agent, "_core_names", None) or [])
+    core_tokens = sum(_tok(n) for n in core)
+    # ── T7 验收字段（2026-10-17；方案 §8.6「口径唯一」）──────────────────
+    # connect_state_counts：**状态**计数（声明视角）——QD_TOOL_CONNECT 声明 +
+    #   config 基座叠加后每个工具的生效态，四键之和 == 注册工具数。
+    #   ⚠ 与 deferred_count（**层**计数，面视角）不是一回事：finance 等子域工具
+    #   状态是 resident、但按 CORE_TOOL_DOMAINS 规则落入按需**层**⇒ 层计数更大。
+    #   审计对账时：声明 ↔ 状态计数；"这轮藏起了什么" ↔ 层计数。
+    # disabled/deferred_count：面视角（与 _disabled_names/_on_demand_names 一致）。
+    # connect_invalid：fail-loud 登记的非法条目（G4）——非空即说明有配置笔误，
+    #   必须修 env 而非容忍。
+    states = dict(getattr(agent, "_connect_states", None) or {})
+    state_counts = {s: 0 for s in ("resident", "deferred", "capability", "disabled")}
+    for st in states.values():
+        state_counts[st] = state_counts.get(st, 0) + 1
+    return {
+        "active_tool_names": names,
+        "active_count": len(names),
+        "active_schema_tokens": sum(per_tool.values()),
+        "per_tool_tokens": per_tool,
+        "core_count": len(core),
+        "core_schema_tokens": core_tokens,
+        "face_total_tokens": core_tokens + sum(per_tool.values()),
+        "cap": getattr(getattr(agent, "config", None), "max_active_domain_tools", None),
+        "connect_state_counts": state_counts,
+        "disabled_count": len(getattr(agent, "_disabled_names", None) or []),
+        "deferred_count": len(getattr(agent, "_on_demand_names", None) or []),
+        "connect_invalid": list(tool_connect_invalid()),
+    }

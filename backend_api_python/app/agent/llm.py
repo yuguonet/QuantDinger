@@ -66,13 +66,18 @@ mimo 自带 `models/`（chat / anthropic / responses 三种协议）已经覆盖
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
+import time as _time
+from time import perf_counter as _perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from mimoagent.models import get_model as _mimo_get_model
+
+from .upstream_compat import read_token_stats
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,8 @@ __all__ = [
     "get_model",
     "complete",
     "acomplete",
+    "complete_direct",
+    "set_profile_sink",
 ]
 
 
@@ -210,6 +217,23 @@ _MODEL_CACHE: dict[tuple, Any] = {}
 _CACHE_LOCK = threading.Lock()
 
 
+def _freeze(obj: Any) -> Any:
+    """把任意嵌套值转为可哈希的稳定表示（供缓存键用）。
+
+    `get_model(**extra)` 的 extra 值可以是 dict（如 `model_kwargs`）/list/set，
+    直接塞进缓存键会触发 `unhashable type`（F5 收敛后首次触发：主链传入
+    `model_kwargs={...}`）。递归冻结保证键恒可哈希，且同值不同插入顺序得到
+    同一键（dict 按键排序）。
+    """
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _freeze(v)) for k, v in obj.items()))
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze(v) for v in obj)
+    if isinstance(obj, set):
+        return frozenset(_freeze(v) for v in obj)
+    return obj
+
+
 def get_model(
     *,
     provider: Optional[str] = None,
@@ -230,7 +254,7 @@ def get_model(
     spec = resolve_provider(provider, model, base_url=base_url, api_key=api_key)
     tmo = timeout if timeout is not None else _default_timeout()
     key = (spec.name, spec.base_url, spec.model, tmo,
-           hash(spec.api_key), tuple(sorted(extra.items())))
+           hash(spec.api_key), _freeze(extra))
     with _CACHE_LOCK:
         cached = _MODEL_CACHE.get(key)
         if cached is not None:
@@ -274,6 +298,97 @@ def _to_response(payload: dict, model_name: str = "") -> LLMResponse:
     )
 
 
+# ── 调用级埋点（诊断用 / 2026-10-16）──────────────────────────
+# 用户实测：最后一次 LLM 调用 token 巨大（16k→60k）、耗时极长，但当天分不清是
+# 主循环 / 溯源重写 / C3P 证据提取。这里用 mimo 自带 token_stats 的**调用前后差值**
+# 精确归因。默认关闭；`QD_LLM_PROFILE=1` 开，`QD_LLM_PROFILE_TRACE=1` 另落 trace。
+def _llm_profile_enabled() -> bool:
+    return (os.getenv("QD_LLM_PROFILE") or "").strip() not in ("", "0", "false", "False")
+
+
+# 进程级 trace sink：`QD_LLM_PROFILE_TRACE=1` 时把调用画像也写进 trace。
+# 【为什么需要设置器】`_profile_call` 里 `getattr(TraceAdapter, "_profile_sink", None)`
+# 原先是**死代码**——该属性从未被赋值 ⇒ 即使开了 TRACE 也写不进 trace
+# （2026-10-16 偏移审计实测）。由 `QDAgent.__init__`（trace 已建）挂上。
+_PROFILE_SINK = None
+
+
+def set_profile_sink(adapter) -> None:
+    """显式设置 trace 落点（传 None 取消；一般不必要，见 `_resolve_profile_sink`）。"""
+    global _PROFILE_SINK
+    _PROFILE_SINK = adapter
+
+
+def _resolve_profile_sink():
+    """惰性解析 trace 落点（仅 `QD_LLM_PROFILE_TRACE=1` 时）。
+
+    【为什么不从 QDAgent 注入】`qd_agent.py` 有 ≤420 行守卫，注入块把它顶超；
+    而 `TraceAdapter()` 默认就写 `app/agent/traces/qd_agent_runs.jsonl`
+    —— 与 agent 的默认路径**同一个文件**，本模块自行构造即可对齐。
+    `QD_TRACE_DIR` 可覆盖目录（与 config.trace_dir 同义）。
+    """
+    global _PROFILE_SINK
+    if _PROFILE_SINK is not None:
+        return _PROFILE_SINK
+    try:
+        from .audit.trace_adapter import TraceAdapter
+        out = (os.getenv("QD_TRACE_DIR") or "").strip() or None
+        _PROFILE_SINK = TraceAdapter(out)
+    except Exception:
+        _PROFILE_SINK = False          # 用 False 记住"试过且失败"，避免反复重试
+    return _PROFILE_SINK or None
+
+
+def _profile_call(model: Any, messages: Sequence[dict], t0: float, err: str = "") -> None:
+    if not _llm_profile_enabled():
+        return
+    try:
+        st = read_token_stats(model)
+        n = int(getattr(model, "n_calls", 0) or 0)
+        inp = int(getattr(st, "input_tokens", 0) or 0)
+        out = int(getattr(st, "output_tokens", 0) or 0)
+        # 差值口径：token_stats 是**模型实例累计**（实例按 (provider,base_url,model,timeout)
+        # 缓存 ⇒ 同一调用点连续多次调用会累加）。埋点只报累计值与调用数，
+        # 归因由"调用前后两次读数的差"在分析脚本里算 —— 这样不会因实例复用而失真。
+        # 调用方归因：取栈帧里**第一个 app/agent 下的业务帧**（跳过 llm/profile 自身）。
+        # 为什么需要：用户看到"4 次调用"，但说不出是哪 4 处发起的 ⇒ 无法判断是否重复。
+        caller = ""
+        try:
+            import traceback as _tb
+            for fr in reversed(_tb.extract_stack()[:-2]):
+                fn = fr.filename.replace("\\", "/")
+                if "/app/agent/" in fn and not fn.endswith(("llm.py", "trace_collector.py")):
+                    caller = "%s:%d:%s" % (fn.split("/app/agent/")[-1], fr.lineno, fr.name)
+                    break
+        except Exception:
+            pass
+        rec = {
+            "event": "llm_call",
+            "caller": caller,
+            "model": str(getattr(getattr(model, "config", None), "model_name", "") or ""),
+            "timeout": getattr(getattr(model, "config", None), "timeout", None),
+            "n_calls": n,
+            "cum_input_tokens": inp,
+            "cum_output_tokens": out,
+            "cum_total_tokens": inp + out,
+            "msg_count": len(list(messages or [])),
+            "in_chars": sum(len(str(m.get("content") or ""))
+                            for m in (messages or []) if isinstance(m, dict)),
+            "elapsed_ms": round((_perf_counter() - t0) * 1000, 1),
+            "error": err,
+        }
+        logger.warning("[LLM-PROFILE] %s", json.dumps(rec, ensure_ascii=False))
+        if (os.getenv("QD_LLM_PROFILE_TRACE") or "").strip() not in ("", "0", "false", "False"):
+            try:
+                _sink = _resolve_profile_sink()
+                if _sink is not None:
+                    _sink.emit("llm_call", **rec)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def complete(
     messages: Sequence[dict],
     *,
@@ -304,8 +419,114 @@ def complete(
         kwargs["max_tokens"] = max_tokens
     kwargs.update(extra)
 
-    payload = m.query(list(messages), **kwargs)
+    _t0 = _perf_counter()
+    try:
+        payload = m.query(list(messages), **kwargs)
+    except Exception as _e:
+        _profile_call(m, messages, _t0, err="%s: %s" % (type(_e).__name__, _e))
+        raise
+    _profile_call(m, messages, _t0)
     return _to_response(payload, model_name=getattr(m, "config", None) and getattr(m.config, "model_name", "") or "")
+
+
+def complete_direct(
+    messages: Sequence[dict],
+    *,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    timeout: Optional[float] = None,
+    attempts: int = 2,
+    gap_s: float = 6.0,
+    provider: Optional[str] = None,
+) -> LLMResponse:
+    """**独立 HTTP 通道**：绕过 mimoagent 的 tenacity 重试，自己掌控超时与尝试次数。
+
+    【为什么需要它·2026-10-16 实测】mimo `OpenAIChatModel._query` 上的 tenacity 是
+    **硬编码 5 次**（4~60s 退避，改不了）⇒ 一次 `complete()` 的墙钟 =
+    5 × (单次 timeout + 退避)。实测 `timeout=5.0` 实际耗时 **52.9s**；
+    C3P 默认 `QD_C3P_LLM_TIMEOUT=20` ⇒ 最坏 ≈125s 且 5 次全超时（网关对本任务
+    本身就慢：成功调用实测 15.4 / 77.5 / 81.3 / 189.7 秒）。
+
+    本函数把三个旋钮交回调用方：
+      · `timeout` —— **读取超时**（秒），给足（C3P 场景建议 ≥120s，默认 QD_LLM_TIMEOUT）；
+      · `attempts` —— 总尝试次数（默认 2，**不是 5**）；
+      · `max_tokens` —— 显式限制输出（C3P 只要一段 JSON）。
+    并返回**精确 usage**（网关 `usage` 字段 ⇒ LLMResponse 的 prompt/completion tokens）。
+
+    ⚠ 与 `complete()` 的分工：主链路、其余 6 个调用点**继续用 `complete()`**
+      （它们依赖 mimo 的保链/流式聚合）；只有"需要精确控时 + 要 usage"的
+      旁路（C3P 证据提取）走本通道。两个出口并存是有意为之。
+    """
+    import requests
+
+    spec = resolve_provider(provider=provider, model=model)
+    tmo = timeout if timeout is not None else _default_timeout()
+    url = spec.base_url.rstrip("/") + "/chat/completions"
+    body: dict[str, Any] = {"model": spec.model, "messages": list(messages)}
+    if temperature is not None:
+        body["temperature"] = temperature
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        t0 = _perf_counter()
+        try:
+            resp = requests.post(
+                url, json=body,
+                headers={"Authorization": "Bearer " + (spec.api_key or ""),
+                         "Content-Type": "application/json"},
+                timeout=(10.0, float(tmo)),      # (连接, 读取)
+            )
+            if resp.status_code != 200:
+                raise RuntimeError("HTTP %s: %s" % (resp.status_code, resp.text[:200]))
+            data = resp.json()
+            choice = ((data.get("choices") or [{}])[0].get("message") or {})
+            usage = data.get("usage") or {}
+            out = LLMResponse(
+                content=choice.get("content") or "",
+                model=spec.model,
+                finish_reason=str((data.get("choices") or [{}])[0].get("finish_reason") or "stop"),
+                tokens_used=int(usage.get("total_tokens") or 0),
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                metadata={"attempt": attempt, "transport": "direct"},
+            )
+            _log_direct_call(spec, messages, out, (_perf_counter() - t0) * 1000.0, attempt, "")
+            return out
+        except BaseException as e:              # noqa: BLE001 —— fail-open 由调用方负责
+            last_err = e
+            _log_direct_call(spec, messages, None, (_perf_counter() - t0) * 1000.0,
+                             attempt, "%s: %s" % (type(e).__name__, str(e)[:160]))
+            if attempt < max(1, int(attempts)):
+                _time.sleep(float(gap_s))
+    raise last_err if last_err else RuntimeError("complete_direct: 无尝试")
+
+
+def _log_direct_call(spec: ProviderSpec, messages: Sequence[dict],
+                     resp: Optional[LLMResponse], elapsed_ms: float,
+                     attempt: int, err: str) -> None:
+    """独立通道的调用留痕（与 complete() 的 [LLM-PROFILE] 同前缀，便于一次 grep）。"""
+    if not _llm_profile_enabled():
+        return
+    try:
+        rec = {
+            "event": "llm_call",
+            "transport": "direct",
+            "model": spec.model,
+            "attempt": attempt,
+            "msg_count": len(list(messages or [])),
+            "in_chars": sum(len(str(m.get("content") or ""))
+                            for m in (messages or []) if isinstance(m, dict)),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "input_tokens": (resp.prompt_tokens if resp else None),
+            "output_tokens": (resp.completion_tokens if resp else None),
+            "error": err,
+        }
+        logger.warning("[LLM-PROFILE] %s", json.dumps(rec, ensure_ascii=False))
+    except Exception:
+        pass
 
 
 async def acomplete(messages: Sequence[dict], **kwargs: Any) -> LLMResponse:

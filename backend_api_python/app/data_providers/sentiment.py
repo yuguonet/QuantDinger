@@ -1,15 +1,19 @@
 """
 sentiment.py — 情绪数据聚合模块（单文件版）
 
-数据源: TwelveData(优先) → yfinance → tencent → akshare → alternative.me
+数据源: akshare → alternative.me（VIX 族整族摘除后，见 _ORDER 上方记录）
 已删除: 新浪、东方财富
+已移除: yfinance（2026-10-17，Yahoo 持续 read timeout，详见 _ORDER 上方说明）、
+        DXY 指标（同日，剩余三源均拿不到值）、
+        VIX 族 vix/vxn/gvz/vix_term（2026-10-18：用户不需要 VIX 具体值，
+        且实测 TwelveData 免费计划对 VIX/VXN/GVZ 全 symbol invalid、
+        US02Y/US10Y 亦 invalid，tencent 仅 usVIX 有效）
 
 环境变量:
-  TWELVEDATA_API_KEY  — TwelveData API Key
-  YFINANCE_PROXY      — yfinance 代理地址 (如 http://127.0.0.1:7890)
+  TWELVE_DATA_API_KEY  — TwelveData API Key（与 config_loader 注册名一致，
+        少写下划线会恒为空；commodities 侧的黄金源仍在使用该 key）
 """
 
-import os
 import re
 import time
 import logging
@@ -25,13 +29,14 @@ logger = logging.getLogger("app.data_providers.sentiment")
 # ============================================================
 
 _TD_BASE = "https://api.twelvedata.com"
+# 2026-10-18 实测（免费计划）: VIX/VXN/GVZ/DXY 均 symbol invalid,
+# US02Y/US10Y 亦 invalid ⇒ _TwelveData 在 sentiment 侧已无有效指标,
+# 仅保留 us2y/us10y 条目作恢复对照（commodities 侧的黄金 XAU/USD 不受影响）
 _TD_SYMBOLS = {
-    "vix": "VIX", "vxn": "VXN", "gvz": "GVZ",
-    "dxy": "DXY", "us2y": "US2Y", "us10y": "US10Y",
+    "us2y": "US2Y", "us10y": "US10Y",
 }
 _TD_RANGES = {
-    "vix": (5, 90), "vxn": (5, 90), "gvz": (5, 90),
-    "dxy": (70, 120), "us2y": (0.05, 10), "us10y": (0.05, 10),
+    "us2y": (0.05, 10), "us10y": (0.05, 10),
 }
 
 
@@ -104,22 +109,6 @@ class _TwelveData:
             logger.warning("twelvedata %s: %s", sym, e)
             return None
 
-    def fetch_vix(self):
-        return self._quote("vix")
-
-    def fetch_vxn(self):
-        return self._quote("vxn")
-
-    def fetch_gvz(self):
-        return self._quote("gvz")
-
-    def fetch_dxy(self):
-        return self._quote("dxy")
-
-    def fetch_vix_term(self):
-        """TwelveData 没有 VIX3M, 无法算期限结构"""
-        return None
-
     def fetch_yield_curve(self):
         y2 = self._quote("us2y")
         y10 = self._quote("us10y")
@@ -136,7 +125,11 @@ class _TwelveData:
 
 
 # ============================================================
-#  yfinance
+#  yfinance 源已于 2026-10-17 整源移除（Yahoo 持续超时，
+#  且它排在_ORDER 首位导致每次刷新先耗 60s+ 等报错）。
+#  若要恢复：需重连query2.finance.yahoo.com 或配 YFINANCE_PROXY，
+#  然后在 _ORDER 对应指标首位补回 "yfinance" 并重新启用下面的类。
+#  保留 _YF_SYMBOLS 仅作恢复时的标的对照参考，当前无代码引用。
 # ============================================================
 
 _YF_SYMBOLS = {
@@ -145,83 +138,16 @@ _YF_SYMBOLS = {
 }
 
 
-class _YFinance:
-
-    def __init__(self, proxy: str | None = None):
-        if proxy:
-            import yfinance as _yf
-            _yf.set_config(proxy=proxy)
-            logger.info("yfinance: proxy=%s", proxy)
-
-    @staticmethod
-    def _close(symbol: str) -> Optional[float]:
-        import yfinance as _yf
-        from datetime import datetime, timedelta
-
-        try:
-            t = _yf.Ticker(symbol)
-            df = t.history(period="5d")
-            if df is None or df.empty:
-                end = datetime.now()
-                start = end - timedelta(days=10)
-                df = t.history(
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                )
-            if df is None or df.empty:
-                logger.warning("yfinance %s: no data", symbol)
-                return None
-            val = float(df.iloc[-1]["Close"])
-            return val if val > 0 else None
-        except Exception as e:
-            logger.warning("yfinance %s: %s", symbol, e)
-            return None
-
-    def fetch_vix(self):
-        v = self._close(_YF_SYMBOLS["vix"])
-        return {"value": v, "source": "yfinance"} if v else None
-
-    def fetch_vxn(self):
-        v = self._close(_YF_SYMBOLS["vxn"])
-        return {"value": v, "source": "yfinance"} if v else None
-
-    def fetch_gvz(self):
-        v = self._close(_YF_SYMBOLS["gvz"])
-        return {"value": v, "source": "yfinance"} if v else None
-
-    def fetch_dxy(self):
-        v = self._close(_YF_SYMBOLS["dxy"])
-        if v and 70 < v < 120:
-            return {"value": v, "source": "yfinance"}
-        return None
-
-    def fetch_vix_term(self):
-        vix = self._close(_YF_SYMBOLS["vix"])
-        vix3m = self._close(_YF_SYMBOLS["vix3m"])
-        if not vix or not vix3m:
-            return None
-        ratio = round(vix / vix3m, 4)
-        return {
-            "vix": vix, "vix3m": vix3m,
-            "ratio": ratio, "backwardated": ratio > 1.0,
-            "source": "yfinance",
-        }
-
-    def fetch_yield_curve(self):
-        return None
-
-    def fetch_fear_greed_index(self):
-        return None
-
-
 # ============================================================
 #  腾讯
 # ============================================================
 
 _TX_BASE = "https://qt.gtimg.cn/q="
+# 2026-10-18: vix/vxn/gvz/dxy 键随 VIX 族与 DXY 摘除一并删除。
+# 实测 tencent 仅 usVIX 有效 (21.67)，usVXN/usGVZ/usDXY 均返空；
+# 保留 tnx 仅作恢复对照（当前无 fetch 方法消费）
 _TX_SYMBOLS = {
-    "vix": "usVIX", "vxn": "usVXN",
-    "gvz": "usGVZ", "dxy": "usDXY", "tnx": "usTNX",
+    "tnx": "usTNX",
 }
 
 
@@ -266,21 +192,6 @@ class _Tencent:
         if val is None or not (lo <= val <= hi):
             return None
         return {"value": val, "source": "tencent"}
-
-    def fetch_vix(self):
-        return self._get("vix", 5, 90)
-
-    def fetch_vxn(self):
-        return self._get("vxn", 5, 90)
-
-    def fetch_gvz(self):
-        return self._get("gvz", 5, 90)
-
-    def fetch_dxy(self):
-        return self._get("dxy", 70, 120)
-
-    def fetch_vix_term(self):
-        return None
 
     def fetch_yield_curve(self):
         return None
@@ -332,11 +243,6 @@ class _Akshare:
             logger.warning("akshare yield: %s", e)
             return None
 
-    def fetch_vix(self):       return None
-    def fetch_vxn(self):       return None
-    def fetch_gvz(self):       return None
-    def fetch_dxy(self):       return None
-    def fetch_vix_term(self):  return None
     def fetch_fear_greed_index(self): return None
 
 
@@ -364,11 +270,6 @@ class _AltMe:
             logger.warning("alternative.me: %s", e)
             return None
 
-    def fetch_vix(self):        return None
-    def fetch_vxn(self):        return None
-    def fetch_gvz(self):        return None
-    def fetch_dxy(self):        return None
-    def fetch_vix_term(self):   return None
     def fetch_yield_curve(self): return None
 
 
@@ -380,34 +281,35 @@ class sentiment:
     """
     情绪数据聚合器
 
-    优先级（每项 TwelveData 排第一）:
-      VIX:       twelvedata → yfinance → tencent
-      VXN:       twelvedata → yfinance → tencent
-      GVZ:       twelvedata → yfinance → tencent
-      DXY:       twelvedata → yfinance → tencent → akshare
-      Yield:     twelvedata → akshare → tencent
-      VIX Term:  yfinance → twelvedata
+    优先级:
+      Yield:     akshare → tencent
       Fear&Greed: alternative.me
+
+    2026-10-17 摘除的源与指标（依据实测，不是猜测）:
+      - yfinance 全线失效: Yahoo query2.finance.yahoo.com 持续 read timeout=10，
+        ^VIX/^VXN/^GVZ/^VIX3M/DX-Y.NYB 全部 "No data found"，
+        而它排在 vix/vxn/gvz/dxy/vix_term 五项的首位或次位，
+        导致每次刷新先把 60s+耗在等 Yahoo 报错上。整源摘除。
+      - DXY 整条移除: 摘掉 yfinance 后剩余三源实测全部拿不到值。
+        若日后要恢复 DXY，需先补 TWELVE_DATA_API_KEY 或给 akshare 补实现。
+
+    2026-10-18 摘除的源与指标（依据实测，不是猜测）:
+      - VIX 族 vix/vxn/gvz/vix_term 整族摘除: 用户不需要 VIX 具体值；
+        且实测 TwelveData 免费计划对 VIX/VXN/GVZ 全 symbol invalid、
+        US02Y/US10Y 亦 invalid（yield_curve 的 twelvedata 源随之摘除），
+        tencent 仅 usVIX 有效（usVXN/usGVZ 返空）。每轮刷新 3 条
+        "ALL sources failed" ERROR 属纯噪音，故整族移除。
+        恢复路径: 升级 TwelveData 套餐或改用其他 VIX 数据源后，
+        按 _TD_SYMBOLS/_TX_SYMBOLS 的恢复对照注释补回条目与方法。
     """
 
     _ORDER = {
-        "vix":          ["twelvedata", "yfinance", "tencent"],
-        "vxn":          ["twelvedata", "yfinance", "tencent"],
-        "gvz":          ["twelvedata", "yfinance", "tencent"],
-        "dxy":          ["twelvedata", "yfinance", "tencent", "akshare"],
-        "yield_curve":  ["twelvedata", "akshare", "tencent"],
-        "vix_term":     ["yfinance", "twelvedata"],
+        "yield_curve":  ["akshare", "tencent"],
         "fear_greed":   ["altme"],
     }
 
-    def __init__(
-        self,
-        twelvedata_api_key: str = "",
-        yfinance_proxy: str | None = None,
-    ):
+    def __init__(self):
         self._p: dict[str, object] = {
-            "twelvedata": _TwelveData(twelvedata_api_key or os.environ.get("TWELVEDATA_API_KEY", "")),
-            "yfinance":   _YFinance(yfinance_proxy or os.environ.get("YFINANCE_PROXY")),
             "tencent":    _Tencent(),
             "akshare":    _Akshare(),
             "altme":      _AltMe(),
@@ -436,39 +338,12 @@ class sentiment:
 
     # ── 公开接口 ──
 
-    def get_vix(self) -> Optional[float]:
-        """VIX 恐慌指数"""
-        r = self._run("vix", "fetch_vix")
-        return r["value"] if r else None
-
-    def get_vxn(self) -> Optional[float]:
-        """NASDAQ VIX"""
-        r = self._run("vxn", "fetch_vxn")
-        return r["value"] if r else None
-
-    def get_gvz(self) -> Optional[float]:
-        """黄金 VIX"""
-        r = self._run("gvz", "fetch_gvz")
-        return r["value"] if r else None
-
-    def get_dxy(self) -> Optional[float]:
-        """美元指数"""
-        r = self._run("dxy", "fetch_dxy")
-        return r["value"] if r else None
-
     def get_yield_curve(self) -> Optional[dict]:
         """
         收益率曲线
         返回 {"y2": float, "y10": float, "spread": float} 或 None
         """
         return self._run("yield_curve", "fetch_yield_curve")
-
-    def get_vix_term(self) -> Optional[dict]:
-        """
-        VIX 期限结构
-        返回 {"vix": float, "vix3m": float, "ratio": float, "backwardated": bool} 或 None
-        """
-        return self._run("vix_term", "fetch_vix_term")
 
     def get_fear_greed(self) -> Optional[int]:
         """CNN 恐惧贪婪指数 (0=极度恐惧, 100=极度贪婪)"""
@@ -481,26 +356,16 @@ class sentiment:
 
         Returns:
             {
-                "vix": 21.67,
-                "vxn": 25.3,
-                "gvz": 18.5,
-                "dxy": 104.2,
                 "yield_curve": {"y2": 4.05, "y10": 4.35, "spread": 0.30},
-                "vix_term": {"ratio": 0.95, "backwardated": False},
                 "fear_greed": 12,
             }
         """
         tasks = {
-            "vix":         self.get_vix,
-            "vxn":         self.get_vxn,
-            "gvz":         self.get_gvz,
-            "dxy":         self.get_dxy,
             "yield_curve": self.get_yield_curve,
-            "vix_term":    self.get_vix_term,
             "fear_greed":  self.get_fear_greed,
         }
         results: dict = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futs = {pool.submit(fn): k for k, fn in tasks.items()}
             for fut in concurrent.futures.as_completed(futs):
                 k = futs[fut]
@@ -539,29 +404,9 @@ def _set_cached_indicator(key: str, data: object) -> None:
     pass
 
 
-def fetch_vix() -> Optional[dict]:
-    return _get_sentiment()._run("vix", "fetch_vix")
-
-
-def fetch_vxn() -> Optional[dict]:
-    return _get_sentiment()._run("vxn", "fetch_vxn")
-
-
-def fetch_gvz() -> Optional[dict]:
-    return _get_sentiment()._run("gvz", "fetch_gvz")
-
-
-def fetch_dollar_index() -> Optional[dict]:
-    return _get_sentiment()._run("dxy", "fetch_dxy")
-
-
 def fetch_yield_curve() -> Optional[dict]:
     return _get_sentiment()._run("yield_curve", "fetch_yield_curve")
 
 
 def fetch_fear_greed_index() -> Optional[dict]:
     return _get_sentiment()._run("fear_greed", "fetch_fear_greed_index")
-
-
-def fetch_put_call_ratio() -> Optional[dict]:
-    return _get_sentiment()._run("vix_term", "fetch_vix_term")

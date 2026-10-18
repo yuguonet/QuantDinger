@@ -123,6 +123,29 @@ def test_call_capability_blocks_generic_name(cap_env) -> None:
     assert "error" in out, f"通用名能力被放行：{out}"
 
 
+def test_call_capability_same_name_executes_tool_layer(cap_env) -> None:
+    """F4（2026-10-17）：**同名**工具存在时，call_capability 直接执行工具层实现。
+
+    原实现回一句「请直接调用该工具」，模型需再发一次 tool call（run10 实测绕 3 轮）。
+    修法：派发层把同名工具执行掉、结果原样交给模型（工具层 > 能力层 = 用工具层那份）。
+    反向护栏：标注键 name 仍不得被工具返回值覆盖（与 G7② 同口径）。
+    """
+    class _P(_FakeProvider):
+        def get(self, nm):
+            if nm == "get_fund_flow":
+                return lambda **kw: {"from_tool_layer": True, "name": "覆盖名"}
+            return None
+
+    cap_env.register("get_fund_flow", lambda **kw: {"from_capability": True},
+                     _P({"common": ["get_fund_flow"]}))
+    out = _ct.call_capability("get_fund_flow", {})
+    assert "error" not in out, f"同名工具应被代执行而非报错：{out}"
+    assert out.get("from_tool_layer") is True, (
+        f"同名时未执行工具层实现（实际 {out}）—— 仍让模型白跑一轮")
+    assert out.get("from_capability") is None, "不得执行能力层那份"
+    assert out["name"] == "get_fund_flow", "标注键 name 不得被工具返回值覆盖"
+
+
 # ────────────────────────────────────────────────────────────── G7②
 
 

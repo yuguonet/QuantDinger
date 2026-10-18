@@ -455,22 +455,50 @@ def call_tool(name: str, **kwargs) -> Any:
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_kline(code: str, days: int = 60) -> List[Dict]:
-    from app.data_sources.provider.adjustment import unadj_to_qfq
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=int(days * 1.5))).strftime("%Y-%m-%d")
+    """个股日线（前复权），统一走 `CNStockDataSource.get_kline` 门面。
+
+    2026-10-18 F23 收口：原实现直读 db_market writer（不复权原始价）+ 自调
+    `unadj_to_qfq`，是 agent 内部最后一处绕开门面的 K 线取数。现改为经门面，
+    与追责链（evaluator）/ C3P（kline_feed）/ 工具面（agent_get_kline）同源：
+    DB 优先 + snapshot lastbar（盘中）+ 远端补满（DB 不够新时）+ 出口 qfq。
+    - **契约不变**：`days` = 回溯根数（_facts.multitimeframe docstring「日线
+      回溯根数」）⇒ 直传 `limit=days`。旧实现用 `days*1.5` 日历窗近似，实测
+      给 days-1 根；limit 语义更准且只多不少。
+    - **返回形状不变**：`time` 为 `YYYY-MM-DD` 日期串（下游 `_norm_bars` 按此
+      转 int 时间戳给 predict）。门面 1D 出口 `time` 是 int 时间戳 ⇒ 在此转串，
+      转换不外溢给调用方。时区显式取北京时间（对齐门面 `_read_db` 的
+      `ZoneInfo("Asia/Shanghai")`，不依赖部署机本地时区）。
+    - **失败语义不变**：取不到返回 []（不抛）。
+    对拍基线：tmp/fetch_kline_baseline_20261018.json（改造前输出），
+    逐键比对脚本 tmp/fetch_kline_compare_20261018.py，值零差异。
+    """
+    from zoneinfo import ZoneInfo
     try:
-        writer = _get_writer()
-        data = writer.query("CNStock", code, "1D", start_time=start, end_time=end, limit=0)
-        if not data:
-            return []
-        bars = [{
-            "time": str(r["time"])[:10], "open": float(r["open"]),
-            "high": float(r["high"]), "low": float(r["low"]),
-            "close": float(r["close"]), "volume": float(r["volume"]),
-        } for r in data]
-        return unadj_to_qfq(bars, code)
+        from app.data_sources.cn_stock import CNStockDataSource
+        raw = CNStockDataSource().get_kline(code, "1D", int(days)) or []
     except Exception:
         return []
+    _bj = ZoneInfo("Asia/Shanghai")
+    bars: List[Dict] = []
+    for k in raw:
+        if not isinstance(k, dict):
+            continue
+        t = k.get("time")
+        if isinstance(t, (int, float)) and not isinstance(t, bool):
+            # 门面 1D 行 time = int epoch（_read_db 按北京时区生成）
+            try:
+                ts = datetime.fromtimestamp(int(t), tz=_bj).strftime("%Y-%m-%d")
+            except (ValueError, OSError, OverflowError):
+                continue
+        else:
+            ts = str(t or "")[:10]     # 容错：门面若直出日期串则原样取前 10 位
+        if not ts:
+            continue
+        bars.append({
+            "time": ts, "open": k.get("open"), "high": k.get("high"),
+            "low": k.get("low"), "close": k.get("close"), "volume": k.get("volume"),
+        })
+    return bars
 def get_limit_pct(code: str, name: str = "") -> float:
     """涨跌停幅度（%）。返回 0.0 = 无涨跌幅限制。
 

@@ -20,7 +20,7 @@ import json
 import os
 from ..log import logger
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .schema import DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct
@@ -1009,7 +1009,273 @@ def get_worker_health() -> Dict[str, Any]:
     h["is_alive"] = _eval_thread is not None and _eval_thread.is_alive()
     h["next_run_in_seconds"] = _seconds_until_post_market() if h["is_alive"] else None
     h["schedule"] = "每天 15:30（盘后）"
+    # ── C：合并只读探针（2026-10-18）────────────────────────────────
+    # in-process 字段在"宿主根本没起"时全是 None/假象（没有进程就没有内存状态）
+    # ⇒ 探针读**落盘**真相补进来：stalled/health_status/health_detail。
+    probe = probe_worker_health()
+    h["stalled"] = probe["stalled"]
+    h["health_status"] = probe["status"]
+    h["health_detail"] = probe["detail"]
+    h["health_file"] = probe["health_file"]
+    h["last_persisted_success_at"] = probe["last_success_at"]
     return h
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  停摆自愈（B）+ 健康探针（C）—— 2026-10-18 用户裁定 B+C
+#
+#  背景：盘后闭环 = scheduler._post_market_batch（15:30，backfill 1m/1d
+#  → post_market_done.set()）→ EvalWorker（auto_evaluate + v5 采集 + 酿造）。
+#
+#  B) 停摆不自健：flask 在 15:30 之后才起（宿主机几天没开 / 重启）时，
+#     scheduler 主循环会在 ~10s 内补跑当日 post_market_batch（**启动补跑
+#     路径刻意跳过它、主循环不跳过**，scheduler.py:833-881），但本线程
+#     按 _seconds_until_post_market() 睡到次日 15:30 ⇒ 错过事件、当日
+#     闭环静默顺延，v5 情境帧（C 类不可重建）永久丢失。
+#     ⇒ 线程启动时判定：已过盘后时刻 + 批次今日未完成 ⇒ 等事件而非睡到
+#        明日；批次已完成而评估今日未成功（进程在两者之间死过）⇒ 立即补评。
+#
+#  B') 消费即清：post_market_done 历史上从不 clear ⇒ 长跑进程从第 2 天起
+#     "等待盘后数据同步"恒跳过，15:30 评估与 backfill 赛跑（靠 resolver
+#       视界门② + 重试治理兜底，但违背设计意图）。清在**消费侧**
+#       （_wait_post_market_done）而非 batch 起始侧——后者与 15:30 准点
+#       wake 存在竞态（wake 可能先于 clear 读到昨日的置位）。
+#
+#  C) 停摆不可见：_worker_health 只在进程内 ⇒ 宿主不起时外部无从得知。
+#     ⇒ 健康快照落盘 JSONL（对齐 trace 机制：AGENT_*_FILE 相对路径锚定
+#       app/agent/）+ 只读探针 + CLI --health（stalled ⇒ exit 1）。
+# ═══════════════════════════════════════════════════════════════════
+
+# 盘后批次触发时刻 —— 与 scheduler.TASKS 的 post_market_batch(15:30) **同口径**；
+# 改时刻必须两处同改（本常量是 EvalWorker 侧的自愈判据，不是新事实源）。
+_POST_MARKET_TRIGGER = (15, 30)
+
+
+def _wait_post_market_secs() -> float:
+    """等盘后批次完成事件的上限秒数（QD_EVAL_WAIT_POST_MARKET_SECONDS，默认 3600）。
+
+    默认值即旧代码内联的 3600（批次含 10min 未到位重试，~50min 量级）；
+    提成 env 旋钮：阈值口径走配置层，不新造硬编码。
+    """
+    try:
+        return max(60.0, float(os.getenv("QD_EVAL_WAIT_POST_MARKET_SECONDS", "3600") or 3600))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
+def _stall_grace_hours() -> float:
+    """探针判定停摆的宽限小时数（QD_EVAL_STALL_GRACE_HOURS，默认 2）。"""
+    try:
+        return max(0.5, float(os.getenv("QD_EVAL_STALL_GRACE_HOURS", "2") or 2))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _health_file_path():
+    """健康落盘路径：AGENT_EVAL_HEALTH_FILE 相对路径锚定 app/agent/（对齐 trace 机制）。"""
+    from app.agent.utils.tracing import anchored_path
+    return anchored_path("AGENT_EVAL_HEALTH_FILE", "traces/eval_worker_health.jsonl")
+
+
+def _persist_worker_health(extra: Optional[Dict[str, Any]] = None) -> None:
+    """把 _worker_health 快照追加进健康 JSONL（C）。**fail-soft**：观测不许成为新故障源。
+
+    一行一事件（worker_start / run）；字段含 ts/pid + _worker_health 全量 +
+    extra（event/catchup）。写失败只记 warning，绝不影响 worker 主线。
+    """
+    try:
+        snap: Dict[str, Any] = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "pid": os.getpid()}
+        snap.update(_worker_health)
+        if extra:
+            snap.update(extra)
+        p = _health_file_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(snap, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logger.warning("[EvalWorker] 健康落盘失败(不影响 worker): %s: %s",
+                       type(e).__name__, e)
+
+
+def _read_last_health_line() -> Optional[Dict[str, Any]]:
+    """读健康落盘最后一条**可解析**行（容忍尾撕裂/半写）；没有 ⇒ None。"""
+    try:
+        p = _health_file_path()
+        if not p.is_file():
+            return None
+        last = None
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    last = json.loads(line)
+                except Exception:
+                    continue    # 撕裂行跳过，用上一条好行
+        return last
+    except Exception:
+        return None
+
+
+def _post_market_catchup_plan(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """停摆自愈判定（B）。返回 {"mode": "wait"|"run_now"|"none", "reason": str}。
+
+    - wait:    今日已过盘后触发时刻、批次今日未完成 ⇒ 批次会由 scheduler 主循环
+               补跑（单一触发点不破，EvalWorker **不自己跑批次**）⇒ 本线程应等
+               事件，而非睡到次日 15:30。
+    - run_now: 批次今日已完成、但评估今日未成功跑过（健康落盘有历史成功证据）
+               ⇒ 数据已就绪，立即补评（补的是当日闭环，不是重跑批次）。
+    - none:    未到时刻 / 非交易日 / 今日闭环已大概率完成 / 无证据（首次部署）。
+
+    ★ run_now 的证据要求：健康落盘必须存在且历史 total_successes>0。没有证据时
+      宁可漏一次自愈，也不冒"评估其实已跑过"的风险双算（weight_feed 是 EMA 慢调，
+      同数据双跑会双步进）。漏诊由 C 探针暴露，不错算。
+    """
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if (now.hour, now.minute) < _POST_MARKET_TRIGGER:
+        return {"mode": "none",
+                "reason": f"未到盘后时刻({now.strftime('%H:%M')} < 15:30)"}
+    from app.utils.trading_calendar import is_trading_day
+    if not is_trading_day(today):
+        return {"mode": "none", "reason": "非交易日"}
+    from app.market_cn.scheduler import scheduler_task_done
+    if not scheduler_task_done("post_market_batch", today):
+        return {"mode": "wait",
+                "reason": f"今日({today})盘后批次未完成 ⇒ 等 scheduler 主循环补跑后 set 的事件"}
+    last = _read_last_health_line()
+    if last and str(last.get("last_success_at") or "").startswith(today):
+        return {"mode": "none", "reason": "今日盘后闭环已成功完成"}
+    if last and int(last.get("total_successes") or 0) > 0:
+        return {"mode": "run_now",
+                "reason": "批次已完成但评估今日未成功跑过(有历史成功证据) ⇒ 数据就绪，立即补评"}
+    return {"mode": "none",
+            "reason": "批次已完成、评估无历史成功证据(首次部署/从未跑过) ⇒ 不敢双算，回归正常节拍"}
+
+
+def _wait_post_market_done(timeout: float) -> bool:
+    """等盘后批次完成事件；**等到即消费（clear）**，返回是否等到（B/B'）。
+
+    ★ 为什么消费即清：post_market_done 历史上从不 clear ⇒ 长跑进程从第 2 天起
+      `is_set()` 恒真，"等待盘后数据同步完成"永远跳过，15:30 评估与 backfill
+      赛跑（靠视界门② + 重试治理兜底，但违背设计意图）。
+    ★ 导入失败（market_cn 不可用）⇒ 返回 True 按旧语义继续执行，不炸 worker
+      （C-1 事故教训：启动期导入失败必须显式记一笔，不能静默）。
+    """
+    try:
+        from app.market_cn.scheduler import post_market_done
+    except Exception as e:
+        logger.warning("[EvalWorker] 盘后事件不可用(%s: %s)，按旧语义继续执行",
+                       type(e).__name__, e)
+        return True
+    if not post_market_done.is_set():
+        logger.info("[EvalWorker] 等待盘后数据同步完成...")
+        if not post_market_done.wait(timeout=timeout):
+            return False
+        logger.info("[EvalWorker] 盘后数据同步完成，开始回溯验证")
+    post_market_done.clear()   # 消费即清：次日等待才有效
+    return True
+
+
+def probe_worker_health(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """只读健康探针（C）：不依赖进程内状态/DB，宿主down了也能从外部调。
+
+    staleness 判据：
+      · 有成功记录 ⇒ 预期下一完成时刻 = 下一交易日 15:30 + 宽限
+        （QD_EVAL_STALL_GRACE_HOURS，默认 2h）；now 超过它仍无新成功 ⇒ stalled。
+      · 从未成功 ⇒ 以最后一条线的日期为参照：当天 15:30+宽限前算 pending
+        （首跑还没到/当天还会重试），之后 stalled（闭环从未完成）。
+      · 文件缺失/空 ⇒ no_data（无证据 ≠ 健康，只是判不了）；无可解析行 ⇒ unreadable。
+
+    返回 {"status": ok|pending|stalled|no_data|unreadable, "stalled": bool,
+          "health_file", "last_run_at", "last_success_at",
+          "consecutive_failures", "total_runs", "detail"}
+    """
+    now = now or datetime.now()
+    out: Dict[str, Any] = {
+        "stalled": False, "status": "no_data",
+        "health_file": str(_health_file_path()),
+        "last_run_at": None, "last_success_at": None,
+        "consecutive_failures": 0, "total_runs": 0, "detail": "",
+    }
+    try:
+        p = _health_file_path()
+        if not p.is_file():
+            out["detail"] = "健康文件不存在（worker 从未在本机起过或未落盘）"
+            return out
+        rows = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue    # 容忍尾撕裂/半写行
+        if not rows:
+            out["status"] = "unreadable"
+            out["detail"] = "健康文件无任何可解析行（格式损坏？）"
+            return out
+        last = rows[-1]
+        out["last_run_at"] = last.get("last_run_at")
+        out["last_success_at"] = last.get("last_success_at")
+        out["consecutive_failures"] = int(last.get("consecutive_failures") or 0)
+        out["total_runs"] = int(last.get("total_runs") or 0)
+        succ = str(last.get("last_success_at") or "")
+        if succ:
+            ref = succ[:10]
+            from app.utils.trading_calendar import next_trading_day
+            ref = next_trading_day(ref)
+        else:
+            ref = str(last.get("ts") or "")[:10]
+            if not ref:
+                out["status"] = "unreadable"
+                out["detail"] = "最后一行无 ts（无法定位时间参照）"
+                return out
+        expected = datetime.strptime(ref, "%Y-%m-%d").replace(hour=15, minute=30) \
+            + timedelta(hours=_stall_grace_hours())
+        if now > expected:
+            out["stalled"] = True
+            out["status"] = "stalled"
+            out["detail"] = (f"超过预期完成时刻 {expected:%Y-%m-%d %H:%M} 仍无成功记录"
+                             + (f"（连续失败 {out['consecutive_failures']} 次）"
+                                if out["consecutive_failures"] else ""))
+        else:
+            out["status"] = "ok" if succ else "pending"
+            out["detail"] = ("正常" if succ else
+                             f"今日尚未首跑（等待 15:30 节拍；连续失败 {out['consecutive_failures']} 次）")
+        return out
+    except Exception as e:
+        out["status"] = "unreadable"
+        out["detail"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """只读 CLI（C）：--health 探针 / --catchup-plan 自愈判定预演。零副作用。"""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="app.agent.chain.evaluator",
+        description="EvalWorker 只读观测（不触跑任何闭环；宿主 down 时也可用）")
+    ap.add_argument("--health", action="store_true",
+                    help="打印健康探针 JSON；stalled/unreadable 时 exit 1（供外部监控）")
+    ap.add_argument("--catchup-plan", action="store_true",
+                    help="打印停摆自愈判定（wait/run_now/none）")
+    args = ap.parse_args(argv)
+    if args.catchup_plan:
+        print(json.dumps(_post_market_catchup_plan(), ensure_ascii=False,
+                         indent=2, default=str))
+        return 0
+    r = probe_worker_health()   # 默认即 --health
+    print(json.dumps(r, ensure_ascii=False, indent=2, default=str))
+    return 1 if (r.get("stalled") or r.get("status") == "unreadable") else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 def _seconds_until_post_market() -> float:
     """计算距离下一个盘后 15:30 的秒数。"""
     from datetime import datetime
@@ -1060,23 +1326,42 @@ def start_eval_worker():
     _eval_stop = threading.Event()
 
     def _worker():
-        while not _eval_stop.is_set():
-            # 计算距离下一个盘后 15:30 的等待时间
-            wait_secs = _seconds_until_post_market()
-            logger.info("[EvalWorker] 下次盘后验证: %.0f 秒后 (%.1f 小时)",
-                        wait_secs, wait_secs / 3600)
-            if _eval_stop.wait(timeout=wait_secs):
-                break  # 收到停止信号
+        # ── 停摆自愈判定（B，2026-10-18）────────────────────────────
+        # flask 15:30 之后才起 ⇒ scheduler 主循环 ~10s 内补跑当日 post_market_batch
+        # （启动补跑路径刻意跳过它，主循环不跳过，scheduler.py:833-881），但本线程
+        # 若按 _seconds_until_post_market() 睡到次日 15:30，事件被错过、当日闭环
+        # 静默顺延、v5 情境帧（C 类不可重建）永久丢失 ⇒ 启动时改判一次。
+        plan = _post_market_catchup_plan()
+        if plan["mode"] != "none":
+            logger.info("[EvalWorker] 停摆自愈(%s): %s", plan["mode"], plan["reason"])
+        _persist_worker_health({"event": "worker_start", "catchup": plan["mode"]})
 
-            # 等待盘后批次完成（K线数据同步就绪）
-            try:
-                from app.market_cn.scheduler import post_market_done
-                if not post_market_done.is_set():
-                    logger.info("[EvalWorker] 等待盘后数据同步完成...")
-                    post_market_done.wait(timeout=3600)  # 最多等1小时
-                    logger.info("[EvalWorker] 盘后数据同步完成，开始回溯验证")
-            except Exception as e:
-                logger.warning("[EvalWorker] 等待盘后批次失败: %s，继续执行", e)
+        while not _eval_stop.is_set():
+            mode = plan["mode"]
+            if mode == "wait":
+                # 批次由 scheduler 主循环补跑（单一触发点不破）；本线程只负责等它
+                if not _wait_post_market_done(_wait_post_market_secs()):
+                    logger.warning(
+                        "[EvalWorker] 停摆自愈等待超时(%ds)：盘后批次未完成，照常评估"
+                        "（数据可能未齐，追责重试治理兜底）", _wait_post_market_secs())
+            elif mode == "run_now":
+                pass   # 批次已完成（数据就绪），无需等待，直接评估
+            else:
+                # 计算距离下一个盘后 15:30 的等待时间
+                wait_secs = _seconds_until_post_market()
+                logger.info("[EvalWorker] 下次盘后验证: %.0f 秒后 (%.1f 小时)",
+                            wait_secs, wait_secs / 3600)
+                if _eval_stop.wait(timeout=wait_secs):
+                    break  # 收到停止信号
+
+                # 等待盘后批次完成（K线数据同步就绪；B'：消费即清）
+                if not _wait_post_market_done(_wait_post_market_secs()):
+                    logger.warning("[EvalWorker] 等待盘后批次超时(%ds)，照常评估",
+                                   _wait_post_market_secs())
+
+            plan = {"mode": "none"}   # 自愈只生效一次，之后回归正常节拍
+            if _eval_stop.is_set():
+                break
 
             # 盘后执行 T+N 验证
             _worker_health["total_runs"] += 1
@@ -1111,6 +1396,11 @@ def start_eval_worker():
                     refresh_skill_adapter()
             except Exception as e:
                 logger.warning("[EvalWorker] 技能酿造跳过: %s", e)
+
+            # ── C：每轮跑完落一份健康快照（停摆可诊断、探针有数据可读）──────
+            # 放在酿造之后：本行的 last_success_at 反映"整条闭环跑完"这一事实。
+            # 进程在落盘前被杀 ⇒ 探针读到上一条旧线 ⇒ 判 stalled（正是目的）。
+            _persist_worker_health({"event": "run", "catchup": mode})
 
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()

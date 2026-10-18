@@ -40,38 +40,8 @@
             />
           </div>
         </a-tab-pane>
-        <a-tab-pane key="polymarket">
-          <span slot="tab">
-            <a-icon type="radar-chart" />
-            {{ $t('aiAssetAnalysis.tabs.polymarket') }}
-          </span>
-          <div class="tab-body">
-            <div class="polymarket-tab-content">
-              <div class="polymarket-placeholder">
-                <div class="placeholder-icon"><a-icon type="radar-chart" /></div>
-                <h3>{{ $t('polymarket.analysis.title') }}</h3>
-                <p>{{ $t('polymarket.analysis.description') }}</p>
-                <a-button
-                  type="primary"
-                  size="large"
-                  icon="thunderbolt"
-                  @click="showPolymarketModal = true"
-                  style="margin-top: 16px;"
-                >
-                  {{ $t('polymarket.analysis.startAnalysis') }}
-                </a-button>
-              </div>
-            </div>
-          </div>
-        </a-tab-pane>
       </a-tabs>
     </a-card>
-
-    <!-- Polymarket分析对话框 -->
-    <PolymarketAnalysisModal
-      :visible="showPolymarketModal"
-      @close="showPolymarketModal = false"
-    />
 
   </div>
 </template>
@@ -80,14 +50,12 @@
 import { mapState } from 'vuex'
 import AnalysisView from '@/views/ai-analysis'
 import QuickTradePanel from '@/components/QuickTradePanel/QuickTradePanel'
-import PolymarketAnalysisModal from '@/components/PolymarketAnalysisModal'
 
 export default {
   name: 'AIAssetAnalysis',
   components: {
     AnalysisView,
     QuickTradePanel,
-    PolymarketAnalysisModal
   },
   data () {
     return {
@@ -104,8 +72,6 @@ export default {
       // Current analysis symbol (from AnalysisView)
       currentAnalysisSymbol: '',
       currentAnalysisMarket: '',
-      // Polymarket Analysis Modal
-      showPolymarketModal: false
     }
   },
   computed: {
@@ -224,16 +190,6 @@ export default {
         overflow: hidden;
       }
 
-      .polymarket-tab-content {
-        padding: 40px 20px;
-        text-align: center;
-
-        .polymarket-placeholder {
-          .placeholder-icon { font-size: 32px; color: #6366f1; margin-bottom: 24px; }
-          h3 { font-size: 20px; font-weight: 700; margin-bottom: 12px; color: rgba(0, 0, 0, 0.85); }
-          p  { font-size: 14px; color: rgba(0, 0, 0, 0.55); margin-bottom: 24px; }
-        }
-      }
     }
   }
 
@@ -252,10 +208,6 @@ export default {
         ::v-deep .ant-tabs-ink-bar { background-color: #a78bfa; }
       }
 
-      .polymarket-tab-content .polymarket-placeholder {
-        h3 { color: #d4d4d4; }
-        p  { color: #a3a3a3; }
-      }
     }
   }
 }
@@ -295,17 +247,6 @@ export default {
         }
       }
 
-      .tab-body {
-        .polymarket-tab-content {
-          padding: 16px 8px;
-
-          .polymarket-placeholder {
-            .placeholder-icon { font-size: 48px; margin-bottom: 12px; }
-            h3 { font-size: 17px; }
-            p { font-size: 13px; }
-          }
-        }
-      }
     }
   }
 }
@@ -323,9 +264,6 @@ export default {
           font-size: 13px;
           padding: 8px 6px;
         }
-      }
-      .tab-body .polymarket-tab-content {
-        padding: 12px 6px;
       }
     }
   }

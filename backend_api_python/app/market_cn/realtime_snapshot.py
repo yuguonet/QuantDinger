@@ -18,6 +18,8 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
 
 核心职责:
   1. 盘中每分钟拉取全市场实时行情快照 (原始数据)
+     - 9:15~9:25 集合竞价段 / 9:30~11:31 与 13:00~15:01 连续竞价段
+     (2026-10-17 由"9:26 单拍 + 9:30 起"扩到 9:15~9:25 整段, 见 _is_auction_time)
   2. 存入独立表 realtime_snapshot (单表，不按年分表)
   3. 供盘中 VWAP/换手率等指标直接读取，不经过 1m K 线中转
 
@@ -27,6 +29,8 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
   3. 独立表，不与 kline 表混用
   4. 表自动创建 (CREATE TABLE IF NOT EXISTS)，无需手动建表
   5. 单表，保留 KEEP_DAYS 天历史（默认 8 天），过期自动清理
+  6. **空拍不入库** (2026-10-17): open<=0 且 volume<=0 的记录是"无成交前收报价",
+     竞价段扩窗后这类会大量出现, 落库必污染下游 (见 _extract_snapshot_records)
 
 表结构 (realtime_snapshot):
   核心字段 — 与 coordinator 返回的行情 dict 字段一一对应:
@@ -40,13 +44,16 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
   3. volume 单位是"股"（各源已归一化），不是"手"
   4. extras 内容因源而异，不要在业务逻辑中依赖 extras 的具体字段
   5. 与 backfill_db 的 kline 表是两套独立数据，不要混用
+  6. **落库 time 用的是"数据源返回的行情时间"**（q.time 优先，缺失才用整分钟兜底），
+     所以同一次调度写出的行 time 会秒级错开（实测 9:26 那次写出 09:25:00~09:26:22），
+     别误以为是多次调度; 也因此"按分钟整点"去数拍数会低估真实调度频次。
 """
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from app.utils.logger import get_logger
 
@@ -109,14 +116,29 @@ def _load_all_codes() -> List[str]:
 _CORE_KEYS = {"symbol", "last", "open", "high", "low", "previousClose", "prev_close", "volume", "close", "price", "name", "change", "changePercent", "time"}
 
 
-def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str) -> List[Dict]:
+def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str):
     """
     coordinator 返回的行情 dict → 快照记录列表。
 
     核心字段存独立列，其余字段打包到 extras JSONB (有就存，没有忽略)。
     time 字段优先使用数据源返回的 time，若无则使用 fallback_ts。
+
+    两道丢弃闸门（2026-10-17 竞价段扩窗配套）:
+      1. last <= 0 —— 无效报价（停牌/源未返回），历史行为不变;
+      2. **空拍**: open<=0 且 volume<=0 —— 日内既无开盘价又无成交，纯"前收报价",
+         对下游全是负资产（cn_stock 会拿它拼今日 1D bar、fund_flow 会按 last 的
+         涨跌方向伪造资金流）。集合竞价 9:15~9:25 正是这类报价的高发区，
+         扩窗采集后必须挡掉；实测全库该类记录约占每天 0.2%~0.28%。
+
+    ⚠️ 竞价段的代价：9:15-9:25 若数据源只给前收报价，则这 11 分钟每分钟一次
+       的全市场拉取都不会产生有效行（白跑）。日志里的 empty_pick 计数可直接
+       看出源在竞价段到底给不给数据（若恒为全量 => 竞价段数据全被过滤）。
+
+    Returns:
+        (records, skipped_empty) —— skipped_empty 为被空拍闸门丢弃的条数
     """
     records = []
+    skipped_empty = 0
     for q in quotes:
         sym = q.get("symbol", "")
         last = q.get("last") or q.get("close") or q.get("price") or 0
@@ -124,18 +146,24 @@ def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str) -> List[Dict
             continue
 
         # 核心字段
+        open_px = q.get("open") or 0
+        cum_vol = q.get("volume") or 0
+        if open_px <= 0 and cum_vol <= 0:
+            skipped_empty += 1
+            continue
+
         rec = {
             "symbol": sym,
             "time": q.get("time") or fallback_ts,
             "name": q.get("name") or "",
             "last": last,
-            "open": q.get("open") or 0,
+            "open": open_px,
             "high": q.get("high") or 0,
             "low": q.get("low") or 0,
             "previousClose": q.get("previousClose") or q.get("prev_close") or 0,
             "change": q.get("change") or 0,
             "changePercent": q.get("changePercent") or 0,
-            "volume": q.get("volume") or 0,
+            "volume": cum_vol,
         }
 
         # 扩展字段 → extras (有就存，没有不加)
@@ -144,7 +172,7 @@ def _extract_snapshot_records(quotes: List[Dict], fallback_ts: str) -> List[Dict
             rec["extras"] = extras
 
         records.append(rec)
-    return records
+    return records, skipped_empty
 
 
 # ================================================================
@@ -223,13 +251,30 @@ def _bulk_upsert(records: List[Dict]) -> int:
 # ================================================================
 
 def _is_auction_time(now: datetime) -> bool:
-    """9:26 集合竞价阶段, 采集一次"""
+    """集合竞价段: 9:15~9:25 整段 (2026-10-17 由"仅 9:26 一拍"扩到整段、右端收到 9:25)。
+
+    为什么要整段而不是单拍：
+      9:15-9:20 可撤单、9:20-9:25 不可撤单 —— 两段的竞价博弈状态完全不同，
+      单拍只拿到撮合后的结果，等于放弃了盘前竞价的过程数据。
+      撮合前的报价多为"无成交前收"（open=0/volume=0），由 `_extract_snapshot_records`
+      的空拍闸门挡在库外，不会污染下游。
+
+    为什么右端是 9:25 而不是 9:29：
+      9:25 集合竞价一次性撮合出开盘价，此后到 9:30 开盘前**不会有新成交**，
+      9:26~9:29 每分钟再拉一次拿到的都是同一份撮合结果，属纯开销+限流风险。
+      ⚠️ 代价：9:25 那一拍若源尚未刷新出撮合结果（拉到的仍是撮合前报价），
+         会全被空拍闸门拦下 → 当日就完全没有开盘价快照。
+         实测 10-15/10-16 的 9:26 拍才是稳定拿到撮合结果的一拍（09:25:00 那批
+         2830/1050 条都是 9:26 调度写的，落库 time 用的是源返回的行情时间）。
+         所以若首日上线后日志显示 9:25 拍 empty_pick 接近全量，就把右端
+         放回 926 做兜底 —— 这是"源何时刷新"的外部事实，代码无法预知。
+    """
     t = now.hour * 100 + now.minute
-    return t == 926
+    return 915 <= t <= 925
 
 
 def _is_trading_collect_time(now: datetime) -> bool:
-    """盘中可采集时段: 9:30~11:31, 13:00~15:01"""
+    """连续竞价可采集时段: 9:30~11:31, 13:00~15:01 (与竞价段 9:15~9:25 相接不重叠)"""
     t = now.hour * 100 + now.minute
     return (930 <= t <= 1131) or (1300 <= t <= 1501)
 
@@ -275,14 +320,15 @@ def collect_realtime_snapshot() -> Dict:
     流程: 交易时间检查 → 拉代码 → coordinator 批量拉取 → 原始数据 UPSERT 写入 → 清理过期数据
 
     交易时间:
-      9:29       → 采集一次(集合竞价快照)
+      9:15~9:25 → 集合竞价段采集(撮合前的无成交报价由空拍闸门丢弃, 只留有成交的拍;
+                9:25 撮合后到 9:30 无新成交, 故 9:26~9:29 不采)
       9:30~11:31 → 正常采集
       13:00~15:01 → 正常采集
       其他时段   → 跳过
 
     Returns:
         {"status": "ok"|"skip"|"error", "stocks": int, "written": int,
-         "failed": int, "elapsed": float}
+         "failed": int, "elapsed": float, "empty_pick": int}
     """
     t0 = time.time()
     now = datetime.now(TZ_CN)
@@ -321,9 +367,19 @@ def collect_realtime_snapshot() -> Dict:
         return {"status": "error", "stocks": len(codes), "written": 0,
                 "failed": len(codes), "elapsed": time.time() - t0}
 
-    # ── 3. 提取原始快照 ──
+    # ── 3. 提取原始快照（丢弃 last<=0 与空拍 open<=0 AND volume<=0）──
     ts_str = now.strftime("%Y-%m-%d %H:%M:00")
-    records = _extract_snapshot_records(quotes, ts_str)
+    records, empty_pick = _extract_snapshot_records(quotes, ts_str)
+    if not records:
+        # 竞价段常态：源此时只给"前收报价"（无开盘价无成交）→ 全部被空拍闸门拦下。
+        # 不视为错误（源本身在竞价段就没数据），记 info 便于次日核对源行为。
+        logger.info(
+            "[realtime_snapshot] %s 全部为空拍/无效报价 (拉取 %d 只, 空拍 %d), 跳过写入",
+            now.strftime("%H:%M"), len(quotes), empty_pick,
+        )
+        return {"status": "ok", "stocks": len(codes), "written": 0,
+                "failed": 0, "elapsed": time.time() - t0,
+                "empty_pick": empty_pick}
 
     # ── 4. 建表 + UPSERT ──
     _ensure_snapshot_table()
@@ -341,8 +397,8 @@ def collect_realtime_snapshot() -> Dict:
     missing_sample = missing[:20]
 
     logger.info(
-        "[realtime_snapshot] 完成: %d/%d 只 (%.1f%%), %d 条写入, %d 缺失, %.2fs",
-        fetched, total, success_rate, written, failed, elapsed,
+        "[realtime_snapshot] 完成: %d/%d 只 (%.1f%%), %d 条写入, %d 缺失, %d 空拍丢弃, %.2fs",
+        fetched, total, success_rate, written, failed, empty_pick, elapsed,
     )
     if failed > 0:
         logger.info(
@@ -359,4 +415,5 @@ def collect_realtime_snapshot() -> Dict:
         "written": written,
         "failed": failed,
         "elapsed": round(elapsed, 2),
+        "empty_pick": empty_pick,
     }

@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "record_pairs_path", "weights_path", "load_pairs", "load_pairs_from_db",
     "build_weights", "save_weights", "load_weights", "get_weights",
-    "rank_candidates", "heldout_recall", "main",
+    "rank_candidates", "heldout_recall", "eval_heldout", "main",
 ]
 
 WEIGHTS_VERSION = 1
@@ -389,11 +389,9 @@ def _core_names() -> set:
     except Exception as e:
         logger.debug("[preselect-cooc] core(common/meta) 取失败: %s: %s",
                      type(e).__name__, e)
-    try:
-        from mimoagent.tools.mimocode import MIMOCODE_CORE_TOOL_NAMES
-        core |= set(MIMOCODE_CORE_TOOL_NAMES)
-    except Exception:
-        pass
+    # F15b：经 upstream_compat —— 上游改名时显式告警（原 try/except pass 会静默丢核心工具）
+    from ..upstream_compat import core_tool_names
+    core |= set(core_tool_names())
     core.add("update_plan")      # qd_agent 跨目录注册的计划工具，同样每轮在场
     return core
 
@@ -420,6 +418,42 @@ def _weighted_face(query: str, weights: dict, k: int) -> List[str]:
             if c > 0 and t not in pool:
                 pool.append(t)
     return rank_candidates(pool, query, weights)[:k]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  五、held-out 双口径评估（口径单一真源，供周级脚本与批跑脚本共用）
+# ═══════════════════════════════════════════════════════════════════════════
+def eval_heldout(pairs: Sequence[dict], *,
+                 k: int = 8,
+                 weights: Optional[dict] = None) -> dict:
+    """在已切分好的 held-out 段上做双口径召回评估。
+
+    抽自 `main()` 的内联块（F23 2026-10-17），使周级脚本与批跑脚本
+    （`scripts/preselect_eval.py`）共用同一口径，避免两处各写一遍：
+
+    1. 先剔除**必选层/元工具**调用（预选只考核按需层，见 `_core_names`）；
+    2. 对启发式面（必需）与共现加权面（有 weights 时）各算一次 `heldout_recall`。
+
+    Returns:
+        {"n","skipped_core_only","heuristic":{...}|None,"weighted":{...}|None}
+    """
+    core = _core_names()
+    ev: List[dict] = []
+    skipped = 0
+    for p in pairs or ():
+        tools = [str(t) for t in (p.get("tools") or []) if str(t).strip()]
+        od = [t for t in tools if t not in core]
+        skipped += len(tools) - len(od)
+        if od:
+            ev.append({"query": str(p.get("query") or ""), "tools": od})
+    out: dict = {"n": len(ev), "skipped_core_only": skipped,
+                 "heuristic": None, "weighted": None}
+    if ev:
+        out["heuristic"] = heldout_recall(ev, lambda q: _domain_face(q, k))
+        if weights:
+            out["weighted"] = heldout_recall(
+                ev, lambda q: _weighted_face(q, weights, k))
+    return out
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -480,21 +514,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report["tokens_learned"] = len(weights.get("token_tool") or {})
         if test:
             # 召回只考核**按需层**调用（必选层/元工具每轮在场，不归预选管）
-            core = _core_names()
-            ev: List[dict] = []
-            skipped = 0
-            for p in test:
-                od = [t for t in p["tools"] if t not in core]
-                skipped += len(p["tools"]) - len(od)
-                if od:
-                    ev.append({"query": p["query"], "tools": od})
+            ev = eval_heldout(test, k=args.k, weights=weights)
             report["eval_note"] = (
                 "held-out 按需层口径（已剔除必选层/元工具调用 %d 次）；"
-                "代理面 ≠ LLM 真实预选面，达标性以跑批为准" % skipped)
-            report["heldout_heuristic"] = heldout_recall(
-                ev, lambda q: _domain_face(q, args.k))
-            report["heldout_weighted"] = heldout_recall(
-                ev, lambda q: _weighted_face(q, weights, args.k))
+                "代理面 ≠ LLM 真实预选面，达标性以跑批为准" % ev["skipped_core_only"])
+            report["heldout_heuristic"] = ev["heuristic"]
+            report["heldout_weighted"] = ev["weighted"]
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if weights else 1
 

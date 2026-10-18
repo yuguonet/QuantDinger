@@ -1092,8 +1092,8 @@ const DATE_PRESETS = [
   { key: '3y', label: '3Y', days: 1095 }
 ]
 
-/** 与指标分析 / AI 资产分析一致的市场列表（含 A 股、H 股、预测市场） */
-const IDE_ADD_MARKET_KEYS = ['Crypto', 'USStock', 'CNStock', 'HKStock', 'Forex', 'Futures', 'PredictionMarket']
+/** 与指标分析 / AI 资产分析一致的市场列表（含 A 股、H 股） */
+const IDE_ADD_MARKET_KEYS = ['Crypto', 'USStock', 'CNStock', 'HKStock', 'Forex', 'Futures']
 
 /**
  * 旧版自构造 localStorage key (仅保留用于一次性迁移: 读出旧数据提升到
@@ -3939,7 +3939,7 @@ export default {
       }
     },
     getMarketColor (m) {
-      const colors = { Crypto: 'orange', USStock: 'blue', CNStock: 'magenta', HKStock: 'red', Forex: 'green', Futures: 'purple', PredictionMarket: 'cyan' }
+      const colors = { Crypto: 'orange', USStock: 'blue', CNStock: 'magenta', HKStock: 'red', Forex: 'green', Futures: 'purple' }
       return colors[m] || 'default'
     },
     marketLabel (m) {

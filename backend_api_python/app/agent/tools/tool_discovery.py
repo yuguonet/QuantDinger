@@ -40,11 +40,28 @@ def _agent_of(_context: Any):
     return (_context or {}).get("agent") if isinstance(_context, dict) else None
 
 
-def _domains_overview(p: ToolProvider) -> str:
-    """按需域概览：只给"域名 + 数量"，不给全量名单（省 token 且引导检索）。"""
+def _domains_overview(p: ToolProvider, agent: Any = None) -> str:
+    """按需域概览：只给"域名 + 数量"，不给全量名单（省 token 且引导检索）。
+
+    【T1·2026-10-16】agent 在会话中时，改按**注册表全量口径**列层（provider 之外
+    还有 mimo 原生的 read/write/edit/glob/grep/task/bash/compact）。原先只列 provider
+    域 ⇒ 原生工具在 `list_tools(domain='all')` 里**根本不出现**，一旦被
+    on_demand_tools 移出必注入就是"静默消失"（实测确认）。无 agent 时保持原样。
+    """
     lines = []
+    covered = set()
+    if agent is not None and hasattr(agent, "_deferred_names"):
+        try:
+            core = set(getattr(agent, "_core_names", None) or ())
+            covered = set(agent.tool_registry.list_tools())
+            deferred = [n for n in sorted(agent._deferred_names()) if n not in core]
+            lines.append(f"  - 必注入层: {len(core)} 个（可直接调用）")
+            if deferred:
+                lines.append(f"  - 延迟层: {len(deferred)} 个（需 activate_tools 激活）")
+        except Exception:
+            covered = set()
     for dom in p.get_domains():
-        names = p.list_by_domain(dom)
+        names = [n for n in p.list_by_domain(dom) if n not in covered]
         if names:
             lines.append(f"  - {dom}: {len(names)} 个（用 search_tools 检索）")
     return "\n".join(lines) or "  （无）"
@@ -62,20 +79,33 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
         工具名(参数签名) + 一行简介的清单文本；末尾附按需域概览。
     """
     p = _provider()
+    agent = _agent_of(_context)
+    reg = getattr(agent, "tool_registry", None) if agent is not None else None
     if domain == "all":
-        names = p.get_tool_names()
+        names = list(p.get_tool_names())
+        # 【T1·2026-10-16】注册表里但不在 provider 的工具（mimo 原生）也属于"全部"
+        if reg is not None:
+            names = names + sorted(n for n in reg.list_tools() if n not in set(names))
     elif domain:
         names = p.list_by_domain(domain)
+        if domain in ("native", "other") and reg is not None:
+            names = sorted(set(names) | {
+                n for n in reg.list_tools()
+                if getattr(reg.get(n), "domain", "other") == domain})
     else:
         names = p.list_by_domain("common")
 
     if query:
-        import inspect
+        import inspect as _ins
         q = query.lower()
         kept = []
         for n in names:
-            desc = (inspect.getdoc(p.get(n)) or "") if p.get(n) else ""
-            if q in n.lower() or q in desc.lower():
+            fn = p.get(n)
+            if fn is not None:
+                desc = _ins.getdoc(fn) or ""
+            else:
+                desc = str(getattr(reg.get(n), "description", "") or "") if reg else ""
+            if q in n.lower() or q in str(desc).lower():
                 kept.append(n)
         names = kept
 
@@ -85,10 +115,25 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
     if domain != "all":
         names = names[: max(1, limit)]
     import inspect
+    core_names = set(getattr(agent, "_core_names", None) or ()) if agent else set()
     lines = [f"工具清单（{len(names)}/{total}，domain='{domain or 'common'}'）："]
     for n in names:
         fn = p.get(n)
         if fn is None:
+            # 【T1·2026-10-16】非 provider 工具（mimo 原生）：注册表取描述与参数名
+            obj = reg.get(n) if reg is not None else None
+            if obj is None:
+                continue
+            desc = str(getattr(obj, "description", "") or "").strip().split("\n")[0][:100]
+            sig_str = ""
+            try:
+                params = (obj.get_function_definition() or {}).get(
+                    "function", {}).get("parameters", {})
+                sig_str = ", ".join((params.get("properties") or {}).keys())
+            except Exception:
+                sig_str = ""
+            mark = "" if n in core_names else "[未激活] "
+            lines.append(f"  - {mark}{n}({sig_str}) — {desc}")
             continue
         desc = (inspect.getdoc(fn) or "").strip().split("\n")[0][:100]
         sig_str = ""
@@ -100,7 +145,7 @@ def list_tools(domain: str = "", query: str = "", limit: int = 40, _context: Any
             sig_str = ""
         lines.append(f"  - {n}({sig_str}) — {desc}")
     lines.append("按需域（默认未激活，需 search_tools/activate_tools）：")
-    lines.append(_domains_overview(p))
+    lines.append(_domains_overview(p, agent))
     if domain != "all":
         lines.append("提示：domain='all' 可看全部；按需层工具须 activate_tools 激活后才能调用。")
     return "\n".join(lines)
@@ -125,35 +170,68 @@ def search_tools(query: str, domain: str = "", count: int = 8, _context: Any = N
     count = max(1, min(int(count), 20))
     p = _provider()
     matched = p.search(query, domain=domain)
-    if not matched:
+    names = [n for n, _ in matched[:count]]
+
+    # 【T1·2026-10-16】provider 之外还有注册表工具（mimo 原生 read/write/edit/
+    #  glob/grep/task/bash/compact 以及 update_plan）；它们不在 provider.search
+    #  的检索范围内 ⇒ 一旦被移出必注入就是"搜也搜不到"。这里按同一关键词补检。
+    agent0 = _agent_of(_context)
+    reg0 = getattr(agent0, "tool_registry", None) if agent0 is not None else None
+    if reg0 is not None:
+        q = str(query).lower()
+        extra = []
+        for n in reg0.list_tools():
+            try:
+                d = str(getattr(reg0.get(n), "description", "") or "")
+            except Exception:
+                d = ""
+            if q in n.lower() or q in d.lower():
+                extra.append(n)
+        names = names + [n for n in sorted(extra) if n not in set(names)]
+
+    if not names:
         return (f"未找到匹配 '{query}' 的工具。"
                 f"可用域：{', '.join(p.get_domains()) or '无'}；"
                 f"也可 list_tools(domain='all') 全量查看。")
 
-    names = [n for n, _ in matched[:count]]
-    agent = _agent_of(_context)
+    agent = agent0
     activated: List[str] = []
     if agent is not None and hasattr(agent, "activate_tools"):
-        res = agent.activate_tools(names[:_AUTO_ACTIVATE_MAX])
+        res = agent.activate_tools(names[:_AUTO_ACTIVATE_MAX], source="auto")
         activated = list(res.get("activated", []))
 
     import inspect
-    lines = [f"命中 {len(matched)} 个，展示 {len(names)} 个，已激活 {len(activated)} 个："]
-    for n, desc in matched[:count]:
+    lines = [f"命中 {len(names)} 个，展示 {len(names)} 个，已激活 {len(activated)} 个："]
+    for n in names:
+        # 【T1·2026-10-16】provider 没有的工具走注册表取描述（mimo 原生的
+        #  read/write/edit/glob/grep/task/bash/compact 等）。原先只遍历 provider
+        #  命中 ⇒ 注册表命中即便找得到也不显示，等于白补。
         fn = p.get(n)
         sig_str = ""
         if fn is not None:
+            desc = str(inspect.getdoc(fn) or "").strip().split("\n")[0][:120]
             try:
                 sig = inspect.signature(fn)
                 sig_str = ", ".join(
                     pname for pname in sig.parameters if not pname.startswith("_"))
             except Exception:
                 sig_str = ""
+        else:
+            obj = reg0.get(n) if reg0 is not None else None
+            if obj is None:
+                continue
+            desc = str(getattr(obj, "description", "") or "").strip().split("\n")[0][:120]
+            try:
+                params = (obj.get_function_definition() or {}).get(
+                    "function", {}).get("parameters", {})
+                sig_str = ", ".join((params.get("properties") or {}).keys())
+            except Exception:
+                sig_str = ""
         mark = "[已激活]" if n in activated else "[未激活]"
         lines.append(f"  {mark} {n}({sig_str}) — {desc}")
-    if activated:
-        lines.append("已激活的工具可直接调用（schema 已在下一轮工具清单里）。")
-    else:
+    # 仅当本轮一个都没激活时才提示（原先误写成 for-else：循环内无 break ⇒ 恒执行，
+    # 与上方 [已激活] 标记自相矛盾）。
+    if not activated:
         lines.append("未自动激活：请用 activate_tools 点名激活后再调用。")
     return "\n".join(lines)
 
@@ -179,10 +257,18 @@ def activate_tools(names: str, _context: Any = None) -> str:
     activated = res.get("activated", [])
     already = res.get("already", [])
     unknown = res.get("unknown", [])
-    lines = [f"激活结果：新激活 {len(activated)}，已激活 {len(already)}，未找到 {len(unknown)}。"]
+    off = res.get("disabled", [])
+    lines = [f"激活结果：新激活 {len(activated)}，已激活 {len(already)}，未找到 {len(unknown)}"
+             + (f"，已停用 {len(off)}" if off else "") + "。"]
     if activated:
         lines.append("新激活: " + ", ".join(activated))
     if unknown:
         lines.append("未找到: " + ", ".join(unknown) + "（用 search_tools 查准确名字）")
+    if off:
+        # ★ T7（2026-10-17）：disabled 不是"未找到"——静默归零会让模型反复重试。
+        #   明示停用状态；直调仍可回退执行（execute_action fail-open），但不会
+        #   进工具面，别把任务押在它上面。
+        lines.append("已停用: " + ", ".join(off)
+                     + "（当前被 tool_connect 禁用——不会进工具清单；如确需调用请直呼其名走回退通道）")
     lines.append(f"当前已激活按需工具 {res.get('active_total', 0)}/{res.get('cap', 0)} 个。")
     return "\n".join(lines)

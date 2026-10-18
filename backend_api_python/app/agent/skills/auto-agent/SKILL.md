@@ -2,9 +2,9 @@
 name: auto-agent
 description: 股票多维度资本面尽调流水线——一次性拉取 K线走势、筹码分布、融资融券/大宗交易摘要、主力/超大单资金流向，用于个股或批量股票的复盘、调研、资金面画像。当用户表述类似"分析/复盘/调研/梳理/拆解XX股票"、"XX资金面怎么样"、"看一下XX筹码结构"、"XX主力流向"时优先匹配本技能。
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   tags: stock-analysis, kline, chip-distribution, fund-flow, capital-summary, multi-dimensional-analysis
-  tools: activate_tools, agent_get_kline, get_chip_distribution, get_capital_summary, get_fund_flow
+  tools: agent_get_kline, get_chip_distribution, get_capital_summary, get_fund_flow, get_realtime_quote, technical_analysis, bull_bear_research, search_intel, batch_valuation_compare
 ---
 <!-- auto-brewed 2026-10-09 from root_id=398 chain=agent | human-edited 后请去除 auto- 前缀接管 -->
 # 股票多维度资本面尽调（auto-agent）
@@ -27,16 +27,16 @@ metadata:
 
 ## 执行流程
 
-按以下顺序串行调用，输出按目标代码分组统一汇总（最新一期排前）。
+各步骤之间**无数据依赖**（互不引用对方返回），除"需用上一步结果定参"外，**优先一批并行发出**，不要逐条串行——串行会把 1 次 LLM 往返拆成 N 次，纯浪费轮次。输出按目标代码分组统一汇总（最新一期排前）。
 
-### 步骤 1：按需激活工具
+### 步骤 0：确认工具已在工具面（条件激活，不要无脑激活）
 
-- 工具：`activate_tools`
-- 参数：`names: str`（**字符串**，逗号分隔）
-- 调用示例：`activate_tools(names="agent_get_kline,get_chip_distribution,get_capital_summary,get_fund_flow")`
-- 加工要点：检查返回中 `新激活 N / 未找到 N / 当前已激活按需工具 N/12`。若任一名未找到，立即停止后续步骤并要求用户确认名称。
+先看本轮系统提示的「工具地图」：
+- 若「已激活」段**已列出**本技能要用的工具（预选器通常已激活）⇒ **跳过激活**，直接并行调用。系统提示词明文「已激活·本轮可以直接调用，**不要再** search_tools/activate_tools」——此时再调 activate_tools 是纯空转，白烧一轮 LLM。
+- 若未列出 ⇒ 才调 `activate_tools(names="...")`（**字符串**，逗号分隔），并检查返回中 `新激活 N / 未找到 N / 当前已激活按需工具 N/12`；若任一名未找到，立即停止后续步骤并要求用户确认名称。
+- 已知名字时也可以直接调用未激活的工具（系统会自动激活放行），不必先走激活三步。
 
-### 步骤 2：拉取 K 线 OHLCV
+### 步骤 1：拉取 K 线 OHLCV
 
 - 工具：`agent_get_kline`
 - 参数：
@@ -48,8 +48,9 @@ metadata:
 - 加工要点：
   - 提取每只目标代码每日 OHLCV 序列，注意 `t` 字段为短格式 `'MM-DD'`。
   - 批量调用时 `data` 为 `code → 序列` 的字典，需按 code 索引再聚合。
+  - **前高/压力位/支撑位必须在整个返回窗口内扫描极值**，不得只引用其中一段（审计实例：60 日窗口内真正前高是 08-03 的 1363.35，报告却只取 07-21/07-29 两个更低的"7 月前高"，把压力带错定在 1346，突破/证伪位全部偏低约 17 元）。给出任何"前高/突破位"结论前，先对全窗口 `h` 列取 max 及其日期。
 
-### 步骤 3：拉取筹码分布
+### 步骤 2：拉取筹码分布
 
 - 工具：`get_chip_distribution`
 - 参数：
@@ -66,16 +67,18 @@ metadata:
   - `concentration_*_width_pct` 是上下界差的相对比，**不是盈亏百分比**；解读时要结合 `upper / lower` 的绝对价位与当前股价对比下结论。
   - 把当前价相对均价的偏离方向（上方套牢 vs 下方获利）给出定性结论。
 
-### 步骤 4：拉取资金面摘要（融资融券 + 大宗交易）
+### 步骤 3：拉取资金面摘要（融资融券 + 大宗交易）
 
 - 工具：`get_capital_summary`
 - 参数：`codes: str`（**字符串**，支持批量）
 - 关键字段（来自返回 `summary`）：
-  - `margin`：`rz_balance` 融资余额、`rz_5d_change_pct` 5日变化、`rq_balance` 融券余额、`signal` 信号文本（如"融资净流入"）
+  - `margin`：`rz_balance_wan` 融资余额（**万元**）、`rz_5d_change_pct` 5日变化、`rq_balance_wan` 融券余额（**万元**）、`signal` 信号文本（如"融资净流入"）
   - `block_trade`：`recent_count` 近期大宗交易次数、`avg_premium_pct` 平均溢价率、`inst_buy` 机构买入次数
-- 加工要点：结合步骤 3 的成本区间，判断融资余额边际变化方向（流入 = 杠杆资金加仓，流出 = 减仓）。`signal` 字段为字符串，给出方向但需结合数值复核。
+  - `financials`：`revenue_wan` 营收、`net_profit_wan` 净利润、`total_assets_wan`/`total_liabilities_wan`/`equity_wan`/`cash_wan` 资产/负债/权益/货币资金（均为**万元**口径，`_wan` 后缀即单位），附 `financial_unit:"万元"` 与 `report_date` 报告期
+  - `holders`：`holder_count` 股东户数、`change_pct` 环比、`avg_hold_market_cap_rmb` 户均持股市值（**元**）、`avg_hold_num_shares` 户均持股（**股**）
+- 加工要点：结合步骤 2 的成本区间，判断融资余额边际变化方向（流入 = 杠杆资金加仓，流出 = 减仓）。`signal` 字段为字符串，给出方向但需结合数值复核。`financials` 换算为亿元时按 /10000，并带上 `report_date` 报告期说明。
 
-### 步骤 5：拉取资金流向（主力 / 大单 / 超大单）
+### 步骤 4：拉取资金流向（主力 / 大单 / 超大单）
 
 - 工具：`get_fund_flow`
 - 参数：
@@ -92,7 +95,7 @@ metadata:
   - `small_net / mid_net / large_net / super_net` 可能为 `null`（表示当日该分项未采集到），按"数据缺失"处理，**不能当作 0**——否则会误判净流入方向。
   - 取 `total_main_net` 与 `data[]` 单日 `main_net` 累加交叉验证，避免总量与明细不一致。
 
-### 步骤 6：汇总呈现
+### 步骤 5：汇总呈现
 
 将上述 4 类数据按目标代码分组，输出一份结构化报告：
 
@@ -107,9 +110,12 @@ metadata:
 2. **null ≠ 0**：`get_fund_flow` 在某些时段未采集大单/超大单等分项时会返回 `null`，必须按"数据缺失"处理，不可视为 0；同样地，`get_capital_summary` 的 `inst_buy` 等字段也可能是 `null`，需明确说明。
 3. **筹码集中度宽度易误读**：`concentration_*_width_pct` 是上下界差相对值，不是盈亏百分比；务必读 `concentration_*_lower` 与 `concentration_*_upper` 的**绝对价位**再与当前股价对比。
 4. **K线短日期格式**：`agent_get_kline` 在 `1D` 频次下 `t` 字段为 `'MM-DD'`（不带年份），跨年度回测需自行补年份上下文，否则无法对齐到具体交易日。
-5. **按需工具有上限**：系统按需工具槽位为 12 个，超额激活会失败。执行前先看 `activate_tools` 返回中的 `当前已激活按需工具 N/12`；如已接近上限，先 `activate_tools` 替换再继续，避免重复激活造成浪费。
+5. **按需工具有上限**：系统按需工具槽位为 12 个，超额激活会失败。若确需激活，先看 `activate_tools` 返回中的 `当前已激活按需工具 N/12`；如已接近上限，先替换再继续。工具地图已列出目标工具时不要重复激活（见步骤 0）。
 6. **批量 vs 单只语义一致性**：`agent_get_kline` / `get_chip_distribution` / `get_capital_summary` / `get_fund_flow` 均支持批量，但返回结构均为 `data → {code: ...}` 字典映射，**单只调用也是同样的字典结构**，下游逻辑不能假设是数组。
 7. **数据时效性**：`get_capital_summary` 的融资融券、块交易为日频截面；`get_fund_flow` 在 `indicator='今日'` 下为分时级、`days>1` 时为日频级——下游呈现时要按数据点的 `time` 颗粒度分别说明，不能把分时数据按日频误读。
 8. **复权口径**：默认 `adj='qfq'` 前复权。切换至不复权或后复权会改变历史价位与后续计算的输入，需在最终报告中显式注明复权方式。
 9. **回测/短线/情绪类工具的边界**：本技能不覆盖涨停池、龙虎榜、情绪指数、个股 K 线形态、技术评分等维度；用户提出这些子问题时，应主动切换到对应工具，而不是强行在本流水线内做扩展。
 10. **激活失败熔断**：若 `activate_tools` 任一名字未找到，立即停止后续步骤并要求确认；不要试图在未激活工具上继续调用，会失败并浪费一轮调用预算。
+11. **估值口径补位**（2026-10-17）：`get_realtime_quote` 只给价格量价，**不含 PE/PB/市值/换手率**。当任务或计划含估值维度（PE、市盈率、市值、基本面快照）时，调 `batch_valuation_compare(codes="600519")`——它返回 `pe_ttm/pb/mcap_yi/float_mcap_yi`，单只股票也可以传（不必凑对比组）。预选器补充激活它时往往不带原因说明，看到它已在「已激活」列表且计划含估值，就应调用，不要留「未获取 PE/PB」的缺口。
+12. **技术评分是两套模型，禁止互相对冲**（2026-10-17）：`technical_analysis` 的 `score` 是六维加权（`score_model=tech6_weighted(...)`），`bull_bear_research` 的 `score` 是五维加权（`score_model=bb5_weighted(...)`），同股给出不同分是设计使然。引用时必须带 `score_model` 身份、分别解释，**不得**把两个分取平均、互相对冲或当作同一指标核对。
+13. **单位口径以键名为准，禁止跨字段泛化**（2026-10-17）：金额类键名自带单位后缀——`_wan`=万元（`rz_balance_wan`/`revenue_wan`…）、`_rmb`=元、`_yi`=亿元（`mcap_yi`）、`元/10股`=派息。2026-10-17 复跑曾出现把 `get_capital_summary` 的「万元」口径泛化到非 money 字段的幻觉：现价 1329 元被写成「13.29 万元」（÷100）、累计派息 2806.172 元/10股被写成「28.06 元/10股」。价格、派息、比率（`_pct`）字段**按原值引用，不做任何倍数换算**；只有 `_wan` 金额键可按 /10000 换亿元。

@@ -84,6 +84,68 @@ def _expand_stock_query(user_input: str, entities: list[dict]) -> str:
     return f"{expanded}，{default_params}"
 
 
+# ── 代码类请求闸门（2026-10-16 新增）────────────────────────────────
+# 实测事故：`用 read 工具读一下 app/agent/qd_config.py 的前 20 行…`
+#   → 本解析器把片段 "20" 当标的名，`_candidates("20")` 命中 5 只 ⇒ 判"歧义"
+#   → 直接反问用户（qd_service 的 clarify 分支 **不进 agent**、不跑预选、0 次工具调用）。
+# 与本文档头部"只在有把握时才扩写"同一立场：**解析器不该对明显不是股票问题的输入表态**。
+#
+# ⚠ 刻意**不复用** preselect 的 `_CODE_HINT_RE`：那个太宽（含"脚本/代码/写个/改一下"），
+#   会把「分析 600519 的代码实现」这类真股票请求误挡。这里只挡"**动文件**"的强信号。
+_CODE_PATH_RE = re.compile(
+    r"\b[\w\-./\\]+\.(?:py|js|ts|tsx|jsx|vue|md|json|ya?ml|toml|ini|cfg|sql|sh|ps1|bat)\b"
+    r"|(?:backend_api_python|QuantDinger-Vue|app/agent|app[\\/]routes)"
+    r"|tests?[\\/][\w\-]+\.py",
+    re.I,
+)
+# 代码动作词 × 文件/脚本类词：两者**同时**出现才算（避免"帮我写首诗"这类误伤）
+_CODE_ACTION_RE = re.compile(
+    r"(?:读|看|改|写|重构|重写|调试|跑|执行|迁移|移动|删除|新建|创建|加|实现|优化|修复|"
+    r"排查|定位|审计|梳理|整理|落地|接入|接线|收口|补)"
+    r"|\b(?:read|edit|write|refactor|rewrite|debug|run|move|rename|fix|install|build|"
+    r"compile|lint|migrate|wire)\b",
+    re.I,
+)
+_CODE_OBJECT_RE = re.compile(
+    r"(?:文件|目录|脚本|模块|函数|代码|源码|工程|仓库|埋点|依赖|报错|堆栈|逻辑|入参|"
+    r"调用链|测试|用例|配置)"
+    r"|\b(?:file|dir|docs?|module|function|code|script|repo|patch|diff|logic|test)\b",
+    re.I,
+)
+# 裸代码信号：无需与动作词/对象词搭配，命中即视为代码类请求。
+# （实测补："npm install 之后 build 失败" 只有工具链名与失败语义，组合判据不成立。）
+_RAW_CODE_RE = re.compile(
+    r"(?:编译|构建|打包|类型检查|lint|单测|单元测试)\s*(?:失败|报错|不通过|挂了|过了)"
+    r"|(?:报错|报了个错|异常|崩溃|堆栈|traceback|stack ?trace)"
+    r"|\b(?:npm|pnpm|yarn|npx|pytest|pip|conda|docker|git|ruff|mypy|flake8|black|isort)\b"
+    r"|\b(?:syntaxerror|importerror|modulenotfounderror|typeerror|valueerror|keyerror|"
+    r"attributeerror|nameerror|indexerror|runtimeerror|zerodivisionerror)\b"
+    r"|\btests?/[\w\-]+\.py\b",
+    re.I,
+)
+
+# 显式 6 位标的代码（用户给了标的 ⇒ 豁免闸门，正常解析）
+_STOCK_CODE_EXPLICIT_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
+
+
+def _looks_like_code_request(text: str) -> bool:
+    """是否"动文件"的代码类请求（⇒ 实体解析应让路）。
+
+    豁免：文本里出现**显式 6 位标的代码**时不挡 —— 那说明用户确实在谈某只股票
+    （如「分析 600519 的代码实现」），解析器该正常工作。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return False
+    if _STOCK_CODE_EXPLICIT_RE.search(s):
+        return False
+    if _CODE_PATH_RE.search(s):
+        return True
+    if _RAW_CODE_RE.search(s):
+        return True
+    return bool(_CODE_ACTION_RE.search(s) and _CODE_OBJECT_RE.search(s))
+
+
 class StockResolver(EntityResolver):
     """股票实体解析器。
 
@@ -147,6 +209,13 @@ class StockResolver(EntityResolver):
         for code in codes:
             clean_input = clean_input.replace(code, '')
         clean_input = clean_input.strip()
+
+        # 【2026-10-16】代码类请求让路：本解析器不该对"动文件"的请求表态
+        # （否则片段里的数字会被当成标的候选 ⇒ 歧义反问 ⇒ 整轮不进执行）。
+        if _looks_like_code_request(user_input):
+            logger.info("[StockResolver] 代码类请求，跳过实体解析: %s",
+                        str(user_input)[:60])
+            return None
 
         ambiguous = []      # [(关键词, [候选, ...]), ...] 无法唯一确定 → 反问
         if clean_input:

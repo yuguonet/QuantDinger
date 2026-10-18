@@ -12,7 +12,14 @@
 
 输出（stdout，单行 JSON）：
     {"name":..., "ok":bool, "result":<截断>,
-     "full_path":"<backend_api_python>/tmp/skill_output/xxx.json", "elapsed_s":...}
+     "full_path":"<全量结果路径>", "elapsed_s":...}
+
+产物落点（F26-D2，2026-10-18）：
+  · 工具路径（run_skill 派活）：父进程建好作业目录经 env `QD_SKILL_JOB_DIR` 传入，
+    全量结果写 `<job_dir>/result.json`，并在**调用前后** touch `last_progress`
+    （停滞看门狗的观测源，见 app/agent/exec/job_runner.py）；
+  · 人工直跑（无该 env）：回落旧扁平输出 `<backend>/tmp/skill_output/<ts>_<name>.json`
+    —— 这是文档化的直跑用法，不是兜底。
 """
 from __future__ import annotations
 
@@ -44,6 +51,15 @@ _OUT_DIR = Path(__file__).resolve().parents[3] / "tmp" / "skill_output"
 _PREVIEW_LIMIT = 20000   # 回传主 agent 的预览上限（字符）；全量落盘不受限
 
 
+def _touch(job_dir: str) -> None:
+    """进度戳（F26-D2）。延迟 import：本进程刚启动时 `app.*` 还不可导，
+    须等 main() 里先把 backend 根挂上 sys.path。job_dir 为空 = 人工直跑，不戳。"""
+    if not job_dir:
+        return
+    from app.agent.exec.job_runner import touch_progress
+    touch_progress(job_dir)
+
+
 def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] not in EXECUTABLE_SKILLS:
         print(json.dumps({"ok": False, "error":
@@ -70,12 +86,14 @@ def main() -> int:
         return 2
 
     t0 = time.time()
+    job_dir = os.environ.get("QD_SKILL_JOB_DIR", "") or ""
     try:
         # 只挂 backend_api_python（保证 `import app.*` 成立）。
         # 【2026-10-13·P5】原本还挂 app/agent 让 `skills.*` 裸名成立 ——
         # 改造后包内相对导入，EXECUTABLE_SKILLS 里的裸名由 modpath.resolve 补前缀，
         # 不再需要把包目录塞进 sys.path（那正是 M-1 双实例的成因）。
         sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        _touch(job_dir)   # F26-D2：作业启动即留进度戳（看门狗"已开工"证据）
         import importlib
         from app.agent.modpath import import_module
         fn = getattr(import_module(mod_path), fn_name)
@@ -102,13 +120,25 @@ def main() -> int:
         return 1
 
     # 产物落盘 + 预览回传（差距 B 第 3 条：主上下文只拿结论，不搬明细）
-    _OUT_DIR.mkdir(parents=True, exist_ok=True)
-    full_path = _OUT_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{name}.json"
-    try:
-        full_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str),
-                             encoding="utf-8")
-    except Exception:
-        full_path = None
+    if job_dir:
+        # F26-D2：作业目录模式 —— 全量落 <job>/result.json，与 bridge 的 report.json 同范式
+        full_path = Path(job_dir) / "result.json"
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                                 encoding="utf-8")
+            _touch(job_dir)   # 产物落定 = 最后一次有效进展
+        except Exception:
+            full_path = None
+    else:
+        # 人工直跑：旧扁平输出（文档化用法，见模块头）
+        _OUT_DIR.mkdir(parents=True, exist_ok=True)
+        full_path = _OUT_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{name}.json"
+        try:
+            full_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                                 encoding="utf-8")
+        except Exception:
+            full_path = None
 
     preview = json.dumps(result, ensure_ascii=False, default=str)
     if len(preview) > _PREVIEW_LIMIT:

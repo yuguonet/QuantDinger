@@ -114,7 +114,7 @@ def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dic
 
 
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
-    """实时行情：价格、涨跌幅、成交量、换手率、量比、PE、PB、总市值等。
+    """实时行情：最新价、涨跌幅、成交量、开高低收、名称、行情时间 + 涨跌停价。
 
     Args:
         codes: 多股用逗号分隔
@@ -122,8 +122,17 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     Returns:
         统一结构（单/多代码一致，2026-09-24 起）：{"count": N, "data": {代码: 行情dict},
         "error": None}；行情dict 字段：{stock_code, last, changePercent, volume, name,
-        high, low, open, previousClose, time} + 涨跌停价 {limit_up, limit_down}
-        （来自腾讯源增补，供涨跌停判定）；失败 → {"error": "...", "retriable": False}
+        high, low, open, previousClose, time, limit_up, limit_down}
+        （limit_* 来自腾讯源增补，供涨跌停判定）；volume 单位见 volume_unit（恒 "股"，
+        六个 provider 出口已各自归一化为股——腾讯/搜狐/tdx 原始为手已×100，
+        新浪/同花顺/百度原生为股；2026-10-17 审计：无单位标注致模型把成交量
+        误写成"万手"，补此键后下游不得再猜单位）；失败 → {"error": "...", "retriable": False}
+
+    ⚠ **不含**换手率/量比/PE/PB/总市值（2026-10-17 修正：旧版首行承诺这五项，
+    实测返回里根本没有——描述是唯一进 LLM 的契约，写了就等于教模型去承诺
+    拿不到的数据，run8 实测被列为"目录过承诺"）。要这些口径请用：
+      · 换手率/PE/PB/总市值 → `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）
+      · 量比/量能 → `get_volume_analysis`
     """
     # 归一化：剥离市场后缀（.SZ/.SH）与市场前缀（sh/sz），与 get_tickers 的
     # symbol 键对齐（get_tickers 返回的 symbol 是纯代码，如 "300497"）。
@@ -153,7 +162,9 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     for code in code_list:
         t = ticker_map.get(code)
         if t:
-            results[code] = {"stock_code": code, "market": "CNStock", **t}
+            # volume_unit 放 **t 之后：provider 若自带单位键不得覆盖工具层口径
+            results[code] = {"stock_code": code, "market": "CNStock", **t,
+                             "volume_unit": "股"}
         else:
             results[code] = {"error": "未获取到行情", "stock_code": code}
 
@@ -597,7 +608,11 @@ def _tencent_quote_raw(codes: list) -> dict:
 # ── 五档盘口 ──────────────────────────────────────────────────
 
 def get_order_book(codes: str) -> dict:
-    """五档盘口：返回买卖各5档价格和挂单量、涨跌幅、换手率、PE、市值等。
+    """五档盘口：买卖各 5 档价格与挂单量，含最新价、涨跌幅。
+
+    ⚠ **不含**换手率/PE/市值（2026-10-17 修正，同 `get_realtime_quote` 同型：
+    旧版首行承诺了三项，返回里根本没有——描述是唯一进 LLM 的契约）。要这些
+    口径用 `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）。
 
     Returns:
         统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
@@ -727,6 +742,26 @@ def _safe_float(v, default=0.0):
     from app.data_sources.normalizer import safe_float
     return safe_float(v, default)
 
+def _num(v):
+    """工具返回值数值化：千分位字符串→float；None/NaN/空→None。
+
+    ⚠️ 与 `_safe_float` 的区别：缺失值**不回落 0**（null≠0，技能注意事项
+    第 2 条——把缺失当 0 会虚构"零余额/零营收"）；`safe_float` 不剥千分位
+    逗号（'9,227,807.21'→0.0），这里先剥再转。
+    """
+    import math
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.replace(",", "").strip()
+        if not v or v.lower() in ("nan", "none", "-"):
+            return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
+
 def _market_prefix(code: str) -> str:
     if code.startswith(("6", "9")):
         return "sh"
@@ -735,7 +770,19 @@ def _market_prefix(code: str) -> str:
     return "sz"
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
-    """融资融券摘要。提取融资余额趋势+近期变化幅度。"""
+    """融资融券摘要。提取融资余额趋势+近期变化幅度。
+
+    ⚠️ 单位口径（2026-10-17 修复，审计 O1）：上游 `RZYE`/`RQYE` 为**元**
+    （实测 2026-10-16：600519 RZYE=16,450,780,103 元），本函数 /1e4 输出
+    **万元**。旧版键名 `rz_balance`/`rq_balance` 不带单位，模型只能猜——
+    600519 复跑中模型把「万元」过度泛化到价格/派息等非 money 字段，写出
+    「现价 13.29 万元」（真值 1329 元被 ÷100）的幻觉。现按仓内约定
+    （`main_net_wan`/`amount_wan` 同款）把单位写进键名，见名知口径。
+    ★ 双单位并列（2026-10-17 二次修复，run8 §3.1）：只给万元键仍会错——模型
+      把 1,645,078 万元**换算对了**（164.51 亿）却**贴错单位名**（写成
+      「164.51 万万元」）。根因是它必须自己做 ÷1e4 再自己起单位名 ⇒ 直接给
+      亿元键让它照抄（`main_net_yi`/`mcap_yi` 已是同款先例）。
+    """
     from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPTA_WEB_RZRQ_GGMX",
@@ -755,9 +802,13 @@ def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
 
     signal = "融资净流入" if rz_change_pct > 2 else "融资净流出" if rz_change_pct < -2 else "持平"
     return {
-        "rz_balance": round(rz_latest / 1e4, 1),  # 万元
+        # 键名即口径：融资/融券余额，双单位并列（见上方口径说明）。
+        # 万元 = 工具层传统口径；亿元 = 模型直接照抄用的口径（run8 幻觉根因）。
+        "rz_balance_wan": round(rz_latest / 1e4, 1),
+        "rz_balance_yi": round(rz_latest / 1e8, 2),
         "rz_5d_change_pct": round(rz_change_pct, 1),
-        "rq_balance": round(rq_latest / 1e4, 1),
+        "rq_balance_wan": round(rq_latest / 1e4, 1),
+        "rq_balance_yi": round(rq_latest / 1e8, 2),
         "signal": signal,
     }
 
@@ -799,7 +850,19 @@ def _get_block_trades(code: str, page_size: int = 20) -> Dict[str, Any]:
     }
 
 def _get_holder_count(code: str) -> Dict[str, Any]:
-    """股东户数摘要。提取最新户数、环比变化趋势。"""
+    """股东户数摘要。提取最新户数、环比变化趋势。
+
+    ⚠️ 字段口径（2026-10-17 修复）：上游 `RPT_HOLDERNUMLATEST` **没有**
+    `AVG_AMOUNT` 这一列——实测 2026-10-17 该报表实际列为 `AVG_MARKET_CAP`
+    （户均持股市值，**元**）与 `AVG_HOLD_NUM`（户均持股数量，**股**）。
+    旧版按 `AVG_AMOUNT` 取数恒得 0.0（死字段，"户均持股"语义留空）。
+    现按真实列名取数，键名自带单位后缀；字段缺失给 None 而非 0
+    （null≠0，技能注意事项第 2 条）。
+    另修一个死值：该报表按股票**只返回最新一期**（单股查询 len==1），
+    上期户数在同行的 `PRE_HOLDER_NUM` 里（实测 600519：296404 vs
+    243159）。旧版只认 `data[1]` ⇒ 单股查询恒取到自己，`change_pct`
+    恒 0、`signal` 恒"持平"——把"筹码分散 +21.9%"读成"无变化"。
+    """
     from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPT_HOLDERNUMLATEST",
@@ -812,21 +875,35 @@ def _get_holder_count(code: str) -> Dict[str, Any]:
 
     latest = data[0]
     latest_count = _safe_float(latest.get("HOLDER_NUM"))
-    prev_count = _safe_float(data[1].get("HOLDER_NUM")) if len(data) > 1 else latest_count
+    prev_count = _safe_float(latest.get("PRE_HOLDER_NUM"))
+    if not prev_count and len(data) > 1:
+        prev_count = _safe_float(data[1].get("HOLDER_NUM"))
     change_pct = ((latest_count / prev_count - 1) * 100) if prev_count else 0
-    avg_amount = _safe_float(latest.get("AVG_AMOUNT"))  # 户均持股
+    avg_mcap = latest.get("AVG_MARKET_CAP")    # 户均持股市值（元）
+    avg_hold_num = latest.get("AVG_HOLD_NUM")  # 户均持股数量（股）
 
     signal = "筹码集中" if change_pct < -5 else "筹码分散" if change_pct > 5 else "持平"
     return {
         "latest_date": str(latest.get("END_DATE", ""))[:10],
         "holder_count": int(latest_count),
         "change_pct": round(change_pct, 1),
-        "avg_amount": round(avg_amount, 0),
+        # 键名即口径：户均持股市值（元）/ 户均持股数量（股），见上方口径说明
+        "avg_hold_market_cap_rmb": round(_safe_float(avg_mcap), 0) if avg_mcap else None,
+        "avg_hold_num_shares": round(_safe_float(avg_hold_num), 1) if avg_hold_num else None,
         "signal": signal,
     }
 
 def _get_dividend_history(code: str) -> Dict[str, Any]:
-    """分红送转摘要。提取累计分红次数、连续分红年数、近期派息水平。"""
+    """分红送转摘要。提取累计分红次数、连续分红年数、近期派息水平。
+
+    ⚠️ 单位口径（2026-10-17 修复，审计 O1）：上游 `PRETAX_BONUS_RMB` 是
+    **每 10 股派息（元）**——实测 600519 该字段 280.2423 对应方案文案
+    "10派280.2423元(含税)"，不是派息总额。旧版把它累加进名为
+    `total_bonus_rmb` 的键，名字像"总额(rmb)"且无单位标注，诱发下游模型
+    ÷10 折算成"280.62 亿元"的幻觉（真值：累计每 10 股派息 2806.17 元）。
+    现改名自描述 + 显式单位键；要真实派息总额需另乘总股本/10（本函数不
+    取股本数据，不硬造第二口径——缺口显式 > 硬凑数字）。
+    """
     from ._em_utils import em_datacenter
     data = em_datacenter(
         "RPT_SHAREBONUS_DET",
@@ -838,22 +915,35 @@ def _get_dividend_history(code: str) -> Dict[str, Any]:
         return {"signal": "无分红记录"}
 
     years = set()
-    total_bonus = 0.0
+    cum_bonus_per_10shares = 0.0
     for row in data:
         date_str = str(row.get("EX_DIVIDEND_DATE", ""))[:4]
         if date_str:
             years.add(date_str)
-        total_bonus += _safe_float(row.get("PRETAX_BONUS_RMB"))
+        cum_bonus_per_10shares += _safe_float(row.get("PRETAX_BONUS_RMB"))
 
     return {
         "record_count": len(data),
         "dividend_years": len(years),
-        "total_bonus_rmb": round(total_bonus, 3),
+        # 键名即口径：累计「每 10 股」派息，单位元/10股（见上方口径说明）
+        "cum_bonus_per_10shares_rmb": round(cum_bonus_per_10shares, 3),
+        "bonus_unit": "元/10股",
         "signal": "持续分红" if len(years) >= 3 else "偶有分红" if years else "无分红",
     }
 
 def _get_financial_statements(code: str) -> Dict[str, Any]:
-    """财报关键指标摘要。只提取 Agent 关心的几个数，不返回原始表格。"""
+    """财报关键指标摘要。只提取 Agent 关心的几个数，不返回原始表格。
+
+    ⚠️ 单位口径（2026-10-17 修复，审计 O1）：新浪 `vFD_BalanceSheet` /
+    `vFD_ProfitStatement` 页面表头明写「单位：万元」（实测 2026-10-17，
+    money.finance.sina.com.cn `/displaytype/4.phtml`：600519 营业总收入
+    9,227,807.21 = 922.78 亿、资产总计 30,905,078.46 = 3090.51 亿）。
+    旧版键名（`revenue`/`total_assets`…）裸名无单位，模型只能猜口径，
+    600519 复跑中模型把「万元」泛化到价格/派息等非 money 字段（「现价
+    13.29 万元」= 1329 元被 ÷100）。现按仓内约定加 `_wan` 后缀
+    （与 `main_net_wan`/`mcap_yi` 同款），并显式给出 `financial_unit`
+    与 `report_date`——金额不带报告期同样是裸数字。
+    """
     import requests
     _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     prefix = _market_prefix(code)
@@ -864,6 +954,7 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
     # 2026-09-15：旧视图 vFD_FinancialGuideLine 已被新浪下线（返回 {"__ERROR":0,"__ERRORMSG":"Invalid view go"}），
     # 改用 money.finance.sina.com.cn 新版三表视图（vFD_BalanceSheet / vFD_ProfitStatement）。
     # 新表结构：最大表为数据表，列0=项目名，列1+=报告期（第0行为日期行）。
+    # 单位：万元（页面表头明示，见函数 docstring 口径说明）。
     import requests
     _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
@@ -885,7 +976,7 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
             return None
 
     def _latest_value(df, keywords, exclude=None):
-        """取最新报告期（列1）中匹配关键词的值。"""
+        """取最新报告期（列1）中匹配关键词的值（float；None 保持 None）。"""
         if df is None or df.shape[1] < 2:
             return None
         exclude = exclude or []
@@ -896,23 +987,34 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
                 return val if pd.notna(val) else None
         return None
 
-    # 资产负债表
+    df_bs = df_is = None
+    # 资产负债表（键名即口径：单位万元，见函数 docstring）
     try:
         df_bs = _fetch_sina_table('vFD_BalanceSheet')
-        summary["total_assets"] = _latest_value(df_bs, ["资产总计", "总资产"])
-        summary["total_liabilities"] = _latest_value(df_bs, ["负债合计", "总负债"])
-        summary["equity"] = _latest_value(df_bs, ["股东权益合计", "所有者权益合计", "归属母公司"])
-        summary["cash"] = _latest_value(df_bs, ["货币资金"])
+        summary["total_assets_wan"] = _num(_latest_value(df_bs, ["资产总计", "总资产"]))
+        summary["total_liabilities_wan"] = _num(_latest_value(df_bs, ["负债合计", "总负债"]))
+        summary["equity_wan"] = _num(_latest_value(df_bs, ["股东权益合计", "所有者权益合计", "归属母公司"]))
+        summary["cash_wan"] = _num(_latest_value(df_bs, ["货币资金"]))
     except Exception as e:
         logger.warning("_get_financial_statements(%s) 资产负债表失败: %s", code, e)
 
-    # 利润表
+    # 利润表（同上，万元口径）
     try:
         df_is = _fetch_sina_table('vFD_ProfitStatement')
-        summary["revenue"] = _latest_value(df_is, ["营业总收入", "营业收入"])
-        summary["net_profit"] = _latest_value(df_is, ["净利润"], exclude=["扣非"])
+        summary["revenue_wan"] = _num(_latest_value(df_is, ["营业总收入", "营业收入"]))
+        summary["net_profit_wan"] = _num(_latest_value(df_is, ["净利润"], exclude=["扣非"]))
     except Exception as e:
         logger.warning("_get_financial_statements(%s) 利润表失败: %s", code, e)
+
+    # 报告期：第 0 行日期行第 2 列（实测 600519 → 2026-06-30）
+    for _df in (df_bs, df_is):
+        if _df is not None and _df.shape[1] >= 2:
+            try:
+                summary["report_date"] = str(_df.iloc[0, 1])[:10]
+                break
+            except Exception:
+                pass
+    summary["financial_unit"] = "万元"
 
     return summary
 
@@ -926,6 +1028,21 @@ def get_capital_summary(codes: str) -> dict:
         统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
         "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{"summary": {margin, block_trade, holders, dividend, financials,
         overall_signal(中长线偏多/偏空/中性)}}。
+
+    ⚠️ 单位口径（2026-10-17 起，键名即单位，见名知口径）：
+        - margin：`rz_balance_wan`/`rq_balance_yi`（及 rq_ 同款）融资/融券余额，
+          **万元与亿元各一份**——引用时取 `_yi` 键直接照抄，不要自己换算
+          （run8：换算对了却把单位名写成「万万元」）
+        - financials：`revenue_wan`/`net_profit_wan`/`total_assets_wan`/
+          `total_liabilities_wan`/`equity_wan`/`cash_wan` 财报金额，**万元**
+          （附 `financial_unit:"万元"` 与 `report_date` 报告期）
+        - holders：`avg_hold_market_cap_rmb` 户均持股市值 **元**、
+          `avg_hold_num_shares` 户均持股 **股**
+        - dividend：`cum_bonus_per_10shares_rmb` 累计派息 **元/10股**
+          （附 `bonus_unit`）
+        上述口径**只适用于对应键**：价格（元）、派息（元/10股）等非 money
+        字段不得套用万元/亿元口径做倍数换算（2026-10-17 复跑曾出现把
+        1329 元现价 ÷100 标成「13.29 万元」的幻觉）。
 
     Args:
         codes: 多股用逗号分隔

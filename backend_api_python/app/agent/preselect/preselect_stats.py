@@ -21,7 +21,14 @@
     * 单 domain 连续 N>=20 命中 → 该域该单独考察（可能是某个具体问法没覆盖）
 
 注意：计数器是**进程内**的，重启归零。要看长期趋势得落库或进日志聚合，
-短期内以 warning 日志为准（`grep "preselect-empty-face"`）。
+近期以 warning 日志为准（`grep "preselect-empty-face"`）。
+
+【O-7 追加（2026-10-17 F23）：观测快照落盘】
+    每 run 收口 `snapshot()` 把当前累计观测写一行 JSONL
+    （`QD_PRESELECT_STATS_FILE`，默认 agent/traces/preselect_stats.jsonl）；
+    读侧 `load_snapshots()` + `aggregate_snapshots()` 按进程（`boot_ts`）分组取
+    末条再求和，**跨重启不丢不重** ⇒ 拿到真正的长期趋势（批跑见
+    `scripts/preselect_eval.py`）。仍是先攒数、不改任何在线行为。
 
 【差距 K 追加（2026-10）：任务→实际调用工具 配对通道】
     `record_task_calls()` 在 run 收口处把「用户问题 + 本轮真正调用过的工具」
@@ -60,7 +67,10 @@ _WARN_MIN_SAMPLE = 20
 # `_LATENCY`：total / empty 是**空域率**的分子分母（只统计"本应给出工具面却没给"）；
 # gate 是"闸门有意跳过"的独立计数 —— 闲聊/代码类任务**本就不需要工具**，
 # 把它算进空域率会污染退化指标（本次事故：打招呼即 1/1=100% 告警）。
-_LATENCY = {"total": 0, "empty": 0, "gate": 0}
+# gate_miss（F13 2026-10-17）：闸门**漏判总次数**（含被域兜底救回的），与 gate 分开：
+#   gate      只在「跳过闸门 **且** 域兜底也空手」时 +1（空域率视角）；
+#   gate_miss 每次漏判都 +1 ⇒ 直接观测漏判率（R2/D-8 长期闭环的缺失口）。
+_LATENCY = {"total": 0, "empty": 0, "gate": 0, "gate_miss": 0}
 _ROUTES: Counter = Counter()          # 触发原因 → 次数
 _DOMAINS: Counter = Counter()         # 兜底也没命中的 #domain → 次数
 _SAMPLES: Deque[Dict[str, str]] = deque(maxlen=_SAMPLE_LIMIT)
@@ -79,6 +89,104 @@ def pairs_path() -> Path:
     if not p.is_absolute():
         p = Path(__file__).resolve().parent.parent / p
     return p
+
+
+def stats_path() -> Path:
+    """观测快照 JSONL 的落盘路径（O-7）。
+
+    env `QD_PRESELECT_STATS_FILE` 覆盖；相对路径按**本文件位置**解析（与
+    `pairs_path` 同款），与 cwd 无关——批跑脚本在哪个目录跑都能读到同一份。
+    """
+    raw = os.getenv("QD_PRESELECT_STATS_FILE") or "traces/preselect_stats.jsonl"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent.parent / p
+    return p
+
+
+def snapshot() -> Optional[Dict[str, Any]]:
+    """把当前累计观测写一行 JSONL（O-7：进程内计数器落盘，求长期趋势）。
+
+    【为什么每 run 写一行】计数器是进程内累计的，进程被强杀时拿不到退出事件，
+    所以每 run 收口写一份**当前累计值**（末条即该进程终值）。跨进程重启由
+    `aggregate_snapshots` 按 `boot_ts` 分组去重，不会重复计数。
+
+    Returns:
+        快照 dict（含 report 字段 + `pid`/`boot_ts`/`file`）；写盘失败 None +
+        warning（fail-open，绝不影响回复主链）。
+    """
+    try:
+        path = stats_path()
+        rec = {k: v for k, v in report().items()
+               if k not in ("recent_samples", "uptime_sec")}
+        rec["pid"] = os.getpid()
+        rec["boot_ts"] = _STARTED          # 进程启动时间戳 = 分组键
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("[preselect-stats] 快照写盘失败(fail-open): %s: %s",
+                       type(e).__name__, e)
+        return None
+    rec["file"] = str(path)
+    return rec
+
+
+def load_snapshots(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """读回快照 JSONL（跳过坏行/空行；文件不存在/读失败返回 []，fail-open）。"""
+    p = Path(path) if path else stats_path()
+    out: List[Dict[str, Any]] = []
+    try:
+        if not p.exists():
+            return out
+        with p.open("r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except Exception as e:
+        logger.warning("[preselect-stats] 快照读回失败(fail-open→空): %s: %s",
+                       type(e).__name__, e)
+    return out
+
+
+def aggregate_snapshots(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """跨进程重启聚合观测（O-7 长期趋势）。
+
+    【为什么要分组】计数器是进程内累计的，重启即归零。把所有快照直接相加会
+    重复计数；正确做法是**按进程（`boot_ts`）分组、每组只取末条**（该进程终值）
+    再求和——重启前后的观测都不丢、也不重。
+
+    Returns:
+        {"boots","total","empty","gate_skip","gate_miss","empty_rate","gate_miss_rate"}
+    """
+    last: Dict[Any, Dict[str, Any]] = {}
+    for rec in records or ():
+        if not isinstance(rec, dict):
+            continue
+        key = rec.get("boot_ts")
+        if key is None:
+            key = rec.get("pid")
+        last[key] = rec                    # 文件有序 ⇒ 后写覆盖 = 取末条
+    total = sum(int(r.get("total") or 0) for r in last.values())
+    empty = sum(int(r.get("empty") or 0) for r in last.values())
+    gate = sum(int(r.get("gate_skip") or 0) for r in last.values())
+    gm = sum(int(r.get("gate_miss") or 0) for r in last.values())
+    return {
+        "boots": len(last),
+        "total": total,
+        "empty": empty,
+        "gate_skip": gate,
+        "gate_miss": gm,
+        "empty_rate": round(empty / total, 4) if total else 0.0,
+        "gate_miss_rate": round(gm / (total + gm), 4) if (total + gm) else 0.0,
+    }
 
 
 def record_task_calls(query: str, tools: Sequence[str]) -> Optional[Dict[str, Any]]:
@@ -171,6 +279,31 @@ def record_empty_face(query: str = "", route: str = "", domain_count: int = 0) -
             "rate": rate, "sample": sample}
 
 
+def record_gate_miss(query: str = "") -> Dict[str, Any]:
+    """记一次「闸门漏判」——域特征闸门没认出领域、于是跳过了那次 LLM plan。
+
+    【F13 2026-10-17】与 `record_empty_face(route="gate")` 的分工：
+      · 后者只在「跳过闸门 **且** 域兜底也空手」时计数（空域率视角，告警噪声低）；
+      · 本函数**每次漏判都计**（含被确定性快路由/域兜底救回的），给出漏判总量
+        与占比 ⇒ R2「长期漏判率」可直接观测（原实现漏判既不报警、计数器也拿不到）。
+    不计入 empty_rate 分母（漏判 ≠ 空域：兜底可能已救回）。
+    """
+    _LATENCY["gate_miss"] += 1
+    _ROUTES["gate_miss"] += 1
+    rate = gate_miss_rate()
+    q = _mask_user_text(query or "")[:60]
+    level = "warning" if (_LATENCY["gate_miss"] >= _WARN_MIN_SAMPLE and rate > 0.05) else "debug"
+    getattr(logger, level)("[preselect-gate-miss] 闸门漏判 rate=%.2f%% (%d) q=%s",
+                           rate * 100, _LATENCY["gate_miss"], q)
+    return {"gate_miss": _LATENCY["gate_miss"], "total": _LATENCY["total"], "rate": rate}
+
+
+def gate_miss_rate() -> float:
+    """漏判占「本应预选」总量的比例 0~1（分母 = 有结果 + 漏判）。"""
+    denom = _LATENCY["total"] + _LATENCY["gate_miss"]
+    return (_LATENCY["gate_miss"] / denom) if denom else 0.0
+
+
 def empty_rate() -> float:
     """空域占比 0~1。"""
     return (_LATENCY["empty"] / _LATENCY["total"]) if _LATENCY["total"] else 0.0
@@ -183,6 +316,8 @@ def report() -> Dict[str, Any]:
         "total": _LATENCY["total"],
         "empty": _LATENCY["empty"],
         "gate_skip": _LATENCY["gate"],
+        "gate_miss": _LATENCY["gate_miss"],
+        "gate_miss_rate": round(gate_miss_rate(), 4),
         "empty_rate": round(rate, 4),
         "by_route": dict(_ROUTES.most_common()),
         "by_domain_miss": dict(_DOMAINS.most_common()),
@@ -219,12 +354,15 @@ DECISION_NOTE = """
 
 def reset() -> None:
     """清零（仅供测试）。"""
-    _LATENCY.update(total=0, empty=0, gate=0)
+    _LATENCY.update(total=0, empty=0, gate=0, gate_miss=0)
     _ROUTES.clear()
     _DOMAINS.clear()
     _SAMPLES.clear()
     _PAIRS["n"] = 0
 
 
-__all__ = ["record_selected", "record_empty_face", "empty_rate", "report",
-           "reset", "DECISION_NOTE", "record_task_calls", "pairs_path"]
+__all__ = ["record_selected", "record_empty_face", "record_gate_miss",
+           "empty_rate", "gate_miss_rate", "report",
+           "reset", "DECISION_NOTE", "record_task_calls", "pairs_path",
+           # O-7（2026-10-17 F23）：观测快照落盘 + 跨重启聚合
+           "stats_path", "snapshot", "load_snapshots", "aggregate_snapshots"]
