@@ -52,21 +52,24 @@
 
 ### 1.1 要解决的问题
 
-Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（个股分析、全市场筛选、策略诊断、交易确认、通用问答），在 **89 个工具**的面上收敛出当轮最小可用工具集，跑 ReAct 闭环，输出结论，并把可证伪的断言留档、T+N 用真实行情判定。
+Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（个股分析、全市场筛选、策略诊断、交易确认、通用问答），在 **95 个工具**的面上收敛出当轮最小可用工具集，跑 ReAct 闭环，输出结论，并把可证伪的断言留档、T+N 用真实行情判定。
 
 三个硬约束决定了后面所有的架构选择：
 
-> 📌 **本文所有「实测」数字的时点与口径（2026-10-18 重测；2026-10-13 版留档见附录 Z）**
+> 📌 **本文所有「实测」数字的时点与口径（2026-10-19 重测；2026-10-13 版留档见附录 Z）**
 > - **窄口径（QD 自建工具面 = 工具 + 能力层，探针 `tmp/probe_design_drift_*.py` 可复现）**：
->   注册表 **89** 个（工具 **49** + 能力层 **40**）；必注入 **11** / 按需 **78**
+>   注册表 **95** 个（工具 **55** + 能力层 **40**）；必注入 **11** / 按需 **84**
 >   （`CORE_TOOL_DOMAINS=("common","meta")` 域）。
 > - **宽口径（叠加 mimo 原生工具）**：2026-10-17 快照 **101**（必注入 **15** / 按需 **86**）。
 >   ⚠️ 10-17 曾把宽口径 101 与 10-13 窄口径 92 直接相比（"工具数 92→101"）、把宽口径
 >   schema 75,299 与窄口径 49,507 相比 —— 均为**口径混用**（2026-10-18 订正，见附录 Z）。
 >   同口径下 10-13 的 92 → 10-18 的 89，差在 finance 工具净减 4：`indicator_tools`
 >   模块下线（并入 `technical_analysis`）、`backtest_tools` 两工具被 `agent_*` 系列替代，
->   `auto_bt_tools` 同批新增。**10-18 起正文一律以窄口径为准，宽口径数仅作 10-17 留档。**
-> - **schema 体积（窄口径 2026-10-18 实测）**：全量 **51,572 字符**、必注入 **4,315 字符**。
+>   `auto_bt_tools` 同批新增。**10-19 的 89 → 95**：`indicator_tools`/`backtest_tools`
+>   两模块于 10-18 17:02 被**无记录恢复**（+6 工具）——详见**附录 AN**
+>   （2026-10-19 用户裁定：保留恢复、正式登记），
+>   本文数字同步现状。**10-18 起正文一律以窄口径为准，宽口径数仅作 10-17 留档。**
+> - **schema 体积（窄口径 2026-10-19 实测）**：全量 **55,977 字符**、必注入 **4,315 字符**。
 >   ⚠️ 2026-10-17 记的全量 75,299 / 必注入 11,281 是**宽口径**（含原生编码家族 schema），
 >   不可与窄口径数相比。**体积口径以本行为准，历史数勿再引用。**
 > - 工具变少而 schema 反而变大（P12 时就有此现象）：P12 恢复了 finance 的
@@ -75,7 +78,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 
 | 约束 | 后果 |
 |---|---|
-| 工具面 **89** 个、全量 schema **51,572 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
+| 工具面 **95** 个、全量 schema **55,977 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
 | 结论里的数字必须可溯源 | 需要 grounding gate（数字溯源拦截） |
 | 用户会问"你上次说的对不对" | 需要追责四表 + T+N 真值判定 + 反哺行为 |
 
@@ -83,7 +86,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 
 | 原则 | 落地形态 |
 |---|---|
-| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **11** 个 / 全量 **89** 个（窄口径，见 §1.1） |
+| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **11** 个 / 全量 **95** 个（窄口径，见 §1.1） |
 | **fail-open 优先** | 预选空手有域兜底、未激活直调就地激活、能力层补位；宁多不可断 |
 | **可追责** | `decisions/claims/resolutions` 三表 + T+N 判定 + 权重反哺 |
 | **只提示、不过滤** | 权重/历史表现只做 hint，不做硬过滤（硬过滤与 fail-open 冲突） |
@@ -96,7 +99,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 ### 1.3 四条关键取舍
 
 1. **删掉自研编排**：旧版 StateGraph + 4 节点 + phase acceptance 全部删除，只保留 mimo 单 ReAct 循环 + 一个 `update_plan` 清单工具。
-   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**89**，窄口径见 §1.1；⚠️ 早期写 102、其后写 92/101 均为历史时点或宽口径数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
+   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**95**，窄口径见 §1.1；⚠️ 早期写 102、其后写 92/101 均为历史时点或宽口径数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
 2. **分级是架构不是配置**：框架只在 init 算一次工具定义，我们 override `get_model_query_kwargs` 改成**每轮现算**，否则 `activate_tools` 激活了也不生效 —— 这是整套分层的前提。
 3. **权重只提示不过滤**：硬过滤会让模型在真需要某工具时拿不到它。粒度也只到 domain —— resolutions 不带 tool/skill 归因，硬按 `user_query` 反推"当时用了哪几个工具"是伪精确。
 4. **接入组件前先问"它要几次 LLM 往返"**：本地计算（权重提示 0ms / 实体解析 95ms）与一整轮 LLM 生成（结论格式化 11.7s）是两类东西，评审阶段就要区分，不能等用户说"变慢了"再归因。
@@ -172,7 +175,7 @@ backend_api_python/app/agent/
 │                         #   数据域词典**单源**在 preselect/tool_preselect.py::DATA_DOMAINS）
 ├── log.py
 │
-├── tools/        [35 py]  工具层:顶层 13(含 __init__) + finance 19 + knowledge 3
+├── tools/        [37 py]  工具层:顶层 13(含 __init__) + finance 21 + knowledge 3
 │   ├── tool_discovery.py     # search_tools / list_tools / activate_tools(两级装载)
 │   ├── skill_tools.py        # list_skills / read_skill / run_skill
 │   ├── capability_tools.py   # search_capabilities / call_capability / list_capabilities
@@ -185,7 +188,7 @@ backend_api_python/app/agent/
 │   ├── _serialize.py         # 结果序列化(TSV/紧凑 JSON/空值剥离)
 │   ├── _fn_adapter.py        # FnToolAdapter:裸函数工具零改动适配 mimo BaseTool(F16:from_raw+metadata 合并)
 │   ├── _availability.py      # 启动期工具可用性探测(进系统提示工具地图)
-│   └── finance/(19) knowledge/(3)
+│   └── finance/(21) knowledge/(3)
 │     ※ **扫描规则(2026-10-13 P10)**:文件名以 `_` 开头 = 非工具模块,
 │       扫描器天然跳过。取代已删除的 `_SKIP_FILES` 名单(曾有两份且实测漂移:
 │       mcp 侧漏登记 availability ⇒ 自检函数被暴露成 MCP 工具)。
@@ -205,6 +208,10 @@ backend_api_python/app/agent/
 │       （并入 `technical_analysis`，见 `_provider.py` 注释）、`backtest_tools`
 │       两工具（run_backtest / get_backtest_history）被 `agent_*` 系列替代；
 │       `auto_bt_tools` 同批新增（§5.3）⇒ 净 -4 工具、-2 文件。
+│     ※ **finance/ 19 → 21（2026-10-19 登记）**：上述两模块于 2026-10-18 17:02
+│       被**无记录恢复**（旧版原样回填，+6 工具）——证据见**附录 AN**；用户已裁定
+│       **保留恢复、正式登记**（2026-10-19），目录树数字按现状同步，
+│       `_provider.py`/`tool_preselect.py` 相关注释已改为正式状态说明。
 │
 ├── capabilities/ [4 py]  三级能力层(admission.json 准入 **68** → 注册 40)
 │     ※ **admission.json 就在工作副本里**(2026-10-13 订正:早期注「不在工作副本」
@@ -215,7 +222,7 @@ backend_api_python/app/agent/
 │       **零行为变更**:注册数当时为 39,它从来没注册上。)
 │       (2026-10-18 基线同步:注册 39→40,为 admission 增长后当前实测,探针 B3。)
 │
-├── chain/        [24 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
+├── chain/        [26 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
 │   ├── claims.py             # 域判定 / 入库闸门 / Claim 提取(纯函数,零 LLM)
 │   ├── intake.py             # record_decision 唯一入口
 │   ├── account_store.py      # decisions/claims/resolutions 持久化
@@ -234,6 +241,7 @@ backend_api_python/app/agent/
 │   │     消费方 1：chain/c3p.py::_c3p_pipeline（aggregate 的 coefs 实参）
 │   ├── backtest_bridge.py    # ★ §5.3 回测桥(2026-10-18 随 auto-backtest 落地,含预算/钳制/落盘)
 │   └── reset.py / schema.py / store.py / judge_stats.py / skill_brewer.py
+│   └── skill_registry.py / skill_events.py  # ★ skill 治理改造(2026-10-19)：稳定身份+生命周期注册 / 反馈事件链(附录 AM 前置,见 §14 skill 改造系列)
 │
 ├── skills/       [7 目录]  market-screener / strategy-debug / auto-backtest(**含 run.py,可执行**)
 │                           + auto-stock-analyze / auto-finance-analysis-stock
@@ -294,7 +302,7 @@ backend_api_python/app/agent/
 │                 qd_core_base.txt / qd_system.txt / skill_brew.txt
 │                 skill_revise.md / tool_preselect.yaml / wrapup_summary.md
 │                 evidence_extract.md / verdict_judge.md / skill_engineer.yaml / func_overlap.yaml
-├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 258 项,2026-10-18 实测;旧记 257/256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
+├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 259 项,2026-10-19 实测;旧记 258/257/256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
 │                                  qd_bench.py + yaml(25 题;F19 加 selftest/--num-rollouts)/ qd_dispatch_ab.py / skill_run.py / weekly_panel.py
 └── traces/, data/, tmp/   辅助目录
 ```
@@ -376,16 +384,16 @@ backend_api_python/app/agent/
 > 改动实质：分层不再裸读 `QD_ON_DEMAND_TOOLS`，改由 **T7 四态推导链**产出（见本节末）。
 > ⚠️ **2026-10-18 口径分流**：10-17 的 **101 / 15 / 86** 是**宽口径**
 > （`connect_state_counts`，含 mimo 原生工具）；本节计数 10-18 起改以**窄口径**
-> （QD 自建工具面，探针 `probe_design_drift` 可复现）为准：**89 / 11 / 78**。
+> （QD 自建工具面，探针 `probe_design_drift` 可复现）为准：**95 / 11 / 84**。
 > 宽口径数仅作 10-17 留档、不参与判定（§1.1 口径注、附录 Z 2026-10-18 更新）。
 
-| 级 | 定义 | 实测（窄口径，2026-10-18） |
+| 级 | 定义 | 实测（窄口径，2026-10-19） |
 |---|---|---|
 | **一级 必注入** | `tools/` 顶层中 `common`+`meta` 域（宽口径另计元工具/`update_plan`/mimo 原生） | **11** |
 | **二级 域内** | `tools/finance` + `tools/knowledge` | 域内优先于能力层 |
 | **三级 能力层** | `capabilities/` 准入函数 | 准入 **68** → 注册 **40** |
 
-- 注册表总量 **89**（必注入 **11** / 按需 **78**，窄口径）；宽口径（叠加 mimo 原生）10-17 快照为 **101**（必注入 15 / 按需 86）。与附录 Z 早期快照（92 / 21 / 71）的差异见该表。
+- 注册表总量 **95**（必注入 **11** / 按需 **84**，窄口径）；宽口径（叠加 mimo 原生）10-17 快照为 **101**（必注入 15 / 按需 86）。与附录 Z 早期快照（92 / 21 / 71）的差异见该表。10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）。
 - **T2 起的默认降级**：`QD_ON_DEMAND_TOOLS` 默认 **8 个**（`actor,run_skill,task,edit,read,write,glob,grep`）——
   mimo 原生编码家族实测 30 次工具调用里 0 次被业务用到，白付 9,673 tok/轮（占必注入体积 77.5%）。
 - **"域内优先"的三处落实**：① `build_catalog_grouped` 目录分两段、能力层垫底；
@@ -657,7 +665,7 @@ run 级一次性 few-shot（CBR），填技能酿造的粒度空档。**增益�
 
 | 尺 | 管什么 | 产物 |
 |---|---|---|
-| `scripts/qd_smoke.py` | 回归（不调模型） | **258** 项断言（40 个 test 函数，**2026-10-18 实测 258/260 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **258** 为准（口径演变见 §9） |
+| `scripts/qd_smoke.py` | 回归（不调模型） | **259** 项断言（40 个 test 函数，**2026-10-19 实测 257/259 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「258 项」（258/260）、「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **259** 为准（口径演变见 §9；10-19 的 -1 来自 skill 阶段 5 的 test_39 改制：G 乘子五断言 → 摘除后四不变量） |
 | `scripts/qd_prompt_eval.py` + `prompt_tasks.yaml` | prompt 行为（真实端点） | 10 任务/35 断言，含规划 5 题 |
 | `scripts/qd_bench.py` + `bench_tasks.yaml` | 能力质量（C） | 25 题五类各 5；五维确定性打分 |
 | `scripts/qd_dispatch_ab.py` | 成本对照（B） | 分发 vs 不分发单变量 A/B；`--rejudge` 不重跑复核 |
@@ -1114,13 +1122,13 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | 项 | 实测 |
 |---|---|
 | `compileall app/ scripts/` | ✅ 通过 |
-| `qd_smoke.py` | ✅ **258 项**（40 个 test 函数）；**2026-10-18 实测 258/260 passed · 0 failed · 2 skipped**（2 skip 均为 `del/` 归档缺件）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259，**2026-10-18 为 258/260** |
+| `qd_smoke.py` | ✅ **259 项**（40 个 test 函数）；**2026-10-19 实测 257/259 passed · 0 failed · 2 skipped**（2 skip 均为 `del/` 归档缺件）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259、2026-10-18 为 258/260，**2026-10-19 为 257/259**（test_39 改制 -1 断言，见附录 AM） |
 | `qd_prompt_eval --validate` | ✅ 10 条任务 / 35 项断言；plan_* 断言 **17/19** |
 | `qd_bench` | 25 题；真实端点首跑 **71.7**（coverage 81.5 / grounding 86.8 / claims 38.0 / structure 62.6） |
 | `qd_dispatch_ab` | 首跑成本比 **0.889**（未达 0.40，见 D-18）、质量Δ +0.5 |
 | v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`） |
-| 全量 `tests/` | ✅ **1301 passed / 4 skipped / 0 failed**（**2026-10-18 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ） |
-| 工具面 | 注册表 **89**（窄口径：工具 **49** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **11** / 按需 **78** |
+| 全量 `tests/` | ✅ **1423 passed / 4 skipped / 0 failed**（**2026-10-19 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ）→ **1374**（skill 阶段 3 Top-K，见附录 AK）→ **1408**（skill 阶段 4 反馈事件链，见附录 AL）→ **1423**（skill 阶段 5 软重排，见附录 AM） |
+| 工具面 | 注册表 **95**（窄口径：工具 **55** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **11** / 按需 **84**。⚠️ 10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记） |
 | 技能 | **7** 个目录，其中可执行 **3** 个（`market-screener`/`strategy-debug`/`auto-backtest`） |
 | `formatters/` | 不在生产包内（已归档 `del/agent_formatters_20261001/`） |
 
@@ -2812,3 +2820,336 @@ skill 全市场批量扫描的专用场景（`limit=0` 无截断 + 任意时间�
   「供技能排序」，但代码里 `_rank_skills` 只吃 `layer='skill'`，domain 根本没进硬排序。
 - **裁定**：该问题暂缓，先记录；skill 还有更大的"闭环无限生成 skill 拖垮预选"问题
   优先处理（见后续讨论 / 待落实施计划）。本 § 仅留痕，不在此批动码。
+
+---
+
+## 附录 AK · 阶段 3：技能 Top-K 渐进披露 + 可见性兜底 + 单一字符预算 + 受限探索位（2026-10-19）
+
+> 出处：`tmp/skill_system_rework_implementation_plan_20261018.md` §5/§14.1/§14.2/§14.4/§15.2
+> （该方案由用户裁定「无人值守完整实施」；阶段 0/1/2 报告见
+> `tmp/skill_rework_phase0_baseline_20261019.md` 与本批总账）
+> 实施报告：`tmp/skill_rework_phase3_topk_20261019.md`
+
+### 1 根因（阶段 0 实测）
+
+技能目录进预选（2026-10-17）后**全量序列化**：7 技能 1678 字符、每技能 +94c
+线性增长；自动酿造可持续增长（容量治理阶段 1 已建）⇒ 目录成本无上界。
+同期实锤旧 `layer='skill'` 排序链已死（权重全 1.0 且 n=0、键名错配）——本阶段
+只摘**候选排序消费**的前提因此低风险（§14.3）。
+
+### 2 落地（生产码）
+
+| 件 | 内容 |
+|---|---|
+| `preselect/candidate_index.py` | `QD_PRESELECT_SKILL_TOPK`（默认 4）统一旋钮；`rank_skills_scored`（eligible 排序真源，`rank_pools` 委托）；探索位机制 `explore_ttl_days`/`_EXPOSURE`(OrderedDict+锁)/`select_explore` |
+| `preselect/tool_preselect.py` | `_SKILL_CATALOG_HEAD` 共用段头；`_SKILL_POINTER`（§14.1 兜底：计数 + list_skills()/read_skill() 路径 + 禁编造，不列名）；`build_skill_catalog_topk` **单一入口**（k≤0 内部委托旧 `build_skill_catalog`，回退逐位一致）；`preselect_catalog_chars` + `_PRESELECT_FIXED_CHARS`（§14.4 单一预算）；F14 三函数 docstring 补口径边界 |
+| `qd_preselect.py` | `_maybe_preselect_tools` 接单一入口；`report["skill_catalog"]` 记 `mode/topk/total/size/shown/regular/hidden/chars/explore/funnel`；新增 `report["preselect_chars"]` 影子观测 |
+| `chain/skill_registry.py` | `recent_published_skill_ids(days)`：探索资格真源（`qd_skill_registry.created_at` 口径，修订不刷新资格；参数化天数；DB 不可用 ⇒ None ⇒ fail-closed） |
+
+### 3 行为契约（测试钉死，18 例 + 变异 7/7）
+
+1. **Top-K 封顶**：K=4 = 3 常规位 + 1 探索位；段内技能行数恒定，与技能总数
+   脱钩（治 +94c/技能）。真实数据探针：分析600519 1678→1143（−32%）、
+   跑回测 1678→403（−76%），四查语义首位全对（`tmp/skill_rework_phase3_topk_20261019.md` §3）。
+2. **可见性兜底（P14/§14.1）**：截断后指针告知「另有 N 个可用技能」+ 发现路径
+   + 禁编造；`list_skills()` 全集不缩；未展示技能不得出现在段内（防照抄幻觉）。
+3. **单一字符预算（§14.4）**：`preselect_catalog_chars(工具目录, 技能段)` =
+   两者 + 固定模板骨架（system + user 空槽）；**不含量身加载的技能正文**；
+   不新增平行技能字符阈值，`QD_PRESELECT_TIER_CHARS` 仍是唯一阈值 env；
+   `schema_chars_of` 保持工具 schema 专用口径（F14 冻结），二者分工写进 docstring。
+4. **受限探索位（§14.2）**：候选 = eligible（active + 过 `QD_SKILL_MIN_SCORE`）
+   ∧ TTL 内新发布（registry；DB 不可用 ⇒ 不探索）∧ 未在曝光窗口内曝光
+   （进程级轮换簿记；同一技能不得重复获得无限优先级）。探索**不降低门槛、
+   不强制 planner 的 skill 结果、不视为成功使用**；不合格 ⇒ 空置不填充。
+5. **空池不填充（§15.2）**：无达标技能 ⇒ 无技能行、指针保留、允许 planner 输出
+   null；长尾经发现兜底可达。词面门槛含入边界（恰好 2 命中算达标，与
+   `_SKILL_INJECT_MIN` 注入门槛同语义）。
+6. **回退铁律**：`QD_PRESELECT_SKILL_TOPK=0` ⇒ 与 2026-10-19 前逐位一致；
+   `QD_PRESELECT_SKILL=0` ⇒ 整段不出现（v17j 守卫不回归）。
+
+### 4 职责切分（v6 拆分守卫联动）
+
+`qd_preselect.py` 因接线涨到 614 行触 `≤600` 单职责预算 ⇒ 将
+`PRESELECT_DOMAIN_CN`/`preselect_additions`（预选域词汇表）迁入 `preselect` 包
+（纯搬迁零行为变化），现 589 行；消费方 `qd_tool_face`/`test_v17c` 导入路径随迁。
+
+### 5 测试与回归
+
+- 新守卫 `tests/test_v43_skill_topk_preselect_20261019.py`（18 例：封顶/兜底/
+  预算/探索轮换与守门/不强制选择/空池/边界/SQL 形状契约/接线 AST/影子字段）。
+- 变异检验 **7/7 全杀**（`tmp/skill_rework_phase3_mutation_20261019.py`）。
+- 全量 pytest **1374 passed / 4 skipped / 0 failed**（1356+18 闭合）。
+- 既有调整透明登记：v17j 三例夹具描述同型化（薄描述不过词面门）+ 清 env 补删
+  Top-K 三旋钮；v42 env 更名；v17c 导入随迁。
+
+### 6 已知边界（登记不动）
+
+- 快路由（T5，2026-10-16）命中时整段不跑 LLM 预选 ⇒ 技能选择回落 prefetch
+  关键词链；既有取舍，如要改需单独评估（省 3k token vs 语义选技能）。
+- 描述 60 字符截断沿用 `_one_line` 既有口径（全量路径同样截断）。
+- 迁移 `agent_v7_skill_registry.sql`：**2026-10-19 06:49 已应用**（`tmp/apply_skill_migrations_20261019.py`，
+  含插验删写路径冒烟）。应用前 lifecycle/版本/探索资格走 fail-open/fail-closed
+  软化路径（设计内）；应用后探索位自动生效。人工技能仍不强制入注册表
+  （`get_active_version` 无行 ⇒ 空版本，事件链按 fail-soft 记录）。
+
+### 7 阶段 4 预告
+
+事件链 `qd_skill_selection_events`（候选/选中/注入/执行分状态 + 版本冻结 +
+trace 关联）；漏斗六阶段分开统计，**零曝光/曝光未选中不计负向样本**；归因
+纪律（单技能明确归因才计）+ 15/30 样本门槛 + 幂等聚合；先影子不换生产排序。
+
+---
+
+## 附录 AL · 阶段 4：技能反馈事件链（选择事件 + 版本级反馈 + 归因纪律）（2026-10-19）
+
+> 出处：`tmp/skill_system_rework_implementation_plan_20261018.md` §6/§8/§14.2/§15.4
+> 实施报告：`tmp/skill_rework_phase4_events_20261019.md`
+> 变异检验：`tmp/skill_rework_phase4_mutation_20261019.py`（8/8 全杀）
+
+### 1 根因（阶段 0 实锤）
+
+技能效果数据此前的三条通道全部不可用或口径错：旧 `qd_agent_weights
+layer='skill'` 权重全 1.0 且 n=0（2026-10-19 实测）、键名错配（阶段 3 已证）；
+案例库 `qd_agent_cases` 是链路级不区分技能；没有任何机制回答「这个技能被
+选中后，**真的跑了吗？跑得对吗？」——「被召回」不等于「被使用」，
+「被使用」不等于「用对了」。缺一条分状态、可归因、幂等的事件链，
+后续任何软重排/自动调权重都是拍脑袋。
+
+### 2 落地（生产码）
+
+| 件 | 内容 |
+|---|---|
+| `migrations/agent_v8_skill_events.sql`（新） | `qd_skill_selection_events`（五态 + 候选快照 JSONB + 版本冻结 + trace root + label/exclusion_reason）+ 3 索引；`qd_skill_feedback`（(skill_id, version) PK + 计数 + weight + uncertainty + policy_version）。**2026-10-19 06:49 已应用**（运行日志报 `qd_skill_selection_events 不存在` 即应用前症状；fail-soft 兜住请求不阻塞，应用后事件链/反馈读写自动生效） |
+| `chain/skill_events.py`（新，577 行） | 事件链唯一模块：record_selection / mark_injected / mark_run_outcome / finalize_label / ingest_trace_labels / aggregate_feedback / weight_of / feedback_snapshot / funnel_report + CLI |
+| `qd_service.py` | `_run_sync`：preselect 后 `record_selection`（候选快照 + 选择时冻结版本，event_id 挂 `agent._skill_event_id`）；prefetch 后 `mark_injected`（实际注入 ≠ planner 点名） |
+| `qd_aftercare.py` | `_intake_accountability` 末尾 `mark_run_outcome`（executed = injected_skill_id ∈ 本 trace 技能节点名集合） |
+| `chain/evaluator.py` | 扫描查询加 `root_id` + `skill_node_count`（归因判据进 SQL）；行循环 `ingest_trace_labels`；`update_weights` 收口 `aggregate_feedback` |
+
+### 3 行为契约（测试钉死，33 例 + 变异 8/8）
+
+1. **事件分状态**（§6.2）：候选/选中/注入/执行/标签五态各自独立；**注入 ≠
+   执行**（trace 出现该技能节点才算跑过）；选中版本在**选择时刻冻结**
+   （registry active_version，后续文件变更不改写历史）。
+2. **归因纪律**（§6.3）：只有「唯一注入 + 实际执行 + 单技能节点」的事件才计
+   样本；多技能协作 ⇒ `unattributable`（排除，**不分摊、不猜测**）；
+   `correct=None`（未成熟/neutral）⇒ `pending`；`pending/undecidable/
+   data_missing/interrupted/infra_failure` **不计失败**；**零曝光/曝光未选中
+   不是负向样本**（§14.2：漏斗六阶段分开统计）。
+3. **first-wins 标签**：`WHERE event_id=%s AND (label='' OR label=%s)`——
+   T+N 重跑/重复成熟不改写已成熟标签（幂等第一入口，防 worker 重跑翻转）。
+4. **聚合幂等**（§6.4）：按事件全量重算（event_id 天然去重，可反复跑）；
+   只统计 `injected ∧ executed`；排除态进 `excluded_counts` 与样本分离。
+5. **权重公式**（§15.4）：`score=(correct+0.5×partial)/n`、
+   `confidence=n/(n+K)`（K=门槛 15）、`w=1+(score−0.5)×2×confidence`，
+   夹 `[0.9, 1.1]`；**低于门槛恒 1.0**（排序与无反馈基线一致）；
+   **版本隔离**：新版本无样本回中性，不继承旧版本。
+6. **唯一读口 + fail-soft**（§6.5）：`weight_of()` TTL 缓存 60s + 失败/无行/
+   空 id ⇒ 中性 1.0；DB 不可用/表未建 ⇒ 全链 no-op 不抛不阻塞。
+7. **三分离**（§6.1）：`qd_skill_feedback` 与案例库、domain 权重、旧
+   `qd_agent_weights layer='skill'` 不混算、不互相读取；本阶段**只写影子
+   统计**，生产排序不变（阶段 5 才消费）。
+
+### 4 漏斗口径（§14.2，六阶段分开统计）
+
+`eligible_but_not_exposed`（candidates 中 exposed=False）/
+`exposed_not_selected`（曝光未成为 selected/injected）/
+`selected_not_injected` / `injected_not_executed` / `executed_pending` /
+`executed_labeled`，外加排除原因分组。判据源：阶段 3 的 `meta.candidates`
+完整快照（含落选 eligible——`exposed` 标记即漏斗第一段判据）。
+
+### 5 变异检验与两条「假绿」教训（8/8）
+
+首轮 3 项 SURVIVED，根因都不是生产码而是**守卫自身假绿**：
+
+1. **假 DB 不得自带与生产 SQL 重合的业务规则**：内存假 DB 的 label 路由
+   自带 first-wins、聚合扫描自带 injected∧executed 过滤 ⇒ 生产 SQL 的
+   守卫被摘后假 DB 仍在把关，变异穿不透。修法：假 DB 改**忠实代理 SQL
+   文本**（守卫子串在才生效），并补行为判据（注入+已标签但未执行不得进
+   样本——生产 SQL WHERE 是唯一防线）。
+2. **AST 接线守卫必须查调用位置而非字样**：`None and f(...)` 字样仍在、
+   永不执行，纯文本断言恒绿。修法：`_live_calls` 收 Call 节点 + 祖先链，
+   校验「存在 + 不在 BoolOp 短路位 + 最近语句是 Expr/Assign」。
+
+> 教训意义：「守卫恒绿」比没有守卫更坏（给人虚假安全感）。凡夹具/断言
+> 与生产语义重合处，都要让生产变异能穿透——这一条已按项目
+> 「判死代码/守卫反直觉」经验库同型入账。
+
+### 6 测试与回归
+
+- 新守卫 `tests/test_v44_skill_events_20261019.py`（33 例，见 §3）；
+  `test_v43` 接线期补 1 例候选快照契约（18→19）。
+- 变异检验 **8/8 全杀**（M1 executed 恒真 / M2 first-wins 摘除 / M3 多技能
+  排除摘除 / M4 门槛摘除 / M5 限幅摘除 / M6 聚合过滤摘除 / M7 TTL 摘除 /
+  M8 evaluator 接线摘除）。
+- 全量 pytest **1408 passed / 4 skipped / 0 failed**（1356+19+33 闭合，
+  `tmp/pytest_phase4_final_20261019.log`）。
+
+### 7 已知边界（登记不动）
+
+- 迁移未执行期间：事件链全 fail-soft no-op、聚合/漏斗空榜（设计内；
+  应用后自动生效，无代码变动）。
+- `weight_of` 未接入排序；`qd_service._rank_skills` 对旧 `layer='skill'`
+  的消费原样保留（三分离）；partial 标签 v1 恒 0（标签源只有 trace correct
+  布尔，公式预留）。
+- 归因依赖 `collector._skill_nodes` 与 evaluator 查询同款口径（root 下
+  layer='skill' 节点计数），两处 fail-soft，挂了只丢影子数据。
+
+### 8 阶段 5 预告
+
+`weight_of()` 接入技能池排序：基础分保留、池内轻量重排；摘除
+`qd_service._rank_skills` 对 `layer='skill'` 的旧排序消费（旧治理链保留
+只读）；冷启动 1.0 恒等；影子→灰度开关；排序 trace 记基础分/反馈权重/
+样本数/版本/最终分。
+
+---
+
+## 附录 AM · 阶段 5：软重排灰度与权重拆分（新反馈唯一读口入池 + 旧排序读口摘除）（2026-10-19）
+
+> 出处：`tmp/skill_system_rework_implementation_plan_20261018.md` §9 阶段 5 / §14.3 / §15.4 / §11
+> 实施报告：`tmp/skill_rework_phase5_rerank_20261019.md`
+> 变异检验：`tmp/skill_rework_phase5_mutation_20261019.py`（8/8 全杀；
+> 阶段 3/4 变异复跑 7/7、8/8 无回退，合计 23/23）
+
+### 1 根因（阶段 0 实锤 + §14.3 裁定）
+
+技能效果反馈此前只有旧 `qd_agent_weights.layer='skill'` 一条路，且已实锤为
+死链（权重全 1.0 且 n=0、键名错配）——`_rank_skills` 的乘子恒 1.0，白占一次
+快照查询。§14.3 裁定：新 `qd_skill_feedback` 是技能候选排序的**唯一反馈
+来源**；接管排序后摘除旧读口，避免排序双账本；旧治理链（evaluator 写入 /
+skill_brewer.maybe_revise / weight_hints 其余三层）在消费者迁移完成前保留。
+
+### 2 落地（生产码）
+
+| 件 | 内容 |
+|---|---|
+| `preselect/candidate_index.py` | `feedback_rank_enabled()`（`QD_SKILL_FEEDBACK_RANK` 默认开，可一键回退）；`apply_feedback_rerank(eligible)`：`final = base × weight_of(skill_id, version)`，(final, base, name) 降序，**只调序不过滤**，返回 `(list, {enabled, would_reorder, weights})`，每候选 `rank_metadata["feedback"]={weight,samples,final,applied}` |
+| `preselect/tool_preselect.py` | `build_skill_catalog_topk` 接线（②b 步）：`meta["feedback"]` + `candidates` 快照补 `fb_weight/fb_samples/final_score`——排序 trace 五要素（基础分/反馈权重/样本数/版本/最终分）齐备，§14.3 可审计 |
+| `chain/skill_events.py` | `feedback_detail()` 诊断读口（weight+样本+policy，与 weight_of 同表同 TTL 缓存）；`weight_of` 改委托 + **读侧限幅**（写侧已夹，读口再夹 = 纵深防御） |
+| `qd_service.py` | 删 `_skill_weight`（全仓唯一 skill 层排序消费）；`_rank_skills` 去乘子改 2 元组 `(分,名)`、回归纯确定性；调用方随改；注释/docstring 登记改制 |
+| `scripts/qd_smoke.py` + `agent差距与改进路线.md` | `test_39` 由 G 乘子五断言改制为摘除后四不变量；路线文档 G 节补换链注记 |
+
+### 3 行为契约（测试钉死，13 例 + 变异 8/8）
+
+1. **唯一反馈来源**：Top-K 池是技能候选排序的唯一反馈消费点；`_rank_skills`
+   （关键词回落）零反馈、纯确定性——守卫查调用级+导入级（含别名回接），
+   旧 `layer='skill'` 读口不得以任何形式回接。
+2. **冷启动恒等**：无行/低于 15 样本/DB 不可用/读取异常 ⇒ 权重 1.0 ⇒ 序与
+   分量逐位一致（安全性由构造保证：门槛 + 限幅 + 只调序不过滤）。
+3. **池内轻量重排**：final = base × weight；eligible 集合、注入门槛
+   （`QD_SKILL_MIN_SCORE`）、探索位资格全不变；低权重技能可被挤出常规位
+   但**仍在 candidates 快照**（漏斗判据不丢）；并列按 (final, base, name)
+   确定性裁决。
+4. **可关闭灰度（§11）**：`QD_SKILL_FEEDBACK_RANK=0` ⇒ 与阶段 3 纯词面
+   逐位一致；`would_reorder` 影子判据两种状态都算——启用前后排序差异可对照。
+5. **读侧限幅**：`weight_of` 返回恒在 [0.9, 1.1]（写侧夹 + 读口夹，幂等）。
+6. **旧治理链保留**：weight_hints/evaluator/skill_brewer 不因摘除改动
+   （守卫直接断言其存在与写入）。
+
+### 4 两条「假绿/假红」教训（入经验库）
+
+1. **tie-break 测试的名字序必须与 base 序反向**：同向时「按 base 降序」与
+   「按名字升序」结果重合，断言无鉴别力（P3 首轮 SURVIVED）。排除名字序
+   假象必须构造性排除，不能靠巧合。
+2. **AST 守卫的匹配口径必须与变异改写口径同精度**：① 别名回接
+   （`import weight_of as _whw`）穿过调用名黑名单 ⇒ 必须同时查
+   `ImportFrom` 的 (module, name)；② 相对导入的 `ImportFrom.module` 属性
+   **无前导点**（`"chain.weight_hints"`），子串匹配假绿 ⇒ 必须 `endswith`。
+   与阶段 4 两课（假 DB 不带业务规则、AST 查调用位置）同型入库。
+
+### 5 测试与回归
+
+- 新守卫 `tests/test_v45_skill_feedback_rerank_20261019.py`（13 例）；
+  v44 补 2 例 + 假 DB 路由适配（35 例）；v6 mock 2 元组化；qd_smoke 40/40。
+- 变异 23/23（阶段 3：7/7；阶段 4：8/8；阶段 5：8/8）。
+- 全量 pytest **1423 passed / 4 skipped / 0 failed**（1408+13+2 闭合，
+  `tmp/pytest_phase5_final_20261019.log`）。
+
+### 6 已知边界（登记不动）
+
+- 迁移未执行 ⇒ 权重恒 1.0 ⇒ 软重排当前与基线逐位一致（设计内）；应用且
+  ≥15 样本/版本后自动生效。
+- 关键词回落路径（快路由/预选关/LLM 返 null）暂无反馈影响——单一反馈真源
+  的取舍，阶段 6 按数据决定是否扩展。
+- partial 标签 v1 恒 0；`weight_of` 空版本读 = 最新一行（池内用 active_version）。
+
+### 7 阶段 6 预告
+
+检索增强按数据决定：description 词面召回不达标才建离线意图手册/语义索引；
+不把在线 LLM 生成作默认检索路径；回退路径与索引版本可审计。
+
+## 附录 AN · 工具面静默恢复事件登记（2026-10-19 发现；用户裁定：分支 A 保留恢复）
+
+> 出处：skill 改造收尾时跑设计机检（`tmp/probe_design_drift_20261013.py`）
+> 报 7 项 DRIFT，逐项对账后定位到本事件。发现时按"不回退、不洗白"处置，
+> 2026-10-19 用户裁定**分支 A（保留恢复）**后正式化，本附录即登记依据。
+
+### 1 事件
+
+2026-10-18 17:02（本地时间）`app/agent/tools/finance/` 目录发生一次**无任何
+记录**的文件恢复：`indicator_tools.py`（mtime 2026-10-13 22:28）与
+`backtest_tools.py`（mtime 2026-10-13 18:00）两个**已于 2026-10-16 退役**
+的模块以**旧版原样**重新出现在目录里，工具面随之 **49 → 55**（+6 工具：
+`list_indicators` / `get_indicator_params` / `run_indicator_signal` /
+`indicator_analysis` / `run_backtest` / `get_backtest_history`），注册表
+**89 → 95**，schema 全量 51,572 → 55,977 字符，finance py 19 → 21。
+
+### 2 证据链（为何判定"无记录的外部恢复"）
+
+1. **目录时间戳**：全仓同窗口（16:30–17:40）只有 `tools/finance` 一个目录
+   mtime 变动；两个文件自身 mtime 均为 10-13（退役前）⇒ 是**保留时间戳的
+   文件级恢复**（mv / cp -p / 资源管理器复制），不是新写代码。
+2. **无会话记录**：WorkBuddy 会话记录（10-16 退休会话、10-18 对账会话）
+   在该时段零工具调用，全文无任何 mv/cp/Write 这两个文件的记录；opencode
+   存储无 10-18 项目会话痕迹。git 类操作会刷新 mtime，可排除。
+3. **内容为旧版原样**：docstring 与代码均带 10-13 前的形态（无退役标注、
+   无版本化改造痕迹），排除"借恢复之名做新版本"。
+4. **与已登记决定矛盾**：10-16 退休是 documented decision（§2.2 注释、
+   附录 Z 10-18 更新块、`_provider.py` 摘名表注释、`tool_preselect.py`
+   域词典注释、qd_smoke test_30 沿革块五处互证），恢复无对应新决定。
+5. **现状副作用**：`_provider.py` 注释"module 不在扫描树"与
+   `tool_preselect.py`"不再注册/已下线"两处注释**已与代码事实相反**
+   （零名单扫描规则下两模块在树内、6 工具在面内）——不修则误导后人，
+   故本附录登记时同步加了"待裁定"现状标注（见 §4）。
+
+### 3 影响面（实测）
+
+- 6 个工具**仅在按需通道可达**（search_tools / list_tools / activate_tools）；
+  域词典补位表（`tool_preselect.py`）未含它们 ⇒ 不进必注入、不进域兜底，
+  本轮预选注入面不变。实际代价 = 注册表 +6 条目、schema +4,405 字符。
+- 与替代件重复：`run_backtest`/`get_backtest_history` vs
+  `agent_backtest_strategy`/`agent_backtest_svc`（回测桥双泳道）；
+  `run_indicator_signal`/`list_indicators` vs `technical_analysis`
+  （市场指标口径；用户指标策略口径 technical_analysis 未覆盖，10-16 退休时
+  记为"无替代直接退役"）。
+- 测试面：全量 pytest 1423/4/0、qd_smoke 40/40 均不因恢复变红
+  （smoke 只有 ≥87 下限，无"退休工具不得在面"断言）。
+
+### 4 本次处置（推荐方式 → 用户裁定 A 后正式化）
+
+发现时按"不决点先分析后按推荐方式实施"：**不回退文件**（恢复可能有意，
+回退属需用户拍板的大变动），也**不静默洗白**——记录同步到现状并全处标记。
+2026-10-19 用户裁定**分支 A（保留恢复，正式登记）**，随后正式化：
+
+1. §1.1/§2.2/§3.2/§9 数字同步为 95/55/21/26/55,977（本节即为出处）；
+2. 探针基线同步（A1/A3/A6/B1/B2/B5/B7），复跑 99 OK / 0 DRIFT；
+3. `_provider.py` 与 `tool_preselect.py`（两处）的"待裁定"标注已改写为
+   **正式状态说明**：模块在面内、摘名项保持不登记、退休陈述标注为历史；
+4. 本文口径注（§1.1）与 §2.2 树注的"待裁定"字样随本裁定更新为已登记。
+
+### 5 用户裁定与后续清单
+
+- **裁定（2026-10-19）**：**分支 A——保留恢复，正式登记**。`indicator_tools`
+  4 工具 + `backtest_tools` 2 工具维持在工具面内（仅按需通道可达，域词典
+  未纳管）；10-16 退休决定在本附录范围内被用户裁定推翻，相关注释的历史
+  陈述保留但标注"已被裁定推翻"。
+- **分支 B（回退退休）存档不执行**：若日后再要退休，按"移 `del/` 归档 +
+  README + 本文与探针基线回退 89/49/19/24/51,572"执行，并同步本附录。
+- **后续评估（未定时，属独立任务）**：
+  ① 6 个恢复工具与替代件的去留——`run_backtest`/`get_backtest_history` vs
+     `agent_backtest_strategy`/`agent_backtest_svc`（是否重新摘名）；
+     `run_indicator_signal`/`list_indicators` 等 4 个 vs `technical_analysis`
+     （是否纳管 trend 域词典，注意用户指标策略口径后者未覆盖）；
+  ② 防再发断言：smoke 现只有 ≥87 下限，守不住"无记录回填"——建议补
+     "工具面数量/清单变动须与机检基线同步"类断言（数量精确匹配 or
+     退休工具回面须显式登记），立项时优先于摘名/纳管。
+

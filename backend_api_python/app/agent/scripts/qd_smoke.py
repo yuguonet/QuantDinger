@@ -2379,16 +2379,24 @@ def test_38_exec_skill_dispatch_card():
 
 
 def test_39_skill_weight_multiplier():
-    """差距 G 验收（2026-10-10）：权重从 tie-break 升级为排序分乘子。
+    """差距 G 验收（2026-10-10）→ 阶段 5 改制（2026-10-19，方案 §14.3）。
 
-    验收原文：「构造胜率差异明显的技能对，断言高胜率者稳定排前；冷启动（无数据）
-    行为与现状一致」。判据：
-      ① 冷启动（weight 全 1.0）⇒ 乘子=1.0，排序与纯词典分一致（不误伤）；
-      ② 同分技能对：高权重稳定排前，且权重对调后顺序对称翻转（排除名字序假象）；
-      ③ 乘子语义超出 tie-break：高词典分×低权重 能被 低词典分×高权重 反超；
-      ④ 注入阈值仍消费原始词典分（权重只调序不过滤，防回退源码断言）。
+    【改制说明】原验收钉「_rank_skills 权重乘子」——该乘子的数据源
+    `qd_agent_weights.layer='skill'` 已实锤为死链（权重全 1.0 且 n=0、
+    键名错配，阶段 0 基线），且 §14.3 要求技能候选排序的反馈收敛到新链
+    唯一读口 `skill_events.weight_of()`（qd_skill_feedback），旧读口摘除、
+    避免排序双账本。乘子语义随之移入预选 Top-K 池
+    （candidate_index.apply_feedback_rerank：final = base × weight，限幅
+    [0.9,1.1]、只调序不过滤、冷启动恒等；守卫 tests/test_v45_*）。
+
+    本用例改守摘除后的四条不变量（静态/行为均可证）：
+      ① 冷启动（无反馈）⇒ _rank_skills 纯词典分序，2 元组 (分, 名)；
+      ② 注入阈值仍消费 _rank_skills 的原始分（_prefetch 源码防回退）；
+      ③ 旧 layer='skill' 排序读口确已摘除（qd_service 无 _skill_weight /
+         weight_hints / 旧读调用）——排序仅读新反馈 API（§14.3 验收原文）；
+      ④ Top-K 池确已接新反馈软重排（candidate_index 有 apply_feedback_rerank）。
     """
-    print("\n[test_39] 技能权重排序分乘子（G 验收）")
+    print("\n[test_39] 技能排序：旧权重乘子摘除 + 新反馈唯一读口（G→阶段5）")
     try:
         from app.agent import qd_service as QS
     except Exception as e:
@@ -2400,43 +2408,55 @@ def test_39_skill_weight_multiplier():
              {"name": "gamma", "description": "同分技能乙"}]
     # 桩：词典分 alpha=5 > beta=gamma=3（按 name 精确控制，不受描述词面影响）
     _raw = {"alpha": 5, "beta": 3, "gamma": 3}
-    orig_score, orig_weight = QS._skill_score, QS._skill_weight
+    orig_score = QS._skill_score
     try:
         QS._skill_score = lambda hay, keys, msg, ent: next(
             (v for n, v in _raw.items() if n in hay), 0)
 
-        # ① 冷启动
-        QS._skill_weight = lambda name: 1.0
+        # ① 冷启动：纯词典分序（无乘子；分量即总分，2 元组）
         cold = QS._rank_skills(cands, set(), "", False)
-        check("冷启动：乘子=1.0 且排序与纯词典分一致（alpha>beta>gamma 名序）",
-              [t[2] for t in cold] == ["alpha", "beta", "gamma"]
-              and all(t[0] == t[1] for t in cold), str(cold))
+        check("冷启动：纯词典分序 alpha>beta>gamma（名序）且 2 元组 (分,名)",
+              [t[1] for t in cold] == ["alpha", "beta", "gamma"]
+              and all(len(t) == 2 and t[0] == _raw[t[1]] for t in cold),
+              str(cold))
 
-        # ② 同分对：高权重排前 + 权重对调对称翻转
-        w_hi_lo = {"alpha": 1.0, "beta": 0.6, "gamma": 1.4}
-        QS._skill_weight = lambda name: w_hi_lo.get(name, 1.0)
-        r1 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
-        w_swap = {"alpha": 1.0, "beta": 1.4, "gamma": 0.6}
-        QS._skill_weight = lambda name: w_swap.get(name, 1.0)
-        r2 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
-        check("同分对：高权重稳定排前（gamma 前于 beta）", r1[1:] == ["gamma", "beta"], str(r1))
-        check("权重对调 → 顺序对称翻转（排除名字序假象）", r2[1:] == ["beta", "gamma"], str(r2))
-
-        # ③ 乘子反超：alpha(5×0.8=4.0) < gamma(3×1.5=4.5)
-        w_flip = {"alpha": 0.6, "beta": 1.0, "gamma": 2.0}
-        QS._skill_weight = lambda name: w_flip.get(name, 1.0)
-        r3 = [t[2] for t in QS._rank_skills(cands, set(), "", False)]
-        check("乘子语义超出 tie-break：低词典分×高权重可反超",
-              r3 == ["gamma", "alpha", "beta"], str(r3))
-
-        # ④ 阈值消费原始词典分（源码防回退）
+        # ② 注入阈值取原始分（源码防回退）
         import inspect as _inspect
         from app.agent.qd_service import QDAgentService as _Svc
         _src = _inspect.getsource(_Svc._prefetch)
-        check("注入阈值取原始词典分（ranked[0][1]，权重只调序不过滤）",
-              "ranked[0][1]" in _src and "_rank_skills(" in _src, "")
+        check("注入阈值取分量（ranked[0][0]，无乘子、不过滤）",
+              "ranked[0][0]" in _src and "_rank_skills(" in _src, "")
+
+        # ③ 旧 layer='skill' 排序读口摘除（§14.3 验收原文）。
+        #    判据取调用/导入级（非字样）：docstring 说明「旧链保留」是文档，
+        #    文本断言会把文档误判成回接。⚠ 相对导入的 ImportFrom.module 属性
+        #    是 "chain.weight_hints"（无前导点）⇒ 必须 endswith 匹配；
+        #    别名回接（import weight_of as _whw）改不掉 module 与原名。
+        import ast as _ast
+        _qs_src = _inspect.getsource(QS)
+        _tree = _ast.parse(_qs_src)
+        _calls = {getattr(n.func, "id", "") or getattr(n.func, "attr", "")
+                  for n in _ast.walk(_tree) if isinstance(n, _ast.Call)}
+        _mods = {(n.module or "") for n in _ast.walk(_tree)
+                 if isinstance(n, _ast.ImportFrom)}
+        _wh_names = {a.name for n in _ast.walk(_tree)
+                     if isinstance(n, _ast.ImportFrom)
+                     and (n.module or "").endswith("weight_hints")
+                     for a in n.names}
+        check("qd_service 不再读 qd_agent_weights.layer='skill' 排序",
+              "_skill_weight" not in _qs_src
+              and not any(m.endswith("weight_hints") for m in _mods)
+              and not _wh_names
+              and not (_calls & {"weight_of", "snapshot", "feedback_detail"}),
+              "")
+
+        # ④ Top-K 池接新反馈软重排（乘子语义的新家）
+        import app.agent.preselect.candidate_index as _ci
+        check("Top-K 池接新反馈软重排（apply_feedback_rerank + weight_of）",
+              "apply_feedback_rerank" in _inspect.getsource(_ci)
+              and "weight_of" in _inspect.getsource(_ci), "")
     finally:
-        QS._skill_score, QS._skill_weight = orig_score, orig_weight
+        QS._skill_score = orig_score
 
 
 def test_40_c3p_wiring_and_r2_guard():

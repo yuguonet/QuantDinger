@@ -530,7 +530,9 @@ class ToolFaceMixin:
                 #   白白放着没用，报告留了本可避免的"未获取"缺口。
                 #   来源：qd_agent 在预选后、渲染前写好 last_preselect_report；
                 #   此处现算（不落新属性）以守住 qd_agent ≤420 行拆分红线。
-                from .qd_preselect import preselect_additions
+                #   2026-10-19：域词汇表迁入 preselect 包（qd_preselect ≤600 行
+                #   单职责预算），导入路径随迁。
+                from .preselect import preselect_additions
                 additions = preselect_additions(
                     getattr(self, "last_preselect_report", {}) or {})
                 lines += ["[已激活·本轮可直接调用，**不要再** "

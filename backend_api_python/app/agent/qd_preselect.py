@@ -30,7 +30,11 @@ from typing import List
 from .preselect import build_catalog_grouped, build_preselect_messages, parse_plan, lint_selection, apply_lint, get_tool_index, has_domain_hint, capability_domain, fallback_domain_tools, fast_route_tools, detect_domains, shrink_catalog, _preselect_catalog_limit, single_target_default_tools
 # 2026-10-17 skill 进预选：技能目录 + 两个 env 旋钮（QD_PRESELECT_SKILL /
 # QD_PRESELECT_SKILL_TOOLS_MAX），关停时整段不出现（见 _preselect_skill_on）
-from .preselect import build_skill_catalog, _preselect_skill_on, _preselect_skill_tools_max
+# 2026-10-19 阶段3：Top-K 渐进披露为单一入口（QD_PRESELECT_SKILL_TOPK ≤0 时
+# 内部委托 build_skill_catalog 旧全量路径）+ 单一预选目录字符预算（§14.4）
+from .preselect import (build_skill_catalog, build_skill_catalog_topk,
+                        _preselect_skill_on, _preselect_skill_tools_max,
+                        preselect_catalog_chars)
 # 2026-10-17 F14（E3）：O-14 分级目录的触发条件改判 schema 总字符数
 from .preselect import tier_catalog_enabled
 
@@ -43,34 +47,10 @@ _PHASE_IDLE = "idle"
 _PHASE_PRIMED = "primed"
 _PHASE_RUNNING = "running"
 
-# 预选补充域 → 模型面中文标签（2026-10-17 审计 T3）：lint 覆盖补位加进来的
-# 工具，工具地图里必须带原因，否则模型不知道"为什么多出一个没点过的工具"，
-# 实测导致预选 deliverables 要的估值口径被白白放着（报告留"未获取 PE/PB"）。
-PRESELECT_DOMAIN_CN = {
-    "kline": "K线/走势", "trend": "技术面/趋势", "fundflow": "资金流",
-    "sector": "板块/行业", "screen": "选股/筛选", "valuation": "估值/基本面",
-    "chip": "筹码", "volume": "量能", "market": "大盘/市场",
-    "dragon": "龙虎榜", "strategy": "策略/回测", "intel": "情报/新闻",
-    "capital": "两融/资本面", "knowledge": "知识库",
-}
-
-
-def preselect_additions(report: dict) -> dict:
-    """从预选报告里取出「lint 覆盖补位」加进来的工具 → {工具名: 域中文标签}。
-
-    只认 `lint.coverage` 中 `auto_added=True` 的条目（R1 高置信补位）；
-    模型自己点名的不算——那些没有"为什么多出来"的解释负担。
-    """
-    out: dict = {}
-    lint = (report or {}).get("lint") or {}
-    for item in lint.get("coverage") or []:
-        if not isinstance(item, dict) or not item.get("auto_added"):
-            continue
-        tool = item.get("tool")
-        dom = item.get("domain") or ""
-        if tool:
-            out[tool] = PRESELECT_DOMAIN_CN.get(dom, dom or "相关维度")
-    return out
+# 【2026-10-19 阶段3 职责切分】`PRESELECT_DOMAIN_CN` / `preselect_additions` 已迁至
+# `preselect` 包（预选域词汇表属于预选管线知识，不属于 mixin 编排；qd_preselect
+# 因此守住了 ≤600 行单职责预算，见 tests/test_v6_qd_agent_split）。消费方
+# （qd_tool_face / tests/test_v17c）改为从 `app.agent.preselect` 导入。
 
 
 class PreselectMixin:
@@ -380,11 +360,23 @@ class PreselectMixin:
         # 走模板 `{skills}` 槽（贴在工具目录标题行行首）：空串时该行与改造前
         # 逐字一致 ⇒ v9 基线零登记、关停路径零痕迹。关 QD_PRESELECT_SKILL=0
         # ⇒ 整段不出现（守卫 tests/test_v17j_*）。
+        # ★ 2026-10-19 阶段3 Top-K 渐进披露（§5/§14）：技能段不再随总数线性
+        #   增长（阶段 0 实测每技能 +94c）。`build_skill_catalog_topk` 是单一
+        #   入口：QD_PRESELECT_SKILL_TOPK 默认 4（3 常规 + 1 探索位），≤0 内部
+        #   委托旧 build_skill_catalog 全量路径（回退逐位一致）。report 的
+        #   skill_catalog 记 mode/topk/total/shown/hidden/chars/funnel/explore
+        #   供影子对照（阶段 4 事件链消费同一口径）。
         skill_tools_map: dict = {}
         skill_section = ""
+        skill_meta: dict = {"mode": "off", "size": 0}
         if _preselect_skill_on():
-            skill_section, skill_tools_map = build_skill_catalog(getattr(self, "skills", None))
-        report["skill_catalog"] = {"size": len(skill_tools_map)}
+            skill_section, skill_tools_map, skill_meta = build_skill_catalog_topk(
+                getattr(self, "skills", None), query)
+        report["skill_catalog"] = skill_meta
+        # §14.4 单一预选目录字符预算：工具目录 + 技能段 + 固定模板骨架
+        # （不含选中后才加载的技能正文）。与 QD_PRESELECT_TIER_CHARS 同一阈值
+        # 体系，不新增平行技能字符阈值；数值进 report 供影子观测。
+        report["preselect_chars"] = preselect_catalog_chars(catalog, skill_section)
 
         max_tools = max(1, int(self.config.preselect_max_tools))
         # ── 闭环消费端（2026-10-01）：盘后产出的权重在这里影响"选哪些工具" ──

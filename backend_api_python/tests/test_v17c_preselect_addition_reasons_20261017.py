@@ -10,15 +10,18 @@ r"""V17c：预选补充工具**带原因进工具地图**守卫（2026-10-17，�
   **本可避免的自伤**。
 
 ★ 修复
-  `qd_preselect.preselect_additions(report)` 从 lint.coverage 的 auto_added
+  `preselect.preselect_additions(report)` 从 lint.coverage 的 auto_added
   条目派生 {工具: 域中文标签}，qd_agent 每 run 刷新，`_tool_map_text` 在
   已激活段给这些工具加"（预选补充：任务涉及XX）"后缀。
+
+  【2026-10-19 迁入】域词汇表属预选管线知识，自 `qd_preselect` 迁入
+  `preselect` 包（qd_preselect ≤600 行单职责预算）；导入路径随迁，行为不变。
 
 本文件钉死：① 派生函数只认 auto_added ② 地图渲染带原因 ③ 无补充时零附加。
 """
 from __future__ import annotations
 
-from app.agent.qd_preselect import preselect_additions, PRESELECT_DOMAIN_CN  # noqa: E402
+from app.agent.preselect import preselect_additions, PRESELECT_DOMAIN_CN  # noqa: E402
 from app.agent.qd_tool_face import ToolFaceMixin  # noqa: E402
 
 # 中文标签 → 域键（测试夹具用，避免把域键写死在用例里）

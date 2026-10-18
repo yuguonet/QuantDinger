@@ -114,6 +114,13 @@ _SUPERSEDED_BY_MERGE = frozenset({
     # 指标策略模块（finance.indicator_tools）已整体下线：其 list_indicators /
     # run_indicator_signal / get_indicator_params / indicator_analysis 不再注册，
     # 故此处不再登记摘除项（module 不在扫描树，登记亦永不命中）。
+    # ★ 2026-10-19 用户裁定（附录 AN·分支 A：保留恢复）：indicator_tools.py 与
+    #   backtest_tools.py 于 2026-10-18 17:02 恢复（旧版原样回填，用户确认有意），
+    #   两模块现**在扫描树内**（零名单规则只按 `_` 前缀跳过），上述 4+2 个工具
+    #   **已在工具面内**（49→55，附录 AN）。本段"下线/不在扫描树"为 10-16 退休
+    #   决定的历史陈述，已被裁定推翻；摘名项保持不登记（= 工具保留在面）。
+    #   后续评估（未定时）：6 个恢复工具与 agent_* / technical_analysis 替代件的
+    #   去留——重新摘名 or 域词典纳管，见附录 AN §5 后续清单。
 })
 
 # 工具更名/归并的权重迁移表（旧名 → 新名）：chain/evaluator 同步权重表时，

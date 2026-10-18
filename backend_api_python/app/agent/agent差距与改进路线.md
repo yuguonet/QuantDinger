@@ -88,12 +88,12 @@
 **方案**:以 C 的 benchmark 为标尺，对上述 5 个参数做单变量扫描（每次只动一个，跑分对比）;结论写回 `.env.example` 注释。
 **验收**:每个参数有数据支撑的推荐值和敏感度说明（"±1 档掉几分")。
 
-## G. 胜率反哺扩展（部分落地）
+## G. 胜率反哺扩展（2026-10-19 阶段 5 改制：反馈来源换链）
 
-**现状**(2026-10-10 晚代码落地）:`chain/weight_feed`(追责→权重喂数）+ `weight_hints`(四层快照）已落地;权重已从 tie-break 升级为**排序分乘子**——`qd_service._rank_skills`:`score × (0.5 + 0.5×weight)`（weight∈[0.5,2.0] ⇒ 乘子∈[0.75,1.5]）,样本纪律复用写侧（weight_feed n<MIN_SAMPLES 只记账、evaluator n<10 恒 1.0,读侧不重复校验）;**注入阈值仍消费原始词典分**（权重只调序不过滤,与 hint_text/case 同型标签的 fail-open 哲学一致）。tool_preselect 侧的同理接入已随 K 落地（preselect_cooc 共现权重）。
-**差距**:已无（代码+护栏齐;真实权重数据的排序影响待 weight_feed 积累样本后观察）。
-**方案**:（完成）乘子化 + smoke 护栏。
-**验收**:构造胜率差异明显的技能对，断言高胜率者稳定排前 ✅;冷启动（无数据）行为与现状一致 ✅——smoke `test_39_skill_weight_multiplier` 五断言:冷启动乘子=1.0 位序与纯词典分一致 / 同分对高权重排前 / 权重对调对称翻转（排除名字序假象）/ 低词典分×高权重可反超（乘子语义超出 tie-break）/ 阈值源码防回退（ranked[0][1]）。
+**现状**(2026-10-10 落地 → 2026-10-19 改制）:~~`qd_service._rank_skills` 乘子 `score × (0.5 + 0.5×weight)`（weight∈[0.5,2.0]）~~ **已摘除**——其数据源 `qd_agent_weights.layer='skill'` 实锤为死链（权重全 1.0 且 n=0、键名错配，skill 治理阶段 0 基线）。技能效果反馈收敛到新链唯一读口 `skill_events.weight_of()`（新表 `qd_skill_feedback`：版本隔离 + 15 样本门槛 + 限幅 [0.9,1.1]），由预选 Top-K 技能池消费（`candidate_index.apply_feedback_rerank`：`final = base × weight`，只调序不过滤、冷启动恒 1.0 逐位一致、`QD_SKILL_FEEDBACK_RANK=0` 一键回退纯词面）。`_rank_skills`（关键词回落路径）回归纯确定性；旧治理链（evaluator 写入 / skill_brewer.maybe_revise / weight_hints 其余三层）保留只读（§14.3：迁移完成后才另立退役任务）。
+**差距**:关键词回落路径暂无反馈影响（设计取舍：反馈只在 Top-K 池单一真源，避免双账本；真实排序影响待新链积累 ≥15 样本/版本后观察）。
+**方案**:（完成）摘旧读口 + 新链入池 + 灰度开关 + 排序 trace（基础分/反馈权重/样本数/版本/最终分）。
+**验收**:smoke `test_39_skill_weight_multiplier` 已改制为四条不变量:冷启动纯词典分序（2 元组 (分,名)）/ 注入阈值取原始分源码防回退（ranked[0][0]）/ 旧 layer='skill' 读口确已摘除（排序仅读新反馈 API）/ Top-K 池确已接 apply_feedback_rerank；乘子语义（同分对高权重排前、低分词×高权重反超、并列确定性）由 `tests/test_v45_skill_feedback_rerank_20261019.py` 守卫 + 变异检验。
 
 ## H. 成本/时延 SLO
 

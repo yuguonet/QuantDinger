@@ -510,6 +510,22 @@ class AftercareMixin:
             logger.debug("[accountability] 入库跳过(fail-open): %s: %s",
                          type(e).__name__, e)
 
+        # ★ 阶段4（2026-10-19，影子）：技能选择事件回填 trace root + 执行状态。
+        #   executed 判定 = 事件的注入技能出现在本次 trace 的 skill 节点集合
+        #   （planner 真跑过；注入≠执行，§6.2）。全段 fail-soft：事件链是观测
+        #   旁路，挂了不能影响追责主链，更不能影响用户回复。
+        try:
+            _ev = getattr(self, "_skill_event_id", None)
+            if _ev:
+                from .chain import skill_events
+                _nodes = [str(getattr(n, "name", "") or "")
+                          for n in (getattr(collector, "_skill_nodes", None) or [])]
+                skill_events.mark_run_outcome(_ev, trace_root_id=root_id,
+                                              skill_node_names=_nodes)
+        except Exception as e:
+            logger.debug("[skill-events] 执行状态回填跳过(fail-open): %s: %s",
+                         type(e).__name__, e)
+
     # ── 轨迹采集（工具级，闭环②的写侧）──────────────────────────
     def _trace_tool(self, action: dict, result, elapsed_ms: float, error: str = None) -> None:
         """工具调用落 qd_traces（闭环② DB 链，TraceCollector）。"""

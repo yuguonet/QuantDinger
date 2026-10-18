@@ -36,6 +36,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+from . import skill_registry as sr   # 阶段 1（2026-10-19）：身份/门禁/发布/登记单一真源
+
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "skill_brew.txt"
 _AUTO_PREFIX = "auto-"
@@ -139,17 +141,10 @@ def _strip_code_fence(text: str) -> str:
 def _extract_frontmatter_tools(skmd: str) -> list:
     """从 SKILL.md frontmatter 提取 tools 列表（用于真实性校验）。
 
-    兼容两种写法：legacy 顶层 `tools: [a, b]` 与规范 `metadata.tools: a, b`
-    （值可能带引号/方括号，正则不限缩进）。
+    2026-10-19 阶段 1：实现下沉 `skill_registry.extract_frontmatter_tools`（单一真源），
+    本名保留为薄包装（既有调用点/测试不变）。
     """
-    m = re.search(r"^[ \t]*tools:[ \t]*(.+?)[ \t]*$", skmd, re.M)
-    if not m:
-        return []
-    raw = m.group(1).strip()
-    if raw.startswith("[") and raw.endswith("]"):
-        raw = raw[1:-1]
-    raw = raw.strip("'\"")
-    return [t.strip().strip("'\"") for t in raw.split(",") if t.strip()]
+    return sr.extract_frontmatter_tools(skmd)
 
 
 # 元工具/沙箱内置：始终在场，写进 skill tools 白名单只是噪音（LLM 从日志推断时
@@ -157,12 +152,9 @@ def _extract_frontmatter_tools(skmd: str) -> list:
 #
 # 【2026-10-14·D-11 下沉】原为硬编码集合，违反"阈值/口径走 env 或配置层"红线
 # ⇒ 改为 `QD_META_TOOLS`（逗号分隔）可配，默认沿用原 6 个。
-# 【为什么只能配置、不能从 provider 推导】元工具里只有 format_result/web_search
-# 这类来自 `_MUST_HAVE` 模块（provider.get_meta_names() 查得到）；**其余四个
-# （list_tools / search_tools / final_answer / python_interpreter）是框架内置，
-# 根本不进 ToolProvider 注册表** ⇒ 推导必然盖不全，不能假装推导成"零配置"。
-_META_TOOLS_DEFAULT = ("list_tools", "search_tools", "format_result",
-                       "final_answer", "python_interpreter", "web_search")
+# 【2026-10-19·阶段 1】实现再下沉 `skill_registry.meta_tools`（单一真源，门禁与
+# 酿造共用）；本名保留为薄包装。
+_META_TOOLS_DEFAULT = sr._META_TOOLS_DEFAULT
 
 
 def _meta_tools() -> frozenset:
@@ -171,11 +163,7 @@ def _meta_tools() -> frozenset:
     ⚠ 空 env 回落**默认**而不是空集：空集会让元工具名写进 SKILL.md 的 tools
     白名单（噪音，且诱导 planner 去"调用"查工具的工具）。
     """
-    raw = os.getenv("QD_META_TOOLS")
-    if raw is None or not raw.strip():
-        return frozenset(_META_TOOLS_DEFAULT)
-    names = {t.strip() for t in raw.split(",") if t.strip()}
-    return frozenset(names) if names else frozenset(_META_TOOLS_DEFAULT)
+    return sr.meta_tools()
 
 
 def _validate_tools(skmd: str, provider) -> str:
@@ -183,28 +171,19 @@ def _validate_tools(skmd: str, provider) -> str:
 
     LLM 从 Execution logs 推断工具名可能编造；写死不存在的名字 = 执行期必踩坑。
     写回时**保留原有写法**（legacy `[a, b]` 维持方括号，规范 `a, b` 维持逗号串）。
+
+    2026-10-19 阶段 1：实现下沉 `skill_registry.strip_unknown_tools`（单一真源，
+    与发布门禁同一函数——避免"酿造剔一套、门禁认一套"的双口径）。
     """
     if provider is None:
         return skmd
-    meta = _meta_tools()
-    valid = set(provider.get_tool_names()) - meta
-    tools = _extract_frontmatter_tools(skmd)
-    bad = [t for t in tools if t and (t not in valid or t in meta)]
-    if not bad:
-        return skmd
-    kept = [t for t in tools if t not in bad]
-
-    def _repl(m):
-        prefix, value = m.group(1), m.group(2).strip()
-        body = "[" + ", ".join(kept) + "]" if value.startswith("[") else ", ".join(kept)
-        return prefix + body
-
-    fixed = re.sub(
-        r"^([ \t]*tools:[ \t]*)(.*)$",
-        _repl,
-        skmd, count=1, flags=re.M,
-    )
-    logger.warning("[Brewer] 剔除编造的工具名（不在 provider 注册表）: %s", bad)
+    valid = set(provider.get_tool_names()) - _meta_tools()
+    before = _extract_frontmatter_tools(skmd)
+    fixed = sr.strip_unknown_tools(skmd, valid)
+    after = set(sr.extract_frontmatter_tools(fixed))
+    bad = [t for t in before if t not in after]
+    if bad:
+        logger.warning("[Brewer] 剔除编造的工具名（不在 provider 注册表）: %s", bad)
     return fixed
 
 
@@ -245,10 +224,11 @@ def _find_entity_codes(skmd: str) -> list:
     设计文档声称“写死具体代码 = 编译失败重酿”，但此前无任何实现（校验只有
     tools 白名单 + frontmatter 字段），auto-stock-analyze-600929 这类绑定单股
     的技能即由此漏过。此处扫编译产物里的六位实体码（日期/溯源 id 先剥离防误伤）。
+
+    2026-10-19 阶段 1：实现下沉 `skill_registry.find_entity_codes`（单一真源，
+    发布门禁与重酿判据共用）。
     """
-    text = re.sub(r"\d{4}-\d{2}-\d{2}", "", skmd or "")
-    text = re.sub(r"root_id=\d+", "", text)
-    return re.findall(r"(?<!\d)\d{6}(?!\d)", text)
+    return sr.find_entity_codes(skmd)
 
 
 def _generic_violation(skmd: str, sample_name: str = "") -> list:
@@ -256,12 +236,10 @@ def _generic_violation(skmd: str, sample_name: str = "") -> list:
 
     名称级检查：LLM 不写代码却写“贵州茅台”同样绑定单股——样本 root 的
     stock_name 命中产物即违规（名称 ≥2 字才检查，防单字误伤）。
+
+    2026-10-19 阶段 1：实现下沉 `skill_registry.generic_violations`（单一真源）。
     """
-    refs = [f"code:{c}" for c in _find_entity_codes(skmd)]
-    name = str(sample_name or "").strip()
-    if len(name) >= 2 and name in (skmd or ""):
-        refs.append(f"name:{name}")
-    return refs
+    return sr.generic_violations(skmd, sample_name)
 
 
 # ── brew 触发 v2 常量（重设计 §2.5，2026-09-19；S6：字面量 → 命名常量）──
@@ -464,21 +442,67 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
         # 目录名由代码决定（不信任 LLM 输出的 name——它可能改前缀/连字符风格）；
         # frontmatter 里的 name 仅作展示，_scan_markdown 的 display 映射会兜住。
         final_name = skill_name
-        skmd = _validate_tools(skmd, provider)
+
+        # ── 容量门（§4.3/§15.1，2026-10-19 阶段 1）──
+        # 达上限 ⇒ 新候选转待审队列：不覆盖、不删除、不改写存量技能。
+        if not sr.capacity_available():
+            logger.info("[Brewer] 自动技能容量已满（cap=%d）⇒ chain=%s 转待审，不覆盖存量",
+                        sr.auto_skill_cap(), chain_name)
+            results.append({"chain_name": chain_name, "status": "capacity_deferred",
+                            "cap": sr.auto_skill_cap()})
+            continue
+
+        # ── 生成验证关卡（§7，2026-10-19 阶段 1）──
+        # 格式 → 契约（工具真实性剔除，既有语义由此接管）→ 通用性 → 近重复；
+        # 任一硬失败 ⇒ 不落盘（上方的泛化重试/格式预检保留为"带提醒重酿一次"的
+        # 触发判据，本门禁是发布的最终裁决）。
+        try:
+            from ..skills_adapter import QDSkillAdapter
+            active_infos = QDSkillAdapter().list_skills()
+        except Exception as e:
+            logger.debug("[Brewer] active 技能清单获取失败（跳过去重门，fail-open）: %s", e)
+            active_infos = None
+        gate = sr.validate_gates(
+            skmd, skill_id=final_name,
+            provider_tools=(provider.get_tool_names() if provider is not None else None),
+            sample_name=_sample_name, active_infos=active_infos)
+        if not gate.ok:
+            logger.info("[Brewer] chain=%s 门禁未过（%s）: %s",
+                        chain_name, gate.status, gate.issues[:3])
+            results.append({"chain_name": chain_name, "status": gate.status,
+                            "issues": gate.issues[:5]})
+            continue
+        skmd = gate.skmd
+
         skill_dir = _SKILLS_DIR / final_name
         skill_dir.mkdir(parents=True, exist_ok=True)
         header = (f"<!-- auto-brewed {date.today().isoformat()} from root_id="
                   f"{cand['sample_root_id']} chain={chain_name} | "
                   f"{_HUMAN_EDITED_MARK} 后请去除 auto- 前缀接管 -->\n")
         # B3：溯源注释放 frontmatter 之后，保证 _parse_skill_md 能读到 name/description/tools
-        (skill_dir / "SKILL.md").write_text(_compose_skill_doc(header, skmd), encoding="utf-8")
-        logger.info("[Brewer] 酿成技能: %s (chain=%s)", final_name, chain_name)
-        results.append({"chain_name": chain_name, "status": "brewed", "skill_dir": final_name})
+        doc = _compose_skill_doc(header, skmd)
+        # ── 事务性发布（§7.6）：staging + 原子替换，失败不留半发布状态 ──
+        sr.publish_skill_doc(skill_dir / "SKILL.md", doc)
+        # ── 版本登记（§4.1：内容摘要版本 ID；fail-soft，DB 不可用不挡发布）──
+        version = sr.content_digest(doc)
+        sr.register_version(
+            skill_id=final_name, version=version,
+            description=gate.description, facets=gate.facets,
+            declared_tools=gate.declared_tools,
+            body_uri=str(skill_dir / "SKILL.md"),
+            validation_state="validated", validation_report=gate.report,
+            source_chain=chain_name, semver=sr.frontmatter_semver(skmd))
+        logger.info("[Brewer] 酿成技能: %s (chain=%s, version=%s)",
+                    final_name, chain_name, version[:8])
+        results.append({"chain_name": chain_name, "status": "brewed",
+                        "skill_dir": final_name, "version": version})
         set_brew_state(chain_name, last_brew_date=_today, fail_streak=0)
 
-    # 失败/跳过链也记尝试日期（兜底节奏由 brew_state 驱动；失败连续计数驱动冷却）
+    # 失败/跳过链也记尝试日期（兜底节奏由 brew_state 驱动；失败连续计数驱动冷却）。
+    # capacity_deferred / duplicate 不是酿造失败：不计 fail_streak（冷却是给"修不好"
+    # 的链用的），也不记 last_brew_date（容量可能很快释放，压 7 天反而误事）。
     for r in results:
-        if r["status"] not in ("brewed", "exists"):
+        if r["status"] not in ("brewed", "exists", "capacity_deferred", "duplicate"):
             set_brew_state(r["chain_name"], last_brew_date=_today,
                            fail_streak=(states.get(r["chain_name"], {}).get("fail_streak", 0) + 1))
     return results
@@ -580,7 +604,9 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
     if "name:" not in new_doc or "description:" not in new_doc:
         return {"chain_name": chain_name, "status": "bad_format"}
 
-    # tools 白名单真实性校验（与首酿同规则）
+    # tools 白名单真实性校验（与首酿同规则；2026-10-19 起由发布门禁统一裁决，
+    # 这里的直调保留为"修订版工具清洗"的既有行为，门禁会再跑一遍同函数 ⇒ 幂等）
+    provider = None
     try:
         from ..tools._base import ToolProvider
         provider = ToolProvider.get_default()
@@ -601,6 +627,19 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
                      lambda mm: mm.group(1) + new_version,
                      new_doc, count=1, flags=re.M)
 
+    # ── 发布门禁（§7，2026-10-19 阶段 1）：格式/契约/通用性（修订不跑近重复门——
+    #    与自身 active 版本比必中；重复性由首酿门禁与 maybe_revise 治理负责）──
+    gate = sr.validate_gates(
+        new_doc, skill_id=Path(skill_dir).name,
+        provider_tools=(provider.get_tool_names() if provider is not None else None),
+        sample_name="", active_infos=None)
+    if not gate.ok:
+        logger.info("[Brewer] 修订门禁未过 %s（%s）: %s——保留原 active 版本",
+                    skill_dir, gate.status, gate.issues[:3])
+        return {"chain_name": chain_name, "status": gate.status,
+                "issues": gate.issues[:5]}
+    new_doc = gate.skmd
+
     # 护栏 3：.bak 回滚点（2026-09-24 升级为轮转归档，保留 BREW_BAK_KEEP 份）
     _snapshot_bak(skill_path)
 
@@ -611,7 +650,18 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
               f"chain={chain_name} | revision={rev['revision'] + 1} | "
               f"pre_weight={pre_weight if pre_weight is not None else 'NA'} | "
               f"{_HUMAN_EDITED_MARK} 后请去除 auto- 前缀接管 -->\n")
-    skill_path.write_text(_compose_skill_doc(header, new_doc), encoding="utf-8")
+    # ── 事务性发布（§7.6）：staging + 原子替换；失败不留半发布状态 ──
+    doc = _compose_skill_doc(header, new_doc)
+    sr.publish_skill_doc(skill_path, doc)
+    # ── 新版本登记（§4.1：内容摘要版本 ID；fail-soft）──
+    version = sr.content_digest(doc)
+    sr.register_version(
+        skill_id=Path(skill_dir).name, version=version,
+        description=gate.description, facets=gate.facets,
+        declared_tools=gate.declared_tools,
+        body_uri=str(skill_path),
+        validation_state="validated", validation_report=gate.report,
+        source_chain=chain_name, semver=new_version)
 
     # 护栏 2 真落地（2026-09-24，设计 §3.17）：修订完成 → 权重重置 1.0、sample_count 归零
     # （新版本重新积累）。旧实现这里写的是 set_brew_state(fail_streak=0)——**写错了行**，

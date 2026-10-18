@@ -45,6 +45,11 @@ from .tool_preselect import (
     # 2026-10-17 skill 进预选（技能目录 / skill 字段解析 / 两个 env 旋钮）
     build_skill_catalog, parse_skill_field,
     _preselect_skill_on, _preselect_skill_tools_max, _SKILL_LINE,
+    # 2026-10-19 阶段3 Top-K 渐进披露（§5/§14.1/§14.2/§14.4/§15.2）
+    build_skill_catalog_topk, _preselect_skill_topk,
+    preselect_catalog_chars, _PRESELECT_FIXED_CHARS,
+    # 预选补充域中文标签（2026-10-19 自 qd_preselect 迁入：域词汇表属预选知识）
+    PRESELECT_DOMAIN_CN, preselect_additions,
 )
 from .preselect_cooc import (
     build_weights, get_weights, heldout_recall, load_pairs,
@@ -80,6 +85,11 @@ __all__ = [
     # skill 进预选（2026-10-17）
     "build_skill_catalog", "parse_skill_field",
     "_preselect_skill_on", "_preselect_skill_tools_max", "_SKILL_LINE",
+    # Top-K 渐进披露（2026-10-19 阶段3）
+    "build_skill_catalog_topk", "_preselect_skill_topk",
+    "preselect_catalog_chars", "_PRESELECT_FIXED_CHARS",
+    # 预选补充域中文标签（2026-10-19 迁入）
+    "PRESELECT_DOMAIN_CN", "preselect_additions",
     # 组注册表（T7 group 单位唯一事实源，2026-10-17）
     "CODING_NATIVE_TOOLS", "GROUP_DESC", "expand_overrides", "group_members",
     # 共现权重

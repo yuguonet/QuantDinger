@@ -136,8 +136,12 @@ def _stand(tools: dict, *, skills=None, response: str = "",
 
 
 _SKILLS = [
+    # 【2026-10-19 阶段3 fixture 调整】Top-K 词面门（QD_SKILL_MIN_SCORE=2）下，
+    # 薄描述不过门 ⇒ 技能段空 ⇒ 声明工具补位契约无从验证。真实技能描述本就含
+    # "分析/复盘/调研"（见 skills/auto-agent/SKILL.md），标准问法"分析600519"
+    # 可过门；夹具补成同型措辞，守卫意图（补位加法/陈旧声明/常驻层双计）不变。
     {"name": "auto-agent", "type": "markdown",
-     "description": "个股资本面尽调：K线走势、筹码分布、融资融券与资金流向画像",
+     "description": "个股资本面尽调分析：K线走势复盘、筹码分布、融资融券与资金流向画像",
      "tools": ["agent_get_kline", "get_chip_distribution", "get_capital_summary"]},
     {"name": "auto-backtest", "type": "markdown",
      "description": "策略回测与参数对照", "tools": []},
@@ -153,8 +157,14 @@ def _plan(skill=None, tools=("get_realtime_quote",)) -> str:
 
 @pytest.fixture(autouse=True)
 def _clean_skill_env(monkeypatch):
-    """每个用例从"无技能旋钮 env"的干净态开始（默认开 ⇒ 走新路径）。"""
+    """每个用例从"无技能旋钮 env"的干净态开始（默认开 ⇒ 走新路径）。
+
+    【2026-10-19 阶段3】补删 Top-K 三旋钮：默认值（Top-K=4 / 门槛=2 / TTL=14）
+    即生产路径，守卫必须跑在默认态而不是被别的用例泄漏的 env 带上歧路。
+    """
     for var in ("QD_PRESELECT_SKILL", "QD_PRESELECT_SKILL_TOOLS_MAX",
+                "QD_PRESELECT_SKILL_TOPK", "QD_SKILL_MIN_SCORE",
+                "QD_SKILL_EXPLORE_TTL_DAYS",
                 "QD_PRESELECT_CATALOG_MAX", "QD_TOOL_CONNECT", "QD_ON_DEMAND_TOOLS"):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -232,8 +242,9 @@ def agent_in(tool: str, report: dict) -> bool:
 def test_declared_stale_name_is_loud(caplog):
     """技能声明了注册表里没有的工具（frontmatter 陈旧）⇒ 留痕，不得静默 pass。"""
     import logging
+    # 【2026-10-19 阶段3】描述含"分析" ⇒ 过 Top-K 词面门（与真实 frontmatter 同型）
     stale = [{"name": "old-skill", "type": "markdown",
-              "description": "旧技能：仍写着已改名的工具",
+              "description": "旧技能分析：仍写着已改名的工具",
               "tools": ["get_fund_flow_daily", "agent_get_kline"]}]
     tools = _fn_tools("agent_get_kline")
     s = _stand(tools, skills=_FakeSkills(stale), response=_plan("old-skill"))
@@ -249,7 +260,8 @@ def test_declared_core_tool_not_double_counted():
     """声明工具在**常驻层**（不在按需合法集）⇒ 既不加也不报 unknown。"""
     tools = _fn_tools("agent_get_kline")            # 按需
     tools["get_realtime_quote"] = object()          # 非 FnToolAdapter ⇒ 常驻层
-    skills = [{"name": "auto-agent", "type": "markdown", "description": "个股尽调",
+    # 【2026-10-19 阶段3】描述含"分析" ⇒ 过 Top-K 词面门
+    skills = [{"name": "auto-agent", "type": "markdown", "description": "个股尽调分析",
                "tools": ["get_realtime_quote", "agent_get_kline"]}]
     s = _stand(tools, skills=_FakeSkills(skills), response=_plan("auto-agent"))
     rep = s._maybe_preselect_tools("分析600519")

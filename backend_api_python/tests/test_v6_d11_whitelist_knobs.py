@@ -258,7 +258,7 @@ def test_prefetch_dispatch_card_forces_run_skill(monkeypatch):
     skills = _FakeSkillsForPrefetch(
         [{"name": "market-screener", "description": "全市场选股"}],
         {"market-screener": "market_screener"})
-    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(4.0, 4, "market-screener")])
+    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(4.0, "market-screener")])
     monkeypatch.setattr(qs, "_executable_skills",
                         lambda: {"market_screener": ("m", ("run",), "run")})
     svc = qs.QDAgentService(skills=skills)
@@ -272,7 +272,7 @@ def test_prefetch_non_executable_skill_does_not_force(monkeypatch):
         [{"name": "auto-agent", "description": "通用"}],
         {"auto-agent": "auto_agent"},
         bodies={"auto-agent": "正文"})
-    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(3.0, 3, "auto-agent")])
+    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(3.0, "auto-agent")])
     monkeypatch.setattr(qs, "_executable_skills", lambda: {})
     svc = qs.QDAgentService(skills=skills)
     report = _prefetch_report(monkeypatch, svc)
@@ -284,7 +284,7 @@ def test_prefetch_pointer_hit_also_forces_run_skill(monkeypatch):
     skills = _FakeSkillsForPrefetch(
         [{"name": "market-screener", "description": "全市场选股"}],
         {"market-screener": "market_screener"})
-    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(4.0, 4, "market-screener")])
+    monkeypatch.setattr(qs, "_rank_skills", lambda *a, **k: [(4.0, "market-screener")])
     monkeypatch.setattr(qs, "_executable_skills",
                         lambda: {"market_screener": ("m", ("run",), "run")})
     svc = qs.QDAgentService(skills=skills)

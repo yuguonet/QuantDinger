@@ -615,7 +615,11 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
             # （update_skill_verify 写子节点），保持 t.correct。
             cur.execute("""
                 SELECT t.name as skill_name, t.factors, r.pnl_pct,
-                       r.hold_days, t.correct, r.exec_date
+                       r.hold_days, t.correct, r.exec_date,
+                       r.id AS root_id,
+                       (SELECT COUNT(*) FROM qd_agent_traces s
+                         WHERE s.root_id = r.id AND s.layer = 'skill'
+                       ) AS skill_node_count
                 FROM qd_agent_traces t
                 JOIN qd_agent_traces r ON r.id = t.root_id
                 WHERE t.layer = 'skill'
@@ -643,6 +647,19 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 _rev = _revisions.get(skill_name)
                 if _rev and _rev.get("revised_at") and exec_date < _rev["revised_at"]:
                     continue
+
+                # ★ 阶段4（2026-10-19，影子）：成熟标签 → 技能选择事件链。
+                #   只喂数据不换排序（§6.5 排序消费在阶段 5 才接）。归因纪律
+                #   （唯一注入+执行+单技能节点）在 skill_events.ingest_trace_labels
+                #   内执行：多技能 root 标 unattributable 排除，不计失败。
+                try:
+                    from .skill_events import ingest_trace_labels
+                    ingest_trace_labels(row["root_id"], skill_name, correct,
+                                        skill_node_count=int(
+                                            row.get("skill_node_count") or 1))
+                except Exception as _ev_e:
+                    logger.debug("[Evaluator] 技能事件标签入库跳过(fail-soft): %s",
+                                 _ev_e)
 
                 # 聚合 skill 交易数据
                 if skill_name not in skill_trades:
@@ -851,6 +868,17 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 stats["revised"] = sum(1 for r in _rev_results if r.get("status") == "revised")
         except Exception as _re:
             logger.warning("[Evaluator] 技能修订调度跳过: %s", _re)
+
+    # ★ 阶段4（2026-10-19，影子）：版本级技能反馈聚合（幂等重算，只写
+    #   qd_skill_feedback 新表，不碰 qd_agent_weights 任何层）。低于样本门槛
+    #   权重恒 1.0 ⇒ 与无反馈基线一致；阶段 5 才把 weight_of 接进排序。
+    try:
+        from .skill_events import aggregate_feedback
+        _fb = aggregate_feedback()
+        if _fb:
+            stats["skill_feedback_versions"] = len(_fb)
+    except Exception as _fb_e:
+        logger.debug("[Evaluator] 技能反馈聚合跳过(fail-soft): %s", _fb_e)
 
     return stats
 

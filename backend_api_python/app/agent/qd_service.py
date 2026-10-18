@@ -80,7 +80,7 @@ def _should_store_assistant(text: str) -> bool:
     return bool((text or "").strip()) and not is_transient_control(text)
 
 
-# ── 技能选择（2026-10-01 重写：词典分 + 范围信号 + 历史权重）─────────────
+# ── 技能选择（2026-10-01 重写：词典分 + 范围信号 + 意图信号）───────────────
 # 【原实现的缺陷·实测取证】纯中文二元组词典匹配，阈值 2 ⇒ 5 条典型问法里只有
 # 2 条命中："帮我分析一下贵州茅台" 只得 1 分（技能描述里没有"茅台"），
 # "帮我查一下平安银行现在多少钱" 得 0 分 —— 最日常的问法反而注入不了技能，
@@ -91,9 +91,15 @@ def _should_store_assistant(text: str) -> bool:
 #   ① 范围信号：由 resolvers 解析出的**标的**决定——有标的 → 个股类技能加分；
 #      无标的 → 全市场筛选类技能加分（这条正是"贵州茅台"类问法缺的那 2 分）。
 #   ② 意图信号：query 里的动作词（分析/查询/策略）与技能描述里的同类词对应加分。
-#   ③ 历史权重是**排序分乘子**（G，2026-10-10：score × (0.5+0.5×weight)，见
-#      _rank_skills）——它来自 qd_agent_weights（盘后产出），初始恒 1.0（乘子 1.0，
-#      冷启动与纯词典序一致）；注入阈值仍看原始词典分（权重只调序不过滤）。
+#   ③ 历史权重乘子（G，2026-10-10）**已摘除**（2026-10-19 阶段 5，§14.3）：
+#      其数据源 `qd_agent_weights.layer='skill'` 实锤为死链（权重全 1.0 且
+#      n=0、键名错配，阶段 0 基线）⇒ 乘子恒 1.0、白占一次快照查询。技能
+#      效果反馈收敛到新链唯一读口 `skill_events.weight_of()`
+#      （qd_skill_feedback，版本隔离 + 样本门槛 + 限幅 [0.9,1.1]），由预选
+#      Top-K 池消费（`candidate_index.apply_feedback_rerank`，final = base ×
+#      weight，只调序不过滤）——避免排序双账本。旧治理链（evaluator 写入 /
+#      skill_brewer.maybe_revise / weight_hints 其余三层）保留不动。
+#      本函数（关键词回落路径）回归纯确定性：注入阈值看本函数的原始分。
 _SCOPE_SINGLE = ("单只", "个股", "目标股票")     # 个股类技能
 _SCOPE_SCREEN = ("全市场", "筛选")              # 选股/全市场类
 _SCOPE_STRAT = ("策略",)                        # 策略调试类
@@ -289,28 +295,20 @@ def _skill_score(desc_l: str, keys, msg_l: str, has_entity: bool) -> int:
     return base + bonus
 
 
-def _skill_weight(name: str) -> float:
-    """技能历史权重（无记录 = 1.0 中性）。"""
-    try:
-        from .chain.weight_hints import weight_of
-    except ImportError:
-        return 1.0
-    try:
-        return float(weight_of("skill", name, 1.0))
-    except Exception:
-        return 1.0
-
-
 def _rank_skills(cands: list, keys, msg_l: str, has_entity: bool) -> list:
-    """候选技能排序（G，2026-10-10：权重从 tie-break 升级为排序分乘子）。
+    """候选技能排序（纯确定性：词典分 + 范围/意图信号，无 LLM、无权重乘子）。
 
-    返回 [(乘子化分, 原始词典分, name), ...] 按分降序。
-    · 乘子 = 0.5 + 0.5×weight（weight∈[0.5,2.0]，evaluator 写侧口径）⇒ 乘子∈[0.75,1.5]；
-      冷启动无记录 weight=1.0 ⇒ ×1.0，排序与纯词典分 bit 级一致（验收「不误伤」）。
-    · 样本纪律在写侧（weight_feed n<MIN_SAMPLES 只记账、evaluator n<10 恒 1.0），
-      读侧不重复校验；负向词面证据不足时 weight 仍为 1.0 ⇒ 自动回中性。
-    · 注入阈值（_SKILL_INJECT_MIN）消费**原始词典分**——权重只调序不过滤，
-      与 weight_hints.hint_text / case 同型标签一致的 fail-open 哲学。
+    2026-10-19 阶段 5（§14.3）：历史权重乘子摘除——数据源
+    `qd_agent_weights.layer='skill'` 是死链（权重全 1.0 且 n=0，阶段 0
+    实锤），且技能候选排序的反馈来源必须收敛到新链唯一读口
+    `skill_events.weight_of()`（由预选 Top-K 池 `apply_feedback_rerank`
+    消费：final = base × weight，只调序不过滤、冷启动恒等、限幅 [0.9,1.1]）。
+    本函数是**预选不可用时的关键词回落路径**，保持纯确定性基线：排序稳定、
+    可复现，也是反馈重排出问题时的对照基准。旧治理链（evaluator 写入 /
+    skill_brewer.maybe_revise / weight_hints 其余三层）保留不动。
+
+    返回 [(分, name), ...] 按分降序、同名按 name；注入阈值
+    （_SKILL_INJECT_MIN）消费本函数的原始分。
     """
     out = []
     for c in cands:
@@ -320,9 +318,8 @@ def _rank_skills(cands: list, keys, msg_l: str, has_entity: bool) -> list:
         nm = c.get("name") or ""
         sc = _skill_score(hay, keys, msg_l, has_entity)
         if sc > 0:
-            w = _skill_weight(nm)
-            out.append((sc * (0.5 + 0.5 * w), sc, nm))
-    out.sort(key=lambda t: (-t[0], -t[1], t[2]))
+            out.append((sc, nm))
+    out.sort(key=lambda t: (-t[0], t[1]))
     return out
 
 
@@ -522,8 +519,8 @@ class QDAgentService:
                 # 退化为"词典分 + 意图信号"，不会比原实现更差）
                 has_entity = bool((resolve_info or {}).get("entity_code"))
                 ranked = _rank_skills(cands, keys, msg_l, has_entity)
-                best = ranked[0][2] if ranked else None
-                best_score = ranked[0][1] if ranked else 0   # 阈值看原始分（权重只调序）
+                best = ranked[0][1] if ranked else None
+                best_score = ranked[0][0] if ranked else 0   # 阈值看原始分（无乘子）
                 # ★ skill 进预选（2026-10-17）：预选器 LLM 点名的技能作**强提示**
                 #   覆盖关键词 top-1。两个设计判据：
                 #   ① 为什么可信——7 个技能里有 3 个都声明适用"分析某只股票"
@@ -741,8 +738,48 @@ class QDAgentService:
             except Exception as e:
                 logger.debug("[preselect] run 前预选失败（fail-open，转 _run_inner 原路径）"
                              ": %s: %s", type(e).__name__, e)
+            # ★ 阶段4（2026-10-19，影子）：技能选择事件链（fail-soft，不换排序）。
+            #   候选快照 = 预选 report 的 skill_catalog.candidates（eligible 全集 +
+            #   分数 + 曝光标记，漏斗 eligible_but_not_exposed 的判据源）；选中技能
+            #   版本在**选择时刻冻结**（registry active_version），后续文件变更
+            #   不改写历史事件（§6.2）。注入/执行状态由 prefetch 与收尾回填。
+            agent._skill_event_id = None
+            try:
+                import uuid as _uuid
+                from .chain import skill_events as _se
+                from .chain import skill_registry as _sr
+                _sk_rep = getattr(agent, "last_preselect_report", None) or {}
+                _sk_cat = _sk_rep.get("skill_catalog") or {}
+                _sel = str(_sk_rep.get("skill") or "")
+                _sel_ver = ""
+                if _sel:
+                    _sel_id = _sr.resolve_skill_id(getattr(agent, "skills", None), _sel)
+                    _sel_ver = _sr.get_active_version(_sel_id) or ""
+                agent._skill_event_id = _se.record_selection(
+                    request_id=_uuid.uuid4().hex,
+                    session_id=session_id,
+                    query=message,
+                    candidates=_sk_cat.get("candidates") or [],
+                    selected_skill_id=_sel, selected_version=_sel_ver)
+            except Exception as e:
+                logger.debug("[skill-events] 选择事件记录跳过(fail-open): %s: %s",
+                             type(e).__name__, e)
             task, prefetch_report = self._prefetch(message, session_id, resolve_info,
                                                    skill_hint=skill_hint)
+            # ★ 阶段4（续）：实际注入的技能（可能是关键词回落 top-1，非 planner
+            #   点名）标记到事件——选中与注入是两个状态（§6.2 漏斗第③段）。
+            try:
+                _ev = getattr(agent, "_skill_event_id", None)
+                _inj = str(prefetch_report.get("skill_resolved") or "")
+                if _ev and _inj:
+                    from .chain import skill_events as _se2
+                    from .chain import skill_registry as _sr2
+                    _inj_id = _sr2.resolve_skill_id(getattr(agent, "skills", None), _inj)
+                    _se2.mark_injected(_ev, _inj_id,
+                                       _sr2.get_active_version(_inj_id) or "")
+            except Exception as e:
+                logger.debug("[skill-events] 注入标记跳过(fail-open): %s: %s",
+                             type(e).__name__, e)
             try:
                 agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
             except Exception as e:

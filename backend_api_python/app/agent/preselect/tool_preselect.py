@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -107,9 +108,14 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
 
     ("trend", ("技术面", "趋势", "形态", "支撑", "压力", "突破", "macd", "kdj", "rsi",
                "指标", "多头", "空头", "背离"),
-     # analyze_trend / get_indicator_snapshot → technical_analysis；
-     # indicator_tools 模块已并入 technical_analysis（run_indicator_signal /
-     # list_indicators 不再注册），指标类查询一律走 technical_analysis
+    # analyze_trend / get_indicator_snapshot → technical_analysis；
+    # indicator_tools 模块已并入 technical_analysis（run_indicator_signal /
+    # list_indicators 不再注册），指标类查询一律走 technical_analysis
+    # ★ 2026-10-19 用户裁定（附录 AN·分支 A）：indicator_tools.py 于 10-18 17:02
+    #   恢复（用户确认有意），run_indicator_signal / list_indicators /
+    #   get_indicator_params / indicator_analysis 现**已在工具面内**（仅按需通道
+    #   可达，本域词典未纳管）。本条为 10-16 退休决定的历史陈述；后续评估：
+    #   4 个指标工具是否纳管本词典（技术分析域），见附录 AN §5 后续清单。
      ("technical_analysis", "analyze_pattern",
       "analyze_chart_patterns")),
 
@@ -158,6 +164,10 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
                   "交易信号", "策略信号", "买入信号", "卖出信号", "交易记录"),
      # run_backtest / get_backtest_history 已下线：回测桥工具更名为
      # agent_backtest_strategy（auto 泳道）/ agent_backtest_svc（指标·脚本泳道）
+     # ★ 2026-10-19 用户裁定（附录 AN·分支 A）：backtest_tools.py 于 10-18 17:02
+     #   恢复（用户确认有意），run_backtest / get_backtest_history 现**已在工具
+     #   面内**（仅按需通道可达，本域词典未纳管）。本条为 10-16 退休决定的历史
+     #   陈述；后续评估：与 agent_backtest_* 双泳道的去留，见附录 AN §5 后续清单。
      ("list_strategies", "get_strategy_detail", "get_strategy_trades",
       "start_strategy", "stop_strategy",
       "agent_backtest_strategy", "agent_backtest_svc")),
@@ -820,6 +830,12 @@ _preselect_prompts = _load_prompt_doc("tool_preselect")
 PRESELECT_SYSTEM = _preselect_prompts["system"]
 PRESELECT_PROMPT = _preselect_prompts["user"]
 
+#: §14.4 固定模板骨架 = system + user 模板空槽（query/already/catalog/history/
+#: skills/max_tools 全空）的字符数。`preselect_catalog_chars` 用它补足"预选
+#: 那一轮输入"里与目录无关的固定部分；口径单一可复现（同模板同值）。
+_PRESELECT_FIXED_CHARS = len(PRESELECT_SYSTEM) + len(PRESELECT_PROMPT.format(
+    query="", already="", catalog="", max_tools=0, history="", skills=""))
+
 
 def shrink_catalog(query: str, names: Sequence[str],
                    defs_by_name: Dict[str, dict],
@@ -978,6 +994,12 @@ def schema_chars_of(defs_by_name) -> int:
     （O-14 原文「工具面破 120 个」）的盲区。
     口径：与探针 `tmp/_schema_stats.py` 一致，即 `json.dumps(defs, ensure_ascii=False)`
     的长度（同一份 dict 稳定可复现）。
+
+    【§14.4 口径边界（2026-10-19）】本函数是**工具 schema 专用**度量，回答
+    "工具面本身多胖"；预选那一轮输入的**总字符预算**（工具目录 + 技能候选段 +
+    固定模板，不含选中后才加载的正文）由 `preselect_catalog_chars` 度量。
+    两者分工明确、不得混称：`QD_PRESELECT_TIER_CHARS` 仍是唯一阈值 env，
+    不新增平行的技能字符阈值。
     """
     try:
         return len(json.dumps(defs_by_name, ensure_ascii=False))
@@ -990,6 +1012,10 @@ def _preselect_tier_chars() -> int:
 
     env `QD_PRESELECT_TIER_CHARS`，默认 60000（源报告 `:41-45` 建议值）。
     0/负 = 恒触发分级（等价改造前「无条件收窄」的行为，回退开关）。
+
+    【§14.4】本阈值只管**工具面分级触发**；技能候选的规模由 Top-K 计数
+    （`QD_PRESELECT_SKILL_TOPK`）治理、总输入由 `preselect_catalog_chars`
+    观测——三者各司其职，不存在第二个字符阈值。
     """
     raw = (os.getenv("QD_PRESELECT_TIER_CHARS") or "60000").strip()
     try:
@@ -1003,6 +1029,10 @@ def tier_catalog_enabled(defs_by_name) -> bool:
 
     高于阈值 ⇒ 启用（只展开命中域，省预选那一轮的目录 token）；
     低于阈值 ⇒ 不分级（面本就便宜，全量目录给足命中率）。
+
+    【§14.4】触发判据保持 F14 冻结口径（工具 schema 字符数）；技能段是否
+    膨胀不在本函数判据内——技能侧由 Top-K 从结构上封顶（段长与技能总数
+    脱钩），无需第二个字符触发器。
     """
     thr = _preselect_tier_chars()
     if thr <= 0:
@@ -1029,6 +1059,25 @@ def tier_catalog_enabled(defs_by_name) -> bool:
 # 说明，不落模板 ⇒ 关停路径与改造前**逐位一致**。
 _SKILL_LINE = "{name} | {desc} | 声明工具: {tools}"
 
+#: 技能段段头（全量与 Top-K 两条路径共用同一契约文案——分叉必然漂移）。
+_SKILL_CATALOG_HEAD = (
+    "【技能候选·先选技能，再选工具】每行：技能名 | 适用场景 | 声明工具\n"
+    "技能是方法论，优先于工具：先挑最匹配本任务的一个技能；没有匹配的就把\n"
+    "JSON 的 skill 字段填 null（技能名必须逐字来自本段，禁止编造）。\n"
+    "选了某技能后，它「声明工具」里你没点到的会自动补进工具面（按声明顺序，"
+    "受工具面容量约束），无需重复点名。\n"
+    "输出 JSON 时新增 \"skill\" 字段：填上面某个技能名，或 null。\n"
+)
+
+#: §14.1 可见性兜底指针：截断后告知尚有多少可用技能 + 发现路径 + 禁编造。
+#: 【为什么不列名】列了未展示的名 ⇒ 模型照抄幻觉名与真名无从分辨（P14 事故
+#: 同型：指针行只说"另有 N 个"不列名，正是当年能力层的修法）；只给计数与路径。
+_SKILL_POINTER = (
+    "另有 {n} 个可用技能未在本段展示（与本任务相关度未过门槛或探索轮换未至）。"
+    "可用 list_skills() 查看全部可用技能、read_skill() 读取其正文；"
+    "技能名必须逐字来自本段，不得编造未展示名称。"
+)
+
 
 def _preselect_skill_on() -> bool:
     """技能目录是否进预选（`QD_PRESELECT_SKILL`，默认开；"0"/"false" 关）。
@@ -1038,6 +1087,16 @@ def _preselect_skill_on() -> bool:
     """
     return (os.getenv("QD_PRESELECT_SKILL") or "1").strip().lower() \
         not in ("0", "false", "no", "off")
+
+
+def _preselect_skill_topk() -> int:
+    """技能目录 Top-K（`QD_PRESELECT_SKILL_TOPK`，默认 4；0/负 = 旧全量路径）。
+
+    §15.2：4 = 3 常规排序位 + 1 合格新技能探索位。0/负 时
+    `build_skill_catalog_topk` 内部委托旧 `build_skill_catalog`（逐位一致）。
+    """
+    from .candidate_index import skill_topk
+    return skill_topk()
 
 
 def _preselect_skill_tools_max() -> int:
@@ -1094,17 +1153,215 @@ def build_skill_catalog(skills) -> Tuple[str, Dict[str, List[str]]]:
             tools=",".join(tools) if tools else "（未声明）"))
     if not lines:
         return "", {}
-    head = (
-        "【技能候选·先选技能，再选工具】每行：技能名 | 适用场景 | 声明工具\n"
-        "技能是方法论，优先于工具：先挑最匹配本任务的一个技能；没有匹配的就把\n"
-        "JSON 的 skill 字段填 null（技能名必须逐字来自本段，禁止编造）。\n"
-        "选了某技能后，它「声明工具」里你没点到的会自动补进工具面（按声明顺序，"
-        "受工具面容量约束），无需重复点名。\n"
-        "输出 JSON 时新增 \"skill\" 字段：填上面某个技能名，或 null。\n"
-    )
     # 尾随空行：模板里 {skills} 与"候选工具目录"标题**同行**，段后必须换行
     # 才能让标题起新行（空串时整行与改造前逐字一致）。
-    return head + "\n".join(lines) + "\n\n", tmap
+    return _SKILL_CATALOG_HEAD + "\n".join(lines) + "\n\n", tmap
+
+
+def _render_skill_section(shown, total: int) -> Tuple[str, Dict[str, List[str]]]:
+    """展示集 → (段文本, 声明工具映射)。`shown` 为 Candidate 序列（含 name/desc/tools）。
+
+    与 `build_skill_catalog` 同行格式（`_SKILL_LINE`）同口径；差异只在**展示集
+    来源**（Top-K 截断 + 探索位）与截断后的可见性兜底指针（§14.1）。
+    """
+    lines: List[str] = []
+    tmap: Dict[str, List[str]] = {}
+    for c in shown:
+        tools = [str(t).strip() for t in (c.declared_tools or []) if str(t).strip()]
+        tmap[c.name] = tools
+        desc = _one_line(c.description, 60) or "（无说明）"
+        lines.append(_SKILL_LINE.format(
+            name=c.name, desc=desc,
+            tools=",".join(tools) if tools else "（未声明）"))
+    hidden = max(0, int(total) - len(lines))
+    if hidden > 0:
+        lines.append(_SKILL_POINTER.format(n=hidden))
+    if not lines:
+        return "", {}
+    return _SKILL_CATALOG_HEAD + "\n".join(lines) + "\n\n", tmap
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  五之三、预选补充域中文标签（2026-10-19 自 qd_preselect.py 迁入）
+# ═══════════════════════════════════════════════════════════════════════════
+# 【为什么迁这里】域词汇表是**预选管线知识**（DATA_DOMAINS 同家的中文面），
+# 不属于 qd_preselect 的 mixin 编排职责；qd_preselect 因此守住 ≤600 行单职责
+# 预算（tests/test_v6_qd_agent_split）。纯函数 + 常量，零行为变化。
+
+#: 预选补充域 → 模型面中文标签（2026-10-17 审计 T3）：lint 覆盖补位加进来的
+#: 工具，工具地图里必须带原因，否则模型不知道"为什么多出一个没点过的工具"，
+#: 实测导致预选 deliverables 要的估值口径被白白放着（报告留"未获取 PE/PB"）。
+PRESELECT_DOMAIN_CN = {
+    "kline": "K线/走势", "trend": "技术面/趋势", "fundflow": "资金流",
+    "sector": "板块/行业", "screen": "选股/筛选", "valuation": "估值/基本面",
+    "chip": "筹码", "volume": "量能", "market": "大盘/市场",
+    "dragon": "龙虎榜", "strategy": "策略/回测", "intel": "情报/新闻",
+    "capital": "两融/资本面", "knowledge": "知识库",
+}
+
+
+def preselect_additions(report: dict) -> dict:
+    """从预选报告里取出「lint 覆盖补位」加进来的工具 → {工具名: 域中文标签}。
+
+    只认 `lint.coverage` 中 `auto_added=True` 的条目（R1 高置信补位）；
+    模型自己点名的不算——那些没有"为什么多出来"的解释负担。
+    """
+    out: dict = {}
+    lint = (report or {}).get("lint") or {}
+    for item in lint.get("coverage") or []:
+        if not isinstance(item, dict) or not item.get("auto_added"):
+            continue
+        tool = item.get("tool")
+        dom = item.get("domain") or ""
+        if tool:
+            out[tool] = PRESELECT_DOMAIN_CN.get(dom, dom or "相关维度")
+    return out
+
+
+def build_skill_catalog_topk(skills, query: str, *, topk: Optional[int] = None,
+                             now: Optional[float] = None,
+                             exposure: Optional[dict] = None
+                             ) -> Tuple[str, Dict[str, List[str]], dict]:
+    """Top-K 渐进披露技能目录（2026-10-19 阶段 3 §5/§14.1/§14.2/§14.4/§15.2；
+    阶段 5 增反馈软重排 §14.3/§15.4）。
+
+    【单一入口】`QD_PRESELECT_SKILL_TOPK ≤ 0` ⇒ 内部委托旧 `build_skill_catalog`
+    全量路径并返回 `mode="full"`（回退逐位一致由构造保证）；>0 ⇒ Top-K 路径。
+
+    Top-K 路径：
+      ① 候选构建（candidate_index，只带轻量字段，不常驻正文）+ 硬约束过滤
+         （非 active 剔除；registry 不可用 fail-open 保留全集）；
+      ② `rank_skills_scored` 词面分池：≥ `QD_SKILL_MIN_SCORE` 才 eligible，
+         无达标 ⇒ 空池（无匹配不强配，§15.2 允许 planner 输出 null）；
+      ②b `apply_feedback_rerank`（阶段 5）：final = base ×
+         `skill_events.weight_of(skill_id, version)` 轻量重排——新反馈链是
+         候选排序唯一反馈来源（§14.3），只调序不过滤，冷启动/失败恒 1.0
+         逐位一致；`QD_SKILL_FEEDBACK_RANK=0` 回退纯词面（影子留痕）；
+      ③ 常规位 = 分数序前 `K-1`（K≥2）；探索位 = `select_explore` 从落选
+         eligible 里挑 TTL 内新发布且未近期曝光者（有界轮换，§14.2）；
+      ④ 渲染同旧行格式 + 可见性兜底指针（§14.1：另有 N 个可用技能，经
+         `list_skills()` 发现、`read_skill()` 读取；不得编造未展示名称）。
+
+    Args:
+        exposure: 曝光状态注入（测试用；None = 进程级全局，加锁）。
+        now: 当前时间戳（测试注入；None = time.time()）。
+
+    Returns:
+        (段文本, 技能→声明工具映射, 元数据)。元数据供 report 影子对照：
+        {mode, topk, total, size, shown, regular, hidden, chars,
+         explore:{picked, candidates, exhausted, ttl_days,
+                  recent_published_known},
+         funnel:{eligible, exposed, eligible_but_not_exposed},
+         feedback:{enabled, would_reorder, weights}}。
+        `candidates` 为 eligible 全集快照（阶段 4 事件链消费）：每条含
+        skill_id/version/base_score/fb_weight/fb_samples/final_score/
+        exposed/reasons。
+    """
+    from .candidate_index import (build_skill_candidates, filter_available,
+                                  rank_skills_scored, select_explore,
+                                  explore_ttl_days, skill_topk,
+                                  apply_feedback_rerank)
+    from ..chain import skill_registry as _sr
+
+    k = skill_topk() if topk is None else max(0, int(topk))
+    now_ts = time.time() if now is None else float(now)
+    if k <= 0:
+        sec, tmap = build_skill_catalog(skills)
+        return sec, tmap, {"mode": "full", "topk": 0, "size": len(tmap)}
+
+    meta: Dict[str, Any] = {
+        "mode": "topk", "topk": k, "total": 0, "size": 0, "shown": [],
+        "regular": [], "hidden": 0, "chars": 0,
+        "explore": {"picked": "", "candidates": 0, "exhausted": False,
+                    "ttl_days": explore_ttl_days(),
+                    "recent_published_known": False},
+        "funnel": {"eligible": 0, "exposed": 0,
+                   "eligible_but_not_exposed": 0},
+    }
+    if skills is None:
+        return "", {}, meta
+    try:
+        cands = build_skill_candidates(skills)
+    except Exception as e:      # 技能系统不可用 ≠ 预选不可用（fail-open）
+        logger.debug("[preselect] Top-K 技能候选构建失败(fail-open): %s: %s",
+                     type(e).__name__, e)
+        return "", {}, meta
+    skill_cands = [c for c in filter_available(cands) if c.kind == "skill"]
+    meta["total"] = len(skill_cands)
+    if not skill_cands:
+        return "", {}, meta
+
+    eligible = rank_skills_scored(query, skill_cands)
+    meta["funnel"]["eligible"] = len(eligible)
+    # ★ 阶段5（2026-10-19）：技能效果反馈软重排（§14.3：新链是技能候选
+    #   排序唯一反馈来源）。final = base × skill_events.weight_of(skill_id,
+    #   version)；只调序不过滤（eligible 集合/注入门槛/探索位资格不变）；
+    #   冷启动/低于门槛/DB 不可用 ⇒ 权重 1.0 ⇒ 与纯词面逐位一致；
+    #   QD_SKILL_FEEDBACK_RANK=0 ⇒ 回退纯词面（meta 仍记影子 would_reorder）。
+    eligible, fb_meta = apply_feedback_rerank(eligible)
+    meta["feedback"] = fb_meta
+    explore_slots = 1 if k >= 2 else 0
+    regular = eligible[:max(0, k - explore_slots)]
+    meta["regular"] = [c.name for c in regular]
+
+    shown = list(regular)
+    rest = eligible[len(regular):]
+    if explore_slots and rest:
+        ttl = explore_ttl_days()
+        try:
+            recent = _sr.recent_published_skill_ids(ttl)
+        except Exception as e:      # 双保险：查询本身已 fail-soft，这里防接口变更
+            logger.debug("[preselect] 探索位发布资格查询异常(fail-closed): %s", e)
+            recent = None
+        pick, exp_meta = select_explore(
+            rest, recent_published=recent, now=now_ts, ttl_days=ttl,
+            exposure=exposure)
+        meta["explore"].update(exp_meta)
+        if pick is not None:
+            shown.append(pick)
+
+    section, tmap = _render_skill_section(shown, meta["total"])
+    meta["shown"] = [c.name for c in shown]
+    meta["size"] = len(tmap)
+    meta["hidden"] = max(0, meta["total"] - len(shown))
+    meta["chars"] = len(section)
+    meta["funnel"]["exposed"] = len(shown)
+    meta["funnel"]["eligible_but_not_exposed"] = max(0, len(eligible) - len(shown))
+    # 候选快照（阶段 4 事件链消费：eligible 全集 + 分数 + 是否曝光 + 理由；
+    # 阶段 5 补反馈重排痕迹：基础分/反馈权重/样本数/最终分——排序可按
+    # ranker/policy 版本复现，§14.3）。版本经 registry 单一真源
+    # （None = 不可用，留空不猜）。
+    _shown_ids = {c.id for c in shown}
+
+    def _fb(c) -> dict:
+        return (c.rank_metadata or {}).get("feedback") or {}
+
+    meta["candidates"] = [{
+        "skill_id": c.id, "name": c.name,
+        "version": c.skill_version or "",
+        "base_score": round(float(c.base_score), 4),
+        "fb_weight": _fb(c).get("weight"),
+        "fb_samples": _fb(c).get("samples"),
+        "final_score": _fb(c).get("final"),
+        "exposed": c.id in _shown_ids,
+        "reasons": list((c.rank_metadata or {}).get("reasons") or []),
+    } for c in eligible]
+    return section, tmap, meta
+
+
+def preselect_catalog_chars(tool_catalog: str, skill_section: str) -> int:
+    """§14.4 单一预选目录字符预算：工具目录 + 技能候选段 + 固定模板骨架。
+
+    【口径】= len(工具目录) + len(技能段) + `_PRESELECT_FIXED_CHARS`
+    （PRESELECT_SYSTEM + PRESELECT_PROMPT 空槽 format 长度）。**不包含**
+    选中后才加载的技能正文/资源，也不含 query/already/history 等会话变量
+    （它们不是目录侧成本，Top-K/预算治理管不到也不该管）。
+    与 `schema_chars_of`（工具 schema 专用口径，F14 冻结）分工：后者回答
+    "工具面本身多胖"，本函数回答"预选那一轮输入总共多大"；`QD_PRESELECT_TIER_CHARS`
+    仍是唯一阈值 env，不新增平行的技能字符阈值。
+    """
+    return (len(tool_catalog or "") + len(skill_section or "")
+            + _PRESELECT_FIXED_CHARS)
 
 
 def parse_skill_field(parsed, body: str, valid_skills: Sequence[str]) -> str:
