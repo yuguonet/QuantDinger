@@ -545,16 +545,17 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                 logger.info("[Evaluator] 已删除 Skill，权重行清理: %s", name)
 
             # ①c 同步 tools：新工具 → INSERT 默认；已删除工具 → DELETE（与 skill 同一张表，layer='tool'）
-            # 注意 tool_provider 在 execute 阶段才惰性初始化；这里独立扫描工具目录（与 ToolProvider 同规则）。
+            # ★ 2026-10-19 修：原实现自建 provider 并硬编码 package_prefix 为 "tools"
+            #   （sys.path 时代写法）。P5 起生产/CLI 都以 backend_api_python 为根、统一
+            #   app.agent.* 口径（cli.py 只挂项目根，app/agent 不进 sys.path），顶层没有
+            #   tools 模块 ⇒ 24 个工具模块 + 2 个元工具全部 ModuleNotFoundError、live_tools
+            #   恒空 ⇒ tool 层同步静默失效（每次盘后评估刷一片 ERROR/WARNING）。
+            #   改走 get_or_build()：前缀从 __module__ 推导（app.agent.tools），且与主
+            #   工具面（qd_tool_face 预热）共用同一份缓存，不再另扫一遍目录。
             live_tools: set = set()
             try:
-                from pathlib import Path as _Path
                 from ..tools._base import ToolProvider as _TP
-                _tp = _TP()
-                _tools_dir = _Path(__file__).resolve().parent.parent / "tools"
-                _tp.scan_directory(_tools_dir, domain="common", package_prefix="tools")
-                _tp.scan_subdirectories(_tools_dir, package_prefix="tools")
-                live_tools = set(_tp.get_tool_names())
+                live_tools = set(_TP.get_or_build().get_tool_names())
             except Exception as e:
                 logger.warning("[Evaluator] 工具目录扫描失败，跳过 tool 层同步: %s", e)
             if live_tools:

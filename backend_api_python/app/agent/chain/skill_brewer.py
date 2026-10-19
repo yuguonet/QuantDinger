@@ -339,14 +339,13 @@ def brew_skills(min_runs: int = 5, limit: int = 3, trigger: str = "auto") -> lis
     low_tools = "（无数据）"
     try:
         from ..tools._base import ToolProvider
-        provider = ToolProvider.get_default()
-        if provider is None:
-            # 手动酿造入口没经过 plan_node 的 init_tools——自建一份用于校验/签名
-            from pathlib import Path as _P
-            provider = ToolProvider()
-            _td = _P(__file__).resolve().parent.parent / "tools"
-            provider.scan_directory(_td, domain="common", package_prefix="tools")
-            provider.scan_subdirectories(_td, package_prefix="tools")
+        # ★ 2026-10-19 修：原来 get_default() 为 None 时自建 provider 且把
+        #   package_prefix 硬编码成 "tools"（sys.path 时代写法）——生产模式顶层无 tools
+        #   模块 ⇒ 扫描全失败、注册表为空 ⇒ 签名清单"不可用"，且 _validate_tools
+        #   会把 LLM 输出的工具名全部当"编造"摘除（酿酒质量静默降级）。
+        #   统一走 get_or_build()：前缀从 __module__ 推导，无默认 provider 时
+        #   自建并缓存（与主工具面同一份）。
+        provider = ToolProvider.get_or_build()
         if provider:
             from ..utils.prescan import prescan_tools
             signatures = prescan_tools(provider, limit=40, query="")
@@ -609,13 +608,10 @@ def revise_skill(chain_name: str, skill_dir: str, pre_weight: float = None) -> d
     provider = None
     try:
         from ..tools._base import ToolProvider
-        provider = ToolProvider.get_default()
-        if provider is None:
-            provider = ToolProvider()
-            from pathlib import Path as _P
-            _td = _P(__file__).resolve().parent.parent / "tools"
-            provider.scan_directory(_td, domain="common", package_prefix="tools")
-            provider.scan_subdirectories(_td, package_prefix="tools")
+        # 2026-10-19 修：同首酿——原自建扫描把 package_prefix 硬编码成 "tools"，
+        # 生产模式全失败，空注册表会让 _validate_tools 把修订版工具名全部当编造摘除。
+        # 统一 get_or_build()（前缀从 __module__ 推导，与主工具面同缓存）。
+        provider = ToolProvider.get_or_build()
         new_doc = _validate_tools(new_doc, provider)
     except Exception as e:
         logger.debug("[Brewer] 修订版工具校验跳过: %s", e)

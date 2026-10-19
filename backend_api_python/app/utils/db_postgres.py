@@ -270,9 +270,51 @@ class PostgresCursor:
     def _convert_placeholders(query: str) -> str:
         """Convert ``?`` placeholders to PostgreSQL ``%s`` for backward
         compatibility with legacy SQLite-style code.
+
+        ★ 2026-10-19 修（IndexError 三连事故）：只替换**引号字面量之外**的 ``?``。
+
+        旧实现 `query.replace('?', '%s')` 是无条件全局替换——SQL 字符串字面量里
+        的 ``?`` 被一并替换，平白多出占位符，psycopg2 直接抛
+        `IndexError: tuple index out of range`。实证：chain 权重查询内嵌的链名
+        归一正则 `'\\+?\\d{4,6}'` 的量词 ``?`` 被改成 `%s``，占位符 1→3 而参数
+        只有 1 个，10-15/10-16/10-19 三次盘后评估全挂，且拖垮整笔 update_weights
+        事务（commit 在最后 ⇒ 前面所有写入被连接池 rollback）。
+
+        PostgreSQL 引号规则：单引号 = 字符串字面量（``''`` 为转义引号），
+        双引号 = 标识符。两类引号内的 ``?`` 都是数据/标识符一部分，绝不是
+        占位符。 routes/*.py 等大量遗留 SQLite 风格 ``?`` 占位符仍依赖本转换，
+        故不能删除，只收窄作用范围。
         """
-        query = query.replace('?', '%s')
-        return query
+        out = []
+        in_single = False   # '...' 字符串字面量
+        in_double = False   # "..." 标识符
+        i, n = 0, len(query)
+        while i < n:
+            ch = query[i]
+            if in_single or in_double:
+                if ch == "'" and in_single or ch == '"' and in_double:
+                    if i + 1 < n and query[i + 1] == ch:  # '' / "" 转义引号
+                        out.append(ch * 2)
+                        i += 2
+                        continue
+                    in_single = in_double = False
+                out.append(ch)
+                i += 1
+            elif ch == "'":
+                in_single = True
+                out.append(ch)
+                i += 1
+            elif ch == '"':
+                in_double = True
+                out.append(ch)
+                i += 1
+            elif ch == '?':
+                out.append('%s')
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
 
     @staticmethod
     def _rewrite_insert_or_ignore(query: str) -> str:

@@ -214,8 +214,15 @@ class ToolProvider:
 
     # ── 扫描注册 ──────────────────────────────────────────────
 
+    # ★ 2026-10-19 修：package_prefix 默认值原为硬编码 "tools"（sys.path 时代
+    #   口径）——P5 起 app/agent 不进 sys.path，生产/CLI 都只有 app.agent.tools
+    #   可达，调用方一旦省略该参数即全员 ModuleNotFoundError（evaluator/skill_brewer
+    #   三处自建扫描就是这样挂的，工具面同步静默失效）。
+    #   默认改为从本模块 __name__ 推导（app.agent.tools | tools 两种加载法均正确），
+    #   与 get_or_build() 同源；显式传参的调用方不受影响。
     def scan_directory(self, tools_dir: Path, domain: str = "common",
-                       package_prefix: str = "tools", load_meta: bool = True):
+                       package_prefix: str = __name__.rsplit(".", 1)[0],
+                       load_meta: bool = True):
         """扫描目录下所有 .py，自动注册公开函数。
 
         `_MUST_HAVE` 里的模块**不进注册表**（下方 continue 跳过），但它们的公开函数
@@ -225,7 +232,8 @@ class ToolProvider:
         Args:
             tools_dir: 目录路径
             domain: 领域名（默认 common）
-            package_prefix: 导入包前缀
+            package_prefix: 导入包前缀。**默认从本模块 __name__ 推导**
+                （app.agent.tools）——勿改回硬编码 "tools"，见上方 2026-10-19 注释。
             load_meta: 是否顺带装配元工具表。子目录扫描传 False —— 元工具模块只在
                 tools/ 顶层，对每个子目录都找一遍会刷出一堆"模块缺失"假告警。
         """
@@ -281,12 +289,16 @@ class ToolProvider:
                 if _is_tool_function(obj, mod):
                     self._meta_tools[attr_name] = obj
 
-    def scan_subdirectories(self, tools_dir: Path, package_prefix: str = "tools"):
+    def scan_subdirectories(self, tools_dir: Path,
+                            package_prefix: str = __name__.rsplit(".", 1)[0]):
         """扫描子目录，子目录名即 domain（同时登记为"可选域"）。
 
         可选域只来自目录：手动注册的来源层（如 capabilities）虽带 domain 标记，
         但不进 _selectable_domains，因此不会出现在 planner 的可用域清单里——
         "工具集域"与"工具来源层"不再混淆（2026-09-13，见 get_domains）。
+
+        package_prefix 默认从本模块 __name__ 推导，理由同 scan_directory
+        （2026-10-19：勿硬编码 "tools"）。
         """
         for sub in sorted(tools_dir.iterdir()):
             if not sub.is_dir() or sub.name.startswith("_") or sub.name == "__pycache__":

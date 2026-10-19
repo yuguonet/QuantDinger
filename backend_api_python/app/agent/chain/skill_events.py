@@ -407,6 +407,11 @@ def aggregate_feedback(*, skill_id: Optional[str] = None) -> Dict[str, dict]:
                         uncertainty = EXCLUDED.uncertainty,
                         policy_version = EXCLUDED.policy_version,
                         updated_at = NOW()
+                    -- qd_skill_feedback 无 id 列（PK=(skill_id, version)）：必须自带
+                    -- RETURNING，抑制 db_postgres 兼容层对 INSERT...VALUES 自动追加的
+                    -- id 回显子句（2026-10-19 修；同 evaluator qd_agent_weights 各
+                    -- INSERT 的约定，见 evaluator.py 内 "无 id 列" 注释）。
+                    RETURNING skill_id
                 """, (sid, ver,
                       slot["correct"] + slot["partial"] + slot["incorrect"],
                       slot["correct"], slot["partial"], slot["incorrect"],
