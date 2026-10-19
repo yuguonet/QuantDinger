@@ -203,7 +203,9 @@ def create_cron_job(
         # 计算下次执行时间（用于返回给用户）
         try:
             from .cron_worker import next_cron_time
-            nxt = next_cron_time(cron_expr, datetime.now(TZ_CN))
+            # 窗口取 400 天（与武装同口径）：合法的稀疏表达式（如年度）不应被误显示
+            # “表达式无效”。真正非法才返回 None。
+            nxt = next_cron_time(cron_expr, datetime.now(TZ_CN), max_search_days=400)
             # 表达式非法时 next_cron_time 返回 None（不会被执行），如实告知用户
             next_run = (nxt.strftime("%Y-%m-%d %H:%M") if nxt
                         else "(表达式无效，不会执行)")

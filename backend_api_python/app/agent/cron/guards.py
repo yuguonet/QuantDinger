@@ -73,24 +73,32 @@ def _expand_field(field: str, idx: int) -> list:
 
 
 def min_interval_minutes(expr: str) -> Optional[int]:
-    """估算表达式最小触发间隔（分钟）；无法判定返回 None。"""
+    """估算表达式最小触发间隔（分钟）；无法判定返回 None。
+
+    2026-10-19 修正（cron 重实现附录 B2-6）：旧实现按段各自估算后取 min，
+    **跨段间隔不算** —— `0 9 * * *|1 9 * * *` 各段估 1440 分钟放行，实际相邻
+    1 分钟，MIN_INTERVAL 被 `|` 一条绕过。改为合并**全部段**的每日 (时,分)
+    触发点算相邻最小差（含跨日回环）；星期/日/月限制只会拉长实际间隔，
+    按"每天都有触发点"估算即保守下界，方向安全。
+    """
     multi = [e for e in (expr or "").split("|") if e.strip()]
-    mins = []
+    if not multi:
+        return None
+    points = set()
     for e in multi:
         fields = parse_cron_fields(e)
         if not fields:
             return None
-        minutes = fields[0]
-        if len(minutes) >= 2:
-            deltas = [minutes[i + 1] - minutes[i] for i in range(len(minutes) - 1)]
-            mins.append(max(1, min(deltas)))
-        else:
-            # 单分钟点：看是否每小时/每天级
-            if len(fields[1]) >= 24:
-                mins.append(60)
-            else:
-                mins.append(60 * 24)
-    return min(mins) if mins else None
+        minutes, hours = fields[0], fields[1]
+        for h in hours:
+            for m in minutes:
+                points.add(h * 60 + m)
+    if not points:
+        return None
+    ordered = sorted(points)
+    deltas = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1)]
+    deltas.append(1440 - ordered[-1] + ordered[0])   # 跨日回环
+    return max(1, min(deltas))
 
 
 def validate_cron_expr(expr: str) -> Dict[str, Any]:

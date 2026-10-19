@@ -27,7 +27,8 @@ def _get_db():
 
 def _row_to_dict(row) -> dict:
     d = dict(row)
-    for k in ("last_run_at", "last_success_at", "created_at", "updated_at"):
+    for k in ("last_run_at", "last_success_at", "created_at", "updated_at",
+              "next_run", "locked_until"):
         v = d.get(k)
         if v and hasattr(v, "strftime"):
             d[k] = v.strftime("%Y-%m-%d %H:%M:%S")
@@ -91,14 +92,45 @@ def create_job():
         except (ImportError, AttributeError) as e:
             return jsonify({"error": f"函数路径无效: {e}"}), 400
 
+    # ── v2 新列（附录 D 遗留1）：类型校验 ──
+    session_id = (data.get("session_id") or "").strip() or None
+    timeout_seconds = data.get("timeout_seconds", 300)
+    misfire_grace_time = data.get("misfire_grace_time")
+    trading_days_only = bool(data.get("trading_days_only", False))
+
+    if type(timeout_seconds) is not int or timeout_seconds <= 0:
+        return jsonify({"error": "timeout_seconds 必须是正整数"}), 400
+    if misfire_grace_time is not None and (
+            type(misfire_grace_time) is not int or misfire_grace_time <= 0):
+        return jsonify({"error": "misfire_grace_time 必须是正整数或 null"}), 400
+
+    # ── guards 校验（附录 D 遗留2）：与 cron_tools 同闸——表达式格式/最短间隔/
+    #    任务数上限。REST 不得绕过；fail-closed（校验本身失败即 500，不静默放行）。──
+    try:
+        from app.agent.cron.guards import guard_create
+        with _get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) AS n FROM qd_agent_cron_jobs")
+            r = cur.fetchone()
+            existing = int((r.get("n") if isinstance(r, dict) else r[0]) or 0)
+        v = guard_create(cron_expr=cron_expr, existing_count=existing)
+        if not v.get("ok"):
+            return jsonify({"error": v.get("error")}), 400
+    except Exception as e:
+        logger.error("[CronAPI] guard 校验失败: %s", e)
+        return jsonify({"error": str(e)}), 500
+
     try:
         with _get_db() as conn:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO qd_agent_cron_jobs (name, cron_expr, mode, prompt, function_path, description)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO qd_agent_cron_jobs
+                    (name, cron_expr, mode, prompt, function_path, description,
+                     session_id, misfire_grace_time, trading_days_only, timeout_seconds)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
-            """, (name, cron_expr, mode, prompt, function_path, description))
+            """, (name, cron_expr, mode, prompt, function_path, description,
+                  session_id, misfire_grace_time, trading_days_only, timeout_seconds))
             row = cur.fetchone()
             conn.commit()
 
@@ -124,6 +156,18 @@ def update_job(job_id):
     updates = []
     params = []
 
+    # ── guards 校验（附录 D 遗留2）：改 cron_expr 必须过校验，不得直写 DB ──
+    if "cron_expr" in data:
+        new_expr = (data.get("cron_expr") or "").strip()
+        try:
+            from app.agent.cron.guards import validate_cron_expr
+            v = validate_cron_expr(new_expr)
+        except Exception as e:
+            logger.error("[CronAPI] guard 校验失败: %s", e)
+            return jsonify({"error": str(e)}), 500
+        if not v.get("ok"):
+            return jsonify({"error": v.get("error")}), 400
+
     for field in ("name", "cron_expr", "mode", "prompt", "function_path", "description"):
         if field in data:
             updates.append(f"{field} = %s")
@@ -132,6 +176,29 @@ def update_job(job_id):
     if "enabled" in data:
         updates.append("enabled = %s")
         params.append(bool(data["enabled"]))
+
+    # ── v2 新列（附录 D 遗留1）：此前白名单缺失，任何新列更新都 400 ──
+    if "session_id" in data:
+        updates.append("session_id = %s")
+        params.append((data.get("session_id") or "").strip() or None)
+
+    if "trading_days_only" in data:
+        updates.append("trading_days_only = %s")
+        params.append(bool(data["trading_days_only"]))
+
+    if "misfire_grace_time" in data:
+        mg = data["misfire_grace_time"]
+        if mg is not None and (type(mg) is not int or mg <= 0):
+            return jsonify({"error": "misfire_grace_time 必须是正整数或 null"}), 400
+        updates.append("misfire_grace_time = %s")
+        params.append(mg)
+
+    if "timeout_seconds" in data:
+        ts = data["timeout_seconds"]
+        if type(ts) is not int or ts <= 0:
+            return jsonify({"error": "timeout_seconds 必须是正整数"}), 400
+        updates.append("timeout_seconds = %s")
+        params.append(ts)
 
     if not updates:
         return jsonify({"error": "没有要更新的字段"}), 400
@@ -201,7 +268,10 @@ def trigger_job(job_id):
     try:
         with _get_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, name, cron_expr, mode, prompt, function_path FROM qd_agent_cron_jobs WHERE id = %s", (job_id,))
+            # 2026-10-19 修正（cron 重实现附录 B2-5）：必须取**完整行**——旧 SELECT 缺
+            # one_shot/session_id，手动触发一次性任务不删行且被 _reschedule_job 重新
+            # 武装 ⇒ 手动点一次变双跑。执行改走统一包装器（claim 互斥/交易日/记账）。
+            cur.execute("SELECT * FROM qd_agent_cron_jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
 
         if not row:

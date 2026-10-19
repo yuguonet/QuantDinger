@@ -52,3 +52,5 @@ mootdx>=0.11.7
 # smolagents built-in tool dependencies
 ddgs>=7.0.0
 markdownify>=0.14.0
+# cron 重实现 (2026-10-19): APScheduler 调度核心 (4.x 为不兼容重写, 锁 <4)
+APScheduler>=3.10,<4
