@@ -199,6 +199,10 @@
                   <a-icon type="down" style="font-size: 10px; margin-left: 2px;" />
                 </a-button>
               </a-popover>
+              <div v-if="symbol" class="ide-chart-stock">
+                <span v-if="currentStockNameResolved" class="ide-chart-stock-name">{{ currentStockNameResolved }}</span>
+                <span class="ide-chart-stock-code">{{ symbol }}</span>
+              </div>
             </div>
             <kline-chart
               ref="klineChart"
@@ -1139,6 +1143,7 @@ export default {
       timeframe: '1D',
       watchlist: [],
       selectedWatchlistKey: undefined,
+      currentStockName: '', // 当前标的名称(代码编辑器/自选切换时写入, 工具栏标题展示用)
 
       initialCapital: 10000,
       leverage: 1,
@@ -1389,6 +1394,17 @@ export default {
         }
       }
       return out
+    },
+    /**
+     * 工具栏标题要展示的「股票名称(代码)」中的名称部分。
+     * 优先用切换标的时写入的 currentStockName (自选/搜索结果带 name, 最准),
+     * 回退到已加载自选列表 this.watchlist 的同款 market:symbol 行 name,
+     * 都没有则返回空(模板里只显示代码)。
+     */
+    currentStockNameResolved () {
+      if (this.currentStockName) return this.currentStockName
+      const row = (this.watchlist || []).find(r => r && r.market === this.market && r.symbol === this.symbol)
+      return (row && row.name) || ''
     },
     chartTabOptions () {
       return [
@@ -3933,6 +3949,7 @@ export default {
       if (stock && stock.market && stock.symbol) {
         this.market = stock.market
         this.symbol = stock.symbol
+        this.currentStockName = stock.name || ''
         this.selectedWatchlistKey = `${stock.market}:${stock.symbol}`
         this.ensureChartReady()
         this.schedulePersistIdeUiState()
@@ -3996,6 +4013,7 @@ export default {
         this.selectedWatchlistKey = `${mkt}:${item.symbol}`
         this.market = mkt
         this.symbol = item.symbol
+        this.currentStockName = item.name || ''
         this.showAddModal = false
       } catch (e) {
         this.$message.error(e.message || 'Failed')
@@ -4456,6 +4474,23 @@ export default {
   font-size: 12px;
   color: #666;
   white-space: nowrap;
+}
+/* 工具栏右侧的当前标的标题: 与「K线周期」标签齐平, 加粗显示 */
+.ide-chart-stock {
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-weight: 700;
+  white-space: nowrap;
+  color: #1f1f1f;
+}
+.ide-chart-stock-name {
+  font-size: 14px;
+}
+.ide-chart-stock-code {
+  font-size: 13px;
+  color: #595959;
 }
 /* 工具栏外置指标选择器 */
 .ide-toolbar-ext-indicator {
@@ -6085,6 +6120,8 @@ export default {
     background: #1a1a1a;
     border-bottom-color: #303030;
   }
+  .ide-chart-stock { color: rgba(255, 255, 255, 0.92); }
+  .ide-chart-stock-code { color: rgba(255, 255, 255, 0.6); }
   .ide-chart-toolbar-label { color: rgba(255,255,255,0.45); }
   .indicator-popover-trigger { color: rgba(255,255,255,0.65); &:hover { color: #58a6ff; } }
   .tf-group /deep/ .ant-radio-button-wrapper {

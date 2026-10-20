@@ -1001,9 +1001,10 @@ def _sina_moneyflow_rows(code: str, num: int) -> Optional[List[Dict[str, Any]]]:
     """新浪日级资金流原始行（num 条，opendate 降序）。失败/空返回 None。
 
     接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
-    字段: opendate(日期), netamount(主力净流入,元), r0_net(超大单净额,元),
-          turnover(成交额)。
-    ⚠ 新浪该接口仅提供「主力净流入 + 超大单」两档，无大/中/小单拆分。
+    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
+    字段实证 (2026-10-20): netamount=四档净额总和(sum(r*_net), 全档净额, != 主力),
+          r0_net=超大单净额, turnover=换手率。该接口无大/中/小拆分, 也推不出主力。
+    日级四档拆解已迁 lscjfb (_fund_flow_sina_daily), 本函数仅剩实时路径在用。
     抽成单函数供分钟级(_fund_flow_sina)与日级(_fund_flow_sina_daily)共用，
     避免 URL/参数/headers 两处漂移。
     """
@@ -1028,8 +1029,8 @@ def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
     """当日个股资金流向（新浪日级，主源，无反爬）。
 
     接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
-    返回最新一条日级资金流。字段: netamount(主力净流入), r0_net(超大单净额),
-    turnover(成交额)。
+    返回最新一条日级资金流。字段实证: netamount=四档净额总和(非主力),
+    r0_net=超大单净额, turnover=换手率; 本接口无大/中/小拆分。
 
     Returns:
         {code, points:1, total_main_net, data:[{time, main_net, small_net,
@@ -1051,8 +1052,8 @@ def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
             "main_net": main_net,
             "small_net": 0.0,
             "mid_net": 0.0,
-            # 新浪 r0_net = 超大单净额；本文件既有约定（同 _fund_flow_sina 旧实现）
-            # 放在 large_net 槽位，日级路径保持一致，勿单改一侧。
+            # 新浪 r0_net = 超大单净额。历史槽位约定: 超大单值放 large_net 槽位
+            # (2026-10-20 日级已迁 lscjfb 改为正确槽位, 本实时路径保留旧约定)。
             "large_net": _safe_float(row.get("r0_net")),
             "super_net": 0.0,
         }],
@@ -1060,36 +1061,43 @@ def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
 
 
 def _fund_flow_sina_daily(code: str, days: int = 120) -> Optional[Dict[str, Any]]:
-    """近 N 日日级资金流（新浪，主外部源，无反爬）。失败返回 None。
+    """近 N 日日级资金流（新浪 lscjfb，主外部源，真实四档拆解）。失败返回 None。
 
-    与分钟级同源（ssl_qsfx_zjlrqs 的 num=N 即返回 N 个交易日），因此日级历史
-    无需依赖东财 push2his。字段映射见 _sina_moneyflow_rows 说明。
+    2026-10-20 换源修正: 原走 zjlrqs，该接口只有「四档总净额(netamount) +
+    超大单(r0_net)」两字段，且旧实现把总净额当主力、把超大单塞 large_net 槽位，
+    五列口径全错（大/中/小=0）。现改走 lscjfb（ssl_qsfx_lscjfb，r0~r3_net
+    真实四档，阈值与东财一致），复用 app.market_cn.sina_moneyflow 同一取数模块
+    （指数聚合方案2 同源），口径与东财 daykline 完全对齐：
+      super=r0_net(特大)  large=r1_net(大)  mid=r2_net(中)  small=r3_net(小)
+      main_net = super + large (东财自洽式 主力=超大+大)
+    历史起点 2010-03-01 (新浪源全局限制)。
 
     Returns:
         {code, total_days, recent_5d_main_net, recent_20d_main_net,
-         data:[{date, main_net, small_net, mid_net, large_net, super_net}]（升序）,
+         data:[{date, main_net, small_net, mid_net, large_net, super_net}] (升序),
          source:"sina"}
-        失败: None（不抛异常，交给东财兜底）
+        失败: None (不抛异常，交给东财兜底)
     """
-    raw = _sina_moneyflow_rows(code, days)
-    if not raw:
+    from app.market_cn.sina_moneyflow import get_stock_daily_flow, to_daima
+    try:
+        flow = get_stock_daily_flow(to_daima(code))
+    except Exception as e:
+        logger.warning("[sina] lscjfb 日级资金流失败(%s): %s", code, e)
         return None
-    rows: List[Dict[str, Any]] = []
-    for row in raw:
-        dt = str(row.get("opendate", "") or "")
-        if not dt:
-            continue
-        rows.append({
-            "date": dt,
-            "main_net": _safe_float(row.get("netamount")),
-            "small_net": 0.0,
-            "mid_net": 0.0,
-            "large_net": _safe_float(row.get("r0_net")),  # 见 _fund_flow_sina 约定
-            "super_net": 0.0,
-        })
+    if not flow:
+        return None
+    flow = flow[-max(1, int(days)):]
+    rows: List[Dict[str, Any]] = [{
+        "date": r["date"],
+        "main_net": r["main_net"],
+        "small_net": r["small_net"],
+        "mid_net": r["mid_net"],
+        "large_net": r["big_net"],      # tape 槽位名 large_net = 大单
+        "super_net": r["super_net"],
+    } for r in flow]
     if not rows:
         return None
-    rows.sort(key=lambda x: x["date"])  # 升序（旧→新），与东财口径一致
+    rows.sort(key=lambda x: x["date"])  # 升序 (旧->新)，与东财口径一致
     recent_5 = rows[-5:] if len(rows) >= 5 else rows
     recent_20 = rows[-20:] if len(rows) >= 20 else rows
     return {
@@ -1100,7 +1108,6 @@ def _fund_flow_sina_daily(code: str, days: int = 120) -> Optional[Dict[str, Any]
         "data": rows,
         "source": "sina",
     }
-
 
 def _mark_push2_blocked() -> None:
     global _push2_blocked_until
@@ -1258,8 +1265,8 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
         }
         失败: {code, error: "..."}
 
-    ⚠ 新浪主源仅提供 主力净流入 + 超大单（映射到 large_net 槽位，见
-      _fund_flow_sina 约定），大/中/小单为 0；完整拆分需东财可用。
+    2026-10-20 起新浪主源 (lscjfb) 已提供真实四档拆解, 五列口径与东财一致
+    (main=超大+大); 东财 push2his 仅作兜底。
 
     Example:
         >>> flow = get_fund_flow_daily("600519", 60)

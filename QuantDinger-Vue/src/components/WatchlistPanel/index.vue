@@ -1358,17 +1358,22 @@ export default {
       try {
         let successCount = 0
         const failedSymbols = []
+        // 仅记录成功加入的股票 key, 用于把它们放到分组最前面
+        const addedKeys = []
         for (const { market, symbol, name } of symbolsToAdd) {
           try {
             const res = await addWatchlist({ userid: this.userId, market, symbol, name, group_name: group })
             if (res && res.code === 1) {
               successCount++
+              addedKeys.push(`${market}:${symbol.toUpperCase()}`)
             } else if (res && res.data && res.data.candidates) {
               // Single match — auto pick first candidate
               const c = res.data.candidates[0]
               const res2 = await addWatchlist({ userid: this.userId, market: c.market || market, symbol: c.symbol, name: c.name || c.symbol, group_name: group })
-              if (res2 && res2.code === 1) successCount++
-              else failedSymbols.push(symbol)
+              if (res2 && res2.code === 1) {
+                successCount++
+                addedKeys.push(`${(c.market || market)}:${c.symbol}`)
+              } else failedSymbols.push(symbol)
             } else {
               failedSymbols.push(symbol)
             }
@@ -1383,12 +1388,28 @@ export default {
           this.$message.success(msg)
           this.handleCloseAddStockModal()
           await this.loadWatchlist()
+          // 新增股票置于该分组最前面 (前端记忆; 与拖拽排序同一套机制, 不提交后端)
+          if (addedKeys.length) this._prependNewStocksToFront(group, addedKeys)
           this.$emit('refresh')
         }
         if (failedSymbols.length > 0) {
           this.$message.warning(this.$t('dashboard.analysis.message.addStockFailed') + ': ' + failedSymbols.join(', '))
         }
       } catch (error) { this.$message.error(error?.response?.data?.msg || error?.message || this.$t('dashboard.analysis.message.addStockFailed')) } finally { this.addingStock = false }
+    },
+    // 把新加入的股票放到指定分组最前面。
+    // 复用 itemOrder (前端记忆, 与拖拽排序同一套机制), 持久化到 uiPrefs, 不提交后端。
+    // 排序结果: 新增的股票在前, 之后是已记住顺序的其余股票, 最后是该组尚未记忆的后端股票(兜底)。
+    _prependNewStocksToFront (group, newKeys) {
+      const existingOrder = (this.itemOrder && this.itemOrder[group]) || []
+      const filtered = existingOrder.filter(k => !newKeys.includes(k))
+      const backendKeys = (this.watchlist || [])
+        .filter(s => (s.group_name || DEFAULT_GROUP_NAME) === group)
+        .map(s => `${s.market}:${s.symbol}`)
+      const known = new Set([...newKeys, ...filtered])
+      const remainder = backendKeys.filter(k => !known.has(k))
+      this.itemOrder = { ...(this.itemOrder || {}), [group]: [...newKeys, ...filtered, ...remainder] }
+      setPrefValue('watchlist', 'itemOrder', this.itemOrder)
     },
     handleCloseAddStockModal () {
       this.showAddStockModal = false; this.selectedSymbolForAdd = null; this.selectedSymbolsForAdd = []; this.symbolSearchKeyword = ''; this.symbolSearchResults = []; this.hasSearched = false

@@ -76,7 +76,7 @@ def _fetch_money_flow_kline(symbol: str, days: int = 10) -> list:
         logger.info("money_flow(%s): 获取 %d 日资金流向", symbol, len(results))
         return results
     except Exception as e:
-        logger.debug("money_flow(%s) 获取失败: %s", symbol, e)
+        logger.warning("money_flow(%s) 获取失败: %s", symbol, e)
         _cache[cache_key] = []
         return []
 
@@ -97,7 +97,7 @@ def _fetch_realtime_flow(symbol: str) -> dict:
             "main_net_pct": result.get("main_pct", 0),
         }
     except Exception as e:
-        logger.debug("money_flow realtime(%s) 失败: %s", symbol, e)
+        logger.warning("money_flow realtime(%s) 失败: %s", symbol, e)
         return {}
 
 
