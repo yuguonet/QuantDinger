@@ -146,6 +146,8 @@ def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
         {"ok": True, "result": <预览>, "full_path": ..., "elapsed_s": ...,
          "job_dir": ...} 或 {"error": ..., "job_dir": ...}
         （job_dir = 作业目录，manifest.json 在内，终态可观测）
+        预览按**整条目**裁剪（永远是合法 JSON）；被裁时多带 preview_note
+        说明裁了几条、全量在 full_path —— 看到它就别把预览当全量下结论。
     """
     # 名称归一化（2026-10-12）：SKILL.md frontmatter 的 name 用连字符
     # （market-screener / strategy-debug），而 skill_run.py 的执行注册表键是**目录名**

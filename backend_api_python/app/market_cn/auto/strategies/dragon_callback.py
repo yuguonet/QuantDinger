@@ -673,6 +673,16 @@ class DragonCallbackStrategy(StrategyBase):
         r = state["ring"]
         return [(r[0]["t"], r[0]["c"]), (r[-1]["t"], r[-1]["c"])]
 
+    def state_dates(self, state: dict) -> list[str]:
+        """切片已吸纳的交易日（ring 环形窗口，升序）—— 可选契约 `StateDatesAware`。
+
+        供 runner 比对市场数据做**断档自愈**（见 `runner._has_state_gap`）。
+        ⚠ ring 是滚动窗口：只含最近 N 根，故检测范围受窗口长度限制（够用——
+        断档发生在最近数日，窗口内必然可见）。
+        """
+        return [str(x.get("t") or "")[:10] for x in (state.get("ring") or ())
+                if x.get("t")]
+
     def evaluate(self, state: dict, inp: DayInput, prev: Progress | None) -> list[Progress]:
         """递推路径判定（三分支共用：预处理 / 回测 / 实时）。"""
         bar, code = inp.bar, inp.code

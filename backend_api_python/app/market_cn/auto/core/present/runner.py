@@ -438,14 +438,39 @@ class DailyRunner:
     def __init__(self, store: StateStore):
         self.store = store
 
+    def _has_state_gap(self, strategy: StrategyProtocol, rec: Record,
+                       probe_bars: dict | None, today: str) -> bool:
+        """切片是否漏吸纳了「市场有 bar 的中间交易日」⇒ 断档（可选契约 state_dates）。
+
+        ⚠ 为什么条件② date_gap 兜不住 (2026-10-21 实证): 它拿 `yesterday`(==`bars[-2]`)
+          比对 `rec.date`，但两者**都来自当时同一份 bars**。某日数据迟到时那份 bars
+          本就没有这些天 ⇒ `bars[-2]` 恰等于 `rec.date` ⇒ "看起来连续" ⇒ 漏检；数据
+          补齐后同日重跑又被 `noop` 拒绝 ⇒ 永不自愈。实测 10-19/10-20 的 daily_scan
+          未触发（lhb 未就绪），全市场 **99.2%** 的票切片 win 缺这两天。
+          本方法改比对**切片自报日期** vs **市场数据**（来源不同才可能发现缺口）：
+          存在 `d` 满足 `min(已吸纳) < d < today`、市场有 bar、切片没有 ⇒ 断档。
+          停牌日在市场里本就没有 bar ⇒ 天然不误判。
+        """
+        fn = getattr(strategy, "state_dates", None)
+        if fn is None or not probe_bars or not rec.date:
+            return False                      # 未实现可选契约 / 无对照 ⇒ 不判定
+        sd = [str(d)[:10] for d in (fn(rec.state) or ()) if d]
+        if len(sd) < 2:
+            return False
+        have, lo, hi = set(sd), min(sd), str(today)[:10]
+        return any(lo < (ds := str(d)[:10]) < hi and ds not in have for d in probe_bars)
+
     # ---- 重建判定（1 日延伸口径：只看昨/今两根 + 探针锚） ----
     def _rebuild_reason(self, strategy: StrategyProtocol, rec: Record | None,
                         today: dict, yesterday: dict | None,
                         probe_bars: dict | None) -> str | None:
         """返回重建原因；None=正常推进；"noop"=同日重跑幂等拒绝。
 
-        四条件（设计要点④）：① 日期错位（重发/乱序）② 日期断档（切片不在昨根上）
-        ③ 除权/订正（probe 锚严格比对）④ 策略文件被修改。"""
+        五条件（设计要点④）：① 日期错位（重发/乱序）② 日期断档（切片不在昨根上）
+        ③ 除权/订正（probe 锚严格比对）④ 策略文件被修改
+        ⑤ 切片内断档（**切片自报日期 vs 市场数据**，见 `_has_state_gap`）。
+        ⑤ 必须在 `noop` **之前**判：否则同日重跑一律幂等拒绝，迟到的补齐数据永
+        远等不到自愈的机会（这是 ② 漏检后唯一的补救入口）。"""
         if rec is None:
             return "seed"
         if rec.strategy_hash != strategy_source_hash(strategy):
@@ -457,6 +482,8 @@ class DailyRunner:
                 b = probe_bars.get(d)
                 if b is not None and float(b["close"]) != float(c):
                     return "probe_mismatch"     # 锚缺失=无法校验，跳过；不等=改写
+        if self._has_state_gap(strategy, rec, probe_bars, today["time"]):
+            return "date_gap"                   # ⑤ 切片内断档（数据迟到的事后自愈）
         if today["time"] == rec.date:
             return "noop"                       # 同日重跑：幂等拒绝（probe 已通过）
         if yesterday is not None and yesterday["time"] != rec.date:

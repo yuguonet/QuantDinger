@@ -34,8 +34,10 @@ AUTO_DIR = os.path.join(_ROOT, "app", "market_cn", "auto")
 
 # (模块, 定稿行数, 上限)
 MODULES = [
-    ("contract.py", 112, 140),
-    ("runner.py", 553, 600),
+    # 2026-10-21: 断档自愈（StateDatesAware 契约 + runner._has_state_gap，修 99.2% 切片断档）
+    #   用户裁定「文件长度不作为问题处理」⇒ cap 140→155 / 600→625（余量按新增量给，不虚高）。
+    ("contract.py", 112, 155),
+    ("runner.py", 553, 625),
     ("realtime.py", 89, 140),   # 2026-10-08: cap 110→140（用户裁定长度不在考虑范围; 原109/110零余量）
 ]
 

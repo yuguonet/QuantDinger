@@ -131,9 +131,25 @@ def market_state() -> Dict[str, Any]:
         except Exception:
             pass
 
-    zt_pool = fetch_zt_pool(today)
-    dt_pool = fetch_dt_pool(today)
-    broken = fetch_broken_board(today)
+    # 源级失败显性化（2026-10-21）：三池 fetcher 已 fail-fast，此处降级为 0 计数
+    # 但必须把失败写进 source_errors，由 pre_screen 合并进 missing —— 静默归零会把
+    # 「涨跌停池源故障」伪装成「情绪冰点」（zt=0/dt=0/炸板率 0 的假情绪分）。
+    src_errors: List[str] = []
+    try:
+        zt_pool = fetch_zt_pool(today)
+    except Exception as e:
+        zt_pool = []
+        src_errors.append(f"涨停池源失败: {type(e).__name__}: {e}")
+    try:
+        dt_pool = fetch_dt_pool(today)
+    except Exception as e:
+        dt_pool = []
+        src_errors.append(f"跌停池源失败: {type(e).__name__}: {e}")
+    try:
+        broken = fetch_broken_board(today)
+    except Exception as e:
+        broken = []
+        src_errors.append(f"炸板池源失败: {type(e).__name__}: {e}")
     zt_count = len(zt_pool)
     dt_count = len(dt_pool)
     broken_count = len(broken)
@@ -179,6 +195,7 @@ def market_state() -> Dict[str, Any]:
         "dt_count": dt_count,
         "broken_count": broken_count,
         "broken_rate": broken_rate,
+        "source_errors": src_errors,
     }
 
 
@@ -529,6 +546,28 @@ _QUERY_DEFAULT = {
 }
 
 
+def _annotate_empty_pool_calendar(missing: List[str], date: str) -> None:
+    """空池兜底：校验交易日历，把「非真实空候选」显式写进 missing。
+
+    纯真空池（全部源成功返回空）在**交易日**上才是真实筛选结果；非交易日或
+    日历不可确认时，空池不可作为「今日无行情机会」的证据 —— 否则主 agent 会
+    把休市/日历故障当「今日无候选」交付（2026-10-21 缺陷闭环的最后一块）。
+    日历复用 app/utils/trading_calendar.py（akshare 沪深交易日历 + pickle 缓存，
+    项目唯一既有交易日历实现），此处不自造日历；日历拉取失败视为「不可确认」
+    如实留痕，不做任何推测性兜底。
+    """
+    try:
+        from app.utils.trading_calendar import is_trading_day
+        trading_day = bool(is_trading_day(date))
+    except Exception as e:
+        missing.append(
+            f"交易日历不可确认（空池无法区分节假日与数据故障，非真实空候选）: "
+            f"{type(e).__name__}: {e}")
+        return
+    if not trading_day:
+        missing.append(f"{date} 非交易日（日历核实）：空池为休市所致，非真实候选筛选结果")
+
+
 def candidate_pool(
     strategy: str = "post_market",
     date: str = None,
@@ -590,12 +629,15 @@ def candidate_pool(
     dragon_pullback: List[Dict] = []
 
     # ── 涨停池（连板 / 尾盘封板）──
+    # 源失败必须进 missing（2026-10-21）：fetch_zt_pool 已 fail-fast，
+    # 静默漏记会让下游把「数据不可用」当「今日无候选」交付。
     if "zt" in srcs or "eod_zt" in srcs:
         try:
             zt_pool = fetch_zt_pool(date)
         except Exception as e:
             zt_pool = []
-            missing.append(f"涨停池: {type(e).__name__}: {e}")
+            logger.warning("[MktScreen] 涨停池源失败: %s", e)
+            missing.append(f"涨停池源失败: {type(e).__name__}: {e}")
         for s in zt_pool or []:
             code = str(s.get("stock_code", "") or "")
             if not code:
@@ -628,7 +670,8 @@ def candidate_pool(
             dragon_pullback = scan_dragon_pullback(date) or []
         except Exception as e:
             dragon_pullback = []
-            missing.append(f"龙回头: {type(e).__name__}: {e}")
+            logger.warning("[MktScreen] 龙回头源失败: %s", e)
+            missing.append(f"龙回头源失败: {type(e).__name__}: {e}")
         for s in dragon_pullback:
             _put(str(s.get("code", "")), {
                 "code": str(s.get("code", "")), "name": s.get("name", ""),
@@ -646,7 +689,8 @@ def candidate_pool(
             hot = fetch_hot_stocks_with_reason(date) or {}
         except Exception as e:
             hot = {}
-            missing.append(f"热点题材: {type(e).__name__}: {e}")
+            logger.warning("[MktScreen] 热点题材源失败: %s", e)
+            missing.append(f"热点题材源失败: {type(e).__name__}: {e}")
         main_themes = [(t, c) for t, c in (hot.get("hot_tags") or [])[:10]]
         for s in hot.get("stocks", []) or []:
             code = str(s.get("code", "") or "")
@@ -727,6 +771,11 @@ def candidate_pool(
         # turnover_pct 缺失（0/None）时不据此剔除 —— 避免把没有字段的票误杀
         candidates = [c for c in candidates
                       if not (c.get("turnover_pct") and float(c["turnover_pct"]) < lo)]
+
+    # 空池兜底校验交易日历（2026-10-21）：非交易日/日历不可确认必须显式标注，
+    # 保证「纯真空池 + missing 为空」只可能出现在可核实的交易日上。
+    if not candidates:
+        _annotate_empty_pool_calendar(missing, date)
 
     return {
         "strategy": strategy,

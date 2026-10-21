@@ -20,6 +20,7 @@ market-screener/_helpers.py — 事实与证据层（不做选股决策）
     · 所有回退必须留痕（missing / errors），不静默吞异常 —— 否则 LLM 会把数据缺口当成无信号
 """
 
+import os
 from datetime import date, datetime, time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -28,7 +29,24 @@ from typing import Any, Dict, List, Optional
 
 # 证据卡默认上限：候选池可达数百只，全量画像会撑爆上下文（trim 优先保证「有证据」而非「全」）
 _PROFILE_LIMIT_DEFAULT = 20
-_SCORE_BATCH = 80  # 漏斗打分批上限：profile_candidates(limit=80) 内部 pool=160/kept=80
+# 漏斗打分资源护栏（2026-10-21 修「隐形截断」）：最多给多少只挂 p_up，是**取数
+# 预算上限、不是选股口径**。旧值 _SCORE_BATCH=80 经 profile_candidates 的
+# limit*2 窗口只给**池序前 160** 打分——宽池（扩词后 500+）下后排票永远没被
+# 打过分，排序公平性失真（2026-10-21 用户裁定修此点）。
+# 打分成本便宜：predict_next_day 是本地模型（吃已取的 bars，_market_klines 有
+# 缓存），kline 走 DB 优先门面 ⇒ 护栏放宽到 600；env QD_SCREENER_SCORE_MAX
+# 可调（阈值不走硬编码）。只有真超护栏才按 _objective_rank_key 让位。
+_SCORE_MAX_DEFAULT = 600
+
+
+def _score_max() -> int:
+    """打分护栏（只数）：env 优先，回落模块缺省。"""
+    raw = os.environ.get("QD_SCREENER_SCORE_MAX", "") or ""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _SCORE_MAX_DEFAULT
+    return v if v > 0 else _SCORE_MAX_DEFAULT
 # 并发取数线程数：IO 密集（DB 查询），线程池有效（GIL 在 IO 等待期会释放）
 _FETCH_WORKERS = 8
 # 单批取数等待上限：DB/网络抖动时不拖垮整轮选股（超时项计入 missing）
@@ -110,6 +128,24 @@ def _f(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _num_or_none(v: Any) -> Optional[float]:
+    """容错转 float；None/空串/非数 → None（缺失语义），不做 0.0 归一。
+
+    与 _f 的分工：_f 适合「有缺省值」的数值字段；本函数用于 **0 与缺失语义
+    不同的字段**（涨跌停价 / 涨跌幅）——契约上 0/-1 是「无涨跌幅限制」哨兵、
+    None 是「源未给」（腾讯增补偶发失败，见 data_tools.get_realtime_quote），
+    _f(None)=0.0 会把「未知」伪造成「0 价」→ _parse_limit_px 判 no_limit →
+    封板票 buyable=True 进可买表（C1，2026-10-21；missing≠no_limit，
+    见 references/limit-rules.md）。
+    """
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def hard_exclusions(item: Dict, strategy: str = "") -> List[str]:
@@ -266,10 +302,21 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
 
 
 def _prev_streak(bars: List[Dict], limit_pct: float, streak: int) -> int:
-    """截至上一交易日结束时的连板高度（判断「连板后首阴」等形态用）。"""
+    """截至上一交易日结束时的连板高度（判断「连板后首阴」等形态用）。
+
+    语义 =「今日之前」的连板数（analysis-framework.md 维度 4：prev 高 + 当日
+    收阴 = 首阴；common.py 渲染「连板X/前Y」）：
+    · 今日仍涨停（streak>=1）→ streak-1（3 连板 → 前 2 板）；
+    · 今日未涨停（首阴/断板）→ 从昨日（len-2）向前数（前 4 板首阴 → 4）。
+    【易错】旧实现 idx=len-1-streak 恰落在主 streak 循环「因涨幅不足 break 的
+    那根 bar」上，while 首查必败 → 恒 0（C3，2026-10-21 修）。判定阈值与
+    tech_summary 主循环同口径（limit_pct-0.8 容差），勿单独改动。
+    """
     if limit_pct <= 0:
         return 0
-    idx = len(bars) - 1 - max(streak, 0)
+    if streak >= 1:
+        return streak - 1
+    idx = len(bars) - 2
     n = 0
     while idx > 0:
         pc = bars[idx - 1]["close"]
@@ -320,6 +367,11 @@ def fetch_rt_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """批量实时行情 → {code: rt事实}；2026-10-20 改分块绕过 20 只截断。
 
     失败块只丢该块并 logger.warning，不整批作废；返回 map 只含成功票，失败票缺席。
+    【三态契约（2026-10-21 C1）】change_pct / limit_up_price / limit_down_price
+    缺失时保留 **None**（源未给 ≠ 0）：0/-1 是「无涨跌幅限制」哨兵、None 是
+    「未知」，_f(None)=0.0 会把未知伪造成 0 价 → 下游判 no_limit → 封板票
+    buyable=True 进可买表、涨跌幅显示 +0.00%（与 _facts.fill_quote 的
+    「0 是合法哨兵、仅排 None」同一口径）。
     """
     if not codes:
         return {}
@@ -343,10 +395,10 @@ def fetch_rt_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         last = _f(last_raw)
         out[code] = {
             "price": last,
-            "change_pct": _f(info.get("changePercent")),
+            "change_pct": _num_or_none(info.get("changePercent")),
             "previous_close": _f(info.get("previousClose")),
-            "limit_up_price": _f(info.get("limit_up")),
-            "limit_down_price": _f(info.get("limit_down")),
+            "limit_up_price": _num_or_none(info.get("limit_up")),
+            "limit_down_price": _num_or_none(info.get("limit_down")),
             "high": _f(info.get("high")),
             "low": _f(info.get("low")),
             "time": info.get("time"),
@@ -482,12 +534,38 @@ def objective_preexclude(candidates, strategy, quotes=None):
     return kept, stats
 
 
-def score_pool(candidates, strategy="", market=None, main_themes=None,
-               p_up_floor=0.40, rank_cut=0.30, floor_keep=4):
-    """双保险软门槛——run() 内部漏斗第 2 层（2026-10-20）。
+def _objective_rank_key(item: Dict, index: int, themes: List[str] = ()) -> tuple:
+    """客观优先级键（2026-10-21）：纯计数分层，**不编造分数**——p_up 仍是唯一数字。
 
-    复用 profile_candidates（limit=_SCORE_BATCH, with_flow=False, with_pred=True）
-    拿 kline+p_up（不二次拉数），然后：
+    统一供两处「谁先获得资源/名额」的排序（同一口径，勿另写）：
+      · 池子超过打分护栏时，谁先拿 p_up（score_pool 预算让位）；
+      · 缺分（no_pred）票按什么顺序占用保送名额（缺分保送）。
+    分层（越小越优先）：题材命中 0 → 稀缺来源(龙回头/热点) 1 →
+    多源命中(source 含 +) 2 → 其余 3；同层按输入顺序（index）稳定排，可复盘。
+    题材命中：画像后的 item 自带 theme.hit；画像前的原始候选无此字段，回退
+    _theme_hit 现算（同一函数，口径一致）。
+    """
+    theme = item.get("theme")
+    hit = theme.get("hit") if isinstance(theme, dict) \
+        else _theme_hit(item, list(themes))["hit"]
+    source = str(item.get("source") or "")
+    if hit:
+        tier = 0
+    elif "龙回头" in source or "热点" in source:
+        tier = 1
+    elif "+" in source:
+        tier = 2
+    else:
+        tier = 3
+    return (tier, index)
+
+
+def score_pool(candidates, strategy="", market=None, main_themes=None,
+               p_up_floor=0.40, rank_cut=0.30, floor_keep=4, no_pred_keep=2):
+    """双保险软门槛 + 缺分保送——run() 内部漏斗第 2 层（2026-10-21 修订）。
+
+    全量拿 kline+p_up（不二次拉数；只受打分护栏 _score_max() 约束，超护栏按
+    _objective_rank_key 让位并计 score_skipped），然后：
 
     0. hard 剔除：profile 层 hard_exclusions 标记的客观不可交易票不进 deep，
        计 stats["hard"]（不占 deep 名额，但漏斗必须可复盘）
@@ -495,8 +573,10 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
     2. 相对排名：按 p_up 降序去掉后 rank_cut（比例，0~0.9）
     3. 保底回捞：被剔但 theme.hit 或 source 含「龙回头/热点」的前 floor_keep 只，
        标 floor_kept=true 放回——避免硬切断丢掉稀缺题材票
-    4. 无 p_up 的票不进 deep，只计 stats["no_pred"]（打分模型覆盖不到的票
-       不应占 deep 名额，但要在 funnel 里可见）
+    4. 缺分保送（2026-10-21，替代旧「无 p_up 不进 deep」）：p_up 缺失是**模型
+       盲区，不是低分**（旧口径把缺分当出局，连保底回捞都够不着，属系统性
+       排除）。缺分票按 _objective_rank_key 占用独立名额 no_pred_keep，标
+       no_pred_kept=true——不与有分票抢 p_up 排序，LLM 侧按「无标定分」处理。
 
     Args:
         candidates: objective_preexclude 保留的候选（dict 列表）
@@ -504,28 +584,42 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
         p_up_floor: p_up 硬地板（Round0=0.40, Round1=0.35）
         rank_cut: 排名尾部剔除比例（Round0=0.30, Round1=0.15）
         floor_keep: 保底回捞只数上限（Round0=4, Round1=6）
+        no_pred_keep: 缺分保送只数上限（Round0=2, Round1=3；0=退回旧口径）
 
     Returns:
-        (selected, stats, meta): selected=可进 deep 的 profiles（按 p_up 降序，
-            含 floor_kept）；stats={hard, p_up_hard, rank_cut, no_pred,
-            floor_kept, scored}；
+        (selected, stats, meta): selected=可进 deep 的 profiles（有分票按 p_up
+            降序，缺分保送殿后；含 floor_kept / no_pred_kept）；
+            stats={hard, p_up_hard, rank_cut, no_pred, no_pred_kept,
+            floor_kept, scored, score_skipped}；
             meta=profile_bundle 附加上下文 {strategy, market, mood_regime, themes,
             hints, missing, errors} 供 run() 空结果分支使用。
     """
+    cand_list = list(candidates or [])
+    themes = [t[0] for t in (main_themes or []) if isinstance(t, (list, tuple)) and t]
+    score_skipped = 0
+    budget = _score_max()
+    if len(cand_list) > budget:
+        # 只有真超护栏才让位：客观优先级（纯计数）决定谁先拿 p_up，
+        # 被让位的票计 score_skipped（漏斗可见，不静默丢）
+        order = sorted(range(len(cand_list)),
+                       key=lambda i: _objective_rank_key(cand_list[i], i, themes))
+        cand_list = [cand_list[i] for i in order[:budget]]
+        score_skipped = len(candidates) - len(cand_list)
     prescreen_like = {
         "strategy": strategy,
         "market": market or {},
         "main_themes": main_themes or [],
-        "candidates": candidates,
+        "candidates": cand_list,
     }
-    bundle = profile_candidates(prescreen_like, limit=_SCORE_BATCH,
+    # limit=len ⇒ 全量画像/打分（profile 内部 limit*2 窗口自此不设限）
+    bundle = profile_candidates(prescreen_like, limit=max(len(cand_list), 1),
                                 with_flow=False, with_pred=True)
     profiles_all = bundle.get("profiles", [])
     hard_n = sum(1 for p in profiles_all if p.get("hard"))
     profiles = [p for p in profiles_all if not p.get("hard")]
 
     with_pred = [p for p in profiles if p.get("p_up") is not None]
-    no_pred_n = len(profiles) - len(with_pred)
+    no_pred_list = [p for p in profiles if p.get("p_up") is None]
 
     ranked = sorted(with_pred, key=lambda x: x.get("p_up") or 0, reverse=True)
     n = len(ranked)
@@ -558,15 +652,28 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
     for p in floor_kept:
         p["floor_kept"] = True
 
-    selected = kept + floor_kept
-    selected.sort(key=lambda x: x.get("p_up") or 0, reverse=True)
+    # 缺分保送（2026-10-21）：模型盲区 ≠ 坏票。独立名额、独立排序，标 no_pred_kept
+    no_pred_kept = []
+    if no_pred_list and int(no_pred_keep or 0) > 0:
+        ranked_np = sorted(enumerate(no_pred_list),
+                           key=lambda iv: _objective_rank_key(iv[1], iv[0], themes))
+        no_pred_kept = [p for _, p in ranked_np[:max(0, int(no_pred_keep))]]
+        for p in no_pred_kept:
+            p["no_pred_kept"] = True
+
+    # 有分票按 p_up 降序在前，缺分保送殿后（排序键分两级，不让 0 分票插队）
+    selected = kept + floor_kept + no_pred_kept
+    selected.sort(key=lambda x: (x.get("p_up") is not None, x.get("p_up") or 0),
+                  reverse=True)
     stats = {
         "hard": hard_n,
         "p_up_hard": p_up_hard_n,
         "rank_cut": rank_cut_n,
-        "no_pred": no_pred_n,
+        "no_pred": len(no_pred_list),
+        "no_pred_kept": len(no_pred_kept),
         "floor_kept": len(floor_kept),
         "scored": len(profiles),
+        "score_skipped": score_skipped,
     }
     meta = {
         "strategy": bundle.get("strategy"),
@@ -651,13 +758,17 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
         "limit_band": up_kind,  # price | no_limit | missing（跌停侧同 kind 语义，无限制时两价皆空）
         "time": rt.get("time"),
     }
-    # 可买性：封板（涨/跌）当日不可买 —— 写进 rt_risks，LLM 不得放入可买表
-    if limit_up is True:
+    # 可买性：封板（涨/跌）当日不可买 —— 写进 rt_risks，LLM 不得放入可买表。
+    # 三态（2026-10-21 C1）：任一侧涨跌停状态未知（missing 且无昨收可近似）→
+    # buyable=None（待定，不可确认可买），**绝不给 True** —— 旧逻辑「一侧已知
+    # False 即 True」会在另一侧状态不明时漏掉封板票；limit_band="missing" 即
+    # 「未知」的可读标注（missing≠no_limit，见 references/limit-rules.md）。
+    if limit_up is True or limit_down is True:
         row["rt"]["buyable"] = False
-    elif limit_down is True:
-        row["rt"]["buyable"] = False
+    elif limit_up is None or limit_down is None:
+        row["rt"]["buyable"] = None
     else:
-        row["rt"]["buyable"] = None if (limit_up is None and limit_down is None) else True
+        row["rt"]["buyable"] = True
     row["stale_bar"] = stale
 
     if tech:
@@ -673,8 +784,10 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
 
     if name and not row.get("name"):
         row["name"] = name
-    if limit_up_price and row.get("tech") is not None and limit_up:
-        # 买不进：与 hard_exclusions 同语义，但 deep_analyze 不做淘汰，只标事实
+    if row.get("tech") is not None and limit_up:
+        # 买不进：与 hard_exclusions 同语义，但 deep_analyze 不做淘汰，只标事实。
+        # 不再要求 limit_up_price 有值（2026-10-21 C1）：价缺失但按公式近似判出
+        # 封板时，同样要留痕，否则 rt.buyable=false 与 rt_risks 口径分裂。
         risks = row.setdefault("rt_risks", [])
         if "涨停封板-当日买不进" not in risks:
             risks.append("涨停封板-当日买不进")

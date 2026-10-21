@@ -327,6 +327,17 @@ class BreakStrategy(StrategyBase):
         w = state["win"]
         return [(w[0]["t"], w[0]["c"]), (w[-1]["t"], w[-1]["c"])]
 
+    def state_dates(self, state: dict) -> list[str]:
+        """切片已吸纳的交易日（win 窗口，升序）—— 可选契约 `StateDatesAware`。
+
+        供 runner 做**断档自愈**比对：切片 win 若漏了市场里存在的中间交易日（某日
+        数据迟到 / daily_scan 整天未推进），只有比对二者才能发现（见
+        `runner._has_state_gap`）。2026-10-21 实证：10-19/10-20 断档 ⇒ 全市场 99.2%
+        的票 win 缺这两天 ⇒ 连板/断板结构识别失真。
+        """
+        w = state.get("win") or []
+        return [str(x.get("t") or "")[:10] for x in w if x.get("t")]
+
     def evaluate(self, state: dict, inp: DayInput, prev: "Progress | None") -> list:
         """信号日判定 + 结算链（判定规则单源到门表：候选定位 + 5a~5g 走 bk_struct + GateEvaluator）。
 

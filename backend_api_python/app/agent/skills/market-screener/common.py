@@ -531,56 +531,52 @@ def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bo
         return False  # 无涨跌幅（新股），不存在「封板买不进」
     change_pct = (close - prev_close) / prev_close * 100
     return change_pct >= limit_pct - 0.5
+# ── 四源取数（2026-10-21 fail-fast 收口）──
+# 旧版在此吞异常返回 [] / {"error":...}，调用方（candidate_pool / market_state）
+# 无法区分「源故障」与「真空无候选」⇒ 数据不可用被交付成「今日无候选」。
+# 现一律向上抛，由调用方记 missing / source_errors（_facts.py 同构处理）。
 def fetch_zt_pool(date: str) -> List[Dict]:
-    try:
-        from app.market_cn.dragon_limit import get_zt_pool
-        return get_zt_pool(date)
-    except Exception as e:
-        logger.warning("[MktScreen] 涨停池获取失败: %s", e)
-        return []
+    """涨停池。fail-fast：失败向上抛（调用方负责记 missing，不静默吞成空池）。"""
+    from app.market_cn.dragon_limit import get_zt_pool
+    return get_zt_pool(date)
 def fetch_dt_pool(date: str) -> List[Dict]:
-    try:
-        from app.market_cn.dragon_limit import get_dt_pool
-        return get_dt_pool(date)
-    except Exception as e:
-        logger.warning("[MktScreen] 跌停池获取失败: %s", e)
-        return []
+    """跌停池。fail-fast：同 fetch_zt_pool。"""
+    from app.market_cn.dragon_limit import get_dt_pool
+    return get_dt_pool(date)
 def fetch_broken_board(date: str) -> List[Dict]:
-    try:
-        from app.market_cn.dragon_limit import get_broken_board
-        return get_broken_board(date)
-    except Exception as e:
-        logger.warning("[MktScreen] 炸板池获取失败: %s", e)
-        return []
+    """炸板池。fail-fast：同 fetch_zt_pool。"""
+    from app.market_cn.dragon_limit import get_broken_board
+    return get_broken_board(date)
 def fetch_hot_stocks_with_reason(date: str) -> Dict:
+    """同花顺强势股+题材。fail-fast：HTTP 错误码与网络异常一律抛错。
+
+    旧版返回 {"error":...} 而 candidate_pool 不检查该键 ⇒ 源故障静默塌缩成
+    「热点真空」（2026-10-21 缺陷），故错误码改为抛错，与 zt/dt/broken 同构。
+    """
     import requests as _req
     url = (
         f"http://zx.10jqka.com.cn/event/api/getharden/"
         f"date/{date}/orderby/date/orderway/desc/charset/GBK/"
     )
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0"}
-    try:
-        r = _req.get(url, headers=headers, timeout=10)
-        data = r.json()
-        if data.get("errocode", 0) != 0:
-            return {"error": f"同花顺错误: {data.get('errormsg', '')}"}
-        rows = data.get("data") or []
-        stocks = [{
-            "code": row.get("code", ""), "name": row.get("name", ""),
-            "reason": row.get("reason", ""),
-            "change_pct": float(row.get("zhangfu", 0) or 0),
-            "turnover_pct": float(row.get("huanshou", 0) or 0),
-            "amount": float(row.get("chengjiaoe", 0) or 0),
-        } for row in rows]
-        tag_counter: Counter = Counter()
-        for s in stocks:
-            if s["reason"]:
-                tags = [t.strip() for t in s["reason"].replace("，", "+").replace(",", "+").split("+") if t.strip()]
-                tag_counter.update(tags)
-        return {"stocks": stocks, "hot_tags": tag_counter.most_common(20)}
-    except Exception as e:
-        logger.warning("[MktScreen] 强势股获取失败: %s", e)
-        return {"error": str(e)}
+    r = _req.get(url, headers=headers, timeout=10)
+    data = r.json()
+    if data.get("errocode", 0) != 0:
+        raise RuntimeError(f"同花顺错误: {data.get('errormsg', '')}")
+    rows = data.get("data") or []
+    stocks = [{
+        "code": row.get("code", ""), "name": row.get("name", ""),
+        "reason": row.get("reason", ""),
+        "change_pct": float(row.get("zhangfu", 0) or 0),
+        "turnover_pct": float(row.get("huanshou", 0) or 0),
+        "amount": float(row.get("chengjiaoe", 0) or 0),
+    } for row in rows]
+    tag_counter: Counter = Counter()
+    for s in stocks:
+        if s["reason"]:
+            tags = [t.strip() for t in s["reason"].replace("，", "+").replace(",", "+").split("+") if t.strip()]
+            tag_counter.update(tags)
+    return {"stocks": stocks, "hot_tags": tag_counter.most_common(20)}
 def fetch_hot_sectors() -> Dict:
     try:
         from app.market_cn.china_market import get_hot_sectors
@@ -677,13 +673,27 @@ def compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
+    """近 N 日涨停池（龙回头输入）。
+
+    容错口径（2026-10-21，配合四源 fail-fast）：单日失败跳过并留痕（历史某日
+    缺数据不致命）；但**全部日期都失败**时必须抛出——否则源故障会塌缩成
+    「近 8 日无涨停」，龙回头源随之静默空手而归（源失败显性化同一纪律）。
+    """
     pools = {}
     today = datetime.now()
+    last_err: Optional[Exception] = None
     for i in range(days):
         d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-        pool = fetch_zt_pool(d)
+        try:
+            pool = fetch_zt_pool(d)
+        except Exception as e:
+            last_err = e
+            logger.warning("[MktScreen] 近N日涨停池 %s 获取失败: %s", d, e)
+            continue
         if pool:
             pools[d] = pool
+    if not pools and last_err is not None:
+        raise last_err
     return pools
 def scan_dragon_pullback(date: str) -> List[Dict]:
     recent_pools = fetch_recent_zt_pools(8)

@@ -107,6 +107,14 @@ class V1Strategy(StrategyBase):
         return [(bars[0]["time"], bars[0]["close"]),
                 (bars[-1]["time"], bars[-1]["close"])]
 
+    def state_dates(self, state: dict) -> list[str]:
+        """切片已吸纳的交易日（bars 窗口，升序）—— 可选契约 `StateDatesAware`。
+
+        供 runner 比对市场数据做**断档自愈**（见 `runner._has_state_gap`）。
+        """
+        return [str(x.get("time") or "")[:10] for x in (state.get("bars") or ())
+                if x.get("time")]
+
     def evaluate(self, state, inp: DayInput, prev: Progress | None):
         if prev is not None:
             if prev.stage == "ready" and str(inp.bar.get("time", ""))[:10] > prev.date[:10]:

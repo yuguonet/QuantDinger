@@ -2,7 +2,7 @@
 """market-screener 分层漏斗测试（2026-10-20）。
 
 覆盖：batch_realtime_quotes 分块、fill_quote 扩展回填、objective_preexclude、
-score_pool 双保险软门槛、run() 分层编排。
+score_pool 双保险软门槛（含 2026-10-21 缺分保送 / 打分护栏）、run() 分层编排。
 包目录名含连字符，统一走 modpath.import_module。
 """
 import sys
@@ -241,7 +241,7 @@ def _fake_bundle_factory(profiles):
 
 
 def test_score_pool_dual_gate():
-    """p_up<0.40 剔除 + 排名后30%剔除 + 保底回捞 theme.hit。"""
+    """p_up<0.40 剔除 + 排名后30%剔除 + 保底回捞 theme.hit + 缺分保送（2026-10-21 修订）。"""
     profiles = [
         {"code": "A", "p_up": 0.60, "hard": [], "theme": {"hit": True, "tags": []}, "source": "热点题材"},
         {"code": "B", "p_up": 0.55, "hard": [], "theme": {"hit": False, "tags": []}, "source": "条件搜索"},
@@ -256,7 +256,8 @@ def test_score_pool_dual_gate():
     _helpers.profile_candidates = _fake_bundle_factory(profiles)
     try:
         selected, stats, meta = _helpers.score_pool(
-            candidates=[], strategy="post_market", market={}, main_themes=[("机器人", 3)],
+            [{"code": p["code"]} for p in profiles],
+            strategy="post_market", market={}, main_themes=[("机器人", 3)],
             p_up_floor=0.40, rank_cut=0.30, floor_keep=4)
     finally:
         _helpers.profile_candidates = orig
@@ -266,12 +267,94 @@ def test_score_pool_dual_gate():
     # G(0.30) p_up 地板剔；F(0.38) 地板剔但 theme.hit+龙回头 → 保底回捞
     assert "A" in codes and "B" in codes and "C" in codes and "D" in codes
     assert "G" not in codes, "G p_up=0.30 无保底资格应剔"
-    assert "H" not in codes, "无 p_up 不进 deep"
-    assert stats["no_pred"] == 1
+    # 2026-10-21 用户裁定：缺分（模型盲区）≠ 低分 ⇒ H 走缺分保送（默认名额 2）
+    assert "H" in codes, "H 无 p_up 但应缺分保送——模型盲区不是坏票"
+    assert any(p["code"] == "H" and p.get("no_pred_kept") for p in selected), \
+        "H 应标 no_pred_kept"
+    assert stats["no_pred"] == 1 and stats["no_pred_kept"] == 1
     assert stats["p_up_hard"] >= 1
     assert any(p["code"] == "F" and p.get("floor_kept") for p in selected), \
         "F 应被保底回捞并标 floor_kept"
     assert meta["mood_regime"] == "neutral"
+
+    # no_pred_keep=0 = 回到旧口径：缺分票不进 deep（旋钮可关）
+    _helpers.profile_candidates = _fake_bundle_factory(profiles)
+    try:
+        selected2, stats2, _ = _helpers.score_pool(
+            [{"code": p["code"]} for p in profiles],
+            strategy="post_market", market={}, main_themes=[("机器人", 3)],
+            p_up_floor=0.40, rank_cut=0.30, floor_keep=4, no_pred_keep=0)
+    finally:
+        _helpers.profile_candidates = orig
+    assert "H" not in {p["code"] for p in selected2}, "no_pred_keep=0 时缺分票不进"
+    assert stats2["no_pred_kept"] == 0
+
+
+def test_score_pool_no_pred_priority_and_quota():
+    """缺分保送按客观优先级（题材命中→稀缺来源→多源）占名额，配额外不进。
+
+    排序键是纯计数分层（_objective_rank_key），不编造分数；有分票仍按 p_up
+    排在前，缺分保送殿后。
+    """
+    profiles = [
+        {"code": "P3", "p_up": None, "hard": [], "theme": {"hit": False}, "source": "条件搜索"},
+        {"code": "P2", "p_up": None, "hard": [], "theme": {"hit": False}, "source": "连板+条件搜索"},
+        {"code": "P1", "p_up": None, "hard": [], "theme": {"hit": False}, "source": "龙回头"},
+        {"code": "P0", "p_up": None, "hard": [], "theme": {"hit": True}, "source": "条件搜索"},
+        {"code": "W", "p_up": 0.55, "hard": [], "theme": {"hit": False}, "source": "条件搜索"},
+    ]
+    orig = _helpers.profile_candidates
+    _helpers.profile_candidates = _fake_bundle_factory(profiles)
+    try:
+        selected, stats, _ = _helpers.score_pool(
+            [{"code": p["code"]} for p in profiles],
+            strategy="post_market", market={}, main_themes=[("机器人", 3)],
+            p_up_floor=0.40, rank_cut=0.0, floor_keep=0, no_pred_keep=2)
+    finally:
+        _helpers.profile_candidates = orig
+
+    codes = [p["code"] for p in selected]
+    assert set(codes) == {"W", "P0", "P1"}, \
+        f"配额2只应给题材命中P0+稀缺来源P1，实际{codes}"
+    assert codes == ["W", "P0", "P1"], f"有分票在前、缺分保送殿后，实际{codes}"
+    assert stats["no_pred"] == 4 and stats["no_pred_kept"] == 2
+
+
+def test_score_pool_budget_guard_skips_with_objective_priority(monkeypatch):
+    """超打分护栏（QD_SCREENER_SCORE_MAX）时按客观优先级让位，score_skipped 可复盘。
+
+    2026-10-21 修「隐形截断」：旧 _SCORE_BATCH=80 只给池序前 160 打分，后排票
+    永远没分；现改为全员打分（护栏 600，env 可调），真超护栏时才按纯计数
+    优先级（稀缺来源→多源）让位，不再按任意池序截断。
+    """
+    monkeypatch.setenv("QD_SCREENER_SCORE_MAX", "2")
+    seen = {}
+
+    def fake_bundle(prescreen_like, limit=20, with_flow=True, with_pred=True):
+        seen["codes"] = [c.get("code") for c in prescreen_like.get("candidates") or []]
+        return _fake_bundle_factory([
+            {"code": "B1", "p_up": 0.55, "hard": [], "theme": {"hit": False}, "source": "条件搜索"},
+            {"code": "B2", "p_up": 0.50, "hard": [], "theme": {"hit": False}, "source": "条件搜索"},
+        ])(prescreen_like, limit=limit, with_flow=with_flow, with_pred=with_pred)
+
+    candidates = [
+        {"code": "C1", "source": "条件搜索"},
+        {"code": "C2", "source": "龙回头"},
+        {"code": "C3", "source": "连板+条件搜索"},
+        {"code": "C4", "source": "条件搜索"},
+    ]
+    orig = _helpers.profile_candidates
+    _helpers.profile_candidates = fake_bundle
+    try:
+        selected, stats, _ = _helpers.score_pool(
+            candidates, strategy="post_market", market={}, main_themes=[])
+    finally:
+        _helpers.profile_candidates = orig
+
+    # 预算 2：稀缺来源 C2(tier1) + 多源 C3(tier2) 先拿 p_up，C1/C4 让位
+    assert seen["codes"] == ["C2", "C3"], f"让位顺序错，实际{seen['codes']}"
+    assert stats["score_skipped"] == 2
+    assert stats["scored"] == 2
 
 
 def test_score_pool_rank_cut_only():
@@ -285,7 +368,8 @@ def test_score_pool_rank_cut_only():
     _helpers.profile_candidates = _fake_bundle_factory(profiles)
     try:
         selected, stats, _ = _helpers.score_pool(
-            candidates=[], strategy="post_market", market={}, main_themes=[],
+            [{"code": p["code"]} for p in profiles],
+            strategy="post_market", market={}, main_themes=[],
             p_up_floor=0.40, rank_cut=0.30, floor_keep=0)
     finally:
         _helpers.profile_candidates = orig
@@ -323,9 +407,10 @@ def test_run_funnel_two_rounds_when_low_alive():
     round_params = []
 
     def fake_score_pool(cands, strategy="", market=None, main_themes=None,
-                        p_up_floor=0.40, rank_cut=0.30, floor_keep=4):
+                        p_up_floor=0.40, rank_cut=0.30, floor_keep=4,
+                        no_pred_keep=2):
         round_params.append({"p_up_floor": p_up_floor, "rank_cut": rank_cut,
-                             "floor_keep": floor_keep})
+                             "floor_keep": floor_keep, "no_pred_keep": no_pred_keep})
         if len(round_params) == 1:
             # Round0：只活 2 只
             selected = [{"code": "600000", "p_up": 0.55}, {"code": "600001", "p_up": 0.50}]
@@ -359,7 +444,9 @@ def test_run_funnel_two_rounds_when_low_alive():
 
     assert round_calls["n"] == 2, f"应两轮，实际{round_calls['n']}"
     assert round_params[0]["p_up_floor"] == 0.40
+    assert round_params[0]["no_pred_keep"] == 2, "Round0 缺分保送名额 2"
     assert round_params[1]["p_up_floor"] == 0.35, "Round1 应放宽地板"
+    assert round_params[1]["no_pred_keep"] == 3, "Round1 缺分保送名额应放宽到 3"
     assert "换手率大于3%" in round_calls["queries"][1], \
         f"Round1 queries 应含通用词，实际{round_calls['queries'][1]}"
     funnel = result["funnel"]

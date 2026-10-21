@@ -11,8 +11,12 @@
     python scripts/skill_run.py strategy-debug '{"fn": "debug_strategy", "kwargs": {"strategy": "break", "code": "600519"}}'
 
 输出（stdout，单行 JSON）：
-    {"name":..., "ok":bool, "result":<截断>,
-     "full_path":"<全量结果路径>", "elapsed_s":...}
+    {"name":..., "ok":bool, "result":<预览，恒为合法 JSON>,
+     "preview_note":<裁剪事实，仅被裁时出现>, "full_path":"<全量结果路径>",
+     "elapsed_s":...}
+    预览按**整条目**裁剪（2026-10-21）：条目要么完整、要么整条不在，永不盲切
+    字符 —— 盲切会把证据卡拦腰斩断，主 agent 拿到半张卡的坏 JSON。裁剪事实放
+    外层信封 preview_note（传输层元信息不混进技能载荷）。
 
 产物落点（F26-D2，2026-10-18）：
   · 工具路径（run_skill 派活）：父进程建好作业目录经 env `QD_SKILL_JOB_DIR` 传入，
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -48,7 +53,152 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
 #   目录里不再夹带运行时产物（`app/agent` 只放代码）。
 #   parents: 0=scripts 1=agent 2=app 3=backend_api_python
 _OUT_DIR = Path(__file__).resolve().parents[3] / "tmp" / "skill_output"
-_PREVIEW_LIMIT = 20000   # 回传主 agent 的预览上限（字符）；全量落盘不受限
+# ── 预览裁剪（2026-10-21，结构化裁剪替代字符盲切）──────────────────────
+# 预算推导（test_skill_run_preview.py 锁定）：market-screener 漏斗扩容后 run()
+# 契约 = 12 张 deep_analyze 证据卡 ≈ 24K 字符 + report_guide/funnel/market 等
+# 顶层信封 ≈ 2K ⇒ 32000 让 12 卡常态**完整送达**，再留 ~25% 余量防卡片膨胀。
+# 改小前先过 ① 号测试；env `QD_SKILL_PREVIEW_LIMIT` 可调（≤0/非法回落缺省）。
+_PREVIEW_LIMIT = 32000
+_STR_CUT_MARK = "……【字符串过长已截断，全量见 full_path】"   # 截断处可见标记
+_STR_CUT_MIN = 128   # 短于此的字符串不参与截断：截了救不回预算，还白毁语义
+_LIST_ITEM_SEP = 2   # json.dumps 缺省分隔符 ", " 的长度（批量估算条目占用用）
+
+
+def _preview_limit() -> int:
+    """预览预算：env `QD_SKILL_PREVIEW_LIMIT` 优先，≤0/非法回落模块缺省。"""
+    raw = os.environ.get("QD_SKILL_PREVIEW_LIMIT", "") or ""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return _PREVIEW_LIMIT
+    return v if v > 0 else _PREVIEW_LIMIT
+
+
+def _dumps(obj) -> str:
+    """预览统一序列化口径（与全量落盘一致：非 ASCII 直出、未知类型转 str）。"""
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _normalize(result):
+    """经 dumps/loads 往返把返回体拷成**纯 JSON 类型**副本。
+
+    易错点：裁剪必须工作在副本上 —— main() 之后还要把**原样** result 写进
+    full_path，且调用方（测试/技能）不得被预览改动污染；直接 deepcopy 会碰上
+    技能产出里的任意对象（default=str 的存在暗示了这一点），JSON 往返最稳。
+    """
+    return json.loads(_dumps(result))
+
+
+def _dict_list_paths(node, path: str):
+    """yield (path, list)：非空且元素**全为 dict** 的列表（可整条裁剪的候选）。
+
+    只裁 dict 列表：条目是自包含对象（证据卡/明细行），整条丢弃语义无损；
+    标量列表（themes/missing/errors）语义是"清单"，丢一项就是丢事实，不动。
+    path 以 "result" 为根（该对象在信封里就是 result 字段），列表层级记 "[]"。
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _dict_list_paths(v, f"{path}.{k}")
+    elif isinstance(node, list):
+        if node and all(isinstance(it, dict) for it in node):
+            yield path, node
+        for it in node:
+            yield from _dict_list_paths(it, f"{path}[]")
+
+
+def _drop_tail_items(work, limit: int, preview: str):
+    """第一层裁剪：按**整条目**丢。返回 ({裁剪路径: 丢的条数}, 新 preview)。
+
+    每轮挑序列化占比最大的候选列表，按条目均摊体积从**尾部**批量丢整条
+    （deep_analyze 按 p_up 降序，尾巴最弱）。丢完重序列化复核，不达标继续，
+    直到装下或无候选 —— 条目严格递减保证终止，绝不产出半条。
+    """
+    dropped: dict[str, int] = {}
+    while len(preview) > limit:
+        candidates = list(_dict_list_paths(work, "result"))
+        if not candidates:
+            break
+        path, lst = max(candidates, key=lambda c: len(_dumps(c[1])))
+        sizes = [len(_dumps(it)) + _LIST_ITEM_SEP for it in lst]
+        overshoot = len(preview) - limit
+        avg = sum(sizes) / len(sizes)
+        k = max(1, min(len(lst), math.ceil(overshoot / avg)))
+        del lst[-k:]
+        dropped[path] = dropped.get(path, 0) + k
+        preview = _dumps(work)
+    return dropped, preview
+
+
+def _string_spots(node):
+    """yield (container, key, value)：树里全部字符串值（container[key] 可回写），
+    key 在 list 容器里是下标。供第二层超大字符串截断用。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str):
+                yield node, k, v
+            else:
+                yield from _string_spots(v)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if isinstance(v, str):
+                yield node, i, v
+            else:
+                yield from _string_spots(v)
+
+
+def _cut_long_strings(work, limit: int, preview: str):
+    """第二层裁剪：超大字符串截短（唯一改语义的层级）。返回 (截断数, 新 preview)。
+
+    每轮挑最长串按超出量截短，截断处补 _STR_CUT_MARK 可见标记。源串去掉 c 个
+    字符至少省 c 个序列化字符（转义只多不少），故减去 len(MARK) 后仍保证
+    截后 ≤ 预算；找不到足够长的串就停手，宁可超预算也不毁短串语义。
+    """
+    cut = 0
+    while len(preview) > limit:
+        longest = None
+        for container, key, s in _string_spots(work):
+            if len(s) > _STR_CUT_MIN and (longest is None or len(s) > longest[2]):
+                longest = (container, key, s)
+        if longest is None:
+            break
+        container, key, s = longest
+        keep = max(0, len(s) - (len(preview) - limit) - len(_STR_CUT_MARK))
+        container[key] = s[:keep] + _STR_CUT_MARK
+        cut += 1
+        preview = _dumps(work)
+    return cut, preview
+
+
+def _build_preview(result, limit=None) -> tuple:
+    """把技能返回体裁成回传主 agent 的预览：恒为**合法 JSON**，永不盲切。
+
+    两层语义（tests/test_skill_run_preview.py 为契约）：
+      1. 整条目层：dict 列表从尾部丢整条，条目要么完整、要么整条不在；
+      2. 字符串层：整条丢完仍超预算时才截超大字符串，截断处留可见标记。
+    Returns:
+        (preview, note)。note 无裁剪时为 {}；被裁时
+        {"trimmed": True, "dropped_items": {路径: 条数}, "strings_cut": N}，
+        由 main() 放进**外层信封** preview_note 字段 —— 传输层元信息不混进技能载荷。
+    """
+    if limit is None or limit <= 0:
+        limit = _preview_limit()
+    work = _normalize(result)
+    preview = _dumps(work)
+    if len(preview) <= limit:
+        return preview, {}
+    dropped, preview = _drop_tail_items(work, limit, preview)
+    strings_cut = 0
+    if len(preview) > limit:
+        strings_cut, preview = _cut_long_strings(work, limit, preview)
+    if not (dropped or strings_cut):
+        # 结构上无可裁（无 dict 列表、无够长的串）——如实回全量，不伪造 note。
+        return preview, {}
+    note = {"trimmed": True}
+    if dropped:
+        note["dropped_items"] = dropped
+    if strings_cut:
+        note["strings_cut"] = strings_cut
+    return preview, note
 
 
 def _touch(job_dir: str) -> None:
@@ -140,14 +290,17 @@ def main() -> int:
         except Exception:
             full_path = None
 
-    preview = json.dumps(result, ensure_ascii=False, default=str)
-    if len(preview) > _PREVIEW_LIMIT:
-        preview = preview[:_PREVIEW_LIMIT] + f"\n……（结果共 {len(preview)} 字符，全量见 full_path）"
-    print(json.dumps({
+    # 预览按整条目结构化裁剪（永不盲切字符）；裁剪事实进外层信封 preview_note，
+    # 技能载荷 result 本身不被元信息污染（契约见 tests/test_skill_run_preview.py）。
+    preview, preview_note = _build_preview(result)
+    envelope = {
         "ok": True, "name": name, "fn": fn_name,
         "result": preview, "full_path": str(full_path) if full_path else "",
         "elapsed_s": round(time.time() - t0, 2),
-    }, ensure_ascii=False))
+    }
+    if preview_note:
+        envelope["preview_note"] = preview_note
+    print(json.dumps(envelope, ensure_ascii=False))
     return 0
 
 

@@ -83,6 +83,11 @@ def pre_screen(sources: str = None, queries: str = None, search_top_n: int = 50,
     except Exception as e:
         market = {}
         missing.append(f"市场状态: {type(e).__name__}: {e}")
+    else:
+        # 源级失败显性化（2026-10-21）：market_state 对涨停/跌停/炸板池降级返回但带
+        # source_errors，不合并进 missing 的话 dt/broken 源故障仍然不可见
+        for _se in (market.get("source_errors") or []):
+            missing.append(f"市场状态: {_se}")
 
     pool["market"] = market
     pool["sources_available"] = list(POOL_SOURCES)
@@ -220,20 +225,28 @@ _REPORT_GUIDE = {
     "words": "选股用 看多/中性/看空/回避（不入选）；用户问持仓才写「兑现」",
     "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors",
     "funnel": "funnel 是分层漏斗统计（rounds 轮数 / pool_raw 原始池 / excluded_obj 客观淘汰 / "
-              "scored 打分数 / excluded_score 软门槛淘汰明细 / deep_n 进 deep 数 / eastmoney_ok 搜索源是否可用）；"
+              "scored 打分数 / excluded_score 软门槛淘汰明细（含 no_pred_kept 缺分保送 / "
+              "score_skipped 超打分预算让位）/ deep_n 进 deep 数 / eastmoney_ok 搜索源是否可用）；"
               "写「数据可信度」时引用——eastmoney_ok=false 表示 search 来源缺失，结论依赖 zt/dragon/hot",
+    "no_pred": "标 no_pred_kept 的票是打分模型盲区（p_up 缺失），**不是坏票也不是低分**——"
+               "评分列写「无标定分」，六维照常给；并在「数据可信度」里点名模型盲区",
 }
 
 
-# ── 分层漏斗参数（2026-10-20）：Round0 严 → Round1 放宽 ──
+# ── 分层漏斗参数（2026-10-20；2026-10-21 增 no_pred_keep 缺分保送）──
 _FUNNEL_ROUNDS = (
-    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4},
-    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6},
+    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4, "no_pred_keep": 2},
+    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6, "no_pred_keep": 3},
 )
 _FUNNEL_MIN_ALIVE = 4       # Round0 存活 < 此数 → 自动进 Round1
 _FUNNEL_DEEP_N = 12         # 进 deep 的最终候选数（原 8）
 _FUNNEL_SEARCH_TOP_N = 100  # run() 扩池：每条查询拉满（pre_screen 默认 50 保留给手工调用）
 _FUNNEL_FALLBACK_QUERIES = ("换手率大于3%", "放量上涨")  # Round1 追加通用词
+
+# 源失败条目识别标记（2026-10-21）：missing 里出现这些子串 = 候选源/市场源故障，
+# 而不是数据缺口。candidate_pool 的 zt/龙回头/热点用「<源>源失败: …」措辞，
+# search 沿用既有「条件搜索[q]: …」，market_state 源错误经 pre_screen 加「市场状态: 」前缀。
+_SRC_FAIL_MARKS = ("源失败", "条件搜索[")
 
 
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
@@ -647,12 +660,16 @@ def run(sources: str = None, queries: str = None,
         "rounds": 0, "pool_raw": 0, "excluded_obj": {},
         "scored": 0,
         "excluded_score": {"hard": 0, "p_up_hard": 0, "rank_cut": 0,
-                           "no_pred": 0, "floor_kept": 0},
+                           "no_pred": 0, "no_pred_kept": 0, "floor_kept": 0,
+                           "score_skipped": 0},
         "deep_n": 0, "eastmoney_ok": True,
     }
     strategy = select_strategy()
     base_queries = [q.strip() for q in str(queries).split(",") if q.strip()] \
         if queries else []
+    # 候选池级缺口（源失败/日历标注，2026-10-21）：profile 画像层的 meta.missing
+    # 不含池级信息，空结果分支若只读 meta 会把「源故障空池」误交付成「无候选」
+    pool_missing: list = []
 
     selected = []
     meta = {}
@@ -676,6 +693,7 @@ def run(sources: str = None, queries: str = None,
 
         candidates = list(prescreen_result.get("candidates") or [])
         missing = list(prescreen_result.get("missing") or [])
+        pool_missing = missing   # 每轮覆盖，取最终决定轮口径
         search_failed = [m for m in missing if "条件搜索" in str(m)]
         # 各轮统计取「最终决定轮」口径：Round1 池 ⊇ Round0 池，累加会把同一批
         # 淘汰重复计数，且 pool_raw 与 scored 必须来自同一个池才自洽。
@@ -697,11 +715,13 @@ def run(sources: str = None, queries: str = None,
             p_up_floor=params["p_up_floor"],
             rank_cut=params["rank_cut"],
             floor_keep=params["floor_keep"],
+            no_pred_keep=params["no_pred_keep"],
         )
         funnel["scored"] = score_stats.get("scored", 0)
         funnel["excluded_score"] = {k: score_stats.get(k, 0)
                                     for k in ("hard", "p_up_hard", "rank_cut",
-                                              "no_pred", "floor_kept")}
+                                              "no_pred", "no_pred_kept",
+                                              "floor_kept", "score_skipped")}
         if len(selected) >= _FUNNEL_MIN_ALIVE:
             break
 
@@ -712,6 +732,16 @@ def run(sources: str = None, queries: str = None,
         # 空结果必须「可汇报」（沿用 2026-10-12 契约，funnel 补充漏斗口径）。
         # 原先只回 {analyzed: [], signal: "…"} ⇒ 模型无可写口径 ⇒ 转主对话重跑一遍
         # 同样逻辑（D-18）。这里把「筛了多少 / 因什么淘汰 / 有什么数据缺口」一并给出。
+        # 源故障显性化（2026-10-21）：pool_missing 含候选源失败/日历标注时，
+        # 必须写进 hard_reasons 并前置到 missing —— 防止把「数据不可用」交付成
+        # 「今日无候选」（pool_raw=0 + missing 为空的纯真空池只可能出现在
+        # 交易日 + 全源成功，否则 candidate_pool 已标注）。
+        src_fail_n = sum(1 for m in pool_missing
+                         if any(mark in str(m) for mark in _SRC_FAIL_MARKS))
+        hard_reasons = [f"{k}:{v}" for k, v in funnel["excluded_obj"].items() if v]
+        if src_fail_n:
+            hard_reasons.append(
+                f"候选源失败{src_fail_n}条（数据不可用≠真实空候选，明细见missing）")
         return SkillResult({
             "report_guide": _REPORT_GUIDE,
             "strategy": meta.get("strategy") or strategy,
@@ -720,8 +750,8 @@ def run(sources: str = None, queries: str = None,
             "pool_size": funnel["pool_raw"],
             "hard_blocked": sum(v for k, v in funnel["excluded_obj"].items()
                                 if k != "quotes_missing"),
-            "hard_reasons": [f"{k}:{v}" for k, v in funnel["excluded_obj"].items() if v],
-            "missing": list(meta.get("missing") or [])[:6],
+            "hard_reasons": hard_reasons,
+            "missing": (list(pool_missing) + list(meta.get("missing") or []))[:6],
             "errors": list(meta.get("errors") or [])[:3],
             "mood_regime": meta.get("mood_regime"),
             "themes": list(meta.get("themes") or [])[:5],

@@ -85,11 +85,25 @@ class DayInput:
     bar: dict
     ctx: dict | None = None
 
+class StateDatesAware(Protocol):
+    """可选契约：自报切片**已吸纳的交易日**（升序 YYYY-MM-DD）⇒ 支持断档自愈。
+
+    runner 策略无关，无从得知 state 内部推进过哪些日；"市场有 bar、切片没吸纳"
+    只能靠比对二者发现（见 `runner._has_state_gap`）。未实现 ⇒ 不检测，行为不变。
+    """
+
+    def state_dates(self, state: dict) -> list[str]:
+        ...
+
+
 class StrategyProtocol(Protocol):
     """展示层对策略的**结构化契约**（core → strategies 不产生 import 依赖）。
 
     生产 `strategies.base.StrategyBase` 实现本 Protocol（折叠契约已并入，
     全部策略单继承），展示层只按本 Protocol 取用，不感知任何策略细节（设计要点①）。
+
+    ⚠ 可选能力（如 `StateDatesAware`）不并入本 Protocol：并入会让未实现的策略在
+      类型校验上不合规。可选能力走 `getattr` 探测。
     """
 
     key: str
