@@ -1676,7 +1676,8 @@ def test_32_skill_injection_progressive():
          不带参数 = 全文（`skill_tools.py` 实测走 `load_body`），模型可自取，
          不再依赖历史是否还在。
 
-    判据：① 超阈值技能注入块必须带 [技能目录] + [按需读取]
+    判据：① 超阈值技能注入块必须带 [技能大纲] + [按需读取]
+          （2026-10-20：注入层改「使用场景 + 小节可选」，标记 [技能目录]→[技能大纲]）
           ② resource 路标必须与 `list_resources()` 实况一致（防指向空气）
           ③ 指针必须给出"完整正文"自取方式（防压缩后正文消失）
           ④ 同会话二次命中→指针；换 session→重新注入（知识型=正文 / 执行型=分发卡片，不串味）
@@ -1707,8 +1708,9 @@ def test_32_skill_injection_progressive():
               f"当前无 >{_CAP} 字符的技能，①②③ 跳过")
         return
 
-    _no_ol = [_n for _n, _b in _big if "[技能目录]" not in _blk(_n, _b, _sk)]
-    check(f"超阈值技能注入块含 [技能目录]（{len(_big)} 个）", not _no_ol, ",".join(_no_ol))
+    # 2026-10-20 注入层改「使用场景 + 小节可选」后标记改名 [技能大纲]（原 [技能目录]）
+    _no_ol = [_n for _n, _b in _big if "[技能大纲]" not in _blk(_n, _b, _sk)]
+    check(f"超阈值技能注入块含 [技能大纲]（{len(_big)} 个）", not _no_ol, ",".join(_no_ol))
     _no_rd = [_n for _n, _b in _big if "[按需读取]" not in _blk(_n, _b, _sk)]
     check("超阈值技能注入块含 [按需读取] 路标", not _no_rd, ",".join(_no_rd))
 
@@ -2316,18 +2318,23 @@ def test_38_exec_skill_dispatch_card():
     # 21 万 token / budget_wrapped。空结果纪律只堵了「空」，没堵「非空但不信任」。
     # 锁两处：卡片带非空提示、qd_system.txt 带「非空结果纪律」+ 禁止重验。
     check("卡片含非空结果纪律（证据齐 ⇒ 直接写结论，禁止逐只重拉 quote/flow/tech）",
-          all(t in card for t in ("非空结果", "禁止", "inspect_stock")), card[-200:])
+          all(t in card for t in ("非空结果", "禁止", "run_skill")), card[-200:])
     try:
         import os as _os39
         _sys_txt39 = open(_os39.path.join(_os39.path.dirname(_os39.path.abspath(__file__)),
                                          "..", "prompts", "qd_system.txt"),
                           encoding="utf-8").read()
         _sec2 = _sys_txt39.split("## 重活分发", 1)[1].split("\n## ", 1)[0]
-        # 口径订正（2026-10-16）：prompt 侧（qd_system.txt:95 与 dispatch_card.md:6）均为
-        # 「≤1 轮」（对最终可买 Top1 调 inspect_stock），测试旧值「≤2」为 10-14 首版遗留。
+        # 口径订正（2026-10-16）：prompt 侧（qd_system.txt §重活分发 与 dispatch_card.md）
+        # 均为「≤1 轮」补取，测试旧值「≤2」为 10-14 首版遗留。
+        # ★ 2026-10-20 修正错误调用：原断言写 `inspect_stock`，但它是
+        #   `skills/market-screener/run.py` 的**技能内部函数**，主对话工具面里没有
+        #   （ToolProvider 55 项 + mimo 原生工具均无）⇒ 模型照做必得 Unknown tool。
+        #   正确手段是「再派一次 run_skill（开 deep / with_mtf）」——意图不变
+        #   （补取 ≤1 轮且走流水线，不逐只重拉），只是换成主对话真能调到的工具。
         check("qd_system.txt §重活分发含非空结果纪律（直接交付 + ≤1 轮补取）",
               "非空结果纪律" in _sec2 and "禁止" in _sec2
-              and "inspect_stock" in _sec2 and "≤1" in _sec2, _sec2[-200:])
+              and "run_skill" in _sec2 and "≤1" in _sec2, _sec2[-200:])
     except Exception as _e39:
         check("qd_system.txt §重活分发非空纪律可读", False, f"{type(_e39).__name__}: {_e39}")
 

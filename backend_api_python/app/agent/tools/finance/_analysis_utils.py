@@ -62,6 +62,67 @@ def _fetch_ohlcv(stock_code: str, days: int = 120) -> Dict[str, List[float]]:
 # 数值工具
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# K线聚合摘要（2026-10-21）
+# ═══════════════════════════════════════════════════════════════
+
+def _kline_summary(bars: List[Dict[str, Any]], ma_windows=(5, 10, 20, 60, 120)) -> Dict[str, Any]:
+    """把原始 OHLCV 序列压成**聚合摘要**（均线 / 关键高低点 / 量能）。
+
+    【为什么需要】`agent_get_kline` 返回的是逐日 OHLCV 明细。实测一只票 120 天
+    = 4,212 字符，而模型最终输出只引用 4 个日期（最近 6–20 个交易日内的前高/前低/
+    套牢区/顶底分型）—— 明细表里绝大多数行是**冗余**。更要紧的是：模型为了写
+    "均���/量比/关键位"这类结论，得**自己从长表逐行算**，这既费 token 又容易算错
+    （实测输出里出现过"剔除某日后合计 -2.40 亿（算式：-1.01-0.33-1.06+0.003）"
+    这种把明细当账本翻的用法）。
+
+    【给什么】只给模型做判断真正需要的聚合量，缺一档就少一档（不补零、不编造）：
+      · ma5/ma10/ma20/ma60/ma120 —— 窗口不足该档则**不给该键**（不是给 0；
+        与项目「缺失值 None 不回落 0」铁律一致）；
+      · high_N / low_N + 对应日期 —— 近 N 日关键高低点（模型写支撑阻力的原料）；
+      · recent_vol / vol_ma5 / vol_ratio —— 近 5 日均量与量比（缩量/放量判断）；
+      · total_days —— 实际返回天数（模型据此判断窗口够不够）。
+
+    【不做什么】不预测、不给买卖建议、不替模型下结论——只是把"从长表算"变成
+    "读现成值"。详细数值仍在明细表里，摘要**不替代**明细，两者是互补关系。
+    """
+    n = len(bars)
+    out: Dict[str, Any] = {"total_days": n}
+    if n == 0:
+        return out
+
+    closes = [float(b.get("c", 0) or 0) for b in bars]
+    highs = [float(b.get("h", 0) or 0) for b in bars]
+    lows = [float(b.get("l", 0) or 0) for b in bars]
+    vols = [float(b.get("v", 0) or 0) for b in bars]
+
+    # 均线：窗口不足则**不给该键**（缺就是缺，不回落 0）
+    for w in ma_windows:
+        if n >= w:
+            out["ma%d" % w] = round(sum(closes[-w:]) / w, 3)
+
+    # 近 N 日关键高低点（模型写支撑阻力的直接原料）
+    for w in (20, 60):
+        if n >= w:
+            seg_h, seg_l = highs[-w:], lows[-w:]
+            out["high_%dd" % w] = round(max(seg_h), 2)
+            out["low_%dd" % w] = round(min(seg_l), 2)
+            out["high_%dd_date" % w] = bars[-w + seg_h.index(max(seg_h))].get("t")
+            out["low_%dd_date" % w] = bars[-w + seg_l.index(min(seg_l))].get("t")
+
+    # 量能：近 5 日均量 + 量比（缩量/放量判断；量比 = 近1日 / 5日均量）
+    if n >= 5:
+        vol_ma5 = sum(vols[-5:]) / 5.0
+        out["vol_ma5"] = round(vol_ma5, 0)
+        if n >= 2 and vol_ma5 > 0:
+            out["vol_ratio"] = round(vols[-1] / vol_ma5, 3)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# 数值工具
+# ═══════════════════════════════════════════════════════════════
+
 def _safe_round(v: float, n: int = 4) -> float:
     """安全四舍五入，处理 NaN/Inf。"""
     if v is None or math.isnan(v) or math.isinf(v):

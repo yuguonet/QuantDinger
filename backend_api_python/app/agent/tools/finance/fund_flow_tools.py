@@ -148,17 +148,30 @@ def get_concept_fund_flow(indicator: str = "今日") -> dict:
     except Exception as e:
         logger.warning("get_concept_fund_flow failed: %s", e)
         return {"error": str(e)}
-def get_fund_flow_daily(codes: str, days: int = 120) -> dict:
+def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
 
     Returns:
-        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
-        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{code, total_days, recent_20d_main_net, data:[...]}（日线列表在 data）。
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果}, "error": None}；
+        失败 → {"error": "...", "retriable": False}。单股结果字段：
+        {code, total_days, recent_5d_main_net, recent_20d_main_net,
+         main_net_streak, main_net_streak_dir, max_main_net_day, max_main_net,
+         recent_20d_main_net_ex_max, recent_5d_sign, data:[...]}
+        前两项是近 5/20 日主力累计（元）；main_net_streak 是主力连续同向天数；
+        max_main_net_day / recent_20d_main_net_ex_max 用于"剔除某单日后的累计"口径；
+        recent_5d_sign 是近 5 日逐日符号序列（"+"主力净流入 / "-"净流出）。
 
     Args:
         codes: 多股用逗号分隔
-        days: 回溯天数，默认120
+        days: 回溯天数，默认 30
     """
+    # ── days 默认 30 的依据（2026-10-21 实测；论证不进 docstring：docstring 是
+    # 工具契约，模型逐轮读，只该讲"干什么/怎么传/返回什么"）──
+    #   ① 返回头已有 recent_5d/recent_20d 摘要 ⇒ 30 天覆盖 20 天窗口；
+    #   ② 实测 120 天明细 8,496 字符（占单轮输入约 29%），而模型输出只引用 4 个
+    #      日期（10-14/10-15/10-20/10-21）⇒ 缩到 30 省约 6,372 字符。
+    # 权威口径落工具层：auto-* 技能会被 chain/skill_brewer.maybe_revise 重写，
+    #   且实测模型不传参时直接走这里。
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}

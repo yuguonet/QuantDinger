@@ -14,6 +14,9 @@ market-screener/_helpers.py — 事实与证据层（不做选股决策）
 
 设计红线：
     · 本模块禁止根据「策略偏好」剔除候选；只标注客观事实与不可执行项
+   2026-10-20 分层：objective_preexclude / score_pool 是 run() 漏斗编排层的函数——
+   前者只排除客观不可交易项（与 hard_exclusions 同一性质，用实时行情提前做），
+   后者做双保险软门槛（p_up 地板+排名尾部+保底回捞）。偏好取舍仍归 LLM。
     · 所有回退必须留痕（missing / errors），不静默吞异常 —— 否则 LLM 会把数据缺口当成无信号
 """
 
@@ -25,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 # 证据卡默认上限：候选池可达数百只，全量画像会撑爆上下文（trim 优先保证「有证据」而非「全」）
 _PROFILE_LIMIT_DEFAULT = 20
+_SCORE_BATCH = 80  # 漏斗打分批上限：profile_candidates(limit=80) 内部 pool=160/kept=80
 # 并发取数线程数：IO 密集（DB 查询），线程池有效（GIL 在 IO 等待期会释放）
 _FETCH_WORKERS = 8
 # 单批取数等待上限：DB/网络抖动时不拖垮整轮选股（超时项计入 missing）
@@ -313,44 +317,267 @@ _STALE_BAR_REL_TOL = 0.005
 
 
 def fetch_rt_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """批量取实时行情快照。返回 {code: {...}}；取不到的代码**缺席**（不塞空壳）。
+    """批量实时行情 → {code: rt事实}；2026-10-20 改分块绕过 20 只截断。
 
-    字段口径与 get_realtime_quote 三键契约对齐：last / changePercent /
-    previousClose / limit_up（涨停价）/ time。
+    失败块只丢该块并 logger.warning，不整批作废；返回 map 只含成功票，失败票缺席。
     """
     if not codes:
         return {}
+    from .common import batch_realtime_quotes
     try:
-        from ...tools.finance.data_tools import get_realtime_quote
-        q = get_realtime_quote(",".join(codes[:20]))
+        quotes, failed = batch_realtime_quotes(codes)
     except Exception as e:
-        logger.warning("[MktScreen] 实时行情批量取数失败: %s", e)
+        logger.warning("[MktScreen] 实时行情分块失败: %s", e)
         return {}
-    if not isinstance(q, dict) or q.get("error"):
-        logger.warning("[MktScreen] 实时行情返回异常: %s", (q or {}).get("error"))
-        return {}
-    data = q.get("data") if isinstance(q.get("data"), dict) else q
-    out: Dict[str, Dict[str, Any]] = {}
-    if not isinstance(data, dict):
-        return out
-    for code, info in data.items():
-        if not isinstance(info, dict) or info.get("error"):
+    if failed:
+        logger.warning("[MktScreen] 实时行情分块失败 %d 块，涉及 %d 只",
+                       len(failed), sum(len(c) for c in failed))
+    out = {}
+    for code in codes:
+        info = quotes.get(code)
+        if not isinstance(info, dict):
             continue
-        last = _f(info.get("last") or info.get("price"))
-        if last is None:
+        last_raw = info.get("last") or info.get("price")
+        if last_raw is None:
             continue
-        out[str(code)] = {
-            "price": round(float(last), 2),
-            "change_pct": _f(info.get("changePercent", info.get("change_pct"))),
-            "previous_close": _f(info.get("previousClose") or info.get("prev_close")),
+        last = _f(last_raw)
+        out[code] = {
+            "price": last,
+            "change_pct": _f(info.get("changePercent")),
+            "previous_close": _f(info.get("previousClose")),
             "limit_up_price": _f(info.get("limit_up")),
             "limit_down_price": _f(info.get("limit_down")),
             "high": _f(info.get("high")),
             "low": _f(info.get("low")),
             "time": info.get("time"),
-            "name": info.get("name") or "",
+            "name": info.get("name"),
         }
     return out
+
+
+def objective_preexclude(candidates, strategy, quotes=None):
+    """客观事实预排除——run() 内部漏斗第 1 层（2026-10-20）。
+
+    只排除客观不可交易项（与 hard_exclusions 同性质，但用实时行情在画像前做，
+    省掉注定进不了 deep 的票的 kline/pred 开销）：
+
+    - 所有时段：ST/退市、停牌（仅显式 suspended 标记）、价格带 [2,300]、
+      换手 <1%（字段存在且 >0 才判，缺失不剔）
+    - intraday / eod：涨停封板、跌停封死（当日买不进/无流动性）
+    - post_market：不排涨停（次日仍可买），仅标记；跌停封死仍排
+
+    涨停判定：quotes 里 limit_up 价 >0 且现价 >= 价-0.01；哨兵 <=0 = 无涨跌幅限制不排；
+    缺行情回退 common.is_limit_locked(code, name, close, prev_close)；
+    两者都拿不到 → 不剔，计入 stats["quotes_missing"]。
+
+    Args:
+        candidates: pre_screen 返回的候选列表（dict）
+        strategy: intraday / eod / post_market
+        quotes: 可选 {code: 行情dict}；缺省时只用候选自身字段（fill_quote 已回填）
+
+    Returns:
+        (kept, stats): kept=保留候选（原 dict 引用，不复制）；
+            stats=excluded_stats 各类计数 {limit_up, limit_down, st, suspended,
+            price_band, low_turnover, quotes_missing}
+    """
+    from .common import is_limit_locked
+
+    strategy = strategy or "post_market"
+    exclude_limit = strategy in ("intraday", "eod")
+    stats = {"limit_up": 0, "limit_down": 0, "st": 0, "suspended": 0,
+             "price_band": 0, "low_turnover": 0, "quotes_missing": 0}
+    kept = []
+    quotes = quotes or {}
+
+    for item in candidates or []:
+        code = str(item.get("code") or "")
+        name = str(item.get("name") or "")
+        src = str(item.get("source") or "")
+
+        # 停牌：仅显式 suspended 标记才剔（缺行情不算停牌）
+        if item.get("suspended"):
+            stats["suspended"] += 1
+            continue
+
+        # ST / 退市（与 hard_exclusions 同判定口径）
+        if "ST" in name.upper() or src == "ST股" or "退" in name:
+            stats["st"] += 1
+            continue
+
+        # 价格带 [2, 300]（缺价 raw=None 不剔，与换手规则同口径）
+        price_raw = item.get("price") if item.get("price") is not None else item.get("close")
+        price = _f(price_raw) if price_raw is not None else None
+        if price is not None and (price < 2 or price > 300):
+            stats["price_band"] += 1
+            continue
+
+        # 换手 <1%：字段存在且 >0 才判（0/None = 数据不全，不据此剔）
+        trn = _f(item.get("turnover_pct"))
+        if trn is not None and 0 < trn < 1:
+            stats["low_turnover"] += 1
+            continue
+
+        # 涨跌停封板判定：quotes 优先，缺则用候选自身回填字段，再缺回退日线
+        rt = quotes.get(code) if isinstance(quotes.get(code), dict) else None
+        # 缺失保持 None（_f(None)=0.0 会把「没价」变成「价为0」→ 100% 误判跌停，
+        # 2026-10-21 线上假阴性根因之一；与下方 line「判不了不剔计 quotes_missing」同语义）
+        last_raw = (rt or {}).get("last") or (rt or {}).get("price") or item.get("price")
+        last = _f(last_raw) if last_raw is not None else None
+        # Need to distinguish "missing" from "sentinel 0"
+        up_px_raw = None
+        if rt and rt.get("limit_up") is not None:
+            up_px_raw = rt.get("limit_up")
+        elif item.get("limit_up") is not None:
+            up_px_raw = item.get("limit_up")
+        up_px = _f(up_px_raw)
+        down_px_raw = None
+        if rt and rt.get("limit_down") is not None:
+            down_px_raw = rt.get("limit_down")
+        elif item.get("limit_down") is not None:
+            down_px_raw = item.get("limit_down")
+        down_px = _f(down_px_raw)
+        prev_close_raw = None
+        if rt and rt.get("previousClose") is not None:
+            prev_close_raw = rt.get("previousClose")
+        elif item.get("previous_close") is not None:
+            prev_close_raw = item.get("previous_close")
+        prev_close = _f(prev_close_raw)
+
+        limit_up = None
+        limit_down = None
+        if up_px_raw is not None:  # 有字段值
+            if up_px > 0:
+                if last is not None:  # 缺价判不了 → 保持 None（计 quotes_missing）
+                    limit_up = last >= up_px - 0.01
+            elif up_px <= 0:  # 哨兵 <=0：无涨跌幅限制
+                limit_up = False
+        if down_px_raw is not None:
+            if down_px > 0:
+                if last is not None:
+                    limit_down = last <= down_px + 0.01
+            elif down_px <= 0:
+                limit_down = False
+
+        # 实时信息不足以判涨停 → 回退日线 is_limit_locked
+        if limit_up is None and last is not None and prev_close and prev_close > 0:
+            try:
+                limit_up = is_limit_locked(code, name, last, prev_close)
+            except Exception:
+                limit_up = None
+
+        if limit_up is None and limit_down is None:
+            stats["quotes_missing"] += 1  # 判不了，不剔，留痕
+
+        if limit_up:
+            item["_preexcluded"] = "涨停封板"
+            if exclude_limit:
+                stats["limit_up"] += 1
+                continue
+        if limit_down:
+            item["_preexcluded"] = "跌停封死"
+            stats["limit_down"] += 1  # 跌停封死所有时段都排（无流动性）
+            continue
+
+        kept.append(item)
+    return kept, stats
+
+
+def score_pool(candidates, strategy="", market=None, main_themes=None,
+               p_up_floor=0.40, rank_cut=0.30, floor_keep=4):
+    """双保险软门槛——run() 内部漏斗第 2 层（2026-10-20）。
+
+    复用 profile_candidates（limit=_SCORE_BATCH, with_flow=False, with_pred=True）
+    拿 kline+p_up（不二次拉数），然后：
+
+    0. hard 剔除：profile 层 hard_exclusions 标记的客观不可交易票不进 deep，
+       计 stats["hard"]（不占 deep 名额，但漏斗必须可复盘）
+    1. 硬地板：p_up < p_up_floor 剔除
+    2. 相对排名：按 p_up 降序去掉后 rank_cut（比例，0~0.9）
+    3. 保底回捞：被剔但 theme.hit 或 source 含「龙回头/热点」的前 floor_keep 只，
+       标 floor_kept=true 放回——避免硬切断丢掉稀缺题材票
+    4. 无 p_up 的票不进 deep，只计 stats["no_pred"]（打分模型覆盖不到的票
+       不应占 deep 名额，但要在 funnel 里可见）
+
+    Args:
+        candidates: objective_preexclude 保留的候选（dict 列表）
+        strategy / market / main_themes: 透传给 profile_candidates 的上下文
+        p_up_floor: p_up 硬地板（Round0=0.40, Round1=0.35）
+        rank_cut: 排名尾部剔除比例（Round0=0.30, Round1=0.15）
+        floor_keep: 保底回捞只数上限（Round0=4, Round1=6）
+
+    Returns:
+        (selected, stats, meta): selected=可进 deep 的 profiles（按 p_up 降序，
+            含 floor_kept）；stats={hard, p_up_hard, rank_cut, no_pred,
+            floor_kept, scored}；
+            meta=profile_bundle 附加上下文 {strategy, market, mood_regime, themes,
+            hints, missing, errors} 供 run() 空结果分支使用。
+    """
+    prescreen_like = {
+        "strategy": strategy,
+        "market": market or {},
+        "main_themes": main_themes or [],
+        "candidates": candidates,
+    }
+    bundle = profile_candidates(prescreen_like, limit=_SCORE_BATCH,
+                                with_flow=False, with_pred=True)
+    profiles_all = bundle.get("profiles", [])
+    hard_n = sum(1 for p in profiles_all if p.get("hard"))
+    profiles = [p for p in profiles_all if not p.get("hard")]
+
+    with_pred = [p for p in profiles if p.get("p_up") is not None]
+    no_pred_n = len(profiles) - len(with_pred)
+
+    ranked = sorted(with_pred, key=lambda x: x.get("p_up") or 0, reverse=True)
+    n = len(ranked)
+    cut_start = int(n * (1 - max(0.0, min(float(rank_cut), 0.9))))
+
+    kept = []
+    cut_list = []
+    p_up_hard_n = 0
+    rank_cut_n = 0
+    for i, p in enumerate(ranked):
+        p_up = p.get("p_up") or 0
+        if p_up < p_up_floor:
+            cut_list.append(p)
+            p_up_hard_n += 1
+        elif n > 1 and i >= cut_start:
+            cut_list.append(p)
+            rank_cut_n += 1
+        else:
+            kept.append(p)
+
+    # 保底回捞：题材命中或稀缺来源（龙回头/热点）
+    rescued = []
+    for p in cut_list:
+        theme = p.get("theme") or {}
+        source = str(p.get("source") or "")
+        scarce = ("龙回头" in source) or ("热点" in source)
+        if theme.get("hit") or scarce:
+            rescued.append(p)
+    floor_kept = rescued[:max(0, int(floor_keep))]
+    for p in floor_kept:
+        p["floor_kept"] = True
+
+    selected = kept + floor_kept
+    selected.sort(key=lambda x: x.get("p_up") or 0, reverse=True)
+    stats = {
+        "hard": hard_n,
+        "p_up_hard": p_up_hard_n,
+        "rank_cut": rank_cut_n,
+        "no_pred": no_pred_n,
+        "floor_kept": len(floor_kept),
+        "scored": len(profiles),
+    }
+    meta = {
+        "strategy": bundle.get("strategy"),
+        "market": bundle.get("market"),
+        "mood_regime": bundle.get("mood_regime"),
+        "themes": bundle.get("themes"),
+        "hints": bundle.get("hints"),
+        "missing": bundle.get("missing"),
+        "errors": bundle.get("errors"),
+    }
+    return selected, stats, meta
 
 
 def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
@@ -712,8 +939,9 @@ def profile_candidates(
             close = bars[-1]["close"]
             if len(bars) >= 2:
                 item["limit_locked"] = is_limit_locked(code, name, bars[-1]["close"], bars[-2]["close"])
-            item.setdefault("change_pct", round(
-                (bars[-1]["close"] - bars[-2]["close"]) / bars[-2]["close"] * 100, 2))
+                # 涨幅需两根日线，单根（新股/取数截断）无环比基准，留空
+                item.setdefault("change_pct", round(
+                    (bars[-1]["close"] - bars[-2]["close"]) / bars[-2]["close"] * 100, 2))
             item.setdefault("price", bars[-1]["close"])
         else:
             miss.append("日线缺失")

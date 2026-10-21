@@ -1100,11 +1100,41 @@ def _fund_flow_sina_daily(code: str, days: int = 120) -> Optional[Dict[str, Any]
     rows.sort(key=lambda x: x["date"])  # 升序 (旧->新)，与东财口径一致
     recent_5 = rows[-5:] if len(rows) >= 5 else rows
     recent_20 = rows[-20:] if len(rows) >= 20 else rows
+    # ★ 2026-10-21 聚合摘要扩展（原来只有 5/20 日累计，模型仍要自己翻明细）：
+    #   实测模型写「近5日 +4.18亿，主要来自 10-14 单日 +6.58亿；剔除该日后
+    #   10-15→10-20 合计约 -2.40亿（算式：-1.01-0.33-1.06+0.003）」——就是把
+    #   明细当账本逐行加。这三个量**正是它每次都要自己算的**，直接给：
+    #     main_net_streak  —— 主力连续净流入/流出的天数与方向（"近3日净流出"直接读）
+    #     max_main_net_day / 剔除该单日后的 20 日累计（"剔除某日后合计"直接读）
+    #     recent_5d_sign    —— 近 5 日逐日符号序列（"是否连续流出"一眼可判）
+    streak = 0
+    if rows:
+        last_sign = (1 if rows[-1]["main_net"] >= 0 else -1)
+        for r in reversed(rows):
+            s = (1 if r["main_net"] >= 0 else -1)
+            if s != last_sign:
+                break
+            streak += 1
+    main_vals = [r["main_net"] for r in rows]
+    max_i = max(range(len(main_vals)), key=lambda i: main_vals[i]) if main_vals else -1
+    # 剔除最大单日：按**索引**排除（不能用 `is not` / `!=` 比 dict —— 相同内容
+    # 的不同对象会被误判为"没剔除"，相同 dict 也会被误剔除）
+    excl20_idx = {i for i in range(len(rows)) if i not in (max_i,)}
+    recent_20_idx = range(max(0, len(rows) - 20), len(rows))
+    excl20 = [rows[i]["main_net"] for i in recent_20_idx if i in excl20_idx]
     return {
         "code": code,
         "total_days": len(rows),
         "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
         "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
+        # ── 以下为 2026-10-21 新增摘要 ──
+        "main_net_streak": streak,                      # 连续同向天数
+        "main_net_streak_dir": ("inflow" if (rows and rows[-1]["main_net"] >= 0)
+                                else "outflow"),
+        "max_main_net_day": (rows[max_i]["date"] if max_i >= 0 else None),
+        "max_main_net": (round(main_vals[max_i], 2) if max_i >= 0 else None),
+        "recent_20d_main_net_ex_max": round(sum(excl20), 2),  # 剔除最大单日后
+        "recent_5d_sign": "".join("+" if r["main_net"] >= 0 else "-" for r in recent_5),
         "data": rows,
         "source": "sina",
     }

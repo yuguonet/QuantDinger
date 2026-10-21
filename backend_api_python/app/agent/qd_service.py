@@ -69,6 +69,78 @@ def _clip(text: str, limit: int) -> str:
     return window                    # 无可用边界：硬切（保持原上限语义）
 
 
+def _first_paragraph(text: str, limit: int = 600) -> str:
+    """取首个空行之前的首段（行内空白折叠），作为无 ## 结构技能的降级引导段。
+
+    只在技能正文**没有任何 ## 标题**时才用——有结构时一律走 `_skill_block` 的
+    首个 ## 段抽取（更贴近"使用场景"）。本函数是最后保底，**绝不盲截整篇**。
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    para = re.split(r"\n\s*\n", s, maxsplit=1)[0].strip()
+    para = re.sub(r"\s+", " ", para)
+    return para[:limit]
+
+
+def _history_headline(text: str, limit: int = 120) -> str:
+    """把旧 assistant 答案**降级成一行标题**（记忆近史专用，2026-10-21）。
+
+    【为什么降级而不是原样注入】记忆近史里的 assistant 段是**上一轮的完整
+    诊断**（Markdown 标题 + 结论表格 + 关键位）。原样注入有两个实测问题：
+
+      ① **过时数字混入**：实测捕获（tmp/llm_capture_step2_20261021.jsonl 步 2
+         user 第 125 行）注入的是半截表格
+         `| **今日表现** | 跌停收盘（-9.96%），光头光脚大阴线 |`——
+         而本轮实际是 **+2.83%**。system 自己的数字纪律明写「价格、前高/前低、
+         均线、涨跌停等关键锚点**必须本轮复核**」，输入里却摆着上次的涨跌停。
+      ② **身份不可辨**：旧答案与模型自己刚产出的最终答案**格式完全同构**
+         （`## 标题` + `| 表格 |`）⇒ 模型无法快速判断这段是"历史"还是"本轮事实"。
+
+    【保留什么、丢弃什么】**留标题行（含标的/周期/时点）、丢正文**：
+      · 标题行承载了"上次分析过什么标的、什么周期"——这是续接（同一标的追问、
+        周期变化）真正需要的上下文；
+      · **时点**额外抽一次（`MemoryMessage` 只有 role/content、**无时间戳字段**，
+        只能从旧答案正文的「分析时点/诊断日期」里正则捞）——模型据此判断这条
+        历史有多旧，是否还值得参考；
+      · 正文里的价格/涨跌幅/关键位**全部是旧时点的**，留着比不留更危险
+        （模型会当锚点用），故一律不进上下文。
+      · 2026-10-21 用户裁定：**只做降级，不加警示头尾**（保持注入块形态不变）。
+
+    【无标题时怎么办】取首个非空行（并按 limit 截断）——旧答案没有 `##`
+    标题时也不至于退化成空串（空串会让 `- assistant:` 成为无信息的空行）。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    title = ""
+    for line in s.split("\n"):
+        ln = line.strip()
+        if not ln:
+            continue
+        if ln.startswith("#"):
+            ln = ln.lstrip("#").strip()
+            if ln:
+                title = _clip(ln, limit)
+                break
+        # 非标题行：首个非空行就是标题（模型答案通常第一行就是 ## 标题）
+        title = _clip(ln, limit)
+        break
+    if not title:
+        return ""
+    # 时点抽取：优先「分析时点 / 诊断日期 / 时点」后的日期时间，其次任意日期
+    stamp = ""
+    m = re.search(r"(?:分析时点|诊断日期|时点)\s*[:：]?\s*"
+                  r"(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?)", s)
+    if not m:
+        m = re.search(r"(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?)", s)
+    if m:
+        stamp = m.group(1)
+    if stamp and stamp not in title:
+        title = f"{title}（{stamp}）"
+    return title
+
+
 def _should_store_assistant(text: str) -> bool:
     """本轮回复是否入会话记忆（best-effort 写侧闸门）。
 
@@ -236,21 +308,59 @@ def _dispatch_card(name: str, spec) -> str:
 
 
 def _skill_block(name: str, body: str, skills) -> str:
-    """技能注入块：小技能全文；超大技能 = 前段 + 目录 + 按需读路标。"""
+    """技能注入块：小技能全文；超大技能 = 使用场景（首个 ## 段）+ 小节清单 + 按需读路标。
+
+    【2026-10-20 修正·用户裁定】超大技能**不再盲截正文**：
+    旧实现 `_clip(body, _SKILL_BODY_CAP)` 把正文前 2200 字按句边界砍一段塞进
+    上下文，常砍在"使用场景"段中部 ⇒ 模型拿到半句指令（比"明确告知已截断"更难
+    识破）。改为给模型**决策所需的最小信息**：
+      ① 使用场景 —— 首个 ## 段（技能里通常即"使用场景/何时用"引导段），告诉模型
+         "该不该用、怎么用"；该段之前真有 H1 之外的实质前言也一并保留；
+      ② 小节清单 —— 全部 ## 段标题，模型据此决定 read_skill(heading=...) 取哪节；
+      ③ 按需读路标 —— read_skill(name) 全文 / read_skill(name, heading=) 单节 / 资源。
+    read_skill(heading=...) 的小节选择机制（skills_adapter.load_section）早已存在，
+    此前注入层没用它、一直盲截正文——本次改为由它收口。_clip 只作为**单段极端过长**
+    的兜底（不截断整篇、不截断决策段）。
+    """
     if len(body) <= _SKILL_BODY_CAP:
         return body
+    sections = []
     try:
-        headings = skills.get_section_headings(name) or []
+        sections = skills.load_sections(name) or []
     except Exception as _he:
-        # 不能静默：拿不到目录时下文的 outline 会退化成"（无）"，与"该技能
-        # 本来就没有小节"在输出上完全无法区分，事后排查必然被误导。
-        headings = []
-        logger.debug("[skill_block] %s 取小节目录失败（fail-open）: %s: %s",
+        # 不能静默：拿不到段落时下文 outline 退化成"（无）"，与"该技能本来
+        # 就没有小节"在输出上完全无法区分，事后排查必然被误导。
+        logger.debug("[skill_block] %s 取段落失败（fail-open）: %s: %s",
                      name, type(_he).__name__, _he)
-    outline = "；".join(str(h).strip("# ").strip() for h in headings[:20]) or "（无）"
-    # resource 路标只在技能**真的有**引用文件时才给：实测 5 个技能里 4 个
-    # list_resources() 为空，无条件给会诱导模型做一次必然失败的工具调用
-    # （返回 {"error": "无资源", "resources": []}），白花一轮。
+    # 真实正文段（排除 (前言) 占位与无结构的 (全文) 包）
+    body_sections = [s for s in sections if s.heading not in ("(前言)", "(全文)")]
+    # 真·前言：首个 ## 之前、剔除 H1 标题行后仍有实质内容才保留（罕见；避免把
+    # "# 文档标题"这种与技能名重复的行塞进去）。
+    preamble = ""
+    for s in sections:
+        if s.heading == "(前言)":
+            _clean = re.sub(r"(?m)^#\s+.*$", "", s.content).strip()
+            if _clean:
+                preamble = _clean
+            break
+    if body_sections:
+        # ① 使用场景：首个 ## 段（最贴近"该不该用/怎么用"的引导段）
+        scenario = body_sections[0].content.strip()
+        # 兜底长度保护：单段极端过长（个别技能把使用场景写成长文）才按句边界截断
+        if len(scenario) > _SKILL_BODY_CAP:
+            scenario = _clip(scenario, _SKILL_BODY_CAP)
+        if preamble:
+            scenario = preamble + "\n\n" + scenario
+        # ② 小节清单：所有 ## 段标题
+        headings = [s.heading for s in body_sections]
+        outline = "；".join(str(h).strip("# ").strip() for h in headings[:20]) or "（无）"
+    else:
+        # 无 ## 结构（罕见）：取首段作为降级引导段，绝不盲截整篇
+        scenario = _first_paragraph(body)
+        headings = []
+        outline = "（无）"
+    # ③ 资源路标：只在技能**真的有**引用文件时才给（实测多数技能无资源，
+    # 无条件给会诱导一次必然失败的工具调用，白花一轮）。
     _res_hint = ""
     try:
         if skills.list_resources(name):
@@ -258,12 +368,9 @@ def _skill_block(name: str, body: str, skills) -> str:
                          f'resource="references/<文件>")')
     except Exception:
         _res_hint = ""
-    # 截断走 _clip（句子边界），不盲切：盲切会把步骤 4 的标题腰斩在半个词上
-    # （2026-10-17 审计：auto-agent 正文 4459c 被切在"### 步骤 4"后一行中间），
-    # 模型拿到的是半句指令，比"明确告知已截断"更难识破。
     return (
-        f"{_clip(body, _SKILL_BODY_CAP)}\n……（正文共 {len(body)} 字符，已截断）\n"
-        f"[技能目录] {outline}\n"
+        f"{scenario}\n\n"
+        f"[技能大纲] 正文共 {len(body)} 字符，分 {len(headings)} 节：{outline}\n"
         f"[按需读取] 要完整正文用 read_skill(name=\"{name}\")；"
         f"只看某小节用 read_skill(name=\"{name}\", heading=\"<小节关键词>\"){_res_hint}。"
     )
@@ -338,6 +445,15 @@ def _build_default_model():
 
     超时（用户裁定 A1，2026-10-17）：主链默认 **120s**（原 mimo 默认 3600s），
     `QD_LLM_TIMEOUT` 显式设置时覆盖 —— 与 chain/skill 同一旋钮、同一默认值档。
+
+    流式（2026-10-20，用户裁定「不拦截 mimoagent、走生产 SDK」后的重做）：
+    mimo `OpenAIChatModel._query` 第 2 行即
+    `stream = bool(call_kwargs.pop("stream", False))`，`call_kwargs` 来自
+    `self.config.model_kwargs | kwargs` ⇒ **在 model_kwargs 传 stream 即可让主循环
+    流式化**，不覆盖 mimo 内部方法、不替换模型类，走的仍是 mimo 自己的
+    `self.client`（openai SDK）。实测流式墙钟约省 1/3（网关流式生成更快；
+    且 openai SDK 非流式 timeout 计整段生成，流式 timeout 按 chunk 间计，
+    大上下文慢尾不再 120s 读超时+重发）。`QD_LLM_STREAM=0` 回落非流式。
     """
     import os
     from .llm import get_model
@@ -345,6 +461,9 @@ def _build_default_model():
         timeout = float((os.getenv("QD_LLM_TIMEOUT") or "").strip() or 120)
     except ValueError:
         timeout = 120
+    # 默认开流式：见 docstring。注意 stream 进 model_kwargs 会进缓存键（_freeze），
+    # 开/关是两个 Model 实例——正确语义（协议不同不该复用连接）。
+    stream = (os.getenv("QD_LLM_STREAM") or "1").strip() not in ("0", "false", "False")
     return get_model(
         base_url=os.getenv("OPENAI_BASE_URL") or None,
         api_key=os.getenv("OPENAI_API_KEY", ""),
@@ -353,6 +472,7 @@ def _build_default_model():
         model_kwargs={
             "temperature": float(os.getenv("AGENT_LLM_TEMPERATURE", "0.1")),
             "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "16384")),
+            "stream": stream,
         },
     )
 
@@ -490,12 +610,24 @@ class QDAgentService:
         _user_q = str((resolve_info or {}).get("effective_input") or "").strip() or message
         # 记忆近史（相关度闸门：无关历史不注入——2026-10-01 文不对题回归，
         # 问跑马灯被旧股票记忆带偏成行情跑马灯）
+        # ★ 2026-10-21 用户裁定（只做降级，不加警示头尾）：assistant 侧旧答案
+        #   降级成**一行标题**（_history_headline）——旧答案正文里的价格/涨跌停/
+        #   关键位全是旧时点的（实测注入的是"跌停 -9.96%"，而本轮实际 +2.83%），
+        #   与 system 数字纪律「关键锚点必须本轮复核」冲突。user 侧原样保留
+        #   （那是用户原话，无过时数字问题，且是相关度判定的依据）。
         if self.memory is not None:
             try:
                 hist = asyncio.run(self.memory.get_history(session_id, limit=6))
                 if hist:
-                    lines = [f"- {getattr(m, 'role', 'user')}: {_clip(str(getattr(m, 'content', '')), 200)}" for m in hist]
-                    block = "\n".join(lines)
+                    _lines = []
+                    for m in hist:
+                        _role = getattr(m, "role", "user")
+                        _content = str(getattr(m, "content", ""))
+                        if _role == "assistant":
+                            _lines.append(f"- {_role}: {_history_headline(_content)}")
+                        else:
+                            _lines.append(f"- {_role}: {_clip(_content, 200)}")
+                    block = "\n".join(_lines)
                     score = _relevance(message, block)
                     if score >= 2:
                         parts.append("[会话记忆近史]\n" + block)
@@ -559,10 +691,13 @@ class QDAgentService:
                             force_tools.append("run_skill")
                         _ptr_tail = ("（执行型技能：重活直接派 run_skill，别读正文硬跑）"
                                      if _exec_spec is not None else "")
+                        _route = ("" if _exec_spec is not None else
+                                  "（按序执行：技能已给出⇒**先走技能流程**；"
+                                  "取数工具已在工具面可**直调**，无需 search_tools）")
                         parts.append(
                             f"[技能指针：{best}] 正文本会话已注入过；"
                             f"要完整正文用 read_skill(name=\"{best}\")，"
-                            f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。{_ptr_tail}")
+                            f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。{_ptr_tail}{_route}")
                         hit = True
                     else:
                         # 2026-10-10 分叉：执行型技能不注方法论正文，只注分发卡片
@@ -580,7 +715,10 @@ class QDAgentService:
                             body = self.skills.load_body(best) or ""
                             if body:
                                 blk = _skill_block(best, body, self.skills)
-                                parts.append(f"[相关技能：{best}]\n{blk}")
+                                parts.append(
+                                    f"[相关技能：{best}]\n{blk}\n"
+                                    f"（按序执行：技能已给出⇒**先走技能流程**；"
+                                    f"取数工具已在工具面可**直调**，无需 search_tools）")
                                 seen.add(best)
                                 hit = True
                 _skill_resolved = best if hit else ""

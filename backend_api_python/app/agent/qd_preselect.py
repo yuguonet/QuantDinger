@@ -395,22 +395,12 @@ class PreselectMixin:
         try:
             # 纯文本回合（不带 tools），与 mimo 压缩摘要同范式：
             # 防止模型在"选工具"这一步又去调工具，死循环。
-            # T6（2026-10-16）：编码类工具已延迟暴露（T2）⇒ 目录里必须能被识别。
-            # 仅在**本轮确实存在延迟的编码工具**时给出线索，其余情况为空串
-            # （不改 system、不引入无关 token）。
-            _coding = []
-            try:
-                _labels = getattr(self, "_DEFERRED_NATIVE_LABELS", None) or {}
-                # ★ 2026-10-17：存在性判据用合法点名集（全网）而非目录集——编码
-                # 工具被目录预过滤裁掉时，本提示里的名字仍可被 parse_plan 的正文
-                # 逐字扫描捞到（hint 就在 user message 里），不受裁剪影响。
-                _coding = [n for n in _labels if n in valid]
-            except Exception:
-                _coding = []
-            _coding_hint = (
-                "提示：如需读取/修改文件、运行脚本或调试代码，优先从目录里选择："
-                + ", ".join(sorted(_coding))
-            ) if _coding else ""
+            # ★ 2026-10-21 用户裁定（方案 A）：本层**不再注入**编码工具线索。
+            #   T6 曾按 `_DEFERRED_NATIVE_LABELS`（全网合法点名集 ⇒ 恒非空）注入，
+            #   cli 模式每轮都带，实测（tmp/seq1_payload_dump.txt 第 59-60 行）
+            #   纯噪声且把模板末行「用户"{query}" →」顶断 ⇒ 撤回。
+            #   能力未删（`build_preselect_messages(coding_hint=...)` 仍在，见
+            #   tool_preselect 同名参数的 docstring）；代价与回滚方式见那里。
             # 【2026-10-16 用户裁定：不加预选超时预算】
             #   实测预选一次可达 152.7s（输出 1876 tokens 多为隐藏推理，独占整轮 85% 墙钟），
             #   曾尝试用独立实例 + `QD_PRESELECT_TIMEOUT`(25s) 限制；用户要求撤回 ⇒
@@ -418,8 +408,7 @@ class PreselectMixin:
             #   应改**输入规模/候选集**或换模型，而不是给它加超时。
             resp = self.model.query(build_preselect_messages(
                 query, catalog, max_tools, already=self._core_names,
-                history_hint=hist_hint, coding_hint=_coding_hint,
-                skills=skill_section))
+                history_hint=hist_hint, skills=skill_section))
             text = self._text_of(resp)
             report["raw"] = (text or "")[:500]
             # ★ 2026-10-17：valid_names 用**合法点名集（全网）**而非目录集——

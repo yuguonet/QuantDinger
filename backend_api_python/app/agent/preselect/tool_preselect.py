@@ -1417,6 +1417,20 @@ def build_preselect_messages(
         coding_hint: 【T6·2026-10-16】编码类工具自 T2 起进入延迟层，目录里有了但
             模型未必认得出用途 ⇒ 给一句"需要读写文件/跑脚本/调试代码时优先选这些"。
             同样**只提示不过滤**，空串时不出现（不改 system、不占 token）。
+            ★ 2026-10-21 用户裁定（方案 A）：**参数与拼装能力保留**（设计文档
+            §3.3 第 5 步把 coding_hint 登记为 plan 契约，删它=破坏契约+降智），
+            但**生产调用方（qd_preselect）已不再传值** ⇒ 预选这一轮不再注入。
+            撤回理由（实测 tmp/seq1_payload_dump.txt 第 59-60 行 + 
+            tmp/probe_coding_hint_impact2_20261021.py 复刻真实裁剪链路）：
+              ① 判据是"全网合法点名集"⇒ cli 模式**每轮必注入**，纯股票任务纯属
+                 无关 token；
+              ② 它作为**末段**追加在模板最后一行「用户"{query}" →」之后 ⇒ 把
+                 续写引导顶断，模型看到的是半句示例 + 无关提示。
+            能力损失（已核对，不阻断）：编码类任务目录**本来就含**全部编码工具
+            （纯编码 query 实测目录 48 条含 7 个编码工具）⇒ 模型照常点名；
+            目录被裁掉编码工具的混合任务，主循环系统提示的"延迟层清单"仍列着
+            这些名字，模型可自行 activate_tools 补回。
+            回滚方式：qd_preselect 调用处补回 `coding_hint=...` 一行即可。
         skills: 【2026-10-17 skill 进预选】技能目录段（build_skill_catalog 产出），
             排在**工具目录之前**（方法论优先于工具）。空串时模板该行与改造前
             逐字一致 ⇒ 关停路径零痕迹；非空时由调用方保证带尾换行（段后自然
@@ -1429,6 +1443,9 @@ def build_preselect_messages(
     # 【T6·2026-10-16 最终形态】编码线索**完全在 Python 侧追加**：
     # 模板（PRESELECT_PROMPT）是 v9 逐字对拍契约 ⇒ 不放条件占位（空串会多一个空行）。
     # 空 hint 时**零痕迹**，非空时作为末段追加。
+    # ⚠ 末段追加会顶断模板末行「用户"{query}" →」的续写引导（2026-10-21 实测）；
+    #   故当前**无生产调用方传值**（见上 coding_hint 说明）。若将来要重新启用，
+    #   应改插在「【示例】」之前（工具目录之后），而不是追加在末尾。
     body = PRESELECT_PROMPT.format(
         query=(query or "")[:800], already=already_txt,
         catalog=catalog, max_tools=max_tools, history=hist_txt,

@@ -186,11 +186,14 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
 def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qfq") -> Dict[str, Any]:
     """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
 
-    ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取，不要重复调用。
+    ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取。
 
     Returns:
-        {"count": N, "data": {代码: [{"t","o","h","l","c","v"}, ...]}}；
-        失败 → {"error": "...", "retriable": bool}（error 键恒参与，成功时为 None）
+        {"count": N, "data": {代码: [{"t","o","h","l","c","v"}, ...]},
+         "summary": {代码: {ma5/ma10/ma20/ma60/ma120, high_20d/low_20d(含日期),
+         high_60d/low_60d, vol_ma5/vol_ratio, total_days}}}；
+        summary 是聚合摘要（窗口不足的档位**不给该键**），明细 data 仍全量返回；
+        失败 → {"error": "...", "retriable": bool}（error 键恒参与，成功时为 None）。
         注意：无论单代码还是多代码，data 都是"代码 → K线列表"的映射，取单只用 data[codes]。
 
     Args:
@@ -202,6 +205,14 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
     2026-09-25：补 adj——底层本就做 qfq，分析/回测口径不可比的缺口在工具层未暴露。
     """
     # codes 容错：模型可能传 list / list[tuple] / 数字 / 带前后缀串
+    # ── days 默认 30 的依据（2026-10-21 实测；论证留此处不进 docstring：
+    #    docstring 是工具契约，模型逐轮读，只该讲"干什么/怎么传/返回什么"）──
+    #   ① MA5..MA120 由 technical_analysis（ma20/ma60）与 bull_bear_research
+    #      （ma5..ma120）结构化字段直接给出，不需要从长表自己算；
+    #   ② 实测 120 天表 4,212 字符，而模型输出只引用 4 个日期（最近 6–20 个交易日
+    #      内的前高/前低/套牢区/顶底分型）⇒ 30 天覆盖有余。
+    # 权威口径落工具层：auto-* 技能会被 chain/skill_brewer.maybe_revise 重写，
+    #   写在 skills/*/SKILL.md 里的 days 会被覆盖。
     if isinstance(codes, (list, tuple)):
         _parts = []
         for c in codes:
@@ -264,9 +275,10 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
             return str(ts)
 
     results: Dict[str, Any] = {}
+    summaries: Dict[str, Any] = {}
     for raw, code in zip(raw_codes, code_list):
         klines = _fetch(code)
-        results[raw] = [{
+        rows = [{
             "t": k.get("date") or _ts_to_date(k.get("time", 0)),
             "o": round(k.get("open", 0), 2),
             "h": round(k.get("high", 0), 2),
@@ -274,12 +286,25 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
             "c": round(k.get("close", 0), 2),
             "v": k.get("volume", 0),
         } for k in klines]
+        results[raw] = rows
+        # ★ 2026-10-21 聚合摘要：均线 / 关键高低点 / 量能 —— 模型不必再从
+        #   明细表逐行自己算（实测"剔除某日后合计 -2.40 亿（算式：-1.01-0.33…）"
+        #   就是把明细当账本翻）。窗口不足的档位**不给键**（不回落 0）。
+        try:
+            from ._analysis_utils import _kline_summary
+            summaries[raw] = _kline_summary(rows)
+        except Exception as e:
+            logger.debug("[agent_get_kline] summary 失败(fail-open) %s: %s",
+                         type(e).__name__, e)
 
     # 统一形态：单/多代码都是 {count, data: {code: [...]}}，error 键恒在
     # （2026-09-21 修复：旧版单代码返回裸 list、多代码返回 dict 的二义性导致
     #  模型拿 list 当 dict 切片 → TypeError "string indices must be integers"，
     #  连续两次触发熔断，是 step 爆炸的主要推手之一）
-    return {"count": len(results), "data": results, "adj": (adj or "qfq").lower(), "error": None}
+    # ★ summary 同构：{代码: {ma5/ma10/ma20/ma60/ma120/high_20d/…}}，多代码平铺。
+    return {"count": len(results), "data": results,
+            "summary": summaries,
+            "adj": (adj or "qfq").lower(), "error": None}
 
 # ── 核心字段集（Agent 日常分析最常用的 ~15 个字段） ──────────────────────
 _STOCK_INFO_CORE_FIELDS = {

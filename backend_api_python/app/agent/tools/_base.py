@@ -136,21 +136,21 @@ class Tool(ABC):
     """
     工具基类
     所有自定义工具必须继承此类并实现 execute() 方法。
-    使用示例：
-        class WeatherTool(Tool):
-            name = "get_weather"
-            description = "查询城市天气"
+    使用示例（示例名仅作模板，不要在对话里调用它）：
+        class MyExampleTool(Tool):
+            name = "my_example_tool"
+            description = "（文档示例）按参数查询一条记录"
             parameters = {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名"},
+                    "code": {"type": "string", "description": "记录标识"},
                 },
-                "required": ["city"],
+                "required": ["code"],
             }
 
-            async def execute(self, city: str) -> ToolResult:
-                # 调用天气 API
-                return ToolResult(success=True, output={"city": city, "temp": "25C"})
+            async def execute(self, code: str) -> ToolResult:
+                # 调用真实数据源
+                return ToolResult(success=True, output={"code": code, "value": "..."})
     """
 
     # 子类必须定义这三个属性

@@ -488,10 +488,44 @@ _SOURCE_DEFAULT = {
 }
 
 # search_stocks 的查询串只是**默认建议**，调用方可用 queries= 完全替换。
+# 扩词（2026-10-20）：各时段默认查询统一覆盖资金流/板块/连板/涨停/情绪等多维度，
+# 配合 search_top_n 形成宽候选池，再由客观预排除与软门槛收窄。
 _QUERY_DEFAULT = {
-    "intraday": ("放量突破 站上20日均线", "缩量企稳 底部放量"),
-    "eod": ("涨幅3%到8% 换手率大于3% 非ST",),
-    "post_market": ("涨幅1%到8% 换手率大于2% 非ST", "近10日涨停 换手率大于2% 非ST"),
+    "intraday": (
+        "主力资金流向",
+        "行业板块涨幅",
+        "连板涨停",
+        "高换手活跃",
+        "机构调研",
+        "业绩预增",
+        "龙虎榜上榜",
+        "并购重组",
+        "放量突破 站上20日均线",
+        "缩量企稳 底部放量",
+    ),
+    "eod": (
+        "主力资金流向",
+        "行业板块涨幅",
+        "连板涨停",
+        "高换手活跃",
+        "机构调研",
+        "业绩预增",
+        "龙虎榜上榜",
+        "并购重组",
+        "涨幅3%到8% 换手率大于3% 非ST",
+    ),
+    "post_market": (
+        "主力资金流向",
+        "行业板块涨幅",
+        "连板涨停",
+        "高换手活跃",
+        "机构调研",
+        "业绩预增",
+        "龙虎榜上榜",
+        "并购重组",
+        "涨幅1%到8% 换手率大于2% 非ST",
+        "近10日涨停 换手率大于2% 非ST",
+    ),
 }
 
 
@@ -647,30 +681,43 @@ def candidate_pool(
     elif "recent_zt" in srcs:
         missing.append("recent_zt 需要 queries（近N日涨停靠 search_stocks 表达）")
 
-    # ── 批量回填实时行情（事实补全，不是筛选）──
+    # ── 批量回填实时行情（事实补全，不是筛选；2026-10-20 改分块绕过 20 只截断）──
     if fill_quote and pool:
         try:
-            from ...tools.finance.data_tools import get_realtime_quote
-            raw = get_realtime_quote(",".join(list(pool.keys())[:200])) or {}
-            quotes = {}
-            if isinstance(raw, dict):
-                if "data" in raw:
-                    quotes = raw["data"] or {}
-                elif raw.get("stock_code"):
-                    quotes = {raw["stock_code"]: raw}
-            for code_str, q in (quotes or {}).items():
+            from .common import batch_realtime_quotes
+            quotes, failed_chunks = batch_realtime_quotes(list(pool.keys()))
+            for chunk in failed_chunks:
+                missing.append(f"行情回填: 分块失败{len(chunk)}只({','.join(chunk[:3])}...)")
+            for code_str, q in quotes.items():
                 if not isinstance(q, dict):
                     continue
                 target = pool.get(str(q.get("stock_code") or code_str))
                 if target is None:
                     continue
-                for dst, src in (("price", "price"), ("change_pct", "change_pct"),
+                # 契约对齐（2026-10-21 线上假阴性根因）：get_realtime_quote 的
+                # 统一键是 last/changePercent，写 price/change_pct 永远取不到
+                for dst, src in (("price", "last"), ("change_pct", "changePercent"),
                                  ("turnover_pct", "turnover_pct"), ("turnover_pct", "turnover_rate"),
                                  ("vol_ratio", "vol_ratio"), ("high", "high"),
                                  ("low", "low"), ("amount", "amount")):
                     v = q.get(src)
                     if v not in (None, "", 0):
                         target[dst] = v
+                # 扩展字段（漏斗 objective_preexclude 用）：name / 涨跌停价 / 昨收
+                nm = q.get("name")
+                if nm not in (None, ""):
+                    target["name"] = nm
+                for dst, src in (("limit_up", "limit_up"), ("limit_down", "limit_down")):
+                    v = q.get(src)
+                    # 0 是合法哨兵（无涨跌幅限制），仅排除 None / 空串
+                    if v not in (None, ""):
+                        try:
+                            target[dst] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+                pc = q.get("previousClose")
+                if pc not in (None, "", 0):
+                    target["previous_close"] = pc
         except Exception as e:
             missing.append(f"行情回填: {type(e).__name__}: {e}")
 

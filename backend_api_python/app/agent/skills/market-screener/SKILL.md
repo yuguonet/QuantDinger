@@ -2,7 +2,7 @@
 name: market-screener
 description: 从A股全市场筛选短中线标的。用户问"今天买什么股""有什么好股票""短线/短中线选什么"时使用。不含个股分析。
 metadata:
-  version: 8.1.0
+  version: 8.2.0
   tags: market, screener, short_term, mid_term, a_share
   tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
 ---
@@ -55,7 +55,7 @@ metadata:
 
 | 函数（真实签名） | 作用 | 何时用 |
 | --- | --- | --- |
-| `run()` | 一次性跑完整流程：pre_screen → profile_candidates（取 hard 过滤）→ deep_analyze(Top8)。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
+| `run()` | 一次性跑完整流程：`pre_screen(search_top_n=100)` → `objective_preexclude` → `score_pool`（双保险软门槛，Round0 存活<4 自动 Round1 放宽，最多 2 轮）→ `deep_analyze(Top12)`。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
 | `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 | 起手，判断大环境 |
 | `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：自选来源（连板/尾盘封板/龙回头/热点/条件搜索/近期涨停），不做取舍与排序 | 起手取池 |
 | `profile_candidates(prescreen_result, limit=20, with_flow=True, with_pred=True)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍。**入参是上一步的 dict** | 核心，几乎所有场景都要跑 |
@@ -83,6 +83,7 @@ metadata:
 - `theme.hit` 题材是否落在当日主线；`hard` 客观障碍清单；`missing` 数据缺口
 - `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
+- `funnel` 是 `run()` 返回的漏斗统计键，包含：`rounds` / `pool_raw` / `excluded_obj` / `scored` / `excluded_score` / `deep_n` / `eastmoney_ok`，用于复盘每一步筛掉了多少候选
 - `filter_candidates` 保守地把 hard 与 warnings 一并剔除；走 `profile_candidates` 你能看到全部候选
 
 ## 工作流（`run()` 内部阶段示意，不必线性）

@@ -67,6 +67,13 @@ _REPO = _PROJECT.parent                # D:/QuantDinger
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 
+# 与 cli.py 同口径：先加载 backend 的 .env，否则 --replay 拿不到 OPENAI_*（401）
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(str(_PROJECT / ".env"), override=False)
+except ImportError:
+    pass
+
 _OUT = _REPO / "tmp" / "llm_probe"
 _OUT.mkdir(parents=True, exist_ok=True)
 
@@ -628,6 +635,108 @@ def _run_ttfb_ab(full_path: str) -> int:
     return 0
 
 
+def _run_replay(paths: list) -> int:
+    """独立重放：把 call_NN_full.json 的 messages+tools **直发网关**，跳过 agent。
+
+    【判据】与捕获时的墙钟对照：
+      重放也慢 ⇒ 模型/网关/缓存问题（agent 无罪）；
+      重放明显快 ⇒ agent 侧开销（预选/技能/工具面/步数）才是主因。
+    路径可为若干 call_NN_full.json，或一个目录（取其下全部 *_full.json）。
+    """
+    install()   # 挂 TTFB hooks；与捕获同口径
+    from app.agent.qd_service import _build_default_model as _gm
+
+    files: list = []
+    for p in paths:
+        pp = Path(p)
+        if pp.is_dir():
+            files.extend(sorted(pp.glob("*_full.json")))
+        elif pp.is_file():
+            files.append(pp)
+    if not files:
+        _log("[replay] 未找到 call_NN_full.json")
+        return 2
+
+    rows = []
+    for fp in files:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        messages = data.get("messages") or []
+        tools = data.get("tools_sent")
+        tool_choice = data.get("tool_choice")
+        orig_s = None
+        brief = fp.with_name(fp.name.replace("_full.json", ".json"))
+        if brief.is_file():
+            try:
+                orig_s = (json.loads(brief.read_text(encoding="utf-8"))
+                          .get("latency", {}).get("wall_s"))
+            except Exception:
+                pass
+
+        kwargs = {}
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
+
+        # 与主链同一构造路径（含 stream/QD_LLM_TIMEOUT），但无 agent/预选/技能
+        m = _gm()
+        mark = len(_ttfb_events)
+        t0 = time.perf_counter()
+        err = ""
+        out_chars = 0
+        tool_names = []
+        try:
+            payload = m.query(list(messages), **kwargs)
+            out_chars = len(str((payload or {}).get("content") or ""))
+            for tc in (payload or {}).get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tool_names.append(str(((tc.get("function") or {}).get("name") or "?")))
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, str(e)[:120])
+        wall = time.perf_counter() - t0
+        ev = _ttfb_events[mark:]
+        ttfb = sum(e.get("ttfb_s", 0) for e in ev)
+        ratio = (wall / orig_s) if (orig_s and orig_s > 0) else None
+        rows.append({
+            "file": fp.name, "msgs": len(messages),
+            "tools": len(tools or []),
+            "orig_wall_s": orig_s, "replay_wall_s": round(wall, 2),
+            "ttfb_s": round(ttfb, 2), "ratio": round(ratio, 2) if ratio else None,
+            "out_chars": out_chars, "tool_calls": tool_names, "error": err,
+        })
+        _log("[replay] %s: wall=%.1fs orig=%s ratio=%s ttfb=%.1fs tools=%s %s" % (
+            fp.name, wall,
+            ("%.1fs" % orig_s) if orig_s else "?",
+            ("%.2f" % ratio) if ratio else "?",
+            ttfb, ",".join(tool_names) or "-", err))
+
+    tot = sum(r["replay_wall_s"] for r in rows)
+    tot_o = sum(r["orig_wall_s"] or 0 for r in rows)
+    L = ["# 独立重放对照（跳过 agent）", "",
+         "- **输入**: `call_NN_full.json` 的 messages + tools，经 `llm.get_model().query` 直发",
+         "- **判据**: 重放墙钟 ≈ 捕获墙钟 ⇒ 模型/网关；重放明显快 ⇒ agent 侧开销", "",
+         "| 文件 | msgs | tools | 捕获墙钟 | 重放墙钟 | 比值 | TTFB | 输出c | tool_calls | 错误 |",
+         "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        L.append("| %s | %d | %d | %s | **%.1fs** | %s | %.1fs | %d | %s | %s |" % (
+            r["file"], r["msgs"], r["tools"],
+            ("%.1fs" % r["orig_wall_s"]) if r["orig_wall_s"] else "?",
+            r["replay_wall_s"],
+            ("%.2f" % r["ratio"]) if r["ratio"] else "?",
+            r["ttfb_s"], r["out_chars"],
+            ",".join(r["tool_calls"]) or "-", r["error"] or "-"))
+    L += ["", "**合计**: 重放 %.1fs / 捕获 %s" % (
+        tot, ("%.1fs" % tot_o) if tot_o else "?"), ""]
+    out = _REPO / "tmp" / "llm_replay" / (
+        "REPLAY_%s.md" % time.strftime("%Y%m%d_%H%M%S"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(L), encoding="utf-8")
+    (out.parent / ("REPLAY_%s.json" % time.strftime("%Y%m%d_%H%M%S"))).write_text(
+        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log("[replay] 报告: %s" % out)
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] == "--ttfb-ab":
@@ -636,6 +745,11 @@ def main() -> int:
             return 2
         install()
         return _run_ttfb_ab(argv[1])
+    if argv and argv[0] == "--replay":
+        if len(argv) < 2:
+            _log("用法: --replay <call_NN_full.json|目录> [...]")
+            return 2
+        return _run_replay(argv[1:])
     install()
     from app.agent import cli
     sys.argv = ["app.agent.cli"] + argv

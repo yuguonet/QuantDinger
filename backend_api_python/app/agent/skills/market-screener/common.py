@@ -15,6 +15,7 @@ from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 # ═══════════════════════════════════════════════════════════════
 #  Skill 自包含数据结构
@@ -819,3 +820,66 @@ def scan_dragon_pullback(date: str) -> List[Dict]:
 
     candidates.sort(key=lambda x: -x["strength_score"])
     return candidates
+
+
+# ═══════════════════════════════════════════════════════════════
+#  实时行情分块获取（2026-10-20 漏斗）
+# ═══════════════════════════════════════════════════════════════
+
+def batch_realtime_quotes(codes, workers=4):
+    """分块并发获取实时行情——绕过 get_realtime_quote 内部 20 只硬截断（2026-10-20）。
+
+    data_tools.get_realtime_quote 固定只处理前 20 只（code_list[:20]），宽池回填
+    会被静默截断。本函数按 20 只/块切分、线程池并发拉取后合并，块级失败只丢该块。
+
+    Args:
+        codes: 股票代码列表
+        workers: 并发块数（每块固定 20 只）
+
+    Returns:
+        (quotes, failed_chunks): quotes={code: 行情dict} 只含成功项（无 error 字段）；
+            failed_chunks=[[code, ...], ...] 整块失败（异常/格式错）的代码块。
+
+    Gotcha:
+        函数内局部 import get_realtime_quote——测试通过替换
+        data_tools.get_realtime_quote 模块属性注入假数据，模块级 import 会绕过补丁。
+    """
+    from ...tools.finance.data_tools import get_realtime_quote
+
+    codes = [c for c in (codes or []) if c]
+    if not codes:
+        return {}, []
+    chunks = [codes[i:i + 20] for i in range(0, len(codes), 20)]
+    quotes = {}
+    failed_chunks = []
+
+    def _fetch(chunk):
+        try:
+            raw = get_realtime_quote(",".join(chunk)) or {}
+        except Exception as e:
+            logger.warning("[MktScreen] 行情分块获取异常 %s只: %s", len(chunk), e)
+            return chunk, None
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if not isinstance(data, dict):
+            if isinstance(raw, dict) and raw.get("stock_code"):
+                data = {raw["stock_code"]: raw}
+            else:
+                return chunk, None
+        return chunk, data
+
+    ex = None
+    try:
+        ex = ThreadPoolExecutor(max_workers=max(1, min(int(workers or 4), len(chunks))))
+        results = list(ex.map(_fetch, chunks))
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    for chunk, data in results:
+        if data is None:
+            failed_chunks.append(list(chunk))
+            continue
+        for k, v in data.items():
+            if isinstance(v, dict) and not v.get("error"):
+                quotes[str(k)] = v
+    return quotes, failed_chunks

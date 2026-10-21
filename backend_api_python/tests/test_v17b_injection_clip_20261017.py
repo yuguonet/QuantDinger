@@ -63,18 +63,35 @@ def test_clip_boundary_must_be_in_front_half():
 
 
 def test_injection_points_use_clip():
-    """④ 三个注入点必须走 _clip，不允许回退成裸切片（AST 级防呆）。"""
+    """④ 三个注入点必须走 _clip，不允许回退成裸切片（AST 级防呆）。
+
+    ★ 2026-10-21 夹具同型化（**断言意图不变**，见 test_v48 守卫）：
+      近史注入点原为单行表达式
+          f"- {role}: {_clip(str(getattr(m, 'content', '')), 200)}"
+      2026-10-21 记忆近史改「assistant 旧答案降级为标题行」后拆成 if/else
+      （user 侧仍走 `_clip(_content, 200)`；assistant 侧走
+      `_history_headline`，其内部对标题行仍调 `_clip`）。
+      ⇒ 断言从「旧字面形态」改为**同型语义**：近史注入路径上必须有
+      `_clip(..., 200)` 调用，且**不得**出现裸切片 `[:200]`。
+    """
     src = _SVC.read_text(encoding="utf-8")
     tree = ast.parse(src)
-    bad_slices = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
-            # 只关心注入路径上的 str[:N]（近史/参考资料/技能正文）
-            pass  # 字面量切片本身合法（如 qd_preselect 的 query[:200] 留痕用）
-    # 直接文本断言三处调用点在位（比 AST 更直白，改签名会立刻红）
-    assert "_clip(str(getattr(m, 'content', '')), 200)" in src, "近史注入点未用 _clip"
+    # ① 近史注入点：必须仍有 _clip(..., 200) 调用，且不得回退成裸切片
+    clip200 = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Name) and n.func.id == "_clip"
+               and any(isinstance(a, ast.Constant) and a.value == 200
+                       for a in n.args)]
+    assert clip200, "近史注入点未用 _clip(..., 200)"
+    # ② 参考资料注入点未变
     assert "_clip(str(d.get('content', '')), 300)" in src, "参考资料注入点未用 _clip"
+    # ③ 技能正文注入点未变
     assert "_clip(body, _SKILL_BODY_CAP)" in src, "技能正文注入点未用 _clip"
+    # ④ 裸切片防回退：近史/参考资料/技能正文三处不得用 str[:N] 硬切
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant):
+            assert n.slice.value not in (200, 300), (
+                "注入路径回退成裸切片 %r（须走 _clip）" % n.slice.value)
 
 
 def test_skill_body_cap_positive():

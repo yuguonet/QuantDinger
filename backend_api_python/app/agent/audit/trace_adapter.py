@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -23,6 +24,32 @@ def _sha(obj: Any) -> str:
     return hashlib.sha256(
         json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
+
+
+# ── 落盘串行化（2026-10-19 发现；2026-10-20 回退后复现，故重新加回）──
+# 【症状】并发 emit 会把同一文件里的事件行**切成两半**（残留形如 `6}` 的孤立续行）
+#   ⇒ 任何"逐行 json.loads 整个文件"的消费方直接 JSONDecodeError
+#   （qd_smoke test_5_trace_events / test_20_prefetch_trace 实测失败）。
+#   文件是**追加累积**的 ⇒ 坏行一旦产生就永久污染，之后每次跑都红。
+# 【根因】`open(...,"a")` + write 无锁；收尾链后台线程（QD_TAIL_ASYNC）/ 并行子代理
+#   与主线程**并发 emit 同一文件**。`open(...,"a")` 只保证单次系统调用的追加原子性，
+#   而 record 序列化后可达数 KB，一次 `f.write` 会被拆成多次系统调用 ⇒ 交错成半行。
+# 【修法】按**文件路径**加锁（不是按实例：每个 run 一个实例，但写同一个文件）。
+#   本块只加互斥，不改任何事件语义与字段。
+_TRACE_FILE_LOCKS: dict = {}
+_TRACE_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path) -> Any:
+    key = str(path)
+    lk = _TRACE_FILE_LOCKS.get(key)
+    if lk is None:
+        with _TRACE_FILE_LOCKS_GUARD:
+            lk = _TRACE_FILE_LOCKS.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                _TRACE_FILE_LOCKS[key] = lk
+    return lk
 
 
 class TraceAdapter:
@@ -60,8 +87,11 @@ class TraceAdapter:
     def emit(self, event: str, **fields: Any) -> None:
         record = {"ts": round(time.time(), 3), "run_id": self.run_id, "event": event}
         record.update(fields)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        # 按文件加锁：并发 emit（收尾后台线程 / 并行子代理 / 多实例同文件）时保证
+        # 这一行完整落盘，不被另一次 write 切成两半（详见本模块顶部注释）。
+        with _lock_for(self.path):
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     def run_start(self, agent: Any, task: str) -> None:
         # 游标 = 本轮 task 入队前的消息数：本 run 只摘此后新增的消息。

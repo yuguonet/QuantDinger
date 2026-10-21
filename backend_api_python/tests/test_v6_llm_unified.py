@@ -256,6 +256,9 @@ def test_get_model_cache_key_accepts_dict_extra(clean_env, monkeypatch):
         return object()
 
     monkeypatch.setattr(unified, "_mimo_get_model", _factory)
+    # 本测试只验证「缓存键接受 dict extra」（_freeze + _MODEL_CACHE），与具体
+    # factory 无关；关闭受控模型路径让上面的 _mimo_get_model mock 生效。
+    monkeypatch.setenv("QD_LLM_CONTROLLED", "0")
     unified.clear_model_cache()
     kwargs = dict(
         provider="openai", model="m1", timeout=120.0,
@@ -280,3 +283,127 @@ def test_get_model_cache_key_accepts_dict_extra(clean_env, monkeypatch):
         assert len(created) == 2
     finally:
         unified.clear_model_cache()
+
+
+# ── 5. 流式（model_kwargs 传 stream，不拦截 mimoagent）2026-10-20 ────
+# `ControlledOpenAIChatModel`（覆盖 mimo `_query`）已按用户裁定移除。
+# 流式改为在 `_build_default_model` 的 `model_kwargs` 传 `stream`（mimo
+# `openai_chat._query` 第 2 行 `call_kwargs.pop("stream", False)` 原生支持），
+# 走生产 SDK、不碰 mimo 内部。
+
+
+def test_build_default_model_stream_on_by_default(clean_env, monkeypatch):
+    """默认 QD_LLM_STREAM 未设 ⇒ model_kwargs 含 stream=True。"""
+    captured: dict = {}
+
+    def _fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("app.agent.llm.get_model", _fake_get_model)
+    from app.agent.qd_service import _build_default_model
+    _build_default_model()
+    assert captured["model_kwargs"]["stream"] is True
+
+
+def test_build_default_model_stream_off_via_env(clean_env, monkeypatch):
+    """QD_LLM_STREAM=0 ⇒ stream=False（回退非流式）。"""
+    captured: dict = {}
+
+    def _fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("app.agent.llm.get_model", _fake_get_model)
+    monkeypatch.setenv("QD_LLM_STREAM", "0")
+    from app.agent.qd_service import _build_default_model
+    _build_default_model()
+    assert captured["model_kwargs"]["stream"] is False
+
+
+# ── 6. [LLM #N] 画像：query 公共入口埋点（不碰 _query）──────────────
+def test_wrap_query_logging_emits_block_and_counts():
+    """包一层 query 后：序号递增、===== 分隔块出现、原 query 仍被委托。"""
+
+    class _M:
+        def __init__(self):
+            self.n = 0
+            self.token_stats = type("T", (), {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "total_tokens": 0})()
+            self.config = type("C", (), {
+                "model_name": "m-test",
+                "model_kwargs": {"stream": True}})()
+
+        def query(self, messages, **kw):
+            self.n += 1
+            self.token_stats.input_tokens += 100
+            self.token_stats.output_tokens += 20
+            self.token_stats.cache_read_tokens += 30
+            return {"content": "hi", "tool_calls": []}
+
+    m = unified._wrap_query_logging(_M())
+    assert m.query is not _M.query
+    r = m.query([{"role": "user", "content": "hello"}])
+    assert r["content"] == "hi"
+    assert m.n == 1
+    # 二次包装幂等
+    m2 = unified._wrap_query_logging(m)
+    assert m2 is m
+    assert m2.query is m.query
+
+
+def test_wrap_query_logging_failure_still_logs():
+    class _M:
+        def __init__(self):
+            self.token_stats = type("T", (), {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "total_tokens": 0})()
+            self.config = type("C", (), {
+                "model_name": "m-test", "model_kwargs": {}})()
+
+        def query(self, messages, **kw):
+            raise RuntimeError("boom")
+
+    m = unified._wrap_query_logging(_M())
+    with pytest.raises(RuntimeError):
+        m.query([{"role": "user", "content": "x"}])
+
+
+def test_instrument_create_counter_counts_http_attempts():
+    """HTTP 计数：create() 每调一次 n+=1，异常也计入 —— 让 tenacity 重试可见。"""
+    calls = {"n": 0, "raised": 0}
+
+    class _Comp:
+        _qd_attempt_counted = False
+
+        def create(self, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                calls["raised"] += 1
+                raise RuntimeError("timeout-ish")
+            return object()
+
+    class _Chat:
+        completions = _Comp()
+
+    class _Client:
+        chat = _Chat()
+
+    class _M:
+        client = _Client()
+
+    m = _M()
+    st = unified._instrument_create_counter(m)
+    assert st["n"] == 0
+    for _ in range(3):
+        try:
+            m.client.chat.completions.create()
+        except Exception:
+            pass
+    assert st["n"] == 3, "三次 create（含 2 次异常）都要计数"
+    assert st["errors"] == 2
+    # 幂等：再 instrument 不包第二层
+    st2 = unified._instrument_create_counter(m)
+    m.client.chat.completions.create()
+    assert st["n"] == 4 and st2["n"] == 0

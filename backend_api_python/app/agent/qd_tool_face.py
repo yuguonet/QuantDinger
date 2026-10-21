@@ -468,22 +468,23 @@ class ToolFaceMixin:
 
     # ── 每轮动态上下文（注入本轮 task，不进 system）──────────────
     def _dynamic_context_text(self, task):
-        """F9：把 per-turn 动态上下文（当前时间 + 工具地图）前置到本轮 task。
+        """F9：把 per-turn 动态上下文（当前时间 + 工具地图）注入本轮 task。
 
         【为什么必须离开 system_template】mimo `agents/base.py:213` 只在会话
         **第一条消息**时 seed system（`if first_turn: add_message("system", ...)`），
         之后 system 永久冻结。而 `now`（秒级）与 `tool_map`（含
         `[已激活·本轮…]`，依赖每轮 `_activated`）都是 per-turn 量 ⇒ 若留在
-        system 里，自 turn2 起即陈旧（实测 turn2 的 system 仍是 turn1 的
-        时间戳）。而 task 每轮都新进 messages ⇒ 是唯一可靠的 per-turn 通道。
+        system 里，自 turn2 起即陈旧。而 task 每轮都新进 messages ⇒ 唯一可靠通道。
 
         【tool_availability 为何留下】它是启动期实测的进程内不变量
         （`probe_tools`），会话内不变 ⇒ 仍在 system 里渲染，且**只算一次**
-        （首个 run、`self.messages` 尚空时）—— 避免每轮白算。system 冻结对
-        prompt cache 友好（跨轮前缀逐字节稳定），故不逐轮重渲 system。
+        （首个 run、`self.messages` 尚空时）。
 
-        【token 代价】工具地图每轮随 task 进一次（约 k 级 tok）；换取"模型
-        每轮看到真实工具面/时间"。旧实现在 turn2+ 既不刷新、又每轮白算，两头亏。
+        【为什么默认拼在 task **末尾**（命中率·2026-10-20）】网关用前缀缓存
+        （响应带 cached_tokens），只对"从头起逐 token 相同"的前缀生效。动态块含
+        **秒级**时间戳 + 每轮重建的工具地图 ⇒ 拼开头则从该 token 起全部失效
+        （实测命中 1~3%）。拼末尾 ⇒ 前缀 = system + 历史 + task 原文逐轮稳定
+        （实测命中 43~50%）。`QD_DYNAMIC_CTX_TAIL=0` 回退到拼开头。
         """
         if not getattr(self, "messages", None):
             try:
@@ -497,6 +498,9 @@ class ToolFaceMixin:
             tmap = self._tool_map_text()
             if tmap:
                 head += "\n[工具地图]\n" + tmap
+            # 默认拼末尾：让 system + 全部历史 + task 原文构成逐轮稳定前缀。
+            if (os.getenv("QD_DYNAMIC_CTX_TAIL") or "1").strip() not in ("0", "false", "False"):
+                return task + "\n\n" + head
             return head + "\n\n" + task
         except Exception:
             return task

@@ -304,6 +304,29 @@ def main():
     _, _, _, DEFAULT_SESSION_ID = _import_agent()
     session_id = args.session or DEFAULT_SESSION_ID
 
+    # ── LLM 录制探针（默认关闭）──────────────────────────────────
+    # ★ 位置是硬要求：必须在 `_import_agent()` **之后**。探针要 import
+    #   mimoagent.models.openai_chat 才能打类级 patch，而 mimoagent 在
+    #   **import 期**就往 stdout 写就绪日志——若赶在 _import_agent() 前
+    #   触发它，那几行会污染 stdout 结果通道（`_pin_mimo_log_to_stderr`
+    #   的收口还没执行，追不回来）。放在此处既已收口完毕，又远早于首次
+    #   LLM 调用（submit 才触发），patch 对后续所有模型实例生效。
+    # 用途：把每步真实 payload 录下来做离线复放/单步计时优化——
+    # 定位「哪一步慢、慢在想还是慢在写」只能靠它，靠整链重跑既慢又不可控。
+    try:
+        from app.agent.llm_capture import maybe_install as _cap_install
+        _cap_out = _cap_install()
+        if _cap_out:
+            print(f"[rec] LLM 录制已开启 -> {_cap_out}", flush=True)
+            if args.message:
+                from app.agent.llm_capture import _append as _cap_append
+                _cap_append(_cap_out, {"event": "meta_message",
+                                       "message": args.message,
+                                       "session": session_id})
+    except Exception as _cap_e:
+        # 不静默：探针挂了 = 这轮没有可复放数据，事后无法归因
+        print(f"[rec] ⚠ 录制探针安装失败（本次无录制数据）: {_cap_e}", flush=True)
+
     if args.message:
         try:
             from app.agent.llm import resolve_provider

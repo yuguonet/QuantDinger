@@ -210,15 +210,35 @@ def _make_face():
 
 
 def test_dynamic_context_prefixes_task(monkeypatch):
+    """【契约变更·2026-10-19 登记】动态块**默认拼在任务末尾**，不再前置。
+
+    意图不变：① 时间行与工具地图**每轮都进本轮 task**（不回退到 system 冻结那套）；
+    ② 原 task 内容原样保留。变的只是**拼接位置**——秒级时间戳 + 每轮重建的工具
+    地图放在开头会把整条 prompt 前缀逐轮打断，前缀缓存命中率实测仅 1~3%
+    （详见 `qd_tool_face._dynamic_context_text` 的 docstring）。
+    故本用例改为「默认末尾 + `QD_DYNAMIC_CTX_TAIL=0` 时仍前置」双向断言，
+    保证回退旋钮**真的能回去**，不是只留个 env 名字。
+    """
     face = _make_face()
     monkeypatch.setattr(type(face), "_tool_map_text", lambda self: "MAP")
+
+    # 默认：动态块在末尾 ⇒ task 原文在前（前缀跨轮稳定，缓存可命中）
     out = face._dynamic_context_text("分析600519")
-    assert out.startswith("[当前时间] "), "时间行必须前置到本轮 task 开头"
+    assert out.startswith("分析600519"), "默认: 原 task 必须在最前（动态块让位到末尾）"
     assert "[工具地图]\nMAP" in out, "工具地图块必须进本轮 task（每轮重建）"
-    assert out.endswith("分析600519"), "原 task 内容必须原样保留在尾部"
+    assert "[当前时间] " in out, "时间行必须进本轮 task"
+
     monkeypatch.setattr(type(face), "_tool_map_text", lambda self: "")
     out2 = face._dynamic_context_text("hi")
-    assert out2.startswith("[当前时间] ") and "[工具地图]" not in out2 and out2.endswith("hi")
+    assert out2.startswith("hi") and "[工具地图]" not in out2 and "[当前时间] " in out2
+
+    # 回退旋钮：QD_DYNAMIC_CTX_TAIL=0 ⇒ 逐位回到改造前（动态块前置）
+    monkeypatch.setenv("QD_DYNAMIC_CTX_TAIL", "0")
+    monkeypatch.setattr(type(face), "_tool_map_text", lambda self: "MAP")
+    out3 = face._dynamic_context_text("分析600519")
+    assert out3.startswith("[当前时间] "), "QD_DYNAMIC_CTX_TAIL=0: 时间行必须前置到 task 开头"
+    assert "[工具地图]\nMAP" in out3, "回退态: 工具地图块仍必须进本轮 task"
+    assert out3.endswith("分析600519"), "回退态: 原 task 内容必须原样保留在尾部"
 
 
 def test_dynamic_context_computes_availability_only_first_run(monkeypatch):

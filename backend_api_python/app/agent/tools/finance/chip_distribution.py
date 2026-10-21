@@ -197,20 +197,32 @@ def _format_chip_markdown(r: Dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
-def get_chip_distribution(codes: str, lookback_days: int = 120) -> Dict[str, Any]:
+def get_chip_distribution(codes: str, lookback_days: int = 60) -> Dict[str, Any]:
     """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
 
-    从日K线计算筹码分布，不依赖数据源原生接口。
-    算法：按日K线的 high/low 区间分配成交量到价格档位，
-    用指数衰减加权（近期筹码权重更高），汇总计算各维度指标。
-
-    Returns:
-        dict: {avg_cost, current_price, profit_ratio, concentration_90, support_prices/resistance_prices/chip_peaks 均为 list}；多代码→{count, data:{代码:上述}}；error=失败。
+    从日K线计算筹码分布，不依赖数据源原生接口。算法：按日K线的 high/low 区间
+    分配成交量到价格档位，用指数衰减加权（近期筹码权重更高）汇总各维度。
 
     Args:
         codes: 多股用逗号分隔（也兼容 search_stock 返回的 dict）
-        lookback_days: 回看天数，默认120天
+        lookback_days: 回看天数，默认 60
+
+    Returns:
+        dict: {avg_cost, current_price, profit_ratio, loss_ratio, concentration_90/70
+        (含 lower/upper/width_pct), support_prices/resistance_prices, chip_peaks,
+        analyzed_days}；多代码 → {count, data:{代码: 上述}}；error=失败。
+        输出为纯摘要（均价/获利比例/集中度/支撑阻力均为聚合值，末尾附筹码峰明细）。
     """
+    # ── 默认窗口 60 的依据（2026-10-21 实测 600121）────────────────────────
+    # 论证刻意**不进 docstring**：docstring 是工具契约，模型逐轮读它，只该讲
+    # "干什么/怎么传/返回什么"；塞实测表格会淹没契约信息且白烧 token。
+    #   30 天：均价 5.250 / 获利 3.1% / 90%筹码 4.70–5.71 / 支撑 [4.58]（塌成 1 个）
+    #   60 天：均价 5.020 / 获利 20.5% / 90%筹码 3.92–5.66 / 支撑 [4.58, 4.17, 3.99]
+    #  120 天：均价 4.930 / 获利 27.0% / 90%筹码 3.74–5.67 / 支撑 [4.61, 4.18, 3.99]
+    # ⇒ 不取 30（获利 27.0%→3.1%、支撑位 3 个塌成 1 个，中线判断失真）；
+    #   不必取 120（60 与 120 支撑位基本一致，算量减半）。
+    # 权威口径落工具层：auto-* 技能会被 chain/skill_brewer.maybe_revise 重写，
+    #   且实测模型不传参时直接走这里。
     # 兼容 search_stock 返回的 dict: {'results': [{'code': '600593', ...}], ...}
     if isinstance(codes, dict):
         results = codes.get("results", [])

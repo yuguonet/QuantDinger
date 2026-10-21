@@ -2140,5 +2140,85 @@ def get_obv_analysis(codes: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
 
+
+def get_price_stats(codes: str, days: int = 120) -> dict:
+    """价格统计：±σ 价格带 + T+N 历史胜率（经验分布，非预测）。
+
+    【为什么单独一个工具】实测「分析X股」任务里模型无工具可算波动带/持有胜率时
+    会挤到 bash 自行算（155s+128s 墙钟）。本工具一次给出，避免 shell 代算。
+
+    Args:
+        codes: 股票代码，逗号分隔支持批量
+        days: 回看窗口（默认 120 个交易日）
+
+    Returns:
+        单只 → {code, n_bars, close, mean, std, band_1sigma, band_2sigma,
+                t_plus_win_rates: {"T+1": {...}, "T+3": ..., "1W": ..., "1M": ...}}
+        多只 → {count, data: {code: {...}}}
+        t_plus_win_rates 为**历史经验频率**（样本内收盘更高的占比），不是预测概率。
+        字段缺失/数据不足时对应键为 null 或 error，不编造。
+    """
+    # T+N 交易日近似：T+1=1, T+3=3, 1W≈5, 1M≈21
+    _HORIZONS = (("T+1", 1), ("T+3", 3), ("1W", 5), ("1M", 21))
+
+    def _one(code: str) -> dict:
+        try:
+            closes = _fetch_closes(code, int(days) if days else 120)
+        except Exception as e:
+            return {"error": f"取数失败: {e}"}
+        n = len(closes)
+        if n < 30:
+            return {"error": f"数据不足: n={n}（需 ≥30）"}
+        last = closes[-1]
+        mean = sum(closes) / n
+        var = sum((c - mean) ** 2 for c in closes) / (n - 1)
+        std = math.sqrt(var)
+        bands = {}
+        for k in (1, 2):
+            bands[f"band_{k}sigma"] = {
+                "lower": _safe_round(mean - k * std),
+                "upper": _safe_round(mean + k * std),
+            }
+        win = {}
+        for label, h in _HORIZONS:
+            if n <= h:
+                win[label] = None
+                continue
+            wins = 0
+            samples = 0
+            for i in range(n - h):
+                samples += 1
+                if closes[i + h] > closes[i]:
+                    wins += 1
+            win[label] = {
+                "horizon_days": h,
+                "samples": samples,
+                "win_rate": _safe_round(wins / samples, 4) if samples else None,
+            }
+        return {
+            "code": code,
+            "n_bars": n,
+            "latest_close": _safe_round(last),
+            "mean": _safe_round(mean),
+            "std": _safe_round(std),
+            "band_1sigma": bands["band_1sigma"],
+            "band_2sigma": bands["band_2sigma"],
+            "t_plus_win_rates": win,
+            "note": "win_rate 为窗口内历史经验频率（收盘更高的占比），非预测概率",
+        }
+
+    code_list = [c.strip() for c in str(codes or "").split(",") if c.strip()]
+    if not code_list:
+        return {"error": "codes 为空"}
+    if len(code_list) == 1:
+        return _one(code_list[0])
+    results = {}
+    for code in code_list:
+        try:
+            results[code] = _one(code)
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
+
 # ── OpenAI tool declarations ─────────────────────────────────
 

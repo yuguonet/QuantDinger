@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ...log import logger
 
-from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime
+from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime, objective_preexclude, score_pool
 from ._facts import candidate_pool, market_state as _market_state, multitimeframe as _multitimeframe, detect_patterns as _detect_patterns, POOL_SOURCES, _PATTERN_PARAMS_DEFAULT
 from .common import SkillResult, fetch_kline
 
@@ -210,6 +210,7 @@ _REPORT_GUIDE = {
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
              "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote",
     "buyable": "rt.limit_up=true（涨停封板）或 rt.limit_down=true（跌停封死）→ **只进排除表，禁止进可买表**；"
+               "盘中涨停已在池层 objective_preexclude 排除，rt.buyable=false 是 deep 阶段的最终防线；"
                "stale_bar 不影响此条",
     "horizon": "主写 T+1/T+3/T+5；T+10/T+20 可选，证据不够写「不适用」；p_up 仅 T+1",
     "priority": "支撑与弱转强/强转弱 ≫ 涨跌幅；禁止按涨跌幅排序",
@@ -218,7 +219,21 @@ _REPORT_GUIDE = {
     "board_cut": "zt_streak>=3 默认只写 T+1",
     "words": "选股用 看多/中性/看空/回避（不入选）；用户问持仓才写「兑现」",
     "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors",
+    "funnel": "funnel 是分层漏斗统计（rounds 轮数 / pool_raw 原始池 / excluded_obj 客观淘汰 / "
+              "scored 打分数 / excluded_score 软门槛淘汰明细 / deep_n 进 deep 数 / eastmoney_ok 搜索源是否可用）；"
+              "写「数据可信度」时引用——eastmoney_ok=false 表示 search 来源缺失，结论依赖 zt/dragon/hot",
 }
+
+
+# ── 分层漏斗参数（2026-10-20）：Round0 严 → Round1 放宽 ──
+_FUNNEL_ROUNDS = (
+    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4},
+    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6},
+)
+_FUNNEL_MIN_ALIVE = 4       # Round0 存活 < 此数 → 自动进 Round1
+_FUNNEL_DEEP_N = 12         # 进 deep 的最终候选数（原 8）
+_FUNNEL_SEARCH_TOP_N = 100  # run() 扩池：每条查询拉满（pre_screen 默认 50 保留给手工调用）
+_FUNNEL_FALLBACK_QUERIES = ("换手率大于3%", "放量上涨")  # Round1 追加通用词
 
 
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
@@ -615,7 +630,11 @@ def _safe_market() -> dict:
 
 def run(sources: str = None, queries: str = None,
         min_turnover: float = None, limit: int = None) -> dict:
-    """一次性跑完整流程（pre_screen → profile → 分析 Top8）。供 run_skill 快捷派活。
+    """一次性跑完整流程——分层漏斗（2026-10-20）。
+
+    流程：pre_screen(search_top_n=100) → objective_preexclude 客观预排除 →
+    score_pool 双保险软门槛（Round0 严参数；存活 <4 自动 Round1 放宽并追加通用查询词，
+    最多 2 轮）→ deep_analyze(Top12)。LLM 仍单次调用，漏斗在 run() 内部自动完成。
 
     可选参数（与 pre_screen 同义；全部可省）：
         sources: 候选来源，如 "zt,dragon,search"；省略用时段默认
@@ -624,41 +643,96 @@ def run(sources: str = None, queries: str = None,
         limit: 候选截断；省略=不截断
     **不要传** strategy / min_market_cap / with_mtf 等不存在的参数。
     """
-    prescreen_result = pre_screen(
-        sources=sources, queries=queries,
-        min_turnover=min_turnover, limit=limit,
-    )
-    if prescreen_result.get("error"):
-        return SkillResult({
-            "report_guide": _REPORT_GUIDE,
-            **prescreen_result,
-        })
-    bundle = _profile_candidates(prescreen_result, limit=10, with_flow=False, with_pred=False)
-    codes = [p["code"] for p in bundle.get("profiles", []) if not p.get("hard")]
+    funnel = {
+        "rounds": 0, "pool_raw": 0, "excluded_obj": {},
+        "scored": 0,
+        "excluded_score": {"hard": 0, "p_up_hard": 0, "rank_cut": 0,
+                           "no_pred": 0, "floor_kept": 0},
+        "deep_n": 0, "eastmoney_ok": True,
+    }
+    strategy = select_strategy()
+    base_queries = [q.strip() for q in str(queries).split(",") if q.strip()] \
+        if queries else []
+
+    selected = []
+    meta = {}
+    for round_idx, params in enumerate(_FUNNEL_ROUNDS):
+        funnel["rounds"] = round_idx + 1
+        round_queries = list(base_queries)
+        if round_idx > 0:
+            for q in _FUNNEL_FALLBACK_QUERIES:
+                if q not in round_queries:
+                    round_queries.append(q)
+
+        prescreen_result = pre_screen(
+            sources=sources,
+            queries=",".join(round_queries) if round_queries else None,
+            search_top_n=_FUNNEL_SEARCH_TOP_N,
+            min_turnover=min_turnover, limit=limit,
+        )
+        if prescreen_result.get("error"):
+            return SkillResult({"report_guide": _REPORT_GUIDE,
+                                "funnel": funnel, **prescreen_result})
+
+        candidates = list(prescreen_result.get("candidates") or [])
+        missing = list(prescreen_result.get("missing") or [])
+        search_failed = [m for m in missing if "条件搜索" in str(m)]
+        # 各轮统计取「最终决定轮」口径：Round1 池 ⊇ Round0 池，累加会把同一批
+        # 淘汰重复计数，且 pool_raw 与 scored 必须来自同一个池才自洽。
+        funnel["pool_raw"] = len(candidates)
+        if round_idx == 0:
+            # 只按 Round0 的基础查询词评估搜索源可用性：Round1 追加的兜底词
+            # 只是扩大分母，会把「搜索源挂了」误判成可用
+            funnel["eastmoney_ok"] = len(search_failed) < max(1, len(round_queries or [""]))
+
+        kept, obj_stats = objective_preexclude(
+            candidates, prescreen_result.get("strategy") or strategy)
+        funnel["excluded_obj"] = obj_stats
+
+        selected, score_stats, meta = score_pool(
+            kept,
+            strategy=prescreen_result.get("strategy") or strategy,
+            market=prescreen_result.get("market"),
+            main_themes=prescreen_result.get("main_themes"),
+            p_up_floor=params["p_up_floor"],
+            rank_cut=params["rank_cut"],
+            floor_keep=params["floor_keep"],
+        )
+        funnel["scored"] = score_stats.get("scored", 0)
+        funnel["excluded_score"] = {k: score_stats.get(k, 0)
+                                    for k in ("hard", "p_up_hard", "rank_cut",
+                                              "no_pred", "floor_kept")}
+        if len(selected) >= _FUNNEL_MIN_ALIVE:
+            break
+
+    codes = [p["code"] for p in selected[:_FUNNEL_DEEP_N]]
+    funnel["deep_n"] = len(codes)
+
     if not codes:
-        # 空结果必须「可汇报」（2026-10-12）。原先只回 {analyzed: [], signal: "…"}，
-        # 模型拿不到任何可写的口径 ⇒ 无法收尾 ⇒ 只能转为主对话逐个取数重跑一遍同样的
-        # 逻辑（D-18 记的「run_skill 空结果 → 主对话硬跑 6 个取数工具」正是这么来的，
-        # 一次几十轮、烧掉几十万 token 且结论不变）。
-        # 这里把「筛了多少 / 因什么硬条件被淘汰 / 有什么数据缺口」一并给出，
-        # 让「空」本身成为一个能直接交付的结论，而不是一个等待被重跑的失败信号。
-        _profiles = list(bundle.get("profiles") or [])
-        _hard_reasons: list = []
-        for _p in _profiles:
-            for _r in (_p.get("hard") or []):
-                if str(_r) not in _hard_reasons:
-                    _hard_reasons.append(str(_r))
+        # 空结果必须「可汇报」（沿用 2026-10-12 契约，funnel 补充漏斗口径）。
+        # 原先只回 {analyzed: [], signal: "…"} ⇒ 模型无可写口径 ⇒ 转主对话重跑一遍
+        # 同样逻辑（D-18）。这里把「筛了多少 / 因什么淘汰 / 有什么数据缺口」一并给出。
         return SkillResult({
             "report_guide": _REPORT_GUIDE,
-            "strategy": bundle.get("strategy"),
+            "strategy": meta.get("strategy") or strategy,
             "analyzed": [],
-            "signal": "无符合硬条件的候选",
-            "pool_size": len(_profiles),
-            "hard_blocked": sum(1 for _p in _profiles if _p.get("hard")),
-            "hard_reasons": _hard_reasons[:10],
-            "missing": list(bundle.get("missing") or [])[:6],
-            "errors": list(bundle.get("errors") or [])[:3],
-            "mood_regime": bundle.get("mood_regime"),
-            "themes": list(bundle.get("themes") or [])[:5],
+            "signal": "无符合软硬门槛的候选",
+            "pool_size": funnel["pool_raw"],
+            "hard_blocked": sum(v for k, v in funnel["excluded_obj"].items()
+                                if k != "quotes_missing"),
+            "hard_reasons": [f"{k}:{v}" for k, v in funnel["excluded_obj"].items() if v],
+            "missing": list(meta.get("missing") or [])[:6],
+            "errors": list(meta.get("errors") or [])[:3],
+            "mood_regime": meta.get("mood_regime"),
+            "themes": list(meta.get("themes") or [])[:5],
+            "funnel": funnel,
         })
-    return deep_analyze(",".join(codes[:8]))
+
+    result = deep_analyze(",".join(codes), limit=_FUNNEL_DEEP_N)
+    # funnel 紧跟 report_guide（SkillResult 渲染分流按键存在性判断，键序不影响渲染）
+    if isinstance(result, dict):
+        out = {"report_guide": result.get("report_guide", _REPORT_GUIDE),
+               "funnel": funnel}
+        out.update({k: v for k, v in result.items() if k != "report_guide"})
+        return SkillResult(out)
+    return result

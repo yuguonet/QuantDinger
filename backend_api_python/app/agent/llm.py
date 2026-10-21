@@ -77,9 +77,16 @@ from typing import Any, Optional, Sequence
 
 from mimoagent.models import get_model as _mimo_get_model
 
-from .upstream_compat import read_token_stats
+from .upstream_compat import read_cache_tokens, read_token_stats
 
 logger = logging.getLogger(__name__)
+
+# httpx 逐请求 INFO（`POST .../chat/completions "200"`）只给方法+URL+状态码，
+# 看不到 tokens/耗时/输入输出。默认压到 WARNING，由 [LLM #N] 画像替代；
+# 要看原始 HTTP 明细设 `QD_LLM_HTTP_DEBUG=1`。
+if (os.getenv("QD_LLM_HTTP_DEBUG") or "").strip() in ("", "0", "false", "False"):
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 __all__ = [
     "ProviderSpec",
@@ -270,6 +277,7 @@ def get_model(
         }
         cfg.update(extra)
         m = _mimo_get_model(spec.model, cfg)
+        m = _wrap_query_logging(m)
         _MODEL_CACHE[key] = m
         return m
 
@@ -278,6 +286,158 @@ def clear_model_cache() -> None:
     """测试/配置热更新用：清空 Model 缓存。"""
     with _CACHE_LOCK:
         _MODEL_CACHE.clear()
+
+
+# ── [LLM #N] 调用画像（2026-10-20 重做：只包 query 公共入口）──────────
+# 用户要求：每次 LLM 调用显示输入/输出长度、tokens、耗时，用 ===== 分隔。
+# 【为什么不碰 _query】用户裁定「不拦截 mimoagent、走生产 SDK」——禁止覆盖
+# `OpenAIChatModel._query` / 替换模型类。这里只 **decorate 公共 `query`**：
+# 原方法原样委托（tenacity/流式/token 记账全在 mimo 内部不动），外层做观测。
+# 主循环（mimo BaseAgent.step）与 complete() 都走 model.query ⇒ 单点覆盖。
+_LLM_CALL_SEQ = 0
+
+
+def _snap_tokens(model: Any) -> tuple[int, int, Optional[int]]:
+    """token_stats 快照 (input, output, cache_read)；cache 未上报 → None。
+
+    经 upstream_compat 读（F15 收口）；字段漂移时 None/0 + 告警，不静默假 0。
+    """
+    st = read_token_stats(model)
+    inp = int(getattr(st, "input_tokens", 0) or 0) if st is not None else 0
+    out = int(getattr(st, "output_tokens", 0) or 0) if st is not None else 0
+    return inp, out, read_cache_tokens(model)
+
+
+def _log_llm_call(model: Any, seq: int, messages: Sequence[dict],
+                  in_chars: int, out_chars: int, before: tuple,
+                  elapsed_s: float, err: str,
+                  attempts: int = 0, tool_names: str = "") -> None:
+    """打一次 ===== 分隔的调用画像。失败也打（err 非空）。
+
+    attempts = 本次 query() 内 **HTTP 级** `chat.completions.create` 次数。
+    mimo `_query` 外面套着 tenacity 最多 5 次重试 ⇒ attempts>1 就是「一次
+    日志盖住多次全量重发」的硬证据（超时/空回复 ValueError 都会触发）。
+    """
+    try:
+        inp0, out0, cache0 = before
+        inp1, out1, cache1 = _snap_tokens(model)
+        d_in, d_out = max(0, inp1 - inp0), max(0, out1 - out0)
+        # cache 任一侧未上报 → None（别写 0，会把命中率算成 0% 误导）
+        d_cache = None if (cache0 is None or cache1 is None) else max(0, cache1 - cache0)
+        total = d_in + d_out
+        cfg = getattr(model, "config", None)
+        name = str(getattr(cfg, "model_name", "") or "")
+        stream_on = bool((getattr(cfg, "model_kwargs", None) or {}).get("stream"))
+        rate = (d_out / elapsed_s) if elapsed_s > 0 and d_out else 0.0
+        cache_part = "n/a"
+        if d_cache is not None and d_in > 0:
+            cache_part = "%s (%.1f%%)" % (f"{d_cache:,}", 100.0 * d_cache / d_in)
+        bar = "=" * 72
+        # attempts>1 打醒目标记：这就是「超时/空回复 → tenacity 全量重发」
+        att_part = ""
+        if attempts:
+            att_part = " attempt=%d" % attempts
+            if attempts > 1:
+                att_part += " ⚠重试"
+        lines = [
+            bar,
+            "[LLM #%d] %s stream=%s elapsed=%.2fs msgs=%d%s%s" % (
+                seq, name, stream_on, elapsed_s, len(list(messages or [])),
+                att_part, ("  ERR=" + err) if err else ""),
+            "  输入: chars=%s   输出: chars=%s%s" % (
+                f"{in_chars:,}", f"{out_chars:,}" if out_chars else "—",
+                ("  tools=[" + tool_names + "]") if tool_names else ""),
+            "  tokens: prompt=%s completion=%s total=%s cache_read=%s  (%.1f tok/s out)" % (
+                f"{d_in:,}", f"{d_out:,}", f"{total:,}", cache_part, rate),
+            bar,
+        ]
+        logger.info("\n".join(lines))
+    except Exception:
+        pass
+
+
+def _instrument_create_counter(model: Any) -> dict:
+    """给 `client.chat.completions.create` 计数（HTTP 级，幂等）。
+
+    【为什么不碰 mimo `_query`】用户裁定禁止覆盖 `OpenAIChatModel._query`。
+    tenacity 包在 `_query` 外面 ⇒ 每次重试都是一次 `create()`。在 openai SDK
+    的 create 上计数，就能区分「1 次 query = 1 次 HTTP」还是「1 次 query
+    盖住 N 次全量重发」——这是查「超时重复」的唯一无侵入观测点。
+    """
+    state = {"n": 0, "errors": 0}
+    client = getattr(model, "client", None)
+    comp = getattr(getattr(client, "chat", None), "completions", None)
+    if comp is None or getattr(comp, "_qd_attempt_counted", False):
+        return state
+    original_create = comp.create
+
+    def create_counted(*a, **kw):
+        state["n"] += 1
+        try:
+            return original_create(*a, **kw)
+        except Exception:
+            state["errors"] += 1
+            raise
+
+    comp.create = create_counted
+    comp._qd_attempt_counted = True
+    return state
+
+
+def _wrap_query_logging(model: Any) -> Any:
+    """给 model.query 挂观测埋点（幂等）。返回同一个 model 实例。"""
+    if getattr(model, "_qd_query_logged", False):
+        return model
+    if not callable(getattr(model, "query", None)):
+        return model          # 测试替身 / 无 query 契约的实例：原样放行
+    original = model.query
+    # 一次 query() 对应一个计数桶；query 结束后读走（含 tenacity 全部重试）。
+    attempt_state = _instrument_create_counter(model)
+
+    def query_with_log(messages, **kwargs):
+        global _LLM_CALL_SEQ
+        _LLM_CALL_SEQ += 1
+        seq = _LLM_CALL_SEQ
+        t0 = _perf_counter()
+        before = _snap_tokens(model)
+        attempt_state["n"] = 0
+        attempt_state["errors"] = 0
+        try:
+            in_chars = sum(len(str(m.get("content") or ""))
+                           for m in (messages or []) if isinstance(m, dict))
+        except Exception:
+            in_chars = 0
+        err = ""
+        out_chars = 0
+        tool_names = ""
+        try:
+            payload = original(messages, **kwargs)
+            try:
+                out_chars = len(str((payload or {}).get("content") or ""))
+                tcs = (payload or {}).get("tool_calls") or []
+                names = []
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        names.append(str((tc.get("function") or {}).get("name") or tc.get("name") or "?"))
+                tool_names = ", ".join(names)
+            except Exception:
+                pass
+            return payload
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, str(e)[:160])
+            raise
+        finally:
+            try:
+                _log_llm_call(model, seq, messages, in_chars, out_chars,
+                              before, _perf_counter() - t0, err,
+                              attempts=attempt_state["n"],
+                              tool_names=tool_names)
+            except Exception:
+                pass
+
+    model.query = query_with_log
+    model._qd_query_logged = True
+    return model
 
 
 def _to_response(payload: dict, model_name: str = "") -> LLMResponse:
