@@ -1,4 +1,4 @@
-"""store.py (原 dragon_store.py) - 自动策略组存储层
+"""store.py (原 auto_store.py) - 自动策略组存储层
 
 职责:
   1. qd_dragon_signals 事实表 (状态机全量+历史) 的建表与 CRUD
@@ -207,14 +207,14 @@ def ensure_tables():
                 """)
                 if not cur.fetchone():
                     raise
-                logger.info("[dragon_store] UNIQUE 约束已存在(重名跳过): %s", e)
+                logger.info("[auto_store] UNIQUE 约束已存在(重名跳过): %s", e)
 
         # ── 4. 历史残留清理 ──
         cur.execute(f"DELETE FROM {_SIGNALS_TABLE} WHERE strategy = 'dragon2'")
 
         db.commit()
         cur.close()
-    logger.info("[dragon_store] ensure_tables 完成")
+    logger.info("[auto_store] ensure_tables 完成")
 
 
 # ================================================================
@@ -1133,7 +1133,7 @@ def sync_watchlist_group(active_rows):
 
         db.commit()
         cur.close()
-    logger.info("[dragon_store] 组同步: 目标%d 插入%d 更新%d 删除%d",
+    logger.info("[auto_store] 组同步: 目标%d 插入%d 更新%d 删除%d",
                 len(target), inserted, updated, deleted)
 
     # ── 上级答案 → label 唯一写接口 submit() (grade=3, auto) ──
@@ -1144,7 +1144,7 @@ def sync_watchlist_group(active_rows):
     try:
         submitted = _submit_labels_to_label_layer(active_rows)
     except Exception:
-        logger.error("[dragon_store] label 提交失败 (不影响组同步)")
+        logger.error("[auto_store] label 提交失败 (不影响组同步)")
         import traceback as _tb
         logger.error(_tb.format_exc())
 
@@ -1258,7 +1258,7 @@ def _label_payload(s) -> dict:
             strategy = s.get("strategy") or DRAGON_STRATEGY
             log = (logger.debug if strategy == "dragon_callback" and score == -1
                    else logger.warning)
-            log("[dragon_store] 忽略超出 label 合约的信号评分 %s %s: %r",
+            log("[auto_store] 忽略超出 label 合约的信号评分 %s %s: %r",
                 strategy, s.get("code"), score)
             score = None
     state_rows = [{"label": "状态",
@@ -1293,9 +1293,9 @@ def _submit_labels_to_label_layer(active_rows) -> int:
                    ttl_days=LABEL_TTL_TRADING_DAYS)
             n += 1
         except Exception as e:
-            logger.warning("[dragon_store] label 提交失败 %s: %s", code, e)
+            logger.warning("[auto_store] label 提交失败 %s: %s", code, e)
     if n:
-        logger.info("[dragon_store] label 提交(auto/grade3): %d 条 (ttl=%d 交易日)",
+        logger.info("[auto_store] label 提交(auto/grade3): %d 条 (ttl=%d 交易日)",
                     n, LABEL_TTL_TRADING_DAYS)
     return n
 
