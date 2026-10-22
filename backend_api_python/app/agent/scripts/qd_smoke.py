@@ -670,8 +670,16 @@ def test_16_meta_tools_mounted():
     meta_names = set(prov.get_meta_functions())
     check("元工具已装配（非空）", bool(meta_names), str(meta_names))
     check("web_search 在工具面", "web_search" in names, str(names))
-    check("format_result 在工具面", "format_result" in names, str(names))
-    check("发现元工具已挂", {"list_tools", "search_tools", "activate_tools"} <= set(names),
+    # 2026-10-22 裁定断链：tools/format_utils.py 已移除（见 _provider.py 头注，
+    # LLM 版 format_result 由 mimo 原生元工具接管），此处从「存在性」反转为「缺席锁」，
+    # 防止有人把已删工具悄悄加回工具面。检查项总数不变（259）。
+    check("format_result 已移出工具面（mimo 原生接管）", "format_result" not in names,
+          str(names))
+    check("发现元工具已挂", {"list_resources", "search_resources", "activate_tools"} <= set(names),
+          str(names))
+    check("旧发现动词已从工具面摘除（v52 统一口接管）",
+          not ({"list_tools", "search_tools", "list_skills",
+                "list_capabilities", "search_capabilities"} & set(names)),
           str(names))
 
 
@@ -707,7 +715,8 @@ def test_18_activate_and_auto_activate():
     print("test 18: 激活通道（activate_tools 点名 + 未激活直调 fail-open）")
     import asyncio
     from app.agent.qd_service import QDAgentService
-    from app.agent.tools.tool_discovery import search_tools, activate_tools
+    from app.agent.tools.exec_tools import activate_tools
+    from app.agent.tools.resource_catalog import _search_tools as search_tools
 
     svc = QDAgentService(model=ScriptedModel([{"content": "ok"}]),
                          agent_config={"tools": []})
@@ -982,8 +991,12 @@ def test_24_tool_grading():
           all(m.__name__.startswith("app.agent.preselect.")
               for m in (_tp, _cooc, _stats)),
           "/".join(m.__name__ for m in (_tp, _cooc, _stats)))
-    check("必选层仍保留真工具（发现/记忆）",
-          {"search_tools", "list_tools", "activate_tools", "recall"} <= common,
+    check("必选层仍保留真工具（统一发现口 + 记忆）",
+          {"list_resources", "search_resources", "activate_tools", "recall"} <= common,
+          str(sorted(common)))
+    check("旧发现动词已从必选层摘除（v52 统一口接管）",
+          not ({"list_tools", "search_tools", "list_skills",
+                "list_capabilities", "search_capabilities"} <= common),
           str(sorted(common)))
     # 注：文件读写能力已由 mimo 原生 read/write 承担（核心工具，不在 common 域），
     # 由 test_6_native_mimo_capabilities 覆盖；filesystem_tools 已于 2026-10-11 退役。
@@ -1777,9 +1790,9 @@ def test_33_skill_dispatch_and_plan_lint():
         return
 
     try:
-        from app.agent.tools import skill_tools as _st
+        from app.agent.tools import exec_tools as _st
     except Exception as e:
-        check("可导入 tools.skill_tools", False, f"{type(e).__name__}: {e}")
+        check("可导入 tools.exec_tools", False, f"{type(e).__name__}: {e}")
         return
 
     # ── B② 白名单拦截（未登记技能不得执行）──

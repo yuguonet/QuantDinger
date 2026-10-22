@@ -259,9 +259,12 @@ if _agent_type != "code":
         "[启动] AGENT_TYPE=%s 不受支持，本系统仅支持 CodeAgent 形态，已按 code 运行", _agent_type)
 # 工具架构：
 #   - ToolProvider 统一注册（tools/ 通用 + 子目录领域工具），一次扫描两种输出（函数 + schema）
-#   - 必选工具（list_tools/search_tools/format_result/web_search）→ smolagents tools=[]
-#   - 领域工具 → executor.custom_tools，LLM 通过 search_tools/list_tools 动态发现
+#   - 必选工具（web_search/format_result 等元工具 + 执行层动词）→ smolagents tools=[]
+#   - 领域工具 → executor.custom_tools，LLM 通过统一发现口 search_resources 检索、activate_tools 激活
 #   - 全量工具 schema → planning YAML {{tool_list}}，供 smolagents 内部 planning 选工具
+#   - 统一发现口（v52，2026-10-22）：list_resources/search_resources 是唯一发现入口（skill/tool/
+#     capability 级联）；旧 5 发现动词（list_tools/search_tools/list_skills/list_capabilities/
+#     search_capabilities）已从工具面摘除、实现保留为内部 API；执行层动词不动
 _mode = "task"
 logger.info(
     "QuantDinger Agent 启动: %s 模式 | %d 技能 | provider=%s model=%s",

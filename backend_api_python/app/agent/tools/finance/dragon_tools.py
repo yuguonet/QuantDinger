@@ -16,14 +16,14 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
     """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
 
     codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
-    2026-09-27 工具归组化：合并原 get_dragon_tiger_detail（detail=True 展开席位明细）。
+    detail=True 时展开席位明细。
 
     Returns:
-        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
         "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{stock_code, count, records:[...]}（records 含个股龙虎榜明细；
         不传代码时 data 为日期汇总 {date, count, stocks:[...]}）。
         detail=True 时单股结果追加 seats{buy,sell} 与 institution{}（席位与机构动向，
-        与原 get_dragon_tiger_detail 单股返回同构）。
+        与单股返回同构）。
 
     Args:
         codes: 逗号分隔的股票代码（可选，空=全市场），如 "600519" 或 "600519,000001"

@@ -240,7 +240,7 @@ def _fake_skill_module():
 
 
 def test_run_skill_creates_job_dir_and_manifest(monkeypatch, tmp_path):
-    from app.agent.tools import skill_tools
+    from app.agent.tools import exec_tools as skill_tools
     captured = {}
 
     def fake_run_job(cmd, **kw):
@@ -267,7 +267,7 @@ def test_run_skill_passes_structured_error_through(monkeypatch, tmp_path):
     """★ 冒烟 B② 实锤的回归防护：子进程 rc≠0 + stdout ok=False（带重试指引）
     必须**原样透传**给模型；被 run_job 的 RuntimeError 吞掉 = 降智
     （"未知参数"的 hint/report_guide 是模型自救的唯一指引）。"""
-    from app.agent.tools import skill_tools
+    from app.agent.tools import exec_tools as skill_tools
     child_payload = {
         "ok": False, "error": "未知参数: ['market_cap']",
         "hint": "请只用: ['strategy', 'code']",
@@ -289,7 +289,7 @@ def test_run_skill_passes_structured_error_through(monkeypatch, tmp_path):
 
 
 def test_run_skill_timeout_and_stall_write_terminal_manifest(monkeypatch, tmp_path):
-    from app.agent.tools import skill_tools
+    from app.agent.tools import exec_tools as skill_tools
     from app.agent.exec.job_runner import JobStalled
 
     def fake_timeout(cmd, **kw):

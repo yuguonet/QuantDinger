@@ -48,11 +48,11 @@ def agent_backtest_strategy(
 ) -> dict:
     """对 auto 折叠策略跑一次回测（独立桥：生产树只读、零写共享表、删作业目录即回滚）。
 
-    载体三选一（§5.7 档位）：
+    载体三选一：
       ①/② proposal_json —— 对现有策略 <strategy>.yaml 的最小改动提案；最小 schema：
         {"strategy":"break","edits":[{"kind":"param","target":"x","before":1,"after":2}]}
         （schema 真源 app/market_cn/auto/tools/proposal.py；改选择集须附
-        evidence.stability/pool_check，红线由 proposal.validate 强制）；
+        evidence.stability/pool_check，由 proposal.validate 强制）；
       ③ strategy_py + strategy_yaml —— 全新策略（两者必须成对，strategy_key 必填，
         agentbt_ 前缀；strategy_yaml 是 JSON 字符串）；
       existing —— 只传 strategy_key 且不传前两者 = 回测现有策略零改动（对照组）。

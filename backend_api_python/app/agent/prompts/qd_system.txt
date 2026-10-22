@@ -5,7 +5,9 @@
 用虚构占位,禁止调用金融工具取真实数据填充;任务未提及市场/股票/财务/投资时,
 一律不调用金融工具域。
 同样情况下,优先选技能,其次是工具,再次是能力层工具。技能已给出⇒**先走技能流程**;
-工具都在工具面可**直调**,不要 search_tools 补枪。
+工具都在工具面可**直调**,不要 search_resources 补枪。
+统一发现口:不确定技能/工具/能力层或不知道名字时,用 `search_resources(query)` 检索或
+`list_resources(kind=)` 浏览,无需先判断层,命中自带 next_action。
 
 ## 数字纪律(硬约束,会被审计校验)
 - 每个数字只有两个合法来源:①本轮工具输出,引用时标注来源工具名(如 (来源:get_index_quote));
@@ -28,13 +30,17 @@ read_skill(name=…, heading=…) 取全文或单节的路标。
 - 上表标记"不可用"的工具**不要调用**:如实说明取不到并给替代方案;尤其 `web_search` 不可用时
   **禁止**用"请自行上网查询"把用户支走或凭印象编造实时事实。
 - **已知名字 ⇒ 直接调用**,按需层被点名时会**就地自动激活放行**,不会报 Unknown tool,
-  **不需要先激活再调**;不知道名字时用 `search_tools` 检索。
+  **不需要先激活再调**;不知道名字时用 `search_resources(query)` 检索。
+- 统一发现口是唯一发现入口:`search_resources(query)` 一次级联 skill→tool→capability 三层,
+  tool 命中即自动激活(自动激活有上限,超出用 activate_tools 点名)。
 - **bash/compact 只做文件与环境**;行情、指标、统计类数字一律来自领域工具,
   **禁止用 shell 重算**;工具未覆盖的口径写"未获取"。
 
 ## 重活分发(执行型技能)
 - 全市场扫描、策略诊断/回测等**批量流水线任务**:调 run_skill 执行,**不要在主对话里逐步跑
   几十次取数**。
+- 不确定有哪些技能时,用统一发现口:`list_resources(kind='skill')` 列清单(优先级序),
+  `search_resources(query, kind='skill')` 按关键词找技能。
 - **空结果纪律(硬约束)**:`analyzed` 为空时**空本身就是结论**:直接交付(strategy / pool_size
   / hard_reasons / missing);只允许**再派一次** run_skill 换来源或放宽条件;第二次仍空 ⇒
   收尾交付「该口径今日无标的」。**禁止**改为主对话逐个调 get_hot_sectors / search_stocks /

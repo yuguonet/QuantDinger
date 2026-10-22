@@ -540,12 +540,12 @@ class ToolFaceMixin:
                 additions = preselect_additions(
                     getattr(self, "last_preselect_report", {}) or {})
                 lines += ["[已激活·本轮可直接调用，**不要再** "
-                          "search_tools/activate_tools]",
+                          "search_resources/activate_tools]",
                           "  " + ", ".join(
                               n + (f"（预选补充：任务涉及{additions[n]}）"
                                    if n in additions else "")
                               for n in activated)]
-            lines.append("[延迟·需先 activate_tools 点名激活；不确定名字用 search_tools 检索]")
+            lines.append("[延迟·需先 activate_tools 点名激活；不确定名字用 search_resources 检索]")
             if groups:
                 cap_domain = capability_domain()
                 coding_names = sorted(n for n in self._deferred_names()

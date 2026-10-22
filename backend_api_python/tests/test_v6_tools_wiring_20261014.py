@@ -28,7 +28,7 @@ from app.agent.preselect.tool_preselect import (
     lint_selection,
     parse_selection,
 )
-from app.agent.tools import capability_tools as _ct
+from app.agent.tools import exec_tools as _ct
 from app.agent.tools._base import ToolProvider
 
 

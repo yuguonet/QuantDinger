@@ -18,8 +18,8 @@ from .news_search_tools import search_stock_intel, search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
-    ⚠️ 与其它技术工具的关系（2026-10-17，防重复取数与口径误读）：
-    · 本工具**内部已自行取数并计算**：实时行情 + 120 日 K 线 + 五维技术快照
+    ⚠️ 与其它技术工具的关系（防重复取数与口径误读）：
+    · 本工具**已自行取数并计算**：实时行情 + 120 日 K 线 + 五维技术快照
       （ma/macd/rsi/boll/kdj，`score_model=bb5_weighted(...)`）+ 个股情报。
       与 `get_realtime_quote`/`agent_get_kline`/`technical_analysis` 同批调用时，
       后三者的取数与技术快照部分是**重复劳动**（费 token，不影响正确性）；仅当

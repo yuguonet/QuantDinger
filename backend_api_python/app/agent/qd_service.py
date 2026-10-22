@@ -692,7 +692,7 @@ class QDAgentService:
                                      if _exec_spec is not None else "")
                         _route = ("" if _exec_spec is not None else
                                   "（按序执行：技能已给出⇒**先走技能流程**；"
-                                  "取数工具已在工具面可**直调**，无需 search_tools）")
+                                  "取数工具已在工具面可**直调**，无需 search_resources）")
                         parts.append(
                             f"[技能指针：{best}] 正文本会话已注入过；"
                             f"要完整正文用 read_skill(name=\"{best}\")，"
@@ -717,7 +717,7 @@ class QDAgentService:
                                 parts.append(
                                     f"[相关技能：{best}]\n{blk}\n"
                                     f"（按序执行：技能已给出⇒**先走技能流程**；"
-                                    f"取数工具已在工具面可**直调**，无需 search_tools）")
+                                    f"取数工具已在工具面可**直调**，无需 search_resources）")
                                 seen.add(best)
                                 hit = True
                 _skill_resolved = best if hit else ""

@@ -46,7 +46,7 @@ metadata:
 | `description` | 必填；单句/短段；长度 ≤1024；写清「做什么 + 何时用」 |
 | `metadata.version` | 语义化版本，首酿固定 `0.1.0` |
 | `metadata.tags` | 逗号分隔字符串（不是 YAML 列表） |
-| `metadata.tools` | 逗号分隔字符串；只写本技能关键工具；元工具（list_tools/search_tools 等）不要写进白名单 |
+| `metadata.tools` | 逗号分隔字符串；只写本技能关键工具；统一发现口与执行层元工具（list_resources/search_resources/activate_tools/read_skill/run_skill/call_capability 等）不要写进白名单 |
 
 ### 正文结构
 

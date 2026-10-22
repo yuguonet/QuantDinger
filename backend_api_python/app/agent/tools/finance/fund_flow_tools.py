@@ -81,7 +81,7 @@ def _fund_flow_boards_view(src: dict) -> dict:
 
 def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
                   indicator: str = "今日") -> dict:
-    """资金流向（统一入口，2026-09-27 工具归组化）。
+    """资金流向统一入口：按 scope 返回个股/市场/板块的主力资金净流入。
 
     Args:
         scope: 资金流范围，stock | stock_daily | market | sector | concept

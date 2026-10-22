@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 def list_indicators(user_id: int = 1, include_params: bool = False,
                     indicator_id: Optional[int] = None) -> Dict[str, Any]:
-    """指标策略列表（2026-09-27 工具归组化：合并原 get_indicator_params）。
+    """指标策略列表：返回全部用户自定义指标策略。
 
     Returns:
         dict: {indicators:[{id, user_id, is_buy, name, description, price, createtime,
@@ -139,7 +139,7 @@ def run_indicator_signal(
     params: Optional[Dict[str, Any]] = None,
     codes: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """执行指标策略（2026-09-27 工具归组化：合并原 indicator_analysis 批量研判）。
+    """执行指标策略：对单只股票或批量股票运行用户自定义指标策略。
 
     Returns:
         单股模式 → dict: {success(True/False), stock_code, indicator_id, indicator_name,
@@ -147,7 +147,7 @@ def run_indicator_signal(
         signals(list), data_points, last5_buy/last5_sell/last5_close}；失败→{success: False, error}。
         批量模式（codes 非空）→ {count, data:{代码: 标准化 SkillReport dict}}，
         单标的时顶层再镜像 report（SkillReport，双通道）；此模式下 indicator_id 忽略，
-        对用户全部指标策略综合研判（等价原 indicator_analysis）。
+        对用户全部指标策略综合研判。
 
     Args:
         indicator_id: 指标策略 ID（单股模式必填；批量模式忽略）
@@ -371,8 +371,7 @@ def indicator_analysis(codes: str, user_id: int = 1,
     Returns:
         标准化 SkillReport dict
 
-    ⚠️（2026-09-27 修复）原签名无 context 参数却引用 context ⇒ 调用即 NameError。
-    现显式接收可选 context（兼容可能的封装层注入），无 context 时以 user_id 参数为准。
+    ⚠️ context 参数为可选封装层注入（其 user_id 优先于显式 user_id）；无 context 时以 user_id 参数为准。
     """
     user_id = (context or {}).get("user_id", user_id)
 

@@ -90,6 +90,13 @@ _TOOL_MODULE_IMPORT_FAILURES: list = []
 #   （get_fund_flow_daily/get_sector_fund_flow/get_hot_sectors/get_index_kline）
 #   不得进本表——否则包装被摘、能力薄实现出静默接管，语义降级无人知（P0 定案）。
 _SUPERSEDED_BY_MERGE = frozenset({
+    # ★ 2026-10-22 AP.7：旧 5 个发现动词（list_tools/search_tools/list_skills/
+    #   list_capabilities/search_capabilities）已随 tools/tool_discovery.py、
+    #   tools/skill_tools.py、tools/capability_tools.py 三文件合并而**物理删除**，
+    #   实现并入 tools/resource_catalog.py 成为 `_` 前缀内部接口（统一口数据源），
+    #   不再需要本表登记摘除（`_` 前缀天然退出 scan_directory 自发现）。
+    #   执行层动词（activate_tools/read_skill/run_skill/call_capability）合并至
+    #   tools/exec_tools.py，仍随扫描自动注册进工具面。
     # 资金流 → get_fund_flow(scope=...)（P0 保留 get_fund_flow_daily/get_sector_fund_flow）
     "finance.fund_flow_tools:get_market_fund_flow",
     "finance.fund_flow_tools:get_concept_fund_flow",

@@ -33,11 +33,8 @@ def get_market_indices() -> dict:
 def get_market_overview() -> dict:
     """市场概览：返回市场情绪指数、主力资金流向、指数涨跌概况。
 
-    2026-09-14 移除北向资金字段（与 get_northbound_flow 摘除同因）：上游同花顺
-    hexin 实时接口数据源残缺（实测 sgt 仅 13% 完整度，接口自判"北向数据不完整"）
-    ——北向实时披露已停，属数据源性死亡而非临时故障。留在聚合里，每次调用都要
-    白等一个必死请求，还诱导模型每轮写"北向资金：未明确返回"。日级历史
-    （get_northbound_daily）不受影响。
+    ⚠️ 不含北向资金字段：北向实时披露已停（上游接口数据源残缺），属数据源性
+    死亡而非临时故障。日级历史（get_northbound_daily）不受影响。
 
     注意字段语义：up_count/down_count 是**两大指数（上证/深成）的涨跌抽样**，
     不是全市场涨跌家数——全市场维度请用 get_market_indices 自行汇总。
@@ -120,17 +117,15 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         codes: 多股用逗号分隔
 
     Returns:
-        统一结构（单/多代码一致，2026-09-24 起）：{"count": N, "data": {代码: 行情dict},
+        统一结构（单/多代码一致）：{"count": N, "data": {代码: 行情dict},
         "error": None}；行情dict 字段：{stock_code, last, changePercent, volume, name,
         high, low, open, previousClose, time, limit_up, limit_down}
         （limit_* 来自腾讯源增补，供涨跌停判定）；volume 单位见 volume_unit（恒 "股"，
         六个 provider 出口已各自归一化为股——腾讯/搜狐/tdx 原始为手已×100，
-        新浪/同花顺/百度原生为股；2026-10-17 审计：无单位标注致模型把成交量
-        误写成"万手"，补此键后下游不得再猜单位）；失败 → {"error": "...", "retriable": False}
+        新浪/同花顺/百度原生为股）；失败 → {"error": "...", "retriable": False}
 
-    ⚠ **不含**换手率/量比/PE/PB/总市值（2026-10-17 修正：旧版首行承诺这五项，
-    实测返回里根本没有——描述是唯一进 LLM 的契约，写了就等于教模型去承诺
-    拿不到的数据，run8 实测被列为"目录过承诺"）。要这些口径请用：
+    ⚠ **不含**换手率/量比/PE/PB/总市值（描述是唯一进 LLM 的契约，写了就等于教模型去承诺
+    拿不到的数据）。要这些口径请用：
       · 换手率/PE/PB/总市值 → `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）
       · 量比/量能 → `get_volume_analysis`
     """
@@ -201,8 +196,6 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
         timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
         days: 天数，默认 30，最大 250
         adj: 复权口径 qfq(前复权,默认)/hfq(后复权)/none(不复权)。返回 data 各 bar 含 adj 标注。
-
-    2026-09-25：补 adj——底层本就做 qfq，分析/回测口径不可比的缺口在工具层未暴露。
     """
     # codes 容错：模型可能传 list / list[tuple] / 数字 / 带前后缀串
     # ── days 默认 30 的依据（2026-10-21 实测；论证留此处不进 docstring：
@@ -639,12 +632,11 @@ def _tencent_quote_raw(codes: list) -> dict:
 def get_order_book(codes: str) -> dict:
     """五档盘口：买卖各 5 档价格与挂单量，含最新价、涨跌幅。
 
-    ⚠ **不含**换手率/PE/市值（2026-10-17 修正，同 `get_realtime_quote` 同型：
-    旧版首行承诺了三项，返回里根本没有——描述是唯一进 LLM 的契约）。要这些
-    口径用 `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）。
+    ⚠ **不含**换手率/PE/市值（描述是唯一进 LLM 的契约，写了就等于教模型去承诺
+    拿不到的数据）。要这些口径用 `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）。
 
     Returns:
-        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
         "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{code, name, price, change_percent, bid, ask}，五档在 bid/ask。
 
     Args:
@@ -1054,11 +1046,11 @@ def get_capital_summary(codes: str) -> dict:
     并生成结构化摘要供中长线持仓决策参考。
 
     Returns:
-        统一结构（单/多股一致，2026-09-22 起）：{"count": N, "data": {代码: 单股结果},
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
         "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{"summary": {margin, block_trade, holders, dividend, financials,
         overall_signal(中长线偏多/偏空/中性)}}。
 
-    ⚠️ 单位口径（2026-10-17 起，键名即单位，见名知口径）：
+    ⚠️ 单位口径（键名即单位，见名知口径）：
         - margin：`rz_balance_wan`/`rq_balance_yi`（及 rq_ 同款）融资/融券余额，
           **万元与亿元各一份**——引用时取 `_yi` 键直接照抄，不要自己换算
           （run8：换算对了却把单位名写成「万万元」）
@@ -1070,8 +1062,7 @@ def get_capital_summary(codes: str) -> dict:
         - dividend：`cum_bonus_per_10shares_rmb` 累计派息 **元/10股**
           （附 `bonus_unit`）
         上述口径**只适用于对应键**：价格（元）、派息（元/10股）等非 money
-        字段不得套用万元/亿元口径做倍数换算（2026-10-17 复跑曾出现把
-        1329 元现价 ÷100 标成「13.29 万元」的幻觉）。
+        字段不得套用万元/亿元口径做倍数换算。
 
     Args:
         codes: 多股用逗号分隔

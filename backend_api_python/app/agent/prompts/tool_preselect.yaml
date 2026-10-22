@@ -35,7 +35,7 @@ user: |-
   {skills}候选工具目录（每行：工具名 | 说明 | 参数，逐字命中才算）：
   {catalog}
 
-  【能力层】域内确实无法覆盖某条交付信息时，用 search_tools(name) 检索 capability 后点名；**不要预列**。
+  【能力层】域内确实无法覆盖某条交付信息时，用 search_resources(query, kind='capability') 检索后点名；**不要预列**。
   {history}
   【示例】
   用户"分析宁德时代" → {{"goal":"对宁德时代进行A股一站式综合分析","deliverables":["股票基本信息","实时行情","K线走势","技术面评分","基本面摘要","筹码分布","资金流向"],"tools":["get_realtime_quote","agent_get_kline","technical_analysis","get_capital_summary","get_chip_distribution","get_fund_flow"],"skill":"auto-stock-analyze"}}

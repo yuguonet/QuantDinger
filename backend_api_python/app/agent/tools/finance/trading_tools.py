@@ -96,7 +96,7 @@ def start_strategy(strategy_id: int, user_id: int = 1, confirm: bool = False) ->
     策略将按照配置的指标信号自动执行买卖操作；订单由 PendingOrderWorker +
     app.services.live_trading **实盘成交**（各所直连 REST，见 trading_executor.py 头注释）。
 
-    【human-in-the-loop 硬闸（2026-09-24 提智 0.1）】调用前**必须**把策略名与“将按信号
+    【human-in-the-loop 硬闸】调用前**必须**把策略名与“将按信号
     自动实盘买卖”告知用户、获得明确同意，再以 confirm=True 重调；未确认只返回
     requires_confirmation（展示信息，不执行）。每次启动/停止均审计留痕。
 

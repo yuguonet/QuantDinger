@@ -207,7 +207,7 @@ def test_capability_catalog_folded_keeps_p14_invariant(monkeypatch):
     assert "（8 个）" in text, "组计数必须在（P14：只报计数=回退，但计数仍要有）"
     for rep in caps[:6]:
         assert rep in text, f"代表名 {rep} 必须可见（P14 不可见即不可用）"
-    assert "list_tools(domain='capability')" in text, "检索指针必须可行动"
+    assert "search_resources(query, kind='capability')" in text, "检索指针必须可行动"
     # 合法点名集不受折叠影响（lint/parse 仍认全量）
     assert set(kept) >= set(caps), "折叠只缩呈现，不缩合法集"
 

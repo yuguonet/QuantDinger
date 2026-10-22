@@ -188,7 +188,7 @@ def search_comprehensive_intel(codes: str, name: str = "") -> dict:
 
 def search_intel(scope: str = "stock", codes: str = "", name: str = "",
                  market: str = "CNStock") -> dict:
-    """情报检索（统一入口，2026-09-27 工具归组化：合并原 4 个情报工具）。
+    """情报检索统一入口：按 scope 返回个股/板块/政策的新闻情报。
 
     Args:
         scope: 检索范围，stock | sector | policy | all

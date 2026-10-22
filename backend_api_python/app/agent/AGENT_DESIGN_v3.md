@@ -56,9 +56,9 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 
 三个硬约束决定了后面所有的架构选择：
 
-> 📌 **本文所有「实测」数字的时点与口径（2026-10-21 重测；2026-10-13 版留档见附录 Z）**
+> 📌 **本文所有「实测」数字的时点与口径（2026-10-22 重测；2026-10-13 版留档见附录 Z）**
 > - **窄口径（QD 自建工具面 = 工具 + 能力层，探针 `tmp/probe_design_drift_*.py` 可复现）**：
->   注册表 **96** 个（工具 **56** + 能力层 **40**）；必注入 **11** / 按需 **85**
+>   注册表 **93** 个（工具 **53** + 能力层 **40**）；必注入 **8** / 按需 **85**
 >   （`CORE_TOOL_DOMAINS=("common","meta")` 域）。
 > - **宽口径（叠加 mimo 原生工具）**：2026-10-17 快照 **101**（必注入 **15** / 按需 **86**）。
 >   ⚠️ 10-17 曾把宽口径 101 与 10-13 窄口径 92 直接相比（"工具数 92→101"）、把宽口径
@@ -70,20 +70,29 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 >   （2026-10-19 用户裁定：保留恢复、正式登记）。
 >   **10-21 的 95 → 96**：`tools/finance/analysis_tools.py` 新增 `get_price_stats`
 >   （用户 10-20 补丁，**有记录**）——详见**附录 AO**。
+>   **10-22 的 96 → 98**：v52 统一发现口 `tools/resource_catalog.py` 新增
+>   `list_resources`/`search_resources` 两个 common 域工具（附录 AP2）。
+>   **10-22 的 98 → 93**：旧 5 个发现动词（`list_tools`/`search_tools`/`list_skills`/
+>   `list_capabilities`/`search_capabilities`）从 LLM 工具面**摘除**（实现保留为内部 API），
+>   统一口 `list_resources`/`search_resources` 成为唯一发现入口（附录 AP.5）。
 >   **10-18 起正文一律以窄口径为准，宽口径数仅作 10-17 留档。**
-> - **schema 体积（窄口径 2026-10-22 实测）**：全量 **57,346 字符**、必注入 **4,409 字符**。
+> - **schema 体积（窄口径 2026-10-22 实测，含能力层 93 工具）**：全量 **55,366 字符**、必注入 **3,570 字符**。
 >   ⚠️ 2026-10-17 记的全量 75,299 / 必注入 11,281 是**宽口径**（含原生编码家族 schema），
 >   不可与窄口径数相比。**体积口径以本行为准，历史数勿再引用。**
 >   ⚠️ 10-19 的 55,977 → 10-21 的 57,252（+694）即 `get_price_stats` 的 schema；
 >   10-22 的 +94 是 `run_skill` docstring 描述 skill_run 整条目裁剪+preview_note
->   （10-21 晚落地的真实功能，基线滞后非缺陷，见附录 AP）。
+>   （10-21 晚落地的真实功能，基线滞后非缺陷，见附录 AP）；
+>   10-22 的 +993 是 v52 统一发现口两个新工具 schema（附录 AP2）；
+>   10-22 的 −1,804 是旧 5 发现动词摘除（附录 AP.5）；
+>   10-22 的 −1,169 是工具 docstring 开发元信息清理（附录 AP.6：20 个工具描述
+>   删除日期/版本号/方案编号/事故叙述，纯语义契约保留）。
 > - 工具变少而 schema 反而变大（P12 时就有此现象）：P12 恢复了 finance 的
 >   自包含参数（如 kdj 的 m1/m2），单工具 schema 变胖；2026-10-17 又叠加描述增厚。
 >   结论方向**不变且更强** —— 全量下发更不可行，分级与预选的必要性只增不减。
 
 | 约束 | 后果 |
 |---|---|
-| 工具面 **96** 个、全量 schema **57,346 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
+| 工具面 **93** 个、全量 schema **55,366 字符**（窄口径含能力层实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
 | 结论里的数字必须可溯源 | 需要 grounding gate（数字溯源拦截） |
 | 用户会问"你上次说的对不对" | 需要追责四表 + T+N 真值判定 + 反哺行为 |
 
@@ -91,7 +100,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 
 | 原则 | 落地形态 |
 |---|---|
-| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **11** 个 / 全量 **96** 个（窄口径，见 §1.1） |
+| **最小工具面** | 三级分级 + 预选 + lint；必注入层 **8** 个 / 全量 **93** 个（窄口径，见 §1.1） |
 | **fail-open 优先** | 预选空手有域兜底、未激活直调就地激活、能力层补位；宁多不可断 |
 | **可追责** | `decisions/claims/resolutions` 三表 + T+N 判定 + 权重反哺 |
 | **只提示、不过滤** | 权重/历史表现只做 hint，不做硬过滤（硬过滤与 fail-open 冲突） |
@@ -104,7 +113,7 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 ### 1.3 四条关键取舍
 
 1. **删掉自研编排**：旧版 StateGraph + 4 节点 + phase acceptance 全部删除，只保留 mimo 单 ReAct 循环 + 一个 `update_plan` 清单工具。
-   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**96**，窄口径见 §1.1；⚠️ 早期写 102、其后写 92/101 均为历史时点或宽口径数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
+   ⚠️ 「单循环」≠「裸循环」：执行核实为 `QDAgent(MimocodeAgent)`，而 mimo 的 `MimocodeAgent` 本就自带 **`task` 子代理 / `actor` 并行子代理 / `compact` 模型触发压缩 + `<context_usage>` 预算感知 / AntiHack 拦截器 / 入参 schema 硬校验 / stray `<tool_call>` 恢复**。本项目的「自研」只加在：金融域工具面（**93**，窄口径见 §1.1；⚠️ 早期写 102、其后写 92/101 均为历史时点或宽口径数）、工具分级与预选、金融 prompt 层、`update_plan` 补挂、追责闭环三件、grounding 门；循环与上述原语全部沿用上游。
 2. **分级是架构不是配置**：框架只在 init 算一次工具定义，我们 override `get_model_query_kwargs` 改成**每轮现算**，否则 `activate_tools` 激活了也不生效 —— 这是整套分层的前提。
 3. **权重只提示不过滤**：硬过滤会让模型在真需要某工具时拿不到它。粒度也只到 domain —— resolutions 不带 tool/skill 归因，硬按 `user_query` 反推"当时用了哪几个工具"是伪精确。
 4. **接入组件前先问"它要几次 LLM 往返"**：本地计算（权重提示 0ms / 实体解析 95ms）与一整轮 LLM 生成（结论格式化 11.7s）是两类东西，评审阶段就要区分，不能等用户说"变慢了"再归因。
@@ -309,7 +318,7 @@ backend_api_python/app/agent/
 │                 qd_core_base.txt / qd_system.txt / skill_brew.txt
 │                 skill_revise.md / tool_preselect.yaml / wrapup_summary.md
 │                 evidence_extract.md / verdict_judge.md / skill_engineer.yaml / func_overlap.yaml
-├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 259 项,2026-10-19 实测;旧记 258/257/256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
+├── scripts/      [6 py + 2 yaml]  qd_smoke.py(回归 259 项,2026-10-22 实测 40 passed/2 skipped;旧记 258/257/256)/ qd_prompt_eval.py + yaml(10 任务/35 断言)/
 │                                  qd_bench.py + yaml(25 题;F19 加 selftest/--num-rollouts)/ qd_dispatch_ab.py / skill_run.py / weekly_panel.py
 └── traces/, data/, tmp/   辅助目录
 ```
@@ -394,13 +403,13 @@ backend_api_python/app/agent/
 > （QD 自建工具面，探针 `probe_design_drift` 可复现）为准：**95 / 11 / 84**。
 > 宽口径数仅作 10-17 留档、不参与判定（§1.1 口径注、附录 Z 2026-10-18 更新）。
 
-| 级 | 定义 | 实测（窄口径，2026-10-19） |
+| 级 | 定义 | 实测（窄口径，2026-10-22） |
 |---|---|---|
-| **一级 必注入** | `tools/` 顶层中 `common`+`meta` 域（宽口径另计元工具/`update_plan`/mimo 原生） | **11** |
+| **一级 必注入** | `tools/` 顶层中 `common`+`meta` 域（宽口径另计元工具/`update_plan`/mimo 原生） | **8** |
 | **二级 域内** | `tools/finance` + `tools/knowledge` | 域内优先于能力层 |
 | **三级 能力层** | `capabilities/` 准入函数 | 准入 **68** → 注册 **40** |
 
-- 注册表总量 **96**（必注入 **11** / 按需 **85**，窄口径）；宽口径（叠加 mimo 原生）10-17 快照为 **101**（必注入 15 / 按需 86）。与附录 Z 早期快照（92 / 21 / 71）的差异见该表。10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 的用户补丁（新增 `get_price_stats`，有记录）**。
+- 注册表总量 **93**（必注入 **8** / 按需 **85**，窄口径）；宽口径（叠加 mimo 原生）10-17 快照为 **101**（必注入 15 / 按需 86）。与附录 Z 早期快照（92 / 21 / 71）的差异见该表。10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 的用户补丁（新增 `get_price_stats`，有记录）；10-22 的 96 → 98 为 v52 统一发现口新增两个 common 工具（附录 AP2）；10-22 的 98 → 93 为旧 5 发现动词从 LLM 工具面摘除（附录 AP.5，实现保留为内部 API）**。
 - **T2 起的默认降级**：`QD_ON_DEMAND_TOOLS` 默认 **8 个**（`actor,run_skill,task,edit,read,write,glob,grep`）——
   mimo 原生编码家族实测 30 次工具调用里 0 次被业务用到，白付 9,673 tok/轮（占必注入体积 77.5%）。
 - **"域内优先"的三处落实**：① `build_catalog_grouped` 目录分两段、能力层垫底；
@@ -687,7 +696,7 @@ run 级一次性 few-shot（CBR），填技能酿造的粒度空档。**增益�
 
 | 尺 | 管什么 | 产物 |
 |---|---|---|
-| `scripts/qd_smoke.py` | 回归（不调模型） | **259** 项断言（40 个 test 函数，**2026-10-19 实测 257/259 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「258 项」（258/260）、「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **259** 为准（口径演变见 §9；10-19 的 -1 来自 skill 阶段 5 的 test_39 改制：G 乘子五断言 → 摘除后四不变量） |
+| `scripts/qd_smoke.py` | 回归（不调模型） | **259** 项断言（40 个 test 函数，**2026-10-22 实测 40 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「258 项」（258/260）、「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **259** 为准（口径演变见 §9；10-19 的 -1 来自 skill 阶段 5 的 test_39 改制：G 乘子五断言 → 摘除后四不变量；10-22 起 40 函数全过，见附录 AP.7） |
 | `scripts/qd_prompt_eval.py` + `prompt_tasks.yaml` | prompt 行为（真实端点） | 10 任务/35 断言，含规划 5 题 |
 | `scripts/qd_bench.py` + `bench_tasks.yaml` | 能力质量（C） | 25 题五类各 5；五维确定性打分 |
 | `scripts/qd_dispatch_ab.py` | 成本对照（B） | 分发 vs 不分发单变量 A/B；`--rejudge` 不重跑复核 |
@@ -1144,13 +1153,13 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | 项 | 实测 |
 |---|---|
 | `compileall app/ scripts/` | ✅ 通过 |
-| `qd_smoke.py` | ✅ **259 项**（40 个 test 函数）；**2026-10-19 实测 257/259 passed · 0 failed · 2 skipped**（2 skip 均为 `del/` 归档缺件）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259、2026-10-18 为 258/260，**2026-10-19 为 257/259**（test_39 改制 -1 断言，见附录 AM） |
+| `qd_smoke.py` | ✅ **259 项**（40 个 test 函数）；**2026-10-22 实测 40 passed · 0 failed · 2 skipped**（259/261 断言口径）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259、2026-10-18 为 258/260、2026-10-19 为 257/259（test_39 改制 -1 断言，见附录 AM）、2026-10-22 为 40 passed（259/261，pytest 壳，见附录 AP/AP.7） |
 | `qd_prompt_eval --validate` | ✅ 10 条任务 / 35 项断言；plan_* 断言 **17/19** |
 | `qd_bench` | 25 题；真实端点首跑 **71.7**（coverage 81.5 / grounding 86.8 / claims 38.0 / structure 62.6） |
 | `qd_dispatch_ab` | 首跑成本比 **0.889**（未达 0.40，见 D-18）、质量Δ +0.5 |
 | v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`） |
-| 全量 `tests/` | ✅ **1423 passed / 4 skipped / 0 failed**（**2026-10-19 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ）→ **1374**（skill 阶段 3 Top-K，见附录 AK）→ **1408**（skill 阶段 4 反馈事件链，见附录 AL）→ **1423**（skill 阶段 5 软重排，见附录 AM） |
-| 工具面 | 注册表 **96**（窄口径：工具 **56** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **11** / 按需 **85**。⚠️ 10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 用户补丁（新增 `get_price_stats`，有记录）** |
+| 全量 `tests/` | ✅ **1628 passed / 4 skipped / 0 failed**（**2026-10-22 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ）→ **1374**（skill 阶段 3 Top-K，见附录 AK）→ **1408**（skill 阶段 4 反馈事件链，见附录 AL）→ **1423**（skill 阶段 5 软重排，见附录 AM）→ **1627**（v52 统一发现口 + 死代码清理/冗余收敛 + format_utils 移出同期增量，见附录 AP/AP.4）→ **1628**（旧 5 发现动词摘除后的守卫更新，见附录 AP.5）→ **1628**（工具三模块合并：执行层动词归并 + 旧 5 发现动词收拢为内部接口，见附录 AP.7；数字不变，结构收敛） |
+| 工具面 | 注册表 **93**（窄口径：工具 **53** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **8** / 按需 **85**。⚠️ 10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 用户补丁（新增 `get_price_stats`，有记录）；10-22 的 96 → 98 为 v52 统一发现口新增两个 common 工具（附录 AP2）；10-22 的 98 → 93 为旧 5 发现动词摘除（附录 AP.5）** |
 | 技能 | **7** 个目录，其中可执行 **3** 个（`market-screener`/`strategy-debug`/`auto-backtest`） |
 | `formatters/` | 不在生产包内（已归档 `del/agent_formatters_20261001/`） |
 
@@ -1845,7 +1854,7 @@ qd_agent_cases 一行 = { 原有 CBR 字段
 
 **决定性的一点：schema 是「每步」都发，预选是「一次」。** 撤掉预选不等于省一轮 LLM，而是把「全量 schema × 步数」这笔账加回来。
 
-| 工具数 N | 无预选：N×544×6 步 | 有预选：目录一次 + (必注入 11 + 激活 ≤8)×544×6 步 | 节省 |
+| 工具数 N | 无预选：N×544×6 步 | 有预选：目录一次 + (必注入 13 + 激活 ≤8)×544×6 步 | 节省 |
 |---|---|---|---|
 | 53（当前） | 172,992 | 66,410 | **62%** |
 | 100 | 326,400 | 69,860 | **79%** |
@@ -3302,3 +3311,158 @@ skill_brewer.maybe_revise / weight_hints 其余三层）在消费者迁移完成
   —— 行数字段非机检项，本次取实测值；§1 schema 行 57,252→57,346 / 4,315→4,409；
 - 全量 pytest：**1571 passed / 4 skipped / 0 failed**（删除后复跑与删除前逐字一致）；
   qd_smoke 40 passed；编译 0 错；17 个受影响模块导入冒烟 OK。
+
+### AP.4 统一发现层 resource_catalog（v52，2026-10-22）
+
+> 来源：`tmp/plan_unified_discovery_20261022.md`（§1-§12，含 v2 修订块）。
+> 实施：实现 agent（Claude），2026-10-22。本节为**追加登记**，不改动上文。
+
+**新增**：`tools/resource_catalog.py` —— `list_resources` / `search_resources` 两个统一口
+（随 scan_directory 自动注册进工具面），把 list_tools / search_tools / list_skills /
+list_capabilities / search_capabilities 五套发现动词收敛为 2 个：LLM 事先不必决定调的是
+skill/tool/capability 哪一层。
+
+| 设计点 | 落法 |
+|---|---|
+| 级联 | search_resources 按 skill→tool→capability 逐级检索、首非空层即返回（不跨层混排）；kind 显式单层时只查该层不下探；list_resources 三层按序合并浏览，每层先截 top-N（env `QD_DISCOVERY_LAYER_TOPN`，默认 20）再统一分页 |
+| P0-1 skill 层过滤 | skills_adapter.list_skills 无 query 参数 ⇒ 过滤由统一口做（name/description/tags 子串、大小写不敏感）；**过滤≠排序**，priority 序原样保留（守卫对拍锁死） |
+| P0-2 空 query | fail-fast 返回用法提示，不级联（否则 skill 层恒非空 ⇒ tool/capability 永不可达） |
+| P0-3 层截断 | 每层 top-N 截断，头部标注各层 总数/是否截断 |
+| P1-4 kind 校验 | 非法值 fail-fast 返回合法值列表（报错风格对齐 skill_run 白名单） |
+| P1-5 激活幂等 | tool 命中复用 tool_discovery 同一机制同一上限：`agent.activate_tools(names[:_AUTO_ACTIVATE_MAX], source="auto")`；activate_tools 已激活进 already 桶不重复登记（qd_tool_face.py 实现核实 + 守卫锁死） |
+| 同名去重 | capability 的 name 已存在于 provider 工具注册表 ⇒ 丢弃（与「工具层>能力层」裁定一致，堵 list_capabilities 从 admission.json 直读、被遮蔽名仍残留的裂缝） |
+| 边界 | 执行层动词（run_skill/read_skill/call_capability/activate_tools）不动；各层内部排序/评分不动；旧 5 发现动词**兼容期保留**（行为/格式未改）；qd_system.txt 仅**纯追加** 3 句引导（任务范围纪律/工具激活纪律/重活分发三节内，不改原行）；agent.py 工具架构注释补统一口引用（仅注释） |
+
+**守卫**：`tests/test_v52_unified_discovery_20261022.py` 8 项 —— ① kind 五取值+非法 fail-fast
+② 级联顺序（只 tool 命中的 query 落第二层）③ 同名去重 ④ 激活纪律+幂等+_AUTO_ACTIVATE_MAX
+生效 ⑤ 各层内部排序对拍（provider.search 原序 / skills priority 原序 / list_by_domain 原序）
+⑥ kind 标识+next_action ⑦ 空 query fail-fast ⑧ 旧 5 动词输出格式快照锁。
+
+**易错点登记**：测试须先 `tool_discovery._provider()` 建 provider 再 monkeypatch 层函数——
+provider 首次构建扫描 tools/ 各模块公开函数注册工具；若先 patch（如 `_st.list_skills` 换成
+测试 lambda），扫描读到 lambda（`__module__` 不属 tools 模块）⇒ 同名工具漏注册 ⇒ 去重判据
+失真。实现期真实踩坑，已写进守卫文件 `_patch_layers` docstring。
+
+**验证（2026-10-22 实测）**：v52 守卫 8/8；全量 pytest **1627 passed / 4 skipped / 1 failed**
+（唯一失败 = qd_smoke 套件 `test_16_meta_tools_mounted` 的 `format_result 在工具面` 检查——
+系**并行协作于 2026-10-22 移出 `tools/format_utils.py`**（现 `del/format_utils.py`，
+`_provider.py` 元工具注释已改 `_MUST_HAVE={"web_search_tools"}`）后的**既有漂移**，
+与本改动无关，本改动只增 2 工具不删任何工具；基线 1571 → 1627 的其余增量来自并行协作同期新增）；
+qd_smoke 40 组 / 259 检查项：256 passed / 1 failed（同上 format_result 既有漂移）/ 2 skipped（既有）；
+`compileall app/agent/` 0 错。
+
+**机检基线同步（2026-10-22 补记，探针已回归）**：`tmp/probe_design_drift_20261013.py` 实际仍在
+工作副本；本会话对账后同步 A16（`tools/format_utils.py` 存在性 `True→False`）、B1（96→98）、
+B2（56→58）、B4（必注入 11→13）、B7（57,346→58,339）、B8（4,409→5,402），
+复跑 **99 OK / 0 DRIFT**。正文 §1.1/§3.2/§9 四处数字已同步（注册表 98 / 工具 58 / 必注入 13 /
+按需 85 / 全量 schema 58,339 / 必注入 schema 5,402）。
+
+**断链收尾（2026-10-22，用户裁定「format_utils.py 是我删掉的，把 test_16 断链」）**：
+qd_smoke.py test_16 的「format_result 在工具面」存在性断言**反转为缺席锁**
+（「format_result 已移出工具面（mimo 原生接管）」，检查项总数 259 不变）——
+原 1 failed 已消：壳套 test_v30/v31 + v17k/v6_d11/v52 共 **86 passed**，qd_smoke 直跑
+**257 passed / 0 failed / 2 skipped**（2 skipped 为既有 DB 结构项）。
+
+### AP.5 旧 5 发现动词从工具面摘除（2026-10-22，用户裁定「回到方案1的正确姿势」）
+
+> 来源：`tmp/plan_unified_discovery_20261022.md` §12（v2 修订块）与用户最终裁定
+> 「V2 没有问题就按照 v2 执行」「四、我的建议（回到方案1的正确姿势）」。
+> 实施：实现 agent（Claude），2026-10-22。本节为**追加登记**，不改动上文。
+
+**决策**：v52（附录 AP.2/AP.4）先以「兼容期保留」方式新增统一口；本步进一步把
+**旧 5 个发现动词从 LLM 工具面摘除**——让 `list_resources`/`search_resources` 成为
+唯一展示口，LLM 事先不必决定调用 skill/tool/capability 哪一层。
+
+**改动清单**：
+
+| 落点 | 改动 |
+|---|---|
+| `tools/_provider.py` | `_SUPERSEDED_BY_MERGE` 新增 5 键：`tools.tool_discovery:list_tools` / `tools.tool_discovery:search_tools` / `tools.skill_tools:list_skills` / `tools.capability_tools:list_capabilities` / `tools.capability_tools:search_capabilities`。实现保留为内部 API（统一口/预选/测试仍直接 import 调用），只是不再注册进工具面 |
+| 提示词 | `prompts/qd_system.txt`、`prompts/dispatch_card.md`、`preselect/tool_preselect.yaml`、`prompts/skill_brew.txt` 里对旧发现动词的引导全部改为统一口（`search_resources`/`list_resources`）；执行层动词（`activate_tools`/`read_skill`/`run_skill`/`call_capability`）原样保留 |
+| LLM 可见注入文本 | `qd_tool_face.py`（工具面地图文本）、`qd_service.py`（反馈文本）、`preselect/tool_preselect.py`（检索指针）的旧发现动词引导改为统一口 |
+| `agent.py` | 工具架构注释更新：旧 5 发现动词已摘除，统一口是唯一发现入口 |
+| 守卫测试 | `qd_smoke.py` test_16/test_30 断言**反转**：断言旧 5 发现动词**不在**工具面/公共域；`test_v17i`/`test_v43`/`test_v52` 同步改为统一口引导断言 |
+
+**计数变化（窄口径，探针实测）**：注册表 98→93（工具 58→53，能力层 40 不变）、
+必注入 common+meta 13→8、按需 85 不变（93−8=85）、全量 schema 58,339→56,535（−1,804）、
+必注入 schema 5,402→3,598。
+
+**验证（2026-10-22 实测）**：285 个受影响测试全过；qd_smoke 40 passed；设计机检
+探针基线同步（B1 98→93 / B2 58→53 / B4 13→8 / B7 58,339→56,535 / B8 5,402→3,598）
+后复跑 **99 OK / 0 DRIFT**；全量 pytest 基线另行记录于 §9。
+
+### AP.6 工具 docstring 开发元信息清理（2026-10-22，用户裁定「提示词/工具 docstring 不能随意加注释」）
+
+> 触发：用户指出「提示词、工具 docstring 等位置不能随意加注释」。经核查，
+> `func_to_openai_schema` 会把函数 docstring 中除 Args/Returns 外的**全部内容**
+> 注入 LLM 工具描述——日期、版本号、方案编号、开发事故叙述都会进模型上下文。
+> 实施：实现 agent（Claude），2026-10-22。本节为**追加登记**。
+
+**清理范围**：20 个注册工具的 docstring 含开发元信息，全部清理。分三类：
+
+| 类型 | 处理 | 涉及工具 |
+|---|---|---|
+| A 纯开发元信息（日期/版本号/归组化/事故记录） | 删除，改写为纯净语义描述 | `get_fund_flow`/`get_index_quote`/`list_indicators`/`run_indicator_signal`/`indicator_analysis`/`search_intel`/`get_sector_board`/`get_hot_sectors` |
+| B 语义契约（不含字段/单位口径/模型约束） | 保留契约语义，去掉日期外壳 | `get_capital_summary`/`get_realtime_quote`/`get_order_book`/`get_market_overview`/`get_dragon_tiger`/`get_stock_sector_info`/`technical_analysis`/`start_strategy`/`agent_get_kline`/`bull_bear_research`/`agent_backtest_strategy`/`search_knowledge` |
+| C 本次新增工具 | 同步精简（去 P0-1/P0-3/P0-2 方案编号与「见模块头」引用） | `list_resources`/`search_resources`（resource_catalog.py） |
+
+**同步清理**：`prompts/qd_system.txt` 正文 `(2026-10-22 v52)` 开发元信息已移除。
+
+**计数变化（窄口径含能力层 93 工具，探针实测）**：全量 schema 56,535→**55,366**（−1,169）、
+必注入 schema 3,598→**3,570**（−28，resource_catalog 两个新工具描述精简）。
+
+**验证（2026-10-22 实测）**：`func_to_openai_schema` 全量扫描 **0 残留**（日期/版本号/
+方案编号/事故叙述）；工具面守卫测试 72 passed；qd_smoke 259/261 passed · 0 failed ·
+2 skipped；全量 pytest **1628 passed / 4 skipped / 0 failed**；设计机检探针基线同步
+（B7 56,535→55,366 / B8 3,598→3,570）后复跑 **99 OK / 0 DRIFT**。
+
+**纪律（防回退）**：今后任何工具 docstring 或提示词正文**不得夹带**日期、版本号、
+方案编号、开发事故叙述、内部实现引用等开发元信息——这些位置是 LLM 可见文本；
+开发沿革只写进模块头注释（不进 docstring）或本文档附录。
+
+### AP.7 工具三模块合并：执行层动词归并 + 旧 5 发现动词收拢为内部接口（2026-10-22，用户裁定「合并成一个文件」）
+
+> 触发：用户指出 `tools/tool_discovery.py` / `tools/skill_tools.py` /
+> `tools/capability_tools.py` 仍住在 `tools/` 自发现目录，靠
+> `_SUPERSEDED_BY_MERGE` 名单硬拦旧 5 发现动词，违背「零名单」纪律（`_` 前缀
+> 退出扫描才是规则）；并建议「这三个文件合并成一个文件」。
+> 实施：实现 agent（Claude），2026-10-22。本节为**追加登记**。
+
+**合并方案（用户简化版）**：
+- **执行层动词**：`activate_tools` / `read_skill` / `run_skill` / `call_capability`
+  合并进 `tools/exec_tools.py`（公开函数恰好 4 个，随 `scan_directory` 自动注册
+  进工具面；辅助函数一律 `_` 前缀退出扫描）。
+- **旧 5 发现动词**：`list_tools` / `search_tools` / `list_skills` /
+  `list_capabilities` / `search_capabilities` 并进
+  `tools/resource_catalog.py` 成为 `_` 前缀内部接口（`_list_tools` /
+  `_search_tools` / `_list_skills` / `_list_capabilities` /
+  `_search_capabilities`），连同 `_provider` / `_agent_of` /
+  `_registry_supplement` / `_AUTO_ACTIVATE_MAX` 辅助函数一并收拢。
+  公开函数仍只有 `list_resources` / `search_resources`。
+- 原三个文件物理删除，备份 `del/tools_merge_20261022/`（附 README：来源/复核/
+  回滚方式）。`_SUPERSEDED_BY_MERGE` 中 5 个旧发现动词 key 已删除（模块物理删除
+  后不再需要名单拦）。
+
+**关键设计点**：
+- 依赖方向单向：`resource_catalog` → `exec_tools`（执行层动词实现），无反向
+  import，防环。
+- 执行层 4 动词注册面**完全不变**（`_is_tool_function` 扫描恰好 4 个公开函数），
+  工具面总数 93 不变；旧 5 发现动词不再进入工具面（此前已由 AP.5 摘除，本次
+  从「名单拦」升级为「物理移出扫描树」）。
+- 测试 import 同步：`tests/test_v38_job_runner_20261018.py` 等改从
+  `app.agent.tools import exec_tools as skill_tools` 取 `run_skill` 实现。
+
+**机检探针基线同步（第三次，本次收尾）**：
+- A 系列：顶层 py 13→11、总 py 37→35（新增 `tools/exec_tools.py` 应存在；
+  三个旧文件应已删除不存在）。
+- B7 全量 schema 55,366→**55,363**（−3，执行层 docstring 旧名改统一口名）；
+  B8 必注入 schema 3,570→**3,567**（−3，同上）。
+- 可判定项 99→**100**（新增 A21/A22 守三文件已归档）。
+
+**验证（2026-10-22 实测）**：全量 pytest **1628 passed / 4 skipped / 0 failed**；
+qd_smoke（40 函数）**40 passed · 0 failed · 2 skipped**（259/261 断言口径）；
+设计机检探针 **100 OK / 0 DRIFT**。
+
+**纪律（防回退）**：非工具模块一律以 `_` 前缀命名退出 `scan_directory` 自发现，
+不得靠维护 `_SUPERSEDED_BY_MERGE` 名单硬拦；执行层动词与发现层内部接口的存放
+位置以本节为准（`exec_tools.py` / `resource_catalog.py`）。

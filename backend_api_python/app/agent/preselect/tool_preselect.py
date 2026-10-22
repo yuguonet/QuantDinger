@@ -573,7 +573,7 @@ def _capability_folded_text(caps: Sequence[str], reps: int = 6) -> str:
     shown = ", ".join(sorted(caps)[:reps])
     return (f"capability（{len(caps)} 个）外部能力包——仅当上面的域内工具确实无法"
             f"覆盖某条交付信息时才从这里选；例：{shown}；完整名单用 "
-            f"list_tools(domain='capability') 或 search_tools 检索后点名。")
+            f"search_resources(query, kind='capability') 检索后点名。")
 
 
 def build_catalog_grouped(
@@ -1067,7 +1067,8 @@ _SKILL_CATALOG_HEAD = (
 #: 同型：指针行只说"另有 N 个"不列名，正是当年能力层的修法）；只给计数与路径。
 _SKILL_POINTER = (
     "另有 {n} 个可用技能未在本段展示（与本任务相关度未过门槛或探索轮换未至）。"
-    "可用 list_skills() 查看全部可用技能、read_skill() 读取其正文；"
+    "可用 search_resources(query, kind='skill') 查找、list_resources(kind='skill') 浏览全部；"
+    "read_skill() 读取其正文；"
     "技能名必须逐字来自本段，不得编造未展示名称。"
 )
 
@@ -1233,7 +1234,8 @@ def build_skill_catalog_topk(skills, query: str, *, topk: Optional[int] = None,
       ③ 常规位 = 分数序前 `K-1`（K≥2）；探索位 = `select_explore` 从落选
          eligible 里挑 TTL 内新发布且未近期曝光者（有界轮换，§14.2）；
       ④ 渲染同旧行格式 + 可见性兜底指针（§14.1：另有 N 个可用技能，经
-         `list_skills()` 发现、`read_skill()` 读取；不得编造未展示名称）。
+         `search_resources(query, kind='skill')`/`list_resources(kind='skill')` 发现、
+         `read_skill()` 读取；不得编造未展示名称）。
 
     Args:
         exposure: 曝光状态注入（测试用；None = 进程级全局，加锁）。

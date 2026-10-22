@@ -35,11 +35,11 @@ def _norm_codes(codes: Union[str, List[str], None]) -> List[str]:
 
 def get_index_quote(codes: Union[str, List[str]] = "", scope: str = "single",
                     days: int = 60) -> Dict[str, Any]:
-    """指数/ETF 行情（统一入口，2026-09-27 工具归组化：合并五大指数快照与 ETF 行情）。
+    """指数/ETF 行情统一入口：五大指数快照、指定指数实时、ETF 行情与指数日线。
 
     scope: indices=五大指数快照 | single=指定指数实时（默认） | etf=指数对应 ETF
            | kline=指数日线序列
-    注：指数日 K 另有独立工具 get_index_kline（P0 定案：同名让位项保留注册），
+    注：指数日 K 另有独立工具 get_index_kline（同名让位项保留注册），
     与 scope=kline 同源同实现。
 
     Args:

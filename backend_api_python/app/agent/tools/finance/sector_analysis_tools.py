@@ -106,13 +106,8 @@ def _merge_em_rows(rows: List[Dict[str, Any]], em_rows: List[Dict[str, Any]]) ->
 def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
     """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股。
 
-    2026-09-15 主源改为**新浪**（经 market_cn.china_market，其内部已是"新浪优先、
-    东财兜底"）。东财退为**富化源**，只负责补 BK 板块代码与涨停家数。
-
-    改动原因（事故）：此前 industry/concept **只**取自东财。东财被反爬掐断后
-    （`RemoteDisconnected`；且本文件当时用的是必被掐断的截断 UA）两个列表直接变
-    空数组，而同一时刻新浪的数据是好的 ⇒ 数据丢了却静默、无人察觉。
-    现在东财挂掉不影响主结果。
+    主源新浪（新浪优先、东财兜底）；东财仅作富化源，负责补 BK 板块代码与涨停家数。
+    东财不可用不影响主结果。
 
     Returns:
         dict: {timestamp, industry:[...], concept:[...], analysis:{}}。板块列表在 hs['industry']/hs['concept']（list，勿用 hs['data']）。
@@ -199,11 +194,11 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dic
 def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
                      board_type: str = "industry", days: int = 30,
                      top_n: int = 20) -> dict:
-    """板块行情统一入口（2026-09-27 工具归组化：合并排名/历史/趋势三个板块工具）。
+    """板块行情统一入口：板块涨跌排名、历史排名变化、趋势分析。
 
     view: ranking=行业涨跌幅排名 | history=近N日排名变化 | trend=趋势+周期位置+预测信号
-    ⚠️ 不含热门板块：热门板块一律用独立工具 get_hot_sectors（2026-09-27 定案删除
-    view=hot——它与 get_hot_sectors 同源同实现，双入口会让 planner 纠结选哪个）。
+    ⚠️ 不含热门板块：热门板块一律用独立工具 get_hot_sectors（同名让位，
+    双入口会让 planner 纠结选哪个）。
 
     Returns:
         view=ranking → {top:[{name,code,change_pct,lead_stock,limit_up_count,...}], total}。
@@ -233,17 +228,16 @@ def get_stock_sector_info(codes: str) -> dict:
     """从本地数据库查询股票所属行业和概念（单股/多股同一入口，逗号分隔即可）。
 
     与 agent_get_kline / get_stock_concept_blocks 同构：多股一次调用拿全，
-    概念归属只发【一次】批量请求后按代码分发（2026-09-27 定案——逐票拉取会把本工具
-    的纯本地快查询拖成 N 次外部 HTTP，批量 100 只票即 100 次请求）。
+    概念归属只发【一次】批量请求后按代码分发（逐票拉取会把本工具
+    的纯本地快查询拖成 N 次外部 HTTP）。
 
     Returns:
-        统一三键结构（单股/多股一致，⚠️ 勿按"单股扁平 dict"取数，2026-09-27 修正
-        docstring 与实际返回不符的遗留描述）：
+        统一三键结构（单股/多股一致，勿按"单股扁平 dict"取数）：
         {"count": N, "data": {代码: 单股dict}, "error": None}；
         参数非法 → {"error", "retriable"}。
         单股dict: {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?,
         boards?: [{name,code,change_pct,lead_stock}], concept_tags?: [...]}。
-        boards/concept_tags 为概念归属富化（2026-09-27 归组：合并原 get_stock_concept_blocks，
+        boards/concept_tags 为概念归属富化（合并 get_stock_concept_blocks，
         行情类板块字段），源拉取失败时显式给 concept_error，不静默丢字段。
 
     Args:

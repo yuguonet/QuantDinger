@@ -8,8 +8,8 @@
      默认 4 = 3 常规排序位 + 1 探索位；≤0 时**内部委托**旧 `build_skill_catalog`
      全量路径（逐位一致由构造保证，回退铁律）。
   ② **可见性兜底（§14.1/P14）**：截断后段内追加指针——尚有多少可用技能、经
-     `list_skills()` 发现 / `read_skill()` 读取；不得暗示可编造未展示名称。
-     未展示技能仍全量可查（不缩 `list_skills()` 全集）。
+     `search_resources(query, kind='skill')` 发现 / `read_skill()` 读取；不得暗示可编造未展示名称。
+     未展示技能仍全量可查（不缩 `search_resources(query, kind='skill')` 全集）。
   ③ **单一字符预算（§14.4）**：`preselect_catalog_chars(tool_catalog, skill_section)`
      = 工具目录 + 技能段 + 固定模板骨架（system + user 空槽）。不新增技能字符平行
      阈值；`QD_PRESELECT_TIER_CHARS` 仍是唯一阈值 env；`schema_chars_of` 保持
@@ -136,7 +136,8 @@ def test_topk_caps_section_growth():
         "段内技能行数恒定：9 个新技能不得多出一行（治阶段 0 的 +94c/技能）"
     assert len(sec_m) - len(sec_f) < len(_SKILL_POINTER.format(n=999)) + 8, \
         "总增量只允许是指针句本身（+计数位数），不得含技能行"
-    assert "list_skills()" not in sec_f and "list_skills()" in sec_m
+    assert "search_resources(query, kind='skill')" not in sec_f \
+    and "search_resources(query, kind='skill')" in sec_m
 
 
 def test_topk_zero_env_uses_legacy_full_catalog(monkeypatch):
@@ -170,7 +171,7 @@ def test_visibility_pointer_keeps_longtail_discoverable():
     assert "auto-tail-a" not in sec and "auto-tail-b" not in sec, \
         "未展示技能名不得出现在段内（指针也不许列名 ⇒ 防模型照抄幻觉）"
     assert "另有 2 个可用技能" in sec, "指针必须说明尚有多少可用技能"
-    assert "list_skills()" in sec and "read_skill()" in sec, "必须给发现路径"
+    assert "search_resources(query, kind='skill')" in sec and "read_skill()" in sec, "必须给发现路径"
     assert "不得编造" in sec, "必须明令禁止编造未展示名称（§14.1）"
     # P14：Top-K 限制的是预选展示集，不缩可用技能全集
     names = [i["name"] for i in skills.list_skills()]
