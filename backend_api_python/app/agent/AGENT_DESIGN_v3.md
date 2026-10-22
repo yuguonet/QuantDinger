@@ -71,17 +71,19 @@ Agent 模块是 QuantDinger 的智能决策核心：接收自然语言输入（�
 >   **10-21 的 95 → 96**：`tools/finance/analysis_tools.py` 新增 `get_price_stats`
 >   （用户 10-20 补丁，**有记录**）——详见**附录 AO**。
 >   **10-18 起正文一律以窄口径为准，宽口径数仅作 10-17 留档。**
-> - **schema 体积（窄口径 2026-10-21 实测）**：全量 **57,252 字符**、必注入 **4,315 字符**。
+> - **schema 体积（窄口径 2026-10-22 实测）**：全量 **57,346 字符**、必注入 **4,409 字符**。
 >   ⚠️ 2026-10-17 记的全量 75,299 / 必注入 11,281 是**宽口径**（含原生编码家族 schema），
 >   不可与窄口径数相比。**体积口径以本行为准，历史数勿再引用。**
->   ⚠️ 10-19 的 55,977 → 10-21 的 57,252（+694）即 `get_price_stats` 的 schema。
+>   ⚠️ 10-19 的 55,977 → 10-21 的 57,252（+694）即 `get_price_stats` 的 schema；
+>   10-22 的 +94 是 `run_skill` docstring 描述 skill_run 整条目裁剪+preview_note
+>   （10-21 晚落地的真实功能，基线滞后非缺陷，见附录 AP）。
 > - 工具变少而 schema 反而变大（P12 时就有此现象）：P12 恢复了 finance 的
 >   自包含参数（如 kdj 的 m1/m2），单工具 schema 变胖；2026-10-17 又叠加描述增厚。
 >   结论方向**不变且更强** —— 全量下发更不可行，分级与预选的必要性只增不减。
 
 | 约束 | 后果 |
 |---|---|
-| 工具面 **96** 个、全量 schema **57,252 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
+| 工具面 **96** 个、全量 schema **57,346 字符**（窄口径实测；宽口径 10-17 快照 101 / 75,299） | 全量下发不可行 ⇒ 必须分级，且必须每轮现算 |
 | 结论里的数字必须可溯源 | 需要 grounding gate（数字溯源拦截） |
 | 用户会问"你上次说的对不对" | 需要追责四表 + T+N 真值判定 + 反哺行为 |
 
@@ -225,7 +227,7 @@ backend_api_python/app/agent/
 │       **零行为变更**:注册数当时为 39,它从来没注册上。)
 │       (2026-10-18 基线同步:注册 39→40,为 admission 增长后当前实测,探针 B3。)
 │
-├── chain/        [26 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
+├── chain/        [27 py] ★ 追责 + 评估 + 权重闭环 + 条件化预测引擎(下编)
 │   ├── claims.py             # 域判定 / 入库闸门 / Claim 提取(纯函数,零 LLM)
 │   ├── intake.py             # record_decision 唯一入口
 │   ├── account_store.py      # decisions/claims/resolutions 持久化
@@ -252,7 +254,7 @@ backend_api_python/app/agent/
 ├── exec/        [2 py]  ★ 子进程作业执行器（F26-D1，2026-10-18）：job_runner
 │                         #   kill_tree(杀进程树)/run_job(墙钟+停滞看门狗)/touch_progress；
 │                         #   bridge _kill_tree 已移交（留委托 seam），skill_run 经此出口
-├── rag/          [6 py, 1230 行]  检索:BGE reranker + pgvector(PgVectorStore) + PG FTS + 聊天历史/关键词
+├── rag/          [7 py, 1314 行]  检索:BGE reranker + pgvector(PgVectorStore) + PG FTS + 聊天历史/关键词
 │     消费方 3:agent.py(_build_retriever 四路线 / _build_reranker)、tools/knowledge/knowledge_tools.py:62、utils/case_memory.py:200
 │     ⚠️ 消费方**全用相对 import**(`.rag.X`) —— 只扫绝对形式会漏成"零引用"
 │       (2026-10-13 差点据此把它误判死代码归档,见 §7.1 三形式判据)
@@ -265,13 +267,13 @@ backend_api_python/app/agent/
 │       事实:`RedisMemory` 在 `__init__.py` 的 `__all__` 里 —— 是包的**公开导出**,
 │       不算死代码(工厂虽从不创建它,但导出契约存在)。要删须先改 `__init__` 并确认
 │       仓外无人 import,属"降能力"操作,不在死代码清理范围。
-├── utils/        [11 py, 2800 行] 共用件:budget / calibration / case_memory / grounding / json_parser /
+├── utils/        [11 py, 2658 行] 共用件:budget / calibration / case_memory / grounding / json_parser /
 │                                 logger / mask / md_format / prescan / tracing
 │     消费方 28(**全包最大枢纽**):chain×4、qd_*×4、scripts×3、tools/finance×11、
 │                                 tools/knowledge、trace_collector、tests×3
 ├── resolvers/    [6 py,  968 行] 实体/时间/复合解析 + 澄清优先(bridge 挂取数前,clarify 非空短路反问)
 │     消费方 2:qd_service.py(296/451/454/467)、scripts/qd_smoke.py
-├── cron/         [5 py, 1581 行] 定时任务:cron_tools(工具面) + cron_worker(执行) + guards
+├── cron/         [5 py, 1526 行] 定时任务:cron_tools(工具面) + cron_worker(执行) + guards
 │     消费方 4 **全在包外**:app/__init__.py:423(启动 start_cron_worker)、routes/cron.py、
 │                            routes/health.py、tests/test_v6_legacy_boundary.py
 │     ⚠️ 即 D-2「被**旧系统**反向依赖」:摘旧路由会直接断掉定时任务启动
@@ -3232,3 +3234,71 @@ skill_brewer.maybe_revise / weight_hints 其余三层）在消费者迁移完成
   `resolvers` 968→1059、`audit` 106→151）**未在本次同步**（不在机检可判定项内），
   留作独立清理项。
 
+
+---
+
+## 附录 AP · 死代码清理 + 冗余统一接口（2026-10-22；用户裁定「先删死代码和冗余」）
+
+> **来源**：任务「和 `tmp/审计报告_app_agent_20261022.md` 一起核对，先删死代码和冗余」。
+> **依据**：`docs/代码审查_app_agent_20261022.md`（只读审计）+ `tmp/审计报告_app_agent_20261022.md`
+> （另一路审计）交叉核对；执行侧证据链见 `del/deadcode_cleanup_20261022/README.md`。
+> **回滚**：17 个受影响文件原样备份在 `del/deadcode_cleanup_20261022/`（相对路径同构），
+> 单文件 `cp` 即回滚；`tests/test_v51_unified_interfaces_20261022.py` 是本次契约守卫。
+
+### AP.1 死代码删除（39 符号 / 490 行 / 17 文件）
+
+三件套扫描（import 三形式按包解析 + 全仓 + 同名异物 (module,name) 精确解析）+
+设计文档核对 + 测试零引用 + `__all__` 核对，四项全过才删：
+
+| 模块 | 删除 | 删除理由（一句话） |
+|---|---|---|
+| `chain/store.py` | 人工反馈惩罚 8 函数（`query_latest_root*`/`mark_root_*`/`delete_tree`/`get_penalty_count*`/`get_chain_weights`） | 承诺方是 `tmp/AGENT_ACCOUNTABLE.md §7.3` 的 prepare_node 旧架构（S1 已证不存在）；现行设计 §3.5 追责闭环走 decisions/claims/resolutions，不经这些函数 |
+| `chain/schema.py` | EvalNode 6 个便捷 API（`is_root`/`is_leaf`/`is_valid`/`is_veto` property + `get_skill_report`/`to_skill_report`） | 属性/文本零引用（两份审计独立同结论） |
+| `chain/skill_brewer.py` | `_find_entity_codes` | 纯委托壳，实现已下沉 `skill_registry.find_entity_codes`（单一真源） |
+| `cron/cron_worker.py` | `cron_matches` + 级联 `_parse_cron_field` | 手写 cron 解析旧实现，已被 APScheduler（`scheduler.py`）取代；10-14 起死至今 |
+| `cron/guards.py` | `seconds_delay_to_at` | 同上；docstring 自述的消费方 `cron_tools._parse_at_time` 亦不引用它 |
+| `chain/evaluator.py` | `stop_eval_worker` | 零引用；**EvalWorker 停止路径问题改为「登记」**——后续若选接线方案，从 `del/` 恢复该 3 行函数即可（10-19 遗留项的去留拍板不受删除影响） |
+| `utils/budget.py` | `panel_from_trace`/`tokens_from_agent`/`tool_calls_from_agent` | 前者是死备选聚合器（活路径 `tracing.py` inline bump → `weekly_panel.py` 读 panel 字段）；后两个是 smolagents 时代残留（参照物 `nodes.py` 已不存在，现口径 `_qd_run_tokens`/`_last_request_tokens`） |
+| `agent.py` | `LLM_SEED` + 级联 `_seed_env` | 可复现采样常量从未被模型构造读取（env `AGENT_LLM_SEED` 随之明确失效） |
+| `chain/claims.py` | `_RANGE_RE`/`_env_flag` | 后者与 `resolver.py` 同名异物——删的是 claims 这份死副本 |
+| `chain/kline_feed.py` | `_INDEX_CODE` | 与 `context_frame.py` 同名异物——删的是 kline_feed 这份死副本 |
+| `domain_registry.py` | `specs`/`get_spec` | `tools/finance/domain_meta.py:31-33` 有登记：零消费方函数是旧编排层 plan_linter 遗产 |
+| `flask_app.py` | `register_agent_routes`/`create_agent_blueprint` | 活路径是 `app/routes/agent_blueprint.py:18` 直接 import `agent_v2_bp`；docstring 用法示例已同步改指 |
+| `preselect/tool_preselect.py` | `clear_name_cache` | 名单缓存清理从未接线（潜在陈旧缺口已登记） |
+| `qd_service.py` | `_SCOPE_STRAT` | 策略域 scope 加成未接线（395/397 只用了 SINGLE/SCREEN）；后续接线从 `del/` 恢复 |
+| `utils/grounding.py` | `collect_grounding_corpus`/`check_claims` | 旧 grounding 管线；活的是 `check_grounding`/`_observation_corpus` |
+| `utils/md_format.py` | `_format_final_md`/`_lookup_stock_name`/`_format_output` | 仅 `_to_md` 在用 |
+| `utils/prescan.py` | `_return_hint`/`prescan_skills` | 仅 `prescan_tools` 在用 |
+
+**明确未删（设计待接线/文档承诺，按「零引用≠可删」纪律登记）**：
+
+1. `utils/budget.py` 的 `add_day_usage`/`get_day_usage`/`reset_day_usage` —— 本文件 D-5/G9/O-9 明确「**勿删**」（日配额待接线，三者是一个功能单元）；
+2. `chain/label_spec.py` 的 `SCHEMA_VER="ls2"` —— §2.2 树注标注为 label_spec 的 schema 版本单一真源；
+3. `chain/skill_registry.py` 的 `set_lifecycle` —— 生命周期状态机 setter（阶段 1 设计内未接线；删一个 setter 会留下半台状态机，去留随生命周期机制一并拍板）；
+4. `constants.py` 的 `AGENT_ENV_KEYS` —— env 契约清单（standing_checks 未接线，声明而非逻辑）；
+5. `chain/sampler.py` —— **不是死代码**：另一路审计（`tmp/审计报告_app_agent_20261022.md` P1-4）漏判了
+   `chain/collector.py:33` 的相对 import + `:149` 的 `sampler.pick_daily_universe` 生产调用
+   （evaluator.py:1332 → collector.run_daily_collection → sampler 链路活着）。
+   这正是本项目死代码硬流程「相对 import 按包解析」条款防的误判，本次交叉核对拦下。
+
+### AP.2 冗余统一接口（4 组 curated 重复全部收敛）
+
+| 统一接口 | 收敛前 | 契约要点 |
+|---|---|---|
+| `chain/_jsonl.read_jsonl` | `aggregator`/`collector`/`evidence` 三处同型 `_read`（9 个调用点） | 缺文件 `[]`/空行跳/坏行跳；整文件 JSON 读（backtest_bridge/calib_feed）不是同一契约，不误伤 |
+| `tools/finance/_analysis_utils.classify_vol_price` | `analysis_tools` 量能分析（盘中/非盘中双套）+ 批量快诊 + `bull_bear_research` 三处四分支判定 | **分支逻辑唯一**（放量 >1.3×/缩量 <0.7×）；四套标签常量逐字保留各站历史文案（量价标签是模型可见输出，统一文案须单独拍板） |
+| `rag/_doc_item.doc_item` | `agent.py:_load_analysis_memory_docs` 与 `postgres_fts.py::retrieve` 两处同型文档组装 | content 500 截断 + metadata 信封；调用方特有键走 extra 透传（fts 的 score/retrieval_route） |
+| `tools/finance/analysis_tools._batch_run` | 8 个批量工具各写一遍 for/try/except（10-19 curated #1，收益最大） | 单股错误隔离（失败位 `{"error": str(e)}`）+ `{count, data}` 信封；supplement 钩子供 `get_indicator_snapshot` 回填批量预取量比；`get_volume_analysis` 原无守卫循环一并纳入统一契约（唯一行为差异：意料位异常不再拖垮整批，已登记） |
+
+**验证**：每组逐键对拍（旧实现 vs 新接口全组合）；`tests/test_v51_unified_interfaces_20261022.py`
+49 项契约守卫（含 5 个变异探针实测可杀：绝对 import/别名属性/全路径链/逃逸相对 import/包内相对 import）。
+
+### AP.3 机检基线与正文数字同步
+
+- 探针 `tmp/probe_design_drift_20261013.py`：A6 `chain/` 26→27 py（+`_jsonl.py`）、
+  A8 `rag/` 6→7 py（+`_doc_item.py`）、B7 57,252→57,346、B8 4,315→4,409
+  （后两者为 10-21 skill_run 整条目裁剪的 run_skill docstring，附录 AO 之后落地的真实功能）；
+- §2.2 树注：`rag/` 行数 1230→1314、`utils/` 2800→2658（删 187 行）、`cron/` 1581→1526（删 46 行）
+  —— 行数字段非机检项，本次取实测值；§1 schema 行 57,252→57,346 / 4,315→4,409；
+- 全量 pytest：**1571 passed / 4 skipped / 0 failed**（删除后复跑与删除前逐字一致）；
+  qd_smoke 40 passed；编译 0 错；17 个受影响模块导入冒烟 OK。

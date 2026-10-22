@@ -255,22 +255,6 @@ class EvalNode:
     # ── 便捷属性 ──
 
     @property
-    def is_root(self) -> bool:
-        return self.parent_id is None
-
-    @property
-    def is_leaf(self) -> bool:
-        return len(self.children) == 0
-
-    @property
-    def is_valid(self) -> bool:
-        return self.status == Status.OK.value and self.score is not None
-
-    @property
-    def is_veto(self) -> bool:
-        return self.status == Status.VETO.value
-
-    @property
     def skill_reports(self) -> List["EvalNode"]:
         """获取所有 skill 子节点。"""
         return [c for c in self.children if c.layer == Layer.SKILL.value]
@@ -285,12 +269,6 @@ class EvalNode:
             result.extend(c.tool_nodes)
         return result
 
-    def get_skill_report(self, skill_name: str) -> Optional["EvalNode"]:
-        """按名称查找 skill 子节点。"""
-        for c in self.children:
-            if c.layer == Layer.SKILL.value and c.name == skill_name:
-                return c
-        return None
 
     def add_child(self, child: "EvalNode"):
         """添加子节点。"""
@@ -310,22 +288,6 @@ class EvalNode:
         child.stock_name = str(sn).strip() if sn else ""
         self.children.append(child)
 
-    def to_skill_report(self) -> SkillReport:
-        """将 skill 节点转为 SkillReport。"""
-        return SkillReport(
-            skill_name=self.name,
-            score=self.score or 50.0,
-            confidence=self.confidence or 0.0,
-            direction=self.direction or "neutral",
-            signal=self.signal,
-            factors=list(self.factors),
-            analysis=self.analysis,
-            output_data=self.output_data,
-            tools_called=list(self.tools_called),
-            missing_data=list(self.missing_data),
-            status=self.status,
-            error=self.error,
-        )
 
     # ── 序列化 ──
 

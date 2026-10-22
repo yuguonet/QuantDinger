@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -128,6 +128,64 @@ def _safe_round(v: float, n: int = 4) -> float:
     if v is None or math.isnan(v) or math.isinf(v):
         return 0.0
     return round(v, n)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 量价关系四分支判定（2026-10-22 冗余收敛）
+# ═══════════════════════════════════════════════════════════════
+# 收敛前：analysis_tools 量能分析（盘中/非盘中双套）+ analysis_tools 批量快诊
+# （简版）+ bull_bear_research（警惕版）各写一遍 if/elif，阈值口径相同
+# （放量 >1.3× / 缩量 <0.7×）但标签文案三处不同。
+# **分支逻辑在此唯一**；标签是模型可见输出，各调用方历史文案逐字保留
+# （四套标签常量在下方，改输出文案需单独拍板，不在此偷偷统一）。
+
+_VPR_LABELS = {          # 非盘中标准口径（量能分析 / bull_bear 默认同款）
+    "up_strong": "量价齐升（健康上涨）",
+    "up_weak": "缩量上涨（上涨乏力）",
+    "down_strong": "放量下跌（恐慌抛售）",
+    "down_weak": "缩量下跌（动能减弱）",
+    "flat": "量价配合一般",
+}
+_VPR_LABELS_INTRADAY = {  # 盘中口径（量比实时，各档带（盘中）标注）
+    "up_strong": "放量上涨（盘中）",
+    "up_weak": "缩量上涨（盘中）",
+    "down_strong": "放量下跌（盘中）",
+    "down_weak": "缩量下跌（盘中）",
+    "flat": "量价一般（盘中）",
+}
+_VPR_LABELS_BRIEF = {     # 简版（批量快诊，无后缀）
+    "up_strong": "放量上涨",
+    "up_weak": "缩量上涨",
+    "down_strong": "放量下跌",
+    "down_weak": "缩量下跌",
+    "flat": "量价一般",
+}
+_VPR_LABELS_ALERT = {     # 警惕口径（bull_bear：缩量上涨带「需警惕」）
+    "up_strong": "量价齐升（健康上涨）",
+    "up_weak": "缩量上涨（上涨乏力，需警惕）",
+    "down_strong": "放量下跌（恐慌抛售）",
+    "down_weak": "缩量下跌（下跌动能减弱）",
+    "flat": "量价配合一般",
+}
+
+
+def classify_vol_price(price_change: float, volume_ratio: float,
+                       labels: Optional[Dict[str, str]] = None) -> str:
+    """量价关系四分支判定（统一阈值口径：放量 >1.3× / 缩量 <0.7×）。
+
+    labels 缺省 = 非盘中标准口径（_VPR_LABELS）；传入另一套标签常量
+    保留各调用方历史文案（见上方四套常量的口径注释）。
+    """
+    L = labels or _VPR_LABELS
+    if price_change > 0 and volume_ratio > 1.3:
+        return L["up_strong"]
+    if price_change > 0 and volume_ratio < 0.7:
+        return L["up_weak"]
+    if price_change < 0 and volume_ratio > 1.3:
+        return L["down_strong"]
+    if price_change < 0 and volume_ratio < 0.7:
+        return L["down_weak"]
+    return L["flat"]
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1903,3 +1903,49 @@
 {"ts": "2026-10-22 07:34:57", "query": "看行情 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-22 07:34:58", "query": "茅台现在(2026-10-22 07:34:58)多少钱", "tools": ["get_demo_quotes"]}
 {"ts": "2026-10-22 07:35:04", "query": "帮我分析一下贵州茅台600519，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:36", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:36", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-22 08:11:36", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-22 08:11:36", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:37", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:39", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-22 08:11:39", "query": "看看茅台的行情多少钱 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:39", "query": "看行情 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:40", "query": "茅台现在(2026-10-22 08:11:40)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:11:46", "query": "帮我分析一下贵州茅台600519，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:42", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:42", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-22 08:25:43", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-22 08:25:43", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:43", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:45", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-22 08:25:45", "query": "看看茅台的行情多少钱 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:45", "query": "看行情 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:46", "query": "茅台现在(2026-10-22 08:25:46)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:25:52", "query": "帮我分析一下贵州茅台600519，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:55", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:55", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-22 08:56:55", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-22 08:56:56", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:56", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:58", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-22 08:56:58", "query": "看看茅台的行情多少钱 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:58", "query": "看行情 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:56:59", "query": "茅台现在(2026-10-22 08:56:59)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 08:57:07", "query": "帮我分析一下贵州茅台600519，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:06", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:06", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-10-22 09:03:06", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-10-22 09:03:06", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:07", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:09", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-10-22 09:03:09", "query": "看看茅台的行情多少钱 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:09", "query": "看行情 今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:10", "query": "茅台现在(2026-10-22 09:03:10)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:03:16", "query": "帮我分析一下贵州茅台600519，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-10-22 09:34:26", "query": "现在(2026-10-22 09:32:01)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-10-22 09:38:59", "query": "分析肯特股份(301591)，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_chip_distribution", "analyze_pattern", "agent_get_kline", "analyze_chart_patterns", "get_stock_info", "get_stock_sector_info", "get_fund_flow_daily", "get_fund_flow", "get_realtime_quote", "technical_analysis", "get_capital_summary", "get_dragon_tiger", "bull_bear_research"]}
+{"ts": "2026-10-22 09:47:47", "query": "分析振华股份(603067)，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["get_chip_distribution", "analyze_chart_patterns", "agent_get_kline", "get_dragon_tiger", "analyze_pattern", "get_stock_info", "get_stock_sector_info", "get_fund_flow_daily", "get_realtime_quote", "technical_analysis", "bull_bear_research", "get_capital_summary"]}
+{"ts": "2026-10-22 09:57:43", "query": "现在(2026-10-22 09:53:47)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-10-22 10:07:37", "query": "分析风语筑(603466)，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["agent_get_kline", "get_chip_distribution", "get_realtime_quote", "get_fund_flow_daily", "get_stock_info", "technical_analysis", "get_dragon_tiger", "analyze_chart_patterns", "get_finance", "get_fund_flow", "get_stock_sector_info", "search_intel", "bull_bear_research", "get_capital_summary"]}
+{"ts": "2026-10-22 10:13:36", "query": "振华股份(603067) 38的成本,我该如何操作，周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）；今天(2026-10-22)", "tools": ["agent_get_kline", "get_chip_distribution", "get_realtime_quote", "get_stock_info", "get_fund_flow", "technical_analysis"]}

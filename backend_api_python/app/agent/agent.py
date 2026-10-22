@@ -34,10 +34,6 @@ LLM_MODEL        = os.getenv("OPENAI_MODEL", "qwen-plus")
 LLM_API_KEY      = os.getenv("OPENAI_API_KEY", "")
 LLM_BASE_URL     = os.getenv("OPENAI_BASE_URL")
 LLM_TEMPERATURE  = float(os.getenv("AGENT_LLM_TEMPERATURE", "0.1"))
-# 可复现采样（2026-09-15）：同 seed 同输入消除采样路径抖动；未设置=不传（默认随机）。
-# 注意：MoE 模型/网关负载均衡/实时数据使复现非严格，属"尽量可复现"而非"严格复现"。
-_seed_env = os.getenv("AGENT_LLM_SEED", "").strip()
-LLM_SEED         = int(_seed_env) if _seed_env else None
 LLM_MAX_TOKENS   = int(os.getenv("OPENAI_MAX_TOKENS", "16384"))
 MEMORY_MAX_HISTORY = int(os.getenv("AGENT_MEMORY_MAX_HISTORY", "2000"))
 MEMORY_BACKEND    = os.getenv("MEMORY_BACKEND", "local").lower()
@@ -222,6 +218,7 @@ def _load_analysis_memory_docs() -> list:
     conn = None
     try:
         import psycopg2
+        from .rag._doc_item import doc_item
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         cur = conn.cursor()
         cur.execute("""
@@ -234,16 +231,10 @@ def _load_analysis_memory_docs() -> list:
         docs = []
         for row in cur.fetchall():
             summary, decision, symbol, created_at = row
-            content = f"{decision or ''} {symbol or ''} {summary}"
-            docs.append({
-                "content": content[:500],
-                "metadata": {
-                    "source": "analysis_memory",
-                    "symbol": symbol or "",
-                    "decision": decision or "",
-                    "date": str(created_at) if created_at else "",
-                },
-            })
+            # 文档条目统一走 rag._doc_item.doc_item（content 截断+metadata 信封）
+            docs.append(doc_item(decision=decision, symbol=symbol,
+                                 summary=summary, created_at=created_at,
+                                 source="analysis_memory"))
         cur.close()
         return docs
     except Exception as e:
@@ -319,8 +310,6 @@ agent = QDAgentService(
 
 # 注：旧「启动期预热（NodeContext.init_tools）」已随 nodes.py 退役；
 # 工具注册改由 QDAgent._build_tool_registry 在会话首建时一次性完成（同样有进程内缓存）。
-
-
 
 
 def run_agent(message: str, session_id: str = "default", timeout: int = 300) -> str:

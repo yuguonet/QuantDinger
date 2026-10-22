@@ -11,9 +11,10 @@ Flask 壳 — 共用 agent.py 全局组件。
   GET  /api/agent-v2/health        — 健康检查
   GET  /api/agent-v2/info          — 配置信息
 
-使用方式：
-    from app.agent.flask_app import register_agent_routes
-    register_agent_routes(app)
+使用方式（2026-10-22：register_agent_routes/create_agent_blueprint 两个包装
+函数零引用已删——活路径是 app/routes/agent_blueprint.py 直接 import 本蓝图）：
+    from app.agent.flask_app import agent_v2_bp
+    app.register_blueprint(agent_v2_bp)
 """
 from __future__ import annotations
 
@@ -288,10 +289,3 @@ def stop():
         return jsonify({"error": str(e)}), 500
 
 
-def register_agent_routes(app):
-    app.register_blueprint(agent_v2_bp)
-    logger.info("[AgentV2] 路由已注册: /api/agent-v2/*")
-
-
-def create_agent_blueprint() -> Blueprint:
-    return agent_v2_bp

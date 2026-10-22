@@ -76,8 +76,6 @@ _LEVEL_RE = re.compile(
     r"(目标价|目标位|支撑|支撑位|压力|压力位|不跌破|站稳|突破|站上)\s*"
     r"(?:在)?\s*(\d+(?:\.\d+)?)")
 
-# 区间：X~Y / X-Y / X 到 Y
-_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:~|-|—|到|至)\s*(\d+(?:\.\d+)?)")
 
 # 视界
 _HORIZON_RULES: Tuple[Tuple[str, str], ...] = (
@@ -125,13 +123,6 @@ _SECTOR_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*(?:板块|概念|题
 #   改一处忘两处 = 静默漂移；现三者已统一为一张表（1M=21，与 1Y=252 自洽）。
 #   `n/a: 0` 表示"无到期日"（不是"持有 0 天"），见 label_spec。
 _HORIZON_DAYS: Dict[str, int] = label_spec.HOLDS
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if not v:
-        return default
-    return v not in ("0", "false", "no", "off")
 
 
 # ═══════════════════════════════════════════════════════════════

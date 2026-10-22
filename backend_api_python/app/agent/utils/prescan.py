@@ -56,17 +56,6 @@ def _sig_str(fn) -> str:
         return fn.__name__ + "(…)"
 
 
-def _return_hint(fn) -> str:
-    """返回结构提示：从 docstring 里抓 Returns 段首行（≤70 字符）。"""
-    doc = (inspect.getdoc(fn) or "")
-    m = re.search(r"Returns:\s*\n\s*(.+)", doc)
-    if m:
-        return m.group(1).strip()[:70]
-    return ""
-
-
-
-
 def prescan_skill_funcs(module_name: str) -> list:
     """静态解析 skills/<module>/run.py：公开函数的签名+文档（不 import，无副作用）。
 
@@ -100,32 +89,6 @@ def prescan_skill_funcs(module_name: str) -> list:
             ret = ast.unparse(ret_node.value)[:60]
         out.append({"name": node.name, "sig": sig, "doc": doc, "ret": ret})
     return out
-
-
-def prescan_skills(skill_adapter) -> str:
-    """技能预扫文本：每技能一段（名称+描述+阶段流+函数签名表）。
-
-    注入规划提示的 {skills_text} 槽位——替代"名字+描述"薄信息。
-    """
-    if not skill_adapter:
-        return "(无可用技能)"
-    parts = []
-    try:
-        skills = skill_adapter.list_skills()
-    except Exception as e:
-        logger.debug("[prescan] list_skills 失败: %s", e)
-        return "(无可用技能)"
-    for s in skills:
-        name = s.get("name", "")
-        desc = s.get("description", "")[:120]
-        mod = name.replace("-", "_")
-        parts.append(f"- {name}: {desc}")
-        for f in prescan_skill_funcs(mod)[:8]:
-            line = f"    · {f['sig']} — {f['doc']}"
-            if f["ret"]:
-                line += f"（返回 {f['ret']}）"
-            parts.append(line)
-    return "\n".join(parts) if parts else "(无可用技能)"
 
 
 # ═══════════════════════════════════════════════════════════════

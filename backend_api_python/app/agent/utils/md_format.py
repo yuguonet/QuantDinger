@@ -61,43 +61,6 @@ def _list_to_md(lst: list, depth: int = 0) -> str:
     return ", ".join(items) + suffix
 
 
-def _format_final_md(
-    title: str,
-    score: float,
-    direction: str,
-    factors: Optional[List[Dict[str, Any]]] = None,
-    signals: Optional[List[str]] = None,
-    extra: Optional[List[str]] = None,
-    first_line: Optional[str] = None,
-) -> str:
-    """终输出工具通用 markdown 格式化。
-
-    统一输出结构：标题+评分方向 / 因子列表 / 信号列表 / 额外行。
-
-    Args:
-        title: 工具标题，如 "茅台技术面"、"指标分析"
-        score: 综合评分 (0-100)
-        direction: bullish / bearish / neutral
-        factors: [{"name": "趋势偏多", "score": 75}, ...]
-        signals: ["MACD金叉", "RSI超卖", ...]
-        extra: 额外行，如 ["买3 卖2 胜率60%", "一票否决"]
-        first_line: 覆盖首行（用于自定义格式如 "600519 1888.0 +1.25%"）
-    """
-    dir_map = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
-    if first_line:
-        md = first_line
-    else:
-        md = f"{title} {score:.0f}分 {dir_map.get(direction, direction)}"
-    if factors:
-        md += "\n" + " ".join(f"{f['name']}:{f.get('score', '')}" for f in factors[:4])
-    if signals:
-        md += "\n" + " ".join(signals[:3])
-    if extra:
-        for line in extra:
-            md += f"\n{line}"
-    return md
-
-
 def _to_tsv(rows: List[Dict[str, Any]], columns: Optional[List[str]] = None) -> str:
     """将 dict 列表转为 TSV（tab 分隔）字符串。首行为列名注释行（# 开头）。
 
@@ -149,20 +112,3 @@ def _batch_execute(fn, codes: List[str]) -> Any:
     return {"count": len(results), "data": results, "error": None}
 
 
-def _lookup_stock_name(stock_code: str) -> str:
-    """从 basicinfo_db 查询股票名称。查不到返回空字符串。"""
-    try:
-        from app.utils.basicinfo_db import get_stock_basic_db
-        info = get_stock_basic_db().get_stock(stock_code)
-        if info:
-            return info.get("name", "")
-    except Exception:
-        pass
-    return ""
-
-
-def _format_output(data: Any, output: str = "markdown") -> str:
-    """统一输出分发：markdown → _to_md()，json → json.dumps()。"""
-    if output == "json":
-        return json.dumps(data, ensure_ascii=False)
-    return _to_md(data)

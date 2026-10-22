@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..log import logger
 
 from . import label_spec
+from ._jsonl import read_jsonl
 
 EV_VER = "ev1"
 PRODUCER_VER = "ev1-producer"
@@ -208,27 +209,12 @@ def evidence_path(as_of: str) -> Path:
     return Path(_ev_dir()) / f"evidence_{str(as_of)[:7]}.jsonl"
 
 
-def _read(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        try:
-            out.append(json.loads(s))
-        except (ValueError, TypeError):
-            continue
-    return out
-
-
 def append_evidence(ev: Dict[str, Any]) -> Path:
     """落盘一条证据。**同一 (as_of, subject) 覆盖**（幂等，补跑不重复计票）。"""
     key = (str(ev.get("as_of") or "")[:10], str(ev.get("subject") or ""))
     path = evidence_path(key[0])
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [r for r in _read(path)
+    rows = [r for r in read_jsonl(path)
             if (str(r.get("as_of") or "")[:10], str(r.get("subject") or "")) != key]
     rows.append(ev)
     rows.sort(key=lambda r: (str(r.get("as_of") or ""), str(r.get("subject") or "")))
@@ -245,9 +231,9 @@ def load_evidence(as_of: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
     if as_of:
         k = str(as_of)[:10]
-        return [r for r in _read(evidence_path(k))
+        return [r for r in read_jsonl(evidence_path(k))
                 if str(r.get("as_of") or "")[:10] == k]
     out: List[Dict[str, Any]] = []
     for p in sorted(d.glob("evidence_*.jsonl")):
-        out.extend(_read(p))
+        out.extend(read_jsonl(p))
     return out

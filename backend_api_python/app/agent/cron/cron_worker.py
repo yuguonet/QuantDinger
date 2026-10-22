@@ -118,49 +118,6 @@ def _make_event(event_type: str, job_id: int, job_name: str, **extra) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 
-def _parse_cron_field(field_str: str, min_val: int, max_val: int) -> set:
-    values = set()
-    for part in field_str.split(","):
-        part = part.strip()
-        if part == "*":
-            values.update(range(min_val, max_val + 1))
-        elif part.startswith("*/"):
-            step = int(part[2:])
-            values.update(range(min_val, max_val + 1, step))
-        elif "-" in part and "/" not in part:
-            lo, hi = part.split("-", 1)
-            values.update(range(int(lo), int(hi) + 1))
-        elif "-" in part and "/" in part:
-            range_part, step_part = part.split("/", 1)
-            lo, hi = range_part.split("-", 1)
-            step = int(step_part)
-            values.update(range(int(lo), int(hi) + 1, step))
-        else:
-            values.add(int(part))
-    return {v for v in values if min_val <= v <= max_val}
-
-
-def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    """检查时间是否匹配 cron 表达式（含标准 cron 0=周日语义）。支持 | 多段。"""
-    for sub_expr in cron_expr.split("|"):
-        parts = sub_expr.strip().split()
-        if len(parts) != 5:
-            continue
-        minutes = _parse_cron_field(parts[0], 0, 59)
-        hours = _parse_cron_field(parts[1], 0, 23)
-        days = _parse_cron_field(parts[2], 1, 31)
-        months = _parse_cron_field(parts[3], 1, 12)
-        weekdays = _parse_cron_field(parts[4], 0, 6)
-        py_wday = dt.isoweekday() % 7
-        if (dt.minute in minutes
-                and dt.hour in hours
-                and dt.day in days
-                and dt.month in months
-                and py_wday in weekdays):
-            return True
-    return False
-
-
 def next_cron_time(cron_expr: str, after: datetime,
                    max_search_days: int = 62) -> Optional[datetime]:
     """计算 `after` 之后的下一触发时刻。支持 | 多段，取最早。

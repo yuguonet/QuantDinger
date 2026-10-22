@@ -119,14 +119,6 @@ def _ensure() -> Dict[str, DomainSpec]:
     return _SPECS
 
 
-def specs() -> Dict[str, DomainSpec]:
-    return dict(_ensure())
-
-
-def get_spec(domain: str) -> Optional[DomainSpec]:
-    return _ensure().get(domain or "")
-
-
 # ── 查找 API（核心只准走这里）────────────────────────────────
 
 

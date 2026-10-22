@@ -8,6 +8,8 @@ import logging
 import re
 from typing import Optional
 
+from ._doc_item import doc_item
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,18 +128,13 @@ class PostgresFTSRetriever:
             docs = []
             for row in rows:
                 symbol, decision, summary, created_at, rank = row
-                content = f"{decision or ''} {symbol or ''} {summary or ''}"
-                docs.append({
-                    "content": content[:500],
-                    "metadata": {
-                        "source": "postgres_fts",
-                        "symbol": symbol or "",
-                        "decision": decision or "",
-                        "date": str(created_at) if created_at else "",
-                    },
-                    "score": float(rank) if rank else 0,
-                    "retrieval_route": "postgres_fts",
-                })
+                # 文档条目统一走 rag._doc_item.doc_item（content 截断+metadata 信封）；
+                # 本路特有键 score/retrieval_route 走 extra 透传
+                docs.append(doc_item(decision=decision, symbol=symbol,
+                                     summary=summary, created_at=created_at,
+                                     source="postgres_fts",
+                                     score=float(rank) if rank else 0,
+                                     retrieval_route="postgres_fts"))
 
             cur.close()
             conn.close()

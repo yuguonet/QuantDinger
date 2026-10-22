@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..log import logger
+from ._jsonl import read_jsonl
 
 AGG_VER = "agg1"
 
@@ -195,21 +196,6 @@ def pair_path(as_of: str) -> Path:
     return Path(_pair_dir()) / f"pairs_{str(as_of)[:7]}.jsonl"
 
 
-def _read(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        try:
-            out.append(json.loads(s))
-        except (ValueError, TypeError):
-            continue
-    return out
-
-
 def record_pair(claim_id: Any, p_base: Any, p_final: Any,
                 condition_key: Optional[str] = None,
                 as_of: Optional[str] = None,
@@ -236,7 +222,7 @@ def record_pair(claim_id: Any, p_base: Any, p_final: Any,
     key = (_as_of, str(claim_id))
     path = pair_path(_as_of)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [r for r in _read(path)
+    rows = [r for r in read_jsonl(path)
             if (str(r.get("as_of") or "")[:10], str(r.get("claim_id"))) != key]
     rows.append(rec)
     rows.sort(key=lambda r: (str(r.get("as_of") or ""), str(r.get("claim_id"))))
@@ -253,8 +239,8 @@ def load_pairs(as_of: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
     if as_of:
         k = str(as_of)[:10]
-        return [r for r in _read(pair_path(k)) if str(r.get("as_of") or "")[:10] == k]
+        return [r for r in read_jsonl(pair_path(k)) if str(r.get("as_of") or "")[:10] == k]
     out: List[Dict[str, Any]] = []
     for p in sorted(d.glob("pairs_*.jsonl")):
-        out.extend(_read(p))
+        out.extend(read_jsonl(p))
     return out

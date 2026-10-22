@@ -782,13 +782,6 @@ def _hit_stock_name(query: str) -> str:
     return hits[0] if hits else ""
 
 
-def clear_name_cache() -> None:
-    """清空名单缓存（数据库同步后或测试用）。"""
-    _NAME_CACHE["names"] = None
-    _NAME_CACHE["aliases"] = None
-    _NAME_CACHE["at"] = 0.0
-
-
 def has_domain_hint(query: str, hints: Optional[Sequence[str]] = None) -> bool:
     """问题是否带有"需要专业工具"的领域特征。
 

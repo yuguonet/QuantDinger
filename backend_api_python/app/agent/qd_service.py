@@ -174,7 +174,6 @@ def _should_store_assistant(text: str) -> bool:
 #      本函数（关键词回落路径）回归纯确定性：注入阈值看本函数的原始分。
 _SCOPE_SINGLE = ("单只", "个股", "目标股票")     # 个股类技能
 _SCOPE_SCREEN = ("全市场", "筛选")              # 选股/全市场类
-_SCOPE_STRAT = ("策略",)                        # 策略调试类
 _INTENT_RULES = (
     # (query 动作词, 技能描述对应词, 加分)
     (re.compile(r"分析|诊断|研判|怎么样|怎么看|能不能买|走势"), re.compile(r"分析|诊断|研判"), 1),

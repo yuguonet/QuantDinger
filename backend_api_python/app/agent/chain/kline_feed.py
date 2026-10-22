@@ -31,7 +31,6 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..log import logger
 
 DEFAULT_BARS = 120          # 默认取数根数（远大于 predict.MIN_BARS=60，留余量）
-_INDEX_CODE = "000001"      # 上证，与 context_frame._INDEX_CODE 同口径
 
 
 def _env_int(name: str, default: int) -> int:

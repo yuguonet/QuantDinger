@@ -138,32 +138,6 @@ def bump(panel: dict, key: str, n: int = 1) -> dict:
     return panel
 
 
-def panel_from_trace(events) -> Dict[str, int]:
-    """从一串 trace 事件（dict 列表 [{type,payload}]）汇总面板计数。"""
-    p = empty_panel()
-    for ev in (events or []):
-        if not isinstance(ev, dict):
-            continue
-        t = ev.get("type") or ev.get("kind") or ""
-        pl = ev.get("payload") or {}
-        if t == "verify_done":
-            bump(p, "verify_seen")
-            r = str(pl.get("route") or "")
-            bump(p, {"PASS": "verify_pass", "REPAIR_ONCE": "verify_repair",
-                     "DEGRADE": "verify_degrade"}.get(r, "verify_seen"))
-        elif t == "verify_skipped":
-            bump(p, "verify_skipped")
-        elif t == "grounding_reject":
-            bump(p, "grounding_rejects", int(pl.get("count", 1) or 1))
-        elif t == "hallucination_blocked":
-            bump(p, "hallucination_blocks", int(pl.get("count", 1) or 1))
-        elif t == "budget_exceeded":
-            bump(p, "budget_exceeded")
-        elif t == "replan":
-            bump(p, "replans")
-    return p
-
-
 def render_panel(panel: dict) -> str:
     """渲染面板为可读文本（周报/日志用）。"""
     p = dict(empty_panel()); p.update({k: v for k, v in (panel or {}).items() if k in PANEL_KEYS})
@@ -177,37 +151,3 @@ def render_panel(panel: dict) -> str:
     return "\n".join(lines)
 
 
-# ── 运行中从 smolagents memory 现算用量（供每步预算钩子）──
-def tokens_from_agent(agent) -> int:
-    """从 agent.memory.steps 累加 input+output token（与 nodes._extract_token_usage 同口径）。"""
-    total = 0
-    try:
-        from smolagents.memory import ActionStep, PlanningStep
-        for step in getattr(getattr(agent, "memory", None), "steps", []) or []:
-            if not isinstance(step, (ActionStep, PlanningStep)):
-                continue
-            u = getattr(step, "token_usage", None)
-            if u is None:
-                continue
-            total += (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0)
-    except Exception:
-        return 0
-    return total
-
-
-def tool_calls_from_agent(agent) -> int:
-    """统计已发生的真实工具调用数（ActionStep.tool_calls，去掉伪工具名）。"""
-    n = 0
-    try:
-        from smolagents.memory import ActionStep
-        for step in getattr(getattr(agent, "memory", None), "steps", []) or []:
-            if not isinstance(step, ActionStep):
-                continue
-            for tc in (getattr(step, "tool_calls", None) or []):
-                nm = getattr(tc, "name", "") or ""
-                if nm in ("python_interpreter", "final_answer", ""):
-                    continue
-                n += 1
-    except Exception:
-        return 0
-    return n

@@ -8,12 +8,46 @@ Pure-Python calculations on K-line data, no external API calls.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ...log import logger
 from ._analysis_utils import (
     _get_ds, _fetch_klines, _fetch_closes, _fetch_ohlcv, _safe_round, _calc_obv, _fetch_realtime_volume_ratio,
+    classify_vol_price, _VPR_LABELS_INTRADAY, _VPR_LABELS_BRIEF,
 )
+
+# ═══════════════════════════════════════════════════════════════
+# 批量执行包装器（2026-10-22 冗余收敛：8 处同型循环 → 单一契约）
+# ═══════════════════════════════════════════════════════════════
+
+def _batch_run(code_list: List[str], one: Callable[[str], Dict[str, Any]],
+               supplement: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+               ) -> Dict[str, Any]:
+    """批量执行 + 单股错误隔离（本文件 8 个批量工具的统一尾巴）。
+
+    契约（与收敛前各站逐字一致）：
+    - 每个 code 独立 try：单股异常**不拖垮整批**，失败位写 {"error": str(e)}
+      （与单股路径的错误形态一致——模型可读，且能区分「这只挂了」与「整批挂了」）；
+    - 返回 {"count": len(results), "data": results}；
+    - supplement(code, result) -> result：成功结果写入前的补充钩子
+      （get_indicator_snapshot 用它回填批量预取的盘中量比），在 try 内调用，
+      补充逻辑自身异常同样走单股隔离。
+
+    收敛前 8 处各写一遍 for/try/except（10-19 审计 curated 重复 #1，收益最大）。
+    get_volume_analysis 原为无守卫循环，本次一并纳入统一契约：其 _one 已有
+    内部 try，外层守卫只对「内部 try 之外的意料位」生效——单股挂不再拖垮整批，
+    与其余 7 站同契约（唯一行为差异，仅出现在意料外的异常路径）。
+    """
+    results: Dict[str, Any] = {}
+    for code in code_list:
+        try:
+            r = one(code)
+            if supplement is not None:
+                r = supplement(code, r)
+            results[code] = r
+        except Exception as e:
+            results[code] = {"error": str(e)}
+    return {"count": len(results), "data": results}
 
 # ═══════════════════════════════════════════════════════════════
 # 指标计算核心（纯 Python，无外部依赖）
@@ -1123,13 +1157,7 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
     if len(code_list) == 1:
         return _one(code_list[0])
 
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """均线指标：返回多个周期均线的 MA 值、斜率和趋势方向。
 
@@ -1186,13 +1214,7 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
         from .._base import as_code_envelope
         return as_code_envelope(code_list[0], _one(code_list[0]))
 
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 def get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：返回量比、近5/20日均量与量能趋势（放量/缩量/平量）、量价关系。
 
@@ -1259,33 +1281,17 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
                 earlier_avg = sum(volumes[-7:-4]) / 3
                 vol_trend = "上升" if recent_avg > earlier_avg * 1.1 else ("下降" if recent_avg < earlier_avg * 0.9 else "平稳")
 
-            # 量价关系
+            # 量价关系（分支判定统一走 _analysis_utils.classify_vol_price，
+            # 阈值口径唯一：放量 >1.3× / 缩量 <0.7×；标签各口径逐字保留）
             vol_price_relation = "数据不足"
             if len(closes) >= 2 and latest_vol > 0:
                 price_change = closes[-1] - closes[-2]
                 if is_intraday and volume_ratio > 0:
                     # 盘中有实时量比，可以判断量价关系
-                    if price_change > 0 and volume_ratio > 1.3:
-                        vol_price_relation = "放量上涨（盘中）"
-                    elif price_change > 0 and volume_ratio < 0.7:
-                        vol_price_relation = "缩量上涨（盘中）"
-                    elif price_change < 0 and volume_ratio > 1.3:
-                        vol_price_relation = "放量下跌（盘中）"
-                    elif price_change < 0 and volume_ratio < 0.7:
-                        vol_price_relation = "缩量下跌（盘中）"
-                    else:
-                        vol_price_relation = "量价一般（盘中）"
+                    vol_price_relation = classify_vol_price(
+                        price_change, volume_ratio, labels=_VPR_LABELS_INTRADAY)
                 elif volume_ratio > 0:
-                    if price_change > 0 and volume_ratio > 1.3:
-                        vol_price_relation = "量价齐升（健康上涨）"
-                    elif price_change > 0 and volume_ratio < 0.7:
-                        vol_price_relation = "缩量上涨（上涨乏力）"
-                    elif price_change < 0 and volume_ratio > 1.3:
-                        vol_price_relation = "放量下跌（恐慌抛售）"
-                    elif price_change < 0 and volume_ratio < 0.7:
-                        vol_price_relation = "缩量下跌（动能减弱）"
-                    else:
-                        vol_price_relation = "量价配合一般"
+                    vol_price_relation = classify_vol_price(price_change, volume_ratio)
 
             return {
                 "stock_code": stock_code,
@@ -1335,23 +1341,11 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
             closes = _fetch_closes(stock_code, 30)
             if len(closes) >= 2:
                 pc = closes[-1] - closes[-2]
-                if pc > 0 and vr > 1.3:
-                    r["vol_price_relation"] = "放量上涨"
-                elif pc > 0 and vr < 0.7:
-                    r["vol_price_relation"] = "缩量上涨"
-                elif pc < 0 and vr > 1.3:
-                    r["vol_price_relation"] = "放量下跌"
-                elif pc < 0 and vr < 0.7:
-                    r["vol_price_relation"] = "缩量下跌"
-                else:
-                    r["vol_price_relation"] = "量价一般"
+                r["vol_price_relation"] = classify_vol_price(
+                    pc, vr, labels=_VPR_LABELS_BRIEF)
         return r
 
-    results = {}
-    for code in code_list:
-        results[code] = _one_with_vr(code)
-
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one_with_vr)
 def analyze_pattern(codes: str) -> Dict[str, Any]:
     """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
 
@@ -1567,13 +1561,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
     if len(code_list) == 1:
         return _one(code_list[0])
 
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 # get_chip_distribution 已迁移至 chip_distribution.py
 from .chip_distribution import get_chip_distribution  # noqa: F401
 def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
@@ -1643,20 +1631,15 @@ def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     _t2 = _dt2.now().hour * 60 + _dt2.now().minute
     _vr_map2 = _fetch_realtime_volume_ratio(code_list) if 570 <= _t2 < 900 and len(code_list) > 1 else {}
 
-    results = {}
-    for code in code_list:
-        try:
-            r = _one(code)
-            # 多股时用批量预取的量比补充
-            if "error" not in r and _vr_map2 and r.get("volume_ratio", 0) == 0:
-                vr = _vr_map2.get(code, 0)
-                if vr > 0:
-                    r["volume_ratio"] = vr
-            results[code] = r
-        except Exception as e:
-            results[code] = {"error": str(e)}
+    def _supplement_vr(code: str, r: Dict[str, Any]) -> Dict[str, Any]:
+        # 多股时用批量预取的量比补充
+        if "error" not in r and _vr_map2 and r.get("volume_ratio", 0) == 0:
+            vr = _vr_map2.get(code, 0)
+            if vr > 0:
+                r["volume_ratio"] = vr
+        return r
 
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one, supplement=_supplement_vr)
 
 # ═══════════════════════════════════════════════════════════════
 # 图表形态识别（从 chart_patterns.py 合并）
@@ -2063,13 +2046,7 @@ def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
     if len(code_list) == 1:
         return _one(code_list[0])
 
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 
 def get_obv_analysis(codes: str) -> Dict[str, Any]:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
@@ -2132,13 +2109,7 @@ def get_obv_analysis(codes: str) -> Dict[str, Any]:
     if len(code_list) == 1:
         return _one(code_list[0])
 
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 
 
 def get_price_stats(codes: str, days: int = 120) -> dict:
@@ -2212,13 +2183,7 @@ def get_price_stats(codes: str, days: int = 120) -> dict:
         return {"error": "codes 为空"}
     if len(code_list) == 1:
         return _one(code_list[0])
-    results = {}
-    for code in code_list:
-        try:
-            results[code] = _one(code)
-        except Exception as e:
-            results[code] = {"error": str(e)}
-    return {"count": len(results), "data": results}
+    return _batch_run(code_list, _one)
 
 # ── OpenAI tool declarations ─────────────────────────────────
 

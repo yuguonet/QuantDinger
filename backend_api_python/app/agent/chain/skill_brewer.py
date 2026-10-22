@@ -218,19 +218,6 @@ def _skill_dir_exists_for(chain_name: str) -> Optional[str]:
     return None
 
 
-def _find_entity_codes(skmd: str) -> list:
-    """通用性质量门（2026-09-30，§3.16 泛化纪律的代码化）：
-
-    设计文档声称“写死具体代码 = 编译失败重酿”，但此前无任何实现（校验只有
-    tools 白名单 + frontmatter 字段），auto-stock-analyze-600929 这类绑定单股
-    的技能即由此漏过。此处扫编译产物里的六位实体码（日期/溯源 id 先剥离防误伤）。
-
-    2026-10-19 阶段 1：实现下沉 `skill_registry.find_entity_codes`（单一真源，
-    发布门禁与重酿判据共用）。
-    """
-    return sr.find_entity_codes(skmd)
-
-
 def _generic_violation(skmd: str, sample_name: str = "") -> list:
     """通用性违规清单（2026-09-30 提智扩展）：实体码 + 标的名称双维度。
 

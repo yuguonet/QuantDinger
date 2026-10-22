@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 # 一旦被调用即 NameError（被内层 except 吞掉后只返回 {"error": ...}，静默退化）。
 # 按项目"复用优于重定义"约定改为导入单一实现，不在此复制第三份。
 from ...log import logger
-from ._analysis_utils import _fetch_ohlcv, _safe_round
+from ._analysis_utils import _fetch_ohlcv, _safe_round, classify_vol_price, _VPR_LABELS_ALERT
 from .analysis_tools import (
     _calc_boll, _calc_kdj, _calc_macd, _calc_rsi,
 )
@@ -541,16 +541,10 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
             vol_price_relation = "数据不足"
             if len(closes) >= 2 and latest_vol > 0:
                 price_change = closes[-1] - closes[-2]
-                if price_change > 0 and volume_ratio > 1.3:
-                    vol_price_relation = "量价齐升（健康上涨）"
-                elif price_change > 0 and volume_ratio < 0.7:
-                    vol_price_relation = "缩量上涨（上涨乏力，需警惕）"
-                elif price_change < 0 and volume_ratio > 1.3:
-                    vol_price_relation = "放量下跌（恐慌抛售）"
-                elif price_change < 0 and volume_ratio < 0.7:
-                    vol_price_relation = "缩量下跌（下跌动能减弱）"
-                else:
-                    vol_price_relation = "量价配合一般"
+                # 分支判定统一走 _analysis_utils.classify_vol_price（阈值口径唯一）；
+                # 本工具用警惕口径标签（缩量上涨带「需警惕」），逐字保留历史文案
+                vol_price_relation = classify_vol_price(
+                    price_change, volume_ratio, labels=_VPR_LABELS_ALERT)
 
             return {
                 "codes": codes,

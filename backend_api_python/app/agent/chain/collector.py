@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 from ..log import logger
 
 from . import context_frame, sampler
+from ._jsonl import read_jsonl
 
 SCHEMA_VER = "col1"
 
@@ -61,27 +62,12 @@ def universe_path(as_of: str) -> Path:
     return Path(_universe_dir()) / f"daily_universe_{str(as_of)[:7]}.jsonl"
 
 
-def _read(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    out: List[Dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        try:
-            out.append(json.loads(s))
-        except (ValueError, TypeError):
-            continue                        # 坏行跳过，不因一行毁掉整个文件
-    return out
-
-
 def _append_universe(rec: Dict[str, Any]) -> Path:
     """落盘一日样本。**同 as_of 覆盖**（幂等，补跑不重复）。"""
     key = str(rec.get("as_of") or "")[:10]
     path = universe_path(key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [r for r in _read(path) if str(r.get("as_of") or "")[:10] != key]
+    rows = [r for r in read_jsonl(path) if str(r.get("as_of") or "")[:10] != key]
     rows.append(rec)
     rows.sort(key=lambda r: str(r.get("as_of") or ""))
     path.write_text(
@@ -94,14 +80,14 @@ def _append_universe(rec: Dict[str, Any]) -> Path:
 def load_universe(as_of: Optional[str] = None) -> List[Dict[str, Any]]:
     """回读样本。指定 `as_of` 时只回该月文件再过滤（不扫全目录）。"""
     if as_of:
-        rows = _read(universe_path(str(as_of)[:10]))
+        rows = read_jsonl(universe_path(str(as_of)[:10]))
         return [r for r in rows if str(r.get("as_of") or "")[:10] == str(as_of)[:10]]
     d = Path(_universe_dir())
     if not d.exists():
         return []
     out: List[Dict[str, Any]] = []
     for p in sorted(d.glob("daily_universe_*.jsonl")):
-        out.extend(_read(p))
+        out.extend(read_jsonl(p))
     return out
 
 

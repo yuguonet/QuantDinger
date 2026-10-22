@@ -1434,7 +1434,3 @@ def start_eval_worker():
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()
     logger.info("[EvalWorker] 盘后回溯评估 worker 已启动")
-def stop_eval_worker():
-    global _eval_stop
-    if _eval_stop:
-        _eval_stop.set()

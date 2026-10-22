@@ -528,184 +528,23 @@ def update_skill_verify(root_id: int, actual_direction: str):
 # ═══════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════
-# 用户反馈惩罚（trace 层）
+# 链名归一 SQL 版（evaluator chain 层权重聚合按链名同键的唯一推导入口）
 # ═══════════════════════════════════════════════════════════════
 
-def query_latest_root(stock_code: str) -> Optional[Dict[str, Any]]:
-    """查询某股票最近一条根节点 trace。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT id, exec_date, stock_code, stock_name, name,
-                       score, action, direction, confidence, status
-                FROM qd_agent_traces
-                WHERE parent_id IS NULL AND stock_code = %s
-                ORDER BY created_at DESC LIMIT 1
-            """, (stock_code,))
-
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "id": row['id'],
-                "exec_date": row['exec_date'].isoformat() if row['exec_date'] else None,
-                "stock_code": row['stock_code'],
-                "stock_name": row['stock_name'],
-                "chain_id": row['name'],
-                "score": row['score'],
-                "action": row['action'],
-                "direction": row['direction'],
-                "confidence": row['confidence'],
-                "status": row['status'],
-            }
-    except Exception as e:
-        logger.error("[Store] 查询最近根节点失败 stock=%s: %s", stock_code, e)
-        return None
 def _sql_chain_norm(col: str) -> str:
     """链名归一 SQL 版（2026-09-30，与 domain_registry.normalize_chain_name 同语义近似：
     剥 4~6 位实体数字段及相邻 '+'，压缩并清首尾 '+'）。
 
     链名归一上线后新旧行键不同（stock+analyze+600929 vs stock+analyze），
-    按链名匹配的追责面（惩罚计数/最近根节点/链权重聚合）两侧必须同键，
-    否则切换点起惩罚计数清零、链权重断账。
+    按链名匹配的权重聚合面两侧必须同键，否则切换点起链权重断账
+    （活消费方：evaluator.update_chain_weights 的 chain 层 win_rate 聚合；
+    2026-10-22 随「用户反馈惩罚」集群删除，docstring 里的惩罚计数/最近根节点
+    两个旧消费面已不存在）。
     """
     return ("trim('+' from regexp_replace(regexp_replace(lower(" + col + "), "
             "'\\+?\\d{4,6}', '', 'g'), '\\++', '+', 'g'))")
 
 
-def query_latest_root_by_chain(chain_name: str) -> Optional[Dict[str, Any]]:
-    """查询某 chain 最近一条根节点 trace（无 stock_code 时使用；键按归一匹配）。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT id, exec_date, stock_code, stock_name, name,
-                       score, action, direction, confidence, status
-                FROM qd_agent_traces
-                WHERE parent_id IS NULL
-                  AND %s = %s
-                ORDER BY created_at DESC LIMIT 1
-            """ % (_sql_chain_norm("name"), _sql_chain_norm("%s")), (chain_name,))
-
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "id": row['id'],
-                "exec_date": row['exec_date'].isoformat() if row['exec_date'] else None,
-                "stock_code": row['stock_code'],
-                "stock_name": row['stock_name'],
-                "chain_id": row['name'],
-                "score": row['score'],
-                "action": row['action'],
-                "direction": row['direction'],
-                "confidence": row['confidence'],
-                "status": row['status'],
-            }
-    except Exception as e:
-        logger.error("[Store] 查询最近根节点失败 chain=%s: %s", chain_name, e)
-        return None
-def mark_root_wrong(root_id: int):
-    """轻度惩罚：标记根节点 correct=False + calibration 重校准。
-
-    [AUDIT-MASK:C2|2026-09-19 → fix 2026-09-19] 时序冲突已修：query_pending_verify
-    现排除 human_reviewed=TRUE 的行，本函数写入的人工判定不会被自动验证覆盖。
-    """
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE qd_agent_traces SET
-                    correct = FALSE,
-                    calibration = 1.10,
-                    human_reviewed = TRUE,
-                    human_verdict = 'negative_feedback'
-                WHERE id = %s AND parent_id IS NULL
-            """, (root_id,))
-            conn.commit()
-            logger.info("[Store] 标记 trace root_id=%d correct=False", root_id)
-    except Exception as e:
-        logger.error("[Store] 标记 trace 失败 root_id=%d: %s", root_id, e)
-def mark_root_good(root_id: int):
-    """正面奖励（2026-09-15）：用户认可上一轮编排。
-    correct=TRUE 固化 + calibration 上调至上限 1.05 + human_reviewed=TRUE
-    （跳过 T+N 自动校准，防止把用户认可的链路改判）→ 下轮 update_weights
-    的 win_rate/编排缓存立即受益。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE qd_agent_traces SET
-                    correct = TRUE,
-                    calibration = 1.05,
-                    human_reviewed = TRUE,
-                    human_verdict = 'positive_feedback'
-                WHERE id = %s AND parent_id IS NULL
-            """, (root_id,))
-            conn.commit()
-            logger.info("[Store] 正面认可 root_id=%d correct=TRUE calibration=1.05", root_id)
-    except Exception as e:
-        logger.error("[Store] 正面奖励失败 root_id=%d: %s", root_id, e)
-
-
-def delete_tree(root_id: int):
-    """重度惩罚：删除整棵 trace 树。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM qd_agent_traces WHERE root_id = %s", (root_id,))
-            deleted = cur.rowcount
-            conn.commit()
-            logger.info("[Store] 删除 trace 树 root_id=%d, 共 %d 条", root_id, deleted)
-    except Exception as e:
-        logger.error("[Store] 删除 trace 树失败 root_id=%d: %s", root_id, e)
-def get_penalty_count(stock_code: str) -> int:
-    """统计某股票最近 trace 的负面反馈次数（human_verdict='negative_feedback'）。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT COUNT(*) as cnt FROM qd_agent_traces
-                WHERE parent_id IS NULL
-                  AND stock_code = %s
-                  AND human_verdict = 'negative_feedback'
-            """, (stock_code,))
-            row = cur.fetchone()
-            return row['cnt'] if row else 0
-    except Exception as e:
-        logger.warning("[Store] 统计惩罚次数失败: %s", e)
-        return 0
-def get_penalty_count_by_chain(chain_name: str) -> int:
-    """统计某 chain 最近 trace 的负面反馈次数（human_verdict='negative_feedback'）。"""
-    from app.utils.db import get_db_connection
-
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT COUNT(*) as cnt FROM qd_agent_traces
-                WHERE parent_id IS NULL
-                  AND %s = %s
-                  AND human_verdict = 'negative_feedback'
-            """ % (_sql_chain_norm("name"), _sql_chain_norm("%s")), (chain_name,))
-            row = cur.fetchone()
-            return row['cnt'] if row else 0
-    except Exception as e:
-        logger.warning("[Store] 统计惩罚次数失败 chain=%s: %s", chain_name, e)
-        return 0
 def get_skill_weights() -> Dict[str, float]:
     """从 qd_agent_weights 获取 Skill 权重。"""
     from app.utils.db import get_db_connection
@@ -759,26 +598,6 @@ def get_factor_weights(skill_name: str = None) -> Dict[str, float]:
     return weights
 
 
-def get_chain_weights() -> Dict[str, float]:
-    """从 qd_agent_weights 获取链路权重（layer='chain'，2026-09-24 提智 P3/TODO-1）。
-
-    背景（已知局限 G1 的补全）：update_weights 此前只产 skill/factor/tool 三层权重，
-    chain 层“只记账不加权”；本函数是 planner 侧的消费入口（与 get_tool_weights 同款
-    低权重提示）。写入点在 evaluator.update_weights 的⑦段（同表分层，additive）。
-    """
-    from app.utils.db import get_db_connection
-    weights: Dict[str, float] = {}
-    try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name, weight FROM qd_agent_weights WHERE layer = 'chain'")
-            # 行是 RealDictRow，按键取（按位置解包会拿到列名字符串）
-            for _crow in cur.fetchall():
-                weights[_crow["name"]] = _crow["weight"]
-            cur.close()
-    except Exception as e:
-        logger.warning("[Store] 获取链路权重失败: %s", e)
-    return weights
 # [AUDIT-MASK:B1|2026-09-19] 第④闭环双轨之一：本函数（工具序列参考注入）与 skill_brewer
 # （酿造）同源同目的，质量门口径不一致（此处 win_rate>=0.7/MIN_SAMPLES=1；酿造 证伪<=0.3）。
 # 等混合触发（重设计稿 §2.5）与迭代旁支稳定后二选一；建议保留酿造，本通道降级 debug 开关。

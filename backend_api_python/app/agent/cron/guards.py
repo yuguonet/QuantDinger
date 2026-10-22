@@ -134,10 +134,3 @@ def guard_create(*, cron_expr: str = "", existing_count: int = 0) -> Dict[str, A
     return {"ok": True, "min_interval": v.get("min_interval")}
 
 
-def seconds_delay_to_at(seconds: int) -> str:
-    """B7：秒级延迟用「HH:MM:SS 偏移到今天稍后」语义，禁止漂移到明天。
-
-    这里返回相对描述，由 cron_tools._parse_at_time 消费；超过当日则显式 `tomorrow`。
-    """
-    s = max(1, int(seconds))
-    return f"+{s}s"

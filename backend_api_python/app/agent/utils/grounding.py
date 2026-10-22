@@ -95,41 +95,6 @@ def _is_source_slot(key: str) -> bool:
     return bool(_SOURCE_VAR_RE.match(key))
 
 
-def collect_grounding_corpus(state: dict, *, strict: bool = True) -> str:
-    """从 executor.state 收集溯源语料——**仅白名单来源槽位**（提智评审 C2）。
-
-    收录（strict=True，默认）：
-      · `_r_<工具名>` —— 工具原始载荷（`_wrap_stage_guard` 登记，核心来源）
-      · `_print_outputs` —— 模型 print 回显（留证）
-      · `_qd_stats` —— 执行器统计摘要
-      · 模型变量名命中 `_SOURCE_VAR_RE`（疑似数据源命名，如 `quote_df`/`raw_kline`）
-
-    排除：其余模型自造变量（标量/中间计算结果）——否则模型先写 `x=28.5` 再引用
-    `28.5`，会被判「可溯源」→ 门自我放过幻觉（C2 的原始病灶）。
-
-    strict=False：保留旧的「state 全量」行为，仅供排查/对照；生产禁用。
-    state 非 dict（未初始化/异常路径）时返回 ""，由调用方决定是否退回 observations。
-    """
-    if not isinstance(state, dict):
-        return ""
-    parts: list = []
-    total = 0
-    for key, val in state.items():
-        if key in _INTERNAL_STATE_KEYS:
-            continue
-        if strict and not _is_source_slot(key):
-            continue
-        try:
-            chunk = f"{key}={val!r}"
-        except Exception:
-            chunk = f"{key}=<unreprable>"
-        parts.append(chunk)
-        total += len(chunk)
-        if total >= _CORPUS_MAX_CHARS:
-            break
-    return "\n".join(parts)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # E2（2026-09-24 提智先手）：数值变体归一 + 容差匹配（**单一事实源**）
 # ═══════════════════════════════════════════════════════════════════════════
@@ -212,25 +177,6 @@ def _grounded_count(nums: list, corpus: str) -> int:
         if tok in corpus or any(numbers_match(v, c) for c in cvals):
             n += 1
     return n
-
-
-def check_claims(claims, corpus: str) -> Tuple[bool, list]:
-    """E2：校验 claims[] 中每个 claim 的 value 能否溯源（single source）。
-
-    claims: list[dict]，每项应含 {text, value, provenance{tool,field,row}, verified_by_exec}。
-    返回 (ok, 未溯源 claim 列表)——ok=False 表示存在凭空数值，须改走 missing_data。
-    """
-    ungrounded: list = []
-    cvals = _corpus_values(corpus)
-    for c in (claims or []):
-        if not isinstance(c, dict):
-            continue
-        v = c.get("value")
-        if c.get("verified_by_exec"):
-            continue
-        if not value_in_corpus(v, corpus, corpus_vals=cvals):
-            ungrounded.append(c)
-    return (not ungrounded), ungrounded
 
 
 def check_grounding(text: str, corpus: str) -> Tuple[bool, str]:
