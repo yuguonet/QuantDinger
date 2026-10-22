@@ -2078,9 +2078,13 @@ def get_obv_analysis(codes: str) -> Dict[str, Any]:
             if "error" in obv_result:
                 return obv_result
 
-            vol = volumes[-1]
-            avg_vol = sum(volumes[-5:]) / 5
-            vol_ratio = _safe_round(vol / avg_vol, 2) if avg_vol else 0
+            # 量比统一走 volume_ratio_summary（2026-10-22）：盘中末根是未走完的
+            # 当日，裸除 5 日全天均量会系统性低估（实测 0.227 vs 归一化后约 1.27）。
+            from ._analysis_utils import volume_ratio_summary
+            _vs = volume_ratio_summary(volumes,
+                                      last_bar_date=data.get("last_date"),
+                                      last_bar_ts=data.get("last_ts"))
+            vol_ratio = _safe_round(_vs["vol_ratio"], 2) if _vs.get("vol_ratio") is not None else None
             price_change_pct = _safe_round((closes[-1] - closes[-2]) / closes[-2] * 100, 2) if closes[-2] else 0
 
             if price_change_pct > 0 and obv_result["obv_trend"] == "上升":

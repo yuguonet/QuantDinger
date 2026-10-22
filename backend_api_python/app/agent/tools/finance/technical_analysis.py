@@ -69,6 +69,7 @@ def _algo_analyze(
     # ── 1. 趋势评分（主权重 40%）──
     trend = tool_results.get("analyze_trend", {})
     trend_score = 50
+    ma_align = ""   # 趋势排列（供均值回归系数/方向守卫用；缺数据 → 空串）
     if isinstance(trend, dict) and "error" not in trend:
         trend_score = trend.get("trend_score", 50)
         trend_desc = trend.get("trend", "震荡")
@@ -87,6 +88,14 @@ def _algo_analyze(
         factors.append({"name": "趋势", "value": trend_desc, "score": trend_score})
     else:
         factors.append({"name": "趋势", "value": "数据缺失", "score": 50})
+
+    # ── 均值回归类修正系数（2026-10-22）──
+    # RSI/KDJ/BOLL 超卖、获利盘低这类加分只表达「反弹概率」，不表达方向看多；
+    # 均线空头排列下照全分给 ⇒「跌得多=看多」，实测 603067 弱势空头排列下仍拿
+    # 69 分/bullish，与均线/资金/筹码证据自相矛盾。故与排列反向的均值回归修正
+    # 折半（超卖类遇空头 / 超买类遇多头），同向不打折。
+    _mr_long_mult = 0.5 if "空头" in ma_align else 1.0   # 超卖反弹类加分
+    _mr_short_mult = 0.5 if "多头" in ma_align else 1.0  # 超买回调类减分
 
     # ── 2. 动量指标（权重 25%）──
     indicator = tool_results.get("get_indicator_snapshot", {})
@@ -112,24 +121,26 @@ def _algo_analyze(
             signals.append("MACD死叉")
 
         if rsi_value < 30:
-            indicator_score += 10
-            signals.append(f"RSI超卖({rsi_value:.0f})")
+            indicator_score += 10 * _mr_long_mult
+            signals.append(f"RSI超卖({rsi_value:.0f})"
+                           + ("，空头排列反弹分折半" if _mr_long_mult < 1 else ""))
         elif rsi_value > 70:
-            indicator_score -= 10
-            signals.append(f"RSI超买({rsi_value:.0f})")
+            indicator_score -= 10 * _mr_short_mult
+            signals.append(f"RSI超买({rsi_value:.0f})"
+                           + ("，多头排列回调分折半" if _mr_short_mult < 1 else ""))
 
         if kdj_j < 20:
-            indicator_score += 5
+            indicator_score += 5 * _mr_long_mult
         elif kdj_j > 80:
-            indicator_score -= 5
+            indicator_score -= 5 * _mr_short_mult
 
         if isinstance(boll_pos, (int, float)):
             if boll_pos >= 80:
-                indicator_score -= 5
+                indicator_score -= 5 * _mr_short_mult
             elif boll_pos <= 20:
-                indicator_score += 5
+                indicator_score += 5 * _mr_long_mult
 
-        indicator_score = max(0, min(100, indicator_score))
+        indicator_score = int(round(max(0, min(100, indicator_score))))
         macd_label = "金叉" if macd_has_golden else ("死叉" if macd_has_death else "中性")
         factors.append({"name": "指标", "value": f"MACD:{macd_label} RSI:{rsi_value:.0f}", "score": indicator_score})
     else:
@@ -208,12 +219,13 @@ def _algo_analyze(
         _pr = chip.get("profit_ratio", 0.5)
         profit_ratio = (_pr * 100.0) if _pr is not None and _pr <= 1.0 else float(_pr or 0)
         if profit_ratio > 80:
-            chip_score -= 10
+            chip_score -= 10 * _mr_short_mult
             signals.append(f"获利盘{profit_ratio:.0f}%，抛压风险")
         elif profit_ratio < 20:
-            chip_score += 10
-            signals.append(f"获利盘{profit_ratio:.0f}%，超跌")
-        chip_score = max(0, min(100, chip_score))
+            chip_score += 10 * _mr_long_mult
+            signals.append(f"获利盘{profit_ratio:.0f}%，超跌"
+                           + ("，空头排列反弹分折半" if _mr_long_mult < 1 else ""))
+        chip_score = int(round(max(0, min(100, chip_score))))
         factors.append({"name": "筹码",
                         "value": f"获利{profit_ratio:.0f}%"
                                  + (f" 集中度{concentration}" if concentration else ""),
@@ -281,6 +293,18 @@ def _algo_analyze(
     else:
         direction = "neutral"
 
+    # 趋势一致性守卫（2026-10-22）：均线排列与结论反向时降为 neutral——
+    # 「超跌反弹」分表达反弹概率不构成趋势反转，防止 score=69/bullish 与
+    # ma_alignment=弱势空头 同时出现在同一份输出里自相矛盾。
+    if direction == "bullish" and "空头" in ma_align:
+        direction = "neutral"
+        # 插到首位：signal 摘要只留前 5 条，降级原因必须可见（它解释了
+        # 为什么 score≥60 而 direction=neutral，不是可省略的补充说明）
+        signals.insert(0, "均线空头排列，看多降级为中性（反弹≠反转）")
+    elif direction == "bearish" and "多头" in ma_align:
+        direction = "neutral"
+        signals.insert(0, "均线多头排列，看空降级为中性（回调≠反转）")
+
     # ── A1c 校准命中率（score→P(方向正确)）──
     # 有校准数据用 calibration.apply，无则 None（输出标 n/a）。
     # 置信度优先用 hit_rate 区间映射（>0.6 high / 0.4-0.6 medium / <0.4 low），
@@ -331,6 +355,10 @@ def _algo_analyze(
 
     # ── A4 可证伪条件（若 X 发生则本判断失效）──
     # 基于实际 MA/RSI 数据生成，数据缺失时降级为 score 阈值条件。
+    # ⚠️ 条件必须是**尚未发生**的事件（2026-10-22）：早期写法把当前值塞进
+    # 括号（"RSI(26)跌破30"/"MA5(34.95)跌破MA20(38.49)"），条件早已触发，
+    # 输出被指出自相矛盾。已触发方向 → 换成「修复落空」形态的未来事件；
+    # 括号里的数字统一标注为当前值，避免被误读成阈值/周期。
     ma5 = trend_raw.get("ma5") if isinstance(trend_raw, dict) else None
     ma20 = trend_raw.get("ma20") if isinstance(trend_raw, dict) else None
     rsi_val = None
@@ -345,18 +373,30 @@ def _algo_analyze(
     falsifiable = []
     if direction == "bullish":
         if ma5 and ma20:
-            falsifiable.append(f"MA5({ma5:.2f})跌破MA20({ma20:.2f})")
+            if ma5 >= ma20:
+                falsifiable.append(f"MA5跌破MA20（当前MA5 {ma5:.2f} ≥ MA20 {ma20:.2f}）")
+            else:
+                falsifiable.append(f"MA5修复失败、无法上穿MA20（当前MA5 {ma5:.2f} < MA20 {ma20:.2f}）")
         if isinstance(rsi_val, (int, float)):
-            falsifiable.append(f"RSI({rsi_val:.0f})跌破30")
-        falsifiable.append(f"综合分({final_score:.0f})跌破55")
+            if rsi_val > 30:
+                falsifiable.append(f"RSI6跌破30（当前{rsi_val:.0f}）")
+            else:
+                falsifiable.append(f"RSI6超卖反弹落空、继续下探（当前{rsi_val:.0f}）")
+        falsifiable.append(f"综合分跌破55（当前{final_score:.0f}）")
     elif direction == "bearish":
         if ma5 and ma20:
-            falsifiable.append(f"MA5({ma5:.2f})突破MA20({ma20:.2f})")
+            if ma5 <= ma20:
+                falsifiable.append(f"MA5突破MA20（当前MA5 {ma5:.2f} ≤ MA20 {ma20:.2f}）")
+            else:
+                falsifiable.append(f"MA5反弹失败、无法下穿MA20（当前MA5 {ma5:.2f} > MA20 {ma20:.2f}）")
         if isinstance(rsi_val, (int, float)):
-            falsifiable.append(f"RSI({rsi_val:.0f})突破70")
-        falsifiable.append(f"综合分({final_score:.0f})突破45")
+            if rsi_val < 70:
+                falsifiable.append(f"RSI6突破70（当前{rsi_val:.0f}）")
+            else:
+                falsifiable.append(f"RSI6超买回落夭折、续创新高（当前{rsi_val:.0f}）")
+        falsifiable.append(f"综合分突破45（当前{final_score:.0f}）")
     else:
-        falsifiable.append(f"综合分({final_score:.0f})突破60或跌破40")
+        falsifiable.append(f"综合分突破60或跌破40（当前{final_score:.0f}）")
     falsifiable_conditions = "；".join(falsifiable) if falsifiable else "数据不足，无法生成可证伪条件"
 
     # ── 派生字段（中间结果直出，2026-09-27 工具归组化 §3.6）──

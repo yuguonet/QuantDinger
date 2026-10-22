@@ -292,7 +292,11 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
         #   就是把明细当账本翻）。窗口不足的档位**不给键**（不回落 0）。
         try:
             from ._analysis_utils import _kline_summary
-            summaries[raw] = _kline_summary(rows)
+            # 2026-10-22：透传 timeframe/末根时间戳 —— 量比盘中归一化只对日线生效，
+            # 且要判「末根是否今天」（分钟线/周线语义不同，见 volume_ratio_summary）。
+            summaries[raw] = _kline_summary(
+                rows, timeframe=timeframe,
+                last_bar_ts=(klines[-1].get("time") if klines else None))
         except Exception as e:
             logger.debug("[agent_get_kline] summary 失败(fail-open) %s: %s",
                          type(e).__name__, e)

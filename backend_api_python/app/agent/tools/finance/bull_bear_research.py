@@ -514,9 +514,18 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
             avg_vol_5 = sum(volumes[-5:]) / 5
             avg_vol_20 = sum(volumes) / len(volumes)
 
-            volume_ratio = _safe_round(latest_vol / avg_vol_5, 2) if avg_vol_5 else 0
+            # 量比统一走 volume_ratio_summary（2026-10-22）：盘中末根未走完，
+            # 裸除 5 日全天均量会系统性低估（实测 0.227 vs 归一化后约 1.27）。
+            from ._analysis_utils import volume_ratio_summary
+            _vs = volume_ratio_summary(volumes,
+                                      last_bar_date=data.get("last_date"),
+                                      last_bar_ts=data.get("last_ts"))
+            volume_ratio = _safe_round(_vs["vol_ratio"], 2) if _vs.get("vol_ratio") is not None else None
 
-            if volume_ratio > 2.0:
+            if volume_ratio is None:
+                status = "量比未知"
+                meaning = "完整日线不足5根，量比不可算"
+            elif volume_ratio > 2.0:
                 status = "显著放量"
                 meaning = "放量，需结合价格方向判断"
             elif volume_ratio > 1.5:
@@ -539,7 +548,7 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
                 vol_trend = "上升" if recent_avg > earlier_avg * 1.1 else ("下降" if recent_avg < earlier_avg * 0.9 else "平稳")
 
             vol_price_relation = "数据不足"
-            if len(closes) >= 2 and latest_vol > 0:
+            if len(closes) >= 2 and latest_vol > 0 and volume_ratio is not None:
                 price_change = closes[-1] - closes[-2]
                 # 分支判定统一走 _analysis_utils.classify_vol_price（阈值口径唯一）；
                 # 本工具用警惕口径标签（缩量上涨带「需警惕」），逐字保留历史文案
@@ -759,10 +768,14 @@ def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
             if "error" not in kdj:
                 result["kdj"] = kdj
 
-            if len(data["volume"]) >= 5:
-                vol = data["volume"][-1]
-                avg5 = sum(data["volume"][-5:]) / 5
-                result["volume_ratio"] = _safe_round(vol / avg5, 2) if avg5 else 0
+            if data["volume"]:
+                # 量比统一走 volume_ratio_summary（2026-10-22，口径同上）
+                from ._analysis_utils import volume_ratio_summary
+                _vs = volume_ratio_summary(data["volume"],
+                                          last_bar_date=data.get("last_date"),
+                                          last_bar_ts=data.get("last_ts"))
+                if _vs.get("vol_ratio") is not None:
+                    result["volume_ratio"] = _safe_round(_vs["vol_ratio"], 2)
 
             return result
         except Exception as e:
