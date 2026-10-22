@@ -59,11 +59,11 @@ def get_index_quote(codes: Union[str, List[str]] = "", scope: str = "single",
     s = (scope or "single").strip().lower()
     if s == "indices":
         # 惰性 import：data_tools 与本模块同域，避免模块级环形 import 风险
-        from .data_tools import get_market_indices
-        return get_market_indices()
+        from .data_tools import _get_market_indices
+        return _get_market_indices()
     if s == "etf":
-        from .data_tools import get_index_etf_quote
-        raw = get_index_etf_quote(
+        from .data_tools import _get_index_etf_quote
+        raw = _get_index_etf_quote(
             codes if isinstance(codes, str) else ",".join(codes))
         if not isinstance(raw, dict) or "error" in raw:
             return raw

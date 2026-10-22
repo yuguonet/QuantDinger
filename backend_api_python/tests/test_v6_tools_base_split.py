@@ -63,7 +63,7 @@ def test_base_is_thin_now() -> None:
 
 @pytest.mark.parametrize("name", [
     "Tool", "ToolResult", "ToolProvider", "func_to_openai_schema",
-    "as_code_envelope", "TOOL_ALIAS", "_SUPERSEDED_BY_MERGE",
+    "as_code_envelope",
     "_MUST_HAVE",
     "_TOOL_MODULE_IMPORT_FAILURES", "_is_tool_function",
 ])
@@ -91,14 +91,35 @@ def test_import_failure_registry_is_identical_object() -> None:
     assert tools_base._TOOL_MODULE_IMPORT_FAILURES is tools_provider._TOOL_MODULE_IMPORT_FAILURES
 
 
-def test_superseded_set_is_identical_object() -> None:
-    """`_SUPERSEDED_BY_MERGE` 同理：聚合摘除表必须是同一实例。"""
-    assert tools_base._SUPERSEDED_BY_MERGE is tools_provider._SUPERSEDED_BY_MERGE
+def test_superseded_list_must_not_come_back() -> None:
+    """`_SUPERSEDED_BY_MERGE` 名单已整体删除（2026-10-22 AP.8），不得回流。
+
+    ★ AP.8 零名单改造：18 个被聚合的旧工具实现已降级为 `_` 前缀私有函数，
+    天然退出 scan_directory 自发现——不再需要任何函数级屏蔽名单。
+    若有人把 `_SUPERSEDED_BY_MERGE`（或同类名单）加回来，这里立刻红。
+    """
+    assert not hasattr(tools_base, "_SUPERSEDED_BY_MERGE"), \
+        "tools._base 里 _SUPERSEDED_BY_MERGE 回流了（AP.8 已删除）"
+    assert not hasattr(tools_provider, "_SUPERSEDED_BY_MERGE"), \
+        "tools._provider 里 _SUPERSEDED_BY_MERGE 回流了（AP.8 已删除）"
 
 
-def test_tool_alias_is_identical_object() -> None:
-    """`TOOL_ALIAS` 被 chain/evaluator 用于权重迁移，必须是同一实例（否则迁移失效）。"""
-    assert tools_base.TOOL_ALIAS is tools_provider.TOOL_ALIAS
+def test_tool_weight_migration_must_not_come_back() -> None:
+    """`TOOL_WEIGHT_MIGRATION` 映射表已整体删除（2026-10-22 用户裁定），不得回流。
+
+    ★ 原 `TOOL_ALIAS`（工具归并的权重迁移表：18 个旧工具名 → 新工具名）经调查：
+      - 数据库实测 `qd_agent_weights(layer='tool')` 旧工具名行 = 0，映射表空转从未命中；
+      - 唯一程序化消费方 chain/evaluator 已改为对「工具面已消失的旧名行」直接 DELETE。
+    若有人把映射表（或同类别名/迁移表）加回来，这里立刻红。
+    """
+    assert not hasattr(tools_base, "TOOL_WEIGHT_MIGRATION"), \
+        "tools._base 里 TOOL_WEIGHT_MIGRATION 回流了（2026-10-22 已删除）"
+    assert not hasattr(tools_provider, "TOOL_WEIGHT_MIGRATION"), \
+        "tools._provider 里 TOOL_WEIGHT_MIGRATION 回流了（2026-10-22 已删除）"
+    assert not hasattr(tools_base, "TOOL_ALIAS"), \
+        "tools._base 里 TOOL_ALIAS 回流了（2026-10-22 已删除）"
+    assert not hasattr(tools_provider, "TOOL_ALIAS"), \
+        "tools._provider 里 TOOL_ALIAS 回流了（2026-10-22 已删除）"
 
 
 # ── 4. 非工具模块靠「下划线前缀」退出扫描（目录即契约，零名单）─────────
@@ -332,30 +353,29 @@ def test_meta_table_separate_from_registry() -> None:
 
 
 def test_superseded_tools_not_registered() -> None:
-    """`_SUPERSEDED_BY_MERGE` 里的函数被摘出注册面（实现保留给技能层 import）。"""
+    """归组旧工具以 `_` 前缀私有化后**天然不进注册面**（零名单，AP.8）。
+
+    ★ 原测试（2026-10-22 改写）：此前靠 `_SUPERSEDED_BY_MERGE` 名单摘除，AP.8
+    已整体删除名单，机制改为「`_` 前缀私有函数天然退出 scan_directory」。
+    测试意图不变：归组旧工具不得进注册表、公开同名函数必须照常注册。
+    """
     mod = type(sys)("finance.fake_tools")
 
-    def legacy():
-        """已被聚合取代的旧工具。"""
-    legacy.__module__ = "finance.fake_tools"
-    mod.legacy = legacy
+    def _legacy():
+        """已被聚合取代的旧工具（`_` 前缀 = 私有，天然退出注册）。"""
+    _legacy.__module__ = "finance.fake_tools"
+    mod._legacy = _legacy
 
     p = tools_provider.ToolProvider()
-    # key 拼法必须与 `_register_module_functions` 一致：
-    #   _mod_key = ".".join(module.__name__.split(".")[-2:]) ⇒ "finance.fake_tools"
-    #   再拼 ":<函数名>"
     mod.__name__ = "finance.fake_tools"
-    key = "finance.fake_tools:legacy"
-    orig = tools_provider._SUPERSEDED_BY_MERGE
-    try:
-        tools_provider._SUPERSEDED_BY_MERGE = orig | {key}
-        p._register_module_functions(mod, domain="finance")
-        assert "legacy" not in p.get_functions(), "已归组的旧工具不得进注册表"
+    p._register_module_functions(mod, domain="finance")
+    assert "_legacy" not in p.get_functions(), "`_` 前缀旧工具不得进注册表（零名单）"
 
-        # 摘除必须**只认完整 key**：换个模块就不该命中（防跨模块同名误伤）
-        tools_provider._SUPERSEDED_BY_MERGE = orig
-        p2 = tools_provider.ToolProvider()
-        p2._register_module_functions(mod, domain="finance")
-        assert "legacy" in p2.get_functions(), "未登记的同名函数必须照常注册"
-    finally:
-        tools_provider._SUPERSEDED_BY_MERGE = orig
+    # 反向：公开同名函数必须照常注册（`_` 前缀是唯一判据，不误伤公开函数）
+    def legacy():
+        """同名公开函数照常注册。"""
+    legacy.__module__ = "finance.fake_tools"
+    mod.legacy = legacy
+    p2 = tools_provider.ToolProvider()
+    p2._register_module_functions(mod, domain="finance")
+    assert "legacy" in p2.get_functions(), "公开同名函数必须照常注册"

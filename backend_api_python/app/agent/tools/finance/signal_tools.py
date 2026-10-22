@@ -132,7 +132,7 @@ def get_hot_stocks_with_reason(date: str = "") -> dict:
 # 概念板块归属
 # ══════════════════════════════════════════════════════════════
 
-def get_stock_concept_blocks(codes: str) -> dict:
+def _get_stock_concept_blocks(codes: str) -> dict:
     """个股概念归属：返回股票所属的行业板块和概念板块列表。
 
     Returns:
@@ -180,7 +180,7 @@ def get_stock_concept_blocks(codes: str) -> dict:
                 "concept_tags": [b["name"] for b in boards],
             }
         except Exception as e:
-            logger.warning("get_stock_concept_blocks(%s) failed: %s", code, e)
+            logger.warning("_get_stock_concept_blocks(%s) failed: %s", code, e)
             return {"stock_code": code, "error": str(e)}
 
     return _batch_execute(_one, code_list)
@@ -251,7 +251,7 @@ def get_lockup_expiry(codes: str, forward_days: int = 90) -> dict:
 # 行业排名
 # ══════════════════════════════════════════════════════════════
 
-def get_industry_ranking(top_n: int = 20) -> dict:
+def _get_industry_ranking(top_n: int = 20) -> dict:
     """行业涨跌幅排名：返回当日各行业板块涨跌幅、领涨股、成交额排名。
 
     数据源：market_cn.hot_sectors（东财 + 新浪双源）
@@ -267,13 +267,13 @@ def get_industry_ranking(top_n: int = 20) -> dict:
         data = _get(limit=top_n)
         return {"top": data[:top_n], "total": len(data)}
     except Exception as e:
-        logger.warning("get_industry_ranking failed: %s", e)
+        logger.warning("_get_industry_ranking failed: %s", e)
         return {"error": str(e)}
 # ══════════════════════════════════════════════════════════════
 # 龙虎榜详情
 # ══════════════════════════════════════════════════════════════
 
-def get_dragon_tiger_detail(codes: str, look_back_days: int = 30) -> dict:
+def _get_dragon_tiger_detail(codes: str, look_back_days: int = 30) -> dict:
     """龙虎榜详情：返回个股上榜日期、买卖席位明细、机构/游资动向。
 
     Returns:

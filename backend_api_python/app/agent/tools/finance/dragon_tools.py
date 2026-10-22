@@ -66,9 +66,9 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
     if not detail:
         return base
 
-    # detail=True：逐股追加 seats/institution（委托原 get_dragon_tiger_detail 实现，
+    # detail=True：逐股追加 seats/institution（委托 _get_dragon_tiger_detail 实现，
     # 不自算第三份；单股等价性 = 原工具单股返回的 seats/institution 子集）
-    from .signal_tools import get_dragon_tiger_detail as _detail
+    from .signal_tools import _get_dragon_tiger_detail as _detail
     data = base.get("data") if isinstance(base, dict) else None
     if not isinstance(data, dict):
         return base

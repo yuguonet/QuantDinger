@@ -84,9 +84,9 @@ def test_realtime_quote_schema_promises_only_real_fields():
         assert phantom not in head, (
             f"描述首段仍承诺「{phantom}」，但实现不返回（旧承诺 2026-10-17 已移除）")
     assert "get_stock_info" in desc, "撤掉承诺必须同时给出路（要这口径去哪个工具）"
-    # 指路必须指对：量比在 get_volume_analysis，不在 get_order_book
+    # 指路必须指对：量比在 technical_analysis（量价维聚合），不在 get_order_book
     # （修 A 类时一度指错——指错=制造新幻觉，性质与原 bug 同级）
-    assert "get_volume_analysis" in desc and "get_order_book（量比）" not in desc
+    assert "technical_analysis" in desc and "get_order_book（量比）" not in desc
 
 
 def test_order_book_schema_promises_only_real_fields():

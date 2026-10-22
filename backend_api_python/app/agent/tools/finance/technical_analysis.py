@@ -3,7 +3,7 @@
 
 本文件只暴露 technical_analysis() 作为标准 tool。
 内部辅助函数（_call_tools / _algo_analyze）以下划线开头，不注册。
-具体的分析工具（analyze_trend 等）在 analysis_tools.py 中定义。
+具体的分析工具（_analyze_trend 等）在 analysis_tools.py 中定义。
 """
 from __future__ import annotations
 
@@ -12,23 +12,23 @@ from typing import Any, Dict, List
 def _call_tools(stock_code: str) -> Dict[str, Any]:
     """调用 analysis_tools 中的分析算法（同包内规范实现，非工具包装层）+ basicinfo，返回结果字典。
 
-    说明：analyze_trend 等是 tools/finance 包内的规范实现本身（其底层 _fetch_ohlcv/_calc_* 在
+    说明：_analyze_trend 等是 tools/finance 包内的规范实现本身（其底层 _fetch_ohlcv/_calc_* 在
     _analysis_utils），这里同包复用属正常库调用、二者都会被扫描注册，不构成"外部层偷用工具包装层"。
     唯一被替换为底层调用的是实时行情：get_realtime_quote 工具即 _get_ds().get_tickers 的封装，
     已改为直接走数据源，不再 import 工具包装层。
     """
     from app.utils.basicinfo_db import get_stock_basic_db
     from .analysis_tools import (
-        analyze_trend, get_indicator_snapshot, get_volume_analysis,
+        _analyze_trend, _get_indicator_snapshot, _get_volume_analysis,
         analyze_pattern, get_chip_distribution,
     )
     from ._analysis_utils import _get_ds
 
     results = {}
     for name, fn in [
-        ("analyze_trend", lambda: analyze_trend(stock_code)),
-        ("get_indicator_snapshot", lambda: get_indicator_snapshot(stock_code)),
-        ("get_volume_analysis", lambda: get_volume_analysis(stock_code)),
+        ("analyze_trend", lambda: _analyze_trend(stock_code)),
+        ("get_indicator_snapshot", lambda: _get_indicator_snapshot(stock_code)),
+        ("get_volume_analysis", lambda: _get_volume_analysis(stock_code)),
         ("analyze_pattern", lambda: analyze_pattern(stock_code)),
         ("get_chip_distribution", lambda: get_chip_distribution(stock_code)),
     ]:
@@ -151,7 +151,7 @@ def _algo_analyze(
     volume_score = 50
     if isinstance(volume, dict) and "error" not in volume:
         vol_ratio = volume.get("volume_ratio", 1.0)
-        # ⚠️ 生产者 `get_volume_analysis` **不返回** `turnover_rate`
+        # ⚠️ 生产者 `_get_volume_analysis` **不返回** `turnover_rate`
         # （其返回键见 analysis_tools.py:1190 docstring：stock_code/latest_volume/
         # avg_volume_5d/avg_volume_20d/volume_ratio/volume_status/volume_trend/
         # vol_price_relation/is_intraday）⇒ 早期写法恒取到 0，
@@ -365,7 +365,7 @@ def _algo_analyze(
     if isinstance(indicator_raw, dict):
         rsi_dict = indicator_raw.get("rsi", {})
         if isinstance(rsi_dict, dict):
-            # ⚠️ 键名对齐生产者：get_indicator_snapshot 的 rsi 子结构给的是
+            # ⚠️ 键名对齐生产者：_get_indicator_snapshot 的 rsi 子结构给的是
             # rsi6/rsi12/rsi24（本文件 :99 取 rsi6 即据此）。早期按 "rsi"/"value"
             # 取恒 None ⇒ 可证伪条件里的 RSI 分支从未生成。
             rsi_val = (rsi_dict.get("rsi6") or rsi_dict.get("rsi")
@@ -401,10 +401,10 @@ def _algo_analyze(
 
     # ── 派生字段（中间结果直出，2026-09-27 工具归组化 §3.6）──
     # 口径以本块为唯一真源（纯由已取回的工具结果推导，不新增数据拉取）：
-    #   ma_alignment: 均线排列，【透传】analyze_trend 的既有结论（7 档：强多头排列/
+    #   ma_alignment: 均线排列，【透传】_analyze_trend 的既有结论（7 档：强多头排列/
     #     多头排列/弱势多头/强空头排列/空头排列/弱势空头/均线缠绕/震荡），缺失 → None。
     #     ⚠️ 禁止在此自算第二份排列：2026-09-27 曾产出 4 档劣化副本 ma_arrangement，
-    #     与 analyze_trend 的 ma_alignment 语义重叠且信息量更少（2026-09-27 用户定案删除）。
+    #     与 _analyze_trend 的 ma_alignment 语义重叠且信息量更少（2026-09-27 用户定案删除）。
     #   vol_price_divergence: 量价背离 = 价升量缩（vol_price_relation 含"缩量上涨"）；
     #     数据不足 → None（勿把 None 当 False，三态语义）
     #   trend_strength_grade: 趋势因子分分级（trend_score ≥65 强 / ≤35 弱 / 其余 中）
@@ -425,7 +425,7 @@ def _algo_analyze(
         "direction": direction,
         "confidence": confidence,
         # 评分模型自证（2026-10-17）：六维加权（趋势/指标/量价/形态/筹码/流通盘），
-        # 其中「趋势」维取自 analyze_trend 的复合共振分；与 bull_bear_research 的
+        # 其中「趋势」维取自 _analyze_trend 的复合共振分；与 bull_bear_research 的
         # 五维加权（score_model=bb5_weighted(...)）是两套口径，引用须带身份。
         "score_model": "tech6_weighted(趋势/指标/量价/形态/筹码/流通盘)",
         "signal": signal,
@@ -448,18 +448,18 @@ def _algo_analyze(
         "bias_ma20": trend_raw.get("bias_ma20") if isinstance(trend_raw, dict) else None,
         "rsi": indicator_raw.get("rsi", {}) if isinstance(indicator_raw, dict) else {},
         # 派生字段（中间结果直出，2026-09-27）——模型不再自己算排列/背离/强度
-        # ma_alignment 为 analyze_trend 原值透传（非空即 7 档之一，见上）
+        # ma_alignment 为 _analyze_trend 原值透传（非空即 7 档之一，见上）
         "ma_alignment": ma_alignment,
         "vol_price_divergence": vol_price_divergence,
         "trend_strength_grade": trend_strength_grade,
     }
     return _r
 def technical_analysis(codes: str) -> dict:
-    """技术面综合评分：聚合趋势/指标/量价/形态/筹码/流通盘六维分析，加权输出 0-100 分。需要单股深度分析时用此工具，不要同时调 analyze_trend。
+    """技术面综合评分：聚合趋势/指标/量价/形态/筹码/流通盘六维分析，加权输出 0-100 分。需要单股深度分析时用此工具。
 
     ⚠️ 评分口径：本分数是**六维加权**（趋势/指标/量价/形态/筹码/
     流通盘，输出 `score_model=tech6_weighted(...)`），其中「趋势」维取自
-    analyze_trend 的复合共振分。与 `bull_bear_research` 的五维加权
+    复合共振分析。与 `bull_bear_research` 的五维加权
     （`score_model=bb5_weighted(...)`）**是两套不同模型**，同股给出不同分
     属设计使然，不得互相当作同一指标对比或对冲。
 

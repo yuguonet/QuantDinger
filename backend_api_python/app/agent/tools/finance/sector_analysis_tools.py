@@ -160,7 +160,7 @@ def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
     except Exception as e:
         logger.warning("get_hot_sectors failed: %s", e)
         return {"error": str(e)}
-def get_sector_trend_analysis(board_type: str = "industry") -> dict:
+def _get_sector_trend_analysis(board_type: str = "industry") -> dict:
     """板块趋势：返回近1月涨跌趋势、6个月周期位置、今日预测信号。
 
     Returns:
@@ -173,9 +173,9 @@ def get_sector_trend_analysis(board_type: str = "industry") -> dict:
         from app.market_cn.china_market import get_sector_trend as _get
         return _get(board_type=board_type)
     except Exception as e:
-        logger.warning("get_sector_trend_analysis failed: %s", e)
+        logger.warning("_get_sector_trend_analysis failed: %s", e)
         return {"error": str(e)}
-def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dict:
+def _get_sector_history_data(board_type: str = "industry", days: int = 30) -> dict:
     """板块历史排名：返回板块近N天的每日涨跌幅排名变化。
 
     Returns:
@@ -189,7 +189,7 @@ def get_sector_history_data(board_type: str = "industry", days: int = 30) -> dic
         from app.market_cn.china_market import get_sector_history as _get
         return _get(board_type=board_type, days=days)
     except Exception as e:
-        logger.warning("get_sector_history_data failed: %s", e)
+        logger.warning("_get_sector_history_data failed: %s", e)
         return {"error": str(e)}
 def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
                      board_type: str = "industry", days: int = 30,
@@ -214,12 +214,12 @@ def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
     """
     v = (view or "ranking").strip().lower()
     if v == "ranking":
-        from .signal_tools import get_industry_ranking
-        return get_industry_ranking(top_n=top_n)
+        from .signal_tools import _get_industry_ranking
+        return _get_industry_ranking(top_n=top_n)
     if v == "history":
-        return get_sector_history_data(board_type=board_type, days=days)
+        return _get_sector_history_data(board_type=board_type, days=days)
     if v == "trend":
-        return get_sector_trend_analysis(board_type=board_type)
+        return _get_sector_trend_analysis(board_type=board_type)
     return {"error": f"view 无效: {view!r}，可选 ranking|history|trend（热门板块用 get_hot_sectors）",
             "retriable": False}
 
@@ -227,7 +227,7 @@ def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
 def get_stock_sector_info(codes: str) -> dict:
     """从本地数据库查询股票所属行业和概念（单股/多股同一入口，逗号分隔即可）。
 
-    与 agent_get_kline / get_stock_concept_blocks 同构：多股一次调用拿全，
+    与 agent_get_kline 同构：多股一次调用拿全，
     概念归属只发【一次】批量请求后按代码分发（逐票拉取会把本工具
     的纯本地快查询拖成 N 次外部 HTTP）。
 
@@ -237,8 +237,8 @@ def get_stock_sector_info(codes: str) -> dict:
         参数非法 → {"error", "retriable"}。
         单股dict: {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?,
         boards?: [{name,code,change_pct,lead_stock}], concept_tags?: [...]}。
-        boards/concept_tags 为概念归属富化（合并 get_stock_concept_blocks，
-        行情类板块字段），源拉取失败时显式给 concept_error，不静默丢字段。
+        boards/concept_tags 为概念归属富化（行情类板块字段），
+        源拉取失败时显式给 concept_error，不静默丢字段。
 
     Args:
         codes: 股票代码，多股用逗号分隔（上限 20）
@@ -247,11 +247,11 @@ def get_stock_sector_info(codes: str) -> dict:
     if not code_list:
         return {"error": "codes 不能为空", "retriable": False}
 
-    # 概念归属富化：一次批量拉取后分发（委托原 get_stock_concept_blocks，不自算第三份）
+    # 概念归属富化：一次批量拉取后分发（委托 _get_stock_concept_blocks，不自算第三份）
     concept_map: Dict[str, dict] = {}
     concept_error_all = ""
     try:
-        from .signal_tools import get_stock_concept_blocks as _concept
+        from .signal_tools import _get_stock_concept_blocks as _concept
         cb_all = _concept(",".join(code_list))
         if isinstance(cb_all, dict):
             if "error" in cb_all and not cb_all.get("data"):

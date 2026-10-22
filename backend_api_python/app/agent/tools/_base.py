@@ -22,11 +22,14 @@
   再统一换成直连新模块。
 
 ★⚠ 最重要的 re-export 约束：可变共享状态必须是**同一个对象**
-  `_TOOL_MODULE_IMPORT_FAILURES`（list）、`_SUPERSEDED_BY_MERGE`（frozenset）、
-  `TOOL_ALIAS`（dict）一律用 `from ._provider import X` 原样引用，**绝不重建**。
-  否则登记与读取落到两个对象 ⇒ 导入失败登记表永远为空 ⇒ 工具面悄悄缺一大块而
-  无人知（历史事故：工具面从 101 掉到 91，能力层补位掩盖缺口）。
+  `_TOOL_MODULE_IMPORT_FAILURES`（list）一律用 `from ._provider import X` 原样引用，
+  **绝不重建**。否则登记与读取落到两个对象 ⇒ 导入失败登记表永远为空 ⇒ 工具面
+  悄悄缺一大块而无人知（历史事故：工具面从 101 掉到 91，能力层补位掩盖缺口）。
   `tests/test_v6_tools_base_split.py` 用 `is` 断言守着这一点。
+  （`_SUPERSEDED_BY_MERGE` 名单已于 2026-10-22 AP.8 整体删除，不再 re-export。）
+  （`TOOL_WEIGHT_MIGRATION` 映射表已于 2026-10-22 用户裁定整体删除：数据库实测
+    `qd_agent_weights(layer='tool')` 旧工具名行 = 0，映射表空转从未命中；evaluator
+    对旧名行直接 DELETE。不再 re-export。）
 
 设计原则：
   - 一个注册表，一次扫描，两种输出（函数 + schema）
@@ -67,13 +70,12 @@ from ._schema_gen import (  # noqa: F401
 )
 
 # ── 注册表（tools/_provider.py）──────────────────────────────────────────
-# ⚠ 下面这批**必须原样引用**：_TOOL_MODULE_IMPORT_FAILURES 是可变 list，
-#   _SUPERSEDED_BY_MERGE / TOOL_ALIAS 是可变映射，重建即静默失效（详见文件头）。
+# ⚠ 下面这批**必须原样引用**：`_TOOL_MODULE_IMPORT_FAILURES` 是可变 list，
+#   重建即静默失效（详见文件头）。
+#   （`_SUPERSEDED_BY_MERGE` 名单已于 2026-10-22 AP.8 整体删除，不再 re-export。）
 from ._provider import (  # noqa: F401
     _MUST_HAVE,
-    _SUPERSEDED_BY_MERGE,
     _TOOL_MODULE_IMPORT_FAILURES,
-    TOOL_ALIAS,
     ToolProvider,
 )
 
@@ -200,7 +202,7 @@ __all__ = [
     "Tool", "ToolResult", "as_code_envelope",
     # re-export（保持历史导入面）
     "ToolProvider", "func_to_openai_schema",
-    "TOOL_ALIAS", "_SUPERSEDED_BY_MERGE", "_MUST_HAVE",
+    "_MUST_HAVE",
     "_TOOL_MODULE_IMPORT_FAILURES", "_is_tool_function",
     "_serialize", "_to_tsv", "_strip_nulls",
 ]

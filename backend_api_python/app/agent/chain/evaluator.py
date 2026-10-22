@@ -508,7 +508,7 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
 
     stats = {"synced": 0, "skill_updated": 0, "factor_updated": 0, "factor_cleaned": 0,
              "tool_updated": 0, "tool_synced": 0, "tool_cleaned": 0, "skill_cleaned": 0,
-             "tool_migrated": 0, "chain_updated": 0}
+             "chain_updated": 0}
     since = date.today() - timedelta(days=days)
     today = date.today()
 
@@ -569,40 +569,10 @@ def update_weights(days: int = 90) -> Dict[str, Any]:
                     """, (name,))
                     stats["tool_synced"] += 1
                 for name in sorted(existing_tools - live_tools):
-                    # 工具归并的权重迁移（2026-09-27）：旧名→新名，样本量加权并入后再删旧行，
-                    # 避免 EvalNode 历史学习被冷启动清零。多旧名并入同新名时逐个累加。
-                    from ..tools._base import TOOL_ALIAS
-                    target = TOOL_ALIAS.get(name)
-                    if target and target in live_tools:
-                        cur.execute("""
-                            SELECT weight, win_rate, sample_count FROM qd_agent_weights
-                            WHERE layer = 'tool' AND name = %s
-                        """, (name,))
-                        old = cur.fetchone()
-                        cur.execute("""
-                            SELECT weight, win_rate, sample_count FROM qd_agent_weights
-                            WHERE layer = 'tool' AND name = %s
-                        """, (target,))
-                        new = cur.fetchone()
-                        if old and new:
-                            n_old = int(old.get("sample_count") or 0)
-                            n_new = int(new.get("sample_count") or 0)
-                            n_all = n_old + n_new
-                            if n_old > 0 and n_all > 0:
-                                w = ((old.get("weight") or 1.0) * n_old
-                                     + (new.get("weight") or 1.0) * n_new) / n_all
-                                wr_old, wr_new = old.get("win_rate"), new.get("win_rate")
-                                wr = (wr_old * n_old + wr_new * n_new) / n_all \
-                                    if wr_old is not None and wr_new is not None else None
-                                cur.execute("""
-                                    UPDATE qd_agent_weights
-                                    SET weight = %s, win_rate = COALESCE(%s, win_rate),
-                                        sample_count = %s, last_updated = NOW()
-                                    WHERE layer = 'tool' AND name = %s
-                                """, (w, wr, n_all, target))
-                                stats["tool_migrated"] += 1
-                                logger.info("[Evaluator] 工具权重迁移: %s → %s（样本 %d+%d）",
-                                            name, target, n_old, n_new)
+                    # ★ 2026-10-22 用户裁定：工具归并的权重迁移表（TOOL_ALIAS /
+                    #   TOOL_WEIGHT_MIGRATION）已整体删除。数据库实测旧工具名行 = 0，
+                    #   映射表空转从未命中；对「工具面已消失的旧名行」直接 DELETE。
+                    #   未来工具归并时，旧名权重行由人工一次性 UPDATE 改名。
                     cur.execute("DELETE FROM qd_agent_weights WHERE layer = 'tool' AND name = %s", (name,))
                     stats["tool_cleaned"] += 1
                     logger.info("[Evaluator] 已删除工具，权重行清理: %s", name)

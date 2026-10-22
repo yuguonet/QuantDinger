@@ -70,94 +70,20 @@ _MUST_HAVE = {"web_search_tools"}
 #   ⇒ 工具模块导入失败再也不会被发现。
 _TOOL_MODULE_IMPORT_FAILURES: list = []
 
-# 已被聚合工具取代：实现保留（技能/内部仍可 import、能力层仍可让位判定），
-# 但不再注册为工具面。key 用**去顶层包前缀**的 "<子目录>.<模块名>:<func>"
-# （如 finance.fund_flow_tools:get_market_fund_flow），只保留子目录+模块名即可避免
-# 跨模块同名误伤。
-#
-# ⚠ 绝不要把顶层包前缀（`tools.` / `app.agent.tools.`）写进 key：模块的 __name__
-# 取决于导入口径（裸名 vs 全名），一旦两者不一致，本表**永不命中** ⇒ 聚合摘除
-# 静默失效、废弃工具重新混进工具面。2026-10-02 回退裸名时才暴露：全名周期内
-# `tools.finance.*` 恒不匹配，20 个已归组的旧工具一直在面里，而 smoke 的词典自检
-# 反倒因它们"存在"而通过。故此处与 `_register_module_functions` 的 key 拼法
-# 必须与导入口径无关。
-#
-# 【为什么只摘注册不删实现】（工具归组化方案 §4，2026-09-27）：
-#   ① 技能层直接 import 这些函数（market-screener/common.py 等），删实现会断链；
-#   ② 能力层同名让位机制依赖"包装函数存在"做语义对比（loader.py 先注册者胜出）；
-#   ③ 归组的目的是缩注入面，不是抹掉代码。
-# 【易错点】摘名后能力层会**自动补位**（loader.py:170 既定行为）。凡同名让位项
-#   （get_fund_flow_daily/get_sector_fund_flow/get_hot_sectors/get_index_kline）
-#   不得进本表——否则包装被摘、能力薄实现出静默接管，语义降级无人知（P0 定案）。
-_SUPERSEDED_BY_MERGE = frozenset({
-    # ★ 2026-10-22 AP.7：旧 5 个发现动词（list_tools/search_tools/list_skills/
-    #   list_capabilities/search_capabilities）已随 tools/tool_discovery.py、
-    #   tools/skill_tools.py、tools/capability_tools.py 三文件合并而**物理删除**，
-    #   实现并入 tools/resource_catalog.py 成为 `_` 前缀内部接口（统一口数据源），
-    #   不再需要本表登记摘除（`_` 前缀天然退出 scan_directory 自发现）。
-    #   执行层动词（activate_tools/read_skill/run_skill/call_capability）合并至
-    #   tools/exec_tools.py，仍随扫描自动注册进工具面。
-    # 资金流 → get_fund_flow(scope=...)（P0 保留 get_fund_flow_daily/get_sector_fund_flow）
-    "finance.fund_flow_tools:get_market_fund_flow",
-    "finance.fund_flow_tools:get_concept_fund_flow",
-    # 指数行情 → get_index_quote(scope=...)（P0 保留 get_index_kline）
-    "finance.data_tools:get_market_indices",
-    "finance.data_tools:get_index_etf_quote",
-    # 情报 → search_intel(scope=...)
-    "finance.news_search_tools:search_stock_intel",
-    "finance.news_search_tools:search_sector_intel",
-    "finance.news_search_tools:search_policy_intel",
-    "finance.news_search_tools:search_comprehensive_intel",
-    # 龙虎榜 → get_dragon_tiger(detail=...)；板块 → get_sector_board(view=...)
-    "finance.signal_tools:get_dragon_tiger_detail",
-    "finance.signal_tools:get_industry_ranking",
-    "finance.signal_tools:get_stock_concept_blocks",
-    "finance.sector_analysis_tools:get_sector_trend_analysis",
-    "finance.sector_analysis_tools:get_sector_history_data",
-    # 技术分析 → technical_analysis（实现保留供技能 import）
-    "finance.analysis_tools:analyze_trend",
-    "finance.analysis_tools:get_indicator_snapshot",
-    "finance.analysis_tools:get_volume_analysis",
-    "finance.analysis_tools:get_obv_analysis",
-    "finance.analysis_tools:calculate_ma",
-    # 指标策略模块（finance.indicator_tools）已整体下线：其 list_indicators /
-    # run_indicator_signal / get_indicator_params / indicator_analysis 不再注册，
-    # 故此处不再登记摘除项（module 不在扫描树，登记亦永不命中）。
-    # ★ 2026-10-19 用户裁定（附录 AN·分支 A：保留恢复）：indicator_tools.py 与
-    #   backtest_tools.py 于 2026-10-18 17:02 恢复（旧版原样回填，用户确认有意），
-    #   两模块现**在扫描树内**（零名单规则只按 `_` 前缀跳过），上述 4+2 个工具
-    #   **已在工具面内**（49→55，附录 AN）。本段"下线/不在扫描树"为 10-16 退休
-    #   决定的历史陈述，已被裁定推翻；摘名项保持不登记（= 工具保留在面）。
-    #   后续评估（未定时）：6 个恢复工具与 agent_* / technical_analysis 替代件的
-    #   去留——重新摘名 or 域词典纳管，见附录 AN §5 后续清单。
-})
+# 【零名单纪律·2026-10-22 AP.8】tools/ 目录（含子目录）**全部自发现**，不再有
+# 任何"模块级/函数级屏蔽名单"。旧工具归组化（2026-09-27）中被聚合工具取代的
+# 18 个实现（get_market_fund_flow/search_stock_intel/analyze_trend 等）已降级为
+# `_` 前缀私有函数（_get_market_fund_flow/_search_stock_intel/_analyze_trend 等），
+# 天然退出 scan_directory 自发现；其公开入口由 get_fund_flow/search_intel/
+# technical_analysis 等统一工具承接。能力层同名让位判定继续依赖这些私有实现
+# 存在（loader.py 先注册者胜出），故实现保留、仅不注册。
+# 历史沿革（indicator_tools/backtest_tools 下线与恢复，附录 AN）见 AGENT_DESIGN_v3.md。
 
-# 工具更名/归并的权重迁移表（旧名 → 新名）：chain/evaluator 同步权重表时，
-# 把旧名的 win_rate/sample_count 按样本量加权并入新名，再删旧行，
-# 避免 EvalNode 历史学习成果被冷启动清零（2026-09-27 工具归组化）。
-# 多旧名并入同新名时逐个迁移累加。
-TOOL_ALIAS: Dict[str, str] = {
-    "get_market_fund_flow": "get_fund_flow",
-    "get_concept_fund_flow": "get_fund_flow",
-    "get_market_indices": "get_index_quote",
-    "get_index_etf_quote": "get_index_quote",
-    "search_stock_intel": "search_intel",
-    "search_sector_intel": "search_intel",
-    "search_policy_intel": "search_intel",
-    "search_comprehensive_intel": "search_intel",
-    "get_dragon_tiger_detail": "get_dragon_tiger",
-    "get_industry_ranking": "get_sector_board",
-    "get_sector_trend_analysis": "get_sector_board",
-    "get_sector_history_data": "get_sector_board",
-    "get_stock_concept_blocks": "get_stock_sector_info",
-    "analyze_trend": "technical_analysis",
-    "get_indicator_snapshot": "technical_analysis",
-    "get_volume_analysis": "technical_analysis",
-    "get_obv_analysis": "technical_analysis",
-    "calculate_ma": "technical_analysis",
-    # 指标策略模块已下线：不再映射 get_indicator_params / indicator_analysis
-    # （旧名行由 evaluator 的"已删除工具"分支直接清理，无历史权重可迁移）。
-}
+# ★ 工具归并的权重迁移表已整体删除（2026-10-22 用户裁定）。
+#   原 `TOOL_ALIAS` / `TOOL_WEIGHT_MIGRATION` 映射（18 个旧工具名 → 新工具名）不再维护：
+#   - 数据库实测 `qd_agent_weights(layer='tool')` 旧工具名行 = 0，映射表空转从未命中；
+#   - evaluator 对「工具面已消失的旧名行」直接 DELETE 清理，不做权重迁移；
+#   - 未来工具归并时，旧名权重行由人工一次性 UPDATE 改名，不靠常驻映射表。
 
 
 class ToolProvider:
@@ -330,18 +256,10 @@ class ToolProvider:
     def _register_module_functions(self, module, domain: str):
         """扫描模块公开函数并注册（判据见 schema_gen._is_tool_function）。
 
-        聚合摘除（`_SUPERSEDED_BY_MERGE`）判定**只在本处**、不在 `_is_tool_function`：
-        后者被注册表与元工具表共用（2026-09-21 判据漂移事故），塞聚合语义会污染另一处。
+        零名单（2026-10-22 AP.8）：本方法不再有任何名单判定——`_is_tool_function`
+        是唯一判据（`_` 前缀函数天然不注册），tools/ 目录（含子目录）全部自发现。
         """
-        mod_name = getattr(module, "__name__", "")
-        # key 只取「子目录.模块名」，抹掉顶层包前缀（tools. / app.agent.tools.），
-        # 使判定与导入口径无关（详见 _SUPERSEDED_BY_MERGE 头部注释）
-        _mod_key = ".".join(mod_name.split(".")[-2:])
         for attr_name in dir(module):
-            if f"{_mod_key}:{attr_name}" in _SUPERSEDED_BY_MERGE:
-                logger.debug("[ToolProvider] %s:%s 已被聚合工具取代，摘除注册（实现保留）",
-                             mod_name, attr_name)
-                continue
             obj = getattr(module, attr_name)
             if not _is_tool_function(obj, module):
                 continue

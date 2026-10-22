@@ -433,12 +433,12 @@ def _today_str() -> str:
 # 旧路径 app.agent.tools.screener_tools 不存在，导致整个 run.py 导入失败
 # （_load_skill_functions 静默返回 []，skill 工具全部不注入沙箱 → 模型调用被幻觉拦截）。
 from ...tools.finance.screener_tools import search_stocks
-from ...tools.finance.analysis_tools import get_indicator_snapshot
+from ...tools.finance.analysis_tools import _get_indicator_snapshot
 from app.market_cn.tape import get_fund_flow_realtime
 
 _TOOL_REGISTRY = {
     "get_fund_flow_realtime": get_fund_flow_realtime,
-    "get_indicator_snapshot": get_indicator_snapshot,
+    "get_indicator_snapshot": _get_indicator_snapshot,
     "search_stocks": search_stocks,
 }
 def call_tool(name: str, **kwargs) -> Any:

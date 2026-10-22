@@ -93,10 +93,11 @@ __all__ = [
 #
 # 关键词要用**用户会怎么写**的词（问法），不是工具的字段名。
 #
-# ⚠️ 归组后的旧工具名**不得出现在候选里**：它们已被 `_SUPERSEDED_BY_MERGE` 摘出
+# ⚠️ 归组后的旧工具名**不得出现在候选里**：它们已 `_` 前缀私有化，天然退出
 # 注册表（如 analyze_trend → technical_analysis、search_stock_intel → search_intel），
 # 写旧名 = 补位补出一个不存在的名字、白跑一轮且静默。改名一律查
-# `tools/_base.py::TOOL_ALIAS`（旧名 → 新名的权威映射），不要凭印象写。
+# AGENT_DESIGN_v3.md 附录 AP.8 的旧名→新名对照（原 TOOL_ALIAS /
+# TOOL_WEIGHT_MIGRATION 映射表已删除，2026-10-22 用户裁定），不要凭印象写。
 DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("quote", ("行情", "现价", "报价", "涨跌", "涨幅", "跌幅", "价格", "收盘", "实时",
                "quote", "最新"),

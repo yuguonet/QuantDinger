@@ -7,7 +7,7 @@ r"""V17：趋势评分**双模型身份标识**守卫（2026-10-17）。
   数据，两个工具给出矛盾结论，最终报告把矛盾误诊为"多空因子对冲"。
   根因**不是**某一方算错，而是两套评分模型输出**同名键 `trend_score` 却无
   身份标识**，下游无法区分口径：
-    · analysis_tools.analyze_trend   → 复合共振模型（多指标加权+共振过滤+
+    · analysis_tools._analyze_trend   → 复合共振模型（多指标加权+共振过滤+
       背离+量能，trend_composite）
     · bull_bear_research._analyze_trend → 五维加权模型（ma/macd/rsi/boll/kdj
       × _BB_DEFAULT_WEIGHTS，校准命名空间 bull_bear_research，bb5_weighted）
@@ -69,7 +69,7 @@ def _patched_ohlcv(monkeypatch):
 def test_both_models_self_identify_and_differ(_patched_ohlcv):
     """① 两个模型都必须带 score_model 且取值不同（身份标识不丢）。"""
     analysis_tools, bull_bear_research = _patched_ohlcv
-    a = analysis_tools.analyze_trend("600519")
+    a = analysis_tools._analyze_trend("600519")
     b = bull_bear_research._analyze_trend("600519")
 
     assert "error" not in a, f"canonical 模型异常: {a}"
@@ -85,7 +85,7 @@ def test_both_models_self_identify_and_differ(_patched_ohlcv):
 def test_models_both_produce_scores(_patched_ohlcv):
     """③ 合成数据下两边都能正常出分（0-100，含五维/复合各自的关键键）。"""
     analysis_tools, bull_bear_research = _patched_ohlcv
-    a = analysis_tools.analyze_trend("600519")
+    a = analysis_tools._analyze_trend("600519")
     b = bull_bear_research._analyze_trend("600519")
 
     for name, r in (("canonical", a), ("bb5", b)):
@@ -98,7 +98,7 @@ def test_models_both_produce_scores(_patched_ohlcv):
 
 
 def test_bb_not_delegated_to_canonical():
-    """② bull_bear_research 不得被改成转调 analysis_tools.analyze_trend
+    """② bull_bear_research 不得被改成转调 analysis_tools._analyze_trend
     （"好心统一"会静默删掉五维校准模型 = 降智，必须 consciously 决策）。"""
     tree = ast.parse(_BB_PATH.read_text(encoding="utf-8"))
     calls = [
@@ -109,12 +109,21 @@ def test_bb_not_delegated_to_canonical():
         n.func.attr for n in ast.walk(tree)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
     ]
+    imports = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            imports.extend(a.name for a in n.names)
+        elif isinstance(n, ast.Import):
+            imports.extend(a.name for a in n.names)
     assert "analyze_trend" not in calls, (
         "bull_bear_research 出现了对裸名 analyze_trend 的调用——若这是"
         "「统一到 canonical」的改造，请先读 test_v9_factor_weight_keys_20261014.py "
         "与禁止降智红线：五维加权 + bull_bear_research 校准命名空间必须保留")
     assert "analyze_trend" not in attrs, (
         "bull_bear_research 出现了对 analysis_tools.analyze_trend 的属性调用"
+        "（转调化），同样受上一条约束")
+    assert "_analyze_trend" not in imports, (
+        "bull_bear_research 出现了对 analysis_tools._analyze_trend 的导入"
         "（转调化），同样受上一条约束")
 
 

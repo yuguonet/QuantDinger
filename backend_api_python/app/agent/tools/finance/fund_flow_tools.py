@@ -109,11 +109,11 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
                     one["资金趋势判定"] = _fund_flow_trend(one.get("data") or [])
         return out
     if s == "market":
-        return get_market_fund_flow()
+        return _get_market_fund_flow()
     if s == "sector":
         return _fund_flow_boards_view(get_sector_fund_flow(indicator))
     if s == "concept":
-        return _fund_flow_boards_view(get_concept_fund_flow(indicator))
+        return _fund_flow_boards_view(_get_concept_fund_flow(indicator))
     return {"error": f"scope 无效: {scope!r}，可选 stock|stock_daily|market|sector|concept",
             "retriable": False}
 def get_sector_fund_flow(indicator: str = "今日") -> dict:
@@ -132,7 +132,7 @@ def get_sector_fund_flow(indicator: str = "今日") -> dict:
     except Exception as e:
         logger.warning("get_sector_fund_flow failed: %s", e)
         return {"error": str(e)}
-def get_concept_fund_flow(indicator: str = "今日") -> dict:
+def _get_concept_fund_flow(indicator: str = "今日") -> dict:
     """概念资金流向：返回各概念板块主力资金净流入排名。
 
     Returns:
@@ -146,7 +146,7 @@ def get_concept_fund_flow(indicator: str = "今日") -> dict:
         data = _get(indicator=indicator, board_type="concept")
         return {"indicator": indicator, "count": len(data), "concepts": data}
     except Exception as e:
-        logger.warning("get_concept_fund_flow failed: %s", e)
+        logger.warning("_get_concept_fund_flow failed: %s", e)
         return {"error": str(e)}
 def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
@@ -185,7 +185,7 @@ def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
             return {"error": str(e)}
 
     return _batch_execute(_one, code_list)
-def get_market_fund_flow() -> dict:
+def _get_market_fund_flow() -> dict:
     """大盘资金流向：返回全市场主力/散户实时净流入金额。
 
     Returns:
@@ -195,7 +195,7 @@ def get_market_fund_flow() -> dict:
     try:
         return _get()
     except Exception as e:
-        logger.warning("get_market_fund_flow failed: %s", e)
+        logger.warning("_get_market_fund_flow failed: %s", e)
         return {"error": str(e)}
 # 2026-09-14 移除 `get_northbound_flow`：上游（同花顺 hexin 实时接口）已不可用，
 # 调用恒返回 {"error": ...}。留在工具面只会诱导模型反复试探、白烧步数与 token。

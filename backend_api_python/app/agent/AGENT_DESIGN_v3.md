@@ -696,7 +696,7 @@ run 级一次性 few-shot（CBR），填技能酿造的粒度空档。**增益�
 
 | 尺 | 管什么 | 产物 |
 |---|---|---|
-| `scripts/qd_smoke.py` | 回归（不调模型） | **259** 项断言（40 个 test 函数，**2026-10-22 实测 40 passed · 0 failed · 2 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「258 项」（258/260）、「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **259** 为准（口径演变见 §9；10-19 的 -1 来自 skill 阶段 5 的 test_39 改制：G 乘子五断言 → 摘除后四不变量；10-22 起 40 函数全过，见附录 AP.7） |
+| `scripts/qd_smoke.py` | 回归（不调模型） | **259** 项断言（40 个 test 函数，**2026-10-22 实测 40 passed · 0 failed · 0 skipped**）；`--with-env` 把环境缺件 fail→skip。⚠️ 旧记「258 项」（258/260）、「257 项」（255/257）、「256 项」「248 项」是更早时点的数，现以 **259** 为准（口径演变见 §9；10-19 的 -1 来自 skill 阶段 5 的 test_39 改制：G 乘子五断言 → 摘除后四不变量；10-22 起 40 函数全过，见附录 AP.7/AP.8） |
 | `scripts/qd_prompt_eval.py` + `prompt_tasks.yaml` | prompt 行为（真实端点） | 10 任务/35 断言，含规划 5 题 |
 | `scripts/qd_bench.py` + `bench_tasks.yaml` | 能力质量（C） | 25 题五类各 5；五维确定性打分 |
 | `scripts/qd_dispatch_ab.py` | 成本对照（B） | 分发 vs 不分发单变量 A/B；`--rejudge` 不重跑复核 |
@@ -1153,13 +1153,13 @@ JSONL 一行字段：`ts / session_id / job_id / strategy_key / carrier / overla
 | 项 | 实测 |
 |---|---|
 | `compileall app/ scripts/` | ✅ 通过 |
-| `qd_smoke.py` | ✅ **259 项**（40 个 test 函数）；**2026-10-22 实测 40 passed · 0 failed · 2 skipped**（259/261 断言口径）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259、2026-10-18 为 258/260、2026-10-19 为 257/259（test_39 改制 -1 断言，见附录 AM）、2026-10-22 为 40 passed（259/261，pytest 壳，见附录 AP/AP.7） |
+| `qd_smoke.py` | ✅ **259 项**（40 个 test 函数）；**2026-10-22 实测 40 passed · 0 failed · 0 skipped**（259/259 断言口径）。⚠️ 口径演变：P12 写「256 项」、附录 F C-14 写「256/254」、2026-10-13 晚 255/257、2026-10-17 为 257/259、2026-10-18 为 258/260、2026-10-19 为 257/259（test_39 改制 -1 断言，见附录 AM）、2026-10-22 为 40 passed（259/261，pytest 壳，见附录 AP/AP.7/AP.8） |
 | `qd_prompt_eval --validate` | ✅ 10 条任务 / 35 项断言；plan_* 断言 **17/19** |
 | `qd_bench` | 25 题；真实端点首跑 **71.7**（coverage 81.5 / grounding 86.8 / claims 38.0 / structure 62.6） |
 | `qd_dispatch_ab` | 首跑成本比 **0.889**（未达 0.40，见 D-18）、质量Δ +0.5 |
 | v5 单测（pytest） | **162 passed / 1 skipped**（**14 个** `test_v5_*.py`） |
-| 全量 `tests/` | ✅ **1628 passed / 4 skipped / 0 failed**（**2026-10-22 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ）→ **1374**（skill 阶段 3 Top-K，见附录 AK）→ **1408**（skill 阶段 4 反馈事件链，见附录 AL）→ **1423**（skill 阶段 5 软重排，见附录 AM）→ **1627**（v52 统一发现口 + 死代码清理/冗余收敛 + format_utils 移出同期增量，见附录 AP/AP.4）→ **1628**（旧 5 发现动词摘除后的守卫更新，见附录 AP.5）→ **1628**（工具三模块合并：执行层动词归并 + 旧 5 发现动词收拢为内部接口，见附录 AP.7；数字不变，结构收敛） |
-| 工具面 | 注册表 **93**（窄口径：工具 **53** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **8** / 按需 **85**。⚠️ 10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 用户补丁（新增 `get_price_stats`，有记录）；10-22 的 96 → 98 为 v52 统一发现口新增两个 common 工具（附录 AP2）；10-22 的 98 → 93 为旧 5 发现动词摘除（附录 AP.5）** |
+| 全量 `tests/` | ✅ **1627 passed / 4 skipped / 0 failed**（**2026-10-22 实测**，`pytest tests/ -q`；pytest.ini 已钉 `testpaths = tests`，裸 `pytest` 不会再递归进 `del/` 归档）。口径演变：716（2026-10-14 O-11）→ 1000+（2026-10-16 O1/O2）→ 1021（T7 接线 +21）→ 1045（skill 进预选 +16、契约修复 +8）→ 1102（批3 第一轮 F9/F10/F12/F13/F14/F17）→ 1135（批 4a/4b）→ 1169（批 4c F15/F16 +32、4c 收红 +2）→ 1184（批 4d F26 +15）→ 1241（批 4e：F18 qd_smoke 壳 44 + F19 qd_bench CLI 13）→ 1255（批 4f F21 blackbox 对照臂 +14）→ 1274（F22 A 口径对照 T1–T8 +19，见附录 AH）→ **1301**（EvalWorker 停摆自愈 B+C +27，见附录 AJ）→ **1374**（skill 阶段 3 Top-K，见附录 AK）→ **1408**（skill 阶段 4 反馈事件链，见附录 AL）→ **1423**（skill 阶段 5 软重排，见附录 AM）→ **1627**（v52 统一发现口 + 死代码清理/冗余收敛 + format_utils 移出同期增量，见附录 AP/AP.4）→ **1628**（旧 5 发现动词摘除后的守卫更新，见附录 AP.5）→ **1628**（工具三模块合并：执行层动词归并 + 旧 5 发现动词收拢为内部接口，见附录 AP.7；数字不变，结构收敛）→ **1627**（零名单改造：`test_v6_tools_base_split` 的 re-export 参数化用例移除 `_SUPERSEDED_BY_MERGE`，−1；见附录 AP.8） |
+| 工具面 | 注册表 **93**（窄口径：工具 **53** + 能力层 **40**；宽口径叠加 mimo 原生为 10-17 快照 **101**）；必注入 **8** / 按需 **85**。⚠️ 10-19 的 89 → 95 为附录 AN 无记录恢复事件（2026-10-19 用户裁定：保留恢复、正式登记）；**10-21 的 95 → 96 为附录 AO 用户补丁（新增 `get_price_stats`，有记录）；10-22 的 96 → 98 为 v52 统一发现口新增两个 common 工具（附录 AP2）；10-22 的 98 → 93 为旧 5 发现动词摘除（附录 AP.5）；10-22 的 AP.8 零名单改造不改数字（18 个旧工具函数 `_` 前缀私有化，本就不在注册表）** |
 | 技能 | **7** 个目录，其中可执行 **3** 个（`market-screener`/`strategy-debug`/`auto-backtest`） |
 | `formatters/` | 不在生产包内（已归档 `del/agent_formatters_20261001/`） |
 
@@ -3466,3 +3466,81 @@ qd_smoke（40 函数）**40 passed · 0 failed · 2 skipped**（259/261 断言�
 **纪律（防回退）**：非工具模块一律以 `_` 前缀命名退出 `scan_directory` 自发现，
 不得靠维护 `_SUPERSEDED_BY_MERGE` 名单硬拦；执行层动词与发现层内部接口的存放
 位置以本节为准（`exec_tools.py` / `resource_catalog.py`）。
+
+### AP.8 零名单改造：`_SUPERSEDED_BY_MERGE` 名单整体删除，旧工具改 `_` 前缀私有化（2026-10-22，用户裁定「tools 目录全部自发现，包括子目录」）
+
+> 触发：AP.7 后 `_SUPERSEDED_BY_MERGE` 仍含 18 个屏蔽项（2026-09-27 工具归组化的
+> 摘注册名单）。用户问「为什么有这么多屏蔽的」，经解释后裁定：**tools 目录下的
+> 内容应该全部是自发现的，包括子目录**——`_` 前缀退出扫描是唯一规则，任何
+> 模块级/函数级屏蔽名单都不该存在。
+> 实施：实现 agent（Claude），2026-10-22。
+
+**改造内容**：
+- **删除名单**：`tools/_provider.py` 的 `_SUPERSEDED_BY_MERGE` frozenset 常量（18
+  键 + 历史注释块）整体删除；`_register_module_functions` 中的名单判定逻辑
+  （`_mod_key` 拼装 + `continue` 跳过）删除。`_is_tool_function` 成为**唯一判据**。
+- **18 个旧工具函数改 `_` 前缀私有化**（实现保留、仅不注册，供技能层/能力层/
+  新工具内部 import）：
+  - `fund_flow_tools.py`：`get_market_fund_flow` / `get_concept_fund_flow` →
+    `_get_market_fund_flow` / `_get_concept_fund_flow`
+  - `data_tools.py`：`get_market_indices` / `get_index_etf_quote` →
+    `_get_market_indices` / `_get_index_etf_quote`
+  - `news_search_tools.py`：4 个 `search_*_intel` → `_search_*_intel`
+  - `signal_tools.py`：`get_stock_concept_blocks` / `get_industry_ranking` /
+    `get_dragon_tiger_detail` → `_` 前缀
+  - `sector_analysis_tools.py`：`get_sector_trend_analysis` /
+    `get_sector_history_data` → `_` 前缀
+  - `analysis_tools.py`：`analyze_trend` / `calculate_ma` /
+    `get_volume_analysis` / `get_indicator_snapshot` / `get_obv_analysis` →
+    `_` 前缀
+- **内部调用与外部 import 同步**：`technical_analysis` / `index_tools` /
+  `dragon_tools` / `bull_bear_research` / `sector_analysis_tools` /
+  `market-screener/common.py` 等改引 `_` 前缀实现；技能沙箱工具名
+  （`_TOOL_REGISTRY` 键）与内部数据契约键名（`tool_results.get("analyze_trend")`）
+  保持不动。
+- **re-export 清理**：`tools/_base.py` 文件头注释、import 列表、`__all__` 中的
+  `_SUPERSEDED_BY_MERGE` 删除。
+- **消费方注释同步**：`preselect/tool_preselect.py` 的「旧工具名被名单摘出」注释
+  改为「`_` 前缀私有化，天然退出」。
+- **测试守卫改写**：`tests/test_v6_tools_base_split.py`：
+  - `test_base_reexports_public_surface` 参数列表移除 `_SUPERSEDED_BY_MERGE`；
+  - `test_superseded_set_is_identical_object` → `test_superseded_list_must_not_come_back`
+    （断言常量不存在、名单不得回流）；
+  - `test_superseded_tools_not_registered` 从「往名单塞 key」改为「`_` 前缀函数
+    天然不进注册表 + 公开同名函数照常注册」的等价守卫。
+
+**关键设计点**：
+- `_` 前缀私有化后，18 个旧函数**彻底退出 schema 生成**——此前靠名单摘除、
+  现在靠命名判据，双保险且零同步成本。新工具（`get_fund_flow` /
+  `technical_analysis` / `search_intel` 等）公开入口不变。
+- 能力层同名让位判定（`loader.py` 先注册者胜出）继续依赖这些私有实现存在，
+  实现保留、仅不注册——与 AP.7 的「物理移出扫描树」互补。
+- 工具面总数 **93 不变**（18 个旧函数本就不在注册表；改名不改变注册表数字）。
+
+**机检探针基线同步**：
+- B7 全量 schema 55,363→**55,294**（−69）：18 个旧函数退出 schema 生成 + 多个
+  公开统一工具 docstring 旧名指路改为新名（`get_realtime_quote` 的
+  `get_volume_analysis`→`technical_analysis`、`get_stock_sector_info` 移除
+  `get_stock_concept_blocks` 引用等）的净效果。
+- B8 必注入 schema 3,567 **不变**（旧工具全在 finance 按需域，common/meta
+  docstring 未动）。
+- A 系列目录计数不变（无文件增删）。
+
+**验证（2026-10-22 实测）**：全量 pytest **1627 passed / 4 skipped / 0 failed**；
+qd_smoke（40 函数）**40 passed · 0 failed · 0 skipped**；设计机检探针
+**100 OK / 0 DRIFT**；`tools._base` / `tools._provider` 导入冒烟通过、
+re-export 同一实例（`_TOOL_MODULE_IMPORT_FAILURES`）保持。
+
+**纪律（防回退）**：tools/ 目录（含子目录）**全部自发现**，不维护任何模块级/
+函数级屏蔽名单。旧工具归组/下线一律走 `_` 前缀私有化，禁止新增
+`_SUPERSEDED_BY_MERGE` 类名单。
+
+**★ 工具归并权重迁移表已整体删除（2026-10-22 用户裁定）**：原 `TOOL_ALIAS` /
+`TOOL_WEIGHT_MIGRATION` 映射（18 个旧工具名 → 新工具名）不再维护。依据：
+- 数据库实测 `qd_agent_weights(layer='tool')` 旧工具名行 = **0**，映射表空转从未命中；
+- 唯一程序化消费方 `chain/evaluator` 的迁移分支已删除，对「工具面已消失的旧名行」
+  直接 DELETE 清理（`evaluator.py` 同步段）；
+- 未来工具归并时，旧名权重行由人工一次性 UPDATE 改名，不靠常驻映射表。
+同步清理：`tools/_base.py` 的 import / `__all__` / 注释、`tests/test_v6_tools_base_split.py`
+参数列表与守卫测试（改为 `test_tool_weight_migration_must_not_come_back`）、
+`preselect/tool_preselect.py` 注释（改名依据改指 AP.8 附录）。

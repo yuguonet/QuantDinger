@@ -15,7 +15,7 @@ from ...utils.md_format import _batch_execute, _to_md
 
 # ── 指数行情 / 市场概览 ──────────────────────────────────────
 
-def get_market_indices() -> dict:
+def _get_market_indices() -> dict:
     """指数行情：返回上证/深证/创业板/科创/北证五大指数的价格、涨跌幅、成交量。
 
     Returns:
@@ -27,7 +27,7 @@ def get_market_indices() -> dict:
         data = _get()
         return {"count": len(data), "indices": data}
     except Exception as e:
-        logger.warning("get_market_indices failed: %s", e)
+        logger.warning("_get_market_indices failed: %s", e)
         return {"error": str(e)}
 
 def get_market_overview() -> dict:
@@ -37,7 +37,7 @@ def get_market_overview() -> dict:
     死亡而非临时故障。日级历史（get_northbound_daily）不受影响。
 
     注意字段语义：up_count/down_count 是**两大指数（上证/深成）的涨跌抽样**，
-    不是全市场涨跌家数——全市场维度请用 get_market_indices 自行汇总。
+    不是全市场涨跌家数——全市场维度请用 get_index_quote(scope="indices") 汇总。
 
     Returns:
         dict: {up_count, down_count(两大指数抽样涨跌家数), emotion(0-100情绪),
@@ -127,7 +127,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     ⚠ **不含**换手率/量比/PE/PB/总市值（描述是唯一进 LLM 的契约，写了就等于教模型去承诺
     拿不到的数据）。要这些口径请用：
       · 换手率/PE/PB/总市值 → `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）
-      · 量比/量能 → `get_volume_analysis`
+      · 量比/量能 → `technical_analysis`（量价维聚合）
     """
     # 归一化：剥离市场后缀（.SZ/.SH）与市场前缀（sh/sz），与 get_tickers 的
     # symbol 键对齐（get_tickers 返回的 symbol 是纯代码，如 "300497"）。
@@ -662,7 +662,7 @@ def get_order_book(codes: str) -> dict:
 
 # ── 指数/ETF行情 ──────────────────────────────────────────────
 
-def get_index_etf_quote(codes: str) -> dict:
+def _get_index_etf_quote(codes: str) -> dict:
     """指数/ETF行情：返回价格、涨跌幅、成交量，支持上证/深证/创业板/沪深300及对应ETF。
 
     Returns:
@@ -701,7 +701,7 @@ def get_index_etf_quote(codes: str) -> dict:
         _r = {"total": len(results), "quotes": results}
         return _r
     except Exception as e:
-        logger.warning("get_index_etf_quote(%s) failed: %s", codes, e)
+        logger.warning("_get_index_etf_quote(%s) failed: %s", codes, e)
         return {"error": str(e)}
 
 # ── 批量估值对比 ──────────────────────────────────────────────

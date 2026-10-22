@@ -101,7 +101,7 @@ def _build_result(items: List[Dict[str, Any]], label: str) -> Dict[str, Any]:
         "count": len(merged),
         "news": merged,
     }
-def search_stock_intel(codes: str, name: str = "") -> dict:
+def _search_stock_intel(codes: str, name: str = "") -> dict:
     """个股情报搜索：返回指定股票的新闻、公告、研报列表及摘要。
 
     Returns:
@@ -130,7 +130,7 @@ def search_stock_intel(codes: str, name: str = "") -> dict:
         except Exception as e:
             results[code] = {"error": str(e)}
     return {"count": len(results), "data": results}
-def search_sector_intel(market: str = "CNStock") -> dict:
+def _search_sector_intel(market: str = "CNStock") -> dict:
     """板块情报搜索：返回指定板块的相关新闻和政策动态。
 
     Returns:
@@ -142,7 +142,7 @@ def search_sector_intel(market: str = "CNStock") -> dict:
     """
     items = _get_news(market, market)
     return _build_result(items, f"板块:{market}")
-def search_policy_intel(market: str = "CNStock") -> dict:
+def _search_policy_intel(market: str = "CNStock") -> dict:
     """政策情报搜索：返回最新财经政策、监管动态。
 
     Returns:
@@ -154,7 +154,7 @@ def search_policy_intel(market: str = "CNStock") -> dict:
     """
     items = _get_policy_from_cache()
     return _build_result(items, f"政策:{market}")
-def search_comprehensive_intel(codes: str, name: str = "") -> dict:
+def _search_comprehensive_intel(codes: str, name: str = "") -> dict:
     """综合情报：同时搜索个股新闻+板块动态+政策面，返回合并结果。
 
     Returns:
@@ -205,11 +205,11 @@ def search_intel(scope: str = "stock", codes: str = "", name: str = "",
     """
     s = (scope or "stock").strip().lower()
     if s == "stock":
-        return search_stock_intel(codes, name)
+        return _search_stock_intel(codes, name)
     if s == "sector":
-        return search_sector_intel(market)
+        return _search_sector_intel(market)
     if s == "policy":
-        return search_policy_intel(market)
+        return _search_policy_intel(market)
     if s == "all":
-        return search_comprehensive_intel(codes, name)
+        return _search_comprehensive_intel(codes, name)
     return {"error": f"scope 无效: {scope!r}，可选 stock|sector|policy|all", "retriable": False}

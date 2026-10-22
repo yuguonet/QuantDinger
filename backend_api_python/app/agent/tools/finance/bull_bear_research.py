@@ -14,7 +14,7 @@ from .analysis_tools import (
     _calc_boll, _calc_kdj, _calc_macd, _calc_rsi,
 )
 from .data_tools import get_realtime_quote
-from .news_search_tools import search_stock_intel, search_policy_intel
+from .news_search_tools import _search_stock_intel, _search_policy_intel
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
 
@@ -51,7 +51,7 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
         ("trend", lambda: _analyze_trend(codes)),
         ("volume", lambda: _get_volume_analysis(codes)),
         ("indicator", lambda: _get_indicator_snapshot(codes)),
-        ("intel", lambda: search_stock_intel(codes, stock_name or "")),
+        ("intel", lambda: _search_stock_intel(codes, stock_name or "")),
     ]:
         try:
             data[name] = fn()
@@ -263,9 +263,9 @@ def bull_bear_research(codes: str, stock_name: str = "") -> dict:
 
 def _analyze_trend(codes: str) -> Dict[str, Any]:
     """技术趋势（内部复用）：五维加权模型（ma/macd/rsi/boll/kdj × _BB_DEFAULT_WEIGHTS），
-    仅供 bull_bear_research 内部调用，外部请用 analyze_trend。
+    仅供 bull_bear_research 内部调用，外部技术面分析请用 technical_analysis。
 
-    ⚠️ 与 analysis_tools.analyze_trend 的关系（2026-10-17 澄清）：
+    ⚠️ 与 analysis_tools._analyze_trend 的关系（2026-10-17 澄清）：
     这不是"过期副本"，而是**独立评分模型** —— 五维加权、校准命名空间
     `bull_bear_research`（因子名 ma/macd/rsi/boll/kdj 与 _BB_DEFAULT_WEIGHTS
     同名，A1a 闭环靠此对齐，见 test_v9_factor_weight_keys_20261014.py）。

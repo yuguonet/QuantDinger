@@ -30,11 +30,11 @@ def _batch_run(code_list: List[str], one: Callable[[str], Dict[str, Any]],
       （与单股路径的错误形态一致——模型可读，且能区分「这只挂了」与「整批挂了」）；
     - 返回 {"count": len(results), "data": results}；
     - supplement(code, result) -> result：成功结果写入前的补充钩子
-      （get_indicator_snapshot 用它回填批量预取的盘中量比），在 try 内调用，
+      （_get_indicator_snapshot 用它回填批量预取的盘中量比），在 try 内调用，
       补充逻辑自身异常同样走单股隔离。
 
     收敛前 8 处各写一遍 for/try/except（10-19 审计 curated 重复 #1，收益最大）。
-    get_volume_analysis 原为无守卫循环，本次一并纳入统一契约：其 _one 已有
+    _get_volume_analysis 原为无守卫循环，本次一并纳入统一契约：其 _one 已有
     内部 try，外层守卫只对「内部 try 之外的意料位」生效——单股挂不再拖垮整批，
     与其余 7 站同契约（唯一行为差异，仅出现在意料外的异常路径）。
     """
@@ -735,7 +735,7 @@ def _detect_resonance(
 # Tool 函数（注册给 Agent 调用）
 # ═══════════════════════════════════════════════════════════════
 
-def analyze_trend(codes: str) -> Dict[str, Any]:
+def _analyze_trend(codes: str) -> Dict[str, Any]:
     """技术趋势综合分析：趋势类(MA/MACD/BOLL) + 动量类(RSI/KDJ) + 量能类(OBV/MFI/CMF) + 波动率(ATR/HV)。
 
     包含多指标共振检测、背离检测、均线收敛度、乖离率极值等高级信号。
@@ -1151,14 +1151,14 @@ def analyze_trend(codes: str) -> Dict[str, Any]:
                 "data_points": len(closes),
             }
         except Exception as e:
-            logger.error("analyze_trend(%s) failed: %s", stock_code, e)
+            logger.error("_analyze_trend(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
         return _one(code_list[0])
 
     return _batch_run(code_list, _one)
-def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
+def _calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
     """均线指标：返回多个周期均线的 MA 值、斜率和趋势方向。
 
     Returns:
@@ -1207,7 +1207,7 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
                     result[f"ma{p}_trend"] = "上行" if slope_pct > 0.05 else ("下行" if slope_pct < -0.05 else "走平")
             return result
         except Exception as e:
-            logger.error("calculate_ma(%s) failed: %s", stock_code, e)
+            logger.error("_calculate_ma(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -1215,7 +1215,7 @@ def calculate_ma(codes: str, periods: str = "5,10,20,60,120") -> Dict[str, Any]:
         return as_code_envelope(code_list[0], _one(code_list[0]))
 
     return _batch_run(code_list, _one)
-def get_volume_analysis(codes: str) -> Dict[str, Any]:
+def _get_volume_analysis(codes: str) -> Dict[str, Any]:
     """量能分析：返回量比、近5/20日均量与量能趋势（放量/缩量/平量）、量价关系。
 
     Returns:
@@ -1305,7 +1305,7 @@ def get_volume_analysis(codes: str) -> Dict[str, Any]:
                 "is_intraday": is_intraday,
             }
         except Exception as e:
-            logger.error("get_volume_analysis(%s) failed: %s", stock_code, e)
+            logger.error("_get_volume_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -1564,7 +1564,7 @@ def analyze_pattern(codes: str) -> Dict[str, Any]:
     return _batch_run(code_list, _one)
 # get_chip_distribution 已迁移至 chip_distribution.py
 from .chip_distribution import get_chip_distribution  # noqa: F401
-def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
+def _get_indicator_snapshot(codes: str) -> Dict[str, Any]:
     """指标快照：一次返回MACD/RSI/BOLL/KDJ/KD的最新数值和金叉/死叉/超买超卖状态。
 
     Returns:
@@ -1620,7 +1620,7 @@ def get_indicator_snapshot(codes: str) -> Dict[str, Any]:
 
             return result
         except Exception as e:
-            logger.error("get_indicator_snapshot(%s) failed: %s", stock_code, e)
+            logger.error("_get_indicator_snapshot(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
@@ -2048,7 +2048,7 @@ def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
 
     return _batch_run(code_list, _one)
 
-def get_obv_analysis(codes: str) -> Dict[str, Any]:
+def _get_obv_analysis(codes: str) -> Dict[str, Any]:
     """OBV（能量潮）量价分析：返回 OBV 值、趋势、与价格的背离检测。
 
     OBV 是累计成交量指标，价格上涨日加上成交量，价格下跌日减去成交量。
@@ -2107,7 +2107,7 @@ def get_obv_analysis(codes: str) -> Dict[str, Any]:
                 "vol_price_assessment": vol_price_assessment,
             }
         except Exception as e:
-            logger.error("get_obv_analysis(%s) failed: %s", stock_code, e)
+            logger.error("_get_obv_analysis(%s) failed: %s", stock_code, e)
             return {"error": str(e)}
 
     if len(code_list) == 1:
