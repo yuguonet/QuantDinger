@@ -105,16 +105,15 @@ def _merge_em_rows(rows: List[Dict[str, Any]], em_rows: List[Dict[str, Any]]) ->
 
 def get_hot_sectors(industry_limit: int = 15, concept_limit: int = 15) -> dict:
     """实时热门板块：返回行业+概念板块的涨跌幅排名、涨停家数、领涨股。
-
-    主源新浪（新浪优先、东财兜底）；东财仅作富化源，负责补 BK 板块代码与涨停家数。
-    东财不可用不影响主结果。
-
-    Returns:
-        dict: {timestamp, industry:[...], concept:[...], analysis:{}}。板块列表在 hs['industry']/hs['concept']（list，勿用 hs['data']）。
+    主源新浪（东财兜底/富化：补 BK 板块代码与涨停家数），东财不可用不影响主结果。
 
     Args:
         industry_limit: 行业板块数量，默认15
         concept_limit: 概念板块数量，默认15
+
+    Returns:
+        dict: {timestamp, industry:[...], concept:[...], analysis:{}}。
+        板块列表在 hs['industry']/hs['concept']（list，勿用 hs['data']）。
     """
     try:
         from app.market_cn.china_market import get_hot_sectors as _get
@@ -195,22 +194,20 @@ def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
                      board_type: str = "industry", days: int = 30,
                      top_n: int = 20) -> dict:
     """板块行情统一入口：板块涨跌排名、历史排名变化、趋势分析。
-
-    view: ranking=行业涨跌幅排名 | history=近N日排名变化 | trend=趋势+周期位置+预测信号
     ⚠️ 不含热门板块：热门板块一律用独立工具 get_hot_sectors（同名让位，
     双入口会让 planner 纠结选哪个）。
+
+    Args:
+        view: 视图，ranking=行业涨跌幅排名 | history=近N日排名变化
+              | trend=趋势+周期位置+预测信号
+        board_type: 板块类型，"industry"(行业) 或 "concept"(概念)（view=history/trend 用）
+        days: 历史天数（view=history 用），默认30
+        top_n: 条数上限（view=ranking 用），默认20
 
     Returns:
         view=ranking → {top:[{name,code,change_pct,lead_stock,limit_up_count,...}], total}。
         view=history → {code(1成功/0失败), msg, count, data:[每日排名行, ...]}。
-        view=trend → {code(1成功/0失败), msg, data:{趋势指标 dict}}。
-        失败 → {"error": "..."}。
-
-    Args:
-        view: 视图，ranking | history | trend（热门板块请用 get_hot_sectors）
-        board_type: 板块类型，"industry"(行业) 或 "concept"(概念)（view=history/trend 用）
-        days: 历史天数（view=history 用），默认30
-        top_n: 条数上限（view=ranking 用），默认20
+        view=trend → {code(1成功/0失败), msg, data:{趋势指标 dict}}。失败 → {"error": "..."}。
     """
     v = (view or "ranking").strip().lower()
     if v == "ranking":
@@ -224,24 +221,22 @@ def get_sector_board(view: Literal["ranking", "history", "trend"] = "ranking",
             "retriable": False}
 
 
+# 概念归属取数约定（2026-10-22 自 docstring 移出，注入瘦身）：概念归属只发【一次】
+# 批量请求后按代码分发（逐票拉取会把本工具的纯本地快查询拖成 N 次外部 HTTP）。
 def get_stock_sector_info(codes: str) -> dict:
     """从本地数据库查询股票所属行业和概念（单股/多股同一入口，逗号分隔即可）。
+    与 agent_get_kline 同构：多股一次调用拿全。
 
-    与 agent_get_kline 同构：多股一次调用拿全，
-    概念归属只发【一次】批量请求后按代码分发（逐票拉取会把本工具
-    的纯本地快查询拖成 N 次外部 HTTP）。
+    Args:
+        codes: 股票代码，多股用逗号分隔（上限 20）
 
     Returns:
         统一三键结构（单股/多股一致，勿按"单股扁平 dict"取数）：
-        {"count": N, "data": {代码: 单股dict}, "error": None}；
-        参数非法 → {"error", "retriable"}。
+        {"count": N, "data": {代码: 单股dict}, "error": None}；参数非法 → {"error", "retriable"}。
         单股dict: {stock_code, name?, industry?, concepts[]?, market_cn?, list_date?,
         boards?: [{name,code,change_pct,lead_stock}], concept_tags?: [...]}。
         boards/concept_tags 为概念归属富化（行情类板块字段），
         源拉取失败时显式给 concept_error，不静默丢字段。
-
-    Args:
-        codes: 股票代码，多股用逗号分隔（上限 20）
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:

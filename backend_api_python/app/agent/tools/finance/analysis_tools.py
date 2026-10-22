@@ -1349,13 +1349,13 @@ def _get_volume_analysis(codes: str) -> Dict[str, Any]:
 def analyze_pattern(codes: str) -> Dict[str, Any]:
     """K线形态识别：返回当日出现的形态信号（锤子线/十字星/吞没/三连阳等）及含义。
 
-    Returns:
-        dict: {stock_code, latest_candle(open/high/low/close), body_size,
-        upper_shadow, lower_shadow, patterns(list[str]), pattern_count}；
-        多代码→{count, data:{代码:上述}}；失败→{error}。
-
     Args:
         codes: 多股用逗号分隔
+
+    Returns:
+        dict: {stock_code, latest_candle(open/high/low/close), body_size, upper_shadow,
+        lower_shadow, patterns(list[str]), pattern_count}；
+        多代码→{count, data:{代码:上述}}；失败→{error}。
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -1809,16 +1809,15 @@ def _detect_chan_fractals(highs: List[float], lows: List[float],
 
 def analyze_chart_patterns(codes: str) -> Dict[str, Any]:
     """图表形态识别：头肩顶/底、双顶/双底、三角形、旗形、楔形、矩形、杯柄等经典形态。
+    基于枢轴点（局部极值）检测多K线结构性形态，一次调用完成取数与判定。
 
-    基于枢轴点（局部极值）检测，分析多K线构成的结构性形态；一次调用完成取数与判定。
+    Args:
+        codes: 多股用逗号分隔
 
     Returns:
         dict: {stock_code, latest_close, patterns(list[str]), pattern_count,
         pattern_score(0-100), direction(看多/看空/中性), signals(list)}；
         多代码→{count, data:{代码:上述}}；失败→{error}。
-
-    Args:
-        codes: 多股用逗号分隔
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -2116,11 +2115,11 @@ def _get_obv_analysis(codes: str) -> Dict[str, Any]:
     return _batch_run(code_list, _one)
 
 
+# 存在理由（2026-10-22 自 docstring 移出，注入瘦身）：实测「分析X股」任务里
+# 模型无工具可算波动带/持有胜率时会挤到 bash 自行算（155s+128s 墙钟）。
+# 本工具一次给出，避免 shell 代算。
 def get_price_stats(codes: str, days: int = 120) -> dict:
-    """价格统计：±σ 价格带 + T+N 历史胜率（经验分布，非预测）。
-
-    【为什么单独一个工具】实测「分析X股」任务里模型无工具可算波动带/持有胜率时
-    会挤到 bash 自行算（155s+128s 墙钟）。本工具一次给出，避免 shell 代算。
+    """价格统计：±σ 价格带 + T+N 历史胜率（经验分布，非预测）。一次给出波动带/持有胜率，避免模型自行用 shell 代算。
 
     Args:
         codes: 股票代码，逗号分隔支持批量
@@ -2128,9 +2127,8 @@ def get_price_stats(codes: str, days: int = 120) -> dict:
 
     Returns:
         单只 → {code, n_bars, close, mean, std, band_1sigma, band_2sigma,
-                t_plus_win_rates: {"T+1": {...}, "T+3": ..., "1W": ..., "1M": ...}}
-        多只 → {count, data: {code: {...}}}
-        t_plus_win_rates 为**历史经验频率**（样本内收盘更高的占比），不是预测概率。
+        t_plus_win_rates: {"T+1": {...}, "T+3", "1W", "1M"}}；多只 → {count, data: {code: {...}}}。
+        t_plus_win_rates 为历史经验频率（样本内收盘更高的占比），不是预测概率；
         字段缺失/数据不足时对应键为 null 或 error，不编造。
     """
     # T+N 交易日近似：T+1=1, T+3=3, 1W≈5, 1M≈21

@@ -197,20 +197,20 @@ def _format_chip_markdown(r: Dict[str, Any]) -> str:
     return '\n'.join(lines)
 
 
+# 算法（2026-10-22 自 docstring 移出，注入瘦身）：按日K线的 high/low 区间
+# 分配成交量到价格档位，用指数衰减加权（近期筹码权重更高）汇总各维度。
 def get_chip_distribution(codes: str, lookback_days: int = 60) -> Dict[str, Any]:
     """筹码分布：返回获利比例、平均成本、90%筹码集中度、套牢/获利盘比例。
-
-    从日K线计算筹码分布，不依赖数据源原生接口。算法：按日K线的 high/low 区间
-    分配成交量到价格档位，用指数衰减加权（近期筹码权重更高）汇总各维度。
+    从日K线计算，不依赖数据源原生接口（算法见代码旁注释）。
 
     Args:
         codes: 多股用逗号分隔（也兼容 search_stock 返回的 dict）
         lookback_days: 回看天数，默认 60
 
     Returns:
-        dict: {avg_cost, current_price, profit_ratio, loss_ratio, concentration_90/70
-        (含 lower/upper/width_pct), support_prices/resistance_prices, chip_peaks,
-        analyzed_days}；多代码 → {count, data:{代码: 上述}}；error=失败。
+        dict: {avg_cost, current_price, profit_ratio, loss_ratio,
+        concentration_90/70(含 lower/upper/width_pct), support_prices/resistance_prices,
+        chip_peaks, analyzed_days}；多代码 → {count, data:{代码: 上述}}；error=失败。
         输出为纯摘要（均价/获利比例/集中度/支撑阻力均为聚合值，末尾附筹码峰明细）。
     """
     # ── 默认窗口 60 的依据（2026-10-21 实测 600121）────────────────────────

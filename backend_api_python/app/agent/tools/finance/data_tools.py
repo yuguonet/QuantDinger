@@ -31,13 +31,11 @@ def _get_market_indices() -> dict:
         return {"error": str(e)}
 
 def get_market_overview() -> dict:
-    """市场概览：返回市场情绪指数、主力资金流向、指数涨跌概况。
+    """市场概览：市场情绪指数、主力资金流向、指数涨跌概况。不含北向资金字段（北向实时
+    披露已停，属数据源性死亡而非临时故障；日级历史 get_northbound_daily 不受影响）。
 
-    ⚠️ 不含北向资金字段：北向实时披露已停（上游接口数据源残缺），属数据源性
-    死亡而非临时故障。日级历史（get_northbound_daily）不受影响。
-
-    注意字段语义：up_count/down_count 是**两大指数（上证/深成）的涨跌抽样**，
-    不是全市场涨跌家数——全市场维度请用 get_index_quote(scope="indices") 汇总。
+    注意字段语义：up_count/down_count 是两大指数（上证/深成）的涨跌抽样，不是全市场
+    涨跌家数——全市场维度请用 get_index_quote(scope="indices") 汇总。
 
     Returns:
         dict: {up_count, down_count(两大指数抽样涨跌家数), emotion(0-100情绪),
@@ -110,6 +108,8 @@ def resolve_stock(keyword: str, market: str = "CNStock", limit: int = 10) -> Dic
         return {"error": str(e), "retriable": False}
 
 
+# volume 归一化细节（2026-10-22 自 docstring 移出，注入瘦身）：腾讯/搜狐/tdx
+# 原始为手已 ×100，新浪/同花顺/百度原生为股——六个 provider 出口已各自归一化为股。
 def get_realtime_quote(codes: str) -> Dict[str, Any]:
     """实时行情：最新价、涨跌幅、成交量、开高低收、名称、行情时间 + 涨跌停价。
 
@@ -121,11 +121,10 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
         "error": None}；行情dict 字段：{stock_code, last, changePercent, volume, name,
         high, low, open, previousClose, time, limit_up, limit_down}
         （limit_* 来自腾讯源增补，供涨跌停判定）；volume 单位见 volume_unit（恒 "股"，
-        六个 provider 出口已各自归一化为股——腾讯/搜狐/tdx 原始为手已×100，
-        新浪/同花顺/百度原生为股）；失败 → {"error": "...", "retriable": False}
+        六个 provider 出口已各自归一化为股）；失败 → {"error": "...", "retriable": False}
 
-    ⚠ **不含**换手率/量比/PE/PB/总市值（描述是唯一进 LLM 的契约，写了就等于教模型去承诺
-    拿不到的数据）。要这些口径请用：
+    ⚠ **不含**换手率/量比/PE/PB/总市值（描述是唯一进 LLM 的契约，写了就等于教模型去
+    承诺拿不到的数据）。要这些口径请用：
       · 换手率/PE/PB/总市值 → `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）
       · 量比/量能 → `technical_analysis`（量价维聚合）
     """
@@ -180,22 +179,20 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
 
 def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qfq") -> Dict[str, Any]:
     """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
+    ⚠ 仅在需要原始数据或自定义计算时调用（趋势/指标/形态/量价/筹码分析已内置取数）。
 
-    ⚠ 仅在需要原始数据或自定义计算时调用。趋势/指标/形态/量价/筹码分析已内置K线获取。
+    Args:
+        codes: 股票代码，字符串（如 "603466"）或代码列表，多股逗号分隔
+        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
+        days: 天数，默认 30，最大 250
+        adj: 复权口径 qfq(前复权,默认)/hfq(后复权)/none(不复权)。data 各 bar 含 adj 标注。
 
     Returns:
         {"count": N, "data": {代码: [{"t","o","h","l","c","v"}, ...]},
          "summary": {代码: {ma5/ma10/ma20/ma60/ma120, high_20d/low_20d(含日期),
          high_60d/low_60d, vol_ma5/vol_ratio, total_days}}}；
-        summary 是聚合摘要（窗口不足的档位**不给该键**），明细 data 仍全量返回；
-        失败 → {"error": "...", "retriable": bool}（error 键恒参与，成功时为 None）。
-        注意：无论单代码还是多代码，data 都是"代码 → K线列表"的映射，取单只用 data[codes]。
-
-    Args:
-        codes: 股票代码，字符串（如 "603466"）或代码列表均可，多股逗号分隔
-        timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
-        days: 天数，默认 30，最大 250
-        adj: 复权口径 qfq(前复权,默认)/hfq(后复权)/none(不复权)。返回 data 各 bar 含 adj 标注。
+        summary 是聚合摘要（窗口不足的档位**不给该键**）；data 恒为"代码→K线列表"映射，
+        取单只用 data[codes]；失败 → {"error": "...", "retriable": bool}（error 键恒参与）。
     """
     # codes 容错：模型可能传 list / list[tuple] / 数字 / 带前后缀串
     # ── days 默认 30 的依据（2026-10-21 实测；论证留此处不进 docstring：
@@ -327,19 +324,17 @@ def _filter_stock_info(info: Dict[str, Any], detail: bool = False) -> Dict[str, 
     return {k: v for k, v in info.items() if v is not None and k in _STOCK_INFO_CORE_FIELDS}
 
 def get_stock_info(codes: str, detail: bool = False) -> Dict[str, Any]:
-    """股票基本信息（精简模式，节省 token）。
-
-    默认返回核心字段：名称、行业、价格、PE/PB、市值、ROE、EPS、股本等。
-    数据量小，Agent 直接评估更靠谱，不出评分。
-    如需完整财务数据（利润表/资产负债表/现金流/股东/杜邦），设置 detail=true。
-
-    Returns:
-        单代码 → 扁平 dict（核心字段 name/price/pe_ratio/mcap_yi 等，detail=true 时50+字段）；
-        多代码 → {"count": N, "data": {代码: dict}}；失败 → {"error": ...}
+    """股票基本信息（精简模式，节省 token）：默认返回核心字段——名称、行业、价格、PE/PB、
+    市值、ROE、EPS、股本等。数据量小，Agent 直接评估更靠谱，不出评分。如需完整财务数据
+    （利润表/资产负债表/现金流/股东/杜邦），设置 detail=true。
 
     Args:
         codes: 多股用逗号分隔
         detail: false=精简（默认），true=完整（50+字段）
+
+    Returns:
+        单代码 → 扁平 dict（核心字段 name/price/pe_ratio/mcap_yi 等，detail=true 时
+        50+字段）；多代码 → {"count": N, "data": {代码: dict}}；失败 → {"error": ...}
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()][:20]
     if not code_list:
@@ -637,7 +632,8 @@ def get_order_book(codes: str) -> dict:
 
     Returns:
         统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
-        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{code, name, price, change_percent, bid, ask}，五档在 bid/ask。
+        "error": None}；单股结果字段：{code, name, price, change_percent, bid, ask}，
+        五档在 bid/ask；失败 → {"error": "...", "retriable": False}。
 
     Args:
         codes: 多股用逗号分隔
@@ -1039,30 +1035,29 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
 
     return summary
 
+# 换算教训（2026-10-22 自 docstring 移出，注入瘦身）：run8 换算对了却把单位名
+# 写成「万万元」——引用时取 _yi 键直接照抄，不要自己换算。
+# 换算教训（2026-10-22 自 docstring 移出，注入瘦身）：run8 换算对了却把单位名
+# 写成「万万元」——引用时取 _yi 键直接照抄，不要自己换算。
 def get_capital_summary(codes: str) -> dict:
     """基本面摘要：返回营收/利润增速、ROE、PE/PB估值、机构持仓变化等中长线指标。
-
     一次调用聚合融资融券、大宗交易、股东户数、分红送转、财报三表五大维度数据，
     并生成结构化摘要供中长线持仓决策参考。
 
     Returns:
         统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
-        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{"summary": {margin, block_trade, holders, dividend, financials,
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：
+        {"summary": {margin, block_trade, holders, dividend, financials,
         overall_signal(中长线偏多/偏空/中性)}}。
 
-    ⚠️ 单位口径（键名即单位，见名知口径）：
-        - margin：`rz_balance_wan`/`rq_balance_yi`（及 rq_ 同款）融资/融券余额，
-          **万元与亿元各一份**——引用时取 `_yi` 键直接照抄，不要自己换算
-          （run8：换算对了却把单位名写成「万万元」）
-        - financials：`revenue_wan`/`net_profit_wan`/`total_assets_wan`/
-          `total_liabilities_wan`/`equity_wan`/`cash_wan` 财报金额，**万元**
-          （附 `financial_unit:"万元"` 与 `report_date` 报告期）
-        - holders：`avg_hold_market_cap_rmb` 户均持股市值 **元**、
-          `avg_hold_num_shares` 户均持股 **股**
-        - dividend：`cum_bonus_per_10shares_rmb` 累计派息 **元/10股**
-          （附 `bonus_unit`）
-        上述口径**只适用于对应键**：价格（元）、派息（元/10股）等非 money
-        字段不得套用万元/亿元口径做倍数换算。
+    ⚠️ 单位口径（键名即单位，引用时取对应键直接照抄，不要自行换算）：
+        - margin: rz_balance_wan/rq_balance_wan（万元）与 rz_balance_yi/rq_balance_yi
+          （亿元）各一份；
+        - financials: revenue_wan/net_profit_wan/total_assets_wan/total_liabilities_wan/
+          equity_wan/cash_wan 财报金额**万元**（附 financial_unit:"万元" 与 report_date）；
+        - holders: avg_hold_market_cap_rmb 户均持股市值**元**、avg_hold_num_shares 户均持股**股**；
+        - dividend: cum_bonus_per_10shares_rmb 累计派息**元/10股**（附 bonus_unit）。
+        上述口径**只适用于对应键**：价格（元）等非 money 字段不得套用万元/亿元口径换算。
 
     Args:
         codes: 多股用逗号分隔

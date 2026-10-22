@@ -14,22 +14,21 @@ from ...utils.md_format import _batch_execute, _to_md
 def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
                      detail: bool = False) -> dict:
     """龙虎榜：返回上榜股票的买卖金额、上榜原因（涨幅/跌幅/换手异常等）、日期。
-
-    codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录。
+    codes 为空时返回全市场龙虎榜；非空时返回该股票的历史龙虎榜记录；
     detail=True 时展开席位明细。
-
-    Returns:
-        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
-        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：{stock_code, count, records:[...]}（records 含个股龙虎榜明细；
-        不传代码时 data 为日期汇总 {date, count, stocks:[...]}）。
-        detail=True 时单股结果追加 seats{buy,sell} 与 institution{}（席位与机构动向，
-        与单股返回同构）。
 
     Args:
         codes: 逗号分隔的股票代码（可选，空=全市场），如 "600519" 或 "600519,000001"
         date: 查询日期 YYYY-MM-DD，默认最近交易日
         days: 回溯天数，默认30
         detail: 是否展开席位/机构明细（仅单股模式生效；全市场模式忽略）
+
+    Returns:
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果},
+        "error": None}；失败 → {"error": "...", "retriable": False}。单股结果字段：
+        {stock_code, count, records:[...]}（records 含个股龙虎榜明细；不传代码时
+        data 为日期汇总 {date, count, stocks:[...]}）。detail=True 时单股结果追加
+        seats{buy,sell} 与 institution{}（席位与机构动向，与单股返回同构）。
     """
     def _one(stock_code: str) -> dict:
         from datetime import datetime, timedelta
@@ -119,7 +118,7 @@ def get_limit_pool(date: str = "", pool_type: str = "zt", min_continuous_days: i
 
     Returns:
         {"date": "YYYY-MM-DD", "zt": {"count": N, "stocks": [{code, name, ...}]}}
-        —— dict 结构， stocks 列表在二级键下（zt/dt/broken），不要对返回值直接切片/迭代；
+        —— stocks 列表在二级键下（zt/dt/broken），不要对返回值直接切片/迭代；
         无效 pool_type 或无数据时对应键缺失，取值前用 .get() 并判空。
     """
     from datetime import datetime

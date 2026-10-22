@@ -202,6 +202,55 @@ def _rows_to_dicts(rows: list, timeframe: str = "1D",
 # 同步位置: source_config.py max_workers 需与此值保持一致。
 MAX_CONCURRENCY = 6
 
+
+# ================================================================
+# volume 单位自适应判据（2026-10-23 事故修复）
+# ================================================================
+# ★ 腾讯 parts[6]（成交量）的单位**按板块不同**，不是全市场统一：
+#     688/689（科创板）→ 返回"股"
+#     其余板块        → 返回"手"
+#   实测证据见只读探针 `tmp/probe_flow_unit8_20261022.py`：
+#     sh688787 parts[6]=8521555  == 日线量 8,521,555（股）
+#     sh600519 parts[6]=42491    == 日线量 4,249,133 / 100（手）
+#   历史代码无条件 `vol * 100` ⇒ 科创板被二次放大 100 倍（2026-10-22 事故：
+#   688787 实时快照 volume 逐拍在 852 万与 8.29 亿之间跳变，资金流模块据此
+#   算出主力净额 1349 亿）。
+#
+# 判据（不按板块硬编码，腾讯将来改口径也能自适应）:
+#   parts[37] = 成交额（万元） ⇒ 每股均价 = amount / vol
+#     - vol 已是"股"  ⇒ amount / vol ≈ last        ⇒ ratio ≈ 1
+#     - vol 是  "手"  ⇒ amount / vol ≈ last × 100  ⇒ ratio ≈ 100
+#   分界取 1 与 100 的几何中点（实测 688787 ratio=1.01、600519 ratio=99.5，
+#   二分度极高，不会误判）。
+#
+# ★ 单位无法判定时**返回 None，不猜**（2026-10-23 用户裁定：provider 层
+#   "允许值是空的，但不允许值是错误的"）。历史代码的 `vol * 100` 兜底正是
+#   错误值的来源：判不出来时它按"手"处理，对科创板就变成 100 倍的错值，
+#   且下游无从分辨"没数据"与"数据错了"。宁可让下游拿不到成交量，
+#   也不能给它一个会被累加进资金流的错数。
+_VOL_UNIT_RATIO_MID = 10.0
+
+
+def _volume_to_shares(vol: float, amount_wan: float, last: float) -> Optional[float]:
+    """把腾讯 parts[6] 归一化为"股"。
+
+    Args:
+        vol:        parts[6] 原始值（单位随板块而变）
+        amount_wan: parts[37] 成交额（万元）；缺失/为 0 表示判据不可用
+        last:       现价 parts[3]，用于反推单位
+
+    Returns:
+        成交量（股）；**判据不可用（缺成交额、零量、零价）时返回 None**。
+        调用方须按"缺失"处理，不要自行回落到任何猜测值。
+    """
+    if vol <= 0 or last <= 0 or amount_wan <= 0:
+        return None
+    ratio = (amount_wan * 10000.0) / vol / last
+    if ratio < _VOL_UNIT_RATIO_MID:
+        return vol
+    return vol * 100
+
+
 @register(priority=10)
 class TencentDataSource:
     """
@@ -378,7 +427,7 @@ class TencentDataSource:
             "changePercent": round(chg / prev * 100, 2) if prev else 0,
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
-            "volume": vol * 100, "time": time_str,
+            "volume": _volume_to_shares(vol, _f(37), last), "time": time_str,
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
@@ -455,6 +504,14 @@ class TencentDataSource:
                         prev = float(parts[4]) if parts[4] else 0
                         chg = round(last - prev, 4) if prev else 0
                         vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0
+                        # parts[37] = 成交额（万元），用于反推 parts[6] 的单位
+                        # （详见 `_volume_to_shares`：科创板返回"股"，其余板块返回"手"）
+                        _amt_wan = 0.0
+                        if len(parts) > 37 and parts[37]:
+                            try:
+                                _amt_wan = float(parts[37])
+                            except (TypeError, ValueError):
+                                _amt_wan = 0.0
                         raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
                         # 统一格式: "20260510150000" → "2026-05-10 15:00:00"
                         time_str = ""
@@ -467,7 +524,7 @@ class TencentDataSource:
                             "low": float(parts[34]) if len(parts) > 34 and parts[34] else last,
                             "open": float(parts[5]) if parts[5] else last,
                             "previousClose": prev,
-                            "volume": vol * 100,
+                            "volume": _volume_to_shares(vol, _amt_wan, last),
                             "time": time_str,
                             "name": parts[1].strip(),
                             "symbol": parts[2].strip(),

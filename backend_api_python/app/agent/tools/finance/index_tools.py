@@ -36,25 +36,21 @@ def _norm_codes(codes: Union[str, List[str], None]) -> List[str]:
 def get_index_quote(codes: Union[str, List[str]] = "", scope: str = "single",
                     days: int = 60) -> Dict[str, Any]:
     """指数/ETF 行情统一入口：五大指数快照、指定指数实时、ETF 行情与指数日线。
-
-    scope: indices=五大指数快照 | single=指定指数实时（默认） | etf=指数对应 ETF
-           | kline=指数日线序列
-    注：指数日 K 另有独立工具 get_index_kline（同名让位项保留注册），
-    与 scope=kline 同源同实现。
+    指数日 K 另有 get_index_kline（与 scope=kline 同源同实现，同名让位项保留注册）。
 
     Args:
         codes: 指数/ETF 代码，逗号分隔或列表。常用: 000001 上证, 000300 沪深300,
                399001 深成指, 399006 创业板指, 000905 中证500；ETF: 510050, 510300…
-        scope: indices | single | etf | kline
+        scope: indices=五大指数快照 | single=指定指数实时（默认） | etf=指数对应 ETF
+               | kline=指数日线序列
         days: K 线天数（scope=kline 用），默认60
 
     Returns:
         scope=indices → {"count", "indices": [{code,name,price,change_percent,...}]}。
         scope=single/etf → {"count", "data": {code: {code,name,price,change_percent,...}}}，
             单标的时顶层再镜像（双通道）；获取失败的代码其值为 {"code", "error"}。
-        scope=kline → {"count", "data": {code: [{t,o,h,l,c,v}...]}}（双键 bar，可直接
-            下标 bar['c']；无数据的代码其值为 {"error"}）。
-        失败 → {"error": "...", "retriable": bool}。
+        scope=kline → {"count", "data": {code: [{t,o,h,l,c,v}...]}}（可直接 bar['c']；
+            无数据的代码其值为 {"error"}）。失败 → {"error", "retriable"}。
     """
     s = (scope or "single").strip().lower()
     if s == "indices":

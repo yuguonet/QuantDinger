@@ -41,7 +41,12 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
 ⚠️ 容易踩坑的点:
   1. "last" 和 "previousClose" 是 PostgreSQL 保留字/特殊名，SQL 中必须加双引号
   2. coordinator 返回的字段名是 camelCase (previousClose)，不是 snake_case
-  3. volume 单位是"股"（各源已归一化），不是"手"
+  3. volume 单位是"股"，由各 Provider 自行归一化——**不是本模块保证的**。
+     ⚠️ 2026-10-23 事故：tencent 对科创板 parts[6] 返回"股"却按"手"×100，
+     叠加 coordinator 逐拍换源 ⇒ 累计量在真实值与 ×100 之间跳变，下游资金流
+     据此算出 688787 主力净额 1349 亿。根因已在 provider 层修复
+     （`tencent.py::_volume_to_shares`）；本层另加 `_mark_volume_jumps`
+     打 `extras.vol_jump` 标记作为第二道观测（**只标记不丢弃**）。
   4. extras 内容因源而异，不要在业务逻辑中依赖 extras 的具体字段
   5. 与 backfill_db 的 kline 表是两套独立数据，不要混用
   6. **落库 time 用的是"数据源返回的行情时间"**（q.time 优先，缺失才用整分钟兜底），
@@ -247,6 +252,74 @@ def _bulk_upsert(records: List[Dict]) -> int:
 
 
 # ================================================================
+# volume 跳变标记
+# ================================================================
+
+# 2026-10-23 事故配套：coordinator 是「主池 + 重试池、失败即换源」，同一 symbol
+# 逐拍可能来自不同源；而**各源 volume 单位口径并非天然一致**——tencent 对科创板
+# parts[6] 返回"股"、对其余板块返回"手"，历史代码无条件 ×100 ⇒ 科创板累计量在
+# 真实值与 ×100 之间来回跳变；下游资金流按正增量累加 ⇒ 688787 算出主力净额 1349 亿。
+#
+# 这里**只打标记、不过滤**：
+#   - 开盘瞬时真实增长可达数倍（实测 688787 09:25→09:30: 13.2 万 → 52.5 万，约 4x），
+#     而单位跳变是 100x 量级 ⇒ 阈值 20x 足以分离常态与跳变；
+#   - 但极端小成交量票（竞价几百股 → 开盘几十万股）仍可能误标，
+#     故不在写入端丢弃，改由消费侧按标记决策，避免误杀真实数据。
+_VOL_JUMP_RATIO = 20.0
+
+
+def _mark_volume_jumps(records: List[Dict], day_start: str) -> int:
+    """给疑似单位跳变的拍打 `extras.vol_jump` 标记（原地修改）。
+
+    判据：本次 volume ≥ 该 symbol 当日已入库最大累计量 × `_VOL_JUMP_RATIO`。
+    累计量在日内单调不减，正常单拍增量不可能到 20 倍。
+
+    Args:
+        records:   `_extract_snapshot_records` 产出的记录列表
+        day_start: 当日 00:00:00，用于限定"当日已入库累计量"的查询范围
+
+    Returns:
+        被打标记的条数
+    """
+    if not records:
+        return 0
+
+    from app.utils.db_market import get_market_db_manager
+
+    pool = get_market_db_manager()._get_pool("CNStock")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT symbol, MAX(volume) FROM "{_TABLE}" '
+                "WHERE time >= %s::timestamp GROUP BY symbol",
+                (day_start,),
+            )
+            prev_max = {r[0]: (r[1] or 0) for r in cur.fetchall()}
+
+    marked = 0
+    samples: List[str] = []
+    for rec in records:
+        vol = rec.get("volume") or 0
+        pv = prev_max.get(rec["symbol"])
+        if pv and pv > 0 and vol >= pv * _VOL_JUMP_RATIO:
+            extras = rec.get("extras") or {}
+            extras["vol_jump"] = True
+            extras["vol_jump_prev_max"] = pv
+            rec["extras"] = extras
+            marked += 1
+            if len(samples) < 5:
+                samples.append(f"{rec['symbol']} {vol:,.0f} vs 前值 {pv:,.0f}")
+
+    if marked:
+        logger.warning(
+            "[realtime_snapshot] volume 跳变拍 %d 条（疑似源单位不一致，已打 "
+            "extras.vol_jump 标记，不丢弃）样例: %s",
+            marked, "; ".join(samples),
+        )
+    return marked
+
+
+# ================================================================
 # 交易时间判断
 # ================================================================
 
@@ -381,8 +454,10 @@ def collect_realtime_snapshot() -> Dict:
                 "failed": 0, "elapsed": time.time() - t0,
                 "empty_pick": empty_pick}
 
-    # ── 4. 建表 + UPSERT ──
+    # ── 4. 建表 + volume 跳变标记 + UPSERT ──
+    #    标记必须在建表之后（要查当日已入库累计量做对比）、写入之前。
     _ensure_snapshot_table()
+    vol_jumps = _mark_volume_jumps(records, now.strftime("%Y-%m-%d 00:00:00"))
     written = _bulk_upsert(records)
 
     elapsed = time.time() - t0
@@ -397,8 +472,9 @@ def collect_realtime_snapshot() -> Dict:
     missing_sample = missing[:20]
 
     logger.info(
-        "[realtime_snapshot] 完成: %d/%d 只 (%.1f%%), %d 条写入, %d 缺失, %d 空拍丢弃, %.2fs",
-        fetched, total, success_rate, written, failed, empty_pick, elapsed,
+        "[realtime_snapshot] 完成: %d/%d 只 (%.1f%%), %d 条写入, %d 缺失, %d 空拍丢弃, "
+        "%d 跳变标记, %.2fs",
+        fetched, total, success_rate, written, failed, empty_pick, vol_jumps, elapsed,
     )
     if failed > 0:
         logger.info(
@@ -416,4 +492,5 @@ def collect_realtime_snapshot() -> Dict:
         "failed": failed,
         "elapsed": round(elapsed, 2),
         "empty_pick": empty_pick,
+        "vol_jumps": vol_jumps,
     }

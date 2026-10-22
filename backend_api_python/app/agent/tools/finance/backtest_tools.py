@@ -47,11 +47,6 @@ def run_backtest(
 ) -> Dict[str, Any]:
     """策略回测：返回指定策略在指定股票上的胜率、盈亏比、最大回撤、交易次数等绩效指标。
 
-    Returns:
-        dict: {success, summary:{totalReturn, annualReturn, maxDrawdown, sharpeRatio,
-        winRate, profitFactor, totalTrades, totalProfit}, trade_count,
-        recent_trades:[{time,type,price,amount,profit,reason}]}
-
     Args:
         strategy_id: 策略 ID
         stock_code: 股票代码（如 600519）或交易对（如 BTC/USDT）
@@ -59,6 +54,11 @@ def run_backtest(
         end_date: 回测结束日期 YYYY-MM-DD
         timeframe: K 线周期，默认 1D（可选 1H, 4H, 1W）
         user_id: 用户 ID，默认 1
+
+    Returns:
+        dict: {success, summary:{totalReturn, annualReturn, maxDrawdown, sharpeRatio,
+        winRate, profitFactor, totalTrades, totalProfit}, trade_count,
+        recent_trades:[{time,type,price,amount,profit,reason}]}
     """
     if not _BACKTEST_DEPS_OK:
         return {"success": False, "error": f"回测依赖缺失: {_BACKTEST_DEPS_ERROR}"}

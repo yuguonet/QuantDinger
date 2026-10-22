@@ -15,33 +15,36 @@ from .analysis_tools import (
 )
 from .data_tools import get_realtime_quote
 from .news_search_tools import _search_stock_intel, _search_policy_intel
+# 与 technical_analysis 的分工细节（2026-10-22 自 docstring 移出，注入瘦身）：
+# · 本工具已自行取数并计算：实时行情 + 120 日 K 线 + 五维技术快照
+#   （score_model=bb5_weighted(...)）+ 个股情报；与 get_realtime_quote/
+#   agent_get_kline/technical_analysis 同批调用时后三者的取数与技术快照部分
+#   是重复劳动（费 token，不影响正确性）；仅当需要它们独有输出（如
+#   technical_analysis 的六维加权分与 score_model=trend_composite(...) 复合
+#   共振口径）时才值得同批调。
+# · 多空论据完整保留在 output_data.bull_case/bear_case。
 def bull_bear_research(codes: str, stock_name: str = "") -> dict:
     """多空研究：对单只股票做技术面+筹码+情报综合分析，返回多空评分和方向判断。
+    已自行取数并计算（实时行情 + 120 日 K 线 + 五维技术快照 ma/macd/rsi/boll/kdj
+    + 个股情报），与 get_realtime_quote/agent_get_kline/technical_analysis 同批调用
+    属重复取数；仅当需要它们独有输出时才值得同批调。
 
-    ⚠️ 与其它技术工具的关系（防重复取数与口径误读）：
-    · 本工具**已自行取数并计算**：实时行情 + 120 日 K 线 + 五维技术快照
-      （ma/macd/rsi/boll/kdj，`score_model=bb5_weighted(...)`）+ 个股情报。
-      与 `get_realtime_quote`/`agent_get_kline`/`technical_analysis` 同批调用时，
-      后三者的取数与技术快照部分是**重复劳动**（费 token，不影响正确性）；仅当
-      需要它们独有的输出（如 technical_analysis 的六维加权分与
-      `score_model=trend_composite(...)` 复合共振口径）时才值得同批调。
-    · 本工具的 `score`（多空五维加权）与 `technical_analysis` 的 `score`
-      （六维加权）**是两套不同评分模型**，分歧是设计使然；引用时必须带
-      `score_model` 身份，不得互相当作同一指标对比或对冲。
+    ⚠ score 是五维加权（score_model=bb5_weighted），与 technical_analysis 的六维加权
+    （tech6_weighted）是两套不同评分模型，分歧是设计使然；引用时必须带 score_model
+    身份，不得互相当作同一指标对比或对冲。
 
     Args:
         codes: 股票代码，如 "600066"
         stock_name: 股票名称，可选
 
     Returns:
-        dict — 多空综合报告。
-        核心键: score(0-100), direction(bullish|bearish|neutral), confidence(float),
-        factors(list), analysis(str), hit_rate(float|None), missing_data(list[str]),
-        falsifiable_conditions(str), output_data(bull_case/bear_case/verdict 嵌套)。
-        factors 同 technical_analysis 格式：list[dict{"name","score","direction"}]，
-        因子名 = 五维评分键 ma/macd/rsi/boll/kdj（与 `_BB_DEFAULT_WEIGHTS` 键同名，
-        校准闭环靠此对齐；多空论据完整保留在 output_data.bull_case/bear_case）。
-        失败 → {"error": str, "retriable": bool}。
+        dict — 多空综合报告。核心键: score(0-100), direction(bullish|bearish|neutral),
+        confidence(float), factors(list), analysis(str), hit_rate(float|None),
+        missing_data(list[str]), falsifiable_conditions(str),
+        output_data(bull_case/bear_case/verdict 嵌套)。
+        factors 同 technical_analysis 格式: list[dict{"name","score","direction"}]，
+        因子名 = 五维评分键 ma/macd/rsi/boll/kdj（与 _BB_DEFAULT_WEIGHTS 键同名，
+        校准闭环靠此对齐）；失败 → {"error": str, "retriable": bool}。
     """
         
     # ── 获取数据 ──

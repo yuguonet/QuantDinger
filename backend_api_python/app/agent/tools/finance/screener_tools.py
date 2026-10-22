@@ -97,7 +97,8 @@ def search_stocks(
     market: str = "全部",
     top_n: int = 50,
 ) -> dict:
-    """选股：根据自然语言条件（如"PE<20 半导体"）或结构化 filters 从全市场筛选股票，返回代码/名称/行业/价格/PE/PB等。
+    """选股：根据自然语言条件（如"PE<20 半导体"）或结构化 filters 从全市场筛选股票，
+    返回代码/名称/行业/价格/PE/PB等。
 
     Args:
         query: 自然语言选股条件（如 "半导体 净利增长>15%"、"PE在5到20之间"）
@@ -107,7 +108,7 @@ def search_stocks(
         top_n: 返回数量上限，默认50，最大200
 
     Returns:
-        dict: {"stocks": [{"code": "600519", "name": "贵州茅台", "industry": "白酒", ...}, ...], "count": N}
+        dict: {"stocks": [{"code", "name", "industry", ...}, ...], "count": N}
         取第一个结果: result["stocks"][0]["code"]
     """
     top_n = min(max(top_n, 1), 200)

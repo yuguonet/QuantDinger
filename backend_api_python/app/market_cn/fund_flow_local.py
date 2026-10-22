@@ -103,16 +103,48 @@ def get_fund_flow_from_snapshot(code: str, date: Optional[str] = None) -> Dict[s
     return _derive(code, rows)
 
 
+# ★ 单拍增量异常判据（2026-10-23 事故修复）：
+#   `realtime_snapshot` 的累计量在日内单调不减。但各源 volume 单位口径并非
+#   天然一致（tencent 对科创板 parts[6] 返回"股"却按"手"×100），而 coordinator
+#   逐拍换源 ⇒ 累计量在真实值与 ×100 之间跳变。若下游只累加正增量、把回落
+#   （dvol<0）静默丢弃，62 次跳变累加即 688787 主力净额 1349 亿。
+#   单拍（≈60s）增量不可能达到前一拍累计量的 20 倍（实测开盘瞬时最大约 4x），
+#   故以此为界丢弃异常拍。与 `realtime_snapshot._VOL_JUMP_RATIO` 同量级但
+#   基准不同（那边比当日 MAX、这边比前一拍），不共用常量。
+_DVOL_JUMP_RATIO = 20.0
+
+
 def _derive(code: str, rows: List) -> Dict[str, Any]:
-    """累计量快照序列 → 分钟级近似净额（差分 + 价格方向）。"""
+    """累计量快照序列 → 分钟级近似净额（差分 + 价格方向）。
+
+    ⚠️ 数据有效性闸门（2026-10-23 事故修复）。累计量在日内单调不减，故：
+      - `dvol < 0`  ⇒ 累计量倒退，该拍口径与前后不一致，丢弃；
+      - `dvol > 前值 × _DVOL_JUMP_RATIO` ⇒ 疑似源单位跳变，丢弃；
+      - `dvol == 0` ⇒ 无增量，不产生点（非异常）。
+    丢弃数计入返回值的 `dropped`，**不静默**：异常拍数会在日志告警，
+    避免"数据错了但没人知道"重演（provider 层"允许空、不允许错"的延伸）。
+
+    Returns:
+        {"code", "points", "total_main_net", "data", "dropped",
+         "source", "approx", "note"}
+    """
     data: List[Dict[str, Any]] = []
+    dropped = {"negative": 0, "jump": 0}
     prev = None
     for r in rows:
         t, last, vol = r[0], r[1], r[2]
         if prev is not None and last is not None and vol is not None:
             _, p_last, p_vol = prev
             dvol = float(vol) - float(p_vol)
-            if dvol > 0 and p_last is not None:
+            if dvol < 0:
+                # 累计量倒退 ⇒ 源返回了不一致的口径，不是"卖出了负量"
+                dropped["negative"] += 1
+            elif dvol == 0:
+                pass  # 该分钟无成交增量，正常不产生点
+            elif p_vol and dvol > float(p_vol) * _DVOL_JUMP_RATIO:
+                # 单拍增量远超已累计量 ⇒ 单位跳变（如"股"被当成"手"×100）
+                dropped["jump"] += 1
+            elif p_last is not None:
                 dlast = float(last) - float(p_last)
                 direction = 1 if dlast > 0 else (-1 if dlast < 0 else 0)
                 data.append({
@@ -124,5 +156,12 @@ def _derive(code: str, rows: List) -> Dict[str, Any]:
         prev = (t, last, vol)
 
     total = round(sum(d["main_net"] for d in data), 2)
+    if dropped["negative"] or dropped["jump"]:
+        logger.warning(
+            "[fund_flow_local] %s 丢弃异常拍: 累计量倒退 %d、单位跳变 %d "
+            "（保留 %d 拍，净额 %s）",
+            code, dropped["negative"], dropped["jump"], len(data), total,
+        )
     return {"code": code, "points": len(data), "total_main_net": total, "data": data,
+            "dropped": dropped,
             "source": "realtime_snapshot", "approx": True, "note": _NOTE}

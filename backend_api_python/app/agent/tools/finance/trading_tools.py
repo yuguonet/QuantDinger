@@ -91,24 +91,23 @@ def get_strategy_detail(strategy_id: int, user_id: int = 1) -> dict:
         return {"success": False, "error": str(e)}
 
 def start_strategy(strategy_id: int, user_id: int = 1, confirm: bool = False) -> dict:
-    """启动策略：将指定策略从停止状态切换为运行状态。**真实资金动作**。
+    """启动策略：将指定策略从停止状态切换为运行状态。**真实资金动作**——策略将按照配置的
+    指标信号自动执行买卖操作；订单由 PendingOrderWorker + app.services.live_trading
+    **实盘成交**（各所直连 REST，见 trading_executor.py 头注释）。
 
-    策略将按照配置的指标信号自动执行买卖操作；订单由 PendingOrderWorker +
-    app.services.live_trading **实盘成交**（各所直连 REST，见 trading_executor.py 头注释）。
-
-    【human-in-the-loop 硬闸】调用前**必须**把策略名与“将按信号
-    自动实盘买卖”告知用户、获得明确同意，再以 confirm=True 重调；未确认只返回
-    requires_confirmation（展示信息，不执行）。每次启动/停止均审计留痕。
-
-    Returns:
-        成功 → {"success": True, "strategy_id", "strategy_name", "message"}；
-        未确认 → {"success": False, "requires_confirmation": True, "strategy_id", "strategy_name"}；
-        失败 → {"success": False, "error": str}。
+    【human-in-the-loop 硬闸】调用前**必须**把策略名与"将按信号自动实盘买卖"告知用户、
+    获得明确同意，再以 confirm=True 重调；未确认只返回 requires_confirmation（展示
+    信息，不执行）。每次启动/停止均审计留痕。
 
     Args:
         strategy_id: 策略 ID
         user_id: 用户 ID，默认 1
         confirm: 是否已获用户明确同意（默认 False = 只展示、不执行）
+
+    Returns:
+        成功 → {"success": True, "strategy_id", "strategy_name", "message"}；
+        未确认 → {"success": False, "requires_confirmation": True, "strategy_id", "strategy_name"}；
+        失败 → {"success": False, "error": str}。
     """
     if not _TRADING_DEPS_OK:
         return {"success": False, "error": f"交易依赖缺失: {_TRADING_DEPS_ERROR}"}

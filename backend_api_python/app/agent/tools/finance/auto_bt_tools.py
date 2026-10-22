@@ -49,12 +49,12 @@ def agent_backtest_strategy(
     """对 auto 折叠策略跑一次回测（独立桥：生产树只读、零写共享表、删作业目录即回滚）。
 
     载体三选一：
-      ①/② proposal_json —— 对现有策略 <strategy>.yaml 的最小改动提案；最小 schema：
+      ①/② proposal_json —— 对现有策略 <strategy>.yaml 的最小改动提案，最小 schema：
         {"strategy":"break","edits":[{"kind":"param","target":"x","before":1,"after":2}]}
-        （schema 真源 app/market_cn/auto/tools/proposal.py；改选择集须附
+        （真源 app/market_cn/auto/tools/proposal.py；改选择集须附
         evidence.stability/pool_check，由 proposal.validate 强制）；
-      ③ strategy_py + strategy_yaml —— 全新策略（两者必须成对，strategy_key 必填，
-        agentbt_ 前缀；strategy_yaml 是 JSON 字符串）；
+      ③ strategy_py + strategy_yaml 成对 —— 全新策略（strategy_key 必填，agentbt_ 前缀；
+        strategy_yaml 是 JSON 字符串）；
       existing —— 只传 strategy_key 且不传前两者 = 回测现有策略零改动（对照组）。
     全盘回测（scope=all）不在此工具：请走 auto-backtest 技能。
 
@@ -63,16 +63,14 @@ def agent_backtest_strategy(
         proposal_json: proposal JSON 字符串（①/②档，schema 见上）
         strategy_py: 新策略 .py 全文（③档，@register + 折叠契约）
         strategy_yaml: 新策略 yaml 的 JSON 字符串（③档）
-        codes: 逗号/空格分隔的股票代码（必填，≤ QD_BT_MAX_CODES 个）
+        codes: 逗号/空格分隔股票代码（必填，≤ QD_BT_MAX_CODES 个）
         days: 回看自然日数（默认 120，上限 QD_BT_MAX_DAYS）
 
     Returns:
-        成功：桥 summary（含 ok=True/job_id/stats{n,winrate,pl_ratio,...}/report_path
-          （全量逐笔，agent 自取）/elapsed_seconds/scope/days/codes_n/codes_ok/
-          overlay_digest/git_sha/effective_params/summary_path——口径单源
-          core.backtest._summary，桥不重算）；
-        失败：裸 {"error": str}（含 stderr 尾部；畸形入参经桥 parse_carrier 归一，
-          不会以裸异常逃逸）。
+        成功：桥 summary（ok=True/job_id/stats{n,winrate,pl_ratio,...}/report_path（全量逐笔，
+        agent 自取）/elapsed_seconds/scope/days/codes_n/codes_ok/overlay_digest/git_sha/
+        effective_params/summary_path——口径单源 core.backtest._summary）；
+        失败：裸 {"error": str}（含 stderr 尾部；畸形入参经 parse_carrier 归一）。
     """
     if not codes.strip():
         return {"error": "codes 不能为空；全盘回测请走 auto-backtest 技能"}
@@ -109,42 +107,35 @@ def agent_backtest_svc(
     """指标/脚本策略回测（svc 泳道独立桥：子进程纯计算、零写共享表、删作业目录即回滚）。
 
     载体二选一（互斥）：
-      code —— agent 自己想出的策略：strategy_indicator（指标 DSL）或 strategy_script
+      code —— agent 自拟策略：strategy_indicator（指标 DSL）或 strategy_script
        （含 on_bar 的 Python 脚本），直构 snapshot 回测，无需 DB 注册；
-      strategy_id —— 对照组：回测 DB 已注册策略（子进程内走 resolver，与 run_backtest
-        工具同语义）。
+      strategy_id —— 对照组：回测 DB 已注册策略（子进程内走 resolver，与 run_backtest 同语义）。
 
-    口径与问责（重要）：
-      - commission/slippage 默认 0 = **零费率毛收益**；A 股要 T+1/涨跌停假设必须传
-        strategy_config_json（如 {"ashare_rules": {"t_plus_1": true, "limit_pct": 0.10}}）。
-        结果里的 cost_model 字段是实际口径（毛/净一目了然），引用结论时必须带口径。
-      - 本工具结论按「探索性参考」表述：svc_code 载体是 agent 自由代码，带前视/
-        理想化风险，不与 auto 泳道（有生产锚点）结论同权重进判定闭环。
+    口径与问责：commission/slippage 默认 0 = 零费率毛收益；A 股 T+1/涨跌停假设须传
+    strategy_config_json（如 {"ashare_rules": {"t_plus_1": true, "limit_pct": 0.10}}）；
+    结果 cost_model 字段是实际口径，引用结论必须带口径。code 载体是 agent 自由代码，
+    带前视/理想化风险，结论按「探索性参考」表述，不与 auto 泳道结论同权重进判定闭环。
 
     Args:
         code: 指标 DSL 或策略脚本全文（与 strategy_id 互斥）
         run_type: strategy_indicator（默认）| strategy_script
         strategy_id: DB 已注册策略 ID（与 code 互斥）
-        symbol: 标的，如 600519 或 BTC/USDT（必填；symbol 本身不决定市场——
-            BTC/USDT 必须配 market="Crypto"，否则按 A 股数据源取数取不到）
-        market: 数据源市场 key（与数据源工厂注册表对齐），CNStock（默认）| Crypto |
-            Forex | USStock | HKStock（完整集见 app/data_sources/factory.py）
-        start_date / end_date: YYYY-MM-DD（窗口上限 QD_BT_MAX_DAYS，默认 365 天）
+        symbol: 标的（如 600519 / BTC/USDT，必填；加密货币必须配 market="Crypto"）
+        market: CNStock（默认）| Crypto | Forex | USStock | HKStock（完整集见 app/data_sources/factory.py）
+        start_date / end_date: YYYY-MM-DD（上限 QD_BT_MAX_DAYS，默认 365 天）
         timeframe: K 线周期，默认 1D
-        commission / slippage: 单边费率/滑点（比例），默认 0（毛收益口径，改进 M）
+        commission / slippage: 单边费率/滑点（比例），默认 0（毛收益口径）
         leverage: 杠杆倍数，默认 1
         trade_direction: long（默认）| short
-        strategy_config_json: 执行假设 JSON 字符串（如 A 股 ashare_rules），默认空
-        initial_capital: 初始本金，默认 0 = 不指定（引擎默认 10000）；仅 code 载体
-            生效——svc_strategy 对照组的本金由 DB 策略配置决定（传了桥侧诚实拒绝）
-        user_id: 用户 ID（对照组 svc_strategy 走 resolver 时按此过滤策略归属），默认 1
+        strategy_config_json: 执行假设 JSON（如 ashare_rules），默认空
+        initial_capital: 初始本金，默认 0=引擎默认 10000；仅 code 载体生效（对照组由 DB 配置决定）
+        user_id: 用户 ID（对照组按此过滤策略归属），默认 1
 
     Returns:
-        成功：桥 summary（含 ok=True/lane="svc"/job_id/summary_metrics{totalReturn,
-          maxDrawdown,winRate,...}（标量；trades/equityCurve 留 report.json，要明细拿
-          report_path 自取）/cost_model{market,commission,slippage,trade_direction,
-          source}（实际口径）/snapshot_digest/report_path/summary_path）；
-        失败：裸 {"error": str}（含 stderr 尾部或校验原因；引用结论必须带 cost_model 口径）。
+        成功：桥 summary（ok=True/lane="svc"/job_id/summary_metrics{totalReturn,maxDrawdown,
+        winRate,...}（标量；trades/equityCurve 留 report.json，明细取 report_path）/
+        cost_model{market,commission,slippage,trade_direction,source}/snapshot_digest/
+        report_path/summary_path）；失败：裸 {"error": str}（含 stderr 尾部或校验原因）。
     """
     if bool(code) == bool(strategy_id):
         return {"error": "code 与 strategy_id 必须二选一（互斥载体）"}

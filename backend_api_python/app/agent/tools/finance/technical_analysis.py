@@ -455,23 +455,22 @@ def _algo_analyze(
     }
     return _r
 def technical_analysis(codes: str) -> dict:
-    """技术面综合评分：聚合趋势/指标/量价/形态/筹码/流通盘六维分析，加权输出 0-100 分。需要单股深度分析时用此工具。
+    """技术面综合评分：聚合趋势/指标/量价/形态/筹码/流通盘六维分析，加权输出 0-100 分。
+    需要单股深度分析时用此工具。
 
-    ⚠️ 评分口径：本分数是**六维加权**（趋势/指标/量价/形态/筹码/
-    流通盘，输出 `score_model=tech6_weighted(...)`），其中「趋势」维取自
-    复合共振分析。与 `bull_bear_research` 的五维加权
-    （`score_model=bb5_weighted(...)`）**是两套不同模型**，同股给出不同分
-    属设计使然，不得互相当作同一指标对比或对冲。
+    ⚠️ 评分口径：本分数是六维加权（score_model=tech6_weighted），「趋势」维取自复合
+    共振分析。与 bull_bear_research 的五维加权（bb5_weighted）是两套不同模型，同股
+    给出不同分属设计使然，不得互相当作同一指标对比或对冲，引用时必须带 score_model。
 
     Args:
         codes: 股票代码（6位数字），如 "600519"
 
     Returns:
-        dict — 综合评分报告。
-        核心键: score(0-100), direction(bullish|bearish|neutral), confidence(high|medium|low),
-        factors(list[dict: {"name","value","score"}]), analysis(str), hit_rate(float|None),
-        missing_data(list[str]), falsifiable_conditions(str), ma_alignment, vol_price_divergence。
-        ⚠ factors 是 list，取值 r["factors"] 后按 f["name"] 过滤；r["factors"].get() 会报错。
+        dict — 综合评分报告。核心键: score(0-100), direction(bullish|bearish|neutral),
+        confidence(high|medium|low), factors(list[dict: {"name","value","score"}]),
+        analysis(str), hit_rate(float|None), missing_data(list[str]),
+        falsifiable_conditions(str), ma_alignment, vol_price_divergence。
+        ⚠ factors 是 list，取值 r["factors"] 后按 f["name"] 过滤（.get() 会报错）；
         失败 → {"error": str, "retriable": bool}。
     """
     tool_results = _call_tools(codes)

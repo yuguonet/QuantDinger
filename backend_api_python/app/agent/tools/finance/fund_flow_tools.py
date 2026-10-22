@@ -84,8 +84,8 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
     """资金流向统一入口：按 scope 返回个股/市场/板块的主力资金净流入。
 
     Args:
-        scope: 资金流范围，stock | stock_daily | market | sector | concept
-        codes: 股票代码，多股逗号分隔（scope=stock/stock_daily 用），如 "000001,600519"
+        scope: stock | stock_daily | market | sector | concept
+        codes: 股票代码，多股逗号分隔（scope=stock/stock_daily 用）
         days: 历史回溯天数（scope=stock_daily 用），默认120
         indicator: 时间维度（scope=sector/concept 用），"今日"|"5日"|"10日"
 
@@ -151,19 +151,17 @@ def _get_concept_fund_flow(indicator: str = "今日") -> dict:
 def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
     """个股历史资金流向：返回近N天每日主力/散户净流入金额。
 
-    Returns:
-        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果}, "error": None}；
-        失败 → {"error": "...", "retriable": False}。单股结果字段：
-        {code, total_days, recent_5d_main_net, recent_20d_main_net,
-         main_net_streak, main_net_streak_dir, max_main_net_day, max_main_net,
-         recent_20d_main_net_ex_max, recent_5d_sign, data:[...]}
-        前两项是近 5/20 日主力累计（元）；main_net_streak 是主力连续同向天数；
-        max_main_net_day / recent_20d_main_net_ex_max 用于"剔除某单日后的累计"口径；
-        recent_5d_sign 是近 5 日逐日符号序列（"+"主力净流入 / "-"净流出）。
-
     Args:
         codes: 多股用逗号分隔
         days: 回溯天数，默认 30
+
+    Returns:
+        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果}, "error": None}；
+        失败 → {"error": "...", "retriable": False}。单股结果字段：
+        {code, total_days, recent_5d_main_net, recent_20d_main_net（近5/20日主力累计，元）,
+         main_net_streak（主力连续同向天数）, main_net_streak_dir, max_main_net_day,
+         max_main_net, recent_20d_main_net_ex_max（剔除最大单日后的累计口径）,
+         recent_5d_sign（近5日逐日符号序列 "+"净流入/"-"净流出）, data:[...]}
     """
     # ── days 默认 30 的依据（2026-10-21 实测；论证不进 docstring：docstring 是
     # 工具契约，模型逐轮读，只该讲"干什么/怎么传/返回什么"）──
