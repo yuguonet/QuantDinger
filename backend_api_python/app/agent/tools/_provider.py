@@ -56,7 +56,9 @@ logger = logging.getLogger(__name__)
 # provider.get_meta(name) —— 它查的是 _load_meta_tools 装出来的元工具表。
 # 2026-09-21 事故正是消费方误用了 get()：web_search 直接返回
 # {"error": "web_search 工具不可用"}、format_result 静默降级成 str(result)[:2000]。
-_MUST_HAVE = {"format_utils", "web_search_tools"}
+# 注：format_utils 模块已于 2026-10-22 移出（其 LLM 版 format_result 由 mimo 原生
+# 元工具 + 各工具内联 TSV 取代，见 del/format_utils.py），此处不再列入必加载。
+_MUST_HAVE = {"web_search_tools"}
 
 # 工具模块导入失败登记表（2026-10-02）：`_load_domain_tools` 遇到 ImportError 只
 # warning 后 `continue`，属于**静默降级**——日志没人盯时工具面悄悄缺一大块，而
