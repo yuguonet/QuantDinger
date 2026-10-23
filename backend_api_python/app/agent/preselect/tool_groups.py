@@ -31,7 +31,7 @@ from .tool_preselect import DATA_DOMAIN_TOOLS, capability_domain
 # （口径对齐 OpenAI namespace 的 description）。域键与 DATA_DOMAIN_TOOLS 对齐。
 GROUP_DESC: Dict[str, str] = {
     "quote": "实时行情/报价/指数点位",
-    "kline": "K线历史走势（日线/周线）",
+    "kline": "K线/多周期/盘中结构（日线、分钟、VWAP、开盘区间）",
     "trend": "技术面趋势/形态/指标（MACD KDJ 均线）",
     "fundflow": "资金流/主力净流入/融资融券",
     "sector": "板块题材概念行业",
@@ -45,6 +45,7 @@ GROUP_DESC: Dict[str, str] = {
     "intel": "新闻公告研报舆情",
     "capital": "账户资金/持仓/市值盈亏",
     "knowledge": "本地知识库检索",
+    "schedule": "定时任务/条件告警（到点执行、参数达阈值才提醒）",
     "coding": "读写改文件/跑 shell/派子任务（编码与调试）",
     "capability": "外部能力包（域内无覆盖时的兜底）",
     "native": "agent 原生工具",

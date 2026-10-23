@@ -914,4 +914,123 @@ class SignalNotifier:
 
         return results
 
+    def notify_alert(
+        self,
+        *,
+        user_id: int,
+        title: str,
+        message: str,
+        channels: Optional[List[str]] = None,
+        targets: Optional[Dict[str, Any]] = None,
+        symbol: str = "",
+        alert_name: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """告警专用推送入口 —— **不绑策略**（strategy_id=None）。
+
+        ★ 为什么不能直接用 `notify_signal`：它要求 `strategy_id` 且内部据此
+          反查 user_id / 用户时区（`_load_user_timezone_for_strategy`），而
+          cron 告警任务没有策略归属，硬造一个 strategy_id 会让时区与归属
+          落到错误的默认值。本方法把 `send_profile_test_notifications` 的
+          通道分发逻辑**能力平移**过来（同样的 `_notify_*` 调用序列），只换
+          成告警语义的文案与 payload —— 不重写任何通道实现。
+
+        Args:
+            user_id: 接收者（单用户部署下为 1；多用户时由告警任务携带）
+            title: 标题
+            message: 正文（纯文本）
+            channels: 通道列表，默认 ["browser"]
+            targets: 各通道目标地址 {"telegram":..., "email":..., "webhook":...}
+            symbol: 相关标的代码（可空）
+            alert_name: 告警任务名（用于 payload 标注）
+
+        Returns:
+            {channel: {"ok": bool, "error": str}}
+        """
+        now = int(time.time())
+        iso = datetime.now(timezone.utc).isoformat()
+        plain = str(message or "")
+        html_body = f"<p>{html.escape(plain)}</p>"
+        telegram_html = (
+            f"<b>{html.escape(str(title or ''))}</b>\n\n{html.escape(plain)}"
+        )
+        payload: Dict[str, Any] = {
+            "event": "qd.alert",
+            "version": 1,
+            "timestamp": now,
+            "timestamp_iso": iso,
+            "strategy": {"id": 0, "name": alert_name or "Alert"},
+            "instrument": {"symbol": symbol or ""},
+            "signal": {"type": "alert", "action": "notify", "side": ""},
+            "order": {"ref_price": 0.0, "stake_amount": 0.0},
+            "trace": {},
+            "extra": {"kind": "alert", "alert_name": alert_name or ""},
+        }
+
+        ch_list = _as_list(channels)
+        if not ch_list:
+            ch_list = ["browser"]
+        tgt = targets or {}
+
+        results: Dict[str, Dict[str, Any]] = {}
+        for ch in ch_list:
+            c = (ch or "").strip().lower()
+            if not c:
+                continue
+            ok, err = False, ""
+            try:
+                if c == "browser":
+                    ok, err = self._notify_browser(
+                        strategy_id=None,
+                        symbol=symbol or "",
+                        signal_type="alert",
+                        channels=ch_list,
+                        title=str(title or ""),
+                        message=html_body,
+                        payload=payload,
+                        user_id=int(user_id),
+                    )
+                elif c == "telegram":
+                    ok, err = self._notify_telegram(
+                        chat_id=str(tgt.get("telegram") or "").strip(),
+                        text=telegram_html,
+                        token_override=str(
+                            tgt.get("telegram_bot_token")
+                            or tgt.get("telegram_token")
+                            or ""
+                        ).strip() or None,
+                        parse_mode="HTML",
+                    )
+                elif c == "email":
+                    ok, err = self._notify_email(
+                        to_email=str(tgt.get("email") or "").strip(),
+                        subject=str(title or ""),
+                        body_text=plain,
+                        body_html=html_body,
+                    )
+                elif c == "phone":
+                    ok, err = self._notify_phone(
+                        to_phone=str(tgt.get("phone") or "").strip(),
+                        body=f"{title}\n\n{plain}",
+                    )
+                elif c == "discord":
+                    ok, err = self._notify_discord(
+                        url=str(tgt.get("discord") or "").strip(),
+                        payload=payload,
+                        fallback_text=f"{title}\n\n{plain}",
+                    )
+                elif c == "webhook":
+                    tok = str(tgt.get("webhook_token") or "").strip()
+                    ok, err = self._notify_webhook(
+                        url=str(tgt.get("webhook") or "").strip(),
+                        payload=payload,
+                        token_override=tok or None,
+                    )
+                else:
+                    ok, err = False, f"unsupported_channel:{c}"
+            except Exception as e:                      # noqa: BLE001 — 逐通道记账
+                ok, err = False, str(e)
+            results[c] = {"ok": bool(ok), "error": (err or "")}
+
+        return results
+
 

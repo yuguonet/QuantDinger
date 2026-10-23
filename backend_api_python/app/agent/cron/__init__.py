@@ -36,3 +36,7 @@ from .cron_worker import (
     schedule_job_from_db, unschedule_job,
     get_scheduled_jobs, subscribe, unsubscribe,
 )
+# 告警模式（2026-10-23）：条件求值器 + 推送钩子注入口（后者避免本包反向
+# 依赖 app.services 成环，实现由 app/__init__.py 启动期注入）
+from .alert_eval import evaluate as evaluate_alert
+from .cron_worker import set_alert_notifier

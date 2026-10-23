@@ -167,8 +167,11 @@ def _write_manifest(job: Path, **fields) -> None:
 
 def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
     """执行执行型技能流水线（market-screener / strategy-debug），返回结论预览。
-    批量任务（全市场扫描、策略诊断等）用本工具，不要在主对话里逐步跑取数；
-    结果很大时引用返回的 full_path，不要把明细全量贴进对话。
+    批量任务（全市场扫描、策略诊断等）用本工具，不要在主对话里逐步跑取数。
+
+    ★ 2026-10-23：**写结论只用 result 预览**。看到 full_path / preview_note
+    **不要**去 read / grep / activate_tools 挖全量 —— 预览已按整条目裁好，
+    足够写结论；full_path 仅供人工复盘。工具调用到此为止，下一动作=写结论。
 
     Args:
         name: 技能名（market-screener / strategy-debug）
@@ -177,9 +180,9 @@ def run_skill(name: str, arguments: str = "") -> Dict[str, Any]:
 
     Returns:
         {"ok": True, "result": <预览>, "full_path": ..., "elapsed_s": ...,
-         "job_dir": ...} 或 {"error": ..., "job_dir": ...}（job_dir=作业目录）。
-        预览按**整条目**裁剪（永远是合法 JSON）；被裁时多带 preview_note
-        说明裁了几条、全量在 full_path —— 看到它就别把预览当全量下结论。
+         "next_action": "写结论（勿读 full_path）", "job_dir": ...}
+        或 {"error": ..., "job_dir": ...}。预览按**整条目**裁剪（合法 JSON）；
+        被裁时多带 preview_note。next_action 是硬路标：预览即证据终点。
     """
     # 名称归一化（2026-10-12）：SKILL.md frontmatter 的 name 用连字符
     # （market-screener / strategy-debug），而 skill_run.py 的执行注册表键是**目录名**

@@ -127,6 +127,7 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     承诺拿不到的数据）。要这些口径请用：
       · 换手率/PE/PB/总市值 → `get_stock_info`（turnover_pct/pe_ttm/pb/mcap_yi）
       · 量比/量能 → `technical_analysis`（量价维聚合）
+      · 盘中 VWAP/开盘区间/分时均线 → `get_intraday_structure`（本工具只有报价快照）
     """
     # 归一化：剥离市场后缀（.SZ/.SH）与市场前缀（sh/sz），与 get_tickers 的
     # symbol 键对齐（get_tickers 返回的 symbol 是纯代码，如 "300497"）。
@@ -180,6 +181,9 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
 def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qfq") -> Dict[str, Any]:
     """K线数据：返回统一结构的 OHLCV 序列，支持 A 股，1D/1W 走本地库直连。
     ⚠ 仅在需要原始数据或自定义计算时调用（趋势/指标/形态/量价/筹码分析已内置取数）。
+    ⚠ 盘中结构/多周期方向不要从本工具原始序列自己算，用现成结论：
+      · VWAP/开盘区间/分时均线 → `get_intraday_structure`
+      · 日线+15m+5m 方向一致/冲突 → `get_multiframe_direction`
 
     Args:
         codes: 股票代码，字符串（如 "603466"）或代码列表，多股逗号分隔

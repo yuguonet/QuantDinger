@@ -433,7 +433,20 @@ def create_app(config_name='default'):
         # warning ⇒ **定时任务从未启动过**（事故 C-1，静默失效）。
         # 与 `cron/cron_tools.py`、`app/routes/cron.py` 的写法保持一致。
         try:
-            from app.agent.cron.cron_worker import start_cron_worker
+            from app.agent.cron.cron_worker import start_cron_worker, set_alert_notifier
+
+            # 告警推送实现注入（依赖倒置：cron 包不得反向依赖 app.services）。
+            # 未注入时命中告警会 fail-loud 报错，而不是静默丢弃。
+            def _alert_notify(*, user_id, title, message, channels, targets,
+                              symbol, alert_name):
+                from app.services.signal_notifier import SignalNotifier
+                return SignalNotifier().notify_alert(
+                    user_id=user_id, title=title, message=message,
+                    channels=channels, targets=targets,
+                    symbol=symbol, alert_name=alert_name,
+                )
+
+            set_alert_notifier(_alert_notify)
             start_cron_worker()
             logger.info("[CronWorker] 定时任务调度器已启动")
         except Exception as e:

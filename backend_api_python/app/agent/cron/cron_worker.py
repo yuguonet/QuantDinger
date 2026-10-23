@@ -7,7 +7,8 @@ Cron Worker — Agent 定时任务后台执行器（APScheduler 版，2026-10-19
     （表达式是唯一真源，next_fire 由 scheduler.trigger 推导；DB 的 next_run 仅展示）
   · 跨进程互斥：claim 式（UPDATE/DELETE ... RETURNING 原子抢执行权），
     TTL = timeout_seconds + margin（附录 A7-1），不长占 PG 连接（附录 A1-1）
-  · one_shot：DELETE ... RETURNING 作原子 claim，天然至多一次（附录 B1-4 选项一）
+  · one_shot：DELETE ... RETURNING 作原子 claim，天然至多一次（附录 B1-4 选项一）；
+    mode='alert' 例外 —— 「命中才消费」，claim 阶段只加锁不删除（见 _claim_job）
   · 重启 catch-up：启动时对照 DB next_run 补触发宽限内的错过触发，标 is_misfire
     （附录 B1-3——APScheduler misfire 只覆盖进程活着的场景）
   · 对账循环（默认 45s）：DB ⇄ 内存 trigger diff，解决多 worker CRUD 传播
@@ -143,6 +144,11 @@ _SCHEMA_STATEMENTS = (
     "ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
     "ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS run_token VARCHAR(64)",
     "ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS next_run TIMESTAMPTZ",
+    # ── 告警模式（mode='alert'）· 2026-10-23 ──
+    # condition: 结构化条件（字段+运算符+阈值），由 alert_eval.evaluate() 求值
+    # notify:    {"channels": [...], "targets": {...}}，命中后的推送配置
+    'ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS "condition" JSONB',
+    'ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS "notify" JSONB',
     """CREATE TABLE IF NOT EXISTS qd_agent_cron_runs (
         id SERIAL PRIMARY KEY,
         job_id INTEGER,
@@ -191,9 +197,11 @@ def _ensure_cron_schema():
 #  DB 小工具
 # ═══════════════════════════════════════════════════════════════
 
+# condition / notify 为 2026-10-23 告警模式（mode='alert'）新增，详见 alert_eval.py
 _JOB_COLUMNS = ("id, name, cron_expr, mode, prompt, function_path, description, "
                 "one_shot, enabled, session_id, misfire_grace_time, trading_days_only, "
-                "timeout_seconds, locked_until, run_token, next_run, last_run_at")
+                'timeout_seconds, locked_until, run_token, next_run, last_run_at, '
+                '"condition", "notify"')
 
 
 def _as_aware(dt):
@@ -299,13 +307,23 @@ def _disable_job(job_id: int, reason: str):
 # ═══════════════════════════════════════════════════════════════
 #  claim 互斥（附录 A1-1 / B1-4 / A7-1）
 #  · recurring: UPDATE ... WHERE enabled AND 空闲 RETURNING *（短连接，不长占）
-#  · one_shot : DELETE ... RETURNING * 作原子 claim，天然至多一次
+#  · one_shot (mode!='alert'): DELETE ... RETURNING * 作原子 claim，天然至多一次
+#  · one_shot (mode=='alert'): 「命中才消费」——claim 阶段 UPDATE 加锁不删除，
+#    命中后由 _run_alert_body 再次调用本函数消费（见 _claim_job 的 mode 分派）
 #  · 执行结束由执行线程释放（finally）；崩溃靠 TTL 自然恢复
 # ═══════════════════════════════════════════════════════════════
 
 
 def _claim_job(job: dict) -> Optional[dict]:
-    """抢执行权。成功返回**以 DB 为准**的完整任务行；失败 None（被他人持有/已消失/已禁用）。"""
+    """抢执行权。成功返回**以 DB 为准**的完整任务行；失败 None（被他人持有/已消失/已禁用）。
+
+    one_shot 的消费策略在**本函数内**按 mode 分派（调用方零记忆）：
+      · mode != 'alert'：one_shot = claim 即 DELETE ... RETURNING（原子至多一次）。
+        非交易日跳过 / 进程内错过 / 超宽限 catch-up 消费一次性任务都走这里。
+      · mode == 'alert'：一次性告警是「**命中才消费**」——claim 阶段只 UPDATE 加锁，
+        **绝不 DELETE**。否则第一次检查未命中就把任务删了 ⇒ 永远等不到条件成立。
+        命中后由 _run_alert_body 再次调用本函数完成消费。
+    """
     job_id = job.get("id")
     if not job_id:
         return None
@@ -314,7 +332,7 @@ def _claim_job(job: dict) -> Optional[dict]:
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:
             cur = conn.cursor()
-            if job.get("one_shot"):
+            if job.get("one_shot") and job.get("mode") != "alert":
                 # 原子 claim：拿到行的进程才有执行权（行即删除 ⇒ 至多一次）
                 cur.execute("DELETE FROM qd_agent_cron_jobs WHERE id = %s AND enabled = TRUE RETURNING *",
                             (job_id,))
@@ -424,13 +442,110 @@ def _run_function_body(job: dict, outcome: dict):
 # ═══════════════════════════════════════════════════════════════
 
 
+# ── 告警推送钩子（依赖倒置）────────────────────────────────────
+# ★ 为什么用钩子而不是直接 import SignalNotifier：
+#   本包的单向契约（见 cron/__init__.py，由 tests/test_v6_cron_boundary.py 钉住）
+#   禁止 `app.agent.cron → app.routes / app.services`（会与消费方成环）。
+#   推送实现由外部（app/__init__.py 启动期）注入，本包只认可调用对象。
+_alert_notifier = None
+
+
+def set_alert_notifier(fn) -> None:
+    """注入告警推送实现。fn(user_id, title, message, channels, targets, symbol, alert_name) -> dict。"""
+    global _alert_notifier
+    _alert_notifier = fn
+
+
+def _run_alert_body(job: dict, outcome: dict):
+    """告警模式执行体：求值条件 → 命中才推送 → 命中且 one_shot 才消费任务。
+
+    ★ 与 prompt 模式的分工（这是"参数识别"落地的位置）：
+      · prompt 模式 = 到点**必跑** LLM，让模型自己看数据判条件
+      · alert  模式 = 到点先做**零成本确定性判定**，未命中直接返回，不跑 LLM
+      判定规则见 alert_eval.evaluate（字段字典 + 运算符 + 阈值）。
+
+    ★ one_shot 语义（与 prompt 模式不同，务必注意）：
+      一次性告警是「命中才消费」——未命中保留任务行继续等。claim 阶段刻意
+      不删（见 _claim_job 的 mode 分派），只有**命中**后才在此消费。
+    """
+    import json as _json
+
+    from .alert_eval import evaluate
+
+    def _as_obj(v):
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except Exception:                          # noqa: BLE001 — 转显式 error
+                raise ValueError(f"字段不是合法 JSON: {str(v)[:120]}")
+        return v or {}
+
+    cond = _as_obj(job.get("condition"))
+    res = evaluate(cond)
+    outcome["result"] = res
+    outcome["ok"] = True
+    outcome["hit"] = bool(res.get("hit"))
+
+    if res.get("error"):
+        # 条件不可判定：如实报错（不猜、不静默）
+        outcome["error"] = RuntimeError(f"告警条件无法判定: {res['error']}")
+        return
+
+    if not res.get("hit"):
+        return
+
+    # ── 命中：推送 ────────────────────────────────────────────
+    notify = _as_obj(job.get("notify"))
+    channels = notify.get("channels") or ["browser"]
+    targets = notify.get("targets") or {}
+    # 单用户部署假设（既有项目约定：user_id 默认 1，见用户维度总裁定）
+    user_id = int(notify.get("user_id") or 1)
+
+    actual = res.get("actual") or {}
+    name = job.get("name") or "告警"
+    symbol = res.get("symbol") or ""
+    check = res.get("check") or {}
+    # 单子句：字段=实际值 op 阈值
+    detail = (f"{check.get('field')}={actual.get(check.get('field'))} "
+              f"{check.get('op')} {check.get('value')}")
+    title = f"告警触发：{name}"
+    message = f"{name}（{symbol}）条件满足\n{detail}\n快照时间: {res.get('snapshot_time') or '-'}"
+
+    if _alert_notifier is None:
+        # fail-loud：命中却没人接 = 告警形同虚设，必须显式暴露（对应 F15b）
+        outcome["error"] = RuntimeError(
+            "告警已命中但未注入推送实现（启动期需调用 set_alert_notifier）"
+        )
+        logger.error("[CronWorker] %s", outcome["error"])
+        return
+
+    try:
+        outcome["notify_result"] = _alert_notifier(
+            user_id=user_id, title=title, message=message,
+            channels=channels, targets=targets,
+            symbol=symbol, alert_name=name,
+        )
+    except Exception as e:                              # noqa: BLE001 — 记账
+        outcome["error"] = e
+        return
+
+    # ── 命中且 one_shot：消费掉任务（复用 _claim_job 的 DELETE 分支）──
+    if job.get("one_shot"):
+        try:
+            _claim_job(job)   # mode='alert' 且命中后，这里才 DELETE 消费
+            logger.info("[CronWorker] 一次性告警已命中并消费: %s", name)
+        except Exception as e:                          # noqa: BLE001 — 不影响已推送
+            logger.error("[CronWorker] 告警命中后删除任务失败 job=%s: %s",
+                         job.get("id"), e)
+
+
 def _run_job(job: dict, trigger_source: str = "cron",
              fire_time=None, is_misfire: bool = False,
              force_mode: Optional[str] = None):
     """claim → 交易日闸 → 并发预算 → 执行(带超时) → 记账/SSE。
 
     语义要点：
-      · one_shot 的 claim 即删除（含手动触发——"执行一次后自动删除"含手动，已知语义）
+      · one_shot 的消费策略由 _claim_job 按 mode 分派（alert="命中才消费"）
       · 交易日闸只作用于 cron/catchup；手动触发是显式意图，直跑（附录 B2-5）
       · 超时：记 status=timeout 且**不释放锁**，执行线程自然结束时释放（附录 B2-7）
       · 并发预算：超出 MAX_CONCURRENT_RUNS 排队，等待时长落 runs 表（附录 C1-15）
@@ -440,8 +555,10 @@ def _run_job(job: dict, trigger_source: str = "cron",
     mode = force_mode or job.get("mode", "prompt")
 
     # ── 交易日闸（手动触发豁免）──
+    # 消费策略同 _claim_job：alert 未检查过绝不消费（保留行等下次），
+    # prompt/function 一次性跳过即消费（没有下次触发）。
     if trigger_source != "manual" and job.get("trading_days_only") and not _is_trading_day_today():
-        if job.get("one_shot"):
+        if job.get("one_shot") and job.get("mode") != "alert":
             _claim_job(job)     # 一次性任务没有下次触发：消费掉，如实记账
         _record_run(job_id=job_id, job_name=job_name, status="skipped_nontrading",
                     trigger_source=trigger_source, fire_time=fire_time, is_misfire=is_misfire)
@@ -456,6 +573,8 @@ def _run_job(job: dict, trigger_source: str = "cron",
     queue_wait = _time.monotonic() - t_wait
     try:
         # ── claim（以 DB 返回的完整行为准）──
+        # alert 的 one_shot = "命中才消费"，由 _claim_job 内部按 mode 分派
+        # （claim 阶段不删行，否则永远等不到条件成立，告警静默失效）
         claimed = _claim_job(job)
         if claimed is None:
             _record_run(job_id=job_id, job_name=job_name, status="skipped_lock",
@@ -467,7 +586,6 @@ def _run_job(job: dict, trigger_source: str = "cron",
         job_id = job.get("id", job_id)
         job_name = job.get("name", job_name)
         token = job.get("__run_token", "")
-        one_shot = bool(job.get("one_shot"))
         timeout = int(job.get("timeout_seconds") or 300)
 
         started_at = datetime.now(TZ_CN)
@@ -476,7 +594,12 @@ def _run_job(job: dict, trigger_source: str = "cron",
 
         outcome: Dict[str, Any] = {"ok": False, "result": None, "error": None,
                                    "trigger_source": trigger_source}
-        body = _run_prompt_body if mode == "prompt" else _run_function_body
+        if mode == "prompt":
+            body = _run_prompt_body
+        elif mode == "alert":
+            body = _run_alert_body
+        else:
+            body = _run_function_body
 
         def _body():
             try:
@@ -485,7 +608,9 @@ def _run_job(job: dict, trigger_source: str = "cron",
                 outcome["error"] = e
             finally:
                 # 执行线程自然结束才释放 claim（超时后防双跑的关键，附录 B2-7）
-                if not one_shot and token:
+                # alert 未命中时行未被消费，锁必须释放，否则 locked_until 未过期
+                # 期间后续拍全部 claim 失败 ⇒ 漏检。
+                if token:
                     _release_claim(job_id, token)
 
         th = threading.Thread(target=_body, daemon=True, name=f"cron-run-{job_id}")
@@ -702,8 +827,9 @@ def _catchup_missed():
                         error=f"超出补跑宽限 {grace}s（错过 {int(late)}s）")
             _publish(_make_event("job_missed", row["id"], row.get("name", "?"),
                                  mode=row.get("mode", "prompt"), missed_seconds=int(late)))
-            if row.get("one_shot"):
-                _claim_job(row)   # 一次性任务过期：消费掉（claim 即删除）
+            # 一次性任务过期：消费掉（claim 即删除）——alert 除外（条件未检查过，保留）
+            if row.get("one_shot") and row.get("mode") != "alert":
+                _claim_job(row)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -735,8 +861,9 @@ def _on_job_missed(event):
                          mode=row.get("mode", "prompt"),
                          missed_seconds=int(late_s) if late_s is not None else None))
     logger.warning("[CronWorker] ⚠ 进程内错过触发: %s（%s）", row.get("name", "?"), err)
-    if row.get("one_shot"):
-        _claim_job(row)   # 与 catch-up 超宽限分支一致：消费掉，不留残行
+    # 一次性任务消费掉（不留残行）——alert 除外（条件未检查过，保留行等下次）
+    if row.get("one_shot") and row.get("mode") != "alert":
+        _claim_job(row)
 
 
 def _attach_listeners(scheduler):

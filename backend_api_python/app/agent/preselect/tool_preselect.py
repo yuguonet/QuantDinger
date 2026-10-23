@@ -104,11 +104,22 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
      ("get_realtime_quote", "get_index_quote")),   # get_index_etf_quote → get_index_quote
 
     ("kline", ("k线", "K线", "日线", "周线", "历史", "走势", "均线", "ma5", "ma20",
-               "ma60", "kline", "蜡烛"),
-     ("agent_get_kline", "get_index_kline", "technical_analysis")),  # calculate_ma → technical_analysis
+               "ma60", "kline", "蜡烛",
+               # 盘中结构三件套（2026-10-23）：VWAP/开盘区间/分时均线
+               "vwap", "VWAP", "开盘区间", "分时均线", "分时", "均价线", "日内结构",
+               "intraday",
+               # 多周期方向（2026-10-23）：日线定势 + 15m/5m 定节奏
+               "多周期", "日线定势", "15分钟", "5分钟", "15m", "5m", "周期共振",
+               "多周期方向", "一致", "冲突", "multiframe", "mtf"),
+     ("agent_get_kline", "get_index_kline", "technical_analysis",
+      "get_intraday_structure", "get_multiframe_direction")),  # calculate_ma → technical_analysis
 
     ("trend", ("技术面", "趋势", "形态", "支撑", "压力", "突破", "macd", "kdj", "rsi",
-               "指标", "多头", "空头", "背离"),
+               "指标", "多头", "空头", "背离",
+               # 盘中结构（开盘区间突破 / 分时均线排列）
+               "开盘区间突破", "orb", "ORB", "盘中方向", "日内方向",
+               # 多周期方向（日线+15m+5m）
+               "多周期", "周期共振", "日线定势", "定节奏", "多周期方向"),
     # analyze_trend / get_indicator_snapshot → technical_analysis；
     # indicator_tools 模块已并入 technical_analysis（run_indicator_signal /
     # list_indicators 不再注册），指标类查询一律走 technical_analysis
@@ -118,7 +129,7 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     #   可达，本域词典未纳管）。本条为 10-16 退休决定的历史陈述；后续评估：
     #   4 个指标工具是否纳管本词典（技术分析域），见附录 AN §5 后续清单。
      ("technical_analysis", "analyze_pattern",
-      "analyze_chart_patterns")),
+      "analyze_chart_patterns", "get_intraday_structure", "get_multiframe_direction")),
 
     ("fundflow", ("资金流", "主力", "净流入", "净流出", "大单", "超大单", "北向",
                   "融资", "主力净额"),
@@ -184,6 +195,24 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
 
     ("knowledge", ("知识库", "文档", "资料", "笔记", "之前记录", "咱们的"),
      ("search_knowledge",)),
+
+    # ★ 2026-10-23 用户裁定：schedule 域工具（定时任务/条件告警）从 common
+    #   （必注入层）移出到 tools/schedule/ 子目录走按需预选 —— 5 个窄场景工具
+    #   原先每轮白占 ~3.8k 字符 schema。本条目是移出后**唯一**的选中通道
+    #   （`detect_domains` 关键词命中 ⇒ 域候选全收），词典覆盖失败 = 用户
+    #   说"建个定时任务"却选不中工具，故关键词按真实问法铺开。
+    #   匹配方式是子串 `in`（detect_domains:233）⇒ "每5分钟/每10分钟"这类
+    #   无限节拍变体无法穷举（残留盲区：靠 search_resources 逃生门自救），
+    #   其余能收的词一律收。
+    #   刻意不收"每天/每周/开盘/分钟"等裸词：会误命中"每天涨停的股票"
+    #   "5分钟K线"这类 screen/kline 问句（误命中只是多带 schema，漏命中是
+    #   功能失效，取不漏——但这两个词的误命中面大到不值得，故不收）。
+    ("schedule", ("定时", "提醒", "告警", "警报", "监视", "盯着", "监控",
+                  "条件单", "计划任务", "自动执行", "cron", "schedule", "alert",
+                  "跌破", "涨破", "跌到", "涨到", "告诉我", "通知我",
+                  "每分钟", "每小时", "每隔"),
+     ("create_cron_job", "create_alert_job", "list_cron_jobs",
+      "remove_cron_job", "toggle_cron_job")),
 )
 
 # 派生视图：域 → 候选工具 / 域 → 首选工具（勿单独维护）

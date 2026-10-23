@@ -71,10 +71,87 @@ _MAGNITUDE_RE = re.compile(
     r"(?:涨|跌|上涨|下跌|涨幅|跌幅|振幅)?\s*[约至]?\s*([+-]?\d+(?:\.\d+)?)\s*%")
 _MAG_SIGN_RE = re.compile(r"(跌|下跌|跌幅|回落|回调|下探|走弱|看空|看跌|偏空)")
 
-# 点位：目标价/目标位/支撑/压力/不跌破/站稳 X(.XX)
+# 点位：目标价/目标位/支撑/压力/止损/不跌破/站稳 X(.XX)
+# ★ 2026-10-23：加「止损|跌破|跌穿」——选股结论的「止损价」是 level claim 主来源
+#   （「走坏了能不能全身而退」必须可被 T+N 追责），旧表漏掉止损词 ⇒ 止损位永远抽不到。
 _LEVEL_RE = re.compile(
-    r"(目标价|目标位|支撑|支撑位|压力|压力位|不跌破|站稳|突破|站上)\s*"
+    r"(目标价|目标位|支撑|支撑位|压力|压力位|止损|止损位|不跌破|跌破|跌穿|站稳|突破|站上)\s*"
     r"(?:在)?\s*(\d+(?:\.\d+)?)")
+
+# ── 多周期方向（2026-10-23）─────────────────────────────────────────
+# 【为什么】经验库/label_spec 本来就支持 T+1/T+3/T+5，但 extract_claims 原先
+# 只 guess_horizon **一次**、整篇共享同一 horizon ⇒ 结论表里的三档方向
+# 只有一档进追责，T+1 与 T+3 被混成一票。现每档各立 claim，resolver 按
+# due_date 分日到期。
+# 【周期上限】用户裁定：筛选封顶 **T+20 ≈ 1M**；T+10/T+20 同 2W/1M 天数。
+_HORIZON_DIR_RE = re.compile(
+    r"T\s*\+?\s*(10|20|1|3|5)\s*[）)】\]]?\s*[：:，,、\s]*"
+    r"(看多|看涨|偏多|做多|看空|看跌|偏空|中性|震荡|回避|不适用)", re.I)
+# 表头「T+1/T+3/T+5(/T+10/T+20)」+ 单元格同序映射
+_TN_HEADER_RE = re.compile(
+    r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5", re.I)
+_TN_HEADER5_RE = re.compile(
+    r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5\s*[/／|]\s*"
+    r"T\s*\+?\s*10\s*[/／|]\s*T\s*\+?\s*20", re.I)
+_TN_CELL_RE = re.compile(
+    r"(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
+    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
+    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
+    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用))?"
+    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用))?",
+    re.I)
+
+_DIR_MAP = {
+    "看多": "bullish", "看涨": "bullish", "偏多": "bullish", "做多": "bullish",
+    "看空": "bearish", "看跌": "bearish", "偏空": "bearish",
+    "中性": "neutral", "震荡": "neutral", "回避": "neutral", "不适用": "neutral",
+}
+
+
+def _map_dir(word: str) -> Optional[str]:
+    return _DIR_MAP.get(str(word or "").strip())
+
+
+def extract_horizon_directions(text: str) -> List[Tuple[str, str]]:
+    """从结论抽「周期 → 方向」多档（宁漏不脏：认不出的词跳过）。
+
+    支持两种写法：
+      1. `T+1看多 / T+3中性 / T+5看空 / T+10… / T+20…`（封顶 T+20≈1M）
+      2. 表格 `T+1/T+3/T+5[/T+10/T+20]` 列 + 单元格同序
+    Returns:
+        [("T+1","bullish"), ("T+3","neutral"), ...]  不去重顺序保留；中性不产出
+        （neutral 无追责价值，与 _extract_direction 口径一致）。
+    """
+    t = text or ""
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for m in _HORIZON_DIR_RE.finditer(t):
+        lab = "T+%s" % m.group(1)
+        d = _map_dir(m.group(2))
+        if not d or d == "neutral":
+            continue
+        key = (lab, d)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    # 表头 + 同行三档/五档单元格
+    if not out and (_TN_HEADER5_RE.search(t) or _TN_HEADER_RE.search(t)):
+        labs5 = bool(_TN_HEADER5_RE.search(t))
+        for m in _TN_CELL_RE.finditer(t):
+            names = ("T+1", "T+3", "T+5", "T+10", "T+20") if labs5 else \
+                    ("T+1", "T+3", "T+5")
+            for i, lab in enumerate(names):
+                if i + 1 > (m.lastindex or 0):
+                    break
+                d = _map_dir(m.group(i + 1))
+                if not d or d == "neutral":
+                    continue
+                key = (lab, d)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+            break   # 只认第一行（宁漏不脏）
+    return out
 
 
 # 视界
@@ -378,29 +455,38 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
     concl = _conclusion_text(answer)
     horizon = guess_horizon(f"{query}\n{concl}", horizon_default)
     conf = guess_confidence(concl)
-    due = due_date_of(horizon, exec_date)
     out: List[Dict[str, Any]] = []
 
-    def _add(claim_type: str, predicted: Dict[str, Any], quote: str) -> None:
+    def _add(claim_type: str, predicted: Dict[str, Any], quote: str,
+             hz: Optional[str] = None) -> None:
         if len(out) >= max_claims:
             return
+        h = hz or horizon
         out.append({
             "claim_type": claim_type,
             "subject": subject,
             "subject_kind": subject_kind,
-            "horizon": horizon,
+            "horizon": h,
             "predicted": predicted,
             "confidence": conf,
             "evidence": concl[:300],
             "source_quote": quote,
-            "due_date": due,
+            "due_date": due_date_of(h, exec_date),
             "seq": len(out),
         })
 
-    # ① 方向（主 claim，与旧表 direction 同口径）
-    d = _extract_direction(answer)
-    if d and d != "neutral":
-        _add("direction", {"dir": d}, _conclusion_text(answer, span=200)[:200])
+    # ① 方向：优先**多周期**（T+1/T+3/T+5 各立 claim，2026-10-23）；
+    #    抽不到再退单条全局方向（旧行为）
+    hz_dirs = extract_horizon_directions(answer)
+    if hz_dirs:
+        for lab, d in hz_dirs:
+            if len(out) >= max_claims:
+                break
+            _add("direction", {"dir": d}, lab, hz=lab)
+    else:
+        d = _extract_direction(answer)
+        if d and d != "neutral":
+            _add("direction", {"dir": d}, _conclusion_text(answer, span=200)[:200])
 
     # ② 幅度：只在结论段里抽，且必须有 % 与涨跌语义
     m = _MAGNITUDE_RE.search(concl)

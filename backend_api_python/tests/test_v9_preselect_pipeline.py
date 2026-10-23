@@ -70,6 +70,12 @@ EXPECTED_CHANGES = {
     #    场景就要回来补一条）。前缀口径不会误豁免真实的未登记变更——
     #    `messages` / `messages_no_hist` 这两个顶层键的**唯一**内容就是
     #    preselect 消息，不含 catalog / lint / parse_* 等其它采集面。
+    # ⑦ 【2026-10-23 附录 AQ】schedule 域新建：5 个定时/告警工具从 common
+    #    （必注入层）移入 tools/schedule/ 子目录走按需预选（用户裁定：窄场景
+    #    工具不该每轮白占 ~3.8k 字符 schema）。`_PREFERRED`（域→首选工具）
+    #    因此多出 `schedule: create_cron_job` 一条，其余键不变（工具总量 58
+    #    不变、只换域）。必注入 schema 7,349→3,535 由设计机检 B8 对账。
+    "preferred.schedule",
 }
 
 # 前缀豁免（见 ⑥）：preselect system 变更波及的所有消息场景键。
@@ -82,7 +88,7 @@ def _is_expected_change(key: str) -> bool:
 
 
 def test_baseline_parity_except_expected():
-    """改造前后逐键对拍：除登记在案的 11 处有意变更，其余必须一字不差。"""
+    """改造前后逐键对拍：除登记在案的 12 处有意变更，其余必须一字不差。"""
     bad = [d for d in diff(collect(), load_baseline())
            if not _is_expected_change(d.split(":")[0].strip())]
     assert not bad, "预选管线输出发生未登记的变化：\n  " + "\n  ".join(bad[:30])

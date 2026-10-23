@@ -507,6 +507,74 @@ def test_on_job_missed_consumes_one_shot(monkeypatch):
     assert any(s.strip().startswith("DELETE FROM qd_agent_cron_jobs") for s, _ in log)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  ⑧ 告警模式（mode='alert'）one_shot 语义守卫（2026-10-23）
+#  · 一次性告警 = 「命中才消费」：未命中时行必须保留，否则永远等不到条件成立。
+#  · 该语义只收口在 _claim_job 内部（按 mode 判断），7 个调用点零 mode 记忆。
+# ═══════════════════════════════════════════════════════════════
+
+def test_claim_alert_one_shot_uses_update_not_delete(monkeypatch):
+    """mode='alert' 的一次性任务：claim 阶段必须 UPDATE 加锁，绝不 DELETE。"""
+    from app.agent.cron import cron_worker as cw
+    log = _install_fake_db(monkeypatch, fetchone_rows=[
+        {"id": 11, "name": "al", "mode": "alert", "one_shot": True,
+         "timeout_seconds": 300, "enabled": True}])
+    claimed = cw._claim_job({"id": 11, "mode": "alert", "one_shot": True,
+                             "timeout_seconds": 300})
+    assert claimed and claimed["id"] == 11
+    sql, _ = log[0]
+    assert sql.strip().startswith("UPDATE qd_agent_cron_jobs")
+    assert "locked_until" in sql and "run_token" in sql
+    assert "enabled = TRUE" in sql
+
+
+def test_claim_prompt_one_shot_still_delete(monkeypatch):
+    """mode='prompt' 的一次性任务：仍 DELETE...RETURNING 原子 claim（至多一次）。"""
+    from app.agent.cron import cron_worker as cw
+    log = _install_fake_db(monkeypatch, fetchone_rows=[
+        {"id": 12, "name": "pt", "mode": "prompt", "one_shot": True,
+         "timeout_seconds": 300, "enabled": True}])
+    claimed = cw._claim_job({"id": 12, "mode": "prompt", "one_shot": True,
+                             "timeout_seconds": 300})
+    assert claimed and claimed["id"] == 12
+    sql, _ = log[0]
+    assert sql.strip().startswith("DELETE FROM qd_agent_cron_jobs")
+    assert "RETURNING *" in sql and "enabled = TRUE" in sql
+
+
+def test_run_job_alert_does_not_consume_on_non_trading_day(monkeypatch):
+    """非交易日跳过 alert 任务：不能消费（未检查过的告警行必须保留）。"""
+    from app.agent.cron import cron_worker as cw
+    monkeypatch.setattr(cw, "_is_trading_day_today", lambda: False)
+    log = _install_fake_db(monkeypatch,
+                           fetchone_rows=[{"id": 13, "name": "al", "mode": "alert",
+                                           "one_shot": True, "enabled": True}],
+                           all_rows=[])
+    cw._run_job({"id": 13, "name": "al", "mode": "alert",
+                 "trading_days_only": True, "one_shot": True}, trigger_source="cron")
+    sqls = [s for s, _ in log]
+    assert not any(s.strip().startswith("DELETE FROM qd_agent_cron_jobs") for s in sqls), \
+        "alert 任务非交易日跳过不能消费（未检查过，须保留行等下次）"
+    assert any("skipped_nontrading" in (p or ()) for _, p in log if p)
+
+
+def test_on_job_missed_keeps_alert_row(monkeypatch):
+    """进程内错过 alert 任务：不消费（条件未检查过，行必须保留）。"""
+    from app.agent.cron import cron_worker as cw
+    log = _install_fake_db(monkeypatch, fetchone_rows=[
+        {"id": 14, "name": "al", "mode": "alert", "one_shot": True,
+         "enabled": True}])
+    recorded = []
+    monkeypatch.setattr(cw, "_record_run", lambda **kw: recorded.append(kw))
+    ev = types.SimpleNamespace(
+        job=types.SimpleNamespace(id="cron-14"),
+        scheduled_run_time=datetime.now(cw.TZ_CN) - timedelta(minutes=10))
+    cw._on_job_missed(ev)
+    assert recorded and recorded[0]["status"] == "missed"
+    assert not any(s.strip().startswith("DELETE FROM qd_agent_cron_jobs") for s, _ in log), \
+        "alert 任务进程内错过不能消费（条件未检查过，须保留行）"
+
+
 def test_on_job_missed_ignores_foreign_job_ids(monkeypatch):
     from app.agent.cron import cron_worker as cw
     log = _install_fake_db(monkeypatch)

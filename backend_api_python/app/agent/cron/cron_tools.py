@@ -105,6 +105,43 @@ def _parse_at_time(at: str) -> tuple[str, bool]:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  辅助：cron 表达式守卫（F6 调度滥用防线，两处创建共用）
+# ═══════════════════════════════════════════════════════════════
+
+
+def _guard_cron_expr(cron_expr: str) -> Optional[str]:
+    """校验 cron 表达式并应用 F6 防线（最短间隔/任务数上限）。
+
+    Returns:
+        合法返回 None；非法返回错误描述字符串。
+    """
+    try:
+        from . import guards as _cguard
+    except Exception:
+        return None
+    if _cguard is None or not cron_expr:
+        return None
+    try:
+        _exist = 0
+        try:
+            from app.utils.db import get_db_connection as _gdb
+            with _gdb() as _dc:
+                _c = _dc.cursor()
+                _c.execute("SELECT COUNT(*) AS n FROM qd_agent_cron_jobs")
+                _r = _c.fetchone()
+                _exist = int((_r.get("n") if isinstance(_r, dict) else _r[0]) or 0)
+                _c.close()
+        except Exception:
+            _exist = 0
+        _v = _cguard.guard_create(cron_expr=cron_expr, existing_count=_exist)
+        if not _v.get("ok"):
+            return _v.get("error") or "cron guard rejected"
+    except Exception:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
 #  工具函数
 # ═══════════════════════════════════════════════════════════════
 
@@ -157,28 +194,9 @@ def create_cron_job(
         return {"error": "必须提供 cron_expr 或 at 参数"}
 
     # F6 调度滥用防线：表达式校验 + 最短间隔 + 任务数上限
-    try:
-        from . import guards as _cguard
-    except Exception:
-        _cguard = None
-    if _cguard is not None and cron_expr:
-        try:
-            _exist = 0
-            try:
-                from app.utils.db import get_db_connection as _gdb
-                with _gdb() as _dc:
-                    _c = _dc.cursor()
-                    _c.execute("SELECT COUNT(*) AS n FROM qd_agent_cron_jobs")
-                    _r = _c.fetchone()
-                    _exist = int((_r.get("n") if isinstance(_r, dict) else _r[0]) or 0)
-                    _c.close()
-            except Exception:
-                _exist = 0
-            _v = _cguard.guard_create(cron_expr=cron_expr, existing_count=_exist)
-            if not _v.get("ok"):
-                return {"error": _v.get("error") or "cron guard rejected"}
-        except Exception:
-            pass
+    guard_err = _guard_cron_expr(cron_expr)
+    if guard_err:
+        return {"error": guard_err}
 
     try:
         from app.utils.db import get_db_connection
@@ -226,6 +244,148 @@ def create_cron_job(
 
     except Exception as e:
         logger.error("[CronTools] 创建任务失败: %s", e)
+        return {"error": f"创建失败: {e}"}
+
+
+def _validate_alert_clause(field: str, op: str, value) -> Optional[str]:
+    """校验一条告警子句。返回错误描述，合法返回 None。"""
+    from .alert_eval import FIELDS, _OPS
+
+    if field not in FIELDS:
+        return f"未知字段 '{field}'（可用: {sorted(FIELDS)}）"
+    if op not in _OPS:
+        return f"未知运算符 '{op}'（可用: {sorted(_OPS)}）"
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return f"阈值必须是数值，收到: {value!r}"
+    return None
+
+
+def create_alert_job(
+    name: str,
+    symbol: str,
+    field: str,
+    op: str,
+    value: float,
+    at: str = "",
+    cron_expr: str = "",
+    one_shot: bool = True,
+    message: str = "",
+    channels: str = "browser",
+) -> Dict:
+    """创建**条件告警**任务：到点检查参数，条件满足才推送提醒。
+
+    与 create_cron_job 的区别（这是本函数存在的理由）：
+      · create_cron_job（mode='prompt'）：到点**必跑**一次 LLM，让模型看数据判断
+      · create_alert_job（mode='alert'）：到点只做**零成本数值判定**，不满足就
+        返回，不调 LLM。判定规则是确定的字段比较，不是模型自由心证。
+
+    one_shot 语义：**命中才消费**。未命中时任务保留并继续按节拍检查，
+    不会像 prompt 模式的一次性任务那样第一次触发就消失。
+
+    Args:
+        name: 告警名（如"600519 跌到1650"）
+        symbol: 标的代码（如 "600519"）
+        field: 监测字段，取 alert_eval.FIELDS：
+            last 现价 / open 今开 / high 最高 / low 最低 /
+            previousClose 昨收 / changePercent 涨跌幅(%) / volume 累计量(股)
+        op: 比较符：> >= < <= == !=
+        value: 阈值（数值）
+        at: 检查节拍，同 create_cron_job（如 "开盘期间,每5分钟"）
+        cron_expr: 5 段式 cron，与 at 二选一
+        one_shot: 命中一次后是否结束（默认 True）
+        message: 命中时附带的说明（可选）
+        channels: 推送通道，逗号分隔（browser/telegram/email/webhook/discord）
+
+    Returns:
+        {"job_id": int, "name": str, "mode": "alert", "next_run": str,
+         "condition": {...}}；失败时 {"error": str}
+    """
+    if not name:
+        return {"error": "告警名称不能为空"}
+    if not symbol:
+        return {"error": "标的代码不能为空"}
+    err = _validate_alert_clause(field, op, value)
+    if err:
+        return {"error": err}
+
+    if at and not cron_expr:
+        parsed_cron, parsed_one_shot = _parse_at_time(at)
+        if not parsed_cron:
+            return {"error": f"无法解析时间描述: '{at}'"}
+        cron_expr = parsed_cron
+        # alert 的 one_shot 由调用方显式控制：at 指定具体时刻才强制一次性
+        if parsed_one_shot:
+            one_shot = True
+    elif cron_expr:
+        for sub in cron_expr.split("|"):
+            if len(sub.strip().split()) != 5:
+                return {"error": f"cron 表达式格式错误（需要5段）: '{sub.strip()}'"}
+    else:
+        return {"error": "必须提供 cron_expr 或 at 参数"}
+
+    # F6 调度滥用防线（与 create_cron_job 同一条防线）
+    guard_err = _guard_cron_expr(cron_expr)
+    if guard_err:
+        return {"error": guard_err}
+
+    condition = {
+        "symbol": symbol.strip(),
+        "field": field,
+        "op": op,
+        "value": float(value),
+    }
+    ch_list = [c.strip() for c in (channels or "browser").split(",") if c.strip()]
+    notify = {"channels": ch_list or ["browser"], "targets": {}}
+
+    try:
+        import json as _json
+        from app.utils.db import get_db_connection
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO qd_agent_cron_jobs
+                    (name, cron_expr, mode, prompt, description, one_shot,
+                     "condition", "notify")
+                VALUES (%s, %s, 'alert', %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (name, cron_expr,
+                  f"{symbol} {field} {op} {value}" + (f" — {message}" if message else ""),
+                  message or None, one_shot,
+                  _json.dumps(condition), _json.dumps(notify)))
+            row = cur.fetchone()
+            conn.commit()
+            job_id = row["id"]
+
+        try:
+            from .cron_worker import schedule_job_from_db
+            schedule_job_from_db(job_id)
+        except Exception as e:
+            logger.warning("[CronTools] 告警调度注册失败: %s", e)
+
+        try:
+            from .cron_worker import next_cron_time
+            nxt = next_cron_time(cron_expr, datetime.now(TZ_CN), max_search_days=400)
+            next_run = (nxt.strftime("%Y-%m-%d %H:%M") if nxt
+                        else "(表达式无效，不会执行)")
+        except Exception:
+            next_run = "(计算失败)"
+
+        logger.info("[CronTools] 创建告警: id=%d name=%s cond=%s one_shot=%s",
+                    job_id, name, condition, one_shot)
+        return {
+            "job_id": job_id,
+            "name": name,
+            "mode": "alert",
+            "cron_expr": cron_expr,
+            "next_run": next_run,
+            "one_shot": one_shot,
+            "condition": condition,
+            "status": "created",
+        }
+    except Exception as e:
+        logger.error("[CronTools] 创建告警失败: %s", e)
         return {"error": f"创建失败: {e}"}
 
 

@@ -408,9 +408,10 @@ def test_run_funnel_two_rounds_when_low_alive():
 
     def fake_score_pool(cands, strategy="", market=None, main_themes=None,
                         p_up_floor=0.40, rank_cut=0.30, floor_keep=4,
-                        no_pred_keep=2):
+                        no_pred_keep=2, **kw):
         round_params.append({"p_up_floor": p_up_floor, "rank_cut": rank_cut,
-                             "floor_keep": floor_keep, "no_pred_keep": no_pred_keep})
+                             "floor_keep": floor_keep, "no_pred_keep": no_pred_keep,
+                             "w2s_keep": kw.get("w2s_keep")})
         if len(round_params) == 1:
             # Round0：只活 2 只
             selected = [{"code": "600000", "p_up": 0.55}, {"code": "600001", "p_up": 0.50}]

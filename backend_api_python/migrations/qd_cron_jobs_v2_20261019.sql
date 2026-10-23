@@ -47,3 +47,15 @@ CREATE INDEX IF NOT EXISTS idx_cron_runs_started ON qd_agent_cron_runs(started_a
 COMMENT ON TABLE qd_agent_cron_runs IS 'Agent 定时任务运行历史（含 skipped/missed，附录A2-5）';
 COMMENT ON COLUMN qd_agent_cron_runs.status IS 'ok|error|timeout|skipped_lock|skipped_nontrading|missed';
 COMMENT ON COLUMN qd_agent_cron_runs.is_misfire IS 'TRUE=错过触发后宽限期内补跑';
+
+-- =============================================================================
+-- 告警模式（mode='alert'）· 2026-10-23
+-- ⚠ 与 app/agent/cron/cron_worker.py::_SCHEMA_STATEMENTS 同源，改动须两处同步
+-- =============================================================================
+ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS "condition" JSONB;
+ALTER TABLE qd_agent_cron_jobs ADD COLUMN IF NOT EXISTS "notify"    JSONB;
+
+COMMENT ON COLUMN qd_agent_cron_jobs."condition" IS
+  '告警条件JSON: {"symbol":"600519","field":"last","op":"<=","value":1650}（单子句）；由 app/agent/cron/alert_eval.py 求值';
+COMMENT ON COLUMN qd_agent_cron_jobs."notify" IS
+  '告警推送配置JSON: {"channels":["browser","telegram"],"targets":{...}}；命中后交由 SignalNotifier.notify_alert 发送';

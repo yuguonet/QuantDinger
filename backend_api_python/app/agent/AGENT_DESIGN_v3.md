@@ -3544,3 +3544,74 @@ re-export 同一实例（`_TOOL_MODULE_IMPORT_FAILURES`）保持。
 同步清理：`tools/_base.py` 的 import / `__all__` / 注释、`tests/test_v6_tools_base_split.py`
 参数列表与守卫测试（改为 `test_tool_weight_migration_must_not_come_back`）、
 `preselect/tool_preselect.py` 注释（改名依据改指 AP.8 附录）。
+
+---
+
+## 附录 AQ · 会话内定时任务/条件告警落地（1-A + 2-B + schedule 域移出必注入层，2026-10-23；用户裁定）
+
+**动机**：用户场景「第一轮"明天买什么股"→ 第二轮"明天开盘后监视，符合条件就提醒我买入"」。
+`app/agent/cron/` 子系统（cron_tools CRUD + cron_worker 执行器 + guards 防线）早已存在，
+但**会话入口未接**：`ToolProvider` 只扫 `tools/`，cron 工具从未进工具面（实测 0 个）。
+
+### ① 1-A · 工具面接入（薄封装，非 re-export）
+- 新增 `tools/schedule_tools.py`（后移入 `tools/schedule/`，见 ③）：5 个**真定义**的
+  同名包装函数，内部 `_impl()` 延迟委托 `cron/cron_tools.py`。
+- ★ 约束：`_schema_gen._is_tool_function` 要求 `obj.__module__ == module.__name__`
+  ⇒ **re-export 注册不上**，必须真定义函数。
+- 依赖方向 `tools → cron`（外部消费方 → cron），不违反 cron 包单向契约。
+
+### ② 2-B · 条件告警模式（mode='alert'）
+- 用户关键质疑「cron 怎么识别参数」⇒ **cron 只管 when，参数识别靠独立求值层**
+  （否则每拍唤醒 LLM 问"到了吗"，按耗时公式纯浪费）。
+- 新增 `cron/alert_eval.py`：L1 确定性求值层，字段字典封闭白名单
+  （last/open/high/low/previousClose/changePercent/volume，取自 realtime_snapshot 当日最后一拍）。
+  技术指标（MA/RSI/MACD）**不开放**——需现场算 K 线、成本高口径易漂移。
+- ★ **不可判定 ⇒ 不命中**（未知字段/未知 op/值 NULL/条件空/取数失败一律 hit=False）：
+  退化成"当它满足"会轰炸用户，退化成"当它不满足"永不触发，都比不告警更糟。
+  （这是**告警语义自身的设计选择**——告警的失败模式是静默的；不引用
+  `realtime_snapshot` provider 层的"允许空不允许错"纪律。）
+- ★ **条件结构为单子句**（2026-10-23 重构，去 all/any 复合）：
+  `{"symbol","field","op","value"}`。工具面 `create_alert_job` 只暴露单条
+  field/op/value，复合结构无调用方。未来需要多条件时再按同一协议扩展。
+- ★ **one_shot 语义坑**（已踩）：`_claim_job` 原对 one_shot 是 **claim 即 DELETE**，
+  一次性告警未命中就被删 ⇒ 永远等不到条件成立。已收口：`_claim_job` **内部按 mode
+  分派**（`mode != "alert"` 才 DELETE；alert 只 UPDATE 加锁），调用方零记忆。
+  alert 未命中保留行 + 释放锁，**命中后**才由 `_run_alert_body` 再次调用 `_claim_job`
+  消费。交易日闸 / catch-up / 进程内 missed 三处消费点同步受同一策略保护。
+- ★ **推送用依赖倒置**：cron 包契约禁止反向 import `app.services`
+  （`test_v6_cron_boundary.py` 钉住）⇒ `set_alert_notifier(fn)` 钩子由 `app/__init__.py`
+  启动期注入；**命中但未注入钩子时 fail-loud**（告警命中没人接 = 形同虚设）。
+- 表扩展：`qd_agent_cron_jobs` 加 `condition JSONB` / `notify JSONB`
+  （`cron_worker._SCHEMA_STATEMENTS` + `migrations/qd_cron_jobs_v2_20261019.sql` 两处同源）。
+
+### ③ schedule 域移出必注入层（用户裁定"加一个领域"）
+- 5 个工具原在顶层 = domain=common = **必注入层** ⇒ 每轮白带 ~3.8k 字符 schema。
+  移入 `tools/schedule/` 子目录（子目录名即 domain，`scan_subdirectories` 登记为可选域）。
+- ★ **加域两步缺一不可**：① 建子目录（域名自动登记）；② `tool_preselect.py::DATA_DOMAINS`
+  加 `(域, 关键词, 工具名)` 条目——`detect_domains`（子串匹配）是**唯一**选中通道，
+  只建目录不加词典 = 域永远选不中 = 功能实质失效。派生视图
+  （`DATA_DOMAIN_TOOLS`/`_PREFERRED`）自动跟进，勿单独维护。
+- ★ 移动含相对 import 的文件必查层级：`schedule_tools.py` 深一层后
+  `from ..cron import` 会解析到 `app.agent.tools.cron`（不存在）⇒ 必须 `...cron`。
+- `tool_groups.py::GROUP_DESC` 补 schedule 检索面描述（`test_v17i` 守卫：加域漏描述即红）；
+  `test_v9` parity 登记 ⑦ `preferred.schedule`（新域首选工具）。
+- 词典覆盖实测：用户原话「明天开盘后监视，符合条件就提醒我买入」「茅台跌到1650告诉我」
+  均命中；误命中抽检 5/5 干净。**残留盲区**：「每5分钟分析一次」类无限节拍变体
+  子串穷举不了 ⇒ 靠必注入层 `search_resources` 逃生门自救。
+- ⚠ **基数更正**：1-A/2-B 落地时报告的「B8 3,567→7,349」中 3,567 是**过时基数**
+  （`exec_tools.py` 10-23 00:06 有一次未登记改动，schema −32）。本次对账自洽：
+  7,349−3,535 = 3,814 = 5 工具 schema 逐个实测和。**引用旧基线做减法叙事前必须重新实测**。
+
+### 验证（2026-10-23 实测）
+- 工具面 58 不变（common 8 / finance 44 / knowledge 1 / schedule 5）；
+  必注入 schema **7,349 → 3,535**；可选域含 schedule。
+- 全量 pytest **1652 passed / 4 skipped / 0 failed**；qd_smoke **40 passed**；
+  设计机检 **100 OK / 0 DRIFT**（对账同步 5 项：A1 36→37 公式补 schedule 子目录、
+  A2 12→11、B4 13→8、B5 85→90、B8 7349→3535；B7 57,778 不变）。
+- 守卫：`test_v23b_alert_eval` 17 passed（全离线）+ **变异检验 4/4 全杀**；
+  `test_v23a_tencent_volume_unit` 9 passed + 4/4 全杀（P0 单位修复，同期）。
+
+### 已知边界（未做实盘验证）
+- `create_alert_job` 只有单元测试，**未跑过真实盘中告警**（需下一交易日快照数据端到端验证）。
+- 告警推送通道默认 browser（SSE 进程内队列，多 worker 时前端收不全，`cron_worker.py:24` 自述）；
+  email/telegram 等外网通道需用户在通知配置里启用后才真正可达。

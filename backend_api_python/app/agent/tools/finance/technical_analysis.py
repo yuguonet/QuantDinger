@@ -461,6 +461,9 @@ def technical_analysis(codes: str) -> dict:
     ⚠️ 评分口径：本分数是六维加权（score_model=tech6_weighted），「趋势」维取自复合
     共振分析。与 bull_bear_research 的五维加权（bb5_weighted）是两套不同模型，同股
     给出不同分属设计使然，不得互相当作同一指标对比或对冲，引用时必须带 score_model。
+    ⚠️ **只吃日线**。盘中结构 / 多周期方向不要在本工具分数里找：
+      · VWAP/开盘区间/分时均线 → `get_intraday_structure`
+      · 日线+15m+5m 方向与一致/冲突 → `get_multiframe_direction`
 
     Args:
         codes: 股票代码（6位数字），如 "600519"

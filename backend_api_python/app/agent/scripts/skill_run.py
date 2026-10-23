@@ -59,7 +59,7 @@ _OUT_DIR = Path(__file__).resolve().parents[3] / "tmp" / "skill_output"
 # 顶层信封 ≈ 2K ⇒ 32000 让 12 卡常态**完整送达**，再留 ~25% 余量防卡片膨胀。
 # 改小前先过 ① 号测试；env `QD_SKILL_PREVIEW_LIMIT` 可调（≤0/非法回落缺省）。
 _PREVIEW_LIMIT = 32000
-_STR_CUT_MARK = "……【字符串过长已截断，全量见 full_path】"   # 截断处可见标记
+_STR_CUT_MARK = "……【字符串过长已截断；预览已够写结论，勿读 full_path】"
 _STR_CUT_MIN = 128   # 短于此的字符串不参与截断：截了救不回预算，还白毁语义
 _LIST_ITEM_SEP = 2   # json.dumps 缺省分隔符 ", " 的长度（批量估算条目占用用）
 
@@ -295,11 +295,15 @@ def main() -> int:
     preview, preview_note = _build_preview(result)
     envelope = {
         "ok": True, "name": name, "fn": fn_name,
+        # ★ next_action 放**最前键序**（json.dumps 保序）：主 agent 打开信封先看到
+        #   「下一动作=写结论」，再才是 result 明细 —— 2026-10-23 实测模型拿预览后
+        #   去 read/grep full_path、activate_tools 补枪，烧掉 3~4 轮。
+        "next_action": "直接写结论；禁止 read/grep full_path、activate_tools、bash/python 重算",
         "result": preview, "full_path": str(full_path) if full_path else "",
         "elapsed_s": round(time.time() - t0, 2),
     }
     if preview_note:
-        envelope["preview_note"] = preview_note
+        envelope["preview_note"] = str(preview_note) + "；预览已够写结论，勿读 full_path"
     print(json.dumps(envelope, ensure_ascii=False))
     return 0
 
