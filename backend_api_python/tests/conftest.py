@@ -34,6 +34,12 @@ if 'psycopg2' not in sys.modules:
     _pg = _make_mock_module('psycopg2')
     _pg.extras = _make_mock_module('psycopg2.extras')
     _pg.extras.RealDictCursor = type('RealDictCursor', (), {})
+    # db_market.py L41 顶层 `from psycopg2.extras import execute_values` ——
+    # 缺此属性则任何 import db_market 的测试收集即炸（2026-10-24 提速任务
+    # 引入 db_market 测试时发现）。mock 语义不变：本环境零真实连接，
+    # 需要真 DB 的用例自行 skip（判据见 test_window_cache.test_real_db_golden：
+    # 检测 psycopg2.__file__ 是否 /mock/ 前缀，勿再用「有无 execute_values」）。
+    _pg.extras.execute_values = lambda *a, **k: None
     _pg.pool = _make_mock_module('psycopg2.pool')
     _pg.pool.ThreadedConnectionPool = type('ThreadedConnectionPool', (), {})
     sys.modules['psycopg2'] = _pg

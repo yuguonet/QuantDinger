@@ -183,9 +183,12 @@ def test_real_db_golden(tmp_path, monkeypatch):
     from app.market_cn.auto.core.data.kline import all_codes, fetch_klines_batch
     # conftest 把 psycopg2 整包 mock 掉 (pytest 环境无库) ⇒ 这是**环境限制**, skip;
     # 但真实运行时若连不上 ⇒ FAIL (不静默)。两者必须分清, 否则测试等于没跑。
+    # 判据 2026-10-24 改为「检测 mock 身份」而非「有无 execute_values」——
+    # 后者曾被 db_market 的 import 需求（conftest 补 execute_values）打破，
+    # 导致判据失效、真连 mock 库报 `no attribute 'connect'`。
     try:
-        import psycopg2.extras as _pe
-        if not hasattr(_pe, "execute_values"):
+        import psycopg2 as _pc2
+        if getattr(_pc2, "__file__", "").startswith("/mock/"):
             pytest.skip("psycopg2 被 conftest mock —— pytest 环境无真实 DB "
                         "(真实对账见 tmp/verify_all_equal.py: 164 万行零差异)")
     except Exception:

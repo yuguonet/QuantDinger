@@ -212,31 +212,50 @@ def filter_candidates(prescreen_result: dict) -> str:
 
 # 结论写法（内嵌到结果**最前**，主 agent 打开预览第一眼看到；不必 read_skill）
 _REPORT_GUIDE = {
+    "OUTPUT_FORM": (
+        "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了怎么退。"
+        "禁止长篇分析，全文 ≤25 行，必须用下表：\n"
+        "## 买什么（0~3 只，可空）\n"
+        "| 代码 | 现价 | 买点价位 | 止损价 | T+1/T+3/T+5 | 一句话理由 |\n"
+        "每只一行；代码=6 位数字；"
+        "★ 买点/止损**只写日线均线与支撑**（MA5/MA10/MA20、前高前低），"
+        "禁止用 VWAP/分时均价当买点；止损写「跌破 X」/「不跌破 X」；"
+        "T+N 填 看多/中性/看空。\n"
+        "★ **全文用中文白话**，禁止输出 p_up / w2s_kept / floor_kept / t1_bias / "
+        "near_support / rank_cut 等字段名："
+        "p_up 写「次日上涨参考」，w2s_kept 写「今日弱转强信号」，"
+        "无标定分写「暂无历史参考分」。\n"
+        "## 不买/观察（每只一行：代码+拒因≤20字）\n"
+        "## 风险（≤3 行）\n"
+        "指标罗列、漏斗数字不进正文。保留代码+看多看空+跌破 X（喂 claims）。"
+    ),
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
              "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote",
     "buyable": "rt.limit_up=true（涨停封板）或 rt.limit_down=true（跌停封死）→ **只进排除表，禁止进可买表**；"
                "盘中涨停已在池层 objective_preexclude 排除，rt.buyable=false 是 deep 阶段的最终防线；"
                "stale_bar 不影响此条",
-    "horizon": "主写 T+1/T+3/T+5；T+10/T+20 可选，证据不够写「不适用」；p_up 仅 T+1",
+    "entry_exit": "买点=回踩 MA5/MA10/MA20 或前高支撑（写具体价）；"
+                  "止损=「跌破 X」/「不跌破 X」；走坏=收盘破止损或主力转净流出。"
+                  "无明确止损价不得进「买什么」",
+    "horizon": "表内只写 T+1/T+3/T+5（词表：看多/中性/看空）；T+10/T+20 不写。"
+               "zt_streak>=3 只写 T+1。p_up 仅 T+1，禁止外推胜率",
     "priority": "支撑与弱转强/强转弱 ≫ 涨跌幅；禁止按涨跌幅排序",
     "support_rule": "盘中红绿不决定安全；可怕的是无支撑阴跌。-8%弱转强+有支撑 可以比 +8%转分歧更安全",
-    "fields": "tech.support.nearest/near_support 看贴哪条均线；rt 看现价/涨跌停；stale_bar 盘中常态，可执行性已按 rt 修正",
+    "fields": "主论据=tech.support.nearest / MA 排列 / flow / p_up；rt 看现价/涨跌停",
     "board_cut": "zt_streak>=3 默认只写 T+1",
-    "words": "选股用 看多/中性/看空/回避（不入选）；用户问持仓才写「兑现」",
-    "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors",
-    "funnel": "funnel 是分层漏斗统计（rounds 轮数 / pool_raw 原始池 / excluded_obj 客观淘汰 / "
-              "scored 打分数 / excluded_score 软门槛淘汰明细（含 no_pred_kept 缺分保送 / "
-              "score_skipped 超打分预算让位）/ deep_n 进 deep 数 / eastmoney_ok 搜索源是否可用）；"
-              "写「数据可信度」时引用——eastmoney_ok=false 表示 search 来源缺失，结论依赖 zt/dragon/hot",
-    "no_pred": "标 no_pred_kept 的票是打分模型盲区（p_up 缺失），**不是坏票也不是低分**——"
-               "评分列写「无标定分」，六维照常给；并在「数据可信度」里点名模型盲区",
+    "words": "方向用 看多/中性/看空/回避；用户问持仓才写「兑现」",
+    "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors；"
+              "大盘最多进「风险」一行轻注，不得当筛选主条件",
+    "funnel": "漏斗数字只允许出现在末行「数据」；禁止写进正文",
+    "no_pred": "无标定分票写「暂无历史参考分」（不是坏票）；禁止写 no_pred_kept/p_up 等字段名",
 }
 
 
-# ── 分层漏斗参数（2026-10-20；2026-10-21 增 no_pred_keep 缺分保送）──
+# ── 分层漏斗参数（2026-10-20；10-21 增 no_pred_keep；10-23 增 w2s_keep 弱转强）──
+# w2s：条件已严（回踩滞跌+主力≥2000万+今日>昨日），名额可略宽于 2
 _FUNNEL_ROUNDS = (
-    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4, "no_pred_keep": 2},
-    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6, "no_pred_keep": 3},
+    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4, "no_pred_keep": 2, "w2s_keep": 4},
+    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6, "no_pred_keep": 3, "w2s_keep": 6},
 )
 _FUNNEL_MIN_ALIVE = 4       # Round0 存活 < 此数 → 自动进 Round1
 _FUNNEL_DEEP_N = 12         # 进 deep 的最终候选数（原 8）
@@ -716,12 +735,14 @@ def run(sources: str = None, queries: str = None,
             rank_cut=params["rank_cut"],
             floor_keep=params["floor_keep"],
             no_pred_keep=params["no_pred_keep"],
+            w2s_keep=params.get("w2s_keep", 2),
         )
         funnel["scored"] = score_stats.get("scored", 0)
         funnel["excluded_score"] = {k: score_stats.get(k, 0)
                                     for k in ("hard", "p_up_hard", "rank_cut",
                                               "no_pred", "no_pred_kept",
-                                              "floor_kept", "score_skipped")}
+                                              "floor_kept", "w2s_kept",
+                                              "score_skipped")}
         if len(selected) >= _FUNNEL_MIN_ALIVE:
             break
 
