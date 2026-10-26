@@ -52,6 +52,10 @@ os.environ.setdefault("ADMIN_USER", "testadmin")
 os.environ.setdefault("ADMIN_PASSWORD", "testpass123")
 os.environ.setdefault("TQDM_DISABLE", "1")
 os.environ.setdefault("CACHE_ENABLED", "false")
+# 测试环境不起 mootdx 保活 daemon（2026-10-25 L1）：create_app → scheduler.start()
+# 会调 start_mootdx_keepalive，测试会话不该留后台 TDX 连接线程。需测保活的
+# 用例在自己的进程内显式起（tests/test_mootdx_direct_connect_20261025.py）。
+os.environ.setdefault("QD_MOOTDX_KEEPALIVE_SEC", "0")
 
 import pytest
 from app import create_app

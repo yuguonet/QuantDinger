@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================================
-# backfill_1m_mootdx.py — mootdx 直连下载 1 分钟 K 线 → kline_1m_YYYY 表
+# backfill_1m_mootdx.py — 下载 1 分钟 K 线 → kline_1m_YYYY 表
 # ============================================================================
 #
-# 与 source_sync.py 的区别:
-#   - source_sync: 走 Coordinator，数据源只保留 ~7 天 1m 数据
-#   - 本脚本:     mootdx 直连通达信，通过递增 offset 翻页拉取更长历史
+# 数据源优先级:
+#   1. mootdx 直连通达信（TCP，翻页拉取长历史）
+#   2. HTTP 备用源（mootdx 不可用时自动降级，纯 requests，不依赖系统 Provider 层）
 #
 # mootdx bars() 机制:
 #   - 每次返回最近 N 条 bar（offset=N，上限 800/次）
@@ -17,6 +17,11 @@
 # 通达信服务器限制:
 #   - 1m 数据仅保留约 4~5 个月（实测最早可到 ~4 个月前）
 #   - 超出范围的数据服务器不返回，脚本会自动停止
+#
+# HTTP 备用源（mootdx 挂掉时自动降级）:
+#   - 腾讯 ifzq.gtimg.cn mkline — 不传 count 返回全量，历史深度可达数月
+#   - 新浪 quotes.sina.cn JSONP — 上限 ~2000 条（约 8 个交易日）
+#   - volume 单位: mootdx K 线与 HTTP 源均返回"股"，口径一致
 #
 # 用法:
 # python fix/backfill_1m_mootdx.py                          # 默认全量（自动从服务器最早可用日期开始）
@@ -39,6 +44,7 @@ import signal
 import logging
 import argparse
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
@@ -350,6 +356,313 @@ def _fetch_1m_paged(
     return result
 
 
+# ---------------------------------------------------------------------------
+# HTTP 备用数据源（mootdx 不可用时自动降级，纯 requests，不依赖系统 Provider 层）
+# ---------------------------------------------------------------------------
+#
+# volume 单位对齐:
+#   - mootdx K 线 vol → "股"（直接存储）
+#   - 腾讯 mkline r[5]:
+#       科创板(688/689) → "股"（直接使用）
+#       其余板块        → "手"（×100 转"股"）
+#   - 新浪 JSONP volume → "股"（直接使用）
+#
+# ⚠️ 腾讯 volume 按板块区分单位（与实时行情 _volume_to_shares 同坑）:
+#   实测 2026-10: 688/689 K线 rawVol 与新浪"股"等值，×100 后偏差 100 倍
+#
+# 参考（与 app/data_sources/provider/tencent.py 的 _rows_to_dicts 同口径）:
+#   腾讯 mkline 每行: [time, open, close, high, low, volume, ...]
+#   历史 time 格式 "YYYYMMDDHHMM"(12位)，当日部分为 "HH:MM:SS"
+
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*",
+}
+
+_TC_KLINE_REFERERS = [
+    "https://gu.qq.com/",
+    "https://finance.qq.com/",
+    "https://stockapp.finance.qq.com/",
+    "https://stock.qq.com/",
+]
+_tc_ref_idx = 0
+
+
+def _next_tc_referer() -> str:
+    global _tc_ref_idx
+    ref = _TC_KLINE_REFERERS[_tc_ref_idx % len(_TC_KLINE_REFERERS)]
+    _tc_ref_idx += 1
+    return ref
+
+
+def _to_tencent_code(code: str) -> str:
+    """纯代码 → 腾讯带市场前缀小写 (sh600519 / sz000001)"""
+    c = (code or "").strip()
+    if c.lower().startswith(("sh", "sz", "bj")):
+        return c.lower()
+    if c[:1] in ("6", "9"):
+        return "sh" + c
+    if c[:1] in ("0", "2", "3"):
+        return "sz" + c
+    return "sz" + c
+
+
+def _to_sina_code(code: str) -> str:
+    """纯代码 → 新浪带市场前缀小写 (sh600519 / sz000001)"""
+    return _to_tencent_code(code)
+
+
+def _parse_http_time(raw: str, fallback_date: str = "") -> Optional[datetime]:
+    """解析 HTTP 源时间字符串 → tz-aware datetime (TZ_SH)。
+
+    支持:
+      - "YYYYMMDDHHMM" (12位, 腾讯 mkline)
+      - "YYYY-MM-DD HH:MM:SS" / "YYYY-MM-DD HH:MM"
+      - "HH:MM:SS" / "HH:MM" (当日, 用 fallback_date 补全日期)
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if s.isdigit() and len(s) == 12:
+        try:
+            return datetime.strptime(s, "%Y%m%d%H%M").replace(tzinfo=TZ_SH)
+        except ValueError:
+            return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=TZ_SH)
+        except ValueError:
+            continue
+    # "HH:MM:SS" / "HH:MM" — 当日数据，用 fallback_date 补全
+    if ":" in s and len(s) <= 8:
+        day = fallback_date or datetime.now(TZ_SH).strftime("%Y-%m-%d")
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                t = datetime.strptime(s, fmt)
+                return datetime.strptime(day, "%Y-%m-%d").replace(
+                    hour=t.hour, minute=t.minute, tzinfo=TZ_SH)
+            except ValueError:
+                continue
+    return None
+
+
+def _bars_to_records(
+    bars: List[Dict[str, Any]],
+    start_date: str,
+    end_date: str,
+) -> List[Dict[str, Any]]:
+    """HTTP 源 bar 列表 → 标准记录（与 _df_to_records 输出格式一致）。
+
+    做与 _df_to_records 相同的过滤:
+      日期范围 / 9:30 集合竞价丢弃 / 非交易日丢弃 / OHLC 越界修正 / 去重
+    """
+    if not bars:
+        return []
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ_SH)
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=TZ_SH)
+
+    seen: Dict[datetime, Dict[str, Any]] = {}
+
+    for b in bars:
+        dt_val = b.get("time")
+        if isinstance(dt_val, str):
+            dt_val = _parse_http_time(dt_val, fallback_date=end_date)
+        if not isinstance(dt_val, datetime):
+            continue
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=TZ_SH)
+
+        if dt_val < start_dt or dt_val > end_dt:
+            continue
+        if dt_val.hour == 9 and dt_val.minute == 30:
+            continue
+        if not _is_trading_day(dt_val.strftime("%Y-%m-%d")):
+            continue
+
+        o = _safe_float(b.get("open"))
+        h = _safe_float(b.get("high"))
+        l = _safe_float(b.get("low"))
+        c = _safe_float(b.get("close"))
+        v = _safe_float(b.get("volume"))
+        if o <= 0 and c <= 0:
+            continue
+
+        prices = [p for p in (o, h, l, c) if p > 0]
+        if prices:
+            if h > 0:
+                h = max(h, *prices)
+            if l > 0:
+                l = min(l, *prices)
+
+        if dt_val not in seen:
+            seen[dt_val] = {
+                "time": dt_val, "open": o, "high": h,
+                "low": l, "close": c, "volume": v,
+            }
+        else:
+            prev = seen[dt_val]
+            if _safe_float(prev.get("volume")) > 0 and v == 0:
+                continue
+            seen[dt_val] = {
+                "time": dt_val, "open": o, "high": h,
+                "low": l, "close": c, "volume": v,
+            }
+
+    return sorted(seen.values(), key=lambda r: r["time"])
+
+
+def _http_tencent_1m(code: str) -> Optional[List[Dict[str, Any]]]:
+    """腾讯 mkline 拉取 1m K 线（不传 count 返回全量）。
+
+    API: https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600519,m1
+    返回 data.{code}.m1 = [[time, open, close, high, low, volume, ...], ...]
+    volume 原始单位"手" → ×100 转"股"（对齐 mootdx）。
+    """
+    import requests as _req
+
+    c = _to_tencent_code(code)
+    url = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+    headers = dict(_HTTP_HEADERS, Referer=_next_tc_referer())
+    try:
+        resp = _req.get(url, headers=headers,
+                        params={"param": f"{c},m1"}, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"[http:1m] tencent {code} HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"[http:1m] tencent {code} 请求失败: {e}")
+        return None
+
+    if not isinstance(data, dict) or int(data.get("code", 0)) != 0:
+        return None
+    root = (data.get("data") or {}).get(c)
+    if not isinstance(root, dict):
+        return None
+
+    rows = root.get("m1")
+    if not rows:
+        return None
+
+    bars: List[Dict[str, Any]] = []
+    # 科创板(688/689)腾讯 mkline 返回"股"，其余板块返回"手"
+    # （与 tencent.py 实时行情 _volume_to_shares 的坑同源）
+    need_x100 = code[:3] not in ("688", "689")
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) < 6:
+            continue
+        dt = _parse_http_time(str(r[0]))
+        if dt is None:
+            continue
+        try:
+            o, cl, h, lo, vol = (float(r[1]), float(r[2]),
+                                 float(r[3]), float(r[4]), float(r[5]))
+        except (TypeError, ValueError):
+            continue
+        bars.append({
+            "time": dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": round(o, 4), "high": round(h, 4),
+            "low": round(lo, 4), "close": round(cl, 4),
+            "volume": round(vol * 100, 2) if need_x100 else round(vol, 2),
+        })
+
+    return bars if bars else None
+
+
+def _http_sina_1m(code: str, datalen: int = 1800) -> Optional[List[Dict[str, Any]]]:
+    """新浪 JSONP 拉取 1m K 线。
+
+    API: quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData
+    上限 datalen≤1800（约 7.5 个交易日），超 2000 返回 null。volume 已是"股"。
+    """
+    import requests as _req
+    import re as _re
+
+    sc = _to_sina_code(code)
+    url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php"
+           "/var/CN_MarketDataService.getKLineData")
+    params = {"symbol": sc, "scale": "1", "ma": "no", "datalen": min(datalen, 1800)}
+    headers = dict(_HTTP_HEADERS, Referer="https://finance.sina.com.cn/")
+    try:
+        resp = _req.get(url, headers=headers, params=params, timeout=15)
+        text = (resp.text or "").strip()
+    except Exception as e:
+        logger.warning(f"[http:1m] sina {code} 请求失败: {e}")
+        return None
+
+    m = _re.search(r"\[.*\]", text, _re.DOTALL)
+    if not m:
+        return None
+    try:
+        import json as _json
+        raw = _json.loads(m.group())
+    except Exception:
+        return None
+    if not isinstance(raw, list) or not raw:
+        return None
+
+    bars: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            dt_str = str(item.get("day", "")).strip()
+            if not dt_str:
+                continue
+            o = float(item.get("open", 0))
+            h = float(item.get("high", 0))
+            lo = float(item.get("low", 0))
+            cl = float(item.get("close", 0))
+            v = float(item.get("volume", 0))
+        except (ValueError, TypeError):
+            continue
+        if o == 0 and cl == 0:
+            continue
+        bars.append({
+            "time": dt_str, "open": round(o, 4), "high": round(h, 4),
+            "low": round(lo, 4), "close": round(cl, 4), "volume": round(v, 2),
+        })
+
+    return bars if bars else None
+
+
+def _fetch_1m_http(
+    code: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """HTTP 备用源拉取 1m K 线，按 腾讯 → 新浪 顺序尝试。"""
+    for fetcher, name in ((_http_tencent_1m, "tencent"),
+                          (_http_sina_1m, "sina")):
+        bars = fetcher(code)
+        if not bars:
+            continue
+        records = _bars_to_records(bars, start_date, end_date)
+        if records:
+            logger.info(f"[http:1m] {code} {name}: {len(records)} 条 "
+                        f"({records[0]['time']:%Y-%m-%d} ~ "
+                        f"{records[-1]['time']:%Y-%m-%d})")
+            return records
+    logger.warning(f"[http:1m] {code} 所有 HTTP 源均无数据")
+    return None
+
+
+def _fetch_1m(
+    cli,
+    code: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """统一 1m 拉取入口: mootdx 优先，失败则 HTTP 降级。"""
+    if cli is not None:
+        records = _fetch_1m_paged(cli, code, start_date, end_date)
+        if records:
+            return records
+    return _fetch_1m_http(code, start_date, end_date)
+
+
 # ═══════════════════════════════════════════════════════
 # DB 写入（复用 source_sync.py 的模式）
 # ═══════════════════════════════════════════════════════
@@ -616,6 +929,25 @@ def _save_retry_codes(data: Dict[str, Dict[str, Any]]):
 # 核心处理: 单批
 # ═══════════════════════════════════════════════════════
 
+# ── 并发拉取参数 ──
+_HTTP_CONCURRENCY = 12        # HTTP 并发线程数
+_HTTP_MIN_INTERVAL = 0.08    # 每次请求最小间隔（秒），粗限流防封
+
+_http_rate_lock = threading.Lock()
+_http_last_ts = 0.0
+
+
+def _http_throttle():
+    """粗粒度限流: 控制全局 HTTP 请求速率"""
+    global _http_last_ts
+    with _http_rate_lock:
+        now = time.monotonic()
+        wait = _http_last_ts + _HTTP_MIN_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+        _http_last_ts = time.monotonic()
+
+
 def process_batch(
     symbols: List[str],
     cli,
@@ -625,7 +957,7 @@ def process_batch(
     dry_run: bool = False,
     incremental: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """处理一批股票: mootdx 拉取 → 写入"""
+    """处理一批股票: 并发拉取（mootdx 或 HTTP 降级）→ 写入"""
     stats = {"total": len(symbols), "fetched": 0, "written": 0, "failed": 0, "no_data": 0}
     results = []
 
@@ -639,22 +971,46 @@ def process_batch(
     # 重传文件
     retry_data = _load_retry_codes()
 
+    # ── 阶段1: 并发拉取 ──
+    fetch_results: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+    done_count = 0
+
+    def _fetch_one(code):
+        _http_throttle()
+        try:
+            return code, _fetch_1m(cli, code, start_date, end_date)
+        except Exception as e:
+            logger.warning(f"[fetch] {code} 异常: {e}")
+            return code, None
+
+    with ThreadPoolExecutor(max_workers=_HTTP_CONCURRENCY) as executor:
+        futures = {executor.submit(_fetch_one, c): c for c in symbols}
+        for future in as_completed(futures):
+            if _INTERRUPTED:
+                break
+            code, records = future.result()
+            fetch_results[code] = records
+            done_count += 1
+            if done_count % 50 == 0 or done_count == len(symbols):
+                print(f"\r  [{done_count}/{len(symbols)}] 已拉取",
+                      end='', flush=True)
+    print()
+
+    # ── 阶段2: 逐只写库 ──
     for i, code in enumerate(symbols):
         if _INTERRUPTED:
             break
 
         board = _detect_board(code)
-
-        # 拉取
-        records = _fetch_1m_paged(cli, code, start_date, end_date)
+        records = fetch_results.get(code)
 
         if records is None:
             stats["no_data"] += 1
-            retry_data[code] = {"errors": ["mootdx 无数据"], "retries": 0}
+            retry_data[code] = {"errors": ["无数据(含HTTP降级)"], "retries": 0}
             results.append({
                 "code": code, "board": board, "bars": 0,
                 "first_bar": "", "last_bar": "",
-                "written": 0, "status": "no_data", "errors": "mootdx 无数据",
+                "written": 0, "status": "no_data", "errors": "无数据(含HTTP降级)",
             })
             continue
 
@@ -775,14 +1131,13 @@ def main():
 
     _init_trading_calendar()
 
-    # 连接 mootdx
+    # 连接 mootdx（失败则降级 HTTP 源）
     print("\n[1/5] 连接 mootdx...")
     cli = _get_mootdx_client()
     if cli is None:
-        print("❌ mootdx 连接失败")
-        mgr.close_all_pools()
-        return 1
-    print("  ✅ mootdx 已连接")
+        print("  ⚠️  mootdx 连接失败，将降级为 HTTP 备用源（腾讯→新浪）")
+    else:
+        print("  ✅ mootdx 已连接")
 
     # 获取股票列表
     if args.code:
@@ -826,12 +1181,14 @@ def main():
     total = len(all_codes)
     batch_size = min(args.batch_size, total)
 
+    data_src = "mootdx" if cli is not None else "HTTP(腾讯→新浪)"
     print(f"""
 ╔═══════════════════════════════════════════════════════╗
-║  📡 mootdx 直连下载 1 分钟 K 线                       ║
+║  📡 下载 1 分钟 K 线 → kline_1m_YYYY                  ║
 ╠═══════════════════════════════════════════════════════╣
 ║  日期: {start_date} → {end_date}                     ║
 ║  股票: {total} 只  批次: {batch_size}                        ║
+║  数据源: {data_src:20s}                        ║
 ║  模式: {'重试' if args.retry_only else '主循环'}{'  dry-run' if args.dry_run else ''}{'  增量' if args.incremental else ''}                         ║
 ╚═══════════════════════════════════════════════════════╝
 """)

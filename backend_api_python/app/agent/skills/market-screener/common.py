@@ -9,8 +9,10 @@ market-screener/common.py
 from __future__ import annotations
 
 from ...log import logger
+import json
 import os
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
@@ -423,6 +425,54 @@ def _get_basic_db():
     from app.utils.basicinfo_db import get_stock_basic_db
     _basic_db_cache = get_stock_basic_db()
     return _basic_db_cache
+# ═══════════════════════════════════════════════════════════════
+#  CNStock 行情库连接池预热（2026-10-25 P0）
+# ═══════════════════════════════════════════════════════════════
+#
+# 根因（2026-10-24 探针实锤 tmp/probe_sql_concurrency_split_20261024.py）：
+# psycopg2 ThreadedConnectionPool._putconn 只保留 minconn(=2) 个空闲连接
+# （psycopg2/pool.py:105，超出即 conn.close()），且 getconn 持全局锁执行
+# _connect（TCP + PG 后端 fork + 认证）。画像期 _FETCH_WORKERS=8 并发取
+# K 线时每波 6 建 6 关、创建锁内串行 ⇒ 单次 read_db 0.30s（同 SQL 串行
+# 1.4ms；PG 侧 EXPLAIN 仅 0.386ms、索引无恙——劣化全在池层）。
+# 本 skill 画像期固定 8 线程并发单股取数 ⇒ 入口把 CNStock 池空闲连接
+# 预热到同值，消除连接抖动。限定本 skill 生效：不动 db_multi 的 POOL_MIN
+# 缺省与 env（全局池配置影响所有调用方，不在本技能授权内）。
+_FETCH_POOL_MIN = 8   # 与 _helpers._FETCH_WORKERS 对齐；改动需同步两侧
+
+
+def warm_market_pool(workers: int = _FETCH_POOL_MIN) -> None:
+    """把 CNStock 行情库连接池的空闲连接预热到 workers 条（P0）。
+
+    先抬 minconn 再补连接：_putconn 见空闲已满 minconn 会把多出的连接
+    直接 close，顺序反了预热白做。失败不抛（预热是优化不是关键路径），
+    记 warning 后按原 2 连接池行为继续。
+    """
+    try:
+        _load_env()
+        from app.utils.db_market import get_market_db_manager
+        pool = get_market_db_manager()._get_pool("CNStock")
+        inner = pool._pool          # psycopg2 ThreadedConnectionPool
+        if inner.minconn >= workers:
+            return
+        inner.minconn = workers     # 先抬阈值，防补充的连接被 _putconn 关掉
+
+        # 串行持有 workers 条再统一归还：前几条弹空闲、其余锁内新建，全部
+        # 同时在手 ⇒ 归还时见 minconn=workers 逐一保留为空闲连接。
+        # 不用并发 ping wave：快查询的连接会被后续任务弹走复用，wave 结束
+        # 后空闲数不确定（实测 8 任务只补到 6）。
+        held = []
+        try:
+            for _ in range(workers):
+                held.append(inner.getconn())
+        finally:
+            for c in held:
+                inner.putconn(c)
+        logger.info("[market-screener] CNStock 连接池预热完成: 空闲 %d 条"
+                    "（对齐画像并发 %d）", len(inner._pool), workers)
+    except Exception as e:
+        logger.warning(
+            "[market-screener] CNStock 连接池预热失败（按原池行为继续）: %s", e)
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 # ═══════════════════════════════════════════════════════════════
@@ -535,10 +585,80 @@ def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bo
 # 旧版在此吞异常返回 [] / {"error":...}，调用方（candidate_pool / market_state）
 # 无法区分「源故障」与「真空无候选」⇒ 数据不可用被交付成「今日无候选」。
 # 现一律向上抛，由调用方记 missing / source_errors（_facts.py 同构处理）。
+# ═══════════════════════════════════════════════════════════════
+#  涨停池按日落盘缓存（2026-10-25 P1-②）
+# ═══════════════════════════════════════════════════════════════
+#
+# 根因（主探针实锤）：fetch_recent_zt_pools(8) 每个进程冷启都对 7 个历史
+# 日期串行拉 akshare（stock_zt_pool_em），限流器纯睡 27.68s
+# （min=2.0 + jitter U(1.5,3.5) ≈ 3.5-5.5s/次）+ 实取 ~5s。历史日期的
+# 涨停池当日不变 ⇒ 按日落盘，同日二次运行零网络、零限流等待。
+# 口径：① 只缓存**历史日期**（< 今日）；当日实时池盘中动态，且
+# get_zt_pool 当日本就走 _rt_zt_pool 内存缓存（零网络），无需落盘；
+# ② TTL 24h——上游迟到的数据修正不会永久驻留，也不会每次运行重付；
+# ③ 只缓存非空结果——akshare 失败时 _ak_zt_pool 静默返回 []
+# （dragon_limit 的 fail-soft），把 [] 落盘会把瞬时故障冻结成假数据；
+# ④ 原子写（tmp + os.replace）防多进程并发写半截文件；读坏按未命中回源。
+# 缓存目录：backend_api_python/data/zt_pool/（与 adjustment_factors.json 同区的
+# 跨进程缓存；本模块在 app/agent/skills/market-screener/ 下，上溯四层到 backend
+# 根—— Adjustment 在 app/data_sources/provider/ 下只需三层，勿照抄层数）
+_ZT_POOL_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data", "zt_pool")
+_ZT_POOL_CACHE_TTL_S = 24 * 3600
+
+
+def _zt_pool_cache_path(date_str: str) -> str:
+    return os.path.join(_ZT_POOL_CACHE_DIR, f"zt_pool_{date_str}.json")
+
+
+def _zt_pool_cache_get(date_str: str) -> Optional[List[Dict]]:
+    """读按日涨停池缓存；未命中/过期/损坏返回 None（调用方回源拉取）。"""
+    path = _zt_pool_cache_path(date_str)
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict) or not isinstance(payload.get("pool"), list):
+            return None
+        if time.time() - float(payload.get("fetched_at") or 0) > _ZT_POOL_CACHE_TTL_S:
+            return None
+        return payload["pool"]
+    except Exception as e:
+        logger.warning("[MktScreen] 涨停池缓存读取失败 %s: %s", date_str, e)
+        return None
+
+
+def _zt_pool_cache_put(date_str: str, pool: List[Dict]) -> None:
+    """原子写按日涨停池缓存（tmp + replace）。失败仅记 warning 不抛。"""
+    path = _zt_pool_cache_path(date_str)
+    try:
+        os.makedirs(_ZT_POOL_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"date": date_str, "fetched_at": time.time(), "pool": pool},
+                      f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("[MktScreen] 涨停池缓存写入失败 %s: %s", date_str, e)
+
+
 def fetch_zt_pool(date: str) -> List[Dict]:
-    """涨停池。fail-fast：失败向上抛（调用方负责记 missing，不静默吞成空池）。"""
+    """涨停池。fail-fast：失败向上抛（调用方负责记 missing，不静默吞成空池）。
+
+    2026-10-25 P1-②：历史日期（< 今日）按日落盘缓存（TTL 24h、只存非空），
+    同日重复运行免 akshare 往返与限流等待；当日实时池不缓存（盘中动态）。
+    """
     from app.market_cn.dragon_limit import get_zt_pool
-    return get_zt_pool(date)
+    _day = (date or "").strip()
+    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+        cached = _zt_pool_cache_get(_day)
+        if cached is not None:
+            return cached
+        pool = get_zt_pool(_day)
+        if pool:                      # 不落空：akshare 失败是静默 []（见上）
+            _zt_pool_cache_put(_day, pool)
+        return pool
+    return get_zt_pool(_day)
 def fetch_dt_pool(date: str) -> List[Dict]:
     """跌停池。fail-fast：同 fetch_zt_pool。"""
     from app.market_cn.dragon_limit import get_dt_pool

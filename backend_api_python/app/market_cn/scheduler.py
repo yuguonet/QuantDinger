@@ -911,3 +911,16 @@ def start():
 
     t = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
     t.start()
+
+    # ── mootdx 全局单例保活（L1，2026-10-25）──────────────────
+    # 单例 TTL 3600s，到期重建走 mootdx_client._create_client 的免扫描直连
+    # （L0，最坏 ~5s 快速失败）。保活线程提前重建 ⇒ 业务调用（index/tape/
+    # finance 的 get_client、backfill 的线程级客户端）任何时刻命中热连接。
+    # 不落在 app/__init__.py：那是 `import app.*` 必经之路，skill_run 子进程
+    # 与 pytest 全体进程都会执行，起线程会污染测试与短命进程。
+    try:
+        from app.utils.mootdx_client import start_mootdx_keepalive
+        if start_mootdx_keepalive():
+            logger.info("[scheduler] mootdx 单例保活线程已启动")
+    except Exception as e:
+        logger.warning(f"mootdx keepalive not started: {e}")

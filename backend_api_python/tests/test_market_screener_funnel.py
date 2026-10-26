@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""market-screener 分层漏斗测试（2026-10-20）。
+"""market-screener 分层漏斗测试（2026-10-20；2026-10-25 增 8.1.0 基线层）。
 
 覆盖：batch_realtime_quotes 分块、fill_quote 扩展回填、objective_preexclude、
-score_pool 双保险软门槛（含 2026-10-21 缺分保送 / 打分护栏）、run() 分层编排。
+score_pool 双保险软门槛（含 2026-10-21 缺分保送 / 打分护栏）、
+8.1.0 基线保底（_baseline_selection / reserved 去重 / 低 p_up 恒入 deep）、
+run() 分层编排。
 包目录名含连字符，统一走 modpath.import_module。
 """
 import sys
@@ -380,8 +382,45 @@ def test_score_pool_rank_cut_only():
     assert stats["rank_cut"] == 3
 
 
+def _fake_baseline_profiles(n_hard=0, p_up=None):
+    """伪造 _run._profile_candidates（8.1.0 基线画像调用）。
+
+    镜像真实 profile_candidates 的窗口语义：窗口 candidates[:limit*2]、
+    返回 kept=profiles[:limit]（池序）；前 n_hard 只标 hard。
+    p_up=None（with_pred=False 时真实行为）⇒ 池序保持。
+    """
+    def fake(prescreen_like, limit=20, with_flow=True, with_pred=True):
+        cands = (prescreen_like.get("candidates") or [])[:max(limit * 2, limit)]
+        prof = [{"code": c["code"], "hard": ["ST/退市风险"] if i < n_hard else [],
+                 "source": "条件搜索", "theme": {"hit": False}, "p_up": p_up}
+                for i, c in enumerate(cands)]
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "pool_size": len(prof), "trimmed": 0,
+                "profiles": prof[:limit], "missing": [], "errors": []}
+    return fake
+
+
+def _fake_additive_profiles():
+    """伪造 _helpers.profile_candidates（加法层画像调用，score_pool 内部）。
+
+    对收到的候选（reserved 已在 score_pool 内剔除）全部给高分 p_up。
+    """
+    def fake(prescreen_like, limit=20, with_flow=False, with_pred=True):
+        cands = prescreen_like.get("candidates") or []
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "missing": [], "errors": [],
+                "profiles": [{"code": c["code"], "p_up": 0.80, "hard": [],
+                              "theme": {"hit": False}, "source": "条件搜索"}
+                             for c in cands]}
+    return fake
+
+
 def test_run_funnel_two_rounds_when_low_alive():
-    """Round0 存活 <4 → 自动 Round1 放宽参数并追加通用查询词。"""
+    """Round0 存活 <4 → 自动 Round1 放宽参数并追加通用查询词。
+
+    2026-10-25 起触发条件 =「8.1.0 基线 + 加法层」合计 <4；本测试把基线打成
+    0（窗口全 hard）才能验 Round1 兜底路径。
+    """
     round_calls = {"n": 0, "queries": []}
 
     def fake_pre_screen(sources=None, queries=None, search_top_n=50,
@@ -407,7 +446,7 @@ def test_run_funnel_two_rounds_when_low_alive():
     round_params = []
 
     def fake_score_pool(cands, strategy="", market=None, main_themes=None,
-                        p_up_floor=0.40, rank_cut=0.30, floor_keep=4,
+                        p_up_floor=0.48, rank_cut=0.30, floor_keep=4,
                         no_pred_keep=2, **kw):
         round_params.append({"p_up_floor": p_up_floor, "rank_cut": rank_cut,
                              "floor_keep": floor_keep, "no_pred_keep": no_pred_keep,
@@ -427,14 +466,28 @@ def test_run_funnel_two_rounds_when_low_alive():
         return {"report_guide": _run._REPORT_GUIDE, "analyzed": codes.split(","),
                 "strategy": "post_market", "signal": "ok", "limit": limit}
 
+    # 2026-10-25 同型化登记：run() 入口新增两个后台初始化调用
+    # （prewarm_market_klines = P1-① 指数K线预热；warm_market_pool = P0
+    # 连接池预热）。funnel 测试只关心漏斗编排，必须把这两个 mock 掉——
+    # 否则真起 daemon 预热线程跑指数K线链：pytest 环境 ThreadedConnectionPool
+    # 被 conftest mock ⇒ 本地聚合回落远端 mootdx 真连 TDX（~74s 且并发改
+    # mootdx_client 单例状态，污染同进程其他测试，实测见
+    # test_mootdx_direct_connect_20261025 的全量红）。
     orig_pre = _run.pre_screen
     orig_obj = _run.objective_preexclude
     orig_score = _run.score_pool
     orig_deep = _run.deep_analyze
+    orig_pw = _run.prewarm_market_klines
+    orig_wp = _run.warm_market_pool
+    orig_prof = _run._profile_candidates
     _run.pre_screen = fake_pre_screen
     _run.objective_preexclude = fake_objective_preexclude
     _run.score_pool = fake_score_pool
     _run.deep_analyze = fake_deep_analyze
+    _run.prewarm_market_klines = lambda *a, **k: None
+    _run.warm_market_pool = lambda *a, **k: None
+    # 8.1.0 基线（2026-10-25）：窗口全 hard ⇒ 基线 0，Round0 只有加法层 2 只
+    _run._profile_candidates = _fake_baseline_profiles(n_hard=99)
     try:
         result = _run.run()
     finally:
@@ -442,16 +495,21 @@ def test_run_funnel_two_rounds_when_low_alive():
         _run.objective_preexclude = orig_obj
         _run.score_pool = orig_score
         _run.deep_analyze = orig_deep
+        _run.prewarm_market_klines = orig_pw
+        _run.warm_market_pool = orig_wp
+        _run._profile_candidates = orig_prof
 
     assert round_calls["n"] == 2, f"应两轮，实际{round_calls['n']}"
-    assert round_params[0]["p_up_floor"] == 0.40
+    assert round_params[0]["p_up_floor"] == 0.48
     assert round_params[0]["no_pred_keep"] == 2, "Round0 缺分保送名额 2"
-    assert round_params[1]["p_up_floor"] == 0.35, "Round1 应放宽地板"
+    assert round_params[1]["p_up_floor"] == 0.45, "Round1 应放宽地板"
     assert round_params[1]["no_pred_keep"] == 3, "Round1 缺分保送名额应放宽到 3"
     assert "换手率大于3%" in round_calls["queries"][1], \
         f"Round1 queries 应含通用词，实际{round_calls['queries'][1]}"
     funnel = result["funnel"]
     assert funnel["rounds"] == 2
+    assert funnel["baseline"] == 0, "本测试基线应恒 0（窗口全 hard）"
+    assert funnel["baseline_hard"] > 0, "基线窗口硬障碍只数应可见"
     assert funnel["deep_n"] == 6
     assert result["limit"] == 12, f"deep limit 应 12，实际{result.get('limit')}"
     # funnel 在 report_guide 之后
@@ -461,7 +519,7 @@ def test_run_funnel_two_rounds_when_low_alive():
 
 
 def test_run_funnel_single_round_when_alive_enough():
-    """Round0 存活 >=4 → 不进 Round1，单轮交付。"""
+    """Round0 存活 >=4 → 不进 Round1，单轮交付；8.1.0 基线在前、加法层殿后。"""
     calls = {"n": 0}
 
     def fake_pre_screen(**kw):
@@ -476,7 +534,8 @@ def test_run_funnel_single_round_when_alive_enough():
                              "price_band": 0, "low_turnover": 0, "quotes_missing": 0}
 
     def fake_score(cands, strategy="", market=None, main_themes=None, **params):
-        selected = [{"code": f"60000{i}", "p_up": 0.60 - i * 0.02} for i in range(5)]
+        # 加法层：基线之外的 5 只高分票（codes 故意与基线不重叠）
+        selected = [{"code": f"6001{i:02d}", "p_up": 0.60 - i * 0.02} for i in range(5)]
         return selected, {"p_up_hard": 0, "rank_cut": 1, "no_pred": 0,
                           "floor_kept": 0, "scored": 6}, {"mood_regime": "neutral"}
 
@@ -484,20 +543,47 @@ def test_run_funnel_single_round_when_alive_enough():
         return {"report_guide": _run._REPORT_GUIDE, "analyzed": codes.split(","),
                 "limit": limit}
 
+    # 2026-10-25 同型化登记：run() 入口新增两个后台初始化调用
+    # （prewarm_market_klines = P1-① 指数K线预热；warm_market_pool = P0
+    # 连接池预热）。funnel 测试只关心漏斗编排，必须把这两个 mock 掉——
+    # 否则真起 daemon 预热线程跑指数K线链：pytest 环境 ThreadedConnectionPool
+    # 被 conftest mock ⇒ 本地聚合回落远端 mootdx 真连 TDX（~74s 且并发改
+    # mootdx_client 单例状态，污染同进程其他测试，实测见
+    # test_mootdx_direct_connect_20261025 的全量红）。
+    # 2026-10-25 基线层登记：run() 先调 _baseline_selection（内部走
+    # _run._profile_candidates）——同样 mock 掉，返回值即 8.1.0 基线画像。
     orig = (_run.pre_screen, _run.objective_preexclude, _run.score_pool, _run.deep_analyze)
+    orig_pw = _run.prewarm_market_klines
+    orig_wp = _run.warm_market_pool
+    orig_prof = _run._profile_candidates
     _run.pre_screen = fake_pre_screen
     _run.objective_preexclude = fake_obj
     _run.score_pool = fake_score
     _run.deep_analyze = fake_deep
+    _run.prewarm_market_klines = lambda *a, **k: None
+    _run.warm_market_pool = lambda *a, **k: None
+    # 6 只候选：窗口前 3 只无 hard（基线），后 3 只 hard（窗口内被拦）
+    _run._profile_candidates = _fake_baseline_profiles(n_hard=3)
     try:
         result = _run.run()
     finally:
         (_run.pre_screen, _run.objective_preexclude,
          _run.score_pool, _run.deep_analyze) = orig
+        _run.prewarm_market_klines = orig_pw
+        _run.warm_market_pool = orig_wp
+        _run._profile_candidates = orig_prof
 
     assert calls["n"] == 1, f"存活>=4应单轮，实际{calls['n']}轮"
     assert result["funnel"]["rounds"] == 1
-    assert result["funnel"]["deep_n"] == 5
+    assert result["funnel"]["baseline"] == 3, "基线应为窗口内无 hard 的前 3 只"
+    assert result["funnel"]["baseline_hard"] == 3, "窗口内 3 只 hard 应计数"
+    # 基线 3 + 加法 5 = 8（deep 上限 12 内不截断）
+    assert result["funnel"]["deep_n"] == 8
+    analyzed = result["analyzed"]
+    assert analyzed[:3] == ["600003", "600004", "600005"], \
+        f"8.1.0 基线应按池序排在 deep 最前（前 3 只 hard ⇒ 基线为后 3 只），实际{analyzed[:3]}"
+    assert "600100" in analyzed, "加法层票应出现在 deep"
+    assert len(analyzed) == len(set(analyzed)), f"deep 不应有重复 code，实际{analyzed}"
 
 
 def test_run_funnel_empty_after_gates():
@@ -516,20 +602,41 @@ def test_run_funnel_empty_after_gates():
         return [], {"p_up_hard": 0, "rank_cut": 0, "no_pred": 0,
                     "floor_kept": 0, "scored": 0}, {"mood_regime": "weak"}
 
+    # 2026-10-25 同型化登记：run() 入口新增两个后台初始化调用
+    # （prewarm_market_klines = P1-① 指数K线预热；warm_market_pool = P0
+    # 连接池预热）。funnel 测试只关心漏斗编排，必须把这两个 mock 掉——
+    # 否则真起 daemon 预热线程跑指数K线链：pytest 环境 ThreadedConnectionPool
+    # 被 conftest mock ⇒ 本地聚合回落远端 mootdx 真连 TDX（~74s 且并发改
+    # mootdx_client 单例状态，污染同进程其他测试，实测见
+    # test_mootdx_direct_connect_20261025 的全量红）。
+    # 2026-10-25 基线层登记：_baseline_selection 的画像调用也 mock 掉
+    # （唯一候选是 ST ⇒ 窗口全 hard ⇒ 基线 0，与 fake_obj 的池层剔除叠加）。
     orig = (_run.pre_screen, _run.objective_preexclude, _run.score_pool)
+    orig_pw = _run.prewarm_market_klines
+    orig_wp = _run.warm_market_pool
+    orig_prof = _run._profile_candidates
     _run.pre_screen = fake_pre_screen
     _run.objective_preexclude = fake_obj
     _run.score_pool = fake_score
+    _run.prewarm_market_klines = lambda *a, **k: None
+    _run.warm_market_pool = lambda *a, **k: None
+    _run._profile_candidates = _fake_baseline_profiles(n_hard=99)
     try:
         result = _run.run()
     finally:
         (_run.pre_screen, _run.objective_preexclude, _run.score_pool) = orig
+        _run.prewarm_market_klines = orig_pw
+        _run.warm_market_pool = orig_wp
+        _run._profile_candidates = orig_prof
 
     assert result["analyzed"] == []
     assert result["signal"] == "无符合软硬门槛的候选"
     assert result["funnel"]["pool_raw"] == 1
     assert result["funnel"]["excluded_obj"]["st"] == 1
     assert result["funnel"]["eastmoney_ok"] is False
+    assert result["funnel"]["baseline"] == 0
+    assert any("8.1.0基线窗口硬障碍" in r for r in result["hard_reasons"]), \
+        f"空结果应写明基线窗口硬障碍，实际{result['hard_reasons']}"
     assert "report_guide" in result
 
 
@@ -595,3 +702,201 @@ def test_score_pool_hard_counted_in_stats():
     assert "600001" not in codes, f"hard票不应进deep，实际{codes}"
     assert stats["hard"] == 1, f"hard应计1，实际{stats.get('hard')}"
     assert "600002" in codes
+
+
+def test_baseline_selection_is_810_rule():
+    """_baseline_selection = 8.1.0 run() 同函数同参数同规则（2026-10-25 用户裁定）。
+
+    锁三件事：① 调用参数与 8.1.0 逐字同（limit=10 / with_flow=False /
+    with_pred=False）；② 池序保持（无 p_up 时 stable sort 不重排）；
+    ③ 窗口内无 hard 取前 _BASELINE_N=8（第 9 只无 hard 也不进）。
+    """
+    seen = {}
+
+    def fake_profile(prescreen_like, limit=20, with_flow=True, with_pred=True):
+        seen["limit"] = limit
+        seen["with_flow"] = with_flow
+        seen["with_pred"] = with_pred
+        cands = (prescreen_like.get("candidates") or [])[:max(limit * 2, limit)]
+        prof = [{"code": c["code"], "hard": ["ST/退市风险"] if i == 1 else [],
+                 "source": "条件搜索"} for i, c in enumerate(cands)]
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "pool_size": len(prof), "trimmed": 0,
+                "profiles": prof[:limit], "missing": [], "errors": []}
+
+    orig = _run._profile_candidates
+    _run._profile_candidates = fake_profile
+    try:
+        # 12 只候选：窗口 candidates[:20] 全进；index1 hard；窗口返回前 10
+        # ⇒ 窗口内无 hard 9 只（index 0,2..9）⇒ 基线取前 8（0,2,3,4,5,6,7,8）
+        cands = [{"code": f"6{i:05d}", "name": f"票{i}", "price": 10.0}
+                 for i in range(12)]
+        baseline, window_hard = _run._baseline_selection(
+            cands, {"strategy": "post_market", "market": {}, "main_themes": []})
+    finally:
+        _run._profile_candidates = orig
+
+    assert seen["limit"] == 10, f"基线必须用 8.1.0 的 limit=10，实际{seen['limit']}"
+    assert seen["with_flow"] is False and seen["with_pred"] is False, \
+        "基线必须与 8.1.0 同样不取资金流/不挂预测分"
+    codes = [p["code"] for p in baseline]
+    assert codes == [f"6{i:05d}" for i in (0, 2, 3, 4, 5, 6, 7, 8)], \
+        f"池序前 8 无 hard（跳过 index1），实际{codes}"
+    assert len(codes) == _run._BASELINE_N
+    assert window_hard == 1
+
+
+def test_score_pool_reserved_excluded_from_additive():
+    """reserved（8.1.0 基线）在加法层全程排除：不画像打分、不重复进 deep。"""
+    seen = {}
+
+    def fake_bundle(prescreen_like, limit=20, with_flow=False, with_pred=True):
+        cands = prescreen_like.get("candidates") or []
+        seen["codes"] = [c.get("code") for c in cands]
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "missing": [], "errors": [],
+                "profiles": [{"code": c["code"], "p_up": 0.90, "hard": [],
+                              "theme": {"hit": False}, "source": "条件搜索"}
+                             for c in cands]}
+
+    orig = _helpers.profile_candidates
+    _helpers.profile_candidates = fake_bundle
+    try:
+        selected, stats, _ = _helpers.score_pool(
+            [{"code": "A"}, {"code": "B"}, {"code": "C"}],
+            strategy="post_market", market={}, main_themes=[],
+            reserved=[{"code": "A", "hard": []}, {"code": "B", "hard": []}])
+    finally:
+        _helpers.profile_candidates = orig
+
+    assert seen["codes"] == ["C"], \
+        f"reserved 不应进加法层画像（不占打分额度），实际{seen['codes']}"
+    codes = [p["code"] for p in selected]
+    assert codes == ["C"], f"加法层只应剩 C，实际{codes}"
+    assert stats["scored"] == 1
+
+
+def test_score_pool_reserved_not_counted_as_budget_skipped(monkeypatch):
+    """reserved 不占打分护栏额度：score_skipped 只计加法层让位（2026-10-25 口径修正）。
+
+    旧口径 `len(candidates)-len(cand_list)` 会把 reserved 算成「被让位」——
+    6 只候选 + 2 只 reserved + 预算 2 ⇒ 旧口径 skipped=4（假），
+    新口径 = 加法层 4 只超预算 2 ⇒ skipped=2（真）。
+    """
+    monkeypatch.setenv("QD_SCREENER_SCORE_MAX", "2")
+
+    def fake_bundle(prescreen_like, limit=20, with_flow=False, with_pred=True):
+        cands = prescreen_like.get("candidates") or []
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "missing": [], "errors": [],
+                "profiles": [{"code": c["code"], "p_up": 0.90, "hard": [],
+                              "theme": {"hit": False}, "source": "条件搜索"}
+                             for c in cands]}
+
+    orig = _helpers.profile_candidates
+    _helpers.profile_candidates = fake_bundle
+    try:
+        selected, stats, _ = _helpers.score_pool(
+            [{"code": c} for c in "ABCDEF"],
+            strategy="post_market", market={}, main_themes=[],
+            reserved=[{"code": "A", "hard": []}, {"code": "B", "hard": []}])
+    finally:
+        _helpers.profile_candidates = orig
+
+    assert stats["scored"] == 2, f"加法层 4 只超预算 2 ⇒ 只打分 2，实际{stats['scored']}"
+    assert stats["score_skipped"] == 2, \
+        f"让位只应计加法层 2 只（不含 reserved），实际{stats['score_skipped']}"
+
+
+def test_run_baseline_guaranteed_despite_low_p_up():
+    """用户裁定回归（2026-10-25）：p_up 低于硬闸的 8.1.0 基线票仍恒入 deep。
+
+    「8.4.0 = 8.1.0 胜率的再提高」核心 invariant：加法层（p_up 硬闸/排名
+    截断/回捞）只能在基线之外做加法，不能把 8.1.0 会选出的票挤掉——
+    10-21~10-23 线上「12 只全部 near_support=false」正是旧漏斗违反本条
+    invariant 的结果（p_up 硬闸把回踩支撑票全部砍掉）。
+    """
+    def fake_pre_screen(**kw):
+        return {"strategy": "post_market", "market": {}, "main_themes": [],
+                "candidates": [{"code": f"60000{i}", "name": f"票{i}", "price": 10.0,
+                                "turnover_pct": 5.0} for i in range(12)],
+                "missing": [], "errors": []}
+
+    def fake_obj(cands, strategy, quotes=None):
+        return list(cands), {"limit_up": 0, "limit_down": 0, "st": 0, "suspended": 0,
+                             "price_band": 0, "low_turnover": 0, "quotes_missing": 0}
+
+    def fake_deep(codes, limit=8, **kw):
+        return {"report_guide": _run._REPORT_GUIDE, "analyzed": codes.split(","),
+                "limit": limit}
+
+    orig = (_run.pre_screen, _run.objective_preexclude, _run.deep_analyze)
+    orig_pw = _run.prewarm_market_klines
+    orig_wp = _run.warm_market_pool
+    orig_prof = _run._profile_candidates
+    orig_aprof = _helpers.profile_candidates
+    _run.pre_screen = fake_pre_screen
+    _run.objective_preexclude = fake_obj
+    _run.deep_analyze = fake_deep
+    _run.prewarm_market_klines = lambda *a, **k: None
+    _run.warm_market_pool = lambda *a, **k: None
+    # 基线：窗口 12 只全无 hard ⇒ 取池序前 8（600000~600007），p_up=None
+    # （8.1.0 口径：基线票根本没有分，更遑论过 0.48 硬闸）
+    _run._profile_candidates = _fake_baseline_profiles()
+    # 加法层：真实 score_pool 内部对「基线之外的 4 只」打分（全 0.80 高分）
+    _helpers.profile_candidates = _fake_additive_profiles()
+    try:
+        result = _run.run()
+    finally:
+        (_run.pre_screen, _run.objective_preexclude, _run.deep_analyze) = orig
+        _run.prewarm_market_klines = orig_pw
+        _run.warm_market_pool = orig_wp
+        _run._profile_candidates = orig_prof
+        _helpers.profile_candidates = orig_aprof
+
+    analyzed = result["analyzed"]
+    assert result["funnel"]["baseline"] == 8
+    # 8 只基线（无 p_up，全在 0.48 硬闸之下）恒入 deep 且按池序在前
+    assert analyzed[:8] == [f"60000{i}" for i in range(8)], \
+        f"8.1.0 基线应恒入 deep 且在前，实际{analyzed}"
+    # 加法层 4 只中 2 只过排名截断进 deep（排名截断只作用于加法层）
+    assert "600008" in analyzed and "600009" in analyzed
+    assert "600010" not in analyzed and "600011" not in analyzed, \
+        "加法层排名截断不应外溢到基线"
+    assert len(analyzed) == len(set(analyzed)), f"deep 不应重复，实际{analyzed}"
+
+
+def test_score_pool_w2s_still_additive_only():
+    """w2s 是旁支（2026-10-25）：只回捞加法层被砍的票，不碰 reserved 基线。"""
+    def fake_bundle(prescreen_like, limit=20, with_flow=False, with_pred=True):
+        cands = prescreen_like.get("candidates") or []
+        return {"strategy": "post_market", "market": {}, "mood_regime": "neutral",
+                "themes": [], "hints": {}, "missing": [], "errors": [],
+                "profiles": [
+                    {"code": c["code"], "p_up": 0.20 if c["code"] == "W" else 0.90,
+                     "hard": [], "theme": {"hit": False}, "source": "条件搜索",
+                     "tech": {"near_support": True, "dist_ma5_pct": 1.0,
+                              "dist_ma20_pct": 3.0, "ma_bull_stack": True}}
+                    for c in cands]}
+
+    orig_pc = _helpers.profile_candidates
+    orig_w2s = _helpers._is_weak_to_strong
+    _helpers.profile_candidates = fake_bundle
+    # 旁支判定直接给过（flow IO 已由 test_v57 单测覆盖，这里只验编排位置）
+    _helpers._is_weak_to_strong = lambda p: (True, {"reason": "w2s"})
+    try:
+        selected, stats, _ = _helpers.score_pool(
+            [{"code": "BASE"}, {"code": "W"}, {"code": "K"}],
+            strategy="post_market", market={}, main_themes=[],
+            p_up_floor=0.48, rank_cut=0.30, floor_keep=0, no_pred_keep=0,
+            w2s_keep=2, reserved=[{"code": "BASE", "hard": []}])
+    finally:
+        _helpers.profile_candidates = orig_pc
+        _helpers._is_weak_to_strong = orig_w2s
+
+    codes = [p["code"] for p in selected]
+    assert "BASE" not in codes, "reserved 基线不经过加法层任何通道"
+    assert "W" in codes, "W 被 p_up 闸砍但明确弱转强 ⇒ w2s 旁支回捞进 deep"
+    assert any(p["code"] == "W" and p.get("w2s_kept") for p in selected), \
+        "W 应标 w2s_kept（旁支通道）"
+    assert stats["w2s_kept"] == 1

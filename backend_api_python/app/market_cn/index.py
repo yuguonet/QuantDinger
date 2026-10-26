@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -272,6 +272,97 @@ def _rt_akshare(codes: List[str]) -> Optional[List[Dict[str, Any]]]:
 #  日K线数据源（三级降级）
 # ══════════════════════════════════════════════════════════════
 
+# ── 本地指数日K聚合（2026-10-25 L2）────────────────────────────
+# kline_index_5m（scheduler 盘后同步，2026-04-14 起攒 129 个交易日）5m→1D
+# 聚合，温调用 6-11ms、零外网。门控任一不过即回落原远端链
+# （mootdx→tencent→sina→baostock，原文不动）：
+#   ① code ∈ 白名单 —— 库里只有 9 个指数（899050/399303 未落库，
+#      按 _idx_prefix 规则推断会查空，故显式集合）；
+#   ② 深度: 聚合行数 ≥ days（129 天满足 screener 的 120，不满足
+#      refresh 的 500/calibrate 的 250，那些自动回落远端）；
+#   ③ 新鲜度: 末条日期 ≥ 上一交易日 —— index_minute 是盘后同步
+#      （_post_market_batch，docstring「不可回补只能向前攒」），盘中当天
+#      未入库属设计行为，此时末条=昨天，仍满足门控。
+# 口径对齐现链：date=str "YYYY-MM-DD"；volume=手（本地库存的是股，÷100；
+# open/high/low/close 与腾讯直连对拍一致到 1e-6，2026-10-25 实测）。
+_LOCAL_AGG_INDEX_SYMBOLS = {
+    "000001": "000001.SH", "000016": "000016.SH", "000300": "000300.SH",
+    "000688": "000688.SH", "000852": "000852.SH", "000905": "000905.SH",
+    "399001": "399001.SZ", "399005": "399005.SZ", "399006": "399006.SZ",
+}
+
+
+def _kline_local_agg(code: str, days: int) -> Optional[pd.DataFrame]:
+    """数据源0（2026-10-25 L2）: 本地 kline_index_5m 聚合日K，零外网。
+
+    门控不过返回 None，由 get_index_daily_kline 的 fetcher 链回落远端。
+
+    Args:
+        code: 6 位指数代码，如 "000001"
+        days: 需要的日K条数
+
+    Returns:
+        成功: DataFrame [date, open, high, low, close, volume]（升序）
+        门控不过/异常: None
+    """
+    symbol = _LOCAL_AGG_INDEX_SYMBOLS.get(code)
+    if symbol is None:
+        return None
+
+    try:
+        from app.utils.db_market import get_market_db_manager
+
+        with get_market_db_manager()._get_pool("CNStock").cursor() as cur:
+            cur.execute(
+                """
+                SELECT time::date AS d,
+                       (array_agg(open  ORDER BY time))[1]    AS open,
+                       max(high)                              AS high,
+                       min(low)                               AS low,
+                       (array_agg(close ORDER BY time DESC))[1] AS close,
+                       sum(volume)                            AS volume
+                FROM "kline_index_5m"
+                WHERE symbol = %s
+                GROUP BY time::date
+                ORDER BY d DESC
+                LIMIT %s
+                """,
+                (symbol, days),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("[local-agg] 日K线聚合失败(%s): %s", code, e)
+        return None
+
+    # ② 深度
+    if not rows or len(rows) < days:
+        return None
+
+    # ③ 新鲜度: 末条（DESC 首行）≥ 上一交易日
+    try:
+        from app.utils.trading_calendar import prev_trading_day
+
+        # prev_trading_day 返回 "YYYY-MM-DD" 字符串；SQL time::date 是 date 对象
+        prev_td = date.fromisoformat(prev_trading_day())
+    except Exception as e:
+        logger.warning("[local-agg] 交易日历不可用(%s)，保守回落远端", e)
+        return None
+    if rows[0][0] < prev_td:
+        logger.info("[local-agg] 日K线 %s 末条 %s 早于上一交易日 %s，回落远端",
+                    code, rows[0][0], prev_td)
+        return None
+
+    out = [
+        {"date": str(r[0]), "open": float(r[1]), "high": float(r[2]),
+         "low": float(r[3]), "close": float(r[4]),
+         "volume": float(r[5]) / 100.0}   # 股 → 手，对齐 mootdx/腾讯现链口径
+        for r in reversed(rows)
+    ]
+    logger.info("[local-agg] 日K线 %s: %d 条（kline_index_5m 聚合，零外网）",
+                code, len(out))
+    return pd.DataFrame(out)
+
+
 def _kline_mootdx(code: str, days: int) -> Optional[pd.DataFrame]:
     """数据源1: mootdx 获取指数日K线。
 
@@ -512,7 +603,8 @@ def get_index_realtime(codes: Optional[List[str]] = None, force: bool = False) -
 def get_index_daily_kline(code: str = "000001", days: int = 200, force: bool = False) -> List[Dict[str, Any]]:
     """获取指数日K线（自动降级）
 
-    依次尝试 mootdx → AKShare → BaoStock。
+    依次尝试 本地聚合(kline_index_5m) → mootdx → 腾讯 → 新浪 → BaoStock。
+    本地聚合门控（白名单∧深度≥days∧末条≥上一交易日）不过自动回落远端。
 
     Args:
         code: 指数代码，默认 "000001"（上证指数）
@@ -532,7 +624,8 @@ def get_index_daily_kline(code: str = "000001", days: int = 200, force: bool = F
     cached = _rt_idx_daily.get(code)                 # ② 内存缓存
     if not force and cached and len(cached) >= days:
         return cached[:days]
-    for fetcher in (_kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):  # ③ 远端 fallback
+    # ③ 远端 fallback（本地聚合 → mootdx → 腾讯 → 新浪 → BaoStock）
+    for fetcher in (_kline_local_agg, _kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):
         df = fetcher(code, days)
         if df is not None and not df.empty:
             df = df.loc[:, ~df.columns.duplicated()]

@@ -21,6 +21,7 @@ market-screener/_helpers.py — 事实与证据层（不做选股决策）
 """
 
 import os
+import threading
 from datetime import date, datetime, time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -668,29 +669,57 @@ def _is_weak_to_strong(p: dict) -> Tuple[bool, dict]:
 
 
 def score_pool(candidates, strategy="", market=None, main_themes=None,
-               p_up_floor=0.40, rank_cut=0.30, floor_keep=4, no_pred_keep=2,
-               w2s_keep=2):
-    """双保险软门槛 + 缺分保送 + 弱转强回捞——run() 漏斗第 2 层。
+               p_up_floor=0.48, rank_cut=0.30, floor_keep=4, no_pred_keep=2,
+               w2s_keep=2, reserved=None):
+    """双保险软门槛 + 缺分保送 + 弱转强回捞——run() 漏斗第 2 层（**加法层**）。
 
-    …（1~4 同旧）…
-    5. **w2s_kept**（2026-10-23）：被剔但**明确弱转强**（回踩 MA5 滞跌 + 主力净流入
-       + 日线结构好 + 今日主力>昨日）的前 w2s_keep 只，标 w2s_kept=true 放回。
-       只回捞、不改 p_up 排名；条件从严，防假弱转强。
+    层次（2026-10-25 起与 8.1.0 基线分层，见 run._baseline_selection）：
+    1. **hard**：画像层已标的客观障碍，本层计数不放进 deep；
+    2. **p_up 硬闸**：低于 p_up_floor 的进 cut_list（计 p_up_hard）；
+    3. **排名截断**：过闸票按 p_up 降序砍后 rank_cut 比例（计 rank_cut）；
+    4. **三条回捞通道**（都只加不减）：
+       · floor_kept：被砍但题材命中或稀缺来源（龙回头/热点）的前 floor_keep 只；
+       · no_pred_kept：无 p_up（模型盲区）按客观优先级占 no_pred_keep 名额
+         （2026-10-21：缺分 ≠ 低分）；
+       · w2s_kept（2026-10-23）：被砍但**明确弱转强**（回踩 MA5 滞跌 + 主力净流入
+         + 日线结构好 + 今日主力>昨日）的前 w2s_keep 只。只回捞、不改 p_up 排名；
+         条件从严，防假弱转强。
+
+    【reserved（2026-10-25 用户裁定：8.4.0 = 8.1.0 胜率的再提高，不是重新设计）】
+    reserved = 8.1.0 基线画像（run._baseline_selection 产出：池序前 8 无 hard）。
+    基线**恒入 deep**，不参与本层的闸/排名/回捞——本层只在基线之外做加法
+    （p_up 排序的改进名额，填到 run._FUNNEL_DEEP_N）。按 code 去重：基线与
+    本层是两次独立画像的 dict 对象（同票不同体），且本层候选集（objective
+    之后的 kept）通常仍含基线票，必须先剔除再进预算/画像，否则基线票会
+    ① 白占打分护栏额度 ② 以加法身份重复进 deep。
+
+    【rank_cut 定位】是**数量控制**（限制进 deep 的条数），不是质量否决。
+    相对截断（砍排名后 X%）意味着同一只票在强池出局、弱池存活——三条回捞通道
+    （floor/w2s/no_pred）为此而设。要绝对门槛请调 p_up_floor。
 
     Args:
         w2s_keep: 弱转强名额上限（默认 2；0=关闭）
+        reserved: 8.1.0 基线画像列表（dict 带 code/hard）；其 code 在本层
+            全程排除（不占预算、不画像、不进任何名单）。None=无保留（旧行为）
     """
+    reserved_codes = {str(p.get("code") or "") for p in (reserved or [])}
     cand_list = list(candidates or [])
+    if reserved_codes:
+        cand_list = [c for c in cand_list
+                     if str(c.get("code") or "") not in reserved_codes]
     themes = [t[0] for t in (main_themes or []) if isinstance(t, (list, tuple)) and t]
     score_skipped = 0
     budget = _score_max()
     if len(cand_list) > budget:
         # 只有真超护栏才让位：客观优先级（纯计数）决定谁先拿 p_up，
-        # 被让位的票计 score_skipped（漏斗可见，不静默丢）
-        order = sorted(range(len(cand_list)),
+        # 被让位的票计 score_skipped（漏斗可见，不静默丢）。
+        # 口径 = 加法层候选（reserved 已剔除后的 cand_list）超预算的部分——
+        # reserved 是基线保底，不占打分额度，不计让位（2026-10-25）。
+        add_n = len(cand_list)
+        order = sorted(range(add_n),
                        key=lambda i: _objective_rank_key(cand_list[i], i, themes))
         cand_list = [cand_list[i] for i in order[:budget]]
-        score_skipped = len(candidates) - len(cand_list)
+        score_skipped = add_n - budget
     prescreen_like = {
         "strategy": strategy,
         "market": market or {},
@@ -915,16 +944,44 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
 # 现改为「只给分数和建议」，裁剪权交还 LLM（详见 SKILL.md 的评分语义段）。
 
 _MKT_KLINES_CACHE = {"data": None}
+# 冷启互斥（2026-10-25 P1-①）：后台预热线程与画像期首票 predict_one 可能
+# 并发触发 _market_klines()。无锁时双方都 miss ⇒ 各建一次 mootdx 客户端
+# （bestip 扫描 ~74s/次），纯浪费。双重检查锁保证整个进程只取一次。
+_MKT_KLINES_LOCK = threading.Lock()
 
 
 def _market_klines():
     if _MKT_KLINES_CACHE["data"] is None:
-        try:
-            from app.watchlist.predict import load_market_klines
-            _MKT_KLINES_CACHE["data"] = load_market_klines(120) or []
-        except Exception:
-            _MKT_KLINES_CACHE["data"] = []
+        with _MKT_KLINES_LOCK:
+            if _MKT_KLINES_CACHE["data"] is None:
+                try:
+                    from app.watchlist.predict import load_market_klines
+                    _MKT_KLINES_CACHE["data"] = load_market_klines(120) or []
+                except Exception:
+                    _MKT_KLINES_CACHE["data"] = []
     return _MKT_KLINES_CACHE["data"]
+
+
+def prewarm_market_klines() -> None:
+    """后台预热指数日线（2026-10-25 P1-①）。
+
+    根因（主探针 probe_screener_timing_20261024 实锤）：画像期
+    attach_prediction 的首个 predict_one 触发 _market_klines() 冷启 →
+    get_index_daily_kline("000001",120) → mootdx 客户端创建（冷进程里
+    provider.tdx_ex 无 live 服务器 ⇒ bestip 全扫 ~74s）+ 腾讯兜底，
+    单点 78.35s，占 run() 总耗时 44%。该取数与候选池（candidate_pool
+    ~69s：龙回头 akshare + 行情回填）无依赖 ⇒ run() 入口起后台线程
+    预热，两者重叠后单点基本隐藏。失败仅记 warning：主流程到时按原
+    路径自取，行为与无预热时一致（不静默吞，见模块头纪律）。
+    """
+    def _bg():
+        try:
+            _market_klines()
+            logger.info("[market-screener] 指数K线后台预热完成")
+        except Exception as e:
+            logger.warning("[market-screener] 指数K线后台预热失败: %s", e)
+
+    threading.Thread(target=_bg, name="mktkl-prewarm", daemon=True).start()
 
 
 def _norm_bars(bars: list) -> list:

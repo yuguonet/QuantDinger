@@ -21,9 +21,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ...log import logger
 
-from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime, objective_preexclude, score_pool
+from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime, objective_preexclude, score_pool, prewarm_market_klines
 from ._facts import candidate_pool, market_state as _market_state, multitimeframe as _multitimeframe, detect_patterns as _detect_patterns, POOL_SOURCES, _PATTERN_PARAMS_DEFAULT
-from .common import SkillResult, fetch_kline
+from .common import SkillResult, fetch_kline, warm_market_pool
 
 
 # 单票深挖的总等待上限：外部源（龙虎榜/板块/资金）偶发挂起，不能拖死整轮选股
@@ -213,9 +213,9 @@ def filter_candidates(prescreen_result: dict) -> str:
 # 结论写法（内嵌到结果**最前**，主 agent 打开预览第一眼看到；不必 read_skill）
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
-        "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了怎么退。"
-        "禁止长篇分析，全文 ≤25 行，必须用下表：\n"
-        "## 买什么（0~3 只，可空）\n"
+        "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了能不能全身而退。"
+        "禁止长篇分析，表格行数随推荐数浮动，正文保持精简，必须用下表：\n"
+        "## 买什么（N 只，N=实际符合条件数；可空；可加一句共性提示如「均需回踩再买，勿追高」）\n"
         "| 代码 | 现价 | 买点价位 | 止损价 | T+1/T+3/T+5 | 一句话理由 |\n"
         "每只一行；代码=6 位数字；"
         "★ 买点/止损**只写日线均线与支撑**（MA5/MA10/MA20、前高前低），"
@@ -230,7 +230,9 @@ _REPORT_GUIDE = {
         "指标罗列、漏斗数字不进正文。保留代码+看多看空+跌破 X（喂 claims）。"
     ),
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
-             "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote",
+             "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote；"
+             "funnel.baseline=8.1.0 基线保底只数（恒入 deep，先于改进层）；"
+             "funnel.excluded_score 只统计加法层淘汰（p_up 硬闸/排名截断/回捞），不是全候选集",
     "buyable": "rt.limit_up=true（涨停封板）或 rt.limit_down=true（跌停封死）→ **只进排除表，禁止进可买表**；"
                "盘中涨停已在池层 objective_preexclude 排除，rt.buyable=false 是 deep 阶段的最终防线；"
                "stale_bar 不影响此条",
@@ -251,21 +253,77 @@ _REPORT_GUIDE = {
 }
 
 
-# ── 分层漏斗参数（2026-10-20；10-21 增 no_pred_keep；10-23 增 w2s_keep 弱转强）──
+# ── 加法层漏斗参数（2026-10-20；10-21 增 no_pred_keep；10-23 增 w2s_keep；10-24 门槛对齐 hints；
+#    10-25 起降为「加法层」——8.1.0 基线保底之后只做加法，见下方 _BASELINE_* ）──────────
+# p_up_floor 与 hints.p_up_floor_suggest 同源（AUC≈0.61，0.40–0.60 为噪声带）：
+# 硬闸取 suggest 下限 0.48，LLM 看到的 suggest（0.48~0.55）仍可按情绪微调。
+# 【自动放宽】基线+加法存活 <_FUNNEL_MIN_ALIVE 时进 Round1（门槛略降 + 追加通用查询词）。
+#   这意味着**同一只票在弱池存活、强池出局**——跨日口径不可比，属有意设计
+#   （保底出候选），非缺陷。要可比口径请固定单一 round 参数、不触发放宽。
+#   注：基线恒入 deep ⇒ 只有池子坏到基线也空时才真正需要 Round1 兜底。
 # w2s：条件已严（回踩滞跌+主力≥2000万+今日>昨日），名额可略宽于 2
 _FUNNEL_ROUNDS = (
-    {"p_up_floor": 0.40, "rank_cut": 0.30, "floor_keep": 4, "no_pred_keep": 2, "w2s_keep": 4},
-    {"p_up_floor": 0.35, "rank_cut": 0.15, "floor_keep": 6, "no_pred_keep": 3, "w2s_keep": 6},
+    {"p_up_floor": 0.48, "rank_cut": 0.30, "floor_keep": 4, "no_pred_keep": 2, "w2s_keep": 4},
+    {"p_up_floor": 0.45, "rank_cut": 0.15, "floor_keep": 6, "no_pred_keep": 3, "w2s_keep": 6},
 )
-_FUNNEL_MIN_ALIVE = 4       # Round0 存活 < 此数 → 自动进 Round1
-_FUNNEL_DEEP_N = 12         # 进 deep 的最终候选数（原 8）
+_FUNNEL_MIN_ALIVE = 4       # 「基线+加法」合计 < 此数 → 自动进 Round1（兜底出候选）
+_FUNNEL_DEEP_N = 12         # 进 deep 的最终候选数（原 8；基线≤8 + 加法层填充）
 _FUNNEL_SEARCH_TOP_N = 100  # run() 扩池：每条查询拉满（pre_screen 默认 50 保留给手工调用）
 _FUNNEL_FALLBACK_QUERIES = ("换手率大于3%", "放量上涨")  # Round1 追加通用词
+
+# ── 8.1.0 基线（2026-10-25 用户裁定）────────────────────────────────────
+# 【定位】8.4.0 = 8.1.0 胜率/准确度的**再提高**，不是重新设计：8.1.0 当年会
+#   选出的票，必须原样出现在 8.4.0 的 deep 名单里。基线 = 与 8.1.0 run()
+#   **同函数、同参数、同规则**的一次画像（_baseline_selection），恒入 deep；
+#   下面所有漏斗参数（p_up 闸/排名/回捞）只在其之上做**加法**。
+# 【为什么独立一次画像，不并进 score_pool】score_pool 带 p_up 且内部按 p_up
+#   排序（profile_candidates 末尾 stable sort 键含 p_up），池序会被打乱；
+#   objective_preexclude 也会预先改子集。基线必须独立于一切改进层。
+# 【成本】基线只画像池序前 20（limit*2），kline 走同一 DB 门面，与加法层
+#   重叠部分会重复取一次（≤20 只，可接受）；不并缓存是为保「同规则」可证。
+_BASELINE_PROFILE_LIMIT = 10   # = 8.1.0 run() 里 profile_candidates 的 limit
+_BASELINE_N = 8                # = 8.1.0 run() 里 deep_analyze(codes[:8]) 的 8
 
 # 源失败条目识别标记（2026-10-21）：missing 里出现这些子串 = 候选源/市场源故障，
 # 而不是数据缺口。candidate_pool 的 zt/龙回头/热点用「<源>源失败: …」措辞，
 # search 沿用既有「条件搜索[q]: …」，market_state 源错误经 pre_screen 加「市场状态: 」前缀。
 _SRC_FAIL_MARKS = ("源失败", "条件搜索[")
+
+
+def _baseline_selection(candidates: list, prescreen_result: dict) -> tuple:
+    """8.1.0 基线选择（2026-10-25）——与 8.1.0 run() 逐位同规则。
+
+    调用 `profile_candidates(limit=_BASELINE_PROFILE_LIMIT, with_flow=False,
+    with_pred=False)`（8.1.0 run() 的原调用）：内部窗口 candidates[:20]、
+    `kept=profiles[:10]`、无 p_up 时末尾 stable sort 保**池序** ⇒ 取无 hard
+    的前 _BASELINE_N 只。不做任何 p_up/排名/回捞取舍——那些是加法层的事。
+
+    宽池（扩词 + search_top_n=100）是核定扩围：源插入序 zt/eod_zt→dragon→
+    hot→search 不变，前 10 窗口仍由非 search 源主导（与 8.1.0 同源同序）；
+    仅当非 search 源不足 10 只时窗口尾部才进 search 结果（8.1.0 窄词 vs
+    现行宽词）——属「扩大范围」的既定部分，非基线规则改变。
+
+    Args:
+        candidates: pre_screen 返回的**原始**候选列表（objective 之前——
+            基线与 8.1.0 一样只看画像层 hard，不过池层预排除）
+        prescreen_result: pre_screen 全量返回（取 strategy/market/main_themes）
+
+    Returns:
+        (baseline, window_hard_n): baseline=基线画像列表（池序，≤8 只）；
+            window_hard_n=前 10 窗口内被 hard 拦掉的只数（漏斗复盘用）
+    """
+    if not candidates:
+        return [], 0
+    bundle = _profile_candidates(
+        {"strategy": prescreen_result.get("strategy"),
+         "market": prescreen_result.get("market") or {},
+         "main_themes": prescreen_result.get("main_themes") or [],
+         "candidates": candidates},
+        limit=_BASELINE_PROFILE_LIMIT, with_flow=False, with_pred=False)
+    window = bundle.get("profiles") or []
+    window_hard_n = sum(1 for p in window if p.get("hard"))
+    baseline = [p for p in window if not p.get("hard")][:_BASELINE_N]
+    return baseline, window_hard_n
 
 
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
@@ -662,11 +720,17 @@ def _safe_market() -> dict:
 
 def run(sources: str = None, queries: str = None,
         min_turnover: float = None, limit: int = None) -> dict:
-    """一次性跑完整流程——分层漏斗（2026-10-20）。
+    """一次性跑完整流程——8.1.0 基线保底 + 加法改进漏斗（2026-10-25 分层）。
 
-    流程：pre_screen(search_top_n=100) → objective_preexclude 客观预排除 →
-    score_pool 双保险软门槛（Round0 严参数；存活 <4 自动 Round1 放宽并追加通用查询词，
-    最多 2 轮）→ deep_analyze(Top12)。LLM 仍单次调用，漏斗在 run() 内部自动完成。
+    流程：
+      ① **8.1.0 基线**：原始池按 8.1.0 同规则选 ≤8 只（池序前 10 画像、无
+         hard 前 8，见 _baseline_selection），**恒入 deep**——8.4.0 是 8.1.0
+         胜率的再提高，不是重新设计；
+      ② **加法层**：objective_preexclude 客观预排除 → score_pool 双保险软门槛
+         （p_up 硬闸 + 排名截断 + floor/w2s/no_pred 回捞，reserved=基线去重），
+         只在基线之外做改进（Round0 严参数；基线+加法存活 <4 自动 Round1
+         放宽并追加通用查询词，最多 2 轮）；
+      ③ deep_analyze(基线 + 加法，合计 ≤_FUNNEL_DEEP_N=12)。LLM 仍单次调用。
 
     可选参数（与 pre_screen 同义；全部可省）：
         sources: 候选来源，如 "zt,dragon,search"；省略用时段默认
@@ -675,12 +739,21 @@ def run(sources: str = None, queries: str = None,
         limit: 候选截断；省略=不截断
     **不要传** strategy / min_market_cap / with_mtf 等不存在的参数。
     """
+    # ── 运行期预热（2026-10-25，探针定位的两大单点；均失败不阻塞主流程）──
+    # P1-①：指数 K 线后台预热——mootdx 冷启 bestip 扫描 ~74s 与候选池取数
+    # （candidate_pool ~69s）无依赖，后台重叠后该 78s 单点基本隐藏
+    prewarm_market_klines()
+    # P0：CNStock 连接池预热到画像并发度——消除 psycopg2 池 minconn=2 的
+    # 连接抖动（8 线程每波 6 建 6 关，单次 read_db 0.30s vs PG 侧 0.386ms）
+    warm_market_pool()
+
     funnel = {
         "rounds": 0, "pool_raw": 0, "excluded_obj": {},
         "scored": 0,
         "excluded_score": {"hard": 0, "p_up_hard": 0, "rank_cut": 0,
                            "no_pred": 0, "no_pred_kept": 0, "floor_kept": 0,
                            "score_skipped": 0},
+        "baseline": 0, "baseline_hard": 0,
         "deep_n": 0, "eastmoney_ok": True,
     }
     strategy = select_strategy()
@@ -691,6 +764,7 @@ def run(sources: str = None, queries: str = None,
     pool_missing: list = []
 
     selected = []
+    selected_all = []   # 基线 + 加法层合并（2026-10-25）；循环外初始化防 lint 未绑定
     meta = {}
     for round_idx, params in enumerate(_FUNNEL_ROUNDS):
         funnel["rounds"] = round_idx + 1
@@ -722,6 +796,13 @@ def run(sources: str = None, queries: str = None,
             # 只是扩大分母，会把「搜索源挂了」误判成可用
             funnel["eastmoney_ok"] = len(search_failed) < max(1, len(round_queries or [""]))
 
+        # ── ① 8.1.0 基线（2026-10-25 用户裁定）：原始池（objective 之前）上
+        #    按 8.1.0 同规则选 ≤8 只，恒入 deep。基线不过池层预排除、不过
+        #    p_up 闸/排名/回捞——与 8.1.0 当年交付给 LLM 的子集同规则。
+        baseline, baseline_hard = _baseline_selection(candidates, prescreen_result)
+        funnel["baseline"] = len(baseline)
+        funnel["baseline_hard"] = baseline_hard
+
         kept, obj_stats = objective_preexclude(
             candidates, prescreen_result.get("strategy") or strategy)
         funnel["excluded_obj"] = obj_stats
@@ -736,6 +817,7 @@ def run(sources: str = None, queries: str = None,
             floor_keep=params["floor_keep"],
             no_pred_keep=params["no_pred_keep"],
             w2s_keep=params.get("w2s_keep", 2),
+            reserved=baseline,
         )
         funnel["scored"] = score_stats.get("scored", 0)
         funnel["excluded_score"] = {k: score_stats.get(k, 0)
@@ -743,10 +825,17 @@ def run(sources: str = None, queries: str = None,
                                               "no_pred", "no_pred_kept",
                                               "floor_kept", "w2s_kept",
                                               "score_skipped")}
-        if len(selected) >= _FUNNEL_MIN_ALIVE:
+        # 基线在前（池序，同 8.1.0 交付序），加法层按 p_up 降序殿后；
+        # score_pool 已按 code 排除 reserved，此处再去重一次是「8.1.0 结果
+        # 不重复」 invariant 的防线（加法层若将来绕过 reserved 会立刻现形）。
+        baseline_codes = {str(b.get("code") or "") for b in baseline}
+        additive = [p for p in selected
+                    if str(p.get("code") or "") not in baseline_codes]
+        selected_all = baseline + additive
+        if len(selected_all) >= _FUNNEL_MIN_ALIVE:
             break
 
-    codes = [p["code"] for p in selected[:_FUNNEL_DEEP_N]]
+    codes = [p["code"] for p in selected_all[:_FUNNEL_DEEP_N]]
     funnel["deep_n"] = len(codes)
 
     if not codes:
@@ -760,6 +849,12 @@ def run(sources: str = None, queries: str = None,
         src_fail_n = sum(1 for m in pool_missing
                          if any(mark in str(m) for mark in _SRC_FAIL_MARKS))
         hard_reasons = [f"{k}:{v}" for k, v in funnel["excluded_obj"].items() if v]
+        # 基线窗口硬障碍（2026-10-25）：空结果现在意味着「8.1.0 基线 + 加法层」
+        # 双双为空；基线窗口（池序前 10）被 hard 拦掉几只必须可见——否则分不清
+        # 「池层预排除剔的」与「8.1.0 口径下就选不出」。
+        if funnel["baseline_hard"]:
+            hard_reasons.append(
+                f"8.1.0基线窗口硬障碍:{funnel['baseline_hard']}只（池序前10画像内）")
         if src_fail_n:
             hard_reasons.append(
                 f"候选源失败{src_fail_n}条（数据不可用≠真实空候选，明细见missing）")
