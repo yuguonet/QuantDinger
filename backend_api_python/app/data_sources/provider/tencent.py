@@ -323,6 +323,9 @@ class TencentDataSource:
             params=params, timeout=timeout,
         )
 
+        if resp.status_code == 501:
+            logger.debug("[tencent] %s %s HTTP 501 (WAF拦截)，跳过该源", timeframe, c)
+            return {}
         if resp.status_code != 200:
             logger.warning("[tencent] %s %s HTTP %s", timeframe, c, resp.status_code)
             return {}

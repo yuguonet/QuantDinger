@@ -16,10 +16,15 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Tuple
 
-from app.data_sources.dispatch import is_object, is_rows, run
+from app.data_sources.dispatch import is_object, is_rows, run, run_batch
 from app.data_sources.provider_tape import get_providers
 
 DEFAULT_TIMEOUT = 8.0
+
+# 批量分发节奏（限频上游防突发：新浪/东财连发会进 RST 突发窗；tencent 为非 RST 并发源，
+# 串行回退态仍按码间 pause 限频。可被 env 覆盖，见 §红线「阈值走 env」）。
+BATCH_PAUSE = float(os.getenv("QD_BATCH_PAUSE_TAPE", "2.0"))            # item 间歇秒
+BATCH_RETRY_PAUSE = float(os.getenv("QD_BATCH_RETRY_PAUSE_TAPE", "8.0"))  # 重试池翻窗等待秒
 
 
 @dataclass(frozen=True)
@@ -41,10 +46,10 @@ def _spec(kind: str, params: Tuple[str, ...], env: str,
 
 
 TAPE_CAPS: Dict[str, CapSpec] = {
-    "orderbook": _spec("orderbook", ("code",), "QD_EXT_TIMEOUT_ORDERBOOK", is_object),
-    "ticks_today": _spec("ticks_today", ("code", "limit"),
+    "orderbook": _spec("orderbook", ("code", "codes"), "QD_EXT_TIMEOUT_ORDERBOOK", is_object),
+    "ticks_today": _spec("ticks_today", ("code", "limit", "codes"),
                          "QD_EXT_TIMEOUT_TICKS_TODAY", is_rows),
-    "ticks_history": _spec("ticks_history", ("code", "date", "limit"),
+    "ticks_history": _spec("ticks_history", ("code", "date", "limit", "codes"),
                            "QD_EXT_TIMEOUT_TICKS_HISTORY", is_rows),
 }
 
@@ -75,16 +80,32 @@ def coordinate(kind: str, **params) -> Dict[str, Any]:
                 "error": "unexpected params: %s（该 kind 接受: %s）"
                          % (", ".join(unknown), ", ".join(spec.params) or "无")}
 
+    # 批量入口: codes=[...] → dispatch.run_batch（主池+重试池；tencent 声明 batch_kinds
+    # 走 fanout_codes 多股并发，sina/eastmoney/mootdx 为限频 RST 源保持逐码串行）。
+    codes = params.pop("codes", None)
+    if codes is not None:
+        if isinstance(codes, (str, bytes)):
+            codes = [codes]
+        out = run_batch(spec.mode, get_providers(kind), kind, list(codes), params, "code",
+                        spec.validator, timeout=_timeout(spec), page_size=0, max_pages=1,
+                        pause=BATCH_PAUSE, retry_pause=BATCH_RETRY_PAUSE, max_retries=1,
+                        batch_item_key="codes")
+        rows = (out.data or {}).get("rows") or []
+        count = sum(1 for r in rows if r.get("rows"))
+        return {"kind": kind, "ok": bool(out.ok), "source": out.source, "mode": out.mode,
+                "count": count, "data": out.data, "error": out.error}
+
     out = run(spec.mode, get_providers(kind), kind, params,
               spec.validator, timeout=_timeout(spec))
 
     data = out.data
-    if isinstance(data, dict) and "object" in data:
-        count = 1 if isinstance(data.get("object"), dict) else 0
-    elif isinstance(data, dict):
-        count = len(data.get("rows") or [])
+    # 单码返回信封：rows 类 data={"rows":[...]} ⇒ 计行数；object 类 data={"object":...}
+    # ⇒ object 为 dict 计 1、为 None（合法「暂无」）计 0。按 validator 判定，避免把扁平
+    # 数据行当成需再解包的嵌套信封（此前错把每行 e.get("rows") 判空导致 count 恒 0）。
+    if spec.validator is is_rows:
+        count = len((data or {}).get("rows") or [])
     else:
-        count = 0
+        count = 1 if isinstance((data or {}).get("object"), dict) else 0
 
     return {
         "kind": kind,

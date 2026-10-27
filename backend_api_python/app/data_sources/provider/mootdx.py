@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """provider / mootdx —— 个股域 TDX 直连源（kline + quote）。
 
-与 market_cn/index.py、data_sources/backfill_db.py 同一 mootdx_client 管理点。
+与 market_cn/index.py、coordinate_market_kline（provider/mootdx）同一 mootdx_client 管理点。
 volume 单位: TDX K 线 vol 为"股"（与 kline_1m/kline_1D 口径一致）。
 """
 from __future__ import annotations

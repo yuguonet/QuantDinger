@@ -430,48 +430,16 @@ def _individual_info_map(symbol_6: str) -> Dict[str, Any]:
 
 
 def fetch_cn_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
-    """PE/PB/PS, market cap, ROE proxy, EPS for A-share (best-effort)."""
-    sym6 = ak_a_code_from_tencent(tencent_code)
-    if not sym6:
-        return {}
-    result: Dict[str, Any] = {"source": "akshare_em"}
-    info = _individual_info_map(sym6)
-    if info:
-        result["market_cap"] = _float_clean(info.get("总市值"))
-        result["float_market_cap"] = _float_clean(info.get("流通市值"))
-        ind = info.get("行业")
-        if ind is not None and str(ind).strip():
-            result["industry"] = str(ind).strip()
-        result["total_shares"] = _float_clean(info.get("总股本"))
-        result["float_shares"] = _float_clean(info.get("流通股"))
+    """PE/PB/PS, market cap, ROE proxy, EPS for A-share.
 
-    em_sym = _eastmoney_a_em_symbol(tencent_code)
-    try:
-        import akshare as ak  # type: ignore
-        with _bypass_proxy():
-            vdf = ak.stock_zh_valuation_comparison_em(symbol=em_sym)
-    except Exception as e:
-        logger.debug("stock_zh_valuation_comparison_em failed %s: %s", em_sym, e)
-        vdf = None
-
-    if vdf is not None and not vdf.empty and "代码" in vdf.columns:
-        hit = vdf[vdf["代码"].astype(str).str.replace(".0", "", regex=False).str.zfill(6) == sym6.zfill(6)]
-        if not hit.empty:
-            r = hit.iloc[0]
-            pe = _float_clean(r.get("市盈率-TTM"))
-            if pe is not None:
-                result["pe_ratio"] = pe
-            pb = _float_clean(r.get("市净率-MRQ"))
-            if pb is not None:
-                result["pb_ratio"] = pb
-            ps = _float_clean(r.get("市销率-TTM"))
-            if ps is not None:
-                result["ps_ratio"] = ps
-            peg = _float_clean(r.get("PEG"))
-            if peg is not None:
-                result["peg"] = peg
-
-    return result
+    2026-10-26 Phase C: 函数体已搬进 provider_basic/akshare.py，
+    本函数改走 coord_basic 多源调度。
+    """
+    from app.data_sources.coord_basic import coordinate
+    out = coordinate("cn_fundamental", code=tencent_code)
+    if out.get("ok") and out.get("data", {}).get("object"):
+        return out["data"]["object"]
+    return {}
 
 
 def fetch_hk_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
@@ -564,93 +532,16 @@ def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]
 
 
 def fetch_cn_financial_indicators(tencent_code: str) -> Dict[str, Any]:
+    """Fetch revenue growth, debt/equity, current ratio, FCF, margins.
+
+    2026-10-26 Phase C: 函数体已搬进 provider_basic/akshare.py，
+    本函数改走 coord_basic 多源调度。
     """
-    Fetch revenue growth, debt/equity, current ratio, FCF, margins from
-    Eastmoney financial statements for A-shares.
-
-    Uses:
-      - stock_financial_abstract_ths (同花顺财务摘要) for growth/profitability
-      - stock_financial_analysis_indicator (东财财务分析) as fallback
-    """
-    sym6 = ak_a_code_from_tencent(tencent_code)
-    if not sym6:
-        return {}
-
-    result: Dict[str, Any] = {}
-
-    try:
-        import akshare as ak  # type: ignore
-
-        with _bypass_proxy():
-            # --- profit sheet (利润表) for revenue growth & margins ---
-            try:
-                profit_df = ak.stock_profit_sheet_by_report_em(symbol=sym6)
-                if profit_df is not None and not profit_df.empty:
-                    rev_curr = _safe_iloc(profit_df, 0, "营业总收入")
-                    rev_prev = _safe_iloc(profit_df, 1, "营业总收入")
-                    result["revenue_growth"] = _pct_change(rev_curr, rev_prev)
-
-                    net_curr = _safe_iloc(profit_df, 0, "净利润")
-                    if rev_curr and rev_curr > 0 and net_curr is not None:
-                        result["profit_margin"] = round(net_curr / rev_curr * 100, 2)
-
-                    gross_curr = _safe_iloc(profit_df, 0, "营业利润")
-                    if rev_curr and rev_curr > 0 and gross_curr is not None:
-                        result["operating_margin"] = round(gross_curr / rev_curr * 100, 2)
-
-                    if net_curr is not None:
-                        net_prev = _safe_iloc(profit_df, 1, "净利润")
-                        result["earnings_growth"] = _pct_change(net_curr, net_prev)
-            except Exception as e:
-                logger.debug("A-share profit sheet failed %s: %s", sym6, e)
-
-            # --- balance sheet (资产负债表) for debt/equity, current ratio ---
-            try:
-                balance_df = ak.stock_balance_sheet_by_report_em(symbol=sym6)
-                if balance_df is not None and not balance_df.empty:
-                    total_debt = _safe_iloc(balance_df, 0, "负债合计") or _safe_iloc(balance_df, 0, "流动负债合计")
-                    total_equity = _safe_iloc(balance_df, 0, "股东权益合计") or _safe_iloc(balance_df, 0, "所有者权益合计")
-                    if total_debt is not None and total_equity and total_equity > 0:
-                        result["debt_to_equity"] = round(total_debt / total_equity, 4)
-
-                    current_assets = _safe_iloc(balance_df, 0, "流动资产合计")
-                    current_liab = _safe_iloc(balance_df, 0, "流动负债合计")
-                    if current_assets is not None and current_liab and current_liab > 0:
-                        result["current_ratio"] = round(current_assets / current_liab, 4)
-
-                    total_assets = _safe_iloc(balance_df, 0, "资产总计")
-                    if total_assets is not None:
-                        result["total_assets"] = total_assets
-                    if total_debt is not None:
-                        result["total_debt"] = total_debt
-            except Exception as e:
-                logger.debug("A-share balance sheet failed %s: %s", sym6, e)
-
-            # --- cash flow (现金流量表) for FCF ---
-            try:
-                cashflow_df = ak.stock_cash_flow_sheet_by_report_em(symbol=sym6)
-                if cashflow_df is not None and not cashflow_df.empty:
-                    op_cf = _safe_iloc(cashflow_df, 0, "经营活动产生的现金流量净额")
-                    capex = _safe_iloc(cashflow_df, 0, "购建固定资产、无形资产和其他长期资产支付的现金")
-                    if op_cf is not None:
-                        result["operating_cash_flow"] = op_cf
-                        if capex is not None:
-                            result["free_cash_flow"] = round(op_cf - abs(capex), 2)
-                    invest_cf = _safe_iloc(cashflow_df, 0, "投资活动产生的现金流量净额")
-                    finance_cf = _safe_iloc(cashflow_df, 0, "筹资活动产生的现金流量净额")
-                    if invest_cf is not None:
-                        result["investing_cash_flow"] = invest_cf
-                    if finance_cf is not None:
-                        result["financing_cash_flow"] = finance_cf
-            except Exception as e:
-                logger.debug("A-share cash flow failed %s: %s", sym6, e)
-
-    except ImportError:
-        logger.warning("akshare not installed, A-share financial data unavailable")
-
-    if result:
-        logger.debug("A-share financial indicators for %s: %d fields", sym6, len(result))
-    return result
+    from app.data_sources.coord_basic import coordinate
+    out = coordinate("cn_financial", code=tencent_code)
+    if out.get("ok") and out.get("data", {}).get("object"):
+        return out["data"]["object"]
+    return {}
 
 
 def fetch_cn_financial_statements(tencent_code: str) -> Dict[str, Any]:

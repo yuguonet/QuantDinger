@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import threading
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -61,21 +61,6 @@ INDEX_CODES: Dict[str, str] = {
     "899050": "北证50",      # 北交所50只核心标的
     "399303": "国证2000",    # 小盘股2000只
     "399005": "中小100",    # 中小板100只（原中小板指）
-}
-
-# 通达信 K线周期编码映射
-# mootdx 的 frequency 参数使用通达信内部编码:
-#   0=5分钟  1=15分钟  2=30分钟  3=1小时
-#   4=日线   5=周线    6=月线    7=1分钟
-TDX_FREQ: Dict[str, int] = {
-    "1m": 7,   # 1分钟K线
-    "5m": 0,   # 5分钟K线
-    "15m": 1,  # 15分钟K线
-    "30m": 2,  # 30分钟K线
-    "1H": 3,   # 1小时K线
-    "1D": 4,   # 日K线（最常用）
-    "1W": 5,   # 周K线
-    "1M": 6,   # 月K线
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -272,308 +257,30 @@ def _rt_akshare(codes: List[str]) -> Optional[List[Dict[str, Any]]]:
 #  日K线数据源（三级降级）
 # ══════════════════════════════════════════════════════════════
 
-# ── 本地指数日K聚合（2026-10-25 L2）────────────────────────────
-# kline_index_5m（scheduler 盘后同步，2026-04-14 起攒 129 个交易日）5m→1D
-# 聚合，温调用 6-11ms、零外网。门控任一不过即回落原远端链
-# （mootdx→tencent→sina→baostock，原文不动）：
-#   ① code ∈ 白名单 —— 库里只有 9 个指数（899050/399303 未落库，
-#      按 _idx_prefix 规则推断会查空，故显式集合）；
-#   ② 深度: 聚合行数 ≥ days（129 天满足 screener 的 120，不满足
-#      refresh 的 500/calibrate 的 250，那些自动回落远端）；
-#   ③ 新鲜度: 末条日期 ≥ 上一交易日 —— index_minute 是盘后同步
-#      （_post_market_batch，docstring「不可回补只能向前攒」），盘中当天
-#      未入库属设计行为，此时末条=昨天，仍满足门控。
-# 口径对齐现链：date=str "YYYY-MM-DD"；volume=手（本地库存的是股，÷100；
-# open/high/low/close 与腾讯直连对拍一致到 1e-6，2026-10-25 实测）。
-_LOCAL_AGG_INDEX_SYMBOLS = {
-    "000001": "000001.SH", "000016": "000016.SH", "000300": "000300.SH",
-    "000688": "000688.SH", "000852": "000852.SH", "000905": "000905.SH",
-    "399001": "399001.SZ", "399005": "399005.SZ", "399006": "399006.SZ",
-}
+# ── 本地指数日K聚合（2026-10-25 L2；2026-10-27 归位 cn_stock_ext）─────
+# kline_index_5m（scheduler 盘后同步）5m→1D 聚合实现收口在
+# app/data_sources/cn_stock_ext.aggregate_daily_df（含白名单/深度/新鲜度三重
+# 门控，新鲜度锚点走 trading_calendar）。此处保留薄包装，维持既有 import 点。
+# 原多源 fetcher 链（_kline_mootdx/_kline_tencent/_kline_sina/_kline_baostock，
+# 含 _idx_prefix/_LOCAL_AGG_INDEX_SYMBOLS）已于 2026-10-27 删除：Phase C 起
+# 远端统一走 coord_index 多源调度，这些函数自此无调用点（死代码）。
 
 
 def _kline_local_agg(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源0（2026-10-25 L2）: 本地 kline_index_5m 聚合日K，零外网。
+    """数据源0: 本地 kline_index_5m 聚合日K（实现见 cn_stock_ext.aggregate_daily_df）。
 
-    门控不过返回 None，由 get_index_daily_kline 的 fetcher 链回落远端。
+    门控不过返回 None，由 get_index_daily_kline 回落 coord_index。
 
     Args:
         code: 6 位指数代码，如 "000001"
         days: 需要的日K条数
 
     Returns:
-        成功: DataFrame [date, open, high, low, close, volume]（升序）
+        成功: DataFrame [date, open, high, low, close, volume]（升序, volume=手）
         门控不过/异常: None
     """
-    symbol = _LOCAL_AGG_INDEX_SYMBOLS.get(code)
-    if symbol is None:
-        return None
-
-    try:
-        from app.utils.db_market import get_market_db_manager
-
-        with get_market_db_manager()._get_pool("CNStock").cursor() as cur:
-            cur.execute(
-                """
-                SELECT time::date AS d,
-                       (array_agg(open  ORDER BY time))[1]    AS open,
-                       max(high)                              AS high,
-                       min(low)                               AS low,
-                       (array_agg(close ORDER BY time DESC))[1] AS close,
-                       sum(volume)                            AS volume
-                FROM "kline_index_5m"
-                WHERE symbol = %s
-                GROUP BY time::date
-                ORDER BY d DESC
-                LIMIT %s
-                """,
-                (symbol, days),
-            )
-            rows = cur.fetchall()
-    except Exception as e:
-        logger.warning("[local-agg] 日K线聚合失败(%s): %s", code, e)
-        return None
-
-    # ② 深度
-    if not rows or len(rows) < days:
-        return None
-
-    # ③ 新鲜度: 末条（DESC 首行）≥ 上一交易日
-    try:
-        from app.utils.trading_calendar import prev_trading_day
-
-        # prev_trading_day 返回 "YYYY-MM-DD" 字符串；SQL time::date 是 date 对象
-        prev_td = date.fromisoformat(prev_trading_day())
-    except Exception as e:
-        logger.warning("[local-agg] 交易日历不可用(%s)，保守回落远端", e)
-        return None
-    if rows[0][0] < prev_td:
-        logger.info("[local-agg] 日K线 %s 末条 %s 早于上一交易日 %s，回落远端",
-                    code, rows[0][0], prev_td)
-        return None
-
-    out = [
-        {"date": str(r[0]), "open": float(r[1]), "high": float(r[2]),
-         "low": float(r[3]), "close": float(r[4]),
-         "volume": float(r[5]) / 100.0}   # 股 → 手，对齐 mootdx/腾讯现链口径
-        for r in reversed(rows)
-    ]
-    logger.info("[local-agg] 日K线 %s: %d 条（kline_index_5m 聚合，零外网）",
-                code, len(out))
-    return pd.DataFrame(out)
-
-
-def _kline_mootdx(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源1: mootdx 获取指数日K线。
-
-    通过 index_bars() 拉取指数日线数据，frequency=4 表示日线。
-    最多单次拉取 800 条（通达信协议限制）。
-
-    Args:
-        code: 指数代码，如 "000001"
-        days: 需要的K线条数
-
-    Returns:
-        成功: DataFrame，列 = [date, open, high, low, close, volume, amount]
-        失败: None
-    """
-    cli = _get_client()
-    if cli is None:
-        return None
-    try:
-        # frequency=4 是日线编码; offset 最大 800（通达信协议限制）
-        df = cli.index_bars(symbol=code, frequency=4, start=0, offset=min(days, 800))
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            return None
-
-        # 统一列名: mootdx 用 datetime/vol，我们用 date/volume
-        df = df.rename(columns={"datetime": "date", "vol": "volume"})
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-
-        # 只保留标准 OHLCV 列
-        cols = [c for c in ["date", "open", "high", "low", "close", "volume", "amount"] if c in df.columns]
-        logger.info("[mootdx] 日K线 %s: %d 条", code, len(df))
-        return df[cols].tail(days)
-    except Exception as e:
-        logger.warning("[mootdx] 日K线失败(%s): %s", code, e)
-        return None
-
-
-def _idx_prefix(code: str) -> str:
-    """指数代码加 sh/sz 前缀。"""
-    return "sh" if code[:3] in ("000", "88", "99") else "sz"
-
-
-def _kline_tencent(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源2: 腾讯财经 获取指数日K线。
-
-    接口: web.ifzq.gtimg.cn/appstock/app/fqkline/get
-    返回 JSON: data.{code}.day = [[date, open, close, high, low, volume], ...]
-    volume 单位为手(lots)。
-
-    Args:
-        code: 指数代码，如 "000001"
-        days: 需要的K线条数
-
-    Returns:
-        成功: DataFrame [date, open, high, low, close, volume]
-        失败: None
-    """
-    import urllib.request
-    try:
-        sc = _idx_prefix(code) + code
-        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-        params = f"param={sc},day,,,{days},"
-        full_url = f"{url}?{params}"
-        req = urllib.request.Request(full_url)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        req.add_header("Referer", "https://web.ifzq.gtimg.cn/")
-        raw = urllib.request.urlopen(req, timeout=10).read()
-        data = json.loads(raw)
-
-        root = (data.get("data") or {}).get(sc)
-        if not isinstance(root, dict):
-            return None
-
-        rows = root.get("day") or root.get("qfqday") or []
-        if not rows:
-            return None
-
-        out = []
-        for r in rows:
-            if len(r) < 6:
-                continue
-            out.append({
-                "date": str(r[0]),
-                "open": float(r[1]),
-                "high": float(r[3]),
-                "low": float(r[4]),
-                "close": float(r[2]),
-                "volume": float(r[5]),  # 已是手(lots)
-            })
-
-        if out:
-            logger.info("[tencent] 日K线 %s: %d 条", code, len(out))
-        return pd.DataFrame(out) if out else None
-    except Exception as e:
-        logger.warning("[tencent] 日K线失败(%s): %s", code, e)
-        return None
-
-
-def _kline_sina(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源3: 新浪财经 获取指数日K线。
-
-    接口: quotes.sina.cn/cn/api/jsonp_v2.php/CN_MarketDataService.getKLineData
-    scale=240 表示日线，返回 JSONP 格式。
-
-    Args:
-        code: 指数代码，如 "000001"
-        days: 需要的K线条数
-
-    Returns:
-        成功: DataFrame [date, open, high, low, close, volume]
-        失败: None
-    """
-    import urllib.request, re
-    try:
-        sc = _idx_prefix(code) + code
-        url = (
-            f"https://quotes.sina.cn/cn/api/jsonp_v2.php"
-            f"/var%20_{sc}=/CN_MarketDataService.getKLineData"
-            f"?symbol={sc}&scale=240&ma=no&datalen={days}"
-        )
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        req.add_header("Referer", "https://finance.sina.com.cn/")
-        raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
-
-        # 去掉可能的 <script> 标签和注释
-        clean = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
-        clean = re.sub(r"<[^>]+>", "", clean)
-        # 匹配 JSON 数组: var _xxx=([...]) 或 =([...])
-        m = re.search(r"=\s*\(?\s*(\[.*\])\s*\)?\s*;?\s*$", clean, re.DOTALL)
-        if not m:
-            return None
-
-        arr = json.loads(m.group(1))
-        out = []
-        for r in arr:
-            out.append({
-                "date": str(r.get("day", "")),
-                "open": float(r.get("open", 0)),
-                "high": float(r.get("high", 0)),
-                "low": float(r.get("low", 0)),
-                "close": float(r.get("close", 0)),
-                "volume": float(r.get("volume", 0)) / 100,  # 股→手
-            })
-
-        if out:
-            logger.info("[sina] 日K线 %s: %d 条", code, len(out))
-        return pd.DataFrame(out) if out else None
-    except Exception as e:
-        logger.warning("[sina] 日K线失败(%s): %s", code, e)
-        return None
-
-
-def _kline_baostock(code: str, days: int) -> Optional[pd.DataFrame]:
-    """数据源3: BaoStock（证券宝）获取指数日K线（兜底）。
-
-    BaoStock 是免费开源的证券数据接口，需要 pip install baostock。
-    需要先 login() 才能查询，用完后 logout()。
-
-    Args:
-        code: 指数代码
-        days: 需要的K线条数
-
-    Returns:
-        成功: DataFrame [date, open, high, low, close, volume, amount]
-        失败: None
-    """
-    try:
-        import baostock as bs
-    except ImportError:
-        return None
-    try:
-        # BaoStock 需要 sh./sz. 前缀格式
-        pfx = "sh" if code[:3] in ("000", "88", "99") else "sz"
-        bs.login()
-
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=days + 60)).strftime("%Y-%m-%d")
-
-        # adjustflag="3": 不复权（指数一般不需要复权）
-        rs = bs.query_history_k_data_plus(
-            f"{pfx}.{code}", "date,open,high,low,close,volume,amount",
-            start_date=start, end_date=end, frequency="d", adjustflag="3",
-        )
-
-        # BaoStock 返回的是迭代器，逐行读取
-        rows = []
-        while rs.next():
-            rows.append(rs.get_row_data())
-        bs.logout()
-
-        if not rows:
-            return None
-
-        df = pd.DataFrame(rows, columns=rs.fields)
-        # BaoStock 返回的数值都是字符串，需要转换
-        for c in ["open", "high", "low", "close", "volume", "amount"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        # BaoStock volume 单位是股, 转为手 (÷100) 对齐 mootdx/akshare
-        if "volume" in df.columns:
-            df["volume"] = df["volume"] / 100
-
-        logger.info("[baostock] 日K线 %s: %d 条", code, len(df))
-        return df.tail(days)
-    except Exception as e:
-        logger.warning("[baostock] 日K线失败(%s): %s", code, e)
-        try:
-            bs.logout()
-        except Exception:
-            pass
-        return None
+    from app.data_sources.cn_stock_ext import aggregate_daily_df
+    return aggregate_daily_df(code, days)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -603,8 +310,9 @@ def get_index_realtime(codes: Optional[List[str]] = None, force: bool = False) -
 def get_index_daily_kline(code: str = "000001", days: int = 200, force: bool = False) -> List[Dict[str, Any]]:
     """获取指数日K线（自动降级）
 
-    依次尝试 本地聚合(kline_index_5m) → mootdx → 腾讯 → 新浪 → BaoStock。
-    本地聚合门控（白名单∧深度≥days∧末条≥上一交易日）不过自动回落远端。
+    依次尝试 本地聚合(kline_index_5m, cn_stock_ext) → coord_index 多源调度
+    （mootdx → 腾讯 → 新浪 → BaoStock）。本地聚合门控（白名单∧深度≥days∧
+    新鲜度≥trading_calendar 锚点）不过自动回落远端。
 
     Args:
         code: 指数代码，默认 "000001"（上证指数）
@@ -624,22 +332,31 @@ def get_index_daily_kline(code: str = "000001", days: int = 200, force: bool = F
     cached = _rt_idx_daily.get(code)                 # ② 内存缓存
     if not force and cached and len(cached) >= days:
         return cached[:days]
-    # ③ 远端 fallback（本地聚合 → mootdx → 腾讯 → 新浪 → BaoStock）
-    for fetcher in (_kline_local_agg, _kline_mootdx, _kline_tencent, _kline_sina, _kline_baostock):
-        df = fetcher(code, days)
-        if df is not None and not df.empty:
-            df = df.loc[:, ~df.columns.duplicated()]
-            return df.to_dict(orient="records")
+    # ③ 本地聚合（kline_index_5m → 1D，零外网；实现收口 cn_stock_ext）
+    df = _kline_local_agg(code, days)
+    if df is not None:
+        return df.to_dict("records")
+    # ④ 远端 fallback（2026-10-26 Phase C: 改走 coord_index 多源调度；
+    #    index_kline 统 kind + timeframe 参数，与 coordinator 周期语义对齐）
+    from app.data_sources.coord_index import coordinate
+    out = coordinate("index_kline", code=code, timeframe="1D", limit=days)
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_index] 日K线 %s: %d 条 (source=%s)", code, len(rows), out.get("source", ""))
+        return rows
 
     logger.error("所有数据源获取指数日K线均失败: %s", code)
     return []
 
 
 def get_index_kline(code: str = "000001", frequency: str = "1D", days: int = 200) -> List[Dict[str, Any]]:
-    """获取指数K线（支持多周期，仅 mootdx）
+    """获取指数K线（支持多周期）
 
-    对于日线(1D)会自动降级到 AKShare/BaoStock；
-    对于分钟/周/月线，仅支持 mootdx（其他数据源不支持这些周期）。
+    2026-10-27 起非日线周期聚合收口 `app/data_sources/cn_stock_ext.get_index_kline`
+    （5m 底仓聚合 5m/15m/30m/1H/2H/4H/1W/1M + trading_calendar 新鲜度闸门
+    + coord_index 兜底；1m 无 5m 底仓，远端 mootdx 原生直拉）。
+    1D 仍走 get_index_daily_kline 降级链（含内存缓存）。
+    本函数保留原签名/返回口径作门面。
 
     Args:
         code: 指数代码，如 "000001"
@@ -652,47 +369,21 @@ def get_index_kline(code: str = "000001", frequency: str = "1D", days: int = 200
                    "1D"  — 日线（默认，支持降级）
                    "1W"  — 周线
                    "1M"  — 月线
-        days: 数据条数，最大 800（通达信协议限制）
+        days: 数据条数
 
     Returns:
-        成功: [{date, open, high, low, close, volume, amount}, ...]
+        成功: [{date, open, high, low, close, volume}, ...]
               非日线的 date 格式为 "YYYY-MM-DD HH:MM:SS"
         失败: []（空列表）
 
     Example:
         >>> get_index_kline("000300", "30m", 100)  # 沪深300的30分钟线，100条
     """
-    # 日线走完整的降级链路
+    # 1D 保持原降级链（内存缓存 + aggregate_daily_df 口径 volume=手）
     if frequency == "1D":
         return get_index_daily_kline(code, days)
-
-    # 非日线周期必须通过 mootdx
-    freq = TDX_FREQ.get(frequency)
-    if freq is None:
-        logger.error("不支持的周期: %s，可选: %s", frequency, list(TDX_FREQ.keys()))
-        return []
-
-    cli = _get_client()
-    if cli is None:
-        logger.error("[mootdx] 不可用，无法获取 %s 周期K线", frequency)
-        return []
-
-    try:
-        df = cli.index_bars(symbol=code, frequency=freq, start=0, offset=min(days, 800))
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            return []
-
-        df = df.rename(columns={"datetime": "date", "vol": "volume"})
-        if "date" in df.columns:
-            # 分钟级别保留时分秒
-            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        df = df.loc[:, ~df.columns.duplicated()]
-        cols = [c for c in ["date", "open", "high", "low", "close", "volume", "amount"] if c in df.columns]
-        return df[cols].tail(days).to_dict(orient="records")
-    except Exception as e:
-        logger.error("[mootdx] K线失败(%s/%s): %s", code, frequency, e)
-        return []
+    from app.data_sources.cn_stock_ext import get_index_kline as _ext
+    return _ext(code, timeframe=frequency, limit=days)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -703,6 +394,54 @@ def get_index_kline(code: str = "000001", frequency: str = "1D", days: int = 200
 # 沪股通(hgt): 香港 → 上海
 # 深股通(sgt): 香港 → 深圳
 # 北向合计 = 沪股通净买入 + 深股通净买入（单位: 亿元）
+
+
+def _northbound_summary_fallback() -> Dict[str, Any]:
+    """hexin 实时不可用/缺腿时的兜底：东财 summary 当日北向净买入（单点，无分钟序列）。
+
+    返回与 get_northbound_realtime 同构（points=1，data=[1 点]，source=em_summary）；
+    兜底也失败 ⇒ error dict（维持"宁缺勿假"）。单位口径与
+    get_northbound_daily 的 akshare summary 分支一致。
+    """
+    try:
+        import akshare as ak
+        summary = ak.stock_hsgt_fund_flow_summary_em()
+        if summary is None or getattr(summary, "empty", True):
+            return {"error": "北向数据不完整，且东财 summary 无数据"}
+        hgt_val = 0.0
+        sgt_val = 0.0
+        date_val = ""
+        for _, row in summary.iterrows():
+            board = str(row.get("板块", ""))
+            direction = str(row.get("资金方向", ""))
+            if direction != "北向":
+                continue
+            date_val = str(row.get("交易日", ""))[:10]
+            net = row.get("成交净买额", 0)
+            try:
+                if net is not None and str(net) not in ("", "nan", "NaN"):
+                    if "沪" in board:
+                        hgt_val = float(net)
+                    elif "深" in board:
+                        sgt_val = float(net)
+            except (TypeError, ValueError):
+                continue
+        if not date_val:
+            return {"error": "北向数据不完整，且东财 summary 缺交易日"}
+        logger.info("[akshare] 北向实时兜底(summary): hgt=%.2f sgt=%.2f (%s)",
+                    hgt_val, sgt_val, date_val)
+        pt = {"time": "15:00", "hgt_yi": round(hgt_val, 2), "sgt_yi": round(sgt_val, 2)}
+        return {
+            "points": 1,
+            "hgt_latest_yi": round(hgt_val, 2),
+            "sgt_latest_yi": round(sgt_val, 2),
+            "total_latest_yi": round(hgt_val + sgt_val, 2),
+            "data": [pt],
+            "source": "em_summary",
+        }
+    except Exception as e:
+        logger.warning("[akshare] 北向实时兜底失败: %s", e)
+        return {"error": f"北向数据不完整，无法展示（兜底失败: {e}）"}
 
 
 def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
@@ -757,10 +496,10 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
         d = json.loads(text)
     except json.JSONDecodeError as e:
         logger.warning("[hexin] 北向实时JSON解析失败: %s", e)
-        return {"error": f"JSON解析失败: {e}"}
+        return _northbound_summary_fallback()
     except Exception as e:
         logger.warning("[hexin] 北向实时失败: %s", e)
-        return {"error": str(e)}
+        return _northbound_summary_fallback()
 
     times = d.get("time", [])
     hgt = d.get("hgt", [])
@@ -787,10 +526,10 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
         sgt_ratio = len(sgt) / len(times)
         if hgt_ratio < 0.5 or sgt_ratio < 0.5:
             logger.warning(
-                "[hexin] 北向数据不完整: time=%d, hgt=%d(%.0f%%), sgt=%d(%.0f%%)，跳过",
+                "[hexin] 北向数据不完整: time=%d, hgt=%d(%.0f%%), sgt=%d(%.0f%%)，走东财兜底",
                 len(times), len(hgt), hgt_ratio * 100, len(sgt), sgt_ratio * 100
             )
-            return {"error": "北向数据不完整，无法展示"}
+            return _northbound_summary_fallback()
 
     # hgt/sgt 长度可能不同，分别取各自最后一个非零值
     hgt_latest = next((h for h in reversed(hgt) if h is not None and h != 0), 0)

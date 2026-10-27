@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """coord_misc 契约测试（交易日历 / 个股资金流族）。
 
-本族 2 个 kind 均已迁移 provider（sina）：trading_calendar（object 型）/ stock_flow_daily（rows 型）。
-PENDING_KINDS 为空。
+**零联网约定**：所有 `coordinate()` 调用都 monkeypatch `get_providers` 注入假
+provider。本族 2 个 kind 均已迁移 provider（sina）：trading_calendar（object 型）/
+stock_flow_daily（rows 型）。PENDING_KINDS 为空。
+
+`get_providers()` 仅实例化 provider（__init__ 不建连），故接线断言安全。
 """
+
 import pytest
 
 from app.data_sources import coord_misc as C
@@ -81,8 +85,9 @@ def test_coordinate_failure_keeps_reason(monkeypatch):
 
 
 def test_public_shape_matches_coord_pool(monkeypatch):
-    _patch(monkeypatch, [Fake("sina", 50, results=[{"rows": [{"d": "1"}]}])])
+    """返回结构同构（全程 mock，不联网）。"""
     keys = {"kind", "ok", "source", "mode", "count", "data", "error"}
+    _patch(monkeypatch, [Fake("sina", 50, results=[{"rows": [{"d": "1"}]}])])
     a = C.coordinate("stock_flow_daily", code="600519", days=30)
-    b = coord_pool.coordinate("not_a_kind")
+    b = coord_pool.coordinate("not_a_kind")  # 早返回，无取数
     assert keys <= set(a) and keys <= set(b)

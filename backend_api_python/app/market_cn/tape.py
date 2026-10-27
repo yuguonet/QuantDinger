@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.utils.logger import get_logger
 
@@ -320,86 +320,88 @@ def _ticks_history_mootdx(code: str, date: str, limit: int = 2000) -> Optional[L
 #  对外接口 — 分笔相关
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+#  源表（插槽）— fund_flow_daily 仍用；orderbook/ticks 于 Phase C
+#  （2026-10-26）改走 coord_tape 多源调度，原槽表已无人消费，2026-10-27 删除
+#  （插槽语义现由 dispatch.py 统一保证，见 tests/test_tape_source_slot.py）
+# ══════════════════════════════════════════════════════════════
+
+
+def _first_ok(kind: str, candidates, *args):
+    """按顺序尝试候选源，返回 (data, source_name, last_error)。
+
+    ★ 判成功的标准不只是"真值"：`{"code": ..., "error": ...}` 是**真值但失败**。
+      原实现用 `if sina:` 判成功，会把东财的失败 dict 当成结果直接返回。
+      这里显式识别 `error` 键，并把它记为 last_error 交给调用方。
+
+    与 v3 §3.2 对齐的语义：
+      · 源抛异常 → 记 warning，试下一个（异常不再中断整条链）；
+      · 源返回错误 dict → 记 warning + last_error，试下一个；
+      · 源返回空 → 试下一个（盘口/分笔没有"确认无数据"的稳定判据）；
+      · 命中时打 debug，便于 trace 归因"这次是谁给的数"。
+    """
+    last_error = ""
+    for name, fn in candidates:
+        try:
+            data = fn(*args)
+        except Exception as e:
+            last_error = str(e)
+            logger.warning("[tape] %s 源 %s 异常: %s", kind, name, e)
+            continue
+        if isinstance(data, dict) and data.get("error"):
+            last_error = str(data.get("error"))
+            logger.warning("[tape] %s 源 %s 返回错误: %s", kind, name, last_error)
+            continue
+        if data:
+            logger.debug("[tape] %s 命中 %s", kind, name)
+            return data, name, ""
+        logger.debug("[tape] %s 源 %s 无数据，试下一个", kind, name)
+    return None, "", last_error
+
+
 def get_order_book(code: str) -> Dict[str, Any]:
-    """获取五档盘口 + 实时行情快照（自动降级）
-
-    依次尝试 mootdx → 腾讯财经。
-
-    Args:
-        code: 股票/指数代码，如 "600519"、"000001"
+    """获取五档盘口 + 实时行情快照（2026-10-26 Phase C: 改走 coord_tape 多源调度）
 
     Returns:
-        成功: {
-            code, name, price, open, high, low, last_close, change, change_percent,
-            volume, amount,
-            bid: {bid1~bid5: {price, vol}},  # 买盘五档
-            ask: {ask1~ask5: {price, vol}},  # 卖盘五档
-        }
+        成功: {code, name, price, open, high, low, last_close, change, change_percent,
+              volume, amount, bid: {bid1~bid5}, ask: {ask1~ask5}}
         失败: {code, error: "获取失败"}
-
-    Example:
-        >>> book = get_order_book("600519")
-        >>> print(book["bid"]["bid1"]["price"])  # 买一价
     """
-    data = _quote_mootdx(code)
-    if data:
-        return data
-
-    data = _quote_tencent(code)
-    if data:
-        return data
-
-    logger.error("所有数据源获取五档行情均失败: %s", code)
+    from app.data_sources.coord_tape import coordinate
+    out = coordinate("orderbook", code=code)
+    if out.get("ok") and out.get("data", {}).get("object"):
+        return out["data"]["object"]
+    logger.error("[coord_tape] orderbook 失败: %s (%s)", code, out.get("error", ""))
     return {"code": code, "error": "获取失败"}
 
 
 def get_ticks_today(code: str, limit: int = 2000) -> List[Dict[str, Any]]:
-    """获取当日分笔成交（仅交易时段可用）
-
-    Args:
-        code: 股票代码，如 "600519"
-        limit: 最大条数，默认 2000（通达信协议上限）
-
-    Returns:
-        成功: [{time, price, vol, amount, buy_sell}, ...]
-              buy_sell: "0"=主动买(外盘) "1"=主动卖(内盘) "2"=中性
-        失败: []（非交易时段或网络异常）
-
-    Note:
-        - 仅在交易时段(9:15-15:00)有数据
-        - 主动买: 以卖价成交（买方主动追高）
-        - 主动卖: 以买价成交（卖方主动砸低）
-        - 中性: 买卖价格相同（集合竞价等）
-    """
-    data = _ticks_today_mootdx(code, limit)
-    if data:
-        return data
-
-    logger.error("获取当日分笔失败: %s", code)
-    return []
-
-
-def get_ticks_history(code: str, date: str, limit: int = 2000) -> List[Dict[str, Any]]:
-    """获取历史分笔成交
-
-    Args:
-        code: 股票代码，如 "600519"
-        date: 日期，支持 "YYYY-MM-DD" 或 "YYYYMMDD" 格式
-        limit: 最大条数，默认 2000
+    """获取当日分笔成交（Phase C: 改走 coord_tape）
 
     Returns:
         成功: [{time, price, vol, amount, buy_sell}, ...]
         失败: []
-
-    Example:
-        >>> ticks = get_ticks_history("600519", "2025-01-15")
-        >>> big_buys = [t for t in ticks if t["buy_sell"] == "0" and t["amount"] > 1000000]
     """
-    data = _ticks_history_mootdx(code, date, limit)
-    if data:
-        return data
+    from app.data_sources.coord_tape import coordinate
+    out = coordinate("ticks_today", code=code, limit=limit)
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        return out["data"]["rows"]
+    logger.error("[coord_tape] ticks_today 失败: %s (%s)", code, out.get("error", ""))
+    return []
 
-    logger.error("获取历史分笔失败: %s %s", code, date)
+
+def get_ticks_history(code: str, date: str, limit: int = 2000) -> List[Dict[str, Any]]:
+    """获取历史分笔成交（Phase C: 改走 coord_tape）
+
+    Returns:
+        成功: [{time, price, vol, amount, buy_sell}, ...]
+        失败: []
+    """
+    from app.data_sources.coord_tape import coordinate
+    out = coordinate("ticks_history", code=code, date=date, limit=limit)
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        return out["data"]["rows"]
+    logger.error("[coord_tape] ticks_history 失败: %s %s (%s)", code, date, out.get("error", ""))
     return []
 
 
@@ -1260,6 +1262,13 @@ def _fund_flow_eastmoney_daily(code: str, days: int) -> Dict[str, Any]:
         return {"code": code, "error": str(e)}
 
 
+# 日级资金流源表（2026-10-14 主备翻转：新浪主、东财兜底）
+_FUND_FLOW_DAILY_SOURCES: List[Tuple[str, Callable[..., Optional[Dict[str, Any]]]]] = [
+    ("sina", _fund_flow_sina_daily),
+    ("eastmoney", _fund_flow_eastmoney_daily),
+]
+
+
 def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
     """获取近 N 日日级资金流向。
 
@@ -1304,10 +1313,11 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
         >>> for day in recent:
         ...     print(f"{day['date']}: 主力净流入 {day['main_net']/10000:.0f}万")
     """
-    # 1) 新浪主源（无反爬，2026-10-14 主备翻转）
-    sina = _fund_flow_sina_daily(code, days)
-    if sina:
-        return sina
+    data, src, err = _first_ok("fund_flow_daily", _FUND_FLOW_DAILY_SOURCES, code, days)
+    if data:
+        if isinstance(data, dict):
+            data.setdefault("source", src)
+        return data
 
-    # 2) 东财 push2his 兜底（熔断期内自动跳过）
-    return _fund_flow_eastmoney_daily(code, days)
+    # 两个源都失败：保持原契约（调用方按 error 判定），不伪造空数据
+    return {"code": code, "error": err or "获取失败", "source": ""}

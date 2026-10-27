@@ -872,8 +872,8 @@ class CNStockDataSource(BaseDataSource):
         """分钟线统一入口：取不复权原始价 → 统一前复权后返回（盘中/盘后同构）。
 
         为什么复权必须收口在这一层（同 symbol 同周期口径一致红线）：
-          · DB 的 `kline_1m_YYYY` 存的是**不复权原始价**（backfill_db 由 mootdx 直写，
-            复权因子另存，见 backfill_db.py 文件头）；
+          · DB 的 `kline_1m_YYYY` 存的是**不复权原始价**（原由 backfill_db/mootdx 直写，
+            现由 cn_stock_putdb.sync_stock_kline 经 coordinate_market_kline 覆写，复权因子另存）；
           · 远端 provider 返回的同样是不复权价；
           ⇒ 若只在远端分支复权，除权股会出现「盘中查是前复权价 / 盘后查是原始价」
             的同周期价格跳变（同一支股跨时段口径漂移）。

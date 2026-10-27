@@ -400,7 +400,7 @@ def unadj_to_hfq(klines: list, code: str) -> list:
 
 
 # ================================================================
-# 全量更新 — 供 backfill_db 调度器调用
+# 全量更新 — 供 cn_stock_putdb 调度器调用（原 backfill_db，2026-10-27 迁入）
 # ================================================================
 
 def update_all_factors(max_workers: int = 16) -> int:

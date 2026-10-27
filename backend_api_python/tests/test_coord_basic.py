@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """coord_basic 契约测试（基本面/基础信息族）。
 
-本族 3 个 kind 均已迁移 provider（akshare）：cn_fundamental / cn_financial（object 型）
-/ stock_basic（rows 型）。PENDING_KINDS 为空。
+**零联网约定**：所有 `coordinate()` 调用都 monkeypatch `get_providers` 注入假
+provider。本族 3 个 kind 均已迁移 provider（akshare）：cn_fundamental /
+cn_financial（object 型）/ stock_basic（rows 型）。PENDING_KINDS 为空。
+
+`get_providers()` 仅实例化 provider（__init__ 不建连），故接线断言安全。
 """
+
 import pytest
 
 from app.data_sources import coord_basic as C
@@ -34,6 +38,7 @@ def _patch(monkeypatch, providers):
 
 
 def test_each_kind_has_provider():
+    """已注册 kind 必须至少有 1 个真实 provider 声明该 kind。"""
     for kind in C.CAPS:
         assert get_providers(kind), "%s 无可用源" % kind
 
@@ -64,7 +69,7 @@ def test_unexpected_param_rejected():
 
 def test_cn_fundamental_success_shape(monkeypatch):
     _patch(monkeypatch, [Fake("akshare", 50,
-                              results=[{"object": {"code": "600519", "pe": 12.3}}])])
+                             results=[{"object": {"code": "600519", "pe": 12.3}}])])
     out = C.coordinate("cn_fundamental", code="600519")
     assert out["ok"] and out["count"] == 1
     assert out["data"]["object"]["code"] == "600519"
@@ -84,7 +89,9 @@ def test_coordinate_failure_keeps_reason(monkeypatch):
 
 
 def test_public_shape_matches_coord_pool(monkeypatch):
+    """返回结构同构（全程 mock，不联网）。"""
     keys = {"kind", "ok", "source", "mode", "count", "data", "error"}
+    _patch(monkeypatch, [Fake("akshare", 50, results=[{"object": {"code": "600519"}}])])
     a = C.coordinate("cn_fundamental", code="600519")
-    b = coord_pool.coordinate("not_a_kind")
+    b = coord_pool.coordinate("not_a_kind")  # 早返回，无取数
     assert keys <= set(a) and keys <= set(b)

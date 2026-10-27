@@ -8,13 +8,16 @@
       ↓
   服务层 (services/kline.py, portfolio_monitor.py, ...)
       ↓
-  数据源门面 (DataSourceFactory)
+  数据门面 (DataSourceFactory)              ← 只按 market 实例化数据源，不含取数逻辑
       ↓
-  ★ 协助层 (Coordinator) ← 你在这里
+  数据层 (cn_stock.py / hk_stock.py / ...)   ← 语义与口径：单位 / 复权 / 时间 / 三态 / 本地库 / 缓存
       ↓
-  数据源层 (data_sources/cn_stock.py, us_stock.py, ...)
+  ★ 协助层 (Coordinator) ← 你在这里            ← 只调度 provider：候选 / 回退 / race / 批量 / 熔断 / 限速
       ↓
-  Provider 层 (tencent, sina, eastmoney, akshare, ...)
+  Provider 层 (tencent, sina, sohu, baidu, tdx_ex, ...)   ← 单次 I/O + 解析 + 源专属单位换算
+
+  注：箭头是**调用方向 = 依赖方向**。数据源层在协助层之上——cn_stock.py 调 get_coordinator()，
+      协助层不 import 任何数据源层模块。2026-10-26 修正：原注释把协助层画在数据源层之上，与代码相反。
 
 === 核心职责 ===
 
@@ -203,20 +206,16 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 # 比 SourceConfig 里的超时更严格 — 这是硬上限。
 PER_TASK_TIMEOUT = 8.0
 
-
-class _ProviderCallError(Exception):
-    """Preserve provider exceptions without confusing them with Future timeouts."""
-
-
-class _ExecutorSaturatedError(RuntimeError):
-    """Raised rather than queuing more work behind stuck provider calls."""
-
-
-def _run_provider_call(fn: Callable, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except Exception as exc:
-        raise _ProviderCallError(str(exc)) from exc
+# 分发原语调用 dispatch 的接口（2026-10-27）：submit_bounded/异常分类/
+# NotSupported 判定 —— dispatch 是唯一实现方，coordinator 只做调用方。
+# 两处各写一份时，"槽位耗尽被当成源失败"的幻影三振 bug 就是这么来的
+# （见下方 _mkline_timeout_pool 注释）。
+from app.data_sources.dispatch import (  # noqa: E402
+    ExecutorSaturatedError,
+    ProviderCallError,
+    _is_unsupported as _dispatch_unsupported,
+    submit_bounded as _submit_bounded,
+)
 
 
 # 超时辅助线程池 — 长生命周期，避免每次 _fetch_with_timeout 都创建新线程池。
@@ -234,24 +233,16 @@ _batch_timeout_pool = concurrent.futures.ThreadPoolExecutor(
 _batch_timeout_slots = threading.BoundedSemaphore(12)
 atexit.register(_batch_timeout_pool.shutdown, wait=False)
 
+# ⚠ 容量必须 ≥ market_kline 的 worker 总数（tencent6+sina4+10jqka4+sohu8+baidu8
+# = 30 线程）。2026-10-27 实测: 槽位只有 12 ⇒ 18 个 worker 提交即饱和，
+# ExecutorSaturatedError 被记成源失败 → 各源"试过一轮"即三振 ⇒ 3730 只里
+# 2793 只**从未真正发起过 fetch**就判彻底失败（6min、75% 幻影失败；≤12 只的
+# 小批量却 100% 成功）。留 2 倍余量覆盖硬超时弃置期间仍占槽的孤儿任务。
 _mkline_timeout_pool = concurrent.futures.ThreadPoolExecutor(
-    max_workers=12, thread_name_prefix="mkline-timeout"
+    max_workers=64, thread_name_prefix="mkline-timeout"
 )
-_mkline_timeout_slots = threading.BoundedSemaphore(12)
+_mkline_timeout_slots = threading.BoundedSemaphore(64)
 atexit.register(_mkline_timeout_pool.shutdown, wait=False)
-
-
-def _submit_bounded(pool, slots, fn: Callable, *args, **kwargs):
-    """Submit without allowing an unbounded queue to form behind stuck workers."""
-    if not slots.acquire(blocking=False):
-        raise _ExecutorSaturatedError("provider executor has no free worker slots")
-    try:
-        future = pool.submit(_run_provider_call, fn, *args, **kwargs)
-    except Exception:
-        slots.release()
-        raise
-    future.add_done_callback(lambda _: slots.release())
-    return future
 
 
 # ================================================================
@@ -679,7 +670,7 @@ class Coordinator:
             except Exception as e:
                 elapsed = time.monotonic() - start
                 # 熔断只对超时计数
-                if (not isinstance(e, (_ExecutorSaturatedError, _ProviderCallError))
+                if (not isinstance(e, (ExecutorSaturatedError, ProviderCallError))
                         and elapsed > PER_TASK_TIMEOUT):
                     _realtime_cb.record_failure(name, str(e))
                 cfg.record(False, elapsed)
@@ -911,7 +902,7 @@ class Coordinator:
             return []
 
         from collections import deque
-        from app.data_sources.provider import get_providers, NotSupportedResult
+        from app.data_sources.provider import get_providers
         from app.data_sources.normalizer import strip_market_prefix
 
         # ── 入口: dict → list ──
@@ -1001,7 +992,7 @@ class Coordinator:
 
         # 统计
         source_stats: Dict[str, Dict[str, int]] = {
-            p.name: {"ok": 0, "fail": 0, "timeout": 0, "batches": 0} for p in available
+            p.name: {"ok": 0, "fail": 0, "timeout": 0, "batches": 0, "skipped": 0} for p in available
         }
         stats_lock = threading.Lock()
 
@@ -1166,12 +1157,10 @@ class Coordinator:
 
                 elapsed = time.time() - start
 
-                # NotSupported → 不算熔断失败，整批放回重试池
-                if isinstance(task_result, NotSupportedResult):
+                # NotSupported → 该源不支持此接口，不算失败、不放回重试池、不计入source_fails
+                if _dispatch_unsupported(task_result):
                     with stats_lock:
-                        source_stats[source_name]["fail"] += 1
-                    for sym in batch:
-                        _return_to_retry(sym, source_name)
+                        source_stats[source_name]["skipped"] = source_stats[source_name].get("skipped", 0) + 1
                     return False
 
                 # 有返回数据 → 逐 symbol 处理
@@ -1230,9 +1219,19 @@ class Coordinator:
                     _return_to_retry(sym, source_name)
                 return False
 
+            except ExecutorSaturatedError:
+                # 基础设施拥塞（执行器槽位耗尽）≠ 源失败：只放回重试池、不计
+                # source_fails —— 否则每源"碰壁"一次即幻影三振（2026-10-27）。
+                with stats_lock:
+                    source_stats[source_name]["fail"] += 1
+                with retry_pool_lock:
+                    for sym in batch:
+                        retry_pool.append(sym)
+                return False
+
             except Exception as e:
                 elapsed = time.time() - start
-                is_timeout = (not isinstance(e, _ProviderCallError)
+                is_timeout = (not isinstance(e, ProviderCallError)
                               and elapsed > _PER_TASK_TIMEOUT)
                 # 熔断只对超时计数，错误代码和没数据的不进行计数
                 if is_timeout:
@@ -1310,8 +1309,8 @@ class Coordinator:
         # ── 第七步: 统计 ──
         stat_parts = []
         for name, s in source_stats.items():
-            if s["ok"] > 0 or s["fail"] > 0 or s["timeout"] > 0:
-                stat_parts.append(f"{name}: {s['ok']}只/{s['batches']}批 {s['fail']}失败 {s['timeout']}超时")
+            if s["ok"] > 0 or s["fail"] > 0 or s["timeout"] > 0 or s.get("skipped", 0) > 0:
+                stat_parts.append(f"{name}: {s['ok']}只/{s['batches']}批 {s['fail']}失败 {s['timeout']}超时 {s.get('skipped', 0)}跳过")
         logger.info("[batch_quotes] 完成: %d成功 %d失败 | %s",
                     len(results), permanent_fail_count[0],
                     " | ".join(stat_parts))
@@ -1368,7 +1367,7 @@ class Coordinator:
             List[Dict] — K线数据列表，每个 dict 含 symbol 字段表示所属股票。
         """
         from collections import deque
-        from app.data_sources.provider import get_providers, NotSupportedResult
+        from app.data_sources.provider import get_providers
         from app.data_sources.normalizer import strip_market_prefix
 
         # ── 第一步: 发现源 + 过滤 ──
@@ -1501,7 +1500,7 @@ class Coordinator:
 
         # 统计
         source_stats: Dict[str, Dict[str, int]] = {
-            p.name: {"ok": 0, "fail": 0, "timeout": 0} for p in available
+            p.name: {"ok": 0, "fail": 0, "timeout": 0, "skipped": 0} for p in available
         }
         stats_lock = threading.Lock()
 
@@ -1554,20 +1553,21 @@ class Coordinator:
             """
             将 symbol 放入重试池（失败/超时后归还）。
 
-            记录到该源的失败表。检查是否超过1/2活源试过此 symbol → 是则彻底失败。
+            记录到该源的失败表。只有所有活跃源都试过且失败，才彻底失败。
+            （2026-10-26 修复: 原为 1/2 阈值，快失败源会抢在慢成功源之前"三振"symbol，
+              导致 100 只批量时 sina 来不及试就被放弃。改为全部源试过才放弃。）
             """
             with results_lock:
                 if sym in results:
                     return
 
-            # 正常失败流程：加锁 → 标记 → 检查是否超过1/2活源试过
             with source_fails_lock:
                 source_fails[source_name].add(sym)
                 fail_count = sum(1 for src in available if sym in source_fails[src.name])
 
-            # 超过1/2活源（未熔断）试过就彻底失败
+            # 所有活源（未熔断）都试过且失败 → 彻底失败
             active_count = sum(1 for src in available if _realtime_cb.is_available(src.name))
-            if active_count > 0 and fail_count * 2 > active_count:
+            if active_count > 0 and fail_count >= active_count:
                 with results_lock:
                     if sym in results:
                         return
@@ -1656,11 +1656,10 @@ class Coordinator:
                     return False
                 elapsed = time.time() - start
 
-                # NotSupported → 该源不支持，不算熔断失败，只放回重试池
-                if isinstance(task_result, NotSupportedResult):
+                # NotSupported → 该源不支持此接口，不算失败、不放回重试池、不计入source_fails
+                if _dispatch_unsupported(task_result):
                     with stats_lock:
-                        source_stats[source_name]["fail"] += 1
-                    _return_to_retry(sym, source_name)
+                        source_stats[source_name]["skipped"] = source_stats[source_name].get("skipped", 0) + 1
                     return False
 
                 # 有返回数据 → 校验有效性
@@ -1685,9 +1684,18 @@ class Coordinator:
                 _return_to_retry(sym, source_name)
                 return False
 
+            except ExecutorSaturatedError:
+                # 基础设施拥塞（执行器槽位耗尽）≠ 源失败：只放回重试池、不计
+                # source_fails —— 否则每源"碰壁"一次即幻影三振（2026-10-27）。
+                with stats_lock:
+                    source_stats[source_name]["fail"] += 1
+                with retry_pool_lock:
+                    retry_pool.append(sym)
+                return False
+
             except Exception as e:
                 elapsed = time.time() - start
-                is_timeout = (not isinstance(e, _ProviderCallError)
+                is_timeout = (not isinstance(e, ProviderCallError)
                               and elapsed > _PER_TASK_TIMEOUT)
                 # 熔断只对超时计数，错误代码和没数据的不进行计数
                 if is_timeout:
@@ -1775,8 +1783,8 @@ class Coordinator:
         # ── 第八步: 统计 ──
         stats_lines = []
         for name, s in source_stats.items():
-            if s["ok"] > 0 or s["fail"] > 0 or s["timeout"] > 0:
-                stats_lines.append(f"{name}: {s['ok']}成功 {s['fail']}失败 {s['timeout']}超时")
+            if s["ok"] > 0 or s["fail"] > 0 or s["timeout"] > 0 or s.get("skipped", 0) > 0:
+                stats_lines.append(f"{name}: {s['ok']}成功 {s['fail']}失败 {s['timeout']}超时 {s.get('skipped', 0)}跳过")
         logger.info("[market_kline] 完成: %d成功 %d彻底失败 %d只 | %s",
                     len(results), permanent_fail_count[0], total,
                     " | ".join(stats_lines))

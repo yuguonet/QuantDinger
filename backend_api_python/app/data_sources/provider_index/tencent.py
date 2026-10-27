@@ -71,14 +71,20 @@ def _parse_tencent_line(line: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def fetch_index_quote(codes: Optional[List[str]] = None) -> Dict[str, Any]:
+def fetch_index_quote(code: Optional[str] = None,
+                     codes: Optional[List[str]] = None) -> Dict[str, Any]:
     """全市场指数实时快照（腾讯 qt.gtimg.cn 批量接口）。
 
-    不传 codes 时拉取主要指数（上证/深成/创业板/科创50/沪深300 等）。
-    返回格式与 akshare 版一致: {"rows": [...]}
+    接受 codes=[...]（一次性多股批量，单 HTTP 请求）或 code=单码；不传则返回
+    主要指数（上证/深成/创业板/科创50/沪深300 等）。返回 {"rows": [...]}。
+    code=/codes= 双入口是为兼容 run_batch 串行分支（按 code= 逐码注入）与批量分支
+    （按 codes=[整批] 一次性注入）。
     """
     import urllib.request
 
+    # code= 单码归一为 codes=[code]，供两条分支共用同一实现
+    if not codes:
+        codes = [code] if code else None
     if not codes:
         # 主要指数默认列表
         codes = [
@@ -111,18 +117,23 @@ def fetch_index_quote(codes: Optional[List[str]] = None) -> Dict[str, Any]:
     return {"rows": rows}
 
 
-def fetch_index_kline(code: str, days: int = 250) -> Dict[str, Any]:
-    """指数日K线（腾讯 fqkline）。
+def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dict[str, Any]:
+    """指数日K线（腾讯 fqkline，timeframe=1D；其余周期 NotSupported）。
 
     API: web.ifzq.gtimg.cn/appstock/app/fqkline/get
     返回 data.{code}.day = [[date, open, close, high, low, volume], ...]
     volume 原始"手"→×100 转"股"对齐 mootdx 口径。
     """
+    from app.data_sources.normalizer import normalize_chart_timeframe
+    from app.data_sources.dispatch import NotSupported
+
+    if normalize_chart_timeframe(timeframe) != "1D":
+        return NotSupported("index_kline/%s" % timeframe)
     import urllib.request
 
     tc_code = _index_tencent_code(code)
     url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-    params = f"param={tc_code},day,,,{days},"
+    params = f"param={tc_code},day,,,{limit},"
 
     try:
         req = urllib.request.Request(
@@ -163,7 +174,7 @@ def fetch_index_kline(code: str, days: int = 250) -> Dict[str, Any]:
         except (ValueError, TypeError):
             continue
 
-    return {"rows": rows[-days:]}
+    return {"rows": rows[-limit:]}
 
 
 from app.data_sources.provider_index import register  # noqa: E402
@@ -174,6 +185,9 @@ class TencentIndexProvider:
     name = "tencent"
     priority = 10  # 优先于 akshare (50)
     markets = {"CNStock"}
+    # index_quote 是腾讯真·多股单请求批量接口（qt.gtimg.cn q=逗号拼码），声明后
+    # run_batch 走并发批量分支一次性取回整批，效率远高于逐码串行（2026-10-27 接通）。
+    batch_kinds = {"index_quote"}
     capabilities = {
         "index_quote": fetch_index_quote,
         "index_kline": fetch_index_kline,

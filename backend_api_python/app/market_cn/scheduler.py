@@ -220,23 +220,27 @@ def _refresh_sector_daily():
 def _save_dragon_hot_daily():
     """龙虎榜 & 热榜持久化 — 每天 17:00 调用 (LHB(D) 交易所 ~17:00-17:30 发布)。
 
+    龙虎榜 2026-10-27 起走 app/data_sources/cn_stock_putdb.sync_dragon_tiger
+    （coord_pool dragon_tiger 多源 + cnd_dragon_tiger_list UPSERT）；热榜仍走
+    dragon_tiger_store.save_daily(include_dragon_tiger=False)。
     当日榜未发布(total=0)时 10min 间隔重试(最多 3 次尝试), 必须先于
     dragon_scan(17:25) 完成落库 —— 2026-09-18 调度重排: 榜先落库、扫描后跑,
     杜绝"策略消费 LHB 时当日榜缺失"的时序错位 (hub.lhb 时效纪律配套)。
     """
+    from app.data_sources.cn_stock_putdb import sync_dragon_tiger
     from app.market_cn.dragon_tiger_store import save_daily
     from app.utils.trading_calendar import is_trading_day
     today = datetime.now().strftime("%Y-%m-%d")
     for attempt in range(1, 4):
         try:
-            result = save_daily()
-            dt = result.get("dragon_tiger", {})
-            hr = result.get("hot_rank", {})
+            dt = sync_dragon_tiger()
+            hr_result = save_daily(include_dragon_tiger=False)
+            hr = hr_result.get("hot_rank", {})
             logger.info(
                 "[dragon_hot_daily] 完成: 龙虎榜 %d/%d, 热榜 %d/%d, 状态=%s",
                 dt.get("written", 0), dt.get("total", 0),
                 hr.get("written", 0), hr.get("total", 0),
-                result.get("status", "unknown"),
+                dt.get("status", "unknown"),
             )
             # 拿到当日榜 / 非交易日 / 已到最后一次尝试 → 结束; 否则等 10min 重试
             if dt.get("total", 0) > 0 or not is_trading_day(today) or attempt >= 3:
@@ -375,55 +379,40 @@ def _dragon_strategy_knife_scan(slot=None):
 
 
 def _refresh_backfill_1m():
-    """盘后: 回填当日 1m K 线"""
-    from app.data_sources.backfill_db import run_1m
+    """盘后: 回填当日 1m K 线（coordinate_market_kline 多源批量 → kline_1m）"""
+    from app.data_sources.cn_stock_putdb import run_1m
     run_1m()
 
 
 def _sync_index_minute():
     """盘后: 指数 5m K线同步 → kline_index_5m (指数分钟不可回补, 只能向前攒;
-    幂等 upsert, 800 根窗口断采一周可补回)。
-    scripts/ 目录脚本, 用 importlib 按路径载入 (scripts/ 不在 app 包内)。"""
-    import importlib.util
-    import os as _os
-    _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
-        _os.path.dirname(_os.path.abspath(__file__))))), "scripts", "sync_index_minute.py")
-    if not _os.path.isfile(_p):
-        logger.warning("[index_minute] 未找到 scripts/sync_index_minute.py, 跳过")
-        return
+    幂等 upsert, ~104 交易日滑动窗口断采一周可补回)。
+    2026-10-27 起改走 app/data_sources/cn_stock_putdb（coord_index 多源调度）,
+    不再 importlib 载入 scripts/sync_index_minute.py。"""
     try:
-        _spec = importlib.util.spec_from_file_location("sync_index_minute", _p)
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        r = _mod.sync()
+        from app.data_sources.cn_stock_putdb import sync
+        r = sync()
         logger.info("[index_minute] 指数 5m 同步: %s", r)
     except Exception as e:
         logger.error("[index_minute] 执行失败: %s", e)
 
 
 def _sync_index_fflow():
-    """盘后: 指数大盘资金流同步 → kline_index_fflow (EM 1分钟累计, 当日240根/指数;
-    只能向前攒不可回补)。scripts/ 目录脚本, 用 importlib 按路径载入。"""
-    import importlib.util
-    import os as _os
-    _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(
-        _os.path.dirname(_os.path.abspath(__file__))))), "scripts", "sync_index_fflow.py")
-    if not _os.path.isfile(_p):
-        logger.warning("[index_fflow] 未找到 scripts/sync_index_fflow.py, 跳过")
-        return
+    """盘后/盘中: 指数大盘资金流同步 → kline_index_fflow (EM 1分钟累计, 当日240根/指数;
+    只能向前攒, 盘中每5分钟全日重写幂等)。
+    2026-10-27 起改走 app/data_sources/cn_stock_putdb（coord_index index_fflow）,
+    不再 importlib 载入 scripts/sync_index_fflow.py。"""
     try:
-        _spec = importlib.util.spec_from_file_location("sync_index_fflow", _p)
-        _mod = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_mod)
-        r = _mod.sync()
+        from app.data_sources.cn_stock_putdb import sync_index_fflow
+        r = sync_index_fflow()
         logger.info("[index_fflow] 指数资金流同步: %s", r)
     except Exception as e:
         logger.error("[index_fflow] 执行失败: %s", e)
 
 
 def _refresh_backfill_1d() -> dict:
-    """覆写 1D，返回 {status, written, skipped}。"""
-    from app.data_sources.backfill_db import run_1d
+    """覆写 1D（coordinate_market_kline 多源批量 → kline_1D），返回 {status, written, skipped}。"""
+    from app.data_sources.cn_stock_putdb import run_1d
     return run_1d()
 
 
@@ -444,14 +433,57 @@ import threading as _threading
 post_market_done = _threading.Event()
 
 def _post_market_batch():
-    """盘后日级串行: 1m → 日档 → 龙虎榜/北向/资金流 → 1D → 板块统计，重试至数据到位后退出。"""
+    """盘后日级串行: 1m → 1D（K线基座优先）→ 指数5m/资金流/日档/北向 → 板块统计，重试至数据到位后退出。"""
     from app.utils.trading_calendar import last_finish_trading_day
     target = last_finish_trading_day()
 
-    # 1m K线回填 (mootdx, 每标的240条) — 替代原 15m，精度更高
+    # ── K线基座优先（2026-10-27 用户裁定：1D 紧跟 1m，不等中段任务）──
+    # 1m K线回填 (每标的240条)；minute_1m/daily_1d 完成标记在补拉闭环到位后统一打
     _refresh_backfill_1m()
-    _mark_event("minute_1m", target)
 
+    # K线补拉闭环（1D+1m 同判据）：增量缺口回填（run_1d/run_1m 只拉缺失标的），
+    # 未齐则 10min 一轮补拉到位。覆盖率判据 = trading_calendar 目标日 +
+    # 库内 distinct symbol（stock_kline_coverage）；2026-10-27 报障「1D 只有
+    # 1504/5223 且无人补拉」即缺这层闭环 —— 之前跑一次就走、失败也标完成。
+    from app.data_sources.cn_stock_putdb import (
+        run_1d, run_1m, stock_kline_coverage,
+    )
+    result_1d = run_1d()
+    if result_1d.get("written", 0) > 0:
+        logger.info("[post_market] 1D 写入 %d 条", result_1d["written"])
+    else:
+        logger.info("[post_market] 1D 无新数据 (skipped=%s)", result_1d.get("skipped"))
+    kline_complete = False
+    for attempt in range(1, 4):
+        have_1d, total = stock_kline_coverage("1D")
+        have_1m, _ = stock_kline_coverage("1m")
+        # 停牌/退市边缘票当日无 bar 属常态 ⇒ 95% 即视为到位
+        # （2026-10-27 用户裁定：1m=5215/5234 就算完成，缺口只重试 3 轮）
+        d1_ok = total > 0 and (have_1d == total or have_1d / total >= 0.95)
+        m1_ok = total > 0 and (have_1m == total or have_1m / total >= 0.95)
+        kline_complete = d1_ok and m1_ok
+        if kline_complete:
+            logger.info("[post_market] K线到位 1D=%d 1m=%d /%d", have_1d, have_1m, total)
+            break
+        logger.warning("[post_market] K线未齐 1D=%d 1m=%d /%d，10min 后补拉缺口 (attempt %d)",
+                       have_1d, have_1m, total, attempt)
+        _time.sleep(600)
+        if not d1_ok:
+            r = run_1d(force=True)          # 缺口补拉：旁路防重守卫，只拉缺失标的
+            if r.get("written", 0) > 0:
+                logger.info("[post_market] 1D 补拉写入 %d 条", r["written"])
+        if not m1_ok:
+            r = run_1m(force=True)
+            if r.get("written", 0) > 0:
+                logger.info("[post_market] 1m 补拉写入 %d 条", r["written"])
+    if kline_complete:
+        _mark_event("daily_1d", target)
+        _mark_event("minute_1m", target)
+    else:
+        logger.error("[post_market] K线 3 轮后仍未齐（停牌容差 95%%），"
+                     "daily_1d/minute_1m 不标记完成")
+
+    # ── 中段任务（不挡 K线补拉）──
     # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
     _sync_index_minute()
 
@@ -461,14 +493,6 @@ def _post_market_batch():
 
     _refresh_daily()
     _refresh_post_market()
-
-    # 1D 最后跑，完成后触发板块统计
-    result_1d = _refresh_backfill_1d()
-    if result_1d.get("written", 0) > 0:
-        logger.info("[post_market] 1D 写入 %d 条", result_1d["written"])
-    else:
-        logger.info("[post_market] 1D 无新数据 (skipped=%s)", result_1d.get("skipped"))
-    _mark_event("daily_1d", target)
 
     # 检测数据是否到位
     dt_date = nb_date = ""
@@ -513,9 +537,15 @@ def _post_market_batch():
         import traceback as _tb
         logger.error(_tb.format_exc())
 
-    # 通知 EvalWorker: 盘后批次完成，K线数据已就绪
-    post_market_done.set()
-    logger.info("[post_market] 盘后批次完成，已通知 EvalWorker")
+    # 通知 EvalWorker: 仅当 K线就绪才叫醒（缺 K 线的回溯验证是假数据）；
+    # 未齐 ⇒ 返回 error，_task_result_ok=False ⇒ 不写完成标记 ⇒ 重启补跑兜底
+    # （2026-10-27 报障根因之二：此前返回 None 恒判成功，1D 半截也被标 done）。
+    if kline_complete:
+        post_market_done.set()
+        logger.info("[post_market] 盘后批次完成，已通知 EvalWorker")
+    else:
+        logger.error("[post_market] K线未齐，不通知 EvalWorker；本次不标完成，等补跑")
+    return {"status": "ok" if kline_complete else "error"}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -790,6 +820,20 @@ def _worker(task: Task, slot=None):
 # ═══════════════════════════════════════════════════════════
 
 
+def _kline_day_complete() -> bool:
+    """1D+1m 目标日是否齐（95% 停牌容差）。查库失败 ⇒ False（保守补跑）。"""
+    try:
+        from app.data_sources.cn_stock_putdb import stock_kline_coverage
+        have_1d, total = stock_kline_coverage("1D")
+        have_1m, _ = stock_kline_coverage("1m")
+        if total <= 0:
+            return False
+        return ((have_1d == total or have_1d / total >= 0.95)
+                and (have_1m == total or have_1m / total >= 0.95))
+    except Exception:
+        return False
+
+
 def _scheduler_loop():
     """每 10 秒检查一次，到期任务拉新线程执行。"""
     logger.info("[scheduler] 调度线程启动，每 10 秒检查一次")
@@ -797,31 +841,61 @@ def _scheduler_loop():
     now_dt = datetime.now()
     today = now_dt.strftime("%Y-%m-%d")
 
-    # 首次立即执行周期任务
+    # 首次立即执行周期任务（尊重 trading_only：夜里/非交易时段重启不拉起盘中任务
+    # ——2026-10-27 报障「重启后重复写库」：旧版无视 trading_only，22:00 重启也
+    # 立即跑 fflow_intraday 等盘中任务，整段重写已收官数据）。
     for task in TASKS:
-        if not task.once_per_day:
-            _launch(task)
+        if task.once_per_day:
+            continue
+        if task.trading_only and not _is_trading_time():
+            logger.info("[scheduler] 启动跳过(非盘中, trading_only): %s", task.name)
+            continue
+        _launch(task)
 
-    # 启动补跑：日级任务触发时刻已过且未执行过，立即补跑
-    # 跳过 post_market_batch（会唤醒 EvalWorker，与 mq-worker 产生导入竞争）
+    # 启动补跑：日级任务触发时刻已过且未执行过，立即补跑。
+    # post_market_batch 延迟 60s：它末尾会唤醒 EvalWorker，与 mq-worker 的启动
+    # 导入相撞（2026-09 规避）——延迟到 worker 初始化落定后再跑。2026-10-27 报障
+    # 「重启后没有回填入库」即此前直接 continue 跳过本任务，当天盘后批次永不补跑。
+    def _delayed_launch(t, delay=60):
+        def _run():
+            _time.sleep(delay)
+            # 注意: daily_done 不能作本线程的跳过判据 —— 调度前已把它当"认领"
+            # 写成 today（防主循环 10s tick 抢跑），自己再判它 == 今日已完成
+            # 会**自锁跳过、补跑永不执行**（2026-10-27 22:29 日志复现）。
+            if t.running:
+                return
+            logger.info("[scheduler] 延迟补跑启动: %s", t.name)
+            _launch(t)
+        threading.Thread(target=_run, daemon=True, name="catchup-%s" % t.name).start()
+
     from app.utils.trading_calendar import is_trading_day
     for task in TASKS:
         trig = _task_trigger_hm(task) if task.once_per_day else None
         if not trig:
             continue
-        if task.name == "post_market_batch":
-            continue
         if now_dt.strftime("%H:%M") < trig:
             continue
         if not is_trading_day(today):
             continue
-        # 跨重启守卫: 今日已完成则跳过启动补跑 (防重复扫描→并发死锁丢信号)
+        # 跨重启守卫: 今日已完成则跳过启动补跑 (防重复扫描→并发死锁丢信号)。
+        # 例外（2026-10-27）: post_market_batch 的完成标记可能由旧代码在 K线
+        # 未齐时写入（返回 None 恒判成功）⇒ **数据事实优先**，K线未齐仍补跑。
         if scheduler_task_done(task.name, today):
-            task.daily_done = today
-            logger.info("[scheduler] 跳过启动补跑(今日已完成): %s", task.name)
+            if task.name == "post_market_batch" and not _kline_day_complete():
+                logger.warning("[scheduler] %s 已标完成但 K线未齐，数据事实优先，补跑",
+                               task.name)
+            else:
+                task.daily_done = today
+                logger.info("[scheduler] 跳过启动补跑(今日已完成): %s", task.name)
+                continue
+        if task.name == "post_market_batch":
+            task.daily_done = today        # 防主循环 10s tick 抢跑（防重入）
+            logger.info("[scheduler] 启动补跑(延迟 60s): %s (今日 %02d:%02d 已过)",
+                        task.name, task.trigger_hour, task.trigger_minute)
+            _delayed_launch(task)
             continue
         logger.info("[scheduler] 启动补跑: %s (今日 %02d:%02d 已过)",
-                     task.name, task.trigger_hour, task.trigger_minute)
+                    task.name, task.trigger_hour, task.trigger_minute)
         _launch(task)
 
     while True:

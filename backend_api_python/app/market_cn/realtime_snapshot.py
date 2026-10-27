@@ -3,7 +3,7 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
 
 ═══════════════════════════════════════════════════════════════
   本文件负责盘中原始快照存储，不负责 K 线转换。
-  精确 1m K 线由 backfill_db.run_1m() 盘后回填。
+  精确 1m K 线由 cn_stock_putdb.run_1m()（coordinate_market_kline 多源批量）盘后回填。
 ═══════════════════════════════════════════════════════════════
 
 在架构中的位置:
@@ -14,7 +14,7 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
       → UPSERT 到 realtime_snapshot 单表
 
   scheduler.py (post_market_batch)
-    → backfill_db.run_1m()                 ← 盘后精确1m K线
+    → cn_stock_putdb.run_1m()              ← 盘后精确1m K线（coordinate_market_kline 多源批量）
 
 核心职责:
   1. 盘中每分钟拉取全市场实时行情快照 (原始数据)
@@ -48,7 +48,7 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
      （`tencent.py::_volume_to_shares`）；本层另加 `_mark_volume_jumps`
      打 `extras.vol_jump` 标记作为第二道观测（**只标记不丢弃**）。
   4. extras 内容因源而异，不要在业务逻辑中依赖 extras 的具体字段
-  5. 与 backfill_db 的 kline 表是两套独立数据，不要混用
+  5. 与 cn_stock_putdb 的 kline 表是两套独立数据，不要混用
   6. **落库 time 用的是"数据源返回的行情时间"**（q.time 优先，缺失才用整分钟兜底），
      所以同一次调度写出的行 time 会秒级错开（实测 9:26 那次写出 09:25:00~09:26:22），
      别误以为是多次调度; 也因此"按分钟整点"去数拍数会低估真实调度频次。

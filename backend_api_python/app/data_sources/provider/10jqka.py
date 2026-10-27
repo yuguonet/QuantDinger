@@ -353,10 +353,14 @@ class ThsDataSource:
                 except (ValueError, TypeError):
                     prev = 0.0
         chg = round(last - prev, 4) if prev > 0 else 0.0
-        return {"last": last, "change": chg,
+        from app.data_sources.provider import normalize_quote
+        result = {"last": last, "change": chg,
                 "changePercent": round(chg / prev * 100, 2) if prev > 0 else 0.0,
                 "high": high, "low": low, "open": open_p, "previousClose": prev,
-                "volume": vol, "name": data.get("name", ""), "symbol": f"{digits}"}
+                "volume": vol, "time": str(parts[0]) if len(parts) > 0 else "",
+                "name": data.get("name", ""), "symbol": f"{digits}"}
+        normalize_quote(result)
+        return result
 
     def fetch_batch_quotes(self, codes, timeout=10):
         return NotSupportedResult(self.name, "fetch_batch_quotes")

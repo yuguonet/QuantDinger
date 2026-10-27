@@ -397,11 +397,13 @@ class StockBasicDB:
         with pool.connection() as conn:
             cur = conn.cursor()
             try:
-                # ── 快速路径：整批一次性写入 ──
-                # page_size=1000：每 1000 条一批发给 PostgreSQL，
-                # 平衡内存占用和网络往返次数
-                execute_values(cur, sql, valid_rows, page_size=1000)
-                total_ok = cur.rowcount
+                # ── 快速路径：外层显式分页 + **逐页累计 rowcount** ──
+                # 为什么不用 execute_values(page_size=1000) 一把梭：
+                # 它内部拆多条 SQL，cur.rowcount 只反映**最后一页**
+                # （2026-10-27 实测 5234 条只报 234 = 末页大小，账目假亏空）。
+                for i in range(0, len(valid_rows), 1000):
+                    execute_values(cur, sql, valid_rows[i:i + 1000], page_size=1000)
+                    total_ok += cur.rowcount
                 conn.commit()
             except Exception as e:
                 # ── 整批失败：回滚后拆半重试 ──

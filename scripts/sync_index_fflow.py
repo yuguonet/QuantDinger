@@ -50,7 +50,9 @@ sync_index_fflow.py — A股主要指数大盘资金流同步 (kline_index_fflow
   # 口径校验: 新浪聚合日级 vs 已有东财分钟数据日终值 (需 DB):
   python scripts/sync_index_fflow.py --verify
 
-调度: 由 backend scheduler._post_market_batch 在指数 5m 同步后调用 sync() 函数。
+调度: 2026-10-27 起 scheduler._sync_index_fflow 直调
+      app/data_sources/cn_stock_putdb.sync_index_fflow（与本脚本 sync() 同源）；
+      本脚本保留 CLI 全部能力（分钟 sync / 日级 --backfill / --verify）。
 """
 
 import sys
@@ -87,13 +89,6 @@ INDICES: Dict[str, str] = {
 TABLE = "kline_index_fflow"
 # f52~f56 净流入字段 → 库列名 (累计值, 元)
 NET_COLS = ["main_net", "small_net", "mid_net", "big_net", "super_net"]
-# host 优先级: 实时主站优先 (秒级), 封锁时自动落延迟镜像 (~15分钟滞后)
-# 2026-10-18 实测: push2 (edge101 指纹) HTTP 200 通; push2delay RST 不通,
-# 保留仅作部署网络下的回退位
-FFLOW_HOSTS = [
-    "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
-    "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get",
-]
 # 日级历史端点 (push2his, akshare 同款参数; 只在本机网络可达)
 DAYKLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 # 分钟根数阈值: 当日已有 ≥ 此数视为分钟数据完整, 日级回补跳过该日
@@ -142,76 +137,21 @@ def _em_get(url: str, timeout: float = 15, retries: int = 3) -> Optional[str]:
 
 
 def fetch_fflow(symbol: str) -> Optional[list]:
-    """EM 1分钟资金流。返回 [{time, main_net, small_net, mid_net, big_net,
-    super_net}] (净额为当日累计, 元; time 为 bar 起始时刻), 失败 None。"""
-    import json
-    txt = None
-    for base in FFLOW_HOSTS:
-        url = (base
-               + "?lmt=0&klt=1&fields1=f1,f2,f3,f7"
-               + "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
-               + f"&secid={_to_secid(symbol)}")
-        txt = _em_get(url, timeout=15, retries=2)
-        if txt:
-            break  # 任一 host 成功即用 (实时优先, 封锁自动落 delay)
-    if not txt:
-        print("    [fflow] 拉取失败 (全部 host 无响应)")
-        return None
-    try:
-        d = json.loads(txt)
-    except Exception as e:
-        print(f"    [fflow] JSON 解析失败: {e}")
-        return None
-    kl = ((d.get("data") or {}).get("klines")) or []
-    if not kl:
-        print("    [fflow] 无数据")
-        return None
-    rows = []
-    for line in kl:
-        p = line.split(",")
-        try:
-            rows.append({
-                "time": p[0],
-                **{c: float(p[i + 1]) for i, c in enumerate(NET_COLS)},
-            })
-        except (ValueError, IndexError) as e:
-            print(f"    [fflow] 行解析跳过: {e} ({line[:60]})")
-    return rows
+    """EM 1分钟资金流。委托 provider_index.fflow_em（同源同口径，2026-10-27 归位）。
+
+    返回 [{time, main_net, small_net, mid_net, big_net, super_net}]（净额当日累计、
+    元、bar 起始时刻），失败 None。
+    """
+    from app.data_sources.provider_index.fflow_em import fetch_index_fflow
+    out = fetch_index_fflow(symbol)
+    rows = out.get("rows") or []
+    return rows or None
 
 
 def write_to_db(pool, symbol: str, rows: list, dry_run: bool = False) -> int:
-    if not rows:
-        return 0
-    table = f'"{TABLE}"'
-    if dry_run:
-        print(f"    [dry-run] {table} {symbol}: {len(rows)} 条 "
-              f"({rows[0]['time']} ~ {rows[-1]['time']})")
-        return len(rows)
-    cols = ", ".join(NET_COLS)
-    ph = ", ".join(["%s"] * (2 + len(NET_COLS)))
-    try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {table} (
-                        symbol VARCHAR(20) NOT NULL,
-                        time   TIMESTAMP   NOT NULL,
-                        {", ".join(f"{c} DOUBLE PRECISION" for c in NET_COLS)},
-                        PRIMARY KEY (symbol, time)
-                    )
-                """)
-                for r in rows:
-                    cur.execute(f"""
-                        INSERT INTO {table} (symbol, time, {cols})
-                        VALUES ({ph})
-                        ON CONFLICT (symbol, time) DO UPDATE SET
-                            {", ".join(f"{c} = EXCLUDED.{c}" for c in NET_COLS)}
-                    """, (symbol, r["time"], *[r[c] for c in NET_COLS]))
-            conn.commit()
-        return len(rows)
-    except Exception as e:
-        print(f"    ❌ {table} 写入失败: {e}")
-        return 0
+    """落库委托 app/data_sources/cn_stock_putdb.write_index_fflow（同 UPSERT，2026-10-27 归位）。"""
+    from app.data_sources.cn_stock_putdb import write_index_fflow
+    return write_index_fflow(pool, symbol, rows, dry_run=dry_run)
 
 
 def get_pool():
@@ -393,30 +333,13 @@ def verify_against_minute(symbols: Optional[List[str]] = None,
 
 def sync(symbols: Optional[List[str]] = None, dry_run: bool = False,
          verbose: bool = False) -> Dict[str, int]:
-    """同步入口 (scheduler 与 CLI 共用)。返回 {written, failed} 统计。"""
-    import time as _time
-    symbols = symbols or list(INDICES.keys())
-    pool = get_pool()
-    total, failed = 0, []
-    for symbol in symbols:
-        name = INDICES.get(symbol, symbol)
-        print(f"  📊 {name} ({symbol})")
-        rows = fetch_fflow(symbol)
-        if not rows:
-            failed.append(symbol)
-            print("    ❌ 拉取失败")
-            continue
-        if verbose:
-            print(f"    fflow: {len(rows)} 根 ({rows[0]['time']} ~ {rows[-1]['time']}), "
-                  f"主力累计尾值={rows[-1]['main_net']:.0f}")
-        written = write_to_db(pool, symbol, rows, dry_run=dry_run)
-        total += written
-        if verbose:
-            print(f"    → 写入 {written} 条")
-        _time.sleep(2)  # EM 防限流
-    print(f"\n  完成: {total} 条写入, {len(failed)} 个失败"
-          + (f" ({', '.join(failed)})" if failed else ""))
-    return {"written": total, "failed": len(failed)}
+    """同步入口 (scheduler 与 CLI 共用)。返回 {written, failed} 统计。
+
+    2026-10-27 起委托 app/data_sources/cn_stock_putdb.sync_index_fflow
+    （coord_index index_fflow 多源调度；scheduler 同源入口）。
+    """
+    from app.data_sources.cn_stock_putdb import sync_index_fflow
+    return sync_index_fflow(symbols, dry_run=dry_run, verbose=verbose)
 
 
 def main():

@@ -481,7 +481,9 @@ def all_codes():
 
 
 def lhb(stock_code=None, trade_date="", days=30):
-    """龙虎榜事件 (名单型数据, 不 OHLVC 化)。只读引用 market_cn/dragon_tiger_store。
+    """龙虎榜事件 (名单型数据, 不 OHLVC 化)。2026-10-27 起读收口
+    `app/data_sources/cn_stock_ext.lhb`（dragon_tiger_store 本地优先,
+    空窗 coord_pool dragon_tiger 兜底; 落库由 cn_stock_putdb.sync_dragon_tiger）。
 
     Returns:
         list[dict]: 龙虎榜事件行（含 stock_code/stock_name/trade_date/net_amount 等）；无数据 []。
@@ -494,12 +496,8 @@ def lhb(stock_code=None, trade_date="", days=30):
     函数; 2026-09-12 偏差审计 A2 固化。)
     若策略真消费本通道, 须 data_needs 声明加 "lhb"。
     """
-    try:
-        from app.market_cn.dragon_tiger_store import query_dragon_tiger
-        return query_dragon_tiger(trade_date=trade_date, stock_code=stock_code, days=days)
-    except Exception as e:
-        logger.warning("[hub] 龙虎榜读取失败: %s", e)
-        return []
+    from app.data_sources.cn_stock_ext import lhb as _lhb_impl
+    return _lhb_impl(trade_date=trade_date, stock_code=stock_code or "", days=days)
 
 
 # ================================================================
@@ -608,33 +606,16 @@ def index_daily(code="000001", days=800, as_of=None, force=False):
     return bars
 
 
-def _tail_trading_days(bars, days):
-    """按**交易日**取尾部 N 日 (不是"最后 N 根 bar")。
-
-    2026-09-28 审计 A1b: index_minute/index_fflow 原先 `bars[-days:]` 把 days 当
-    **bar 行数**, 而这两张表是分钟粒度 (约 240 行/交易日) ⇒ `days=10` 只拿到 10 **分钟**。
-    调用方的语义是交易日: `tools/pool_check` 传 10（2026-10-12: 另一举例
-    `features/env_flow` 已随该模块退役归档到 `del/20261012_env_flow_retired/`, 此处
-    举例同步收敛为仍在用的 pool_check）⇒ 修正前实际拿到的窗口被压缩 ~240 倍。
-    bars 需按 time 升序 (两函数 SQL 均 ORDER BY time ASC)。
-    """
-    if not days or days <= 0:
-        return bars
-    dates = []
-    for b in bars:
-        d = str(b["time"])[:10]
-        if not dates or dates[-1] != d:
-            dates.append(d)
-    if len(dates) <= days:
-        return bars
-    cut = dates[-days]
-    return [b for b in bars if str(b["time"])[:10] >= cut]
+# 原 _tail_trading_days（按交易日取尾部 N 日）随 index_minute/index_fflow 收口
+# 迁至 app/data_sources/cn_stock_ext.py，2026-10-27 删除本处副本（已无调用点）。
 
 
 def index_minute(code="000300", days=800, as_of=None):
     """指数 5m K线 (list[dict] time/open/high/low/close/volume/up_count/down_count,
-    time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_5m
-    (scripts/sync_index_minute.py 盘后落库, 2026-09-11 起; 无磁盘缓存 — DB 即存储)。
+    time 升序, "YYYY-MM-DD HH:MM" 字符串)。2026-10-27 起读写收口
+    `app/data_sources/cn_stock_ext.index_minute`（kline_index_5m 本地优先,
+    trading_calendar 新鲜度闸门, 陈旧时 coord_index 兜底; 昨日盘后
+    cn_stock_putdb 落库）。
 
     Returns:
         list[dict]: [{time, open, high, low, close, volume, up_count, down_count}]（time 升序）。
@@ -647,35 +628,16 @@ def index_minute(code="000300", days=800, as_of=None):
     2026-09-11 hub.index_daily 同型 bug 的教训)。
     ⚠ `days` = **交易日数** (2026-09-28 审计 A1b 修正: 原为 bar 行数, 240 倍偏差)。
     """
-    sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
-    from app.utils.db_market import get_market_db_manager
-    mgr = get_market_db_manager()
-    mgr.ensure_market_db("CNStock")
-    pool = mgr._get_pool("CNStock")
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            if as_of:
-                cur.execute(
-                    'SELECT time, open, high, low, close, volume, up_count, down_count '
-                    'FROM "kline_index_5m" WHERE symbol = %s AND time::date <= %s '
-                    'ORDER BY time ASC',
-                    (sym, str(as_of)[:10]))
-            else:
-                cur.execute(
-                    'SELECT time, open, high, low, close, volume, up_count, down_count '
-                    'FROM "kline_index_5m" WHERE symbol = %s ORDER BY time ASC',
-                    (sym,))
-            rows = cur.fetchall()
-    bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"), "open": r[1], "high": r[2],
-             "low": r[3], "close": r[4], "volume": r[5],
-             "up_count": r[6], "down_count": r[7]} for r in rows]
-    return _tail_trading_days(bars, days)
+    from app.data_sources.cn_stock_ext import index_minute as _index_minute_impl
+    return _index_minute_impl(code=code, days=days, as_of=as_of)
 
 
 def index_fflow(code="000300", days=800, as_of=None):
     """指数大盘资金流 (list[dict] time/main_net/small_net/mid_net/big_net/super_net,
-    time 升序, "YYYY-MM-DD HH:MM" 字符串)。读独立表 kline_index_fflow
-    (scripts/sync_index_fflow.py 落库, 2026-09-12 起; 无磁盘缓存 — DB 即存储)。
+    time 升序, "YYYY-MM-DD HH:MM" 字符串)。2026-10-27 起读收口
+    `app/data_sources/cn_stock_ext.index_fflow`（kline_index_fflow 本地优先,
+    trading_calendar 新鲜度闸门, 陈旧时 coord_index index_fflow 补当日;
+    盘后/盘中由 cn_stock_putdb.sync_index_fflow 落库）。
 
     Returns:
         list[dict]: [{time, main_net, small_net, mid_net, big_net, super_net}]（time 升序，单位元）。
@@ -689,29 +651,8 @@ def index_fflow(code="000300", days=800, as_of=None):
     as_of: 只返回该交易日(含)以前 —— **必须先过滤后尾切** (同 index_minute 教训)。
     ⚠ `days` = **交易日数** (2026-09-28 审计 A1b 修正: 原为 bar 行数, 240 倍偏差)。
     """
-    sym = f"{code}.{'SZ' if str(code).startswith('399') else 'SH'}"
-    from app.utils.db_market import get_market_db_manager
-    mgr = get_market_db_manager()
-    mgr.ensure_market_db("CNStock")
-    pool = mgr._get_pool("CNStock")
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            if as_of:
-                cur.execute(
-                    'SELECT time, main_net, small_net, mid_net, big_net, super_net '
-                    'FROM "kline_index_fflow" WHERE symbol = %s AND time::date <= %s '
-                    'ORDER BY time ASC',
-                    (sym, str(as_of)[:10]))
-            else:
-                cur.execute(
-                    'SELECT time, main_net, small_net, mid_net, big_net, super_net '
-                    'FROM "kline_index_fflow" WHERE symbol = %s ORDER BY time ASC',
-                    (sym,))
-            rows = cur.fetchall()
-    bars = [{"time": r[0].strftime("%Y-%m-%d %H:%M"),
-             "main_net": r[1], "small_net": r[2], "mid_net": r[3],
-             "big_net": r[4], "super_net": r[5]} for r in rows]
-    return _tail_trading_days(bars, days)
+    from app.data_sources.cn_stock_ext import index_fflow as _index_fflow_impl
+    return _index_fflow_impl(code=code, days=days, as_of=as_of)
 
 
 # ================================================================

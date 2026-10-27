@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
-from app.utils.mootdx_client import get_client as _get_client
 
 logger = get_logger(__name__)
 
@@ -240,9 +239,18 @@ class TencentTapeProvider:
         "ticks_history": fetch_ticks_history,
     }
 
+    # 非 RST 上游：声明 batch_kinds ⇒ run_batch 把整批 codes 一次交给本源，
+    # 由 dispatch.fanout_codes 多股并发取数（效率远高于逐码串行）。
+    batch_kinds = {"orderbook", "ticks_today", "ticks_history"}
+
     def fetch(self, kind: str, **params) -> Dict[str, Any]:
         fn = self.capabilities.get(kind)
         if fn is None:
             from app.data_sources.dispatch import NotSupported
             return NotSupported(kind)
+        codes = params.get("codes")
+        if codes is not None and kind in self.batch_kinds:
+            rest = {k: v for k, v in params.items() if k not in ("code", "codes")}
+            from app.data_sources.dispatch import fanout_codes
+            return fanout_codes(fn, list(codes), rest, name=self.name, timeout=8.0)
         return fn(**params)

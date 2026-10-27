@@ -812,13 +812,17 @@ def import_history(
 #  每日保存入口（scheduler 调用）
 # ══════════════════════════════════════════════════════════════
 
-def save_daily() -> Dict[str, Any]:
+def save_daily(include_dragon_tiger: bool = True) -> Dict[str, Any]:
     """每日保存龙虎榜 + 热榜到 CNStock_db
 
-    由 scheduler.py 在工作日 18:00 调用。
-    数据源策略与 import_history 一致:
-      龙虎榜: AkShare 优先（字段完整），东财搜索兜底
-      热榜: pywencai → AkShare → 东财搜索
+    由 scheduler.py 在工作日 17:00+ 调用。
+    2026-10-27 起龙虎榜写链收口 app/data_sources/cn_stock_putdb.sync_dragon_tiger
+    （coord_pool 多源），scheduler 以 include_dragon_tiger=False 只跑热榜 ——
+    保留参数为 True 的旧形以兼容独立调用/import_history 场景。
+
+    Args:
+        include_dragon_tiger: False 时跳过龙虎榜拉取/落库（scheduler 路径，
+            LHB 由 cn_stock_putdb.sync_dragon_tiger 负责）。
 
     Returns:
         {
@@ -843,9 +847,11 @@ def save_daily() -> Dict[str, Any]:
     }
 
     # 获取龙虎榜（AkShare 优先，字段完整；东财搜索兜底）
-    dt_data = _fetch_dragon_tiger_from_akshare(trade_date, trade_date)
-    if not dt_data:
-        dt_data = _fetch_dragon_tiger_from_em("龙虎榜", 200)
+    dt_data = []
+    if include_dragon_tiger:
+        dt_data = _fetch_dragon_tiger_from_akshare(trade_date, trade_date)
+        if not dt_data:
+            dt_data = _fetch_dragon_tiger_from_em("龙虎榜", 200)
 
     # 获取热榜（pywencai → AkShare → 东财搜索）
     hr_data = _fetch_hot_rank_from_pywencai(trade_date)

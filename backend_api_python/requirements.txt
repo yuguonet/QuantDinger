@@ -45,7 +45,7 @@ smolagents[openai]>=1.26.0
 # ── CN 行情数据源强依赖（缺失时对应 Provider 静默不注册）──
 # eastmoney: TLS 指纹绕过（push2 CDN 对 urllib/requests 封锁 JA3）
 curl_cffi>=0.7.0
-# tdx_ex: 通达信二进制协议；backfill_db: 盘后 K 线覆写
+# mootdx(pytdx): 通达信二进制协议；coordinate_market_kline 经 provider/mootdx 拉 K线（原 backfill_db 已迁入 cn_stock_putdb）
 pytdx>=1.72
 mootdx>=0.11.7
 

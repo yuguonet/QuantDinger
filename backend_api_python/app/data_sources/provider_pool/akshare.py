@@ -217,6 +217,12 @@ def fetch_dragon_tiger(start_date: str = "", end_date: str = "") -> Dict[str, An
 def _pool(fn_name: str, trade_date: str, normalizer) -> Dict[str, Any]:
     get_akshare_limiter().wait()
     day = (trade_date or "").replace("-", "")
+    if not day:
+        # 空日期默认**今天**（榜单语义就是"当日池"）：调用方（dragon_limit 等）
+        # 不传 trade_date 时 akshare 会拿到 date="" —— stock_zt_pool_em 返空表、
+        # dtgc/zbgc 直接在库内 int('') 崩（2026-10-27 日志：三池全空/全炸）。
+        from datetime import datetime
+        day = datetime.now().strftime("%Y%m%d")
     df = getattr(_ak(), fn_name)(date=day)
     env = _rows(df)
     iso = ("%s-%s-%s" % (day[:4], day[4:6], day[6:8])) if len(day) == 8 else ""

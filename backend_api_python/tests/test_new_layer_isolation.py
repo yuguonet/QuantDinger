@@ -12,7 +12,9 @@
   · `app.data_sources.coordinator` / `provider`(legacy) / `cn_stock` / `base` —— 旧数据源层。
     （`provider_pool` 前缀与 legacy `provider` 不同，比较时按“模块段”匹配，不会误伤。）
 
-另锁一条：新层**不得被生产模块 import**（本阶段只实现、不接入）。
+另锁一条（2026-10-27 起改为接入点白名单）：生产模块可 import 新层，但仅限
+test_new_layer_wiring_allowlist 登记的入口文件 —— 原「只实现、不接入」已随
+Phase C（index.py 改走 coord_index）退役。
 """
 
 from __future__ import annotations
@@ -95,12 +97,32 @@ def test_no_forbidden_imports(path):
     assert not bad, "新层出现越界依赖：\n" + "\n".join(bad)
 
 
-def test_new_layer_not_wired_into_production():
-    """本阶段“只实现、不接入”：app/ 下除新层自身外，不得 import 它们。"""
+def test_new_layer_wiring_allowlist():
+    """接入期（2026-10-26 Phase C 起）：生产允许 import 新层，但仅限登记的入口文件。
+
+    原「只实现、不接入」契约已随 Phase C（index.py 改走 coord_index）退役；
+    本用例改为**白名单**约束 —— 防止引用点无序扩散，新增接入须在此登记。
+    """
     layer_parts = {"dispatch.py", "coord_pool.py", "coord_tape.py",
                    "coord_basic.py", "coord_misc.py", "coord_index.py",
                    "provider_pool", "provider_tape", "provider_basic",
                    "provider_misc", "provider_index"}
+    layer_tokens = ("data_sources.dispatch", "data_sources.coord_pool",
+                    "data_sources.coord_tape", "data_sources.coord_basic",
+                    "data_sources.coord_misc", "data_sources.coord_index",
+                    "data_sources.provider_pool", "data_sources.provider_tape",
+                    "data_sources.provider_basic", "data_sources.provider_misc",
+                    "data_sources.provider_index")
+    # 允许引用新层的生产文件（接入点登记表；新增须评估后追加）
+    allowed_refs = {
+        "cn_hk_fundamentals.py",   # coord_basic 基本面
+        "cn_stock_ext.py",         # coord_index 指数K线兜底
+        "cn_stock_putdb.py",       # coord_index 5m/资金流/龙虎榜落库
+        "dragon_limit.py",         # coord_pool 涨跌停池
+        "index.py",                # coord_index 日K兜底（Phase C）
+        "tape.py",                 # coord_tape 分笔
+        "coordinator.py",          # 调用 dispatch 提交/异常分类原语（2026-10-27）
+    }
     offenders = []
     for p in APP.rglob("*.py"):
         if "__pycache__" in p.parts:
@@ -108,15 +130,10 @@ def test_new_layer_not_wired_into_production():
         if p.stem in layer_parts or any(x in p.parts for x in layer_parts):
             continue
         txt = p.read_text("utf-8", errors="ignore")
-        for token in ("data_sources.dispatch", "data_sources.coord_pool",
-                      "data_sources.coord_tape", "data_sources.coord_basic",
-                      "data_sources.coord_misc", "data_sources.coord_index",
-                      "data_sources.provider_pool", "data_sources.provider_tape",
-                      "data_sources.provider_basic", "data_sources.provider_misc",
-                      "data_sources.provider_index"):
-            if token in txt:
-                offenders.append("%s 引用了 %s" % (p.relative_to(APP), token))
-    assert not offenders, "新层被接入了生产：\n" + "\n".join(offenders)
+        for token in layer_tokens:
+            if token in txt and p.name not in allowed_refs:
+                offenders.append("%s 引用了 %s（未登记接入点）" % (p.relative_to(APP), token))
+    assert not offenders, "新层接入点未登记：\n" + "\n".join(offenders)
 
 
 def test_market_cn_is_read_only_source_of_copy():

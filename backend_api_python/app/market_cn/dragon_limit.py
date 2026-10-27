@@ -387,85 +387,63 @@ _rt_broken_board = None
 _rt_hot_rank = None
 
 def _fetch_dragon_tiger() -> List[Dict[str, Any]]:
-    """拉取龙虎榜数据（AkShare 为主，东财搜索兜底）"""
-    # AkShare 有完整龙虎榜字段（买卖额、净额、席位、上榜原因）
-    data = _ak_dragon_tiger("")
-    if data:
-        logger.info("[AkShare] dragon_tiger: %d stocks", len(data))
-        return data
-    # 东财搜索只有代码和价格，缺少龙虎榜专属字段，仅作兜底
-    data = _em_search("龙虎榜", 200)
-    if data:
-        normalized = _normalize_dragon_tiger_list(data, source="em")
-        logger.info("[HTTP] dragon_tiger (兜底): %d stocks", len(normalized))
-        return normalized
-    logger.warning("[dragon_limit] dragon_tiger: 所有数据源均无结果")
+    """拉取龙虎榜数据（2026-10-26 Phase C: 改走 coord_pool 多源调度）"""
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate("dragon_tiger")
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_pool] dragon_tiger: %d stocks (source=%s)", len(rows), out.get("source", ""))
+        return rows
+    logger.warning("[coord_pool] dragon_tiger: 所有数据源均无结果 (%s)", out.get("error", ""))
     return []
 
 
 def _fetch_zt_pool() -> List[Dict[str, Any]]:
-    """拉取涨停池数据"""
-    data = _em_search("涨停", 200)
-    if data:
-        # 东财搜索返回 code/name 字段，归一化
-        for r in data:
-            if "code" in r and "stock_code" not in r:
-                r["stock_code"] = r.pop("code")
-            if "name" in r and "stock_name" not in r:
-                r["stock_name"] = r.pop("name")
-        logger.info("[HTTP] zt_pool: %d stocks", len(data))
-        return data
-    logger.info("[HTTP] zt_pool 无结果，回退 AkShare")
-    return _ak_zt_pool("")
+    """拉取涨停池数据（Phase C: 改走 coord_pool）"""
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate("limit_up_pool")
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_pool] limit_up_pool: %d stocks (source=%s)", len(rows), out.get("source", ""))
+        return rows
+    logger.info("[coord_pool] limit_up_pool: 无结果 (%s)", out.get("error", ""))
+    return []
 
 
 def _fetch_dt_pool() -> List[Dict[str, Any]]:
-    """拉取跌停池数据"""
-    data = _em_search("跌停", 200)
-    if data:
-        for r in data:
-            if "code" in r and "stock_code" not in r:
-                r["stock_code"] = r.pop("code")
-            if "name" in r and "stock_name" not in r:
-                r["stock_name"] = r.pop("name")
-        logger.info("[HTTP] dt_pool: %d stocks", len(data))
-        return data
-    logger.info("[HTTP] dt_pool 无结果，回退 AkShare")
-    return _ak_dt_pool("")
+    """拉取跌停池数据（Phase C: 改走 coord_pool）"""
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate("limit_down_pool")
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_pool] limit_down_pool: %d stocks (source=%s)", len(rows), out.get("source", ""))
+        return rows
+    logger.info("[coord_pool] limit_down_pool: 无结果 (%s)", out.get("error", ""))
+    return []
 
 
 def _fetch_broken_board() -> List[Dict[str, Any]]:
-    """拉取炸板池数据"""
-    data = _em_search("炸板", 200)
-    if data:
-        for r in data:
-            if "code" in r and "stock_code" not in r:
-                r["stock_code"] = r.pop("code")
-            if "name" in r and "stock_name" not in r:
-                r["stock_name"] = r.pop("name")
-        logger.info("[HTTP] broken_board: %d stocks", len(data))
-        return data
-    logger.info("[HTTP] broken_board 无结果，回退 AkShare")
-    return _ak_broken_board("")
+    """拉取炸板池数据（Phase C: 改走 coord_pool）"""
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate("broken_board_pool")
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_pool] broken_board_pool: %d stocks (source=%s)", len(rows), out.get("source", ""))
+        return rows
+    logger.info("[coord_pool] broken_board_pool: 无结果 (%s)", out.get("error", ""))
+    return []
 
 
 def _fetch_hot_rank() -> List[Dict[str, Any]]:
-    """拉取热榜数据（AkShare 为主，东财搜索兜底）"""
-    # AkShare 有完整热榜字段（排名、人气值、排名变化）
-    data = _ak_hot_rank()
-    if data:
-        logger.info("[AkShare] hot_rank: %d stocks", len(data))
-        return data
-    # 东财搜索缺少排名和人气值，仅作兜底
-    data = _em_search("热门股票", 200)
-    if data:
-        for r in data:
-            if "code" in r and "stock_code" not in r:
-                r["stock_code"] = r.pop("code")
-            if "name" in r and "stock_name" not in r:
-                r["stock_name"] = r.pop("name")
-        logger.info("[HTTP] hot_rank (兜底): %d stocks", len(data))
-        return data
+    """拉取热榜数据（Phase C: 改走 coord_pool）"""
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate("hot_rank")
+    if out.get("ok") and out.get("data", {}).get("rows"):
+        rows = out["data"]["rows"]
+        logger.info("[coord_pool] hot_rank: %d stocks (source=%s)", len(rows), out.get("source", ""))
+        return rows
+    logger.warning("[coord_pool] hot_rank: 所有数据源均无结果 (%s)", out.get("error", ""))
+    return []
     logger.warning("[dragon_limit] hot_rank: 所有数据源均无结果")
     return []
 

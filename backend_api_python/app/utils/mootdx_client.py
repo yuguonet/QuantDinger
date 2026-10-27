@@ -6,11 +6,11 @@ mootdx_client.py — 全局共享 mootdx Quotes 客户端（单例）
 ═══════════════════════════════════════════════════════════════
 
 设计原则:
-  1. 全局单例: 整个进程只维护一个 mootdx TCP 连接
+  1. 全局单例: 整个进程只维护一个 mootdx TCP 连接（含保活线程，见下）
   2. 线程安全: 加锁保护首次创建
   3. 自动重连: 连接断开/超时后自动重建
-  4. 服务器选择: 优先复用 provider.tdx_ex 已探测的可用 HQ 服务器,
-     回退到 bestip 自动探测
+  4. 服务器选择: 免扫描直连（_last_server / config BESTIP.HQ）优先，
+     回退 HQ 主机扫描榜（并发 TCP 探测 ~1-3s）逐台过数据面验证
   5. TTL: 连接超过 CLIENT_TTL 秒自动重建, 避免长时间空闲断开
 
 使用方式:
@@ -23,12 +23,16 @@ mootdx_client.py — 全局共享 mootdx Quotes 客户端（单例）
   - app/market_cn/index.py
   - app/market_cn/finance.py
   - app/market_cn/tape.py
-  - app/data_sources/backfill_db.py
+  - app/data_sources/provider/mootdx.py（coordinate_market_kline 经此拉 K线）
+
+初始化收敛（2026-10-27）：本文件是**唯一**初始化点。原线程级客户端
+（get_thread_client，backfill_db 并行抓取用）已随 backfill_db 归档删除——
+每线程一条 TCP+心跳的第二套初始化机制无人消费；原策略1（provider.tdx_ex
+已探测服务器）随 tdx_ex 模块退役删除。现存两条策略：免扫描直连 → bestip。
 """
 
 from __future__ import annotations
 
-import itertools
 import os
 import threading
 import time
@@ -47,10 +51,7 @@ _client_ts = 0
 _client_lock = threading.Lock()
 
 CLIENT_TTL = 3600  # 连接有效期: 1小时
-
-# 线程创建连接时的服务器轮转游标：让不同 worker 落在不同 live 服务器上，
-# 避免 8 条连接全压同一台触发通达信限流/封 IP。
-_server_rotor = itertools.count()
+FAIL_TTL = 300     # 失败缓存: 5分钟内不重试 bestip 扫描（避免每次 84s 重扫）
 
 # ── 免扫描直连状态（2026-10-25 L0）────────────────────────────
 # 背景：`Quotes.factory(bestip=True)` 会**无条件**串行扫描 146 个 host
@@ -62,17 +63,6 @@ _server_rotor = itertools.count()
 # 写（StdQuotes.__init__ 传 server 时 / bestip() 扫描后），项目零维护。
 _last_server: Optional[Tuple[str, int]] = None
 _bad_servers: set = set()
-
-
-def _live_servers() -> list:
-    """获取 provider.tdx_ex 已探测的可用 HQ 服务器列表。"""
-    try:
-        from app.data_sources.provider.tdx_ex import TdxExDataSource
-        provider = TdxExDataSource()
-        return [(h, p) for h, p, proto in provider._live_servers if proto == "hq"]
-    except Exception as e:
-        logger.debug("[mootdx] 获取 provider 服务器失败: %s", e)
-        return []
 
 
 def _daemonize_heartbeat() -> None:
@@ -163,14 +153,65 @@ def _direct_server_candidates() -> list:
     return out
 
 
-def _create_client(servers: Optional[list] = None) -> Optional[object]:
-    """创建并连接一个 mootdx Quotes 客户端（provider 服务器优先，bestip 回退）。
+_hq_scan_cache: Optional[list] = None
+
+
+def _scan_hq_candidates(limit: int = 8) -> list:
+    """TCP 存活扫描 mootdx HQ 主机清单，返回按延迟排序的 (host, port) 榜（进程内缓存）。
+
+    只回答"哪些机器 TCP 活着"，**不**代表数据面可用 —— 由调用方逐台过
+    _probe_data_plane（协议通 ≠ bars 有数据）。并发探测 ~1-3s，替代原
+    Quotes.factory(bestip=True) 的 74s 串行全扫 + 只取第一名的黑盒行为
+    （2026-10-27 日志：bestip 两轮选出的"最快"都是 bars 恒空的僵尸）。
+    """
+    global _hq_scan_cache
+    if _hq_scan_cache:
+        return _hq_scan_cache
+    import socket
+    import concurrent.futures as cf
+
+    hq: list = []
+    try:
+        # importlib 取真子模块：`import mootdx.server` 会被包属性上的同名函数遮蔽
+        import importlib
+        _srv = importlib.import_module("mootdx.server")
+        hq = [(h["addr"], int(h["port"])) for h in (_srv.hosts or {}).get("HQ", [])]
+    except Exception as e:
+        logger.warning("[mootdx] HQ 主机清单获取失败: %s", e)
+    ranked = []
+
+    def _ping(ap):
+        a, p = ap
+        t0 = time.perf_counter()
+        try:
+            s = socket.create_connection((a, p), timeout=0.7)
+            s.close()
+            return (time.perf_counter() - t0, a, p)
+        except Exception:
+            return None
+
+    try:
+        with cf.ThreadPoolExecutor(max_workers=32) as ex:
+            for r in ex.map(_ping, hq):
+                if r:
+                    ranked.append(r)
+    except Exception as e:
+        logger.warning("[mootdx] HQ 扫描失败: %s", e)
+    ranked.sort()
+    _hq_scan_cache = [(a, p) for _, a, p in ranked[:limit]]
+    logger.info("[mootdx] HQ 扫描: %d/%d 台 TCP 通，取前 %d 作数据面候选",
+                len(ranked), len(hq), len(_hq_scan_cache))
+    return _hq_scan_cache
+
+
+def _create_client() -> Optional[object]:
+    """创建并连接一个 mootdx Quotes 客户端（免扫描直连优先 → HQ 榜逐台验数据面）。
 
     Quotes.factory(timeout=10) → pytdx connect(socket).settimeout(10)：
     socket 层自带 10s 超时，单次 recv 停滞会在超时后抛异常，不会永久挂死。
 
-    Args:
-        servers: 依次尝试的 (host, port) 列表；None 时按默认顺序取 live 服务器。
+    每台候选都必须过数据面验证（bars 真能出数）；僵尸机进 _bad_servers
+    不再重试。全部候选判死 ⇒ 返 None，由 get_client 的 FAIL_TTL 退避。
     """
     from mootdx.quotes import Quotes
     global _last_server
@@ -179,82 +220,64 @@ def _create_client(servers: Optional[list] = None) -> Optional[object]:
     # daemon 属性只能在 start 之前改写。
     _daemonize_heartbeat()
 
-    # 策略1: 从 provider.tdx_ex 获取已探测的可用 HQ 服务器
-    #   （tdx_ex 退役后本策略自然消失，见下方策略2 接棒）
-    if servers is None:
-        servers = _live_servers()
-    if servers:
-        for host, port in servers:
+    # 候选: 免扫描直连（_last_server/config，命中即 0.15s）优先；
+    # 直连全废才跑 HQ 扫描榜（懒触发，命中零扫描成本）。
+    tried = 0
+
+    def _try_candidates(cands) -> Optional[object]:
+        """逐台建连 + 数据面把关；返回活客户端，全废返回 None（计数进 tried）。"""
+        nonlocal tried
+        global _last_server
+        for host, port in cands:
+            if (host, port) in _bad_servers:
+                continue
+            tried += 1
+            if tried > 10:                   # 数据面判死一台 ~4.4s，上限兜住最坏耗时
+                return None
             try:
                 cli = Quotes.factory(
                     market='std', timeout=10, heartbeat=True,
                     server=(host, port),
                 )
-                logger.info("[mootdx] 连接成功 %s:%d", host, port)
-                _last_server = (host, port)
-                return cli
             except Exception:
                 continue
-        logger.warning("[mootdx] 服务器列表全部失败, 回退免扫描直连")
+            if _probe_data_plane(cli):
+                _last_server = (host, port)
+                logger.info("[mootdx] 直连成功 %s:%d（数据面验证通过，第 %d 候选）",
+                            host, port, tried)
+                return cli
+            _bad_servers.add((host, port))
+            logger.info("[mootdx] %s:%d 协议通但数据面不可用（bars 空），"
+                        "标记坏服务器、试下一台", host, port)
+            try:
+                cli.close()
+            except Exception:
+                pass
+        return None
 
-    # 策略2（2026-10-25 L0）: 免扫描直连 —— 跳过 bestip 全扫（74s/进程冷启）。
-    #   直连 0.15s 建成后必须过数据面验证；本环境实测"协议通但 bars 恒空"
-    #   的僵尸服务器，判死 ~4.4s 后标记 _bad_servers 不再重试。
-    for host, port in _direct_server_candidates():
-        try:
-            cli = Quotes.factory(
-                market='std', timeout=10, heartbeat=True,
-                server=(host, port),
-            )
-        except Exception:
-            continue
-        if _probe_data_plane(cli):
-            _last_server = (host, port)
-            logger.info("[mootdx] 免扫描直连成功 %s:%d（跳过 bestip 全扫）", host, port)
-            return cli
-        _bad_servers.add((host, port))
-        logger.info("[mootdx] %s:%d 协议通但数据面不可用（bars 空），"
-                    "标记坏服务器、回落下一级", host, port)
-        try:
-            cli.close()
-        except Exception:
-            pass
+    cli = _try_candidates(_direct_server_candidates())
+    if cli is not None:
+        return cli
+    cli = _try_candidates(_scan_hq_candidates())
+    if cli is not None:
+        return cli
 
-    # 策略3: bestip 自动探测（最后手段，~74s）
-    #   同样必须过数据面验证——本环境实测 bestip 扫出的 IP "TCP 通但 bars
-    #   恒空"，不过验证会把僵尸客户端放进单例（每次 bars 白等 4.4s）。
-    try:
-        cli = Quotes.factory(market='std', bestip=True, timeout=10, heartbeat=True)
-    except Exception as e:
-        logger.error("[mootdx] 连接失败: %s", e)
-        return None
-    if cli is None:
-        return None
-    srv = getattr(cli, "server", None)
-    if isinstance(srv, (list, tuple)) and len(srv) == 2:
-        srv = (str(srv[0]), int(srv[1]))
-    if not _probe_data_plane(cli):
-        if srv:
-            _bad_servers.add(srv)
-        logger.info("[mootdx] bestip 结果 %s 数据面不可用（bars 空），放弃入单例", srv)
-        try:
-            cli.close()
-        except Exception:
-            pass
-        return None
-    if srv:
-        _last_server = srv
-    logger.info("[mootdx] bestip 探测连接成功 %s（数据面验证通过）", srv)
-    return cli
+    logger.warning("[mootdx] %d 台候选全部数据面不可用（进程内已判死 %d 台），本周期放弃",
+                   tried, len(_bad_servers))
+    return None
 
 
 def get_client() -> Optional[object]:
-    """获取全局共享的 mootdx Quotes 客户端（单例）。
+    """获取全局共享的 mootdx Quotes 客户端（单例，**唯一**取数入口）。
 
     策略:
       1. 已有连接且未过期且未关闭 → 直接复用
-      2. 从 provider.tdx_ex 获取已探测的可用 HQ 服务器, 逐个尝试
-      3. 回退到 bestip 自动探测
+      2. 免扫描直连（_last_server / config BESTIP.HQ）+ 数据面验证
+      3. HQ 扫描榜逐台验数据面（协议通 ≠ bars 活，僵尸进 _bad_servers）
+
+    失败缓存（2026-10-26）: _create_client 失败时也刷新 _client_ts，
+    避免每次调用都重扫（扫描虽已并发化，数据面判死仍有代价）。
+    失败结果缓存 FAIL_TTL 秒。
 
     Returns:
         mootdx.quotes.Quotes 实例, 或 None（连接失败时）
@@ -270,6 +293,10 @@ def get_client() -> Optional[object]:
             pass
         _client = None
 
+    # 失败缓存: 近期失败过 → 直接返回 None（不重扫）
+    if _client is None and _client_ts > 0 and (time.time() - _client_ts) < FAIL_TTL:
+        return None
+
     # 慢路径: 需要创建/重建连接
     with _client_lock:
         # double-check: 其他线程可能已经创建好了
@@ -281,12 +308,12 @@ def get_client() -> Optional[object]:
                 pass
             _client = None
 
+        # double-check 失败缓存
+        if _client is None and _client_ts > 0 and (time.time() - _client_ts) < FAIL_TTL:
+            return None
+
         _client = _create_client()
-        if _client:
-            _client_ts = time.time()
-            import traceback as _tb
-            with open('tmp/_ts_write_stack.txt', 'a', encoding='utf-8') as _f:
-                _f.write('=== ts write @ %.3f ===\n%s\n' % (time.time(), ''.join(_tb.format_stack())))
+        _client_ts = time.time()  # 成功和失败都刷新时间戳
         return _client
 
 
@@ -298,58 +325,11 @@ def reset_client() -> None:
         _client_ts = 0
 
 
-# ================================================================
-# 线程级客户端（用于高并发批量拉取，如 backfill_db 并行抓取）
-# ================================================================
-# 每个线程持有一条独立 TCP 连接，互不阻塞；单条连接卡死只影响该线程自身，
-# 不会像共享单例那样级联拖垮全部分片。
-
-_thread_local = threading.local()
-
-
-def _thread_servers() -> list:
-    """当前线程创建连接使用的服务器顺序：轮转打散，避免全压一台。"""
-    servers = _live_servers()
-    if servers:
-        offset = next(_server_rotor) % len(servers)
-        servers = servers[offset:] + servers[:offset]
-    return servers
-
-
-def get_thread_client() -> Optional[object]:
-    """获取当前线程专用的 mootdx 客户端（线程级单例）。
-
-    Returns:
-        mootdx.quotes.Quotes 实例, 或 None（连接失败时）
-    """
-    cli = getattr(_thread_local, "client", None)
-    ts = getattr(_thread_local, "ts", 0)
-    if cli is not None:
-        try:
-            if not cli.closed and (time.time() - ts) < CLIENT_TTL:
-                return cli
-        except Exception:
-            pass
-
-    cli = _create_client(_thread_servers())
-    _thread_local.client = cli
-    _thread_local.ts = time.time() if cli else 0
-    return cli
-
-
-def reset_thread_client() -> None:
-    """断开并丢弃当前线程的客户端（下次 get_thread_client() 会重建）。
-
-    显式 disconnect 以停掉对应用户态 heartbeat 线程，避免旧连接泄漏。
-    """
-    cli = getattr(_thread_local, "client", None)
-    if cli is not None:
-        try:
-            cli.client.disconnect()
-        except Exception:
-            pass
-    _thread_local.client = None
-    _thread_local.ts = 0
+# 原「线程级客户端」段（_thread_local / get_thread_client / reset_thread_client，
+# 每线程一条 TCP+心跳的第二套初始化机制）已删除，2026-10-27：
+# 唯一消费者 backfill_db 归档进 del/backfill_db_20261027/ 后生产零调用，
+# 并行抓取现走 coordinator.coordinate_market_kline（其 provider 复用 get_client 单例）。
+# mootdx 初始化收敛为本文件单例 + 保活 daemon 一条路径。
 
 
 # ================================================================

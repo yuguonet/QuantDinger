@@ -13,8 +13,13 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def fetch_index_kline(code: str, days: int = 250) -> Dict[str, Any]:
-    """指数日K线（BaoStock query_history_k_data_plus）。"""
+def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dict[str, Any]:
+    """指数日K线（BaoStock query_history_k_data_plus, timeframe=1D；其余周期 NotSupported）。"""
+    from app.data_sources.normalizer import normalize_chart_timeframe
+    from app.data_sources.dispatch import NotSupported
+
+    if normalize_chart_timeframe(timeframe) != "1D":
+        return NotSupported("index_kline/%s" % timeframe)
     try:
         import baostock as bs
     except ImportError:
@@ -31,7 +36,7 @@ def fetch_index_kline(code: str, days: int = 250) -> Dict[str, Any]:
     try:
         import datetime
         end = datetime.date.today()
-        start = end - datetime.timedelta(days=int(days * 1.5))
+        start = end - datetime.timedelta(days=int(limit * 1.5))
         rs = bs.query_history_k_data_plus(
             bs_code,
             "date,open,high,low,close,volume",
@@ -58,7 +63,7 @@ def fetch_index_kline(code: str, days: int = 250) -> Dict[str, Any]:
             except (ValueError, IndexError):
                 continue
 
-        return {"rows": rows[-days:]}
+        return {"rows": rows[-limit:]}
     except Exception as e:
         logger.warning("[baostock] index_kline %s 失败: %s", code, e)
         return {"rows": [], "error": str(e)}

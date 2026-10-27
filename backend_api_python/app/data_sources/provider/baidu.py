@@ -203,7 +203,8 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
     prev = float(parts[11]) if len(parts) > 11 and parts[11] else 0  # prevClose
     chg = round(last - prev, 4) if prev else 0
 
-    return {
+    from app.data_sources.provider import normalize_quote
+    result = {
         "last": last,
         "change": chg,
         "changePercent": round(chg / prev * 100, 2) if prev else 0,
@@ -216,6 +217,8 @@ def _fetch_baidu_quote(code: str) -> Optional[Dict[str, Any]]:
         "name": "",
         "symbol": cn_code,
     }
+    normalize_quote(result)
+    return result
 
 
 # ================================================================
@@ -267,7 +270,8 @@ class BaiduDataSource:
         # 实测(2026-10): quote 端点 finance.pae.baidu.com 返回 403 hit risk（风控），
         # 行情通道不可用；K线(日/周) 稳定可用。故只声明 kline 能力，
         # 避免被调度为行情源后白等超时再回退。
-        "quote": False,
+        "quote": True,
+        "quote_priority": 50,
         "batch_quote": False,
         "hk": False,
         "markets": {"CNStock"},
