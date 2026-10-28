@@ -23,14 +23,16 @@ _HTTP_HEADERS = {
 
 
 def _index_tencent_code(code: str) -> str:
-    """指数纯代码 → 腾讯带前缀代码（sh000001 / sz399001）。
+    """指数代码 → 腾讯带前缀代码（sh000001 / sz399001）。
 
-    指数前缀规则: 000/88/99 → sh（沪），其余 → sz（深）。
+    解析统一走 normalizer.split_index_code：入参可能是裸码，也可能是 cn_stock_ext
+    那种 "000001.SH"。旧实现 `code[:3] in (...)` 后直接拼接，会把带后缀的入参
+    拼成 "sh000001.SH"（非法，腾讯返 501 / 无 data 节点）。
     """
-    c = (code or "").strip()
-    if c[:3] in ("000", "88", "99"):
-        return f"sh{c}"
-    return f"sz{c}"
+    from app.data_sources.normalizer import split_index_code
+
+    base, exch = split_index_code(code)
+    return exch.lower() + base
 
 
 def _parse_tencent_line(line: str) -> Optional[Dict[str, Any]]:
@@ -64,8 +66,13 @@ def _parse_tencent_line(line: str) -> Optional[Dict[str, Any]]:
         "open": open_,
         "high": high,
         "low": low,
-        "volume": round(volume * 100, 2),  # 手 → 股
-        "amount": amount,
+        # 单位口径（2026-10-28 实测标定 sh000001: v36=417789532 / v37=67241440）：
+        #   v[36] 本身就是"手"（4.18 亿手 ≈ 上证日成交量级），不可再 ×100 或 ÷100；
+        #   v[37] 是"万元"（6724 万元×1e4 = 6724 亿元 ≈ 上证日成交额级），必须 ×1e4 得元。
+        # 此前本函数写 `volume*100`(手→股) 且 `amount` 未换算，与 index_quote 消费方
+        # （amount 需"元"、context_frame.turnover 直取 amount）量级不符，已修正。
+        "volume": volume,                       # 手
+        "amount": round(amount * 10000, 2),     # 万元 → 元
         "change": round(price - last_close, 4) if last_close else 0,
         "change_percent": round((price - last_close) / last_close * 100, 4) if last_close else 0,
     }
@@ -142,8 +149,12 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
         )
         raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
     except Exception as e:
+        # 必须 raise 让 dispatch 换源：同族还有 sina / baostock / akshare / mootdx。
+        # 返回空信封会被 is_rows 判「成功」（它只校验 rows 是 list，不看是否为空），
+        # 于是一个 501 就把同族全部备用源挡在门外 —— 2026-10-28 1.log 九个指数
+        # 日线全灭、error 还是空串，根因就在这里。
         logger.warning("[tencent] index_kline %s 请求失败: %s", code, e)
-        return {"rows": [], "error": str(e)}
+        raise
 
     try:
         import json
@@ -153,10 +164,12 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
 
     root = (data.get("data") or {}).get(tc_code)
     if not isinstance(root, dict):
-        return {"rows": [], "error": "no data"}
+        # 抛出让 dispatch 换源：limit 超上游上限时腾讯会返回无 data 节点，
+        # 若这里回空信封会被协议判成"成功"，把同族 sina/akshare 挡在门外
+        raise RuntimeError("tencent index_kline 无 data 节点（limit=%s）" % limit)
     day_arr = root.get("day")
     if not isinstance(day_arr, list):
-        return {"rows": [], "error": "no day array"}
+        raise RuntimeError("tencent index_kline 无 day 数组（limit=%s）" % limit)
 
     rows = []
     for r in day_arr:

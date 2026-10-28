@@ -202,15 +202,43 @@ def _rows(df) -> Dict[str, Any]:
 
 
 def fetch_dragon_tiger(start_date: str = "", end_date: str = "") -> Dict[str, Any]:
-    """龙虎榜明细。日期 YYYY-MM-DD 或 YYYYMMDD 均可（内部转 YYYYMMDD）。"""
+    """龙虎榜明细。日期 YYYY-MM-DD 或 YYYYMMDD 均可（内部转 YYYYMMDD）。
+
+    ⚠ 空日期不能原样转给 akshare（2026-10-28 1.log 两次
+      `TypeError: 'NoneType' object is not subscriptable` 的根因）：
+        akshare 内部 `"-".join([s[:4], s[4:6], s[6:]])` 对 "" 得到 "--"，
+        请求 filter 变成 `(TRADE_DATE<='--')(TRADE_DATE>='--')` ⇒ 东财返
+        result=null ⇒ 下一行 `data_json["result"]["pages"]` 抛出上述 TypeError。
+      与 `_pool()` 的「空日期默认今天」是同一类缺陷，此前只修了 _pool 一处。
+
+    语义（无参 = 「最近一次榜单」，dragon_limit 的缓存口径就是当日榜单）：
+      · 两端都空 → 查最近 7 个自然日，只留**最新交易日**那一组。不用"今天"是因为
+        龙虎榜 T 日盘后披露、且周末/节假日本就没有，取今天会稳定空转；
+      · 显式给了任一端 → 按原样当窗口查询，返回窗口内全部行（历史回补语义）。
+    """
+    start = (start_date or "").strip()
+    end = (end_date or "").strip()
+    latest_only = not start and not end
+
+    if latest_only:
+        from datetime import datetime, timedelta
+        day = datetime.now()
+        end = day.strftime("%Y%m%d")
+        start = (day - timedelta(days=6)).strftime("%Y%m%d")
+    else:
+        start = start.replace("-", "") or end.replace("-", "")
+        end = end.replace("-", "") or start
+
     get_akshare_limiter().wait()
-    df = _ak().stock_lhb_detail_em(
-        start_date=(start_date or "").replace("-", ""),
-        end_date=(end_date or "").replace("-", ""),
-    )
+    df = _ak().stock_lhb_detail_em(start_date=start, end_date=end)
     env = _rows(df)
     env["rows"] = [r for r in _normalize_dragon_tiger_list(env["rows"], source="akshare")
                    if r.get("stock_code") and r.get("trade_date")]
+
+    if latest_only and env["rows"]:
+        # trade_date 已由 _normalize_dragon_tiger 归一为 ISO（YYYY-MM-DD），按字符串取 max 正确
+        newest = max(r["trade_date"] for r in env["rows"])
+        env["rows"] = [r for r in env["rows"] if r["trade_date"] == newest]
     return env
 
 

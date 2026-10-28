@@ -33,10 +33,22 @@ class CapSpec:
 
 
 CAPS: Dict[str, CapSpec] = {
-    "trading_calendar": CapSpec("trading_calendar", "sequential", ("date",),
-                                "QD_EXT_TIMEOUT_CALENDAR", is_object),
+    # trading_calendar: 交易日历整表（akshare trade_date_hist_sina，1990 起全量）。
+    # validator=is_rows：上游给的是"日期列表"，不是单对象；早期写成 is_object
+    # 导致 akshare provider 的信封恒判不合协议（只有 delegating 的 sina 源能过）。
+    # params=()：能力是"整表"，不是"某一天" —— provider 签名无参，早前声明的
+    # `date` 会让 dispatch 传参 TypeError（2026-10-28 实测）。单日判定由调用方
+    # 在本层返回的集合上做（本地集合查询，零额外取数）。
+    "trading_calendar": CapSpec("trading_calendar", "sequential", (),
+                                "QD_EXT_TIMEOUT_CALENDAR", is_rows, timeout=30.0),
     "stock_flow_daily": CapSpec("stock_flow_daily", "sequential", ("code", "days"),
                                 "QD_EXT_TIMEOUT_STOCK_FLOW_DAILY", is_rows),
+    # stock_flow_rt: 当日个股资金流（新浪 1 点近似 → 东财 push2 分钟级 240 点兜底）。
+    # 两个 provider 的**行数/粒度不同**（1 行 vs 240 行），但行键同构
+    # {time, main_net, small_net, mid_net, large_net, super_net}，消费方按 data 自行解释。
+    # timeout=90: 东财 push2 限频时 _em_get 要跑 2 host × 2 重试 × 3s 退避。
+    "stock_flow_rt": CapSpec("stock_flow_rt", "sequential", ("code",),
+                             "QD_EXT_TIMEOUT_STOCK_FLOW_RT", is_rows, timeout=90.0),
 
 }
 

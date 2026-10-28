@@ -92,11 +92,18 @@ def _parse_at_time(at: str) -> tuple[str, bool]:
     if m:
         step = int(m.group(1))
         # A股: 9:30-11:30 + 13:00-15:00, 周一到周五
+        # 2026-10-28 修两处：① 11 点段分钟表按 step 生成——旧版硬编码
+        # "0,5,10,15,20,25,30"，N≠5 时该小时退化成 5 分钟一跑（"每N分钟"语义破）；
+        # ② 补 15:00 收盘检查点（旧版 */N 13-14 只到 14:5x，漏掉收盘定格）。
+        # 输出长度 80~95 字符，依赖 cron_expr 列宽 ≥255（见
+        # cron_worker._ensure_cron_expr_width 与 migrations/qd_cron_jobs_v3_20261028.sql）。
+        h11 = ",".join(str(mi) for mi in range(0, 31, step))
         expr = (
             f"30-59/{step} 9 * * 1-5|"
             f"*/{step} 10 * * 1-5|"
-            f"0,5,10,15,20,25,30 11 * * 1-5|"
-            f"*/{step} 13-14 * * 1-5"
+            f"{h11} 11 * * 1-5|"
+            f"*/{step} 13-14 * * 1-5|"
+            f"0 15 * * 1-5"
         )
         return expr, False
 

@@ -189,6 +189,14 @@ def _cons_via_phtml(code: str) -> Optional[List[str]]:
     return cons or None
 
 
+# 【不动清单 · coord 缺口】中证/新浪「指数成分股」
+#   所有 coord_*.py 均无"指数成分股" kind（provider 层也无中证 oss xls 实现），
+#   故此处保留中证官网 xls / node / phtml 三路直连。
+#   ⚠ 有真实调用方：app/market_cn/sina_moneyflow.py:174 用它做指数资金流聚合
+#     （2026-10-28 核实；此前曾误判为"无调用方/死代码"，已更正）。
+#   收敛前须先在 coord_basic（或新建 coord 族）补成分股 kind 并平移三路通道，
+#   不得为"看起来收敛"而删能力（禁止降智红线）。
+#   见 docs/数据源外围收敛改造方案_20261028.md §3
 def get_index_cons(symbol: str) -> List[str]:
     """指数成分股 → ["sh600000", ...] (当前成分, 去重保序)。
 

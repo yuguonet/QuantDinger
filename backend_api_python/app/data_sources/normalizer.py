@@ -359,6 +359,62 @@ safe_int = _si
 
 
 # ================================================================
+# 指数代码解析 — provider_index 全族唯一入口
+# ================================================================
+# 背景（2026-10-28，依据 1.log 九个指数日线全灭）：
+#   同一个 index_kline kind 的入参历史上有三种形式 ——
+#     index_daily 传裸码 "000001"；cn_stock_ext 传 "000001.SH"；
+#   而 tencent / sina / akshare / baostock 四个 provider 各自 `code[:3]` 判前缀后
+#   **直接拼接**，拿到 "000001.SH" 就拼成 "sh000001.SH" / "sh.000001.SH"（非法）：
+#     akshare  → KeyError: 'date'
+#     tencent  → HTTP 501 / 无 data 节点
+#     baostock → 库内报「股票代码应为9位」
+#   收口成本函数：provider 只从这里取 (纯代码, 交易所)，不再各自推断。
+
+# 沪市指数前缀（000xxx 系列：000001 上证 / 000300 沪深300 / 000905 中证500 …）
+_INDEX_SH_PREFIXES = ("000", "88", "99")
+
+
+def split_index_code(code: str) -> tuple:
+    """指数代码 → (纯 6 位代码, 交易所 "SH"/"SZ")。
+
+    接受三种写法，与 provider 既有前缀规则保持一致：
+        "000001"    → ("000001", "SH")   裸码按指数规则推断
+        "000001.SH" → ("000001", "SH")   带后缀直接采信（不覆盖）
+        "sh000001"  → ("000001", "SH")   带前缀直接采信（不覆盖）
+        "399001"    → ("399001", "SZ")
+
+    指数前缀规则：000/88/99 → SH，其余（399/899…）→ SZ。
+    后缀/前缀无法识别时交易所回空串，纯代码原样返回，由 provider 决定是否支持。
+
+    Examples:
+        split_index_code("000300")    → ("000300", "SH")
+        split_index_code("399006.SZ") → ("399006", "SZ")
+        split_index_code("sh000688")  → ("000688", "SH")
+    """
+    s = (code or "").strip()
+    if not s:
+        return "", ""
+
+    # 带后缀：000001.SH / 000001.SS / 399001.SZ / 899050.BJ
+    if "." in s:
+        base, _, sfx = s.partition(".")
+        base, sfx = base.strip(), sfx.strip().upper()
+        if sfx in ("SH", "SS"):
+            return base, "SH"
+        return base, sfx
+
+    # 带前缀：sh000001 / SZ399001
+    if s[:2].upper() in ("SH", "SZ") and s[2:].isdigit():
+        return s[2:], s[:2].upper()
+
+    # 裸码
+    if s.isdigit():
+        return s, ("SH" if s[:3] in _INDEX_SH_PREFIXES else "SZ")
+    return s, ""
+
+
+# ================================================================
 # 指数/ETF 代码识别 — 供行情接口区分市场前缀
 # ================================================================
 

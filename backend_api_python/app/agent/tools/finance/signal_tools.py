@@ -148,31 +148,14 @@ def _get_stock_concept_blocks(codes: str) -> dict:
         return {"error": "codes 不能为空", "retriable": False}
 
     def _one(stock_code: str) -> dict:
-        from app.market_cn.eastmoney_search import _em_get
+        from app.data_sources.coord_index import coordinate
 
         code = _strip_prefix(stock_code)
-        market_code = 1 if code.startswith("6") else 0
-        params = {
-            "fltt": "2", "invt": "2",
-            "secid": f"{market_code}.{code}",
-            "spt": "3", "pi": "0", "pz": "200", "po": "1",
-            "fields": "f12,f14,f3,f128",
-        }
-        headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
         try:
-            r = _em_get("https://push2.eastmoney.com/api/qt/slist/get",
-                         params=params, headers=headers, timeout=15)
-            d = r.json()
-            diff = (d.get("data") or {}).get("diff") or {}
-            items = diff.values() if isinstance(diff, dict) else diff
-            boards = []
-            for it in items:
-                boards.append({
-                    "name": it.get("f14", ""),
-                    "code": it.get("f12", ""),
-                    "change_pct": it.get("f3", ""),
-                    "lead_stock": it.get("f128", ""),
-                })
+            out = coordinate("stock_boards", code=code)
+            boards = [b for b in ((out.get("data") or {}).get("rows") or []) if isinstance(b, dict)]
+            if not out.get("ok"):
+                return {"stock_code": code, "error": out.get("error") or "板块归属取数失败"}
             return {
                 "stock_code": code,
                 "total": len(boards),

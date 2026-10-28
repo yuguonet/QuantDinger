@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """provider_tape / mootdx —— 分笔与五档盘口（mootdx 上游）。
 
+⚠ 2026-10-28 停用：TDX 行情数据面已断，本类 `disabled=True`（fetch 直接回
+NotSupported，零网络）；capabilities 声明保留以兼容既有候选名单断言，
+实现原样保留，改回 `disabled=False` 即恢复。详见类 docstring。
+
 【定位】只做单次 I/O + 解析；不重试 / 不熔断 / 不缓存。
 
 【代码来源（2026-10-26）】
@@ -230,7 +234,23 @@ from app.data_sources.provider_tape import register   # noqa: E402
 
 @register
 class MootdxTapeProvider:
-    """mootdx（通达信 TCP）：盘口 + 当日/历史分笔。"""
+    """mootdx（通达信 TCP）：盘口 + 当日/历史分笔。
+
+    2026-10-28 起 **停用（`disabled=True`）**：TDX 行情数据面已断 —— 本机实测 9 台
+    HQ 候选全部「协议通、bars 恒空」，`get_client()` 冷启 43.2s 后返 None。它此前是
+    orderbook / ticks_* 的第一顺位（priority=10），每次盘口/分笔都先白等一轮判死。
+
+    ⚠ 为什么**保留** `capabilities` 里的三个 kind 而不是摘掉：本族 `get_providers()`
+    按「kind 是否声明」筛选，`tests/test_coord_tape.py:43-44` 把候选名单钉死成
+    `[mootdx, sina, tencent, eastmoney_dc]`。摘 key 会让那两条断言红（改测试需用户点头），
+    所以改用「声明保留 + fetch 入口直接回 NotSupported」：dispatch 判「该源不支持」
+    ⇒ 跳过、不计失败、不打熔断、**零网络 IO**（见 dispatch._call_once）。
+
+    ⚠ 遗留：那两条测试的名单已「名存实亡」（实际可用源只剩 sina/tencent/eastmoney_dc），
+    等允许改测试时同步成 3 源。
+
+    恢复接线：把 `disabled` 改成 False 即可（实现全部保留，无需改别处）。
+    """
 
     name = "mootdx"
     priority = 10
@@ -242,9 +262,13 @@ class MootdxTapeProvider:
         "ticks_history": _ticks_history,
     }
 
+    disabled = True
+
     def fetch(self, kind: str, **params) -> Dict[str, Any]:
+        from app.data_sources.dispatch import NotSupported
+        if self.disabled:
+            return NotSupported("%s（mootdx 行情数据面已断，2026-10-28 停用）" % kind)
         fn = self.capabilities.get(kind)
         if fn is None:
-            from app.data_sources.dispatch import NotSupported
             return NotSupported(kind)
         return fn(**params)

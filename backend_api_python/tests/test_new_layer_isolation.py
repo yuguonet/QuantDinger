@@ -25,25 +25,14 @@ import pathlib
 import pytest
 
 APP = pathlib.Path(__file__).resolve().parents[1] / "app"
-NEW_FILES = [
-    APP / "data_sources" / "dispatch.py",
-    APP / "data_sources" / "coord_pool.py",
-    APP / "data_sources" / "coord_tape.py",
-    APP / "data_sources" / "coord_basic.py",
-    APP / "data_sources" / "coord_misc.py",
-    APP / "data_sources" / "coord_index.py",
-    APP / "data_sources" / "provider_pool" / "__init__.py",
-    APP / "data_sources" / "provider_pool" / "akshare.py",
-    APP / "data_sources" / "provider_tape" / "__init__.py",
-    APP / "data_sources" / "provider_tape" / "mootdx.py",
-    APP / "data_sources" / "provider_tape" / "tencent.py",
-    APP / "data_sources" / "provider_basic" / "__init__.py",
-    APP / "data_sources" / "provider_basic" / "akshare.py",
-    APP / "data_sources" / "provider_misc" / "__init__.py",
-    APP / "data_sources" / "provider_misc" / "sina.py",
-    APP / "data_sources" / "provider_index" / "__init__.py",
-    APP / "data_sources" / "provider_index" / "akshare.py",
-]
+# 2026-10-28：原为手写文件清单，新增 provider 文件不会被自动覆盖（本批次 8 个
+# 新 provider 就漏检了）。改为按目录展开 —— 新层边界是「结构」而非「文件名」。
+NEW_FILES = sorted(
+    list((APP / "data_sources").glob("coord_*.py"))
+    + [APP / "data_sources" / "dispatch.py"]
+    + [p for d in sorted((APP / "data_sources").glob("provider_*")) if d.is_dir()
+       for p in sorted(d.glob("*.py"))]
+)
 
 ALLOWED = (
     "app.utils",
@@ -119,9 +108,20 @@ def test_new_layer_wiring_allowlist():
         "cn_stock_ext.py",         # coord_index 指数K线兜底
         "cn_stock_putdb.py",       # coord_index 5m/资金流/龙虎榜落库
         "dragon_limit.py",         # coord_pool 涨跌停池
-        "index.py",                # coord_index 日K兜底（Phase C）
-        "tape.py",                 # coord_tape 分笔
+        "dragon_tiger_store.py",   # coord_pool 龙虎榜/热榜落库（2026-10-28 Phase 1 收敛）
+        "index.py",                # coord_index 日K兜底（Phase C）+ 北向/大盘/板块资金流（2026-10-28）
+        "tape.py",                 # coord_tape 分笔 + coord_misc 个股资金流 rt/daily（2026-10-28）
+        "basicinfo_db.py",         # coord_basic stock_basic 全量A股清单（2026-10-28 外围接线）
         "coordinator.py",          # 调用 dispatch 提交/异常分类原语（2026-10-27）
+        # ↓ 2026-10-28「外围不再自拉远端」收口批次
+        "hot_sectors.py",          # coord_index sector_list/sector_stocks
+        "index_daily.py",          # coord_index index_kline（删 akshare/baostock/tushare 自建链）
+        "emotion.py",              # coord_index emotion_cycle
+        "eastmoney_search.py",     # coord_pool em_stock_search
+        "sector_flow.py",          # ext_params：coord_index sector_list/sector_flow
+        "concept_heat.py",         # ext_params：coord_index sector_list/sector_flow
+        "northbound.py",           # ext_params：coord_index northbound_stock_hold
+        "signal_tools.py",         # agent tools：coord_index stock_boards
     }
     offenders = []
     for p in APP.rglob("*.py"):

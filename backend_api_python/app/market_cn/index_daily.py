@@ -65,107 +65,26 @@ INDICES: Dict[str, dict] = {
 }
 
 # ============================================================
-# 数据源: akshare
+# 数据源：coord_index("index_kline") 多源调度
 # ============================================================
+# 收敛前是 akshare → baostock → tushare 三段自建降级链；三个上游给的是**同一种**
+# 指数日线，属"同一决策多条自建链"，已收口到 data_sources 层（selected by priority）。
+# 本文件只负责"要多少根 bar → 转 DataFrame → 落库"。
 
-def fetch_ak(symbol_cfg: dict, start: str = "", end: str = "") -> Optional[pd.DataFrame]:
-    """akshare 指数日线。返回 DataFrame[date, open, high, low, close, volume]"""
+def _limit_for(start: str) -> int:
+    """按起始日估算需要的 bar 数（交易日 ≈ 日历日 × 0.75，两端各留余量）。"""
+    if not start:
+        return 2600          # 约 10 年，与收敛前 baostock 默认回看 3650 天等价
     try:
-        import akshare as ak
-        code = symbol_cfg["ak"]
-        df = ak.stock_zh_index_daily(symbol=code)
-        if df is None or df.empty:
-            return None
-        df = df.rename(columns={"date": "date"})
-        df["date"] = pd.to_datetime(df["date"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"])
-        df = df.sort_values("date").reset_index(drop=True)
-        if start:
-            df = df[df["date"] >= start]
-        if end:
-            df = df[df["date"] <= end]
-        return df
-    except Exception as e:
-        print(f"    [akshare] 失败: {e}")
-        return None
+        d0 = datetime.date.fromisoformat(str(start)[:10])
+    except ValueError:
+        return 2600
+    span = (datetime.date.today() - d0).days
+    return max(250, int(span * 0.75) + 20)
 
-
-# ============================================================
-# 数据源: baostock
-# ============================================================
-
-def fetch_bs(symbol_cfg: dict, start: str = "", end: str = "") -> Optional[pd.DataFrame]:
-    """baostock 指数日线。返回 DataFrame[date, open, high, low, close, volume]"""
-    try:
-        import baostock as bs
-        bs.login()
-        try:
-            code = symbol_cfg["bs"]
-            today = datetime.date.today().strftime("%Y-%m-%d")
-            s = start or (datetime.date.today() - datetime.timedelta(days=3650)).strftime("%Y-%m-%d")
-            e = end or today
-            rs = bs.query_history_k_data_plus(
-                code, "date,open,high,low,close,volume",
-                start_date=s, end_date=e, frequency="d", adjustflag="3"
-            )
-            data = []
-            while rs.next():
-                data.append(rs.get_row_data())
-            if not data:
-                return None
-            df = pd.DataFrame(data, columns=rs.fields)
-            df["date"] = pd.to_datetime(df["date"])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.dropna(subset=["close"])
-            df = df.sort_values("date").reset_index(drop=True)
-            return df
-        finally:
-            bs.logout()
-    except Exception as e:
-        print(f"    [baostock] 失败: {e}")
-        return None
-
-
-# ============================================================
-# 数据源: tushare
-# ============================================================
-
-def fetch_ts(symbol: str, start: str = "", end: str = "") -> Optional[pd.DataFrame]:
-    """通过 index.py 获取指数日线。返回 DataFrame[date, open, high, low, close, volume]"""
-    try:
-        from app.market_cn.index import get_index_daily_kline
-        # 转换 symbol 格式: "000001.SH" -> "000001"
-        code = symbol.split(".")[0]
-        data = get_index_daily_kline(code, 800)
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        df["date"] = pd.to_datetime(df["date"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"])
-        df = df.sort_values("date").reset_index(drop=True)
-        if start:
-            df = df[df["date"] >= start]
-        if end:
-            df = df[df["date"] <= end]
-        return df
-    except Exception as e:
-        print(f"    [index.py] 失败: {e}")
-        return None
-
-
-# ============================================================
-# 多源降级拉取
-# ============================================================
 
 def fetch_index_daily(symbol: str, start: str = "", end: str = "") -> Optional[pd.DataFrame]:
-    """多源降级拉取指数日线"""
+    """指数日线。返回 DataFrame[date, open, high, low, close, volume]；失败 None。"""
     cfg = INDICES.get(symbol)
     if not cfg:
         print(f"  ⚠️  未知指数: {symbol}，跳过")
@@ -173,26 +92,35 @@ def fetch_index_daily(symbol: str, start: str = "", end: str = "") -> Optional[p
 
     print(f"  📊 {cfg['name']} ({symbol})")
 
-    # akshare 优先
-    df = fetch_ak(cfg, start, end)
-    if df is not None and len(df) > 0:
-        print(f"    ✅ akshare: {len(df)} 条 ({df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()})")
-        return df
+    from app.data_sources.coord_index import coordinate
 
-    # baostock
-    df = fetch_bs(cfg, start, end)
-    if df is not None and len(df) > 0:
-        print(f"    ✅ baostock: {len(df)} 条 ({df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()})")
-        return df
+    code = symbol.split(".")[0]
+    out = coordinate("index_kline", code=code, timeframe="1D", limit=_limit_for(start))
+    rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+    if not out.get("ok") or not rows:
+        print(f"    ❌ 指数日线取数失败: {out.get('error')}")
+        return None
 
-    # tushare
-    df = fetch_ts(symbol, start, end)
-    if df is not None and len(df) > 0:
-        print(f"    ✅ tushare: {len(df)} 条 ({df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()})")
-        return df
+    df = pd.DataFrame(rows)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in df.columns:
+            print(f"    ❌ 返回缺列 {col}")
+            return None
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"])
+    df = df.sort_values("date").reset_index(drop=True)
+    if start:
+        df = df[df["date"] >= start]
+    if end:
+        df = df[df["date"] <= end]
+    if df.empty:
+        print("    ❌ 过滤后无数据")
+        return None
 
-    print(f"    ❌ 所有数据源均失败")
-    return None
+    print(f"    ✅ {out.get('source')}: {len(df)} 条 "
+          f"({df['date'].iloc[0].date()} ~ {df['date'].iloc[-1].date()})")
+    return df
 
 
 # ============================================================

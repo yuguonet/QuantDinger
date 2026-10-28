@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 热门板块 & 概念板块实时分析
-数据源: **新浪为主**（newSinaHy / newFLJK，无反爬，稳定），东方财富 push2 作降级
-       （2026-09-21 主备翻转：push2 反爬频繁掐连接，sina 反而稳定）
-依赖: pip install requests pandas
+
+数据源: 一律经 `app/data_sources/coord_index`（远端实现在 provider_index/）：
+  · sector_list   板块行情排名 —— sina(newSinaHy/newFLJK) 主源 → 东财 push2 备用
+  · sector_stocks 板块成分股   —— 东财 push2（唯一源）
+本文件不再直连远端、不再写降级链与 push2 熔断：选源/排序/降级全在 data_sources 层。
 
 功能:
   - 行业板块涨幅排名 + 量能分析
@@ -13,23 +15,10 @@
 """
 
 import logging
-import requests
-import pandas as pd
 from datetime import datetime
-import time
-import json
 
 logger = logging.getLogger(__name__)
 
-# 2026-09-14：UA 必须是**完整**的 Chrome UA——截断版（缺 "(KHTML, like Gecko)…" 段）
-# 会被 push2.eastmoney.com 直接掐断连接（RemoteDisconnected，连状态码都不给）。
-# 实测对照：同 URL 同参数，截断 UA 必失败、完整 UA 稳定返回。
-# 与 eastmoney_search._em_get 的 UA 保持一致。
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Referer": "https://data.eastmoney.com/",
-}
 
 # ═══════════════════════════════════════════════════
 #  工具函数
@@ -53,256 +42,42 @@ def _safe_str(val, default=""):
 
 
 # ═══════════════════════════════════════════════════
-#  东方财富板块行情 API
+#  取数（全部经 data_sources 层）
 # ═══════════════════════════════════════════════════
 
-# 板块类型映射
-_BOARD_TYPES = {
-    "industry": {"fs": "b:BK0475", "name": "行业板块"},
-    "concept":  {"fs": "b:BK0815", "name": "概念板块"},
-    "area":     {"fs": "b:BK0813", "name": "地域板块"},
-}
-
-# 行业板块字段
-_INDUSTRY_FIELDS = (
-    "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,"
-    "f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,"
-    "f34,f35,f38,f39,f40,f41,f42,f43,f44,f45,f46,f47,f48,f49,f50,"
-    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f100,f104,f105,f128,f136,f115"
-)
-
-
-# ═══ push2 熔断 + sina 兜底（2026-09-14 反爬封禁事件）═══
-# push2.eastmoney.com 会对连续请求的 IP 掐连接（RemoteDisconnected，无状态码；
-# 数字前缀镜像 host 一并封禁，分钟级以上）。`_retry` 连打 3 次反而加重限频
-# ⇒ 失败即熔断：10 分钟内入口不再碰 push2。
-# 2026-09-21：主备翻转——sina 升为主源，push2 降为降级源（仅在 sina 为空时尝试）。
-_push2_blocked_until = 0.0
-_PUSH2_BLOCK_SECONDS = 600
-
-
-def _mark_push2_blocked():
-    global _push2_blocked_until
-    _push2_blocked_until = time.time() + _PUSH2_BLOCK_SECONDS
-    logger.warning("[hot_sectors] push2 触发熔断，%d 分钟内直接走 sina 兜底",
-                   _PUSH2_BLOCK_SECONDS // 60)
-
-
-def _board_list_sina(board_type: str, limit: int) -> list:
-    """sina 兜底：复用 index.get_sector_fund_flow（已验证稳定的资金流通道）。
-
-    sina 只有行业资金流、无概念板块行情 ⇒ concept/area 返回空，由调用方降级
-    （空列表好过异常）。字段对齐 `_fetch_board_list` 的形状，sina 没有的字段填
-    默认值，并多给 main_net（主力净流入，对板块筛选同样有用）。
-    """
-    if board_type != "industry":
-        return []
-    try:
-        from app.market_cn.index import get_sector_fund_flow  # 延迟 import 防循环依赖
-        rows = get_sector_fund_flow("今日")
-    except Exception as e:
-        logger.warning("[hot_sectors] sina 兜底也失败: %s", e)
-        return []
-    out = []
-    for r in (rows or [])[:limit]:
-        if not isinstance(r, dict):
-            continue
-        out.append({
-            "name": _safe_str(r.get("name")),
-            "code": _safe_str(r.get("code")),
-            "change_pct": _safe_num(r.get("change_pct")),
-            "price": 0,
-            "volume": 0,
-            "amount": 0,
-            "turnover": _safe_num(r.get("turnover")),
-            "up_count": 0,
-            "down_count": 0,
-            "lead_stock": _safe_str(r.get("lead_stock")),
-            "lead_stock_code": "",
-            "lead_stock_pct": _safe_num(r.get("lead_pct")),
-            "limit_up_count": 0,
-            "total_mv": 0,
-            "pe_ratio": 0,
-            "main_net": _safe_num(r.get("main_net")),
-        })
-    return out
-
-
-def _fetch_board_list_sina(board_type, limit):
-    """新浪板块行情主源：行业→newSinaHy，概念→newFLJK，地域无 sina 等价 → []。"""
-    try:
-        if board_type == "industry":
-            return _fetch_sina_industry_boards(limit)
-        if board_type == "concept":
-            return _fetch_sina_concept_boards(limit)
-        return []   # area 无 sina 板块行情通道
-    except Exception as e:
-        logger.warning("[hot_sectors] sina 板块行情失败(%s): %s", board_type, e)
-        return []
-
-
-def _sort_boards(rows, sort_by, sort_dir):
-    """按请求字段重排（sina 主源默认按涨跌幅降序返回，其余排序键需本地重排）。"""
-    keymap = {"f3": "change_pct", "f6": "amount", "f8": "turnover", "f20": "total_mv"}
-    key = keymap.get(sort_by, "change_pct")
-    try:
-        return sorted(rows, key=lambda x: _safe_num(x.get(key)), reverse=(sort_dir != "asc"))
-    except Exception:
-        return rows
-
-
 def _fetch_board_list(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
-    """板块排名入口：**sina 主源**；sina 空时降级东财 push2；再不行回退 sina 资金流通道。
+    """板块行情排名（一次 coordinate；排序键沿用东财 fid，跨源同参）。
 
     board_type: industry | concept | area
     sort_by: f3=涨跌幅, f6=成交额, f8=换手率, f20=总市值
+    失败返回 []（空列表好过异常，由调用方降级展示）。
     """
-    # ① 主源：新浪板块行情（无反爬、稳定）
-    rows = _fetch_board_list_sina(board_type, limit)
-    if rows:
-        return _sort_boards(rows, sort_by, sort_dir)
+    from app.data_sources.coord_index import coordinate
 
-    # ② 降级：东财 push2（连续请求会被反爬掐断 ⇒ 失败即熔断，10 分钟内不再尝试）
-    if time.time() >= _push2_blocked_until:
-        try:
-            rows = _fetch_board_list_push2(board_type, sort_by, sort_dir, limit)
-            if rows:
-                logger.warning("[hot_sectors] sina 主源为空，已降级东财 push2（%d 行）", len(rows))
-                return rows
-        except Exception as e:
-            _mark_push2_blocked()
-            logger.warning("[hot_sectors] push2 降级源失败(%s)", type(e).__name__)
-
-    # ③ 末级兜底：sina 资金流通道（index.get_sector_fund_flow，含 main_net）
-    fallback = _board_list_sina(board_type, limit)
-    if fallback:
-        logger.warning("[hot_sectors] 主源与 push2 均不可用，回退 sina 资金流（%d 行）", len(fallback))
-    return fallback
-
-
-def _fetch_board_list_push2(board_type="industry", sort_by="f3", sort_dir="desc", limit=30):
-    """push2 clist 原实现（2026-09-14 起去掉 _retry——熔断承担节流）。"""
-    config = _BOARD_TYPES.get(board_type, _BOARD_TYPES["industry"])
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1,
-        "pz": limit,
-        "po": 1 if sort_dir == "desc" else 0,
-        "np": 1,
-        "fltt": 2,
-        "invt": 2,
-        "fid": sort_by,
-        "fs": config["fs"],
-        "fields": _INDUSTRY_FIELDS,
-    }
-
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-    except requests.exceptions.Timeout:
-        logger.error("东方财富 API 请求超时 (15s)")
-        raise
-    except requests.exceptions.ConnectionError as e:
-        logger.error("东方财富 API 连接失败: %s", e)
-        _mark_push2_blocked()   # RemoteDisconnected = 反爬封禁信号，立即熔断
-        raise
-
-    # 检查 HTTP 状态码
-    if resp.status_code != 200:
-        logger.error("东方财富 API 返回 HTTP %d, body=%s", resp.status_code, resp.text[:200])
-        raise ConnectionError(f"东方财富 API 返回 {resp.status_code}")
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        logger.error("东方财富 API 返回非 JSON: %s, body=%s", e, resp.text[:200])
-        raise
-
-    # 防御 data 或 diff 为 None 的情况
-    data_node = data.get("data")
-    if not data_node or not isinstance(data_node, dict):
-        logger.warning("东方财富 API 返回无 data 节点: rc=%s, msg=%s", data.get("rc"), data.get("msg"))
+    out = coordinate("sector_list", board_type=board_type, limit=limit,
+                     sort_by=sort_by, sort_dir=sort_dir)
+    rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+    if not out.get("ok") or not rows:
+        logger.warning("[hot_sectors] 板块行情不可用(%s): %s", board_type, out.get("error"))
         return []
-
-    items = data_node.get("diff")
-    if not items:
-        logger.warning("东方财富 API 返回空 diff: data keys=%s", list(data_node.keys()))
-        return []
-
-    results = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        results.append({
-            "name": _safe_str(item.get("f14")),
-            "code": _safe_str(item.get("f12")),
-            "change_pct": _safe_num(item.get("f3")),
-            "price": _safe_num(item.get("f2")),
-            "volume": _safe_num(item.get("f5")),
-            "amount": _safe_num(item.get("f6")),
-            "turnover": _safe_num(item.get("f8")),
-            "up_count": int(_safe_num(item.get("f104"))),
-            "down_count": int(_safe_num(item.get("f105"))),
-            "lead_stock": _safe_str(item.get("f128")),
-            "lead_stock_code": _safe_str(item.get("f136")),
-            "lead_stock_pct": _safe_num(item.get("f115")),
-            "limit_up_count": int(_safe_num(item.get("f100"))),
-            "total_mv": _safe_num(item.get("f20")),
-            "pe_ratio": _safe_num(item.get("f9")),
-        })
-    return results
+    return rows
 
 
 def _fetch_sector_stocks(board_code, limit=10):
-    """获取板块内个股行情（领涨股详情）
+    """板块内个股行情（按涨跌幅降序）。
 
-    与 _fetch_board_list_push2 一致采用"失败即熔断"策略：push2 对连续请求会掐连接
-    （RemoteDisconnected，无状态码），连打 retry 反而加重限频。故**不重试**，
-    ConnectionError 立即触发熔断，后续 10 分钟内入口直接降级为空（个股明细无 sina 等价
-    通道，由调用方降级处理）——这正是 2026-09-14 板块列表接口已落地的行为，此处对齐。
+    返回 [{code, name, price, change_pct, amount, turnover, is_limit_up}]；失败/无数据 []。
     """
-    if time.time() < _push2_blocked_until:
-        return []   # 熔断期内不碰 push2（个股明细无 sina 等价通道，由调用方降级）
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1,
-        "pz": limit,
-        "po": 1,
-        "np": 1,
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": f"b:{board_code}",
-        "fields": "f2,f3,f4,f5,f6,f8,f12,f14,f15,f16,f17,f18,f62,f100,f115",
-    }
+    from app.data_sources.coord_index import coordinate
 
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-    except requests.exceptions.ConnectionError as e:
-        # RemoteDisconnected / Connection aborted = 反爬封禁信号 → 触发熔断，
-        # 10 分钟内后续板块直接走降级，不再连打 push2 加重限频
-        _mark_push2_blocked()
-        raise
-    if resp.status_code != 200:
-        raise ConnectionError(f"东方财富板块个股 API 返回 {resp.status_code}")
-
-    data = resp.json()
-    data_node = data.get("data")
-    if not data_node or not isinstance(data_node, dict):
+    if not board_code:
         return []
-
-    items = data_node.get("diff")
-    if not items:
+    out = coordinate("sector_stocks", board_code=board_code, limit=limit)
+    rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+    if not out.get("ok") or not rows:
+        logger.warning("[hot_sectors] 板块成分股不可用(%s): %s", board_code, out.get("error"))
         return []
-
-    return [{
-        "code": _safe_str(i.get("f12")),
-        "name": _safe_str(i.get("f14")),
-        "price": _safe_num(i.get("f2")),
-        "change_pct": _safe_num(i.get("f3")),
-        "amount": _safe_num(i.get("f6")),
-        "turnover": _safe_num(i.get("f8")),
-        "is_limit_up": i.get("f100") == 1,
-    } for i in items if isinstance(i, dict)]
+    return rows
 
 
 # ═══════════════════════════════════════════════════
@@ -346,10 +121,11 @@ def _analyze_continuity(boards):
 # ═══════════════════════════════════════════════════
 
 def get_hot_industry_boards(limit=20):
-    """获取热门行业板块（按涨幅排序）。数据源：**新浪为主**（newSinaHy），东财 push2 降级。
+    """获取热门行业板块（按涨幅排序）。
 
     Returns:
-        list[dict]: 板块行 [{name, code, change_pct, amount, up_count, down_count, lead_stock, limit_up_count, strength, amount_yi}]。
+        list[dict]: 板块行 [{name, code, change_pct, amount, up_count, down_count,
+        lead_stock, limit_up_count, strength, amount_yi}]。
         注：sina 主源无 涨停家数/涨跌家数 ⇒ limit_up_count/up_count/down_count 为 0。
     """
     logger.info("获取热门行业板块 top %d", limit)
@@ -359,7 +135,7 @@ def get_hot_industry_boards(limit=20):
 
 
 def get_hot_concept_boards(limit=20):
-    """获取热门概念板块（按涨幅排序）。数据源：**新浪为主**（newFLJK），东财 push2 降级。
+    """获取热门概念板块（按涨幅排序）。
 
     Returns:
         list[dict]: 板块行，键同 get_hot_industry_boards（sina 主源同样无涨跌家数）。
@@ -374,154 +150,22 @@ def get_sector_detail(board_code, limit=10):
     """获取板块内强势个股
 
     Returns:
-        list[dict]: 板块内个股 [{code, name, price, change_pct, amount, turnover, is_limit_up}]；失败/熔断 []。
+        list[dict]: [{code, name, price, change_pct, amount, turnover, is_limit_up}]；失败 []。
     """
     return _fetch_sector_stocks(board_code, limit=limit)
-
-
-def _fetch_sina_industry_boards(limit=30):
-    """新浪行业板块（**主数据源**）
-
-    数据格式 (13字段):
-      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]avg_change_amount,[5]change_pct,
-      [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
-
-    注意（2026-09-21 修正）:
-      - [4] 是**平均价格变动（元）**，不是涨跌幅；涨跌幅取 [5]（%）。
-        实测 [4]/[3]*100 ≈ [5]（简单均值 vs 加权）。旧实现误用 [4]*100，
-        产出 281.6% 之类的乱值。
-      - lead_pct [9] 已经是百分比 (10.084 = 10.08%)，不需要转换。
-    """
-    url = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.encoding = "gbk"
-        text = resp.text
-        # 解析 JS 变量: var S_Finance_bankuai_sinaindustry = {...}
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= 0:
-            logger.warning("新浪板块接口返回格式异常")
-            return []
-        import json
-        data = json.loads(text[start:end])
-        results = []
-        for key, val in data.items():
-            parts = val.split(",")
-            if len(parts) < 13:
-                continue
-            change_pct = _safe_num(parts[5])  # [5]=涨跌幅(%)（[4] 是平均价格变动(元)，勿用）
-            results.append({
-                "name": parts[1],
-                "code": parts[0],
-                "change_pct": round(change_pct, 2),
-                "price": _safe_num(parts[3]),
-                "amount": _safe_num(parts[7]),
-                "up_count": 0,
-                "down_count": 0,
-                "lead_stock": parts[12],
-                "lead_stock_pct": round(_safe_num(parts[9]), 2),  # 已是百分比
-                "limit_up_count": 0,
-            })
-        results.sort(key=lambda x: -x["change_pct"])
-        return results[:limit]
-    except Exception as e:
-        logger.error("新浪行业板块获取失败: %s", e)
-        return []
-
-
-def _fetch_sina_concept_boards(limit=30):
-    """新浪概念板块（**主数据源**）
-
-    数据来源: https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class
-    返回 gn_ 前缀的概念板块，共约 175 个。
-
-    数据格式 (13字段):
-      [0]code,[1]name,[2]stock_count,[3]avg_price,[4]avg_change_amount,[5]change_pct,
-      [6]volume,[7]amount,[8]lead_code,[9]lead_pct,[10]lead_price,[11]lead_change,[12]lead_name
-
-    注意（2026-09-21 修正）: 涨跌幅取 [5]（%）。[4] 是平均价格变动(元)，不是百分比；
-    旧实现误把 [4] 当百分比，全表普遍偏小/错位。lead_pct [9] 已是百分比。
-    """
-    url = "https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.encoding = "gbk"
-        text = resp.text
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start < 0 or end <= 0:
-            logger.warning("新浪概念板块接口返回格式异常")
-            return []
-        data = json.loads(text[start:end])
-        results = []
-        for key, val in data.items():
-            if not key.startswith("gn_"):
-                continue
-            parts = val.split(",")
-            if len(parts) < 13:
-                continue
-            change_pct = _safe_num(parts[5])  # [5]=涨跌幅(%)（[4] 是平均价格变动(元)，勿用）
-            results.append({
-                "name": parts[1],
-                "code": parts[0],
-                "change_pct": round(change_pct, 2),
-                "price": _safe_num(parts[3]),
-                "amount": _safe_num(parts[7]),
-                "up_count": 0,
-                "down_count": 0,
-                "lead_stock": parts[12],
-                "lead_stock_pct": round(_safe_num(parts[9]), 2),
-                "limit_up_count": 0,
-                "stock_count": int(_safe_num(parts[2])),
-            })
-        results.sort(key=lambda x: -x["change_pct"])
-        return results[:limit]
-    except Exception as e:
-        logger.error("新浪概念板块获取失败: %s", e)
-        return []
 
 
 def get_all_hot_sectors(industry_limit=15, concept_limit=15):
     """获取全部热门板块数据（供 API 使用）
 
     Returns:
-        dict: {timestamp, industry: [...], concept: [...], analysis: {...}}；板块行键同 get_hot_industry_boards。
-
-    优先使用新浪（稳定，无反爬），东财作为兜底。
+        dict: {timestamp, industry: [...], concept: [...], analysis: {...}}；
+              板块行键同 get_hot_industry_boards。
     """
     logger.info("热门板块分析: %d 行业 + %d 概念", industry_limit, concept_limit)
 
-    industry = []
-    concept = []
-
-    # ① 优先新浪（稳定，无反爬）
-    try:
-        industry = _fetch_sina_industry_boards(industry_limit)
-    except Exception as e:
-        logger.error("新浪行业板块获取失败: %s", e)
-
-    # ② 新浪失败时降级到东财
-    if not industry:
-        logger.info("新浪行业板块为空，降级到东财")
-        try:
-            industry = get_hot_industry_boards(industry_limit)
-        except Exception as e:
-            logger.error("东财行业板块获取失败: %s", e)
-
-    # ③ 概念板块：优先新浪
-    try:
-        concept = _fetch_sina_concept_boards(concept_limit)
-    except Exception as e:
-        logger.error("新浪概念板块获取失败: %s", e)
-
-    # ④ 新浪概念失败时降级到东财
-    if not concept:
-        logger.info("新浪概念板块为空，降级到东财")
-        try:
-            concept = get_hot_concept_boards(concept_limit)
-        except Exception as e:
-            logger.error("东财概念板块获取失败: %s", e)
+    industry = get_hot_industry_boards(industry_limit)
+    concept = get_hot_concept_boards(concept_limit)
 
     # 综合分析
     analysis = _build_sector_analysis(industry, concept)
@@ -604,13 +248,3 @@ def _gen_summary(sentiment, main_lines, top_concept, zt_sectors):
         parts.append(f"涨停集中: {', '.join(zt_names)}")
 
     return "；".join(parts)
-
-
-# ═══════════════════════════════════════════════════
-#  CLI 入口
-# ═══════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    result = get_all_hot_sectors()
-    print(json.dumps(result["analysis"], ensure_ascii=False, indent=2))

@@ -109,7 +109,7 @@ def _orderbook(code: str) -> Dict[str, Any]:
         except (ValueError, IndexError):
             pass
 
-    from app.data_sources.provider import normalize_quote
+    # 标准字段（normalize_quote 的目标形状）此处全部显式给齐，无需再归一化
     result = {
         "last": last,
         "change": chg,
@@ -125,7 +125,6 @@ def _orderbook(code: str) -> Dict[str, Any]:
         "bid": {},
         "ask": {},
     }
-    normalize_quote(result)
     return {"object": result}
 
 

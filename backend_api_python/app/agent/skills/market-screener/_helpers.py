@@ -185,6 +185,291 @@ def hard_exclusions(item: Dict, strategy: str = "") -> List[str]:
     return flags
 
 
+def rule_prefilter(candidates: List[Dict], min_turnover: float = 1.0,
+                   min_list_days: int = 60) -> tuple:
+    """代码规则初筛（2026-10-28）——**先规则、后画像**，禁止「搜索命中 1470 取前 10」。
+
+    基础层（始终执行）：
+      · **排除不活跃**：明确换手 < min_turnover%、停牌
+      · **排除新股**：名称 N/C 开头、list_date 距今 < min_list_days、上市日期未知且
+        标了 ipo/new 的（缺字段不杀——未知≠不合格）
+
+    扩展层（池子仍过大时追加，防止二次硬截）：
+      · ST/退市、价格带 [2,300]
+
+    Returns:
+        (kept, stats)：kept=通过的候选（**全量**，不截断）；
+        stats={inactive, new_stock, st, price_band, total_in, total_kept}
+    """
+    stats = {"inactive": 0, "new_stock": 0, "st": 0, "price_band": 0,
+             "total_in": len(candidates or [])}
+    kept: List[Dict] = []
+    today = datetime.now().date()
+    # 扩展层阈值：全量 >200 时才加 ST/价格带（与 objective_preexclude 不重复计数语义不同）
+    apply_ext = len(candidates or []) > 200
+
+    for item in candidates or []:
+        name = str(item.get("name") or "").upper()
+        # ── 新股 ──
+        if name.startswith("N") or name.startswith("C"):
+            stats["new_stock"] += 1
+            item["_rule_excluded"] = "新股"
+            continue
+        ld = str(item.get("list_date") or "").strip()
+        if ld:
+            try:
+                d = datetime.strptime(ld[:10], "%Y-%m-%d").date()
+                if (today - d).days < int(min_list_days):
+                    stats["new_stock"] += 1
+                    item["_rule_excluded"] = "次新"
+                    continue
+            except ValueError:
+                pass
+
+        # ── 不活跃 ──
+        if item.get("suspended"):
+            stats["inactive"] += 1
+            item["_rule_excluded"] = "停牌"
+            continue
+        trn = _f(item.get("turnover_pct"))
+        if 0 < trn < float(min_turnover):
+            stats["inactive"] += 1
+            item["_rule_excluded"] = f"换手{trn:.1f}%不活跃"
+            continue
+
+        if apply_ext:
+            if "ST" in name or "退" in name:
+                stats["st"] += 1
+                item["_rule_excluded"] = "ST/退市"
+                continue
+            price = _f(item.get("price") or item.get("close"))
+            if price and (price < 2 or price > 300):
+                stats["price_band"] += 1
+                item["_rule_excluded"] = "价格带"
+                continue
+
+        kept.append(item)
+
+    stats["total_kept"] = len(kept)
+    return kept, stats
+
+
+def code_narrow(candidates: List[Dict], main_themes: List = None,
+                max_n: int = 40) -> tuple:
+    """代码收窄（2026-10-28 v2）：宽池 400+ → **≤max_n**，对齐「最小风险、最大涨幅」。
+
+    问题复盘（实盘 4 只结论偏「指标平铺」）：旧分层只看题材/多源/换手，
+    没挡「买不进的封板」和「追高/无空间」，评分层再砍一半 ⇒ 进 deep 的质量差。
+
+    分层（计数，不编造分数；p_up 仍留给 score_pool）：
+      - **买不进**（limit_up / 跌停）直接不进候选（硬剔，计 unbuyable）
+      - tier0 题材命中 +（贴支撑/多源/健康换手）且 **非极端追高**
+      - tier1 题材命中 或（贴支撑 + 健康换手）
+      - tier2 健康换手(2~15%) 且 非极端追高
+      - tier3 其余
+    「极端追高」= 当日涨幅 >7% 或（有 20 日位且 >=95）。
+    同层：换手靠近 5% 优先；涨幅更低优先（更少追高）；再输入序。
+
+    Returns:
+        (kept, stats)
+    """
+    themes = [t[0] for t in (main_themes or []) if isinstance(t, (list, tuple)) and t]
+    scored = []
+    stats = {"unbuyable": 0, "total_in": len(candidates or []),
+             "by_tier": {0: 0, 1: 0, 2: 0, 3: 0}}
+
+    def _chg(it):
+        try:
+            return float(it.get("change_pct") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _unbuyable(it) -> bool:
+        """封板判定：limit_up 可能是**布尔**也可能是**涨停价**（fill_quote 回填的是价）。"""
+        if it.get("limit_locked") is True or it.get("limit_down") is True:
+            return True
+        lu = it.get("limit_up")
+        if lu is True:
+            return True
+        if isinstance(lu, (int, float)) and not isinstance(lu, bool) and lu > 0:
+            price = _f(it.get("price") or it.get("close"))
+            if price and price >= float(lu) - 0.01:
+                return True
+        return False
+
+    for i, item in enumerate(candidates or []):
+        # 买不进：封板/跌停不留名额（2026-10-28 实盘：40 里 24 只 hard 白占）
+        if _unbuyable(item):
+            stats["unbuyable"] += 1
+            item["_rule_excluded"] = "买不进"
+            continue
+
+        theme = item.get("theme")
+        hit = theme.get("hit") if isinstance(theme, dict) else _theme_hit(item, themes)["hit"]
+        source = str(item.get("source") or "")
+        multi = "+" in source
+        trn = _f(item.get("turnover_pct"))
+        chg = _chg(item)
+        pos = item.get("pos_in_20d_pct")
+        try:
+            pos_f = float(pos) if pos is not None else None
+        except (TypeError, ValueError):
+            pos_f = None
+        # 贴支撑线索：结构扫描带上的 reason / 已有 tech
+        tech = item.get("tech") or {}
+        near = bool((tech.get("support") or {}).get("near_support")
+                    or tech.get("near_support")
+                    or "均线" in str(item.get("reason") or ""))
+        extreme = chg > 7.0 or (pos_f is not None and pos_f >= 95)
+        healthy = 2.0 <= trn <= 15.0
+
+        if hit and (near or multi or healthy) and not extreme:
+            tier = 0
+        elif hit or (near and healthy):
+            tier = 1
+        elif healthy and not extreme:
+            tier = 2
+        else:
+            tier = 3
+        stats["by_tier"][tier] = stats["by_tier"].get(tier, 0) + 1
+        dist_trn = abs(trn - 5.0) if trn > 0 else 99.0
+        # 涨幅越低越不追高；同层稳定
+        scored.append((tier, dist_trn, chg, i, item))
+
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+
+    # ── 板性分散（2026-10-28）：创业板/科创扎堆直接降权，避免「三只全是 300/301」──
+    def _board(code: str) -> str:
+        c = str(code or "")
+        if c.startswith(("300", "301")):
+            return "创业板"
+        if c.startswith("688") or c.startswith("689"):
+            return "科创板"
+        if c.startswith("60"):
+            return "沪主板"
+        if c.startswith(("00", "30")):
+            return "深主板"
+        return "其他"
+
+    # 每板上限：创业板/科创各 ≤8/40，防单一高波动属性吃满名额
+    board_cap = {"创业板": 8, "科创板": 4}
+    board_n: Dict[str, int] = {}
+    kept = []
+    overflow = []
+    for tier, _d, _c, _i, item in scored:
+        b = _board(item.get("code"))
+        cap = board_cap.get(b)
+        n = board_n.get(b, 0)
+        if cap is not None and n >= cap:
+            overflow.append(item)
+            continue
+        board_n[b] = n + 1
+        kept.append(item)
+        if len(kept) >= max(1, int(max_n)):
+            break
+    # 名额有空再回填溢出（保持 ≤max_n）
+    if len(kept) < max(1, int(max_n)):
+        for item in overflow:
+            kept.append(item)
+            if len(kept) >= max(1, int(max_n)):
+                break
+
+    stats["total_kept"] = len(kept)
+    stats["max_n"] = int(max_n)
+    stats["board_n"] = board_n
+    return kept, stats
+
+
+def _board_of(code: str) -> str:
+    c = str(code or "")
+    if c.startswith(("300", "301")):
+        return "创业板"
+    if c.startswith("688") or c.startswith("689"):
+        return "科创板"
+    if c.startswith("60"):
+        return "沪主板"
+    if c.startswith(("00", "30")):
+        return "深主板"
+    return "其他"
+
+
+def enforce_buy_quality(profiles: List[Dict], main_themes: List = None,
+                        max_n: int = 12, max_per_board: int = 3,
+                        min_sr_gap_pct: float = 8.0) -> tuple:
+    """进 deep /「买什么」质量闸（2026-10-28 三条硬约束）。
+
+    1. **题材或结构内空间**：`theme.hit` 或（**结构未坏** 且 `sr_gap_pct >= min_sr_gap_pct`）。
+       「结构未坏」= 贴支撑 / 多头 / 站上 MA20 / 弱转强，且 **非深跌无承接**
+       （距 MA20 < -5% 且 20 日跌 >15% = 超跌反弹，不算趋势空间）
+    2. **高波动板性上限**：创业板/科创板各 ≤ max_per_board
+    3. T+1~T+5 置信由 LLM 落笔（quality_bar）
+
+    Returns:
+        (kept, stats)
+    """
+    themes = [t[0] for t in (main_themes or []) if isinstance(t, (list, tuple)) and t]
+    passed = []
+    stats = {"total_in": len(profiles or []), "no_theme_no_space": 0,
+             "oversold_bounce": 0, "board_capped": 0, "by_board": {}}
+
+    def _fnum(v, default=None):
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    for p in profiles or []:
+        theme = p.get("theme") or {}
+        hit = bool(theme.get("hit"))
+        if not hit:
+            hit = _theme_hit(p, themes)["hit"]
+        tech = p.get("tech") or {}
+        support = tech.get("support") or {}
+        near = bool(support.get("near_support") or tech.get("near_support"))
+        bull = bool(tech.get("ma_bull_stack"))
+        d20 = _fnum(tech.get("dist_ma20_pct"), 0.0) or 0.0
+        ret20 = _fnum(tech.get("ret_20d_pct"), 0.0) or 0.0
+        above20 = d20 >= -1.0
+        w2s = bool(tech.get("weak_to_strong") or (p.get("w2s") or {}).get("reason") == "w2s")
+        structure_ok = (near or bull or above20 or w2s)
+        oversold = (d20 < -5.0 and ret20 < -15.0)
+        gap = tech.get("sr_gap_pct")
+        gap_f = _fnum(gap, None)
+        space_ok = (gap_f is not None and gap_f >= float(min_sr_gap_pct)
+                    and structure_ok and not oversold)
+        if oversold and not hit:
+            stats["oversold_bounce"] += 1
+            p["quality_skip"] = "超跌反弹非趋势"
+            continue
+        if not hit and not space_ok:
+            stats["no_theme_no_space"] += 1
+            p["quality_skip"] = "无题材且空间/结构不足"
+            continue
+        passed.append((p, hit, gap_f if gap_f is not None else -1.0))
+
+    passed.sort(key=lambda x: (
+        0 if (x[1] and x[2] >= min_sr_gap_pct) else (1 if x[2] >= min_sr_gap_pct else 2),
+        -x[2],
+    ))
+    capped_boards = {"创业板", "科创板"}
+    kept = []
+    board_n: Dict[str, int] = {}
+    for p, _hit, _gap in passed:
+        b = _board_of(p.get("code"))
+        n = board_n.get(b, 0)
+        if b in capped_boards and n >= int(max_per_board):
+            stats["board_capped"] += 1
+            p["quality_skip"] = f"高波动板超限({b})"
+            continue
+        board_n[b] = n + 1
+        kept.append(p)
+        if len(kept) >= max(1, int(max_n)):
+            break
+    stats["total_kept"] = len(kept)
+    stats["by_board"] = board_n
+    return kept, stats
+
+
 def soft_warnings(item: Dict, market: dict, strategy: str = "") -> List[str]:
     """软提示：历史经验型风控（不是不可交易事实）。
 
@@ -195,8 +480,8 @@ def soft_warnings(item: Dict, market: dict, strategy: str = "") -> List[str]:
     out: List[str] = []
     if _mood_regime(market) == "weak":
         src = str(item.get("source") or "")
-        if any(k in src for k in ("连板", "4IN1", "龙回头", "涨停")) and not (item.get("reason") or ""):
-            out.append("弱势市涨停活跃源无题材支撑(退潮风险)")
+        if any(k in src for k in ("热点",)) and not (item.get("reason") or ""):
+            out.append("弱势市热点活跃源无题材支撑(退潮风险)")
     trn = _f(item.get("turnover_pct"))
     if trn > 25:
         out.append(f"换手{trn:.0f}%过热")
@@ -263,6 +548,22 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
     _valid = [c for c in _cands if c[1] is not None and abs(c[1]) <= 3.0]
     nearest = min(_valid, key=lambda c: abs(c[1])) if _valid else None
 
+    # 压力位 / 支撑–压力间距（2026-10-28 v2）：用**最近有效压力**，不是远处前高——
+    # 超跌 20% 后到 20 日峰的 gap 会虚高成「大空间」，那是反弹不是趋势空间。
+    # 口径：优先上方 MA20 / 近 10 日峰中的**更近者**；已站上则用近 20 日峰。
+    win_hi20 = max(highs[-win20:])
+    win_hi10 = max(highs[-min(10, win20):])
+    overhead = [x for x in (win_hi10, ma20_v) if x and x > close * 1.005]
+    if overhead:
+        resistance = min(overhead)  # 最近压力
+    else:
+        resistance = win_hi20 if win_hi20 > close * 1.005 else (
+            max(highs[-40:-win20]) if len(highs) > win20 else None)
+    sup_px = nearest[2] if nearest else None
+    sr_gap_pct = None
+    if resistance and sup_px and sup_px > 0:
+        sr_gap_pct = round((resistance - sup_px) / sup_px * 100, 2)
+
     intraday_pos = None
     rng = today["high"] - today["low"]
     if rng > 0:
@@ -291,6 +592,12 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
             "ma10": round(_last(ma10), 2) if _last(ma10) else None,
             "ma20": round(ma20_v, 2) if ma20_v else None,
         },
+        "resistance": {
+            "price": round(resistance, 2) if resistance else None,
+            "dist_pct": round((resistance - close) / close * 100, 2)
+            if resistance and close else None,
+        },
+        "sr_gap_pct": sr_gap_pct,  # 支撑–压力间距%；过窄=操作性弱
         "ma_bull_stack": bool(_last(ma5) and _last(ma10) and ma20_v and _last(ma5) > _last(ma10) > ma20_v),
         "pos_in_20d_pct": round(pos20, 1) if pos20 is not None else None,
         "is_20d_high": bool(pos20 is not None and pos20 >= 99),
@@ -536,23 +843,28 @@ def objective_preexclude(candidates, strategy, quotes=None):
 
 
 def _objective_rank_key(item: Dict, index: int, themes: List[str] = ()) -> tuple:
-    """客观优先级键（2026-10-21）：纯计数分层，**不编造分数**——p_up 仍是唯一数字。
+    """客观优先级键（2026-10-28 选股目标：短线最小风险、最大涨幅）——
+    纯计数分层，**不编造分数**——p_up 仍是唯一数字。
 
     统一供两处「谁先获得资源/名额」的排序（同一口径，勿另写）：
       · 池子超过打分护栏时，谁先拿 p_up（score_pool 预算让位）；
       · 缺分（no_pred）票按什么顺序占用保送名额（缺分保送）。
-    分层（越小越优先）：题材命中 0 → 稀缺来源(龙回头/热点) 1 →
+    分层（越小越优先）：题材命中+贴支撑 0 → 题材命中或贴支撑 1 →
     多源命中(source 含 +) 2 → 其余 3；同层按输入顺序（index）稳定排，可复盘。
+    【2026-10-28】删除龙回头/热点稀缺特权——追高源不再是加分项。
     题材命中：画像后的 item 自带 theme.hit；画像前的原始候选无此字段，回退
-    _theme_hit 现算（同一函数，口径一致）。
+    _theme_hit 现算（同一函数，口径一致）。贴支撑：画像后的 tech.support.near_support。
     """
     theme = item.get("theme")
     hit = theme.get("hit") if isinstance(theme, dict) \
         else _theme_hit(item, list(themes))["hit"]
+    tech = item.get("tech") or {}
+    support = tech.get("support") or {}
+    near = bool(support.get("near_support") or tech.get("near_support"))
     source = str(item.get("source") or "")
-    if hit:
+    if hit and near:
         tier = 0
-    elif "龙回头" in source or "热点" in source:
+    elif hit or near:
         tier = 1
     elif "+" in source:
         tier = 2
@@ -671,27 +983,22 @@ def _is_weak_to_strong(p: dict) -> Tuple[bool, dict]:
 def score_pool(candidates, strategy="", market=None, main_themes=None,
                p_up_floor=0.48, rank_cut=0.30, floor_keep=4, no_pred_keep=2,
                w2s_keep=2, reserved=None):
-    """双保险软门槛 + 缺分保送 + 弱转强回捞——run() 漏斗第 2 层（**加法层**）。
+    """双保险软门槛 + 缺分保送 + 弱转强回捞——run() 漏斗（选股目标：短线最小风险、最大涨幅）。
 
-    层次（2026-10-25 起与 8.1.0 基线分层，见 run._baseline_selection）：
+    层次（2026-10-28 去连板/龙回头后单漏斗）：
     1. **hard**：画像层已标的客观障碍，本层计数不放进 deep；
     2. **p_up 硬闸**：低于 p_up_floor 的进 cut_list（计 p_up_hard）；
     3. **排名截断**：过闸票按 p_up 降序砍后 rank_cut 比例（计 rank_cut）；
     4. **三条回捞通道**（都只加不减）：
-       · floor_kept：被砍但题材命中或稀缺来源（龙回头/热点）的前 floor_keep 只；
+       · floor_kept：被砍但**题材命中或贴支撑**（低风险位）的前 floor_keep 只；
        · no_pred_kept：无 p_up（模型盲区）按客观优先级占 no_pred_keep 名额
          （2026-10-21：缺分 ≠ 低分）；
-       · w2s_kept（2026-10-23）：被砍但**明确弱转强**（回踩 MA5 滞跌 + 主力净流入
+       · w2s_kept：被砍但**明确弱转强**（回踩 MA5 滞跌 + 主力净流入
          + 日线结构好 + 今日主力>昨日）的前 w2s_keep 只。只回捞、不改 p_up 排名；
-         条件从严，防假弱转强。
+         条件从严，防假弱转强。**本通道最贴「最小风险+最大涨幅」**。
 
-    【reserved（2026-10-25 用户裁定：8.4.0 = 8.1.0 胜率的再提高，不是重新设计）】
-    reserved = 8.1.0 基线画像（run._baseline_selection 产出：池序前 8 无 hard）。
-    基线**恒入 deep**，不参与本层的闸/排名/回捞——本层只在基线之外做加法
-    （p_up 排序的改进名额，填到 run._FUNNEL_DEEP_N）。按 code 去重：基线与
-    本层是两次独立画像的 dict 对象（同票不同体），且本层候选集（objective
-    之后的 kept）通常仍含基线票，必须先剔除再进预算/画像，否则基线票会
-    ① 白占打分护栏额度 ② 以加法身份重复进 deep。
+    【reserved】可选保留名单（其 code 全程排除，不占预算）。run() 不再有
+    8.1.0 基线层（2026-10-28 用户裁定：选股去掉连板/龙回头旧逻辑）。
 
     【rank_cut 定位】是**数量控制**（限制进 deep 的条数），不是质量否决。
     相对截断（砍排名后 X%）意味着同一只票在强池出局、弱池存活——三条回捞通道
@@ -699,8 +1006,7 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
 
     Args:
         w2s_keep: 弱转强名额上限（默认 2；0=关闭）
-        reserved: 8.1.0 基线画像列表（dict 带 code/hard）；其 code 在本层
-            全程排除（不占预算、不画像、不进任何名单）。None=无保留（旧行为）
+        reserved: 保留画像列表（dict 带 code）；其 code 在本层全程排除
     """
     reserved_codes = {str(p.get("code") or "") for p in (reserved or [])}
     cand_list = list(candidates or [])
@@ -713,8 +1019,6 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
     if len(cand_list) > budget:
         # 只有真超护栏才让位：客观优先级（纯计数）决定谁先拿 p_up，
         # 被让位的票计 score_skipped（漏斗可见，不静默丢）。
-        # 口径 = 加法层候选（reserved 已剔除后的 cand_list）超预算的部分——
-        # reserved 是基线保底，不占打分额度，不计让位（2026-10-25）。
         add_n = len(cand_list)
         order = sorted(range(add_n),
                        key=lambda i: _objective_rank_key(cand_list[i], i, themes))
@@ -755,13 +1059,14 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
         else:
             kept.append(p)
 
-    # 保底回捞：题材命中或稀缺来源（龙回头/热点）
+    # 保底回捞：题材命中或贴支撑（低风险位；不再给连板/龙回头稀缺特权）
     rescued = []
     for p in cut_list:
         theme = p.get("theme") or {}
-        source = str(p.get("source") or "")
-        scarce = ("龙回头" in source) or ("热点" in source)
-        if theme.get("hit") or scarce:
+        tech = p.get("tech") or {}
+        support = tech.get("support") or {}
+        near = bool(support.get("near_support") or tech.get("near_support"))
+        if theme.get("hit") or near:
             rescued.append(p)
     floor_kept = rescued[:max(0, int(floor_keep))]
     for p in floor_kept:
@@ -970,7 +1275,7 @@ def prewarm_market_klines() -> None:
     get_index_daily_kline("000001",120) → mootdx 客户端创建（冷进程里
     provider.tdx_ex 无 live 服务器 ⇒ bestip 全扫 ~74s）+ 腾讯兜底，
     单点 78.35s，占 run() 总耗时 44%。该取数与候选池（candidate_pool
-    ~69s：龙回头 akshare + 行情回填）无依赖 ⇒ run() 入口起后台线程
+    ~69s：候选池取数 + 行情回填）无依赖 ⇒ run() 入口起后台线程
     预热，两者重叠后单点基本隐藏。失败仅记 warning：主流程到时按原
     路径自取，行为与无预热时一致（不静默吞，见模块头纪律）。
     """
@@ -1103,9 +1408,9 @@ def enrich_predictive(results: list, market: dict = None) -> list:
         p = it.get("p_up")
         if p is None:
             continue
-        # 情绪弱时对涨停活跃源折价：连板/炸板题材在弱势市次日溢价差
+        # 情绪弱时对高位/无题材活跃源折价
         src = str(it.get("source") or "")
-        if regime == "weak" and any(k in src for k in ("连板", "4IN1", "龙回头", "涨停")):
+        if regime == "weak" and any(k in src for k in ("热点", "涨停")):
             p = max(0.05, p * 0.92)
             it["p_up"] = round(p, 4)
             it["score"] = round(p * 100, 1)

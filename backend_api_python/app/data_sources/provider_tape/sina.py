@@ -2,7 +2,8 @@
 """provider_tape / sina —— 分笔与盘口族新浪源（orderbook + ticks_today）。
 
 新浪 hq.sinajs.cn 五档盘口 + stock.gtimg.cn 分笔。
-字段与 mootdx/tencent 对齐: orderbook → normalize_quote; ticks → {time,price,vol,amount,buy_sell}
+字段与 mootdx/tencent 对齐: orderbook → 标准行情字段（last/change/changePercent/… + bid/ask）;
+ticks → {time,price,vol,amount,buy_sell}
 """
 from __future__ import annotations
 
@@ -65,19 +66,22 @@ def _orderbook(code: str) -> Dict[str, Any]:
         vol = float(parts[8])  # 成交量(股)
         amount = float(parts[9])  # 成交额(元)
         # 五档: 买一~五档 (parts[10:20]), 卖一~五档 (parts[20:30])
+        # ⚠ 新浪是「量在前、价在后」：parts[10]=买一量 parts[11]=买一价，
+        #   parts[20]=卖一量 parts[21]=卖一价（2026-10-28 原始串实测复核）。
+        #   早期实现把二者取反，导致 price 字段是股数、vol 字段是价格。
         bid = {}
         ask = {}
         for i in range(5):
-            bp = float(parts[10 + i * 2] or 0)
-            bv = float(parts[11 + i * 2] or 0)
-            sp = float(parts[20 + i * 2] or 0)
-            sv = float(parts[21 + i * 2] or 0)
+            bv = float(parts[10 + i * 2] or 0)
+            bp = float(parts[11 + i * 2] or 0)
+            sv = float(parts[20 + i * 2] or 0)
+            sp = float(parts[21 + i * 2] or 0)
             bid[f"bid{i+1}"] = {"price": bp, "vol": bv}
             ask[f"ask{i+1}"] = {"price": sp, "vol": sv}
     except (ValueError, IndexError):
         return {"object": None}
 
-    from app.data_sources.provider import normalize_quote
+    # 标准字段（normalize_quote 的目标形状）此处全部显式给齐，无需再归一化
     result = {
         "last": price,
         "change": round(price - prev, 4) if prev else 0,
@@ -91,7 +95,6 @@ def _orderbook(code: str) -> Dict[str, Any]:
         "bid": bid,
         "ask": ask,
     }
-    normalize_quote(result)
     return {"object": result}
 
 

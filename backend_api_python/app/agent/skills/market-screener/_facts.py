@@ -31,7 +31,7 @@ from .common import (
     call_tool, fetch_kline, _today_str,
     fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
     fetch_hot_stocks_with_reason, fetch_hot_sectors,
-    scan_dragon_pullback, _get_writer,
+    _get_writer,
     compute_ma, compute_macd, compute_rsi, compute_volume_ratio,
 )
 
@@ -495,55 +495,68 @@ def detect_patterns(bars: List[Dict], params: Dict[str, float] = None) -> List[D
 #  候选池编排（只负责「从哪取」，不负责「留哪只」）
 # ═══════════════════════════════════════════════════════════════
 
-# 候选来源清单 —— 全部给，由调用方通过 sources= 自选，不再按策略写死。
-POOL_SOURCES = ("zt", "eod_zt", "dragon", "hot", "search", "recent_zt")
+# 候选来源清单 —— 多源并进（2026-10-28：禁止东财搜索单点）。
+# 【用户裁定】选股目标 = 短线最小风险、最大涨幅。
+#   连板/尾盘封板/龙回头/近期涨停 = 追高或接刀，**整源删除**。
+#   涨停池数据仍供 market_state / zt_streak 客观事实使用，但不进候选池。
+POOL_SOURCES = ("hot", "search", "flow", "sector", "scan")
 
 _SOURCE_DEFAULT = {
-    "intraday": ("zt", "dragon", "search"),
-    "eod": ("eod_zt", "search"),
-    "post_market": ("hot", "search", "recent_zt", "dragon"),
+    "intraday": ("hot", "search", "flow", "sector", "scan"),
+    "eod": ("hot", "search", "flow", "sector", "scan"),
+    "post_market": ("hot", "search", "flow", "sector", "scan"),
 }
 
 # search_stocks 的查询串只是**默认建议**，调用方可用 queries= 完全替换。
-# 扩词（2026-10-20）：各时段默认查询统一覆盖资金流/板块/连板/涨停/情绪等多维度，
-# 配合 search_top_n 形成宽候选池，再由客观预排除与软门槛收窄。
+# 口径（2026-10-28）：围绕「有支撑 + 资金/趋势确认 + 未极端追高」扩词，
+# 不再用连板/龙虎榜/近端涨停等追高词。
+# 【池子偏小缺陷 2026-10-28】hot 在涨停潮里几乎全是封板，若 search 再空转，
+# 池子只剩十几只且全被 objective 剔光。默认词必须以**东财智能选股真能命中**
+# 的过滤语句为主（涨幅/换手/均线结构），纯意象词只作补充。
 _QUERY_DEFAULT = {
     "intraday": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
+        "涨幅0%到7% 站上5日均线 非ST",
+        "涨幅3%到8% 换手率大于3% 非ST",
+        "主力资金净流入 换手率大于2%",
         "放量突破 站上20日均线",
-        "缩量企稳 底部放量",
+        "缩量回调 站上20日均线 非ST",
+        "站上5日均线 多头排列 非ST",
+        "底部放量 非ST",
+        "回踩5日均线 收阳",
     ),
     "eod": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
+        "涨幅0%到7% 站上5日均线 非ST",
         "涨幅3%到8% 换手率大于3% 非ST",
+        "主力资金净流入 换手率大于2%",
+        "放量突破 站上20日均线",
+        "缩量回调 站上20日均线 非ST",
+        "站上5日均线 多头排列 非ST",
+        "底部放量 非ST",
     ),
     "post_market": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
+        "涨幅0%到7% 站上5日均线 非ST",
         "涨幅1%到8% 换手率大于2% 非ST",
-        "近10日涨停 换手率大于2% 非ST",
+        "主力资金净流入 换手率大于2%",
+        "放量突破 站上20日均线",
+        "缩量回调 站上20日均线 非ST",
+        "站上5日均线 多头排列 非ST",
+        "底部放量 非ST",
+        "回踩5日均线 收阳",
     ),
 }
+
+# 池底补采（默认词仍不够时）：更宽的活跃/结构/资金词，目标是**买到的票**，
+# 不是封板名单。与 Round1 通用词分工：这里在取数阶段就补，避免 score 层才放空。
+_QUERY_EXPAND = (
+    "涨幅大于1% 非ST 换手率大于1%",
+    "现价高于5日均线 非ST",
+    "现价高于10日均线 非ST",
+    "主力资金净流入",
+    "放量上涨 非ST",
+    "上涨趋势 非ST",
+    "中小盘 换手率大于3%",
+    "行业板块涨幅",
+)
 
 
 def _annotate_empty_pool_calendar(missing: List[str], date: str) -> None:
@@ -592,8 +605,8 @@ def candidate_pool(
 
     Returns:
         dict: strategy / date / sources_used / pool_size / main_themes /
-            candidates[{code,name,source,reason,continuous_days,zt_time,change_pct,turnover_pct,...}] /
-            continuous_board / dragon_pullback / eod_zt / missing
+            candidates[{code,name,source,reason,change_pct,turnover_pct,...}] /
+            missing
     """
     date = date or _today_str()
     missing: List[str] = []
@@ -624,65 +637,7 @@ def candidate_pool(
             return
         pool[code] = payload
 
-    continuous_board: List[Dict] = []
-    eod_zt: List[Dict] = []
-    dragon_pullback: List[Dict] = []
-
-    # ── 涨停池（连板 / 尾盘封板）──
-    # 源失败必须进 missing（2026-10-21）：fetch_zt_pool 已 fail-fast，
-    # 静默漏记会让下游把「数据不可用」当「今日无候选」交付。
-    if "zt" in srcs or "eod_zt" in srcs:
-        try:
-            zt_pool = fetch_zt_pool(date)
-        except Exception as e:
-            zt_pool = []
-            logger.warning("[MktScreen] 涨停池源失败: %s", e)
-            missing.append(f"涨停池源失败: {type(e).__name__}: {e}")
-        for s in zt_pool or []:
-            code = str(s.get("stock_code", "") or "")
-            if not code:
-                continue
-            days = int(s.get("continuous_zt_days", 1) or 1)
-            zt_time = s.get("zt_time", "") or ""
-            row = {
-                "code": code, "name": s.get("stock_name", ""),
-                "reason": s.get("reason", ""), "continuous_days": days,
-                "zt_time": zt_time, "seal_amount": s.get("seal_amount", 0),
-                "change_pct": None, "turnover_pct": s.get("turnover_rate", 0),
-            }
-            if "zt" in srcs and days >= 2:
-                row["source"] = "连板"
-                continuous_board.append(row)
-                _put(code, row)
-            if "eod_zt" in srcs and ":" in zt_time:
-                try:
-                    hh, mm = zt_time.split(":")[:2]
-                    if int(hh) == 14 and int(mm) >= 30:
-                        row2 = dict(row, source="尾盘封板")
-                        eod_zt.append(row2)
-                        _put(code, row2)
-                except (ValueError, IndexError):
-                    pass
-
-    # ── 龙回头 ──
-    if "dragon" in srcs:
-        try:
-            dragon_pullback = scan_dragon_pullback(date) or []
-        except Exception as e:
-            dragon_pullback = []
-            logger.warning("[MktScreen] 龙回头源失败: %s", e)
-            missing.append(f"龙回头源失败: {type(e).__name__}: {e}")
-        for s in dragon_pullback:
-            _put(str(s.get("code", "")), {
-                "code": str(s.get("code", "")), "name": s.get("name", ""),
-                "source": "龙回头", "reason": s.get("reason", ""),
-                "pullback_signals": s.get("signals", []),
-                "pullback_pct": s.get("pullback_pct"),
-                "strength_score": s.get("strength_score"),
-                "change_pct": None, "turnover_pct": s.get("turnover_pct", 0),
-            })
-
-    # ── 当日热点题材股 ──
+    # ── 当日热点题材股（题材命中线索 + 候选，不作追高特权）──
     main_themes: List = []
     if "hot" in srcs:
         try:
@@ -701,7 +656,7 @@ def candidate_pool(
                     "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
                 })
 
-    # ── 条件搜索（含 recent_zt）──
+    # ── 条件搜索（支撑/资金/趋势结构，非连板追高）──
     if "search" in srcs and qs:
         for q in qs:
             try:
@@ -722,8 +677,158 @@ def candidate_pool(
                     "change_pct": s.get("change_pct") or s.get("pct_change"),
                     "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
                 })
-    elif "recent_zt" in srcs:
-        missing.append("recent_zt 需要 queries（近N日涨停靠 search_stocks 表达）")
+
+    # ── 池底补采（2026-10-28）：hot 在涨停潮里几乎全是封板，search 默认词若
+    #    命中偏少，池子会被「19 涨停 + 1 ST」吃光。pool < 门槛时自动追加更宽
+    #    过滤词，目标是**可买**候选，不是封板名单。
+    _POOL_FLOOR = 40
+    if "search" in srcs and len(pool) < _POOL_FLOOR:
+        tried = set(qs)
+        for q in _QUERY_EXPAND:
+            if q in tried:
+                continue
+            tried.add(q)
+            try:
+                res = call_tool("search_stocks", query=q, source="eastmoney",
+                                top_n=int(search_top_n))
+            except Exception as e:
+                missing.append(f"条件搜索扩池[{q}]: {type(e).__name__}: {e}")
+                continue
+            stocks = (res or {}).get("stocks", []) if isinstance(res, dict) else []
+            if isinstance(res, dict) and res.get("error") and not stocks:
+                missing.append(f"条件搜索扩池[{q}]: {res.get('error')}")
+            for s in stocks:
+                code = str(s.get("code", "") or s.get("symbol", "") or "")
+                if len(code) != 6:
+                    continue
+                _put(code, {
+                    "code": code, "name": s.get("name", ""), "source": "条件搜索",
+                    "search_query": q, "reason": s.get("reason", ""),
+                    "change_pct": s.get("change_pct") or s.get("pct_change"),
+                    "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
+                })
+            if len(pool) >= _POOL_FLOOR:
+                break
+        # 真空池（0 只）走下方交易日历标注，不写「偏少」——否则会污染
+        # 「全源成功真空」契约（2026-10-21 missing==[] 才是真实空候选）。
+        if 0 < len(pool) < _POOL_FLOOR:
+            missing.append(
+                f"池底补采后仍偏少: pool={len(pool)}（<{_POOL_FLOOR}）"
+                f"——若大半为封板/ST，属盘面结构，不是数据故障")
+
+    # ── 人气榜（flow）：关注度/资金聚集线索，**不是**涨停池 ──
+    if "flow" in srcs:
+        try:
+            hr = call_tool("get_hot_rank", top_n=50) or {}
+            hr_stocks = hr.get("stocks") if isinstance(hr, dict) else None
+            if isinstance(hr, dict) and hr.get("error") and not hr_stocks:
+                missing.append(f"人气榜源失败: {hr.get('error')}")
+            for s in hr_stocks or []:
+                code = str(s.get("code") or s.get("stock_code") or "")
+                if len(code) != 6:
+                    continue
+                _put(code, {
+                    "code": code, "name": s.get("name") or s.get("stock_name", ""),
+                    "source": "人气榜", "reason": s.get("reason") or "",
+                    "change_pct": s.get("change_pct"),
+                    "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
+                })
+        except Exception as e:
+            logger.warning("[MktScreen] 人气榜源失败: %s", e)
+            missing.append(f"人气榜源失败: {type(e).__name__}: {e}")
+
+    # ── 板块成分（sector）：主线板块内的非涨停候选 ──
+    if "sector" in srcs:
+        try:
+            hs = fetch_hot_sectors() or {}
+            sd = hs.get("data") if isinstance(hs, dict) and "data" in hs else hs
+            if isinstance(hs, dict) and hs.get("error"):
+                missing.append(f"热门板块源失败: {hs.get('error')}")
+            board_names = []
+            for s in ((sd or {}).get("industry") or [])[:6]:
+                nm = s.get("name") or s.get("board_name") or ""
+                if nm:
+                    board_names.append(nm)
+            for s in ((sd or {}).get("concept") or [])[:4]:
+                nm = s.get("name") or s.get("board_name") or ""
+                if nm:
+                    board_names.append(nm)
+            for bn in board_names[:8]:
+                try:
+                    br = call_tool("get_sector_stocks", board_name=bn, limit=15) or {}
+                    rows = br.get("data") or br.get("stocks") or []
+                    if isinstance(br, dict) and br.get("error") and not rows:
+                        missing.append(f"板块成分[{bn}]: {br.get('error')}")
+                        continue
+                    for s in rows:
+                        code = str(s.get("code") or s.get("stock_code") or s.get("symbol") or "")
+                        if len(code) != 6:
+                            continue
+                        _put(code, {
+                            "code": code, "name": s.get("name") or s.get("stock_name", ""),
+                            "source": "板块", "reason": f"板块:{bn}",
+                            "change_pct": s.get("change_pct") or s.get("pct_change"),
+                            "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
+                        })
+                except Exception as e:
+                    missing.append(f"板块成分[{bn}]: {type(e).__name__}: {e}")
+        except Exception as e:
+            logger.warning("[MktScreen] 板块成分源失败: %s", e)
+            missing.append(f"板块成分源失败: {type(e).__name__}: {e}")
+
+    # ── 本地结构扫描（scan）：不依赖东财搜索，用日线几何捞「有支撑/未追高」──
+    if "scan" in srcs:
+        try:
+            universe = list(pool.keys())
+            # 扩样：basicinfo 抽样，避免只扫到已有候选的邻居
+            try:
+                from app.utils.basicinfo_db import get_stock_basic_db
+                allc = get_stock_basic_db().market_all_codes(status="active") or []
+                step = max(1, len(allc) // 80) if allc else 1
+                universe.extend(allc[::step][:120])
+            except Exception as e:
+                missing.append(f"结构扫描全市场抽样: {type(e).__name__}: {e}")
+            seen_u = set()
+            scanned = 0
+            for code in universe:
+                if code in seen_u or len(code) != 6 or code in pool:
+                    continue
+                seen_u.add(code)
+                if scanned >= 150:
+                    break
+                scanned += 1
+                try:
+                    bars = fetch_kline(code, days=40)
+                except Exception:
+                    continue
+                if not bars or len(bars) < 20:
+                    continue
+                closes = [b["close"] for b in bars]
+                highs = [b["high"] for b in bars]
+                lows = [b["low"] for b in bars]
+                ma5 = compute_ma(closes, 5)
+                ma10 = compute_ma(closes, 10)
+                ma20 = compute_ma(closes, 20)
+                c = closes[-1]
+                m5, m10, m20 = ma5[-1], ma10[-1], ma20[-1]
+                if not (m5 and m10 and m20):
+                    continue
+                # 结构门槛（客观，不打分）：站上/贴均线 且 非 20 日极端高位
+                near = (abs(c - m5) / m5 <= 0.03 or abs(c - m10) / m10 <= 0.03
+                        or abs(c - m20) / m20 <= 0.03 or c >= m5)
+                win = min(20, len(bars))
+                hi20, lo20 = max(highs[-win:]), min(lows[-win:])
+                pos = ((c - lo20) / (hi20 - lo20) * 100) if hi20 > lo20 else 50.0
+                if not near or pos >= 92:
+                    continue
+                _put(code, {
+                    "code": code, "name": "", "source": "结构扫描",
+                    "reason": "站上/贴均线且非20日高位",
+                    "change_pct": None, "turnover_pct": None,
+                })
+        except Exception as e:
+            logger.warning("[MktScreen] 结构扫描源失败: %s", e)
+            missing.append(f"结构扫描源失败: {type(e).__name__}: {e}")
 
     # ── 批量回填实时行情（事实补全，不是筛选；2026-10-20 改分块绕过 20 只截断）──
     if fill_quote and pool:
@@ -765,7 +870,39 @@ def candidate_pool(
         except Exception as e:
             missing.append(f"行情回填: {type(e).__name__}: {e}")
 
-    candidates = list(pool.values())
+    # ── 代码规则初筛（2026-10-28）：先剔不活跃/新股，禁止「命中 1470 取前 10」──
+    # list_date 批量补全（新股判定）；缺字段不杀。
+    if pool:
+        try:
+            from app.utils.basicinfo_db import get_stock_basic_db
+            bdb = get_stock_basic_db()
+            for code_str in list(pool.keys()):
+                try:
+                    info = bdb.get_stock(code_str) or {}
+                except Exception:
+                    info = {}
+                ld = info.get("list_date") if isinstance(info, dict) else None
+                if ld and not pool[code_str].get("list_date"):
+                    pool[code_str]["list_date"] = str(ld)
+        except Exception as e:
+            missing.append(f"上市日期补全: {type(e).__name__}: {e}")
+
+    try:
+        from ._helpers import rule_prefilter, code_narrow
+        cand_list, rule_stats = rule_prefilter(list(pool.values()))
+    except Exception as e:
+        cand_list = list(pool.values())
+        rule_stats = {"error": str(e)}
+        missing.append(f"规则初筛: {type(e).__name__}: {e}")
+
+    # ── 代码收窄（2026-10-28）：400+ → ≤40，再进画像/评分；禁止取前 10 ──
+    try:
+        cand_list, narrow_stats = code_narrow(cand_list, main_themes=main_themes, max_n=40)
+    except Exception as e:
+        narrow_stats = {"error": str(e)}
+        missing.append(f"代码收窄: {type(e).__name__}: {e}")
+
+    candidates = cand_list
     if min_turnover is not None:
         lo = float(min_turnover)
         # turnover_pct 缺失（0/None）时不据此剔除 —— 避免把没有字段的票误杀
@@ -783,10 +920,10 @@ def candidate_pool(
         "sources_used": srcs,
         "queries_used": qs,
         "pool_size": len(candidates),
+        "pool_raw": len(pool),
+        "rule_prefilter": rule_stats,
+        "code_narrow": narrow_stats,
         "main_themes": main_themes,
         "candidates": candidates[:limit] if limit else candidates,
-        "continuous_board": continuous_board[:20],
-        "dragon_pullback": dragon_pullback[:20],
-        "eod_zt": eod_zt[:20],
         "missing": missing,
     }

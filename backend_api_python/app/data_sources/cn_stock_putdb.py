@@ -15,6 +15,11 @@ cn_stock_putdb — 指数 5m K线落库（coord_index → kline_index_5m）
 
   设计点:
   - 数据源一律走 coord_* 多源串行调度；
+  - 🚫 方向红线（2026-10-28 固化并达成）：本文件属 data_sources 层（最底层），
+    **禁止 import app.market_cn.***——下层不得反依赖上层。
+    本地库读写与龙虎榜内存缓存一律经同层 app/data_sources/dragon_tiger_local.py。
+    （本文件原有 3 处反依赖已全部消除：2 处改调同层本地库读，
+      1 处龙虎榜缓存刷新改调同层——缓存所有权已下沉，market_cn 侧正向读取。）
   - UPSERT 幂等，重复跑不重不漏；
   - 指数分钟/资金流不可回补只能向前攒：默认拉新浪上限 5001 根（≈104 交易日）
     滑动覆盖，断采一周仍可自动补回；资金流仅当日 240 根，每日增量即全量。
@@ -702,7 +707,7 @@ def sync_dragon_tiger(trade_date: Optional[str] = None, dry_run: bool = False,
                     trade_date, len(rows), out.get("source"))
         return result
     try:
-        from app.market_cn.dragon_tiger_store import (
+        from app.data_sources.dragon_tiger_local import (
             _ensure_tables, _get_cnstock_pool, _save_dragon_tiger,
         )
         pool = _get_cnstock_pool()
@@ -715,9 +720,10 @@ def sync_dragon_tiger(trade_date: Optional[str] = None, dry_run: bool = False,
         result["status"] = "error"
         logger.error("[putdb] 龙虎榜 %s 写入失败: %s", trade_date, e)
         return result
-    # 写入成功后刷新内存缓存（dragon_monitor 读热数据）
+    # 写入成功后刷新内存缓存（dragon_monitor 经 dragon_limit.get_dragon_tiger 读热数据）。
+    # 缓存所有权 2026-10-28 已下沉至同层 dragon_tiger_local ⇒ 同层调用，无反依赖。
     try:
-        from app.market_cn.dragon_limit import load_dragon_tiger_from_db
+        from app.data_sources.dragon_tiger_local import load_dragon_tiger_from_db
         load_dragon_tiger_from_db(trade_date)
     except Exception as e:
         logger.warning("[putdb] 龙虎榜缓存刷新失败: %s", e)

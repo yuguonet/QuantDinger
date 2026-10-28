@@ -17,10 +17,7 @@ northbound — 北向资金 (沪深港通) 持股扩展参数
 import logging
 from datetime import datetime, timedelta
 
-import requests
-
 from . import provider
-from app.data_sources.normalizer import safe_float as _safe_float
 from app.utils.trading_calendar import trading_days_count
 
 logger = logging.getLogger(__name__)
@@ -29,21 +26,6 @@ logger = logging.getLogger(__name__)
 _MAX_STALE_TRADING_DAYS = 1
 
 _cache = {}
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://data.eastmoney.com/",
-}
-
-
-def _to_secid(symbol: str) -> str:
-    """6 位代码 -> 东方财富 secid"""
-    s = symbol.strip()
-    if not s:
-        return ''
-    if s.startswith(('6', '9')):
-        return f'1.{s}'
-    return f'0.{s}'
 
 
 
@@ -90,39 +72,25 @@ def _is_north_data_stale(north_data: list, df, max_stale_days: int = _MAX_STALE_
 
 
 def _fetch_north_hold(symbol: str, days: int = 10) -> list:
-    """获取个股沪深港通持股历史数据（带缓存）。"""
+    """获取个股沪深港通持股历史数据（带缓存）。
+
+    取数经 `coord_index("northbound_stock_hold")`（provider_index/em_datacenter：
+    东财 RPT_MUTUAL_HOLD_DET，按交易日聚合后按日期降序）。
+    """
     cache_key = f"{symbol}_{days}"
     if cache_key in _cache:
         return _cache[cache_key]
 
-    secid = _to_secid(symbol)
-    if not secid:
+    if not symbol:
         return []
 
     try:
-        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-        params = {
-            "sortColumns": "HOLD_DATE",
-            "sortTypes": "-1",
-            "pageSize": days,
-            "pageNumber": 1,
-            "reportName": "RPT_MUTUAL_HOLD_DET",
-            "columns": "ALL",
-            "filter": f"(SECURITY_CODE=\"{symbol}\")",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        data = resp.json()
+        from app.data_sources.coord_index import coordinate
 
-        items = (data.get("result") or {}).get("data") or []
-        results = []
-        for item in items:
-            results.append({
-                "date": str(item.get("HOLD_DATE", ""))[:10],
-                "hold_vol": _safe_float(item.get("HOLD_NUM")),              # 持股数量 (股)
-                "hold_pct": _safe_float(item.get("HOLD_SHARES_RATIO")),     # 持股占流通比 (%)
-                "hold_vol_chg": _safe_float(item.get("HOLD_SHARES_CHG", 0)),  # 持股变化 (股, 该字段已废弃, 默认0)
-                "hold_market_value": _safe_float(item.get("HOLD_MARKET_CAP")),  # 持股市值 (元)
-            })
+        out = coordinate("northbound_stock_hold", code=symbol, days=days)
+        results = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+        if not out.get("ok"):
+            logger.debug("northbound(%s) 取数失败: %s", symbol, out.get("error"))
 
         _cache[cache_key] = results
         logger.info("northbound(%s): 获取 %d 日北向持股", symbol, len(results))

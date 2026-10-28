@@ -918,7 +918,7 @@ class StockBasicDB:
         }
 
     # ────────────────────────────────────────────────────────────────────
-    # 远程同步（多源 HTTP 下载）
+    # 远程同步（经 data_sources 基本面族）
     # ────────────────────────────────────────────────────────────────────
 
     def sync_from_remote(self) -> Dict[str, Any]:
@@ -931,31 +931,18 @@ class StockBasicDB:
         行业、市值、市盈率等详情字段不在此同步（太慢），
         按需单只补充。
 
-        ── 数据源 fallback 链 ──
+        ── 数据源 ──
 
-        源1: 巨潮资讯（优先）
-          - 接口: www.cninfo.com.cn/new/data/all_stock.json
-          - 优势: 单次请求返回全量 A 股（沪深北交所），无需分页，官方数据
-          - 字段: code→代码, zwjc→名称, category→"A股"过滤
+        统一走 app/data_sources 的 `stock_basic` kind（coord_basic）：
+        provider_basic 现有 cninfo / sina / akshare 三家，选源、排序、
+        降级、熔断全在 data_sources 层内完成；本模块只发一次调用，
+        不再自建兜底链（2026-10-28 外围收敛方案 §2）。
 
-        源2: 新浪财经（巨潮失败时）
-          - 接口: vip.stock.finance.sina.com.cn Market_Center API
-          - 优势: 纯 HTTP，无需额外依赖，稳定性好
-          - 分页: 每页 100 条，自动翻页直到无数据
-
-        源3: AkShare（兜底）
-          - 接口: akshare.stock_info_a_code_name()
-          - 优势: 数据全面，作为 fallback
-          - 依赖: 需要 pip install akshare
-
-        切换逻辑：
-          巨潮返回空或不足 100 条 → 切换到新浪
-          新浪返回空或不足 100 条 → 切换到 AkShare
-          所有源都失败 → 返回 {"source": "none", "fetched": 0}
+        失败 → 返回 {"source": "none", "fetched": 0}
 
         ── Returns ──
             {
-                "source": str,      -- 数据源名称 "cninfo" / "sina" / "akshare" / "none"
+                "source": str,      -- 实际命中的 provider 名 / "none"
                 "fetched": int,     -- 远程拉取到的条数
                 "inserted": int,    -- 成功写入 DB 的条数
                 "errors": int,      -- 失败条数
@@ -972,19 +959,8 @@ class StockBasicDB:
             logger.info("[同步] 今日已同步过，跳过")
             return {"source": "skip", "fetched": 0, "upserted": {}}
 
-        # ── 源1: 巨潮 ──
-        stocks = self._fetch_cninfo()
-        source = "cninfo"
-
-        # ── 源2: 新浪 fallback ──
-        if not stocks or len(stocks) < 100:
-            stocks = self._fetch_sina()
-            source = "sina"
-
-        # ── 源2: AkShare fallback ──
-        if not stocks or len(stocks) < 100:
-            stocks = self._fetch_akshare()
-            source = "akshare"
+        # ── 全量清单：一次 coordinate（选源/降级在 data_sources 内）──
+        stocks, source = self._fetch_stock_basic()
 
         # 所有源都失败
         if not stocks:
@@ -1073,170 +1049,38 @@ class StockBasicDB:
                 logger.warning(f"[停牌检测] 标记 suspended 失败: {e}")
                 return 0
 
-    def _fetch_cninfo(self) -> List[Dict[str, Any]]:
+    def _fetch_stock_basic(self) -> tuple:
+        """全量 A 股代码清单 —— 统一走 data_sources 基本面族 `stock_basic`。
+
+        选源/排序/降级全在 app/data_sources 内（provider_basic 现有
+        cninfo / sina / akshare 三家，按 priority 自动调度）；本模块只发
+        一次 coordinate 调用，不再自建"巨潮→新浪→AkShare"三段兜底链。
+
+        Returns:
+            (stocks, source)
+            stocks: [{"symbol": "600519", "name": "贵州茅台", "market_cn": "SH"}, ...]
+            source: 实际命中的 provider 名；失败为 "none"
         """
-        从巨潮资讯拉取全量 A 股代码列表。
+        from app.data_sources.coord_basic import coordinate
 
-        ── API 说明 ──
-
-        接口: GET http://www.cninfo.com.cn/new/data/all_stock.json
-        优势: 单次请求返回全量 A 股（沪深北交所），无需分页，官方数据
-
-        响应结构:
-          {"stockList": [{"code": "000001", "zwjc": "平安银行", "category": "A股", ...}, ...]}
-
-        过滤: category == "A股"
-
-        ── Returns ──
-            [{"symbol": "000001", "name": "平安银行", "market_cn": "SZ"}, ...]
-            失败返回 []
-        """
-        try:
-            import requests
-
-            resp = requests.get(
-                "http://www.cninfo.com.cn/new/data/all_stock.json",
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                         "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
-                timeout=20,
-            )
-            data = resp.json()
-            stocks = data.get("stockList") or []
-
-            result = []
-            for item in stocks:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("category") != "A股":
-                    continue
-                code = str(item.get("code", "")).strip()
-                name = str(item.get("zwjc", "")).strip()
-                if code and name and len(code) == 6 and code.isdigit():
-                    result.append({
-                        "symbol": code,
-                        "name": name,
-                        "market_cn": _detect_market(code),
-                    })
-
-            logger.info(f"[巨潮] 获取 A 股列表: {len(result)} 只")
-            return result
-        except Exception as e:
-            logger.warning(f"[巨潮] 获取 A 股列表失败: {e}")
-            return []
-
-    def _fetch_sina(self) -> List[Dict[str, Any]]:
-        """
-        从新浪财经拉取全量 A 股代码列表（备用源）。
-
-        ── API 说明 ──
-
-        接口: GET http://vip.stock.finance.sina.com.cn/quotes_service/
-              api/json_v2.php/Market_Center.getHQNodeData
-        参数:
-          page=1      页码
-          num=100     每页条数（API 实际上限 100）
-          sort=symbol 按代码排序
-          asc=1       升序
-          node=hs_a   沪深 A 股 + 北交所
-          fields=symbol,code,name  只取需要的字段
-
-        响应结构:
-          [{"symbol":"sh600519", "code":"600519", "name":"贵州茅台", ...}, ...]
-
-        ── Returns ──
-            [{"symbol": "600519", "name": "贵州茅台", "market_cn": "SH"}, ...]
-            失败返回 []
-        """
-        try:
-            import requests
-
-            result = []
-            page = 1
-            while True:
-                resp = requests.get(
-                    "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-                    "Market_Center.getHQNodeData",
-                    params={
-                        "page": page,
-                        "num": 100,
-                        "sort": "symbol",
-                        "asc": 1,
-                        "node": "hs_a",
-                        "fields": "symbol,code,name",
-                    },
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                             "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
-                    timeout=20,
-                )
-                data = resp.json()
-                if not data:
-                    break
-
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    code = str(item.get("code", "")).strip()
-                    name = str(item.get("name", "")).strip()
-                    if code and name and len(code) == 6 and code.isdigit():
-                        result.append({
-                            "symbol": code,
-                            "name": name,
-                            "market_cn": _detect_market(code),
-                        })
-
-                # 新浪返回的数据少于请求数量 → 最后一页
-                if len(data) < 100:
-                    break
-                page += 1
-
-            logger.info(f"[新浪] 获取 A 股列表: {len(result)} 只")
-            return result
-        except Exception as e:
-            logger.warning(f"[新浪] 获取 A 股列表失败: {e}")
-            return []
-
-    def _fetch_akshare(self) -> List[Dict[str, Any]]:
-        """
-        从 AkShare 拉取全量 A 股代码列表（兜底源）。
-
-        AkShare 是开源金融数据接口库，底层也是爬取东财/新浪等。
-        stock_info_a_code_name() 返回 DataFrame，含 code 和 name 两列。
-
-        ── 限流 ──
-
-        调用前通过 get_akshare_limiter().wait() 排队。
-        AkShare 底层会发 HTTP 请求，需要限流避免被封。
-
-        ── Returns ──
-            [{"symbol": "600519", "name": "贵州茅台", "market_cn": "SH"}, ...]
-            失败返回 []
-        """
-        try:
-            import akshare as ak
-            from app.data_sources.rate_limiter import get_akshare_limiter
-
-            get_akshare_limiter().wait()
-            df = ak.stock_info_a_code_name()
-            if df is None or df.empty:
-                return []
-
-            result = []
-            for _, row in df.iterrows():
-                code = str(row.get("code", "")).strip()
-                name = str(row.get("name", "")).strip()
-                # 过滤无效数据
-                if code and name and len(code) == 6 and code.isdigit():
-                    result.append({
-                        "symbol": code,
-                        "name": name,
-                        "market_cn": _detect_market(code),
-                    })
-
-            logger.info(f"[AkShare] 获取 A 股列表: {len(result)} 只")
-            return result
-        except Exception as e:
-            logger.warning(f"[AkShare] 获取 A 股列表失败: {e}")
-            return []
+        out = coordinate("stock_basic")
+        rows = (out.get("data") or {}).get("rows") or []
+        stocks = []
+        for r in rows:
+            code = str(r.get("code") or "").strip()
+            name = str(r.get("name") or "").strip()
+            if code and name and len(code) == 6 and code.isdigit():
+                stocks.append({
+                    "symbol": code,
+                    "name": name,
+                    "market_cn": _detect_market(code),
+                })
+        if not out.get("ok") or not stocks:
+            logger.warning("[stock_basic] 拉取失败: %s", out.get("error"))
+            return [], "none"
+        logger.info("[stock_basic] 获取 A 股列表: %d 只（source=%s）",
+                    len(stocks), out.get("source"))
+        return stocks, out.get("source") or "none"
 
     # ────────────────────────────────────────────────────────────────────
     # 详情补充（按需单只，非全量同步）

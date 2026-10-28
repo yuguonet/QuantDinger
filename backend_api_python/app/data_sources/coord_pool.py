@@ -62,6 +62,11 @@ POOL_CAPS: Dict[str, CapSpec] = {
     "broken_board_pool": _spec("broken_board_pool", ("trade_date",),
                                "QD_EXT_TIMEOUT_BROKEN_BOARD_POOL"),
     "hot_rank": _spec("hot_rank", (), "QD_EXT_TIMEOUT_HOT_RANK"),
+    # em_stock_search: 东财智能选股（自然语言关键词 → 股票列表，全仓唯一真源）。
+    # timeout=30: 上游是 LLM 式语义检索，冷查询常见 3~10s。
+    "em_stock_search": CapSpec("em_stock_search", "sequential",
+                               ("keyword", "page_size", "page_no"),
+                               "QD_EXT_TIMEOUT_EM_STOCK_SEARCH", is_rows, timeout=30.0),
 }
 
 

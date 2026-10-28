@@ -52,7 +52,7 @@ def _build_gbk_lines(codes_with_price):
 
 
 def test_tencent_index_quote_codes_batch(monkeypatch):
-    """codes=[...] 单 HTTP 多股：返回条数=码数，URL 含全部逗号拼码，手→股换算。"""
+    """codes=[...] 单 HTTP 多股：返回条数=码数，URL 含全部逗号拼码，单位口径正确。"""
     opener = _fake_urlopen(_build_gbk_lines([("000001", 3200.5), ("399006", 2100.0)]))
     monkeypatch.setattr(urllib.request, "urlopen", opener)
     from app.data_sources.provider_index.tencent import fetch_index_quote
@@ -61,7 +61,10 @@ def test_tencent_index_quote_codes_batch(monkeypatch):
     assert len(rows) == 2
     assert {r["code"] for r in rows} == {"000001", "399006"}
     r0 = next(r for r in rows if r["code"] == "000001")
-    assert r0["volume"] == pytest.approx(12345600.0)        # 手 → 股
+    # 2026-10-28 实测标定（sh000001: v36=417789532 ≈ 4.18 亿手、v37=67241440 万元）：
+    # 腾讯 v[36] 本身即"手"，**不再 ×100 转股**；v[37] 为"万元"，须 ×1e4 得元。
+    assert r0["volume"] == pytest.approx(123456.0)          # 手（原值透传）
+    assert r0["amount"] == pytest.approx(500000 * 10000.0)  # 万元 → 元
     assert "sh000001" in opener.captured["url"] and "sz399006" in opener.captured["url"]
 
 

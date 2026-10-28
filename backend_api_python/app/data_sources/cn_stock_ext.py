@@ -3,6 +3,11 @@
 cn_stock_ext — 指数扩展数据源（kline_index_5m 底仓的读/聚合层）
 
 ═══════════════════════════════════════════════════════════════
+  🚫 方向红线（2026-10-28 固化）：本文件属 data_sources 层（最底层），
+     **禁止 import app.market_cn.***——下层不得反依赖上层。
+     远端取数一律走 coord_* / provider_*；本地库读一律走同层 *_local 模块
+     （龙虎榜/热榜：app/data_sources/dragon_tiger_local.py）。
+
   设计思路（作业抄 cn_stock.py：本地优先 + 闸门 + 远端兜底）：
 
   1. 底仓 = kline_index_5m（5m、股、bar 结束时刻 09:35 起、含 up/down_count）。
@@ -723,7 +728,7 @@ def index_fflow(code: str = "000300", days: int = 800,
 def lhb(trade_date: str = "", stock_code: str = "", days: int = 30) -> List[Dict[str, Any]]:
     """龙虎榜事件（名单型数据，不 OHLVC 化）。hub.lhb 同构契约。
 
-    本地 dragon_tiger_store 优先；空窗/缺日时 coord_pool("dragon_tiger") 兜底。
+    本地 dragon_tiger_local 优先；空窗/缺日时 coord_pool("dragon_tiger") 兜底。
 
     Returns:
         list[dict]: 龙虎榜事件行（含 stock_code/stock_name/trade_date/net_amount 等）；
@@ -738,7 +743,7 @@ def lhb(trade_date: str = "", stock_code: str = "", days: int = 30) -> List[Dict
     若策略真消费本通道, 须 data_needs 声明加 "lhb"。
     """
     try:
-        from app.market_cn.dragon_tiger_store import query_dragon_tiger
+        from app.data_sources.dragon_tiger_local import query_dragon_tiger
         rows = query_dragon_tiger(trade_date=trade_date, stock_code=stock_code, days=days)
     except Exception as e:
         logger.warning("[cn_stock_ext] 龙虎榜本地读取失败: %s", e)

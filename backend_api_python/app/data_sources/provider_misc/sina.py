@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
-"""provider_misc —— 交易日历（委托 app.utils，允许）+ 个股日级资金流（新浪，AST 抽取）。"""
+"""provider_misc / sina —— 个股资金流（新浪 lscjfb 日级四档 + zjlrqs 当日近似）。"""
 from __future__ import annotations
 
 import time
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from app.data_sources.rate_limiter import get_akshare_limiter
 from app.utils.logger import get_logger
-from app.utils import trading_calendar
 
 logger = get_logger(__name__)
 
@@ -96,17 +95,49 @@ def get_stock_daily_flow(daima: str) -> List[Dict]:
     return rows
 
 
-def fetch_trading_calendar(date: str = "") -> Dict[str, Any]:
-    """交易日历：委托 `app.utils.trading_calendar`（用户裁定允许的基础接口）。"""
-    return {"object": {
-        "date": date,
-        "is_trading_day": trading_calendar.is_trading_day(date) if date
-        else trading_calendar.is_trading_day_today(),
-    }}
-
-
 def fetch_stock_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
-    return {"rows": get_stock_daily_flow(to_daima(code))[: max(1, days)]}
+    """近 N 日日级四档净额（元）。
+
+    `get_stock_daily_flow` 返回**升序**（旧→新）全历史，故取尾部 N 条
+    = 最近 N 个交易日（取头部会拿到上市初期的最老 N 条，2026-10-28 修正）。
+    """
+    rows = get_stock_daily_flow(to_daima(code))
+    return {"rows": rows[-max(1, int(days)):] if rows else []}
+
+
+_ZJLRQS_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+               "json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs")
+
+
+def fetch_stock_flow_rt(code: str) -> Dict[str, Any]:
+    """当日个股资金流（新浪 zjlrqs，取最新一条日级记录）。
+
+    该接口只有两个量：`netamount`（四档净额总和）与 `r0_net`（超大单净额），
+    **没有**大/中/小拆分，也推不出"主力=超大+大"。
+
+    ⚠ 槽位沿用历史约定（2026-10-20 已在日级路径纠正，实时路径未动）：
+        main_net  = netamount（四档总和，**不是**主力）
+        large_net = r0_net（实际是超大单，槽位名叫大单）
+        small/mid/super = 0
+      这是"近似映射"而非真实四档，改口径会改变 agent 可见数值，需单独拍板。
+
+    返回 {"rows": [{time, main_net, small_net, mid_net, large_net, super_net}]}。
+    """
+    data = _get_json(_ZJLRQS_URL, params={
+        "page": 1, "num": 1, "sort": "opendate", "asc": 0, "daima": to_daima(code),
+    })
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("新浪 zjlrqs 返回空（%s）" % code)
+    row = data[0]
+    main_net = float(row.get("netamount") or 0)
+    return {"rows": [{
+        "time": str(row.get("opendate", "") or ""),
+        "main_net": main_net,
+        "small_net": 0.0,
+        "mid_net": 0.0,
+        "large_net": float(row.get("r0_net") or 0),
+        "super_net": 0.0,
+    }]}
 
 
 from app.data_sources.provider_misc import register   # noqa: E402
@@ -119,7 +150,7 @@ class SinaMiscProvider:
     markets = {"CNStock"}
     capabilities = {
         "stock_flow_daily": fetch_stock_flow_daily,
-        "trading_calendar": fetch_trading_calendar,
+        "stock_flow_rt": fetch_stock_flow_rt,
     }
 
     def fetch(self, kind: str, **params) -> Dict[str, Any]:

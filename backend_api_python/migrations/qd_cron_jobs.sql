@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS qd_agent_cron_jobs (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(128) NOT NULL,           -- 任务名称（Agent 可读）
-    cron_expr       VARCHAR(64) NOT NULL,            -- 5 段式 cron: 分 时 日 月 周
+    cron_expr       VARCHAR(255) NOT NULL,           -- 5 段式 cron，支持 | 多段（交易时段拆分后可达 ~95 字符）
     mode            VARCHAR(16) NOT NULL DEFAULT 'prompt',  -- 'prompt' | 'function'
     prompt          TEXT,                            -- mode=prompt 时的 Agent 消息
     function_path   VARCHAR(256),                    -- mode=function 时的 Python 函数路径

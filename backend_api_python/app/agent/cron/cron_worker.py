@@ -171,6 +171,39 @@ _SCHEMA_STATEMENTS = (
 _schema_ensured = False
 
 
+# ── cron_expr 列宽（2026-10-28）──────────────────────────────
+# 建表时 cron_expr 是 VARCHAR(64)，前提是「单条 5 段式表达式」；但
+# cron_tools._parse_at_time 的「开盘期间/交易时间 + 每N分钟」分支按 A 股交易
+# 时段拆成 4~5 段 | 拼接，实测 82~93 字符 ⇒ INSERT 必抛
+# StringDataRightTruncation(64)，报错只指向列不指向语义（10-28 线上误判成
+# message/channels 字段问题）。这里加宽到 255。
+# 不放进 _SCHEMA_STATEMENTS 的原因：ALTER COLUMN TYPE 没有 IF NOT EXISTS 语法，
+# 必须先查 information_schema 再决定是否 ALTER；而 _SCHEMA_STATEMENTS 有
+# 「每条 DDL 必含 IF NOT EXISTS」的钉测断言（test_v38_cron_scheduler_20261019）。
+# 与 migrations/qd_cron_jobs_v3_20261028.sql 同源，改动须两处同步。
+_CRON_EXPR_MAXLEN = 255
+
+
+def _ensure_cron_expr_width(cur) -> bool:
+    """cron_expr 宽度不足时加宽到 _CRON_EXPR_MAXLEN。
+
+    Returns:
+        True=本次真正执行了 ALTER；False=已达标/列不存在（幂等，重复启动无副作用）
+    """
+    cur.execute(
+        "SELECT character_maximum_length AS len FROM information_schema.columns "
+        "WHERE table_name = 'qd_agent_cron_jobs' AND column_name = 'cron_expr'")
+    row = cur.fetchone()
+    cur_len = None
+    if row:
+        cur_len = row.get("len") if isinstance(row, dict) else row[0]
+    if cur_len is None or cur_len >= _CRON_EXPR_MAXLEN:
+        return False
+    cur.execute("ALTER TABLE qd_agent_cron_jobs "
+                f"ALTER COLUMN cron_expr TYPE VARCHAR({_CRON_EXPR_MAXLEN})")
+    return True
+
+
 def _ensure_cron_schema():
     """存量库幂等补列/建表（fail-open：单条失败只告警，不让启动崩）。"""
     global _schema_ensured
@@ -180,6 +213,16 @@ def _ensure_cron_schema():
         from app.utils.db import get_db_connection
         with get_db_connection() as conn:
             cur = conn.cursor()
+            # 列宽 ensure 先单独提交：下面任一语句失败会让 PG 事务进入 aborted
+            # 态、后续语句全废，这条是「告警能否创建成功」的关键，必须保证生效。
+            try:
+                if _ensure_cron_expr_width(cur):
+                    logger.info("[CronWorker] cron_expr 列宽已放宽至 %d",
+                                _CRON_EXPR_MAXLEN)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning("[CronWorker] cron_expr 列宽放宽失败(跳过): %s", e)
             for stmt in _SCHEMA_STATEMENTS:
                 try:
                     cur.execute(stmt)

@@ -14,8 +14,12 @@ logger = get_logger(__name__)
 
 
 def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dict[str, Any]:
-    """指数日K线（BaoStock query_history_k_data_plus, timeframe=1D；其余周期 NotSupported）。"""
-    from app.data_sources.normalizer import normalize_chart_timeframe
+    """指数日K线（BaoStock query_history_k_data_plus, timeframe=1D；其余周期 NotSupported）。
+
+    ⚠ 本函数所有失败分支一律 raise，不返回空信封：is_rows 只校验 rows 是 list，
+    空 rows 会被判「成功」并终止 sequential 换源（2026-10-28 1.log 事故）。
+    """
+    from app.data_sources.normalizer import normalize_chart_timeframe, split_index_code
     from app.data_sources.dispatch import NotSupported
 
     if normalize_chart_timeframe(timeframe) != "1D":
@@ -23,15 +27,19 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
     try:
         import baostock as bs
     except ImportError:
-        return {"rows": [], "error": "baostock 未安装"}
+        raise RuntimeError("baostock 未安装")
 
     # BaoStock 指数代码格式: sh.000001 / sz.399001
-    pfx = "sh" if code[:3] in ("000", "88", "99") else "sz"
-    bs_code = f"{pfx}.{code}"
+    # 旧实现 `code[:3]` 判前缀后直拼，入参带后缀时会得到 "sh.000001.SH"，
+    # baostock 库内直接报「股票代码应为9位」。
+    base, exch = split_index_code(code)
+    if not base or not exch:
+        raise ValueError("baostock index_kline 无法解析指数代码: %r" % (code,))
+    bs_code = "%s.%s" % (exch.lower(), base)
 
     lg = bs.login()
     if lg.error_code != "0":
-        return {"rows": [], "error": f"login failed: {lg.error_msg}"}
+        raise RuntimeError("baostock login failed: %s" % lg.error_msg)
 
     try:
         import datetime
@@ -46,7 +54,7 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
             adjustflag="3",  # 不复权
         )
         if rs.error_code != "0":
-            return {"rows": [], "error": rs.error_msg}
+            raise RuntimeError("baostock query failed: %s" % rs.error_msg)
 
         rows = []
         while rs.next():
@@ -66,7 +74,7 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
         return {"rows": rows[-limit:]}
     except Exception as e:
         logger.warning("[baostock] index_kline %s 失败: %s", code, e)
-        return {"rows": [], "error": str(e)}
+        raise
     finally:
         bs.logout()
 

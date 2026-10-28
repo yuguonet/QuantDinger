@@ -186,6 +186,11 @@ def get_f10_categories(code: str) -> List[Dict[str, Any]]:
         return []
 
 
+# 【不动清单 · coord 缺口】mootdx「F10 资料」/「除权除息」
+#   coord_basic 的 cn_fundamental / cn_financial 是否覆盖 F10 与除权除息尚未实测确认；
+#   未确认前不得替换（替换即可能丢字段 ⇒ 违反禁止降智红线）。
+#   收敛前须先逐字段对拍 coord_basic 输出，确认覆盖后再切；否则维持现状。
+#   见 docs/数据源外围收敛改造方案_20261028.md §3
 def get_f10_content(code: str, category: str = "", max_length: int = 50000) -> Dict[str, Any]:
     """获取 F10 指定栏目的详细内容。
 

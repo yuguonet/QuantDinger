@@ -3237,7 +3237,8 @@ json.dumps(output)
       const incoming = newData.filter(b =>
         b && b.timestamp &&
         minuteDateStr(b.timestamp) === todayStr &&
-        toNumForFilter(b.timestamp) >= session.start)
+        toNumForFilter(b.timestamp) >= session.start &&
+        toNumForFilter(b.timestamp) <= session.end)
       const existingReal = (klineData.value || []).filter(b => b && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
       if (incoming.length === 0 && existingReal.length === 0) return
 
@@ -3446,7 +3447,7 @@ json.dumps(output)
     /**
      * 分时图数据处理：
      * 1. 使用1m数据
-     * 2. 只保留当天从9:30开始的数据
+     * 2. 只保留当天交易时段内的数据 [开盘, 收盘]
      * 3. 补充成交额 turnover（供内置 AVP 均价线使用；数据多长就多长，不补齐未来时段，
      *    显示区域由 fitMinuteLineView 锁死为整个交易时段）
      */
@@ -3460,7 +3461,10 @@ json.dumps(output)
       const day = String(now.getDate()).padStart(2, '0')
       const todayStr = `${year}-${month}-${day}`
 
-      // 过滤只保留今天的数据，并且时间 >= 9:30
+      // 交易时段边界（A股 9:30-15:00 / 港股 9:30-16:00），过滤需含上下界
+      const session = getMinuteLineSession()
+
+      // 过滤只保留今天、且落在 [开盘, 收盘] 交易时段内的数据
       const todayData = rawData.filter(item => {
         const d = new Date(item.timestamp)
         const itemYear = d.getFullYear()
@@ -3471,8 +3475,9 @@ json.dumps(output)
         const minutes = d.getMinutes()
         const timeNum = hours * 100 + minutes
 
-        // 只保留今天 9:30 之后的数据
-        return dateStr === todayStr && timeNum >= 930
+        // 只在 [开盘, 收盘] 内收柱：杜绝收盘后（盘后固定价 15:00-15:30、收盘 tick 等）
+        // 越界柱混入序列，避免时间轴被迫右推、15:00 后出现一段平移数据
+        return dateStr === todayStr && timeNum >= session.start && timeNum <= session.end
       })
 
       if (todayData.length === 0) {
@@ -3484,7 +3489,9 @@ json.dumps(output)
           const fallbackData = rawData.filter(item => {
             const d = new Date(item.timestamp)
             const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-            return dateStr === lastDateStr
+            const timeNum = d.getHours() * 100 + d.getMinutes()
+            // 同样约束在 [开盘, 收盘] 内，与上界过滤一致，避免上一交易日盘后柱平移
+            return dateStr === lastDateStr && timeNum >= session.start && timeNum <= session.end
           })
           if (fallbackData.length > 0) {
             return attachMinuteTurnover(fallbackData.map(item => ({ ...item })))
@@ -5437,15 +5444,18 @@ json.dumps(output)
                 })
               })
 
-              // 分时模式：只保留当日数据，避免均价线（AVP）基于多日数据计算
+              // 分时模式：只保留当日交易时段内的数据，避免均价线（AVP）基于多日数据计算，
+              // 并杜绝收盘后越界柱混入导致 15:00 后一段平移数据
               let dataToAppend = uniqueNewData
               if (isMinuteLine.value && uniqueNewData.length > 0) {
                 const now = new Date()
                 const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+                const session = getMinuteLineSession()
                 dataToAppend = uniqueNewData.filter(item => {
                   const d = new Date(item.timestamp)
                   const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-                  return dateStr === todayStr
+                  const timeNum = d.getHours() * 100 + d.getMinutes()
+                  return dateStr === todayStr && timeNum >= session.start && timeNum <= session.end
                 })
               }
 

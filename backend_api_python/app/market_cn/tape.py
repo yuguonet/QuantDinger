@@ -1,5 +1,5 @@
 """
-五档盘口 / 当日分笔 / 历史分笔 / 个股资金流向 — mootdx + 东财
+五档盘口 / 当日分笔 / 历史分笔 / 个股资金流向
 
 功能:
   1. 五档实时行情 — 买一~买五 / 卖一~卖五 + 实时快照（最新价/涨跌/成交量等）
@@ -7,20 +7,23 @@
   3. 历史分笔成交 — 指定日期的逐笔成交明细（可用于复盘分析）
   4. 个股资金流向 — 当日分钟级 + 近120日日级
 
-数据源:
-  五档行情:  mootdx(TCP) → 腾讯财经(HTTP)
-  分笔数据:  mootdx(TCP) — 仅此一个源
-  资金流向:  分钟级 本地快照派生(主) → 新浪日级(2026-09-22 主备翻转) → 东财 push2(末级兜底,熔断)
-             日级   新浪(2026-10-14 主备翻转) → 东财 push2his(兜底,熔断)
+数据源（2026-10-28 Phase 2 收敛后）:
+  五档 / 分笔: 一律经 app/data_sources/coord_tape
+               （orderbook / ticks_today / ticks_history；mootdx·sina·tencent·eastmoney_dc
+                四源由 dispatch 排序降级，本文件不再自建"源1→源2"链）
+  资金流向:    分钟级 本地快照派生 → 新浪日级 → 东财 push2（暂留，Phase 3 收敛）
+               日级   新浪 → 东财 push2his（暂留，Phase 3 收敛）
 
-依赖: pip install mootdx
+遗留直连（未收敛，勿增用）:
+  `_get_liutongguben` 仍经 utils/mootdx_client 直连 TDX get_finance_info（万股口径），
+  改走 coord_basic 需先解决"万股 vs 股"单位对拍，单列。
 """
 from __future__ import annotations
 
 import logging
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.utils.logger import get_logger
 
@@ -33,330 +36,12 @@ logger = logging.getLogger(__name__)
 from app.utils.mootdx_client import get_client as _get_client
 
 
-def _market(code: str) -> int:
-    """股票/指数代码 → 通达信市场号。
-
-    通达信市场编码:
-      1 = 上海证券交易所（代码以 000/88/99 开头的指数，或 60xxxx 开头的股票）
-      0 = 深圳证券交易所（代码以 399 开头的指数，或 00xxxx/30xxxx 开头的股票）
-
-    注意: 此函数对指数和股票都适用，但判断逻辑略有不同。
-    这里用前3位判断，对股票来说 000 开头的会被判为上海（实际是深圳），
-    但这个函数主要服务于指数场景，股票场景请用 _secid()。
-
-    Args:
-        code: 6位代码
-
-    Returns:
-        0 或 1（通达信市场号）
-    """
-    return 1 if code[:3] in ("000", "88", "99") else 0
-
-
 # ══════════════════════════════════════════════════════════════
-#  1. 五档实时行情（双数据源降级）
+#  源表（插槽）— 已于 2026-10-28 全部清空
+#  orderbook/ticks 于 Phase C（2026-10-26）改走 coord_tape；个股资金流于
+#  2026-10-28 改走 coord_misc（stock_flow_rt / stock_flow_daily）。
+#  插槽语义现由 dispatch.py 统一保证（见 tests/test_tape_source_slot.py）
 # ══════════════════════════════════════════════════════════════
-
-def _quote_mootdx(code: str) -> Optional[Dict[str, Any]]:
-    """数据源1: mootdx 获取五档盘口 + 实时快照。
-
-    五档盘口含义:
-      买一~买五: 当前挂单买入的最高5个价位及其委托量
-      卖一~卖五: 当前挂单卖出的最低5个价位及其委托量
-      买一价 ≤ 卖一价（正常情况下买一 < 卖一，相等时有成交）
-
-    Args:
-        code: 股票/指数代码，如 "600519"、"000001"
-
-    Returns:
-        成功: {
-            code, name, price, open, high, low, last_close, change, change_percent,
-            volume, amount,
-            bid: {bid1~bid5: {price, vol}},  # 买盘五档
-            ask: {ask1~ask5: {price, vol}},  # 卖盘五档
-            source: "mootdx"
-        }
-        失败: None
-    """
-    cli = _get_client()
-    if cli is None:
-        return None
-    try:
-        df = cli.quotes(symbol=[code])
-        if df is None or df.empty:
-            return None
-        r = df.iloc[0]
-
-        price = float(r.get("price", 0))
-        last_close = float(r.get("last_close", 0))
-
-        return {
-            "code": str(r.get("code", code)),
-            "name": str(r.get("name", "")),
-            "price": price,                          # 最新价
-            "open": float(r.get("open", 0)),         # 今开
-            "high": float(r.get("high", 0)),         # 最高
-            "low": float(r.get("low", 0)),           # 最低
-            "last_close": last_close,                # 昨收
-            "change": round(price - last_close, 4),  # 涨跌额
-            "change_percent": float(r.get("percent", 0)),  # 涨跌幅(%)
-            "volume": float(r.get("vol", 0)),        # 成交量（手）
-            "amount": float(r.get("amount", 0)),     # 成交额（元）
-            # 买盘五档: bid1 为最高买价（最接近成交价），bid5 为最低买价
-            "bid": {
-                "bid1": {"price": float(r.get("bid1", 0)), "vol": float(r.get("bid_vol1", 0))},
-                "bid2": {"price": float(r.get("bid2", 0)), "vol": float(r.get("bid_vol2", 0))},
-                "bid3": {"price": float(r.get("bid3", 0)), "vol": float(r.get("bid_vol3", 0))},
-                "bid4": {"price": float(r.get("bid4", 0)), "vol": float(r.get("bid_vol4", 0))},
-                "bid5": {"price": float(r.get("bid5", 0)), "vol": float(r.get("bid_vol5", 0))},
-            },
-            # 卖盘五档: ask1 为最低卖价（最接近成交价），ask5 为最高卖价
-            "ask": {
-                "ask1": {"price": float(r.get("ask1", 0)), "vol": float(r.get("ask_vol1", 0))},
-                "ask2": {"price": float(r.get("ask2", 0)), "vol": float(r.get("ask_vol2", 0))},
-                "ask3": {"price": float(r.get("ask3", 0)), "vol": float(r.get("ask_vol3", 0))},
-                "ask4": {"price": float(r.get("ask4", 0)), "vol": float(r.get("ask_vol4", 0))},
-                "ask5": {"price": float(r.get("ask5", 0)), "vol": float(r.get("ask_vol5", 0))},
-            },
-            "source": "mootdx",
-        }
-    except Exception as e:
-        logger.warning("[mootdx] 五档行情失败(%s): %s", code, e)
-        return None
-
-
-def _quote_tencent(code: str) -> Optional[Dict[str, Any]]:
-    """数据源2: 腾讯财经获取五档盘口 + 实时快照（备用）。
-
-    腾讯接口返回的字段布局（~ 分隔，共 50+ 字段）:
-      v[1]  = 名称
-      v[3]  = 最新价    v[4]  = 昨收
-      v[5]  = 今开      v[6]  = 成交量(手)
-      v[9]  = 买一价    v[10] = 买一量    # 买盘五档: v[9]-v[18]
-      v[11] = 买二价    v[12] = 买二量
-      v[13] = 买三价    v[14] = 买三量
-      v[15] = 买四价    v[16] = 买四量
-      v[17] = 买五价    v[18] = 买五量
-      v[19] = 卖一价    v[20] = 卖一量    # 卖盘五档: v[19]-v[28]
-      v[21] = 卖二价    v[22] = 卖二量
-      v[23] = 卖三价    v[24] = 卖三量
-      v[25] = 卖四价    v[26] = 卖四量
-      v[27] = 卖五价    v[28] = 卖五量
-      v[31] = 涨跌额    v[32] = 涨跌幅(%)
-      v[33] = 最高      v[34] = 最低
-      v[36] = 成交量    v[37] = 成交额
-
-    Args:
-        code: 股票/指数代码
-
-    Returns:
-        同 _quote_mootdx 格式，source 为 "tencent"
-        失败: None
-    """
-    import urllib.request
-
-    # 添加沪深前缀
-    pfx = "sh" if _market(code) == 1 else "sz"
-    try:
-        req = urllib.request.Request(f"https://qt.gtimg.cn/q={pfx}{code}")
-        req.add_header("User-Agent", "Mozilla/5.0")
-        raw = urllib.request.urlopen(req, timeout=10).read().decode("gbk")
-    except Exception as e:
-        logger.warning("[tencent] 五档行情请求失败: %s", e)
-        return None
-
-    # 解析第一条记录（单只股票查询只有一条）
-    line = raw.strip().split(";")[0]
-    if '"' not in line:
-        return None
-
-    v = line.split('"')[1].split("~")
-    if len(v) < 50:
-        return None  # 字段不足，数据异常
-
-    price = float(v[3]) if v[3] else 0
-    last_close = float(v[4]) if v[4] else 0
-
-    return {
-        "code": code,
-        "name": v[1],
-        "price": price,
-        "open": float(v[5]) if v[5] else 0,
-        "high": float(v[33]) if v[33] else 0,
-        "low": float(v[34]) if v[34] else 0,
-        "last_close": last_close,
-        "change": float(v[31]) if v[31] else 0,
-        "change_percent": float(v[32]) if v[32] else 0,
-        "volume": float(v[36]) if v[36] else 0,
-        "amount": float(v[37]) if v[37] else 0,
-        # 买盘五档: v[9]~v[18]，奇数位=价格，偶数位=量
-        "bid": {
-            "bid1": {"price": float(v[9]) if v[9] else 0, "vol": float(v[10]) if v[10] else 0},
-            "bid2": {"price": float(v[11]) if v[11] else 0, "vol": float(v[12]) if v[12] else 0},
-            "bid3": {"price": float(v[13]) if v[13] else 0, "vol": float(v[14]) if v[14] else 0},
-            "bid4": {"price": float(v[15]) if v[15] else 0, "vol": float(v[16]) if v[16] else 0},
-            "bid5": {"price": float(v[17]) if v[17] else 0, "vol": float(v[18]) if v[18] else 0},
-        },
-        # 卖盘五档: v[19]~v[28]，奇数位=价格，偶数位=量
-        "ask": {
-            "ask1": {"price": float(v[19]) if v[19] else 0, "vol": float(v[20]) if v[20] else 0},
-            "ask2": {"price": float(v[21]) if v[21] else 0, "vol": float(v[22]) if v[22] else 0},
-            "ask3": {"price": float(v[23]) if v[23] else 0, "vol": float(v[24]) if v[24] else 0},
-            "ask4": {"price": float(v[25]) if v[25] else 0, "vol": float(v[26]) if v[26] else 0},
-            "ask5": {"price": float(v[27]) if v[27] else 0, "vol": float(v[28]) if v[28] else 0},
-        },
-        "source": "tencent",
-    }
-
-
-# ══════════════════════════════════════════════════════════════
-#  2. 当日分笔成交
-# ══════════════════════════════════════════════════════════════
-
-def _ticks_today_mootdx(code: str, limit: int = 2000) -> Optional[List[Dict[str, Any]]]:
-    """mootdx: 获取当日分笔成交明细。
-
-    分笔(tick)是最低粒度的成交数据，每一条代表一笔实际发生的交易。
-    非交易时段（收盘后、节假日）此接口可能返回空数据。
-
-    Args:
-        code: 股票代码，如 "600519"
-        limit: 最大返回条数，默认 2000（通达信单次上限）
-
-    Returns:
-        成功: [{
-            time: "2025-01-15 09:30:05",  # 成交时间
-            price: 1800.00,               # 成交价格
-            vol: 100,                     # 成交量（股）
-            amount: 180000.00,            # 成交金额（元）
-            buy_sell: "0"                 # 买卖方向: "0"=主动买 "1"=主动卖 "2"=中性
-        }, ...]
-        失败: None
-    """
-    cli = _get_client()
-    if cli is None:
-        return None
-    try:
-        mkt = _market(code)
-        # get_transaction_data: 通达信分笔成交接口
-        # 参数: 市场号, 代码, start(0=从头), count(最大2000)
-        result = cli.client.get_transaction_data(mkt, code, 0, min(limit, 2000))
-        if not result:
-            return None
-
-        from mootdx.utils import to_data
-        df = to_data(result)
-        if df is None or df.empty:
-            return None
-
-        out = []
-        for _, r in df.iterrows():
-            out.append({
-                "time": str(r.get("datetime", r.get("time", ""))),
-                "price": float(r.get("price", 0)),
-                "vol": float(r.get("vol", 0)),          # 成交量
-                "amount": float(r.get("amount", 0)),     # 成交金额
-                "buy_sell": str(r.get("buyorsell", "")), # "0"=买 "1"=卖 "2"=中性
-            })
-        logger.info("[mootdx] 当日分笔 %s: %d 条", code, len(out))
-        return out
-    except Exception as e:
-        logger.warning("[mootdx] 当日分笔失败(%s): %s", code, e)
-        return None
-
-
-# ══════════════════════════════════════════════════════════════
-#  3. 历史分笔成交
-# ══════════════════════════════════════════════════════════════
-
-def _ticks_history_mootdx(code: str, date: str, limit: int = 2000) -> Optional[List[Dict[str, Any]]]:
-    """mootdx: 获取指定日期的历史分笔成交。
-
-    用于复盘分析：查看某天的逐笔成交，判断主力行为、大单异动等。
-
-    Args:
-        code: 股票代码，如 "600519"
-        date: 日期，格式 "YYYYMMDD" 或 "YYYY-MM-DD"
-        limit: 最大返回条数，默认 2000
-
-    Returns:
-        同 _ticks_today_mootdx 格式
-        失败: None
-    """
-    cli = _get_client()
-    if cli is None:
-        return None
-    try:
-        mkt = _market(code)
-        date_str = date.replace("-", "")  # 统一为 YYYYMMDD 格式
-        # get_history_transaction_data: 通达信历史分笔接口
-        # 参数: 市场号, 代码, start, count, 日期(整数)
-        result = cli.client.get_history_transaction_data(mkt, code, 0, min(limit, 2000), int(date_str))
-        if not result:
-            return None
-
-        from mootdx.utils import to_data
-        df = to_data(result)
-        if df is None or df.empty:
-            return None
-
-        out = []
-        for _, r in df.iterrows():
-            out.append({
-                "time": str(r.get("datetime", r.get("time", ""))),
-                "price": float(r.get("price", 0)),
-                "vol": float(r.get("vol", 0)),
-                "amount": float(r.get("amount", 0)),
-                "buy_sell": str(r.get("buyorsell", "")),
-            })
-        logger.info("[mootdx] 历史分笔 %s %s: %d 条", code, date, len(out))
-        return out
-    except Exception as e:
-        logger.warning("[mootdx] 历史分笔失败(%s, %s): %s", code, date, e)
-        return None
-
-
-# ══════════════════════════════════════════════════════════════
-#  对外接口 — 分笔相关
-# ══════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════
-#  源表（插槽）— fund_flow_daily 仍用；orderbook/ticks 于 Phase C
-#  （2026-10-26）改走 coord_tape 多源调度，原槽表已无人消费，2026-10-27 删除
-#  （插槽语义现由 dispatch.py 统一保证，见 tests/test_tape_source_slot.py）
-# ══════════════════════════════════════════════════════════════
-
-
-def _first_ok(kind: str, candidates, *args):
-    """按顺序尝试候选源，返回 (data, source_name, last_error)。
-
-    ★ 判成功的标准不只是"真值"：`{"code": ..., "error": ...}` 是**真值但失败**。
-      原实现用 `if sina:` 判成功，会把东财的失败 dict 当成结果直接返回。
-      这里显式识别 `error` 键，并把它记为 last_error 交给调用方。
-
-    与 v3 §3.2 对齐的语义：
-      · 源抛异常 → 记 warning，试下一个（异常不再中断整条链）；
-      · 源返回错误 dict → 记 warning + last_error，试下一个；
-      · 源返回空 → 试下一个（盘口/分笔没有"确认无数据"的稳定判据）；
-      · 命中时打 debug，便于 trace 归因"这次是谁给的数"。
-    """
-    last_error = ""
-    for name, fn in candidates:
-        try:
-            data = fn(*args)
-        except Exception as e:
-            last_error = str(e)
-            logger.warning("[tape] %s 源 %s 异常: %s", kind, name, e)
-            continue
-        if isinstance(data, dict) and data.get("error"):
-            last_error = str(data.get("error"))
-            logger.warning("[tape] %s 源 %s 返回错误: %s", kind, name, last_error)
-            continue
-        if data:
-            logger.debug("[tape] %s 命中 %s", kind, name)
-            return data, name, ""
-        logger.debug("[tape] %s 源 %s 无数据，试下一个", kind, name)
-    return None, "", last_error
 
 
 def get_order_book(code: str) -> Dict[str, Any]:
@@ -545,13 +230,13 @@ def get_fund_flow_from_ticks(code: str, limit: int = 2000) -> Dict[str, Any]:
         >>> if flow.get("main_net", 0) > 0:
         ...     print(f"主力净流入 {flow['main_net']/10000:.0f} 万")
     """
-    ticks = _ticks_today_mootdx(code, limit)
+    ticks = get_ticks_today(code, limit)
     if not ticks:
-        return {"code": code, "source": "mootdx", "error": "非交易时段或无数据"}
+        return {"code": code, "source": "ticks", "error": "非交易时段或无数据"}
 
     result = _calc_flow_from_ticks(ticks)
     result["code"] = code
-    result["source"] = "mootdx"
+    result["source"] = "ticks"
     return result
 
 
@@ -571,14 +256,14 @@ def get_fund_flow_history_from_ticks(code: str, date: str, limit: int = 2000) ->
     Example:
         >>> flow = get_fund_flow_history_from_ticks("600519", "2025-01-15")
     """
-    ticks = _ticks_history_mootdx(code, date, limit)
+    ticks = get_ticks_history(code, date, limit)
     if not ticks:
-        return {"code": code, "date": date, "source": "mootdx", "error": "无数据"}
+        return {"code": code, "date": date, "source": "ticks", "error": "无数据"}
 
     result = _calc_flow_from_ticks(ticks)
     result["code"] = code
     result["date"] = date
-    result["source"] = "mootdx"
+    result["source"] = "ticks"
     return result
 
 
@@ -587,29 +272,6 @@ def get_fund_flow_history_from_ticks(code: str, date: str, limit: int = 2000) ->
 # 通用 User-Agent，模拟浏览器请求
 # 2026-09-14：截断 UA（缺 "(KHTML, like Gecko)…" 段）会被东财服务端直接掐连接
 # （hot_sectors 实测：截断 UA 必 RemoteDisconnected，完整 UA 稳定返回），统一换完整版。
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-
-def _secid(code: str) -> str:
-    """股票代码 → 东财 secid 编码。
-
-    东财接口需要 secid 格式: "市场号.代码"
-      - 上海股票: "1.600519"（60xxxx 开头）
-      - 深圳股票: "0.000858"（00xxxx/30xxxx 开头）
-
-    注意: 与通达信的市场号规则相同但格式不同。
-
-    Args:
-        code: 6位股票代码
-
-    Returns:
-        "1.代码" 或 "0.代码"
-    """
-    # 60开头 = 上海(1)，其余(00/30开头) = 深圳(0)
-    return f"1.{code}" if code.startswith("6") else f"0.{code}"
-
-
 def _safe_float(v) -> float:
     """安全的浮点数转换，异常时返回 0.0。
 
@@ -716,10 +378,10 @@ def get_realtime_turnover(code: str) -> Dict[str, Any]:
         >>> t = get_realtime_turnover("600519")
         >>> print(f"换手率: {t['turnover_rate']:.2f}%")
     """
-    # Step 1: 获取实时行情（含成交量）
-    quote = _quote_mootdx(code) or _quote_tencent(code)
-    if not quote:
-        return {"code": code, "error": "获取实时行情失败"}
+    # Step 1: 获取实时行情（含成交量）—— 经 coord_tape，多源降级由 data_sources 层调度
+    quote = get_order_book(code)
+    if quote.get("error"):
+        return {"code": code, "error": quote["error"]}
 
     volume = quote.get("volume", 0)  # 成交量（股）
     if volume <= 0:
@@ -812,19 +474,22 @@ def get_realtime_main_flow(code: str) -> Dict[str, Any]:
     ef = get_fund_flow_realtime(code)
     if not ef.get("error") and ef.get("data"):
         # 汇总主力净流入
-        total_main = sum(r.get("main_net", 0) for r in ef["data"])
-        last = ef["data"][-1] if ef["data"] else {}
+        # ⚠ 四档净额可能是 **None 而非 0**：本地快照派生源（fund_flow_local，
+        #   量价方向法）只能算主力方向，四档不可知就显式给 None（宁缺勿假）。
+        #   直接 sum 会 TypeError（None + int）—— 2026-10-28 接线时实测踩到，
+        #   此处按"缺失即 0 计入合计、但不改写单点数值"处理。
+        total_main = sum((r.get("main_net") or 0) for r in ef["data"])
         result = {
             "main_net": round(total_main, 2),
-            "super_net": round(sum(r.get("super_net", 0) for r in ef["data"]), 2),
-            "large_net": round(sum(r.get("large_net", 0) for r in ef["data"]), 2),
-            "mid_net": round(sum(r.get("mid_net", 0) for r in ef["data"]), 2),
-            "small_net": round(sum(r.get("small_net", 0) for r in ef["data"]), 2),
+            "super_net": round(sum((r.get("super_net") or 0) for r in ef["data"]), 2),
+            "large_net": round(sum((r.get("large_net") or 0) for r in ef["data"]), 2),
+            "mid_net": round(sum((r.get("mid_net") or 0) for r in ef["data"]), 2),
+            "small_net": round(sum((r.get("small_net") or 0) for r in ef["data"]), 2),
             "points": ef.get("points", 0),
         }
-        source = "eastmoney"
+        source = ef.get("source") or "eastmoney"
 
-    # 数据源2: mootdx 分笔计算（精度高，仅交易时段）
+    # 数据源2: 分笔派生（精度高，仅交易时段；分笔源由 coord_tape 多源调度）
     if result is None:
         mf = get_fund_flow_from_ticks(code)
         if not mf.get("error"):
@@ -838,13 +503,15 @@ def get_realtime_main_flow(code: str) -> Dict[str, Any]:
                 "total_sell": mf.get("total_sell", 0),
                 "ticks_count": mf.get("ticks_count", 0),
             }
-            source = "mootdx"
+            source = "ticks"
 
     if result is None:
         return {"code": code, "error": "所有数据源获取主力资金流均失败"}
 
-    # 获取行情快照（最新价、涨跌幅）
-    quote = _quote_mootdx(code) or _quote_tencent(code)
+    # 获取行情快照（最新价、涨跌幅）—— 经 coord_tape，多源由 data_sources 层调度
+    quote = get_order_book(code)
+    if quote.get("error"):
+        quote = None
 
     main_net = result["main_net"]
     return {
@@ -909,9 +576,9 @@ def get_realtime_snapshot(code: str) -> Dict[str, Any]:
         >>> s = get_realtime_snapshot("600519")
         >>> print(f"{s['name']} {s['price']} 换手{s['turnover_rate']:.2f}% 主力{s['main_net_yi']:.2f}亿")
     """
-    # 行情 + 五档
-    quote = _quote_mootdx(code) or _quote_tencent(code)
-    if not quote:
+    # 行情 + 五档 —— 经 coord_tape，多源由 data_sources 层调度
+    quote = get_order_book(code)
+    if quote.get("error"):
         return {"code": code, "error": "获取行情失败"}
 
     # 换手率
@@ -978,305 +645,32 @@ def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("[fund_flow] 本地快照派生失败(%s): %s", code, e)
 
-    # 2) 新浪日级资金流（主外部源，无反爬，2026-09-22 主备翻转）
-    sina = _fund_flow_sina(code)
-    if sina:
-        return sina
+    # 2) 远端：coord_misc("stock_flow_rt") —— 新浪 1 点近似(优先) → 东财分钟级 240 点
+    from app.data_sources.coord_misc import coordinate as _coord_misc
+    out = _coord_misc("stock_flow_rt", code=code)
+    rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+    if not out.get("ok") or not rows:
+        logger.warning("[fund_flow] 远端资金流失败(%s): %s", code, out.get("error"))
+        return {"code": code, "error": out.get("error") or "获取失败", "source": ""}
 
-    # 3) 东财 push2 远程兜底（熔断期内自动跳过）
-    return _fund_flow_eastmoney(code)
-
-
-# ── 个股资金流向: 新浪日级主源 + 东财 push2 兜底（2026-09-22 主备翻转）──
-# 与 hot_sectors（2026-09-21 M.8）同款原则：新浪无反爬、稳定，东财 push2 会
-# 对被连续请求的 IP 掐连接（RemoteDisconnected）。故外部源优先走新浪；
-# push2 仅在 sina 不可用且不在熔断期内才试，失败即熔断（_PUSH2_BLOCK_SECONDS
-# 内不再碰 push2）。note: sina 仅日级（ssl_qsfx_zjlrqs），无分钟级；minutes
-# 级仍由本地快照派生或 push2 补充。
-import threading as _threading
-_push2_lock = _threading.Lock()
-_push2_blocked_until = 0.0
-_PUSH2_BLOCK_SECONDS = 600
-
-
-def _sina_moneyflow_rows(code: str, num: int) -> Optional[List[Dict[str, Any]]]:
-    """新浪日级资金流原始行（num 条，opendate 降序）。失败/空返回 None。
-
-    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
-    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
-    字段实证 (2026-10-20): netamount=四档净额总和(sum(r*_net), 全档净额, != 主力),
-          r0_net=超大单净额, turnover=换手率。该接口无大/中/小拆分, 也推不出主力。
-    日级四档拆解已迁 lscjfb (_fund_flow_sina_daily), 本函数仅剩实时路径在用。
-    抽成单函数供分钟级(_fund_flow_sina)与日级(_fund_flow_sina_daily)共用，
-    避免 URL/参数/headers 两处漂移。
-    """
-    import requests
-    code_num = code.split(".")[0]
-    daima = ("sh" if code_num.startswith("6") else "sz") + code_num
-    url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
-           "json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs")
-    params = {"page": 1, "num": max(1, int(num)), "sort": "opendate",
-              "asc": 0, "daima": daima}
-    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
-        return d if isinstance(d, list) and d else None
-    except Exception as e:
-        logger.debug("[sina] 资金流行获取失败(%s): %s", code, e)
-        return None
-
-
-def _fund_flow_sina(code: str) -> Optional[Dict[str, Any]]:
-    """当日个股资金流向（新浪日级，主源，无反爬）。
-
-    接口: vip.stock.finance.sina.com.cn/.../MoneyFlow.ssl_qsfx_zjlrqs
-    返回最新一条日级资金流。字段实证: netamount=四档净额总和(非主力),
-    r0_net=超大单净额, turnover=换手率; 本接口无大/中/小拆分。
-
-    Returns:
-        {code, points:1, total_main_net, data:[{time, main_net, small_net,
-             mid_net, large_net, super_net}]}（近似映射，小/中单为 0）
-        失败: None（不抛异常，交给下级兜底）
-    """
-    d = _sina_moneyflow_rows(code, 1)
-    if not d:
-        return None
-    row = d[0]
-    t = row.get("opendate", "") or ""
-    main_net = _safe_float(row.get("netamount"))
+    total_main = sum(r.get("main_net") or 0 for r in rows)
     return {
         "code": code,
-        "points": 1,
-        "total_main_net": round(main_net, 2),
-        "data": [{
-            "time": t,
-            "main_net": main_net,
-            "small_net": 0.0,
-            "mid_net": 0.0,
-            # 新浪 r0_net = 超大单净额。历史槽位约定: 超大单值放 large_net 槽位
-            # (2026-10-20 日级已迁 lscjfb 改为正确槽位, 本实时路径保留旧约定)。
-            "large_net": _safe_float(row.get("r0_net")),
-            "super_net": 0.0,
-        }],
-    }
-
-
-def _fund_flow_sina_daily(code: str, days: int = 120) -> Optional[Dict[str, Any]]:
-    """近 N 日日级资金流（新浪 lscjfb，主外部源，真实四档拆解）。失败返回 None。
-
-    2026-10-20 换源修正: 原走 zjlrqs，该接口只有「四档总净额(netamount) +
-    超大单(r0_net)」两字段，且旧实现把总净额当主力、把超大单塞 large_net 槽位，
-    五列口径全错（大/中/小=0）。现改走 lscjfb（ssl_qsfx_lscjfb，r0~r3_net
-    真实四档，阈值与东财一致），复用 app.market_cn.sina_moneyflow 同一取数模块
-    （指数聚合方案2 同源），口径与东财 daykline 完全对齐：
-      super=r0_net(特大)  large=r1_net(大)  mid=r2_net(中)  small=r3_net(小)
-      main_net = super + large (东财自洽式 主力=超大+大)
-    历史起点 2010-03-01 (新浪源全局限制)。
-
-    Returns:
-        {code, total_days, recent_5d_main_net, recent_20d_main_net,
-         data:[{date, main_net, small_net, mid_net, large_net, super_net}] (升序),
-         source:"sina"}
-        失败: None (不抛异常，交给东财兜底)
-    """
-    from app.market_cn.sina_moneyflow import get_stock_daily_flow, to_daima
-    try:
-        flow = get_stock_daily_flow(to_daima(code))
-    except Exception as e:
-        logger.warning("[sina] lscjfb 日级资金流失败(%s): %s", code, e)
-        return None
-    if not flow:
-        return None
-    flow = flow[-max(1, int(days)):]
-    rows: List[Dict[str, Any]] = [{
-        "date": r["date"],
-        "main_net": r["main_net"],
-        "small_net": r["small_net"],
-        "mid_net": r["mid_net"],
-        "large_net": r["big_net"],      # tape 槽位名 large_net = 大单
-        "super_net": r["super_net"],
-    } for r in flow]
-    if not rows:
-        return None
-    rows.sort(key=lambda x: x["date"])  # 升序 (旧->新)，与东财口径一致
-    recent_5 = rows[-5:] if len(rows) >= 5 else rows
-    recent_20 = rows[-20:] if len(rows) >= 20 else rows
-    # ★ 2026-10-21 聚合摘要扩展（原来只有 5/20 日累计，模型仍要自己翻明细）：
-    #   实测模型写「近5日 +4.18亿，主要来自 10-14 单日 +6.58亿；剔除该日后
-    #   10-15→10-20 合计约 -2.40亿（算式：-1.01-0.33-1.06+0.003）」——就是把
-    #   明细当账本逐行加。这三个量**正是它每次都要自己算的**，直接给：
-    #     main_net_streak  —— 主力连续净流入/流出的天数与方向（"近3日净流出"直接读）
-    #     max_main_net_day / 剔除该单日后的 20 日累计（"剔除某日后合计"直接读）
-    #     recent_5d_sign    —— 近 5 日逐日符号序列（"是否连续流出"一眼可判）
-    streak = 0
-    if rows:
-        last_sign = (1 if rows[-1]["main_net"] >= 0 else -1)
-        for r in reversed(rows):
-            s = (1 if r["main_net"] >= 0 else -1)
-            if s != last_sign:
-                break
-            streak += 1
-    main_vals = [r["main_net"] for r in rows]
-    max_i = max(range(len(main_vals)), key=lambda i: main_vals[i]) if main_vals else -1
-    # 剔除最大单日：按**索引**排除（不能用 `is not` / `!=` 比 dict —— 相同内容
-    # 的不同对象会被误判为"没剔除"，相同 dict 也会被误剔除）
-    excl20_idx = {i for i in range(len(rows)) if i not in (max_i,)}
-    recent_20_idx = range(max(0, len(rows) - 20), len(rows))
-    excl20 = [rows[i]["main_net"] for i in recent_20_idx if i in excl20_idx]
-    return {
-        "code": code,
-        "total_days": len(rows),
-        "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
-        "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
-        # ── 以下为 2026-10-21 新增摘要 ──
-        "main_net_streak": streak,                      # 连续同向天数
-        "main_net_streak_dir": ("inflow" if (rows and rows[-1]["main_net"] >= 0)
-                                else "outflow"),
-        "max_main_net_day": (rows[max_i]["date"] if max_i >= 0 else None),
-        "max_main_net": (round(main_vals[max_i], 2) if max_i >= 0 else None),
-        "recent_20d_main_net_ex_max": round(sum(excl20), 2),  # 剔除最大单日后
-        "recent_5d_sign": "".join("+" if r["main_net"] >= 0 else "-" for r in recent_5),
+        "points": len(rows),
+        "total_main_net": round(total_main, 2),
         "data": rows,
-        "source": "sina",
+        "source": out.get("source", ""),
     }
 
-def _mark_push2_blocked() -> None:
-    global _push2_blocked_until
-    with _push2_lock:
-        _push2_blocked_until = time.time() + _PUSH2_BLOCK_SECONDS
 
-
-def _push2_allowed() -> bool:
-    global _push2_blocked_until
-    with _push2_lock:
-        return time.time() >= _push2_blocked_until
-
-
-def _fund_flow_eastmoney(code: str) -> Dict[str, Any]:
-    """当日分钟级资金流（东财 push2 远程，兜底路径）。
-
-    Args:
-        code: 股票代码，如 "600519"
-
-    Returns:
-        {
-            code, points, total_main_net,
-            data: [{time, main_net, small_net, mid_net, large_net, super_net}, ...]
-        }
-        主力=超大单+大单, 单位: 元
-    """
-    # 熔断期内不再碰 push2（反爬 RemoteDisconnected 掐连接，2026-09-22）
-    if not _push2_allowed():
-        logger.warning("[eastmoney] 分钟资金流: push2 熔断期内，跳过东财直接走 sina")
-        return {"code": code, "error": "push2 blocked (circuit breaker)"}
-    import requests
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": _secid(code), "klt": 1,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57",
-    }
-    headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        d = r.json()
-        rows = []
-        for line in d.get("data", {}).get("klines", []):
-            p = line.split(",")
-            if len(p) >= 6:
-                rows.append({
-                    "time": p[0],
-                    "main_net": _safe_float(p[1]),      # 主力净流入
-                    "small_net": _safe_float(p[2]),      # 小单净流入
-                    "mid_net": _safe_float(p[3]),        # 中单净流入
-                    "large_net": _safe_float(p[4]),      # 大单净流入
-                    "super_net": _safe_float(p[5]),      # 超大单净流入
-                })
-        total_main = sum(r["main_net"] for r in rows)
-        return {
-            "code": code,
-            "points": len(rows),
-            "total_main_net": round(total_main, 2),
-            "data": rows,
-        }
-    except Exception as e:
-        _mark_push2_blocked()
-        logger.warning("[eastmoney] 分钟资金流失败(%s): %s — 触发 push2 熔断", code, e)
-        return {"code": code, "error": str(e)}
-
-
-def _fund_flow_eastmoney_daily(code: str, days: int) -> Dict[str, Any]:
-    """近 N 日日级资金流（东财 push2his，兜底路径，熔断保护）。
-
-    2026-10-14 收口：push2his 会对连续请求的 IP 掐连接（实证 002866:
-    RemoteDisconnected），故降为兜底并复用 push2 熔断
-    （_push2_allowed/_mark_push2_blocked），与分钟级 _fund_flow_eastmoney 同款。
-    """
-    if not _push2_allowed():
-        logger.warning("[eastmoney] 日级资金流: push2 熔断期内，跳过东财(%s)", code)
-        return {"code": code, "error": "push2 blocked (circuit breaker)"}
-    import requests
-
-    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    params = {
-        "secid": _secid(code),
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        "lmt": str(days),  # limit: 返回天数上限
-    }
-    headers = {"User-Agent": _UA, "Referer": "https://quote.eastmoney.com/"}
-
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        d = r.json()
-
-        rows = []
-        for line in d.get("data", {}).get("klines", []):
-            p = line.split(",")
-            if len(p) >= 6:
-                rows.append({
-                    "date": p[0],
-                    "main_net": _safe_float(p[1]),
-                    "small_net": _safe_float(p[2]),
-                    "mid_net": _safe_float(p[3]),
-                    "large_net": _safe_float(p[4]),
-                    "super_net": _safe_float(p[5]),
-                })
-
-        # 计算最近5个交易日和20个交易日的主力累计净流入
-        recent_5 = rows[-5:] if len(rows) >= 5 else rows
-        recent_20 = rows[-20:] if len(rows) >= 20 else rows
-
-        return {
-            "code": code,
-            "total_days": len(rows),
-            "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
-            "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
-            "data": rows,
-            "source": "eastmoney",
-        }
-    except Exception as e:
-        _mark_push2_blocked()
-        logger.warning("[eastmoney] 日级资金流失败(%s): %s — 触发 push2 熔断", code, e)
-        return {"code": code, "error": str(e)}
-
-
-# 日级资金流源表（2026-10-14 主备翻转：新浪主、东财兜底）
-_FUND_FLOW_DAILY_SOURCES: List[Tuple[str, Callable[..., Optional[Dict[str, Any]]]]] = [
-    ("sina", _fund_flow_sina_daily),
-    ("eastmoney", _fund_flow_eastmoney_daily),
-]
-
+# ── 个股日级资金流（远端取数收口 coord_misc，本段只做摘要计算）──
 
 def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
     """获取近 N 日日级资金流向。
 
-    数据源优先级（2026-10-14 主备翻转，对齐实时资金流）：
-      1. **新浪日级**（ssl_qsfx_zjlrqs，num=N，无反爬）—— 主外部源；
-      2. 东财 push2his 远程 —— 兜底（熔断期内自动跳过，不反复打扰反爬源）。
-    历史背景：原实现只挂东财 push2his，该源会对连续请求的 IP 掐连接
-    （RemoteDisconnected），导致 002866 等日线维度整体取数失败。
+    远端取数: `coord_misc("stock_flow_daily")` —— 新浪 lscjfb（主，真实四档）→
+    东财 push2his daykline（兜底）。选源/降级/超时在 data_sources 层按 priority 决定，
+    本函数只做槽位映射与摘要计算。
 
     用途:
       - 分析近 120 日的主力资金趋势
@@ -1290,34 +684,73 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
     Returns:
         成功: {
             code: "600519",
-            total_days: 120,           # 实际返回天数
-            recent_20d_main_net: 5e8,  # 最近20日主力累计净流入（元）
-            data: [{
-                date: "2025-01-15",
-                main_net: 12345678.90,
-                small_net: -5000000.00,
-                mid_net: 2000000.00,
-                large_net: 8000000.00,
-                super_net: 4345678.90,
-            }, ...],
+            total_days: 120,
+            recent_5d_main_net / recent_20d_main_net,
+            main_net_streak / main_net_streak_dir,
+            max_main_net_day / max_main_net / recent_20d_main_net_ex_max,
+            recent_5d_sign,
+            data: [{date, main_net, small_net, mid_net, large_net, super_net}] (升序),
             source: "sina" | "eastmoney",
         }
-        失败: {code, error: "..."}
+        失败: {code, error, source:""}
 
-    2026-10-20 起新浪主源 (lscjfb) 已提供真实四档拆解, 五列口径与东财一致
-    (main=超大+大); 东财 push2his 仅作兜底。
-
-    Example:
-        >>> flow = get_fund_flow_daily("600519", 60)
-        >>> recent = flow["data"][-5:]  # 最近5天
-        >>> for day in recent:
-        ...     print(f"{day['date']}: 主力净流入 {day['main_net']/10000:.0f}万")
+    口径: main = 超大 + 大（东财自洽式），单位元。
     """
-    data, src, err = _first_ok("fund_flow_daily", _FUND_FLOW_DAILY_SOURCES, code, days)
-    if data:
-        if isinstance(data, dict):
-            data.setdefault("source", src)
-        return data
+    from app.data_sources.coord_misc import coordinate as _coord_misc
 
-    # 两个源都失败：保持原契约（调用方按 error 判定），不伪造空数据
-    return {"code": code, "error": err or "获取失败", "source": ""}
+    out = _coord_misc("stock_flow_daily", code=code, days=days)
+    flow = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+    if not out.get("ok") or not flow:
+        logger.warning("[fund_flow] 日级资金流失败(%s): %s", code, out.get("error"))
+        return {"code": code, "error": out.get("error") or "获取失败", "source": ""}
+
+    # 槽位映射：源层统一 big_net（大单），tape 出口沿用 large_net 槽位名
+    rows: List[Dict[str, Any]] = [{
+        "date": r["date"],
+        "main_net": r["main_net"],
+        "small_net": r["small_net"],
+        "mid_net": r["mid_net"],
+        "large_net": r.get("big_net", 0.0),
+        "super_net": r["super_net"],
+    } for r in flow]
+    rows.sort(key=lambda x: x["date"])  # 升序 (旧->新)
+
+    recent_5 = rows[-5:] if len(rows) >= 5 else rows
+    recent_20 = rows[-20:] if len(rows) >= 20 else rows
+    # ★ 2026-10-21 聚合摘要扩展（原来只有 5/20 日累计，模型仍要自己翻明细）：
+    #   实测模型写「近5日 +4.18亿，主要来自 10-14 单日 +6.58亿；剔除该日后
+    #   10-15→10-20 合计约 -2.40亿（算式：-1.01-0.33-1.06+0.003）」——就是把
+    #   明细当账本逐行加。这三个量**正是它每次都要自己算的**，直接给：
+    #     main_net_streak  —— 主力连续净流入/流出的天数与方向（"近3日净流出"直接读）
+    #     max_main_net_day / 剔除该单日后的 20 日累计（"剔除某日后合计"直接读）
+    #     recent_5d_sign    —— 近 5 日逐日符号序列（"是否连续流出"一眼可判）
+    streak = 0
+    last_sign = (1 if rows[-1]["main_net"] >= 0 else -1)
+    for r in reversed(rows):
+        sgn = (1 if r["main_net"] >= 0 else -1)
+        if sgn != last_sign:
+            break
+        streak += 1
+    main_vals = [r["main_net"] for r in rows]
+    max_i = max(range(len(main_vals)), key=lambda idx: main_vals[idx]) if main_vals else -1
+    # 剔除最大单日：按**索引**排除（不能用 `is not` / `!=` 比 dict —— 相同内容
+    # 的不同对象会被误判为"没剔除"，相同 dict 也会被误剔除）
+    excl20_idx = {idx for idx in range(len(rows)) if idx not in (max_i,)}
+    recent_20_idx = range(max(0, len(rows) - 20), len(rows))
+    excl20 = [rows[idx]["main_net"] for idx in recent_20_idx if idx in excl20_idx]
+
+    return {
+        "code": code,
+        "total_days": len(rows),
+        "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
+        "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
+        # ── 以下为 2026-10-21 新增摘要 ──
+        "main_net_streak": streak,                      # 连续同向天数
+        "main_net_streak_dir": ("inflow" if rows[-1]["main_net"] >= 0 else "outflow"),
+        "max_main_net_day": (rows[max_i]["date"] if max_i >= 0 else None),
+        "max_main_net": (round(main_vals[max_i], 2) if max_i >= 0 else None),
+        "recent_20d_main_net_ex_max": round(sum(excl20), 2),  # 剔除最大单日后
+        "recent_5d_sign": "".join("+" if r["main_net"] >= 0 else "-" for r in recent_5),
+        "data": rows,
+        "source": out.get("source", ""),
+    }

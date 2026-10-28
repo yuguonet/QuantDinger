@@ -84,31 +84,12 @@ def get_index_quote(codes: Union[str, List[str]] = "", scope: str = "single",
         code_list = ["000001", "399001", "399006", "000300", "000688"]
     try:
         from app.market_cn.index import INDEX_CODES
-        rows: List[Dict[str, Any]] = []
-        # mootdx 实测脏数据（code 错票 / price=0 / 假价 11.3）且会短路后续源
-        # → 包装层**优先腾讯**，再用 get_index_realtime 兜底，且只收 price>0 且 code 匹配
-        try:
-            from app.market_cn.index import _rt_tencent
-            rows = _rt_tencent(code_list) or []
-        except Exception:
-            rows = []
-        # 腾讯 code 字段是原始串（000300="1~...），不能用 zfill 精确比
-        def _has_good(rs):
-            for r in rs or []:
-                if not isinstance(r, dict):
-                    continue
-                try:
-                    if float(r.get("price") or 0) > 10:
-                        return True
-                except Exception:
-                    continue
-            return False
-        if not _has_good(rows):
-            try:
-                from app.market_cn.index import get_index_realtime
-                rows = get_index_realtime(codes=code_list, force=True) or []
-            except Exception:
-                pass
+        # 2026-10-28 Phase 3：原"优先 _rt_tencent → get_index_realtime 兜底"的双链已收口。
+        # get_index_realtime 内部即 coord_index("index_quote")：tencent 优先（真·多股单请求），
+        # mootdx 已按 kind_priority 降为兜底并在 provider 内过滤 price<=0
+        # （原"脏数据短路后续源"在源头解决，包装层不再需要 _has_good 二次挑源）。
+        from app.market_cn.index import get_index_realtime
+        rows: List[Dict[str, Any]] = get_index_realtime(codes=code_list, force=True) or []
     except Exception as e:
         return {"error": f"指数行情获取失败: {e}", "retriable": True}
 

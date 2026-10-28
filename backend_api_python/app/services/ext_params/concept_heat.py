@@ -20,7 +20,6 @@ concept_heat — 股票概念热度 + 概念板块资金流向
     stock_concept_inflow      命中概念主力净流入合计 (元)
 """
 import logging
-import requests
 
 from . import provider
 from app.data_sources.normalizer import safe_float as _safe_float
@@ -32,55 +31,44 @@ _hot_concepts_cache = None
 _concept_flow_cache = None
 _stock_concepts_cache = {}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://data.eastmoney.com/",
-}
-
 
 
 
 def _get_hot_concepts(limit=50):
-    """从东方财富获取当日热门概念板块排名（带缓存）。"""
+    """当日热门概念板块排名（带缓存）。
+
+    取数经 `coord_index("sector_list", board_type="concept")`：sina 概念板块页为主源、
+    东财 push2 为备用源，按涨跌幅降序（rank 即该顺序的位次）。
+    """
     global _hot_concepts_cache
     if _hot_concepts_cache is not None:
         return _hot_concepts_cache
 
     try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": 1,
-            "pz": limit,
-            "po": 1,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f3",
-            "fs": "b:BK0815",
-            "fields": "f2,f3,f6,f8,f12,f14,f104,f105",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        data = resp.json()
-        items = (data.get("data") or {}).get("diff") or []
+        from app.data_sources.coord_index import coordinate
+
+        out = coordinate("sector_list", board_type="concept", limit=limit,
+                         sort_by="f3", sort_dir="desc")
+        rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
 
         results = []
-        for i, item in enumerate(items):
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("f14") or "").strip()
+        for i, item in enumerate(rows):
+            name = str(item.get("name") or "").strip()
             if not name:
                 continue
             results.append({
                 "rank": i + 1,
                 "name": name,
-                "code": str(item.get("f12") or ""),
-                "change_pct": _safe_float(item.get("f3")),
-                "amount": _safe_float(item.get("f6")),
-                "turnover": _safe_float(item.get("f8")),
-                "up_count": int(_safe_float(item.get("f104"))),
-                "down_count": int(_safe_float(item.get("f105"))),
+                "code": str(item.get("code") or ""),
+                "change_pct": _safe_float(item.get("change_pct")),
+                "amount": _safe_float(item.get("amount")),
+                "turnover": _safe_float(item.get("turnover")),
+                "up_count": int(_safe_float(item.get("up_count"))),
+                "down_count": int(_safe_float(item.get("down_count"))),
             })
 
+        if not out.get("ok"):
+            logger.warning("concept_heat: 热门概念取数失败: %s", out.get("error"))
         _hot_concepts_cache = results
         logger.info("concept_heat: 获取 %d 个热门概念", len(results))
         return results
@@ -92,14 +80,23 @@ def _get_hot_concepts(limit=50):
 
 
 def _get_concept_fund_flow(limit=50):
-    """获取概念板块资金流向（通过 index.py 多源接口）。"""
+    """获取概念板块资金流向（带缓存）。
+
+    取数经 `coord_index("sector_flow", board_type="concept")`——注意必须指定
+    board_type="concept"：概念板块资金流只有东财有，而默认 industry 拿到的是
+    行业板块代码（new_xxx / BK0475 系），与概念代码空间不相交，匹配必为空。
+    """
     global _concept_flow_cache
     if _concept_flow_cache is not None:
         return _concept_flow_cache
 
     try:
-        from app.market_cn.index import get_sector_fund_flow
-        raw = get_sector_fund_flow("今日")
+        from app.data_sources.coord_index import coordinate
+
+        out = coordinate("sector_flow", indicator="今日", board_type="concept")
+        raw = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
+        if not out.get("ok"):
+            logger.warning("concept_heat: 概念资金流取数失败: %s", out.get("error"))
 
         results = {}
         for item in raw[:limit]:
