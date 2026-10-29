@@ -458,7 +458,8 @@
 <script>
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
-import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies, getTradingStatus } from '@/api/market'
+import { getWatchlist, addWatchlist, removeWatchlist, renameWatchlistGroup, removeWatchlistGroup, getWatchlistPrices, getMarketTypes, searchSymbols, getHotSymbols, getDragonStrategies } from '@/api/market'
+import { shouldPollPrices } from '@/utils/marketSession'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 import { prefValue, setPrefValue } from '@/utils/uiPrefs'
 
@@ -633,8 +634,6 @@ export default {
     }
   },
   created () {
-    this._pricePolling = null      // 后端交易日历判定的价格轮询开关 (null=未就绪)
-    this._statusFetchedAt = 0
     this.selectedKey = this.value || ''
     this.loadUserInfo()
     this.loadMarketTypes()
@@ -1058,31 +1057,9 @@ export default {
         }
       } catch (error) { /* silent */ }
     },
-    async _refreshTradingStatus () {
-      // 交易日历状态来自后端(单一事实源: 日历+服务器时区), 5 分钟同步一次;
-      // 拉取失败沿用上次结果, 首次失败降级用本地时间窗口
-      try {
-        const res = await getTradingStatus()
-        if (res && res.code === 1 && res.data) {
-          this._pricePolling = !!res.data.price_polling
-          this._statusFetchedAt = Date.now()
-        }
-      } catch (e) { /* silent: 沿用旧值/降级 */ }
-    },
-    _inTradingWindow () {
-      // 降级判定(status 未就绪时): 本地时间工作日 9:15~15:05
-      const now = new Date()
-      const day = now.getDay()
-      if (day === 0 || day === 6) return false
-      const mins = now.getHours() * 60 + now.getMinutes()
-      return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 5
-    },
     async _watchlistTick () {
       // 每 15s: 成员/策略组同步(读库, 无压力) → 价格仅 后端判定轮询中 或 列表有变更 时刷新
-      if (this._pricePolling == null || Date.now() - (this._statusFetchedAt || 0) > 5 * 60 * 1000) {
-        await this._refreshTradingStatus()
-      }
-      const polling = this._pricePolling != null ? this._pricePolling : this._inTradingWindow()
+      const polling = await shouldPollPrices()
       const changed = await this.refreshWatchlistSilent()
       if (this.watchlist && this.watchlist.length > 0 && (polling || changed)) {
         await this.loadWatchlistPrices()

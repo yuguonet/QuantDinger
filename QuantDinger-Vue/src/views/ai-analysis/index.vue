@@ -383,6 +383,7 @@
 import { mapGetters, mapState } from 'vuex'
 import { getUserInfo } from '@/api/login'
 import { getWatchlist, removeWatchlist, getWatchlistPrices } from '@/api/market'
+import { shouldPollPrices } from '@/utils/marketSession'
 import { getPositions, addPosition, getMonitors, addMonitor, updateMonitor, deleteMonitor } from '@/api/portfolio'
 import { fastAnalyze, getAllAnalysisHistory, deleteAnalysisHistory } from '@/api/fast-analysis'
 import FastAnalysisReport from './components/FastAnalysisReport.vue'
@@ -1365,10 +1366,14 @@ export default {
       }
     },
     startWatchlistPriceRefresh () {
-      this.watchlistPriceTimer = setInterval(() => {
-        if (this.watchlist && this.watchlist.length > 0) {
-          this.loadWatchlistPrices()
-        }
+      // 30s 自选价格轮询：仅在「后端判定该轮询」(可报价时段) 时发请求。
+      // 原先无条件每 30s 打一次 /watchlist/prices —— 盘后/午休照样空转，
+      // 且后端当时把午休算作盘中，等于每 30s 真拉一次 45 只自选股行情。
+      // 进页面仍无条件首刷一次（拿盘后收盘价，不受门控影响）。
+      this.watchlistPriceTimer = setInterval(async () => {
+        if (!this.watchlist || this.watchlist.length === 0) return
+        if (!(await shouldPollPrices())) return
+        this.loadWatchlistPrices()
       }, 30000)
 
       if (this.watchlist && this.watchlist.length > 0) {

@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -265,6 +265,40 @@ def is_trading_day(date: str) -> bool:
 
 def is_trading_day_today() -> bool:
     return is_trading_day(datetime.now().strftime("%Y-%m-%d"))
+
+
+# ─── 报价时段（"此刻该不该拉行情"的单一事实源）────────────────────────
+#
+# 为什么需要：`is_trading_day` 只能回答"今天开不开市"，回答不了"此刻要不要
+# 拉行情"。2026-10-29 前该判定散在三处各写一份区间，其中两处写成连续区间
+# 09:15~15:01：
+#   · `cn_stock._is_in_trading_hours()`  → 决定 TTL 全命中是否也必拉远端；
+#   · `routes/market` 的 `price_polling` → 前端自选价格轮询的开关。
+# 结果午休 11:31~13:00 被判成盘中（实测 12:50 返回 True），前端每 15s/30s
+# 照打 45 只自选股行情。只有 `realtime_snapshot._is_trading_collect_time`
+# 写对了（9:30~11:31 / 13:00~15:01）。三份定义必有一份先漂，故收口于此。
+_SESSION_AM = (dtime(9, 15), dtime(11, 31))
+_SESSION_PM = (dtime(13, 0), dtime(15, 1))
+
+
+def is_in_quote_session(now: Optional[datetime] = None) -> bool:
+    """此刻是否处于「可报价时段」：交易日 ∧ (09:15<t≤11:31 或 13:00≤t≤15:01)。
+
+    边界口径（四个调用方共用这一份，改前先看）：
+      · 左端 09:15 开区间：集合竞价首拍在此之前不可能有报价；
+      · 午休 11:31~13:00 **不算**盘中：A 股 11:30 收盘，期间无新成交，
+        价格定格在上午收盘价，再拉只是重复同一份数据；
+      · 右端 15:01 闭区间：收盘瞬间的成交回传有几秒延迟，留 1 分钟缓冲
+        确保能抓到收盘价。
+
+    非交易日恒 False。日历不可用时 `is_trading_day` 抛 `CalendarUnavailable`，
+    本函数**不吞**——由调用方决定降级（价格轮询宁可停，也不猜节假日）。
+    """
+    dt = now or datetime.now()
+    if not is_trading_day(dt.strftime("%Y-%m-%d")):
+        return False
+    t = dt.time()
+    return (_SESSION_AM[0] < t <= _SESSION_AM[1]) or (_SESSION_PM[0] <= t <= _SESSION_PM[1])
 
 
 def prev_trading_day(date: Optional[str] = None, n: int = 1) -> str:

@@ -657,15 +657,18 @@ def get_watchlist_prices():
 
 @market_bp.route('/watchlist/trading-status', methods=['GET'])
 def get_watchlist_trading_status():
-    """交易日历状态 — 前端自选行情轮询的开关依据(节假日/收盘后不轮询)。
+    """交易日历状态 — 前端自选行情轮询的开关依据(节假日/午休/收盘后不轮询)。
 
-    price_polling: 交易日 9:15~15:01 为 true; 前端据此决定是否轮询自选价格。
+    price_polling: 交易日且处于可报价时段(09:15~11:31 / 13:00~15:01)为 true;
+    前端据此决定是否轮询自选价格。**区间判定只许调
+    `trading_calendar.is_in_quote_session`**——本路由曾自带 09:15~15:01 连续区间，
+    午休被算作盘中，前端照刷(2026-10-29 修)。
     单一事实源在后端(交易日历+服务器时区), 前端不自行猜测节假日。"""
-    from datetime import datetime, time as dtime
-    from app.utils.trading_calendar import is_trading_day_today
+    from datetime import datetime
+    from app.utils.trading_calendar import is_in_quote_session, is_trading_day_today
     now = datetime.now()
     is_td = bool(is_trading_day_today())
-    price_polling = bool(is_td and dtime(9, 15) < now.time() <= dtime(15, 1))
+    price_polling = is_in_quote_session(now)
     return jsonify({
         'code': 1,
         'data': {

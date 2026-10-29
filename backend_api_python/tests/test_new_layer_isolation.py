@@ -107,7 +107,7 @@ def test_new_layer_wiring_allowlist():
     allowed_refs = {
         "cn_hk_fundamentals.py",   # coord_basic 基本面
         "cn_stock_ext.py",         # coord_index 指数K线兜底
-        "cn_stock_putdb.py",       # coord_index 5m/资金流/龙虎榜落库
+        "cn_stock_putdb.py",       # coord_index 5m/资金流 + coord_pool 龙虎榜落库
         "dragon_limit.py",         # coord_pool 涨跌停池
         "dragon_tiger_store.py",   # coord_pool 龙虎榜/热榜落库（2026-10-28 Phase 1 收敛）
         "index.py",                # coord_index 日K兜底（Phase C）+ 北向/大盘/板块资金流（2026-10-28）

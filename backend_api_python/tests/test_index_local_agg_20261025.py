@@ -17,9 +17,10 @@ date=str、volume=手（本地库是股，÷100）。
   C. 端到端 get_index_daily_kline：local_agg 在链首且命中后不调远端；
      本地未命中 → coord_index 兜底（2026-10-27 起远端链收口 coord_index）
 """
+import contextlib
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -78,10 +79,24 @@ def _patch_db(rows):
                       return_value=_FakeMgr(rows))
 
 
-def _patch_anchor(day: str):
-    """新鲜度锚点（trading_calendar）：fixture 数据停在 2026-10-23，锚点须可注。"""
-    return mock.patch("app.utils.trading_calendar.last_finish_trading_day",
-                      return_value=day)
+def _patch_anchor(day: str, trading_today: bool = False):
+    """新鲜度锚点（trading_calendar）：fixture 数据停在 2026-10-23，锚点须可注。
+
+    2026-10-29 锚点新增「盘中=今日」分支（fresh_anchor 取「源此刻能给到的最新交易日」）
+    后，放行类断言统一注入 `trading_today=False` ⇒ 锚点退回 last_finish_trading_day，
+    与旧断言同义（确定性，不依赖跑测试的真实日期）；盘中分支由
+    test_local_agg_freshness_gate 单独覆盖。
+    """
+    @contextlib.contextmanager
+    def _cm():
+        with mock.patch("app.utils.trading_calendar.last_finish_trading_day",
+                        return_value=day), \
+             mock.patch("app.utils.trading_calendar.is_trading_day_today",
+                        return_value=trading_today), \
+             mock.patch("app.data_sources.cn_stock_ext._now",
+                        return_value=datetime(2026, 10, 29, 12, 0)):
+            yield
+    return _cm()
 
 
 def test_local_agg_hit_contract():
@@ -141,20 +156,32 @@ def test_local_agg_depth_gate():
 
 
 def test_local_agg_freshness_gate():
-    """B③: 末条 < trading_calendar 锚点回落（同步停摆）；等于则放行。"""
+    """B③: 末条 < 锚点回落；等于放行；盘中锚点=今日（2026-10-29 读路径闭环）。"""
     rows = _fake_rows(120, date(2026, 10, 23))
-    # 末条 10-23，锚点 10-30 ⇒ 陈旧回落
+    # 末条 10-23，锚点 10-30 ⇒ 陈旧回落（非交易日/盘前分支）
     with _patch_db(rows), _patch_anchor("2026-10-30"):
         assert _kline_local_agg("000001", 120) is None
-    # 末条 == 锚点（盘中当天未同步的设计行为，锚点=上一完结交易日）⇒ 放行
+    # 末条 == 锚点 ⇒ 放行（非交易日：源只有上一完结交易日的数据）
     with _patch_db(rows), _patch_anchor("2026-10-23"):
         assert _kline_local_agg("000001", 120) is not None
+    # 交易日盘中（12:00）⇒ 锚点=今日，末条 10-23 判陈旧回落 —— 当日数据源已有，
+    # 库内只到昨天必须落远端，否则盘中永远读到昨天收盘（原「盘中锚点=昨天」已废弃）
+    with _patch_db(rows), _patch_anchor("2026-10-23", trading_today=True):
+        assert _kline_local_agg("000001", 120) is None
 
 
 def test_local_agg_calendar_failure_falls_back():
-    """B④: 日历异常保守回落远端（不猜日期）。"""
+    """B④: 日历异常保守回落远端（不猜日期）。
+
+    2026-10-29：锚点新增「盘中=今日」分支后，须同时注入非交易日+固定时刻，
+    否则走不到 last_finish_trading_day → 断言会假绿。
+    """
     rows = _fake_rows(120, date(2026, 10, 23))
     with _patch_db(rows), \
+         mock.patch("app.utils.trading_calendar.is_trading_day_today",
+                    return_value=False), \
+         mock.patch("app.data_sources.cn_stock_ext._now",
+                    return_value=datetime(2026, 10, 29, 12, 0)), \
          mock.patch("app.utils.trading_calendar.last_finish_trading_day",
                     side_effect=RuntimeError("calendar boom")):
         assert _kline_local_agg("000001", 120) is None

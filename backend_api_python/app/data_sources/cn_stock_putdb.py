@@ -3,15 +3,22 @@
 cn_stock_putdb — 指数 5m K线落库（coord_index → kline_index_5m）
 
 ═══════════════════════════════════════════════════════════════
-  用途: 把 coord_index 多源调度拿到的指数数据 UPSERT 进库，替代原
-        scripts/sync_index_minute.py / sync_index_fflow.py 的调度入口与
-        dragon_tiger_store.save_daily 的龙虎榜半边（scheduler 改调本模块）；
-        CLI 场景仍可用 scripts/ 目录脚本（backfill/verify 等历史工具）。
+  用途: 写侧作业层 —— 直接调 coord_* 多源调度取数，再 UPSERT 落库
+        （sync / sync_index_fflow / sync_stock_kline / run_1d / run_1m /
+        write_to_db / write_index_fflow / write_stock_kline_bulk /
+        sync_dragon_tiger）。读侧（读库 / 聚合 / 新鲜度闸门 / 远端兜底）在
+        app/data_sources/cn_stock_ext.py，两侧职责不混。
+
+  读写分离（2026-10-29 用户裁定）:
+  - 写 = 本模块 → coord_* → 库。「已在目标日收官」的幂等跳过判据（_index_day_complete）
+    只服务于写作业本身（重启不重复写库），不是对外读接口。
+  - 读 = 外围 → cn_stock_ext（读库优先，缺/陈旧才走远端）。
 
   收口的写链（2026-10-27 起）:
-  - sync()             指数 5m K线 → kline_index_5m（coord_index index_kline/5m）
-  - sync_index_fflow() 指数资金流 → kline_index_fflow（coord_index index_fflow）
-  - sync_dragon_tiger() 龙虎榜 → cnd_dragon_tiger_list（coord_pool dragon_tiger）
+  - sync()              → kline_index_5m    （coord_index index_kline，5m）
+  - sync_index_fflow()  → kline_index_fflow （coord_index index_fflow，当日 240 根）
+  - sync_stock_kline()  → kline_1D/kline_1m （coordinator 个股 K线，含覆盖率补齐）
+  - sync_dragon_tiger() → cnd_dragon_tiger_list（coord_pool dragon_tiger）
 
   设计点:
   - 数据源一律走 coord_* 多源串行调度；
@@ -140,6 +147,126 @@ def _opt_int(v) -> Optional[int]:
 
 
 # ================================================================
+# 指数 5m K线同步作业（coord_index index_kline → kline_index_5m）
+# ────────────────────────────────────────────────────────────────
+# 读写分离（2026-10-29 用户裁定）：本模块是**写侧作业**，直接调 coord_* 取数后
+# 落库；读侧（读库 / 聚合 / 新鲜度闸门 / 远端兜底）在 cn_stock_ext.py。
+# 因此「库里这一天有没有 15:00 收官根」这种幂等跳过判据留在这里——它只服务于
+# 写作业本身（重启不重复写库），不是对外读接口的一部分。
+# ================================================================
+
+
+def _index_day_complete(table: str, symbol: str, target_td: str) -> bool:
+    """该 symbol 是否已写到目标日 **15:00 收官 bar**（重启不再重复写库）。
+
+    判据 = **目标日当天**的末条 time ≥ 15:00（kline_index_5m 的 bar 结束时刻 /
+    kline_index_fflow 的 15:00 日累计行）。盘中只写到 14:xx 的**半日数据不算**
+    —— 指数 5m/资金流不可回补，把半日当收官会永久丢尾段（2026-10-27）。
+
+    ★ 必须带 `time::date = target_td`（2026-10-29 修）：只取 max(time) 再比字符串
+    时，库里一旦有**今天**的 bar（盘中写入），`"今天 09:34" >= "昨天 15:00"` 恒真
+    ⇒ 目标日被误判收官、全天不再刷新（000852.SH 实测：09:33 写今日 4 根后
+    09:38 起永久跳过）。
+    查库失败 ⇒ False（保守重写，幂等无害）。
+    """
+    try:
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'SELECT max(time) FROM "%s" WHERE symbol = %%s '
+                    'AND time::date = %%s::date' % table,
+                    (symbol, target_td),
+                )
+                row = cur.fetchone()
+        if not row or row[0] is None:
+            return False
+        last = row[0]
+        last_s = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else str(last)[:16]
+        return last_s >= ("%s 15:00" % target_td)
+    except Exception as e:
+        logger.warning("[putdb] %s %s 收官检查失败（保守重写）: %s", table, symbol, e)
+        return False
+
+
+def _sync_index_kind(*, kind: str, table: str, target_td: str,
+                     symbols: Optional[List[str]], dry_run: bool, verbose: bool,
+                     force: bool, coord_params: Dict[str, Any],
+                     writer) -> Dict[str, int]:
+    """指数同步作业内核：**库内收官裁决 → 一次打包 coordinate → 逐码落库**。
+
+    指数码一次打包交 `coordinate(kind, codes=[...])`，由 dispatch.run_batch 逐码
+    多源分发（主池+重试池、码间限频 pause），不逐码循环 coordinate（2026-10-27
+    用户裁定，对齐 coordinator.coordinate_market_kline 的批量形态）。
+
+    目标日已有 15:00 收官根 ⇒ 跳过该码（重启不重复写库，2026-10-27 用户报障）；
+    未收官（盘中）⇒ 每轮全量重写，UPSERT 幂等、累计值逐轮归正。force 跳过裁决。
+    断采/限频无需单独补数：下一轮拿到的是当日全量累计，重写即自愈；真正补不上
+    的只有跨日缺口（源不给历史），属上游限制。
+    """
+    from app.data_sources.coord_index import coordinate
+
+    syms = list(symbols) if symbols else list(INDICES.keys())
+    if not syms:
+        return {"written": 0, "failed": 0}
+    if not force:
+        pending = [s for s in syms if not _index_day_complete(table, s, target_td)]
+        if not pending:
+            logger.info("[putdb] %s 目标=%s 已收官 %d/%d，跳过",
+                        table, target_td, len(syms), len(syms))
+            return {"written": 0, "failed": 0}
+        if len(pending) < len(syms):
+            logger.info("[putdb] %s 目标=%s 收官 %d/%d，仅补 %d 个缺口",
+                        table, target_td, len(syms) - len(pending),
+                        len(syms), len(pending))
+        syms = pending
+    code2sym = {s.split(".")[0]: s for s in syms}
+    logger.info("[putdb] %s 批量同步 %d 个 %s", table, len(syms), coord_params)
+    out = coordinate(kind, codes=list(code2sym), **coord_params)
+    entries = (out.get("data") or {}).get("rows") or []
+    pool = get_pool()
+    total, failed = 0, []
+    for e in entries:
+        code = str(e.get("code", ""))
+        sym = code2sym.get(code, code)
+        rows = e.get("rows") or []
+        if not rows:
+            err = (e.get("error") or "").strip()
+            if err:
+                failed.append(sym)
+                logger.warning("[putdb] %s %s 拉取失败: %s", table, sym, err)
+            else:
+                # NotSupported / 空信封无 error ⇒ 跳过，不进失败表（dispatch 同语义）
+                logger.info("[putdb] %s %s 无数据/无源支持（跳过，不计失败）", table, sym)
+            continue
+        if verbose:
+            logger.info("[putdb] %s %s source=%s %d 根 (%s ~ %s)",
+                        table, sym, e.get("source"), len(rows),
+                        rows[0].get("time"), rows[-1].get("time"))
+        total += writer(pool, sym, rows, dry_run=dry_run)
+    logger.info("[putdb] %s 完成: %d 条写入, %d 个失败%s", table, total,
+                len(failed), f" ({', '.join(failed)})" if failed else "")
+    return {"written": total, "failed": len(failed)}
+
+
+def sync(symbols: Optional[List[str]] = None, dry_run: bool = False,
+         verbose: bool = False, bars: Optional[int] = None,
+         force: bool = False) -> Dict[str, int]:
+    """指数 5m K线同步 → kline_index_5m（scheduler / CLI 的唯一写入口）。
+
+    返回 {written, failed}。目标日 = `_target_trading_day()` = 最近一个已收盘
+    交易日（5m bar 以 15:00 收官根判完整）。默认拉新浪上限 SINA_BARS
+    （≈104 交易日）滑动覆盖：断采一周仍可自动补回。
+    """
+    return _sync_index_kind(
+        kind="index_kline", table=TABLE, target_td=_target_trading_day(),
+        symbols=symbols, dry_run=dry_run, verbose=verbose, force=force,
+        coord_params={"timeframe": "5m", "limit": int(bars or SINA_BARS)},
+        writer=write_to_db,
+    )
+
+
+# ================================================================
 # 个股 1D / 1m K线盘后覆写（coordinate_market_kline → kline_1D/kline_1m）
 # ────────────────────────────────────────────────────────────────
 # 2026-10-27 从 app/data_sources/backfill_db 迁入：原 mootdx 直连通达信已不可用，
@@ -163,7 +290,10 @@ def _stock_kline_sync_timeout() -> int:
 
 
 def _target_trading_day() -> str:
-    """计算目标交易日（最近一个已收盘的交易日）。"""
+    """计算目标交易日（最近一个已收盘的交易日）。
+
+    供 K线族（5m/1D）用：它们的 bar 以 15:00 收官根判完整性。
+    """
     from app.utils.trading_calendar import last_finish_trading_day
     return last_finish_trading_day()
 
@@ -472,93 +602,6 @@ def run_1m(symbols: Optional[List[str]] = None, force: bool = False) -> dict:
             "skipped": r["written"] == 0 and r["status"] == "ok"}
 
 
-def _index_day_complete(table: str, symbol: str, target_td: str) -> bool:
-    """该 symbol 是否已写到目标日 **15:00 收官 bar**（重启不再重复写库）。
-
-    判据 = 库内末条 time ≥ 目标日 15:00（kline_index_5m 的 bar 结束时刻 /
-    kline_index_fflow 的 15:00 日累计行）。盘中只写到 14:xx 的**半日数据不算**
-    —— 指数 5m/资金流不可回补，把半日当收官会永久丢尾段（2026-10-27）。
-    查库失败 ⇒ False（保守重写，幂等无害）。
-    """
-    try:
-        pool = get_pool()
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    'SELECT max(time) FROM "%s" WHERE symbol = %%s' % table,
-                    (symbol,),
-                )
-                row = cur.fetchone()
-        if not row or row[0] is None:
-            return False
-        last = row[0]
-        last_s = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else str(last)[:16]
-        return last_s >= ("%s 15:00" % target_td)
-    except Exception as e:
-        logger.warning("[putdb] %s %s 收官检查失败（保守重写）: %s", table, symbol, e)
-        return False
-
-
-def sync(symbols: Optional[List[str]] = None, dry_run: bool = False,
-         verbose: bool = False, bars: Optional[int] = None,
-         force: bool = False) -> Dict[str, int]:
-    """同步入口（scheduler 与 CLI 共用）。返回 {written, failed}。
-
-    指数代码**一次打包**交 coord_index("index_kline", codes=[...], timeframe="5m")，
-    由 dispatch.run_batch 逐码多源分发（主池+重试池、码间限频 pause）——
-    不再逐码循环 coordinate 调用（2026-10-27 用户裁定，对齐
-    coordinator.coordinate_market_kline 的批量形态）。
-
-    已收官（目标日 15:00 bar 在库）的指数跳过 —— 重启不重复写库
-    （2026-10-27 用户报障：指数/资金流重启后整段重写）；force=强制覆写。
-    """
-    from app.data_sources.coord_index import coordinate
-
-    symbols = list(symbols) if symbols else list(INDICES.keys())
-    if not symbols:
-        return {"written": 0, "failed": 0}
-    target_td = _target_trading_day()
-    if not force:
-        pending = [s for s in symbols
-                   if not _index_day_complete("kline_index_5m", s, target_td)]
-        if not pending:
-            logger.info("[putdb] 指数 5m 目标=%s 已收官 %d/%d，跳过",
-                        target_td, len(symbols), len(symbols))
-            return {"written": 0, "failed": 0}
-        if len(pending) < len(symbols):
-            logger.info("[putdb] 指数 5m 目标=%s 收官 %d/%d，仅补 %d 个缺口",
-                        target_td, len(symbols) - len(pending), len(symbols), len(pending))
-        symbols = pending
-    code2sym = {s.split(".")[0]: s for s in symbols}
-    n_bars = int(bars or SINA_BARS)
-    logger.info("[putdb] 指数 5m 批量同步 %d 个 × %d 根", len(symbols), n_bars)
-    out = coordinate("index_kline", codes=list(code2sym), timeframe="5m", limit=n_bars)
-    entries = (out.get("data") or {}).get("rows") or []
-    pool = get_pool()
-    total, failed = 0, []
-    for e in entries:
-        code = str(e.get("code", ""))
-        sym = code2sym.get(code, code)
-        rows = e.get("rows") or []
-        if not rows:
-            err = (e.get("error") or "").strip()
-            if err:
-                failed.append(sym)
-                logger.warning("[putdb] %s 5m 拉取失败: %s", sym, err)
-            else:
-                # NotSupported / 空信封无 error ⇒ 跳过，不进失败表（dispatch 同语义）
-                logger.info("[putdb] %s 5m 无数据/无源支持（跳过，不计失败）", sym)
-            continue
-        if verbose:
-            logger.info("[putdb] 5m %s source=%s %d 根 (%s ~ %s)",
-                        sym, e.get("source"), len(rows),
-                        rows[0].get("time"), rows[-1].get("time"))
-        total += write_to_db(pool, sym, rows, dry_run=dry_run)
-    logger.info("[putdb] 完成: %d 条写入, %d 个失败%s",
-                total, len(failed), f" ({', '.join(failed)})" if failed else "")
-    return {"written": total, "failed": len(failed)}
-
-
 # ================================================================
 # 指数资金流落库（coord_index index_fflow → kline_index_fflow）
 # ================================================================
@@ -611,65 +654,40 @@ def write_index_fflow(pool, symbol: str, rows: Iterable[Dict[str, Any]],
         return 0
 
 
+def _fflow_target_day() -> str:
+    """指数资金流的目标交易日 —— **上游源会返回的那一天**。
+
+    `fflow_em` 无日期参数、只给当日累计（provider_index/fflow_em.py:50），所以
+    目标日必须是「今天」（今天为交易日时）；非交易日源返上一交易日，故回退
+    `last_finish_trading_day()`。
+
+    与 `_target_trading_day()` 的区别（易错点）：盘中 10:00 时本函数=今天、
+    后者=昨天。资金流若用后者，每轮都在问「昨天是否收官」→ 恒 True → 全天空转
+    （2026-10-29 实测 `已收官 9/9，跳过` 每 5 分钟一次，`kline_index_fflow`
+    当日 0 行）。交易日历走本地 pkl 缓存，零外网。
+    """
+    from app.utils.trading_calendar import is_trading_day_today, last_finish_trading_day
+    if is_trading_day_today():
+        return datetime.now().strftime("%Y-%m-%d")
+    return last_finish_trading_day()
+
+
 def sync_index_fflow(symbols: Optional[List[str]] = None, dry_run: bool = False,
                      verbose: bool = False, limit: int = 240,
                      force: bool = False) -> Dict[str, int]:
-    """指数资金流同步入口（scheduler._sync_index_fflow 调用）。返回 {written, failed}。
+    """指数分钟资金流同步 → kline_index_fflow（scheduler / CLI 的唯一写入口）。
 
-    指数代码**一次打包**交 coord_index("index_fflow", codes=[...])，由
-    dispatch.run_batch 逐码多源分发 + 重试池补抓（2026-10-27 收口批量形态）。
-    仅当日 240 根、断采不可回补；盘中调用=全日重写幂等（EM delay host 滞后
-    ~15 分钟属上游行为）。EM push2 IP 限频 RST 突发窗（分钟级翻转）由 run_batch
-    的码间 pause + 重试池覆盖，长关窗由下一轮调度收敛，不伪造数据。
-
-    已收官（目标日 15:00 日累计行在库）的指数跳过 —— 重启不重复写库
-    （2026-10-27 用户报障）；盘中未收官 ⇒ 照旧每轮全日重写。force=强制覆写。
+    返回 {written, failed}。目标日 = `_fflow_target_day()`（源无日期参数、只给
+    当日）。盘中每轮全日重写（240 根/指数，累计值逐轮归正），15:30 盘后批次再
+    终校准。EM delay host 滞后 ~15 分钟属上游行为；EM push2 IP 限频 RST 突发窗
+    由 dispatch.run_batch 的码间 pause + 重试池覆盖，长关窗由下一轮调度收敛。
     """
-    from app.data_sources.coord_index import coordinate
-
-    symbols = list(symbols) if symbols else list(INDICES.keys())
-    if not symbols:
-        return {"written": 0, "failed": 0}
-    target_td = _target_trading_day()
-    if not force:
-        pending = [s for s in symbols
-                   if not _index_day_complete(FFLOW_TABLE, s, target_td)]
-        if not pending:
-            logger.info("[putdb] 指数资金流 目标=%s 已收官 %d/%d，跳过",
-                        target_td, len(symbols), len(symbols))
-            return {"written": 0, "failed": 0}
-        if len(pending) < len(symbols):
-            logger.info("[putdb] 指数资金流 目标=%s 收官 %d/%d，仅补 %d 个缺口",
-                        target_td, len(symbols) - len(pending), len(symbols), len(pending))
-        symbols = pending
-    code2sym = {s.split(".")[0]: s for s in symbols}
-    logger.info("[putdb] 指数资金流批量同步 %d 个", len(symbols))
-    out = coordinate("index_fflow", codes=list(code2sym), limit=int(limit))
-    entries = (out.get("data") or {}).get("rows") or []
-    pool = get_pool()
-    total, failed = 0, []
-    for e in entries:
-        code = str(e.get("code", ""))
-        sym = code2sym.get(code, code)
-        rows = e.get("rows") or []
-        if not rows:
-            err = (e.get("error") or "").strip()
-            if err:
-                failed.append(sym)
-                logger.warning("[putdb] %s 资金流拉取失败: %s", sym, err)
-            else:
-                # NotSupported / 空信封无 error ⇒ 跳过，不进失败表（dispatch 同语义）
-                logger.info("[putdb] %s 资金流无数据/无源支持（跳过，不计失败）", sym)
-            continue
-        if verbose:
-            logger.info("[putdb] fflow %s source=%s %d 根 (%s ~ %s), 主力尾值=%.0f",
-                        sym, e.get("source"), len(rows),
-                        rows[0].get("time"), rows[-1].get("time"),
-                        float(rows[-1].get("main_net") or 0))
-        total += write_index_fflow(pool, sym, rows, dry_run=dry_run)
-    logger.info("[putdb] fflow 完成: %d 条写入, %d 个失败%s",
-                total, len(failed), f" ({', '.join(failed)})" if failed else "")
-    return {"written": total, "failed": len(failed)}
+    return _sync_index_kind(
+        kind="index_fflow", table=FFLOW_TABLE, target_td=_fflow_target_day(),
+        symbols=symbols, dry_run=dry_run, verbose=verbose, force=force,
+        coord_params={"limit": int(limit)},
+        writer=write_index_fflow,
+    )
 
 
 # ================================================================
@@ -731,6 +749,7 @@ def sync_dragon_tiger(trade_date: Optional[str] = None, dry_run: bool = False,
 
 
 def main():
+    """CLI 便捷入口：指数 5m 同步。"""
     import argparse
     parser = argparse.ArgumentParser(description="A股主要指数 5m K线同步 → kline_index_5m")
     parser.add_argument("--indices", help="指定指数, 逗号分隔 (如 000001.SH,000300.SH)")

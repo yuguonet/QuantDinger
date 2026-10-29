@@ -61,7 +61,7 @@ from app.data_sources.coordinator import get_coordinator
 from app.data_sources.normalizer import normalize_chart_timeframe, strip_market_prefix
 from app.data_sources.provider.adjustment import unadj_to_qfq
 from app.utils.logger import get_logger
-from app.utils.trading_calendar import is_trading_day, prev_trading_day
+from app.utils.trading_calendar import is_in_quote_session, is_trading_day, prev_trading_day
 
 logger = get_logger(__name__)
 
@@ -175,18 +175,34 @@ _snapshot_cache = _SnapshotCache()
 # ================================================================
 
 def _is_in_trading_hours() -> bool:
-    """判断当前是否在交易时段内（交易日 9:15 < t <= 15:01）。
+    """此刻是否处于可报价时段 —— 语义与边界全在 `trading_calendar.is_in_quote_session`。
 
-    为什么是 15:01：
-      A 股 15:00 收盘，但收盘瞬间最后一笔成交可能延迟几秒，
-      给 1 分钟缓冲确保能抓到收盘价。
+    用途（只有这三处）：get_tickers 非盘中先查缓存、拉取失败降级返缓存、
+    get_ticker 的 TTL 是否只认 10s 内新鲜值。**午休 11:31~13:00 判 False**：
+    期间无新成交，价格定格在上午收盘价，再拉只是重复同一份数据。
+
+    2026-10-29 前本函数自带 09:15~15:01 连续区间，午休被判成盘中，导致自选股
+    每 15s/30s 轮询都打远端（实测 12:50 返回 True，45 只自选股 × 腾讯单批）。
+
+    ⚠ 判断"当日是否已有实时数据可拼日线"请用 `_has_today_live_bar()`：
+    午休**算有**（rt 末拍=11:30 收盘拍）。两者混用会让午休的 1D 缺当日 bar。
+    """
+    return is_in_quote_session()
+
+
+def _has_today_live_bar() -> bool:
+    """今日此刻是否已有可用的当日实时数据（1D 拼 lastbar 的判据）。
+
+    与 `_is_in_trading_hours()` 的差别只有一个：**午休算有**。
+    午休虽无新成交，但 `realtime_snapshot` 末拍仍是 11:30 收盘拍、`open/high/low`
+    都已成立，当日 bar 是有效数据；而"要不要再向远端拉一次行情"在午休是否定的。
+    所以 1D 的拼装分叉用本函数、价格轮询用另一个，**不可互相替代**
+    （2026-10-29 收口时段时若合并，午休日线会静默缺当日 bar）。
     """
     now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-    if not is_trading_day(today_str):
+    if not is_trading_day(now.strftime("%Y-%m-%d")):
         return False
-    t = now.time()
-    return dtime(9, 15) < t <= dtime(15, 1)
+    return dtime(9, 15) < now.time() <= dtime(15, 1)
 
 
 def _prev_trading_day_ts() -> int:
@@ -650,7 +666,7 @@ class CNStockDataSource(BaseDataSource):
         再按 limit 截断并前复权；调用方（get_kline / _get_kline_weekly）传 None
         时行为与旧版一致（等价于取最近 limit 条）。
         """
-        in_trading = _is_in_trading_hours()
+        in_trading = _has_today_live_bar()
         now = datetime.now()
         today_ts = _today_ts()
         prev_td_ts = _prev_trading_day_ts()

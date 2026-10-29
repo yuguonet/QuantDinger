@@ -11,16 +11,22 @@ cn_stock_ext — 指数扩展数据源（kline_index_5m 底仓的读/聚合层�
   设计思路（作业抄 cn_stock.py：本地优先 + 闸门 + 远端兜底）：
 
   1. 底仓 = kline_index_5m（5m、股、bar 结束时刻 09:35 起、含 up/down_count）。
-     由 app/data_sources/cn_stock_putdb.py 盘后经 coord_index 同步；
+     由 app/data_sources/cn_stock_putdb.py 盘后经 coord_index 同步落库；
      语义「不可回补，只能向前攒」⇒ 新鲜度判据是本模块的核心闸门。
 
   2. 新鲜度闸门（trading_calendar）——**远端兜底的真正作用**：
-     · 锚点 fresh_anchor(as_of)：
-       - as_of=None → last_finish_trading_day()（最近一个已完结交易日）
-       - as_of=D    → last_finish_trading_day(D 15:00)（D 含以前最后已完结交易日）
-     · 库中末条日期 < 锚点 ⇒ 判陈旧（盘后同步未跑 / 同步停摆 / 窗口右沿缺日）
+     · 锚点 fresh_anchor(as_of) = 「**上游源此刻能给到的最新交易日**」：
+       - as_of=D → last_finish_trading_day(D 15:00)（历史回放窗口右沿）
+       - as_of=None ∧ 今天为交易日 ∧ 已开盘（≥09:31）→ 今天
+       - 否则 → last_finish_trading_day()（非交易日 / 开盘前，源也只有上一完结日）
+     · 库中末条日期 < 锚点 ⇒ 判陈旧（当日未落库 / 盘后同步停摆 / 窗口右沿缺日）
        → 走 coord_index 远端兜底；命中则零外网。
-     · 盘中当天未入库属设计行为：此时锚点=昨天，库有昨天即判新鲜。
+     · 盘中锚点=今天：远端 5m 盘中已有当日实时 bar（实测 11:30）、fflow 有 09:31 起
+       当日累计，而库内当日要盘后才落 ⇒ 不兜底就会永远读到昨天收盘
+       （2026-10-29 读路径闭环：原锚点恒为 last_finish_trading_day()，盘中=昨天，
+       库里有昨天即「新鲜」；且 get_index_daily 结果随 days 大小飘）。
+     · 兜底结果与库内历史**按时间拼接**（merge_bars），不整体替换 —— 远端窗口
+       （sina 5m ≤5001 根 / EM fflow 当日 240 根）常短于库内历史。
      · 交易日历异常 ⇒ 保守判陈旧、回落远端（不猜日期）。
 
   3. 聚合：5m 为唯一底仓粒度，向上聚合 **15m/30m/1H/2H/4H/1D/1W/1M**
@@ -49,6 +55,11 @@ cn_stock_ext — 指数扩展数据源（kline_index_5m 底仓的读/聚合层�
      · lhb()              = hub.lhb 形态（cnd_dragon_tiger_list 名单型事件，不 OHLVC 化；
                             store 优先，空窗走 coord_pool dragon_tiger；时效纪律见其 docstring）
 
+  6. 写链不在本层（2026-10-29 用户裁定：读写分离）：
+     写 = cn_stock_putdb.sync() / .sync_index_fflow() → coord_index → 库；
+     读 = 本模块（库优先，缺/陈旧才走远端）。本模块只出读接口，
+     不得新增同步/落库入口，也不得把「查库判收官」写进 coord_* 。
+
 ═══════════════════════════════════════════════════════════════
   易错点：
   - kline_index_5m 的 time 是 **bar 结束时刻**（09:35 首根），volume=股；
@@ -62,6 +73,8 @@ cn_stock_ext — 指数扩展数据源（kline_index_5m 底仓的读/聚合层�
 
 from __future__ import annotations
 
+import os
+import time as _time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -88,6 +101,16 @@ _TF_LABEL = {
 # 交易时段（分钟数）：bar 结束时刻 09:35..11:30 / 13:05..15:00
 _AM_START, _AM_END = 9 * 60 + 30, 11 * 60 + 30
 _PM_START, _PM_END = 13 * 60, 15 * 60
+
+# 当日数据最早可得的时刻（分钟数）：fflow 首根 09:31、5m 首根 09:35 ⇒ 取 09:31，
+# 开盘前远端也只有上一完结交易日，锚点不该前移到今天。
+_FIRST_BAR_MIN = 9 * 60 + 31
+
+# 远端 5m 窗口取量：历史缺口拉满（sina 硬顶 5001 根 ≈104 交易日，mootdx/tencent 兜底）；
+# 只缺当日时拉近端 60 根（≈1.25 个交易日，够覆盖当日已有 bar），盘中每次读都打远端，
+# 窗口越小代价越低（实测 sina 200 根 1.24s / 60 根亚秒级）。
+_REMOTE_5M_FULL = 5001
+_REMOTE_5M_TAIL = 60
 
 
 # ================================================================
@@ -147,15 +170,16 @@ def _norm_tf(timeframe: str) -> str:
 # 新鲜度闸门（trading_calendar）—— 远端兜底的判据
 # ================================================================
 
-def fresh_anchor(as_of: Optional[str] = None) -> str:
-    """新鲜度锚点：库中末条至少要覆盖到的交易日。
+def _now() -> datetime:
+    """当前本地时刻（naive 北京时间）。抽成函数便于锚点判据注入时刻（测试）。"""
+    return datetime.now()
 
-    · as_of=None → last_finish_trading_day()：最近一个**已完结**交易日
-      （kline_index_5m 盘后同步，盘中当天未入库属设计行为，锚点=昨天）；
-    · as_of=D    → last_finish_trading_day(D 15:00)：D 含以前最后已完结交易日
-      （历史回放窗口右沿；D 为周末时自动回退到上一交易日）。
 
-    交易日历异常原样抛出，调用方保守判陈旧、回落远端。
+def _finish_anchor(as_of: Optional[str] = None) -> str:
+    """「已完结交易日」锚点：最近一个 15:00 已收盘的交易日。
+
+    只用于判断**历史缺口**（盘后同步停摆 / 断采 / 窗口右沿缺日）与窗口取量，
+    不用于「当日是否缺」—— 后者是 fresh_anchor 的职责。
     """
     from app.utils.trading_calendar import last_finish_trading_day
     if as_of:
@@ -163,11 +187,39 @@ def fresh_anchor(as_of: Optional[str] = None) -> str:
     return last_finish_trading_day()
 
 
+def fresh_anchor(as_of: Optional[str] = None) -> str:
+    """新鲜度锚点：**上游源此刻能给到的最新交易日** —— 库中末条至少要覆盖到这天。
+
+    · as_of=D → last_finish_trading_day(D 15:00)：历史回放窗口右沿
+      （D 为周末时自动回退到上一交易日）；
+    · as_of=None 且今天是交易日、已开盘（≥09:31）→ 今天；
+    · 否则（非交易日 / 开盘前）→ last_finish_trading_day()，源也只有上一完结交易日。
+
+    ★ 2026-10-29 修（读路径闭环）：原锚点恒为 last_finish_trading_day()，盘中=昨天
+    ⇒ 库里有昨天即判「新鲜」，**永不补当日**。实测：远端 5m 盘中已给到当天 11:30、
+    fflow 给到 09:31 起当日累计，而 index_minute/index_fflow 读出口一律停在昨天
+    收盘（末条 10-28 15:00），且 get_index_daily 的返回条随 days 大小飘（days≤库深
+    命中本地 → 缺今日；days>库深落远端 → 有今日）。锚点取「源能给到的那一天」才是
+    闸门本意，也与写侧 cn_stock_putdb._fflow_target_day 同口径（读写对齐）。
+
+    交易日历异常原样抛出，调用方保守判陈旧、回落远端。
+    """
+    from app.utils.trading_calendar import is_trading_day_today
+    if as_of:
+        return _finish_anchor(as_of)
+    now = _now()
+    if is_trading_day_today() and (now.hour * 60 + now.minute) >= _FIRST_BAR_MIN:
+        return now.strftime("%Y-%m-%d")
+    return _finish_anchor()
+
+
+
 def freshness_ok(last_bar: Optional[Dict[str, Any]], as_of: Optional[str] = None) -> bool:
     """末条 bar 是否新鲜（≥ fresh_anchor）。空/日历异常 ⇒ False。
 
     这是「本地可用」的核心判据：False 时调用方必须走 coord_index 远端兜底，
-    不得把陈旧库数据当最新返回。
+    不得把陈旧库数据当最新返回。盘中锚点=今天（源有当日），所以「库里有昨天」
+    不再算新鲜 —— 否则当日实时永远读不到（见 fresh_anchor 的 2026-10-29 说明）。
     """
     if not last_bar:
         return False
@@ -177,6 +229,21 @@ def freshness_ok(last_bar: Optional[Dict[str, Any]], as_of: Optional[str] = None
         logger.warning("[cn_stock_ext] 交易日历不可用，保守判陈旧回落远端: %s", e)
         return False
     return _bar_date(last_bar) >= anchor
+
+
+def history_gap(last_time: Any, as_of: Optional[str] = None) -> bool:
+    """是否缺**已完结交易日**级的历史（不是当日缺口）—— 决定远端窗口取量。
+
+    真 ⇒ 远端要拉满窗口（历史可能有大段缺口）；假 ⇒ 只缺当日那一截，
+    拉近端少量即可（盘中每次读都打远端，窗口越小代价越低）。
+    """
+    if not last_time:
+        return True
+    try:
+        return str(last_time)[:10] < _finish_anchor(as_of)
+    except Exception:
+        return True
+
 
 
 # ================================================================
@@ -227,6 +294,34 @@ def read_db_5m(
         logger.warning("[cn_stock_ext] %s 5m 读取失败: %s", symbol, e)
         return []
     return list(reversed(_rows_to_bars(rows)))
+
+
+def merge_bars(local: Optional[List[Dict[str, Any]]],
+               remote: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """库内历史 + 远端窗口按时间合并（时间升序）。
+
+    读路径闭环的拼接作业（2026-10-29）：远端窗口往往**短于**库内历史
+    —— sina 5m 硬顶 5001 根（≈104 交易日）、EM fflow 只给当日 240 根 ——
+    直接 `bars = remote` 会把库里的长历史截断。这里按时间取并集：
+      · 同时间点：远端覆盖本地（远端更权威，当日累计值/收盘值以它为准）；
+      · 远端缺的字段（None）保留本地值 —— up_count/down_count 只有 kline_index_5m
+        有，远端 5m 源没有，直接覆盖会把市场宽度抹成 None。
+    time 统一用 `_bar_dt` 做键（库内 datetime / 远端 "YYYY-MM-DD HH:MM" 混存）。
+    """
+    merged: Dict[datetime, Dict[str, Any]] = {}
+    for b in local or []:
+        merged[_bar_dt(b)] = dict(b)
+    for b in remote or []:
+        dt = _bar_dt(b)
+        base = merged.get(dt)
+        if base is None:
+            merged[dt] = dict(b)
+            continue
+        for k, v in b.items():
+            if k == "time" or v is None:
+                continue
+            base[k] = v
+    return [merged[k] for k in sorted(merged)]
 
 
 # ================================================================
@@ -454,14 +549,18 @@ def index_minute(code: str = "000300", days: int = 800,
                     time="YYYY-MM-DD HH:MM"（bar 结束时刻），升序；volume=股。
 
     days=**交易日数**（不是 bar 行数）。as_of: 只返回该交易日（含）以前。
-    本地 DB 优先；**新鲜度不过闸**（trading_calendar 锚点）⇒ coord_index 远端兜底。
+    本地 DB 优先；**新鲜度不过闸**（trading_calendar 锚点）⇒ coord_index 远端兜底，
+    远端结果与库内历史**拼接**（远端窗口短于库内时不丢历史）。
     """
     bars = read_db_5m(code, as_of=as_of)
     if not bars or not freshness_ok(bars[-1], as_of=as_of):
-        remote = _coord_kline(code, "5m", max(int(days) * 48, 200))
+        want = (max(min(int(days) * 48, _REMOTE_5M_FULL), 200)
+                if history_gap(bars[-1]["time"] if bars else None, as_of)
+                else _REMOTE_5M_TAIL)
+        remote = _coord_kline(code, "5m", want)
         remote = [r for r in remote
                   if not as_of or str(r.get("time", ""))[:10] <= str(as_of)[:10]]
-        bars = _remote_5m_to_bars(remote)
+        bars = merge_bars(bars, _remote_5m_to_bars(remote))
     out = []
     for b in bars:
         row = {
@@ -512,8 +611,10 @@ def get_index_kline(code: str = "000001", timeframe: str = "1D", limit: int = 20
     流程（抄 cn_stock.get_kline 的本地优先骨架）：
       1) 本地 kline_index_5m 直读（5m）或聚合（15m/30m/1H/2H/4H/1D/1W/1M，
          聚合实现见 aggregate_5m_bars —— 其它周期一律由此归并，勿另写聚合）；
-      2) 闸门：白名单（日线族强制）∧ 深度 ≥ limit ∧ 新鲜度 ≥ fresh_anchor(as_of)；
-      3) 不过闸 → coord_index 兜底（1m 无 5m 底仓，只走远端）。
+      2) 闸门：白名单（日线族强制）∧ 深度 ≥ limit ∧ 新鲜度 ≥ fresh_anchor(as_of)
+         （盘中锚点=今天，故库内只到昨天时必落远端取当日）；
+      3) 不过闸 → coord_index 兜底（1m 无 5m 底仓，只走远端）；分钟族兜底结果与
+         库内历史按时间拼接（merge_bars），1D 不与本地聚合混拼（volume 单位不统一）。
 
     Returns:
         [{date, open, high, low, close, volume}, ...] date 升序
@@ -526,6 +627,7 @@ def get_index_kline(code: str = "000001", timeframe: str = "1D", limit: int = 20
     daily_like = tf in ("1D", "1W", "1M")
 
     # ── 本地路径（1m 无 5m 底仓可下钻，跳过）──
+    local: List[Dict[str, Any]] = []
     if tf != "1m":
         need_bars = _tf_5m_bars(tf, limit)
         local = read_db_5m(code, limit=need_bars + 48, as_of=as_of)
@@ -535,15 +637,26 @@ def get_index_kline(code: str = "000001", timeframe: str = "1D", limit: int = 20
                 if len(agg) >= limit:
                     return _fmt_exit_rows(agg, tf, limit, as_of)
 
-    # ── 远端兜底 ──
+    # ── 远端兜底（分钟族与库内历史拼接，不整体替换）──
     if daily_like:
         bars = _remote_daily_to_bars(_coord_kline(code, "1D", _tf_1d_days(tf, limit)))
+        # 1D 远端深度 ~800 日常规够用，且各源 volume 单位不统一（sina 股/tencent 手），
+        # 与库内聚合（股）混拼会造出同表混单位 ⇒ 远端不给数时才退回本地聚合，
+        # 宁可陈旧也不空手（上游 index.get_index_daily_kline 同型容忍）。
+        if not bars and local:
+            bars = aggregate_5m_bars(local, "1D")
+        agg = (bars if tf == "1D"
+               else aggregate_weekly(bars) if tf == "1W"
+               else aggregate_monthly(bars))
     elif tf == "1m":
         # 1m 不可由 5m 聚合（coord 亦无 1m kind），mootdx 原生直拉即终点
-        bars = _remote_tdx_minute(code, "1m", limit)
+        agg = _remote_tdx_minute(code, "1m", limit)
     else:
-        bars = _remote_5m_to_bars(_coord_kline(code, "5m", _tf_5m_bars(tf, limit) + 48))
-    agg = bars if tf == "1m" else aggregate_5m_bars(bars, tf)
+        want = ((_tf_5m_bars(tf, limit) + 48)
+                if history_gap(local[-1]["time"] if local else None, as_of)
+                else _REMOTE_5M_TAIL)
+        bars = merge_bars(local, _remote_5m_to_bars(_coord_kline(code, "5m", want)))
+        agg = aggregate_5m_bars(bars, tf)
     return _fmt_exit_rows(agg, tf, limit, as_of)
 
 
@@ -631,11 +744,10 @@ def get_index_daily(code: str = "000001", days: int = 200,
     df = aggregate_daily_df(code, days)
     if df is not None:
         return df.to_dict("records")
-    remote = _coord_kline(code, "1D", days)
-    if as_of:
-        remote = [r for r in remote
-                  if str(r.get("date", r.get("time", "")))[:10] <= str(as_of)[:10]]
-    return remote[-days:]
+    # 远端行须过归一（_remote_daily_to_bars 排序/数值化 + _fmt_exit_rows 裁剪），
+    # 不能原样透传 —— 否则本出口的字段/排序/条数随源漂移（与 get_index_kline 不一致）。
+    bars = _remote_daily_to_bars(_coord_kline(code, "1D", days))
+    return _fmt_exit_rows(bars, "1D", days, as_of)
 
 
 # ================================================================
@@ -644,6 +756,19 @@ def get_index_daily(code: str = "000001", days: int = 200,
 
 FFLOW_TABLE = "kline_index_fflow"
 FFLOW_NET_COLS = ("main_net", "small_net", "mid_net", "big_net", "super_net")
+
+# 远端 fflow 失败冷却截止时刻（time.time() 秒）。EM 单源整段挂死实测 46.8s/次，
+# 高频读路径必须熔断；成功即清零。
+_fflow_remote_down_until = 0.0
+
+
+def _fflow_cooldown_sec() -> int:
+    """远端 fflow 失败冷却时长（秒），env QD_FFLOW_REMOTE_COOLDOWN_SEC，默认 300。"""
+    try:
+        v = int(os.getenv("QD_FFLOW_REMOTE_COOLDOWN_SEC", "300"))
+    except (TypeError, ValueError):
+        return 300
+    return v if v >= 0 else 300
 
 
 def read_db_fflow(code: str, as_of: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -681,14 +806,27 @@ def read_db_fflow(code: str, as_of: Optional[str] = None) -> List[Dict[str, Any]
 
 
 def _coord_fflow(code: str, limit: int = 240) -> List[Dict[str, Any]]:
-    """coord_index index_fflow → 当日分钟资金流行（仅当日，断采不可回补）。"""
+    """coord_index index_fflow → 当日分钟资金流行（仅当日，断采不可回补）。
+
+    失败冷却（2026-10-29）：EM 指数资金流**单源**且会整段挂死（实测 2026-10-29
+    盘中「全部 host 无响应」耗时 46.8s 才返失败）。读接口是高频路径（auto core
+    poll_check 盘中每轮读），若每轮都付这 46.8s，读路径直接被源拖死 ⇒ 失败后
+    `QD_FFLOW_REMOTE_COOLDOWN_SEC`（默认 300s）内不再尝试，直接返回 []，调用方
+    用库内历史（宁可少当日一截，不可让读挂住）。
+    """
+    global _fflow_remote_down_until
+    now = _time.time()
+    if now < _fflow_remote_down_until:
+        return []
     from app.data_sources.coord_index import coordinate
     out = coordinate("index_fflow", code=str(code).split(".")[0], limit=int(limit))
     if not (out.get("ok") and (out.get("data") or {}).get("rows")):
         logger.warning("[cn_stock_ext] 远端资金流兜底失败(%s): %s",
                        code, out.get("error", ""))
+        _fflow_remote_down_until = now + _fflow_cooldown_sec()
         return []
     rows = out["data"]["rows"]
+    _fflow_remote_down_until = 0.0
     logger.info("[cn_stock_ext] 远端资金流 %s: %d 根 (source=%s)",
                 code, len(rows), out.get("source", ""))
     return rows
@@ -704,8 +842,10 @@ def index_fflow(code: str = "000300", days: int = 800,
                     **当日累计值语义**（15:00 累计 = 日级值，特征工程用时差分）。
 
     days=**交易日数**。as_of: 只返回该交易日（含）以前。
-    本地 DB 优先；**新鲜度不过闸**（trading_calendar 锚点）⇒ coord_index 兜底
-    —— 远端仅当日 240 根（断采不可回补），故兜底只补当日缺日，历史缺口不造。
+    本地 DB 优先；**新鲜度不过闸**（trading_calendar 锚点，盘中锚点=今天）⇒
+    coord_index 兜底当日，与库内历史按时间拼接（远端只给当日 240 根，断采不可回补；
+    历史缺口不造）。远端整段失败时按 QD_FFLOW_REMOTE_COOLDOWN_SEC 熔断，避免读路径
+    被 46s 级超时拖死。
     ⚠ time 为 bar 起始时刻（09:31 起），与 index_minute 的 bar 结束时刻差 1 根，
       跨表对齐特征时注意（hub 原契约，勿改）。
     """
@@ -715,9 +855,7 @@ def index_fflow(code: str = "000300", days: int = 800,
         remote = [r for r in remote
                   if not as_of or str(r.get("time", ""))[:10] <= str(as_of)[:10]]
         if remote:
-            today = str(remote[-1]["time"])[:10]
-            history = [r for r in local if str(r.get("time", ""))[:10] < today]
-            local = history + remote
+            local = merge_bars(local, remote)
     return _tail_trading_days(local, days)
 
 

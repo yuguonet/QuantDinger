@@ -387,8 +387,8 @@ def _refresh_backfill_1m():
 def _sync_index_minute():
     """盘后: 指数 5m K线同步 → kline_index_5m (指数分钟不可回补, 只能向前攒;
     幂等 upsert, ~104 交易日滑动窗口断采一周可补回)。
-    2026-10-27 起改走 app/data_sources/cn_stock_putdb（coord_index 多源调度）,
-    不再 importlib 载入 scripts/sync_index_minute.py。"""
+    2026-10-29 起接 app/data_sources/cn_stock_putdb.sync（写侧作业：直接调
+    coord_index 取数后落库；读侧在 cn_stock_ext）。"""
     try:
         from app.data_sources.cn_stock_putdb import sync
         r = sync()
@@ -400,8 +400,8 @@ def _sync_index_minute():
 def _sync_index_fflow():
     """盘后/盘中: 指数大盘资金流同步 → kline_index_fflow (EM 1分钟累计, 当日240根/指数;
     只能向前攒, 盘中每5分钟全日重写幂等)。
-    2026-10-27 起改走 app/data_sources/cn_stock_putdb（coord_index index_fflow）,
-    不再 importlib 载入 scripts/sync_index_fflow.py。"""
+    2026-10-29 起接 app/data_sources/cn_stock_putdb.sync_index_fflow（目标日=今天，
+    已收官跳过、未收官每轮全日重写）。"""
     try:
         from app.data_sources.cn_stock_putdb import sync_index_fflow
         r = sync_index_fflow()

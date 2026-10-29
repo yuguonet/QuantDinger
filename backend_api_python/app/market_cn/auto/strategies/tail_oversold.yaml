@@ -9,7 +9,7 @@ meta:
   name: 尾盘超卖超短
   market: A
   version: 1
-  enabled: true                # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
+  enabled: false               # 策略开关 (§3.5): 宏内一行 = 上下线; 回测/调试不受影响
   enumeration: intraday
   intraday:
     windows: ["14:50", "15:00"]   # 滚动预览窗口 (14:50 起)

@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
-"""cn_stock_putdb 批量落库契约测试（零联网、零真库）。
+"""指数同步写作业批量契约测试（零联网、零真库）。
 
-验证 sync() / sync_index_fflow() 已改为「一次打包 coordinate(kind, codes=[...])」，
-不再逐码循环 coordinate —— 即把码间 pause / 重试池上移到 dispatch.run_batch。
+被测对象 = cn_stock_putdb.sync() / .sync_index_fflow()：写侧作业直接调
+coord_index 取数后落库；读侧（读库/聚合/闸门）在 cn_stock_ext，不在本文件范围。
+
+核心断言是「一次打包 coordinate(kind, codes=[...])」——码间 pause / 重试池
+收口在 dispatch.run_batch，不逐码循环 coordinate（2026-10-27 用户裁定）。
+另一组断言是「已在目标日收官 ⇒ 零远端」的幂等跳过（2026-10-27 用户报障：
+指数/资金流重启后重复写库）。
+
+★ 2026-10-29 读写分离：曾有短暂版本把同步入口上移到 cn_stock_ext，同日按用户
+裁定回滚 —— 写作业留在 putdb（直接调 coord），本文件只改指向、不收窄断言。
 """
 
 import pytest
@@ -35,13 +43,14 @@ def mock_coord(monkeypatch):
         calls.append((kind, params))
         return _fake_out(kind, params.get("codes") or [])
 
-    # sync() 内部 `from app.data_sources.coord_index import coordinate`，
+    # 内核内部 `from app.data_sources.coord_index import coordinate`，
     # 打模块属性即可覆盖；dry_run 不触库，get_pool 返回空桩。
-    # _target_trading_day 钉死日期（不依赖交易日历/网络），_index_day_complete
-    # 默认 False（未收官 ⇒ 正常拉取）。
+    # 目标日钉死（5m 走 _target_trading_day、资金流走 _fflow_target_day，均不依赖
+    # 交易日历/网络），_index_day_complete 默认 False（未收官 ⇒ 正常拉取）。
     monkeypatch.setattr("app.data_sources.coord_index.coordinate", fake)
     monkeypatch.setattr(P, "get_pool", lambda: None)
     monkeypatch.setattr(P, "_target_trading_day", lambda: "2026-10-27")
+    monkeypatch.setattr(P, "_fflow_target_day", lambda: "2026-10-27")
     monkeypatch.setattr(P, "_index_day_complete", lambda *a, **k: False)
     return calls
 
