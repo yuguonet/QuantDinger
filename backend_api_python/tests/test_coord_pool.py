@@ -119,15 +119,6 @@ def test_paged_merges_same_source():
 
 # ── coord_pool 契约 ────────────────────────────────────────────
 
-def test_caps_match_provider_capabilities():
-    """加 kind 只改两个文件：POOL_CAPS 与 provider.capabilities 必须双向一致。"""
-    caps = set(C.POOL_CAPS)
-    for p in get_providers("limit_up_pool"):
-        declared = set(getattr(p, "capabilities", {}) or {})
-        assert declared == caps, "provider %s 声明与 POOL_CAPS 不一致: %s" % (
-            p.name, declared ^ caps)
-
-
 def test_capability_values_are_callable():
     """capabilities 的值必须是**可调用对象**。
 

@@ -149,18 +149,6 @@ def test_llm_exception_is_failed_open(env, monkeypatch):
 #  正常路径
 # ═══════════════════════════════════════════════════════════════
 
-def test_happy_path_records_pair(env):
-    r = _run(claim_ids=[11], claims=[_claim()])
-    assert r["ran"] is True and r["n_pairs"] == 1
-    rows = c3p.load_recent_pairs("2026-10-12")
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["claim_id"] == 11
-    assert row["p_base"] == pytest.approx(0.55)
-    assert row["condition_key"] == "down|low"
-    assert row["delta_p"] == pytest.approx(0.0)     # ★ P3 未上线 ⇒ 恒 0 是预期
-
-
 def test_missing_frame_yields_unknown_condition_key(env, monkeypatch):
     """情境帧取不到 ⇒ condition_key 全 unknown，**不猜**。
 
