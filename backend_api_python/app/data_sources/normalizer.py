@@ -86,6 +86,24 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+# 北交所（北证）代码段 —— **全库唯一**，禁止在别处再抄一份。
+#   43/82/83/87/88 是老三板转板段；92 是 2024-10 起启用的北交所新代码段
+#   （如 920682 球冠电缆）。腾讯/新浪的 K 线与行情接口一律要求 `bj` 前缀：
+#   实测 param=920682,day → {"code":0,"data":{}}（data 里没有该 code 的 key，
+#   provider/tencent.py:344 会打 "root不是dict, data.keys=[]"）；param=bj920682
+#   正常返回。新浪同理：sh920682/sz920682 → null，bj920682 → 日线数组。
+# ★ 2026-10-29 补 92 前，detect_market 已含 92、normalize_cn_code 却没有，
+#   同一文件内自相矛盾：能识别出北交所，却拼不出 bj 前缀 ⇒ 92 段 K 线全线取不到，
+#   降级到 sohu 才成（实测 coordinate_kline("920682","1D",5) 12.89s，正常 0.05s）。
+CN_BJ_PREFIXES = ("43", "82", "83", "87", "88", "92")
+
+
+def is_bj_code(symbol: str) -> bool:
+    """是否北交所代码（裸码或带 SH/SZ/BJ 前缀/后缀皆可）。判据见 CN_BJ_PREFIXES。"""
+    digits = to_raw_digits(symbol)
+    return bool(digits) and digits.startswith(CN_BJ_PREFIXES)
+
+
 def normalize_cn_code(symbol: str) -> str:
     """
     Normalize A-share symbol to Tencent code: sh600519 / sz000001 / bj830799.
@@ -93,9 +111,9 @@ def normalize_cn_code(symbol: str) -> str:
     前缀规则：
       沪市 (sh): 600/601/603/605/688/900
       深市 (sz): 000/001/002/003/300/200
-      北证 (bj): 43/82/83/87/88
+      北证 (bj): 43/82/83/87/88/92（见 CN_BJ_PREFIXES）
 
-    Accepts: 600519 / 600519.SH / 600519.SS / 000001.SZ / 830799.BJ
+    Accepts: 600519 / 600519.SH / 600519.SS / 000001.SZ / 830799.BJ / 920682
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -115,8 +133,8 @@ def normalize_cn_code(symbol: str) -> str:
         # 深市：00x / 300 / 301 / 200
         if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
             return "SZ" + s
-        # 北证：43 / 82 / 83 / 87 / 88
-        if s.startswith(("43", "82", "83", "87", "88")):
+        # 北证：43 / 82 / 83 / 87 / 88 / 92
+        if s.startswith(CN_BJ_PREFIXES):
             return "BJ" + s
 
     return s
@@ -214,7 +232,7 @@ def detect_market(symbol: str) -> tuple:
             return ("SH", s)
         if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
             return ("SZ", s)
-        if s.startswith(("43", "82", "83", "87", "88", "92")):
+        if s.startswith(CN_BJ_PREFIXES):
             return ("BJ", s)
 
     return ("", "")
@@ -276,7 +294,7 @@ def add_market_prefix(symbol: str, market: str = "") -> str:
                 return "SH" + digits
             if digits.startswith(("000", "001", "002", "003", "300", "301", "200")):
                 return "SZ" + digits
-            if digits.startswith(("43", "82", "83", "87", "88")):
+            if digits.startswith(CN_BJ_PREFIXES):
                 return "BJ" + digits
 
     return s  # 无法识别，原样返回

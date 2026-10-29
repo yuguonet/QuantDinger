@@ -76,10 +76,13 @@ def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
             num = str(int(num)).zfill(4)
         return num, "HKEX"
     digits = c.lstrip("SHSZBJ")
+    # 北证判据必须先于「6/9 开头 = SSE」——92 段以 9 开头，排在后面会被当成
+    # 沪 B 股判成 SSE（实测修复前 920682 → SSE）。北证段见 normalizer.CN_BJ_PREFIXES。
+    from app.data_sources.normalizer import is_bj_code
+    if c.startswith("BJ") or is_bj_code(digits):
+        return digits, "BSE"
     if c.startswith("SH") or digits.startswith(("6", "9")):
         return digits, "SSE"
-    if c.startswith("BJ") or digits.startswith(("43", "82", "83", "87", "88")):
-        return digits, "BSE"
     return digits, "SZSE"
 
 

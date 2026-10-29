@@ -282,14 +282,17 @@ def _get_limit_ratio(symbol: str, name: str = "") -> float:
     主板(60/00): 10%
     创业板(30)/科创板(68): 20%
     ST: 5%
-    北交所(43/82/83/87/88): 30%
+    北交所(43/82/83/87/88/92, 见 normalizer.CN_BJ_PREFIXES): 30%
     """
     code = symbol.split(".")[0] if "." in symbol else symbol
     if name and "ST" in name.upper():
         return 0.05
     if code.startswith(("300", "301", "688", "689")):
         return 0.20
-    if code.startswith(("43", "82", "83", "87", "88")):
+    # 北证段判据统一在 normalizer.CN_BJ_PREFIXES（含 92 段）：漏判会让 920xxx
+    # 的涨跌幅限制从 30% 掉到 10%，涨停价与涨停家数一起算错。
+    from app.data_sources.normalizer import is_bj_code
+    if is_bj_code(code):
         return 0.30
     return 0.10
 

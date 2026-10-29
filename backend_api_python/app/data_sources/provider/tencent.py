@@ -373,6 +373,11 @@ class TencentDataSource:
                         rows = v
                         break
 
+        # 无 bar 是正常业务分支（停牌/退市/新股上市前：root 有 "day" 但为空 list，
+        # 后缀匹配也命中不了 ⇒ rows 仍是 None）。不判空会让 _rows_to_dicts(None)
+        # 抛 TypeError，被协助层当成"源失败"计进熔断（830799 实测必现）。
+        if not rows:
+            return {}
         bars = _rows_to_dicts(rows, timeframe, quote_row=root.get("qt", {}).get(c)
                               if isinstance(root.get("qt"), dict) else None)
         if not bars:

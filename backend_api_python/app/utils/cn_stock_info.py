@@ -69,7 +69,10 @@ def _detect_market(code: str) -> str:
         return "SH"
     if c.startswith(("000", "001", "002", "003", "300", "301", "200")):
         return "SZ"
-    if c.startswith(("43", "82", "83", "87", "88")):
+    # 北证段判据统一在 normalizer.CN_BJ_PREFIXES（含 2024 年启用的 92 段）；
+    # 过去这里自抄一份 43/82/83/87/88，92 段会漏判 ⇒ _sina_sym 拼不出 bj 前缀。
+    from app.data_sources.normalizer import is_bj_code
+    if is_bj_code(c):
         return "BJ"
     return ""
 

@@ -228,7 +228,9 @@ def chat():
             return jsonify({"error": "message 不能为空"}), 400
 
         return Response(
-            _sse_stream(message, session_id, timeout=120),
+            # 普通对话 SSE 硬超时：原 120s 过短（LLM + 工具链易触发），与 _sse_stream 默认(300)对齐；
+            # 注意 _sse_stream 另有 SSE_HARD_TIMEOUT_EXTRA(默认+600s) 兜底，不会在 300s 被强杀。
+            _sse_stream(message, session_id, timeout=600),
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
