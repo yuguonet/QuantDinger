@@ -117,7 +117,11 @@ def test_sync_stock_kline_1d_filters_prev_day_and_normalizes(monkeypatch):
 
 
 def test_sync_stock_kline_1m_filters_and_writes(monkeypatch):
+    # 2026-10-29 夹具同型化：拉取条数与校验基准解耦（count 240→TF_FETCH_COUNT 300），
+    # 且 1m 增加交易时段过滤（09:30 竞价点 / 13:00 / 盘后 15:01~15:30 不入库）。
+    # 故补一根 09:30 断言被剔除，其余断言（条数/失败数/状态）语义不变。
     bars = [
+        {"symbol": "000001", "time": "2026-10-26 09:30:00", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 9.0},
         {"symbol": "000001", "time": "2026-10-26 09:31:00", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10.0},
         {"symbol": "000001", "time": "2026-10-26 15:00:00", "open": 1, "high": 2, "low": 0.5, "close": 1.6, "volume": 12.0},
         {"symbol": "399001", "time": "2026-10-25 15:00:00", "open": 3, "high": 4, "low": 2, "close": 3.5, "volume": 5.0},
@@ -127,11 +131,11 @@ def test_sync_stock_kline_1m_filters_and_writes(monkeypatch):
     _patch(monkeypatch, coord, rec)
 
     r = P.sync_stock_kline("1m", symbols=["000001", "399001"])
-    assert r["written"] == 2                          # 000001 两根；399001 前一日过滤
+    assert r["written"] == 2                          # 000001 两根有效（09:30 被时段过滤）；399001 前一日过滤
     assert r["failed"] == 1
     assert r["status"] == "error"                     # 1/2 成功
     kw = coord.calls[0]
-    assert kw["timeframe"] == "1m" and kw["count"] == 240
+    assert kw["timeframe"] == "1m" and kw["count"] == P.TF_FETCH_COUNT["1m"]
 
 
 def test_sync_stock_kline_all_ok_status_ok(monkeypatch):

@@ -548,9 +548,18 @@ class SohuDataSource:
     搜狐财经数据源 — A股数据源（priority=45）。
 
     能力:
-      - K线: 日/周 + 5m/15m/30m/1H 历史分钟线 + 当日1m分时（无月线，1M 不在能力集内）
+      - K线: 日/周 + 5m/15m/30m/1H 历史分钟线（无月线，1M 不在能力集内）
       - 实时行情: 单只 (-1.html) + 批量 (getqjson)
       - 全市场批量: 并发获取全市场K线
+
+    ★ 1m 已摘（2026-10-29）：`-4.html` 给的是**当日分时线**，不是 K 线 ——
+      open=high=low=close=price，无真实 OHLC；且固定返回 272 点（09:30 + 上午
+      120 + 13:00 + 下午 120 + 盘后 15:01~15:30 共 30 点），调用方按 count=240
+      取末 240 条时必然砍掉当日头部（实测 002313 变 10:02~15:30，缺 9:31~10:00）。
+      伪 high/low 会让 `market_cn/auto/core/data/frames.py` 的「当日累计极值」
+      系统性偏小 ⇒ 突破类判定失真。降级链改由 tencent→sina 承担。
+      恢复法：capabilities["kline_tf"] 加回 "1m"，并在 `_fetch_sohu_intraday`
+      返回前按 09:31~11:30 / 13:01~15:00 过滤掉 09:30、13:00 与盘后段。
 
     线程安全性:
       - 纯标准库 HTTP，线程安全
@@ -566,7 +575,7 @@ class SohuDataSource:
     capabilities = {
         "kline": True,
         "kline_priority": 45,
-        "kline_tf": {"1D", "1W", "1m", "5m", "15m", "30m", "1H"},
+        "kline_tf": {"1D", "1W", "5m", "15m", "30m", "1H"},
         "kline_batch": True,
         "kline_batch_priority": 45,
         "quote": True,
@@ -586,8 +595,6 @@ class SohuDataSource:
     # 分钟级周期: 直接走 hq.stock.sohu.com 的独立接口
     # 注: 搜狐上游只认 60m，对外统一用全链路周期名 "1H"（fetch_kline 内做映射）
     _MINUTE_PERIODS = {"5m", "15m", "30m", "1H"}
-    # 当日分时
-    _INTRADAY_PERIODS = {"1m"}
 
     def __init__(self):
         pass
@@ -597,15 +604,15 @@ class SohuDataSource:
         timeout: int = 10,
         start_date: str = "", end_date: str = "",
     ) -> Dict[str, Any]:
-        """获取单只股票K线。支持日/周线 + 5m/15m/30m/1H历史分钟线 + 当日1m分时。"""
-        # 当日分时 (1m)
-        if timeframe in self._INTRADAY_PERIODS:
-            data = _fetch_sohu_intraday(code)
-            if not data:
-                return {}
-            if count and len(data) > count:
-                data = data[-count:]  # 取最近 count 条
-            return {"bars": data, "count": len(data)}
+        """获取单只股票K线。支持日/周线 + 5m/15m/30m/1H历史分钟线。
+
+        1m 已摘（见类 docstring）：`-4.html` 是当日分时线，无真实 OHLC，
+        且固定 272 点窗口按 count 截尾会砍掉当日头部。
+        `_fetch_sohu_intraday` 实现保留，恢复法见类 docstring。
+        """
+        if timeframe == "1m":
+            return NotSupportedResult(self.name, "fetch_kline",
+                                     "1m 已摘：分时线无 OHLC（见类 docstring 恢复法）")
 
         # 历史分钟K线 (5m/15m/30m/1H)
         if timeframe in self._MINUTE_PERIODS:

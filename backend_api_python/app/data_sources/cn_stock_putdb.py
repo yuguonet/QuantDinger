@@ -276,8 +276,29 @@ def sync(symbols: Optional[List[str]] = None, dry_run: bool = False,
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# 每标的一个完整交易日应有的 bar 数（拉取数量 + 完整性校验基准）
+# 每标的一个完整交易日应有的 bar 数（**完整性校验基准**，不含任何余量）
 TF_BAR_COUNT = {"1D": 1, "1m": 240}
+
+# 实际**拉取**条数：必须严格大于 TF_BAR_COUNT。
+# 若拉取数恰等于应有根数（原实现 count=240），源返回里混入任何非交易时段点
+# 都会按"取最近 N 条"砍掉当日头部 —— 实测 2026-10-29：
+#   · sohu 一次给 272 点（09:30 + 上午120 + 13:00 + 下午120 + 盘后15:01~15:30 共30）
+#     ⇒ 截尾 240 后起点变 10:02，679 只票缺 9:31~10:00；
+#   · tencent 给 241 点（含 09:30 竞价成交点）；
+#   · sina 的 240 根跨日（前日 2 根 + 当日 238 根）。
+# 余量 60 覆盖盘后 30 + 竞价 1 + 跨日残留，并留出源侧偶发多返的缓冲。
+TF_FETCH_COUNT = {"1D": 1, "1m": 300}
+
+# 1m 有效 bar 时段（库表口径）：09:31~11:30 + 13:01~15:00 = 240 根。
+# 库表不含 09:30 集合竞价成交点与 15:01~15:30 盘后固定价格交易点；
+# 拉取余量放大后源侧会带出这些点，须在此统一剔除（跨源同一口径，勿逐 provider 各写一份）。
+_INTRADAY_1M_RANGES = ((9 * 60 + 31, 11 * 60 + 30), (13 * 60 + 1, 15 * 60))
+
+
+def _in_1m_session(dt: datetime) -> bool:
+    """bar 时刻是否落在 1m 有效时段内（分钟粒度，秒/微秒忽略）。"""
+    mins = dt.hour * 60 + dt.minute
+    return any(lo <= mins <= hi for lo, hi in _INTRADAY_1M_RANGES)
 
 
 def _stock_kline_sync_timeout() -> int:
@@ -497,7 +518,7 @@ def sync_stock_kline(tf: str = "1D", symbols: Optional[List[str]] = None,
     bar_time = datetime.strptime(target_td, "%Y-%m-%d").replace(
         hour=15, minute=0, second=0, tzinfo=TZ_CN)
 
-    count = TF_BAR_COUNT[tf]
+    count = TF_FETCH_COUNT[tf]
     key = f"{tf}:{target_td}"
     now = datetime.now(TZ_CN)
     last = _last_stock_sync.get(key)
@@ -537,12 +558,13 @@ def sync_stock_kline(tf: str = "1D", symbols: Optional[List[str]] = None,
         return {"status": "error", "written": 0, "failed": len(fetch_symbols),
                 "report": f"拉取到 0 条数据（目标 {target_td}）"}
 
-    # time 归一成 datetime + 仅保留目标交易日
+    # time 归一成 datetime + 仅保留目标交易日 + 1m 仅保留交易时段
     from app.utils.db_market import _ensure_datetime
     target_date = target_td
     all_records: List[Dict[str, Any]] = []
     bars_by_symbol: Dict[str, int] = {}
     skipped = 0
+    off_session = 0
     for b in bars:
         sym = b.get("symbol")
         if not sym:
@@ -554,10 +576,16 @@ def sync_stock_kline(tf: str = "1D", symbols: Optional[List[str]] = None,
             continue
         if dt.strftime("%Y-%m-%d") != target_date:
             continue
+        if tf == "1m" and not _in_1m_session(dt):
+            off_session += 1
+            continue
         b["symbol"] = sym
         b["time"] = dt
         all_records.append(b)
         bars_by_symbol[sym] = bars_by_symbol.get(sym, 0) + 1
+    if off_session:
+        logger.info("[putdb] kline_1m 剔除非交易时段 bar %d 条（09:30 竞价 / 13:00 / 盘后）",
+                    off_session)
 
     if not all_records:
         logger.error("[putdb] kline_%s 目标 %s 过滤后 0 条，跳过删除和写入", tf, target_td)

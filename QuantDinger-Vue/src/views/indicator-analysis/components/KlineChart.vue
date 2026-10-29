@@ -2627,18 +2627,24 @@ json.dumps(output)
       const chart = chartRef.value
       if (!chart || _minuteAnchoring) return
       let count = 0
+      let lastTs = null
       try {
         const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
         count = (list || []).length
+        if (count) lastTs = list[count - 1].timestamp
       } catch (_) { /* 预期内 */ }
       if (!count) return
       const bs = readBarSpace(chart)
       if (!(bs > 0)) return
-      const totalBars = minuteSessionBarCount(getMinuteLineSession())
+      const session = getMinuteLineSession()
+      // 右缘空位按「末柱时间→收盘的剩余交易分钟」算，而非 (totalBars - count)。
+      // 对连续数据的正常票两者等价（逐分钟流式下 count+diff 仍≈全时段柱数，柱不抖）；
+      // 但对一字板/停牌股（早盘无成交缺柱），柱数差会把空位错留右侧 ⇒ 收盘前就结束。
+      const remainBars = minuteRemainingBars(lastTs, session)
       _minuteAnchoring = true
       try {
         if (typeof chart.setOffsetRightDistance === 'function') {
-          chart.setOffsetRightDistance(Math.max(0, totalBars - count) * bs)
+          chart.setOffsetRightDistance(Math.max(0, remainBars) * bs)
         }
       } catch (_) { /* 预期内：图表未就绪时等下一轮 */ } finally {
         _minuteAnchoring = false
@@ -3074,6 +3080,33 @@ json.dumps(output)
       const morningBars = Math.max(0, toMin(session.morningEnd) - toMin(session.start))
       const afternoonBars = Math.max(0, toMin(session.end) - toMin(session.afternoonStart))
       return Math.max(1, morningBars + afternoonBars)
+    }
+
+    /**
+     * 分时：从「最后一根柱的时间」到收盘还剩多少根（=剩余交易分钟数）。
+     * 右缘空位必须按时间算，不能按柱数差（totalBars - count）：
+     * 一字板/停牌股早盘无成交会缺柱，用柱数差会把空位错误留在右侧，
+     * 导致线在收盘前就结束、右侧一大片留白（用户反馈「不以 15:00 结束」）。
+     * 收盘后（末柱时间 >= end）返回 0 ⇒ 最后一根贴右缘。
+     */
+    const minuteRemainingBars = (lastTs, session) => {
+      if (!lastTs || !session) return 0
+      const toMin = (n) => Math.floor(n / 100) * 60 + (n % 100)
+      const d = new Date(lastTs)
+      // 统一到「分钟制」再参与比较（hour*100+minute 不能直接与分钟数比）
+      const tm = toMin(d.getHours() * 100 + d.getMinutes())
+      const start = toMin(session.start)
+      const mEnd = toMin(session.morningEnd)
+      const aStart = toMin(session.afternoonStart)
+      const end = toMin(session.end)
+      const totalMin = (mEnd - start) + (end - aStart)
+      if (tm >= end) return 0
+      let elapsed
+      if (tm <= start) elapsed = 0
+      else if (tm <= mEnd) elapsed = tm - start
+      else if (tm <= aStart) elapsed = mEnd - start
+      else elapsed = (mEnd - start) + (tm - aStart)
+      return Math.max(0, totalMin - elapsed)
     }
 
     const minuteDateStr = (ts) => {
@@ -7693,8 +7726,15 @@ json.dumps(output)
 
       for (let i = 0; i < n; i++) {
         const lo = bars[i].low, hi = bars[i].high, cl = bars[i].close, vol = bars[i].volume || 0
-        if (hi <= lo || vol <= 0) continue
+        if (vol <= 0) continue
         const decay = Math.pow(0.98, n - 1 - i)
+        // 一字板/平盘（high == low，价格无区间）：全量筹码落在收盘价所在档。
+        // 否则若沿用 hi<=lo 跳过，一字板票整日被跳过 → maxDensity=0 → 筹码图空白。
+        if (hi <= lo) {
+          const flatIdx = Math.min(Math.max(Math.floor((cl - priceMin) / bucketWidth), 0), buckets - 1)
+          chipDensity[flatIdx] += vol * decay
+          continue
+        }
         const leftHalf = Math.max(cl - lo, 0.0001)
         const rightHalf = Math.max(hi - cl, 0.0001)
         const steps = Math.max(Math.floor((hi - lo) / bucketWidth) + 1, 8)
@@ -7774,7 +7814,9 @@ json.dumps(output)
       if (!canvas || !chart) return
 
       // 获取主图 pane 的高度，确保筹码图与主图Y轴对齐
-      const container = document.getElementById('kline-chart-container')
+      // 优先用组件内 ref 定位容器：避免同页多实例/缓存页时 getElementById 取到异源 DOM，
+      // 导致筹码层按错误容器算尺寸/位置（表现为错位或重复区域）
+      const container = klineContainerRef.value || document.getElementById('kline-chart-container')
       if (!container) return
       const containerH = container.clientHeight
 
@@ -9016,7 +9058,9 @@ json.dumps(output)
   height: 100%;
   background: rgba(250, 250, 250, 0.92);
   border-left: 1px solid #e8e8e8;
-  z-index: 10;
+  /* 装饰性覆盖层：仅需盖在蜡烛 canvas 之上，必须低于所有弹层（ant-popover/modal 等 1000+），
+     否则会盖住设置/指标弹窗（z-index:10 曾高于部分容器层叠导致遮挡） */
+  z-index: 1;
   pointer-events: none;
 }
 
