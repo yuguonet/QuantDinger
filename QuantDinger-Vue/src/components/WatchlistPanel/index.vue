@@ -1179,7 +1179,7 @@ export default {
       const age = stock.age_days
       if (age !== undefined && age !== null && age > 0) parts.push(`${age} 个交易日未更新`)
       const stale = stock.stale && Object.keys(stock.stale)
-      if (stale && stale.length) parts.push(stale.map(k => `${this.labelSourceByKey(k)}已失效`).join(' '))
+      if (stale && stale.length) parts.push(stale.map(k => `${this.labelSourceByKey(k)}${stock.stale[k]}`).join(' '))
       return parts.join(' · ')
     },
     // 关键位: 水平排列 —— 标题在左, 价格在一行内从左到右铺开(不再一档一行)

@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Optional
 
+from app.data_sources.normalizer import build_stock_basic_row, strip_market_prefix
 from app.data_sources.rate_limiter import get_akshare_limiter
 from app.utils.logger import get_logger
 
@@ -313,7 +314,39 @@ def fetch_stock_basic() -> Dict[str, Any]:
     get_akshare_limiter().wait()
     df = _ak().stock_info_a_code_name()
     rows = [] if df is None or getattr(df, "empty", True) else df.to_dict("records")
-    return {"rows": [{"code": _ss(r.get("code")), "name": _ss(r.get("name"))} for r in rows]}
+    out = []
+    for r in rows:
+        code = strip_market_prefix(_ss(r.get("code")))
+        if len(code) == 6 and code.isdigit():
+            out.append(build_stock_basic_row(code, r.get("name")))
+    if not out:
+        raise RuntimeError("akshare stock_basic 返回空")
+    return {"rows": out}
+
+
+def fetch_trading_calendar() -> Dict[str, Any]:
+    """交易日历（akshare trade_date_hist_sina）。
+
+    空结果一律 raise：`is_rows` 对空 list 判 True，返回空信封会挡死同族后续源。
+    """
+    try:
+        import akshare as ak
+    except ImportError as e:
+        raise RuntimeError("akshare 未安装: %s" % e) from e
+
+    df = ak.tool_trade_date_hist_sina()
+    if df is None or df.empty:
+        raise ValueError("akshare 返回空交易日历")
+
+    rows = []
+    for _, r in df.iterrows():
+        d = str(r.get("trade_date", ""))
+        if d:
+            rows.append({"date": d, "is_trading_day": True})
+
+    if not rows:
+        raise ValueError("akshare 交易日历解析后为空")
+    return {"rows": rows}
 
 
 def _ss(v, default="") -> str:
@@ -339,6 +372,7 @@ class AkshareBasicProvider:
         "cn_fundamental": lambda **kw: _rows_object(fetch_cn_fundamental_akshare(kw["code"])),
         "cn_financial": lambda **kw: _rows_object(fetch_cn_financial_indicators(kw["code"])),
         "stock_basic": lambda **kw: fetch_stock_basic(),
+        "trading_calendar": lambda **kw: fetch_trading_calendar(),
     }
 
     def fetch(self, kind: str, **params) -> Dict[str, Any]:

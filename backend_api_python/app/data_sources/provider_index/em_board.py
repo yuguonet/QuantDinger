@@ -2,7 +2,7 @@
 """provider_index / em_board —— 指数族东财源（大盘资金流 / 板块资金流 / 板块行情 / 板块成分股）。
 
 四个 kind 全部落在 push2 系（push2 / push2his / push2delay），共用同一个
-curl_cffi edge101 TLS 指纹封装（见 `fflow_em._em_get`，不要在别处重写 HTTP 层：
+curl_cffi edge101 TLS 指纹封装（见 `em_http.em_get`，不要在别处重写 HTTP 层：
 东财 CDN 对 urllib/requests 的 JA3 指纹直接掐连接）。
 
 【字段口径（东财资金流标准布局，成对出现「净额, 占比」）】
@@ -23,7 +23,7 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from app.data_sources.provider_index import fflow_em
+from app.data_sources.em_http import em_get
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,7 +73,7 @@ def _get_json(hosts, params: Dict[str, Any]) -> Dict[str, Any]:
     last_err = "no host"
     query = "&".join("%s=%s" % (k, v) for k, v in params.items())
     for host in hosts:
-        txt = fflow_em._em_get("%s?%s" % (host, query), timeout=15, retries=2)
+        txt = em_get("%s?%s" % (host, query), timeout=15, retries=2)
         if not txt:
             last_err = "empty response"
             continue

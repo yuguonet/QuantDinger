@@ -97,31 +97,41 @@ def _orderbook(code: str) -> Dict[str, Any]:
     except (ValueError, IndexError):
         return {"object": None}
 
-    # price_A2 提取 prev_close/open/high/low/vol
-    prev, open_p, high, low, vol = 0, 0, 0, 0, 0
+    # price_A2 索引（2026-10-29 与腾讯 qt.gtimg.cn 三票对拍标定 600519/000001/300750）：
+    #   [0]=均价(成交额÷成交量)  [1]=昨收  [2]="--"  [3]=今开  [4]=?
+    #   [5]=最高  [6]=振幅  [7]=最低  [8]=成交量(手)  …  [12]=成交额(万元)
+    # ⚠ 旧实现把 [0] 当昨收 ⇒ 昨收被填成均价（600519 得 1336.77，真值 1355.90），
+    #   涨跌幅/涨跌额随之失真。已按对拍结果改取 [1]。
+    prev, open_p, high, low, vol, amount = 0, 0, 0, 0, 0, 0
     if len(p2) >= 9:
         try:
-            prev = float(p2[0])
+            prev = float(p2[1])
             open_p = float(p2[3]) if p2[3] not in ("--", "") else last
             high = float(p2[5]) if p2[5] not in ("--", "") else last
             low = float(p2[7]) if p2[7] not in ("--", "") else last
             vol = float(p2[8]) * 100  # sohu vol 为"手"→×100 转"股"
         except (ValueError, IndexError):
             pass
+    if len(p2) >= 13:
+        try:
+            amount = round(float(p2[12]) * 10000, 2)  # 万元 → 元
+        except (ValueError, IndexError):
+            pass
 
-    # 标准字段（normalize_quote 的目标形状）此处全部显式给齐，无需再归一化
     result = {
-        "last": last,
-        "change": chg,
-        "changePercent": chg_pct,
+        "code": code,
+        "name": name,
+        "price": last,
+        "open": open_p or last,
         "high": high or last,
         "low": low or last,
-        "open": open_p or last,
-        "previousClose": prev or round(last - chg, 4),
+        "last_close": prev or round(last - chg, 4),
+        "change": chg,
+        "change_percent": chg_pct,
         "volume": vol,
-        "time": "",
-        "name": name,
-        "symbol": code,
+        "amount": amount,
+        # sohu 心跳不带买卖档位 ⇒ 空 dict（比 None 强：下游可读价格部分）。
+        # 字段数与族内一致；五档真实值只有 mootdx/sina/tencent 能给。
         "bid": {},
         "ask": {},
     }
@@ -134,9 +144,20 @@ def fetch_ticks_today(code: str, limit: int = 2000) -> Dict[str, Any]:
 
 
 def fetch_ticks_history(code: str, date: str, limit: int = 2000) -> Dict[str, Any]:
-    """历史分笔成交明细（东财 datacenter RPT_TRANSACTION_DET）。
+    """历史分笔成交明细（**东财报表已下线**，2026-10-29 从 capabilities 摘除）。
 
-    返回: {"rows": [{time, price, vol, amount, buy_sell}, ...]}
+    实测（2026-10-29）：`datacenter-web.eastmoney.com/api/data/v1/get`
+    对 `RPT_TRANSACTION_DET` 返回 `{"success": false, "code": 9501,
+    "message": "报表配置不存在,RPT_TRANSACTION_DET"}`；换 RPT_TRANSACTION_DETAIL /
+    RPT_TRANSACTION / RPT_DEAL_DET / RPT_TRADE_DETAIL / RPT_TRANSACTION_HIS 五个候选名
+    均同为 9501 ⇒ 东财免费历史分笔通道已下线，不是改名问题。
+
+    摘除原因：报表不存在时本函数必走 `return {"rows": [], "error": "empty"}`，
+    而 `is_rows` 对**空 list 判 True** ⇒ 恒空假源被 dispatch 判成功。
+
+    恢复方法：东财若恢复该报表（或换 reportName），把
+    `"ticks_history": fetch_ticks_history` 加回 `EastmoneyDcTapeProvider.capabilities`；
+    本函数实现原样保留，字段契约 {time, price, vol, amount, buy_sell} 未变。
     """
     # 东财成交明细: RPT_TRANSACTION_DET (DATA_CODE + TRADE_DATE)
     c = (code or "").strip().zfill(6)
@@ -196,7 +217,8 @@ class EastmoneyDcTapeProvider:
     capabilities = {
         "orderbook": _orderbook,
         "ticks_today": fetch_ticks_today,
-        "ticks_history": fetch_ticks_history,
+        # "ticks_history": 2026-10-29 摘除——东财 RPT_TRANSACTION_DET 报表已下线
+        # （code 9501 报表配置不存在），恒空信封会挡住真源，详见函数 docstring。
     }
 
     def fetch(self, kind: str, **params) -> Dict[str, Any]:

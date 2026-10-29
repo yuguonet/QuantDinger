@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from app.data_sources.normalizer import build_stock_basic_row
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -41,7 +42,7 @@ def fetch_stock_basic() -> Dict[str, Any]:
         stocks = data.get("stockList") or []
     except Exception as e:
         logger.warning("[cninfo] stock_basic 失败: %s", e)
-        return {"rows": [], "error": str(e)}
+        raise RuntimeError("巨潮 stock_basic 失败: %s" % e) from e
 
     rows = []
     for item in stocks:
@@ -50,10 +51,13 @@ def fetch_stock_basic() -> Dict[str, Any]:
         if item.get("category") != "A股":
             continue
         code = str(item.get("code", "")).strip()
-        name = str(item.get("zwjc", "")).strip()
-        if code and name and len(code) == 6 and code.isdigit():
-            rows.append({"code": code, "name": name})
+        if code and len(code) == 6 and code.isdigit():
+            row = build_stock_basic_row(code, item.get("zwjc"))
+            if row["name"]:
+                rows.append(row)
 
+    if not rows:
+        raise RuntimeError("巨潮 stock_basic 解析后为空")
     return {"rows": rows}
 
 

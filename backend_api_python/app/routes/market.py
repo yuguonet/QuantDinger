@@ -283,7 +283,7 @@ def get_watchlist():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT id, market, symbol, name, group_name, strategy_state, strategy_detail FROM qd_watchlist WHERE user_id = ? ORDER BY COALESCE(sort_order, 1000000) ASC, id DESC",
+                "SELECT id, market, symbol, name, group_name, strategy_state, strategy_detail FROM qd_watchlist WHERE user_id = %s ORDER BY COALESCE(sort_order, 1000000) ASC, id DESC",
                 (user_id,)
             )
             rows = cur.fetchall() or []
@@ -309,7 +309,7 @@ def get_watchlist():
                         backfill_budget -= 1
                         row['name'] = resolved
                         cur.execute(
-                            "UPDATE qd_watchlist SET name = ?, updated_at = NOW() WHERE user_id = ? AND market = ? AND symbol = ?",
+                            "UPDATE qd_watchlist SET name = %s, updated_at = NOW() WHERE user_id = %s AND market = %s AND symbol = %s",
                             (resolved, user_id, market, symbol)
                         )
                 except Exception:
@@ -375,7 +375,7 @@ def add_watchlist():
             cur.execute(
                 """
                 INSERT INTO qd_watchlist (user_id, market, symbol, name, group_name, created_at, updated_at) 
-                VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
                 ON CONFLICT(user_id, market, symbol, group_name) DO UPDATE SET
                     name = excluded.name,
                     group_name = excluded.group_name,
@@ -415,17 +415,27 @@ def remove_watchlist():
             cur = db.cursor()
             if market:
                 cur.execute(
-                    "DELETE FROM qd_watchlist WHERE user_id = ? AND market = ? AND symbol = ?",
+                    "DELETE FROM qd_watchlist WHERE user_id = %s AND market = %s AND symbol = %s",
                     (user_id, market, symbol)
                 )
             else:
                 # 兼容旧调用：未传 market 时按 symbol 删除（可能误删跨市场同名标的）
                 cur.execute(
-                    "DELETE FROM qd_watchlist WHERE user_id = ? AND symbol = ?",
+                    "DELETE FROM qd_watchlist WHERE user_id = %s AND symbol = %s",
                     (user_id, symbol)
                 )
             db.commit()
             cur.close()
+
+        # 联动清理孤儿标签：移出自选后，该标的若不在任何用户自选则删其标签
+        try:
+            from app.watchlist import store
+            cleaned = store.delete_orphan_labels()
+            if cleaned:
+                logger.info("[label] 移出自选后清理孤儿标签 %d 条: %s/%s", cleaned, market, symbol)
+        except Exception as e:
+            logger.warning("移出自选后清理孤儿标签失败（不影响移出结果）: %s", e)
+
         return jsonify({'code': 1, 'msg': 'success', 'data': None})
     except Exception as e:
         logger.error(f"remove_watchlist failed: {str(e)}")
@@ -455,7 +465,7 @@ def rename_watchlist_group():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT 1 FROM qd_watchlist WHERE user_id = ? AND group_name = ? AND group_name <> ? LIMIT 1",
+                "SELECT 1 FROM qd_watchlist WHERE user_id = %s AND group_name = %s AND group_name <> %s LIMIT 1",
                 (user_id, new_name, old_name)
             )
             if cur.fetchone():
@@ -463,7 +473,7 @@ def rename_watchlist_group():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "UPDATE qd_watchlist SET group_name = ?, updated_at = NOW() WHERE user_id = ? AND group_name = ?",
+                "UPDATE qd_watchlist SET group_name = %s, updated_at = NOW() WHERE user_id = %s AND group_name = %s",
                 (new_name, user_id, old_name)
             )
             updated = cur.rowcount or 0
@@ -495,12 +505,20 @@ def remove_watchlist_group():
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "DELETE FROM qd_watchlist WHERE user_id = ? AND group_name = ?",
+                "DELETE FROM qd_watchlist WHERE user_id = %s AND group_name = %s",
                 (user_id, group_name)
             )
             deleted = cur.rowcount or 0
             db.commit()
             cur.close()
+        # 联动清理孤儿标签：删分组后，组内标的若不在任何用户自选则删其标签
+        try:
+            from app.watchlist import store
+            cleaned = store.delete_orphan_labels()
+            if cleaned:
+                logger.info("[label] 删分组后清理孤儿标签 %d 条: group=%s", cleaned, group_name)
+        except Exception as e:
+            logger.warning("删分组后清理孤儿标签失败（不影响删组结果）: %s", e)
         if deleted == 0:
             return jsonify({'code': 0, 'msg': '分组不存在', 'data': None}), 200
         return jsonify({'code': 1, 'msg': 'success', 'data': {'deleted': deleted}})

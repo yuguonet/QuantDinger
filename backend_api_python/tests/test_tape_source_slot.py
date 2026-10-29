@@ -4,13 +4,14 @@
 验证的是"插槽"的行为，不是具体数据源：
   · 源抛异常 → 继续下一个，不中断；
   · 源返回错误 dict `{"code","error"}` → 不算成功（信封不合协议，必须换源）；
-  · 全失败 → 保持原契约（盘口返回 error dict、分笔返回 []、资金流带 error）；
+  · 全失败 → 保持原契约（盘口返回 error dict、分笔返回 []）；
   · 公共函数签名冻结。
 
 2026-10-27 起 orderbook/ticks 插槽 = coord_tape provider 表（Phase C 起
 get_order_book/get_ticks_today 走 coord_tape 多源调度，旧 *_SOURCES 槽表
-已无人消费），分发语义由 dispatch.py 统一保证；fund_flow_daily 仍走
-_first_ok + _FUND_FLOW_DAILY_SOURCES（本文件后半段，原样锁定）。
+已无人消费），分发语义由 dispatch.py 统一保证。个股资金流已于 2026-10-28
+整体改为本地派生（snapshot / kline_1m），无源表可测，原两条日级用例随源表
+一并退役。
 """
 import inspect
 
@@ -82,23 +83,6 @@ def test_ticks_all_fail_returns_empty_list(monkeypatch):
     dead = Fake("a", {"ticks_today": True}, raises=RuntimeError("down"))
     _patch_coord(monkeypatch, [dead])
     assert tape.get_ticks_today("600519") == []
-
-
-def test_fund_flow_daily_propagates_last_error(monkeypatch):
-    monkeypatch.setattr(tape, "_FUND_FLOW_DAILY_SOURCES", [
-        ("sina", lambda code, days: {"code": code, "error": "sina boom"}),
-        ("em", lambda code, days: {"code": code, "error": "em boom"}),
-    ])
-    out = tape.get_fund_flow_daily("600519")
-    assert out["error"] == "em boom"
-
-
-def test_fund_flow_daily_stamps_source(monkeypatch):
-    monkeypatch.setattr(tape, "_FUND_FLOW_DAILY_SOURCES", [
-        ("sina", lambda code, days: {"code": code, "data": [1, 2, 3]}),
-    ])
-    out = tape.get_fund_flow_daily("600519")
-    assert out["source"] == "sina" and out["data"] == [1, 2, 3]
 
 
 # ── 签名冻结 ────────────────────────────────────────────────────

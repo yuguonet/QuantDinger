@@ -2,10 +2,7 @@
 """
 market-screener/common.py
 
-通用基础设施：数据加载、技术指标计算、涨停/跌停/炸板池（市场事实）。
-
-【2026-10-28】龙回头检测已随「选股去连板/龙回头」整段移除；近 N 日涨停池
-仅保留给 inspect_stock 的涨停史客观事实，不再进候选池。
+通用基础设施：数据加载、技术指标计算、涨停/跌停/炸板池、龙回头检测。
 三个策略（盘中/尾盘/盘后）共享此模块。
 """
 
@@ -101,7 +98,8 @@ class SkillReport:
 # ═══════════════════════════════════════════════════════════════
 
 _SRC_SHORT = {
-    "热点题材": "热点", "条件搜索": "搜索",
+    "连板": "连板", "龙回头": "龙头", "尾盘封板": "封板", "尾盘强势": "尾强",
+    "盘后筛选": "筛选", "条件搜索": "搜索", "4IN1(近期涨停)": "4IN1",
 }
 
 _DIR_CN = {"bullish": "看多", "bearish": "看空", "neutral": "中性"}
@@ -497,18 +495,7 @@ def call_tool(name: str, **kwargs) -> Any:
     """按名称分发工具调用。"""
     fn = _TOOL_REGISTRY.get(name)
     if fn is None:
-        # 惰性登记（2026-10-28 多源选股：人气榜/板块成分必须可调）
-        try:
-            if name == "get_hot_rank":
-                from ...tools.finance.dragon_tools import get_hot_rank as _fn
-            elif name == "get_sector_stocks":
-                from ...tools.finance.sector_analysis_tools import get_sector_stocks as _fn
-            else:
-                return {"error": f"未知工具: {name}"}
-            _TOOL_REGISTRY[name] = _fn
-            fn = _fn
-        except Exception as e:
-            return {"error": f"未知工具: {name} ({type(e).__name__}: {e})"}
+        return {"error": f"未知工具: {name}"}
     try:
         return fn(**kwargs)
     except Exception as e:
@@ -802,14 +789,15 @@ def compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
             atrs[i] = (atrs[i - 1] * (period - 1) + trs[i]) / period
     return atrs
 # ═══════════════════════════════════════════════════════════════
-#  近 N 日涨停池（inspect_stock 涨停史事实；不进候选池）
+#  龙回头弱转强检测（盘中 + 盘后共享）
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
-    """近 N 日涨停池（仅供 inspect_stock 的涨停史客观事实）。
+    """近 N 日涨停池（龙回头输入）。
 
-    容错口径（2026-10-21）：单日失败跳过并留痕；**全部日期都失败**时必须抛出，
-    否则源故障会塌缩成「近 N 日无涨停」假事实。
+    容错口径（2026-10-21，配合四源 fail-fast）：单日失败跳过并留痕（历史某日
+    缺数据不致命）；但**全部日期都失败**时必须抛出——否则源故障会塌缩成
+    「近 8 日无涨停」，龙回头源随之静默空手而归（源失败显性化同一纪律）。
     """
     pools = {}
     today = datetime.now()
@@ -827,6 +815,141 @@ def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
     if not pools and last_err is not None:
         raise last_err
     return pools
+def scan_dragon_pullback(date: str) -> List[Dict]:
+    recent_pools = fetch_recent_zt_pools(8)
+    code_history: Dict[str, List[Dict]] = {}
+
+    for pool_date, pool in recent_pools.items():
+        for s in pool:
+            code = s.get("stock_code", "")
+            if not code:
+                continue
+            if code not in code_history:
+                code_history[code] = []
+            code_history[code].append({
+                "date": pool_date,
+                "continuous_days": int(s.get("continuous_zt_days", 1) or 1),
+                "reason": s.get("reason", ""),
+                "name": s.get("stock_name", ""),
+            })
+
+    dragon_codes = {}
+    for code, records in code_history.items():
+        max_days = max(r["continuous_days"] for r in records)
+        if max_days >= 2:
+            dragon_codes[code] = {
+                "name": records[0]["name"],
+                "max_continuous_days": max_days,
+                "zt_dates": [r["date"] for r in records],
+                "last_zt_date": max(records[0]["date"], date),
+                "reason": records[0]["reason"],
+            }
+
+    if not dragon_codes:
+        return []
+
+    candidates = []
+    for code, info in dragon_codes.items():
+        bars = fetch_kline(code, days=30)
+        if len(bars) < 10:
+            continue
+
+        closes = [b["close"] for b in bars]
+        volumes = [b["volume"] for b in bars]
+        highs = [b["high"] for b in bars]
+        lows = [b["low"] for b in bars]
+        n = len(bars)
+        i = n - 1
+
+        lookback_start = max(0, n - 15)
+        peak_idx = lookback_start
+        for j in range(lookback_start, n):
+            if highs[j] > highs[peak_idx]:
+                peak_idx = j
+
+        if peak_idx >= i:
+            continue
+
+        peak_price = highs[peak_idx]
+        current_close = closes[i]
+        trough_price = min(lows[peak_idx + 1:i + 1]) if peak_idx + 1 <= i else current_close
+        pullback_pct = (peak_price - trough_price) / peak_price * 100
+
+        if pullback_pct < 8 or pullback_pct > 35:
+            continue
+
+        signals = []
+        strength_score = 0
+
+        pullback_volumes = volumes[peak_idx + 1:i]
+        avg_pullback_vol = sum(pullback_volumes) / len(pullback_volumes) if pullback_volumes else 1
+        vol_ratio_today = volumes[i] / avg_pullback_vol if avg_pullback_vol > 0 else 1
+        if vol_ratio_today > 1.5:
+            signals.append(f"放量{vol_ratio_today:.1f}倍")
+            strength_score += 15
+        elif vol_ratio_today > 1.2:
+            signals.append(f"温和放量{vol_ratio_today:.1f}倍")
+            strength_score += 8
+
+        if closes[i] > bars[i]["open"]:
+            signals.append("收阳")
+            strength_score += 5
+
+        ma5 = compute_ma(closes, 5)
+        if ma5[i] is not None and closes[i] > ma5[i]:
+            signals.append("站上MA5")
+            strength_score += 8
+
+        if ma5[i] is not None and ma5[i - 1] is not None:
+            ma5_slope_today = (ma5[i] - ma5[i - 1]) / ma5[i - 1] * 100 if ma5[i - 1] > 0 else 0
+            if ma5_slope_today > 0:
+                signals.append("MA5拐头")
+                strength_score += 5
+
+        rsi = compute_rsi(closes)
+        if rsi[i] > 40 and rsi[i - 1] < 40:
+            signals.append(f"RSI低位回升{rsi[i]:.0f}")
+            strength_score += 10
+        elif 40 <= rsi[i] <= 60:
+            signals.append(f"RSI{rsi[i]:.0f}中性")
+            strength_score += 3
+
+        if len(pullback_volumes) >= 2:
+            vol_declining = all(
+                pullback_volumes[j] <= pullback_volumes[j - 1] * 1.1
+                for j in range(1, len(pullback_volumes))
+            )
+            if vol_declining:
+                signals.append("回调缩量(卖盘衰竭)")
+                strength_score += 10
+
+        if ma5[i] is not None and lows[i] <= ma5[i] * 1.01 and closes[i] > ma5[i]:
+            signals.append("均线支撑")
+            strength_score += 8
+
+        if len(signals) < 2:
+            continue
+
+        candidates.append({
+            "code": code, "name": info["name"], "source": "龙回头",
+            "max_continuous_days": info["max_continuous_days"],
+            "zt_dates": info["zt_dates"], "reason": info["reason"],
+            "pullback_pct": round(pullback_pct, 1),
+            "peak_price": round(peak_price, 3),
+            "trough_price": round(trough_price, 3),
+            "close": round(closes[i], 3),
+            "vol_ratio_today": round(vol_ratio_today, 2),
+            "rsi": round(rsi[i], 2),
+            "signals": signals, "strength_score": strength_score,
+            "evaluation": {
+                "score": strength_score,
+                "highlights": signals,
+                "warnings": [] if strength_score >= 40 else ["强度偏低，谨慎"],
+            },
+        })
+
+    candidates.sort(key=lambda x: -x["strength_score"])
+    return candidates
 
 
 # ═══════════════════════════════════════════════════════════════

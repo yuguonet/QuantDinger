@@ -4,7 +4,7 @@
 背景:
   个股分钟资金流原走东财 push2 远程（tape.get_fund_flow_realtime），盘中频繁
   `RemoteDisconnected`，且外网依赖重。本模块改为**从本地 DB 派生**，盘中零外网。
-  远程仅在本地无数据时兜底（见 tape.get_fund_flow_realtime）。
+  2026-10-28 远端源整族下线后，本模块即该能力的唯一实现。
 
 数据来源:
   realtime_snapshot（scheduler 每 60s/拍全市场快照，见 realtime_snapshot.py）
@@ -51,7 +51,8 @@ def _table() -> str:
 
 
 def _empty(code: str) -> Dict[str, Any]:
-    return {"code": code, "points": 0, "total_main_net": 0.0, "data": [],
+    return {"code": code, "points": 0, "total_main_net": 0.0, "total_amount": 0.0,
+            "main_pct": None, "data": [],
             "source": "realtime_snapshot", "approx": True, "note": _NOTE}
 
 
@@ -77,7 +78,8 @@ def get_fund_flow_from_snapshot(code: str, date: Optional[str] = None) -> Dict[s
         date: "YYYY-MM-DD"；None = 当日（无数据则回退最近交易日）
 
     Returns:
-        {code, points, total_main_net, data:[{time, main_net, small_net, mid_net,
+        {code, points, total_main_net, total_amount, main_pct,
+         data:[{time, main_net, small_net, mid_net,
          large_net, super_net}], source:"realtime_snapshot", approx:True, note}
         无数据时 data=[]（调用方据此回退远程）。
     """
@@ -125,11 +127,12 @@ def _derive(code: str, rows: List) -> Dict[str, Any]:
     避免"数据错了但没人知道"重演（provider 层"允许空、不允许错"的延伸）。
 
     Returns:
-        {"code", "points", "total_main_net", "data", "dropped",
-         "source", "approx", "note"}
+        {"code", "points", "total_main_net", "total_amount", "main_pct",
+         "data", "dropped", "source", "approx", "note"}
     """
     data: List[Dict[str, Any]] = []
     dropped = {"negative": 0, "jump": 0}
+    amt_sum = 0.0
     prev = None
     for r in rows:
         t, last, vol = r[0], r[1], r[2]
@@ -147,9 +150,11 @@ def _derive(code: str, rows: List) -> Dict[str, Any]:
             elif p_last is not None:
                 dlast = float(last) - float(p_last)
                 direction = 1 if dlast > 0 else (-1 if dlast < 0 else 0)
+                amt = dvol * float(last)
+                amt_sum += amt
                 data.append({
                     "time": t.strftime("%Y-%m-%d %H:%M") if hasattr(t, "strftime") else str(t),
-                    "main_net": round(dvol * float(last) * direction, 2),
+                    "main_net": round(amt * direction, 2),
                     "small_net": None, "mid_net": None,
                     "large_net": None, "super_net": None,
                 })
@@ -162,6 +167,10 @@ def _derive(code: str, rows: List) -> Dict[str, Any]:
             "（保留 %d 拍，净额 %s）",
             code, dropped["negative"], dropped["jump"], len(data), total,
         )
-    return {"code": code, "points": len(data), "total_main_net": total, "data": data,
+    amt_sum = round(amt_sum, 2)
+    return {"code": code, "points": len(data), "total_main_net": total,
+            "total_amount": amt_sum,
+            "main_pct": (round(total / amt_sum * 100.0, 2) if amt_sum else None),
+            "data": data,
             "dropped": dropped,
             "source": "realtime_snapshot", "approx": True, "note": _NOTE}

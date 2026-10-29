@@ -2,8 +2,9 @@
 """
 Fund Flow Tools — 资金流向（个股/板块/大盘）。
 
-数据源优先级：腾讯 > 新浪 > 同花顺 > 东财
-（market_cn.tape / market_cn.index 已内置多源容灾）
+个股：本地量价派生（kline_1m 日级 / realtime_snapshot 分钟级），
+      口径是「价格方向净额」，**不是**主力/机构资金，详见 get_fund_flow_daily。
+板块/大盘：远端多源（market_cn.index 已内置多源容灾）。
 """
 from __future__ import annotations
 import json
@@ -12,8 +13,11 @@ from ...log import logger
 from typing import Any, Dict, List
 from ...utils.md_format import _batch_execute, _to_md
 def _fund_flow_stock_realtime(codes: str) -> dict:
-    """个股实时资金流 + 5日/20日累计（2026-09-28 补全多日汇总）。
+    """个股当日「价格方向净额」+ 5日/20日累计（本地派生，非主力资金口径）。
 
+    返回字段同 tape.get_fund_flow_realtime（total_main_net / main_pct / data），
+    再并入 daily 的 recent_5d/20d_main_net 与 recent_5d/20d_net_ratio。
+    口径见 get_fund_flow_daily：比较强度用 main_pct / net_ratio，不用绝对金额。
     私有函数不注册（_ 前缀），仅供 get_fund_flow(scope="stock") 分发。
     """
     if not codes or not codes.strip():
@@ -33,6 +37,8 @@ def _fund_flow_stock_realtime(codes: str) -> dict:
                     if isinstance(daily, dict) and "error" not in daily:
                         rt["recent_5d_main_net"] = daily.get("recent_5d_main_net")
                         rt["recent_20d_main_net"] = daily.get("recent_20d_main_net")
+                        rt["recent_5d_net_ratio"] = daily.get("recent_5d_net_ratio")
+                        rt["recent_20d_net_ratio"] = daily.get("recent_20d_net_ratio")
                 except Exception as e:
                     logger.debug("_fund_flow_stock_realtime(%s) daily 汇总失败: %s", code, e)
             results[code] = rt
@@ -81,7 +87,7 @@ def _fund_flow_boards_view(src: dict) -> dict:
 
 def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
                   indicator: str = "今日") -> dict:
-    """资金流向统一入口：按 scope 返回个股/市场/板块的主力资金净流入。
+    """资金流向统一入口：个股按 scope 返回「价格方向净额」，板块/大盘返回远端主力净额。
 
     Args:
         scope: stock | stock_daily | market | sector | concept
@@ -91,8 +97,9 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
 
     Returns:
         信封格式（scope 决定结构）：
-        stock       → {"count": N, "data": {CODE: {主力净流入, 趋势, ...}}}
-        stock_daily → {"count": N, "data": {CODE: {data:[{date, main_net, ...}]}}}
+        stock       → {"count": N, "data": {CODE: {total_main_net, main_pct,
+                        recent_5d_main_net, recent_5d_net_ratio, ...}}}
+        stock_daily → {"count": N, "data": {CODE: {data:[{date, main_net, net_ratio,...}]}}}
         market      → {"source","main_net","in_net","out_net",...}
         sector/concept → {"indicator","count","boards":[{name, main_net, ...}]}
         统一顶层键: "data"/"count"/"error"(失败)。切片迭代先取 result["data"]。
@@ -149,19 +156,22 @@ def _get_concept_fund_flow(indicator: str = "今日") -> dict:
         logger.warning("_get_concept_fund_flow failed: %s", e)
         return {"error": str(e)}
 def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
-    """个股历史资金流向：返回近N天每日主力/散户净流入金额。
+    """个股近 N 日「价格方向净额」序列与摘要。
 
-    Args:
+        Args:
         codes: 多股用逗号分隔
         days: 回溯天数，默认 30
 
     Returns:
-        统一结构（单/多股一致）：{"count": N, "data": {代码: 单股结果}, "error": None}；
+        统一结构：{"count": N, "data": {代码: 单股结果}, "error": None}；
         失败 → {"error": "...", "retriable": False}。单股结果字段：
-        {code, total_days, recent_5d_main_net, recent_20d_main_net（近5/20日主力累计，元）,
-         main_net_streak（主力连续同向天数）, main_net_streak_dir, max_main_net_day,
-         max_main_net, recent_20d_main_net_ex_max（剔除最大单日后的累计口径）,
-         recent_5d_sign（近5日逐日符号序列 "+"净流入/"-"净流出）, data:[...]}
+        {code, total_days,
+         recent_5d_main_net, recent_20d_main_net（近5/20日净额累计，元）,
+         recent_5d_net_ratio, recent_20d_net_ratio（区间净额÷成交额，%，跨票可比）,
+         main_net_streak（连续同向天数）, main_net_streak_dir, max_main_net_day,
+         max_main_net, recent_20d_main_net_ex_max（剔除最大单日）,
+         recent_5d_sign（近5日逐日符号串）,
+         data:[{date, main_net, net_ratio, turnover, small_net..super_net}]}
     """
     # ── days 默认 30 的依据（2026-10-21 实测；论证不进 docstring：docstring 是
     # 工具契约，模型逐轮读，只该讲"干什么/怎么传/返回什么"）──

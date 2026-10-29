@@ -181,8 +181,8 @@ def _detect_market(code: str) -> str:
     # 深市主板 + 创业板 + B股
     if c.startswith(("000", "001", "002", "003", "300", "301", "200")):
         return "SZ"
-    # 北交所
-    if c.startswith(("43", "82", "83", "87", "88")):
+    # 北交所（920 为 2024 年启用的新号段）
+    if c.startswith(("43", "82", "83", "87", "88", "92")):
         return "BJ"
     return ""
 
@@ -1073,7 +1073,7 @@ class StockBasicDB:
                 stocks.append({
                     "symbol": code,
                     "name": name,
-                    "market_cn": _detect_market(code),
+                    "market_cn": str(r.get("market_cn") or ""),
                 })
         if not out.get("ok") or not stocks:
             logger.warning("[stock_basic] 拉取失败: %s", out.get("error"))

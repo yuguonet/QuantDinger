@@ -49,8 +49,15 @@ def trading_age_days(updated_at: Any, ref: Optional[str] = None) -> Optional[int
     if d0.strftime("%Y-%m-%d") >= ref:
         return 0
     nxt = (d0 + timedelta(days=1)).strftime("%Y-%m-%d")
+    ref_dt = to_dt(ref).date()
+    today = datetime.now().date()
+    # 年龄 = 已**收盘**的交易日数：ref 当天（今天）尚未收盘，不计入 ⇒ 盘后刷新的标签次日早晨 age=0，
+    # 而非误报 1。历史 asof（ref≠今天，如回测）仍按 [nxt, ref] 计。
+    end = (ref_dt - timedelta(days=1)).strftime("%Y-%m-%d") if ref_dt == today else ref
+    if end < nxt:
+        return 0
     try:
-        return max(0, tcal.trading_days_count(nxt, ref))
+        return max(0, tcal.trading_days_count(nxt, end))
     except Exception:
         return None
 

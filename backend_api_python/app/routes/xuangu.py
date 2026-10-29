@@ -414,6 +414,15 @@ def remove_from_watchlist(item_id: int):
             conn.commit()
             cur.close()
 
+        # 联动清理孤儿标签：移出自选后，该标的若不在任何用户自选则删其标签
+        try:
+            from app.watchlist import store
+            cleaned = store.delete_orphan_labels()
+            if cleaned:
+                logger.info("[label] 移出自选后清理孤儿标签 %d 条: item=%s", cleaned, item_id)
+        except Exception as e:
+            logger.warning("移出自选后清理孤儿标签失败（不影响移出结果）: %s", e)
+
         return jsonify({"code": 0, "msg": "已从自选中移除"})
     except Exception as e:
         logger.error(f"remove_from_watchlist failed: {e}", exc_info=True)

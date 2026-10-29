@@ -2082,3 +2082,5 @@ F2	trading_day_context() 注入 system（{{ trading_days }}），消除「后天
 日k线还是作为主线主战场
 历史分钟线应该只用于日内分析,也就是说只会用1-2日的1m线
 实时线realtime和1m线是同一根线,做历史分析用1m线,做实时分析用realtime线,realtime需要除错
+
+cn_stock_ext.py中,需要用backend_api_python\app\utils\trading_calendar.py检查库中数据的新鲜度,这才是远端数据源兜底的真正作用

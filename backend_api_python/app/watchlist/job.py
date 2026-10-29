@@ -27,8 +27,14 @@ def takeover_report(asof: Optional[str] = None) -> Dict[str, Any]:
     higher = store.fetch_higher_grade_latest()     # 未失效的高级行
     expired = store.fetch_expired_by_grade(asof)   # 已失效的行
 
+    # 接管率口径：scope 与 higher/expired **必须同口径** = 仅 watchlist 内。
+    # 否则全表的 auto 标签会让 higher_active 远超 scope，接管率算出负值（失真）。
+    scope_set = set(store.list_watchlist_symbols())
+
     items: List[Dict[str, Any]] = []
     for row in expired:
+        if (row["market"], row["symbol"]) not in scope_set:
+            continue
         items.append({
             "market": row["market"], "symbol": row["symbol"],
             "source": row["source"], "grade": row["grade"],
@@ -37,6 +43,8 @@ def takeover_report(asof: Optional[str] = None) -> Dict[str, Any]:
             "state": "expired",
         })
     for (market, symbol), row in higher.items():
+        if (market, symbol) not in scope_set:
+            continue
         items.append({
             "market": market, "symbol": symbol,
             "source": row["source"], "grade": row["grade"],
@@ -45,7 +53,7 @@ def takeover_report(asof: Optional[str] = None) -> Dict[str, Any]:
             "state": "active",
         })
 
-    scope = len(store.list_watchlist_symbols())
+    scope = len(scope_set)
     expired_n = sum(1 for i in items if i["state"] == "expired")
     active_higher = sum(1 for i in items if i["state"] == "active")
     report = {
@@ -83,6 +91,28 @@ def run_daily(asof: Optional[str] = None) -> Dict[str, Any]:
     stats["takeover"] = {
         k: report[k] for k in ("scope", "higher_active", "higher_expired", "takeover_rate")
     }
+
+    # 兜底清理孤儿标签：移出自选 / 历史遗留 / 其他入口删 watchlist 行后，
+    # 不在任何用户自选的标签立即回收（防复发；亦为接管率口径一致性兜底）。
+    try:
+        orphan_n = store.delete_orphan_labels()
+        if orphan_n:
+            logger.info("[label] 孤儿标签清理: 删除 %d 条", orphan_n)
+        stats["orphan_cleaned"] = orphan_n
+    except Exception as e:
+        logger.warning("[label] 孤儿标签清理失败（不影响刷分）: %s", e)
+        stats["orphan_cleaned"] = None
+
+    # 过期标签 TTL 回收：回收过期 >30 天的行（与孤儿清理正交；保留近期过期给 stale 显示）
+    try:
+        expired_n = store.delete_expired_labels(older_than_days=30)
+        if expired_n:
+            logger.info("[label] 过期标签回收(>30d): 删除 %d 条", expired_n)
+        stats["expired_cleaned"] = expired_n
+    except Exception as e:
+        logger.warning("[label] 过期标签回收失败（不影响刷分）: %s", e)
+        stats["expired_cleaned"] = None
+
     det = cal_stats.get("detect") or {}
     rec = cal_stats.get("recal") or {}
     stats["calibrate"] = {

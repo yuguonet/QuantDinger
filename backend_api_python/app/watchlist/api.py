@@ -25,6 +25,7 @@ from app.watchlist import model, store
 from app.watchlist.render import render_one
 from app.watchlist.render import section_empty as render_section_empty
 from app.watchlist.render import to_dt as render_to_dt
+from app.watchlist.render import trading_age_days
 
 logger = get_logger(__name__)
 
@@ -173,11 +174,7 @@ def _pick(rows: List[Dict[str, Any]]):
             age = None
             start = render_to_dt(r.get("updated_at"))
             if start is not None:
-                try:
-                    nxt = (start.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-                    age = tcal.trading_days_count(nxt, now.strftime("%Y-%m-%d"))
-                except Exception:
-                    age = None
+                age = trading_age_days(start, now.strftime("%Y-%m-%d"))
             stale[r.get("source")] = (f"{age} 个交易日未更新" if age is not None else "已失效")
             continue
         if pick is None:

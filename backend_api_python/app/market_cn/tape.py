@@ -11,8 +11,8 @@
   五档 / 分笔: 一律经 app/data_sources/coord_tape
                （orderbook / ticks_today / ticks_history；mootdx·sina·tencent·eastmoney_dc
                 四源由 dispatch 排序降级，本文件不再自建"源1→源2"链）
-  资金流向:    分钟级 本地快照派生 → 新浪日级 → 东财 push2（暂留，Phase 3 收敛）
-               日级   新浪 → 东财 push2his（暂留，Phase 3 收敛）
+  资金流向:    分钟级 本地 realtime_snapshot 派生
+               日级   本地 kline_1m 派生（+ qd_fund_flow_stock 缓存）
 
 遗留直连（未收敛，勿增用）:
   `_get_liutongguben` 仍经 utils/mootdx_client 直连 TDX get_finance_info（万股口径），
@@ -39,7 +39,7 @@ from app.utils.mootdx_client import get_client as _get_client
 # ══════════════════════════════════════════════════════════════
 #  源表（插槽）— 已于 2026-10-28 全部清空
 #  orderbook/ticks 于 Phase C（2026-10-26）改走 coord_tape；个股资金流于
-#  2026-10-28 改走 coord_misc（stock_flow_rt / stock_flow_daily）。
+#  2026-10-28 改走本地派生（snapshot / kline_1m），远端源已整族下线。
 #  插槽语义现由 dispatch.py 统一保证（见 tests/test_tape_source_slot.py）
 # ══════════════════════════════════════════════════════════════
 
@@ -623,59 +623,43 @@ def get_realtime_snapshot(code: str) -> Dict[str, Any]:
 
 
 def get_fund_flow_realtime(code: str) -> Dict[str, Any]:
-    """获取当日分钟级资金流向。
+    """获取当日分钟级资金流向 —— 本地 realtime_snapshot 派生（零外网）。
 
-    数据源优先级（2026-09-22 主备翻转）：
-      1. **本地 realtime_snapshot 派生**（量价方向近似，零外网）—— 主源；
-      2. **新浪日级资金流**（无反爬，稳定）—— 外部主源；
-      3. 东财 push2 远程 —— 末级兜底（熔断期内自动跳过，不反复打扰反爬源）。
-
-    返回结构两源一致：
-        {code, points, total_main_net,
+    返回结构：
+        {code, points, total_main_net, total_amount, main_pct,
          data: [{time, main_net, small_net, mid_net, large_net, super_net}]}
-    ⚠ 本地源为**量价近似**（返回带 approx=True），非真实主力/散户分类，
+    ⚠ 为**量价近似**（返回带 approx=True），非真实主力/散户分类：
+       main_net 是「累计成交量增量 × 价格方向」，度量日内价格动能，不含"谁在买"；
+       main_pct 是当日净额占成交额百分比（%，-100~+100），跨票可比，优先用它。
        口径见 market_cn/fund_flow_local.py。
     """
-    # 1) 本地快照派生（外网零依赖）
     try:
         from app.market_cn.fund_flow_local import get_fund_flow_from_snapshot
         local = get_fund_flow_from_snapshot(code)
         if local.get("data"):
             return local
+        return {"code": code, "error": "empty snapshot", "source": "realtime_snapshot",
+                "points": 0, "total_main_net": 0.0, "total_amount": 0.0,
+                "main_pct": None, "data": [], "approx": True}
     except Exception as e:
         logger.warning("[fund_flow] 本地快照派生失败(%s): %s", code, e)
-
-    # 2) 远端：coord_misc("stock_flow_rt") —— 新浪 1 点近似(优先) → 东财分钟级 240 点
-    from app.data_sources.coord_misc import coordinate as _coord_misc
-    out = _coord_misc("stock_flow_rt", code=code)
-    rows = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
-    if not out.get("ok") or not rows:
-        logger.warning("[fund_flow] 远端资金流失败(%s): %s", code, out.get("error"))
-        return {"code": code, "error": out.get("error") or "获取失败", "source": ""}
-
-    total_main = sum(r.get("main_net") or 0 for r in rows)
-    return {
-        "code": code,
-        "points": len(rows),
-        "total_main_net": round(total_main, 2),
-        "data": rows,
-        "source": out.get("source", ""),
-    }
+        return {"code": code, "error": str(e)[:160], "source": ""}
 
 
-# ── 个股日级资金流（远端取数收口 coord_misc，本段只做摘要计算）──
+# ── 个股日级资金流（本地 kline_1m 派生 + 库，本段只做摘要计算）──
 
 def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
-    """获取近 N 日日级资金流向。
+    """获取近 N 日资金方向净额序列与摘要。
 
-    远端取数: `coord_misc("stock_flow_daily")` —— 新浪 lscjfb（主，真实四档）→
-    东财 push2his daykline（兜底）。选源/降级/超时在 data_sources 层按 priority 决定，
-    本函数只做槽位映射与摘要计算。
+    取数: `fund_flow_api.stock_fund_flow_history` —— 本地 kline_1m 量价方向派生
+    （优先读 `qd_fund_flow_stock`，缺日现算并回填）。本函数只做摘要计算。
 
-    用途:
-      - 分析近 120 日的主力资金趋势
-      - 判断机构是在持续建仓还是减仓
-      - 配合股价走势做资金面分析
+    口径（勿按"主力资金"读取）:
+        net = Σ(上涨分钟成交额) - Σ(下跌分钟成交额) = 成交额 × 价格方向偏度。
+        它度量当日**价格动能的方向与强度**，不含"谁在买"的信息，与东财主力净额
+        （超大+大单净额，四档零和分解）不可换算：同日同票比值跨日 CV 2~25、
+        近 5 日累计方向相反率 7/12，任何固定系数缩放都不成立。
+        横向比较强度用 net_ratio（无量纲占比），不要用 main_net 的绝对值。
 
     Args:
         code: 股票代码，如 "600519"
@@ -685,38 +669,56 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
         成功: {
             code: "600519",
             total_days: 120,
-            recent_5d_main_net / recent_20d_main_net,
+            recent_5d_main_net / recent_20d_main_net（元）,
+            recent_5d_net_ratio / recent_20d_net_ratio（%，区间净额合计÷成交额合计）,
             main_net_streak / main_net_streak_dir,
             max_main_net_day / max_main_net / recent_20d_main_net_ex_max,
             recent_5d_sign,
-            data: [{date, main_net, small_net, mid_net, large_net, super_net}] (升序),
-            source: "sina" | "eastmoney",
+            data: [{date, main_net, net_ratio, turnover, small_net, mid_net,
+                    large_net, super_net}] (升序),
+            source: "kline_1m",
         }
         失败: {code, error, source:""}
 
-    口径: main = 超大 + 大（东财自洽式），单位元。
+    net_ratio 单位 %，范围 -100~+100；turnover 缺失的日子为 None（不回落 0）。
+    四档恒为 None（本地不具备拆单能力）。
     """
-    from app.data_sources.coord_misc import coordinate as _coord_misc
+    from app.market_cn.fund_flow_api import stock_fund_flow_history
 
-    out = _coord_misc("stock_flow_daily", code=code, days=days)
-    flow = [r for r in ((out.get("data") or {}).get("rows") or []) if isinstance(r, dict)]
-    if not out.get("ok") or not flow:
-        logger.warning("[fund_flow] 日级资金流失败(%s): %s", code, out.get("error"))
-        return {"code": code, "error": out.get("error") or "获取失败", "source": ""}
+    try:
+        flow = stock_fund_flow_history(code, days=days) or []
+    except Exception as e:
+        logger.warning("[fund_flow] 日级资金流失败(%s): %s", code, e)
+        return {"code": code, "error": str(e)[:160], "source": ""}
+    if not flow:
+        logger.warning("[fund_flow] 日级资金流无数据(%s)", code)
+        return {"code": code, "error": "本地 kline_1m 无数据", "source": ""}
 
-    # 槽位映射：源层统一 big_net（大单），tape 出口沿用 large_net 槽位名
     rows: List[Dict[str, Any]] = [{
-        "date": r["date"],
-        "main_net": r["main_net"],
-        "small_net": r["small_net"],
-        "mid_net": r["mid_net"],
-        "large_net": r.get("big_net", 0.0),
-        "super_net": r["super_net"],
-    } for r in flow]
+        "date": str(r.get("trade_date") or r.get("date") or "")[:10],
+        "main_net": r.get("main_net"),
+        "net_ratio": r.get("main_pct"),
+        "turnover": r.get("turnover"),
+        "small_net": r.get("small_net"),
+        "mid_net": r.get("mid_net"),
+        "large_net": r.get("large_net"),
+        "super_net": r.get("super_net"),
+    } for r in flow if isinstance(r, dict)]
+    rows = [r for r in rows if r["date"] and r["main_net"] is not None]
+    if not rows:
+        return {"code": code, "error": "本地 kline_1m 无数据", "source": ""}
     rows.sort(key=lambda x: x["date"])  # 升序 (旧->新)
 
     recent_5 = rows[-5:] if len(rows) >= 5 else rows
     recent_20 = rows[-20:] if len(rows) >= 20 else rows
+
+    def _ratio(rs: List[Dict[str, Any]]) -> Optional[float]:
+        """净额合计 / 成交额合计（%）。只在两者齐全的日子上算，缺数日不参与。"""
+        pairs = [(r["main_net"], r["turnover"]) for r in rs
+                 if r.get("main_net") is not None and r.get("turnover")]
+        amt = sum(t for _, t in pairs)
+        return round(sum(n for n, _ in pairs) / amt * 100.0, 2) if amt else None
+
     # ★ 2026-10-21 聚合摘要扩展（原来只有 5/20 日累计，模型仍要自己翻明细）：
     #   实测模型写「近5日 +4.18亿，主要来自 10-14 单日 +6.58亿；剔除该日后
     #   10-15→10-20 合计约 -2.40亿（算式：-1.01-0.33-1.06+0.003）」——就是把
@@ -744,6 +746,8 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
         "total_days": len(rows),
         "recent_5d_main_net": round(sum(r["main_net"] for r in recent_5), 2),
         "recent_20d_main_net": round(sum(r["main_net"] for r in recent_20), 2),
+        "recent_5d_net_ratio": _ratio(recent_5),
+        "recent_20d_net_ratio": _ratio(recent_20),
         # ── 以下为 2026-10-21 新增摘要 ──
         "main_net_streak": streak,                      # 连续同向天数
         "main_net_streak_dir": ("inflow" if rows[-1]["main_net"] >= 0 else "outflow"),
@@ -752,5 +756,5 @@ def get_fund_flow_daily(code: str, days: int = 120) -> Dict[str, Any]:
         "recent_20d_main_net_ex_max": round(sum(excl20), 2),  # 剔除最大单日后
         "recent_5d_sign": "".join("+" if r["main_net"] >= 0 else "-" for r in recent_5),
         "data": rows,
-        "source": out.get("source", ""),
+        "source": "kline_1m",
     }

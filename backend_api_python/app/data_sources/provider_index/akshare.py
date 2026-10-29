@@ -8,12 +8,21 @@ index_kline 走 `stock_zh_index_daily`（全历史），是同族的**大窗口�
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from app.data_sources.rate_limiter import get_akshare_limiter
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _f(v: Any) -> float:
+    """东财数值 → float（"--"/空/非数值 一律 0.0，不抛异常）。"""
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f == f else 0.0  # NaN → 0.0
 
 
 def _rows(df) -> Dict[str, Any]:
@@ -27,12 +36,73 @@ def _ak():
     return ak
 
 
-def fetch_index_quote() -> Dict[str, Any]:
-    """全市场指数实时快照（ak.stock_zh_index_spot_em，同 index.py:245）。"""
+def fetch_index_quote(code: Optional[str] = None,
+                      codes: Optional[List[str]] = None) -> Dict[str, Any]:
+    """沪深重要指数实时快照（ak.stock_zh_index_spot_em(symbol="沪深重要指数")）。
+
+    symbol 为什么必须是「沪深重要指数」：akshare 默认参数是「上证系列指数」
+    （东财 fs=m:1+t:1），只含上交所指数，**深证成指/创业板指/国证2000 全都不在结果里**，
+    而 index_quote 的主消费方 `market_cn/index.py:INDEX_CODES` 有 6/11 个是深证/北证代码
+    ⇒ 默认值对该 kind 是错的（取到也覆盖不全）。「沪深重要指数」走 fs=b:MK0010，
+    沪深京主要指数在同一张表里。
+
+    归一化（多源铁律：库表/族内唯一基准）：akshare 直接透出东财**中文列名**
+    （序号/代码/名称/最新价/涨跌幅/涨跌额/成交量/成交额/振幅/最高/最低/今开/昨收/量比），
+    本函数统一映射为同族 tencent 源的行结构，二者可互换：
+        {code, name, price, last_close, open, high, low,
+         volume(手), amount(元), change, change_percent}
+    单位：东财 f5 成交量=手、f6 成交额=元，与 tencent 源（v[36] 手 / v[37] 万元×1e4）
+    标定后的口径一致，不做换算。
+
+    Args:
+        code / codes: 与 tencent 源同签名（coord_index 的 index_quote 接受二者）；
+            传入则按纯代码过滤（"000001" 与 "000001.SH" 等价）。不传返回全表。
+
+    Returns:
+        {"rows": [...]}；过滤后为空 **抛异常**（空信封会被 dispatch 判成功，把后续源挡在门外）。
+    """
+    from app.data_sources.normalizer import split_index_code
+
+    want: Optional[set] = None
+    raw_codes = list(codes) if codes else ([code] if code else [])
+    if raw_codes:
+        want = set()
+        for c in raw_codes:
+            base, _exch = split_index_code(c)
+            if base:
+                want.add(base)
+
     get_akshare_limiter().wait()
-    env = _rows(_ak().stock_zh_index_spot_em())
-    env["rows"] = [{k: v for k, v in r.items() if k} for r in env["rows"]]
-    return env
+    df = _ak().stock_zh_index_spot_em(symbol="沪深重要指数")
+    if df is None or getattr(df, "empty", True):
+        raise RuntimeError("akshare index_quote 返回空")
+
+    rows = []
+    for rec in df.to_dict("records"):
+        base = str(rec.get("代码", "") or "").strip()
+        if want is not None and base not in want:
+            continue
+        price = _f(rec.get("最新价"))
+        last_close = _f(rec.get("昨收"))
+        rows.append({
+            "code": base,
+            "name": str(rec.get("名称", "") or ""),
+            "price": price,
+            "last_close": last_close,
+            "open": _f(rec.get("今开")),
+            "high": _f(rec.get("最高")),
+            "low": _f(rec.get("最低")),
+            "volume": _f(rec.get("成交量")),
+            "amount": _f(rec.get("成交额")),
+            "change": _f(rec.get("涨跌额")),
+            "change_percent": _f(rec.get("涨跌幅")),
+        })
+
+    if want is not None and not rows:
+        raise RuntimeError("akshare index_quote 未命中任何请求代码: %s" % sorted(want))
+    if not rows:
+        raise RuntimeError("akshare index_quote 归一化后为空")
+    return {"rows": rows}
 
 
 def fetch_northbound_summary() -> Dict[str, Any]:

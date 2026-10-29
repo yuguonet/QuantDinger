@@ -81,26 +81,6 @@ def _fetch_money_flow_kline(symbol: str, days: int = 10) -> list:
         return []
 
 
-def _fetch_realtime_flow(symbol: str) -> dict:
-    """获取个股实时资金流向。"""
-    try:
-        from app.market_cn.tape import get_fund_flow_realtime
-        result = get_fund_flow_realtime(symbol)
-        if "error" in result:
-            return {}
-        return {
-            "main_net_inflow": result.get("main_net", 0),
-            "super_net_inflow": result.get("super_net", 0),
-            "big_net_inflow": result.get("large_net", 0),
-            "mid_net_inflow": result.get("mid_net", 0),
-            "small_net_inflow": result.get("small_net", 0),
-            "main_net_pct": result.get("main_pct", 0),
-        }
-    except Exception as e:
-        logger.warning("money_flow realtime(%s) 失败: %s", symbol, e)
-        return {}
-
-
 @provider
 def register(ctx: dict) -> dict:
     symbol = ctx.get('symbol', '')

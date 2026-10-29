@@ -50,7 +50,7 @@ CAPS: Dict[str, CapSpec] = {
                            "QD_EXT_TIMEOUT_INDEX_KLINE", is_rows, timeout=60.0),
     # index_fflow: 指数当日分钟资金流（净额累计、元、bar 起始时刻）。
     # 仅当日 240 根 ⇒ limit=240 即当日全量，断采不可回补。
-    # timeout=90: EM push2 IP 限频 RST 突发窗下 _em_get 要跑 2 host × 3 退避重试，
+    # timeout=90: EM push2 IP 限频 RST 突发窗下 em_get 要跑 2 host × 3 退避重试，
     # 默认 8s 预算会在重试链跑完前把 future 判超时（2026-10-27 实测）。
     "index_fflow": CapSpec("index_fflow", "sequential", ("code", "codes", "limit"),
                            "QD_EXT_TIMEOUT_INDEX_FFLOW", is_rows, timeout=90.0),

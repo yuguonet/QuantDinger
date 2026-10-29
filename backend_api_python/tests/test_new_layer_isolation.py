@@ -4,7 +4,8 @@
 允许依赖：
   · `app.utils.*`        —— 基础接口（日历、日志…），明确允许；
   · `app.data_sources.dispatch` / `provider_pool.*` —— 新层自身；
-  · `app.data_sources.normalizer` / `rate_limiter` —— 纯转换与全局限速（**非上游取数接口**）。
+  · `app.data_sources.normalizer` / `rate_limiter` / `em_http`
+    —— 纯转换、全局限速、东财 HTTP 层（**均非上游取数接口**）。
 
 禁止依赖：
   · `app.market_cn.*`            —— 生产业务模块，替换期要删的就是它；
@@ -42,10 +43,10 @@ ALLOWED = (
     "app.data_sources.provider_pool",
     "app.data_sources.provider_tape",
     "app.data_sources.provider_basic",
-    "app.data_sources.provider_misc",
     "app.data_sources.provider_index",
     "app.data_sources.normalizer",
     "app.data_sources.rate_limiter",
+    "app.data_sources.em_http",
 )
 FORBIDDEN = (
     "app.market_cn",
@@ -93,14 +94,14 @@ def test_new_layer_wiring_allowlist():
     本用例改为**白名单**约束 —— 防止引用点无序扩散，新增接入须在此登记。
     """
     layer_parts = {"dispatch.py", "coord_pool.py", "coord_tape.py",
-                   "coord_basic.py", "coord_misc.py", "coord_index.py",
+                   "coord_basic.py", "coord_index.py",
                    "provider_pool", "provider_tape", "provider_basic",
-                   "provider_misc", "provider_index"}
+                   "provider_index"}
     layer_tokens = ("data_sources.dispatch", "data_sources.coord_pool",
                     "data_sources.coord_tape", "data_sources.coord_basic",
-                    "data_sources.coord_misc", "data_sources.coord_index",
+                    "data_sources.coord_index",
                     "data_sources.provider_pool", "data_sources.provider_tape",
-                    "data_sources.provider_basic", "data_sources.provider_misc",
+                    "data_sources.provider_basic",
                     "data_sources.provider_index")
     # 允许引用新层的生产文件（接入点登记表；新增须评估后追加）
     allowed_refs = {
@@ -110,7 +111,7 @@ def test_new_layer_wiring_allowlist():
         "dragon_limit.py",         # coord_pool 涨跌停池
         "dragon_tiger_store.py",   # coord_pool 龙虎榜/热榜落库（2026-10-28 Phase 1 收敛）
         "index.py",                # coord_index 日K兜底（Phase C）+ 北向/大盘/板块资金流（2026-10-28）
-        "tape.py",                 # coord_tape 分笔 + coord_misc 个股资金流 rt/daily（2026-10-28）
+        "tape.py",                 # coord_tape 分笔（个股资金流已于 2026-10-28 改本地派生）
         "basicinfo_db.py",         # coord_basic stock_basic 全量A股清单（2026-10-28 外围接线）
         "coordinator.py",          # 调用 dispatch 提交/异常分类原语（2026-10-27）
         # ↓ 2026-10-28「外围不再自拉远端」收口批次
@@ -122,6 +123,9 @@ def test_new_layer_wiring_allowlist():
         "concept_heat.py",         # ext_params：coord_index sector_list/sector_flow
         "northbound.py",           # ext_params：coord_index northbound_stock_hold
         "signal_tools.py",         # agent tools：coord_index stock_boards
+        # ↓ 2026-10-28 Phase 4 basic 收敛（外围不再自拉远端）
+        "trading_calendar.py",     # coord_basic trading_calendar（删 akshare 直连）
+        "data_tools.py",           # agent tools：coord_basic cn_financial_report（新浪三大报表）
     }
     offenders = []
     for p in APP.rglob("*.py"):

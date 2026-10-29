@@ -107,8 +107,15 @@ def _quote_tencent(code: str) -> Optional[Dict[str, Any]]:
         "last_close": last_close,
         "change": float(v[31]) if v[31] else 0,
         "change_percent": float(v[32]) if v[32] else 0,
-        "volume": float(v[36]) if v[36] else 0,
-        "amount": float(v[37]) if v[37] else 0,
+        # 单位口径（2026-10-29 实测标定 600519: v36=38805 / v37=518732）：
+        #   v[36] 是**手**（38805 手 = 388.05 万股，与新浪源 3880493 股同源同量级），
+        #     ×100 转"股"才能与 sina/mootdx 源对齐；
+        #   v[37] 是**万元**（518732 万元 = 51.87 亿元，与 sohu 源 A2[12] 同值），
+        #     ×1e4 转"元"。
+        # 此前本函数两者都原样透出 ⇒ 与同族差 100 倍 / 1 万倍，外围
+        # `tape.get_realtime_turnover` 的换手率（volume÷流通股数）随之差 100 倍。
+        "volume": float(v[36]) * 100 if v[36] else 0,          # 手 → 股
+        "amount": round(float(v[37]) * 10000, 2) if v[37] else 0,  # 万元 → 元
         # 买盘五档: v[9]~v[18]，奇数位=价格，偶数位=量
         "bid": {
             "bid1": {"price": float(v[9]) if v[9] else 0, "vol": float(v[10]) if v[10] else 0},
@@ -211,13 +218,23 @@ def fetch_ticks_today(code: str, limit: int = 2000) -> Dict[str, Any]:
 
 
 def fetch_ticks_history(code: str, date: str, limit: int = 2000) -> Dict[str, Any]:
-    """历史分笔成交（腾讯，同 ticks_today 接口，腾讯不支持指定日期，返回最近数据）。
+    """历史分笔成交（**腾讯无此通道**，2026-10-29 从 capabilities 摘除）。
 
-    注意: 腾讯分笔 API 无日期参数，只能返回当日/最近数据。
-    历史分笔需走 mootdx（当前不可用）或其他源。
+    实测（2026-10-29）三条候选路径全部不成立：
+      · `stock.gtimg.cn/data/index.php?appn=detail` 带 `date=` 参数 → 上游**忽略**该参数，
+        仍返回当日/最近交易日数据（拿它冒充指定日期是错的，比没有更危险）；
+      · `web.ifzq.gtimg.cn/appstock/app/dealData|dealClass` → `{"code":11,
+        "msg":"Can't load controller:DealDataController"}`（控制器不存在）。
+    akshare 的 `stock_zh_a_tick_tx_js`（同通道）也只有当日实现，可作旁证。
+
+    摘除原因：旧实现恒返回 `{"rows": [], "error": ...}`，而 `is_rows` 对**空 list 判 True**
+    ⇒ 恒空假源被 dispatch 判成功，把后面的真源永久挡在门外。
+
+    恢复方法：腾讯若开放带日期的历史分笔 HTTP 接口，实现本函数并把
+    `"ticks_history": fetch_ticks_history` 加回 `TencentTapeProvider.capabilities` 即可
+    （autodiscover 自动生效，无需改 coord_tape）。
     """
-    # 腾讯无历史分笔 API，返回空并注明
-    return {"rows": [], "error": "tencent 无历史分笔 API，仅支持当日"}
+    raise RuntimeError("tencent 无历史分笔 API：上游 detail 接口忽略 date 参数")
 
 
 # ── Provider 声明 ──────────────────────────────────────────────
@@ -236,7 +253,8 @@ class TencentTapeProvider:
     capabilities = {
         "orderbook": _orderbook,
         "ticks_today": fetch_ticks_today,
-        "ticks_history": fetch_ticks_history,
+        # "ticks_history": 2026-10-29 摘除——腾讯无历史分笔通道，恒空信封会挡住真源
+        # （详见 fetch_ticks_history docstring 的实测证据与恢复方法）。
     }
 
     # 非 RST 上游：声明 batch_kinds ⇒ run_batch 把整批 codes 一次交给本源，

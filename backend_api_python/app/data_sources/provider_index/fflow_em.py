@@ -6,7 +6,7 @@ API: push2.eastmoney.com/api/qt/stock/fflow/kline/get (klt=1, 当日 240 根 1 �
 ⚠ TLS 指纹硬约束（2026-10-18 实证，自 scripts/sync_index_fflow.py 迁入）：
   东财 CDN 对 urllib/requests 的 JA3 指纹封杀（RemoteDisconnected 无状态码），
   必须走 curl_cffi 的 edge101 指纹；Referer 必须带 quote.eastmoney.com，
-  UA 不覆盖（edge101 自带 UA 与指纹一致）。
+  UA 不覆盖（edge101 自带 UA 与指纹一致）。该封装在 `em_http.em_get`。
 
 ⚠ IP 级限频（2026-10-27 实测）：push2 对连续请求打 RST 突发窗（约连发 2 个后
   整段 curl 56 拒绝，窗口分钟级翻转）——不是永久死，属上游风控。对应策略：
@@ -22,11 +22,10 @@ API: push2.eastmoney.com/api/qt/stock/fflow/kline/get (klt=1, 当日 240 根 1 �
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from app.utils.logger import get_logger
+from app.data_sources.em_http import em_get
 
-logger = get_logger(__name__)
 
 # f52~f56 净流入字段 → 行键（与 kline_index_fflow 库列名同名，累计值、元）
 NET_COLS = ("main_net", "small_net", "mid_net", "big_net", "super_net")
@@ -44,35 +43,6 @@ def _to_secid(symbol: str) -> str:
     return ("1" if suffix.upper() == "SH" else "0") + "." + code
 
 
-def _em_get(url: str, timeout: float = 15, retries: int = 3) -> Optional[str]:
-    """东财 GET — curl_cffi edge101 TLS 指纹封装，返回响应文本，失败 None。"""
-    import time as _t
-    try:
-        from curl_cffi import requests as _cr
-    except ImportError:
-        logger.debug("[fflow_em] curl_cffi 未安装 (pip install curl_cffi)")
-        return None
-    headers = {"Referer": "https://quote.eastmoney.com/"}
-    last_err = None
-    for i in range(retries):
-        try:
-            s = _cr.Session(impersonate="edge101")
-            r = s.get(url, timeout=timeout, headers=headers)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-            if i < retries - 1:
-                # 退避跨限频窗（RST 突发窗分钟级翻转，1.5s 递增常撞同一关闭窗）
-                _t.sleep(3.0 * (i + 1))
-    err_str = str(last_err)[:120]
-    if "Connection closed" in err_str or "curl: (56)" in err_str or "RST" in err_str:
-        logger.debug("[fflow_em] _em_get 重试 %d 次失败(限频窗口): %s", retries, err_str)
-    else:
-        logger.warning("[fflow_em] _em_get 重试 %d 次失败: %s", retries, err_str)
-    return None
-
-
 def fetch_index_fflow(code: str, limit: int = 240) -> Dict[str, Any]:
     """指数当日分钟资金流（EM fflow kline, klt=1）。
 
@@ -87,18 +57,18 @@ def fetch_index_fflow(code: str, limit: int = 240) -> Dict[str, Any]:
                + "?lmt=0&klt=1&fields1=f1,f2,f3,f7"
                + "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
                + "&secid=%s" % _to_secid(symbol))
-        txt = _em_get(url, timeout=15, retries=3)
+        txt = em_get(url, timeout=15, retries=3)
         if txt:
             break  # 任一 host 成功即用 (实时优先, 封锁自动落 delay)
     if not txt:
-        return {"rows": [], "error": "全部 host 无响应"}
+        raise RuntimeError("东财指数资金流全部 host 无响应（%s）" % code)
     try:
         d = json.loads(txt)
     except Exception as e:
-        return {"rows": [], "error": "JSON 解析失败: %s" % e}
+        raise RuntimeError("东财指数资金流 JSON 解析失败: %s" % e) from e
     kl = ((d.get("data") or {}).get("klines")) or []
     if not kl:
-        return {"rows": [], "error": "无数据"}
+        raise RuntimeError("东财指数资金流无数据（%s）" % code)
     rows: List[Dict[str, Any]] = []
     for line in kl:
         p = line.split(",")
@@ -109,6 +79,8 @@ def fetch_index_fflow(code: str, limit: int = 240) -> Dict[str, Any]:
             rows.append(row)
         except (ValueError, IndexError):
             continue
+    if not rows:
+        raise RuntimeError("东财指数资金流解析后为空（%s）" % code)
     if limit and len(rows) > int(limit):
         rows = rows[-int(limit):]
     return {"rows": rows}

@@ -3,6 +3,7 @@ A股数据标准化层 — 工具函数 + safe 类型转换
 
 提供:
   - safe_float / safe_int: 安全类型转换（处理 None/"-"/""/"nan"/"--"）
+  - to_number: 数值化（剥千分位逗号 + 缺失保持 None，全库唯一实现）
   - normalize_cn_code / normalize_hk_code: 股票代码格式归一
   - to_raw_digits / detect_market / add_market_prefix / strip_market_prefix: 市场前缀工具
   - normalize_chart_timeframe: 图表周期归一化（全库唯一实现，2026-10-16 迁入）
@@ -39,6 +40,36 @@ def _ss(v, default="") -> str:
     if v is None:
         return default
     return str(v).strip()
+
+
+def to_number(v):
+    """数值化：剥千分位逗号 → float；缺失返回 None（**不回落 0**）。
+
+    与 `safe_float` 不可互换，差别有两点：
+      - 缺失语义：`safe_float` 回落 `default`（多为 0.0）；本函数保持 None
+        —— null≠0，把缺失当 0 会虚构"零余额 / 零营收"。
+      - 千分位：`safe_float("9,227,807.21")` → 0.0（转不动）；本函数先剥逗号再转。
+
+    千分位来源：新浪三表页面（vFD_BalanceSheet / vFD_ProfitStatement）的金额
+    单元格是带逗号的字符串，`pandas.read_html` 按 object 原样保留。
+
+    Examples:
+        to_number("9,227,807.21") → 9227807.21
+        to_number(None) → None ; to_number("--") → None ; to_number("abc") → None
+    """
+    import math
+
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.replace(",", "").strip()
+        if not v or v.lower() in ("nan", "none", "-"):
+            return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
 
 """
 Tencent market data helpers (no API key).
@@ -183,7 +214,7 @@ def detect_market(symbol: str) -> tuple:
             return ("SH", s)
         if s.startswith(("000", "001", "002", "003", "300", "301", "200")):
             return ("SZ", s)
-        if s.startswith(("43", "82", "83", "87", "88")):
+        if s.startswith(("43", "82", "83", "87", "88", "92")):
             return ("BJ", s)
 
     return ("", "")
@@ -295,6 +326,52 @@ def strip_market_prefix(symbol: str) -> str:
         return s
 
     return s  # 无法识别，原样返回
+
+
+def _strip_name_suffix(s: str) -> str:
+    for sfx in ("-UW", "-U", "-W"):
+        if s.endswith(sfx) and len(s) > len(sfx) + 1:
+            return s[:-len(sfx)]
+    return s
+
+
+def normalize_stock_name(name: str) -> str:
+    """A 股简称归一化：全角→半角、去空白、剥除权除息/新股标记与同股不同权后缀。
+
+    三个 stock_basic 源原样给名：新浪/akshare 是「万  科Ａ」「金 螳 螂」，
+    akshare 还带 `XD`/`C` 前缀与 `-U`/`-UW` 后缀（当日行情状态，非简称本体），
+    巨潮 zwjc 则是干净简称。统一到巨潮口径后三源才能互相替换。
+    """
+    s = "".join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c
+                for c in str(name or ""))
+    s = "".join(s.split())
+    for pfx in ("XD", "XR", "DR"):
+        if s.startswith(pfx) and len(s) > len(pfx) + 1:
+            return _strip_name_suffix(s[len(pfx):])
+    if len(s) > 2 and s[:1] in ("N", "C"):
+        s = s[1:]
+    return _strip_name_suffix(s)
+
+
+def build_stock_basic_row(code: str, name: str) -> dict:
+    """stock_basic 单行 —— 对齐库表 stock_basic_info 的业务列（9 列）。
+
+    远端清单接口只给代码与简称：`market_cn` 由代码推导，其余详情列（industry /
+    concepts / list_date / total_shares / circ_shares）该接口不提供，取 DDL 默认值
+    —— 落库侧对这几列用 COALESCE/NULLIF，空值不会冲掉库内已补充的详情。
+    """
+    pure = strip_market_prefix(str(code or ""))
+    return {
+        "code": pure,
+        "name": normalize_stock_name(name),
+        "market_cn": detect_market(pure)[0],
+        "industry": "",
+        "concepts": "",
+        "list_date": "",
+        "total_shares": 0.0,
+        "circ_shares": 0.0,
+        "status": "active",
+    }
 
 
 # ================================================================

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""coord_basic — 基本面/基础信息族协调器
+"""coord_basic — 基本面 / 基础参照族协调器
 
 【模式】全部 sequential（各上游一次返回所需粒度；paged 留给真分页上游）。
 【状态】只实现、不接入；PENDING_KINDS 中的 kind 尚未迁移 provider。
@@ -42,8 +42,18 @@ CAPS: Dict[str, CapSpec] = {
                               "QD_EXT_TIMEOUT_CN_FUNDAMENTAL", is_object),
     "cn_financial": CapSpec("cn_financial", "sequential", ("code", "codes"),
                             "QD_EXT_TIMEOUT_CN_FINANCIAL", is_object),
+    # cn_financial_report: 三大报表**原始科目**（总资产/负债/净资产/货币资金/营收/净利
+    # + report_date，万元口径）。与 cn_financial（比率指标）是两个契约，实测两者
+    # 共有字段为 0 个（2026-10-28 对拍 600519）——不可互相替代，故单列 kind。
+    # timeout=40：两个报表页各一次 HTTP（单页 timeout=15s）+ pandas.read_html 解析。
+    "cn_financial_report": CapSpec("cn_financial_report", "sequential", ("code",),
+                                   "QD_EXT_TIMEOUT_CN_FIN_REPORT", is_object, timeout=40.0),
     "stock_basic": CapSpec("stock_basic", "sequential", (),
                            "QD_EXT_TIMEOUT_STOCK_BASIC", is_rows),
+    # trading_calendar: 整表无参（provider 签名不收 date）；validator 必须 is_rows，
+    # 写成 is_object 会让 akshare 源的信封恒判不合协议。
+    "trading_calendar": CapSpec("trading_calendar", "sequential", (),
+                                "QD_EXT_TIMEOUT_CALENDAR", is_rows, timeout=30.0),
 
 }
 

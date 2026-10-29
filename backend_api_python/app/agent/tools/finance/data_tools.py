@@ -769,26 +769,13 @@ def _num(v):
     ⚠️ 与 `_safe_float` 的区别：缺失值**不回落 0**（null≠0，技能注意事项
     第 2 条——把缺失当 0 会虚构"零余额/零营收"）；`safe_float` 不剥千分位
     逗号（'9,227,807.21'→0.0），这里先剥再转。
-    """
-    import math
-    if v is None:
-        return None
-    if isinstance(v, str):
-        v = v.replace(",", "").strip()
-        if not v or v.lower() in ("nan", "none", "-"):
-            return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(f) else f
 
-def _market_prefix(code: str) -> str:
-    if code.startswith(("6", "9")):
-        return "sh"
-    elif code.startswith("8"):
-        return "bj"
-    return "sz"
+    实现已收口到 `normalizer.to_number`（全库唯一实现，报表 provider 同款）；
+    本函数保留为工具层的薄入口 —— 护栏 `test_v17f_capital_summary_units`
+    直接引用本名，且工具层调用方语义不变。
+    """
+    from app.data_sources.normalizer import to_number
+    return to_number(v)
 
 def _get_margin_trading(code: str, days: int = 60) -> Dict[str, Any]:
     """融资融券摘要。提取融资余额趋势+近期变化幅度。
@@ -964,79 +951,31 @@ def _get_financial_statements(code: str) -> Dict[str, Any]:
     13.29 万元」= 1329 元被 ÷100）。现按仓内约定加 `_wan` 后缀
     （与 `main_net_wan`/`mcap_yi` 同款），并显式给出 `financial_unit`
     与 `report_date`——金额不带报告期同样是裸数字。
+
+    取数（2026-10-28 Phase 4 收敛）：本函数不再直连新浪，改调
+    `coord_basic("cn_financial_report")`（provider_basic/sina 承接）。
+    注意它与 `cn_financial` **不是同一契约**：后者只给比率指标
+    （增长率/利润率/ROE…），实测两者共有字段为 0 个，换过去会丢全部金额字段。
     """
-    import requests
-    _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    prefix = _market_prefix(code)
-    symbol = f"{prefix}{code}"
+    from app.data_sources.coord_basic import coordinate
 
+    out = coordinate("cn_financial_report", code=_strip_prefix(code))
+    if not out.get("ok"):
+        logger.warning("_get_financial_statements(%s) 取数失败: %s", code, out.get("error"))
+        return {}
+    obj = (out.get("data") or {}).get("object") or {}
+
+    # Agent 面收窄：只放行下列键（provider 侧将来新增字段不会自动泄漏进提示词）。
+    # 键名即口径（`_wan` = 万元），缺失保持 None，不回落 0。
     summary: Dict[str, Any] = {}
-
-    # 2026-09-15：旧视图 vFD_FinancialGuideLine 已被新浪下线（返回 {"__ERROR":0,"__ERRORMSG":"Invalid view go"}），
-    # 改用 money.finance.sina.com.cn 新版三表视图（vFD_BalanceSheet / vFD_ProfitStatement）。
-    # 新表结构：最大表为数据表，列0=项目名，列1+=报告期（第0行为日期行）。
-    # 单位：万元（页面表头明示，见函数 docstring 口径说明）。
-    import requests
-    _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    headers = {"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"}
-    code_num = _strip_prefix(code)
-
-    import pandas as pd
-    from io import StringIO
-
-    def _fetch_sina_table(path: str):
-        try:
-            r = requests.get(f"https://money.finance.sina.com.cn/corp/go.php/{path}/stockid/{code_num}/ctrl/part/displaytype/4.phtml",
-                             headers=headers, timeout=15)
-            r.encoding = "gbk"
-            dfs = pd.read_html(StringIO(r.text))
-            # 数据表 = 行数最多的那张（导航页表格都是 2~5 行的小表）
-            return max(dfs, key=lambda d: d.shape[0]) if dfs else None
-        except Exception as e:
-            logger.warning("_get_financial_statements(%s) %s 抓取失败: %s", code, path, e)
-            return None
-
-    def _latest_value(df, keywords, exclude=None):
-        """取最新报告期（列1）中匹配关键词的值（float；None 保持 None）。"""
-        if df is None or df.shape[1] < 2:
-            return None
-        exclude = exclude or []
-        for _, row in df.iterrows():
-            item_name = str(row.iloc[0])
-            if any(k in item_name for k in keywords) and not any(x in item_name for x in exclude):
-                val = row.iloc[1]
-                return val if pd.notna(val) else None
-        return None
-
-    df_bs = df_is = None
-    # 资产负债表（键名即口径：单位万元，见函数 docstring）
-    try:
-        df_bs = _fetch_sina_table('vFD_BalanceSheet')
-        summary["total_assets_wan"] = _num(_latest_value(df_bs, ["资产总计", "总资产"]))
-        summary["total_liabilities_wan"] = _num(_latest_value(df_bs, ["负债合计", "总负债"]))
-        summary["equity_wan"] = _num(_latest_value(df_bs, ["股东权益合计", "所有者权益合计", "归属母公司"]))
-        summary["cash_wan"] = _num(_latest_value(df_bs, ["货币资金"]))
-    except Exception as e:
-        logger.warning("_get_financial_statements(%s) 资产负债表失败: %s", code, e)
-
-    # 利润表（同上，万元口径）
-    try:
-        df_is = _fetch_sina_table('vFD_ProfitStatement')
-        summary["revenue_wan"] = _num(_latest_value(df_is, ["营业总收入", "营业收入"]))
-        summary["net_profit_wan"] = _num(_latest_value(df_is, ["净利润"], exclude=["扣非"]))
-    except Exception as e:
-        logger.warning("_get_financial_statements(%s) 利润表失败: %s", code, e)
-
-    # 报告期：第 0 行日期行第 2 列（实测 600519 → 2026-06-30）
-    for _df in (df_bs, df_is):
-        if _df is not None and _df.shape[1] >= 2:
-            try:
-                summary["report_date"] = str(_df.iloc[0, 1])[:10]
-                break
-            except Exception:
-                pass
-    summary["financial_unit"] = "万元"
-
+    summary["total_assets_wan"] = obj.get("total_assets_wan")
+    summary["total_liabilities_wan"] = obj.get("total_liabilities_wan")
+    summary["equity_wan"] = obj.get("equity_wan")
+    summary["cash_wan"] = obj.get("cash_wan")
+    summary["revenue_wan"] = obj.get("revenue_wan")
+    summary["net_profit_wan"] = obj.get("net_profit_wan")
+    summary["report_date"] = obj.get("report_date")
+    summary["financial_unit"] = obj.get("financial_unit")
     return summary
 
 # 换算教训（2026-10-22 自 docstring 移出，注入瘦身）：run8 换算对了却把单位名

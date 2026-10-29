@@ -2,7 +2,7 @@
 name: market-screener
 description: 从A股全市场筛选短中线标的。用户问"今天买什么股""有什么好股票""短线/短中线选什么"时使用。不含个股分析。
 metadata:
-  version: 8.5.0
+  version: 8.4.0
   tags: market, screener, short_term, mid_term, a_share
   tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
 ---
@@ -13,16 +13,14 @@ metadata:
 
 - **用**：用户问「今天买什么」「有什么好股票」「短线/短中线选什么」这类**全市场筛选**问题
 - **不用**：用户指定了具体股票代码/个股分析——那是单票分析链路，不要走本技能
+## 选股目标
 
-## 选股目标（2026-10-28 用户裁定）
+**短线小风险、大涨幅。**
 
-**短线最小风险、最大涨幅。**
-
-- **最小风险**：有清晰支撑（可写「跌破 X」止损）、非追高、非无支撑下跌
-- **最大涨幅**：主线题材 + 资金/趋势确认 + 有上行空间 + `p_up` 尽量高
-- **现价优先入场**：信号明确时现价买优于等回踩（回踩不一定成交）；**追高 ≠ 现价买**
+- **小风险**：有清晰支撑（可写「跌破 X」止损）、非追高、非无支撑下跌
+- **大涨幅**：主线题材 + 资金/趋势确认 + 有上行空间 + `p_up` 尽量高
+- **现价优先入场**：信号明确时且现价有足够上行空间时买优于等回踩；**追高 ≠ 现价买**
   （追高=无信号/无支撑/连板接力；现价买=信号+支撑+资金/主线）
-- **已删除**：连板 / 尾盘封板 / 龙回头 / 近期涨停候选源，以及 8.1.0「池序前 8 恒入」基线——它们是追高/接刀逻辑，不再是选股主路径
 
 ## 分析周期（短中线，不是中长线）
 
@@ -42,7 +40,7 @@ metadata:
 
 三条原则：
 
-1. **代码不做取舍**（`pre_screen` / `profile_candidates` 层）：候选池不排序、不截断、不过滤；`hard` 只是客观障碍，如何处置由你决定。`run()` 内部 = **单漏斗**（2026-10-28）：`pre_screen`（多源宽池 + **代码规则初筛**：剔不活跃/新股）→ `objective_preexclude` → `score_pool`（p_up 闸 + 排名截断 + 贴支撑/题材 floor + 弱转强 w2s + 缺分保送）→ `deep_analyze(Top12)`。**禁止「搜索命中 1470 取前 10」式硬截**
+1. **代码不做取舍**（`pre_screen` / `profile_candidates` 层）：候选池不排序、不截断、不过滤；`hard` 只是客观障碍，如何处置由你决定。`run()` 内部 = **基线保底 + 加法改进**；加法层（p_up 硬闸 + 排名截断 + 弱转强/缺分/保底回捞）只在基线之外做改进、填充至 12。淘汰计数在 `funnel.excluded_score`（只含加法层）——被砍的票未进 `analyzed`
 2. **你可以自己写代码**：在沙箱里对画像结果自由排序、过滤、分组、加权——这比套模板更接近真实盘感
 3. **结论必须可复盘**：每只推荐的票要说清「靠哪条证据入选」+「什么情况下这条证据失效」
 
@@ -57,7 +55,6 @@ metadata:
 - 把技术形态当成功概率（形态只能解释方向，不能直接加成胜率或编造 xx%）
 - 把数据缺口当成「无信号」（画像里的 missing 与调用失败要看）
 - 编造数据：工具没给出的数值，不允许出现在结论里
-- **从连板/龙回头/近端涨停名单里挑前几名当推荐**（追高/接刀，已从候选源删除）
 
 ## 工具面（`run.py` 公开函数，docstring 首行即描述）
 
@@ -66,14 +63,14 @@ metadata:
 
 | 函数（真实签名） | 作用 | 何时用 |
 | --- | --- | --- |
-| `run()` | 一次性跑完整流程：**单漏斗** `pre_screen`（多源宽池 → 规则初筛剔不活跃/新股 → **代码收窄≤40**）→ `objective_preexclude` → `score_pool`（p_up 闸 + 排名截断 + 贴支撑/题材 floor + 弱转强 w2s + 缺分保送，Round0 存活<4 自动 Round1 放宽，最多 2 轮）→ `deep_analyze(Top12)`。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
+| `run()` | 一次性跑完整流程：**① 基线**（池序前 10 画像、无 hard 前 8，恒入 deep）→ **② 加法层** `pre_screen(search_top_n=100)` → `objective_preexclude` → `score_pool`（双保险软门槛 + 缺分保送，Round0 存活<4 自动 Round1 放宽，最多 2 轮，reserved=基线去重）→ **③ deep_analyze(基线+加法，Top12)**。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
 | `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 | 起手，判断大环境 |
-| `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：**多源** hot / search / flow(人气) / sector(板块成分) / scan(本地结构)；东财搜索只是之一；池子偏少时自动扩词 | 起手取池 |
+| `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：自选来源（连板/尾盘封板/龙回头/热点/条件搜索/近期涨停），不做取舍与排序 | 起手取池 |
 | `profile_candidates(prescreen_result, limit=20, with_flow=True, with_pred=True)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍。**入参是上一步的 dict** | 核心，几乎所有场景都要跑 |
 | `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / p_up / **实时行情对账**），无任何主观评分 | 对你挑出的少数票做证据汇总 |
 | `detect_patterns(codes, days=60, params=None)` | 六种 K 线形态识别，回答「是不是」不回答「好不好」；`params` 是 JSON 几何定义覆盖 | 想验证形态 / 做阈值敏感性检查 |
 | `multitimeframe(code, daily_days=60, minute_days=5)` | 日线 + 15m + 5m 的结构量与速记标签 | 判断多日结构与日内强弱时用（注意标签是日线几何，见下） |
-| `inspect_stock(code, deep=False)` | 单票深挖：题材归属、资金、涨停史、**龙虎榜席位**（注意：是席位数据，不是已删除的「龙回头」选股源）、客观风险点；`deep=True` 追加快源 | 想验证某只票 / 证据互相矛盾时 |
+| `inspect_stock(code, deep=False)` | 单票深挖：题材归属、资金、涨停史、龙虎榜席位、客观风险点；`deep=True` 追加快源 | 想验证某只票 / 证据互相矛盾时 |
 | `filter_candidates(prescreen_result)` | 便捷形式（旧流程兼容）：保守剔除有硬障碍的候选，返回逗号分隔 codes | 只要 codes 清单时（要看证据用 `profile_candidates`） |
 
 > ⚠️ 除 `run()` 外，其余函数都是 `run()` 的**内部阶段**，当前**未经 `run_skill` 暴露**
@@ -88,13 +85,13 @@ metadata:
 
 `profile_candidates` 返回的每行字段含义：
 
-- `p_up` 模型给出的 **T+1** 上涨概率（仅此一档）；`tech` 收盘 / 涨跌 / 量比 / RSI / MA 乖离 / 20 日位置 / 连板数 / **`support.nearest`（贴哪条均线）** / **`resistance.price` 与 `sr_gap_pct`（支撑–压力间距，过窄操作性弱）**
+- `p_up` 模型给出的 **T+1** 上涨概率（仅此一档）；`tech` 收盘 / 涨跌 / 量比 / RSI / MA 乖离 / 20 日位置 / 连板数 / **`support.nearest`（贴哪条均线）**
 - `report_guide` 判定规则摘要（支撑≫涨跌幅、周期、禁止重验）——**写结论时直接照它落笔，不必 read_skill**
 - `rt` 实时快照（价格 / 涨跌幅 / 涨停价 / 跌停价 / `limit_band` / 涨跌停）；`stale_bar=True` 时 `tech` 的收盘/涨跌停已按 rt 修正（MA/RSI 仍基于日线）。**有 rt 就不要在主对话重拉实时行情**；`stale_bar` 时**不要用 `close_pos_in_day` 下结论**。**ST/新股信 rt 价**：`limit_band=no_limit`（新股无涨跌幅）两价为空，禁止用公式回退；ST 的 quote 带可能按板规则而非 ±5%（见 `limit-rules.md`）
 - `theme.hit` 题材是否落在当日主线；`hard` 客观障碍清单；`missing` 数据缺口
-- `warnings` 经验型软提示（如「弱势市热点活跃源无题材支撑」）——你可以采纳也可以否决
+- `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
-- `funnel` 是 `run()` 返回的漏斗统计键，包含：`rounds` / `pool_raw` / `excluded_obj` / `scored`（被打分只数）/ `excluded_score` / `deep_n` / `eastmoney_ok`，用于复盘每一步筛掉了多少候选；`excluded_score` 内 `no_pred_kept`=缺分保送只数（模型盲区票）、`floor_kept`=贴支撑/题材回捞只数、`w2s_kept`=弱转强回捞只数、`score_skipped`=超打分预算被让位只数
+- `funnel` 是 `run()` 返回的漏斗统计键，包含：`rounds` / `pool_raw` / `excluded_obj` / `scored`（加法层被打分只数）/ `baseline`（基线保底只数，恒入 deep）/ `baseline_hard`（基线窗口内被 hard 拦掉的只数）/ `excluded_score` / `deep_n` / `eastmoney_ok`，用于复盘每一步筛掉了多少候选；`excluded_score` 内 `no_pred_kept`=缺分保送只数（模型盲区票）、`score_skipped`=超打分预算被让位只数（均只计加法层）
 - `filter_candidates` 保守地把 hard 与 warnings 一并剔除；走 `profile_candidates` 你能看到全部候选
 
 ## 工作流（`run()` 内部阶段示意，不必线性）
@@ -103,17 +100,16 @@ metadata:
 
 ```python
 st = market_state()                       # 先看环境
-result = pre_screen(sources="hot,search",
-                    queries="回踩均线支撑 缩量企稳,主力资金净流入")   # 来源与查询词都由你定
+result = pre_screen(sources="zt,dragon,search",
+                    queries="放量突破 站上20日均线")   # 来源与查询词都由你定
 bundle = profile_candidates(result, limit=20)
 
-# 之后完全由你决定，例如：挑贴支撑 + 题材 + 资金同向的（候选筛选）；买点另按「现价优先」写
+# 之后完全由你决定，例如：
 profiles = bundle["profiles"]
 picks = [p for p in profiles
          if not p["hard"]
          and (p.get("p_up") or 0) >= bundle["hints"]["p_up_floor_suggest"]
-         and ((p.get("tech") or {}).get("support") or {}).get("near_support")
-         and (p["tech"] or {}).get("pos_in_20d_pct", 100) <= 95]
+         and (p["tech"] or {}).get("pos_in_20d_pct", 0) <= 95]
 codes = ",".join(p["code"] for p in picks[:8])
 
 deep = deep_analyze(codes=codes)                     # 拉齐证据，再自己加权（默认无 mtf）
@@ -132,10 +128,10 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 
 1. **题材与主线**：是否落在当日 `themes`？同一题材已被你推了几只（过度集中 = 单点风险）
 2. **量价结构**：量比、收盘在日内位置、是否 20 日高位、振幅；放量突破 vs 放量滞涨要区分；**日内 MACD 红绿柱变化**作涨/跌压力参考
-3. **资金**：主力净额方向与占成交额比；**结合个股流通市值看控盘**（同额资金在流通市值小的票上控制力更强）；**流通市值越大趋势越连续、变盘越慢，流通市值小的一日可反转**（勿与大盘指数混读）；形态好但资金流出 → 减配或放弃
+3. **资金**：主力净额方向与占成交额比；形态好但资金流出 → 减配或放弃；**结合个股流通市值看控盘**（同额资金在流通市值小的票上控制力更强）；**流通市值越大趋势越连续、变盘越慢，流通市值小的票容易被资金带动，趋势更快更短**；**龙虎榜席位**：是否有主力席位、是否有游资席位、是否有机构席位
 4. **位置与空间**：距 MA20 乖离、20 日位置、连板高度、**支撑位是否清晰**、**支撑–压力间距**（`sr_gap_pct` 过窄 → 操作性弱、排序下调）
 5. **市场状态**：情绪分桶、涨停 / 跌停家数、炸板率——弱势市应自动提高门槛、减少只数
-6. **可执行性**：`hard` 全集（ST/退市、换手不足、**价格 <2 或 >300**、涨停买不进、停牌）；次日干扰；**T+1 风险:收益 ≥1.5~2:1 才进「买什么」**
+6. **可执行性**：`hard` 全集（ST/退市、换手不足、**价格 <2 或 >300**、涨停买不进、停牌）；次日干扰
 
 ### 核心判定原则（摘要）
 
@@ -170,13 +166,7 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 ## 风险（≤3 行）
 ```
 
-- **买点优先写「现价 X」**（2026-10-28）：信号明确（放量突破/上升通道打开/弱转强+资金）时
-  **现价直接买优于等回踩**——回踩不一定给成交；风险收益比也按现价算更直接。
-  只有当现价已在 20 日高位/乖离过大、或明确「等回踩更优」时，才写「回踩 X」作备选/替代
-- **买点写法**：「现价 X」或「回踩 MA5/MA10/MA20/前高 X」；**止损写「跌破 X」**
-  （X=日线 MA 或前高前低，禁止用 VWAP/分时均价）
-- **质量线**：每只须同时有「题材/资金结构 + 上方空间 + 止损」；禁止纯指标罗列；
-  **T+5 看空不得进「买什么」**；T+1~T+5 几乎全中性 = 没想清楚，改写观察
+- **买点/止损只写日线 MA / 前高前低**（如「回踩 MA5 9.71」「跌破 MA5 离场」）；
 - 无明确止损价不得进「买什么」；止损写「跌破 X」/「不跌破 X」
 - 表格行数随推荐数浮动，正文保持精简；指标罗列、漏斗数字、长篇分析不进正文
 - **中文白话**：不写 p_up / w2s_kept / t1_bias 等字段名；「次日上涨参考」「今日弱转强」「暂无历史参考分」
@@ -188,10 +178,10 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 ```
 **post_market**  情绪:中性(58)  参考门槛 次日上涨参考>=0.50  主窗口=T+1/+3/+5
 
-## 买什么（2 只）
+## 买什么（2 只，均需回踩再买，勿追高）
 | 代码 | 现价 | 买点价位 | 止损价 | T+1/T+3/T+5 | 一句话理由 |
-| 301199 迈赫股份 | 21.40 | 现价 21.40 | 跌破 MA10 20.80 | 看多/看多/中性 | 主线"人形机器人"放量启动；通道打开，现价入，回踩不一定给 |
-| 300129 泰胜风能 | 8.65 | 现价 8.65（若冲高回落再回踩 MA5 8.50） | 跌破 MA5 8.50 | 中性/看多/看多 | 放量2.1倍突破前高；距MA20略大，现价入+回踩备选 |
+| 301199 迈赫股份 | 21.40 | 回踩 MA10 20.80 | 跌破 MA10 20.80 | 看多/看多/中性 | 主线"人形机器人"内唯一非连板；主力+3200万 |
+| 300129 泰胜风能 | 8.65 | 回踩 MA5 8.50 | 跌破 MA5 8.50 | 中性/看多/看多 | 放量2.1倍突破前高；距MA20偏大等回踩 |
 
 ## 不买/观察
 600xxx  暂无明确止损位

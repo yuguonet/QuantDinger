@@ -13,7 +13,7 @@ system 的 upsert **物理上不可能**改到 auto/agent 的行（方案 §3.2 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.utils.db import get_db_connection
@@ -253,6 +253,92 @@ def list_watchlist_symbols() -> List[Tuple[str, str]]:
         rows = cur.fetchall() or []
         cur.close()
     return [(r["market"], r["symbol"]) for r in rows]
+
+
+def delete_labels_for_symbols(symbols: Sequence[Tuple[str, str]]) -> int:
+    """删除给定 (market, symbol) 的全部标签行（移出自选 / 删分组时联动）。
+
+    ⚠️ label 表按 (market, symbol) **全局共享、不区分用户** ⇒ 调用方须自行保证
+    该标的已不在**任何**用户自选（多用户安全应由 `delete_orphan_labels` 保证）。
+    """
+    if not symbols:
+        return 0
+    with get_db_connection() as db:
+        cur = db.cursor()
+        n = 0
+        for mkt, sym in symbols:
+            cur.execute(
+                f"DELETE FROM {TABLE} WHERE market = %s AND symbol = %s", (mkt, sym)
+            )
+            n += cur.rowcount or 0
+        db.commit()
+        cur.close()
+    return n
+
+
+def delete_orphan_labels() -> int:
+    """删除所有不在 `qd_watchlist` 中的标签 —— 每日 job 兜底 + 移出自选联动清理。
+
+    根因：label 表按 (market, symbol) 全局共享、不区分 user；历史遗留 / 移出自选后
+    会产生"孤儿标签"（前端 `get_labels` 只读 watchlist 内、auto 单向写不回读 ⇒ 纯冗余），
+    且让 `takeover_report` 的 scope 与 higher/expired 口径错配（接管率失真）。
+
+    多用户安全：以**全用户** watchlist 并集为存活集，`NOT IN` 仅删真正孤儿，
+    不会误删仍被其他用户持有的标的标签。
+    """
+    wl = list_watchlist_symbols()
+    if not wl:
+        # 自选全空 ⇒ 标签全为孤儿（极端情况），整表清空
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(f"DELETE FROM {TABLE}")
+            n = cur.rowcount or 0
+            db.commit()
+            cur.close()
+        return n
+    placeholders = ",".join(["(%s,%s)"] * len(wl))
+    params: List[Any] = []
+    for mkt, sym in wl:
+        params.extend([mkt, sym])
+    sql = f"DELETE FROM {TABLE} WHERE (market, symbol) NOT IN ({placeholders})"
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(sql, params)
+        n = cur.rowcount or 0
+        db.commit()
+        cur.close()
+    return n
+
+
+def delete_expired_labels(older_than_days: int = 30) -> int:
+    """回收**已过期超过 `older_than_days` 天**的标签行（TTL 卫生，防表无限膨胀）。
+
+    与 `delete_orphan_labels` 正交：
+      - 孤儿清理管"标的是否在任意用户自选"（空间维度）；
+      - 本函数管"过期多久"（时间维度）。
+
+    背景：
+      - `submit` 用 `ON CONFLICT DO UPDATE` **不删旧行**；auto/agent 标签是事件驱动、
+        短 TTL（auto TTL=2 交易日），一旦标的离开活跃集便不再续期，过期行长期滞留，
+        使 `qd_watchlist_label` 持续膨胀。
+      - 前端 stale 段对"刚过期"的标签仍展示"策略N个交易日未更新"，有参考价值，
+        故只回收**过期已久**（默认 >30 天）的行；近期过期的保留给 stale 显示，
+        避免把"策略刚离场"误判成"系统一直自算"。
+
+    ⚠️ 时间比较走 Python 时钟（同 `fetch_expired_by_grade`）：库会话 TimeZone=UTC，
+    SQL `NOW()` 比本地早 8 小时，会与读路径的本地时钟分歧 ⇒ 用 `datetime.now() - timedelta`。
+    """
+    cutoff = datetime.now() - timedelta(days=older_than_days)
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"DELETE FROM {TABLE} WHERE expires_at IS NOT NULL AND expires_at < %s",
+            (cutoff,),
+        )
+        n = cur.rowcount or 0
+        db.commit()
+        cur.close()
+    return n
 
 
 def list_user_rows(user_id: int, group_name: Optional[str] = None) -> List[Dict[str, Any]]:

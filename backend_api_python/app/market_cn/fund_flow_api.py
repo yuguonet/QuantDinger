@@ -560,16 +560,17 @@ def stock_fund_flow_history(code: str, days: int = 30,
 
 
 def _fetch_stock_daily(code: str, days: int) -> List[Dict[str, Any]]:
+    """CLI 同步用：取个股日线资金流（现由 tape 走本地 kline_1m 派生）。"""
     from app.market_cn.tape import get_fund_flow_daily
     try:
         d = get_fund_flow_daily(code, days=days) or {}
     except Exception as e:
-        logger.warning("[fund_flow_api] 个股日线远端失败(%s): %s", code, e)
+        logger.warning("[fund_flow_api] 个股日线取数失败(%s): %s", code, e)
         return []
     items = d.get("data") or d.get("rows") or d.get("list") or []
     if isinstance(items, dict):
         items = items.get("data") or []
-    src = d.get("source") or "eastmoney"
+    src = d.get("source") or "kline_1m"
     out = []
     for r in items:
         if not isinstance(r, dict):
@@ -582,8 +583,10 @@ def _fetch_stock_daily(code: str, days: int) -> List[Dict[str, Any]]:
             "large_net": _f(r.get("large_net")),
             "mid_net": _f(r.get("mid_net")),
             "small_net": _f(r.get("small_net")),
+            # turnover 必须带上：缺它则落库后在 _load_stock_db 里永远算不出占比
+            "turnover": _f(r.get("turnover")),
             "source": src,
-            "approx": False,
+            "approx": src != "eastmoney",
         })
     return [r for r in out if r["trade_date"]]
 
@@ -762,10 +765,12 @@ def _load_stock_db(code: str, days: int) -> List[Dict[str, Any]]:
             rows = cur.fetchall()
     out = []
     for r in rows:
+        main_net, turnover = _f(r[1]), _f(r[6])
         out.append({
             "trade_date": str(r[0])[:10], "code": code,
-            "main_net": _f(r[1]), "super_net": _f(r[2]), "large_net": _f(r[3]),
-            "mid_net": _f(r[4]), "small_net": _f(r[5]), "turnover": _f(r[6]),
+            "main_net": main_net, "super_net": _f(r[2]), "large_net": _f(r[3]),
+            "mid_net": _f(r[4]), "small_net": _f(r[5]), "turnover": turnover,
+            "main_pct": _pct(main_net, turnover),
             "source": r[7], "approx": bool(r[8]),
         })
     return list(reversed(out))
@@ -1101,14 +1106,14 @@ def _flow_from_1m_day(day: str, code: Optional[str] = None) -> Optional[Dict[str
     amt = float(amt or 0)
     inflow = float(inflow or 0)
     outflow = float(outflow or 0)
-    pct = (net / amt * 100.0) if amt > 0 else 0.0
+    pct = _pct(net, amt)
     direction = "inflow" if net > 0 else ("outflow" if net < 0 else "flat")
     out = {
         "trade_date": str(day)[:10],
         "main_net": round(net, 2),
         "super_net": None, "large_net": None, "mid_net": None, "small_net": None,
-        "main_pct": round(pct, 2),
-        "net_pct": round(pct, 2),
+        "main_pct": pct,
+        "net_pct": pct,
         "inflow": round(inflow, 2), "outflow": round(outflow, 2),
         "turnover": round(amt, 2),
         "inflow_yi": round(inflow / 1e8, 2),
@@ -1123,53 +1128,61 @@ def _flow_from_1m_day(day: str, code: Optional[str] = None) -> Optional[Dict[str
     return out
 
 
-def _market_from_kline1m(days: int, as_of: Optional[str] = None) -> List[Dict[str, Any]]:
-    """最近 N 个交易日 (从 kline_1m)。"""
+def _recent_1m_days(code: Optional[str] = None, days: int = 30) -> List[str]:
+    """最近 N 个有 1m 数据的交易日（升序）。当年表不足时回退上一年表。"""
     days = _clamp_days(days)
-    cutoff = (datetime.now() - timedelta(days=days * 3)).strftime("%Y-%m-%d")
+    now = datetime.now()
+    cutoff = (now - timedelta(days=days * 3)).strftime("%Y-%m-%d")
+    upper = now.strftime("%Y-%m-%d")
+    year = now.year
+    kept: List[str] = []
     try:
         with _pool().connection() as conn:
             with conn.cursor() as cur:
-                year = datetime.now().year
                 for yt in (year, year - 1):
-                    cur.execute(
-                        f"SELECT DISTINCT time::date FROM kline_1m_{yt} "
-                        f"WHERE time::date >= %s ORDER BY 1 DESC LIMIT %s",
-                        (cutoff, days))
-                    dts = [str(r[0])[:10] for r in cur.fetchall()]
-                    if dts:
+                    want = days - len(kept)
+                    if want <= 0:
                         break
+                    table = _kline_1m_year_table(yt)
+                    cur.execute("SELECT to_regclass(%s)", (table,))
+                    if cur.fetchone()[0] is None:
+                        continue
+                    if code:
+                        cur.execute(
+                            f"SELECT DISTINCT time::date FROM {table} "
+                            f"WHERE symbol=%s AND time::date BETWEEN %s AND %s "
+                            f"ORDER BY 1 DESC LIMIT %s",
+                            (code, cutoff, upper, want))
+                    else:
+                        cur.execute(
+                            f"SELECT DISTINCT time::date FROM {table} "
+                            f"WHERE time::date BETWEEN %s AND %s "
+                            f"ORDER BY 1 DESC LIMIT %s",
+                            (cutoff, upper, want))
+                    kept.extend(str(r[0])[:10] for r in cur.fetchall())
     except Exception as e:
-        logger.warning("[fund_flow_api] 1m 日期列表失败: %s", e)
+        logger.warning("[fund_flow_api] 1m 日期列表失败(%s): %s", code or "market", e)
         return []
+    return sorted(set(kept))[-days:]
+
+
+def _market_from_kline1m(days: int, as_of: Optional[str] = None) -> List[Dict[str, Any]]:
+    """最近 N 个交易日 (从 kline_1m)。"""
+    dts = _recent_1m_days(days=days)
     if as_of:
         dts = [d for d in dts if d <= str(as_of)[:10]]
     rows = []
-    for d in dts[:days]:
+    for d in dts:
         r = _flow_from_1m_day(d)
         if r:
             rows.append(r)
-    return list(reversed(rows))
+    return rows
 
 
 def _stock_from_kline1m(code: str, days: int) -> List[Dict[str, Any]]:
     """个股最近 N 日 1m 资金流。"""
-    days = _clamp_days(days)
-    cutoff = (datetime.now() - timedelta(days=days * 3)).strftime("%Y-%m-%d")
-    try:
-        with _pool().connection() as conn:
-            with conn.cursor() as cur:
-                year = datetime.now().year
-                cur.execute(
-                    f"SELECT DISTINCT time::date FROM kline_1m_{year} "
-                    f"WHERE symbol=%s AND time::date >= %s ORDER BY 1 DESC LIMIT %s",
-                    (code, cutoff, days))
-                dts = [str(r[0])[:10] for r in cur.fetchall()]
-    except Exception as e:
-        logger.warning("[fund_flow_api] 1m 个股日期失败(%s): %s", code, e)
-        return []
     out = []
-    for d in dts[:days]:
+    for d in _recent_1m_days(code=code, days=days):
         r = _flow_from_1m_day(d, code=code)
         if not r:
             continue
@@ -1186,7 +1199,7 @@ def _stock_from_kline1m(code: str, days: int) -> List[Dict[str, Any]]:
             "direction": r["direction"],
             "source": "kline_1m", "approx": True,
         })
-    return list(reversed(out))
+    return out
 
 
 
@@ -1275,6 +1288,13 @@ def _f(v) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+def _pct(net, amt) -> Optional[float]:
+    """净额占成交额百分比（%）。amt 缺失或为 0 → None（缺数据不回落 0）。"""
+    if net is None or not amt:
+        return None
+    return round(float(net) / float(amt) * 100.0, 2)
 
 
 # ================================================================

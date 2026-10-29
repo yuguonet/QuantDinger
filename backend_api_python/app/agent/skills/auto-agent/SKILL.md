@@ -78,7 +78,7 @@ metadata:
   - `holders`：`holder_count` 股东户数、`change_pct` 环比、`avg_hold_market_cap_rmb` 户均持股市值（**元**）、`avg_hold_num_shares` 户均持股（**股**）
 - 加工要点：结合步骤 2 的成本区间，判断融资余额边际变化方向（流入 = 杠杆资金加仓，流出 = 减仓）。`signal` 字段为字符串，给出方向但需结合数值复核。`financials` 换算为亿元时按 /10000，并带上 `report_date` 报告期说明。
 
-### 步骤 4：拉取资金流向（主力 / 大单 / 超大单）
+### 步骤 4：拉取资金流向（个股为价格方向净额）
 
 - 工具：`get_fund_flow`
 - 参数：
@@ -88,12 +88,13 @@ metadata:
   - `indicator: str`（默认 `'今日'`）
 - 关键字段：
   - `points`：数据点数
-  - `total_main_net`：主力净流入合计（绝对金额）
-  - `data[]`：按时段或按日的 `main_net / small_net / mid_net / large_net / super_net`，带 `time` 字段
+  - `total_main_net`：当日**价格方向净额**合计（元）。
+  - `data[]`：按时段的 `main_net / net_ratio`，大单/超大单等四档恒为 `null`（系统无拆单能力）
 - 加工要点：
   - 把 `data` 按 `time` 升序或倒序排列后再聚合。
-  - `small_net / mid_net / large_net / super_net` 可能为 `null`（表示当日该分项未采集到），按"数据缺失"处理，**不能当作 0**——否则会误判净流入方向。
+  - `small_net / mid_net / large_net / super_net` 恒为 `null`（本地无拆单能力），按"不提供该项"表述，**不能当作 0**——否则会误判净流入方向。
   - 取 `total_main_net` 与 `data[]` 单日 `main_net` 累加交叉验证，避免总量与明细不一致。
+  - 描述资金面时用「方向净额 / 占成交额比例」
 
 ### 步骤 5：汇总呈现
 
@@ -102,12 +103,12 @@ metadata:
 1. **价格走势**：K线区间、振幅、最新一期收盘。
 2. **筹码结构**：均价成本、当前价偏离、获利盘/套牢盘占比、90%/70% 集中度区间。
 3. **资本面**：融资余额 + 5日变化 + 融券余额 + 大宗交易次数/溢价/机构买入。
-4. **资金流向**：主力净流入总额、近期分项方向（结合 null 缺失说明）。
+4. **资金流向**：方向净额的方向与占成交额比例（`main_pct` / 近 5 日 `net_ratio`）。
 
 ## 注意事项
 
 1. **批量参数类型**：所有"支持批量"工具的入参（`codes`）一律为**字符串**（逗号分隔），不要写成 `List[str]`。
-2. **null ≠ 0**：`get_fund_flow` 在某些时段未采集大单/超大单等分项时会返回 `null`，必须按"数据缺失"处理，不可视为 0；同样地，`get_capital_summary` 的 `inst_buy` 等字段也可能是 `null`，需明确说明。
+2. **null ≠ 0**：`get_fund_flow` 个股 scope 的 `small_net / mid_net / large_net / super_net` **恒为 `null`**（本地量价派生无拆单能力），按"不提供该项"表述，不可视为 0；同样地，`get_capital_summary` 的 `inst_buy` 等字段也可能是 `null`，需明确说明。
 3. **筹码集中度宽度易误读**：`concentration_*_width_pct` 是上下界差相对值，不是盈亏百分比；务必读 `concentration_*_lower` 与 `concentration_*_upper` 的**绝对价位**再与当前股价对比。
 4. **K线短日期格式**：`agent_get_kline` 在 `1D` 频次下 `t` 字段为 `'MM-DD'`（不带年份），跨年度回测需自行补年份上下文，否则无法对齐到具体交易日。
 5. **按需工具有上限**：系统按需工具槽位为 12 个，超额激活会失败。若确需激活，先看 `activate_tools` 返回中的 `当前已激活按需工具 N/12`；如已接近上限，先替换再继续。工具地图已列出目标工具时不要重复激活（见步骤 0）。

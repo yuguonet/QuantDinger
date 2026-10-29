@@ -13,11 +13,15 @@
 === 架构位置（按 v3 的分层）===
     业务层（scheduler / backfill / cn_stock / evaluator …）→ 只调本模块公共 API
         ↓  签名完全冻结（8 个函数一个没改）
-    数据源适配层（本文件）—— 持有"日历"这一能力的口径
-        ↓  按顺序尝试候选源
-    源 1: akshare（远端权威）     源 2: 持久化快照（离线兜底）
-        ↓
+    数据源接口层（本文件）—— 持有"日历"这一能力的口径（三态 + 快照 + 元数据）
+        ↓  一次性 coordinate()，不写兜底链、不管优先级
+    协助/源层: coord_basic("trading_calendar") → provider_basic/akshare
+        ↓  （provider 失败时 coord 报错，本层降级到下面的快照）
     缓存：单文件，带 fetched_at / coverage_end 元数据，原子写
+
+    ★ 2026-10-28 Phase 4 收敛：远端访问已收口到 `data_sources`（原先本文件直接
+      `import akshare` 自拉）。本地快照不是"兜底补丁"而是三态设计的一部分
+      （离线可用 + 刷新失败不冒泡），保留不动。
 
 === 三态（对齐 v3 §3.2）===
   · 命中且新鲜           → 正常返回
@@ -68,26 +72,40 @@ class CalendarUnavailable(RuntimeError):
     """
 
 
-# ── 源 1：akshare（远端）──────────────────────────────────────────
+# ── 源 1：coord_basic（远端，provider 侧为 akshare）─────────────────
 
 def _from_akshare() -> Set[str]:
-    """从 akshare 拉取沪深交易日（2000 年起）。
+    """经 `coord_basic` 拉取沪深交易日（2000 年起）。
 
-    注意：`akshare` 在测试里被 conftest mock 成空模块 ⇒ 调用会抛 AttributeError，
-    这正是我们想测的"源失败"路径。
+    2026-10-28 收敛（方案 Phase 4）：本文件不再 `import akshare` 直连 ——
+    远端访问统一走 `coord_basic.coordinate("trading_calendar")`，选源 / 超时 /
+    熔断都在 `data_sources` 层（外围只做一次 coordinate）。
+
+    函数名与 `_candidates()` 里的来源标签**保持 "akshare"**：provider 侧仍是同一个
+    `ak.tool_trade_date_hist_sina`，口径未变；测试也通过 monkeypatch 本函数模拟
+    「源失败」三态，改名会让 5 条既有用例失效。
+
+    失败语义：provider 抛错 ⇒ coord 返 `ok=False`；上游给空行 ⇒ coord 返
+    `ok=True` 但 0 行。两者都视为取数失败并抛 `CalendarUnavailable`，
+    交给 `_load()` 降级到快照（不假装"没有交易日"）。
     """
-    import akshare as ak
+    from app.data_sources.coord_basic import coordinate
 
-    df = ak.tool_trade_date_hist_sina()
+    out = coordinate("trading_calendar")
+    if not out.get("ok"):
+        raise CalendarUnavailable("coord 取交易日历失败: %s" % (out.get("error") or "unknown"))
+
+    rows = (out.get("data") or {}).get("rows") or []
     dates: Set[str] = set()
-    for val in df["trade_date"]:
-        s = str(val).strip()
+    for r in rows:
+        # 上游是 pandas date 列（"2000-01-04"），兜住 datetime 形式的 "2000-01-04 00:00:00"
+        s = str((r or {}).get("date") or "").strip()[:10]
         if len(s) == 8 and s.isdigit():
             s = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-        if s >= "2000-01-01":
+        if len(s) == 10 and s[4] == "-" and s >= "2000-01-01":
             dates.add(s)
     if not dates:
-        raise CalendarUnavailable("akshare 返回空交易日历")
+        raise CalendarUnavailable("coord 返回空交易日历")
     return dates
 
 

@@ -89,7 +89,11 @@ def _quote_mootdx(code: str) -> Optional[Dict[str, Any]]:
             "last_close": last_close,                # 昨收
             "change": round(price - last_close, 4),  # 涨跌额
             "change_percent": float(r.get("percent", 0)),  # 涨跌幅(%)
-            "volume": float(r.get("vol", 0)),        # 成交量（手）
+            # 单位口径：通达信 quotes 的 vol 为"手"，与 sina(股)/tencent(手×100)/sohu(手×100)
+            # 对齐需 ×100（tape 族统一"股"，外围换手率公式 volume÷(流通股数) 依赖此口径）。
+            # ⚠ 2026-10-28 起 TDX 数据面已断（disabled=True），本换算**未经实测**，
+            #   恢复 disabled=False 时须先用 600519 对拍 sina/tencent 复核。
+            "volume": float(r.get("vol", 0)) * 100,  # 成交量（手→股）
             "amount": float(r.get("amount", 0)),     # 成交额（元）
             # 买盘五档: bid1 为最高买价（最接近成交价），bid5 为最低买价
             "bid": {

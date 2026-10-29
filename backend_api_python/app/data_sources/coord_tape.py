@@ -3,8 +3,15 @@
 
 【职责】声明本族能力表 → 取候选源 → 交给 dispatch（同 coord_pool，不重复实现调度）。
 
-【多源】`orderbook` 有 2 个上游（mootdx 主、tencent 兜底）——本族是 20 个 kind 里
-少数真多源之一。mootdx 挂了 tencent 顶上，这就是"源坏了随时换"的落点。
+【多源】`orderbook` 有 4 个上游（mootdx 主、sina/tencent/eastmoney_dc 兜底）——本族是
+少数真多源之一。mootdx 挂了后面顶上，这就是"源坏了随时换"的落点。
+`ticks_today` 同为 4 源；`ticks_history` 2026-10-29 起只剩 sina（东财
+RPT_TRANSACTION_DET 报表下线、腾讯无历史通道，两者原恒空 ⇒ 已摘，见各自 docstring）。
+
+【口径】`orderbook` 行结构 = {code, name, price, open, high, low, last_close, change,
+change_percent, volume(股), amount(元), bid/ask}（2026-10-29 统一：sina/eastmoney_dc
+原输出 normalize_quote 形状 last/changePercent/previousClose，与外围 tape.py 消费的
+price/last_close/change_percent 对不上，主源命中时 7 个字段恒 0）。
 
 【模式】全 sequential（与生产 `tape.py` 的回退顺序一致：mootdx → tencent）。
 tick 级 race 会把 TCP 连接数翻倍，收益极小。
