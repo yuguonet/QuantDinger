@@ -106,12 +106,18 @@ def resample(bars: List[Dict], minutes: int) -> List[Dict]:
 def market_state() -> Dict[str, Any]:
     """市场层面客观事实：资金流向、涨跌停家数、炸板率、板块强弱、情绪描述标签。
 
-    注意：mood / mood_score 是**描述性标签**（便于人和 LLM 快速理解当前环境），
-    不是入场规则 —— 怎么用由调用方决定。
+    2026-10-30 增（缺陷③）：指数日内强弱（index_intraday / intraday_bias）、
+    大盘资金近5日方向（fund_flow_days）与走弱环境标记（cautious）——早盘阶段
+    涨停/炸板计数未成熟，这两块是仅有的先行信号。
+
+    注意：mood / mood_score / intraday_bias 是**描述性标签**（便于人和 LLM 快速
+    理解当前环境），不是入场规则 —— 怎么用由调用方决定。cautious=True 供下游
+    （_helpers._hints / soft_warnings）收紧选股用，同样不是自动砍候选。
 
     Returns:
         dict: fund_flow / zt_count / dt_count / broken_count / broken_rate /
-            strong_sectors / weak_sectors / mood / mood_score
+            strong_sectors / weak_sectors / mood / mood_score /
+            index_intraday / fund_flow_days / intraday_bias / cautious
     """
     today = _today_str()
 
@@ -166,6 +172,57 @@ def market_state() -> Dict[str, Any]:
             bucket = strong_sectors if (s.get("change_pct") or 0) > 0 else weak_sectors
             bucket.append({"name": s.get("name"), "change_pct": s.get("change_pct")})
 
+    # ── 指数日内 + 大盘资金多日（2026-10-30 用户缺陷③：早盘预判力不够）──
+    # 【为什么加】旧版只有资金/涨跌停/炸板三类计数，而早盘（10:00 前）涨停/炸板
+    # 计数尚未成熟（封板还在变），唯一可用的先行信号是：①指数相对开盘强弱
+    # ②当日/近5日大盘资金方向。两块都是**描述性事实**（同 mood 性质，非入场规则）。
+    index_rows: List[Dict] = []
+    try:
+        from app.market_cn.index import get_index_realtime
+        for r in (get_index_realtime(["000001", "399001", "399006"]) or []):
+            try:
+                price = float(r.get("price") or 0)
+                opn = float(r.get("open") or 0)
+            except (TypeError, ValueError):
+                price = opn = 0.0
+            index_rows.append({
+                "code": r.get("code"), "name": r.get("name"),
+                "change_pct": r.get("change_percent"),
+                "vs_open_pct": round((price - opn) / opn * 100, 2) if price and opn else None,
+            })
+    except Exception as e:
+        src_errors.append(f"指数日内源失败: {type(e).__name__}: {e}")
+
+    fund_days: Dict[str, Any] = {}
+    try:
+        from app.market_cn.fund_flow_api import market_flow_summary
+        ms = market_flow_summary(days=5) or {}
+        fund_days = {
+            "direction": ms.get("direction"),
+            "net_yi": ms.get("net_yi"),
+            "direction_seq": ms.get("direction_seq"),  # 近5日逐日方向，看持续性
+        }
+    except Exception as e:
+        src_errors.append(f"大盘资金多日源失败: {type(e).__name__}: {e}")
+
+    # 描述性早盘倾向（同 mood：便于人和 LLM 快速理解，不是入场规则）：
+    #   指数全部在开盘价下方=偏弱；全部在上方=偏强；否则看当日资金定温和偏向。
+    vs_opens = [r.get("vs_open_pct") for r in index_rows if r.get("vs_open_pct") is not None]
+    bias = "震荡"
+    if vs_opens:
+        if all(v < 0 for v in vs_opens):
+            bias = "偏弱"
+        elif all(v > 0 for v in vs_opens):
+            bias = "偏强"
+        elif net_inflow < 0 and sum(1 for v in vs_opens if v < 0) >= len(vs_opens) * 2 / 3:
+            bias = "偏弱"
+        elif net_inflow > 0 and sum(1 for v in vs_opens if v > 0) >= len(vs_opens) * 2 / 3:
+            bias = "偏强"
+    # cautious=True ⇒ 下跌/持续流出环境，下游（_helpers._hints / soft_warnings）应收紧选股
+    seq = fund_days.get("direction_seq") or []
+    persistent_out = len(seq) >= 3 and all(s == "outflow" for s in seq[-3:])
+    cautious = (bias == "偏弱") or persistent_out
+
     # 描述性情绪标签（历史口径，保持与 _helpers._mood_regime 兼容）
     mood_score = 50
     if net_inflow > 0:
@@ -195,6 +252,11 @@ def market_state() -> Dict[str, Any]:
         "dt_count": dt_count,
         "broken_count": broken_count,
         "broken_rate": broken_rate,
+        # ── 早盘预判块（2026-10-30）：指数日内强弱 + 大盘资金多日方向 ──
+        "index_intraday": index_rows,       # [{code,name,change_pct,vs_open_pct}]
+        "fund_flow_days": fund_days,        # {direction, net_yi, direction_seq}
+        "intraday_bias": bias,              # 描述性标签：偏强/震荡/偏弱
+        "cautious": cautious,               # True=走弱环境，下游收紧选股（非入场规则）
         "source_errors": src_errors,
     }
 

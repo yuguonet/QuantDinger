@@ -3109,6 +3109,96 @@ json.dumps(output)
       return Math.max(0, totalMin - elapsed)
     }
 
+    /**
+     * 分时槽位：把「结束分钟」映射为交易时段内的槽位索引（0 起）；不在时段内返回 -1。
+     * 后端 1m 柱时间戳为结束时间（A股 09:31…11:30、13:01…15:00），
+     * 槽位索引 = 该分钟在「连续交易分钟序列」中的位置 ⇒ 索引即时间轴位置。
+     */
+    const minuteSlotIndex = (timeNum, session) => {
+      const toMin = (n) => Math.floor(n / 100) * 60 + (n % 100)
+      const start = toMin(session.start)
+      const mEnd = toMin(session.morningEnd)
+      const aStart = toMin(session.afternoonStart)
+      const end = toMin(session.end)
+      const t = toMin(timeNum)
+      const morningCount = mEnd - start
+      if (t === start) return 0
+      if (t > start && t <= mEnd) return t - start - 1
+      if (t === aStart) return morningCount
+      if (t > aStart && t <= end) return morningCount + (t - aStart - 1)
+      return -1
+    }
+
+    /** 槽位索引 → 该槽位的结束分钟（当日 0 点起的分钟数） */
+    const minuteSlotMinute = (slotIdx, session) => {
+      const toMin = (n) => Math.floor(n / 100) * 60 + (n % 100)
+      const start = toMin(session.start)
+      const mEnd = toMin(session.morningEnd)
+      const aStart = toMin(session.afternoonStart)
+      const morningCount = mEnd - start
+      return slotIdx < morningCount
+        ? start + slotIdx + 1
+        : aStart + (slotIdx - morningCount) + 1
+    }
+
+    /**
+     * 分时序列按「交易时段分钟网格」装配 —— 分时时间轴对齐的唯一真源。
+     *
+     * 为什么必须有网格：后端 1m 只在「有成交的分钟」产出柱（一字板封死、停牌、流动性枯竭
+     * 都会缺分钟），而 klinecharts 的横坐标是**数据索引**而非时间戳。直接喂稀疏柱 ⇒
+     * 索引与真实时间错位：缺失的早盘被压缩掉（末柱提前结束），视口左侧还会空出一片。
+     *
+     * 网格规则：
+     *   - 槽位索引 = 该分钟在交易时段中的位置 ⇒ 索引即时间轴位置（X 轴标签与柱位一一对应）
+     *   - 缺失分钟补占位柱：价格沿用前一根真实收盘（开头无前值则沿用首根真实收盘，
+     *     即「该分钟价格未变动」），volume/turnover = 0 ⇒ 不污染 AVP 均价线与筹码分布
+     *   - 只铺到「最后一根真实柱」为止；未来时段不补占位（由视口右缘空位表达）
+     * ⇒ 网格长度 + 剩余交易分钟 ≡ 全时段柱数 ⇒ 视口恒铺满整个时段：
+     *    历史无空白（缺分钟以占位柱表达），末柱精确落在 15:00。
+     */
+    const buildMinuteGrid = (realBars, session) => {
+      const list = (realBars || []).filter(b => b && b.timestamp != null)
+      if (!list.length) return []
+      const slotMap = new Map()
+      let lastSlot = -1
+      for (const b of list) {
+        const d = new Date(b.timestamp)
+        const idx = minuteSlotIndex(d.getHours() * 100 + d.getMinutes(), session)
+        if (idx < 0) continue
+        slotMap.set(idx, b)
+        if (idx > lastSlot) lastSlot = idx
+      }
+      if (lastSlot < 0) return []
+      // 占位柱时间戳基准：首根真实柱当日的 0 点 + 槽位分钟（精确到分钟）
+      const dayBase = new Date(list[0].timestamp)
+      dayBase.setHours(0, 0, 0, 0)
+      const firstReal = list.find(b => Number.isFinite(b.close))
+      const firstClose = firstReal ? firstReal.close : 0
+      const grid = new Array(lastSlot + 1)
+      let carry = null
+      for (let i = 0; i <= lastSlot; i++) {
+        const real = slotMap.get(i)
+        if (real) {
+          grid[i] = { ...real }
+          if (Number.isFinite(real.close)) carry = real.close
+          continue
+        }
+        // 占位柱：价格沿用前值（无前值则沿用首根真实收盘），成交量为 0
+        const price = carry != null ? carry : firstClose
+        grid[i] = {
+          timestamp: dayBase.getTime() + minuteSlotMinute(i, session) * 60 * 1000,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          volume: 0,
+          turnover: 0,
+          _padded: true
+        }
+      }
+      return grid
+    }
+
     const minuteDateStr = (ts) => {
       const d = new Date(ts)
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -3272,28 +3362,35 @@ json.dumps(output)
         minuteDateStr(b.timestamp) === todayStr &&
         toNumForFilter(b.timestamp) >= session.start &&
         toNumForFilter(b.timestamp) <= session.end)
+      // 当前 klineData 已是「分钟网格」，占位柱同样参与合并：
+      // 新到的真实柱按时间戳替换掉同槽位的占位柱
       const existingReal = (klineData.value || []).filter(b => b && b.timestamp && minuteDateStr(b.timestamp) === todayStr)
       if (incoming.length === 0 && existingReal.length === 0) return
 
       const realMap = new Map()
       existingReal.forEach(b => realMap.set(b.timestamp, b))
       incoming.forEach(b => realMap.set(b.timestamp, { ...b }))
-      const realBars = attachMinuteTurnover(Array.from(realMap.values()).sort((a, b) => a.timestamp - b.timestamp))
-      if (realBars.length === 0) return
+      const mergedBars = Array.from(realMap.values()).sort((a, b) => a.timestamp - b.timestamp)
+      if (mergedBars.length === 0) return
+
+      // 重新按分钟网格装配：新柱可能填补此前缺失的分钟（占位柱 → 真实柱），也可能延长网格。
+      // 不重装网格 ⇒ 索引与时间轴错位（末柱提前结束 / 左侧留白）
+      const gridBars = attachMinuteTurnover(buildMinuteGrid(mergedBars, session))
+      if (gridBars.length === 0) return
 
       const prev = klineData.value || []
       // 与上一帧完全一致则直接跳过（避免无意义的重绘）
-      const sameAsPrev = prev.length === realBars.length &&
-        prev.every((b, i) => b && b.timestamp === realBars[i].timestamp && klineBarSnapshotKey(b) === klineBarSnapshotKey(realBars[i]))
+      const sameAsPrev = prev.length === gridBars.length &&
+        prev.every((b, i) => b && b.timestamp === gridBars[i].timestamp && klineBarSnapshotKey(b) === klineBarSnapshotKey(gridBars[i]))
       if (sameAsPrev) return
 
-      klineData.value = realBars
+      klineData.value = gridBars
       // 数据确实发生了变化 → 记录时间戳，供停滞看门狗判断
       _minuteLastChangeTs = Date.now()
       // 展示交易日变化（休市时回退显示上一交易日 → 今日数据到达后切到今日）：
       // 昨收 = 「被展示交易日的上一交易日收盘」，必须重推；区间锚点同属当日，一并作废。
       // 否则昨收会停在上一交易日的口径上（0 轴线偏心、窗口略微撑大）
-      const _rtDay = minuteDateStr(realBars[realBars.length - 1].timestamp)
+      const _rtDay = minuteDateStr(gridBars[gridBars.length - 1].timestamp)
       if (_rtDay !== _minutePcDayKey) {
         _minutePcDayKey = _rtDay
         minutePrevClose.value = null
@@ -3301,29 +3398,29 @@ json.dumps(output)
         _minuteAxisAnchorDev = 0
         _minuteAxisKey = ''
       }
-      updatePricePanel(convertToInternalFormat(realBars), { force: true })
+      updatePricePanel(convertToInternalFormat(gridBars), { force: true })
 
-      const structureChanged = prev.length !== realBars.length ||
-        prev.some((b, i) => !b || b.timestamp !== realBars[i].timestamp)
+      const structureChanged = prev.length !== gridBars.length ||
+        prev.some((b, i) => !b || b.timestamp !== gridBars[i].timestamp)
 
       if (isMinuteLine.value) {
         // 走全量 applyNewData（内部带合并节流）：视口锁死与指标重算由 fitMinuteLineView /
-        // applyMinutePrevCloseAxis 统一处理。数据末尾就是最新真实柱（已无占位柱），
+        // applyMinutePrevCloseAxis 统一处理。写入的是「分钟网格」（索引=时间轴位置），
         // updateData 也可用，但全量刷新能同步重设右侧空位并保持指标/视口状态一致，更稳。
-        scheduleMinuteChartApply(realBars)
+        scheduleMinuteChartApply(gridBars)
       } else if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
         // 时间轴变化（跨日 / 首次构建）：全量刷新
         if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
           try {
-            chartRef.value.applyNewData(realBars)
+            chartRef.value.applyNewData(gridBars)
             maybeUpdateIndicators(true)
           } catch (_) { /* 预期内：图表未就绪时等待下一轮全量加载 */ }
         }
       } else {
         // 时间轴未变：只替换内容有变化的柱
         if (chartRef.value && typeof chartRef.value.updateData === 'function') {
-          for (let i = 0; i < realBars.length; i++) {
-            const p = realBars[i]
+          for (let i = 0; i < gridBars.length; i++) {
+            const p = gridBars[i]
             const q = prev[i]
             if (!q || q.timestamp !== p.timestamp || klineBarSnapshotKey(q) !== klineBarSnapshotKey(p)) {
               flushRealtimeChartBar(p)
@@ -3481,8 +3578,9 @@ json.dumps(output)
      * 分时图数据处理：
      * 1. 使用1m数据
      * 2. 只保留当天交易时段内的数据 [开盘, 收盘]
-     * 3. 补充成交额 turnover（供内置 AVP 均价线使用；数据多长就多长，不补齐未来时段，
-     *    显示区域由 fitMinuteLineView 锁死为整个交易时段）
+     * 3. 按「交易时段分钟网格」装配（缺失分钟补占位柱）⇒ 数据索引 = 时间轴位置：
+     *    历史时段不留空白、末柱精确落在收盘；未来时段不补占位（由视口右缘空位表达）
+     * 4. 补充成交额 turnover（供内置 AVP 均价线使用）
      */
     const processMinuteLineData = (rawData) => {
       if (!rawData || rawData.length === 0) return []
@@ -3527,16 +3625,17 @@ json.dumps(output)
             return dateStr === lastDateStr && timeNum >= session.start && timeNum <= session.end
           })
           if (fallbackData.length > 0) {
-            return attachMinuteTurnover(fallbackData.map(item => ({ ...item })))
+            // 上一交易日同样按分钟网格装配：缺分钟也要与时间轴对齐
+            return attachMinuteTurnover(buildMinuteGrid(fallbackData, session))
           }
         }
         return []
       }
 
-      // 浅拷贝（避免污染 _minuteRawData 原始数据）并补充成交额
-      const result = todayData.map(item => ({ ...item }))
-
-      return attachMinuteTurnover(result)
+      // 按交易时段分钟网格装配（缺失分钟补占位柱）：使「数据索引 = 时间轴位置」，
+      // 历史时段不留空白、末柱精确落在收盘；buildMinuteGrid 内部已浅拷贝，
+      // 不会污染 _minuteRawData 原始数据。
+      return attachMinuteTurnover(buildMinuteGrid(todayData, session))
     }
 
     /**
@@ -4314,8 +4413,8 @@ json.dumps(output)
           return fromBars
         }
       } catch (_) { /* 预期内 */ }
-      // 今日首柱 开/收 近似
-      const first = realBars[0]
+      // 今日首柱 开/收 近似（取首根**真实**柱：序列首元素可能是补齐的占位柱）
+      const first = realBars.find(b => b && b._padded !== true) || realBars[0]
       const openVal = Number(first.open)
       const closeVal = Number(first.close)
       const approx = (Number.isFinite(openVal) && openVal > 0)
@@ -4806,10 +4905,12 @@ json.dumps(output)
       const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
       const close = Number(cur.close)
       const valid = cur.close != null && Number.isFinite(close)
+      // 占位柱 = 该分钟无成交（网格补齐）：如实标注，不把补齐价当成真实成交价展示
+      const padded = cur._padded === true
       return [
         { title: '时间', value: timeStr },
-        { title: '价格', value: valid ? close.toFixed(p) : '--' },
-        { title: '成交量', value: String(cur.volume || 0) }
+        { title: '价格', value: padded ? '--' : (valid ? close.toFixed(p) : '--') },
+        { title: '成交量', value: padded ? '0（无成交）' : String(cur.volume || 0) }
       ]
     }
     /** 当前渲染模式对应的图例配置（切主题/换模式时都要重中一次，避免被上一次的形态残留） */
@@ -5138,6 +5239,14 @@ json.dumps(output)
                   // （极坐标/自适应范围、150/400/1000ms 自愈重试均由 setup 内部处理）
                   fitMinuteLineView()
                   setupMinutePrevCloseReference()
+                  // 布局稳定后再铺一次：换股瞬间绘图区宽度可能尚未稳定，
+                  // fitMinuteLineView 用 plotWidth/totalBars 算 barSpace 会算偏，
+                  // 导致时段铺不满宽度（残留态：重启前端即恢复）。
+                  // 与 applyMinuteLineChartStyle 的 150ms 自愈重试同源。
+                  safeTimeout(() => {
+                    if (!isMinuteLine.value || !chartRef.value) return
+                    fitMinuteLineView()
+                  }, 150)
                 } else {
                   applyMinuteLineChartStyle()
                 }

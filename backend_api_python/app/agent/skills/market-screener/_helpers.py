@@ -193,7 +193,7 @@ def soft_warnings(item: Dict, market: dict, strategy: str = "") -> List[str]:
     filter_candidates（保守兼容路径）才会把 warnings 一并剔除。
     """
     out: List[str] = []
-    if _mood_regime(market) == "weak":
+    if _mood_regime(market) == "weak" or (market or {}).get("cautious"):
         src = str(item.get("source") or "")
         if any(k in src for k in ("连板", "4IN1", "龙回头", "涨停")) and not (item.get("reason") or ""):
             out.append("弱势市涨停活跃源无题材支撑(退潮风险)")
@@ -329,25 +329,179 @@ def _prev_streak(bars: List[Dict], limit_pct: float, streak: int) -> int:
     return n
 
 
+# ── 开盘脉冲（拉高出货）识别阈值（2026-10-30 用户缺陷②）──────────────────
+# 「开盘几千万拉升后抛盘」的客观形态：开盘窗大额净流入 → 其后转净流出 → 冲高回落。
+# 阈值是**经验值**（只产 warnings，不进 hard）——形态是经验判断不是客观不可交易，
+# 取舍仍归 LLM（设计原则见 SKILL.md「你的角色与自由度」）。
+_OPEN_WINDOW_START = "09:30"   # 开盘窗起点（集合竞价后的连续竞价）
+_OPEN_WINDOW_END = "10:00"     # 开盘窗截止时刻（早盘定调窗口，见 strategy-rules）
+_PUMP_OPEN_MIN_WAN = 2000.0    # 开盘窗净流入下限（万元）≈「几千万级」脉冲
+_PUMP_OPEN_SHARE_PCT = 60.0    # 开盘窗净额占全天净额比例上限（全天净流入为正时）
+_PUMP_FADE_PCT = 3.0           # 现价距日内高点回落幅度（%）——冲高回落佐证
+_PUMP_FADE_POS = 35.0          # 缺 rt 时用 close_pos_in_day ≤ 此值近似冲高回落
+
+
+def _intraday_shape(points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """分钟净额 → 日内时段结构（开盘窗 vs 其后）。纯求和，无判断。
+
+    开盘窗 = 09:30 ≤ t < `_OPEN_WINDOW_END`（左闭右开：bar 时间是**起始**时刻，
+    10:00 起的 bar 属盘中段；strategy-rules「10:00 前基本定调」）。
+    points 来自 tape.get_fund_flow_realtime 的 data：[{time:"YYYY-MM-DD HH:MM", main_net:元}]。
+    open_share_pct = 开盘窗净额 ÷ 全天净额；其后净流出时可 >100%（脉冲全部被回吐），
+    不是计算错误。
+    """
+    open_net = after_net = 0.0
+    n = 0
+    for p in points or []:
+        t = str(p.get("time") or "")
+        if len(t) < 16:
+            continue
+        v = _f(p.get("main_net"))
+        if _OPEN_WINDOW_START <= t[11:16] < _OPEN_WINDOW_END:
+            open_net += v
+        else:
+            after_net += v
+        n += 1
+    total = open_net + after_net
+    return {
+        "ok": n > 0,
+        "open_net_wan": round(open_net / 1e4, 1),
+        "after_net_wan": round(after_net / 1e4, 1),
+        "open_share_pct": round(open_net / total * 100, 1) if total > 0 else None,
+        "points": n,
+    }
+
+
+def pump_dump_risk(flow: Dict[str, Any], tech: Dict[str, Any] = None,
+                   rt: Dict[str, Any] = None) -> List[str]:
+    """开盘脉冲拉升后抛盘（拉高出货）风险线索 —— 经验型软提示（进 warnings，可被否决）。
+
+    判据（2026-10-30 用户缺陷②；阈值见 _PUMP_* 常量，经验值非硬规则）：
+      ① 开盘窗净流入 ≥ _PUMP_OPEN_MIN_WAN 且其后净额转负 —— 资金脉冲后撤；
+      ② 开盘窗净额占全天 ≥ _PUMP_OPEN_SHARE_PCT 且其后净额为负 —— 早盘对倒特征；
+      ③ 现价距日内高点回落 ≥ _PUMP_FADE_PCT（rt.high/price 优先；缺 rt 用
+         tech.close_pos_in_day ≤ _PUMP_FADE_POS 近似）—— 冲高回落佐证；
+      ④ 今日大额净流入但近 5 日累计净流出 —— 单日脉冲与多日趋势背离。
+    ①/② 命中后再叠加 ③/④ 升级为「疑似拉高出货」；只描述形态，取舍归 LLM。
+
+    Returns:
+        list[str]: 风险线索（空 = 未命中；字段缺失按「判不了」处理，不硬凑）
+    """
+    out: List[str] = []
+    if not isinstance(flow, dict) or not flow.get("ok"):
+        return out
+    intr = flow.get("intraday") if isinstance(flow.get("intraday"), dict) else {}
+    if not intr.get("ok"):
+        return out
+    open_wan = _f(intr.get("open_net_wan"))
+    after_wan = _f(intr.get("after_net_wan"))
+    share = intr.get("open_share_pct")
+
+    pulse = (open_wan >= _PUMP_OPEN_MIN_WAN or
+             (share is not None and _f(share) >= _PUMP_OPEN_SHARE_PCT))
+    if not (pulse and after_wan < 0):
+        return out
+    out.append(f"开盘脉冲：{_OPEN_WINDOW_END} 前净流入 {open_wan:.0f} 万，其后净流出 {abs(after_wan):.0f} 万")
+
+    # ③ 冲高回落佐证
+    fade_note = None
+    if rt:
+        high, price = _f(rt.get("high")), _f(rt.get("price"))
+        if high > 0 and price > 0:
+            fade = (high - price) / high * 100
+            if fade >= _PUMP_FADE_PCT:
+                fade_note = f"冲高回落 {fade:.1f}%（较日内高点）"
+    elif isinstance(tech, dict) and tech.get("close_pos_in_day") is not None \
+            and _f(tech.get("close_pos_in_day")) <= _PUMP_FADE_POS:
+        fade_note = f"收于日内低侧 {tech['close_pos_in_day']}%（冲高回落近似）"
+    if fade_note:
+        out.append(fade_note + " → 疑似拉高出货")
+
+    # ④ 单日脉冲与多日趋势背离
+    rec = flow.get("recent") if isinstance(flow.get("recent"), dict) else {}
+    net5 = rec.get("net_5d_wan")
+    if net5 is not None and _f(net5) < 0 and _f(flow.get("main_net_wan")) >= _PUMP_OPEN_MIN_WAN:
+        out.append(f"今日脉冲与近5日净流出 {_f(net5):.0f} 万背离（趋势未转向）")
+    return out
+
+
 def flow_summary(code: str) -> Dict[str, Any]:
-    """个股资金流客观事实（单位：万元）。失败返回 ok=False + 原因，不静默。"""
+    """个股资金流客观事实（单位：万元）：当日 + 近5/20日总体 + 日内时段结构。
+
+    2026-10-30 扩展（用户缺陷①②：只看当天看不出资金「总体」，也防不住开盘几千万
+    拉升后抛盘）—— 两个既有工具各取所需，不做重复聚合：
+      · `get_fund_flow_realtime`                当日分钟净额 → `intraday`（开盘/其后分段）
+      · `get_fund_flow(scope="stock_daily", days=30)` 日线聚合 → `recent`（5/20日累计、
+        连续方向、逐日符号、剔除最大单日、上一完整交易日、资金趋势判定）
+    失败返回 ok=False + 原因，不静默；recent / intraday 各自带 ok，单块失败不拖垮另一块。
+
+    口径提醒（勿按「主力资金」读取）：main_net 是量价方向净额（近似口径，见
+    fund_flow_tools 头注）；跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
+
+    Returns:
+        {ok, main_net_wan, net_pct_of_amount,
+         recent: {ok, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
+                  streak_dir, streak_days, sign_5d, max_day, net_20d_ex_max_wan,
+                  prev_day_net_wan, trend},
+         intraday: {ok, open_net_wan, after_net_wan, open_share_pct, points},
+         reason?}
+    """
+    out: Dict[str, Any] = {}
+    # ── 当日：分钟净额（realtime_snapshot 量价派生）──
     try:
         from .common import call_tool
         ff = call_tool("get_fund_flow_realtime", code=code)
         if not isinstance(ff, dict) or ff.get("error"):
-            return {"ok": False, "reason": (ff or {}).get("error", "无返回")}
-        # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
-        # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0；amount/turnover 在该
-        # 返回里同样不存在，拿不到就如实给 None（不再瞎除），调试字段 raw_keys 移除。
-        main_net = _f(ff.get("total_main_net", ff.get("main_net_inflow"))) / 1e4
-        amount = _f(ff.get("amount") or ff.get("turnover") or ff.get("amount_wan"))
-        return {
-            "ok": True,
-            "main_net_wan": round(main_net, 1),
-            "net_pct_of_amount": round(main_net * 1e4 / amount * 100, 2) if amount else None,
-        }
+            out["reason"] = (ff or {}).get("error", "无返回")
+        else:
+            # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
+            # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0。2026-10-30 补：占比
+            # 一直为 None 的根因是键名取错——该返回带 main_pct / total_amount，直接读。
+            main_net = _f(ff.get("total_main_net", ff.get("main_net_inflow"))) / 1e4
+            pct = _num_or_none(ff.get("main_pct"))
+            if pct is None:
+                amount = _f(ff.get("total_amount") or ff.get("amount") or ff.get("turnover"))
+                pct = round(main_net * 1e4 / amount * 100, 2) if amount else None
+            out["main_net_wan"] = round(main_net, 1)
+            out["net_pct_of_amount"] = pct
+            out["intraday"] = _intraday_shape(ff.get("data") or [])
     except Exception as e:
-        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+        out["reason"] = f"{type(e).__name__}: {e}"
+
+    # ── 近5/20日总体：日线聚合（含资金趋势判定，stock_daily dispatch 已附）──
+    try:
+        from ...tools.finance.fund_flow_tools import get_fund_flow
+        df = get_fund_flow(scope="stock_daily", codes=code, days=30) or {}
+        one = (df.get("data") or {}).get(code) or {}
+        if isinstance(one, dict) and not one.get("error"):
+            rows = one.get("data") or []
+            today = datetime.now().strftime("%Y-%m-%d")
+            prev_wan = None
+            for r in reversed(rows):
+                if str(r.get("date") or "")[:10] < today and r.get("main_net") is not None:
+                    prev_wan = round(_f(r.get("main_net")) / 1e4, 1)
+                    break
+            out["recent"] = {
+                "ok": True,
+                "net_5d_wan": round(_f(one.get("recent_5d_main_net")) / 1e4, 1),
+                "net_20d_wan": round(_f(one.get("recent_20d_main_net")) / 1e4, 1),
+                "ratio_5d_pct": one.get("recent_5d_net_ratio"),
+                "ratio_20d_pct": one.get("recent_20d_net_ratio"),
+                "streak_dir": one.get("main_net_streak_dir"),
+                "streak_days": one.get("main_net_streak"),
+                "sign_5d": one.get("recent_5d_sign"),
+                "max_day": one.get("max_main_net_day"),
+                "net_20d_ex_max_wan": round(_f(one.get("recent_20d_main_net_ex_max")) / 1e4, 1),
+                "prev_day_net_wan": prev_wan,
+                "trend": one.get("资金趋势判定"),
+            }
+        else:
+            out["recent"] = {"ok": False, "reason": (one or {}).get("error", "无返回")}
+    except Exception as e:
+        out["recent"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+    out["ok"] = "main_net_wan" in out
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -610,7 +764,10 @@ def _w2s_tech_ok(p: dict) -> Tuple[bool, str]:
 
 
 def _w2s_flow_ok(code: str) -> Tuple[bool, str, dict]:
-    """主力 ≥2000万 且 今日>昨日（抢筹加速）。只对短名单调用。"""
+    """主力 ≥2000万 且 今日>上一完整交易日（抢筹加速）。只对短名单调用。
+
+    2026-10-30：多日口径统一走 flow_summary.recent（与画像/深挖同源），不再单独
+    取 stock_daily —— 消除重复取数与口径漂移（统一接口约定）。"""
     extra: Dict[str, Any] = {}
     try:
         fl = flow_summary(code) or {}
@@ -627,29 +784,18 @@ def _w2s_flow_ok(code: str) -> Tuple[bool, str, dict]:
     if today < _W2S_MIN_MAIN_WAN:
         return False, f"今日主力 {today:.0f}万 < {_W2S_MIN_MAIN_WAN:.0f}万", extra
 
-    # ④ 加速：今日 > **上一完整交易日**（不是死取倒数第二条——最后一条可能是今日）
-    try:
-        from datetime import date as _date
-        from ...tools.finance.fund_flow_tools import get_fund_flow
-        df = get_fund_flow(scope="stock_daily", codes=code, days=5) or {}
-        rows = ((df.get("data") or {}).get(code) or {}).get("data") or []
-        _today = _date.today().isoformat()
-        y_nets = [float(r["main_net"]) for r in rows
-                  if r.get("main_net") is not None
-                  and str(r.get("date") or "")[:10] < _today]
-        if y_nets:
-            y_wan = y_nets[-1] / 1e4
-            extra["y_main_net_wan"] = round(y_wan, 1)
-            extra["net_accel"] = today > y_wan
-            if today <= y_wan:
-                return False, f"今日 {today:.0f}万 ≤ 昨日 {y_wan:.0f}万（未加速）", extra
-        else:
-            extra["y_main_net_wan"] = None
-            extra["net_accel"] = None
-    except Exception as e:
+    # ④ 加速：今日 > **上一完整交易日**（recent.prev_day_net_wan 已滤掉今日行）
+    rec = fl.get("recent") if isinstance(fl.get("recent"), dict) else {}
+    y_wan = rec.get("prev_day_net_wan")
+    if y_wan is not None:
+        extra["y_main_net_wan"] = y_wan
+        extra["net_accel"] = today > _f(y_wan)
+        if today <= _f(y_wan):
+            return False, f"今日 {today:.0f}万 ≤ 昨日 {_f(y_wan):.0f}万（未加速）", extra
+    else:
         extra["y_main_net_wan"] = None
         extra["net_accel"] = None
-        extra["accel_note"] = f"昨日主力取不到:{type(e).__name__}"
+        extra["accel_note"] = str(rec.get("reason") or "昨日主力取不到")
     return True, "ok", extra
 
 
@@ -1254,6 +1400,11 @@ def profile_candidates(
                 p["flow"] = flow_summary(p["code"])
                 if not p["flow"].get("ok"):
                     p["missing"].append(f"资金流缺失:{p['flow'].get('reason')}")
+                else:
+                    # 拉高出货线索（2026-10-30 缺陷②）：并入 warnings 由 LLM 定夺
+                    for w in pump_dump_risk(p["flow"], tech=p.get("tech")):
+                        if w not in p["warnings"]:
+                            p["warnings"].append(w)
             except Exception as e:
                 p["flow"] = {"ok": False, "reason": str(e)}
                 p["missing"].append(f"资金流异常:{e}")
@@ -1298,16 +1449,28 @@ def profile_candidates(
 
 
 def _hints(regime: str, market: dict) -> Dict[str, Any]:
-    """给 LLM 的参考门槛（不是硬规则）：弱势市提高胜率要求、强势市可放宽。"""
+    """给 LLM 的参考门槛（不是硬规则）：弱势市/下跌环境提高胜率要求、减只数。
+
+    2026-10-30（用户缺陷③）：market.cautious=True（指数弱于开盘或资金连续流出）
+    时在情绪分桶之上**再收紧一档**——下跌时选股应更谨慎，早盘尤其如此。
+    """
     base = {"weak": 0.55, "neutral": 0.50, "strong": 0.48}.get(regime, 0.50)
     caps = {"weak": 5, "neutral": 8, "strong": 10}
+    cautious = bool((market or {}).get("cautious"))
+    if cautious:
+        base = {"weak": 0.58, "neutral": 0.54, "strong": 0.52}.get(regime, 0.54)
+    picks = max(3, caps.get(regime, 8) - (2 if cautious else 0))
+    note = (
+        "门槛/条数是历史均值经验值，非硬约束：若候选普遍高 p_up 且题材共振，可适当放宽；"
+        "若 profile 里 missing 很多（数据缺口），应主动降低给出的置信度"
+    )
+    if cautious:
+        note += "；大盘走弱（cautious）：提高门槛、减少只数、只做有支撑的票，早盘勿抢反弹"
     return {
         "p_up_floor_suggest": base,
-        "max_picks_suggest": caps.get(regime, 8),
-        "note": (
-            "门槛/条数是历史均值经验值，非硬约束：若候选普遍高 p_up 且题材共振，可适当放宽；"
-            "若 profile 里 missing 很多（数据缺口），应主动降低给出的置信度"
-        ),
+        "max_picks_suggest": picks,
+        "cautious": cautious,
+        "note": note,
     }
 
 

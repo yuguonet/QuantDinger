@@ -45,6 +45,7 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
         "debug_strategy",
     ),
     "auto-backtest": ("skills.auto-backtest.run", ("run",), "run"),
+    "stock-analyzer": ("skills.stock-analyzer.run", ("analyze",), "analyze"),
 }
 
 # ★ 2026-10-14 迁址：原为 `parents[1]`（= app/agent）⇒ 产物落在 `app/agent/tmp/`

@@ -2,7 +2,7 @@
 name: market-screener
 description: 从A股全市场筛选短中线标的。用户问"今天买什么股""有什么好股票""短线/短中线选什么"时使用。不含个股分析。
 metadata:
-  version: 8.4.0
+  version: 8.5.0
   tags: market, screener, short_term, mid_term, a_share
   tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
 ---
@@ -64,7 +64,7 @@ metadata:
 | 函数（真实签名） | 作用 | 何时用 |
 | --- | --- | --- |
 | `run()` | 一次性跑完整流程：**① 基线**（池序前 10 画像、无 hard 前 8，恒入 deep）→ **② 加法层** `pre_screen(search_top_n=100)` → `objective_preexclude` → `score_pool`（双保险软门槛 + 缺分保送，Round0 存活<4 自动 Round1 放宽，最多 2 轮，reserved=基线去重）→ **③ deep_analyze(基线+加法，Top12)**。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
-| `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 | 起手，判断大环境 |
+| `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 / **指数日内强弱（index_intraday/intraday_bias）** / **大盘资金近5日方向（fund_flow_days）** / **cautious（走弱环境，收紧选股）** | 起手，判断大环境 |
 | `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：自选来源（连板/尾盘封板/龙回头/热点/条件搜索/近期涨停），不做取舍与排序 | 起手取池 |
 | `profile_candidates(prescreen_result, limit=20, with_flow=True, with_pred=True)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍。**入参是上一步的 dict** | 核心，几乎所有场景都要跑 |
 | `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / p_up / **实时行情对账**），无任何主观评分 | 对你挑出的少数票做证据汇总 |
@@ -89,6 +89,8 @@ metadata:
 - `report_guide` 判定规则摘要（支撑≫涨跌幅、周期、禁止重验）——**写结论时直接照它落笔，不必 read_skill**
 - `rt` 实时快照（价格 / 涨跌幅 / 涨停价 / 跌停价 / `limit_band` / 涨跌停）；`stale_bar=True` 时 `tech` 的收盘/涨跌停已按 rt 修正（MA/RSI 仍基于日线）。**有 rt 就不要在主对话重拉实时行情**；`stale_bar` 时**不要用 `close_pos_in_day` 下结论**。**ST/新股信 rt 价**：`limit_band=no_limit`（新股无涨跌幅）两价为空，禁止用公式回退；ST 的 quote 带可能按板规则而非 ±5%（见 `limit-rules.md`）
 - `theme.hit` 题材是否落在当日主线；`hard` 客观障碍清单；`missing` 数据缺口
+- `flow` = 资金证据卡：`main_net_wan`/`net_pct_of_amount`（当日）+ **`recent`（近5/20日累计、连续方向、逐日符号、剔除最大单日、上一交易日）** + **`intraday`（开盘窗 vs 其后净额、open_share_pct）**。**资金看多日总体，单日大额流入 ≠ 趋势**（口径=量价方向净额，非真实主力）；`recent`/`intraday` 各自带 ok，缺失看 missing
+- `warnings` 可能含**拉高出货线索**（「开盘脉冲」「疑似拉高出货」「趋势背离」，deep 层在 `flow_risks` 键）：开盘窗大额净流入后转流出/冲高回落/今日脉冲与近5日净流出背离 —— 经验型判断，可否决但要写理由
 - `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
 - `funnel` 是 `run()` 返回的漏斗统计键，包含：`rounds` / `pool_raw` / `excluded_obj` / `scored`（加法层被打分只数）/ `baseline`（基线保底只数，恒入 deep）/ `baseline_hard`（基线窗口内被 hard 拦掉的只数）/ `excluded_score` / `deep_n` / `eastmoney_ok`，用于复盘每一步筛掉了多少候选；`excluded_score` 内 `no_pred_kept`=缺分保送只数（模型盲区票）、`score_skipped`=超打分预算被让位只数（均只计加法层）
@@ -128,9 +130,9 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 
 1. **题材与主线**：是否落在当日 `themes`？同一题材已被你推了几只（过度集中 = 单点风险）
 2. **量价结构**：量比、收盘在日内位置、是否 20 日高位、振幅；放量突破 vs 放量滞涨要区分；**日内 MACD 红绿柱变化**作涨/跌压力参考
-3. **资金**：主力净额方向与占成交额比；形态好但资金流出 → 减配或放弃；**结合个股流通市值看控盘**（同额资金在流通市值小的票上控制力更强）；**流通市值越大趋势越连续、变盘越慢，流通市值小的票容易被资金带动，趋势更快更短**；**龙虎榜席位**：是否有主力席位、是否有游资席位、是否有机构席位
+3. **资金**：主力净额方向与占成交额比；**近5/20日总体（flow.recent：累计、连续方向、逐日符号）优先于当日单格**；形态好但资金流出 → 减配或放弃；**开盘脉冲后回落/单日脉冲与多日趋势背离 → 拉高出货嫌疑（flow_risks）**；**结合个股流通市值看控盘**（同额资金在流通市值小的票上控制力更强）；**流通市值越大趋势越连续、变盘越慢，流通市值小的票容易被资金带动，趋势更快更短**；**龙虎榜席位**：是否有主力席位、是否有游资席位、是否有机构席位
 4. **位置与空间**：距 MA20 乖离、20 日位置、连板高度、**支撑位是否清晰**、**支撑–压力间距**（`sr_gap_pct` 过窄 → 操作性弱、排序下调）
-5. **市场状态**：情绪分桶、涨停 / 跌停家数、炸板率——弱势市应自动提高门槛、减少只数
+5. **市场状态**：情绪分桶、涨停 / 跌停家数、炸板率、**指数相对开盘强弱（早盘主信号）与大盘资金近5日方向**——弱势市/`cautious` 应自动提高门槛、减少只数
 6. **可执行性**：`hard` 全集（ST/退市、换手不足、**价格 <2 或 >300**、涨停买不进、停牌）；次日干扰
 
 ### 核心判定原则（摘要）
@@ -200,6 +202,9 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 - 把 `p_up`（仅 T+1）外推成 T+3/T+5 的胜率；理由里重复写方向
 - 忽视 `hard`：涨停买不进、**低价/高价带**、停牌、换手不足
 - 弱势情绪（weak）下仍推一堆高位连板
+- **只看当日资金流向就下结论（不看近5/20日总体）**；把单日大额流入当趋势反转
+- **接盘「开盘几千万拉升后抛盘」**：忽视 flow_risks 的开盘脉冲/冲高回落/趋势背离线索
+- **早盘只看涨停家数下结论**（封板未成熟，应看指数相对开盘+大盘资金方向）；大盘走弱（cautious）仍按强市门槛推票
 - 多只票同一题材却当成分散配置
 - 把 missing 当作「没有风险」
 

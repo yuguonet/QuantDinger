@@ -287,10 +287,20 @@ def test_qd_system_has_no_multi_period_requirement() -> None:
 
 
 def test_skill_md_not_edited_with_long_rationale() -> None:
-    """SKILL.md 不该再有长论证段（会被 brewer 覆盖 + 每轮烧 token）。"""
-    skill = BACKEND / "app" / "agent" / "skills" / "auto-stock-analyze" / "SKILL.md"
-    src = skill.read_text(encoding="utf-8")
-    for banned in ("为什么是 30 天而不是 120", "为什么是 60 而不是 120 或 30",
-                   "为什么是 30 而不是 120"):
-        assert banned not in src, (
-            "SKILL.md 仍含长论证段 %r（每轮进上下文 + 会被 brewer 覆盖）" % banned)
+    """SKILL.md 不该再有长论证段（会被 brewer 覆盖 + 每轮烧 token）。
+
+    2026-10-30 同型化（来源：个股分析独立化，用户裁定退役 3 个重叠分析技能）：
+    原只钉 `auto-stock-analyze/SKILL.md` 一个文件，该技能退役后路径消失 ⇒ 夹具失配。
+    改为扫描 `skills/*/SKILL.md` 全部现存技能 —— 语义不变（SKILL.md 不该有长论证段），
+    且不再依赖某个具体技能是否存在。
+    """
+    skills_dir = BACKEND / "app" / "agent" / "skills"
+    checked = 0
+    for skill in sorted(skills_dir.glob("*/SKILL.md")):
+        src = skill.read_text(encoding="utf-8")
+        checked += 1
+        for banned in ("为什么是 30 天而不是 120", "为什么是 60 而不是 120 或 30",
+                       "为什么是 30 而不是 120"):
+            assert banned not in src, (
+                f"{skill.parent.name}/SKILL.md 仍含长论证段 %r（每轮进上下文 + 会被 brewer 覆盖）" % banned)
+    assert checked, f"未扫描到任何 SKILL.md（目录结构异常？）: {skills_dir}"

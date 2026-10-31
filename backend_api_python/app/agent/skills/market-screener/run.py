@@ -33,9 +33,14 @@ _INSPECT_DEADLINE_S = 15.0
 def market_state() -> dict:
     """市场层面事实：资金流向、涨停/跌停家数、炸板率、板块强弱、情绪描述标签。
 
+    2026-10-30 增：指数日内强弱（index_intraday/intraday_bias）、大盘资金近5日
+    方向（fund_flow_days）、走弱环境标记（cautious=True 时选股应更谨慎）。
+
     返回:
-        dict: fund_flow=上证净流入；zt_count/dt_count/broken_count/broken_rate=涨停/跌停/炸板；
-            strong_sectors/weak_sectors=行业涨跌；mood/mood_score=描述性情绪标签（非入场规则）。
+        dict: fund_flow=当日净流入；zt_count/dt_count/broken_count/broken_rate=涨停/跌停/炸板；
+            strong_sectors/weak_sectors=行业涨跌；mood/mood_score=描述性情绪标签（非入场规则）；
+            index_intraday=三大指数涨跌/相对开盘位置；fund_flow_days=近5日大盘资金方向；
+            intraday_bias=偏强/震荡/偏弱；cautious=走弱环境标记。
     """
     try:
         return SkillResult(_market_state())
@@ -247,7 +252,12 @@ _REPORT_GUIDE = {
     "board_cut": "zt_streak>=3 默认只写 T+1",
     "words": "方向用 看多/中性/看空/回避；用户问持仓才写「兑现」",
     "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors；"
-              "大盘最多进「风险」一行轻注，不得当筛选主条件",
+              "market.cautious=True（大盘走弱）→ 提高门槛、减少只数、只做有支撑的票；"
+              "大盘本身最多进「风险」一行轻注，不得当筛选主条件",
+    "fund_trend": "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 main_net；"
+                  "单日大额流入不等于趋势，连续3日以上同向才算趋势；剔除最大单日后仍为正才是普遍承接",
+    "pump_dump": "flow_risks/warnings 含「开盘脉冲」「疑似拉高出货」「趋势背离」→ 拉高出货嫌疑，"
+                 "除非有强反证（如尾盘重新放量收回），否则降权或不买",
     "funnel": "漏斗数字只允许出现在末行「数据」；禁止写进正文",
     "no_pred": "无标定分票写「暂无历史参考分」（不是坏票）；禁止写 no_pred_kept/p_up 等字段名",
 }
@@ -343,9 +353,13 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     返回:
         dict: analyzed[{code,name,patterns,tech,flow,mtf,score,direction,confidence,signal,missing,
             rt{price,change_pct,previous_close,limit_up,limit_up_price,limit_down_price,limit_band,time},
-            stale_bar,rt_risks}]；
+            stale_bar,rt_risks,flow_risks}]；
             strategy / missing / errors。confidence 是**证据完整度**（拿到几维 / 共几维），
             不是模型对自己判断的把握。
+            flow = {ok, main_net_wan, net_pct_of_amount, recent{近5/20日累计/连续方向/逐日符号/
+            剔除最大单日/上一交易日}, intraday{开盘窗 vs 其后净额}}——资金看多日总体，
+            单日大额流入 ≠ 趋势（口径=量价方向净额，非真实主力）。
+            flow_risks = 拉高出货线索（开盘脉冲后转流出/冲高回落/单日脉冲背离，经验型，可否决）。
             rt = 实时快照；limit_band=price|no_limit|missing（新股无涨跌幅为 no_limit，
             两价为 None 且 limit_up=false，勿用公式回退）。stale_bar=True 表示本地日线滞后，
             tech 的收盘/涨跌停已按 rt 修正（MA/RSI 等历史指标仍基于 bar）。
@@ -483,6 +497,15 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         apply_rt_overlay(r, _rt, code=str(r.get("code") or ""), name=str(r.get("name") or ""))
         if _rt is None and r.get("tech"):
             r.setdefault("missing", []).append("实时行情缺失")
+        # 拉高出货线索（2026-10-30 缺陷②）：rt 到手后判冲高回落才准，单独成键
+        # 不混进 rt_risks（那是可执行性风险），由 LLM 自行定夺。
+        try:
+            from ._helpers import pump_dump_risk
+            r["flow_risks"] = pump_dump_risk(r.get("flow") or {},
+                                            tech=r.get("tech"), rt=r.get("rt"))
+        except Exception as e:
+            r["flow_risks"] = []
+            missing.append(f"拉高出货识别:{type(e).__name__}: {e}")
 
     raw = attach_prediction(raw, market=market)
 
@@ -701,6 +724,15 @@ def inspect_stock(code: str, deep: bool = False) -> dict:
         risks.append(f"量比{tech['vol_ratio']}异常放大（注意出货）")
     if isinstance(out.get("flow"), dict) and out["flow"].get("ok") and (out["flow"].get("main_net_wan") or 0) < 0:
         risks.append(f"主力净流出{abs(out['flow']['main_net_wan'])}万")
+    # 多日资金总体（2026-10-30 缺陷①）：连续净流出比单日净流出更值得警惕
+    _rec = (out.get("flow") or {}).get("recent") or {}
+    if _rec.get("ok") and (_rec.get("streak_dir") == "outflow") and (_rec.get("streak_days") or 0) >= 3:
+        risks.append(f"资金连续{_rec['streak_days']}日净流出（趋势未转向）")
+    try:
+        from ._helpers import pump_dump_risk
+        risks.extend(pump_dump_risk(out.get("flow") or {}, tech=tech))
+    except Exception:
+        pass
     if tech.get("limit_up"):
         risks.append("当日涨停封板（次日竞价溢价已 price in，需防冲高回落）")
     out["risks"] = risks
@@ -861,6 +893,8 @@ def run(sources: str = None, queries: str = None,
         return SkillResult({
             "report_guide": _REPORT_GUIDE,
             "strategy": meta.get("strategy") or strategy,
+            "market": meta.get("market") or prescreen_result.get("market") or {},
+            "hints": meta.get("hints") or {},
             "analyzed": [],
             "signal": "无符合软硬门槛的候选",
             "pool_size": funnel["pool_raw"],
@@ -878,6 +912,11 @@ def run(sources: str = None, queries: str = None,
     # funnel 紧跟 report_guide（SkillResult 渲染分流按键存在性判断，键序不影响渲染）
     if isinstance(result, dict):
         out = {"report_guide": result.get("report_guide", _REPORT_GUIDE),
+               # market/hints 必须随结果交付（2026-10-30 缺陷③）：旧版只在空结果分支
+               # 带 mood_regime/themes，常规路径的早盘预判/下跌收紧信息根本到不了
+               # 写结论的 LLM —— 与 report_guide「market 已由 run_skill 覆盖」自相矛盾。
+               "market": meta.get("market") or prescreen_result.get("market") or {},
+               "hints": meta.get("hints") or {},
                "funnel": funnel}
         out.update({k: v for k, v in result.items() if k != "report_guide"})
         return SkillResult(out)

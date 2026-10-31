@@ -50,7 +50,11 @@ def test_validate_frontmatter_clean_doc_has_no_issue():
 # ── 端到端：全量技能迁移后 tags/tools 仍从 metadata 成功解析 ──────
 def test_real_skills_parse_from_metadata_and_no_legacy_toplevel():
     adapter = sa.QDSkillAdapter()
-    assert len(adapter) >= 6
+    # 2026-10-30 同型化（来源：个股分析独立化，用户裁定退役 3 个重叠分析技能）：
+    # 技能目录 7 → 5（退役 auto-agent / auto-finance-analysis-stock / auto-stock-analyze，
+    # 新增 stock-analyzer）。本断言是「全量解析没崩」的下限守卫，不是钉死技能数量，
+    # 故随退役同步下调；若将来再增删技能需再同步，并在本行注明。
+    assert len(adapter) >= 5
     ms = adapter.get("market-screener")          # 走 display→name 映射
     assert ms is not None and ms.name == "market-screener"
     # v8.1.0（2026-10-15）起 tags 增 mid_term —— 技能定位「全市场短中线选股」

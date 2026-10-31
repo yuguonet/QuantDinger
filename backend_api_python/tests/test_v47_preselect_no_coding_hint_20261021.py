@@ -146,7 +146,9 @@ def test_prompt_tail_keeps_example_and_planning_blocks() -> None:
     assert body.index("【示例】") < body.index("【待规划】"), (
         "【示例】应在【待规划】之前（模板结构被打乱）")
     # 示例里的 JSON 必须完整收尾（不被 hint 半句截断）
-    assert '"skill":"auto-stock-analyze"}' in body, (
+    # 2026-10-30 同型化（来源：个股分析独立化）：示例技能随退役改为 stock-analyzer，
+    # 本断言钉的是「示例 JSON 未闭合」，技能名只是载体。
+    assert '"skill":"stock-analyzer"}' in body, (
         "示例 JSON 未闭合 ⇒ 示例段被截断")
 
 

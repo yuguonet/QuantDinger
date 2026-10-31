@@ -69,15 +69,18 @@
 
 ## 维度 3：资金
 
-**看什么**：`flow.main_net_wan`、`flow.net_pct_of_amount`；深挖看 `inspect_stock(deep=True).fund_hist`
+**看什么**：`flow.main_net_wan` / `flow.net_pct_of_amount`（当日）、**`flow.recent`（近5/20日总体）**、**`flow.intraday`（开盘窗结构）**；深挖看 `inspect_stock(deep=True).fund_hist`
 
 怎么读：
 
+- **先看多日总体再看当日**：`recent`（5/20日累计、连续方向、逐日符号、剔除最大单日）是主论据，当日净额只是其中一格
 - 主力净额为正且占成交额比 > 1% 才算有效流入；小额净流入在活跃票上属于噪音
+- **单日大额流入 ≠ 趋势**：`sign_5d` 全负 + 今日大额正 = 单日脉冲，趋势未转向；连续 3 日以上同向才算趋势；`net_20d_ex_max_wan`（剔除最大单日后）仍为正才是普遍承接
 - 形态好 + 资金净流出 = 拉抬出货嫌疑，明确降权
+- **开盘脉冲防御**（`flow.intraday` / `flow_risks`）：开盘窗净流入几千万级、其后转净流出，尤其叠加冲高回落 → 疑似拉高出货，除非有强反证（尾盘重新放量收回）否则降权/不买
 - `fund_hist` 看的是连续性：单日大额流入不如连续 3 日温和流入可靠
 
-失败模式：把「净额为正」直接当买入依据，忽略占比与连续性；盘中资金数据是时点快照，尾盘会变。
+失败模式：把「当日净额为正」直接当买入依据，忽略多日总体与占比；把单日脉冲当趋势反转；忽视开盘脉冲后回落（接盘拉高出货）；盘中资金数据是时点快照，尾盘会变。
 
 ## 维度 4：位置与空间
 
@@ -99,16 +102,18 @@
 
 ## 维度 5：市场状态
 
-**看什么**：`market.mood` / `mood_score` / `zt_count` / `dt_count` / `broken_rate`、`mood_regime`
+**看什么**：`market.mood` / `mood_score` / `zt_count` / `dt_count` / `broken_rate`、`mood_regime`、**`market.index_intraday` / `intraday_bias`（指数相对开盘强弱）**、**`market.fund_flow_days`（近5日大盘资金方向）**、**`market.cautious`**
 
 怎么读：
 
+- **早盘（10:00 前）涨停/炸板计数未成熟**，此时预判以 `index_intraday`（指数相对开盘）+ `fund_flow_days`（资金持续性）为主，计数类只作辅助
+- `intraday_bias=偏弱` 或 `fund_flow_days.direction_seq` 连续 outflow → `cautious=True`：**下跌时选股更谨慎** ——提高门槛、减少只数、只做有清晰支撑的票、早盘勿抢反弹
 - `weak`：提高门槛、减少只数、优先低位启动票，避开高位连板接力
 - `strong`：可放宽 p_up 门槛，允许题材内多配一只
 - 炸板率高说明接力资金不足，此时「封板」反而是风险信号而不是买点
 - `hints.p_up_floor_suggest` 是按上面规则算的经验值，可以偏离但要写理由
 
-失败模式：无视情绪分桶，在炸板率 40% 的市场里推荐接力板。
+失败模式：无视情绪分桶，在炸板率 40% 的市场里推荐接力板；早盘只看涨停家数下结论（计数未成熟）；大盘走弱（cautious）仍按强势市门槛满仓推票。
 
 ## 维度 6：可执行性
 

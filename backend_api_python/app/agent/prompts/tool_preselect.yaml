@@ -38,7 +38,7 @@ user: |-
   【能力层】域内确实无法覆盖某条交付信息时，用 search_resources(query, kind='capability') 检索后点名；**不要预列**。
   {history}
   【示例】
-  用户"分析宁德时代" → {{"goal":"对宁德时代进行A股一站式综合分析","deliverables":["股票基本信息","实时行情","K线走势","技术面评分","基本面摘要","筹码分布","资金流向"],"tools":["get_realtime_quote","agent_get_kline","technical_analysis","get_capital_summary","get_chip_distribution","get_fund_flow"],"skill":"auto-stock-analyze"}}
+  用户"分析宁德时代" → {{"goal":"对宁德时代做 T+1~T+20 全周期诊断（分周期方向+置信度+触发/证伪+关键价位）","deliverables":["实时行情","K线走势","技术面","资金流向","筹码分布","形态与支撑","分周期方向"],"tools":["get_realtime_quote","agent_get_kline","technical_analysis","get_capital_summary","get_chip_distribution","get_fund_flow"],"skill":"stock-analyzer"}}
 
   【待规划】（tools 最多 {max_tools} 个；确实无关则 []）
   （再强调：从 {{ 起笔，无前导空白/换行。）
