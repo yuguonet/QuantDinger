@@ -1346,122 +1346,19 @@ def _objective_rank_key(item: Dict, index: int, themes: List[str] = ()) -> tuple
     return (tier, index)
 
 
-# ── P1 弱转强回捞（2026-10-23 用户裁定，合并收紧版）──────────────────
-# 【定位】排名按 p_up（已收盘日线）砍尾会漏掉「今天才转强」的票（002164@11:20）。
-#   本通道**只回捞、不改排名**，条件从严，防假弱转强。
-# 【明确弱转强】合并「乖离≤2%+流入≥2000万」与「滞跌+抢筹加速」两版之长：
-#   ① 回踩 MA5 附近（乖离 ≤2.5% 或 near_support）
-#   ② 滞跌：非放量破位、非深跌（接飞刀否决）
-#   ③ 量价方向净额 **≥2000万**（绝对门槛，挡小单噪声；非东财主力净额）
-#   ④ 且 **今日 > 昨日**（抢筹加速；昨日取不到则只卡③）
-#   ⑤ 日线结构好（多头排列或距 MA20 不过远）——用日线几何替代 t1，不进多周期
-# 【日内动量】只作滞跌轻确认（未继续深跌），**不**进 VWAP/m15。
-
-_W2S_MIN_NET_WAN = 2000.0   # 今日量价方向净额下限（万元；非东财主力净额）
-
-
-def _w2s_tech_ok(p: dict) -> Tuple[bool, str]:
-    """回踩 + 滞跌 + 日线结构：(通过, 原因)。纯 tech，零 IO。"""
-    tech = p.get("tech") or {}
-    try:
-        d5 = abs(float(tech.get("dist_ma5_pct"))) if tech.get("dist_ma5_pct") is not None else 99.0
-    except (TypeError, ValueError):
-        d5 = 99.0
-    try:
-        d20 = float(tech.get("dist_ma20_pct")) if tech.get("dist_ma20_pct") is not None else 99.0
-    except (TypeError, ValueError):
-        d20 = 99.0
-    try:
-        chg = float(tech.get("change_pct") or 0.0)
-    except (TypeError, ValueError):
-        chg = 0.0
-    try:
-        vr = float(tech.get("vol_ratio") or 0.0)
-    except (TypeError, ValueError):
-        vr = 0.0
-
-    # ① 回踩 MA5 附近（≤2.5%）
-    if not (tech.get("near_support") or d5 <= 2.5):
-        return False, f"距MA5 {d5:.1f}% 非回踩位"
-    # ② 滞跌：非放量破位、非深跌
-    if vr >= 2.5 and chg <= -3.0:
-        return False, f"放量下跌 vr={vr:.1f} chg={chg:.1f}%"
-    if chg <= -5.0:
-        return False, f"仍深跌 {chg:.1f}% 非滞跌"
-    # ⑤ 日线结构仍好（多头或未远离 MA20）
-    if not (tech.get("ma_bull_stack") or d20 <= 6.0):
-        return False, f"日线结构差 距MA20 {d20:.1f}% 且非多头"
-    return True, "ok"
-
-
-def _w2s_flow_ok(code: str) -> Tuple[bool, str, dict]:
-    """今日量价方向净额 ≥2000万 且 今日>上一完整交易日（抢筹加速）。只对短名单调用。
-
-    2026-10-30：多日口径统一走 flow_summary.recent（与画像/深挖同源），不再单独
-    取 stock_daily —— 消除重复取数与口径漂移（统一接口约定）。
-    2026-10-31：读 `net_wan`（原 main_net_wan），口径=量价方向净额，非东财主力。"""
-    extra: Dict[str, Any] = {}
-    try:
-        fl = flow_summary(code) or {}
-    except Exception as e:
-        return False, f"flow:{type(e).__name__}", extra
-    if not fl.get("ok"):
-        return False, str(fl.get("reason") or "flow缺"), extra
-    try:
-        today = float(fl.get("net_wan") or 0.0)
-    except (TypeError, ValueError):
-        today = 0.0
-    extra["net_wan"] = today
-    # ③ 绝对门槛：真抢筹，挡小单
-    if today < _W2S_MIN_NET_WAN:
-        return False, f"今日量价净额 {today:.0f}万 < {_W2S_MIN_NET_WAN:.0f}万", extra
-
-    # ④ 加速：今日 > **上一完整交易日**（recent.prev_day_net_wan 已滤掉今日行）
-    rec = fl.get("recent") if isinstance(fl.get("recent"), dict) else {}
-    y_wan = rec.get("prev_day_net_wan")
-    if y_wan is not None:
-        extra["y_net_wan"] = y_wan
-        extra["net_accel"] = today > _f(y_wan)
-        if today <= _f(y_wan):
-            return False, f"今日 {today:.0f}万 ≤ 昨日 {_f(y_wan):.0f}万（未加速）", extra
-    else:
-        extra["y_net_wan"] = None
-        extra["net_accel"] = None
-        extra["accel_note"] = str(rec.get("reason") or "昨日净额取不到")
-    return True, "ok", extra
-
-
-def _is_weak_to_strong(p: dict) -> Tuple[bool, dict]:
-    """P1 弱转强（合并收紧）：回踩滞跌 + 量价净额≥2000万 + 抢筹加速 + 日线好。"""
-    tech_ok, tech_why = _w2s_tech_ok(p)
-    if not tech_ok:
-        return False, {"reason": tech_why}
-    flow_ok, flow_why, fl = _w2s_flow_ok(str(p.get("code") or ""))
-    out = dict(fl)
-    out["tech_why"] = tech_why
-    if not flow_ok:
-        out["reason"] = flow_why
-        return False, out
-    out["reason"] = "w2s"
-    return True, out
-
-
 def score_pool(candidates, strategy="", market=None, main_themes=None,
                p_up_floor=0.48, rank_cut=0.30, floor_keep=4, no_pred_keep=2,
-               w2s_keep=2, reserved=None):
-    """双保险软门槛 + 缺分保送 + 弱转强回捞——run() 漏斗第 2 层（**加法层**）。
+               reserved=None):
+    """双保险软门槛 + 缺分保送——run() 漏斗第 2 层（**加法层**）。
 
     层次（2026-10-25 起与 8.1.0 基线分层，见 run._baseline_selection）：
     1. **hard**：画像层已标的客观障碍，本层计数不放进 deep；
     2. **p_up 硬闸**：低于 p_up_floor 的进 cut_list（计 p_up_hard）；
     3. **排名截断**：过闸票按 p_up 降序砍后 rank_cut 比例（计 rank_cut）；
-    4. **三条回捞通道**（都只加不减）：
+    4. **两条回捞通道**（都只加不减）：
        · floor_kept：被砍但题材命中或稀缺来源（龙回头/热点）的前 floor_keep 只；
        · no_pred_kept：无 p_up（模型盲区）按客观优先级占 no_pred_keep 名额
          （2026-10-21：缺分 ≠ 低分）；
-       · w2s_kept（2026-10-23）：被砍但**明确弱转强**（回踩 MA5 滞跌 + 量价净流入
-         + 日线结构好 + 今日主力>昨日）的前 w2s_keep 只。只回捞、不改 p_up 排名；
-         条件从严，防假弱转强。
 
     【reserved（2026-10-25 用户裁定：8.4.0 = 8.1.0 胜率的再提高，不是重新设计）】
     reserved = 8.1.0 基线画像（run._baseline_selection 产出：池序前 8 无 hard）。
@@ -1472,11 +1369,10 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
     ① 白占打分护栏额度 ② 以加法身份重复进 deep。
 
     【rank_cut 定位】是**数量控制**（限制进 deep 的条数），不是质量否决。
-    相对截断（砍排名后 X%）意味着同一只票在强池出局、弱池存活——三条回捞通道
-    （floor/w2s/no_pred）为此而设。要绝对门槛请调 p_up_floor。
+    相对截断（砍排名后 X%）意味着同一只票在强池出局、弱池存活——两条回捞通道
+    （floor/no_pred）为此而设。要绝对门槛请调 p_up_floor。
 
     Args:
-        w2s_keep: 弱转强名额上限（默认 2；0=关闭）
         reserved: 8.1.0 基线画像列表（dict 带 code/hard）；其 code 在本层
             全程排除（不占预算、不画像、不进任何名单）。None=无保留（旧行为）
     """
@@ -1554,26 +1450,8 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
         for p in no_pred_kept:
             p["no_pred_kept"] = True
 
-    # ★ P1 弱转强回捞（2026-10-23）：被 rank_cut/p_up 剔掉但**明确弱转强**
-    #   （回踩滞跌 + 量价净额≥2000万 + 今日>昨日 + 日线好）→ 进 deep。只回捞不改排名。
-    w2s_kept = []
-    if int(w2s_keep or 0) > 0:
-        already = {id(x) for x in kept + floor_kept + no_pred_kept}
-        shortlist = [p for p in cut_list if id(p) not in already]
-        # 先零 IO tech 预筛，再对入围者拉资金（限名额×3，控 IO）
-        pre = [p for p in shortlist if _w2s_tech_ok(p)[0]]
-        pre.sort(key=lambda x: str(x.get("code") or ""))
-        for p in pre[:max(0, int(w2s_keep) * 3)]:
-            if len(w2s_kept) >= int(w2s_keep):
-                break
-            ok, info = _is_weak_to_strong(p)
-            p["w2s"] = info
-            if ok:
-                p["w2s_kept"] = True
-                w2s_kept.append(p)
-
-    # 有分票按 p_up 降序在前，弱转强/缺分保送殿后
-    selected = kept + floor_kept + w2s_kept + no_pred_kept
+    # 有分票按 p_up 降序在前，缺分保送殿后
+    selected = kept + floor_kept + no_pred_kept
     selected.sort(key=lambda x: (x.get("p_up") is not None, x.get("p_up") or 0),
                   reverse=True)
     stats = {
@@ -1583,7 +1461,6 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
         "no_pred": len(no_pred_list),
         "no_pred_kept": len(no_pred_kept),
         "floor_kept": len(floor_kept),
-        "w2s_kept": len(w2s_kept),
         "scored": len(profiles),
         "score_skipped": score_skipped,
     }

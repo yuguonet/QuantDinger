@@ -8,7 +8,7 @@
 > **T+10 / T+20 可选延伸**，证据不够就写「不适用」，不强制凑满五档。
 > `p_up` 只标定 T+1；其余周期靠证据推断并写明依据，后两档置信度默认更低。
 >
-> **实时对账字段（2026-10-14/15）**：`deep_analyze` 每行带 `rt{price,change_pct,
+> **实时对账字段**：`deep_analyze` 每行带 `rt{price,change_pct,
 > previous_close,limit_up,limit_up_price,limit_down_price,limit_band,time}`、
 > `stale_bar`、`rt_risks`。`limit_band`: `price|no_limit|missing`（新股无涨跌幅为
 > `no_limit`，两价为 None 且 `limit_up=false`，详见 `limit-rules.md`）。

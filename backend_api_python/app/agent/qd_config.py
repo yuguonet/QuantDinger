@@ -357,7 +357,7 @@ class QDAgentConfig(MimocodeAgentConfig):
     # MimocodeAgent 是 super() 调用后再拼 <context_usage> 页脚，故本值有效。
     # 设 QD_MAX_OBSERVATION_CHARS=0 可退回上游行为。
     max_observation_length: int = field(
-        default_factory=lambda: int(os.getenv("QD_MAX_OBSERVATION_CHARS", "30000")))
+        default_factory=lambda: int(os.getenv("QD_MAX_OBSERVATION_CHARS", "45000")))
     # ── 成本硬预算（2026-10-12 P0 修复）────────────────────────────────────
     # 光有 step_limit 一个刹车不够：**步数便宜、上下文贵**。实测「明天买什么股」
     # 一轮 15 次调用、累计 ≈40 万 token、上下文每轮 ~29k tokens（其中工具 schema

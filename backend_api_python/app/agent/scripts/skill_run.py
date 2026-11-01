@@ -54,12 +54,13 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
 #   目录里不再夹带运行时产物（`app/agent` 只放代码）。
 #   parents: 0=scripts 1=agent 2=app 3=backend_api_python
 _OUT_DIR = Path(__file__).resolve().parents[3] / "tmp" / "skill_output"
-# ── 预览裁剪（2026-10-21，结构化裁剪替代字符盲切）──────────────────────
-# 预算推导（test_skill_run_preview.py 锁定）：market-screener 漏斗扩容后 run()
-# 契约 = 12 张 deep_analyze 证据卡 ≈ 24K 字符 + report_guide/funnel/market 等
-# 顶层信封 ≈ 2K ⇒ 32000 让 12 卡常态**完整送达**，再留 ~25% 余量防卡片膨胀。
-# 改小前先过 ① 号测试；env `QD_SKILL_PREVIEW_LIMIT` 可调（≤0/非法回落缺省）。
-_PREVIEW_LIMIT = 32000
+# ── 预览裁剪（结构化裁剪替代字符盲切）────────────────────────────────
+# 预算推导（test_skill_run_preview.py ① 号契约锁定）：market-screener run()
+# 交付 = rank 全量（45 行 × ~603 字符）+ 满卡 N 张（~2,017 字符/张）+
+# report_guide/funnel/market 顶层信封 ⇒ 47000 = observation 闸 45000 + 2000
+# 信封余量，配套 skill 侧 _DEEP_BUDGET_CHARS=44500（三闸联动，改小前先过测试；
+# env `QD_SKILL_PREVIEW_LIMIT` 可调（≤0/非法回落缺省）。
+_PREVIEW_LIMIT = 47000
 _STR_CUT_MARK = "……【字符串过长已截断；预览已够写结论，勿读 full_path】"
 _STR_CUT_MIN = 128   # 短于此的字符串不参与截断：截了救不回预算，还白毁语义
 _LIST_ITEM_SEP = 2   # json.dumps 缺省分隔符 ", " 的长度（批量估算条目占用用）
