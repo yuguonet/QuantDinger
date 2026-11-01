@@ -1051,12 +1051,21 @@ def _kline_1m_year_table(year: int) -> str:
     return f"kline_1m_{year}"
 
 
-def _flow_from_1m_day(day: str, code: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """单日 1m OHLCV → 流入/流出/净额/净占比。code=None 全市场。"""
+def _flow_from_1m_day(day: str, code: Optional[str] = None,
+                      until: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """单日 1m OHLCV → 流入/流出/净额/净占比。code=None 全市场。
+
+    until="HH:MM" 时只累计该时刻前（同刻口径，大盘校准层用；返回 dict 带 until 键）。
+    时间谓词用范围（可走 time 索引）；`time::date =` 写法不可 sargable，勿改回。
+    """
     year = int(str(day)[:4])
     table = _kline_1m_year_table(year)
-    where = "time::date = %s"
-    args: list = [day]
+    day_s = str(day)[:10]
+    where = "time >= %s::timestamp AND time < %s::timestamp + interval '1 day'"
+    args: list = [day_s, day_s]
+    if until:
+        where += " AND time <= %s::timestamp"
+        args.append(f"{day_s} {str(until)[:5]}")
     if code:
         where += " AND symbol = %s"
         args.append(code)
@@ -1123,6 +1132,7 @@ def _flow_from_1m_day(day: str, code: Optional[str] = None) -> Optional[Dict[str
         "direction": direction,
         "source": "kline_1m",
         "approx": True,
+        "until": (str(until)[:5] if until else None),
         "note": f"1m OHLCV 量价方向近似 nsym={nsym} (非主力单型)",
     }
     return out

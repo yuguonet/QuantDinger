@@ -22,13 +22,15 @@ market-screener/_facts.py — 纯客观事实层（无评分、无取舍、无�
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from ...log import logger
 
 from .common import (
-    call_tool, fetch_kline, _today_str,
+    call_tool, fetch_kline, _today_str, _data_day,
     fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
     fetch_hot_stocks_with_reason, fetch_hot_sectors,
     scan_dragon_pullback, _get_writer,
@@ -103,6 +105,10 @@ def resample(bars: List[Dict], minutes: int) -> List[Dict]:
 #  市场事实快照
 # ═══════════════════════════════════════════════════════════════
 
+_MARKET_MEMO: Dict[str, Any] = {"at": 0.0, "day": "", "data": None}
+_MARKET_MEMO_TTL_S = float(os.getenv("QD_SCREENER_MARKET_TTL", "60") or 0)
+
+
 def market_state() -> Dict[str, Any]:
     """市场层面客观事实：资金流向、涨跌停家数、炸板率、板块强弱、情绪描述标签。
 
@@ -114,12 +120,23 @@ def market_state() -> Dict[str, Any]:
     理解当前环境），不是入场规则 —— 怎么用由调用方决定。cautious=True 供下游
     （_helpers._hints / soft_warnings）收紧选股用，同样不是自动砍候选。
 
+    进程内 memo：默认 TTL 60s（`QD_SCREENER_MARKET_TTL` 秒，0=关闭），键含目标
+    交易日故跨日不复用。动机是 inspect_stock 每查一只票都要调一次，而单次实测
+    883~1428ms（大头是指数实时行情），秒级内快照无变化。
+
     Returns:
         dict: fund_flow / zt_count / dt_count / broken_count / broken_rate /
             strong_sectors / weak_sectors / mood / mood_score /
             index_intraday / fund_flow_days / intraday_bias / cautious
     """
-    today = _today_str()
+    # 三池取数日 = **目标交易日**（非交易日回落上一交易日，见 common._data_day）：
+    # 用 _today_str() 会在周末/节假日拿到空池，进而把 zt_count=0 当成情绪冰点。
+    day = _data_day()
+    _memo = _MARKET_MEMO
+    if (_MARKET_MEMO_TTL_S > 0 and _memo["data"] is not None
+            and _memo["day"] == day
+            and (time.time() - _memo["at"]) < _MARKET_MEMO_TTL_S):
+        return _memo["data"]
 
     # 三对账修正（2026-09-30）：旧实现拿平安银行（000001）个券资金流冒充“上证净流入”，
     # 且读 net_inflow（真实键 total_main_net）恒 0 → 情绪分恒基线。改走大盘口径
@@ -142,17 +159,17 @@ def market_state() -> Dict[str, Any]:
     # 「涨跌停池源故障」伪装成「情绪冰点」（zt=0/dt=0/炸板率 0 的假情绪分）。
     src_errors: List[str] = []
     try:
-        zt_pool = fetch_zt_pool(today)
+        zt_pool = fetch_zt_pool(day)
     except Exception as e:
         zt_pool = []
         src_errors.append(f"涨停池源失败: {type(e).__name__}: {e}")
     try:
-        dt_pool = fetch_dt_pool(today)
+        dt_pool = fetch_dt_pool(day)
     except Exception as e:
         dt_pool = []
         src_errors.append(f"跌停池源失败: {type(e).__name__}: {e}")
     try:
-        broken = fetch_broken_board(today)
+        broken = fetch_broken_board(day)
     except Exception as e:
         broken = []
         src_errors.append(f"炸板池源失败: {type(e).__name__}: {e}")
@@ -160,6 +177,13 @@ def market_state() -> Dict[str, Any]:
     dt_count = len(dt_pool)
     broken_count = len(broken)
     broken_rate = round(broken_count / max(1, zt_count + broken_count) * 100, 1)
+    # 空池必须在 missing 里留痕（2026-10-31）：源故障在数值上与「该日确无涨停」
+    # 无法区分，但 zt_count=0 会被情绪分读成冰点（2026-10-21 已修过「异常」分支，
+    # 「空」分支当时漏了）。留痕后模型看到的是「不知道」而不是「0 家涨停」。
+    if not zt_pool:
+        src_errors.append(f"涨停池 {day} 为空：源未产出或该日确无涨停")
+    if not dt_pool:
+        src_errors.append(f"跌停池 {day} 为空：源未产出或该日确无跌停")
 
     strong_sectors: List[Dict] = []
     weak_sectors: List[Dict] = []
@@ -242,7 +266,7 @@ def market_state() -> Dict[str, Any]:
     mood_score = max(0, min(100, mood_score))
     mood = "偏强" if mood_score >= 70 else ("中性" if mood_score >= 50 else ("偏弱" if mood_score >= 30 else "弱势"))
 
-    return {
+    out = {
         "fund_flow": net_inflow,
         "mood": mood,
         "mood_score": mood_score,
@@ -259,7 +283,9 @@ def market_state() -> Dict[str, Any]:
         "cautious": cautious,               # True=走弱环境，下游收紧选股（非入场规则）
         "source_errors": src_errors,
     }
-
+    if _MARKET_MEMO_TTL_S > 0:
+        _MARKET_MEMO.update({"at": time.time(), "day": day, "data": out})
+    return out
 
 # ═══════════════════════════════════════════════════════════════
 #  多周期几何量（客观描述，不含买入含义）
@@ -644,7 +670,8 @@ def candidate_pool(
 
     Args:
         strategy: 时段（intraday / eod / post_market），仅用于挑 sources / queries 默认值
-        date: 交易日，默认今天
+        date: 交易日，默认**目标交易日**（今日非交易日则取最近一个交易日，
+            见 common._data_day）；显式传入则以传入值为准
         sources: 逗号串或列表，取值见 POOL_SOURCES；None = 用该时段的默认组合
         queries: 逗号串或列表，传给 search_stocks；None = 用默认建议词
         search_top_n: 每条查询返回上限
@@ -657,7 +684,8 @@ def candidate_pool(
             candidates[{code,name,source,reason,continuous_days,zt_time,change_pct,turnover_pct,...}] /
             continuous_board / dragon_pullback / eod_zt / missing
     """
-    date = date or _today_str()
+    # 目标交易日（非交易日回落上一交易日，见 common._data_day）——三池按此日取数
+    date = date or _data_day()
     missing: List[str] = []
 
     srcs = [s.strip() for s in (sources.split(",") if isinstance(sources, str) else (sources or [])) if s.strip()]

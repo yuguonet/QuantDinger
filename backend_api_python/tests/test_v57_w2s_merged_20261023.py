@@ -36,35 +36,40 @@ def test_w2s_pass_pullback_stall() -> None:
 
 
 def test_w2s_flow_floor(monkeypatch) -> None:
+    """夹具同型化（2026-10-31 契约变更：`main_net_wan` → `net_wan`）。
+
+    口径未变（仍是量价方向净额、门槛 2000 万），只改键名以对齐
+    `flow_summary` 的新输出；断言不动。
+    """
     import importlib
     h = importlib.import_module("app.agent.skills.market-screener._helpers")
     monkeypatch.setattr(h, "flow_summary",
-                        lambda code: {"ok": True, "main_net_wan": 800.0})
+                        lambda code: {"ok": True, "net_wan": 800.0})
     ok, why, _ = h._w2s_flow_ok("002164")
     assert not ok and "2000" in why
 
 
 def test_w2s_flow_accel(monkeypatch) -> None:
-    """夹具同型化（2026-10-30 契约变更）。
+    """夹具同型化（2026-10-30 契约变更 / 2026-10-31 键名）。
 
-    昨日主力改由 `flow_summary().recent.prev_day_net_wan` 提供（见
+    昨日净额改由 `flow_summary().recent.prev_day_net_wan` 提供（见
     `_helpers._w2s_flow_ok`：「多日口径统一走 flow_summary.recent，不再单独取
     stock_daily」），故不再 mock `fund_flow_tools.get_fund_flow`。
-    断言与口径不变：金额单位万元、加速 = 今日 > 上一完整交易日。
+    今日与昨日两个键一并改名为 `net_wan` / `y_net_wan`（口径未变：万元、加速=今日>上一完整交易日）。
     """
     import importlib
     h = importlib.import_module("app.agent.skills.market-screener._helpers")
     monkeypatch.setattr(h, "flow_summary",
-                        lambda code: {"ok": True, "main_net_wan": 5787.0,
+                        lambda code: {"ok": True, "net_wan": 5787.0,
                                       "recent": {"ok": True, "prev_day_net_wan": 200.0}})
     ok, why, extra = h._w2s_flow_ok("002164")
     assert ok, (why, extra)
     assert extra.get("net_accel") is True
-    assert extra.get("y_main_net_wan") == 200.0
+    assert extra.get("y_net_wan") == 200.0
 
     # 未加速：今日 2100 万 ≤ 昨日 5000 万 → 拒
     monkeypatch.setattr(h, "flow_summary",
-                        lambda code: {"ok": True, "main_net_wan": 2100.0,
+                        lambda code: {"ok": True, "net_wan": 2100.0,
                                       "recent": {"ok": True, "prev_day_net_wan": 5000.0}})
     ok, why, extra = h._w2s_flow_ok("002164")
     assert not ok and "加速" in why

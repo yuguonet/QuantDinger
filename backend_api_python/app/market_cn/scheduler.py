@@ -231,6 +231,16 @@ def _save_dragon_hot_daily():
     from app.market_cn.dragon_tiger_store import save_daily
     from app.utils.trading_calendar import is_trading_day
     today = datetime.now().strftime("%Y-%m-%d")
+    # 三池落库（2026-10-31）：涨跌停/炸板按日恒定，收盘后落一次即可；此后分析
+    # 读库 1~2ms。此前每次运行都要重走 akshare，三池合计 ~12s（冷进程）。
+    # 与龙虎榜同一作业但不共用重试：池在 15:00 就固化，不存在"尚未发布"。
+    try:
+        from app.data_sources.cn_stock_putdb import sync_limit_pools
+        lp = sync_limit_pools(days=1)
+        logger.info("[dragon_hot_daily] 三池落库: written=%s skipped=%s errors=%s",
+                    lp.get("written"), lp.get("skipped"), lp.get("errors"))
+    except Exception as e:
+        logger.warning("[dragon_hot_daily] 三池落库失败(不影响龙虎榜): %s", e)
     for attempt in range(1, 4):
         try:
             dt = sync_dragon_tiger()
@@ -255,9 +265,12 @@ def _save_dragon_hot_daily():
 
 
 def _refresh_daily():
-    from app.market_cn.index_daily import sync_index_daily
+    # 2026-11-01 起指数日线**不再写 kline_1D**：单一事实源 = kline_index_5m
+    # （由 _sync_index_minute 盘后同步），读侧走 cn_stock_ext.aggregate_daily_df 5m→1D 聚合。
+    # 原 sync_index_daily（远端拉日线 + 只写当日无回补，导致 198 个交易日只落 44 天）
+    # 已摘除，index_daily.py 移入 del/index_daily_20261101/。勿再加回。
     from app.market_cn.index import refresh_northbound_holdings
-    _run_all("daily", [sync_index_daily, refresh_northbound_holdings])
+    _run_all("daily", [refresh_northbound_holdings])
 
 
 def _refresh_policy():

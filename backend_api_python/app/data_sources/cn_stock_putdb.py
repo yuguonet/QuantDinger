@@ -776,6 +776,76 @@ def sync_dragon_tiger(trade_date: Optional[str] = None, dry_run: bool = False,
     return result
 
 
+def _trading_days_back(days: int, end: Optional[str] = None) -> List[str]:
+    """从 end（默认 current_data_day()）往前数 days 个**交易日**，升序返回。
+
+    不做自然日回溯：三池按日恒定，周末/节假日拉到的是空（远端白跑 4~5s 一次）。
+    交易日历不可用或越界时提前截断，由调用方从返回值长度判缺口。
+    """
+    from app.utils.trading_calendar import current_data_day, prev_trading_day
+    cur = end or current_data_day()
+    out = [cur]
+    while len(out) < max(1, int(days)):
+        prev = prev_trading_day(cur)
+        if not prev or prev >= cur:
+            break
+        out.append(prev)
+        cur = prev
+    return list(reversed(out))
+
+
+def sync_limit_pools(days: int = 1, trade_date: Optional[str] = None,
+                     kinds: List[str] = None, force: bool = False,
+                     dry_run: bool = False) -> Dict[str, Any]:
+    """涨跌停 / 炸板三池落库作业（coord_pool → cnd_limit_pool_list）。
+
+    三池是按日恒定的榜单：某交易日收盘后就不再变化，却每次分析都要重新走一遍
+    远端（单池 2.9~5.8s）。落库后历史日命中即 1~2ms（2026-10-31 用户裁定）。
+
+    · days>1 → 按**交易日**回溯补齐（技能侧 fetch_recent_zt_pools 需要近 8~10 日）；
+    · 已落库且非 force 的日期跳过（池不变化，重拉纯浪费）；
+    · 只写**已完结日**（≤ _finish_anchor()）：盘中当日池仍在变，落进去等于伪造收盘快照。
+
+    Returns:
+        {"days": [...], "written": {kind: n}, "skipped": n, "errors": [...]}
+    """
+    from app.data_sources import limit_pool_local as _lp
+    from app.data_sources.cn_stock_ext import _finish_anchor
+    from app.data_sources.coord_pool import coordinate
+
+    kinds = list(kinds or _lp.KINDS)      # kind 取值唯一真源 = limit_pool_local.KINDS
+    targets = [str(trade_date)[:10]] if trade_date else _trading_days_back(days)
+    settled = _finish_anchor()
+    result: Dict[str, Any] = {"days": [], "written": {}, "skipped": 0, "errors": []}
+
+    for day in targets:
+        if day > settled:
+            result["skipped"] += 1          # 当日未收盘：池未固化，不许写
+            continue
+        result["days"].append(day)
+        for kind in kinds:
+            if not force and _lp.has_date(kind, day):
+                result["skipped"] += 1
+                continue
+            try:
+                out = coordinate(kind, trade_date=day)
+                if not out.get("ok"):
+                    result["errors"].append("%s %s: %s" % (kind, day, out.get("error")))
+                    continue
+                rows = (out.get("data") or {}).get("rows") or []
+                if dry_run:
+                    result["written"][kind] = result["written"].get(kind, 0) + len(rows)
+                    continue
+                result["written"][kind] = result["written"].get(kind, 0) + _lp.save_rows(kind, day, rows)
+            except Exception as e:
+                result["errors"].append("%s %s: %s" % (kind, day, e))
+
+    logger.info("[putdb] 三池落库 days=%d %s written=%s skipped=%d errors=%d",
+                len(result["days"]), result["days"][:1], result["written"],
+                result["skipped"], len(result["errors"]))
+    return result
+
+
 def main():
     """CLI 便捷入口：指数 5m 同步。"""
     import argparse

@@ -20,6 +20,7 @@ market-screener/_helpers.py — 事实与证据层（不做选股决策）
     · 所有回退必须留痕（missing / errors），不静默吞异常 —— 否则 LLM 会把数据缺口当成无信号
 """
 
+import json
 import os
 import threading
 from datetime import date, datetime, time
@@ -177,8 +178,9 @@ def hard_exclusions(item: Dict, strategy: str = "") -> List[str]:
             flags.append("高价>300元")
 
     if item.get("limit_locked"):
-        # 盘中/尾盘是「当日买不进」的硬约束；盘后是复盘次日机会，只作提示
-        flags.append("涨停封板-当日买不进" if strategy in ("intraday", "eod") else "涨停封板")
+        # 「当日买不进」只在盘中此刻成立（2026-10-30 用户裁定）：eod/post_market
+        # 是次日承接视角，封板不是买不进的硬约束，只作事实提示。
+        flags.append("涨停封板-当日买不进" if strategy == "intraday" else "涨停封板")
 
     if item.get("suspended"):
         flags.append("停牌")
@@ -207,11 +209,283 @@ def _last(seq: List[Optional[float]]) -> Optional[float]:
     return seq[-1] if seq else None
 
 
+def _open_gap_floor(bars: List[Dict], lookback: int = 30) -> Optional[float]:
+    """最近一个**向上跳空且未被回补**的缺口下沿（= 跳空前一日最高价）。
+
+    向上跳空 low[i] > high[i-1] 形成的缺口，回踩到下沿常获支撑。只认现价之上
+    还有缺口的（`bars[i:]` 全部最低价仍 > 下沿）：已回补的缺口不再有支撑意义。
+    取最近的一个 —— 越近的缺口对当下越有意义。
+    """
+    n = len(bars)
+    for i in range(n - 1, max(1, n - lookback), -1):
+        floor = bars[i - 1]["high"]
+        if not floor or bars[i]["low"] <= floor:
+            continue
+        if min(b["low"] for b in bars[i:]) > floor:
+            return float(floor)
+    return None
+
+
+def _volume_poc(bars: List[Dict], window: int = 20, bins: int = 10) -> Optional[float]:
+    """近 N 日**成交密集区**中心价（筹码成本带，成交量价格分布的 POC 简化版）。
+
+    把 window 根 bar 的典型价 (H+L+C)/3 按价格等分 bins 档、累计成交量，取最重
+    那一档的中心价 —— 该处换手最充分，回踩常获支撑。峰值量占窗口总量不足 8%
+    视为无显著密集区（分布太散，给出来反而误导），返回 None。
+    """
+    w = min(window, len(bars))
+    if w < 5:
+        return None
+    seg = bars[-w:]
+    lo = min(b["low"] for b in seg)
+    hi = max(b["high"] for b in seg)
+    if hi <= lo:
+        return None
+    step = (hi - lo) / bins
+    buckets = [0.0] * bins
+    for b in seg:
+        p = (b["high"] + b["low"] + b["close"]) / 3
+        buckets[min(bins - 1, int((p - lo) / step))] += float(b["volume"] or 0)
+    total = sum(buckets)
+    if total <= 0:
+        return None
+    peak = max(range(bins), key=lambda i: buckets[i])
+    if buckets[peak] / total < 0.08:
+        return None
+    return lo + step * (peak + 0.5)
+
+
+def _last_zt_low(bars: List[Dict], limit_pct: float, lookback: int = 20) -> Optional[float]:
+    """最近一次涨停那根 bar 的最低价（首板起点；跌回此处通常是最后一道防线）。
+
+    涨停判据与 tech_summary 的连板循环同口径（`limit_pct - 0.8` 容差），
+    limit_pct<=0（新股无涨跌幅）时不给。
+    """
+    if limit_pct <= 0:
+        return None
+    n = len(bars)
+    for i in range(n - 1, max(1, n - lookback), -1):
+        pc = bars[i - 1]["close"]
+        if pc and (bars[i]["close"] - pc) / pc * 100 >= limit_pct - 0.8:
+            return float(bars[i]["low"])
+    return None
+
+
+def _key_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float]],
+                limit_pct: float) -> Dict[str, List[Dict[str, Any]]]:
+    """客观关键价位候选（均线 / 近端低高点 / 跳空缺口 / 成交密集区 / 涨停起点）。
+
+    只出「价格 + 类型 + 距离」，**不判断能不能撑住** —— 挑哪个位置当买点、
+    止损放哪一档，由调用方结合大盘/板块/资金环境决定（2026-10-31 用户裁定：
+    不该固定 MA5/MA10/MA20）。
+    支撑与压力按现价分侧：同一价位在现价上方时是压力不是支撑。旧实现只取
+    |dist|≤3% 且不分上下，会把上方均线也报成「支撑」。
+    同价去重（差 <0.8% 视为同一位置）保留先出现的，优先序即 cands 的构造顺序。
+    """
+    lows = [b["low"] for b in bars]
+    cands: List[tuple] = []          # (kind, px)
+    for k in ("ma5", "ma10", "ma20", "ma60"):
+        v = ma_map.get(k)
+        if v:
+            cands.append((k, float(v)))
+    for w in (10, 20, 60):
+        if len(bars) >= w:
+            cands.append(("lo%d" % w, float(min(lows[-w:]))))
+    if len(bars) >= 20:
+        cands.append(("hi20", float(max(b["high"] for b in bars[-20:]))))
+    gap = _open_gap_floor(bars)
+    if gap:
+        cands.append(("gap", gap))
+    poc = _volume_poc(bars)
+    if poc:
+        cands.append(("poc", poc))
+    zt_low = _last_zt_low(bars, limit_pct)
+    if zt_low:
+        cands.append(("zt", zt_low))
+
+    sup: List[Dict[str, Any]] = []
+    res: List[Dict[str, Any]] = []
+    for kind, px in cands:
+        if not px or px <= 0 or not close:
+            continue
+        if any(abs(o["px"] - px) / close * 100 < 0.8 for o in sup + res):
+            continue                  # 同价只留优先序靠前的
+        item = {"k": kind, "px": round(px, 2), "d": round((px - close) / close * 100, 2)}
+        (res if px > close else sup).append(item)
+    return {"supports": sorted(sup, key=lambda x: -x["d"])[:3],
+            "resists": sorted(res, key=lambda x: x["d"])[:2]}
+
+
+def regime_tag(run5: Optional[float], d0: float, d1: Optional[float],
+               vr: Optional[float], cpos: Optional[float],
+               rs_d0: Optional[float] = None) -> str:
+    """形态标签（纯函数，无 IO）：一鼓作气/跳水回踩/高位分歧/再而竭/三而衰/弱转强/低位启动/低位蓄势/低位走弱。
+
+    依据 2026-10-31 漏斗实测（tmp/out_winrate_funnel_20261031.json）+ 全市场验证
+    （tmp/probe_sane_decay_20261031.py，325 笔/日）：触及10% 最高的是「转强|高位」56%，
+    最差是「分歧|高位」T+3 均收 -6.4%；高位大跌按大盘归因拆分——rs_d0≥-1.5（跌主要来自
+    大盘带崩）= 跳水回踩 T+3 +0.85%（n=35），显著跑输大盘才入三而衰 -3.35%（n=78）。
+    ★「三而衰」本义=反弹波的高度与力度递减（波段结构，需 1m/多日判定，2026-10-31 用户指正；
+    日线单日层只能做大盘归因，波段结构判定待实现）。标签是**描述性事实**（非准入闸）：
+    供 LLM 分流动作——强→突破追、竭→禁追、疑→回踩支撑，判定仍归 LLM。
+    """
+    hi = run5 is not None and run5 > 10
+    if hi:
+        if d0 > 2:
+            return "一鼓作气"
+        if d0 < -2:
+            if rs_d0 is not None and rs_d0 >= -1.5:
+                return "跳水回踩"
+            return "三而衰"
+        if (vr is not None and vr < 0.9) or (cpos is not None and cpos < 40):
+            return "再而竭"
+        return "高位分歧"
+    if d0 > 2:
+        return "弱转强" if (d1 is not None and d1 < 0) else "低位启动"
+    if d0 < -2:
+        return "低位走弱"
+    return "低位蓄势"
+
+
+_BENCH_CACHE = {"t": None, "val": None}
+
+
+def _bench_index() -> dict:
+    """上证基准涨跌幅：d0=当日涨跌%、d5=近5日涨跌%；进程内 60s TTL；失败返回 {}。
+
+    rs（个股相对大盘超额）的基准。IO 走 market_cn 门面（同 flow_summary/zt_index
+    先例）。失败语义 = 缺键（rs 不进输出），不抛、不重试轰炸（失败也缓存 60s）。
+    """
+    now = datetime.now().timestamp()
+    v = _BENCH_CACHE.get("val")
+    if v is not None and _BENCH_CACHE.get("t") and now - _BENCH_CACHE["t"] < 60:
+        return v
+    out: dict = {}
+    try:
+        from app.market_cn.index import get_index_realtime, get_index_daily_kline
+        rows = get_index_realtime(["000001"]) or []
+        if rows and rows[0].get("change_percent") is not None:
+            out["d0"] = float(rows[0]["change_percent"])
+        kl = get_index_daily_kline("000001", days=8) or []
+        closes = [float(b.get("close")) for b in kl if b.get("close")]
+        if len(closes) >= 6 and closes[-6]:
+            out["d5"] = round((closes[-1] / closes[-6] - 1) * 100, 2)
+    except Exception as e:
+        logger.warning("[MktScreen] 大盘基准获取失败: %s", e)
+        out = {}
+    _BENCH_CACHE["t"], _BENCH_CACHE["val"] = now, out
+    return out
+
+
+_MKT_CALIB_TTL_S = float(os.getenv("QD_SCREENER_MKT_CALIB_TTL", "60") or 0)
+_MKT_CALIB_CACHE: Dict[str, Any] = {"key": None, "t": 0.0, "val": {}}
+
+
+def market_calib_stats(same_t: Optional[str] = None, day: Optional[str] = None) -> Dict[str, Any]:
+    """大盘两轴校准基准：vr=全市场量比、fp_pct=全市场净占比%（vr_rel/flow_rel 的分母/基准）。
+
+    口径（2026-11-01 大盘校准探针同源）：vr=当日全市场成交量÷前5交易日均量；fp_pct=
+    量价方向净额÷成交额×100（fund_flow_api._flow_from_1m_day 同规则，非主力口径）；
+    fp_prev_pct=前5交易日净占比均值（「资金流和前几日同刻比对」用）。same_t="HH:MM"
+    时量与净额双方只累计该时刻前（今日T前 vs 前几日T前，用户 9:50 口径）；day=个股
+    日线末日（stale_bar 对齐用）。日级净占比优先读 qd_fund_flow_market（派生视图），
+    缺日现算回填读 1m（同规则、只算不写，与 stock_fund_flow_history 同型；该表写入
+    任务有断档，缺行须现算）。失败/缺数据返回 {}，下游相对字段缺键=未校准。
+    进程内 TTL QD_SCREENER_MKT_CALIB_TTL 秒（0=关，每次直查）：同刻全市场一次 2~5s，
+    per-stock 调用会乘 N，TTL 只做一次交付内去重（同 _bench_index 先例）。
+
+    可改进点（未做）：目前只有全市场（大盘）一根校准基准，缺板块/概念维度——
+    个股对所属板块/概念的 vr_rel/flow_rel（“板块弱个股强”才是板块内的真强）。
+    逐票取板块归属再聚合板块量能/净额成本过高，故不做；待板块归属表或板块
+    行情数据就绪后可在此函数旁加 market_calib_stats 的板块版，下游字段
+    vr_rel/flow_rel 加 board_rel 同型扩展即可。
+    """
+    from datetime import timedelta
+    key = (str(same_t or ""), str(day or ""))
+    now = datetime.now().timestamp()
+    if (_MKT_CALIB_TTL_S > 0 and _MKT_CALIB_CACHE["val"]
+            and _MKT_CALIB_CACHE["key"] == key
+            and now - _MKT_CALIB_CACHE["t"] < _MKT_CALIB_TTL_S):
+        return _MKT_CALIB_CACHE["val"]
+    out: Dict[str, Any] = {}
+    try:
+        from app.utils.db_market import get_market_db_manager
+        from app.market_cn import fund_flow_api as _ffa
+        pool = get_market_db_manager()._get_pool("CNStock")
+        with pool.cursor() as c:
+            c.execute(
+                "SELECT \"time\"::date, SUM(volume) FROM \"kline_1D_2026\" "
+                "WHERE \"time\" >= %s GROUP BY 1 ORDER BY 1",
+                ((datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d"),))
+            vols = {str(r[0]): float(r[1] or 0) for r in c.fetchall()}
+        dlist = [d for d in sorted(vols) if vols[d] > 0]
+        if day:
+            dlist = [d for d in dlist if d <= str(day)[:10]]
+        if len(dlist) >= 2:
+            target, prev5 = dlist[-1], dlist[-6:-1]
+            if same_t:
+                tbl = _ffa._kline_1m_year_table(int(target[:4]))
+
+                def _vol_until(dd: str) -> float:
+                    with pool.cursor() as c:
+                        c.execute(
+                            f"SELECT COALESCE(SUM(volume),0) FROM {tbl} "
+                            "WHERE \"time\" >= %s::timestamp AND \"time\" <= %s::timestamp",
+                            (f"{dd} 00:00", f"{dd} {str(same_t)[:5]}"))
+                        return float(c.fetchone()[0] or 0)
+
+                tv = _vol_until(target)
+                bvs = [_vol_until(d) for d in prev5]
+            else:
+                tv = vols.get(target) or 0.0
+                bvs = [vols.get(d) or 0.0 for d in prev5]
+            base = [b for b in bvs if b > 0]
+            vr = round(tv / (sum(base) / len(base)), 2) if tv > 0 and base else None
+            fp_map: Dict[str, Optional[float]] = {}
+            if same_t:
+                for d in [target] + prev5:
+                    r = _ffa._flow_from_1m_day(d, until=str(same_t)[:5])
+                    if r and r.get("main_pct") is not None:
+                        fp_map[d] = float(r["main_pct"])
+            else:
+                with pool.cursor() as c:
+                    c.execute(
+                        "SELECT \"trade_date\"::text, \"main_net\", \"turnover\" "
+                        "FROM \"qd_fund_flow_market\" WHERE \"trade_date\" >= %s",
+                        (dlist[0],))
+                    for td, mn, tn in c.fetchall():
+                        if mn is not None and tn:
+                            fp_map[str(td)] = round(float(mn) / float(tn) * 100.0, 2)
+                for d in [target] + prev5:
+                    if fp_map.get(d) is None:
+                        r = _ffa._flow_from_1m_day(d)
+                        if r and r.get("main_pct") is not None:
+                            fp_map[d] = float(r["main_pct"])
+            fp_base = [fp_map[d] for d in prev5 if fp_map.get(d) is not None]
+            out = {
+                "ok": True,
+                "t": (str(same_t)[:5] if same_t else None),
+                "day": target,
+                "days_used": len(prev5),
+                "vr": vr,
+                "fp_pct": fp_map.get(target),
+                "fp_prev_pct": (round(sum(fp_base) / len(fp_base), 2) if fp_base else None),
+            }
+    except Exception as e:
+        logger.warning("[MktScreen] 大盘校准基准失败: %s", e)
+        out = {}
+    _MKT_CALIB_CACHE["key"], _MKT_CALIB_CACHE["t"], _MKT_CALIB_CACHE["val"] = key, now, out
+    return out
+
+
 def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, Any]:
-    """从日线算出「位置 / 量能 / 强度 / 涨停史」的客观事实（不含评分）。
+    """从日线算出「位置 / 量能 / 强度 / 涨停史 / 形态标签 / 相对大盘超额」的客观事实（不含评分）。
 
     之所以不含评分：评分语义已统一为 P(T+1 涨)×100（见 attach_prediction），
     这里的字段只是让 LLM 能解释「为什么」，或自行推翻自带的模型分。
+    regime（2026-10-31）：形态标签，见 regime_tag；rs_d0/rs_5d = 个股涨跌 − 上证
+    同期涨跌（大盘弱个股强=真强，用户口径），基准经 _bench_index（60s TTL，失败缺键）。
+    vr_rel = 个股量比÷大盘量比（market_calib_stats 全市场口径，缺基准缺键）。
     """
     if not bars or len(bars) < 2:
         return {"ok": False, "reason": "日线不足"}
@@ -252,30 +526,51 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
             else:
                 break
 
+    zt_10d = 0
+    if limit_pct > 0:
+        win = min(10, len(bars) - 1)
+        for i in range(len(bars) - win, len(bars)):
+            pc = bars[i - 1]["close"]
+            if pc and (bars[i]["close"] - pc) / pc * 100 >= limit_pct - 0.8:
+                zt_10d += 1
+
     def _dist(ma_v):
         return round((close - ma_v) / ma_v * 100, 2) if ma_v and close else None
 
     dist_ma5 = _dist(_last(ma5))
     dist_ma10 = _dist(_last(ma10))
-    # 支撑距离（供 LLM 直接用支撑框架，无需 read_skill）
-    _cands = [("ma5", dist_ma5, _last(ma5)), ("ma10", dist_ma10, _last(ma10)),
-              ("ma20", dist_ma20, ma20_v)]
-    _valid = [c for c in _cands if c[1] is not None and abs(c[1]) <= 3.0]
-    nearest = min(_valid, key=lambda c: abs(c[1])) if _valid else None
+    # 关键价位候选（供 LLM 直接用，无需 read_skill / 拉 K 线）：不再只认三条均线
+    ma60_v = _last(compute_ma(closes, 60))
+    levels = _key_levels(bars, close,
+                         {"ma5": _last(ma5), "ma10": _last(ma10),
+                          "ma20": ma20_v, "ma60": ma60_v}, limit_pct)
+    nearest = levels["supports"][0] if levels["supports"] else None
 
     intraday_pos = None
     rng = today["high"] - today["low"]
     if rng > 0:
         intraday_pos = (close - today["low"]) / rng * 100
 
+    d1_chg = None
+    if len(bars) >= 3 and bars[-3]["close"]:
+        d1_chg = (prev["close"] - bars[-3]["close"]) / bars[-3]["close"] * 100
+    bench = _bench_index()
+    rs_d0 = round(chg - bench["d0"], 2) if bench.get("d0") is not None else None
+    rs_5d = (round(ret5 - bench["d5"], 2)
+             if (ret5 is not None and bench.get("d5") is not None) else None)
+    mkt = market_calib_stats(day=(str(today.get("time") or today.get("date") or "")[:10] or None))
+    vr_rel = round(vr / mkt["vr"], 2) if (vr and mkt.get("vr")) else None
+
     return {
         "ok": True,
         "bars": len(bars),
         "close": round(close, 2),
         "change_pct": round(chg, 2),
+        "chg_prev_pct": round(d1_chg, 2) if d1_chg is not None else None,
         "amplitude_pct": round(rng / prev["close"] * 100, 2) if prev["close"] and rng else None,
         "close_pos_in_day": round(intraday_pos, 1) if intraday_pos is not None else None,
         "vol_ratio": round(vr, 2) if vr else None,
+        "vr_rel": vr_rel,
         "rsi14": round(compute_rsi(closes)[-1], 1),
         "ma5": round(_last(ma5), 2) if _last(ma5) else None,
         "ma10": round(_last(ma10), 2) if _last(ma10) else None,
@@ -284,21 +579,28 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
         "dist_ma10_pct": dist_ma10,
         "dist_ma20_pct": round(dist_ma20, 2) if dist_ma20 is not None else None,
         "support": {
-            "nearest": nearest[0] if nearest else None,
-            "nearest_dist_pct": nearest[1] if nearest else None,
-            "near_support": bool(nearest),  # |dist|<=3% 视为贴支撑
-            "ma5": round(_last(ma5), 2) if _last(ma5) else None,
-            "ma10": round(_last(ma10), 2) if _last(ma10) else None,
-            "ma20": round(ma20_v, 2) if ma20_v else None,
+            # 只出候选列表 + 是否贴支撑：近端位置 = supports[0]，均线在 tech 顶层
+            # （2026-10-31 去重：原 ma5/ma10/ma20 + nearest 三件套与这两处逐字重复，
+            #  满卡每张省 ~285 字符，等于把第 6 张满卡换回来）
+            "near_support": bool(nearest and abs(nearest["d"]) <= 3.0),  # |dist|<=3% 视为贴支撑
+            "supports": levels["supports"],   # 现价下方候选，由近到远，≤3 条
+            "resists": levels["resists"],     # 现价上方候选，由近到远，≤2 条
         },
         "ma_bull_stack": bool(_last(ma5) and _last(ma10) and ma20_v and _last(ma5) > _last(ma10) > ma20_v),
+        "hi20": round(hi20, 2),
+        "lo20": round(lo20, 2),
+        "hi_today": round(today["high"], 2),
         "pos_in_20d_pct": round(pos20, 1) if pos20 is not None else None,
         "is_20d_high": bool(pos20 is not None and pos20 >= 99),
         "ret_5d_pct": round(ret5, 2) if ret5 is not None else None,
         "ret_20d_pct": round(ret20, 2) if ret20 is not None else None,
         "limit_up": bool(is_limit_locked(code, name, close, prev["close"])),
         "zt_streak": streak,
+        "zt_10d": zt_10d,
         "prev_zt_streak": _prev_streak(bars, limit_pct, streak),
+        "regime": regime_tag(ret5, chg, d1_chg, vr, intraday_pos, rs_d0),
+        "rs_d0": rs_d0,
+        "rs_5d": rs_5d,
     }
 
 
@@ -420,8 +722,314 @@ def pump_dump_risk(flow: Dict[str, Any], tech: Dict[str, Any] = None,
     # ④ 单日脉冲与多日趋势背离
     rec = flow.get("recent") if isinstance(flow.get("recent"), dict) else {}
     net5 = rec.get("net_5d_wan")
-    if net5 is not None and _f(net5) < 0 and _f(flow.get("main_net_wan")) >= _PUMP_OPEN_MIN_WAN:
+    if net5 is not None and _f(net5) < 0 and _f(flow.get("net_wan")) >= _PUMP_OPEN_MIN_WAN:
         out.append(f"今日脉冲与近5日净流出 {_f(net5):.0f} 万背离（趋势未转向）")
+    return out
+
+
+# ── 封板结构（客观事实 + 硬标签，**不打分、不排序**）─────────────────────
+# 2026-10-30 用户裁定：盘后/尾盘的决策场景是「次日开盘按涨停价挂单」，买不到不是
+#   决策问题 ⇒ 不做「可买性」维度（原 buy_ease 摩擦分已删）。封板结构改为只给
+#   事实与标签，由 LLM 估算次日强弱。
+# 标签边界来自次日表现实证（最近 8 个已收盘交易日 426 只涨停票，本地日线算
+#   次日开盘/收盘相对当日收盘，均值，括号内为次日收盘中位）：
+#     0 开板    +1.79%（+1.94%）  n=192     1-2 开板  +1.11%（+0.82%）  n=149
+#     3-5 开板  +0.82%（-0.28%）  n=55      6+ 开板   -0.57%（-2.18%）  n=30
+#   封单÷成交额同样单调：≤5% -0.62% / 5-15% +1.20% / 15-40% +1.84% / 40%+ +3.51%。
+#   连板高度非单调：2 板最弱（中位 -1.69%，n=61），4+ 板最强（中位 +7.56%，n=16，
+#   样本小不可当定论）。⇒ 开板多=差、封单厚=好，与「可买性」正好相反。
+# 复现：tmp/probe_open_count_nextday_20261030.py、tmp/probe_ease_inputs_20261030.py
+# 标签命名刻意**不含价值判断**（曾是 solid/reseal/weak，实测 000568 出现「0 开板但
+#   封单仅 0.38%」——叫 solid 会把最可疑的组合读成最扎实）：tag 只回答开板次数，
+#   seal_tier 只回答封单厚薄，两个正交事实交给 LLM 组合。
+_SEAL_TAG_ENV = "QD_SCREENER_SEAL_TAG"
+_SEAL_TAG_DEFAULT: Dict[str, Any] = {
+    "reseal_max": 2,          # 开板 ≤2 次 → open1_2（实证 1-2 次档）
+    "loose_max": 5,           # 开板 ≤5 次 → open3_5（实证 3-5 次档）；>5 → open6p
+    "seal_tiers": [5, 15, 40],  # 封单÷成交额 ≤n% → thin / mid / thick / vthick
+}
+_ZT_INDEX_TTL_S = 60.0
+_ZT_INDEX_CACHE: Dict[str, Any] = {"day": "", "at": datetime.now(), "map": None}
+
+
+def _seal_tag_rules() -> Dict[str, Any]:
+    """封板标签边界：缺省 dict 被 env JSON 局部覆盖（未知键忽略，坏 JSON 告警不改行为）。"""
+    rules = dict(_SEAL_TAG_DEFAULT)
+    raw = (os.getenv(_SEAL_TAG_ENV, "") or "").strip()
+    if not raw:
+        return rules
+    try:
+        extra = json.loads(raw)
+    except (TypeError, ValueError) as e:
+        logger.warning("[MktScreen] %s 非法 JSON，按缺省: %s", _SEAL_TAG_ENV, e)
+        return rules
+    if isinstance(extra, dict):
+        rules.update({k: v for k, v in extra.items() if k in rules})
+    return rules
+
+
+def _empty_pool_reason(day: str) -> str:
+    """池为空的成因判据（2026-10-31）。
+
+    三种成因的处置**完全不同**，旧文案一律写「进程未热?」是错的归因：
+      · 非交易日        —— 该日根本没有池，属日期口径错（周末提问的典型症状）；
+      · 交易日·盘中     —— 池未产出或仍在变动，属正常，不必告警级别；
+      · 交易日·已收盘   —— akshare 失败也表现为 []，是真失败，须进 missing。
+    """
+    try:
+        from app.utils.trading_calendar import is_trading_day, is_in_quote_session
+    except Exception as e:            # 日历不可用：归因不明就照实说，不猜
+        return f"日历不可用，无法判定: {type(e).__name__}"
+    try:
+        if not is_trading_day(day):
+            return "非交易日：该日无池"
+        if day == datetime.now().strftime("%Y-%m-%d") and is_in_quote_session():
+            return "交易日·盘中：池未产出或仍在变动"
+        return "交易日·非报价时段（开盘前/午休/收盘后）：源返回空（源故障亦表现为 []）"
+    except Exception as e:
+        return f"日历判定异常: {type(e).__name__}: {e}"
+
+
+def zt_index(date: str = "") -> Dict[str, Dict[str, Any]]:
+    """涨停池 → {code: 池行}（含 open_count/seal_amount/amount/turnover_rate）。
+
+    ★ 2026-10-31：默认日期由「今天」改为**目标交易日** `common._data_day()`
+      （今日非交易日 → 最近一个交易日）。原口径在周末/节假日恒取到空池，
+      而同一时刻日线/资金流/画像用的都是上一交易日的数据 ⇒ 口径错位，
+      封板结构（open_count/seal_amount）恒 unknown。实测对照（2026-10-31）：
+      `get_zt_pool("2026-10-30")` = 47 只带 open_count/seal_amount，
+      `get_zt_pool("2026-10-31")`（周六）= 0。
+
+    取数：历史日走 coord_pool 按日拉取 + 落盘缓存；当日盘中走实时接口。
+    60s 内存 memo：run() 内 profile 会调多次，池本身由源侧刷新。
+    空池按「开板/封单未知」降级，不得把空 map 当成「该日没涨停」。
+    """
+    from .common import fetch_zt_pool, _data_day
+    day = (date or "").strip() or _data_day()
+    now = datetime.now()
+    if _ZT_INDEX_CACHE.get("day") == day and _ZT_INDEX_CACHE.get("map") is not None:
+        age = (now - _ZT_INDEX_CACHE["at"]).total_seconds()
+        if age < _ZT_INDEX_TTL_S:
+            return _ZT_INDEX_CACHE["map"]
+    try:
+        pool = fetch_zt_pool(day) or []
+    except Exception as e:
+        logger.warning("[MktScreen] 涨停池不可用（封板结构降级）: %s", e)
+        return {}
+    if not pool:
+        logger.warning("[MktScreen] 涨停池 %s 为空（%s）: 封板结构只剩连板数",
+                       day, _empty_pool_reason(day))
+    out = {str(r.get("stock_code") or ""): r for r in pool if r.get("stock_code")}
+    _ZT_INDEX_CACHE.update({"day": day, "at": now, "map": out})
+    return out
+
+
+def seal_summary(sealed: Optional[bool], zt_streak: int = 0,
+                 zt_row: Dict[str, Any] = None, rt: Dict[str, Any] = None,
+                 turnover_pct: Optional[float] = None) -> Dict[str, Any]:
+    """封板结构的客观事实 + 硬标签（只描述「今天封得怎么样」，**不打分、不排序**）。
+
+    输入全部是客观值，无新取数：`zt_row` 来自涨停池（开板次数/封单额/成交额/换手/
+    连板数），`rt` 给一字判定（low ≈ 涨停价），`zt_streak` 是日线连板兜底。
+
+    标签（边界见 `_SEAL_TAG_DEFAULT`，来自次日表现实证，见上方常量块注释）。
+    `tag` 只切开板次数，`seal_tier` 只切封单厚薄——**两个正交事实，都不含价值判断**
+    （实测存在「0 开板但封单仅 0.38%」这种组合，任何单向命名都会误导）：
+      · `tag=none`      未封板（其余字段照实给，不受影响）
+      · `tag=one_word`  日内最低价 = 涨停价（一字/全天封死，实证次日最强档）
+      · `tag=open0`     0 次开板但非一字（盘中封住后未再打开）
+      · `tag=open1_2`   1~2 次开板后回封
+      · `tag=open3_5`   3~5 次开板（反复开合）
+      · `tag=open6p`    ≥6 次开板（尾盘勉强封住，实证次日唯一负收益档）
+      · `tag=unknown`   实时涨跌停未知（缺 rt），或封板但涨停池缺该票（开板次数未知）
+      · `seal_tier`     thin(≤5%) / mid(≤15%) / thick(≤40%) / vthick(>40%)
+                        ——按实证单调性，thin 最弱（次日 -0.62%）、vthick 最强（+3.51%）
+
+    为什么给标签而不给分数：开板次数 / 封单厚度 / 连板高度三项高度共线（一字板三项
+    同时极端），合成会重复计权；权重怎么拍都缺样本支撑（4+ 板仅 16 只）。给事实比给
+    权重更利于 LLM 估算，也不违反「不做主观评分梯形」。
+
+    Args:
+        sealed: 是否涨停封板（rt.limit_up）；None = 缺 rt，不猜
+        zt_streak: 日线连板数（涨停池缺该票时的兜底）
+        zt_row: 涨停池该票一行（open_count/seal_amount/amount/turnover_rate/
+            continuous_zt_days）
+        rt: 实时快照（要 low 与 limit_up_price 判一字）
+        turnover_pct: 换手率（传了优先，否则取池里的 turnover_rate）
+
+    Returns:
+        dict: {tag, seal_tier, open_count, seal_ratio_pct（封单÷成交额 %）, zt_days,
+            turnover_pct}；取不到的一律 None，不回落 0。
+    """
+    rules = _seal_tag_rules()
+    row = zt_row if isinstance(zt_row, dict) else {}
+    _rt = rt if isinstance(rt, dict) else {}
+
+    days = max(int(_f(zt_streak)), int(_f(row.get("continuous_zt_days"))))
+    open_count = None if row.get("open_count") is None else int(_f(row.get("open_count")))
+    seal_pct = None
+    _seal, _amt = _f(row.get("seal_amount")), _f(row.get("amount"))
+    if _seal > 0 and _amt > 0:
+        seal_pct = round(_seal / _amt * 100, 2)
+    turn = turnover_pct if turnover_pct is not None else row.get("turnover_rate")
+    turn = round(_f(turn), 2) if turn is not None else None
+
+    seal_tier = None
+    if seal_pct is not None:
+        _cuts = [float(x) for x in (rules.get("seal_tiers") or [])]
+        seal_tier = ("thin" if seal_pct <= _cuts[0] else
+                     "mid" if seal_pct <= _cuts[1] else
+                     "thick" if seal_pct <= _cuts[2] else "vthick")
+
+    one_word = None
+    _lo, _up = _f(_rt.get("low")), _f(_rt.get("limit_up_price"))
+    if _lo > 0 and _up > 0:
+        one_word = _lo >= _up - 0.01
+
+    if sealed is None:
+        tag = "unknown"
+    elif not sealed:
+        tag = "none"
+    elif one_word:
+        tag = "one_word"
+    elif open_count is None:
+        tag = "unknown"
+    elif open_count <= 0:
+        tag = "open0"
+    elif open_count <= int(rules["reseal_max"]):
+        tag = "open1_2"
+    elif open_count <= int(rules["loose_max"]):
+        tag = "open3_5"
+    else:
+        tag = "open6p"
+
+    # 未封板 / 缺 rt：封单厚薄没有意义（涨停池里若残留该票的旧封单会造出
+    # 「未封板 + vthick」这种矛盾组合），一律置空。
+    if sealed is not True:
+        seal_tier = None
+
+    return {"tag": tag, "seal_tier": seal_tier, "open_count": open_count,
+            "seal_ratio_pct": seal_pct, "zt_days": days or None, "turnover_pct": turn}
+
+
+def same_time_stats(code: str) -> Dict[str, Any]:
+    """同时刻横向比对（盘中直接参考）：今日截至 T 的量能与相对大盘超额，对比前几日同一时刻。
+
+    用户口径（2026-10-31）：大盘弱个股强=真强、大盘强个股弱=真弱；「同一时刻」
+    （而非全天）的量比才有盘中直接参考价值。T = 今日最新 1m bar 时刻（盘后调用
+    即≈全天，退化为普通对比，无害）。数据走门面 1m（本地 DB 优先，个股+上证各一次）。
+    vr_same_t = 今日 T 前累计量 ÷ 前N日(≤5)同一时刻累计量均值；ret_same_t /
+    idx_ret_same_t = 双方昨收→T 涨幅；rs_same_t = 前者−后者。fp_same_t = 今日 T 前
+    量价方向净占比%（_flow_from_1m_day 同规则）；vr_rel_same_t / flow_rel_same_t =
+    个股同刻量比÷大盘同刻量比、个股同刻净占比−大盘同刻净占比（三轴校准的同刻版，
+    大盘侧 market_calib_stats）。
+    失败语义 = ok:False + reason，不抛（inspect 超时留痕由调用方负责）。
+    """
+    from zoneinfo import ZoneInfo
+    _bj = ZoneInfo("Asia/Shanghai")
+    try:
+        from app.data_sources.cn_stock import CNStockDataSource
+        raw = CNStockDataSource().get_kline(code, "1m", 1500) or []
+    except Exception as e:
+        return {"ok": False, "reason": f"1m源失败:{type(e).__name__}"}
+
+    days: Dict[str, list] = {}
+    for k in raw:
+        if not isinstance(k, dict) or not k.get("time") or k.get("volume") is None:
+            continue
+        try:
+            ts = datetime.fromtimestamp(int(k["time"]), tz=_bj)
+        except (ValueError, OSError, OverflowError, TypeError):
+            continue
+        days.setdefault(ts.strftime("%Y-%m-%d"), []).append(
+            (ts.strftime("%H:%M"), float(k["volume"]), float(k.get("close") or 0),
+             float(k.get("open") or 0)))
+    if len(days) < 2:
+        return {"ok": False, "reason": "1m不足两日"}
+
+    dlist = sorted(days)
+    today = dlist[-1]
+    prevs = dlist[max(1, len(dlist) - 6):len(dlist) - 1]
+    t = days[today][-1][0]
+
+    def _cum(d: str) -> float:
+        return sum(row[1] for row in days[d] if row[0] <= t)
+
+    def _day_ret(d: str) -> Optional[float]:
+        seq = days[d]
+        if seq and seq[0][2] and seq[-1][2]:
+            return (seq[-1][2] / seq[0][2] - 1) * 100
+        return None
+
+    prev_cums = [_cum(d) for d in prevs]
+    prev_cums = [c for c in prev_cums if c > 0]
+    if not prev_cums:
+        return {"ok": False, "reason": "前日同时刻量缺失"}
+    today_cum = _cum(today)
+    if today_cum <= 0:
+        return {"ok": False, "reason": "今日量缺失"}
+    out: Dict[str, Any] = {
+        "ok": True,
+        "t": t,
+        "days_used": len(prev_cums),
+        "vr_same_t": round(today_cum / (sum(prev_cums) / len(prev_cums)), 2),
+        "ret_same_t": (round(_day_ret(today), 2) if _day_ret(today) is not None else None),
+    }
+    try:
+        from app.market_cn.index import get_index_kline
+        iraw = get_index_kline("000001", frequency="1m", days=8) or []
+        idays: Dict[str, list] = {}
+        for k in iraw:
+            if not isinstance(k, dict) or not k.get("time"):
+                continue
+            try:
+                ts = datetime.fromtimestamp(int(k["time"]), tz=_bj)
+            except (ValueError, OSError, OverflowError, TypeError):
+                continue
+            idays.setdefault(ts.strftime("%Y-%m-%d"), []).append(
+                (ts.strftime("%H:%M"), float(k.get("close") or 0)))
+        idl = sorted(idays)
+        if len(idl) >= 2 and today in idays:
+            it, ip = idl[-1], idl[-2]
+            t_i = min(t, idays[it][-1][0])
+            i_now = next((c for h, c in reversed(idays[it]) if h <= t_i), None)
+            i_prev = idays[ip][-1][1] if idays[ip] else None
+            if i_now and i_prev:
+                idx_ret = (i_now / i_prev - 1) * 100
+                out["idx_ret_same_t"] = round(idx_ret, 2)
+                if out.get("ret_same_t") is not None:
+                    out["rs_same_t"] = round(out["ret_same_t"] - idx_ret, 2)
+    except Exception as e:
+        logger.warning("[MktScreen] 同时刻指数比对失败: %s", e)
+
+    def _fp(d: str) -> Optional[float]:
+        net = 0.0
+        amt = 0.0
+        ref = None
+        for h, v, c, o in sorted(days[d]):
+            if h > t:
+                break
+            if v <= 0 or c <= 0:
+                continue
+            r = ref if ref is not None else o
+            if c > r:
+                net += v * c
+            elif c < r:
+                net -= v * c
+            amt += v * c
+            ref = c
+        return round(net / amt * 100, 2) if amt else None
+
+    out["fp_same_t"] = _fp(today)
+    mkt = market_calib_stats(same_t=t)
+    if mkt:
+        if out.get("fp_same_t") is not None and mkt.get("fp_pct") is not None:
+            out["flow_rel_same_t"] = round(out["fp_same_t"] - mkt["fp_pct"], 2)
+        if out.get("vr_same_t") and mkt.get("vr"):
+            out["vr_rel_same_t"] = round(out["vr_same_t"] / mkt["vr"], 2)
+        out["mkt_vr"] = mkt.get("vr")
+        out["mkt_fp_pct"] = mkt.get("fp_pct")
+        out["mkt_fp_prev_pct"] = mkt.get("fp_prev_pct")
     return out
 
 
@@ -435,11 +1043,13 @@ def flow_summary(code: str) -> Dict[str, Any]:
         连续方向、逐日符号、剔除最大单日、上一完整交易日、资金趋势判定）
     失败返回 ok=False + 原因，不静默；recent / intraday 各自带 ok，单块失败不拖垮另一块。
 
-    口径提醒（勿按「主力资金」读取）：main_net 是量价方向净额（近似口径，见
-    fund_flow_tools 头注）；跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
+    口径提醒（勿按「主力资金」读取）：net_wan 是**量价方向净额**（按分钟涨跌方向
+    累计成交额，见 fund_flow_tools 头注），不是东财四档主力净额，两者不可换算；
+    `caliber`/`caliber_note` 两个键把这件事写进载荷本身，键名不再自称 main_net。
+    跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
 
     Returns:
-        {ok, main_net_wan, net_pct_of_amount,
+        {ok, net_wan, caliber, caliber_note, net_pct_of_amount,
          recent: {ok, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
                   streak_dir, streak_days, sign_5d, max_day, net_20d_ex_max_wan,
                   prev_day_net_wan, trend},
@@ -462,13 +1072,15 @@ def flow_summary(code: str) -> Dict[str, Any]:
             if pct is None:
                 amount = _f(ff.get("total_amount") or ff.get("amount") or ff.get("turnover"))
                 pct = round(main_net * 1e4 / amount * 100, 2) if amount else None
-            out["main_net_wan"] = round(main_net, 1)
+            out["net_wan"] = round(main_net, 1)
             out["net_pct_of_amount"] = pct
             out["intraday"] = _intraday_shape(ff.get("data") or [])
     except Exception as e:
         out["reason"] = f"{type(e).__name__}: {e}"
 
     # ── 近5/20日总体：日线聚合（含资金趋势判定，stock_daily dispatch 已附）──
+    fp_today = None
+    fp_day = ""
     try:
         from ...tools.finance.fund_flow_tools import get_fund_flow
         df = get_fund_flow(scope="stock_daily", codes=code, days=30) or {}
@@ -480,6 +1092,16 @@ def flow_summary(code: str) -> Dict[str, Any]:
             for r in reversed(rows):
                 if str(r.get("date") or "")[:10] < today and r.get("main_net") is not None:
                     prev_wan = round(_f(r.get("main_net")) / 1e4, 1)
+                    break
+            fp_day = max((str(r.get("date") or "")[:10] for r in rows), default="")
+            for r in rows:
+                if str(r.get("date") or "")[:10] != fp_day:
+                    continue
+                v = r.get("main_pct")
+                if v is None and r.get("main_net") is not None and _f(r.get("turnover")):
+                    v = _f(r["main_net"]) / _f(r["turnover"]) * 100
+                if v is not None:
+                    fp_today = float(v)
                     break
             out["recent"] = {
                 "ok": True,
@@ -500,7 +1122,14 @@ def flow_summary(code: str) -> Dict[str, Any]:
     except Exception as e:
         out["recent"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
-    out["ok"] = "main_net_wan" in out
+    if fp_today is not None:
+        _mkt = market_calib_stats(day=(fp_day or None))
+        if _mkt.get("fp_pct") is not None:
+            out["flow_rel"] = round(fp_today - _mkt["fp_pct"], 2)
+
+    out["caliber"] = "price_direction"
+    out["caliber_note"] = "量价方向净额（非主力）"
+    out["ok"] = "net_wan" in out
     return out
 
 
@@ -590,7 +1219,9 @@ def objective_preexclude(candidates, strategy, quotes=None):
     from .common import is_limit_locked
 
     strategy = strategy or "post_market"
-    exclude_limit = strategy in ("intraday", "eod")
+    # 「涨停买不进」只在盘中此刻成立（2026-10-30 用户裁定）：intraday 排，
+    # eod/post_market 一律放行（尾盘与盘后都是次日承接视角，不是当下成交）。
+    exclude_limit = strategy == "intraday"
     stats = {"limit_up": 0, "limit_down": 0, "st": 0, "suspended": 0,
              "price_band": 0, "low_turnover": 0, "quotes_missing": 0}
     kept = []
@@ -721,12 +1352,12 @@ def _objective_rank_key(item: Dict, index: int, themes: List[str] = ()) -> tuple
 # 【明确弱转强】合并「乖离≤2%+流入≥2000万」与「滞跌+抢筹加速」两版之长：
 #   ① 回踩 MA5 附近（乖离 ≤2.5% 或 near_support）
 #   ② 滞跌：非放量破位、非深跌（接飞刀否决）
-#   ③ 主力净流入 **≥2000万**（绝对门槛，挡小单噪声）
+#   ③ 量价方向净额 **≥2000万**（绝对门槛，挡小单噪声；非东财主力净额）
 #   ④ 且 **今日 > 昨日**（抢筹加速；昨日取不到则只卡③）
 #   ⑤ 日线结构好（多头排列或距 MA20 不过远）——用日线几何替代 t1，不进多周期
 # 【日内动量】只作滞跌轻确认（未继续深跌），**不**进 VWAP/m15。
 
-_W2S_MIN_MAIN_WAN = 2000.0   # 今日主力净流入下限（万元）
+_W2S_MIN_NET_WAN = 2000.0   # 今日量价方向净额下限（万元；非东财主力净额）
 
 
 def _w2s_tech_ok(p: dict) -> Tuple[bool, str]:
@@ -764,10 +1395,11 @@ def _w2s_tech_ok(p: dict) -> Tuple[bool, str]:
 
 
 def _w2s_flow_ok(code: str) -> Tuple[bool, str, dict]:
-    """主力 ≥2000万 且 今日>上一完整交易日（抢筹加速）。只对短名单调用。
+    """今日量价方向净额 ≥2000万 且 今日>上一完整交易日（抢筹加速）。只对短名单调用。
 
     2026-10-30：多日口径统一走 flow_summary.recent（与画像/深挖同源），不再单独
-    取 stock_daily —— 消除重复取数与口径漂移（统一接口约定）。"""
+    取 stock_daily —— 消除重复取数与口径漂移（统一接口约定）。
+    2026-10-31：读 `net_wan`（原 main_net_wan），口径=量价方向净额，非东财主力。"""
     extra: Dict[str, Any] = {}
     try:
         fl = flow_summary(code) or {}
@@ -776,31 +1408,31 @@ def _w2s_flow_ok(code: str) -> Tuple[bool, str, dict]:
     if not fl.get("ok"):
         return False, str(fl.get("reason") or "flow缺"), extra
     try:
-        today = float(fl.get("main_net_wan") or 0.0)
+        today = float(fl.get("net_wan") or 0.0)
     except (TypeError, ValueError):
         today = 0.0
-    extra["main_net_wan"] = today
+    extra["net_wan"] = today
     # ③ 绝对门槛：真抢筹，挡小单
-    if today < _W2S_MIN_MAIN_WAN:
-        return False, f"今日主力 {today:.0f}万 < {_W2S_MIN_MAIN_WAN:.0f}万", extra
+    if today < _W2S_MIN_NET_WAN:
+        return False, f"今日量价净额 {today:.0f}万 < {_W2S_MIN_NET_WAN:.0f}万", extra
 
     # ④ 加速：今日 > **上一完整交易日**（recent.prev_day_net_wan 已滤掉今日行）
     rec = fl.get("recent") if isinstance(fl.get("recent"), dict) else {}
     y_wan = rec.get("prev_day_net_wan")
     if y_wan is not None:
-        extra["y_main_net_wan"] = y_wan
+        extra["y_net_wan"] = y_wan
         extra["net_accel"] = today > _f(y_wan)
         if today <= _f(y_wan):
             return False, f"今日 {today:.0f}万 ≤ 昨日 {_f(y_wan):.0f}万（未加速）", extra
     else:
-        extra["y_main_net_wan"] = None
+        extra["y_net_wan"] = None
         extra["net_accel"] = None
-        extra["accel_note"] = str(rec.get("reason") or "昨日主力取不到")
+        extra["accel_note"] = str(rec.get("reason") or "昨日净额取不到")
     return True, "ok", extra
 
 
 def _is_weak_to_strong(p: dict) -> Tuple[bool, dict]:
-    """P1 弱转强（合并收紧）：回踩滞跌 + 主力≥2000万 + 抢筹加速 + 日线好。"""
+    """P1 弱转强（合并收紧）：回踩滞跌 + 量价净额≥2000万 + 抢筹加速 + 日线好。"""
     tech_ok, tech_why = _w2s_tech_ok(p)
     if not tech_ok:
         return False, {"reason": tech_why}
@@ -827,7 +1459,7 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
        · floor_kept：被砍但题材命中或稀缺来源（龙回头/热点）的前 floor_keep 只；
        · no_pred_kept：无 p_up（模型盲区）按客观优先级占 no_pred_keep 名额
          （2026-10-21：缺分 ≠ 低分）；
-       · w2s_kept（2026-10-23）：被砍但**明确弱转强**（回踩 MA5 滞跌 + 主力净流入
+       · w2s_kept（2026-10-23）：被砍但**明确弱转强**（回踩 MA5 滞跌 + 量价净流入
          + 日线结构好 + 今日主力>昨日）的前 w2s_keep 只。只回捞、不改 p_up 排名；
          条件从严，防假弱转强。
 
@@ -923,7 +1555,7 @@ def score_pool(candidates, strategy="", market=None, main_themes=None,
             p["no_pred_kept"] = True
 
     # ★ P1 弱转强回捞（2026-10-23）：被 rank_cut/p_up 剔掉但**明确弱转强**
-    #   （回踩滞跌 + 主力≥2000万 + 今日>昨日 + 日线好）→ 进 deep。只回捞不改排名。
+    #   （回踩滞跌 + 量价净额≥2000万 + 今日>昨日 + 日线好）→ 进 deep。只回捞不改排名。
     w2s_kept = []
     if int(w2s_keep or 0) > 0:
         already = {id(x) for x in kept + floor_kept + no_pred_kept}
@@ -971,7 +1603,8 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
                      code: str = "", name: str = "") -> None:
     """把实时行情对账进证据行（原地改 row）。
 
-    · row["rt"]：实时快照（缺 rt 时不写，不塞 None 壳）
+    · row["rt"]：实时快照（缺 rt 时不写，不塞 None 壳）；含 high/low（2026-10-30 补，
+      供一字判定与冲高回落——此前 rt 无 high，pump_dump_risk 的该分支从未命中）
     · row["stale_bar"]：bar close 与 rt last 相对偏差 > 0.5% ⇒ True
     · tech.limit_up / 顶层可执行价：以 rt 为准修正（涨停买不进是 hard 条件）
     · tech 的 MA/RSI/位置类指标不动（历史几何，rt 改不了也不该改）
@@ -1031,6 +1664,10 @@ def apply_rt_overlay(row: Dict[str, Any], rt: Optional[Dict[str, Any]],
         "price": rt.get("price"),
         "change_pct": round(rt["change_pct"], 2) if rt.get("change_pct") is not None else None,
         "previous_close": rt.get("previous_close"),
+        # high/low 2026-10-30 补：① 一字判定（low≈涨停价 → 买不到）；② pump_dump_risk
+        # 的冲高回落分支读 rt.high，此前 rt 从不带 high ⇒ 该分支恒不命中（静默失效）。
+        "high": rt.get("high"),
+        "low": rt.get("low"),
         "limit_up": limit_up,
         "limit_down": limit_down,
         "limit_up_price": limit_up_price,
@@ -1345,6 +1982,7 @@ def profile_candidates(
             ex.shutdown(wait=False, cancel_futures=True)
 
     profiles: List[Dict] = []
+    zt_map = zt_index()   # 封板结构要用池里的开板次数/封单额，缺了按 unknown 降级
     for c in pool:
         code = str(c.get("code") or "")
         if not code:
@@ -1388,6 +2026,13 @@ def profile_candidates(
             "hard": hard_exclusions(item, strategy),
             "warnings": soft_warnings(item, market, strategy),
             "tech": {k: v for k, v in tech.items() if k != "ok"} if tech.get("ok") else None,
+            "seal": seal_summary(
+                # 日线末根封板（盘中有 rt 时 deep 层会用实时口径重算，这里只做画像层估计）
+                sealed=(None if item.get("limit_locked") is None
+                        else bool(item.get("limit_locked"))),
+                zt_streak=tech.get("zt_streak") or 0,
+                zt_row=zt_map.get(code),
+                turnover_pct=item.get("turnover_pct")),
             "missing": miss,
         }
         prof["_bars"] = bars

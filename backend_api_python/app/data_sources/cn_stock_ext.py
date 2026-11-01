@@ -860,6 +860,74 @@ def index_fflow(code: str = "000300", days: int = 800,
 
 
 # ================================================================
+# 涨跌停 / 炸板池（cnd_limit_pool_list — 名单型，按日恒定）
+# ================================================================
+
+def limit_pool(kind: str, trade_date: str = "", with_remote: bool = True,
+               backfill: bool = True) -> List[Dict[str, Any]]:
+    """涨跌停 / 炸板池（名单型数据，不 OHLVC 化）。
+
+    库优先（`limit_pool_local` 的 cnd_limit_pool_list）→ 未命中走
+    `coord_pool.coordinate(kind, trade_date=...)` → **已完结日回填库**。
+
+    · 目标日：trade_date 为空时取 `current_data_day()`（交易日 ∧ >09:15 → 今日，
+      否则上一交易日）—— 与 K 线/资金流/画像同一口径，否则周末会去问一个
+      永远不存在的「今天的池」。
+    · 回填条件：`day <= _finish_anchor()` 即该日 15:00 已收盘，池已固化；
+      盘中当日不落库（快照仍在变，落进去会把 09:40 的池当成收盘池）。
+    · 三池按日恒定，因此库命中即零外网：实测单池 2.9~5.8s → 1~2ms。
+
+    Args:
+        kind: limit_up_pool | limit_down_pool | broken_board_pool
+        trade_date: YYYY-MM-DD；空 = current_data_day()
+        with_remote: False 时只读库（调用方要「库里有就用、没有就算了」的场景）
+        backfill: 远端命中后是否回填库（批量补历史时置 False 省一次写）
+
+    Returns:
+        list[dict]: provider 归一后的池行（stock_code/stock_name/price/
+            change_percent/continuous_zt_days/zt_time/break_time/seal_amount/
+            turnover_rate/volume/amount/sector/reason/open_count）；该日确实无票 → []。
+
+    Raises:
+        RuntimeError: 库未命中且远端失败。**失败不返回 []** —— 空 list 会被调用方
+            读成「那天没有涨跌停」，源故障就此隐形（四源 fail-fast 同一纪律）。
+    """
+    from app.data_sources import limit_pool_local as _lp
+
+    day = (trade_date or "").strip()
+    if not day:
+        from app.utils.trading_calendar import current_data_day
+        day = current_data_day()
+
+    rows = _lp.query_pool(kind, day)
+    if rows:
+        return rows
+    if not with_remote:
+        return []
+
+    from app.data_sources.coord_pool import coordinate
+    out = coordinate(kind, trade_date=day)
+    remote = ((out.get("data") or {}).get("rows") or []) if out.get("ok") else []
+    if not remote:
+        if not out.get("ok"):
+            raise RuntimeError("%s %s 远端取数失败: %s" % (kind, day, out.get("error") or "无数据"))
+        logger.info("[cn_stock_ext] %s %s 无票（源正常返回空）", kind, day)
+        return []
+    if backfill:
+        try:
+            if day <= _finish_anchor():
+                _lp.save_rows(kind, day, remote)
+                logger.info("[cn_stock_ext] %s %s 回填 %d 条 (source=%s)",
+                            kind, day, len(remote), out.get("source", ""))
+        except Exception as e:            # 回填失败不影响本次返回
+            logger.warning("[cn_stock_ext] %s %s 回填失败: %s", kind, day, e)
+    else:
+        logger.info("[cn_stock_ext] %s %s 远端 %d 条 (source=%s)",
+                    kind, day, len(remote), out.get("source", ""))
+    return remote
+
+
+# ================================================================
 # 龙虎榜（cnd_dragon_tiger_list — hub.lhb 同构契约）
 # ================================================================
 

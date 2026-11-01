@@ -373,6 +373,33 @@ def last_finish_trading_day(ref_dt: Optional[str] = None) -> str:
     return prev_trading_day(ref_date)
 
 
+def current_data_day(now: Optional[datetime] = None) -> str:
+    """「此刻该用哪一天的数据」——取数日期的唯一口径（2026-10-31 新增）。
+
+    语义：
+      - 交易日 ∧ 时刻 > 09:15（盘中 / 午休 / 收盘后）→ 今日
+      - 交易日 ∧ 开盘前（≤09:15）                → 上一交易日（今日数据尚未产出）
+      - 非交易日                                  → 上一交易日
+
+    ★ 与 `last_finish_trading_day()` 的差别只有一个：**盘中与午休取今日**。
+      last_finish 要等到 15:00 收盘才认今日，盘中返回上一交易日；但涨停/跌停/
+      炸板三池在盘中就是此刻有效的实时榜单，日线末根也是当日 bar（午休时
+      11:30 收盘拍已成立）。实测 2026-10-30 10:00（周五盘中）：
+      last_finish=2026-10-29，本函数=2026-10-30。
+
+    ★ 与 `is_in_quote_session()` 的差别也只有一个：**午休算**。
+      该判据是「要不要再向远端拉一次行情」的口径（午休否定），本函数是
+      「今日数据是否已存在」的口径（午休肯定）。两者不可互替：若用
+      is_in_quote_session 拼目标日，午休会静默退回上一交易日。
+    """
+    if now is None:
+        now = datetime.now()
+    ref_date = now.strftime("%Y-%m-%d")
+    if is_trading_day(ref_date) and now.time() > dtime(9, 15):
+        return ref_date
+    return prev_trading_day(ref_date)
+
+
 def trade_date_range(start_date: str, end_date: str) -> List[str]:
     """范围内的交易日列表"""
     _load()

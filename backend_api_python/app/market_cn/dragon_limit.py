@@ -65,46 +65,59 @@ def get_zt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
 
     ⚠ 2026-09-30 修正：旧实现忽略 trade_date、任何日期都返回当日实时快照——
     fetch_recent_zt_pools(8) 会把今天这份池子当成 8 天记录（伪造历史日期维度）。
-    现：当日/未指定 → 实时缓存（零网络，不触发拉取）；历史日期 → coord_pool 按日拉取。
+    现：历史日期 → coord_pool 按日拉取；当日 → 内存池（scheduler 刷新，零网络）。
+
+    ⚠ 2026-10-31 再修正：当日分支只认**进程内存** `_rt_zt_pool`，而它只在
+    scheduler 所在进程被 refresh_zt_pool 填充 ⇒ 任何其它进程（技能子进程、
+    手工脚本）拿到的恒为 []，调用方把 [] 读成「今日无涨停」——结构性误判，
+    不是"没热"。现：内存池未热则**现拉一次并回填**（该请求本就是当日池的唯一
+    真源），拉不到才返回 []。
 
     Returns:
         list[dict]: 涨停池行（含 stock_code/stock_name/price/change_percent/
         zt_time/turnover_rate/amount/continuous_zt_days/seal_amount/reason）；无数据 []。
     """
+    global _rt_zt_pool
     _day = (trade_date or "").strip()
-    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+    _today = datetime.now().strftime("%Y-%m-%d")
+    if _day and _day != _today:
         return _fetch_pool_by_date("limit_up_pool", _day)
-    if _rt_zt_pool is not None:
-        return _rt_zt_pool
-    return []
+    if _rt_zt_pool is None:
+        _rt_zt_pool = _fetch_today_pool("limit_up_pool", _today, _fetch_zt_pool)
+    return _rt_zt_pool
 
 
 def get_dt_pool(trade_date: str = "") -> List[Dict[str, Any]]:
-    """获取跌停池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存）。
+    """获取跌停池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存/现拉）。
 
     Returns:
         list[dict]: 跌停池行（键同涨停池）；无数据 []。
     """
+    global _rt_dt_pool
     _day = (trade_date or "").strip()
-    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+    _today = datetime.now().strftime("%Y-%m-%d")
+    if _day and _day != _today:
         return _fetch_pool_by_date("limit_down_pool", _day)
-    if _rt_dt_pool is not None:
-        return _rt_dt_pool
-    return []
+    if _rt_dt_pool is None:
+        _rt_dt_pool = _fetch_today_pool("limit_down_pool", _today, _fetch_dt_pool)
+    return _rt_dt_pool
 
 
 def get_broken_board(trade_date: str = "") -> List[Dict[str, Any]]:
-    """获取炸板池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存）。
+    """获取炸板池（日期语义同 get_zt_pool：历史按日拉取，当日走缓存/现拉）。
 
     Returns:
         list[dict]: 炸板池行（键同涨停池）；无数据 []。
     """
+    global _rt_broken_board
     _day = (trade_date or "").strip()
-    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
+    _today = datetime.now().strftime("%Y-%m-%d")
+    if _day and _day != _today:
         return _fetch_pool_by_date("broken_board_pool", _day)
-    if _rt_broken_board is not None:
-        return _rt_broken_board
-    return []
+    if _rt_broken_board is None:
+        _rt_broken_board = _fetch_today_pool("broken_board_pool", _today,
+                                             _fetch_broken_board)
+    return _rt_broken_board
 
 
 def get_hot_rank() -> List[Dict[str, Any]]:
@@ -193,6 +206,28 @@ def _fetch_pool_by_date(kind: str, trade_date: str) -> List[Dict[str, Any]]:
     else:
         logger.info("[coord_pool] %s %s: 无结果 (%s)", kind, trade_date, out.get("error", ""))
     return rows
+
+
+def _fetch_today_pool(kind: str, today: str, fetch_realtime) -> List[Dict[str, Any]]:
+    """当日池取数（2026-10-31）：盘中走实时接口，已收盘/未开盘走按日接口。
+
+    为什么必须分两种：实时接口（`coordinate(kind)` 不带 trade_date）是盘中唯一
+    能给出**此刻**封板结构的源，scheduler 反复刷的就是它；按日接口
+    （`coordinate(kind, trade_date=...)`）读的是当日固化后的榜单，盘中此刻
+    尚未产出，硬查只会拿到空。收盘后反过来：实时快照已不再更新，按日才是真值。
+
+    日历不可用 ⇒ 走按日（行为可预测，与历史日同源），并如实告警，不猜时段。
+    """
+    try:
+        from app.utils.trading_calendar import is_in_quote_session
+        intraday = is_in_quote_session()
+    except Exception as e:
+        logger.warning("[coord_pool] %s 当日: 报价时段判定不可用(%s)，改走按日路径",
+                       kind, e)
+        intraday = False
+    if intraday:
+        return fetch_realtime()
+    return _fetch_pool_by_date(kind, today)
 
 
 def _fetch_hot_rank() -> List[Dict[str, Any]]:

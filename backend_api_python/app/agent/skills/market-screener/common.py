@@ -9,7 +9,6 @@ market-screener/common.py
 from __future__ import annotations
 
 from ...log import logger
-import json
 import os
 import sys
 import time
@@ -244,8 +243,8 @@ class SkillResult(dict):
 
         flow = self.get("flow") or {}
         if flow.get("ok"):
-            parts.append(f"资金: 主力净额{flow.get('main_net_wan')}万 "
-                         f"占成交{flow.get('net_pct_of_amount')}%")
+            parts.append(f"资金: 量价净额{flow.get('net_wan')}万 "
+                         f"占成交{flow.get('net_pct_of_amount')}%（派生口径，非主力）")
         elif flow:
             parts.append(f"资金: 缺失（{flow.get('reason')}）")
 
@@ -255,13 +254,48 @@ class SkillResult(dict):
             tags = ",".join(th.get("concept_tags") or []) or "-"
             parts.append(f"题材: 行业{th.get('industry') or '-'} | 板块{boards} | 概念{tags}")
 
+        if tech.get("regime") or tech.get("rs_d0") is not None:
+            seg = []
+            if tech.get("regime"):
+                seg.append(f"形态[{tech['regime']}]")
+            if tech.get("rs_d0") is not None:
+                seg.append(f"当日相对上证{tech['rs_d0']:+}%")
+            if tech.get("rs_5d") is not None:
+                seg.append(f"5日超额{tech['rs_5d']:+}%")
+            if tech.get("vr_rel") is not None:
+                seg.append(f"量比相对大盘{tech['vr_rel']}x")
+            if (self.get("flow") or {}).get("flow_rel") is not None:
+                seg.append(f"资金流相对大盘{(self.get('flow') or {})['flow_rel']:+}pp")
+            parts.append("相对强度: " + " ".join(seg)
+                         + "（三轴：大盘弱个股强=真强；大盘强个股弱=真弱）")
+
+        st = self.get("same_t")
+        if isinstance(st, dict) and st.get("ok"):
+            seg = [f"截至{st.get('t')} 量能={_n(st.get('vr_same_t'), 'x前日均值')}",
+                   f"个股昨收→今{st.get('t')}涨{_n(st.get('ret_same_t'), '%')}"]
+            if st.get("idx_ret_same_t") is not None:
+                seg.append(f"上证同期{_n(st.get('idx_ret_same_t'), '%')}")
+            if st.get("rs_same_t") is not None:
+                seg.append(f"同时刻超额{_n(st.get('rs_same_t'), '%')}")
+            if st.get("vr_rel_same_t") is not None:
+                seg.append(f"量比相对大盘={_n(st.get('vr_rel_same_t'), 'x')}")
+            if st.get("fp_same_t") is not None:
+                seg.append(f"同刻净占比={_n(st.get('fp_same_t'), '%')}")
+            if st.get("flow_rel_same_t") is not None:
+                seg.append(f"资金流相对大盘={_n(st.get('flow_rel_same_t'), 'pp')}")
+            if st.get("mkt_vr") is not None:
+                seg.append(f"大盘量比={_n(st.get('mkt_vr'), 'x')}")
+            if st.get("mkt_fp_pct") is not None:
+                seg.append(f"大盘净占比={_n(st.get('mkt_fp_pct'), '%')}")
+            parts.append("同时刻比对(" + str(st.get("days_used")) + "日前推): " + " | ".join(seg))
+
         zt = self.get("zt_history") or []
         if zt:
             parts.append("涨停史: " + " ".join(
                 f"{z.get('date')}({z.get('continuous_days')}板)" for z in zt[:6]))
 
         if self.get("fund_hist"):
-            parts.append(f"近10日主力资金明细已附(fund_hist)")
+            parts.append("近10日逐日净额明细已附(fund_hist)")
         if self.get("dragon"):
             parts.append(f"龙虎榜席位已附(dragon, detail=True)")
         if self.get("boards"):
@@ -475,6 +509,38 @@ def warm_market_pool(workers: int = _FETCH_POOL_MIN) -> None:
             "[market-screener] CNStock 连接池预热失败（按原池行为继续）: %s", e)
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def _data_day() -> str:
+    """本次分析的**目标交易日**（三池取数日期唯一来源）。
+
+    语义（见下方实现注释）：盘中/盘后 → 今日；开盘前/非交易日 → 上一个交易日。
+
+    ★ 2026-10-31 实锤：三池（涨停/跌停/炸板）的取数不能用 `_today_str()`。
+      实测 `get_zt_pool("2026-10-30")` = 47 只（含 open_count / seal_amount），
+      `get_zt_pool("2026-10-31")` = 0（周六）——而整份分析（日线、资金流、
+      画像）用的都是 10-30 的数据。日期口径错位 ⇒ 三个后果：
+        · 封板结构（open_count / seal_amount）恒 unknown；
+        · `market.zt_count` 恒 0，模型据此写「涨停 0」，与它自己列出的
+          涨停票自相矛盾；
+        · `zt` / `eod_zt` 两个候选源恒空，候选池只剩 search + dragon。
+      周末/节假日是**最常用**的提问场景（"明天买什么"多在盘后问），故必须对齐。
+
+    日历不可用（`CalendarUnavailable`）时按「回落到今天 + 记 warning」降级：
+    宁可用一个可能取不到池的日期，也不要把整条链路静默塌成空池。
+    """
+    today = _today_str()
+    try:
+        # 语义整体下沉到 trading_calendar.current_data_day（该文件内的统一实现，
+        # 此处只保留「日历不可用」的降级）：盘中/午休/盘后 → 今日；开盘前/非交易日
+        # → 上一交易日。勿在本文件拼 is_in_quote_session + last_finish_trading_day：
+        # 前者午休不算（会把午休退回昨天），后者盘中不算（会把盘中退回昨天）。
+        from app.utils.trading_calendar import current_data_day
+        return current_data_day() or today
+    except Exception as e:      # 日历不可用：由本调用方显式降级，不静默吞
+        logger.warning("[MktScreen] 交易日历不可用，目标交易日回落到今天 %s: %s",
+                       today, e)
+        return today
 # ═══════════════════════════════════════════════════════════════
 #  工具分发
 # ═══════════════════════════════════════════════════════════════
@@ -586,87 +652,41 @@ def is_limit_locked(code: str, name: str, close: float, prev_close: float) -> bo
 # 无法区分「源故障」与「真空无候选」⇒ 数据不可用被交付成「今日无候选」。
 # 现一律向上抛，由调用方记 missing / source_errors（_facts.py 同构处理）。
 # ═══════════════════════════════════════════════════════════════
-#  涨停池按日落盘缓存（2026-10-25 P1-②）
+#  三池（涨停/跌停/炸板）取数（2026-10-31 改走 data_sources 链路）
 # ═══════════════════════════════════════════════════════════════
 #
-# 根因（主探针实锤）：fetch_recent_zt_pools(8) 每个进程冷启都对 7 个历史
-# 日期串行拉 akshare（stock_zt_pool_em），限流器纯睡 27.68s
-# （min=2.0 + jitter U(1.5,3.5) ≈ 3.5-5.5s/次）+ 实取 ~5s。历史日期的
-# 涨停池当日不变 ⇒ 按日落盘，同日二次运行零网络、零限流等待。
-# 口径：① 只缓存**历史日期**（< 今日）；当日实时池盘中动态，且
-# get_zt_pool 当日本就走 _rt_zt_pool 内存缓存（零网络），无需落盘；
-# ② TTL 24h——上游迟到的数据修正不会永久驻留，也不会每次运行重付；
-# ③ 只缓存非空结果——akshare 失败时 _ak_zt_pool 静默返回 []
-# （dragon_limit 的 fail-soft），把 [] 落盘会把瞬时故障冻结成假数据；
-# ④ 原子写（tmp + os.replace）防多进程并发写半截文件；读坏按未命中回源。
-# 缓存目录：backend_api_python/data/zt_pool/（与 adjustment_factors.json 同区的
-# 跨进程缓存；本模块在 app/agent/skills/market-screener/ 下，上溯四层到 backend
-# 根—— Adjustment 在 app/data_sources/provider/ 下只需三层，勿照抄层数）
-_ZT_POOL_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "data", "zt_pool")
-_ZT_POOL_CACHE_TTL_S = 24 * 3600
+# 2026-10-25 曾在此做过一份 JSON 落盘缓存（data/pool_cache/），2026-10-31 撤除：
+# 三池落库改由 data_sources 承担（表 cnd_limit_pool_list，同一份数据只存一处），
+# 读侧统一经 cn_stock_ext.limit_pool，写侧 cn_stock_putdb.sync_limit_pools 批量补齐。
+# 保留此处注释是为了说明「不要再在技能侧加一层缓存」——那会重新制造双份真源。
 
 
-def _zt_pool_cache_path(date_str: str) -> str:
-    return os.path.join(_ZT_POOL_CACHE_DIR, f"zt_pool_{date_str}.json")
+def _limit_pool(kind: str, date: str) -> List[Dict]:
+    """三池统一取数：库优先 → coord_pool 远端兜底 → 已完结日回填库。
 
-
-def _zt_pool_cache_get(date_str: str) -> Optional[List[Dict]]:
-    """读按日涨停池缓存；未命中/过期/损坏返回 None（调用方回源拉取）。"""
-    path = _zt_pool_cache_path(date_str)
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if not isinstance(payload, dict) or not isinstance(payload.get("pool"), list):
-            return None
-        if time.time() - float(payload.get("fetched_at") or 0) > _ZT_POOL_CACHE_TTL_S:
-            return None
-        return payload["pool"]
-    except Exception as e:
-        logger.warning("[MktScreen] 涨停池缓存读取失败 %s: %s", date_str, e)
-        return None
-
-
-def _zt_pool_cache_put(date_str: str, pool: List[Dict]) -> None:
-    """原子写按日涨停池缓存（tmp + replace）。失败仅记 warning 不抛。"""
-    path = _zt_pool_cache_path(date_str)
-    try:
-        os.makedirs(_ZT_POOL_CACHE_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"date": date_str, "fetched_at": time.time(), "pool": pool},
-                      f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.warning("[MktScreen] 涨停池缓存写入失败 %s: %s", date_str, e)
+    2026-10-31 收口（用户裁定：改走 data_sources 链路）：此前技能侧自己写 JSON
+    落盘缓存，与库表 cnd_limit_pool_list 双份冗余、且只有本技能享受。现统一走
+    `cn_stock_ext.limit_pool` —— 读库 1~2ms，未命中才回源，回填由同层负责；
+    批量补齐另由 `cn_stock_putdb.sync_limit_pools`（按交易日）承担。
+    fail-fast 不变：取不到数向上抛（含远端失败），由调用方记 missing/source_errors。
+    """
+    from app.data_sources.cn_stock_ext import limit_pool
+    return limit_pool(kind, date)
 
 
 def fetch_zt_pool(date: str) -> List[Dict]:
-    """涨停池。fail-fast：失败向上抛（调用方负责记 missing，不静默吞成空池）。
+    """涨停池。fail-fast：失败向上抛（调用方负责记 missing，不静默吞成空池）。"""
+    return _limit_pool("limit_up_pool", date)
 
-    2026-10-25 P1-②：历史日期（< 今日）按日落盘缓存（TTL 24h、只存非空），
-    同日重复运行免 akshare 往返与限流等待；当日实时池不缓存（盘中动态）。
-    """
-    from app.market_cn.dragon_limit import get_zt_pool
-    _day = (date or "").strip()
-    if _day and _day != datetime.now().strftime("%Y-%m-%d"):
-        cached = _zt_pool_cache_get(_day)
-        if cached is not None:
-            return cached
-        pool = get_zt_pool(_day)
-        if pool:                      # 不落空：akshare 失败是静默 []（见上）
-            _zt_pool_cache_put(_day, pool)
-        return pool
-    return get_zt_pool(_day)
+
 def fetch_dt_pool(date: str) -> List[Dict]:
     """跌停池。fail-fast：同 fetch_zt_pool。"""
-    from app.market_cn.dragon_limit import get_dt_pool
-    return get_dt_pool(date)
+    return _limit_pool("limit_down_pool", date)
+
+
 def fetch_broken_board(date: str) -> List[Dict]:
     """炸板池。fail-fast：同 fetch_zt_pool。"""
-    from app.market_cn.dragon_limit import get_broken_board
-    return get_broken_board(date)
+    return _limit_pool("broken_board_pool", date)
 def fetch_hot_stocks_with_reason(date: str) -> Dict:
     """同花顺强势股+题材。fail-fast：HTTP 错误码与网络异常一律抛错。
 
@@ -792,18 +812,37 @@ def compute_atr(bars: List[Dict], period: int = 14) -> List[float]:
 #  龙回头弱转强检测（盘中 + 盘后共享）
 # ═══════════════════════════════════════════════════════════════
 
+def _recent_trading_days(n: int) -> List[str]:
+    """近 n 个交易日（含目标交易日），倒序。日历不可用 → 自然日回退并告警。"""
+    try:
+        from app.utils.trading_calendar import current_data_day, prev_trading_day
+        day = current_data_day()
+        out: List[str] = []
+        for _ in range(n):
+            out.append(day)
+            day = prev_trading_day(day)
+        return out
+    except Exception as e:
+        logger.warning("[MktScreen] 交易日历不可用，近N日涨停池回退自然日回溯: %s", e)
+        now = datetime.now()
+        return [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
+
+
 def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
-    """近 N 日涨停池（龙回头输入）。
+    """近 N 个**交易日**涨停池（龙回头输入）。
 
     容错口径（2026-10-21，配合四源 fail-fast）：单日失败跳过并留痕（历史某日
     缺数据不致命）；但**全部日期都失败**时必须抛出——否则源故障会塌缩成
     「近 8 日无涨停」，龙回头源随之静默空手而归（源失败显性化同一纪律）。
+
+    ★ 2026-10-31：回溯单位由「自然日」改为「交易日」。旧实现按自然日取 8 天，
+      其中 2~3 天是周末/节假日，每天仍要真拉一次远端等 4~5s 拿空 —— 实测
+      `fetch_recent_zt_pools(8)` 8.4~11.1s，几乎全耗在非交易日的空拉上。
+      改为交易日回溯后，历史日一律命中按日落盘缓存（1~2ms/日）。
     """
     pools = {}
-    today = datetime.now()
     last_err: Optional[Exception] = None
-    for i in range(days):
-        d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+    for d in _recent_trading_days(days):
         try:
             pool = fetch_zt_pool(d)
         except Exception as e:
