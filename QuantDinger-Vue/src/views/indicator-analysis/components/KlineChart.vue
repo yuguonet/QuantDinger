@@ -2663,23 +2663,33 @@ json.dumps(output)
      * （实测 988px 绘图区 ≈ 124 根，1600px 窗口 ≈ 200 根），且分时留下的跨度/空位会残留。
      * 何时用：首次进入、以及该周期没有现场可恢复（不再退化成"库默认跨度"）。
      */
-    const applyEntryViewport = () => {
+    const applyEntryViewport = (syncSpan = true) => {
       const chart = chartRef.value
       if (!chart || isMinuteLine.value) return false
       const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
       if (!list || !list.length) return false
       // 程序化定位不归档现场（否则会把"进入态"写进用户拖拽存档）
       suppressSceneCapture()
+      // syncSpan=false（换股）时直接返回：X 轴跨度与右缘空位完全沿用当前值。
+      // 原因：换股瞬间 Y 轴刻度尚未按新价格重建，resolvePlotWidth 读到的是上一只股票的
+      // 绘图区宽度，据此算出的 barSpace 与随后 resize() 实测宽度不匹配 ⇒ 横向挪动一下。
+      // 既然同周期数据根数一致，沿用当前跨度即可保持 X 轴静止。
+      if (!syncSpan) return true
       const bs = entryBarSpace({
         plotWidth: resolvePlotWidth(chart),
         barCount: list.length,
         visibleBars: ENTRY_VISIBLE_BARS,
         breathBars: ENTRY_BREATH_BARS
       })
-      if (bs > 0 && typeof chart.setBarSpace === 'function') {
+      // 与 fitMinuteLineView 同模式：先读当前 barSpace，差不到 0.5px 就跳过 setBarSpace。
+      // applyNewData 后库已自动铺满到合理 barSpace（通常就是 ENTRY_VISIBLE_BARS 所需的那个），
+      // 此处又强制重设一遍 = 白跑一次视口重排（adjustVisibleRange + 整视口重绘），造成"换股抖一下"。
+      // setRightSideDiffBars 也一并跳过：右缘空位同理，applyNewData 已设好合理值。
+      const current = readBarSpace(chart)
+      if (bs > 0 && Math.abs(current - bs) > 0.5 && typeof chart.setBarSpace === 'function') {
         try { chart.setBarSpace(bs) } catch (_) { /* 预期内：越界时库会静默拒绝，沿用当前跨度 */ }
+        setRightSideDiffBars(ENTRY_BREATH_BARS)
       }
-      setRightSideDiffBars(ENTRY_BREATH_BARS)
       return true
     }
 
@@ -3404,10 +3414,27 @@ json.dumps(output)
         prev.some((b, i) => !b || b.timestamp !== gridBars[i].timestamp)
 
       if (isMinuteLine.value) {
-        // 走全量 applyNewData（内部带合并节流）：视口锁死与指标重算由 fitMinuteLineView /
-        // applyMinutePrevCloseAxis 统一处理。写入的是「分钟网格」（索引=时间轴位置），
-        // updateData 也可用，但全量刷新能同步重设右侧空位并保持指标/视口状态一致，更稳。
-        scheduleMinuteChartApply(gridBars)
+        // 分时模式：按"时间轴是否变化"分层写数据。
+        //   - 结构变（跨日 / 首次构建 / 分钟网格填补）：走 applyNewData 全量刷新，
+        //     scheduleMinuteChartApply 内部会 fitMinuteLineView + installMinuteXAxisTicks，
+        //     保证视口与 X 轴补丁同步。
+        //   - 结构不变（盘中 tick 只改最末 1m 柱）：走 updateData 单 bar 增量 —— 这是
+        //     消灭每次 tick 都"全量 applyNewData 导致的窗口闪烁/抖动"的关键；
+        //     applyMinutePrevCloseAxis 必须在每次增量后重锁一次 Y 轴（锚点可能因新高低被突破而失效）。
+        if (structureChanged) {
+          scheduleMinuteChartApply(gridBars)
+        } else if (chartRef.value && typeof chartRef.value.updateData === 'function') {
+          for (let i = 0; i < gridBars.length; i++) {
+            const p = gridBars[i]
+            const q = prev[i]
+            if (!q || klineBarSnapshotKey(q) !== klineBarSnapshotKey(p)) {
+              flushRealtimeChartBar(p)
+            }
+          }
+          applyMinutePrevCloseAxis()
+        } else {
+          scheduleMinuteChartApply(gridBars)
+        }
       } else if (structureChanged || !chartRef.value || typeof chartRef.value.updateData !== 'function') {
         // 时间轴变化（跨日 / 首次构建）：全量刷新
         if (chartRef.value && typeof chartRef.value.applyNewData === 'function') {
@@ -3554,25 +3581,10 @@ json.dumps(output)
     }
 
     /**
-     * 把主图 Y 轴恢复为自动计算刻度。
-     * klinecharts 一旦手动缩放过 Y 轴，autoCalcTickFlag 永久为 false，
-     * 换股/换周期后新数据会被塞进旧的手动范围，无法最大化填充窗口；
-     * 官方交互是双击右轴复位，这里走内部实例等价复位（版本锁定 9.8.x，带降级保护）。
+     * 换股/换周期后 Y 轴最终调整统一收口到 loadKlineData / initChart 的
+     * 分时/日线分支里（各分支自己调 setAutoCalcTickFlag(true) + adjustPaneViewport 一次）。
+     * 参见：loadKlineData 图表已存在分支 applyNewData 前关 auto 的注释。
      */
-    const resetYAxisToAuto = () => {
-      const chart = chartRef.value
-      if (!chart) return
-      try {
-        const pane = chart._candlePane
-        const axis = pane && typeof pane.getAxisComponent === 'function' ? pane.getAxisComponent() : null
-        if (axis && typeof axis.setAutoCalcTickFlag === 'function' && axis.getAutoCalcTickFlag() === false) {
-          axis.setAutoCalcTickFlag(true)
-          if (typeof chart.adjustPaneViewport === 'function') {
-            chart.adjustPaneViewport(false, true, true, true)
-          }
-        }
-      } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
-    }
 
     /**
      * 分时图数据处理：
@@ -4136,6 +4148,36 @@ json.dumps(output)
       if (i < 0) return s
       const out = s.length - i - 1 <= maxDec ? s : s.slice(0, i + maxDec + 1)
       return out.replace(/0+$/, '').replace(/\.$/, '')
+    }
+    /**
+     * 按数据推断并写入价格精度：
+     * klinecharts 会从数据的小数位数推断 precision（后端返回 7.4600 ⇒ 精度 4），
+     * 导致最新价标签与价格轴显示 7.4600。这里取最近 30 根收盘价的「有效小数位」
+     * （Number 化后自动去掉尾随零，最多保留 3 位），仅在精度确有变化时写回。
+     * ★ 必须走 ChartStore：Chart 实例上没有 setPrecision（v9 只暴露在 ChartStore 上），
+     *   且 ChartStore.setPrecision 是整体替换而非合并，所以要带上原有 volume 精度。
+     */
+    const applyPricePrecision = (list) => {
+      const chart = chartRef.value
+      if (!chart || !Array.isArray(list) || !list.length) return
+      const store = typeof chart.getChartStore === 'function' ? chart.getChartStore() : null
+      if (!store || typeof store.setPrecision !== 'function') return
+      let pricePrecision = 0
+      for (let i = Math.max(0, list.length - 30); i < list.length; i++) {
+        const raw = list[i] && list[i].close
+        if (raw == null) continue
+        const s = String(Number(raw))
+        if (s.indexOf('e') >= 0 || s.indexOf('E') >= 0) continue
+        const dot = s.indexOf('.')
+        if (dot >= 0) pricePrecision = Math.max(pricePrecision, Math.min(s.length - dot - 1, 3))
+      }
+      let volumePrecision = 2
+      try {
+        const cur = typeof store.getPrecision === 'function' ? store.getPrecision() : null
+        if (cur && Number.isFinite(Number(cur.volume))) volumePrecision = Number(cur.volume)
+        if (cur && Number(cur.price) === pricePrecision && Number(cur.volume) === volumePrecision) return
+      } catch (_) { /* 预期内：内部结构变化时按推断值写入 */ }
+      try { store.setPrecision({ price: pricePrecision, volume: volumePrecision }) } catch (_) { /* 预期内 */ }
     }
     /**
      * 主图 Y 轴刻度策略（安装一次，常驻；两个分支各自按当前状态生效）：
@@ -5007,22 +5049,24 @@ json.dumps(output)
         //     两者数据独立，关键位不该被昨收的可用性连坐。
         ensureMinuteSrLinesIndicator()
 
-        // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
-        setupMinutePrevCloseReference()
-
         // 3. 铺满全部数据并锁定交互：X 轴固定覆盖整个交易时段（9:30 - 15:00）
         //    铺满需要在滚动能力未被禁用时执行，故先 fit 再 disable
         fitMinuteLineView()
-        // 铺满会重排绘图区并重算刻度，之后必须再锁定一次 Y 轴范围
-        applyMinutePrevCloseAxis()
+        // 2.5 分时专用：昨日首板价 0 轴线 + Y 轴以昨收为中心
+        //     必须在 fitMinuteLineView 之后调：fit 会重排绘图区并重算刻度，
+        //     之前锚定的 Y 轴范围会被推翻 → 合并为一次正确的 Y 轴炸。
+        //     setupMinutePrevCloseReference 内部已调 applyMinutePrevCloseAxis（drawZeroLine 里），
+        //     不再在外层重复调 applyMinutePrevCloseAxis。
+        setupMinutePrevCloseReference()
         disableMinuteInteractions()
         // 锁定主图 Y 轴手势（右轴拖拽/滚轮缩放），Y 轴自动跟随数据
         lockMinutePaneAxes()
-        // 布局/指标副图就绪后再校准一次（首次铺满时绘图区宽度可能尚未稳定）
+        // 布局/指标副图就绪后 fit 自愈（首次铺满时绘图区宽度可能尚未稳定）
+        // 不再重复 applyMinutePrevCloseAxis：setupMinutePrevCloseReference 内部的
+        // [150,400,1000]ms 自愈链已覆盖这个时序窗口，safeTimeout 只保留 fit 让 AVP 等指标正确跟随宽度
         safeTimeout(() => {
           if (!isMinuteLine.value) return
           fitMinuteLineView()
-          applyMinutePrevCloseAxis()
         }, 150)
       } catch (e) {
         console.warn('设置分时图样式失败:', e)
@@ -5053,6 +5097,7 @@ json.dumps(output)
         //    必须显式清除 area 配置并恢复 bar 颜色，
         //    因为 klinecharts 的 setStyles 是深度合并，不会自动重置旧字段
         const isDark = chartTheme.value === 'dark'
+        const barColors = candleBarColors(chartColorScheme.value, isDark, isDark ? '#888' : '#999')
         chartRef.value.setStyles({
           candle: {
             type: 'candle_solid',
@@ -5064,14 +5109,19 @@ json.dumps(output)
               backgroundColor: 'transparent'
             },
             // 恢复 K 线柱体颜色（★ 走单一配色来源，禁止写死方案，否则与买卖点标记色脱钩）
-            bar: candleBarColors(chartColorScheme.value, isDark, isDark ? '#888' : '#999'),
+            bar: barColors,
             // 恢复价格标记
+            // v9 的 last 颜色字段是 upColor / downColor / noChangeColor，线型在 line.style；
+            // v8 的顶层 color / lineStyle 在 v9 已不再被消费 —— 写旧字段会让最新价标签
+            // 永远使用库默认的 green(涨)/red(跌)，与 A 股红涨绿跌相反。
             priceMark: {
               show: true,
               last: {
                 show: true,
-                color: isDark ? '#d1d4dc' : '#333',
-                lineStyle: 'dashed'
+                upColor: barColors.upColor,
+                downColor: barColors.downColor,
+                noChangeColor: barColors.noChangeColor,
+                line: { show: true, style: 'dashed', size: 1 }
               }
             },
             // 恢复日K tooltip：9.8 起 candle.tooltip.labels/values 已不再被消费（死配置）；
@@ -5221,32 +5271,44 @@ json.dumps(output)
             if (validData.length > 0 && chartRef.value) {
               // 换数据引发的视口变化(含后续程序化定位)不归档现场, 保护用户拖拽存档
               suppressSceneCapture()
+
+              // ★ 在 applyNewData 之前先关掉 autoCalcTickFlag — 阻止库内部自动 adjustPaneViewport
+              //   把 Y 轴 auto 排一次（那就是用户看到的"显示一瞬"第一帧）。
+              //   我们会在后续的分时/日线分支里统一手动调一次 adjustPaneViewport 搞定 Y 轴，
+              //   这样 applyNewData 的 Canvas 渲染和手动 Y 轴调整合并成同一帧 → 消除"两帧抖"。
+              try {
+                const _axis = chartRef.value._candlePane?.getAxisComponent?.()
+                if (_axis?.setAutoCalcTickFlag) _axis.setAutoCalcTickFlag(false)
+              } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
+
               // 使用 applyNewData 初始化
+              // 先按数据校正价格精度（后端 7.4600 ⇒ 显示 7.46），避免标签/价格轴带无意义尾零
+              applyPricePrecision(validData)
               try {
                 chartRef.value.applyNewData(validData)
               } catch (e) {
                 chartRef.value.applyNewData(validData)
               }
-
-              // Y 轴复位为自动贴合：手动缩放状态不清除会让新数据卡在旧范围里
-              resetYAxisToAuto()
+              // 注意：不再单独调 resetYAxisToAuto — 它的 adjustPaneViewport 合并到下面
+              // 分时/日线各自的"最终 Y 轴调整"里，一次搞定。
 
               // 分时图模式：应用面积图样式
               if (isMinuteLine.value) {
                 if (_lastRenderedMode === 'minute') {
                   // 同为分时（换股/静默刷新）：面积样式、AVP 均价线、交互锁定与实例同在，
-                  // 跳过整套样式重设；仅重铺 X 轴时段 + 按新标的昨收重建 0 轴线与 Y 轴
-                  // （极坐标/自适应范围、150/400/1000ms 自愈重试均由 setup 内部处理）
-                  fitMinuteLineView()
-                  setupMinutePrevCloseReference()
-                  // 布局稳定后再铺一次：换股瞬间绘图区宽度可能尚未稳定，
-                  // fitMinuteLineView 用 plotWidth/totalBars 算 barSpace 会算偏，
-                  // 导致时段铺不满宽度（残留态：重启前端即恢复）。
-                  // 与 applyMinuteLineChartStyle 的 150ms 自愈重试同源。
-                  safeTimeout(() => {
-                    if (!isMinuteLine.value || !chartRef.value) return
+                  // 跳过整套样式重设。把 fitMinuteLineView(X 轴铺满) +
+                  // setupMinutePrevCloseReference(Y 轴锚定) 推到同一个 nextTick 里顺序执行，
+                  // 避免同步路径上连续 5 次重排（applyNewData→resetYAxisToAuto→fit→setup
+                  // → safeTimeout 里再 fit）全部在同一帧触发，造成"切换股票时抖几次"。
+                  // 原 safeTimeout(150ms) 从日志看被 polyfill 吃掉延迟全部同步执行，
+                  // 与首次 fit 完全冗余；用 nextTick 等待 DOM 更新比硬等毫秒数更语义化。
+                  // setupMinutePrevCloseReference 内部的 [150,400,1000]ms 自愈重试是独立
+                  // 的长期抖动防御，此处不动。
+                  nextTick(() => {
+                    if (!chartRef.value || !isMinuteLine.value) return
                     fitMinuteLineView()
-                  }, 150)
+                    setupMinutePrevCloseReference()
+                  })
                 } else {
                   applyMinuteLineChartStyle()
                 }
@@ -5263,10 +5325,12 @@ json.dumps(output)
                   applyEntryViewport()
                 } else if (_goLatestOnNextLoad) {
                   _goLatestOnNextLoad = false
-                  // ★ 换股也走进入态视口：只设右缘空位（旧 goLatestWithBreath 的做法）
-                  //   不改 barSpace，会继承分时残留的巨大右缘空位与上一张图的缩放跨度；
-                  //   applyEntryViewport 显式重算 barSpace（最新 120 根铺满）+ 右缘呼吸位，根因修复。
-                  applyEntryViewport()
+                  // ★ 换股沿用当前 X 轴跨度与右缘空位（syncSpan=false）
+                  //   无需重算 barSpace：同周期数据根数一致，且换股瞬间 Y 轴刻度尚未按
+                  //   新价格重建，此时按旧绘图区宽度算出的 barSpace 会与随后 resize() 实测
+                  //   宽度不匹配 ⇒ 横向挪动一下（X 轴小抖动）。分时残留的大跨度仍由
+                  //   _minuteLineRestore、以及各周期现场恢复负责，不在此处强设。
+                  applyEntryViewport(false)
                 } else if (!restoreChartScene(props.timeframe)) {
                   // 该周期没有现场：统一走进入态视口
                   applyEntryViewport()
@@ -5281,6 +5345,12 @@ json.dumps(output)
                 } catch (_) { /* 预期内 */ }
                 installAxisTickPolicy(getCandleYAxis())
                 installCrosshairReadoutPolicy()
+                // ★ 日线 Y 轴最终调整：打开 auto + adjustPaneViewport 一次搞定。
+                //   applyNewData 之前我们关了 auto 阻止库内部自动排 Y 轴（那是"显示一瞬"第一帧），
+                //   现在统一手动开 auto + adjustPaneViewport，整个日线分支只调一次 Y 轴重排。
+                const _dyAxis = getCandleYAxis()
+                if (_dyAxis?.setAutoCalcTickFlag) _dyAxis.setAutoCalcTickFlag(true)
+                try { chartRef.value.adjustPaneViewport(false, true, true, true) } catch (_) { /* 预期内 */ }
               }
 
               // 确保 VOL 副图指标存在（applyNewData 可能导致 VOL pane 数据绑定丢失）
@@ -6160,7 +6230,16 @@ json.dumps(output)
           if (validData.length > 0) {
             // 首建换数据的视口变化不归档现场(保护持久化恢复的现场)
             suppressSceneCapture()
+
+            // ★ 同 loadKlineData 分支：applyNewData 前先关 autoCalcTickFlag
+            try {
+              const _axis = chartRef.value._candlePane?.getAxisComponent?.()
+              if (_axis?.setAutoCalcTickFlag) _axis.setAutoCalcTickFlag(false)
+            } catch (_) { /* 预期内 */ }
+
             // 使用 applyNewData 初始化
+            // 先按数据校正价格精度（后端 7.4600 ⇒ 显示 7.46），避免标签/价格轴带无意义尾零
+            applyPricePrecision(validData)
             try {
               chartRef.value.applyNewData(validData)
             } catch (e) {
@@ -6192,8 +6271,8 @@ json.dumps(output)
                     applyEntryViewport()
                   } else if (_goLatestOnNextLoad) {
                     _goLatestOnNextLoad = false
-                    // 同 loadKlineData 分支：改用进入态视口，根因修复换股残留缩放/右缘
-                    applyEntryViewport()
+                    // 同 loadKlineData 分支：换股沿用当前 X 轴跨度，避免横向挪动（X 轴小抖动）
+                    applyEntryViewport(false)
                   } else if (!restoreChartScene(props.timeframe)) {
                     applyEntryViewport()
                   }
@@ -6203,6 +6282,10 @@ json.dumps(output)
                   } catch (_) { /* 预期内 */ }
                   installAxisTickPolicy(getCandleYAxis())
                   installCrosshairReadoutPolicy()
+                  // ★ 日线 Y 轴最终调整（同 loadKlineData 分支）
+                  const _dyAxis = getCandleYAxis()
+                  if (_dyAxis?.setAutoCalcTickFlag) _dyAxis.setAutoCalcTickFlag(true)
+                  try { chartRef.value.adjustPaneViewport(false, true, true, true) } catch (_) { /* 预期内 */ }
                 }
               })
             }
@@ -6265,6 +6348,7 @@ json.dumps(output)
 
       const theme = themeConfig.value
       const isDark = chartTheme.value === 'dark'
+      const barColors = candleBarColors(chartColorScheme.value, isDark, theme.borderColor)
 
       chartRef.value.setStyles({
         grid: {
@@ -6300,6 +6384,13 @@ json.dumps(output)
             low: {
               show: true,
               color: theme.axisLabelColor
+            },
+            // v9 的 last 颜色字段是 upColor/downColor/noChangeColor（v8 的顶层
+            // color / lineStyle 在 v9 不再被消费，写旧字段会让标签用库默认国际配色）
+            last: {
+              upColor: barColors.upColor,
+              downColor: barColors.downColor,
+              noChangeColor: barColors.noChangeColor
             }
           },
           tooltip: {
@@ -6309,7 +6400,7 @@ json.dumps(output)
             custom: tooltipCustomForMode()
           },
           // ★ 主题切换也必须跟随当前配色方案（曾写死 cn ⇒ 切主题后 intl 用户蜡烛跳回红涨）
-          bar: candleBarColors(chartColorScheme.value, isDark, theme.borderColor),
+          bar: barColors,
           // 若使用面积图类型，关闭末端点动画可减少实时跳动观感
           area: {
             point: { animation: false, animationDuration: 0 }
@@ -6428,8 +6519,28 @@ json.dumps(output)
         return
       }
 
+      // ★ 指标「全删重建」期间冻结 Y 轴。
+      //   原因：removeIndicator / createIndicator 每一次都会触发库内 adjustPaneViewport，
+      //   而主图指标（FX 等）的 minValue/maxValue 参与 calcRange ⇒ 每挂一个指标就把 Y 轴
+      //   重算并重绘一次。N 个指标 = N 个中间帧，且本函数跑在 safeTimeout(100ms) 之后，
+      //   首帧早已上屏 ⇒ 用户看到「加 FX 后抖一下」。
+      //   这里先记录原 auto 状态并把 autoCalcTickFlag 置 false 冻结，末尾统一恢复并只调一次
+      //   adjustPaneViewport（日线）；分时的锁定态由 ensureMinuteIndicators →
+      //   applyMinutePrevCloseAxis 重新 setRange 收口一次。
+      let _yAxisPrevAuto = null
+      try {
+        const _axis = getCandleYAxis()
+        if (_axis && typeof _axis.getAutoCalcTickFlag === 'function') {
+          _yAxisPrevAuto = _axis.getAutoCalcTickFlag()
+          if (typeof _axis.setAutoCalcTickFlag === 'function') _axis.setAutoCalcTickFlag(false)
+        }
+      } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
+
       indicatorsUpdating.value = true
       try {
+      // 0. 数据格式转换提前：Python 指标预计算必须发生在「移除旧指标之前」，
+      //    否则 await 期间旧指标已被清空，浏览器会绘制出「副图消失 / 主图被拉伸」的中间帧。
+      const internalData = convertToInternalFormat(klineData.value)
       // 1. 移除所有已添加的信号 overlays
       try {
         if (addedSignalOverlayIds.value.length > 0 && chartRef.value) {
@@ -6447,6 +6558,38 @@ json.dumps(output)
           addedSignalOverlayIds.value = []
         }
       } catch (e) {
+      }
+
+      // 1.5 Python 指标预计算（必须在「移除旧指标」之前完成）
+      //     原实现把 await executePythonStrategy（pyodide 约 300ms）放在主循环里，
+      //     而主循环前的第 2 步已经把旧指标全部移除 ⇒ await 期间浏览器会绘制
+      //     「副图消失 / 主图被拉伸」的中间帧，视觉上就是「加上回测指标后抖一下」。
+      //     前置计算后，第 2 步「移除」与主循环「创建」落在同一个同步块里，只绘制一帧。
+      //     注意：此处不做 pyodide 就绪门槛判断，executePythonStrategy 内部会 waitForPyodide
+      //     （原主循环也是等），等待期间旧指标保持可见，视觉更稳定。
+      const _pythonPreResults = new Map()
+      if (!isMinuteLine.value) {
+        for (const _pi of (props.activeIndicators || [])) {
+          if (!_pi || _pi.visible === false || _pi.type !== 'python' || !_pi.code) continue
+          const _pKey = String(_pi.instanceId || _pi.id)
+          try {
+            const _pResult = (_pi.calculate && typeof _pi.calculate === 'function')
+              ? await _pi.calculate(internalData, _pi.params || {})
+              : await executePythonStrategy(_pi.code, internalData, _pi.params || {}, {
+                id: _pi.originalId || _pi.id,
+                user_id: _pi.user_id || _pi.userId,
+                is_encrypted: _pi.is_encrypted || _pi.isEncrypted || 0
+              })
+            _pythonPreResults.set(_pKey, _pResult)
+          } catch (_pErr) {
+            // 保持与原主循环 catch 一致的错误语义：仅「引擎未就绪」标记失败，其余静默
+            const _pMsg = (_pErr && _pErr.message) ? String(_pErr.message) : ''
+            if (_pMsg.includes('Python 引擎未就绪') && !loadingPython.value) {
+              pyodideLoadFailed.value = true
+            }
+            _pythonPreResults.set(_pKey, null)
+          }
+        }
       }
 
       // 2. 移除所有已添加的指标
@@ -6476,8 +6619,6 @@ json.dumps(output)
       // 清理副图关闭按钮
       removeAllPaneCloseButtons()
 
-      // 转换数据格式（KLineChart 需要内部格式用于计算）
-      const internalData = convertToInternalFormat(klineData.value)
       const mainPaneOverlayFigures = []
       const mainPaneOverlayCalcEntries = []
       const mainPaneOverlaySignatureParts = []
@@ -6528,7 +6669,8 @@ json.dumps(output)
             try {
               // 如果有 calculate 函数，使用它（用于 Python 指标）
               if (indicator.calculate && typeof indicator.calculate === 'function') {
-                const result = await indicator.calculate(internalData, indicator.params || {})
+                // 计算已在第 1.5 步前置完成，这里只取缓存（不再 await，避免产生中间帧）
+                const result = _pythonPreResults.get(String(indicator.instanceId || indicator.id))
 
                 // 处理结果中的 plots - 将所有 plots 合并到一个指标中
                 // 注意：signals 不添加到指标中，而是单独处理，避免显示 "n/a"
@@ -6733,19 +6875,8 @@ json.dumps(output)
                   }
                 }
               } else {
-                // 如果没有 calculate 函数，直接使用 executePythonStrategy
-                // 构建解密所需的信息
-                const decryptInfo = {
-                  id: indicator.originalId || indicator.id, // 优先使用原始数据库ID
-                  user_id: indicator.user_id || indicator.userId,
-                  is_encrypted: indicator.is_encrypted || indicator.isEncrypted || 0
-                }
-                const pythonResult = await executePythonStrategy(
-                  indicator.code,
-                  internalData,
-                  indicator.params || {},
-                  decryptInfo // 传递解密信息
-                )
+                // 计算已在第 1.5 步前置完成（含解密信息），这里只取缓存，不再 await
+                const pythonResult = _pythonPreResults.get(String(indicator.instanceId || indicator.id))
 
                 // 处理 plots - 将所有 plots 合并到一个指标中
                 // 注意：signals 不添加到指标中，而是单独处理，避免显示 "n/a"
@@ -7583,8 +7714,47 @@ json.dumps(output)
         }
       }
       } finally {
-        // 分时：指标刷新可能清空主图指标 → 补挂均价线与 Y 轴锚定
+        // 分时：指标刷新可能清空主图指标 → 补挂均价线与 Y 轴锚定（内部 setRange + 一次重排）
         try { ensureMinuteIndicators() } catch (_) { /* 预期内 */ }
+        // ★ 恢复 Y 轴并做唯一一次收口：
+        //   日线：还原原 auto 状态；原本 auto 时重算一次（让新指标的 min/max 正确纳入范围）；
+        //   分时：必须保持锁定（autoCalcTickFlag=false），Y 轴范围已由 applyMinutePrevCloseAxis 设定。
+        try {
+          const axis = getCandleYAxis()
+          if (axis && typeof axis.setAutoCalcTickFlag === 'function' && _yAxisPrevAuto !== null) {
+            axis.setAutoCalcTickFlag(_yAxisPrevAuto)
+            if (_yAxisPrevAuto === true && !isMinuteLine.value &&
+                typeof chartRef.value.adjustPaneViewport === 'function') {
+              chartRef.value.adjustPaneViewport(false, true, true, true)
+            }
+          }
+        } catch (_) { /* 预期内：内部结构变化时静默跳过 */ }
+        // ★ 副图 pane 数量/高度变化会让各 canvas 尺寸随之改变，而 klinecharts 的
+        //   Canvas.update() 在「尺寸发生变化」的这一帧只改尺寸、跳过重绘
+        //   （见 node_modules/klinecharts/dist/index.esm.js Canvas.prototype.update），
+        //   于是会出现「旧内容 + 新尺寸」的闪帧 —— 即观感上的「K 线/蜡烛图下移闪一下」。
+        //   布局定型后主动 resize 一次，让「改尺寸」与「重绘」落在同一个 rAF 帧。
+        try {
+          if (chartRef.value && typeof chartRef.value.resize === 'function') {
+            const _bsBefore = readBarSpace(chartRef.value)
+            const _rightBefore = typeof chartRef.value.getOffsetRightDistance === 'function'
+              ? Number(chartRef.value.getOffsetRightDistance())
+              : null
+            chartRef.value.resize()
+            // resize 内部会 _measurePaneWidth()：Y 轴刻度文字宽度变化（如 10.00 → 128.50）
+            // 会让绘图区宽度随之改变，库按新宽度重算 barSpace ⇒ X 方向平移一点
+            // （观感上的「X 轴小抖动」）。在同一同步块内恢复 barSpace 与右缘空位：
+            // 既保留 resize 带来的 Y 轴布局修正，又保证 X 轴跨度不变，且同帧完成不产生新闪帧。
+            const _bsAfter = readBarSpace(chartRef.value)
+            if (_bsBefore > 0 && _bsAfter > 0 && Math.abs(_bsAfter - _bsBefore) > 0.01) {
+              try { chartRef.value.setBarSpace(_bsBefore) } catch (_) { /* 预期内 */ }
+            }
+            if (_rightBefore != null && Number.isFinite(_rightBefore) &&
+                typeof chartRef.value.setOffsetRightDistance === 'function') {
+              try { chartRef.value.setOffsetRightDistance(_rightBefore) } catch (_) { /* 预期内 */ }
+            }
+          }
+        } catch (_) { /* 预期内：图表销毁时静默跳过 */ }
         indicatorsUpdating.value = false
       }
     }
@@ -7645,6 +7815,8 @@ json.dumps(output)
 
     watch(() => props.activeIndicators, (newVal, oldVal) => {
       // 当指标列表变化时，重新渲染图表
+      // 注: immediate=true 确保首帧也尝试挂一次指标；若 chart 未就绪则被内部门
+      // （chartRef 空 / klineData 空）自然跳过，由下方 klineData.length watch 兜底
       if (chartRef.value && klineData.value.length > 0) {
         // 使用 nextTick 确保 DOM 更新完成后再更新图表
         nextTick(() => {
@@ -7659,7 +7831,22 @@ json.dumps(output)
           closeIndicatorEditor()
         }
       }
-    }, { deep: true })
+    }, { deep: true, immediate: true })
+
+    // —— 后端重启 / 首帧 klineData 从空 → 有 时，补挂 FX/Python 指标 ——
+    // 设计要点：父组件在 readPersistedIdeUiState 里恢复 activeIndicators，但 KlineChart
+    // mount 时 chart 还在等 ResizeObserver + 1000ms safeTimeout；若此时后端重启导致
+    // 首次 klineData 为空，initChart 的 maybeUpdateIndicators 会因为数据源空而静默跳过，
+    // 且 watch activeIndicators 不会再触发第二次（props 没变过）。这里监听 klineData
+    // 从 0→>0，且 chartRef 已就绪时 force 调一次 updateIndicators，把丢失的指标补挂回来。
+    watch(
+      () => (klineData.value || []).length,
+      (newLen, oldLen) => {
+        if (newLen > 0 && (!oldLen || oldLen === 0) && chartRef.value) {
+          maybeUpdateIndicators(true)
+        }
+      }
+    )
 
     // 分时：昨收可能异步到位（父组件传入 / 从 1m 数据推导 / 日线接口兜底），
     // 到位后立即补画 0 轴线并锁定 Y 轴，避免「数据先渲染、昨收后到」导致两者都缺失

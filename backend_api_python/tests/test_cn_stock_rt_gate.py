@@ -357,8 +357,8 @@ class TestKline1dFallback:
                             lambda bars: bars)
         monkeypatch.setattr(CNStockDataSource, "_read_db",
                             lambda self, sym, *a, **k: list(self._env.db_bars))
-        monkeypatch.setattr(CNStockDataSource, "_save_to_db",
-                            lambda self, sym, bars: self._env.saved.append(bars))
+        # 2026-11-02 生产语义变更（用户裁定）：cn_stock 不再写库，_save_to_db 已删除，
+        # 写入全归 cn_stock_putdb ⇒ 原对 _save_to_db 的写入捕获 patch 同步移除。
 
     def _mk_ds(self, *, in_trading, lastbar):
         ds = CNStockDataSource()

@@ -33,7 +33,7 @@ from .common import (
     call_tool, fetch_kline, _today_str, _data_day,
     fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
     fetch_hot_stocks_with_reason, fetch_hot_sectors,
-    scan_dragon_pullback, _get_writer,
+    scan_dragon_pullback, scan_eod_start, scan_lhb, _get_writer,
     compute_ma, compute_macd, compute_rsi, compute_volume_ratio,
 )
 
@@ -584,12 +584,12 @@ def detect_patterns(bars: List[Dict], params: Dict[str, float] = None) -> List[D
 # ═══════════════════════════════════════════════════════════════
 
 # 候选来源清单 —— 全部给，由调用方通过 sources= 自选，不再按策略写死。
-POOL_SOURCES = ("zt", "eod_zt", "dragon", "hot", "search", "recent_zt")
+POOL_SOURCES = ("zt", "eod_zt", "eod_start", "dragon", "hot", "search", "recent_zt", "lhb")
 
 _SOURCE_DEFAULT = {
-    "intraday": ("zt", "dragon", "search"),
-    "eod": ("eod_zt", "search"),
-    "post_market": ("hot", "search", "recent_zt", "dragon"),
+    "intraday": ("zt", "dragon", "search", "lhb"),
+    "eod": ("eod_start", "search", "lhb"),
+    "post_market": ("hot", "search", "recent_zt", "dragon", "lhb"),
 }
 
 # search_stocks 的查询串只是**默认建议**，调用方可用 queries= 完全替换。
@@ -682,7 +682,7 @@ def candidate_pool(
     Returns:
         dict: strategy / date / sources_used / pool_size / main_themes /
             candidates[{code,name,source,reason,continuous_days,zt_time,change_pct,turnover_pct,...}] /
-            continuous_board / dragon_pullback / eod_zt / missing
+            continuous_board / dragon_pullback / eod_zt / eod_start / missing
     """
     # 目标交易日（非交易日回落上一交易日，见 common._data_day）——三池按此日取数
     date = date or _data_day()
@@ -716,7 +716,9 @@ def candidate_pool(
 
     continuous_board: List[Dict] = []
     eod_zt: List[Dict] = []
+    eod_start: List[Dict] = []
     dragon_pullback: List[Dict] = []
+    lhb: List[Dict] = []
 
     # ── 涨停池（连板 / 尾盘封板）──
     # 源失败必须进 missing（2026-10-21）：fetch_zt_pool 已 fail-fast，
@@ -754,6 +756,17 @@ def candidate_pool(
                 except (ValueError, IndexError):
                     pass
 
+    # ── 尾盘启动（行情刚启动 + 尾盘资金流入 + 未涨停，2026-11-02 拍板替换 eod 默认）──
+    if "eod_start" in srcs:
+        try:
+            eod_start = scan_eod_start(date) or []
+        except Exception as e:
+            eod_start = []
+            logger.warning("[MktScreen] 尾盘启动源失败: %s", e)
+            missing.append(f"尾盘启动源失败: {type(e).__name__}: {e}")
+        for s in eod_start:
+            _put(str(s.get("code", "")), dict(s))
+
     # ── 龙回头 ──
     if "dragon" in srcs:
         try:
@@ -770,6 +783,21 @@ def candidate_pool(
                 "pullback_pct": s.get("pullback_pct"),
                 "strength_score": s.get("strength_score"),
                 "change_pct": None, "turnover_pct": s.get("turnover_pct", 0),
+            })
+
+    if "lhb" in srcs:
+        try:
+            lhb = scan_lhb(date) or []
+        except Exception as e:
+            lhb = []
+            logger.warning("[MktScreen] 龙虎榜源失败: %s", e)
+            missing.append(f"龙虎榜源失败: {type(e).__name__}: {e}")
+        for s in lhb:
+            _put(str(s.get("code") or ""), {
+                "code": str(s.get("code") or ""), "name": s.get("name", ""),
+                "source": "龙虎榜", "reason": s.get("reason", ""),
+                "lhb_count": s.get("count"), "lhb_net": s.get("net"),
+                "change_pct": s.get("change_pct"), "turnover_pct": s.get("turnover_pct"),
             })
 
     # ── 当日热点题材股 ──
@@ -837,7 +865,7 @@ def candidate_pool(
                     v = q.get(src)
                     if v not in (None, "", 0):
                         target[dst] = v
-                # 扩展字段（漏斗 objective_preexclude 用）：name / 涨跌停价 / 昨收
+                # 扩展字段：name / 涨跌停价 / 昨收（供可买性判断与涨停识别）
                 nm = q.get("name")
                 if nm not in (None, ""):
                     target["name"] = nm
@@ -878,5 +906,7 @@ def candidate_pool(
         "continuous_board": continuous_board[:20],
         "dragon_pullback": dragon_pullback[:20],
         "eod_zt": eod_zt[:20],
+        "eod_start": eod_start[:20],
+        "lhb": lhb[:20],
         "missing": missing,
     }

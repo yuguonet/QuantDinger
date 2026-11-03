@@ -25,7 +25,6 @@ metadata:
 run_skill("stock-analyzer", {"fn": "analyze", "kwargs": {"code": "600519"}})
 ```
 `deep=true` 追加龙虎榜席位与板块排名（更慢，默认不开）。
-
 返回核心是 `horizons` 五档：
 
 | 周期 | 含义 | 能不能给概率 |
@@ -73,3 +72,24 @@ run_skill("stock-analyzer", {"fn": "analyze", "kwargs": {"code": "600519"}})
 - 把低 `confidence` 当成风险信号 —— 风险看 `risks` 字段
 - 编造数值：工具没给出的数字不允许出现在结论里
 - 用 VWAP / 分时均价当买点 —— 价位只写日线均线与支撑
+
+### 证据地基（`deep_cards`）
+
+```
+run_skill("stock-analyzer", {"fn": "deep_cards", "kwargs": {"codes": "600519,000858"}})
+```
+
+`deep_cards` 是 `analyze` 下面的**证据装配层**（自 market-screener 的 deep 层完整复制，见
+`_deep.py` 顶部说明）：只取事实、不做判断、不给方向，返回两档
+
+- `analyzed_rank[]`：**全部票**的横向可比字段（价位/均线/支撑压力/封板/量比/连板/资金/风险），不截断；
+- `analyzed[]`：满卡，按字符预算截断，**与 rank 同序**（p_up 降序、无预测沉底），故满卡即证据最强的 N 只。
+  分两档：前 3 只**标准卡**（全字段），其后为 `card_tier="compact"` 的**精简卡**
+  （剔 `tech.support.supports/resists`、`flow.recent`、`shape`，这三类在 rank 行或 `inspect_stock` 里可复得）。
+  实测 20 只票、默认预算：满卡 11 张（3 标准 + 8 精简），未分层时只有 9 张。
+
+分工：`analyze` 给结论（方向/触发/证伪/价位），`deep_cards` 给证据。
+两者不互相调用；需要「结论 + 全量证据」时先 `deep_cards` 再逐只 `analyze`。
+
+字段口径与 market-screener 的 `deep_analyze` **完全一致**（同一份复制的 `_REPORT_GUIDE`）；
+两份实现独立演化——改本技能的 `_deep.py` 不会影响选股技能，反之亦然。

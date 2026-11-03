@@ -854,6 +854,42 @@ def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
     if not pools and last_err is not None:
         raise last_err
     return pools
+def scan_lhb(date: str = None, days: int = 10) -> List[Dict]:
+    """近 N 个交易日龙虎榜上榜股（按上榜次数 + 累计净买入聚合；供 candidate_pool 的 lhb 源）。
+
+    Args:
+        date: 截止交易日（含）；空 = 库内最新交易日。
+        days: 回看交易日数，默认 10。
+
+    Returns:
+        [{code,name,source="龙虎榜",reason,count(上榜行数),net(累计净买入元),
+          last_date,change_pct,turnover_pct}, ...]，按 (count, net) 降序。
+    """
+    from app.data_sources.dragon_tiger_local import query_dragon_tiger_last_days
+    rows = query_dragon_tiger_last_days(trade_date=(date or ""), days=days) or []
+    agg: Dict[str, Dict] = {}
+    for r in rows:
+        code = str(r.get("stock_code") or "")
+        if len(code) != 6:
+            continue
+        a = agg.get(code)
+        if a is None:
+            a = agg[code] = {"code": code, "name": r.get("stock_name") or "",
+                             "source": "龙虎榜", "reason": "", "count": 0, "net": 0.0,
+                             "last_date": "", "change_pct": None, "turnover_pct": None}
+        a["count"] += 1
+        a["net"] += float(r.get("net_amount") or 0)
+        td = str(r.get("trade_date") or "")
+        if td > a["last_date"]:
+            a["last_date"] = td
+            a["reason"] = r.get("reason") or a["reason"]
+            a["change_pct"] = r.get("change_percent")
+            a["turnover_pct"] = r.get("turnover_rate")
+    out = list(agg.values())
+    out.sort(key=lambda x: (x["count"], x["net"]), reverse=True)
+    return out
+
+
 def scan_dragon_pullback(date: str) -> List[Dict]:
     recent_pools = fetch_recent_zt_pools(8)
     code_history: Dict[str, List[Dict]] = {}
@@ -989,6 +1025,267 @@ def scan_dragon_pullback(date: str) -> List[Dict]:
 
     candidates.sort(key=lambda x: -x["strength_score"])
     return candidates
+
+
+_EOD_START_1M_SQL = """
+WITH t AS (
+    SELECT symbol, "time", high, close, volume,
+           lag(close) OVER (PARTITION BY symbol ORDER BY "time") AS p_close
+      FROM "kline_1m_{y}"
+     WHERE "time" >= %s::timestamp AND "time" < %s::timestamp + interval '1 day'
+)
+SELECT symbol,
+       (array_agg(close ORDER BY "time" DESC))[1] AS last,
+       max(high) AS day_high,
+       sum(CASE WHEN "time"::time < TIME '14:30' THEN volume ELSE 0 END) AS v_am,
+       sum(CASE WHEN "time"::time >= TIME '14:30' THEN volume ELSE 0 END) AS v_pm,
+       sum(CASE WHEN "time"::time >= TIME '14:30' AND p_close IS NOT NULL THEN
+                 CASE WHEN close > p_close THEN volume
+                      WHEN close < p_close THEN -volume ELSE 0 END
+            ELSE 0 END) AS pm_flow,
+       max("time") AS last_t
+  FROM t GROUP BY symbol
+"""
+
+_EOD_START_PREV_SQL = """
+SELECT DISTINCT ON (symbol) symbol, close AS prev_close, "time" AS prev_t
+  FROM "kline_1m_{y}"
+ WHERE "time" >= %s::timestamp AND "time" <= %s::timestamp
+ ORDER BY symbol, "time" DESC
+"""
+
+_EOD_START_SNAP_SQL = """
+WITH t AS (
+    SELECT symbol, "time", name, last, high, "previousClose" AS pclose, volume,
+           lag(last) OVER (PARTITION BY symbol ORDER BY "time") AS p_last,
+           lag(volume) OVER (PARTITION BY symbol ORDER BY "time") AS p_vol
+      FROM realtime_snapshot
+     WHERE "time" >= %s::timestamp AND "time" < %s::timestamp + interval '1 day'
+)
+SELECT symbol,
+       (array_agg(last ORDER BY "time" DESC))[1] AS last,
+       max(name) AS name,
+       max(high) AS day_high,
+       max(pclose) AS prev_close,
+       coalesce(max(CASE WHEN "time"::time < TIME '14:30' THEN volume END), 0) AS v_am,
+       coalesce(max(volume), 0)
+         - coalesce(max(CASE WHEN "time"::time < TIME '14:30' THEN volume END), 0) AS v_pm,
+       sum(CASE WHEN "time"::time >= TIME '14:30' AND p_vol IS NOT NULL THEN
+                 CASE WHEN last > p_last THEN volume - p_vol
+                      WHEN last < p_last THEN -(volume - p_vol) ELSE 0 END
+            ELSE 0 END) AS pm_flow,
+       max("time") AS last_t
+  FROM t GROUP BY symbol
+"""
+
+
+def _eod_start_qfq(code: str, items: List) -> List:
+    """[(日期, 价格|None), ...] → 前复权价格列表（None 原样透传）。
+
+    kline_1m/kline_1D 库表均存**不复权原始价**（cn_stock._get_kline_intraday 注
+    同一口径）；「未复权不能直接用」（2026-11-02 用户裁定）：与 facade 出口同款
+    `unadj_to_qfq` 收口。prev_close 记前一交易日、当日价记扫描日 —— 除权日两侧
+    因子不同，日涨幅/涨停价由此还原成行情显示口径；同一日内的价同因子，比值不变。
+    """
+    from app.data_sources.provider.adjustment import unadj_to_qfq
+    idx = [i for i, it in enumerate(items) if it[0] and it[1] is not None]
+    bars = [{"time": items[i][0], "open": items[i][1], "high": items[i][1],
+             "low": items[i][1], "close": items[i][1], "volume": 0} for i in idx]
+    conv = unadj_to_qfq(bars, code)
+    out: List = [None] * len(items)
+    for k, i in enumerate(idx):
+        out[i] = conv[k]["close"]
+    return out
+
+
+def _eod_start_facts(date: str) -> List[Dict]:
+    """尾盘启动扫描的分钟事实（每票一行）：现价/最高/上午量/尾盘量/尾盘净流/末拍。
+
+    双路（_helpers._snap_same_t 同源纪律 + 2026-11-02 用户裁定「尾盘用 realtime」）：
+    目标日=当日 → realtime_snapshot **优先**（尾盘 14:30-15:00 kline_1m 尚未盘后
+    回填、且 ETL 15:01~15:30 半截窗口不可用，当日事实只能走实时），snapshot 无
+    数据才落 1m；目标日=历史 → kline_1m 优先（盘后回填的完整日），snapshot 只兜底。
+    当日分子分母同源，无跨源量偏差。
+    1m 路的 prev_close = 上一交易日 1m 末拍（与行情 previousClose 互证为交易所收盘
+    真值），出口经 _eod_start_qfq 转前复权后返回；snapshot 路的 previousClose 本就
+    是交易所除权后昨收、当日价=复权锚点，无需再转。**不用 kline_1D 取前收**：实测
+    2026-11-02 全市场 827 只 1D 前收与行情/1m 不一致，成因是 1D 行残写（非复权差 ——
+    争议日复权因子恒等、300640/000702 无除权、偏差双向），1m+snapshot+行情三方互证
+    为真源；300640 案例 1D 前收 5.16 → 涨幅算成 4.65%，真实 5.02 → 7.57%。
+    snapshot 路自带 previousClose / name。量=股；pm_flow=Σ±股×价格方向（量价方向
+    口径，与 fund_flow 本地派生同构，非东财主力口径）。
+    """
+    def _run(pool, sql, args):
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, args)
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+            finally:
+                cur.close()
+
+    from app.utils.db_market import get_market_db_manager
+    pool = get_market_db_manager()._get_pool("CNStock")
+    year = date[:4]
+
+    def _from_snap() -> Dict[str, Dict]:
+        out: Dict[str, Dict] = {}
+        for r in _run(pool, _EOD_START_SNAP_SQL,
+                      (date + " 00:00:00", date + " 00:00:00")):
+            code = str(r.get("symbol") or "")
+            if not code:
+                continue
+            out[code] = {
+                "code": code, "name": str(r.get("name") or ""),
+                "prev_close": r.get("prev_close"), "last": r.get("last"),
+                "day_high": r.get("day_high"), "v_am": float(r.get("v_am") or 0),
+                "v_pm": float(r.get("v_pm") or 0), "pm_flow": float(r.get("pm_flow") or 0),
+                "last_t": r.get("last_t"),
+            }
+        return out
+
+    def _from_1m() -> Dict[str, Dict]:
+        out: Dict[str, Dict] = {}
+        rows = _run(pool, _EOD_START_1M_SQL.format(y=year),
+                    (date + " 00:00:00", date + " 00:00:00"))
+        if not rows:
+            return out
+        prev: Dict[str, Any] = {}
+        pt = _run(pool, 'SELECT max("time") AS t FROM "kline_1m_{y}" '
+                        'WHERE "time" < %s::timestamp'.format(y=year),
+                  (date + " 00:00:00",))
+        if pt and pt[0].get("t"):
+            prev_t = pt[0]["t"]
+            prev = {r["symbol"]: (r["prev_close"], r.get("prev_t")) for r in _run(
+                pool, _EOD_START_PREV_SQL.format(y=year),
+                (prev_t - timedelta(days=1), prev_t))}
+        for r in rows:
+            code = str(r.get("symbol") or "")
+            if not code:
+                continue
+            pclose, pt_ = prev.get(code, (None, None))
+            prev_date = str(pt_)[:10] if pt_ else None
+            q_prev, q_last, q_high = _eod_start_qfq(
+                code, [(prev_date, pclose), (date, r.get("last")),
+                       (date, r.get("day_high"))])
+            out[code] = {
+                "code": code, "name": "",
+                "prev_close": q_prev, "last": q_last,
+                "day_high": q_high, "v_am": float(r.get("v_am") or 0),
+                "v_pm": float(r.get("v_pm") or 0), "pm_flow": float(r.get("pm_flow") or 0),
+                "last_t": r.get("last_t"),
+            }
+        return out
+
+    facts = (_from_snap() or _from_1m()) if date == _data_day() \
+        else (_from_1m() or _from_snap())
+    return list(facts.values())
+
+
+def _eod_start_prior8(code: str, date: str) -> Optional[float]:
+    """前 8 个交易日（不含当日）累计涨跌%（qfq）；前史不足 9 根返回 None。
+
+    不足 9 根同时是 N/C 新股（上市 ≤5 日）的天然排除 —— 不依赖名称识别新股。
+    """
+    bars = fetch_kline(code, days=60)
+    prior = [b for b in bars if (b.get("time") or "") < date and b.get("close")]
+    if len(prior) < 9:
+        return None
+    c0, c1 = float(prior[-9]["close"]), float(prior[-1]["close"])
+    if c0 <= 0:
+        return None
+    return (c1 / c0 - 1) * 100
+
+
+def scan_eod_start(date: str = None) -> List[Dict]:
+    """尾盘启动扫描：行情刚启动 + 尾盘资金流入 + 未涨停（eod 候选源 eod_start）。
+
+    语义（2026-11-02 用户拍板，参照 605333@2026-10-23 / 002487@2026-09-10）：
+    找尾盘明显资金流入、当日涨幅适中但未涨停、启动前处于横盘/缓跌的票 —— 买在
+    启动日尾盘吃次日延续（参照股 3 日 +26.5% / +17.6%）。
+
+    核心 5 条判据（阈值 env 可调 QD_EOD_START_*）：
+      1. 涨幅带：当日涨幅 ∈ [RET_MIN, RET_MAX]%（默认 2~8，现价口径）
+      2. 未触板：当日最高价 < 涨停价（触过板不算「未涨停」）
+      3. 刚启动：前 8 个交易日（不含当日）累计 ∈ [PRIOR8_MIN, PRIOR8_MAX]%
+         （默认 -15~+6，横盘/缓跌底部区；前史不足自动跳过，兼排 N/C 新股）
+      4. 尾盘放量：尾盘(≥14:30)每分钟量 ÷ 上午每分钟量 ≥ PM_RATE_MIN(1.05)
+         且 ≥ PM_MED_MULT(1.15) × 当日截面中位强度。满日口径「尾盘量占比 ≥13%
+         且 ≥1.15×截面中位」即此强度比（share13% ⇔ 强度 1.05，30/210 时长归一）；
+         用强度比是为了盘中任意扫描时点可评 —— 14:45 时 1.15× 强度的票 share
+         仅 ~7.6%，固定 share 阈值在 14:30-15:00 窗口内永远不触发
+      5. 尾盘净流：尾盘量价方向净流 > PM_FLOW_MIN(0)
+
+    Returns:
+        list[dict]: [{code,name,source,reason,change_pct,pm_vol_share_pct,
+            pm_rate_ratio,pm_flow,prior8d_ret,...}]，无命中 []。取数失败向上抛
+            （fail-fast，调用方记 missing，不把源故障当「无候选」）。
+    """
+    def _f(key: str, dflt: float) -> float:
+        try:
+            return float(os.getenv("QD_EOD_START_" + key, "") or dflt)
+        except ValueError:
+            return dflt
+
+    ret_min, ret_max = _f("RET_MIN", 2.0), _f("RET_MAX", 8.0)
+    p8_min, p8_max = _f("PRIOR8_MIN", -15.0), _f("PRIOR8_MAX", 6.0)
+    rate_min, med_mult = _f("PM_RATE_MIN", 1.05), _f("PM_MED_MULT", 1.15)
+    flow_min = _f("PM_FLOW_MIN", 0.0)
+
+    date = date or _data_day()
+    facts = _eod_start_facts(date)
+    if not facts:
+        return []
+
+    day_1430 = datetime.strptime(date, "%Y-%m-%d").replace(hour=14, minute=30)
+    horizon = max((f["last_t"] for f in facts if f.get("last_t")), default=day_1430)
+    t_pm = max(1.0, (horizon - day_1430).total_seconds() / 60.0)
+    t_am = 210.0
+    for f in facts:
+        f["pm_rate"] = ((f["v_pm"] / t_pm) / (f["v_am"] / t_am)
+                        if f["v_am"] > 0 and f["v_pm"] >= 0 else None)
+    rates = sorted(f["pm_rate"] for f in facts
+                   if f.get("pm_rate") is not None and f["v_am"] + f["v_pm"] > 0)
+    median_rate = rates[len(rates) // 2] if rates else None
+
+    out: List[Dict] = []
+    for f in facts:
+        prev_close, last = f.get("prev_close"), f.get("last")
+        if not prev_close or not last:
+            continue
+        day_ret = (float(last) / float(prev_close) - 1) * 100
+        if not (ret_min <= day_ret <= ret_max):
+            continue
+        lim_pct = get_limit_pct(f["code"], f.get("name") or "")
+        if lim_pct <= 0:
+            continue
+        limit_px = round(float(prev_close) * (1 + lim_pct / 100), 2)
+        if not f.get("day_high") or float(f["day_high"]) >= limit_px:
+            continue
+        rate = f.get("pm_rate")
+        if rate is None or median_rate is None:
+            continue
+        if rate < rate_min or rate < med_mult * median_rate:
+            continue
+        if f["pm_flow"] <= flow_min:
+            continue
+        p8 = _eod_start_prior8(f["code"], date)
+        if p8 is None or not (p8_min <= p8 <= p8_max):
+            continue
+        v_day = f["v_am"] + f["v_pm"]
+        out.append({
+            "code": f["code"], "name": f.get("name") or "", "source": "尾盘启动",
+            "reason": ("尾盘启动 涨%.1f%% 尾盘量强%.2f倍 净流%.0f万 启动前8日%+.1f%%"
+                       % (day_ret, rate, f["pm_flow"] / 1e4, p8)),
+            "change_pct": round(day_ret, 2), "turnover_pct": None,
+            "pm_vol_share_pct": round(f["v_pm"] / v_day * 100, 1) if v_day > 0 else None,
+            "pm_rate_ratio": round(rate, 2),
+            "pm_flow": round(f["pm_flow"], 1),
+            "prior8d_ret": round(p8, 2),
+        })
+    out.sort(key=lambda x: -(x["pm_rate_ratio"] or 0))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════

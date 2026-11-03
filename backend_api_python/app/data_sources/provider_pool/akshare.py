@@ -34,6 +34,29 @@ def _ss(v, default="") -> str:
         return default
     return str(v).strip() if v else default
 
+
+def _norm_hhmmss(v) -> str:
+    """封板/炸板时间归一为 HH:MM:SS（库表 zt_time / break_time 基准格式）。
+
+    akshare `首次封板时间` 值为 '092500'（HHMMSS 纯数字串，str 型；pandas
+    部分版本会丢前导零成 int 92500），EM 侧是 '09:25:00' 或
+    '2026-10-30 09:25:00'。下游按冒号切（_facts eod_zt 判 14:30+ 封板），
+    无冒号值会被静默跳过 —— 2026-11-02 eod_zt 恒空的第二根因（第一根因是
+    字段名 `涨停时间` 对不上 `首次封板时间`），故必须在归一层统一成带冒号格式。
+    """
+    s = _ss(v)
+    if not s:
+        return ""
+    if ":" in s:
+        return s.split(" ")[-1][:8]
+    d = "".join(ch for ch in s if ch.isdigit())
+    if len(d) == 4:                     # HHMM
+        return "%s:%s:00" % (d[:2], d[2:4])
+    if len(d) >= 5:                     # HHMMSS / 丢前导零的 int / 更长时间戳取末 6 位
+        d = d[-6:].zfill(6)
+        return "%s:%s:%s" % (d[:2], d[2:4], d[4:6])
+    return ""
+
 def _normalize_dragon_tiger(raw: Dict[str, Any], source: str = "") -> Dict[str, Any]:
     """标准化一条龙虎榜记录（内部用）
     
@@ -109,7 +132,7 @@ def _normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = 
             "price": _sf(raw.get("最新价", raw.get("close", raw.get("price")))),
             "change_percent": _sf(raw.get("涨跌幅", raw.get("pct_chg", raw.get("change_percent")))),
             "continuous_zt_days": _si(raw.get("连板数", raw.get("zt_days", raw.get("continuous_zt_days", 1)))),
-            "zt_time": _ss(raw.get("涨停时间", raw.get("zt_time"))),
+            "zt_time": _norm_hhmmss(raw.get("首次封板时间", raw.get("涨停时间", raw.get("zt_time")))),
             "seal_amount": _sf(raw.get("封板资金", raw.get("seal_amount"))),
             "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
             "volume": _sf(raw.get("成交额", raw.get("amount", raw.get("volume")))),
@@ -125,7 +148,7 @@ def _normalize_zt_pool(raw: Dict[str, Any], source: str = "", trade_date: str = 
         "price": _sf(raw.get("price", raw.get("CLOSE_PRICE"))),
         "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
         "continuous_zt_days": _si(raw.get("continuous_zt_days", raw.get("CONTINUOUS_LIMIT_DAYS", raw.get("ZT_DAYS", 1)))),
-        "zt_time": _ss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
+        "zt_time": _norm_hhmmss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
         "seal_amount": _sf(raw.get("seal_amount", raw.get("LIMIT_ORDER_AMT"))),
         "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
         "volume": _sf(raw.get("volume", raw.get("VOLUME"))),
@@ -168,8 +191,8 @@ def _normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: s
             "trade_date": trade_date,
             "price": _sf(raw.get("最新价", raw.get("price"))),
             "change_percent": _sf(raw.get("涨跌幅", raw.get("change_percent"))),
-            "zt_time": _ss(raw.get("涨停时间", raw.get("zt_time"))),
-            "break_time": _ss(raw.get("炸板时间", raw.get("break_time"))),
+            "zt_time": _norm_hhmmss(raw.get("首次封板时间", raw.get("涨停时间", raw.get("zt_time")))),
+            "break_time": _norm_hhmmss(raw.get("炸板时间", raw.get("break_time"))),
             "turnover_rate": _sf(raw.get("换手率", raw.get("turnover_rate"))),
             "amount": _sf(raw.get("成交额", raw.get("amount"))),
         }
@@ -179,8 +202,8 @@ def _normalize_broken_board(raw: Dict[str, Any], source: str = "", trade_date: s
         "trade_date": _ss(raw.get("trade_date", trade_date)),
         "price": _sf(raw.get("price", raw.get("CLOSE_PRICE"))),
         "change_percent": _sf(raw.get("change_percent", raw.get("CHANGE_RATE"))),
-        "zt_time": _ss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
-        "break_time": _ss(raw.get("break_time", raw.get("LAST_ZDT_TIME"))),
+        "zt_time": _norm_hhmmss(raw.get("zt_time", raw.get("FIRST_ZDT_TIME"))),
+        "break_time": _norm_hhmmss(raw.get("break_time", raw.get("LAST_ZDT_TIME"))),
         "turnover_rate": _sf(raw.get("turnover_rate", raw.get("TURNOVERRATE"))),
         "amount": _sf(raw.get("amount", raw.get("TURNOVER"))),
     }

@@ -336,6 +336,54 @@ def query_dragon_tiger_latest(limit: int = 500) -> List[Dict[str, Any]]:
         return []
 
 
+def query_dragon_tiger_last_days(trade_date: str = "", days: int = 10,
+                                 limit: int = 8000) -> List[Dict[str, Any]]:
+    """近 N 个交易日龙虎榜（终点 = trade_date；空=库内最新交易日）。
+
+    供 market-screener 的「近 10 日龙虎榜」候选源使用。按库内 DISTINCT trade_date 回看
+    N 个交易日（非自然日），一次查询取回区间全量行，聚合由调用方负责。
+
+    Args:
+        trade_date: 截止交易日（含）；空 = 库内最新交易日。
+        days: 回看交易日数（DISTINCT trade_date）。
+        limit: 返回行数上限（10 日 × ~80 只 ≈ 800，留余量）。
+
+    Returns:
+        龙虎榜记录列表（字段同 query_dragon_tiger）；失败 []。
+    """
+    params: List[Any] = []
+    cond = ""
+    if trade_date:
+        cond = "WHERE trade_date <= %s"
+        params.append(trade_date)
+    sql = f"""
+        SELECT trade_date, stock_code, stock_name, reason,
+               buy_amount, sell_amount, net_amount,
+               change_percent, close_price, turnover_rate, amount,
+               buy_seat_count, sell_seat_count
+        FROM cnd_dragon_tiger_list
+        WHERE trade_date IN (
+            SELECT DISTINCT trade_date FROM cnd_dragon_tiger_list {cond}
+            ORDER BY trade_date DESC LIMIT %s
+        )
+        ORDER BY trade_date DESC, net_amount DESC
+        LIMIT %s
+    """
+    params.extend([max(1, int(days)), max(1, int(limit))])
+    try:
+        pool = _get_cnstock_pool()
+        with pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.warning("[dragon_tiger_store] 查询近N日龙虎榜失败: %s", e)
+        return []
+
+
 def query_hot_rank(trade_date: str = "", stock_code: str = "") -> List[Dict[str, Any]]:
     """查询热榜数据
 

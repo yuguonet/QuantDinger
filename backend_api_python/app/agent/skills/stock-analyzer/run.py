@@ -559,3 +559,30 @@ def analyze(code: str, deep: bool = False) -> dict:
         "basis_note": "confidence = 档位上限 × 证据完整度 × 信号强度；仅 T+1 的 p_up 经标定，其余档位只给方向不给概率。",
     })
     return AnalyzerResult(out)
+
+def deep_cards(codes: str, limit: int = 8, with_flow: bool = True,
+               with_patterns: bool = True, with_mtf: bool = False,
+               budget: int = None) -> dict:
+    """deep 层地基：批量装配全部证据维度（rank 行 + 满卡），按 p_up 降序返回。
+
+    与 `analyze` 的分工：`analyze` 是**单票结论生成器**（给方向/触发/证伪/价位）；
+    本函数是它下面的**证据地基**——只取事实、不做判断、不给方向，供上层自行加权。
+    逻辑逐字来自 market-screener 的 deep 层（见 `_deep.py` 的复制说明）。
+
+    Args:
+        codes: 逗号分隔代码，如 "600519,000858"
+        limit: 最多几只（默认 8）
+        with_flow: 是否取资金流（口径=量价方向净额，非主力）
+        with_patterns: 是否识别 K 线形态
+        with_mtf: 是否取多周期结构（需分钟源，更慢）
+        budget: 整份返回值的字符预算；缺省 QD_SCREENER_DEEP_BUDGET
+
+    Returns:
+        dict: analyzed_rank[]（全部票的横向可比字段，不截断）/
+            analyzed[]（满卡，按预算截断）/ report_guide / strategy / missing / errors。
+            两档同序（p_up 降序、无预测沉底），故满卡即证据最强的 N 只。
+    """
+    from ._deep import deep_analyze as _deep_analyze
+    return _deep_analyze(codes, limit=limit, with_flow=with_flow,
+                         with_patterns=with_patterns, with_mtf=with_mtf,
+                         budget=budget)

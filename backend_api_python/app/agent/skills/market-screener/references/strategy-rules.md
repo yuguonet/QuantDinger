@@ -30,27 +30,29 @@
 | --- | --- | --- |
 | `zt` | 连板股 | 当日涨停池里 `continuous_zt_days >= 2`【定义】 |
 | `eod_zt` | 尾盘封板 | 涨停时间 `14:30` 及以后【定义】 |
+| `eod_start` | 尾盘启动 | 行情刚启动 + 尾盘资金流入 + 未涨停：涨幅 2~8% ∧ 未触板 ∧ 前 8 日累计 -15%~+6% ∧ 尾盘量强度 ≥1.05 且 ≥1.15×截面中位 ∧ 尾盘量价净流>0（`scan_eod_start()`，阈值 `QD_EOD_START_*`）【定义】 |
 | `dragon` | 龙回头 | `scan_dragon_pullback()`（涨停后回调企稳） |
 | `hot` | 当日热点题材股 | 东方财富热榜，带涨停原因 |
 | `search` | 条件搜索 | `search_stocks(query=...)`，`queries` 可完全自定 |
 | `recent_zt` | 近期涨停 | 靠 `search` 的查询串表达（如「近10日涨停 换手率大于2% 非ST」） |
+| `lhb` | 近10日龙虎榜 | `scan_lhb()`：近 10 交易日的 `cnd_dragon_tiger_list` 上榜股，按「上榜次数 + 累计净买入」聚合（`days` 可调）【定义】 |
 
 按时段的默认来源与查询（【定义】）：
 
 | 时段 | 默认 sources | 默认 queries 末尾的场景词 |
 | --- | --- | --- |
-| intraday (09:30-14:29) | zt, dragon, search | 放量突破 站上20日均线 / 缩量企稳 底部放量 |
-| eod (14:30-15:00) | eod_zt, search | 涨幅3%到8% 换手率大于3% 非ST |
-| post_market (15:00+) | hot, search, recent_zt, dragon | 涨幅1%到8% 换手率大于2% 非ST / 近10日涨停 换手率大于2% 非ST |
+| intraday (09:30-14:29) | zt, dragon, search, lhb | 放量突破 站上20日均线 / 缩量企稳 底部放量 |
+| eod (14:30-15:00) | eod_start, search, lhb | 涨幅3%到8% 换手率大于3% 非ST |
+| post_market (15:00+) | hot, search, recent_zt, dragon, lhb | 涨幅1%到8% 换手率大于2% 非ST / 近10日涨停 换手率大于2% 非ST |
 
 查询串只是默认建议，`queries=` 可完全替换；默认列表另含资金流/板块/连板/涨停/情绪等通用扩词。
 
 ## 三、候选池默认行为
 
 > **范围**：本节说的是 `pre_screen` / `profile_candidates` 层的默认行为。
-> `run()` 一键路径另有**基线 + 加法两层**：基线按池序规则选 ≤25 只**恒入 deep**；
-> 加法层（p_up 硬闸 + 排名截断 + 回捞名额）只在基线之外做改进、填充至 45，
-> 淘汰计数见 `funnel.excluded_score`——与本节「不取舍」不矛盾。
+> `run()` 一键路径另有**保底轨**：整个候选池画像后按「连板高度降序 → 当日收盘位置更低者先」
+> 排序，剔除近 3 日一字涨停与位置透支 hot 后顺延补位，取前 25 只**恒入 deep**；淘汰计数见 `funnel.baseline_hard`
+> ——那是客观障碍计数，与本节「不取舍」不矛盾。
 
 | 项目 | 默认行为（pre_screen / profile 层） |
 | --- | --- |

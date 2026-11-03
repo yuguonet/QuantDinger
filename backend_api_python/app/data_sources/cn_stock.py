@@ -749,11 +749,15 @@ class CNStockDataSource(BaseDataSource):
         logger.debug(f"[kline_1d] {symbol} 远端返回 {len(source)} 条, "
                       f"source_last_ts={source_last_ts}")
 
-        # ── 步骤 5：合并 DB + 远端，归一化去重，远端覆盖 DB，写 DB ──
+        # ── 步骤 5：合并 DB + 远端，归一化去重（只读不写）──
+        # 2026-11-02 用户裁定：cn_stock.py 不写库，写入全归 cn_stock_putdb（run_1d）。
+        # 原 `_save_to_db` 回写是 kline_1D 残写根因：盘中慢路径取到的"今日bar"是
+        # 半截快照（close=取数当时现价），落库后被 putdb._missing_symbols（只拉
+        # 目标日尚无 bar 的票）视为已存在永远跳过 ⇒ 半截价固化成"收盘价"
+        # （实测 827+ 只前收被污染，另有除权后复权价从部分源混入）。
         if source:
             db_bars = self._merge_bars(db_bars, source)
             db_bars = _normalize_1d_bars(db_bars)
-            self._save_to_db(symbol, db_bars)
             logger.debug(f"[kline_1d] {symbol} 合并后 {len(db_bars)} 条")
 
         # ── 步骤 6：三分支构造 out_kline ──
@@ -1381,30 +1385,6 @@ class CNStockDataSource(BaseDataSource):
             return []
 
         return _rows_to_bars(rows)
-
-    def _save_to_db(self, symbol: str, bars: List[Dict[str, Any]]) -> None:
-        """写入 1D DB（upsert 覆盖同时间 bar）。"""
-        if not bars:
-            return
-        try:
-            from app.utils.db_market import get_market_kline_writer, normalize_1d_time
-            writer = get_market_kline_writer()
-            db_symbol = strip_market_prefix(symbol) if symbol else symbol
-            _beijing = ZoneInfo("Asia/Shanghai")
-            db_bars = []
-            for b in bars:
-                bar = dict(b)
-                t = bar.get("time")
-                if isinstance(t, (int, float)):
-                    # Convert epoch to naive Beijing time for DB storage
-                    bar["time"] = datetime.fromtimestamp(t, tz=_beijing).replace(tzinfo=None)
-                # 写库统一为 15:00:00（1D 收盘时间），与 kline_1D 其它写入路径一致
-                bar["time"] = normalize_1d_time(bar["time"])
-                db_bars.append(bar)
-            writer.upsert("CNStock", db_symbol, "1D", db_bars)
-            logger.debug(f"[DB写入] {db_symbol}/1D 写入 {len(db_bars)} 条")
-        except Exception as e:
-            logger.debug(f"[DB写入] {symbol}/1D 失败: {e}")
 
     def _fetch_remote_1d(self, symbol: str, count: int) -> List[Dict[str, Any]]:
         """从远端拉取 1D K 线，归一化 time 为 int 时间戳。"""
