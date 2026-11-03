@@ -13,13 +13,16 @@
   2) 删除行内注释（本包铁律：app/agent 下不写注释），docstring 全部保留。
 逻辑、字段、阈值、预算链均未改动；market-screener 侧一行未动。
 
-【本副本唯一的功能性差异：分层配卡（2026-11-03）】
-原 `_full_card_quota` 只按「整张标准卡装得下就装」放卡，装不下即停。本副本改为
-`_compact_card` + `_card_plan`：先给前 3 张标准卡，余量用**精简卡**（剔除
-`tech.support.supports/resists`、`flow.recent`、`shape` 明细，这三类在 rank 行或工具里可复得）
-继续装，并取「3 标准 + 精简」与「全精简」两种排法中张数更多者。
+【本副本的功能性差异（2 处，均不影响字段契约）】
+1) 分层配卡（2026-11-03）：原 `_full_card_quota` 只按「整张标准卡装得下就装」放卡，
+装不下即停。本副本改为 `_compact_card` + `_card_plan`：先给前 3 张标准卡，余量用
+**精简卡**（剔除 `tech.support.supports/resists`、`flow.recent`、`shape` 明细，这三类在
+rank 行或工具里可复得）继续装，并取「3 标准 + 精简」与「全精简」两种排法中张数更多者。
 实测（20 只票、默认预算）：满卡 9 张 → 11 张（前 3 张标准 + 其后 8 张精简）；
 单卡 2.7k → 2.0k 字符。全精简可到 13 张，但会牺牲头部票明细，故不采用。
+2) 日线暂存 `_BARS_STASH`（2026-11-03）：`_one` 取到的日线在进程内暂存 60s，
+`take_bars(code)` 取回——`analyze()` 需要同一份日线做价位推演，不暂存就要对同一票
+拉两遍日线。暂存不进返回值、不占预算、不影响任何字段。
 
 【关键点】
   · 预算链：`_deep_budget()` < observation 闸 45000 < 预览闸 47000。超预算时 `_full_card_quota`
@@ -36,11 +39,32 @@
 """
 import json
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ._deps import (SkillResult, fetch_kline, select_strategy, resolve_names,
                     tech_summary, build_report, cross_verdict,
                     _detect_patterns, _market_state, _multitimeframe)
+
+#: 日线暂存（code → {t, bars}）：deep 取到的 bars 留 60s 供 analyze 复用，消除重复拉取
+_BARS_STASH_TTL_S = 60.0
+_BARS_STASH: dict = {}
+_BARS_STASH_LOCK = threading.Lock()
+
+
+def take_bars(code: str):
+    """取回本进程最近一次 deep 取到的日线（60s TTL）；无暂存/过期返回 None。"""
+    with _BARS_STASH_LOCK:
+        one = _BARS_STASH.get(str(code or "").strip())
+        if one and time.time() - one["t"] < _BARS_STASH_TTL_S:
+            return one["bars"]
+    return None
+
+
+def _stash_bars(code: str, bars) -> None:
+    with _BARS_STASH_LOCK:
+        _BARS_STASH[str(code or "").strip()] = {"t": time.time(), "bars": bars}
 
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
@@ -537,6 +561,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         except Exception as e:
             miss.append(f"日线异常:{type(e).__name__}: {e}")
             bars = []
+        _stash_bars(code, bars)
         if not bars:
             miss.append("日线缺失")
             row["tech"] = None
