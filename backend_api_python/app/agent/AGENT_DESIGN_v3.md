@@ -3615,3 +3615,17 @@ re-export 同一实例（`_TOOL_MODULE_IMPORT_FAILURES`）保持。
 - `create_alert_job` 只有单元测试，**未跑过真实盘中告警**（需下一交易日快照数据端到端验证）。
 - 告警推送通道默认 browser（SSE 进程内队列，多 worker 时前端收不全，`cron_worker.py:24` 自述）；
   email/telegram 等外网通道需用户在通知配置里启用后才真正可达。
+
+---
+
+## 交易日期限统一（2026-11-04）
+
+> 来源：用户确认“都应该是交易日计算”；实现记录由 Copilot 完成。
+
+- Claim 到期日与 trace evaluator 成熟日统一使用 `trading_calendar.nth_trading_day`；
+  持有期计数从执行日之后开始，周末与休市日不计入。
+- 日历不可用或覆盖不足时，不再用自然日比例估算成熟/到期日。Evaluator 暂缓且不
+  增加行情评估失败计数；claim 到期计算显式报 `CalendarUnavailable`，由追责旁路记录。
+- 若行情结果未提供实际退出日，trace 验证记录使用同一交易日成熟日期，而非自然日加法。
+- 针对性回归：`tests/test_v57_trading_day_horizons.py` 覆盖周末、节假日、覆盖不足、
+  日历不可用及 claim/evaluator 日期一致性。

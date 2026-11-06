@@ -3467,14 +3467,24 @@ json.dumps(output)
      */
     let _tfSceneMap = {}
 
-    // 会话恢复: 从 uiPrefs 读取上次持久化的周期现场。
-    // 现场按周期记 (barSpace+右缘to), 不区分股票/不区分市场 —— 换股后照常恢复该周期视野
+    // 会话恢复: 从 uiPrefs 读取上次持久化的 symbol+周期现场。
+    // ★ key 口径: `${symbol}|${tf}` —— 每只股票每个周期独立保存；
+    //   旧版本只按 tf 分桶的历史数据会被自然淘汰（换 symbol 后恢复不命中，回落到进入态）。
     try {
       const _savedScenes = readPrefs('kline-scene')
       if (_savedScenes && _savedScenes.scenes && typeof _savedScenes.scenes === 'object') {
         _tfSceneMap = { ..._savedScenes.scenes }
       }
     } catch (_) { /* 损坏数据静默忽略 */ }
+
+    /** 现场桶 key: `${symbol}|${tf}` —— 每只股票每个周期独立保存自己的 barSpace/右缘锚。
+     *  sym 不传时用 props.symbol（默认）；watch symbol 切换时需显式传 oldSym，
+     *  因为 props.symbol 此时已更新但图表上仍是旧 symbol 的数据，直接用 props.symbol 会把
+     *  旧视口写错到新 symbol 的桶里。 */
+    const sceneKey = (tf, sym) => {
+      const s = (sym != null ? sym : props.symbol || '').trim()
+      return s ? `${s}|${tf}` : tf
+    }
 
     /** 换股后下一次数据加载: 右缘滚到最新K线 (保留缩放跨度, 现场随后自动归档为最新视图) */
     let _goLatestOnNextLoad = false
@@ -3517,7 +3527,8 @@ json.dumps(output)
      */
     const restoreChartScene = (tf) => {
       const chart = chartRef.value
-      const scene = tf ? _tfSceneMap[tf] : null
+      // ★ 按 symbol+tf 分桶：同周期不同股票的视野互相独立
+      const scene = tf ? _tfSceneMap[sceneKey(tf)] : null
       if (!chart || !scene || !(scene.barSpace > 0) || scene.savedTo == null) return false
       try {
         const list = typeof chart.getDataList === 'function' ? chart.getDataList() : (klineData.value || [])
@@ -3574,7 +3585,8 @@ json.dumps(output)
         if (Date.now() < _sceneSuppressUntil) return // 程序化定位的余波, 非用户拖拽
         const scene = captureChartScene()
         if (scene) {
-          _tfSceneMap[props.timeframe] = scene
+          // ★ 按 symbol+tf 分桶写入 —— 换股后新 symbol 不会覆盖旧 symbol 的视野
+          _tfSceneMap[sceneKey(props.timeframe)] = scene
           persistTfScenes()
         }
       }, 500)
@@ -7806,11 +7818,27 @@ json.dumps(output)
         // 分时→蜡烛: oldTf='分时' → 返回 null, 不产生分时现场写入任何槽位
         const scene = captureChartScene(oldTf)
         if (scene) {
-          _tfSceneMap[oldTf] = scene
+          // ★ 按 symbol+旧tf 分桶写入 —— 同 symbol 切周期，旧周期的视野保留在该 symbol 的桶里
+          _tfSceneMap[sceneKey(oldTf)] = scene
           persistTfScenes()
         }
       }
       debouncedLoad()
+    })
+
+    // 切股：离开前把「旧 symbol + 当前 timeframe」的现场归档 ——
+    // 这是 watch timeframe 没覆盖的缺口（切股不触发 timeframe watch）。
+    // ★ 必须显式传 oldSym：watch symbol 触发时 props.symbol 已更新为新值，
+    //  但图表上仍是旧 symbol 的数据（debouncedLoad 还没执行），直接用 props.symbol 会把
+    //  旧视口写错到新 symbol 的桶里。
+    watch(() => props.symbol, (newSym, oldSym) => {
+      if (oldSym && oldSym !== newSym) {
+        const scene = captureChartScene()
+        if (scene) {
+          _tfSceneMap[sceneKey(props.timeframe, oldSym)] = scene
+          persistTfScenes()
+        }
+      }
     })
 
     watch(() => props.activeIndicators, (newVal, oldVal) => {
@@ -8683,7 +8711,7 @@ json.dumps(output)
       // 清理周期现场归档定时器 (卸载前把未flush的现场立即落盘)
       if (_sceneCaptureTimer) { clearTimeout(_sceneCaptureTimer); _sceneCaptureTimer = null }
       const _lastScene = captureChartScene()
-      if (_lastScene) { _tfSceneMap[props.timeframe] = _lastScene; persistTfScenes() }
+      if (_lastScene) { _tfSceneMap[sceneKey(props.timeframe)] = _lastScene; persistTfScenes() }
       // 清理等待容器尺寸的 ResizeObserver（冗余修复引入）
       _observers.forEach(ro => ro.disconnect())
       _observers.clear()

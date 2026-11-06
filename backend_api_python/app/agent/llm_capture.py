@@ -18,7 +18,7 @@
 
 【两级观测】
   · Level 1（逻辑级）：patch `OpenAIChatModel.query` —— 每次 LLM 调用的
-    messages 深拷贝 + 总耗时 + 结果/异常 + 调用方归因 + 输出内容。
+    messages 深拷贝 + 总耗时 + TokenStats 差分 + 结果/异常 + 调用方归因 + 输出内容。
   · Level 2（HTTP 尝试级）：patch openai SDK `Completions.create` ——
     tenacity 每次重试的计时 + 异常 + **服务端 usage 真值**（对拍计费）。
   两級用 threading.local 的 seq 关联：Level1 进入时压栈，Level2 直接读栈顶，
@@ -64,6 +64,35 @@ _TLS = threading.local()
 
 # 单条输出内容截断（防超大正文把 JSONL 撑爆；默认 8000 字符 ≈ 正文全量）
 _MAX_CHARS = int(os.getenv("QD_LLM_CAPTURE_MAXCHARS", "8000") or 8000)
+_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+)
+
+
+def _token_snapshot(model) -> dict | None:
+    """Read cumulative mimo TokenStats counters without making capture mandatory."""
+    stats = getattr(model, "token_stats", None)
+    if stats is None:
+        return None
+    snapshot = {}
+    for field in _TOKEN_FIELDS:
+        value = getattr(stats, field, None)
+        try:
+            snapshot[field] = int(value) if value is not None else None
+        except (TypeError, ValueError, OverflowError):
+            snapshot[field] = None
+    return snapshot
+
+
+def _token_delta(before: dict | None, after: dict | None) -> dict | None:
+    """Return per-query token deltas; missing counters stay explicitly unknown."""
+    if before is None or after is None:
+        return None
+    delta = {}
+    for field in _TOKEN_FIELDS:
+        start, end = before.get(field), after.get(field)
+        delta[field] = max(0, end - start) if start is not None and end is not None else None
+    return delta
 
 
 def _append(out_path: str, rec: dict) -> None:
@@ -150,6 +179,7 @@ def install_hooks(out_path: str, level: str = "12") -> bool:
             with _LOCK:
                 _CALL_SEQ += 1
                 seq = _CALL_SEQ
+            token_before = _token_snapshot(self)
             rec = {
                 "event": "llm_logical_call",
                 "seq": seq,
@@ -202,6 +232,7 @@ def install_hooks(out_path: str, level: str = "12") -> bool:
                 raise
             finally:
                 _stack_pop()
+                rec["token_usage"] = _token_delta(token_before, _token_snapshot(self))
                 _append(out_path, rec)
 
         OpenAIChatModel.query = patched_query

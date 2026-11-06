@@ -426,6 +426,7 @@ class TencentDataSource:
         last, prev = _f(3), _f(4)
         chg = round(last - prev, 4) if prev else 0
         vol = _f(6)
+        amount_wan = _f(37, None)
         raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
         time_str = ""
         if len(raw_time) == 14 and raw_time.isdigit():
@@ -436,6 +437,8 @@ class TencentDataSource:
             "high": _f(33, last), "low": _f(34, last),
             "open": _f(5) or last, "previousClose": prev,
             "volume": _volume_to_shares(vol, _f(37), last), "time": time_str,
+            "amount": round(amount_wan * 10000, 2) if amount_wan is not None else None,
+            "amount_unit": "元",
             "name": (parts[1] or "").strip(),
             "symbol": (parts[2] or "").strip(),
         }
@@ -515,9 +518,11 @@ class TencentDataSource:
                         # parts[37] = 成交额（万元），用于反推 parts[6] 的单位
                         # （详见 `_volume_to_shares`：科创板返回"股"，其余板块返回"手"）
                         _amt_wan = 0.0
+                        _amount = None
                         if len(parts) > 37 and parts[37]:
                             try:
                                 _amt_wan = float(parts[37])
+                                _amount = round(_amt_wan * 10000, 2)
                             except (TypeError, ValueError):
                                 _amt_wan = 0.0
                         raw_time = parts[30].strip() if len(parts) > 30 and parts[30] else ""
@@ -533,6 +538,7 @@ class TencentDataSource:
                             "open": float(parts[5]) if parts[5] else last,
                             "previousClose": prev,
                             "volume": _volume_to_shares(vol, _amt_wan, last),
+                            "amount": _amount, "amount_unit": "元",
                             "time": time_str,
                             "name": parts[1].strip(),
                             "symbol": parts[2].strip(),
@@ -540,5 +546,4 @@ class TencentDataSource:
                         break
             except Exception:
                 continue
-
 

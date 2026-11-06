@@ -362,6 +362,7 @@ class SinaDataSource:
             "open": quote.get("open", last) or last,
             "previousClose": prev,
             "volume": vol, "time": time_str,
+            "amount": quote.get("amount"), "amount_unit": "元",
             "name": quote.get("name", ""),
             "symbol": sc,
         }
@@ -438,6 +439,7 @@ class SinaDataSource:
                 high = float(parts[4]) if parts[4] else 0.0
                 low = float(parts[5]) if parts[5] else 0.0
                 vol = float(parts[8]) if len(parts) > 8 and parts[8] else 0.0
+                amount = float(parts[9]) if len(parts) > 9 and parts[9] else None
                 if last == 0 and prev_close == 0 and open_p == 0:
                     continue
                 chg = round(last - prev_close, 4) if prev_close else 0.0
@@ -449,9 +451,9 @@ class SinaDataSource:
                     "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
                     "open": open_p, "high": high, "low": low,
                     "previousClose": prev_close, "volume": vol, "time": time_str,
+                    "amount": amount, "amount_unit": "元",
                     "symbol": code_str,
                 }
             except (ValueError, IndexError):
                 continue
-
 

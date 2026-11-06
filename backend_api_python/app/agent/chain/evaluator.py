@@ -23,6 +23,7 @@ import math
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from app.utils.trading_calendar import CalendarUnavailable, nth_trading_day
 from .schema import DIRECTION_THRESHOLD, Direction, classify_return, is_direction_correct
 from . import store
 from . import label_spec as _ls
@@ -35,7 +36,7 @@ from . import label_spec as _ls
 #   此前 `_TIMEFRAME_DAYS`（1M=22）与 `HOLD_LABELS`（1M=20）两处各写一份且数值
 #   不同 —— 改一处忘一处即**静默漂移**。当时判断"两者语义不同（自然月 vs 交易日），
 #   不许合并"，**这个判断已查证推翻**：
-#     · 消费端按**交易日**解释 —— `_maturity_days` 注释原文「hold_days 按交易日计」，
+#     · 消费端按**交易日**解释 —— 成熟门此前的注释写明「hold_days 按交易日计」，
 #       且 `_get_actual_return` 用 `base_idx + hold_days` 偏移 **K 线根数**；
 #     · 22 与表内 `1Y=252` 不自洽（22×12=264 > 252，一年没那么多交易日）；
 #     · 影响面实测为零：`qd_agent_traces` 根节点 timeframe **恒为空**（1256 条），
@@ -62,14 +63,9 @@ def _get_hold_days(timeframe: str) -> int:
 #     到 `chain/label_spec`（v5 P1-1）。此处不再重复定义。
 
 
-def _maturity_days(hold_days: int) -> int:
-    """持有交易日数 → 可以定论所需的**自然日**下界（视界门，2026-09-27 修 E2）。
-
-    hold_days 按交易日计（_TIMEFRAME_DAYS），而 exec_date / CURRENT_DATE 是自然日
-    口径，两者必须换算：A 股一年约 244 交易日 / 365 自然日 ≈ 1.496，取 1.5；
-    +2 天用于覆盖周末与节假日（周五做的 T+1 决策，要到下周一才有第 1 根 K 线）。
-    """
-    return int(hold_days * 1.5) + 2
+def _maturity_date(exec_date: date, hold_days: int) -> Optional[date]:
+    """Return the exact maturity date after ``hold_days`` trading days."""
+    return nth_trading_day(exec_date, hold_days)
 # ═══════════════════════════════════════════════════════════════
 # 实际行情获取
 # ═══════════════════════════════════════════════════════════════
@@ -300,11 +296,12 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
 
     Returns:
         {"evaluated": int, "errors": int, "details": list,
-         "not_mature": int, "truncated": int}
+         "not_mature": int, "truncated": int, "calendar_unavailable": int}
         not_mature = 持有期未走完而跳过；truncated = 数据缺口导致窗口被截断而跳过。
+        calendar_unavailable = 无法从交易日历确定成熟日而暂缓。
     """
     stats = {"evaluated": 0, "errors": 0, "details": [],
-             "not_mature": 0, "truncated": 0}
+             "not_mature": 0, "truncated": 0, "calendar_unavailable": 0}
     today = date.today()
 
     pending = store.query_pending_verify(days_old=days_old, limit=100)
@@ -329,10 +326,18 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             # 静默截断到"现有最后一根 K 线"，于是 T+5/1M/3M/1Y 在次日就被 1 天的窗口
             # 定了论；exit_date 一写入该记录即永久出队（WHERE exit_date IS NULL），
             # 之后永不再验 → 权重/酿造信号/win_rate 全被错误标签污染。
-            # hold_days 是**交易日**数，换算自然日下界（1 交易日 ≈ 1.5 自然日，
-            # +2 覆盖周末/节假日）。未到视界只跳过，**不计失败**——否则连跳 5 次
-            # 会被 query_pending_verify 误判 unverifiable 永久出队。
-            if exec_date + timedelta(days=_maturity_days(hold_days)) > today:
+            # 到期窗口与 claims.due_date_of 使用相同的交易日历口径。日历覆盖不足
+            # 时不猜测成熟日期，也不记作行情评估失败，避免污染失败计数并永久出队。
+            maturity_date = _maturity_date(exec_date, hold_days)
+            if maturity_date is None:
+                stats["calendar_unavailable"] += 1
+                logger.warning(
+                    "[Evaluator] 交易日历覆盖不足，暂缓 root_id=%d 的成熟判定 "
+                    "(exec_date=%s, hold_days=%d)",
+                    root_id, exec_date, hold_days,
+                )
+                continue
+            if maturity_date > today:
                 stats["not_mature"] += 1
                 continue
 
@@ -379,7 +384,7 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
 
             store.update_verify_results(
                 root_id=root_id,
-                exit_date=exit_date or exec_date + timedelta(days=hold_days),
+                exit_date=exit_date or maturity_date,
                 exit_reason="max_hold",
                 pnl_pct=actual["pnl_pct"],
                 hold_days=actual["hold_days"],
@@ -400,6 +405,12 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
                 "pnl_pct": actual["pnl_pct"], "correct": correct,
             })
 
+        except CalendarUnavailable as e:
+            stats["calendar_unavailable"] += 1
+            logger.warning(
+                "[Evaluator] 交易日历不可用，暂缓 root_id=%d 的成熟判定: %s",
+                root_id, e,
+            )
         except Exception as e:
             stats["errors"] += 1
             stats["details"].append({
@@ -408,8 +419,8 @@ def evaluate_pending(days_old: int = 1, market: str = "CNStock") -> Dict[str, An
             })
             logger.error("[Evaluator] 评估 root_id=%d 失败: %s", root_id, e)
 
-    logger.info("[Evaluator] 评估完成: %d 条已评估, %d 条失败",
-                stats["evaluated"], stats["errors"])
+    logger.info("[Evaluator] 评估完成: %d 条已评估, %d 条失败, %d 条因交易日历暂缓",
+                stats["evaluated"], stats["errors"], stats["calendar_unavailable"])
 
     # 评估后自动更新权重（链式门控 · 第 1 级：evaluated>0 才进入下一步）。
     # 末级 maybe_revise 已移入 update_weights() 末尾，按 "updated>0" 再门控一次

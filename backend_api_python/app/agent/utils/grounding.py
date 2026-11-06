@@ -70,13 +70,46 @@ _CORPUS_MAX_CHARS = 200_000
 # 历史残留；判分取数现由 `tests/test_v6_domain_taxonomy_20261014.py` 一类守卫覆盖）。
 BANNED_PHRASES = (
     "保证收益", "稳赚", "必然涨停", "百分百", "无风险套利", "包赚", "必涨无疑",
-    "保证盈利", "稳簿不赔",
+    "保证盈利",
 )
+
+_CLAUSE_SPLIT_RE = re.compile(r"[,，、;；。.!！?？:\n]")
+_NEGATED_PREFIX_RE = re.compile(
+    r"(?:并非|并不|绝非|绝不|从未|未曾|不曾|无法|难以|不能|不会|不可能|"
+    r"无须|无需|不必|不用|不得|不宜|不应|没有|不一定|未必|不|未|没|非|无)"
+    r"(?:\s*(?:一定|必然|可能|能够|可以|会|能|将|再|继续|仍|是|属于|构成|"
+    r"代表|意味着|承诺|保证|算|为|有))*$"
+)
+_DOUBLE_NEGATION_RE = re.compile(r"(?:不得不|不能不|不会不|不可能不|不可以不|难以不|不是不)$")
+
+
+def _negated_prefix(prefix: str) -> bool:
+    prefix = prefix.strip()
+    if _DOUBLE_NEGATION_RE.search(prefix):
+        return False
+    return bool(_NEGATED_PREFIX_RE.search(prefix))
+
+
+def phrase_is_asserted(text: str, phrase: str) -> bool:
+    """判断禁用短语是否在其所在分句中以肯定语义出现。"""
+    if not text or not phrase:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        start = 0
+        while True:
+            index = clause.find(phrase, start)
+            if index < 0:
+                break
+            if not _negated_prefix(clause[:index]):
+                return True
+            start = index + len(phrase)
+    return False
 
 
 def check_banned_phrases(text: str) -> list:
-    """E3：返回命中禁用表述（营销/确定性承诺），供 verify 越界性与评测 L1 共用。"""
-    return [w for w in BANNED_PHRASES if w in (text or "")]
+    """返回以肯定语义命中的禁用表述；同词只记录一次。"""
+    return [phrase for phrase in BANNED_PHRASES
+            if phrase_is_asserted(text or "", phrase)]
 
 
 def _to_float(s: str) -> float:

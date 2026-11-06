@@ -390,6 +390,7 @@ def _parse_sohu_heartbeat(text: str) -> Optional[Dict[str, Any]]:
         "changePercent": _float(pa1[4]),
         "volume": round(float(pa2[8]) * 100, 2) if _float(pa2[8]) else 0,  # 总手→股
         "amount": round(_float(pa2[12]) * 10000.0, 2),  # 万元 → 元（统一口径）
+        "amount_unit": "元",
         "turnover_rate": _float(pa2[6]),
         "PE": _float(pa2[10]),
         "amplitude": _float(pa2[14]),
@@ -488,6 +489,7 @@ def _fetch_sohu_batch_quotes(codes: List[str], timeout: int = 10) -> Dict[str, D
                     "change": _float(arr[4]),
                     "volume": round(float(arr[5]) * 100, 2) if _float(arr[5]) else 0,
                     "amount": round(_float(arr[7]) * 10000.0, 2),  # 万元 → 元（统一口径）
+                    "amount_unit": "元",
                     "turnover_rate": _float(arr[8]),
                     "high": _float(arr[10]),
                     "low": _float(arr[11]),

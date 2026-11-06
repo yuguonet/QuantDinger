@@ -2,7 +2,7 @@
 name: market-screener
 description: 从A股全市场筛选短中线标的。用户问"今天买什么股""有什么好股票""短线/短中线选什么"时使用。不含个股分析。
 metadata:
-  version: 8.5.0
+  version: 8.6.0
   tags: market, screener, short_term, mid_term, a_share
   tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
 ---
@@ -40,7 +40,7 @@ metadata:
 
 三条原则：
 
-1. **代码不做取舍**（`pre_screen` / `profile_candidates` 层）：候选池不排序、不截断、不过滤；`hard` 只是客观障碍，如何处置由你决定。`run()` 内部 = **单链路保底轨**（取前 25 只恒入 deep，取舍规则见 `strategy-rules.md` §三）；被非封板 `hard` 拦掉的只数见 `funnel.baseline_hard`，被拦的票未进 `analyzed_rank`
+1. **代码不做取舍**：选人层唯一为 `run()` 内部的**三层漏斗**（L1 大盘闸 → L2 板块闸 → L3 板块内选股 → 连板放量准入闸 → 截断 25，规则见 `_topdown.py`）；漏斗输出即 deep 名单，各层阈值全走 `QD_TOPDOWN_*` 环境变量
 2. **你可以自己写代码**：在沙箱里对画像结果自由排序、过滤、分组、加权——这比套模板更接近真实盘感
 3. **结论必须可复盘**：每只推荐的票要说清「靠哪条证据入选」+「什么情况下这条证据失效」
 
@@ -67,19 +67,15 @@ metadata:
 
 | 函数（真实签名） | 作用 | 何时用 |
 | --- | --- | --- |
-| `run()` | 一次性跑完整流程：**① 候选池** `pre_screen(search_top_n=100)` → **② 保底轨** `_baseline_selection`（整个候选池画像；`hard` 只拦 ST/停牌/价格越界/低换手，**涨停封板放行**；按「连板高度降序 → 当日收盘位置更低者先」排序，剔除近 3 日一字涨停与位置透支 hot 后顺延补位，取前 25 只）→ **③ deep_analyze(≤45)**。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
+| `run()` | 一次性跑完整流程：**三层漏斗选人**（L1 大盘同刻量能闸 → L2 行业/概念板块资金流闸，板块数随大盘档位：弱 3 / 中性 4 / 强 6，两轨分开计、无备选 → L3 板块内选股：健康闸 + **涨停票与跳变检测并行**（有涨停也跑跳变，对象为非涨停成员），每板块 ≤10 只 → 连板放量准入闸 → 全部板块票在截断前合并去重（`dup_n`=重复板块数）→ 按「首次跳变/触板时间先后、重复多者优先」截断 25 只）→ **deep 只分析非涨停票**（涨停票不进 deep，只列 `limit_up_ref` 参考）→ **deep_analyze(≤45)**。**无入参** | 主对话派活（经 `run_skill` 暴露的入口） |
 | `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 / **指数日内强弱（index_intraday/intraday_bias）** / **大盘资金近5日方向（fund_flow_days）** / **cautious（走弱环境，收紧选股）** | 起手，判断大环境 |
-| `pre_screen(sources=None, queries=None, search_top_n=50, min_turnover=None, limit=None)` | 候选池：自选来源（连板/尾盘封板/尾盘启动/龙回头/热点/条件搜索/近期涨停/近10日龙虎榜），不做取舍与排序 | 起手取池 |
-| `profile_candidates(prescreen_result, limit=20, with_flow=True, with_pred=True)` | 每只候选的证据卡：位置 / 量能 / 资金 / 题材 / 模型分 / 硬障碍。**入参是上一步的 dict** | 核心，几乎所有场景都要跑 |
-| `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False, budget=None)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / **实时行情对账**），无任何主观评分。返回 **两档同序（位置透支升序，p_up 不参与排序）**：`analyzed_rank`=全部票的横向可比字段（不截断）+ `analyzed`=**位置最干净的 N 只**满卡（按交付预算裁剪） | 对你挑出的少数票做证据汇总 |
+| `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False, budget=None)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / **实时行情对账**），无任何主观评分。返回 **两档同序（非涨停优先，再按位置透支升序）**：`analyzed_rank`=全部票的横向可比字段（不截断）+ `analyzed`=**位置最干净的 N 只**满卡（按交付预算裁剪） | 对你挑出的少数票做证据汇总 |
 | `detect_patterns(codes, days=60, params=None)` | 六种 K 线形态识别，回答「是不是」不回答「好不好」；`params` 是 JSON 几何定义覆盖 | 想验证形态 / 做阈值敏感性检查 |
 | `multitimeframe(code, daily_days=60, minute_days=5)` | 日线 + 15m + 5m 的结构量与速记标签 | 判断多日结构与日内强弱时用（注意标签是日线几何，见下） |
 | `inspect_stock(code, deep=False)` | 单票深挖：题材归属、资金、涨停史、龙虎榜席位、客观风险点；`deep=True` 追加快源 | 想验证某只票 / 证据互相矛盾时 |
-| `filter_candidates(prescreen_result)` | 便捷形式（旧流程兼容）：保守剔除有硬障碍的候选，返回逗号分隔 codes | 只要 codes 清单时（要看证据用 `profile_candidates`） |
 
 > ⚠️ 除 `run()` 外，其余函数都是 `run()` 的**内部阶段**，当前**未经 `run_skill` 暴露**
 > （`skill_run.EXECUTABLE_SKILLS["market-screener"]` 只登记了 `run`）。其中
-> `profile_candidates` / `filter_candidates` 的入参是上一步的返回值，独立子进程间无法传递。
 
 ### 三条数据硬约束
 
@@ -87,7 +83,7 @@ metadata:
 - `confidence` 在 `deep_analyze` 里是**证据完整度**（tech / patterns / flow / prediction 拿到几维），不是模型对判断的把握
 - **`weak_to_strong` / `strong_to_weak` 是日线 MA5 计数标签，不是盘中即时信号**；「分时均线 / 低点不移」无现成字段，需自算 1m
 
-`profile_candidates` 返回的每行字段含义：
+deep 满卡里与个股事实相关的两个分组：
 
 - `tech` 收盘 / 涨跌 / 量比 / RSI / MA 乖离 / 20 日位置 / 连板数 / **`support.supports`·`support.resists`（现价下方/上方最近的关键位置候选）**
 - `seal` 封板结构（画像层用日线末根判封板、无 rt ⇒ `one_word` 判不出，深挖层才用实时 high/low 判一字）
@@ -105,7 +101,7 @@ metadata:
 - **三轴校准（价格/量能/资金流）**：`rs_d0`/`rs_5d`=个股−上证同期超额（%）（参考数据，rs_d0≥-1.5 拆分见跳水回踩）、`vr_rel`=量比÷大盘量比、`flow_rel`=净占比−大盘净占比（百分点，参考数据）。**大盘暴跌、个股横盘（rs_d0 明显为正）=有支撑**（跳水回踩拆分即此义，带崩≠个股弱）。庄股例外：与大盘恒反向、量能自锁（放量缩量不随大盘）的票按独立行情读。**买前确认闸 = 量能对大盘的校准 ≥2（唯一闸）**：有 `intraday` 块（盘中）看 `vr_rel_st`，无（收盘后）看 `vr_rel`；两者口径不同（一个截至此刻、一个是全天含昨日），别混用
 - `inspect_stock` 结果带 **`same_t`（同时刻横向比对）**：`vr_same_t`=今日截至 T 的累计量 ÷ 前几日**同一时刻**累计量均值、`rs_same_t`=个股与上证「昨收→T」的同期超额——盘中判断「现在这一刻谁真强」直接看它，不要拿全天口径倒推；盘后调用 T≈15:00 退化为全天对比（无害）。**同刻三轴校准**：`fp_same_t`=同刻量价方向净占比%、`vr_rel_same_t`/`flow_rel_same_t`=个股对大盘的同刻相对值；`mkt_vr`/`mkt_fp_pct`/`mkt_fp_prev_pct`=大盘同刻量比与净占比（今日 vs 前几日**同一时刻**，大盘强弱两轴：量比+资金流，资金流和前几日同刻比对，用户 9:50 口径）
 - **盘后默认给「条件单」而不是一口价**：次日 09:30-10:00 观察，**突破 `hi_today` + 早盘成交明显放大 + 强于大盘** 三条同时成立才买，任一不成立当天放弃。「早盘涨了才追」单看涨幅无效，要的是**放量突破**。买点列写「触发条件 + 触发后成交价上限」
-- `analyzed` = 前 N 只**满卡**（按交付预算裁剪，`analyzed_note` 写明 N），与 `analyzed_rank` **同序、按位置透支升序**（贴近均线 / 20 日偏低位 / 近期未大涨者在前）；满卡之外的票用 `inspect_stock(code)` 定点取。满卡已瘦身：不含 `evidence_dims`、空容器与 None 键；盘中另有 **`intraday`（同刻校准块）**：`t` 截断时刻 / `day` 目标日 / `vr_same_t` 个股同刻量比 / `vr_rel_st` / `fp_same_t` 个股同刻净占比% / `flow_rel_st` / `ret_same_t` 昨收→`t` 涨幅% / `idx_ret_same_t` 上证同期涨跌% / `rs_same_t` 超额 / `mkt_vr`·`mkt_fp_pct` 大盘同刻基准 / `mkt_fp_prev_pct` 前5日同刻净占比均值（大盘两轴 = 量比 + 资金流，且都和前几日**同一时刻**比）
+- `analyzed` = 前 N 只**满卡**（按交付预算裁剪，`analyzed_note` 写明 N），与 `analyzed_rank` **同序、非涨停优先再按位置透支升序**（贴近均线 / 20 日偏低位 / 近期未大涨者在前）；满卡之外的票用 `inspect_stock(code)` 定点取。满卡已瘦身：不含 `evidence_dims`、空容器与 None 键；盘中另有 **`intraday`（同刻校准块）**：`t` 截断时刻 / `day` 目标日 / `vr_same_t` 个股同刻量比 / `vr_rel_st` / `fp_same_t` 个股同刻净占比% / `flow_rel_st` / `ret_same_t` 昨收→`t` 涨幅% / `idx_ret_same_t` 上证同期涨跌% / `rs_same_t` 超额 / `mkt_vr`·`mkt_fp_pct` 大盘同刻基准 / `mkt_fp_prev_pct` 前5日同刻净占比均值（大盘两轴 = 量比 + 资金流，且都和前几日**同一时刻**比）
 - `seal` = 封板结构的**客观事实 + 硬标签**，`{tag, seal_tier, open_count, seal_ratio_pct(封单÷成交额 %), zt_days, turnover_pct}`。**两个正交事实，必须合起来读**：`tag` 只切开板次数（`none` 未封板 / `one_word` 一字·全天封死 / `open0` 0 开板非一字 / `open1_2` / `open3_5` / `open6p` ≥6 次 / `unknown` 缺实时或池里无该票）；`seal_tier` 只切封单厚薄（`thin` ≤5% / `mid` ≤15% / `thick` ≤40% / `vthick` >40%）。**不打分、不排序**——买不到不是决策问题（盘后次日按涨停价挂单即可），它回答的是「今天封得怎么样」。**开板越多越差；封单越厚越强**；连板 2 板最弱、4+ 板最强。**组合要看**：`open0` + `thin`（0 开板但封单极薄，如 000568）与 `open6p` 同为最可疑，别因为「没开板」就当强；有厚封单支撑（`one_word`/`vthick`/`thick`）才是真强封。标签边界可用 `QD_SCREENER_SEAL_TAG`（JSON）覆盖
 - **`limit_up=true` / `buyable=false` 只是事实，不是排除令**：封板票可进名单（盘中此刻买不进，盘后/次日是另一回事），接不接由你的逻辑决定，但进「可买」列表要写清凭什么
 - `report_guide` 判定规则摘要（支撑≫涨跌幅、周期、禁止重验）——**写结论时直接照它落笔，不必 read_skill**
@@ -115,8 +111,7 @@ metadata:
 - `warnings` 可能含**拉高出货线索**（「开盘脉冲」「疑似拉高出货」「趋势背离」，deep 层在 `flow_risks` 键）：开盘窗大额净流入后转流出/冲高回落/今日脉冲与近5日净流出背离 —— 经验型判断，可否决但要写理由
 - `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
-- `funnel` 是 `run()` 返回的漏斗统计键，包含：`rounds`（恒 1）/ `pool_raw`（原始候选池只数）/ `baseline`（保底轨入选只数 = 全部入 deep）/ `baseline_hard`（被非封板 `hard` 拦掉的只数）/ `baseline_risk`（其中高连板且距 MA5>10% 的风险提示数）/ `deep_n` / `eastmoney_ok`，用于复盘「池子多大、拦掉多少、最后进 deep 几只」
-- `filter_candidates` 保守地把 hard 与 warnings 一并剔除；走 `profile_candidates` 你能看到全部候选
+- `funnel` 是 `run()` 返回的漏斗统计键：`pipeline=topdown` / `verdict`（L1 大盘档） / `pool_raw`（闸前收集只数）/ `baseline`（截断入选只数 = 全部入 deep）/ `dup_max`（入选票最大重复板块数，重复=多板块资金共识）/ `short_of_limit`（不足额定额、不凑数）/ `deep_n`（真正进 deep 的非涨停只数）/ `zt_ref_n`（只列参考的涨停只数）/ `flow_invalid_n`（资金流通比落在低区无效区间的只数）/ `excluded_streak_surge`（连板放量闸放弃的票）/ `streak_surge_unknown`（数据不足未判数），用于复盘「漏斗各层过了多少、最后进 deep 几只」
 
 ## 工作流（`run()` 内部阶段示意，不必线性）
 
@@ -124,26 +119,22 @@ metadata:
 
 ```python
 st = market_state()                       # 先看环境
-result = pre_screen(sources="zt,dragon,search",
-                    queries="放量突破 站上20日均线")   # 来源与查询词都由你定
-bundle = profile_candidates(result, limit=20)
+result = run()                            # 三层漏斗选人 → deep 一次完成
 
-# 之后完全由你决定，例如：
-profiles = bundle["profiles"]
-picks = [p for p in profiles
-         if not p["hard"]
-         and (p.get("p_up") or 0) >= bundle["hints"]["p_up_floor_suggest"]
-         and (p["tech"] or {}).get("pos_in_20d_pct", 0) <= 95]
-codes = ",".join(p["code"] for p in picks[:8])
-
+# 对漏斗选出的票继续追问（自查证据）：
+rank = result["analyzed_rank"]            # 全部票的横向可比字段
+codes = ",".join(x["code"] for x in rank[:8])
 deep = deep_analyze(codes=codes)                     # 拉齐证据，再自己加权（默认无 mtf）
 pats = detect_patterns(codes=codes, params='{"platform_range_pct": 10}')  # 换个定义看结论稳不稳
-detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追问
+detail = inspect_stock(rank[0]["code"], deep=True)  # 对最想确认的票追问
 ```
 
 - 证据不足就继续追数据：调大 `limit`、`deep=True`、或用 finance 工具查板块/资金/消息面
 - 同一批票可以用不同口径重试；不必一次定型
 - 六维里有任何一维答不上来，就把它写进「数据缺口」，别装作没这个问题
+
+- **`limit_up_ref` = 涨停参考清单（不进 deep 分析）**：`{code,name,board,track,t_first,dup_n,reason}`。决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；它只回答「该板块此刻几只封板、几点封的、几个板块同时选中」，用来判断**未涨停票所在板块**的强弱与资金共识。**禁止**把清单里的票写进「买什么」，也不要在正文整表罗列。
+- **资金流通比 `fund_circ_ratio`（净额÷流通市值%）**：已按盘子归一、可跨票比；`flow_valid=false` 表示流通市值低于有效下限或数据缺失，该指标不可用，不要当 0 读。
 
 ## 分析框架（六维交叉验证 + 短窗周期）
 
@@ -153,7 +144,7 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 2. **量价结构**：量比、收盘在日内位置、是否 20 日高位、振幅；放量突破 vs 放量滞涨要区分；**日内 MACD 红绿柱变化**作涨/跌压力参考
 3. **资金**：量价净额方向与占成交额比（`caliber=price_direction`，**不是主力净额，正文禁止写「主力」**）；**近5/20日总体（flow.recent：累计、连续方向、逐日符号）优先于当日单格**；形态好但资金流出 → 减配或放弃；**开盘脉冲后回落/单日脉冲与多日趋势背离 → 拉高出货嫌疑（flow_risks）**；**结合个股流通市值看控盘**（同额资金在流通市值小的票上控制力更强）；**流通市值越大趋势越连续、变盘越慢，流通市值小的票容易被资金带动，趋势更快更短**；**龙虎榜席位**：是否有主力席位、是否有游资席位、是否有机构席位
 4. **位置与空间**：距 MA20 乖离、20 日位置、连板高度、**支撑位是否清晰**、**支撑–压力间距**（`sr_gap_pct` 过窄 → 操作性弱、排序下调）
-5. **市场状态**：情绪分桶、涨停 / 跌停家数、炸板率、**指数相对开盘强弱（早盘主信号）与大盘资金近5日方向**——弱势市/`cautious` 应自动提高门槛、减少只数
+5. **市场状态**：**两档情绪分开读**——大盘情绪 `market_mood`/`market_mood_score`（指数+资金，决定姿态与只数）、个股情绪 `stock_mood`/`stock_mood_score`（涨跌停比/炸板率，决定敢不敢追高）；另看涨停 / 跌停家数、炸板率、**指数相对开盘强弱（早盘主信号）与大盘资金近5日方向**——弱势市/`cautious` 应自动提高门槛、减少只数；**两档背离（大盘强、个股难做）时按收紧执行**
 6. **可执行性**：`hard` 全集（ST/退市、换手不足、**价格 <2 或 >300**、涨停买不进、停牌）；次日干扰
 
 ### 核心判定原则（摘要）
@@ -237,4 +228,4 @@ detail = inspect_stock(picks[0]["code"], deep=True)  # 对最想确认的票追�
 - `references/trading-logic.md` — **核心交易逻辑**（支撑×强弱矩阵、涨跌停带、三时段、字段对齐——判定真源）
 - `references/analysis-framework.md` — 六维分析框架 + 周期落笔与失败模式清单（推荐先读）
 - `references/market-sentiment.md` — 市场情绪判断标准
-- `references/limit-rules.md` — 涨跌停幅度表（过滤/排序规则见 strategy-rules.md §三）
+- `references/limit-rules.md` — 涨跌停幅度表（涨跌停带归一与三时段见 trading-logic.md §0）

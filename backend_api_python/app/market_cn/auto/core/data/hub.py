@@ -278,7 +278,7 @@ def _synth_bar_from_series(series, date):
 
 
 
-def daily_live(code, days=200, series=None, bars=None):
+def daily_live(code, days: int = 200, series=None, bars=None):
     """实时日线 = 历史日线 + 今日合成 bar (若 1D 尚未回填今日)。
 
     Returns:

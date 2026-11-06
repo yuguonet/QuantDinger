@@ -13,8 +13,9 @@
  *   - from = round(to - 绘图区宽度 / barSpace) - 1，下限 0
  */
 
-/** 进入态默认可见柱数：初始进入展示「最新 120 根」 */
-export const ENTRY_VISIBLE_BARS = 120
+/** 进入态默认可见柱数：初始进入展示「最新 60 根」 —— 窗口较小时 60 根足够看清结构，
+ *  且与 KlineChart.vue 现场恢复独立（已按 symbol+timeframe 持久化）。 */
+export const ENTRY_VISIBLE_BARS = 60
 /** 进入态右缘呼吸位（bar 数）：最新柱不贴死右轴（与换股定位同口径，留出最后一根的高低点） */
 export const ENTRY_BREATH_BARS = 2
 /** barSpace 合法域（与库 BarSpaceLimitConstants 一致） */

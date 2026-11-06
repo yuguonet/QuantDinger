@@ -119,9 +119,10 @@ def get_realtime_quote(codes: str) -> Dict[str, Any]:
     Returns:
         统一结构（单/多代码一致）：{"count": N, "data": {代码: 行情dict},
         "error": None}；行情dict 字段：{stock_code, last, changePercent, volume, name,
-        high, low, open, previousClose, time, limit_up, limit_down}
+        high, low, open, previousClose, time, limit_up, limit_down, amount?}
         （limit_* 来自腾讯源增补，供涨跌停判定）；volume 单位见 volume_unit（恒 "股"，
-        六个 provider 出口已各自归一化为股）；失败 → {"error": "...", "retriable": False}
+        六个 provider 出口已各自归一化为股）；amount 若数据源提供则以元为单位，
+        缺失来源不估算；失败 → {"error": "...", "retriable": False}
 
     ⚠ **不含**换手率/量比/PE/PB/总市值（描述是唯一进 LLM 的契约，写了就等于教模型去
     承诺拿不到的数据）。要这些口径请用：
@@ -188,7 +189,7 @@ def agent_get_kline(codes, timeframe: str = "1D", days: int = 30, adj: str = "qf
     Args:
         codes: 股票代码，字符串（如 "603466"）或代码列表，多股逗号分隔
         timeframe: 1m/5m/15m/30m/1H/4H/1D/1W，默认 1D
-        days: 天数，默认 30，最大 250
+        days: 返回的 K 线根数，默认 30，最大 250；日线周期按交易日根数计
         adj: 复权口径 qfq(前复权,默认)/hfq(后复权)/none(不复权)。data 各 bar 含 adj 标注。
 
     Returns:

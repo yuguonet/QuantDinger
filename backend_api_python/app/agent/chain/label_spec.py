@@ -18,7 +18,7 @@
 旧的 `TRACE_HOLDS`（1M=22）曾被认为是"自然月口径"、与 claim 的"交易日口径"
 语义不同，故故意并存。**这个判断是错的**，已查证推翻：
 
-1. 消费端按**交易日**解释：`evaluator._maturity_days` 的注释原文写明
+1. 消费端按**交易日**解释：evaluator 成熟门此前的注释写明
    「hold_days 按交易日计（_TIMEFRAME_DAYS）」，且 `_get_actual_return` 用
    `base_idx + hold_days` 偏移 **K 线根数**。22 是"按自然月折算出的数"，
    但被当成交易日消费 ⇒ **两者是同一个量**，不是两种语义。

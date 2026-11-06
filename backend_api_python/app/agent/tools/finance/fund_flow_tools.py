@@ -12,6 +12,19 @@ import json
 from ...log import logger
 from typing import Any, Dict, List
 from ...utils.md_format import _batch_execute, _to_md
+
+_STOCK_FLOW_CALIBER = "价格方向净额近似（按涨跌方向分配成交额；非真实主力/机构资金分类）"
+
+
+def _mark_stock_flow_caliber(result: dict) -> dict:
+    """Make the stock-level proxy caliber explicit alongside legacy main_net names."""
+    if isinstance(result, dict) and "error" not in result:
+        result["caliber"] = _STOCK_FLOW_CALIBER
+        result["approx"] = True
+        result["main_net_semantics"] = "价格方向近似值，不代表主力或机构账户净流入"
+    return result
+
+
 def _fund_flow_stock_realtime(codes: str) -> dict:
     """个股当日「价格方向净额」+ 5日/20日累计（本地派生，非主力资金口径）。
 
@@ -41,6 +54,7 @@ def _fund_flow_stock_realtime(codes: str) -> dict:
                         rt["recent_20d_net_ratio"] = daily.get("recent_20d_net_ratio")
                 except Exception as e:
                     logger.debug("_fund_flow_stock_realtime(%s) daily 汇总失败: %s", code, e)
+                rt = _mark_stock_flow_caliber(rt)
             results[code] = rt
         except Exception as e:
             results[code] = {"error": str(e)}
@@ -97,9 +111,10 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
 
     Returns:
         信封格式（scope 决定结构）：
-        stock       → {"count": N, "data": {CODE: {total_main_net, main_pct,
+        stock       → {"count": N, "data": {CODE: {caliber, approx, total_main_net, main_pct,
                         recent_5d_main_net, recent_5d_net_ratio, ...}}}
-        stock_daily → {"count": N, "data": {CODE: {data:[{date, main_net, net_ratio,...}]}}}
+        stock_daily → {"count": N, "data": {CODE: {caliber, approx,
+                        data:[{date, main_net, net_ratio,...}]}}}
         market      → {"source","main_net","in_net","out_net",...}
         sector/concept → {"indicator","count","boards":[{name, main_net, ...}]}
         统一顶层键: "data"/"count"/"error"(失败)。切片迭代先取 result["data"]。
@@ -187,7 +202,7 @@ def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
     def _one(stock_code: str) -> dict:
         from app.market_cn.tape import get_fund_flow_daily as _get
         try:
-            return _get(stock_code, days=days)
+            return _mark_stock_flow_caliber(_get(stock_code, days=days))
         except Exception as e:
             logger.warning("get_fund_flow_daily(%s) failed: %s", stock_code, e)
             return {"error": str(e)}

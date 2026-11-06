@@ -25,9 +25,8 @@
 """
 from __future__ import annotations
 
-import os
 import re
-from datetime import date, timedelta
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import label_spec
@@ -193,8 +192,7 @@ _INDEX_ALIAS: Dict[str, str] = {
 _CODE_RE = re.compile(r"(?<![0-9])(\d{6})(?![0-9])")
 _SECTOR_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*(?:板块|概念|题材)")
 
-# 视界 → 到期日（自然日估算，与 evaluator._maturity_days 同口径：
-# 1 交易日 ≈ 1.5 自然日 + 2 天周末/节假日缓冲）
+# 视界 → 到期日（交易日数来自 label_spec.HOLDS，具体日期按交易日历计算）
 # ★ 2026-10-13（v5 P1-1 收口）：委派 `chain/label_spec.HOLDS`（唯一真源）。
 #   此前本文件自持一份（与 evaluator 的另两份并存且 1M 数值不同），
 #   改一处忘两处 = 静默漂移；现三者已统一为一张表（1M=21，与 1Y=252 自洽）。
@@ -332,30 +330,6 @@ def guess_confidence(text: str) -> Optional[float]:
     return None
 
 
-def _nth_trading_day(base: date, n: int, max_calendar_days: int = 400) -> Optional[date]:
-    """base 之后第 n 个交易日（base 本身不算）。日历不足则 None。
-
-    不调 `next_trading_day()`：它在日历越界时会一路拖到底再逐天回退，
-    实测在 2026-12-20 之后要 n=20 会抛 `OverflowError: date value out of range`
-    （缓存日历只到 2026-12-31）。故直接读日历集合，带**自然日上限**限步。
-    """
-    try:
-        from app.utils.trading_calendar import _load
-        cal = _load()
-    except Exception:
-        return None
-    if not cal:
-        return None
-    d, cnt = base, 0
-    for _ in range(max_calendar_days):
-        d = d + timedelta(days=1)
-        if d.strftime("%Y-%m-%d") in cal:
-            cnt += 1
-            if cnt >= n:
-                return d
-    return None
-
-
 def due_date_of(horizon: str, exec_date: Optional[date] = None) -> Optional[date]:
     """视界 → 到期日。n/a 返回 None。
 
@@ -370,26 +344,21 @@ def due_date_of(horizon: str, exec_date: Optional[date] = None) -> Optional[date
     语义选择（重要）：本函数继续返回**自然日 date**（不改列类型、不改扫描 SQL），
     只把日期算准 —— 到期日 = exec_date 之后第 N 个交易日。
 
-    兵分两路：
-      · 日历可命中 ⇒ 精确交易日口径；
-      · 日历越界（缓存通常只到当年年底）⇒ 回退**自然日估算**。
-    默认再取两者**较大值**（宁可晚判，不可早判）—— 早判会拿到不完整窗口，
-    而这是旧 `_maturity_days` 已被实证过的致命错误。
-    `QD_DUEDATE_EXACT=1` 可改为完全信任日历（不取 max）。
+    交易日历是唯一日期口径。若日历不可用或覆盖不足，则显式报告，
+    不以自然日估算替代交易日计算。
     """
     days = _HORIZON_DAYS.get(horizon)
     if not days:
         return None
     base = exec_date or date.today()
-    naive = base + timedelta(days=int(days * 1.5) + 2)
+    from app.utils.trading_calendar import CalendarUnavailable, nth_trading_day
 
-    exact = _nth_trading_day(base, days)
-    if exact is None:
-        return naive
-    import os
-    if os.getenv("QD_DUEDATE_EXACT", "").strip().lower() in ("1", "true", "yes", "on"):
-        return exact
-    return max(exact, naive)
+    due_date = nth_trading_day(base, days)
+    if due_date is None:
+        raise CalendarUnavailable(
+            f"交易日历覆盖不足，无法计算 {horizon}（{days} 个交易日）到期日，基准日={base}"
+        )
+    return due_date
 
 
 def _conclusion_text(answer: str, span: int = 600) -> str:

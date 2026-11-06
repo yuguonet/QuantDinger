@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""闭环②数字溯源门 —— 结论里的数字必须能在工具观察值里找到出处。
+"""闭环②结论门 —— 数字须可溯源，禁用的确定性承诺须重写或拦截。
 
 从 `qd_agent.py` 拆出（2026-10-13 P3 拆分）。
 
@@ -7,16 +7,17 @@
 但没人说得清从哪来**。grounding gate 在 run 收尾时比对答复文本与工具语料，
 不可溯源就要求模型重写（最多 `grounding_max_retries` 次）。
 
-【★ 全部 fail-open】判定模块不可用 / 抛异常 ⇒ 返回 None（放行）。
-溯源是增益纪律，绝不能因为门坏了让用户收不到答复。
+【数字溯源 fail-open】判定模块不可用 / 抛异常 ⇒ 放行，避免误拦正常答复。
+禁用承诺检查是 live 合规门，判定异常不静默放行。
 """
 from __future__ import annotations
 
+import time as _time
 from typing import Optional
 
 
 class GroundingMixin:
-    """数字溯源：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
+    """结论校验：以 mixin 形式并进 QDAgent（必须排在 MimocodeAgent 之前）。"""
 
     def _grounding_violation_timed(self, text: str, corpus: str):
         """带分时的判定（QD_GROUND_TIMING=1 时打点）。判定本体仍走静态方法。"""
@@ -37,6 +38,64 @@ class GroundingMixin:
             if isinstance(content, str):
                 parts.append(content)
         return "\n".join(parts)
+
+    @staticmethod
+    def _banned_violation(text: str) -> Optional[str]:
+        """命中禁用的确定性承诺时返回整改指引；None 表示通过。"""
+        from .utils.grounding import check_banned_phrases
+
+        hits = check_banned_phrases(text)
+        if not hits:
+            return None
+        return "命中禁止的确定性/营销式表述：" + "、".join(hits) + "。"
+
+    def _run_grounding_gate(self, status: str, message: str) -> tuple[str, str]:
+        """重写不可溯源数字或禁用承诺；多次不合规时不交付原始答复。"""
+        if not self.config.grounding_gate or status in ("truncated", "empty", "budget_wrapped"):
+            return status, message
+
+        corpus = self._observation_corpus()
+        check_numbers = bool(corpus.strip())
+        t0 = _time.perf_counter()
+        guide = self._grounding_violation_timed(message, corpus) if check_numbers else None
+        banned = self._banned_violation(message)
+        retries = 0
+        while (guide is not None or banned is not None) \
+                and retries < self.config.grounding_max_retries:
+            retries += 1
+            self._steps_taken = 0
+            t1 = _time.perf_counter()
+            self._g_mark("REWRITE#%d 前 messages=%d" % (
+                retries, len(getattr(self, "messages", []) or [])), t0)
+            if banned is not None:
+                prompt = (
+                    f"【结论合规拦截】{banned}"
+                    "请删除或改写这些承诺式表述，改用有条件、概率性的表述，不要复述命中词。"
+                )
+                if guide is not None:
+                    prompt += (
+                        "\n另外，数字也须可溯源：" + guide +
+                        "无法溯源的数字改为\"未获取\"并说明缺失口径。"
+                    )
+            else:
+                prompt = (
+                    f"【数字溯源拦截】{guide}\n"
+                    "请只依据本轮工具输出中的数字重写结论；无法溯源的数字改为"
+                    "\"未获取\"并说明缺失口径。"
+                )
+            status, message = super().run(prompt)
+            self._g_mark("REWRITE#%d 后" % retries, t1)
+            guide = self._grounding_violation_timed(message, corpus) if check_numbers else None
+            banned = self._banned_violation(message)
+
+        if banned is not None:
+            return "grounding_failed", (
+                "本次答复包含未通过合规检查的确定性或营销式表述，原答复未展示。"
+                "请重试并使用基于数据、条件和不确定性的表述。"
+            )
+        if guide is not None:
+            return "grounding_failed", message
+        return status, message
 
     # ── 溯源分时埋点（QD_GROUND_TIMING=1 / 2026-10-16）──────────────
     # 用户实测：复杂问题答案段 95 秒、期间零工具调用 ⇒ 需分辨

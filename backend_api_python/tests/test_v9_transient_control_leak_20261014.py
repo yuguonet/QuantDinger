@@ -44,6 +44,9 @@ def test_markers_cover_all_real_control_texts() -> None:
         "grounding_rewrite": (
             "【数字溯源拦截】某个数字无法溯源\n请只依据本轮工具输出中的数字重写结论；"
             "无法溯源的数字改为\"未获取\"并说明缺失口径。"),
+        "compliance_rewrite": (
+            "【结论合规拦截】命中禁止的确定性/营销式表述：稳赚。"
+            "请删除或改写这些承诺式表述。"),
         "mimo_empty": "Empty assistant response",
     }
     for name, text in samples.items():
@@ -87,13 +90,14 @@ def test_purge_removes_prior_turn_control_messages() -> None:
         # ← 上一轮的空回复轻推轮 / 溯源重写轮 prompt（同样会被 mimo 永久留存）
         {"role": "user", "content": "请用文字直接给出本轮结论（不要再调用工具）。"},
         {"role": "user", "content": "【数字溯源拦截】x\n请只依据本轮工具输出中的数字重写结论。"},
+        {"role": "user", "content": "【结论合规拦截】请重写为有条件的表述。"},
         # 真实对话必须保留
         {"role": "user", "content": "分析002866"},
         {"role": "assistant", "content": "传艺科技属于消费电子板块。"},
         {"role": "tool", "content": "收盘价 12.34"},  # 工具消息不参与（角色不符）
     ]
     removed = purge(messages)
-    assert removed == 4, f"应删 4 条瞬态控制消息，实际 {removed}"
+    assert removed == 5, f"应删 5 条瞬态控制消息，实际 {removed}"
 
     kept = [(m["role"], m["content"]) for m in messages]
     assert ("user", "现在买什么股?") in kept
@@ -103,6 +107,7 @@ def test_purge_removes_prior_turn_control_messages() -> None:
     # 确认污染源全没了
     assert all("已停止继续探索" not in (m.get("content") or "") for m in messages)
     assert all("【数字溯源拦截】" not in (m.get("content") or "") for m in messages)
+    assert all("【结论合规拦截】" not in (m.get("content") or "") for m in messages)
 
 
 def test_purge_is_noop_on_clean_history() -> None:

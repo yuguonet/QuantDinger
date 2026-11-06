@@ -213,6 +213,7 @@ TRANSIENT_CONTROL_MARKERS = (
     "（模型未返回文字内容",         # qd_agent._run_inner 空回复兜底文案
     "请用文字直接给出本轮结论",     # qd_agent._run_inner 空回复轻推 prompt
     "【数字溯源拦截】",             # qd_agent._run_inner 溯源重写 prompt
+    "【结论合规拦截】",             # qd_grounding._run_grounding_gate 合规重写 prompt
     "Empty assistant response",     # mimo BaseAgent.query 空响应字面量
 )
 

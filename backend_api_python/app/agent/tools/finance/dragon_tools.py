@@ -75,6 +75,14 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
         row = data.get(code)
         if not isinstance(row, dict) or "error" in row:
             continue
+        records = row.get("records")
+        if not isinstance(records, list) or not records:
+            row["detail_error"] = "无可核验的上榜日期，已跳过席位明细"
+            continue
+        record_date = str(records[0].get("date") or records[0].get("TRADE_DATE") or "")[:10]
+        if not record_date:
+            row["detail_error"] = "上榜记录缺少日期，已跳过席位明细"
+            continue
         try:
             d = _detail(code, look_back_days=max(1, min(days, 365)))
             # 形状容错：单股扁平 {seats,...} 或批量信封 {data:{code:{seats,...}}}
@@ -86,9 +94,17 @@ def get_dragon_tiger(codes: str = "", date: str = "", days: int = 30,
                 elif isinstance(d.get("data"), dict) and d["data"]:
                     src = d["data"].get(code) or next(iter(d["data"].values()))
             if isinstance(src, dict):
+                detail_date = str(src.get("detail_date") or "")[:10]
+                if detail_date != record_date:
+                    row["detail_error"] = (
+                        f"席位明细日期与上榜记录不一致（{detail_date or '未知'} vs "
+                        f"{record_date}），已跳过席位明细"
+                    )
+                    continue
                 for k in ("seats", "institution"):
                     if k in src:
                         row[k] = src[k]
+                row["detail_date"] = detail_date
             else:
                 row["detail_error"] = (d.get("error") if isinstance(d, dict) else None) or "明细获取失败"
         except Exception as e:  # 明细拉取失败不拖垮主结果，但显式标注（不静默）

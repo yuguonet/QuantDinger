@@ -88,7 +88,7 @@ DIM_WEIGHTS: Dict[str, int] = {
 DEFAULT_DIMS = ["grounding", "claims", "structure", "coverage"]
 
 # ── 机检规则（baseline.must 的检查项 id → 判据）──────────────────
-_FAKE_CERT = re.compile(r"必然|必定|保证(收益|盈利)|稳赚|包赚|100%|百分百|必涨|必跌|无风险套利")
+_EXTRA_CERTAINTY_PATTERNS = ("必然", "必定", "必涨", "必跌", "100%")
 _DIR_RE = re.compile(r"看多|看空|偏多|偏空|上涨|下跌|震荡|中性|买入|卖出|加仓|减仓|"
                      r"持有|补仓|观望|止盈|止损|割肉|突破|回调")
 _HORIZON_RE = re.compile(r"T\+\d|未来[一二三四五六七1-7]+[天日周月]|短线|中线|本周|"
@@ -138,12 +138,19 @@ def _chk_action(a: str, t: dict) -> bool:
 
 
 def _chk_no_fake(a: str, t: dict) -> bool:
-    return not _FAKE_CERT.search(a)
+    return not _certainty_hits(a)
 
 
 def _chk_compliance(a: str, t: dict) -> bool:
     from app.agent.utils.grounding import check_banned_phrases
     return not check_banned_phrases(a)
+
+
+def _certainty_hits(answer: str) -> list:
+    from app.agent.utils.grounding import BANNED_PHRASES, phrase_is_asserted
+
+    phrases = list(BANNED_PHRASES) + list(_EXTRA_CERTAINTY_PATTERNS)
+    return [phrase for phrase in phrases if phrase_is_asserted(answer, phrase)]
 
 
 _CHECKS: Dict[str, Callable[[str, dict], bool]] = {
@@ -247,7 +254,7 @@ def _score_grounding(task: dict, answer: str, corpus: str = "") -> float:
     from app.agent.utils.grounding import check_banned_phrases, check_grounding, extract_numbers
     banned = check_banned_phrases(answer)
     compliance = 100.0 if not banned else 50.0
-    certainty = 100.0 if not _FAKE_CERT.search(answer) else 50.0
+    certainty = 100.0 if not _certainty_hits(answer) else 50.0
     if (corpus or "").strip():
         ok, _why = check_grounding(answer, corpus)
         numbers = 100.0 if ok else 30.0

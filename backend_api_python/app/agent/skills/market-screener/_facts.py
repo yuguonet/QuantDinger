@@ -30,10 +30,7 @@ from typing import Any, Dict, List, Optional
 from ...log import logger
 
 from .common import (
-    call_tool, fetch_kline, _today_str, _data_day,
-    fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
-    fetch_hot_stocks_with_reason, fetch_hot_sectors,
-    scan_dragon_pullback, scan_eod_start, scan_lhb, _get_writer,
+    fetch_kline, _data_day, fetch_hot_sectors, _get_writer,
     compute_ma, compute_macd, compute_rsi, compute_volume_ratio,
 )
 
@@ -109,6 +106,19 @@ _MARKET_MEMO: Dict[str, Any] = {"at": 0.0, "day": "", "data": None}
 _MARKET_MEMO_TTL_S = float(os.getenv("QD_SCREENER_MARKET_TTL", "60") or 0)
 
 
+def _mood_label(score: int) -> str:
+    """情绪分 → 描述性标签（大盘/个股两档共用同一套刻度，便于并列阅读）。"""
+    if score >= 70:
+        return "偏强"
+    if score >= 55:
+        return "中性偏强"
+    if score >= 45:
+        return "中性"
+    if score >= 30:
+        return "偏弱"
+    return "弱势"
+
+
 def market_state() -> Dict[str, Any]:
     """市场层面客观事实：资金流向、涨跌停家数、炸板率、板块强弱、情绪描述标签。
 
@@ -116,9 +126,11 @@ def market_state() -> Dict[str, Any]:
     大盘资金近5日方向（fund_flow_days）与走弱环境标记（cautious）——早盘阶段
     涨停/炸板计数未成熟，这两块是仅有的先行信号。
 
-    注意：mood / mood_score / intraday_bias 是**描述性标签**（便于人和 LLM 快速
-    理解当前环境），不是入场规则 —— 怎么用由调用方决定。cautious=True 供下游
-    （_helpers._hints / soft_warnings）收紧选股用，同样不是自动砍候选。
+    注意：market_mood(_score) 与 stock_mood(_score) 是**两档独立**的描述性标签 ——
+    大盘档只看「指数日内强弱 + 大盘资金」，个股档只看「涨跌停比 / 涨停活跃度 /
+    炸板率」。二者常背离（资金强但赚钱效应差），不可互相替代，也不是入场规则。
+    intraday_bias 同为描述性标签。cautious=True 供下游（_helpers._hints /
+    soft_warnings）收紧选股用，同样不是自动砍候选。
 
     进程内 memo：默认 TTL 60s（`QD_SCREENER_MARKET_TTL` 秒，0=关闭），键含目标
     交易日故跨日不复用。动机是 inspect_stock 每查一只票都要调一次，而单次实测
@@ -126,7 +138,8 @@ def market_state() -> Dict[str, Any]:
 
     Returns:
         dict: fund_flow / zt_count / dt_count / broken_count / broken_rate /
-            strong_sectors / weak_sectors / mood / mood_score /
+            strong_sectors / weak_sectors / market_mood / market_mood_score /
+            stock_mood / stock_mood_score /
             index_intraday / fund_flow_days / intraday_bias / cautious
     """
     # 三池取数日 = **目标交易日**（非交易日回落上一交易日，见 common._data_day）：
@@ -199,7 +212,7 @@ def market_state() -> Dict[str, Any]:
     # ── 指数日内 + 大盘资金多日（2026-10-30 用户缺陷③：早盘预判力不够）──
     # 【为什么加】旧版只有资金/涨跌停/炸板三类计数，而早盘（10:00 前）涨停/炸板
     # 计数尚未成熟（封板还在变），唯一可用的先行信号是：①指数相对开盘强弱
-    # ②当日/近5日大盘资金方向。两块都是**描述性事实**（同 mood 性质，非入场规则）。
+    # ②当日/近5日大盘资金方向。两块都是**描述性事实**（同 market_mood/stock_mood 性质，非入场规则）。
     index_rows: List[Dict] = []
     try:
         from app.market_cn.index import get_index_realtime
@@ -229,7 +242,7 @@ def market_state() -> Dict[str, Any]:
     except Exception as e:
         src_errors.append(f"大盘资金多日源失败: {type(e).__name__}: {e}")
 
-    # 描述性早盘倾向（同 mood：便于人和 LLM 快速理解，不是入场规则）：
+    # 描述性早盘倾向（同 market_mood/stock_mood：便于人和 LLM 快速理解，不是入场规则）：
     #   指数全部在开盘价下方=偏弱；全部在上方=偏强；否则看当日资金定温和偏向。
     vs_opens = [r.get("vs_open_pct") for r in index_rows if r.get("vs_open_pct") is not None]
     bias = "震荡"
@@ -247,29 +260,84 @@ def market_state() -> Dict[str, Any]:
     persistent_out = len(seq) >= 3 and all(s == "outflow" for s in seq[-3:])
     cautious = (bias == "偏弱") or persistent_out
 
-    # 描述性情绪标签（历史口径，保持与 _helpers._mood_regime 兼容）
-    mood_score = 50
-    if net_inflow > 0:
-        mood_score += min(20, net_inflow // 10000000)
+    # ── 情绪分拆两档（2026-11-04）：大盘情绪 ≠ 个股赚钱效应 ──
+    # 旧版把「大盘资金流」与「涨停/跌停/炸板家数」加进同一个 50 基线的分里：
+    #   · 资金因子 2 亿即封顶（min(20, net_inflow//1e7)），659 亿与 2 亿同分；
+    #   · 涨跌停因子阈值落在死区（zt 要 >30 才加、dt 要 >20 才减、炸板率要 >40 才减），
+    #     20 涨停 / 14 跌停 / 37.5% 炸板这种分化市三项全不触发；
+    #   ⇒ 70 分实际只由资金一个维度撑起，把分化市标成「偏强」。拆开后两档独立可读：
+    #   大盘档回答「指数和资金强不强」，个股档回答「钱好不好赚」，二者常背离。
+    _yi = net_inflow / 1e8
+    market_mood_score = 50
+    if _yi >= 200:
+        market_mood_score += 20
+    elif _yi >= 50:
+        market_mood_score += 16
+    elif _yi >= 20:
+        market_mood_score += 14
+    elif _yi >= 5:
+        market_mood_score += 10
+    elif _yi >= 1:
+        market_mood_score += 6
+    elif _yi > 0:
+        market_mood_score += 2
+    elif _yi > -1:
+        market_mood_score -= 2
+    elif _yi > -5:
+        market_mood_score -= 6
+    elif _yi > -20:
+        market_mood_score -= 10
+    elif _yi > -50:
+        market_mood_score -= 14
+    elif _yi > -200:
+        market_mood_score -= 16
     else:
-        mood_score += max(-20, net_inflow // 10000000)
-    if zt_count > 30:
-        mood_score += 10
-    elif zt_count < 15:
-        mood_score -= 10
-    if dt_count > 20:
-        mood_score -= 15
-    if broken_rate > 40:
-        mood_score -= 10
-    elif broken_rate < 20:
-        mood_score += 5
-    mood_score = max(0, min(100, mood_score))
-    mood = "偏强" if mood_score >= 70 else ("中性" if mood_score >= 50 else ("偏弱" if mood_score >= 30 else "弱势"))
+        market_mood_score -= 20
+    if vs_opens:
+        _up_n = sum(1 for v in vs_opens if v > 0)
+        if _up_n == len(vs_opens):
+            market_mood_score += 10
+        elif _up_n * 3 <= len(vs_opens):
+            market_mood_score -= 10
+        elif _up_n * 2 > len(vs_opens):
+            market_mood_score += 4
+    if persistent_out:
+        market_mood_score -= 8
+    market_mood_score = max(0, min(100, market_mood_score))
+
+    stock_mood_score = 50
+    if dt_count <= 0:
+        stock_mood_score += 15 if zt_count >= 20 else 6
+    else:
+        _zt_dt = zt_count / dt_count
+        if _zt_dt >= 3:
+            stock_mood_score += 15
+        elif _zt_dt >= 2:
+            stock_mood_score += 8
+        elif _zt_dt < 0.8:
+            stock_mood_score -= 15
+        elif _zt_dt < 1.2:
+            stock_mood_score -= 8
+    if zt_count >= 60:
+        stock_mood_score += 10
+    elif zt_count >= 30:
+        stock_mood_score += 5
+    elif zt_count < 10:
+        stock_mood_score -= 10
+    if broken_rate >= 45:
+        stock_mood_score -= 15
+    elif broken_rate >= 30:
+        stock_mood_score -= 8
+    elif broken_rate < 15:
+        stock_mood_score += 6
+    stock_mood_score = max(0, min(100, stock_mood_score))
 
     out = {
         "fund_flow": net_inflow,
-        "mood": mood,
-        "mood_score": mood_score,
+        "market_mood": _mood_label(market_mood_score),
+        "market_mood_score": market_mood_score,
+        "stock_mood": _mood_label(stock_mood_score),
+        "stock_mood_score": stock_mood_score,
         "strong_sectors": strong_sectors,
         "weak_sectors": weak_sectors,
         "zt_count": zt_count,
@@ -579,334 +647,3 @@ def detect_patterns(bars: List[Dict], params: Dict[str, float] = None) -> List[D
     return found
 
 
-# ═══════════════════════════════════════════════════════════════
-#  候选池编排（只负责「从哪取」，不负责「留哪只」）
-# ═══════════════════════════════════════════════════════════════
-
-# 候选来源清单 —— 全部给，由调用方通过 sources= 自选，不再按策略写死。
-POOL_SOURCES = ("zt", "eod_zt", "eod_start", "dragon", "hot", "search", "recent_zt", "lhb")
-
-_SOURCE_DEFAULT = {
-    "intraday": ("zt", "dragon", "search", "lhb"),
-    "eod": ("eod_start", "search", "lhb"),
-    "post_market": ("hot", "search", "recent_zt", "dragon", "lhb"),
-}
-
-# search_stocks 的查询串只是**默认建议**，调用方可用 queries= 完全替换。
-# 扩词（2026-10-20）：各时段默认查询统一覆盖资金流/板块/连板/涨停/情绪等多维度，
-# 配合 search_top_n 形成宽候选池，再由客观预排除与软门槛收窄。
-_QUERY_DEFAULT = {
-    "intraday": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
-        "放量突破 站上20日均线",
-        "缩量企稳 底部放量",
-    ),
-    "eod": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
-        "涨幅3%到8% 换手率大于3% 非ST",
-    ),
-    "post_market": (
-        "主力资金流向",
-        "行业板块涨幅",
-        "连板涨停",
-        "高换手活跃",
-        "机构调研",
-        "业绩预增",
-        "龙虎榜上榜",
-        "并购重组",
-        "涨幅1%到8% 换手率大于2% 非ST",
-        "近10日涨停 换手率大于2% 非ST",
-    ),
-}
-
-
-def _annotate_empty_pool_calendar(missing: List[str], date: str) -> None:
-    """空池兜底：校验交易日历，把「非真实空候选」显式写进 missing。
-
-    纯真空池（全部源成功返回空）在**交易日**上才是真实筛选结果；非交易日或
-    日历不可确认时，空池不可作为「今日无行情机会」的证据 —— 否则主 agent 会
-    把休市/日历故障当「今日无候选」交付（2026-10-21 缺陷闭环的最后一块）。
-    日历复用 app/utils/trading_calendar.py（akshare 沪深交易日历 + pickle 缓存，
-    项目唯一既有交易日历实现），此处不自造日历；日历拉取失败视为「不可确认」
-    如实留痕，不做任何推测性兜底。
-    """
-    try:
-        from app.utils.trading_calendar import is_trading_day
-        trading_day = bool(is_trading_day(date))
-    except Exception as e:
-        missing.append(
-            f"交易日历不可确认（空池无法区分节假日与数据故障，非真实空候选）: "
-            f"{type(e).__name__}: {e}")
-        return
-    if not trading_day:
-        missing.append(f"{date} 非交易日（日历核实）：空池为休市所致，非真实候选筛选结果")
-
-
-def candidate_pool(
-    strategy: str = "post_market",
-    date: str = None,
-    sources: Any = None,
-    queries: Any = None,
-        search_top_n: int = 50,
-    min_turnover: float = None,
-    limit: int = None,
-    fill_quote: bool = True,
-) -> Dict[str, Any]:
-    """按来源取候选。**不做任何取舍**：不按涨跌幅/连板排序，不截断，不打分。
-
-    Args:
-        strategy: 时段（intraday / eod / post_market），仅用于挑 sources / queries 默认值
-        date: 交易日，默认**目标交易日**（今日非交易日则取最近一个交易日，
-            见 common._data_day）；显式传入则以传入值为准
-        sources: 逗号串或列表，取值见 POOL_SOURCES；None = 用该时段的默认组合
-        queries: 逗号串或列表，传给 search_stocks；None = 用默认建议词
-        search_top_n: 每条查询返回上限
-        min_turnover: 换手率下限过滤；None = 不过滤（推荐由 profile 的 hard 标记去处理）
-        limit: 返回条数上限；None = 不截断
-        fill_quote: 是否用实时行情批量回填 price / change_pct / turnover_pct / price extremes
-
-    Returns:
-        dict: strategy / date / sources_used / pool_size / main_themes /
-            candidates[{code,name,source,reason,continuous_days,zt_time,change_pct,turnover_pct,...}] /
-            continuous_board / dragon_pullback / eod_zt / eod_start / missing
-    """
-    # 目标交易日（非交易日回落上一交易日，见 common._data_day）——三池按此日取数
-    date = date or _data_day()
-    missing: List[str] = []
-
-    srcs = [s.strip() for s in (sources.split(",") if isinstance(sources, str) else (sources or [])) if s.strip()]
-    if not srcs:
-        srcs = list(_SOURCE_DEFAULT.get(strategy, ("search",)))
-    unknown = [s for s in srcs if s not in POOL_SOURCES]
-    missing.extend(f"未知候选源: {s}" for s in unknown)
-    srcs = [s for s in srcs if s in POOL_SOURCES]
-
-    qs = [q.strip() for q in (queries.split(",") if isinstance(queries, str) else (queries or [])) if q.strip()]
-    if "search" in srcs and not qs:
-        qs = list(_QUERY_DEFAULT.get(strategy, ()))
-
-    pool: Dict[str, Dict] = {}
-
-    def _put(code: str, payload: Dict) -> None:
-        if not code:
-            return
-        if code in pool:
-            old = pool[code]["source"]
-            if payload["source"] not in old.split("+"):
-                pool[code]["source"] = f"{old}+{payload['source']}"
-            for k, v in payload.items():
-                if k != "source" and pool[code].get(k) in (None, "", 0):
-                    pool[code][k] = v
-            return
-        pool[code] = payload
-
-    continuous_board: List[Dict] = []
-    eod_zt: List[Dict] = []
-    eod_start: List[Dict] = []
-    dragon_pullback: List[Dict] = []
-    lhb: List[Dict] = []
-
-    # ── 涨停池（连板 / 尾盘封板）──
-    # 源失败必须进 missing（2026-10-21）：fetch_zt_pool 已 fail-fast，
-    # 静默漏记会让下游把「数据不可用」当「今日无候选」交付。
-    if "zt" in srcs or "eod_zt" in srcs:
-        try:
-            zt_pool = fetch_zt_pool(date)
-        except Exception as e:
-            zt_pool = []
-            logger.warning("[MktScreen] 涨停池源失败: %s", e)
-            missing.append(f"涨停池源失败: {type(e).__name__}: {e}")
-        for s in zt_pool or []:
-            code = str(s.get("stock_code", "") or "")
-            if not code:
-                continue
-            days = int(s.get("continuous_zt_days", 1) or 1)
-            zt_time = s.get("zt_time", "") or ""
-            row = {
-                "code": code, "name": s.get("stock_name", ""),
-                "reason": s.get("reason", ""), "continuous_days": days,
-                "zt_time": zt_time, "seal_amount": s.get("seal_amount", 0),
-                "change_pct": None, "turnover_pct": s.get("turnover_rate", 0),
-            }
-            if "zt" in srcs and days >= 2:
-                row["source"] = "连板"
-                continuous_board.append(row)
-                _put(code, row)
-            if "eod_zt" in srcs and ":" in zt_time:
-                try:
-                    hh, mm = zt_time.split(":")[:2]
-                    if int(hh) == 14 and int(mm) >= 30:
-                        row2 = dict(row, source="尾盘封板")
-                        eod_zt.append(row2)
-                        _put(code, row2)
-                except (ValueError, IndexError):
-                    pass
-
-    # ── 尾盘启动（行情刚启动 + 尾盘资金流入 + 未涨停，2026-11-02 拍板替换 eod 默认）──
-    if "eod_start" in srcs:
-        try:
-            eod_start = scan_eod_start(date) or []
-        except Exception as e:
-            eod_start = []
-            logger.warning("[MktScreen] 尾盘启动源失败: %s", e)
-            missing.append(f"尾盘启动源失败: {type(e).__name__}: {e}")
-        for s in eod_start:
-            _put(str(s.get("code", "")), dict(s))
-
-    # ── 龙回头 ──
-    if "dragon" in srcs:
-        try:
-            dragon_pullback = scan_dragon_pullback(date) or []
-        except Exception as e:
-            dragon_pullback = []
-            logger.warning("[MktScreen] 龙回头源失败: %s", e)
-            missing.append(f"龙回头源失败: {type(e).__name__}: {e}")
-        for s in dragon_pullback:
-            _put(str(s.get("code", "")), {
-                "code": str(s.get("code", "")), "name": s.get("name", ""),
-                "source": "龙回头", "reason": s.get("reason", ""),
-                "pullback_signals": s.get("signals", []),
-                "pullback_pct": s.get("pullback_pct"),
-                "strength_score": s.get("strength_score"),
-                "change_pct": None, "turnover_pct": s.get("turnover_pct", 0),
-            })
-
-    if "lhb" in srcs:
-        try:
-            lhb = scan_lhb(date) or []
-        except Exception as e:
-            lhb = []
-            logger.warning("[MktScreen] 龙虎榜源失败: %s", e)
-            missing.append(f"龙虎榜源失败: {type(e).__name__}: {e}")
-        for s in lhb:
-            _put(str(s.get("code") or ""), {
-                "code": str(s.get("code") or ""), "name": s.get("name", ""),
-                "source": "龙虎榜", "reason": s.get("reason", ""),
-                "lhb_count": s.get("count"), "lhb_net": s.get("net"),
-                "change_pct": s.get("change_pct"), "turnover_pct": s.get("turnover_pct"),
-            })
-
-    # ── 当日热点题材股 ──
-    main_themes: List = []
-    if "hot" in srcs:
-        try:
-            hot = fetch_hot_stocks_with_reason(date) or {}
-        except Exception as e:
-            hot = {}
-            logger.warning("[MktScreen] 热点题材源失败: %s", e)
-            missing.append(f"热点题材源失败: {type(e).__name__}: {e}")
-        main_themes = [(t, c) for t, c in (hot.get("hot_tags") or [])[:10]]
-        for s in hot.get("stocks", []) or []:
-            code = str(s.get("code", "") or "")
-            if len(code) == 6:
-                _put(code, {
-                    "code": code, "name": s.get("name", ""), "source": "热点题材",
-                    "reason": s.get("reason", ""), "change_pct": s.get("change_pct"),
-                    "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
-                })
-
-    # ── 条件搜索（含 recent_zt）──
-    if "search" in srcs and qs:
-        for q in qs:
-            try:
-                res = call_tool("search_stocks", query=q, source="eastmoney", top_n=int(search_top_n))
-            except Exception as e:
-                missing.append(f"条件搜索[{q}]: {type(e).__name__}: {e}")
-                continue
-            stocks = (res or {}).get("stocks", []) if isinstance(res, dict) else []
-            if isinstance(res, dict) and res.get("error") and not stocks:
-                missing.append(f"条件搜索[{q}]: {res.get('error')}")
-            for s in stocks:
-                code = str(s.get("code", "") or s.get("symbol", "") or "")
-                if len(code) != 6:
-                    continue
-                _put(code, {
-                    "code": code, "name": s.get("name", ""), "source": "条件搜索",
-                    "search_query": q, "reason": s.get("reason", ""),
-                    "change_pct": s.get("change_pct") or s.get("pct_change"),
-                    "turnover_pct": s.get("turnover_pct") or s.get("turnover_rate"),
-                })
-    elif "recent_zt" in srcs:
-        missing.append("recent_zt 需要 queries（近N日涨停靠 search_stocks 表达）")
-
-    # ── 批量回填实时行情（事实补全，不是筛选；2026-10-20 改分块绕过 20 只截断）──
-    if fill_quote and pool:
-        try:
-            from .common import batch_realtime_quotes
-            quotes, failed_chunks = batch_realtime_quotes(list(pool.keys()))
-            for chunk in failed_chunks:
-                missing.append(f"行情回填: 分块失败{len(chunk)}只({','.join(chunk[:3])}...)")
-            for code_str, q in quotes.items():
-                if not isinstance(q, dict):
-                    continue
-                target = pool.get(str(q.get("stock_code") or code_str))
-                if target is None:
-                    continue
-                # 契约对齐（2026-10-21 线上假阴性根因）：get_realtime_quote 的
-                # 统一键是 last/changePercent，写 price/change_pct 永远取不到
-                for dst, src in (("price", "last"), ("change_pct", "changePercent"),
-                                 ("turnover_pct", "turnover_pct"), ("turnover_pct", "turnover_rate"),
-                                 ("vol_ratio", "vol_ratio"), ("high", "high"),
-                                 ("low", "low"), ("amount", "amount")):
-                    v = q.get(src)
-                    if v not in (None, "", 0):
-                        target[dst] = v
-                # 扩展字段：name / 涨跌停价 / 昨收（供可买性判断与涨停识别）
-                nm = q.get("name")
-                if nm not in (None, ""):
-                    target["name"] = nm
-                for dst, src in (("limit_up", "limit_up"), ("limit_down", "limit_down")):
-                    v = q.get(src)
-                    # 0 是合法哨兵（无涨跌幅限制），仅排除 None / 空串
-                    if v not in (None, ""):
-                        try:
-                            target[dst] = float(v)
-                        except (TypeError, ValueError):
-                            pass
-                pc = q.get("previousClose")
-                if pc not in (None, "", 0):
-                    target["previous_close"] = pc
-        except Exception as e:
-            missing.append(f"行情回填: {type(e).__name__}: {e}")
-
-    candidates = list(pool.values())
-    if min_turnover is not None:
-        lo = float(min_turnover)
-        # turnover_pct 缺失（0/None）时不据此剔除 —— 避免把没有字段的票误杀
-        candidates = [c for c in candidates
-                      if not (c.get("turnover_pct") and float(c["turnover_pct"]) < lo)]
-
-    # 空池兜底校验交易日历（2026-10-21）：非交易日/日历不可确认必须显式标注，
-    # 保证「纯真空池 + missing 为空」只可能出现在可核实的交易日上。
-    if not candidates:
-        _annotate_empty_pool_calendar(missing, date)
-
-    return {
-        "strategy": strategy,
-        "date": date,
-        "sources_used": srcs,
-        "queries_used": qs,
-        "pool_size": len(candidates),
-        "main_themes": main_themes,
-        "candidates": candidates[:limit] if limit else candidates,
-        "continuous_board": continuous_board[:20],
-        "dragon_pullback": dragon_pullback[:20],
-        "eod_zt": eod_zt[:20],
-        "eod_start": eod_start[:20],
-        "lhb": lhb[:20],
-        "missing": missing,
-    }

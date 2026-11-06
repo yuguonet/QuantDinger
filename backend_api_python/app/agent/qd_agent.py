@@ -361,32 +361,13 @@ class QDAgent(ToolFaceMixin, PreselectMixin, GuardMixin, BudgetMixin,
         # ── TODO(阶段验收)·2026-10-01 标记，暂不实现 ──────────────────────
         # 旧系统在 execute↔finalize 之间插 verify 节点做**阶段验收**（每阶段打分、
         # 部分达标保留、不达标回炉一次），随 nodes.py 退役消失。
-        # 现状：grounding gate 只覆盖"数字溯源"这一条纪律，阶段粒度的是否达标无人判。
+        # 现状：grounding gate 覆盖数字溯源与禁用承诺，阶段粒度的是否达标无人判。
         # 用户裁定（2026-10-01）：**暂不实现**——当前未观察到偏差较大的结果，
         # 且阶段验收的价值主要在"多轮大循环的大项目"里（单轮短任务加了只增成本）。
         # 将来要做的落点就在这里（formatter 之后、grounding 之前），判据与埋点见
         # docs/AGENT_DESIGN_v2_20261001.md §阶段验收（暂缓）。搜索本标记即可定位。
-        # 异常收尾（截断/空回复/预算软收尾）不做溯源重写：文案本身是控制语，
-        # 重写轮还会立刻再触发同一熔断（成本计数器不归零），纯属浪费。
-        if self.config.grounding_gate and status not in ("truncated", "empty", "budget_wrapped"):
-            corpus = self._observation_corpus()
-            if corpus.strip():
-                _t0g = _time.perf_counter(); guide = self._grounding_violation_timed(message, corpus); retries = 0
-                while guide is not None and retries < self.config.grounding_max_retries:
-                    retries += 1
-                    # 同上：只归零步数（否则主轮耗尽后重写轮一进来就死），
-                    # 成本与累计步数继续累计，由 run_step_cap / token 预算兜底。
-                    self._steps_taken = 0
-                    _t1g = _time.perf_counter(); self._g_mark("REWRITE#%d 前 messages=%d" % (retries, len(getattr(self, "messages", []) or [])), _t0g)
-                    status, message = super().run(
-                        f"【数字溯源拦截】{guide}\n"
-                        "请只依据本轮工具输出中的数字重写结论；无法溯源的数字改为"
-                        "\"未获取\"并说明缺失口径。"
-                    )
-                    self._g_mark("REWRITE#%d 后" % retries, _t1g)
-                    guide = self._grounding_violation_timed(message, corpus)
-                if guide is not None:
-                    status = "grounding_failed"
+        # 溯源 + 合规收尾；异常结束状态不做重写（见 GroundingMixin）。
+        status, message = self._run_grounding_gate(status, message)
 
         # ① 结果先出：收尾链转后台（C3P 实测 80~155s，原先用户干等）；细节见
         #   `qd_aftercare._spawn_tail`，QD_TAIL_ASYNC=0 回退同步。

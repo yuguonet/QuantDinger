@@ -16,9 +16,13 @@ mimo `base.run` 捕获后返回 `(type(e).__name__, str(e))`，`_run_inner` 的�
 """
 from __future__ import annotations
 
+import logging
+
 from mimoagent.agents.base import LimitsExceeded
 
 from .upstream_compat import invoke_compaction
+
+logger = logging.getLogger(__name__)
 
 
 class BudgetMixin:
@@ -51,10 +55,7 @@ class BudgetMixin:
             invoke_compaction(self)
             return int(pre)
         except Exception as e:
-            try:
-                logger.debug("[turn_compact] 主动压缩失败(fail-open): %s", e)
-            except Exception:
-                pass
+            logger.warning("[turn_compact] 主动压缩失败(fail-open): %s", e)
             return 0
 
     def _account_budget(self) -> None:

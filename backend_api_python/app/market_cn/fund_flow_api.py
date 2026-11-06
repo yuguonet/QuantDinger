@@ -39,6 +39,7 @@ fund_flow_api.py — 资金流**唯一出入口** (2026-09-29 收口)
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -878,7 +879,10 @@ def sync_fund_flow_history(days: int = 30,
         days: 5~30
         codes: 个股列表 (空则不同步个股)
         board_types: ["industry","concept"]; 空则不刷板块
-        with_sector_today: True 时若 board_types 非空则先拉「今日」再入库
+        with_sector_today: True 时若 board_types 非空则把板块资金流落库。
+            参数名沿用历史，实际覆盖窗口由 QD_SECTOR_SYNC_INDICATOR 指定
+            （默认 10日 = realtime_snapshot 全部可得交易日），使 qd_fund_flow_sector
+            留下按日序列而不是只有当日一行。只写本地 snapshot 派生口径，不打远端。
 
     Returns:
         {"days", "market", "stock", "sector", "pruned_note"}
@@ -905,8 +909,9 @@ def sync_fund_flow_history(days: int = 30,
     btypes = list(board_types or [])
     qcount = 0
     if with_sector_today and btypes:
+        indicator = os.getenv("QD_SECTOR_SYNC_INDICATOR", "") or "10日"
         for bt in btypes:
-            rows = sector_fund_flow_realtime(board_type=bt, indicator="今日")
+            rows = sector_fund_flow_realtime(board_type=bt, indicator=indicator)
             qcount += upsert_sector(rows)
     summary["sector"] = qcount
     summary["pruned_note"] = f"history keep last {days} days (5~30)"

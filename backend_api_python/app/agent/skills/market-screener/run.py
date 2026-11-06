@@ -7,7 +7,7 @@ market-screener/run.py — LLM 工具出口（不含任何选股规则）
 LLM 只能消费别人替它算好的结论 —— 这就是「自由度太小、分析深度不够」的根因。
 
 现在的分工：
-    _facts.py                      纯客观计算（市场事实 / 多周期几何 / 形态识别 / 候选池取数）
+    _facts.py                      纯客观计算（市场事实 / 多周期几何 / 形态识别）
     _helpers.py                    证据加工（证据卡 / 预测分 / 汇总）
     references/strategy-rules.md   规则（怎么解读上面的事实，由 LLM 读、采纳或推翻）
 
@@ -24,8 +24,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ...log import logger
 
-from ._helpers import select_strategy, build_report, resolve_names, profile_candidates as _profile_candidates, filter_candidates as _filter_candidates, tech_summary, predict_one, _mood_regime, prewarm_market_klines, cross_verdict, _num_or_none, _has_stretched_streak_risk
-from ._facts import candidate_pool, market_state as _market_state, multitimeframe as _multitimeframe, detect_patterns as _detect_patterns, POOL_SOURCES, _PATTERN_PARAMS_DEFAULT
+from ._helpers import (select_strategy, build_report, resolve_names,
+                       tech_summary, predict_one, _mood_regime,
+                       prewarm_market_klines, cross_verdict, _num_or_none)
+from ._facts import (market_state as _market_state,
+                     multitimeframe as _multitimeframe,
+                     detect_patterns as _detect_patterns,
+                     _PATTERN_PARAMS_DEFAULT)
 from .common import SkillResult, fetch_kline, warm_market_pool
 
 
@@ -41,7 +46,10 @@ def market_state() -> dict:
 
     返回:
         dict: fund_flow=当日净流入；zt_count/dt_count/broken_count/broken_rate=涨停/跌停/炸板；
-            strong_sectors/weak_sectors=行业涨跌；mood/mood_score=描述性情绪标签（非入场规则）；
+            strong_sectors/weak_sectors=行业涨跌；
+            market_mood/market_mood_score=**大盘情绪**（指数日内+大盘资金）；
+            stock_mood/stock_mood_score=**个股情绪**（涨跌停比/涨停活跃度/炸板率）；
+            两档独立、常背离，不可互相替代，均非入场规则；
             index_intraday=三大指数涨跌/相对开盘位置；fund_flow_days=近5日大盘资金方向；
             intraday_bias=偏强/震荡/偏弱；cautious=走弱环境标记。
     """
@@ -49,87 +57,8 @@ def market_state() -> dict:
         return SkillResult(_market_state())
     except Exception as e:
         logger.warning("[market-screener] market_state 失败: %s", e)
-        return SkillResult({"error": str(e), "mood": "未知", "mood_score": None})
-
-
-def pre_screen(sources: str = None, queries: str = None, search_top_n: int = 50,
-               min_turnover: float = None, limit: int = None) -> dict:
-    """拿候选池与市场情绪。只负责「从哪些渠道取」，不做任何取舍与排序。
-
-    参数:
-        sources: 逗号分隔的候选来源，取值 zt(连板≥2) / eod_zt(尾盘封板) /
-            eod_start(尾盘启动: 刚启动+尾盘流入+未涨停) / dragon(龙回头) /
-            hot(当日热点题材) / search(条件搜索) / recent_zt(近期涨停) / lhb(近10交易日龙虎榜)。留空用时段的默认组合。
-        queries: 逗号分隔的 search_stocks 查询串，覆盖默认建议词
-        search_top_n: 每条查询返回上限，默认 50
-        min_turnover: 换手率下限；留空 = 不过滤（换手不足会在画像的 hard 里标记，由你决定）
-        limit: 返回条数上限；留空 = 不截断
-
-    返回:
-        dict: strategy=时段；market=市场事实；candidates=候选列表；continuous_board /
-            dragon_pullback / eod_zt / eod_start=各来源明细；main_themes=当日主线；missing=取数缺口。
-    """
-    strategy = select_strategy()
-    logger.info("[market-screener] pre_screen 策略: %s 来源: %s", strategy, sources or "默认")
-
-    missing: list = []
-    try:
-        pool = candidate_pool(
-            strategy=strategy, sources=sources, queries=queries,
-            search_top_n=int(search_top_n or 50),
-            min_turnover=None if min_turnover is None else float(min_turnover),
-            limit=None if limit is None else int(limit),
-        )
-    except Exception as e:
-        logger.warning("[market-screener] 候选池取数失败: %s", e)
-        return SkillResult({
-            "strategy": strategy, "error": str(e),
-            "candidates": [], "main_themes": [], "market": {}, "missing": [str(e)],
-        })
-
-    try:
-        market = _market_state()
-    except Exception as e:
-        market = {}
-        missing.append(f"市场状态: {type(e).__name__}: {e}")
-    else:
-        # 源级失败显性化（2026-10-21）：market_state 对涨停/跌停/炸板池降级返回但带
-        # source_errors，不合并进 missing 的话 dt/broken 源故障仍然不可见
-        for _se in (market.get("source_errors") or []):
-            missing.append(f"市场状态: {_se}")
-
-    pool["market"] = market
-    pool["sources_available"] = list(POOL_SOURCES)
-    pool["missing"] = list(pool.get("missing") or []) + missing
-    return SkillResult(pool)
-
-
-def profile_candidates(prescreen_result: dict, limit: int = 20, with_flow: bool = True,
-                       with_pred: bool = True) -> dict:
-    """给候选做「证据卡」—— 只陈述事实，不淘汰任何一只。
-
-    你可以（也应当）在拿到结果后自己写 Python 排序/分组/过滤/加自定义加权；
-    hard 字段是客观障碍（买不进/ST/流动性），请自行决定是排除还是降权。
-
-    参数:
-        prescreen_result: pre_screen() 的返回值
-        limit: 最多画像几只，默认 20（超出部分计入 trimmed）
-        with_flow: 是否取资金流，默认 True
-        with_pred: 是否挂 P(次日涨) 模型分，默认 True
-
-    返回:
-        dict: strategy / market / mood_regime / themes / hints(参考门槛，非硬约束) /
-            profiles[{code,name,source,reason,price,change_pct,turnover_pct,amount_wan,
-                      theme{hit,tags},hard[],warnings[],tech{...},flow{...},missing[]}] /
-            trimmed / missing / errors
-    """
-    if not isinstance(prescreen_result, dict):
-        return SkillResult({"error": "prescreen_result 必须是 pre_screen() 的返回值", "profiles": []})
-    bundle = _profile_candidates(
-        prescreen_result, limit=int(limit or 20),
-        with_flow=bool(with_flow), with_pred=bool(with_pred),
-    )
-    return SkillResult(bundle)
+        return SkillResult({"error": str(e), "market_mood": "未知", "market_mood_score": None,
+                            "stock_mood": "未知", "stock_mood_score": None})
 
 
 def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> dict:
@@ -205,21 +134,6 @@ def detect_patterns(codes: str, days: int = 60, params: str = None) -> dict:
     return SkillResult({"patterns": out, "params_used": used, "missing": missing})
 
 
-def filter_candidates(prescreen_result: dict) -> str:
-    """便捷形式（旧流程兼容）：剔除有硬障碍的候选，返回逗号分隔 codes。
-
-    想自己看证据做取舍请用 profile_candidates()。
-
-    参数:
-        prescreen_result: pre_screen() 的返回值
-
-    返回:
-        str: 逗号分隔股票代码，无符合项时返回空字符串
-    """
-    return _filter_candidates(prescreen_result)
-
-
-# 结论写法（内嵌到结果**最前**，主 agent 打开预览第一眼看到；不必 read_skill）
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
         "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了能不能全身而退。"
@@ -244,6 +158,12 @@ _REPORT_GUIDE = {
              "funnel.baseline_hard=被非封板 hard 规则拦掉的只数；"
              "funnel.baseline_risk=其中高连板且远离 MA5 的风险提示数；"
              "funnel 其余键（rounds/pool_raw/deep_n/eastmoney_ok）只用于判断取数是否完整",
+    "limit_up_ref": "涨停参考清单（**不进 deep 分析**）：每项 {code,name,board,track,t_first,dup_n,reason}。"
+                    "决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；"
+                    "它只回答「该板块此刻几只封板、几点封的、几个板块同时选中」——"
+                    "用来判断**未涨停票所在板块**的强弱与资金共识。"
+                    "**禁止**把清单里的票写进「买什么」，也不要在正文整表罗列；"
+                    "可作为「该板块已有多只封板」的旁证出现。",
     "buyable": "**只在盘中此刻（strategy=intraday）生效**：rt.limit_up=true 或 rt.limit_down=true → 只进排除表，禁止进可买表；"
                "盘后/尾盘一律放行——封板/跌停是事实不是排除令，可进「买什么」但要写明「当日已封板」"
                "与次日买点（一字板风险：需等开板或回踩支撑，不追集合竞价）；接不接由你的逻辑决定，须给理由；"
@@ -260,10 +180,12 @@ _REPORT_GUIDE = {
             "别因为「没开板」就当强；one_word/vthick/thick 才是有厚封单支撑的强封。"
             "盘后以此估次日强弱，不因「买不到」降权；买得到买不到由你按当时段口径处理。",
     "entry_exit": "★ **顺序不能反，买点不是模板**：\n"
-                  "① 先定姿态（读 market）：mood 偏强 + fund_flow_days 净流入 → 可放宽，允许给突破/追价"
-                  "买点、容忍较高乖离、推荐只数可多；cautious=true 或 mood 偏弱 → 收紧，只给回踩买点、"
-                  "买点压到更深的支撑、宁可少给；中性环境按个股自身结构定。"
-                  "姿态是**每次按环境算**的，不是固定偏保守。\n"
+                  "① 先定姿态（读 market 的**两档情绪**）：大盘档 market_mood 偏强 + fund_flow_days "
+                  "净流入 → 可放宽，允许给突破/追价买点、容忍较高乖离、推荐只数可多；cautious=true "
+                  "或 market_mood 偏弱 → 收紧，只给回踩买点、买点压到更深的支撑、宁可少给；"
+                  "中性环境按个股自身结构定。**个股档 stock_mood 另算一票**：它衡量当日赚钱效应"
+                  "（涨跌停比/炸板率），stock_mood 偏弱时即使大盘强也不追高——两档背离是大盘强、"
+                  "个股难做，按收紧执行。姿态是**每次按环境算**的，不是固定偏保守。\n"
                   "② 再挑**关键位置**（不是固定 MA5/MA10/MA20）：候选=MA5/MA10/MA20、hi20/lo20 区间边界、"
                   "前高前低、近期密集成交区、跳空缺口、涨停板起点；rank 每行已给两侧最近位置："
                   "**sup=现价下方最近（承接位）**、**res=现价上方最近（突破位）**；"
@@ -294,7 +216,7 @@ _REPORT_GUIDE = {
     "stance_rule": "禁止「一律回踩均线」，也禁止**把 rank 的 sup.px 直接当买点**——sup 只是「现价下方"
                    "最近的位置」，照抄的结果是三只票买点全在现价下方、当天一只也买不到。"
                    "若所有票的买点都等于 sup.px 或都写成 MA5/MA10，说明没读环境、在用模板。"
-                   "强环境（mood 偏强 + fund_flow_days 净流入）该给的是「突破 res 追」或「不破 sup 持有」；"
+                   "强环境（market_mood 偏强 + fund_flow_days 净流入）该给的是「突破 res 追」或「不破 sup 持有」；"
                    "弱环境才把买点压到 sup 下方一档，并且只留能当日成交的。"
                    "**买点形态要跟着强度走**：强度加分项多的给「突破 hi_today 追」，加分项少的只给回踩；"
                    "全名单买点长得一模一样（全回踩或全突破）同样是没排序。",
@@ -335,10 +257,13 @@ _REPORT_GUIDE = {
               "主论据= 强度四件套 / MA 排列 / flow / 位置透支档；rt 看现价/涨跌停",
     "board_cut": "zt_streak>=3 默认只写 T+1",
     "words": "方向用 看多/中性/看空/回避；用户问持仓才写「兑现」",
-    "market": "mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors；"
-              "**环境决定姿态，两个方向都要用**：cautious=true 或 mood 偏弱 → 提高门槛、减少只数、"
-              "只做有支撑的票、买点压深一档；mood 偏强 + fund_flow_days 净流入 → 放宽（可给突破买点、"
+    "market": "market_mood/stock_mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors；"
+              "**环境决定姿态，两个方向都要用**：cautious=true 或 market_mood 偏弱 → 提高门槛、减少只数、"
+              "只做有支撑的票、买点压深一档；market_mood 偏强 + fund_flow_days 净流入 → 放宽（可给突破买点、"
               "容忍较高乖离、只数可多）。不要只取「收紧」这一半。"
+              "**大盘档与个股档不可互相替代**：market_mood 回答指数与资金强不强，决定整体姿态；"
+              "stock_mood 回答钱好不好赚，决定敢不敢追高；两者背离（大盘强、个股档偏弱）时按收紧执行，"
+              "并把分歧写进风险行。"
               "大盘本身最多进「风险」一行轻注，不得当筛选主条件",
     "fund_trend": "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 net_wan；"
                   "单日大额流入不等于趋势，连续3日以上同向才算趋势；剔除最大单日后仍为正才是普遍承接。"
@@ -397,208 +322,6 @@ _REPORT_GUIDE = {
 
 # 进 deep 的最终候选数（保底轨上限 25；N 与满卡的权衡曲线见 tmp/probe_budget_split_20261101）
 _FUNNEL_DEEP_N = 45
-_FUNNEL_SEARCH_TOP_N = 100  # run() 扩池：每条查询拉满（pre_screen 默认 50 保留给手工调用）
-
-# ── 保底选人层（选人层唯一出口；沿用 8.1.0 数量 / hard 口径）─────────────────
-# 【定位】保底候选独立画像并恒入 deep；按「连板高度降序 → 当日收盘位置更低者先」
-#   排序后取前 _BASELINE_N 只（2026-11-03 起为单链路：objective_preexclude +
-#   score_pool 加法层已整体移除）。
-# 【2026-10-30 扩容】8 只 → 25 只，且「涨停封板」只在盘中算买不进、其余时段
-#   放行（见 _baseline_blocked）：旧口径下池首批封板占满时基线会塌缩到 1~2 只，
-#   顺延出的替代票强度更弱；改为把「能不能买」交给 LLM，代码只留客观不可选。
-
-_BASELINE_N = 25
-_BASELINE_WINDOW_ENV = "QD_FUNNEL_BASE_WINDOW"
-_BASELINE_RANK_ENV = "QD_FUNNEL_BASE_RANK"
-_BASELINE_YIZI_ENV = "QD_FUNNEL_BASE_YIZI"
-_BASELINE_HOT_ENV = "QD_FUNNEL_BASE_HOT"
-
-
-def _baseline_window() -> int:
-    """保底轨画像窗口（只数）：0 = 全池（缺省）。
-
-    env QD_FUNNEL_BASE_WINDOW 可回退固定窗口（旧口径 60 = 本值 30×2）。
-    全池与 60 只窗口的在线实测耗时：388 只画像 50.8s vs 30 只 33.4s
-    （边际 +17.4s，大头是固定开销），故缺省去掉窗口。
-    """
-    try:
-        v = int(os.getenv(_BASELINE_WINDOW_ENV, "0") or "0")
-    except (TypeError, ValueError):
-        return 0
-    return v if v > 0 else 0
-
-
-def _baseline_rank() -> str:
-    """保底轨排序键：zt_cpos（缺省）/ zt。
-
-    p_up 口径（闸 + 排序 + 回退开关）已整体移除（2026-11-03 用户要求），
-    保底轨任何路径不再出现 p_up。
-    """
-    v = (os.getenv(_BASELINE_RANK_ENV, "") or "zt_cpos").strip().lower()
-    return v if v in ("zt_cpos", "zt") else "zt_cpos"
-
-
-def _baseline_sort_key(p: dict) -> tuple:
-    """保底轨排序键（越大越先）：连板高度 → 当日收盘位置更低 → 非风险票。
-
-    缺省 zt_cpos 的两个分量都是**画像已有字段**（tech.zt_streak /
-    tech.close_pos_in_day），零新增计算、零额外取数；风险票（连板≥3 且
-    距 MA5>10%）只在同高度同收盘位置时垫底，不硬排除。
-    键的选择依据见 tmp/probe_rank_keys_20261103.py（34 决策日对比）。
-    """
-    tech = p.get("tech") if isinstance(p.get("tech"), dict) else {}
-    streak = _num_or_none(tech.get("zt_streak")) or 0
-    if _baseline_rank() == "zt":
-        return (streak,)
-    cpos = _num_or_none(tech.get("close_pos_in_day"))
-    return (streak, -(cpos if cpos is not None else 50.0),
-            not _has_stretched_streak_risk(p))
-
-
-def _baseline_yizi_on() -> bool:
-    """保底轨是否剔除「上一交易日一字板」票（涨/跌都剔）。env QD_FUNNEL_BASE_YIZI，缺省 1。"""
-    return (os.getenv(_BASELINE_YIZI_ENV, "1") or "1").strip() != "0"
-
-
-def _baseline_hot_on() -> bool:
-    """保底轨是否剔除「位置透支」票（location=hot）。env QD_FUNNEL_BASE_HOT，
-    缺省 1（2026-11-03 用户指令：fake_strong 剔除回退后换 hot 剔除，口径可切）。"""
-    return (os.getenv(_BASELINE_HOT_ENV, "1") or "1").strip() != "0"
-
-def _is_yizi_hit(p: dict) -> bool:
-    """画像自带的一字板标记（`_helpers._yizi_hit` 用同一份 bars 在画像时算出）。
-
-    与画像同源 ⇒ 不做二次取数、不会引入额外 IO；标记缺失视为判不出（不剔除）。
-    """
-    return bool(p.get("yizi_hit"))
-
-
-def _is_hot_loc(p: dict) -> bool:
-    """画像自带的 location 合成档 == hot（`_helpers.location_tier`：三件套全高
-    且非 1 板 = 位置透支）。任一项缺失档为 unknown ⇒ 不剔除（不猜）。"""
-    tech = p.get("tech") if isinstance(p.get("tech"), dict) else {}
-    return tech.get("location") == "hot"
-
-# 源失败条目识别标记（2026-10-21）：missing 里出现这些子串 = 候选源/市场源故障，
-# 而不是数据缺口。candidate_pool 的 zt/龙回头/热点用「<源>源失败: …」措辞，
-# search 沿用既有「条件搜索[q]: …」，market_state 源错误经 pre_screen 加「市场状态: 」前缀。
-_SRC_FAIL_MARKS = ("源失败", "条件搜索[")
-
-
-def _baseline_blocked(flags, strategy: str) -> bool:
-    """基线是否因 hard 被拦：涨停封板只在盘中（intraday）算买不进，其余时段放行。"""
-    for f in (flags or []):
-        if "涨停封板" in str(f) and strategy != "intraday":
-            continue
-        return True
-    return False
-
-
-def _baseline_selection(candidates: list, prescreen_result: dict) -> tuple:
-    """选人层保底选择（hard 过滤 + 全池按连板高度排序截断 N 只）。
-
-    **2026-11-03 去掉「窗口 60 + p_up 闸」**（用户裁定）：原实现只给池序前 60 只画像、
-    再按 p_up 硬闸 + p_up 降序截断，实测两处都反向——
-      · 窗口 60 是「按来源插入序」的隐形排序（zt 先、dragon 后），把龙回头/龙虎榜
-        挤出画像，等于截断前先按「谁在池里靠前」选人；
-      · p_up 作排序键的「深亏率 / 触板率」= 1.08（各键最差），把高波动票顶到最前。
-    现在：画像**整个候选池**（`_baseline_window()`=0），hard 过滤后按
-    `_baseline_sort_key()` 排序取前 `_BASELINE_N` 只（缺省键 = 连板高度降序，
-    同高度取当日收盘位置更低者）。34 决策日实测（09-01~10-26，recon 池）：
-    触板 33.5%→32.0%、深亏 25.5%→23.4%、净 −2.92%→−2.46%、胜率 42.3%→44.0%
-    （见 tmp/probe_rank_keys_20261103.py）。
-
-    hard 口径（2026-10-30 用户裁定）：ST/退市、停牌、价格越界、低换手仍拦；
-    「涨停封板」只在**盘中此刻**算买不进（intraday），eod/post_market 一律
-    放行 —— 可买性交 LLM 判断。旧口径在所有时段排掉封板，池首批封板占满时
-    基线会塌缩到 1~2 只。
-
-    宽池（扩词 + search_top_n=100）是核定扩围：源插入序 zt/eod_zt→eod_start→
-    dragon→hot→search→lhb 不变；仅当非 search 源不足时窗口尾部才进 search 结果。
-
-    回退：`QD_FUNNEL_BASE_RANK=zt` 只按连板高度排；`QD_FUNNEL_BASE_WINDOW=30`
-    恢复固定窗口。p_up 硬闸 + p_up 降序的旧口径回退已整体移除
-    （2026-11-03 用户要求：保底轨不再出现 p_up，连带删掉 `with_pred` 打分）。
-
-    **一字板剔除（2026-11-03 用户指令，口径可切）**：排序后按 `_is_yizi_hit` 读画像自带
-    标记，命中则跳过并顺延补位，名额仍取满 `_BASELINE_N`。缺省口径 = **近 3 个交易日
-    一字涨停**（`QD_FUNNEL_BASE_YIZI_WIN`，不含当日；`_MODE=both` 可含跌停）。
-    34 决策日实测（zt+dragon+lhb，同名额补位，对比不剔）：近3日涨停 净 −2.42%→−2.29%、
-    深亏 22.2%→20.5%、t=+0.63；昨日(涨/跌) −2.17%、深亏 21.1%、t=+1.87；近5日涨停 −2.29%；
-    含当日 −2.45%（无益）。**窗口越长深亏越低、但补位票更弱，净收益改善反而变小**。
-    env `QD_FUNNEL_BASE_YIZI=0` 关闭；振幅容差 `QD_FUNNEL_BASE_YIZI_AMP`（0.15%）。
-    取不到日线时不剔除（不因数据缺失误杀）。
-
-    **hot 位置剔除（2026-11-03 用户指令，口径可切）**：排序后对同一名额池再跳过
-    「位置透支」（`_is_hot_loc`：location=hot，三件套全高且非 1 板）并顺延补位。
-    34 决策日实测（09-01~10-26，zt+dragon recon 池，对比不剔）：触板 28.6%→22.0%、
-    深亏 16.9%→10.1%、净中位 −3.03→−3.16（见 tests/test_market_screener_selection_bt.py
-    探针 probe_prod_skip_hot）。分时口径的 fake_strong 剔除（高位×分时强）同窗实测
-    21.0% / 11.3% / −3.42，全面劣于本口径，已回退删除。档缺失（unknown）不剔除；
-    env `QD_FUNNEL_BASE_HOT=0` 关闭。
-
-    **昨榜龙虎榜净买入剔除已回退（2026-11-03 用户裁定「改进太小」）**：叠加 hot 剔
-    实测 21.7 触/10.3 深/净 −3.03（对比 hot 单独 22.0/10.1/−3.16 仅净收益微改善），
-    判据与回测口径见 `tests/test_market_screener_selection_bt.py` 探针
-    probe_prod_skip_netbuy_d1 / probe_prod_skip_hot_netbuy（保留可复跑）。
-
-    Args:
-        candidates: pre_screen 返回的**原始**候选列表（objective 之前）
-        prescreen_result: pre_screen 全量返回（取 strategy/market/main_themes）
-
-    Returns:
-        (baseline, window_hard_n): baseline=按排序键取前 _BASELINE_N 的画像列表；
-            window_hard_n=画像范围内被**非封板** hard 拦掉的只数（漏斗复盘用）
-    """
-    if not candidates:
-        return [], 0
-    limit = _baseline_window() or len(candidates)
-    bundle = _profile_candidates(
-        {"strategy": prescreen_result.get("strategy"),
-         "market": prescreen_result.get("market") or {},
-         "main_themes": prescreen_result.get("main_themes") or [],
-         "candidates": candidates},
-        limit=limit, with_flow=False, with_pred=False)
-    window = bundle.get("profiles") or []
-    strategy = prescreen_result.get("strategy") or ""
-    window_hard_n = sum(1 for p in window
-                        if _baseline_blocked(p.get("hard"), strategy))
-    eligible = [p for p in window
-                if not _baseline_blocked(p.get("hard"), strategy)]
-    eligible.sort(key=_baseline_sort_key, reverse=True)
-    yizi_on = _baseline_yizi_on()
-    hot_on = _baseline_hot_on()
-    if yizi_on or hot_on:
-        picked, yizi_n, hot_n = [], 0, 0
-        for p in eligible:
-            if len(picked) >= _BASELINE_N:
-                break
-            if yizi_on and _is_yizi_hit(p):
-                yizi_n += 1
-                continue
-            if hot_on and _is_hot_loc(p):
-                hot_n += 1
-                continue
-            picked.append(p)
-        if yizi_n:
-            logger.info("[MktScreen] 保底轨剔除昨日一字板 %d 只（名额补位至 %d）",
-                        yizi_n, len(picked))
-        if hot_n:
-            logger.info("[MktScreen] 保底轨剔除位置透支(hot) %d 只（名额补位至 %d）",
-                        hot_n, len(picked))
-        baseline = picked
-    else:
-        baseline = eligible[:_BASELINE_N]
-    return baseline, window_hard_n
-
-
-# ── deep 交付预算（rank 全量 + 满卡按预算）────────────────────────────────
-# rank 行实测 ~603 字符/行（含 sup/res/vr_rel/flow_rel 等全字段），45 行 ≈27K；
-# 满卡实测 ~2,017 字符/张 ⇒ rank 全量 + 满卡全量会远超闸，故按预算交付：
-# rank 给全部票的横向可比字段，analyzed 只放装得下的前 N 张满卡；
-# 单只满卡用 inspect_stock(code) 取。
-# 预算链：本值 < observation 闸 45000 < 预览闸 47000（skill_run 整条目裁剪），
-# 超出 observation 会截碎 JSON、超出预览会尾部整条丢票，故三者联动抬升（2026-11-01）。
 _DEEP_WORKERS = 16              # deep 并发：45 只名单 ≈3 波
 _DEEP_BUDGET_CHARS = 44500      # observation 闸 45000 内留 500；超出由 _pack 实测回退减卡
 _DEEP_BUDGET_ENV = "QD_SCREENER_DEEP_BUDGET"
@@ -614,9 +337,12 @@ def _deep_budget() -> int:
 
 
 def _delivery_key(card: dict) -> tuple:
-    """交付序（升序）：按「位置安全度」排，**p_up 不参与排序**。
+    """交付序（升序）：**非涨停优先**，再按「位置安全度」排。
 
-    三个分量都取画像现成字段，零新增计算：
+    首位 = 涨停沉底：满卡名额尽量给可操作的票 —— 封板票此刻买不进，
+    满卡的长字段（价位/支撑/分时形态）对它当期没有操作意义，简卡足够；
+    涨停取 rt.limit_up（实时口径）优先，缺则退 card.limit_up / tech.limit_up
+    （日线收盘口径）。三项位置分量都取画像现成字段，零新增计算：
       ① 距 20 日均线偏离度 `dist_ma20_pct` → **落在 [-10%, +5%] 视为贴近均线**，
          区间内记 0，区间外记超出量。注意不是「越负越好」：越负是断崖下跌票
          （实测中位 -25% 那组，深亏 9.8%），贴均线那组才最低（4.5%）。
@@ -626,16 +352,17 @@ def _delivery_key(card: dict) -> tuple:
          避免把「刚跌过一波」当成负面而推高追涨票。
     缺值按最差处理（沉底），不猜。
 
-    为什么不用 p_up 排：p_up 是**波动档**不是质量分，高 p_up 组触板率与深亏率同时最高。
-    实测（每日前 6 只 = 满卡张数，深亏 = 持仓期最低价 ≤ -15%）：
+    位置键的实测依据（每日前 6 只 = 满卡张数，深亏 = 持仓期最低价 ≤ -15%）：
       · 9-10 月弱势窗：p_up 降序 30.9% → 本键 7.0%（逐日配对 t=-5.88），
         净收益 -1.42% → -1.86%（代价 0.44pp）；
       · 4-5 月强势窗：19.4% → 3.8%（t=-5.56），净 +0.70% → -0.63%（代价 1.33pp），
         T+3 仍为正（+0.14%）。
-    即「深亏大幅下降、收益小幅让出」，且弱市收益代价小于「越负越前」那种极端版。
-    数据见 tmp/probe_deep_order_20261103.py。
+    即「深亏大幅下降、收益小幅让出」。数据见 tmp/probe_deep_order_20261103.py。
     """
     tech = card.get("tech") if isinstance(card.get("tech"), dict) else {}
+    rt = card.get("rt") if isinstance(card.get("rt"), dict) else {}
+    sealed = bool(rt.get("limit_up")) or bool(card.get("limit_up")) \
+        or bool(tech.get("limit_up"))
 
     def _v(key, miss):
         x = _num_or_none(tech.get(key))
@@ -643,7 +370,8 @@ def _delivery_key(card: dict) -> tuple:
 
     d20 = _v("dist_ma20_pct", 99.0)
     band = 0.0 if -10.0 <= d20 <= 5.0 else min(abs(d20 + 10.0), abs(d20 - 5.0))
-    return (band,
+    return (1 if sealed else 0,
+            band,
             abs(_v("pos_in_20d_pct", 50.0) - 35.0),
             max(0.0, _v("ret_5d_pct", 99.0)))
 
@@ -1348,147 +1076,122 @@ def _safe_market() -> dict:
         return {}
 
 
-def run(sources: str = None, queries: str = None,
-        min_turnover: float = None, limit: int = None) -> dict:
-    """一次性跑完整流程——单链路保底选择 → deep 分析。
+def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
+                      t0: float, ms: dict):
+    """跑 deep_analyze 并按交付契约组装结果 —— 两条选人管线共用同一出口。
 
-    流程：
-      ① **保底候选**：整个原始池画像后按 hard 过滤，再按「连板高度降序 → 当日收盘位置
-         更低者先」排序取 ≤25 只（2026-11-03 去掉窗口 60 与 p_up 闸，见
-         _baseline_selection），**恒入 deep**；
-      ② **存活 0 只 → 立即退出**，如实告知用户无合适候选（2026-11-02 移除 Round1
-         自动放宽与双回捞；2026-11-03 清除 objective_preexclude + score_pool 加法层）；
-      ③ deep_analyze(基线，≤_FUNNEL_DEEP_N=45)。LLM 仍单次调用。
-         交付按位置透支升序（满卡=位置最干净的 N 只；p_up 不参与排序），名单成员与顺序解耦：
-         排序只影响「先看谁」，不影响「有谁」。
-
-    可选参数（与 pre_screen 同义；全部可省）：
-        sources: 候选来源，如 "zt,dragon,search"；省略用时段默认
-        queries: 条件搜索词
-        min_turnover: 换手率下限；省略=不过滤
-        limit: 候选截断；省略=不截断
-    **不要传** strategy / min_market_cap / with_mtf 等不存在的参数。
+    收口的原因：classic 与 topdown 的差别只在「候选怎么来」；进了 deep 之后
+    （预算扣减、report_guide 合流、_log_run 口径）必须完全一致，否则同一批票在
+    两条管线下会得到不同交付。
     """
-    _t0 = time.perf_counter()
-    _ms: dict = {}
-    # ── 运行期预热（2026-10-25，探针定位的两大单点；均失败不阻塞主流程）──
-    # P1-①：指数 K 线后台预热——mootdx 冷启 bestip 扫描 ~74s 与候选池取数
-    # （candidate_pool ~69s）无依赖，后台重叠后该 78s 单点基本隐藏
-    prewarm_market_klines()
-    # P0：CNStock 连接池预热到画像并发度——消除 psycopg2 池 minconn=2 的
-    # 连接抖动（8 线程每波 6 建 6 关，单次 read_db 0.30s vs PG 侧 0.386ms）
-    warm_market_pool()
-
-    funnel = {
-        "rounds": 0, "pool_raw": 0,
-        "baseline": 0, "baseline_hard": 0, "baseline_risk": 0,
-        "deep_n": 0, "eastmoney_ok": True,
-    }
-    strategy = select_strategy()
-    base_queries = [q.strip() for q in str(queries).split(",") if q.strip()] \
-        if queries else []
-    # 候选池级缺口（源失败/日历标注，2026-10-21）：profile 画像层的 meta.missing
-    # 不含池级信息，空结果分支若只读 meta 会把「源故障空池」误交付成「无候选」
-    pool_missing: list = []
-
-    selected_all = []
-    meta = {}
-    funnel["rounds"] = 1
-
-    _t = time.perf_counter()
-    prescreen_result = pre_screen(
-        sources=sources,
-        queries=",".join(base_queries) if base_queries else None,
-        search_top_n=_FUNNEL_SEARCH_TOP_N,
-        min_turnover=min_turnover, limit=limit,
-    )
-    _ms["pre_screen"] = _ms.get("pre_screen", 0) + _elapsed(_t)
-    if prescreen_result.get("error"):
-        _out = {"report_guide": _REPORT_GUIDE,
-                "funnel": funnel, **prescreen_result}
-        _log_run(_t0, _ms, funnel, _out)
-        return SkillResult(_out)
-
-    candidates = list(prescreen_result.get("candidates") or [])
-    missing = list(prescreen_result.get("missing") or [])
-    pool_missing = missing
-    search_failed = [m for m in missing if "条件搜索" in str(m)]
-    funnel["pool_raw"] = len(candidates)
-    # 搜索源可用性：按基础查询词评估（不再追加兜底词放大分母，避免把「搜索源挂了」误判成可用）
-    funnel["eastmoney_ok"] = len(search_failed) < max(1, len(base_queries or [""]))
-
-    _t = time.perf_counter()
-    baseline, baseline_hard = _baseline_selection(candidates, prescreen_result)
-    _ms["profile"] = _ms.get("profile", 0) + _elapsed(_t)
-    funnel["baseline"] = len(baseline)
-    funnel["baseline_hard"] = baseline_hard
-    from ._helpers import _has_stretched_streak_risk
-    funnel["baseline_risk"] = sum(
-        1 for p in baseline if _has_stretched_streak_risk(p))
-    selected_all = baseline
-
-    codes = [p["code"] for p in selected_all[:_FUNNEL_DEEP_N]]
-    funnel["deep_n"] = len(codes)
-
-    # 存活 0 只 → 立即退出并告知用户无合适候选（2026-11-02：移除 Round1 自动放宽，
-    # 不再为凑数降门槛；保底轨为空意味着连 8.1.0 基线口径都选不出，直接如实汇报）。
-    if not selected_all:
-        # 空结果必须「可汇报」（沿用 2026-10-12 契约，funnel 补充漏斗口径）。
-        # 原先只回 {analyzed: [], signal: "…"} ⇒ 模型无可写口径 ⇒ 转主对话重跑一遍
-        # 同样逻辑（D-18）。这里把「筛了多少 / 因什么淘汰 / 有什么数据缺口」一并给出。
-        # 源故障显性化（2026-10-21）：pool_missing 含候选源失败/日历标注时，
-        # 必须写进 hard_reasons 并前置到 missing —— 防止把「数据不可用」交付成
-        # 「今日无候选」（pool_raw=0 + missing 为空的纯真空池只可能出现在
-        # 交易日 + 全源成功，否则 candidate_pool 已标注）。
-        src_fail_n = sum(1 for m in pool_missing
-                         if any(mark in str(m) for mark in _SRC_FAIL_MARKS))
-        hard_reasons = []
-        # 基线硬障碍（2026-10-25；2026-10-30 口径改非封板）：空结果现在
-        # 只剩一种成因——保底轨被非封板 hard 拦空（加法层已于 2026-11-03 移除）。
-        if funnel["baseline_hard"]:
-            hard_reasons.append(
-                f"8.1.0基线窗口硬障碍:{funnel['baseline_hard']}只"
-                f"（非封板类；画像范围内）")
-        if src_fail_n:
-            hard_reasons.append(
-                f"候选源失败{src_fail_n}条（数据不可用≠真实空候选，明细见missing）")
-        _out = {
-            "report_guide": _REPORT_GUIDE,
-            "strategy": meta.get("strategy") or strategy,
-            "market": meta.get("market") or prescreen_result.get("market") or {},
-            "hints": meta.get("hints") or {},
-            "analyzed": [],
-            "signal": "无符合软硬门槛的候选",
-            "pool_size": funnel["pool_raw"],
-            "hard_blocked": funnel["baseline_hard"],
-            "hard_reasons": hard_reasons,
-            "missing": (list(pool_missing) + list(meta.get("missing") or []))[:6],
-            "errors": list(meta.get("errors") or [])[:3],
-            "mood_regime": meta.get("mood_regime"),
-            "themes": list(meta.get("themes") or [])[:5],
-            "funnel": funnel,
-        }
-        _log_run(_t0, _ms, funnel, _out)
-        return SkillResult(_out)
-
-    # 外层信封（market/hints/funnel）不进 deep_analyze 的预算账，但会并进最终交付：
-    # 先按实际体量扣掉再传预算，`_DEEP_BUDGET_CHARS` 才真是「整份结果」的上限而不是
-    # 「deep_analyze 自己那一段」的上限（旧口径下 28K+外层 ≈ 29.9K，离 30K 闸只剩百来字符）。
-    outer = {"market": meta.get("market") or prescreen_result.get("market") or {},
-             "hints": meta.get("hints") or {},
-             "funnel": funnel}
     _t = time.perf_counter()
     result = deep_analyze(",".join(codes), limit=_FUNNEL_DEEP_N,
                           budget=_deep_budget() - _dumps_len(outer))
-    _ms["deep"] = _ms.get("deep", 0) + _elapsed(_t)
-    # funnel 紧跟 report_guide（SkillResult 渲染分流按键存在性判断，键序不影响渲染）
+    ms["deep"] = ms.get("deep", 0) + _elapsed(_t)
     if isinstance(result, dict):
-        out = {"report_guide": result.get("report_guide", _REPORT_GUIDE),
-               # market/hints 必须随结果交付（2026-10-30 缺陷③）：旧版只在空结果分支
-               # 带 mood_regime/themes，常规路径的早盘预判/下跌收紧信息根本到不了
-               # 写结论的 LLM —— 与 report_guide「market 已由 run_skill 覆盖」自相矛盾。
-               **outer}
+        out = {"report_guide": result.get("report_guide", _REPORT_GUIDE), **outer}
         out.update({k: v for k, v in result.items() if k != "report_guide"})
-        _log_run(_t0, _ms, funnel, out)
+        _log_run(t0, ms, funnel, out)
         return SkillResult(out)
     return result
+
+
+def _run_topdown(t0: float, ms: dict):
+    """三层漏斗选人管线：大盘闸 → 板块闸 → 板块内选股 → 截断 → deep。
+
+    与 classic 的差别只在选人阶段；deep 层走 `_deep_and_deliver`，一行不差。
+    失败时**如实返回**，不回落 classic —— 回落会把「漏斗选不出」伪装成
+    「classic 有票」，掩盖数据或阈值问题。
+    """
+    from . import _topdown as _T
+    funnel = {"rounds": 1, "pool_raw": 0, "baseline": 0, "baseline_hard": 0,
+              "baseline_risk": 0, "deep_n": 0, "eastmoney_ok": True,
+              "pipeline": "topdown", "verdict": None,
+              "short_of_limit": False}
+    try:
+        mkt = _market_state() or {}
+    except Exception as e:
+        logger.warning("[market-screener] topdown 取大盘状态失败: %s", e)
+        mkt = {}
+
+    _t = time.perf_counter()
+    try:
+        td = _T.topdown_pick()
+    except Exception as e:
+        logger.warning("[market-screener] topdown 选人失败: %s", e)
+        _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "market": mkt, "funnel": funnel,
+                "analyzed": [], "signal": "三层漏斗执行失败",
+                "missing": [f"topdown: {type(e).__name__}: {e}"]}
+        _log_run(t0, ms, funnel, _out)
+        return SkillResult(_out)
+    ms["pre_screen"] = ms.get("pre_screen", 0) + _elapsed(_t)
+
+    f = td.get("funnel") or {}
+    funnel.update({"verdict": f.get("verdict"),
+                   "pool_raw": f.get("picked_raw") or 0,
+                   "baseline": f.get("picked") or 0,
+                   "deep_n": len(td.get("picked") or []),
+                   "dup_max": f.get("dup_max"),
+                   "short_of_limit": bool(f.get("short_of_limit"))})
+    picked = td.get("picked") or []
+    if not picked:
+        _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "market": mkt, "mood_regime": _mood_regime(mkt),
+                "funnel": funnel, "boards": td.get("boards") or {},
+                "analyzed": [], "signal": "三层漏斗无候选",
+                "missing": (td.get("missing") or [])[:8]}
+        _log_run(t0, ms, funnel, _out)
+        return SkillResult(_out)
+
+    # 涨停票**不进 deep 分析**：决策时已封板，可成交价在涨停价附近或之上，
+    # 满卡的长字段（价位/支撑/分时形态）对它当期没有操作意义；它们只作为
+    # 「该板块已封板、封板时刻、多板块共识」的参考清单（limit_up_ref），
+    # 供 LLM 判断未涨停票所在板块的强弱。deep 只分析非涨停票。
+    zt_ref = [x for x in picked if x.get("kind") == "limit_up"]
+    cand = [x for x in picked if x.get("kind") != "limit_up"]
+    codes = [x["code"] for x in cand if x.get("code")][:_FUNNEL_DEEP_N]
+    funnel["deep_n"] = len(codes)
+    funnel["zt_ref_n"] = len(zt_ref)
+
+    limit_up_ref = [{k: x.get(k) for k in
+                     ("code", "name", "board", "track", "t_first", "dup_n", "reason")}
+                    for x in zt_ref]
+    if not codes:
+        _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "market": mkt, "mood_regime": _mood_regime(mkt),
+                "funnel": funnel, "boards": td.get("boards") or {},
+                "limit_up_ref": limit_up_ref,
+                "analyzed": [], "analyzed_rank": [],
+                "signal": "候选全部已封板：仅列涨停参考，无可分析标的",
+                "missing": (td.get("missing") or [])[:8]}
+        _log_run(t0, ms, funnel, _out)
+        return SkillResult(_out)
+
+    outer = {"market": mkt, "mood_regime": _mood_regime(mkt),
+             "hints": {}, "funnel": funnel,
+             "pipeline": "topdown",
+             "boards": td.get("boards") or {},
+             "limit_up_ref": limit_up_ref,
+             "topdown_notes": (td.get("missing") or [])[:8],
+             "picked_detail": [{k: x.get(k) for k in
+                                ("code", "board", "track", "tier", "kind", "reason",
+                                 "dup_n", "t_first", "flow_valid")}
+                               for x in picked]}
+    return _deep_and_deliver(codes, outer, funnel, t0, ms)
+
+
+def run() -> dict:
+    """一次性跑完整流程——盘中三层漏斗选人 → deep 分析（唯一链路）。
+
+    流程：L1 大盘闸 → L2 板块闸（行业/概念三备二）→ L3 板块内选股（跟随/跳变
+    双分支）→ 连板放量准入闸 → 截断 25 → deep_analyze(<=45)，LLM 单次调用；
+    交付按位置透支升序，名单成员与顺序解耦。运行期预热两大单点（指数 K 线
+    mootdx 冷启、CNStock 连接池），失败不阻塞主流程。选人层规则详见
+    _topdown.py 与 SKILL.md；本函数无入参。失败如实返回，不回落任何备用链路。
+    """
+    _t0 = time.perf_counter()
+    _ms: dict = {}
+    prewarm_market_klines()
+    warm_market_pool()
+    return _run_topdown(_t0, _ms)

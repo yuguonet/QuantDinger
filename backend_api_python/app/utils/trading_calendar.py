@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -265,6 +265,29 @@ def is_trading_day(date: str) -> bool:
 
 def is_trading_day_today() -> bool:
     return is_trading_day(datetime.now().strftime("%Y-%m-%d"))
+
+
+def nth_trading_day(base: date, n: int, max_calendar_days: int = 400) -> Optional[date]:
+    """Return the nth trading date after ``base``; ``base`` itself is excluded.
+
+    Return None when the loaded calendar does not cover the requested horizon.
+    Calendar loading errors remain explicit so callers cannot mistake missing
+    calendar data for a non-trading date.
+    """
+    if n < 1:
+        raise ValueError("n must be a positive number of trading days")
+    if max_calendar_days < 1:
+        raise ValueError("max_calendar_days must be positive")
+
+    cal = _load()
+    current, count = base, 0
+    for _ in range(max_calendar_days):
+        current += timedelta(days=1)
+        if current.isoformat() in cal:
+            count += 1
+            if count == n:
+                return current
+    return None
 
 
 # ─── 报价时段（"此刻该不该拉行情"的单一事实源）────────────────────────

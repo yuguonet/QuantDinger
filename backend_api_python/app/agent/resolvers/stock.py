@@ -56,7 +56,7 @@ def _expand_stock_query(user_input: str, entities: list[dict]) -> str:
         entities: 解析出的实体列表 [{code, name, type}, ...]
 
     Returns:
-        扩写后的指令，如 "分析贵州茅台(600519): 帮我看看最近能不能买，周期：T+3，深度：标准"
+    扩写后的指令，如 "分析贵州茅台(600519): 帮我看看最近能不能买"
     """
     if not entities:
         return user_input
@@ -79,9 +79,7 @@ def _expand_stock_query(user_input: str, entities: list[dict]) -> str:
             elif e['code'] in expanded:
                 expanded = expanded.replace(e['code'], f"{e['name']}({e['code']})", 1)
 
-    # 加默认分析参数
-    default_params = "周期：T+3（T+1/T+3/1W/1M），深度：标准（简单/标准/深度）"
-    return f"{expanded}，{default_params}"
+    return expanded
 
 
 # ── 代码类请求闸门（2026-10-16 新增）────────────────────────────────

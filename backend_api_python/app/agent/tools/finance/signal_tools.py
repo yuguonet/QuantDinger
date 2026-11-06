@@ -337,6 +337,7 @@ def _get_dragon_tiger_detail(codes: str, look_back_days: int = 30) -> dict:
 
         _r = {
             "stock_code": code,
+            "detail_date": records[0]["date"] if records else None,
             "records": records,
             "seats": seats,
             "institution": institution,

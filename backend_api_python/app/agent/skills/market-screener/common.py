@@ -161,13 +161,15 @@ class SkillResult(dict):
         strategy = self.get("strategy", "")
         market = self.get("market", {})
         if market:
-            mood = market.get("mood", "")
-            ms = market.get("mood_score", 0)
             zt = market.get("zt_count", 0)
             dt = market.get("dt_count", 0)
             fund = market.get("fund_flow", 0)
             brk = market.get("broken_rate", 0)
-            m_line = f"{strategy} M:{mood}({ms}) ZT:{zt} DT:{dt}"
+            m_line = (
+                f"{strategy} 大盘M:{market.get('market_mood','')}({market.get('market_mood_score','')})"
+                f" 个股M:{market.get('stock_mood','')}({market.get('stock_mood_score','')})"
+                f" ZT:{zt} DT:{dt}"
+            )
             if fund:
                 m_line += f" F{fund/1e8:.1f}e"
             if brk:
@@ -316,7 +318,8 @@ class SkillResult(dict):
         market = self.get("market", {}) or {}
         if market:
             parts.append(
-                f"{strategy} M:{market.get('mood','')}({market.get('mood_score','')}) "
+                f"{strategy} 大盘M:{market.get('market_mood','')}({market.get('market_mood_score','')}) "
+                f"个股M:{market.get('stock_mood','')}({market.get('stock_mood_score','')}) "
                 f"ZT:{market.get('zt_count',0)} DT:{market.get('dt_count',0)} "
                 f"炸{market.get('broken_rate',0)}% F{_fmt(market.get('fund_flow',0)/1e8,1)}e"
             )
@@ -484,26 +487,9 @@ def warm_market_pool(workers: int = _FETCH_POOL_MIN) -> None:
     """
     try:
         _load_env()
-        from app.utils.db_market import get_market_db_manager
-        pool = get_market_db_manager()._get_pool("CNStock")
-        inner = pool._pool          # psycopg2 ThreadedConnectionPool
-        if inner.minconn >= workers:
-            return
-        inner.minconn = workers     # 先抬阈值，防补充的连接被 _putconn 关掉
-
-        # 串行持有 workers 条再统一归还：前几条弹空闲、其余锁内新建，全部
-        # 同时在手 ⇒ 归还时见 minconn=workers 逐一保留为空闲连接。
-        # 不用并发 ping wave：快查询的连接会被后续任务弹走复用，wave 结束
-        # 后空闲数不确定（实测 8 任务只补到 6）。
-        held = []
-        try:
-            for _ in range(workers):
-                held.append(inner.getconn())
-        finally:
-            for c in held:
-                inner.putconn(c)
-        logger.info("[market-screener] CNStock 连接池预热完成: 空闲 %d 条"
-                    "（对齐画像并发 %d）", len(inner._pool), workers)
+        # 连接池内部细节属数据层：预热逻辑下沉到 screen_query（skill 层零直连）
+        from app.data_sources import screen_query as _sq
+        _sq.warm_pool(workers)
     except Exception as e:
         logger.warning(
             "[market-screener] CNStock 连接池预热失败（按原池行为继续）: %s", e)
@@ -1027,56 +1013,6 @@ def scan_dragon_pullback(date: str) -> List[Dict]:
     return candidates
 
 
-_EOD_START_1M_SQL = """
-WITH t AS (
-    SELECT symbol, "time", high, close, volume,
-           lag(close) OVER (PARTITION BY symbol ORDER BY "time") AS p_close
-      FROM "kline_1m_{y}"
-     WHERE "time" >= %s::timestamp AND "time" < %s::timestamp + interval '1 day'
-)
-SELECT symbol,
-       (array_agg(close ORDER BY "time" DESC))[1] AS last,
-       max(high) AS day_high,
-       sum(CASE WHEN "time"::time < TIME '14:30' THEN volume ELSE 0 END) AS v_am,
-       sum(CASE WHEN "time"::time >= TIME '14:30' THEN volume ELSE 0 END) AS v_pm,
-       sum(CASE WHEN "time"::time >= TIME '14:30' AND p_close IS NOT NULL THEN
-                 CASE WHEN close > p_close THEN volume
-                      WHEN close < p_close THEN -volume ELSE 0 END
-            ELSE 0 END) AS pm_flow,
-       max("time") AS last_t
-  FROM t GROUP BY symbol
-"""
-
-_EOD_START_PREV_SQL = """
-SELECT DISTINCT ON (symbol) symbol, close AS prev_close, "time" AS prev_t
-  FROM "kline_1m_{y}"
- WHERE "time" >= %s::timestamp AND "time" <= %s::timestamp
- ORDER BY symbol, "time" DESC
-"""
-
-_EOD_START_SNAP_SQL = """
-WITH t AS (
-    SELECT symbol, "time", name, last, high, "previousClose" AS pclose, volume,
-           lag(last) OVER (PARTITION BY symbol ORDER BY "time") AS p_last,
-           lag(volume) OVER (PARTITION BY symbol ORDER BY "time") AS p_vol
-      FROM realtime_snapshot
-     WHERE "time" >= %s::timestamp AND "time" < %s::timestamp + interval '1 day'
-)
-SELECT symbol,
-       (array_agg(last ORDER BY "time" DESC))[1] AS last,
-       max(name) AS name,
-       max(high) AS day_high,
-       max(pclose) AS prev_close,
-       coalesce(max(CASE WHEN "time"::time < TIME '14:30' THEN volume END), 0) AS v_am,
-       coalesce(max(volume), 0)
-         - coalesce(max(CASE WHEN "time"::time < TIME '14:30' THEN volume END), 0) AS v_pm,
-       sum(CASE WHEN "time"::time >= TIME '14:30' AND p_vol IS NOT NULL THEN
-                 CASE WHEN last > p_last THEN volume - p_vol
-                      WHEN last < p_last THEN -(volume - p_vol) ELSE 0 END
-            ELSE 0 END) AS pm_flow,
-       max("time") AS last_t
-  FROM t GROUP BY symbol
-"""
 
 
 def _eod_start_qfq(code: str, items: List) -> List:
@@ -1115,27 +1051,12 @@ def _eod_start_facts(date: str) -> List[Dict]:
     snapshot 路自带 previousClose / name。量=股；pm_flow=Σ±股×价格方向（量价方向
     口径，与 fund_flow 本地派生同构，非东财主力口径）。
     """
-    def _run(pool, sql, args):
-        with pool.connection() as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute(sql, args)
-                cols = [d[0] for d in cur.description]
-                return [dict(zip(cols, r)) for r in cur.fetchall()]
-            finally:
-                cur.close()
-
-    from app.utils.db_market import get_market_db_manager
-    pool = get_market_db_manager()._get_pool("CNStock")
-    year = date[:4]
+    from app.data_sources import screen_query as _sq
 
     def _from_snap() -> Dict[str, Dict]:
         out: Dict[str, Dict] = {}
-        for r in _run(pool, _EOD_START_SNAP_SQL,
-                      (date + " 00:00:00", date + " 00:00:00")):
-            code = str(r.get("symbol") or "")
-            if not code:
-                continue
+        raw = _sq.eod_start_raw(date, which="snap").get("snap") or {}
+        for code, r in raw.items():
             out[code] = {
                 "code": code, "name": str(r.get("name") or ""),
                 "prev_close": r.get("prev_close"), "last": r.get("last"),
@@ -1147,23 +1068,12 @@ def _eod_start_facts(date: str) -> List[Dict]:
 
     def _from_1m() -> Dict[str, Dict]:
         out: Dict[str, Dict] = {}
-        rows = _run(pool, _EOD_START_1M_SQL.format(y=year),
-                    (date + " 00:00:00", date + " 00:00:00"))
+        raw = _sq.eod_start_raw(date, which="1m")
+        rows = raw.get("m1") or {}
         if not rows:
             return out
-        prev: Dict[str, Any] = {}
-        pt = _run(pool, 'SELECT max("time") AS t FROM "kline_1m_{y}" '
-                        'WHERE "time" < %s::timestamp'.format(y=year),
-                  (date + " 00:00:00",))
-        if pt and pt[0].get("t"):
-            prev_t = pt[0]["t"]
-            prev = {r["symbol"]: (r["prev_close"], r.get("prev_t")) for r in _run(
-                pool, _EOD_START_PREV_SQL.format(y=year),
-                (prev_t - timedelta(days=1), prev_t))}
-        for r in rows:
-            code = str(r.get("symbol") or "")
-            if not code:
-                continue
+        prev: Dict[str, Any] = raw.get("prev") or {}
+        for code, r in rows.items():
             pclose, pt_ = prev.get(code, (None, None))
             prev_date = str(pt_)[:10] if pt_ else None
             q_prev, q_last, q_high = _eod_start_qfq(

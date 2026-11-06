@@ -58,6 +58,28 @@ from . import _inner, _levels
 #: 全周期档位（顺序即输出顺序）；天数不在此硬编码，取 `label_spec.HOLDS`
 _HORIZONS: Tuple[str, ...] = ("T+1", "T+3", "T+5", "T+10", "T+20")
 
+_ANALYZE_REPORT_GUIDE = {
+    "OUTPUT_FORM": (
+        "按当前数据时点先给结论，再分列事实、推导、判断、风险与未知项；"
+        "使用 horizons 的五档方向、触发条件和证伪条件。用户只要求分析时，不给命令式买卖或仓位指令；"
+        "价位只作为条件情景，不保证买卖结果。"
+    ),
+    "EVIDENCE": (
+        "外部事实注明来源和对应日期。flow 是价格方向净额近似，不是主力/机构资金分类；"
+        "不得据此断言主力或机构买卖。龙虎榜席位/机构数据仅在 detail_date 与 records 上榜日期一致时引用；"
+        "无记录、日期缺失/不匹配或存在 detail_error 时不作日期归因。"
+    ),
+    "EVENTS": "增持、回购等只陈述公告事实和可能影响，不断言导致股价变化或构成托底。",
+    "TIME_CALIBER": (
+        "区分实时/竞价快照与日线指标的时点和口径；未收盘或零成交 K 线不是收盘价，"
+        "技术指标须注明所依据的最近完整交易日。"
+    ),
+    "SEARCH": (
+        "只为关键缺失事实检索；同一事实最多检索一次，整份报告最多检索 2 次。"
+        "优先一手来源；标的、日期或来源无法核实时，注明未知，不补猜、不重复查询。"
+    ),
+}
+
 #: 各档置信度上限（T+1 有标定故最高；越远越不确定）。可被 env 覆盖
 _CONF_CAP_DEFAULT: Dict[str, float] = {
     "T+1": 0.90, "T+3": 0.72, "T+5": 0.68, "T+10": 0.58, "T+20": 0.50,
@@ -192,12 +214,16 @@ _SESSION_NOTE: Dict[str, str] = {
 
 
 def _mood_label(market: Dict[str, Any]) -> str:
-    """大盘情绪分桶 strong / neutral / weak / unknown（上下文标签）。"""
+    """大盘情绪分桶 strong / neutral / weak / unknown（上下文标签）。
+
+    取**大盘档** market_mood(_score)：它回答「指数与资金强不强」。个股档
+    stock_mood(_score) 衡量赚钱效应，随 `market` 原样透传供七维读数，不进本分桶。
+    """
     if not isinstance(market, dict) or not market:
         return "unknown"
-    mood = str(market.get("mood") or "")
+    mood = str(market.get("market_mood") or "")
     try:
-        ms = float(market.get("mood_score", 50) or 50)
+        ms = float(market.get("market_mood_score", 50) or 50)
     except (TypeError, ValueError):
         ms = 50.0
     if mood in ("弱势", "偏弱") or ms < 40:
@@ -458,7 +484,7 @@ def _v_flow(h: str, flow: Dict[str, Any]) -> Dict[str, Any]:
     n5 = rec.get("net_5d_wan")
     n20 = rec.get("net_20d_wan")
     rel = flow.get("flow_rel")
-    note = f"资金5日{n5}万/20日{n20}万"
+    note = f"量价方向净额近似（非主力分类）：5日{n5}万/20日{n20}万"
     if rec.get("streak_dir"):
         note += f"（连续方向:{rec.get('streak_dir')}）"
     if h in ("T+1", "T+3"):
@@ -964,7 +990,7 @@ def analyze(code: str, deep: bool = False) -> dict:
         deep: True 追加慢速源（多周期结构 + 龙虎榜席位），默认 False
 
     Returns:
-        code/name/as_of/regime/market/session（盘前/盘中/盘后）；quote/tech/
+        report_guide（报告写作边界）/code/name/as_of/regime/market/session（盘前/盘中/盘后）；quote/tech/
         prediction/patterns/flow/seal/sector（板块涨跌 + α 修正）/events（解禁日历）/
         levels（supports/resists/checks 演算痕迹）/horizons 五档，每档 {h, days, dir,
         p_up(仅T+1), confidence, agree, votes, basis, unknown, trigger, invalidate,
@@ -1070,11 +1096,14 @@ def analyze(code: str, deep: bool = False) -> dict:
 
     session = _session()
     out = {
+        "report_guide": _ANALYZE_REPORT_GUIDE,
         "code": code,
         "name": card.get("name") or "",
         "as_of": rt.get("time") or levels.get("as_of"),
         "regime": _mood_label(market),
-        "market": {k: market.get(k) for k in ("mood", "mood_score", "cautious", "fund_flow_days")
+        "market": {k: market.get(k) for k in ("market_mood", "market_mood_score",
+                                              "stock_mood", "stock_mood_score",
+                                              "cautious", "fund_flow_days")
                    if market.get(k) is not None},
         "quote": {"price": rt.get("price") or tech.get("close"),
                   "change_pct": chg, "limit_up": rt.get("limit_up"),

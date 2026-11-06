@@ -125,12 +125,13 @@ def test_disabled_by_env(monkeypatch):
     assert s.compact_calls == 0
 
 
-def test_fail_open_on_compact_error(monkeypatch):
+def test_fail_open_on_compact_error(monkeypatch, caplog):
     """压缩抛异常 ⇒ 吞掉并返回 0，绝不让整轮崩（保留原历史）。"""
     monkeypatch.setenv("QD_TURN_COMPACT_THRESHOLD", "50")
     s = _stand(_prior_round(big=True), raise_on_compact=True)
     assert s._maybe_turn_compact() == 0
     assert s.compact_calls == 1, "既然尝试了就该记到调用（然后被 fail-open 吞掉）"
+    assert "主动压缩失败" in caplog.text
 
 
 # ── ③ 接线不变量 ──────────────────────────────────────────────────────

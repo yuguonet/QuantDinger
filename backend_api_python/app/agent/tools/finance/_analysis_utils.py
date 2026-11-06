@@ -43,7 +43,21 @@ def _fetch_klines(stock_code: str, days: int = 120) -> List[Dict[str, Any]]:
 def _fetch_closes(stock_code: str, days: int = 120) -> List[float]:
     """获取收盘价序列。"""
     klines = _fetch_klines(stock_code, days)
-    return [float(k.get("close", 0)) for k in klines if k.get("close")]
+    return [_required_kline_value(k, "close") for k in klines]
+
+
+def _required_kline_value(kline: Dict[str, Any], field: str) -> float:
+    """读取必需的有限数值字段；数据缺失或损坏时显式失败，不伪造零值。"""
+    value = kline.get(field)
+    if value is None:
+        raise ValueError(f"K线缺失必需字段: {field}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"K线字段不是有效数值: {field}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"K线字段不是有限数值: {field}")
+    return number
 
 
 def _fetch_ohlcv(stock_code: str, days: int = 120) -> Dict[str, Any]:
@@ -55,11 +69,11 @@ def _fetch_ohlcv(stock_code: str, days: int = 120) -> Dict[str, Any]:
     klines = _fetch_klines(stock_code, days)
     o, h, l, c, v = [], [], [], [], []
     for k in klines:
-        o.append(float(k.get("open", 0)))
-        h.append(float(k.get("high", 0)))
-        l.append(float(k.get("low", 0)))
-        c.append(float(k.get("close", 0)))
-        v.append(float(k.get("volume", 0)))
+        o.append(_required_kline_value(k, "open"))
+        h.append(_required_kline_value(k, "high"))
+        l.append(_required_kline_value(k, "low"))
+        c.append(_required_kline_value(k, "close"))
+        v.append(_required_kline_value(k, "volume"))
     return {"open": o, "high": h, "low": l, "close": c, "volume": v,
             "last_date": (klines[-1].get("date") if klines else None),
             "last_ts": (klines[-1].get("time") if klines else None)}
@@ -251,9 +265,15 @@ def _kline_summary(bars: List[Dict[str, Any]], ma_windows=(5, 10, 20, 60, 120),
 # ═══════════════════════════════════════════════════════════════
 
 def _safe_round(v: float, n: int = 4) -> float:
-    """安全四舍五入，处理 NaN/Inf。"""
-    if v is None or math.isnan(v) or math.isinf(v):
-        return 0.0
+    """四舍五入有限数值；无效数据显式报错，避免伪装成真实零值。"""
+    if v is None:
+        raise ValueError("不能对缺失数值进行舍入")
+    try:
+        finite = math.isfinite(v)
+    except TypeError as exc:
+        raise ValueError("舍入输入必须是数值") from exc
+    if not finite:
+        raise ValueError("不能对 NaN 或无穷数值进行舍入")
     return round(v, n)
 
 

@@ -102,10 +102,12 @@
 
 ## 维度 5：市场状态
 
-**看什么**：`market.mood` / `mood_score` / `zt_count` / `dt_count` / `broken_rate`、`mood_regime`、**`market.index_intraday` / `intraday_bias`（指数相对开盘强弱）**、**`market.fund_flow_days`（近5日大盘资金方向）**、**`market.cautious`**
+**看什么**：**`market.market_mood` / `market_mood_score`（大盘档：指数+资金）**、**`market.stock_mood` / `stock_mood_score`（个股档：赚钱效应）**、`zt_count` / `dt_count` / `broken_rate`、`mood_regime`、**`market.index_intraday` / `intraday_bias`（指数相对开盘强弱）**、**`market.fund_flow_days`（近5日大盘资金方向）**、**`market.cautious`**
 
 怎么读：
 
+- **两档情绪分开读，不可互相替代**：大盘档回答「指数和资金强不强」→ 决定整体姿态与只数；个股档回答「钱好不好赚」→ 决定敢不敢追高
+- **两档背离时按收紧执行**：大盘档偏强但个股档偏弱（涨停少、跌停多、炸板率高）是典型「大盘强、个股难做」，不要因为大盘分高就放宽追高
 - **早盘（10:00 前）涨停/炸板计数未成熟**，此时预判以 `index_intraday`（指数相对开盘）+ `fund_flow_days`（资金持续性）为主，计数类只作辅助
 - `intraday_bias=偏弱` 或 `fund_flow_days.direction_seq` 连续 outflow → `cautious=True`：**下跌时选股更谨慎** ——提高门槛、减少只数、只做有清晰支撑的票、早盘勿抢反弹
 - `weak`：提高门槛、减少只数、优先低位启动票，避开高位连板接力
@@ -113,7 +115,7 @@
 - 炸板率高说明接力资金不足，此时「封板」反而是风险信号而不是买点
 - `hints.p_up_floor_suggest` 是按上面规则算的经验值，可以偏离但要写理由
 
-失败模式：无视情绪分桶，在炸板率 40% 的市场里推荐接力板；早盘只看涨停家数下结论（计数未成熟）；大盘走弱（cautious）仍按强势市门槛满仓推票。
+失败模式：把两档情绪混成一个数（用资金强掩盖赚钱效应差）；无视情绪分桶，在炸板率 40% 的市场里推荐接力板；早盘只看涨停家数下结论（计数未成熟）；大盘走弱（cautious）仍按强势市门槛满仓推票。
 
 ## 维度 6：可执行性
 
