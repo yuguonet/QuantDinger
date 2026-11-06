@@ -141,18 +141,51 @@ _STREAK_SURGE_LOOKBACK = _env_i("STREAK_SURGE_LOOKBACK", 12)
 _STREAK_SURGE_ZT_TOL = _env_f("STREAK_SURGE_ZT_TOL", 0.8)
 _MIN_CIRC_MV_YI = _env_f("MIN_CIRC_MV", 15.0)
 _JUMP_WITH_ZT = _env_i("JUMP_WITH_ZT", 1)
-# 有涨停板块里「非涨停（跳变）票」的名额上限（trae 2026-11-06）。
-# 合并后按首次跳变/触板时间排序取 per_board（默认 10）时，涨停票通常只有 1~2 只，
-# 其余名额会被越来越晚的跳变票顶满 —— 时间越晚的跳变质量越差（越接近尾盘越像
-# 「已经涨完了」）。限制 3 只，避免后续垃圾票占用名额；涨停票不受此限。
-# `0` = 该分支只出涨停票；`<0` = 关闭限制（回到旧行为）。
-_ZT_JUMP_MAX = _env_i("ZT_JUMP_MAX", 3)
+# 有涨停板块里「非涨停（跳变）票」的精细截断（trae 2026-11-06，v2 修正）。
+#
+# ★ v1→v2 迭代：
+#   v1（先2 + 跳2-3 + 后2，CAP_FIRST=2/IDX_MIN=4/CAP_SEC=2）假设 idx 2-3 是质量
+#   谷值（12 天样本 T3均=-0.0087），但扩展到 13 天后 idx 2-3 变成 +0.00016
+#   中性（强市里 +2.1%），跳过反而裁掉好票。更糟的是：裁掉的 idx 2-3 早票位置
+#   被 pure jump 板块的 idx 7+ 尾盘垃圾（T3均=-2.678%）在全局截断里填补，
+#   导致 NEW 最终 T3均=-0.147%（反而差于 OLD 的 -0.068%）。
+#
+# ★ v2 修正：全取好段 idx 0-6（T3均 +0.295~+0.606%），只裁 idx 7+ 尾盘垃圾
+#   （T3均 -2.678%）。13 天回测验证：
+#     PERF（CAP_FIRST=6/IDX_MIN=7/CAP_SEC=2）T3均=+0.125%（翻正！）
+#     vs ZERO（关闭三段式）-0.068%，vs 旧 v1 NEW -0.147%
+#
+# 三段参数（只在 limit_up+jump 分支生效；pure jump 分支只过 per_board cap=10）：
+#   _ZT_JUMP_CAP_FIRST  idx 0..CAP_FIRST-1 全取（默认 6，覆盖好段 0-5）
+#   _ZT_JUMP_IDX_MIN    接力段起始 idx（默认 7，跳过尾盘垃圾）
+#   _ZT_JUMP_FUND_THR   接力段 fund_circ_ratio 下限（默认 -1，关闭质量门）
+#   _ZT_JUMP_CAP_SEC    接力段 cap（默认 2）
+#   CAP_FIRST < 0       关闭整个非涨停票截断（回到 per_board cap 控制）
+_ZT_JUMP_CAP_FIRST = _env_i("ZT_JUMP_CAP_FIRST", 6)
+_ZT_JUMP_IDX_MIN = _env_i("ZT_JUMP_IDX_MIN", 7)
+_ZT_JUMP_FUND_THR = _env_f("ZT_JUMP_FUND_THR", -1.0)
+_ZT_JUMP_CAP_SEC = _env_i("ZT_JUMP_CAP_SEC", 2)
 _JUMP_CONFIRM_BARS = _env_i("JUMP_CONFIRM_BARS", 3)
 _JUMP_STREAK_RET = _env_f("JUMP_STREAK_RET", 2.0)
 _JUMP_MIN_VR = _env_f("JUMP_MIN_VR", 2.0)
 _DUP_MIN = _env_i("DUP_MIN", 1)
 _L2_SORT = (os.getenv("QD_TOPDOWN_L2_SORT", "net_pct") or "net_pct").strip().lower()
 _L2_MIN_NET_YI = _env_f("L2_MIN_NET_YI", 0.0)
+# ── 早盘防拉高出货闸（trae 2026-11-06）──
+# 根因：09:35 深亏率 14.3%（09:45 仅 4.5%），开盘 streak 模式连涨门槛极低，
+# 假启动混入。庄家拉高出货的特征是「前几日已有资金流入建仓 → 早盘突然拉升
+# 诱多 → 出货」；而「前几日无资金流入 + 早盘拉升」通常是利好消息刺激的
+# 抢筹（无庄家），不应误伤。因此本闸**只过滤前几日有净流入的跳变票**：
+#   前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR → 拦
+#   反之（净流入 ≤ 阈值，含净流出）→ 保留（消息刺激 / 无庄）
+# 只在早盘（as_of <= _EARLY_GATE_TIME）、只对 kind=jump 生效；涨停票
+# 不拦（封板=真共识）。数据不足（无 N 日净流 / 无 circ_mv）保留不剔除。
+_EARLY_GATE_ENABLE = _env_i("EARLY_GATE_ENABLE", 1)
+_EARLY_GATE_TIME = os.getenv("QD_TOPDOWN_EARLY_GATE_TIME", "10:00") or "10:00"
+_EARLY_FLOW_DAYS = _env_i("EARLY_FLOW_DAYS", 5)
+# 前 N 日累计净流入占流通市值比下限（百分数）。> 此值视为「有庄建仓痕迹」。
+# 默认 0.3 = 前 5 日累计净流入 > 流通市值的 0.3% 才拦。
+_EARLY_FLOW_IN_THR = _env_f("EARLY_FLOW_IN_THR", 0.3)
 
 _PRESETS: Dict[str, Dict[str, float]] = {
     "strong":  {"boards": _L2_BOARDS_STRONG, "jump_ret": 0.4, "jump_amt_mult": 2.5,
@@ -729,19 +762,38 @@ def pick_stocks_in_board(track: str, name: str, zt_rows: List[Dict[str, Any]],
             out["jumps"] = jp
             out["branch"] = "limit_up+jump"
             picked.sort(key=lambda x: (x.get("t_first") or "99:99"))
-            # 除涨停票外（跳变票）最多 _ZT_JUMP_MAX 只：涨停票按时间全取，
-            # 跳变票只留最早触发的前 N 只 —— 后面时间的跳变多为「涨完了才报」的
-            # 垃圾票，旧版用 cap=10 的剩余名额把 8 只一并塞进 picked（trae 2026-11-06）。
-            if _ZT_JUMP_MAX >= 0:
-                kept: List[Dict[str, Any]] = []
-                n_jump = 0
+            # 跳变票精细截断（v2：全取好段 0-6，只裁尾盘垃圾 7+）。
+            # ★ v1→v2 根因见常量注释 L144-163。三段式逻辑不变，只改默认参数：
+            #   v1 默认 (2,4,2) → 先2 + 跳2-3 + 后2
+            #   v2 默认 (6,7,2) → 全取 idx 0-5 + 接力 idx 7+ 限 2 只
+            # 13 天回测：v1 T3均=-0.147% → v2 T3均=+0.125%（翻正）
+            #
+            # 截断步骤：
+            #   (a) 涨停票全取（不变）
+            #   (b) first = idx 0..CAP_FIRST-1 全取（好段 0-5，T3均 +0.3~+0.6%）
+            #   (c) sec = idx >= IDX_MIN 接力，FUND_THR 质量门 + CAP_SEC cap
+            #   (d) 总跳变票 cap = CAP_FIRST + CAP_SEC
+            #       若 FUND_THR < 0 关闭质量门；CAP_FIRST < 0 关闭整个截断。
+            if _ZT_JUMP_CAP_FIRST >= 0:
+                zt: List[Dict[str, Any]] = []
+                jp_sorted: List[Dict[str, Any]] = []
                 for x in picked:
                     if x.get("kind") == "limit_up":
-                        kept.append(x)
-                    elif n_jump < _ZT_JUMP_MAX:
-                        kept.append(x)
-                        n_jump += 1
+                        zt.append(x)
+                    else:
+                        jp_sorted.append(x)
+                # picked 已按 t_first 排序（L731），jp_sorted 继承此顺序
+                first = jp_sorted[:_ZT_JUMP_CAP_FIRST]
+                rest = jp_sorted[_ZT_JUMP_CAP_FIRST:]
+                sec = [p for i, p in enumerate(rest)
+                       if i + _ZT_JUMP_CAP_FIRST >= _ZT_JUMP_IDX_MIN
+                       and (_ZT_JUMP_FUND_THR < 0
+                            or (p.get("fund_circ_ratio") or 0) > _ZT_JUMP_FUND_THR)
+                       ][:_ZT_JUMP_CAP_SEC]
+                kept = zt + first + sec
                 out["jump_capped_n"] = len(picked) - len(kept)
+                out["jump_first_n"] = len(first)
+                out["jump_sec_n"] = len(sec)
                 picked = kept
             picked = picked[:cap]
             # ⚠ 必须回写：L702 的 out.update 存的是同一个 list 引用，而上面
@@ -983,6 +1035,69 @@ def attach_flow_strength(items: List[Dict[str, Any]], day: str,
     return out, invalid
 
 
+def _early_pump_dump_gate(items: List[Dict[str, Any]], day: str,
+                          as_of: Optional[str]
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """早盘防拉高出货闸：前几日有资金净流入 + 早盘跳变 → 可能拉高出货。
+
+    只在早盘（as_of <= _EARLY_GATE_TIME）生效，只对 kind=jump 的跳变票生效；
+    涨停票不拦（封板=真资金共识）。
+
+    判定逻辑（用户 2026-11-06 澄清）：
+      · 前 N 日**累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR**
+        → 有庄家建仓痕迹 + 早盘突然拉升 = 可能拉高出货 → 拦
+      · 反之（净流入 ≤ 阈值，含净流出 / 零流入）
+        → 无庄家建仓，早盘拉升更可能是利好消息刺激的抢筹 → 保留
+
+    数据口径：snap_panel(as_of="15:00") 取前 N 个交易日的**全日**累计净额
+    （不含今日 day，避免前视），求和得「前 N 日累计净流入」。流通市值复用
+    attach_flow_strength 已挂的 circ_mv（与 fund_circ_ratio 同口径）。
+    数据不足（缺 N 日净流 或 无 circ_mv）按"不可验证"保留，不默认放行也不剔除。
+
+    Returns:
+        (kept, excluded, unknown)
+    """
+    if not _EARLY_GATE_ENABLE or not as_of:
+        return list(items), [], 0
+    if as_of > _EARLY_GATE_TIME:
+        return list(items), [], 0
+    jump_items = [x for x in items if x.get("kind") == "jump"]
+    if not jump_items:
+        return list(items), [], 0
+    codes = sorted({str(x.get("code") or "").split(".")[0] for x in jump_items})
+    # days = N+1：含今日 day，但后续只取 day 之前的 N 个交易日
+    p = _sq.snap_panel(as_of="15:00", codes=codes, days=_EARLY_FLOW_DAYS + 1,
+                       with_net=True, full_net=True, end_day=day, with_last=False)
+    rows = p.get("rows") or {}
+    days = sorted(d for d in (p.get("days") or []) if d < day)[-_EARLY_FLOW_DAYS:]
+    kept: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    unknown = 0
+    for x in items:
+        if x.get("kind") != "jump":
+            kept.append(x)
+            continue
+        code = str(x.get("code") or "").split(".")[0]
+        byday = rows.get(code) or {}
+        nets = [(byday.get(d) or {}).get("net") for d in days]
+        nets = [n for n in nets if n is not None]
+        circ_mv = x.get("circ_mv")
+        # 缺 N 日净流 或 无流通市值 → 不可验证，保留
+        if len(nets) < _EARLY_FLOW_DAYS or not circ_mv:
+            unknown += 1
+            kept.append(x)
+            continue
+        cum_net = sum(nets)
+        ratio = cum_net / float(circ_mv) * 100.0
+        if ratio > _EARLY_FLOW_IN_THR:
+            excluded.append({**x, "excluded_reason":
+                             f"前{_EARLY_FLOW_DAYS}日净流入{ratio:+.2f}%"
+                             f"（有庄建仓+早盘拉升疑出货）"})
+        else:
+            kept.append(x)
+    return kept, excluded, unknown
+
+
 def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
                  limit: Optional[int] = None) -> Dict[str, Any]:
     """三层漏斗主流程：L1 大盘闸 → L2 板块闸 → L3 板块内选股 → 截断。
@@ -1103,6 +1218,18 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
         notes.append(f"资金流通比 {flow_invalid} 只落在低区无效区间"
                      f"（流通市值 < {_MIN_CIRC_MV_YI:g} 亿或数据缺失），不参与排序")
 
+    # 早盘防拉高出货闸：前几日有净流入 + 早盘跳变 = 疑似出货 → 拦
+    # 只对 kind=jump 生效；涨停票不拦。详见 _early_pump_dump_gate 注释。
+    all_picked, early_excluded, early_unknown = _early_pump_dump_gate(
+        all_picked, d, as_of)
+    if early_excluded:
+        brief = "、".join(f"{x['code']}({x['excluded_reason']})"
+                         for x in early_excluded[:8])
+        notes.append(f"早盘防拉高出货闸放弃 {len(early_excluded)} 只：{brief}")
+    if early_unknown:
+        notes.append(f"早盘防拉高出货闸 {early_unknown} 只因前{_EARLY_FLOW_DAYS}日"
+                     f"净流或流通市值缺失未判（保留）")
+
     all_picked.sort(key=lambda x: ((x.get("t_first") or "99:99"),
                                    -(x.get("dup_n") or 1),
                                    0 if x.get("flow_valid") else 1,
@@ -1132,6 +1259,8 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
             "picked": len(trunc),
             "excluded_streak_surge": [x["code"] for x in streak_excluded],
             "streak_surge_unknown": streak_unknown,
+            "excluded_early_pump_dump": [x["code"] for x in early_excluded],
+            "early_pump_dump_unknown": early_unknown,
             "dup_codes": dup_codes,
             "dup_max": max((int(x.get("dup_n") or 1) for x in trunc), default=1),
             "dup_min_gate": _DUP_MIN,
