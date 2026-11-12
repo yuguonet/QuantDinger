@@ -27,6 +27,7 @@ from ...log import logger
 from ._helpers import (select_strategy, build_report, resolve_names,
                        tech_summary, predict_one, _mood_regime,
                        prewarm_market_klines, cross_verdict, _num_or_none)
+from .monitor_tags import attach_monitor   # 重点监控格（软提示，2026-11-07）
 from ._facts import (market_state as _market_state,
                      multitimeframe as _multitimeframe,
                      detect_patterns as _detect_patterns,
@@ -144,9 +145,11 @@ _REPORT_GUIDE = {
         "★ 买点/止损写**关键位置**并注明是哪个位置（回踩 MA10 11.62 / 区间下沿 11.30 / "
         "前低 11.05 / 缺口上沿 11.40 任选其一，不要求是均线），"
         "禁止用 VWAP/分时均价当买点；止损写「跌破 X」/「不跌破 X」；"
-        "T+N 填 看多/中性/看空。\n"
+        "T+N 填 看多/中性/看空/未知；中性须有充分证据支持，"
+        "证据不足、无法相互验证或存在未解决的矛盾时填未知，并简述缺口或冲突；"
+        "市场及其他综合判断也须区分中性和未知，不得把缺失或冲突当中性。\n"
         "★ **全文用中文白话**，禁止输出 near_support / rank_cut 等字段名。\n"
-        "## 不买/观察（每只一行：代码+拒因≤20字）\n"
+        "不另设「不买/观察」栏目，也不逐一罗列未推荐标的；无合格标的时写「今日无符合标的」及理由。\n"
         "## 风险（≤3 行）\n"
         "指标罗列、漏斗数字不进正文。保留代码+看多看空+跌破 X（喂 claims）。"
     ),
@@ -164,7 +167,23 @@ _REPORT_GUIDE = {
                     "用来判断**未涨停票所在板块**的强弱与资金共识。"
                     "**禁止**把清单里的票写进「买什么」，也不要在正文整表罗列；"
                     "可作为「该板块已有多只封板」的旁证出现。",
-    "buyable": "**只在盘中此刻（strategy=intraday）生效**：rt.limit_up=true 或 rt.limit_down=true → 只进排除表，禁止进可买表；"
+    "monitor": "回测经验提示（1m全样本2026-04-15~11-02，134个交易日、deep可成交n=1862；"
+               "弱市市值按当日指数分组跌幅<0、80亿元分界；仅作软证据，不是排除令）："
+               "将 analyzed_rank / picked_detail / limit_up_ref 的 `monitor` 内容并入对应的题材、"
+               "量价、位置或可执行性分析，结合当日支撑/资金/市场状态判断；不得把监控格当作单独分析项，"
+               "也不要单独罗列格子名称或提示清单。确实影响结论时，在「一句话理由」或「风险」中自然写出"
+               "具体风险、确认条件和反制动作；可被当日证据否决，不得机械服从。"
+               "解读冲突的优先级：个股当下可执行性、支撑/分时承接和多日资金证据"
+               " > 1m全样本分组关联 > 10/21-10/29七日过滤/确认实验 > 更早5m小样本标签。"
+               "不同口径不得混为同一结论；数据缺失时不推断。"
+               "全样本提示：loc=hot组触板率较高但深亏率也更高；loc=cool深亏较低但触板率不高。"
+               "决策日涨幅2~5%组并非深亏最高；≥5%组深亏更多但触板止盈改善收益，"
+               "不按涨幅单独排除。前5日下跌只是背景，不等于洗盘或买点。"
+               "弱市<80亿组历史深亏/触板均较高，≥80亿组两者均较低；只提高/调整证据门槛，"
+               "不筛盘、不自动优先大盘股。早盘信号触板率低于午盘，但盘中上冲和大回撤比例都更高；"
+               "确认支撑、回踩承接和量价延续，不能仅按时段加分。"
+               "limit_up_ref只作板块情绪旁证，不是可买清单；不得仅凭早封、连板或午后封板推导接力结论。",
+    "buyable": "**只在盘中此刻（strategy=intraday）生效**：rt.limit_up=true 或 rt.limit_down=true → 禁止进可买表，无需另列排除表；"
                "盘后/尾盘一律放行——封板/跌停是事实不是排除令，可进「买什么」但要写明「当日已封板」"
                "与次日买点（一字板风险：需等开板或回踩支撑，不追集合竞价）；接不接由你的逻辑决定，须给理由；"
                "rt.buyable=false 是 deep 阶段的最终防线（选人层不再做池层预排除）；"
@@ -210,8 +229,9 @@ _REPORT_GUIDE = {
                      "**缩量回踩是减分不是加分**。"
                      "★ 位置透支看三件套（dist_ma20_pct / pos20 / ret5_pct）：三项都高 = 深亏高发区（实测该档 −3.51%、"
                      "深亏率 35%）；三项都低 = 位置干净（历史样本 +3.55%、深亏率 1%，可关注但非必反转）。"
-                     "**这一维度是排序参考的首要依据**，优先看它。rank 已给合成档 **loc**（hot=透支 / cool=位置干净 / normal），见 location 条。"
-                     "加分项不足 2 条的进「不买/观察」并注明缺哪条；"
+                     "位置与资金流入流出同为核心证据，不得用位置或新增提示稀释、替代资金判断。"
+                     "rank 已给合成档 **loc**（hot=透支 / cool=位置干净 / normal），见 location 条。"
+                     "加分项不足 2 条的不进「买什么」，不另列未推荐名单；"
                      "**数量不是考核项**：弱市给 1 只也合规，凑数才是错的；环境转强可多给，但要写明成立的是哪几条。",
     "stance_rule": "禁止「一律回踩均线」，也禁止**把 rank 的 sup.px 直接当买点**——sup 只是「现价下方"
                    "最近的位置」，照抄的结果是三只票买点全在现价下方、当天一只也买不到。"
@@ -220,7 +240,10 @@ _REPORT_GUIDE = {
                    "弱环境才把买点压到 sup 下方一档，并且只留能当日成交的。"
                    "**买点形态要跟着强度走**：强度加分项多的给「突破 hi_today 追」，加分项少的只给回踩；"
                    "全名单买点长得一模一样（全回踩或全突破）同样是没排序。",
-    "horizon": "表内只写 T+1/T+3/T+5（词表：看多/中性/看空）；T+10/T+20 不写。"
+    "horizon": "表内只写 T+1/T+3/T+5（词表：看多/中性/看空/未知）；T+10/T+20 不写。"
+               "每个周期独立判断：中性是有充分证据支持的明确结论，不是缺省值；"
+               "数据不足、无法相互验证或证据矛盾且无法消解时为未知，说明缺口或冲突；"
+               "不得把未知写成中性，也不得以其他周期结论代替。"
                "zt_streak>=3 只写 T+1。",
     "priority": "支撑与弱转强/强转弱 ≫ 涨跌幅；禁止按涨跌幅排序",
     "support_rule": "盘中红绿不决定安全；可怕的是无支撑阴跌。-8%弱转强+有支撑 可以比 +8%转分歧更安全",
@@ -256,7 +279,7 @@ _REPORT_GUIDE = {
               "mkt_fp_prev_pct 前5日同刻净占比均值}；"
               "主论据= 强度四件套 / MA 排列 / flow / 位置透支档；rt 看现价/涨跌停",
     "board_cut": "zt_streak>=3 默认只写 T+1",
-    "words": "方向用 看多/中性/看空/回避；用户问持仓才写「兑现」",
+    "words": "方向用 看多/中性/看空/未知/回避；中性与未知不可混用；用户问持仓才写「兑现」",
     "market": "market_mood/stock_mood/资金/热点已由 run_skill 覆盖；不要再 get_market_overview / get_hot_sectors；"
               "**环境决定姿态，两个方向都要用**：cautious=true 或 market_mood 偏弱 → 提高门槛、减少只数、"
               "只做有支撑的票、买点压深一档；market_mood 偏强 + fund_flow_days 净流入 → 放宽（可给突破买点、"
@@ -265,7 +288,10 @@ _REPORT_GUIDE = {
               "stock_mood 回答钱好不好赚，决定敢不敢追高；两者背离（大盘强、个股档偏弱）时按收紧执行，"
               "并把分歧写进风险行。"
               "大盘本身最多进「风险」一行轻注，不得当筛选主条件",
-    "fund_trend": "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 net_wan；"
+    "fund_trend": "资金流入流出是选股、排序和买卖判断的核心证据，不因新增位置、形态或回测提示而降权；"
+                  "按数据口径综合当日流向和近5/20日连续性，持续流出或脉冲后流出应明确影响排序与风险判断，"
+                  "不能仅凭低位、形态或统计提示抵消；资金数据缺失须标明，不能当作零或流入。"
+                  "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 net_wan；"
                   "单日大额流入不等于趋势，连续3日以上同向才算趋势；剔除最大单日后仍为正才是普遍承接。"
                   "★**口径**：net_wan / net5d_wan / net20d_wan 都是 `caliber=price_direction` 的"
                   "**量价方向净额**（按分钟涨跌方向累计成交额派生），**不是东财四档主力净额**，"
@@ -1091,6 +1117,7 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
     if isinstance(result, dict):
         out = {"report_guide": result.get("report_guide", _REPORT_GUIDE), **outer}
         out.update({k: v for k, v in result.items() if k != "report_guide"})
+        attach_monitor(out)          # 重点监控格：rank/picked_detail/limit_up_ref 软标记
         _log_run(t0, ms, funnel, out)
         return SkillResult(out)
     return result
@@ -1129,6 +1156,7 @@ def _run_topdown(t0: float, ms: dict):
 
     f = td.get("funnel") or {}
     funnel.update({"verdict": f.get("verdict"),
+                   "idx_ret": f.get("idx_ret"),
                    "pool_raw": f.get("picked_raw") or 0,
                    "baseline": f.get("picked") or 0,
                    "deep_n": len(td.get("picked") or []),
@@ -1165,6 +1193,7 @@ def _run_topdown(t0: float, ms: dict):
                 "analyzed": [], "analyzed_rank": [],
                 "signal": "候选全部已封板：仅列涨停参考，无可分析标的",
                 "missing": (td.get("missing") or [])[:8]}
+        attach_monitor(_out)          # 涨停参考只补充板块情绪与次日验证提示
         _log_run(t0, ms, funnel, _out)
         return SkillResult(_out)
 
@@ -1176,7 +1205,7 @@ def _run_topdown(t0: float, ms: dict):
              "topdown_notes": (td.get("missing") or [])[:8],
              "picked_detail": [{k: x.get(k) for k in
                                 ("code", "board", "track", "tier", "kind", "reason",
-                                 "dup_n", "t_first", "flow_valid")}
+                                 "dup_n", "t_first", "flow_valid", "circ_mv")}
                                for x in picked]}
     return _deep_and_deliver(codes, outer, funnel, t0, ms)
 

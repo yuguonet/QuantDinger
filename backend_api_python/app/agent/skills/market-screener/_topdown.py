@@ -34,6 +34,13 @@
       深亏 5→1 笔、负收益累计 -176→-70、T+3 胜 69.8%→75.2%（累计收益 430→396）。
       闸在 per_board 截断之前生效，被剔除的名额由后续跳变票回填。
     出票只有两支：涨停票（按 zt_time 先后）与跳变票（按 t_first 先后）。
+    · **早盘吸筹准入闸**（`_early_accumulation_gate`，仅 as_of ≤ 09:40）：
+      跳变票须满足「前 5 日累计净流入 > 流通市值 1%（明显吸筹）」且「前 5 日
+      累计涨幅 < 10%（未过度拉升）」，否则放弃；涨停票不拦。生产实测：阈值
+      0→1.0 后 09:40 触板率 11.8%→26.3%、T3 均 +1.079%→+1.931%；09:35 深亏
+      归零但样本降到日均 1.2 只。09:45 实测深亏反而 3.2%→5.6%（被拦组深亏 0%
+      纯误伤），故截止收到 09:40。流通市值「中位更优」不成立（20~80 亿反而
+      最差），故不设市值条件（trae 2026-11-06）。
 
   截断        板块内 per_board（默认 10）：涨停分支里涨停票按触板时间全取，
     非涨停的跳变票只留最早 `QD_TOPDOWN_ZT_JUMP_MAX`（默认 3）只 —— 旧版把
@@ -171,21 +178,42 @@ _JUMP_MIN_VR = _env_f("JUMP_MIN_VR", 2.0)
 _DUP_MIN = _env_i("DUP_MIN", 1)
 _L2_SORT = (os.getenv("QD_TOPDOWN_L2_SORT", "net_pct") or "net_pct").strip().lower()
 _L2_MIN_NET_YI = _env_f("L2_MIN_NET_YI", 0.0)
-# ── 早盘防拉高出货闸（trae 2026-11-06）──
-# 根因：09:35 深亏率 14.3%（09:45 仅 4.5%），开盘 streak 模式连涨门槛极低，
-# 假启动混入。庄家拉高出货的特征是「前几日已有资金流入建仓 → 早盘突然拉升
-# 诱多 → 出货」；而「前几日无资金流入 + 早盘拉升」通常是利好消息刺激的
-# 抢筹（无庄家），不应误伤。因此本闸**只过滤前几日有净流入的跳变票**：
-#   前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR → 拦
-#   反之（净流入 ≤ 阈值，含净流出）→ 保留（消息刺激 / 无庄）
-# 只在早盘（as_of <= _EARLY_GATE_TIME）、只对 kind=jump 生效；涨停票
-# 不拦（封板=真共识）。数据不足（无 N 日净流 / 无 circ_mv）保留不剔除。
+# ── 早盘「庄家吸筹」准入闸（trae 2026-11-06）──
+# ★ 两轮回测修正后的结论（12 天 10-21~11-05，09:35/09:40/09:45，详见 tmp/
+#   oc_sel_early_gate_*_20261106.py）：
+#   1) 原假说「前几日流入 + 早盘拉升 = 拉高出货」被数据**否定**：09:35 加闸后
+#      保留组 T3 均 -0.110%，被拦组 +1.334% —— 拦掉的是好票。资金流入是
+#      **正向因子**（庄在继续做），不是风险信号。
+#   2) 用户新假说（庄家需时间吸筹）**成立**，前 5 日净流分档三时点一致单调：
+#        净流出组 T3 -4.5~-7.1%，净流入 0~3% 组 +3.5~+4.1%。
+#      前 5 日涨幅 <10% 最佳；≥10% 明显变差（09:40 该组 T3 -4.155%、深亏 42.9%）。
+#   3) 流通市值「中位」假说**不成立**：20~80 亿反而最差（09:35 -4.187%、
+#      09:45 -3.548%），两头（<20 亿 / ≥150 亿）更好。后续 1m 全样本弱市切片中，
+#      ≥80 亿深亏率较低但触板率也较低；效果存在取舍，**不做市值硬筛/排序**，
+#      只把弱市市值层级与早盘波动线索交给 deep 作为风险证据。
+#
+# 准入条件（仅 kind=jump；涨停票不拦；仅 as_of <= _EARLY_GATE_TIME 生效）：
+#   前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR（默认 1.0）
+#   且 前 N 日累计涨幅 < _EARLY_RET5_MAX（默认 10%）
+# 生产管道实测（闸 ON，全量池）：
+#   阈值 0（12 天 10-21~11-05）：09:35 深亏 10.4%→6.2%、T3 +0.468%→+1.955%；
+#                                 09:40 深亏 8.0%→5.6%、T3 +0.102%→+0.588%
+#   阈值 1.0（11 天 10-22~11-05）：09:35 n=13 深亏 0%、T3 +6.986%（样本少，
+#                                 易被单只极端值拉动）；09:40 n=19 触板
+#                                 11.8%→26.3%、T3 +1.079%→+1.931%、深亏 5.3%
+#   09:45 深亏 3.2%→5.6% 恶化，被拦组深亏 0%（纯误伤）→ 截止收到 09:40
+# 代价：阈值 1.0 下候选约 1.2~1.7 只/天，09:40 触板率翻倍。
 _EARLY_GATE_ENABLE = _env_i("EARLY_GATE_ENABLE", 1)
-_EARLY_GATE_TIME = os.getenv("QD_TOPDOWN_EARLY_GATE_TIME", "10:00") or "10:00"
+_EARLY_GATE_TIME = os.getenv("QD_TOPDOWN_EARLY_GATE_TIME", "09:40") or "09:40"
 _EARLY_FLOW_DAYS = _env_i("EARLY_FLOW_DAYS", 5)
-# 前 N 日累计净流入占流通市值比下限（百分数）。> 此值视为「有庄建仓痕迹」。
-# 默认 0.3 = 前 5 日累计净流入 > 流通市值的 0.3% 才拦。
-_EARLY_FLOW_IN_THR = _env_f("EARLY_FLOW_IN_THR", 0.3)
+# 前 N 日累计净流入 ÷ 流通市值 × 100 的**准入下限**（%）。
+# 默认 1.0 = 要求前 5 日净流入超过流通市值的 1%（明显吸筹）。
+# 依据（生产实测，09:40 截止）：0→1.0 时 09:40 T3 均 +1.079%→+1.931%、
+# 触板率 11.8%→26.3%（翻倍）；1.0→2.0 则 09:35 样本降到日均 0.5 只且
+# T3 -1.935%，过度收紧。0.5 在 09:40 反而 T3 -0.003%，不稳定，故取 1.0。
+_EARLY_FLOW_IN_THR = _env_f("EARLY_FLOW_IN_THR", 1.0)
+# 前 N 日累计涨幅的**准入上限**（%）。≥ 此值视为已过度拉升、无吸筹空间。
+_EARLY_RET5_MAX = _env_f("EARLY_RET5_MAX", 10.0)
 
 _PRESETS: Dict[str, Dict[str, float]] = {
     "strong":  {"boards": _L2_BOARDS_STRONG, "jump_ret": 0.4, "jump_amt_mult": 2.5,
@@ -1035,24 +1063,27 @@ def attach_flow_strength(items: List[Dict[str, Any]], day: str,
     return out, invalid
 
 
-def _early_pump_dump_gate(items: List[Dict[str, Any]], day: str,
-                          as_of: Optional[str]
-                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    """早盘防拉高出货闸：前几日有资金净流入 + 早盘跳变 → 可能拉高出货。
+def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
+                             as_of: Optional[str]
+                             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """早盘「庄家吸筹」准入闸：前 N 日有净流入 且 涨幅未过度。
 
-    只在早盘（as_of <= _EARLY_GATE_TIME）生效，只对 kind=jump 的跳变票生效；
-    涨停票不拦（封板=真资金共识）。
+    ★ 结论来自 2026-11-06 两轮回测（12 天 10-21~11-05，09:35/09:40/09:45，
+      脚本 tmp/oc_sel_early_gate_*_20261106.py），关键翻转：
+      · 原「前几日流入 + 早盘拉升 = 拉高出货」假说被否定：09:35 拦掉的是好票
+        （被拦组 T3 +1.334% vs 保留组 -0.110%）。资金流入是**正向因子**。
+      · 新假说「庄家需时间吸筹」成立：前 5 日净流分档三时点一致单调
+        （净流出 -4.5~-7.1%，净流入 0~3% +3.5~+4.1%）；前 5 日涨幅 ≥10% 明显变差。
+      · 「中位流通市值更优」不成立（20~80 亿最差）→ 本闸不引入市值条件。
 
-    判定逻辑（用户 2026-11-06 澄清）：
-      · 前 N 日**累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR**
-        → 有庄家建仓痕迹 + 早盘突然拉升 = 可能拉高出货 → 拦
-      · 反之（净流入 ≤ 阈值，含净流出 / 零流入）
-        → 无庄家建仓，早盘拉升更可能是利好消息刺激的抢筹 → 保留
+    准入条件（仅 kind=jump；涨停票不拦；仅 as_of <= _EARLY_GATE_TIME 生效）：
+        前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR（默认 1.0）
+        且 前 N 日累计涨幅 < _EARLY_RET5_MAX（默认 10%）
 
-    数据口径：snap_panel(as_of="15:00") 取前 N 个交易日的**全日**累计净额
-    （不含今日 day，避免前视），求和得「前 N 日累计净流入」。流通市值复用
-    attach_flow_strength 已挂的 circ_mv（与 fund_circ_ratio 同口径）。
-    数据不足（缺 N 日净流 或 无 circ_mv）按"不可验证"保留，不默认放行也不剔除。
+    数据口径：snap_panel(as_of="15:00", end_day=day) 取 day 之前 N 个交易日的
+    全日净额与末拍价（**不含今日**，避免前视）。5 日涨幅 = 前1日收 ÷ 前6日收 - 1。
+    流通市值复用 attach_flow_strength 已挂的 circ_mv（与 fund_circ_ratio 同口径）。
+    数据不足（缺 N 日净流 / 末拍价 / 流通市值）→ 不可验证，保留并计数。
 
     Returns:
         (kept, excluded, unknown)
@@ -1065,11 +1096,11 @@ def _early_pump_dump_gate(items: List[Dict[str, Any]], day: str,
     if not jump_items:
         return list(items), [], 0
     codes = sorted({str(x.get("code") or "").split(".")[0] for x in jump_items})
-    # days = N+1：含今日 day，但后续只取 day 之前的 N 个交易日
-    p = _sq.snap_panel(as_of="15:00", codes=codes, days=_EARLY_FLOW_DAYS + 1,
-                       with_net=True, full_net=True, end_day=day, with_last=False)
+    # N+2 天窗口：N 日净流 + 多 1 个交易日做涨幅起点（前6日收）
+    p = _sq.snap_panel(as_of="15:00", codes=codes, days=_EARLY_FLOW_DAYS + 2,
+                       with_net=True, full_net=True, end_day=day, with_last=True)
     rows = p.get("rows") or {}
-    days = sorted(d for d in (p.get("days") or []) if d < day)[-_EARLY_FLOW_DAYS:]
+    d_prev = sorted(d for d in (p.get("days") or []) if d < day)
     kept: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
     unknown = 0
@@ -1079,20 +1110,26 @@ def _early_pump_dump_gate(items: List[Dict[str, Any]], day: str,
             continue
         code = str(x.get("code") or "").split(".")[0]
         byday = rows.get(code) or {}
-        nets = [(byday.get(d) or {}).get("net") for d in days]
-        nets = [n for n in nets if n is not None]
         circ_mv = x.get("circ_mv")
-        # 缺 N 日净流 或 无流通市值 → 不可验证，保留
-        if len(nets) < _EARLY_FLOW_DAYS or not circ_mv:
+        nets = [(byday.get(d) or {}).get("net")
+                for d in d_prev[-_EARLY_FLOW_DAYS:]]
+        nets = [n for n in nets if n is not None]
+        # 前1日收 与 前6日收（5 日涨幅的起止点）
+        c1 = (byday.get(d_prev[-1]) or {}).get("last") if d_prev else None
+        c6 = ((byday.get(d_prev[-_EARLY_FLOW_DAYS - 1]) or {}).get("last")
+              if len(d_prev) >= _EARLY_FLOW_DAYS + 1 else None)
+        if len(nets) < _EARLY_FLOW_DAYS or not circ_mv or not c1 or not c6:
             unknown += 1
             kept.append(x)
             continue
-        cum_net = sum(nets)
-        ratio = cum_net / float(circ_mv) * 100.0
-        if ratio > _EARLY_FLOW_IN_THR:
+        ratio = sum(nets) / float(circ_mv) * 100.0
+        ret5 = (float(c1) / float(c6) - 1) * 100.0
+        if ratio <= _EARLY_FLOW_IN_THR:
             excluded.append({**x, "excluded_reason":
-                             f"前{_EARLY_FLOW_DAYS}日净流入{ratio:+.2f}%"
-                             f"（有庄建仓+早盘拉升疑出货）"})
+                             f"前{_EARLY_FLOW_DAYS}日净流入{ratio:+.2f}%（无庄吸筹）"})
+        elif ret5 >= _EARLY_RET5_MAX:
+            excluded.append({**x, "excluded_reason":
+                             f"前{_EARLY_FLOW_DAYS}日涨幅{ret5:+.1f}%（已过度拉升）"})
         else:
             kept.append(x)
     return kept, excluded, unknown
@@ -1218,17 +1255,17 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
         notes.append(f"资金流通比 {flow_invalid} 只落在低区无效区间"
                      f"（流通市值 < {_MIN_CIRC_MV_YI:g} 亿或数据缺失），不参与排序")
 
-    # 早盘防拉高出货闸：前几日有净流入 + 早盘跳变 = 疑似出货 → 拦
-    # 只对 kind=jump 生效；涨停票不拦。详见 _early_pump_dump_gate 注释。
-    all_picked, early_excluded, early_unknown = _early_pump_dump_gate(
+    # 早盘「庄家吸筹」准入闸：前 N 日有净流入 且 5 日涨幅未过度（仅 jump）。
+    # 只对 kind=jump 生效；涨停票不拦。详见 _early_accumulation_gate 注释。
+    all_picked, early_excluded, early_unknown = _early_accumulation_gate(
         all_picked, d, as_of)
     if early_excluded:
         brief = "、".join(f"{x['code']}({x['excluded_reason']})"
                          for x in early_excluded[:8])
-        notes.append(f"早盘防拉高出货闸放弃 {len(early_excluded)} 只：{brief}")
+        notes.append(f"早盘吸筹准入闸放弃 {len(early_excluded)} 只：{brief}")
     if early_unknown:
-        notes.append(f"早盘防拉高出货闸 {early_unknown} 只因前{_EARLY_FLOW_DAYS}日"
-                     f"净流或流通市值缺失未判（保留）")
+        notes.append(f"早盘吸筹准入闸 {early_unknown} 只因前{_EARLY_FLOW_DAYS}日"
+                     f"净流/末拍价/流通市值缺失未判（保留）")
 
     all_picked.sort(key=lambda x: ((x.get("t_first") or "99:99"),
                                    -(x.get("dup_n") or 1),
@@ -1251,6 +1288,7 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
         "picked": trunc,
         "funnel": {
             "verdict": gate.get("verdict"),
+            "idx_ret": gate.get("idx_ret"),
             "boards_n": boards.get("n"),
             "l2_sort": _L2_SORT,
             "boards_main": len(boards.get("main") or []),
@@ -1259,8 +1297,8 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
             "picked": len(trunc),
             "excluded_streak_surge": [x["code"] for x in streak_excluded],
             "streak_surge_unknown": streak_unknown,
-            "excluded_early_pump_dump": [x["code"] for x in early_excluded],
-            "early_pump_dump_unknown": early_unknown,
+            "excluded_early_accumulation": [x["code"] for x in early_excluded],
+            "early_accumulation_unknown": early_unknown,
             "dup_codes": dup_codes,
             "dup_max": max((int(x.get("dup_n") or 1) for x in trunc), default=1),
             "dup_min_gate": _DUP_MIN,

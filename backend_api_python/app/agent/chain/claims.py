@@ -85,7 +85,7 @@ _LEVEL_RE = re.compile(
 # 【周期上限】用户裁定：筛选封顶 **T+20 ≈ 1M**；T+10/T+20 同 2W/1M 天数。
 _HORIZON_DIR_RE = re.compile(
     r"T\s*\+?\s*(10|20|1|3|5)\s*[）)】\]]?\s*[：:，,、\s]*"
-    r"(看多|看涨|偏多|做多|看空|看跌|偏空|中性|震荡|回避|不适用)", re.I)
+    r"(看多|看涨|偏多|做多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)", re.I)
 # 表头「T+1/T+3/T+5(/T+10/T+20)」+ 单元格同序映射
 _TN_HEADER_RE = re.compile(
     r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5", re.I)
@@ -93,11 +93,11 @@ _TN_HEADER5_RE = re.compile(
     r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5\s*[/／|]\s*"
     r"T\s*\+?\s*10\s*[/／|]\s*T\s*\+?\s*20", re.I)
 _TN_CELL_RE = re.compile(
-    r"(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
-    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
-    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用)"
-    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用))?"
-    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用))?",
+    r"(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
+    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
+    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
+    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知))?"
+    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知))?",
     re.I)
 
 _DIR_MAP = {
@@ -119,7 +119,7 @@ def extract_horizon_directions(text: str) -> List[Tuple[str, str]]:
       2. 表格 `T+1/T+3/T+5[/T+10/T+20]` 列 + 单元格同序
     Returns:
         [("T+1","bullish"), ("T+3","neutral"), ...]  不去重顺序保留；中性不产出
-        （neutral 无追责价值，与 _extract_direction 口径一致）。
+        （neutral 和未知不产方向 claim，未知仅占位、不影响其他周期）。
     """
     t = text or ""
     out: List[Tuple[str, str]] = []
@@ -452,7 +452,13 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
             if len(out) >= max_claims:
                 break
             _add("direction", {"dir": d}, lab, hz=lab)
-    else:
+    elif not (
+        any(m.group(2) == "未知" for m in _HORIZON_DIR_RE.finditer(answer))
+        or (
+            _TN_HEADER_RE.search(answer)
+            and any("未知" in m.groups() for m in _TN_CELL_RE.finditer(answer))
+        )
+    ):
         d = _extract_direction(answer)
         if d and d != "neutral":
             _add("direction", {"dir": d}, _conclusion_text(answer, span=200)[:200])

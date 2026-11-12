@@ -32,6 +32,7 @@ from ...log import logger
 from .common import (
     fetch_kline, _data_day, fetch_hot_sectors, _get_writer,
     compute_ma, compute_macd, compute_rsi, compute_volume_ratio,
+    fetch_zt_pool, fetch_dt_pool, fetch_broken_board,
 )
 
 
