@@ -132,9 +132,12 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
       "analyze_chart_patterns", "get_intraday_structure", "get_multiframe_direction")),
 
     ("fundflow", ("资金流", "主力", "净流入", "净流出", "大单", "超大单", "北向",
-                  "融资", "主力净额"),
+                  "融资", "主力净额", "出逃", "高低切换", "资金性质", "资金去向",
+                  "资金往哪", "资金去哪", "钱往哪",
+                  "净离场", "大盘资金", "板块资金"),
      # get_market_fund_flow / get_concept_fund_flow → get_fund_flow
-     ("get_fund_flow", "get_fund_flow_daily", "get_sector_fund_flow")),
+     ("get_fund_flow", "get_fund_flow_daily", "get_sector_fund_flow",
+      "get_market_flow_state")),
 
     ("sector", ("板块", "题材", "概念", "行业", "龙头", "赛道"),
      # get_sector_trend_analysis / get_sector_history_data / get_industry_ranking
@@ -162,7 +165,7 @@ DATA_DOMAINS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...] = (
     ("market", ("大盘", "指数", "上证", "深证", "创业板", "沪深", "市场", "两市",
                 "科创", "北证"),
      # get_market_indices → get_index_quote
-     ("get_market_overview", "get_index_quote",
+     ("get_market_overview", "get_index_quote", "get_market_flow_state",
       "get_index_kline", "get_capital_summary")),
 
     ("dragon", ("龙虎", "席位", "游资", "机构专用"),

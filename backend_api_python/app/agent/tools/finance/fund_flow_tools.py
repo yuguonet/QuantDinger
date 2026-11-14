@@ -101,7 +101,12 @@ def _fund_flow_boards_view(src: dict) -> dict:
 
 def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
                   indicator: str = "今日") -> dict:
-    """资金流向统一入口：个股按 scope 返回「价格方向净额」，板块/大盘返回远端主力净额。
+    """资金流向统一入口：个股返回「价格方向净额」，板块/大盘返回远端板块汇总净额。
+
+    字段名沿用上游 main_net/main_pct，但不含东财四档主力/机构/散户单型拆分：
+    日线口径是 kline_1m 量价方向近似（涨计流入、跌计流出），远端板块/大盘
+    同样是板块汇总。对外只能写「资金净额」「全市场净离场」，不得写
+    「主力净流入/主力净流出」。
 
     Args:
         scope: stock | stock_daily | market | sector | concept
@@ -116,7 +121,14 @@ def get_fund_flow(scope: str = "stock", codes: str = "", days: int = 120,
         stock_daily → {"count": N, "data": {CODE: {caliber, approx,
                         data:[{date, main_net, net_ratio,...}]}}}
         market      → {"source","main_net","in_net","out_net",...}
+                      main_pct = main_net/(in_net+out_net)*100，分母是
+                      流入+流出总额、不是成交额；对外写「资金净占比」，
+                      不得写成「占成交额比例」，也不得重复作证；data 为板块明细，
+                      Σ(板块 main_net) = main_net，加总为负即全市场净离场，
+                      仅凭少数板块净流入不能判「资金在板块间切换」。
         sector/concept → {"indicator","count","boards":[{name, main_net, ...}]}
+                      源不可用/无数据时 count=0、boards=[]，表示「未获取」；
+                      不得据此写任何净额、合计、板块数或守恒比数字。
         统一顶层键: "data"/"count"/"error"(失败)。切片迭代先取 result["data"]。
     """
     s = (scope or "stock").strip().lower()
@@ -209,10 +221,15 @@ def get_fund_flow_daily(codes: str, days: int = 30) -> dict:
 
     return _batch_execute(_one, code_list)
 def _get_market_fund_flow() -> dict:
-    """大盘资金流向：返回全市场主力/散户实时净流入金额。
+    """大盘资金流向：远端板块汇总的当日累计净额，不含主力/散户单型拆分。
 
     Returns:
-        dict: {source,timestamp,main_net,main_pct,in_net,out_net,data}。main_net 元；data 明细 list；sectors_count/points 或缺；异常含 error。
+        dict: {source,timestamp,main_net,main_pct,in_net,out_net,data}。
+        main_net 元，等于 data 中各板块 main_net 之和；main_pct =
+        main_net/(in_net+out_net)*100，分母是流入+流出总额而非成交额；
+        timestamp 是拉取时刻，不是数据截止时刻；data 为板块明细；
+        sectors_count/points 或缺；异常含 error。
+        对外表述用「资金净额」，不得写「主力净流出」。
     """
     from app.market_cn.index import get_market_fund_flow_realtime as _get
     try:

@@ -8,6 +8,7 @@ A股市场贪婪恐惧指数 — 简化版
 import pandas as pd
 import numpy as np
 import time
+import threading
 from datetime import datetime
 from .index import get_index_daily_kline, get_northbound_daily
 
@@ -15,6 +16,14 @@ from .index import get_index_daily_kline, get_northbound_daily
 _fg_cache = None
 _fg_cache_ts = 0
 _FG_TTL = 300  # 5分钟缓存
+
+# 沪深300日线缓存:momentum/volatility/volume 三指标共享一次取数(带锁防并发冷启动
+# 各自拉远端);TTL 与 _FG_TTL 对齐,避免盘中把最新价冻结。请求 130 根而非 200:
+# 本地 kline_index_5m 目前 143 个交易日,200 触发深度门控回落 tencent 外网;
+# 指标最长窗口为 MA125(需≥130根),130 已够,143 天本地可直接命中。
+_idx_cache = None  # (df, ts)
+_idx_lock = threading.Lock()
+_IDX_DAYS = 130
 
 
 # ── 工具 ──────────────────────────────────────────
@@ -41,11 +50,16 @@ def _col(df, *names):
     return None
 
 def _index_df():
-    """沪深300日线 (多源降级)"""
-    data = get_index_daily_kline("000300", 200)
-    if data:
-        return pd.DataFrame(data)
-    return None
+    """沪深300日线 (多源降级)；模块级 TTL 缓存 + 锁，一轮计算只取一次数"""
+    global _idx_cache
+    now = time.time()
+    with _idx_lock:
+        if _idx_cache is not None and (now - _idx_cache[1]) < _FG_TTL:
+            return _idx_cache[0]
+        data = get_index_daily_kline("000300", _IDX_DAYS)
+        df = pd.DataFrame(data) if data else None
+        _idx_cache = (df, now)
+        return df
 
 def _sorted(df):
     """按日期排序"""

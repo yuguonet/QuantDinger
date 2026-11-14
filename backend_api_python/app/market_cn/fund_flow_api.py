@@ -432,17 +432,67 @@ def upsert_market(rows: List[Dict[str, Any]]) -> int:
     return n
 
 
+def _market_freshness(hist: List[Dict[str, Any]], days: int,
+                      as_of: Optional[str] = None) -> Dict[str, Any]:
+    """大盘历史行相对「取数目标日」的新鲜度（读侧标注，不改写历史行）。
+
+    目标日唯一口径是 trading_calendar.current_data_day()：交易日 09:15 后取今日，
+    否则上一交易日。不能用 is_in_quote_session（午休会静默退回昨日），也不能用
+    last_finish_trading_day（盘中会退回昨日）；显式 as_of 用于历史回测场景。
+
+    易误解点：stale=True 在盘中属正常状态（今日全天值要等收盘后落库），不代表
+    数据错误；它约束的是「不得把库里末行方向当作目标日方向」。日历不可用时
+    freshness=unknown 并带 error，不猜一个目标日。
+    """
+    out: Dict[str, Any] = {
+        "target_day": None, "last_trade_date": None, "stale": None,
+        "lag_trading_days": None, "missing_dates": [], "freshness": "unknown",
+    }
+    try:
+        from app.utils.trading_calendar import current_data_day, trade_date_range
+        target = str(as_of)[:10] if as_of else current_data_day()
+    except Exception as e:
+        logger.warning("[fund_flow_api] 交易日历不可用, 新鲜度判为 unknown: %s", e)
+        out["error"] = f"trading_calendar unavailable: {type(e).__name__}"
+        return out
+    out["target_day"] = target
+    if not hist:
+        return out
+    last = str(hist[-1].get("trade_date") or "")[:10]
+    out["last_trade_date"] = last
+    if not last:
+        return out
+    have = {str(r.get("trade_date") or "")[:10] for r in hist}
+    try:
+        start = (datetime.strptime(target, "%Y-%m-%d")
+                 - timedelta(days=max(days, 5) * 3)).strftime("%Y-%m-%d")
+        window = trade_date_range(start, target)[-max(days, 5):]
+        out["missing_dates"] = [d for d in window if d not in have]
+        out["lag_trading_days"] = max(0, len(trade_date_range(last, target)) - 1)
+    except Exception as e:
+        logger.warning("[fund_flow_api] 交易日区间计算失败: %s", e)
+        out["error"] = f"trade_date_range failed: {type(e).__name__}"
+        return out
+    stale = last < target
+    out["stale"] = stale
+    out["freshness"] = "stale" if stale else "fresh"
+    return out
+
+
 def market_flow_summary(days: int = 5, as_of: Optional[str] = None) -> Dict[str, Any]:
     """大盘资金方向摘要 —— **只关心流入/流出**, 不区分主力/全量。
 
     Returns:
-        {trade_date, direction, net_yi, turnover_yi, pct, history:[...],
-         note}
+        {trade_date, direction, net_yi, turnover_yi, pct, history:[...], note}
+        另附新鲜度：{target_day, last_trade_date, stale, lag_trading_days,
+        missing_dates, freshness}。freshness=stale 时末行不是目标日，方向不可
+        当作目标日方向；freshness=unknown 时目标日未知，同样不可外推。
     """
     hist = market_fund_flow_history(days=days, as_of=as_of)
     if not hist:
         return {"direction": "unknown", "history": [],
-                "note": "no data (snapshot/remote empty)"}
+                "note": "no data (snapshot/remote empty)",
+                **_market_freshness(hist, days, as_of)}
     last = hist[-1]
     net = _f(last.get("main_net")) or 0.0
     to = _f(last.get("turnover_yi"))
@@ -479,6 +529,7 @@ def market_flow_summary(days: int = 5, as_of: Optional[str] = None) -> Dict[str,
         "direction_seq": seq,
         "history": hist,
         "note": last.get("note") or "量价方向近似: 流入/流出/净额/净占比, 非主力单型",
+        **_market_freshness(hist, days, as_of),
     }
 
 
@@ -747,6 +798,50 @@ def backfill_stock_from_1m(days: int = 7) -> Dict[str, Any]:
     for d in todo:
         written.append({"day": d, "rows": upsert_stock_day_from_1m(d)})
     logger.info("[fund_flow_api] 1m 日度落库: 候选 %d 天, 需补 %d 天, 写入 %s",
+                len(src_days), len(todo), written)
+    return {"source_days": src_days, "todo": todo, "written": written}
+
+
+def backfill_market_from_1m(days: int = 7) -> Dict[str, Any]:
+    """最近 N 个交易日 qd_fund_flow_market 缺日补齐与末日定稿（每日调度，自愈）。
+
+    为什么末日恒重算：盘中 update_intraday_fund_flow 每 180s 把「截至当时」的
+    累计净额写进当日行，而本表没有 until 列可区分半截与全天。只补缺日会把
+    14:5x 的半截值永久固化成当日收盘值。
+
+    口径：一律 _flow_from_1m_day（kline_1m 量价方向净额），不接 _fetch_market_daily
+    （东财主力净额），遵守本模块头注「勿再混源」。源侧无该日 1m 数据则跳过，
+    下次调度仍在窗口内时自动补上。
+    """
+    days = max(1, min(int(days), 60))
+    year = datetime.now().year
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT DISTINCT time::date FROM {_kline_1m_year_table(year)} "
+                    f"WHERE time::date <= %s ORDER BY 1 DESC LIMIT %s",
+                    (today, days))
+                src_days = sorted(str(r[0])[:10] for r in cur.fetchall())
+                have = set()
+                if src_days:
+                    cur.execute(
+                        f"SELECT trade_date FROM {T_MARKET} WHERE trade_date IN %s",
+                        (tuple(src_days),))
+                    have = {str(r[0])[:10] for r in cur.fetchall()}
+    except Exception as e:
+        logger.warning("[fund_flow_api] 大盘落库候选日查询失败: %s", e)
+        return {"error": repr(e)[:160]}
+    if not src_days:
+        return {"source_days": [], "todo": [], "written": []}
+    todo = [d for d in src_days if d not in have or d == src_days[-1]]
+    written = []
+    for d in todo:
+        row = _flow_from_1m_day(d)
+        if row:
+            written.append({"day": d, "rows": upsert_market([row])})
+    logger.info("[fund_flow_api] 大盘 1m 日度落库: 候选 %d 天, 需补 %d 天, 写入 %s",
                 len(src_days), len(todo), written)
     return {"source_days": src_days, "todo": todo, "written": written}
 

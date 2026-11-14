@@ -717,11 +717,17 @@ def _save_fund_flow_daily():
          本任务放 18:00 与之解耦, 互不拖累;
       ② days=7 的"自愈"语义与 batch 的"仅当天"不同 —— 容许补前几天,
          任一天失败/漏跑, 只要还在窗口内下次自动补上。
+
+    大盘表与个股表一起补：盘中每 180s 只写「截至当时」的当日行，收盘后必须
+    由 kline_1m 全天值覆盖定稿，否则半截净额会固化成收盘读数；历史缺日也在
+    这里自愈。两者口径同为 kline_1m 量价方向净额。
     """
     try:
-        from app.market_cn.fund_flow_api import backfill_stock_from_1m
+        from app.market_cn.fund_flow_api import (
+            backfill_stock_from_1m, backfill_market_from_1m)
         r = backfill_stock_from_1m(days=7)
-        logger.info("[fund_flow_daily] %s", r)
+        r_market = backfill_market_from_1m(days=7)
+        logger.info("[fund_flow_daily] stock=%s market=%s", r, r_market)
         _mark_event("fund_flow")
     except Exception as e:
         logger.warning("[fund_flow_daily] 失败: %s", e)

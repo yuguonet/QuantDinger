@@ -4009,3 +4009,101 @@
 {"ts": "2026-11-09 14:23:23", "query": "现在(2026-11-09 14:21:25)买什么股?", "tools": ["run_skill"]}
 {"ts": "2026-11-09 14:36:25", "query": "现在(2026-11-09 14:33:38)买什么股?", "tools": ["update_plan", "run_skill"]}
 {"ts": "2026-11-09 16:21:06", "query": "航宇微(300053)明天该如何操作?；11-10)该如何操作? 今天(2026-11-09)", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 09:29:26", "query": "航宇微(300053)该如何操作？支撑位和压力位在哪里？；今天(2026-11-10)", "tools": ["get_fund_flow", "agent_get_kline", "get_chip_distribution", "analyze_chart_patterns", "technical_analysis", "get_realtime_quote", "get_stock_sector_info", "search_intel", "get_intraday_structure"]}
+{"ts": "2026-11-10 09:35:18", "query": "贵州燃气(600903)该如何操作？支撑位和压力位在哪里？；今天(2026-11-10)", "tools": ["get_fund_flow", "agent_get_kline", "analyze_chart_patterns", "get_chip_distribution", "get_realtime_quote", "technical_analysis", "get_intraday_structure", "search_intel"]}
+{"ts": "2026-11-10 09:47:43", "query": "现在(2026-11-10 09:46:06)买什么股？", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 10:10:12", "query": "航宇微(300053)剩半仓,今天资金是流入还是流出?该如何操作?；入还是流出?该如何操作?", "tools": ["update_plan", "get_chip_distribution", "get_fund_flow", "get_realtime_quote", "technical_analysis", "agent_get_kline", "search_intel"]}
+{"ts": "2026-11-10 10:23:34", "query": "现在(2026-11-10 10:21:29)买什么股？", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 10:30:07", "query": "分析航天动力？", "tools": ["run_skill", "get_fund_flow", "get_stock_sector_info", "get_realtime_quote", "technical_analysis", "agent_get_kline", "get_chip_distribution"]}
+{"ts": "2026-11-10 10:38:57", "query": "自选股中,有今天(2026-11-10)可以进的股票吗？", "tools": ["search_resources", "get_watchlist", "read_skill", "run_skill", "get_realtime_quote"]}
+{"ts": "2026-11-10 11:01:22", "query": "现在(2026-11-10 10:58:55)买什么股?", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 12:40:28", "query": "现在(2026-11-10 12:37:40)买什么股?", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 14:20:08", "query": "现在(2026-11-10 14:17:57)买什么股?", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 14:31:03", "query": "航宇微(300053)下午资金如何变化?；今天(2026-11-10)", "tools": ["agent_get_kline", "get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-10 14:38:33", "query": "航宇微(300053)下午资金如何变化?；今天(2026-11-10)", "tools": ["agent_get_kline", "get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-10 14:42:58", "query": "广电网络(600831)尾盘资金在流入?；今天(2026-11-10)", "tools": ["activate_tools", "get_fund_flow", "get_realtime_quote", "agent_get_kline"]}
+{"ts": "2026-11-10 14:56:54", "query": "现在(2026-11-10 14:54:40)买什么股?", "tools": ["update_plan", "run_skill"]}
+{"ts": "2026-11-10 14:59:44", "query": "自选股中有什么可以买的股?", "tools": ["search_resources", "get_watchlist", "get_realtime_quote", "get_fund_flow"]}
+{"ts": "2026-11-10 15:03:53", "query": "贵州燃气资金流入流出情况,明日(2026-11-11)风险多大? 今天(2026-11-10)", "tools": ["get_fund_flow", "technical_analysis", "get_realtime_quote", "agent_get_kline"]}
+{"ts": "2026-11-11 08:11:19", "query": "航宇微(300053)最近一周资金流入流出情况,今日风险多大?；1-10，近5个交易日)一周资金流入流出情况,今日(2026-11-11)风险多大?", "tools": ["get_fund_flow", "agent_get_kline", "get_chip_distribution", "get_realtime_quote", "technical_analysis", "search_intel"]}
+{"ts": "2026-11-11 09:37:52", "query": "分析贵州燃气早盘情况？", "tools": ["activate_tools", "get_fund_flow", "agent_get_kline", "get_realtime_quote", "search_intel", "get_intraday_structure", "get_multiframe_direction", "technical_analysis"]}
+{"ts": "2026-11-11 09:55:32", "query": "现在(2026-11-11 09:53:25)买什么股？", "tools": ["run_skill"]}
+{"ts": "2026-11-11 20:50:50", "query": "分析铭普光磁最近(2026-11-05~2026-11-11，近5个交易日)20日的资金流入流出情况,特别是今日(2026-11-11)和近5日流入流出", "tools": ["agent_get_kline", "get_fund_flow_daily", "get_chip_distribution", "get_fund_flow", "get_realtime_quote", "technical_analysis"]}
+{"ts": "2026-11-12 09:03:48", "query": "自选股中,哪些股值得今天(2026-11-12)买入?", "tools": ["search_resources", "list_resources", "read_skill", "recall", "get_watchlist", "update_plan", "get_realtime_quote"]}
+{"ts": "2026-11-12 09:09:08", "query": "需要分析前5个股票最近(2026-11-05~2026-11-11，近5个交易日)20日的资金流入流出情况 今天(2026-11-12)", "tools": ["get_fund_flow_daily", "get_fund_flow"]}
+{"ts": "2026-11-12 09:23:35", "query": "分析麦格米特(002851)；今天(2026-11-12)", "tools": ["run_skill"]}
+{"ts": "2026-11-12 09:38:14", "query": "铭普光磁早盘资金流向 今天(2026-11-12)", "tools": ["get_fund_flow_daily", "get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-12 09:45:15", "query": "现在(2026-11-12 09:43:48)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-11-12 09:49:50", "query": "航宇微(300053)早盘资金流入流出情况；今天(2026-11-12)", "tools": ["get_fund_flow", "get_realtime_quote", "activate_tools", "get_fund_flow_daily"]}
+{"ts": "2026-11-12 10:04:23", "query": "现在(2026-11-12 10:02:24)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-11-12 10:24:04", "query": "航宇微(300053)滞涨,该如何处理,11.4的本；今天(2026-11-12)", "tools": ["get_chip_distribution", "get_fund_flow", "agent_get_kline", "get_realtime_quote", "technical_analysis", "get_stock_sector_info", "search_intel"]}
+{"ts": "2026-11-12 10:33:48", "query": "巨轮智能(002031)拉升,可不可以追?；今天(2026-11-12)", "tools": ["get_chip_distribution", "agent_get_kline", "get_fund_flow", "get_realtime_quote", "get_stock_info", "technical_analysis"]}
+{"ts": "2026-11-12 10:50:24", "query": "铭普光磁(002902) 20.45的本,要不要走?；今天(2026-11-12)", "tools": ["get_stock_sector_info", "get_chip_distribution", "agent_get_kline", "get_fund_flow", "get_realtime_quote", "technical_analysis"]}
+{"ts": "2026-11-12 11:29:49", "query": "麦格米特(002851)资金全部流出了吧?；今天(2026-11-12)", "tools": ["get_fund_flow", "get_realtime_quote", "technical_analysis"]}
+{"ts": "2026-11-12 13:37:34", "query": "大盘在跳水吗? 今天(2026-11-12)", "tools": ["get_limit_pool", "fetch_overview", "get_market_overview", "fear_greed_index", "get_fund_flow", "get_hot_sectors", "agent_get_kline", "get_realtime_quote"]}
+{"ts": "2026-11-12 13:43:30", "query": "麦格米特(002851)已经破位了；今天(2026-11-12)", "tools": ["agent_get_kline", "get_fund_flow", "get_realtime_quote", "technical_analysis", "get_chip_distribution"]}
+{"ts": "2026-11-12 13:50:59", "query": "大盘资金在大幅出逃? 今天(2026-11-12)", "tools": ["get_fund_flow", "get_limit_pool", "fetch_overview", "fear_greed_index", "get_market_overview"]}
+{"ts": "2026-11-12 14:00:49", "query": "下午资金抛售200多个亿,足以引起恐慌了. 今天(2026-11-12)", "tools": ["get_fund_flow", "get_limit_pool", "fetch_overview", "fear_greed_index"]}
+{"ts": "2026-11-12 14:12:33", "query": "今天(2026-11-12)大盘资金是不是在大幅出逃？还是高低切换？", "tools": ["update_plan", "get_fund_flow", "get_hot_sectors", "get_market_overview", "get_limit_pool", "get_realtime_quote", "activate_tools", "get_index_quote", "list_resources", "call_capability", "agent_get_kline"]}
+{"ts": "2026-11-12 15:07:36", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:36", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-11-12 15:07:36", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-11-12 15:07:36", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:36", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:38", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-11-12 15:07:38", "query": "看看茅台的行情多少钱 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:39", "query": "看行情 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:39", "query": "茅台现在(2026-11-12 15:07:39)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:07:44", "query": "帮我分析一下贵州茅台600519；今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 15:12:16", "query": "今天(2026-11-12)大盘资金是不是在大幅出逃？还是高低切换？", "tools": ["activate_tools", "get_market_flow_state"]}
+{"ts": "2026-11-12 16:29:12", "query": "今天(2026-11-12)大盘资金是不是在大幅出逃？还是高低切换？", "tools": ["search_resources", "get_market_overview", "get_market_flow_state", "get_limit_pool", "index_fflow", "get_fund_flow", "get_index_quote"]}
+{"ts": "2026-11-12 19:19:36", "query": "分析大盘今天(2026-11-12)的形态", "tools": ["activate_tools", "agent_get_kline", "get_realtime_quote", "get_market_overview", "get_index_quote", "get_market_flow_state", "get_hot_sectors", "get_limit_pool"]}
+{"ts": "2026-11-12 19:45:30", "query": "今天(2026-11-12)大盘资金是不是在大幅出逃？还是高低切换？", "tools": ["search_resources", "get_fund_flow", "get_market_overview", "get_market_flow_state", "get_limit_pool"]}
+{"ts": "2026-11-12 19:48:31", "query": "今天(2026-11-12)大盘资金是不是在大幅出逃？还是高低切换？", "tools": ["search_resources", "activate_tools", "get_market_flow_state", "get_market_overview", "get_limit_pool"]}
+{"ts": "2026-11-12 19:55:17", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:17", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-11-12 19:55:17", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-11-12 19:55:17", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:17", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:19", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-11-12 19:55:19", "query": "看看茅台的行情多少钱 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:19", "query": "看行情 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:20", "query": "茅台现在(2026-11-12 19:55:20)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 19:55:25", "query": "帮我分析一下贵州茅台600519；今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:33:54", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["fetch_overview", "get_fund_flow", "get_hot_sectors", "get_market_overview", "get_limit_pool", "activate_tools", "get_index_kline", "get_index_quote"]}
+{"ts": "2026-11-12 20:45:54", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["activate_tools", "get_market_overview", "get_hot_sectors", "get_limit_pool", "get_market_flow_state", "get_index_quote"]}
+{"ts": "2026-11-12 20:48:01", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:01", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-11-12 20:48:01", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-11-12 20:48:01", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:01", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:03", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-11-12 20:48:03", "query": "看看茅台的行情多少钱 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:04", "query": "看行情 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:04", "query": "茅台现在(2026-11-12 20:48:04)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 20:48:10", "query": "帮我分析一下贵州茅台600519；今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:02:23", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["update_plan", "search_resources", "get_fund_flow", "get_market_overview", "activate_tools", "get_market_flow_state", "get_limit_pool", "get_index_quote", "get_hot_sectors", "get_index_kline"]}
+{"ts": "2026-11-12 21:13:53", "query": "资金往哪走了 今天(2026-11-12)", "tools": ["get_fund_flow", "get_sector_fund_flow", "get_market_flow_state"]}
+{"ts": "2026-11-12 21:14:04", "query": "看看茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:04", "query": "帮我买 100 股茅台", "tools": ["place_demo_order"]}
+{"ts": "2026-11-12 21:14:04", "query": "帮我清理一下系统", "tools": ["run_shell"]}
+{"ts": "2026-11-12 21:14:04", "query": "茅台现在多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:04", "query": "看看茅台", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:06", "query": "帮我建个文件并看看内容", "tools": ["write", "bash"]}
+{"ts": "2026-11-12 21:14:06", "query": "看看茅台的行情多少钱 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:06", "query": "看行情 今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:06", "query": "茅台现在(2026-11-12 21:14:06)多少钱", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:14:12", "query": "帮我分析一下贵州茅台600519；今天(2026-11-12)", "tools": ["get_demo_quotes"]}
+{"ts": "2026-11-12 21:50:55", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["update_plan", "activate_tools", "fetch_overview", "get_fund_flow", "get_hot_sectors", "fear_greed_index", "get_market_overview", "get_limit_pool", "get_market_flow_state", "get_index_quote"]}
+{"ts": "2026-11-12 23:14:32", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["search_resources", "get_fund_flow", "get_hot_sectors", "get_market_overview", "get_market_flow_state", "get_limit_pool", "get_index_quote"]}
+{"ts": "2026-11-12 23:29:55", "query": "今天(2026-11-12)大盘怎么样?", "tools": ["get_market_overview", "get_hot_sectors", "get_realtime_quote", "activate_tools", "get_limit_pool", "get_index_quote"]}
+{"ts": "2026-11-12 23:35:20", "query": "分析今日(2026-11-12)大盘", "tools": ["update_plan", "fear_greed_index", "fetch_overview", "get_fund_flow", "get_market_overview", "get_hot_sectors", "get_limit_pool", "activate_tools", "get_index_quote"]}
+{"ts": "2026-11-13 09:20:45", "query": "麦格米特(002851)昨日资金流入流出情况；-12)资金流入流出情况 今天(2026-11-13)", "tools": ["get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-13 09:21:46", "query": "航宇微(300053)昨日资金流入流出情况；-12)资金流入流出情况 今天(2026-11-13)", "tools": ["activate_tools", "get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-13 09:30:37", "query": "早盘情况如何?", "tools": ["activate_tools", "search_resources", "get_index_quote", "get_hot_sectors", "get_market_overview", "get_market_flow_state", "get_fear_greed"]}
+{"ts": "2026-11-13 09:33:52", "query": "麦格米特(002851)要不要割肉?；今天(2026-11-13)", "tools": ["get_chip_distribution", "agent_get_kline", "get_fund_flow", "get_realtime_quote", "technical_analysis", "search_intel", "get_stock_sector_info"]}
+{"ts": "2026-11-13 09:46:45", "query": "现在(2026-11-13 09:45:53)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-11-13 09:51:07", "query": "航宇微(300053)是买入还是卖出?；今天(2026-11-13)", "tools": ["get_chip_distribution", "get_fund_flow", "get_realtime_quote", "technical_analysis", "search_intel"]}
+{"ts": "2026-11-13 09:57:04", "query": "现在(2026-11-13 09:55:49)买什么股?", "tools": ["run_skill"]}
+{"ts": "2026-11-13 10:31:29", "query": "大盘资金在流出,上证指数在托底,是哪些板块在支撑着? 今天(2026-11-13)", "tools": ["get_sector_fund_flow", "get_hot_sectors", "activate_tools", "get_market_flow_state", "get_index_quote", "get_limit_pool"]}
+{"ts": "2026-11-13 12:43:22", "query": "大盘资金流出接近尾声了,下午有什么股票可以选择的? 今天(2026-11-13)", "tools": ["run_skill", "get_market_flow_state", "activate_tools", "bash"]}

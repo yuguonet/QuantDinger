@@ -39,7 +39,9 @@ def get_market_overview() -> dict:
 
     Returns:
         dict: {up_count, down_count(两大指数抽样涨跌家数), emotion(0-100情绪),
-        main_net_yi(主力净流亿元), main_pct}。单源失败则该键缺失，无 error 键
+        emotion_label(数据源给的情绪分档), main_net_yi(主力净流亿元), main_pct}。
+        情绪分档以 emotion_label 为准，不得临场自拟「偏弱/恐慌」等分档或阈值；
+        单源失败则该键缺失，无 error 键
     """
     result = {}
 
@@ -59,6 +61,8 @@ def get_market_overview() -> dict:
         from app.market_cn.fear_greed_index import fear_greed_index
         fg = fear_greed_index()
         result["emotion"] = int(fg.get("composite_score", 50))
+        if fg.get("label"):
+            result["emotion_label"] = str(fg["label"])
     except Exception:
         pass
 
