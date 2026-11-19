@@ -227,7 +227,8 @@ def _northbound_summary_fallback() -> Dict[str, Any]:
     出口组装，不再自拉远端。
 
     返回与 get_northbound_realtime 同构（points=1，data=[1 点]，source=em_summary）；
-    兜底也失败 ⇒ error dict（维持"宁缺勿假"）。单位口径与
+    缺腿 / 两腿恒 0（停披露占位）/ 取数失败 ⇒ error dict（维持"宁缺勿假"，
+    不把停披露占位 0 冒充有效的"净流入为 0"）。单位口径与
     get_northbound_daily 的 akshare summary 分支一致。
     """
     from app.data_sources.coord_index import coordinate as _coord_index
@@ -238,6 +239,7 @@ def _northbound_summary_fallback() -> Dict[str, Any]:
             return {"error": "北向数据不完整，且东财 summary 无数据"}
         hgt_val = 0.0
         sgt_val = 0.0
+        hgt_seen = sgt_seen = False
         date_val = ""
         for row in rows:
             board = str(row.get("板块", ""))
@@ -250,12 +252,21 @@ def _northbound_summary_fallback() -> Dict[str, Any]:
                 if net is not None and str(net) not in ("", "nan", "NaN"):
                     if "沪" in board:
                         hgt_val = float(net)
+                        hgt_seen = True
                     elif "深" in board:
                         sgt_val = float(net)
+                        sgt_seen = True
             except (TypeError, ValueError):
                 continue
         if not date_val:
             return {"error": "北向数据不完整，且东财 summary 缺交易日"}
+        if not (hgt_seen and sgt_seen):
+            return {"error": "北向数据不完整，东财 summary 缺沪股通或深股通腿"}
+        # 两腿恒 0 是 2024-08 起停止披露的占位值，不是真实的"净流入恰好为 0"。
+        # 如实上报不可用，不能把占位 0 冒充有效数值喂给上游。
+        if hgt_val == 0 and sgt_val == 0:
+            logger.warning("[northbound_summary] 北向两腿成交净买额均为 0（停披露占位），如实上报不可用")
+            return {"error": "北向资金数据源已停止披露（两腿恒为 0），无当日真实值"}
         logger.info("[northbound_summary] 北向实时兜底(summary): hgt=%.2f sgt=%.2f (%s)",
                     hgt_val, sgt_val, date_val)
         pt = {"time": "15:00", "hgt_yi": round(hgt_val, 2), "sgt_yi": round(sgt_val, 2)}
@@ -284,8 +295,9 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
       - hgt_yi: 沪股通累计净买入（亿元）
       - sgt_yi: 深股通累计净买入（亿元）
 
-    注意: 数值为当日累计值（从开盘到该时间点的总净买入），
-    不是单分钟净买入。最后一个非零值即为当日收盘时的总净买入。
+    注意: 数值为当日累计值（从开盘到该时间点的总净买入），不是单分钟净买入。
+    只取最后一个时间点两腿都有真实数值的那一笔；任一腿在该点缺失即判数据不可用，
+    不回退到更早的陈旧值、不补 0（2024-08 起北向已停止实时披露，旧值冒充会误导上游）。
 
     Returns:
         成功: {
@@ -295,7 +307,7 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
             total_latest_yi: 91.0,    # 北向合计净买入（亿元）
             data: [{time, hgt_yi, sgt_yi}, ...]  # 最近10条
         }
-        失败: {error: "..."}
+        失败: {error: "..."} —— 数据不完整/停披露时只给 error，绝不用陈旧值拼凑。
 
     Example:
         >>> nb = get_northbound_realtime()
@@ -330,26 +342,28 @@ def get_northbound_realtime(force: bool = False) -> Dict[str, Any]:
         logger.info("[hexin] 今天非交易日，北向实时数据不适用")
         return {"error": "今天非交易日，无实时北向数据"}
 
-    # 数据完整性校验：hgt/sgt 任一严重缺失 → 数据不可信，不输出
-    if len(times) > 0:
-        hgt_ratio = len(hgt) / len(times)
-        sgt_ratio = len(sgt) / len(times)
-        if hgt_ratio < 0.5 or sgt_ratio < 0.5:
-            logger.warning(
-                "[hexin] 北向数据不完整: time=%d, hgt=%d(%.0f%%), sgt=%d(%.0f%%)，走东财兜底",
-                len(times), len(hgt), hgt_ratio * 100, len(sgt), sgt_ratio * 100
-            )
-            return _northbound_summary_fallback()
-
-    # hgt/sgt 长度可能不同，分别取各自最后一个非零值
-    hgt_latest = next((h for h in reversed(hgt) if h is not None and h != 0), 0)
-    sgt_latest = next((s for s in reversed(sgt) if s is not None and s != 0), 0)
+    # 只认最后一个时间点的真实值：两腿在该点都必须是真实数值才算可用。
+    # 绝不反向回退到更早的非零值——那会把断流前的陈旧值当成当日最新（370 亿假值根因）。
+    if n == 0:
+        logger.warning("[hexin] 北向实时无数据点")
+        return {"error": "北向实时无数据点，无法获取当日真实值"}
+    last_hgt = hgt[-1] if len(hgt) == n else None
+    last_sgt = sgt[-1] if len(sgt) == n else None
+    if last_hgt is None or last_sgt is None:
+        logger.warning(
+            "[hexin] 北向最新时间点数据不全: time=%s, hgt=%s, sgt=%s（上游断流/停披露），如实上报不可用",
+            times[-1], last_hgt, last_sgt
+        )
+        return {"error": "北向实时数据在最新时间点不完整（上游停披露/断流），无当日真实值"}
+    if last_hgt == 0 and last_sgt == 0:
+        logger.warning("[hexin] 北向最新时间点两腿均为 0（停披露占位），如实上报不可用")
+        return {"error": "北向实时数据源已停止披露（两腿恒为 0），无当日真实值"}
 
     return {
         "points": len(points),
-        "hgt_latest_yi": hgt_latest,
-        "sgt_latest_yi": sgt_latest,
-        "total_latest_yi": round((hgt_latest or 0) + (sgt_latest or 0), 2),
+        "hgt_latest_yi": last_hgt,
+        "sgt_latest_yi": last_sgt,
+        "total_latest_yi": round(last_hgt + last_sgt, 2),
         "data": points[-10:],  # 返回最近 10 条
     }
 

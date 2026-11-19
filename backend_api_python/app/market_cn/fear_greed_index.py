@@ -1,8 +1,11 @@
 """
 A股市场贪婪恐惧指数 — 简化版
 
-7个维度，等权平均，输出 0-100 分:
+多维度等权平均，输出 0-100 分:
   0-25 极度恐惧 | 25-40 恐惧 | 40-60 中性 | 60-75 贪婪 | 75-100 极度贪婪
+
+数据不可用的维度（如停更的北向）不参与评分：indicators 中该维 score=None、
+available=False，均值只用可用维度计算，杜绝旧数据/占位值伪装成当前情绪。
 """
 
 import pandas as pd
@@ -16,6 +19,7 @@ from .index import get_index_daily_kline, get_northbound_daily
 _fg_cache = None
 _fg_cache_ts = 0
 _FG_TTL = 300  # 5分钟缓存
+_NB_MAX_STALE_TRADING_DAYS = 3  # 北向日级数据允许的最大滞后交易日数（超过视为停更、不参与评分）
 
 # 沪深300日线缓存:momentum/volatility/volume 三指标共享一次取数(带锁防并发冷启动
 # 各自拉远端);TTL 与 _FG_TTL 对齐,避免盘中把最新价冻结。请求 130 根而非 200:
@@ -135,15 +139,24 @@ def _volume():
         return 50, str(e)
 
 def _northbound():
-    """5. 近5日北向净流入 (亿)"""
+    """5. 近5日北向净流入 (亿)。
+
+    北向 2024-08 起停止披露，上游日级数据可能永久停在旧日期。陈旧数据返回 None
+    由主循环剔除，不能用旧值参与评分（否则旧数据伪装成当前情绪）。
+    """
+    from app.utils.trading_calendar import current_data_day, trading_days_count
     try:
         data = get_northbound_daily(5)
         if not data:
-            return 50, "数据不可用"
+            return None, "数据不可用"
+        latest = str(data[-1].get("date", ""))[:10]
+        gap = trading_days_count(latest, current_data_day()) - 1 if latest else 99
+        if gap > _NB_MAX_STALE_TRADING_DAYS:
+            return None, f"数据停更(最新{latest}, 落后{gap}交易日)"
         total = sum(d.get("total_yi", 0) for d in data)
         return _map(total, -200, 200), f"5日净流入{total:.0f}亿"
     except Exception as e:
-        return 50, str(e)
+        return None, str(e)
 
 def _limit_ratio():
     """6. 涨停/跌停比 — 读 scheduler 缓存，不发 HTTP"""
@@ -183,9 +196,13 @@ def fear_greed_index():
     scores = []
     for name, fn in _CALC:
         score, detail = fn()
+        if score is None:
+            # 数据不可用维度如实剔除，绝不用 50/旧值混入评分伪装成有效数据
+            indicators.append({"name": name, "score": None, "detail": detail, "available": False})
+            continue
         score = round(score, 1)
         scores.append(score)
-        indicators.append({"name": name, "score": score, "detail": detail})
+        indicators.append({"name": name, "score": score, "detail": detail, "available": True})
 
     avg = round(float(np.mean(scores)), 1) if scores else 50.0
 

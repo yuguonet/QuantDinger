@@ -45,11 +45,14 @@ def fetch():
 
     # 市场快照
     north_net = emotion = 0.0
+    north_available = False
     up_count = down_count = 0
     try:
         from app.market_cn.index import get_northbound_realtime
         nb = get_northbound_realtime()
-        north_net = safe_float(nb.get("total_latest_yi", 0))
+        if "error" not in nb:
+            north_net = safe_float(nb.get("total_latest_yi", 0))
+            north_available = True
     except Exception:
         pass
     try:
@@ -89,7 +92,9 @@ def fetch():
         "upCount": up_count, "downCount": down_count,
         "limitUp": limit_up, "limitDown": limit_down,
         "streakHeight": streak_height, "brokenBoard": broken_board,
-        "northBound": north_net, "emotionIndex": emotion,
+        "northBound": north_net if north_available else None,
+        "northBoundAvailable": north_available,
+        "emotionIndex": emotion,
         "mainNetFlow": main_net_yi, "mainNetPct": main_pct,
     }
 
@@ -103,7 +108,7 @@ def _empty():
         "bzse": {"index": "0.00", "change": 0, "code": "899050"},
         "heat": "—", "upCount": 0, "downCount": 0,
         "limitUp": 0, "limitDown": 0, "streakHeight": 0,
-        "brokenBoard": 0, "northBound": 0, "emotionIndex": 50,
+        "brokenBoard": 0, "northBound": None, "northBoundAvailable": False, "emotionIndex": 50,
         "mainNetFlow": 0, "mainNetPct": 0,
     }
 

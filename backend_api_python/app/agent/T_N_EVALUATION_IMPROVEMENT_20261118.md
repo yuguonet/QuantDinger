@@ -279,6 +279,17 @@ data_quality
 
 `entry_fill`、`exit_fill`、滑点和手续费必须使用统一、可配置的口径；执行字段是应用层 outcome，不应成为预测标签的前置条件。
 
+#### 5.2.1 多视界（T+1 / T+3 / T+5）记录口径
+
+T+N 回评是事后对已给出建议的评估：真值源为到期后的真实行情，按预测成立时点不可更改。但“真值源可靠”不等于“每条样本都可判定”，也不等于“所有视界都进判定”。多视界必须按以下口径分开记录，避免重复计票或静默丢失：
+
+1. **claim 层分档**：同一回答若给出多个视界的方向（如“T+1 看多 / T+3 中性 / T+5 看空”），每个视界各立一条 claim，携带各自的 `horizon`、到期日与 resolution；中性/未明示的档位不产出 claim。因此 T+1 / T+3 / T+5 在 claim 层是分条存储的；
+2. **主窗口唯一进 verdict**：一条 claim 的 `prediction_verdict` / `verdict_score` 及权重只由其自身 `horizon`（主窗口）决定。额外观测视界（通过配置 `QD_LABEL_WINDOWS`，默认 `T+1,T+3`）只挂在 `actual.windows` / `deviation.windows` 供快速诊断（这两个字段已列入 §10 的 outcome schema，作为诊断子结构），**不进 verdict、不进权重**——否则同一预测会被记多票；
+3. **T+5 成为权威结果的条件**：T+5 若要作为可评分的主结果，必须是某条 claim 自身的 `horizon`；仅把它加入额外观测配置只够诊断，不能进 verdict。方案在定义 outcome 时必须为每个主视界显式确认其 claim 来源，不得把附加窗口当作独立预测；
+4. **不可判定态单列**：截断（数据不足、窗口被截短）、不可判定（落在 flat 区间，方向不可分）、数据缺失（如板块指数不支持取数）不得当作真值或 miss，记入 coverage/exclusion 并注明原因，与 §5.3 的处理一致。
+
+统一经验层在做多视界归因时，必须沿用上述口径：一条经验在一个主视界上贡献一票，附加视界只作诊断证据，不得把同一预测的不同视界拆成多条独立样本进入成功率或 Brier 统计。
+
 ### 5.3 分离三类评估结果
 
 不要只保留单一 `correct`。
@@ -298,7 +309,8 @@ learning_eligibility # 是否具备进入校准或反馈的数据质量
 1. `prediction_target`、`subject`、`horizon`、`as_of` 与标签规则必须齐全且一致；
 2. 概率存在时，概率值必须有限且在 `[0,1]`；`probability_target == prediction_target`、`probability_horizon == horizon`，并校验 `probability_source` 对应的实际模型口径；
 3. 任一概率契约不匹配（例如 T+1 `p_base` 配 T+3 claim）时，**该预测仍可参与符合条件的方向指标**，但 Brier 记 N/A，且 `coverage_gap` 必须记录 `probability_target_mismatch`（含来源/视界）；不得换用别的概率或静默剔除；
-4. 概率缺失时，Brier 记 N/A、`coverage_gap=probability_missing`；自然语言 confidence 不得自动填成概率。
+4. 概率缺失时，Brier 记 N/A、`coverage_gap=probability_missing`；自然语言 confidence 不得自动填成概率；
+5. `probability_source` 只取两个枚举值：`calibrated`（标定概率，如 predict_next_day 的 `p_up`，唯一允许计算 Brier 的来源）与 `heuristic_confidence`（结构化把握度，如 stock-analyzer 各档 confidence，只参与 coverage 与分层观测、不进 Brier）；其余取值视为未知来源（记 `unknown_p_source`、概率作废），不得参与任何概率指标。
 
 ### 5.4 建立统一经验目录并评价每条经验
 
@@ -339,7 +351,14 @@ consumption_mode         # 行为档位：observe / shadow / active（与证据�
 
 来源经验不能稳定定位和版本化时，可以作为临时上下文供分析，但不得进入“单条经验效果”统计，其 `evidence_status` 不得升为 `validated`，`consumption_mode` 也不得放开到 `shadow`/`active`。
 
-候选提取与发布必须分开：只读来源片段并保留原始引用 → 规范化成一个可检验的“条件—判断/做法—适用边界—证伪条件”经验项 → 去重并检查冲突/敏感信息 → `evidence_status=candidate` → 通过独立回评或受控证据后标为 `validated` → 证据被推翻或失效时转 `retired`。提取 LLM 的总结本身不构成验证证据；不确定、冲突或无法脱离原上下文的内容应保持候选状态。
+候选提取与发布必须分开：只读来源片段并保留原始引用 → 规范化成一个可检验的“条件—判断/做法—适用边界—证伪条件”经验项 → 去重并检查冲突/敏感信息 → `evidence_status=candidate` → 满足**入库质检**后标为 `validated` → 证据被推翻或失效时转 `retired`。提取 LLM 的总结本身不构成验证证据；不确定、冲突或无法脱离原上下文的内容应保持候选状态。
+
+此处 `validated` 是**经验项自身的入库质检档**，判据为"来源可追溯 + 质检门通过 + 抽检通过"，**不要求 §9 的受控实验或 δ 门槛**——那是 `consumption_mode` 从 `observe` 升 `shadow`/`active` 才需要的（§8.2、§9）。把质检与效果验证分开，是为了不让"候选能否入库"也绕回"必须先做实验"的循环。
+
+入库质检的两项关键判据必须机械化，不接受 LLM 自证：
+
+- **引用校验机械化**：`source_ref` + `source_span_or_event`（§5.4.1 字段）必须能定位回该来源类型表中的身份与版本，且 `content_sha` 与该 span 覆盖的原文内容对得上。span 定位失败、hash 不符，或仅有模型自述"引用了某来源"的，一律维持 `evidence_status=candidate` 并降级，不得靠 LLM 自证引用晋升 `validated`。
+- **证伪条件可观察**：四段字段（§8.4① 的 `condition`/`judgement`/`boundary`/`falsifier`）非空的同时，`falsifier` 必须含可观察事件——落成与 `condition` 同构的 `(key, op, value)` 谓词（key 同样受 §8.4① 白名单约束）或绑定可枚举的可观测事件字段（价格 / 日期 / 形态须有确定计算口径）。"若判断错则证伪"这类空话式证伪不算通过，降级为 `candidate` 并记原因；否则该经验永远无法被 §8.4④ 的失败归因触发改写。
 
 `evidence_status` 只描述经验自身的证据成熟度，与 §8.2 的 `consumption_mode`（行为档位）是两个正交维度，不共用取值、不在同一字段流转。二者的对应规则见 §8.2 末的状态对应表；“升级为 active”在本文档中一律指 `consumption_mode` 的变化，不以它替代证据成熟度判定。
 
@@ -376,7 +395,7 @@ LLM 接收的是可读经验及其适用条件、样本量、胜率/预测质量
 
 #### 5.4.3 逐项记录曝光漏斗
 
-建议新增 `qd_experience_injection_events`（名称可在实施时与现有 schema 统一）。每行表示“一个请求中的一个统一经验项”，关联 request、decision 和 outcome：
+建议新增 `qd_agent_experience_injection_events`（名称可在实施时与现有 schema 统一）。每行表示“一个请求中的一个统一经验项”，关联 request、decision 和 outcome：
 
 ```text
 event_id
@@ -508,6 +527,8 @@ Sortino 或 Calmar
 
 预测层的主指标仅在相应数据条件成立时计算：`direction_success_rate` 要求明确方向、对象和成熟视界；Brier score 要求概率与标签目标严格匹配。未通过概率契约的数据只计入概率 coverage gap，不得用其他视界或模型概率补位。
 
+**当前数据现状对主端点的约束**：现有决策记录中，`claims.predicted` 为方向/幅度/点位结构，不含与标签目标匹配的校准概率键（`p` / `prob` / `p_up` 等覆盖率为 0），`claims.confidence` 非空率约 2.2%。因此在概率字段按本方案补齐并积累之前，Brier score 与 `δ_brier` 相关端点**无数据可算**，预测主端点只能用 `direction_success_rate`，并把概率 coverage gap 记为 100% 而非 0；不得用置信度冒充概率，也不得据此宣布概率质量达标。这是数据供给缺口，不是指标定义问题——补齐概率字段后本节契约自动适用，无需改口径。
+
 **交易应用层主指标：**只有实际或仿真执行口径明确时，才评价净超额收益和回撤；不得用方向成功率替代交易绩效。
 
 ### 6.2 次指标
@@ -517,7 +538,10 @@ Sortino 或 Calmar
 止损命中率
 概率校准误差（Brier 的分箱诊断）
 交易成本与换手
+决策一致性 / 经验呼应率（采纳信号；实测未证实与终局相关，仅诊断、不驱动升级；§5.4.6、§9.4 第 5 条）
 ```
+
+`决策一致性` 与 `经验呼应率` 是采纳信号（弱信号），不等于预测质量本身：第 1 步配对实测显示 T+1 与 T+3/T+5 的 outcome 相关性不显著（§9.4 第 5 条），故这两个信号**仅作诊断与候选生成，不得作为低档位（`observe` → `shadow`）升级的辅助证据**，也不得替代 §6.1 主端点。其口径沿用 §5.4.6 的"被引用或呼应比例"；将来若要用作升级证据，须先单独验证与终局的相关性并预注册。
 
 ### 6.3 诊断指标
 
@@ -531,6 +555,14 @@ undecidable 率
 工具失败率
 模型格式失败率
 ```
+
+经验提取与供给漏斗（诊断指标，逐级计数，分母为各级入口数，逐级留存率单列）：
+
+```text
+抽出 → 结构化 → 可算 → 去重 → candidate → validated → 检索命中 → 组合增益
+```
+
+每级记录入口数、通过数、拒绝数与拒绝原因。`白名单覆盖率`（`condition` 可计算候选占全部候选比）单列，与 §8.4① 的越界 key 拒绝数、`needs_data` 滞留数对齐；末级"组合增益"是 §5.4.5/§9 的实验量，只在此标注为漏斗终点，不是诊断性的比率。
 
 指标层级：预测层主指标用于判断预测质量；交易应用层主指标用于判断策略可执行性；诊断指标解释误差来源。二者分开验收，不将收益、命中率和校准误差加权成一个未经验证的综合分。
 
@@ -602,7 +634,7 @@ active   # 正式影响行为
 | `evidence_status`（证据成熟度） | 允许的 `consumption_mode`（行为档位） | 说明 |
 |---|---|---|
 | `candidate` | 仅 `observe` | 证据未确认，只记录曝光与结果，不参与决策 |
-| `validated` | `observe` / `shadow` | 证据成熟；升 `shadow` 需受控对照，升 `active` 还需 δ 参数获批并通过实验一（见 §9.3） |
+| `validated` | `observe` / `shadow` / `active` | 入库质检通过（§5.4.1，非效果验证）；默认仅 `observe`，升 `shadow`/`active` 须另按版本化判定策略达标逐级自动生效（见 §9.3/§9.4），人保留否决与撤回权 |
 | `retired` | 强制 `observe` | 证据被推翻或失效，退出决策影响 |
 
 `consumption_mode` 可按版本/请求比例/domain 灰度（§8.3），灰度只改变作用强度，不改变经验的 `evidence_status`。同一条经验的成熟度升级与档位放开是两个独立决定，不能相互替代。
@@ -616,6 +648,66 @@ active   # 正式影响行为
 - 按 domain 或 skill 灰度；
 - 一键关闭；
 - 恢复上一组确定性参数。
+
+### 8.4 经验如何随回评增长：五个引擎
+
+前面各章定义了"评估什么"（§5）、"反馈以什么档位作用"（§8.2）和"如何验证有效"（§9），但尚未定义一条经验在拿到失败结果后**如何变得更好**——若失败只导致降权，系统只会淘汰经验，不会改进经验，这正是"回评没有提智"的直接原因。本节把"经验→更聪明"的过程显式化为五个引擎。
+
+边界声明：以下引擎中，①—④借鉴了 `docs/经验库升级设计_20261104.md` 与 `经验库升级设计_20261117.md` 的成熟机制，但**只借契约思想，不搬其实体**——不引入 DSL/AST 表达式解释器、独立特征注册表服务、节点树、谱系族预算、建表与迁移；一切在 `app/agent/` 内以本方案的 `experience_id` 目录字段、本地求值与版本化配置实现，遵守 §1.1 硬边界。文中"已登记特征 key"仅指版本化配置中的一个轻量白名单（定义见 ①），不是独立注册表服务。⑤ 为本方案独有增量。
+
+**① 结构化编码：让经验可机读、可匹配**
+
+§5.4.1 已把候选经验规范化为"条件—判断/做法—适用边界—证伪条件"四段式，但 `applicability_conditions` / `normalized_content` 仍是自由文本。增强方向：把四段拆成稳定字段——`condition`（可计算条件）、`judgement`（判断/做法）、`boundary`（适用边界）、`falsifier`（证伪条件），并让 `condition` 只引用"已登记、可计算的特征 key"；未登记或不可计算的条件不得进入匹配（这与来源类型表"判别特征/证伪规则"的 `feature_key` 对齐）。
+
+这里的"登记"落为一个**版本化轻量白名单**：一份带版本号的配置清单，列出允许在 `condition` 中引用、且能由上下文直接取值的 key；初始集合为情境帧 `context_frame` 的六个条件字段（`regime` / `theme_heat` / `vol_bucket` / `index_ret` / `limit_up_cnt` / `turnover`，`as_of` 为时点不参与条件）加上 claim 已有字段（`subject` / `horizon` / `prediction_target` / `direction`）。白名单的扩展须经评审并记录版本，不得由提取 LLM 自行新增 key（这与 §9.3 版本化判定策略同一套版本纪律）。
+
+`condition` 的求值是**固定谓词函数**，不是表达式解释器：每个条件形如 `(key, op, value)`，`op` 只允许 `eq` / `in` / `gt` / `lt` 四种，输出 `applicable` / `not_applicable` / `unknown` 三值（取值缺失即 `unknown`，不猜、不当 `false`）。组合只用显式记录的 `and` / `or`，不解析任意表达式字符串、不执行代码。借鉴自两份设计的"特征门 + 三值条件求值"思想，但落点是白名单 + 谓词函数，不搬 `feature_registry` 服务或 AST 解释器实体。可观测产物：每条经验四段字段非空率、`condition` 可计算比例、白名单版本与越界 key 拒绝数。
+
+**①附·来源优先级与提取预算倾斜**：候选来源按信息价值显式排序——**失败改写（§8.4④ 产物） > 用户纠正 > 成功复盘 > 自由文本**。每 run 的候选提取上限（预算）按此优先级倾斜，高价值来源优先占用额度，避免均等配额让高噪声的自由文本挤占预算。此优先级只约束提取配额，不改变 §5.4.1 的入库质检与 `evidence_status` 流转：失败改写产物仍须回到 §5.4.1 全流程重评，不得因来源优先级高而跳过质检。预算数值与各级配比写入版本化配置（§9.3 同一套版本纪律），不在代码中硬编码。可观测产物：各来源类型的候选数、各阶段成功率（§6.3 漏斗）、预算使用率。
+
+**①附·不可计算候选不留滞留区**：`condition` 引用越界 key 或运行时不可计算的候选（`needs_data`），不得长期滞留为 `candidate` 堆积成"永不生效的僵尸条目"。处置二选一——当场拒绝（记入 coverage 与拒绝原因），或标记为待白名单扩展并设时限（如 30 天，数值走版本化配置），到期仍不可计算则转 `evidence_status=retired`。此状态是 `candidate` 的一个待办标记，不新增第五种 `evidence_status`，也不与 §5.3 的 `undecidable`/`data_missing`（那是 resolution 层判定态）混用。可观测产物：`needs_data` 候选数、待扩展时长分布、到期退役数。
+
+**② 情境匹配：把"适用条件"从字段变成求值**
+
+这是 1118 原方案的实质缺口——`applicability_conditions` 只是被记录的字段，没有"当前状态→该经验是否适用"的判定逻辑。定义本地 `applicability` 求值结果：`applicable` / `not_applicable` / `unknown`（缺数据、无匹配、存储故障分开，与 §5.3 不可判定态一致）；检索先按 `condition` 求值过滤，再按 §5.4.2 的 `effective_weight` 与证据强度排序，顺序、版本与 PIT 可用时间一并留痕（§5.4.1）。`unknown` 不得当作 `applicable`，也不得把旧快照复用到今天（§10.3）。借鉴自两份设计的 `retrieval_policy` 与三值条件求值（`unknown ≠ false`）。可观测产物：每次检索的 applicable/unknown 计数、求值失败原因。
+
+**③ 冲突消解与组合合成：多条经验如何在一次决策里共存**
+
+§5.4.5 只要求"标记冲突与交互"，没有给出消解规则。定义：适用条件重叠且结论相反的经验，按共享样本/特征来源归为同组联合评估（§5.4.5），不把高度相关的经验当独立投票；无法单独归因时标 `unattributable`（沿用 outcome link 的 `eligible_for_attribution` / `exclusion_reason`），不摊分权重；组合级结论先于单项结论（§5.4.5）。冲突未解决时，注入内容显式呈现分歧与不确定性，由 LLM 结合当前证据判断，不得静默按"最新版本"覆盖，也不得让文字权重直接改写量化概率（§5.4.2）。借鉴自两份设计的共线归组、联合评估、冲突未决时提高不确定性或 abstain。可观测产物：冲突组数量、每组联合评估结论、abstain 次数。
+
+**④ 反事实学习：失败经验如何被改写而不是只被降权**
+
+这是"提智"的核心引擎。一条经验在独立回评中失败（`evidence_status=retired` 或效果检验不通过）时，不直接淘汰，而是先按失败归因分类再对症改写：
+
+| 失败类型 | 判定特征（沿用 §6/§9 口径） | 改写动作 |
+|---|---|---|
+| 无区分力 | 样本内效果就在中性区间、条件没有分开样本 | 叠加：补一个能把样本分开的前提条件，收窄适用范围 |
+| 时间外不重现 | 样本内有效应、独立时间外不延续 | 精简：删掉样本内偶然成立、时间外不稳的条件项 |
+| 归因不清 | 多条经验重叠命中、无法单独评估 | 双轨：并行保留两个近似变体，各自独立累积曝光与 outcome |
+
+改写产出的是**新版本经验**（新 `experience_id` / `experience_version`），必须回到 §5.4.1 的"候选→独立回评→validated"全流程重评，不复活旧结论、不覆盖旧证据。防自欺约束：改写候选由探索数据形成后、在确认性评估开始前登记（预注册）——改写本身由失败结果触发，不可能先于结果存在，故约束的是"确认评估前登记"而非"看结果前登记"；确认性评估只能用未参与本轮探索的新数据；改写代数与候选数上限写入版本化配置，不得在代码中硬编码。借鉴自两份设计的改造通道（叠加/精简/双轨并行）与"整批预注册、不得复用看过的数据、按谱系封顶"约束，但**不建谱系树/族预算实体**，改写谱系只用新版本指向旧版本的引用字段表达。可观测产物：改写候选数、各失败类型的改写成功率、改写版相对原版的增量。
+
+**⑤ 元学习：把"哪类经验在哪类情境有效"本身登记为经验（本方案独有）**
+
+前四个引擎优化的是单条经验；但系统是否"越用越聪明"，取决于它能否把跨经验的规律沉淀下来。定义一类特殊经验 `meta_experience`：它不描述具体行情判断，而描述**经验选择本身的规律**（例如"当前波动状态下，带明确证伪条件的经验比泛化经验的有效率更高"）。其身份、版本、`evidence_status`/`consumption_mode` 与 §5.4.1/§8.2 完全复用，仅 `experience_type` 区分；它的 outcome 不是行情收益，而是"按该元规则选出的经验包"相对"无差别经验包"在组合级实验（§5.4.5）中的预测质量增量，同样受 §9 对照与 §9.3 δ 门槛约束，默认 `observe`。`meta_experience` 的准入、披露与灰度与普通经验一致，不得绕过对照实验直接生效。
+
+对照臂口径：初期不新增第四臂，直接用 §9.1 现有两项实验的数据做**描述性差值**——在实验一/实验二的臂内，把经验包按 `meta_experience` 的元规则分组与"无差别选包"子组比较，报告预测质量差值与不确定性。该差值只作诊断与候选生成，**不构成因果有效结论，也不得单独驱动档位升级**；`meta_experience` 若要 `shadow`/`active`，仍须走 §9 的独立预注册对照（为其专门设臂）并通过 §9.3 门槛，§13 相应验收项同步约束。这样既不让元学习绕过门槛，也避免实验组合在起步阶段爆炸。
+
+两份设计均未提供这一层，故其实现与判定口径为本方案新增，需单独预注册，不与具体 skill 或工具绑定。
+
+五个引擎的关系：① 使经验可计算，② 决定用哪条，③ 决定多条如何共存，④ 使失败经验得到改写，⑤ 使选择规律本身可积累。前四者提升"单条与组合经验的效果"，⑤ 提升"选择经验的能力"——只有 ⑤ 闭环，系统才会随时间改变自己的检索与融合策略，而非仅增减条目。
+
+### 8.5 经验细化的纪律（规则先定，实施留待后续）
+
+本节只固定将来把一条经验拆成更细子经验时必须遵守的纪律；本方案当前**不实施任何细化动作**，也不新增来源或改权重。细化指按 §8.4① 白名单内可计算条件把父经验切成更窄的适用情境，属于经验粒度的演化，不改变 §5.2.1 的主视界一票口径。
+
+1. **一票不因细化稀释**（根本约束）：同一决策、同一父经验的所有细化子经验在成功率、Brier、权重中**合并计一票**，不得因拆分而增加样本数；口径沿用 §5.2.1 主视界一票与 §8.4③ 共线归组。违反此条等于用拆分人为制造独立样本、绕过 §9 的功效约束（该约束已由独立交易日簇实测钉死）。
+2. **证据不继承**：子经验的 outcome 只由自身曝光与回评独立累积，不得继承父经验的命中记录充当自身证据；确认性评估只用未参与该次细分探索的数据（§8.4④ 防自欺约束）。细分依据必须是 §8.4① 白名单内的可计算谓词，不得由提取 LLM 自行发明条件。
+3. **谱系可追溯但不建树**：子经验记录 `parent_experience_id` / `split_rule` / 版本，沿用 §8.4④"新版本指向旧版本"的引用字段表达，不建谱系树或族预算实体（§8.4 边界声明）。
+4. **粒度下限与僵尸防治**：子经验独立簇低于 §9.4 的 `n_min`、或其 `condition` 不可计算时，不得挂为长期 `candidate`——应对照 §8.4① 的 `needs_data` 处置当场拒绝、限时等白名单扩展或合并回父级，到期仍不成立则转 `retired`。
+5. **档位与闸门不绕过**：子经验一律从 `evidence_status=candidate` 重走 §5.4.1 全流程、默认 `observe`；升 `shadow`/`active` 仍按 §9.3/§9.4 达标自动生效，不因"是父的细化"而直接获得 `validated` 或放开档位。细化代数与分支数上限写入版本化配置，防无限细分。
+
+可观测产物：细分候选数、各分支独立簇数、合并计一票的口径留痕，并入 §6.3 漏斗的去重级。
 
 ## 9. 对照实验
 
@@ -684,11 +776,27 @@ token 和工具成本
 5. 结果覆盖多个交易日、行情状态、horizon 和标的簇，不依赖单条经验、单只股票或单个市场事件；
 6. 独立簇数达到预注册门槛，关闭经验回路后可恢复基线行为。
 
-`δ_pred`、`δ_brier`、`δ_return`、`δ_drawdown` 是业务/策略风险容忍参数，不能从实验结果反推；须在实验前由用户/策略负责人确定并写入实验配置。当前文档未擅自填数值，因此在这些参数获批前：不仅交易层“非劣”结论不可判定，实验一主端点“A 优于 B”的结论同样不可判定；任何经验项不得从 `shadow` 升级为 `active`，整个反馈回路保持 `observe`/`shadow`（预测主端点依赖 `δ_pred`/`δ_brier`，交易层依赖 `δ_return`/`δ_drawdown`，任一所用参数未获批即阻断对应升级）。多主端点需预注册优先级并控制多重比较。
+判定门槛不采用“由人拍定单一收益阈值后才解锁”的方式——那会形成“没有效应量数据就不敢拍阈值 → 回路停在 `observe` → 更没有数据”的死锁。改为**版本化判定策略**：把主端点、实际意义阈值 `δ_pred`/`δ_brier`/`δ_return`/`δ_drawdown`、最小可检测效应 `mde`、功效、最小独立簇数 `n_min`、look 里程碑与上限 `n_cap`/`max_looks` 集中写入一份带版本的实验配置（与 §5.4.2 `effective_weight` 口径的版本化要求一致），由策略负责人在实验前一次定档，并经独立簇功效审计校验；文档不擅自填具体数值。
+
+发布规则：**门槛达标即按消费档位逐级自动生效**（`observe` → `shadow` → `active`），人只保留否决与随时撤回权，不需要在每轮实验后再次人工批准一个收益数字。`δ_*` 取自预置的策略风险容忍区间，不得从本次实验结果反推；预测层升级依赖 `δ_pred`/`δ_brier`，交易层依赖 `δ_return`/`δ_drawdown`。任一层所需参数缺失或配置版本不兼容时，该层维持当前档位并记录原因，而不是进入无限等待（退出机制见 §9.4）。多主端点须预注册优先级并控制多重比较。
+
+**功效审计的前置数据门槛**：§9.4 的 `n_min`/`n_cap` 必须以**独立交易日簇**为单位估算，不能用名义 resolution 条数。按现有记录的实测口径：约 26 个已回评交易日、每日标的池约 6.8，折算后独立簇约 78、MDE 约 15.9pp（按天算簇则 MDE 约 27.5pp）；分辨 5pp 需约 262 个交易日。因此当前样本不足以判定任何 5~10pp 量级的经验增益，任何经验项在此期间一律维持 `observe`，不得据现有数据升 `shadow`/`active`——这与 §9.4 的"未达门槛不升级"一致，是功效不足的如实反映，不是死锁复发。此外概率端点当前无数据（§6.1），`δ_brier` 相关判定在数据补齐前标为不可判定并计入 coverage，不参与档位升级。
+
+### 9.4 门槛定档与自适应停止
+
+功效不足是 T+N 回评落地的主要障碍：独立簇数近似等于可用交易日数，T+3/T+5 成熟慢，固定样本显著性检验容易被噪声拖成年级周期。判定策略按以下方式定档与停止，使任何经验在有限期内都能出结论，不长期卡在 `observe`/`shadow`：
+
+1. **按预注册 `mde` 定样本量**：`n_min ∝ σ²/mde²`，`σ` 用历史同簇方差的保守估计，`mde` 用策略预注册的最小有意义效应而非本次实测效应——用实测效应反推样本量会系统性高估收益（winner's curse）；
+2. **等价检验判无效**：对“无实质增益”采用 TOST/等价检验，达标即判 `no_gain` 并维持或降档，而不是因“证不出有效”永久 pending；
+3. **双向封顶**：设独立簇上限 `n_cap` 与最大 look 次数 `max_looks`；到上限仍无定论即判 `inconclusive`（证据不足），按当前档位保留并记入 coverage，不再等待；
+4. **前置 look**：预注册里程碑（例如 5/10/20/40/80 独立簇），在早期点即可按停止规则判有效/无效；多次 look 须预注册 α 消耗控制（如 alpha spending 或 Holm 步降），不得看到结果后追加 look；
+5. **代理信号不得驱动升级（实测否证后降级为纯诊断）**：现有数据中，同一 (标的, 决策交易日) 上 T+1 与 T+3 的 outcome 可配对 36 组（展开 793 对），二值列联表给出 `phi≈0.062`、`OR=1.35`、`95%CI [0.96,1.90]` 含 1，相关性不显著；T+1 与 T+5 仅 2 组（`phi≈0.024`），按 decision_id 配对则为 0。因此 **T+1 命中不能预测 T+3/T+5 命中，代理-终局相关性不成立**：T+1 的预测质量、决策一致性/经验呼应率等早期可得信号只作诊断与候选生成，**不得作为 `observe` → `shadow` 升级的代理证据**。升级的前置证据只能是该经验自身的独立簇回评；若将来确需代理信号，须先单独验证其与终局的相关性并预注册，未验证前一律不用。T+3/T+5 真实收益与净超额收益仍仅用于高档位（`shadow` → `active`）确认。证据出处：第 1 步只读配对探针 `tmp/probe_tn_pairing_20261119.py` / `.json`。
+
+以上仅为判定口径的通用约定，不绑定具体 skill、工具或领域；实现留在 `app/agent/` 内，符合 §1.1 边界。
 
 ## 10. 数据落库方案
 
-建议新增统一结果表 `qd_evaluation_outcomes`，一条记录对应一个可评价 decision/horizon。
+建议新增统一结果表 `qd_agent_evaluation_outcomes`，一条记录对应一个可评价 decision/horizon。
 
 由于实施范围不包括 `migrations/` 等目录，不新增或修改范围外的迁移文件。表结构在 `app/agent/` 内按本仓已有的 `_DDL + _ensure_schema()` 惰性初始化模式实现，参考 `utils/case_memory.py` 和 `rag/pg_vector_store.py`：仅做 additive、幂等的 `CREATE TABLE/INDEX IF NOT EXISTS`，通过现有 DB 接口执行并显式 commit/rollback；初始化失败必须产生可观测告警/健康状态，不能返回“写入成功”的假结果。DDL/初始化代码必须留在 `app/agent/`，不得要求手工改 `migrations/`。若数据库权限或既有部署策略不允许运行时建表，先停在设计/影子阶段并请用户确认范围，不得越界补迁移。
 
@@ -696,12 +804,12 @@ token 和工具成本
 
 ```text
 qd_agent_experiences          # 统一经验目录与版本/状态/来源
-qd_experience_injection_events # 请求级逐项经验曝光及实验分配
-qd_evaluation_outcomes         # 预测身份及不可变的回评版本
-qd_experience_outcome_links    # 曝光事件 ↔ outcome 的多对多归因连接
+qd_agent_experience_injection_events # 请求级逐项经验曝光及实验分配
+qd_agent_evaluation_outcomes         # 预测身份及不可变的回评版本
+qd_agent_experience_outcome_links    # 曝光事件 ↔ outcome 的多对多归因连接
 ```
 
-核心字段示例：
+核心字段示例（字段按 §10.3 的"共享核心信封 / 领域 adapter 扩展"两层理解；本清单是全集，其中标注 `[finance]` 的字段仅存在于 finance adapter 扩展、不进共享核心表；实现时以 §10.3 为准）：
 
 ```text
 decision_id
@@ -740,15 +848,17 @@ experience_injection_ids
 experience_assignment
 predicted_probability
 predicted_direction
-entry_fill
-exit_fill
-net_return
-benchmark_return
-excess_return
-max_drawdown
+entry_fill            # [finance] adapter 扩展，不进共享核心表（§10.3）
+exit_fill             # [finance]
+net_return            # [finance]
+benchmark_return      # [finance]
+excess_return         # [finance]
+max_drawdown          # [finance]
 verdict
 verdict_score
 brier_score
+actual.windows             # 多视界诊断子结构（§5.2.1），只诊断、不进 verdict/权重
+deviation.windows          # 多视界诊断子结构（§5.2.1），只诊断、不进 verdict/权重
 execution_status
 data_quality
 ```
@@ -784,8 +894,44 @@ outcome_version 1 ── N experience_outcome_link
 | `label` | 某个消费方/评估策略基于 outcome 生成的专用分类；必须带 label policy/version | raw verdict；不同表的同名 label |
 | `experience` | 有来源、版本、条件和状态的可复用经验项 | skill 本身或原案例的正确标签 |
 | `experience_injection_event` | 某请求实际候选、曝光/注入某经验的记录 | 证明 LLM 内部采纳或证明因果有效 |
+| `domain` / `domain_schema_version` | outcome 所属任务领域及其契约版本，决定用哪个 adapter 解析结果 | 现有 `weight_feed` 的 domain 权重层；两者同名但语义不同 |
+| `DomainAdapter` | 提供该领域 snapshot 校验、outcome 解析/成熟、评估与检索策略的显式注册插件（§10.3） | 共享表里的金融专属字段；通用层里的领域判断分支 |
 
 `resolution.verdict` 是判定事实；`outcome` 是在指定预测目标、成熟视界和 outcome policy 下的评分记录；面向技能反馈或经验聚合的 `label` 是从 outcome 派生的消费口径。任何聚合都必须记录从 verdict 到 outcome/label 的确定性映射版本。
+
+### 10.3 领域适配边界与通用信封
+
+上节核心字段表里，并非所有字段都跨域通用：`prediction_target`、`horizon`、`verdict`、`verdict_score`、`brier_score`、`predicted_probability` 及各类 id/version/时间字段对所有预测回评一致；而 `entry_fill`、`exit_fill`、`net_return`、`benchmark_return`、`excess_return`、`max_drawdown` 是金融交易专属。若把这些字段平铺进共享结果表并让通用回评链路直接读取，链路会隐式假设“任何 outcome 都有成交价与基准收益”，换到其他任务类型便无法复用。因此采用两层契约：
+
+**共享核心信封（全域一致，语义不依赖任何具体领域）**
+
+- 身份与版本：`decision_id`、`claim_id`、`prediction_id`、`resolution_id`、`outcome_id`、`outcome_policy_version`、`snapshot_version`、`domain`、`domain_schema_version`；
+- 时间与分配：`subject`、`subject_kind`、`horizon`、`as_of`、`data_as_of`、`outcome_available_at`、`resolved_at`、`experiment_arm`；
+- 预测侧：`target_event`、`prediction_target`、`label_rule_version`、`predicted_probability`、`predicted_direction`、`probability_source/target/horizon`、`coverage_gap`；
+- 评分侧：`verdict`、`verdict_score`、`brier_score`、`data_quality`、`condition_key`、`sample_layer`；
+- 来源/实验/模型版本：`skill_id`、`skill_version`、`tool_chain_sha`、`model_name`、`prompt_sha`、`experience_bundle_id/sha`、`experience_injection_ids`、`experience_assignment`。
+
+**领域 adapter（显式注册，领域专属语义不进共享表）**
+
+每条 outcome 记录带 `domain` 与 `domain_schema_version`，由注册表中的 adapter 提供下列能力；共享层只按注册表调用，不写 `if domain == ...` 分支：
+
+| 能力 | 职责 | 金融域（当前唯一实现） |
+|---|---|---|
+| `task_classifier` | 判定 decision 属于哪个领域、是否适合提取经验 | 股票方向/选股/板块任务分类 |
+| `validate_snapshot` | 特征、单位、时间语义与数据质量校验 | PIT 时点、行情可见时间、缺帧 |
+| `resolve_outcome` / `maturity_status` | 结果如何观测、何时成熟、何时不可判 | 主窗口取 claim 自身 horizon，`QD_LABEL_WINDOWS` 附加视界只诊断；`truncated`/`undecidable`/`data_missing` 记 coverage（§5.2.1、§5.3） |
+| `evaluation_policy` | 指标、基准、成本、时间切分与统计门槛 | 预测质量为主、净收益为护栏；δ 与 look 门槛走版本化配置（§6、§9.3） |
+| `retrieval_policy` | scope 兼容、证据排序、冲突展示 | 按适用条件、horizon 与版本兼容性排序 |
+| `retention_policy` | 数据保留、脱敏与归档 | 快照/曝光/outcome 的保留期与脱敏 |
+
+金融专属字段（`entry_fill`/`exit_fill`/`net_return`/`benchmark_return`/`excess_return`/`max_drawdown`）只放在 finance adapter 的 outcome 扩展里，共享引擎不直接读这些列，也不要求其他领域实现它们。
+
+**硬约束**
+
+1. adapter 缺失或 `domain_schema_version` 不兼容时，明确返回 `unsupported_domain` / `schema_incompatible`，记为 coverage/exclusion（§5.3），不用 finance 默认 resolver 兜底，也不当成负面 outcome 或经验失败。
+2. 不强行把不同领域的 outcome 压成统一“胜率”；outcome 可为分数、分类、集合一致性、时长或成本。确需跨领域上层比较时，必须先定义带版本的业务效用函数与归一化口径。
+3. 本方案首期只落地 finance adapter；adapter 接口先定义、只实现金融一个领域，不为“未来可能跨域”提前写死通用逻辑，避免单一领域上的过度通用化。
+4. adapter 的注册、解析与调用全部位于 `app/agent/` 内，不改 `migrations/`、`skills/`、`tools/`，符合 §1.1 硬边界。
 
 ## 11. 分阶段实施
 
@@ -876,7 +1022,17 @@ outcome_version 1 ── N experience_outcome_link
 - [ ] `undecidable` 和数据缺失不被伪装为中性结果；
 - [ ] 关闭反馈后行为可恢复；
 - [ ] `evidence_status`（candidate/validated/retired）与 `consumption_mode`（observe/shadow/active）分字段记录，状态对应表完整；
-- [ ] `δ_pred` / `δ_brier` / `δ_return` / `δ_drawdown` 已由用户/策略负责人预注册获批并写入实验配置；未获批前不存在 active 升级；
+- [ ] 失败经验先按失败类型归因再叠加/精简/双轨改写，改写产新版本并回到候选→回评流程，确认只用未参与探索的数据；
+- [ ] 来源按失败改写 > 用户纠正 > 成功复盘 > 自由文本显式排序，每 run 提取预算按此倾斜且高价值来源不跳过入库质检；
+- [ ] 入库质检机械化：span 定位失败或 hash 不符即降级、`validated` 不由 LLM 自证引用产生；`falsifier` 含可观察事件谓词，空话式证伪降级；
+- [ ] 不可计算候选（`needs_data`）当场拒绝或限时等白名单扩展、到期转 `retired`，不留永久滞留的僵尸候选；
+- [ ] §6.3 提取漏斗逐级计数（抽出→结构化→可算→去重→candidate→validated→检索命中→组合增益），白名单覆盖率单列；
+- [ ] 经验细化纪律已固化且当前未实施细化：子经验合并计一票、证据不继承、谱系只作引用、粒度下限与僵尸防治、档位闸门不绕过；
+- [ ] `meta_experience` 与普通经验分型记录，其效果按组合级对照衡量、默认 observe，不绕过 §9 门槛；
+- [ ] 版本化判定策略已一次定档：主端点、`δ_pred`/`δ_brier`/`δ_return`/`δ_drawdown`、`mde`、功效、`n_min`、look 里程碑与 `n_cap`/`max_looks` 均写入带版本配置并经独立簇功效审计校验，未擅自填数值；
+- [ ] 门槛达标按消费档位逐级自动生效，人工否决/撤回路径可用且可观测；预测层与交易层分别依赖 `δ_pred`/`δ_brier` 与 `δ_return`/`δ_drawdown`；
+- [ ] `n_min ∝ 1/mde²` 用预注册 `mde`、无效走等价检验、`n_cap`/`max_looks` 双封顶，任何经验在有限期内出有效/无效/证据不足三者之一；
+- [ ] 功效审计按独立交易日簇（非名义 resolution 条数）估算；独立簇未达 `n_min` 或概率字段未补齐时一律维持 `observe`，Brier/`δ_brier` 标不可判定并计入 coverage，不用置信度冒充概率；
 - [ ] 至少分别完成“回评更新效果”与“经验注入效果”两项预注册对照；
 - [ ] 只有通过离线对照和灰度后才允许全量启用。
 

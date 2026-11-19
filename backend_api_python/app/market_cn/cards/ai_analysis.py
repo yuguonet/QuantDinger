@@ -23,7 +23,7 @@ def fetch():
     emotion = ov.get("emotionIndex", 50)
     up = ov.get("upCount", 0)
     down = ov.get("downCount", 0)
-    north = ov.get("northBound", 0)
+    north = ov.get("northBound")  # None = 北向数据不可用（停披露），不得当 0 参与判断
     broken = ov.get("brokenBoard", 0)
 
     total = up + down
@@ -68,7 +68,7 @@ def _fetch_hot_sectors(lup, north, emotion):
     sectors = []
     if lup > 50:
         sectors.append({"name": "涨停潮", "driver": f"涨停{lup}家", "score": min(95, 60 + lup // 10)})
-    if north > 30:
+    if north is not None and north > 30:
         sectors.append({"name": "北向加仓", "driver": f"净流入{north:.1f}亿", "score": min(85, 60 + int(north))})
     if emotion > 70:
         sectors.append({"name": "市场做多", "driver": "情绪高涨", "score": emotion})
@@ -111,7 +111,9 @@ def _build_advice(lup, ldn, broken, north, emotion):
     if broken > 20:
         op.append(f"炸板{broken}家，封板成功率低，追涨需谨慎")
 
-    if north > 50:
+    if north is None:
+        op.append("北向资金已停止披露，本次分析不含北向判断")
+    elif north > 50:
         op.append(f"北向净流入{north:.1f}亿，外资看好，可适当乐观")
     elif north < -50:
         op.append(f"北向净流出{abs(north):.1f}亿，外资撤退，注意风险")

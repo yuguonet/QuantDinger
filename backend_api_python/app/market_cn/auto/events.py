@@ -29,7 +29,6 @@ KNOWN_EVENTS = (
     "daily_1d",      # 日 K 已回填 (post_market_batch)
     "minute_1m",     # 1m K 已回填 (post_market_batch)
     "lhb",           # 龙虎榜已落库 (dragon_hot_daily)
-    "northbound",    # 北向日级已落库
     "fund_flow",     # 个股资金流日度已落库 (fund_flow_daily)
     "index_fflow",   # 指数大盘资金流已同步
 )
@@ -59,20 +58,9 @@ def _derive_lhb(date: str) -> bool:
         return False
 
 
-def _derive_northbound(date: str) -> bool:
-    try:
-        from app.market_cn.index import get_northbound_daily
-        nb = get_northbound_daily(10)
-        return bool(nb) and str(nb[-1].get("date", ""))[:10] >= date
-    except Exception as e:
-        logger.debug("[events] northbound deriver 失败: %s", e)
-        return False
-
-
 _DERIVERS = {
     "daily_1d": _derive_daily_1d,
     "lhb": _derive_lhb,
-    "northbound": _derive_northbound,
 }
 
 

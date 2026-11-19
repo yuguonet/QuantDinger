@@ -43,7 +43,7 @@
             </div>
             <div class="overview-card">
               <h4>北向资金</h4>
-              <p class="value">{{ overview.northBound }}亿</p>
+              <p class="value">{{ overview.northBoundAvailable ? overview.northBound + '亿' : '未获取' }}</p>
             </div>
             <div class="overview-card">
               <h4>情绪指数</h4>
@@ -152,7 +152,7 @@ export default {
         cyse: { index: '--', change: 0 },
         bzse: { index: '--', change: 0 },
         heat: '未知', limitUp: 0, limitDown: 0,
-        northBound: 0, emotionIndex: 50
+        northBound: 0, northBoundAvailable: false, emotionIndex: 50
       },
       // 动态卡片列表
       cardList: [],
@@ -198,6 +198,7 @@ export default {
         this.overview.limitUp = d.limitUp || 0
         this.overview.limitDown = d.limitDown || 0
         this.overview.northBound = typeof d.northBound === 'number' ? d.northBound.toFixed(2) : String(d.northBound || 0)
+        this.overview.northBoundAvailable = d.northBoundAvailable === true
         this.overview.emotionIndex = d.emotionIndex || 50
         // 热度：前端根据涨跌比重新算
         const up = d.upCount || 0
