@@ -6,7 +6,7 @@
     <div class="bubble-body">
       <div class="bubble-meta">
         <span class="role-label">{{ message.role === 'user' ? 'You' : 'Agent' }}</span>
-        <span class="time-label" v-if="message.time">{{ message.time }}</span>
+        <span class="time-label" v-if="timeLabel">{{ timeLabel }}</span>
       </div>
 
       <!-- 工具调用过程 -->
@@ -278,7 +278,29 @@ export default defineComponent({
       return safe
     }
 
-    return { renderedContent, renderMarkdown, analysisResult, isMultiStock, actionColor, actionLabel, scoreClass, dirColor, factorColor }
+    /**
+     * 消息时间标签：有 ts 时显示「日期 + 时间」，便于区分前些天的历史对话。
+     * - 今天       → 14:35
+     * - 今年       → 11-03 14:35
+     * - 跨年       → 2025-11-03 14:35
+     * 历史遗留消息只有 HH:mm（无 ts），退化为仅时间。
+     */
+    const timeLabel = computed(() => {
+      const msg = props.message
+      if (!msg || !msg.ts) return msg && msg.time ? msg.time : ''
+      const d = new Date(msg.ts)
+      if (!Number.isFinite(d.getTime())) return msg.time || ''
+      const pad2 = (n) => String(n).padStart(2, '0')
+      const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+      const now = new Date()
+      const isToday = d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+      if (isToday) return hm
+      const md = `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+      return d.getFullYear() === now.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}-${md} ${hm}`
+    })
+
+    return { renderedContent, renderMarkdown, analysisResult, isMultiStock, actionColor, actionLabel, scoreClass, dirColor, factorColor, timeLabel }
   }
 })
 </script>

@@ -1,5 +1,5 @@
 <template>
-  <div class="ai-agent-page">
+  <div class="ai-agent-page" ref="pageRef" :style="pageStyle">
     <!-- 顶部操作栏 -->
     <div class="agent-header">
       <div class="header-left">
@@ -110,8 +110,13 @@
           </div>
         </div>
 
-        <!-- 消息列表 -->
-        <ChatBubble v-for="(msg, idx) in messages" :key="idx" :message="msg" />
+        <!-- 消息列表（按天分组：跨天插入日期分隔条） -->
+        <template v-for="item in timeline">
+          <div v-if="item.type === 'divider'" :key="item.key" class="date-divider">
+            <span class="date-chip">{{ item.label }}</span>
+          </div>
+          <ChatBubble v-else :key="item.key" :message="item.msg" />
+        </template>
       </div>
     </div>
 
@@ -121,9 +126,9 @@
         <!-- eslint-disable-next-line vue/no-v-model-argument -->
         <a-textarea
           v-model:value="inputText"
-          :placeholder="$t('ai-agent.inputPlaceholder') || '输入消息... (Enter 发送, Shift+Enter 换行)'"
-          :auto-size="{ minRows: 1, maxRows: 4 }"
-          @keydown.enter.exact.prevent="sendMessage"
+          :placeholder="$t('ai-agent.inputPlaceholder') || '输入消息…'"
+          :auto-size="{ minRows: 1, maxRows: 6 }"
+          @keydown="onInputKeydown"
           :disabled="streaming"
         />
         <!-- 发送 / 停止 二合一按钮 -->
@@ -147,7 +152,11 @@
           <template #icon><a-icon type="stop" /></template>
         </a-button>
       </div>
-
+      <div class="input-hint">
+        <span><kbd>Enter</kbd> 发送</span>
+        <span class="hint-sep">·</span>
+        <span><kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</span>
+      </div>
     </div>
 
     <!-- 任务状态抽屉 -->
@@ -189,7 +198,7 @@
 </template>
 
 <script>
-import { ref, computed, nextTick, onBeforeUnmount, watch, reactive } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, onMounted, watch, reactive } from 'vue'
 import { message } from 'ant-design-vue'
 // icons: using <a-icon type="xxx" /> (ant-design-vue 1.x pattern)
 
@@ -260,12 +269,60 @@ export default {
 
     // 模板引用
     const chatContainerRef = ref(null)
+    const pageRef = ref(null)
+
+    // ── 页面铺满窗口 ────────────────────────────────────
+    // 布局层（pro-layout）的 header / 外边距会随主题与屏宽变化，写死 100vh-Npx 一定会留白或溢出。
+    // 这里直接实测页面元素距视口顶部的偏移，用剩余高度作为页面高度，随窗口尺寸同步。
+    const pageHeight = ref(0)
+    const pageStyle = computed(() => (
+      pageHeight.value > 0 ? { height: pageHeight.value + 'px' } : { height: 'calc(100vh - 120px)' }
+    ))
+
+    function syncPageHeight () {
+      const el = pageRef.value
+      if (!el) return
+      const top = el.getBoundingClientRect().top
+      if (!Number.isFinite(top) || top < 0) return
+      pageHeight.value = Math.max(360, Math.round(window.innerHeight - top))
+    }
 
     // ── 计算属性 ────────────────────────────────────────
 
     const currentStrategyInfo = computed(() => {
       if (!selectedStrategy.value) return null
       return indicators.value.find((s) => s.id === selectedStrategy.value) || null
+    })
+
+    // ── 会话时间轴（跨天插入日期分隔条）──────────────────
+    // 旧版本消息只存了 HH:mm（无 ts），这类消息不产生日期分隔，仅显示原时间。
+    const pad2 = (n) => String(n).padStart(2, '0')
+    const dayKeyOf = (ts) => {
+      const d = new Date(ts)
+      return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    }
+    function dayLabelOf (ts) {
+      const d = new Date(ts)
+      const now = new Date()
+      const key = dayKeyOf(ts)
+      if (key === dayKeyOf(now.getTime())) return '今天'
+      if (key === dayKeyOf(now.getTime() - 86400000)) return '昨天'
+      if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日`
+      return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`
+    }
+
+    const timeline = computed(() => {
+      const out = []
+      let lastDay = ''
+      messages.value.forEach((msg, idx) => {
+        const day = msg.ts ? dayKeyOf(msg.ts) : ''
+        if (day && day !== lastDay) {
+          out.push({ type: 'divider', key: 'd-' + day + '-' + idx, label: dayLabelOf(msg.ts) })
+          lastDay = day
+        }
+        out.push({ type: 'msg', key: 'm-' + idx, msg })
+      })
+      return out
     })
 
     // ── 消息持久化（账号私有域: 严格按用户隔离, 未登录不落盘）────────────
@@ -283,11 +340,54 @@ export default {
       } catch (_) {}
     }
 
+    /**
+     * 历史遗留消息迁移：老版本只持久化 HH:mm（无 ts），数据里确实没有日期信息。
+     * 按会话内时间单调性反推补全：从最新一条往前遍历，若更早一条的 HH:mm 大于
+     * 后一条的 HH:mm（同一天不可能倒序），说明它落在前一天，日偏移 +1。
+     * 已有 ts 的消息以其真实日期为锚，其后更早的无 ts 消息继续按此规则推算。
+     * 补全结果随下一次 saveMessages 落盘，因此只在首次升级时计算一次。
+     */
+    function backfillLegacyTimestamps (list) {
+      const DAY = 86400000
+      const now = new Date()
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+      const minutesOf = (s) => {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || ''))
+        return m ? Number(m[1]) * 60 + Number(m[2]) : null
+      }
+      let dayOffset = 0
+      let prevMinutes = null
+      let dirty = false
+      for (let i = list.length - 1; i >= 0; i--) {
+        const msg = list[i]
+        if (!msg || typeof msg !== 'object') continue
+        if (msg.ts) {
+          const d = new Date(msg.ts)
+          if (Number.isFinite(d.getTime())) {
+            const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+            dayOffset = Math.round((todayStart - dayStart) / DAY)
+            prevMinutes = d.getHours() * 60 + d.getMinutes()
+          }
+          continue
+        }
+        const mins = minutesOf(msg.time)
+        if (mins == null) continue
+        if (prevMinutes != null && mins > prevMinutes) dayOffset += 1
+        msg.ts = todayStart - dayOffset * DAY + mins * 60000
+        prevMinutes = mins
+        dirty = true
+      }
+      return dirty
+    }
+
     function restoreMessages () {
       try {
         const saved = readUserPrefs('ai-agent')
         if (Array.isArray(saved.messages) && saved.messages.length > 0) {
-          messages.value = saved.messages
+          // 恢复时清掉 streaming 标记：上次若在流式输出中关闭页面，否则会一直显示光标/打字动画
+          messages.value = saved.messages.map((m) => (m && m.streaming ? { ...m, streaming: false } : m))
+          const backfilled = backfillLegacyTimestamps(messages.value)
+          if (backfilled) nextTick(saveMessages)
         }
         if (saved.sessionId) {
           sessionId.value = saved.sessionId
@@ -333,6 +433,20 @@ export default {
       inputText.value = ''
       pushMessage('user', text)
       await sendStream(text)
+    }
+
+    /**
+     * 输入框回车策略：
+     * - Enter             → 发送
+     * - Shift/Ctrl/Alt+Enter → 原生换行（不拦截，交给 textarea 自己插入 \n）
+     * - 输入法组合中（中文候选确认）的 Enter → 必须忽略，否则会打断拼音输入
+     */
+    function onInputKeydown (e) {
+      if (e.isComposing || e.keyCode === 229) return
+      if (e.key !== 'Enter' && e.keyCode !== 13) return
+      if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return
+      e.preventDefault()
+      sendMessage()
     }
 
     function quickAsk (text) {
@@ -478,7 +592,8 @@ export default {
     function pushMessage (role, content, extra = {}) {
       const now = new Date()
       const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
-      messages.value.push({ role, content, time, ...extra })
+      // ts 用于历史会话按天分组显示日期（旧消息无 ts，只显示 time）
+      messages.value.push({ role, content, time, ts: now.getTime(), ...extra })
       nextTick(() => scrollToBottom())
     }
 
@@ -492,9 +607,22 @@ export default {
       nextTick(() => scrollToBottom())
     }
 
-    function scrollToBottom () {
+    /**
+     * 滚到底部。
+     * instant=true 时临时关闭 CSS smooth（scroll-behavior 对 scrollTop 赋值同样生效），
+     * 否则首次进入历史会话会从顶部"滑"到底，观感很怪。
+     */
+    function scrollToBottom (instant = false) {
       const el = chatContainerRef.value
-      if (el) el.scrollTop = el.scrollHeight
+      if (!el) return
+      if (!instant) {
+        el.scrollTop = el.scrollHeight
+        return
+      }
+      const prev = el.style.scrollBehavior
+      el.style.scrollBehavior = 'auto'
+      el.scrollTop = el.scrollHeight
+      el.style.scrollBehavior = prev
     }
 
     // ── 分析 ────────────────────────────────────────────
@@ -677,15 +805,31 @@ export default {
       })
     }
 
+    onMounted(() => {
+      syncPageHeight()
+      window.addEventListener('resize', syncPageHeight)
+      // 进入页面（含恢复历史会话）后直接落到最后一条消息，避免默认停在会话开头
+      nextTick(() => {
+        scrollToBottom(true)
+        // 图表 iframe / 字体加载会改变高度，下一帧再贴一次底
+        window.requestAnimationFrame(() => scrollToBottom(true))
+      })
+    })
+
     onBeforeUnmount(() => {
       // 不关闭流式连接！只断开回调，后端继续跑
       _detachComponent()
+      window.removeEventListener('resize', syncPageHeight)
       taskStream.value?.close()
       saveMessages()
     })
 
     return {
       messages,
+      timeline,
+      pageRef,
+      pageStyle,
+      onInputKeydown,
       inputText,
       streaming,
       connected,
@@ -718,8 +862,12 @@ export default {
 .ai-agent-page {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 120px);
-  background: #fafafa;
+  /* 高度由 setup 里实测的 pageStyle 提供（视口剩余高度），这里只兜底最小高度 */
+  min-height: 360px;
+  background: #fff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
 .agent-header {
@@ -783,14 +931,32 @@ export default {
 
 .chat-container {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  padding: 24px;
-  scroll-behavior: smooth;
+  padding: 20px 24px;
+  background: #fafbfc;
 }
 
 .chat-messages {
   max-width: 99%;
   margin: 0 auto;
+}
+
+/* 跨天日期分隔条 */
+.date-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 6px 0 18px;
+
+  .date-chip {
+    padding: 2px 12px;
+    font-size: 12px;
+    color: #8c8c8c;
+    background: rgba(0, 0, 0, 0.04);
+    border-radius: 10px;
+    line-height: 20px;
+  }
 }
 
 .welcome-message {
@@ -853,9 +1019,10 @@ export default {
 
 .input-area {
   flex-shrink: 0;
-  padding: 12px 24px 16px;
+  padding: 12px 24px 10px;
   background: #fff;
   border-top: 1px solid #f0f0f0;
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.02);
 
   .input-wrapper {
     max-width: 900px;
@@ -868,6 +1035,12 @@ export default {
       border-radius: 20px;
       padding: 8px 16px;
       resize: none;
+      line-height: 1.6;
+      transition: box-shadow 0.2s, border-color 0.2s;
+
+      &:focus {
+        box-shadow: 0 0 0 3px rgba(24, 144, 255, 0.12);
+      }
     }
 
     .send-btn {
@@ -882,10 +1055,25 @@ export default {
     margin: 6px auto 0;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: center;
     gap: 6px;
     font-size: 12px;
-    color: #999;
+    color: #b0b0b0;
+
+    kbd {
+      padding: 0 4px;
+      font-size: 11px;
+      font-family: inherit;
+      color: #8c8c8c;
+      background: #f5f5f5;
+      border: 1px solid #e8e8e8;
+      border-bottom-width: 2px;
+      border-radius: 4px;
+    }
+
+    .hint-sep {
+      color: #d9d9d9;
+    }
   }
 }
 

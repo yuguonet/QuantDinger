@@ -7,6 +7,9 @@
   ③ 止损「跌破 X」抽成 level claim（全身而退可追责）；
   ④ 各档 due_date 按 label_spec.HOLDS 分日到期。
 
+【夹具】extract_horizon_directions 返回三元组 (周期, 方向, 把握度)，
+  本文件断言一律投影前两项比方向与顺序，把握度由带括注的用例单独覆盖。
+
 【纪律】纯规则抽取，零网络零 DB。
 """
 from __future__ import annotations
@@ -22,7 +25,7 @@ def test_github_style_horizon_line_multi_claims() -> None:
         "301199  迈赫股份  68 | 主线人形机器人\n"
         "  周期: T+1看多 T+3看多 T+5中性 T+10/T+20不适用 | 支撑=MA10\n"
     )
-    hz = extract_horizon_directions(ans)
+    hz = [(lab, d) for lab, d, _p in extract_horizon_directions(ans)]
     assert ("T+1", "bullish") in hz
     assert ("T+3", "bullish") in hz
     assert not any(lab == "T+5" for lab, _ in hz), "中性不产 claim"
@@ -68,7 +71,7 @@ def test_label_spec_has_t10_t20_for_mid_term_claims() -> None:
 )
 def test_unknown_horizon_is_not_a_direction_and_preserves_positions(cell, expected):
     answer = f"| 代码 | T+1/T+3/T+5 |\n| 300129 | {cell} |"
-    assert extract_horizon_directions(answer) == expected
+    assert [(lab, d) for lab, d, _p in extract_horizon_directions(answer)] == expected
 
 
 def test_unknown_periods_do_not_fall_back_to_reason_text_for_direction():
@@ -79,4 +82,4 @@ def test_unknown_periods_do_not_fall_back_to_reason_text_for_direction():
 
 def test_explicit_unknown_period_does_not_hide_known_periods():
     answer = "300129 T+1未知 T+3看多 T+5未知"
-    assert extract_horizon_directions(answer) == [("T+3", "bullish")]
+    assert [(lab, d) for lab, d, _p in extract_horizon_directions(answer)] == [("T+3", "bullish")]

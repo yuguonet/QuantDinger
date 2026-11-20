@@ -5334,7 +5334,9 @@ json.dumps(output)
                 // 右缘留呼吸位，丢弃上一张图残留的缩放/右缘空位）；其余（切周期/页面刷新）→ 恢复现场
                 if (_entryViewportPending) {
                   _entryViewportPending = false
-                  applyEntryViewport()
+                  // ★ 首次进入（页面刷新/重开浏览器）优先恢复该 symbol+周期的现场，
+                  //   没有现场才回落到进入态；否则用户调好的柱数每次刷新都会被重置为默认根数
+                  if (!restoreChartScene(props.timeframe)) applyEntryViewport()
                 } else if (_goLatestOnNextLoad) {
                   _goLatestOnNextLoad = false
                   // ★ 换股沿用当前 X 轴跨度与右缘空位（syncSpan=false）
@@ -6280,7 +6282,8 @@ json.dumps(output)
                   // 与上方「图表已存在」分支同规则：进入态/换股/现场恢复三选一
                   if (_entryViewportPending) {
                     _entryViewportPending = false
-                    applyEntryViewport()
+                    // 首次进入优先恢复现场（同 loadKlineData 分支），无现场才用进入态
+                    if (!restoreChartScene(props.timeframe)) applyEntryViewport()
                   } else if (_goLatestOnNextLoad) {
                     _goLatestOnNextLoad = false
                     // 同 loadKlineData 分支：换股沿用当前 X 轴跨度，避免横向挪动（X 轴小抖动）

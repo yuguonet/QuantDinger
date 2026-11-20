@@ -1149,6 +1149,12 @@ def test_26_accountability_v11():
          就是被这个常量毒化的）。
       ③ **多域通用留位**——域开关来自**配置**，把 finance 关掉后同样的问题
          产出 0 条 claim ⇒ 证明调用方没有 `if domain == 'finance'` 硬编码。
+
+    端点⑤（端到端入库）显式走规则法（`QD_CLAIM_LLM=0`）：这里验的是「闸门→抽取→
+    落库」的接线是否通，不是抽取质量。LLM 通道有 +4s 与空返回抖动，会让健康检查
+    本身变成不确定事件；抽取质量归 `claim_extract_llm` 的探针与回归。
+    同段还验**评估侧可达**（`query_due_claims` 不抛）：入库侧一直是绿的、评估侧静默
+    断链，正是 2026-11-19 实测断链 16 天无人发现的盲区。
     """
     from app.agent.chain import claims as C
     from app.agent.chain.resolver import compute_deviation, verdict_by_rule
@@ -1216,10 +1222,22 @@ def test_26_accountability_v11():
     # ⑤ 端到端入库（有 DB 才验；无 DB 不影响主结论）
     try:
         from app.agent.chain.intake import record_decision
-        r_fin = record_decision(user_query=q_fin, answer=a_fin, session_id="smoke26")
-        r_weather = record_decision(user_query="今天北京天气怎么样",
-                                    answer="北京今天晴，气温 22 度，适宜出行。",
-                                    session_id="smoke26")
+        from datetime import date as _date
+        from app.utils.trading_calendar import current_data_day as _cdd
+        _exec_date = _date.fromisoformat(_cdd())
+        _prev_claim_llm = os.environ.get("QD_CLAIM_LLM")
+        os.environ["QD_CLAIM_LLM"] = "0"
+        try:
+            r_fin = record_decision(user_query=q_fin, answer=a_fin, session_id="smoke26",
+                                    exec_date=_exec_date)
+            r_weather = record_decision(user_query="今天北京天气怎么样",
+                                        answer="北京今天晴，气温 22 度，适宜出行。",
+                                        session_id="smoke26", exec_date=_exec_date)
+        finally:
+            if _prev_claim_llm is None:
+                os.environ.pop("QD_CLAIM_LLM", None)
+            else:
+                os.environ["QD_CLAIM_LLM"] = _prev_claim_llm
         if r_fin.get("reason", "").startswith("error"):
             print("  [SKIP] DB 不可用，跳过入库端到端断言")
         else:
@@ -1232,6 +1250,19 @@ def test_26_accountability_v11():
             check("不追责的**一行都没写库**",
                   not r_weather.get("tracked") and r_weather.get("decision_id") is None,
                   str(r_weather))
+            check("幅度已停用：含 % 的结论不再产 magnitude",
+                  not any(c.get("claim_type") == "magnitude" for c in C.extract_claims(
+                      "帮我分析 300236",
+                      "结论：预计短期上涨 5%，量能配合，回踩不破均线，多头排列完好，可继续观察。",
+                      "finance")), "")
+            _due_err = ""
+            try:
+                from app.agent.chain.account_store import query_due_claims as _qdc
+                _due_ok = isinstance(_qdc(limit=1), list)
+            except Exception as _e:
+                _due_ok = False
+                _due_err = "%s: %s" % (type(_e).__name__, _e)
+            check("评估侧可达：query_due_claims 正常返回", _due_ok, _due_err)
             _cleanup_accountability_rows()
     except Exception as e:
         print(f"  [SKIP] 入库端到端不可用: {type(e).__name__}")

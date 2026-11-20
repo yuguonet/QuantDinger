@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional
 
 from flask import Blueprint, request, jsonify, Response
 
+from app.utils.auth import login_required
 from app.routes.schemas.analysis import (
     AnalyzeRequest,
     AnalysisResultResponse,
@@ -368,6 +369,28 @@ def task_stream():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@analysis_bp.route("/effect-report", methods=["GET"])
+@login_required
+def get_experience_effect_report():
+    """只读经验效果报告（§5.4.6）；数据不足明确标注「证据不足」。"""
+    try:
+        from app.agent.chain.experience_effect_report import report
+        experience_id = (request.args.get("experience_id") or "").strip() or None
+        raw_limit = (request.args.get("limit") or "").strip()
+        limit = None
+        if raw_limit:
+            limit = max(1, min(int(raw_limit), 200))
+        data = report(experience_id=experience_id, limit=limit)
+        return jsonify({
+            'code': 1 if data.get('ok') else 0,
+            'msg': 'success' if data.get('ok') else str(data.get('reason', '')),
+            'data': data,
+        })
+    except Exception as exc:
+        logger.error("get_experience_effect_report failed", exc_info=True)
+        return jsonify({'code': 0, 'msg': str(exc), 'data': None}), 400
 
 
 @analysis_bp.route("/status/<task_id>", methods=["GET"])

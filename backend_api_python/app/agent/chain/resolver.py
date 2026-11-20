@@ -254,7 +254,11 @@ def compute_deviation(claim: Dict[str, Any], actual: Dict[str, Any]) -> Dict[str
 # ═══════════════════════════════════════════════════════════════
 def verdict_by_rule(claim: Dict[str, Any], actual: Dict[str, Any],
                     dev: Dict[str, Any]) -> Dict[str, Any]:
-    """用代码锚点出 verdict（**放宽版**：方向对即 hit，见模块头修正②）。"""
+    """用代码锚点出 verdict（**放宽版**：方向对即 hit，见模块头修正②）。
+
+    magnitude 分支保留但不在生产路径上：该维度 2026-11-19 起抽取与到期扫描双双停用
+    （`claims.DISABLED_CLAIM_TYPES`），此处只用于解读历史 resolution 与回归直测。
+    """
     ctype = claim.get("claim_type") or ""
 
     if ctype == "direction":

@@ -269,6 +269,8 @@ def _score_grounding(task: dict, answer: str, corpus: str = "") -> float:
 
 
 def _score_claims(task: dict, answer: str) -> float:
+    """claim 维度得分（0~100）。magnitude 已于 2026-11-19 停用，剩余维度按 80 分
+    归一化，保持各维度相对权重、与历史分数可比。"""
     try:
         from app.agent.chain.claims import extract_claims
         cs = extract_claims(task.get("query", ""), answer, "finance") or []
@@ -279,11 +281,10 @@ def _score_claims(task: dict, answer: str) -> float:
     types = {c.get("claim_type") for c in cs}
     s = 0.0
     s += 40.0 if "direction" in types else 0.0
-    s += 20.0 if "magnitude" in types else 0.0
     s += 20.0 if "level" in types else 0.0
     s += 10.0 if any(c.get("confidence") is not None for c in cs) else 0.0
     s += 10.0 if any(c.get("horizon") for c in cs) else 0.0
-    return round(s, 1)
+    return round(s / 80.0 * 100.0, 1)
 
 
 def _score_structure(task: dict, answer: str) -> float:

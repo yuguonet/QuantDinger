@@ -49,6 +49,56 @@ def _relevance(query: str, text: str) -> int:
 _BOUNDARY_CHARS = "\n。！？；"
 
 
+def _mask_excerpt(text: str) -> str:
+    """前端经验捕获：正文脱敏 + 定长截断（不落全文，避免复制技能/会话原文）。"""
+    from .utils.mask import mask_text
+    try:
+        limit = max(40, int(os.getenv("QD_CAPTURE_EXCERPT_CHARS", "240") or 240))
+    except (TypeError, ValueError):
+        limit = 240
+    return mask_text(str(text or ""))[:limit]
+
+
+def _pup_inject_block(entity_code: str) -> str:
+    """冻结基线当日 P(T+1涨) 注入块；env 关或取不到均返回空串。
+
+    概率源固定 `app.watchlist.predict`（C3P `p_base_of`），与任何 skill 解耦。
+    只认单标的（多标的会触发抽取器的 P() 全文唯一约束），且只补 T+1 标定档。
+    """
+    if (os.getenv("QD_INJECT_P_UP") or "").strip() not in ("1", "true", "True"):
+        return ""
+    code = str(entity_code or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return ""
+    try:
+        from .chain.c3p import p_base_of
+        p = p_base_of(code)
+    except Exception as e:
+        logger.debug("[p_up注入] 冻结基线取数失败(fail-open): %s", type(e).__name__)
+        return ""
+    if p is None or not (0.0 <= float(p) <= 1.0):
+        return ""
+    try:
+        from .chain.prediction_contract import CALIBRATED
+        src = CALIBRATED
+    except Exception:
+        src = "calibrated"
+    p_txt = "%.3f" % float(p)
+    return (
+        "[标定概率参考]\n"
+        "- %s 的 predict_nextday 次日上涨标定概率 P(T+1涨)=%s。\n"
+        "- 若对该标的给出 T+1 方向结论且为看多，在结论段原样写一次「P(T+1涨)=%s」；"
+        "口径=%s，基准=决策当日。看空/中性不写此值（p_up 是涨概率，不等价于看空把握）。"
+        % (code, p_txt, p_txt, src)
+    )
+
+
+def _capture_sha(text: str) -> str:
+    """前端经验捕获：对**脱敏前全文**算 hash —— 截断后的 hash 会随截断位漂移。"""
+    import hashlib
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:32]
+
+
 def _clip(text: str, limit: int) -> str:
     """按 limit 截断，但**落在句子/行边界**上，不盲切。
 
@@ -587,6 +637,10 @@ class QDAgentService:
         _t0 = _time.perf_counter()
         parts: list[str] = []
         blocks: list[dict] = []
+        # LLM 输入前端经验捕获（1118 P0-4）：与 parts 同步记「实际注入块」的
+        # 来源身份与正文，供 trace_prefetch 之后登记 candidate 经验。
+        # 只记 injected 的块，正文在落 report 前脱敏+截断（见尾部推导）。
+        capture_items: list[dict] = []
         # 执行型技能注入时卡片点名的工具（2026-10-14 解耦修复）：卡片让模型用
         # `run_skill` 派活，但 `run_skill` 是**按需工具**（QD_ON_DEMAND_TOOLS 默认
         # `actor,run_skill`），而预选看的是剥掉注入后的**用户原始问题**、看不到技能
@@ -602,6 +656,32 @@ class QDAgentService:
                 parts.append(_rb)
                 blocks.append({"kind": "resolve", "injected": True, "chars": len(_rb),
                                "reason": "已识别实体/领域"})
+        _dom = str((resolve_info or {}).get("domain") or "").strip().lower()
+        if not _dom:
+            try:
+                from .chain.claims import classify_domain as _cd
+                _dom = str(_cd(message) or "").strip().lower()
+            except Exception:
+                _dom = ""
+        if _dom == "finance" or (resolve_info or {}).get("entity_code"):
+            _pc = (
+                "[预测概率契约]\n"
+                "- 个股/指数的涨跌判断按 T+1 / T+3 / T+5 三档分别给方向，写成"
+                "「T+1看多(把握65%)」：周期在前、方向词居中、把握度括注在后；"
+                "某档无方向写中性/证据不足/未知，不附把握度。\n"
+                "- 把握度是你对该档结论的概率估计（0~100 整数），不是行情数字。\n"
+                "- 工具返回过 T+1 上涨概率时，在结论段原样写一次「P(T+1涨)=0.62」；"
+                "没给就不写，禁止自拟标定分。"
+            )
+            parts.append(_pc)
+            blocks.append({"kind": "prob_contract", "injected": True, "chars": len(_pc),
+                           "reason": "金融域预测类任务"})
+            _ec = str((resolve_info or {}).get("entity_code") or "").strip()
+            _pb = _pup_inject_block(_ec)
+            if _pb:
+                parts.append(_pb)
+                blocks.append({"kind": "p_up_ref", "injected": True, "chars": len(_pb),
+                               "reason": "冻结基线当日T+1标定概率(%s)" % _ec})
         # 时间/实体增强后的用户问题（2026-10-17 F2 返工）：解析器（TimeResolver 等）把
         # 相对日词**就地标注**进 effective_input（如「后天(2026-10-19)」）。必须把它作为
         # 模型看到的用户问题下发——否则模型只拿原始问句自算相对日 ⇒ 幻觉（run10 H1）。
@@ -630,6 +710,9 @@ class QDAgentService:
                     score = _relevance(message, block)
                     if score >= 2:
                         parts.append("[会话记忆近史]\n" + block)
+                        capture_items.append({"kind": "memory", "text": block,
+                                              "chars": len(block),
+                                              "source_ref": f"session:{session_id}"})
                     blocks.append({"kind": "memory", "injected": score >= 2,
                                    "chars": len(block), "relevance": score,
                                    "reason": "相关度达标" if score >= 2 else f"相关度 {score} < 2 闸门丢弃"})
@@ -693,10 +776,14 @@ class QDAgentService:
                         _route = ("" if _exec_spec is not None else
                                   "（按序执行：技能已给出⇒**先走技能流程**；"
                                   "取数工具已在工具面可**直调**，无需 search_resources）")
-                        parts.append(
+                        _ptr = (
                             f"[技能指针：{best}] 正文本会话已注入过；"
                             f"要完整正文用 read_skill(name=\"{best}\")，"
                             f"只看某小节用 read_skill(name=\"{best}\", heading=\"…\")。{_ptr_tail}{_route}")
+                        parts.append(_ptr)
+                        capture_items.append({"kind": "skill", "text": _ptr,
+                                              "chars": len(_ptr),
+                                              "source_ref": f"skill:{best}:pointer"})
                         hit = True
                     else:
                         # 2026-10-10 分叉：执行型技能不注方法论正文，只注分发卡片
@@ -705,6 +792,9 @@ class QDAgentService:
                         if _spec_exec is not None:
                             blk = _dispatch_card(best, _spec_exec)
                             parts.append(f"[技能分发卡片：{best}]\n{blk}")
+                            capture_items.append({"kind": "skill", "text": blk,
+                                                  "chars": len(blk),
+                                                  "source_ref": f"skill:{best}:dispatch"})
                             # 卡片第一行就让模型 run_skill 派活 ⇒ 必须让它在首轮工具面里，
                             # 否则模型要先 search_tools 发现（本次实测的额外一轮）。
                             force_tools.append("run_skill")
@@ -718,6 +808,9 @@ class QDAgentService:
                                     f"[相关技能：{best}]\n{blk}\n"
                                     f"（按序执行：技能已给出⇒**先走技能流程**；"
                                     f"取数工具已在工具面可**直调**，无需 search_resources）")
+                                capture_items.append({"kind": "skill", "text": blk,
+                                                      "chars": len(blk),
+                                                      "source_ref": f"skill:{best}:body"})
                                 seen.add(best)
                                 hit = True
                 _skill_resolved = best if hit else ""
@@ -754,6 +847,9 @@ class QDAgentService:
                             dropped += 1
                     if lines:
                         parts.append("[参考资料]\n" + "\n".join(lines))
+                        capture_items.append({"kind": "rag", "text": "\n".join(lines),
+                                              "chars": sum(len(x) for x in lines),
+                                              "source_ref": f"rag:top{len(docs)}"})
                     blocks.append({"kind": "rag", "injected": bool(lines),
                                    "chars": sum(len(x) for x in lines),
                                    "relevance": kept,
@@ -775,6 +871,9 @@ class QDAgentService:
                 _blk = _cm.format_case_injection(_cases)
                 if _blk:
                     parts.append(_blk)
+                    capture_items.append({"kind": "case", "text": _blk,
+                                          "chars": len(_blk),
+                                          "source_ref": f"case:n{len(_cases)}"})
                 blocks.append({"kind": "case", "injected": bool(_blk),
                                "chars": len(_blk), "relevance": len(_cases),
                                "reason": (f"命中 {len(_cases)} 条相似案例"
@@ -789,6 +888,21 @@ class QDAgentService:
             logger.debug("[prefetch] 案例注入失败（fail-open）: %s", e)
             blocks.append({"kind": "case", "injected": False, "chars": 0,
                            "reason": f"注入异常（fail-open）: {e}"})
+        _shadow_items: list = []
+        try:
+            from .chain import shadow_injection as _si
+            _shadow_items = _si.select_for_decision(
+                domain=_dom,
+                entity_code=str((resolve_info or {}).get("entity_code") or ""))
+            _sb = _si.inject_block(_shadow_items) if _shadow_items else ""
+        except Exception as e:
+            logger.debug("[prefetch] 经验影子注入跳过（fail-closed）: %s", e)
+            _shadow_items, _sb = [], ""
+        if _sb:
+            parts.append(_sb)
+            blocks.append({"kind": "experience_shadow", "injected": True,
+                           "chars": len(_sb),
+                           "reason": "shadow 对照注入（observe 态，不参与消费）"})
         report = {
             "blocks": blocks,
             "injected_kinds": [b["kind"] for b in blocks if b.get("injected")],
@@ -800,6 +914,15 @@ class QDAgentService:
             # F1（2026-10-17）：实际注入正文/卡片的技能名（"" = 未注入）⇒ service 按它
             # 补声明工具（`supplement_skill_declared`），消除"注入正文却无工具"悬空。
             "skill_resolved": _skill_resolved,
+            # P0-4（1118）：前端实际注入块的来源身份 + 脱敏摘要。
+            # 正文先 mask 再截断，不把技能全文/会话原文整段复制进 trace 与经验目录。
+            "capture_items": [
+                {**{k: v for k, v in c.items() if k != "text"},
+                 "text": _mask_excerpt(c.get("text") or ""),
+                 "content_sha": _capture_sha(c.get("text") or "")}
+                for c in capture_items
+            ],
+            "shadow_experiences": _shadow_items,
         }
         if not parts:
             return _user_q, report
@@ -921,6 +1044,88 @@ class QDAgentService:
                 agent.trace_prefetch(prefetch_report)   # 预取留痕（排查"为什么它会这么说"）
             except Exception as e:
                 logger.debug("[prefetch] 留痕失败（不影响主流程）: %s", e)
+            try:
+                from .chain import experience_capture as _ec
+                from .chain import evaluation_store as _evs2
+                _caps = (_ec.capture_from_report(prefetch_report,
+                                                 session_id=session_id)
+                         if _evs2.enabled() else [])
+            except Exception as e:
+                logger.debug("[experience-capture] 前端捕获跳过(fail-open): %s: %s",
+                             type(e).__name__, e)
+                _caps = []
+            try:
+                from .chain import evaluation_store as _evs
+                if _evs.enabled():
+                    _reason = {}
+                    for _b in (prefetch_report.get("blocks") or []):
+                        _k = str(_b.get("kind") or "")
+                        if _b.get("injected") and _k and _k not in _reason:
+                            _reason[_k] = str(_b.get("reason") or "")[:120]
+                    _cap_kinds = [str(c.get("kind") or "")
+                                  for c in (prefetch_report.get("capture_items") or [])
+                                  if isinstance(c, dict)
+                                  and str(c.get("kind") or "") in
+                                  ("skill", "memory", "rag", "case")]
+                    _items = []
+                    for _i, c in enumerate(_caps):
+                        _k = _cap_kinds[_i] if _i < len(_cap_kinds) else ""
+                        _items.append({
+                            "kind": str(c.get("source_kind") or ""),
+                            "injected": True,
+                            "chars": int((c.get("normalized_content") or {}).get(
+                                "chars") or 0),
+                            "position": _i,
+                            "experience_id": str(c.get("experience_id") or ""),
+                            "content_sha": str(c.get("content_sha") or ""),
+                            "source_ref": str(c.get("source_ref") or ""),
+                            "reason": _reason.get(_k, "")})
+                    _shadow = [x for x in (prefetch_report.get("shadow_experiences")
+                                           or []) if isinstance(x, dict)
+                               and x.get("experience_id")]
+                    for _j, x in enumerate(_shadow):
+                        _items.append({
+                            "kind": "experience_shadow",
+                            "injected": True,
+                            "chars": int(x.get("chars") or 0),
+                            "position": len(_items),
+                            "experience_id": str(x.get("experience_id") or ""),
+                            "content_sha": str(x.get("content_sha") or ""),
+                            "source_ref": str(x.get("source_ref") or ""),
+                            "reason": "shadow 对照注入"})
+                    _bundle_id = _uuid.uuid4().hex
+                    _bundle_sha = _evs.fingerprint("|".join(sorted(
+                        str(c.get("content_sha") or "") for c in _caps)
+                        + sorted(str(x.get("content_sha") or "")
+                                 for x in _shadow)))
+                    _evs.record_exposure(
+                        request_id=_uuid.uuid4().hex, session_id=session_id,
+                        subject="", subject_kind="",
+                        prompt_sha=_evs.fingerprint(task),
+                        model_name=str(getattr(agent, "model", "") or ""),
+                        skill_id=str(prefetch_report.get("skill_resolved") or ""),
+                        exposure_stage="injected",
+                        experience_ids=[str(c.get("experience_id") or "")
+                                        for c in _caps if c.get("experience_id")]
+                                        + [str(x.get("experience_id") or "")
+                                           for x in _shadow],
+                        exposure_items=_items,
+                        bundle_id=_bundle_id,
+                        bundle_sha=_bundle_sha,
+                        position=0,
+                        token_budget=int(prefetch_report.get("chars_total") or 0),
+                        domain="")
+            except Exception as e:
+                logger.debug("[eval-store] 曝光事件跳过(fail-open): %s: %s",
+                             type(e).__name__, e)
+            try:
+                from .chain import evaluation_store as _evs2
+                if _evs2.enabled():
+                    for _cand in _caps:
+                        _evs2.register_experience(**_cand)
+            except Exception as e:
+                logger.debug("[experience-capture] 前端经验登记跳过(fail-open): %s: %s",
+                             type(e).__name__, e)
             # ★ 技能卡片 ↔ 工具激活解耦（2026-10-14）：prefetch 注入执行型技能时卡片
             #   点名 run_skill，它却是按需工具 ⇒ 交给 agent 在预选后激活（见 qd_agent._run_inner）。
             #   挂在 agent 上（同 last_user_query 范式），run 后由 _run_inner 清空防跨轮残留。

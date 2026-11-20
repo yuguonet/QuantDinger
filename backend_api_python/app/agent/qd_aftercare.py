@@ -495,6 +495,20 @@ class AftercareMixin:
         self.last_accountability: dict = {}
         try:
             from .chain.intake import record_decision
+            try:
+                from datetime import date as _d
+                from app.utils.trading_calendar import current_data_day as _cdd
+                _exec_date = _d.fromisoformat(_cdd())
+            except Exception:
+                _exec_date = None
+            _snap_ctx = None
+            try:
+                from .chain import evaluation_store as _evs
+                if _evs.enabled():
+                    _snap_ctx = _evs.latest_exposure_for_session(
+                        str(getattr(collector, "session_id", "") or ""))
+            except Exception as _e:
+                logger.debug("[snapshot_context] 曝光上下文跳过: %s", _e)
             self.last_accountability = record_decision(
                 user_query=str(getattr(collector, "user_query", "") or ""),
                 answer=answer,
@@ -505,9 +519,22 @@ class AftercareMixin:
                 total_tokens=int(getattr(stats, "total_tokens", 0) or 0),
                 latency_ms=int(getattr(getattr(collector, "_root", None),
                                        "elapsed_ms", 0) or 0),
+                exec_date=_exec_date,
+                snapshot_context=_snap_ctx,
             )
         except Exception as e:
             logger.debug("[accountability] 入库跳过(fail-open): %s: %s",
+                         type(e).__name__, e)
+        try:
+            _dec = (self.last_accountability or {}).get("decision_id")
+            if _dec:
+                from .chain import evaluation_store as _evs
+                if _evs.enabled():
+                    _evs.backfill_decision_by_session(
+                        session_id=str(getattr(collector, "session_id", "") or ""),
+                        decision_id=int(_dec))
+        except Exception as e:
+            logger.debug("[eval-store] decision_id 回填跳过(fail-open): %s: %s",
                          type(e).__name__, e)
 
         # ★ 阶段4（2026-10-19，影子）：技能选择事件回填 trace root + 执行状态。

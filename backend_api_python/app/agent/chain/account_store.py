@@ -198,7 +198,13 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
 
     重试节流：同一 claim 两次尝试间隔 `QD_CLAIM_RETRY_HOURS`（默认 6 小时），
     避免盘后 worker 每小时重复撞同一批尚未就绪的数据。
+
+    ★ 已停用维度不送评估：`claims.DISABLED_CLAIM_TYPES`（当前含 magnitude）在
+      SQL 层排除。停用只针对「新增」是不够的——存量 pending 若继续被判，错误
+      verdict 仍会进统计、还白占 worker 与行情取数。
     """
+    from .claims import DISABLED_CLAIM_TYPES
+
     day = as_of or date.today()
     try:
         with _conn() as conn:
@@ -216,19 +222,21 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
                 " FROM qd_agent_claims c"
                 " JOIN qd_agent_decisions d ON d.id = c.decision_id"
                 " WHERE c.status = 'pending'"
+                "   AND c.claim_type <> ALL(%s)"
                 "   AND (c.due_date IS NULL OR c.due_date <= %s)"
                 "   AND (c.last_attempt_at IS NULL"
                 "        OR c.last_attempt_at <= now() - make_interval(hours => %s))"
                 " ORDER BY c.due_date NULLS LAST, c.id"
                 " LIMIT %s",
-                (day, _retry_hours(), int(limit)))
+                (sorted(DISABLED_CLAIM_TYPES), day, _retry_hours(), int(limit)))
             rows = [dict(r) for r in (cur.fetchall() or [])]
     except Exception as e:
         logger.warning("[AccountStore] 查询到期 claim 失败: %s", e)
         return []
 
     # ── 视界门①（时间门）：按交易日历校验「第 N 个交易日是否已走完」
-    from .claims import _HORIZON_DAYS, _nth_trading_day
+    from .claims import _HORIZON_DAYS
+    from app.utils.trading_calendar import nth_trading_day as _nth_trading_day
     ready: List[Dict[str, Any]] = []
     for r in rows:
         days = _HORIZON_DAYS.get(r.get("horizon") or "")
@@ -236,8 +244,12 @@ def query_due_claims(limit: int = 50, as_of: Optional[date] = None) -> List[Dict
         if not days or ed is None:
             ready.append(r)          # 视界未知 ⇒ 不阻挠（保持旧行为）
             continue
-        # 数据可用日 = exec 之后第 N 个交易日；取不到（日历未覆盖）⇒ 不阻挠
-        due_td = _nth_trading_day(ed, days)
+        # 数据可用日 = exec 之后第 N 个交易日；取不到（日历未覆盖/加载失败）⇒ 不阻挠
+        try:
+            due_td = _nth_trading_day(ed, days)
+        except Exception as e:
+            logger.warning("[AccountStore] 交易日历不可用，本轮放行: %s", e)
+            due_td = None
         if due_td is None or due_td <= day:
             ready.append(r)
         # else: 交易日未走完 ⇒ 本轮跳过（不计失败）
@@ -293,7 +305,21 @@ def save_resolution(*, claim_id: int, actual: Dict[str, Any],
             row = cur.fetchone()
             _advance_claim_status(cur, int(claim_id), verdict, attribution)
             conn.commit()
-            return int(row["id"]) if row else None
+            res_id = int(row["id"]) if row else None
+            if res_id:
+                try:
+                    from . import evaluation_store as _es
+                    if _es.enabled():
+                        _es.sync_outcome_from_resolution(
+                            claim_id=int(claim_id), resolution_id=res_id,
+                            verdict=verdict, verdict_score=verdict_score,
+                            actual=actual, actual_as_of=actual_as_of,
+                            resolved_at=None, resolver_ver=resolver_ver,
+                            data_source=data_source)
+                except Exception as e:
+                    logger.debug("[eval-store] resolution→outcome 跳过(fail-open): %s: %s",
+                                 type(e).__name__, e)
+            return res_id
     except Exception as e:
         logger.warning("[AccountStore] 写 resolution 失败(忽略): %s: %s",
                        type(e).__name__, e)

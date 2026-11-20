@@ -1063,7 +1063,7 @@ import { ACCESS_TOKEN } from '@/store/mutation-types'
 import { baseMixin } from '@/store/app-mixin'
 import request from '@/utils/request'
 import { getUserInfo } from '@/api/login'
-import { readUserPrefs, writeUserPrefs } from '@/utils/uiPrefs'
+import { readPrefs, writePrefs, readUserPrefs, writeUserPrefs, clearUserPrefs } from '@/utils/uiPrefs'
 import { getWatchlist, addWatchlist, searchSymbols } from '@/api/market'
 import KlineChart from '@/views/indicator-analysis/components/KlineChart.vue'
 import BacktestHistoryDrawer from '@/views/indicator-analysis/components/BacktestHistoryDrawer.vue'
@@ -1667,11 +1667,17 @@ export default {
     }
   },
   async created () {
+    // 恢复完成前禁止持久化：created 里的若干 await（后端重启时会变慢）期间，
+    // 各 watch（activeIndicators/timeframe/symbol/...）可能先触发 schedulePersist，
+    // 250ms 后把「默认空状态」写进去，覆盖掉尚未读出的已保存快照 —— 这正是
+    // 「重启后 IDE 设置/fx 开关/柱数全部丢失」的根因。
+    this._ideUiRestored = false
     await this.loadUserId()
     this.loadPurchasedMarketHintDismissed()
     await this.loadIndicators()
     await this.loadWatchlist()
     this.restoreIdeUiState()
+    this._ideUiRestored = true
     this.autoSelectFirstIndicator()
   },
   mounted () {
@@ -1786,19 +1792,31 @@ export default {
     },
 
     restoreIdeUiState () {
-      if (!this.userId) return
+      // 设备域与账号无关：后端重启/未登录/取用户信息失败时也要能恢复界面状态
       try {
         if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
-        let s = readUserPrefs('ide-ui')
+        // ★ 设备域读（qd.ui.v1.<clientId>.ide-ui）：与登录态/后端重启解耦，长效第一。
+        //   IDE 工作状态属于「界面偏好」（市场/标的/周期/图内指标/面板宽度/图表显示开关），
+        //   用账号私有域时，登出/401/USER_INFO 暂缺都会让读写落到不同 key 或直接被拒。
+        let s = readPrefs('ide-ui')
         if (!s || typeof s !== 'object' || Object.keys(s).length === 0) {
-          // 旧版自构造 key 一次性迁移: 命中即提升到账号私有域并删旧键
+          // 一次性迁移：账号私有域(旧方案) → 设备域
+          const legacy = readUserPrefs('ide-ui')
+          if (legacy && typeof legacy === 'object' && Object.keys(legacy).length > 0) {
+            writePrefs('ide-ui', legacy, false)
+            clearUserPrefs('ide-ui')
+            s = readPrefs('ide-ui')
+          }
+        }
+        if (!s || typeof s !== 'object' || Object.keys(s).length === 0) {
+          // 更老的自构造 key 迁移: 命中即提升到设备域并删旧键
           const raw = storage.get(ideUiCacheStorageKey(this.userId))
           if (raw != null && raw !== '') {
             const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
             if (parsed && typeof parsed === 'object') {
-              writeUserPrefs('ide-ui', parsed, false)
+              writePrefs('ide-ui', parsed, false)
               storage.remove(ideUiCacheStorageKey(this.userId))
-              s = readUserPrefs('ide-ui')
+              s = readPrefs('ide-ui')
             }
           }
         }
@@ -1868,7 +1886,8 @@ export default {
     },
 
     persistIdeUiState () {
-      if (!this.userId) return
+      // 恢复完成前不写：否则会用默认空状态覆盖已保存的快照（详见 created 注释）
+      if (!this._ideUiRestored) return
       try {
         // 持久化前把当前图内指标写回「当前 timeframe 对应桶」，保证两桶均为最新
         if (!this.indicatorBuckets) this.indicatorBuckets = { minute: [], candle: [] }
@@ -1894,8 +1913,8 @@ export default {
           // 左侧自选股面板宽度 (百分比, 拖拽手柄调整)
           leftPanelPct: this.leftPanelWidthPct
         }
-        // 账号私有域 (ide-ui 模块): 整体替换快照, 不 merge (payload 即完整状态)
-        writeUserPrefs('ide-ui', payload, false)
+        // 设备域 (ide-ui 模块): 整体替换快照, 不 merge (payload 即完整状态)
+        writePrefs('ide-ui', payload, false)
       } catch (_) { /* ignore quota */ }
     },
     normalizePersistedChartIndicators (items) {

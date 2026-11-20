@@ -7,6 +7,7 @@ market_cn 数据刷新调度器 v4 — 全 fire-and-forget
 调度线程每 10 秒检查一次，到期的任务拉新线程执行。
 """
 
+import os
 import threading
 import logging
 import time as _time
@@ -17,6 +18,72 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
+
+_KLINE_COVERAGE_DEFAULT = 0.90
+_KLINE_COVERAGE_ROUNDS = 4
+_KLINE_RETRY_DEFAULT_SEC = 300
+_KLINE_OBSERVE_ROUNDS_DEFAULT = 2
+
+
+def _kline_retry_sec() -> int:
+    """K线缺口补拉的轮间冷却秒数（QD_KLINE_RETRY_SEC，默认 300=5min）。"""
+    try:
+        raw = int(os.getenv("QD_KLINE_RETRY_SEC", "") or _KLINE_RETRY_DEFAULT_SEC)
+    except (TypeError, ValueError):
+        return _KLINE_RETRY_DEFAULT_SEC
+    return raw if raw > 0 else _KLINE_RETRY_DEFAULT_SEC
+
+
+def _kline_observe_rounds() -> int:
+    """严格观察「新增0」的轮数（QD_KLINE_OBSERVE_ROUNDS，默认 2）。
+
+    观察期内要求上一轮补拉新增 0 才判齐；过了观察期，剩余缺口是远端
+    常态拉不到的停牌/退市票，覆盖率达标即放行。env 非法或 <0 回退默认。
+    """
+    try:
+        raw = int(os.getenv("QD_KLINE_OBSERVE_ROUNDS", "") or _KLINE_OBSERVE_ROUNDS_DEFAULT)
+    except (TypeError, ValueError):
+        return _KLINE_OBSERVE_ROUNDS_DEFAULT
+    return raw if raw >= 0 else _KLINE_OBSERVE_ROUNDS_DEFAULT
+
+
+def _kline_coverage_min() -> float:
+    """1D/1m 覆盖率达标线（QD_KLINE_COVERAGE_MIN，默认 0.90）。
+
+    停牌/退市票当日无 bar 属常态；不可能也不要求全齐。env 非法或越界
+    (<=0 / >1) 一律回退默认，不让配置错误把盘后批卡死。
+    """
+    try:
+        raw = float(os.getenv("QD_KLINE_COVERAGE_MIN", "") or _KLINE_COVERAGE_DEFAULT)
+    except (TypeError, ValueError):
+        return _KLINE_COVERAGE_DEFAULT
+    return raw if 0.0 < raw <= 1.0 else _KLINE_COVERAGE_DEFAULT
+
+
+def _kline_coverage_ok(have_1d: int, have_1m: int, total: int) -> bool:
+    """目标交易日 1D+1m 覆盖率是否双达标（单一判据，两处消费）。"""
+    if total <= 0:
+        return False
+    min_ratio = _kline_coverage_min()
+    return have_1d >= total * min_ratio and have_1m >= total * min_ratio
+
+
+def _kline_settled(have_1d: int, have_1m: int, total: int,
+                   last_added: int, attempt: int = 0) -> bool:
+    """到位判据：覆盖率达标 AND（已过观察期 OR 上一轮补拉新增 0）。
+
+    观察期（前 N 轮，QD_KLINE_OBSERVE_ROUNDS）内严格按「新增0」确认远端
+    无缺口可补；观察期后缺口只剩远端常态拉不到的停牌/退市票，它们零星
+    吐数使新增恒不为 0，覆盖率达标即放行。attempt=0 表示不启用观察期豁免
+    （外部只读调用走纯严格判据）。`status=error` 是部分标的失败，只要
+    written 如实计入即可，不否决收敛。首轮 last_added=-1 不判齐。
+    """
+    if not _kline_coverage_ok(have_1d, have_1m, total):
+        return False
+    if attempt > _kline_observe_rounds():
+        return True
+    return last_added == 0
+
 
 _emotion_last_ts = 0.0
 _EMOTION_MIN_INTERVAL = 1800
@@ -455,7 +522,7 @@ def _post_market_batch():
     _refresh_backfill_1m()
 
     # K线补拉闭环（1D+1m 同判据）：增量缺口回填（run_1d/run_1m 只拉缺失标的），
-    # 未齐则 10min 一轮补拉到位。覆盖率判据 = trading_calendar 目标日 +
+    # 未收敛则按 QD_KLINE_RETRY_SEC（默认 5min）一轮补拉到位。覆盖率判据 = trading_calendar 目标日 +
     # 库内 distinct symbol（stock_kline_coverage）；2026-10-27 报障「1D 只有
     # 1504/5223 且无人补拉」即缺这层闭环 —— 之前跑一次就走、失败也标完成。
     from app.data_sources.cn_stock_putdb import (
@@ -466,35 +533,56 @@ def _post_market_batch():
         logger.info("[post_market] 1D 写入 %d 条", result_1d["written"])
     else:
         logger.info("[post_market] 1D 无新数据 (skipped=%s)", result_1d.get("skipped"))
+    # 判据 = 覆盖率达标 AND（过观察期 OR 本轮补拉新增 0）。
+    # 前 QD_KLINE_OBSERVE_ROUNDS 轮严格看「新增0」防远端陆续吐数时提前放行；
+    # 之后缺口只剩远端拉不到的停牌/退市票，新增恒不为 0，覆盖率达标即放行。
+    # status=error 只记 warning（部分标的失败），不否决 written 的实际新增。
     kline_complete = False
-    for attempt in range(1, 4):
+    last_added = -1
+    for attempt in range(1, _KLINE_COVERAGE_ROUNDS + 1):
         have_1d, total = stock_kline_coverage("1D")
         have_1m, _ = stock_kline_coverage("1m")
-        # 停牌/退市边缘票当日无 bar 属常态 ⇒ 95% 即视为到位
-        # （2026-10-27 用户裁定：1m=5215/5234 就算完成，缺口只重试 3 轮）
-        d1_ok = total > 0 and (have_1d == total or have_1d / total >= 0.95)
-        m1_ok = total > 0 and (have_1m == total or have_1m / total >= 0.95)
-        kline_complete = d1_ok and m1_ok
-        if kline_complete:
-            logger.info("[post_market] K线到位 1D=%d 1m=%d /%d", have_1d, have_1m, total)
+        cov_ok = _kline_coverage_ok(have_1d, have_1m, total)
+        if _kline_settled(have_1d, have_1m, total, last_added, attempt=attempt):
+            kline_complete = True
+            logger.info("[post_market] K线到位且收敛 1D=%d 1m=%d /%d "
+                        "(覆盖率 %.0f%%, 第 %d 轮, 上轮新增 %d)",
+                        have_1d, have_1m, total, _kline_coverage_min() * 100,
+                        attempt, last_added)
             break
-        logger.warning("[post_market] K线未齐 1D=%d 1m=%d /%d，10min 后补拉缺口 (attempt %d)",
-                       have_1d, have_1m, total, attempt)
-        _time.sleep(600)
-        if not d1_ok:
-            r = run_1d(force=True)          # 缺口补拉：旁路防重守卫，只拉缺失标的
-            if r.get("written", 0) > 0:
-                logger.info("[post_market] 1D 补拉写入 %d 条", r["written"])
-        if not m1_ok:
-            r = run_1m(force=True)
-            if r.get("written", 0) > 0:
-                logger.info("[post_market] 1m 补拉写入 %d 条", r["written"])
+        logger.warning("[post_market] K线未收敛 1D=%d 1m=%d /%d "
+                       "(覆盖率%s, 上轮新增 %s)，%dmin 后补拉缺口 (attempt %d)",
+                       have_1d, have_1m, total,
+                       "达标" if cov_ok else "未达标", last_added,
+                       _kline_retry_sec() // 60, attempt)
+        _time.sleep(_kline_retry_sec())
+        # 每轮无条件补拉两类缺口：1D/1m 各自独立看收敛，不能因一类达标就停另一类。
+        added = 0
+        for tf, fn in (("1D", run_1d), ("1m", run_1m)):
+            r = fn(force=True)          # 缺口补拉：旁路防重守卫，只拉缺失标的
+            n = int(r.get("written", 0) or 0)
+            added += n
+            if r.get("status") != "ok":
+                logger.warning("[post_market] %s 补拉部分失败(status=%s, written=%d)，"
+                               "按实际新增计入收敛判据", tf, r.get("status"), n)
+            if n > 0:
+                logger.info("[post_market] %s 补拉写入 %d 条", tf, n)
+        last_added = added
+    if not kline_complete:
+        have_1d, total = stock_kline_coverage("1D")
+        have_1m, _ = stock_kline_coverage("1m")
+        kline_complete = _kline_settled(have_1d, have_1m, total, last_added,
+                                        attempt=_KLINE_COVERAGE_ROUNDS)
+        if kline_complete:
+            logger.info("[post_market] 末轮补拉后到位且收敛 1D=%d 1m=%d /%d",
+                        have_1d, have_1m, total)
     if kline_complete:
         _mark_event("daily_1d", target)
         _mark_event("minute_1m", target)
     else:
-        logger.error("[post_market] K线 3 轮后仍未齐（停牌容差 95%%），"
-                     "daily_1d/minute_1m 不标记完成")
+        logger.error("[post_market] K线 3 轮后仍未齐（覆盖率门槛 %.0f%%），"
+                     "daily_1d/minute_1m 不标记完成",
+                     _kline_coverage_min() * 100)
 
     # ── 中段任务（不挡 K线补拉）──
     # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
@@ -840,15 +928,12 @@ def _worker(task: Task, slot=None):
 
 
 def _kline_day_complete() -> bool:
-    """1D+1m 目标日是否齐（95% 停牌容差）。查库失败 ⇒ False（保守补跑）。"""
+    """1D+1m 目标日是否到位（覆盖率单一判据）。查库失败 ⇒ False（保守补跑）。"""
     try:
         from app.data_sources.cn_stock_putdb import stock_kline_coverage
         have_1d, total = stock_kline_coverage("1D")
         have_1m, _ = stock_kline_coverage("1m")
-        if total <= 0:
-            return False
-        return ((have_1d == total or have_1d / total >= 0.95)
-                and (have_1m == total or have_1m / total >= 0.95))
+        return _kline_coverage_ok(have_1d, have_1m, total)
     except Exception:
         return False
 

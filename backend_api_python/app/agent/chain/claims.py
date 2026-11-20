@@ -17,6 +17,15 @@
   ③ **多域通用留位**——域由 `DOMAIN_POLICY` 配置驱动，**禁止**在调用方写
      `if domain == 'finance'`；v1 只启用 finance，其余域翻开关即可（不加字段）。
 
+【已停用的维度（2026-11-19 用户裁定）】
+  magnitude（幅度）**彻底停用**。历史 564 条（占全部 claim 36%）抽样 18 条全为
+  噪音——资金净占比、当日涨幅、筹码套牢比例、区间分位、炸板率都被正则当成「预测
+  幅度」，回评必错。停用同时覆盖两侧：`extract_claims` 不再产（`_add` 按
+  `DISABLED_CLAIM_TYPES` 兜底拦截）；`account_store.query_due_claims` 不再把存量
+  pending 的 magnitude 送评估，免得错误 verdict 继续进统计。`resolver` 的 magnitude
+  分支保留，用于解读历史 resolution、以及将来若重新启用。
+  由此 v1 实际只抽两类：direction / level。
+
 【不变量】
   · `extract_claims` 返回的每条 claim 必须有可解析的 subject —— 抽不出标的的
     direction claim **不产出**（没有 subject 就取不到真实数据 ⇒ 必然 unresolvable）。
@@ -33,6 +42,7 @@ from . import label_spec
 
 GATE_VER = "v1.1"
 EXTRACTOR_VER = "v1.1"
+DISABLED_CLAIM_TYPES = frozenset({"magnitude"})
 
 # ── 域判定：只分领域，不分类别（P1）─────────────────────────────────
 # 粗粒度关键词；命中多域时按命中数计分，finance 与 data 冲突时 finance 优先
@@ -65,17 +75,62 @@ _VERIFIABLE_RE = re.compile(
     r"[+-]?\d+(?:\.\d+)?\s*%|涨\d|跌\d|"
     r"强于|弱于|优于|跑赢|跑输)", re.I)
 
-# 幅度：±X% / 涨X% / 跌X% / 涨幅 X%
-_MAGNITUDE_RE = re.compile(
-    r"(?:涨|跌|上涨|下跌|涨幅|跌幅|振幅)?\s*[约至]?\s*([+-]?\d+(?:\.\d+)?)\s*%")
-_MAG_SIGN_RE = re.compile(r"(跌|下跌|跌幅|回落|回调|下探|走弱|看空|看跌|偏空)")
-
 # 点位：目标价/目标位/支撑/压力/止损/不跌破/站稳 X(.XX)
 # ★ 2026-10-23：加「止损|跌破|跌穿」——选股结论的「止损价」是 level claim 主来源
 #   （「走坏了能不能全身而退」必须可被 T+N 追责），旧表漏掉止损词 ⇒ 止损位永远抽不到。
 _LEVEL_RE = re.compile(
     r"(目标价|目标位|支撑|支撑位|压力|压力位|止损|止损位|不跌破|跌破|跌穿|站稳|突破|站上)\s*"
     r"(?:在)?\s*(\d+(?:\.\d+)?)")
+
+# ── 概率契约（2026-11-19）：claim 携带与 horizon 对应的概率 ─────────
+# 两个来源严格分开（勿合并，对应 1118 §5.4.2 / stock-analyzer 两置信度字段纪律）：
+#   heuristic_confidence — 方向词后的把握括注「(把握58%)」，取自 stock-analyzer
+#     的结构化把握度（档位上限×evidence×一致度），不是标定概率，不进 Brier；
+#   calibrated — 「P(T+1涨)=0.62」，predict_nextday 标定分，唯一进 Brier 的源。
+# 抽不到一律 None（同 confidence：绝不填 0.5）。
+_PNOTE = (r"(?:[（(]\s*(?:把握|置信度?|概率)\s*[约]?\s*\d{1,3}\s*%\s*[）)])?")
+_PNOTE_RE = re.compile(
+    r"[（(]\s*(?:把握|置信度?|概率)\s*[约]?\s*(\d{1,3})\s*%\s*[）)]")
+_PUP_RE = re.compile(
+    r"P\s*[（(]\s*T\s*\+\s*(\d{1,2})\s*涨\s*[）)]\s*[=:：]\s*"
+    r"(0?\.\d{1,3}|\d{1,3}\s*%)", re.I)
+
+
+def _split_cell(cell: str) -> Tuple[str, Optional[float]]:
+    """「看空(把握58%)」→ («看空», 0.58)；「看多」→ («看多», None)。"""
+    s = (cell or "").strip()
+    m = _PNOTE_RE.search(s)
+    if not m:
+        return s, None
+    try:
+        pct = int(m.group(1)) / 100.0
+    except (TypeError, ValueError):
+        return s[:m.start()].strip(), None
+    return s[:m.start()].strip(), (pct if 0.0 <= pct <= 1.0 else None)
+
+
+def _pup_values(text: str) -> List[Tuple[str, float]]:
+    """全文抽 P(T+N涨)= 标定概率，[("T+1", 0.62), ...]（只认「涨」目标）。"""
+    out: List[Tuple[str, float]] = []
+    for m in _PUP_RE.finditer(text or ""):
+        raw = (m.group(2) or "").strip()
+        try:
+            v = (float(raw[:-1]) / 100.0) if raw.endswith("%") else float(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= v <= 1.0:
+            out.append(("T+%s" % m.group(1), v))
+    return out
+
+
+def strip_prob_annotations(text: str) -> str:
+    """剥掉概率标注（「(把握65%)」与「P(T+1涨)=0.62」），供置信度/方向抽取用。
+
+    两类标注里的百分数与小数都是**概率**，不是置信度、也不是预测幅度；不剥离会让
+    `guess_confidence` 把概率当置信度、让概率数字混进方向判断的依据文本。
+    """
+    t = _PUP_RE.sub(" ", text or "")
+    return _PNOTE_RE.sub(" ", t)
 
 # ── 多周期方向（2026-10-23）─────────────────────────────────────────
 # 【为什么】经验库/label_spec 本来就支持 T+1/T+3/T+5，但 extract_claims 原先
@@ -85,19 +140,20 @@ _LEVEL_RE = re.compile(
 # 【周期上限】用户裁定：筛选封顶 **T+20 ≈ 1M**；T+10/T+20 同 2W/1M 天数。
 _HORIZON_DIR_RE = re.compile(
     r"T\s*\+?\s*(10|20|1|3|5)\s*[）)】\]]?\s*[：:，,、\s]*"
-    r"(看多|看涨|偏多|做多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)", re.I)
-# 表头「T+1/T+3/T+5(/T+10/T+20)」+ 单元格同序映射
+    r"(看多|看涨|偏多|做多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
+    + _PNOTE, re.I)
+# 表头「T+1/T+3/T+5(/T+10/T+20)」+ 单元格同序映射；单元格允许方向词后带把握括注
+#（组=「方向词+可选括注」整体，组数与旧版一致，括注用 _split_cell 二次解析）
+_CELL_W = r"((?:看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)" + _PNOTE + r")"
 _TN_HEADER_RE = re.compile(
     r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5", re.I)
 _TN_HEADER5_RE = re.compile(
     r"T\s*\+?\s*1\s*[/／|]\s*T\s*\+?\s*3\s*[/／|]\s*T\s*\+?\s*5\s*[/／|]\s*"
     r"T\s*\+?\s*10\s*[/／|]\s*T\s*\+?\s*20", re.I)
 _TN_CELL_RE = re.compile(
-    r"(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
-    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
-    r"\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知)"
-    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知))?"
-    r"(?:\s*[/／|]\s*(看多|看涨|偏多|看空|看跌|偏空|中性|震荡|回避|不适用|未知))?",
+    _CELL_W + r"\s*[/／|]\s*" + _CELL_W + r"\s*[/／|]\s*" + _CELL_W
+    + r"(?:\s*[/／|]\s*" + _CELL_W + r")?"
+    + r"(?:\s*[/／|]\s*" + _CELL_W + r")?",
     re.I)
 
 _DIR_MAP = {
@@ -111,18 +167,19 @@ def _map_dir(word: str) -> Optional[str]:
     return _DIR_MAP.get(str(word or "").strip())
 
 
-def extract_horizon_directions(text: str) -> List[Tuple[str, str]]:
-    """从结论抽「周期 → 方向」多档（宁漏不脏：认不出的词跳过）。
+def extract_horizon_directions(text: str) -> List[Tuple[str, str, Optional[float]]]:
+    """从结论抽「周期 → 方向 → 把握度」多档（宁漏不脏：认不出的词跳过）。
 
     支持两种写法：
-      1. `T+1看多 / T+3中性 / T+5看空 / T+10… / T+20…`（封顶 T+20≈1M）
-      2. 表格 `T+1/T+3/T+5[/T+10/T+20]` 列 + 单元格同序
+      1. `T+1看多(把握65%) / T+3中性 / T+5看空(把握58%)`（封顶 T+20≈1M）
+      2. 表格 `T+1/T+3/T+5[/T+10/T+20]` 列 + 单元格同序（单元格可带把握括注）
     Returns:
-        [("T+1","bullish"), ("T+3","neutral"), ...]  不去重顺序保留；中性不产出
-        （neutral 和未知不产方向 claim，未知仅占位、不影响其他周期）。
+        [("T+1","bullish",0.65), ("T+3","neutral",None), ...]  顺序保留不去重；
+        中性/未知不产方向 claim（未知仅占位）；把握度是 heuristic_confidence
+        （非标定概率，不进 Brier），抽不到为 None。
     """
     t = text or ""
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str, Optional[float]]] = []
     seen = set()
     for m in _HORIZON_DIR_RE.finditer(t):
         lab = "T+%s" % m.group(1)
@@ -132,7 +189,8 @@ def extract_horizon_directions(text: str) -> List[Tuple[str, str]]:
         key = (lab, d)
         if key not in seen:
             seen.add(key)
-            out.append(key)
+            _, pct = _split_cell(m.group(0))
+            out.append((lab, d, pct))
     # 表头 + 同行三档/五档单元格
     if not out and (_TN_HEADER5_RE.search(t) or _TN_HEADER_RE.search(t)):
         labs5 = bool(_TN_HEADER5_RE.search(t))
@@ -142,13 +200,13 @@ def extract_horizon_directions(text: str) -> List[Tuple[str, str]]:
             for i, lab in enumerate(names):
                 if i + 1 > (m.lastindex or 0):
                     break
-                d = _map_dir(m.group(i + 1))
+                d = _map_dir(_split_cell(m.group(i + 1) or "")[0])
                 if not d or d == "neutral":
                     continue
                 key = (lab, d)
                 if key not in seen:
                     seen.add(key)
-                    out.append(key)
+                    out.append((lab, d, _split_cell(m.group(i + 1) or "")[1]))
             break   # 只认第一行（宁漏不脏）
     return out
 
@@ -346,6 +404,11 @@ def due_date_of(horizon: str, exec_date: Optional[date] = None) -> Optional[date
 
     交易日历是唯一日期口径。若日历不可用或覆盖不足，则显式报告，
     不以自然日估算替代交易日计算。
+
+    `exec_date` 是**该条判断的生成日**，缺省退到 `date.today()` 只对实时链路成立
+    （回答当场入库）。历史回放**必须**显式传记录保存日——否则三天前的 T+1 会被
+    按今天重新计时，到期窗口整体错位。`intake.record_decision` 已把缺失基准日
+    当作不追责处理，正常不会走到这里的 today 兜底。
     """
     days = _HORIZON_DAYS.get(horizon)
     if not days:
@@ -399,8 +462,9 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
     宁可漏抽不可错抽（修正②：慢调容忍误判，但**不容忍错的标签**——错标方向会
     训练出反向权重）。
 
-    v1 只抽 finance 域的三类：direction / magnitude / level。
-    range 暂不抽：`X~Y` 在中文回答里大量是数值区间罗列而非预测区间，误判率高。
+    v1 实际只抽 finance 域的两类：direction / level（magnitude 已于 2026-11-19
+    停用，见模块头）。range 暂不抽：`X~Y` 在中文回答里大量是数值区间罗列而非预测
+    区间，误判率高。
 
     Returns:
         [{"claim_type","subject","subject_kind","horizon","predicted",
@@ -423,12 +487,12 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
 
     concl = _conclusion_text(answer)
     horizon = guess_horizon(f"{query}\n{concl}", horizon_default)
-    conf = guess_confidence(concl)
+    conf = guess_confidence(strip_prob_annotations(concl))
     out: List[Dict[str, Any]] = []
 
     def _add(claim_type: str, predicted: Dict[str, Any], quote: str,
              hz: Optional[str] = None) -> None:
-        if len(out) >= max_claims:
+        if len(out) >= max_claims or claim_type in DISABLED_CLAIM_TYPES:
             return
         h = hz or horizon
         out.append({
@@ -445,13 +509,33 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
         })
 
     # ① 方向：优先**多周期**（T+1/T+3/T+5 各立 claim，2026-10-23）；
-    #    抽不到再退单条全局方向（旧行为）
+    #    把握度括注落 predicted.p（heuristic_confidence，非标定概率）
     hz_dirs = extract_horizon_directions(answer)
     if hz_dirs:
-        for lab, d in hz_dirs:
+        for lab, d, p in hz_dirs:
             if len(out) >= max_claims:
                 break
-            _add("direction", {"dir": d}, lab, hz=lab)
+            pred = {"dir": d}
+            if p is not None:
+                pred["p"] = p
+                pred["p_source"] = "heuristic_confidence"
+                pred["p_target"] = "up" if d == "bullish" else "down"
+                pred["p_horizon"] = lab
+            _add("direction", pred, lab, hz=lab)
+        # ①-a 标定概率：P(T+N涨)= 全文唯一 且 对应档方向 claim 唯一 才关联
+        #     （宁漏不脏；bullish 才填——p_up 是「涨」概率，bearish 语义不等价）；
+        #     标定源优先于把握括注（覆盖 p/p_source）。
+        pups = _pup_values(answer)
+        if len(pups) == 1:
+            plab, pval = pups[0]
+            t1 = [c for c in out
+                  if c["claim_type"] == "direction" and c["horizon"] == plab]
+            if len(t1) == 1 and t1[0]["predicted"].get("dir") == "bullish" \
+                    and t1[0]["predicted"].get("p_source") != "calibrated":
+                t1[0]["predicted"]["p"] = pval
+                t1[0]["predicted"]["p_source"] = "calibrated"
+                t1[0]["predicted"]["p_target"] = "up"
+                t1[0]["predicted"]["p_horizon"] = plab
     elif not (
         any(m.group(2) == "未知" for m in _HORIZON_DIR_RE.finditer(answer))
         or (
@@ -462,19 +546,6 @@ def extract_claims(query: str, answer: str, domain: Optional[str] = None,
         d = _extract_direction(answer)
         if d and d != "neutral":
             _add("direction", {"dir": d}, _conclusion_text(answer, span=200)[:200])
-
-    # ② 幅度：只在结论段里抽，且必须有 % 与涨跌语义
-    m = _MAGNITUDE_RE.search(concl)
-    if m:
-        try:
-            pct = float(m.group(1))
-        except (TypeError, ValueError):
-            pct = None
-        if pct is not None:
-            if _MAG_SIGN_RE.search(concl[:m.end() + 6]):
-                pct = -abs(pct)
-            _add("magnitude", {"pct": round(pct, 2)},
-                 _quote_of(concl, re.escape(m.group(0))))
 
     # ③ 点位：目标价/支撑/压力/跌破
     m2 = _LEVEL_RE.search(answer)

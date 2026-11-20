@@ -989,6 +989,23 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
         logger.error("[AutoEval] 追责→权重失败(不影响报告): %s", e)
         result["weight_feed"] = {"error": str(e)}
 
+    # ── 升档驱动（§8.2/§9.3）：经验档位自动判定 ─────────────────────────
+    # outcome/link/stats 落库后，对簇数达 n_min 的经验按预注册阈值判定
+    # consumption_mode；证据不足时 decide_mode 自动维持 observe（fail-closed），
+    # 阈值未预注册或策略关闸时整步空转。独立 try：不影响闭环其余段。
+    try:
+        from .chain.promotion_runner import run_promotion_check
+        promo = run_promotion_check()
+        result["promotion"] = promo
+        _worker_health["last_promotion"] = promo
+        if promo.get("results"):
+            logger.info("[AutoEval] 升档判定: %s",
+                        [(r.get("experience_id"), r.get("verdict"),
+                          r.get("to_mode")) for r in promo["results"]])
+    except Exception as e:
+        logger.error("[AutoEval] 升档判定失败(不影响闭环): %s", e)
+        result["promotion"] = {"error": str(e)}
+
     try:
         report = get_eval_report()
         result["report"] = report

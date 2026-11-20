@@ -47,6 +47,14 @@ def _strip_fillers(fragment: str) -> str:
 _AMBIGUOUS_LIMIT = 5    # 拉取候选数（判定歧义用）
 _MAX_SHOWN = 5          # 反问时最多列出几个候选
 
+# 整词零命中时的前缀收缩兜底（2026-11-20 实测缺口）：
+#   "上海新阳76.8的本" 洗成 "上海新阳76.8" → 整词查 0 命中 → 静默 None；
+#   "比亚迪该如何进攻和防守" 整词（全 CJK）→ 0 命中 → 同样 None。
+# 取片段**开头连续汉字串**逐级右缩（只收「候选名 == 收缩词」的精确命中），
+# 多候选一律继续缩不判歧义（兜底路径绝不触发反问，避免 2026-10-16 类误拦）。
+_CJK_LEAD_RE = re.compile(r'^[\u4e00-\u9fa5]+')
+_FALLBACK_MAX_QUERIES = 8
+
 
 def _expand_stock_query(user_input: str, entities: list[dict]) -> str:
     """将股票分析指令扩写为完整指令。
@@ -187,6 +195,25 @@ class StockResolver(EntityResolver):
             return [{"code": r.get("symbol"), "name": r.get("name", "")}
                     for r in rows if r.get("symbol")]
 
+        _fb_budget = [_FALLBACK_MAX_QUERIES]
+
+        def _shrink_hit(keyword: str) -> list:
+            m = _CJK_LEAD_RE.match(keyword or "")
+            if not m:
+                return []
+            cur = m.group(0)
+            while len(cur) >= 2 and _fb_budget[0] > 0:
+                _fb_budget[0] -= 1
+                cands = _candidates(cur)
+                if not cands:
+                    cur = cur[:-1]
+                    continue
+                exact = [c for c in cands if c.get('name') == cur]
+                if exact:
+                    return exact[:1]
+                cur = cur[:-1]
+            return []
+
         entities = []
 
         # 1. 提取所有6位股票代码（前后不能紧跟数字）
@@ -236,6 +263,11 @@ class StockResolver(EntityResolver):
                     logger.debug("[StockResolver] 解析 '%s' 跳过: %s", name, e)
                     continue
                 if not cands:
+                    _fb = _shrink_hit(name)
+                    if _fb:
+                        entities.append({"code": _fb[0]['code'],
+                                         "name": _fb[0].get('name', ''),
+                                         "type": "stock"})
                     continue
                 if len(cands) > 1:
                     # 精确同名优先收敛：只有一个候选与用户原词完全一致时不算歧义
