@@ -12,9 +12,12 @@ PostgreSQL 持久化记忆
 
 环境变量：
     DATABASE_URL=postgresql://user:password@host:port/dbname
+    MEMORY_TTL_DAYS=1095  （消息保留天数，默认 3 年；覆盖 DEFAULT_TTL_DAYS）
+    MEMORY_RECENCY_TAU_DAYS=365  （全文检索时间衰减常数，<=0 关闭；覆盖 DEFAULT_RECENCY_TAU_DAYS）
 """
 import asyncio
 import logging
+import os
 from typing import Optional
 
 from .base import MemoryBase, MemoryMessage
@@ -24,8 +27,10 @@ logger = logging.getLogger(__name__)
 
 # 默认表名
 DEFAULT_TABLE = "qd_agent_messages"
-# 默认 TTL：7 天
-DEFAULT_TTL_SECONDS = 7 * 24 * 3600
+# 默认 TTL：3 年（1095 天），可由 MEMORY_TTL_DAYS 覆盖；落到 SQL 时才换算成秒
+DEFAULT_TTL_DAYS = int(os.getenv("MEMORY_TTL_DAYS", "1095"))
+# 默认时间衰减常数（天）：tau<=0 时关闭时间衰减
+DEFAULT_RECENCY_TAU_DAYS = float(os.getenv("MEMORY_RECENCY_TAU_DAYS", "365"))
 
 
 # ── 中文分词辅助（复用 postgres_fts.py 的思路）──
@@ -77,11 +82,14 @@ class PostgresMemory(MemoryBase):
         *,
         max_messages: int = 100,
         table_name: str = DEFAULT_TABLE,
-        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        ttl_days: int = DEFAULT_TTL_DAYS,
+        recency_tau_days: float = DEFAULT_RECENCY_TAU_DAYS,
     ):
         self._max_messages = max_messages
         self._table_name = table_name
-        self._ttl_seconds = ttl_seconds
+        self._ttl_days = ttl_days
+        self._ttl_seconds = ttl_days * 86400
+        self._recency_tau_days = recency_tau_days
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -162,8 +170,8 @@ class PostgresMemory(MemoryBase):
             await self._run_sync(_init)
             self._initialized = True
             logger.info(
-                "PostgresMemory 就绪: table=%s max_messages=%d ttl=%ds",
-                self._table_name, self._max_messages, self._ttl_seconds,
+                "PostgresMemory 就绪: table=%s max_messages=%d ttl=%dd",
+                self._table_name, self._max_messages, self._ttl_days,
             )
 
     # ── MemoryBase 接口 ─────────────────────────────────────────
@@ -360,7 +368,8 @@ class PostgresMemory(MemoryBase):
         """全文搜索历史聊天记录。
 
         使用 PostgreSQL tsvector + tsquery 实现中文检索。
-        对用户消息和助手回复都做搜索，返回按相关度排序的结果。
+        返回按「相关度 × 时间衰减」排序的结果：score = rank * exp(-age_days / tau)。
+        tau <= 0 时关闭衰减，退化为纯 rank 排序。时间只影响排序，不参与召回过滤。
 
         Args:
             query: 搜索关键词（支持中文，内部做分词处理）
@@ -383,28 +392,37 @@ class PostgresMemory(MemoryBase):
         # tokens 已是空格分隔的 gram，拆开用 | 连接
         tsquery = " | ".join(tokens.split())
 
+        # tau>0：相关度按距今天数指数衰减；GREATEST 防未来时间戳反向加分。
+        # tau<=0：衰减因子恒 1，排序退化为纯 rank（回退开关）。
+        _tau = float(self._recency_tau_days)
+        if _tau > 0:
+            score_sql = (
+                "ts_rank(fts_vector, q) * "
+                f"exp(-GREATEST(0, EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0) / {_tau})"
+            )
+        else:
+            score_sql = "ts_rank(fts_vector, q)"
+
         def _search():
             with self._get_connection() as conn:
                 c = _raw_cursor(conn)
                 try:
                     if session_id:
                         c.execute(sql.SQL("""
-                            SELECT role, content, session_id, created_at,
-                                   ts_rank(fts_vector, q) AS rank
+                            SELECT role, content, session_id, created_at, ({score}) AS score
                             FROM {tbl}, to_tsquery('simple', %s) AS q
                             WHERE fts_vector @@ q AND session_id = %s
-                            ORDER BY rank DESC, created_at DESC
+                            ORDER BY score DESC, created_at DESC
                             LIMIT %s
-                        """).format(tbl=tbl), (tsquery, session_id, limit))
+                        """).format(tbl=tbl, score=sql.SQL(score_sql)), (tsquery, session_id, limit))
                     else:
                         c.execute(sql.SQL("""
-                            SELECT role, content, session_id, created_at,
-                                   ts_rank(fts_vector, q) AS rank
+                            SELECT role, content, session_id, created_at, ({score}) AS score
                             FROM {tbl}, to_tsquery('simple', %s) AS q
                             WHERE fts_vector @@ q
-                            ORDER BY rank DESC, created_at DESC
+                            ORDER BY score DESC, created_at DESC
                             LIMIT %s
-                        """).format(tbl=tbl), (tsquery, limit))
+                        """).format(tbl=tbl, score=sql.SQL(score_sql)), (tsquery, limit))
                     rows = c.fetchall()
                     return [
                         {
@@ -412,7 +430,7 @@ class PostgresMemory(MemoryBase):
                             "content": r["content"],
                             "session_id": r["session_id"],
                             "created_at": str(r["created_at"]) if r["created_at"] else "",
-                            "score": float(r["rank"]) if r["rank"] else 0.0,
+                            "score": float(r["score"]) if r["score"] else 0.0,
                         }
                         for r in rows
                     ]

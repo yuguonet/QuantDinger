@@ -994,7 +994,7 @@ def auto_evaluate(days_old: int = 1, market: str = "CNStock") -> Dict[str, Any]:
     # consumption_mode；证据不足时 decide_mode 自动维持 observe（fail-closed），
     # 阈值未预注册或策略关闸时整步空转。独立 try：不影响闭环其余段。
     try:
-        from .chain.promotion_runner import run_promotion_check
+        from .promotion_runner import run_promotion_check
         promo = run_promotion_check()
         result["promotion"] = promo
         _worker_health["last_promotion"] = promo
@@ -1023,6 +1023,7 @@ _eval_stop = None
 
 _worker_health = {
     "last_run_at": None, "last_success_at": None,
+    "dispatched_date": None,
     "last_error": None, "consecutive_failures": 0,
     "total_runs": 0, "total_successes": 0, "total_failures": 0,
     # v4 追责判定上一次结果（None = 一次都没跑成功过，用来区分"没数据"和"没接线"）
@@ -1340,12 +1341,174 @@ def run_v5_collection() -> Dict[str, Any]:
         return {"ok": False, "errors": [f"collector: {type(e).__name__}: {e}"]}
 
 
+def _eval_pipeline_enabled() -> bool:
+    """盘后流水线总开关是否打开（读全局 env QD_POST_PIPELINE，不 import market_cn）。
+
+    与 market_cn.scheduler 读同一 env：总开关=1 时常驻 worker 退役、评估改由流水线派发。
+    """
+    return (os.getenv("QD_POST_PIPELINE", "0") or "0").strip() == "1"
+
+
+def _run_eval_cycle(mode: str = "normal", v5_hook=None) -> dict:
+    """跑一次完整评估闭环：auto_evaluate → v5 采集 → 技能酿造 → 健康落盘。
+
+    旧常驻 worker 与一次性 dispatch worker 共用此执行体（避免两处重复）。
+    v5_hook：由调用方注入 v5 采集钩子（默认 run_v5_collection）——保留各 worker 入口
+    对钩子的显式调用结构（源码守卫 test_worker_source_calls_the_hook 定位 _worker 体）。
+    失败不抛出、记入 _worker_health，健康探针可诊断；返回运行摘要。
+    """
+    import time as _time
+    _worker_health["total_runs"] += 1
+    _worker_health["last_run_at"] = _time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        result = auto_evaluate(days_old=1)
+        evaluated = result.get("evaluation", {}).get("evaluated", 0)
+        _worker_health["consecutive_failures"] = 0
+        _worker_health["total_successes"] += 1
+        _worker_health["last_success_at"] = _worker_health["last_run_at"]
+        _worker_health["last_error"] = None
+        logger.info("[EvalWorker] 盘后验证完成: %d 条已评估", evaluated)
+    except Exception as e:
+        _worker_health["consecutive_failures"] += 1
+        _worker_health["total_failures"] += 1
+        _worker_health["last_error"] = str(e)
+        logger.warning("[EvalWorker] 盘后验证失败: %s", e)
+
+    (v5_hook or run_v5_collection)()
+
+    try:
+        from .skill_brewer import brew_skills, refresh_skill_adapter
+        _brewed = brew_skills(trigger="auto")
+        if any(r.get("status") == "brewed" for r in _brewed):
+            refresh_skill_adapter()
+    except Exception as e:
+        logger.warning("[EvalWorker] 技能酿造跳过: %s", e)
+
+    _persist_worker_health({"event": "run", "catchup": mode})
+    return {
+        "status": "ok" if _worker_health["last_error"] is None else "error",
+        "last_success_at": _worker_health["last_success_at"],
+        "last_error": _worker_health["last_error"],
+    }
+
+
+_EVAL_RETRY_DEFAULT = 2
+_EVAL_RETRY_DELAY_DEFAULT = 600
+
+
+def _eval_retry_config() -> tuple[int, int]:
+    """评估派发失败的运行时重试配置 (QD_PIPELINE_EVAL_RETRY / _DELAY_SEC)。
+
+    次数 = 首次之外的额外重试（0 = 不重试）；延时 = 每次重试前的等待秒数。
+    上限防误配（次数 <=10、延时 <=3600s）；非法或越界回退默认并打 warning。
+    """
+    def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not str(raw).strip():
+            return default
+        try:
+            val = int(str(raw).strip())
+        except (ValueError, TypeError):
+            logger.warning("[EvalWorker] %s=%r 非法, 回退 %d", name, raw, default)
+            return default
+        if not lo <= val <= hi:
+            logger.warning("[EvalWorker] %s=%d 越界[%d,%d], 回退 %d", name, val, lo, hi, default)
+            return default
+        return val
+
+    return (_env_int("QD_PIPELINE_EVAL_RETRY", _EVAL_RETRY_DEFAULT, 0, 10),
+            _env_int("QD_PIPELINE_EVAL_RETRY_DELAY_SEC", _EVAL_RETRY_DELAY_DEFAULT, 0, 3600))
+
+
+def _run_eval_with_retry(sleep_fn=None) -> dict:
+    """一次性 eval 的执行体：闭环判失败时延时重试至上限, 跑完退出。
+
+    成功判据 = _run_eval_cycle 返回 status=="ok"（闭环内已落 last_success_at）。
+    失败态 error / 异常均触发重试；有限次数、非 60s 常驻轮询。零 market_cn 依赖。
+    sleep_fn 仅供验证注入。
+    """
+    import time as _time
+    retries, delay = _eval_retry_config()
+    sleep = sleep_fn or _time.sleep
+    last = None
+    for attempt in range(1, retries + 2):
+        try:
+            last = _run_eval_cycle("dispatch")
+            status = last.get("status") if isinstance(last, dict) else last
+            if status == "ok":
+                if attempt > 1:
+                    logger.info("[EvalWorker] 第 %d 次重试成功", attempt)
+                return last
+            logger.warning("[EvalWorker] 第 %d/%d 次未成功(status=%s)",
+                           attempt, retries + 1, status)
+        except Exception:
+            logger.exception("[EvalWorker] 第 %d/%d 次执行异常", attempt, retries + 1)
+        if attempt <= retries:
+            sleep(delay)
+    logger.error("[EvalWorker] 重试 %d 次后仍未成功: %s", retries, last)
+    return last if isinstance(last, dict) else {"status": "error"}
+
+
+def dispatch_eval_once():
+    """发一条非阻塞评估指令（P2）：一次性 daemon 线程跑一次闭环，跑完退出。
+
+    零 market_cn 依赖：不 import 调度器、不等 Event、不读其完成标记。
+    派发即落盘 dispatched_date（agent 自有健康文件），跑完 _run_eval_cycle 落 last_success_at；
+    进程在两者之间崩溃 ⇒ 下次启动 catchup_if_needed 补跑（v5 情境帧 C 类不可重建）。
+    防重入：一次性线程未退出时重复派发返回 already_running。
+    """
+    global _eval_thread
+    import threading
+    if _eval_thread is not None and _eval_thread.is_alive():
+        return {"status": "already_running"}
+    today = datetime.now().strftime("%Y-%m-%d")
+    _worker_health["dispatched_date"] = today
+    _persist_worker_health({"event": "dispatch", "dispatched_date": today})
+
+    def _run():
+        _run_eval_with_retry()
+
+    _eval_thread = threading.Thread(target=_run, daemon=True, name="eval-once")
+    _eval_thread.start()
+    logger.info("[EvalWorker] 一次性评估指令已发出 (fire-and-forget): dispatched_date=%s", today)
+    return {"status": "dispatched", "dispatched_date": today}
+
+
+def catchup_if_needed():
+    """agent 启动时自愈：今日已派发但未成功完成 ⇒ 补跑一次（零 market_cn 依赖）。
+
+    判据只用 agent 自有健康落盘的最后一行：dispatched_date 是今日 ∧ last_success_at
+    非今日 ⇒ 派发后进程崩在跑完之前，补跑。无证据/未派发/已成功都不动（宁可漏不双算）。
+    """
+    if not _eval_pipeline_enabled():
+        return {"status": "skip", "reason": "pipeline_disabled"}
+    last = _read_last_health_line()
+    if not last:
+        return {"status": "skip", "reason": "no_health_evidence"}
+    dispatched = str(last.get("dispatched_date") or "")
+    success = str(last.get("last_success_at") or "")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if dispatched.startswith(today) and not success.startswith(today):
+        logger.warning("[EvalWorker] 今日(%s)已派发但未成功完成，启动补跑一次", today)
+        return dispatch_eval_once()
+    return {"status": "skip", "reason": "no_pending_dispatch"}
+
+
 def start_eval_worker():
-    """启动后台评估 worker（盘后 15:30 每天运行一次，T+N 验证）。"""
+    """启动后台评估 worker（盘后 15:30 每天运行一次，T+N 验证）。
+
+    总开关 QD_POST_PIPELINE=1 时常驻 worker 退役：评估改由盘后流水线⑥派发一次性 worker，
+    此处只做启动补跑（catchup_if_needed，agent 自有落盘、零 market_cn 依赖）。
+    =0 时逐字保留旧常驻线程 + B/B' 自愈（回滚位）。
+    """
     global _eval_thread, _eval_stop
 
     import threading
     import time as _time
+
+    if _eval_pipeline_enabled():
+        logger.info("[EvalWorker] QD_POST_PIPELINE=1: 常驻 worker 退役，改由流水线派发一次性 worker")
+        return catchup_if_needed()
 
     if _eval_thread is not None and _eval_thread.is_alive():
         return
@@ -1390,44 +1553,7 @@ def start_eval_worker():
             if _eval_stop.is_set():
                 break
 
-            # 盘后执行 T+N 验证
-            _worker_health["total_runs"] += 1
-            _worker_health["last_run_at"] = _time.strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                result = auto_evaluate(days_old=1)
-                evaluated = result.get("evaluation", {}).get("evaluated", 0)
-                _worker_health["consecutive_failures"] = 0
-                _worker_health["total_successes"] += 1
-                _worker_health["last_success_at"] = _worker_health["last_run_at"]
-                _worker_health["last_error"] = None
-                logger.info("[EvalWorker] 盘后验证完成: %d 条已评估", evaluated)
-            except Exception as e:
-                _worker_health["consecutive_failures"] += 1
-                _worker_health["total_failures"] += 1
-                _worker_health["last_error"] = str(e)
-                logger.warning("[EvalWorker] 盘后验证失败: %s", e)
-
-            # ── v5 盘后采集（阶段 D4）：情境帧 + 分层配额样本 ──────────────
-            # ★ 必须每天跑：C 类情境**不可重建**，今天没记事后补不回来。
-            #   放在验证之后、酿造之前：验证是主线，采集失败不影响主线。
-            run_v5_collection()
-
-            # 技能酿造挂钩（2026-09-19 升级为触发策略 v2，重设计 §2.5）：
-            # 每日调用一次 brew_skills(trigger="auto")，节拍由信号分内部决定
-            # （信号就绪立即酿 / 7 日兜底 / 冷却），状态落 qd_agent_weights
-            # （layer='brew_state'），重启不丢。worker 不再管理日期。
-            try:
-                from .skill_brewer import brew_skills, refresh_skill_adapter
-                _brewed = brew_skills(trigger="auto")
-                if any(r.get("status") == "brewed" for r in _brewed):
-                    refresh_skill_adapter()
-            except Exception as e:
-                logger.warning("[EvalWorker] 技能酿造跳过: %s", e)
-
-            # ── C：每轮跑完落一份健康快照（停摆可诊断、探针有数据可读）──────
-            # 放在酿造之后：本行的 last_success_at 反映"整条闭环跑完"这一事实。
-            # 进程在落盘前被杀 ⇒ 探针读到上一条旧线 ⇒ 判 stalled（正是目的）。
-            _persist_worker_health({"event": "run", "catchup": mode})
+            _run_eval_cycle(mode, v5_hook=run_v5_collection)
 
     _eval_thread = threading.Thread(target=_worker, daemon=True, name="eval-worker")
     _eval_thread.start()

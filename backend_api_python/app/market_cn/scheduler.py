@@ -284,14 +284,16 @@ def _refresh_sector_daily():
         logger.warning("[sector_daily] collect_sector_daily 失败: %s", e)
 
 
-def _save_dragon_hot_daily():
+def _save_dragon_hot_daily(retries=3):
     """龙虎榜 & 热榜持久化 — 每天 17:00 调用 (LHB(D) 交易所 ~17:00-17:30 发布)。
 
     龙虎榜 2026-10-27 起走 app/data_sources/cn_stock_putdb.sync_dragon_tiger
     （coord_pool dragon_tiger 多源 + cnd_dragon_tiger_list UPSERT）；热榜仍走
     dragon_tiger_store.save_daily(include_dragon_tiger=False)。
-    当日榜未发布(total=0)时 10min 间隔重试(最多 3 次尝试), 必须先于
-    dragon_scan(17:25) 完成落库 —— 2026-09-18 调度重排: 榜先落库、扫描后跑,
+    当日榜未发布(total=0)时 10min 间隔重试(最多 retries 次尝试, 默认 3 保持旧路径);
+    盘后流水线传 retries=1: 只拉一次, 未拉到打 warning 报告即结束, 不阻塞后续步骤,
+    由 not_before=17:00 保证唯一拉取机会落在发布时刻之后 (用户 2026-11-20 裁定)。
+    必须先于 dragon_scan 完成落库 —— 2026-09-18 调度重排: 榜先落库、扫描后跑,
     杜绝"策略消费 LHB 时当日榜缺失"的时序错位 (hub.lhb 时效纪律配套)。
     """
     from app.data_sources.cn_stock_putdb import sync_dragon_tiger
@@ -308,7 +310,11 @@ def _save_dragon_hot_daily():
                     lp.get("written"), lp.get("skipped"), lp.get("errors"))
     except Exception as e:
         logger.warning("[dragon_hot_daily] 三池落库失败(不影响龙虎榜): %s", e)
-    for attempt in range(1, 4):
+    try:
+        retries = max(1, int(retries))
+    except (TypeError, ValueError):
+        retries = 3
+    for attempt in range(1, retries + 1):
         try:
             dt = sync_dragon_tiger()
             hr_result = save_daily(include_dragon_tiger=False)
@@ -320,11 +326,18 @@ def _save_dragon_hot_daily():
                 dt.get("status", "unknown"),
             )
             # 拿到当日榜 / 非交易日 / 已到最后一次尝试 → 结束; 否则等 10min 重试
-            if dt.get("total", 0) > 0 or not is_trading_day(today) or attempt >= 3:
+            if dt.get("total", 0) > 0 or not is_trading_day(today) or attempt >= retries:
                 if dt.get("total", 0) > 0:
                     _mark_event("lhb", today)
+                else:
+                    logger.warning(
+                        "[dragon_hot_daily] 报告: 当日龙虎榜未拉到(total=0, attempts=%d/%d, "
+                        "status=%s, 目标=%s); 不再重试",
+                        attempt, retries, dt.get("status", "unknown"), today,
+                    )
                 return
-            logger.warning("[dragon_hot_daily] 当日龙虎榜尚未发布(attempt %d), 10min 后重试", attempt)
+            logger.warning("[dragon_hot_daily] 当日龙虎榜尚未发布(attempt %d/%d), 10min 后重试",
+                           attempt, retries)
             _time.sleep(600)
         except Exception as e:
             logger.error("[dragon_hot_daily] 执行失败: %s", e)
@@ -425,8 +438,6 @@ def _daily_scan_dispatch():
     status = result.get("status") if isinstance(result, dict) else None
     if status in ("ok", "no_active_strategy"):
         _daily_scanned.setdefault(target, set()).update(ready)
-        for key in ready:
-            mark_scheduler_task_done(f"daily_scan@{key}", target)
         logger.info("[daily_scan] 完成 %s → %s", ready, result)
     else:
         # data_not_ready 等: 不标记, 下一轮重试 (run_scan 内部 wait_data 兜 1D)
@@ -512,11 +523,13 @@ def _morning_batch():
 import threading as _threading
 post_market_done = _threading.Event()
 
-def _post_market_batch():
-    """盘后日级串行: 1m → 1D（K线基座优先）→ 指数5m/资金流/日档/北向 → 板块统计，重试至数据到位后退出。"""
-    from app.utils.trading_calendar import last_finish_trading_day
-    target = last_finish_trading_day()
+def _run_kline_settlement(target: str) -> bool:
+    """K线基座回填 + 收敛闭环（1m→1D，同判据），返回是否收敛到位。
 
+    从 _post_market_batch 等价抽出（2026-11-20，盘后流水线 P0）：旧批处理和流水线
+    @kline 步骤共用同一判据，避免两处复制 60 行致口径漂移。收敛后 mark
+    daily_1d/minute_1m（沿用原行为）；未收敛只记 error、不标记，留给重启补跑。
+    """
     # ── K线基座优先（2026-10-27 用户裁定：1D 紧跟 1m，不等中段任务）──
     # 1m K线回填 (每标的240条)；minute_1m/daily_1d 完成标记在补拉闭环到位后统一打
     _refresh_backfill_1m()
@@ -583,6 +596,15 @@ def _post_market_batch():
         logger.error("[post_market] K线 3 轮后仍未齐（覆盖率门槛 %.0f%%），"
                      "daily_1d/minute_1m 不标记完成",
                      _kline_coverage_min() * 100)
+    return kline_complete
+
+
+def _post_market_batch():
+    """盘后日级串行: 1m → 1D（K线基座优先）→ 指数5m/资金流/日档/北向 → 板块统计，重试至数据到位后退出。"""
+    from app.utils.trading_calendar import last_finish_trading_day
+    target = last_finish_trading_day()
+
+    kline_complete = _run_kline_settlement(target)
 
     # ── 中段任务（不挡 K线补拉）──
     # 指数 5m K线同步 (kline_index_5m, 指数分钟只能向前攒, 不可回补)
@@ -596,7 +618,11 @@ def _post_market_batch():
     _refresh_post_market()
 
     # 检测数据是否到位
-    dt_date = nb_date = ""
+    # 北向资金自 2024-08 起停止披露（index.py:265：两腿恒 0 为占位值，
+    # get_northbound_daily 末条恒为 2024-08-16），以 nb_date >= target 作就绪
+    # 判据永远为假 ⇒ northbound event 永不 mark。停更即视为结构性到位：
+    # 不再查北向、不再拿它当初次就绪条件，直接标记到位；龙虎榜 dt 仍作等待判据。
+    dt_date = ""
     try:
         from app.market_cn.dragon_limit import get_dragon_tiger
         dt = get_dragon_tiger()
@@ -604,20 +630,14 @@ def _post_market_batch():
             dt_date = dt[0].get("date", "") if isinstance(dt[0], dict) else ""
     except Exception:
         pass
-    try:
-        from app.market_cn.index import get_northbound_daily
-        nb = get_northbound_daily(10)
-        if nb and isinstance(nb, list) and len(nb) > 0:
-            nb_date = nb[-1].get("date", "") if isinstance(nb[-1], dict) else ""
-    except Exception:
-        pass
+    _mark_event("northbound", target)
 
-    if dt_date >= target and nb_date >= target:
-        logger.info("[post_market] 数据到位 (dt=%s, nb=%s, 目标=%s)", dt_date, nb_date, target)
-        if nb_date >= target:
-            _mark_event("northbound", target)
+    if dt_date >= target:
+        logger.info("[post_market] 中段数据到位 (dt=%s, 北向=停披露视为到位, 目标=%s)",
+                    dt_date, target)
     else:
-        logger.info("[post_market] 数据未到 (dt=%s, nb=%s, 目标≥%s)，10min 后重试", dt_date, nb_date, target)
+        logger.info("[post_market] 龙虎榜未到 (dt=%s, 北向=停披露视为到位, 目标≥%s)，"
+                    "10min 后重试", dt_date, target)
         _time.sleep(600)
         _refresh_post_market()  # 重试一次
 
@@ -854,6 +874,44 @@ TASKS = [
 ]
 
 
+def _post_pipeline_enabled() -> bool:
+    """盘后流水线总开关 (QD_POST_PIPELINE=1 启用)。默认 0 = 现状逐字保留。"""
+    raw = (os.getenv("QD_POST_PIPELINE", "0") or "0").strip()
+    if raw == "1":
+        return True
+    if raw in ("", "0"):
+        return False
+    logger.warning("[scheduler] QD_POST_PIPELINE=%r 非法(仅 0/1)，回退 0", raw)
+    return False
+
+
+def _run_post_pipeline():
+    """流水线 Task 入口（延迟 import 避免与 scheduler 循环依赖）。"""
+    from app.market_cn.post_pipeline import run_post_pipeline
+    return run_post_pipeline()
+
+
+def _apply_post_pipeline_switch():
+    """开关=1 时用一条流水线替换 4 个盘后任务（3 数据任务 + daily_scan 60s 轮询）。
+
+    P1 起流水线 ⑥ 直接派发一次性 daily_scan worker，故 60s 轮询任务同步删除 —— 空转消失。
+    被替换任务的**函数体全部保留**（_post_market_batch/_save_dragon_hot_daily/_save_fund_flow_daily/
+    _daily_scan_dispatch），开关关闭时 TASKS 原样注册 ⇒ 逐字回滚。
+    """
+    if not _post_pipeline_enabled():
+        return
+    replaced = {"post_market_batch", "dragon_hot_daily", "fund_flow_daily", "daily_scan"}
+    kept = [t for t in TASKS if t.name not in replaced]
+    kept.append(Task("post_pipeline", _run_post_pipeline, interval=86400,
+                     trading_only=False, once_per_day=True,
+                     trigger_hour=15, trigger_minute=30))
+    TASKS[:] = kept
+    logger.info("[scheduler] QD_POST_PIPELINE=1: 3 个盘后数据任务 + daily_scan 轮询并入 post_pipeline 流水线")
+
+
+_apply_post_pipeline_switch()
+
+
 def _get_interval(task: Task) -> int:
     """动态间隔（dragon / daily_scan 自适应）。"""
     if task.name == "dragon_pools":
@@ -1001,6 +1059,15 @@ def _scheduler_loop():
         logger.info("[scheduler] 启动补跑: %s (今日 %02d:%02d 已过)",
                     task.name, task.trigger_hour, task.trigger_minute)
         _launch(task)
+
+    # P1 启动补扫兜底（仅总开关=1）：流水线已完成但 scan 指令此前丢失（进程在派发后崩溃）
+    # ⇒ 补发一次日线扫描。判据只用 qd_scheduler_done，不查事件表、不抢正在跑的流水线。
+    if _post_pipeline_enabled():
+        try:
+            from app.market_cn.post_pipeline import catchup_dispatch_scan_if_needed
+            logger.info("[scheduler] 启动补扫检查: %s", catchup_dispatch_scan_if_needed())
+        except Exception as e:
+            logger.warning("[scheduler] 启动补扫检查失败(不影响主线程): %s", e)
 
     while True:
         _time.sleep(10)
