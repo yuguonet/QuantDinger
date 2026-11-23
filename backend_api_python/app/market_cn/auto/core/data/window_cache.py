@@ -141,6 +141,21 @@ def _dstr(o: int) -> str:
     return date.fromordinal(int(o)).isoformat()
 
 
+def _max_bar_date(data: dict) -> str:
+    """缓存内实际最大 bar 日期（数据水位），与窗口右边界 end 严格区分。
+
+    end = anchor+1 是「窗口应覆盖到哪」，在当日 bar 落库前它已越过真实数据。
+    若把 end 当水位写回 meta.end，盘中拉空也会把水位推到 T+1 ⇒ 盘后再也补不到
+    当日 bar（2026-11-20 实盘事故：四策略全空退回直判）。水位必须是缓存里真实
+    存在的最后一根：拉空时自然停在 T-1，后续调用仍从 T-1 拉起，直到当日落库。
+    """
+    mx = 0
+    for ds, _ in (data or {}).values():
+        if len(ds) and int(ds[-1]) > mx:
+            mx = int(ds[-1])
+    return _dstr(mx) if mx else ""
+
+
 def _to_arrays(bars: list[dict]):
     import numpy as np
     n = len(bars)
@@ -315,8 +330,8 @@ def _slide(codes, days: int, lg) -> dict:
             if bars:
                 data[code] = _to_arrays(bars)
                 fps[code] = _factor_fp(code)
-        _save_cache(days, data, {"start": start, "end": end, "fps": fps,
-                                "seen": {c: _today() for c in data},
+        _save_cache(days, data, {"start": start, "end": _max_bar_date(data) or end,
+                                "fps": fps, "seen": {c: _today() for c in data},
                                 "built_at": _today()})
         lg.info("[window_cache] 建缓存 %d 票 (%s~%s)", len(data), start, end)
         return {c: _to_bars(*data[c]) for c in codes if c in data}
@@ -342,11 +357,19 @@ def _slide(codes, days: int, lg) -> dict:
     old_fps = meta.get("fps") or {}
     todo = [c for c in codes if c not in data]        # 新股 / 缓存未覆盖
 
-    # ③ 尾部新增: 只拉 > end_old 的行 (~5236 行, 而非 164 万行)
+    # ③ 尾部新增: 起点取「历史水位」与「缓存实际末根」的较小者 (~5236 行)。
+    #   新代码 meta.end 写的就是实际末根; 但存量坏缓存写的是窗口右边界(end=anchor+1),
+    #   当日 bar 未落库时该水位越过真实数据 ⇒ `meta.end < end` 为假、永不补拉,
+    #   缓存末根永远停在 T-1 (2026-11-20 事故: 四策略全空退回直判)。取 min 让坏
+    #   缓存自动回退到真实末根, 当天重跑即可补回当日 bar。每票仍有 `> last_o`
+    #   过滤, 起点偏早只会多拉已存在的行再丢弃, 不漏数据也不写脏。
+    old_end = str(meta.get("end") or start)
+    real_end = _max_bar_date(data)
+    query_from = min(old_end, real_end) if real_end else old_end
     new_rows = {}
-    if str(meta.get("end")) < end:
+    if query_from < end:
         new_rows = _query_batch_raw("CNStock", codes, "1D",
-                                    start_time=meta.get("end"), end_time=end)
+                                    start_time=query_from, end_time=end)
     fps = dict(old_fps)
     n_new = n_rb = 0
     for i, code in enumerate(codes):
@@ -413,8 +436,12 @@ def _slide(codes, days: int, lg) -> dict:
                 continue
             data[code] = (ds_arr[k:], arr[k:])
 
-    _save_cache(days, data, {"start": start, "end": end, "fps": fps,
-                            "seen": seen,
+    # ⚠ meta.end 写「实际数据水位」而非窗口右边界 end：当日 bar 未落库时尾部
+    #   拉空，水位停在 T-1，下一轮仍从 T-1 查起；否则盘中一次拉空就把水位推到
+    #   T+1，17:0x 正式扫描判「无需拉尾部」⇒ 缓存末根永远停在 T-1 ⇒ asof 全空。
+    #   回退检测(②)与过期扫描仍以 built_at/start 为准，不受水位语义影响。
+    _save_cache(days, data, {"start": start, "end": _max_bar_date(data) or end,
+                            "fps": fps, "seen": seen,
                             "built_at": meta.get("built_at") or _today()})
     return {c: _to_bars(*data[c]) for c in codes if c in data}
 
@@ -428,8 +455,8 @@ def _rebuild(codes, days, start, end, unadj_to_qfq, lg) -> dict:
         if bars:
             data[code] = _to_arrays(bars)
             fps[code] = _factor_fp(code)
-    _save_cache(days, data, {"start": start, "end": end, "fps": fps,
-                            "seen": {c: _today() for c in data},
+    _save_cache(days, data, {"start": start, "end": _max_bar_date(data) or end,
+                            "fps": fps, "seen": {c: _today() for c in data},
                             "built_at": _today()})
     lg.info("[window_cache] 重建缓存 %d 票", len(data))
     return {c: _to_bars(*data[c]) for c in codes if c in data}

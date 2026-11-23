@@ -59,6 +59,19 @@ def _mask_excerpt(text: str) -> str:
     return mask_text(str(text or ""))[:limit]
 
 
+def _tail_hint_block(entity_code: str) -> str:
+    """GBDT 粗筛提示块（A1：只作条件证据，不进 p_base）。取不到/env 关返回空串。
+
+    与 skill/learning 零关系；wheel 独立模块实现，此处只做薄转发 + fail-open。
+    """
+    try:
+        from .wheels.gbdt_tail.hint import tail_hint_block
+        return tail_hint_block(entity_code)
+    except Exception as e:
+        logger.debug("[tail_hint] 注入失败(fail-open): %s", type(e).__name__)
+        return ""
+
+
 def _pup_inject_block(entity_code: str) -> str:
     """冻结基线当日 P(T+1涨) 注入块；env 关或取不到均返回空串。
 
@@ -682,6 +695,11 @@ class QDAgentService:
                 parts.append(_pb)
                 blocks.append({"kind": "p_up_ref", "injected": True, "chars": len(_pb),
                                "reason": "冻结基线当日T+1标定概率(%s)" % _ec})
+            _tb = _tail_hint_block(_ec)
+            if _tb:
+                parts.append(_tb)
+                blocks.append({"kind": "tail_hint", "injected": True, "chars": len(_tb),
+                               "reason": "GBDT粗筛top-K提示(%s,非概率)" % _ec})
         # 时间/实体增强后的用户问题（2026-10-17 F2 返工）：解析器（TimeResolver 等）把
         # 相对日词**就地标注**进 effective_input（如「后天(2026-10-19)」）。必须把它作为
         # 模型看到的用户问题下发——否则模型只拿原始问句自算相对日 ⇒ 幻觉（run10 H1）。

@@ -841,6 +841,32 @@ def _save_fund_flow_daily():
         logger.warning("[fund_flow_daily] 失败: %s", e)
 
 
+def _save_tail_scores_daily():
+    """P0-A GBDT 粗筛分数盘后落库（接入闭环 [a]，2026-11-23）。
+
+    纯本地计算（无 LLM 往返）：调 agent wheel compute_scores 得当日 top-K，
+    经 wheels/gbdt_tail/store.upsert 写 qd_tail_scores。
+    - 启用开关 QD_TAIL_SCORES_ENABLED（默认 0，显式开才跑）——粗筛是旁路，不默认占资源；
+    - top-K QD_TAIL_SCORES_K（默认 200）、宇宙 QD_TAIL_SCORES_UNIVERSE（默认空=全市场）；
+    - 触发时刻由 Task 的 trigger_hour/minute 控制，晚于 post_market_batch(15:30) 日线定稿；
+    - 幂等由 scheduler 主循环的 once_per_day + qd_scheduler_done 统一处理，此处不重复；
+    - fail-open：任何异常记 warning 不抛（落库失败不影响其他盘后任务）。
+    """
+    if (os.getenv("QD_TAIL_SCORES_ENABLED", "0") or "0").strip() != "1":
+        return
+    try:
+        from app.agent.wheels.gbdt_tail import score as gbdt_score
+        from app.agent.wheels.gbdt_tail import store as gbdt_store
+        k = int(os.getenv("QD_TAIL_SCORES_K", "200") or 200)
+        universe = (os.getenv("QD_TAIL_SCORES_UNIVERSE", "") or "").strip()
+        result = gbdt_score.compute_scores(top_k=k, universe=universe)
+        n = gbdt_store.upsert_scores(result)
+        logger.info("[tail_scores_daily] as_of=%s rows=%s model_ver=%s",
+                    result.get("as_of"), n, (result.get("meta") or {}).get("model_ver"))
+    except Exception as e:
+        logger.warning("[tail_scores_daily] 失败(忽略): %s: %s", type(e).__name__, e)
+
+
 # 任务列表
 TASKS = [
     # 盘中周期任务
@@ -871,6 +897,9 @@ TASKS = [
     # 放 18:00 —— 晚于 post_market_batch(15:30, 内含 1m 回填), 与之解耦;
     # days=7 自愈: 当日 1m 未到位则自动跳过, 次日补上。
     Task("fund_flow_daily", _save_fund_flow_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
+    # P0-A GBDT 粗筛分数落库 (2026-11-23, 接入闭环 [a]): 放 18:30 —— 晚于日线定稿与资金流,
+    # 纯本地无 LLM; 默认关闭(QD_TAIL_SCORES_ENABLED=1 才跑), 幂等复用 qd_scheduler_done。
+    Task("tail_scores_daily", _save_tail_scores_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=30),
 ]
 
 

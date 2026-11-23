@@ -383,10 +383,11 @@ def market_same_t(as_of: Optional[str] = None, days: int = 6,
 
 def kline_batch(codes: Iterable[str], days: int = 30, as_of: Optional[str] = None,
                 fill_intraday: bool = False) -> Dict[str, Any]:
-    """批量日线（一次 SQL）：{code: [bar...]}，bar 含 time/open/high/low/close/volume。
+    """批量日线：{code: [bar...]}，bar 含 time/open/high/low/close/volume。
 
-    只读 kline_1D（分年表按当前年份取）——**不回落远端**：取不到就进 missing，
-    由调用方决定是否逐票兜底（保持本层「只读、被动、可预期」的定位）。
+    只读 kline_1D 分年表，按 start~end 覆盖的年份逐年取数后合并，不受当前年份限制；
+    年表存在性由 information_schema 判定，不存在的年不产生查询。**不回落远端**：
+    取不到就进 missing，由调用方决定是否逐票兜底（保持本层「只读、被动、可预期」的定位）。
     fill_intraday=True 时，若库内缺「今日」bar 而 snapshot 有今日数据，
     用 snapshot 现算一根**未收盘** bar 补上，并在 caliber 标注 snapshot_intraday。
 
@@ -399,24 +400,39 @@ def kline_batch(codes: Iterable[str], days: int = 30, as_of: Optional[str] = Non
     codes_list = [str(c).split(".")[0] for c in codes if str(c).strip()]
     if not codes_list:
         return {"codes": {}, "missing": [], "caliber": "kline_1d_final", "meta": {}}
-    table = f"kline_1D_{datetime.now().year}"
     end = str(as_of)[:10] if as_of else datetime.now().strftime("%Y-%m-%d")
     start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=int(days * 1.8) + 20)
              ).strftime("%Y-%m-%d")
-    sql = (f'SELECT symbol, "time", open, high, low, close, volume FROM "{table}" '
-           f'WHERE symbol = ANY(%s) AND "time" >= %s::timestamp '
-           f'AND "time" < %s::timestamp + interval \'1 day\' ORDER BY symbol, "time"')
+    wanted_years = set(range(int(start[:4]), int(end[:4]) + 1))
     out: Dict[str, List[Dict[str, Any]]] = {}
+    tables: List[str] = []
     try:
         with _pool().cursor() as c:
-            c.execute(sql, (codes_list, start, end))
-            for sym, ts, o, h, low, cl, vol in c.fetchall():
-                code = str(sym).split(".")[0]
-                bar_day = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
-                out.setdefault(code, []).append({
-                    "time": bar_day, "date": bar_day, "open": o, "high": h,
-                    "low": low, "close": cl, "volume": vol,
-                })
+            c.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                  AND table_name LIKE 'kline_1D_%'
+            """)
+            existing = set()
+            for (name,) in c.fetchall():
+                suffix = str(name).rsplit("_", 1)[-1]
+                if suffix.isdigit():
+                    existing.add(int(suffix))
+            years = sorted(wanted_years & existing)
+            sql = ('SELECT symbol, "time", open, high, low, close, volume FROM "{}" '
+                   'WHERE symbol = ANY(%s) AND "time" >= %s::timestamp '
+                   'AND "time" < %s::timestamp + interval \'1 day\' ORDER BY symbol, "time"')
+            for year in years:
+                table = f"kline_1D_{year}"
+                tables.append(table)
+                c.execute(sql.format(table), (codes_list, start, end))
+                for sym, ts, o, h, low, cl, vol in c.fetchall():
+                    code = str(sym).split(".")[0]
+                    bar_day = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+                    out.setdefault(code, []).append({
+                        "time": bar_day, "date": bar_day, "open": o, "high": h,
+                        "low": low, "close": cl, "volume": vol,
+                    })
     except Exception as e:
         logger.warning("[screen_query] kline_batch 失败: %s", e)
         return {"codes": {}, "missing": [{"code": "*", "reason": f"{type(e).__name__}: {e}"}],
@@ -427,7 +443,8 @@ def kline_batch(codes: Iterable[str], days: int = 30, as_of: Optional[str] = Non
         if len(arr) > days:
             del arr[:len(arr) - days]
 
-    missing = [{"code": c, "reason": f"{table} 无数据"} for c in codes_list if c not in out]
+    reason = ",".join(tables) if tables else f"kline_1D {start[:4]}~{end[:4]}"
+    missing = [{"code": c, "reason": f"{reason} 无数据"} for c in codes_list if c not in out]
     caliber = "kline_1d_final"
     if fill_intraday:
         t = resolve_as_of(as_of)
