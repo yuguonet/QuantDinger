@@ -467,6 +467,85 @@ def kline_batch(codes: Iterable[str], days: int = 30, as_of: Optional[str] = Non
             "meta": {"requested": len(codes_list), "got": len(out)}}
 
 
+def kline_batch_qfq(codes: Iterable[str], days: int = 30, as_of: Optional[str] = None,
+                    fill_intraday: bool = False) -> Dict[str, Any]:
+    """批量日线的前复权视图：复用 kline_batch 的原始 bar，不另起 SQL、不写库。
+
+    ★ 为什么独立接口而不是给 kline_batch 默认复权：连板高度（_topdown）与尾部
+      标签（recall_diag）必须用**不复权真实成交价** —— 除权日 qfq 会按比例改写
+      前一日价格，涨停判定/次日收益全部失真；GBDT 特征才要求跨除权可比。
+      两种口径并存，kline_batch 默认仍返回原始价。
+
+    复权源是 adjustment 的 qfq 因子缓存（只读）。只有缓存里已有的标的才换算，
+    缺失标的保持原样并列入 meta.no_factor —— 绝不为此触网，保持本层被动只读。
+    volume 沿用 adjustment.unadj_to_qfq 口径：不随价格缩放，与训练侧一致。
+    adjustment 在函数内延迟 import：它在模块加载时会拉起因子后台更新线程，
+    不能让所有 screen_query 调用方都被动触发。
+
+    Returns: 同 kline_batch，另带 as_of / meta.factor_sig（缓存指纹，供溯源与
+    缓存失效）/ meta.qfq_n / meta.no_factor_n / meta.no_factor_sample。
+    """
+    from app.data_sources.provider import adjustment
+
+    batch = kline_batch(codes, days=days, as_of=as_of, fill_intraday=fill_intraday)
+    out = dict(batch)
+    bars_by_code = batch.get("codes") or {}
+    try:
+        raw = adjustment.factor_cache_json()
+        cached = {k for k, val in raw.items()
+                  if not k.startswith("_") and isinstance(val, list)}
+        factor_sig = adjustment.factor_cache_fingerprint()
+    except Exception as e:
+        logger.warning("[screen_query] kline_batch_qfq 因子缓存读取失败: %s", e)
+        cached, factor_sig = set(), "missing"
+
+    adjusted: Dict[str, List[Dict[str, Any]]] = {}
+    no_factor: List[str] = []
+    for code, bars in bars_by_code.items():
+        sina = adjustment.to_sina_code(str(code))
+        if not sina or sina not in cached:
+            no_factor.append(str(code))
+            adjusted[code] = bars
+            continue
+        try:
+            converted = adjustment.unadj_to_qfq(bars, str(code))
+        except Exception as e:
+            logger.warning("[screen_query] kline_batch_qfq 复权失败 %s: %s", code, e)
+            no_factor.append(str(code))
+            adjusted[code] = bars
+            continue
+        if len(converted) == len(bars):
+            adjusted[code] = [
+                {**bar, **{k: a[k] for k in ("open", "high", "low", "close", "volume")}}
+                for bar, a in zip(bars, converted)
+            ]
+        else:
+            adjusted[code] = converted
+
+    qfq_n = len(bars_by_code) - len(no_factor)
+    base_caliber = str(batch.get("caliber") or "kline_1d_final")
+    if bars_by_code:
+        caliber = base_caliber + ("+qfq_cache" if qfq_n else "+qfq_unavailable")
+    else:
+        caliber = base_caliber
+    actual_asof = (str(as_of)[:10] if as_of else
+                   max((str(b.get("time"))[:10] for arr in adjusted.values() for b in arr),
+                       default=""))
+    out.update({
+        "codes": adjusted,
+        "as_of": actual_asof,
+        "caliber": caliber,
+        "meta": {
+            **(batch.get("meta") or {}),
+            "factor_sig": factor_sig,
+            "qfq_n": qfq_n,
+            "no_factor_n": len(no_factor),
+            "no_factor_sample": no_factor[:10],
+        },
+    })
+    return out
+
+
 _SQL_INDEX_SAME_T = """
 SELECT d, c FROM (
     SELECT DISTINCT ON ("time"::date) "time"::date AS d, close AS c

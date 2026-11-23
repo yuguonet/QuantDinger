@@ -638,3 +638,60 @@ python run_p0a.py --work_dir . --num_boost_round 600   # 产物：tmp/p0a_report
 - 回滚：`QD_INJECT_TAIL_HINT=0`、`QD_TAIL_SCORES_ENABLED=0`；`qd_service.py` 新增块可整段摘除；DROP 新表不影响既有链路。未碰 p_base/learning/skill/tool。
 - 部署状态（2026-11-23 收尾）：代码层两开关默认仍关，部署层已在 `.env` 显式打开 `QD_TAIL_SCORES_ENABLED=1` / `QD_INJECT_TAIL_HINT=1`；真库实测 cron 在册、hint 命中注入非空。CLI 端到端实证：`python -m app.agent.cli "分析000530"` + LLM 录制，模型实际 prompt 命中 `[GBDT粗筛提示]` 3/3 次 ⇒ 开关真进模型上下文。另：`p0a_gbdt/tmp/` 一次性实验产物约 1.7G 移入 `del/p0a_tmp_cleanup_20261123/`（1.8G→101M），生产模型 `models/tail_cls_live.txt` 与重训工具链、当前基线 `preds_a158_cls_fixed` 均保留原位，加载复核 OK。
 - 溯源补正（2026-11-23）：`score.py` meta 补 `data_asof`（模型数据截止日），修复 `qd_tail_scores.data_asof` 全 NULL、hint 显示"未知"错配（非本次开关引入，是接入期 meta 接口与落库字段不一致）；重落库 200/200 行带真实日期，打分对拍 200/200 重合、差 8.3e-17 不变。
+
+### L. screen_query 前复权独立接口（2026-11-23，来源：用户拍板「新增独立接口」）
+
+**L1. 决策：新增独立接口，不改默认口径**
+
+- 用户判断「screen_query 直接提供前复权后的数据给 GBDT，分层更合理」。核查调用面后确认：**不能给 `kline_batch()` 默认加复权**——它还有两个依赖不复权真实价的调用方：
+  · `_topdown.py:981` 用连板高度/涨停判定：除权日 qfq 会按比例改写前一日价格，连板与涨停线全失真；
+  · `recall_diag.py:99` 用 t→t+1 尾部标签：标签定义是真实收盘收益，必须用不复权价。
+  另有一条独立路径 `market-screener/common.py` 经门面自调 `unadj_to_qfq`，不归本层。
+- 因此按用户拍板新增**独立只读接口** `screen_query.kline_batch_qfq()`：复用 `kline_batch()` 的 SQL 与分年表覆盖逻辑，只在返回视图上做前复权；`kline_batch()` 默认行为与三个既有调用方一字未动。
+
+**L2. 接口契约与边界**
+
+- 签名 `kline_batch_qfq(codes, days=30, as_of=None, fill_intraday=False)`，返回与 `kline_batch()` 同构的 `{codes, missing, caliber, as_of, meta}`，`meta` 另带 `factor_sig`（qfq 缓存 `mtime_ns:size`，供溯源/缓存失效）、`qfq_n`、`no_factor_n`、`no_factor_sample`。
+- 复权源 = `adjustment` 的 qfq 因子缓存（只读）。**只有缓存中已有的标的才换算**，缺因子票原样返回并进 `no_factor`，绝不为此触网；`volume` 沿用 `adjustment.unadj_to_qfq` 口径不随价格缩放，与训练侧一致。
+- `adjustment` 在函数内延迟 import：该模块加载时会拉起因子后台更新线程，不能让所有 `screen_query` 调用方被动触发。
+- `score.py::_load_panel` 改调新接口，删除自身逐票 `if sina in cached: unadj_to_qfq(...)` 分支及零引用辅助函数；cache key 仍在调用前用公共访问器取 `factor_sig`，key 与 `meta.factor_sig` 口径不变。app/agent 下新增/修改部分零注释。
+
+**L3. 验收证据**
+
+- 小样本（`as_of=2026-11-20`）：`kline_batch` caliber 仍 `kline_1d_final`，新接口为 `...+qfq_cache`；600519 历史段 101/200 根改价、000001 91/200 根改价，最新日价不变、volume 全量不变；北证 920001 无因子进 `no_factor` 且原样返回。
+- 改造前后 `compute_scores(as_of=2026-11-20, top_k=200)` 逐键对拍：200/200 顺序与全部字段 **0 差异**，`meta`（model_ver/data_asof/factor_sig/caliber/universe/cache_hit）完全一致，宇宙 5350 只。
+- 接线变异检验：monkeypatch 新接口统计调用，实测 `1` 次（5588 codes/days=70/as_of=2026-11-20）；把 000530 当日 close ×1.5 后其分数 0.17629→0.30164、top200 组成变化 ⇒ 证明打分数据流经新接口，而非未生效的空接线。
+- 全量 pytest `tmp/pytest_qfq_iface_20261123.log`：**1 failed / 1941 passed / 4 skipped**（279s），与 11-23 既有基线完全一致；唯一失败 `test_v36_upstream_compat`（`llm_capture.py:74`，mtime 11-18、与本轮零交集）。退出码 1 是 pytest atexit 清理被沙箱 bulk-delete 守卫拦截，测试执行本身完整跑完。
+
+**L4. 回滚与已知边界**
+
+- 回滚：`score.py::_load_panel` 一行改回 `kline_batch()` 并恢复逐票 `unadj_to_qfq` 分支即可；`screen_query.py` 删 `kline_batch_qfq()` 函数即回退。两接口并存，无表结构/数据迁移，无需回改模型或基线。
+- 已知边界（非本次引入）：qfq 因子是**当前快照**而非 as_of 时点版本，严格 PIT 回测仍待因子版本化（I6 ④）；因子缺失票保持不复权、与训练侧旧行为一致；`to_sina_code` 对 920 段的前缀处理沿用既有实现。
+
+### M. tail_recall 盘后实证与第 5 处适配 bug（2026-11-23 收盘后，来源：用户「现在应该可以进行之前的验证了」）
+
+**M1. 开关与标签成熟**
+
+- 用户拍板打开 `QD_TAIL_RECALL_ENABLED=1`（`.env`），cron 18:40 `tail_recall_daily` 守卫放行。
+- 11-20 打分日的标签需次一交易日收盘价：当日（11-23）盘后 `kline_1D_2026` max date=11-23，标签成熟；11-23 打分日需 11-24 价，未熟跳过。
+
+**M2. 第 5 处适配 bug（交付包原版遗留，dry-run 期因表空未暴露）**
+
+- 现象：开关打开、bar 已入库，但 `run_daily()` 仍 `filled=0`。
+- 定位：`recall_diag.py:84` `_score_dates` 的 `for d, mv in rows` 与 `:95` `_load_top` 的 `for r, n in cur.fetchall()` 是**位置解包**，但本项目 `PostgresCursor.fetchall()` 返回 `RealDictRow`，位置解包拿到的是**列名字符串**——实测 `pending=[('trade_date',['model_ver','model_ver'])]`，`score_date` 恒为字面量 `'trade_date'` ⇒ 标签成熟判断恒假。
+- 修复：照 `store.py::load_top` 的 `dict(r)` 按名取值改写这两处，不动语义、不兜底。`grep` 确认全文件无其它位置解包残留。
+- 这是交付包 `recall_diag.py` 入库以来发现的第 5 处适配问题（前 4 处：cursor 上下文管理器 ×4、bar 无 instrument 字段、code 来源、.env 未加载）；前次 dry-run 因表空恒走 fail-open 分支，掩盖了此 bug。
+
+**M3. 真库回填结果（11-20 → 11-23，model_ver=live_fixed:2026-11-20:109）**
+
+| K | n_tail | n_hit | recall@K | precision@K | recall_tradable |
+|---|---|---|---|---|---|
+| 20 | 453 | 4 | 0.0088 | 0.20 | 0.0089 |
+| 50 | 453 | 17 | 0.0375 | 0.34 | 0.0379 |
+| 100 | 453 | 36 | 0.0795 | 0.36 | 0.0780 |
+| 200 | 453 | 65 | 0.1435 | 0.325 | 0.1403 |
+
+- `filled=4`（1 个成熟打分日 × 4 个 K）；重跑 `filled=0`（ON CONFLICT DO NOTHING 幂等）；11-23 打分日标签未熟正确跳过。
+- 说明：这是**单日样本**（11-23 全市场 453 只尾部），不是 walk-forward 4 窗平均；与基线 recall@200=0.2311 口径不同，不可直接对比下结论。
+- 验证：py_compile OK；pytest 工具/schema/scheduler 子集 `273 passed`；收尾全量 `tmp/pytest_final_after_tailrecall_20261123.log` = **1 failed / 1941 passed / 4 skipped**（284s），与既有基线完全一致，唯一失败仍是 `llm_capture.py:74`（与本轮零交集）。
+- 回滚：`recall_diag.py` 两处改回位置解包（会复现 `filled=0`，不建议）；`.env` 开关改 0 或删行（cron 跳过）。

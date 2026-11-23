@@ -11,6 +11,9 @@
   - reverse_fwd_adjust(klines, code) — 将前复权K线还原为不复权
   - unadj_to_qfq(klines, code) — 不复权 → 前复权
   - unadj_to_hfq(klines, code) — 不复权 → 后复权
+  - factor_cache_fingerprint() — qfq 因子缓存文件指纹 (mtime_ns:size)，只读
+  - factor_cache_json() — qfq 因子缓存原始 dict，只读（调用方不得修改返回对象）
+  - to_sina_code(code) — 6 位代码归一为新浪前缀码 (sh/sz/bj...)，只读
 
 因子性质: 只增不改的历史档案 — 已有记录永远不变，只追加新除权日。
 缓存策略: 整体更新间隔为1天，每次更新会重新拉取所有活跃股票的数据。
@@ -474,3 +477,23 @@ def update_all_factors(max_workers: int = 16) -> int:
     _save_async(now)
     print(f"[复权因子] 全量更新完成: 成功 {updated}, 失败 {failed}")
     return updated
+
+
+def factor_cache_fingerprint() -> str:
+    """qfq 因子缓存文件指纹 (mtime_ns:size)，供下游做溯源/缓存失效；文件缺失返回 'missing'。"""
+    try:
+        st = os.stat(_CACHE_FILE)
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return "missing"
+
+
+def factor_cache_json() -> Dict:
+    """qfq 因子缓存原始 dict（只读快照）；调用方不得修改返回对象。"""
+    with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def to_sina_code(code: str) -> Optional[str]:
+    """6 位代码归一为新浪前缀码（sh/sz/bj...），无效返回 None。"""
+    return _to_sina_code(str(code))

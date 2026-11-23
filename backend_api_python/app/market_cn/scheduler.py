@@ -867,6 +867,31 @@ def _save_tail_scores_daily():
         logger.warning("[tail_scores_daily] 失败(忽略): %s: %s", type(e).__name__, e)
 
 
+def _save_tail_recall_daily():
+    """P0-A tail_recall 诊断回填（§4.3 轮子层独立归因，2026-11-23）。
+
+    对 qd_tail_scores 的打分日，用成熟后的次日行情算 tail_recall@K / precision@K
+    写入 qd_tail_recall（分数错是轮子的锅，与 agent 引用对错分账）。
+    - 放 18:40 —— 晚于 18:30 分数落库；标签未成熟（次日 bar 未入库）时 wheel 内部 fail-open 跳过；
+    - 启用开关 QD_TAIL_RECALL_ENABLED（默认 0）；Ks 走 QD_TAIL_RECALL_KS（默认 20,50,100,200）；
+    - 幂等由 wheel 的 UNIQUE(score_date,model_ver,k) + ON CONFLICT DO NOTHING 保证；
+    - fail-open：任何异常记 warning 不抛。
+    """
+    if (os.getenv("QD_TAIL_RECALL_ENABLED", "0") or "0").strip() != "1":
+        return
+    try:
+        from app.agent.wheels.gbdt_tail.recall_diag import run_daily
+        ks_raw = (os.getenv("QD_TAIL_RECALL_KS", "20,50,100,200") or "20,50,100,200")
+        ks = tuple(int(x) for x in ks_raw.split(",") if x.strip())
+        result = run_daily(ks=ks)
+        if "error" in (result or {}):
+            logger.warning("[tail_recall_daily] 跳过: %s", result["error"])
+        else:
+            logger.info("[tail_recall_daily] %s", result)
+    except Exception as e:
+        logger.warning("[tail_recall_daily] 失败(忽略): %s: %s", type(e).__name__, e)
+
+
 # 任务列表
 TASKS = [
     # 盘中周期任务
@@ -900,6 +925,9 @@ TASKS = [
     # P0-A GBDT 粗筛分数落库 (2026-11-23, 接入闭环 [a]): 放 18:30 —— 晚于日线定稿与资金流,
     # 纯本地无 LLM; 默认关闭(QD_TAIL_SCORES_ENABLED=1 才跑), 幂等复用 qd_scheduler_done。
     Task("tail_scores_daily", _save_tail_scores_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=30),
+    # P0-A tail_recall 诊断回填 (2026-11-23, §4.3 轮子层归因): 18:40 —— 晚于 18:30 分数落库;
+    # 标签成熟才回填(跳过未成熟日); 默认关闭(QD_TAIL_RECALL_ENABLED=1 才跑)。
+    Task("tail_recall_daily", _save_tail_recall_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=40),
 ]
 
 
