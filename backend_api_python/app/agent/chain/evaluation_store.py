@@ -711,7 +711,22 @@ def upsert_outcome(*, decision_id: Any = None, claim_id: Any = None,
                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (prediction_id, outcome_policy_version) DO UPDATE SET
                     canonical = EXCLUDED.canonical,
-                    resolved_at = COALESCE(EXCLUDED.resolved_at, qd_agent_evaluation_outcomes.resolved_at)
+                    resolved_at = COALESCE(EXCLUDED.resolved_at, qd_agent_evaluation_outcomes.resolved_at),
+                    verdict = EXCLUDED.verdict,
+                    verdict_score = EXCLUDED.verdict_score,
+                    resolution_id = EXCLUDED.resolution_id,
+                    forecast_capture_status = EXCLUDED.forecast_capture_status,
+                    execution_status = EXCLUDED.execution_status,
+                    sample_layer = EXCLUDED.sample_layer,
+                    brier_score = EXCLUDED.brier_score,
+                    data_as_of = EXCLUDED.data_as_of,
+                    data_quality = EXCLUDED.data_quality,
+                    coverage_gap = EXCLUDED.coverage_gap,
+                    actual_windows = EXCLUDED.actual_windows,
+                    adapter_data = EXCLUDED.adapter_data,
+                    outcome_available_at = COALESCE(EXCLUDED.outcome_available_at, qd_agent_evaluation_outcomes.outcome_available_at)
+                WHERE COALESCE(qd_agent_evaluation_outcomes.verdict, '') = ''
+                  AND EXCLUDED.verdict IN ('hit', 'miss', 'partial')
                 RETURNING outcome_id
             """, (oid, pid, decision_id, claim_id, resolution_id,
                   _s(outcome_policy_version, 32), _s(label_rule_version, 32),

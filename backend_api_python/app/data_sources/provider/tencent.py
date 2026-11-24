@@ -6,7 +6,8 @@ API来源 & 最新信息:
   - 浏览器F12抓包 https://gu.qq.com/ 或 https://stockapp.finance.qq.com/
   - 行情: qt.gtimg.cn/q=sh600519（经典接口，多年未变）
   - K线分钟: ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600519,m15,300
-  - K线日周: web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600519,day,,,300,qfq
+  - K线日周: appstock/app/fqkline/get，web.ifzq 与 ifzq 双主机镜像
+    （WAF 按 host 独立限流，主机被 501 时自动切换，见 _fetch_fqkline）
   - mkline: 分钟线（m1/m5/m15/m30/m60），不支持复权
   - fqkline: 日/周线（day/week），支持前/后复权
 
@@ -69,6 +70,42 @@ _tc_kline_referers = _RefererPool([
     "https://stockapp.finance.qq.com/",
     "https://stock.qq.com/",
 ])
+
+# fqkline 镜像主机: 同一 API，但 WAF 按 host 独立限流。
+# 批量抓取时被封的那台会持续返回 501（HTML 挑战页），另一台仍可正常 200；
+# 实测两台状态会随时间互换（2026-11-24: web 被封时 ifzq 可用，数分钟后反转）。
+# 因此不能写死主机，必须"记住最近可用主机 + 501 时切换"。
+_TC_FQ_HOSTS = ("https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn")
+_tc_fq_host = _TC_FQ_HOSTS[0]
+_tc_fq_host_lock = threading.Lock()
+
+
+def _fetch_fqkline(params: Dict[str, str], timeout: float):
+    """请求腾讯 fqkline，501 时自动切换镜像主机。
+
+    Returns:
+        requests.Response（最后一次尝试）；全部 501 时 status_code 仍为 501，
+        由上层的 501 分支统一跳过该源。
+    """
+    global _tc_fq_host
+    with _tc_fq_host_lock:
+        first = _tc_fq_host
+    hosts = [first] + [h for h in _TC_FQ_HOSTS if h != first]
+
+    resp = None
+    for host in hosts:
+        resp = requests.get(
+            host + "/appstock/app/fqkline/get",
+            headers=get_request_headers(referer=_tc_kline_referers.next()),
+            params=params, timeout=timeout,
+        )
+        if resp.status_code != 501:
+            if host != first:
+                with _tc_fq_host_lock:
+                    _tc_fq_host = host
+                logger.info("[tencent] fqkline 主机切换 → %s", host)
+            return resp
+    return resp
 
 # 腾讯行情接口 Referer 池
 _tc_quote_referers = _RefererPool([
@@ -310,18 +347,17 @@ class TencentDataSource:
             # 实测(2026-10): 带 count 的 param（sh600519,m15,30）返回 0 行，
             # 去掉 count（sh600519,m15）返回全量。取全量后本地截断，失败再退回带 count。
             params = {"param": f"{c},{tc_tf}"}
+            resp = requests.get(
+                url, headers=get_request_headers(referer=_tc_kline_referers.next()),
+                params=params, timeout=timeout,
+            )
         else:
-            url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
             # fqkline 原生支持日期范围: param=code,period,start,end,count,adj
             sd = start_date if start_date else ""
             ed = end_date if end_date else ""
             # adj: "qfq"=前复权, "hfq"=后复权, ""=不复权
             params = {"param": f"{c},{tc_tf},{sd},{ed},{int(count)},"}
-
-        resp = requests.get(
-            url, headers=get_request_headers(referer=_tc_kline_referers.next()),
-            params=params, timeout=timeout,
-        )
+            resp = _fetch_fqkline(params, timeout)
 
         if resp.status_code == 501:
             logger.debug("[tencent] %s %s HTTP 501 (WAF拦截)，跳过该源", timeframe, c)

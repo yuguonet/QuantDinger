@@ -391,16 +391,66 @@ def _mark_event(name: str, date: str = None):
 # 进程内已扫缓存 (2026-09-29): DB 批量读抖动时仍不重复全市场扫描
 # {trade_date: {strategy_key, ...}}。与 qd_scheduler_done 双写/双读, 任一命中即视为已完成。
 _daily_scanned: dict = {}
-# dispatch 维护的空闲标志: 当日已扫完 → 间隔退避 600s + 压掉空转 INFO (2026-09-29)
+# dispatch 维护的空闲标志: 当日已扫完 → 间隔退避 1800s + 压掉空转 INFO (2026-09-29)
 _daily_scan_state = {"pending": True}
 
 
 def _daily_scan_interval() -> int:
-    """有未扫策略 → 60s; 当日已扫完 → 600s 自愈兜底 (重启/补数据用)。"""
-    return 60 if _daily_scan_state.get("pending", True) else 600
+    """兜底轮询间隔 (主触发已改为 mark_event 推送, 见 _daily_scan_wake_worker):
+    有未扫策略 → 300s (兜底重启/deriver 自愈); 当日已扫完 → 1800s (仅防漏)。"""
+    return 300 if _daily_scan_state.get("pending", True) else 1800
+
+
+# ── 事件推送唤醒 (2026-11-24) ─────────────────────────────────
+# 原 60s 盲轮询: 数据就绪后最多等 60s, 空转期间每 60s 查一次 done/事件表。
+# 改为 mark_event(数据任务收尾) → 置位 → 2s 去抖 → 立即分发;
+# 兜底轮询保留, 覆盖「重启后事件未 mark」「deriver 自愈」等无推送路径。
+_scan_wake = threading.Event()
+_scan_wake_started = False
+_daily_scan_dispatch_lock = threading.Lock()
+
+
+def _wake_daily_scan(name: str = "", date: str = ""):
+    """events.mark_event 订阅回调: 只置位, 不阻塞数据任务线程 (重活在 worker 里)。"""
+    _scan_wake.set()
+
+
+def _daily_scan_wake_worker():
+    while True:
+        _scan_wake.wait()
+        _scan_wake.clear()
+        _time.sleep(2.0)      # 去抖: daily_1d / lhb 连续 mark 合并成一次分发
+        _scan_wake.clear()
+        try:
+            _daily_scan_dispatch()
+        except Exception:
+            logger.exception("[daily_scan] 事件唤醒分发失败(等兜底轮询重试)")
+
+
+def _start_daily_scan_wake():
+    """幂等启动推送 worker 并订阅事件 (由 start() 调用)。"""
+    global _scan_wake_started
+    if _scan_wake_started:
+        return
+    _scan_wake_started = True
+    from app.market_cn.auto import events
+    events.subscribe(_wake_daily_scan)
+    threading.Thread(target=_daily_scan_wake_worker, daemon=True,
+                     name="daily-scan-wake").start()
+    logger.info("[daily_scan] 事件推送已启用 (mark_event → 2s 去抖分发)")
 
 
 def _daily_scan_dispatch():
+    """盘后扫描分发入口: 单飞保护 (兜底轮询与事件推送可能同时到达)。"""
+    if not _daily_scan_dispatch_lock.acquire(blocking=False):
+        return
+    try:
+        _daily_scan_dispatch_locked()
+    finally:
+        _daily_scan_dispatch_lock.release()
+
+
+def _daily_scan_dispatch_locked():
     """盘后扫描分发 (2026-09-29): 策略 after_events/fire_at 就绪即触发 keys 子集。
 
     取代 dragon_scan 17:25 硬编码 —— 触发声明在策略 ScanSpec / config.json schedule,
@@ -822,7 +872,7 @@ def _save_fund_flow_daily():
 
     为什么独立成任务而不并入 `_post_market_batch`:
       ① 后者要串行回填 1m(5221 标的 x 240 条) + 日线 + 龙虎榜, 跑完时刻不定;
-         本任务放 18:00 与之解耦, 互不拖累;
+         本任务放 17:10 与之解耦, 互不拖累;
       ② days=7 的"自愈"语义与 batch 的"仅当天"不同 —— 容许补前几天,
          任一天失败/漏跑, 只要还在窗口内下次自动补上。
 
@@ -872,7 +922,7 @@ def _save_tail_recall_daily():
 
     对 qd_tail_scores 的打分日，用成熟后的次日行情算 tail_recall@K / precision@K
     写入 qd_tail_recall（分数错是轮子的锅，与 agent 引用对错分账）。
-    - 放 18:40 —— 晚于 18:30 分数落库；标签未成熟（次日 bar 未入库）时 wheel 内部 fail-open 跳过；
+    - 放 17:30 —— 晚于 17:20 分数落库；标签未成熟（次日 bar 未入库）时 wheel 内部 fail-open 跳过；
     - 启用开关 QD_TAIL_RECALL_ENABLED（默认 0）；Ks 走 QD_TAIL_RECALL_KS（默认 20,50,100,200）；
     - 幂等由 wheel 的 UNIQUE(score_date,model_ver,k) + ON CONFLICT DO NOTHING 保证；
     - fail-open：任何异常记 warning 不抛。
@@ -911,6 +961,8 @@ TASKS = [
     # 自动策略组: 盘后扫描(事件驱动分发) + 盘中状态机(60s)
     # 2026-09-29: dragon_scan 17:25 硬编码 → daily_scan 按策略 after_events/fire_at 就绪触发
     # (auto/sched.py::daily_fire_ready + auto/events.py). 数据任务 mark_event, 本任务 60s 扫就绪集。
+    # 2026-11-24: 主触发改为 mark_event 推送(_start_daily_scan_wake), 本 Task 的 interval 仅作兜底,
+    #              实际间隔由 _daily_scan_interval() 动态给出 (未扫完 300s / 已扫完 1800s)。
     Task("daily_scan",    _daily_scan_dispatch,    interval=60, trading_only=False),
     # knife_scan 触发时刻由 auto/sched.py 分段声明决定 (config.json schedule 段为事实源,
     # 见 _knife_trigger_hm; Task 上的 trigger_* 仅作 sched 不可用时的兜底)
@@ -919,15 +971,15 @@ TASKS = [
     Task("knife_scan",     _dragon_strategy_knife_scan, interval=86400, trading_only=True, once_per_slot=True),
     Task("dragon_monitor", _dragon_strategy_monitor, interval=60,   trading_only=True),
     # 资金流日度落库 (2026-09-27 用户裁定): `kline_15m` 已作废 => 1m 是唯一可用分钟源。
-    # 放 18:00 —— 晚于 post_market_batch(15:30, 内含 1m 回填), 与之解耦;
+    # 放 17:10 —— 晚于 post_market_batch(15:30, 内含 1m 回填), 与之解耦;
     # days=7 自愈: 当日 1m 未到位则自动跳过, 次日补上。
-    Task("fund_flow_daily", _save_fund_flow_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=0),
-    # P0-A GBDT 粗筛分数落库 (2026-11-23, 接入闭环 [a]): 放 18:30 —— 晚于日线定稿与资金流,
+    Task("fund_flow_daily", _save_fund_flow_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=10),
+    # P0-A GBDT 粗筛分数落库 (2026-11-23, 接入闭环 [a]): 放 17:20 —— 晚于日线定稿与资金流,
     # 纯本地无 LLM; 默认关闭(QD_TAIL_SCORES_ENABLED=1 才跑), 幂等复用 qd_scheduler_done。
-    Task("tail_scores_daily", _save_tail_scores_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=30),
-    # P0-A tail_recall 诊断回填 (2026-11-23, §4.3 轮子层归因): 18:40 —— 晚于 18:30 分数落库;
+    Task("tail_scores_daily", _save_tail_scores_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=20),
+    # P0-A tail_recall 诊断回填 (2026-11-23, §4.3 轮子层归因): 17:30 —— 晚于 17:20 分数落库;
     # 标签成熟才回填(跳过未成熟日); 默认关闭(QD_TAIL_RECALL_ENABLED=1 才跑)。
-    Task("tail_recall_daily", _save_tail_recall_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=18, trigger_minute=40),
+    Task("tail_recall_daily", _save_tail_recall_daily, interval=86400, trading_only=False, once_per_day=True, trigger_hour=17, trigger_minute=30),
 ]
 
 
@@ -1213,6 +1265,9 @@ def start():
 
     t = threading.Thread(target=_scheduler_loop, daemon=True, name="scheduler")
     t.start()
+
+    # daily_scan 主触发走事件推送 (mark_event → 立即分发), 兜底轮询见 TASKS
+    _start_daily_scan_wake()
 
     # ── mootdx 全局单例保活（L1，2026-10-25）──────────────────
     # 单例 TTL 3600s，到期重建走 mootdx_client._create_client 的免扫描直连

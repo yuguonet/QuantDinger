@@ -37,6 +37,28 @@ _lock = threading.Lock()
 _cache: dict[tuple[str, str], bool] = {}
 _neg_ts: dict[tuple[str, str], float] = {}
 _NEG_TTL_SEC = 60.0
+# 事件订阅者 (2026-11-24): mark_event 后同步回调, 用于把「数据就绪」
+# 从「调度盲轮询」变成「推送即触发」。回调必须快速返回 (置位/入队),
+# 禁止在回调里跑重活 —— 它在数据任务的收尾线程上执行。
+_subscribers: list = []
+
+
+def subscribe(fn):
+    """注册事件回调 fn(name, date)。重复注册幂等。"""
+    with _lock:
+        if fn not in _subscribers:
+            _subscribers.append(fn)
+
+
+def _notify(name: str, date: str):
+    with _lock:
+        subs = list(_subscribers)
+    for fn in subs:
+        try:
+            fn(name, date)
+        except Exception as e:
+            logger.warning("[events] 订阅回调失败 %s: %s",
+                           getattr(fn, "__name__", fn), e)
 
 
 # ================================================================
@@ -132,6 +154,7 @@ def mark_event(name: str, date: str) -> bool:
         _neg_ts.pop((name, date), None)
     _db_mark(name, date)
     logger.info("[events] mark %s @ %s", name, date)
+    _notify(name, date)
     return name in KNOWN_EVENTS
 
 

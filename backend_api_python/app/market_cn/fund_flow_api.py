@@ -1338,13 +1338,16 @@ def update_intraday_fund_flow(codes: Optional[List[str]] = None) -> Dict[str, An
                 "elapsed": 0.0}
     day = datetime.now().strftime("%Y-%m-%d")
     try:
-        rows = _market_from_kline1m(1, as_of=day)
-        if not rows:
-            rows = _market_from_snapshot(1, as_of=day)
-        # _snap_days 可能无今日(开盘前) → 空
-        row = next((r for r in rows if r.get("trade_date") == day), None)
-        if row is None and rows:
-            row = rows[0]
+        # ⚠ 按「当日精确匹配」取行，不能用 `if not rows` 兜底 (2026-11-24 修):
+        #   _clamp_days(1) 被夹到下限 KEEP_DAYS_MIN=5 天，历史 1m 非空 ⇒ rows 恒非空，
+        #   snapshot 兜底永不触发；且 _market_from_kline1m 返回**升序**，rows[0] 是窗口内
+        #   最旧的一天 ⇒ 盘中每拍都在重写 7 天前的行，今日行永远不落库。
+        #   正确语义: 今日无 1m(盘中常态，1m 盘后才回填) 就退到 snapshot 派生的今日行。
+        row = next((r for r in _market_from_kline1m(1, as_of=day)
+                    if r.get("trade_date") == day), None)
+        if row is None:
+            row = next((r for r in _market_from_snapshot(1, as_of=day)
+                        if r.get("trade_date") == day), None)
         if row:
             upsert_market([row])
             _LAST_INTRADAY_TS = _time.time()

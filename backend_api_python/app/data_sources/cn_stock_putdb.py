@@ -550,9 +550,13 @@ def sync_stock_kline(tf: str = "1D", symbols: Optional[List[str]] = None,
         return {"status": "error", "written": 0, "failed": 0, "report": "无股票列表"}
 
     from app.data_sources.coordinator import get_coordinator
+    # min_last_date: 最新 bar 早于目标交易日 ⇒ 该源本次判失败、symbol 立即回池换源重拉。
+    # 盘后 15:30 时 sohu / 部分 10jqka 的日线尚未更新，若按"谁先回谁赢"接受，
+    # symbol 被占位后不再重试，下面的目标日过滤会把整批丢成 failed（2026-11-24 丢 1104 只）。
     bars = get_coordinator().coordinate_market_kline(
         market="CNStock", timeframe=tf, count=count,
-        timeout=_stock_kline_sync_timeout(), symbols=fetch_symbols)
+        timeout=_stock_kline_sync_timeout(), symbols=fetch_symbols,
+        min_last_date=target_td)
     if not bars:
         logger.error("[putdb] kline_%s 拉取到 0 条记录，跳过删除和写入（目标 %s）", tf, target_td)
         return {"status": "error", "written": 0, "failed": len(fetch_symbols),

@@ -5007,3 +5007,4 @@
 {"ts": "2026-11-24 14:03:18", "query": "现在(2026-11-24 14:00:28)买什么股?", "tools": ["run_skill"]}
 {"ts": "2026-11-24 14:38:24", "query": "现在(2026-11-24 14:36:34)买什么股?", "tools": ["run_skill"]}
 {"ts": "2026-11-24 14:47:43", "query": "方正电机的资金上午流入多少,下午流出多少? 今天(2026-11-24)", "tools": ["search_resources", "get_fund_flow", "get_realtime_quote"]}
+{"ts": "2026-11-24 21:36:39", "query": "明天(2026-11-25)买什么股,将选择的结果添加到自选股中", "tools": ["update_plan", "activate_tools", "run_skill", "add_watchlist"]}

@@ -127,7 +127,8 @@ def fetch_index_quote(code: Optional[str] = None,
 def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dict[str, Any]:
     """指数日K线（腾讯 fqkline，timeframe=1D；其余周期 NotSupported）。
 
-    API: web.ifzq.gtimg.cn/appstock/app/fqkline/get
+    API: ifzq.gtimg.cn/appstock/app/fqkline/get
+    （不要用 web.ifzq.gtimg.cn：高频批量时返回 HTTP 501 WAF，2026-11-24 实测）
     返回 data.{code}.day = [[date, open, close, high, low, volume], ...]
     volume 原始"手"→×100 转"股"对齐 mootdx 口径。
     """
@@ -136,25 +137,39 @@ def fetch_index_kline(code: str, timeframe: str = "1D", limit: int = 250) -> Dic
 
     if normalize_chart_timeframe(timeframe) != "1D":
         return NotSupported("index_kline/%s" % timeframe)
+    import urllib.error
     import urllib.request
 
     tc_code = _index_tencent_code(code)
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # 双主机镜像: WAF 按 host 独立限流，被限流的那台持续 501，另一台仍可用，
+    # 且两台状态会随时间互换（2026-11-24 实测）→ 501 时切换。
+    hosts = ("https://web.ifzq.gtimg.cn", "https://ifzq.gtimg.cn")
     params = f"param={tc_code},day,,,{limit},"
 
-    try:
-        req = urllib.request.Request(
-            f"{url}?{params}",
-            headers=dict(_HTTP_HEADERS, Referer="https://gu.qq.com/"),
-        )
-        raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
-    except Exception as e:
-        # 必须 raise 让 dispatch 换源：同族还有 sina / baostock / akshare / mootdx。
-        # 返回空信封会被 is_rows 判「成功」（它只校验 rows 是 list，不看是否为空），
-        # 于是一个 501 就把同族全部备用源挡在门外 —— 2026-10-28 1.log 九个指数
-        # 日线全灭、error 还是空串，根因就在这里。
-        logger.warning("[tencent] index_kline %s 请求失败: %s", code, e)
-        raise
+    raw = None
+    last_err = None
+    for host in hosts:
+        try:
+            req = urllib.request.Request(
+                f"{host}/appstock/app/fqkline/get?{params}",
+                headers=dict(_HTTP_HEADERS, Referer="https://gu.qq.com/"),
+            )
+            raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="replace")
+            break
+        except Exception as e:
+            last_err = e
+            if getattr(e, "code", None) == 501:
+                logger.debug("[tencent] index_kline %s %s HTTP 501, 切换镜像主机", code, host)
+                continue
+            # 必须 raise 让 dispatch 换源：同族还有 sina / baostock / akshare / mootdx。
+            # 返回空信封会被 is_rows 判「成功」（它只校验 rows 是 list，不看是否为空），
+            # 于是一个 501 就把同族全部备用源挡在门外 —— 2026-10-28 1.log 九个指数
+            # 日线全灭、error 还是空串，根因就在这里。
+            logger.warning("[tencent] index_kline %s 请求失败: %s", code, e)
+            raise
+    if raw is None:
+        logger.warning("[tencent] index_kline %s 双主机均 501: %s", code, last_err)
+        raise last_err
 
     try:
         import json

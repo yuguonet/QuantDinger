@@ -275,7 +275,7 @@ def _normalize_symbols(symbols, market: str) -> List[str]:
     return result
 
 
-def _is_valid_kline(bars) -> bool:
+def _is_valid_kline(bars, min_last_date: str = "") -> bool:
     """
     校验 K 线数据是否有效。
 
@@ -284,6 +284,15 @@ def _is_valid_kline(bars) -> bool:
       - 空 list
       - list 内容不是 dict（如 ["error", "N/A"]）
       - dict 里关键字段全为空/0/NaN
+      - min_last_date 非空时，最新一根 bar 的日期 < min_last_date（数据陈旧）
+
+    Args:
+        bars: 待校验的 bar 列表
+        min_last_date: "YYYY-MM-DD"；非空则要求覆盖该日。
+            ⚠ 多源"谁先回谁赢"必须先过新鲜度校验，否则日线尚未更新的源
+            （如 15:30 的 sohu/部分 10jqka 仍只有昨日 bar）会先抢答成功，
+            symbol 被占位后不再重试，调用方按目标日过滤时整批丢失
+            （2026-11-24 实测 5592 只丢 1104 只）。
 
     Returns:
         True = 数据可用, False = 应丢弃并重试
@@ -317,6 +326,16 @@ def _is_valid_kline(bars) -> bool:
             has_data = True
             break
         if not has_data:
+            return False
+
+    if min_last_date:
+        newest = ""
+        for bar in bars:
+            t = bar.get("time") or bar.get("date") or bar.get("datetime")
+            s = str(t)[:10] if t else ""
+            if s > newest:
+                newest = s
+        if newest < min_last_date:
             return False
     return True
 
@@ -1333,6 +1352,7 @@ class Coordinator:
         start_date: str = "",
         end_date: str = "",
         symbols: Optional[List[str]] = None,
+        min_last_date: str = "",
     ) -> List[Dict[str, Any]]:
         """
         全市场批量K线 — 长效线程 + 主池/重试池 + 立即退出。
@@ -1362,6 +1382,9 @@ class Coordinator:
             start_date: 起始日期
             end_date: 结束日期
             symbols: 股票代码列表，为 None 时自动获取全市场
+            min_last_date: "YYYY-MM-DD"；非空则要求返回的最新 bar 不早于该日。
+                未达标视作该源本次失败 → symbol 立即回到重试池换源重拉（同一轮内完成，
+                不需要再起第二轮补拉）。日线增量同步必须传目标交易日。
 
         Returns:
             List[Dict] — K线数据列表，每个 dict 含 symbol 字段表示所属股票。
@@ -1614,9 +1637,9 @@ class Coordinator:
             流程:
               1. 检查是否已被其他源完成（跳过）
               2. 硬超时调用 fetch_kline(code=sym)（卡死不会阻塞 worker）
-              3. 校验数据有效性 (_is_valid_kline)
+              3. 校验数据有效性 (_is_valid_kline，含 min_last_date 新鲜度)
               4. 有效 → _mark_success（首次成功才计入，后回丢弃）
-              5. 硬超时/无效/空/异常 → _return_to_retry（标记源失败，放回重试池）
+              5. 硬超时/无效/陈旧/空/异常 → _return_to_retry（标记源失败，symbol 回池换源）
 
             Returns:
                 True = 成功或已由其他源完成
@@ -1665,7 +1688,7 @@ class Coordinator:
                 # 有返回数据 → 校验有效性
                 if task_result:
                     bars = task_result.get("bars", [])
-                    if bars and _is_valid_kline(bars):
+                    if bars and _is_valid_kline(bars, min_last_date):
                         # 有效数据 → 尝试标记成功
                         _realtime_cb.record_success(source_name)
                         cfg = get_source_config(source_name)
