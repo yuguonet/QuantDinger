@@ -623,6 +623,13 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
     if rng > 0:
         intraday_pos = (close - today["low"]) / rng * 100
 
+    # 近5日平均振幅%（止损宽度基准：贴身止损=噪声成本，见 strategy-rules §六；
+    # 2026-11-24 回测调研发现规则缺数据支撑，补此字段）
+    amps = [(bars[j]["high"] - bars[j]["low"]) / bars[j - 1]["close"] * 100
+            for j in range(max(1, len(bars) - 5), len(bars))
+            if bars[j - 1].get("close")]
+    amp_avg5 = round(sum(amps) / len(amps), 2) if amps else None
+
     d1_chg = None
     if len(bars) >= 3 and bars[-3]["close"]:
         d1_chg = (prev["close"] - bars[-3]["close"]) / bars[-3]["close"] * 100
@@ -647,6 +654,7 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
         "change_pct": round(chg, 2),
         "chg_prev_pct": round(d1_chg, 2) if d1_chg is not None else None,
         "amplitude_pct": round(rng / prev["close"] * 100, 2) if prev["close"] and rng else None,
+        "amp_avg5": amp_avg5,
         "close_pos_in_day": round(intraday_pos, 1) if intraday_pos is not None else None,
         "vol_ratio": round(vr, 2) if vr else None,
         "vr_rel": vr_rel,
@@ -664,6 +672,10 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
             "near_support": bool(nearest and abs(nearest["d"]) <= 3.0),  # |dist|<=3% 视为贴支撑
             "supports": levels["supports"],   # 现价下方候选，由近到远，≤3 条
             "resists": levels["resists"],     # 现价上方候选，由近到远，≤2 条
+            # 支撑-压力间距%（过窄→操作性弱，见 SKILL.md 维度4）
+            "sr_gap_pct": round((levels["resists"][0]["px"] - levels["supports"][0]["px"])
+                                / close * 100, 2)
+            if (levels["resists"] and levels["supports"] and close) else None,
         },
         "ma_bull_stack": bool(_last(ma5) and _last(ma10) and ma20_v and _last(ma5) > _last(ma10) > ma20_v),
         "hi20": round(hi20, 2),

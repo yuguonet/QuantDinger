@@ -15,6 +15,15 @@ analyze() 不自建取证链，deep 负责把单票全维证据（日线技术�
      sector/tape 七维）：方向必须 ≥2 维同向且与反向差值 ≥2 才成立。
      tape 维含事件证据（解禁供给压力，日历源 `get_lockup_expiry`）；
      触发条件的时间口径按 `session`（盘前/盘中/盘后/非交易日）区分，不拿盘中诊断当次日预案。
+  ④ 三项补充事实（不改变七维投票、_DIMS 与 confidence）：`market_outlook` 把底层已标定
+     的大盘次日涨概率从 `prediction.model` 提为独立输出；`cap_regime` 按「弱市跌多涨少
+     ⇒ 大流通市值相对占优，强市涨多跌少 ⇒ 小盘相对占优」给出市值分层事实；`board_rank`
+     用 realtime_snapshot 判定板块内排名、龙头/跟风；`trend_outlook` 只做长档日线趋势。
+     三块逻辑全在本技能本地模块，与 market-screener 无引用关系。
+  ⑤ 补证事实层（`_extra_facts`）：同批并发取筹码分布、资金节奏、情报面、融资与基本面、
+     日内结构、多周期方向、估值快照、日频资金共八类；只陈述事实、不进七维投票；
+     其中可核对的离场压力事实进 `stop_pressure`，与价格/资金/板块/大盘事实并列计数。
+     日内与多周期取数目标日由 `current_data_day()` 钉死，工具默认的「今天」在非交易日会取错日。
 
 【证据纪律（用户裁定 2026-11-03，不可放松）】
   · 不猜测、不妄想：结论只允许来自返回的事实字段，缺数就承认缺数；
@@ -53,16 +62,56 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...log import logger
-from . import _inner, _levels
+from . import _board_rank, _cap_regime, _inner, _levels, _mtf_guard, _trend
 
 #: 全周期档位（顺序即输出顺序）；天数不在此硬编码，取 `label_spec.HOLDS`
 _HORIZONS: Tuple[str, ...] = ("T+1", "T+3", "T+5", "T+10", "T+20")
 
 _ANALYZE_REPORT_GUIDE = {
     "OUTPUT_FORM": (
-        "按当前数据时点先给结论，再分列事实、推导、判断、风险与未知项；"
-        "使用 horizons 的五档方向、触发条件和证伪条件。用户只要求分析时，不给命令式买卖或仓位指令；"
-        "价位只作为条件情景，不保证买卖结果。"
+        "先按当前数据时点用一句话给结论，再给 execution_core 四要素，最后是极简依据；不重列完整表格。"
+        "四要素直接读 execution_core：买点/卖点是条件触发参考价（不是下单指令），"
+        "hold_days 是预计持仓时间，risk_reward_ratio 是持仓风险收益比；任一为 NULL 就写未知并点明缺什么。"
+        "horizons 只有 T+1/T+3/T+5 三档，每档最多一行「方向（置信度）｜触发｜证伪」，证据只取最关键 1-2 条；"
+        "T+10/T+20 不逐档给触发/证伪，只按 trend_outlook 的日线趋势一句话陈述；"
+        "market_outlook/cap_regime/board_rank/九块补证事实是经验收集用，正文最多各一句带过，不改变七维投票结论。"
+        "不给命令式买卖或仓位指令；价位只作为条件情景，不保证买卖结果。"
+    ),
+    "CORE_FOUR": (
+        "全自动场景只关心四要素，必须逐项给出：买点（放量站上何价才转多的触发参考）、"
+        "卖点（收盘跌破何价的止损参考，偏空时附反抽压力减仓参考）、预计持仓时间（hold_days 天）、"
+        "持仓风险收益比（risk_reward_ratio=(最近压力−现价)/(现价−最近止损)，价外记不适用）。"
+        "四要素来自 levels/horizons 派生，是条件触发参考价、不是买卖指令；缺验证价位写未知不猜。"
+    ),
+    "LENGTH": (
+        "结论全文控制在 {max_chars} 字以内（含四要素、三档与风险）；四要素各一行，"
+        "三档各一行且每档证据最多 2 条，按 basis 顺序取最关键，不要逐维复述。"
+        "正文只放结论与可执行条件，长篇解释留给结构化字段做经验收集。"
+        "宁可短而可执行，不要长而面面俱到。"
+    ),
+    "FLOW_DRIVER": (
+        "资金驱动只分析 20 日以内（flow_driver.sequence），按逐日「资金净额×涨幅」形态"
+        "（推进/承接/惜售/共振）陈述，配合 intraday 分时支撑看短线节奏；"
+        "20 日以上长线资金不进方向判断。资金净额是价格方向近似、非主力分类，"
+        "四档拆单本地不可得，不得推算庄家持仓成本或利润空间。"
+    ),
+    "DIRECTION_WORDS": (
+        "方向词只能用词表五选一：看多 / 看空 / 中性 / 证据不足 / 未知。"
+        "禁止「可能上涨」「建议关注」「谨慎乐观」「或有压力」「大概率」等模糊措辞；"
+        "证据不足就写证据不足并点明缺什么，不要用地表述替代方向。"
+    ),
+    "CONSISTENCY": (
+        "若本轮对同一只票给出与上一轮不同的方向/止损位，必须显式写出"
+        "「较上一轮由 X 改为 Y，依据 Z」，Z 只能是本轮新出现的可观测事实"
+        "（价格破位、量能、资金方向、板块 α、均线位置）。没有新增事实时维持上一轮结论，"
+        "不得仅因时点变化而翻转方向。"
+    ),
+    "STOP_CALIBER": (
+        "horizons 的 invalidate 是最近一道**止损参考位**（verified 且距现价最近），"
+        "last_defense 是更远、方法数更多的最后防线；两层都写清，不要把远位当成唯一防线。"
+        "stop_pressure 只统计离场压力的**事实条数**（价格/资金/板块/大盘/筹码/情报/融资/日内结构的可核对事实），"
+        "条数多时明确提示「核对止损参考位」，但它是事实汇总，不是买卖指令、不改方向投票。"
+        "用户问去留/止损时，把参考位与压力事实前置；只问分析时照条件情景陈述，不下命令。"
     ),
     "EVIDENCE": (
         "外部事实注明来源和对应日期。flow 是价格方向净额近似，不是主力/机构资金分类；"
@@ -85,6 +134,13 @@ _CONF_CAP_DEFAULT: Dict[str, float] = {
     "T+1": 0.90, "T+3": 0.72, "T+5": 0.68, "T+10": 0.58, "T+20": 0.50,
 }
 
+#: 输出层强调的短档；长档（T+10/T+20）仍逐档计算但只由 trend_outlook 承载。
+#: 分清「内部全档计算」与「输出强调档」，五档计算能力不因收敛而删除。
+_SHORT_HORIZONS: Tuple[str, ...] = ("T+1", "T+3", "T+5")
+
+#: 结论全文字符上限（只约束 LLM 写作，不改事实字段）。env 可覆盖。
+_REPORT_MAX_CHARS_DEFAULT = 400
+
 _BARS_DAYS_DEFAULT = 120
 
 #: 并发取证总等待上限：deep 内部还有一层并发，这里给宽裕值防拖死整轮
@@ -105,6 +161,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _conf_cap() -> Dict[str, float]:
     raw = os.environ.get("QD_STOCK_ANALYZER_CONF_CAP") or ""
     cap = dict(_CONF_CAP_DEFAULT)
@@ -118,6 +181,48 @@ def _conf_cap() -> Dict[str, float]:
 
 def _bars_days() -> int:
     return _env_int("QD_STOCK_ANALYZER_BARS_DAYS", _BARS_DAYS_DEFAULT)
+
+
+def _report_guide() -> Dict[str, str]:
+    guide = dict(_ANALYZE_REPORT_GUIDE)
+    guide["LENGTH"] = guide["LENGTH"].format(
+        max_chars=_env_int("QD_STOCK_ANALYZER_REPORT_MAX_CHARS", _REPORT_MAX_CHARS_DEFAULT))
+    return guide
+
+
+def _brief_view(horizons: List[Dict[str, Any]], trend: Dict[str, Any]) -> str:
+    """三档 + 长档的一句话骨架，供写作直接照抄；不新增事实，只压字数。"""
+    lines = []
+    for v in horizons:
+        conf = f"（{v['confidence']}）" if v.get("confidence") else ""
+        lines.append(f"{v['h']} {v['dir']}{conf}｜触发：{v.get('trigger') or '—'}｜证伪：{v.get('invalidate') or '—'}")
+    if isinstance(trend, dict) and trend.get("trend"):
+        lines.append(f"长档（日线趋势）：{trend['trend']}"
+                     + (f"，{trend['basis']}" if trend.get("basis") else ""))
+    return "\n".join(lines)
+
+
+def _consistency_view(horizons: List[Dict[str, Any]],
+                      prev: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """与上一轮结论比对：只列方向/止损变化的事实，依据由写作层填；缺省 None 不触发。"""
+    if not isinstance(prev, dict) or not prev:
+        return None
+    changes = []
+    for v in horizons:
+        h = v["h"]
+        old = prev.get(h)
+        if not isinstance(old, dict):
+            continue
+        old_dir = old.get("dir")
+        if old_dir and old_dir != v["dir"]:
+            changes.append({"h": h, "from": old_dir, "to": v["dir"]})
+        old_stop = old.get("stop")
+        if old_stop is not None:
+            changes.append({"h": h, "stop_from": old_stop,
+                            "stop_to": (v.get("invalidate") or "").strip() or None})
+    return {"ok": bool(changes), "changes": changes,
+            "note": ("方向或止损较上一轮有变化，按 CONSISTENCY 写明「由 X 改为 Y，依据 Z」；"
+                     "Z 只能取本轮新事实，取不到就维持上一轮") if changes else "与上一轮一致"}
 
 
 def _days(h: str) -> int:
@@ -681,19 +786,86 @@ def _horizon_view(h: str, ctx: Dict[str, Any], cap: float, evidence: float) -> D
     sup = _level_ref(ctx["levels"], h, "sup")
     res = _level_ref(ctx["levels"], h, "res")
     sup_t, res_t = _ref_txt(sup), _ref_txt(res)
+    stop_t = sup_t
+    last_defense = None
+    if h in _SHORT_HORIZONS and dir_ != "看空":
+        near = ctx["levels"].get("nearest_support")
+        if near and sup and near.get("px") != sup.get("px"):
+            stop_t = _ref_txt(near)
+            last_defense = sup_t
     if dir_ == "看多":
         view["trigger"] = f"回踩 {sup_t} 不破且量能转强，或放量站上 {res_t}"
-        view["invalidate"] = f"收盘跌破 {sup_t}"
+        view["invalidate"] = f"收盘跌破 {stop_t}"
     elif dir_ == "看空":
         view["trigger"] = f"反抽 {res_t} 不破且量能不济"
         view["invalidate"] = f"放量站上 {res_t}"
     else:
         view["trigger"] = f"放量站上 {res_t} 才看多"
-        view["invalidate"] = f"收盘跌破 {sup_t} 转空"
+        view["invalidate"] = f"收盘跌破 {stop_t} 转空"
+    if last_defense:
+        view["last_defense"] = last_defense
+        view["invalidate"] += f"；再破 {last_defense} 则下一支撑需重估"
 
     strength = agree if dir_ in ("看多", "看空") else 0.0
     view["confidence"] = round(cap * evidence * strength, 2)
     return view
+
+
+def _execution_core(horizons: List[Dict[str, Any]], levels: Dict[str, Any],
+                    price: Optional[float]) -> Dict[str, Any]:
+    """全自动四要素：买点/卖点/预计持仓时间/持仓风险收益比。
+
+    买/卖点都是**条件触发参考价**，不是下单指令；取不到就写 None + 原因，不猜。
+    风险收益比用现价到最近止损参考、最近压力的距离，口径随结果一起透出。
+    """
+    core: Dict[str, Any] = {
+        "buy_point": None, "sell_point": None, "hold_days": None,
+        "risk_reward_ratio": None, "caliber": "",
+    }
+    if not horizons:
+        core["caliber"] = "三档方向缺失，四要素无法派生"
+        return core
+
+    decided = [v for v in horizons if v.get("dir") in ("看多", "看空")]
+    primary = decided[0] if decided else horizons[0]
+    core["hold_days"] = primary.get("days")
+
+    supports = levels.get("supports") or []
+    resists = levels.get("resists") or []
+    near = levels.get("nearest_support") or (supports[0] if supports else None)
+    top = resists[0] if resists else None
+
+    def _pt(r: Optional[Dict[str, Any]], kind: str) -> Optional[Dict[str, Any]]:
+        if not r or r.get("px") is None:
+            return None
+        return {"price": r["px"], "name": r.get("name"), "kind": kind,
+                "verified": bool(r.get("verified"))}
+
+    buy_kind = ("放量站上转多触发" if primary.get("dir") in ("看多", "证据不足")
+                else "放量站上（转多确认，当前偏空不参与）")
+    sell_kind = ("收盘跌破止损参考" if primary.get("dir") != "看空"
+                 else "收盘跌破（偏空延续）；反抽压力为减仓参考")
+    core["buy_point"] = _pt(top, buy_kind)
+    core["sell_point"] = _pt(near, sell_kind)
+
+    cap = _env_float("QD_STOCK_ANALYZER_RR_CAP", 99.0)
+    if isinstance(price, (int, float)) and price > 0:
+        risk = price - float(near["px"]) if near and near.get("px") is not None else None
+        reward = float(top["px"]) - price if top and top.get("px") is not None else None
+        if risk is not None and reward is not None:
+            if risk > 0 and reward > 0:
+                rr = round(reward / risk, 2)
+                core["risk_reward_ratio"] = f"≥{int(cap)}" if rr > cap else rr
+            else:
+                core["risk_reward_ratio"] = "不适用（现价不在止损与压力之间）"
+    if core["risk_reward_ratio"] is None:
+        core["risk_reward_ratio"] = "未知（缺现价或验证价位）"
+
+    core["caliber"] = (
+        "四要素由 horizons/levels 派生，买点卖点是条件触发参考价、不是买卖指令；"
+        "risk_reward_ratio=(最近压力−现价)/(现价−最近止损参考)，价外记不适用；"
+        "模板字段供全自动读取，不构成仓位建议")
+    return core
 
 
 # ─────────────────────────── 证据完整度 ───────────────────────────
@@ -728,6 +900,104 @@ def _evidence(card: Dict[str, Any], sector: Dict[str, Any],
         if ok:
             have.append(d)
     return (round(len(have) / len(_DIMS), 2) if _DIMS else 0.0), have, list(_DIMS)
+
+
+def _stop_pressure(tech: Dict[str, Any], flow: Dict[str, Any], sc: Dict[str, Any],
+                   market: Dict[str, Any], levels: Dict[str, Any],
+                   chip: Optional[Dict[str, Any]] = None,
+                   flow_rhythm: Optional[Dict[str, Any]] = None,
+                   intel: Optional[Dict[str, Any]] = None,
+                   capital: Optional[Dict[str, Any]] = None,
+                   intraday: Optional[Dict[str, Any]] = None,
+                   flow_daily: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """离场压力的**事实汇总**：数清价格/资金/板块/大盘/筹码/情报/融资/日内结构几个方向的力量，不做买卖指令。
+
+    只陈述已算出的事实（破位/资金净流出/板块自弱/大盘谨慎/距最后防线距离/筹码套牢压顶/
+    尾盘连续流出/情报否决/杠杆回落/开盘区间破位/日内均线空头/日频连续流出），
+    供写作层提醒用户注意止损参考位；不进七维投票、不改 dir/confidence。
+    """
+    facts: List[str] = []
+    cpos = tech.get("close_pos_in_day")
+    if cpos is not None:
+        try:
+            if float(cpos) <= 0.05:
+                facts.append(f"收在日内低位（close_pos_in_day={cpos}）")
+        except (TypeError, ValueError):
+            pass
+    rec = (flow.get("recent") if isinstance(flow, dict) else None) or {}
+    n5 = rec.get("net_5d_wan")
+    if n5 is not None:
+        try:
+            if float(n5) < 0:
+                facts.append(f"5日资金净流出（{n5}万）")
+        except (TypeError, ValueError):
+            pass
+    alpha = sc.get("alpha_pct")
+    if alpha is not None:
+        try:
+            alpha_f = float(alpha)
+            weak_alpha = float(os.getenv("QD_STOCK_ANALYZER_STOP_WEAK_ALPHA_PCT", "0") or 0)
+            if alpha_f <= weak_alpha:
+                facts.append(f"弱于板块（α={alpha}%）")
+        except (TypeError, ValueError):
+            pass
+    ms = market.get("market_mood_score")
+    if ms is not None:
+        try:
+            if float(ms) <= 45:
+                facts.append(f"大盘情绪偏弱（{ms}）")
+        except (TypeError, ValueError):
+            pass
+    gap_pct = None
+    near = levels.get("nearest_support")
+    for s in (levels.get("supports") or []):
+        if near and s.get("px") != near.get("px") and s.get("dist_pct") is not None \
+                and near.get("dist_pct") is not None:
+            gap_pct = round(abs(float(s["dist_pct"]) - float(near["dist_pct"])), 2)
+            break
+    if chip and chip.get("ok"):
+        loss = chip.get("loss_ratio")
+        lower = (chip.get("band_90") or {}).get("lower")
+        price = chip.get("current_price")
+        floor = _env_float("QD_STOCK_ANALYZER_CHIP_LOSS_RATIO", 0.9)
+        if isinstance(loss, (int, float)) and loss >= floor \
+                and isinstance(lower, (int, float)) and isinstance(price, (int, float)) \
+                and price < lower:
+            facts.append(f"套牢盘{chip.get('loss_ratio_pct') or loss}且现价低于90%筹码下沿{lower}")
+    if flow_rhythm and flow_rhythm.get("ok"):
+        streak = flow_rhythm.get("tail_streak") or []
+        if len(streak) >= 3 and all(float(x.get("wan") or 0) < 0 for x in streak):
+            total = round(sum(float(x.get("wan") or 0) for x in streak), 1)
+            facts.append(f"尾盘连续{len(streak)}分钟净流出（合计{total}万）")
+    if intel and intel.get("ok") and intel.get("veto"):
+        facts.append("情报一票否决")
+    if capital and capital.get("ok"):
+        chg = (capital.get("margin") or {}).get("rz_5d_change_pct")
+        floor = _env_float("QD_STOCK_ANALYZER_MARGIN_5D_PCT", 0)
+        if isinstance(chg, (int, float)) and chg <= floor:
+            facts.append(f"融资余额5日变化{chg}%")
+    if intraday and intraday.get("ok"):
+        op = intraday.get("opening_range") or {}
+        if op.get("breakout_down"):
+            facts.append(f"开盘{op.get('minutes')}分钟向下破位"
+                         f"（区间{op.get('low')}~{op.get('high')}）")
+        ma = intraday.get("intraday_ma") or {}
+        if ma.get("align") == "空头":
+            facts.append("日内均线空头排列")
+    if flow_daily and flow_daily.get("ok"):
+        streak = flow_daily.get("main_net_streak")
+        threshold = _env_int("QD_STOCK_ANALYZER_FLOW_STREAK_MIN", 2)
+        if isinstance(streak, int) and streak >= threshold \
+                and flow_daily.get("main_net_streak_dir") == "outflow":
+            facts.append(f"日频资金连续{streak}日净流出")
+    return {
+        "ok": bool(facts),
+        "n": len(facts),
+        "facts": facts,
+        "gap_between_stops_pct": gap_pct,
+        "caliber": "离场压力的事实条数；只提示核对止损参考位，不产生买卖或仓位指令，"
+                   "也不改变方向投票与置信度",
+    }
 
 
 def _risks(card: Dict[str, Any], tech: Dict[str, Any], sc: Dict[str, Any],
@@ -824,64 +1094,72 @@ def _mtf_line(mtf: Dict[str, Any]) -> str:
     missing = [str(m) for m in (mtf.get("missing") or [])]
     if missing:
         body += f"（缺：{'、'.join(missing[:3])}）"
+    if mtf.get("stale"):
+        cc = mtf.get("caliber_check") or {}
+        body += (f"｜【短周期跨日不采信】分钟线停在 {cc.get('minute_last')}，"
+                 f"日线目标日 {cc.get('daily_target')}，上方 15m/5m 属更早交易日的形态")
     return "多周期（分时口径，与日线 regime 不同义）：" + (body or "未知")
 
 
 def _render(out: Dict[str, Any]) -> str:
-    """给 LLM / 用户的诊断摘要：结论先行，四要素齐全，不给模糊措辞。"""
+    """诊断摘要：结论先行 + 全自动四要素 + 极简三档 + 一句经验依据，不给模糊措辞。
+
+    长篇事实（九块补证/逐维投票/basis）留在结构化 dict 里做经验收集，不进正文。
+    """
+    def _money(v: Any) -> str:
+        try:
+            x = float(v)
+            return f"{x / 1e8:.2f}亿" if abs(x) >= 1e8 else f"{x / 1e4:.0f}万"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _ptxt(p: Any) -> str:
+        if not isinstance(p, dict) or p.get("price") is None:
+            return "未知"
+        return f"{p['price']}（{p.get('name') or p.get('kind') or '参考'}）"
+
     if out.get("error"):
         return f"ERR: {out['error']}"
     sess = {"pre": "盘前", "intraday": "盘中", "post": "盘后",
             "closed": "非交易日", "unknown": "时段未知"}.get(out.get("session"), "")
-    head = (f"{out.get('code', '')} {out.get('name', '')}｜市场情绪 {out.get('regime', 'unknown')}"
-            f"｜证据完整度 {out.get('evidence')}" + (f"｜{sess}" if sess else ""))
+    core = out.get("execution_core") or {}
+    head = (f"{out.get('code', '')} {out.get('name', '')}｜{out.get('as_of') or ''}"
+            + (f" {sess}" if sess else "") + f"｜证据完整度 {out.get('evidence')}")
+
     lines = [head]
-    if out.get("missing"):
-        lines.append("数据缺口：" + "；".join(str(m) for m in out["missing"][:4]))
-    lines.append("")
-    lines.append("| 周期 | 方向 | 置信度 | 触发条件 | 证伪条件 |")
-    lines.append("|---|---|---|---|---|")
-    for v in out.get("horizons") or []:
-        p = f"P={v['p_up']}" if v.get("p_up") is not None else ""
-        d = v["dir"] + (f"（{p}）" if p else "")
-        note = v.get("reason") or ""
-        lines.append(f"| {v['h']} | {d} | {v['confidence']} | {v['trigger'] or note} | {v['invalidate'] or '—'} |")
+    lines.append("四要素：")
+    lines.append(f"买点 {_ptxt(core.get('buy_point'))}")
+    lines.append(f"卖点 {_ptxt(core.get('sell_point'))}")
+    lines.append(f"持仓时间 {core.get('hold_days') if core.get('hold_days') is not None else '未知'}日"
+                 f"｜风险收益比 {core.get('risk_reward_ratio') or '未知'}")
+    hz_seg = " ".join(
+        f"{v['h']} {v['dir']}" + (f"（{v['confidence']}）" if v.get("confidence") else "")
+        for v in (out.get("horizons") or []))
+    if hz_seg:
+        lines.append("三档：" + hz_seg + "（触发/证伪见结构化 horizons）")
+    tr = out.get("trend_outlook") or {}
+    if tr.get("trend"):
+        lines.append(f"长档：{tr['trend']}")
 
-    lv = out.get("levels") or {}
-    for side, label in (("supports", "支撑"), ("resists", "压力")):
-        rows = lv.get(side) or []
-        if rows:
-            lines.append(f"{label}：" + " ｜ ".join(
-                f"{r['px']}（{r.get('name')}，{'已验证' if r.get('verified') else '孤证'}，"
-                f"有效测试{r.get('touches')}次"
-                + (f"，失守{r.get('broken')}次" if r.get("broken") else "") + "）" for r in rows))
-        else:
-            lines.append(f"{label}：未知（无可推演价位）")
-
+    exp: List[str] = []
     sc = out.get("sector") or {}
-    if sc.get("ok") and sc.get("industry_board"):
-        lines.append(f"板块修正：行业「{sc.get('industry_board')}」{sc.get('industry_chg_pct')}%，"
-                     f"概念均{sc.get('concept_chg_pct')}%，个股α={sc.get('alpha_pct')}%（{sc.get('label')}）")
-    elif sc.get("ok"):
-        lines.append(f"板块修正：行业板未命中（industry={sc.get('industry')}），"
-                     f"基准=所属板块均值{sc.get('bench_chg_pct')}%，"
-                     f"个股α={sc.get('alpha_pct')}%（{sc.get('label')}）")
-    else:
-        lines.append(f"板块修正：未知（{sc.get('reason', '板块涨跌幅缺失')}）")
-
-    if isinstance(out.get("mtf"), dict):
-        lines.append(_mtf_line(out["mtf"]))
-
-    if out.get("basis_note"):
-        lines.append("")
-        lines.append(out["basis_note"])
-    if out.get("session_note"):
-        lines.append(out["session_note"])
-    pats = [p.get("pattern") for p in (out.get("patterns") or []) if isinstance(p, dict)]
-    if pats:
-        lines.append("形态：" + "、".join(str(x) for x in pats[:5]))
-    if out.get("risks"):
-        lines.append("风险：" + "；".join(str(x) for x in out["risks"][:5]))
+    if sc.get("ok") and sc.get("alpha_pct") is not None:
+        exp.append(f"板块α{sc.get('alpha_pct')}%")
+    fd = out.get("flow_driver") or {}
+    if fd.get("ok"):
+        c = fd.get("counts") or {}
+        exp.append(f"资金20日形态 推进{c.get('推进', 0)}/承接{c.get('承接', 0)}/"
+                   f"惜售{c.get('惜售', 0)}/共振{c.get('共振', 0)}")
+    cp = out.get("chip") or {}
+    if cp.get("ok"):
+        exp.append(f"获利{cp.get('profit_ratio_pct')}")
+    sp = out.get("stop_pressure") or {}
+    if sp.get("n"):
+        exp.append(f"离场压力{sp['n']}条")
+    if exp:
+        lines.append("经验事实：" + "；".join(exp))
+    if out.get("missing"):
+        lines.append("缺口：" + "；".join(str(m) for m in out["missing"][:3]))
     return "\n".join(lines)
 
 
@@ -919,7 +1197,7 @@ def _bars_for(code: str) -> List[Dict[str, Any]]:
 
 
 def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
-    """并发取证：deep 证据基座 + 板块 + 大盘状态 + 解禁日历（deep=True 加龙虎榜）。
+    """并发取证：deep 证据基座 + 板块 + 大盘状态 + 解禁日历 + 八项补证事实（deep=True 加龙虎榜）。
 
     日线不在并发清单里：deep 内部已经拉过一份并暂存（`_deep.take_bars`），
     analyze 事后复用，同一票不再拉两遍。
@@ -928,6 +1206,12 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
     """
     missing: List[str] = []
     out: Dict[str, Any] = {}
+    try:
+        from app.utils.trading_calendar import current_data_day
+        target_day = str(current_data_day() or "")[:10]
+    except Exception as e:
+        target_day = ""
+        missing.append(f"取数目标日: {type(e).__name__}: {e}")
 
     def _task(name: str, fn):
         try:
@@ -957,7 +1241,44 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
         from ...tools.finance.dragon_tools import get_dragon_tiger
         return get_dragon_tiger(codes=code, detail=True)
 
-    tasks = {"deep": _t_deep, "sector": _t_sector, "market": _t_market, "lockup": _t_lockup}
+    def _t_chip():
+        from ._extra_facts import build_chip
+        return build_chip(code)
+
+    def _t_flow_rhythm():
+        from ._extra_facts import build_flow_rhythm
+        return build_flow_rhythm(code)
+
+    def _t_intel():
+        from ._extra_facts import build_intel
+        return build_intel(code)
+
+    def _t_capital():
+        from ._extra_facts import build_capital
+        return build_capital(code)
+
+    def _t_intraday():
+        from ._extra_facts import build_intraday
+        return build_intraday(code, target_day,
+                              _env_int("QD_STOCK_ANALYZER_OR_MINUTES", 15))
+
+    def _t_multiframe():
+        from ._extra_facts import build_multiframe
+        return build_multiframe(code, target_day)
+
+    def _t_valuation():
+        from ._extra_facts import build_valuation
+        return build_valuation(code)
+
+    def _t_flow_daily():
+        from ._extra_facts import build_flow_daily
+        return build_flow_daily(code)
+
+    tasks = {"deep": _t_deep, "sector": _t_sector, "market": _t_market, "lockup": _t_lockup,
+             "chip": _t_chip, "flow_rhythm": _t_flow_rhythm,
+             "intel": _t_intel, "capital": _t_capital,
+             "intraday": _t_intraday, "multiframe": _t_multiframe,
+             "valuation": _t_valuation, "flow_daily": _t_flow_daily}
     if deep:
         tasks["dragon"] = _t_dragon
 
@@ -978,23 +1299,44 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
     return out, missing
 
 
-def analyze(code: str, deep: bool = False) -> dict:
+def _aux_field(name: str, fn, missing: List[str]) -> Dict[str, Any]:
+    """补充事实的失败留痕口：异常写进 missing，不静默吞断也不伪造空事实。"""
+    try:
+        return fn()
+    except Exception as e:
+        missing.append(f"{name}: {type(e).__name__}: {e}")
+        return {"ok": False, "reason": f"{name} 取数失败"}
+
+
+def analyze(code: str, deep: bool = False,
+            prev_horizons: Optional[Dict[str, Any]] = None) -> dict:
     """对单只 A 股做 T+1~T+20 全周期多维诊断（deep 为证据基座）。
 
     输出分周期方向（看多/看空/中性/证据不足/未知）、置信度、触发/证伪条件、
     经 8 类方法交叉验证的 1-2 个支撑位与压力位（含演算痕迹）、板块/概念涨跌幅
-    修正（β/α 拆分）与多维投票依据。
+    修正（β/α 拆分）与多维投票依据。五档逐档计算保留，horizons 只输出 T+1/T+3/T+5
+    三档，长档由 trend_outlook 承载；brief 是照抄即可的一句话骨架。
 
     Args:
         code: 6 位股票代码
         deep: True 追加慢速源（多周期结构 + 龙虎榜席位），默认 False
+        prev_horizons: 可选，上一轮同票三档结论（{h: {dir, stop}}），传入时产出
+            consistency 比对；缺省不触发。不读库、不写库，由调用方按需提供。
 
     Returns:
         report_guide（报告写作边界）/code/name/as_of/regime/market/session（盘前/盘中/盘后）；quote/tech/
         prediction/patterns/flow/seal/sector（板块涨跌 + α 修正）/events（解禁日历）/
-        levels（supports/resists/checks 演算痕迹）/horizons 五档，每档 {h, days, dir,
+        market_outlook（大盘次日涨概率）/cap_regime（弱市大流通盘、强市小盘的分层事实）/
+        board_rank（板块内排名与龙头/跟风）/trend_outlook（长档纯日线趋势）/
+        chip（筹码）/flow_rhythm（资金节奏）/intel（情报）/capital（融资与基本面）/
+        intraday（日内结构）/multiframe（多周期方向）/valuation（估值快照）/
+        flow_daily（日频资金）/flow_driver（20日内资金×涨幅形态）九块补证事实，均不进七维投票/
+        execution_core（全自动四要素：买点/卖点/预计持仓时间/持仓风险收益比，条件触发参考价非指令）/
+        brief（三档+长档的一句话写作骨架）/levels（supports/resists/checks 演算痕迹）/
+        horizons 三档（T+1/T+3/T+5），每档 {h, days, dir,
         p_up(仅T+1), confidence, agree, votes, basis, unknown, trigger, invalidate,
-        reason}；evidence（证据完整度）与 missing（数据缺口）。方向取值：看多 / 看空 /
+        reason}；传入 prev_horizons 时加 consistency（方向/止损较上一轮的变化事实）。
+        evidence（证据完整度）与 missing（数据缺口）。方向取值：看多 / 看空 /
         中性 / 证据不足 / 未知。
         证据纪律：缺数答「未知」，孤证或冲突答「证据不足」，二者都不是看空。
     """
@@ -1020,6 +1362,17 @@ def analyze(code: str, deep: bool = False) -> dict:
     for err in (deep_res.get("errors") or []):
         missing.append(f"deep:{err}")
 
+    extra: Dict[str, Dict[str, Any]] = {}
+    for name in ("chip", "flow_rhythm", "intel", "capital",
+                 "intraday", "multiframe", "valuation", "flow_daily"):
+        val = gathered.get(name)
+        if isinstance(val, dict):
+            extra[name] = val
+            if not val.get("ok") and val.get("reason"):
+                missing.append(f"{name}: {val['reason']}")
+        else:
+            extra[name] = {"ok": False, "reason": f"{name} 未取证"}
+
     tech = card.get("tech") or {}
     flow = card.get("flow") or {}
     rt = card.get("rt") or {}
@@ -1038,6 +1391,11 @@ def analyze(code: str, deep: bool = False) -> dict:
     bars = _bars_for(code)
     if not bars:
         missing.append("bars: 日线缺失")
+    def _t_flow_driver():
+        from ._extra_facts import build_flow_driver
+        return build_flow_driver(code, bars)
+    flow_driver = _aux_field("flow_driver", _t_flow_driver, missing)
+    extra["flow_driver"] = flow_driver
     chg = rt.get("change_pct")
     if chg is None:
         chg = tech.get("change_pct")
@@ -1092,11 +1450,38 @@ def analyze(code: str, deep: bool = False) -> dict:
 
     evidence, have, counted = _evidence(card, sector, missing)
     cap_map = _conf_cap()
-    horizons = [_horizon_view(h, ctx, cap_map.get(h, 0.5), evidence) for h in _HORIZONS]
+    horizons_all = [_horizon_view(h, ctx, cap_map.get(h, 0.5), evidence) for h in _HORIZONS]
+    horizons = [v for v in horizons_all if v["h"] in _SHORT_HORIZONS]
+
+    market_model = pred.get("model") if isinstance(pred.get("model"), dict) else {}
+    market_p_up = market_model.get("market_p_up")
+    market_outlook = {
+        "ok": market_p_up is not None,
+        "p_up": market_p_up,
+        "source": "watchlist.predict.market_p_up",
+        "caliber": "大盘次日涨概率；描述性事实，不进七维投票，也不外推到 T+3 及以后",
+    }
+    if not market_outlook["ok"]:
+        market_outlook["reason"] = "大盘预测分缺失"
+    price = rt.get("price") or tech.get("close")
+    cap_regime = _aux_field("cap_regime", lambda: _cap_regime.build(code, price, market), missing)
+    board_rank = _aux_field("board_rank", lambda: _board_rank.build(code, sector), missing)
+    trend_outlook = _aux_field("trend_outlook", lambda: _trend.build(bars), missing)
+    execution_core = _execution_core(horizons, levels, price)
+    brief = _brief_view(horizons, trend_outlook)
+    consistency = _consistency_view(horizons, prev_horizons)
+    stop_pressure = _aux_field(
+        "stop_pressure",
+        lambda: _stop_pressure(tech, flow, sector, market, levels,
+                              extra["chip"], extra["flow_rhythm"],
+                              extra["intel"], extra["capital"],
+                              extra["intraday"], extra["flow_daily"]), missing)
 
     session = _session()
     out = {
-        "report_guide": _ANALYZE_REPORT_GUIDE,
+        "report_guide": _report_guide(),
+        "brief": brief,
+        "execution_core": execution_core,
         "code": code,
         "name": card.get("name") or "",
         "as_of": rt.get("time") or levels.get("as_of"),
@@ -1105,6 +1490,20 @@ def analyze(code: str, deep: bool = False) -> dict:
                                               "stock_mood", "stock_mood_score",
                                               "cautious", "fund_flow_days")
                    if market.get(k) is not None},
+        "market_outlook": market_outlook,
+        "chip": extra["chip"],
+        "flow_rhythm": extra["flow_rhythm"],
+        "intel": extra["intel"],
+        "capital": extra["capital"],
+        "intraday": extra["intraday"],
+        "multiframe": extra["multiframe"],
+        "valuation": extra["valuation"],
+        "flow_daily": extra["flow_daily"],
+        "flow_driver": extra["flow_driver"],
+        "cap_regime": cap_regime,
+        "board_rank": board_rank,
+        "trend_outlook": trend_outlook,
+        "stop_pressure": stop_pressure,
         "quote": {"price": rt.get("price") or tech.get("close"),
                   "change_pct": chg, "limit_up": rt.get("limit_up"),
                   "limit_band": rt.get("limit_band"), "turnover_pct": rt.get("turnover_pct")},
@@ -1127,12 +1526,24 @@ def analyze(code: str, deep: bool = False) -> dict:
         "basis_note": ("confidence = 档位上限 × 证据完整度 × 一致度（|同向维-反向维|/有效维）；"
                        "仅 T+1 的 p_up 经标定，其余档只给方向不给概率。"
                        "方向纪律：≥2 维同向且差值 ≥2 才给方向；孤证/冲突答「证据不足」；"
-                       "缺数答「未知」。价位只用经 8 类方法交叉验证的支撑/压力（见 levels.checks）。"),
+                       "缺数答「未知」。价位只用经 8 类方法交叉验证的支撑/压力（见 levels.checks）。"
+                       "horizons 只列 T+1/T+3/T+5，长档见 trend_outlook；brief 是照抄骨架，"
+                       "跨轮变化见 consistency；invalidate 为最近止损参考、last_defense 为最后防线，"
+                       "stop_pressure 是离场压力事实条数（非买卖指令）；"
+                       "九块补证事实只陈述、不投票；筹码价位与 levels 不同源、不合并排序，"
+                       "快照与日频资金两口径并列不合并。20 日以上长线资金不进方向判断，"
+                       "flow_driver 只分解 20 日内价量资金形态、四档拆单本地不可得、"
+                       "不推庄家持仓成本与利润空间；execution_core 四要素是条件触发参考价、"
+                       "非买卖指令。"),
     }
+    if consistency is not None:
+        out["consistency"] = consistency
     if deep and gathered.get("dragon") is not None:
         out["dragon"] = gathered.get("dragon")
     if isinstance(card.get("mtf"), dict):
-        out["mtf"] = card["mtf"]
+        out["mtf"] = _mtf_guard.guard(card["mtf"], code, bars)
+        if out["mtf"].get("stale"):
+            missing.append(str(out["mtf"].get("stale_reason") or "多周期跨日"))
     return AnalyzerResult(out)
 
 

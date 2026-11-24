@@ -138,34 +138,66 @@ def detect_patterns(codes: str, days: int = 60, params: str = None) -> dict:
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
         "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了能不能全身而退。"
-        "禁止长篇分析，表格行数随推荐数浮动，正文保持精简，必须用下表：\n"
-        "## 买什么（N 只，N=实际符合条件数；可空；可加一句共性提示如「均需回踩再买，勿追高」）\n"
-        "| 代码 | 现价 | 买点价位 | 止损价 | T+1/T+3/T+5 | 一句话理由 |\n"
-        "每只一行；代码=6 位数字；"
+        "禁止长篇分析，表格行数随推荐数浮动，正文保持精简，必须用下表（**表头逐字，列不许删改**）：\n"
+        "## 买什么（N 只，N=实际符合条件数；可空，0 只是常态输出；可加一句共性提示如「均需放量突破再买，勿追现价」）\n"
+        "| 代码 | 现价 | 买点价位 | 止损价(触发口径) | 目标价/止盈条件 | 仓位 | T+1/T+3/T+5 | 一句话理由 |\n"
+        "每只一行；保留 6 位代码 + 股票名称；"
+        "★ 进表资格：主线龙头 / 弱转强确认 / 放量突破 三类强信号至少一类，且加分项 ≥2；"
+        "**推荐重心 = 早段确认区**（当日涨幅 <5% 的弱转强/回踩企稳/放量突破早段——止损近、深亏最低档，"
+        "宁在早段挖十只，不追一只已拉升的；>8% 大阳/追击档保留但非主力）；"
+        "早段须叠加 **amp<8% 或放量突破确认**——早段里 amp≥8% 的『看似回踩实为高波动』是雷区"
+        "（配对 t=-4.26 全表最差），仅放量突破确认可进；"
+        "**资金是资格级证据**，两档处理：①**否决**——资金连续方向为负（3~5 日窗口逐日净流出）或单日脉冲后回吐"
+        "= 资格线过了也不进表；②**降权**——3~5 日累计为负（**归一后显著才算数**：噪声带内的小负不降权，按 "
+        "net_pct_of_amount/fund_circ_ratio 判）但当日/近段资金回流（弱转强配套）= 只给试仓/深回踩/条件单，不给追价。"
+        "**窗口权重（超短线）**：当日抢筹/分段吸筹（时机）＞ 3~5 日埋伏（资格）＞ 20 日（语境：脉冲识别/拉高出货/持有周期，"
+        "不作独立否决或降权，20 日大额流入反而是迟到信号）；资金流入是确认项，不独立构成买入理由；"
+        "无确认超跌反抽（接刀）与 B 级机会无资格进表，没有 A+ 就写空仓卡，禁止矮子里拔将军。\n"
         "★ 买点/止损写**关键位置**并注明是哪个位置（回踩 MA10 11.62 / 区间下沿 11.30 / "
         "前低 11.05 / 缺口上沿 11.40 任选其一，不要求是均线），"
-        "禁止用 VWAP/分时均价当买点；止损写「跌破 X」/「不跌破 X」；"
+        "禁止用 VWAP/分时均价当买点；"
+        "★ 止损三条硬口径：① 宽度取 **min(amp_avg5, 8%)**：≥日均振幅量级防噪声（1.3% 止损配 8% 振幅是白送），"
+        "止损不得越过 -8% 深亏线（amp≥8% 的票封顶 8%、靠仓位控风险）；"
+        "② 落点在结构位外侧 + 缓冲，避开当日已被穿过的价位；"
+        "③ 必须写触发口径「盘中触价」或「收盘确认」（动量/接力仓默认盘中触价）。"
+        "格式「跌破 X（盘中触价）」/「不跌破 X」；无合格止损价不得进表。\n"
+        "★ 必须有止盈：目标价（上方压力位/涨幅预期）或止盈条件（触板/冲高滞涨/破均价）写在"
+        "「目标价/止盈条件」列，用「卖出/落袋」措辞（「兑现」一词留给持仓处置）；"
+        "只有止损没有目标的票不进表——复利靠兑现滚出来，不靠拿着。\n"
+        "★ 仓位档写在「仓位」列：空仓 / 试仓（≤1成） / 标准（2~3成） / 重仓（3~5成，仅 A+："
+        "三类强信号齐 + 无证据冲突）；小仓试错不写——B 级机会赚了没意义、亏了照样磨损。\n"
         "T+N 填 看多/中性/看空/未知；中性须有充分证据支持，"
         "证据不足、无法相互验证或存在未解决的矛盾时填未知，并简述缺口或冲突；"
+        "三个周期全中性还进「买什么」= 把未知包装成中性凑数，禁止；"
         "市场及其他综合判断也须区分中性和未知，不得把缺失或冲突当中性。\n"
         "★ **全文用中文白话**，禁止输出 near_support / rank_cut 等字段名。\n"
-        "不另设「不买/观察」栏目，也不逐一罗列未推荐标的；无合格标的时写「今日无符合标的」及理由。\n"
-        "## 风险（≤3 行）\n"
-        "指标罗列、漏斗数字不进正文。保留代码+看多看空+跌破 X（喂 claims）。"
+        "不另设「不买/观察」栏目，也不整表罗列未推荐标的；排除项按**类别各 ≤3 只**一行证伪"
+        "（资金不过关 / 高波动高位 / 接刀等各一类，例：「资金背离不追：688090、301112」），单类超 3 只只写前 3；"
+        "N=0 时写空仓卡：「## 空仓卡  今日无符合标的，空仓等待：<一行『今天别打』的证据>」——"
+        "弱市空仓等待本身就是复利，禁止硬凑。\n"
+        "## 风险与证伪（≤3 行）\n"
+        "指标罗列、长篇分析不进正文；尾注可留**一行**（来源/口径/漏斗计数，供 claims 追责与口径披露）。"
+        "保留代码+名称+看多看空+跌破 X（喂 claims）。"
     ),
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
              "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote；"
              "**禁止 agent_get_kline / get_index_kline**——analyzed_rank 已给 ma5/ma10/ma20/hi20/lo20 "
              "绝对值，买点/止损/压力据此直接算，不需要原始 K 线；"
              "funnel.baseline=本次入选只数（选人层唯一出口，全部入 deep）；"
-             "funnel.baseline_hard=被非封板 hard 规则拦掉的只数；"
-             "funnel.baseline_risk=其中高连板且远离 MA5 的风险提示数；"
-             "funnel 其余键（rounds/pool_raw/deep_n/eastmoney_ok）只用于判断取数是否完整",
+             "funnel.streak_surge_tagged/early_accum_tagged=闸门打标保留的票（挂 flags，不放弃）；"
+             "funnel 其余键（pool_raw/deep_n/zt_ref_n/flow_invalid_n/short_of_limit 等）只用于复盘漏斗与取数完整性",
     "limit_up_ref": "涨停参考清单（**不进 deep 分析**）：每项 {code,name,board,track,t_first,dup_n,reason}。"
                     "决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；"
                     "它只回答「该板块此刻几只封板、几点封的、几个板块同时选中」——"
                     "用来判断**未涨停票所在板块**的强弱与资金共识。"
-                    "**禁止**把清单里的票写进「买什么」，也不要在正文整表罗列；"
+                    "**接力分层**（接力=次日买，不是今天追板）：**只在板块强周期接力**"
+                    "（弱周期接力就是坑：孤板/炸板/资金退潮/断板断层 → 一律不接，强确认也不给；"
+                    "判据见 strategy-rules §11.5）；仅主线龙头+强确认（连板/厚封/题材核心"
+                    "+次日弱转强或放量突破确认）可给次日接力条件单，且**给单前必须先 "
+                    "inspect_stock(code, deep=True) 取满卡证据**（封单/龙虎榜/资金/位置，证据不齐不给单）；"
+                    "标注「接力档：仓位上限≤2成、宽止损、失败即走」；"
+                    "早盘板/无强确认接力默认不接（5m 小样本：早盘板接力深亏 62.5%、连板 80%）；"
+                    "无确认接力一律不写入「买什么」，也不要整表罗列清单；"
                     "可作为「该板块已有多只封板」的旁证出现。",
     "monitor": "回测经验提示（1m全样本2026-04-15~11-02，134个交易日、deep可成交n=1862；"
                "弱市市值按当日指数分组跌幅<0、80亿元分界；仅作软证据，不是排除令）："
@@ -260,7 +292,8 @@ _REPORT_GUIDE = {
               "绝对量比≥2 但 vr_rel<2=跟风放量（大盘同放）；<1=放量不及大盘）"
               "/**vr_rel_st**（**分时口径，仅盘中给**：截至 intraday.t 的量比÷大盘同刻量比；"
               "盘中量能确认项用它）/**flow_rel**（全天：净占比−大盘净占比，百分点；资金为首要评估维度，见 fund_trend）"
-              "/**flow_rel_st**（分时同口径）/dist_ma5_pct/dist_ma20_pct"
+              "/**flow_rel_st**（分时同口径）/dist_ma5_pct/dist_ma20_pct/amp_avg5（近5日平均振幅%，止损宽度基准）/sr_gap_pct（支撑-压力间距%）"
+              "/**flags**（闸门打标命中原因：连板放量/吸筹不足/已过度拉升——高波动档护栏证据，不是排除令；缺键=无命中）"
               "/regime（**日线**形态标签，动作映射见 regime 条）"
               "/shape（**分时**形态标签，见 intraday_shape 条；与 regime 并列、互不覆盖，用来相互印证）"
               "/rs_d0/rs_5d（相对上证超额%，见 regime 条）"
@@ -297,6 +330,14 @@ _REPORT_GUIDE = {
                   "不能仅凭低位、形态或统计提示抵消；资金数据缺失须标明，不能当作零或流入。"
                   "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 net_wan；"
                   "单日大额流入不等于趋势，连续3日以上同向才算趋势；剔除最大单日后仍为正才是普遍承接。"
+                  "★**跨票比量级必须归一**（2026-11-24）：绝对净额只读方向/连续性；量级影响力用 "
+                  "net_pct_of_amount（净额÷成交额=当日边际压力，**换手率进这个口径**）与 "
+                  "fund_circ_ratio（净额÷流通市值=多日火力）。同样 1000 万：换手 10% 的中盘 ≈成交额 1%（噪音级），"
+                  "换手 1% 的 20 亿小盘 ≈50%（半个盘口单向）；低换手小盘的高净占比是双刃剑——边际强但出口窄"
+                  "（换手<2% 流动性警示），进出速度优势会反转。"
+                  "★止损棘轮：已持仓者的止损以入场计划为准、**只紧不松**——本表止损是新开仓视角，"
+                  "不得拿来放宽旧单止损；★评级纪律：一句话理由须引资格主窗口（5 日）+当日归一值，"
+                  "缺字段标数据缺口——缺证据不评最高档也不降档，评价不跟字段表抖。"
                   "★**口径**：net_wan / net5d_wan / net20d_wan 都是 `caliber=price_direction` 的"
                   "**量价方向净额**（按分钟涨跌方向累计成交额派生），**不是东财四档主力净额**，"
                   "两者量级不同、不可换算 ⇒ 正文只能写「量价净流入/资金净额/净流入 X 亿」，"
@@ -473,6 +514,8 @@ def _rank_row(card: dict) -> dict:
         "zt_streak": tech.get("zt_streak"),
         "dist_ma5_pct": tech.get("dist_ma5_pct"),
         "dist_ma20_pct": tech.get("dist_ma20_pct"),
+        "amp_avg5": tech.get("amp_avg5"),
+        "sr_gap_pct": sup.get("sr_gap_pct"),
         "loc": tech.get("location"),
         "sup": (sup.get("supports") or [None])[0],
         "res": (sup.get("resists") or [None])[0],
@@ -489,7 +532,7 @@ def _rank_row(card: dict) -> dict:
     for _k in ("sup", "res"):
         if row.get(_k) is None:
             row.pop(_k, None)
-    for _k in ("chg_prev_pct", "cpos", "pos20", "loc", "vr_rel", "flow_rel", "vr_rel_st", "flow_rel_st", "shape"):
+    for _k in ("chg_prev_pct", "cpos", "pos20", "loc", "vr_rel", "flow_rel", "vr_rel_st", "flow_rel_st", "shape", "amp_avg5", "sr_gap_pct"):
         if row.get(_k) is None:
             row.pop(_k, None)
     if row.get("regime") in (None, "低位蓄势"):
@@ -609,7 +652,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                  budget: int = None) -> dict:
     """对指定股票批量汇总全部可用证据，并按标定模型的 P(次日涨) 排序。
 
-    这里**没有**主观评分梯形：唯一的数字是 _helpers.predict_one 给出的已标定 p_up。
+    这里**没有**主观评分梯形：唯一的数字是 _helpers.predict_one 给出的已标定模型分（满卡 `score`）。
     你要加权、改口径、加自己的判断都可以 —— 请基于返回的 tech / patterns / flow / mtf 自己写。
 
     参数:
@@ -623,21 +666,24 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             一并扣掉再传，使「最终交付」而不是「本函数输出」受预算约束。
 
     返回:
-        dict: analyzed_rank[]=**全部票**的横向可比字段（code/name/p_up/direction/
-            confidence/price/chg_pct/**ma5/ma10/ma20/hi20/lo20**（价位绝对值）/
+        dict: analyzed_rank[]=**全部票**的横向可比字段（code/name/
+            price/chg_pct/**ma5/ma10/ma20/hi20/lo20**（价位绝对值）/
             **sup**/**res**={k 位置名, px 价位, d 距离%}（sup=现价下方最近、res=现价上方最近的
             关键位置，k 见 tech_summary 的 _key_levels：均线/近端低点/缺口下沿/密集区/涨停起点/hi20）/
             **seal/seal_tier/seal_pct**/**hi_today**（当日最高，条件单突破基准）/
             vol_ratio/**ret5_pct/zt10/zt_streak**/dist_ma5_pct/dist_ma20_pct/
+            **amp_avg5**（近5日平均振幅%，止损宽度基准）/**sr_gap_pct**（支撑-压力间距%）/
             net5d_wan/net20d_wan/streak_dir（20 日位置按 (price-lo20)÷(hi20-lo20) 自算）；
             **vr_rel_st/flow_rel_st**（分时同刻口径，**仅盘中给**：截至此刻的量比÷大盘同刻量比、
             净占比−大盘同刻净占比；收盘后同刻≡全天，改用 vr_rel/flow_rel）；
-            limit_up/buyable/stale_bar/risks/seal/zt_streak/confidence **缺键即正常**
-            （未涨停/可买/未滞后/无风险/未封板/没连板/证据满维）——
+            limit_up/buyable/stale_bar/risks/seal/zt_streak/confidence/**flags** **缺键即正常**
+            （未涨停/可买/未滞后/无风险/未封板/没连板/证据满维/无打标命中；flags=闸门打标
+            命中原因：连板放量/吸筹不足/已过度拉升——高波动档护栏证据（仓位/触发/止损收紧），
+            不是排除令）——
             **比强弱看这张表，它不截断，也不含明细**；
             analyzed[]=满卡，按交付预算截断（analyzed_note 写明给了几只），
             两档**同序，按位置透支升序**（距20日均线近 / 20日区间低位 / 近5日涨幅小者在前；
-            **p_up 不参与排序**，只作字段给值），故满卡 = 位置最干净的 N 只，不是「最强 N 只」；
+            **模型分不参与排序**，只作字段给值），故满卡 = 位置最干净的 N 只，不是「最强 N 只」；
             每张 {code,name,patterns,tech,flow,**intraday**,mtf,score,direction,confidence,
             signal,missing,**seal**,stale_bar,rt_risks,flow_risks}；
             intraday={t 截断时刻,day 目标日,vr_same_t 个股同刻量比,vr_rel_st,fp_same_t 个股
@@ -1138,6 +1184,13 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
         out = {"report_guide": result.get("report_guide", _REPORT_GUIDE), **outer}
         out.update({k: v for k, v in result.items() if k != "report_guide"})
         attach_monitor(out)          # 重点监控格：rank/picked_detail/limit_up_ref 软标记
+        # 闸门打标（连板放量/吸筹/过度拉升）从 picked_detail 合入 rank，
+        # 比强弱的表要能看到护栏证据（flags 缺键 = 无命中）。
+        _pm = {str(x.get("code")): x for x in (out.get("picked_detail") or [])}
+        for r in out.get("analyzed_rank") or []:
+            _fl = (_pm.get(str(r.get("code"))) or {}).get("flags")
+            if _fl:
+                r["flags"] = _fl
         _log_run(t0, ms, funnel, out)
         return SkillResult(out)
     return result
@@ -1181,6 +1234,12 @@ def _run_topdown(t0: float, ms: dict):
                    "baseline": f.get("picked") or 0,
                    "deep_n": len(td.get("picked") or []),
                    "dup_max": f.get("dup_max"),
+                   "dup_min_gate": f.get("dup_min_gate"),
+                   "flow_invalid_n": f.get("flow_invalid_n"),
+                   "streak_surge_tagged": f.get("streak_surge_tagged"),
+                   "streak_surge_unknown": f.get("streak_surge_unknown"),
+                   "early_accum_tagged": f.get("early_accum_tagged"),
+                   "early_accum_unknown": f.get("early_accum_unknown"),
                    "short_of_limit": bool(f.get("short_of_limit"))})
     picked = td.get("picked") or []
     if not picked:
@@ -1225,7 +1284,7 @@ def _run_topdown(t0: float, ms: dict):
              "topdown_notes": (td.get("missing") or [])[:8],
              "picked_detail": [{k: x.get(k) for k in
                                 ("code", "board", "track", "tier", "kind", "reason",
-                                 "dup_n", "t_first", "flow_valid", "circ_mv")}
+                                 "flags", "dup_n", "t_first", "flow_valid", "circ_mv")}
                                for x in picked]}
     return _deep_and_deliver(codes, outer, funnel, t0, ms)
 
@@ -1234,7 +1293,7 @@ def run() -> dict:
     """一次性跑完整流程——盘中三层漏斗选人 → deep 分析（唯一链路）。
 
     流程：L1 大盘闸 → L2 板块闸（行业/概念三备二）→ L3 板块内选股（跟随/跳变
-    双分支）→ 连板放量准入闸 → 截断 25 → deep_analyze(<=45)，LLM 单次调用；
+    双分支）→ 连板放量/吸筹打标（不放弃，挂 flags）→ 截断 35 → deep_analyze(<=45)，LLM 单次调用；
     交付按位置透支升序，名单成员与顺序解耦。运行期预热两大单点（指数 K 线
     mootdx 冷启、CNStock 连接池），失败不阻塞主流程。选人层规则详见
     _topdown.py 与 SKILL.md；本函数无入参。失败如实返回，不回落任何备用链路。

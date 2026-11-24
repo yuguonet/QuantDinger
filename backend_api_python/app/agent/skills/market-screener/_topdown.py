@@ -34,9 +34,10 @@
       深亏 5→1 笔、负收益累计 -176→-70、T+3 胜 69.8%→75.2%（累计收益 430→396）。
       闸在 per_board 截断之前生效，被剔除的名额由后续跳变票回填。
     出票只有两支：涨停票（按 zt_time 先后）与跳变票（按 t_first 先后）。
-    · **早盘吸筹准入闸**（`_early_accumulation_gate`，仅 as_of ≤ 09:40）：
-      跳变票须满足「前 5 日累计净流入 > 流通市值 1%（明显吸筹）」且「前 5 日
-      累计涨幅 < 10%（未过度拉升）」，否则放弃；涨停票不拦。生产实测：阈值
+    · **早盘吸筹打标**（`_flag_early_accumulation`，仅 as_of ≤ 09:40；2026-11-23
+      小资金复利对齐起打标不放弃）：跳变票不满足「前 5 日累计净流入 > 流通市值 1%
+      （明显吸筹）」或「前 5 日累计涨幅 < 10%（未过度拉升）」即挂 flags（护栏证据，
+      取舍归裁决层）；涨停票不标。原闸口径实测：阈值
       0→1.0 后 09:40 触板率 11.8%→26.3%、T3 均 +1.079%→+1.931%；09:35 深亏
       归零但样本降到日均 1.2 只。09:45 实测深亏反而 3.2%→5.6%（被拦组深亏 0%
       纯误伤），故截止收到 09:40。流通市值「中位更优」不成立（20~80 亿反而
@@ -129,10 +130,13 @@ def _parse_idx_scale() -> Dict[str, float]:
 
 
 _L1_IDX_SCALE = _parse_idx_scale()
-_L2_BOARDS_STRONG = _env_i("L2_BOARDS_STRONG", 6)
-_L2_BOARDS_NEUTRAL = _env_i("L2_BOARDS_NEUTRAL", 4)
-_L2_BOARDS_WEAK = _env_i("L2_BOARDS_WEAK", 3)
-_L3_LIMIT = _env_i("L3_LIMIT", 25)
+# 2026-11-23 小资金复利对齐：粗筛宁滥勿缺（设计方案 v2 §3.1），板块数/截断额放宽，
+# 取舍归裁决层；弱市档仍相对收紧，但不再砍到 3 板块/25 只（仓位是输出层的事，
+# 不是扫描层的事）。
+_L2_BOARDS_STRONG = _env_i("L2_BOARDS_STRONG", 8)
+_L2_BOARDS_NEUTRAL = _env_i("L2_BOARDS_NEUTRAL", 6)
+_L2_BOARDS_WEAK = _env_i("L2_BOARDS_WEAK", 4)
+_L3_LIMIT = _env_i("L3_LIMIT", 35)
 _L3_PER_BOARD = _env_i("L3_PER_BOARD", 10)
 _FOLLOW_WINDOW_MIN = _env_i("FOLLOW_WINDOW_MIN", 10)
 _MIN_BOARD_FUND_PCT = _env_f("MIN_BOARD_FUND_PCT", 0.0)
@@ -147,6 +151,12 @@ _STREAK_SURGE_MIN_HIST = _env_i("STREAK_SURGE_MIN_HIST", 2)
 _STREAK_SURGE_LOOKBACK = _env_i("STREAK_SURGE_LOOKBACK", 12)
 _STREAK_SURGE_ZT_TOL = _env_f("STREAK_SURGE_ZT_TOL", 0.8)
 _MIN_CIRC_MV_YI = _env_f("MIN_CIRC_MV", 15.0)
+# 死水/噪音护栏（打标降权，不放弃）：口径为 T-1 全日（snapshot 15:00 full_net），
+# 与日线回测同口径；盘中累计量只有全日约四成，禁止把全日阈值套到盘中同刻。
+_DEADPOOL_ENABLE = _env_i("DEADPOOL_ENABLE", 1)
+_DEADPOOL_TURN_PCT = _env_f("DEADPOOL_TURN_PCT", 3.0)
+_DEADPOOL_MV_YI = _env_f("DEADPOOL_MV_YI", 30.0)
+_DEADPOOL_NOISE_WAN = _env_f("DEADPOOL_NOISE_WAN", 1000.0)
 _JUMP_WITH_ZT = _env_i("JUMP_WITH_ZT", 1)
 # 有涨停板块里「非涨停（跳变）票」的精细截断（trae 2026-11-06，v2 修正）。
 #
@@ -178,7 +188,7 @@ _JUMP_MIN_VR = _env_f("JUMP_MIN_VR", 2.0)
 _DUP_MIN = _env_i("DUP_MIN", 1)
 _L2_SORT = (os.getenv("QD_TOPDOWN_L2_SORT", "net_pct") or "net_pct").strip().lower()
 _L2_MIN_NET_YI = _env_f("L2_MIN_NET_YI", 0.0)
-# ── 早盘「庄家吸筹」准入闸（trae 2026-11-06）──
+# ── 早盘「庄家吸筹」打标（trae 2026-11-06 建闸；2026-11-23 小资金复利对齐改打标不放弃）──
 # ★ 两轮回测修正后的结论（12 天 10-21~11-05，09:35/09:40/09:45，详见 tmp/
 #   oc_sel_early_gate_*_20261106.py）：
 #   1) 原假说「前几日流入 + 早盘拉升 = 拉高出货」被数据**否定**：09:35 加闸后
@@ -192,9 +202,12 @@ _L2_MIN_NET_YI = _env_f("L2_MIN_NET_YI", 0.0)
 #      ≥80 亿深亏率较低但触板率也较低；效果存在取舍，**不做市值硬筛/排序**，
 #      只把弱市市值层级与早盘波动线索交给 deep 作为风险证据。
 #
-# 准入条件（仅 kind=jump；涨停票不拦；仅 as_of <= _EARLY_GATE_TIME 生效）：
+# 打标条件（仅 kind=jump；涨停票不标；仅 as_of <= _EARLY_GATE_TIME 生效）：
 #   前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR（默认 1.0）
 #   且 前 N 日累计涨幅 < _EARLY_RET5_MAX（默认 10%）
+# 2026-11-23 小资金复利对齐：命中只打 flags 不放弃（粗筛宁滥勿缺、群体比例
+# 不淘汰候选，取舍归裁决层）；下方回测收益是护栏先验（仓位/触发/止损），
+# 不是排除依据。
 # 生产管道实测（闸 ON，全量池）：
 #   阈值 0（12 天 10-21~11-05）：09:35 深亏 10.4%→6.2%、T3 +0.468%→+1.955%；
 #                                 09:40 深亏 8.0%→5.6%、T3 +0.102%→+0.588%
@@ -206,13 +219,13 @@ _L2_MIN_NET_YI = _env_f("L2_MIN_NET_YI", 0.0)
 _EARLY_GATE_ENABLE = _env_i("EARLY_GATE_ENABLE", 1)
 _EARLY_GATE_TIME = os.getenv("QD_TOPDOWN_EARLY_GATE_TIME", "09:40") or "09:40"
 _EARLY_FLOW_DAYS = _env_i("EARLY_FLOW_DAYS", 5)
-# 前 N 日累计净流入 ÷ 流通市值 × 100 的**准入下限**（%）。
+# 前 N 日累计净流入 ÷ 流通市值 × 100 的**打标下限**（%）；低于此值打「吸筹不足」标。
 # 默认 1.0 = 要求前 5 日净流入超过流通市值的 1%（明显吸筹）。
 # 依据（生产实测，09:40 截止）：0→1.0 时 09:40 T3 均 +1.079%→+1.931%、
 # 触板率 11.8%→26.3%（翻倍）；1.0→2.0 则 09:35 样本降到日均 0.5 只且
 # T3 -1.935%，过度收紧。0.5 在 09:40 反而 T3 -0.003%，不稳定，故取 1.0。
 _EARLY_FLOW_IN_THR = _env_f("EARLY_FLOW_IN_THR", 1.0)
-# 前 N 日累计涨幅的**准入上限**（%）。≥ 此值视为已过度拉升、无吸筹空间。
+# 前 N 日累计涨幅的**打标上限**（%）。≥ 此值打「已过度拉升」标（回测组明显变差）。
 _EARLY_RET5_MAX = _env_f("EARLY_RET5_MAX", 10.0)
 
 _PRESETS: Dict[str, Dict[str, float]] = {
@@ -952,11 +965,15 @@ def _zt_streak_before(bars: List[Dict[str, Any]], code: str, day: str) -> int:
     return n
 
 
-def exclude_streak_surge(items: List[Dict[str, Any]], day: str,
-                         as_of: Optional[str],
-                         zt_codes: List[str]) -> Tuple[List[Dict[str, Any]],
-                                                       List[Dict[str, Any]], int]:
-    """准入闸：放弃「当前连板高度 ≥N 且当日放量上涨」的候选。
+def flag_streak_surge(items: List[Dict[str, Any]], day: str,
+                      as_of: Optional[str],
+                      zt_codes: List[str]) -> Tuple[List[Dict[str, Any]],
+                                                    List[Dict[str, Any]], int]:
+    """打标（不放弃）：标记「当前连板高度 ≥N 且当日放量上涨」的候选。
+
+    2026-11-23 小资金复利对齐：连板/动能是尾部捕捉对象，选人层不再清场；
+    命中者挂 `flags` 命中证据（高波动档护栏：仓位上限/宽止损/触发条件），
+    取舍归裁决层（粗筛宁滥勿缺，设计方案 v2 §3.1）。
 
     连板高度 = 截至昨收的连续涨停天数 + 今日截至 as_of 是否曾触板。
     加今日触板是因为「昨日首板 + 今日再板」已经是 2 连板，正是要挡的高位加速票。
@@ -969,7 +986,8 @@ def exclude_streak_surge(items: List[Dict[str, Any]], day: str,
     任一侧缺失（ret 或 vr 为 None）时保留该票并计入 unknown，不猜、不默认剔除。
 
     Returns:
-        (kept, excluded, unknown_n)；excluded 每行带 excluded_reason 便于复盘。
+        (items, flagged, unknown_n)；items 含全部候选、一个不丢，flagged 是
+        命中打标的票（同一批对象，已挂 flags 命中原因）。
     """
     if not _STREAK_SURGE_ENABLE or not items:
         return list(items), [], 0
@@ -987,8 +1005,8 @@ def exclude_streak_surge(items: List[Dict[str, Any]], day: str,
     rows = panel.get("rows") or {}
     zt = {str(c).split(".")[0] for c in zt_codes}
 
-    kept: List[Dict[str, Any]] = []
-    excluded: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+    flagged: List[Dict[str, Any]] = []
     unknown = 0
     for x in items:
         code = str(x.get("code") or "").split(".")[0]
@@ -996,7 +1014,7 @@ def exclude_streak_surge(items: List[Dict[str, Any]], day: str,
         if code in zt:
             streak += 1
         if streak < _STREAK_SURGE_MIN_STREAK:
-            kept.append(x)
+            out.append(x)
             continue
 
         by_day = rows.get(code) or {}
@@ -1013,13 +1031,16 @@ def exclude_streak_surge(items: List[Dict[str, Any]], day: str,
 
         if ret is None or vr is None:
             unknown += 1
-            kept.append(x)
+            out.append(x)
         elif ret > _STREAK_SURGE_MIN_RET and vr >= _STREAK_SURGE_MIN_VR:
-            excluded.append({**x, "excluded_reason":
-                             f"{streak}连板 量×{vr:.2f} 涨{ret:+.2f}%"})
+            y = {**x, "flags": [*(x.get("flags") or []),
+                                f"连板放量：{streak}连板 量×{vr:.2f} 涨{ret:+.2f}%"
+                                "（高波动档护栏：仓位上限/宽止损/触发条件）"]}
+            out.append(y)
+            flagged.append(y)
         else:
-            kept.append(x)
-    return kept, excluded, unknown
+            out.append(x)
+    return out, flagged, unknown
 
 
 def attach_flow_strength(items: List[Dict[str, Any]], day: str,
@@ -1063,10 +1084,13 @@ def attach_flow_strength(items: List[Dict[str, Any]], day: str,
     return out, invalid
 
 
-def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
+def _flag_early_accumulation(items: List[Dict[str, Any]], day: str,
                              as_of: Optional[str]
                              ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    """早盘「庄家吸筹」准入闸：前 N 日有净流入 且 涨幅未过度。
+    """早盘「庄家吸筹」打标（不放弃）：前 N 日有净流入 且 涨幅未过度。
+
+    2026-11-23 小资金复利对齐：命中只打 flags 不放弃——群体比例不淘汰候选
+    （strategy-rules §11.7），回测收益作护栏先验，取舍归裁决层。
 
     ★ 结论来自 2026-11-06 两轮回测（12 天 10-21~11-05，09:35/09:40/09:45，
       脚本 tmp/oc_sel_early_gate_*_20261106.py），关键翻转：
@@ -1076,7 +1100,7 @@ def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
         （净流出 -4.5~-7.1%，净流入 0~3% +3.5~+4.1%）；前 5 日涨幅 ≥10% 明显变差。
       · 「中位流通市值更优」不成立（20~80 亿最差）→ 本闸不引入市值条件。
 
-    准入条件（仅 kind=jump；涨停票不拦；仅 as_of <= _EARLY_GATE_TIME 生效）：
+    打标条件（仅 kind=jump；涨停票不标；仅 as_of <= _EARLY_GATE_TIME 生效）：
         前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR（默认 1.0）
         且 前 N 日累计涨幅 < _EARLY_RET5_MAX（默认 10%）
 
@@ -1086,7 +1110,7 @@ def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
     数据不足（缺 N 日净流 / 末拍价 / 流通市值）→ 不可验证，保留并计数。
 
     Returns:
-        (kept, excluded, unknown)
+        (items, flagged, unknown)；items 含全部候选、一个不丢，flagged 已挂 flags。
     """
     if not _EARLY_GATE_ENABLE or not as_of:
         return list(items), [], 0
@@ -1101,12 +1125,12 @@ def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
                        with_net=True, full_net=True, end_day=day, with_last=True)
     rows = p.get("rows") or {}
     d_prev = sorted(d for d in (p.get("days") or []) if d < day)
-    kept: List[Dict[str, Any]] = []
-    excluded: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+    flagged: List[Dict[str, Any]] = []
     unknown = 0
     for x in items:
         if x.get("kind") != "jump":
-            kept.append(x)
+            out.append(x)
             continue
         code = str(x.get("code") or "").split(".")[0]
         byday = rows.get(code) or {}
@@ -1120,19 +1144,88 @@ def _early_accumulation_gate(items: List[Dict[str, Any]], day: str,
               if len(d_prev) >= _EARLY_FLOW_DAYS + 1 else None)
         if len(nets) < _EARLY_FLOW_DAYS or not circ_mv or not c1 or not c6:
             unknown += 1
-            kept.append(x)
+            out.append(x)
             continue
         ratio = sum(nets) / float(circ_mv) * 100.0
         ret5 = (float(c1) / float(c6) - 1) * 100.0
         if ratio <= _EARLY_FLOW_IN_THR:
-            excluded.append({**x, "excluded_reason":
-                             f"前{_EARLY_FLOW_DAYS}日净流入{ratio:+.2f}%（无庄吸筹）"})
+            y = {**x, "flags": [*(x.get("flags") or []),
+                                f"前{_EARLY_FLOW_DAYS}日净流入{ratio:+.2f}%"
+                                "（吸筹不足：资金偏弱，降权评估）"]}
+            out.append(y)
+            flagged.append(y)
         elif ret5 >= _EARLY_RET5_MAX:
-            excluded.append({**x, "excluded_reason":
-                             f"前{_EARLY_FLOW_DAYS}日涨幅{ret5:+.1f}%（已过度拉升）"})
+            y = {**x, "flags": [*(x.get("flags") or []),
+                                f"前{_EARLY_FLOW_DAYS}日涨幅{ret5:+.1f}%"
+                                "（已过度拉升：回测组明显变差，高波动档护栏）"]}
+            out.append(y)
+            flagged.append(y)
         else:
-            kept.append(x)
-    return kept, excluded, unknown
+            out.append(x)
+    return out, flagged, unknown
+
+
+def _flag_deadpool_guard(items: List[Dict[str, Any]], day: str,
+                         as_of: Optional[str]
+                         ) -> Tuple[List[Dict[str, Any]], int, int]:
+    """死水/资金噪音护栏打标（不放弃）：T-1 全日换手<阈值 且 流通市值<阈值，或 T-1 全日净额<噪音线。
+
+    取数走 snapshot 15:00 full_net 的 T-1 日切片（与 qd_fund_flow_stock.main_net
+    同源同量级），换手/市值用 T-1 全日累计量与末拍价配当前流通股本。
+    T-1 是已收盘确定值，不含 as_of 之后信息，故盘中任意时刻可打标。
+    命中只挂 flags、排序沉底，不删候选（SKILL.md:46「代码不做取舍」）。
+    数据不足（缺 T-1 全日切片/流通股本）→ 不打标并计数，不猜。
+
+    Returns:
+        (items 带 deadpool 标记, 命中数, 未知数)
+    """
+    if not _DEADPOOL_ENABLE:
+        return list(items), 0, 0
+    codes = sorted({str(x.get("code") or "").split(".")[0]
+                    for x in items if x.get("code")})
+    if not codes:
+        return list(items), 0, 0
+    p = _sq.snap_panel(as_of="15:00", codes=codes, days=2,
+                       with_net=True, full_net=True, end_day=day, with_last=True)
+    rows = p.get("rows") or {}
+    d_prev = sorted(d for d in (p.get("days") or []) if d < day)
+    if not d_prev:
+        return list(items), 0, len(items)
+    prev_day = d_prev[-1]
+    shares = _sq._shares_map(codes)
+    out: List[Dict[str, Any]] = []
+    flagged = 0
+    unknown = 0
+    for x in items:
+        code = str(x.get("code") or "").split(".")[0]
+        bar = (rows.get(code) or {}).get(prev_day) or {}
+        vol = _sq._num(bar.get("vol"))
+        last = _sq._num(bar.get("last"))
+        net = _sq._num(bar.get("net"))
+        sh = shares.get(code)
+        if not (vol and last and sh and net is not None):
+            unknown += 1
+            out.append(x)
+            continue
+        turn = vol / float(sh) * 100.0
+        mv_yi = float(last) * float(sh) / 1e8
+        net_wan = abs(float(net)) / 1e4
+        dead = (turn < _DEADPOOL_TURN_PCT and mv_yi < _DEADPOOL_MV_YI)
+        noise = net_wan < _DEADPOOL_NOISE_WAN
+        if dead or noise:
+            flagged += 1
+            reasons = []
+            if dead:
+                reasons.append(f"死水小盘(T-1换手{turn:.2f}%<{_DEADPOOL_TURN_PCT:g}% "
+                               f"且流通{mv_yi:.1f}亿<{_DEADPOOL_MV_YI:g}亿)")
+            if noise:
+                reasons.append(f"资金噪音(T-1全日净额{net_wan:.0f}万<{_DEADPOOL_NOISE_WAN:g}万)")
+            out.append({**x, "deadpool": True,
+                        "flags": [*(x.get("flags") or []),
+                                  "、".join(reasons) + "（回测排除型护栏，降权评估）"]})
+        else:
+            out.append(x)
+    return out, flagged, unknown
 
 
 def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
@@ -1144,16 +1237,17 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     （前视），又缺"涨停过又炸板的票"（幸存者偏差），两种偏差都不允许进入盘中决策。
     `as_of=None`（生产实时）时直接用实时涨停池。
 
-    截断前过一道准入闸 `exclude_streak_surge()`：当前连板高度 ≥
+    截断前过一遍 `flag_streak_surge()` 打标（不放弃）：当前连板高度 ≥
     `QD_TOPDOWN_STREAK_SURGE_MIN_STREAK`（默认 2，含今日截至 as_of 曾触板）
-    且当日放量上涨（同刻量比 ≥ `MIN_VR`、末拍涨幅 > `MIN_RET`）的票一律放弃；
-    `QD_TOPDOWN_STREAK_SURGE_ENABLE=0` 可整闸关闭。闸只吃已收盘日线与
-    `as_of` 及以前的 snapshot，不引入未来信息；数据不足的票保留并计数。
+    且当日放量上涨（同刻量比 ≥ `MIN_VR`、末拍涨幅 > `MIN_RET`）的票挂 `flags`
+    命中证据（高波动档护栏：仓位/触发/止损收紧，取舍归裁决层）；
+    `QD_TOPDOWN_STREAK_SURGE_ENABLE=0` 可关闭打标。打标只吃已收盘日线与
+    `as_of` 及以前的 snapshot，不引入未来信息；数据不足的票不打标并计数。
 
     Args:
         as_of: 截断时刻 HH:MM；None=此刻（用实时涨停池原文）
         day: 目标交易日；None=今天（涨停池/分时取数的日期）
-        limit: 最终送 deep 的只数；None 取 env QD_TOPDOWN_L3_LIMIT（默认 25）
+        limit: 最终送 deep 的只数；None 取 env QD_TOPDOWN_L3_LIMIT（默认 35）
 
     Returns:
         {ok, gate, boards, per_board: [...], picked: [...], funnel: {...}, missing}
@@ -1241,35 +1335,46 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
         all_picked = kept
 
     zt_codes = [str(r.get("stock_code") or "").split(".")[0] for r in zt_rows]
-    all_picked, streak_excluded, streak_unknown = exclude_streak_surge(
+    all_picked, streak_flagged, streak_unknown = flag_streak_surge(
         all_picked, d, as_of, zt_codes)
-    if streak_excluded:
-        brief = "、".join(f"{x['code']}({x['excluded_reason']})"
-                         for x in streak_excluded[:8])
-        notes.append(f"连板放量闸放弃 {len(streak_excluded)} 只：{brief}")
+    if streak_flagged:
+        brief = "、".join(f"{x['code']}({(x.get('flags') or [''])[-1]})"
+                         for x in streak_flagged[:8])
+        notes.append(f"连板放量打标 {len(streak_flagged)} 只（保留，高波动档护栏）：{brief}")
     if streak_unknown:
-        notes.append(f"连板放量闸 {streak_unknown} 只因同刻量能或末拍价缺失未判（保留）")
+        notes.append(f"连板放量打标 {streak_unknown} 只因同刻量能或末拍价缺失未打标")
 
     all_picked, flow_invalid = attach_flow_strength(all_picked, d, as_of)
     if flow_invalid:
         notes.append(f"资金流通比 {flow_invalid} 只落在低区无效区间"
                      f"（流通市值 < {_MIN_CIRC_MV_YI:g} 亿或数据缺失），不参与排序")
 
-    # 早盘「庄家吸筹」准入闸：前 N 日有净流入 且 5 日涨幅未过度（仅 jump）。
-    # 只对 kind=jump 生效；涨停票不拦。详见 _early_accumulation_gate 注释。
-    all_picked, early_excluded, early_unknown = _early_accumulation_gate(
+    # 早盘「庄家吸筹」打标（不放弃）：前 N 日有净流入 且 5 日涨幅未过度（仅 jump）。
+    # 只对 kind=jump 生效；涨停票不标。详见 _flag_early_accumulation 注释。
+    all_picked, early_flagged, early_unknown = _flag_early_accumulation(
         all_picked, d, as_of)
-    if early_excluded:
-        brief = "、".join(f"{x['code']}({x['excluded_reason']})"
-                         for x in early_excluded[:8])
-        notes.append(f"早盘吸筹准入闸放弃 {len(early_excluded)} 只：{brief}")
+    if early_flagged:
+        brief = "、".join(f"{x['code']}({(x.get('flags') or [''])[-1]})"
+                         for x in early_flagged[:8])
+        notes.append(f"早盘吸筹打标 {len(early_flagged)} 只（保留）：{brief}")
     if early_unknown:
-        notes.append(f"早盘吸筹准入闸 {early_unknown} 只因前{_EARLY_FLOW_DAYS}日"
-                     f"净流/末拍价/流通市值缺失未判（保留）")
+        notes.append(f"早盘吸筹打标 {early_unknown} 只因前{_EARLY_FLOW_DAYS}日"
+                     f"净流/末拍价/流通市值缺失未打标")
+
+    all_picked, deadpool_flagged, deadpool_unknown = _flag_deadpool_guard(
+        all_picked, d, as_of)
+    deadpool_flagged_for_funnel = [x["code"] for x in all_picked if x.get("deadpool")]
+    if deadpool_flagged:
+        notes.append(f"死水/噪音护栏打标 {deadpool_flagged} 只（保留、排序沉底）："
+                     f"T-1全日换手<{_DEADPOOL_TURN_PCT:g}%且流通<{_DEADPOOL_MV_YI:g}亿 "
+                     f"或净额<{_DEADPOOL_NOISE_WAN:g}万")
+    if deadpool_unknown:
+        notes.append(f"死水/噪音护栏 {deadpool_unknown} 只因T-1全日切片/流通股本缺失未打标")
 
     all_picked.sort(key=lambda x: ((x.get("t_first") or "99:99"),
                                    -(x.get("dup_n") or 1),
                                    0 if x.get("flow_valid") else 1,
+                                   1 if x.get("deadpool") else 0,
                                    -(x.get("fund_circ_ratio") or 0)))
     trunc = all_picked[:lim]
 
@@ -1295,10 +1400,12 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
             "boards_reserve": len(boards.get("reserve") or []),
             "picked_raw": picked_raw_n,
             "picked": len(trunc),
-            "excluded_streak_surge": [x["code"] for x in streak_excluded],
+            "streak_surge_tagged": [x["code"] for x in streak_flagged],
             "streak_surge_unknown": streak_unknown,
-            "excluded_early_accumulation": [x["code"] for x in early_excluded],
-            "early_accumulation_unknown": early_unknown,
+            "early_accum_tagged": [x["code"] for x in early_flagged],
+            "early_accum_unknown": early_unknown,
+            "deadpool_tagged": deadpool_flagged_for_funnel,
+            "deadpool_unknown": deadpool_unknown,
             "dup_codes": dup_codes,
             "dup_max": max((int(x.get("dup_n") or 1) for x in trunc), default=1),
             "dup_min_gate": _DUP_MIN,

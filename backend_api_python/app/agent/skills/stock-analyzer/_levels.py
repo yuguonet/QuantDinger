@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import os
 import statistics
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -322,12 +323,18 @@ def build_levels(bars: List[Dict[str, Any]], code: str = "", name: str = "",
         rows.sort(key=lambda r: (not r["verified"], -r["score"], abs(r["dist_pct"])))
         return rows[:_SIDE_KEEP]
 
+    picked_sup = _pick(sides["sup"])
+    picked_res = _pick(sides["res"])
+    near_max_pct = float(os.getenv("QD_STOCK_ANALYZER_STOP_NEAREST_MAX_PCT", "6") or 6)
+    nearest = [r for r in picked_sup if abs(r["dist_pct"]) <= near_max_pct]
+    nearest.sort(key=lambda r: abs(r["dist_pct"]))
     out = {
         "ok": True,
         "close": round(px_now, 2),
         "as_of": norm[-1]["date"],
-        "supports": _pick(sides["sup"]),
-        "resists": _pick(sides["res"]),
+        "supports": picked_sup,
+        "resists": picked_res,
+        "nearest_support": nearest[0] if nearest else None,
         "checks": checks,
         "note": "8 类方法（均线/枢轴/波段/区间/缺口/密集区/涨停起点/关键位引擎）±1% 聚类交叉验证；"
                 "verified=至少 2 类方法聚合或 30 日内有效测试（触碰且收回）≥2 次，孤证价位仅可参考",

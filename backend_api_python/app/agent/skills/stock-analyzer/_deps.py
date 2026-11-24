@@ -42,11 +42,12 @@ _FETCH_TIMEOUT_S = _H._FETCH_TIMEOUT_S
 _detect_patterns = _F.detect_patterns
 _market_state = _F.market_state
 _multitimeframe = _F.multitimeframe
+intraday_bars = _F.intraday_bars
 
 __all__ = [
     "SkillResult", "fetch_kline", "select_strategy", "resolve_names", "build_report",
     "tech_summary", "cross_verdict", "flow_summary", "seal_summary", "pump_dump_risk",
     "zt_index", "attach_prediction", "same_time_batch", "intraday_shape_batch",
     "fetch_rt_map", "apply_rt_overlay", "_now_hhmm", "_FETCH_TIMEOUT_S",
-    "_detect_patterns", "_market_state", "_multitimeframe",
+    "_detect_patterns", "_market_state", "_multitimeframe", "intraday_bars",
 ]
