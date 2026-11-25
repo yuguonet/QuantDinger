@@ -31,6 +31,7 @@ from ...log import logger
 from ._helpers import (select_strategy, build_report, resolve_names,
                        tech_summary, predict_one, _mood_regime,
                        prewarm_market_klines, cross_verdict, _num_or_none,
+                       _CROSS_STRONG_SHAPES, _CROSS_WEAK_SHAPES,
                        ERROR_CATEGORIES, _format_error)
 from .monitor_tags import attach_monitor   # 重点监控格（软提示，2026-11-07）
 from ._facts import (market_state as _market_state,
@@ -514,7 +515,7 @@ def _rank_row(card: dict) -> dict:
     hi_today 是条件单的突破基准（次日 09:30-10:00 突破它才买），否则模型只能给
     「回踩现价下方」这一种买点。
     默认值不写（limit_up=False / stale_bar=False / risks=0 / buyable=True / 无 res /
-    seal=none 未封板 / confidence=1.0 满证据 / zt_streak=0 无连板 / 空 name /
+    seal=none 未封板 / zt_streak=0 无连板 / 空 name /
     hi_today==hi20 当日最高就是 20 日最高），缺键即正常，
     口径见 _REPORT_GUIDE["fields"]。唯一例外：关键资格判据缺列时写 `gaps`
     （缺键清单，序=_EVIDENCE_KEYS；证据缺省按坏读，打标不是闸）。
@@ -591,8 +592,6 @@ def _rank_row(card: dict) -> dict:
         row.pop("hi_today", None)
     if row.get("seal") == "none":
         row.pop("seal", None)
-    if row.get("confidence") == 1.0:
-        row.pop("confidence", None)
     if row.get("zt_streak") == 0:
         row.pop("zt_streak", None)
     if rt.get("buyable") is None:
@@ -701,7 +700,7 @@ def _full_card_quota(head: dict, cards: list, rank: list, budget: int) -> int:
 
 
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
-                 with_patterns: bool = True, with_mtf: bool = "auto",
+                 with_patterns: bool = True, with_mtf="auto",
                  budget: int = None, min_cards: int = 0) -> dict:
     """对指定股票批量汇总全部可用证据，并按标定模型的 P(次日涨) 排序。
 
@@ -719,7 +718,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             - 中性市场（40<=mkt_score<70）→ True（常规分析）
             显式传入 bool 值则按值执行（True/False）。
         budget: 整份返回值的字符预算（含信封+rank+满卡）；默认 QD_SCREENER_DEEP_BUDGET
-            （29500）。run() 会把外层 market/hints/funnel 的体量与随后追加的 src 标注
+            （44500，observation 闸 45000 内留 500）。run() 会把外层 market/hints/funnel 的体量与随后追加的 src 标注
             一并扣掉再传，使「最终交付」而不是「本函数输出」受预算约束。
         min_cards: 最少保留的满卡数，不超过实际分析数；大于 0 时允许暂时超过预算，
             由 run() 的最终交付阶段压缩或明确报错。
@@ -772,19 +771,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     strategy = select_strategy()
     errors: list = []
     missing: list = []
-    
-    # 根据 with_mtf 参数决定实际行为
-    if with_mtf == "auto":
-        try:
-            # 获取市场情绪判断是否需要 MTF
-            mkt_info = _market_state() if 'mkt_info' not in locals() else mkt_info
-            mkt_score = float(mkt_info.get("market_mood_score", 50) or 50)
-            mtf_enabled = (mkt_score < 70)  # 中性及以下 → 开启 MTF
-        except Exception:
-            mtf_enabled = True  # 默认开启
-    else:
-        mtf_enabled = bool(with_mtf)
-    
+
     code_list = [c.strip() for c in str(codes or "").split(",") if c.strip()][:max(1, int(limit or 8))]
     if not code_list:
         return SkillResult({
@@ -794,12 +781,25 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             "errors": [], "missing": [],
         })
 
-    name_map = resolve_names(code_list)
     market = {}
     try:
         market = _market_state()
     except Exception as e:
         missing.append(f"市场状态: {type(e).__name__}: {e}")
+
+    # with_mtf="auto"：强弱市自动决定是否取多周期（强势关、其余开）。
+    # 复用上方已取的 market（60s memo 内零开销）——原实现的
+    # `'mkt_info' not in locals()` 条件恒真、再调一次 _market_state()，已修。
+    if with_mtf == "auto":
+        try:
+            mkt_score = float(market.get("market_mood_score", 50) or 50)
+            mtf_enabled = (mkt_score < 70)  # 中性及以下 → 开启 MTF
+        except Exception:
+            mtf_enabled = True  # 默认开启
+    else:
+        mtf_enabled = bool(with_mtf)
+
+    name_map = resolve_names(code_list)
 
     # 分时校准只在盘中做：收盘后「同刻」≡全天，日线口径的 vr_rel/flow_rel 已经是
     # 最优解，再叠一份 snapshot 版只会给出两个不同的 flow_rel（实测最多差 17pp，
@@ -1449,6 +1449,78 @@ def _compact_delivery(out: dict, min_cards: int = 0) -> dict:
     )
 
 
+# 强信号判定的形态词表（满卡 patterns 命名，与 SKILL.md deliverability 表格一致）
+_DELIV_STRONG_PATTERNS = ("平台突破", "底部启动", "均线支撑回踩", "放量突破")
+
+
+def build_deliverability_note(rank: list, analyzed: list) -> str:
+    """deliverability_note 生成（纯函数，可单测）：位置 / 分时形态 / 强信号三维。
+
+    三维与 SKILL.md「deliverability_note 生成逻辑」表格一一对应；不做主观评分，
+    不输出“B级/买入”等主观结论。
+
+    ★ patterns 与 seal(dict) 只存在于满卡 analyzed，rank 行没有（rank 行的 seal
+      是字符串标签）——seal 优先取满卡 dict、缺卡时退 rank 行字符串；无满卡的票
+      按「证据未交付」处理，不编造「未命中」（缺证据=坏证据）。原实现读 rank 行
+      patterns 恒空（强信号维度恒不触发）、seal 字符串调 .get 直接 AttributeError
+      （2026-11-25 审查修复）。
+    ★ 分时维度用英文标签（shape 的真实取值，见 _helpers.intraday_shape，与 cross
+      同一套强弱分类）：旧实现匹配中文「冲高回落/跌破」恒不命中，分时维度同样
+      恒输出「中性」（2026-11-25 审查修复）。
+    """
+    card_map = {str(a.get("code") or ""): a
+                for a in (analyzed or []) if isinstance(a, dict)}
+    dn: list = []
+    for r in rank or []:
+        if not isinstance(r, dict):
+            continue
+        c = str(r.get("code") or "")
+        card = card_map.get(c) or {}
+        price = _num_or_none(r.get("price"))
+        hi20 = _num_or_none(r.get("hi20"))
+        vr_rel = _num_or_none(r.get("vr_rel") or r.get("vr_rel_st"))
+        shape = r.get("shape") or ""
+        patterns = card.get("patterns") or []
+        seal_obj = card.get("seal") or r.get("seal")
+        if isinstance(seal_obj, dict):
+            seal_tag = seal_obj.get("tag") or "none"
+        elif seal_obj:
+            seal_tag = str(seal_obj)          # rank 行字符串标签兜底
+        else:
+            seal_tag = "none"
+        nts = []
+        # 位置：距 20 日高点
+        if price is not None and hi20 is not None and hi20 > 0:
+            dist_pct = round((price - hi20) / hi20 * 100, 2)
+            if dist_pct <= -3.0:
+                nts.append(f"位置清洁（距20日高点 {dist_pct}%<=-3%）")
+            else:
+                nts.append(f"位置偏高（距20日高点 {dist_pct}%>-3%）")
+        else:
+            nts.append("位置数据不足")
+        # 分时形态（英文标签，weak/strong 分类与 cross_verdict 同源）
+        if shape in _CROSS_WEAK_SHAPES:
+            nts.append(f"分时走势偏弱（{shape}）")
+        elif shape in _CROSS_STRONG_SHAPES:
+            nts.append(f"分时走势偏强（{shape}）")
+        else:
+            nts.append("分时走势中性")
+        # 强信号：patterns + seal.tag + vr_rel（证据来自满卡）
+        if not card:
+            nts.append("形态/封板证据未交付（无满卡，不判强信号）")
+        else:
+            pnames = [str(p.get("pattern") or "") for p in patterns if isinstance(p, dict)]
+            strong = any(k in ",".join(pnames) for k in _DELIV_STRONG_PATTERNS)
+            if strong and seal_tag in ("one_word", "open0") and (vr_rel or 0) >= 2.0:
+                nts.append("强信号命中（平台突破/底部启动/均线支撑回踩/放量突破 + 封板结构清洁 + 放量）")
+            elif strong:
+                nts.append("形态信号存在（未达强信号阈值：需封板结构 one_word/open0 且 vr_rel>=2）")
+            else:
+                nts.append("未命中强信号形态")
+        dn.append(f"{c}: {'；'.join(nts)}")
+    return " | ".join(dn) if dn else "无可分析候选"
+
+
 def _parse_codes(codes: str) -> list:
     """从自由文本里抓 6 位代码，去重保序；空输入返回空表。"""
     out = []
@@ -1459,11 +1531,28 @@ def _parse_codes(codes: str) -> list:
 
 
 def _run_fine(codes: list, t0: float, ms: dict, run_started_at: str = ""):
-    """两轮协议第二轮：对粗筛短名单出满卡。无漏斗——codes 即终选，只做深度证据。"""
+    """两轮协议第二轮：对粗筛短名单出满卡。无漏斗——codes 即终选，只做深度证据。
+
+    market/mood_regime 必须随行交付（2026-11-25 审查修复）：report_guide 的
+    entry_exit①「先定姿态（读 market 的两档情绪）」与 market 条「market 已在
+    本结果、不要再 get_market_overview」对两轮同样生效——原实现细筛轮不带
+    market 块，判定轮被指引去读一个不存在的块，还被禁止自拉数据。
+    细筛轮不重算漏斗打标（flags 属选人层），第一轮 rank 行的 flags 仍是有效
+    护栏证据，判定时合并使用——flags_note 写进载荷本身。
+    """
+    try:
+        mkt = _market_state() or {}
+    except Exception as e:
+        logger.warning("[market-screener] fine 取大盘状态失败: %s", e)
+        mkt = {}
     funnel = {"rounds": 2, "pipeline": "fine", "verdict": None,
               "pool_raw": len(codes), "baseline": len(codes), "deep_n": len(codes),
               "short_of_limit": False}
-    outer = {"selection_snapshot": {"day": None, "as_of": None}}
+    outer = {"market": mkt, "mood_regime": _mood_regime(mkt),
+             "selection_snapshot": {"day": None, "as_of": None},
+             "flags_note": "细筛轮不重算漏斗打标：第一轮 analyzed_rank 行的 flags"
+                           "（连板放量/吸筹不足/已过度拉升/死水护栏）仍是有效证据，"
+                           "判定时合并使用。"}
     return _deep_and_deliver(codes, outer, funnel, t0, ms,
                              coarse=False, card_floor=len(codes))
 
@@ -1507,52 +1596,14 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
             }
         _floor = 0 if coarse else min(
             card_floor if card_floor is not None else _MIN_DELIVERY_CARDS, len(actual))
-        out = _compact_delivery(out, min_cards=_floor)
-        # ── deliverability_note（给决策层的明确买入/观望提示） ──
-        # 基于 analyzed_rank 的客观字段生成，不做主观评分，不输出“B级/买入”等主观结论。
-        # 每项依据：位置足够干净（价格距 20 日高点 <= -3%，即从高点回撤至少 3%）、
-        #           资金持续流入（net5d_wan > 0 连续 3 日无流出）、
-        #           强信号命中（patterns 含平台突破/均线支撑回踩/放量突破，配合 seal.tag 与 vr_rel 阈值）。
+        # ── deliverability_note（给决策层的买入/观望客观提示）──
+        # 生成逻辑抽为模块级 build_deliverability_note（纯函数、可单测）。
+        # ★ 必须在 _compact_delivery 之前生成：压缩会把 rank 行键名换成短键
+        #   （analyzed_rank_keymap）、满卡裁掉，届时 price/patterns 读取全部降级。
         _rank = out.get("analyzed_rank") or []
-        _dn = []
-        for _r in _rank:
-            _c = str(_r.get("code") or "")
-            _price = _num_or_none(_r.get("price"))
-            _hi20 = _num_or_none(_r.get("hi20"))
-            _net5d = _num_or_none(_r.get("net5d_wan"))
-            _vr_rel = _num_or_none(_r.get("vr_rel") or _r.get("vr_rel_st"))
-            _shape = _r.get("shape") or ""
-            _flags = _r.get("flags") or []
-            _patterns = _r.get("patterns") or []
-            _seal_tag = (_r.get("seal") or {}).get("tag") or "none"
-            _nts = []
-            # 位置：距 20 日高点
-            if _price is not None and _hi20 is not None and _hi20 > 0:
-                _dist_pct = round((_price - _hi20) / _hi20 * 100, 2)
-                if _dist_pct <= -3.0:
-                    _nts.append(f"位置清洁（距20日高点 {_dist_pct}%<=-3%）")
-                else:
-                    _nts.append(f"位置偏高（距20日高点 {_dist_pct}%>-3%）")
-            else:
-                _nts.append("位置数据不足")
-            # 分时形态：冲高回落/跌破分时均价
-            if "冲高回落" in str(_shape) or "跌破" in str(_shape):
-                _nts.append("分时走势偏弱（冲高回落/跌破分时均价）")
-            elif "趋势向好" in str(_shape) or "放量" in str(_shape):
-                _nts.append("分时走势偏强（趋势向好/放量）")
-            else:
-                _nts.append("分时走势中性")
-            # 强信号：patterns + seal.tag + vr_rel
-            _pnames = [str(p.get("pattern") or "") for p in _patterns if isinstance(p, dict)]
-            _strong = any(k in ",".join(_pnames) for k in ("平台突破", "底部启动", "均线支撑回踩", "放量突破"))
-            if _strong and _seal_tag in ("one_word", "open0") and (_vr_rel or 0) >= 2.0:
-                _nts.append("强信号命中（平台突破/均线支撑回踩/放量突破 + 封板结构清洁 + 放量）")
-            elif _strong:
-                _nts.append("形态信号存在（未达强信号阈值：需 seal_tag 为 one_word/open0 且 vr_rel>=2）")
-            else:
-                _nts.append("未命中强信号形态")
-            _dn.append(f"{_c}: {'；'.join(_nts)}")
-        out["deliverability_note"] = " | ".join(_dn) if _dn else "无可分析候选"
+        out["deliverability_note"] = build_deliverability_note(
+            _rank, out.get("analyzed") or [])
+        out = _compact_delivery(out, min_cards=_floor)
         if coarse:
             # 两轮协议第一轮：满卡全撤（粗筛不需要、也避免挤兑预算），
             # LLM 按资金资格粗筛后走 codes= 细筛轮。
@@ -1608,6 +1659,7 @@ def _run_topdown(t0: float, ms: dict, run_started_at: str = "", coarse: bool = T
                    "idx_ret": f.get("idx_ret"),
                    "pool_raw": f.get("picked_raw") or 0,
                    "baseline": f.get("picked") or 0,
+                   "limit": f.get("limit"),
                    "deep_n": len(td.get("picked") or []),
                    "dup_max": f.get("dup_max"),
                    "dup_min_gate": f.get("dup_min_gate"),
@@ -1690,14 +1742,13 @@ def run(codes: str = "") -> dict:
         raise ValueError(
             f"细筛一次最多 {_FINE_CARD_CAP} 只，收到 {len(_req)} 只；"
             "请按资金资格再收窄后重调。")
-    # 预热策略：第一轮（粗筛）全市场扫描，两大单点全预热；
-    # 第二轮（细筛）只预热目标股票，减少开销（2026-11-25 优化）
-    if _req:
-        # 细筛轮：codes 即终选，只预热目标票的K线与连接池
-        prewarm_market_klines(selected_codes=_req)
-        warm_market_pool()
-        return _run_fine(_req, _t0, _ms, _started)
-    # 粗筛轮：全市场扫描，完整预热
+    # 预热两大单点（指数 K 线 mootdx 冷启 + CNStock 连接池）：粗筛/细筛两轮
+    # 预热内容相同（个股 K 线无进程级缓存可填充，不存在「按票预热」），
+    # 失败不阻塞主流程。
     prewarm_market_klines()
     warm_market_pool()
+    if _req:
+        # 细筛轮：codes 即终选，无漏斗，只做深度证据
+        return _run_fine(_req, _t0, _ms, _started)
+    # 粗筛轮：全市场三层漏斗选人
     return _run_topdown(_t0, _ms, _started, coarse=True)

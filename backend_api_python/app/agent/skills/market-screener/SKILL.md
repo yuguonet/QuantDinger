@@ -4,7 +4,7 @@ description: 从A股全市场筛选短中线标的。用户问"今天买什么�
 metadata:
   version: 8.8.1
   tags: market, screener, short_term, mid_term, a_share
-  tools: get_fund_flow, technical_analysis, search_stocks, agent_get_kline, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_dragon_tiger, get_limit_pool, get_hot_stocks_with_reason, search_intel
+  tools: get_fund_flow, technical_analysis, search_stocks, get_realtime_quote, get_hot_sectors, get_sector_board, get_stock_sector_info, get_limit_pool, search_intel
 ---
 
 # 全市场短中线选股 (market-screener)
@@ -63,6 +63,8 @@ metadata:
 > 经 `run_skill` 派活时入口是 `run(codes="")`，**两轮筛选协议**：① 第一轮 `run()`——交付全名单粗筛
 > （`analyzed_rank` 完整、资金/量能/位置字段齐，无满卡）；② 分批 `run(codes="600518,603883")`
 > （每次 ≤10 只）把**全部候选**的满卡取齐，判定在满卡证据上做——粗筛轮只用于排序和分批，不做资格淘汰。
+> 两轮都带 `market`/`mood_regime`（环境姿态两轮都要读）；漏斗打标 `flags`（连板放量/吸筹不足/
+> 已过度拉升/死水护栏）属选人层、细筛轮不重算——第一轮 rank 行的 `flags` 在判定时继续有效，两轮合并使用。
 > 其余函数是 `run()` 的内部阶段，用于理解取数与口径。
 >
 > ⚠️ `run()` 只有 `codes` 一个参数（6 位代码逗号串，≤10 只）——没有 `date` / `for_date` / `trade_date` / `strategy`。
@@ -74,13 +76,14 @@ metadata:
 | --- | --- | --- |
 | `run(codes="")` | 一次性跑完整流程：**三层漏斗选人**（L1 大盘同刻量能闸 → L2 行业/概念板块资金流闸，板块数随大盘档位：弱 4 / 中性 6 / 强 8，两轨分开计、无备选 → L3 板块内选股：健康闸 + **涨停票与跳变检测并行**（有涨停也跑跳变，对象为非涨停成员），每板块 ≤10 只 → 连板放量/吸筹打标（**不放弃**，挂 `flags` 高波动档护栏）→ 全部板块票在截断前合并去重（`dup_n`=重复板块数）→ 按「首次跳变/触板时间先后、重复多者优先」截断 35 只）→ **deep 只分析非涨停票**（涨停票不进 deep，只列 `limit_up_ref` 参考）→ **deep_analyze(≤45)**。交付为**粗筛轮**（全名单、无满卡，细筛见上） | 主对话派活（经 `run_skill` 暴露的入口） |
 | `market_state()` | 市场事实：资金流 / 涨跌停家数 / 炸板率 / 板块强弱 / 情绪标签 / **指数日内强弱（index_intraday/intraday_bias）** / **大盘资金近5日方向（fund_flow_days）** / **cautious（走弱环境，收紧选股）** | 起手，判断大环境 |
-| `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf=False, budget=None)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / **实时行情对账**），无任何主观评分。返回 **两档同序（非涨停优先，再按位置透支升序）**：`analyzed_rank`=全部票的横向可比字段（不截断）+ `analyzed`=**位置最干净的 N 只**满卡（按交付预算裁剪） | 对你挑出的少数票做证据汇总 |
+| `deep_analyze(codes, limit=8, with_flow=True, with_patterns=True, with_mtf="auto", budget=None)` | 批量拉齐证据（形态 / 技术 / 资金 / 多周期 / **实时行情对账**），无任何主观评分。返回 **两档同序（非涨停优先，再按位置透支升序）**：`analyzed_rank`=全部票的横向可比字段（不截断）+ `analyzed`=**位置最干净的 N 只**满卡（按交付预算裁剪） | 对你挑出的少数票做证据汇总 |
 | `detect_patterns(codes, days=60, params=None)` | 六种 K 线形态识别，回答「是不是」不回答「好不好」；`params` 是 JSON 几何定义覆盖 | 想验证形态 / 做阈值敏感性检查 |
 | `multitimeframe(code, daily_days=60, minute_days=5)` | 日线 + 15m + 5m 的结构量与速记标签 | 判断多日结构与日内强弱时用（注意标签是日线几何，见下） |
 | `inspect_stock(code, deep=False)` | 单票深挖：题材归属、资金、涨停史、龙虎榜席位、客观风险点；`deep=True` 追加快源 | 想验证某只票 / 证据互相矛盾时 |
 
 > ⚠️ 除 `run()` 外，其余函数都是 `run()` 的**内部阶段**，当前**未经 `run_skill` 暴露**
-> （`skill_run.EXECUTABLE_SKILLS["market-screener"]` 只登记了 `run`）。其中
+> （`skill_run.EXECUTABLE_SKILLS["market-screener"]` 只登记了 `run`）——主对话只派 `run()`，
+> 其余函数仅在技能内部与回测脚本中使用。
 
 ### 三条数据硬约束
 
@@ -116,13 +119,16 @@ deep 满卡里与个股事实相关的两个分组：
 
 ## deliverability_note 生成逻辑（技能内部自动生成，供参考）
 
+> 生成时机在交付压缩**之前**（短键压缩/满卡裁剪不影响它）；patterns 与 seal 证据取自满卡。
+
 | 维度 | 判定阈值 | 输出示例 |
 |------|----------|----------|
 | **位置** | `price` 距 `hi20` ≤ -3% | "位置清洁（距20日高点 -11.2%<=-3%）" |
-| **分时** | `shape` 含 "冲高回落"/"跌破" | "分时走势偏弱（冲高回落/跌破分时均价）" |
-| **强信号** | `patterns` 含平台突破/均线支撑回踩/放量突破 **且** `seal.tag`∈{one_word,open0} **且** `vr_rel`≥2 | "强信号命中（平台突破/均线支撑回踩/放量突破 + 封板结构清洁 + 放量）" |
+| **分时** | `shape` 偏弱标签（strong_to_weak / strong_to_divergence / sustained_weak / limit_down_locked，与 cross 同一套强弱分类） | "分时走势偏弱（strong_to_weak）" |
+| **强信号** | 满卡 `patterns` 含平台突破/底部启动/均线支撑回踩/放量突破 **且** `seal.tag`∈{one_word,open0} **且** `vr_rel`≥2；无满卡写「证据未交付」 | "强信号命中（平台突破/底部启动/均线支撑回踩/放量突破 + 封板结构清洁 + 放量）" |
 
-> LLM/决策层应**直接阅读 `deliverability_note`**，不再自行重复计算上述三维。
+> LLM/决策层应**直接阅读 `deliverability_note`**，不再自行重复计算上述三维；
+> 粗筛轮无满卡的票只给位置/分时两维，强信号一维写「证据未交付」，**不读作「未命中」**。
 
 `run()` / `deep_analyze` 的双档交付怎么读：
 
@@ -130,7 +136,7 @@ deep 满卡里与个股事实相关的两个分组：
 - **强度是加减分项，不是准入闸**。**进「买什么」先过资格线**：三类强信号（**主线龙头 / 弱转强确认 / 放量突破**）至少命中一类，否则加分项再多也不进表；依据原始证据判断资格，关键证据缺失或相互矛盾时须说明，不得编造或把未知当作已确认；**资金是资格级证据**，两档处理：①**否决**——资金连续方向为负（多日逐日净流出）或单日脉冲后回吐 = 资格线过了也不进表；②**降权**——3~5 日累计为负（**归一后显著才算数**：噪声带内的小负不降权，按 `net_pct_of_amount`/`fund_circ_ratio` 判）但当日/近段资金回流（弱转强配套）= 只给试仓/深回踩/条件单，不给追价；③**20 日只作语境**（脉冲识别/拉高出货/持有周期），不作独立否决或降权；资金流入是确认项（不独立构成买入理由）。加分：`ret5_pct` 高**且 `zt_streak`=1**（1 板上攻=最好的一组）、D0 放量（`vol_ratio` 1.5+）、10 日涨停少（`zt10`≤2）、乖离温和、`ret5_pct` 偏低**且 `zt_streak`=0 且弱转强确认**（支撑企稳+资金回流+量能）——★ 无确认的超跌反抽**不加分、不进表**（接刀；全样本 §11.7：超跌不能单独称洗盘/买点）。**连板/动能不是减分项，是尾部捕捉对象**：`zt_streak`≥2、`ret5_pct` 高 = 动量确认，深亏风险改走「高波动档」护栏（仓位上限/宽止损/触发条件），不做排除；`ret5_pct` 高**且 `zt_streak`=0**（涨了不少却没板=上行乏力，别当强势加分）、`zt10`≥3（高位反复透支）、`vol_ratio`<1（缩量却给强度结论）作减分。**缩量回踩是减分不是加分**。★ 位置透支看三件套（`dist_ma20_pct`/`pos20`/`ret5_pct`），rank 已给合成档 `loc`：`hot`=三件套全高且非 1 板（透支=高波动档：仓位/触发/止损收紧，主线龙头确认仍可参与；`zt_streak`=1 时不算 hot）、`cool`=三件套全低（位置干净，不等于买点，触板率并不高）、`normal`=其余。**资金流入流出与位置同为核心证据**，且资金优先于量能条件；不得因加入位置、形态或回测提示而降低资金判断的重要性；量能是重要评估条件、不是闸，`vol_ratio`/`vr_rel`<2 不构成否决，资金持续净流出或脉冲后回吐才是降权/否决依据，资金流入是确认项而非独立买入信号。命中资格线后加分项不足 2 条 → 降仓档或给条件单，不硬推
 - **`sup.k` 可能不是均线**（`ma5|ma10|ma20|ma60` 均线 / `lo10|lo20|lo60` 近端低点 / `gap` 跳空缺口下沿 / `poc` 成交密集区 / `zt` 涨停起点 / `hi20` 是压力侧），**不要一律写成「回踩 MA5」**——它给的就是「离现价最近的那个位置」。要更多候选看满卡的 `tech.support.supports`（下方 ≤3 条）/ `resists`（上方 ≤2 条），已按现价分成支撑与压力（同一价位在上方是压力，不是支撑）
 - **买点禁止直接抄 `sup.px`**：`sup` 恒在现价下方，照抄的结果是全部「等回踩」、当天一只也买不到。强环境用 `res` 给「突破 X 追 / 不破 sup 持有」，弱环境才把买点压到 `sup` 下方一档
-- **`analyzed_rank` 缺键即正常**：无 `limit_up`=未涨停、无 `buyable`=可买、无 `stale_bar`=日线未滞后、无 `risks`=无风险、无 `sup`/`res`=该侧无关键位置、无 `seal`=今日未封板、无 `zt_streak`=今日没连板、无 `confidence`=证据满维、无 `flags`=无闸门打标命中、无 `regime`=低位蓄势（中性默认，不占字符）、无 `chg_prev_pct`/`cpos`=日线不足（参考字段缺省）、无 `vr_rel`/`flow_rel`=大盘基准缺失（未校准，按绝对值读）、无 `vr_rel_st`/`flow_rel_st`=非盘中（收盘后同刻≡全天，直接用全天的 `vr_rel`/`flow_rel`）
+- **`analyzed_rank` 缺键即正常**：无 `limit_up`=未涨停、无 `buyable`=可买、无 `stale_bar`=日线未滞后、无 `risks`=无风险、无 `sup`/`res`=该侧无关键位置、无 `seal`=今日未封板、无 `zt_streak`=今日没连板、无 `flags`=无闸门打标命中、无 `regime`=低位蓄势（中性默认，不占字符）、无 `chg_prev_pct`/`cpos`=日线不足（参考字段缺省）、无 `vr_rel`/`flow_rel`=大盘基准缺失（未校准，按绝对值读）、无 `vr_rel_st`/`flow_rel_st`=非盘中（收盘后同刻≡全天，直接用全天的 `vr_rel`/`flow_rel`）。（`confidence` 不进 rank 行——它是满卡的证据完整度字段，见下方评分语义）
 - **`regime` 位置标签 = 只报位置与跨日方向，不判盘中动作**（一鼓作气/再而衰/三而竭是分时概念，日线不评，可买否看盘中形态）：**高位**（前5日>10% 且当日涨>2%，或跑输大盘大跌——只报位置）/**高位分歧**（高位横盘）/**跳水回踩**（高位大跌但 rs_d0≥-1.5=跌主要来自大盘带崩、非个股弱；关键位企稳即可按回踩接，当日反抽不追）/**弱转强**（前5日≤10% 且昨日跌今日涨>2%，真伪看量比与资金：**量比≥2 是重要评估条件、不是准入闸**，可给追价；<2 优先给回踩支撑并写明资金与位置理由，量比本身不否决；`vr_rel`≥2=放量强于大盘的确认项，`vr_rel`<2 且资金持续流出/脉冲后回吐时才降权（含跟风放量=绝对量比≥2 但 `vr_rel`<2）；★ 独立回测：≥2 组 T+3 超额系统性为负、峰值在 1.5~2.0，故不作加分硬门；同一量比档内资金强组明显优于资金弱组，冲突时以资金为准；加分项不写死：再看价效高（涨幅÷量比高=价升量稳/惜售）可上调置信，单看惜售不加分）/低位启动（昨未跌，看支撑）/低位走弱（按普通档读、量能只作评估条件）
 - **分时形态 `shape`（独立维度：只强化/精细化/印证日线 `regime`，不改写日线判断）**：`weak_to_strong` 先破低→收复均价站稳且翻红 / `weak_to_divergence` 先破低→收复过但近端没站住 / `strong_to_weak` 先冲高→跌破均价压不回 / `strong_to_divergence` 先冲高→回撤卡在均价附近 / `sustained_strong`·`sustained_weak` 单边 / `limit_up_locked`·`limit_down_locked` 封板 / `flat` 无转折。配套 `first_extreme`（先见低还是先见高）、`vwap_dist`（距均价%）、`above_ratio`/`above_recent`（在均价上方的时间占比）、`cur_ret`/`peak_ret`/`trough_ret`、`dd_from_peak`（距当日高点回撤%）、`vol_up_down`（上涨分钟均量÷下跌分钟均量，>1=涨放跌缩）。**同名不同义、不得互相覆盖**：日线 `regime` 的「弱转强」看**跨日位置**（前5日≤10% + 今日涨>2%），分时 `weak_to_strong` 看**当日盘中换手**（VWAP 收复）；两者并列印证——双向都弱转强=最强，日线弱转强 + 分时 `strong_to_weak` = 日内已走坏（降权），日线强 + 分时 `weak_to_divergence` = 日内转分歧（等确认再买）
 - **`cross` = 日线 × 分时叠加判定（抓假强/假弱，优先级高于任何单侧读数）**：`fake_strong` = 位置已高（高位/高位分歧）却走出分时强形态（该格 86% 是涨停封死）⇒ **高波动高赔率档，不是排除令**：无强确认的次日开盘接力禁止（深亏主力：133 笔 −3.02%，全样本 67 只深亏有 45 只在此格）；**主线龙头 + 强确认**（封板厚实/题材核心 + 次日弱转强或放量突破确认）才给接力条件单——仓位上限、宽止损、失败即走；`fake_weak` = 跨日刚转强但当日盘中回踩 ⇒ **别杀**，是洗盘不是走坏（51 笔 +1.70%、胜率 65%、深亏仅 1 只）；`double_strong` = 两边都强（+0.82%）；`oversold_rebound` = 低位走弱后盘中拉强（超跌反弹 +2.50%，**不算假强**）；`high_weak` = 高位且日内也弱（−1.88%）。缺 `cross` = 无叠加结论（两侧不构成冲突或数据缺），按单侧读。**与单侧结论冲突时以 `cross` 为准**
@@ -152,7 +158,7 @@ deep 满卡里与个股事实相关的两个分组：
 - `warnings` 可能含**拉高出货线索**（「开盘脉冲」「疑似拉高出货」「趋势背离」，deep 层在 `flow_risks` 键）：开盘窗大额净流入后转流出/冲高回落/今日脉冲与近5日净流出背离 —— 经验型判断，可否决但要写理由
 - `warnings` 经验型软提示（如「弱势市涨停活跃源无题材支撑」）——你可以采纳也可以否决
 - `hints` 是历史经验门槛（建议值），**不是硬规则**
-- `funnel` 是 `run()` 返回的漏斗统计键：`pipeline=topdown` / `verdict`（L1 大盘档） / `pool_raw`（闸前收集只数）/ `baseline`（截断入选只数 = 全部入 deep）/ `dup_max`（入选票最大重复板块数，重复=多板块资金共识）/ `short_of_limit`（不足额定额、不凑数）/ `deep_n`（真正进 deep 的非涨停只数）/ `zt_ref_n`（只列参考的涨停只数）/ `flow_invalid_n`（资金流通比落在低区无效区间的只数）/ `streak_surge_tagged`/`early_accum_tagged`（闸门打标保留的票，挂 `flags` 不放弃）/ `streak_surge_unknown`/`early_accum_unknown`（数据不足未打标数），用于复盘「漏斗各层过了多少、最后进 deep 几只」
+- `funnel` 是 `run()` 返回的漏斗统计键：`pipeline=topdown` / `verdict`（L1 大盘档） / `pool_raw`（闸前收集只数）/ `baseline`（截断入选只数 = 全部入 deep）/ `limit`（截断额定上限，默认 35）/ `dup_max`（入选票最大重复板块数，重复=多板块资金共识）/ `short_of_limit`（不足额定额、不凑数）/ `deep_n`（真正进 deep 的非涨停只数）/ `zt_ref_n`（只列参考的涨停只数）/ `flow_invalid_n`（资金流通比落在低区无效区间的只数）/ `streak_surge_tagged`/`early_accum_tagged`（闸门打标保留的票，挂 `flags` 不放弃）/ `streak_surge_unknown`/`early_accum_unknown`（数据不足未打标数），用于复盘「漏斗各层过了多少、最后进 deep 几只」
 
 ## 报告交付安全口径
 

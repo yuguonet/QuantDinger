@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """盘中三层漏斗选人层（自顶向下）：大盘闸 → 板块闸 → 板块内个股 → 截断。
 
-与既有自底向上链路（多源捞票 → 硬过滤 → 连板排序）并列，不替代：
-`run(strategy="topdown")` 走这里，`intraday` / `post_market` 保持原样，便于回测对照。
+run() 的唯一选人链路。旧表述「与 classic 自底向上链路并列、run(strategy=...)
+走这里」已过时：2026-09-29 v7 删除 strategy 参数与 intraday/eod/post_market
+「策略模块」后，run() 只有 codes 一个参数（2026-11-25 审查更正）。
+细筛轮（run(codes=...)）不经过本模块——codes 即终选，无漏斗。
 
 ═══════════════════════════════════════════════════════════════
   L1 大盘闸   market_gate()
@@ -134,7 +136,7 @@ _L1_IDX_SCALE = _parse_idx_scale()
 _L2_BOARDS_STRONG = _env_i("L2_BOARDS_STRONG", 8)
 _L2_BOARDS_NEUTRAL = _env_i("L2_BOARDS_NEUTRAL", 6)
 _L2_BOARDS_WEAK = _env_i("L2_BOARDS_WEAK", 4)
-_L3_LIMIT = _env_i("L3_LIMIT", 25)
+_L3_LIMIT = _env_i("L3_LIMIT", 35)
 _L3_PER_BOARD = _env_i("L3_PER_BOARD", 10)
 _FOLLOW_WINDOW_MIN = _env_i("FOLLOW_WINDOW_MIN", 10)
 _MIN_BOARD_FUND_PCT = _env_f("MIN_BOARD_FUND_PCT", 0.0)
@@ -1250,7 +1252,8 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     Args:
         as_of: 截断时刻 HH:MM；None=此刻（用实时涨停池原文）
         day: 目标交易日；None=今天（涨停池/分时取数的日期）
-        limit: 涨停参考和非涨停候选合计上限；None 取 env QD_TOPDOWN_L3_LIMIT（默认 25）
+        limit: 涨停参考和非涨停候选合计上限；None 取 env QD_TOPDOWN_L3_LIMIT（默认 35，
+            2026-11-23 起 25→35，与 SKILL.md/limit-rules.md「截断 35 只恒入 deep」对齐）
 
     Returns:
         {ok, gate, boards, per_board: [...], picked: [...], funnel: {...}, missing}

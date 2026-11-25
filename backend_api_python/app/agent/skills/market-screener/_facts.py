@@ -74,28 +74,68 @@ def intraday_bars(code: str, days: int = 5) -> List[Dict]:
 def resample(bars: List[Dict], minutes: int) -> List[Dict]:
     """把 1 分钟 K 线按固定根数聚合为 N 分钟 K 线（客观换算，无加工）。
 
+    桶边界按「每日开盘 09:30 起的第 k×minutes 根」对齐
+    （slot = (hh*60+mm - 570) // minutes），不从序列首根顺序切——首根缺失
+    （DB 缺开盘段）时顺序切会让全部桶整体错位 minutes-1 分钟（2026-11-25
+    审查修复）。午休 13:00 与跨日因 slot 跳变自然开新桶，无需显式重置；
+    时间戳无法解析时整体退回旧顺序分桶（避免混桶）。
+
     Args:
         bars: 1m K 线（升序）
         minutes: 聚合根数，例如 15 / 5
 
     Returns:
-        list: 聚合后的 K 线（升序），不足一根的尾部丢弃
+        list: 聚合后的 K 线（升序）；盘中截断的尾桶丢弃，已走完的桶照常交付
     """
     minutes = max(1, int(minutes))
+    rows = [b for b in bars or [] if isinstance(b, dict)]
+
+    def _slot(b: Dict) -> Optional[int]:
+        t = str(b.get("time") or "")
+        try:
+            return (int(t[11:13]) * 60 + int(t[14:16]) - 570) // minutes  # 570=09:30
+        except ValueError:
+            return None
+
+    def _flush(seq: List[Dict]) -> Dict:
+        return {
+            "time": seq[0]["time"],
+            "open": seq[0]["open"],
+            "high": max(x["high"] for x in seq),
+            "low": min(x["low"] for x in seq),
+            "close": seq[-1]["close"],
+            "volume": sum(x["volume"] for x in seq),
+        }
+
+    slots = [_slot(b) for b in rows]
+    aligned = all(s is not None for s in slots)
     out: List[Dict] = []
     chunk: List[Dict] = []
-    for b in bars or []:
-        chunk.append(b)
-        if len(chunk) == minutes:
-            out.append({
-                "time": chunk[0]["time"],
-                "open": chunk[0]["open"],
-                "high": max(x["high"] for x in chunk),
-                "low": min(x["low"] for x in chunk),
-                "close": chunk[-1]["close"],
-                "volume": sum(x["volume"] for x in chunk),
-            })
+    prev: Optional[int] = None
+    for i, b in enumerate(rows):
+        key = slots[i] if aligned else i // minutes
+        if chunk and key != prev:
+            out.append(_flush(chunk))
             chunk = []
+        prev = key
+        chunk.append(b)
+    # 尾桶交付判据（与旧行为「尾部不满一桶丢弃」对齐）：
+    #   顺序模式：恰好满 minutes 根才交付（盘中截断的不满桶丢弃）；
+    #   对齐模式：末根到达该桶理论末分钟才交付——盘中截断（未走完）丢弃，
+    #   中间缺分钟但已走完的桶照常交付（数据缺口不吞整桶）。
+    if chunk:
+        if aligned:
+            tail_ok = False
+            try:
+                t = str(chunk[-1].get("time") or "")
+                end_min = (prev + 1) * minutes - 1 + 570
+                tail_ok = (int(t[11:13]) * 60 + int(t[14:16])) >= end_min
+            except ValueError:
+                tail_ok = False
+            if tail_ok:
+                out.append(_flush(chunk))
+        elif len(chunk) == minutes:
+            out.append(_flush(chunk))
     return out
 
 

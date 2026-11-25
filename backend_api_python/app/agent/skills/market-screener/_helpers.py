@@ -633,7 +633,9 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
     pos20 = ((close - lo20) / (hi20 - lo20) * 100) if hi20 > lo20 else None
 
     ret5 = ((close / closes[-6]) - 1) * 100 if len(closes) > 6 else None
-    ret20 = ((close / closes[-win20]) - 1) * 100 if len(closes) > win20 else None
+    # ret20 与 ret5 同口径（N 个交易日间隔）：closes[-win20-1] 才是 20 根前的收盘，
+    # closes[-win20] 只有 19 个间隔（2026-11-25 审查修正，与 ret_5d_pct 对齐）
+    ret20 = ((close / closes[-win20 - 1]) - 1) * 100 if len(closes) > win20 else None
 
     # 连续涨停（用涨跌停幅度近似，尾部倒序）；limit_pct<=0（新股无涨跌幅）时恒 0
     limit_pct = get_limit_pct(code, name)
@@ -1749,8 +1751,8 @@ def _market_klines():
     return _MKT_KLINES_CACHE["data"]
 
 
-def prewarm_market_klines(selected_codes: Optional[List[str]] = None) -> None:
-    """后台预热指数日线（2026-10-25 P1-①）。
+def prewarm_market_klines() -> None:
+    """后台预热指数日线（2026-10-25 P1-①）。粗筛/细筛两轮入口都调，内容相同。
 
     根因（主探针 probe_screener_timing_20261024 实锤）：画像期
     attach_prediction 的首个 predict_one 触发 _market_klines() 冷启 →
@@ -1760,13 +1762,15 @@ def prewarm_market_klines(selected_codes: Optional[List[str]] = None) -> None:
     起后台线程预热，重叠后单点基本隐藏。失败仅记 warning：主流程到时按原
     路径自取，行为与无预热时一致（不静默吞，见模块头纪律）。
 
-    新增：支持 selected_codes 目标性预热，用于细筛轮只预热特定股票。
+    ★ 预热内容只有指数 K 线（predict_one 的唯一外部依赖）：个股 K 线走
+      fetch_kline → CNStockDataSource 门面，无进程级缓存可填充，按票预热
+      无从谈起（2026-11-25 审查：删除曾在此假挂的 selected_codes 参数——
+      它只进日志文案、不改变预热内容，「细筛轮只预热目标股票」从未成立）。
     """
     def _bg():
         try:
             _market_klines()
-            logger.info("[market-screener] 指数K线后台预热完成" + 
-                       (f" (目标: {len(selected_codes)} 只)" if selected_codes else ""))
+            logger.info("[market-screener] 指数K线后台预热完成")
         except Exception as e:
             logger.warning("[market-screener] 指数K线后台预热失败: %s", e)
 

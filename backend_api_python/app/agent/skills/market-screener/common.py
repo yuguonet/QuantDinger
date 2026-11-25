@@ -2,18 +2,20 @@
 """
 market-screener/common.py
 
-通用基础设施：数据加载、技术指标计算、涨停/跌停/炸板池、龙回头检测。
-三个策略（盘中/尾盘/盘后）共享此模块。
+通用基础设施：SkillResult/SkillReport 数据结构、K 线门面（fetch_kline，前复权
+统一出口）、涨跌停三池与实时行情分块、技术指标计算、交易日口径（_data_day）。
+选人链路唯一为 _topdown.py 三层漏斗——2026-09-29 v7 起盘中/尾盘/盘后三个
+「策略模块」已删除；2026-11-25 审查清理：classic 候选源遗留死代码
+（fetch_hot_stocks_with_reason / scan_lhb / scan_dragon_pullback /
+scan_eod_start / _eod_start_*，全仓库无调用方）一并移除，
+本模块只被 run/_topdown/_helpers/_facts 共享。
 """
 
 from __future__ import annotations
 
 from ...log import logger
 import os
-import sys
-import time
-from collections import Counter
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
@@ -135,6 +137,14 @@ class SkillResult(dict):
         # profile bundle 自身也带 market 键，判序反了会被 _prescreen_md 吃掉（2026-09-29 实测）
         if "profiles" in self:
             return self._profile_md()
+
+        # run()/deep_analyze() 双档交付格式（topdown/fine 两轮与 deep 直调）——
+        # 必须排在 prescreen 之前：它也带 market/analyzed 键，判序落后会被
+        # _prescreen_md 吃掉、只渲染一行 market 摘要，analyzed_rank/满卡全部
+        # 丢失（2026-11-25 审查修复）。这份大载荷的 Markdown 渲染丢字段风险大，
+        # 直接 JSON——skill_run 主链路本就走 JSON，此处只是终端呈现兜底。
+        if "analyzed_rank" in self:
+            return _compact_json(self)
 
         # inspect_stock() 格式（单票深挖）
         if "tech" in self and "risks" in self:
@@ -673,36 +683,8 @@ def fetch_dt_pool(date: str) -> List[Dict]:
 def fetch_broken_board(date: str) -> List[Dict]:
     """炸板池。fail-fast：同 fetch_zt_pool。"""
     return _limit_pool("broken_board_pool", date)
-def fetch_hot_stocks_with_reason(date: str) -> Dict:
-    """同花顺强势股+题材。fail-fast：HTTP 错误码与网络异常一律抛错。
 
-    旧版返回 {"error":...} 而 candidate_pool 不检查该键 ⇒ 源故障静默塌缩成
-    「热点真空」（2026-10-21 缺陷），故错误码改为抛错，与 zt/dt/broken 同构。
-    """
-    import requests as _req
-    url = (
-        f"http://zx.10jqka.com.cn/event/api/getharden/"
-        f"date/{date}/orderby/date/orderway/desc/charset/GBK/"
-    )
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0"}
-    r = _req.get(url, headers=headers, timeout=10)
-    data = r.json()
-    if data.get("errocode", 0) != 0:
-        raise RuntimeError(f"同花顺错误: {data.get('errormsg', '')}")
-    rows = data.get("data") or []
-    stocks = [{
-        "code": row.get("code", ""), "name": row.get("name", ""),
-        "reason": row.get("reason", ""),
-        "change_pct": float(row.get("zhangfu", 0) or 0),
-        "turnover_pct": float(row.get("huanshou", 0) or 0),
-        "amount": float(row.get("chengjiaoe", 0) or 0),
-    } for row in rows]
-    tag_counter: Counter = Counter()
-    for s in stocks:
-        if s["reason"]:
-            tags = [t.strip() for t in s["reason"].replace("，", "+").replace(",", "+").split("+") if t.strip()]
-            tag_counter.update(tags)
-    return {"stocks": stocks, "hot_tags": tag_counter.most_common(20)}
+
 def fetch_hot_sectors() -> Dict:
     try:
         from app.market_cn.china_market import get_hot_sectors
@@ -840,362 +822,6 @@ def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
     if not pools and last_err is not None:
         raise last_err
     return pools
-def scan_lhb(date: str = None, days: int = 10) -> List[Dict]:
-    """近 N 个交易日龙虎榜上榜股（按上榜次数 + 累计净买入聚合；供 candidate_pool 的 lhb 源）。
-
-    Args:
-        date: 截止交易日（含）；空 = 库内最新交易日。
-        days: 回看交易日数，默认 10。
-
-    Returns:
-        [{code,name,source="龙虎榜",reason,count(上榜行数),net(累计净买入元),
-          last_date,change_pct,turnover_pct}, ...]，按 (count, net) 降序。
-    """
-    from app.data_sources.dragon_tiger_local import query_dragon_tiger_last_days
-    rows = query_dragon_tiger_last_days(trade_date=(date or ""), days=days) or []
-    agg: Dict[str, Dict] = {}
-    for r in rows:
-        code = str(r.get("stock_code") or "")
-        if len(code) != 6:
-            continue
-        a = agg.get(code)
-        if a is None:
-            a = agg[code] = {"code": code, "name": r.get("stock_name") or "",
-                             "source": "龙虎榜", "reason": "", "count": 0, "net": 0.0,
-                             "last_date": "", "change_pct": None, "turnover_pct": None}
-        a["count"] += 1
-        a["net"] += float(r.get("net_amount") or 0)
-        td = str(r.get("trade_date") or "")
-        if td > a["last_date"]:
-            a["last_date"] = td
-            a["reason"] = r.get("reason") or a["reason"]
-            a["change_pct"] = r.get("change_percent")
-            a["turnover_pct"] = r.get("turnover_rate")
-    out = list(agg.values())
-    out.sort(key=lambda x: (x["count"], x["net"]), reverse=True)
-    return out
-
-
-def scan_dragon_pullback(date: str) -> List[Dict]:
-    recent_pools = fetch_recent_zt_pools(8)
-    code_history: Dict[str, List[Dict]] = {}
-
-    for pool_date, pool in recent_pools.items():
-        for s in pool:
-            code = s.get("stock_code", "")
-            if not code:
-                continue
-            if code not in code_history:
-                code_history[code] = []
-            code_history[code].append({
-                "date": pool_date,
-                "continuous_days": int(s.get("continuous_zt_days", 1) or 1),
-                "reason": s.get("reason", ""),
-                "name": s.get("stock_name", ""),
-            })
-
-    dragon_codes = {}
-    for code, records in code_history.items():
-        max_days = max(r["continuous_days"] for r in records)
-        if max_days >= 2:
-            dragon_codes[code] = {
-                "name": records[0]["name"],
-                "max_continuous_days": max_days,
-                "zt_dates": [r["date"] for r in records],
-                "last_zt_date": max(records[0]["date"], date),
-                "reason": records[0]["reason"],
-            }
-
-    if not dragon_codes:
-        return []
-
-    candidates = []
-    for code, info in dragon_codes.items():
-        bars = fetch_kline(code, days=30)
-        if len(bars) < 10:
-            continue
-
-        closes = [b["close"] for b in bars]
-        volumes = [b["volume"] for b in bars]
-        highs = [b["high"] for b in bars]
-        lows = [b["low"] for b in bars]
-        n = len(bars)
-        i = n - 1
-
-        lookback_start = max(0, n - 15)
-        peak_idx = lookback_start
-        for j in range(lookback_start, n):
-            if highs[j] > highs[peak_idx]:
-                peak_idx = j
-
-        if peak_idx >= i:
-            continue
-
-        peak_price = highs[peak_idx]
-        current_close = closes[i]
-        trough_price = min(lows[peak_idx + 1:i + 1]) if peak_idx + 1 <= i else current_close
-        pullback_pct = (peak_price - trough_price) / peak_price * 100
-
-        if pullback_pct < 8 or pullback_pct > 35:
-            continue
-
-        signals = []
-        strength_score = 0
-
-        pullback_volumes = volumes[peak_idx + 1:i]
-        avg_pullback_vol = sum(pullback_volumes) / len(pullback_volumes) if pullback_volumes else 1
-        vol_ratio_today = volumes[i] / avg_pullback_vol if avg_pullback_vol > 0 else 1
-        if vol_ratio_today > 1.5:
-            signals.append(f"放量{vol_ratio_today:.1f}倍")
-            strength_score += 15
-        elif vol_ratio_today > 1.2:
-            signals.append(f"温和放量{vol_ratio_today:.1f}倍")
-            strength_score += 8
-
-        if closes[i] > bars[i]["open"]:
-            signals.append("收阳")
-            strength_score += 5
-
-        ma5 = compute_ma(closes, 5)
-        if ma5[i] is not None and closes[i] > ma5[i]:
-            signals.append("站上MA5")
-            strength_score += 8
-
-        if ma5[i] is not None and ma5[i - 1] is not None:
-            ma5_slope_today = (ma5[i] - ma5[i - 1]) / ma5[i - 1] * 100 if ma5[i - 1] > 0 else 0
-            if ma5_slope_today > 0:
-                signals.append("MA5拐头")
-                strength_score += 5
-
-        rsi = compute_rsi(closes)
-        if rsi[i] > 40 and rsi[i - 1] < 40:
-            signals.append(f"RSI低位回升{rsi[i]:.0f}")
-            strength_score += 10
-        elif 40 <= rsi[i] <= 60:
-            signals.append(f"RSI{rsi[i]:.0f}中性")
-            strength_score += 3
-
-        if len(pullback_volumes) >= 2:
-            vol_declining = all(
-                pullback_volumes[j] <= pullback_volumes[j - 1] * 1.1
-                for j in range(1, len(pullback_volumes))
-            )
-            if vol_declining:
-                signals.append("回调缩量(卖盘衰竭)")
-                strength_score += 10
-
-        if ma5[i] is not None and lows[i] <= ma5[i] * 1.01 and closes[i] > ma5[i]:
-            signals.append("均线支撑")
-            strength_score += 8
-
-        if len(signals) < 2:
-            continue
-
-        candidates.append({
-            "code": code, "name": info["name"], "source": "龙回头",
-            "max_continuous_days": info["max_continuous_days"],
-            "zt_dates": info["zt_dates"], "reason": info["reason"],
-            "pullback_pct": round(pullback_pct, 1),
-            "peak_price": round(peak_price, 3),
-            "trough_price": round(trough_price, 3),
-            "close": round(closes[i], 3),
-            "vol_ratio_today": round(vol_ratio_today, 2),
-            "rsi": round(rsi[i], 2),
-            "signals": signals, "strength_score": strength_score,
-            "evaluation": {
-                "score": strength_score,
-                "highlights": signals,
-                "warnings": [] if strength_score >= 40 else ["强度偏低，谨慎"],
-            },
-        })
-
-    candidates.sort(key=lambda x: -x["strength_score"])
-    return candidates
-
-
-
-
-def _eod_start_qfq(code: str, items: List) -> List:
-    """[(日期, 价格|None), ...] → 前复权价格列表（None 原样透传）。
-
-    kline_1m/kline_1D 库表均存**不复权原始价**（cn_stock._get_kline_intraday 注
-    同一口径）；「未复权不能直接用」（2026-11-02 用户裁定）：与 facade 出口同款
-    `unadj_to_qfq` 收口。prev_close 记前一交易日、当日价记扫描日 —— 除权日两侧
-    因子不同，日涨幅/涨停价由此还原成行情显示口径；同一日内的价同因子，比值不变。
-    """
-    from app.data_sources.provider.adjustment import unadj_to_qfq
-    idx = [i for i, it in enumerate(items) if it[0] and it[1] is not None]
-    bars = [{"time": items[i][0], "open": items[i][1], "high": items[i][1],
-             "low": items[i][1], "close": items[i][1], "volume": 0} for i in idx]
-    conv = unadj_to_qfq(bars, code)
-    out: List = [None] * len(items)
-    for k, i in enumerate(idx):
-        out[i] = conv[k]["close"]
-    return out
-
-
-def _eod_start_facts(date: str) -> List[Dict]:
-    """尾盘启动扫描的分钟事实（每票一行）：现价/最高/上午量/尾盘量/尾盘净流/末拍。
-
-    双路（_helpers._snap_same_t 同源纪律 + 2026-11-02 用户裁定「尾盘用 realtime」）：
-    目标日=当日 → realtime_snapshot **优先**（尾盘 14:30-15:00 kline_1m 尚未盘后
-    回填、且 ETL 15:01~15:30 半截窗口不可用，当日事实只能走实时），snapshot 无
-    数据才落 1m；目标日=历史 → kline_1m 优先（盘后回填的完整日），snapshot 只兜底。
-    当日分子分母同源，无跨源量偏差。
-    1m 路的 prev_close = 上一交易日 1m 末拍（与行情 previousClose 互证为交易所收盘
-    真值），出口经 _eod_start_qfq 转前复权后返回；snapshot 路的 previousClose 本就
-    是交易所除权后昨收、当日价=复权锚点，无需再转。**不用 kline_1D 取前收**：实测
-    2026-11-02 全市场 827 只 1D 前收与行情/1m 不一致，成因是 1D 行残写（非复权差 ——
-    争议日复权因子恒等、300640/000702 无除权、偏差双向），1m+snapshot+行情三方互证
-    为真源；300640 案例 1D 前收 5.16 → 涨幅算成 4.65%，真实 5.02 → 7.57%。
-    snapshot 路自带 previousClose / name。量=股；pm_flow=Σ±股×价格方向（量价方向
-    口径，与 fund_flow 本地派生同构，非东财主力口径）。
-    """
-    from app.data_sources import screen_query as _sq
-
-    def _from_snap() -> Dict[str, Dict]:
-        out: Dict[str, Dict] = {}
-        raw = _sq.eod_start_raw(date, which="snap").get("snap") or {}
-        for code, r in raw.items():
-            out[code] = {
-                "code": code, "name": str(r.get("name") or ""),
-                "prev_close": r.get("prev_close"), "last": r.get("last"),
-                "day_high": r.get("day_high"), "v_am": float(r.get("v_am") or 0),
-                "v_pm": float(r.get("v_pm") or 0), "pm_flow": float(r.get("pm_flow") or 0),
-                "last_t": r.get("last_t"),
-            }
-        return out
-
-    def _from_1m() -> Dict[str, Dict]:
-        out: Dict[str, Dict] = {}
-        raw = _sq.eod_start_raw(date, which="1m")
-        rows = raw.get("m1") or {}
-        if not rows:
-            return out
-        prev: Dict[str, Any] = raw.get("prev") or {}
-        for code, r in rows.items():
-            pclose, pt_ = prev.get(code, (None, None))
-            prev_date = str(pt_)[:10] if pt_ else None
-            q_prev, q_last, q_high = _eod_start_qfq(
-                code, [(prev_date, pclose), (date, r.get("last")),
-                       (date, r.get("day_high"))])
-            out[code] = {
-                "code": code, "name": "",
-                "prev_close": q_prev, "last": q_last,
-                "day_high": q_high, "v_am": float(r.get("v_am") or 0),
-                "v_pm": float(r.get("v_pm") or 0), "pm_flow": float(r.get("pm_flow") or 0),
-                "last_t": r.get("last_t"),
-            }
-        return out
-
-    facts = (_from_snap() or _from_1m()) if date == _data_day() \
-        else (_from_1m() or _from_snap())
-    return list(facts.values())
-
-
-def _eod_start_prior8(code: str, date: str) -> Optional[float]:
-    """前 8 个交易日（不含当日）累计涨跌%（qfq）；前史不足 9 根返回 None。
-
-    不足 9 根同时是 N/C 新股（上市 ≤5 日）的天然排除 —— 不依赖名称识别新股。
-    """
-    bars = fetch_kline(code, days=60)
-    prior = [b for b in bars if (b.get("time") or "") < date and b.get("close")]
-    if len(prior) < 9:
-        return None
-    c0, c1 = float(prior[-9]["close"]), float(prior[-1]["close"])
-    if c0 <= 0:
-        return None
-    return (c1 / c0 - 1) * 100
-
-
-def scan_eod_start(date: str = None) -> List[Dict]:
-    """尾盘启动扫描：行情刚启动 + 尾盘资金流入 + 未涨停（eod 候选源 eod_start）。
-
-    语义（2026-11-02 用户拍板，参照 605333@2026-10-23 / 002487@2026-09-10）：
-    找尾盘明显资金流入、当日涨幅适中但未涨停、启动前处于横盘/缓跌的票 —— 买在
-    启动日尾盘吃次日延续（参照股 3 日 +26.5% / +17.6%）。
-
-    核心 5 条判据（阈值 env 可调 QD_EOD_START_*）：
-      1. 涨幅带：当日涨幅 ∈ [RET_MIN, RET_MAX]%（默认 2~8，现价口径）
-      2. 未触板：当日最高价 < 涨停价（触过板不算「未涨停」）
-      3. 刚启动：前 8 个交易日（不含当日）累计 ∈ [PRIOR8_MIN, PRIOR8_MAX]%
-         （默认 -15~+6，横盘/缓跌底部区；前史不足自动跳过，兼排 N/C 新股）
-      4. 尾盘放量：尾盘(≥14:30)每分钟量 ÷ 上午每分钟量 ≥ PM_RATE_MIN(1.05)
-         且 ≥ PM_MED_MULT(1.15) × 当日截面中位强度。满日口径「尾盘量占比 ≥13%
-         且 ≥1.15×截面中位」即此强度比（share13% ⇔ 强度 1.05，30/210 时长归一）；
-         用强度比是为了盘中任意扫描时点可评 —— 14:45 时 1.15× 强度的票 share
-         仅 ~7.6%，固定 share 阈值在 14:30-15:00 窗口内永远不触发
-      5. 尾盘净流：尾盘量价方向净流 > PM_FLOW_MIN(0)
-
-    Returns:
-        list[dict]: [{code,name,source,reason,change_pct,pm_vol_share_pct,
-            pm_rate_ratio,pm_flow,prior8d_ret,...}]，无命中 []。取数失败向上抛
-            （fail-fast，调用方记 missing，不把源故障当「无候选」）。
-    """
-    def _f(key: str, dflt: float) -> float:
-        try:
-            return float(os.getenv("QD_EOD_START_" + key, "") or dflt)
-        except ValueError:
-            return dflt
-
-    ret_min, ret_max = _f("RET_MIN", 2.0), _f("RET_MAX", 8.0)
-    p8_min, p8_max = _f("PRIOR8_MIN", -15.0), _f("PRIOR8_MAX", 6.0)
-    rate_min, med_mult = _f("PM_RATE_MIN", 1.05), _f("PM_MED_MULT", 1.15)
-    flow_min = _f("PM_FLOW_MIN", 0.0)
-
-    date = date or _data_day()
-    facts = _eod_start_facts(date)
-    if not facts:
-        return []
-
-    day_1430 = datetime.strptime(date, "%Y-%m-%d").replace(hour=14, minute=30)
-    horizon = max((f["last_t"] for f in facts if f.get("last_t")), default=day_1430)
-    t_pm = max(1.0, (horizon - day_1430).total_seconds() / 60.0)
-    t_am = 210.0
-    for f in facts:
-        f["pm_rate"] = ((f["v_pm"] / t_pm) / (f["v_am"] / t_am)
-                        if f["v_am"] > 0 and f["v_pm"] >= 0 else None)
-    rates = sorted(f["pm_rate"] for f in facts
-                   if f.get("pm_rate") is not None and f["v_am"] + f["v_pm"] > 0)
-    median_rate = rates[len(rates) // 2] if rates else None
-
-    out: List[Dict] = []
-    for f in facts:
-        prev_close, last = f.get("prev_close"), f.get("last")
-        if not prev_close or not last:
-            continue
-        day_ret = (float(last) / float(prev_close) - 1) * 100
-        if not (ret_min <= day_ret <= ret_max):
-            continue
-        lim_pct = get_limit_pct(f["code"], f.get("name") or "")
-        if lim_pct <= 0:
-            continue
-        limit_px = round(float(prev_close) * (1 + lim_pct / 100), 2)
-        if not f.get("day_high") or float(f["day_high"]) >= limit_px:
-            continue
-        rate = f.get("pm_rate")
-        if rate is None or median_rate is None:
-            continue
-        if rate < rate_min or rate < med_mult * median_rate:
-            continue
-        if f["pm_flow"] <= flow_min:
-            continue
-        p8 = _eod_start_prior8(f["code"], date)
-        if p8 is None or not (p8_min <= p8 <= p8_max):
-            continue
-        v_day = f["v_am"] + f["v_pm"]
-        out.append({
-            "code": f["code"], "name": f.get("name") or "", "source": "尾盘启动",
-            "reason": ("尾盘启动 涨%.1f%% 尾盘量强%.2f倍 净流%.0f万 启动前8日%+.1f%%"
-                       % (day_ret, rate, f["pm_flow"] / 1e4, p8)),
-            "change_pct": round(day_ret, 2), "turnover_pct": None,
-            "pm_vol_share_pct": round(f["v_pm"] / v_day * 100, 1) if v_day > 0 else None,
-            "pm_rate_ratio": round(rate, 2),
-            "pm_flow": round(f["pm_flow"], 1),
-            "prior8d_ret": round(p8, 2),
-        })
-    out.sort(key=lambda x: -(x["pm_rate_ratio"] or 0))
-    return out
 
 
 # ═══════════════════════════════════════════════════════════════
