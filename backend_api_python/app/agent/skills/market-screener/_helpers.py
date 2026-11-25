@@ -1416,56 +1416,115 @@ def intraday_shape_batch(codes: List[str], same_t: Optional[str] = None,
     return out
 
 
+def _is_trading_session() -> bool:
+    """当前是否处于 A 股交易时段（交易日 09:31-15:00）。
+
+    flow_summary 当日净额的口径切换开关：盘中用 realtime_snapshot（此刻量价
+    动能视图，本无定格可言），盘后用 kline_1m 定格（2026-11-26 用户拍板）。
+    日历不可用时保守按钟表时间判，周末等非交易日由 is_trading_day_today 兜住。
+    """
+    try:
+        from app.utils.trading_calendar import is_trading_day_today
+        if not is_trading_day_today():
+            return False
+    except Exception as e:      # 日历不可用：退回钟表时间（周末自会被钟表排除一半）
+        logger.warning("[MktScreen] 交易日判断失败，交易时段按钟表时间判: %s", e)
+    hm = datetime.now().strftime("%H:%M")
+    return "09:31" <= hm <= "15:00"
+
+
 def flow_summary(code: str) -> Dict[str, Any]:
     """个股资金流客观事实（单位：万元）：当日 + 近5/20日总体 + 日内时段结构。
 
     2026-10-30 扩展（用户缺陷①②：只看当天看不出资金「总体」，也防不住开盘几千万
     拉升后抛盘）—— 两个既有工具各取所需，不做重复聚合：
-      · `get_fund_flow_realtime`                当日分钟净额 → `intraday`（开盘/其后分段）
+      · 当日块 + `intraday`（开盘/其后分段）
       · `get_fund_flow(scope="stock_daily", days=30)` 日线聚合 → `recent`（5/20日累计、
         连续方向、逐日符号、剔除最大单日、上一完整交易日、资金趋势判定）
     失败返回 ok=False + 原因，不静默；recent / intraday 各自带 ok，单块失败不拖垮另一块。
 
+    2026-11-26 口径变更（可复测性修复，用户拍板）：**当日块分盘中/盘后两口径**——
+      · 盘中：`get_fund_flow_realtime`（realtime_snapshot 量价派生）。此刻的量价
+        动能视图，本无定格可言。
+      · 盘后：**kline_1m 定格**（`fund_flow_api._flow_from_1m_day`）。实时净额按
+        **调用时刻**的分钟快照累计，盘后不同时刻取值不同（实测 603195 当日净额
+        22:41=+5118 万 vs 重放=+6392 万），证据行随运行时刻漂移、两轮报告对拍
+        失效。kline_1m 盘后回填完整后是定格值，与 recent 块（同一 kline_1m 派生）
+        同源自洽；分时段结构由同函数 `until` 参数派生（开盘窗 09:30-10:00 vs 其后）。
+        kline_1m 缺当日（未回填/停牌/新股）→ 如实缺，**不回落 realtime**（回落即
+        恢复时变，可复测目标破产）。
+
     口径提醒（勿按「主力资金」读取）：net_wan 是**量价方向净额**（按分钟涨跌方向
     累计成交额，见 fund_flow_tools 头注），不是东财四档主力净额，两者不可换算；
-    `caliber`/`caliber_note` 两个键把这件事写进载荷本身，键名不再自称 main_net。
-    跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
+    `caliber`/`caliber_note` 两个键把这件事写进载荷本身（盘后带 1m 定格标注），
+    键名不再自称 main_net。跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
 
     Returns:
         {ok, net_wan, caliber, caliber_note, net_pct_of_amount,
          recent: {ok, as_of_day, last_day_net_wan, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
                   streak_dir, streak_days, sign_5d, max_day, net_20d_ex_max_wan,
                   prev_day_net_wan, trend},
-         intraday: {ok, open_net_wan, after_net_wan, open_share_pct, points},
+         intraday: {ok, open_net_wan, after_net_wan, open_share_pct, points, caliber?},
          reason?}
     """
     out: Dict[str, Any] = {}
-    # ── 当日：分钟净额（realtime_snapshot 量价派生）──
-    try:
-        from .common import call_tool
-        ff = call_tool("get_fund_flow_realtime", code=code)
-        if not isinstance(ff, dict) or ff.get("error"):
-            out["reason"] = (ff or {}).get("error", "无返回")
-        else:
-            # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
-            # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0。2026-10-30 补：占比
-            # 一直为 None 的根因是键名取错——该返回带 main_pct / total_amount，直接读。
-            raw_net = ff.get("total_main_net")
-            if raw_net is None:
-                raw_net = ff.get("main_net_inflow")
-            raw_net = _num_or_none(raw_net)
-            pct = _num_or_none(ff.get("main_pct"))
-            if raw_net is not None and pct is None:
-                amount = _f(ff.get("total_amount") or ff.get("amount") or ff.get("turnover"))
-                pct = round(raw_net / amount * 100, 2) if amount else None
-            if raw_net is None:
-                out["reason"] = "当日资金净额缺失"
+    # ── 当日：盘中 realtime_snapshot 量价派生 / 盘后 kline_1m 定格（见 docstring）──
+    if not _is_trading_session():
+        try:
+            from app.market_cn.fund_flow_api import _flow_from_1m_day
+            from .common import _data_day
+            # 目标日必须走交易日历（_data_day）：凌晨 00:xx 属于前一交易日的盘后
+            # 延伸——datetime.now() 的钟表日已是次日（kline_1m 当日空），会把
+            # 「昨天已定格的完整数据」误判成「无数据」（2026-11-26 00:23 实测）。
+            _day = _data_day()
+            day_net = _flow_from_1m_day(_day, code=code)
+            if not day_net or not (day_net.get("turnover") or 0) > 0:
+                out["reason"] = f"盘后 kline_1m 无 { _day } 数据（未回填/停牌/新股）"
             else:
-                out["net_wan"] = round(raw_net / 1e4, 1)
-            out["net_pct_of_amount"] = pct
-            out["intraday"] = _intraday_shape(ff.get("data") or [])
-    except Exception as e:
-        out["reason"] = f"{type(e).__name__}: {e}"
+                out["net_wan"] = round(float(day_net.get("main_net") or 0) / 1e4, 1)
+                out["net_pct_of_amount"] = day_net.get("main_pct")
+                out["caliber"] = "price_direction_1m_fixed"
+                out["caliber_note"] = "量价方向净额（kline_1m 15:00 定格，非主力）"
+                open_win = _flow_from_1m_day(_day, code=code, until=_OPEN_WINDOW_END)
+                open_net = float((open_win or {}).get("main_net") or 0)
+                total_net = float(day_net.get("main_net") or 0)
+                out["intraday"] = {
+                    "ok": True,
+                    "open_net_wan": round(open_net / 1e4, 1),
+                    "after_net_wan": round((total_net - open_net) / 1e4, 1),
+                    "open_share_pct": (round(open_net / total_net * 100, 1)
+                                       if total_net > 0 else None),
+                    "points": None,   # 1m 口径无逐拍点数；结构=开盘窗(09:30-10:00) vs 其后
+                    "caliber": "kline_1m_fixed",
+                }
+        except Exception as e:
+            out["reason"] = f"{type(e).__name__}: {e}"
+    else:
+        try:
+            from .common import call_tool
+            ff = call_tool("get_fund_flow_realtime", code=code)
+            if not isinstance(ff, dict) or ff.get("error"):
+                out["reason"] = (ff or {}).get("error", "无返回")
+            else:
+                # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
+                # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0。2026-10-30 补：占比
+                # 一直为 None 的根因是键名取错——该返回带 main_pct / total_amount，直接读。
+                raw_net = ff.get("total_main_net")
+                if raw_net is None:
+                    raw_net = ff.get("main_net_inflow")
+                raw_net = _num_or_none(raw_net)
+                pct = _num_or_none(ff.get("main_pct"))
+                if raw_net is not None and pct is None:
+                    amount = _f(ff.get("total_amount") or ff.get("amount") or ff.get("turnover"))
+                    pct = round(raw_net / amount * 100, 2) if amount else None
+                if raw_net is None:
+                    out["reason"] = "当日资金净额缺失"
+                else:
+                    out["net_wan"] = round(raw_net / 1e4, 1)
+                out["net_pct_of_amount"] = pct
+                out["intraday"] = _intraday_shape(ff.get("data") or [])
+        except Exception as e:
+            out["reason"] = f"{type(e).__name__}: {e}"
 
     # ── 近5/20日总体：日线聚合（含资金趋势判定，stock_daily dispatch 已附）──
     fp_today = None
@@ -1525,8 +1584,9 @@ def flow_summary(code: str) -> Dict[str, Any]:
         if _mkt.get("fp_pct") is not None:
             out["flow_rel"] = round(fp_today - _mkt["fp_pct"], 2)
 
-    out["caliber"] = "price_direction"
-    out["caliber_note"] = "量价方向净额（非主力）"
+    # 盘后分支已写 kline_1m 定格口径（price_direction_1m_fixed），不覆盖
+    out.setdefault("caliber", "price_direction")
+    out.setdefault("caliber_note", "量价方向净额（非主力）")
     out["ok"] = "net_wan" in out
     return out
 

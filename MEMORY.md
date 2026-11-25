@@ -4,7 +4,8 @@
 - **本地**: D:/QuantDinger
 - **用途**: A股量化交易系统，小资金中短线快速复利,追求单位时间收益比
 - **技术栈**: Python 后端 (Flask + mimo agents + quantdinger) + Vue 前端 + PostgreSQL
-- **用户环境**: Windows10 + 40核 64G, D:\QuantDinger\, powershell, vscode
+- **用户环境**: Windows10 + 40核 64G, D:\QuantDinger\, powershell, vscode, Python 3.12
+- **虚拟环境位置**: D:\QuantDinger\.venv
 ## 关键设计文档
 - docs目录中及根目录/当前系统目录下
 
@@ -23,6 +24,13 @@
 - 有设计方案的坚持按设计方案生成代码,修改范围较大的在修改完后需要重新审核是否和方案核心思想发生偏离,遇到方案错误或偏差的先说明
 - 修复问题不要矫枉过正,较大变动先出方案并分析是否有更巧思路.
 - 快速拔插的文件一定要动态加载方式
-- 目前是基于flask调试阶段,交互后变为docker,要考虑兼容性
+- 目前是基于flask调试阶段,交付后变为docker,要考虑兼容性
 - 文件代码长度不作为问题处理
 - 非必要不做红绿验证
+
+## 数据库
+- **类型**: PostgreSQL, 两个库:库1:CNStock_db 库2:QuantDinger_db
+- 库1中关键表1: stock_basic_info (股票基本信息)
+- 库1中关键表2: kline_1D_YYYY (股票日线行情) YYYY=2021~今年
+- 库1中关键表3: kline_1m_YYYY (股票分时1m行情) 盘后15:30以后入库
+- 库1中关键表4: realtime_snapshot (1m 实时快照) 盘中实时,数据有秒级偏差或小断档

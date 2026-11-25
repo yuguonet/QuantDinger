@@ -144,6 +144,11 @@ def detect_patterns(codes: str, days: int = 60, params: str = None) -> dict:
 
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
+        "★ **报告长度预算：全文 ≤1000 汉字**（必须以完整段落收尾——生成到一半被截断="
+        "本次交付失败）；先结论卡、再风险与证伪，不写排除举例、不写长篇分析"
+        "（LLM completion 上限实测会被长报告打满，2026-11-26 实锤）。\n"
+        "★ **简单直观方便识别**：结论用加粗短句，数字带口径；证据细节在快照里，"
+        "报告不搬运候选明细（交付载荷 analyzed_rank 已完整，追责走快照 diff）。\n"
         "正文精简，表头逐字保留，N=实际符合条件数，可为 0：\n"
         "## 买什么（N 只）\n"
         "| 代码 | 现价 | 买点价位 | 止损价(触发口径) | 目标价/止盈条件 | 仓位 | T+1/T+3/T+5 | 一句话理由 |\n"
@@ -178,12 +183,14 @@ _REPORT_GUIDE = {
         "证据不足、无法相互验证或存在未解决的矛盾时填未知，并简述缺口或冲突；"
         "三个周期全中性不得进表；市场及其他综合判断也须区分中性和未知。\n"
         "★ **全文用中文白话**，禁止输出 near_support / rank_cut 等字段名。\n"
-        "不另设「不买/观察」栏目，也不整表罗列未推荐标的；排除项按**类别各 ≤3 只**一行证伪"
-        "（资金不过关 / 高波动高位 / 接刀等）；"
-        "N=0 时写「## 空仓卡  今日无符合标的，空仓等待：<一行证据>」，禁止硬凑。\n"
+        "**不写排除举例/不买/观察栏目**（候选证据全在交付载荷与快照里，追责走快照 diff）；"
+        "N=0 时写「## 空仓卡  今日无符合标的，空仓等待：<一行证据>」+ 环境读数 ≤2 行（只写数字），"
+        "禁止硬凑。\n"
         "## 风险与证伪（≤3 行）\n"
-        "指标罗列、长篇分析不进正文；尾注可留**一行**（来源/口径/漏斗计数，供 claims 追责与口径披露）。"
-        "保留代码+名称+看多看空+跌破 X（喂 claims）。"
+        "指标罗列、长篇分析不进正文；尾注固定一行抄模板："
+        "「尾注：market-screener ｜ 漏斗 {pool_raw}→{baseline}→{deep_n}+{zt_ref_n} ｜ "
+        "快照 {selection_snapshot.day} {selection_snapshot.as_of} ｜ 资金=量价方向净额」。"
+        "进表票保留代码+名称+看多看空+跌破 X（喂 claims）。"
     ),
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
              "检查 preview_note 和候选行数：若 analyzed_rank 被裁剪或行数少于 funnel.deep_n，"
@@ -300,15 +307,15 @@ _REPORT_GUIDE = {
               "/**flow_rel_st**（分时同口径）/dist_ma5_pct/dist_ma20_pct/amp_avg5（近5日平均振幅%，止损宽度基准）/sr_gap_pct（支撑-压力间距%）"
               "/**flags**（闸门打标命中原因：连板放量/吸筹不足/已过度拉升——高波动档护栏证据，不是排除令；缺键=无命中）"
               "/**gaps**（关键资格判据缺列清单：chg_pct/vol_ratio/amp_avg5/sr_gap_pct/pos20/sup/"
-              "net5d_wan/ratio5d_pct/streak_dir/streak_days/sign_5d/flow_day；"
+              "net5d_wan/ratio5d_pct/streak_dir/streak_days/sign_5d/flow_data_day；"
               "缺列=坏证据，缺哪项就按那项判据的最不利档读，从满卡 analyzed 补到证据才解除；缺键=证据齐全）"
               "/regime（**日线**形态标签，动作映射见 regime 条）"
               "/shape（**分时**形态标签，见 intraday_shape 条；与 regime 并列、互不覆盖，用来相互印证）"
               "/rs_d0/rs_5d（相对上证超额%，见 regime 条）"
               "/loc（**位置透支分档** hot/cool/normal，见 location 条）"
               "/seal/seal_tier/seal_pct/net5d_wan/net20d_wan/streak_dir/streak_days/sign_5d/"
-              "flow_day（最近资金日线日期）/flow_last_day_wan（该日净额）/"
-              "flow_today_wan（实时当日净额）；"
+              "flow_data_day（最近资金日线数据的对应日期）/flow_last_day_wan（该日净额）/"
+              "flow_today_wan（当日净额：盘中=realtime 量价、盘后=kline_1m 定格，口径见 caliber_note）；"
               "20 日位置直接读 pos20（0=区间最低、100=最高，无需自算）；"
               "满卡 tech.support.supports/resists 是全量候选（各 ≤4/≤3 条），要横向比多个位置才看它；"
               "**缺键即正常**：无 limit_up=未涨停、无 buyable=可买、无 stale_bar=日线未滞后、无 risks=无风险、"
@@ -341,7 +348,16 @@ _REPORT_GUIDE = {
                   "缺了就当资金未转向读。"
                   "资金资格看近3~5日连续性，入场时机看当日抢筹和分段吸筹，20日只作语境；"
                   "flow.recent 包含近5/20日累计、连续方向、逐日符号和剔除最大单日；"
-                  "历史资金日线与当日实时资金分开读：按 flow_day 标注日线日期，"
+                  "★**净额口径速查（引用任何净额数字前先对表，2026-11-26 防误读硬护栏）**："
+                  "flow_today_wan=**当日**净额；flow_last_day_wan=最近资金日线**那一日**净额；"
+                  "net5d_wan=**近 5 个交易日**累计；net20d_wan=**近 20 个交易日**累计——"
+                  "实测两次报告分别把 20 日净流出误读成『近 5 日』（方向反了）、把 5 日净额误读成『当日』，"
+                  "**引用净额必须写明 N 日口径且能逐字对应到上述字段，写不出口径的字段不引用**；"
+                  "★**涨幅/乖离类同理（2026-11-26 补）**：ret5_pct=近 5 日**涨幅**、chg_pct=**当日**涨跌、"
+                  "chg_prev_pct=昨日涨跌、dist_ma20_pct=现价**距 MA20 乖离**——乖离≠跌幅！"
+                  "实测有报告把 dist_ma20_pct=-9.48% 写成『跌 -9.48%』（实际当日仅 -0.72%）；"
+                  "引用任何百分比必须写明口径，乖离类要写成『低于 MA20 达 9.5%』这类表述；"
+                  "历史资金日线与当日资金分开读：按 flow_data_day 标注日线数据对应日期，"
                   "盘中日线可能停在前一交易日，不得把它冒称当日；"
                   "sign_5d 的 + 包含零，最新日是否流入须核对 flow_last_day_wan；"
                   "即使与选人快照同日，也不能证明取数同刻；关键数据缺失或冲突时说明不确定性。"
@@ -497,7 +513,7 @@ _EVIDENCE_KEYS = (
     "streak_dir",    # 资金连续方向：逐日否决判据
     "streak_days",
     "sign_5d",       # 5日逐日符号
-    "flow_day",      # 资金新鲜度锚（口径日期）
+    "flow_data_day",  # 资金新鲜度锚（口径日期）
 )
 
 
@@ -563,7 +579,7 @@ def _rank_row(card: dict) -> dict:
         "net20d_wan": rec.get("net_20d_wan"),
         "ratio5d_pct": rec.get("ratio_5d_pct"),
         "streak_dir": rec.get("streak_dir"),
-        "flow_day": rec.get("as_of_day"),
+        "flow_data_day": rec.get("as_of_day"),
         "flow_last_day_wan": rec.get("last_day_net_wan"),
         "sign_5d": rec.get("sign_5d"),
         "streak_days": rec.get("streak_days"),
@@ -1335,7 +1351,7 @@ def _compact_delivery(out: dict, min_cards: int = 0) -> dict:
                 return out
 
     flow_fields = ("net5d_wan", "net20d_wan", "ratio5d_pct", "streak_dir",
-                   "streak_days", "sign_5d", "flow_day", "flow_last_day_wan",
+                   "streak_days", "sign_5d", "flow_data_day", "flow_last_day_wan",
                    "flow_today_wan", "flow_risks", "flow_rel", "flow_rel_st")
     omitted_empty_flow = False
     for row in out.get("analyzed_rank") or []:
@@ -1382,7 +1398,7 @@ def _compact_delivery(out: dict, min_cards: int = 0) -> dict:
         guide["fields"] = (
             "analyzed_rank 是全部候选；价位、资金和量能直接按字段读取。"
             "sup/res 是现价两侧最近关键位置；buyable=unknown 表示未知。"
-            "flow_day 是最近资金日线日期，flow_today_wan 是当日实时净额，不能混作同一时点；"
+            "flow_data_day 是最近资金日线数据的对应日期，flow_today_wan 是当日净额，不能混作同一时点；"
             "sign_5d 的 + 包含零。关键证据缺失或冲突时须说明，不得猜测。"
         )
         out["report_guide"] = guide
@@ -1519,6 +1535,52 @@ def build_deliverability_note(rank: list, analyzed: list) -> str:
                 nts.append("未命中强信号形态")
         dn.append(f"{c}: {'；'.join(nts)}")
     return " | ".join(dn) if dn else "无可分析候选"
+
+
+# ── 证据快照落盘（P2 可复测基建，2026-11-26）─────────────────────────────
+# 目标：证据层已两口径定格（盘后资金=kline_1m、涨停集合=曾触板池），重放对拍
+# 还需要**当时的完整交付**做 diff。rank/满卡/funnel/market 全量落 JSON：
+#   · {day}_{HHMMSS}_market-screener.json  时间戳快照（保留最近 _SNAPSHOT_KEEP 份）
+#   · latest_market-screener.json          固定名，供重放工具取最新
+# 交付给 LLM 的载荷（out 本体）不动；落盘失败只告警不阻断主流程。
+_SNAPSHOT_DIR = Path(__file__).resolve().parents[4] / "tmp" / "skill_output"
+_SNAPSHOT_KEEP = 30
+
+
+def _dump_evidence_snapshot(result, codes: list = None) -> None:
+    """run() 交付快照落盘：day/as_of/round 元信息 + 完整交付载荷。
+
+    含 report_guide（同轮重复文本）换取「与交付完全一致」的 diff 基准，
+    单份 ~40KB 可接受。清理：时间戳快照按名排序保留最近 _SNAPSHOT_KEEP 份
+    （latest 固定名不计入、不清理）。
+    """
+    try:
+        if not isinstance(result, dict):
+            return
+        _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        meta = {
+            "snapshot_version": 1,
+            "day": (result.get("funnel") or {}).get("day") or now.strftime("%Y-%m-%d"),
+            "as_of": (result.get("selection_snapshot") or {}).get("as_of"),
+            "run_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "round": "fine" if codes else "coarse",
+            "codes": ",".join(str(c) for c in (codes or [])) or None,
+            "pipeline": (result.get("funnel") or {}).get("pipeline"),
+        }
+        text = json.dumps({"meta": meta, "deliver": result},
+                          ensure_ascii=False, default=str)
+        ts_path = _SNAPSHOT_DIR / f"{meta['day']}_{now.strftime('%H%M%S')}_market-screener.json"
+        ts_path.write_text(text, encoding="utf-8")
+        latest = _SNAPSHOT_DIR / "latest_market-screener.json"
+        latest.write_text(text, encoding="utf-8")
+        snaps = sorted(p for p in _SNAPSHOT_DIR.glob("*_market-screener.json")
+                       if p.name != latest.name)
+        for old in snaps[:max(0, len(snaps) - _SNAPSHOT_KEEP)]:
+            old.unlink(missing_ok=True)
+        logger.info("[MktScreen] 证据快照已落盘: %s", ts_path.name)
+    except Exception as e:
+        logger.warning("[MktScreen] 证据快照落盘失败（不阻断主流程）: %s", e)
 
 
 def _parse_codes(codes: str) -> list:
@@ -1749,6 +1811,10 @@ def run(codes: str = "") -> dict:
     warm_market_pool()
     if _req:
         # 细筛轮：codes 即终选，无漏斗，只做深度证据
-        return _run_fine(_req, _t0, _ms, _started)
-    # 粗筛轮：全市场三层漏斗选人
-    return _run_topdown(_t0, _ms, _started, coarse=True)
+        result = _run_fine(_req, _t0, _ms, _started)
+    else:
+        # 粗筛轮：全市场三层漏斗选人
+        result = _run_topdown(_t0, _ms, _started, coarse=True)
+    # 证据快照落盘（P2 可复测基建）：完整交付 + day/as_of 元信息，供跨时刻重放 diff
+    _dump_evidence_snapshot(result, codes=_req)
+    return result

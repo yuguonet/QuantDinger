@@ -1237,10 +1237,11 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
                  limit: Optional[int] = None) -> Dict[str, Any]:
     """三层漏斗主流程：L1 大盘闸 → L2 板块闸 → L3 板块内选股 → 截断。
 
-    `as_of` 是**信息边界**：该时刻之后才发生的事一律不可见。给定 `as_of` 时，
-    涨停集合由 `zt_rows_asof` 用 snapshot 重建 —— 收盘涨停池既含"此刻还没涨停的票"
-    （前视），又缺"涨停过又炸板的票"（幸存者偏差），两种偏差都不允许进入盘中决策。
-    `as_of=None`（生产实时）时直接用实时涨停池。
+    `as_of` 是**信息边界**：该时刻之后才发生的事一律不可见。涨停集合一律由
+    `zt_rows_asof` 用 snapshot 重建（截至 as_of 曾触板，2026-11-26 统一口径）——
+    收盘涨停池既含"此刻还没涨停的票"（前视），又缺"涨停过又炸板的票"
+    （幸存者偏差），两种偏差都不允许进入盘中决策；生产与固定边界重放走
+    **同一条路径**（as_of=None 时由 resolve_as_of 解析：盘中=此刻、盘后=15:00）。
 
     截断前过一遍 `flag_streak_surge()` 打标（不放弃）：当前连板高度 ≥
     `QD_TOPDOWN_STREAK_SURGE_MIN_STREAK`（默认 2，含今日截至 as_of 曾触板）
@@ -1250,7 +1251,8 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     `as_of` 及以前的 snapshot，不引入未来信息；数据不足的票不打标并计数。
 
     Args:
-        as_of: 截断时刻 HH:MM；None=此刻（用实时涨停池原文）
+        as_of: 截断时刻 HH:MM；None=解析为当前时刻（盘中）或收盘 15:00（盘后），
+            涨停集合两态都走 zt_rows_asof 曾触板重建（口径统一，见上方说明）
         day: 目标交易日；None=今天（涨停池/分时取数的日期）
         limit: 涨停参考和非涨停候选合计上限；None 取 env QD_TOPDOWN_L3_LIMIT（默认 35，
             2026-11-23 起 25→35，与 SKILL.md/limit-rules.md「截断 35 只恒入 deep」对齐）
@@ -1268,15 +1270,16 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
                          min_fund_pct=max(0.0, p["min_fund_pct"] - _MIN_BOARD_FUND_PCT),
                          boards_n=int(p.get("boards") or _L2_BOARDS_NEUTRAL))
 
-    if as_of:
-        zt_rows = zt_rows_asof(d, as_of, _board_union_members(boards))
-    else:
-        from app.data_sources.cn_stock_ext import limit_pool
-        try:
-            zt_rows = limit_pool("limit_up_pool", d)
-        except Exception as e:
-            zt_rows = []
-            logger.warning("[topdown] 涨停池取数失败（L3 将全部走跳变分支）: %s", e)
+    # 涨停集合统一「截至 as_of 曾触板池」（2026-11-26 用户拍板）：技能内只有
+    # **信息边界语义**——盘中 as_of=此刻、盘后 as_of=15:00；T+N 回评是真实场景
+    # 重放（不是回测），回测（统计技能有效性）在技能外（optimizer/）。
+    # 收盘最终池（limit_pool）带双偏差：含 as_of 时刻不可见的「之后才涨停的票」
+    # （前视）、漏掉「涨停过又炸板」（幸存者偏差）——生产(收盘池) vs 固定边界
+    # 重放(曾触板池) 两条路径实测选人结果差 5 只（pool_raw 61 vs 63），对拍失效。
+    # 代价：重建路径 seal_amount/continuous_zt_days 恒 0/1（见 zt_rows_asof），
+    # 涨停票 reason 文案自动落「触板 HH:MM」（picked head 逻辑 amt>0 else 触板）。
+    as_of_eff = _sq.resolve_as_of(as_of)
+    zt_rows = zt_rows_asof(d, as_of_eff, _board_union_members(boards))
 
     per_board: List[Dict[str, Any]] = []
     all_picked: List[Dict[str, Any]] = []
