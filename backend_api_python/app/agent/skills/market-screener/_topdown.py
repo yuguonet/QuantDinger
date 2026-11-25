@@ -130,13 +130,11 @@ def _parse_idx_scale() -> Dict[str, float]:
 
 
 _L1_IDX_SCALE = _parse_idx_scale()
-# 2026-11-23 小资金复利对齐：粗筛宁滥勿缺（设计方案 v2 §3.1），板块数/截断额放宽，
-# 取舍归裁决层；弱市档仍相对收紧，但不再砍到 3 板块/25 只（仓位是输出层的事，
-# 不是扫描层的事）。
+# 板块数随大盘档位变化；候选上限为满卡交付留出预算，可通过环境变量调整。
 _L2_BOARDS_STRONG = _env_i("L2_BOARDS_STRONG", 8)
 _L2_BOARDS_NEUTRAL = _env_i("L2_BOARDS_NEUTRAL", 6)
 _L2_BOARDS_WEAK = _env_i("L2_BOARDS_WEAK", 4)
-_L3_LIMIT = _env_i("L3_LIMIT", 35)
+_L3_LIMIT = _env_i("L3_LIMIT", 25)
 _L3_PER_BOARD = _env_i("L3_PER_BOARD", 10)
 _FOLLOW_WINDOW_MIN = _env_i("FOLLOW_WINDOW_MIN", 10)
 _MIN_BOARD_FUND_PCT = _env_f("MIN_BOARD_FUND_PCT", 0.0)
@@ -1100,7 +1098,8 @@ def _flag_early_accumulation(items: List[Dict[str, Any]], day: str,
         （净流出 -4.5~-7.1%，净流入 0~3% +3.5~+4.1%）；前 5 日涨幅 ≥10% 明显变差。
       · 「中位流通市值更优」不成立（20~80 亿最差）→ 本闸不引入市值条件。
 
-    打标条件（仅 kind=jump；涨停票不标；仅 as_of <= _EARLY_GATE_TIME 生效）：
+    打标条件（仅 kind=jump；涨停票不标；仅 as_of ≤ _EARLY_GATE_TIME 生效，
+        as_of=None 时解析为当前时刻——生产实时早盘照常打标，非交易时段 15:00 不触发）：
         前 N 日累计净流入 ÷ 流通市值 × 100 > _EARLY_FLOW_IN_THR（默认 1.0）
         且 前 N 日累计涨幅 < _EARLY_RET5_MAX（默认 10%）
 
@@ -1112,9 +1111,13 @@ def _flag_early_accumulation(items: List[Dict[str, Any]], day: str,
     Returns:
         (items, flagged, unknown)；items 含全部候选、一个不丢，flagged 已挂 flags。
     """
-    if not _EARLY_GATE_ENABLE or not as_of:
+    if not _EARLY_GATE_ENABLE:
         return list(items), [], 0
-    if as_of > _EARLY_GATE_TIME:
+    # as_of=None（生产实时）不是「跳过」：解析为当前时刻（resolve_as_of，非交易
+    # 时段落 15:00 自然不触发）。原实现 None 直接 return，实时早盘（09:40 前）跑
+    # run() 时整条吸筹打标链路静默失效（2026-11-25 审查修复）。
+    eff = _sq.resolve_as_of(as_of)
+    if eff > _EARLY_GATE_TIME:
         return list(items), [], 0
     jump_items = [x for x in items if x.get("kind") == "jump"]
     if not jump_items:
@@ -1247,7 +1250,7 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     Args:
         as_of: 截断时刻 HH:MM；None=此刻（用实时涨停池原文）
         day: 目标交易日；None=今天（涨停池/分时取数的日期）
-        limit: 最终送 deep 的只数；None 取 env QD_TOPDOWN_L3_LIMIT（默认 35）
+        limit: 涨停参考和非涨停候选合计上限；None 取 env QD_TOPDOWN_L3_LIMIT（默认 25）
 
     Returns:
         {ok, gate, boards, per_board: [...], picked: [...], funnel: {...}, missing}

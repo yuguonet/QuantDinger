@@ -34,6 +34,23 @@ from app.data_sources import screen_query as _sq
 # 单批取数等待上限：DB/网络抖动时不拖垮整轮选股（超时项计入 missing）
 _FETCH_TIMEOUT_S = 20.0
 
+# 错误分类字典（用于统一错误信息格式）
+ERROR_CATEGORIES = {
+    "DATA_SOURCE": "数据源异常",
+    "TIMEOUT": "超时未返回",
+    "INSUFFICIENT_DATA": "数据不足",
+    "NETWORK": "网络问题",
+    "PARSING": "解析失败",
+    "API": "API 调用失败",
+    "THREAD": "线程异常",
+    "SYNTAX": "语法错误",
+    "CUSTOM": "自定义错误",
+    # 业务级错误分类（用于帮助 LLM 定位决策问题，非系统异常）
+    "PATTERN_SIGNAL": "形态信号（技术形态定性）",
+    "FLOW_RISK": "资金风险（拉高出货/异常流向）",
+    "POSITION_WARN": "位置提醒（距高点/支撑阻力）",
+}
+
 
 def select_strategy() -> str:
     """根据当前时间选择交易日策略。"""
@@ -110,6 +127,22 @@ def _f(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _format_error(code: Optional[str], error_type: str, message: str) -> str:
+    """统一格式化错误信息，返回带代码前缀的中文错误描述。
+    
+    Args:
+        code: 股票代码
+        error_type: 错误类型（对应 ERROR_CATEGORIES 键）
+        message: 异常原始消息
+    
+    Returns:
+        格式化后的错误字符串，如 "数据源异常: 600519 - ConnectionError: ..."
+    """
+    category = ERROR_CATEGORIES.get(error_type, error_type)
+    code_prefix = f"{code} - " if code else ""
+    return f"{category}: {code_prefix}{message}"
 
 
 def _num_or_none(v: Any) -> Optional[float]:
@@ -326,7 +359,8 @@ def _now_hhmm() -> str:
 
 
 def _snap_st_query(same_t: Optional[str], symbols: Optional[List[str]] = None,
-                   day: Optional[str] = None) -> list:
+                   day: Optional[str] = None,
+                   lookback_days: int = 6) -> list:
     """snapshot 同刻聚合的取数入口：一次查询返回「按交易日（多票时按 symbol+日）」的原始行。
 
     **取数实现已下沉到 `data_sources.screen_query.snap_panel`**（分层铁律：skill 层不写
@@ -340,9 +374,23 @@ def _snap_st_query(same_t: Optional[str], symbols: Optional[List[str]] = None,
 
     净额必须覆盖整个窗口（full_net=True）：调用方都要「今日 vs 前 N 日同刻」对比，
     只算今天会让历史日的 net/amt 恒为 None。
+
+    参数:
+        same_t: 同刻时间（HH:MM）
+        symbols: 股票代码列表；None 表示全市场
+        day: 目标交易日（YYYY-MM-DD）
+        lookback_days: 回看窗口大小（默认6）。
+            较大值保证高波动期数据充足；较小值提升速度。
+            可通过环境变量 QD_SCREENER_LOOKBACK_DAYS 覆盖默认值。
+
+    **备注**：窗口大小由调用方决定，不在本函数内部查询市场状态（避免慢路径阻塞）。
     """
+    # 环境变量覆盖默认值（优先级：显式参数 > 环境变量 > 默认 6）
+    _env_lb = int(os.getenv("QD_SCREENER_LOOKBACK_DAYS", "6"))
+    _lb = lookback_days if lookback_days > 0 else _env_lb
+
     try:
-        panel = _sq.snap_panel(as_of=same_t, codes=symbols, days=6,
+        panel = _sq.snap_panel(as_of=same_t, codes=symbols, days=_lb,
                                with_net=True, full_net=True, end_day=day,
                                with_last=bool(symbols))
     except Exception as e:
@@ -1383,7 +1431,7 @@ def flow_summary(code: str) -> Dict[str, Any]:
 
     Returns:
         {ok, net_wan, caliber, caliber_note, net_pct_of_amount,
-         recent: {ok, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
+         recent: {ok, as_of_day, last_day_net_wan, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
                   streak_dir, streak_days, sign_5d, max_day, net_20d_ex_max_wan,
                   prev_day_net_wan, trend},
          intraday: {ok, open_net_wan, after_net_wan, open_share_pct, points},
@@ -1400,12 +1448,18 @@ def flow_summary(code: str) -> Dict[str, Any]:
             # 三对账修正（2026-09-30）：tape 返回的真实键是 total_main_net（单位元）——
             # 旧读 main_net_inflow 恒 None，主力净流入被算成恒 0。2026-10-30 补：占比
             # 一直为 None 的根因是键名取错——该返回带 main_pct / total_amount，直接读。
-            main_net = _f(ff.get("total_main_net", ff.get("main_net_inflow"))) / 1e4
+            raw_net = ff.get("total_main_net")
+            if raw_net is None:
+                raw_net = ff.get("main_net_inflow")
+            raw_net = _num_or_none(raw_net)
             pct = _num_or_none(ff.get("main_pct"))
-            if pct is None:
+            if raw_net is not None and pct is None:
                 amount = _f(ff.get("total_amount") or ff.get("amount") or ff.get("turnover"))
-                pct = round(main_net * 1e4 / amount * 100, 2) if amount else None
-            out["net_wan"] = round(main_net, 1)
+                pct = round(raw_net / amount * 100, 2) if amount else None
+            if raw_net is None:
+                out["reason"] = "当日资金净额缺失"
+            else:
+                out["net_wan"] = round(raw_net / 1e4, 1)
             out["net_pct_of_amount"] = pct
             out["intraday"] = _intraday_shape(ff.get("data") or [])
     except Exception as e:
@@ -1414,11 +1468,12 @@ def flow_summary(code: str) -> Dict[str, Any]:
     # ── 近5/20日总体：日线聚合（含资金趋势判定，stock_daily dispatch 已附）──
     fp_today = None
     fp_day = ""
+    fp_last_net_wan = None
     try:
         from ...tools.finance.fund_flow_tools import get_fund_flow
         df = get_fund_flow(scope="stock_daily", codes=code, days=30) or {}
         one = (df.get("data") or {}).get(code) or {}
-        if isinstance(one, dict) and not one.get("error"):
+        if isinstance(one, dict) and not one.get("error") and one.get("data"):
             rows = one.get("data") or []
             today = datetime.now().strftime("%Y-%m-%d")
             prev_wan = None
@@ -1430,28 +1485,36 @@ def flow_summary(code: str) -> Dict[str, Any]:
             for r in rows:
                 if str(r.get("date") or "")[:10] != fp_day:
                     continue
+                last_net = _num_or_none(r.get("main_net"))
+                if last_net is not None:
+                    fp_last_net_wan = last_net / 1e4
                 v = r.get("main_pct")
                 if v is None and r.get("main_net") is not None and _f(r.get("turnover")):
                     v = _f(r["main_net"]) / _f(r["turnover"]) * 100
                 if v is not None:
                     fp_today = float(v)
                     break
+            net_5d = _num_or_none(one.get("recent_5d_main_net"))
+            net_20d = _num_or_none(one.get("recent_20d_main_net"))
+            net_20d_ex_max = _num_or_none(one.get("recent_20d_main_net_ex_max"))
             out["recent"] = {
                 "ok": True,
-                "net_5d_wan": round(_f(one.get("recent_5d_main_net")) / 1e4, 1),
-                "net_20d_wan": round(_f(one.get("recent_20d_main_net")) / 1e4, 1),
+                "as_of_day": fp_day or None,
+                "last_day_net_wan": fp_last_net_wan,
+                "net_5d_wan": round(net_5d / 1e4, 1) if net_5d is not None else None,
+                "net_20d_wan": round(net_20d / 1e4, 1) if net_20d is not None else None,
                 "ratio_5d_pct": one.get("recent_5d_net_ratio"),
                 "ratio_20d_pct": one.get("recent_20d_net_ratio"),
                 "streak_dir": one.get("main_net_streak_dir"),
                 "streak_days": one.get("main_net_streak"),
                 "sign_5d": one.get("recent_5d_sign"),
                 "max_day": one.get("max_main_net_day"),
-                "net_20d_ex_max_wan": round(_f(one.get("recent_20d_main_net_ex_max")) / 1e4, 1),
+                "net_20d_ex_max_wan": round(net_20d_ex_max / 1e4, 1) if net_20d_ex_max is not None else None,
                 "prev_day_net_wan": prev_wan,
                 "trend": one.get("资金趋势判定"),
             }
         else:
-            out["recent"] = {"ok": False, "reason": (one or {}).get("error", "无返回")}
+            out["recent"] = {"ok": False, "reason": (one or {}).get("error") or "资金日线数据为空"}
     except Exception as e:
         out["recent"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
@@ -1686,7 +1749,7 @@ def _market_klines():
     return _MKT_KLINES_CACHE["data"]
 
 
-def prewarm_market_klines() -> None:
+def prewarm_market_klines(selected_codes: Optional[List[str]] = None) -> None:
     """后台预热指数日线（2026-10-25 P1-①）。
 
     根因（主探针 probe_screener_timing_20261024 实锤）：画像期
@@ -1696,11 +1759,14 @@ def prewarm_market_klines() -> None:
     单点 78.35s，占 run() 总耗时 44%。该取数与选人层取数无依赖 ⇒ run() 入口
     起后台线程预热，重叠后单点基本隐藏。失败仅记 warning：主流程到时按原
     路径自取，行为与无预热时一致（不静默吞，见模块头纪律）。
+
+    新增：支持 selected_codes 目标性预热，用于细筛轮只预热特定股票。
     """
     def _bg():
         try:
             _market_klines()
-            logger.info("[market-screener] 指数K线后台预热完成")
+            logger.info("[market-screener] 指数K线后台预热完成" + 
+                       (f" (目标: {len(selected_codes)} 只)" if selected_codes else ""))
         except Exception as e:
             logger.warning("[market-screener] 指数K线后台预热失败: %s", e)
 

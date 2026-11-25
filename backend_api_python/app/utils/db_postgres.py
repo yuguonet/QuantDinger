@@ -252,8 +252,9 @@ class PostgresCursor:
            cur.execute("INSERT INTO t (a) VALUES (%s) RETURNING id", (val,))
            new_id = cur.lastrowid
 
-    ``execute()`` **never** mutates your SQL.  If you need the inserted id,
-    add ``RETURNING id`` yourself or use ``insert_returning()``.
+    ``execute()`` auto-appends ``RETURNING *`` only for simple INSERT … VALUES
+    (see :meth:`execute`).  For other statements it never mutates your SQL;
+    add ``RETURNING id`` yourself or use :meth:`insert_returning`.
     """
 
     def __init__(self, cursor):
@@ -377,8 +378,12 @@ class PostgresCursor:
     def execute(self, query: str, args: Any = None):
         """Execute SQL statement.
 
-        For simple INSERT … VALUES statements, automatically appends ``RETURNING id``
-        so that :attr:`lastrowid` is populated.  This is skipped for:
+        For simple INSERT … VALUES statements, automatically appends ``RETURNING *``
+        so that :attr:`lastrowid` is populated when the table has an ``id`` column.
+        ``*`` is used instead of ``id`` so tables whose primary key is not ``id``
+        (e.g. ``skill_id`` / composite keys) do not raise UndefinedColumn; the
+        wrapper reads ``id`` from the returned row and simply gets ``None`` there.
+        This is skipped for:
         - INSERT … SELECT (returns multiple rows)
         - INSERT … ON CONFLICT DO NOTHING (may insert 0 rows)
         - Statements that already contain RETURNING
@@ -396,9 +401,10 @@ class PostgresCursor:
         is_insert = upper_q.startswith('INSERT')
         has_returning = 'RETURNING' in upper_q
 
-        # Auto-append RETURNING id for simple INSERT … VALUES
+        # Auto-append RETURNING * for simple INSERT … VALUES. Works for tables
+        # with or without an `id` column (the latter gets lastrowid=None).
         if is_insert and not has_returning and self._is_simple_insert(upper_q):
-            query = query.rstrip().rstrip(';') + ' RETURNING id'
+            query = query.rstrip().rstrip(';') + ' RETURNING *'
             has_returning = True
 
         if args:
@@ -425,7 +431,9 @@ class PostgresCursor:
     def insert_returning(self, query: str, args: Any = None) -> Optional[int]:
         """Execute an INSERT and return the new row's ``id``.
 
-        Appends ``RETURNING id`` if the query doesn't already have it.
+        Appends ``RETURNING *`` if the query doesn't already have it; the ``id``
+        is then read from the returned row.  ``*`` keeps this safe for tables
+        whose primary key is not ``id`` (returns ``None`` for their ``id``).
         This is the **preferred** way to get the inserted id::
 
             new_id = cur.insert_returning(
@@ -434,7 +442,8 @@ class PostgresCursor:
             db.commit()
 
         Returns the inserted row's ``id``, or ``None`` if no row was inserted
-        (e.g. ``ON CONFLICT DO NOTHING`` hit a conflict).
+        (e.g. ``ON CONFLICT DO NOTHING`` hit a conflict) or the table has no
+        ``id`` column.
         """
         self._last_insert_id = None
         self._returning_row = None
@@ -442,10 +451,10 @@ class PostgresCursor:
         query = self._rewrite_insert_or_ignore(query)
         query = self._convert_placeholders(query)
 
-        # Append RETURNING id if not already present
+        # Append RETURNING * if not already present; id is picked from the row
         upper_q = query.strip().upper()
         if 'RETURNING' not in upper_q:
-            query = query.rstrip().rstrip(';') + ' RETURNING id'
+            query = query.rstrip().rstrip(';') + ' RETURNING *'
 
         if args:
             if not isinstance(args, (tuple, list)):

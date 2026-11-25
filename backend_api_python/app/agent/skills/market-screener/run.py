@@ -19,14 +19,19 @@ LLM 只能消费别人替它算好的结论 —— 这就是「自由度太小�
 
 import json
 import os
+import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
 
 from ...log import logger
 
 from ._helpers import (select_strategy, build_report, resolve_names,
                        tech_summary, predict_one, _mood_regime,
-                       prewarm_market_klines, cross_verdict, _num_or_none)
+                       prewarm_market_klines, cross_verdict, _num_or_none,
+                       ERROR_CATEGORIES, _format_error)
 from .monitor_tags import attach_monitor   # 重点监控格（软提示，2026-11-07）
 from ._facts import (market_state as _market_state,
                      multitimeframe as _multitimeframe,
@@ -59,7 +64,8 @@ def market_state() -> dict:
     except Exception as e:
         logger.warning("[market-screener] market_state 失败: %s", e)
         return SkillResult({"error": str(e), "market_mood": "未知", "market_mood_score": None,
-                            "stock_mood": "未知", "stock_mood_score": None})
+                            "stock_mood": "未知", "stock_mood_score": None,
+                            "error_type": "API"})
 
 
 def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> dict:
@@ -137,68 +143,59 @@ def detect_patterns(codes: str, days: int = 60, params: str = None) -> dict:
 
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
-        "★ 输出壳（硬约束）：用户只关心 买什么 / 什么价位买 / T+N 能不能赚 / 走坏了能不能全身而退。"
-        "禁止长篇分析，表格行数随推荐数浮动，正文保持精简，必须用下表（**表头逐字，列不许删改**）：\n"
-        "## 买什么（N 只，N=实际符合条件数；可空，0 只是常态输出；可加一句共性提示如「均需放量突破再买，勿追现价」）\n"
+        "正文精简，表头逐字保留，N=实际符合条件数，可为 0：\n"
+        "## 买什么（N 只）\n"
         "| 代码 | 现价 | 买点价位 | 止损价(触发口径) | 目标价/止盈条件 | 仓位 | T+1/T+3/T+5 | 一句话理由 |\n"
         "每只一行；保留 6 位代码 + 股票名称；"
         "★ 进表资格：主线龙头 / 弱转强确认 / 放量突破 三类强信号至少一类，且加分项 ≥2；"
-        "**推荐重心 = 早段确认区**（当日涨幅 <5% 的弱转强/回踩企稳/放量突破早段——止损近、深亏最低档，"
-        "宁在早段挖十只，不追一只已拉升的；>8% 大阳/追击档保留但非主力）；"
-        "早段须叠加 **amp<8% 或放量突破确认**——早段里 amp≥8% 的『看似回踩实为高波动』是雷区"
-        "（配对 t=-4.26 全表最差），仅放量突破确认可进；"
+        "推荐重心为当日涨幅 <5% 的弱转强/回踩企稳/放量突破早段；>8% 追击档保留但非主力；"
+        "早段 amp≥8% 仅放量突破确认可进；"
         "**资金是资格级证据**，两档处理：①**否决**——资金连续方向为负（3~5 日窗口逐日净流出）或单日脉冲后回吐"
         "= 资格线过了也不进表；②**降权**——3~5 日累计为负（**归一后显著才算数**：噪声带内的小负不降权，按 "
         "net_pct_of_amount/fund_circ_ratio 判）但当日/近段资金回流（弱转强配套）= 只给试仓/深回踩/条件单，不给追价。"
-        "**窗口权重（超短线）**：当日抢筹/分段吸筹（时机）＞ 3~5 日埋伏（资格）＞ 20 日（语境：脉冲识别/拉高出货/持有周期，"
-        "不作独立否决或降权，20 日大额流入反而是迟到信号）；资金流入是确认项，不独立构成买入理由；"
+        "当日资金看时机、3~5 日看资格、20 日作语境，不因 20 日单独否决或降权；"
+        "资金流入是确认项，不独立构成买入理由；"
         "无确认超跌反抽（接刀）与 B 级机会无资格进表，没有 A+ 就写空仓卡，禁止矮子里拔将军。\n"
-        "★ 买点/止损写**关键位置**并注明是哪个位置（回踩 MA10 11.62 / 区间下沿 11.30 / "
-        "前低 11.05 / 缺口上沿 11.40 任选其一，不要求是均线），"
-        "禁止用 VWAP/分时均价当买点；"
-        "★ 止损三条硬口径：① 宽度取 **min(amp_avg5, 8%)**：≥日均振幅量级防噪声（1.3% 止损配 8% 振幅是白送），"
-        "止损不得越过 -8% 深亏线（amp≥8% 的票封顶 8%、靠仓位控风险）；"
+        "★ 依据原始资金、量能和位置证据判断资格；**缺证据=坏证据**"
+        "（gaps 与报告未引用的关键判据按最不利档读，从满卡 analyzed 补到证据才解除）；"
+        "关键证据缺失或相互矛盾时须说明，不得编造或把未知当作已确认。\n"
+        "★ 买点/止损写关键位置及位置名，不限定均线；禁止用 VWAP/分时均价当买点；"
+        "★ 止损宽度取 **min(amp_avg5, 8%)**，amp≥8% 时封顶 8%、靠仓位控风险；"
         "② 落点在结构位外侧 + 缓冲，避开当日已被穿过的价位；"
         "③ 必须写触发口径「盘中触价」或「收盘确认」（动量/接力仓默认盘中触价）。"
-        "格式「跌破 X（盘中触价）」/「不跌破 X」；无合格止损价不得进表。\n"
-        "★ 必须有止盈：目标价（上方压力位/涨幅预期）或止盈条件（触板/冲高滞涨/破均价）写在"
-        "「目标价/止盈条件」列，用「卖出/落袋」措辞（「兑现」一词留给持仓处置）；"
-        "只有止损没有目标的票不进表——复利靠兑现滚出来，不靠拿着。\n"
+        "无合格止损价不得进表。\n"
+        "★ A股新买入股份买入当日不可卖出，触发止损后最早下一交易日处置；"
+        "跳空或跌停可能无法按触发价成交，不保证最大损失。"
+        "每个分支按实际成交价计算风险，计划中按买价上限计算"
+        "(买入价-止损触发价)/买入价。买点明确「不高于 X」，止损写「跌破 X"
+        "（盘中触价）」或「跌破 X（收盘确认）」，目标写具体价格。\n"
+        "★ 必须有止盈目标或条件，写在「目标价/止盈条件」列，用「卖出/落袋」措辞；"
+        "无目标不进表，「兑现」留给持仓处置。\n"
         "★ 仓位档写在「仓位」列：空仓 / 试仓（≤1成） / 标准（2~3成） / 重仓（3~5成，仅 A+："
-        "三类强信号齐 + 无证据冲突）；小仓试错不写——B 级机会赚了没意义、亏了照样磨损。\n"
+        "三类强信号齐 + 无证据冲突）；不写小仓试错。\n"
         "T+N 填 看多/中性/看空/未知；中性须有充分证据支持，"
         "证据不足、无法相互验证或存在未解决的矛盾时填未知，并简述缺口或冲突；"
-        "三个周期全中性还进「买什么」= 把未知包装成中性凑数，禁止；"
-        "市场及其他综合判断也须区分中性和未知，不得把缺失或冲突当中性。\n"
+        "三个周期全中性不得进表；市场及其他综合判断也须区分中性和未知。\n"
         "★ **全文用中文白话**，禁止输出 near_support / rank_cut 等字段名。\n"
         "不另设「不买/观察」栏目，也不整表罗列未推荐标的；排除项按**类别各 ≤3 只**一行证伪"
-        "（资金不过关 / 高波动高位 / 接刀等各一类，例：「资金背离不追：688090、301112」），单类超 3 只只写前 3；"
-        "N=0 时写空仓卡：「## 空仓卡  今日无符合标的，空仓等待：<一行『今天别打』的证据>」——"
-        "弱市空仓等待本身就是复利，禁止硬凑。\n"
+        "（资金不过关 / 高波动高位 / 接刀等）；"
+        "N=0 时写「## 空仓卡  今日无符合标的，空仓等待：<一行证据>」，禁止硬凑。\n"
         "## 风险与证伪（≤3 行）\n"
         "指标罗列、长篇分析不进正文；尾注可留**一行**（来源/口径/漏斗计数，供 claims 追责与口径披露）。"
         "保留代码+名称+看多看空+跌破 X（喂 claims）。"
     ),
     "STEPS": "run_skill 一次即可交付；起手不要 get_hot_sectors / get_market_overview（market 已在本结果）；"
+             "检查 preview_note 和候选行数：若 analyzed_rank 被裁剪或行数少于 funnel.deep_n，"
+             "或 candidate_integrity.ok=false，必须说明候选不完整，不得据此生成买入推荐；"
+             "缺少满卡证据时不得编造。"
              "禁止 search_tools / read_skill / get_dragon_tiger / 二次 run_skill / 逐只 quote；"
-             "**禁止 agent_get_kline / get_index_kline**——analyzed_rank 已给 ma5/ma10/ma20/hi20/lo20 "
-             "绝对值，买点/止损/压力据此直接算，不需要原始 K 线；"
+             "禁止 agent_get_kline / get_index_kline；价位从 analyzed_rank 读取；"
              "funnel.baseline=本次入选只数（选人层唯一出口，全部入 deep）；"
              "funnel.streak_surge_tagged/early_accum_tagged=闸门打标保留的票（挂 flags，不放弃）；"
              "funnel 其余键（pool_raw/deep_n/zt_ref_n/flow_invalid_n/short_of_limit 等）只用于复盘漏斗与取数完整性",
     "limit_up_ref": "涨停参考清单（**不进 deep 分析**）：每项 {code,name,board,track,t_first,dup_n,reason}。"
                     "决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；"
-                    "它只回答「该板块此刻几只封板、几点封的、几个板块同时选中」——"
-                    "用来判断**未涨停票所在板块**的强弱与资金共识。"
-                    "**接力分层**（接力=次日买，不是今天追板）：**只在板块强周期接力**"
-                    "（弱周期接力就是坑：孤板/炸板/资金退潮/断板断层 → 一律不接，强确认也不给；"
-                    "判据见 strategy-rules §11.5）；仅主线龙头+强确认（连板/厚封/题材核心"
-                    "+次日弱转强或放量突破确认）可给次日接力条件单，且**给单前必须先 "
-                    "inspect_stock(code, deep=True) 取满卡证据**（封单/龙虎榜/资金/位置，证据不齐不给单）；"
-                    "标注「接力档：仓位上限≤2成、宽止损、失败即走」；"
-                    "早盘板/无强确认接力默认不接（5m 小样本：早盘板接力深亏 62.5%、连板 80%）；"
-                    "无确认接力一律不写入「买什么」，也不要整表罗列清单；"
-                    "可作为「该板块已有多只封板」的旁证出现。",
+                    "它仅作板块情绪旁证，不是可买清单；未进入 deep 的票证据不足，不得给买入单。",
     "monitor": "回测经验提示（1m全样本2026-04-15~11-02，134个交易日、deep可成交n=1862；"
                "弱市市值按当日指数分组跌幅<0、80亿元分界；仅作软证据，不是排除令）："
                "将 analyzed_rank / picked_detail / limit_up_ref 的 `monitor` 内容并入对应的题材、"
@@ -215,11 +212,9 @@ _REPORT_GUIDE = {
                "不筛盘、不自动优先大盘股。早盘信号触板率低于午盘，但盘中上冲和大回撤比例都更高；"
                "确认支撑、回踩承接和量价延续，不能仅按时段加分。"
                "limit_up_ref只作板块情绪旁证，不是可买清单；不得仅凭早封、连板或午后封板推导接力结论。",
-    "buyable": "**只在盘中此刻（strategy=intraday）生效**：rt.limit_up=true 或 rt.limit_down=true → 禁止进可买表，无需另列排除表；"
-               "盘后/尾盘一律放行——封板/跌停是事实不是排除令，可进「买什么」但要写明「当日已封板」"
-               "与次日买点（一字板风险：需等开板或回踩支撑，不追集合竞价）；接不接由你的逻辑决定，须给理由；"
-               "rt.buyable=false 是 deep 阶段的最终防线（选人层不再做池层预排除）；"
-               "stale_bar 不影响此条",
+    "buyable": "buyable=unknown 表示行情缺失，不能推断可买；盘中 buyable=false 不得写成可立即成交。"
+               "封板票不进入本次 deep，limit_up_ref 仅作参考；不得把缺少满卡的参考票写成买入单。"
+               "跌停后的接刀机会不进买入表；stale_bar 不代表实时可成交性。",
     "seal": "封板结构（只描述今天封得怎么样，**不是可买性、不是分数**）：tag=none 未封板 / "
             "one_word 一字·全天封死 / open0 0开板非一字 / open1_2 开板1~2次回封 / "
             "open3_5 开板3~5次 / open6p 开板≥6次 / unknown 缺实时或池里无该票；"
@@ -233,7 +228,8 @@ _REPORT_GUIDE = {
     "entry_exit": "★ **顺序不能反，买点不是模板**：\n"
                   "① 先定姿态（读 market 的**两档情绪**）：大盘档 market_mood 偏强 + fund_flow_days "
                   "净流入 → 可放宽，允许给突破/追价买点、容忍较高乖离、推荐只数可多；cautious=true "
-                  "或 market_mood 偏弱 → 收紧，只给回踩买点、买点压到更深的支撑、宁可少给；"
+                  "或 market_mood 偏弱 → 收紧，只给回踩条件单、买点压到更深的支撑、宁可少给；"
+                  "需突破确认的票须先放量突破再回踩企稳，两项未全部发生不得买入；"
                   "中性环境按个股自身结构定。**个股档 stock_mood 另算一票**：它衡量当日赚钱效应"
                   "（涨跌停比/炸板率），stock_mood 偏弱时即使大盘强也不追高——两档背离是大盘强、"
                   "个股难做，按收紧执行。姿态是**每次按环境算**的，不是固定偏保守。\n"
@@ -244,35 +240,43 @@ _REPORT_GUIDE = {
                   "同一个位置在强环境可直接挂、弱环境要打折（往下一档）。\n"
                   "③ 止损=该位置失效价（跌破 X）。买点必须高于止损；无明确止损价不得进「买什么」。"
                   "走坏=收盘破止损或量价净额转净流出。\n"
-                  "④ **盘后交付默认给「条件单」而不是一口价**：次日 09:30-10:00 观察，三条同时成立才买——"
+                  "④ **盘后交付给「条件单」而不是一口价**：弱市回踩企稳确认后买；"
+                  "其他环境的突破条件单次日 09:30-10:00 观察，三条同时成立才买——"
                   "(a) 突破 D0 最高价（rank 的 hi_today）；(b) 早盘成交明显放大（不是小幅放量）；"
                   "(c) 强于大盘（同期指数不涨它在涨）。任一条不成立 → 当天放弃，不追不补。"
-                  "「早盘涨了才追」只看涨幅无效 ⇒ 要的是**放量突破**，不是单纯上涨。"
-                  "买点列写「触发条件 + 触发后成交价上限（不高于 X）」；现价已高于上限的票写「等回踩到 X 再确认」。",
+                  "只看涨幅无效，须放量突破。"
+                  "买点列写「触发条件 + 触发后成交价上限（不高于 X）」。"
+                  "每个回踩分支或突破分支单独计算风险；观察窗口内条件不成立当天放弃该分支。"
+                  "按条件买价重新判断支撑压力：旧压力低于买价时不再是上方压力，也不自动变成支撑。"
+                  "前一交易日量比不代表次日已确认；次日量能须与历史同刻比较，量比倍数不是涨幅倍数。"
+                  "盘前以 selection_snapshot 为选人时点、run_started_at 为运行时点，明确执行日；"
+                  "选人时点不代表其后获取的所有证据具有相同时刻。",
+
     "strength_rule": "★ 强度是**加减分项，不是准入闸**——在同一份名单里横向比强弱来排序，不是一刀切。"
                      "**加分**："
-                     "① ret5_pct 高**且 zt_streak=1**（1 板上攻，实测该组净收益 +3.38%、触板率 50%，是最好的一组）；"
+                     "① ret5_pct 高且 zt_streak=1（1 板上攻）；"
                      "② vol_ratio ≥1.5（D0 放量再启动）；"
-                     "③ zt10 ≤2（10 日内涨停少，没在高位反复透支）；④ dist_ma5_pct 温和（几天内没翻倍）；"
-                     "⑤ ret5_pct 偏低**且 zt_streak=0**（回调充分、无连板压顶，实测 +2.25%、深亏率 1%，属最好的一档）。"
-                     "**减分**：ret5_pct 高**且 zt_streak ≥2**（涨得多还连板=位置透支，实测 −4.39%、深亏率 44%）、"
-                     "ret5_pct 高**且 zt_streak=0**（涨了不少却没板=上行乏力，实测 −1.16%，别当强势加分）、"
+                     "③ zt10 ≤2；④ dist_ma5_pct 温和；"
+                     "⑤ ret5_pct 偏低且 zt_streak=0，仅在弱转强确认后加分；无确认超跌反抽不加分、不进表。"
+                     "ret5_pct 高且 zt_streak ≥2 是高波动档，收紧仓位、触发和止损，不单独减分或排除。"
+                     "**减分**："
+                     "ret5_pct 高且 zt_streak=0（涨了不少却没板，别当强势加分）、"
                      "zt10 ≥3（高位反复透支）、vol_ratio <1（缩量却给强度结论）。"
                      "**缩量回踩是减分不是加分**。"
-                     "★ 位置透支看三件套（dist_ma20_pct / pos20 / ret5_pct）：三项都高 = 深亏高发区（实测该档 −3.51%、"
-                     "深亏率 35%）；三项都低 = 位置干净（历史样本 +3.55%、深亏率 1%，可关注但非必反转）。"
+                     "★ 位置透支看 dist_ma20_pct / pos20 / ret5_pct：三项都高为深亏高发区，"
+                     "三项都低为位置干净但非必反转。"
                      "位置与资金流入流出同为核心证据，不得用位置或新增提示稀释、替代资金判断；"
                      "资金优先于量能条件，量能是重要评估条件、不是闸，不得单凭量比否决或覆盖资金判断。"
                      "rank 已给合成档 **loc**（hot=透支 / cool=位置干净 / normal），见 location 条。"
                      "加分项不足 2 条的不进「买什么」，不另列未推荐名单；"
                      "**数量不是考核项**：弱市给 1 只也合规，凑数才是错的；环境转强可多给，但要写明成立的是哪几条。",
-    "stance_rule": "禁止「一律回踩均线」，也禁止**把 rank 的 sup.px 直接当买点**——sup 只是「现价下方"
+    "stance_rule": "禁止不看环境机械套用「回踩均线」，也禁止**把 rank 的 sup.px 直接当买点**——sup 只是「现价下方"
                    "最近的位置」，照抄的结果是三只票买点全在现价下方、当天一只也买不到。"
-                   "若所有票的买点都等于 sup.px 或都写成 MA5/MA10，说明没读环境、在用模板。"
+                   "若所有票都直接照抄 sup.px 或机械写成 MA5/MA10，说明没读个股结构。"
                    "强环境（market_mood 偏强 + fund_flow_days 净流入）该给的是「突破 res 追」或「不破 sup 持有」；"
                    "弱环境才把买点压到 sup 下方一档，并且只留能当日成交的。"
                    "**买点形态要跟着强度走**：强度加分项多的给「突破 hi_today 追」，加分项少的只给回踩；"
-                   "全名单买点长得一模一样（全回踩或全突破）同样是没排序。",
+                   "弱市统一要求回踩确认时，允许全部使用回踩条件单，但仍须按个股证据排序。",
     "horizon": "表内只写 T+1/T+3/T+5（词表：看多/中性/看空/未知）；T+10/T+20 不写。"
                "每个周期独立判断：中性是有充分证据支持的明确结论，不是缺省值；"
                "数据不足、无法相互验证或证据矛盾且无法消解时为未知，说明缺口或冲突；"
@@ -294,11 +298,16 @@ _REPORT_GUIDE = {
               "盘中量能确认项用它）/**flow_rel**（全天：净占比−大盘净占比，百分点；资金为首要评估维度，见 fund_trend）"
               "/**flow_rel_st**（分时同口径）/dist_ma5_pct/dist_ma20_pct/amp_avg5（近5日平均振幅%，止损宽度基准）/sr_gap_pct（支撑-压力间距%）"
               "/**flags**（闸门打标命中原因：连板放量/吸筹不足/已过度拉升——高波动档护栏证据，不是排除令；缺键=无命中）"
+              "/**gaps**（关键资格判据缺列清单：chg_pct/vol_ratio/amp_avg5/sr_gap_pct/pos20/sup/"
+              "net5d_wan/ratio5d_pct/streak_dir/streak_days/sign_5d/flow_day；"
+              "缺列=坏证据，缺哪项就按那项判据的最不利档读，从满卡 analyzed 补到证据才解除；缺键=证据齐全）"
               "/regime（**日线**形态标签，动作映射见 regime 条）"
               "/shape（**分时**形态标签，见 intraday_shape 条；与 regime 并列、互不覆盖，用来相互印证）"
               "/rs_d0/rs_5d（相对上证超额%，见 regime 条）"
               "/loc（**位置透支分档** hot/cool/normal，见 location 条）"
-              "/seal/seal_tier/seal_pct/net5d_wan/net20d_wan/streak_dir；"
+              "/seal/seal_tier/seal_pct/net5d_wan/net20d_wan/streak_dir/streak_days/sign_5d/"
+              "flow_day（最近资金日线日期）/flow_last_day_wan（该日净额）/"
+              "flow_today_wan（实时当日净额）；"
               "20 日位置直接读 pos20（0=区间最低、100=最高，无需自算）；"
               "满卡 tech.support.supports/resists 是全量候选（各 ≤4/≤3 条），要横向比多个位置才看它；"
               "**缺键即正常**：无 limit_up=未涨停、无 buyable=可买、无 stale_bar=日线未滞后、无 risks=无风险、"
@@ -327,8 +336,14 @@ _REPORT_GUIDE = {
                   "量能与资金冲突时以资金为准，量比<2 不构成否决；不因新增位置、形态或回测提示而降权；"
                   "资金持续净流出或脉冲后回吐是明确的降权/否决依据，资金流入是确认项、不是独立买入信号；"
                   "按数据口径综合当日流向和近5/20日连续性，持续流出或脉冲后流出应明确影响排序与风险判断，"
-                  "不能仅凭低位、形态或统计提示抵消；资金数据缺失须标明，不能当作零或流入。"
-                  "资金看多日总体：flow.recent（近5/20日累计、连续方向、逐日符号、剔除最大单日）≫ 当日 net_wan；"
+                  "不能仅凭低位、形态或统计提示抵消；资金数据缺失须标明，不能当作零或流入，"
+                  "缺了就当资金未转向读。"
+                  "资金资格看近3~5日连续性，入场时机看当日抢筹和分段吸筹，20日只作语境；"
+                  "flow.recent 包含近5/20日累计、连续方向、逐日符号和剔除最大单日；"
+                  "历史资金日线与当日实时资金分开读：按 flow_day 标注日线日期，"
+                  "盘中日线可能停在前一交易日，不得把它冒称当日；"
+                  "sign_5d 的 + 包含零，最新日是否流入须核对 flow_last_day_wan；"
+                  "即使与选人快照同日，也不能证明取数同刻；关键数据缺失或冲突时说明不确定性。"
                   "单日大额流入不等于趋势，连续3日以上同向才算趋势；剔除最大单日后仍为正才是普遍承接。"
                   "★**跨票比量级必须归一**（2026-11-24）：绝对净额只读方向/连续性；量级影响力用 "
                   "net_pct_of_amount（净额÷成交额=当日边际压力，**换手率进这个口径**）与 "
@@ -409,6 +424,8 @@ _REPORT_GUIDE = {
 
 # 进 deep 的最终候选数（保底轨上限 25；N 与满卡的权衡曲线见 tmp/probe_budget_split_20261101）
 _FUNNEL_DEEP_N = 45
+_MIN_DELIVERY_CARDS = 5
+_FINE_CARD_CAP = 10             # 两轮协议：细筛单次满卡上限（~2k 字符/张，稳在观察值闸内）
 _DEEP_WORKERS = 16              # deep 并发：45 只名单 ≈3 波
 _DEEP_BUDGET_CHARS = 44500      # observation 闸 45000 内留 500；超出由 _pack 实测回退减卡
 _DEEP_BUDGET_ENV = "QD_SCREENER_DEEP_BUDGET"
@@ -463,6 +480,26 @@ def _delivery_key(card: dict) -> tuple:
             max(0.0, _v("ret_5d_pct", 99.0)))
 
 
+# 关键资格证据键（固定序=gaps 输出序）。这些判据缺列时按坏读：
+# 代码只把「真缺」变成可复测事实，不做闸；读法见 _REPORT_GUIDE["fields"]/["OUTPUT_FORM"]。
+# 刻意排除「缺键即正常」的约定字段（res/chg_prev_pct/vr_rel/flow_rel/flow_rel_st/
+# vr_rel_st/regime/seal/zt_streak/hi_today/confidence 等，口径见 fields 缺键清单）。
+_EVIDENCE_KEYS = (
+    "chg_pct",       # 当日涨幅：早段/资格判据
+    "vol_ratio",     # 量比：缩量/放量确认判据
+    "amp_avg5",      # 止损宽度基准（min(amp_avg5, 8%)）
+    "sr_gap_pct",    # 支撑-压力间距：资格判据
+    "pos20",         # 位置透支判据（高位排除标准要用）
+    "sup",           # 现价下方最近结构位：缺=无承接证据
+    "net5d_wan",     # 资金资格核心
+    "ratio5d_pct",   # 资金显著度（归一判据，区分噪声带）
+    "streak_dir",    # 资金连续方向：逐日否决判据
+    "streak_days",
+    "sign_5d",       # 5日逐日符号
+    "flow_day",      # 资金新鲜度锚（口径日期）
+)
+
+
 def _rank_row(card: dict) -> dict:
     """把一张满卡压成一行横向可比字段（只搬已有值，不做新计算）。
 
@@ -479,7 +516,9 @@ def _rank_row(card: dict) -> dict:
     默认值不写（limit_up=False / stale_bar=False / risks=0 / buyable=True / 无 res /
     seal=none 未封板 / confidence=1.0 满证据 / zt_streak=0 无连板 / 空 name /
     hi_today==hi20 当日最高就是 20 日最高），缺键即正常，
-    口径见 _REPORT_GUIDE["fields"]。limit_up 与 seal 冗余（seal 存在即封过板），
+    口径见 _REPORT_GUIDE["fields"]。唯一例外：关键资格判据缺列时写 `gaps`
+    （缺键清单，序=_EVIDENCE_KEYS；证据缺省按坏读，打标不是闸）。
+    limit_up 与 seal 冗余（seal 存在即封过板），
     只在 True 时出现。
     """
     rt = card.get("rt") or {}
@@ -521,7 +560,14 @@ def _rank_row(card: dict) -> dict:
         "res": (sup.get("resists") or [None])[0],
         "net5d_wan": rec.get("net_5d_wan"),
         "net20d_wan": rec.get("net_20d_wan"),
+        "ratio5d_pct": rec.get("ratio_5d_pct"),
         "streak_dir": rec.get("streak_dir"),
+        "flow_day": rec.get("as_of_day"),
+        "flow_last_day_wan": rec.get("last_day_net_wan"),
+        "sign_5d": rec.get("sign_5d"),
+        "streak_days": rec.get("streak_days"),
+        "flow_today_wan": (card.get("flow") or {}).get("net_wan"),
+        "flow_risks": card.get("flow_risks"),
         "flow_rel": (card.get("flow") or {}).get("flow_rel"),
         "flow_rel_st": st.get("flow_rel_same_t"),
         "regime": tech.get("regime"),
@@ -549,7 +595,9 @@ def _rank_row(card: dict) -> dict:
         row.pop("confidence", None)
     if row.get("zt_streak") == 0:
         row.pop("zt_streak", None)
-    if rt.get("buyable") is False:
+    if rt.get("buyable") is None:
+        row["buyable"] = "unknown"
+    elif rt.get("buyable") is False:
         row["buyable"] = False
     if rt.get("limit_up"):
         row["limit_up"] = True
@@ -567,6 +615,11 @@ def _rank_row(card: dict) -> dict:
     _cv = (cross_verdict(tech.get("regime") or "低位蓄势", _sh) or {}).get("verdict")
     if _cv and _cv != "neutral":
         row["cross"] = _cv
+    # 缺证据=坏证据（2026-11-25 用户定调）：关键资格判据缺列时打标 gaps。
+    # 是证据完整性标签不是闸——LLM 可用满卡 analyzed 补证推翻；证据齐全时不出现。
+    _gaps = [k for k in _EVIDENCE_KEYS if row.get(k) is None]
+    if _gaps:
+        row["gaps"] = _gaps
     return row
 
 
@@ -648,8 +701,8 @@ def _full_card_quota(head: dict, cards: list, rank: list, budget: int) -> int:
 
 
 def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
-                 with_patterns: bool = True, with_mtf: bool = False,
-                 budget: int = None) -> dict:
+                 with_patterns: bool = True, with_mtf: bool = "auto",
+                 budget: int = None, min_cards: int = 0) -> dict:
     """对指定股票批量汇总全部可用证据，并按标定模型的 P(次日涨) 排序。
 
     这里**没有**主观评分梯形：唯一的数字是 _helpers.predict_one 给出的已标定模型分（满卡 `score`）。
@@ -660,10 +713,16 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         limit: 最多分析几只，默认 8
         with_flow: 是否取资金流
         with_patterns: 是否识别 K 线形态
-        with_mtf: 是否取多周期结构（需要分钟源，更慢）
+        with_mtf: 是否取多周期结构（需要分钟源，更慢）。默认 "auto" 表示根据市场状态自动决定：
+            - 弱势市场（mkt_score<40）→ True（扩大视野，寻找反转机会）
+            - 强势市场（mkt_score>=70）→ False（关注短线快打，不需多周期）
+            - 中性市场（40<=mkt_score<70）→ True（常规分析）
+            显式传入 bool 值则按值执行（True/False）。
         budget: 整份返回值的字符预算（含信封+rank+满卡）；默认 QD_SCREENER_DEEP_BUDGET
             （29500）。run() 会把外层 market/hints/funnel 的体量与随后追加的 src 标注
             一并扣掉再传，使「最终交付」而不是「本函数输出」受预算约束。
+        min_cards: 最少保留的满卡数，不超过实际分析数；大于 0 时允许暂时超过预算，
+            由 run() 的最终交付阶段压缩或明确报错。
 
     返回:
         dict: analyzed_rank[]=**全部票**的横向可比字段（code/name/
@@ -713,6 +772,19 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     strategy = select_strategy()
     errors: list = []
     missing: list = []
+    
+    # 根据 with_mtf 参数决定实际行为
+    if with_mtf == "auto":
+        try:
+            # 获取市场情绪判断是否需要 MTF
+            mkt_info = _market_state() if 'mkt_info' not in locals() else mkt_info
+            mkt_score = float(mkt_info.get("market_mood_score", 50) or 50)
+            mtf_enabled = (mkt_score < 70)  # 中性及以下 → 开启 MTF
+        except Exception:
+            mtf_enabled = True  # 默认开启
+    else:
+        mtf_enabled = bool(with_mtf)
+    
     code_list = [c.strip() for c in str(codes or "").split(",") if c.strip()][:max(1, int(limit or 8))]
     if not code_list:
         return SkillResult({
@@ -760,10 +832,10 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         try:
             bars = fetch_kline(code, days=120)
         except Exception as e:
-            miss.append(f"日线异常:{type(e).__name__}: {e}")
+            miss.append(_format_error(code, "DATA_SOURCE", f"日线异常 {type(e).__name__}: {e}"))
             bars = []
         if not bars:
-            miss.append("日线缺失")
+            miss.append(_format_error(code, "INSUFFICIENT_DATA", "日线缺失"))
             row["tech"] = None
             row["patterns"] = []
             row["_bars"] = []
@@ -773,7 +845,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         if ts.get("ok"):
             row["tech"] = {k: v for k, v in ts.items() if k != "ok"}
         else:
-            miss.append(f"技术指标缺失:{ts.get('reason')}")
+            miss.append(_format_error(code, "INSUFFICIENT_DATA", f"技术指标缺失:{ts.get('reason')}"))
             row["tech"] = None
         row["_evidence"]["tech"] = bool(ts.get("ok"))
 
@@ -783,7 +855,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                 row["patterns"] = _detect_patterns(bars)
                 row["_evidence"]["patterns"] = True
             except Exception as e:
-                miss.append(f"形态识别:{type(e).__name__}: {e}")
+                miss.append(_format_error(code, "PARSING", f"形态识别 {type(e).__name__}: {e}"))
                 row["_evidence"]["patterns"] = False
 
         row["flow"] = None
@@ -793,10 +865,10 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                 fs = flow_summary(code)
                 row["flow"] = fs
                 if not fs.get("ok"):
-                    miss.append(f"资金流缺失:{fs.get('reason')}")
+                    miss.append(_format_error(code, "INSUFFICIENT_DATA", f"资金流缺失:{fs.get('reason')}"))
                 row["_evidence"]["flow"] = bool(fs.get("ok"))
             except Exception as e:
-                miss.append(f"资金流异常:{type(e).__name__}: {e}")
+                miss.append(_format_error(code, "API", f"资金流异常 {type(e).__name__}: {e}"))
                 row["_evidence"]["flow"] = False
 
         # 分时（同刻）大盘校准：目标日 T 前 vs 前 5 个交易日同一时刻，个股与大盘同源
@@ -813,9 +885,10 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             try:
                 mtf = _multitimeframe(code)
                 row["mtf"] = mtf
-                miss.extend(f"多周期:{m}" for m in (mtf.get("missing") or []))
+                miss.extend(_format_error(code, "INSUFFICIENT_DATA", f"多周期:{m}")
+                            for m in (mtf.get("missing") or []))
             except Exception as e:
-                miss.append(f"多周期异常:{type(e).__name__}: {e}")
+                miss.append(_format_error(code, "DATA_SOURCE", f"多周期异常 {type(e).__name__}: {e}"))
 
         row["_bars"] = bars
         return row
@@ -973,12 +1046,13 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         if n < len(analyzed):
             h["analyzed_note"] = (
                 f"analyzed 只含前 {n} 只满卡（按交付预算裁剪），全部 "
-                f"{len(analyzed)} 只的横向可比字段在 analyzed_rank；需要某只的满卡用 "
-                f"inspect_stock(code)")
+                f"{len(analyzed)} 只的横向可比字段在 analyzed_rank；"
+                "未交付的满卡证据不得猜测。")
         return {**h, "analyzed_rank": rank, "analyzed": analyzed[:n]}
 
-    keep_n = _full_card_quota(head, analyzed, rank, _b)
-    while keep_n > 0 and _dumps_len(_pack(keep_n)) > _b:
+    minimum = min(len(analyzed), max(0, int(min_cards)))
+    keep_n = max(minimum, _full_card_quota(head, analyzed, rank, _b))
+    while keep_n > minimum and _dumps_len(_pack(keep_n)) > _b:
         keep_n -= 1
     return SkillResult(_pack(keep_n))
 
@@ -1168,17 +1242,248 @@ def _safe_market() -> dict:
         return {}
 
 
+def _delivery_sizes(out: dict) -> tuple:
+    """Measure the preview and the observation produced by the existing runner."""
+    from ...scripts.skill_run import _preview_limit
+    from ...tools._base import ToolResult
+
+    preview = json.dumps(out, ensure_ascii=False, default=str)
+    preview_limit = _preview_limit()
+    limit = int(os.getenv("QD_MAX_OBSERVATION_CHARS", "45000"))
+    job = os.getenv("QD_SKILL_JOB_DIR", "")
+    if job:
+        full_path = str(Path(job) / "result.json")
+    else:
+        full_path = str(Path(__file__).resolve().parents[4] / "tmp" / "skill_output"
+                        / "00000000_000000_market-screener.json")
+    envelope = {
+        "ok": True, "name": "market-screener", "fn": "run",
+        "next_action": "直接写结论；禁止 read/grep full_path、activate_tools、bash/python 重算",
+        "result": preview, "full_path": full_path,
+        "elapsed_s": 999999999999999.0, "job_dir": job,
+    }
+    return len(preview), preview_limit, len(ToolResult.from_raw(envelope).to_str()), limit
+
+
+def _delivery_fits(out: dict) -> bool:
+    preview_size, preview_limit, observation_size, observation_limit = _delivery_sizes(out)
+    return (preview_size <= preview_limit
+            and (observation_limit <= 0 or observation_size <= observation_limit))
+
+
+def _compact_delivery(out: dict, min_cards: int = 0) -> dict:
+    """Preserve the complete ranking and required cards within the delivery budget."""
+    cards = out.get("analyzed")
+    if min_cards > 0 and (not isinstance(cards, list) or len(cards) < min_cards):
+        raise RuntimeError(f"选股结果缺少满卡，要求至少 {min_cards} 张；不得推荐或加入自选。")
+    if _delivery_fits(out):
+        return out
+    notes = []
+
+    def note(message: str) -> None:
+        notes.append(message)
+        out["delivery_note"] = "；".join(notes) + "。缺失的证据和解释不得猜测。"
+
+    if isinstance(cards, list) and len(cards) > min_cards:
+        original_count = len(cards)
+        notes.append("")
+        while len(cards) > min_cards:
+            cards.pop()
+            removed = original_count - len(cards)
+            notes[-1] = f"省略{removed}张满卡"
+            out["analyzed_note"] = f"交付预算只容纳{len(cards)}张满卡；缺失证据不得猜测。"
+            out["delivery_note"] = "；".join(notes) + "。缺失的证据和解释不得猜测。"
+            if _delivery_fits(out):
+                return out
+
+    boards = out.get("boards")
+    if isinstance(boards, dict) and isinstance(boards.get("picked"), list):
+        picked_boards = boards["picked"]
+        if all(isinstance(board, dict) for board in picked_boards):
+            duplicates = [
+                tier for tier in ("main", "reserve")
+                if isinstance(boards.get(tier), list)
+                and json.dumps(boards[tier], ensure_ascii=False, default=str)
+                == json.dumps([board for board in picked_boards if board.get("tier") == tier],
+                              ensure_ascii=False, default=str)
+            ]
+            for tier in duplicates:
+                del boards[tier]
+            if duplicates:
+                note("重复的板块分组已省略，按picked的tier读取")
+                if _delivery_fits(out):
+                    return out
+
+    removed_monitor = False
+    for key in ("analyzed_rank", "picked_detail", "limit_up_ref"):
+        for row in out.get(key) or []:
+            if isinstance(row, dict) and "monitor" in row:
+                del row["monitor"]
+                removed_monitor = True
+    if removed_monitor:
+        note("省略回测监控提示")
+        if _delivery_fits(out):
+            return out
+
+    if isinstance(boards, dict) and boards.get("picked"):
+        omitted = [key for key in ("industry", "concept") if key in boards]
+        for key in omitted:
+            del boards[key]
+        if omitted:
+            note("省略未合并板块明细，保留入选板块")
+            if _delivery_fits(out):
+                return out
+
+    flow_fields = ("net5d_wan", "net20d_wan", "ratio5d_pct", "streak_dir",
+                   "streak_days", "sign_5d", "flow_day", "flow_last_day_wan",
+                   "flow_today_wan", "flow_risks", "flow_rel", "flow_rel_st")
+    omitted_empty_flow = False
+    for row in out.get("analyzed_rank") or []:
+        if isinstance(row, dict):
+            for key in flow_fields:
+                if key in row and row[key] is None:
+                    del row[key]
+                    omitted_empty_flow = True
+    if omitted_empty_flow:
+        note("省略空资金字段，缺字段表示未知，不是零")
+        if _delivery_fits(out):
+            return out
+
+    details = out.get("picked_detail")
+    if isinstance(details, list):
+        targets = {str(row.get("code")): row for key in ("analyzed_rank", "limit_up_ref")
+                   for row in out.get(key) or [] if isinstance(row, dict) and row.get("code")}
+        remaining = []
+        moved = False
+        for detail in details:
+            target = targets.get(str(detail.get("code"))) if isinstance(detail, dict) else None
+            if target is None or any(
+                key in target and target[key] != value
+                for key, value in detail.items() if value is not None
+            ):
+                remaining.append(detail)
+                continue
+            target.update({key: value for key, value in detail.items()
+                           if value is not None and key not in target})
+            moved = True
+        if moved:
+            out["picked_detail"] = remaining
+            note("部分选人明细合并到对应候选和涨停参考，其余保留")
+            if _delivery_fits(out):
+                return out
+
+    guide = dict(out.get("report_guide") or {})
+    optional_guides = ("monitor", "fund_micro", "regime", "intraday_shape",
+                       "cross", "seal", "location")
+    omitted_guides = [key for key in optional_guides if key in guide]
+    for key in omitted_guides:
+        del guide[key]
+    if omitted_guides:
+        guide["fields"] = (
+            "analyzed_rank 是全部候选；价位、资金和量能直接按字段读取。"
+            "sup/res 是现价两侧最近关键位置；buyable=unknown 表示未知。"
+            "flow_day 是最近资金日线日期，flow_today_wan 是当日实时净额，不能混作同一时点；"
+            "sign_5d 的 + 包含零。关键证据缺失或冲突时须说明，不得猜测。"
+        )
+        out["report_guide"] = guide
+        note("省略部分历史经验及形态说明")
+        if _delivery_fits(out):
+            return out
+
+    omitted_reasons = False
+    for row in out.get("analyzed_rank") or []:
+        if isinstance(row, dict) and "reason" in row:
+            del row["reason"]
+            omitted_reasons = True
+    if omitted_reasons:
+        note("省略选人原因文本，保留打标和客观字段")
+        if _delivery_fits(out):
+            return out
+
+    # gaps 是读法加速器不是事实（缺键本身仍可见，缺列=坏证据的读法不受影响），
+    # 预算不够时最后丢它，保候选完整交付优先。
+    dropped_gaps = False
+    for row in out.get("analyzed_rank") or []:
+        if isinstance(row, dict) and row.pop("gaps", None) is not None:
+            dropped_gaps = True
+    if dropped_gaps:
+        note("省略缺列打标，缺键读法不变")
+        if _delivery_fits(out):
+            return out
+
+    rank = out.get("analyzed_rank")
+    if isinstance(rank, list) and rank and all(isinstance(row, dict) for row in rank):
+        counts = Counter(key for row in rank for key in row)
+        used = set(counts)
+        aliases = {}
+        index = 0
+        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for key in sorted(counts, key=lambda k: (-counts[k] * len(k), k)):
+            if key in ("code", "name") or counts[key] < 2:
+                continue
+            alias = alphabet[index] if index < len(alphabet) else f"@{index - len(alphabet)}"
+            while alias in used:
+                index += 1
+                alias = alphabet[index] if index < len(alphabet) else f"@{index - len(alphabet)}"
+            if len(alias) >= len(key):
+                continue
+            aliases[key] = alias
+            used.add(alias)
+            index += 1
+        if aliases:
+            out["analyzed_rank"] = [
+                {aliases.get(key, key): value for key, value in row.items()}
+                for row in rank
+            ]
+            out["analyzed_rank_keymap"] = {alias: key for key, alias in aliases.items()}
+            note("候选行短键按analyzed_rank_keymap还原字段名，未列出的键不变，值和缺失语义不变")
+            if _delivery_fits(out):
+                return out
+
+    preview_size, preview_limit, observation_size, observation_limit = _delivery_sizes(out)
+    raise RuntimeError(
+        "选股结果超过观察值预算，无法完整交付全部候选"
+        f"及至少 {min_cards} 张满卡；不得推荐或加入自选，请调整范围后重试。"
+        f"预览字符={preview_size}/{preview_limit}，观察值字符={observation_size}/{observation_limit}，"
+        f"候选数={len(out.get('analyzed_rank') or [])}。"
+    )
+
+
+def _parse_codes(codes: str) -> list:
+    """从自由文本里抓 6 位代码，去重保序；空输入返回空表。"""
+    out = []
+    for m in re.findall(r"\d{6}", codes or ""):
+        if m not in out:
+            out.append(m)
+    return out
+
+
+def _run_fine(codes: list, t0: float, ms: dict, run_started_at: str = ""):
+    """两轮协议第二轮：对粗筛短名单出满卡。无漏斗——codes 即终选，只做深度证据。"""
+    funnel = {"rounds": 2, "pipeline": "fine", "verdict": None,
+              "pool_raw": len(codes), "baseline": len(codes), "deep_n": len(codes),
+              "short_of_limit": False}
+    outer = {"selection_snapshot": {"day": None, "as_of": None}}
+    return _deep_and_deliver(codes, outer, funnel, t0, ms,
+                             coarse=False, card_floor=len(codes))
+
+
 def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
-                      t0: float, ms: dict):
+                      t0: float, ms: dict, coarse: bool = False,
+                      card_floor: int = None):
     """跑 deep_analyze 并按交付契约组装结果 —— 两条选人管线共用同一出口。
 
     收口的原因：classic 与 topdown 的差别只在「候选怎么来」；进了 deep 之后
     （预算扣减、report_guide 合流、_log_run 口径）必须完全一致，否则同一批票在
     两条管线下会得到不同交付。
+    coarse=True（粗筛轮）：交付全名单 rank、满卡全撤，附细筛指引；
+    card_floor（细筛轮）：满卡下限 = 短名单只数。
     """
     _t = time.perf_counter()
     result = deep_analyze(",".join(codes), limit=_FUNNEL_DEEP_N,
-                          budget=_deep_budget() - _dumps_len(outer))
+                          budget=_deep_budget() - _dumps_len(outer),
+                          min_cards=0 if coarse else
+                          (card_floor if card_floor is not None else _MIN_DELIVERY_CARDS))
     ms["deep"] = ms.get("deep", 0) + _elapsed(_t)
     if isinstance(result, dict):
         out = {"report_guide": result.get("report_guide", _REPORT_GUIDE), **outer}
@@ -1191,12 +1496,77 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
             _fl = (_pm.get(str(r.get("code"))) or {}).get("flags")
             if _fl:
                 r["flags"] = _fl
+        expected = set(codes)
+        actual = [str(r.get("code")) for r in out.get("analyzed_rank") or []
+                  if isinstance(r, dict) and r.get("code")]
+        missing_codes = sorted(expected - set(actual))
+        if missing_codes or len(actual) != len(expected) or set(actual) != expected:
+            out["candidate_integrity"] = {
+                "ok": False, "missing_codes": missing_codes,
+                "reason": "深度分析候选不完整或代码重复，不能据此生成推荐。",
+            }
+        _floor = 0 if coarse else min(
+            card_floor if card_floor is not None else _MIN_DELIVERY_CARDS, len(actual))
+        out = _compact_delivery(out, min_cards=_floor)
+        # ── deliverability_note（给决策层的明确买入/观望提示） ──
+        # 基于 analyzed_rank 的客观字段生成，不做主观评分，不输出“B级/买入”等主观结论。
+        # 每项依据：位置足够干净（价格距 20 日高点 <= -3%，即从高点回撤至少 3%）、
+        #           资金持续流入（net5d_wan > 0 连续 3 日无流出）、
+        #           强信号命中（patterns 含平台突破/均线支撑回踩/放量突破，配合 seal.tag 与 vr_rel 阈值）。
+        _rank = out.get("analyzed_rank") or []
+        _dn = []
+        for _r in _rank:
+            _c = str(_r.get("code") or "")
+            _price = _num_or_none(_r.get("price"))
+            _hi20 = _num_or_none(_r.get("hi20"))
+            _net5d = _num_or_none(_r.get("net5d_wan"))
+            _vr_rel = _num_or_none(_r.get("vr_rel") or _r.get("vr_rel_st"))
+            _shape = _r.get("shape") or ""
+            _flags = _r.get("flags") or []
+            _patterns = _r.get("patterns") or []
+            _seal_tag = (_r.get("seal") or {}).get("tag") or "none"
+            _nts = []
+            # 位置：距 20 日高点
+            if _price is not None and _hi20 is not None and _hi20 > 0:
+                _dist_pct = round((_price - _hi20) / _hi20 * 100, 2)
+                if _dist_pct <= -3.0:
+                    _nts.append(f"位置清洁（距20日高点 {_dist_pct}%<=-3%）")
+                else:
+                    _nts.append(f"位置偏高（距20日高点 {_dist_pct}%>-3%）")
+            else:
+                _nts.append("位置数据不足")
+            # 分时形态：冲高回落/跌破分时均价
+            if "冲高回落" in str(_shape) or "跌破" in str(_shape):
+                _nts.append("分时走势偏弱（冲高回落/跌破分时均价）")
+            elif "趋势向好" in str(_shape) or "放量" in str(_shape):
+                _nts.append("分时走势偏强（趋势向好/放量）")
+            else:
+                _nts.append("分时走势中性")
+            # 强信号：patterns + seal.tag + vr_rel
+            _pnames = [str(p.get("pattern") or "") for p in _patterns if isinstance(p, dict)]
+            _strong = any(k in ",".join(_pnames) for k in ("平台突破", "底部启动", "均线支撑回踩", "放量突破"))
+            if _strong and _seal_tag in ("one_word", "open0") and (_vr_rel or 0) >= 2.0:
+                _nts.append("强信号命中（平台突破/均线支撑回踩/放量突破 + 封板结构清洁 + 放量）")
+            elif _strong:
+                _nts.append("形态信号存在（未达强信号阈值：需 seal_tag 为 one_word/open0 且 vr_rel>=2）")
+            else:
+                _nts.append("未命中强信号形态")
+            _dn.append(f"{_c}: {'；'.join(_nts)}")
+        out["deliverability_note"] = " | ".join(_dn) if _dn else "无可分析候选"
+        if coarse:
+            # 两轮协议第一轮：满卡全撤（粗筛不需要、也避免挤兑预算），
+            # LLM 按资金资格粗筛后走 codes= 细筛轮。
+            out["analyzed"] = []
+            out["analyzed_note"] = (
+                "粗筛轮无满卡：全名单资金/量能/位置字段完整；"
+                "分批 run_skill 传 codes=\"代码,代码\"（每次 ≤10 只）取满卡，"
+                "覆盖全部候选后再判定，判定在满卡证据上做。")
         _log_run(t0, ms, funnel, out)
         return SkillResult(out)
     return result
 
 
-def _run_topdown(t0: float, ms: dict):
+def _run_topdown(t0: float, ms: dict, run_started_at: str = "", coarse: bool = True):
     """三层漏斗选人管线：大盘闸 → 板块闸 → 板块内选股 → 截断 → deep。
 
     与 classic 的差别只在选人阶段；deep 层走 `_deep_and_deliver`，一行不差。
@@ -1204,6 +1574,8 @@ def _run_topdown(t0: float, ms: dict):
     「classic 有票」，掩盖数据或阈值问题。
     """
     from . import _topdown as _T
+    run_started_at = run_started_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    snapshot = {"day": None, "as_of": None}
     funnel = {"rounds": 1, "pool_raw": 0, "baseline": 0, "baseline_hard": 0,
               "baseline_risk": 0, "deep_n": 0, "eastmoney_ok": True,
               "pipeline": "topdown", "verdict": None,
@@ -1220,13 +1592,17 @@ def _run_topdown(t0: float, ms: dict):
     except Exception as e:
         logger.warning("[market-screener] topdown 选人失败: %s", e)
         _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "selection_snapshot": snapshot, "run_started_at": run_started_at,
                 "market": mkt, "funnel": funnel,
-                "analyzed": [], "signal": "三层漏斗执行失败",
+                "analyzed": [], "analyzed_rank": [], "signal": "三层漏斗执行失败",
                 "missing": [f"topdown: {type(e).__name__}: {e}"]}
+        _out = _compact_delivery(_out)
         _log_run(t0, ms, funnel, _out)
         return SkillResult(_out)
     ms["pre_screen"] = ms.get("pre_screen", 0) + _elapsed(_t)
 
+    gate = td.get("gate") or {}
+    snapshot = {"day": gate.get("day"), "as_of": gate.get("as_of")}
     f = td.get("funnel") or {}
     funnel.update({"verdict": f.get("verdict"),
                    "idx_ret": f.get("idx_ret"),
@@ -1244,10 +1620,12 @@ def _run_topdown(t0: float, ms: dict):
     picked = td.get("picked") or []
     if not picked:
         _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "selection_snapshot": snapshot, "run_started_at": run_started_at,
                 "market": mkt, "mood_regime": _mood_regime(mkt),
                 "funnel": funnel, "boards": td.get("boards") or {},
-                "analyzed": [], "signal": "三层漏斗无候选",
+                "analyzed": [], "analyzed_rank": [], "signal": "三层漏斗无候选",
                 "missing": (td.get("missing") or [])[:8]}
+        _out = _compact_delivery(_out)
         _log_run(t0, ms, funnel, _out)
         return SkillResult(_out)
 
@@ -1266,6 +1644,7 @@ def _run_topdown(t0: float, ms: dict):
                     for x in zt_ref]
     if not codes:
         _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
+                "selection_snapshot": snapshot, "run_started_at": run_started_at,
                 "market": mkt, "mood_regime": _mood_regime(mkt),
                 "funnel": funnel, "boards": td.get("boards") or {},
                 "limit_up_ref": limit_up_ref,
@@ -1273,10 +1652,12 @@ def _run_topdown(t0: float, ms: dict):
                 "signal": "候选全部已封板：仅列涨停参考，无可分析标的",
                 "missing": (td.get("missing") or [])[:8]}
         attach_monitor(_out)          # 涨停参考只补充板块情绪与次日验证提示
+        _out = _compact_delivery(_out)
         _log_run(t0, ms, funnel, _out)
         return SkillResult(_out)
 
     outer = {"market": mkt, "mood_regime": _mood_regime(mkt),
+             "selection_snapshot": snapshot, "run_started_at": run_started_at,
              "hints": {}, "funnel": funnel,
              "pipeline": "topdown",
              "boards": td.get("boards") or {},
@@ -1286,20 +1667,37 @@ def _run_topdown(t0: float, ms: dict):
                                 ("code", "board", "track", "tier", "kind", "reason",
                                  "flags", "dup_n", "t_first", "flow_valid", "circ_mv")}
                                for x in picked]}
-    return _deep_and_deliver(codes, outer, funnel, t0, ms)
+    return _deep_and_deliver(codes, outer, funnel, t0, ms, coarse=coarse)
 
 
-def run() -> dict:
-    """一次性跑完整流程——盘中三层漏斗选人 → deep 分析（唯一链路）。
+def run(codes: str = "") -> dict:
+    """两轮筛选协议的唯一入口。
 
-    流程：L1 大盘闸 → L2 板块闸（行业/概念三备二）→ L3 板块内选股（跟随/跳变
-    双分支）→ 连板放量/吸筹打标（不放弃，挂 flags）→ 截断 35 → deep_analyze(<=45)，LLM 单次调用；
-    交付按位置透支升序，名单成员与顺序解耦。运行期预热两大单点（指数 K 线
-    mootdx 冷启、CNStock 连接池），失败不阻塞主流程。选人层规则详见
-    _topdown.py 与 SKILL.md；本函数无入参。失败如实返回，不回落任何备用链路。
+    第一轮（codes 为空）：三层漏斗选人 → deep_analyze(≤45) → 交付**全名单粗筛**
+    （analyzed_rank 完整不截断，资金/量能/位置字段齐，无满卡）。LLM 按资金资格
+    粗筛出 ≤10 只短名单。
+    第二轮（codes="600518,603883"）：对短名单逐只出满卡（技术/资金/实时对账
+    证据），据此写买点止损。超 10 只直接拒收，要求再收窄。
+    两轮都在观察值预算内，候选完整交付不再受满卡挤兑。运行期预热两大单点
+    （指数 K 线 mootdx 冷启、CNStock 连接池），失败不阻塞主流程。失败如实返回，
+    不回落任何备用链路。
     """
     _t0 = time.perf_counter()
+    _started = datetime.now().astimezone().isoformat(timespec="seconds")
     _ms: dict = {}
+    _req = _parse_codes(codes)
+    if len(_req) > _FINE_CARD_CAP:
+        raise ValueError(
+            f"细筛一次最多 {_FINE_CARD_CAP} 只，收到 {len(_req)} 只；"
+            "请按资金资格再收窄后重调。")
+    # 预热策略：第一轮（粗筛）全市场扫描，两大单点全预热；
+    # 第二轮（细筛）只预热目标股票，减少开销（2026-11-25 优化）
+    if _req:
+        # 细筛轮：codes 即终选，只预热目标票的K线与连接池
+        prewarm_market_klines(selected_codes=_req)
+        warm_market_pool()
+        return _run_fine(_req, _t0, _ms, _started)
+    # 粗筛轮：全市场扫描，完整预热
     prewarm_market_klines()
     warm_market_pool()
-    return _run_topdown(_t0, _ms)
+    return _run_topdown(_t0, _ms, _started, coarse=True)
