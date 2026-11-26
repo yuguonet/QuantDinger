@@ -15,28 +15,16 @@ get_market_overview 只是上证/深成抽样，两者都不能当全市场宽�
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, Optional
 
-
-def _env_f(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _num(v: Any) -> Optional[float]:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if f != f else f
+from ._inner import env_float as _env_f, num as _num
 
 
 def _now_hhmm() -> str:
+    """分时截断时刻（Asia/Shanghai 墙上钟）；非交易时段取 15:00。显式钉时区防 docker/UTC 误判。"""
     from datetime import datetime
-    now = datetime.now().strftime("%H:%M")
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
     return now if ("09:30" <= now <= "11:30" or "13:00" <= now <= "15:00") else "15:00"
 
 

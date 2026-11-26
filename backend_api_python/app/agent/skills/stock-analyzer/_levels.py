@@ -34,7 +34,6 @@
 """
 from __future__ import annotations
 
-import os
 import statistics
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -272,6 +271,8 @@ def build_levels(bars: List[Dict[str, Any]], code: str = "", name: str = "",
         verified=False 的 level 只可当参考（孤证，证据不足），结论价位优先用 verified。
         touches=有效测试（触碰且收回）次数，broken=测试但失守次数；两者分开计，
         验证强度只看 touches。
+        nearest_support: 距现价最近且 verified 的支撑（≤STOP_NEAREST_MAX_PCT，默认 6%），
+        作短档止损参考位；无 verified 支撑时为 None（不拿孤证当止损参考）。
         一侧无候选 ⇒ 该侧 []，由调用方写「未知」。
     """
     norm = _norm_bars(bars or [])
@@ -325,8 +326,8 @@ def build_levels(bars: List[Dict[str, Any]], code: str = "", name: str = "",
 
     picked_sup = _pick(sides["sup"])
     picked_res = _pick(sides["res"])
-    near_max_pct = float(os.getenv("QD_STOCK_ANALYZER_STOP_NEAREST_MAX_PCT", "6") or 6)
-    nearest = [r for r in picked_sup if abs(r["dist_pct"]) <= near_max_pct]
+    near_max_pct = _inner.env_float("QD_STOCK_ANALYZER_STOP_NEAREST_MAX_PCT", 6.0)
+    nearest = [r for r in picked_sup if r["verified"] and abs(r["dist_pct"]) <= near_max_pct]
     nearest.sort(key=lambda r: abs(r["dist_pct"]))
     out = {
         "ok": True,

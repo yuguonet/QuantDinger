@@ -9,13 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-
-def _num(v: Any) -> Optional[float]:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if f != f else f
+from ._inner import num as _num
 
 
 def _ma(vals: List[float], n: int) -> Optional[float]:

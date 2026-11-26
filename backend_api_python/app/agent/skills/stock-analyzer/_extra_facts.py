@@ -37,15 +37,9 @@
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
+from ._inner import env_int as _env_int
 
 
 def _unwrap(payload: Any, code: str) -> Optional[Dict[str, Any]]:
@@ -275,9 +269,15 @@ def build_valuation(code: str) -> Dict[str, Any]:
 
 
 def build_flow_daily(code: str) -> Dict[str, Any]:
+    """日频资金事实（2026-11-26 起 days=30 与 deep 层 flow_summary 同窗口对齐）。
+
+    ① 20 日聚合需要 ≥20 日数据，原 days=15 下 recent_20d_* 实为 ≤15 日口径（标签失真）；
+    ② 与 deep 层 flow_summary（stock_daily days=30）同 scope 同窗口各查一次，属装配层
+       已知双查（彻底去重需动共享层 market-screener/_helpers，超出本技能目录，记录在案）。
+    """
     from ...tools.finance.fund_flow_tools import get_fund_flow
 
-    one = _unwrap(get_fund_flow(scope="stock_daily", codes=code, days=15), code)
+    one = _unwrap(get_fund_flow(scope="stock_daily", codes=code, days=30), code)
     if one is None:
         return {"ok": False, "reason": "日频资金流未返回该股数据"}
     return {
@@ -319,7 +319,8 @@ def build_flow_driver(code: str, bars: List[Dict[str, Any]],
     """
     from ...tools.finance.fund_flow_tools import get_fund_flow_daily
 
-    n = _env_int("QD_STOCK_ANALYZER_FLOW_DRIVER_DAYS", 20) if days is None else days
+    n = max(1, days if days is not None
+            else _env_int("QD_STOCK_ANALYZER_FLOW_DRIVER_DAYS", 20))
     one = _unwrap(get_fund_flow_daily(code, days=n), code)
     if one is None:
         return {"ok": False, "reason": "日频资金流未返回该股数据"}

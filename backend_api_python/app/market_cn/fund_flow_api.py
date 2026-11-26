@@ -976,7 +976,7 @@ def sync_fund_flow_history(days: int = 30,
         board_types: ["industry","concept"]; 空则不刷板块
         with_sector_today: True 时若 board_types 非空则把板块资金流落库。
             参数名沿用历史，实际覆盖窗口由 QD_SECTOR_SYNC_INDICATOR 指定
-            （默认 10日 = realtime_snapshot 全部可得交易日），使 qd_fund_flow_sector
+            （默认 10日 = realtime_snapshot 保留 QD_SNAPSHOT_KEEP_TDAYS 个交易日），使 qd_fund_flow_sector
             留下按日序列而不是只有当日一行。只写本地 snapshot 派生口径，不打远端。
 
     Returns:

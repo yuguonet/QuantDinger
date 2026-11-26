@@ -18,10 +18,10 @@ screen_query — 横向（横截面）只读查询层：某一时刻 × 一批�
 
   ── 数据口径矩阵（任何组合都必须能回答「这数从哪来、截到几点」）──
     表                     粒度      可用时段        当日实时  历史深度
-    realtime_snapshot      60s/拍    09:15~15:01     是        KEEP_DAYS(8天)
+    realtime_snapshot      60s/拍    09:15~15:01     是        KEEP_TRADING_DAYS
     kline_1D_YYYY          日        盘后落库        盘中缺    多年(分年表)
     kline_1m               1分钟     盘后回填        盘中空    较长
-    qd_fund_flow_sector    日×板块   按需同步落库    否        snapshot 8天
+    qd_fund_flow_sector    日×板块   按需同步落库    否        snapshot KEEP_TRADING_DAYS
     stock_basic_info       静态      随同步更新      —        当前快照
 
     ⇒ 今日那根「日线」盘中不存在，只能由 snapshot 现算；本模块统一在

@@ -1041,7 +1041,7 @@ class CNStockDataSource(BaseDataSource):
           b. open/high/low 为当日累计值，完整可得（provider quote 的 HL 可能缺失）；
           c. 持久化 —— 收盘后 / 进程重启后仍可取到当日最后一拍。
 
-        数据口径：盘中每 60s 一拍 UPSERT 全市场行情（PK symbol+time，保留 8 天），
+        数据口径：盘中每 60s 一拍 UPSERT 全市场行情（PK symbol+time，保留 KEEP_TRADING_DAYS），
         volume 单位"股"，与 kline 表一致（实测 600519 于 2026-10-15 与 kline_1D
         尾差仅 22 股，为 ETL 回填修正），拼接无需换算。
 

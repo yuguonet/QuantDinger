@@ -5,24 +5,31 @@
 资金流、分时同刻校准、分时形态、多周期结构）取齐，压成「rank 行 + 满卡」两档，
 再按已标定的 P(次日涨) 排序交付。**不含主观评分梯形**，唯一的数字是 predict_one 的 p_up。
 
-【复制来源与保真】逐字复制 `skills/market-screener/run.py` 的 deep 层：
-`_REPORT_GUIDE` / `_DEEP_*` 常量 / `_deep_budget` / `_rank_row` / `_dumps_len` /
-`_slim_card` / `_full_card_quota`（已改为分层配卡，见下）/ `deep_analyze`。机械改动：
-  1) `from ._helpers import …` / `from ._facts import …` / `from .common import …`
-     统一改指 `._deps`（依赖桥，见该模块 docstring）；
-  2) 删除行内注释（本包铁律：app/agent 下不写注释），docstring 全部保留。
-逻辑、字段、阈值、预算链均未改动；market-screener 侧一行未动。
+【与 market-screener deep 层的关系（2026-11-26 核定，difflib 代码行口径）】
+market-screener 无本文件（其 deep 层在 run.py 的 _REPORT_GUIDE~deep_analyze 区段）；
+本文件只复制**装配层**，底层取证/指标经 `_deps` 桥借用 market-screener（已是单源）。
+两份装配层已独立演化，此前「逐字复制/逻辑未改动/差异仅 2 处」的声明失实，实况：
 
-【本副本的功能性差异（2 处，均不影响字段契约）】
-1) 分层配卡（2026-11-03）：原 `_full_card_quota` 只按「整张标准卡装得下就装」放卡，
-装不下即停。本副本改为 `_compact_card` + `_card_plan`：先给前 3 张标准卡，余量用
-**精简卡**（剔除 `tech.support.supports/resists`、`flow.recent`、`shape` 明细，这三类在
-rank 行或工具里可复得）继续装，并取「3 标准 + 精简」与「全精简」两种排法中张数更多者。
-实测（20 只票、默认预算）：满卡 9 张 → 11 张（前 3 张标准 + 其后 8 张精简）；
-单卡 2.7k → 2.0k 字符。全精简可到 13 张，但会牺牲头部票明细，故不采用。
-2) 日线暂存 `_BARS_STASH`（2026-11-03）：`_one` 取到的日线在进程内暂存 60s，
-`take_bars(code)` 取回——`analyze()` 需要同一份日线做价位推演，不暂存就要对同一票
-拉两遍日线。暂存不进返回值、不占预算、不影响任何字段。
+逐字一致：`_slim_card` / `_dumps_len`（`_deep_budget` 仅 env 名不同，见差异⑧）。
+机械改动：import 统一改指 `._deps`；删除行内注释（docstring 保留）。
+功能性差异（9 处）：
+  ① 排序键：本副本 p_up 降序、无预测沉底；market-screener 按位置透支升序（交付语义不同）；
+  ② 本副本显式 attach_prediction 接标定分（ms 在 inspect_stock 才接）；
+  ③ rank 字段集不同（本副本多 p_up/direction/confidence，少 amp_avg5 等 9 键）；
+  ④ buyable 三态：rt 缺 buyable ⇒ "unknown"（行情缺失不能推断可买；此前缺键被视为
+     可买，2026-11-26 对齐 market-screener 同款语义）；
+  ⑤ with_mtf: bool = False（ms 为 "auto" 按情绪自决策）；
+  ⑥ 分层配卡 `_compact_card`+`_card_plan`（ms 为 `_full_card_quota` 整卡装）：
+     先给前 3 张标准卡，余量用精简卡（剔 tech.support.supports/resists、flow.recent、
+     shape 明细，rank 行或工具可复得）继续铺。实测（20 只票、默认预算）满卡 9→11 张、
+     单卡 2.7k→2.0k 字符；全精简可到 13 张但牺牲头部票明细，故不采用（2026-11-03）；
+  ⑦ 日线暂存 `_BARS_STASH`/`take_bars`：deep 取到的日线进程内暂存 60s 供 analyze
+     复用，不暂存就要对同一票拉两遍日线（2026-11-03）；
+  ⑧ 预算 env 名：QD_STOCK_ANALYZER_DEEP_BUDGET（ms 为 QD_SCREENER_DEEP_BUDGET，
+     2026-11-26 改名，跨技能共享开关已解除）；
+  ⑨ missing 为自由文本（ms 为 _format_error 结构化错误码；本库无错误码消费点）。
+一致性守卫：tmp/review_deep_diff_20261126.py 可复跑量化；逐字一致函数建议以 hash
+测试锁定（tests/ 属技能目录外，待维护者批次）。
 
 【关键点】
   · 预算链：`_deep_budget()` < observation 闸 45000 < 预览闸 47000。超预算时 `_full_card_quota`
@@ -46,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ._deps import (SkillResult, fetch_kline, select_strategy, resolve_names,
                     tech_summary, build_report, cross_verdict,
                     _detect_patterns, _market_state, _multitimeframe)
+from ._inner import bars_days
 
 #: 日线暂存（code → {t, bars}）：deep 取到的 bars 留 60s 供 analyze 复用，消除重复拉取
 _BARS_STASH_TTL_S = 60.0
@@ -54,17 +62,25 @@ _BARS_STASH_LOCK = threading.Lock()
 
 
 def take_bars(code: str):
-    """取回本进程最近一次 deep 取到的日线（60s TTL）；无暂存/过期返回 None。"""
+    """取回本进程最近一次 deep 取到的日线（60s TTL）；无暂存/过期返回 None（过期条目顺带清除）。"""
+    key = str(code or "").strip()
     with _BARS_STASH_LOCK:
-        one = _BARS_STASH.get(str(code or "").strip())
+        one = _BARS_STASH.get(key)
         if one and time.time() - one["t"] < _BARS_STASH_TTL_S:
             return one["bars"]
+        if one:
+            _BARS_STASH.pop(key, None)
     return None
 
 
 def _stash_bars(code: str, bars) -> None:
+    key = str(code or "").strip()
     with _BARS_STASH_LOCK:
-        _BARS_STASH[str(code or "").strip()] = {"t": time.time(), "bars": bars}
+        if len(_BARS_STASH) >= 128:
+            now = time.time()
+            for k in [k for k, v in _BARS_STASH.items() if now - v["t"] >= _BARS_STASH_TTL_S]:
+                _BARS_STASH.pop(k, None)
+        _BARS_STASH[key] = {"t": time.time(), "bars": bars}
 
 _REPORT_GUIDE = {
     "OUTPUT_FORM": (
@@ -171,7 +187,8 @@ _REPORT_GUIDE = {
               "/seal/seal_tier/seal_pct/net5d_wan/net20d_wan/streak_dir；"
               "20 日位置直接读 pos20（0=区间最低、100=最高，无需自算）；"
               "满卡 tech.support.supports/resists 是全量候选（各 ≤4/≤3 条），要横向比多个位置才看它；"
-              "**缺键即正常**：无 limit_up=未涨停、无 buyable=可买、无 stale_bar=日线未滞后、无 risks=无风险、"
+              "**缺键即正常**：无 limit_up=未涨停、无 stale_bar=日线未滞后、无 risks=无风险、"
+              "buyable=unknown=行情缺失不能推断可买（rt.buyable=True 时缺键即可买）、"
               "无 sup/res=该侧无关键位置（如已在高位无压力）、无 seal=今日未封板、无 zt_streak=今日没连板、"
               "无 name=名称未取到（用代码即可）、无 chg_prev_pct/cpos=日线不足（参考字段缺省）、"
               "无 vr_rel/flow_rel=大盘基准缺失（未校准，按绝对值读）、"
@@ -266,7 +283,7 @@ _REPORT_GUIDE = {
 }
 _DEEP_WORKERS = 16
 _DEEP_BUDGET_CHARS = 44500
-_DEEP_BUDGET_ENV = "QD_SCREENER_DEEP_BUDGET"
+_DEEP_BUDGET_ENV = "QD_STOCK_ANALYZER_DEEP_BUDGET"
 def _deep_budget() -> int:
     """满卡预算（字符）：env 优先，非法/≤0 回落缺省。"""
     try:
@@ -289,7 +306,8 @@ def _rank_row(card: dict) -> dict:
     3.11 vs 1.24、10 日涨停 1.5 vs 3.1 次），不给数值就只能靠模型读 K 线。
     hi_today 是条件单的突破基准（次日 09:30-10:00 突破它才买），否则模型只能给
     「回踩现价下方」这一种买点。
-    默认值不写（limit_up=False / stale_bar=False / risks=0 / buyable=True / 无 res /
+    默认值不写（limit_up=False / stale_bar=False / risks=0 / buyable=True，rt 缺
+    buyable 时写 "unknown"=行情缺失不能推断可买，2026-11-26 对齐三态 / 无 res /
     seal=none 未封板 / confidence=1.0 满证据 / zt_streak=0 无连板 / 空 name /
     hi_today==hi20 当日最高就是 20 日最高），缺键即正常，
     口径见 _REPORT_GUIDE["fields"]。limit_up 与 seal 冗余（seal 存在即封过板），
@@ -365,6 +383,8 @@ def _rank_row(card: dict) -> dict:
         row.pop("zt_streak", None)
     if rt.get("buyable") is False:
         row["buyable"] = False
+    elif rt.get("buyable") is None:
+        row["buyable"] = "unknown"
     if rt.get("limit_up"):
         row["limit_up"] = True
     if not row.get("seal_tier"):
@@ -486,9 +506,9 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         with_flow: 是否取资金流
         with_patterns: 是否识别 K 线形态
         with_mtf: 是否取多周期结构（需要分钟源，更慢）
-        budget: 整份返回值的字符预算（含信封+rank+满卡）；默认 QD_SCREENER_DEEP_BUDGET
-            （29500）。run() 会把外层 market/hints/funnel 的体量与随后追加的 src 标注
-            一并扣掉再传，使「最终交付」而不是「本函数输出」受预算约束。
+        budget: 整份返回值的字符预算（含信封+rank+满卡）；默认
+            QD_STOCK_ANALYZER_DEEP_BUDGET（缺省 44500）。本技能经 deep_cards 直出，
+            无 market-screener run() 的外层扣减环节，函数输出即最终交付。
 
     返回:
         dict: analyzed_rank[]=**全部票**的横向可比字段（code/name/p_up/direction/
@@ -511,7 +531,8 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             同刻净占比%,flow_rel_st,ret_same_t 昨收→t 涨幅%,idx_ret_same_t 上证同期涨跌%,
             rs_same_t 超额,mkt_vr/mkt_fp_pct 大盘同刻基准,mkt_fp_prev_pct 前5日同刻均值}；
             rt{price,change_pct,previous_close,high,low,limit_up,limit_up_price,
-            limit_down_price,limit_band,time}；排在满卡之外的票用 inspect_stock(code) 定点取。
+            limit_down_price,limit_band,time}；排在满卡之外的票重调 analyze 单票补取
+            （inspect_stock 属 market-screener，本技能未提供）。
             seal = {tag(none|one_word|open0|open1_2|open3_5|open6p|unknown)/
             seal_tier(thin|mid|thick|vthick)/open_count/seal_ratio_pct(封单÷成交额 %)/
             zt_days/turnover_pct}
@@ -579,7 +600,7 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         row = {"code": code, "name": name, "missing": miss, "_evidence": {}}
 
         try:
-            bars = fetch_kline(code, days=120)
+            bars = fetch_kline(code, days=bars_days())
         except Exception as e:
             miss.append(f"日线异常:{type(e).__name__}: {e}")
             bars = []
@@ -672,8 +693,18 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         missing.append(f"并发分析中断: {type(e).__name__}: {e}")
     else:
         for fut, _code in futs.items():
-            if fut not in done:
-                errors.append({"code": _code, "error": "未在时限内返回（多为外部源挂起）"})
+            if fut in done:
+                continue
+            if fut.done():
+                try:
+                    r = fut.result()      # 已完成但未迭代到的按真实结果收，不误记超时
+                    if r is not None:
+                        raw.append(r)
+                        continue
+                except Exception as e2:
+                    errors.append({"code": _code, "error": f"{type(e2).__name__}: {e2}"})
+                    continue
+            errors.append({"code": _code, "error": "未在时限内返回（多为外部源挂起）"})
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     if len(raw) < len(items):
@@ -807,8 +838,8 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
                     if n_cmp else "")
             h["analyzed_note"] = (
                 f"analyzed 只含前 {shown} 只满卡（按交付预算裁剪{tier}），全部 "
-                f"{len(analyzed)} 只的横向可比字段在 analyzed_rank；需要某只的满卡用 "
-                f"inspect_stock(code)")
+                f"{len(analyzed)} 只的横向可比字段在 analyzed_rank；需要某只的满卡时"
+                f"对该票重调 analyze（inspect_stock 属 market-screener，本技能未提供）")
         cards = analyzed[:n_std] + compact[n_std:n_std + n_cmp]
         return {**h, "analyzed_rank": rank, "analyzed": cards}
 
@@ -818,6 +849,11 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             n_cmp -= 1
         else:
             n_std -= 1
-    return SkillResult(_pack(n_std, n_cmp))
+    result = _pack(n_std, n_cmp)
+    if (n_std + n_cmp) == 0 and analyzed:
+        # head+rank 自身已超预算：无法靠减卡回收，如实留痕后全量交付（不静默超限）
+        result["missing"].append(
+            f"deep 预算不足：head+rank 已超 {_b} 字符，满卡 0 张（未裁剪交付）")
+    return SkillResult(result)
 
 

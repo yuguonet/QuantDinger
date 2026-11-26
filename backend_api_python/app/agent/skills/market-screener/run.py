@@ -1642,11 +1642,25 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
         attach_monitor(out)          # 重点监控格：rank/picked_detail/limit_up_ref 软标记
         # 闸门打标（连板放量/吸筹/过度拉升）从 picked_detail 合入 rank，
         # 比强弱的表要能看到护栏证据（flags 缺键 = 无命中）。
+        # 板块上下文（board/board_rank/dup_n）同样随行——排序层算好的
+        # 「板块龙头身份」是「主线龙头」资格判定与强弱排序的直接证据，
+        # rank 行与满卡行都合并（2026-11-26 补：原实现 rank 行不带板块上下文）。
         _pm = {str(x.get("code")): x for x in (out.get("picked_detail") or [])}
         for r in out.get("analyzed_rank") or []:
-            _fl = (_pm.get(str(r.get("code"))) or {}).get("flags")
+            _p = _pm.get(str(r.get("code"))) or {}
+            _fl = _p.get("flags")
             if _fl:
                 r["flags"] = _fl
+            for _k in ("board", "board_rank", "dup_n"):
+                _v = _p.get(_k)
+                if _v is not None:
+                    r[_k] = _v
+        for r in out.get("analyzed") or []:
+            _p = _pm.get(str(r.get("code"))) or {}
+            for _k in ("board", "board_rank", "dup_n"):
+                _v = _p.get(_k)
+                if _v is not None:
+                    r.setdefault(_k, _v)
         expected = set(codes)
         actual = [str(r.get("code")) for r in out.get("analyzed_rank") or []
                   if isinstance(r, dict) and r.get("code")]
@@ -1779,7 +1793,7 @@ def _run_topdown(t0: float, ms: dict, run_started_at: str = "", coarse: bool = T
              "topdown_notes": (td.get("missing") or [])[:8],
              "picked_detail": [{k: x.get(k) for k in
                                 ("code", "board", "track", "tier", "kind", "reason",
-                                 "flags", "dup_n", "t_first", "flow_valid", "circ_mv")}
+                                 "flags", "dup_n", "board_rank", "t_first", "flow_valid", "circ_mv")}
                                for x in picked]}
     return _deep_and_deliver(codes, outer, funnel, t0, ms, coarse=coarse)
 

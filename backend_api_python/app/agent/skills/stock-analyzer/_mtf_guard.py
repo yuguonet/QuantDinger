@@ -9,7 +9,7 @@
 口径：日线目标日取 bars[-1]["time"] 前 10 位；1m 日期取 _deps.intraday_bars
 最后一根 time 前 10 位。任一取不到则 aligned=None（未知），不猜。
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from . import _deps
 

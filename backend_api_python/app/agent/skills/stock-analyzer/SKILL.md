@@ -38,7 +38,7 @@ run_skill("stock-analyzer", {"fn": "analyze", "kwargs": {"code": "600519"}})
 `stale=true`，15m/5m 的 `close`/`trend`/RSI 属更早交易日，写作时**明确不采信、不得据此说
 「短周期转暖」**，并在缺口中留痕；不删这些字段，只标口径。
 
-证据基座是 **deep 层**（market-screener deep 的完整移植，见 `_deep.py`）：`analyze()`
+证据基座是 **deep 层**（market-screener deep 装配层的独立演化副本，见 `_deep.py`）：`analyze()`
 内部经 deep 装配单票全维证据（日线技术面 / 形态 / 资金 / 实时对账 / 封板 / 标定预测分），
 在其上做多维投票、支撑压力交叉验证、板块涨跌修正，再给结论。
 `analyze()` 返回的 `report_guide` 是本技能交付给调用方的报告写作契约；主对话应遵循该字段，
@@ -151,15 +151,17 @@ T+10/T+20 不做强调，只按 `trend_outlook` 的日线趋势简述（MA20/MA6
 
 ## 离场压力（`stop_pressure`）
 
-`stop_pressure` 把已算出的负面事实按条数汇总：收盘在日内低位（≤5% 分位）、5 日资金净流出、
-板块 `label=自弱`、大盘情绪分 ≤45。它是**事实汇总，不是买卖/仓位指令，也不改方向投票与
-置信度**；`n` 高时写作层前置「核对止损参考位」的提醒，用户问去留/止损时据此展开，
-用户只问分析时按条件情景陈述。阈值来自既有字段口径，不新造维度。
+`stop_pressure` 把已算出的负面事实按条数汇总（2026-11-26 口径）：收盘在日内低位（≤5% 分位）、
+5 日资金净流出、弱于板块（α≤-阈值）、大盘情绪偏弱（≤`QD_STOCK_ANALYZER_WEAK_SCORE`，
+与 cap_regime 同源）、两层止损距离、筹码套牢压顶、尾盘连续分钟净流出、情报一票否决、
+融资余额回落、开盘区间向下破位、日内均线空头、日频资金连续净流出。它是**事实汇总，不是
+买卖/仓位指令，也不改方向投票与置信度**；`n` 高时写作层前置「核对止损参考位」的提醒，
+用户问去留/止损时据此展开，用户只问分析时按条件情景陈述。阈值来自既有字段口径，不新造维度。
 
 ## 事件与时段口径
 
 - **事件（`events`）**：目前唯一有日历的事件源是限售解禁。窗口内有占比 ≥1% 的
-  解禁 ⇒ tape 维的空证据（T+1/T+3 看 ≤20 日，长档看 ≤45 日）；30 日内解禁进 `risks`。
+  解禁 ⇒ tape 维的空证据（T+1/T+3 看 ≤20 日，其余档（含 T+5）看 ≤45 日）；30 日内解禁进 `risks`。
   日历取不到 ⇒ 该条**缺数**（None）并留痕，不猜。除权除息无日历工具，不做。
 - **时段（`session`）**：`pre`（盘前）/ `intraday`（盘中）/ `post`（盘后）/
   `closed`（非交易日）/ `unknown`（交易日历不可用）。判据是**先判交易日、再判时刻**：
@@ -197,6 +199,14 @@ T+10/T+20 不做强调，只按 `trend_outlook` 的日线趋势简述（MA20/MA6
 且理由要落在可观测事实上（支撑是否守住、量能、资金方向、板块 α、20 日位置），
 不能只说「我觉得」。支撑与结构的优先级 ≫ 涨跌幅。
 
+## 阈值与环境变量（单源，2026-11-26 收敛）
+
+- 七维投票与风险标记阈值集中在 `run.py` 的 `_VOTE_THRESHOLDS` 单源表（改值=改判定纪律，须回测复核）；
+- `QD_STOCK_ANALYZER_ALPHA_PCT`：板块自强/自弱阈值（默认 1.5），label/证据修正/投票/离场压力四处同源；旧 `QD_STOCK_ANALYZER_STOP_WEAK_ALPHA_PCT` 停用；
+- `QD_STOCK_ANALYZER_BARS_DAYS`：日线取数天数（默认 120），deep 与 analyze 同源生效；
+- `QD_STOCK_ANALYZER_DEEP_BUDGET`：deep 满卡字符预算（默认 44500；原借用的 `QD_SCREENER_DEEP_BUDGET` 对本技能停用）；
+- `QD_STOCK_ANALYZER_WEAK_SCORE` / `STRONG_SCORE`：大盘弱/强判定门（默认 45/55，cap_regime 与 stop_pressure 同源）；`_mood_label` 的 40/70 只是展示分桶。
+
 ## 失败模式（别踩）
 
 - 把 `p_up` 外推成 T+5 / T+20 的胜率 —— 它只覆盖 T+1
@@ -230,7 +240,12 @@ T+10/T+20 不做强调，只按 `trend_outlook` 的日线趋势简述（MA20/MA6
 run_skill("stock-analyzer", {"fn": "deep_cards", "kwargs": {"codes": "600519,000858"}})
 ```
 
-`deep_cards` 是 deep 层的**批量**入口（自 market-screener 的 deep 层完整复制，见
+**入口现状（2026-11-26 核实）**：`run_skill` 的技能执行注册表（`scripts/skill_run.py`
+EXECUTABLE_SKILLS）目前只放行 `fn=analyze`，`deep_cards` 经 run_skill 调用必报
+「fn 不在白名单」——放行前批量证据请逐只 `analyze` 获取；放行 = 在注册表白名单补一个
+函数名（一行改动，属技能目录外文件，由维护者执行）。
+
+`deep_cards` 是 deep 层的**批量**入口（自 market-screener 的 deep 层独立演化，见
 `_deep.py` 顶部说明）：只取事实、不做判断、不给方向，返回两档
 
 - `analyzed_rank[]`：**全部票**的横向可比字段（价位/均线/支撑压力/封板/量比/连板/资金/风险），不截断；
@@ -240,7 +255,9 @@ run_skill("stock-analyzer", {"fn": "deep_cards", "kwargs": {"codes": "600519,000
 
 分工：`analyze` 给结论（方向/触发/证伪/价位），`deep_cards` 给批量证据。
 `analyze` 内部复用同一份 deep 实现装配单票证据；需要「结论 + 全量证据」时先
-`deep_cards` 再逐只 `analyze`。
+`deep_cards`（注册表放行后）再逐只 `analyze`。
 
-字段口径与 market-screener 的 `deep_analyze` **完全一致**（同一份复制的 `_REPORT_GUIDE`）；
-两份实现独立演化——改本技能的 `_deep.py` 不会影响选股技能，反之亦然。
+字段口径与 market-screener 的 `deep_analyze` **同源不同步**：同一份装配层复制的两个
+独立演化副本，`_REPORT_GUIDE` 已各自分叉（逐字一致的只有 `_slim_card`/`_dumps_len`，
+量化可复跑 `tmp/review_deep_diff_20261126.py`）——改本技能的 `_deep.py` 不会影响选股
+技能，反之亦然。

@@ -9,7 +9,7 @@
 数据通道与时效硬事实 (用户 09-09 说明):
   - daily:      1D 分区表, qfq, 最大 5 年 —— 盘后更新;
   - minute_1m:  kline_1m_YYYY, 不复权原始价, 最大 ~100 工作日 —— 盘后回填;
-  - 盘中唯一通道: realtime_snapshot (60s/拍, 保留 8 天, 可能丢拍) ——
+  - 盘中唯一通道: realtime_snapshot (60s/拍, 保留 KEEP_TRADING_DAYS, 可能丢拍) ——
     quote/market_snapshot/day_series/minute_live/daily_live 合成段全部来自它;
   - minute_live 输出按 mi 标准化并丢弃无效槽位 (缺口容忍), 调用方按槽位数自判数据是否足够;
   - lhb: 只读引用 market_cn/dragon_tiger_store (名单型事件数据, 不 OHLVC 化);

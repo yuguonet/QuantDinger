@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,7 +63,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...log import logger
-from . import _board_rank, _cap_regime, _inner, _levels, _mtf_guard, _trend
+from . import _board_rank, _cap_regime, _extra_facts, _inner, _levels, _mtf_guard, _trend
+from ._inner import env_float as _env_float, env_int as _env_int
 
 #: 全周期档位（顺序即输出顺序）；天数不在此硬编码，取 `label_spec.HOLDS`
 _HORIZONS: Tuple[str, ...] = ("T+1", "T+3", "T+5", "T+10", "T+20")
@@ -141,8 +143,6 @@ _SHORT_HORIZONS: Tuple[str, ...] = ("T+1", "T+3", "T+5")
 #: 结论全文字符上限（只约束 LLM 写作，不改事实字段）。env 可覆盖。
 _REPORT_MAX_CHARS_DEFAULT = 400
 
-_BARS_DAYS_DEFAULT = 120
-
 #: 并发取证总等待上限：deep 内部还有一层并发，这里给宽裕值防拖死整轮
 _DEADLINE_S = 45.0
 
@@ -153,19 +153,67 @@ _DIM_MISS_TOKEN: Dict[str, str] = {
     "patterns": "形态识别", "flow": "资金流", "sector": "板块",
 }
 
+#: 七维投票与风险标记的阈值单源（2026-11-26 收敛：此前约 20 个魔法数字散在 _v_* 内）。
+#: 改值 = 改判定纪律，须同步 SKILL.md 并回测复核；契约值（SKILL 明文）与经验阀都集中在此。
+_VOTE_THRESHOLDS: Dict[str, Any] = {
+    # model 维：T+1 标定分方向带
+    "model_p_up_long": 0.55,
+    "model_p_up_short": 0.45,
+    # structure 维：短档（T+1/T+3）
+    "sup_near_max_below_pct": -3.0,
+    "rsi_overbought": 75.0,
+    "break_ma20_pct": -3.0,
+    "chase_dist_ma20_pct": 10.0,
+    "sup_far_below_pct": -5.0,
+    # structure 维：长档
+    "t5_pos_up_min": 50.0,
+    "t5_pos_dn_max": 40.0,
+    "t5_dist_cap_pct": 10.0,
+    "t10t20_pos_up_min": 60.0,
+    "t10_pos_dn_max": 30.0,
+    "t10_below_ma20_pct": -5.0,
+    "t20_dist_min_pct": 0.0,
+    "t20_dist_max_pct": 15.0,
+    "t20_below_ma20_pct": -8.0,
+    # volume 维
+    "vr_rel_strong": 2.0,
+    "vr_strong": 1.5,
+    "vr_no_vol": 0.85,
+    "vol5_lift": 1.2,
+    "vol5_shrink": 0.75,
+    # flow / market 维
+    "flow_rel_strong": 1.0,
+    "rs_d0_strong": 1.0,
+    "rs_d0_weak": -2.0,
+    "rs_5d_strong": 2.0,
+    "rs_5d_weak": -2.0,
+    # tape 维与解禁
+    "zt_streak_hot": 2,
+    "zt10_hot": 3,
+    "lockup_window_short_days": 20,
+    "lockup_window_long_days": 45,
+    "lockup_ratio_min_pct": 1.0,
+    # 风险标记（_risks，展示层）
+    "risk_rsi_overbought": 75.0,
+    "risk_dist_ma20_pct": 15.0,
+    "risk_zt_streak": 2,
+    "risk_vol_ratio": 4.0,
+    "risk_board_drop_pct": -3.0,
+}
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
+
+def _alpha_pct() -> float:
+    """板块自强/自弱阈值（%）单源：SKILL 契约值 1.5，env 可调。
+
+    供 _sector_corr label / _move_guards / _v_sector / _stop_pressure 四处引用；
+    旧 QD_STOCK_ANALYZER_STOP_WEAK_ALPHA_PCT 停用（2026-11-26 收敛到本处）。
+    """
+    return _env_float("QD_STOCK_ANALYZER_ALPHA_PCT", 1.5)
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
+#: 大盘情绪展示分桶（_mood_label 的 regime 标签）；与判定门 QD_STOCK_ANALYZER_WEAK_SCORE/
+#: STRONG_SCORE（_cap_regime、_stop_pressure 共用）同名不同义，勿混用。
+_MOOD_BUCKETS: Dict[str, float] = {"weak_lt": 40.0, "strong_ge": 70.0}
 
 
 def _conf_cap() -> Dict[str, float]:
@@ -180,7 +228,7 @@ def _conf_cap() -> Dict[str, float]:
 
 
 def _bars_days() -> int:
-    return _env_int("QD_STOCK_ANALYZER_BARS_DAYS", _BARS_DAYS_DEFAULT)
+    return _inner.bars_days()      # 天数唯一真源在 _inner（deep 与 analyze 同源，2026-11-26 收敛）
 
 
 def _report_guide() -> Dict[str, str]:
@@ -202,6 +250,12 @@ def _brief_view(horizons: List[Dict[str, Any]], trend: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _stop_key(s: Any) -> Optional[str]:
+    """止损比对键：取文本中第一个数值（价位本身），措辞/孤证标注变化不误报「止损变了」。"""
+    m = re.search(r"\d+(?:\.\d+)?", str(s or ""))
+    return m.group(0) if m else (str(s).strip() or None)
+
+
 def _consistency_view(horizons: List[Dict[str, Any]],
                       prev: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """与上一轮结论比对：只列方向/止损变化的事实，依据由写作层填；缺省 None 不触发。"""
@@ -218,8 +272,9 @@ def _consistency_view(horizons: List[Dict[str, Any]],
             changes.append({"h": h, "from": old_dir, "to": v["dir"]})
         old_stop = old.get("stop")
         if old_stop is not None:
-            changes.append({"h": h, "stop_from": old_stop,
-                            "stop_to": (v.get("invalidate") or "").strip() or None})
+            new_stop = (v.get("invalidate") or "").strip() or None
+            if _stop_key(old_stop) != _stop_key(new_stop):
+                changes.append({"h": h, "stop_from": old_stop, "stop_to": new_stop})
     return {"ok": bool(changes), "changes": changes,
             "note": ("方向或止损较上一轮有变化，按 CONSISTENCY 写明「由 X 改为 Y，依据 Z」；"
                      "Z 只能取本轮新事实，取不到就维持上一轮") if changes else "与上一轮一致"}
@@ -233,21 +288,22 @@ def _days(h: str) -> int:
 
 
 def _days_until(date_str: Any) -> Optional[int]:
-    """距今天数（自然日）；日期认不出返回 None（不猜）。"""
+    """距今天数（自然日）；日期认不出返回 None（不猜）。
+
+    「今天」取 Asia/Shanghai 当日（解禁窗口按 A 股日历口径），不用宿主机本地日：
+    docker 部署常为 UTC，北京时间 00:00~08:00 会把窗口整体算多一天。
+    """
     try:
-        from datetime import date as _date
-        return (_date.fromisoformat(str(date_str)[:10]) - _date.today()).days
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return (datetime.fromisoformat(str(date_str)[:10]).date() - today).days
     except (ValueError, TypeError):
         return None
 
 
 def _events_of(raw: Any, code: str) -> Dict[str, Any]:
     """事件维（目前唯一有日历的事件源：限售解禁）。只取事实，不做处置建议。"""
-    one = ((raw or {}).get("data") or {}).get(code)
-    if one is None:
-        vals = [v for v in ((raw or {}).get("data") or {}).values() if isinstance(v, dict)]
-        if len(vals) == 1:
-            one = vals[0]
+    one = _inner.unwrap_single(raw, code) or {}      # 工具契约违约（非 dict）按缺数处理，不炸整份诊断
     one = one or {}
     if not isinstance(one, dict) or one.get("error") or "upcoming" not in one:
         return {"ok": False, "reason": str((one or {}).get("error") or "解禁日历缺失")}
@@ -258,17 +314,22 @@ def _events_of(raw: Any, code: str) -> Dict[str, Any]:
 def _lockup_bear(events: Dict[str, Any], window_days: int) -> Optional[bool]:
     """解禁供给压力（tape 维的空证据条件）：窗口内有占比 ≥1% 的解禁 ⇒ True。
 
-    阈值 1% 为经验阀（小比例解禁的供给冲击不足以作空证据）；日历缺失 ⇒ None（缺数）。
+    阈值 1% 为经验阀（小比例解禁的供给冲击不足以作空证据）；日历缺失 ⇒ None（缺数）；
+    窗口内解禁的占比字段认不出 ⇒ None（缺数，不当作无压力）。
     """
     if not events.get("ok"):
         return None
     for u in events.get("lockup") or []:
         dd = _days_until(u.get("date"))
         try:
-            ratio = float(u.get("ratio") or 0)
+            ratio = float(u.get("ratio"))
         except (TypeError, ValueError):
-            ratio = 0.0
-        if dd is not None and 0 <= dd <= window_days and ratio >= 1.0:
+            ratio = None
+        if dd is None or not (0 <= dd <= window_days):
+            continue
+        if ratio is None:
+            return None
+        if ratio >= _VOTE_THRESHOLDS["lockup_ratio_min_pct"]:
             return True
     return False
 
@@ -293,13 +354,17 @@ def _session(now: Optional[datetime] = None) -> str:
     """
     from zoneinfo import ZoneInfo
 
-    from ....utils.trading_calendar import CalendarUnavailable, is_trading_day
+    from ....utils.trading_calendar import is_trading_day
 
     dt = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     try:
         if not is_trading_day(dt.strftime("%Y-%m-%d")):
             return "closed"
-    except CalendarUnavailable:
+    except Exception as e:
+        # 日历任何故障（CalendarUnavailable 或意外异常）都只影响展示口径，
+        # 不得让整份诊断失败——显式承认不知道，不按时刻猜成交易日；留日志防静默。
+        logger.warning("[stock-analyzer] session 交易日历判定失败，降级 unknown: %s: %s",
+                       type(e).__name__, e)
         return "unknown"
     hm = dt.strftime("%H:%M")
     if hm < "09:30":
@@ -327,14 +392,17 @@ def _mood_label(market: Dict[str, Any]) -> str:
     if not isinstance(market, dict) or not market:
         return "unknown"
     mood = str(market.get("market_mood") or "")
+    raw_ms = market.get("market_mood_score")
     try:
-        ms = float(market.get("market_mood_score", 50) or 50)
+        ms = float(raw_ms) if raw_ms is not None else None
     except (TypeError, ValueError):
-        ms = 50.0
-    if mood in ("弱势", "偏弱") or ms < 40:
+        ms = None
+    if mood in ("弱势", "偏弱") or (ms is not None and ms < _MOOD_BUCKETS["weak_lt"]):
         return "weak"
-    if mood in ("偏强",) or ms >= 70:
+    if mood in ("偏强",) or (ms is not None and ms >= _MOOD_BUCKETS["strong_ge"]):
         return "strong"
+    if not mood and ms is None:
+        return "unknown"
     return "neutral"
 
 
@@ -391,11 +459,7 @@ def _sector_corr(raw: Any, code: str, chg_pct: Optional[float]) -> Dict[str, Any
     label：自强（α≥+1.5）/ 自弱（α≤−1.5）/ 跟板块（其间）/ 未知（数据缺）。
     「未知」是合法答案：板块涨跌幅缺失时不猜 β、不做修正，只留缺口。
     """
-    one = ((raw or {}).get("data") or {}).get(code)
-    if one is None:
-        vals = [v for v in ((raw or {}).get("data") or {}).values() if isinstance(v, dict)]
-        if len(vals) == 1:
-            one = vals[0]      # 单票取证但键名漂移（前缀/去前缀），唯一值即目标票
+    one = _inner.unwrap_single(raw, code) or {}    # 键名漂移（前缀/去前缀）由唯一值兜底，契约违约按缺数
     one = one or {}
     if not isinstance(one, dict) or not one or one.get("error"):
         return {"ok": False, "reason": str(one.get("error") if isinstance(one, dict) else "板块归属缺失"),
@@ -442,7 +506,8 @@ def _sector_corr(raw: Any, code: str, chg_pct: Optional[float]) -> Dict[str, Any
     out["ok"] = True
     out["chg_pct"] = round(chg_pct, 2)
     out["alpha_pct"] = alpha
-    out["label"] = "自强" if alpha >= 1.5 else ("自弱" if alpha <= -1.5 else "跟板块")
+    _t = _alpha_pct()
+    out["label"] = "自强" if alpha >= _t else ("自弱" if alpha <= -_t else "跟板块")
     return out
 
 
@@ -461,11 +526,12 @@ def _move_guards(sc: Dict[str, Any]) -> Tuple[bool, bool, List[str]]:
     label = sc.get("label")
     up_ok, down_ok = True, True
     chg = sc.get("chg_pct")
-    if chg is not None and chg > 0 and alpha is not None and alpha <= -1.5:
+    _t = _alpha_pct()
+    if chg is not None and chg > 0 and alpha is not None and alpha <= -_t:
         up_ok = False
         notes.append(f"板块α修正：今日 +{chg}% 系板块带动（板块 {sc.get('bench_chg_pct')}%，α={alpha}%，自弱），"
                      "上涨类证据作废")
-    if chg is not None and chg < 0 and alpha is not None and alpha >= 1.5:
+    if chg is not None and chg < 0 and alpha is not None and alpha >= _t:
         down_ok = False
         notes.append(f"板块α修正：今日 {chg}% 系板块带崩（板块 {sc.get('bench_chg_pct')}%，α={alpha}%，自强），"
                      "下跌类证据作废")
@@ -509,8 +575,14 @@ def _v_model(h: str, pred: Dict[str, Any]) -> Dict[str, Any]:
     if not (isinstance(pred, dict) and pred.get("ok")):
         return {"vote": None, "why": [f"P(T+1涨)=未知（{pred.get('reason') if isinstance(pred, dict) else '无预测'}）"],
                 "applicable": True}
-    p = float(pred.get("p_up") or 0.5)
-    vote = 1 if p >= 0.55 else (-1 if p <= 0.45 else 0)
+    try:
+        p = float(pred.get("p_up"))
+    except (TypeError, ValueError):
+        p = None
+    if p is None:
+        return {"vote": None, "why": ["P(T+1涨)不可解析（标定分字段异常）"], "applicable": True}
+    vote = 1 if p >= _VOTE_THRESHOLDS["model_p_up_long"] else (
+        -1 if p <= _VOTE_THRESHOLDS["model_p_up_short"] else 0)
     return {"vote": vote, "why": [f"{'✓' if vote else '·'}P(T+1涨)={p}（唯一标定分）"], "applicable": True}
 
 
@@ -530,26 +602,36 @@ def _v_structure(h: str, tech: Dict[str, Any],
     def _b(x, n):
         return (n, None if x is None else bool(x))
 
+    th = _VOTE_THRESHOLDS
     if h in ("T+1", "T+3"):
-        bull = [("贴已验证支撑", None if (sup_d is None or sup_v is None) else (sup_v and sup_d >= -3.0)),
+        bull = [("贴已验证支撑", None if (sup_d is None or sup_v is None)
+                 else (sup_v and sup_d >= th["sup_near_max_below_pct"])),
                 ("均线多头", stack),
-                ("未超买", None if rsi is None else rsi < 75)]
-        bear = [("跌破MA20超3%", None if dist20 is None else dist20 < -3),
-                ("追高过热", None if (dist20 is None and rsi is None) else ((dist20 or 0) >= 10 or (rsi or 0) >= 75)),
-                ("远离支撑", None if sup_d is None else sup_d < -5)]
+                ("未超买", None if rsi is None else rsi < th["rsi_overbought"])]
+        bear = [("跌破MA20超3%", None if dist20 is None else dist20 < th["break_ma20_pct"]),
+                ("追高过热", None if (dist20 is None and rsi is None)
+                 else ((dist20 or 0) >= th["chase_dist_ma20_pct"] or (rsi or 0) >= th["rsi_overbought"])),
+                ("远离支撑", None if sup_d is None else sup_d < th["sup_far_below_pct"])]
     elif h == "T+5":
-        bull = [("均线多头", stack), ("20日位置≥50", None if pos20 is None else pos20 >= 50),
-                ("乖离≤10%", None if dist20 is None else dist20 <= 10)]
-        bear = [("均线非多头", _neg(stack)), ("20日位置≤40", None if pos20 is None else pos20 <= 40),
+        bull = [("均线多头", stack),
+                ("20日位置≥50", None if pos20 is None else pos20 >= th["t5_pos_up_min"]),
+                ("乖离≤10%", None if dist20 is None else dist20 <= th["t5_dist_cap_pct"])]
+        bear = [("均线非多头", _neg(stack)),
+                ("20日位置≤40", None if pos20 is None else pos20 <= th["t5_pos_dn_max"]),
                 ("价格在MA20下方", None if dist20 is None else dist20 < 0)]
     elif h == "T+10":
-        bull = [("均线多头", stack), ("20日位置≥60", None if pos20 is None else pos20 >= 60)]
-        bear = [("均线非多头", _neg(stack)), ("20日位置≤30", None if pos20 is None else pos20 <= 30),
-                ("MA20下方超5%", None if dist20 is None else dist20 <= -5)]
+        bull = [("均线多头", stack),
+                ("20日位置≥60", None if pos20 is None else pos20 >= th["t10t20_pos_up_min"])]
+        bear = [("均线非多头", _neg(stack)),
+                ("20日位置≤30", None if pos20 is None else pos20 <= th["t10_pos_dn_max"]),
+                ("MA20下方超5%", None if dist20 is None else dist20 <= th["t10_below_ma20_pct"])]
     else:
-        bull = [("均线多头", stack), ("20日位置≥60", None if pos20 is None else pos20 >= 60),
-                ("乖离0~15%", None if dist20 is None else 0 <= dist20 <= 15)]
-        bear = [("均线非多头", _neg(stack)), ("MA20下方超8%", None if dist20 is None else dist20 <= -8)]
+        bull = [("均线多头", stack),
+                ("20日位置≥60", None if pos20 is None else pos20 >= th["t10t20_pos_up_min"]),
+                ("乖离0~15%", None if dist20 is None
+                 else th["t20_dist_min_pct"] <= dist20 <= th["t20_dist_max_pct"])]
+        bear = [("均线非多头", _neg(stack)),
+                ("MA20下方超8%", None if dist20 is None else dist20 <= th["t20_below_ma20_pct"])]
     vote, why, un = _weigh(bull, bear)
     return {"vote": vote, "why": why, "applicable": True}
 
@@ -560,20 +642,22 @@ def _v_volume(h: str, tech: Dict[str, Any], vol5_ratio: Optional[float],
     vr = tech.get("vol_ratio")
     vr_rel = tech.get("vr_rel")
 
+    th = _VOTE_THRESHOLDS
+
     def _strong_vol() -> Optional[bool]:
         if vr_rel is not None:
-            return vr_rel >= 2
-        return None if vr is None else vr >= 1.5
+            return vr_rel >= th["vr_rel_strong"]
+        return None if vr is None else vr >= th["vr_strong"]
 
     if h in ("T+1", "T+3"):
         up = None if chg is None else chg > 0
         down = None if chg is None else chg < 0
         bull = [("放量上涨", None if (up is None or _strong_vol() is None) else (up and _strong_vol() and up_ok))]
-        bear = [("涨无量（量价背离)", None if (up is None or vr is None) else (up and vr < 0.85)),
+        bear = [("涨无量（量价背离)", None if (up is None or vr is None) else (up and vr < th["vr_no_vol"])),
                 ("放量下跌", None if (down is None or _strong_vol() is None) else (down and _strong_vol() and down_ok))]
     else:
-        bull = [("5日量能抬升", None if vol5_ratio is None else vol5_ratio >= 1.2)]
-        bear = [("5日量能萎缩", None if vol5_ratio is None else vol5_ratio <= 0.75)]
+        bull = [("5日量能抬升", None if vol5_ratio is None else vol5_ratio >= th["vol5_lift"])]
+        bear = [("5日量能萎缩", None if vol5_ratio is None else vol5_ratio <= th["vol5_shrink"])]
     vote, why, un = _weigh(bull, bear)
     if vr_rel is not None:
         why = [f"量比{vr}/大盘校准vr_rel={vr_rel}"] + why
@@ -594,9 +678,9 @@ def _v_flow(h: str, flow: Dict[str, Any]) -> Dict[str, Any]:
         note += f"（连续方向:{rec.get('streak_dir')}）"
     if h in ("T+1", "T+3"):
         bull = [("5日净流入", None if n5 is None else n5 > 0),
-                ("资金强于大盘", None if rel is None else rel >= 1)]
+                ("资金强于大盘", None if rel is None else rel >= _VOTE_THRESHOLDS["flow_rel_strong"])]
         bear = [("5日净流出", None if n5 is None else n5 < 0),
-                ("资金弱于大盘", None if rel is None else rel <= -1)]
+                ("资金弱于大盘", None if rel is None else rel <= -_VOTE_THRESHOLDS["flow_rel_strong"])]
     else:
         bull = [("20日净流入", None if n20 is None else n20 > 0),
                 ("5日净流入", None if n5 is None else n5 > 0)]
@@ -612,13 +696,14 @@ def _v_market(h: str, tech: Dict[str, Any]) -> Dict[str, Any]:
     rs5 = tech.get("rs_5d")
     if rs0 is None and rs5 is None:
         return {"vote": None, "why": ["相对大盘超额缺失（基准未取到）"], "applicable": True}
+    th = _VOTE_THRESHOLDS
     if h in ("T+1", "T+3"):
-        bull = [("强于大盘", None if rs0 is None else rs0 >= 1)]
-        bear = [("弱于大盘", None if rs0 is None else rs0 <= -2)]
+        bull = [("强于大盘", None if rs0 is None else rs0 >= th["rs_d0_strong"])]
+        bear = [("弱于大盘", None if rs0 is None else rs0 <= th["rs_d0_weak"])]
         why_head = f"超额rs_d0={rs0}%"
     else:
-        bull = [("5日强于大盘", None if rs5 is None else rs5 >= 2)]
-        bear = [("5日弱于大盘", None if rs5 is None else rs5 <= -2)]
+        bull = [("5日强于大盘", None if rs5 is None else rs5 >= th["rs_5d_strong"])]
+        bear = [("5日弱于大盘", None if rs5 is None else rs5 <= th["rs_5d_weak"])]
         why_head = f"超额rs_5d={rs5}%"
     vote, why, un = _weigh(bull, bear)
     return {"vote": vote, "why": [why_head] + why, "applicable": True}
@@ -635,7 +720,8 @@ def _v_sector(h: str, sc: Dict[str, Any]) -> Dict[str, Any]:
     else:
         head = (f"行业板未命中（industry={sc.get('industry')}），"
                 f"基准用所属板块均值{sc.get('bench_chg_pct')}%，α={alpha}%（{sc.get('label')}）")
-    vote = 1 if alpha >= 1.5 else (-1 if alpha <= -1.5 else 0)
+    _t = _alpha_pct()
+    vote = 1 if alpha >= _t else (-1 if alpha <= -_t else 0)
     return {"vote": vote, "why": [head], "applicable": True}
 
 
@@ -661,13 +747,13 @@ def _v_tape(h: str, patterns: List[Dict], patterns_ok: bool, seal: Dict[str, Any
         bull = [("突破/启动形态", pat_cond),
                 ("强封（一字/厚封单）", None if tag in (None, "none", "unknown") else strong_seal)]
         bear = [("弱势封板（开板多/封单薄）", None if tag in (None, "none", "unknown") else weak_seal),
-                ("高位连板≥2", None if zt_streak is None else zt_streak >= 2),
-                ("近期解禁（≤20日，占比≥1%）", _lockup_bear(events, 20)),
+                ("高位连板≥2", None if zt_streak is None else zt_streak >= _VOTE_THRESHOLDS["zt_streak_hot"]),
+                ("近期解禁（≤20日，占比≥1%）", _lockup_bear(events, _VOTE_THRESHOLDS["lockup_window_short_days"])),
                 ("拉高出货线索", bool(pump))]
     else:
         bull = [("形态确认（≥2）", None if not patterns_ok else (len(patterns) >= 2 and up_ok))]
-        bear = [("涨停透支（10日≥3次）", None if zt10 is None else zt10 >= 3),
-                ("近期解禁（≤45日，占比≥1%）", _lockup_bear(events, 45)),
+        bear = [("涨停透支（10日≥3次）", None if zt10 is None else zt10 >= _VOTE_THRESHOLDS["zt10_hot"]),
+                ("近期解禁（≤45日，占比≥1%）", _lockup_bear(events, _VOTE_THRESHOLDS["lockup_window_long_days"])),
                 ("拉高出货线索", bool(pump))]
     vote, why, un = _weigh(bull, bear)
     head = []
@@ -729,11 +815,16 @@ def _decide(votes: Dict[str, Dict[str, Any]]) -> Tuple[str, str, float]:
 # ─────────────────────────── 单档视图 ───────────────────────────
 
 def _level_ref(levels: Dict[str, Any], h: str, side: str) -> Optional[Dict[str, Any]]:
-    """按周期挑锚定价位：短档用最近的，长档优先更粗的（ma20/ma60/lo60/枢轴）。"""
+    """按周期挑锚定价位：短档（T+1/T+3/T+5）取排序首位（verified→方法数→距离），
+    只有长档（T+10/T+20）优先更粗的级别（ma20/ma60/lo60/枢轴）。
+
+    2026-11-26 修正：此前 T+5 误随长档用粗锚定，而 SKILL 只把 ma20/ma60/lo60
+    级优先权给 T+10/T+20，T+5 属输出短档，其触发/证伪与 T+1/T+3 同口径。
+    """
     rows = levels.get("supports" if side == "sup" else "resists") or []
     if not rows:
         return None
-    if h in ("T+1", "T+3"):
+    if h in _SHORT_HORIZONS:
         return rows[0]
     coarse = ("ma20", "ma60", "lo60", "hi60", "枢轴P")
     for r in rows:
@@ -754,9 +845,12 @@ def _horizon_view(h: str, ctx: Dict[str, Any], cap: float, evidence: float) -> D
     """单档位视图：方向 + 置信度 + 触发/证伪 + 多维依据（T+1 之外不给概率）。"""
     need = _days(h)
     view: Dict[str, Any] = {"h": h, "days": need, "dir": "未知", "p_up": None,
-                            "confidence": 0.0, "votes": {}, "basis": [], "unknown": [],
-                            "trigger": "", "invalidate": "", "reason": ""}
+                            "confidence": 0.0, "agree": 0.0, "votes": {}, "basis": [],
+                            "unknown": [], "trigger": "", "invalidate": "", "reason": ""}
 
+    if need <= 0:
+        view["reason"] = f"档位 {h} 天数未收录（label_spec.HOLDS 缺键），无法推演"
+        return view
     if ctx["bars_n"] < need:
         view["reason"] = f"日线仅 {ctx['bars_n']} 根，不足 {need} 根，该档无法推演"
         return view
@@ -935,26 +1029,26 @@ def _stop_pressure(tech: Dict[str, Any], flow: Dict[str, Any], sc: Dict[str, Any
     alpha = sc.get("alpha_pct")
     if alpha is not None:
         try:
-            alpha_f = float(alpha)
-            weak_alpha = float(os.getenv("QD_STOCK_ANALYZER_STOP_WEAK_ALPHA_PCT", "0") or 0)
-            if alpha_f <= weak_alpha:
+            if float(alpha) <= -_alpha_pct():
                 facts.append(f"弱于板块（α={alpha}%）")
         except (TypeError, ValueError):
             pass
     ms = market.get("market_mood_score")
     if ms is not None:
         try:
-            if float(ms) <= 45:
+            if float(ms) <= _env_float("QD_STOCK_ANALYZER_WEAK_SCORE", 45.0):
                 facts.append(f"大盘情绪偏弱（{ms}）")
         except (TypeError, ValueError):
             pass
+    # 两层止损的距离差 = 止损参考位（nearest_support）↔ 最后防线（排序首位支撑），
+    # 与 _horizon_view 展示的两层严格同源；两层重合或只剩一层 ⇒ None，
+    # 不拿未展示的支撑冒充第二层。
     gap_pct = None
     near = levels.get("nearest_support")
-    for s in (levels.get("supports") or []):
-        if near and s.get("px") != near.get("px") and s.get("dist_pct") is not None \
-                and near.get("dist_pct") is not None:
-            gap_pct = round(abs(float(s["dist_pct"]) - float(near["dist_pct"])), 2)
-            break
+    top = (levels.get("supports") or [None])[0]
+    if (near and top and near.get("px") != top.get("px")
+            and near.get("dist_pct") is not None and top.get("dist_pct") is not None):
+        gap_pct = round(abs(float(top["dist_pct"]) - float(near["dist_pct"])), 2)
     if chip and chip.get("ok"):
         loss = chip.get("loss_ratio")
         lower = (chip.get("band_90") or {}).get("lower")
@@ -1004,15 +1098,16 @@ def _risks(card: Dict[str, Any], tech: Dict[str, Any], sc: Dict[str, Any],
            events: Dict[str, Any]) -> List[str]:
     """客观风险标记：只罗列事实，不构成买卖建议。"""
     out: List[str] = [str(r) for r in (card.get("rt_risks") or []) + (card.get("flow_risks") or [])]
+    th = _VOTE_THRESHOLDS
     if tech.get("is_20d_high"):
         out.append("处于20日最高位（追高风险）")
-    if (tech.get("rsi14") or 0) >= 75:
+    if (tech.get("rsi14") or 0) >= th["risk_rsi_overbought"]:
         out.append(f"RSI{tech['rsi14']} 超买")
-    if (tech.get("dist_ma20_pct") or 0) >= 15:
+    if (tech.get("dist_ma20_pct") or 0) >= th["risk_dist_ma20_pct"]:
         out.append(f"离MA20已有 {tech['dist_ma20_pct']}%（乖离偏大）")
-    if (tech.get("zt_streak") or 0) >= 2:
+    if (tech.get("zt_streak") or 0) >= th["risk_zt_streak"]:
         out.append(f"{tech['zt_streak']}连板（次日分歧概率高）")
-    if (tech.get("vol_ratio") or 0) >= 4:
+    if (tech.get("vol_ratio") or 0) >= th["risk_vol_ratio"]:
         out.append(f"量比{tech['vol_ratio']}异常放大（注意出货）")
     if tech.get("limit_up"):
         out.append("当日涨停封板（次日竞价溢价已 price in，需防冲高回落）")
@@ -1028,7 +1123,7 @@ def _risks(card: Dict[str, Any], tech: Dict[str, Any], sc: Dict[str, Any],
             c = float(b.get("change_pct"))
         except (TypeError, ValueError):
             continue
-        if c <= -3:
+        if c <= _VOTE_THRESHOLDS["risk_board_drop_pct"]:
             out.append(f"所属板块「{b.get('name')}」今日 {c}%（板块拖累）")
     return out
 
@@ -1106,13 +1201,6 @@ def _render(out: Dict[str, Any]) -> str:
 
     长篇事实（九块补证/逐维投票/basis）留在结构化 dict 里做经验收集，不进正文。
     """
-    def _money(v: Any) -> str:
-        try:
-            x = float(v)
-            return f"{x / 1e8:.2f}亿" if abs(x) >= 1e8 else f"{x / 1e4:.0f}万"
-        except (TypeError, ValueError):
-            return "—"
-
     def _ptxt(p: Any) -> str:
         if not isinstance(p, dict) or p.get("price") is None:
             return "未知"
@@ -1140,6 +1228,9 @@ def _render(out: Dict[str, Any]) -> str:
     tr = out.get("trend_outlook") or {}
     if tr.get("trend"):
         lines.append(f"长档：{tr['trend']}")
+    mtf = out.get("mtf")
+    if isinstance(mtf, dict) and (mtf.get("daily") or mtf.get("m15") or mtf.get("m5")):
+        lines.append(_mtf_line(mtf))
 
     exp: List[str] = []
     sc = out.get("sector") or {}
@@ -1192,8 +1283,50 @@ def _bars_for(code: str) -> List[Dict[str, Any]]:
     from ._deps import fetch_kline
     bars = fetch_kline(code, days=_bars_days()) or []
     with _BARS_CACHE_LOCK:
+        if len(_BARS_CACHE) >= 64:
+            for _k in [k for k, v in _BARS_CACHE.items() if now - v["t"] >= _BARS_CACHE_TTL_S]:
+                _BARS_CACHE.pop(_k, None)
         _BARS_CACHE[code] = {"t": now, "bars": bars}
     return bars
+
+
+def _safe_call(name: str, fn, missing: List[str]):
+    """并发取证单任务包装：异常写 missing 留痕并返回 (name, None)，不炸整轮。"""
+    try:
+        return name, fn()
+    except Exception as e:
+        missing.append(f"{name}: {type(e).__name__}: {e}")
+        return name, None
+
+
+def _run_wave(tasks: Dict[str, Any], missing: List[str], deadline: float) -> Dict[str, Any]:
+    """收尾并发波：依赖已满足的网络任务一线程一任务并发跑；超时留痕口径与 _gather 一致。"""
+    out: Dict[str, Any] = {}
+    if not tasks:
+        return out
+    futs: Dict[Any, str] = {}
+    ex = ThreadPoolExecutor(max_workers=max(1, len(tasks)))
+    try:
+        futs = {ex.submit(_safe_call, name, fn, missing): name for name, fn in tasks.items()}
+        for fut in as_completed(futs, timeout=deadline):
+            name, val = fut.result()
+            out[name] = val
+    except Exception as e:
+        missing.append(f"收尾并发: {type(e).__name__}: {e}")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    for fut, name in futs.items():
+        if name in out:
+            continue
+        if fut.done():
+            try:
+                _, val = fut.result()      # 已完成但未迭代到的按真实结果收，不误记超时
+                out[name] = val
+                continue
+            except Exception:
+                pass
+        missing.append(f"{name}: 超时>{deadline:g}s 未返回")
+    return out
 
 
 def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
@@ -1212,13 +1345,6 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
     except Exception as e:
         target_day = ""
         missing.append(f"取数目标日: {type(e).__name__}: {e}")
-
-    def _task(name: str, fn):
-        try:
-            return name, fn()
-        except Exception as e:
-            missing.append(f"{name}: {type(e).__name__}: {e}")
-            return name, None
 
     def _t_deep():
         from ._deep import deep_analyze
@@ -1285,7 +1411,7 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
     futs: Dict[Any, str] = {}
     ex = ThreadPoolExecutor(max_workers=max(1, len(tasks)))
     try:
-        futs = {ex.submit(_task, name, fn): name for name, fn in tasks.items()}
+        futs = {ex.submit(_safe_call, name, fn, missing): name for name, fn in tasks.items()}
         for fut in as_completed(futs, timeout=_DEADLINE_S):
             name, val = fut.result()
             out[name] = val
@@ -1294,8 +1420,16 @@ def _gather(code: str, deep: bool) -> Tuple[Dict[str, Any], List[str]]:
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     for fut, name in futs.items():
-        if name not in out:
-            missing.append(f"{name}: 超时>{_DEADLINE_S}s 未返回")
+        if name in out:
+            continue
+        if fut.done():
+            try:
+                _, val = fut.result()      # 已完成但未迭代到的按真实结果收，不误记超时
+                out[name] = val
+                continue
+            except Exception:
+                pass
+        missing.append(f"{name}: 超时>{_DEADLINE_S}s 未返回")
     return out, missing
 
 
@@ -1350,11 +1484,12 @@ def analyze(code: str, deep: bool = False,
     if not isinstance(card, dict):
         reason = "；".join(str(e) for e in (deep_res.get("errors") or [])[:2]) or "deep 基座未返回证据卡"
         return AnalyzerResult({
+            "report_guide": _report_guide(),
             "code": code, "error": f"证据装配失败：{reason}",
             "missing": missing + list(deep_res.get("missing") or []),
             "horizons": [{"h": h, "days": _days(h), "dir": "未知", "confidence": 0.0,
                           "reason": "证据装配失败，无法推演", "trigger": "", "invalidate": ""}
-                         for h in _HORIZONS],
+                         for h in _SHORT_HORIZONS],
         })
 
     missing = missing + [str(m) for m in (deep_res.get("missing") or [])] + \
@@ -1391,14 +1526,11 @@ def analyze(code: str, deep: bool = False,
     bars = _bars_for(code)
     if not bars:
         missing.append("bars: 日线缺失")
-    def _t_flow_driver():
-        from ._extra_facts import build_flow_driver
-        return build_flow_driver(code, bars)
-    flow_driver = _aux_field("flow_driver", _t_flow_driver, missing)
-    extra["flow_driver"] = flow_driver
     chg = rt.get("change_pct")
+    if not isinstance(chg, (int, float)) or isinstance(chg, bool):
+        chg = None
     if chg is None:
-        chg = tech.get("change_pct")
+        missing.append("chg: 当日涨跌缺数（不回退昨日日线口径，板块α修正按未知处理）")
 
     levels = _levels.build_levels(bars, code, card.get("name") or "", tech,
                                   close=tech.get("close"))
@@ -1433,7 +1565,7 @@ def analyze(code: str, deep: bool = False,
         norm = [{"date": str(b.get("time") or "")[:10], "open": _num(b.get("open")),
                  "high": _num(b.get("high")), "low": _num(b.get("low")),
                  "close": _num(b.get("close")), "volume": _num(b.get("volume"))}
-                for b in bars]
+                for b in bars[-30:]]
         zt_history = _inner.zt_days(norm, code, card.get("name") or "", 8)
 
     miss_text = "；".join(missing)
@@ -1464,9 +1596,16 @@ def analyze(code: str, deep: bool = False,
     if not market_outlook["ok"]:
         market_outlook["reason"] = "大盘预测分缺失"
     price = rt.get("price") or tech.get("close")
-    cap_regime = _aux_field("cap_regime", lambda: _cap_regime.build(code, price, market), missing)
-    board_rank = _aux_field("board_rank", lambda: _board_rank.build(code, sector), missing)
-    trend_outlook = _aux_field("trend_outlook", lambda: _trend.build(bars), missing)
+    wave = _run_wave({
+        "flow_driver": lambda: _extra_facts.build_flow_driver(code, bars),
+        "cap_regime": lambda: _cap_regime.build(code, price, market),
+        "board_rank": lambda: _board_rank.build(code, sector),
+        "trend_outlook": lambda: _trend.build(bars),
+    }, missing, _DEADLINE_S)
+    extra["flow_driver"] = wave.get("flow_driver") or {"ok": False, "reason": "flow_driver 未取证"}
+    cap_regime = wave.get("cap_regime") or {"ok": False, "reason": "cap_regime 未取证"}
+    board_rank = wave.get("board_rank") or {"ok": False, "reason": "board_rank 未取证"}
+    trend_outlook = wave.get("trend_outlook") or {"ok": False, "reason": "trend_outlook 未取证"}
     execution_core = _execution_core(horizons, levels, price)
     brief = _brief_view(horizons, trend_outlook)
     consistency = _consistency_view(horizons, prev_horizons)

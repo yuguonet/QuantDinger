@@ -138,6 +138,13 @@ _L2_BOARDS_NEUTRAL = _env_i("L2_BOARDS_NEUTRAL", 6)
 _L2_BOARDS_WEAK = _env_i("L2_BOARDS_WEAK", 4)
 _L3_LIMIT = _env_i("L3_LIMIT", 35)
 _L3_PER_BOARD = _env_i("L3_PER_BOARD", 10)
+# 「先跳先选」区分板块（2026-11-26 用户拍板）：同板块内先跳的是龙头。
+# 1=全局截断排序键首位用 board_rank（同板块组内 t_first 升序序号，1=板块龙头）——
+#   各板块的龙头不被早启动板块的后续票挤掉；0=回退旧纯时间口径（跨板块裸 t_first）。
+# 实测动机：002242 九阳 11-17 板块内先跳（跳变 10:04/触板 10:40），被 09:30-09:50
+#   早跳的 118 只其他板块票全局挤出；其后验 11-18 跌停 -10% 属侥幸，11-23/24 早盘
+#   秒板入选的才是有效信号——晚启动板块的龙头不该被绝对时刻歧视。
+_BOARD_RANK_FIRST = _env_i("BOARD_RANK_FIRST", 1)
 _FOLLOW_WINDOW_MIN = _env_i("FOLLOW_WINDOW_MIN", 10)
 _MIN_BOARD_FUND_PCT = _env_f("MIN_BOARD_FUND_PCT", 0.0)
 _INDUSTRY_MIN_MEMBERS = _env_i("INDUSTRY_MIN_MEMBERS", 10)
@@ -1233,6 +1240,83 @@ def _flag_deadpool_guard(items: List[Dict[str, Any]], day: str,
     return out, flagged, unknown
 
 
+def _enrich_seal_from_closing_pool(zt_rows: List[Dict[str, Any]], day: str) -> List[Dict[str, Any]]:
+    """盘后 15:00 边界：用收盘涨停池回填封单额/连板数（2026-11-26 用户拍板）。
+
+    收盘封单/连板数在 15:00 信息边界内是**已定格的事实**（收盘时点可知），
+    不是未来信息——曾触板池重建把它们置 0 是为**盘中**防前视；盘后运行回填
+    只对最终封住的票（收盘池里的 code）补值，炸板票保持触板语义（0）不破坏
+    口径。回填后涨停票 reason 文案自动升级为「涨停HH:MM 封板X亿 N连板」，
+    封板厚度恢复为涨停票之间的次级排序证据（板块内 zt_sorted 第二键）。
+    失败返回原列表（不阻断主流程，记 warning）。
+    """
+    try:
+        from app.data_sources.cn_stock_ext import limit_pool
+        pool = limit_pool("limit_up_pool", day) or []
+        by_code = {}
+        for r in pool:
+            if isinstance(r, dict):
+                by_code[str(r.get("code") or r.get("stock_code") or "").split(".")[0]] = r
+    except Exception as e:
+        logger.warning("[topdown] 收盘池读取失败（封单不回填）: %s", e)
+        return zt_rows
+    filled = 0
+    for r in zt_rows or []:
+        p = by_code.get(str(r.get("stock_code") or "").split(".")[0])
+        if not p:
+            continue                      # 炸板票：保持触板语义（seal_amount=0）
+        for k in ("seal_amount", "amount", "continuous_zt_days", "open_count"):
+            v = p.get(k)
+            if v is not None:
+                r[k] = v
+        filled += 1
+    if filled:
+        logger.info("[topdown] 盘后封单回填 %s/%s 只（收盘池）", filled, len(zt_rows or []))
+    return zt_rows
+
+
+def _board_rank_sort(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """全局截断排序（纯函数，可单测）。2026-11-26 用户拍板并两轮调整。
+
+    每只票算 board_rank = 同 (track, board) 组内按 t_first 升序的序号
+    （1 = 板块龙头；涨停票 t_first=触板时刻，与跳变票同排；并列 t_first 时
+    dup_n 高者在前）。排序键（升序）：
+
+        board_rank → -board_net_pct → -dup_n → t_first
+        → flow_valid → deadpool → -fund_circ_ratio
+
+    语义：
+      · board_rank 首位——同板块内先跳的是龙头，各板块龙头优先于任何板块的
+        第 2 名（晚启动板块的龙头不被早启动板块的后续票挤掉）；
+      · board_net_pct 第二——强板块（资金净占比高）的票优先于弱板块同位次票；
+      · dup_n 第三——多板块资金共识优先于单板块（同板块强度下）；
+      · t_first 殿后——以上都打平时才比时刻。
+    跨板块/组缺失的键按中性值处理（board_net_pct 缺 = 0）。_BOARD_RANK_FIRST=0
+    时不打 board_rank，退化为旧纯时间口径。返回排序后的新列表（就地写
+    board_rank）。
+    """
+    if _BOARD_RANK_FIRST:
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for x in items:
+            groups.setdefault((x.get("track"), x.get("board")), []).append(x)
+        for grp in groups.values():
+            grp.sort(key=lambda x: (x.get("t_first") or "99:99",
+                                    -(x.get("dup_n") or 1)))
+            for i, x in enumerate(grp, 1):
+                x["board_rank"] = i
+    else:
+        for x in items:
+            x.pop("board_rank", None)
+    return sorted(items, key=lambda x: (
+        (x.get("board_rank") or 99) if _BOARD_RANK_FIRST else 0,
+        -(x.get("board_net_pct") or 0),
+        -(x.get("dup_n") or 1),
+        (x.get("t_first") or "99:99"),
+        0 if x.get("flow_valid") else 1,
+        1 if x.get("deadpool") else 0,
+        -(x.get("fund_circ_ratio") or 0)))
+
+
 def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
                  limit: Optional[int] = None) -> Dict[str, Any]:
     """三层漏斗主流程：L1 大盘闸 → L2 板块闸 → L3 板块内选股 → 截断。
@@ -1280,6 +1364,10 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     # 涨停票 reason 文案自动落「触板 HH:MM」（picked head 逻辑 amt>0 else 触板）。
     as_of_eff = _sq.resolve_as_of(as_of)
     zt_rows = zt_rows_asof(d, as_of_eff, _board_union_members(boards))
+    # 盘后 15:00 边界：收盘封单/连板数是边界内已定格事实，回填给最终封住的票
+    # （炸板票保持触板语义）——恢复封板厚度排序与 reason 证据（见函数 docstring）。
+    if as_of_eff >= "15:00":
+        zt_rows = _enrich_seal_from_closing_pool(zt_rows, d)
 
     per_board: List[Dict[str, Any]] = []
     all_picked: List[Dict[str, Any]] = []
@@ -1380,11 +1468,10 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     if deadpool_unknown:
         notes.append(f"死水/噪音护栏 {deadpool_unknown} 只因T-1全日切片/流通股本缺失未打标")
 
-    all_picked.sort(key=lambda x: ((x.get("t_first") or "99:99"),
-                                   -(x.get("dup_n") or 1),
-                                   0 if x.get("flow_valid") else 1,
-                                   1 if x.get("deadpool") else 0,
-                                   -(x.get("fund_circ_ratio") or 0)))
+    # 全局截断：「先跳先选」区分板块——同板块内先跳的是龙头（board_rank=1），
+    # 各板块龙头优先于任何板块的第 2 名（_BOARD_RANK_FIRST，2026-11-26 拍板）。
+    # 开关关闭时退化为旧纯 t_first 口径（对照回测用）。
+    all_picked = _board_rank_sort(all_picked)
     trunc = all_picked[:lim]
 
     for pb in per_board:
@@ -1420,6 +1507,7 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
             "dup_min_gate": _DUP_MIN,
             "flow_invalid_n": flow_invalid,
             "limit": lim,
+            "board_rank_first": bool(_BOARD_RANK_FIRST),
             "short_of_limit": len(trunc) < lim,
             "by_kind": {k: sum(1 for x in trunc if x.get("kind") == k)
                         for k in ("limit_up", "follow", "jump")},

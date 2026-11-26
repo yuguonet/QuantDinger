@@ -6,44 +6,28 @@
 模块，不改其文件，也不改 screen_query 共享层。取数只调 app.data_sources.screen_query
 的被动只读接口（_tag_map / cross_section / board_series / ticks）。
 
-口径：盘中与历史都用 realtime_snapshot 分钟拍（60s 一拍、保留 8 天），不碰 kline_1m
+口径：盘中与历史都用 realtime_snapshot 分钟拍（60s 一拍、保留 20 个交易日），不碰 kline_1m
 ——后者盘后回填、盘中当日 0 行，且与 snapshot 的同刻量差约 7%、净额差 55%~78%，
 两端不得拼接。龙头 = 板块内最早触及涨停价者；跟随 = 龙头触板后 10 分钟内方向与
 强度都跟上的成员。缺数显式 None / ok=False，不补默认值、不给方向票。
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import _inner
-
-
-def _env_f(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_i(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _num(v: Any) -> Optional[float]:
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if f != f else f
+from ._inner import env_float as _env_f, env_int as _env_i, num as _num
 
 
 def _now_hhmm() -> str:
-    now = datetime.now()
+    """分时截断时刻（Asia/Shanghai 墙上钟，与日线/快照口径同源）；非交易时段取 15:00。
+
+    显式钉时区：宿主机/docker 为 UTC 时，naive now() 会把盘中判成凌晨 ⇒ 永远取 15:00，
+    板块排名与跟随判定会拿全天口径冒充盘中口径。
+    """
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
     t = now.strftime("%H:%M")
     return t if ("09:30" <= t <= "11:30" or "13:00" <= t <= "15:00") else "15:00"
 

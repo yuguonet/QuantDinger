@@ -28,7 +28,8 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
   2. ON CONFLICT (symbol, time) DO UPDATE 幂等写入，重复跑不产生重复数据
   3. 独立表，不与 kline 表混用
   4. 表自动创建 (CREATE TABLE IF NOT EXISTS)，无需手动建表
-  5. 单表，保留 KEEP_DAYS 天历史（默认 8 天），过期自动清理
+  5. 单表，按交易日保留 KEEP_TRADING_DAYS 个交易日历史（默认 20），过期自动清理；
+     日历不可用时跳过本轮清理，不用自然日猜窗口（避免长假附近误删）
   6. **空拍不入库** (2026-10-17): open<=0 且 volume<=0 的记录是"无成交前收报价",
      竞价段扩窗后这类会大量出现, 落库必污染下游 (见 _extract_snapshot_records)
 
@@ -56,6 +57,7 @@ realtime_snapshot.py — 全市场实时行情快照原始数据采集
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
@@ -66,7 +68,7 @@ logger = get_logger(__name__)
 
 TZ_CN = timezone(timedelta(hours=8))
 
-# 单表名 — 2026-09-26 由按年分表改为单表（KEEP_DAYS 清理机制已控量）
+# 单表名 — 单表存储，历史深度由 KEEP_TRADING_DAYS 交易日窗口控量
 _TABLE = "realtime_snapshot"
 
 
@@ -360,22 +362,37 @@ def _is_trading_collect_time(now: datetime) -> bool:
 
 
 # ================================================================
-# 数据清理: 删除超过 KEEP_DAYS 天的快照数据
+# 数据清理: 删除保留窗口之外的快照数据
 # ================================================================
 
-# 快照保留天数（2026-09-26 由 5→8）。
-# 盘中策略回看窗口、资金流近似计算、hub minute_live 当日回看均依赖此数据，
-# 保留 8 天可覆盖完整两周工作日（含一个周末）。
-KEEP_DAYS = 8
+# 快照保留窗口：最近 KEEP_TRADING_DAYS 个交易日（含今日），阈值走 env。
+# 盘中策略回看窗口、资金流近似计算、hub minute_live 当日回看均依赖此数据。
+# 交易日口径由 trading_calendar 提供；日历不可用时不猜窗口、跳过本轮清理。
+KEEP_TRADING_DAYS = int(os.getenv("QD_SNAPSHOT_KEEP_TDAYS", "20"))
 
 
-def _cleanup_old_snapshots(keep_days: int = KEEP_DAYS):
-    """删除 realtime_snapshot 单表中超过 keep_days 天的数据（天然跨年）"""
+def _cleanup_old_snapshots(keep_days: int | None = None):
+    """删除 realtime_snapshot 中早于保留窗口起点的数据（天然跨年）。
+
+    keep_days 为保留的交易日数（含今日），缺省取 KEEP_TRADING_DAYS。
+    cutoff = 今日往前第 (keep_days-1) 个交易日；DELETE < cutoff 00:00:00，
+    使 cutoff 当天整日数据完整保留，窗口内共 keep_days 个交易日。
+    交易日历不可用（无缓存且所有源失败）时记 warning 并跳过本轮清理：
+    拿不到准确 cutoff 就不删，避免长假附近按自然日误删历史。
+    """
+    n = KEEP_TRADING_DAYS if keep_days is None else keep_days
+    today = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+    try:
+        from app.utils.trading_calendar import prev_trading_day
+        cutoff_date = today if n <= 1 else prev_trading_day(today, n - 1)
+    except Exception as e:
+        logger.warning("[realtime_snapshot] 交易日历不可用，跳过本轮清理: %s", e)
+        return
+
     from app.utils.db_market import get_market_db_manager
     mgr = get_market_db_manager()
     pool = mgr._get_pool("CNStock")
-    cutoff = datetime.now(TZ_CN) - timedelta(days=keep_days)
-    cutoff_str = cutoff.strftime("%Y-%m-%d 00:00:00")
+    cutoff_str = f"{cutoff_date} 00:00:00"
     try:
         with pool.connection() as conn:
             cur = conn.cursor()
@@ -489,8 +506,8 @@ def collect_realtime_snapshot() -> Dict:
             len(missing_sample), ", ".join(missing_sample),
         )
 
-    # ── 5. 清理过期数据（保留 KEEP_DAYS 天） ──
-    _cleanup_old_snapshots(keep_days=KEEP_DAYS)
+    # ── 5. 清理过期数据（保留 KEEP_TRADING_DAYS 个交易日） ──
+    _cleanup_old_snapshots()
 
     return {
         "status": "ok" if success_rate > 80 else "error",
