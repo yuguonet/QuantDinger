@@ -108,7 +108,7 @@ def _decision_sha(experiment: str, experience_id: Optional[str],
                   actor: str) -> str:
     raw = json.dumps({
         "experiment": experiment, "experience_id": experience_id,
-        "from_mode": from_mode, "to_mode": decision.get("consumption_mode"),
+        "from_mode": from_mode, "to_mode": decision.get("to_mode"),
         "verdict": decision.get("verdict"), "reason": decision.get("reason"),
         "evidence": evidence, "config_sha": config_sha, "actor": actor,
     }, sort_keys=True, ensure_ascii=False, default=str)
@@ -166,7 +166,7 @@ def _write_ledger(conn, *, experiment, experience_id, experience_version,
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         ON CONFLICT (decision_sha) DO NOTHING
     """, (sha, experiment, experience_id, experience_version, from_mode,
-          str(decision.get("consumption_mode")), str(decision.get("verdict")),
+          str(decision.get("to_mode")), str(decision.get("verdict")),
           str(decision.get("reason")), json.dumps(evidence, ensure_ascii=False),
           config_sha, actor))
     cur.close()
@@ -294,7 +294,7 @@ def human_override(experiment: str, *, experience_ids: Sequence[str],
                 if action == "demote":
                     idx = _MODES.index(cur_mode) if cur_mode in _MODES else 0
                     target = _MODES[max(0, idx - 1)]
-                    decision = {"consumption_mode": target,
+                    decision = {"to_mode": target,
                                 "verdict": "demote", "reason": reason}
                     if target != cur_mode:
                         cur = conn.cursor()
@@ -305,7 +305,7 @@ def human_override(experiment: str, *, experience_ids: Sequence[str],
                         cur.close()
                         result["applied"] = True
                 else:
-                    decision = {"consumption_mode": cur_mode,
+                    decision = {"to_mode": cur_mode,
                                 "verdict": action, "reason": reason}
                 _write_ledger(conn, experiment=experiment, experience_id=eid,
                               experience_version="v1", from_mode=cur_mode,

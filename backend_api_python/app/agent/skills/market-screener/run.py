@@ -165,8 +165,19 @@ _REPORT_GUIDE = {
         "★ 依据原始资金、量能和位置证据判断资格；**缺证据=坏证据**"
         "（gaps 与报告未引用的关键判据按最不利档读，从满卡 analyzed 补到证据才解除）；"
         "关键证据缺失或相互矛盾时须说明，不得编造或把未知当作已确认。\n"
-        "★ 买点/止损写关键位置及位置名，不限定均线；禁止用 VWAP/分时均价当买点；"
-        "★ 止损宽度取 **min(amp_avg5, 8%)**，amp≥8% 时封顶 8%、靠仓位控风险；"
+        "★ 买点 = 承接位挂单（承接位选股框架 2026-11-26，买点三词退休、一锚上岗）："
+        "从 rank 的 `anchor.primary` 取锚位并写明类型（封板价 seal/涨停起点 zt/"
+        "成交密集区 poc/缺口 gap/前低 lo20），挂单价 = 锚位 ± 带宽（带宽参考 amp_avg5，"
+        "默认 ±1.5%）；买点列格式「<锚类型> <锚价>±带宽，承接<confirmed/partial>」"
+        "（例：「涨停起点 9.31±1.5%，承接 confirmed」）。**承接证据在位才成交**："
+        "anchor_evidence.level=confirmed（厚封/带宽内资金为正）才给普通仓，"
+        "partial 只给试仓/条件单，none 不买；「回踩」「突破」不再是三种买法——"
+        "回踩只是价格回到锚位的动作名，突破是价格离开锚位后的确认（此时买点上移到新锚）。"
+        "无 anchor（缺键，罕见）回退 sup/res 关键位并写明位置名；"
+        "禁止用 VWAP/分时均价当买点、禁止自创价位（锚不在 rank 字段上的价位不许出现）。\n"
+        "★ 止损 = 承接位外侧一档 + 噪声带双锚：stop = 锚位 − max(缓冲, min(amp_avg5, 8%))"
+        "（缓冲 ≥ 1×噪声带；主力建仓位失守 = 逻辑破，不是噪声）；"
+        "不得窄于噪声带、不得越过 -8% 深亏线（amp≥8% 封顶 8%、靠仓位控风险）；"
         "② 落点在结构位外侧 + 缓冲，避开当日已被穿过的价位；"
         "③ 必须写触发口径「盘中触价」或「收盘确认」（动量/接力仓默认盘中触价）。"
         "无合格止损价不得进表。\n"
@@ -201,9 +212,13 @@ _REPORT_GUIDE = {
              "funnel.baseline=本次入选只数（选人层唯一出口，全部入 deep）；"
              "funnel.streak_surge_tagged/early_accum_tagged=闸门打标保留的票（挂 flags，不放弃）；"
              "funnel 其余键（pool_raw/deep_n/zt_ref_n/flow_invalid_n/short_of_limit 等）只用于复盘漏斗与取数完整性",
-    "limit_up_ref": "涨停参考清单（**不进 deep 分析**）：每项 {code,name,board,track,t_first,dup_n,reason}。"
-                    "决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；"
-                    "它仅作板块情绪旁证，不是可买清单；未进入 deep 的票证据不足，不得给买入单。",
+    "limit_up_ref": "涨停参考清单（**不进 deep 分析**）：每项 {code,name,board,track,t_first,dup_n,reason}"
+                    "+ 承接位框架 4.2 的封板三事实 seal_ratio_pct/seal_tier/open_count"
+                    "（封单÷当日成交额 %、厚薄档、开板次数；盘中=实时池口径〔此刻封着才有值，"
+                    "炸板票缺键=未知不是 0〕、盘后=收盘池定格；固定边界重放不喂实时池，"
+                    "历史重放缺键）。决策时已封板、买不进，满卡的价位/支撑/形态对它当期没有操作意义；"
+                    "它仅作板块情绪旁证与**封板资金判强弱**（厚封+开板少=真强；薄封+反复开板="
+                    "假板，不接力），不是可买清单；未进入 deep 的票证据不足，不得给买入单。",
     "monitor": "回测经验提示（1m全样本2026-04-15~11-02，134个交易日、deep可成交n=1862；"
                "弱市市值按当日指数分组跌幅<0、80亿元分界；仅作软证据，不是排除令）："
                "将 analyzed_rank / picked_detail / limit_up_ref 的 `monitor` 内容并入对应的题材、"
@@ -233,6 +248,56 @@ _REPORT_GUIDE = {
             "**组合要看**：open0 + thin（0 开板但封单极薄，如 000568）与 open6p 同为最可疑，"
             "别因为「没开板」就当强；one_word/vthick/thick 才是有厚封单支撑的强封。"
             "盘后以此估次日强弱，不因「买不到」降权；买得到买不到由你按当时段口径处理。",
+    "anchor": "承接位五锚（承接位选股框架 2026-11-26）：锚 = 钱的真实成本位候选 —— "
+              "seal 封板价（封单托底）> zt 涨停起点（建仓起点）> poc 成交密集区（成本带）> "
+              "gap 缺口/lo20 前低（结构位）；rank 行的 `anchor` 只带主锚+距离"
+              "（{primary:{k,px,rule}, dist_pct}），全量锚列表在满卡 tech.support.anchor。"
+              "**primary 由 QD_ANCHOR_PRIMARY_RULE 规则合成（默认 R1：seal>zt>poc>gap>lo20），"
+              "回测校准前不手调**；dist_pct=(锚价−现价)/现价%，负 = 锚在现价下方（挂单可达），"
+              "正/远 = 高位锚距拉大（不追，承接位框架 §6.5 口径）。"
+              "**锚位滚动 + 失守即弃锚**：换庄后旧锚失守则自动降级到下一锚，旧锚变压力；"
+              "二进宫不带历史成见（旧龙→出货→换庄→再来重新算）。"
+              "锚是估计值（主力成本不可直读）——「承接证据在位才成交」不是可选项："
+              "anchor_evidence.level=confirmed（封单厚 seal_tier∈thick/vthick，或带宽内"
+              "价格方向净额>0）才成交；partial（只回踩不带钱）只给试仓；none 不买；"
+              "缺键 = 分时数据缺（未知 ≠ none，不得互相冒充）。",
+    "tier_ctx": "生态地图（承接位框架 4.1 v2，用户定义领涨四）：不认角色只报生态 —— "
+                "板块 5 日（T-5..T-1）领涨事件前四 `lead4=[{c,d,t,k,r}]`：事件=涨停(k=zt，"
+                "1m 首次触板时刻)或跳变(k=jump，1m/tape 首次突增时刻，含先跳后板)，按事件时刻升序，"
+                "第 1 名=龙头(r=L)、第 2~4 名=跟随(r=F)；participants_5d=全部领涨事件票数；"
+                "当日同伴数（today_peers）；跟随资金质量（funds_ok_n：领涨 2~4 名中 5日资金正"
+                "且支撑完好数）。"
+                "**「谁是龙头」是结论不是输入**：持续承接+埋伏在身+封单厚+生态在场 = 龙头。"
+                "换龙头信号 = 领涨四中旧龙头承接衰竭（封单变薄/资金转负）+ 新面孔资金初启"
+                "（5日转正+锚位承接）→ 按新面孔锚位重排买点，旧龙回避。"
+                "**lone_surge=true（孤立拉升：前5日无领涨事件且当日同伴≤1）= 出货嫌疑，"
+                "不进「买什么」**（与接刀/无确认接力同族——无信号下注）；但票仍在 rank 带标，"
+                "庄股/独立行情例外（与大盘恒反向、量能自锁）由你判。"
+                "跟随股看前三的资金质量，不看数量（3 只跟风但资金全负 = 互倒造势，比孤板更毒）。",
+    "surge_verdict": "拉升定性四问（承接位框架 5.3，替换盘感；四问全答，①一票否决）："
+                     "① 钱：拉升段的钱在进还是在出？—— `divergence=价升钱出`/脉冲背离 → "
+                     "**一票否决，不进表**（数据：flow.up_net_wan/down_net_wan、flow.intraday、flow_risks；"
+                     "真启动=分段持续流入 10:00 后、divergence 缺键不等于 none）；"
+                     "② 生态：前 5 天有人在场吗？—— tier_ctx 领涨四中有 T-1 事件、跟随资金正为真启动；"
+                     "lone_surge=true、跟风资金全负为孤立拉升（数据：tier_ctx）；"
+                     "③ 位置+承接：在哪、有人接吗？—— 锚位=建仓/成本位（zt/poc/seal）且承接证据 "
+                     "confirmed 为真启动；高位锚远、anchor_evidence=none、loc=hot 无确认为高位接力（数据：anchor、anchor_evidence、loc）；"
+                     "④ 盘口：涨得住吗？—— 回踩锚位不破、厚封少开板、vol_up_down>1 为强；"
+                     "冲高回落（strong_to_weak）、dd_from_peak 扩大、薄封反复开板为弱（数据：shape、cross、seal）。"
+                     "**定案**：①出货指纹 → 不进表；②③④ 同向 → 买点=锚位挂单；"
+                     "混合 → 试仓/写未知（「不判断」永远合法）。"
+                     "周期状态机（承接位框架 5.6）：角色是状态不是身份——判定输出永远是"
+                     "「它现在处于哪个阶段」（跟随/拉升/变龙头/出货/换庄/再拉升六态，"
+                     "与四问一一对应）；转换检测看「变化」不看「水平」（承接证据 none→confirmed、"
+                     "资金对比翻转），必须带 T-5~T-1 前后文；换手 10-30%/日的票换庄是 1-2 天"
+                     "事件，循环以天计——高换手+横盘+above_ratio 高（下午仍在均价上）= 建仓日签名，"
+                     "反例（下午 0/4 翻转）= 试探/分歧日不建仓。",
+    "anchor_evidence_note": "anchor_evidence 口径：hold_minutes/hold/band_net_wan 由分时按 "
+                            "primary±QD_ANCHOR_BAND_PCT（默认 1.5%）带宽聚合（60s 拍≈分钟；"
+                            "band_net_wan 与量价方向净额同口径）；盘中为截至当前时刻的口径，"
+                            "盘后为全天；封板票全拍贴板 → touched=true、hold≈全时段，强弱由 "
+                            "seal_tier 决定 level（厚封 confirmed、薄封 partial）——别把「全程贴板」"
+                            "误读成「回踩确认」。",
     "entry_exit": "★ **顺序不能反，买点不是模板**：\n"
                   "① 先定姿态（读 market 的**两档情绪**）：大盘档 market_mood 偏强 + fund_flow_days "
                   "净流入 → 可放宽，允许给突破/追价买点、容忍较高乖离、推荐只数可多；cautious=true "
@@ -241,12 +306,17 @@ _REPORT_GUIDE = {
                   "中性环境按个股自身结构定。**个股档 stock_mood 另算一票**：它衡量当日赚钱效应"
                   "（涨跌停比/炸板率），stock_mood 偏弱时即使大盘强也不追高——两档背离是大盘强、"
                   "个股难做，按收紧执行。姿态是**每次按环境算**的，不是固定偏保守。\n"
-                  "② 再挑**关键位置**（不是固定 MA5/MA10/MA20）：候选=MA5/MA10/MA20、hi20/lo20 区间边界、"
-                  "前高前低、近期密集成交区、跳空缺口、涨停板起点；rank 每行已给两侧最近位置："
-                  "**sup=现价下方最近（承接位）**、**res=现价上方最近（突破位）**；"
-                  "选「离现价最近且当日量价确认」的那一个，写具体价 + 位置名。"
+                  "② 再定**锚位**（承接位框架：买点从 rank 的 `anchor.primary` 取，写明类型）："
+                  "锚 = 封板价（seal，封单托底）/ 涨停起点（zt，建仓起点）/ 成交密集区（poc，成本带）/ "
+                  "缺口（gap）/ 前低（lo20）——rank.anchor.primary 已按规则选好主锚、"
+                  "dist_pct 给出现价距锚%（负 = 锚在下方，挂单可达）；禁止自创价位。"
+                  "无 anchor 缺键时回退 sup/res（两侧最近关键位置），写具体价 + 位置名。"
+                  "**承接证据在位才成交**：anchor_evidence.level = confirmed（厚封 / 带宽内资金为正）"
+                  "才给普通仓；partial 只给试仓/条件单；none 不买。"
                   "同一个位置在强环境可直接挂、弱环境要打折（往下一档）。\n"
-                  "③ 止损=该位置失效价（跌破 X）。买点必须高于止损；无明确止损价不得进「买什么」。"
+                  "③ 止损 = 锚位外侧一档（锚位下沿再退一个缓冲，缓冲 ≥ 1×噪声带）；"
+                  "双锚取宽：不得窄于噪声带、不得越过 -8% 深亏线；无锚时按旧三条（结构位外侧）。"
+                  "买点必须高于止损；无明确止损价不得进「买什么」。"
                   "走坏=收盘破止损或量价净额转净流出。\n"
                   "④ **盘后交付给「条件单」而不是一口价**：弱市回踩企稳确认后买；"
                   "其他环境的突破条件单次日 09:30-10:00 观察，三条同时成立才买——"
@@ -313,7 +383,10 @@ _REPORT_GUIDE = {
               "/shape（**分时**形态标签，见 intraday_shape 条；与 regime 并列、互不覆盖，用来相互印证）"
               "/rs_d0/rs_5d（相对上证超额%，见 regime 条）"
               "/loc（**位置透支分档** hot/cool/normal，见 location 条）"
-              "/seal/seal_tier/seal_pct/net5d_wan/net20d_wan/streak_dir/streak_days/sign_5d/"
+              "/seal/seal_tier/seal_pct/**anchor**（承接位主锚 {primary:{k,px,rule}, dist_pct}，"
+              "全量锚列表在满卡 tech.support.anchor，读法见 anchor 条）/**anchor_evidence**（{level: "
+              "confirmed/partial/none}，锚位±带宽内承接证据，读法见 anchor_evidence_note）"
+              "/net5d_wan/net20d_wan/streak_dir/streak_days/sign_5d/"
               "flow_data_day（最近资金日线数据的对应日期）/flow_last_day_wan（该日净额）/"
               "flow_today_wan（当日净额：盘中=realtime 量价、盘后=kline_1m 定格，口径见 caliber_note）；"
               "20 日位置直接读 pos20（0=区间最低、100=最高，无需自算）；"
@@ -323,6 +396,9 @@ _REPORT_GUIDE = {
               "无 name=名称未取到（用代码即可）、无 chg_prev_pct/cpos=日线不足（参考字段缺省）、"
               "无 vr_rel/flow_rel=大盘基准缺失（未校准，按绝对值读）、"
               "无 vr_rel_st/flow_rel_st=非盘中（收盘后同刻≡全天，直接用全天 vr_rel/flow_rel）、"
+              "无 anchor=无锚（罕见；日线≥20 根则 lo20 必有）、无 anchor_evidence=分时数据缺，"
+              "无 divergence=背离未命中或资金数据缺（缺≠none）、无 tier_ctx=生态地图未算"
+              "（板块成员/日线缺失，QD_TOPDOWN_TIER_CTX_ENABLE=0 关闭）、"
               "无 confidence=证据满维。"
               "analyzed = 满卡（只含部分票，有 patterns/flow/rt/intraday 明细），看明细用它、比强弱用 rank；"
               "intraday = {t 截断时刻, day 目标日, vr_same_t 个股同刻量比, vr_rel_st, "
@@ -388,7 +464,11 @@ _REPORT_GUIDE = {
                   "③ **叠加边界**：仅上述两项，不作命中计数、不加权、禁止写「命中越多越强」；"
                   "时间外仅 5 天有完整 T+3，不作长期效应估计。",
     "pump_dump": "flow_risks/warnings 含「开盘脉冲」「疑似拉高出货」「趋势背离」→ 拉高出货嫌疑，"
-                 "除非有强反证（如尾盘重新放量收回），否则降权或不买",
+                 "除非有强反证（如尾盘重新放量收回），否则降权或不买。"
+                 "★ divergence（承接位框架 3.3）合读：flow.divergence=价升钱出（当日涨但下跌分钟"
+                 "量能反超上涨分钟 = 拉升段的钱在出）是拉升定性四问①的**一票否决级证据**，"
+                 "不进表；脉冲背离（开盘窗净流入、其后转负）与开盘脉冲线索合读；"
+                 "divergence 缺键 = 数据缺或未命中，不当 none、不反推安全。",
     "funnel": "漏斗数字只允许出现在末行「数据」；禁止写进正文",
     "regime": "regime=位置标签（缺键=低位蓄势，中性不标注）。**只报位置与跨日方向，不判盘中动作**"
               "（一鼓作气/再而衰/三而竭属分时概念，日线不评，可买否看盘中形态）："
@@ -592,6 +672,19 @@ def _rank_row(card: dict) -> dict:
         "rs_d0": tech.get("rs_d0"),
         "rs_5d": tech.get("rs_5d"),
     }
+    # 承接位（承接位框架 3.1/3.2）与量价背离（3.3）：rank 行只带主锚+距离+level
+    # （全量锚列表在满卡 tech.support.anchor，rank 不重复）；缺键语义：
+    # 无 anchor=无锚（罕见，日线≥20 根则 lo20 必有）/ 无 anchor_evidence=分时数据缺
+    # 或未算 / 无 divergence=背离形态未命中或资金数据缺（缺≠none）。
+    _anchor = sup.get("anchor") if isinstance(sup.get("anchor"), dict) else {}
+    if _anchor.get("primary"):
+        row["anchor"] = {"primary": _anchor.get("primary"), "dist_pct": _anchor.get("dist_pct")}
+    _ae = tech.get("anchor_evidence")
+    if isinstance(_ae, dict) and _ae.get("level"):
+        row["anchor_evidence"] = {"level": _ae.get("level")}
+    _div = (card.get("flow") or {}).get("divergence")
+    if _div:
+        row["divergence"] = _div
     for _k in ("sup", "res"):
         if row.get(_k) is None:
             row.pop(_k, None)
@@ -774,7 +867,10 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             标签边界见 QD_SCREENER_SEAL_TAG。
             strategy / missing / errors。confidence 是**证据完整度**（拿到几维 / 共几维），
             不是模型对自己判断的把握。
-            flow = {ok, net_wan, caliber=price_direction, caliber_note, net_pct_of_amount,
+            flow = {ok, net_wan, **up_net_wan/down_net_wan**（上涨/下跌分钟净额两和，承接位框架
+            3.3，down 记负、两和相加=net 守恒）, caliber=price_direction, caliber_note,
+            **divergence**（量价背离形态：价升钱出/脉冲背离，缺键=未命中或数据缺，只描述形态不定性）,
+            net_pct_of_amount,
             recent{近5/20日累计/连续方向/逐日符号/
             剔除最大单日/上一交易日}, intraday{开盘窗 vs 其后净额}}——资金看多日总体，
             单日大额流入 ≠ 趋势（口径=量价方向净额，非真实主力）。
@@ -960,7 +1056,8 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     rt_map = fetch_rt_map(code_list)
     if not rt_map:
         missing.append("实时行情缺失（tech 为日线口径，涨跌停/收盘可能滞后）")
-    from ._helpers import seal_summary, pump_dump_risk, zt_index
+    from ._helpers import seal_summary, pump_dump_risk, zt_index, _f, \
+        seal_anchor_block, attach_seal_anchor, anchor_evidence_batch, flow_divergence
     zt_map = zt_index()          # 封板票开板次数/封单额来源；空则按「未知」降级
     _sealed_need_zt = 0
     for r in raw:
@@ -987,8 +1084,59 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
         except Exception as e:
             r["flow_risks"] = []
             missing.append(f"拉高出货识别:{type(e).__name__}: {e}")
+        # 承接位五锚 seal 锚注入（承接位框架 3.1）：seal_summary 到手后注入封板锚，
+        # 并按 QD_ANCHOR_PRIMARY_RULE 重选 primary/dist_pct（单源 attach_seal_anchor，幂等）。
+        try:
+            _anch = ((r.get("tech") or {}).get("support") or {}).get("anchor")
+            if isinstance(_anch, dict):
+                _sa = seal_anchor_block(r.get("seal") or {}, r.get("rt") or {},
+                                        str(r.get("code") or ""), str(r.get("name") or ""))
+                _px = _num_or_none((r.get("rt") or {}).get("price")) \
+                    or _num_or_none((r.get("tech") or {}).get("close"))
+                if _px:
+                    r["tech"]["support"]["anchor"] = attach_seal_anchor(_anch, _sa, _px)
+        except Exception as e:
+            missing.append(f"承接锚:{type(e).__name__}: {e}")
     if _sealed_need_zt:
         missing.append(f"涨停池缺 {_sealed_need_zt} 只封板票（封板结构只有标签，开板/封单未知）")
+
+    # 承接证据（承接位框架 3.2）：按各票 primary 锚位批量聚合带宽内分时
+    # （ticks 与分时形态共用 60s memo，同一批票不重复取库）。
+    try:
+        _px_map = {}
+        for r in raw:
+            _p = (((r.get("tech") or {}).get("support") or {}).get("anchor") or {}).get("primary")
+            if _p and _num_or_none(_p.get("px")):
+                _px_map[str(r.get("code") or "")] = float(_p["px"])
+        if _px_map:
+            _tiers = {str(r.get("code") or ""): (r.get("seal") or {}).get("seal_tier") for r in raw}
+            _pcs = {str(r.get("code") or ""): (r.get("rt") or {}).get("previous_close") for r in raw}
+            _ev_map = anchor_evidence_batch(list(_px_map.keys()), _px_map,
+                                            seal_tiers=_tiers, prev_closes=_pcs)
+            for r in raw:
+                _e = _ev_map.get(str(r.get("code") or ""))
+                if _e:
+                    r.setdefault("tech", {})["anchor_evidence"] = _e
+    except Exception as e:
+        missing.append(f"承接证据:{type(e).__name__}: {e}")
+
+    # 量价背离（承接位框架 3.3）：flow 卡补 divergence（纯函数判定，缺数据缺键；
+    # 只描述形态、定性归 L4——与 flow_risks 同级，由 LLM 定夺）。
+    for r in raw:
+        _fl = r.get("flow") if isinstance(r.get("flow"), dict) else None
+        if not _fl or not _fl.get("ok"):
+            continue
+        _chg = _num_or_none((r.get("rt") or {}).get("change_pct"))
+        if _chg is None:
+            _chg = _num_or_none((r.get("tech") or {}).get("change_pct"))
+        try:
+            _dv = flow_divergence(_chg, _fl.get("net_wan"), _fl.get("up_net_wan"),
+                                  _fl.get("down_net_wan"), _fl.get("intraday"))
+        except Exception as e:
+            _dv = None
+            missing.append(f"量价背离识别:{type(e).__name__}: {e}")
+        if _dv:
+            _fl["divergence"] = _dv
 
     for r in raw:
         r.pop("_bars", None)
@@ -1614,7 +1762,9 @@ def _run_fine(codes: list, t0: float, ms: dict, run_started_at: str = ""):
              "selection_snapshot": {"day": None, "as_of": None},
              "flags_note": "细筛轮不重算漏斗打标：第一轮 analyzed_rank 行的 flags"
                            "（连板放量/吸筹不足/已过度拉升/死水护栏）仍是有效证据，"
-                           "判定时合并使用。"}
+                           "判定时合并使用。板块/生态上下文（board/board_rank/dup_n/tier_ctx）"
+                           "同理，以第一轮 rank 行为准（承接位框架：tier_ctx 是选人层事实，"
+                           "lone_surge 处置归判定层）。"}
     return _deep_and_deliver(codes, outer, funnel, t0, ms,
                              coarse=False, card_floor=len(codes))
 
@@ -1651,13 +1801,13 @@ def _deep_and_deliver(codes: list, outer: dict, funnel: dict,
             _fl = _p.get("flags")
             if _fl:
                 r["flags"] = _fl
-            for _k in ("board", "board_rank", "dup_n"):
+            for _k in ("board", "board_rank", "dup_n", "tier_ctx"):
                 _v = _p.get(_k)
                 if _v is not None:
                     r[_k] = _v
         for r in out.get("analyzed") or []:
             _p = _pm.get(str(r.get("code"))) or {}
-            for _k in ("board", "board_rank", "dup_n"):
+            for _k in ("board", "board_rank", "dup_n", "tier_ctx"):
                 _v = _p.get(_k)
                 if _v is not None:
                     r.setdefault(_k, _v)
@@ -1767,8 +1917,11 @@ def _run_topdown(t0: float, ms: dict, run_started_at: str = "", coarse: bool = T
     funnel["deep_n"] = len(codes)
     funnel["zt_ref_n"] = len(zt_ref)
 
-    limit_up_ref = [{k: x.get(k) for k in
-                     ("code", "name", "board", "track", "t_first", "dup_n", "reason")}
+    limit_up_ref = [{k: v for k, v in
+                     ((k, x.get(k)) for k in
+                      ("code", "name", "board", "track", "t_first", "dup_n", "reason",
+                       "seal_ratio_pct", "seal_tier", "open_count"))
+                     if v is not None}
                     for x in zt_ref]
     if not codes:
         _out = {"report_guide": _REPORT_GUIDE, "pipeline": "topdown",
@@ -1793,7 +1946,8 @@ def _run_topdown(t0: float, ms: dict, run_started_at: str = "", coarse: bool = T
              "topdown_notes": (td.get("missing") or [])[:8],
              "picked_detail": [{k: x.get(k) for k in
                                 ("code", "board", "track", "tier", "kind", "reason",
-                                 "flags", "dup_n", "board_rank", "t_first", "flow_valid", "circ_mv")}
+                                 "flags", "dup_n", "board_rank", "t_first", "flow_valid", "circ_mv",
+                                 "tier_ctx")}
                                for x in picked]}
     return _deep_and_deliver(codes, outer, funnel, t0, ms, coarse=coarse)
 

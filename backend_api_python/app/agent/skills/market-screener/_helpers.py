@@ -229,16 +229,13 @@ def _last_zt_low(bars: List[Dict], limit_pct: float, lookback: int = 20) -> Opti
     return None
 
 
-def _key_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float]],
-                limit_pct: float) -> Dict[str, List[Dict[str, Any]]]:
-    """客观关键价位候选（均线 / 近端低高点 / 跳空缺口 / 成交密集区 / 涨停起点）。
+def _anchor_candidates(bars: List[Dict], ma_map: Dict[str, Optional[float]],
+                       limit_pct: float) -> List[tuple]:
+    """关键价位候选全集（均线 / 近端低高点 / 跳空缺口 / 成交密集区 / 涨停起点）。
 
-    只出「价格 + 类型 + 距离」，**不判断能不能撑住** —— 挑哪个位置当买点、
-    止损放哪一档，由调用方结合大盘/板块/资金环境决定（2026-10-31 用户裁定：
-    不该固定 MA5/MA10/MA20）。
-    支撑与压力按现价分侧：同一价位在现价上方时是压力不是支撑。旧实现只取
-    |dist|≤3% 且不分上下，会把上方均线也报成「支撑」。
-    同价去重（差 <0.8% 视为同一位置）保留先出现的，优先序即 cands 的构造顺序。
+    承接位选股框架 3.1：_key_levels（分侧截断后的支撑/压力候选）与
+    anchor_levels（承接位五锚）共用的**单一原料源**——两边对「哪里算一个位置」
+    必须永远同口径，任何一侧单独改动都会造成 sup/res 与 anchor 漂移。
     """
     lows = [b["low"] for b in bars]
     cands: List[tuple] = []          # (kind, px)
@@ -260,6 +257,21 @@ def _key_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float
     zt_low = _last_zt_low(bars, limit_pct)
     if zt_low:
         cands.append(("zt", zt_low))
+    return cands
+
+
+def _key_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float]],
+                limit_pct: float) -> Dict[str, List[Dict[str, Any]]]:
+    """客观关键价位候选（均线 / 近端低高点 / 跳空缺口 / 成交密集区 / 涨停起点）。
+
+    只出「价格 + 类型 + 距离」，**不判断能不能撑住** —— 挑哪个位置当买点、
+    止损放哪一档，由调用方结合大盘/板块/资金环境决定（2026-10-31 用户裁定：
+    不该固定 MA5/MA10/MA20）。
+    支撑与压力按现价分侧：同一价位在现价上方时是压力不是支撑。旧实现只取
+    |dist|≤3% 且不分上下，会把上方均线也报成「支撑」。
+    同价去重（差 <0.8% 视为同一位置）保留先出现的，优先序即 cands 的构造顺序。
+    """
+    cands = _anchor_candidates(bars, ma_map, limit_pct)
 
     sup: List[Dict[str, Any]] = []
     res: List[Dict[str, Any]] = []
@@ -272,6 +284,172 @@ def _key_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float
         (res if px > close else sup).append(item)
     return {"supports": sorted(sup, key=lambda x: -x["d"])[:3],
             "resists": sorted(res, key=lambda x: x["d"])[:2]}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  承接位五锚（承接位选股框架 3.1，2026-11-26）
+# ═══════════════════════════════════════════════════════════════
+# 锚 = 钱的真实成本位候选：封板价（封单托底）> 涨停起点 zt（建仓起点）>
+#   成交密集区 poc（成本带）> 缺口/前低（结构位）。锚是估计值（主力成本不可
+#   直读），「证据在位才成交」由 anchor_evidence 承担，不锚上加锚。
+# primary 合成规则由 QD_ANCHOR_PRIMARY_RULE 指定（R1~R5，见 _anchor_primary），
+#   默认 R1；**回测校准（Phase 0）前不手调**，胜出规则由回测改默认值。
+_ANCHOR_PRIMARY_RULE_ENV = "QD_ANCHOR_PRIMARY_RULE"
+_ANCHOR_FRESH_DAYS_ENV = "QD_ANCHOR_FRESH_DAYS"
+_ANCHOR_FRESH_MIN_SHARE_ENV = "QD_ANCHOR_FRESH_MIN_SHARE"
+_ANCHOR_KINDS = ("zt", "poc", "gap", "lo20", "lo10", "lo60")
+
+
+def _fresh_poc(bars: List[Dict], window: int = None, bins: int = 10) -> Optional[float]:
+    """近 N 日「量×新鲜度」加权的成交密集中心价（R5 新鲜度锚，v0 待 Phase 0 回测校准）。
+
+    承接位框架 5.6 时间基修正：高换手票浮筹一周换一遍，20 日 poc 是古代史——
+    成本区应取近期高换手日的成交密集（recency×volume）。与 _volume_poc 同 bins
+    思路，权重改为 volume × 线性新鲜度（最近一日权重最大）。峰值量占比不足
+    QD_ANCHOR_FRESH_MIN_SHARE（默认 10%）视为无显著密集，返回 None。
+    """
+    try:
+        w = int(os.getenv(_ANCHOR_FRESH_DAYS_ENV, "") or 5)
+    except (TypeError, ValueError):
+        w = 5
+    w = max(2, min(window or w, len(bars)))
+    try:
+        min_share = float(os.getenv(_ANCHOR_FRESH_MIN_SHARE_ENV, "") or 0.10)
+    except (TypeError, ValueError):
+        min_share = 0.10
+    seg = bars[-w:]
+    lo = min(b["low"] for b in seg)
+    hi = max(b["high"] for b in seg)
+    if hi <= lo:
+        return None
+    step = (hi - lo) / bins
+    buckets = [0.0] * bins
+    for i, b in enumerate(seg):
+        p = (b["high"] + b["low"] + b["close"]) / 3
+        recency = (i + 1) / len(seg)          # 越新越重
+        buckets[min(bins - 1, int((p - lo) / step))] += float(b["volume"] or 0) * recency
+    total = sum(buckets)
+    if total <= 0:
+        return None
+    peak = max(range(bins), key=lambda i: buckets[i])
+    if buckets[peak] / total < min_share:
+        return None
+    return lo + step * (peak + 0.5)
+
+
+def _anchor_primary(anchors: List[Dict[str, Any]], price: float,
+                    rule: str = None) -> Optional[Dict[str, Any]]:
+    """主锚合成规则（R1~R5，承接位框架 §6.2 网格；QD_ANCHOR_PRIMARY_RULE 指定，默认 R1）。
+
+    R1 seal>zt>poc>gap>lo20（有实盘承接的优先）；R2 zt>seal>poc>gap>lo20；
+    R3 距现价最近；R4 厚封（seal 锚 evidence 含 thick/vthick）优先、其余按 R1
+    （完整语义「带宽内资金正」需 anchor_evidence 联动，v0 简化，Phase 0 校准）；
+    R5 新鲜度锚 fresh_poc 优先、其余按 R1（换庄后旧锚快速贬值，v0）。
+    优先序全部打平时回退 lo10/lo60/fresh_poc（五锚都缺的票极少，日线≥20 根
+    则 lo20 必有）。返回 {k, px, rule}；无锚返回 None（缺键语义：无锚=无锚，不当 0）。
+    """
+    if not anchors:
+        return None
+    rule = (rule or os.getenv(_ANCHOR_PRIMARY_RULE_ENV, "") or "R1").strip().upper()
+    m = {a.get("k"): a for a in anchors if a.get("k")}
+    base = ("seal", "zt", "poc", "gap", "lo20", "lo10", "lo60")
+    if rule == "R3":
+        if not price or price <= 0:
+            return None
+        best = min(anchors, key=lambda a: abs(float(a["px"]) - price))
+        return {"k": best["k"], "px": best["px"], "rule": "R3"}
+    seq = {"R2": ("zt", "seal", "poc", "gap", "lo20", "lo10", "lo60"),
+           "R5": ("fresh_poc",) + base}.get(rule)
+    if rule == "R4":
+        seal = m.get("seal")
+        if seal and "thick" in str(seal.get("evidence") or ""):
+            return {"k": "seal", "px": seal["px"], "rule": "R4"}
+    for k in (seq or base):
+        a = m.get(k)
+        if a:
+            return {"k": k, "px": a["px"], "rule": rule if rule in ("R1", "R2", "R4", "R5") else "R1"}
+    return None
+
+
+def anchor_levels(bars: List[Dict], close: float, ma_map: Dict[str, Optional[float]],
+                  limit_pct: float, price: float = None,
+                  seal_anchor: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """承接位五锚（承接位选股框架 3.1）：成本位候选全集 + 合成主锚 + 距离。
+
+    - anchors：全部候选锚都给（LLM/回测都可用，不删）；seal 锚由调用方在 deep
+      层注入（tech 层无实时封板信息），其余从 _anchor_candidates 取；
+    - primary：合成主锚，规则 QD_ANCHOR_PRIMARY_RULE（默认 R1），**不手调**；
+    - dist_pct = (primary.px − price) / price × 100，负 = 现价在锚上方（挂单距）。
+      口径与方案 §6.5 「锚距」一致（负越大 = 离锚越远 = 不追）。
+    """
+    price = _f(price) if price else _f(close)
+    by_k: Dict[str, float] = {}
+    for k, px in _anchor_candidates(bars, ma_map, limit_pct):
+        if k in _ANCHOR_KINDS and px and px > 0 and k not in by_k:
+            by_k[k] = round(float(px), 2)
+    fresh = _fresh_poc(bars)
+    if fresh:
+        by_k.setdefault("fresh_poc", round(float(fresh), 2))
+    src_map = {"zt": "涨停起点（首板最低价）", "poc": "20日成交密集带中值",
+               "gap": "未回补跳空缺口下沿", "lo20": "20日低点", "lo10": "10日低点",
+               "lo60": "60日低点", "fresh_poc": "近N日高换手成交密集（新鲜度加权）"}
+    anchors: List[Dict[str, Any]] = []
+    if seal_anchor:
+        anchors.append(seal_anchor)
+    for k in ("zt", "poc", "gap", "lo20", "lo10", "lo60", "fresh_poc"):
+        if k in by_k:
+            anchors.append({"k": k, "px": by_k[k], "src": src_map.get(k, k)})
+    primary = _anchor_primary(anchors, price)
+    dist = (round((float(primary["px"]) - price) / price * 100, 2)
+            if (primary and price and price > 0) else None)
+    return {"anchors": anchors, "primary": primary, "dist_pct": dist}
+
+
+def seal_anchor_block(seal: Dict[str, Any], rt: Dict[str, Any],
+                      code: str = "", name: str = "") -> Optional[Dict[str, Any]]:
+    """封板锚（k=seal）：封单托底的涨停价，承接位第一优先级（R1）。
+
+    seal.tag ∈ (none / unknown / 缺) 时不给锚——未封板或封板状态未知不是承接位。
+    px 口径：rt.limit_up_price（实时涨停价）优先；缺失时前收 × (1+板幅) 推算
+    （日线口径；stale_bar 时仍成立——涨停价不随盘中漂移）。evidence 带 seal_tier，
+    供 R4「厚封优先」与 anchor_evidence level 判定复用。
+    """
+    tag = (seal or {}).get("tag")
+    if tag in (None, "", "none", "unknown"):
+        return None
+    up = _num_or_none((rt or {}).get("limit_up_price"))
+    if not up or up <= 0:
+        pc = _f((rt or {}).get("previous_close"))
+        from .common import get_limit_pct
+        lp = get_limit_pct(code, name)
+        up = (round(pc * (1 + lp / 100.0), 2) if (pc > 0 and lp > 0) else None)
+    if not up or up <= 0:
+        return None
+    out = {"k": "seal", "px": round(float(up), 2), "src": "封板价/涨停价"}
+    tier = (seal or {}).get("seal_tier")
+    if tier:
+        out["evidence"] = f"seal_tier={tier}"
+    return out
+
+
+def attach_seal_anchor(anchor_block: Dict[str, Any], seal_anchor: Optional[Dict[str, Any]],
+                       price: float) -> Dict[str, Any]:
+    """deep 层：seal 锚注入 tech 卡已有 anchor 块 + primary 按规则重选（单源收口）。
+
+    tech_summary 生成 anchor 时无实时封板信息；seal_summary（rt + 涨停池）到手后
+    在这里注入 seal 锚并重算 primary/dist_pct。旧 seal 锚替换不追加（幂等）。
+    """
+    if not isinstance(anchor_block, dict):
+        return anchor_block
+    anchors = [a for a in (anchor_block.get("anchors") or [])
+               if isinstance(a, dict) and a.get("k") != "seal"]
+    if seal_anchor:
+        anchors.insert(0, seal_anchor)
+    price = _f(price)
+    primary = _anchor_primary(anchors, price)
+    dist = (round((float(primary["px"]) - price) / price * 100, 2)
+            if (primary and price and price > 0) else None)
+    return {"anchors": anchors, "primary": primary, "dist_pct": dist}
 
 
 def regime_tag(run5: Optional[float], d0: float, d1: Optional[float],
@@ -663,10 +841,13 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
     dist_ma10 = _dist(_last(ma10))
     # 关键价位候选（供 LLM 直接用，无需 read_skill / 拉 K 线）：不再只认三条均线
     ma60_v = _last(compute_ma(closes, 60))
-    levels = _key_levels(bars, close,
-                         {"ma5": _last(ma5), "ma10": _last(ma10),
-                          "ma20": ma20_v, "ma60": ma60_v}, limit_pct)
+    _ma_map = {"ma5": _last(ma5), "ma10": _last(ma10),
+               "ma20": ma20_v, "ma60": ma60_v}
+    levels = _key_levels(bars, close, _ma_map, limit_pct)
     nearest = levels["supports"][0] if levels["supports"] else None
+    # 承接位五锚（承接位框架 3.1）：候选全集 + primary 规则选锚。tech 层无实时
+    # 封板信息，seal 锚由 deep 层在 seal_summary 后注入并重选 primary（attach_seal_anchor）。
+    anchor = anchor_levels(bars, close, _ma_map, limit_pct)
 
     intraday_pos = None
     rng = today["high"] - today["low"]
@@ -722,6 +903,7 @@ def tech_summary(bars: List[Dict], code: str = "", name: str = "") -> Dict[str, 
             "near_support": bool(nearest and abs(nearest["d"]) <= 3.0),  # |dist|<=3% 视为贴支撑
             "supports": levels["supports"],   # 现价下方候选，由近到远，≤3 条
             "resists": levels["resists"],     # 现价上方候选，由近到远，≤2 条
+            "anchor": anchor,                 # 承接位五锚（seal 锚由 deep 层注入）
             # 支撑-压力间距%（过窄→操作性弱，见 SKILL.md 维度4）
             "sr_gap_pct": round((levels["resists"][0]["px"] - levels["supports"][0]["px"])
                                 / close * 100, 2)
@@ -931,6 +1113,23 @@ def _empty_pool_reason(day: str) -> str:
         return "交易日·非报价时段（开盘前/午休/收盘后）：源返回空（源故障亦表现为 []）"
     except Exception as e:
         return f"日历判定异常: {type(e).__name__}: {e}"
+
+
+def seal_tier_of(pct: float) -> Optional[str]:
+    """封单厚薄档（与 seal_summary 同边界、同一 env 规则源：thin≤5%/mid≤15%/
+    thick≤40%/vthick>40%）。
+
+    承接位框架 4.2 引入的公开判档入口：limit_up_ref 行、seal 锚 evidence、
+    anchor_evidence level 都要用同一个边界判档，避免与 seal_summary 漂移。
+    pct 非法返回 None（缺=未知，不当 thin 读）。
+    """
+    v = _f(pct)
+    if v <= 0:
+        return None
+    cuts = [float(x) for x in (_seal_tag_rules().get("seal_tiers") or [5, 15, 40])]
+    return ("thin" if v <= cuts[0] else
+            "mid" if v <= cuts[1] else
+            "thick" if v <= cuts[2] else "vthick")
 
 
 def zt_index(date: str = "") -> Dict[str, Dict[str, Any]]:
@@ -1354,6 +1553,53 @@ def intraday_shape(ticks: List[tuple], prev_close: Optional[float],
     }
 
 
+# 当日 tick 批量取数缓存（60s memo）：intraday_shape_batch 与 anchor_evidence_batch
+# 共用同一份序列 —— deep_analyze 一次 run() 内两处消费同一批票，不重复查库
+# （纪律：单次调用内同一份数据只取一次）。键含 (day, t_to, codes)，跨时刻自然失效。
+_TICKS_CACHE: Dict[str, Any] = {"key": None, "at": None, "data": None}
+_TICKS_TTL_S = 60.0
+
+
+def _ticks_batch(codes: List[str], day: str, t_to: str) -> Dict[str, Dict[str, Any]]:
+    """当日 tick 批量取数（60s memo）→ {code: {ticks, prev_close}}。
+
+    取数走 screen_query.ticks（唯一实现：批量 `= ANY(...)` + 09:30 起 + last/volume>0）。
+    09:15~09:30：current_data_day 已切到今天但今天还没有第一笔 tick，回退上一
+    完整交易日（盘前决策看的是最近完整交易日的分时过程）。失败返回 {}（不缓存失败）。
+    """
+    uni: List[str] = []
+    for c in codes or []:
+        s = str(c or "").split(".")[0].strip()
+        if s and s not in uni:
+            uni.append(s)
+    if not uni:
+        return {}
+    key = (str(day)[:10], str(t_to)[:5], tuple(uni))
+    now = datetime.now()
+    if (_TICKS_CACHE.get("key") == key and _TICKS_CACHE.get("data") is not None):
+        age = (now - _TICKS_CACHE["at"]).total_seconds()
+        if age < _TICKS_TTL_S:
+            return _TICKS_CACHE["data"]
+    try:
+        got = _sq.ticks(uni, day=key[0], t_to=key[1])
+        if not got and key[0] == datetime.now().strftime("%Y-%m-%d"):
+            # 09:15~09:30：current_data_day 已切到今天，但今天还没有第一笔 tick。
+            # 盘前/开盘前决策看的是**上一完整交易日**的分时过程，不是空数据。
+            from app.utils.trading_calendar import last_finish_trading_day
+            d_prev = str(last_finish_trading_day())[:10]
+            if d_prev and d_prev != key[0]:
+                got = _sq.ticks(uni, day=d_prev, t_to=key[1])
+    except Exception as e:
+        logger.warning("[MktScreen] 当日 tick 取数失败: %s", e)
+        return {}
+    bucket: Dict[str, Dict[str, Any]] = {
+        code: {"ticks": b["ticks"], "prev_close": b["prev_close"]}
+        for code, b in got.items()
+    }
+    _TICKS_CACHE.update({"key": key, "at": now, "data": bucket})
+    return bucket
+
+
 def intraday_shape_batch(codes: List[str], same_t: Optional[str] = None,
                          day: Optional[str] = None,
                          names: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
@@ -1363,14 +1609,8 @@ def intraday_shape_batch(codes: List[str], same_t: Optional[str] = None,
     盘前做次日决策时，要看的是**最近那个完整交易日**的分时过程，不是空数据。
     same_t 缺省用 `_now_hhmm()`（交易时段=此刻，否则收盘）。
     一条 `symbol = ANY(...)` 约 45 只票 × 240 拍 ≈ 1 万行、60ms，与票数近似无关。
+    取数经 _ticks_batch（60s memo，与 anchor_evidence_batch 共用，单次调用只查一次库）。
     """
-    uni: List[str] = []
-    for c in codes or []:
-        s = str(c or "").split(".")[0].strip()
-        if s and s not in uni:
-            uni.append(s)
-    if not uni:
-        return {}
     t = str(same_t)[:5] if same_t else _now_hhmm()
     if day:
         d = str(day)[:10]
@@ -1381,23 +1621,7 @@ def intraday_shape_batch(codes: List[str], same_t: Optional[str] = None,
         except Exception as e:
             logger.warning("[MktScreen] 目标交易日缺失，分时形态回落今日: %s", e)
             d = datetime.now().strftime("%Y-%m-%d")
-    # 取数走 screen_query.ticks（唯一实现：批量 `= ANY(...)` + 09:30 起 + last/volume>0）
-    try:
-        got = _sq.ticks(uni, day=d, t_to=t)
-        if not got and d == datetime.now().strftime("%Y-%m-%d"):
-            # 09:15~09:30：current_data_day 已切到今天，但今天还没有第一笔 tick。
-            # 盘前/开盘前决策看的是**上一完整交易日**的分时过程，不是空数据。
-            from app.utils.trading_calendar import last_finish_trading_day
-            d_prev = str(last_finish_trading_day())[:10]
-            if d_prev and d_prev != d:
-                got = _sq.ticks(uni, day=d_prev, t_to=t)
-    except Exception as e:
-        logger.warning("[MktScreen] 分时形态取数失败: %s", e)
-        return {}
-    bucket: Dict[str, Dict[str, Any]] = {
-        code: {"ticks": b["ticks"], "prev_close": b["prev_close"]}
-        for code, b in got.items()
-    }
+    bucket = _ticks_batch(codes, d, t)
     out: Dict[str, Dict[str, Any]] = {}
     from .common import get_limit_pct
     for code, b in bucket.items():
@@ -1413,6 +1637,124 @@ def intraday_shape_batch(codes: List[str], same_t: Optional[str] = None,
         if sh.get("ok"):
             sh.pop("ok", None)
             out[code] = sh
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+#  承接证据（承接位选股框架 3.2，2026-11-26）
+# ═══════════════════════════════════════════════════════════════
+# 「看见庄家还在」的实时证明：锚位 ± 带宽内，今天是否回踩过、停了多久、
+#   带内资金是否真的出钱。level 合成档：confirmed（厚封 / touched 且带内净额
+#   >0）/ partial（只 touched 不带钱）/ none。缺数据返回 None（缺=未知，不当
+#   none 写——未知与「无承接」语义完全不同，禁止互相冒充）。
+_ANCHOR_BAND_PCT_ENV = "QD_ANCHOR_BAND_PCT"
+_SEAL_CONFIRM_TIERS = ("thick", "vthick")
+
+
+def anchor_band_pct() -> float:
+    """承接带宽 ±%（QD_ANCHOR_BAND_PCT，默认 1.5；承接位框架 3.2/5.1 同源）。"""
+    try:
+        v = float(os.getenv(_ANCHOR_BAND_PCT_ENV, "") or 1.5)
+    except (TypeError, ValueError):
+        v = 1.5
+    return v if v > 0 else 1.5
+
+
+def anchor_evidence_from_ticks(ticks: List[tuple], prev_close: Optional[float],
+                               primary_px: float, band_pct: float = None,
+                               seal_tier: str = None) -> Optional[Dict[str, Any]]:
+    """承接证据（承接位框架 3.2，纯函数可单测）：锚位±带宽内的分时聚合。
+
+    输入 ticks = [(HH:MM, last, cum_volume)]（与 intraday_shape 同源，60s 拍）；
+    带宽 = ±QD_ANCHOR_BAND_PCT（默认 1.5%）。聚合：
+      touched_today  今日是否回踩过 primary±带宽（任一拍 last 落带内）；
+      hold_minutes   停留在带宽内的拍数（60s 拍 ≈ 分钟）；
+      band_net_wan   带宽内价格方向净额（万元）—— dir=sign(相邻拍 last 变化)，
+                     amt=增量量×last（与 screen_query 量价方向净额同口径，
+                     _topdown 头注纪律）；首拍方向对 prev_close；
+      level          confirmed（seal_tier ∈ thick/vthick，或 touched 且带内净额>0）/
+                     partial（只 touched 不带钱）/ none（都没）。
+    ticks 不足 / primary_px 非法返回 None（缺=未知）。
+    """
+    px = _f(primary_px)
+    if not ticks or len(ticks) < 3 or px <= 0:
+        return None
+    band = float(band_pct) if band_pct else anchor_band_pct()
+    lo_b, hi_b = px * (1 - band / 100.0), px * (1 + band / 100.0)
+    touched = False
+    hold = 0
+    band_net = 0.0
+    prev_px = _f(prev_close) if prev_close else None
+    prev_cum = 0.0
+    for hh, p, cum in ticks:
+        p = _f(p)
+        cum = _f(cum)
+        if p <= 0:
+            continue
+        in_band = lo_b <= p <= hi_b
+        if in_band:
+            touched = True
+            hold += 1
+            dv = max(0.0, cum - prev_cum)      # 累计量回退按 0 计，不造负额（同 intraday_shape）
+            if prev_px and prev_px > 0 and dv > 0:
+                band_net += (1 if p > prev_px else (-1 if p < prev_px else 0)) * p * dv
+        prev_px = p
+        prev_cum = cum
+    band_net_wan = round(band_net / 1e4, 1)
+    if (seal_tier in _SEAL_CONFIRM_TIERS) or (touched and band_net_wan > 0):
+        level = "confirmed"
+    elif touched:
+        level = "partial"
+    else:
+        level = "none"
+    return {"touched_today": touched, "hold_minutes": hold,
+            "band_net_wan": band_net_wan, "level": level}
+
+
+def anchor_evidence_batch(codes: List[str], px_map: Dict[str, float],
+                          band_pct: float = None, day: Optional[str] = None,
+                          t_to: Optional[str] = None,
+                          seal_tiers: Dict[str, str] = None,
+                          prev_closes: Dict[str, float] = None
+                          ) -> Dict[str, Dict[str, Any]]:
+    """批量承接证据 → {code: evidence 块}（只含成功项）。
+
+    取数经 _ticks_batch（与 intraday_shape_batch 共用 60s memo，同批次只查一次库）。
+    day 缺省 current_data_day、t_to 缺省当前时刻；prev_close 缺省用 ticks 首拍价
+    近似（首拍方向贡献极小，误差可忽略；传入精确值更准）。
+    """
+    uni = sorted({str(c or "").split(".")[0].strip() for c in (codes or []) if str(c or "").strip()}
+                 & set(str(c or "").split(".")[0].strip() for c in (px_map or {})))
+    if not uni:
+        return {}
+    if day:
+        d = str(day)[:10]
+    else:
+        try:
+            from app.utils.trading_calendar import current_data_day
+            d = current_data_day()
+        except Exception as e:
+            logger.warning("[MktScreen] 承接证据目标日缺失，回落今日: %s", e)
+            d = datetime.now().strftime("%Y-%m-%d")
+    t = str(t_to)[:5] if t_to else _now_hhmm()
+    bucket = _ticks_batch(uni, d, t)
+    out: Dict[str, Dict[str, Any]] = {}
+    for code in uni:
+        b = bucket.get(code)
+        if not b:
+            continue
+        px = _f((px_map or {}).get(code))
+        if px <= 0:
+            continue
+        _pc = _f((prev_closes or {}).get(code)) or _f(b.get("prev_close"))
+        try:
+            ev = anchor_evidence_from_ticks(b["ticks"], _pc, px, band_pct,
+                                            (seal_tiers or {}).get(code))
+        except Exception as e:
+            logger.warning("[MktScreen] 承接证据计算失败 %s: %s", code, e)
+            continue
+        if ev:
+            out[code] = ev
     return out
 
 
@@ -1460,12 +1802,15 @@ def flow_summary(code: str) -> Dict[str, Any]:
     键名不再自称 main_net。跨票比较用 *_pct，跨日看方向序列，绝对额只作门槛。
 
     Returns:
-        {ok, net_wan, caliber, caliber_note, net_pct_of_amount,
+        {ok, net_wan, up_net_wan, down_net_wan, caliber, caliber_note, net_pct_of_amount,
          recent: {ok, as_of_day, last_day_net_wan, net_5d_wan, net_20d_wan, ratio_5d_pct, ratio_20d_pct,
                   streak_dir, streak_days, sign_5d, max_day, net_20d_ex_max_wan,
                   prev_day_net_wan, trend},
          intraday: {ok, open_net_wan, after_net_wan, open_share_pct, points, caliber?},
          reason?}
+
+    up_net_wan/down_net_wan（承接位框架 3.3）：上涨/下跌分钟净额两个和（down 记负，
+    up+down=net 守恒）；divergence 由 flow_divergence 在 deep 层合成后写回本卡。
     """
     out: Dict[str, Any] = {}
     # ── 当日：盘中 realtime_snapshot 量价派生 / 盘后 kline_1m 定格（见 docstring）──
@@ -1485,6 +1830,14 @@ def flow_summary(code: str) -> Dict[str, Any]:
                 out["net_pct_of_amount"] = day_net.get("main_pct")
                 out["caliber"] = "price_direction_1m_fixed"
                 out["caliber_note"] = "量价方向净额（kline_1m 15:00 定格，非主力）"
+                # 量价拆分（承接位框架 3.3）：_flow_from_1m_day 已按分钟方向累计，
+                # inflow/outflow 即「上涨/下跌分钟净额」两个和，直接复用不重算；
+                # up+down=net 守恒（同源对账键，down 记负）。
+                _inflow = float(day_net.get("inflow") or 0)
+                _outflow = float(day_net.get("outflow") or 0)
+                if _inflow or _outflow:
+                    out["up_net_wan"] = round(_inflow / 1e4, 1)
+                    out["down_net_wan"] = round(-_outflow / 1e4, 1)
                 open_win = _flow_from_1m_day(_day, code=code, until=_OPEN_WINDOW_END)
                 open_net = float((open_win or {}).get("main_net") or 0)
                 total_net = float(day_net.get("main_net") or 0)
@@ -1522,7 +1875,17 @@ def flow_summary(code: str) -> Dict[str, Any]:
                 else:
                     out["net_wan"] = round(raw_net / 1e4, 1)
                 out["net_pct_of_amount"] = pct
-                out["intraday"] = _intraday_shape(ff.get("data") or [])
+                _pts = ff.get("data") or []
+                # 量价拆分（承接位框架 3.3）：盘中 realtime 返回分钟净额序列，
+                # 按符号拆两个和（up=Σ正、down=Σ负，up+down=total 守恒，down 记负）。
+                _up = round(sum(_f(p.get("main_net")) for p in _pts
+                                if _f(p.get("main_net")) > 0) / 1e4, 1)
+                _dn = round(sum(_f(p.get("main_net")) for p in _pts
+                                if _f(p.get("main_net")) < 0) / 1e4, 1)
+                if _up or _dn:
+                    out["up_net_wan"] = _up
+                    out["down_net_wan"] = _dn
+                out["intraday"] = _intraday_shape(_pts)
         except Exception as e:
             out["reason"] = f"{type(e).__name__}: {e}"
 
@@ -1589,6 +1952,41 @@ def flow_summary(code: str) -> Dict[str, Any]:
     out.setdefault("caliber_note", "量价方向净额（非主力）")
     out["ok"] = "net_wan" in out
     return out
+
+
+# ── 量价背离（承接位选股框架 3.3，拉升定性四问①的数据基础）─────────
+_FLOW_PULSE_MIN_SHARE_ENV = "QD_FLOW_PULSE_MIN_SHARE"
+
+
+def flow_divergence(chg_pct, net_wan, up_net_wan, down_net_wan,
+                    intraday: Dict[str, Any] = None) -> Optional[str]:
+    """量价背离形态判定（承接位框架 3.3，纯函数：只描述形态，定性归 L4）。
+
+    口径（重要）：up_net_wan = 上涨分钟净额和（恒 ≥0）、down_net_wan = 下跌分钟
+    净额和（恒 ≤0），up+down = net（量价方向净额）。方案文字「价升钱出 =
+    up_net_wan<0」在该口径下不可触发（上涨分钟净额恒正），实现按同一意图等价改写：
+      · 价升钱出：当日 chg>0 且 net<0 —— 价在涨、钱在出（下跌分钟量能反超上涨
+        分钟，对倒/出货指纹，四问①一票否决级）；
+      · 脉冲背离：开盘窗净流入且其后转负（open_net_wan>0 / after_net_wan<0 /
+        open_share_pct ≥ QD_FLOW_PULSE_MIN_SHARE 默认 50；share 缺失 = 全日总额
+        ≤0 = 开盘的钱被全部吐回，属最强「其后转负」形态，命中）——拉升段的钱
+        集中在开盘窗，与 pump_dump_risk 开盘脉冲线索合读；
+      · 同时命中取「价升钱出」（一票否决级优先）；都不命中/数据不足 → None（缺键）。
+    """
+    chg, net = _num_or_none(chg_pct), _num_or_none(net_wan)
+    if chg is not None and net is not None and chg > 0 and net < 0:
+        return "价升钱出"
+    intr = intraday if isinstance(intraday, dict) else {}
+    if intr.get("ok"):
+        open_wan, after_wan = _f(intr.get("open_net_wan")), _f(intr.get("after_net_wan"))
+        share = intr.get("open_share_pct")
+        try:
+            min_share = float(os.getenv(_FLOW_PULSE_MIN_SHARE_ENV, "") or 50.0)
+        except (TypeError, ValueError):
+            min_share = 50.0
+        if open_wan > 0 and after_wan < 0 and (share is None or _f(share) >= min_share):
+            return "脉冲背离"
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -75,10 +75,13 @@ run() 的唯一选人链路。旧表述「与 classic 自底向上链路并列�
 from __future__ import annotations
 
 import os
+from collections import defaultdict
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...log import logger
 from app.data_sources import screen_query as _sq
+from ._helpers import seal_tier_of
 
 _DEFAULT_DAY_TZ = "Asia/Shanghai"
 
@@ -491,7 +494,9 @@ def limit_stats(codes: List[str], zt_rows: List[Dict[str, Any]]) -> Dict[str, An
                   "zt_time": _t(r), "seal_amount": float(r.get("seal_amount") or 0),
                   "amount": float(r.get("amount") or 0),
                   "streak": int(r.get("continuous_zt_days") or 1),
-                  "open_count": int(r.get("open_count") or 0)} for r in rows],
+                  "open_count": int(r.get("open_count") or 0),
+                  "seal_ratio_pct": r.get("seal_ratio_pct"),
+                  "seal_tier": r.get("seal_tier")} for r in rows],
         "seal_amount": sum(float(r.get("seal_amount") or 0) for r in rows),
         "amount": sum(float(r.get("amount") or 0) for r in rows),
         "times": times,
@@ -788,7 +793,12 @@ def pick_stocks_in_board(track: str, name: str, zt_rows: List[Dict[str, Any]],
                            "reason": head
                                      + (f" 封板{amt:.1f}亿" if amt > 0 else "")
                                      + (" " + str(r["streak"]) + "连板" if r["streak"] > 1 else ""),
-                           "kind": "limit_up", "score": float(r["seal_amount"])})
+                           "kind": "limit_up", "score": float(r["seal_amount"]),
+                           # 承接位框架 4.2：封板三事实随行（重建路径缺=未知，盘中实时池/
+                           # 盘后收盘池路径有值；缺键语义见 SKILL.md limit_up_ref 条）
+                           "seal_ratio_pct": r.get("seal_ratio_pct"),
+                           "seal_tier": r.get("seal_tier"),
+                           "open_count": r.get("open_count")})
         out.update({"branch": "limit_up", "picked": picked, "follow": fl,
                     "follow_n": len(fl.get("follow") or []),
                     "reverse_n": len(fl.get("reverse") or []),
@@ -1269,10 +1279,355 @@ def _enrich_seal_from_closing_pool(zt_rows: List[Dict[str, Any]], day: str) -> L
             v = p.get(k)
             if v is not None:
                 r[k] = v
+        # 承接位框架 4.2：封单比例与厚薄档同步补齐（与 seal_summary 同口径，
+        # seal_tier_of 单源判档）——涨停参考行的 seal 三字段在盘后同样齐备。
+        _sa, _amt = float(p.get("seal_amount") or 0), float(p.get("amount") or 0)
+        if _sa > 0 and _amt > 0:
+            r["seal_ratio_pct"] = round(_sa / _amt * 100, 2)
+            r["seal_tier"] = seal_tier_of(r["seal_ratio_pct"])
         filled += 1
     if filled:
         logger.info("[topdown] 盘后封单回填 %s/%s 只（收盘池）", filled, len(zt_rows or []))
     return zt_rows
+
+
+def _attach_rt_seal(zt_rows: List[Dict[str, Any]], day: str,
+                    as_of_eff: str) -> List[Dict[str, Any]]:
+    """盘中把实时涨停池的封单三事实补进「曾触板」行（承接位选股框架 4.2）。
+
+    防前视口径：仅当 as_of_eff ≈ 当前钟表时刻（生产实时运行）才喂实时池——
+    固定边界重放（回测/T+N 回评）的 as_of 在过去，实时池是「现在」的池，
+    喂进去就是把未来信息写进历史决策，禁止（与 2026-11-26 定稿的曾触板
+    重建口径一致）。炸板票（不在实时池）保持缺键——封单=0 与缺=未知的语义
+    不同，不回落 0。盘后 ≥15:00 由 _enrich_seal_from_closing_pool 回填，
+    本函数不重复。seal_ratio_pct/seal_tier 与 seal_summary 同口径
+    （封单÷当日成交额，seal_tier_of 单源判档）。
+    """
+    try:
+        _h = int(as_of_eff[:2]) * 60 + int(as_of_eff[3:5])
+        _now = datetime.now()
+        _n = _now.hour * 60 + _now.minute
+    except Exception:
+        return zt_rows
+    if abs(_n - _h) > 5 or _h >= 15 * 60:
+        return zt_rows
+    try:
+        from app.data_sources.cn_stock_ext import limit_pool
+        pool = limit_pool("limit_up_pool", day) or []
+    except Exception as e:
+        logger.warning("[topdown] 实时涨停池读取失败（封单三事实不补）: %s", e)
+        return zt_rows
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for r in pool:
+        if isinstance(r, dict):
+            by_code[str(r.get("code") or r.get("stock_code") or "").split(".")[0]] = r
+    filled = 0
+    for r in zt_rows or []:
+        p = by_code.get(str(r.get("stock_code") or "").split(".")[0])
+        if not p:
+            continue          # 炸板票：此刻不在池 = 未封住，保持缺键（不回落 0）
+        seal_amt, amt = float(p.get("seal_amount") or 0), float(p.get("amount") or 0)
+        if seal_amt > 0:
+            r["seal_amount"] = seal_amt
+        if p.get("open_count") is not None:
+            r["open_count"] = int(float(p.get("open_count")))
+        if seal_amt > 0 and amt > 0:
+            r["seal_ratio_pct"] = round(seal_amt / amt * 100, 2)
+            r["seal_tier"] = seal_tier_of(r["seal_ratio_pct"])
+        filled += 1
+    if filled:
+        logger.info("[topdown] 盘中实时封单补全 %s/%s 只（实时池）", filled, len(zt_rows or []))
+    return zt_rows
+
+
+# ── 生态地图（承接位选股框架 4.1，2026-11-26）─────────────────────────
+# 不认角色只报生态：同板块 T-5~T-1 谁在场（涨停/跳变/放量序列）、各自资金与
+# 支撑、当日同伴数。角色（龙头/跟随）是资金判断的输出（L4 裁量），不是选人层
+# 的输入——60s 颗粒度下分不清谁是龙头、是不是在换龙头。lone_surge（孤立拉升）
+# 处置定死：不进「买什么」但留在 rank 带标（粗筛宁滥勿缺），执行归判定层。
+_TIER_CTX_ENABLE = os.getenv("QD_TOPDOWN_TIER_CTX_ENABLE", "1") not in ("0", "false", "False")
+_TIER_KLINE_DAYS = _env_i("TIER_KLINE_DAYS", 12)       # 日线窗：判据窗 T-5..T-1 + 近10日低点
+_TIER_SUPPORT_TOL = _env_f("TIER_SUPPORT_TOL", 3.0)    # 支撑完好：T-1 收盘距近10日低点跌幅 ≤ 此%
+_TIER_LEAD_DAYS = _env_i("TIER_LEAD_DAYS", 5)          # 领涨事件回看天数（T-5..T-1，用户定义 5 日）
+_TIER_LEAD_TOP = _env_i("TIER_LEAD_TOP", 4)            # 领涨前四 = 1 龙头 + 3 跟随（用户定义）
+_TIER_LEAD_PREFILTER = _env_f("TIER_LEAD_PREFILTER", 3.0)  # 1m 检测前的日线预筛阈值（日涨幅%）
+_TIER_T1_MAX = 8                                       # t1_participants 输出上限（控体积，按 T-1 涨幅降序）
+
+
+def _tier_m1_rows(day: str, codes: List[str]) -> Dict[str, List[dict]]:
+    """kline_1m_2026 当日 1m 序列 → {code: [{t, high, close, volume}]}。
+
+    为什么不用 tape（screen_query.ticks / limit_touch）：snapshot 只存近期采集，
+    历史日为空（2026-11-26 诊断实证：2026-11-05 ticks=0 行）；而生态地图的领涨
+    窗口（T-5..T-1）全是**已收盘日**，kline_1m_2026 完整覆盖且盘后定格——生产与
+    固定边界重放同一条数据路径（可复测）。当日盘中事件不进生态地图，不依赖
+    kline_1m「盘中当日为空」的缺口。连接池走 screen_query._pool（只调用不改）。
+    """
+    uni = sorted({str(c).split(".")[0].strip() for c in (codes or []) if str(c).strip()})
+    if not uni:
+        return {}
+    out: Dict[str, List[dict]] = defaultdict(list)
+    try:
+        from app.data_sources.screen_query import _pool
+        with _pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT symbol, time, high, close, volume
+                    FROM "kline_1m_2026"
+                    WHERE time::date = DATE %s AND symbol = ANY(%s)
+                    ORDER BY symbol, time
+                """, (day, uni))
+                for sym, ts, hi, cl, vol in cur:
+                    out[str(sym)].append({"t": ts.strftime("%H:%M"),
+                                          "high": float(hi or 0),
+                                          "close": float(cl or 0),
+                                          "volume": float(vol or 0)})
+    except Exception as e:
+        logger.warning("[topdown] kline_1m 读取失败 %s %s: %s", day, uni[:3], e)
+        return {}
+    return dict(out)
+
+
+def _tier_lead_events_from_m1(day: str, m1: Dict[str, List[dict]],
+                              prev_close_by_code: Dict[str, float],
+                              limit_pct_by_code: Dict[str, float],
+                              params: Dict[str, float]) -> Dict[str, Tuple[str, str]]:
+    """单日 1m 领涨事件检测 → {code: (时刻HH:MM, kind)}（纯函数可单测）。
+
+    两个事件取**先发生者**（先跳后板 = 跳变时刻）：
+      · 涨停（k=zt）：1m high 首次 ≥ 涨停价−0.005（与 zt_rows_asof 同判据容差）；
+      · 跳变（k=jump）：生产 detect_jumps 判据的 1m 移植（与回测镜像 detect_jumps1
+        同构）——burst：分钟涨幅 ≥ jump_ret 且 分钟额 ≥ jump_amt_mult×前5根均额；
+        streak（开盘基准不足时）：连续 3 根上行有成交且累计涨幅 ≥ 2%。
+    params 用中性档（生态地图是事实层，不联动大盘档）。
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    for code, bars in (m1 or {}).items():
+        pc = (prev_close_by_code or {}).get(code)
+        if not bars or len(bars) < 4 or not pc or pc <= 0:
+            continue
+        pct = (limit_pct_by_code or {}).get(code) or 0.0
+        zt_px = round(pc * (1 + pct / 100.0), 2) if pct > 0 else 0.0
+        zt_t = None
+        jump_ev = None
+        amts: List[float] = []
+        streak = 0
+        streak_i0 = 0
+        for i, b in enumerate(bars):
+            px, hi = float(b["close"]), float(b["high"])
+            t = str(b["t"])
+            if zt_t is None and zt_px > 0 and hi >= zt_px - 0.005:
+                zt_t = t
+            amt = (float(b["volume"]) * px) if float(b["volume"]) > 0 else 0.0
+            step = ((px / float(bars[i - 1]["close"]) - 1) * 100
+                    if i and float(bars[i - 1]["close"]) else 0.0)
+            window = amts[-5:]
+            base = (sum(window) / len(window)) if window else 0.0
+            amts.append(amt)
+            if i and px > float(bars[i - 1]["close"]) and amt > 0:
+                if streak == 0:
+                    streak_i0 = i
+                streak += 1
+            else:
+                streak = 0
+            if jump_ev is None:
+                if len(window) >= 5:
+                    if (step >= params["jump_ret"] and base > 0
+                            and amt >= params["jump_amt_mult"] * base):
+                        jump_ev = (t, "jump")
+                elif streak >= 3:
+                    ref = (float(bars[streak_i0 - 1]["close"])
+                           if streak_i0 >= 1 else float(bars[0]["close"]))
+                    if ref and (px / ref - 1) * 100 >= 2.0:
+                        jump_ev = (str(bars[streak_i0]["t"]), "jump")
+        if zt_t and jump_ev:
+            out[code] = (zt_t, "zt") if zt_t <= jump_ev[0] else jump_ev
+        elif zt_t:
+            out[code] = (zt_t, "zt")
+        elif jump_ev:
+            out[code] = jump_ev
+    return out
+def _tier_ctx_one_board(track: str, board: str, day: str,
+                        as_of: Optional[str]) -> Dict[str, Any]:
+    """单板块生态事实（承接位框架 4.1 v2，用户定义领涨四）：板块 5 日领涨事件前四
+    = **1 龙头 + 3 跟随**。失败降级不猜。
+
+    领涨事件（T-5..T-1，全部已收盘日）：板块成员当日盘中
+      · 涨停（k=zt）—— kline_1m_2026 首次触及涨停价的分钟时刻；
+      · 跳变（k=jump）—— 1m 首次突增时刻（生产 detect_jumps 判据移植，见
+        _tier_lead_events_from_m1；含「先跳后板」的票取更早的跳变时刻）。
+    数据源 kline_1m_2026（历史完整、盘后定格），不用 tape——历史日 snapshot
+    为空（诊断实证），见 _tier_m1_rows docstring。
+    每票每日取先发生者；每票跨日取最早事件；按事件 (日期, 时刻) 升序取前
+    `_TIER_LEAD_TOP`（默认 4）只：第 1 名 = 龙头（r="L"），第 2~4 名 = 跟随（r="F"）。
+    participants_5d = 全部领涨事件票数（不截断）。
+    funds_ok_n = 跟随（第 2~4 名）中「5 日资金净额>0 且 支撑完好」的数量
+    （方案 4.1 原文：跟随股看前三的资金质量，不看数量——3 只跟风但资金全负
+    = 互倒造势，比孤板更毒）。
+    1m 检测前用日线预筛（当日涨幅 ≥ `_TIER_LEAD_PREFILTER` 默认 3% 或曾触板），
+    候选子集才跑 1m 检测——全成员 5 日 1m 检测成本不可接受。
+    事件只取已收盘日（T-1 及更早），当日盘中事件不进生态地图（无前视；
+    当日在场由 today_peers / 当日候选表达）。
+    """
+    empty = {"board": board, "lead4": [], "participants_5d": 0,
+             "funds_ok_n": None, "note": None, "ok": False}
+    try:
+        members = board_members(track, board, as_of=as_of)
+    except Exception as e:
+        empty["note"] = f"板块成员缺失({type(e).__name__})"
+        return empty
+    if not members:
+        empty["note"] = "板块无成员"
+        return empty
+    try:
+        kl = _sq.kline_batch(members, days=_TIER_KLINE_DAYS, as_of=day)
+        bars_all = kl.get("codes") or {}
+    except Exception as e:
+        empty["note"] = f"板块日线缺失({type(e).__name__})"
+        return empty
+    from .common import get_limit_pct
+
+    # ── 日线预筛 + 事件窗口（T-5..T-1 的交易日列表） ──
+    candidates: set = set()
+    event_days: List[str] = []
+    support_feed: Dict[str, list] = {}
+    for code, bars in bars_all.items():
+        hist = [b for b in (bars or []) if str(b.get("time") or "")[:10] < day]
+        if len(hist) < 2:
+            continue
+        support_feed[code] = hist
+        if not event_days:
+            event_days = [str(b.get("time") or "")[:10] for b in hist[-_TIER_LEAD_DAYS:]]
+        for i in range(max(1, len(hist) - _TIER_LEAD_DAYS), len(hist)):
+            b, pb = hist[i], hist[i - 1]
+            c, pcv, hi = (float(b.get("close") or 0), float(pb.get("close") or 0),
+                          float(b.get("high") or 0))
+            if c <= 0 or pcv <= 0 or hi <= 0:
+                continue
+            pct = get_limit_pct(code)
+            touched = bool(pct > 0 and hi >= pcv * (1 + pct / 100.0) - 0.005)
+            chg = (c - pcv) / pcv * 100
+            if touched or chg >= _TIER_LEAD_PREFILTER:
+                candidates.add(code)
+                break
+    if not event_days or len(event_days) < 2:
+        empty["note"] = "日线事件窗不足"
+        return empty
+
+    # ── 1m 领涨事件检测（kline_1m_2026，候选子集 × T-5..T-1）──
+    first: Dict[str, Tuple[str, str, str]] = {}      # code → (day, t, kind) 最早事件
+    if candidates:
+        cand = sorted(candidates)
+        p_neutral = _preset("neutral")
+        lps = {c: get_limit_pct(c) for c in cand}
+        for d in event_days:
+            m1 = _tier_m1_rows(d, cand)
+            if not m1:
+                continue
+            pcs: Dict[str, float] = {}
+            for c in cand:
+                prev_bars = [b for b in (support_feed.get(c) or [])
+                             if str(b.get("time") or "")[:10] < d]
+                if prev_bars:
+                    pcs[c] = float(prev_bars[-1].get("close") or 0)
+            evs = _tier_lead_events_from_m1(d, m1, pcs, lps, p_neutral)
+            for code, (t, kind) in evs.items():
+                prev_ev = first.get(code)
+                if prev_ev is None or (d, t) < (prev_ev[0], prev_ev[1]):
+                    first[code] = (d, t, kind)
+    ranked = sorted(((d, t, c, k) for c, (d, t, k) in first.items()),
+                    key=lambda e: (e[0], e[1]))
+    ctx = {"board": board,
+           "lead4": [{"c": c, "d": d[5:], "t": t, "k": k,
+                      "r": ("L" if i == 0 else "F")}
+                     for i, (d, t, c, k) in enumerate(ranked[:_TIER_LEAD_TOP])],
+           "participants_5d": len(ranked),
+           "funds_ok_n": None,
+           "note": None,
+           "ok": True}
+    if not ranked:
+        ctx["note"] = "T-5..T-1 无领涨事件"
+        return ctx
+    followers = [e[2] for e in ranked[1:_TIER_LEAD_TOP]]
+    if not followers:
+        return ctx                                   # 只有龙头，无跟随 → funds_ok 缺
+    try:
+        panel = _sq.snap_panel(as_of=as_of, codes=followers, days=6, with_net=True,
+                               full_net=True, end_day=day, with_last=True)
+        rows = panel.get("rows") or {}
+    except Exception as e:
+        ctx["note"] = f"板块资金面板缺失({type(e).__name__})"
+        return ctx
+    ok_n = 0
+    for fc in followers:
+        by_day = rows.get(fc) or {}
+        net5 = sum(float((v or {}).get("net") or 0) for d, v in by_day.items()
+                   if str(d)[:10] < day) / 1e4
+        bars = support_feed.get(fc) or []
+        intact = False
+        if len(bars) >= 2:
+            c1 = float(bars[-1].get("close") or 0)
+            lo10 = min(float(b.get("low") or 0) for b in bars[-10:]) if bars else 0.0
+            intact = bool(c1 > 0 and lo10 > 0
+                          and c1 >= lo10 * (1 - _TIER_SUPPORT_TOL / 100.0))
+        if net5 > 0 and intact:
+            ok_n += 1
+    ctx["funds_ok_n"] = ok_n
+    return ctx
+
+
+def _tier_context(items: List[Dict[str, Any]], day: str,
+                  as_of: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
+    """生态地图（承接位选股框架 4.1）：每候选挂 tier_ctx，不认角色只报事实。
+
+    输出（每候选 tier_ctx）：{board, participants_5d（同板块 T-5~T-1 在场者数）,
+    t1_participants（昨日在场者，最关键锚点，按 T-1 涨幅降序 ≤8 只）,
+    today_peers（当日同板块同伴数）, funds_ok_n（在场者前三中「5日资金正且
+    支撑完好」数）, lone_surge（孤立拉升标：前5日无在场者且当日同伴≤1）, note}。
+    同板块只算一次（多候选共享）；数据全部 as_of 边界内，无前视。
+    Returns: (items, unknown_n)；env QD_TOPDOWN_TIER_CTX_ENABLE=0 关闭。
+    """
+    if not _TIER_CTX_ENABLE or not items:
+        return list(items), 0
+    peers: Dict[str, int] = {}
+    for x in items:
+        b = str(x.get("board") or "")
+        peers[b] = peers.get(b, 0) + 1
+    boards: Dict[str, Dict[str, Any]] = {}
+    unknown = 0
+    out: List[Dict[str, Any]] = []
+    for x in items:
+        b = str(x.get("board") or "")
+        if not b:
+            unknown += 1
+            out.append(x)
+            continue
+        if b not in boards:
+            boards[b] = _tier_ctx_one_board(str(x.get("track") or ""), b, day, as_of)
+        ctx = dict(boards[b])
+        ctx["today_peers"] = peers.get(b, 1)
+        # fail-closed：数据缺（ok=False）时 lone_surge=None（未知），不得把「未知」
+        # 冒充「确认孤立拉升」——那是 L4 一票否决级证据，宁缺勿错。
+        _ok = ctx.get("ok") is not False
+        ctx["lone_surge"] = (bool(int(ctx.get("participants_5d") or 0) == 0
+                                  and ctx["today_peers"] <= 1) if _ok else None)
+        if not _ok:
+            unknown += 1
+        elif (ctx.get("funds_ok_n") is None
+              and int(ctx.get("participants_5d") or 0) > 1):
+            unknown += 1
+        ctx.pop("ok", None)
+        if not ctx.get("note"):
+            l4 = ctx.get("lead4") or []
+            l0 = l4[0] if l4 else None
+            n_f = max(0, len(l4) - 1)
+            ctx["note"] = ((f"龙头{l0['c']}({l0['d']} {l0['t']}{l0['k']})，"
+                            f"跟随{n_f}只资金正{ctx.get('funds_ok_n')}，"
+                            f"今日同伴{ctx['today_peers']}") if l0 else
+                            (f"T-5..T-1 无领涨事件，"
+                             f"今日同伴{ctx['today_peers']}"))
+        out.append({**x, "tier_ctx": ctx})
+    return out, unknown
 
 
 def _board_rank_sort(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1366,8 +1721,12 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     zt_rows = zt_rows_asof(d, as_of_eff, _board_union_members(boards))
     # 盘后 15:00 边界：收盘封单/连板数是边界内已定格事实，回填给最终封住的票
     # （炸板票保持触板语义）——恢复封板厚度排序与 reason 证据（见函数 docstring）。
+    # 盘中生产实时（as_of≈此刻）：实时池的封单三事实（承接位框架 4.2）同理是
+    # as_of 可见事实，补进曾触板行；固定边界重放不喂实时池（防前视，见函数 docstring）。
     if as_of_eff >= "15:00":
         zt_rows = _enrich_seal_from_closing_pool(zt_rows, d)
+    else:
+        zt_rows = _attach_rt_seal(zt_rows, d, as_of_eff)
 
     per_board: List[Dict[str, Any]] = []
     all_picked: List[Dict[str, Any]] = []
@@ -1468,6 +1827,12 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
     if deadpool_unknown:
         notes.append(f"死水/噪音护栏 {deadpool_unknown} 只因T-1全日切片/流通股本缺失未打标")
 
+    # 生态地图（承接位框架 4.1）：同板块 T-5~T-1 在场者/资金质量/孤立拉升标。
+    # 选人层只报事实、不排序不淘汰——lone_surge「不进买什么」由判定层执行。
+    all_picked, tier_unknown = _tier_context(all_picked, d, as_of)
+    if tier_unknown:
+        notes.append(f"生态地图 {tier_unknown} 只因板块成员/日线/资金面板缺失未算齐")
+
     # 全局截断：「先跳先选」区分板块——同板块内先跳的是龙头（board_rank=1），
     # 各板块龙头优先于任何板块的第 2 名（_BOARD_RANK_FIRST，2026-11-26 拍板）。
     # 开关关闭时退化为旧纯 t_first 口径（对照回测用）。
@@ -1502,6 +1867,9 @@ def topdown_pick(as_of: Optional[str] = None, day: Optional[str] = None,
             "early_accum_unknown": early_unknown,
             "deadpool_tagged": deadpool_flagged_for_funnel,
             "deadpool_unknown": deadpool_unknown,
+            "tier_unknown": tier_unknown,
+            "lone_surge_codes": [x["code"] for x in trunc
+                                 if (x.get("tier_ctx") or {}).get("lone_surge")],
             "dup_codes": dup_codes,
             "dup_max": max((int(x.get("dup_n") or 1) for x in trunc), default=1),
             "dup_min_gate": _DUP_MIN,
