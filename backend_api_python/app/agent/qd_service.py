@@ -288,7 +288,11 @@ _EXECUTABLE_SKILLS_CACHE: Optional[dict] = None
 
 
 def _executable_skills() -> dict:
-    """执行型技能白名单（单一真源 = app.agent.scripts.skill_run.EXECUTABLE_SKILLS）。
+    """执行型技能白名单（单一真源）。
+
+    优先级：
+    1. **自动发现**：`QDSkillAdapter._build_executable_skills_map()` 扫描 skills/*/run.py 导出函数
+    2. **回落/补充**：`app.agent.scripts.skill_run.EXECUTABLE_SKILLS` 手动维护字典（兼容历史/特殊需求/导入失败的技能）
 
     【加载方式·2026-10-14 D-11 收敛】此前用 `spec_from_file_location` 按文件路径
     加载，理由是「`import scripts.*` 在 sys.path 错序时会解析到
@@ -307,8 +311,31 @@ def _executable_skills() -> dict:
     if _EXECUTABLE_SKILLS_CACHE is not None:
         return _EXECUTABLE_SKILLS_CACHE
     try:
+        # 1. 自动发现（零配置，目录即技能）
+        from .skills_adapter import QDSkillAdapter
+        adapter = QDSkillAdapter()
+        auto_map = adapter._build_executable_skills_map()
+        
+        # 2. 手动维护的 skill_run.EXECUTABLE_SKILLS（作为补充/回落）
         from .scripts.skill_run import EXECUTABLE_SKILLS as _WL
-        _EXECUTABLE_SKILLS_CACHE = dict(_WL or {})
+        manual_map = dict(_WL or {})
+        
+        # 3. 合并：自动发现优先，手动维护补充缺失的
+        #    这样即使某技能导入失败（如缺 yfinance），手动白名单仍能兜底
+        merged = {**manual_map, **auto_map}  # auto_map 覆盖 manual_map（同名以自动为准）
+        
+        if merged:
+            _EXECUTABLE_SKILLS_CACHE = merged
+            auto_count = len(auto_map)
+            manual_count = len(manual_map)
+            added_from_manual = sum(1 for k in manual_map if k not in auto_map)
+            logger.info(
+                "[skill_block] 执行型白名单：合并完成 共 %d 个（自动 %d + 手动补充 %d）",
+                len(merged), auto_count, added_from_manual
+            )
+        else:
+            _EXECUTABLE_SKILLS_CACHE = {}
+            logger.warning("[skill_block] 执行型白名单为空（自动发现与手动均无）")
     except Exception as e:
         logger.debug("[skill_block] 执行型白名单加载失败（fail-open 退化为注正文）: %s", e)
         _EXECUTABLE_SKILLS_CACHE = {}

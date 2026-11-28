@@ -289,6 +289,48 @@ class QDSkillAdapter:
             if issues:
                 self._skill_issues[info.name] = issues
 
+    def _build_executable_skills_map(self) -> dict:
+        """
+        基于已发现的 SKILL.md 技能，自动生成 EXECUTABLE_SKILLS 映射。
+        
+        约定：凡有 run.py 且导出公开函数的，视为可执行技能。
+        返回格式：{name: (mod_path, allowed_functions_tuple, default_fn)}
+        """
+        executable = {}
+        # 已知的执行型技能入口函数名（白名单，防止导出内部函数）
+        KNOWN_ENTRY_FUNCS = {
+            "predict_market", "get_factors_only",  # market-prediction
+            "run", "settle_picks", "measurement_summary",  # market-screener
+            "analyze",  # stock-analyzer
+            "list_strategies", "why_strategy", "debug_strategy", "doctor_auto",  # strategy-debug
+            "run",  # auto-backtest
+        }
+        
+        for name, info in self._skills.items():
+            if info.skill_type != "markdown":
+                continue
+            run_py = Path(info.dir_path) / "run.py"
+            if not run_py.exists():
+                continue
+            try:
+                # 导入模块检查导出函数（包路径：app.agent.skills.*）
+                mod = import_module(f"app.agent.skills.{name}.run")
+                exported = [
+                    n for n in dir(mod)
+                    if not n.startswith("_") 
+                    and callable(getattr(mod, n))
+                    and n in KNOWN_ENTRY_FUNCS
+                ]
+                if exported:
+                    executable[name] = (
+                        f"app.agent.skills.{name}.run",
+                        tuple(sorted(exported)),
+                        exported[0]  # 默认第一个导出函数
+                    )
+            except Exception as e:
+                logger.debug("[QDSkills] 自动构建 EXECUTABLE_SKILLS 失败 %s: %s", name, e)
+        return executable
+
     def _scan_python(self, skills_dir: str):
         """扫描 Python 类技能（继承 Skill 基类）。"""
         base = Path(skills_dir)

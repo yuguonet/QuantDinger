@@ -828,7 +828,7 @@ def fetch_recent_zt_pools(days: int = 8) -> Dict[str, List[Dict]]:
 #  实时行情分块获取（2026-10-20 漏斗）
 # ═══════════════════════════════════════════════════════════════
 
-def batch_realtime_quotes(codes, workers=4):
+def batch_realtime_quotes(codes, workers=6):
     """分块并发获取实时行情——绕过 get_realtime_quote 内部 20 只硬截断（2026-10-20）。
 
     data_tools.get_realtime_quote 固定只处理前 20 只（code_list[:20]），宽池回填

@@ -38,7 +38,7 @@ from pathlib import Path
 # 技能执行注册表：name → (模块路径, 允许调用的函数, 默认函数)
 # 白名单制——run_skill 不执行任意代码，只跑这里登记过的入口。
 EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
-    "market-screener": ("skills.market-screener.run", ("run",), "run"),
+    "market-screener": ("skills.market-screener.run", ("run", "settle_picks", "measurement_summary"), "run"),
     "strategy-debug": (
         "skills.strategy-debug.run",
         ("list_strategies", "why_strategy", "debug_strategy", "doctor_auto"),
@@ -46,6 +46,7 @@ EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
     ),
     "auto-backtest": ("skills.auto-backtest.run", ("run",), "run"),
     "stock-analyzer": ("skills.stock-analyzer.run", ("analyze",), "analyze"),
+    "market-prediction": ("skills.market-prediction.run", ("predict_market", "get_factors_only"), "predict_market"),
 }
 
 # ★ 2026-10-14 迁址：原为 `parents[1]`（= app/agent）⇒ 产物落在 `app/agent/tmp/`
