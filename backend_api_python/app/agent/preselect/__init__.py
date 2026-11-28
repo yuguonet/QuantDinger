@@ -38,6 +38,7 @@ from .tool_preselect import (
     fast_route_tools, get_tool_index, has_domain_hint, index_candidates,
     lint_selection, names_in_text, parse_plan, parse_selection,
     single_target_anchor,
+    guard_index_technical_analysis, INDEX_CODES, _INDEX_ONLY_TOOLS,
     # 2026-10-17 目录预过滤（shrink_catalog 写好两年无人调，接线时补公开导出）
     shrink_catalog, _preselect_catalog_limit, single_target_default_tools,
     # 2026-10-17 F14（E3）：O-14 分级触发改判 schema 总字符数
@@ -78,6 +79,7 @@ __all__ = [
     "fast_route_tools", "get_tool_index", "has_domain_hint", "index_candidates",
     "lint_selection", "names_in_text", "parse_plan", "parse_selection",
     "single_target_anchor",
+    "guard_index_technical_analysis", "INDEX_CODES", "_INDEX_ONLY_TOOLS",
     # 目录预过滤（2026-10-17 接线）
     "shrink_catalog", "_preselect_catalog_limit", "single_target_default_tools",
     # O-14 分级触发（2026-10-17 F14/E3：改判 schema 总字符数）

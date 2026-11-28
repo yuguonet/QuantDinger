@@ -400,6 +400,24 @@ def market_state() -> Dict[str, Any]:
 #  多周期几何量（客观描述，不含买入含义）
 # ═══════════════════════════════════════════════════════════════
 
+# 弱转强量能确认门槛（env 可调，默认 0.5）：纯客观标签，不改变 weak_to_strong
+# 几何判定——量能是否确认作为独立事实输出，降权取舍归裁决层（strategy-rules.md）。
+# 本文件禁止出现入选阈值/评分（见文件头约束），故只输出确认标签、不做判定卡口。
+_W2S_VOL_MIN_CACHE: float | None = None
+
+
+def _w2s_vol_min() -> float:
+    """弱转强量能确认门槛：env QD_W2S_MIN_VOL_RATIO 优先，非法/≤0 回落 0.5。"""
+    global _W2S_VOL_MIN_CACHE
+    if _W2S_VOL_MIN_CACHE is None:
+        try:
+            v = float(os.environ.get("QD_W2S_MIN_VOL_RATIO", "") or 0)
+            _W2S_VOL_MIN_CACHE = v if v > 0 else 0.5
+        except (TypeError, ValueError):
+            _W2S_VOL_MIN_CACHE = 0.5
+    return _W2S_VOL_MIN_CACHE
+
+
 def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> Dict[str, Any]:
     """日线 + 15m + 5m 的结构量。分钟线统一由 1m 聚合而来（其它周期查表恒空）。
 
@@ -418,6 +436,7 @@ def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> Dic
     out: Dict[str, Any] = {
         "ok": False, "code": code, "daily": {}, "m15": {}, "m5": {},
         "weak_to_strong": False, "strong_to_weak": False,
+        "weak_to_strong_vol_confirm": False,
         "volume_pattern": "unknown", "missing": [],
     }
 
@@ -466,6 +485,13 @@ def multitimeframe(code: str, daily_days: int = 60, minute_days: int = 5) -> Dic
         out["strong_to_weak"] = bool(recent_below >= 4 and prev_above >= 3)
         if macd["macd"][i] < 0 and recent_above >= 3 and closes[i] > (ma5[i] or 0):
             out["weak_to_strong"] = True
+        # 量能确认（纯客观标签，不改变 weak_to_strong 几何判定）：弱转强成立时，
+        # 日线量比达门槛才算确认；数据缺失（vr[i] 为 None）不算确认。
+        # 降权取舍归裁决层（strategy-rules.md），本层只输出客观事实。
+        if out["weak_to_strong"]:
+            _vr_i = vr[i]
+            out["weak_to_strong_vol_confirm"] = bool(
+                _vr_i is not None and _vr_i >= _w2s_vol_min())
 
     if vr[i] > 1.5 and closes[i] > closes[i - 1]:
         out["volume_pattern"] = "放量上涨"

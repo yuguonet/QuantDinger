@@ -135,3 +135,14 @@ def doctor_auto(strategy: str = "") -> Dict[str, Any]:
     if r.get("exit") in (0, 1):
         r["status"] = "ok"
     return r
+
+
+# ================================================================
+# 技能注册元数据（供 run_skill 自动发现）
+# ================================================================
+
+SKILL_DEFAULT_ENTRY = "debug_strategy"
+
+__all__ = ["list_strategies", "why_strategy", "debug_strategy", "doctor_auto"]
+
+# run_skill("strategy-debug", {}) 会调用 debug_strategy()

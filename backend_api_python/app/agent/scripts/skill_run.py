@@ -68,13 +68,28 @@ def _executable_skills_registry() -> dict[str, tuple[str, tuple[str, ...], str]]
         return {}
 
 
+def _executable_skills() -> dict[str, tuple[str, tuple[str, ...], str]]:
+    """取（并缓存）自动发现的可执行技能注册表。
+
+    ⚠️ 不能只靠 PEP 562 的模块 `__getattr__`：它只在**外部按属性访问**时触发，
+    模块内部函数里的全局名查找（`EXECUTABLE_SKILLS`）走的是 globals dict，
+    不会触发 `__getattr__` ⇒ main() 里直接引用会 NameError。
+    因此这里提供显式的取值函数，模块内部与外部都走它。
+    """
+    cached = globals().get("_EXECUTABLE_SKILLS_CACHE")
+    if cached is not None:
+        return cached
+    val = _executable_skills_registry()
+    globals()["_EXECUTABLE_SKILLS_CACHE"] = val
+    globals()["EXECUTABLE_SKILLS"] = val
+    return val
+
+
 # PEP 562：模块级 __getattr__ 懒导出 EXECUTABLE_SKILLS（兼容旧消费者）
 # 首次访问时构建并缓存进 globals，后续直接命中
 def __getattr__(name: str) -> Any:
     if name == "EXECUTABLE_SKILLS":
-        val = _executable_skills_registry()
-        globals()[name] = val
-        return val
+        return _executable_skills()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -243,10 +258,11 @@ def _touch(job_dir: str) -> None:
 
 
 def main() -> int:
-    # EXECUTABLE_SKILLS 通过 __getattr__ 懒加载（PEP 562）
-    if len(sys.argv) < 2 or sys.argv[1] not in EXECUTABLE_SKILLS:
+    # 注册表：模块内部引用全局名不会触发 PEP 562 __getattr__，故走显式取值函数
+    registry = _executable_skills()
+    if len(sys.argv) < 2 or sys.argv[1] not in registry:
         print(json.dumps({"ok": False, "error":
-                          f"未知技能。可执行: {sorted(EXECUTABLE_SKILLS)}"}, ensure_ascii=False))
+                          f"未知技能。可执行: {sorted(registry)}"}, ensure_ascii=False))
         return 2
     name = sys.argv[1]
     spec = {}
@@ -257,7 +273,7 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": f"arguments 不是合法 JSON: {e}"}, ensure_ascii=False))
             return 2
 
-    mod_path, allowed, default_fn = EXECUTABLE_SKILLS[name]
+    mod_path, allowed, default_fn = registry[name]
     fn_name = str(spec.get("fn") or default_fn)
     if fn_name not in allowed:
         print(json.dumps({"ok": False, "error":

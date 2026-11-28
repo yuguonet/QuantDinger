@@ -1712,3 +1712,14 @@ def deep_cards(codes: str, limit: int = 8, with_flow: bool = True,
     return _deep_analyze(codes, limit=limit, with_flow=with_flow,
                          with_patterns=with_patterns, with_mtf=with_mtf,
                          budget=budget)
+
+
+# ================================================================
+# 技能注册元数据（供 run_skill 自动发现）
+# ================================================================
+
+SKILL_DEFAULT_ENTRY = "analyze"
+
+__all__ = ["analyze", "deep_cards"]
+
+# run_skill("stock-analyzer", {}) 会调用 analyze()

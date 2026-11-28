@@ -67,7 +67,8 @@ __all__ = [
     # F14（E3）：O-14 分级触发改判 schema 总字符数
     "schema_chars_of", "_preselect_tier_chars", "tier_catalog_enabled",
     "single_target_default_tools", "_SINGLE_STOCK_DOMAINS",
-    "_FAST_ROUTE_INDEX_ONLY",
+    "_FAST_ROUTE_INDEX_ONLY", "_INDEX_ONLY_TOOLS", "INDEX_CODES",
+    "guard_index_technical_analysis",
 ]
 
 # ★ 本模块是「工具预选的管线」，不是工具面本身（2026-10-01）
@@ -410,6 +411,49 @@ _FAST_ROUTE_MAX: int = 4
 _FAST_ROUTE_INDEX_ONLY: Tuple[str, ...] = (
     "get_index_quote", "get_index_kline", "index_fflow",
 )
+
+# ── 防误用（2026-11-28）：指数代码不得走个股技术分析 ──────────────────────
+# 实测事故：用户问「分析未来几天大盘走势」时 LLM 把 000001 当股票代码喂给
+# `technical_analysis`，取到平安银行个股（收盘 12.23），而真正需要的是上证指数
+# （约 3606）；399006 也取到 2026-10-14 的陈旧个股数据。
+# `technical_analysis` 的入参注释明确只接受 6 位股票代码（如 600519），其底层
+# 走个股日线/筹码/基本面源；指数代码必须改走 get_index_quote / get_index_kline /
+# run_skill(market-prediction)。此处在**路由层**对显式指数代码做兜底防护：
+# ① 从注册表白名单缓存 index code（与 market_cn.index.INDEX_CODES 同源）；
+# ② 对指数代码剔除个股工具，并把指数专用工具插到候选最前（快路由/Lint 共用）。
+_INDEX_ONLY_TOOLS: Tuple[str, ...] = (
+    "get_index_quote", "get_index_kline", "get_market_overview",
+    "get_market_flow_state", "run_skill",
+)
+INDEX_CODES: frozenset = frozenset({
+    "000001", "399001", "399006", "000300", "000905", "000852",
+    "000016", "000688", "899050", "399303", "399005",
+})
+
+
+def guard_index_technical_analysis(
+    tools: Sequence[str],
+    text: str,
+    available_names: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """对显式指数代码剔除个股 `technical_analysis`，并前置指数专用工具。
+
+    【契约】纯确定性、无 LLM/无网络；输入合法工具序列，返回新列表（不改入参）。
+    只作用于**文本里出现指数代码**的场景（000001/399001/399006 等）；个股代码
+    （600519）和其它工具完全放行。指数代码若同时被识别为股票（如 000001 平安银行），
+    仍按指数语义处理——用户显式写 6 位指数代码时，宁可少给个股技术面，也不能
+    再拿平安银行冒充上证指数。
+    """
+    out = [t for t in (tools or ())]
+    if not any(code in str(text or "") for code in INDEX_CODES):
+        return out
+    avail = set(available_names or ())
+    kept = [t for t in out if t != "technical_analysis"]
+    for t in _INDEX_ONLY_TOOLS:
+        if t in avail and t not in kept:
+            kept.insert(0 if t in ("get_index_quote", "get_index_kline") else len(kept), t)
+    # 若指数专用工具都不在注册表（测试合成场景），至少把误用工具拿掉
+    return kept or [t for t in out if t != "technical_analysis"]
 
 
 def _stock_codes_in(text: str) -> List[str]:

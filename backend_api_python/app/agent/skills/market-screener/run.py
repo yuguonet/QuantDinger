@@ -1082,6 +1082,23 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
             _bits.append("不可买（封板）")
         if r.get("stale_bar"):
             _bits.append("⚠日线滞后，收盘/涨跌停以实时为准")
+        _mtf = r.get("mtf") or {}
+        if _mtf.get("weak_to_strong") and not _mtf.get("weak_to_strong_vol_confirm"):
+            _bits.append("⚠疑似弱转强（量能未确认，量比未达门槛）")
+        # 信号强度分档（客观速记，非评分）：资金净占比 × 操作空间，供裁决层横向区分。
+        # 满卡 confidence 都是证据完整度（无区分度），此处补一个强度维度，不碰 confidence 语义。
+        # 分档口径：净占比≥20% 且空间≥5%→强；≥10% 或 ≥3%→中；否则弱。
+        _flow = r.get("flow") or {}
+        _net_pct = _flow.get("net_pct_of_amount")
+        _space = (r.get("position_assess") or {}).get("operating_space_pct")
+        if (_net_pct is not None and _net_pct >= 20.0
+                and _space is not None and _space >= 5.0):
+            _bits.append("｜强度:强")
+        elif ((_net_pct is not None and _net_pct >= 10.0)
+              or (_space is not None and _space >= 3.0)):
+            _bits.append("｜强度:中")
+        else:
+            _bits.append("｜强度:弱")
         r["signal"] = "；".join(_bits) or "无形态与技术信号"
 
     report = build_report(raw, selected_codes=code_list)
@@ -1358,7 +1375,8 @@ def _compact_delivery(out: dict, min_cards: int = 0) -> dict:
         while len(cards) > min_cards:
             cards.pop()
             removed = original_count - len(cards)
-            notes[-1] = f"省略{removed}张满卡"
+            notes[-1] = (f"省略{removed}张满卡"
+                         "（按交付序 _delivery_key 末位裁剪：非涨停优先→距MA20贴近度→距35分位距离→5日涨幅）")
             out["analyzed_note"] = f"交付预算只容纳{len(cards)}张满卡；缺失证据不得猜测。"
             out["delivery_note"] = "；".join(notes) + "。缺失的证据和解释不得猜测。"
             if _delivery_fits(out):

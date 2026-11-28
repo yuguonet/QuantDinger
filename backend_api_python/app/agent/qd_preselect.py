@@ -37,6 +37,7 @@ from .preselect import (build_skill_catalog, build_skill_catalog_topk,
                         preselect_catalog_chars)
 # 2026-10-17 F14（E3）：O-14 分级目录的触发条件改判 schema 总字符数
 from .preselect import tier_catalog_enabled
+from .preselect import guard_index_technical_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,7 @@ class PreselectMixin:
         fast_names, fast_why = fast_route_tools(query, dom_names)
         report["fast_route"] = {"hit": bool(fast_names), "why": fast_why}
         if fast_names:
+            fast_names = guard_index_technical_analysis(fast_names, query, on_demand)
             act = self.activate_tools(fast_names, source="preselect")
             report["selected"] = list(act.get("activated", [])) + list(act.get("already", []))
             report["unknown"] = list(act.get("unknown", []))
@@ -476,6 +478,9 @@ class PreselectMixin:
             logger.warning("[preselect] lint 异常(fail-open): %s", e)
             report["lint_error"] = f"{type(e).__name__}: {e}"
 
+        if selected:
+            selected = guard_index_technical_analysis(selected, query, valid)
+
         if not selected:
             report["reason"] = "lint 判定整体误判，已作废(回退 search_tools)"
             return self._finish_preselect(report, query, valid)
@@ -560,6 +565,7 @@ class PreselectMixin:
             except Exception:
                 pass
             return report
+        fb = guard_index_technical_analysis(fb, query, names)
         act = self.activate_tools(fb, source="fallback")
         got = list(act.get("activated", [])) + list(act.get("already", []))
         if not got:
