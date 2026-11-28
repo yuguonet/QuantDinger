@@ -288,54 +288,32 @@ _EXECUTABLE_SKILLS_CACHE: Optional[dict] = None
 
 
 def _executable_skills() -> dict:
-    """执行型技能白名单（单一真源）。
+    """执行型技能白名单（单一真源：全自动发现）。
 
-    优先级：
-    1. **自动发现**：`QDSkillAdapter._build_executable_skills_map()` 扫描 skills/*/run.py 导出函数
-    2. **回落/补充**：`app.agent.scripts.skill_run.EXECUTABLE_SKILLS` 手动维护字典（兼容历史/特殊需求/导入失败的技能）
+    2026-11-28：去掉手工维护的 skill_run.EXECUTABLE_SKILLS 合并，
+    改为纯自动发现 `QDSkillAdapter._build_executable_skills_map()`。
 
-    【加载方式·2026-10-14 D-11 收敛】此前用 `spec_from_file_location` 按文件路径
-    加载，理由是「`import scripts.*` 在 sys.path 错序时会解析到
-    backend_api_python/scripts」（本仓吃过 `utils` 命中 app/utils 的亏，见 test_30）。
-    两个前提现在都不成立了：
-      · P5 起 `app/agent` 不进 sys.path、全包统一 `app.agent.*`；
-      · 用**包内相对导入**（`from .scripts.skill_run import ...`）根本不经过
-        sys.path 查找，不存在被顶层 scripts/ 抢解析的可能。
-    而按路径加载会造出**第二个模块实例**（不进 sys.modules 的影子模块）——
-    与 P5 根治的"双模块实例"是同一类隐患：将来谁正常 import 一次，两份
-    EXECUTABLE_SKILLS 就分叉。故改为包内相对导入（守卫见
-    tests/test_v6_d11_whitelist_knobs.py）。
+    【加载方式】包内相对导入，避免 sys.path 查找与双实例隐患。
     fail-open：取不到返回 {}（退化为注正文，行为等同改前，不会更坏）。
     """
     global _EXECUTABLE_SKILLS_CACHE
     if _EXECUTABLE_SKILLS_CACHE is not None:
         return _EXECUTABLE_SKILLS_CACHE
     try:
-        # 1. 自动发现（零配置，目录即技能）
+        # 自动发现（零配置，目录即技能）
         from .skills_adapter import QDSkillAdapter
         adapter = QDSkillAdapter()
         auto_map = adapter._build_executable_skills_map()
         
-        # 2. 手动维护的 skill_run.EXECUTABLE_SKILLS（作为补充/回落）
-        from .scripts.skill_run import EXECUTABLE_SKILLS as _WL
-        manual_map = dict(_WL or {})
-        
-        # 3. 合并：自动发现优先，手动维护补充缺失的
-        #    这样即使某技能导入失败（如缺 yfinance），手动白名单仍能兜底
-        merged = {**manual_map, **auto_map}  # auto_map 覆盖 manual_map（同名以自动为准）
-        
-        if merged:
-            _EXECUTABLE_SKILLS_CACHE = merged
-            auto_count = len(auto_map)
-            manual_count = len(manual_map)
-            added_from_manual = sum(1 for k in manual_map if k not in auto_map)
+        if auto_map:
+            _EXECUTABLE_SKILLS_CACHE = auto_map
             logger.info(
-                "[skill_block] 执行型白名单：合并完成 共 %d 个（自动 %d + 手动补充 %d）",
-                len(merged), auto_count, added_from_manual
+                "[skill_block] 执行型白名单：自动发现完成 共 %d 个",
+                len(auto_map)
             )
         else:
             _EXECUTABLE_SKILLS_CACHE = {}
-            logger.warning("[skill_block] 执行型白名单为空（自动发现与手动均无）")
+            logger.warning("[skill_block] 执行型白名单为空（自动发现无技能）")
     except Exception as e:
         logger.debug("[skill_block] 执行型白名单加载失败（fail-open 退化为注正文）: %s", e)
         _EXECUTABLE_SKILLS_CACHE = {}

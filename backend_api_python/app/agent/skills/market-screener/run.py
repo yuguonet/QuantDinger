@@ -1026,6 +1026,22 @@ def deep_analyze(codes: str, limit: int = 8, with_flow: bool = True,
     if _sealed_need_zt:
         missing.append(f"涨停池缺 {_sealed_need_zt} 只封板票（封板结构只有标签，开板/封单未知）")
 
+    # 支撑/压力位强度 + 操作空间评估（2026-11-27 用户改进）：进表前空间/强度判据，
+    # 由满卡客观字段（tech.support/resists/anchor/amp_avg5/现价）计算，供 LLM 判定
+    # 「进表前空间是否合理、压力/支撑位强度是否够」；阈值 env QD_SCREENER_SPACE_MIN_PCT
+    # （默认 3.0）。字段名在 SKILL.md 进表规则中引用。
+    from ._helpers import assess_position_space
+    for r in raw:
+        tech = r.get("tech") or {}
+        support = tech.get("support") or {}
+        anchor = support.get("anchor") or {}
+        anchor_ev = (support.get("anchor_evidence") or {}) \
+            if isinstance(support.get("anchor_evidence"), dict) else {}
+        r["position_assess"] = assess_position_space(
+            anchor=anchor, sup=support, res=support.get("resists"),
+            price=(r.get("rt") or {}).get("price"),
+            amp_avg5=tech.get("amp_avg5"), anchor_evidence=anchor_ev)
+
     for r in raw:
         r.pop("_bars", None)
         r.pop("_pred", None)

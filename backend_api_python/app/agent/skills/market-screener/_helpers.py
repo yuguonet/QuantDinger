@@ -2206,5 +2206,133 @@ def build_report(results: list, selected_codes: List[str] = None):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  支撑/压力位强度 + 操作空间评估（2026-11-27 用户改进）
+#  纯函数：由满卡客观字段（sup/res/anchor/amp_avg5/现价）计算位置强度与操作空间，
+#  供 LLM 读 position_assess 判定「进表前空间/强度是否合格」，不代替 LLM 取舍。
+#  阈值 env：QD_SCREENER_SPACE_MIN_PCT（操作空间下限，默认 5.0——对应 600604 现价3.94/
+#  卖4.08/跌3.82 仅3~4%空间、风险收益比不合算的判例：<5% 判为空间不足、不推标准/重仓）。
+#  位强度按强/中/弱三档（距 d≤3.0、硬位集为约定默认，随口径调整）。
+# ═══════════════════════════════════════════════════════════════
+_HARD_SUPPORTS = {"ma5", "ma10", "ma20", "ma60", "gap", "zt", "poc"}
+_HARD_RESIST = {"ma20", "ma10", "ma5", "ma60", "hi20", "gap_up", "zt"}
+_DIST_BAND_PCT = 3.0   # |d| ≤ 3.0 视为贴近关键位（强位）
+_SCREENER_SPACE_MIN_PCT = float(os.getenv("QD_SCREENER_SPACE_MIN_PCT", "5.0") or 5.0)
+
+
+def assess_position_space(anchor: dict, sup: dict, res: dict, price: float,
+                          amp_avg5: float, anchor_evidence: dict = None) -> dict:
+    """支撑/压力位强度 + 操作空间评估（纯函数，可单测）。
+
+    入参为满卡客观字段（tech.support / tech.support.resists / anchor / anchor_evidence）：
+      · sup = tech.support，含 supports（现价下方候选，由近到远，每项 {k,px,d}）；
+      · res = tech.support 的 resists（现价上方候选，由近到远，每项 {k,px,d}）；
+      · anchor = 承接位主锚 {primary:{k,px,rule,dist_pct}, ...}；
+      · anchor_evidence = 承接证据 {level: confirmed/partial/none, ...}。
+
+    返回：
+      · operating_space_pct = (现价 − sup.supports[0].px + stop_buffer) / 现价 ×100，
+        即「买点（锚位±带宽）到止损（支撑外侧一档）」的操作空间（%）；
+        stop_buffer = max(1.0, min(amp_avg5, 8.0))（承接位框架止损公式：止损=锚位−
+        max(缓冲, min(amp_avg5,8%))，缓冲≥1×噪声带）。
+      · support_strength / resistance_strength：强/中/弱（见分级规则）。
+      · space_ok = operating_space_pct ≥ QD_SCREENER_SPACE_MIN_PCT（默认 5.0，
+        <5% 判为空间不足——如 600604 现价3.94/卖4.08/跌3.82 仅3~4%空间、风险收益比不合算）。
+      · intensity_ok = support_strength∈{强,中} 且 resistance_strength∈{强,中}。
+
+    分级规则：
+      · 强：硬位（k∈HARD_SUPPORTS/HARD_RESIST）且 |d|≤_DIST_BAND_PCT；
+        支撑强额外要求 anchor_evidence.level∈{confirmed,partial}；
+        压力强按硬位+距离。
+      · 中：硬位但 |d|>_DIST_BAND_PCT，或软位但有承接证据（支撑）；或仅均线无硬位（压力）。
+      · 弱：sup 空 / 仅软位无均线且无承接 / pos=hot；或 res 空 / 仅软压力。
+    """
+    anchor = anchor or {}
+    anchor_ev = anchor_evidence or {}
+    anchor_primary = (anchor.get("primary") or {}) if isinstance(anchor.get("primary"), dict) else {}
+    sup = sup or {}
+    # res = tech.support 的 resists（现价上方候选列表，调用方直接传）
+    resists = res or []
+    supports = sup.get("supports") or []
+    price = _num_or_none(price)
+    amp = _num_or_none(amp_avg5)
+    if price is None or amp is None:
+        return {
+            "operating_space_pct": None, "space_ok": False,
+            "support_strength": "弱", "resistance_strength": "弱",
+            "intensity_ok": False, "detail": "价格/振幅缺失，无法评估操作空间与位强度",
+        }
+    # 操作空间：止损 = 支撑外侧一档（缓冲 max(1%, min(amp,8%))）
+    stop_buf = max(1.0, min(amp, 8.0))          # 单位：百分点
+    sup0 = supports[0] if supports else None
+    sup_px = _num_or_none((sup0 or {}).get("px"))
+    if sup_px is None:
+        op_space = None
+    else:
+        op_space = (price - sup_px + stop_buf / 100.0) / price * 100.0
+    operating_space_pct = round(op_space, 2) if op_space is not None else None
+    space_ok = (operating_space_pct is not None
+                and operating_space_pct >= float(_SCREENER_SPACE_MIN_PCT))
+
+    # 支撑强度
+    a_level = (anchor_ev.get("level") or "").lower()
+    support_strength = _grade_support(supports, sup0, anchor_primary, a_level)
+    # 压力强度
+    res0 = resists[0] if resists else None
+    resistance_strength = _grade_resistance(resists, res0, _num_or_none((res0 or {}).get("px")))
+    intensity_ok = (support_strength in ("强", "中")
+                    and resistance_strength in ("强", "中"))
+
+    return {
+        "operating_space_pct": operating_space_pct,
+        "space_ok": space_ok,
+        "support_strength": support_strength,
+        "resistance_strength": resistance_strength,
+        "intensity_ok": intensity_ok,
+        "detail": (f"操作空间={operating_space_pct}%（≥{_SCREENER_SPACE_MIN_PCT} 为合格）；"
+                   f"支撑强度={support_strength}、压力强度={resistance_strength}"),
+    }
+
+
+def _grade_support(supports, sup0, anchor_primary, a_level) -> str:
+    """支撑位强度：强/中/弱（见函数 docstring 分级规则）。"""
+    if not supports or sup0 is None:
+        return "弱"
+    k = (sup0 or {}).get("k")
+    d = _num_or_none((sup0 or {}).get("d"))
+    if k is None:
+        return "弱"
+    hard = k in _HARD_SUPPORTS
+    near = (d is not None and abs(d) <= _DIST_BAND_PCT)
+    confirmed = a_level in ("confirmed", "partial")
+    if hard and near and confirmed:
+        return "强"
+    if hard and (not near or not confirmed):
+        return "中"
+    if hard and confirmed and not near:
+        return "中"
+    # 软位（非均线）但有过承接证据 → 中；纯软位无承接 → 弱
+    if not hard and confirmed:
+        return "中"
+    return "弱"
+
+
+def _grade_resistance(resists, res0, res_px) -> str:
+    """压力位强度：强/中/弱。"""
+    if not resists or res0 is None:
+        return "弱"
+    k = (res0 or {}).get("k")
+    d = _num_or_none((res0 or {}).get("d"))
+    if k is None:
+        return "弱"
+    hard = k in _HARD_RESIST
+    near = (d is not None and abs(d) <= _DIST_BAND_PCT)
+    if hard and near:
+        return "强"
+    if hard and not near:
+        return "中"
+    return "中" if not hard and res_px is not None else "弱"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  旧流程兼容层
 # ═══════════════════════════════════════════════════════════════

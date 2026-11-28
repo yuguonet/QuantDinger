@@ -85,6 +85,8 @@ def get_factors_only() -> Dict[str, Any]:
 # 技能注册元数据（供 run_skill 自动发现）
 # ================================================================
 
+SKILL_DEFAULT_ENTRY = "predict_market"
+
 __all__ = ["predict_market", "get_factors_only"]
 
 # 入口函数签名对应 SKILL.md 的 triggers

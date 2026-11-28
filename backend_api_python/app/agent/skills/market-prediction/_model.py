@@ -36,20 +36,42 @@ def predict_market_direction(factors: Dict[str, Any]) -> Dict[str, Any]:
         market_pred = _get_watchlist_market_prediction()
         
         # 2. 四维因子加权融合
-        factor_score = factors.get("composite_score", 50)  # 0-100
+        # 2026-11-28 修正：降级维度（error）不再混入"有效因子分"，避免 error→50
+        # 造成假一致性与虚高置信度。只用可用维度重新归一加权。
+        available = factors.get("available_dimensions")
+        if available is None:
+            # 兼容旧调用：按 details.error 推断
+            available = [
+                d for d in ("technical", "fund_flow", "sentiment", "valuation")
+                if "error" not in factors.get(d, {}).get("details", {})
+            ]
+        degraded = factors.get("degraded_dimensions") or [
+            d for d in ("technical", "fund_flow", "sentiment", "valuation") if d not in available
+        ]
+        if available:
+            renorm = sum(float(factors.get(d, {}).get("weight", 0)) for d in available)
+            factor_score = sum(
+                float(factors.get(d, {}).get("score", 50)) * float(factors.get(d, {}).get("weight", 0))
+                for d in available
+            ) / renorm if renorm > 0 else 50.0
+        else:
+            factor_score = 50.0
         factor_p_up = factor_score / 100.0
-        
+
         # 3. 融合权重：watchlist 模型 60% + 四维因子 40%
-        # watchlist 模型是标定过的 Logistic，优先级更高
+        # watchlist 模型是标定过的 Logistic，优先级更高；
+        # 因子维度全降级时，模型权重升到 100%，不让空因子稀释信号。
         w_model = 0.6
         w_factor = 0.4
-        
+        if not available:
+            w_model, w_factor = 1.0, 0.0
+
         model_p_up = market_pred.get("p_up", 0.5)
         model_logit = market_pred.get("logit", 0.0)
-        
+
         fused_p_up = model_p_up * w_model + factor_p_up * w_factor
         fused_logit = model_logit * w_model + _p_to_logit(factor_p_up) * w_factor
-        
+
         # 4. 方向判定
         if fused_p_up >= 0.55:
             direction = "bullish"
@@ -57,11 +79,14 @@ def predict_market_direction(factors: Dict[str, Any]) -> Dict[str, Any]:
             direction = "bearish"
         else:
             direction = "neutral"
-        
-        # 5. 置信度：基于模型一致性 + 因子完整度
-        consistency = 1.0 - abs(model_p_up - factor_p_up)  # 越接近越一致
-        factor_completeness = _compute_factor_completeness(factors)
-        confidence = (consistency * 0.6 + factor_completeness * 0.4)
+
+        # 5. 置信度：一致性 + 因子完整度，且对降级维度直接惩罚
+        consistency = 1.0 - abs(model_p_up - factor_p_up)
+        factor_completeness = len(available) / 4.0
+        if degraded:
+            # 每降级一个维度，一致性按可用比例折扣（不再把 error→50 当成"一致"）
+            consistency *= factor_completeness
+        confidence = consistency * 0.6 + factor_completeness * 0.4
         confidence = max(0.1, min(0.95, confidence))
         
         # 6. 预期收益（基点）
@@ -75,6 +100,8 @@ def predict_market_direction(factors: Dict[str, Any]) -> Dict[str, Any]:
             "factor_score": round(factor_score, 1),
             "consistency": round(consistency, 3),
             "factor_completeness": round(factor_completeness, 3),
+            "available_dimensions": available,
+            "degraded_dimensions": degraded,
             "weights": {"model": w_model, "factor": w_factor},
             "factor_details": {
                 "technical": factors.get("technical", {}).get("score"),
@@ -183,14 +210,16 @@ def assess_model_health() -> Dict[str, Any]:
             with open(monitor_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         
-        # 默认健康
+        # 未接入真实监控系统时，如实标注数据状态；绝不把模拟值伪装成实测。
         return {
             "drift_alert": False,
             "signal_decay": False,
-            "ic_rolling_mean": 0.042,
-            "last_retrain": "2026-11-01",
-            "feature_psi": 0.08,
-            "prediction_stability": 0.85,
+            "ic_rolling_mean": None,
+            "last_retrain": "unknown",
+            "feature_psi": None,
+            "prediction_stability": None,
+            "data_status": "unavailable",
+            "note": "模型监控数据未接入（data/market_prediction/model_health.json 不存在）；健康指标为空，非实测",
         }
         
     except Exception as e:
@@ -198,6 +227,8 @@ def assess_model_health() -> Dict[str, Any]:
         return {
             "drift_alert": True,
             "signal_decay": True,
-            "ic_rolling_mean": 0.0,
+            "ic_rolling_mean": None,
             "last_retrain": "unknown",
+            "data_status": "error",
+            "note": f"模型健康度读取失败：{e}",
         }

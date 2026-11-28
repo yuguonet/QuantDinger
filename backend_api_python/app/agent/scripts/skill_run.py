@@ -14,9 +14,9 @@
     {"name":..., "ok":bool, "result":<预览，恒为合法 JSON>,
      "preview_note":<裁剪事实，仅被裁时出现>, "full_path":"<全量结果路径>",
      "elapsed_s":...}
-    预览按**整条目**裁剪（2026-10-21）：条目要么完整、要么整条不在，永不盲切
-    字符 —— 盲切会把证据卡拦腰斩断，主 agent 拿到半张卡的坏 JSON。裁剪事实放
-    外层信封 preview_note（传输层元信息不混进技能载荷）。
+     预览按**整条目**裁剪（2026-10-21）：条目要么完整、要么整条不在，永不盲切
+     字符 —— 盲切会把证据卡拦腰斩断，主 agent 拿到半张卡的坏 JSON。裁剪事实放
+     外层信封 preview_note（传输层元信息不混进技能载荷）。
 
 产物落点（F26-D2，2026-10-18）：
   · 工具路径（run_skill 派活）：父进程建好作业目录经 env `QD_SKILL_JOB_DIR` 传入，
@@ -24,6 +24,10 @@
     （停滞看门狗的观测源，见 app/agent/exec/job_runner.py）；
   · 人工直跑（无该 env）：回落旧扁平输出 `<backend>/tmp/skill_output/<ts>_<name>.json`
     —— 这是文档化的直跑用法，不是兜底。
+
+全自动注册（2026-11-28）：手工 `EXECUTABLE_SKILLS` 已移除，改为从
+QDSkillAdapter 自动发现技能目录下的 run.py 并导出公开函数。本模块
+通过 PEP 562 `__getattr__` 懒导出 `EXECUTABLE_SKILLS` 兼容旧消费者。
 """
 from __future__ import annotations
 
@@ -34,20 +38,45 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-# 技能执行注册表：name → (模块路径, 允许调用的函数, 默认函数)
-# 白名单制——run_skill 不执行任意代码，只跑这里登记过的入口。
-EXECUTABLE_SKILLS: dict[str, tuple[str, tuple[str, ...], str]] = {
-    "market-screener": ("skills.market-screener.run", ("run", "settle_picks", "measurement_summary"), "run"),
-    "strategy-debug": (
-        "skills.strategy-debug.run",
-        ("list_strategies", "why_strategy", "debug_strategy", "doctor_auto"),
-        "debug_strategy",
-    ),
-    "auto-backtest": ("skills.auto-backtest.run", ("run",), "run"),
-    "stock-analyzer": ("skills.stock-analyzer.run", ("analyze",), "analyze"),
-    "market-prediction": ("skills.market-prediction.run", ("predict_market", "get_factors_only"), "predict_market"),
-}
+
+def _executable_skills_registry() -> dict[str, tuple[str, tuple[str, ...], str]]:
+    """
+    从 QDSkillAdapter 自动构建可执行技能注册表。
+    
+    要求：已将 backend_api_python 根目录加入 sys.path（main() 已做）。
+    返回格式：{name: (mod_path, allowed_functions_tuple, default_fn)}
+    其中 mod_path 为裸名 `skills.{name}.run`（契约测试要求）。
+    """
+    try:
+        # 确保 backend 根在 sys.path（main() 已挂，但保险起见）
+        backend_root = str(Path(__file__).resolve().parents[3])
+        if backend_root not in sys.path:
+            sys.path.insert(0, backend_root)
+        
+        from app.agent.skills_adapter import QDSkillAdapter
+        
+        # 无参构造：走 `_default_dirs()`（= app/agent/skills），与 qd_service 同源。
+        # ⚠️ 不可传字符串：构造函数签名是 `skills_dirs: List[str] = None`，
+        #   内部 `for d in dirs:` 逐元素遍历，传 str 会退化成逐字符迭代 → 扫不到任何技能。
+        adapter = QDSkillAdapter()
+        # QDSkillAdapter 在 __init__ 里已自动扫描技能目录
+        return adapter._build_executable_skills_map()
+    except Exception:
+        # 兜底：返回空字典，main() 会按"未知技能"处理
+        return {}
+
+
+# PEP 562：模块级 __getattr__ 懒导出 EXECUTABLE_SKILLS（兼容旧消费者）
+# 首次访问时构建并缓存进 globals，后续直接命中
+def __getattr__(name: str) -> Any:
+    if name == "EXECUTABLE_SKILLS":
+        val = _executable_skills_registry()
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ★ 2026-10-14 迁址：原为 `parents[1]`（= app/agent）⇒ 产物落在 `app/agent/tmp/`
 #   skill_output/。随 `app/agent/tmp/` 整体移除，改到**项目级** `backend_api_python/tmp/`
@@ -214,6 +243,7 @@ def _touch(job_dir: str) -> None:
 
 
 def main() -> int:
+    # EXECUTABLE_SKILLS 通过 __getattr__ 懒加载（PEP 562）
     if len(sys.argv) < 2 or sys.argv[1] not in EXECUTABLE_SKILLS:
         print(json.dumps({"ok": False, "error":
                           f"未知技能。可执行: {sorted(EXECUTABLE_SKILLS)}"}, ensure_ascii=False))

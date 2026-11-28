@@ -295,6 +295,9 @@ class QDSkillAdapter:
         
         约定：凡有 run.py 且导出公开函数的，视为可执行技能。
         返回格式：{name: (mod_path, allowed_functions_tuple, default_fn)}
+        其中 mod_path 为裸名 `skills.{name}.run`（契约测试要求），
+        default_fn 优先取模块属性 SKILL_DEFAULT_ENTRY（须在 exported 内），
+        回落 "run"∈exported，再回落 exported[0]。
         """
         executable = {}
         # 已知的执行型技能入口函数名（白名单，防止导出内部函数）
@@ -322,10 +325,14 @@ class QDSkillAdapter:
                     and n in KNOWN_ENTRY_FUNCS
                 ]
                 if exported:
+                    # default_fn: 优先 SKILL_DEFAULT_ENTRY，回落 "run"，再回落首个
+                    default_fn = getattr(mod, "SKILL_DEFAULT_ENTRY", None)
+                    if default_fn not in exported:
+                        default_fn = "run" if "run" in exported else exported[0]
                     executable[name] = (
-                        f"app.agent.skills.{name}.run",
+                        f"skills.{name}.run",  # 裸名：契约测试要求
                         tuple(sorted(exported)),
-                        exported[0]  # 默认第一个导出函数
+                        default_fn
                     )
             except Exception as e:
                 logger.debug("[QDSkills] 自动构建 EXECUTABLE_SKILLS 失败 %s: %s", name, e)

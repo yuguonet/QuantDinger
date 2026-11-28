@@ -26,16 +26,16 @@ metadata:
 
 **供其他技能复用**：`market-screener`、`stock-analyzer` 等通过 `run_skill("market-prediction")` 调用，拿到标准化 `SkillReport` 做下游决策。
 
-## 数据源（纯本地，无外部依赖）
+## 数据源（2026-11-28 修订）
 
 | 数据 | 来源模块 | 说明 |
 |------|----------|------|
 | 指数日线（上证/深证/创业板/沪深300） | `app.market_cn.index.get_index_daily_kline` | 本地缓存，含实时行情 |
-| 大盘资金流向 | `app.market_cn.fund_flow_local` | 本地计算，无东财依赖 |
-| 情绪指标（涨跌停/炸板/贪恐） | `app.market_cn.emotion` / `fear_greed_index` | 本地聚合 |
+| 大盘资金流向 | `app.market_cn.fund_flow_api.market_flow_summary` | DB 分钟资金聚合（本地），北向/两融已彻底剔除 |
+| 情绪指标（涨跌停/炸板/贪恐/市场宽度） | `app.market_cn.dragon_limit` + `emotion.fetch_emotion_cycle` + `fear_greed_index` | 本地协调器/缓存 |
 | 板块轮动/热度 | `app.market_cn.hot_sectors` / `sector_history` | 本地 DB 计算 |
-| 预测模型（P(T+1↑)） | `app.watchlist.predict` | 已标定 Logistic，含大盘/个股/beta/庄代理 |
-| 估值分位（PE/PB/股债利差） | `app.market_cn.index` 本地历史分位计算 | 无 tushare 依赖 |
+| 预测模型（P(T+1↑)） | `app.watchlist.predict` | 已标定 Logistic；实际入口为 `market_score_from_features()` |
+| 估值分位（PE/PB/股债利差） | 技能内直连 akshare：上证 `stock_market_{pe,pb}_lg`（短周期）+ 沪深300 `stock_index_{pe,pb}_lg`（长周期）+ `bond_zh_us_rate` | 用户 2026-11-28 拍板：技能内直连，不动数据层；30 分钟进程内缓存 |
 
 ## 架构分层
 
@@ -58,7 +58,9 @@ market-prediction (Skill)
     "version": "1.0.0",
     "timestamp": "2026-11-27 15:00:00",
     "score": 68,                    # 综合择时分 0-100
-    "confidence": 0.72,             # 置信度 0-1
+    "confidence": 0.72,             # 最终置信度 0-1；健康度未实测时上限 0.75
+    "confidence_raw": 0.95,         # 原始一致性置信度（追溯用）
+    "health_validated": false,      # 模型健康度是否已实测接入
     "direction": "bullish",         # bullish/neutral/bearish
     "factors": {                    # 四维度拆分（各 0-100 + 权重）
         "technical": {"score": 72, "weight": 0.30, "details": {...}},
@@ -125,11 +127,11 @@ position_advice = report["position_sizing"]["current_tier"]
 
 参考 **FinClaw a-share-market-timing** 四维加权：
 - **技术面 (30%)**：均线系统、MACD、布林带、趋势强度、关键位突破
-- **资金面 (25%)**：北向资金、融资余额、成交量、资金流向连续性
-- **情绪面 (20%)**：涨跌家数、涨停数、新高数、贪恐指数、炸板率
-- **估值面 (25%)**：PE分位、PB分位、股债利差、历史百分位
+- **资金面 (25%)**：主力净流入强度、资金持续性（direction_seq）、成交量趋势（北向/两融已剔除）
+- **情绪面 (20%)**：涨跌停、炸板率、贪恐指数、市场宽度（上涨家数占比）
+- **估值面 (25%)**：上证短周期 + 沪深300长周期 PE/PB 分位融合（长 0.6 / 短 0.4）、股债利差、估值中枢偏离
 
-**模型层**：复用 `app.watchlist.predict.market_p_up()`（已标定 Logistic），输出 `p_up`、`logit`、`breakdown`。
+**模型层**：复用 `app.watchlist.predict.market_score_from_features()`（已标定 Logistic；旧文档写的 `market_p_up()` 不存在），输出 `p_up`、`logit`、`breakdown`。降级维度不混入因子分，置信度按可用维度数打折；当模型健康度未实测（`data_status != "available"`）时，最终 `confidence` 上限 0.75，原始一致性保留在 `confidence_raw`，报告中标注“已折减”。
 
 ## 仓位建议逻辑
 

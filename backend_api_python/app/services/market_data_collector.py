@@ -19,7 +19,6 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
-import yfinance as yf
 import pandas as pd
 import requests
 
@@ -889,8 +888,9 @@ class MarketDataCollector:
             except Exception as e:
                 logger.debug(f"Finnhub fundamental failed for {symbol}: {e}")
         
-        # === 2. yfinance 补充基础指标 ===
+        # === 2. yfinance 补充基础指标（懒导入，避免技能链依赖）===
         try:
+            import yfinance as yf
             ticker = yf.Ticker(symbol)
             info = ticker.info or {}
             
@@ -947,9 +947,10 @@ class MarketDataCollector:
         """
         获取财务报表数据（资产负债表、利润表、现金流量表）
         
-        使用 yfinance 获取，包含最近几个季度的数据
+        使用 yfinance 获取，包含最近几个季度的数据（懒导入，避免技能链依赖）
         """
         try:
+            import yfinance as yf
             ticker = yf.Ticker(symbol)
             statements = {}
             
@@ -1015,6 +1016,7 @@ class MarketDataCollector:
 
         使用 quarterly_income_stmt 替代已弃用的 Ticker.earnings / quarterly_earnings，
         历史季度摘要从利润表推导；盈利日历仍用 ticker.calendar（若可用）。
+        懒导入 yfinance，避免技能链依赖
         """
         def _pick_float(stmt: pd.DataFrame, row_names: tuple, col) -> Optional[float]:
             for name in row_names:
@@ -1029,6 +1031,7 @@ class MarketDataCollector:
             return None
 
         try:
+            import yfinance as yf
             ticker = yf.Ticker(symbol)
             earnings_data: Dict[str, Any] = {}
 

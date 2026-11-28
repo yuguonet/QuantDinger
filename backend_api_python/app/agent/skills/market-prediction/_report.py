@@ -35,14 +35,21 @@ def build_skill_report(
     """
     # 基础字段
     score = round(prediction.get("p_up", 0.5) * 100)
-    confidence = prediction.get("confidence", 0.5)
+    confidence_raw = float(prediction.get("confidence", 0.5))
+    health_validated = str(health.get("data_status", "")) == "available"
+    # 2026-11-28：健康度未实测（unavailable/error）时，置信度上限 0.75。
+    # "模型与因子一致"不等于"历史胜率已验证"，保留原始值供追溯。
+    confidence = min(confidence_raw, 0.75) if not health_validated else confidence_raw
     direction = prediction.get("direction", "neutral")
+    effective_prediction: Dict[str, Any] = dict(prediction)
+    effective_prediction["confidence"] = confidence
+    effective_prediction["confidence_raw"] = confidence_raw
     
     # 仓位建议
     position_sizing = _build_position_sizing(score)
     
     # 多周期方向
-    horizons = _build_horizons(prediction, factors)
+    horizons = _build_horizons(effective_prediction, factors)
     
     # 关键位
     key_levels = _build_key_levels(factors)
@@ -51,7 +58,7 @@ def build_skill_report(
     risk_flags = _build_risk_flags(factors, prediction, health)
     
     # 自然语言分析
-    analysis = _build_analysis(factors, prediction, health, style)
+    analysis = _build_analysis(factors, effective_prediction, health, style)
     
     report = {
         "skill": "market-prediction",
@@ -59,6 +66,8 @@ def build_skill_report(
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "score": score,
         "confidence": round(confidence, 3),
+        "confidence_raw": round(confidence_raw, 3),
+        "health_validated": health_validated,
         "direction": direction,
         "factors": {
             "technical": factors.get("technical", {}),
@@ -160,7 +169,9 @@ def _build_key_levels(factors: Dict[str, Any]) -> Dict[str, List[float]]:
             resistance.append(round(level, 2))
     
     # 整数关口
-    int_levels = [i * 100 for i in range(25, 45)]
+    step = 100 if current >= 1000 else (10 if current >= 100 else 1)
+    center = int(current / step)
+    int_levels = [i * step for i in range(max(1, center - 5), center + 6)]
     for level in int_levels:
         if level > current * 1.005 and level < current * 1.1:
             resistance.append(float(level))
@@ -216,9 +227,11 @@ def _build_risk_flags(
         flags.append("布林带下轨支撑强")
     
     fund_det = factors.get("fund_flow", {}).get("details", {})
-    if fund_det.get("north_flow", 50) < 30:
-        flags.append("北向资金持续流出")
-    
+    if fund_det.get("persistence", 50) < 30:
+        flags.append("主力资金持续性偏弱")
+    if fund_det.get("freshness") == "stale":
+        flags.append("资金流数据滞后")
+
     sent_det = factors.get("sentiment", {}).get("details", {})
     if sent_det.get("broken_rate", 50) < 30:
         flags.append("炸板率过高")
@@ -247,13 +260,19 @@ def _build_analysis(
     fund_s = factors.get("fund_flow", {}).get("score", 50)
     sent_s = factors.get("sentiment", {}).get("score", 50)
     val_s = factors.get("valuation", {}).get("score", 50)
+    confidence_raw = float(prediction.get("confidence_raw", confidence))
+    health_validated = str(health.get("data_status", "")) == "available"
+    confidence_note = (
+        f"置信度 {confidence:.0%}（原始一致性 {confidence_raw:.0%}；模型健康度未接入，已折减）"
+        if not health_validated else f"置信度 {confidence:.0%}"
+    )
     
     dir_map = {"bullish": "偏多", "neutral": "中性", "bearish": "偏空"}
     dir_cn = dir_map.get(direction, "中性")
     
     if style == "brief":
         return (
-            f"大盘择时分 {score}，{dir_cn}（置信度 {confidence:.0%}）。"
+            f"大盘择时分 {score}，{dir_cn}（{confidence_note}）。"
             f"四维：技术{tech_s:.0f}/资金{fund_s:.0f}/情绪{sent_s:.0f}/估值{val_s:.0f}。"
             f"建议仓位：{_position_tier_cn(score)}。"
         )
@@ -261,7 +280,7 @@ def _build_analysis(
     # formal 详细版
     lines = [
         f"【大盘择时分析】{datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"综合得分：{score} 分 | 方向：{dir_cn} | 置信度：{confidence:.0%}",
+        f"综合得分：{score} 分 | 方向：{dir_cn} | {confidence_note}",
         "",
         "【四维因子拆解】",
         f"  技术面（30%）：{tech_s:.1f} 分 — {_factor_desc('technical', tech_s, factors.get('technical', {}).get('details', {}))}",
@@ -316,15 +335,16 @@ def _factor_desc(dim: str, score: float, details: Dict) -> str:
         else:
             return "均线粘合，方向不明"
     elif dim == "fund_flow":
-        north = details.get("north_flow", 50)
-        if north > 70:
-            return "北向资金大幅净流入，融资余额增加"
-        elif north > 55:
+        net = details.get("net_flow", 50)
+        persistence = details.get("persistence", 50)
+        if net > 70 and persistence > 60:
+            return "主力资金持续净流入，成交额占比偏高"
+        elif net > 55:
             return "资金面温和流入"
-        elif north < 30:
-            return "北向资金持续流出，融资余额下降"
+        elif net < 30 or persistence < 30:
+            return "主力资金流出或持续性偏弱"
         else:
-            return "资金面中性偏弱"
+            return "资金面中性"
     elif dim == "sentiment":
         ltd = details.get("limit_up_down", 50)
         broken = details.get("broken_rate", 50)
@@ -388,6 +408,8 @@ def _to_brief(report: Dict[str, Any]) -> Dict[str, Any]:
         "timestamp": report["timestamp"],
         "score": report["score"],
         "confidence": report["confidence"],
+        "confidence_raw": report["confidence_raw"],
+        "health_validated": report["health_validated"],
         "direction": report["direction"],
         "position": report["position_sizing"]["current_tier"],
         "horizons": {k: v["direction"] for k, v in report["horizons"].items()},

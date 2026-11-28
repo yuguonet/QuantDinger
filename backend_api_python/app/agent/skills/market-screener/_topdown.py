@@ -722,6 +722,189 @@ def detect_jumps(codes: List[str], day: Optional[str] = None,
             "n": len(jumps)}
 
 
+def _append_pullups(picked: List[Dict[str, Any]], pullups: List[Dict[str, Any]]) -> None:
+    """把拉抬（未现跳变真拉升）候选并入候选池：kind='pullup'，参与后续去重/截断排序。"""
+    for j in pullups:
+        picked.append({
+            "code": j.get("code"),
+            "name": j.get("name", ""),
+            "t_first": j.get("t_first"),
+            "delta_pct": j.get("delta_pct"),
+            "amount": j.get("amount"),
+            "kind": "pullup",
+            "mode": j.get("mode", "pullup"),
+            "reason": j.get("reason", "拉升（未现跳变：分时大部分在日均线VWAP之上+均线缓升+资金吸筹）"),
+            "score": (-float(str(j["t_first"]).replace(":", ""))
+                     if j.get("t_first") else 0),
+        })
+
+
+# ── 拉抬检测（2026-11-27 用户改进：第三类真拉升，未现跳变）──────────────────
+# 跳变检测只抓「当前时刻跳变」（两极端：冲高出货与真拉升），漏「拉升没在某个时刻突然跳变」
+# 的票：分时绝大部分时间在日均线 VWAP 之上、日均线趋势平缓向上、资金在吸筹。本质仍是真
+# 拉升（非追高），作为候选进漏斗（进场买点按承接位/现价买规则，见 SKILL.md）。
+# 三条判据全部满足才出票；阈值走 env（QD_TOPDOWN_PULLUP_*），见 detect_pullups docstring。
+_PULLUP_MA_ABOVE_PCT = _env_f("QD_TOPDOWN_PULLUP_MA_ABOVE_PCT", 60.0)
+_PULLUP_MA_SLOPE_MAX = _env_f("QD_TOPDOWN_PULLUP_MA_SLOPE_PCT", 2.0)
+_PULLUP_FUND_MIN_WAN = _env_i("QD_TOPDOWN_PULLUP_FUND_MIN_WAN", 2000.0)
+
+
+def detect_pullups(codes: List[str], day: Optional[str] = None,
+                   as_of: Optional[str] = None,
+                   params: Optional[Dict[str, float]] = None,
+                   t_from: Optional[str] = None) -> Dict[str, Any]:
+    """拉抬检测（第三类真拉升，未现跳变）。逐票用 1m ticks（与 detect_jumps 同 `_sq.ticks` 口径）。
+
+    三条判据全部满足才出票：
+      ① 分时大部分在日均线VWAP之上：1m 序列中「价格 ≥ 日均线VWAP（默认日 MA5）」的
+         分钟占比 ≥ QD_TOPDOWN_PULLUP_MA_ABOVE_PCT（默认 60%），且当日收盘在 MA5 之上（缓升基础）；
+      ② 日均线趋势平缓向上：日线 MA5 斜率平缓正向（QD_TOPDOWN_PULLUP_MA_SLOPE_PCT，
+          默认 ≤2.0），且近期未大幅下跌（近5日涨幅 > -10%）；
+      ③ 资金在吸筹：10:00 后分段持续净流入（intraday.after_net_wan > 0）或
+          近5日累计净流入为正且非单日脉冲（recent.net_5d_wan ≥ 门槛 + 逐日符号全非负 +
+          剔除最大单日后仍正）——用 flow/recent + intraday 分段。
+
+    输出候选 {code, t_first, delta_pct, amount, mode='pullup', reason}，按 t_first 升序。
+    `as_of` 是信息边界：tick 截到该时刻（与 detect_jumps 同）。
+    """
+    p = params or _preset("neutral")
+    uni = sorted({str(c).split(".")[0] for c in codes or []})
+    if not uni:
+        return {"ok": False, "reason": "无成员", "pullups": [], "skipped": 0, "missing": []}
+
+    got = _sq.ticks(uni, day=day, t_to=as_of)
+    pullups: List[Dict[str, Any]] = []
+    skipped = 0
+    missing: List[str] = []
+
+    def _last_ma(closes: List[float], n: int, idx: Optional[int] = None) -> Optional[float]:
+        if idx is None:
+            idx = len(closes) - 1
+        if idx < n:
+            return None
+        seg = closes[max(0, idx - n + 1):idx + 1]
+        return sum(seg) / len(seg) if seg else None
+
+    def _fund_accumulation(flow: Dict[str, Any], min_wan: float) -> bool:
+        recent = (flow or {}).get("recent") or {}
+        intraday = (flow or {}).get("intraday") or {}
+        after_net = intraday.get("after_net_wan")
+        intraday_ok = (after_net is not None and float(after_net) > 0)
+        net5d = recent.get("net_5d_wan")
+        sign5d = recent.get("sign_5d")
+        ex_max = recent.get("net_20d_ex_max_wan")
+        recent_ok = (net5d is not None
+                     and float(net5d) > float(min_wan)
+                     and all((float(s) >= 0) for s in (sign5d or []) if s is not None)
+                     and (ex_max is not None and float(ex_max) > 0))
+        return intraday_ok or recent_ok
+
+    for code in uni:
+        box = got.get(code) or {}
+        tks = box.get("ticks") or []
+        try:
+            from .common import fetch_kline
+            bars = fetch_kline(code, days=60)
+        except Exception as e:
+            missing.append(f"{code}: 日线取数:{type(e).__name__}: {e}")
+            skipped += 1
+            continue
+        if len(bars) < 20:
+            skipped += 1
+            continue
+        closes = [float(b.get("close") or 0) for b in bars]
+        ma5 = _last_ma(closes, 5)
+        ma5_prev = _last_ma(closes, 5, len(closes) - 6)
+        slope = ((ma5 - ma5_prev) / ma5_prev * 100) if (ma5 and ma5_prev and ma5_prev > 0) else None
+        ret5 = ((closes[-1] / closes[-6] - 1) * 100) if len(closes) > 6 else None
+
+        # ① 分时大部分在日均线VWAP之上 + 当日收盘在 MA5 之上
+        try:
+            n_above = _count_above_vwap(tks, ma5)
+            vwap_above = (n_above is not None and n_above / len(tks) * 100 >= _PULLUP_MA_ABOVE_PCT) \
+                if tks else False
+        except Exception:
+            vwap_above = False
+        close_on_ma = (ret5 is not None and ret5 > 0) or (ma5 is not None and closes[-1] > ma5)
+        if not (vwap_above and close_on_ma):
+            skipped += 1
+            continue
+        # ② 日均线平缓向上（非断崖、近期未大幅下跌）
+        ma_slope_ok = (slope is not None and 0.0 < slope <= _PULLUP_MA_SLOPE_MAX
+                       and (ret5 is not None and ret5 > -10.0))
+        if not ma_slope_ok:
+            skipped += 1
+            continue
+        # ③ 资金在吸筹
+        try:
+            from ._helpers import flow_summary
+            flow = flow_summary(code) or {}
+            if not _fund_accumulation(flow, _PULLUP_FUND_MIN_WAN):
+                skipped += 1
+                continue
+        except Exception as e:
+            missing.append(f"{code}: 资金流:{type(e).__name__}: {e}")
+            skipped += 1
+            continue
+        t_first = _pullup_t_first(tks, ma5)
+        delta_pct = _pullup_delta_pct(tks, ma5)
+        amount = _pullup_amount(tks)
+        pullups.append({
+            "code": code, "t_first": t_first, "delta_pct": delta_pct,
+            "amount": amount, "mode": "pullup",
+            "reason": "拉升（未现跳变）：分时大部分在日均线VWAP之上 + 日均线缓升 + 资金吸筹",
+        })
+
+    pullups.sort(key=lambda x: (x["t_first"] is None,
+                                x["t_first"] if x.get("t_first") is not None else "",
+                                -float(x.get("delta_pct") or 0)))
+    return {"ok": True, "pullups": pullups, "skipped": skipped,
+            "missing": missing,
+            "params": {"ma_above_pct": _PULLUP_MA_ABOVE_PCT,
+                       "ma_slope_pct_max": _PULLUP_MA_SLOPE_MAX,
+                       "fund_min_wan": _PULLUP_FUND_MIN_WAN}}
+
+
+def _count_above_vwap(tks: List, ma5: Optional[float]) -> Optional[int]:
+    """1m 序列中价格 ≥ 日均线VWAP(ma5) 的分钟数（用于占比判据）。"""
+    if not tks or ma5 is None:
+        return None
+    cnt = 0
+    for _t, px, _cum in tks:
+        if px is not None and ma5 is not None and px >= ma5:
+            cnt += 1
+    return cnt
+
+
+def _pullup_t_first(tks: List, ma5: Optional[float]) -> Optional[str]:
+    """拉升起始时刻：首个「价格在 MA5 之上」的分钟（t_first）。"""
+    for t, px, _cum in tks:
+        if px is not None and ma5 is not None and px >= ma5:
+            return t
+    return None
+
+
+def _pullup_delta_pct(tks: List, ma5: Optional[float]) -> Optional[float]:
+    """拉升幅度（%）：价格相对 MA5 的最高偏离。"""
+    best = None
+    for _t, px, _cum in tks:
+        if px is None or ma5 is None:
+            continue
+        v = (px - ma5) / ma5 * 100 if ma5 else None
+        if v is not None and (best is None or v > best):
+            best = v
+    return None if best is None else round(best, 2)
+
+
+def _pullup_amount(tks: List) -> float:
+    """拉升段累计量（元，tick 累计量求和）。"""
+    total = 0.0
+    for _t, _px, cum in tks:
+        if cum is not None:
+            total += float(cum)
+    return round(total, 0)
+
+
 def _jump_vol_ratio(codes: List[str], day: Optional[str],
                     as_of: Optional[str]) -> Dict[str, Optional[float]]:
     """前 5 日同刻累计量**均值**做基准的同刻量比（与 screen_query.cross_section 同定义）。
@@ -768,6 +951,10 @@ def pick_stocks_in_board(track: str, name: str, zt_rows: List[Dict[str, Any]],
     if not members:
         return {"track": track, "name": name, "branch": "none",
                 "picked": [], "missing": [{"code": "*", "reason": "板块无成员或未归类"}]}
+
+    # 拉抬检测（2026-11-27 用户改进：第三类真拉升，未现跳变）——与 detect_jumps 并列，
+    # 并入候选池参与去重/截断排序。逐票取 1m ticks + 日线 MA5 + 资金流，阈值走 env。
+    pullup_cands = detect_pullups(members, day=day, params=p, as_of=as_of) if members else {"pullups": []}
 
     stats = limit_stats(members, zt_rows)
     zt_codes = [r["code"] for r in stats.get("rows") or []]
@@ -889,6 +1076,26 @@ def pick_stocks_in_board(track: str, name: str, zt_rows: List[Dict[str, Any]],
             picked = keep
         picked = picked[:cap]
         out.update({"branch": "jump", "picked": picked, "jumps": jp})
+
+    # 拉抬候选（第三类真拉升）并入最终 picked：kind='pullup'，参与全局去重/截断排序。
+    # 在分支末尾合并，避免被分支内的跳变截断（first/sec）先裁剪掉；全局 _uniq_mark 再按
+    # code 去重（同票若既是跳变又是拉抬，保留一条、dup_n 累加）。
+    for j in (pullup_cands or {}).get("pullups") or []:
+        code = str(j.get("code") or "")
+        if code and any(x.get("code") == code for x in (out.get("picked") or [])):
+            continue
+        out["picked"].append({
+            "code": j.get("code"),
+            "name": j.get("name", ""),
+            "t_first": j.get("t_first"),
+            "delta_pct": j.get("delta_pct"),
+            "amount": j.get("amount"),
+            "kind": "pullup",
+            "mode": j.get("mode", "pullup"),
+            "reason": j.get("reason", "拉升（未现跳变：分时大部分在日均线VWAP之上+均线缓升+资金吸筹）"),
+            "score": (-float(str(j["t_first"]).replace(":", ""))
+                     if j.get("t_first") else 0),
+        })
     return out
 
 

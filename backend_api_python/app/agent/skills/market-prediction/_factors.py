@@ -1,27 +1,47 @@
 # -*- coding: utf-8 -*-
 """
-market-prediction/_factors.py — 四维因子纯计算层
+market-prediction/_factors.py — 四维因子计算层
 
 设计原则：
-1. 纯函数，无 I/O，无副作用，可单测
-2. 只依赖 app.market_cn.* 本地模块
-3. 输出标准化因子字典，供 _model.py 和 _report.py 使用
-4. 所有分数归一到 0-100
+1. 计算层集中在此文件，数据取数均在做失败降级，绝不伪造"有效数据"
+2. technical / fund_flow / sentiment 走 app.market_cn.* 本地协调器
+3. valuation 按用户拍板（2026-11-28）在技能内直连 akshare，不动数据层
+4. 北向资金已彻底剔除（2024-08-16 起停更 551+ 交易日）；两融余额全市场无源，同样剔除
+5. 所有分数归一到 0-100；error 一律显式写入 details，供上游降置信度
 
-因子维度：
+维度：
 - technical (30%)：均线、MACD、布林带、趋势、关键位
-- fund_flow (25%)：北向、融资、成交量、资金连续性
-- sentiment (20%)：涨跌停、贪恐、炸板、新高
-- valuation (25%)：PE/PB分位、股债利差、历史百分位
+- fund_flow (25%)：主力净流入、资金持续性、成交量趋势
+- sentiment (20%)：涨跌停、炸板率、贪恐指数、市场宽度
+- valuation (25%)：上证/沪深300 长短周期 PE/PB 分位融合、股债利差、估值中枢
 
-2026-11-27 v1.0: 初始版本
+2026-11-27 v1.0 初始版本；2026-11-28 v1.1 修数据源与分位融合。
 """
 
 import logging
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from .common import clamp, percentile_rank
+
 logger = logging.getLogger(__name__)
+
+# 估值接口为网络请求，同一进程内缓存 30 分钟，避免一次预测重复拉取
+_CACHE_TTL = 1800
+_CACHE: Dict[str, tuple] = {}
+
+
+def _cached(key: str, loader, ttl: int = _CACHE_TTL):
+    """轻量进程内缓存；失败结果不缓存，便于下次重试。"""
+    now = time.time()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = loader()
+    if value and not (isinstance(value, dict) and value.get("_failed")):
+        _CACHE[key] = (now, value)
+    return value
 
 
 # ================================================================
@@ -29,47 +49,30 @@ logger = logging.getLogger(__name__)
 # ================================================================
 
 def compute_technical_factors() -> Dict[str, Any]:
-    """
-    计算技术面因子（0-100）。
-    
-    子因子：
-    - ma_trend: 均线多头排列度
-    - macd_signal: MACD 金叉/死叉强度
-    - boll_position: 布林带位置
-    - trend_strength: 趋势强度（ADX 简化版）
-    - key_level_break: 关键位突破情况
-    
-    Returns:
-        dict: {score: 0-100, details: {...}}
-    """
+    """技术面因子（0-100）。"""
     try:
         from app.market_cn.index import get_index_daily_kline
-        
-        # 获取上证指数日线（120天）
+
         klines = get_index_daily_kline("000001", 120) or []
         if len(klines) < 60:
             return {"score": 50, "details": {"error": "数据不足"}}
-        
+
         closes = [float(k.get("close", 0)) for k in klines if k.get("close")]
         highs = [float(k.get("high", 0)) for k in klines if k.get("high")]
         lows = [float(k.get("low", 0)) for k in klines if k.get("low")]
         volumes = [float(k.get("volume", 0)) for k in klines if k.get("volume")]
-        
+
         if len(closes) < 60:
             return {"score": 50, "details": {"error": "有效数据不足"}}
-        
+
         c = closes[-1]
-        
-        # 1. 均线系统
         ma5 = sum(closes[-5:]) / 5
         ma10 = sum(closes[-10:]) / 10
         ma20 = sum(closes[-20:]) / 20
         ma60 = sum(closes[-60:]) / 60
-        
-        # 均线多头排列度 (0-100)
-        ma_score = 0
+
         if c > ma5 > ma10 > ma20 > ma60:
-            ma_score = 90  # 完美多头
+            ma_score = 90
         elif c > ma5 > ma10 > ma20:
             ma_score = 75
         elif c > ma5 > ma10:
@@ -80,25 +83,16 @@ def compute_technical_factors() -> Dict[str, Any]:
             ma_score = 50
         else:
             ma_score = 30
-        
-        # MA20 斜率（趋势方向）
+
         ma20_prev = sum(closes[-21:-1]) / 20
         ma20_slope = (ma20 - ma20_prev) / ma20_prev * 100 if ma20_prev > 0 else 0
         slope_score = clamp(50 + ma20_slope * 10, 0, 100)
-        
-        # 2. MACD
+
         macd_score = _compute_macd_score(closes)
-        
-        # 3. 布林带位置
         boll_score = _compute_bollinger_score(closes, highs, lows)
-        
-        # 4. 趋势强度（简化 ADX）
         trend_score = _compute_trend_strength(highs, lows, closes)
-        
-        # 5. 关键位突破（前高/前低/整数关口）
         key_level_score = _compute_key_level_break(closes, highs, lows)
-        
-        # 加权合成
+
         weights = {
             "ma_trend": 0.30,
             "ma_slope": 0.15,
@@ -107,16 +101,14 @@ def compute_technical_factors() -> Dict[str, Any]:
             "trend_strength": 0.10,
             "key_level": 0.10,
         }
-        
         composite = (
-            ma_score * weights["ma_trend"] +
-            slope_score * weights["ma_slope"] +
-            macd_score * weights["macd"] +
-            boll_score * weights["bollinger"] +
-            trend_score * weights["trend_strength"] +
-            key_level_score * weights["key_level"]
+            ma_score * weights["ma_trend"]
+            + slope_score * weights["ma_slope"]
+            + macd_score * weights["macd"]
+            + boll_score * weights["bollinger"]
+            + trend_score * weights["trend_strength"]
+            + key_level_score * weights["key_level"]
         )
-        
         return {
             "score": round(composite, 1),
             "details": {
@@ -131,337 +123,253 @@ def compute_technical_factors() -> Dict[str, Any]:
                 "ma5": round(ma5, 2),
                 "ma20": round(ma20, 2),
                 "ma60": round(ma60, 2),
-            }
+            },
         }
-        
     except Exception as e:
         logger.warning("[market-prediction] technical factors failed: %s", e)
         return {"score": 50, "details": {"error": str(e)}}
 
 
 def _compute_macd_score(closes: List[float]) -> float:
-    """MACD 评分 (0-100)"""
     if len(closes) < 26:
         return 50
-    
+
     def _ema(xs, period):
         k = 2 / (period + 1)
         e = xs[0]
         for x in xs[1:]:
             e = x * k + e * (1 - k)
         return e
-    
+
     ema12 = _ema(closes, 12)
     ema26 = _ema(closes, 26)
     dif = ema12 - ema26
-    
-    # 计算 DEA (DIF 的 9 日 EMA)
+
     dif_series = []
     for i in range(len(closes)):
         if i >= 11:
-            ema12_i = _ema(closes[:i+1], 12)
-            ema26_i = _ema(closes[:i+1], 26)
+            ema12_i = _ema(closes[: i + 1], 12)
+            ema26_i = _ema(closes[: i + 1], 26)
             dif_series.append(ema12_i - ema26_i)
-    
+
     if len(dif_series) < 9:
         dea = dif_series[-1] if dif_series else 0
     else:
         dea = _ema(dif_series, 9)
-    
+
     hist = dif - dea
-    prev_hist = dif_series[-2] - (_ema(dif_series[:-1], 9) if len(dif_series) > 9 else dif_series[-2]) if len(dif_series) >= 2 else 0
-    
-    # 评分逻辑
+    prev_hist = (
+        dif_series[-2] - (_ema(dif_series[:-1], 9) if len(dif_series) > 9 else dif_series[-2])
+        if len(dif_series) >= 2
+        else 0
+    )
     if hist > 0 and hist > prev_hist:
-        return 85  # 金叉向上
-    elif hist > 0:
-        return 70  # DIF>DEA 但柱状收缩
-    elif hist < 0 and hist < prev_hist:
-        return 25  # 死叉向下
-    else:
-        return 40  # DIF<DEA 但柱状收缩
+        return 85
+    if hist > 0:
+        return 70
+    if hist < 0 and hist < prev_hist:
+        return 25
+    return 40
 
 
 def _compute_bollinger_score(closes: List[float], highs: List[float], lows: List[float]) -> float:
-    """布林带位置评分 (0-100)"""
     if len(closes) < 20:
         return 50
-    
     recent_closes = closes[-20:]
-    recent_highs = highs[-20:]
-    recent_lows = lows[-20:]
-    
     mid = sum(recent_closes) / 20
     std = (sum((x - mid) ** 2 for x in recent_closes) / 19) ** 0.5
     upper = mid + 2 * std
     lower = mid - 2 * std
-    
-    c = closes[-1]
-    
     if upper == lower:
         return 50
-    
-    # 位置百分比 (0=下轨, 100=上轨)
+    c = closes[-1]
     pos_pct = (c - lower) / (upper - lower) * 100
-    
-    # 评分：中轨附近偏高分，极端位置偏低
     if 40 <= pos_pct <= 60:
-        return 75  # 中轨附近，均衡
-    elif 30 <= pos_pct < 40 or 60 < pos_pct <= 70:
+        return 75
+    if 30 <= pos_pct < 40 or 60 < pos_pct <= 70:
         return 65
-    elif 20 <= pos_pct < 30 or 70 < pos_pct <= 80:
+    if 20 <= pos_pct < 30 or 70 < pos_pct <= 80:
         return 50
-    elif 10 <= pos_pct < 20 or 80 < pos_pct <= 90:
+    if 10 <= pos_pct < 20 or 80 < pos_pct <= 90:
         return 35
-    else:
-        return 20  # 超买/超卖极端
+    return 20
 
 
 def _compute_trend_strength(highs: List[float], lows: List[float], closes: List[float]) -> float:
-    """简化趋势强度评分 (0-100)，参考 ADX 思想"""
     if len(closes) < 20:
         return 50
-    
-    # 计算 +DM, -DM, TR
-    plus_dm = []
-    minus_dm = []
-    tr = []
-    
+    plus_dm, minus_dm, tr = [], [], []
     for i in range(1, min(20, len(closes))):
-        h_diff = highs[-i] - highs[-i-1]
-        l_diff = lows[-i-1] - lows[-i]
-        
-        if h_diff > l_diff and h_diff > 0:
-            plus_dm.append(h_diff)
-        else:
-            plus_dm.append(0)
-            
-        if l_diff > h_diff and l_diff > 0:
-            minus_dm.append(l_diff)
-        else:
-            minus_dm.append(0)
-        
-        tr.append(max(
-            highs[-i] - lows[-i],
-            abs(highs[-i] - closes[-i-1]),
-            abs(lows[-i] - closes[-i-1])
-        ))
-    
+        h_diff = highs[-i] - highs[-i - 1]
+        l_diff = lows[-i - 1] - lows[-i]
+        plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0)
+        minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0)
+        tr.append(max(highs[-i] - lows[-i], abs(highs[-i] - closes[-i - 1]), abs(lows[-i] - closes[-i - 1])))
     if not tr:
         return 50
-    
     atr = sum(tr) / len(tr)
     if atr == 0:
         return 50
-    
     plus_di = (sum(plus_dm) / len(plus_dm)) / atr * 100
     minus_di = (sum(minus_dm) / len(minus_dm)) / atr * 100
-    
     dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100 if (plus_di + minus_di) > 0 else 0
-    
-    # ADX 简化：DX 本身作为趋势强度
-    # DX > 25 强趋势，> 40 极强
     if dx > 40:
         return 90
-    elif dx > 25:
+    if dx > 25:
         return 75
-    elif dx > 20:
+    if dx > 20:
         return 60
-    else:
-        return 40
+    return 40
+
+
+def _dynamic_round_levels(current: float) -> List[float]:
+    """按当前点位动态生成整数关口，避免写死 2500-4400。"""
+    step = 100 if current >= 1000 else (10 if current >= 100 else 1)
+    center = int(current / step)
+    return [i * step for i in range(max(1, center - 5), center + 6)]
 
 
 def _compute_key_level_break(closes: List[float], highs: List[float], lows: List[float]) -> float:
-    """关键位突破评分 (0-100)"""
     if len(closes) < 60:
         return 50
-    
     c = closes[-1]
-    
-    # 近 60 日高低点
-    high_60 = max(highs[-60:])
-    low_60 = min(lows[-60:])
-    
-    # 近 20 日高低点
-    high_20 = max(highs[-20:])
-    low_20 = min(lows[-20:])
-    
-    # 整数关口（3000, 3200, 3400, 3500...）
-    int_levels = [i * 100 for i in range(25, 45)]
-    nearest_above = min([l for l in int_levels if l > c], default=c + 100)
-    nearest_below = max([l for l in int_levels if l < c], default=c - 100)
-    
+    high_60, low_60 = max(highs[-60:]), min(lows[-60:])
+    high_20, low_20 = max(highs[-20:]), min(lows[-20:])
+    int_levels = _dynamic_round_levels(c)
+    nearest_above = min([lv for lv in int_levels if lv > c], default=c + 100)
+    nearest_below = max([lv for lv in int_levels if lv < c], default=c - 100)
     score = 50
-    
-    # 突破 60 日新高
     if c >= high_60 * 0.995:
         score += 20
-    # 站上 20 日高点
     if c >= high_20 * 0.995:
         score += 10
-    # 跌破 60 日新低
     if c <= low_60 * 1.005:
         score -= 20
-    # 跌破 20 日低点
     if c <= low_20 * 1.005:
         score -= 10
-    # 接近上方整数关口（压力）
     if (nearest_above - c) / c < 0.01:
         score -= 5
-    # 刚站上下方整数关口（支撑）
     if (c - nearest_below) / c < 0.01:
         score += 5
-    
     return clamp(score, 0, 100)
 
 
 # ================================================================
-# 资金面因子
+# 资金面因子（北向/两融已彻底剔除）
 # ================================================================
 
 def compute_fund_flow_factors() -> Dict[str, Any]:
     """
-    计算资金面因子（0-100）。
-    
-    子因子：
-    - north_flow: 北向资金连续性
-    - margin_flow: 融资余额变化
-    - volume_trend: 成交量趋势
-    - flow_persistence: 资金流向持续性
-    
-    Returns:
-        dict: {score: 0-100, details: {...}}
+    资金面因子：全市场主力净流入 + 连续性 + 成交量趋势。
+    数据源 app.market_cn.fund_flow_api.market_flow_summary（DB 分钟资金聚合，本地）。
     """
     try:
-        from app.market_cn.fund_flow_local import get_fund_flow_summary
+        from app.market_cn.fund_flow_api import market_flow_summary
         from app.market_cn.index import get_index_daily_kline
-        
-        # 获取资金流汇总（近 20 日）
-        flow_data = get_fund_flow_summary(days=20) or {}
-        
-        # 获取指数成交量
+
+        flow = market_flow_summary(days=20) or {}
         klines = get_index_daily_kline("000001", 60) or []
         volumes = [float(k.get("volume", 0)) for k in klines if k.get("volume")]
-        
-        # 1. 北向资金 (权重 35%)
-        north_score = _score_north_flow(flow_data)
-        
-        # 2. 融资余额 (权重 25%)
-        margin_score = _score_margin_flow(flow_data)
-        
-        # 3. 成交量趋势 (权重 20%)
+
+        net_score = _score_net_flow(flow)
+        persistence_score = _score_flow_persistence(flow)
         volume_score = _score_volume_trend(volumes)
-        
-        # 4. 资金持续性 (权重 20%)
-        persistence_score = _score_flow_persistence(flow_data)
-        
-        composite = (
-            north_score * 0.35 +
-            margin_score * 0.25 +
-            volume_score * 0.20 +
-            persistence_score * 0.20
-        )
-        
-        return {
-            "score": round(composite, 1),
-            "details": {
-                "north_flow": round(north_score, 1),
-                "margin_flow": round(margin_score, 1),
-                "volume_trend": round(volume_score, 1),
-                "persistence": round(persistence_score, 1),
-                "raw": flow_data,
-            }
+        composite = net_score * 0.40 + persistence_score * 0.35 + volume_score * 0.25
+
+        details = {
+            "net_flow": round(net_score, 1),
+            "persistence": round(persistence_score, 1),
+            "volume_trend": round(volume_score, 1),
+            "net_yi": flow.get("net_yi"),
+            "net_pct": flow.get("net_pct"),
+            "direction": flow.get("direction"),
+            "direction_seq": flow.get("direction_seq"),
+            "trade_date": flow.get("trade_date"),
+            "freshness": flow.get("freshness"),
         }
-        
+        if flow.get("freshness") == "stale" or flow.get("stale"):
+            details.setdefault("warnings", []).append("资金流数据滞后，方向信号仅供参考")
+        return {"score": round(composite, 1), "details": details}
     except Exception as e:
         logger.warning("[market-prediction] fund_flow factors failed: %s", e)
         return {"score": 50, "details": {"error": str(e)}}
 
 
-def _score_north_flow(flow_data: Dict) -> float:
-    """北向资金评分"""
-    north = flow_data.get("north_flow", {})
-    if not north:
+def _score_net_flow(flow: Dict) -> float:
+    """主力净流入强度（net_pct = 净流入/成交额，单位 %）。"""
+    net_pct = flow.get("net_pct")
+    if net_pct is None:
         return 50
-    
-    # 近 5 日净流入
-    net_5d = north.get("net_5d_wan", 0)
-    # 近 10 日净流入
-    net_10d = north.get("net_10d_wan", 0)
-    # 连续流入天数
-    streak = north.get("inflow_streak", 0)
-    
+    net_pct = float(net_pct)
     score = 50
-    if net_5d > 100000:  # 10亿以上
-        score += 30
-    elif net_5d > 50000:
-        score += 20
-    elif net_5d > 0:
-        score += 10
-    elif net_5d < -50000:
-        score -= 20
-    elif net_5d < -100000:
-        score -= 30
-    
-    if net_10d > 200000:
-        score += 15
-    elif net_10d < -100000:
-        score -= 15
-    
-    if streak >= 5:
-        score += 10
-    elif streak >= 3:
-        score += 5
-    elif streak <= -3:
-        score -= 10
-    
+    if net_pct >= 10:
+        score = 85
+    elif net_pct >= 5:
+        score = 75
+    elif net_pct >= 2:
+        score = 65
+    elif net_pct >= 0:
+        score = 55
+    elif net_pct >= -2:
+        score = 45
+    elif net_pct >= -5:
+        score = 35
+    else:
+        score = 20
+    if str(flow.get("direction", "")).lower() == "outflow":
+        score -= 5
     return clamp(score, 0, 100)
 
 
-def _score_margin_flow(flow_data: Dict) -> float:
-    """融资余额评分"""
-    margin = flow_data.get("margin", {})
-    if not margin:
+def _score_flow_persistence(flow: Dict) -> float:
+    """基于 direction_seq / history 的连续性，替代旧 north_flow。"""
+    seq = flow.get("direction_seq") or []
+    if not seq:
+        seq = [
+            "inflow" if float((h or {}).get("net_yi", 0) or 0) > 0 else "outflow"
+            for h in (flow.get("history") or [])
+        ]
+    if not seq:
         return 50
-    
-    change_5d = margin.get("change_5d_pct", 0)
-    change_10d = margin.get("change_10d_pct", 0)
-    
+    max_in = max_out = cur_in = cur_out = 0
+    for direction in seq[-20:]:
+        if direction == "inflow":
+            cur_in += 1
+            cur_out = 0
+            max_in = max(max_in, cur_in)
+        elif direction == "outflow":
+            cur_out += 1
+            cur_in = 0
+            max_out = max(max_out, cur_out)
     score = 50
-    if change_5d > 3:
-        score += 25
-    elif change_5d > 1:
-        score += 15
-    elif change_5d > 0:
-        score += 5
-    elif change_5d < -3:
-        score -= 25
-    elif change_5d < -1:
-        score -= 15
-    elif change_5d < 0:
-        score -= 5
-    
-    if change_10d > 5:
+    if max_in >= 5:
+        score += 20
+    elif max_in >= 3:
         score += 10
-    elif change_10d < -5:
+    if max_out >= 5:
+        score -= 20
+    elif max_out >= 3:
         score -= 10
-    
+    in_ratio = sum(1 for d in seq[-20:] if d == "inflow") / len(seq[-20:])
+    if in_ratio > 0.7:
+        score += 15
+    elif in_ratio > 0.6:
+        score += 5
+    elif in_ratio < 0.3:
+        score -= 15
+    elif in_ratio < 0.4:
+        score -= 5
     return clamp(score, 0, 100)
 
 
 def _score_volume_trend(volumes: List[float]) -> float:
-    """成交量趋势评分"""
     if len(volumes) < 20:
         return 50
-    
     vol_5 = sum(volumes[-5:]) / 5
     vol_20 = sum(volumes[-20:]) / 20
     vol_60 = sum(volumes[-60:]) / 60 if len(volumes) >= 60 else vol_20
-    
-    # 量比
     vr_5_20 = vol_5 / vol_20 if vol_20 > 0 else 1
     vr_20_60 = vol_20 / vol_60 if vol_60 > 0 else 1
-    
     score = 50
     if vr_5_20 > 1.5:
         score += 25
@@ -473,62 +381,10 @@ def _score_volume_trend(volumes: List[float]) -> float:
         score -= 15
     elif vr_5_20 < 0.5:
         score -= 25
-    
     if vr_20_60 > 1.2:
         score += 10
     elif vr_20_60 < 0.8:
         score -= 10
-    
-    return clamp(score, 0, 100)
-
-
-def _score_flow_persistence(flow_data: Dict) -> float:
-    """资金流向持续性评分"""
-    daily = flow_data.get("daily_net_wan", [])
-    if not daily or len(daily) < 10:
-        return 50
-    
-    # 连续同向天数
-    pos_streak = 0
-    neg_streak = 0
-    max_pos = 0
-    max_neg = 0
-    
-    for v in daily[-20:]:
-        if v > 0:
-            pos_streak += 1
-            neg_streak = 0
-            max_pos = max(max_pos, pos_streak)
-        elif v < 0:
-            neg_streak += 1
-            pos_streak = 0
-            max_neg = max(max_neg, neg_streak)
-        else:
-            pos_streak = 0
-            neg_streak = 0
-    
-    score = 50
-    if max_pos >= 5:
-        score += 20
-    elif max_pos >= 3:
-        score += 10
-    if max_neg >= 5:
-        score -= 20
-    elif max_neg >= 3:
-        score -= 10
-    
-    # 净流入占比
-    pos_days = sum(1 for v in daily[-20:] if v > 0)
-    pos_ratio = pos_days / min(20, len(daily))
-    if pos_ratio > 0.7:
-        score += 15
-    elif pos_ratio > 0.6:
-        score += 5
-    elif pos_ratio < 0.3:
-        score -= 15
-    elif pos_ratio < 0.4:
-        score -= 5
-    
     return clamp(score, 0, 100)
 
 
@@ -537,67 +393,66 @@ def _score_flow_persistence(flow_data: Dict) -> float:
 # ================================================================
 
 def compute_sentiment_factors() -> Dict[str, Any]:
-    """
-    计算情绪面因子（0-100）。
-    
-    子因子：
-    - limit_up_down: 涨跌停家数/比率
-    - broken_rate: 炸板率
-    - fear_greed: 贪恐指数
-    - new_highs: 新高/新低家数
-    
-    Returns:
-        dict: {score: 0-100, details: {...}}
-    """
+    """情绪面：涨跌停池 + 炸板率 + 贪恐指数 + 上涨家数比例（市场宽度）。"""
     try:
-        from app.market_cn.emotion import get_emotion_snapshot
+        from app.market_cn.dragon_limit import get_broken_board, get_dt_pool, get_zt_pool
+        from app.market_cn.emotion import fetch_emotion_cycle
         from app.market_cn.fear_greed_index import fear_greed_index
-        
-        emotion = get_emotion_snapshot() or {}
-        fg = fear_greed_index() or {}
-        
-        # 1. 涨跌停情绪 (40%)
-        ltd_score = _score_limit_up_down(emotion)
-        
-        # 2. 炸板率 (20%)
-        broken_score = _score_broken_rate(emotion)
-        
-        # 3. 贪恐指数 (25%)
-        fg_score = _score_fear_greed(fg)
-        
-        # 4. 新高新低 (15%)
-        nh_score = _score_new_highs_lows(emotion)
-        
-        composite = (
-            ltd_score * 0.40 +
-            broken_score * 0.20 +
-            fg_score * 0.25 +
-            nh_score * 0.15
+
+        emo = _cached("emotion", lambda: fetch_emotion_cycle() or {}, ttl=600) or {}
+        row = (emo.get("data") or {}).get("emotion") or {}
+        fg = _cached("fear_greed", lambda: fear_greed_index() or {}, ttl=600) or {}
+        pools = _cached(
+            "limit_pools",
+            lambda: {
+                "zt": len(get_zt_pool() or []),
+                "dt": len(get_dt_pool() or []),
+                "broken": len(get_broken_board() or []),
+            },
+            ttl=600,
         )
-        
-        return {
-            "score": round(composite, 1),
-            "details": {
-                "limit_up_down": round(ltd_score, 1),
-                "broken_rate": round(broken_score, 1),
-                "fear_greed": round(fg_score, 1),
-                "new_highs_lows": round(nh_score, 1),
-                "raw_emotion": emotion,
-                "raw_fg": fg,
-            }
+        zt = pools["zt"]
+        dt = pools["dt"]
+        broken = pools["broken"]
+        # 池全空时用情绪快照的语义字段兜底，避免误判"情绪冰点"
+        if zt == 0 and dt == 0:
+            zt = int(row.get("ztjs", 0) or 0)
+            dt = int(row.get("dtjs", 0) or 0)
+        if broken == 0:
+            broken = int(row.get("zbjs", 0) or 0)
+        breadth = float(row.get("szbl", 50) or 50)
+
+        ltd_score = _score_limit_up_down({"limit_up_count": zt, "limit_down_count": dt})
+        broken_score = _score_broken_rate({"broken_count": broken, "limit_up_count": zt})
+        fg_score = _score_fear_greed(fg)
+        breadth_score = _score_breadth(breadth)
+        composite = ltd_score * 0.40 + broken_score * 0.20 + fg_score * 0.25 + breadth_score * 0.15
+
+        details = {
+            "limit_up_down": round(ltd_score, 1),
+            "broken_rate": round(broken_score, 1),
+            "fear_greed": round(fg_score, 1),
+            "breadth": round(breadth_score, 1),
+            "zt_count": zt,
+            "dt_count": dt,
+            "broken_count": broken,
+            "up_ratio_pct": breadth,
+            "fg_composite": fg.get("composite_score"),
+            "fg_label": fg.get("label"),
+            "emotion_date": row.get("date1"),
         }
-        
+        if zt == 0 and dt == 0 and not row:
+            details.setdefault("warnings", []).append("涨跌停池与情绪快照均无数据")
+        return {"score": round(composite, 1), "details": details}
     except Exception as e:
         logger.warning("[market-prediction] sentiment factors failed: %s", e)
         return {"score": 50, "details": {"error": str(e)}}
 
 
 def _score_limit_up_down(emotion: Dict) -> float:
-    """涨跌停评分"""
-    up = emotion.get("limit_up_count", 0)
-    down = emotion.get("limit_down_count", 0)
-    up_ratio = emotion.get("limit_up_ratio", 0)  # 涨停/跌停比
-    
+    up = int(emotion.get("limit_up_count", 0) or 0)
+    down = int(emotion.get("limit_down_count", 0) or 0)
+    ratio = up / max(down, 1)
     score = 50
     if up > 80:
         score += 30
@@ -609,287 +464,298 @@ def _score_limit_up_down(emotion: Dict) -> float:
         score -= 15
     elif up < 5:
         score -= 25
-    
     if down > 30:
         score -= 20
     elif down > 15:
         score -= 10
-    
-    if up_ratio > 5:
+    if ratio > 5:
         score += 15
-    elif up_ratio > 3:
+    elif ratio > 3:
         score += 10
-    elif up_ratio > 1:
+    elif ratio > 1:
         score += 5
-    elif up_ratio < 0.5:
-        score -= 15
-    elif up_ratio < 0.2:
+    elif ratio < 0.2:
         score -= 25
-    
+    elif ratio < 0.5:
+        score -= 15
     return clamp(score, 0, 100)
 
 
 def _score_broken_rate(emotion: Dict) -> float:
-    """炸板率评分（炸板率越低越好）"""
-    broken = emotion.get("broken_count", 0)
-    total_zt = emotion.get("limit_up_count", 0) + broken
-    
+    broken = int(emotion.get("broken_count", 0) or 0)
+    total_zt = int(emotion.get("limit_up_count", 0) or 0) + broken
     if total_zt == 0:
         return 50
-    
-    broken_rate = broken / total_zt
-    
-    # 炸板率 < 20% 优秀，> 50% 极差
-    if broken_rate < 0.15:
+    rate = broken / total_zt
+    if rate < 0.15:
         return 90
-    elif broken_rate < 0.25:
+    if rate < 0.25:
         return 75
-    elif broken_rate < 0.35:
+    if rate < 0.35:
         return 60
-    elif broken_rate < 0.50:
+    if rate < 0.50:
         return 40
-    elif broken_rate < 0.65:
+    if rate < 0.65:
         return 25
-    else:
-        return 10
+    return 10
 
 
 def _score_fear_greed(fg: Dict) -> float:
-    """贪恐指数评分"""
-    data = fg.get("data") or {}
-    score = data.get("composite_score", 50)
-    label = data.get("label", "中性")
-    
-    # composite_score 已经是 0-100，直接映射
-    # 但极端贪婪(>80)反而要小心，极端恐惧(<20)可能是机会
+    """真实结构：{timestamp, composite_score, label, indicators}，无 data 包裹。"""
+    score = fg.get("composite_score")
+    if score is None:
+        return 50
+    score = float(score)
     if score > 80:
-        return 60  # 极度贪婪，回调风险
-    elif score > 65:
-        return 75  # 贪婪，趋势向上
-    elif score > 55:
-        return 65  # 偏贪婪
-    elif score > 45:
-        return 55  # 中性偏暖
-    elif score > 35:
-        return 50  # 中性
-    elif score > 25:
-        return 55  # 偏恐惧，可能超跌
-    elif score > 15:
-        return 65  # 恐惧，反弹机会
+        return 60
+    if score > 65:
+        return 75
+    if score > 55:
+        return 65
+    if score > 45:
+        return 55
+    if score > 35:
+        return 50
+    if score > 25:
+        return 55
+    if score > 15:
+        return 65
+    return 70
+
+
+def _score_breadth(up_ratio_pct: float) -> float:
+    """市场宽度：上涨家数占比（情绪快照 szbl，单位 %）。"""
+    if up_ratio_pct >= 80:
+        return 90
+    if up_ratio_pct >= 65:
+        return 80
+    if up_ratio_pct >= 55:
+        return 68
+    if up_ratio_pct >= 45:
+        return 55
+    if up_ratio_pct >= 30:
+        return 40
+    if up_ratio_pct >= 20:
+        return 25
+    return 15
+
+
+# ================================================================
+# 估值面因子（技能内直连 akshare：上证短周期 + 沪深300长周期融合）
+# ================================================================
+
+def _numeric_series(df, *columns: str) -> List[float]:
+    """从 DataFrame 中按候选列名提取有效数值序列。"""
+    for col in columns:
+        if col in df.columns:
+            out = []
+            for v in df[col].tolist():
+                try:
+                    if v is None or (isinstance(v, float) and v != v):
+                        continue
+                    out.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            return out
+    return []
+
+
+def _load_valuation_data() -> Dict[str, Any]:
+    """直连 akshare 拉取估值原始数据（技能内，用户 2026-11-28 拍板）。"""
+    import akshare as ak
+
+    out: Dict[str, Any] = {"source": "akshare", "errors": []}
+
+    def _pull(key: str, fn, symbol: str, *columns: str):
+        try:
+            df = fn(symbol=symbol)
+            values = _numeric_series(df, *columns)
+            if not values:
+                raise ValueError(f"列 {columns} 无有效数据")
+            out[key] = values
+            return values
+        except Exception as e:
+            out["errors"].append(f"{key}: {type(e).__name__}: {e}")
+            return []
+
+    sh_pe = _pull("sh_pe_history", ak.stock_market_pe_lg, "上证", "平均市盈率")
+    sh_pb = _pull("sh_pb_history", ak.stock_market_pb_lg, "上证", "市净率")
+    hs300_pe = _pull("hs300_pe_history", ak.stock_index_pe_lg, "沪深300", "滚动市盈率")
+    hs300_pb = _pull("hs300_pb_history", ak.stock_index_pb_lg, "沪深300", "市净率")
+
+    # 股息率（沪深300，近 20 日）与 10 年期国债收益率 → 股债利差
+    try:
+        df = ak.stock_zh_index_value_csindex(symbol="000300")
+        dy = _numeric_series(df, "股息率1", "股息率2")
+        out["dividend_yield"] = dy[-1] if dy else None
+    except Exception as e:
+        out["errors"].append(f"dividend_yield: {type(e).__name__}: {e}")
+        out["dividend_yield"] = None
+    try:
+        bond = ak.bond_zh_us_rate(start_date="20190101")
+        cgb = _numeric_series(bond, "中国国债收益率10年")
+        out["cgb_10y"] = cgb[-1] if cgb else None
+    except Exception as e:
+        out["errors"].append(f"cgb_10y: {type(e).__name__}: {e}")
+        out["cgb_10y"] = None
+
+    dy, cgb = out.get("dividend_yield"), out.get("cgb_10y")
+    out["yield_gap"] = round(dy - cgb, 4) if dy is not None and cgb is not None else None
+
+    if not any(out.get(k) for k in ("sh_pe_history", "hs300_pe_history")):
+        out["_failed"] = True
+    return out
+
+
+def _fused_percentile(current: float, short_hist: List[float], long_hist: List[float]) -> Dict[str, float]:
+    """长短周期分位融合：长周期定方向 0.6 + 短周期定节奏 0.4。"""
+    short_pct = percentile_rank(current, short_hist) if short_hist else 50.0
+    long_pct = percentile_rank(current, long_hist) if long_hist else 50.0
+    return {
+        "short_pct": round(short_pct, 1),
+        "long_pct": round(long_pct, 1),
+        "fused_pct": round(long_pct * 0.6 + short_pct * 0.4, 1),
+    }
+
+
+def _pct_to_value_score(pct: float) -> float:
+    """估值分位 → 得分（分位越低越便宜，得分越高）。"""
+    if pct < 10:
+        return 95
+    if pct < 20:
+        return 85
+    if pct < 30:
+        return 75
+    if pct < 40:
+        return 65
+    if pct < 50:
+        return 55
+    if pct < 60:
+        return 50
+    if pct < 70:
+        return 40
+    if pct < 80:
+        return 30
+    if pct < 90:
+        return 20
+    return 10
+
+
+def _score_pe_pb(val: Dict[str, Any], metric: str) -> tuple:
+    short_key = f"sh_{metric}_history"
+    long_key = f"hs300_{metric}_history"
+    short_hist = val.get(short_key) or []
+    long_hist = val.get(long_key) or []
+    if not short_hist and not long_hist:
+        return 50.0, {}
+    # 用长周期最新值作为当前值（沪深300 口径更稳定），短周期缺失时长短同用长周期
+    current = (long_hist or short_hist)[-1]
+    pct = _fused_percentile(current, short_hist or long_hist, long_hist or short_hist)
+    return _pct_to_value_score(pct["fused_pct"]), {
+        f"current_{metric}": round(current, 3),
+        f"{metric}_short_pct": pct["short_pct"],
+        f"{metric}_long_pct": pct["long_pct"],
+        f"{metric}_fused_pct": pct["fused_pct"],
+    }
+
+
+def _score_yield_gap(val: Dict[str, Any]) -> float:
+    gap = val.get("yield_gap")
+    if gap is None:
+        return 50
+    gap = float(gap)
+    if gap > 2.5:
+        return 95
+    if gap > 2.0:
+        return 85
+    if gap > 1.5:
+        return 75
+    if gap > 1.0:
+        return 65
+    if gap > 0.5:
+        return 55
+    if gap > 0:
+        return 50
+    if gap > -0.5:
+        return 40
+    if gap > -1.0:
+        return 30
+    if gap > -1.5:
+        return 20
+    return 10
+
+
+def _score_valuation_center(val: Dict[str, Any]) -> float:
+    """估值中枢偏离：当前值 / 历史中位数（月频序列，不用假 250 日均线）。"""
+    ratios = []
+    details: Dict[str, Any] = {}
+    for metric, key in (("pe", "hs300_pe_history"), ("pb", "hs300_pb_history")):
+        hist = val.get(key) or []
+        if not hist:
+            continue
+        current = hist[-1]
+        ordered = sorted(hist)
+        median = ordered[len(ordered) // 2]
+        if median > 0:
+            ratios.append(current / median)
+        details[f"{metric}_vs_median"] = round(current / median, 3) if median > 0 else None
+    if not ratios:
+        return 50.0, details
+    avg = sum(ratios) / len(ratios)
+    if avg < 0.75:
+        score = 90
+    elif avg < 0.85:
+        score = 80
+    elif avg < 0.95:
+        score = 65
+    elif avg < 1.05:
+        score = 55
+    elif avg < 1.15:
+        score = 45
+    elif avg < 1.25:
+        score = 35
     else:
-        return 70  # 极度恐惧，大底机会
+        score = 20
+    return float(score), details
 
-
-def _score_new_highs_lows(emotion: Dict) -> float:
-    """新高新低评分"""
-    new_high = emotion.get("new_high_count", 0)
-    new_low = emotion.get("new_low_count", 0)
-    
-    score = 50
-    if new_high > 100:
-        score += 25
-    elif new_high > 50:
-        score += 15
-    elif new_high > 20:
-        score += 5
-    
-    if new_low > 50:
-        score -= 20
-    elif new_low > 20:
-        score -= 10
-    elif new_low > 10:
-        score -= 5
-    
-    return clamp(score, 0, 100)
-
-
-# ================================================================
-# 估值面因子
-# ================================================================
 
 def compute_valuation_factors() -> Dict[str, Any]:
-    """
-    计算估值面因子（0-100）。
-    
-    子因子：
-    - pe_percentile: PE 历史分位（越低越好）
-    - pb_percentile: PB 历史分位
-    - yield_gap: 股债利差（越大越好）
-    - valuation_ma: 估值均值回归位置
-    
-    Returns:
-        dict: {score: 0-100, details: {...}}
-    """
+    """估值面：上证（短周期）+ 沪深300（长周期）PE/PB 分位融合 + 股债利差 + 中枢偏离。"""
     try:
-        from app.market_cn.index import get_index_valuation_history
-        
-        # 获取上证指数估值历史（3年以上）
-        val_data = get_index_valuation_history("000001", years=3) or {}
-        
-        if not val_data:
+        val = _cached("valuation", _load_valuation_data)
+        if not val or val.get("_failed"):
             return {"score": 50, "details": {"error": "估值数据不可用"}}
-        
-        # 1. PE 分位 (35%) —— 分位越低评分越高
-        pe_score = _score_pe_percentile(val_data)
-        
-        # 2. PB 分位 (25%)
-        pb_score = _score_pb_percentile(val_data)
-        
-        # 3. 股债利差 (25%)
-        yg_score = _score_yield_gap(val_data)
-        
-        # 4. 估值均值回归 (15%)
-        ma_score = _score_valuation_mean_reversion(val_data)
-        
-        composite = (
-            pe_score * 0.35 +
-            pb_score * 0.25 +
-            yg_score * 0.25 +
-            ma_score * 0.15
-        )
-        
-        return {
-            "score": round(composite, 1),
-            "details": {
-                "pe_percentile": round(pe_score, 1),
-                "pb_percentile": round(pb_score, 1),
-                "yield_gap": round(yg_score, 1),
-                "mean_reversion": round(ma_score, 1),
-                "raw": val_data,
-            }
+        pe_score, pe_detail = _score_pe_pb(val, "pe")
+        pb_score, pb_detail = _score_pe_pb(val, "pb")
+        yg_score = _score_yield_gap(val)
+        center_score, center_detail = _score_valuation_center(val)
+
+        composite = pe_score * 0.35 + pb_score * 0.25 + yg_score * 0.25 + center_score * 0.15
+        details = {
+            "pe_percentile": round(pe_score, 1),
+            "pb_percentile": round(pb_score, 1),
+            "yield_gap": round(yg_score, 1),
+            "mean_reversion": round(center_score, 1),
+            "yield_gap_pct": val.get("yield_gap"),
+            "dividend_yield_pct": val.get("dividend_yield"),
+            "cgb_10y_pct": val.get("cgb_10y"),
+            "source": val.get("source"),
+            "hist_points": {
+                "sh_pe": len(val.get("sh_pe_history") or []),
+                "sh_pb": len(val.get("sh_pb_history") or []),
+                "hs300_pe": len(val.get("hs300_pe_history") or []),
+                "hs300_pb": len(val.get("hs300_pb_history") or []),
+            },
         }
-        
+        details.update(pe_detail)
+        details.update(pb_detail)
+        details.update(center_detail)
+        if val.get("errors"):
+            details["warnings"] = val["errors"]
+        return {"score": round(composite, 1), "details": details}
     except Exception as e:
         logger.warning("[market-prediction] valuation factors failed: %s", e)
         return {"score": 50, "details": {"error": str(e)}}
-
-
-def _score_pe_percentile(val_data: Dict) -> float:
-    """PE 分位评分（低估值高分）"""
-    current_pe = val_data.get("current_pe", 0)
-    pe_history = val_data.get("pe_history", [])
-    
-    if current_pe <= 0 or not pe_history:
-        return 50
-    
-    # 计算当前 PE 在历史中的百分位
-    from .common import percentile_rank
-    pct = percentile_rank(current_pe, pe_history)
-    
-    # 百分位越低（越便宜）评分越高
-    if pct < 10:
-        return 95
-    elif pct < 20:
-        return 85
-    elif pct < 30:
-        return 75
-    elif pct < 40:
-        return 65
-    elif pct < 50:
-        return 55
-    elif pct < 60:
-        return 50
-    elif pct < 70:
-        return 40
-    elif pct < 80:
-        return 30
-    elif pct < 90:
-        return 20
-    else:
-        return 10
-
-
-def _score_pb_percentile(val_data: Dict) -> float:
-    """PB 分位评分"""
-    current_pb = val_data.get("current_pb", 0)
-    pb_history = val_data.get("pb_history", [])
-    
-    if current_pb <= 0 or not pb_history:
-        return 50
-    
-    from .common import percentile_rank
-    pct = percentile_rank(current_pb, pb_history)
-    
-    if pct < 10:
-        return 95
-    elif pct < 20:
-        return 85
-    elif pct < 30:
-        return 75
-    elif pct < 40:
-        return 65
-    elif pct < 50:
-        return 55
-    elif pct < 60:
-        return 50
-    elif pct < 70:
-        return 40
-    elif pct < 80:
-        return 30
-    elif pct < 90:
-        return 20
-    else:
-        return 10
-
-
-def _score_yield_gap(val_data: Dict) -> float:
-    """股债利差评分（差值越大越好）"""
-    yield_gap = val_data.get("yield_gap", 0)  # 股息率 - 10年国债收益率
-    
-    # 股债利差 > 2% 很安全，< 0% 危险
-    if yield_gap > 2.5:
-        return 95
-    elif yield_gap > 2.0:
-        return 85
-    elif yield_gap > 1.5:
-        return 75
-    elif yield_gap > 1.0:
-        return 65
-    elif yield_gap > 0.5:
-        return 55
-    elif yield_gap > 0:
-        return 50
-    elif yield_gap > -0.5:
-        return 40
-    elif yield_gap > -1.0:
-        return 30
-    elif yield_gap > -1.5:
-        return 20
-    else:
-        return 10
-
-
-def _score_valuation_mean_reversion(val_data: Dict) -> float:
-    """估值均值回归位置评分"""
-    pe_ma = val_data.get("pe_ma_250", 0)
-    current_pe = val_data.get("current_pe", 0)
-    pb_ma = val_data.get("pb_ma_250", 0)
-    current_pb = val_data.get("current_pb", 0)
-    
-    if pe_ma <= 0 or current_pe <= 0:
-        return 50
-    
-    pe_ratio = current_pe / pe_ma
-    pb_ratio = current_pb / pb_ma if pb_ma > 0 else 1
-    
-    # 综合比率
-    avg_ratio = (pe_ratio + pb_ratio) / 2
-    
-    # 低于均值 0.8 倍很便宜，高于 1.2 倍很贵
-    if avg_ratio < 0.75:
-        return 90
-    elif avg_ratio < 0.85:
-        return 80
-    elif avg_ratio < 0.95:
-        return 65
-    elif avg_ratio < 1.05:
-        return 55
-    elif avg_ratio < 1.15:
-        return 45
-    elif avg_ratio < 1.25:
-        return 35
-    else:
-        return 20
 
 
 # ================================================================
@@ -897,47 +763,29 @@ def _score_valuation_mean_reversion(val_data: Dict) -> float:
 # ================================================================
 
 def compute_all_factors() -> Dict[str, Any]:
-    """
-    计算所有四维因子，返回统一格式。
-    
-    Returns:
-        dict: {
-            "technical": {"score": ..., "details": ..., "weight": 0.30},
-            "fund_flow": {"score": ..., "details": ..., "weight": 0.25},
-            "sentiment": {"score": ..., "details": ..., "weight": 0.20},
-            "valuation": {"score": ..., "details": ..., "weight": 0.25},
-            "composite_score": ...,  # 加权总分
-            "timestamp": ...
-        }
-    """
+    """四维因子统一入口，附数据完整度供 _model 降置信度。"""
     tech = compute_technical_factors()
     fund = compute_fund_flow_factors()
     sent = compute_sentiment_factors()
     val = compute_valuation_factors()
-    
-    weights = {
-        "technical": 0.30,
-        "fund_flow": 0.25,
-        "sentiment": 0.20,
-        "valuation": 0.25,
-    }
-    
+
+    weights = {"technical": 0.30, "fund_flow": 0.25, "sentiment": 0.20, "valuation": 0.25}
     composite = (
-        tech["score"] * weights["technical"] +
-        fund["score"] * weights["fund_flow"] +
-        sent["score"] * weights["sentiment"] +
-        val["score"] * weights["valuation"]
+        tech["score"] * weights["technical"]
+        + fund["score"] * weights["fund_flow"]
+        + sent["score"] * weights["sentiment"]
+        + val["score"] * weights["valuation"]
     )
-    
+    dims = {"technical": tech, "fund_flow": fund, "sentiment": sent, "valuation": val}
+    available = [k for k, v in dims.items() if "error" not in v.get("details", {})]
+    degraded = [k for k in dims if k not in available]
     return {
-        "technical": {"score": tech["score"], "details": tech["details"], "weight": weights["technical"]},
-        "fund_flow": {"score": fund["score"], "details": fund["details"], "weight": weights["fund_flow"]},
-        "sentiment": {"score": sent["score"], "details": sent["details"], "weight": weights["sentiment"]},
-        "valuation": {"score": val["score"], "details": val["details"], "weight": weights["valuation"]},
+        **{
+            k: {"score": v["score"], "details": v["details"], "weight": weights[k]}
+            for k, v in dims.items()
+        },
         "composite_score": round(composite, 1),
+        "available_dimensions": available,
+        "degraded_dimensions": degraded,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
